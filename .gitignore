@@ -7,3 +7,5 @@ node_modules/
 *.log
 .tender/
 coverage/
+!packages/shared/test/fixtures/**/*.log
+.DS_Store
