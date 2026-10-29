@@ -1,8 +1,8 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { NETWORKS } from "@tender/shared";
+import { type extractEvents, NETWORKS } from "@tender/shared";
 import { KeyPair } from "near-api-js";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, test } from "vitest";
 import { TenderClient, TenderError, toTxResult } from "../src/index";
 
 const CONTRACT = "tender.test.near";
@@ -384,6 +384,8 @@ describe("toTxResult", () => {
     expect(result.txHash).toBe("TX");
     expect(result.returnValue).toBe("7");
     expect(result.events).toMatchObject([{ event: "voided", receiptId: "R1", logIndex: 0 }]);
+    // The type has the receipt id and the log index too, which consumers deduplicate on.
+    expectTypeOf(result.events).toEqualTypeOf<ReturnType<typeof extractEvents>>();
     expect(result.receipts.map((r) => r.status)).toEqual(["success", "failure", "success"]);
   });
 
