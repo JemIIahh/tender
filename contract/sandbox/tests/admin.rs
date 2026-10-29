@@ -1,4 +1,4 @@
-//! The owner's setters on the built wasm, and `migrate`.
+//! The owner's setters on the built wasm, `migrate`, and a second `new`.
 //!
 //! Each setter first wants exactly 1 yoctoNEAR, which a function-call key cannot attach, then the
 //! owner as the caller. `accept_owner` wants the pending owner instead. The checks run in that
@@ -156,5 +156,36 @@ async fn migrate_is_private_and_keeps_the_state() -> anyhow::Result<()> {
         "migrate changed the stored bytes"
     );
     assert_conserved(&env, &[]).await?;
+    Ok(())
+}
+
+/// A second `new` on a contract that is running, even from the contract account, which
+/// `#[private]` lets through, is refused by near-sdk's init wrapper and changes nothing. The
+/// TypeScript client maps this error by its text, so the text is pinned here word for word.
+#[tokio::test]
+async fn new_on_an_initialised_contract_is_refused() -> anyhow::Result<()> {
+    let env = setup(5).await?;
+    let before = stored(&env).await?;
+    let r = env
+        .tender
+        .call("new")
+        .args_json(json!({
+            "owner": env.alice.id(),
+            "treasury": env.alice.id(),
+            "fee_bps": 0,
+            "min_window_secs": 1,
+        }))
+        .max_gas()
+        .transact()
+        .await?;
+    assert_fails_with(&r, "The contract has already been initialized");
+    assert!(
+        stored(&env).await? == before,
+        "a refused new changed storage"
+    );
+    assert_eq!(
+        view(&env.tender, "get_config", json!({})).await?["owner"],
+        env.owner.id().as_str()
+    );
     Ok(())
 }

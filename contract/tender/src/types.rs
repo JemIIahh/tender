@@ -13,6 +13,10 @@ use near_sdk::{env, near, AccountId, Gas};
 pub const MAX_WINDOW_SECS: u32 = 1_209_600;
 /// Highest protocol fee: 10%.
 pub const MAX_FEE_BPS: u16 = 1_000;
+/// Highest `max_reward` a token may be allowlisted with: about 3.4 * 10^34 of its smallest unit. A
+/// pick multiplies a reward by up to 10_000 basis points, which for any reward up to this fits in
+/// a u128, so every task can be picked.
+pub const MAX_REWARD_LIMIT: u128 = u128::MAX / 10_000;
 /// Most winners one task may pay.
 pub const MAX_WINNERS: u8 = 5;
 /// Most accounts a task may invite.
@@ -72,13 +76,17 @@ pub mod err {
 
 /// Parses a 64-character lowercase hex string into 32 bytes.
 ///
-/// Panics with `E_HASH` on uppercase, a wrong length, or any non-hex character.
-pub(crate) fn parse_hash(s: &str) -> [u8; 32] {
+/// Panics with `E_HASH` on uppercase, a wrong length, or any non-hex character. `field` names the
+/// argument in the message.
+pub(crate) fn parse_hash(field: &str, s: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
     // `hex` accepts uppercase, so the case check is ours; it also rejects a wrong length.
     let lowercase = s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     if !lowercase || hex::decode_to_slice(s, &mut out).is_err() {
-        env::panic_str(&format!("{}: expected 64 lowercase hex chars", err::E_HASH));
+        env::panic_str(&format!(
+            "{}: {field}: expected 64 lowercase hex chars",
+            err::E_HASH
+        ));
     }
     out
 }
@@ -289,6 +297,15 @@ pub struct StorageView {
     pub used_bytes: U64,
 }
 
+/// NEP-145's bounds on a storage balance, as `storage_balance_bounds` returns them, in yoctoNEAR:
+/// `min` is the least a first deposit must be, and `max` is `null` because there is no most.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageBalanceBounds {
+    pub min: U128,
+    pub max: Option<U128>,
+}
+
 /// An amount of one token, as the balance views return it. The amount is a decimal string.
 #[near(serializers = [json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -463,18 +480,21 @@ mod tests {
     #[test]
     fn parse_hash_roundtrip() {
         let h = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
-        assert_eq!(hex32(&parse_hash(h)), h);
+        assert_eq!(hex32(&parse_hash("brief_hash", h)), h);
     }
 
     #[test]
-    #[should_panic(expected = "E_HASH")]
+    #[should_panic(expected = "E_HASH: brief_hash: expected 64 lowercase hex chars")]
     fn parse_hash_rejects_uppercase() {
-        parse_hash("B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9");
+        parse_hash(
+            "brief_hash",
+            "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9",
+        );
     }
 
     #[test]
-    #[should_panic(expected = "E_HASH")]
+    #[should_panic(expected = "E_HASH: salt: expected 64 lowercase hex chars")]
     fn parse_hash_rejects_short() {
-        parse_hash("abcd");
+        parse_hash("salt", "abcd");
     }
 }

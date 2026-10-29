@@ -122,7 +122,7 @@ impl Tender {
                 err::E_INVITE
             ));
         }
-        let commitment = parse_hash(&commitment);
+        let commitment = parse_hash("commitment", &commitment);
         let key = (id, caller.clone());
         let replaced = self.entries.get(&key).is_some();
         if !replaced && task.max_entries > 0 && task.commit_count >= task.max_entries {
@@ -217,8 +217,8 @@ impl Tender {
             ));
         }
         check_uri("uri", &uri);
-        let content_hash = parse_hash(&content_hash);
-        let salt = parse_hash(&salt);
+        let content_hash = parse_hash("content_hash", &content_hash);
+        let salt = parse_hash("salt", &salt);
         if commitment_of(id, &caller, &content_hash, &salt) != entry.commitment {
             env::panic_str(&format!(
                 "{}: content_hash and salt do not match the commitment",
@@ -361,7 +361,7 @@ mod tests {
     /// Adds `deposit` to `who`'s storage balance, registering it if need be.
     fn register(t: &mut Tender, who: &str, deposit: NearToken) {
         testing_env!(ctx(who).attached_deposit(deposit).build());
-        t.storage_deposit(None);
+        t.storage_deposit(None, None);
     }
 
     /// `who` deposits `amount` of USDC, as the token reports it to `ft_on_transfer`.
@@ -828,6 +828,22 @@ mod tests {
     }
 
     #[test]
+    fn an_entrant_under_water_can_replace_its_commitment() {
+        // A rise in the storage price can leave a deposit short of the bytes it already pays for.
+        // A replacement adds no bytes, so it is not refused for that.
+        let mut t = world();
+        let id = post(&mut t, args());
+        enter(&mut t, "bob.test", id, 1);
+        t.storage.get_mut(&acct("bob.test")).unwrap().deposited = 0;
+        let used_before = used(&t, "bob.test");
+
+        let second = commitment(id, "bob.test", 2);
+        try_commit(&mut t, "bob.test", id, T1, HEIGHT + 1, &second).unwrap();
+        assert_eq!(entry(&t, id, "bob.test").commitment, second);
+        assert_eq!(used(&t, "bob.test"), used_before);
+    }
+
+    #[test]
     fn commit_and_reveal_charge_the_caller() {
         let mut t = world();
         register_agent(&mut t, "carol.test");
@@ -1111,22 +1127,32 @@ mod tests {
             String::new(),
         ] {
             let result = try_commit(&mut t, "bob.test", id, T1, HEIGHT, &bad);
-            assert_rejected(result, "E_HASH", &format!("commitment {bad:?}"));
+            assert_eq!(
+                assert_rejected(result, "E_HASH", &format!("commitment {bad:?}")),
+                "E_HASH: commitment: expected 64 lowercase hex chars"
+            );
         }
         assert_eq!(t.get_entry(U64(id), acct("bob.test")), None);
         enter(&mut t, "bob.test", id, 1);
 
         let (content_hash, salt) = work(1);
         let (content_hash, salt) = (hex32(&content_hash), hex32(&salt));
-        for (what, content_hash, salt) in [
+        for (what, field, content_hash, salt) in [
             (
                 "an uppercase content hash",
+                "content_hash",
                 content_hash.to_uppercase(),
                 salt.clone(),
             ),
-            ("a short salt", content_hash.clone(), salt[..62].to_string()),
+            (
+                "a short salt",
+                "salt",
+                content_hash.clone(),
+                salt[..62].to_string(),
+            ),
             (
                 "a salt that is not hex",
+                "salt",
                 content_hash.clone(),
                 format!("g{}", &salt[1..]),
             ),
@@ -1140,7 +1166,10 @@ mod tests {
                 &salt,
                 URI,
             );
-            assert_rejected(result, "E_HASH", what);
+            assert_eq!(
+                assert_rejected(result, "E_HASH", what),
+                format!("E_HASH: {field}: expected 64 lowercase hex chars")
+            );
         }
         try_reveal(
             &mut t,

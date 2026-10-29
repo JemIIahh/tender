@@ -243,14 +243,14 @@ impl World {
             next_seed: 0,
         };
         world.setup(OWNER, NearToken::from_near(1), |t| {
-            t.storage_deposit(None);
+            t.storage_deposit(None, None);
         });
         world.setup(OWNER, ONE_YOCTO, |t| {
             t.set_token(acct(TOKEN), U128(1), U128(MAX_REWARD), true)
         });
         for who in Who::ALL {
             world.setup(who.id(), NearToken::from_near(10), |t| {
-                t.storage_deposit(None);
+                t.storage_deposit(None, None);
             });
             world.balances.insert(who.account(), 0);
         }

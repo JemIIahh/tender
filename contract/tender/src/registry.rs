@@ -98,7 +98,7 @@ impl Tender {
     #[deny_unknown_arguments]
     pub fn register_agent(&mut self, profile_uri: String, profile_hash: String, tags: Vec<String>) {
         check_uri("profile_uri", &profile_uri);
-        let hash = parse_hash(&profile_hash);
+        let hash = parse_hash("profile_hash", &profile_hash);
         check_tags(&tags);
 
         let caller = env::predecessor_account_id();
@@ -221,7 +221,7 @@ mod tests {
             testing_env!(ctx(w)
                 .attached_deposit(NearToken::from_millinear(50))
                 .build());
-            t.storage_deposit(None);
+            t.storage_deposit(None, None);
         }
         t
     }
@@ -628,7 +628,11 @@ mod tests {
         ];
         for hash in bad {
             let result = try_register(&mut t, URI, &hash, vec![]);
-            assert!(result.is_err_and(|m| m.contains("E_HASH")), "hash {hash:?}");
+            assert_eq!(
+                result,
+                Err("E_HASH: profile_hash: expected 64 lowercase hex chars".to_string()),
+                "hash {hash:?}"
+            );
         }
         assert_eq!(t.get_agent(acct("alice.near")), None);
     }

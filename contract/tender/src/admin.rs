@@ -17,7 +17,9 @@
 use near_sdk::json_types::U128;
 use near_sdk::{assert_one_yocto, env, near, AccountId};
 
-use crate::types::{err, ConfigView, TokenConfig, TokenConfigView, MAX_FEE_BPS, MAX_WINDOW_SECS};
+use crate::types::{
+    err, ConfigView, TokenConfig, TokenConfigView, MAX_FEE_BPS, MAX_REWARD_LIMIT, MAX_WINDOW_SECS,
+};
 use crate::{Tender, TenderExt};
 
 #[near]
@@ -48,8 +50,8 @@ impl Tender {
 
     /// Allowlists `token`, or changes the limits and the `enabled` flag of one that is on the
     /// list. A task posted from now on must carry a reward from `min_reward` to `max_reward`, in
-    /// the token's smallest unit, and `1 <= min_reward <= max_reward` (`E_REWARD`), so a task can
-    /// never carry a zero reward.
+    /// the token's smallest unit, and `1 <= min_reward <= max_reward <= MAX_REWARD_LIMIT`
+    /// (`E_REWARD`), so a task can never carry a zero reward, nor one too large to pick.
     ///
     /// Disabling a token refuses new tasks and new deposits in it, and nothing else. Its balances
     /// and the tasks already posted in it are untouched, and `withdraw`, `pick`, `void_task` and
@@ -75,6 +77,13 @@ impl Tender {
                 "{}: the limits must satisfy 1 <= min_reward <= max_reward, got {} and {}",
                 err::E_REWARD,
                 min_reward.0,
+                max_reward.0
+            ));
+        }
+        if max_reward.0 > MAX_REWARD_LIMIT {
+            env::panic_str(&format!(
+                "{}: max_reward {} exceeds the cap of {MAX_REWARD_LIMIT}",
+                err::E_REWARD,
                 max_reward.0
             ));
         }
@@ -345,7 +354,7 @@ mod tests {
     /// Adds `deposit` to `who`'s storage balance, registering it if need be.
     fn register(t: &mut Tender, who: &str, deposit: NearToken) {
         testing_env!(ctx(who).attached_deposit(deposit).build());
-        t.storage_deposit(None);
+        t.storage_deposit(None, None);
     }
 
     /// `who` deposits `amount` of `token`, as the token reports it to `ft_on_transfer`. Returns
@@ -849,8 +858,19 @@ mod tests {
     fn set_token_bounds() {
         let mut t = fresh();
         register(&mut t, OWNER, NearToken::from_near(1));
-        // A reward of zero must be impossible, and so must a range that is empty.
-        for (min, max) in [(0, 0), (0, 10), (0, u128::MAX), (11, 10), (u128::MAX, 1)] {
+        let cap = u128::MAX / 10_000;
+        // A reward of zero must be impossible, and so must a range that is empty, and one that
+        // goes past the cap.
+        for (min, max) in [
+            (0, 0),
+            (0, 10),
+            (0, u128::MAX),
+            (11, 10),
+            (u128::MAX, 1),
+            (1, cap + 1),
+            (1, u128::MAX),
+            (u128::MAX, u128::MAX),
+        ] {
             let result = try_as(&mut t, OWNER, ONE_YOCTO, |t| {
                 t.set_token(acct(USDC), U128(min), U128(max), true)
             });
@@ -859,20 +879,37 @@ mod tests {
         assert!(t.get_config().tokens.is_empty(), "nothing was allowlisted");
         assert!(t.balances_of(acct(TREASURY)).is_empty(), "no slot was made");
 
-        // A single reward, and any range from 1 up, is fine.
-        for (min, max) in [
-            (1, 1),
-            (1, u128::MAX),
-            (7, 7),
-            (10, 20),
-            (u128::MAX, u128::MAX),
-        ] {
+        // A single reward, and any range from 1 up to the cap, is fine.
+        for (min, max) in [(1, 1), (1, cap), (7, 7), (10, 20), (cap, cap)] {
             as_owner(&mut t, |t| {
                 t.set_token(acct(USDC), U128(min), U128(max), true)
             });
             let token = &t.get_config().tokens[0];
             assert_eq!((token.min_reward.0, token.max_reward.0), (min, max));
         }
+    }
+
+    #[test]
+    fn set_token_caps_max_reward() {
+        // A pick multiplies a reward by up to 10_000 basis points. A reward above u128::MAX /
+        // 10_000 could then only be voided (`E_REWARD` at the pick), so no token takes one.
+        let mut t = fresh();
+        register(&mut t, OWNER, NearToken::from_near(1));
+        let cap = u128::MAX / 10_000;
+        let result = try_as(&mut t, OWNER, ONE_YOCTO, |t| {
+            t.set_token(acct(USDC), U128(1), U128(cap + 1), true)
+        });
+        assert_eq!(
+            assert_rejected(result, "E_REWARD", "one above the cap"),
+            format!("E_REWARD: max_reward {} exceeds the cap of {cap}", cap + 1)
+        );
+        assert!(t.get_config().tokens.is_empty(), "nothing was allowlisted");
+
+        // The cap itself is allowed.
+        as_owner(&mut t, |t| {
+            t.set_token(acct(USDC), U128(1), U128(cap), true)
+        });
+        assert_eq!(t.get_config().tokens[0].max_reward, U128(cap));
     }
 
     // set_fee.
@@ -1260,7 +1297,7 @@ mod tests {
             t.set_token(acct(DAI), U128(1), U128(1_000), false)
         });
         as_owner(&mut t, |t| {
-            t.set_token(acct("wnear.test"), U128(1), U128(u128::MAX), true)
+            t.set_token(acct("wnear.test"), U128(1), U128(u128::MAX / 10_000), true)
         });
         // Setting a token again changes it where it stands. It is not listed twice or moved.
         as_owner(&mut t, |t| {
@@ -1281,7 +1318,7 @@ mod tests {
                 {
                     "token": "wnear.test",
                     "min_reward": "1",
-                    "max_reward": u128::MAX.to_string(),
+                    "max_reward": (u128::MAX / 10_000).to_string(),
                     "enabled": true
                 },
             ])
