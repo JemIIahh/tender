@@ -3,3 +3,19 @@ name = "tender_sandbox"
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+# Runs the built wasm in res/ on a local nearcore node. It does not depend on the tender crate, so
+# the tests exercise the same bytes that get deployed and an off-chain client's view of the API.
+# Build res/ first with ../build.sh.
+#
+# near-workspaces' build script downloads the nearcore sandbox unless NEAR_SANDBOX_BIN_PATH is set
+# (CI lets it download; locally set the variable to a binary you have verified).
+[dev-dependencies]
+near-workspaces = "=0.23.0"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde_json = "1"
+# The commitment preimage is hashed off-chain with the same encoding as the contract's
+# `commitment_of`: SHA-256 of the Borsh encoding of (task id, account, content hash, salt).
+borsh = "=1.8.1"
+sha2 = "=0.10.9"

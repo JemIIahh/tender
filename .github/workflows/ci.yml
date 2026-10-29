@@ -16,3 +16,43 @@ jobs:
       - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Builds both contracts and runs every test, the sandbox suites included. The sandbox tests deploy
+  # the wasm that build.sh has just built, and near-workspaces downloads nearcore's sandbox node
+  # while it compiles.
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: contract
+    steps:
+      - uses: actions/checkout@v6
+      # rust-toolchain.toml pins Rust 1.96.0 with the wasm32 target, rustfmt and clippy. Rustup 1.28
+      # and later install the pinned toolchain only when asked to, so ask.
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+      # cargo-near 0.22.0, from its release tarball, checked against a checksum pinned here. The
+      # checksum is the one on the release (cargo-near-x86_64-unknown-linux-gnu.tar.gz.sha256).
+      - name: Install cargo-near 0.22.0
+        env:
+          CARGO_NEAR_SHA256: 9429064e30a427e96523f539cb255f3688d2345e5000d7d4e4873a8247247d1a
+        run: |
+          set -euo pipefail
+          archive=cargo-near-x86_64-unknown-linux-gnu.tar.gz
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/near/cargo-near/releases/download/cargo-near-v0.22.0/$archive"
+          echo "$CARGO_NEAR_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/cargo-near"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/cargo-near"
+          mkdir -p "$HOME/.cargo/bin"
+          install -m 755 "$(find "$RUNNER_TEMP/cargo-near" -type f -name cargo-near | head -n 1)" "$HOME/.cargo/bin/cargo-near"
+          cargo near --version
+      # The wasm is built here, not taken from contract/res, so the bytes differ from the build that
+      # was committed there. Nothing compares them.
+      - name: Build the wasm
+        run: ./build.sh
+      - name: Test
+        run: cargo test --workspace
