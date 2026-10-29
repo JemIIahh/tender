@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "vitest run",
-    "typecheck": "pnpm -r exec tsc --noEmit",
+    "typecheck": "tsc --noEmit -p . && pnpm -r exec tsc --noEmit",
     "lint": "biome check .",
     "skeleton": "tsx scripts/skeleton.ts",
     "demo:local": "tsx scripts/demo-local.ts",
