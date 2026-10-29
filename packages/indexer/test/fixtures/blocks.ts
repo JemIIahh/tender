@@ -212,7 +212,10 @@ export function lifecycleBlocks(): IndexedBlock[] {
   ];
 }
 
-/** Stores the blobs the lifecycle points at: the brief of task 1 and alice's profile. */
+/**
+ * Stores the blobs the lifecycle points at: the brief of task 1, as a public blob of kind `brief`,
+ * and alice's profile, as a public blob of kind `profile`. The indexer reads no others.
+ */
 export async function putFixtureBlobs(db: Db): Promise<void> {
   await putBlob(db, {
     kind: "brief",

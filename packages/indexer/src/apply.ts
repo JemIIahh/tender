@@ -1,4 +1,4 @@
-import { type Db, getBlob } from "@tender/db";
+import { type BlobKind, type Db, getBlob } from "@tender/db";
 import { BriefSchema, extractEvents, ProfileSchema, type TenderEvent } from "@tender/shared";
 import type { IndexedBlock } from "./types";
 
@@ -148,10 +148,19 @@ function withoutNul<T>(value: T): T {
   return value;
 }
 
-/** The JSON document stored under `sha256`, or null if no blob is stored there or it is not JSON. */
-async function readJsonBlob(db: Db, sha256: string): Promise<unknown> {
+/**
+ * The JSON document in the blob stored under `sha256`, if that blob was stored public and as a
+ * blob of `kind`. A blob of another kind, a private one, a missing one and one that is not JSON all
+ * count as absent, and give null.
+ *
+ * The hash is read from the chain, where whoever posted the task or registered the agent chose it.
+ * It can name any blob in the store: a private one, such as another task's held-out document (whose
+ * hash may be public through its `heldout_commitment`), too. What is read here reaches a public
+ * row, so only a blob that was stored to be public, as a brief or as a profile, may be.
+ */
+async function readPublicJsonBlob(db: Db, sha256: string, kind: BlobKind): Promise<unknown> {
   const blob = await getBlob(db, sha256);
-  if (blob === null) return null;
+  if (blob === null || blob.kind !== kind || !blob.isPublic) return null;
   try {
     return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(blob.bytes));
   } catch {
@@ -174,9 +183,9 @@ async function taskRow(db: Db, taskId: string): Promise<TaskRow | undefined> {
 }
 
 async function taskCreated(db: Db, d: Data<"task_created">, height: bigint): Promise<void> {
-  // The brief tells the title, the category and the tags. They are filled only from a stored blob
-  // that is a valid brief; the task is indexed all the same when there is none.
-  const parsed = BriefSchema.safeParse(await readJsonBlob(db, d.brief_hash));
+  // The brief tells the title, the category and the tags. They are filled only from a public blob
+  // of kind brief that is a valid brief; the task is indexed all the same when there is none.
+  const parsed = BriefSchema.safeParse(await readPublicJsonBlob(db, d.brief_hash, "brief"));
   const brief = parsed.success ? parsed.data : null;
   const created = await db.query(
     `insert into tasks (
@@ -327,7 +336,8 @@ async function agentRegistered(
   height: bigint,
   opts: ApplyOptions,
 ): Promise<void> {
-  const profile = ProfileSchema.safeParse(await readJsonBlob(db, d.profile_hash));
+  // The name comes only from a public blob of kind profile that is a valid profile.
+  const profile = ProfileSchema.safeParse(await readPublicJsonBlob(db, d.profile_hash, "profile"));
   const name = profile.success ? withoutNul(profile.data.name) : null;
   const isTeam =
     opts.teamAccounts.includes(d.account) || (d.asp !== null && opts.teamAccounts.includes(d.asp));

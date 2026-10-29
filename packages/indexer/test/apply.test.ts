@@ -1,4 +1,4 @@
-import { type Db, migrate, openDb, putBlob } from "@tender/db";
+import { type BlobKind, type Db, migrate, openDb, putBlob } from "@tender/db";
 import { canonicalJson, sha256Hex } from "@tender/shared";
 import { afterAll, beforeAll, beforeEach, expect, test } from "vitest";
 import { applyBlock, type IndexedBlock } from "../src/index";
@@ -379,6 +379,12 @@ test("cursor_moves_forward_only", async () => {
 
 test("brief_fields_filled_when_blob_present", async () => {
   await putFixtureBlobs(db);
+  // The fixture helpers store the brief and the profile as public blobs of their own kinds, which
+  // is what the indexer reads (see brief_blob_must_be_a_public_brief).
+  expect(await rows("select kind, is_public from blobs order by kind")).toEqual([
+    { kind: "brief", is_public: true },
+    { kind: "profile", is_public: true },
+  ]);
   await apply(eventLine("task_created", { brief_hash: FIXTURE_BRIEF_HASH }));
 
   expect(await taskOf("1")).toMatchObject({
@@ -427,6 +433,66 @@ test("agent_name_only_from_a_valid_profile_blob", async () => {
   expect((await agentOf(alice))?.name).toBe(FIXTURE_PROFILE.name);
   expect((await agentOf(bob))?.name).toBeNull();
   expect((await agentOf(judge))?.name).toBeNull();
+});
+
+// The hash of a brief or a profile is chosen on chain by whoever posts the task or registers the
+// agent, so it can name any blob in the store, a private one included: the hash of another task's
+// held-out document may even be public, through its heldout_commitment. Only a blob stored as a
+// public brief (or a public profile) may fill a public row; any other counts as absent. Each
+// document below differs from the others in one field, so that each has a hash of its own (blobs
+// are addressed by their content), and each is valid for its schema, so that only the guard can
+// leave a field empty. The last one is the control: it is read.
+
+test("brief_blob_must_be_a_public_brief", async () => {
+  const store = (title: string, kind: BlobKind, isPublic: boolean) =>
+    putBlob(db, {
+      kind,
+      contentType: "application/json",
+      bytes: canonicalJson({ ...FIXTURE_BRIEF, title }),
+      isPublic,
+    });
+  const hashes = [
+    await store("A private brief", "brief", false),
+    await store("A public held-out document", "heldout", true),
+    await store("A private held-out document", "heldout", false),
+    await store("A public brief", "brief", true),
+  ];
+
+  await apply(
+    ...hashes.map((brief_hash, i) => eventLine("task_created", { id: String(i + 1), brief_hash })),
+  );
+
+  for (const id of ["1", "2", "3"]) {
+    expect(await taskOf(id), id).toMatchObject({ title: null, category: null, tags: [] });
+  }
+  expect(await taskOf("4")).toMatchObject({
+    title: "A public brief",
+    category: FIXTURE_BRIEF.category,
+    tags: FIXTURE_BRIEF.tags,
+  });
+});
+
+test("profile_blob_must_be_a_public_profile", async () => {
+  const store = (name: string, kind: BlobKind, isPublic: boolean) =>
+    putBlob(db, {
+      kind,
+      contentType: "application/json",
+      bytes: canonicalJson({ ...FIXTURE_PROFILE, name }),
+      isPublic,
+    });
+  const registrations = [
+    { account: alice, profile_hash: await store("A private profile", "profile", false) },
+    { account: bob, profile_hash: await store("A public result", "result", true) },
+    { account: carol, profile_hash: await store("A private result", "result", false) },
+    { account: judge, profile_hash: await store("A public profile", "profile", true) },
+  ];
+
+  await apply(...registrations.map((fields) => eventLine("agent_registered", fields)));
+
+  for (const account of [alice, bob, carol]) {
+    expect((await agentOf(account))?.name, account).toBeNull();
+  }
+  expect((await agentOf(judge))?.name).toBe("A public profile");
 });
 
 // ---- Agents -----------------------------------------------------------------------------------
