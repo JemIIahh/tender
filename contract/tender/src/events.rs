@@ -53,6 +53,20 @@ pub(crate) struct Withdraw {
     pub to: AccountId,
 }
 
+/// Data of `agent_registered`: `account` created its profile (`updated: false`) or replaced it
+/// (`updated: true`). `asp` is `null` when the account has none, and `profile_hash` is 64
+/// lowercase hex characters.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct AgentRegistered {
+    pub account: AccountId,
+    pub asp: Option<AccountId>,
+    pub profile_uri: String,
+    pub profile_hash: String,
+    pub tags: Vec<String>,
+    pub updated: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use near_sdk::serde;

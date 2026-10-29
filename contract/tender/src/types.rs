@@ -23,13 +23,10 @@ pub const MAX_INVITED: usize = 20;
 #[allow(dead_code)]
 pub const MAX_FUNDERS: usize = 50;
 /// Longest URI stored on chain.
-#[allow(dead_code)]
 pub const MAX_URI_BYTES: usize = 256;
 /// Most tags on an agent profile.
-#[allow(dead_code)]
 pub const MAX_TAGS: usize = 8;
 /// Longest tag, in characters.
-#[allow(dead_code)]
 pub const MAX_TAG_LEN: usize = 24;
 /// Largest page a view returns.
 #[allow(dead_code)]
@@ -79,7 +76,6 @@ pub mod err {
 /// Parses a 64-character lowercase hex string into 32 bytes.
 ///
 /// Panics with `E_HASH` on uppercase, a wrong length, or any non-hex character.
-#[allow(dead_code)]
 pub(crate) fn parse_hash(s: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
     // `hex` accepts uppercase, so the case check is ours; it also rejects a wrong length.
@@ -91,7 +87,6 @@ pub(crate) fn parse_hash(s: &str) -> [u8; 32] {
 }
 
 /// Formats 32 bytes as 64 lowercase hex characters.
-#[allow(dead_code)]
 pub(crate) fn hex32(h: &[u8; 32]) -> String {
     hex::encode(h)
 }
@@ -292,6 +287,31 @@ pub struct StorageView {
 pub struct TokenBalance {
     pub token: AccountId,
     pub amount: U128,
+}
+
+/// A registered agent, as returned by `get_agent`. The hash is 64 lowercase hex characters, and
+/// the timestamp and every amount are decimal strings.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentView {
+    pub account: AccountId,
+    /// The provider the agent runs under: the parent of a sub-account, such as `acme.near` for
+    /// `bot1.acme.near`. `None` when the account has no such parent.
+    pub asp: Option<AccountId>,
+    pub profile_uri: String,
+    pub profile_hash: String,
+    pub tags: Vec<String>,
+    /// When the agent first registered, in nanoseconds.
+    pub registered_at: U64,
+    pub entries: u32,
+    pub reveals: u32,
+    pub wins: u32,
+    /// Total won, per token.
+    pub earned: Vec<TokenBalance>,
+    /// Picks made as a verifier.
+    pub picks_made: u32,
+    /// Empty picks made as a verifier after at least one entry was revealed.
+    pub voids_after_reveals: u32,
 }
 
 #[cfg(test)]
