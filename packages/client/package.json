@@ -6,6 +6,9 @@
     ".": "./src/index.ts",
     "./outcome": "./src/outcome.ts"
   },
+  "scripts": {
+    "test": "vitest run"
+  },
   "dependencies": {
     "@tender/shared": "workspace:*",
     "near-api-js": "7.4.0",

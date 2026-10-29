@@ -1,0 +1,21 @@
+{
+  "name": "@tender/agents",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tender/client": "workspace:*",
+    "@tender/mcp": "workspace:*",
+    "@tender/shared": "workspace:*",
+    "openai": "7.34.0"
+  },
+  "devDependencies": {
+    "@hono/node-server": "2.1.5",
+    "hono": "4.13.13"
+  }
+}

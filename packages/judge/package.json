@@ -1,0 +1,20 @@
+{
+  "name": "@tender/judge",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tender/client": "workspace:*",
+    "@tender/db": "workspace:*",
+    "@tender/shared": "workspace:*",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "openai": "7.34.0",
+    "quickjs-emscripten": "0.32.0"
+  }
+}

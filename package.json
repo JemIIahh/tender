@@ -19,9 +19,17 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.6.4",
+    "@tender/agents": "workspace:*",
+    "@tender/api": "workspace:*",
     "@tender/client": "workspace:*",
+    "@tender/db": "workspace:*",
+    "@tender/indexer": "workspace:*",
+    "@tender/judge": "workspace:*",
+    "@tender/mcp": "workspace:*",
     "@tender/shared": "workspace:*",
+    "@tender/telegram": "workspace:*",
     "@types/node": "24.19.2",
+    "near-api-js": "7.4.0",
     "tsx": "4.23.15",
     "typescript": "7.0.2",
     "vitest": "5.0.5"

@@ -4,6 +4,8 @@ import { defineConfig } from "vitest/config";
 // tests and for hooks such as beforeAll(startLocalChain).
 export default defineConfig({
   test: {
+    // Lets `pnpm -r test` pass while the package has no tests yet.
+    passWithNoTests: true,
     projects: [
       {
         test: {
