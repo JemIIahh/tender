@@ -1,7 +1,8 @@
 //! NEP-297 event logging.
 
+use near_sdk::json_types::U128;
 use near_sdk::serde::Serialize;
-use near_sdk::{env, serde_json};
+use near_sdk::{env, serde_json, AccountId};
 
 const STANDARD: &str = "tender";
 const VERSION: &str = "1.0.0";
@@ -11,14 +12,22 @@ const VERSION: &str = "1.0.0";
 /// The envelope is built with `format!` and only `data` goes through serde, so the fields of an
 /// event struct keep their declared order in the log (`serde_json::json!` would sort the keys).
 /// `event` is a fixed name chosen by the caller and is not escaped.
-// No caller outside the tests yet; the allow comes off with the first one.
-#[allow(dead_code)]
 pub(crate) fn emit<T: Serialize>(event: &str, data: &T) {
     let data = serde_json::to_string(data)
         .unwrap_or_else(|e| env::panic_str(&format!("event {event} did not serialize: {e}")));
     env::log_str(&format!(
         r#"EVENT_JSON:{{"standard":"{STANDARD}","version":"{VERSION}","event":"{event}","data":[{data}]}}"#
     ));
+}
+
+/// Data of `storage_deposit`: `account` was credited `amount` and now holds `total` in all
+/// (yoctoNEAR, as strings).
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct StorageDeposit {
+    pub account: AccountId,
+    pub amount: U128,
+    pub total: U128,
 }
 
 #[cfg(test)]

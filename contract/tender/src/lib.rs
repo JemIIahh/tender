@@ -6,6 +6,7 @@
 
 mod admin;
 mod events;
+mod storage;
 #[cfg(test)]
 mod test_utils;
 mod types;

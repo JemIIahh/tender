@@ -6,7 +6,7 @@
 //! An item marked `#[allow(dead_code)]` has no caller yet; the attribute comes off with the first
 //! one.
 
-use near_sdk::json_types::U128;
+use near_sdk::json_types::{U128, U64};
 use near_sdk::{env, near, AccountId, Gas};
 
 /// Longest any of the four task windows may be: 14 days.
@@ -35,7 +35,6 @@ pub const MAX_TAG_LEN: usize = 24;
 #[allow(dead_code)]
 pub const MAX_PAGE: u32 = 50;
 /// Smallest first storage deposit: 0.01 NEAR.
-#[allow(dead_code)]
 pub const STORAGE_MIN_DEPOSIT: u128 = 10u128.pow(22);
 /// Upper bound on the bytes one vault slot occupies.
 #[allow(dead_code)]
@@ -277,6 +276,18 @@ pub struct ConfigView {
     pub paused: bool,
     pub version: u16,
     pub tokens: Vec<TokenConfigView>,
+}
+
+/// An account's storage balance, as returned by the storage methods. All amounts are yoctoNEAR.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageView {
+    /// Everything the account has deposited and not withdrawn.
+    pub total: U128,
+    /// What it could withdraw now: `total` minus the cost of `used_bytes`.
+    pub available: U128,
+    /// Bytes of contract state charged to the account.
+    pub used_bytes: U64,
 }
 
 #[cfg(test)]
