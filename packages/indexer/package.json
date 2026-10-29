@@ -1,0 +1,18 @@
+{
+  "name": "@tender/indexer",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./test/fixtures/blocks.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tender/client": "workspace:*",
+    "@tender/db": "workspace:*",
+    "@tender/shared": "workspace:*",
+    "near-api-js": "7.4.0"
+  }
+}

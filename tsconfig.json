@@ -5,6 +5,7 @@
   },
   "include": [
     "scripts/**/*.ts",
+    "seeds/**/*.ts",
     "vitest.config.ts",
     "packages/shared/test/**/*.ts",
     "packages/shared/vitest.config.ts"

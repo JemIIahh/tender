@@ -1,0 +1,21 @@
+{
+  "name": "@tender/mcp",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "tender-mcp": "./bin/tender-mcp.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@tender/client": "workspace:*",
+    "@tender/shared": "workspace:*",
+    "near-api-js": "7.4.0",
+    "zod": "4.6.7"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "@tender/telegram",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@grammyjs/auto-retry": "2.0.2",
+    "@grammyjs/transformer-throttler": "1.2.1",
+    "@tender/db": "workspace:*",
+    "@tender/shared": "workspace:*",
+    "grammy": "1.46.0"
+  },
+  "devDependencies": {
+    "@tender/indexer": "workspace:*"
+  }
+}
