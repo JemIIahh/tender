@@ -4,6 +4,8 @@ export default defineConfig({
   test: {
     projects: [
       "packages/*",
+      // The web app's unit tests (jsdom). Its Playwright specs run separately, with the e2e script.
+      "apps/web",
       // Tests of the root scripts. Most of them start a local chain, so every one gets long
       // timeouts for the tests and for hooks such as beforeAll(startLocalChain).
       {
