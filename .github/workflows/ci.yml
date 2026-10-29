@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+# The jobs only read the repository. A job that needs more asks for it in its own permissions.
+permissions:
+  contents: read
+
 jobs:
   secrets:
     runs-on: ubuntu-latest
