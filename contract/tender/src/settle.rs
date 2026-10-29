@@ -1,5 +1,5 @@
 //! Settling a task: the pick that pays its winners, the empty pick and the void that refund its
-//! funders, and the payout math.
+//! funders, the payout math, and the cleanup that deletes a settled task's entries.
 //!
 //! A task settles once, by one of these, and its reward leaves the escrow in that call:
 //! - `pick` with winners pays the protocol fee to the treasury, then splits the rest between up
@@ -12,6 +12,10 @@
 //! vault slot that already exists: a funder's, which it paid from; a winner's, made when it
 //! committed; the treasury's, made when its token was allowlisted. The only record that grows is
 //! the task's, by its outcome, and the poster reserved the bytes for that when it posted.
+//!
+//! Once a task is settled, `cleanup` deletes its entries in bounded batches and gives each
+//! entrant back the storage its entry used. Anyone may call it, so the storage never stays
+//! charged for good. The task's record and every payout slot are kept.
 
 use near_sdk::json_types::{U128, U64};
 use near_sdk::{env, near, AccountId};
@@ -20,7 +24,7 @@ use crate::events::{emit, Refund, TaskPicked, TaskVoided};
 use crate::tasks::{no_task, phase};
 use crate::types::{
     check_uri, err, hex32, parse_hash, Outcome, Payout, PayoutView, Phase, Task, VoidReason,
-    WinnerArg, OUTCOME_RESERVE_BYTES,
+    WinnerArg, MAX_PAGE, OUTCOME_RESERVE_BYTES,
 };
 use crate::{Tender, TenderExt};
 
@@ -210,6 +214,70 @@ impl Tender {
         };
         self.void(task, reason, None, None);
     }
+
+    /// Deletes the next `limit` entries of settled task `task_id`, and gives each entrant back
+    /// the storage its entry used. Anyone may call it, so the storage never stays charged for
+    /// good, and the keeper runs it. Returns how many entries the call went through, which is 0
+    /// once the task has none left.
+    ///
+    /// The rules, checked in this order, each with its error code:
+    /// - the task exists (`E_NOT_FOUND`);
+    /// - it is settled, by a pick or a void (`E_PHASE`);
+    /// - `limit` is 1 to 50 (`E_LIMIT`).
+    ///
+    /// The task counts the entries gone through in `cleaned`. A call takes the indices of the
+    /// entrant order from there, `limit` of them or the rest if fewer are left, and adds their
+    /// number to `cleaned`. For each index it removes the entry, revealed or not, and its place
+    /// in the entrant order, and credits that entrant's storage balance with exactly the bytes
+    /// the two records freed and no one else's. An index whose place is gone already is skipped,
+    /// and counts all the same.
+    ///
+    /// The task's record is kept, with its outcome, and so is every vault slot and every `earned`
+    /// slot: the slots an entrant got when it committed stay charged to it, and a winner's payout
+    /// stays where `pick` put it. Emits nothing.
+    ///
+    /// Cleanups work while the contract is paused, and attach no deposit, so a function-call key
+    /// can send them.
+    #[deny_unknown_arguments]
+    pub fn cleanup(&mut self, task_id: U64, limit: u32) -> u32 {
+        let id = task_id.0;
+        let task = self.tasks.get(&id).unwrap_or_else(|| no_task(id));
+        if task.outcome.is_none() {
+            env::panic_str(&format!("{}: not settled", err::E_PHASE));
+        }
+        if !(1..=MAX_PAGE).contains(&limit) {
+            env::panic_str(&format!(
+                "{}: limit must be 1 to {MAX_PAGE}, got {limit}",
+                err::E_LIMIT
+            ));
+        }
+
+        // Every rule has been checked. With no entry left, the call ends here and writes nothing.
+        let first = task.cleaned;
+        let end = first.saturating_add(limit).min(task.commit_count);
+        if end <= first {
+            return 0;
+        }
+        for index in first..end {
+            // One storage window per entrant, so that each is refunded the bytes its own records
+            // free and no more. The collections defer their removes, and `storage_mark` and
+            // `settle_storage` flush them, which is what lets the window see them.
+            let before = self.storage_mark();
+            // A place that is gone leaves nothing to remove and nobody to refund.
+            let Some(account) = self.entrant_at.get(&(id, index)).cloned() else {
+                continue;
+            };
+            self.entrant_at.remove(&(id, index));
+            self.entries.remove(&(id, account.clone()));
+            // Removing frees bytes, so this only refunds and cannot fail: the entrant had a
+            // storage balance when it committed, and a balance is never deleted.
+            self.settle_storage(&account, before);
+        }
+        let n = end - first;
+        let task = self.tasks.get_mut(&id).unwrap_or_else(|| no_task(id));
+        task.cleaned += n;
+        n
+    }
 }
 
 impl Tender {
@@ -361,8 +429,8 @@ mod tests {
     use crate::entries::commitment_of;
     use crate::test_utils::{ctx, fresh, panic_message};
     use crate::types::{
-        hex32, AgentView, Outcome, OutcomeView, PayoutView, Phase, PostTaskArgs, TokenBalance,
-        TokenConfig, VoidReason, WinnerArg, MAX_URI_BYTES, OUTCOME_RESERVE_BYTES,
+        hex32, AgentView, Outcome, OutcomeView, PayoutView, Phase, PostTaskArgs, Task,
+        TokenBalance, TokenConfig, VoidReason, WinnerArg, MAX_URI_BYTES, OUTCOME_RESERVE_BYTES,
     };
     use crate::Tender;
 
@@ -1652,6 +1720,545 @@ mod tests {
             alter(&mut input);
             let message = parse_pick(&input).unwrap_err();
             assert!(message.contains(expected), "{what}: {message}");
+        }
+    }
+
+    // Cleanup.
+
+    /// `who` cleans up task `id` with `limit` at `now`. `Err` holds the message the contract
+    /// panicked with, and `Ok` the number of entries the call went through.
+    fn try_cleanup(
+        t: &mut Tender,
+        who: &str,
+        id: u64,
+        now: u64,
+        limit: u32,
+    ) -> Result<u32, String> {
+        testing_env!(ctx(who).block_timestamp(now).build());
+        let mut n = 0;
+        match panic_message(|| n = t.cleanup(U64(id), limit)) {
+            Some(message) => Err(message),
+            None => Ok(n),
+        }
+    }
+
+    /// The keeper cleans up task `id` with `limit`, after the task's last deadline. Returns how
+    /// many entries the call went through.
+    fn clean(t: &mut Tender, id: u64, limit: u32) -> u32 {
+        try_cleanup(t, KEEPER, id, FALLBACK_DEADLINE, limit)
+            .unwrap_or_else(|m| panic!("a cleanup of task {id} was rejected: {m}"))
+    }
+
+    /// How many entries of task `id` `cleanup` has gone through.
+    fn cleaned(t: &Tender, id: u64) -> u32 {
+        t.get_task(U64(id)).expect("the task exists").cleaned
+    }
+
+    /// The `(index, account)` of each entry of task `id` that `get_entries` shows from
+    /// `from_index` on, up to one page.
+    fn remaining(t: &Tender, id: u64, from_index: u32) -> Vec<(u32, String)> {
+        t.get_entries(U64(id), from_index, 50)
+            .into_iter()
+            .map(|e| (e.index, e.account.to_string()))
+            .collect()
+    }
+
+    /// The storage charged to alice and to each of `AGENTS`, in that order.
+    fn charged(t: &Tender) -> Vec<u64> {
+        ["alice.test"]
+            .into_iter()
+            .chain(AGENTS)
+            .map(|who| used(t, who))
+            .collect()
+    }
+
+    /// The bytes of the payout slots that a first commit in USDC makes for `who`, a registered
+    /// agent if `agent`. They stay after `cleanup`, and stay charged. Each record costs 40 bytes
+    /// of overhead plus its key and value; a key starts with a 1-byte prefix, and an account id
+    /// is a 4-byte length and its bytes.
+    fn slot_bytes(who: &str, agent: bool) -> u64 {
+        let account = 4 + who.len() as u64;
+        // The vault slot is keyed by the account and the token, and holds a u128.
+        let vault_slot = 40 + (1 + account + 4 + USDC.len() as u64) + 16;
+        // The `earned` slot is a `(token, u128)` pushed onto the agent's profile.
+        let earned_slot = if agent { 4 + USDC.len() as u64 + 16 } else { 0 };
+        vault_slot + earned_slot
+    }
+
+    /// The bytes that `cleanup` frees for `who`: its entry in a task, revealed at `uri` if it
+    /// was revealed, and the entry's place in the task's entrant order.
+    fn entry_bytes(who: &str, revealed: Option<&str>) -> u64 {
+        let account = 4 + who.len() as u64;
+        // The entry is keyed by the task id and the account. It holds the commitment, the index,
+        // the block and `revealed`: a 1-byte tag, then for a revealed entry the content hash and
+        // the uri behind its 4-byte length.
+        let work = revealed.map_or(0, |uri| 32 + 4 + uri.len() as u64);
+        let entry = 40 + (1 + 8 + account) + (32 + 4 + 8 + 1 + work);
+        // The place is keyed by the task id and the index, and holds the account.
+        let place = 40 + (1 + 8 + 4) + account;
+        entry + place
+    }
+
+    #[test]
+    fn cleanup_requires_settled() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        revealed(&mut t, id, &["bob.test"]);
+        // Whatever the block time, a task without an outcome is not cleaned: not while it is open,
+        // not in any of its windows, and not once the last of them is over, when anyone may void
+        // the task but nobody has.
+        for (what, now) in [
+            ("open", T1),
+            ("in the reveal window", COMMIT_DEADLINE),
+            ("in the verifier's window", REVEAL_DEADLINE),
+            ("in the poster's window", PICK_DEADLINE),
+            ("expired", FALLBACK_DEADLINE),
+            ("expired for good", u64::MAX),
+        ] {
+            let result = try_cleanup(&mut t, KEEPER, id, now, 50).map(|_| ());
+            let message = assert_rejected(result, "E_PHASE", what);
+            assert_eq!(message, "E_PHASE: not settled");
+        }
+        // Nothing moved.
+        assert!(t.get_entry(U64(id), acct("bob.test")).is_some());
+        assert_eq!(cleaned(&t, id), 0);
+        // Once the task settles, the same call goes through.
+        try_pick(&mut t, JUDGE, id, REVEAL_DEADLINE, &[("bob.test", 10_000)]).unwrap();
+        assert_eq!(try_cleanup(&mut t, KEEPER, id, REVEAL_DEADLINE, 50), Ok(1));
+        assert_eq!(t.get_entry(U64(id), acct("bob.test")), None);
+    }
+
+    #[test]
+    fn cleanup_in_batches_refunds_each_entrant() {
+        let mut t = world();
+        // carol is a registered agent, so her first commit gave her an `earned` slot beside her
+        // vault slot. bob and dave are not, and got a vault slot only.
+        register_agent(&mut t, "carol.test");
+        let crowd = [
+            ("bob.test", false),
+            ("carol.test", true),
+            ("dave.test", false),
+        ];
+        let names = crowd.map(|(who, _)| who);
+        // What each is charged before it enters anything.
+        let start = names.map(|who| used(&t, who));
+        let id = post(&mut t, args());
+        revealed(&mut t, id, &names);
+        try_pick(
+            &mut t,
+            JUDGE,
+            id,
+            REVEAL_DEADLINE,
+            &[("bob.test", 6_000), ("carol.test", 4_000)],
+        )
+        .unwrap();
+        // The premise: each is charged for its entry, the entry's place in the entrant order and
+        // the payout slots that its first commit made.
+        for (i, (who, agent)) in crowd.into_iter().enumerate() {
+            assert_eq!(
+                used(&t, who),
+                start[i] + slot_bytes(who, agent) + entry_bytes(who, Some(URI)),
+                "{who}"
+            );
+        }
+        let settled = names.map(|who| used(&t, who));
+        let (alice_used, paid) = (used(&t, "alice.test"), money(&t));
+
+        // A batch of 2 goes through bob and carol, the first two entrants, and frees exactly
+        // their entries and places. It says nothing.
+        testing_env!(ctx(KEEPER).block_timestamp(FALLBACK_DEADLINE).build());
+        let usage = t.storage_mark();
+        assert_eq!(t.cleanup(U64(id), 2), 2);
+        assert_eq!(
+            usage - t.storage_mark(),
+            entry_bytes("bob.test", Some(URI)) + entry_bytes("carol.test", Some(URI))
+        );
+        assert!(get_logs().is_empty(), "cleanup emits no event");
+        // The two are back where they were before they committed, plus the payout slots, which
+        // stay. dave is charged for his entry still, and it is still there.
+        assert_eq!(
+            used(&t, "bob.test"),
+            start[0] + slot_bytes("bob.test", false)
+        );
+        assert_eq!(
+            used(&t, "carol.test"),
+            start[1] + slot_bytes("carol.test", true)
+        );
+        assert_eq!(used(&t, "dave.test"), settled[2]);
+        for who in ["bob.test", "carol.test"] {
+            assert_eq!(t.get_entry(U64(id), acct(who)), None, "{who}");
+        }
+        assert!(t.get_entry(U64(id), acct("dave.test")).is_some());
+        assert_eq!(remaining(&t, id, 0), [(2, "dave.test".to_string())]);
+        assert_eq!(cleaned(&t, id), 2);
+
+        // The next batch of 2 finds only dave.
+        assert_eq!(clean(&mut t, id, 2), 1);
+        assert_eq!(
+            used(&t, "dave.test"),
+            start[2] + slot_bytes("dave.test", false)
+        );
+        assert_eq!(t.get_entry(U64(id), acct("dave.test")), None);
+        assert!(remaining(&t, id, 0).is_empty());
+        assert_eq!(cleaned(&t, id), 3);
+        // And nothing is left after that.
+        assert_eq!(clean(&mut t, id, 2), 0);
+        assert_eq!(cleaned(&t, id), 3);
+
+        // Only the entrants' storage changed: the poster's did not, the keeper never had any, and
+        // no money moved, since the payouts sit in the vault slots that cleanup leaves alone.
+        assert_eq!(used(&t, "alice.test"), alice_used);
+        assert_eq!(t.storage_balance_of(acct(KEEPER)), None);
+        assert_eq!(money(&t), paid);
+        assert_eq!(agent(&t, "carol.test").earned, usdc(380_000));
+        let v = t.get_task(U64(id)).expect("the task is kept");
+        assert_eq!(
+            (v.phase, v.commit_count, v.reveal_count, v.cleaned),
+            (Phase::Settled, 3, 3, 3)
+        );
+        assert!(matches!(v.outcome, Some(OutcomeView::Picked { .. })));
+    }
+
+    #[test]
+    fn cleanup_limit_bounds() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        revealed(&mut t, id, &["bob.test", "carol.test", "dave.test"]);
+        try_pick(&mut t, JUDGE, id, REVEAL_DEADLINE, &[("bob.test", 10_000)]).unwrap();
+        // A batch is 1 to 50 entries.
+        for limit in [0, 51, 52, 100, u32::MAX] {
+            let result = try_cleanup(&mut t, KEEPER, id, FALLBACK_DEADLINE, limit).map(|_| ());
+            let message = assert_rejected(result, "E_LIMIT", &format!("a limit of {limit}"));
+            assert_eq!(
+                message,
+                format!("E_LIMIT: limit must be 1 to 50, got {limit}")
+            );
+        }
+        assert_eq!(cleaned(&t, id), 0, "nothing moved");
+        assert_eq!(remaining(&t, id, 0).len(), 3);
+        // Both ends are allowed: 1 goes through one entry, and 50, far more than are left, through
+        // the other two and no further.
+        assert_eq!(clean(&mut t, id, 1), 1);
+        assert_eq!(cleaned(&t, id), 1);
+        assert_eq!(clean(&mut t, id, 50), 2);
+        assert_eq!(cleaned(&t, id), 3);
+        assert!(remaining(&t, id, 0).is_empty());
+        // A task with nothing left to clean takes the same limits.
+        for limit in [0, 51] {
+            let result = try_cleanup(&mut t, KEEPER, id, FALLBACK_DEADLINE, limit).map(|_| ());
+            assert_rejected(result, "E_LIMIT", &format!("a limit of {limit}, none left"));
+        }
+        for limit in [1, 50] {
+            assert_eq!(clean(&mut t, id, limit), 0);
+        }
+    }
+
+    #[test]
+    fn cleanup_batch_stops_at_the_limit() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        // 55 entrants who never reveal, so anyone may void the task once the reveal window is over.
+        let who: Vec<String> = (0..55).map(|i| format!("agent{i}.test")).collect();
+        let mut start = Vec::new();
+        for (seed, w) in who.iter().enumerate() {
+            register(&mut t, w, NearToken::from_millinear(100));
+            start.push(used(&t, w));
+            enter(&mut t, w, id, seed as u8);
+        }
+        try_void(&mut t, KEEPER, id, REVEAL_DEADLINE).unwrap();
+
+        // The first batch is as large as one can be, though 5 more entries are waiting.
+        assert_eq!(clean(&mut t, id, 50), 50);
+        assert_eq!(cleaned(&t, id), 50);
+        for (i, w) in who.iter().enumerate() {
+            let gone = i < 50;
+            assert_eq!(t.get_entry(U64(id), acct(w)).is_none(), gone, "{w}");
+            let entry = if gone { 0 } else { entry_bytes(w, None) };
+            assert_eq!(used(&t, w), start[i] + slot_bytes(w, false) + entry, "{w}");
+        }
+        assert!(remaining(&t, id, 0).is_empty());
+        let left: Vec<u32> = remaining(&t, id, 50).into_iter().map(|(i, _)| i).collect();
+        assert_eq!(left, [50, 51, 52, 53, 54]);
+
+        // The next batch takes them, and nothing more.
+        assert_eq!(clean(&mut t, id, 50), 5);
+        assert_eq!(cleaned(&t, id), 55);
+        for (i, w) in who.iter().enumerate() {
+            assert_eq!(t.get_entry(U64(id), acct(w)), None, "{w}");
+            assert_eq!(used(&t, w), start[i] + slot_bytes(w, false), "{w}");
+        }
+        assert_eq!(clean(&mut t, id, 50), 0);
+    }
+
+    #[test]
+    fn cleanup_of_a_missing_task_is_not_found() {
+        let mut t = world();
+        let result = try_cleanup(&mut t, KEEPER, 99, FALLBACK_DEADLINE, 50).map(|_| ());
+        let message = assert_rejected(result, "E_NOT_FOUND", "a cleanup of a missing task");
+        assert_eq!(message, "E_NOT_FOUND: no task 99");
+    }
+
+    #[test]
+    fn cleanup_rules_are_checked_in_the_listed_order() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        // Every call below has a limit of 0, which is the last rule in the list, so the rule that
+        // it is rejected for is the earlier one that it also breaks.
+        let result = try_cleanup(&mut t, KEEPER, 99, T1, 0).map(|_| ());
+        assert_rejected(result, "E_NOT_FOUND", "a missing task");
+        let result = try_cleanup(&mut t, KEEPER, id, T1, 0).map(|_| ());
+        assert_rejected(result, "E_PHASE", "an unsettled task");
+        // Once the task is settled, the limit is all that is wrong with the call.
+        try_void(&mut t, KEEPER, id, REVEAL_DEADLINE).unwrap();
+        let result = try_cleanup(&mut t, KEEPER, id, T1, 0).map(|_| ());
+        assert_rejected(result, "E_LIMIT", "a bad limit");
+        assert_eq!(try_cleanup(&mut t, KEEPER, id, T1, 1), Ok(0));
+    }
+
+    #[test]
+    fn cleanup_with_nothing_left_does_nothing() {
+        let mut t = world();
+        // One task that nobody entered, and one whose entries are all cleaned.
+        let quiet = post(&mut t, args());
+        let busy = post(&mut t, args());
+        revealed(&mut t, busy, &["bob.test", "carol.test"]);
+        try_void(&mut t, KEEPER, quiet, REVEAL_DEADLINE).unwrap();
+        try_pick(
+            &mut t,
+            JUDGE,
+            busy,
+            REVEAL_DEADLINE,
+            &[("bob.test", 10_000)],
+        )
+        .unwrap();
+        assert_eq!(clean(&mut t, busy, 50), 2);
+        for id in [quiet, busy] {
+            let task = t.tasks.get(&id).cloned();
+            let (stored, paid) = (charged(&t), money(&t));
+            testing_env!(ctx(KEEPER).block_timestamp(FALLBACK_DEADLINE).build());
+            // The mocked VM charges gas for each host call, so a write shows up in the gas even
+            // when it stores the bytes that are there already, and the bytes cannot tell. A mark
+            // alone costs some gas. The call and a mark cost the same only if the call made no
+            // host call of its own and left no write for the mark to flush.
+            let usage = t.storage_mark();
+            let gas = env::used_gas().as_gas();
+            let _ = t.storage_mark();
+            let mark_gas = env::used_gas().as_gas() - gas;
+            let gas = env::used_gas().as_gas();
+            // The call goes through and returns 0.
+            assert_eq!(t.cleanup(U64(id), 50), 0, "task {id}");
+            assert_eq!(t.storage_mark(), usage, "task {id}: no bytes");
+            assert_eq!(
+                env::used_gas().as_gas() - gas,
+                mark_gas,
+                "task {id}: no write"
+            );
+            // It changes nothing and says nothing.
+            assert!(get_logs().is_empty(), "task {id}: no event");
+            assert_eq!(
+                t.tasks.get(&id).cloned(),
+                task,
+                "task {id}: the same record"
+            );
+            assert_eq!(charged(&t), stored, "task {id}: nobody is refunded");
+            assert_eq!(money(&t), paid, "task {id}: no money moved");
+        }
+        assert_eq!((cleaned(&t, quiet), cleaned(&t, busy)), (0, 2));
+    }
+
+    #[test]
+    fn cleanup_cleans_unrevealed_entries_too() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        let names = ["bob.test", "carol.test", "dave.test"];
+        let start = names.map(|who| used(&t, who));
+        for (seed, who) in names.into_iter().enumerate() {
+            enter(&mut t, who, id, seed as u8);
+        }
+        // Only bob reveals. carol and dave leave their entries sealed.
+        reveal(&mut t, "bob.test", id, 0);
+        try_pick(&mut t, JUDGE, id, REVEAL_DEADLINE, &[("bob.test", 10_000)]).unwrap();
+        // The premise: each is charged for just what it wrote, which is less for a sealed entry.
+        for (i, who) in names.into_iter().enumerate() {
+            let revealed = (i == 0).then_some(URI);
+            assert_eq!(
+                used(&t, who),
+                start[i] + slot_bytes(who, false) + entry_bytes(who, revealed),
+                "{who}"
+            );
+        }
+        // Sealed or revealed, every entry goes, and its entrant is refunded exactly its bytes.
+        assert_eq!(clean(&mut t, id, 50), 3);
+        for (i, who) in names.into_iter().enumerate() {
+            assert_eq!(t.get_entry(U64(id), acct(who)), None, "{who}");
+            assert_eq!(used(&t, who), start[i] + slot_bytes(who, false), "{who}");
+        }
+        assert_eq!(cleaned(&t, id), 3);
+    }
+
+    #[test]
+    fn cleanup_does_not_need_the_entrants_deposit() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        let start = used(&t, "bob.test");
+        revealed(&mut t, id, &["bob.test", "carol.test"]);
+        try_pick(&mut t, JUDGE, id, REVEAL_DEADLINE, &[("bob.test", 10_000)]).unwrap();
+        // With no deposit left at all, as when a rise in the storage price leaves a deposit short
+        // of the bytes it paid for, bob's refund still goes through: it never looks at a balance,
+        // so one entrant cannot stop a batch, or the cleanups after it.
+        t.storage.get_mut(&acct("bob.test")).unwrap().deposited = 0;
+        assert_eq!(clean(&mut t, id, 50), 2);
+        assert_eq!(used(&t, "bob.test"), start + slot_bytes("bob.test", false));
+        assert_eq!(t.get_entry(U64(id), acct("bob.test")), None);
+        assert_eq!(t.get_entry(U64(id), acct("carol.test")), None);
+    }
+
+    #[test]
+    fn cleanup_skips_an_index_whose_record_is_gone() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        let names = ["bob.test", "carol.test", "dave.test", "erin.test"];
+        let start = names.map(|who| used(&t, who));
+        revealed(&mut t, id, &names);
+        try_pick(&mut t, JUDGE, id, REVEAL_DEADLINE, &[("bob.test", 10_000)]).unwrap();
+        // carol's place in the entrant order, index 1, is gone already, as if an earlier cleanup
+        // had stopped half way.
+        t.entrant_at.remove(&(id, 1u32));
+        let _ = t.storage_mark();
+        let carol_used = used(&t, "carol.test");
+
+        // The gap counts toward the batch, and does not end it: a batch of 3 goes through bob, the
+        // gap and dave, and leaves erin for the next one.
+        assert_eq!(clean(&mut t, id, 3), 3);
+        assert_eq!(cleaned(&t, id), 3);
+        for (i, who) in [(0, "bob.test"), (2, "dave.test")] {
+            assert_eq!(t.get_entry(U64(id), acct(who)), None, "{who}");
+            assert_eq!(used(&t, who), start[i] + slot_bytes(who, false), "{who}");
+        }
+        assert!(t.get_entry(U64(id), acct("erin.test")).is_some());
+        assert_eq!(clean(&mut t, id, 3), 1);
+        assert_eq!(cleaned(&t, id), 4);
+        assert_eq!(
+            used(&t, "erin.test"),
+            start[3] + slot_bytes("erin.test", false)
+        );
+        // Nobody is refunded for the gap. carol's entry cannot be found without its place, so it
+        // stays, and so does what carol is charged for it.
+        assert!(t.get_entry(U64(id), acct("carol.test")).is_some());
+        assert_eq!(used(&t, "carol.test"), carol_used);
+        assert_eq!(clean(&mut t, id, 50), 0);
+    }
+
+    #[test]
+    fn cleanup_batch_bounds_cannot_wrap() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        try_void(&mut t, KEEPER, id, REVEAL_DEADLINE).unwrap();
+        // No task has billions of entries, but the bounds of a batch are sums of u32s and must not
+        // wrap. Here 10 indices are left before the largest one, and none of them has a record.
+        let task = t.tasks.get_mut(&id).unwrap();
+        (task.commit_count, task.cleaned) = (u32::MAX, u32::MAX - 10);
+        assert_eq!(clean(&mut t, id, 50), 10);
+        assert_eq!(cleaned(&t, id), u32::MAX);
+        assert_eq!(clean(&mut t, id, 50), 0);
+    }
+
+    #[test]
+    fn cleanup_works_for_any_caller_while_paused() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        let start = AGENTS.map(|who| used(&t, who));
+        for (seed, who) in AGENTS.into_iter().enumerate() {
+            enter(&mut t, who, id, seed as u8);
+        }
+        // Nobody reveals, so anyone may void the task once the reveal window is over.
+        try_void(&mut t, KEEPER, id, REVEAL_DEADLINE).unwrap();
+        // A pause stops new tasks only. It never stands between an entrant and its storage.
+        t.paused = true;
+        let alice_used = used(&t, "alice.test");
+        // One entry per call, and a different caller each time: a stranger with no storage
+        // balance at all, the poster, the verifier, an entrant whose own entry is already gone,
+        // and the owner of the last entry. Each call refunds the owner of the next entry, never
+        // the caller.
+        let callers = [
+            "stranger.test",
+            "alice.test",
+            JUDGE,
+            "bob.test",
+            "frank.test",
+        ];
+        for (i, caller) in callers.into_iter().enumerate() {
+            let result = try_cleanup(&mut t, caller, id, FALLBACK_DEADLINE, 1);
+            assert_eq!(result, Ok(1), "{caller}");
+            assert!(get_logs().is_empty(), "{caller}: no event");
+            for (j, who) in AGENTS.into_iter().enumerate() {
+                // The entries up to the one just cleaned are gone, and the rest are still charged.
+                let entry = if j > i { entry_bytes(who, None) } else { 0 };
+                assert_eq!(
+                    used(&t, who),
+                    start[j] + slot_bytes(who, false) + entry,
+                    "{who}, after {caller}'s call"
+                );
+            }
+        }
+        assert_eq!(cleaned(&t, id), 5);
+        assert_eq!(used(&t, "alice.test"), alice_used);
+        assert_eq!(t.storage_balance_of(acct("stranger.test")), None);
+    }
+
+    #[test]
+    fn cleanup_keeps_the_task_and_every_payout() {
+        let mut t = world();
+        register_agent(&mut t, "carol.test");
+        let (done, other) = (post(&mut t, args()), post(&mut t, args()));
+        let names = ["bob.test", "carol.test"];
+        let start = names.map(|who| used(&t, who));
+        // bob and carol enter and reveal in both tasks. Only the first is settled, and bob wins it.
+        revealed(&mut t, done, &names);
+        revealed(&mut t, other, &names);
+        try_pick(
+            &mut t,
+            JUDGE,
+            done,
+            REVEAL_DEADLINE,
+            &[("bob.test", 10_000)],
+        )
+        .unwrap();
+        let task = t.tasks.get(&done).cloned().expect("the task exists");
+        assert!(task.outcome.is_some());
+        let untouched = t.tasks.get(&other).cloned();
+        let (paid, carol) = (money(&t), agent(&t, "carol.test"));
+        let slots = names.map(|who| t.balances_of(acct(who)));
+        assert_eq!(slots[0], usdc(950_000));
+        assert_eq!(slots[1], usdc(0), "carol lost, but has the slot");
+
+        assert_eq!(clean(&mut t, done, 50), 2);
+        // The task keeps its record and its outcome, and only `cleaned` has moved.
+        assert_eq!(
+            t.tasks.get(&done),
+            Some(&Task { cleaned: 2, ..task }),
+            "the task is kept"
+        );
+        // Every vault slot keeps what is in it, even the empty one, and the `earned` slot, the
+        // wins and the counters stay as they were.
+        assert_eq!(money(&t), paid);
+        assert_eq!(names.map(|who| t.balances_of(acct(who))), slots);
+        assert_eq!(agent(&t, "carol.test"), carol);
+        // The other task is not touched, nor are the entries in it. Each entrant is charged for
+        // that entry still.
+        assert_eq!(t.tasks.get(&other).cloned(), untouched);
+        assert_eq!(cleaned(&t, other), 0);
+        assert_eq!(
+            remaining(&t, other, 0),
+            [(0, "bob.test".to_string()), (1, "carol.test".to_string())]
+        );
+        for (i, who) in names.into_iter().enumerate() {
+            assert_eq!(t.get_entry(U64(done), acct(who)), None, "{who}");
+            assert_eq!(
+                used(&t, who),
+                start[i] + slot_bytes(who, i == 1) + entry_bytes(who, Some(URI)),
+                "{who}"
+            );
         }
     }
 }
