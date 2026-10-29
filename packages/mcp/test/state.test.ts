@@ -9,11 +9,11 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { computeCommitment, sha256Hex } from "@tender/shared";
+import { computeCommitment, type NetworkId, sha256Hex } from "@tender/shared";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { createStateStore, type Draft } from "../src/state";
+import { createStateStore, type Draft, defaultStateDir } from "../src/state";
 
 // Only `rename` is wrapped, so that a test can make it fail the way a crash would. Every other
 // function is the real one, and so is `rename` until a test says otherwise.
@@ -326,4 +326,129 @@ test("an_unreadable_draft_is_an_error_not_a_missing_draft", async () => {
   await rm(file);
   await mkdir(file);
   await expect(store.getDraft("9")).rejects.toThrow();
+});
+
+// The tests of `defaultStateDir` use `root` as the home directory, so none of them can reach the
+// real ~/.tender. The function only builds a path, and the one test that writes under it goes
+// through the store.
+
+test("default_state_dir_is_dot_tender_network_account_under_home", () => {
+  const stateDir = defaultStateDir("testnet", "alice.test.near", root);
+  expect(stateDir).toBe(join(root, ".tender", "testnet", "alice.test.near"));
+
+  // One directory for each network and each account, so two agents never share drafts.
+  for (const network of ["sandbox", "testnet", "mainnet"] as const) {
+    expect(defaultStateDir(network, "alice.near", root)).toBe(
+      join(root, ".tender", network, "alice.near"),
+    );
+  }
+  expect(defaultStateDir("mainnet", "alice.test.near", root)).not.toBe(stateDir);
+  expect(defaultStateDir("testnet", "bob.test.near", root)).not.toBe(stateDir);
+
+  // Real account ids are all fine, the shortest, the longest and the 64 hex characters of an
+  // implicit account among them.
+  for (const account of [
+    "a1",
+    "a-b_c.d",
+    "sub.alice.test.near",
+    "a".repeat(64),
+    "0123456789abcdef".repeat(4),
+  ]) {
+    expect(defaultStateDir("testnet", account, root)).toBe(
+      join(root, ".tender", "testnet", account),
+    );
+  }
+
+  // The home is the operating system's unless the caller says otherwise. This only builds a path.
+  expect(defaultStateDir("testnet", "alice.test.near")).toBe(
+    join(homedir(), ".tender", "testnet", "alice.test.near"),
+  );
+});
+
+test.skipIf(NO_POSIX_MODES)("default_state_dir_works_with_the_store_and_is_private", async () => {
+  const stateDir = defaultStateDir("testnet", "alice.test.near", root);
+  const store = createStateStore(stateDir);
+  await store.saveDraft(makeDraft("7"));
+
+  expect(await store.getDraft("7")).toEqual(makeDraft("7"));
+  expect(await readdir(join(stateDir, "drafts"))).toEqual(["7.json"]);
+  // The store makes every level that is missing, and each one is closed to other users, so
+  // ~/.tender is private too and not only the drafts directory at the bottom.
+  for (const path of [
+    join(root, ".tender"),
+    join(root, ".tender", "testnet"),
+    stateDir,
+    join(stateDir, "drafts"),
+  ]) {
+    expect(await modeOf(path), path).toBe(0o700);
+  }
+});
+
+test("default_state_dir_rejects_an_account_that_is_not_a_near_account_id", () => {
+  const bad = [
+    "../x", // the attack: up and out of ~/.tender/{network}
+    "..",
+    ".",
+    "x/..",
+    "a/b",
+    "a\\b",
+    "/etc",
+    "~",
+    "",
+    "Alice.near", // a NEAR account id is lowercase
+    "ALICE",
+    "alice.NEAR",
+    "alice near",
+    "alice\n",
+    "alice\0",
+    "alice.near/",
+    "a", // one character is too short
+    "a".repeat(65), // and 65 too long
+    "-alice",
+    "alice-",
+    ".alice",
+    "alice.",
+    "a..b",
+    "a--b",
+  ];
+  for (const account of bad) {
+    expect(
+      () => defaultStateDir("testnet", account, root),
+      `account ${JSON.stringify(account)}`,
+    ).toThrow(/invalid account/);
+  }
+});
+
+test("default_state_dir_rejects_an_unknown_network", () => {
+  const bad = [
+    "devnet",
+    "Mainnet",
+    "TESTNET",
+    "",
+    " testnet",
+    "testnet/../mainnet",
+    "../x",
+    // Names an object has without being a network.
+    "__proto__",
+    "constructor",
+    "toString",
+    "hasOwnProperty",
+  ];
+  for (const network of bad) {
+    expect(
+      () => defaultStateDir(network as NetworkId, "alice.near", root),
+      `network ${JSON.stringify(network)}`,
+    ).toThrow(/invalid network/);
+  }
+});
+
+test("default_state_dir_needs_a_real_absolute_home", () => {
+  // A "~" read from a JSON config is not expanded here, and an empty or relative home would put the
+  // state wherever the process happens to run, which could be inside a git repo.
+  for (const home of ["", "~", "~/home", "relative/home", "./home"]) {
+    expect(
+      () => defaultStateDir("testnet", "alice.near", home),
+      `home ${JSON.stringify(home)}`,
+    ).toThrow(/absolute/);
+  }
 });

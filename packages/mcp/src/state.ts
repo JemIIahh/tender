@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { chmod, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
-import { U64StringSchema } from "@tender/shared";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { AccountIdSchema, NETWORKS, type NetworkId, U64StringSchema } from "@tender/shared";
 import { z } from "zod";
 
 // The drafts of an agent that commits to tasks. A commit puts only a hash on chain, so the work and
@@ -13,9 +14,8 @@ import { z } from "zod";
 //   or a failed write leaves the old draft or the new one, never half of either;
 // - path safe: the task id becomes part of a file name, so it must be a u64 in decimal first.
 //
-// The caller picks the directory. By convention it is `~/.tender/{network}/{account}`, one per
-// network and account, so that two agents on one machine never share drafts. Calls for one task
-// are expected one after another, as commit and reveal are, and the store does not lock.
+// The caller picks the directory, and `defaultStateDir` gives the usual one. Calls for one task are
+// expected one after another, as commit and reveal are, and the store does not lock.
 
 /** The owner may read and write a draft file, and nobody else may do anything. */
 const FILE_MODE = 0o600;
@@ -79,14 +79,18 @@ const DraftSchema: z.ZodType<Draft> = z.object({
   revealedUri: z.string().optional(),
 });
 
+/** A value for an error message: quoted, and cut short so a huge one cannot flood a log. */
+function show(value: unknown): string {
+  return JSON.stringify(String(value).slice(0, 40));
+}
+
 /**
  * Refuses anything but a u64 in decimal. Digits cannot make a `..` or a path separator, so an id
  * that passes cannot name a file outside `drafts/`.
  */
 function assertTaskId(taskId: string): void {
   if (!U64StringSchema.safeParse(taskId).success) {
-    const shown = JSON.stringify(String(taskId).slice(0, 40));
-    throw new Error(`invalid task id ${shown}: expected a u64 as a decimal string`);
+    throw new Error(`invalid task id ${show(taskId)}: expected a u64 as a decimal string`);
   }
 }
 
@@ -150,8 +154,44 @@ async function syncDirectory(path: string): Promise<void> {
 }
 
 /**
+ * Where an agent's state lives unless the operator names another directory:
+ * `{home}/.tender/{network}/{account}`. Each network and each account gets its own, so two agents
+ * on one machine never share drafts. It returns a path and creates nothing: the store makes the
+ * directories, private, when it first writes.
+ *
+ * The network and the account become path segments, so both are checked. The network must be one
+ * of Tender's, and the account a NEAR account id, which cannot hold a `/` or a `..`, so a crafted
+ * `TENDER_ACCOUNT` cannot move the state out of `{home}/.tender`.
+ *
+ * `home` must be a real, absolute path, and a relative one is refused. Nothing here expands a
+ * leading `~`, which a JSON config such as an MCP client's can hold in `TENDER_STATE_DIR`, and
+ * `createStateStore` does not either. The server's `bin` (plan 04 Task 6) expands it before it
+ * calls either.
+ */
+export function defaultStateDir(
+  network: NetworkId,
+  account: string,
+  home: string = homedir(),
+): string {
+  // Own keys only: "constructor" and "toString" are on every object and are not networks.
+  if (!Object.hasOwn(NETWORKS, network)) {
+    const known = Object.keys(NETWORKS).join(", ");
+    throw new Error(`invalid network ${show(network)}: expected one of ${known}`);
+  }
+  if (!AccountIdSchema.safeParse(account).success) {
+    throw new Error(`invalid account ${show(account)}: expected a NEAR account id`);
+  }
+  // An empty or relative home would put the state wherever the process happens to run.
+  if (!isAbsolute(home)) {
+    throw new Error(`the home directory must be an absolute path, got ${show(home)}`);
+  }
+  return join(home, ".tender", network, account);
+}
+
+/**
  * The store for the drafts in `{dir}/drafts/{taskId}.json`. It creates `dir` on the first write,
- * and reading from a `dir` that does not exist yet finds no drafts.
+ * and reading from a `dir` that does not exist yet finds no drafts. Pass a real path: a relative
+ * `dir` is taken from the current directory, and a leading `~` is not expanded.
  */
 export function createStateStore(dir: string): StateStore {
   // An empty path would resolve to the current directory and put the drafts wherever the process
