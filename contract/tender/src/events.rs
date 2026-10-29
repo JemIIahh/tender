@@ -30,6 +30,29 @@ pub(crate) struct StorageDeposit {
     pub total: U128,
 }
 
+/// Data of `deposit`: `account` was credited `amount` of `token`, sent by `sender` (who differs
+/// from `account` when the deposit named a beneficiary).
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct Deposit {
+    pub account: AccountId,
+    pub token: AccountId,
+    pub amount: U128,
+    pub sender: AccountId,
+}
+
+/// Data of `withdraw` and `withdraw_failed`: `amount` of `token` was debited from `account` to be
+/// paid to `to`. `withdraw` says the token paid it; `withdraw_failed` says it did not and the
+/// amount is back in `account`'s vault.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct Withdraw {
+    pub account: AccountId,
+    pub token: AccountId,
+    pub amount: U128,
+    pub to: AccountId,
+}
+
 #[cfg(test)]
 mod tests {
     use near_sdk::serde;

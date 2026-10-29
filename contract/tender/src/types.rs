@@ -37,19 +37,15 @@ pub const MAX_PAGE: u32 = 50;
 /// Smallest first storage deposit: 0.01 NEAR.
 pub const STORAGE_MIN_DEPOSIT: u128 = 10u128.pow(22);
 /// Upper bound on the bytes one vault slot occupies.
-#[allow(dead_code)]
 pub const VAULT_SLOT_MAX_BYTES: u64 = 200;
 /// Bytes the poster reserves at posting so settlement never needs new storage.
 #[allow(dead_code)]
 pub const OUTCOME_RESERVE_BYTES: u64 = 800;
 /// Gas attached to the token's `ft_transfer` in `withdraw`.
-#[allow(dead_code)]
 pub const GAS_FT_TRANSFER: Gas = Gas::from_tgas(10);
 /// Gas attached to the `on_withdraw` callback.
-#[allow(dead_code)]
 pub const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(10);
 /// Least prepaid gas `withdraw` accepts.
-#[allow(dead_code)]
 pub const MIN_WITHDRAW_GAS: Gas = Gas::from_tgas(35);
 
 /// Error codes. Every panic message starts with one, as `"<CODE>: <detail>"`.
@@ -288,6 +284,14 @@ pub struct StorageView {
     pub available: U128,
     /// Bytes of contract state charged to the account.
     pub used_bytes: U64,
+}
+
+/// An amount of one token, as the balance views return it. The amount is a decimal string.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenBalance {
+    pub token: AccountId,
+    pub amount: U128,
 }
 
 #[cfg(test)]

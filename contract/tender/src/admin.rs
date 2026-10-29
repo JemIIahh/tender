@@ -1,9 +1,9 @@
 //! Owner configuration and the `get_config` view.
 
 use near_sdk::json_types::U128;
-use near_sdk::near;
+use near_sdk::{near, AccountId};
 
-use crate::types::{ConfigView, TokenConfigView, MAX_WINDOW_SECS};
+use crate::types::{ConfigView, TokenConfig, TokenConfigView, MAX_WINDOW_SECS};
 use crate::{Tender, TenderExt};
 
 #[near]
@@ -33,9 +33,55 @@ impl Tender {
     }
 }
 
+impl Tender {
+    /// Inserts `token` into the allowlist, or overwrites its limits and `enabled` flag.
+    ///
+    /// Only the unit tests call it for now. Task 10's owner-only `set_token` will wrap it.
+    // No caller outside the tests yet; the allow comes off with `set_token`.
+    #[allow(dead_code)]
+    pub(crate) fn put_token(&mut self, token: AccountId, cfg: TokenConfig) {
+        self.tokens.insert(token, cfg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::test_utils::fresh;
+    use crate::types::TokenConfig;
+
+    #[test]
+    fn put_token_inserts_and_overwrites() {
+        let mut t = fresh();
+        let cfg = |min_reward, max_reward, enabled| TokenConfig {
+            min_reward,
+            max_reward,
+            enabled,
+        };
+        t.put_token("usdc.test".parse().unwrap(), cfg(1, 10, true));
+        t.put_token("dai.test".parse().unwrap(), cfg(2, 20, false));
+        t.put_token("usdc.test".parse().unwrap(), cfg(3, 30, false));
+        let tokens = t.get_config().tokens;
+        // usdc was overwritten in place, not added twice.
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].token.as_str(), "usdc.test");
+        assert_eq!(
+            (
+                tokens[0].min_reward.0,
+                tokens[0].max_reward.0,
+                tokens[0].enabled
+            ),
+            (3, 30, false)
+        );
+        assert_eq!(tokens[1].token.as_str(), "dai.test");
+        assert_eq!(
+            (
+                tokens[1].min_reward.0,
+                tokens[1].max_reward.0,
+                tokens[1].enabled
+            ),
+            (2, 20, false)
+        );
+    }
 
     #[test]
     fn new_sets_config() {

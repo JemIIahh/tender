@@ -10,6 +10,7 @@ mod storage;
 #[cfg(test)]
 mod test_utils;
 mod types;
+mod vault;
 
 use near_sdk::store::{IterableMap, LookupMap};
 use near_sdk::{env, near, AccountId, BorshStorageKey, PanicOnDefault, PublicKey};

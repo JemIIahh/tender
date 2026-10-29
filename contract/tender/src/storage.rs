@@ -25,7 +25,7 @@ use crate::{Tender, TenderExt};
 
 /// What `bytes` of contract state cost at the protocol's storage price. It saturates, so an
 /// absurd byte count reads as unaffordable instead of wrapping.
-fn bytes_cost(bytes: u64) -> u128 {
+pub(crate) fn bytes_cost(bytes: u64) -> u128 {
     u128::from(bytes).saturating_mul(env::storage_byte_cost().as_yoctonear())
 }
 
@@ -202,8 +202,6 @@ impl Tender {
     }
 
     /// What `account` could withdraw now, in yoctoNEAR. Zero if it is not registered.
-    // No caller yet; the allow comes off with the first one.
-    #[allow(dead_code)]
     pub(crate) fn storage_available(&self, account: &AccountId) -> u128 {
         self.storage
             .get(account)
