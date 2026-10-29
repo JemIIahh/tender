@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"committed","data":[{"task_id":"1","account":"alice.test.near","commitment":"f8ea8d0472958708781004e27f609f4ac0087a4820e165d819a2ee4812098c0e","replaced":false,"block_height":"65"}]}

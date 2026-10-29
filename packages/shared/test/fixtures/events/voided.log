@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"voided","data":[{"task_id":"2","reason":"no_award","by":"judge.test.near","refunds":[{"account":"poster.test.near","amount":"1000000"}],"scorecard_hash":"8fad3e916b98df98caa7f0e95f9920cc0b3fc997b0518b6490157602bb072af8","scorecard_uri":"ipfs://scorecard"}]}

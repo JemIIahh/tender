@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"deposit","data":[{"account":"poster.test.near","token":"token.test.near","amount":"2000003","sender":"alice.test.near"}]}

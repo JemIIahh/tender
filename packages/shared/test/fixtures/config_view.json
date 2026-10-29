@@ -1,0 +1,18 @@
+{
+  "owner": "owner.test.near",
+  "pending_owner": null,
+  "treasury": "treasury.test.near",
+  "fee_bps": 500,
+  "min_window_secs": 5,
+  "max_window_secs": 1209600,
+  "paused": false,
+  "version": 1,
+  "tokens": [
+    {
+      "token": "token.test.near",
+      "min_reward": "1",
+      "max_reward": "1000000000000",
+      "enabled": true
+    }
+  ]
+}
