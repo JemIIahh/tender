@@ -15,6 +15,7 @@ use near_sdk::{env, near, AccountId, BorshStorageKey, PanicOnDefault, PublicKey}
 
 use crate::types::{
     err, AgentProfile, DelegateCaps, Entry, StorageAccount, Task, TokenConfig, MAX_FEE_BPS,
+    MAX_WINDOW_SECS,
 };
 
 /// Storage prefixes, one per collection in `Tender`, in field order.
@@ -62,8 +63,11 @@ pub struct Tender {
 #[near]
 impl Tender {
     /// Initialises the contract. `fee_bps` is capped at `MAX_FEE_BPS` (`E_FEE`) and
-    /// `min_window_secs` must be at least 1 (`E_WINDOW`).
+    /// `min_window_secs` must be in `1..=MAX_WINDOW_SECS` (`E_WINDOW`).
+    ///
+    /// Callable only by the contract account itself, so deploy and `new` go in one transaction.
     #[init]
+    #[private]
     pub fn new(owner: AccountId, treasury: AccountId, fee_bps: u16, min_window_secs: u32) -> Self {
         if fee_bps > MAX_FEE_BPS {
             env::panic_str(&format!(
@@ -71,9 +75,9 @@ impl Tender {
                 err::E_FEE
             ));
         }
-        if min_window_secs < 1 {
+        if !(1..=MAX_WINDOW_SECS).contains(&min_window_secs) {
             env::panic_str(&format!(
-                "{}: min_window_secs must be at least 1",
+                "{}: min_window_secs {min_window_secs} must be between 1 and {MAX_WINDOW_SECS}",
                 err::E_WINDOW
             ));
         }
@@ -103,6 +107,7 @@ mod tests {
     use near_sdk::testing_env;
 
     use crate::test_utils::ctx;
+    use crate::types::MAX_WINDOW_SECS;
     use crate::Tender;
 
     #[test]
@@ -127,5 +132,31 @@ mod tests {
             500,
             0,
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "E_WINDOW")]
+    fn new_rejects_min_window_above_max() {
+        testing_env!(ctx("owner.test").build());
+        Tender::new(
+            "owner.test".parse().unwrap(),
+            "treasury.test".parse().unwrap(),
+            500,
+            MAX_WINDOW_SECS + 1,
+        );
+    }
+
+    #[test]
+    fn new_accepts_min_window_bounds() {
+        testing_env!(ctx("owner.test").build());
+        for secs in [1, MAX_WINDOW_SECS] {
+            let t = Tender::new(
+                "owner.test".parse().unwrap(),
+                "treasury.test".parse().unwrap(),
+                500,
+                secs,
+            );
+            assert_eq!(t.get_config().min_window_secs, secs);
+        }
     }
 }
