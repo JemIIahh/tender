@@ -103,3 +103,20 @@ test("mismatch_scores_zero", () => {
     expect(scoreExact(c, expected, bytes(wrong)).score, JSON.stringify(wrong)).toBe(0);
   }
 });
+
+test("leading_bom_is_dropped", () => {
+  const c = criteria([]);
+  const expected = heldout("hello");
+  const withBom = (...rest: number[]): Uint8Array => Uint8Array.from([0xef, 0xbb, 0xbf, ...rest]);
+
+  // The three bytes EF BB BF at the start are a byte order mark, and the decoder drops them.
+  expect(scoreExact(c, expected, withBom(...bytes("hello")))).toEqual({
+    score: 100,
+    passed: true,
+    reasons: [],
+  });
+  // It drops one, and only at the start. Any other mark is part of the text.
+  expect(scoreExact(c, expected, withBom(...withBom(...bytes("hello")))).score).toBe(0);
+  const inside = Uint8Array.from([...bytes("hel"), 0xef, 0xbb, 0xbf, ...bytes("lo")]);
+  expect(scoreExact(c, expected, inside).score).toBe(0);
+});

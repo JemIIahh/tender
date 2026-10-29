@@ -22,8 +22,10 @@ const TRIAL_DOCUMENTS: unknown[] = [null, true, 0, "", [], {}];
 /**
  * Scores a `json_schema` entry. The bytes must be valid UTF-8 holding one JSON document that fits
  * the criteria's schema (JSON Schema 2020-12, with the standard formats such as `date`);
- * otherwise the score is 0, and the reasons say why. A document that fits is scored on the
- * held-out assertions: `round(100 × passed / total)`, with one reason per failed assertion.
+ * otherwise the score is 0, and the reasons say why. A leading byte order mark is dropped, as
+ * `TextDecoder` does by default. A document that fits is scored on the held-out assertions:
+ * `round(100 × passed / total)`, with one reason per failed assertion, and never above 99 while
+ * one has failed, so a score of 100 always means that every check passed.
  *
  * An assertion is a path and a value. A path is `$` followed by `.key` and `[n]` segments:
  * `.key` picks an own key of an object, `[n]` an element of an array (no leading zeros). An
@@ -64,7 +66,9 @@ export function scoreJsonSchema(
     const found = resolve(document, path);
     return found === MISSING || !deepEqual(found, equals);
   });
-  const score = Math.round((100 * (total - failed.length)) / total);
+  const rounded = Math.round((100 * (total - failed.length)) / total);
+  // 100 means that every check passed. With 200 checks or more, one failure would round up to it.
+  const score = failed.length > 0 ? Math.min(rounded, 99) : rounded;
   return scored(
     c,
     score,
@@ -167,6 +171,10 @@ function newAjv(): Ajv2020 {
     // Only the keys a document has count. By default Ajv also finds what every object inherits,
     // so `required: ["toString"]` would be met by `{}`.
     ownProperties: true,
+    // Ajv tests `multipleOf` by division, and 0.07 / 0.01 is 7.000000000000001, so by default
+    // `multipleOf: 0.01` refuses about one two-decimal amount in seven. This allows an error of
+    // 1e-6 of a step, and still refuses 0.0100001 and 1.005.
+    multipleOfPrecision: 6,
     allErrors: true,
     // Without this, every unknown format is a console.warn.
     logger: false,

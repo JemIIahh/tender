@@ -77,6 +77,18 @@ function single(document: unknown, path: string, equals: unknown): EntryScore {
   return scoreJsonSchema(criteria({}), heldout(check(path, equals)), json(document));
 }
 
+/** Scores the document `{ "n": 1 }` on `passing` checks that hold and `failing` that do not. */
+function withChecks(passing: number, failing: number): EntryScore {
+  return scoreJsonSchema(
+    criteria({}),
+    heldout(
+      ...Array.from({ length: passing }, () => check("$.n", 1)),
+      ...Array.from({ length: failing }, () => check("$.n", 2)),
+    ),
+    json({ n: 1 }),
+  );
+}
+
 // Written as a code point, so that the character can be seen in the source.
 const REPLACEMENT_CHARACTER = String.fromCodePoint(0xfffd);
 
@@ -209,15 +221,7 @@ test("partial_assertions_round", () => {
   });
 
   // Rounding: .5 goes up.
-  const ratio = (passing: number, failing: number): number =>
-    scoreJsonSchema(
-      criteria({}),
-      heldout(
-        ...Array.from({ length: passing }, () => check("$.n", 1)),
-        ...Array.from({ length: failing }, () => check("$.n", 2)),
-      ),
-      json({ n: 1 }),
-    ).score;
+  const ratio = (passing: number, failing: number): number => withChecks(passing, failing).score;
   expect(ratio(2, 1)).toBe(67);
   expect(ratio(1, 2)).toBe(33);
   expect(ratio(5, 3)).toBe(63); // 62.5
@@ -428,6 +432,11 @@ test("unusable_paths_never_match", () => {
   expect(at("$.s[0]", "t")).toBe(0);
   expect(at("$.constructor.name", "Object")).toBe(0);
   expect(at("$.a.constructor.name", "Array")).toBe(0);
+
+  // `__proto__` is the one inherited member that is an object, and an empty object equals it. A
+  // document without a key of that name of its own (the one above has one) is not found to have it.
+  const plain = scoreJsonSchema(criteria({}), heldout(check("$.__proto__", {})), bytes('{"b":5}'));
+  expect(plain.score).toBe(0);
 });
 
 test("unusable_schema_scores_zero", async () => {
@@ -566,6 +575,73 @@ test("deep_nesting_scores_zero", () => {
   expect(scoreJsonSchema(criteria(TREE_SCHEMA), checks, deep)).toEqual(tooDeep);
   // A schema that refers to itself without end overflows the same way, for any document.
   expect(scoreJsonSchema(criteria({ $ref: "#" }), checks, bytes("{}"))).toEqual(tooDeep);
+});
+
+test("multiple_of_ignores_float_noise", () => {
+  const cents = criteria({ type: "number", multipleOf: 0.01 });
+  const score = (amount: number): EntryScore =>
+    scoreJsonSchema(cents, heldout(check("$", amount)), json(amount));
+
+  // 0.07 / 0.01 is 7.000000000000001 in floating point, and 0.07 is seven cents all the same.
+  expect(score(0.07)).toEqual({ score: 100, passed: true, reasons: [] });
+  // Amounts that are not a whole number of cents still fail, close as some of them come.
+  for (const amount of [1.005, 0.0100001, 19.9901]) {
+    expect(score(amount), String(amount)).toEqual({
+      score: 0,
+      passed: false,
+      reasons: ["must be multiple of 0.01"],
+    });
+  }
+
+  // Every amount from 0.01 to 200.00, written the way an agent writes it. Ajv's own default
+  // refuses 2,729 of these.
+  const amounts = Array.from({ length: 20_000 }, (_, i) => (i + 1) / 100);
+  const list = criteria({ type: "array", items: { type: "number", multipleOf: 0.01 } });
+  expect(scoreJsonSchema(list, heldout(check("$[0]", 0.01)), json(amounts))).toEqual({
+    score: 100,
+    passed: true,
+    reasons: [],
+  });
+});
+
+test("one_failed_assertion_never_scores_100", () => {
+  // 100 means that every check passed. 199 of 200 is 99.5, which rounds to 100, and 1 of 200
+  // failing would then pass a pass mark of 100.
+  for (const total of [200, 201, 1000]) {
+    expect(withChecks(total - 1, 1), `1 of ${total} failing`).toEqual({
+      score: 99,
+      passed: false,
+      reasons: ["$.n expected 2"],
+    });
+  }
+  // So 100 and "nothing failed" are the same thing, however many checks there are.
+  for (const total of [1, 2, 3, 7, 199, 200, 500]) {
+    expect(withChecks(total, 0), `${total} passing`).toEqual({
+      score: 100,
+      passed: true,
+      reasons: [],
+    });
+    expect(withChecks(total - 1, 1).score, `${total - 1} passing, 1 failing`).toBeLessThan(100);
+  }
+});
+
+test("leading_bom_is_dropped", () => {
+  const withBom = (...rest: number[]): Uint8Array => Uint8Array.from([0xef, 0xbb, 0xbf, ...rest]);
+  const c = criteria({ type: "object" });
+  const checks = heldout(check("$.n", 1));
+
+  // The three bytes EF BB BF at the start are a byte order mark, and the decoder drops them.
+  expect(scoreJsonSchema(c, checks, withBom(...bytes('{"n":1}')))).toEqual({
+    score: 100,
+    passed: true,
+    reasons: [],
+  });
+  // It drops one. A second mark stays in the text, and JSON.parse refuses it.
+  expect(scoreJsonSchema(c, checks, withBom(...withBom(...bytes('{"n":1}'))))).toEqual({
+    score: 0,
+    passed: false,
+    reasons: ["not JSON"],
+  });
 });
 
 test("no_assertions_scores_zero", () => {
