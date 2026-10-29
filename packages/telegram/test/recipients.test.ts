@@ -18,12 +18,14 @@ import {
 //
 // A chat is named after whose it is, and a test says who must hear an alert in those names, so a
 // wrong answer reads "expected acme, got lab" and not a pair of numbers. Every chat that must NOT
-// hear an alert is in the world on purpose: the ASP of the poster, of the verifier and of a
-// funder (the table gives those three roles their own chats, not their owners'), a bystander,
-// the watchers of other tags, a watcher of pieces of a tag, and everyone around the other task.
+// hear an alert is in the world on purpose: the ASP of the poster and of a funder (the table gives
+// those two roles their own chats, not their owners'), a bystander, the watchers of other tags, a
+// watcher of pieces of a tag, and everyone around the other task.
 
 const TASK = "7";
 const OTHER_TASK = "8";
+/** Task 7's tags and people, but only two invitees may enter it. */
+const INVITE_ONLY_TASK = "15";
 const TITLE = "Summarise the Q3 report";
 
 // Task 7's accounts. An account has an ASP only if it is a registered agent whose row names one.
@@ -114,6 +116,18 @@ async function seedWorld(db: Db): Promise<void> {
   await seedEntry(db, OTHER_TASK, BOT_9, { revealed: true });
   await seedEntry(db, OTHER_TASK, SOLO);
   await seedEntry(db, OTHER_TASK, LONE, { revealed: true });
+
+  // Task 15, invite-only. It has no entries: only its announcements are tested.
+  await seedTask(db, {
+    id: INVITE_ONLY_TASK,
+    poster: POSTER,
+    verifier: VERIFIER,
+    title: "Review the vendor contract",
+    tags: ["research", "summary"],
+    invited: [BOT_1, BOT_2],
+  });
+  await seedFunder(db, INVITE_ONLY_TASK, POSTER);
+  await seedFunder(db, INVITE_ONLY_TASK, BACKER_2);
 
   for (const chat of Object.values(CHATS)) await linkChat(db, chat.id, chat.account);
   for (const [name, tag] of WATCHES) await watchTag(db, CHATS[name].id, tag);
@@ -217,10 +231,13 @@ test("entry_committed_reaches_the_poster_only", async () => {
   expect(await who(ALERT.entry_committed)).toEqual(names("poster"));
 });
 
-test("reveal_open_reaches_every_committers_owners_and_the_verifier", async () => {
+test("reveal_open_reaches_every_committers_owners_and_the_verifiers_owners", async () => {
   // bot1 and bot2 share acme's chat, which hears once. solo is not an agent and lone has no ASP,
-  // so each has only its own chat. The verifier's chat, not the chat of its ASP.
-  expect(await who(ALERT.reveal_open)).toEqual(names("acme", "bot1", "lone", "solo", "verifier"));
+  // so each has only its own chat. The verifier is an agent of court.near: its own chat and the
+  // chat of its ASP both hear.
+  expect(await who(ALERT.reveal_open)).toEqual(
+    names("acme", "bot1", "court", "lone", "solo", "verifier"),
+  );
 });
 
 test("reveal_closing_reaches_the_owners_of_committers_who_have_not_revealed", async () => {
@@ -229,9 +246,12 @@ test("reveal_closing_reaches_the_owners_of_committers_who_have_not_revealed", as
   expect(await who(ALERT.reveal_closing)).toEqual(names("acme", "lone"));
 });
 
-test("winner_paid_reaches_the_poster_every_revealers_owners_and_the_verifier", async () => {
-  // Every revealer, not only the winner: solo revealed and did not win. lone never revealed.
-  expect(await who(ALERT.winner_paid)).toEqual(names("poster", "bot1", "acme", "solo", "verifier"));
+test("winner_paid_reaches_the_poster_every_revealers_owners_and_the_verifiers_owners", async () => {
+  // Every revealer, not only the winner: solo revealed and did not win. lone never revealed. The
+  // poster's own chat, not its ASP's; the verifier's own chat and its ASP's.
+  expect(await who(ALERT.winner_paid)).toEqual(
+    names("poster", "bot1", "acme", "solo", "verifier", "court"),
+  );
 });
 
 test("task_voided_reaches_the_poster_and_every_funder", async () => {
@@ -240,7 +260,7 @@ test("task_voided_reaches_the_poster_and_every_funder", async () => {
 });
 
 test("deadline_reminder_reaches_the_poster_and_every_committers_owners", async () => {
-  // Every committer, revealed or not; not the verifier.
+  // Every committer, revealed or not; not the verifier or its ASP.
   expect(await who(ALERT.deadline_reminder)).toEqual(
     names("poster", "bot1", "acme", "solo", "lone"),
   );
@@ -250,6 +270,40 @@ test("pool_grew_reaches_the_poster_every_funder_and_tag_watchers", async () => {
   expect(await who(ALERT.pool_grew)).toEqual(
     names("poster", "backer1", "backer2", "watchesResearch", "watchesBoth"),
   );
+});
+
+// Two refinements of the rows above.
+
+test("verifier_owner_chats_hear_reveal_open_and_winner_paid", async () => {
+  // The Judge is a sub-account of its owner, and nobody links a chat to it. Its row in `agents`
+  // names the owner's account as its ASP, and that chat is the only one on task 16.
+  await seedAgent(db, "judge.bench.near", { asp: "bench.near" });
+  await linkChat(db, 611, "bench.near");
+  await seedTask(db, { id: "16", poster: "nobody.near", verifier: "judge.bench.near" });
+  const open16 = { ...ALERT.reveal_open, taskId: "16" };
+  const paid16 = { ...ALERT.winner_paid, taskId: "16" };
+  expect(await resolveRecipients(db, open16)).toEqual(["611"]);
+  expect(await resolveRecipients(db, paid16)).toEqual(["611"]);
+
+  // The ASP is what the verifier's row says. A verifier that never registered has none, so the
+  // chat of its parent account hears nothing.
+  await linkChat(db, 612, "unlisted.near");
+  await seedTask(db, { id: "17", poster: "nobody.near", verifier: "judge.unlisted.near" });
+  expect(await resolveRecipients(db, { ...open16, taskId: "17" })).toEqual([]);
+  expect(await resolveRecipients(db, { ...paid16, taskId: "17" })).toEqual([]);
+});
+
+test("new_task_for_an_invite_only_task_skips_tag_watchers", async () => {
+  // Task 15 has task 7's tags, but only two invitees may enter it, so the chats watching research
+  // and summary do not hear of it. The poster's owner chats still do.
+  const alert = { ...ALERT.new_task, taskId: INVITE_ONLY_TASK };
+  expect(await who(alert)).toEqual(names("poster", "lab"));
+});
+
+test("pool_grew_for_an_invite_only_task_skips_tag_watchers", async () => {
+  // The poster and the funders have money in the task, so they still hear; the watchers do not.
+  const alert = { ...ALERT.pool_grew, taskId: INVITE_ONLY_TASK };
+  expect(await who(alert)).toEqual(names("poster", "backer2"));
 });
 
 // The rules that hold for every row.

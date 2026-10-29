@@ -46,12 +46,14 @@ function audienceOf(a: Alert): Audience {
     case "entry_committed":
       return { chatsOf: ["poster"] };
     case "reveal_open":
-      return { chatsOf: ["verifier"], ownerChatsOf: ["committers"] };
+      // The verifier is often the Judge, a sub-account that nobody can link a chat to. Its owner
+      // can link the ASP instead, so the verifier's owner chats hear, not only its own.
+      return { ownerChatsOf: ["verifier", "committers"] };
     case "reveal_closing":
       return { ownerChatsOf: ["unrevealed"] };
     case "winner_paid":
       // Every revealer hears, not only the winners the alert lists.
-      return { chatsOf: ["poster", "verifier"], ownerChatsOf: ["revealers"] };
+      return { chatsOf: ["poster"], ownerChatsOf: ["verifier", "revealers"] };
     case "task_voided":
       return { chatsOf: ["poster", "funders"] };
     case "deadline_reminder":
@@ -72,12 +74,15 @@ const NO_CHATS = "select null::bigint as chat_id where false";
  * The chats that watch one of the tags on the task's row. `tags` is a jsonb array of strings and
  * `?` asks whether it has the string as an element, so a whole tag matches and a piece of one does
  * not.
+ *
+ * A task with invitees (`invited` is not the empty array) is not announced to watchers, because
+ * they cannot enter it. Its poster, funders and entrants hear as usual.
  */
 const WATCHERS = `
   select w.chat_id
   from tg_watches w
   join tasks t on t.id = $1::numeric
-  where t.tags ? w.tag`;
+  where t.tags ? w.tag and t.invited = '[]'::jsonb`;
 
 /**
  * The one statement that finds an audience's chats: the chats linked to the accounts it names and
@@ -117,6 +122,8 @@ function queryFor({ chatsOf = [], ownerChatsOf = [], watchers = false }: Audienc
  * lowest first. It runs one query, whatever the kind. `audienceOf` says who hears what.
  *
  * - A muted chat hears nothing.
+ * - Chats that watch a tag hear `new_task` and `pool_grew` only for a task open to everyone: one
+ *   with invitees stays off them.
  * - The poster, verifier, committers, funders and tags all come from the database by `a.taskId`,
  *   and `new_task`'s own `tags` are not read. A task that is not in the database therefore reaches
  *   nobody, except that `agent_started` still reaches the owner chats of the agent it names.
