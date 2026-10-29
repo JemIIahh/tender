@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"task_topped_up","data":[{"task_id":"1","funder":"carol.test.near","amount":"500000","reward":"1500003"}]}
