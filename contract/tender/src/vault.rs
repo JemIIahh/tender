@@ -70,6 +70,7 @@ impl Tender {
     /// This call itself emits nothing: its receipt succeeds either way, so the outcome is only
     /// known in the callback.
     #[payable]
+    #[deny_unknown_arguments]
     pub fn withdraw(&mut self, token: AccountId, amount: U128, to: Option<AccountId>) -> Promise {
         assert_one_yocto();
         require_withdraw_gas(env::prepaid_gas());

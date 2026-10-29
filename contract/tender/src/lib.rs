@@ -3,6 +3,12 @@
 //! All token balances sit in an internal vault, so function-call keys never attach deposits.
 //! Task ids are sequential, so views paginate without iterating a map. The phase of a task is
 //! derived from block time, never stored.
+//!
+//! The methods that accounts call to change state refuse a top-level argument they do not take
+//! (`#[deny_unknown_arguments]`), so a misspelled or misplaced key is an error instead of a
+//! silently absent option. The exceptions are the standard NEP-141 and NEP-145 methods
+//! (`ft_on_transfer`, `storage_deposit`, `storage_withdraw`), whose callers may send extra
+//! arguments.
 
 mod admin;
 mod auth;

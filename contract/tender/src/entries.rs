@@ -102,6 +102,7 @@ impl Tender {
     ///
     /// Commits work while the contract is paused, and attach no deposit, so a function-call key
     /// can send them.
+    #[deny_unknown_arguments]
     pub fn commit(&mut self, task_id: U64, commitment: String) {
         let before = self.storage_mark();
         let caller = env::predecessor_account_id();
@@ -197,6 +198,7 @@ impl Tender {
     ///
     /// Reveals work while the contract is paused, and attach no deposit, so a function-call key
     /// can send them.
+    #[deny_unknown_arguments]
     pub fn reveal(&mut self, task_id: U64, content_hash: String, salt: String, uri: String) {
         let before = self.storage_mark();
         let caller = env::predecessor_account_id();

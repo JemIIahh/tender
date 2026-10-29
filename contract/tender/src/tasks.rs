@@ -212,6 +212,7 @@ impl Tender {
     /// its outcome (`E_STORAGE` if it cannot), so settling the task never needs new storage.
     /// Emits `task_created` once everything has passed.
     #[payable]
+    #[deny_unknown_arguments]
     pub fn post_task(&mut self, task: PostTaskArgs) -> U64 {
         let poster = env::predecessor_account_id();
         if self.paused {
@@ -587,9 +588,10 @@ mod tests {
     /// What `post_task`'s generated wasm wrapper parses `env::input()` into. The wrapper exists
     /// only in the wasm build (`#[cfg(target_arch = "wasm32")]`), so this mirrors the code
     /// near-sdk-macros 5.29.1 generates: a struct of the method's arguments, read with
-    /// `serde_json::from_slice`. The inner object goes through `PostTaskArgs`' own derive.
+    /// `serde_json::from_slice`, which `#[deny_unknown_arguments]` makes `deny_unknown_fields`.
+    /// The inner object goes through `PostTaskArgs`' own derive.
     #[derive(near_sdk::serde::Deserialize)]
-    #[serde(crate = "near_sdk::serde")]
+    #[serde(crate = "near_sdk::serde", deny_unknown_fields)]
     struct Input {
         task: PostTaskArgs,
     }
@@ -685,6 +687,16 @@ mod tests {
         extra["colour"] = json!("blue");
         let message = parse_wire(&extra).unwrap_err();
         assert!(message.contains("unknown field `colour`"), "{message}");
+
+        // And so is a key beside `task`: `verifier` sent next to the task, not inside it, would
+        // otherwise make the poster the verifier.
+        let beside =
+            serde_json::to_vec(&json!({ "task": full, "verifier": "judge.test" })).unwrap();
+        let message = serde_json::from_slice::<Input>(&beside)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("unknown field `verifier`"), "{message}");
     }
 
     // Posting.

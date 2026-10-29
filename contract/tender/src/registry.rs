@@ -95,6 +95,7 @@ impl Tender {
     /// The first registration records the time and the ASP, the account's provider (`acme.near`
     /// for `bot1.acme.near`, see `asp_of`). An update keeps both, along with every counter and
     /// `earned`. Emits `agent_registered`.
+    #[deny_unknown_arguments]
     pub fn register_agent(&mut self, profile_uri: String, profile_hash: String, tags: Vec<String>) {
         check_uri("profile_uri", &profile_uri);
         let hash = parse_hash(&profile_hash);
