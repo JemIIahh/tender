@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"attested_pick","data":[{"task_id":"1","signer_id":"nearai-tee-1","model":"Qwen/Qwen3.8-27B","request_hash":"c1277493658c555dd2440f130b9c645dc5bec3d3fc89a1f425c8e6d9ee2a1354","response_hash":"bbca0d694929bfd3d1cf027fbe402da23f24f689db96ca5df244fe5db335be7a"}]}
