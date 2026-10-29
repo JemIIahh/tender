@@ -11,12 +11,20 @@ import { Pool, TypeOverrides, types } from "pg";
  * u128 does not fit one). Still select them `::text`, so the query says what it returns, and
  * convert with `BigInt()`. int, float and boolean arrive as numbers and booleans, jsonb as
  * parsed JSON, timestamptz as `Date`, bytea as a plain `Uint8Array`.
+ *
+ * Errors keep the driver's message, `code` (the SQLSTATE) and `constraint`. PGlite's copies of the
+ * statement and its parameters are removed from them, since parameters can be blob bytes. Log
+ * `message` and `code`, not the whole error: for a NOT NULL or CHECK violation Postgres itself
+ * puts the failing row, bytes included, in `detail`.
  */
 export interface Db {
   /**
    * Runs one statement and returns its rows. Parameters are `$1`, `$2`, …, bound as in
    * node-postgres, on both drivers:
-   * - bigint is sent as exact decimal text, for numeric and bigint columns;
+   * - bigint is sent as exact decimal text, for numeric and bigint columns. A JS number is for
+   *   floats and integers up to 2^53 - 1: a larger integer throws a RangeError instead of being
+   *   rounded, as a parameter and inside a list or a JSON object, so ids and amounts are bigint
+   *   or text;
    * - an array is a Postgres array, as in `col = any($1)`. For a jsonb column pass JSON text,
    *   `JSON.stringify(list)`: an array bound to jsonb is an error, as it is on Postgres;
    * - a plain object is sent as JSON text for a jsonb column (a bigint inside it is written as a
@@ -60,10 +68,16 @@ const INT8 = 20;
 const JSON_TYPE = 114;
 const JSONB = 3802;
 const TEXT_ARRAY = 1009;
+const INT8_ARRAY = 1016;
+const NUMERIC = 1700;
 const NUMERIC_ARRAY = 1231;
 
 // pg's typings only know a list of common OIDs, which leaves out the array types.
 type KnownOid = Parameters<typeof types.getTypeParser>[0];
+
+// How long a caller waits for a pool connection, a new one or a free one, before it gets an error.
+// Without a limit, a host that does not answer holds the caller for as long as the OS allows.
+const CONNECT_TIMEOUT_MS = 10_000;
 
 /**
  * Opens a database. `pglite:memory` is an in-memory PGlite, `pglite:<dir>` a PGlite that keeps
@@ -96,15 +110,26 @@ async function openPglite(dir?: string): Promise<Db> {
 }
 
 async function openPostgres(url: string): Promise<Db> {
-  // pg already returns int8 and numeric as text. It differs from PGlite in two places. bytea: a
-  // Buffer where PGlite gives a Uint8Array, so hand out a plain Uint8Array copy. numeric[]: pg
-  // parses the elements into floats, which loses digits; read them as text, as PGlite does.
-  // Set on this pool only, not globally.
+  // This pool's own parsers; the process-wide ones are left alone. Where PGlite hands out exact text
+  // or a plain Uint8Array, so does this pool, whatever else in the process has done to pg's parsers:
+  // - int8, int8[], numeric and numeric[] are text. pg does that by default for the first three, but
+  //   its switch `defaults.parseInt8` turns int8 and int8[] into JS numbers for every pool without
+  //   parsers of its own, and its numeric[] parser reads the elements into floats, losing digits.
+  // - bytea is a plain Uint8Array copy; pg gives a Buffer.
   const parseBytea = types.getTypeParser(BYTEA);
+  const parseTextArray = types.getTypeParser(TEXT_ARRAY as number as KnownOid);
+  const asText = (text: string) => text;
   const parsers = new TypeOverrides();
   parsers.setTypeParser(BYTEA, (text: string) => new Uint8Array(parseBytea(text) as Uint8Array));
-  parsers.setTypeParser(NUMERIC_ARRAY, types.getTypeParser(TEXT_ARRAY as number as KnownOid));
-  const pool = new Pool({ connectionString: url, types: parsers });
+  parsers.setTypeParser(INT8, asText);
+  parsers.setTypeParser(INT8_ARRAY, parseTextArray);
+  parsers.setTypeParser(NUMERIC, asText);
+  parsers.setTypeParser(NUMERIC_ARRAY, parseTextArray);
+  const pool = new Pool({
+    connectionString: url,
+    types: parsers,
+    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
+  });
   // An idle connection can fail (server restart, network). Without a listener Node would treat
   // the pool's 'error' event as uncaught and exit; the pool replaces the connection itself.
   pool.on("error", (error) => {
@@ -135,18 +160,42 @@ function jsonParam(value: unknown): string {
   if (Array.isArray(value)) {
     throw new TypeError("a jsonb parameter must be JSON text: pass JSON.stringify(array)");
   }
-  return JSON.stringify(value, bigintAsText);
+  return JSON.stringify(value, exactJson);
 }
 
-function bigintAsText(_key: string, value: unknown): unknown {
+/** JSON.stringify replacer: a bigint is written as a decimal string; a rounded integer is refused. */
+function exactJson(_key: string, value: unknown): unknown {
+  assertNotRounded(value, "a number in a JSON parameter");
   return typeof value === "bigint" ? value.toString() : value;
+}
+
+/**
+ * PGlite attaches the statement, its parameters and the call options to every error it throws.
+ * An error is what gets logged, and the parameters can be blob bytes or a held-out answer, so
+ * those go. The rest stays: message, code (the SQLSTATE), constraint, and so on.
+ */
+function withoutCallContext(error: unknown): unknown {
+  if (typeof error === "object" && error !== null) {
+    for (const key of ["query", "params", "queryOptions"]) Reflect.deleteProperty(error, key);
+  }
+  return error;
 }
 
 function pgliteBackend(pglite: PGlite): Backend {
   const sessionOn = (target: PgliteTarget): Session => ({
-    run: async (sql, params) => (await target.query<Row>(sql, params)).rows,
+    run: async (sql, params) => {
+      try {
+        return (await target.query<Row>(sql, params)).rows;
+      } catch (error) {
+        throw withoutCallContext(error);
+      }
+    },
     script: async (sql) => {
-      await target.exec(sql);
+      try {
+        await target.exec(sql);
+      } catch (error) {
+        throw withoutCallContext(error);
+      }
     },
   });
   return {
@@ -176,6 +225,14 @@ function postgresBackend(pool: Pool): Backend {
     ...sessionOn(pool),
     async transaction(fn) {
       const client = await pool.connect();
+      // pg-pool takes its own 'error' listener off a client while it is checked out and puts it back
+      // on release. If the connection drops in between, pg emits 'error' on a client nobody listens
+      // to, and Node raises that as an uncaught exception, which ends the process. This listener
+      // only has to exist. The transaction still fails by itself: the statement that is running, the
+      // next one or the commit at the latest rejects on a dead client, and the client is then
+      // released as broken.
+      const ignoreLostConnection = () => undefined;
+      client.on("error", ignoreLostConnection);
       let broken = false;
       try {
         await client.query("begin");
@@ -191,6 +248,9 @@ function postgresBackend(pool: Pool): Backend {
         }
         throw error;
       } finally {
+        // Off again before the client goes back: the pool reuses it, and a listener per transaction
+        // would pile up on it.
+        client.off("error", ignoreLostConnection);
         // Releasing with true makes the pool discard the connection instead of reusing it.
         client.release(broken);
       }
@@ -271,19 +331,35 @@ function transactionDb(session: Session, counter: { savepoints: number }) {
 }
 
 /**
+ * Refuses an integer that a JS number cannot hold exactly (beyond 2^53 - 1). Its low digits are
+ * already gone by the time it gets here, so sending it would store a different number without a
+ * word. Floats and the integers a number does hold pass; so does anything that is not a number.
+ */
+function assertNotRounded(value: unknown, where: string): void {
+  if (typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value)) {
+    throw new RangeError(
+      `${where} is an integer beyond 2^53 - 1, which a JS number rounds; pass a bigint or decimal text`,
+    );
+  }
+  if (Array.isArray(value)) for (const item of value) assertNotRounded(item, where);
+}
+
+/**
  * Maps a JS value to something both drivers bind the same way. Strings, numbers, booleans, null,
  * dates, byte arrays and arrays go as they are (node-postgres binds an array as a Postgres
- * array, PGlite by the column's type). bigint becomes decimal text, because a JSON object with
- * a bigint inside would otherwise throw; other byte views become a Uint8Array; and a plain
- * object becomes JSON text, with any bigint inside it as a decimal string.
+ * array, PGlite by the column's type), except that an integer a number cannot hold exactly is
+ * refused, as a value or inside an array or a JSON object. bigint becomes decimal text, because a
+ * JSON object with a bigint inside would otherwise throw; other byte views become a Uint8Array;
+ * and a plain object becomes JSON text, with any bigint inside it as a decimal string.
  */
-function toParam(value: unknown): unknown {
+function toParam(value: unknown, index: number): unknown {
   if (value === undefined) return null;
   if (typeof value === "bigint") return value.toString();
+  assertNotRounded(value, `parameter $${index + 1}`);
   if (value === null || typeof value !== "object") return value;
   if (value instanceof Date || value instanceof Uint8Array || Array.isArray(value)) return value;
   if (ArrayBuffer.isView(value))
     return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  return JSON.stringify(value, bigintAsText);
+  return JSON.stringify(value, exactJson);
 }

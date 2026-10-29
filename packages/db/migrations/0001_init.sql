@@ -12,6 +12,9 @@ create table chain_cursor (
 );
 
 -- One row per contract event log line. unique (receipt_id, log_index) makes replaying a block a no-op.
+-- task_id is the task the event is about, copied out of data by the indexer: data.task_id, or data.id
+-- for task_created, which carries its id as "id". It is null for an event that names no task.
+-- The event stream (SSE), the notifier and the web app filter on it.
 create table events (
   id bigserial primary key,
   height numeric(40,0) not null,
@@ -20,8 +23,10 @@ create table events (
   log_index int not null,
   event text not null,
   data jsonb not null,
+  task_id numeric(40,0),
   unique (receipt_id, log_index)
 );
+create index events_task_id_idx on events (task_id);
 
 create table tasks (
   id numeric(40,0) primary key,
@@ -84,12 +89,12 @@ create table agents (
   profile_hash text not null,
   tags jsonb not null,
   name text,
-  entries int not null,
-  reveals int not null,
-  wins int not null,
+  entries int not null default 0,
+  reveals int not null default 0,
+  wins int not null default 0,
   earned jsonb not null default '{}',
-  picks_made int not null,
-  voids_after_reveals int not null,
+  picks_made int not null default 0,
+  voids_after_reveals int not null default 0,
   registered_height numeric(40,0) not null,
   is_team boolean not null default false
 );

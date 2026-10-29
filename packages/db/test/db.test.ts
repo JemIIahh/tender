@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -93,6 +94,7 @@ const SCHEMA: Record<string, string[]> = {
     "log_index integer",
     "event text",
     "data jsonb",
+    "task_id numeric(40,0)?",
   ],
   tasks: [
     "id numeric(40,0)",
@@ -142,12 +144,12 @@ const SCHEMA: Record<string, string[]> = {
     "profile_hash text",
     "tags jsonb",
     "name text?",
-    "entries integer",
-    "reveals integer",
-    "wins integer",
+    "entries integer = 0",
+    "reveals integer = 0",
+    "wins integer = 0",
     "earned jsonb = '{}'::jsonb",
-    "picks_made integer",
-    "voids_after_reveals integer",
+    "picks_made integer = 0",
+    "voids_after_reveals integer = 0",
     "registered_height numeric(40,0)",
     "is_team boolean = false",
   ],
@@ -195,6 +197,7 @@ const KEYS = [
   "blobs: primary key (sha256)",
   "chain_cursor: primary key (source)",
   "entries: primary key (task_id, account)",
+  "events: index (task_id)",
   "events: primary key (id)",
   "events: unique (receipt_id, log_index)",
   "funders: primary key (task_id, account)",
@@ -211,6 +214,13 @@ const KEYS = [
   "worker_cursor: primary key (name)",
   "working: primary key (task_id, account)",
 ].sort();
+
+// Every constraint that is not a key (those are in KEYS) and not NOT NULL (that is the "?" above;
+// Postgres 18 also lists NOT NULL in pg_constraint, 17 does not): no foreign key, no other CHECK.
+const CONSTRAINTS = [
+  "blobs: CHECK ((kind = ANY (ARRAY['brief'::text, 'criteria'::text, 'heldout'::text, " +
+    "'result'::text, 'scorecard'::text, 'profile'::text])))",
+];
 
 async function describeSchema(db: Db) {
   const columns = await db.query<{
@@ -246,7 +256,13 @@ async function describeSchema(db: Db) {
   const keys = keyRows
     .map((k) => `${k.tbl}: ${k.pk ? "primary key" : k.uniq ? "unique" : "index"} (${k.cols})`)
     .sort();
-  return { tables, keys };
+  const constraintRows = await db.query<{ tbl: string; def: string }>(
+    `select c.relname as tbl, pg_get_constraintdef(k.oid) as def
+       from pg_constraint k join pg_class c on c.oid = k.conrelid
+      where k.connamespace = current_schema()::regnamespace and k.contype not in ('p', 'u', 'n')`,
+  );
+  const constraints = constraintRows.map((k) => `${k.tbl}: ${k.def}`).sort();
+  return { tables, keys, constraints };
 }
 
 // What the drivers must hand back, whichever one is underneath. Every numeric and bigint is text.
@@ -255,6 +271,7 @@ async function probeRows(db: Db) {
     `select 340282366920938463463374607431768211455::numeric(40,0) as numeric_value,
             9007199254740993::bigint as bigint_value,
             array[340282366920938463463374607431768211455::numeric, 1::numeric] as numeric_array_value,
+            array[9007199254740993::bigint, 1::bigint, null] as int8_array_value,
             7::int as int_value, 1.5::float8 as float_value, true as bool_value,
             '{"a":[1,"x",null]}'::jsonb as jsonb_value,
             '\\x00ff10'::bytea as bytea_value,
@@ -295,6 +312,7 @@ async function probeRows(db: Db) {
     log_index: 0,
     event: "task_created",
     data: { id: "1", reward: "1000003" },
+    task_id: 1n,
   });
   const [event] = await db.query("select * from events where receipt_id = 'receipt-probe'");
 
@@ -313,6 +331,7 @@ const EXPECTED_PROBE = {
     numeric_value: U128_MAX,
     bigint_value: "9007199254740993",
     numeric_array_value: [U128_MAX, "1"],
+    int8_array_value: ["9007199254740993", "1", null],
     int_value: 7,
     float_value: 1.5,
     bool_value: true,
@@ -361,6 +380,7 @@ const EXPECTED_PROBE = {
     log_index: 0,
     event: "task_created",
     data: { id: "1", reward: "1000003" },
+    task_id: "1",
   },
   link: {
     chat_id: "-1001234567890123456",
@@ -438,9 +458,10 @@ describe.each(targets)("db on $name", (target) => {
   });
 
   it("schema_matches_the_brief", async () => {
-    const { tables, keys } = await describeSchema(db);
+    const { tables, keys, constraints } = await describeSchema(db);
     expect(tables).toEqual(SCHEMA);
     expect(keys).toEqual(KEYS);
+    expect(constraints).toEqual(CONSTRAINTS);
   });
 
   it("numeric_round_trips_as_text", async () => {
@@ -616,6 +637,101 @@ describe.each(targets)("db on $name", (target) => {
     expect(await sources()).toEqual(["nested-inner-ok", "nested-outer"]);
   });
 
+  it("nested_tx_survives_a_failed_statement", async () => {
+    const sources = async () =>
+      (
+        await db.query<{ source: string }>(
+          "select source from chain_cursor where source like 'nested-sql-%' order by source",
+        )
+      ).map((r) => r.source);
+    const insert = (tx: Db, source: string) =>
+      tx.query("insert into chain_cursor (source, height) values ($1, $2)", [source, 1n]);
+
+    await db.tx(async (tx) => {
+      await insert(tx, "nested-sql-outer");
+      // A statement the database rejects, not just a callback that throws: Postgres refuses every
+      // later command of the transaction until the savepoint has been rolled back.
+      await expect(
+        tx.tx(async (inner) => {
+          await insert(inner, "nested-sql-inner");
+          await insert(inner, "nested-sql-outer");
+        }),
+      ).rejects.toMatchObject({ code: "23505" });
+      await insert(tx, "nested-sql-after");
+    });
+    expect(await sources()).toEqual(["nested-sql-after", "nested-sql-outer"]);
+  });
+
+  it("unsafe_integers_are_refused_not_rounded", async () => {
+    // No JS number holds these exactly, so the digits that would be sent are not the digits meant.
+    for (const n of [2 ** 53, -(2 ** 53), 2 ** 60, 1e21, Number.MAX_VALUE]) {
+      await expect(db.query("select $1::numeric as n", [n])).rejects.toThrow(RangeError);
+    }
+    await expect(db.query("select $1::int as a, $2::numeric as b", [1, 2 ** 60])).rejects.toThrow(
+      /\$2/,
+    );
+    await expect(db.tx((tx) => tx.query("select $1::numeric as n", [2 ** 60]))).rejects.toThrow(
+      /\$1/,
+    );
+    // Inside a list for = any($1), and inside a JSON object.
+    await expect(db.query("select $1::numeric[] as n", [[1, 2 ** 60]])).rejects.toThrow(RangeError);
+    await expect(db.query("select $1::jsonb as n", [{ fee: { amount: 2 ** 60 } }])).rejects.toThrow(
+      RangeError,
+    );
+
+    // What a number does hold exactly goes through; a bigint or decimal text is the way for the rest.
+    expect(await db.query("select $1::numeric::text as n", [Number.MAX_SAFE_INTEGER])).toEqual([
+      { n: "9007199254740991" },
+    ]);
+    expect(await db.query("select $1::numeric::text as n", [Number.MIN_SAFE_INTEGER])).toEqual([
+      { n: "-9007199254740991" },
+    ]);
+    expect(await db.query("select $1::float8 as n", [1.5])).toEqual([{ n: 1.5 }]);
+    expect(await db.query("select $1::numeric::text as n", [2n ** 60n])).toEqual([
+      { n: "1152921504606846976" },
+    ]);
+    expect(await db.query("select $1::numeric::text as n", ["1152921504606846977"])).toEqual([
+      { n: "1152921504606846977" },
+    ]);
+    expect(await db.query("select $1::jsonb as n", [{ fee: 7 }])).toEqual([{ n: { fee: 7 } }]);
+  });
+
+  it("errors_carry_no_statement_or_parameters", async () => {
+    // PGlite attaches the statement and its parameters to every error it throws, and an error is
+    // what gets logged. The parameters can be blob bytes or a held-out answer.
+    const insert =
+      "insert into blobs (sha256, kind, content_type, bytes, is_public) values ('scrub', 'bad', 'x', $1, true)";
+    const secret = Uint8Array.of(0xde, 0xad, 0xbe, 0xef);
+    const attempts = [
+      () => db.query(insert, [secret]),
+      () => db.tx((tx) => tx.query(insert, [secret])),
+      () => db.tx((tx) => tx.tx((inner) => inner.query(insert, [secret]))),
+      () => db.exec(insert.replace("$1", "'\\xdeadbeef'")),
+    ];
+    for (const attempt of attempts) {
+      const error = await attempt().then(
+        () => undefined,
+        (thrown: unknown) => thrown,
+      );
+      expect(error).toBeInstanceOf(Error);
+      // The diagnosis stays: the message, the SQLSTATE and the constraint.
+      expect((error as Error).message).toContain("violates check constraint");
+      expect(error).toHaveProperty("code", "23514");
+      expect(error).toHaveProperty("constraint", "blobs_kind_check");
+      for (const property of ["query", "params", "queryOptions"]) {
+        expect(error).not.toHaveProperty(property);
+      }
+    }
+
+    const syntax = await db.query("selec 1").then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+    expect(syntax).toHaveProperty("code", "42601");
+    expect(syntax).not.toHaveProperty("query");
+    expect(syntax).not.toHaveProperty("params");
+  });
+
   it("blobs_put_get_idempotent", async () => {
     const bytes = Uint8Array.from({ length: 256 }, (_, i) => i);
     const sha = await putBlob(db, {
@@ -770,20 +886,45 @@ describe("openDb", () => {
 describe("postgres adapter against a fake pool", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  function fakePool(failOn?: RegExp) {
+  function fakePool(failOn?: RegExp, dropOn?: RegExp) {
     const log: string[] = [];
     const queries: unknown[] = [];
     const pools: pg.Pool[] = [];
+    // What an 'error' event threw because nobody was listening. In production that is an uncaught
+    // exception, and it ends the process.
+    const uncaught: unknown[] = [];
     const release = vi.fn();
-    const client = {
+    let dead = false;
+    // pg emits 'error' on a dead client from its socket handler, where nothing up the stack can
+    // catch what the emit throws, so the fake catches it here and keeps it.
+    const socketError = (error: Error) => {
+      dead = true;
+      try {
+        client.emit("error", error);
+      } catch (thrown) {
+        uncaught.push(thrown);
+      }
+    };
+    // A pg client is an EventEmitter. pg-pool takes its own 'error' listener off a client while it
+    // is checked out, so this one starts with none, as in production.
+    const client = Object.assign(new EventEmitter(), {
       query: async (q: string | { text: string }) => {
         const text = typeof q === "string" ? q : q.text;
         log.push(text);
+        if (dead) throw new Error("Client has encountered a connection error and is not queryable");
         if (failOn?.test(text)) throw new Error(`fake failure on: ${text}`);
+        if (dropOn?.test(text)) {
+          // As in pg: the statement fails, and the client emits 'error' before the caller has
+          // seen the failure.
+          const lost = new Error("Connection terminated unexpectedly");
+          dead = true;
+          queueMicrotask(() => socketError(lost));
+          throw lost;
+        }
         return { rows: [] };
       },
       release,
-    };
+    });
     vi.spyOn(pg.Pool.prototype, "connect").mockImplementation((async () => client) as never);
     vi.spyOn(pg.Pool.prototype, "query").mockImplementation(function (
       this: pg.Pool,
@@ -794,15 +935,17 @@ describe("postgres adapter against a fake pool", () => {
       return Promise.resolve({ rows: [] });
     } as never);
     const end = vi.spyOn(pg.Pool.prototype, "end").mockImplementation((async () => {}) as never);
-    return { log, queries, pools, release, end };
+    return { log, queries, pools, release, end, client, uncaught, socketError };
   }
   const open = () => openDb("postgres://tester:secret@localhost:1/none");
   const discarded = (release: ReturnType<typeof vi.fn>) => Boolean(release.mock.calls[0]?.[0]);
 
   it("commits and returns the connection", async () => {
-    const { log, release } = fakePool();
+    const { log, release, client } = fakePool();
     const db = await open();
+    let listening = 0;
     const value = await db.tx(async (tx) => {
+      listening = client.listenerCount("error");
       await tx.query("select 1 as one");
       return "ok";
     });
@@ -810,10 +953,14 @@ describe("postgres adapter against a fake pool", () => {
     expect(log).toEqual(["begin", "select 1 as one", "commit"]);
     expect(release).toHaveBeenCalledTimes(1);
     expect(discarded(release)).toBe(false);
+    // Somebody listens for a lost connection while the transaction holds the client, and nobody is
+    // left on it afterwards: the pool reuses the client, and a listener per transaction would pile up.
+    expect(listening).toBe(1);
+    expect(client.listenerCount("error")).toBe(0);
   });
 
   it("rolls back, keeps the original error and returns the connection", async () => {
-    const { log, release } = fakePool();
+    const { log, release, client } = fakePool();
     const db = await open();
     await expect(
       db.tx(async (tx) => {
@@ -824,6 +971,7 @@ describe("postgres adapter against a fake pool", () => {
     expect(log).toEqual(["begin", "select 1 as one", "rollback"]);
     expect(release).toHaveBeenCalledTimes(1);
     expect(discarded(release)).toBe(false);
+    expect(client.listenerCount("error")).toBe(0);
   });
 
   it("rolls back after a failed statement or a failed commit", async () => {
@@ -864,6 +1012,48 @@ describe("postgres adapter against a fake pool", () => {
     expect(log).toHaveLength(before);
   });
 
+  // pg-pool takes its own 'error' listener off a client that is checked out. A connection that drops
+  // meanwhile makes pg emit 'error' on a client nobody listens to, which Node raises as an uncaught
+  // exception: the whole process dies, not just the transaction. The transaction must fail alone.
+  it.each([
+    {
+      when: "between two statements",
+      dropOn: undefined,
+      failsWith: /not queryable/,
+      body: async (tx: Db, socketError: (error: Error) => void) => {
+        await tx.query("select 1");
+        socketError(new Error("read ECONNRESET"));
+        await tx.query("select 2");
+      },
+    },
+    {
+      when: "after the last statement, so the commit finds it",
+      dropOn: undefined,
+      failsWith: /not queryable/,
+      body: async (tx: Db, socketError: (error: Error) => void) => {
+        await tx.query("select 1");
+        socketError(new Error("read ECONNRESET"));
+      },
+    },
+    {
+      when: "while a statement is running",
+      dropOn: /^select 2$/,
+      failsWith: /Connection terminated unexpectedly/,
+      body: async (tx: Db) => {
+        await tx.query("select 1");
+        await tx.query("select 2");
+      },
+    },
+  ])("fails the transaction, not the process, when the connection drops $when", async (c) => {
+    const { client, release, uncaught, socketError } = fakePool(undefined, c.dropOn);
+    const db = await open();
+    await expect(db.tx((tx) => c.body(tx, socketError))).rejects.toThrow(c.failsWith);
+    expect(uncaught).toEqual([]);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(discarded(release)).toBe(true);
+    expect(client.listenerCount("error")).toBe(0);
+  });
+
   it("returns what Postgres sends in the same shapes as PGlite", async () => {
     const { pools } = fakePool();
     await open();
@@ -874,6 +1064,7 @@ describe("postgres adapter against a fake pool", () => {
       numeric_value: parse(1700, U128_MAX),
       bigint_value: parse(20, "9007199254740993"),
       numeric_array_value: parse(1231, `{${U128_MAX},1}`),
+      int8_array_value: parse(1016, "{9007199254740993,1,NULL}"),
       int_value: parse(23, "7"),
       float_value: parse(701, "1.5"),
       bool_value: parse(16, "t"),
@@ -882,6 +1073,50 @@ describe("postgres adapter against a fake pool", () => {
       timestamptz_value: parse(1184, "2026-10-29 12:00:00+00"),
       null_value: null,
     }).toStrictEqual(EXPECTED_PROBE.literals);
+  });
+
+  it("keeps ids, counts and amounts as text when the whole process parses them as numbers", async () => {
+    const { pools } = fakePool();
+    // What some other module in the process may have done: pg's own switch (int8 and int8[] become
+    // JS numbers for every pool without parsers of its own) and a common snippet for numeric.
+    const defaultNumeric = pg.types.getTypeParser(1700);
+    pg.defaults.parseInt8 = true;
+    pg.types.setTypeParser(1700, parseFloat);
+    try {
+      await open();
+      const types = pools[0]?.options.types;
+      const parse = (oid: number, text: string) => types?.getTypeParser(oid, "text")(text);
+      expect(parse(20, "9007199254740993")).toBe("9007199254740993");
+      expect(parse(1016, "{9007199254740993,1,NULL}")).toEqual(["9007199254740993", "1", null]);
+      expect(parse(1700, U128_MAX)).toBe(U128_MAX);
+    } finally {
+      pg.defaults.parseInt8 = false;
+      pg.types.setTypeParser(1700, defaultNumeric);
+    }
+  });
+
+  it("gives the pool a connection timeout, so an unreachable host fails in seconds", async () => {
+    const { pools } = fakePool();
+    await open();
+    expect(pools[0]?.options.connectionTimeoutMillis).toBe(10_000);
+  });
+
+  it.each(["postgres", "postgresql"])("opens %s:// urls through the pool", async (scheme) => {
+    const { pools } = fakePool();
+    const url = `${scheme}://tester:secret@localhost:1/none`;
+    const db = await openDb(url);
+    expect(pools[0]?.options.connectionString).toBe(url);
+    await db.close();
+  });
+
+  it("logs an idle connection that fails instead of letting it crash the process", async () => {
+    const { pools } = fakePool();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await open();
+    // An EventEmitter throws on 'error' when nobody listens, and the pool is no exception.
+    expect(() => pools[0]?.emit("error", new Error("idle connection reset"))).not.toThrow();
+    expect(logged).toHaveBeenCalledTimes(1);
+    expect(String(logged.mock.calls[0]?.[0])).toContain("idle connection reset");
   });
 
   it("hands pg parameters it binds the way PGlite does", async () => {
