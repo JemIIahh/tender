@@ -24,7 +24,7 @@ import {
 
 const TASK = "7";
 const OTHER_TASK = "8";
-/** Task 7's tags and people, but only two invitees may enter it. */
+/** Task 7's tags and people, but only three invitees may enter it. */
 const INVITE_ONLY_TASK = "15";
 const TITLE = "Summarise the Q3 report";
 
@@ -35,6 +35,7 @@ const BACKER_1 = "backer1.fund.near"; // agent of fund.near
 const BACKER_2 = "backer2.near"; // not registered
 const BOT_1 = "bot1.acme.near"; // agent of acme.near: committed and revealed
 const BOT_2 = "bot2.acme.near"; // agent of acme.near, no chat of its own: committed, not revealed
+const BOT_3 = "bot3.acme.near"; // agent of acme.near with a chat of its own, in no task at all
 const SOLO = "solo.near"; // not registered: committed and revealed on task 7, not on task 8
 const LONE = "lone.near"; // agent without an ASP: committed, not revealed on task 7, revealed on 8
 // Task 8's accounts.
@@ -53,7 +54,8 @@ const CHATS = {
   fund: { id: 130, account: "fund.near" }, // backer1's ASP
   backer2: { id: 104, account: BACKER_2 },
   bot1: { id: 201, account: BOT_1 },
-  acme: { id: 202, account: "acme.near" }, // the ASP of bot1 and of bot2
+  acme: { id: 202, account: "acme.near" }, // the ASP of bot1, bot2 and bot3
+  bot3: { id: 205, account: BOT_3 }, // a sibling of bot1 and bot2: not their owner
   solo: { id: 203, account: SOLO },
   lone: { id: 204, account: LONE },
   bystander: { id: 301, account: "bystander.near" }, // has nothing to do with any task
@@ -84,6 +86,7 @@ async function seedWorld(db: Db): Promise<void> {
   await seedAgent(db, BACKER_1, { asp: "fund.near" });
   await seedAgent(db, BOT_1, { asp: "acme.near" });
   await seedAgent(db, BOT_2, { asp: "acme.near" });
+  await seedAgent(db, BOT_3, { asp: "acme.near" });
   await seedAgent(db, LONE);
   await seedAgent(db, BOT_9, { asp: "beta.near" });
 
@@ -124,7 +127,7 @@ async function seedWorld(db: Db): Promise<void> {
     verifier: VERIFIER,
     title: "Review the vendor contract",
     tags: ["research", "summary"],
-    invited: [BOT_1, BOT_2],
+    invited: [BOT_1, BOT_2, SOLO],
   });
   await seedFunder(db, INVITE_ONLY_TASK, POSTER);
   await seedFunder(db, INVITE_ONLY_TASK, BACKER_2);
@@ -293,11 +296,16 @@ test("verifier_owner_chats_hear_reveal_open_and_winner_paid", async () => {
   expect(await resolveRecipients(db, { ...paid16, taskId: "17" })).toEqual([]);
 });
 
-test("new_task_for_an_invite_only_task_skips_tag_watchers", async () => {
-  // Task 15 has task 7's tags, but only two invitees may enter it, so the chats watching research
-  // and summary do not hear of it. The poster's owner chats still do.
+test("new_task_for_an_invite_only_task_reaches_the_poster_and_the_invitees_owners", async () => {
+  // Task 15 has task 7's tags and invites bot1, bot2 and solo. The owner chats of each invitee
+  // hear: bot1's own chat, the chat of acme.near (the ASP of bot1 and of bot2), and solo's, which
+  // is an account with no agent row and so has no ASP. The poster's owner chats still hear too.
+  //
+  // Nobody else does. Not lone, an agent nobody invited. Not bot3, an agent of acme.near that was
+  // not invited: its own chat is not an owner chat of bot1. Not the chats watching research and
+  // summary, since watchers cannot enter the task.
   const alert = { ...ALERT.new_task, taskId: INVITE_ONLY_TASK };
-  expect(await who(alert)).toEqual(names("poster", "lab"));
+  expect(await who(alert)).toEqual(names("poster", "lab", "bot1", "acme", "solo"));
 });
 
 test("pool_grew_for_an_invite_only_task_skips_tag_watchers", async () => {
@@ -310,14 +318,17 @@ test("pool_grew_for_an_invite_only_task_skips_tag_watchers", async () => {
 
 test("muted_chats_excluded", async () => {
   // Mute each chat that hears an alert, one at a time: it drops out and nobody else does, so the
-  // account arm, the ASP arm and the tag arm of every kind all respect the mute.
-  for (const alert of Object.values(ALERT)) {
+  // account arm, the ASP arm and the tag arm of every kind all respect the mute. The invite-only
+  // new_task is in the list for the chats of its invitees.
+  const inviteOnly = { ...ALERT.new_task, taskId: INVITE_ONLY_TASK };
+  for (const alert of [...Object.values(ALERT), inviteOnly]) {
+    const which = `${alert.kind} on task ${alert.taskId}`;
     const everyone = await resolveRecipients(db, alert);
-    expect(everyone.length, `${alert.kind} has recipients`).toBeGreaterThan(0);
+    expect(everyone.length, `${which} has recipients`).toBeGreaterThan(0);
     for (const chat of everyone) {
       await setMuted(chat, true);
       try {
-        expect(await resolveRecipients(db, alert), `${alert.kind} with chat ${chat} muted`).toEqual(
+        expect(await resolveRecipients(db, alert), `${which} with chat ${chat} muted`).toEqual(
           everyone.filter((other) => other !== chat),
         );
       } finally {

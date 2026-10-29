@@ -7,10 +7,15 @@ import type { Alert } from "./alerts";
  *
  * An entry is revealed once it has a `content_hash`. The column stays null from the commit until
  * the `revealed` event sets it, together with `uri`.
+ *
+ * `invitees` are the accounts in `tasks.invited`, a jsonb array of account ids. An open task has
+ * none.
  */
 const ACCOUNTS = {
   poster: "select poster as account from tasks where id = $1::numeric",
   verifier: "select verifier as account from tasks where id = $1::numeric",
+  invitees:
+    "select i.account from tasks t, jsonb_array_elements_text(t.invited) as i(account) where t.id = $1::numeric",
   funders: "select account from funders where task_id = $1::numeric",
   committers: "select account from entries where task_id = $1::numeric",
   revealers: "select account from entries where task_id = $1::numeric and content_hash is not null",
@@ -40,7 +45,9 @@ interface Audience {
 function audienceOf(a: Alert): Audience {
   switch (a.kind) {
     case "new_task":
-      return { ownerChatsOf: ["poster"], watchers: true };
+      // A task open to everyone goes to the tag watchers. One with invitees skips them (see
+      // WATCHERS) and goes to the owners of its invitees instead.
+      return { ownerChatsOf: ["poster", "invitees"], watchers: true };
     case "agent_started":
       return { chatsOf: ["poster"], ownerChatsOf: ["agent"] };
     case "entry_committed":
@@ -76,7 +83,8 @@ const NO_CHATS = "select null::bigint as chat_id where false";
  * not.
  *
  * A task with invitees (`invited` is not the empty array) is not announced to watchers, because
- * they cannot enter it. Its poster, funders and entrants hear as usual.
+ * they cannot enter it. Its poster, funders and entrants hear as usual, and so do the owners of
+ * its invitees, in `new_task`.
  */
 const WATCHERS = `
   select w.chat_id
@@ -123,7 +131,7 @@ function queryFor({ chatsOf = [], ownerChatsOf = [], watchers = false }: Audienc
  *
  * - A muted chat hears nothing.
  * - Chats that watch a tag hear `new_task` and `pool_grew` only for a task open to everyone: one
- *   with invitees stays off them.
+ *   with invitees stays off them, and its `new_task` goes to the owner chats of its invitees.
  * - The poster, verifier, committers, funders and tags all come from the database by `a.taskId`,
  *   and `new_task`'s own `tags` are not read. A task that is not in the database therefore reaches
  *   nobody, except that `agent_started` still reaches the owner chats of the agent it names.
