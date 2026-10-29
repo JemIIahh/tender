@@ -11,6 +11,12 @@ importers:
       '@biomejs/biome':
         specifier: 2.6.4
         version: 2.6.4
+      '@tender/client':
+        specifier: workspace:*
+        version: link:packages/client
+      '@tender/shared':
+        specifier: workspace:*
+        version: link:packages/shared
       '@types/node':
         specifier: 24.19.2
         version: 24.19.2

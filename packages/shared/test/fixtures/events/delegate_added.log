@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"delegate_added","data":[{"account":"poster.test.near","public_key":"ed25519:GF2UCksdEsabAzeQiQUy4sTZSBXFuNCeq7Yv7RC72oz9","token":"token.test.near","per_task_cap":"5000","total_cap":"10000"}]}

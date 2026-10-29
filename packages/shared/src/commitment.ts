@@ -5,19 +5,15 @@ const U64_BYTES = 8;
 const U32_BYTES = 4;
 /** The content hash and the salt are each a `[u8; 32]` in the contract. */
 const ARRAY_BYTES = 32;
+/** The contract's `parse_hash` takes 64 lowercase hex characters and rejects uppercase. */
+const LOWERCASE_HEX_32 = /^[0-9a-f]{64}$/;
 
-/** Decodes `hex` and checks that it is exactly 32 bytes. `name` says which argument in errors. */
+/** Decodes a 32-byte value given as 64 lowercase hex characters. `name` says which in errors. */
 function array32(name: string, hex: string): Uint8Array {
-  let bytes: Uint8Array;
-  try {
-    bytes = hexToBytes(hex);
-  } catch (cause) {
-    throw new Error(`${name} is not valid hex`, { cause });
+  if (!LOWERCASE_HEX_32.test(hex)) {
+    throw new Error(`${name} must be 64 lowercase hex characters`);
   }
-  if (bytes.length !== ARRAY_BYTES) {
-    throw new Error(`${name} must be ${ARRAY_BYTES} bytes, got ${bytes.length}`);
-  }
-  return bytes;
+  return hexToBytes(hex);
 }
 
 /**
@@ -27,8 +23,11 @@ function array32(name: string, hex: string): Uint8Array {
  *
  *   u64 LE task id | u32 LE byte length of account | account in UTF-8 | content hash | salt
  *
- * where the content hash and the salt are 32 bytes each. Throws if the task id does not fit a u64
- * or if either hex string is not 32 bytes of hex.
+ * where the content hash and the salt are 32 bytes each. Both must be given as exactly 64 lowercase
+ * hex characters, the form the contract takes (its `parse_hash` rejects uppercase). Uppercase hex
+ * would give a valid commitment, but revealing with the same strings would then fail with E_HASH,
+ * so it is refused here. Throws if either string is anything else, or if the task id does not fit
+ * a u64.
  */
 export function computeCommitment(
   taskId: bigint,
