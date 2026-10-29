@@ -16,6 +16,8 @@ const PATH = /^\$(?:\.[^.[]+|\[(?:0|[1-9]\d*)\])*$/;
 const SEGMENT = /\.([^.[]+)|\[(\d+)\]/g;
 /** What a path finds when it leads nowhere. Not `undefined` or `null`: `null` is a JSON value. */
 const MISSING = Symbol("missing");
+/** What `checkJsonSchemaUsable` runs a schema on: the smallest document of each JSON type. */
+const TRIAL_DOCUMENTS: unknown[] = [null, true, 0, "", [], {}];
 
 /**
  * Scores a `json_schema` entry. The bytes must be valid UTF-8 holding one JSON document that fits
@@ -31,8 +33,10 @@ const MISSING = Symbol("missing");
  *
  * Pure and total: any bytes give a score, and none of them can make this throw. A document nested
  * so deeply that validating it overflows the stack scores 0, and so does every document when the
- * schema itself cannot be compiled (the criteria say what a task asks for, and a task that asks
- * for something that cannot be checked pays nobody).
+ * schema itself cannot be used: it does not compile, it is an `$async` schema, or it throws when
+ * it is evaluated (the criteria say what a task asks for, and a task that asks for something that
+ * cannot be checked pays nobody). `checkJsonSchemaUsable` lets task intake find such a schema
+ * before any agent enters.
  */
 export function scoreJsonSchema(
   c: JsonSchemaCriteria,
@@ -68,26 +72,84 @@ export function scoreJsonSchema(
   );
 }
 
+/**
+ * Whether `scoreJsonSchema` can use `schema` to score anything. Task intake can use this to turn
+ * a task away before any agent enters it, rather than let every entry score 0.
+ *
+ * It compiles the schema with the scorer's own Ajv options, refuses what the scorer refuses (an
+ * `$async` schema), and runs the schema on a few small documents, which finds the schemas that
+ * throw when they are evaluated. It cannot reach every part of a schema. One that throws only on
+ * some documents passes this check, and the scorer scores such a document 0.
+ */
+export function checkJsonSchemaUsable(
+  schema: Record<string, unknown>,
+): { ok: true } | { ok: false; reason: string } {
+  const compiled = compile(schema);
+  if ("reason" in compiled) return { ok: false, reason: compiled.reason };
+
+  for (const trial of TRIAL_DOCUMENTS) {
+    const run = validateOnce(compiled.validate, trial);
+    if ("error" in run) return { ok: false, reason: cannotEvaluate(run.error) };
+  }
+  return { ok: true };
+}
+
 /** The reasons `document` does not fit `schema`, or `null` when it fits. */
 function checkSchema(schema: Record<string, unknown>, document: unknown): string[] | null {
+  const compiled = compile(schema);
+  if ("reason" in compiled) return [compiled.reason];
+
+  const run = validateOnce(compiled.validate, document);
+  if ("error" in run) {
+    // Under a recursive schema Ajv recurses once per level of nesting, and JSON.parse reads
+    // documents far deeper than the stack allows. Whatever else a schema does to throw, the
+    // document it throws on scores 0 like any other that does not fit.
+    return [
+      run.error instanceof RangeError ? "too deeply nested to validate" : cannotEvaluate(run.error),
+    ];
+  }
+  if (run.fits) return null;
+  return (compiled.validate.errors ?? []).slice(0, MAX_SCHEMA_ERRORS).map(formatError);
+}
+
+/** `schema` compiled, or why it cannot be used. */
+function compile(
+  schema: Record<string, unknown>,
+): { validate: ValidateFunction } | { reason: string } {
   let validate: ValidateFunction;
   try {
     validate = newAjv().compile(schema);
   } catch (error) {
-    const why = error instanceof Error ? error.message : String(error);
-    return [`criteria schema cannot be compiled: ${why}`];
+    return { reason: `criteria schema cannot be compiled: ${messageOf(error)}` };
   }
+  // With `$async: true` the validator returns a Promise. A Promise is truthy whatever the
+  // document, so every document would fit, and the Promise rejects, unhandled, for the ones that
+  // do not. Ajv sets the flag to exactly `true`, for any truthy `$async`.
+  if ((validate as { $async?: boolean }).$async === true) {
+    return { reason: 'criteria schema cannot be compiled: "$async" schemas are not supported' };
+  }
+  return { validate };
+}
 
-  let fits: boolean;
+/** Runs `validate` on `document`: whether it fits, or what the schema threw. */
+function validateOnce(
+  validate: ValidateFunction,
+  document: unknown,
+): { fits: boolean } | { error: unknown } {
   try {
-    fits = validate(document);
+    // Only `true` fits. Nothing that is merely truthy does.
+    return { fits: validate(document) === true };
   } catch (error) {
-    // Under a recursive schema Ajv recurses once per level of nesting, and JSON.parse reads
-    // documents far deeper than the stack allows. Any other error is a bug: let it surface.
-    if (error instanceof RangeError) return ["too deeply nested to validate"];
-    throw error;
+    return { error };
   }
-  return fits ? null : (validate.errors ?? []).slice(0, MAX_SCHEMA_ERRORS).map(formatError);
+}
+
+function cannotEvaluate(error: unknown): string {
+  return `criteria schema cannot be evaluated: ${messageOf(error)}`;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**

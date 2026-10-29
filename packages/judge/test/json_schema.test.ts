@@ -1,6 +1,6 @@
 import type { Heldout, PublicCriteria } from "@tender/shared";
 import { afterEach, expect, test, vi } from "vitest";
-import { type EntryScore, scoreJsonSchema } from "../src/index";
+import { checkJsonSchemaUsable, type EntryScore, scoreJsonSchema } from "../src/index";
 
 type JsonSchemaCriteria = Extract<PublicCriteria, { kind: "json_schema" }>;
 // `Heldout` is a union, so `Heldout["json_schema"]` does not compile: pick the member first.
@@ -75,6 +75,74 @@ const INVOICE_CHECKS = heldout(
 /** Scores `document` against the schema `{}` (anything fits) and one held-out check. */
 function single(document: unknown, path: string, equals: unknown): EntryScore {
   return scoreJsonSchema(criteria({}), heldout(check(path, equals)), json(document));
+}
+
+// Written as a code point, so that the character can be seen in the source.
+const REPLACEMENT_CHARACTER = String.fromCodePoint(0xfffd);
+
+/** A tree: an array of arrays of arrays, as deep as the document goes. */
+const TREE_SCHEMA = {
+  $defs: { node: { type: "array", items: { $ref: "#/$defs/node" } } },
+  $ref: "#/$defs/node",
+};
+
+const NOT_COMPILED = /^criteria schema cannot be compiled: /;
+const NOT_EVALUATED = /^criteria schema cannot be evaluated: /;
+
+/**
+ * Schemas that cannot be used to score, with the start of the reason given for each. Some do not
+ * compile. An `$async` schema compiles, but its validator returns a Promise, which is truthy
+ * whatever the document. A dynamic reference to a name every object has compiles too, and then
+ * throws when it is evaluated.
+ */
+const UNUSABLE: Record<string, { schema: Record<string, unknown>; reason: RegExp }> = {
+  "an unknown type": { schema: { type: "banana" }, reason: NOT_COMPILED },
+  "a reference that cannot be resolved": {
+    schema: { $ref: "http://example.com/schema.json" },
+    reason: NOT_COMPILED,
+  },
+  "a draft-07 $schema": {
+    schema: { $schema: "http://json-schema.org/draft-07/schema#", type: "object" },
+    reason: NOT_COMPILED,
+  },
+  "a pattern that is not a regular expression": {
+    schema: { type: "object", properties: { a: { pattern: "[" } } },
+    reason: NOT_COMPILED,
+  },
+  "an async schema": {
+    schema: { $async: true, type: "object", required: ["x"] },
+    reason: NOT_COMPILED,
+  },
+  "an async schema whose flag is not literally true": {
+    schema: { $async: "yes", type: "object", required: ["x"] },
+    reason: NOT_COMPILED,
+  },
+  "a dynamic reference to constructor": {
+    schema: { $dynamicRef: "#constructor" },
+    reason: NOT_EVALUATED,
+  },
+  "a dynamic reference to __proto__": {
+    schema: { $dynamicRef: "#__proto__" },
+    reason: NOT_EVALUATED,
+  },
+  "a dynamic reference to valueOf": { schema: { $dynamicRef: "#valueOf" }, reason: NOT_EVALUATED },
+};
+
+/** The unhandled rejections Node reports while `work` runs, and for a moment after it. */
+async function rejectionsDuring(work: () => void): Promise<unknown[]> {
+  const seen: unknown[] = [];
+  const record = (reason: unknown): void => {
+    seen.push(reason);
+  };
+  process.on("unhandledRejection", record);
+  try {
+    work();
+    // Node reports a rejection that nothing handles once the microtask queue has drained.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } finally {
+    process.off("unhandledRejection", record);
+  }
+  return seen;
 }
 
 afterEach(() => {
@@ -285,8 +353,8 @@ test("inputs_are_not_modified", () => {
 
 test("invalid_utf8_scores_zero", () => {
   const c = criteria({ type: "object" });
-  const checks = heldout(check("$.name", "�"));
-  // A decoder that replaces bad bytes would read this as {"name":"�"}, which fits and matches.
+  const checks = heldout(check("$.name", REPLACEMENT_CHARACTER));
+  // A decoder that replaces bad bytes would read this as the name U+FFFD, which fits and matches.
   const raw = Uint8Array.from([...bytes('{"name":"'), 0xff, ...bytes('"}')]);
 
   expect(scoreJsonSchema(c, checks, raw)).toEqual({
@@ -295,7 +363,7 @@ test("invalid_utf8_scores_zero", () => {
     reasons: ["not valid UTF-8"],
   });
   // The same document, encoded properly, scores 100.
-  expect(scoreJsonSchema(c, checks, bytes('{"name":"�"}')).score).toBe(100);
+  expect(scoreJsonSchema(c, checks, bytes(`{"name":"${REPLACEMENT_CHARACTER}"}`)).score).toBe(100);
 });
 
 test("passed_means_score_reaches_min_score", () => {
@@ -362,24 +430,63 @@ test("unusable_paths_never_match", () => {
   expect(at("$.a.constructor.name", "Array")).toBe(0);
 });
 
-test("unusable_schema_scores_zero", () => {
-  const schemas: Record<string, Record<string, unknown>> = {
-    "an unknown type": { type: "banana" },
-    "a reference that cannot be resolved": { $ref: "http://example.com/schema.json" },
-    "a draft-07 $schema": { $schema: "http://json-schema.org/draft-07/schema#", type: "object" },
-    "a pattern that is not a regular expression": {
-      type: "object",
-      properties: { a: { pattern: "[" } },
-    },
-  };
+test("unusable_schema_scores_zero", async () => {
+  const rejections = await rejectionsDuring(() => {
+    for (const [label, { schema, reason }] of Object.entries(UNUSABLE)) {
+      // The held-out check holds for `{}`, so a score above 0 can only come from the schema.
+      const result = scoreJsonSchema(criteria(schema), heldout(check("$", {})), json({}));
+      expect(result.score, label).toBe(0);
+      expect(result.passed, label).toBe(false);
+      expect(result.reasons, label).toHaveLength(1);
+      expect(result.reasons[0], label).toMatch(reason);
+    }
+  });
 
-  for (const [label, schema] of Object.entries(schemas)) {
-    const result = scoreJsonSchema(criteria(schema), heldout(check("$", {})), json({}));
-    expect(result.score, label).toBe(0);
-    expect(result.passed, label).toBe(false);
-    expect(result.reasons, label).toHaveLength(1);
-    expect(result.reasons[0], label).toMatch(/^criteria schema cannot be compiled: /);
+  // An async schema is never run: its validator would return a Promise, and that rejects with
+  // nobody to handle it for every document that does not fit.
+  expect(rejections).toEqual([]);
+});
+
+test("schema_check_rejects_unusable_schemas", async () => {
+  const rejections = await rejectionsDuring(() => {
+    for (const [label, { schema, reason }] of Object.entries(UNUSABLE)) {
+      const usable = checkJsonSchemaUsable(schema);
+      expect(usable.ok, label).toBe(false);
+      if (!usable.ok) expect(usable.reason, label).toMatch(reason);
+    }
+  });
+  expect(rejections).toEqual([]);
+
+  // A schema that refers to itself without end overflows the stack on any document, even the
+  // smallest, so the trial run finds it.
+  expect(checkJsonSchemaUsable({ $ref: "#" })).toEqual({
+    ok: false,
+    reason: expect.stringMatching(NOT_EVALUATED),
+  });
+
+  // A schema may throw for some types of document only, so the trial has one of each type. Here
+  // `then` is evaluated for documents of one type. (It is parsed from JSON text because Biome takes
+  // a `then` in an object literal for a thenable; to the schema it is a keyword.)
+  for (const type of ["null", "boolean", "number", "string", "array", "object"]) {
+    const reachedByOneType = JSON.parse(
+      `{"if":{"type":"${type}"},"then":{"$dynamicRef":"#constructor"}}`,
+    );
+    expect(checkJsonSchemaUsable(reachedByOneType).ok, type).toBe(false);
   }
+
+  // Schemas the scorer can use. A trial document that does not fit is no reason to refuse, and
+  // neither is a keyword or a format Ajv does not know: the check uses the scorer's own options.
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const workable = [
+    INVOICE_SCHEMA,
+    TREE_SCHEMA,
+    {},
+    { type: "object", required: ["a"] },
+    { type: "string", minLength: 10 },
+    { type: "string", format: "no-such-format", "x-note": "nobody knows this keyword" },
+  ];
+  for (const schema of workable) expect(checkJsonSchemaUsable(schema)).toEqual({ ok: true });
+  expect(warn).not.toHaveBeenCalled();
 });
 
 test("formats_are_enforced", () => {
@@ -449,19 +556,14 @@ test("non_finite_numbers_fail", () => {
 
 test("deep_nesting_scores_zero", () => {
   const tooDeep = { score: 0, passed: false, reasons: ["too deeply nested to validate"] };
-  // A tree: an array of arrays of arrays, as deep as the document goes.
-  const tree = {
-    $defs: { node: { type: "array", items: { $ref: "#/$defs/node" } } },
-    $ref: "#/$defs/node",
-  };
   const checks = heldout(check("$", []));
 
   expect(
-    scoreJsonSchema(criteria(tree), heldout(check("$[0][0]", [])), bytes("[[[]]]")).score,
+    scoreJsonSchema(criteria(TREE_SCHEMA), heldout(check("$[0][0]", [])), bytes("[[[]]]")).score,
   ).toBe(100);
   // JSON.parse reads this, and Ajv overflows the stack validating it: a result, not an exception.
   const deep = bytes("[".repeat(100_000) + "]".repeat(100_000));
-  expect(scoreJsonSchema(criteria(tree), checks, deep)).toEqual(tooDeep);
+  expect(scoreJsonSchema(criteria(TREE_SCHEMA), checks, deep)).toEqual(tooDeep);
   // A schema that refers to itself without end overflows the same way, for any document.
   expect(scoreJsonSchema(criteria({ $ref: "#" }), checks, bytes("{}"))).toEqual(tooDeep);
 });
