@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { CriteriaKindSchema, JsonValueSchema } from "./criteria";
-import { AccountIdSchema, HashHexSchema, U64StringSchema } from "./views";
+import { AccountIdSchema, HashHexSchema, U64StringSchema } from "./primitives";
 
 /** One revealed entry's result. */
 const ScorecardEntrySchema = z.strictObject({

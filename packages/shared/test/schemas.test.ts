@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { expect, test } from "vitest";
+import { expect, expectTypeOf, test } from "vitest";
 import type { ZodType } from "zod";
 import {
   AccountIdSchema,
@@ -12,10 +12,13 @@ import {
   EntryViewSchema,
   formatTokenAmount,
   HashHexSchema,
+  type Heldout,
   HeldoutSchema,
   heldoutMatchesCriteria,
+  JsonValueSchema,
   NETWORKS,
   PhaseSchema,
+  type PublicCriteria,
   PublicCriteriaSchema,
   parseTokenAmount,
   ScorecardSchema,
@@ -26,6 +29,7 @@ import {
   U64StringSchema,
   U128StringSchema,
 } from "../src/index";
+import { edited, type Json, members, pathOf } from "./json-paths";
 
 const FIXTURES = new URL("./fixtures/", import.meta.url);
 
@@ -49,12 +53,34 @@ const HASH = "ab".repeat(32);
 // Digits that are not ASCII. A parser that takes any Unicode digit for a digit would accept them.
 const ARABIC_INDIC_THREE = String.fromCodePoint(0x0663);
 const FULLWIDTH_ONE = String.fromCodePoint(0xff11);
+// An instance of a class is no plain object, so no JSON.
+class Point {
+  x = 1;
+}
+
+// The views with the sample that the tests below change one place of: the contract's own, except
+// for the delegate, which the contract has no code for yet (see the task 15 test below).
+const DELEGATE = {
+  token: "token.test.near",
+  per_task_cap: "5000",
+  total_cap: "10000",
+  spent: "4000",
+};
+const VIEWS: Record<string, { schema: ZodType; doc: Json }> = {
+  task_view: { schema: TaskViewSchema, doc: sample("task_view") as Json },
+  entry_view: { schema: EntryViewSchema, doc: sample("entry_view") as Json },
+  agent_view: { schema: AgentViewSchema, doc: sample("agent_view") as Json },
+  config_view: { schema: ConfigViewSchema, doc: sample("config_view") as Json },
+  storage_view: { schema: StorageViewSchema, doc: sample("storage_view") as Json },
+  delegate_view: { schema: DelegateViewSchema, doc: DELEGATE },
+};
 
 // ---------------------------------------------------------------------------------------------
 // Views: the real samples
 // ---------------------------------------------------------------------------------------------
-// A schema drops keys it does not know, so `parse(sample)` equal to `sample` shows that the
-// schema names every field the contract sends. A field added to a contract view fails these.
+// A view schema drops keys it does not know, so `parse(sample)` equal to `sample` shows that it
+// names every field in the sample. A field the contract adds to a view shows up here once the
+// sample is captured again.
 
 test("task_view_accepts_contract_sample", () => {
   const real = sample("task_view");
@@ -149,12 +175,7 @@ test("config_view_accepts_pending_owner_derived", () => {
 // Hand-written, not captured: the contract has no delegate keys yet. The fields are those of
 // `get_delegate` in plan 01 Task 15. Replace this with a captured sample when that task lands.
 test("delegate_view_matches_the_task_15_shape", () => {
-  const delegate = {
-    token: "token.test.near",
-    per_task_cap: "5000",
-    total_cap: "10000",
-    spent: "4000",
-  };
+  const delegate = DELEGATE;
   expect(DelegateViewSchema.parse(delegate)).toEqual(delegate);
   for (const field of ["per_task_cap", "total_cap", "spent"]) {
     expect(failures(DelegateViewSchema, { ...delegate, [field]: 5000 }), field).toEqual([field]);
@@ -293,6 +314,66 @@ test("small_integers_stay_json_integers", () => {
   ]);
 });
 
+// Every u64 and u128 field of every view and of the scorecard: where it is in the sample, and the
+// width of its Rust type.
+const WIDTHS: Array<[view: string, path: string, width: "u64" | "u128"]> = [
+  ["task_view", "id", "u64"],
+  ["task_view", "reward", "u128"],
+  ["task_view", "created_at", "u64"],
+  ["task_view", "commit_deadline", "u64"],
+  ["task_view", "reveal_deadline", "u64"],
+  ["task_view", "pick_deadline", "u64"],
+  ["task_view", "fallback_deadline", "u64"],
+  ["task_view", "parent", "u64"],
+  ["task_view", "funders.0.amount", "u128"],
+  ["task_view", "outcome.fee", "u128"],
+  ["task_view", "outcome.winners.0.amount", "u128"],
+  ["entry_view", "task_id", "u64"],
+  ["entry_view", "committed_at_block", "u64"],
+  ["agent_view", "registered_at", "u64"],
+  ["agent_view", "earned.0.amount", "u128"],
+  ["config_view", "tokens.0.min_reward", "u128"],
+  ["config_view", "tokens.0.max_reward", "u128"],
+  ["storage_view", "total", "u128"],
+  ["storage_view", "available", "u128"],
+  ["storage_view", "used_bytes", "u64"],
+  ["delegate_view", "per_task_cap", "u128"],
+  ["delegate_view", "total_cap", "u128"],
+  ["delegate_view", "spent", "u128"],
+  ["scorecard", "task_id", "u64"],
+  ["scorecard", "entries.0.committed_at_block", "u64"],
+];
+
+test("u64_and_u128_fields_take_their_maximum_and_no_more", () => {
+  // The top of the type is accepted and the next number is not, so a u128 field typed as a u64
+  // fails the first check and a u64 field typed as a u128 fails the second.
+  const top = { u64: U64_MAX, u128: U128_MAX };
+  const past = { u64: "18446744073709551616", u128: "340282366920938463463374607431768211456" };
+  const subjects: typeof VIEWS = {
+    ...VIEWS,
+    scorecard: { schema: ScorecardSchema, doc: scorecard() as Json },
+  };
+  for (const [view, dotted, width] of WIDTHS) {
+    const subject = subjects[view];
+    if (!subject) throw new Error(`no sample for ${view}`);
+    const where = `${view}.${dotted}`;
+    const fits = edited(subject.doc, pathOf(dotted), top[width]);
+    expect(accepts(subject.schema, fits), `${where} = ${width} max`).toBe(true);
+    const tooBig = edited(subject.doc, pathOf(dotted), past[width]);
+    expect(accepts(subject.schema, tooBig), `${where} = max + 1`).toBe(false);
+  }
+
+  // The table leaves none out: every decimal string of every sample is in it.
+  const listed = new Set(WIDTHS.map(([view, dotted]) => `${view}.${dotted}`));
+  for (const [view, { doc }] of Object.entries(subjects)) {
+    for (const { path, value } of members(doc)) {
+      if (typeof value !== "string" || !/^\d+$/.test(value)) continue;
+      const field = path.map((step) => (typeof step === "number" ? 0 : step)).join(".");
+      expect(listed.has(`${view}.${field}`), `${view}.${field}`).toBe(true);
+    }
+  }
+});
+
 // ---------------------------------------------------------------------------------------------
 // Views: hashes, account ids, closed vocabularies
 // ---------------------------------------------------------------------------------------------
@@ -404,7 +485,8 @@ test("phases_and_outcomes_are_closed_sets", () => {
 
 test("views_ignore_fields_the_contract_may_add_later", () => {
   // A contract upgrade that adds a field must not break clients that predate it, so a view drops
-  // what it does not know. The sample tests above are what notice such a field.
+  // what it does not know. The sample tests above notice such a field once a sample is captured
+  // again.
   const task = sample("task_view");
   const parsed = TaskViewSchema.parse({ ...task, added_later: true });
   expect(parsed).toEqual(task);
@@ -418,6 +500,34 @@ test("views_reject_missing_fields", () => {
     const { [field]: _removed, ...rest } = task;
     expect(failures(TaskViewSchema, rest), `without ${field}`).toEqual([field]);
   }
+});
+
+// The Option fields of the contract's views, written `<view>.<path>`: the only places a null is
+// valid. The contract writes the key either way.
+const NULLABLE = new Set([
+  "task_view.heldout_commitment",
+  "task_view.parent",
+  "task_view.outcome",
+  "entry_view.content_hash",
+  "entry_view.uri",
+  "agent_view.asp",
+  "config_view.pending_owner",
+]);
+
+test("only_option_fields_accept_null", () => {
+  // Each key and each array element of each sample, set to null on its own.
+  const seen = new Set<string>();
+  for (const [view, { schema, doc }] of Object.entries(VIEWS)) {
+    for (const { path } of members(doc)) {
+      const where = `${view}.${path.join(".")}`;
+      expect(accepts(schema, edited(doc, path, null)), `${where} -> null`).toBe(
+        NULLABLE.has(where),
+      );
+      seen.add(where);
+    }
+  }
+  // no entry of the set names a path that no sample has
+  for (const where of NULLABLE) expect(seen.has(where), where).toBe(true);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -735,6 +845,7 @@ test("heldout_rejects_malformed_documents", () => {
     ["json_schema without assertions", { json_schema: { assertions: [] } }],
     ["an assertion with no value", { json_schema: { assertions: [{ path: "$.a" }] } }],
     ["an assertion with no path", { json_schema: { assertions: [{ equals: 1 }] } }],
+    ["an assertion with an empty path", { json_schema: { assertions: [{ path: "", equals: 1 }] } }],
     ["tests without cases", { tests: { cases: [] } }],
     ["a case with no output", { tests: { cases: [{ input: 1 }] } }],
     ["regex_cases without no_match", { regex_cases: { match: ["a"] } }],
@@ -742,6 +853,63 @@ test("heldout_rejects_malformed_documents", () => {
     ["a stray key in the shape", { exact: { expected: ["x"], note: "hint" } }],
   ];
   for (const [what, doc] of bad) expect(accepts(HeldoutSchema, doc), what).toBe(false);
+});
+
+test("heldout_and_criteria_keep_their_types", () => {
+  // Types, checked by `tsc`: the schemas hand out these shapes, whatever they do inside.
+  expectTypeOf<Heldout>().toEqualTypeOf<
+    | { exact: { expected: string[] } }
+    | { json_schema: { assertions: Array<{ path: string; equals: unknown }> } }
+    | { regex_cases: { match: string[]; no_match: string[] } }
+    | { tests: { cases: Array<{ input: unknown; output: unknown }> } }
+  >();
+  expectTypeOf<Extract<PublicCriteria, { kind: "json_schema" }>["schema"]>().toEqualTypeOf<
+    Record<string, unknown>
+  >();
+  // So checking the key of a parsed document tells which shape it is.
+  const doc = HeldoutSchema.parse(HELDOUT.regex_cases);
+  expect("regex_cases" in doc && doc.regex_cases.no_match).toEqual(["1900-02-29"]);
+});
+
+test("heldout_reports_a_mistake_where_it_is", () => {
+  // The code and path of every issue. The key picks the shape, so a mistake inside it is the one
+  // issue, and not an `invalid_union` that lists what is wrong with each of the four shapes.
+  const issues = (doc: unknown): string[][] => {
+    const result = HeldoutSchema.safeParse(doc);
+    return result.success ? [] : result.error.issues.map((i) => [i.code, i.path.join(".")]);
+  };
+  expect(issues({ regex_cases: { match: ["a"] } })).toEqual([
+    ["invalid_type", "regex_cases.no_match"],
+  ]);
+  expect(issues({ regex_cases: { match: ["a"], no_match: [1] } })).toEqual([
+    ["invalid_type", "regex_cases.no_match.0"],
+  ]);
+  expect(issues({ exact: { expected: [] } })).toEqual([["too_small", "exact.expected"]]);
+  expect(issues({ exact: { expected: ["x"], note: "hint" } })).toEqual([
+    ["unrecognized_keys", "exact"],
+  ]);
+  expect(issues({ json_schema: { assertions: [{ path: "", equals: 1 }] } })).toEqual([
+    ["too_small", "json_schema.assertions.0.path"],
+  ]);
+  expect(issues({ tests: { cases: [{ input: 1 }] } })).toEqual([
+    ["custom", "tests.cases.0.output"],
+  ]);
+  // A kind with no value (undefined) is not a document that is missing fields.
+  expect(issues({ exact: undefined })).toEqual([["invalid_type", "exact"]]);
+
+  // A document that is not keyed by one kind.
+  const oneKey = [["custom", ""]];
+  expect(issues({})).toEqual(oneKey);
+  expect(issues({ ...HELDOUT.exact, ...HELDOUT.regex_cases })).toEqual(oneKey);
+  expect(issues({ fuzzy: { expected: ["x"] } })).toEqual([["unrecognized_keys", ""]]);
+  expect(issues({ ...HELDOUT.exact, fuzzy: 1 })).toEqual([["unrecognized_keys", ""]]);
+  expect(issues({ rubric: [{ criterion: "c", weight: 1 }] })).toEqual([["unrecognized_keys", ""]]);
+  for (const notAnObject of [null, ["exact"], "exact", 1]) {
+    expect(issues(notAnObject), JSON.stringify(notAnObject)).toEqual([["invalid_type", ""]]);
+  }
+  // The message says what a held-out document is.
+  const message = HeldoutSchema.safeParse({}).error?.issues[0]?.message;
+  expect(message).toMatch(/exactly one key.*exact, json_schema, regex_cases or tests/);
 });
 
 test("heldout_kind_must_match", () => {
@@ -868,6 +1036,10 @@ test("scorecard_rejects_bad_scores_and_fields", () => {
   expect(failures(ScorecardSchema, { ...card, entries: entry({ content_hash: "abc" }) })).toEqual([
     "entries.0.content_hash",
   ]);
+  // An entry that was revealed has somewhere its work can be fetched from.
+  expect(failures(ScorecardSchema, { ...card, entries: entry({ uri: "" }) })).toEqual([
+    "entries.0.uri",
+  ]);
   expect(failures(ScorecardSchema, { ...card, entries: entry({ account: "Alice" }) })).toEqual([
     "entries.0.account",
   ]);
@@ -948,6 +1120,192 @@ test("scorecard_generated_at_is_iso_8601", () => {
   expect(failures(ScorecardSchema, { ...card, generated_at: 1793307169820 })).toEqual([
     "generated_at",
   ]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Documents: strict at every level
+// ---------------------------------------------------------------------------------------------
+
+test("documents_reject_an_unknown_key_at_every_object_level", () => {
+  const attachment = { name: "invoice.pdf", uri: "ipfs://bafyattachment", sha256: HASH };
+  const documents: Array<[name: string, schema: ZodType, doc: Json]> = [
+    ["brief", BriefSchema, { ...BRIEF, attachments: [attachment] }],
+    ...Object.entries(CRITERIA).map(([kind, doc]): [string, ZodType, Json] => [
+      `${kind} criteria`,
+      PublicCriteriaSchema,
+      doc,
+    ]),
+    ...Object.entries(HELDOUT).map(([kind, doc]): [string, ZodType, Json] => [
+      `${kind} held-out`,
+      HeldoutSchema,
+      doc,
+    ]),
+    ["scorecard", ScorecardSchema, scorecard() as Json],
+  ];
+  // Values that a document carries as they are may have any keys: the JSON Schema, the published
+  // held-out document, and the inputs, outputs and expected values of cases.
+  const freeForm = /^(schema|heldout)(\.|$)|\.(input|output|equals)(\.|$)/;
+
+  let levels = 0;
+  for (const [name, schema, doc] of documents) {
+    expect(accepts(schema, doc), `${name} as it is`).toBe(true);
+    const objects = members(doc)
+      .filter(({ value }) => typeof value === "object" && value !== null && !Array.isArray(value))
+      .map(({ path }) => path);
+    for (const path of [[], ...objects]) {
+      if (freeForm.test(path.join("."))) continue;
+      const what = `${name}: ${path.join(".") || "the document"} + an unknown key`;
+      expect(accepts(schema, edited(doc, [...path, "unexpected"], 1)), what).toBe(false);
+      levels += 1;
+    }
+  }
+  // 3 in a brief, 8 in the five criteria, 13 in the four held-out documents and 6 in a scorecard.
+  expect(levels).toBe(30);
+});
+
+// ---------------------------------------------------------------------------------------------
+// JSON values inside documents
+// ---------------------------------------------------------------------------------------------
+
+/** A 1 inside `levels` wrappers, each an array unless `wrap` says otherwise. */
+function nested(levels: number, wrap: (inner: unknown) => unknown = (inner) => [inner]): unknown {
+  let value: unknown = 1;
+  for (let level = 0; level < levels; level++) value = wrap(value);
+  return value;
+}
+const inObject = (inner: unknown) => ({ k: inner });
+
+test("json_values_nest_64_levels_deep_and_no_deeper", () => {
+  for (const wrap of [(inner: unknown) => [inner], inObject]) {
+    expect(accepts(JsonValueSchema, nested(64, wrap))).toBe(true);
+    expect(accepts(JsonValueSchema, nested(65, wrap))).toBe(false);
+  }
+  // Arrays and objects count together.
+  const alternating = (inner: unknown) => ({ k: [inner] });
+  expect(accepts(JsonValueSchema, nested(32, alternating))).toBe(true);
+  expect(accepts(JsonValueSchema, nested(33, alternating))).toBe(false);
+  // A value that contains itself is deeper than any limit: refused, not walked for ever.
+  const loop: unknown[] = [];
+  loop.push(loop, loop);
+  expect(accepts(JsonValueSchema, loop)).toBe(false);
+});
+
+test("json_values_nested_beyond_the_call_stack_fail_instead_of_throwing", () => {
+  // z.json() recursed, and threw a RangeError from about 1,400 levels. These are refused like
+  // any other bad value.
+  for (const levels of [2_000, 100_000]) {
+    for (const wrap of [(inner: unknown) => [inner], inObject]) {
+      const deep = nested(levels, wrap);
+      expect(() => JsonValueSchema.safeParse(deep)).not.toThrow();
+      expect(accepts(JsonValueSchema, deep), `${levels} levels`).toBe(false);
+    }
+  }
+  // Wherever a document carries a JSON value.
+  expect(
+    failures(PublicCriteriaSchema, { ...CRITERIA.json_schema, schema: nested(9_999, inObject) }),
+  ).toEqual(["schema"]);
+  expect(failures(ScorecardSchema, { ...scorecard(), heldout: nested(9_999) })).toEqual([
+    "heldout",
+  ]);
+  const cases = [{ input: nested(9_999), output: 1 }];
+  expect(failures(HeldoutSchema, { tests: { cases } })).toEqual(["tests.cases.0.input"]);
+});
+
+test("json_values_with_an_own_proto_key_fail_instead_of_losing_it", () => {
+  // JSON.parse makes it an own key. (An object literal would set the prototype instead.) A parser
+  // that builds a new object has to drop the key, and the copy then hashes differently.
+  const evil = JSON.parse('{"__proto__": {"admin": true}, "ok": 1}');
+  expect(Object.hasOwn(evil, "__proto__")).toBe(true);
+  expect(accepts(JsonValueSchema, evil)).toBe(false);
+  expect(accepts(JsonValueSchema, [1, { deeper: [evil] }])).toBe(false);
+
+  // Wherever a document carries a JSON value.
+  expect(failures(PublicCriteriaSchema, { ...CRITERIA.json_schema, schema: evil })).toEqual([
+    "schema",
+  ]);
+  const properties = { schema: { type: "object", properties: evil } };
+  expect(failures(PublicCriteriaSchema, { ...CRITERIA.json_schema, ...properties })).toEqual([
+    "schema",
+  ]);
+  const examples = [{ input: evil, output: 1 }];
+  expect(failures(PublicCriteriaSchema, { ...CRITERIA.tests, examples })).toEqual([
+    "examples.0.input",
+  ]);
+  const assertions = [{ path: "$.a", equals: evil }];
+  expect(failures(HeldoutSchema, { json_schema: { assertions } })).toEqual([
+    "json_schema.assertions.0.equals",
+  ]);
+  const cases = [{ input: 1, output: evil }];
+  expect(failures(HeldoutSchema, { tests: { cases } })).toEqual(["tests.cases.0.output"]);
+  expect(failures(ScorecardSchema, { ...scorecard(), heldout: evil })).toEqual(["heldout"]);
+
+  // Only an own key of that name counts: it as a value, close names, and every object's inherited
+  // `__proto__` are fine.
+  for (const ok of [{ a: "__proto__" }, { __proto: 1, proto__: 2, prototype: 3 }, ["__proto__"]]) {
+    expect(accepts(JsonValueSchema, ok), JSON.stringify(ok)).toBe(true);
+  }
+});
+
+test("json_values_are_returned_as_they_came", () => {
+  // The value itself, not a copy: nothing is dropped, reordered or rebuilt on the way through.
+  const value = { b: [1, { c: null }], a: "x" };
+  expect(JsonValueSchema.parse(value)).toBe(value);
+  const schema = { type: "object", properties: { total: { type: "number" } } };
+  const criteria = PublicCriteriaSchema.parse({ ...CRITERIA.json_schema, schema });
+  expect(criteria.kind === "json_schema" && criteria.schema).toBe(schema);
+  const input = [1, { n: 2 }];
+  const parsed = PublicCriteriaSchema.parse({
+    ...CRITERIA.tests,
+    examples: [{ input, output: 3 }],
+  });
+  expect(parsed.kind === "tests" && parsed.examples[0]?.input).toBe(input);
+});
+
+test("json_values_are_what_json_can_hold", () => {
+  const sparse: unknown[] = new Array(3);
+  sparse[0] = 1;
+  sparse[2] = 3;
+  const ok: [string, unknown][] = [
+    ["null", null],
+    ["a boolean", false],
+    ["a number", -1.5],
+    ["negative zero", -0],
+    ["an empty string", ""],
+    ["empty containers", [[], {}]],
+    ["an object with no prototype", Object.assign(Object.create(null), { a: 1 })],
+    ["keys named like built-ins", { constructor: 1, toString: 2, hasOwnProperty: 3 }],
+    ["a document", { total: [redacted], items: [{ n: "a" }, null], "": true }],
+  ];
+  for (const [what, value] of ok) expect(accepts(JsonValueSchema, value), what).toBe(true);
+
+  const bad: [string, unknown][] = [
+    ["undefined", undefined],
+    ["NaN", Number.NaN],
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["a bigint", 1n],
+    ["a symbol", Symbol("s")],
+    ["a function", () => 1],
+    ["undefined in an array", [1, undefined]],
+    ["a hole in an array", sparse],
+    ["undefined in an object", { a: undefined }],
+    ["a Date", new Date(0)],
+    ["a Map", new Map()],
+    ["a class instance", new Point()],
+    ["an object with a prototype of its own", Object.create({ inherited: 1 })],
+    ["a boxed number", new Number(1)],
+    ["a symbol key", { [Symbol("k")]: 1 }],
+  ];
+  for (const [what, value] of bad) expect(accepts(JsonValueSchema, value), what).toBe(false);
+  // An array that claims a million elements is refused at its first hole, not walked to the end.
+  let reads = 0;
+  const claims = new Proxy(new Array(1_000_000), {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^\d+$/.test(key)) reads += 1;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  expect(accepts(JsonValueSchema, claims)).toBe(false);
+  expect(reads).toBe(1);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1033,10 +1391,73 @@ test("canonical_json_rejects_values_json_cannot_hold", () => {
     ["a Date", new Date(0)],
     ["a Map", new Map([["a", 1]])],
     ["a Uint8Array", new Uint8Array([1])],
+    ["an instance of a class", new Point()],
+    ["an object with a prototype of its own", Object.create({ inherited: 1 })],
+    ["a boxed string", new String("s")],
   ];
   for (const [what, value] of bad) expect(() => canonicalJson(value), what).toThrow(TypeError);
   // The message says where.
   expect(() => canonicalJson({ entries: [{ score: Number.NaN }] })).toThrow(/entries\[0\]\.score/);
+});
+
+test("canonical_json_accepts_plain_objects_only", () => {
+  // Plain means a prototype of `Object.prototype` or none. The message names the place and the
+  // class.
+  expect(() => canonicalJson({ at: new Point() })).toThrow(/instance of Point.* at \$\.at$/);
+  expect(() => canonicalJson([[new Date(0)]])).toThrow(/instance of Date.* at \$\[0\]\[0\]$/);
+  expect(() => canonicalJson({ a: Object.create({ x: 1 }) })).toThrow(/at \$\.a$/);
+  const bare = Object.assign(Object.create(null), { b: 2, a: [Object.create(null)] });
+  expect(text(canonicalJson(bare))).toBe('{"a":[{}],"b":2}');
+  // What JSON.parse makes is plain.
+  const parsed = JSON.parse('{"z":{"y":[{"x":1}]}}');
+  expect(text(canonicalJson(parsed))).toBe('{"z":{"y":[{"x":1}]}}');
+});
+
+test("canonical_json_rejects_a_value_that_contains_itself", () => {
+  // A TypeError that says where the loop closes, not the RangeError of a stack that ran out.
+  const loop: Record<string, unknown> = { name: "loop" };
+  loop.self = loop;
+  expect(() => canonicalJson(loop)).toThrow(TypeError);
+  expect(() => canonicalJson(loop)).toThrow(/circular reference at \$\.self$/);
+
+  const list: unknown[] = [];
+  const holder = { list };
+  list.push({ holder });
+  expect(() => canonicalJson(holder)).toThrow(/circular reference at \$\.list\[0\]\.holder$/);
+  const ring: unknown[] = [];
+  ring.push([ring]);
+  expect(() => canonicalJson(ring)).toThrow(/circular reference at \$\[0\]\[0\]$/);
+
+  // The same object in two places is not a loop, and is written in both.
+  const shared = { n: 1 };
+  expect(text(canonicalJson({ a: shared, b: [shared, shared] }))).toBe(
+    '{"a":{"n":1},"b":[{"n":1},{"n":1}]}',
+  );
+});
+
+test("canonical_json_escapes_keys_as_strings", () => {
+  // Keys that need escaping, keys of digits (JavaScript lists those first, in numeric order), and
+  // the text of a pattern. They go out sorted by code unit.
+  const keys = ['a"b', "a\\b", "a\nb", "^\\d+$", "10", "9", "007", ""];
+  const doc = Object.fromEntries(keys.map((key, i) => [key, i]));
+  const bytes = canonicalJson(doc);
+  // As written out: a backslash is `\\`, a quote is `\"` and a newline is `\n`.
+  expect(text(bytes)).toBe(
+    String.raw`{"":7,"007":6,"10":4,"9":5,"^\\d+$":3,"a\nb":2,"a\"b":0,"a\\b":1}`,
+  );
+  expect(JSON.parse(text(bytes))).toEqual(doc);
+  // A key and a value are escaped alike.
+  expect(text(canonicalJson({ [keys[0] ?? ""]: keys[0] }))).toBe(String.raw`{"a\"b":"a\"b"}`);
+});
+
+test("canonical_json_rejects_the_holes_of_a_sparse_array", () => {
+  // `map` would skip a hole and `join` would write [1,,3], which is not JSON.
+  const sparse: unknown[] = new Array(3);
+  sparse[0] = 1;
+  sparse[2] = 3;
+  expect(() => canonicalJson(sparse)).toThrow(TypeError);
+  expect(() => canonicalJson(sparse)).toThrow(/\$\[1\]/);
+  expect(() => canonicalJson({ list: new Array(2) })).toThrow(/\$\.list\[0\]/);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1161,6 +1582,17 @@ test("token_meta_names_known_tokens_and_never_guesses_decimals", () => {
     symbol: "token.test.near",
     decimals: 0,
   });
+  // The test tokens exist only where they can: `usdc.sandbox` on the sandbox, and `tusdc.*` on any
+  // network but mainnet, where anyone may register such a name. Elsewhere they are unknown tokens.
+  const raw = (id: string) => ({ symbol: id, decimals: 0 });
+  expect(tokenMeta("usdc.sandbox", "testnet")).toEqual(raw("usdc.sandbox"));
+  expect(tokenMeta("usdc.sandbox", "mainnet")).toEqual(raw("usdc.sandbox"));
+  expect(tokenMeta("tusdc.test.near", "testnet")).toEqual({ symbol: "tUSDC", decimals: 6 });
+  expect(tokenMeta("tusdc.test.near", "mainnet")).toEqual(raw("tusdc.test.near"));
+  expect(tokenMeta("tusdc.tender.testnet", "mainnet")).toEqual(raw("tusdc.tender.testnet"));
+  // `tusdc.` has to start the id. On the sandbox the test token has its own id as well.
+  expect(tokenMeta("x.tusdc.test.near", "sandbox")).toEqual(raw("x.tusdc.test.near"));
+  expect(tokenMeta("usdc.sandbox.near", "sandbox")).toEqual(raw("usdc.sandbox.near"));
   // `tusdc` must be a whole first label: a lookalike is not a test token.
   expect(tokenMeta("tusdc-fake.near", "mainnet").decimals).toBe(0);
   expect(tokenMeta("faketusdc.near", "mainnet").decimals).toBe(0);

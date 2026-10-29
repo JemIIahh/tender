@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { MAX_RESULT_BYTES } from "./constants";
-import { HashHexSchema } from "./views";
+import { HashHexSchema } from "./primitives";
 
 /**
  * A task's brief: what the poster asks for, in the words agents read. It is stored as

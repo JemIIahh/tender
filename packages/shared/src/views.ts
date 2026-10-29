@@ -1,63 +1,24 @@
 import { z } from "zod";
+import {
+  AccountIdSchema,
+  HashHexSchema,
+  U8Schema,
+  U16Schema,
+  U32Schema,
+  U64StringSchema,
+  U128StringSchema,
+} from "./primitives";
 
 // The schemas below check what the contract's view methods return (contract/tender/src/types.rs),
-// field for field. They follow the contract's JSON, which writes numbers by their Rust type:
-//
-// - A u64 or u128 (ids, nanosecond timestamps, block heights, byte counts, amounts) is a decimal
-//   string, because a JSON number loses digits above 2^53.
-// - A u8, u16 or u32 (basis points, counts, windows in seconds, indexes, the version) is a JSON
-//   integer.
+// field for field. They follow the contract's JSON, which writes numbers by their Rust type: a u64
+// or u128 is a decimal string and a u8, u16 or u32 a JSON integer (see `primitives.ts`).
 //
 // A view schema drops a key it does not know, so a field a later contract upgrade adds does not
-// break a client that predates it. The sample tests are what notice a new field.
+// break a client that predates it. The sample tests notice a new field once a sample is captured
+// again from the new contract.
 
-const U64_MAX = 2n ** 64n - 1n;
-const U128_MAX = 2n ** 128n - 1n;
-/** What `U64` and `U128` write: ASCII digits, no sign, no leading zero. */
-const CANONICAL_DECIMAL = /^(?:0|[1-9][0-9]*)$/;
-/** NEAR's account id pattern. It is checked on short strings only, see `AccountIdSchema`. */
-const ACCOUNT_ID = /^(?:(?:[a-z\d]+[-_])*[a-z\d]+\.)*(?:[a-z\d]+[-_])*[a-z\d]+$/;
-const ACCOUNT_ID_MIN_LENGTH = 2;
-const ACCOUNT_ID_MAX_LENGTH = 64;
-
-/**
- * A decimal string for a number up to `max`. The length is checked first so that nothing parses a
- * huge string, and the whole check is one function because a throw inside a second check would
- * escape `safeParse`.
- */
-function decimalString(max: bigint, type: string) {
-  const maxLength = max.toString().length;
-  return z
-    .string()
-    .refine(
-      (s) => s.length <= maxLength && CANONICAL_DECIMAL.test(s) && BigInt(s) <= max,
-      `expected a ${type} as a decimal string`,
-    );
-}
-
-/** A u64 as the contract's `U64` writes it: a decimal string from "0" to "18446744073709551615". */
-export const U64StringSchema = decimalString(U64_MAX, "u64");
-/** A u128 as the contract's `U128` writes it, up to "340282366920938463463374607431768211455". */
-export const U128StringSchema = decimalString(U128_MAX, "u128");
-
-/** A NEAR account id: 2 to 64 characters, lowercase alphanumerics joined by `.`, `-` or `_`. */
-export const AccountIdSchema = z
-  .string()
-  .refine(
-    (s) =>
-      s.length >= ACCOUNT_ID_MIN_LENGTH && s.length <= ACCOUNT_ID_MAX_LENGTH && ACCOUNT_ID.test(s),
-    "expected a NEAR account id",
-  );
-
-/** A SHA-256 as the contract writes one: 64 lowercase hex characters. */
-export const HashHexSchema = z
-  .string()
-  .regex(/^[0-9a-f]{64}$/, "expected 64 lowercase hex characters");
-
-const uint = (max: number) => z.int().min(0).max(max);
-const U8 = uint(255);
-const U16 = uint(65_535);
-const U32 = uint(4_294_967_295);
+// Defined in `primitives.ts`. These four stay exported from here, where `index.ts` finds them.
+export { AccountIdSchema, HashHexSchema, U64StringSchema, U128StringSchema };
 
 /** Where a task is in its life. The contract derives it from block time and the outcome. */
 export const PhaseSchema = z.enum([
@@ -82,7 +43,7 @@ const FunderViewSchema = z.object({
 /** One winner's share of a pick. */
 const PayoutViewSchema = z.object({
   account: AccountIdSchema,
-  bps: U16,
+  bps: U16Schema,
   amount: U128StringSchema,
 });
 
@@ -113,7 +74,7 @@ export const TaskViewSchema = z.object({
   poster: AccountIdSchema,
   token: AccountIdSchema,
   reward: U128StringSchema,
-  fee_bps: U16,
+  fee_bps: U16Schema,
   brief_uri: z.string(),
   brief_hash: HashHexSchema,
   criteria_hash: HashHexSchema,
@@ -125,14 +86,14 @@ export const TaskViewSchema = z.object({
   pick_deadline: U64StringSchema,
   fallback_deadline: U64StringSchema,
   /** 0 means unlimited. */
-  max_entries: U32,
-  max_winners: U8,
+  max_entries: U32Schema,
+  max_winners: U8Schema,
   /** Empty means open to anyone. */
   invited: z.array(AccountIdSchema),
   parent: U64StringSchema.nullable(),
-  commit_count: U32,
-  reveal_count: U32,
-  cleaned: U32,
+  commit_count: U32Schema,
+  reveal_count: U32Schema,
+  cleaned: U32Schema,
   funders: z.array(FunderViewSchema),
   /** `null` until the task is settled. */
   outcome: OutcomeViewSchema.nullable(),
@@ -145,7 +106,7 @@ export const EntryViewSchema = z.object({
   task_id: U64StringSchema,
   account: AccountIdSchema,
   /** The entry's place in the task's entrant order, from 0. */
-  index: U32,
+  index: U32Schema,
   commitment: HashHexSchema,
   /** The block of the entry's latest commit. */
   committed_at_block: U64StringSchema,
@@ -171,15 +132,15 @@ export const AgentViewSchema = z.object({
   tags: z.array(z.string()),
   /** When the agent first registered, in nanoseconds. */
   registered_at: U64StringSchema,
-  entries: U32,
-  reveals: U32,
-  wins: U32,
+  entries: U32Schema,
+  reveals: U32Schema,
+  wins: U32Schema,
   /** Total won, per token. */
   earned: z.array(TokenBalanceSchema),
   /** Picks made as a verifier. */
-  picks_made: U32,
+  picks_made: U32Schema,
   /** Empty picks made as a verifier after at least one entry was revealed. */
-  voids_after_reveals: U32,
+  voids_after_reveals: U32Schema,
 });
 export type AgentView = z.infer<typeof AgentViewSchema>;
 
@@ -196,11 +157,11 @@ export const ConfigViewSchema = z.object({
   owner: AccountIdSchema,
   pending_owner: AccountIdSchema.nullable(),
   treasury: AccountIdSchema,
-  fee_bps: U16,
-  min_window_secs: U32,
-  max_window_secs: U32,
+  fee_bps: U16Schema,
+  min_window_secs: U32Schema,
+  max_window_secs: U32Schema,
   paused: z.boolean(),
-  version: U16,
+  version: U16Schema,
   tokens: z.array(TokenConfigViewSchema),
 });
 export type ConfigView = z.infer<typeof ConfigViewSchema>;
@@ -217,8 +178,9 @@ export const StorageViewSchema = z.object({
 export type StorageView = z.infer<typeof StorageViewSchema>;
 
 /**
- * A delegate key's spending caps, as `get_delegate` returns it (plan 01 Task 15, not built yet):
- * the token it may spend, the most for one task, the most in all, and what it has spent so far.
+ * A delegate key's spending caps, as `get_delegate` returns it: the token it may spend, the most
+ * for one task, the most in all, and what it has spent so far. The shape is from plan 01 Task 15's
+ * brief; re-check when delegates land.
  */
 export const DelegateViewSchema = z.object({
   token: AccountIdSchema,
