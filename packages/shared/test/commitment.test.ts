@@ -21,15 +21,42 @@ test("rejects_bad_hex", () => {
   expect(() => computeCommitment(1n, "a.near", "zz", "00".repeat(32))).toThrow();
 });
 
-test("rejects_hashes_that_are_not_32_bytes", () => {
+test("rejects_hashes_that_are_not_64_lowercase_hex_characters", () => {
   const ok = "00".repeat(32);
-  expect(() => computeCommitment(1n, "a.near", "00".repeat(31), ok)).toThrow(
-    /content hash must be 32 bytes/,
+  const bad = [
+    "",
+    "00".repeat(31),
+    "00".repeat(33),
+    `0x${"00".repeat(31)}`,
+    `${ok} `,
+    `${ok}\n`,
+    "zz".repeat(32),
+  ];
+  for (const b of bad) {
+    expect(() => computeCommitment(1n, "a.near", b, ok)).toThrow(
+      /content hash must be 64 lowercase hex characters/,
+    );
+    expect(() => computeCommitment(1n, "a.near", ok, b)).toThrow(
+      /salt must be 64 lowercase hex characters/,
+    );
+  }
+});
+
+test("rejects_uppercase_hex", () => {
+  // The contract's parse_hash rejects uppercase, so an uppercase commit would succeed and the
+  // reveal would then fail with E_HASH. Reject it when the commitment is made.
+  const hash = "ab".repeat(32);
+  const salt = "cd".repeat(32);
+  expect(computeCommitment(1n, "a.near", hash, salt)).toMatch(/^[0-9a-f]{64}$/);
+  expect(() => computeCommitment(1n, "a.near", hash.toUpperCase(), salt)).toThrow(
+    /content hash must be 64 lowercase hex characters/,
   );
-  expect(() => computeCommitment(1n, "a.near", ok, "00".repeat(33))).toThrow(
-    /salt must be 32 bytes/,
+  expect(() => computeCommitment(1n, "a.near", hash, salt.toUpperCase())).toThrow(
+    /salt must be 64 lowercase hex characters/,
   );
-  expect(() => computeCommitment(1n, "a.near", "", ok)).toThrow(/content hash must be 32 bytes/);
+  // One uppercase digit is enough.
+  expect(() => computeCommitment(1n, "a.near", `A${hash.slice(1)}`, salt)).toThrow(/content hash/);
+  expect(() => computeCommitment(1n, "a.near", hash, `${salt.slice(0, 63)}F`)).toThrow(/salt/);
 });
 
 test("rejects_task_ids_outside_u64", () => {

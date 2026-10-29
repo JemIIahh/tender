@@ -13,29 +13,30 @@ export interface NetworkConfig {
   minWindowSecs: number;
 }
 
-export const NETWORKS: Record<NetworkId, NetworkConfig> = {
-  sandbox: {
+/** Read only, at compile time and at run time, so that no consumer can patch the shared table. */
+export const NETWORKS: Readonly<Record<NetworkId, Readonly<NetworkConfig>>> = Object.freeze({
+  sandbox: Object.freeze({
     id: "sandbox",
     // The sandbox node picks its port when it starts, so the URL comes from the running chain
     // (`LocalChain.rpcUrl`). The empty string only fills the required field.
     rpcUrl: "",
     minWindowSecs: 5,
-  },
-  testnet: {
+  }),
+  testnet: Object.freeze({
     id: "testnet",
     rpcUrl: "https://rpc.testnet.fastnear.com",
     neardataUrl: "https://testnet.neardata.xyz",
     usdc: "3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af",
     minWindowSecs: 60,
-  },
-  mainnet: {
+  }),
+  mainnet: Object.freeze({
     id: "mainnet",
     rpcUrl: "https://rpc.mainnet.fastnear.com",
     neardataUrl: "https://mainnet.neardata.xyz",
     usdc: "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
     minWindowSecs: 300,
-  },
-};
+  }),
+});
 
 /** The `standard` field of every event the contract logs. */
 export const EVENT_STANDARD = "tender";

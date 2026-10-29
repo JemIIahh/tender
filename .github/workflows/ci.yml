@@ -4,9 +4,19 @@ on:
   push:
   pull_request:
 
+# The jobs only read the repository. A job that needs more asks for it in its own permissions.
+permissions:
+  contents: read
+
 jobs:
   secrets:
     runs-on: ubuntu-latest
+    # On a pull request, gitleaks-action lists the pull request's commits through the API, which
+    # needs pull-requests: read. Read only is enough: without write access it logs a warning
+    # instead of commenting, and a leak fails the job anyway.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       # Full history, so gitleaks scans every commit in the push or pull request.
       - uses: actions/checkout@v6
