@@ -12,10 +12,13 @@ import { Pool, TypeOverrides, types } from "pg";
  * convert with `BigInt()`. int, float and boolean arrive as numbers and booleans, jsonb as
  * parsed JSON, timestamptz as `Date`, bytea as a plain `Uint8Array`.
  *
- * Errors keep the driver's message, `code` (the SQLSTATE) and `constraint`. PGlite's copies of the
- * statement and its parameters are removed from them, since parameters can be blob bytes. Log
- * `message` and `code`, not the whole error: for a NOT NULL or CHECK violation Postgres itself
- * puts the failing row, bytes included, in `detail`.
+ * Errors from the database keep the message, the SQLSTATE `code` and the names that locate the
+ * problem (`constraint`, `schema`, `table`, `column`, `dataType`, `position`, `routine`), on both
+ * drivers. Everything else is dropped: `detail` (the failing row or the duplicate key, blob bytes
+ * included), `where`, `hint`, `internalQuery`, and the statement and parameters PGlite adds. An
+ * error is what gets logged, and a row can hold a held-out answer. The one thing that can still
+ * quote data is the message of a value that fails to parse: `invalid input syntax for type
+ * numeric: "abc"`.
  */
 export interface Db {
   /**
@@ -169,38 +172,60 @@ function exactJson(_key: string, value: unknown): unknown {
   return typeof value === "bigint" ? value.toString() : value;
 }
 
+// The fields of a database error that say what went wrong and where, without quoting data. Postgres
+// quotes the failing row or the duplicate key in `detail`, a JSON or COPY line in `where`, and now
+// and then a value in `hint` or `internalQuery`; PGlite adds the statement, its parameters and the
+// call options. A row can hold blob bytes or a held-out answer, and an error is what gets logged, so
+// every other field goes.
+const ERROR_FIELDS_KEPT = new Set([
+  "name",
+  "severity",
+  "code",
+  "schema",
+  "table",
+  "column",
+  "dataType",
+  "constraint",
+  "position",
+  "routine",
+]);
+
 /**
- * PGlite attaches the statement, its parameters and the call options to every error it throws.
- * An error is what gets logged, and the parameters can be blob bytes or a held-out answer, so
- * those go. The rest stays: message, code (the SQLSTATE), constraint, and so on.
+ * Takes the row data off an error that came from the database, in place, and returns it. The
+ * message and the fields above stay. An error that did not come from the database is left as it is:
+ * a network error has a `code` too (ECONNRESET), but no `severity`, and keeps its errno and syscall.
  */
-function withoutCallContext(error: unknown): unknown {
-  if (typeof error === "object" && error !== null) {
-    for (const key of ["query", "params", "queryOptions"]) Reflect.deleteProperty(error, key);
+function withoutRowData(error: unknown): unknown {
+  if (typeof error !== "object" || error === null) return error;
+  const { severity, code } = error as { severity?: unknown; code?: unknown };
+  if (typeof severity === "string" && typeof code === "string") {
+    for (const key of Object.keys(error)) {
+      if (!ERROR_FIELDS_KEPT.has(key)) Reflect.deleteProperty(error, key);
+    }
   }
   return error;
 }
 
+/** Runs `work`; a database error it throws goes on without its row data. */
+async function scrubbed<T>(work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    throw withoutRowData(error);
+  }
+}
+
 function pgliteBackend(pglite: PGlite): Backend {
   const sessionOn = (target: PgliteTarget): Session => ({
-    run: async (sql, params) => {
-      try {
-        return (await target.query<Row>(sql, params)).rows;
-      } catch (error) {
-        throw withoutCallContext(error);
-      }
-    },
-    script: async (sql) => {
-      try {
+    run: (sql, params) => scrubbed(async () => (await target.query<Row>(sql, params)).rows),
+    script: (sql) =>
+      scrubbed(async () => {
         await target.exec(sql);
-      } catch (error) {
-        throw withoutCallContext(error);
-      }
-    },
+      }),
   });
   return {
     ...sessionOn(pglite),
-    transaction: (fn) => pglite.transaction((tx) => fn(sessionOn(tx))),
+    transaction: (fn) => scrubbed(() => pglite.transaction((tx) => fn(sessionOn(tx)))),
     close: () => pglite.close(),
   };
 }
@@ -215,11 +240,14 @@ function postgresBackend(pool: Pool): Backend {
   const sessionOn = (target: PgTarget): Session => ({
     // The extended protocol takes exactly one statement, as PGlite's query does; without it pg
     // would run several statements sent with no parameters and return a list of results.
-    run: async (sql, params) =>
-      (await target.query({ text: sql, values: params, queryMode: "extended" })).rows,
-    script: async (sql) => {
-      await target.query(sql);
-    },
+    run: (sql, params) =>
+      scrubbed(
+        async () => (await target.query({ text: sql, values: params, queryMode: "extended" })).rows,
+      ),
+    script: (sql) =>
+      scrubbed(async () => {
+        await target.query(sql);
+      }),
   });
   return {
     ...sessionOn(pool),
@@ -234,14 +262,15 @@ function postgresBackend(pool: Pool): Backend {
       const ignoreLostConnection = () => undefined;
       client.on("error", ignoreLostConnection);
       let broken = false;
+      const session = sessionOn(client);
       try {
-        await client.query("begin");
-        const result = await fn(sessionOn(client));
-        await client.query("commit");
+        await session.script("begin");
+        const result = await fn(session);
+        await session.script("commit");
         return result;
       } catch (error) {
         try {
-          await client.query("rollback");
+          await session.script("rollback");
         } catch {
           // Not even that works, so the connection is dead; report the original error.
           broken = true;

@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { inspect } from "node:util";
 import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -23,6 +24,11 @@ const POSTGRES_URL = process.env.TEST_DATABASE_URL || undefined;
 
 const U128_MAX = "340282366920938463463374607431768211455";
 const MINUTE = { timeout: 60_000 };
+
+// Stands for a secret (a held-out answer, blob bytes) in the error tests: as text, and as hex, which
+// is how Postgres prints the bytes of a bytea.
+const MARKER = "HELDOUT7C1F";
+const MARKER_NEEDLES = [MARKER, Buffer.from(MARKER).toString("hex")];
 
 interface Fresh {
   db: Db;
@@ -70,6 +76,25 @@ function postgresTarget(url: string): Target {
 }
 
 const targets = POSTGRES_URL ? [pgliteTarget, postgresTarget(POSTGRES_URL)] : [pgliteTarget];
+
+/**
+ * True when any needle shows up anywhere in a value: in a string, in a field whether enumerable or
+ * not (message, stack, cause), in a nested object, in the bytes of a byte array as text or as hex.
+ * Case does not matter, since Postgres prints bytea as lowercase hex.
+ */
+function mentions(value: unknown, needles: string[], seen = new Set<unknown>()): boolean {
+  if (typeof value === "string") {
+    const text = value.toLowerCase();
+    return needles.some((needle) => text.includes(needle.toLowerCase()));
+  }
+  if (typeof value !== "object" || value === null || seen.has(value)) return false;
+  seen.add(value);
+  if (ArrayBuffer.isView(value)) {
+    const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    return mentions(bytes.toString("latin1"), needles) || mentions(bytes.toString("hex"), needles);
+  }
+  return Reflect.ownKeys(value).some((key) => mentions(Reflect.get(value, key), needles, seen));
+}
 
 /** Inserts one row; table and column names are test constants. */
 async function insertRow(db: Db, table: string, row: Record<string, unknown>) {
@@ -732,6 +757,114 @@ describe.each(targets)("db on $name", (target) => {
     expect(syntax).not.toHaveProperty("params");
   });
 
+  it("errors_carry_no_row_data", async () => {
+    // Postgres quotes the failing row or the duplicate key in `detail` and a JSON line in `where`,
+    // and both drivers hand those on. A row can hold blob bytes or a held-out answer, and an error is
+    // what gets logged. The marker stands for such a secret: as text, and as the bytes of a blob.
+    const marker = MARKER;
+    const needles = MARKER_NEEDLES;
+    const cases = [
+      {
+        name: "CHECK violation on a blob insert",
+        attempt: () =>
+          putBlob(db, {
+            kind: "nonsense" as BlobKind,
+            contentType: "text/plain",
+            bytes: new TextEncoder().encode(marker),
+            uploader: marker,
+            isPublic: true,
+          }),
+        message: /violates check constraint/,
+        kept: { code: "23514", table: "blobs", constraint: "blobs_kind_check" },
+      },
+      {
+        name: "duplicate key",
+        attempt: async () => {
+          await insertRow(db, "chain_cursor", { source: marker, height: 1n });
+          await insertRow(db, "chain_cursor", { source: marker, height: 2n });
+        },
+        message: /duplicate key value violates unique constraint/,
+        kept: { code: "23505", table: "chain_cursor", constraint: "chain_cursor_pkey" },
+      },
+      {
+        name: "NOT NULL violation",
+        attempt: () =>
+          db.query(
+            "insert into blobs (sha256, kind, content_type, bytes, is_public) values ($1, 'brief', 'x', null, true)",
+            [marker],
+          ),
+        message: /violates not-null constraint/,
+        kept: { code: "23502", table: "blobs", column: "bytes" },
+      },
+      {
+        name: "malformed JSON",
+        attempt: () =>
+          insertRow(db, "events", {
+            height: 1n,
+            block_ts: 1n,
+            receipt_id: "json-error",
+            log_index: 0,
+            event: "x",
+            data: marker,
+          }),
+        message: /invalid input syntax for type json/,
+        kept: { code: "22P02" },
+      },
+    ];
+
+    for (const c of cases) {
+      const error = await c.attempt().then(
+        () => undefined,
+        (thrown: unknown) => thrown,
+      );
+      expect(error, c.name).toBeInstanceOf(Error);
+      // What says what went wrong, and where, stays.
+      expect((error as Error).message, c.name).toMatch(c.message);
+      expect(error, c.name).toMatchObject(c.kept);
+      // What quotes data goes.
+      for (const field of ["detail", "hint", "where", "internalQuery", "query", "params"]) {
+        expect(error, `${c.name}: ${field}`).not.toHaveProperty(field);
+      }
+      expect(mentions(error, needles), c.name).toBe(false);
+      for (const text of [
+        JSON.stringify(error),
+        inspect(error, { depth: null, showHidden: true, maxStringLength: null }),
+      ]) {
+        for (const needle of needles) {
+          expect(text.toLowerCase(), c.name).not.toContain(needle.toLowerCase());
+        }
+      }
+    }
+  });
+
+  it("commit_errors_carry_no_row_data", MINUTE, async () => {
+    // A deferred constraint fails at COMMIT, not at the statement: another place an error comes from.
+    const { db: scratch, dispose } = await target.fresh();
+    try {
+      await scratch.exec(
+        "create table deferred (x text, constraint deferred_x unique (x) deferrable initially deferred)",
+      );
+      const error = await scratch
+        .tx(async (tx) => {
+          await tx.query("insert into deferred values ($1)", [MARKER]);
+          await tx.query("insert into deferred values ($1)", [MARKER]);
+        })
+        .then(
+          () => undefined,
+          (thrown: unknown) => thrown,
+        );
+      expect((error as Error).message).toContain("duplicate key value");
+      expect(error).toMatchObject({ code: "23505", table: "deferred", constraint: "deferred_x" });
+      for (const field of ["detail", "where", "query", "params"]) {
+        expect(error, field).not.toHaveProperty(field);
+      }
+      expect(mentions(error, MARKER_NEEDLES)).toBe(false);
+      expect(JSON.stringify(error).toLowerCase()).not.toContain(MARKER.toLowerCase());
+    } finally {
+      await dispose();
+    }
+  });
+
   it("blobs_put_get_idempotent", async () => {
     const bytes = Uint8Array.from({ length: 256 }, (_, i) => i);
     const sha = await putBlob(db, {
@@ -886,7 +1019,11 @@ describe("openDb", () => {
 describe("postgres adapter against a fake pool", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  function fakePool(failOn?: RegExp, dropOn?: RegExp) {
+  function fakePool(
+    failOn?: RegExp,
+    dropOn?: RegExp,
+    failure: (text: string) => Error = (text) => new Error(`fake failure on: ${text}`),
+  ) {
     const log: string[] = [];
     const queries: unknown[] = [];
     const pools: pg.Pool[] = [];
@@ -912,7 +1049,7 @@ describe("postgres adapter against a fake pool", () => {
         const text = typeof q === "string" ? q : q.text;
         log.push(text);
         if (dead) throw new Error("Client has encountered a connection error and is not queryable");
-        if (failOn?.test(text)) throw new Error(`fake failure on: ${text}`);
+        if (failOn?.test(text)) throw failure(text);
         if (dropOn?.test(text)) {
           // As in pg: the statement fails, and the client emits 'error' before the caller has
           // seen the failure.
@@ -932,6 +1069,8 @@ describe("postgres adapter against a fake pool", () => {
     ) {
       pools.push(this);
       queries.push(query);
+      const text = typeof query === "string" ? query : (query as { text: string }).text;
+      if (failOn?.test(text)) return Promise.reject(failure(text));
       return Promise.resolve({ rows: [] });
     } as never);
     const end = vi.spyOn(pg.Pool.prototype, "end").mockImplementation((async () => {}) as never);
@@ -1176,6 +1315,78 @@ describe("postgres adapter against a fake pool", () => {
       expect.stringMatching(/^release savepoint \w+$/),
       "commit",
     ]);
+  });
+
+  it("drops row data from the database errors it passes on, whichever call they come from", async () => {
+    const secret = "HELDOUT7C1F";
+    // What pg builds from a server's ErrorResponse: every field Postgres can send.
+    const databaseError = (text: string) =>
+      Object.assign(
+        new pg.DatabaseError(
+          'new row for relation "blobs" violates check constraint "blobs_kind_check"',
+          120,
+          "error",
+        ),
+        {
+          severity: "ERROR",
+          code: "23514",
+          detail: `Failing row contains (${secret}, nonsense, text/plain, \\x4845)`,
+          hint: `Perhaps ${secret}`,
+          position: "8",
+          internalQuery: `insert into blobs values ('${secret}') -- ${text}`,
+          where: `JSON data, line 1: ${secret}`,
+          schema: "public",
+          table: "blobs",
+          constraint: "blobs_kind_check",
+          file: "execMain.c",
+          line: "2081",
+          routine: "ExecConstraints",
+        },
+      );
+    const calls: [string, RegExp, (db: Db) => Promise<unknown>][] = [
+      ["db.query", /boom/, (db) => db.query("select boom")],
+      ["db.exec", /boom/, (db) => db.exec("select boom")],
+      ["tx.query", /boom/, (db) => db.tx((tx) => tx.query("select boom"))],
+      ["tx.exec", /boom/, (db) => db.tx((tx) => tx.exec("select boom"))],
+      ["commit", /^commit$/, (db) => db.tx((tx) => tx.query("select 1"))],
+    ];
+    for (const [name, failOn, call] of calls) {
+      fakePool(failOn, undefined, databaseError);
+      const db = await open();
+      const error = await call(db).then(
+        () => undefined,
+        (thrown: unknown) => thrown,
+      );
+      expect((error as Error).message, name).toContain("violates check constraint");
+      expect(error, name).toMatchObject({
+        code: "23514",
+        schema: "public",
+        table: "blobs",
+        constraint: "blobs_kind_check",
+      });
+      for (const field of ["detail", "hint", "where", "internalQuery"]) {
+        expect(error, `${name}: ${field}`).not.toHaveProperty(field);
+      }
+      expect(mentions(error, [secret]), name).toBe(false);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("leaves an error that did not come from the database as it is", async () => {
+    // A network error has a code and some detail of its own, but no severity.
+    fakePool(/boom/, undefined, () =>
+      Object.assign(new Error("read ECONNRESET"), {
+        code: "ECONNRESET",
+        errno: -54,
+        syscall: "read",
+      }),
+    );
+    const db = await open();
+    const error = await db.query("select boom").then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toMatchObject({ code: "ECONNRESET", errno: -54, syscall: "read" });
   });
 
   it("closes the pool and reports the error when the first query fails", async () => {
