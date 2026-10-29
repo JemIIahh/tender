@@ -423,6 +423,23 @@ pub struct TaskView {
     pub phase: Phase,
 }
 
+/// An entry, as returned by `get_entry` and `get_entries`. Hashes are 64 lowercase hex characters,
+/// and the task id and block height are decimal strings. `content_hash` and `uri` are `null` until
+/// the entry is revealed.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryView {
+    pub task_id: U64,
+    pub account: AccountId,
+    /// The entry's place in the task's entrant order, from 0.
+    pub index: u32,
+    pub commitment: String,
+    /// The block of the entry's latest commit.
+    pub committed_at_block: U64,
+    pub content_hash: Option<String>,
+    pub uri: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

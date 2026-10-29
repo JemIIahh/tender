@@ -6,6 +6,7 @@
 
 mod admin;
 mod auth;
+mod entries;
 mod events;
 mod registry;
 mod storage;

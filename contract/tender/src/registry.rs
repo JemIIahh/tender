@@ -158,8 +158,6 @@ impl Tender {
     ///
     /// This does not settle storage. An edit that grows the profile belongs inside a caller's
     /// `storage_mark` and `settle_storage` window, and the caller chooses who pays.
-    // No caller yet; the allow comes off with the first one.
-    #[allow(dead_code)]
     pub(crate) fn with_profile(&mut self, account: &AccountId, f: impl FnOnce(&mut AgentProfile)) {
         if let Some(profile) = self.agents.get_mut(account) {
             f(profile);
@@ -171,8 +169,6 @@ impl Tender {
     ///
     /// The entry takes storage, and this does not settle it: the caller's `storage_mark` and
     /// `settle_storage` window pays, as with `ensure_vault_slot`.
-    // No caller yet; the allow comes off with the first one.
-    #[allow(dead_code)]
     pub(crate) fn ensure_earned_slot(&mut self, account: &AccountId, token: &AccountId) {
         let missing = self
             .agents
