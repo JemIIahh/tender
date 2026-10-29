@@ -39,13 +39,13 @@ async function signWithNearApiJs(keyPair: KeyPair, payload: Payload): Promise<Ne
   };
 }
 
-/** The four fields a NEP-413 signature covers, read back out of a sign-in. */
+/** The four fields a NEP-413 signature covers, read back out of a sign-in (null is no callback). */
 function payloadOf(input: Nep413Input): Payload {
   return {
     message: input.message,
     recipient: input.recipient,
     nonce: Uint8Array.from(Buffer.from(input.nonce, "base64")),
-    ...(input.callbackUrl === undefined ? {} : { callbackUrl: input.callbackUrl }),
+    ...(typeof input.callbackUrl === "string" ? { callbackUrl: input.callbackUrl } : {}),
   };
 }
 
@@ -90,6 +90,32 @@ function depsForRaw(permission: unknown, overrides: DepsOverrides = {}) {
 
 function functionCallTo(receiver_id: string): KeyPermission {
   return { FunctionCall: { receiver_id, method_names: [] } };
+}
+
+function thrownBy(fn: () => unknown): unknown {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  return undefined;
+}
+
+/** A copy of `source` whose properties are getters that refuse to be read a second time. */
+function readableOnce<T extends object>(source: T): T {
+  const copy = {} as T;
+  for (const [name, value] of Object.entries(source)) {
+    let reads = 0;
+    Object.defineProperty(copy, name, {
+      enumerable: true,
+      get() {
+        reads += 1;
+        if (reads > 1) throw new Error(`${name} was read ${reads} times`);
+        return value;
+      },
+    });
+  }
+  return copy;
 }
 
 async function expectAuthError(promise: Promise<unknown>, code: AuthError["code"]) {
@@ -234,13 +260,18 @@ test("tampered_message_rejected", async () => {
     await expectAuthError(verifyNep413(attempt, deps), "bad_signature");
   }
 
-  // A signature made over a callbackUrl does not verify once the callbackUrl is dropped.
+  // A signature made over a callbackUrl does not verify once the callbackUrl is dropped, whether it
+  // is left out or sent as null.
   const withCallback = await signWithNearApiJs(keyPair, {
     ...payloadOf(input),
     callbackUrl: "https://tender.example/cb",
   });
   const { callbackUrl: _dropped, ...withoutCallback } = withCallback;
   await expectAuthError(verifyNep413(withoutCallback, deps), "bad_signature");
+  await expectAuthError(
+    verifyNep413({ ...withCallback, callbackUrl: null }, deps),
+    "bad_signature",
+  );
 
   // None of these reached the chain: the cheap local checks run first.
   expect(deps.viewAccessKey).not.toHaveBeenCalled();
@@ -459,32 +490,120 @@ test("ill_formed_text_is_rejected", async () => {
   const { input } = await signIn();
   const deps = depsFor("FullAccess");
 
+  // A sign-in over such text is a signature nobody can have made...
   for (const bad of ["\ud800", "\udc00", "a\ud800b", "\udc00\ud800"]) {
     await expectAuthError(verifyNep413({ ...input, message: bad }, deps), "bad_signature");
     await expectAuthError(verifyNep413({ ...input, callbackUrl: bad }, deps), "bad_signature");
-    expect(() => serializeNep413({ ...input, message: bad })).toThrow(AuthError);
   }
+  await expectAuthError(
+    verifyNep413({ ...input, message: 42 as unknown as string }, deps),
+    "bad_signature",
+  );
+  expect(deps.viewAccessKey).not.toHaveBeenCalled();
+
+  // ...but a signer also calls the serializer before it has any signature, so there the same
+  // text is a plain TypeError that names the field, not an authentication failure.
+  const cases: Array<[Partial<Nep413Input>, RegExp]> = [
+    [{ message: "\ud800" }, /message/],
+    [{ message: "a\udc00b" }, /message/],
+    [{ message: 42 as unknown as string }, /message/],
+    [{ recipient: "\ud800" }, /recipient/],
+    [{ callbackUrl: "\ud800" }, /callbackUrl/],
+    [{ callbackUrl: 42 as unknown as string }, /callbackUrl/],
+  ];
+  for (const [bad, field] of cases) {
+    const error = thrownBy(() => serializeNep413({ ...input, ...bad }));
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error).not.toBeInstanceOf(AuthError);
+    expect((error as TypeError).message).toMatch(field);
+  }
+
   // A correctly paired surrogate is ordinary text (and is covered by the near-api-js parity test).
   expect(() => serializeNep413({ ...input, message: "\u{1F600}" })).not.toThrow();
 });
 
-test("account_id_must_be_present_and_bounded", async () => {
+test("account_id_must_be_a_near_account_id", async () => {
+  // @tender/shared's AccountIdSchema has NEAR's rules. A bad id is `key_not_found`, and it never
+  // reaches the RPC. (The signature does not cover the account id, so these are all validly signed.)
   const { input } = await signIn();
   const deps = depsFor("FullAccess");
 
-  // NEAR account ids are at most 64 characters.
-  for (const accountId of ["", "a".repeat(65), undefined as unknown as string]) {
+  const notAccountIds = [
+    "Alice.near", // upper case
+    "a", // too short
+    "x y", // a space
+    "",
+    "a".repeat(65), // too long
+    undefined as unknown as string,
+  ];
+  for (const accountId of notAccountIds) {
     await expectAuthError(verifyNep413({ ...input, accountId }, deps), "key_not_found");
   }
   expect(deps.viewAccessKey).not.toHaveBeenCalled();
+
+  // Real ones go through unchanged: a name, separators and sub-accounts, and an implicit account.
+  for (const accountId of ["alice.near", "a-b.c_d.test.near", "ab", "0123456789abcdef".repeat(4)]) {
+    deps.viewAccessKey.mockClear();
+    await expect(verifyNep413({ ...input, accountId }, deps)).resolves.toMatchObject({ accountId });
+    expect(deps.viewAccessKey).toHaveBeenCalledExactlyOnceWith(accountId, input.publicKey);
+  }
+});
+
+test("a_null_callback_url_is_the_same_as_none", async () => {
+  // JSON says null where TypeScript says absent. borsh and near-api-js write both as None, so a
+  // signature over a payload without a callback has to verify when the input carries null.
+  const { keyPair, input } = await signIn();
+  const deps = depsFor("FullAccess");
+  const accepted = {
+    accountId: ACCOUNT,
+    publicKey: keyPair.getPublicKey().toString(),
+    keyKind: "full_access",
+  };
+  expect("callbackUrl" in input).toBe(false);
+
+  await expect(verifyNep413({ ...input, callbackUrl: null }, deps)).resolves.toEqual(accepted);
+  expect(serializeNep413({ ...input, callbackUrl: null })).toEqual(serializeNep413(input));
+
+  // The other way round: near-api-js is handed a payload that says null. Ed25519 signing is
+  // deterministic, so the very same signature means it hashed the very same bytes as for "absent".
+  const signedWithNull = await signWithNearApiJs(keyPair, {
+    ...payloadOf(input),
+    callbackUrl: null as unknown as undefined,
+  });
+  expect(signedWithNull.callbackUrl).toBeNull();
+  expect(signedWithNull.signature).toBe(input.signature);
+  await expect(verifyNep413(signedWithNull, deps)).resolves.toEqual(accepted);
+  await expect(verifyNep413({ ...signedWithNull, callbackUrl: undefined }, deps)).resolves.toEqual(
+    accepted,
+  );
+
+  // Null is None and nothing else: it neither turns into Some("") nor hides a signed callbackUrl.
+  await expectAuthError(verifyNep413({ ...input, callbackUrl: "" }, deps), "bad_signature");
+});
+
+test("each_input_field_is_read_once", async () => {
+  // A getter could answer the checks with one value and the signature with another. Every field
+  // is read once, up front, and everything after that uses the locals. These objects throw on a
+  // second read of any property.
+  const { input } = await signIn({ callbackUrl: "https://tender.example/cb" });
+  const deps = depsFor("FullAccess");
+
+  await expect(verifyNep413(readableOnce(input), deps)).resolves.toMatchObject({
+    accountId: ACCOUNT,
+    keyKind: "full_access",
+  });
+  expect(deps.viewAccessKey).toHaveBeenCalledExactlyOnceWith(ACCOUNT, input.publicKey);
+  expect(serializeNep413(readableOnce(input))).toEqual(serializeNep413(input));
 });
 
 test("a_key_that_is_not_a_curve_point_is_a_bad_signature", async () => {
-  // Thirty-two 0xff bytes are the right size for a key but not a point on the curve.
+  // y = 2 has no x on the curve: x^2 = 3 / (4d + 1) is not a square mod 2^255 - 19. These 32 bytes
+  // are the right size for a key but decode to no point, in strict and in ZIP-215 decoding alike.
+  // (Thirty-two 0xff bytes would not do: ZIP-215 reads their y as 18, which is a point.)
   const { input } = await signIn();
   const notAPoint = new PublicKey({
     keyType: KeyType.ED25519,
-    data: new Uint8Array(32).fill(0xff),
+    data: Uint8Array.from({ length: 32 }, (_, i) => (i === 0 ? 2 : 0)),
   });
   const deps = depsFor("FullAccess");
 
