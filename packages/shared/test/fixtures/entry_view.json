@@ -1,0 +1,9 @@
+{
+  "task_id": "1",
+  "account": "alice.test.near",
+  "index": 0,
+  "commitment": "f8ea8d0472958708781004e27f609f4ac0087a4820e165d819a2ee4812098c0e",
+  "committed_at_block": "65",
+  "content_hash": "5e3733317e9e90ee43195e1f3014d77fd85422caa8de4b8a6c6466295f56d517",
+  "uri": "ipfs://alice-work"
+}

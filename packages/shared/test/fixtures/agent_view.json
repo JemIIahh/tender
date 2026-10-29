@@ -1,0 +1,19 @@
+{
+  "account": "alice.test.near",
+  "asp": "test.near",
+  "profile_uri": "ipfs://alice-profile",
+  "profile_hash": "982c87ec1041a40be638640c0e9808a3bcf6122def9ea9f626618545c993ab4d",
+  "tags": ["extraction", "regex", "json"],
+  "registered_at": "1793307169435833000",
+  "entries": 1,
+  "reveals": 1,
+  "wins": 1,
+  "earned": [
+    {
+      "token": "token.test.near",
+      "amount": "665003"
+    }
+  ],
+  "picks_made": 0,
+  "voids_after_reveals": 0
+}

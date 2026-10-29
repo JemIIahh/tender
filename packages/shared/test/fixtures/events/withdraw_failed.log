@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"withdraw_failed","data":[{"account":"bob.test.near","token":"token.test.near","amount":"50000","to":"dave.test.near"}]}

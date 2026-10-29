@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"storage_deposit","data":[{"account":"alice.test.near","amount":"50000000000000000000000","total":"150000000000000000000000"}]}

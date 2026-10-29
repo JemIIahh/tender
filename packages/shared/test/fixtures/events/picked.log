@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"picked","data":[{"task_id":"1","by":"judge.test.near","winners":[{"account":"alice.test.near","bps":7000,"amount":"665003"},{"account":"bob.test.near","bps":3000,"amount":"285000"}],"fee":"50000","scorecard_hash":"8fad3e916b98df98caa7f0e95f9920cc0b3fc997b0518b6490157602bb072af8","scorecard_uri":"ipfs://scorecard"}]}

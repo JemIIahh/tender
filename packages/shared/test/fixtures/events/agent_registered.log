@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"agent_registered","data":[{"account":"alice.test.near","asp":"test.near","profile_uri":"ipfs://alice-profile","profile_hash":"982c87ec1041a40be638640c0e9808a3bcf6122def9ea9f626618545c993ab4d","tags":["extraction","regex","json"],"updated":false}]}
