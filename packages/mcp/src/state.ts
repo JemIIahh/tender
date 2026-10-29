@@ -1,0 +1,254 @@
+import { randomBytes } from "node:crypto";
+import { chmod, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+import { U64StringSchema } from "@tender/shared";
+import { z } from "zod";
+
+// The drafts of an agent that commits to tasks. A commit puts only a hash on chain, so the work and
+// the salt that open it stay here until the reveal, and nothing else holds them. Lose a draft and
+// the agent loses its entry; leak one and the work is out before the reveal. So the store is
+//
+// - private: its directories are 0700 and its files 0600;
+// - crash safe: a draft is written whole to a temp file and renamed over the old one, so a crash
+//   or a failed write leaves the old draft or the new one, never half of either;
+// - path safe: the task id becomes part of a file name, so it must be a u64 in decimal first.
+//
+// The caller picks the directory. By convention it is `~/.tender/{network}/{account}`, one per
+// network and account, so that two agents on one machine never share drafts. Calls for one task
+// are expected one after another, as commit and reveal are, and the store does not lock.
+
+/** The owner may read and write a draft file, and nobody else may do anything. */
+const FILE_MODE = 0o600;
+/** The owner may do anything in a directory of the store, and nobody else may enter it. */
+const DIR_MODE = 0o700;
+const DRAFT_SUFFIX = ".json";
+
+/**
+ * What the agent keeps for one task between its commit and its reveal. Apart from the task id, the
+ * store keeps the strings as they are given: it checks that they are strings, not that they are
+ * well-formed hashes.
+ */
+export interface Draft {
+  /** The task, as a u64 in decimal. It names the file, so the store checks it first. */
+  taskId: string;
+  /** The work itself, as base64. It may be empty. */
+  contentBase64: string;
+  /** The SHA-256 of the work, 64 lowercase hex characters. */
+  contentHash: string;
+  /** The random salt that opens the commitment, 64 lowercase hex characters. */
+  salt: string;
+  /** What the commit puts on chain: the hash of the task id, account, content hash and salt. */
+  commitment: string;
+  /** When the commit went through, as an ISO 8601 time. Unset while the commit is in flight. */
+  committedAt?: string;
+  /** Where the revealed work was uploaded. Unset until the reveal has gone through. */
+  revealedUri?: string;
+}
+
+export interface StateStore {
+  /**
+   * Writes the draft, replacing the one for the same task if there is one, as when a commit is
+   * replaced before the reveal. The old draft stays whole until the new one is complete. Rejects
+   * before touching the disk if the task id is not a u64 in decimal, or a field is missing or is
+   * not a string.
+   */
+  saveDraft(draft: Draft): Promise<void>;
+  /**
+   * The draft for the task, or null if there is none. Rejects if the file is there but is not a
+   * readable draft: that is not "no draft", and a caller that took it for one would write over
+   * what may still be recoverable.
+   */
+  getDraft(taskId: string): Promise<Draft | null>;
+  /** Records where the work was revealed, keeping the rest. Rejects if there is no draft. */
+  markRevealed(taskId: string, uri: string): Promise<void>;
+  /**
+   * Every draft, revealed or not, by task number. A caller that wants the ones still to reveal
+   * filters on `revealedUri`. Rejects if any file is not a readable draft.
+   */
+  listDrafts(): Promise<Draft[]>;
+}
+
+// A draft the store reads is checked as closely as one it writes: the disk can hold anything.
+const DraftSchema: z.ZodType<Draft> = z.object({
+  taskId: U64StringSchema,
+  contentBase64: z.string(),
+  contentHash: z.string(),
+  salt: z.string(),
+  commitment: z.string(),
+  committedAt: z.string().optional(),
+  revealedUri: z.string().optional(),
+});
+
+/**
+ * Refuses anything but a u64 in decimal. Digits cannot make a `..` or a path separator, so an id
+ * that passes cannot name a file outside `drafts/`.
+ */
+function assertTaskId(taskId: string): void {
+  if (!U64StringSchema.safeParse(taskId).success) {
+    const shown = JSON.stringify(String(taskId).slice(0, 40));
+    throw new Error(`invalid task id ${shown}: expected a u64 as a decimal string`);
+  }
+}
+
+/** Orders task ids as numbers, so that "2" comes before "10". */
+function compareTaskIds(a: string, b: string): number {
+  const x = BigInt(a);
+  const y = BigInt(b);
+  if (x < y) return -1;
+  return x > y ? 1 : 0;
+}
+
+/** Whether `error` is a file system error with this code, such as `ENOENT`. */
+function hasCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+/**
+ * Writes `text` to `file` so that a reader, or a crash, finds the old file or the new one and never
+ * part of either. The text goes to a temp file in the same directory, so that the rename stays on
+ * one filesystem and is atomic, and is on disk before the rename.
+ */
+async function writeFileAtomic(file: string, text: string): Promise<void> {
+  const temp = join(
+    dirname(file),
+    `.${basename(file)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
+  );
+  // `wx` fails rather than reuse a file that is already there, and so nothing below can remove
+  // somebody else's file. The mode is set by the create itself, so the file is private from its
+  // first moment and not only once it has been written.
+  const handle = await open(temp, "wx", FILE_MODE);
+  try {
+    try {
+      await handle.writeFile(text, "utf8");
+      // Without this, a power cut after the rename can leave an empty file under the real name.
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temp, file);
+  } catch (error) {
+    // The write or the rename failed. Take the unfinished copy away, and report that failure, not
+    // one of this cleanup.
+    await rm(temp, { force: true }).catch(() => undefined);
+    throw error;
+  }
+  await syncDirectory(dirname(file));
+}
+
+/** Makes a rename survive a power cut. Best effort, since not every platform opens a directory. */
+async function syncDirectory(path: string): Promise<void> {
+  try {
+    const handle = await open(path, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // The rename has happened, so the draft is in place. This only hardens it.
+  }
+}
+
+/**
+ * The store for the drafts in `{dir}/drafts/{taskId}.json`. It creates `dir` on the first write,
+ * and reading from a `dir` that does not exist yet finds no drafts.
+ */
+export function createStateStore(dir: string): StateStore {
+  // An empty path would resolve to the current directory and put the drafts wherever the process
+  // happens to run, which is what `process.env.X ?? fallback` gives when X is set but empty.
+  if (dir === "") {
+    throw new Error("the state directory must not be empty");
+  }
+  // Resolved now, so that a later `chdir` cannot move the store.
+  const draftsDir = join(resolve(dir), "drafts");
+  const fileOf = (taskId: string) => join(draftsDir, `${taskId}${DRAFT_SUFFIX}`);
+
+  async function readDraft(taskId: string): Promise<Draft | null> {
+    const file = fileOf(taskId);
+    let text: string;
+    try {
+      text = await readFile(file, "utf8");
+    } catch (error) {
+      if (hasCode(error, "ENOENT")) return null;
+      throw error;
+    }
+    // The errors below name the file and never quote it, because it holds the work and the salt.
+    let json: unknown;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`draft file ${file} is corrupt: it is not valid JSON`);
+    }
+    const parsed = DraftSchema.safeParse(json);
+    if (!parsed.success) {
+      throw new Error(`draft file ${file} is corrupt: ${z.prettifyError(parsed.error)}`);
+    }
+    if (parsed.data.taskId !== taskId) {
+      throw new Error(`draft file ${file} is corrupt: it holds task ${parsed.data.taskId}`);
+    }
+    return parsed.data;
+  }
+
+  async function writeDraft(draft: Draft): Promise<void> {
+    const parsed = DraftSchema.safeParse(draft);
+    if (!parsed.success) {
+      throw new Error(`invalid draft: ${z.prettifyError(parsed.error)}`);
+    }
+    // `mkdir` gives each directory it creates the mode, and leaves one that exists alone. A
+    // directory made by hand has the default umask's 0755, so tighten it.
+    await mkdir(draftsDir, { recursive: true, mode: DIR_MODE });
+    await chmod(draftsDir, DIR_MODE);
+    await writeFileAtomic(fileOf(parsed.data.taskId), `${JSON.stringify(parsed.data, null, 2)}\n`);
+  }
+
+  return {
+    async saveDraft(draft) {
+      assertTaskId(draft.taskId);
+      await writeDraft(draft);
+    },
+
+    async getDraft(taskId) {
+      assertTaskId(taskId);
+      return readDraft(taskId);
+    },
+
+    async markRevealed(taskId, uri) {
+      assertTaskId(taskId);
+      // Without this, an undefined uri would write the draft back as it was and look like success.
+      if (typeof uri !== "string") {
+        throw new TypeError("markRevealed needs the uri the work was revealed at");
+      }
+      const draft = await readDraft(taskId);
+      if (draft === null) {
+        throw new Error(`no draft for task ${taskId}`);
+      }
+      await writeDraft({ ...draft, revealedUri: uri });
+    },
+
+    async listDrafts() {
+      let names: string[];
+      try {
+        names = await readdir(draftsDir);
+      } catch (error) {
+        if (hasCode(error, "ENOENT")) return [];
+        throw error;
+      }
+      // Only `{task id}.json` is a draft. A temp file left by a writer that was killed, and
+      // anything else in the directory, is none.
+      const taskIds = names
+        .filter((name) => name.endsWith(DRAFT_SUFFIX))
+        .map((name) => name.slice(0, -DRAFT_SUFFIX.length))
+        .filter((id) => U64StringSchema.safeParse(id).success)
+        .sort(compareTaskIds);
+      // One file at a time, so that many drafts cannot run the process out of open files, and the
+      // first unreadable draft in task order is the one that is reported.
+      const drafts: Draft[] = [];
+      for (const taskId of taskIds) {
+        const draft = await readDraft(taskId);
+        // A draft that was there when the directory was read may be gone when it is read.
+        if (draft !== null) drafts.push(draft);
+      }
+      return drafts;
+    },
+  };
+}
