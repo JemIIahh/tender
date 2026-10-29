@@ -308,6 +308,24 @@ test("different_blocks_at_one_height_both_project", async () => {
   expect(await count("events")).toBe(2);
 });
 
+test("fixture_line_patch_must_stay_a_valid_event", () => {
+  // extractEvents drops a line that does not fit its event, without a word. The types accept a patch
+  // that breaks the event (a string is a string), and a test built on it would then pass or fail
+  // for the wrong reason, so eventLine refuses it where it is written, and names what it patched.
+  expect(() => eventLine("task_created", { id: "007" })).toThrow(
+    "task_created fixture patched at id is not a valid task_created event",
+  );
+  expect(() =>
+    eventLine("committed", { account: bob, commitment: BOB_ENTRY.commitment.toUpperCase() }),
+  ).toThrow("committed fixture patched at account, commitment is not a valid committed event");
+
+  // The same patches in their canonical form are lines like any other.
+  expect(() => eventLine("task_created", { id: "7" })).not.toThrow();
+  expect(() =>
+    eventLine("committed", { account: bob, commitment: BOB_ENTRY.commitment }),
+  ).not.toThrow();
+});
+
 test("failure_receipt_ignored", async () => {
   const mixed: IndexedBlock = {
     height: 70n,

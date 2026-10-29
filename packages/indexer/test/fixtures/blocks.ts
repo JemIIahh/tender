@@ -123,7 +123,9 @@ export function fixtureData<Name extends EventName>(event: Name): EventData<Name
 /**
  * The log line of the captured `event`, with the `data` fields named in `patch` replaced. The patch
  * is typed by the event; a key that the fixture has no field for also throws, so a key that got past
- * the types cannot pass for a patch.
+ * the types cannot pass for a patch. So does a patch that leaves a line that is no longer a valid
+ * event, such as a u64 with a leading zero or an upper-case hash, which the types accept and
+ * `extractEvents` would drop without a word.
  */
 export function eventLine<Name extends EventName>(
   event: Name,
@@ -135,7 +137,12 @@ export function eventLine<Name extends EventName>(
     if (!(key in data)) throw new Error(`the ${event} fixture has no field "${key}" to patch`);
   }
   envelope.data = [{ ...data, ...patch }];
-  return EVENT_PREFIX + JSON.stringify(envelope);
+  const line = EVENT_PREFIX + JSON.stringify(envelope);
+  if (parseEventLog(line)?.event !== event) {
+    const patched = Object.keys(patch).join(", ") || "nothing";
+    throw new Error(`the ${event} fixture patched at ${patched} is not a valid ${event} event`);
+  }
+  return line;
 }
 
 /** A successful receipt on the fixture contract that logs `logs`. */
