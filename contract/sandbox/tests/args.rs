@@ -8,12 +8,16 @@
 //! Each refusal is followed by the same call made properly, which goes through and changes what the
 //! refused one would have changed. So a refusal cannot be a world that refuses everything, and
 //! "nothing changed" cannot be a call that would have changed nothing anyway.
+//!
+//! The NEP-145 storage methods are the other way round: they take the standard's arguments, and
+//! keep its rules.
 
 mod common;
 
 use common::*;
-use near_workspaces::types::NearToken;
-use near_workspaces::Account;
+use near_workspaces::result::ExecutionFinalResult;
+use near_workspaces::types::{Gas, NearToken};
+use near_workspaces::{Account, AccountId};
 use serde_json::{json, Value};
 
 /// The key that `assert_refuses_unknown_key` adds. No method has an argument of this name.
@@ -333,48 +337,114 @@ async fn post_task_refuses_a_misplaced_or_misspelled_verifier() -> anyhow::Resul
     Ok(())
 }
 
-/// `storage_deposit` is NEP-145 and does not deny unknown arguments, because the standard has
-/// `registration_only` and a client written for any NEP-145 contract sends it. Tender ignores the
-/// flag and credits all the NEAR it is sent.
+/// What `who` holds in NEAR.
+async fn near_balance(env: &Env, who: &AccountId) -> anyhow::Result<u128> {
+    Ok(env.worker.view_account(who).await?.balance.as_yoctonear())
+}
+
+/// `who`'s `storage_deposit` with `args` and `deposit` attached, which must succeed, and how much
+/// NEAR it took from `who`: the deposit that was kept, and gas. It attaches 30 Tgas, so the gas is
+/// small beside a deposit of 1 NEAR.
+async fn storage_deposit_paid(
+    env: &Env,
+    who: &Account,
+    args: Value,
+    deposit: NearToken,
+) -> anyhow::Result<(ExecutionFinalResult, u128)> {
+    let before = near_balance(env, who.id()).await?;
+    let r = who
+        .call(env.tender.id(), "storage_deposit")
+        .args_json(args)
+        .deposit(deposit)
+        .gas(Gas::from_tgas(30))
+        .transact()
+        .await?;
+    let r = clean(r)?;
+    Ok((r, before - near_balance(env, who.id()).await?))
+}
+
+/// `storage_balance_bounds` is NEP-145's view of the least a first deposit must be, and on the real
+/// node that is the floor: one yocto less does not register a new account, and `min` does.
 #[tokio::test]
-async fn storage_deposit_accepts_the_standard_registration_only_flag() -> anyhow::Result<()> {
+async fn storage_balance_bounds_is_the_registration_floor() -> anyhow::Result<()> {
+    let env = setup(5).await?;
+    let bounds = view(&env.tender, "storage_balance_bounds", json!({})).await?;
+    assert_eq!(
+        bounds,
+        json!({ "min": "10000000000000000000000", "max": null })
+    );
+    let min = num(&bounds["min"]);
+    let dave = new_account(&env, "dave").await?;
+    let balance_of = || {
+        view(
+            &env.tender,
+            "storage_balance_of",
+            json!({ "account_id": dave.id() }),
+        )
+    };
+
+    let short = NearToken::from_yoctonear(min - 1);
+    let r = call(&env, &dave, "storage_deposit", json!({}), short).await?;
+    assert_fails_with(&r, "E_STORAGE: a first deposit must be at least");
+    assert!(balance_of().await?.is_null());
+
+    let exact = NearToken::from_yoctonear(min);
+    let r = clean(call(&env, &dave, "storage_deposit", json!({}), exact).await?)?;
+    assert_eq!(num(&r.json::<Value>()?["total"]), min);
+    assert_eq!(num(&balance_of().await?["total"]), min);
+    Ok(())
+}
+
+/// `storage_deposit` is NEP-145 and does not deny unknown arguments, because a client written for
+/// any NEP-145 contract may send the standard's. It takes `registration_only` as the standard has
+/// it: a new account is registered with exactly `storage_balance_bounds().min` and the rest of the
+/// deposit goes back to the caller, and a registered account is credited nothing and gets the
+/// whole deposit back. Without the flag, all of it is credited. The refunds show in the callers'
+/// NEAR balances, which otherwise pay only for gas, far less than the 1 NEAR sent each time.
+#[tokio::test]
+async fn storage_deposit_follows_nep145_registration_only() -> anyhow::Result<()> {
     let env = setup(5).await?;
     let dave = new_account(&env, "dave").await?;
     let erin = new_account(&env, "erin").await?;
-    let amount = NearToken::from_millinear(100);
+    let frank = new_account(&env, "frank").await?;
+    let min = num(&view(&env.tender, "storage_balance_bounds", json!({})).await?["min"]);
+    let amount = NearToken::from_near(1);
+    // More than the gas of any of these calls, and a tenth of the deposit.
+    let gas = amount.as_yoctonear() / 10;
 
-    let r = clean(
-        call(
-            &env,
-            &dave,
-            "storage_deposit",
-            json!({ "registration_only": true }),
-            amount,
-        )
-        .await?,
-    )?;
-    let balance: Value = r.json()?;
-    assert_eq!(num(&balance["total"]), amount.as_yoctonear());
+    // dave registers himself with the flag: he is credited the minimum and pays only that.
+    let flag = json!({ "registration_only": true });
+    let (r, paid) = storage_deposit_paid(&env, &dave, flag.clone(), amount).await?;
+    assert_eq!(num(&r.clone().json::<Value>()?["total"]), min);
+    assert_eq!(event(&r, "storage_deposit")["amount"], min.to_string());
+    assert!(paid > min && paid < min + gas, "dave paid {paid}");
 
-    // For another account, with the flag beside `account_id`.
-    let r = clean(
-        call(
-            &env,
-            &env.alice,
-            "storage_deposit",
-            json!({ "account_id": erin.id(), "registration_only": true }),
-            amount,
-        )
-        .await?,
-    )?;
-    let balance: Value = r.json()?;
-    assert_eq!(num(&balance["total"]), amount.as_yoctonear());
+    // erin sends as much without the flag, and all of it is credited.
+    let (r, paid) = storage_deposit_paid(&env, &erin, json!({}), amount).await?;
+    assert_eq!(num(&r.json::<Value>()?["total"]), amount.as_yoctonear());
+    assert!(
+        paid > amount.as_yoctonear() && paid < amount.as_yoctonear() + gas,
+        "erin paid {paid}"
+    );
+
+    // dave asks again, registered now: nothing is credited, all of it comes back, and no event.
+    let (r, paid) = storage_deposit_paid(&env, &dave, flag, amount).await?;
+    assert_eq!(num(&r.clone().json::<Value>()?["total"]), min);
+    assert!(events(&r).is_empty(), "{:?}", r.logs());
+    assert!(paid < gas, "dave paid {paid}");
+
+    // For another account, with the flag beside `account_id`: frank is registered with the
+    // minimum, and the rest goes back to alice, who sent it.
+    let args = json!({ "account_id": frank.id(), "registration_only": true });
+    let (r, paid) = storage_deposit_paid(&env, &env.alice, args, amount).await?;
+    assert_eq!(num(&r.json::<Value>()?["total"]), min);
+    assert!(paid > min && paid < min + gas, "alice paid {paid}");
     let registered = view(
         &env.tender,
         "storage_balance_of",
-        json!({ "account_id": erin.id() }),
+        json!({ "account_id": frank.id() }),
     )
     .await?;
-    assert_eq!(num(&registered["total"]), amount.as_yoctonear());
+    assert_eq!(num(&registered["total"]), min);
     Ok(())
 }

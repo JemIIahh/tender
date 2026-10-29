@@ -62,8 +62,8 @@ impl Tender {
     ///
     /// Requires exactly 1 yoctoNEAR (`assert_one_yocto`), so a function-call key cannot call it,
     /// and at least `MIN_WITHDRAW_GAS` prepaid (`E_GAS`). `amount` must be positive and at most
-    /// the caller's balance (`E_FUNDS`). It works while paused and for a token that has been
-    /// disabled.
+    /// the caller's balance, and `to` must not be the contract itself (`E_FUNDS`): tokens paid to
+    /// it would sit in no vault. It works while paused and for a token that has been disabled.
     ///
     /// The balance is debited first, then the token is asked to `ft_transfer`. If that fails, for
     /// example because `to` has no storage with the token, `on_withdraw` credits the amount back.
@@ -80,6 +80,12 @@ impl Tender {
         }
         let account = env::predecessor_account_id();
         let to = to.unwrap_or_else(|| account.clone());
+        if to == env::current_account_id() {
+            env::panic_str(&format!(
+                "{}: cannot withdraw to the contract itself",
+                err::E_FUNDS
+            ));
+        }
         self.debit(&account, &token, amount.0);
         ext_ft_core::ext(token.clone())
             .with_attached_deposit(NearToken::from_yoctonear(1))
@@ -312,7 +318,7 @@ mod tests {
     /// Gives `who` a storage balance of `deposit`. `who` stays the caller.
     fn register(t: &mut Tender, who: &str, deposit: NearToken) {
         testing_env!(ctx(who).attached_deposit(deposit).build());
-        t.storage_deposit(None);
+        t.storage_deposit(None, None);
     }
 
     /// A contract with `usdc.test` allowlisted and enabled, and `alice.test` and `bob.test`
@@ -815,6 +821,28 @@ mod tests {
         let mut t = world();
         deposit(&mut t, "alice.test", 100, "");
         withdraw(&mut t, "alice.test", 0, None);
+    }
+
+    #[test]
+    fn withdraw_to_the_contract_itself_rejected() {
+        // A standard token refuses a transfer to its own sender, and the callback restores the
+        // balance. A token that allowed it would leave the tokens with Tender's own account,
+        // outside every vault, and alice's balance debited.
+        let mut t = world();
+        deposit(&mut t, "alice.test", 100, "");
+        testing_env!(ctx("alice.test").attached_deposit(ONE_YOCTO).build());
+        let rejected = panic_message(|| {
+            let _ = t.withdraw(acct(USDC), U128(30), Some(acct("tender.test")));
+        });
+        assert_eq!(
+            rejected.as_deref(),
+            Some("E_FUNDS: cannot withdraw to the contract itself")
+        );
+        assert_eq!(balance(&t, "alice.test"), 100);
+        assert!(scheduled_calls().is_empty(), "no transfer was scheduled");
+        // To anyone else it goes through.
+        withdraw(&mut t, "alice.test", 30, Some("bob.test"));
+        assert_eq!(balance(&t, "alice.test"), 70);
     }
 
     #[test]

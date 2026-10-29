@@ -230,9 +230,12 @@ impl Tender {
         let reward = task.reward.0;
         self.check_reward(&task.token, reward);
         check_uri("brief_uri", &task.brief_uri);
-        let brief_hash = parse_hash(&task.brief_hash);
-        let criteria_hash = parse_hash(&task.criteria_hash);
-        let heldout_commitment = task.heldout_commitment.as_deref().map(parse_hash);
+        let brief_hash = parse_hash("brief_hash", &task.brief_hash);
+        let criteria_hash = parse_hash("criteria_hash", &task.criteria_hash);
+        let heldout_commitment = task
+            .heldout_commitment
+            .as_deref()
+            .map(|h| parse_hash("heldout_commitment", h));
         for (name, secs) in [
             ("commit_secs", task.commit_secs),
             ("reveal_secs", task.reveal_secs),
@@ -477,7 +480,7 @@ mod tests {
     /// Adds `deposit` to `who`'s storage balance, registering it if need be.
     fn register(t: &mut Tender, who: &str, deposit: NearToken) {
         testing_env!(ctx(who).attached_deposit(deposit).build());
-        t.storage_deposit(None);
+        t.storage_deposit(None, None);
     }
 
     /// `who` deposits `amount` of USDC, as the token reports it to `ft_on_transfer`.
@@ -1142,6 +1145,43 @@ mod tests {
     }
 
     #[test]
+    fn hash_rejections_name_the_field() {
+        // Three arguments are hashes, so the message says which one is wrong.
+        let mut t = world();
+        let cases = [
+            (
+                "brief_hash",
+                PostTaskArgs {
+                    brief_hash: BRIEF_HASH.to_uppercase(),
+                    ..args()
+                },
+            ),
+            (
+                "criteria_hash",
+                PostTaskArgs {
+                    criteria_hash: CRITERIA_HASH[..63].to_string(),
+                    ..args()
+                },
+            ),
+            (
+                "heldout_commitment",
+                PostTaskArgs {
+                    heldout_commitment: Some(format!("g{}", &HELDOUT_HASH[1..])),
+                    ..args()
+                },
+            ),
+        ];
+        for (field, task) in cases {
+            let message = assert_rejected(&mut t, field, "E_HASH", "alice.test", ONE_YOCTO, task);
+            assert_eq!(
+                message,
+                format!("E_HASH: {field}: expected 64 lowercase hex chars")
+            );
+        }
+        assert_eq!(t.task_count(), U64(0));
+    }
+
+    #[test]
     fn rules_are_checked_in_the_listed_order() {
         // bob posts a task that breaks every rule it can at once. Each step mends the rule that
         // was reported, so the next one in the list has to be the next one reported.
@@ -1572,7 +1612,7 @@ mod tests {
                 },
             ],
             fee: 50_000,
-            scorecard_hash: parse_hash(CRITERIA_HASH),
+            scorecard_hash: parse_hash("scorecard_hash", CRITERIA_HASH),
             scorecard_uri: "ipfs://scorecard".to_string(),
         };
         let view = OutcomeView::from(&picked);
@@ -1605,7 +1645,7 @@ mod tests {
 
         let no_award = Outcome::Voided {
             reason: VoidReason::NoAward,
-            scorecard_hash: Some(parse_hash(HELDOUT_HASH)),
+            scorecard_hash: Some(parse_hash("scorecard_hash", HELDOUT_HASH)),
             scorecard_uri: Some("ipfs://scorecard".to_string()),
         };
         assert_eq!(

@@ -120,7 +120,7 @@ impl Tender {
             ));
         }
         check_uri("scorecard_uri", &scorecard_uri);
-        let scorecard_hash = parse_hash(&scorecard_hash);
+        let scorecard_hash = parse_hash("scorecard_hash", &scorecard_hash);
 
         if winners.is_empty() {
             // Every rule has been checked.
@@ -512,7 +512,7 @@ mod tests {
     /// Adds `deposit` to `who`'s storage balance, registering it if need be.
     fn register(t: &mut Tender, who: &str, deposit: NearToken) {
         testing_env!(ctx(who).attached_deposit(deposit).build());
-        t.storage_deposit(None);
+        t.storage_deposit(None, None);
     }
 
     /// `who` deposits `amount` of USDC, as the token reports it to `ft_on_transfer`.
@@ -806,6 +806,92 @@ mod tests {
                 payout("carol.test", 3_333, 316_635),
                 payout("dave.test", 3_334, 316_731),
             ]
+        );
+    }
+
+    #[test]
+    fn pick_after_zero_fee_pays_full_reward() {
+        let mut t = world();
+        // The owner takes the fee down to nothing before the task is posted, so the task's
+        // snapshot of it is 0.
+        testing_env!(ctx("owner.test").attached_deposit(ONE_YOCTO).build());
+        t.set_fee(0, acct(TREASURY));
+        let id = post(&mut t, args());
+        assert_eq!(t.get_task(U64(id)).unwrap().fee_bps, 0, "the premise");
+        revealed(&mut t, id, &["bob.test", "carol.test"]);
+        try_pick(
+            &mut t,
+            JUDGE,
+            id,
+            REVEAL_DEADLINE,
+            &[("bob.test", 7_000), ("carol.test", 3_000)],
+        )
+        .unwrap();
+        // The treasury's slot is credited 0, which is no reason to panic, and the winners share
+        // the whole reward.
+        let logs = get_logs();
+        assert_eq!(balance(&t, TREASURY), 0);
+        assert_eq!(balance(&t, "bob.test"), 700_000);
+        assert_eq!(balance(&t, "carol.test"), 300_000);
+        assert_eq!(balance(&t, "alice.test"), FUNDS - REWARD);
+        assert_eq!(money(&t).iter().sum::<u128>(), FUNDS);
+        let Some(OutcomeView::Picked {
+            winners: paid_out,
+            fee,
+            ..
+        }) = outcome(&t, id)
+        else {
+            panic!("the task is picked");
+        };
+        assert_eq!(fee, U128(0));
+        assert_eq!(
+            paid_out,
+            [
+                payout("bob.test", 7_000, 700_000),
+                payout("carol.test", 3_000, 300_000),
+            ]
+        );
+        assert_data_is_outcome(&logs[0], &t, id, &["task_id", "by"]);
+    }
+
+    #[test]
+    fn dust_pick_reward_one_two_winners() {
+        let mut t = world();
+        // The smallest reward there is. The owner lowers the token's minimum to it.
+        testing_env!(ctx("owner.test").attached_deposit(ONE_YOCTO).build());
+        t.set_token(acct(USDC), U128(1), U128(50_000_000), true);
+        let task = PostTaskArgs {
+            reward: U128(1),
+            ..args()
+        };
+        let id = post(&mut t, task);
+        revealed(&mut t, id, &["bob.test", "carol.test"]);
+        try_pick(
+            &mut t,
+            JUDGE,
+            id,
+            REVEAL_DEADLINE,
+            &[("bob.test", 5_000), ("carol.test", 5_000)],
+        )
+        .unwrap();
+        // The fee, 1 * 500 / 10_000, rounds down to 0. Each half of the 1 left rounds down to 0
+        // too, so the 1 is dust, and it goes to the first winner.
+        assert_eq!(balance(&t, TREASURY), 0);
+        assert_eq!(balance(&t, "bob.test"), 1);
+        assert_eq!(balance(&t, "carol.test"), 0);
+        assert_eq!(money(&t).iter().sum::<u128>(), FUNDS);
+        let Some(OutcomeView::Picked {
+            winners: paid_out,
+            fee,
+            ..
+        }) = outcome(&t, id)
+        else {
+            panic!("the task is picked");
+        };
+        assert_eq!(fee, U128(0));
+        assert_eq!(
+            paid_out,
+            [payout("bob.test", 5_000, 1), payout("carol.test", 5_000, 0)]
         );
     }
 
@@ -1117,10 +1203,13 @@ mod tests {
 
         // Awarding nothing still takes a scorecard.
         let result = try_pick_with(&mut t, JUDGE, id, REVEAL_DEADLINE, &[], "x", SCORECARD_URI);
-        assert_rejected(
-            result,
-            "E_HASH",
-            "a no-award without a valid scorecard hash",
+        assert_eq!(
+            assert_rejected(
+                result,
+                "E_HASH",
+                "a no-award without a valid scorecard hash",
+            ),
+            "E_HASH: scorecard_hash: expected 64 lowercase hex chars"
         );
         try_pick(&mut t, JUDGE, id, REVEAL_DEADLINE, &[]).unwrap();
         // Each funder holds exactly what it held before it paid in, and nobody else got anything:
