@@ -4,8 +4,10 @@ import {
   type Brief,
   canonicalJson,
   type Profile,
+  parseEventLog,
   type ReceiptOutcome,
   sha256Hex,
+  type TenderEvent,
 } from "@tender/shared";
 import { type ApplyOptions, applyBlock } from "../../src/apply";
 import type { IndexedBlock } from "../../src/types";
@@ -17,8 +19,9 @@ import type { IndexedBlock } from "../../src/types";
 // wasm contract, captured on a sandbox, except four that the contract did not emit yet when they
 // were written (task_topped_up, attested_pick, delegate_added and delegate_removed; see
 // packages/shared/test/events.test.ts). A line is used as it is, or as a copy in which only the
-// `data` fields named in a patch differ (`eventLine` refuses a field the fixture does not have).
-// Nothing is written from scratch. The lifecycle below patches these fields and no others:
+// `data` fields named in a patch differ. Nothing is written from scratch. `eventLine` and
+// `fixtureData` are typed by the event, so a misspelt event name or patch field does not compile.
+// The lifecycle below patches these fields and no others:
 //
 //   agent_registered   alice  profile_hash -> the hash of FIXTURE_PROFILE, so her name resolves
 //                      bob    account
@@ -34,10 +37,14 @@ import type { IndexedBlock } from "../../src/types";
 /** The account whose receipts the fixtures log. */
 export const FIXTURE_CONTRACT = "tender.test.near";
 
-/** The accounts of the captured logs. Everyone but the judge is also a possible agent. */
+/**
+ * The accounts of the captured logs. Alice and bob, the invited, enter task 1. The poster and the
+ * judge, its verifier, cannot enter it, as on chain (`commit` answers E_AUTH to both); the judge
+ * makes the picks and voids. Any account can be a registered agent, and the lifecycle registers
+ * alice, bob and the judge. Carol is the funder of the captured top-up.
+ */
 export const FIXTURE_ACCOUNTS = {
   poster: "poster.test.near",
-  /** The verifier of the captured task, and the account that picks and voids. */
   judge: "judge.test.near",
   alice: "alice.test.near",
   bob: "bob.test.near",
@@ -87,6 +94,10 @@ export const BOB_ENTRY = {
 const EVENT_PREFIX = "EVENT_JSON:";
 const EVENT_FIXTURES = new URL("../../../shared/test/fixtures/events/", import.meta.url);
 
+/** The name of an event, and its `data`, as `@tender/shared` types them. */
+type EventName = TenderEvent["event"];
+type EventData<Name extends EventName> = Extract<TenderEvent, { event: Name }>["data"];
+
 interface Envelope {
   standard: string;
   version: string;
@@ -94,28 +105,44 @@ interface Envelope {
   data: [Record<string, unknown>];
 }
 
-function capturedEnvelope(event: string): Envelope {
+function capturedEnvelope(event: EventName): Envelope {
   const line = readFileSync(new URL(`${event}.log`, EVENT_FIXTURES), "utf8").trim();
   return JSON.parse(line.slice(EVENT_PREFIX.length)) as Envelope;
 }
 
-/** The `data` of the captured `event`, as the contract logged it. */
-export function fixtureData(event: string): Record<string, unknown> {
-  return capturedEnvelope(event).data[0];
+/**
+ * The `data` of the captured `event`, as the shared schema parses it. The one cast is backed by the
+ * check before it: the parsed line is an event of that name.
+ */
+export function fixtureData<Name extends EventName>(event: Name): EventData<Name> {
+  const parsed = parseEventLog(EVENT_PREFIX + JSON.stringify(capturedEnvelope(event)));
+  if (parsed?.event !== event) throw new Error(`the ${event} fixture is not a valid event`);
+  return parsed.data as EventData<Name>;
 }
 
 /**
- * The log line of the captured `event`, with the `data` fields named in `patch` replaced. A patch
- * key that the fixture has no field for throws, so a misspelt key cannot pass for a patch.
+ * The log line of the captured `event`, with the `data` fields named in `patch` replaced. The patch
+ * is typed by the event; a key that the fixture has no field for also throws, so a key that got past
+ * the types cannot pass for a patch. So does a patch that leaves a line that is no longer a valid
+ * event, such as a u64 with a leading zero or an upper-case hash, which the types accept and
+ * `extractEvents` would drop without a word.
  */
-export function eventLine(event: string, patch: Record<string, unknown> = {}): string {
+export function eventLine<Name extends EventName>(
+  event: Name,
+  patch: Partial<EventData<Name>> = {},
+): string {
   const envelope = capturedEnvelope(event);
   const [data] = envelope.data;
   for (const key of Object.keys(patch)) {
     if (!(key in data)) throw new Error(`the ${event} fixture has no field "${key}" to patch`);
   }
   envelope.data = [{ ...data, ...patch }];
-  return EVENT_PREFIX + JSON.stringify(envelope);
+  const line = EVENT_PREFIX + JSON.stringify(envelope);
+  if (parseEventLog(line)?.event !== event) {
+    const patched = Object.keys(patch).join(", ") || "nothing";
+    throw new Error(`the ${event} fixture patched at ${patched} is not a valid ${event} event`);
+  }
+  return line;
 }
 
 /** A successful receipt on the fixture contract that logs `logs`. */
@@ -133,8 +160,11 @@ const EPOCH_NS = 1_793_307_000_000_000_000n;
 
 /**
  * The block at `height` in which each of `lines` is logged by a receipt of its own, as when each
- * is one call. The receipt ids are unique to the height. Without `timestampNs`, the block's time is
- * one second per height from a fixed epoch.
+ * is one call. A receipt id is made of the height, the line's position and a part of the line's
+ * SHA-256: building the same block twice gives the same ids, so applying it again is a replay, and
+ * two different blocks at one height never share an id, which would make the second look like a
+ * replay and be skipped. Without `timestampNs`, the block's time is one second per height from a
+ * fixed epoch.
  */
 export function blockOf(
   height: number | bigint,
@@ -145,7 +175,9 @@ export function blockOf(
   return {
     height: h,
     timestampNs: timestampNs ?? EPOCH_NS + h * NS_PER_SECOND,
-    receipts: lines.map((line, i) => receipt(`receipt-${h}-${i}`, [line])),
+    receipts: lines.map((line, i) =>
+      receipt(`receipt-${h}-${i}-${sha256Hex(line).slice(0, 16)}`, [line]),
+    ),
   };
 }
 
@@ -168,8 +200,8 @@ export function blockOf(
  */
 export function lifecycleBlocks(): IndexedBlock[] {
   const task = fixtureData("task_created");
-  const at = (field: string, seconds: bigint) =>
-    BigInt(String(task[field])) + seconds * NS_PER_SECOND;
+  const at = (field: "created_at" | "commit_deadline" | "reveal_deadline", seconds: bigint) =>
+    BigInt(task[field]) + seconds * NS_PER_SECOND;
   const { bob, judge } = FIXTURE_ACCOUNTS;
   return [
     blockOf(
