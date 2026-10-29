@@ -50,8 +50,13 @@ jobs:
           mkdir -p "$HOME/.cargo/bin"
           install -m 755 "$(find "$RUNNER_TEMP/cargo-near" -type f -name cargo-near | head -n 1)" "$HOME/.cargo/bin/cargo-near"
           cargo near --version
-      # The wasm is built here, not taken from contract/res, so the bytes differ from the build that
-      # was committed there. Nothing compares them.
+      # contract/res is what gets deployed and what the TypeScript side runs against, so it has to
+      # be the build of the sources in this commit. build.sh records their hash in
+      # res/SOURCES.sha256, and this recomputes it before anything is rebuilt.
+      - name: Check that contract/res was built from these sources
+        run: ./check-res.sh
+      # The wasm is then built again here, and the sandbox tests run that build. Its bytes differ
+      # from the committed ones, since another machine builds them.
       - name: Build the wasm
         run: ./build.sh
       - name: Test
