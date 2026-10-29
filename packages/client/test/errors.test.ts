@@ -11,6 +11,13 @@ const MISSPELLED_KEY =
   "`token`, `reward`, `brief_uri`, `brief_hash`, `criteria_hash`, `heldout_commitment`, " +
   "`verifier`, `commit_secs`, `reveal_secs`, `pick_secs`, `fallback_secs`, `max_entries`, " +
   "`max_winners`, `invited`, `parent` at line 1 column 395`";
+// The same panic for a key the caller wrote as `E_AUTH:` in `post_task`'s task. near-sdk echoes
+// the key, so the text holds what looks like a contract code.
+const ECHOED_CODE =
+  "Failed to deserialize input from JSON. Error: `unknown field `E_AUTH:`, expected one of " +
+  "`token`, `reward`, `brief_uri`, `brief_hash`, `criteria_hash`, `heldout_commitment`, " +
+  "`verifier`, `commit_secs`, `reveal_secs`, `pick_secs`, `fallback_secs`, `max_entries`, " +
+  "`max_winners`, `invited`, `parent` at line 1 column 399`";
 
 describe("parseContractError", () => {
   test("returns_the_code_a_contract_panic_starts_with", () => {
@@ -65,6 +72,15 @@ describe("errorCodeOf", () => {
     expect(errorCodeOf(`${PANIC}E_GAS: withdraw needs at least 35 Tgas prepaid, got 30`)).toBe(
       "E_GAS",
     );
+  });
+
+  test("only_a_code_the_panic_starts_with_counts", () => {
+    // A code the caller wrote, echoed by near-sdk, is not the contract's.
+    expect(errorCodeOf(`${PANIC}${ECHOED_CODE}`)).toBe("E_ARGS");
+    expect(parseContractError(`${PANIC}${ECHOED_CODE}`)).toBe("E_AUTH");
+    expect(errorCodeOf(`${PANIC}The account E_AUTH: is not registered`)).toBe("E_UNKNOWN");
+    // The panic's text alone, without the chain's prefix, still has its code.
+    expect(errorCodeOf("E_FUNDS: insufficient vault balance")).toBe("E_FUNDS");
   });
 
   test("anything_else_is_unknown", () => {

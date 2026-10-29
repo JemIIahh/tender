@@ -24,11 +24,19 @@ export class TenderError extends Error {
 
 /**
  * The contract's error code in `msg`: the first `E_<NAME>:` in it, without the colon, or null.
- * Every panic of the contract starts with its code, as `"<CODE>: <detail>"`.
+ * Every panic of the contract starts with its code, as `"<CODE>: <detail>"`. This searches the
+ * whole text, so it also finds a code that is not the contract's, such as one near-sdk echoes from
+ * the caller's arguments; `errorCodeOf` takes only a code the panic starts with.
  */
 export function parseContractError(msg: string): string | null {
   return /(E_[A-Z_]+):/.exec(msg)?.[1] ?? null;
 }
+
+/**
+ * A code at the start of a panic's text: the contract's own, since all its panics start with one.
+ * The chain reports the text after `Smart contract panicked: `.
+ */
+const LEADING_CODE = /^(?:Smart contract panicked: )?(E_[A-Z_]+):/;
 
 /**
  * The texts of the panics that near-sdk 5.29.1's generated wrappers raise before a method's own
@@ -50,12 +58,14 @@ const SDK_PANICS: ReadonlyArray<readonly [RegExp, string]> = [
 
 /**
  * The code `TenderError` carries for a failure whose text is `message`: the contract's code if the
- * text has one (`parseContractError`), else the code of the near-sdk panic it names (`E_AUTH`,
- * `E_ARGS` or `E_INITIALIZED`), else `E_UNKNOWN`.
+ * panic starts with one (after the chain's `Smart contract panicked: `), else the code of the
+ * near-sdk panic it names (`E_AUTH`, `E_ARGS` or `E_INITIALIZED`), else `E_UNKNOWN`. A code further
+ * into the text is not the contract's: near-sdk's `Failed to deserialize input from JSON` panic
+ * quotes an unknown key, and a caller can write `E_AUTH:` as one.
  */
 export function errorCodeOf(message: string): string {
-  const code = parseContractError(message);
-  if (code !== null) return code;
+  const code = LEADING_CODE.exec(message)?.[1];
+  if (code !== undefined) return code;
   for (const [pattern, sdkCode] of SDK_PANICS) {
     if (pattern.test(message)) return sdkCode;
   }

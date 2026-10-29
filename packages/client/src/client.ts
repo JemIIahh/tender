@@ -25,7 +25,6 @@ import {
   type TaskView,
   TaskViewSchema,
   type TenderCall,
-  type TenderEvent,
   topUpTaskCall,
   U64StringSchema,
   U128StringSchema,
@@ -37,6 +36,7 @@ import { AccessKeyDoesNotExistError, AccountDoesNotExistError } from "near-api-j
 import { errorCodeOf, TenderError } from "./errors";
 import type { KeyPermission } from "./nep413";
 import { receiptsFromTx, type TxReceiptsOutcome } from "./outcome";
+import { defaultQueue } from "./queue";
 
 /** An account and its private key, as near-api-js writes keys: `ed25519:<base58>`. */
 export interface Signer {
@@ -47,8 +47,12 @@ export interface Signer {
 /** What a transaction did, once it is final and succeeded. */
 export interface TxResult {
   txHash: string;
-  /** The Tender events of the receipts that ran on the Tender contract and succeeded, in order. */
-  events: TenderEvent[];
+  /**
+   * The Tender events of the receipts that ran on the Tender contract and succeeded, in order. Each
+   * carries its receipt's id and its line's index in that receipt's logs: the pair is unique, so a
+   * consumer that is handed one event twice can tell.
+   */
+  events: ReturnType<typeof extractEvents>;
   /** What the call returned, decoded from JSON. `undefined` when it returned nothing. */
   returnValue: unknown;
   /** Every receipt of the transaction, the failed ones included. */
@@ -158,8 +162,15 @@ export function toTxResult(resp: FinalTxOutcome, contractId: string): TxResult {
  * Sending needs a `signer`. `send` waits until the transaction and all of its receipts are final,
  * so a view made after it sees what it did. A failure on chain throws a `TenderError`; an error
  * before the transaction ran, from the RPC or from near-api-js, is thrown as near-api-js throws
- * it. Two transactions signed with one key at the same time, by one client or by two, can collide
- * on their nonce (`InvalidNonce`), so send from one key one transaction at a time.
+ * it.
+ *
+ * Every send waits its turn in `defaultQueue`, keyed by the signer's account. The transactions of
+ * one account, from all its clients in this process, go one at a time in the order they were sent,
+ * so they never race for a nonce; those of different accounts go at the same time. A transaction
+ * that still loses its nonce (`InvalidNonceError`) is retried by near-api-js with the chain's
+ * nonce, up to 10 times, and then once more by the queue after 500 ms. That happens when another
+ * process signs with the same key, which nothing coordinates, and when another client of the
+ * account has sent since this one last did, since each client keeps its own count of the nonce.
  */
 export class TenderClient {
   readonly network: NetworkId;
@@ -204,18 +215,25 @@ export class TenderClient {
     return value as T;
   }
 
-  /** Signs `call` as the signer, sends it and waits until it is final. See `toTxResult`. */
+  /**
+   * Signs `call` as the signer, sends it and waits until it is final. See `toTxResult`. It goes
+   * once the earlier sends of the signer's account in this process are done (`defaultQueue`).
+   */
   async send(call: TenderCall): Promise<TxResult> {
-    if (this.account === undefined) {
+    const account = this.account;
+    if (account === undefined) {
       throw new Error("this TenderClient has no signer, so it cannot send transactions");
     }
-    const resp = await this.account.signAndSendTransaction({
-      receiverId: call.receiverId,
-      actions: [actions.functionCall(call.methodName, call.args, call.gas, call.deposit)],
-      waitUntil: "FINAL",
-      throwOnFailure: false,
+    const action = actions.functionCall(call.methodName, call.args, call.gas, call.deposit);
+    return defaultQueue.run(account.accountId, async () => {
+      const resp = await account.signAndSendTransaction({
+        receiverId: call.receiverId,
+        actions: [action],
+        waitUntil: "FINAL",
+        throwOnFailure: false,
+      });
+      return toTxResult(resp, this.contractId);
     });
-    return toTxResult(resp, this.contractId);
   }
 
   // Views of the Tender contract.

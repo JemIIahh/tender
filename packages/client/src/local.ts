@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { NETWORKS, type TenderCall, tokenStorageDepositCall } from "@tender/shared";
 import {
@@ -30,7 +30,10 @@ export interface LocalChain {
   contractId: "tender.sandbox";
   tokenId: "usdc.sandbox";
   accounts: Record<LocalRole, Signer>;
-  /** Stops the node and deletes its data. Calling it again does nothing more. */
+  /**
+   * Stops the node and deletes its data, also when the node has died already. Calling it again does
+   * nothing more.
+   */
   stop(): Promise<void>;
 }
 
@@ -46,6 +49,10 @@ const ROLES = [
 ] as const satisfies readonly LocalRole[];
 const CONTRACT = "tender.sandbox";
 const TOKEN = "usdc.sandbox";
+/** The nearcore that plan 01 tested the contract on, and near-sandbox 0.3.4's default. */
+const NEARCORE_VERSION = "2.13.4";
+/** How long `stop` waits for near-sandbox to see the node exit. A live node exits in about 25 ms. */
+const STOP_TIMEOUT_MS = 10_000;
 
 const NEAR = 10n ** 24n;
 const TGAS = 10n ** 12n;
@@ -73,6 +80,36 @@ async function readWasm(url: URL): Promise<Buffer> {
     throw new Error(`cannot read ${fileURLToPath(url)}; build it with contract/build.sh`, {
       cause: error,
     });
+  }
+}
+
+/**
+ * Kills the node and deletes its home directory. near-sandbox's `tearDown` sends the kill and then
+ * waits for the node's `exit` event, which never comes if the node has died already, so the wait
+ * is cut short after `STOP_TIMEOUT_MS`. The kill has been sent by then, and the directory goes
+ * either way.
+ */
+async function stopNode(sandbox: Sandbox): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, STOP_TIMEOUT_MS);
+  });
+  try {
+    await Promise.race([sandbox.tearDown(), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+  await rm(sandbox.homeDir, { recursive: true, force: true });
+}
+
+/**
+ * Waits until every lane has settled, then throws the error of the first lane that failed, if one
+ * did. `Promise.all` would throw as soon as one lane fails, and the node would then be stopped
+ * while the other lanes still have requests in flight.
+ */
+async function settleLanes(lanes: readonly Promise<unknown>[]): Promise<void> {
+  for (const lane of await Promise.allSettled(lanes)) {
+    if (lane.status === "rejected") throw lane.reason;
   }
 }
 
@@ -121,18 +158,19 @@ const setTokenCall: TenderCall = {
  *   10^12.
  *
  * The node binary is the one at `NEAR_SANDBOX_BIN_PATH`, or near-sandbox downloads nearcore 2.13.4
- * when that is unset. Call `stop` when done; a node that fails to set up is stopped here.
+ * when that is unset. Call `stop` when done. A node that fails to set up is stopped here, once
+ * every request of the setup has settled, and the setup's error is thrown.
  */
 export async function startLocalChain(opts: { minWindowSecs?: number } = {}): Promise<LocalChain> {
   const minWindowSecs = opts.minWindowSecs ?? NETWORKS.sandbox.minWindowSecs;
   const [tenderWasm, tokenWasm] = await Promise.all([readWasm(TENDER_WASM), readWasm(TOKEN_WASM)]);
-  const sandbox = await Sandbox.start({});
+  const sandbox = await Sandbox.start({ version: NEARCORE_VERSION });
   let accounts: Record<LocalRole, Signer>;
   try {
     accounts = await setUp(sandbox.rpcUrl, tenderWasm, tokenWasm, minWindowSecs);
   } catch (error) {
-    // The setup error is the one worth reporting; a failed teardown on top of it is not.
-    await sandbox.tearDown().catch(() => undefined);
+    // The setup error is the one worth reporting; a failed stop on top of it is not.
+    await stopNode(sandbox).catch(() => undefined);
     throw error;
   }
   let stopped: Promise<void> | undefined;
@@ -143,7 +181,7 @@ export async function startLocalChain(opts: { minWindowSecs?: number } = {}): Pr
     tokenId: TOKEN,
     accounts,
     stop() {
-      stopped ??= sandbox.tearDown();
+      stopped ??= stopNode(sandbox);
       return stopped;
     },
   };
@@ -180,7 +218,7 @@ async function setUp(
   // Each contract account deploys and initialises itself in one transaction. From here on every
   // account signs only its own transactions, so the accounts can go at the same time.
   const init = (args: object) => actions.functionCall("new", args, 30n * TGAS, 0n);
-  await Promise.all([
+  await settleLanes([
     transact(accountOf("usdc"), TOKEN, [
       actions.deployContract(tokenWasm),
       init({ owner_id: signers.poster.accountId, total_supply: `${TOKENS_EACH}` }),
@@ -196,7 +234,7 @@ async function setUp(
     ]),
   ]);
 
-  await Promise.all([
+  await settleLanes([
     ...ROLES.map(async (role) => {
       const client = clientOf(role);
       const { accountId } = signers[role];
