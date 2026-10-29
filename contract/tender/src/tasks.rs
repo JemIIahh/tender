@@ -10,7 +10,7 @@ use near_sdk::{env, near, AccountId};
 
 use crate::events::{emit, TaskCreated};
 use crate::types::{
-    check_uri, err, hex32, parse_hash, FunderView, Outcome, OutcomeView, PayoutView, Phase,
+    check_uri, err, hex32, parse_hash, FunderView, Outcome, OutcomeView, Payout, PayoutView, Phase,
     PostTaskArgs, Task, TaskView, MAX_INVITED, MAX_PAGE, MAX_WINDOW_SECS, MAX_WINNERS,
     OUTCOME_RESERVE_BYTES,
 };
@@ -37,6 +37,12 @@ pub(crate) fn phase(t: &Task, now: u64) -> Phase {
     } else {
         Phase::Expired
     }
+}
+
+/// Panics `E_NOT_FOUND` for `task_id`, which no task has. Every method that takes a task id says
+/// so the same way.
+pub(crate) fn no_task(task_id: u64) -> ! {
+    env::panic_str(&format!("{}: no task {task_id}", err::E_NOT_FOUND))
 }
 
 /// The end of a window of `secs` seconds that starts at `start` (nanoseconds). The window caps
@@ -84,6 +90,16 @@ fn check_invited(invited: &[AccountId], poster: &AccountId, verifier: &AccountId
     }
 }
 
+impl From<&Payout> for PayoutView {
+    fn from(p: &Payout) -> Self {
+        PayoutView {
+            account: p.account.clone(),
+            bps: p.bps,
+            amount: U128(p.amount),
+        }
+    }
+}
+
 impl From<&Outcome> for OutcomeView {
     fn from(o: &Outcome) -> Self {
         match o {
@@ -93,14 +109,7 @@ impl From<&Outcome> for OutcomeView {
                 scorecard_hash,
                 scorecard_uri,
             } => OutcomeView::Picked {
-                winners: winners
-                    .iter()
-                    .map(|p| PayoutView {
-                        account: p.account.clone(),
-                        bps: p.bps,
-                        amount: U128(p.amount),
-                    })
-                    .collect(),
+                winners: winners.iter().map(PayoutView::from).collect(),
                 fee: U128(*fee),
                 scorecard_hash: hex32(scorecard_hash),
                 scorecard_uri: scorecard_uri.clone(),

@@ -353,6 +353,21 @@ pub struct PostTaskArgs {
     pub parent: Option<U64>,
 }
 
+/// One winner of a pick, as `pick` takes it: `{"account": "bob.near", "bps": 7000}`. `bps` is the
+/// winner's share, in basis points, of the reward left after the fee, and the shares of one pick
+/// add up to 10_000.
+///
+/// An unknown key fails to parse. A pick pays out at once and cannot be undone, so a client that
+/// sends, say, an `amount` beside `bps` must learn that only `bps` decides the payout before
+/// anything is paid, not after.
+#[near(serializers = [json])]
+#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WinnerArg {
+    pub account: AccountId,
+    pub bps: u16,
+}
+
 /// One funder of a task's escrow and what it paid in, as `get_task` shows it.
 #[near(serializers = [json])]
 #[derive(Clone, Debug, PartialEq, Eq)]

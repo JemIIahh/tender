@@ -4,7 +4,7 @@ use near_sdk::json_types::{U128, U64};
 use near_sdk::serde::Serialize;
 use near_sdk::{env, serde_json, AccountId};
 
-use crate::types::TaskView;
+use crate::types::{PayoutView, TaskView, VoidReason};
 
 const STANDARD: &str = "tender";
 const VERSION: &str = "1.0.0";
@@ -174,6 +174,45 @@ pub(crate) struct EntryRevealed {
     pub account: AccountId,
     pub content_hash: String,
     pub uri: String,
+}
+
+/// Data of `picked`: `by` settled task `task_id` by paying each of `winners` its `amount` and the
+/// treasury `fee`, all in the task's token. `scorecard_hash` (64 lowercase hex characters) and
+/// `scorecard_uri` identify the scorecard behind the pick. The fields after `by` are those of the
+/// task's `outcome` as `get_task` shows it, minus `kind`.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct TaskPicked {
+    pub task_id: U64,
+    pub by: AccountId,
+    pub winners: Vec<PayoutView>,
+    pub fee: U128,
+    pub scorecard_hash: String,
+    pub scorecard_uri: String,
+}
+
+/// Data of `voided`: task `task_id` was voided for `reason`, and each funder in `refunds` got back
+/// what it paid in. `by` is the account whose empty pick voided the task (`reason` `no_award`), or
+/// `null` when `void_task` did. An empty pick's scorecard is in `scorecard_hash` (64 lowercase hex
+/// characters) and `scorecard_uri`; both are `null` after `void_task`. The fields other than
+/// `task_id`, `by` and `refunds` are those of the task's `outcome` as `get_task` shows it.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct TaskVoided {
+    pub task_id: U64,
+    pub reason: VoidReason,
+    pub by: Option<AccountId>,
+    pub refunds: Vec<Refund>,
+    pub scorecard_hash: Option<String>,
+    pub scorecard_uri: Option<String>,
+}
+
+/// One refund in `voided`: `amount` of the task's token went back into `account`'s vault.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct Refund {
+    pub account: AccountId,
+    pub amount: U128,
 }
 
 #[cfg(test)]

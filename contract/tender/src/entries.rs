@@ -12,7 +12,7 @@ use near_sdk::json_types::U64;
 use near_sdk::{borsh, env, near, AccountId};
 
 use crate::events::{emit, EntryCommitted, EntryRevealed};
-use crate::tasks::phase;
+use crate::tasks::{no_task, phase};
 use crate::types::{
     check_uri, err, hex32, parse_hash, Entry, EntryView, Phase, Revealed, MAX_PAGE,
 };
@@ -40,10 +40,6 @@ pub(crate) fn commitment_of(
             ))
         });
     env::sha256_array(&preimage)
-}
-
-fn no_task(task_id: u64) -> ! {
-    env::panic_str(&format!("{}: no task {task_id}", err::E_NOT_FOUND))
 }
 
 fn no_entry(task_id: u64, account: &AccountId) -> ! {

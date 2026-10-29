@@ -210,8 +210,6 @@ impl Tender {
 
     /// Charges `bytes` to `account` without writing anything, for bytes that will be written
     /// later. Panics `E_STORAGE` if `account` is not registered or cannot afford them.
-    // No caller yet; the allow comes off with the first one.
-    #[allow(dead_code)]
     pub(crate) fn reserve_bytes(&mut self, account: &AccountId, bytes: u64) {
         self.storage
             .get_mut(account)
@@ -221,11 +219,21 @@ impl Tender {
 
     /// Gives `bytes` back to `account`, stopping at zero. It never panics, so a cleanup path
     /// cannot get stuck on it, and it ignores an account that is not registered.
-    // No caller yet; the allow comes off with the first one.
-    #[allow(dead_code)]
     pub(crate) fn release_bytes(&mut self, account: &AccountId, bytes: u64) {
         if let Some(record) = self.storage.get_mut(account) {
             record.refund(bytes);
+        }
+    }
+
+    /// Charges `bytes` to `account` without checking that its deposit covers them, stopping at
+    /// `u64::MAX`. It never panics, and it ignores an account that is not registered.
+    ///
+    /// Only for bytes the account has paid for another way. Settlement charges a task's outcome
+    /// to its poster with it, right after releasing the larger reserve that paid for the outcome
+    /// at posting, so that settling never fails on storage.
+    pub(crate) fn add_used_bytes_unchecked(&mut self, account: &AccountId, bytes: u64) {
+        if let Some(record) = self.storage.get_mut(account) {
+            record.used_bytes = record.used_bytes.saturating_add(bytes);
         }
     }
 
@@ -705,6 +713,27 @@ mod tests {
         assert_eq!(used(&t, "alice.test"), 0);
         // An account that was never registered is ignored.
         t.release_bytes(&acct("nobody.test"), 5);
+    }
+
+    #[test]
+    fn add_used_bytes_unchecked_skips_the_balance_check_and_saturates() {
+        // 0.01 NEAR buys 1,000 bytes and the record takes 79 of them. Reserving the other 921
+        // leaves nothing available.
+        let mut t = registered("alice.test", NearToken::from_yoctonear(STORAGE_MIN_DEPOSIT));
+        let alice = acct("alice.test");
+        t.reserve_bytes(&alice, 921);
+        assert_eq!(view(&t, "alice.test").available.0, 0);
+        // Where `reserve_bytes` would panic, this charges the bytes anyway.
+        t.add_used_bytes_unchecked(&alice, 5);
+        assert_eq!(used(&t, "alice.test"), 1_005);
+        assert_eq!(view(&t, "alice.test").available.0, 0);
+        assert_eq!(view(&t, "alice.test").total.0, STORAGE_MIN_DEPOSIT);
+        // It stops at u64::MAX instead of wrapping or panicking.
+        t.add_used_bytes_unchecked(&alice, u64::MAX);
+        assert_eq!(used(&t, "alice.test"), u64::MAX);
+        // An account that was never registered is ignored, and stays unregistered.
+        t.add_used_bytes_unchecked(&acct("nobody.test"), 5);
+        assert_eq!(t.storage_balance_of(acct("nobody.test")), None);
     }
 
     #[test]

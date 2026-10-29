@@ -15,6 +15,7 @@ mod auth;
 mod entries;
 mod events;
 mod registry;
+mod settle;
 mod storage;
 mod tasks;
 #[cfg(test)]
