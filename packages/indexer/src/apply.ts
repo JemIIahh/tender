@@ -124,6 +124,11 @@ async function project(
     case "delegate_removed":
     case "attested_pick":
       return;
+    // An event of the union that no case above names fails to compile here, as it does in taskIdOf.
+    default: {
+      const unhandled: never = event;
+      throw new Error(`no projection for the event ${JSON.stringify(unhandled)}`);
+    }
   }
 }
 

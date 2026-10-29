@@ -289,6 +289,25 @@ test("replay_applies_only_the_events_it_has_not_seen", async () => {
   expect(await fundersOf("1")).toEqual([{ account: poster, amount: "1000003" }]);
 });
 
+test("different_blocks_at_one_height_both_project", async () => {
+  // blockOf names a receipt from its height, its place in the block and its line. Named from the
+  // height and the place alone, two different blocks built at one height would share their receipt
+  // ids, and the second would be taken for a replay of the first and skipped without a word.
+  const registration = () => blockOf(64, [eventLine("agent_registered")]);
+  const creation = () => blockOf(64, [eventLine("task_created")]);
+
+  expect(await applyBlock(db, registration(), FIXTURE_OPTIONS)).toBe(1);
+  expect(await applyBlock(db, creation(), FIXTURE_OPTIONS)).toBe(1);
+  expect(await count("events")).toBe(2);
+  expect(await count("agents")).toBe(1);
+  expect(await count("tasks")).toBe(1);
+
+  // The same blocks built again are replays: the same lines make the same receipt ids.
+  expect(await applyBlock(db, registration(), FIXTURE_OPTIONS)).toBe(0);
+  expect(await applyBlock(db, creation(), FIXTURE_OPTIONS)).toBe(0);
+  expect(await count("events")).toBe(2);
+});
+
 test("failure_receipt_ignored", async () => {
   const mixed: IndexedBlock = {
     height: 70n,
@@ -781,7 +800,7 @@ test("vault_and_delegate_events_are_stored_only", async () => {
     "delegate_added",
     "delegate_removed",
     "attested_pick",
-  ];
+  ] as const;
   expect(await apply(...names.map((name) => eventLine(name)))).toBe(7);
 
   expect(await rows("select event, task_id::text as task_id from events order by id")).toEqual(
