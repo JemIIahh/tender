@@ -363,7 +363,7 @@ impl Tender {
 mod tests {
     use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
     use near_sdk::json_types::{U128, U64};
-    use near_sdk::serde_json::{self, Value};
+    use near_sdk::serde_json::{self, json, Value};
     use near_sdk::test_utils::get_logs;
     use near_sdk::{borsh, env, testing_env, AccountId, NearToken};
 
@@ -580,6 +580,111 @@ mod tests {
             account: acct(account),
             amount: U128(amount),
         }]
+    }
+
+    // The arguments on the wire.
+
+    /// What `post_task`'s generated wasm wrapper parses `env::input()` into. The wrapper exists
+    /// only in the wasm build (`#[cfg(target_arch = "wasm32")]`), so this mirrors the code
+    /// near-sdk-macros 5.29.1 generates: a struct of the method's arguments, read with
+    /// `serde_json::from_slice`. The inner object goes through `PostTaskArgs`' own derive.
+    #[derive(near_sdk::serde::Deserialize)]
+    #[serde(crate = "near_sdk::serde")]
+    struct Input {
+        task: PostTaskArgs,
+    }
+
+    /// Parses `{"task": <task>}` as `post_task` receives it. `Err` holds serde's message.
+    fn parse_wire(task: &Value) -> Result<PostTaskArgs, String> {
+        let input = serde_json::to_vec(&json!({ "task": task })).unwrap();
+        serde_json::from_slice::<Input>(&input)
+            .map(|input| input.task)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn post_task_args_wire_form() {
+        // Every field, as a client sends it: the reward and the parent id are decimal strings.
+        let full = json!({
+            "token": "usdc.test",
+            "reward": "1000000",
+            "brief_uri": BRIEF_URI,
+            "brief_hash": BRIEF_HASH,
+            "criteria_hash": CRITERIA_HASH,
+            "heldout_commitment": HELDOUT_HASH,
+            "verifier": "judge.test",
+            "commit_secs": 60,
+            "reveal_secs": 120,
+            "pick_secs": 180,
+            "fallback_secs": 240,
+            "max_entries": 2,
+            "max_winners": 2,
+            "invited": ["bob.test", "carol.test"],
+            "parent": "7",
+        });
+        let bare = PostTaskArgs {
+            max_entries: 2,
+            max_winners: 2,
+            invited: accounts(&["bob.test", "carol.test"]),
+            ..args()
+        };
+        assert_eq!(
+            parse_wire(&full),
+            Ok(PostTaskArgs {
+                heldout_commitment: Some(HELDOUT_HASH.to_string()),
+                verifier: Some(acct("judge.test")),
+                parent: Some(U64(7)),
+                ..bare.clone()
+            })
+        );
+
+        // The optional fields may be left out or sent as null. Either way they are `None`.
+        let (mut omitted, mut nulls) = (full.clone(), full.clone());
+        for key in ["heldout_commitment", "verifier", "parent"] {
+            omitted.as_object_mut().unwrap().remove(key);
+            nulls[key] = Value::Null;
+        }
+        assert_eq!(parse_wire(&omitted), Ok(bare.clone()), "left out");
+        assert_eq!(parse_wire(&nulls), Ok(bare), "sent as null");
+
+        // The reward is a decimal string. A JSON number is refused.
+        let mut number = full.clone();
+        number["reward"] = json!(1_000_000);
+        let message = parse_wire(&number).unwrap_err();
+        assert!(
+            message.contains("invalid type: integer `1000000`, expected a string"),
+            "{message}"
+        );
+
+        // `invited` is required, even for a task open to anyone.
+        let mut uninvited = full.clone();
+        uninvited.as_object_mut().unwrap().remove("invited");
+        let message = parse_wire(&uninvited).unwrap_err();
+        assert!(message.contains("missing field `invited`"), "{message}");
+
+        // A misspelled key is an error, not a missing optional field that quietly takes its
+        // default: `verifer` would make the poster the verifier.
+        for (key, typo) in [
+            ("verifier", "verifer"),
+            ("heldout_commitment", "heldout_commitement"),
+            ("parent", "parnet"),
+        ] {
+            let mut misspelled = full.clone();
+            let task = misspelled.as_object_mut().unwrap();
+            let value = task.remove(key).unwrap();
+            task.insert(typo.to_string(), value);
+            let message = parse_wire(&misspelled).unwrap_err();
+            assert!(
+                message.contains(&format!("unknown field `{typo}`")),
+                "{typo}: {message}"
+            );
+        }
+
+        // So is any other key `post_task` does not take.
+        let mut extra = full.clone();
+        extra["colour"] = json!("blue");
+        let message = parse_wire(&extra).unwrap_err();
+        assert!(message.contains("unknown field `colour`"), "{message}");
     }
 
     // Posting.

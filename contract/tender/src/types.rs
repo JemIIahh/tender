@@ -323,8 +323,13 @@ pub struct AgentView {
 
 /// The arguments of `post_task`, which takes them as `{"task": {...}}`. `reward` is a decimal
 /// string in the token's smallest unit, each hash is 64 lowercase hex characters, and each window
-/// is in seconds.
+/// is in seconds. The optional fields may be left out or `null`.
+///
+/// An unknown key fails to parse. A posted task cannot be changed, so a misspelled key must not
+/// be read as an absent one: `verifer` would otherwise make the poster the verifier, with the
+/// reward locked under terms nobody asked for.
 #[near(serializers = [json])]
+#[serde(deny_unknown_fields)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostTaskArgs {
     pub token: AccountId,
