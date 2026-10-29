@@ -1,0 +1,14 @@
+{
+  "name": "@tender/client",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./outcome": "./src/outcome.ts"
+  },
+  "dependencies": {
+    "@tender/shared": "workspace:*",
+    "near-api-js": "7.4.0",
+    "near-sandbox": "0.3.4"
+  }
+}

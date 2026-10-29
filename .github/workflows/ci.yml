@@ -56,3 +56,29 @@ jobs:
         run: ./build.sh
       - name: Test
         run: cargo test --workspace
+
+  # Type-checks, lints and tests the TypeScript packages. The sandbox tests start a local chain, and
+  # near-sandbox downloads nearcore's sandbox node (35 MB, Linux x86_64) the first time one starts.
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      # pnpm goes before setup-node, whose pnpm cache asks pnpm for the store path. The version
+      # matches the packageManager field in package.json, as the action requires. The latest majors
+      # of both actions (pnpm/action-setup v6, setup-node v7) run on Node 24.
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.26.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+      - name: Test
+        run: pnpm test
