@@ -4,9 +4,10 @@
 //! ship. Build `res/` first with `contract/build.sh`.
 //!
 //! Chain time moves in two ways. Transactions take a few blocks each, about a second of chain time
-//! in all. `advance_to` jumps ahead in steps of 200 blocks, and one step is about 60 s. The task
-//! windows are `WINDOW_SECS` long, twice a step, so a jump to the end of one window lands inside
-//! the next and never skips it.
+//! in all. `advance_to` jumps ahead by up to 200 blocks at a time, about 60 s, and sizes its last
+//! jump to the blocks still needed, so it stops within about a block of its target. The task
+//! windows are `WINDOW_SECS` long, so a jump to the end of one window lands inside the next and
+//! never skips it.
 //!
 //! Transactions from one key go one after another. near-workspaces numbers a key's transactions when
 //! it sends them, and the node applies them in the order they reach it, so several at once from the
@@ -377,13 +378,33 @@ pub async fn now_ns(env: &Env) -> anyhow::Result<u64> {
     Ok(env.worker.view_block().await?.timestamp())
 }
 
-/// Moves chain time to `ns` or just past it, in steps of 200 blocks.
+/// The most blocks `advance_to` jumps at once: about 60 s of chain time.
+const MAX_JUMP_BLOCKS: u64 = 200;
+/// The chain time a jumped block adds, in nanoseconds, until a jump has measured it: 200 blocks are
+/// about 60 s.
+const GUESSED_BLOCK_NS: u64 = 300_000_000;
+
+/// Moves chain time to `ns` or just past it.
+///
+/// Each jump is the blocks still needed at the chain time per block that the jump before it
+/// measured, and at most `MAX_JUMP_BLOCKS`. So the last jump lands within about a block of `ns`
+/// instead of up to a whole jump past it. The first jump has only a guess to go on, so it goes
+/// half the way.
 pub async fn advance_to(env: &Env, ns: u64) -> anyhow::Result<()> {
+    let mut block_ns = None;
     for _ in 0..1_000 {
-        if now_ns(env).await? >= ns {
+        let now = now_ns(env).await?;
+        if now >= ns {
             return Ok(());
         }
-        env.worker.fast_forward(200).await?;
+        let blocks = match block_ns {
+            Some(block_ns) => (ns - now).div_ceil(block_ns),
+            None => (ns - now) / GUESSED_BLOCK_NS / 2,
+        }
+        .clamp(1, MAX_JUMP_BLOCKS);
+        env.worker.fast_forward(blocks).await?;
+        let moved = now_ns(env).await?.saturating_sub(now);
+        block_ns = Some((moved / blocks).max(1));
     }
     bail!("chain time never reached {ns}")
 }

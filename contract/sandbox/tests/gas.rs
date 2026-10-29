@@ -16,9 +16,10 @@ use serde_json::{json, Value};
 
 const ENTRANTS: usize = 50;
 const WINNERS: usize = 5;
-/// The gas each of the entrants' calls attaches: the most a transaction may carry on mainnet. The
-/// sandbox charges 1 NEAR for 1000 Tgas up front, and refunds what the call does not use, so
-/// `max_gas()` would be more than the entrants' 1 NEAR.
+/// The gas each of the entrants' calls attaches: 300 Tgas, many times what any of them burns. A
+/// transaction may carry up to 1 PGas since nearcore's protocol 83 raised `max_total_prepaid_gas`,
+/// and `max_gas()` attaches all of it. The sandbox charges 1 NEAR for 1000 Tgas up front, and
+/// refunds what the call does not use, so 1 PGas would take all of an entrant's 1 NEAR.
 const TX_GAS: Gas = Gas::from_tgas(300);
 
 /// What a call burnt in all, in Tgas: the transaction and every receipt that followed from it.

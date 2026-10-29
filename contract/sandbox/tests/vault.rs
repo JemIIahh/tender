@@ -98,7 +98,8 @@ async fn withdraw_to_unregistered_restores() -> anyhow::Result<()> {
 
     assert_eq!(vault_balance(&env, dave.id()).await?, 1_000);
     assert_eq!(token_balance(&env, env.tender.id()).await?, tender_tokens);
-    assert_eq!(token_balance(&env, dave.id()).await.unwrap_or(0), 0);
+    // The token reports 0 for an account it has never registered.
+    assert_eq!(token_balance(&env, dave.id()).await?, 0);
     assert_conserved(&env, &[dave.id()]).await?;
     Ok(())
 }
