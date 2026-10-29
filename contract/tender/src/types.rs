@@ -67,6 +67,7 @@ pub mod err {
     pub const E_FEE: &str = "E_FEE";
     pub const E_GAS: &str = "E_GAS";
     pub const E_SETTLED: &str = "E_SETTLED";
+    pub const E_VERSION: &str = "E_VERSION";
 }
 
 /// Parses a 64-character lowercase hex string into 32 bytes.

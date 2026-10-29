@@ -838,8 +838,11 @@ mod tests {
         let mut t = world();
         let id = post(&mut t, args());
         assert_eq!(view(&t, id).fee_bps, 500);
-        // `set_fee` arrives with the admin methods; until then the test sets the field itself.
-        t.fee_bps = 900;
+        // The owner changes the fee. It pays for any vault slot the call makes, so it needs a
+        // storage balance.
+        register(&mut t, "owner.test", NearToken::from_near(1));
+        testing_env!(ctx("owner.test").attached_deposit(ONE_YOCTO).build());
+        t.set_fee(900, acct("treasury.test"));
         assert_eq!(view(&t, id).fee_bps, 500, "a posted task keeps its fee");
         let later = post(&mut t, args());
         assert_eq!(

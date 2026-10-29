@@ -154,7 +154,8 @@ impl Tender {
         // Every rule has been checked and every amount is known. What follows credits slots that
         // exist and records what was paid.
         let token = task.token.clone();
-        // The treasury's slot is made when the token is allowlisted (Task 10's `set_token`).
+        // The treasury has a slot for every allowlisted token: `set_token` makes it when the token
+        // is allowlisted, and `set_fee` makes the new treasury's before it switches.
         let treasury = self.treasury.clone();
         self.credit(&treasury, &token, fee);
         for p in &payouts {
@@ -430,7 +431,7 @@ mod tests {
     use crate::test_utils::{ctx, fresh, panic_message};
     use crate::types::{
         hex32, AgentView, Outcome, OutcomeView, PayoutView, Phase, PostTaskArgs, Task,
-        TokenBalance, TokenConfig, VoidReason, WinnerArg, MAX_URI_BYTES, OUTCOME_RESERVE_BYTES,
+        TokenBalance, VoidReason, WinnerArg, MAX_URI_BYTES, OUTCOME_RESERVE_BYTES,
     };
     use crate::Tender;
 
@@ -520,21 +521,15 @@ mod tests {
         let _ = t.ft_on_transfer(acct(who), U128(amount), String::new());
     }
 
-    /// A contract with USDC enabled and a USDC vault slot for the treasury; alice, the poster,
-    /// with 1 NEAR of storage and `FUNDS` in her vault; and the judge and each of `AGENTS` with
-    /// 0.1 NEAR of storage and no vault slot.
+    /// A contract with USDC enabled and a USDC vault slot for the treasury, both made by the
+    /// owner's `set_token`, which the owner's 1 NEAR of storage pays for; alice, the poster, with
+    /// 1 NEAR of storage and `FUNDS` in her vault; and the judge and each of `AGENTS` with 0.1 NEAR
+    /// of storage and no vault slot.
     fn world() -> Tender {
         let mut t = fresh();
-        t.put_token(
-            acct(USDC),
-            TokenConfig {
-                min_reward: 10,
-                max_reward: 50_000_000,
-                enabled: true,
-            },
-        );
-        // Task 10's `set_token` will make the treasury's slot. Until then the tests make it.
-        t.ensure_vault_slot(&acct(TREASURY), &acct(USDC));
+        register(&mut t, "owner.test", NearToken::from_near(1));
+        testing_env!(ctx("owner.test").attached_deposit(ONE_YOCTO).build());
+        t.set_token(acct(USDC), U128(10), U128(50_000_000), true);
         register(&mut t, "alice.test", NearToken::from_near(1));
         fund(&mut t, "alice.test", FUNDS);
         for who in AGENTS.into_iter().chain([JUDGE]) {
@@ -734,7 +729,8 @@ mod tests {
         let id = post(&mut t, args());
         revealed(&mut t, id, &["bob.test", "carol.test"]);
         // The task keeps the fee it was posted with, whatever the fee is by the time of the pick.
-        t.fee_bps = 1_000;
+        testing_env!(ctx("owner.test").attached_deposit(ONE_YOCTO).build());
+        t.set_fee(1_000, acct(TREASURY));
         try_pick(
             &mut t,
             JUDGE,
