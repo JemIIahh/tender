@@ -7,6 +7,7 @@ import {
   type TenderEvent,
   TenderEventSchema,
 } from "../src/index";
+import { edited, type Json, keyPaths, leaves, members, type Path } from "./json-paths";
 
 // Fixtures: test/fixtures/events/<event>.log holds one NEP-297 log line per event.
 //
@@ -33,9 +34,6 @@ const CAPTURED = [
 ];
 const HAND_WRITTEN = ["attested_pick", "delegate_added", "delegate_removed", "task_topped_up"];
 const EVENT_NAMES = [...CAPTURED, ...HAND_WRITTEN].sort();
-
-type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
-type Path = Array<string | number>;
 
 const PREFIX = "EVENT_JSON:";
 const FIXTURES = new URL("./fixtures/events/", import.meta.url);
@@ -133,9 +131,11 @@ const DERIVED: Derived[] = [
     },
   },
   {
+    // The contract gives an account no provider unless its parent has two labels: `alice.near` has
+    // none (`near` is top-level), where `alice.test.near`, the captured account, has `test.near`.
     label: "derived_agent_registered_without_asp",
     from: "agent_registered",
-    patch: { asp: null },
+    patch: { account: "alice.near", asp: null },
   },
   {
     label: "derived_agent_registered_update",
@@ -226,56 +226,18 @@ const samples: Sample[] = [
   })),
 ];
 
-function leaves(node: Json, path: Path = []): Array<{ path: Path; value: Json }> {
-  if (Array.isArray(node)) return node.flatMap((item, i) => leaves(item, [...path, i]));
-  if (node !== null && typeof node === "object") {
-    return Object.entries(node).flatMap(([key, value]) => leaves(value, [...path, key]));
-  }
-  return [{ path, value: node }];
-}
-
-/** The path of every key of every object in `node`, nested ones included. */
-function keyPaths(node: Json, path: Path = []): Path[] {
-  if (Array.isArray(node)) return node.flatMap((item, i) => keyPaths(item, [...path, i]));
-  if (node !== null && typeof node === "object") {
-    return Object.entries(node).flatMap(([key, value]) => [
-      [...path, key],
-      ...keyPaths(value, [...path, key]),
-    ]);
-  }
-  return [];
-}
-
-/** A copy of `node` with the value at `path` replaced, or the key removed if `replacement` is undefined. */
-function edited(node: Json, path: Path, replacement: Json | undefined): Json {
-  const [head, ...rest] = path;
-  if (head === undefined) return replacement ?? null;
-  if (Array.isArray(node)) {
-    return node.map((item, i) => (i === head ? edited(item, rest, replacement) : item));
-  }
-  if (node !== null && typeof node === "object") {
-    const copy: { [key: string]: Json } = {};
-    for (const [key, value] of Object.entries(node)) {
-      if (key !== head) copy[key] = value;
-      else if (rest.length > 0 || replacement !== undefined)
-        copy[key] = edited(value, rest, replacement);
-    }
-    return copy;
-  }
-  return node;
-}
-
 /**
- * Replaces one leaf of one sample at a time with each value `replacements` gives for it, and
- * expects `parseEventLog` to return null for every such line. Returns how many it checked.
+ * Replaces one leaf of one sample at a time with each value `replacements` gives for it (it is
+ * handed the leaf and its path), and expects `parseEventLog` to return null for every such line.
+ * Returns how many it checked.
  */
-function expectEveryVariantRejected(replacements: (leaf: Json) => Json[]): number {
+function expectEveryVariantRejected(replacements: (leaf: Json, path: Path) => Json[]): number {
   let checked = 0;
   for (const sample of samples) {
     // control: the unmodified sample is accepted, so a null below is the change's doing
     expect(parseEventLog(logLine(sample.event, sample.data)), sample.label).not.toBeNull();
     for (const { path, value } of leaves(sample.data)) {
-      for (const replacement of replacements(value)) {
+      for (const replacement of replacements(value, path)) {
         const line = logLine(sample.event, edited(sample.data, path, replacement));
         const what = `${sample.label} ${path.join(".")} -> ${JSON.stringify(replacement)}`;
         expect(parseEventLog(line), what).toBeNull();
@@ -306,8 +268,21 @@ test("numbers_as_json_numbers_rejected", () => {
 });
 
 test("u64_and_u128_must_be_decimal_digits", () => {
-  // The escapes are two Arabic-Indic digits: \d in JavaScript matches 0 to 9 only.
-  const notDecimal = ["", "-1", "1.5", "1e3", "0x10", " 1", "1 ", "\u0661\u0662", "NaN"];
+  // The escapes are two Arabic-Indic digits: \d in JavaScript matches 0 to 9 only. `U64` and
+  // `U128` never write a leading zero.
+  const notDecimal = [
+    "",
+    "-1",
+    "1.5",
+    "1e3",
+    "0x10",
+    " 1",
+    "1 ",
+    "\u0661\u0662",
+    "NaN",
+    "00",
+    "01",
+  ];
   const checked = expectEveryVariantRejected((leaf) => (isDecimal(leaf) ? notDecimal : []));
   expect(checked).toBeGreaterThan(0);
 });
@@ -341,6 +316,152 @@ test("other_fields_reject_the_wrong_json_type", () => {
     return [];
   };
   expect(expectEveryVariantRejected(wrongType)).toBeGreaterThan(0);
+});
+
+// The widths of the contract's types (`events.rs`). A u64 is an id, a block height or a nanosecond
+// time, and every other decimal string is a u128 amount.
+const U64_KEYS = new Set([
+  "id",
+  "task_id",
+  "created_at",
+  "commit_deadline",
+  "reveal_deadline",
+  "pick_deadline",
+  "fallback_deadline",
+  "block_height",
+  "parent",
+]);
+const SMALL_INT_MAXIMA: Record<string, number> = {
+  max_winners: 255, // u8
+  fee_bps: 65_535, // u16
+  bps: 65_535, // u16
+  max_entries: 4_294_967_295, // u32
+};
+
+test("u64_and_u128_take_their_maximum_and_no_more", () => {
+  // The largest value of the type is accepted and the next one is not, so a u128 field cannot be
+  // typed as a u64 nor the other way round.
+  const over = { u64: "18446744073709551616", u128: "340282366920938463463374607431768211456" };
+  const max = { u64: U64_MAX, u128: U128_MAX };
+  let checked = 0;
+  for (const sample of samples) {
+    for (const { path, value } of leaves(sample.data)) {
+      if (!isDecimal(value)) continue;
+      const width = U64_KEYS.has(String(path.at(-1))) ? "u64" : "u128";
+      const where = `${sample.label} ${path.join(".")} (${width})`;
+      const fits = parseEventLog(logLine(sample.event, edited(sample.data, path, max[width])));
+      expect(fits, `${where} = ${max[width]}`).not.toBeNull();
+      const tooBig = parseEventLog(logLine(sample.event, edited(sample.data, path, over[width])));
+      expect(tooBig, `${where} = ${over[width]}`).toBeNull();
+      checked += 1;
+    }
+  }
+  expect(checked).toBeGreaterThan(0);
+});
+
+test("small_integers_take_their_maximum_and_no_more", () => {
+  let checked = 0;
+  for (const sample of samples) {
+    for (const { path, value } of leaves(sample.data)) {
+      if (typeof value !== "number") continue;
+      const field = String(path.at(-1));
+      const limit = SMALL_INT_MAXIMA[field];
+      if (limit === undefined) throw new Error(`${sample.label}: no maximum for ${field}`);
+      const where = `${sample.label} ${path.join(".")}`;
+      const fits = parseEventLog(logLine(sample.event, edited(sample.data, path, limit)));
+      expect(fits, `${where} = ${limit}`).not.toBeNull();
+      const tooBig = parseEventLog(logLine(sample.event, edited(sample.data, path, limit + 1)));
+      expect(tooBig, `${where} = ${limit + 1}`).toBeNull();
+      checked += 1;
+    }
+  }
+  expect(checked).toBeGreaterThan(0);
+});
+
+test("account_fields_must_be_near_account_ids", () => {
+  // The fields that are an `AccountId` in `events.rs`; the others that hold text are not.
+  const ACCOUNT_KEYS = new Set(["account", "token", "sender", "to", "poster", "verifier"]);
+  ACCOUNT_KEYS.add("funder").add("by").add("asp");
+  const isAccount = (path: Path) =>
+    ACCOUNT_KEYS.has(String(path.at(-1))) || path.at(-2) === "invited";
+  const notAccounts = [
+    "",
+    "a",
+    "Alice.near",
+    "alice..near",
+    ".alice",
+    "alice.",
+    "a b",
+    "a".repeat(65),
+  ];
+  expect(
+    expectEveryVariantRejected((leaf, path) =>
+      typeof leaf === "string" && isAccount(path) ? notAccounts : [],
+    ),
+  ).toBeGreaterThan(0);
+
+  // The ids the contract can hold are all accepted: sub-accounts, implicit accounts, the longest.
+  const accounts = ["a-b.c_d.near", "a".repeat(64), `0x${"ab".repeat(20)}`, "near"];
+  for (const sample of samples) {
+    for (const { path, value } of leaves(sample.data)) {
+      if (typeof value !== "string" || !isAccount(path)) continue;
+      for (const account of accounts) {
+        const line = logLine(sample.event, edited(sample.data, path, account));
+        expect(
+          parseEventLog(line),
+          `${sample.label} ${path.join(".")} = ${account}`,
+        ).not.toBeNull();
+      }
+    }
+  }
+});
+
+// The Option<T> fields of the contract's events, written `<event>.<path>`: the only places a null
+// is valid. `by` and the scorecard are null after `void_task`, and `asp` for an account that has no
+// provider.
+const NULLABLE = new Set([
+  "agent_registered.asp",
+  "task_created.heldout_commitment",
+  "task_created.parent",
+  "voided.by",
+  "voided.scorecard_hash",
+  "voided.scorecard_uri",
+]);
+
+test("only_option_fields_accept_null", () => {
+  // Each key and each array element of each sample, set to null on its own: the event is accepted
+  // if the path is an Option field, and refused if not.
+  const seen = new Set<string>();
+  for (const sample of samples) {
+    for (const { path } of members(sample.data)) {
+      const where = `${sample.event}.${path.join(".")}`;
+      const line = logLine(sample.event, edited(sample.data, path, null));
+      expect(parseEventLog(line) !== null, `${sample.label}: ${where} -> null`).toBe(
+        NULLABLE.has(where),
+      );
+      seen.add(where);
+    }
+  }
+  // no entry of the set names a path that no sample has
+  for (const where of NULLABLE) expect(seen.has(where), where).toBe(true);
+});
+
+test("arrays_and_objects_must_not_be_replaced_by_null_or_text", () => {
+  // Each array and each object of each sample (`tags`, `winners`, `winners.0`, ...) replaced on its
+  // own by a null and by a string: no event has a container that may be either.
+  let checked = 0;
+  for (const sample of samples) {
+    for (const { path, value } of members(sample.data)) {
+      if (value === null || typeof value !== "object") continue;
+      for (const wrong of [null, "x"]) {
+        const line = logLine(sample.event, edited(sample.data, path, wrong));
+        const where = `${sample.label}: ${path.join(".")} -> ${JSON.stringify(wrong)}`;
+        expect(parseEventLog(line), where).toBeNull();
+        checked += 1;
+      }
+    }
+  }
+  expect(checked).toBeGreaterThan(0);
 });
 
 test("every_field_is_required", () => {

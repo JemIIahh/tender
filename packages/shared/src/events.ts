@@ -1,22 +1,28 @@
 import { z } from "zod";
 import { EVENT_STANDARD, EVENT_VERSION } from "./constants";
+import {
+  AccountIdSchema as account,
+  HashHexSchema as hash,
+  U8Schema as u8,
+  U16Schema as u16,
+  U32Schema as u32,
+  U64StringSchema as u64,
+  U128StringSchema as u128,
+} from "./primitives";
 
 /** What NEP-297 puts in front of the JSON of an event log. */
 const EVENT_PREFIX = "EVENT_JSON:";
 
-// Field types, as near-sdk writes them into a log:
+// Field types, as near-sdk writes them into a log, under the short names used below (the
+// definitions are in `primitives.ts`, shared with the view schemas):
 //   u64, u128      a decimal string (`U64`, `U128`). A nanosecond timestamp or a token amount can
-//                  pass 2^53, which a JSON number would corrupt.
-//   u8, u16, u32   a JSON integer (`fee_bps`, `bps`, `max_entries`, `max_winners`)
-//   AccountId      a string
+//                  pass 2^53, which a JSON number would corrupt. Canonical and in range: no sign,
+//                  no leading zero, at most 2^64 - 1 or 2^128 - 1.
+//   u8, u16, u32   a JSON integer in the type's range (`max_winners`; `fee_bps` and `bps`;
+//                  `max_entries`)
+//   AccountId      a NEAR account id
 //   Option<T>      T, or null: the contract writes the key even when the value is None
 //   hash           64 lowercase hex characters, a SHA-256
-const decimalString = z.string().regex(/^\d+$/);
-const u64 = decimalString;
-const u128 = decimalString;
-const smallInt = z.number().int().nonnegative();
-const hash = z.string().regex(/^[0-9a-f]{64}$/);
-const account = z.string();
 
 /** One event: its name, and the single element of the `data` array that follows it in the log. */
 function variant<Name extends string, Data extends z.ZodRawShape>(event: Name, data: Data) {
@@ -56,7 +62,7 @@ export const TenderEventSchema = z.discriminatedUnion("event", [
     poster: account,
     token: account,
     reward: u128,
-    fee_bps: smallInt,
+    fee_bps: u16,
     brief_uri: z.string(),
     brief_hash: hash,
     criteria_hash: hash,
@@ -67,8 +73,8 @@ export const TenderEventSchema = z.discriminatedUnion("event", [
     reveal_deadline: u64,
     pick_deadline: u64,
     fallback_deadline: u64,
-    max_entries: smallInt,
-    max_winners: smallInt,
+    max_entries: u32,
+    max_winners: u8,
     invited: z.array(account),
     parent: u64.nullable(),
   }),
@@ -85,7 +91,7 @@ export const TenderEventSchema = z.discriminatedUnion("event", [
   variant("picked", {
     task_id: u64,
     by: account,
-    winners: z.array(z.object({ account, bps: smallInt, amount: u128 })),
+    winners: z.array(z.object({ account, bps: u16, amount: u128 })),
     fee: u128,
     scorecard_hash: hash,
     scorecard_uri: z.string(),
@@ -158,6 +164,7 @@ export interface ReceiptOutcome {
   receiptId: string;
   /** The account the receipt ran on. For a function call, the contract. */
   executorId: string;
+  /** `success` is a `SuccessValue` or `SuccessReceiptId`; every other status is a `failure`. */
   status: "success" | "failure";
   logs: string[];
 }

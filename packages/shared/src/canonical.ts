@@ -8,17 +8,20 @@
  * RFC 8785 (JCS) for the data JSON can hold, so another language can reproduce the bytes with a
  * JCS library.
  *
- * Accepts null, booleans, finite numbers, strings, arrays and plain objects. A property whose
- * value is `undefined` counts as absent, as in `JSON.stringify`. Anything else throws a
- * `TypeError` that names the place: `undefined` in an array, NaN or an infinity, a bigint, a
- * function, a symbol, and objects with no JSON form such as a `Date` or a `Map`. Write a `Date` as
- * an ISO string and a u64 as a decimal string before calling.
+ * Accepts null, booleans, finite numbers, strings, arrays and plain objects, meaning objects whose
+ * prototype is `Object.prototype` or `null`. A property whose value is `undefined` counts as
+ * absent, as in `JSON.stringify`. Anything else throws a `TypeError` that names the place, such as
+ * `$.entries[0].score`: `undefined` in an array, NaN or an infinity, a bigint, a function, a
+ * symbol, an object with no JSON form (a `Date`, a `Map`, an instance of any class) and a value
+ * that contains itself. Write a `Date` as an ISO string and a u64 as a decimal string before
+ * calling. An object may appear more than once, as long as it is not inside itself.
  */
 export function canonicalJson(value: unknown): Uint8Array {
-  return new TextEncoder().encode(serialize(value, "$"));
+  return new TextEncoder().encode(serialize(value, "$", new Set()));
 }
 
-function serialize(value: unknown, path: string): string {
+/** `ancestors` holds the arrays and objects being written, from the outermost to this one. */
+function serialize(value: unknown, path: string, ancestors: Set<object>): string {
   if (value === null) return "null";
   switch (typeof value) {
     case "string":
@@ -28,22 +31,32 @@ function serialize(value: unknown, path: string): string {
     case "number":
       if (!Number.isFinite(value)) throw new TypeError(`cannot write ${value} as JSON at ${path}`);
       return JSON.stringify(value);
-    case "object":
-      return Array.isArray(value) ? serializeArray(value, path) : serializeObject(value, path);
+    case "object": {
+      if (ancestors.has(value)) throw new TypeError(`circular reference at ${path}`);
+      ancestors.add(value);
+      const written = Array.isArray(value)
+        ? serializeArray(value, path, ancestors)
+        : serializeObject(value, path, ancestors);
+      ancestors.delete(value);
+      return written;
+    }
     default:
       throw new TypeError(`cannot write ${typeof value} as JSON at ${path}`);
   }
 }
 
-function serializeArray(items: unknown[], path: string): string {
+function serializeArray(items: unknown[], path: string, ancestors: Set<object>): string {
   // `Array.from` visits the holes of a sparse array as `undefined`, which then throws, where
   // `map` would skip them and `join` would write invalid JSON.
-  return `[${Array.from(items, (item, i) => serialize(item, `${path}[${i}]`)).join(",")}]`;
+  const written = Array.from(items, (item, i) => serialize(item, `${path}[${i}]`, ancestors));
+  return `[${written.join(",")}]`;
 }
 
-function serializeObject(object: object, path: string): string {
-  const tag = Object.prototype.toString.call(object).slice("[object ".length, -1);
-  if (tag !== "Object") throw new TypeError(`cannot write a ${tag} as JSON at ${path}`);
+function serializeObject(object: object, path: string, ancestors: Set<object>): string {
+  const prototype = Object.getPrototypeOf(object);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`cannot write ${describe(object)} as JSON at ${path}`);
+  }
 
   const record = object as Record<string, unknown>;
   const members: string[] = [];
@@ -52,7 +65,13 @@ function serializeObject(object: object, path: string): string {
   for (const key of Object.keys(record).sort()) {
     const member = record[key];
     if (member === undefined) continue;
-    members.push(`${JSON.stringify(key)}:${serialize(member, `${path}.${key}`)}`);
+    members.push(`${JSON.stringify(key)}:${serialize(member, `${path}.${key}`, ancestors)}`);
   }
   return `{${members.join(",")}}`;
+}
+
+/** What to call an object that is not plain: `an instance of Date`, `an instance of Point`. */
+function describe(object: object): string {
+  const name = object.constructor?.name || Object.prototype.toString.call(object).slice(8, -1);
+  return `an instance of ${name}`;
 }
