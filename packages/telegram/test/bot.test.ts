@@ -405,6 +405,35 @@ test("group_chat_refused_once", async () => {
   }
 });
 
+test("a_group_update_that_is_not_a_message_gets_no_refusal", async () => {
+  // Only a new message can be answered. Edits, and the bot being removed from the group (where a
+  // reply would only fail), are ignored and do not use up the group's one refusal.
+  const group = groupChat(-1_001_000_000_005, "supergroup");
+  const person = { id: 42, is_bot: false, first_name: "Ada" };
+  const edited = {
+    update_id: ++updateCounter,
+    edited_message: { ...messageIn(group, "/help").message, edit_date: 1_793_250_100 },
+  } as Update;
+  const removed = {
+    update_id: ++updateCounter,
+    my_chat_member: {
+      chat: group,
+      from: person,
+      date: 1_793_250_200,
+      old_chat_member: { status: "member", user: BOT_INFO },
+      new_chat_member: { status: "kicked", user: BOT_INFO, until_date: 0 },
+    },
+  } as Update;
+
+  await bot.handleUpdate(edited);
+  await bot.handleUpdate(removed);
+
+  expect(calls.filter((call) => call.payload.chat_id === group.id)).toEqual([]);
+  expect(await sentKeys(group.id)).toEqual([]);
+  // The first real message after them still gets the refusal.
+  expect(await deliver(messageIn(group, "/help"))).toEqual([PRIVATE_ONLY]);
+});
+
 test("a_group_cannot_link_or_spend_a_nonce", async () => {
   await seedLinkNonce(db, "nonce-for-group", "group-target.near");
   const group = groupChat(-1_001_000_000_003, "supergroup");
