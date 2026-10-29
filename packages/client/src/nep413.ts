@@ -1,4 +1,4 @@
-import { hexToBytes, sha256Hex } from "@tender/shared";
+import { AccountIdSchema, hexToBytes, sha256Hex } from "@tender/shared";
 import { KeyType, PublicKey } from "near-api-js";
 
 /** What a NEP-413 sign-in request carries. `signature` and `nonce` are base64. */
@@ -11,7 +11,8 @@ export interface Nep413Input {
   /** base64, exactly 32 bytes */
   nonce: string;
   recipient: string;
-  callbackUrl?: string;
+  /** Left out or null means no callback, as in borsh and near-api-js. An empty string is one. */
+  callbackUrl?: string | null;
 }
 
 /** The four fields of a sign-in that the signature covers. */
@@ -70,7 +71,6 @@ const ED25519_SIGNATURE_BYTES = 64;
  * only junk and post-quantum keys are refused for their length.
  */
 const MAX_PUBLIC_KEY_CHARS = 128;
-const MAX_ACCOUNT_ID_CHARS = 64;
 const LONE_SURROGATE = /\p{Surrogate}/u;
 
 const utf8 = new TextEncoder();
@@ -91,14 +91,28 @@ function concat(parts: readonly Uint8Array[]): Uint8Array {
   return out;
 }
 
+/** A string with a UTF-8 form, which one holding a lone surrogate does not have. */
+function isWellFormedText(value: unknown): value is string {
+  return typeof value === "string" && !LONE_SURROGATE.test(value);
+}
+
+/** borsh and near-api-js write `undefined` and `null` alike, as an Option's None. */
+function isAbsent(value: unknown): value is null | undefined {
+  return value === undefined || value === null;
+}
+
 /**
  * Borsh `string`: a u32 byte length, then UTF-8. A lone surrogate has no UTF-8 form: TextEncoder
  * would write U+FFFD, and borsh-js 2.0.0 writes bytes that other strings also produce, so a
- * signature over such text cannot be matched to one string. It is refused instead.
+ * signature over such text cannot be matched to one string. It is refused with a TypeError, which
+ * is what a signer sees, since it can get here before any signature exists. `verifyNep413` checks
+ * the caller's text first and answers it with `bad_signature`.
  */
-function borshString(value: unknown): Uint8Array {
-  if (typeof value !== "string" || LONE_SURROGATE.test(value)) {
-    throw new AuthError("bad_signature", "signed text must be well-formed Unicode");
+function borshString(name: string, value: unknown): Uint8Array {
+  if (!isWellFormedText(value)) {
+    throw new TypeError(
+      `${name} must be a string without lone surrogates, which have no UTF-8 form`,
+    );
   }
   const text = utf8.encode(value);
   return concat([u32le(text.length), text]);
@@ -130,16 +144,21 @@ function decodeNonce(value: unknown): Uint8Array {
   return bytes;
 }
 
-function encodePayload(i: Nep413Payload, nonce: Uint8Array): Uint8Array {
+function encodePayload(
+  message: string,
+  nonce: Uint8Array,
+  recipient: string,
+  callbackUrl: string | null | undefined,
+): Uint8Array {
   return concat([
     u32le(NEP413_TAG),
-    borshString(i.message),
+    borshString("message", message),
     nonce,
-    borshString(i.recipient),
-    // Option<string>: only an absent callbackUrl is None. An empty one is Some("").
-    i.callbackUrl === undefined
+    borshString("recipient", recipient),
+    // Option<string>: absent and null are None, which has the one encoding. "" is Some("").
+    isAbsent(callbackUrl)
       ? Uint8Array.of(0)
-      : concat([Uint8Array.of(1), borshString(i.callbackUrl)]),
+      : concat([Uint8Array.of(1), borshString("callbackUrl", callbackUrl)]),
   ]);
 }
 
@@ -149,11 +168,12 @@ function encodePayload(i: Nep413Payload, nonce: Uint8Array): Uint8Array {
  * itself is over their SHA-256. Takes a whole sign-in, or just the four signed fields, so that a
  * signer can call it before it has a signature.
  *
- * Throws an `AuthError` for a nonce that is not 32 bytes of canonical base64 and for text that is
- * not well-formed Unicode.
+ * Throws an `AuthError` (`bad_nonce`) for a nonce that is not 32 bytes of canonical base64, and a
+ * `TypeError` for text that is not a string or has a lone surrogate.
  */
 export function serializeNep413(i: Nep413Payload & Partial<Nep413Input>): Uint8Array {
-  return encodePayload(i, decodeNonce(i.nonce));
+  const { message, nonce, recipient, callbackUrl } = i;
+  return encodePayload(message, decodeNonce(nonce), recipient, callbackUrl);
 }
 
 /** `a` is a non-empty string equal to `b`. An unset or empty setting therefore matches nothing. */
@@ -216,7 +236,7 @@ function keyKindOf(permission: unknown, contractId: string): Nep413Result["keyKi
  * 4. the signature is the key's ed25519 signature over the SHA-256 of `serializeNep413(i)`
  *    (`bad_signature`);
  * 5. that key is on that account according to `deps.viewAccessKey` (`key_not_found`, which an
- *    empty or over-long account id also gets, without a lookup);
+ *    account id that is not a NEAR account id also gets, without a lookup);
  * 6. it is a FullAccess key, or a FunctionCall key whose receiver is `deps.contractId`
  *    (`key_not_allowed`).
  *
@@ -228,32 +248,44 @@ function keyKindOf(permission: unknown, contractId: string): Nep413Result["keyKi
  * account.
  */
 export async function verifyNep413(i: Nep413Input, deps: Nep413Deps): Promise<Nep413Result> {
-  const nonce = decodeNonce(i.nonce);
+  // Every field is read here, once. Everything below uses these locals, so a getter on `i` cannot
+  // show the checks one value and the signature another.
+  const {
+    accountId,
+    publicKey: claimedKey,
+    signature: signatureText,
+    message,
+    nonce: nonceText,
+    recipient,
+    callbackUrl,
+  } = i;
 
-  if (!sameNonEmpty(i.recipient, deps.expectedRecipient)) {
+  const nonce = decodeNonce(nonceText);
+
+  if (!sameNonEmpty(recipient, deps.expectedRecipient)) {
     throw new AuthError("wrong_recipient", "message was signed for a different recipient");
   }
 
-  const key = parseEd25519Key(i.publicKey);
+  const key = parseEd25519Key(claimedKey);
 
-  const signature = fromBase64(i.signature);
+  const signature = fromBase64(signatureText);
   if (signature === null || signature.length !== ED25519_SIGNATURE_BYTES) {
     throw new AuthError("bad_signature", "signature must be 64 bytes in base64");
   }
-  const digest = hexToBytes(sha256Hex(encodePayload(i, nonce)));
+  // The recipient equals the configured value by now, so only the caller's own text can be bad.
+  if (!isWellFormedText(message) || (!isAbsent(callbackUrl) && !isWellFormedText(callbackUrl))) {
+    throw new AuthError("bad_signature", "signed text must be well-formed Unicode");
+  }
+  const digest = hexToBytes(sha256Hex(encodePayload(message, nonce, recipient, callbackUrl)));
   if (!signatureVerifies(key, digest, signature)) {
     throw new AuthError("bad_signature", "signature does not match the message and key");
   }
 
-  if (
-    typeof i.accountId !== "string" ||
-    i.accountId === "" ||
-    i.accountId.length > MAX_ACCOUNT_ID_CHARS
-  ) {
-    throw new AuthError("key_not_found", "account id is missing or too long");
+  if (!AccountIdSchema.safeParse(accountId).success) {
+    throw new AuthError("key_not_found", "account id is not a NEAR account id");
   }
   const publicKey = key.toString();
-  const accessKey = await deps.viewAccessKey(i.accountId, publicKey);
+  const accessKey = await deps.viewAccessKey(accountId, publicKey);
   if (!accessKey) {
     throw new AuthError("key_not_found", "that key is not on that account");
   }
@@ -262,5 +294,5 @@ export async function verifyNep413(i: Nep413Input, deps: Nep413Deps): Promise<Ne
   if (keyKind === null) {
     throw new AuthError("key_not_allowed", "that key may not sign in to Tender");
   }
-  return { accountId: i.accountId, publicKey, keyKind };
+  return { accountId, publicKey, keyKind };
 }
