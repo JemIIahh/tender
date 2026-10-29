@@ -225,3 +225,22 @@ export async function linkChat(
 export async function watchTag(db: Db, chatId: ChatId, tag: string): Promise<void> {
   await insertRow(db, "tg_watches", { chat_id: chatId, tag });
 }
+
+/**
+ * A link nonce for `account`, as the API's link endpoint mints one. By default it is unused and
+ * valid for ten more minutes; a negative `expiresInMs` makes an expired one. The database judges
+ * expiry by its own clock, so keep the margins to minutes, not milliseconds.
+ */
+export async function seedLinkNonce(
+  db: Db,
+  nonce: string,
+  account: string,
+  { expiresInMs = 10 * 60_000, used = false }: { expiresInMs?: number; used?: boolean } = {},
+): Promise<void> {
+  await insertRow(db, "tg_link_nonces", {
+    nonce,
+    account,
+    expires_at: new Date(Date.now() + expiresInMs),
+    used,
+  });
+}
