@@ -393,7 +393,7 @@ impl Tender {
 /// `net` by less than one unit per winner, and that dust goes to the first winner, so the fee and
 /// the amounts add up to `reward` exactly. `bps` must be non-empty and add up to 10_000, as `pick`
 /// has checked. Panics `E_REWARD` if a product overflows a u128.
-fn split_reward(reward: u128, fee_bps: u16, bps: &[u16]) -> (u128, Vec<u128>) {
+pub(crate) fn split_reward(reward: u128, fee_bps: u16, bps: &[u16]) -> (u128, Vec<u128>) {
     let fee = bps_of(reward, fee_bps);
     // `fee_bps` is at most `MAX_FEE_BPS`, so the fee is at most a tenth of the reward.
     let net = reward - fee;

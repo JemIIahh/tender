@@ -14,6 +14,8 @@ mod admin;
 mod auth;
 mod entries;
 mod events;
+#[cfg(test)]
+mod props;
 mod registry;
 mod settle;
 mod storage;
