@@ -14,10 +14,8 @@ pub const MAX_WINDOW_SECS: u32 = 1_209_600;
 /// Highest protocol fee: 10%.
 pub const MAX_FEE_BPS: u16 = 1_000;
 /// Most winners one task may pay.
-#[allow(dead_code)]
 pub const MAX_WINNERS: u8 = 5;
 /// Most accounts a task may invite.
-#[allow(dead_code)]
 pub const MAX_INVITED: usize = 20;
 /// Most funders a pooled bounty may have.
 #[allow(dead_code)]
@@ -29,14 +27,12 @@ pub const MAX_TAGS: usize = 8;
 /// Longest tag, in characters.
 pub const MAX_TAG_LEN: usize = 24;
 /// Largest page a view returns.
-#[allow(dead_code)]
 pub const MAX_PAGE: u32 = 50;
 /// Smallest first storage deposit: 0.01 NEAR.
 pub const STORAGE_MIN_DEPOSIT: u128 = 10u128.pow(22);
 /// Upper bound on the bytes one vault slot occupies.
 pub const VAULT_SLOT_MAX_BYTES: u64 = 200;
 /// Bytes the poster reserves at posting so settlement never needs new storage.
-#[allow(dead_code)]
 pub const OUTCOME_RESERVE_BYTES: u64 = 800;
 /// Gas attached to the token's `ft_transfer` in `withdraw`.
 pub const GAS_FT_TRANSFER: Gas = Gas::from_tgas(10);
@@ -89,6 +85,18 @@ pub(crate) fn parse_hash(s: &str) -> [u8; 32] {
 /// Formats 32 bytes as 64 lowercase hex characters.
 pub(crate) fn hex32(h: &[u8; 32]) -> String {
     hex::encode(h)
+}
+
+/// Panics `E_URI` unless `uri` is 1 to `MAX_URI_BYTES` bytes. `field` names the argument in the
+/// message.
+pub(crate) fn check_uri(field: &str, uri: &str) {
+    if !(1..=MAX_URI_BYTES).contains(&uri.len()) {
+        env::panic_str(&format!(
+            "{}: {field} must be 1 to {MAX_URI_BYTES} bytes, got {}",
+            err::E_URI,
+            uri.len()
+        ));
+    }
 }
 
 /// An account's storage balance.
@@ -171,7 +179,6 @@ pub struct Task {
 #[near(serializers = [json])]
 #[serde(rename_all = "snake_case")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Phase {
     Open,
     Revealing,
@@ -312,6 +319,103 @@ pub struct AgentView {
     pub picks_made: u32,
     /// Empty picks made as a verifier after at least one entry was revealed.
     pub voids_after_reveals: u32,
+}
+
+/// The arguments of `post_task`, which takes them as `{"task": {...}}`. `reward` is a decimal
+/// string in the token's smallest unit, each hash is 64 lowercase hex characters, and each window
+/// is in seconds.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostTaskArgs {
+    pub token: AccountId,
+    pub reward: U128,
+    pub brief_uri: String,
+    pub brief_hash: String,
+    pub criteria_hash: String,
+    pub heldout_commitment: Option<String>,
+    /// Who picks the winners. `None` makes it the poster.
+    pub verifier: Option<AccountId>,
+    pub commit_secs: u32,
+    pub reveal_secs: u32,
+    pub pick_secs: u32,
+    pub fallback_secs: u32,
+    /// 0 means unlimited; non-zero only together with `invited`.
+    pub max_entries: u32,
+    pub max_winners: u8,
+    /// Empty means open to anyone.
+    pub invited: Vec<AccountId>,
+    /// Rejected (`E_PARENT`) until lineage is enabled.
+    pub parent: Option<U64>,
+}
+
+/// One funder of a task's escrow and what it paid in, as `get_task` shows it.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunderView {
+    pub account: AccountId,
+    pub amount: U128,
+}
+
+/// One winner's share of a pick, as the views show it.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayoutView {
+    pub account: AccountId,
+    pub bps: u16,
+    pub amount: U128,
+}
+
+/// How a settled task ended, as the views show it: `Outcome` with hashes as 64 lowercase hex
+/// characters and amounts as decimal strings, tagged by `kind` (`"picked"` or `"voided"`).
+#[near(serializers = [json])]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutcomeView {
+    Picked {
+        winners: Vec<PayoutView>,
+        fee: U128,
+        scorecard_hash: String,
+        scorecard_uri: String,
+    },
+    Voided {
+        reason: VoidReason,
+        scorecard_hash: Option<String>,
+        scorecard_uri: Option<String>,
+    },
+}
+
+/// A task, as returned by `get_task` and `get_tasks`: every field of `Task`, plus the phase it is
+/// in at the block time of the call. Hashes are 64 lowercase hex characters; ids, timestamps
+/// (nanoseconds) and amounts are decimal strings.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskView {
+    pub id: U64,
+    pub poster: AccountId,
+    pub token: AccountId,
+    pub reward: U128,
+    pub fee_bps: u16,
+    pub brief_uri: String,
+    pub brief_hash: String,
+    pub criteria_hash: String,
+    pub heldout_commitment: Option<String>,
+    pub verifier: AccountId,
+    pub created_at: U64,
+    pub commit_deadline: U64,
+    pub reveal_deadline: U64,
+    pub pick_deadline: U64,
+    pub fallback_deadline: U64,
+    pub max_entries: u32,
+    pub max_winners: u8,
+    pub invited: Vec<AccountId>,
+    pub parent: Option<U64>,
+    pub commit_count: u32,
+    pub reveal_count: u32,
+    pub cleaned: u32,
+    pub funders: Vec<FunderView>,
+    /// `null` until the task is settled.
+    pub outcome: Option<OutcomeView>,
+    pub phase: Phase,
 }
 
 #[cfg(test)]

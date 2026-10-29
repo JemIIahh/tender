@@ -11,8 +11,7 @@ use near_sdk::{env, near, AccountId};
 
 use crate::events::{emit, AgentRegistered};
 use crate::types::{
-    err, hex32, parse_hash, AgentProfile, AgentView, TokenBalance, MAX_TAGS, MAX_TAG_LEN,
-    MAX_URI_BYTES,
+    check_uri, err, hex32, parse_hash, AgentProfile, AgentView, TokenBalance, MAX_TAGS, MAX_TAG_LEN,
 };
 use crate::{Tender, TenderExt};
 
@@ -28,17 +27,6 @@ pub(crate) fn asp_of(account: &AccountId) -> Option<AccountId> {
         return None;
     }
     parent.parse().ok()
-}
-
-/// Panics `E_URI` unless `uri` is 1 to `MAX_URI_BYTES` bytes.
-fn check_uri(uri: &str) {
-    if !(1..=MAX_URI_BYTES).contains(&uri.len()) {
-        env::panic_str(&format!(
-            "{}: profile_uri must be 1 to {MAX_URI_BYTES} bytes, got {}",
-            err::E_URI,
-            uri.len()
-        ));
-    }
 }
 
 /// Panics `E_TAGS` unless there are at most `MAX_TAGS` tags and each is 1 to `MAX_TAG_LEN`
@@ -108,7 +96,7 @@ impl Tender {
     /// for `bot1.acme.near`, see `asp_of`). An update keeps both, along with every counter and
     /// `earned`. Emits `agent_registered`.
     pub fn register_agent(&mut self, profile_uri: String, profile_hash: String, tags: Vec<String>) {
-        check_uri(&profile_uri);
+        check_uri("profile_uri", &profile_uri);
         let hash = parse_hash(&profile_hash);
         check_tags(&tags);
 
@@ -198,15 +186,13 @@ impl Tender {
 
 #[cfg(test)]
 mod tests {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-
     use near_sdk::json_types::{U128, U64};
     use near_sdk::serde_json;
     use near_sdk::test_utils::get_logs;
     use near_sdk::{borsh, env, testing_env, AccountId, NearToken};
 
     use super::asp_of;
-    use crate::test_utils::{ctx, fresh};
+    use crate::test_utils::{ctx, fresh, panic_message};
     use crate::types::{AgentView, TokenBalance};
     use crate::Tender;
 
@@ -265,16 +251,6 @@ mod tests {
         format!(
             r#"EVENT_JSON:{{"standard":"tender","version":"1.0.0","event":"agent_registered","data":[{data}]}}"#
         )
-    }
-
-    /// The panic message of `f`, or `None` if it returned.
-    fn panic_message(f: impl FnOnce()) -> Option<String> {
-        let payload = catch_unwind(AssertUnwindSafe(f)).err()?;
-        let text = match payload.downcast::<String>() {
-            Ok(text) => *text,
-            Err(payload) => (*payload.downcast::<&str>().expect("a text panic")).to_string(),
-        };
-        Some(text)
     }
 
     /// `alice.near` registers. `Err` holds the panic message if the call is rejected.

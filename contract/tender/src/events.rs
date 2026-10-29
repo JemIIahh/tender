@@ -1,8 +1,10 @@
 //! NEP-297 event logging.
 
-use near_sdk::json_types::U128;
+use near_sdk::json_types::{U128, U64};
 use near_sdk::serde::Serialize;
 use near_sdk::{env, serde_json, AccountId};
+
+use crate::types::TaskView;
 
 const STANDARD: &str = "tender";
 const VERSION: &str = "1.0.0";
@@ -65,6 +67,89 @@ pub(crate) struct AgentRegistered {
     pub profile_hash: String,
     pub tags: Vec<String>,
     pub updated: bool,
+}
+
+/// Data of `task_created`: the new task as `get_task` shows it, in the same field order, minus
+/// `commit_count`, `reveal_count`, `cleaned`, `funders`, `outcome` and `phase`. At posting those
+/// hold nothing an indexer needs (the only funder is the poster, for the whole `reward`), and all
+/// but `funders` change later without this event.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct TaskCreated {
+    pub id: U64,
+    pub poster: AccountId,
+    pub token: AccountId,
+    pub reward: U128,
+    pub fee_bps: u16,
+    pub brief_uri: String,
+    pub brief_hash: String,
+    pub criteria_hash: String,
+    pub heldout_commitment: Option<String>,
+    pub verifier: AccountId,
+    pub created_at: U64,
+    pub commit_deadline: U64,
+    pub reveal_deadline: U64,
+    pub pick_deadline: U64,
+    pub fallback_deadline: U64,
+    pub max_entries: u32,
+    pub max_winners: u8,
+    pub invited: Vec<AccountId>,
+    pub parent: Option<U64>,
+}
+
+impl From<TaskView> for TaskCreated {
+    fn from(view: TaskView) -> Self {
+        // No `..`: a field added to `TaskView` is a compile error here until the event takes it
+        // or drops it on purpose.
+        let TaskView {
+            id,
+            poster,
+            token,
+            reward,
+            fee_bps,
+            brief_uri,
+            brief_hash,
+            criteria_hash,
+            heldout_commitment,
+            verifier,
+            created_at,
+            commit_deadline,
+            reveal_deadline,
+            pick_deadline,
+            fallback_deadline,
+            max_entries,
+            max_winners,
+            invited,
+            parent,
+            commit_count: _,
+            reveal_count: _,
+            cleaned: _,
+            funders: _,
+            outcome: _,
+            phase: _,
+        } = view;
+        Self {
+            id,
+            poster,
+            token,
+            reward,
+            fee_bps,
+            brief_uri,
+            brief_hash,
+            criteria_hash,
+            heldout_commitment,
+            verifier,
+            created_at,
+            commit_deadline,
+            reveal_deadline,
+            pick_deadline,
+            fallback_deadline,
+            max_entries,
+            max_winners,
+            invited,
+            parent,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -5,9 +5,11 @@
 //! derived from block time, never stored.
 
 mod admin;
+mod auth;
 mod events;
 mod registry;
 mod storage;
+mod tasks;
 #[cfg(test)]
 mod test_utils;
 mod types;

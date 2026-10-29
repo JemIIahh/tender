@@ -281,7 +281,7 @@ mod tests {
         env, testing_env, AccountId, Gas, NearToken, PromiseError, PromiseOrValue, PromiseResult,
     };
 
-    use crate::test_utils::{ctx, fresh};
+    use crate::test_utils::{ctx, fresh, panic_message};
     use crate::types::{
         TokenBalance, TokenConfig, GAS_FT_TRANSFER, GAS_ON_WITHDRAW, MIN_WITHDRAW_GAS,
         STORAGE_MIN_DEPOSIT, VAULT_SLOT_MAX_BYTES,
@@ -822,6 +822,30 @@ mod tests {
         let mut t = world();
         deposit(&mut t, "alice.test", 100, "");
         withdraw(&mut t, "alice.test", 101, None);
+    }
+
+    #[test]
+    fn withdraw_uses_predecessor_not_signer() {
+        // alice signs a transaction whose call reaches Tender from evil.test, a contract. The
+        // caller is evil.test, so the withdrawal spends evil.test's vault, which is empty, and
+        // never the signer's.
+        let mut t = world();
+        deposit(&mut t, "alice.test", 100, "");
+        testing_env!(ctx("evil.test")
+            .signer_account_id(acct("alice.test"))
+            .attached_deposit(ONE_YOCTO)
+            .build());
+        let rejected = panic_message(|| {
+            let _ = t.withdraw(acct(USDC), U128(100), None);
+        });
+        assert!(
+            rejected
+                .as_ref()
+                .is_some_and(|m| m.starts_with("E_FUNDS: ")),
+            "{rejected:?}"
+        );
+        assert_eq!(balance(&t, "alice.test"), 100);
+        assert!(scheduled_calls().is_empty(), "no transfer was scheduled");
     }
 
     #[test]
