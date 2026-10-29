@@ -1,0 +1,18 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history, so gitleaks scans every commit in the push or pull request.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      # v3, not v2: v2 runs on Node 20, which GitHub-hosted runners dropped on 2026-09-16.
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

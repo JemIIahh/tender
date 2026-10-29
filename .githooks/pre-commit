@@ -1,0 +1,18 @@
+#!/bin/sh
+# pre-commit: (1) commit only as JemIIahh, (2) scan staged changes for secrets.
+
+expected_name="JemIIahh"
+actual_name="$(git config user.name)"
+
+if [ "$actual_name" != "$expected_name" ]; then
+  echo "pre-commit: git user.name is '$actual_name', expected '$expected_name'. Commit aborted." >&2
+  exit 1
+fi
+
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks protect --staged --redact || exit 1
+else
+  echo "pre-commit: warning: gitleaks is not installed, skipping the staged-secrets scan." >&2
+fi
+
+exit 0

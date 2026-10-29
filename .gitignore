@@ -1,0 +1,9 @@
+target/
+node_modules/
+.env*
+!.env.example
+.data/
+.next/
+*.log
+.tender/
+coverage/

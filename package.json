@@ -1,0 +1,27 @@
+{
+  "name": "tender",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.26.0",
+  "engines": {
+    "node": ">=24.21.0"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "pnpm -r exec tsc --noEmit",
+    "lint": "biome check .",
+    "skeleton": "tsx scripts/skeleton.ts",
+    "demo:local": "tsx scripts/demo-local.ts",
+    "seed": "tsx scripts/seed.ts",
+    "serve": "tsx scripts/serve.ts",
+    "deploy:testnet": "tsx scripts/deploy.ts --network testnet",
+    "deploy:mainnet": "tsx scripts/deploy.ts --network mainnet"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.4",
+    "@types/node": "24.19.2",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}
