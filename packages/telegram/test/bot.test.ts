@@ -1256,6 +1256,9 @@ test("uses_auto_retry_and_the_throttler", async () => {
       network,
     );
 
+  // Timed from just before the first call, not from its start: on a busy machine the first call
+  // can start late inside its turn, while the throttler spaces the turns from when they began.
+  const before = Date.now();
   expect(await chain("sendMessage", { chat_id: 7, text: "one" })).toEqual({
     ok: true,
     result: true,
@@ -1265,7 +1268,7 @@ test("uses_auto_retry_and_the_throttler", async () => {
   // The throttler lets a chat have one message a second.
   await chain("sendMessage", { chat_id: 7, text: "two" });
   expect(starts).toHaveLength(3);
-  expect((starts[2] ?? 0) - (starts[0] ?? 0)).toBeGreaterThanOrEqual(900);
+  expect((starts[2] ?? 0) - before).toBeGreaterThanOrEqual(990);
 }, 15_000);
 
 test("a_failing_update_is_logged_not_thrown", async () => {
