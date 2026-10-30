@@ -59,6 +59,32 @@ test("rejects_uppercase_hex", () => {
   expect(() => computeCommitment(1n, "a.near", hash, `${salt.slice(0, 63)}F`)).toThrow(/salt/);
 });
 
+test("rejects_accounts_that_are_not_account_ids", () => {
+  // The account is held to the contract's form like the hashes are. Only an account id can commit,
+  // so a commitment made for anything else is one that no account can reveal.
+  const h = "00".repeat(32);
+  const bad = [
+    "Alice.near",
+    "",
+    "a",
+    "alice.near ",
+    "alice..near",
+    ".near",
+    "alice.near\n",
+    "älice.near",
+    "a".repeat(65),
+  ];
+  for (const account of bad) {
+    expect(() => computeCommitment(1n, account, h, h), JSON.stringify(account)).toThrow(
+      /account must be a NEAR account id/,
+    );
+  }
+  // The edges of the form pass: 2 and 64 characters, with every separator.
+  for (const account of ["ab", "a.b", "a-b_c.near", "a".repeat(64)]) {
+    expect(computeCommitment(1n, account, h, h), account).toMatch(/^[0-9a-f]{64}$/);
+  }
+});
+
 test("rejects_task_ids_outside_u64", () => {
   const h = "00".repeat(32);
   expect(() => computeCommitment(-1n, "a.near", h, h)).toThrow(RangeError);
