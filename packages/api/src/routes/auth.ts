@@ -1,10 +1,11 @@
 import { AuthError } from "@tender/client";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import { createChallenge, refusal, signIn } from "../auth";
 import type { ApiDeps } from "../deps";
 import { badRequest, type ErrorBody, issuesOf, readJson } from "../format";
+import { clientKey, rateLimit, rateLimitsOf } from "../limits";
 
 /**
  * The most a sign-in may weigh. A real one is about 400 bytes; this is not an upload route, and
@@ -36,17 +37,27 @@ const VerifySchema = z.strictObject({
  *   sign-in that is refused gets a 401 with a code (`bad_nonce`, `wrong_recipient`,
  *   `bad_signature`, `key_not_found` or `key_not_allowed`) and a fixed text. When the chain
  *   cannot say whether the key is there, because its call failed or gave no answer within 5
- *   seconds, the answer is a 503 (`unavailable`) and the challenge is not spent.
+ *   seconds, the answer is a 503 (`unavailable`) with `Retry-After: 5`, and the challenge is not
+ *   spent.
+ *
+ * Each route takes 30 requests a minute from a client address (`clientKey`) unless
+ * `deps.rateLimits` says otherwise, refused ones included; past that the answer is a 429
+ * (`rate_limited`) with `Retry-After`.
  *
  * The routes that need an account are behind `requireAuth`, which the caller mounts them with.
  */
 export function authRoutes(deps: ApiDeps): Hono {
   const app = new Hono();
+  const limits = rateLimitsOf(deps.rateLimits);
+  const byClient = (c: Context) => clientKey(c, deps.trustedProxyHops ?? 0);
 
-  app.post("/auth/challenge", async (c) => c.json(await createChallenge(deps), 200, NOT_CACHED));
+  app.post("/auth/challenge", rateLimit(limits.challenge, byClient), async (c) =>
+    c.json(await createChallenge(deps), 200, NOT_CACHED),
+  );
 
   app.post(
     "/auth/verify",
+    rateLimit(limits.verify, byClient),
     bodyLimit({
       maxSize: MAX_BODY_BYTES,
       onError: (c) => {

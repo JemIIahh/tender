@@ -1,12 +1,24 @@
 import { Hono } from "hono";
+import { withinDeadline } from "../deadline";
 import type { ApiDeps } from "../deps";
 import type { ErrorBody, HealthResponse } from "../format";
+import { RETRY_SOON } from "../limits";
+
+/**
+ * How long the chain has to give its final height, in milliseconds. The RPC client retries a node
+ * that does not answer for minutes, which no monitor waits for.
+ */
+const FINAL_HEIGHT_DEADLINE_MS = 5_000;
 
 /**
  * `GET /v1/health`: whether the API can read the database and the chain, and how far the index is
  * behind. A monitor reads `lag_blocks`; the API stays `ok` while the indexer catches up.
+ *
+ * The chain has 5 seconds (`options.deadlineMs`, for tests) to give its final height. A chain that
+ * fails or does not answer in time is a 503 with `Retry-After: 5`.
  */
-export function healthRoutes(deps: ApiDeps): Hono {
+export function healthRoutes(deps: ApiDeps, options: { deadlineMs?: number } = {}): Hono {
+  const deadlineMs = options.deadlineMs ?? FINAL_HEIGHT_DEADLINE_MS;
   const app = new Hono();
 
   app.get("/health", async (c) => {
@@ -18,7 +30,8 @@ export function healthRoutes(deps: ApiDeps): Hono {
 
     let final: bigint;
     try {
-      final = await deps.client.finalHeight();
+      // Called as a method, because a `TenderClient` reads its own fields.
+      final = await withinDeadline(deadlineMs, deps.client.finalHeight());
     } catch (error) {
       // Only the kind of error is logged: the text of an RPC error can name an endpoint with a key.
       console.error(
@@ -32,7 +45,7 @@ export function healthRoutes(deps: ApiDeps): Hono {
         contract: deps.contractId,
         indexed_height: indexed.toString(),
       };
-      return c.json(body, 503);
+      return c.json(body, 503, RETRY_SOON);
     }
 
     const body: HealthResponse = {

@@ -1,6 +1,7 @@
 import type { KeyPermission } from "@tender/client";
 import type { Db } from "@tender/db";
 import type { NetworkId } from "@tender/shared";
+import type { RateLimits } from "./limits";
 
 /**
  * The two chain reads the API makes: the height of the last final block (`/v1/health`) and the
@@ -58,6 +59,15 @@ export interface ApiDeps {
    * `Retry-After`, and so it is for a value that is not a number. Default: 200.
    */
   maxSseStreams?: number;
+  /**
+   * How many proxies in front of the API add the address they saw to `X-Forwarded-For`
+   * (`TRUSTED_PROXY_HOPS`). The rate limits count requests by client address: the socket's when
+   * this is 0, the default, and otherwise the header's entry that many places from its end (see
+   * `clientKey`).
+   */
+  trustedProxyHops?: number;
+  /** The rate limits, where they differ from `DEFAULT_RATE_LIMITS`. Tests use small ones. */
+  rateLimits?: Partial<RateLimits>;
 }
 
 /** The time, in nanoseconds, that `deps` says it is. */

@@ -1,0 +1,20 @@
+# What the services image is built without. Secrets first: env files, wherever they are, and the
+# MCP server's state.
+.env*
+**/.env*
+.tender
+# Installed, built or written on the machine, as in .gitignore, and made again in the image.
+node_modules
+**/node_modules
+**/target
+**/.next
+**/coverage
+**/*.log
+!packages/shared/test/fixtures/**/*.log
+**/*.tsbuildinfo
+apps/web/test-results
+apps/web/playwright-report
+# Local data and the working records of the repository.
+.data
+.git
+.superpowers

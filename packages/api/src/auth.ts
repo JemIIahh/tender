@@ -9,8 +9,10 @@ import {
 } from "@tender/client";
 import { canonicalBase, SIGN_IN_MESSAGE, sha256Hex } from "@tender/shared";
 import type { Context } from "hono";
+import { withinDeadline } from "./deadline";
 import { type ApiDeps, nowNs } from "./deps";
-import { type ErrorBody, fail } from "./format";
+import type { ErrorBody } from "./format";
+import { unavailableForNow } from "./limits";
 import type { RequireAuth } from "./routes/blobs";
 
 // NEP-413 sign-in. A user or an agent asks for a challenge, signs it with an access key of its
@@ -27,8 +29,9 @@ import type { RequireAuth } from "./routes/blobs";
 // its tokens with it, within a minute, and not at the end of their 12 hours.
 //
 // Each question to the chain has 5 seconds. A chain that does not answer in time, or whose call
-// fails, is a 503 for the caller to try again later, at sign-in and at the check of a token alike,
-// and not a request that waits for the RPC client to give up on its own, which takes minutes.
+// fails, is a 503 with `Retry-After: 5` for the caller to try again later, at sign-in and at the
+// check of a token alike, and not a request that waits for the RPC client to give up on its own,
+// which takes minutes.
 
 const NONCE_BYTES = 32;
 const TOKEN_BYTES = 32;
@@ -120,19 +123,12 @@ export async function createChallenge(deps: ApiDeps): Promise<ChallengeResponse>
  */
 const KEY_LOOKUP_DEADLINE_MS = 5_000;
 
-/** What a lookup fails with when `KEY_LOOKUP_DEADLINE_MS` has passed. */
-class NoAnswerInTime extends Error {
-  constructor() {
-    super(`no answer within ${KEY_LOOKUP_DEADLINE_MS} ms`);
-    this.name = "NoAnswerInTime";
-  }
-}
-
 /**
  * The chain could not say whether a key is on an account: its call failed, or gave no answer
- * within `KEY_LOOKUP_DEADLINE_MS`. `cause` is the call's own error, or `NoAnswerInTime`. It is the
- * one error `lookUpKey` throws, so that whoever asked can tell a chain that is not answering from
- * a fault of our own. It is not to be logged whole: see `logLookupFailure`.
+ * within `KEY_LOOKUP_DEADLINE_MS`. `cause` is the call's own error, or `withinDeadline`'s
+ * `NoAnswerInTime`. It is the one error `lookUpKey` throws, so that whoever asked can tell a
+ * chain that is not answering from a fault of our own. It is not to be logged whole: see
+ * `logLookupFailure`.
  */
 class KeyLookupFailed extends Error {
   constructor(cause: unknown) {
@@ -142,30 +138,22 @@ class KeyLookupFailed extends Error {
 }
 
 /**
- * `deps.client.viewAccessKey`, with `KEY_LOOKUP_DEADLINE_MS` to answer. It rejects with a
- * `KeyLookupFailed` if the call fails, and if the deadline comes first. The call itself cannot be
- * cancelled: one that is given up on settles on its own, and what it says then is dropped. The
- * race subscribes to it, so a failure after the deadline is not an unhandled rejection. The timer
- * is cleared however the question ends.
+ * `deps.client.viewAccessKey`, with `KEY_LOOKUP_DEADLINE_MS` to answer (`withinDeadline`). It
+ * rejects with a `KeyLookupFailed` if the call fails, and if the deadline comes first.
  */
 async function lookUpKey(
   deps: ApiDeps,
   account: string,
   publicKey: string,
 ): Promise<{ permission: KeyPermission } | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
-      // Called as a method, because a `TenderClient` reads its own fields.
+    // Called as a method, because a `TenderClient` reads its own fields.
+    return await withinDeadline(
+      KEY_LOOKUP_DEADLINE_MS,
       deps.client.viewAccessKey(account, publicKey),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new NoAnswerInTime()), KEY_LOOKUP_DEADLINE_MS);
-      }),
-    ]);
+    );
   } catch (error) {
     throw new KeyLookupFailed(error);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -182,9 +170,12 @@ function logLookupFailure(whose: string, error: unknown): void {
   console.error(`api: cannot check the key of ${whose} (${kind})`);
 }
 
-/** The answer to a request that needs the chain to say something about a key, and it cannot. */
+/**
+ * The answer to a request that needs the chain to say something about a key, and it cannot: a 503
+ * that says to try again in 5 seconds.
+ */
 function unavailable(): never {
-  return fail(503, "unavailable", "cannot check your key right now");
+  return unavailableForNow("cannot check your key right now");
 }
 
 /**
