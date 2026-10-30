@@ -1411,3 +1411,31 @@ test("a_web_url_with_whitespace_or_a_login_is_refused", async () => {
   // An @ in the path is no login.
   await expect(startNotifier(stoppedOn("https://tender.example/@tender"))).resolves.toBeUndefined();
 });
+
+test("a_refused_web_url_never_shows_its_query_or_fragment", () => {
+  // The message goes to the startup log, and a query or fragment can hold a secret: a token, or the
+  // `_vercel_share` of a preview link. A URL is shown only up to its first ? or #.
+  const withSecret = [
+    "https://tender.example/app?_vercel_share=CANARY", // refused for the query
+    "https://tender.example/app#access_token=CANARY", // refused for the fragment
+    "tender.example/app?token=CANARY", // refused for the scheme
+  ];
+  for (const webUrl of withSecret) {
+    expect(refusal(webUrl), webUrl).not.toContain("CANARY");
+  }
+
+  // What is left shows where the mistake is.
+  expect(refusal("https://tender.example/app?_vercel_share=CANARY")).toBe(
+    'webUrl must have no query or fragment, got "https://tender.example/app?..."',
+  );
+  expect(refusal("https://tender.example/app#access_token=CANARY")).toBe(
+    'webUrl must have no query or fragment, got "https://tender.example/app#..."',
+  );
+  expect(refusal("tender.example/app?token=CANARY")).toBe(
+    'webUrl must be an http(s) URL with a host, got "tender.example/app?..."',
+  );
+  // A URL with neither is shown whole.
+  expect(refusal("ftp://tender.example/app")).toBe(
+    'webUrl must be an http(s) URL with a host, got "ftp://tender.example/app"',
+  );
+});

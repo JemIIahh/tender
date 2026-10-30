@@ -207,11 +207,14 @@ function checkWebUrl(webUrl: string): void {
 }
 
 /**
- * `webUrl` as an error message shows it. An `@` may start a login, which is a secret, and the
- * message goes to the logs, so a URL with one is not shown.
+ * `webUrl` as an error message shows it. The message goes to the logs, and a URL can carry a
+ * secret: a login before an `@`, or a token in a query or fragment, as a preview link's share key
+ * is. So a URL with an `@` is not shown, and any other is shown only up to its first `?` or `#`.
  */
 function shown(webUrl: string): string {
-  return webUrl.includes("@") ? "(not shown, it has an @)" : JSON.stringify(webUrl);
+  if (webUrl.includes("@")) return "(not shown, it has an @)";
+  const cut = webUrl.search(/[?#]/);
+  return JSON.stringify(cut < 0 ? webUrl : `${webUrl.slice(0, cut + 1)}...`);
 }
 
 // The event stream.
