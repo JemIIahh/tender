@@ -5,7 +5,8 @@ import { StrictMode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import Home from "../app/page";
 
-// The placeholder board over a fake API. 06-T2 replaces the board; the states stay.
+// The board over a fake API: what it shows for each state of the request, and how its filters
+// and its paging ask the API.
 
 const TASK = {
   id: "7",
@@ -35,17 +36,25 @@ const TASK = {
 const page = (...tasks: unknown[]) => ({ tasks, next_cursor: null });
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
-/** A `fetch` that gives the answers in turn, the last one for any call after them. */
-function fakeApi(...answers: Array<Response | Error>): { calls: () => number } {
+/**
+ * A `fetch` that gives the answers in turn, the last one for any call after them, and keeps the
+ * address of each call.
+ */
+function fakeApi(...answers: Array<Response | Error>): { calls: () => number; urls: string[] } {
   let calls = 0;
-  vi.stubGlobal("fetch", async () => {
+  const urls: string[] = [];
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+    urls.push(String(input));
     const answer = answers[Math.min(calls, answers.length - 1)];
     calls++;
     if (answer instanceof Error) throw answer;
     return answer?.clone();
   });
-  return { calls: () => calls };
+  return { calls: () => calls, urls };
 }
+
+/** The query of the `n`th request. */
+const query = (api: { urls: string[] }, n: number) => new URL(api.urls[n] ?? "").searchParams;
 
 /** `console.error` that prints nothing, for a test that reads what the board logs. */
 const quietLog = () => vi.spyOn(console, "error").mockImplementation(() => {});
@@ -75,7 +84,7 @@ test("board_lists_the_tasks_the_api_sends", async () => {
   const first = within(cards[0] as HTMLElement);
   expect(first.getByText("Extract invoice totals")).toBeTruthy();
   expect(first.getByTestId("amount").textContent).toBe("1.50 tUSDC");
-  expect(first.getByText("open")).toBeTruthy();
+  expect(first.getByTestId("phase-chip").textContent).toBe("Open");
   // The team's poster is labelled, anyone else's is not.
   expect(within(first.getByTestId("poster")).getByText("Run by Tender team")).toBeTruthy();
   const second = within(cards[1] as HTMLElement);
@@ -230,4 +239,292 @@ test("board_shows_the_newest_request_even_when_an_older_one_answers_last", async
 
   expect(screen.queryByText("The older answer")).toBeNull();
   expect(screen.getByText("The newer answer")).toBeTruthy();
+});
+
+// ---- Cards ------------------------------------------------------------------------------------
+
+test("board_links_each_card_to_its_task_page", async () => {
+  fakeApi(json(page(TASK, { ...TASK, id: "8", title: null })));
+
+  render(<Home />);
+
+  const cards = await screen.findAllByTestId("task-card");
+  const titled = within(cards[0] as HTMLElement).getByRole("link", {
+    name: "Extract invoice totals",
+  });
+  expect(titled.getAttribute("href")).toBe("/tasks/7");
+  // A task with no public brief has a page too: its title is the stand-in.
+  const untitled = within(cards[1] as HTMLElement).getByRole("link", {
+    name: /no public brief yet/i,
+  });
+  expect(untitled.getAttribute("href")).toBe("/tasks/8");
+});
+
+test("board_shows_the_judges_reason_whenever_there_is_one", async () => {
+  fakeApi(
+    json(
+      page(
+        {
+          ...TASK,
+          id: "1",
+          judge_status: "accepted",
+          judge_reason: "not judged: needs a held-out part",
+        },
+        { ...TASK, id: "2", judge_status: null, judge_reason: "waiting for the Judge" },
+        { ...TASK, id: "3", judge_status: "accepted", judge_reason: null },
+        { ...TASK, id: "4", judge_status: null, judge_reason: null },
+      ),
+    ),
+  );
+
+  render(<Home />);
+
+  const notes = (await screen.findAllByTestId("task-card")).map(
+    (card) => within(card).queryByTestId("judge-note")?.textContent ?? null,
+  );
+  // The reason is shown for an accepted task too: the Judge says why before agents spend effort.
+  expect(notes).toEqual([
+    "Judge: accepted · not judged: needs a held-out part",
+    "Judge: waiting for the Judge",
+    "Judge: accepted",
+    null,
+  ]);
+});
+
+test("board_shows_the_judges_words_as_text_never_as_html", async () => {
+  fakeApi(json(page({ ...TASK, judge_reason: '<img src=x onerror="alert(1)">' })));
+
+  render(<Home />);
+
+  await screen.findByTestId("task-card");
+  expect(document.querySelector("img")).toBeNull();
+  expect(screen.getByTestId("judge-note").textContent).toContain('<img src=x onerror="alert(1)">');
+});
+
+// ---- Filters ----------------------------------------------------------------------------------
+
+test("board_phase_chips_ask_the_api_for_that_phase", async () => {
+  const api = fakeApi(json(page(TASK)));
+  render(<Home />);
+  await screen.findByTestId("task-card");
+  const group = screen.getByRole("group", { name: "Phase" });
+  const pressed = () =>
+    within(group)
+      .getAllByRole("button")
+      .map((chip) => `${chip.textContent}:${chip.getAttribute("aria-pressed")}`);
+  // All the tasks to begin with, as the API lists them when no phase is asked for.
+  expect(pressed()).toEqual([
+    "All:true",
+    "Open:false",
+    "Revealing:false",
+    "Judging:false",
+    "Settled:false",
+  ]);
+  expect(query(api, 0).has("phase")).toBe(false);
+
+  await userEvent.click(within(group).getByRole("button", { name: "Revealing" }));
+
+  await waitFor(() => expect(api.urls).toHaveLength(2));
+  expect(query(api, 1).get("phase")).toBe("revealing");
+  expect(pressed()).toEqual([
+    "All:false",
+    "Open:false",
+    "Revealing:true",
+    "Judging:false",
+    "Settled:false",
+  ]);
+
+  await userEvent.click(within(group).getByRole("button", { name: "All" }));
+
+  await waitFor(() => expect(api.urls).toHaveLength(3));
+  expect(query(api, 2).has("phase")).toBe(false);
+});
+
+test("board_filters_by_tag", async () => {
+  const api = fakeApi(json(page(TASK)));
+  render(<Home />);
+  await screen.findByTestId("task-card");
+
+  // Case and the spaces around a tag do not matter, as a person types it.
+  await userEvent.type(screen.getByLabelText("Tag"), "  JSON {Enter}");
+
+  await waitFor(() => expect(api.urls).toHaveLength(2));
+  expect(query(api, 1).get("tag")).toBe("json");
+
+  await userEvent.click(screen.getByRole("button", { name: "Clear" }));
+
+  await waitFor(() => expect(api.urls).toHaveLength(3));
+  expect(query(api, 2).has("tag")).toBe(false);
+  expect((screen.getByLabelText("Tag") as HTMLInputElement).value).toBe("");
+  expect(screen.queryByRole("button", { name: "Clear" })).toBeNull();
+});
+
+test("board_keeps_the_phase_when_the_tag_changes_and_the_tag_when_the_phase_does", async () => {
+  const api = fakeApi(json(page(TASK)));
+  render(<Home />);
+  await screen.findByTestId("task-card");
+
+  await userEvent.click(screen.getByRole("button", { name: "Open" }));
+  await waitFor(() => expect(api.urls).toHaveLength(2));
+  await userEvent.type(screen.getByLabelText("Tag"), "json{Enter}");
+  await waitFor(() => expect(api.urls).toHaveLength(3));
+  expect(query(api, 2).get("phase")).toBe("open");
+  expect(query(api, 2).get("tag")).toBe("json");
+
+  await userEvent.click(screen.getByRole("button", { name: "Settled" }));
+
+  await waitFor(() => expect(api.urls).toHaveLength(4));
+  expect(query(api, 3).get("phase")).toBe("settled");
+  expect(query(api, 3).get("tag")).toBe("json");
+});
+
+test("board_does_not_ask_for_a_tag_the_api_would_refuse", async () => {
+  const api = fakeApi(json(page(TASK)));
+  render(<Home />);
+  await screen.findByTestId("task-card");
+
+  await userEvent.type(screen.getByLabelText("Tag"), "not a tag!{Enter}");
+
+  // The person is told what a tag looks like, next to the field, and nothing is sent.
+  expect(screen.getByTestId("tag-error").textContent).toBe(
+    "A tag is 1 to 24 characters: a to z, 0 to 9 and -.",
+  );
+  expect(api.urls).toHaveLength(1);
+  // The message is not an alert: the board has one alert at a time, for a request that failed.
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+test("board_shows_the_tags_of_a_card_as_text_and_not_as_buttons", async () => {
+  fakeApi(json(page(TASK)));
+  render(<Home />);
+  const card = within(await screen.findByTestId("task-card"));
+
+  // The Tag field is the one way to filter by a tag.
+  expect(card.getByText("json")).toBeTruthy();
+  expect(card.queryByRole("button")).toBeNull();
+});
+
+test("board_says_when_no_task_matches_the_filters", async () => {
+  fakeApi(json(page(TASK)), json(page()));
+  render(<Home />);
+  await screen.findByTestId("task-card");
+
+  await userEvent.click(screen.getByRole("button", { name: "Settled" }));
+
+  expect(await screen.findByText(/no tasks match/i)).toBeTruthy();
+  expect(screen.queryByText(/no tasks yet/i)).toBeNull();
+});
+
+test("board_drops_the_answer_to_a_filter_that_is_no_longer_the_one_asked_for", async () => {
+  const pending: Array<(response: Response) => void> = [];
+  vi.stubGlobal("fetch", () => new Promise<Response>((resolve) => pending.push(resolve)));
+  render(<Home />);
+  await waitFor(() => expect(pending).toHaveLength(1));
+
+  await userEvent.click(screen.getByRole("button", { name: "Open" }));
+  await waitFor(() => expect(pending).toHaveLength(2));
+  pending[1]?.(json(page({ ...TASK, title: "Answer for Open" })));
+  await screen.findByText("Answer for Open");
+  pending[0]?.(json(page({ ...TASK, title: "Answer for All" })));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  expect(screen.queryByText("Answer for All")).toBeNull();
+  expect(screen.getByText("Answer for Open")).toBeTruthy();
+});
+
+// ---- More pages -------------------------------------------------------------------------------
+
+test("board_loads_the_next_page_with_the_cursor_the_api_gave", async () => {
+  const api = fakeApi(
+    json({ tasks: [TASK], next_cursor: "7" }),
+    json({ tasks: [{ ...TASK, id: "6", title: "An older task" }], next_cursor: null }),
+  );
+  render(<Home />);
+  await screen.findByTestId("task-card");
+  expect(query(api, 0).has("cursor")).toBe(false);
+
+  await userEvent.click(screen.getByRole("button", { name: "Load more" }));
+
+  await screen.findByText("An older task");
+  expect(query(api, 1).get("cursor")).toBe("7");
+  expect(screen.getAllByTestId("task-card")).toHaveLength(2);
+  // That was the last page: a line stands where the button was.
+  expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+  expect(screen.getByText("No more tasks")).toBeTruthy();
+});
+
+test("board_has_no_load_more_on_the_last_page", async () => {
+  fakeApi(json(page(TASK)));
+  render(<Home />);
+
+  await screen.findByTestId("task-card");
+
+  // Nothing was read on from, so there is nothing to say the end of.
+  expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+  expect(screen.queryByText("No more tasks")).toBeNull();
+});
+
+test("board_keeps_its_tasks_when_the_next_page_fails_and_offers_a_retry", async () => {
+  quietLog();
+  const api = fakeApi(
+    json({ tasks: [TASK], next_cursor: "7" }),
+    json({ error: "internal", message: "internal error" }, 500),
+    json({ tasks: [{ ...TASK, id: "6", title: "An older task" }], next_cursor: null }),
+  );
+  render(<Home />);
+  await screen.findByTestId("task-card");
+
+  await userEvent.click(screen.getByRole("button", { name: "Load more" }));
+
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toContain("500");
+  expect(screen.getAllByTestId("task-card")).toHaveLength(1);
+
+  await userEvent.click(within(alert).getByRole("button", { name: "Retry" }));
+
+  await screen.findByText("An older task");
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(query(api, 2).get("cursor")).toBe("7");
+  // The retry button had the focus, and is gone with the last page.
+  expect(document.activeElement).toBe(screen.getByText("No more tasks"));
+});
+
+test("board_moves_the_focus_to_the_line_that_replaces_load_more", async () => {
+  fakeApi(
+    json({ tasks: [TASK], next_cursor: "7" }),
+    json({ tasks: [{ ...TASK, id: "6", title: "An older task" }], next_cursor: null }),
+  );
+  render(<Home />);
+  await screen.findByTestId("task-card");
+
+  await userEvent.click(screen.getByRole("button", { name: "Load more" }));
+
+  const line = await screen.findByText("No more tasks");
+  // A button taken off the page drops the focus to the top of the document: the line takes it.
+  expect(document.activeElement).toBe(line);
+});
+
+test("board_leaves_the_focus_where_the_person_went_while_the_last_page_loaded", async () => {
+  const pending: Array<(response: Response) => void> = [];
+  const answers = [json({ tasks: [TASK], next_cursor: "7" })];
+  vi.stubGlobal(
+    "fetch",
+    () =>
+      new Promise<Response>((resolve) => {
+        const first = answers.shift();
+        if (first) resolve(first);
+        else pending.push(resolve);
+      }),
+  );
+  render(<Home />);
+  await screen.findByTestId("task-card");
+  await userEvent.click(screen.getByRole("button", { name: "Load more" }));
+  await waitFor(() => expect(pending).toHaveLength(1));
+  // While the page is on its way the person goes on to the tag field and starts to type.
+  await userEvent.click(screen.getByLabelText("Tag"));
+
+  pending[0]?.(json({ tasks: [{ ...TASK, id: "6", title: "An older task" }], next_cursor: null }));
+
+  await screen.findByText("No more tasks");
+  expect(document.activeElement).toBe(screen.getByLabelText("Tag"));
 });
