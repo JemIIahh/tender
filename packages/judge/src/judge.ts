@@ -342,6 +342,22 @@ async function stopWaiting(deps: JudgeDeps, taskId: bigint): Promise<void> {
   );
 }
 
+/**
+ * Clears the waiting reason of every accepted task of the Judge's that can no longer be judged at
+ * `nowNs`: its pick deadline has passed, or it is settled. Judging clears the reason when a wait
+ * ends, but a task the Judge did not get to in time, because it was not running when the wait
+ * ended, would go on saying that it waits.
+ */
+export async function clearStaleWaits(deps: JudgeDeps, nowNs: bigint): Promise<void> {
+  // Deadlines are numeric: `<=` compares them as numbers.
+  await deps.db.query(
+    `update tasks set judge_reason = null
+      where verifier = $1 and judge_status = 'accepted' and judge_reason like $2
+        and (pick_deadline <= $3 or outcome is not null)`,
+    [deps.judgeAccount, `${WAITING}%`, nowNs],
+  );
+}
+
 async function judgeRowOf(
   deps: JudgeDeps,
   taskId: bigint,

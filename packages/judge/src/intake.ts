@@ -51,8 +51,11 @@ const MAX_DOCUMENT_BYTES = 262_144;
 /** How long a poster has, from posting, to upload the held-out checks the task commits to. */
 const HELDOUT_WAIT_NS = 10n * 60n * 1_000_000_000n;
 const NS_PER_MS = 1_000_000n;
-/** The keywords whose value is a reference to a schema. */
-const REFERENCE_KEYWORDS = new Set(["$ref", "$dynamicRef", "$recursiveRef"]);
+/**
+ * The keywords that Ajv resolves dynamically: to the schema being compiled, unless the fragment
+ * names a dynamic anchor, whatever pointer it holds. They are refused wherever they are (P05-R11).
+ */
+const DYNAMIC_REFERENCE_KEYWORDS = new Set(["$dynamicRef", "$recursiveRef"]);
 /** The keywords whose value is data, not a schema: what is in it is never a reference. */
 const DATA_KEYWORDS = new Set(["const", "enum", "examples", "default"]);
 /** The keywords whose value maps names to schemas: its keys are names, not keywords. */
@@ -78,7 +81,9 @@ const CRITERIA_TOO_LARGE = "criteria too large";
 const HAS_HELDOUT_MISMATCH = "has_heldout does not match the task's held-out commitment";
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
 const REFERENCE_NOT_ALLOWED =
-  'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry';
+  'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry (move the schema it points to into $defs)';
+const DYNAMIC_REFERENCE =
+  "criteria schema is not supported: $dynamicRef and $recursiveRef are not supported, use $ref";
 const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at the root";
 const ROOT_ID_FRAGMENT = "criteria schema is not supported: the root $id must not have a fragment";
 const HELDOUT_WAITING = "waiting for held-out checks";
@@ -92,7 +97,10 @@ const CHECK_FAILED = "criteria could not be checked";
 
 /**
  * Decides whether the Judge will judge task `taskId`, and records it in `tasks.judge_status`, with
- * the reason in `judge_reason` (`null` once accepted), so that agents see it before they work.
+ * the reason in `judge_reason`, so that agents see it before they work: why the task is rejected,
+ * or what it waits for while `pending`, and `null` once it is accepted. Judging may set it again on
+ * an accepted task, while it waits for another task to close its reveals (`waiting: …`), and
+ * clears it when the wait ends or the task can no longer be judged.
  * Only a task that names `deps.judgeAccount` as its verifier is looked at. One the database does
  * not have yet, or that names another verifier, is left alone and comes back `pending`.
  *
@@ -332,17 +340,20 @@ function parseJson(bytes: Uint8Array): unknown {
  * reading; the schema fails on every document, or worse takes every document as a fit.
  * `checkJsonSchemaUsable` catches the first only. So what may be named, and how, is an allow-list
  * rather than a model of how Ajv resolves references, which would have to be exact to be safe
- * (P05-R9, P05-R10):
+ * (P05-R9, P05-R10, P05-R11):
  *
  * - `$id` is allowed only at the root, so the whole schema is one resource. An `$id` in a schema
  *   below the root is refused, whatever it says; a property named `$id` is a name, not a schema's
  *   `$id`. A root `$id` must not have a fragment, beyond a bare `#`.
- * - A reference (`$ref`, `$dynamicRef`, `$recursiveRef`) is exactly `#`, the whole schema, or
- *   `#/$defs/{name}` or `#/definitions/{name}`, where the name is one pointer segment (with `~1`
- *   and `~0` decoded, and no `%`) and an own key of the root's `$defs` or `definitions`, whose
- *   value is a schema: an object or a boolean. That is what written schemas use. A name of an
- *   `Object.prototype` member, such as `constructor`, is refused even when it is defined. Anything
- *   else is refused: an anchor, a URI, a pointer anywhere else, a missing entry.
+ * - `$dynamicRef` and `$recursiveRef` are refused wherever they are. Ajv resolves both to the
+ *   schema being compiled unless the fragment names a dynamic anchor, whatever pointer they hold,
+ *   so `{"$dynamicRef": "#/$defs/n"}` checks a value against the root and not against `n`.
+ * - A `$ref` is exactly `#`, the whole schema, or `#/$defs/{name}` or `#/definitions/{name}`,
+ *   where the name is one pointer segment (with `~1` and `~0` decoded, and no `%`) and an own key
+ *   of the root's `$defs` or `definitions`, whose value is a schema: an object or a boolean. That
+ *   is what written schemas use. A name of an `Object.prototype` member, such as `constructor`, is
+ *   refused even when it is defined. Anything else is refused: an anchor, a URI, a pointer
+ *   anywhere else, a missing entry. The reason says to move the schema into `$defs`.
  *
  * The values of `const`, `enum`, `examples` and `default` are data, not schemas, so a `"$ref"` in
  * them is no reference and is not looked at, nor is an `$id` in them. That holds where they are
@@ -374,7 +385,8 @@ function referenceProblem(schema: Record<string, unknown>): string | null {
     if (node !== schema && Object.hasOwn(node, "$id")) return ID_BELOW_ROOT;
     for (const [key, member] of Object.entries(node)) {
       if (DATA_KEYWORDS.has(key)) continue;
-      if (REFERENCE_KEYWORDS.has(key) && typeof member === "string") {
+      if (DYNAMIC_REFERENCE_KEYWORDS.has(key)) return DYNAMIC_REFERENCE;
+      if (key === "$ref" && typeof member === "string") {
         const problem = problemOf(member, schema);
         if (problem !== null) return problem;
       } else {

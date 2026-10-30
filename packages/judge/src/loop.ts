@@ -1,6 +1,6 @@
 import { phaseAt } from "@tender/shared";
 import { intakeTask } from "./intake";
-import { describeError, judgeTask } from "./judge";
+import { clearStaleWaits, describeError, judgeTask } from "./judge";
 import type { JudgeDeps } from "./types";
 
 /** How long `startJudge` waits after a tick before the next one starts, by default. */
@@ -21,7 +21,8 @@ interface DeadlineRow {
  * intake (`intakeTask`) for every task with no `judge_status` or a `pending` one, then judging
  * (`judgeTask`) for every `accepted` task the database has no outcome for and whose deadlines put
  * the clock in its judging window. A task accepted by the first pass can be judged in the second.
- * Tasks go in id order.
+ * Tasks go in id order. Last, a `waiting: …` reason is cleared from every task that can no longer
+ * be judged (`clearStaleWaits`), which a Judge that was not running when the wait ended leaves.
  *
  * A task that throws, as on a chain or database error, is logged, and the pass goes on with the
  * next task. The clock is read again for the judging pass: intake can take a while.
@@ -63,6 +64,7 @@ export async function judgeTick(deps: JudgeDeps): Promise<void> {
       console.error(`judge: judging task ${row.id} failed (${describeError(error)})`);
     }
   }
+  await clearStaleWaits(deps, nowNs);
 }
 
 /**

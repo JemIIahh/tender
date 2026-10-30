@@ -1151,6 +1151,42 @@ test("judge_tick_takes_a_task_from_intake_to_pick", async () => {
   expect(chain.getTask.mock.calls).toEqual([[7n]]);
 });
 
+test("judge_tick_clears_a_waiting_reason_that_outlives_the_wait", async () => {
+  // The Judge was not running when task 7's wait ended, and comes back as its pick window closes:
+  // left alone, the reason would say for ever that it waits. A tick clears it once the pick
+  // deadline has passed, and from a settled task, but not from a task that can still be judged,
+  // nor a reason of another kind.
+  const waiting = "waiting: held-out checks shared with task 99";
+  const stillOpen = {
+    reveal_deadline: (NOW_NS + 9n * MINUTE_NS).toString(),
+    pick_deadline: (NOW_NS + 20n * MINUTE_NS).toString(),
+    fallback_deadline: (NOW_NS + 30n * MINUTE_NS).toString(),
+  };
+  await insertTask(db, taskView({ id: "7" }), "accepted", waiting);
+  await insertTask(db, taskView({ id: "8", ...stillOpen }), "accepted", waiting);
+  await db.query("update tasks set outcome = $1 where id = 8", [
+    JSON.stringify({ kind: "voided", reason: "expired" }),
+  ]);
+  await insertTask(db, taskView({ id: "9", ...stillOpen }), "accepted", waiting);
+  await insertTask(db, taskView({ id: "10" }), "rejected", "criteria not found or invalid");
+  // The chain has none of them, so judging does nothing with tasks 7 and 9 in their windows.
+  const chain = fakeChain(null);
+
+  // Just before task 7's pick deadline: only the settled task is cleared.
+  await judgeTick(judgeDeps(db, chain, { now: at(9.99) }));
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: waiting });
+  expect(await judgeRow(db, 8)).toEqual({ judge_status: "accepted", judge_reason: null });
+
+  // At the deadline its window is over, and its reason goes too.
+  await judgeTick(judgeDeps(db, chain, { now: at(10) }));
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: null });
+  expect(await judgeRow(db, 9)).toEqual({ judge_status: "accepted", judge_reason: waiting });
+  expect(await judgeRow(db, 10)).toEqual({
+    judge_status: "rejected",
+    judge_reason: "criteria not found or invalid",
+  });
+});
+
 test("judge_tick_goes_on_after_a_task_fails", async () => {
   const criteriaHash = await putCriteria(db, EXACT);
   // Held-out checks of its own for each task: they are single-use.

@@ -1,7 +1,7 @@
 import { type BlobKind, type Db, putBlob } from "@tender/db";
 import { canonicalJson, sha256Hex, type TaskView } from "@tender/shared";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
-import { intakeTask } from "../src/index";
+import { intakeTask, scoreJsonSchema } from "../src/index";
 import { checkJsonSchemaUsable } from "../src/kinds/json_schema";
 import {
   at,
@@ -75,7 +75,9 @@ const TESTS = {
 
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
 const REFERENCE_NOT_ALLOWED =
-  'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry';
+  'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry (move the schema it points to into $defs)';
+const DYNAMIC_REFERENCE =
+  "criteria schema is not supported: $dynamicRef and $recursiveRef are not supported, use $ref";
 const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at the root";
 /** Text from someone's private answer, which no public reason may quote. */
 const SECRET = "secret-part-of-someone-elses-private-answer";
@@ -95,6 +97,20 @@ function putRaw(db: Db, kind: BlobKind, content: Uint8Array, uploader = POSTER):
     isPublic: kind !== "heldout",
   });
 }
+
+/** The re-review's probe 1 for `keyword`: `t` names the number schema in `$defs`. */
+const dynamicProbe = (keyword: string) => ({
+  $defs: { n: { type: "number" } },
+  properties: { x: { type: "integer" }, t: { [keyword]: "#/$defs/n" } },
+});
+
+/** The re-review's probe 2 for `keyword`: an array entry whose items name the whole schema. */
+const recursionProbe = (keyword: string) => ({
+  type: "object",
+  required: ["x"],
+  $defs: { e: { type: "array", items: { [keyword]: "#" } } },
+  properties: { x: { type: "integer" }, t: { $ref: "#/$defs/e" } },
+});
 
 /** A json_schema task with `schema`, and its held-out checks, stored. */
 async function jsonSchemaTask(
@@ -456,8 +472,21 @@ test("intake_rejects_each_rule", async () => {
     },
     {
       rule: "a $dynamicRef to an anchor",
-      reason: REFERENCE_NOT_ALLOWED,
+      reason: DYNAMIC_REFERENCE,
       view: () => jsonSchemaTask(db, { $dynamicRef: "#isPrototypeOf" }),
+    },
+    // P05-R11, the re-review's probe 1: Ajv checks `t` against the root, not against `n`, so
+    // `t: "text"` would score 100. And probe 2: inside a $defs entry, `$dynamicRef: "#"` recurses
+    // into the entry, not into the root.
+    ...["$dynamicRef", "$recursiveRef"].map((keyword) => ({
+      rule: `a ${keyword} to a $defs entry`,
+      reason: DYNAMIC_REFERENCE,
+      view: () => jsonSchemaTask(db, dynamicProbe(keyword)),
+    })),
+    {
+      rule: 'a $dynamicRef to "#" inside a $defs entry',
+      reason: DYNAMIC_REFERENCE,
+      view: () => jsonSchemaTask(db, recursionProbe("$dynamicRef")),
     },
     {
       rule: "a $ref to a member every array has",
@@ -591,6 +620,13 @@ test("intake_accepts_the_p0_kinds", async () => {
       },
       { json_schema: { assertions: [{ path: "$", equals: 46 }] } },
     ),
+    // The re-review's two probes with `$ref`, which goes where it says.
+    await jsonSchemaTask(db, dynamicProbe("$ref"), {
+      json_schema: { assertions: [{ path: "$", equals: 47 }] },
+    }),
+    await jsonSchemaTask(db, recursionProbe("$ref"), {
+      json_schema: { assertions: [{ path: "$", equals: 48 }] },
+    }),
     // What reads like a reference inside data is data: the values of const, enum, examples and
     // default are no schemas, whatever names they hold.
     await jsonSchemaTask(
@@ -617,6 +653,29 @@ test("intake_accepts_the_p0_kinds", async () => {
     expect(await intake(i + 1, view), `task ${i + 1}`).toBe("accepted");
     expect(await judgeRow(db, i + 1)).toEqual({ judge_status: "accepted", judge_reason: null });
   }
+});
+
+test("the_probe_shapes_with_ref_check_what_they_point_to", () => {
+  // What intake accepts in their place checks what it says. In probe 1 `t` must be a number; in
+  // probe 2 each item of `t` must be the whole schema: an object with an integer `x`.
+  const score = (schema: Record<string, unknown>, document: unknown) =>
+    scoreJsonSchema(
+      {
+        version: 1,
+        kind: "json_schema",
+        min_score: 100,
+        split: "winner_take_all",
+        has_heldout: true,
+        schema,
+      },
+      { assertions: [{ path: "$.x", equals: 1 }] },
+      bytes(JSON.stringify(document)),
+    ).score;
+
+  expect(score(dynamicProbe("$ref"), { x: 1, t: "text" })).toBe(0);
+  expect(score(dynamicProbe("$ref"), { x: 1, t: 2 })).toBe(100);
+  expect(score(recursionProbe("$ref"), { x: 1, t: [[]] })).toBe(0);
+  expect(score(recursionProbe("$ref"), { x: 1, t: [{ x: 2 }] })).toBe(100);
 });
 
 test("intake_pending_then_accepted_when_heldout_arrives", async () => {
