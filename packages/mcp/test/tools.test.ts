@@ -1,7 +1,23 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
+import {
+  chmod,
+  type FileHandle,
+  link,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { TenderError, type TxResult } from "@tender/client";
@@ -25,6 +41,13 @@ import {
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createMcpServer, type McpChain, type McpDeps } from "../src/server";
 import { createStateStore, type Draft, type StateStore } from "../src/state";
+
+// `open` and `stat` are wrapped, so that a test can change the disk between the server's look at a
+// path and its open of the file (the file tests). They do the real thing until a test says not to.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, open: vi.fn(actual.open), stat: vi.fn(actual.stat) };
+});
 
 // The tools are driven the way a client drives them: through the SDK's `Client`, over an in-memory
 // pair of transports, with a plain object for the chain and another for the API. The state store is
@@ -260,6 +283,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.mocked(open).mockReset();
+  vi.mocked(stat).mockReset();
   await Promise.all(closers.splice(0).map((close) => close()));
   await rm(root, { recursive: true, force: true });
 });
@@ -420,10 +445,15 @@ test("commit_result_says_where_files_come_from_and_that_a_commit_stays", async (
   const allowed = await describeCommit({ filesDir: files });
   expect(allowed.tool).toContain(files);
   expect(allowed.file).toContain(files);
+  // One answer for every file that cannot be read, and the reasons it covers (so that a file with a
+  // second name, which is inside and still refused, is no puzzle).
+  expect(allowed.tool).toMatch(/FILE_UNREADABLE/);
+  expect(allowed.tool).toMatch(/hard link/);
 
   const refused = await describeCommit({});
   expect(refused.tool).toMatch(/file_path is not available/);
   expect(refused.tool).not.toContain(files);
+  expect(refused.tool).not.toMatch(/FILE_UNREADABLE/);
   expect(refused.file).toMatch(/not available/);
 
   for (const { tool } of [allowed, refused]) {
@@ -1117,6 +1147,49 @@ async function makeFilesDir(): Promise<string> {
   return files;
 }
 
+/** The one answer to a file that cannot be read from the files directory, whatever the reason. */
+const UNREADABLE = "FILE_UNREADABLE: cannot read that file inside TENDER_FILES_DIR";
+
+/** The real `node:fs/promises`, for a stub to call through to. */
+const realFs = () => vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+
+/**
+ * Changes the disk around the next open of a file under `files`, as somebody with a hand in the
+ * directory could between the server's look at a path and its open of the file: `before` runs just
+ * ahead of the open, and `after` once the file is open, with its handle. Only that one open is
+ * touched; the state store opens files too.
+ */
+async function aroundTheOpen(
+  files: string,
+  hooks: { before?: () => Promise<void>; after?: (handle: FileHandle) => Promise<void> },
+): Promise<void> {
+  const actual = await realFs();
+  const under = `${await realpath(files)}${sep}`;
+  let spent = false;
+  vi.mocked(open).mockImplementation(async (path, flags, mode) => {
+    const ours = !spent && typeof path === "string" && path.startsWith(under);
+    if (ours) {
+      spent = true;
+      await hooks.before?.();
+    }
+    const handle = await actual.open(path, flags, mode);
+    if (ours) await hooks.after?.(handle);
+    return handle;
+  });
+}
+
+/** `folder` swapped for a link to `target`; the folder is kept beside it, as `folder-away`. */
+async function swapForLink(folder: string, target: string): Promise<void> {
+  await rename(folder, `${folder}-away`);
+  await symlink(target, folder, "dir");
+}
+
+/** The swap undone: the link is dropped and the folder is back. */
+async function swapBack(folder: string): Promise<void> {
+  await unlink(folder);
+  await rename(`${folder}-away`, folder);
+}
+
 /** A task whose brief lets a result have `maxBytes` bytes. */
 function detailAllowing(maxBytes: number): TaskDetailResponse {
   return {
@@ -1406,9 +1479,9 @@ test("commit_from_a_file_needs_a_readable_regular_file_at_an_absolute_path", asy
   expect((await call("commit_result", { task_id: "7", file_path: "~/answer.txt" })).text).toMatch(
     /^BAD_INPUT: file_path must be an absolute path/,
   );
+  // A file that is not there gets the one answer that every unreadable file gets: no errno.
   const missing = await call("commit_result", { task_id: "7", file_path: join(files, "gone.txt") });
-  expect(missing.isError).toBe(true);
-  expect(missing.text).toMatch(/^FILE_UNREADABLE: .*ENOENT/);
+  expect(missing).toEqual({ isError: true, text: UNREADABLE });
 
   expect(chain.commit).not.toHaveBeenCalled();
   expect(await state.getDraft("7")).toBeNull();
@@ -1475,18 +1548,12 @@ test("file_outside_the_files_dir_is_refused", async () => {
     ["the directory with a dot", `${files}/.`],
     ["the directory above it", `${files}/..`],
   ];
-  const texts = new Set<string>();
   for (const [why, path] of refused) {
     const answer = await call("commit_result", { task_id: "7", file_path: path });
-    expect(answer.isError, why).toBe(true);
-    expect(answer.text, why).toMatch(/^FILE_NOT_ALLOWED: file_path must be a file inside /);
-    expect(answer.text, why).toContain(files);
-    expect(answer.text, why).not.toContain("TOP SECRET");
-    texts.add(answer.text);
+    // One answer for all of them, the files that are there and the ones that are not, so that the
+    // tool is no way to find out what is on the disk (`no_refusal_says_whether_a_file_exists`).
+    expect(answer, why).toEqual({ isError: true, text: UNREADABLE });
   }
-  // Outside, a file that is there and one that is not get the same answer, so that the tool is no
-  // way to find out what is on the disk.
-  expect(texts.size).toBe(1);
 
   expect(chain.commit).not.toHaveBeenCalled();
   expect(chain.storageBalanceOf).not.toHaveBeenCalled();
@@ -1516,9 +1583,8 @@ test("the_files_dir_may_be_reached_by_another_path_to_the_same_place", async () 
     expect(answer, `${configured} ${named}`).toMatchObject({ content_hash: sha256Hex("alias") });
   }
 
-  // A file that is not there is said to be missing, by whichever name the directory has: it is
-  // inside, and only the outside is kept dark. (The directory's real name is the one that the
-  // alias leads to.)
+  // A file that is not there is refused like any other, by whichever name the directory has. (The
+  // directory's real name is the one that the alias leads to.)
   const real = await realpath(files);
   for (const [configured, named] of [
     [files, join(files, "gone.txt")],
@@ -1530,7 +1596,7 @@ test("the_files_dir_may_be_reached_by_another_path_to_the_same_place", async () 
   ] as const) {
     const { call } = await connectWrite({ filesDir: configured });
     const missing = await call("commit_result", { task_id: "8", file_path: named });
-    expect(missing.text, `${configured} ${named}`).toMatch(/^FILE_UNREADABLE: .*ENOENT/);
+    expect(missing, `${configured} ${named}`).toEqual({ isError: true, text: UNREADABLE });
   }
 
   // A link to a directory is a way in only for what it leads to: outside stays outside.
@@ -1541,7 +1607,7 @@ test("the_files_dir_may_be_reached_by_another_path_to_the_same_place", async () 
     task_id: "9",
     file_path: join(root, "elsewhere", "b.txt"),
   });
-  expect(out.text).toMatch(/^FILE_NOT_ALLOWED: /);
+  expect(out).toEqual({ isError: true, text: UNREADABLE });
 });
 
 test("a_files_dir_written_with_a_slash_or_as_the_root_still_holds_what_it_should", async () => {
@@ -1569,7 +1635,7 @@ test("a_files_dir_written_with_a_slash_or_as_the_root_still_holds_what_it_should
       task_id: "9",
       file_path: join(lookalike, "secret.txt"),
     });
-    expect(refused.text, configured).toMatch(/^FILE_NOT_ALLOWED: /);
+    expect(refused, configured).toEqual({ isError: true, text: UNREADABLE });
   }
 });
 
@@ -1630,6 +1696,313 @@ test("a_directory_or_a_fifo_is_not_a_file_to_commit", async () => {
   }
   expect(chain.commit).not.toHaveBeenCalled();
   expect(await state.getDraft("7")).toBeNull();
+});
+
+test("no_refusal_says_whether_a_file_exists", async () => {
+  // A link inside the directory that leads out would be a way to ask the disk about places outside
+  // it, if the answer differed for a file that is there and one that is not. So every file that
+  // cannot be read gets the one answer: no errno, and no word on which of them it was.
+  const files = await makeFilesDir();
+  const outside = join(root, "outside");
+  await mkdir(outside);
+  await writeFile(join(outside, "secret.txt"), "TOP SECRET");
+  await writeFile(join(files, "a.txt"), "inside");
+  await symlink(outside, join(files, "linkdir"), "dir");
+  await symlink(join(root, "nowhere"), join(files, "dangling"));
+  await symlink("loop", join(files, "loop"));
+  const locked = join(files, "locked");
+  await mkdir(locked);
+  await writeFile(join(locked, "x.txt"), "x");
+  const { call, chain } = await connectWrite({ filesDir: files });
+
+  const cases: Array<[why: string, path: string]> = [
+    ["inside, and not there", join(files, "gone.txt")],
+    ["in a folder that is not there", join(files, "nodir", "gone.txt")],
+    ["below a file", join(files, "a.txt", "below")],
+    ["a link that goes round in a circle", join(files, "loop")],
+    ["a link to nowhere", join(files, "dangling")],
+    ["not there, through a link that leads out", join(files, "linkdir", "gone.txt")],
+    ["there, through a link that leads out", join(files, "linkdir", "secret.txt")],
+    ["outside, and there", join(outside, "secret.txt")],
+    ["outside, and not there", join(outside, "gone.txt")],
+    ["a name with a NUL in it", `${files}/a.txt\0`],
+    ["a name that is too long", join(files, "x".repeat(5000))],
+  ];
+  // A folder that cannot be searched (root can search any, so there the case would prove nothing).
+  if (process.getuid?.() !== 0) {
+    cases.push(["in a folder that cannot be searched", join(locked, "x.txt")]);
+  }
+  try {
+    await chmod(locked, 0o000);
+    for (const [why, path] of cases) {
+      const answer = await call("commit_result", { task_id: "7", file_path: path });
+      expect(answer, why).toEqual({ isError: true, text: UNREADABLE });
+    }
+  } finally {
+    await chmod(locked, 0o700);
+  }
+
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+});
+
+test("a_folder_swapped_for_a_link_after_the_check_is_not_followed_out_of_the_directory", async () => {
+  // The path is checked and the file is opened a moment later, and in between somebody with a hand
+  // in the directory can swap a folder on the way for a link that leads out (O_NOFOLLOW guards only
+  // the last name). So the path is looked up again once the file is open: it must still lead
+  // somewhere inside the directory, and to the very file that was opened. And nothing is said of
+  // what was opened (a folder, a file that is too large) before that: the answer is the one answer.
+  const files = await makeFilesDir();
+  const places = join(root, "places");
+  const targets: Array<[what: string, place: string]> = [
+    ["a file with a secret in it", join(places, "secret")],
+    ["a folder where the file's name is", join(places, "folder")],
+    ["a file that is too large", join(places, "big")],
+  ];
+  for (const [, place] of targets) await mkdir(place, { recursive: true });
+  await writeFile(join(places, "secret", "a.txt"), "TOP SECRET");
+  await mkdir(join(places, "folder", "a.txt"));
+  await writeFile(join(places, "big", "a.txt"), Buffer.alloc(262_144 + 1, 7));
+  const { call, chain } = await connectWrite({ filesDir: files });
+
+  let taskId = 0;
+  for (const [what, place] of targets) {
+    for (const undone of [false, true]) {
+      taskId++;
+      const why = `${what}, ${undone ? "the swap undone as soon as the file is open" : "the swap stays"}`;
+      const folder = join(files, `folder${taskId}`);
+      await mkdir(folder);
+      await writeFile(join(folder, "a.txt"), "inside");
+      await aroundTheOpen(files, {
+        before: () => swapForLink(folder, place),
+        ...(undone && { after: () => swapBack(folder) }),
+      });
+
+      const answer = await call("commit_result", {
+        task_id: String(taskId),
+        file_path: join(folder, "a.txt"),
+      });
+
+      expect(answer, why).toEqual({ isError: true, text: UNREADABLE });
+      expect(await state.getDraft(String(taskId)), why).toBeNull();
+    }
+  }
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+});
+
+test("a_link_on_the_path_that_leads_out_by_the_second_look_is_refused", async () => {
+  // The path as it was given is what is looked up again, so a link on it that was pointed outside
+  // since the check is caught, although the file that was opened is the one the check passed.
+  const files = await makeFilesDir();
+  const outside = join(root, "outside");
+  await mkdir(outside);
+  await writeFile(join(outside, "a.txt"), "TOP SECRET");
+  await mkdir(join(files, "real"));
+  await writeFile(join(files, "real", "a.txt"), "inside");
+  const hop = join(files, "hop");
+  await symlink(join(files, "real"), hop, "dir");
+  const { call, callJson, chain } = await connectWrite({ filesDir: files });
+  await aroundTheOpen(files, {
+    before: async () => {
+      await unlink(hop);
+      await symlink(outside, hop, "dir");
+    },
+  });
+
+  const answer = await call("commit_result", { task_id: "7", file_path: join(hop, "a.txt") });
+
+  expect(answer).toEqual({ isError: true, text: UNREADABLE });
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+  // Left alone, the same kind of path is read (through a link that stays inside).
+  await unlink(hop);
+  await symlink(join(files, "real"), hop, "dir");
+  expect(
+    await callJson("commit_result", { task_id: "8", file_path: join(hop, "a.txt") }),
+  ).toMatchObject({
+    content_hash: sha256Hex("inside"),
+  });
+});
+
+test("a_name_swapped_for_a_link_after_the_check_is_not_opened_through_it", async () => {
+  // The last name is never followed, not even to a file that is inside the directory.
+  const files = await makeFilesDir();
+  const name = join(files, "a.txt");
+  await writeFile(name, "A");
+  await writeFile(join(files, "b.txt"), "B");
+  const { call, chain } = await connectWrite({ filesDir: files });
+  await aroundTheOpen(files, {
+    before: async () => {
+      await unlink(name);
+      await symlink(join(files, "b.txt"), name);
+    },
+  });
+
+  const answer = await call("commit_result", { task_id: "7", file_path: name });
+
+  expect(answer.isError).toBe(true);
+  expect(answer.text).toMatch(/^FILE_UNREADABLE: /);
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+});
+
+test("the_file_that_was_opened_must_be_the_one_the_path_leads_to_by_device_and_by_inode", async () => {
+  const files = await makeFilesDir();
+  await writeFile(join(files, "a.txt"), "inside");
+  const { call, callJson, chain } = await connectWrite({ filesDir: files });
+  const actual = await realFs();
+
+  // A second look that finds another device, or another inode, found another file: each number
+  // counts by itself.
+  const looks: Array<[why: string, change: (seen: BigIntStats) => Partial<BigIntStats>]> = [
+    ["another device", (seen) => ({ dev: seen.dev + 1n })],
+    ["another inode", (seen) => ({ ino: seen.ino + 1n })],
+  ];
+  let taskId = 0;
+  for (const [why, change] of looks) {
+    taskId++;
+    vi.mocked(stat).mockImplementationOnce(async (path, options) => {
+      const seen = await actual.stat(path, { ...options, bigint: true });
+      return Object.assign(seen, change(seen));
+    });
+
+    const answer = await call("commit_result", {
+      task_id: String(taskId),
+      file_path: join(files, "a.txt"),
+    });
+
+    expect(answer, why).toEqual({ isError: true, text: UNREADABLE });
+    expect(await state.getDraft(String(taskId)), why).toBeNull();
+  }
+  expect(chain.commit).not.toHaveBeenCalled();
+
+  // The same look, undisturbed, is the file's own, and the file is read.
+  expect(
+    await callJson("commit_result", { task_id: "9", file_path: join(files, "a.txt") }),
+  ).toMatchObject({
+    content_hash: sha256Hex("inside"),
+  });
+});
+
+test("inode_numbers_are_compared_whole", async () => {
+  // Some file systems number files beyond 2^53, which a JavaScript number cannot tell apart: two
+  // inodes one apart would look the same. Both looks ask for bigints, so that they are told apart.
+  const files = await makeFilesDir();
+  await writeFile(join(files, "a.txt"), "inside");
+  const { call, chain } = await connectWrite({ filesDir: files });
+  const actual = await realFs();
+  const big = 2n ** 60n;
+  type Look = Awaited<ReturnType<typeof stat>>;
+  /** What a look found, with the inode number changed to `ino` (a number, if no bigint was asked). */
+  const withIno = async (look: Promise<Look>, ino: bigint, whole: boolean): Promise<Look> =>
+    Object.assign(await look, { ino: whole ? ino : Number(ino) });
+
+  await aroundTheOpen(files, {
+    after: async (handle) => {
+      const handleStat = handle.stat.bind(handle) as unknown as (options?: {
+        bigint?: boolean;
+      }) => Promise<Look>;
+      handle.stat = ((options?: { bigint?: boolean }) =>
+        withIno(handleStat(options), big, options?.bigint === true)) as typeof handle.stat;
+    },
+  });
+  vi.mocked(stat).mockImplementationOnce((path, options) =>
+    withIno(actual.stat(path, options), big + 1n, options?.bigint === true),
+  );
+
+  const answer = await call("commit_result", { task_id: "7", file_path: join(files, "a.txt") });
+
+  expect(answer).toEqual({ isError: true, text: UNREADABLE });
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+});
+
+test("a_file_with_another_hard_link_is_refused_as_if_it_were_outside", async () => {
+  // A hard link is a second name for the same bytes. A name inside the directory for a file that is
+  // also named outside it is a way out that no look at a path can see, so a file with another name
+  // is refused, wherever the other name is.
+  const files = await makeFilesDir();
+  const outside = join(root, "outside");
+  await mkdir(outside);
+  await writeFile(join(outside, "secret.txt"), "TOP SECRET");
+  await link(join(outside, "secret.txt"), join(files, "hard.txt"));
+  await writeFile(join(files, "a.txt"), "inside");
+  await link(join(files, "a.txt"), join(files, "b.txt"));
+  await writeFile(join(files, "c.txt"), "inside");
+  // Nothing is said of how big such a file is, either.
+  await writeFile(join(outside, "big.bin"), Buffer.alloc(262_144 + 1, 7));
+  await link(join(outside, "big.bin"), join(files, "big-link.bin"));
+  const { call, callJson } = await connectWrite({ filesDir: files });
+
+  for (const name of ["hard.txt", "a.txt", "b.txt", "big-link.bin"]) {
+    const answer = await call("commit_result", { task_id: "7", file_path: join(files, name) });
+    expect(answer, name).toEqual({ isError: true, text: UNREADABLE });
+  }
+
+  // Nothing is said about what such a file is: one that is no regular file (a pipe, say) and has
+  // another name is refused the same way. (The handle is made to say so, since a pipe cannot be
+  // linked from outside on every system.)
+  await aroundTheOpen(files, {
+    after: async (handle) => {
+      const handleStat = handle.stat.bind(handle) as unknown as (options?: {
+        bigint?: boolean;
+      }) => Promise<BigIntStats>;
+      handle.stat = (async (options?: { bigint?: boolean }) =>
+        Object.assign(await handleStat(options), {
+          nlink: 2n,
+          isFile: () => false,
+        })) as typeof handle.stat;
+    },
+  });
+  const odd = await call("commit_result", { task_id: "7", file_path: join(files, "c.txt") });
+  expect(odd).toEqual({ isError: true, text: UNREADABLE });
+  expect(await state.getDraft("7")).toBeNull();
+
+  // Once the other name is gone the file has one name, and that one is inside.
+  await unlink(join(outside, "secret.txt"));
+  await unlink(join(files, "b.txt"));
+  expect(
+    await callJson("commit_result", { task_id: "7", file_path: join(files, "hard.txt") }),
+  ).toMatchObject({
+    content_hash: sha256Hex("TOP SECRET"),
+  });
+  expect(
+    await callJson("commit_result", { task_id: "8", file_path: join(files, "a.txt") }),
+  ).toMatchObject({
+    content_hash: sha256Hex("inside"),
+  });
+});
+
+test("a_file_that_is_gone_by_the_second_look_gets_the_one_answer", async () => {
+  const files = await makeFilesDir();
+  const file = join(files, "a.txt");
+  await writeFile(file, "inside");
+  const { call, chain } = await connectWrite({ filesDir: files });
+
+  // The name is gone once the file is open, so the path cannot be looked up again.
+  await aroundTheOpen(files, { after: () => unlink(file) });
+  expect(await call("commit_result", { task_id: "7", file_path: file })).toEqual({
+    isError: true,
+    text: UNREADABLE,
+  });
+
+  // The path leads to the file, and the name is gone by the time that is looked at.
+  await writeFile(file, "inside");
+  vi.mocked(stat).mockRejectedValueOnce(
+    Object.assign(new Error(`ENOENT: no such file or directory, stat '${file}'`), {
+      code: "ENOENT",
+    }),
+  );
+  expect(await call("commit_result", { task_id: "8", file_path: file })).toEqual({
+    isError: true,
+    text: UNREADABLE,
+  });
+
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+  expect(await state.getDraft("8")).toBeNull();
 });
 
 test("commit_checks_storage_buffer", async () => {

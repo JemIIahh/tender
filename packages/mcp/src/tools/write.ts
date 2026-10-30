@@ -1,5 +1,5 @@
 import { constants as fsConstants } from "node:fs";
-import { type FileHandle, open, realpath } from "node:fs/promises";
+import { type FileHandle, open, realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -176,12 +176,45 @@ function isInside(dir: string, path: string): boolean {
 }
 
 /**
+ * The one answer to a file that cannot be read from the directory, whatever the reason: missing,
+ * outside, a link that leads out, or a file with another name. A reason would say what is on the disk
+ * beyond the directory, to anyone who can put a link inside it that leads out.
+ */
+function unreadable(): ToolError {
+  return new ToolError("FILE_UNREADABLE", "cannot read that file inside TENDER_FILES_DIR");
+}
+
+/**
+ * Where `path` leads (a real path), if that is a place under `directory` (a real path as well). A
+ * path that leads nowhere and one that leads out get the same answer, `unreadable()`.
+ */
+async function realInside(path: string, directory: string): Promise<string> {
+  let real: string;
+  try {
+    real = await realpath(path);
+  } catch {
+    throw unreadable();
+  }
+  if (!isInside(directory, real)) throw unreadable();
+  return real;
+}
+
+/**
  * The bytes of the file at `path`, at most `limit` of them, if it is a regular file inside
  * `filesDir` (P04-R1). Where a path leads is what counts, and not how it is written: `realpath`
  * follows every link and every `..`, and the file's real path must lie under the directory's real
  * path, so that no link, `..` or other name for the same place gets a file out of the directory.
- * A path outside is turned away with the same answer whether or not anything is there, so that the
- * tool is no way to look around the disk.
+ *
+ * Two gaps are closed after that. The path is looked up and the file opened a moment later, and a
+ * folder on the way could be swapped for a link in between; so once the file is open, the path is
+ * looked up again, and must still lead inside, to the very file that is open (the same device and
+ * inode). And a hard link inside the directory to a file outside it leads nowhere that a path shows,
+ * so a file with more than one name counts as outside.
+ *
+ * A path that leads nowhere, out, or to a file that fails either check gets `unreadable()` and
+ * nothing more, and nothing is said about a file (what it is, how big) until it has passed both. (A
+ * file that passes may still fail to open or to be read, and says why. The directory is the user's
+ * to get right, and its own faults are named.)
  */
 async function readLocalFile(
   path: string,
@@ -196,10 +229,6 @@ async function readLocalFile(
     );
   }
   if (!isAbsolute(path)) throw new ToolError("BAD_INPUT", "file_path must be an absolute path");
-  const notAllowed = new ToolError(
-    "FILE_NOT_ALLOWED",
-    `file_path must be a file inside ${filesDir}`,
-  );
   let directory: string;
   try {
     directory = await realpath(filesDir);
@@ -209,20 +238,12 @@ async function readLocalFile(
       `the directory that files are read from (${filesDir}) cannot be used: ${errorText(error)}`,
     );
   }
-  let real: string;
-  try {
-    real = await realpath(path);
-  } catch (error) {
-    // Outside the directory, the reason is not told: it would say what exists there.
-    if (!isInside(directory, path) && !isInside(filesDir, path)) throw notAllowed;
-    throw new ToolError("FILE_UNREADABLE", errorText(error));
-  }
-  if (!isInside(directory, real)) throw notAllowed;
+  const real = await realInside(path, directory);
 
   let handle: FileHandle;
   try {
     // Non-blocking, so that opening a named pipe cannot hang until somebody writes to it, and never
-    // through a link, so that a path swapped for one since the check is not followed.
+    // through a link, so that a name swapped for one since the check is not followed.
     handle = await open(
       real,
       fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
@@ -231,9 +252,21 @@ async function readLocalFile(
     throw new ToolError("FILE_UNREADABLE", errorText(error));
   }
   try {
-    const stats = await handle.stat();
+    // Whole numbers (bigint), so that inodes beyond 2^53 are told apart too.
+    const stats = await handle.stat({ bigint: true });
+    // Is the file that is open the one the path leads to now, and is that inside still?
+    const again = await realInside(path, directory);
+    let there: { dev: bigint; ino: bigint };
+    try {
+      there = await stat(again, { bigint: true });
+    } catch {
+      throw unreadable();
+    }
+    if (there.dev !== stats.dev || there.ino !== stats.ino) throw unreadable();
+    // Another name for the file may be outside. (A folder's link count does not count names.)
+    if (stats.nlink > 1n && !stats.isDirectory()) throw unreadable();
     if (!stats.isFile()) throw new ToolError("BAD_INPUT", "file_path is not a regular file");
-    if (stats.size > limit) throw tooLarge(stats.size, limit);
+    if (stats.size > BigInt(limit)) throw tooLarge(Number(stats.size), limit);
     // One byte more than the limit, so that a file that grew since the `stat` is still caught.
     const buffer = Buffer.alloc(limit + 1);
     let total = 0;
@@ -598,6 +631,14 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       : "Give exactly one of content (the text) and file_path (an absolute path to a file inside " +
         `${filesDir}, the only place this server reads files from; its bytes are what you commit ` +
         "and what reveal_result will publish)";
+  // One answer for all of them, and so the reasons are listed here: a file that is inside and still
+  // refused (it has a second hard link) would otherwise be a puzzle.
+  const fileRefusal =
+    filesDir === undefined
+      ? ""
+      : "A file that cannot be read from there (it is missing, or outside, or reached by a link that " +
+        "leads out, or it has a second hard link) is refused with FILE_UNREADABLE, and the answer " +
+        "does not say which. ";
 
   server.registerTool(
     "commit_result",
@@ -607,9 +648,10 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "Commit to your result for a task while it is open. Only a hash goes on chain; the work " +
         "stays secret until you call reveal_result after the commit window closes (reveal_opens_at). " +
         `${resultSource}, at most ${MAX_RESULT} bytes and no more than the task allows ` +
-        "(output.max_bytes in its brief; TOO_LARGE if it is more, before anything is sent). A task " +
-        "that the API does not know is refused with NO_TASK, before anything is made or spent (one " +
-        "posted a moment ago may need a few seconds to appear). A result that holds this " +
+        "(output.max_bytes in its brief; TOO_LARGE if it is more, before anything is sent). " +
+        fileRefusal +
+        "A task that the API does not know is refused with NO_TASK, before anything is made or " +
+        "spent (one posted a moment ago may need a few seconds to appear). A result that holds this " +
         "server's private key, or another secret it was given, is refused with SECRET_IN_CONTENT, " +
         "since reveal_result publishes the work. The work and a random salt are saved in a draft " +
         "on this machine BEFORE the transaction is sent, so a crash loses nothing. If a call " +
