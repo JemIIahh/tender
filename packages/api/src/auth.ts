@@ -25,6 +25,10 @@ import type { RequireAuth } from "./routes/blobs";
 // A token also lasts only as long as the key that signed in: `requireAuth` asks the chain again
 // whether that key is still on the account and may still sign in, so a key that is removed takes
 // its tokens with it, within a minute, and not at the end of their 12 hours.
+//
+// Each question to the chain has 5 seconds. A chain that does not answer in time is a 503 for the
+// caller to try again later, at sign-in and at the check of a token alike, and not a request that
+// waits for the RPC client to give up on its own, which takes minutes.
 
 /** What the wallet signs, and for whom. The wallet shows both to its user before it signs. */
 const SIGN_IN_MESSAGE = "Sign in to Tender";
@@ -103,11 +107,70 @@ export async function createChallenge(deps: ApiDeps): Promise<ChallengeResponse>
   return { nonce, message: SIGN_IN_MESSAGE, recipient: SIGN_IN_RECIPIENT, expires_at: expiresAt };
 }
 
+// ---- Asking the chain -------------------------------------------------------------------------
+
+/**
+ * How long the chain has to say whether a key is on an account, in milliseconds. The RPC client
+ * retries a node that does not answer for minutes, and nobody should wait that long to be told to
+ * come back later.
+ */
+const KEY_LOOKUP_DEADLINE_MS = 5_000;
+
+/** The chain did not say within `KEY_LOOKUP_DEADLINE_MS`. */
+class KeyLookupTimeout extends Error {
+  constructor() {
+    super(`the chain did not say within ${KEY_LOOKUP_DEADLINE_MS} ms whether the key is there`);
+    this.name = "KeyLookupTimeout";
+  }
+}
+
+/**
+ * `deps.client.viewAccessKey`, with `KEY_LOOKUP_DEADLINE_MS` to answer, after which this rejects
+ * with a `KeyLookupTimeout`. The call itself cannot be cancelled: one that is given up on settles
+ * on its own, and what it says then is dropped. The race subscribes to it, so a failure after the
+ * deadline is not an unhandled rejection. The timer is cleared however the question ends.
+ */
+async function lookUpKey(
+  deps: ApiDeps,
+  account: string,
+  publicKey: string,
+): Promise<{ permission: KeyPermission } | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      // Called as a method, because a `TenderClient` reads its own fields.
+      deps.client.viewAccessKey(account, publicKey),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new KeyLookupTimeout()), KEY_LOOKUP_DEADLINE_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The answer to a request that needs the chain to say something about a key, and it cannot. */
+function unavailable(): never {
+  return fail(503, "unavailable", "cannot check your key right now");
+}
+
+/**
+ * What a sign-in does with the failure of its lookup: a chain that did not answer in time is a
+ * 503, and as nothing was spent the challenge is still good. Any other failure goes on as it is.
+ */
+function unavailableIfNoAnswer(error: unknown): never {
+  if (!(error instanceof KeyLookupTimeout)) throw error;
+  console.error("api: cannot check the key of a sign-in:", error);
+  return unavailable();
+}
+
 // ---- Sign-in ----------------------------------------------------------------------------------
 
 /**
  * Trades a signed challenge for a token, or throws the `AuthError` that says why not. Any other
- * error is not the caller's: the chain could not be read, or the database failed.
+ * error is not the caller's: the chain could not be read, or the database failed. A chain that
+ * gives no answer in 5 seconds is thrown as the 503 (`unavailable`) that tells the caller to try
+ * again.
  *
  * `verifyNep413` does not look at `message`, so it is held to the one the challenge carries here.
  * The challenge has to be live before the key is looked up, because that lookup is a call to the
@@ -130,12 +193,11 @@ export async function signIn(deps: ApiDeps, request: SignInRequest): Promise<Sig
       recipient: request.recipient,
     },
     {
-      // Called as a method, because a `TenderClient` reads its own fields.
-      viewAccessKey: (account, key) => deps.client.viewAccessKey(account, key),
+      viewAccessKey: (account, key) => lookUpKey(deps, account, key),
       contractId: deps.contractId,
       expectedRecipient: SIGN_IN_RECIPIENT,
     },
-  );
+  ).catch(unavailableIfNoAnswer);
 
   const issued = await issueToken(deps, request.nonce, proved);
   if (issued === null) throw new AuthError("bad_nonce");
@@ -226,7 +288,7 @@ type KeyCheck =
   | { status: "qualifies"; keyKind: KeyKind }
   // The key is gone, or is no longer one that may sign in.
   | { status: "revoked" }
-  // The chain could not say.
+  // The chain could not say: it failed, or did not answer in time.
   | { status: "unavailable" };
 
 /**
@@ -236,7 +298,8 @@ type KeyCheck =
  * `deps`, and requests that come while the chain is being asked share that one question. A key
  * that is removed therefore stops signing in within a minute of its removal, since the last good
  * answer was given before it. An answer that is not good is not kept: a token whose key is gone
- * is deleted, and a chain that cannot answer is asked again by the next request.
+ * is deleted, and a chain that cannot answer, because it failed or because it gave no answer in
+ * time, is asked again by the next request.
  */
 function keyChecker(deps: ApiDeps) {
   // Good answers by token hash, the oldest first: a token that is checked again moves to the end,
@@ -253,7 +316,7 @@ function keyChecker(deps: ApiDeps) {
   ): Promise<KeyCheck> {
     let found: { permission: KeyPermission } | null;
     try {
-      found = await deps.client.viewAccessKey(account, publicKey);
+      found = await lookUpKey(deps, account, publicKey);
     } catch (error) {
       console.error("api: cannot check the key of a signed-in token:", error);
       return { status: "unavailable" };
@@ -300,10 +363,11 @@ function unauthorized(c: Context): Response {
  *
  * A token lives only as long as its key. The key is asked about again, at most once a minute per
  * token (`keyChecker`). When it is gone, or no longer qualifies, the token is deleted and the
- * request is refused as above. When the chain cannot say, the request gets a 503 and the token is
- * kept: a token that cannot be checked does not pass, and is not held against its key either. The
- * kind a route sees is the lower of the one the token was issued for and the one the key has now,
- * so a token never gains from a key that is changed, and loses with it.
+ * request is refused as above. When the chain cannot say, because it failed or did not answer in
+ * 5 seconds, the request gets a 503 and the token is kept: a token that cannot be checked does not
+ * pass, and is not held against its key either. The kind a route sees is the lower of the one the
+ * token was issued for and the one the key has now, so a token never gains from a key that is
+ * changed, and loses with it.
  */
 export function requireAuth(deps: ApiDeps): RequireAuth {
   const checkKey = keyChecker(deps);
@@ -323,9 +387,7 @@ export function requireAuth(deps: ApiDeps): RequireAuth {
     if (hash === undefined || !row || !isKeyKind(row.key_kind)) return unauthorized(c);
 
     const check = await checkKey(hash, row.account, row.public_key, now);
-    if (check.status === "unavailable") {
-      return fail(503, "unavailable", "cannot check your key right now");
-    }
+    if (check.status === "unavailable") return unavailable();
     if (check.status === "revoked") {
       await deps.db.query("delete from auth_tokens where token_sha256 = $1", [hash]);
       return unauthorized(c);

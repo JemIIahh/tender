@@ -64,6 +64,8 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  // A test that fails halfway leaves its fake timers and its spies behind.
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -233,29 +235,109 @@ function whoamiAt(app: Hono<{ Variables: AuthVariables }>, token: string, at: bi
 
 /**
  * A chain that changes under a running API. Every key on it has `permission` (null: no key), it
- * records each lookup, and `failing` makes the lookups throw.
+ * records each lookup, `failing` makes the lookups throw, and `hanging` makes them wait for
+ * `settle`, which a test calls when it wants the lookup to end: after the API gave up on it, or
+ * just before.
  */
 interface LiveChain {
   permission: KeyPermission | null;
   failing: boolean;
+  hanging: boolean;
   lookups: Array<[string, string]>;
+  /** Resolves when the chain is next asked about a key. */
+  asked(): Promise<void>;
+  /** Lets the lookups that wait go on: as they would have answered, or failing with `failure`. */
+  settle(failure?: Error): void;
   client: ChainReader;
 }
 
 function liveChain(permission: KeyPermission | null = "FullAccess"): LiveChain {
+  const askers: Array<() => void> = [];
+  const waiting: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
   const chain: LiveChain = {
     permission,
     failing: false,
+    hanging: false,
     lookups: [],
+    asked: () =>
+      new Promise((resolve) => {
+        askers.push(resolve);
+      }),
+    settle: (failure) => {
+      for (const lookup of waiting.splice(0)) {
+        if (failure === undefined) lookup.resolve();
+        else lookup.reject(failure);
+      }
+    },
     client: fakeClient({
       viewAccessKey: async (account, key) => {
         chain.lookups.push([account, key]);
+        for (const resolve of askers.splice(0)) resolve();
+        if (chain.hanging) {
+          await new Promise<void>((resolve, reject) => {
+            waiting.push({ resolve, reject });
+          });
+        }
         if (chain.failing) throw new Error("rpc down at https://marker-rpc.example/?key=secret");
         return chain.permission === null ? null : { permission: chain.permission };
       },
     }),
   };
   return chain;
+}
+
+/** What a request gets when the chain cannot say whether the key is there. */
+const UNAVAILABLE: ErrorBody = {
+  error: "unavailable",
+  message: "cannot check your key right now",
+};
+
+/**
+ * Sends `request` to an API whose chain hangs, and lets the 5 seconds it is given go by: the chain
+ * is asked, with one timer running on the question; 1 ms before the bound the request is still
+ * waiting, and at the bound it is answered. Only `setTimeout` and `clearTimeout` are faked, so the
+ * clock of the API and the database go on as they were. The timers are real again when this
+ * returns.
+ */
+async function waitOutTheDeadline<T>(chain: LiveChain, request: () => T | Promise<T>): Promise<T> {
+  chain.hanging = true;
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const reached = chain.asked();
+  let answered = false;
+  const pending = Promise.resolve(request()).then((reply) => {
+    answered = true;
+    return reply;
+  });
+  await reached;
+  expect(vi.getTimerCount()).toBe(1);
+
+  await vi.advanceTimersByTimeAsync(4_999);
+  expect(answered).toBe(false);
+  await vi.advanceTimersByTimeAsync(1);
+  const reply = await pending;
+  expect(vi.getTimerCount()).toBe(0);
+  vi.useRealTimers();
+  return reply;
+}
+
+/**
+ * Ends the lookups that waited, by failing them now that nobody waits for them, and says which
+ * rejections Node found that nothing handles. It reports those once the microtasks after the
+ * failure have run, so this waits a turn of the event loop.
+ */
+async function unhandledAfterLateFailure(chain: LiveChain): Promise<unknown[]> {
+  const unhandled: unknown[] = [];
+  const note = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", note);
+  try {
+    chain.settle(new Error("the chain failed, late"));
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off("unhandledRejection", note);
+  }
+  return unhandled;
 }
 
 // ---- Sign-in ----------------------------------------------------------------------------------
@@ -840,7 +922,7 @@ test("an_rpc_failure_is_a_503_and_not_a_pass", async () => {
   chain.failing = true;
   const failed = await post<ErrorBody>(app, "/v1/blobs", upload, bearer(token));
   expect(failed.status).toBe(503);
-  expect(failed.body).toEqual({ error: "unavailable", message: "cannot check your key right now" });
+  expect(failed.body).toEqual(UNAVAILABLE);
   expect(failed.headers.get("www-authenticate")).toBeNull();
   expect(JSON.stringify(failed.body)).not.toContain("marker-rpc");
   expect(log).toHaveBeenCalled();
@@ -905,6 +987,97 @@ test("a_token_never_carries_more_than_its_key_has_or_had", async () => {
     if (expected === null) expect(reply.status, name).toBe(401);
     else expect(await reply.json(), name).toEqual({ account: alice, key_kind: expected });
   }
+});
+
+// ---- A chain that does not answer -------------------------------------------------------------
+
+test("a_key_check_that_gets_no_answer_in_5s_is_a_503", async () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const chain = liveChain();
+  const { token } = await signIn(appWith({ client: chain.client }));
+  const app = probe({ client: chain.client });
+  chain.lookups.length = 0;
+
+  // The first request on a token asks the chain, which never says. It is refused as it is when
+  // the chain fails: not served, and not a 401, since nothing is wrong with the token.
+  const refused = await waitOutTheDeadline(chain, () => whoami(app, `Bearer ${token}`));
+  expect(refused.status).toBe(503);
+  expect(await refused.json()).toEqual(UNAVAILABLE);
+  expect(refused.headers.get("www-authenticate")).toBeNull();
+  expect(chain.lookups).toHaveLength(1);
+  expect(log).toHaveBeenCalled();
+
+  // The lookup that was given up on ends on its own, and a failure then is nobody's to handle.
+  expect(await unhandledAfterLateFailure(chain)).toEqual([]);
+
+  // The token is not held against its key for the chain's fault. The give-up is not kept either:
+  // the next request asks the chain again, and has its answer.
+  expect(await tokenRows()).toHaveLength(1);
+  chain.hanging = false;
+  expect((await whoamiAt(app, token, TEST_NOW)).status).toBe(200);
+  expect(chain.lookups).toHaveLength(2);
+});
+
+test("a_sign_in_that_gets_no_key_answer_in_5s_is_a_503_and_keeps_its_challenge", async () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const chain = liveChain();
+  const app = appWith({ client: chain.client });
+  const ch = await challenge(app);
+  const body = await signChallenge(KeyPair.fromRandom("ed25519"), ch);
+
+  const refused = await waitOutTheDeadline(chain, () =>
+    post<ErrorBody>(app, "/v1/auth/verify", body),
+  );
+  expect(refused.status).toBe(503);
+  expect(refused.body).toEqual(UNAVAILABLE);
+  expect(refused.headers.get("www-authenticate")).toBeNull();
+  expect(chain.lookups).toHaveLength(1);
+  expect(log).toHaveBeenCalled();
+
+  // Nothing was spent or stored. The lookup that was given up on ends on its own, as above.
+  expect(await tokenRows()).toEqual([]);
+  expect((await challengeRows()).map((row) => row.used)).toEqual([false]);
+  expect(await unhandledAfterLateFailure(chain)).toEqual([]);
+
+  // The very same sign-in works once the chain answers.
+  chain.hanging = false;
+  const retried = await post<SignInResponse>(app, "/v1/auth/verify", body);
+  expect(retried.status).toBe(200);
+  expect(await tokenRows()).toHaveLength(1);
+});
+
+test("a_lookup_inside_the_deadline_is_used_and_leaves_no_timer_behind", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const chain = liveChain();
+  const app = appWith({ client: chain.client });
+  const checked = probe({ client: chain.client });
+  const body = await signChallenge(KeyPair.fromRandom("ed25519"), await challenge(app));
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+  // A chain that takes 4,999 ms is slow, not down: its answer is used, by the sign-in and by the
+  // check of the token, and the bound on the question is gone with it.
+  const slowly = async <T>(request: () => T | Promise<T>): Promise<T> => {
+    chain.hanging = true;
+    const reached = chain.asked();
+    const pending = request();
+    await reached;
+    await vi.advanceTimersByTimeAsync(4_999);
+    chain.settle();
+    return await pending;
+  };
+  const signed = await slowly(() => post<SignInResponse>(app, "/v1/auth/verify", body));
+  expect(signed.status).toBe(200);
+  expect(vi.getTimerCount()).toBe(0);
+  const who = await slowly(() => whoami(checked, `Bearer ${signed.body.token}`));
+  expect(who.status).toBe(200);
+  expect(vi.getTimerCount()).toBe(0);
+
+  // A chain that fails at once leaves no timer either.
+  chain.hanging = false;
+  chain.failing = true;
+  nowNs = TEST_NOW + MINUTE;
+  expect((await whoami(checked, `Bearer ${signed.body.token}`)).status).toBe(503);
+  expect(vi.getTimerCount()).toBe(0);
 });
 
 // ---- Housekeeping -----------------------------------------------------------------------------
