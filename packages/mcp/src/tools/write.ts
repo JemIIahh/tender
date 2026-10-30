@@ -513,7 +513,10 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
   /**
    * What the task allows a result to have: the `output.max_bytes` of its brief, which the API
    * serves and the contract does not know. When the API cannot say, the answer is why, and the
-   * commit goes on, as it did before the limit was checked: a commit does not hang on an API.
+   * commit goes on, as it did before the limit was checked: a commit does not hang on an API. When
+   * it answers that there is no such task, the commit stops (`NO_TASK`): the contract would refuse
+   * it with E_NOT_FOUND, and that retires the draft for good, so a mistyped id would leave a draft
+   * that blocks the id if a task is posted under it later.
    */
   async function taskLimit(taskId: string): Promise<{ max: number } | { unknown: string }> {
     let detail: Awaited<ReturnType<typeof api.getTask>>;
@@ -522,14 +525,16 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     } catch {
       return { unknown: "the API did not answer" };
     }
-    const max = detail?.brief?.output.max_bytes;
+    if (detail === null) throw new ToolError("NO_TASK", `no task ${taskId}`);
+    const max = detail.brief?.output.max_bytes;
     return max === undefined ? { unknown: "the API has no brief for this task yet" } : { max };
   }
 
   /** A first commit for a task: the task's limit, the storage, then the draft, then the commit. */
   async function commitNew(taskId: string, bytes: Uint8Array): Promise<CallToolResult> {
-    // The limit comes before anything is spent: work that its task will not take can be committed
-    // and never revealed, and the storage top-up below would be paid for nothing.
+    // The task comes before anything is made or spent: work that its task will not take can be
+    // committed and never revealed, a task that is not there leaves a draft that blocks its id, and
+    // the storage top-up below would be paid for nothing.
     const allowed = await taskLimit(taskId);
     if ("max" in allowed && bytes.length > allowed.max) {
       throw new ToolError("TOO_LARGE", `the task allows at most ${allowed.max} bytes`);
@@ -602,13 +607,15 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "Commit to your result for a task while it is open. Only a hash goes on chain; the work " +
         "stays secret until you call reveal_result after the commit window closes (reveal_opens_at). " +
         `${resultSource}, at most ${MAX_RESULT} bytes and no more than the task allows ` +
-        "(output.max_bytes in its brief; TOO_LARGE if it is more, before anything is sent). A " +
-        "result that holds this server's private key, or another secret it was given, is refused " +
-        "with SECRET_IN_CONTENT, since reveal_result publishes the work. The work and a random " +
-        "salt are saved in a draft on this machine BEFORE the transaction is sent, so a crash " +
-        "loses nothing. If a call fails or the server stops, call commit_result " +
-        "again with the same content: it finds out whether the commit landed and finishes it with " +
-        "the same salt, and sends nothing if it is done. Once committed, an answer cannot be " +
+        "(output.max_bytes in its brief; TOO_LARGE if it is more, before anything is sent). A task " +
+        "that the API does not know is refused with NO_TASK, before anything is made or spent (one " +
+        "posted a moment ago may need a few seconds to appear). A result that holds this " +
+        "server's private key, or another secret it was given, is refused with SECRET_IN_CONTENT, " +
+        "since reveal_result publishes the work. The work and a random salt are saved in a draft " +
+        "on this machine BEFORE the transaction is sent, so a crash loses nothing. If a call " +
+        "fails or the server stops, call commit_result again with the same content: it finds out " +
+        "whether the commit landed and finishes it with the same salt, and sends nothing if it " +
+        "is done. Once committed, an answer cannot be " +
         "changed through this server: a task takes one result here, and a call with other content " +
         "is refused with ALREADY_COMMITTED. A key that cannot attach a deposit refuses with " +
         "STORAGE_LOW when your storage in the contract is low; a full-access key tops it up " +

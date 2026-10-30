@@ -434,6 +434,8 @@ test("commit_result_says_where_files_come_from_and_that_a_commit_stays", async (
     expect(tool).toMatch(/output\.max_bytes/);
     // The result is published by the reveal, so it may not hold the server's own secrets.
     expect(tool).toMatch(/SECRET_IN_CONTENT/);
+    // A task that the API does not know is refused, and a task posted a moment ago may be unknown.
+    expect(tool).toMatch(/NO_TASK/);
   }
 });
 
@@ -1319,6 +1321,44 @@ test("commit_reads_the_task_limit_before_it_spends_on_storage", async () => {
   expect(lookedUp ?? Number.MAX_SAFE_INTEGER).toBeLessThan(toppedUp ?? 0);
 });
 
+test("commit_to_a_task_the_api_does_not_know_is_refused_before_anything_is_made_or_spent", async () => {
+  // A typo'd id must leave nothing behind: a commit that the contract refuses (E_NOT_FOUND) retires
+  // its draft for good, and a retired draft blocks that id even if a task is posted under it later.
+  const { call, callJson, chain, api } = await connectWrite({ keyKind: "full_access" });
+  chain.storageBalanceOf.mockResolvedValue(null);
+  api.getTask.mockResolvedValue(null);
+
+  expect(await call("commit_result", { task_id: "7", content: "a" })).toEqual({
+    isError: true,
+    text: "NO_TASK: no task 7",
+  });
+
+  expect(api.getTask).toHaveBeenCalledWith(7n);
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+
+  // The id is free: once the API knows the task, the same call goes through.
+  api.getTask.mockResolvedValue(makeDetail([]));
+  expect(await callJson("commit_result", { task_id: "7", content: "a" })).toMatchObject({
+    tx_hash: "TX_COMMIT",
+  });
+
+  // A file is refused the same way, with the file read first (its own faults come first).
+  const files = await makeFilesDir();
+  await writeFile(join(files, "answer.txt"), "from a file");
+  const withFiles = await connectWrite({ filesDir: files });
+  withFiles.api.getTask.mockResolvedValue(null);
+  expect(
+    await withFiles.call("commit_result", { task_id: "8", file_path: join(files, "answer.txt") }),
+  ).toEqual({ isError: true, text: "NO_TASK: no task 8" });
+  expect(await state.getDraft("8")).toBeNull();
+
+  // A task that is there but has no brief yet, or an API that does not answer, is another matter:
+  // the commit goes on with a note (the next test).
+});
+
 test("a_task_limit_the_api_cannot_give_is_noted_and_does_not_stop_the_commit", async () => {
   // The brief is the API's to give. When it cannot, the commit goes on as it did before the limit
   // was checked, and the answer says what was not checked, in words that carry nothing the API said.
@@ -1328,11 +1368,6 @@ test("a_task_limit_the_api_cannot_give_is_noted_and_does_not_stop_the_commit", a
       "the API does not answer",
       (api) => api.getTask.mockRejectedValue(new Error(leak)),
       /size limit could not be checked \(the API did not answer\)/,
-    ],
-    [
-      "the API does not know the task",
-      (api) => api.getTask.mockResolvedValue(null),
-      /size limit could not be checked \(the API has no brief for this task yet\)/,
     ],
     [
       "the API has no brief yet",
