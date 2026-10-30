@@ -1,0 +1,30 @@
+import type { Heldout, PublicCriteria } from "@tender/shared";
+import type { EntryScore } from "../types";
+
+/**
+ * The held-out part of the criteria of kind `K`. `Heldout` is a union, so `Heldout[K]` does not
+ * compile: pick the member first.
+ */
+export type HeldoutOf<K extends string> = Extract<Heldout, Record<K, unknown>>[K];
+
+/**
+ * The text of `content`, or `null` when it is not valid UTF-8. Bad bytes are not repaired into
+ * U+FFFD, which an answer could be spelled with. A leading byte order mark is dropped, as
+ * `TextDecoder` does by default.
+ */
+export function decodeUtf8(content: Uint8Array): string | null {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch {
+    return null;
+  }
+}
+
+/** An entry's score with the reasons for it, and whether it reaches the criteria's pass mark. */
+export function scored(
+  c: Pick<PublicCriteria, "min_score">,
+  score: number,
+  reasons: string[],
+): EntryScore {
+  return { score, passed: score >= c.min_score, reasons };
+}
