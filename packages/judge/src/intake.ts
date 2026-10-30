@@ -9,7 +9,7 @@ import {
   sha256Hex,
   type TaskView,
 } from "@tender/shared";
-import { COMPILE_BUDGET_MS, checkJsonSchemaIsolated } from "./isolate";
+import { COMPILE_BUDGET_MS, checkJsonSchemaIsolated, type TaskWorkers } from "./isolate";
 import { ScorerUnavailableError } from "./score";
 import { clampReason } from "./scorecard";
 import type { JudgeDeps, JudgeMemory } from "./types";
@@ -65,6 +65,11 @@ interface Policy {
   compileBudgetMs?: number;
   /** Where the outcomes of the compile check are kept, by criteria hash and budget, if anywhere. */
   checks?: JudgeMemory["checks"];
+  /**
+   * Where the compile check's worker comes from, at judging: the task's own (`TaskWorkers`), which
+   * keeps it for the task's scorer. Without it, as at intake, the check starts one of its own.
+   */
+  workers?: TaskWorkers;
 }
 
 /** The most bytes a criteria or held-out document may have: what the blob store takes at once. */
@@ -383,7 +388,7 @@ async function compileProblem(
   const key = `${criteriaHash} ${budgetMs}`;
   let usable = policy.checks?.get(key);
   if (usable === undefined) {
-    usable = await checkJsonSchemaIsolated(criteria.schema, { budgetMs });
+    usable = await checkJsonSchemaIsolated(criteria.schema, { budgetMs, workers: policy.workers });
     policy.checks?.set(key, usable);
   }
   return usable.ok ? null : clampReason(usable.reason);

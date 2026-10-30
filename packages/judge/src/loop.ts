@@ -115,17 +115,20 @@ export function startJudge(
 ): Promise<void> {
   const { intervalMs = DEFAULT_INTERVAL_MS, signal } = deps;
   if (signal.aborted) return Promise.resolve();
-  const warm = deps.warm ?? new WarmWorker();
-  const ticked: JudgeDeps = { ...deps, memory: deps.memory ?? newJudgeMemory(), warm };
+  // One it is given is the giver's to stop.
+  const own = deps.warm === undefined ? new WarmWorker() : undefined;
+  const ticked: JudgeDeps = {
+    ...deps,
+    memory: deps.memory ?? newJudgeMemory(),
+    warm: deps.warm ?? own,
+  };
   return new Promise<void>((resolve) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let ticking = false;
 
     const finish = () => {
       clearTimeout(timer);
-      // One it was given is the giver's to stop.
-      const stopped = deps.warm === undefined ? warm.close() : Promise.resolve();
-      void stopped.then(resolve, resolve);
+      void (own?.close() ?? Promise.resolve()).then(resolve, resolve);
     };
     const run = async () => {
       ticking = true;

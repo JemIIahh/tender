@@ -35,7 +35,7 @@ const scores = [
 ];
 const warm = new WarmWorker();
 await warm.ready();
-const warmed = openTaskScorer(task, { warm });
+const warmed = openTaskScorer(task, { workers: warm });
 scores.push(await warmed.score(bytes("42")));
 const check = await checkJsonSchemaIsolated({ type: "object" });
 await judges.close();

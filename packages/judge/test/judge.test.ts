@@ -82,10 +82,13 @@ function slowAgainMark(): string {
   return join(dir, "compiled");
 }
 
-/** Makes the next task's scorer start its workers from `workerUrl`. */
+/**
+ * Makes the next task's scorer start its workers from `workerUrl`: it takes none of the task's,
+ * neither the warm one nor the one its criteria check ran in.
+ */
 function nextScorerFrom(workerUrl: URL) {
   vi.mocked(openTaskScorer).mockImplementationOnce((task, options) =>
-    isolate.openTaskScorer(task, { ...options, workerUrl }),
+    isolate.openTaskScorer(task, { ...options, workerUrl, workers: undefined }),
   );
 }
 
@@ -717,10 +720,8 @@ test("judging_gives_the_compile_check_four_times_intakes_budget", { timeout: 60_
   });
   expect(await judgeTask(judgeDeps(db, chain, budget), 7n)).toBe("picked");
   expect((await picked(chain)).winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
-  expect(vi.mocked(checkJsonSchemaIsolated).mock.calls.map(([, options]) => options)).toEqual([
-    { budgetMs: 250 },
-    { budgetMs: 1_000 },
-  ]);
+  const budgets = vi.mocked(checkJsonSchemaIsolated).mock.calls.map(([, o]) => o?.budgetMs);
+  expect(budgets).toEqual([250, 1_000]);
 });
 
 test("judge_fails_closed_when_its_heldout_checks_were_used_first", async () => {
@@ -1120,6 +1121,41 @@ test("a_short_window_is_picked_when_workers_are_slow_to_start", { timeout: 60_00
   expect((await picked(chain)).winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
 });
 
+test("the_criteria_check_and_the_scorer_share_the_warm_worker", { timeout: 60_000 }, async () => {
+  // A json_schema task in the 10 s window above, judged at its middle, 2 s before its stop line.
+  // Its criteria check at judging needs a worker, and so does its scorer. The Judge's warm worker
+  // is one that took 3 s more to load, loaded ahead. The check takes it, and hands it on to the
+  // scorer: the warm worker is taken once, and the task is picked. A scorer that took the next
+  // warm worker instead would wait the 3 s, past the stop line.
+  const { view, chain } = await postJudged([["alice.test.near", '{"x":1}', 10n]], {
+    criteria: jsonSchemaCriteria({ type: "object" }),
+    heldout: X_IS_1,
+    view: {
+      reveal_deadline: (NOW_NS - SECOND_NS).toString(),
+      pick_deadline: (NOW_NS + 9n * SECOND_NS).toString(),
+    },
+  });
+  await postSharing(view, "9", NOW_NS + 4n * SECOND_NS);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const warm = new WarmWorker({ workerUrl: SLOW_WORKER });
+  onTestFinished(() => warm.close());
+  const take = vi.fn((timeoutMs: number) => warm.take(timeoutMs));
+  expect(await warm.ready()).toBe(true);
+
+  vi.mocked(openTaskScorer).mockClear();
+
+  const atMiddle = () => new Date(NOW.getTime() + 4_000);
+  const deps = judgeDeps(db, chain, { now: atMiddle, warm: { take } });
+  expect(await judgeTask(deps, 7n)).toBe("picked");
+  // Taken once, by the check, before there was a scorer.
+  expect(take).toHaveBeenCalledTimes(1);
+  const [taken] = take.mock.invocationCallOrder;
+  const [opened] = vi.mocked(openTaskScorer).mock.invocationCallOrder;
+  expect(taken).toBeLessThan(opened ?? 0);
+  expect((await picked(chain)).winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
+  expect(warn).not.toHaveBeenCalled();
+});
+
 test("judging_that_starts_past_the_stop_line_does_not_pick", async () => {
   // P05-R13: this task's stop line is 30 s before its pick deadline, at NOW + 9.5 minutes. A tick
   // that starts past it can score nothing, and a pick would pay nobody for the Judge's own
@@ -1454,6 +1490,16 @@ test("a_compile_that_fails_after_one_fitted_and_before_any_score_does_not_pick",
       "judge: WARN task 7: a worker could not compile the criteria again before any entry was scored; it is not picked, and is left to its fallback window",
     ],
   ]);
+});
+
+test("a_pick_clears_the_judge_reason", { timeout: 60_000 }, async () => {
+  // An earlier tick left a `not judged: …` reason on the task, and a later one picks it: the
+  // reason goes, so that it does not say of a picked task that it was not judged.
+  const { chain } = await postJudged([["alice.test.near", "42", 10n]]);
+  await db.query("update tasks set judge_reason = $2 where id = $1", [7, TOO_LATE]);
+
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("picked");
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: null });
 });
 
 test("a_duplicate_past_the_stop_line_shares_the_score", { timeout: 60_000 }, async () => {

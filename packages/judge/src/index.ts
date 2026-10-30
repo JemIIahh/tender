@@ -1,6 +1,6 @@
 export { fetchEntryContent } from "./fetch";
 export { intakeTask } from "./intake";
-export { WarmWorker } from "./isolate";
+export { WarmWorker, type WorkerSource } from "./isolate";
 export { judgeTask } from "./judge";
 export { scoreExact } from "./kinds/exact";
 export { checkJsonSchemaUsable, scoreJsonSchema } from "./kinds/json_schema";

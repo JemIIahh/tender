@@ -1,6 +1,6 @@
 import type { Db } from "@tender/db";
 import type { EntryView, TaskView } from "@tender/shared";
-import type { WarmWorker } from "./isolate";
+import type { WorkerSource } from "./isolate";
 
 /** How one revealed entry scored against a task's criteria. */
 export interface EntryScore {
@@ -167,8 +167,8 @@ export interface JudgeDeps {
   /** What the Judge keeps between ticks (see `JudgeMemory`). */
   memory?: JudgeMemory;
   /**
-   * A score worker kept loaded for the next task's scorer (see `WarmWorker`). `startJudge` makes
-   * one. Without it, each scorer starts its own workers.
+   * Where a task's scorer, and its criteria check at judging, take a worker kept loaded for them
+   * (a `WarmWorker`). `startJudge` makes one. Without it, each starts its own.
    */
-  warm?: WarmWorker;
+  warm?: WorkerSource;
 }

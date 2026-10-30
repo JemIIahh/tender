@@ -1,8 +1,8 @@
 import { type Db, putBlob, setBlobPublic } from "@tender/db";
 import { type EntryView, phaseOfTaskView, sha256Hex, type TaskView } from "@tender/shared";
 import { FETCH_TIMEOUT_MS, fetchEntryContent, ownBlobHash } from "./fetch";
-import { loadDocuments } from "./intake";
-import { COMPILE_BUDGET_MS, openTaskScorer, type TaskScorer } from "./isolate";
+import { loadDocuments, type TaskDocuments } from "./intake";
+import { COMPILE_BUDGET_MS, openTaskScorer, type TaskScorer, TaskWorkers } from "./isolate";
 import { chooseWinners, rankEntries, type ScoredEntry } from "./rank";
 import { ScorerUnavailableError } from "./score";
 import { buildScorecard, clampReason } from "./scorecard";
@@ -66,7 +66,8 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  * Judges task `taskId` and settles it with `pick`, once. What it came to:
  *
  * - `picked`: the winners are paid. `no_award`: nobody passed, and an empty `pick` refunded the
- *   task at once.
+ *   task at once. Either way the task's `judge_reason` is cleared: no `not judged: …` from an
+ *   earlier tick is left on a task that was picked.
  * - `skipped`: nothing was settled. The task is not one to judge now: the chain has no such task,
  *   it is settled, it names another verifier, it is not in its judging window, or intake did not
  *   accept it. Or it waits for another task of its poster's with the same held-out checks to close
@@ -79,10 +80,11 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   judging started past the stop line before the pick deadline, or its workers could not be
  *   loaded and the criteria compiled before it. It is not picked, as a pick would pay nobody for
  *   the Judge's lateness, and is left to its fallback window; that is one `WARN`, and its
- *   `judge_reason` from then on. When the entrants' own fetches and scores used the time, the task
- *   is picked from what was found out. Or the pick could no longer land before the pick deadline
- *   (P05-R15): nothing is published, and it is the same. So it is when a worker could not compile
- *   the criteria again, after one had (see `failed_closed`), before any entry was scored.
+ *   `judge_reason` from then on, unless a later tick picks it. When the entrants' own fetches and
+ *   scores used the time, the task is picked from what was found out. Or the pick could no longer
+ *   land before the pick deadline (P05-R15): nothing is published, and it is the same. So it is
+ *   when a worker could not compile the criteria again, after one had (see `failed_closed`),
+ *   before any entry was scored.
  * - `yielded`: nothing was settled. The task's slice of the tick ran out with entries still to
  *   judge while another due task waited for a turn (`turn`, P05-R18). It takes up again on its next
  *   turn from what it found out, which the Judge keeps (`JudgeMemory`) until the task is settled.
@@ -113,7 +115,8 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  * (`openTaskScorer`), which compiles the criteria before it takes an entry, with at most 5 s for
  * each: an entry whose scoring times out, runs out of memory or crashes the worker scores 0 with
  * the reason why, and the other entries are scored as usual. Each worker is one `deps.warm`
- * loaded ahead, when the Judge keeps one, so that loading it costs judging no time. In what order
+ * loaded ahead, when the Judge keeps one, so that loading it costs judging no time; the criteria
+ * check takes one too, and hands it on to the scorer (`TaskWorkers`). In what order
  * the entries are fetched and scored, how long one tick spends on them, and which are left
  * unscored so that the pick lands before the pick deadline, is `judgeEntries`'s; a task with no
  * entries is picked as before, and one with some scored is picked from those. Then the entries
@@ -153,54 +156,61 @@ export async function judgeTask(
 
   const compileBudgetMs =
     JUDGING_COMPILE_BUDGET_FACTOR * (deps.scoringLimits?.compileBudgetMs ?? COMPILE_BUDGET_MS);
-  const loaded = await loadDocuments(deps.db, task, {
-    teamAccounts: deps.teamAccounts,
-    nowNs,
-    waitForHeldout: false,
-    compileBudgetMs,
-    checks: deps.memory?.checks,
-  });
-  if (!loaded.ok) {
-    // P05-R12: criteria that fail the check intake runs, run again now, are refused as intake
-    // would refuse them today, and not scored. Anything else means the documents cannot be used.
-    const status = loaded.criteriaCheck === true ? "rejected" : "failed_closed";
-    return forget(deps, taskId, await refuse(deps, taskId, status, loaded.reason));
-  }
-  const { criteria, heldout } = loaded.documents;
+  // The worker the criteria check runs in is the scorer's first: with a warm worker, neither of
+  // them waits for one to load. Whatever is left of them goes once the task is scored.
+  const workers = new TaskWorkers(deps.warm);
+  let documents: TaskDocuments;
+  let judged: Judged;
+  try {
+    const loaded = await loadDocuments(deps.db, task, {
+      teamAccounts: deps.teamAccounts,
+      nowNs,
+      waitForHeldout: false,
+      compileBudgetMs,
+      checks: deps.memory?.checks,
+      workers,
+    });
+    if (!loaded.ok) {
+      // P05-R12: criteria that fail the check intake runs, run again now, are refused as intake
+      // would refuse them today, and not scored. Anything else means the documents cannot be used.
+      const status = loaded.criteriaCheck === true ? "rejected" : "failed_closed";
+      return forget(deps, taskId, await refuse(deps, taskId, status, loaded.reason));
+    }
+    documents = loaded.documents;
 
-  const revealed = (await deps.client.getAllEntries(taskId)).filter(isRevealed);
-  // What earlier ticks found out of these entries, when they did not get through them all.
-  let progress = deps.memory?.progress.get(task.id);
-  if (progress === undefined) {
-    progress = { results: new Map(), scored: 0, compiled: false };
-    deps.memory?.progress.set(task.id, progress);
-  }
-  const scorer = openTaskScorer(
-    { criteria, heldout },
-    {
+    const revealed = (await deps.client.getAllEntries(taskId)).filter(isRevealed);
+    // What earlier ticks found out of these entries, when they did not get through them all.
+    let progress = deps.memory?.progress.get(task.id);
+    if (progress === undefined) {
+      progress = { results: new Map(), scored: 0, compiled: false };
+      deps.memory?.progress.set(task.id, progress);
+    }
+    const scorer = openTaskScorer(documents, {
       entryTimeoutMs: deps.scoringLimits?.entryTimeoutMs,
       // The worker compiles the criteria under the budget of the check just run (P05-R17).
       compileBudgetMs,
-      warm: deps.warm,
+      workers,
       compiled: progress.compiled,
       onCrash: (error) => {
         console.warn(
           `judge: WARN task ${taskId}: scoring an entry failed (${describeError(error)})`,
         );
       },
-    },
-  );
-  let judged: Judged;
-  try {
-    const othersWaiting = () => turn?.othersWaiting() ?? false;
-    judged = await judgeEntries(deps, task, revealed, scorer, nowNs, progress, othersWaiting);
-  } catch (error) {
-    if (!(error instanceof ScorerUnavailableError)) throw error;
-    return retryLater(taskId, `a scorer could not be run (${describeError(error)})`);
+    });
+    try {
+      const othersWaiting = () => turn?.othersWaiting() ?? false;
+      judged = await judgeEntries(deps, task, revealed, scorer, nowNs, progress, othersWaiting);
+    } catch (error) {
+      if (!(error instanceof ScorerUnavailableError)) throw error;
+      return retryLater(taskId, `a scorer could not be run (${describeError(error)})`);
+    } finally {
+      if (scorer.compiled) progress.compiled = true;
+      await scorer.close();
+    }
   } finally {
-    if (scorer.compiled) progress.compiled = true;
-    await scorer.close();
+    await workers.close();
   }
+  const { criteria, heldout } = documents;
   // P05-R17: criteria that do not compile for scoring, or not within the budget, are refused as
   // the criteria check refuses them, and no entry is scored 0 for it.
   if (judged.rejected !== null) {
@@ -275,6 +285,8 @@ export async function judgeTask(
     // What was found out stays, and the next try picks with it.
     return retryLater(taskId, `pick failed (${describeError(error)})`);
   }
+  // A reason an earlier tick left, `not judged: …` say, would say otherwise of a picked task.
+  await deps.db.query("update tasks set judge_reason = null where id = $1", [taskId]);
   return forget(deps, taskId, winners.length === 0 ? "no_award" : "picked");
 }
 

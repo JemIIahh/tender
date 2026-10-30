@@ -61,6 +61,18 @@ export interface ScoreJob {
   heldout: Heldout | null;
 }
 
+/**
+ * Where a scorer's or a check's worker comes from, when not from a start of its own: a worker
+ * loaded ahead (`WarmWorker`), or one that a task's criteria check ran in (`TaskWorkers`).
+ */
+export interface WorkerSource {
+  /**
+   * A worker that has loaded, within `timeoutMs`, or `timeout` (see `WarmWorker.take`), or
+   * `undefined` when it has none to give: then the taker starts one of its own.
+   */
+  take(timeoutMs: number): Promise<Lane | "timeout" | undefined>;
+}
+
 /** How a worker is started. The defaults are the Judge's; tests change them. */
 export interface WorkerOptions {
   /** The worker's entry module: `score-worker.ts`. A test can pass one that misbehaves. */
@@ -136,7 +148,7 @@ export interface TaskScorer {
  * what the criteria's `min_score` makes of it, and reasons that are strings. Anything else is a
  * crash.
  *
- * Each worker is `warm`'s when it is given, one loaded ahead, and otherwise one the scorer starts.
+ * Each worker is one `workers` gives, when it is given, and otherwise one the scorer starts.
  * Only the task's first compile can reject the criteria: once a worker of the task's has compiled
  * them, here or on an earlier tick (`compiled`), a compile that fails is `unavailable`.
  *
@@ -148,7 +160,7 @@ export function openTaskScorer(
   options: WorkerOptions & {
     entryTimeoutMs?: number;
     compileBudgetMs?: number;
-    warm?: WarmWorker;
+    workers?: WorkerSource;
     compiled?: boolean;
     onCrash?: (error: unknown) => void;
   } = {},
@@ -179,7 +191,7 @@ export function openTaskScorer(
   const ready = async (left: () => number): Promise<Lane | Scoring> => {
     const loadMs = Math.min(startTimeoutMs, left());
     if (loadMs <= 0) return { kind: "late" };
-    const started = await (options.warm?.take(loadMs) ?? Lane.start(options, loadMs));
+    const started = (await options.workers?.take(loadMs)) ?? (await Lane.start(options, loadMs));
     if (started === "timeout") {
       if (loadMs < startTimeoutMs) return { kind: "late" };
       throw new ScorerUnavailableError("a score worker did not start in time");
@@ -273,25 +285,32 @@ export function openTaskScorer(
  *
  * It rejects when there is no result: with `ScorerUnavailableError` when no worker can be
  * started, the Judge's trouble, and with another error when the check crashed its worker (it ran
- * out of memory, say), which the schema did. The worker is stopped before it settles.
+ * out of memory, say), which the schema did. The worker is stopped before it settles, unless it
+ * is `workers`'s: a task's, which then keeps it for the task's scorer when the schema passed.
  */
 export async function checkJsonSchemaIsolated(
   schema: Record<string, unknown>,
-  options: WorkerOptions & { budgetMs?: number } = {},
+  options: WorkerOptions & { budgetMs?: number; workers?: TaskWorkers } = {},
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   const startTimeoutMs = options.startTimeoutMs ?? START_TIMEOUT_MS;
-  const lane = await Lane.start(options, startTimeoutMs);
+  const lane =
+    (await options.workers?.take(startTimeoutMs)) ?? (await Lane.start(options, startTimeoutMs));
   if (lane === "timeout") throw new ScorerUnavailableError("a check worker did not start in time");
+  let kept = false;
   try {
     const outcome = await lane.ask({ check: schema }, [], options.budgetMs ?? COMPILE_BUDGET_MS);
     if (outcome.kind === "timeout") return { ok: false, reason: TOO_SLOW };
     const usable = outcome.kind === "answer" ? usabilityOf(outcome.value) : null;
+    if (usable?.ok === true && options.workers !== undefined) {
+      options.workers.keep(lane);
+      kept = true;
+    }
     if (usable !== null) return usable;
     throw new ScoreWorkerError("the criteria check failed in its worker", {
       cause: outcome.kind === "error" ? outcome.error : outcome,
     });
   } finally {
-    await lane.stop();
+    if (!kept) await lane.stop();
   }
 }
 
@@ -361,14 +380,14 @@ export function serveWorker(
 }
 
 /**
- * One score worker loaded ahead of need, so that a task's scorer takes one that is ready and does
- * not wait for one to load: worker start-up is off the judging clock. `startJudge` makes one when
- * the Judge starts. Each time its worker is taken, the next one starts loading. A worker is no
- * task's until it is taken: it gets the task's criteria then, and compiles them under the scorer's
- * budget, as one the scorer started would. A taken worker is never given back: it is stopped with
- * its scorer.
+ * One score worker loaded ahead of need, so that a task's scorer, or its criteria check at judging,
+ * takes one that is ready and does not wait for one to load: worker start-up is off the judging
+ * clock. `startJudge` makes one when the Judge starts. Each time its worker is taken, the next one
+ * starts loading. A worker is no task's until it is taken: it gets the task's criteria then, and
+ * compiles them under the scorer's budget, as one the scorer started would. A taken worker is
+ * never given back: it is stopped with its task's scorer (see `TaskWorkers`).
  */
-export class WarmWorker {
+export class WarmWorker implements WorkerSource {
   /** The worker it keeps, loading or loaded; none when the last one could not be started. */
   private lane: Lane | undefined;
   /** Whether `lane` has loaded: `false` once it could not. */
@@ -435,6 +454,41 @@ export class WarmWorker {
   async close(): Promise<void> {
     this.closed = true;
     await this.lane?.stop();
+  }
+}
+
+/**
+ * The workers of one task's judging. Its criteria check and its scorer take theirs from here:
+ * `warm`'s when there is one, loaded ahead, and otherwise each starts its own. The worker that the
+ * check ran in, once the criteria passed it, is kept for the scorer to take next. So with one warm
+ * worker, neither the check nor the scorer waits for a worker to load. A worker never goes to
+ * another task: one still kept when the task is done is stopped (`close`).
+ */
+export class TaskWorkers implements WorkerSource {
+  /** A loaded worker that the criteria check ran in, for the next taker. */
+  private kept: Lane | undefined;
+
+  constructor(private readonly warm?: WorkerSource) {}
+
+  /** The worker it keeps, if it is still alive, or else `warm`'s, within `timeoutMs`. */
+  async take(timeoutMs: number): Promise<Lane | "timeout" | undefined> {
+    const kept = this.kept;
+    this.kept = undefined;
+    if (kept?.alive === true) return kept;
+    return this.warm?.take(timeoutMs);
+  }
+
+  /** Keeps `lane`, which a check of this task's criteria ran in, for the next taker. */
+  keep(lane: Lane): void {
+    void this.kept?.stop();
+    this.kept = lane;
+  }
+
+  /** Stops the worker it keeps, if any. */
+  async close(): Promise<void> {
+    const kept = this.kept;
+    this.kept = undefined;
+    await kept?.stop();
   }
 }
 

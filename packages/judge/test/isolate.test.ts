@@ -293,7 +293,7 @@ test("a_warm_worker_is_ready_when_a_scorer_needs_one", { timeout: 60_000 }, asyn
   try {
     for (const answer of ["42", "41"]) {
       expect(await warm.ready()).toBe(true);
-      const scorer = openTaskScorer(EXACT_TASK, { warm, startTimeoutMs: 1_000 });
+      const scorer = openTaskScorer(EXACT_TASK, { workers: warm, startTimeoutMs: 1_000 });
       expect(await scorer.score(bytes(answer))).toEqual(answer === "42" ? RIGHT : WRONG);
       await scorer.close();
     }
