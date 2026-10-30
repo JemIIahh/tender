@@ -5,6 +5,7 @@ import {
   type AgentSummary,
   ApiError,
   type BlobUploadResponse,
+  canonicalBase,
   type HealthResponse,
   type ListAgentsResponse,
   type ListTasksResponse,
@@ -430,7 +431,7 @@ test("requests_go_to_the_paths_and_queries_of_the_api", async () => {
   const api = fakeApi();
   serveBoard(api);
   // A trailing slash on the base URL is dropped, and there is no `/v1` in it.
-  const client = new ApiClient({ baseUrl: `${BASE}//`, signer: SIGNER, fetchImpl: api.fetch });
+  const client = new ApiClient({ baseUrl: `${BASE}/`, signer: SIGNER, fetchImpl: api.fetch });
 
   await client.listTasks();
   await client.listTasks({});
@@ -510,13 +511,15 @@ test("the_base_url_is_normalized", async () => {
   const cases: Array<[string, string]> = [
     ["https://api.test", "https://api.test/v1/health"],
     ["https://api.test/", "https://api.test/v1/health"],
-    ["https://api.test//", "https://api.test/v1/health"],
     ["https://api.test/v1", "https://api.test/v1/health"],
     ["https://api.test/v1/", "https://api.test/v1/health"],
     ["http://localhost:8787/v1", "http://localhost:8787/v1/health"],
     // A path the API is mounted under is kept.
     ["https://api.test/tender", "https://api.test/tender/v1/health"],
     ["https://api.test/tender/v1/", "https://api.test/tender/v1/health"],
+    // The scheme and the host are in lower case, and the default port is not written.
+    ["HTTPS://API.Test:443/", "https://api.test/v1/health"],
+    ["https://API.test/Tender/v1/", "https://api.test/Tender/v1/health"],
     // Only a whole last segment is `/v1`, and the host is not a segment.
     ["https://api.test/v10", "https://api.test/v10/v1/health"],
     ["https://api.test/xv1", "https://api.test/xv1/v1/health"],
@@ -539,6 +542,60 @@ test("the_base_url_is_normalized", async () => {
     "/v1/auth/verify",
     "/v1/tasks/7/start",
   ]);
+});
+
+test("a_base_url_that_is_no_base_is_refused_when_the_client_is_made", () => {
+  // The base is read once, by `canonicalBase`, and what it refuses throws then: before any request
+  // is sent, and with a signer or without one. Each of these has two readings, one for where the
+  // requests go and one for whom the key signs for, and no reading is chosen for it.
+  const api = fakeApi();
+  const problem = {
+    noHost: "the API base URL must be an absolute URL with a host",
+    user: "the API base URL must not carry a user name or password",
+    query: "the API base URL must not carry a query",
+    fragment: "the API base URL must not carry a fragment",
+    emptySegment: "the API base URL must not have an empty path segment (//)",
+    repeated: "the API base URL must not repeat /v1",
+  };
+  const refused: Array<[string, string]> = [
+    // A version twice: one is the API's, and which?
+    ["https://api.test/v1/v1", problem.repeated],
+    ["https://api.test/tender/v1/v1/", problem.repeated],
+    ["https://api.test/v1/x/../v1", problem.repeated],
+    // An empty segment.
+    ["https://api.test//", problem.emptySegment],
+    ["https://api.test//v1", problem.emptySegment],
+    ["https://api.test/tender//v1", problem.emptySegment],
+    ["https://api.test/tender/v1//", problem.emptySegment],
+    // A query, a fragment, a user: even when there is nothing after the `?` or the `#`.
+    ["https://api.test/?x=1", problem.query],
+    ["https://api.test/v1?x=1", problem.query],
+    ["https://api.test?", problem.query],
+    ["https://api.test/#top", problem.fragment],
+    ["https://api.test/tender/v1#top", problem.fragment],
+    ["https://api.test#", problem.fragment],
+    ["https://someone@api.test", problem.user],
+    ["https://someone:hunter2@api.test", problem.user],
+    ["https://:hunter2@api.test/tender", problem.user],
+    // Not a base at all.
+    ["", problem.noHost],
+    ["api.test", problem.noHost],
+    ["/v1", problem.noHost],
+    ["//api.test", problem.noHost],
+    ["https://", problem.noHost],
+    ["file:///tmp/api", problem.noHost],
+  ];
+  for (const [baseUrl, message] of refused) {
+    const withSigner = thrown(
+      () => new ApiClient({ baseUrl, signer: SIGNER, fetchImpl: api.fetch }),
+    );
+    expect(withSigner, baseUrl).toBeInstanceOf(Error);
+    // It names the problem and holds none of the URL, which can have a password in it.
+    expect((withSigner as Error).message, baseUrl).toBe(message);
+    const without = thrown(() => new ApiClient({ baseUrl, fetchImpl: api.fetch }));
+    expect((without as Error).message, baseUrl).toBe(message);
+  }
+  expect(api.calls).toHaveLength(0);
 });
 
 test("ids_above_two_to_the_53_go_out_as_exact_decimal_strings", async () => {
@@ -1058,10 +1115,71 @@ test("a_challenge_of_another_path_on_the_same_host_is_not_signed", async () => {
   }
 });
 
+test("the_requests_and_the_recipient_come_from_one_reading_of_the_base", async () => {
+  // How the client reads its base URL decides where it calls and whom it signs for, so both come
+  // from the one reading. The fake names the base it is at as the recipient and takes a sign-in
+  // for that only: a client that called one base and signed for another would get no token.
+  const spellings: Array<[string, string]> = [
+    ["https://api.test", "https://api.test"],
+    ["https://api.test/", "https://api.test"],
+    ["https://api.test/v1", "https://api.test"],
+    ["https://api.test/v1/", "https://api.test"],
+    ["HTTPS://API.Test:443/v1/", "https://api.test"],
+    // The pair the review had: two spellings of one base.
+    ["https://H.test/x/v1/", "https://h.test/x"],
+    ["https://h.test/x", "https://h.test/x"],
+    ["https://h.test/x/", "https://h.test/x"],
+    ["https://h.test/x/y/v1", "https://h.test/x/y"],
+    ["https://h.test/a/../x/./v1/", "https://h.test/x"],
+    // A dot the parser resolves after the slash is off: the base is still the one.
+    ["https://h.test/x/v1/./", "https://h.test/x"],
+    ["https://h.test:8443/x", "https://h.test:8443/x"],
+    ["https://h.test/v10", "https://h.test/v10"],
+    ["https://h.test/xv1/v1", "https://h.test/xv1"],
+    ["https://v1/v1", "https://v1"],
+    ["https://bücher.example/V1", "https://xn--bcher-kva.example/V1"],
+    ["http://localhost:8787/v1/", "http://localhost:8787"],
+    ["http://127.0.0.1:3000", "http://127.0.0.1:3000"],
+    ["http://[0:0:0:0:0:0:0:1]:8787/", "http://[::1]:8787"],
+  ];
+  for (const [spelling, base] of spellings) {
+    expect(canonicalBase(spelling), spelling).toBe(base);
+    const api = fakeApi();
+    api.recipient = base;
+    api.on(/^GET .*\/v1\/health$/, () => json(HEALTH));
+    api.on(
+      /^POST .*\/v1\/tasks\/7\/start$/,
+      api.signedIn(() => json(STARTED)),
+    );
+    const client = new ApiClient({
+      baseUrl: spelling,
+      signer: SIGNER,
+      fetchImpl: api.fetch,
+      now: () => api.clock.now,
+    });
+
+    await client.health();
+    expect(await client.start(7n), spelling).toEqual(STARTED);
+
+    // Every request went to `<base>/v1/...`, the sign-in too, and the base is that of the recipient.
+    expect(
+      api.calls.map((call) => call.url.href),
+      spelling,
+    ).toEqual([
+      `${base}/v1/health`,
+      `${base}/v1/auth/challenge`,
+      `${base}/v1/auth/verify`,
+      `${base}/v1/tasks/7/start`,
+    ]);
+    expect(JSON.parse(nth(api.calls, 2).body ?? "null").recipient, spelling).toBe(base);
+    expect(api.tokens, spelling).toEqual(["token-1"]);
+  }
+});
+
 test("the_recipient_is_the_base_url", async () => {
   // Whom the API names, for the URL a client calls it at: the scheme and host in lower case, the
   // port only if it is not the default of the scheme, and the path without a trailing slash or a
-  // final /v1. Nothing else of the URL is part of it.
+  // final /v1. A URL with anything else (a user, a query, a fragment) is no base: see above.
   const named: Array<[string, string]> = [
     ["https://api.test", "https://api.test"],
     ["https://api.test/v1/", "https://api.test"],
@@ -1069,7 +1187,6 @@ test("the_recipient_is_the_base_url", async () => {
     ["https://api.test:443", "https://api.test"],
     ["https://api.test:8443/tender", "https://api.test:8443/tender"],
     ["https://host.example/tender/v1", "https://host.example/tender"],
-    ["https://someone:secret@api.test", "https://api.test"],
     ["http://localhost", "http://localhost"],
     ["http://localhost:8787", "http://localhost:8787"],
     ["HTTP://LOCALHOST:80", "http://localhost"],
@@ -1124,17 +1241,20 @@ test("a_signer_needs_https_unless_the_host_is_this_machine", async () => {
     "http://192.168.1.10:8787",
     "http://0.0.0.0:8787",
     "http://[::ffff:127.0.0.1]:8787",
-    // Names that start or end like a local one, or hide it in the user, the path or the query.
+    // Names that start or end like a local one, or hide it in the path.
     "http://localhost.example.com",
     "http://127.0.0.1.example.com",
     "http://notlocalhost",
-    "http://localhost@example.com",
     "http://example.com/localhost",
-    "http://example.com/?127.0.0.1",
     // Local, but not http.
     "ftp://localhost",
     "ws://127.0.0.1:8787",
-    // Not an absolute URL.
+  ];
+  // Hiding it in the user or the query, or not giving a URL at all: no base, and refused before the
+  // question of http is asked.
+  const notBases = [
+    "http://localhost@example.com",
+    "http://example.com/?127.0.0.1",
     "localhost:8787",
     "api.example",
     "",
@@ -1154,7 +1274,12 @@ test("a_signer_needs_https_unless_the_host_is_this_machine", async () => {
   for (const baseUrl of refused) {
     const error = thrown(() => new ApiClient({ baseUrl, signer: SIGNER }));
     expect(error, baseUrl).toBeInstanceOf(Error);
-    expect((error as Error).message, baseUrl).toMatch(/baseUrl/);
+    expect((error as Error).message, baseUrl).toMatch(/needs an https baseUrl/);
+  }
+  for (const baseUrl of notBases) {
+    const error = thrown(() => new ApiClient({ baseUrl, signer: SIGNER }));
+    expect(error, baseUrl).toBeInstanceOf(Error);
+    expect((error as Error).message, baseUrl).toMatch(/^the API base URL must /);
   }
   for (const baseUrl of accepted) {
     expect(() => new ApiClient({ baseUrl, signer: SIGNER }), baseUrl).not.toThrow();

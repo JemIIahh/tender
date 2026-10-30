@@ -7,7 +7,7 @@ import {
   type Nep413Result,
   verifyNep413,
 } from "@tender/client";
-import { SIGN_IN_MESSAGE, sha256Hex, signInRecipientOf } from "@tender/shared";
+import { canonicalBase, SIGN_IN_MESSAGE, sha256Hex } from "@tender/shared";
 import type { Context } from "hono";
 import { type ApiDeps, nowNs } from "./deps";
 import { type ErrorBody, fail } from "./format";
@@ -48,7 +48,7 @@ export interface ChallengeResponse {
   nonce: string;
   /** What the wallet signs. */
   message: string;
-  /** Whom the wallet signs it for: this API, by its public URL (`signInRecipientOf`). */
+  /** Whom the wallet signs it for: this API, by its public URL (`canonicalBase`). */
   recipient: string;
   expires_at: string;
 }
@@ -85,15 +85,15 @@ function isoAt(ns: bigint, plusMs = 0): string {
  * minutes and its row is kept for an hour after that. The same transaction deletes the challenges
  * and tokens that expired more than an hour ago, so the tables do not grow with the calls.
  *
- * It names this API as its recipient, by `deps.publicUrl` (`signInRecipientOf`: scheme, host and
+ * It names this API as its recipient, by `deps.publicUrl` (`canonicalBase`: scheme, host and
  * path, so two APIs under paths of one host are two), so that what a client signs is good here
  * and nowhere else: a server that passes this challenge on to a client of another API gets
  * nothing, as the client signs only for the base it called, and `signIn` accepts only a
- * signature for this one.
+ * signature for this one. A public URL that `canonicalBase` refuses is a fault of ours.
  */
 export async function createChallenge(deps: ApiDeps): Promise<ChallengeResponse> {
-  // First, so that a public URL with no host is a fault before a challenge is stored.
-  const recipient = signInRecipientOf(deps.publicUrl);
+  // First, so that a public URL that is no base is a fault before a challenge is stored.
+  const recipient = canonicalBase(deps.publicUrl);
   const now = nowNs(deps);
   const nonce = randomBytes(NONCE_BYTES).toString("base64");
   const expiresAt = isoAt(now, CHALLENGE_TTL_MS);
@@ -208,7 +208,7 @@ function unavailableIfLookupFailed(error: unknown): never {
  *
  * `verifyNep413` does not look at `message`, so it is held to the one the challenge carries here.
  * It is held to the recipient the challenge names, which is this API's base URL
- * (`signInRecipientOf` of `deps.publicUrl`): a signature made for another is `wrong_recipient`.
+ * (`canonicalBase` of `deps.publicUrl`): a signature made for another is `wrong_recipient`.
  *
  * The challenge has to be live before the key is looked up, because that lookup is a call to the
  * chain, and one is not spent on a nonce that was never issued or has run out. That first look
@@ -232,7 +232,7 @@ export async function signIn(deps: ApiDeps, request: SignInRequest): Promise<Sig
     {
       viewAccessKey: (account, key) => lookUpKey(deps, account, key),
       contractId: deps.contractId,
-      expectedRecipient: signInRecipientOf(deps.publicUrl),
+      expectedRecipient: canonicalBase(deps.publicUrl),
     },
   ).catch(unavailableIfLookupFailed);
 

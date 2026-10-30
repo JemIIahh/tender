@@ -26,10 +26,12 @@ export interface ApiDeps {
   /** The Tender contract the indexer follows. */
   contractId: string;
   /**
-   * The base URL the API is served at, with no trailing slash. Blob URIs are built from it, and it
-   * is whom every sign-in is signed for (`signInRecipientOf`: its scheme, host and path, without
-   * a trailing `/v1`): a client signs in only if its own base URL names the same, so it has to be
-   * the address the clients use.
+   * The base URL the API is served at, with no trailing slash. Blob URIs are built from it as it
+   * is written, and it is whom every sign-in is signed for (`canonicalBase`: its scheme, host and
+   * path, without a trailing `/v1`): a client signs in only if its own base URL names the same, so
+   * it has to be the address the clients use, spelled as `canonicalBase` spells it. One that
+   * `canonicalBase` refuses (a query, a fragment, a user, `//` or a repeated `/v1` in it) cannot be
+   * signed for: every challenge fails as a fault.
    */
   publicUrl: string;
   /** Accounts the team runs. Posters and entrants among them are labelled as ours. */

@@ -8,6 +8,7 @@ import {
   type BlobUploadResponse,
   BlobUploadResponseSchema,
   ChallengeResponseSchema,
+  canonicalBase,
   fetchJson,
   type HealthResponse,
   HealthResponseSchema,
@@ -27,7 +28,6 @@ import {
   type StartResponse,
   StartResponseSchema,
   sha256Hex,
-  signInRecipientOf,
   type TaskDetailResponse,
   TaskDetailResponseSchema,
   type TelegramLinkResponse,
@@ -77,12 +77,15 @@ export class ApiTimeoutError extends Error {
 export interface ApiClientOptions {
   /**
    * Where the API is served, as `PUBLIC_API_URL` has it: `https://api.example`. The client adds
-   * `/v1`, so a trailing slash and a trailing `/v1` are both dropped. With a `signer` it must be
-   * https, or http to this machine (`localhost`, `127.0.0.1` or `[::1]`): the signature and the
-   * bearer token travel to it. It is also whom the sign-in is signed for (`signInRecipientOf`:
-   * the scheme, the host, the port if that is not the default, and the path), so it has to name
-   * the API as the API's own `PUBLIC_API_URL` does: an API reached under another name, an
-   * address in place of its domain, say, is refused at sign-in.
+   * `/v1`, so a trailing slash and a trailing `/v1` are both dropped. It is read once, by
+   * `canonicalBase`, when the client is made, and a base that `canonicalBase` refuses (a query, a
+   * fragment, a user name or password, an empty path segment `//`, a repeated `/v1`, or no host)
+   * throws then, with a signer or without one. Every request and the recipient of the sign-in come
+   * from that one reading. With a `signer` it must be https, or http to this machine (`localhost`,
+   * `127.0.0.1` or `[::1]`): the signature and the bearer token travel to it. It is also whom the
+   * sign-in is signed for (the scheme, the host, the port if that is not the default, and the
+   * path), so it has to name the API as the API's own `PUBLIC_API_URL` does: an API reached under
+   * another name, an address in place of its domain, say, is refused at sign-in.
    */
   baseUrl: string;
   /**
@@ -194,24 +197,13 @@ function isUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
 }
 
-/** `url` without its trailing slashes, and then without a trailing `/v1`, which the client adds. */
-function baseOf(url: string): string {
-  // The character before `/v1` is not a slash, so that the host of `https://v1` is not taken for it.
-  return url.replace(/\/+$/, "").replace(/([^/])\/v1$/, "$1");
-}
-
 /**
- * Throws unless `baseUrl` is https, or http to this machine. A client with a signer sends the
- * server a signature and then its bearer token: over plain http to another host the challenge can
- * be swapped on the way and the token can be read.
+ * Throws unless `base`, a canonical base, is https, or http to this machine. A client with a signer
+ * sends the server a signature and then its bearer token: over plain http to another host the
+ * challenge can be swapped on the way and the token can be read.
  */
-function requireSecure(baseUrl: string): void {
-  let url: URL;
-  try {
-    url = new URL(baseUrl);
-  } catch {
-    throw new Error("baseUrl is not an absolute URL");
-  }
+function requireSecure(base: string): void {
+  const url = new URL(base);
   if (url.protocol === "https:") return;
   if (url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname)) return;
   throw new Error(
@@ -303,8 +295,10 @@ async function readCapped(res: Response, limit: number): Promise<Uint8Array | nu
  * the token dropped, signs in again and is sent once more, and a second 401 is thrown.
  *
  * The server at `baseUrl` is not trusted with the key. A challenge is signed only if its message
- * is `SIGN_IN_MESSAGE`, its recipient is `baseUrl` as the API names itself (`signInRecipientOf`)
- * and its nonce is 32 bytes in base64; any other is refused, with nothing signed. The recipient
+ * is `SIGN_IN_MESSAGE`, its recipient is the base of this client and its nonce is 32 bytes in
+ * base64; any other is refused, with nothing signed. The base is `canonicalBase` of `baseUrl`,
+ * taken once when the client is made: it is where every request goes (`<base>/v1/...`) and it is
+ * the recipient, so a base cannot be called as one thing and signed for as another. The recipient
  * is what ties a signature to this API: a server that hands over the challenge of another API, to
  * use there what the key signs, is refused because that challenge names the base of the other
  * API and not this one's, even when the other is under another path of the same host.
@@ -323,6 +317,7 @@ async function readCapped(res: Response, limit: number): Promise<Uint8Array | nu
  * the bearer token. So nothing here logs a body or puts one in a message.
  */
 export class ApiClient implements TenderApi {
+  /** `canonicalBase` of the `baseUrl` given: where the routes are, and the recipient of a sign-in. */
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly now: () => number;
@@ -334,7 +329,7 @@ export class ApiClient implements TenderApi {
   private signingIn: Promise<string> | undefined;
 
   constructor(opts: ApiClientOptions) {
-    this.baseUrl = baseOf(opts.baseUrl);
+    this.baseUrl = canonicalBase(opts.baseUrl);
     this.fetchImpl = opts.fetchImpl;
     // The clock is called as a function of its own, like `fetch`. The default looks `Date.now` up
     // on each call, so a test that fakes the clock after this is built is seen.
@@ -548,10 +543,10 @@ export class ApiClient implements TenderApi {
     const { message, nonce, recipient } = challenge;
     // The server chose all three, and the key signs them: only a Tender sign-in for this API is
     // signed, and nothing a server that is not Tender's would put in its place. The recipient is
-    // `baseUrl`, as the API puts its own public URL there. A server that passes on the challenge
-    // of another API, to use there what the key signs, names that API.
+    // the base this client calls, which is how the API puts its own public URL there. A server that
+    // passes on the challenge of another API, to use there what the key signs, names that API.
     if (message !== SIGN_IN_MESSAGE) throw refusal("message");
-    if (recipient !== signInRecipientOf(this.baseUrl)) throw refusal("recipient");
+    if (recipient !== this.baseUrl) throw refusal("recipient");
     if (!isNonce(nonce)) throw refusal("nonce");
     // The signature is of the SHA-256 of the NEP-413 bytes, the same digest `verifyNep413` checks.
     const digest = hexToBytes(sha256Hex(serializeNep413({ message, nonce, recipient })));

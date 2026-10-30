@@ -430,6 +430,7 @@ test("the_challenge_names_the_base_of_the_public_url", async () => {
     ["https://api.tender.example:443", "https://api.tender.example"],
     ["https://api.tender.example:8443/base", "https://api.tender.example:8443/base"],
     ["https://host.example/tender/v1/", "https://host.example/tender"],
+    ["HTTPS://Host.Example:443/tender/v1/", "https://host.example/tender"],
     ["http://127.0.0.1:8787", "http://127.0.0.1:8787"],
     ["http://localhost:80", "http://localhost"],
     ["http://[::1]:8787", "http://[::1]:8787"],
@@ -489,17 +490,57 @@ test("a_signature_for_another_path_of_the_same_host_is_refused", async () => {
   expect(taken.status).toBe(200);
 });
 
-test("a_public_url_with_no_host_is_a_fault_and_stores_no_challenge", async () => {
-  // Without a host there is no one to sign for. That is the deployment's fault, and so a 500 that
-  // is seen, and not a challenge for a recipient that is nothing.
+test("a_public_url_that_is_no_base_is_a_fault_and_stores_no_challenge", async () => {
+  // `canonicalBase` takes no URL that has no host, or that would be read two ways: a user, a query,
+  // a fragment, an empty path segment or a repeated `/v1`. There is no one to sign for. That is the
+  // deployment's fault, and so a 500 that is seen, and not a challenge for a recipient that is
+  // nothing or that a client reads another way.
   const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  for (const publicUrl of ["", "api.test", "/v1", "file:///api"]) {
+  const publicUrls = [
+    "",
+    "api.test",
+    "/v1",
+    "file:///api",
+    "https://api.test/v1/v1",
+    "https://api.test//",
+    "https://api.test/tender//v1",
+    "https://api.test/?x=1",
+    "https://api.test#top",
+    "https://someone:hunter2@api.test",
+  ];
+  for (const publicUrl of publicUrls) {
     const failed = await post<ErrorBody>(appWith({ publicUrl }), "/v1/auth/challenge");
     expect(failed.status, publicUrl).toBe(500);
     expect(failed.body, publicUrl).toEqual({ error: "internal", message: "internal error" });
   }
-  expect(log).toHaveBeenCalled();
   expect(await challengeRows()).toEqual([]);
+
+  // The log says what is wrong with the public URL and does not repeat it, which can hold a password.
+  const logged = log.mock.calls
+    .flat()
+    .map((arg) => (arg instanceof Error ? arg.message : String(arg)))
+    .join("\n");
+  expect(logged).toContain("the API base URL must");
+  expect(logged).not.toContain("hunter2");
+});
+
+test("a_public_url_that_is_no_base_fails_a_verify_too_and_spends_nothing", async () => {
+  // A challenge issued under a good public URL, and a deployment whose public URL is not one when
+  // the sign-in comes: the same fault, and the challenge is left for the sign-in to try again.
+  const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const ch = await challenge(appWith());
+  const body = await signChallenge(KeyPair.fromRandom("ed25519"), ch);
+
+  for (const publicUrl of ["https://api.test/v1/v1", "https://api.test//", "https://api.test/?x"]) {
+    const failed = await post<ErrorBody>(appWith({ publicUrl }), "/v1/auth/verify", body);
+    expect(failed.status, publicUrl).toBe(500);
+    expect(failed.body, publicUrl).toEqual({ error: "internal", message: "internal error" });
+  }
+  expect(log).toHaveBeenCalled();
+  expect(await tokenRows()).toEqual([]);
+
+  const taken = await post<SignInResponse>(appWith(), "/v1/auth/verify", body);
+  expect(taken.status).toBe(200);
 });
 
 test("nonce_replay_rejected", async () => {
