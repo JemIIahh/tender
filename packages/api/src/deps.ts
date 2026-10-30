@@ -25,10 +25,23 @@ export interface ApiDeps {
   network: NetworkId;
   /** The Tender contract the indexer follows. */
   contractId: string;
-  /** The base URL the API is served at, with no trailing slash. Blob URIs are built from it. */
+  /**
+   * The base URL the API is served at, with no trailing slash. Blob URIs are built from it as it
+   * is written, and it is whom every sign-in is signed for (`canonicalBase`: its scheme, host and
+   * path, without a trailing `/v1`): a client signs in only if its own base URL names the same, so
+   * it has to be the address the clients use, spelled as `canonicalBase` spells it. One that
+   * `canonicalBase` refuses (a query, a fragment, a user, `//`, a repeated `/v1` or a dot at the
+   * end of the host) cannot be signed for: every challenge fails as a fault.
+   */
   publicUrl: string;
   /** Accounts the team runs. Posters and entrants among them are labelled as ours. */
   teamAccounts: string[];
+  /**
+   * The account the team's Judge signs in as (`JUDGE_ACCOUNT`). Only it may upload a scorecard that
+   * carries the Judge's name in `judge.software` (`isJudgeBranded`). When it is not set, every such
+   * scorecard is refused.
+   */
+  judgeAccount?: string;
   /**
    * Origins of the web app, which the browser may call the API from (`PUBLIC_WEB_URL`, split at
    * commas). A trailing slash or a path is dropped. On the sandbox network every origin is

@@ -15,9 +15,11 @@ import {
   canonicalJson,
   HashHexSchema,
   HeldoutSchema,
+  isJudgeBranded,
   MAX_RESULT_BYTES,
   ProfileSchema,
   PublicCriteriaSchema,
+  type Scorecard,
   ScorecardSchema,
   sha256Hex,
   U64StringSchema,
@@ -103,7 +105,9 @@ const HeldoutUploadSchema = z.strictObject({
  *   bytes are served already: then anyone can read them, and holding them proves nothing. The
  *   task a result was sent for decides nothing else. A scorecard is taken only from the verifier
  *   or the poster of its task, and only once the reveal deadline has passed, the task's own and
- *   that of every task of the same poster that uses the same held-out document.
+ *   that of every task of the same poster that uses the same held-out document. It has to name its
+ *   uploader as its verifier, and one that carries the Judge's name is taken only from the team's
+ *   Judge (`deps.judgeAccount`).
  * - `POST /v1/heldout` (signed in): stores a held-out document, which nobody may read.
  * - `GET /v1/blobs/:sha256`: the bytes of a blob that may be read.
  * - `GET /v1/scorecards/:task_id`: the scorecard the task was settled with.
@@ -319,7 +323,7 @@ async function blobOf(
     if (upload.task_id !== undefined && upload.task_id !== scorecard.task_id) {
       return badRequest("task_id is not the task of the scorecard");
     }
-    await requireScorecardRight(deps, scorecard.task_id, account);
+    await requireScorecardRight(deps, scorecard, account);
     return {
       kind,
       contentType: upload.content_type,
@@ -367,11 +371,14 @@ async function requireEntry(db: Db, taskId: string, account: string): Promise<vo
  * so anyone can put it in a task with a far-off deadline, but the Judge takes a held-out only from
  * the poster of a task: a task of anyone else can never be judged against it, and holding the
  * scorecard back for it would hand a stranger the means to stall the verifier. The account's right
- * is looked at first, so an account that has none is told so whatever the time is.
+ * is looked at first, so an account that has none is told so whatever the time is. What the
+ * scorecard says of its uploader is part of that right (`requireOwnScorecard`), so it is told next,
+ * and the time comes last: waiting would not mend a scorecard that cannot be taken from this
+ * account.
  */
 async function requireScorecardRight(
   deps: ApiDeps,
-  taskId: string,
+  scorecard: Scorecard,
   account: string,
 ): Promise<void> {
   const [task] = await deps.db.query<{ poster: string; verifier: string; closed: boolean }>(
@@ -386,7 +393,7 @@ async function requireScorecardRight(
              )) as closed
        from tasks t
       where t.id = $1::numeric`,
-    [taskId, nowNs(deps)],
+    [scorecard.task_id, nowNs(deps)],
   );
   if (!task) return notFound("no such task");
   if (account !== task.verifier && account !== task.poster) {
@@ -396,7 +403,25 @@ async function requireScorecardRight(
       "only the verifier or the poster of the task may upload its scorecard",
     );
   }
+  requireOwnScorecard(deps, scorecard, account);
   if (!task.closed) return fail(409, "too_early", "the task's reveal window has not closed");
+}
+
+/**
+ * A scorecard is the word of the account that uploads it, so it has to name that account as its
+ * `verifier` (P03-R29). Otherwise the poster could publish one in the verifier's name, or either
+ * could name somebody else. And the Judge's name goes with the Judge's account alone: a scorecard
+ * whose `judge.software` is branded as the Judge's (`isJudgeBranded`) is taken from
+ * `deps.judgeAccount`, and from no account when that is not set. Either way the answer is a 403.
+ */
+function requireOwnScorecard(deps: ApiDeps, scorecard: Scorecard, account: string): void {
+  if (scorecard.verifier !== account) {
+    fail(403, "forbidden", "a scorecard must name its uploader as verifier");
+  }
+  // An unset `judgeAccount` is equal to no account, so then every such scorecard is refused.
+  if (isJudgeBranded(scorecard.judge.software) && account !== deps.judgeAccount) {
+    fail(403, "forbidden", "only the team's Judge may publish Judge scorecards");
+  }
 }
 
 /**

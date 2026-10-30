@@ -50,7 +50,9 @@ import { resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 //
 // The data is the lifecycle of `@tender/indexer/testing`: task 1 has the poster, the judge as its
 // verifier, and alice and bob as entrants. Its reveal deadline is `REVEAL_DEADLINE`, and the clock
-// is a variable, so a test can move it across the deadline.
+// is a variable, so a test can move it across the deadline. The judge is also the team's Judge
+// (`deps.judgeAccount`), the one account that may publish a scorecard under the Judge's name; any
+// other account publishes one of its own (`scorecardBy`).
 
 const { poster, judge, alice, bob, carol } = FIXTURE_ACCOUNTS;
 const SECOND = 1_000_000_000n;
@@ -64,7 +66,7 @@ let nowNs = TEST_NOW;
 let nextHeight = 100n;
 
 beforeAll(async () => {
-  deps = await testDeps({ now: () => nowNs });
+  deps = await testDeps({ now: () => nowNs, judgeAccount: judge });
 });
 
 afterAll(() => deps.db.close());
@@ -195,6 +197,20 @@ function scorecardOf(taskId: string, over: Partial<Scorecard> = {}): Scorecard {
   };
 }
 
+/**
+ * The scorecard of `taskId` as `account` writes it: from the Judge it is `scorecardOf` as it is,
+ * and from any other account it names that account as the verifier and some software of its own,
+ * since only the Judge may publish under the Judge's name. `over` replaces any field.
+ */
+function scorecardBy(account: string, taskId: string, over: Partial<Scorecard> = {}): Scorecard {
+  if (account === judge) return scorecardOf(taskId, over);
+  return scorecardOf(taskId, {
+    verifier: account,
+    judge: { software: "poster-script/1", model: null },
+    ...over,
+  });
+}
+
 /** A `task_created` line for task `id`: the captured one, with the given fields replaced. */
 function taskLine(id: number, over: Record<string, string> = {}): string {
   return eventLine("task_created", { id: String(id), ...over });
@@ -266,6 +282,36 @@ async function blobCount(): Promise<number> {
 async function seed(): Promise<number> {
   await seedLifecycle(deps.db);
   return blobCount();
+}
+
+const NAMES_UPLOADER = {
+  error: "forbidden",
+  message: "a scorecard must name its uploader as verifier",
+};
+const JUDGE_ONLY = {
+  error: "forbidden",
+  message: "only the team's Judge may publish Judge scorecards",
+};
+
+/**
+ * Uploads `document` as a scorecard from `account` and expects the 403 `expected`, with nothing
+ * kept of it: the blobs, the row under its hash and the records of uploads are as they were.
+ */
+async function expectScorecardRefused(
+  document: Scorecard,
+  account: string,
+  expected: ErrorBody,
+  app?: App,
+): Promise<void> {
+  const bytes = canonicalJson(document);
+  const hash = sha256Hex(bytes);
+  const blobs = await blobCount();
+  const row = await rowOf(hash);
+  const res = await post<ErrorBody>("/v1/blobs", blobBody("scorecard", bytes), account, app);
+  expect([res.status, res.body], account).toEqual([403, expected]);
+  expect(await blobCount(), account).toBe(blobs);
+  expect(await rowOf(hash), account).toEqual(row);
+  expect(await uploadCount(), account).toBe(0);
 }
 
 const NOT_FOUND = { error: "not_found", message: expect.any(String) };
@@ -652,26 +698,29 @@ test("scorecard_upload_only_by_verifier_or_poster", async () => {
   const upload = (document: Scorecard, over = {}) =>
     blobBody("scorecard", canonicalJson(document), over);
 
-  // The verifier and the poster of task 1 may publish its scorecard.
+  // The verifier and the poster of task 1 may publish its scorecard, each under its own name.
   const byVerifier = await post("/v1/blobs", upload(scorecardOf("1")), judge);
   expect(byVerifier.status).toBe(200);
   const byPoster = await post(
     "/v1/blobs",
-    upload(scorecardOf("1", { generated_at: "2026-10-30T11:00:00Z" })),
+    upload(scorecardBy(poster, "1", { generated_at: "2026-10-30T11:00:00Z" })),
     poster,
   );
   expect(byPoster.status).toBe(200);
   expect(byPoster.body.sha256).not.toBe(byVerifier.body.sha256);
 
-  // Nobody else may, the entrants included.
+  // Nobody else may, the entrants included, though each names itself as a verifier would.
   for (const account of [alice, bob, carol]) {
     const refused = await post<ErrorBody>(
       "/v1/blobs",
-      upload(scorecardOf("1", { generated_at: "2026-10-30T12:00:00Z" })),
+      upload(scorecardBy(account, "1", { generated_at: "2026-10-30T12:00:00Z" })),
       account,
     );
     expect(refused.status, account).toBe(403);
-    expect(refused.body.error).toBe("forbidden");
+    expect(refused.body, account).toEqual({
+      error: "forbidden",
+      message: "only the verifier or the poster of the task may upload its scorecard",
+    });
   }
   expect(await blobCount()).toBe(base + 2);
 
@@ -714,7 +763,7 @@ test("scorecard_upload_waits_for_the_reveal_deadline", async () => {
   // wait, and nothing is stored.
   nowNs = REVEAL_DEADLINE - 1n;
   for (const account of [judge, poster]) {
-    const early = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("1")), account);
+    const early = await post<ErrorBody>("/v1/blobs", upload(scorecardBy(account, "1")), account);
     expect(early.status, account).toBe(409);
     expect(early.body, account).toEqual(tooEarly);
   }
@@ -725,7 +774,7 @@ test("scorecard_upload_waits_for_the_reveal_deadline", async () => {
   const pretty = blobBody("scorecard", utf8(JSON.stringify(scorecardOf("1"), null, 2)));
   const notCanonical = await post<ErrorBody>("/v1/blobs", pretty, judge);
   expect([notCanonical.status, notCanonical.body.message]).toEqual([400, "not canonical JSON"]);
-  const nameless = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("1")), alice);
+  const nameless = await post<ErrorBody>("/v1/blobs", upload(scorecardBy(alice, "1")), alice);
   expect([nameless.status, nameless.body.error]).toEqual([403, "forbidden"]);
   const unknown = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("77")), judge);
   expect([unknown.status, unknown.body.error]).toEqual([404, "not_found"]);
@@ -735,7 +784,7 @@ test("scorecard_upload_waits_for_the_reveal_deadline", async () => {
   nowNs = REVEAL_DEADLINE;
   expect((await post("/v1/blobs", upload(scorecardOf("1")), judge)).status).toBe(200);
   nowNs = REVEAL_DEADLINE + 1n;
-  const byPoster = upload(scorecardOf("1", { generated_at: "2026-10-30T11:00:00Z" }));
+  const byPoster = upload(scorecardBy(poster, "1", { generated_at: "2026-10-30T11:00:00Z" }));
   expect((await post("/v1/blobs", byPoster, poster)).status).toBe(200);
   expect(await blobCount()).toBe(base + 2);
 
@@ -748,6 +797,136 @@ test("scorecard_upload_waits_for_the_reveal_deadline", async () => {
   nowNs = later;
   expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(200);
   expect(await blobCount()).toBe(base + 3);
+});
+
+test("scorecard_must_name_its_uploader_as_verifier", async () => {
+  const base = await seed();
+  // Task 2 has the poster of task 1 and closes its reveals with it, but its verifier is alice: any
+  // account a task names may publish its scorecard, and the card is that account's own word.
+  await openTask(2, REVEAL_DEADLINE, [], { verifier: alice });
+  nowNs = REVEAL_DEADLINE;
+  const upload = (document: Scorecard) => blobBody("scorecard", canonicalJson(document));
+  const card = (verifier: string) =>
+    scorecardOf("2", { verifier, judge: { software: "my-judge/2", model: null } });
+
+  // Alice may not put another name on her card, the poster's, the Judge's or a stranger's.
+  for (const other of [poster, judge, bob]) {
+    await expectScorecardRefused(card(other), alice, NAMES_UPLOADER);
+  }
+  // The poster may not publish alice's card as hers, or one that names the Judge: it is no verifier.
+  await expectScorecardRefused(card(alice), poster, NAMES_UPLOADER);
+  await expectScorecardRefused(card(judge), poster, NAMES_UPLOADER);
+  // Nor may the Judge's account, the verifier of task 1, put a name on a card but its own.
+  await expectScorecardRefused(scorecardOf("1", { verifier: alice }), judge, NAMES_UPLOADER);
+  expect(await blobCount()).toBe(base);
+
+  // Each of them may publish a card that names itself, and the row says whose it is.
+  const byVerifier = await post("/v1/blobs", upload(card(alice)), alice);
+  expect(byVerifier.status).toBe(200);
+  expect(await rowOf(byVerifier.body.sha256)).toEqual({
+    kind: "scorecard",
+    content_type: "application/json",
+    task_id: "2",
+    uploader: alice,
+    is_public: true,
+  });
+  expect((await post("/v1/blobs", upload(card(poster)), poster)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(scorecardOf("1")), judge)).status).toBe(200);
+  expect(await blobCount()).toBe(base + 3);
+
+  // The bytes that alice stored are hers: the poster cannot send them again as its own.
+  await expectScorecardRefused(card(alice), poster, NAMES_UPLOADER);
+});
+
+test("only_the_judge_account_publishes_judge_scorecards", async () => {
+  const base = await seed();
+  await openTask(2, REVEAL_DEADLINE, [], { verifier: alice });
+  nowNs = REVEAL_DEADLINE;
+  const upload = (document: Scorecard) => blobBody("scorecard", canonicalJson(document));
+  const software = (name: string) => ({ software: name, model: null });
+  const bySoftware = (account: string, name: string) =>
+    scorecardBy(account, "2", { judge: software(name) });
+
+  // Alice names herself, but calls her software the Judge's, in any of the ways the schema lets her
+  // write it. The poster, naming itself, does the same. Neither is the Judge: both are refused.
+  for (const name of [
+    "tender-judge/1",
+    "Tender_Judge",
+    "TENDERJUDGE-x",
+    "tender.judge/2",
+    "t-e-n-d-e-r_j-u-d-g-e",
+  ]) {
+    await expectScorecardRefused(bySoftware(alice, name), alice, JUDGE_ONLY);
+    await expectScorecardRefused(bySoftware(poster, name), poster, JUDGE_ONLY);
+  }
+  expect(await blobCount()).toBe(base);
+
+  // A look-alike is no name at all, so a card with one is a 400 from the schema and never gets as
+  // far as this rule.
+  for (const name of ["tender\u{2010}judge/1", "tender\u{200d}judge/1", "tender judge/1"]) {
+    const res = await post<ErrorBody>("/v1/blobs", upload(bySoftware(alice, name)), alice);
+    expect(res.status, name).toBe(400);
+    expect(res.body.issues, name).toEqual([
+      { path: ["judge", "software"], message: expect.any(String), code: "invalid_format" },
+    ]);
+  }
+  expect(await blobCount()).toBe(base);
+
+  // Any other name is hers to choose.
+  for (const name of ["my-judge/2", "tender-agent", "judge/tender"]) {
+    expect((await post("/v1/blobs", upload(bySoftware(alice, name)), alice)).status, name).toBe(
+      200,
+    );
+  }
+  expect(await blobCount()).toBe(base + 3);
+
+  // The Judge's account may use the Judge's name, and is the account that `deps.judgeAccount` says.
+  const asJudge = appWith({ judgeAccount: judge });
+  const published = await post("/v1/blobs", upload(scorecardOf("1")), judge, asJudge);
+  expect(published.status).toBe(200);
+  expect(await rowOf(published.body.sha256)).toMatchObject({ uploader: judge, task_id: "1" });
+  expect(await blobCount()).toBe(base + 4);
+  // Verifying a task does not make an account the Judge. When `deps.judgeAccount` is another
+  // account, the verifier of task 1 is refused the name, and when none is set, so is every account.
+  const other = appWith({ judgeAccount: carol });
+  const unset = appWith({ judgeAccount: undefined });
+  const again = (at: string) => scorecardOf("1", { generated_at: at });
+  await expectScorecardRefused(again("2026-10-30T11:00:00Z"), judge, JUDGE_ONLY, other);
+  await expectScorecardRefused(again("2026-10-30T12:00:00Z"), judge, JUDGE_ONLY, unset);
+  // The Judge's account is no more than any other account for a name that is not the Judge's.
+  const own = scorecardOf("1", { judge: software("my-judge/2") });
+  expect((await post("/v1/blobs", upload(own), judge, unset)).status).toBe(200);
+  expect(await blobCount()).toBe(base + 5);
+});
+
+test("scorecard_attribution_is_told_after_the_right_to_upload_and_before_the_clock", async () => {
+  const base = await seed();
+  // The reveal window of task 2 is open: the clock stays where it starts, before its deadline.
+  await openTask(2, REVEAL_DEADLINE, [], { verifier: alice });
+  const upload = (document: Scorecard) => blobBody("scorecard", canonicalJson(document));
+  const wait = { error: "too_early", message: "the task's reveal window has not closed" };
+
+  // A card that is right for its sender is told to wait. One that is not is told what is wrong with
+  // it at once, since waiting would not mend it.
+  const early = await post<ErrorBody>("/v1/blobs", upload(scorecardBy(alice, "2")), alice);
+  expect([early.status, early.body]).toEqual([409, wait]);
+  await expectScorecardRefused(scorecardOf("2", { verifier: judge }), alice, NAMES_UPLOADER);
+  await expectScorecardRefused(scorecardOf("2", { verifier: alice }), alice, JUDGE_ONLY);
+
+  // Whether the account may upload at all comes before what the card says: carol is neither the
+  // verifier nor the poster, and is told that whoever the card names and whatever it is called.
+  const stranger = {
+    error: "forbidden",
+    message: "only the verifier or the poster of the task may upload its scorecard",
+  };
+  for (const document of [
+    scorecardBy(carol, "2"),
+    scorecardOf("2", { verifier: alice }),
+    scorecardOf("2", { verifier: carol }),
+  ]) {
+    await expectScorecardRefused(document, carol, stranger);
+  }
+  expect(await blobCount()).toBe(base);
 });
 
 test("heldout_hash_must_match_commitment", async () => {
@@ -2010,10 +2189,10 @@ test("scorecard_waits_for_every_task_sharing_its_heldout", async () => {
   // the poster are told to wait, and whoever has no right to upload is told that first.
   nowNs = REVEAL_DEADLINE;
   for (const account of [judge, poster]) {
-    const early = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("2")), account);
+    const early = await post<ErrorBody>("/v1/blobs", upload(scorecardBy(account, "2")), account);
     expect([early.status, early.body], account).toEqual([409, tooEarly]);
   }
-  const stranger = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("2")), alice);
+  const stranger = await post<ErrorBody>("/v1/blobs", upload(scorecardBy(alice, "2")), alice);
   expect([stranger.status, stranger.body.error]).toEqual([403, "forbidden"]);
   nowNs = minute - 1n;
   expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(409);
@@ -2022,7 +2201,7 @@ test("scorecard_waits_for_every_task_sharing_its_heldout", async () => {
   // When task 3 closes, both may publish. Task 4 is still open, and shares nothing with them.
   nowNs = minute;
   expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(200);
-  expect((await post("/v1/blobs", upload(scorecardOf("3")), poster)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(scorecardBy(poster, "3")), poster)).status).toBe(200);
   const own = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("4")), judge);
   expect([own.status, own.body]).toEqual([409, tooEarly]);
   nowNs = hour;
@@ -2064,13 +2243,13 @@ test("a_strangers_copy_of_a_heldout_does_not_hold_a_scorecard_back", async () =>
   const early = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("2")), judge);
   expect([early.status, early.body]).toEqual([409, tooEarly]);
   nowNs = minute - 1n;
-  expect((await post("/v1/blobs", upload(scorecardOf("2")), poster)).status).toBe(409);
+  expect((await post("/v1/blobs", upload(scorecardBy(poster, "2")), poster)).status).toBe(409);
   expect(await blobCount()).toBe(0);
 
   // Carol's task has days to run, and holds nothing back.
   nowNs = minute;
   expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(200);
-  expect((await post("/v1/blobs", upload(scorecardOf("3")), poster)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(scorecardBy(poster, "3")), poster)).status).toBe(200);
   expect(await blobCount()).toBe(2);
 
   // Her own task waits for its own reveal window, like any other.

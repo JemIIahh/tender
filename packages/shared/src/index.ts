@@ -11,5 +11,6 @@ export * from "./hash";
 export * from "./phase";
 export * from "./profile";
 export * from "./scorecard";
+export * from "./signin";
 export * from "./storage";
 export * from "./views";

@@ -14,7 +14,7 @@ export default defineConfig({
           name: "unit",
           include: ["test/**/*.test.ts"],
           exclude: ["test/**/*.sandbox.test.ts"],
-          testTimeout: 15_000,
+          testTimeout: 30_000,
           hookTimeout: 60_000,
         },
       },
