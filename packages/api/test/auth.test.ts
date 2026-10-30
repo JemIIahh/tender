@@ -1,0 +1,766 @@
+import { Buffer } from "node:buffer";
+import type { AuthErrorCode, KeyPermission } from "@tender/client";
+import { FIXTURE_ACCOUNTS, FIXTURE_BRIEF, FIXTURE_CONTRACT } from "@tender/indexer/testing";
+import { canonicalJson, sha256Hex } from "@tender/shared";
+import { Hono } from "hono";
+import { Account, KeyPair, KeyPairSigner, type Provider } from "near-api-js";
+import * as nearNep413 from "near-api-js/nep413";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
+import { type ChallengeResponse, requireAuth, type SignInResponse } from "../src/auth";
+import { handleError } from "../src/format";
+import { type ApiDeps, createApp, type ErrorBody } from "../src/index";
+import type { AuthVariables } from "../src/routes/blobs";
+import { fakeClient, resetDb, TEST_NOW, testDeps } from "./helpers";
+
+// NEP-413 sign-in. Every test signs with near-api-js itself, as a wallet or an agent would, so
+// none of them leans on the serializer in `@tender/client` that the API verifies with. The chain
+// is a stub: `viewAccessKey` answers what each test needs. The clock is a variable, so a test can
+// move time across an expiry.
+
+const { alice, bob } = FIXTURE_ACCOUNTS;
+const MS = 1_000_000n;
+const SECOND = 1_000n * MS;
+const MINUTE = 60n * SECOND;
+const HOUR = 60n * MINUTE;
+const WEB = "https://tender.example";
+
+/** What every refusal of a token says, whatever was wrong with it. */
+const UNAUTHORIZED: ErrorBody = {
+  error: "unauthorized",
+  message: "sign in with a bearer token from POST /v1/auth/verify",
+};
+
+/** What a refused sign-in says: fixed text per code, none of it from the request. */
+const REFUSALS: Record<AuthErrorCode, string> = {
+  bad_nonce: "that challenge was not issued, is used already or has expired",
+  wrong_recipient: "the message was signed for another recipient",
+  bad_signature: "the signature is not that key's signature of the sign-in message and challenge",
+  key_not_found: "that key is not on that account",
+  key_not_allowed:
+    "that key may not sign in: use a full-access key, or a function-call key limited to the Tender contract",
+};
+
+interface VerifyBody {
+  account_id: string;
+  public_key: string;
+  signature: string;
+  nonce: string;
+  message: string;
+  recipient: string;
+}
+
+let deps: ApiDeps;
+let nowNs = TEST_NOW;
+
+beforeAll(async () => {
+  deps = await testDeps({ now: () => nowNs });
+});
+
+afterAll(() => deps.db.close());
+
+beforeEach(async () => {
+  await resetDb(deps.db);
+  nowNs = TEST_NOW;
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+// ---- Helpers ----------------------------------------------------------------------------------
+
+/** A time in nanoseconds as the API writes one: ISO 8601, to the millisecond, in UTC. */
+const isoOf = (ns: bigint) => new Date(Number(ns / MS)).toISOString();
+
+const toBase64 = (bytes: Uint8Array) => Buffer.from(bytes).toString("base64");
+
+/** The whole API, over the shared database. `over` replaces any of the deps. */
+function appWith(over: Partial<ApiDeps> = {}): Hono {
+  return createApp({ ...deps, ...over });
+}
+
+/** A chain whose every key has `permission`, or no key at all for null. */
+function chainWith(permission: KeyPermission | null) {
+  return fakeClient({
+    viewAccessKey: async () => (permission === null ? null : { permission }),
+  });
+}
+
+const functionCallTo = (receiver_id: string): KeyPermission => ({
+  FunctionCall: { receiver_id, method_names: [] },
+});
+
+interface Reply<T> {
+  status: number;
+  body: T;
+  headers: Headers;
+}
+
+/** Posts `body` as JSON (text is sent as it is), or nothing for `undefined`. */
+async function post<T = unknown>(
+  app: Hono,
+  path: string,
+  body?: unknown,
+  headers: Record<string, string> = {},
+): Promise<Reply<T>> {
+  const res = await app.request(path, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: body === undefined || typeof body === "string" ? body : JSON.stringify(body),
+  });
+  return { status: res.status, body: (await res.json()) as T, headers: res.headers };
+}
+
+const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
+
+/** `POST /v1/auth/challenge`, which answers 200. */
+async function challenge(app: Hono): Promise<ChallengeResponse> {
+  const reply = await post<ChallengeResponse>(app, "/v1/auth/challenge");
+  expect(reply.status).toBe(200);
+  return reply.body;
+}
+
+interface SignOptions {
+  /** The account the body names. Default: alice. */
+  account?: string;
+  /** What is signed, and sent as `message`. Default: the challenge's own. */
+  message?: string;
+  /** What is signed, and sent as `recipient`. Default: the challenge's own. */
+  recipient?: string;
+  /** Replaces body fields after signing, which makes the body say what was not signed. */
+  over?: Partial<VerifyBody>;
+}
+
+/** The body of `POST /v1/auth/verify` for `key` signing `ch`, signed by near-api-js. */
+async function signChallenge(
+  key: KeyPair,
+  ch: Pick<ChallengeResponse, "nonce" | "message" | "recipient">,
+  options: SignOptions = {},
+): Promise<VerifyBody> {
+  const account = options.account ?? alice;
+  const message = options.message ?? ch.message;
+  const recipient = options.recipient ?? ch.recipient;
+  // Signing a NEP-413 message is local: the account's provider is never called.
+  const signerAccount = new Account(account, {} as unknown as Provider, new KeyPairSigner(key));
+  const signed = await nearNep413.signMessage({
+    signerAccount,
+    payload: { message, recipient, nonce: Uint8Array.from(Buffer.from(ch.nonce, "base64")) },
+  });
+  return {
+    account_id: account,
+    public_key: signed.publicKey.toString(),
+    signature: toBase64(signed.signature),
+    nonce: ch.nonce,
+    message,
+    recipient,
+    ...options.over,
+  };
+}
+
+/** A whole sign-in: a challenge, signed by a fresh key (or `key`) and verified, which must work. */
+async function signIn(app: Hono, options: SignOptions & { key?: KeyPair } = {}) {
+  const key = options.key ?? KeyPair.fromRandom("ed25519");
+  const ch = await challenge(app);
+  const reply = await post<SignInResponse>(
+    app,
+    "/v1/auth/verify",
+    await signChallenge(key, ch, options),
+  );
+  expect(reply.status).toBe(200);
+  return { ...reply.body, key, challenge: ch };
+}
+
+/** A route behind `requireAuth` alone, which says who the request is signed in as. */
+function probe(over: Partial<ApiDeps> = {}): Hono<{ Variables: AuthVariables }> {
+  const app = new Hono<{ Variables: AuthVariables }>();
+  app.onError(handleError);
+  app.get("/whoami", requireAuth({ ...deps, ...over }), (c) =>
+    c.json({ account: c.var.account, key_kind: c.var.keyKind }),
+  );
+  return app;
+}
+
+function whoami(app: Hono<{ Variables: AuthVariables }>, authorization?: string) {
+  return app.request("/whoami", {
+    headers: authorization === undefined ? {} : { authorization },
+  });
+}
+
+/** Both uploads that need a signed-in account, with bodies that are valid. */
+const BRIEF_BYTES = canonicalJson(FIXTURE_BRIEF);
+const HELDOUT_BYTES = canonicalJson({ exact: { expected: ["42"] } });
+const UPLOADS: Array<[string, unknown]> = [
+  [
+    "/v1/blobs",
+    {
+      kind: "brief",
+      content_type: "application/json",
+      content_base64: toBase64(BRIEF_BYTES),
+    },
+  ],
+  [
+    "/v1/heldout",
+    { commitment: sha256Hex(HELDOUT_BYTES), content_base64: toBase64(HELDOUT_BYTES) },
+  ],
+];
+
+async function tokenRows() {
+  return await deps.db.query<{
+    token_sha256: string;
+    account: string;
+    public_key: string;
+    key_kind: string;
+    expires_at: Date;
+  }>("select token_sha256, account, public_key, key_kind, expires_at from auth_tokens");
+}
+
+async function challengeRows() {
+  return await deps.db.query<{ nonce: string; expires_at: Date; used: boolean }>(
+    "select nonce, expires_at, used from auth_challenges order by nonce",
+  );
+}
+
+// ---- Sign-in ----------------------------------------------------------------------------------
+
+test("challenge_then_verify_issues_token", async () => {
+  const app = appWith();
+  const key = KeyPair.fromRandom("ed25519");
+
+  const issued = await post<ChallengeResponse>(app, "/v1/auth/challenge");
+  expect(issued.status).toBe(200);
+  expect(issued.headers.get("cache-control")).toBe("no-store");
+  expect(issued.body).toEqual({
+    nonce: expect.any(String),
+    message: "Sign in to Tender",
+    recipient: "tender",
+    expires_at: isoOf(TEST_NOW + 5n * MINUTE),
+  });
+  // The nonce is 32 random bytes in the one base64 spelling that `btoa` writes.
+  const raw = Buffer.from(issued.body.nonce, "base64");
+  expect(raw.length).toBe(32);
+  expect(raw.toString("base64")).toBe(issued.body.nonce);
+  expect(await challengeRows()).toEqual([
+    { nonce: issued.body.nonce, expires_at: new Date(isoOf(TEST_NOW + 5n * MINUTE)), used: false },
+  ]);
+
+  const verified = await post<SignInResponse>(
+    app,
+    "/v1/auth/verify",
+    await signChallenge(key, issued.body),
+  );
+  expect(verified.status).toBe(200);
+  expect(verified.headers.get("cache-control")).toBe("no-store");
+  const { token, expires_at, key_kind } = verified.body;
+  expect(Object.keys(verified.body).sort()).toEqual(["expires_at", "key_kind", "token"]);
+  // The token is 32 random bytes as base64url, and lives 12 hours.
+  expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  expect(Buffer.from(token, "base64url").length).toBe(32);
+  expect(expires_at).toBe(isoOf(TEST_NOW + 12n * HOUR));
+  expect(key_kind).toBe("full_access");
+
+  // The challenge is spent, and the database holds the hash of the token and nothing else of it.
+  expect((await challengeRows()).map((row) => row.used)).toEqual([true]);
+  const rows = await tokenRows();
+  expect(rows).toEqual([
+    {
+      token_sha256: sha256Hex(token),
+      account: alice,
+      public_key: key.getPublicKey().toString(),
+      key_kind: "full_access",
+      expires_at: new Date(expires_at),
+    },
+  ]);
+  expect(JSON.stringify(rows)).not.toContain(token);
+
+  // The token signs requests in as the account that proved itself.
+  const who = await whoami(probe(), `Bearer ${token}`);
+  expect(await who.json()).toEqual({ account: alice, key_kind: "full_access" });
+  const upload = await post<{ sha256: string }>(app, "/v1/blobs", UPLOADS[0]?.[1], bearer(token));
+  expect(upload.status).toBe(200);
+  const [blob] = await deps.db.query<{ uploader: string }>(
+    "select uploader from blobs where sha256 = $1",
+    [upload.body.sha256],
+  );
+  expect(blob?.uploader).toBe(alice);
+});
+
+test("every_challenge_is_its_own", async () => {
+  const app = appWith();
+  const first = await challenge(app);
+  const second = await challenge(app);
+  expect(first.nonce).not.toBe(second.nonce);
+  expect((await challengeRows()).map((row) => row.nonce).sort()).toEqual(
+    [first.nonce, second.nonce].sort(),
+  );
+});
+
+test("nonce_replay_rejected", async () => {
+  const app = appWith();
+  const key = KeyPair.fromRandom("ed25519");
+  const ch = await challenge(app);
+  const body = await signChallenge(key, ch);
+
+  const first = await post<SignInResponse>(app, "/v1/auth/verify", body);
+  expect(first.status).toBe(200);
+
+  // The very same request again, and a new signature over the same nonce: both are replays.
+  for (const replay of [body, await signChallenge(key, ch)]) {
+    const again = await post<ErrorBody>(app, "/v1/auth/verify", replay);
+    expect(again.status).toBe(401);
+    expect(again.body).toEqual({ error: "bad_nonce", message: REFUSALS.bad_nonce });
+    expect(again.headers.get("www-authenticate")).toBe("Bearer");
+  }
+  expect(await tokenRows()).toHaveLength(1);
+});
+
+test("parallel_verifies_issue_one_token", async () => {
+  // Both requests pass the signature and key checks before either spends the nonce: they wait
+  // in the lookup until both are there, so the spend is what has to let one of them through.
+  let arrived = 0;
+  let release: () => void = () => undefined;
+  const both = new Promise<void>((resolve) => {
+    release = resolve;
+    setTimeout(resolve, 250);
+  });
+  const client = fakeClient({
+    viewAccessKey: async () => {
+      arrived += 1;
+      if (arrived === 2) release();
+      await both;
+      return { permission: "FullAccess" };
+    },
+  });
+  const app = appWith({ client });
+  const ch = await challenge(app);
+  // Two accounts, each with a key of its own, sign the one challenge.
+  const bodies = [
+    await signChallenge(KeyPair.fromRandom("ed25519"), ch, { account: alice }),
+    await signChallenge(KeyPair.fromRandom("ed25519"), ch, { account: bob }),
+  ];
+
+  const replies = await Promise.all(bodies.map((body) => post(app, "/v1/auth/verify", body)));
+
+  expect(replies.map((reply) => reply.status).sort()).toEqual([200, 401]);
+  const refused = replies.find((reply) => reply.status === 401);
+  expect(refused?.body).toEqual({ error: "bad_nonce", message: REFUSALS.bad_nonce });
+  const rows = await tokenRows();
+  expect(rows).toHaveLength(1);
+  const winner = replies.find((reply) => reply.status === 200)?.body as SignInResponse;
+  expect(rows[0]?.token_sha256).toBe(sha256Hex(winner.token));
+});
+
+test("expired_challenge_rejected", async () => {
+  const app = appWith();
+  const key = KeyPair.fromRandom("ed25519");
+
+  // A challenge lives 5 minutes, up to but not including the instant it expires.
+  const early = await challenge(app);
+  const late = await challenge(app);
+  const earlyBody = await signChallenge(key, early);
+  const lateBody = await signChallenge(key, late);
+
+  nowNs = TEST_NOW + 5n * MINUTE - 1n;
+  const ok = await post(app, "/v1/auth/verify", earlyBody);
+  expect(ok.status).toBe(200);
+
+  nowNs = TEST_NOW + 5n * MINUTE;
+  const expired = await post<ErrorBody>(app, "/v1/auth/verify", lateBody);
+  expect(expired.status).toBe(401);
+  expect(expired.body).toEqual({ error: "bad_nonce", message: REFUSALS.bad_nonce });
+  expect(expired.headers.get("www-authenticate")).toBe("Bearer");
+
+  nowNs = TEST_NOW + 2n * HOUR;
+  const muchLater = await post<ErrorBody>(app, "/v1/auth/verify", lateBody);
+  expect(muchLater.status).toBe(401);
+  expect(muchLater.body.error).toBe("bad_nonce");
+  expect(await tokenRows()).toHaveLength(1);
+});
+
+test("function_call_key_for_tender_accepted", async () => {
+  const lookups: Array<[string, string]> = [];
+  const client = fakeClient({
+    viewAccessKey: async (account, key) => {
+      lookups.push([account, key]);
+      return {
+        permission: { FunctionCall: { receiver_id: FIXTURE_CONTRACT, method_names: ["x"] } },
+      };
+    },
+  });
+  const app = appWith({ client });
+  const key = KeyPair.fromRandom("ed25519");
+
+  const ch = await challenge(app);
+  const reply = await post<SignInResponse>(
+    app,
+    "/v1/auth/verify",
+    await signChallenge(key, ch, { account: bob }),
+  );
+
+  expect(reply.status).toBe(200);
+  expect(reply.body.key_kind).toBe("function_call");
+  // The key was looked up on the account that claimed it, in its canonical spelling.
+  expect(lookups).toEqual([[bob, key.getPublicKey().toString()]]);
+  const [row] = await tokenRows();
+  expect(row).toMatchObject({ account: bob, key_kind: "function_call" });
+  // Requests signed in with it see the kind of the key.
+  const who = await whoami(probe(), `Bearer ${reply.body.token}`);
+  expect(await who.json()).toEqual({ account: bob, key_kind: "function_call" });
+});
+
+test("function_call_key_for_other_contract_rejected", async () => {
+  const app = appWith({ client: chainWith(functionCallTo("other.test.near")) });
+  const ch = await challenge(app);
+
+  const reply = await post<ErrorBody>(
+    app,
+    "/v1/auth/verify",
+    await signChallenge(KeyPair.fromRandom("ed25519"), ch),
+  );
+
+  expect(reply.status).toBe(401);
+  expect(reply.body).toEqual({ error: "key_not_allowed", message: REFUSALS.key_not_allowed });
+  expect(await tokenRows()).toEqual([]);
+});
+
+// ---- Refusals ---------------------------------------------------------------------------------
+
+test("every_auth_error_is_a_fixed_401", async () => {
+  const key = KeyPair.fromRandom("ed25519");
+  const stranger = KeyPair.fromRandom("ed25519");
+  // Marks that must never come back in an answer: the account, and the text that was signed.
+  const account = "marker-account.test.near";
+  const message = "marker message";
+
+  /** One refused sign-in: what it sends, on which chain, and the code it must get. */
+  interface Case {
+    code: AuthErrorCode;
+    app?: Hono;
+    send: (ch: ChallengeResponse) => Promise<unknown>;
+  }
+  const cases: Record<string, Case> = {
+    "a nonce that was never issued": {
+      code: "bad_nonce",
+      send: async (ch) => {
+        const other = toBase64(crypto.getRandomValues(new Uint8Array(32)));
+        return signChallenge(key, { ...ch, nonce: other }, { account });
+      },
+    },
+    "a nonce that is not 32 bytes in canonical base64": {
+      code: "bad_nonce",
+      send: async (ch) => ({ ...(await signChallenge(key, ch, { account })), nonce: "abc" }),
+    },
+    "another recipient": {
+      code: "wrong_recipient",
+      send: (ch) => signChallenge(key, ch, { account, recipient: "evil" }),
+    },
+    "another message, signed correctly": {
+      code: "bad_signature",
+      send: (ch) => signChallenge(key, ch, { account, message }),
+    },
+    "a message that was not signed": {
+      code: "bad_signature",
+      send: (ch) => signChallenge(key, ch, { account, over: { message } }),
+    },
+    "another key's signature": {
+      code: "bad_signature",
+      send: async (ch) => ({
+        ...(await signChallenge(key, ch, { account })),
+        public_key: stranger.getPublicKey().toString(),
+      }),
+    },
+    "a key that is not on the account": {
+      code: "key_not_found",
+      app: appWith({ client: chainWith(null) }),
+      send: (ch) => signChallenge(key, ch, { account }),
+    },
+    "an account id that is no account id": {
+      code: "key_not_found",
+      send: (ch) => signChallenge(key, ch, { account: "Not An Account" }),
+    },
+    "a key that may not sign in": {
+      code: "key_not_allowed",
+      app: appWith({ client: chainWith(functionCallTo("other.test.near")) }),
+      send: (ch) => signChallenge(key, ch, { account }),
+    },
+    "a key that is not ed25519": {
+      code: "key_not_allowed",
+      send: async (ch) => ({
+        ...(await signChallenge(key, ch, { account })),
+        public_key: "secp256k1:marker-key",
+      }),
+    },
+  };
+
+  const seen = new Map<AuthErrorCode, Set<string>>();
+  for (const [name, { code, app = appWith(), send }] of Object.entries(cases)) {
+    const reply = await post<ErrorBody>(app, "/v1/auth/verify", await send(await challenge(app)));
+    expect(reply.status, name).toBe(401);
+    expect(reply.headers.get("www-authenticate"), name).toBe("Bearer");
+    expect(reply.body, name).toEqual({ error: code, message: REFUSALS[code] });
+    // None of the request is in the answer.
+    for (const marker of [account, "marker", "evil", "Not An Account", "abc"]) {
+      expect(JSON.stringify(reply.body), name).not.toContain(marker);
+    }
+    seen.set(code, (seen.get(code) ?? new Set<string>()).add(reply.body.message));
+  }
+  // The same code always says the same thing, and every code of the verifier is covered.
+  expect([...seen.keys()].sort()).toEqual(Object.keys(REFUSALS).sort());
+  for (const messages of seen.values()) expect(messages.size).toBe(1);
+  expect(await tokenRows()).toEqual([]);
+});
+
+test("chain_failure_is_a_500_and_keeps_the_challenge", async () => {
+  // A chain that is down is not the caller's fault: the answer is a 500 that says nothing of the
+  // fault, and the same challenge works when the chain is back.
+  const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const down = fakeClient({
+    viewAccessKey: async () => {
+      throw new Error("rpc down at https://marker-rpc.example/?key=secret");
+    },
+  });
+  const key = KeyPair.fromRandom("ed25519");
+  const ch = await challenge(appWith());
+  const body = await signChallenge(key, ch);
+
+  const failed = await post<ErrorBody>(appWith({ client: down }), "/v1/auth/verify", body);
+  expect(failed.status).toBe(500);
+  expect(failed.body).toEqual({ error: "internal", message: "internal error" });
+  expect(JSON.stringify(failed.body)).not.toContain("marker-rpc");
+  expect(log).toHaveBeenCalled();
+  expect(await tokenRows()).toEqual([]);
+
+  const retried = await post<SignInResponse>(appWith(), "/v1/auth/verify", body);
+  expect(retried.status).toBe(200);
+});
+
+test("malformed_verify_body_is_400", async () => {
+  const app = appWith();
+  const ch = await challenge(app);
+  const good = await signChallenge(KeyPair.fromRandom("ed25519"), ch);
+  const { signature: _signature, ...withoutSignature } = good;
+
+  const bad: Array<[string, unknown, string]> = [
+    ["not JSON", "{", "body is not valid JSON"],
+    ["an empty body", "", "body is not valid JSON"],
+    ["a list", [], "the request body does not fit its schema"],
+    ["null", "null", "the request body does not fit its schema"],
+    ["an empty object", {}, "the request body does not fit its schema"],
+    ["no signature", withoutSignature, "the request body does not fit its schema"],
+    ["a number for the account", { ...good, account_id: 5 }, "the request body does not fit"],
+    ["an unknown key", { ...good, callback_url: "https://x.example" }, "does not fit its schema"],
+  ];
+  for (const [name, body, message] of bad) {
+    const reply = await post<ErrorBody>(app, "/v1/auth/verify", body);
+    expect(reply.status, name).toBe(400);
+    expect(reply.body.error, name).toBe("bad_request");
+    expect(reply.body.message, name).toContain(message);
+  }
+  // The faults of a body that does not fit are listed.
+  const empty = await post<ErrorBody>(app, "/v1/auth/verify", {});
+  expect(empty.body.issues?.map((issue) => issue.path[0]).sort()).toEqual([
+    "account_id",
+    "message",
+    "nonce",
+    "public_key",
+    "recipient",
+    "signature",
+  ]);
+
+  // A body this large is no sign-in, and is not read.
+  const huge = await post<ErrorBody>(app, "/v1/auth/verify", {
+    ...good,
+    message: "x".repeat(9000),
+  });
+  expect(huge.status).toBe(413);
+  expect(huge.body.error).toBe("payload_too_large");
+
+  // None of it spent the challenge.
+  expect((await post(app, "/v1/auth/verify", good)).status).toBe(200);
+});
+
+// ---- Tokens -----------------------------------------------------------------------------------
+
+test("bearer_required_on_protected_routes", async () => {
+  const app = appWith();
+  const { token } = await signIn(app);
+  const refused: Array<[string, string | undefined]> = [
+    ["no header", undefined],
+    ["an empty header", ""],
+    ["the scheme alone", "Bearer"],
+    ["another scheme", `Basic ${Buffer.from("alice:secret").toString("base64")}`],
+    ["a token without a scheme", token],
+    ["a token under another scheme", `Token ${token}`],
+    ["a token that is too long", `Bearer ${token}A`],
+    ["a token that is too short", `Bearer ${token.slice(1)}`],
+    ["a token with more after it", `Bearer ${token} more`],
+    ["a token that is not base64url", `Bearer ${"!".repeat(43)}`],
+    ["a token that was never issued", `Bearer ${"A".repeat(43)}`],
+    [
+      "a token that differs in its last letter",
+      `Bearer ${token.slice(0, -1)}${token.endsWith("A") ? "B" : "A"}`,
+    ],
+  ];
+
+  for (const [path, body] of UPLOADS) {
+    for (const [name, authorization] of refused) {
+      const headers: Record<string, string> = authorization === undefined ? {} : { authorization };
+      const reply = await post<ErrorBody>(app, path, body, headers);
+      expect(reply.status, `${path}: ${name}`).toBe(401);
+      expect(reply.body, `${path}: ${name}`).toEqual(UNAUTHORIZED);
+      expect(reply.headers.get("www-authenticate"), `${path}: ${name}`).toBe("Bearer");
+    }
+    // The scheme is case-insensitive, as RFC 7235 has it.
+    for (const scheme of ["Bearer", "bearer", "BEARER"]) {
+      const reply = await post(app, path, body, { authorization: `${scheme} ${token}` });
+      expect(reply.status, `${path}: ${scheme}`).toBe(200);
+    }
+  }
+  // Nothing was stored for a request that was refused.
+  const [count] = await deps.db.query<{ n: number }>("select count(*)::int as n from blobs");
+  expect(count?.n).toBe(2);
+
+  // Not even a body that is too large or not JSON gets further than the refusal.
+  const junk = await post<ErrorBody>(app, "/v1/blobs", "x".repeat(500_000));
+  expect(junk.status).toBe(401);
+  expect(junk.body).toEqual(UNAUTHORIZED);
+
+  // What needs no account stays open: reads, and the sign-in itself.
+  for (const path of ["/v1/health", "/v1/tasks", "/v1/agents"]) {
+    expect((await app.request(path)).status, path).toBe(200);
+  }
+  expect((await post(app, "/v1/auth/challenge")).status).toBe(200);
+});
+
+test("token_expires_after_12h", async () => {
+  const app = probe();
+  const { token } = await signIn(appWith());
+  const check = async (at: bigint) => {
+    nowNs = at;
+    return await whoami(app, `Bearer ${token}`);
+  };
+
+  // It works as often as it is shown, up to but not including the 12th hour.
+  expect((await check(TEST_NOW)).status).toBe(200);
+  expect((await check(TEST_NOW + 6n * HOUR)).status).toBe(200);
+  expect((await check(TEST_NOW + 12n * HOUR - 1n)).status).toBe(200);
+
+  for (const at of [TEST_NOW + 12n * HOUR, TEST_NOW + 13n * HOUR]) {
+    const expired = await check(at);
+    expect(expired.status).toBe(401);
+    expect(await expired.json()).toEqual(UNAUTHORIZED);
+    expect(expired.headers.get("www-authenticate")).toBe("Bearer");
+  }
+
+  // The 12 hours run from the sign-in, not from the first challenge or from the epoch.
+  nowNs = TEST_NOW + 7n * HOUR;
+  const later = await signIn(appWith());
+  expect(later.expires_at).toBe(isoOf(TEST_NOW + 19n * HOUR));
+  nowNs = TEST_NOW + 18n * HOUR;
+  expect((await whoami(app, `Bearer ${later.token}`)).status).toBe(200);
+});
+
+test("the_token_is_never_logged_or_echoed", async () => {
+  const spies = (["log", "info", "warn", "error", "debug"] as const).map((level) =>
+    vi.spyOn(console, level).mockImplementation(() => undefined),
+  );
+  const app = appWith();
+  const { token } = await signIn(app);
+
+  // Used, sent where it does not belong, met by a database that fails, and refused once expired.
+  const used = await post(app, "/v1/blobs", UPLOADS[0]?.[1], bearer(token));
+  const misplaced = await post(app, "/v1/auth/verify", { token }, bearer(token));
+  vi.spyOn(deps.db, "query").mockRejectedValueOnce(new Error("database down"));
+  const failed = await post(app, "/v1/blobs", UPLOADS[0]?.[1], bearer(token));
+  nowNs = TEST_NOW + 13n * HOUR;
+  const expired = await post(app, "/v1/blobs", UPLOADS[0]?.[1], bearer(token));
+
+  expect(used.status).toBe(200);
+  expect(misplaced.status).toBe(400);
+  // A failing database is not a reason to sign in again: it is the API's fault, not the caller's.
+  expect(failed.status).toBe(500);
+  expect(failed.body).toEqual({ error: "internal", message: "internal error" });
+  expect(expired.status).toBe(401);
+  for (const reply of [used, misplaced, failed, expired]) {
+    expect(JSON.stringify(reply.body)).not.toContain(token);
+    expect(JSON.stringify([...reply.headers])).not.toContain(token);
+  }
+  // The failure was logged, and the log has no token in it.
+  expect(spies.some((spy) => spy.mock.calls.length > 0)).toBe(true);
+  for (const spy of spies) expect(JSON.stringify(spy.mock.calls)).not.toContain(token);
+});
+
+test("a_token_of_an_unknown_kind_signs_nothing_in", async () => {
+  // A row that something else wrote, with a kind this code has never heard of.
+  const token = "B".repeat(43);
+  await deps.db.query(
+    `insert into auth_tokens (token_sha256, account, public_key, key_kind, expires_at)
+     values ($1, $2, 'ed25519:x', 'delegate', $3::timestamptz)`,
+    [sha256Hex(token), alice, isoOf(TEST_NOW + HOUR)],
+  );
+
+  const reply = await whoami(probe(), `Bearer ${token}`);
+
+  expect(reply.status).toBe(401);
+  expect(await reply.json()).toEqual(UNAUTHORIZED);
+});
+
+// ---- Housekeeping -----------------------------------------------------------------------------
+
+test("creating_a_challenge_removes_what_expired_over_an_hour_ago", async () => {
+  const insertChallenge = (nonce: string, expires: bigint, used: boolean) =>
+    deps.db.query(
+      "insert into auth_challenges (nonce, expires_at, used) values ($1, $2::timestamptz, $3)",
+      [nonce, isoOf(expires), used],
+    );
+  const insertToken = (hash: string, expires: bigint) =>
+    deps.db.query(
+      `insert into auth_tokens (token_sha256, account, public_key, key_kind, expires_at)
+       values ($1, $2, 'ed25519:x', 'full_access', $3::timestamptz)`,
+      [hash, alice, isoOf(expires)],
+    );
+
+  await insertChallenge("old-unused", TEST_NOW - HOUR - SECOND, false);
+  await insertChallenge("old-used", TEST_NOW - 3n * HOUR, true);
+  await insertChallenge("recent-used", TEST_NOW - HOUR + SECOND, true);
+  await insertChallenge("recent-unused", TEST_NOW - MINUTE, false);
+  await insertChallenge("live", TEST_NOW + MINUTE, false);
+  await insertToken("old-token", TEST_NOW - HOUR - SECOND);
+  await insertToken("recent-token", TEST_NOW - HOUR + SECOND);
+  await insertToken("live-token", TEST_NOW + HOUR);
+
+  const fresh = await challenge(appWith());
+
+  expect((await challengeRows()).map((row) => row.nonce).sort()).toEqual(
+    ["live", "recent-unused", "recent-used", fresh.nonce].sort(),
+  );
+  expect((await tokenRows()).map((row) => row.token_sha256).sort()).toEqual([
+    "live-token",
+    "recent-token",
+  ]);
+});
+
+// ---- CORS -------------------------------------------------------------------------------------
+
+test("cors_covers_the_auth_routes", async () => {
+  const app = appWith({ network: "testnet", webOrigins: [WEB] });
+  for (const path of ["/v1/auth/challenge", "/v1/auth/verify"]) {
+    const preflight = await app.request(path, {
+      method: "OPTIONS",
+      headers: {
+        Origin: WEB,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "authorization,content-type",
+      },
+    });
+    expect(preflight.status, path).toBe(204);
+    expect(preflight.headers.get("access-control-allow-origin"), path).toBe(WEB);
+  }
+  // The answers, refusals included, can be read by the web app.
+  const challenged = await post(app, "/v1/auth/challenge", undefined, { origin: WEB });
+  const refused = await post(app, "/v1/auth/verify", {}, { origin: WEB });
+  const unauthorized = await post(app, "/v1/blobs", {}, { origin: WEB });
+  expect([challenged.status, refused.status, unauthorized.status]).toEqual([200, 400, 401]);
+  for (const reply of [challenged, refused, unauthorized]) {
+    expect(reply.headers.get("access-control-allow-origin")).toBe(WEB);
+  }
+});
