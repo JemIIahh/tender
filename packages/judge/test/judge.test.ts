@@ -28,8 +28,10 @@ import {
   JUDGE,
   judgeDeps,
   judgeRow,
+  MINUTE_NS,
   NO_NETWORK,
   NOW,
+  NOW_NS,
   PUBLIC_URL,
   putCriteria,
   putHeldout,
@@ -473,6 +475,79 @@ test("judge_fails_closed_when_its_heldout_checks_were_used_first", async () => {
     judge_reason: "held-out checks already used by task 3",
   });
   expect(chain.pick).not.toHaveBeenCalled();
+  expect(await isPublic(db, commitment)).toBe(false);
+});
+
+test("judge_waits_while_a_task_sharing_its_heldout_checks_takes_reveals", async () => {
+  // The poster's later task 9 commits to the same held-out checks and names another verifier, so
+  // this Judge's intake never saw it. Judging task 7 would publish the checks, and with them task
+  // 9's answers, while task 9 still takes reveals: task 7 waits, and nothing is fetched, stored or
+  // published, and no entry is scored.
+  const { view, chain, commitment } = await postJudged([["alice.test.near", "42", 10n]]);
+  const sharing = { criteria_hash: view.criteria_hash, heldout_commitment: commitment };
+  await insertTask(
+    db,
+    taskView({
+      id: "9",
+      verifier: "other-judge.test.near",
+      reveal_deadline: (NOW_NS + 5n * MINUTE_NS).toString(),
+      ...sharing,
+    }),
+  );
+  // A stranger's task with the same commitment does not hold it up: it can never publish them.
+  await insertTask(
+    db,
+    taskView({
+      id: "11",
+      poster: "stranger.test.near",
+      reveal_deadline: (NOW_NS + 60n * MINUTE_NS).toString(),
+      ...sharing,
+    }),
+  );
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
+  expect(warn).toHaveBeenCalledWith(
+    expect.stringMatching(/^judge: WARN task 7: its held-out checks are task 9's too/),
+  );
+  expect(chain.getAllEntries).not.toHaveBeenCalled();
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(await scorecardCount()).toBe(0);
+  expect(await isPublic(db, commitment)).toBe(false);
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: null });
+
+  // Task 9's reveals close at its deadline, inside task 7's pick window, and task 7 is judged.
+  expect(await judgeTask(judgeDeps(db, chain, { now: at(5) }), 7n)).toBe("picked");
+  expect(await isPublic(db, commitment)).toBe(true);
+});
+
+test("judge_looks_again_for_a_task_sharing_its_heldout_checks_before_publishing", async () => {
+  // The indexer stores the poster's task 9 while task 7's entries are being read. The look just
+  // before publishing finds it, and nothing is stored or published.
+  const { view, chain, commitment } = await postJudged([["alice.test.near", "42", 10n]]);
+  const entries = chain.getAllEntries.getMockImplementation();
+  chain.getAllEntries.mockImplementationOnce(async (taskId) => {
+    await insertTask(
+      db,
+      taskView({
+        id: "9",
+        verifier: "other-judge.test.near",
+        criteria_hash: view.criteria_hash,
+        heldout_commitment: commitment,
+        reveal_deadline: (NOW_NS + 5n * MINUTE_NS).toString(),
+      }),
+    );
+    return (await entries?.(taskId)) ?? [];
+  });
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
+  expect(chain.getAllEntries).toHaveBeenCalledTimes(1);
+  expect(warn).toHaveBeenCalledWith(
+    expect.stringMatching(/^judge: WARN task 7: its held-out checks are task 9's too/),
+  );
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(await scorecardCount()).toBe(0);
   expect(await isPublic(db, commitment)).toBe(false);
 });
 

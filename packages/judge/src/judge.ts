@@ -1,5 +1,11 @@
-import { putBlob, setBlobPublic } from "@tender/db";
-import { type EntryView, type Heldout, phaseOfTaskView, sha256Hex } from "@tender/shared";
+import { type Db, putBlob, setBlobPublic } from "@tender/db";
+import {
+  type EntryView,
+  type Heldout,
+  phaseOfTaskView,
+  sha256Hex,
+  type TaskView,
+} from "@tender/shared";
 import { fetchEntryContent, ownBlobHash } from "./fetch";
 import { loadDocuments, type P0Criteria } from "./intake";
 import type { HeldoutOf } from "./kinds/common";
@@ -24,9 +30,12 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   task at once.
  * - `skipped`: nothing was settled. The task is not one to judge now: the chain has no such task,
  *   it is settled, it names another verifier, it is not in its judging window, or intake did not
- *   accept it. Or judging hit trouble of the Judge's own, which it logs as a `WARN` and leaves for
- *   the next tick: a scorer that could not run, a scorecard that could not be built, a `pick` that
- *   failed. `E_SETTLED` from `pick` means someone settled the task first, and is not logged.
+ *   accept it. Or it waits, with a `WARN` each tick, for another task of its poster's with the
+ *   same held-out checks to close its reveals, since publishing the checks would hand out that
+ *   task's answers. Or judging hit trouble of the Judge's own, which it logs as a `WARN` and
+ *   leaves for the next tick: a scorer that could not run, a scorecard that could not be built, a
+ *   `pick` that failed. `E_SETTLED` from `pick` means someone settled the task first, and is not
+ *   logged.
  * - `failed_closed`: the criteria or held-out checks that the chain names cannot be read or used
  *   (they passed intake, so they are gone or changed). The task is never judged: its status
  *   becomes `failed_closed` with the reason, and the poster's fallback window applies.
@@ -76,6 +85,12 @@ export async function judgeTask(
     return "failed_closed";
   }
   const { criteria, heldout } = loaded.documents;
+  // Publishing the held-out checks hands out the answers of any other task of the poster's that
+  // commits to them, so while one still takes reveals, this task waits. Asked here, so that a
+  // task that waits costs little, and again just before publishing: the indexer may store such
+  // a task while this one is judged.
+  const sharing = await sharingTaskStillRevealing(deps.db, task, nowNs);
+  if (sharing !== null) return waitForReveals(taskId, sharing);
 
   const revealed = (await deps.client.getAllEntries(taskId)).filter(isRevealed);
   const fetched = await inParallel(revealed, FETCHES_AT_ONCE, async (entry) => ({
@@ -120,6 +135,12 @@ export async function judgeTask(
     return retryLater(taskId, `the scorecard could not be built (${describeError(error)})`);
   }
 
+  const stillSharing = await sharingTaskStillRevealing(
+    deps.db,
+    task,
+    BigInt(clock().getTime()) * NS_PER_MS,
+  );
+  if (stillSharing !== null) return waitForReveals(taskId, stillSharing);
   const sha256 = await putBlob(deps.db, {
     kind: "scorecard",
     contentType: "application/json",
@@ -242,6 +263,36 @@ async function contentOf(
 
 function isRevealed(entry: EntryView): entry is RevealedEntry {
   return entry.content_hash !== null && entry.uri !== null;
+}
+
+/**
+ * The lowest id of another task of `task`'s poster that commits to the same held-out checks and
+ * still takes reveals at `nowNs`, or `null`, as always for a task without held-out checks. Judging
+ * `task` publishes the checks, and with them that task's answers, whoever its verifier is and
+ * whatever intake made of it. Only the poster's own tasks count: anyone can post a task with a
+ * commitment once it is on chain, and a stranger must not be able to stall this one.
+ */
+async function sharingTaskStillRevealing(
+  db: Db,
+  task: TaskView,
+  nowNs: bigint,
+): Promise<string | null> {
+  if (task.heldout_commitment === null) return null;
+  // Ids and deadlines are numeric: `min`, `<>` and `>` compare them as numbers.
+  const [row] = await db.query<{ id: string | null }>(
+    `select min(id)::text as id from tasks
+      where poster = $1 and heldout_commitment = $2 and id <> $3 and reveal_deadline > $4`,
+    [task.poster, task.heldout_commitment, BigInt(task.id), nowNs],
+  );
+  return row?.id ?? null;
+}
+
+/** Logs that the task waits for task `sharing` to close its reveals, and says nothing settled. */
+function waitForReveals(taskId: bigint, sharing: string): "skipped" {
+  return retryLater(
+    taskId,
+    `its held-out checks are task ${sharing}'s too, and that task still takes reveals`,
+  );
 }
 
 async function judgeStatusOf(deps: JudgeDeps, taskId: bigint): Promise<string | null | undefined> {
