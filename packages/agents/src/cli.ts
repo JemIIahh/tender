@@ -2,7 +2,14 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, parseEnv } from "node:util";
-import { KeyPair, type KeyPairString, keyKindOf, type Signer, TenderClient } from "@tender/client";
+import {
+  ApiClient,
+  KeyPair,
+  type KeyPairString,
+  keyKindOf,
+  type Signer,
+  TenderClient,
+} from "@tender/client";
 import { createStateStore, defaultStateDir } from "@tender/mcp";
 import { AccountIdSchema, NETWORKS, type NetworkId, type TenderApi } from "@tender/shared";
 import { AGENT_NAMES, AGENTS, type AgentConfig, agentVariables, isAgentName } from "./agents";
@@ -27,7 +34,11 @@ import type { Solver } from "./types";
 // override the files (`pnpm serve` reads its environment the same way):
 //
 //   TENDER_CONTRACT       the Tender contract (the deploy writes it)
-//   TENDER_API_URL        where the Tender API is
+//   TENDER_API_URL        where the Tender API is, named as the API's own PUBLIC_API_URL names it. The
+//                         agent signs in for exactly that base, so another spelling of the same
+//                         server (an address in place of its domain) is refused at the first
+//                         sign-in, which is when the agent first acts, not when it starts. It must
+//                         be https, or http to localhost, 127.0.0.1 or [::1] (`createApiClient`)
 //   NEAR_RPC_URL          the chain's RPC; needed on the sandbox, which has none of its own
 //   AGENT_<NAME>_ACCOUNT  the agent's account (the deploy writes it)
 //   AGENT_<NAME>_PRIVATE_KEY
@@ -394,6 +405,29 @@ export async function checkAgentKey(
 /** The client the agent signs with, and the chain read that checks its key. */
 export type CliClient = AgentChain & KeyReader;
 
+/**
+ * The Tender API client of a run: `ApiClient`, acting as the agent's account with its key. The bin
+ * hands it to `main` as `createApi`.
+ *
+ * The client reads its base once, when it is made, and refuses one it cannot use: plain http to any
+ * host but localhost, 127.0.0.1 or [::1] (a signed-in client sends a signature and then a bearer
+ * token), or a base with a user name, a query, a fragment, an empty path segment, a repeated `/v1`
+ * or a host that ends in a dot. Those are the only things it can refuse (the key was read already,
+ * `asKey`), and its sentences name the problem and quote no value, so they are shown as they are,
+ * after the variable they are about. Any other error of a run is shown by name and code alone.
+ *
+ * What the client cannot know when it is made is that the base is the API's own spelling of itself.
+ * It finds out at the first sign-in, which is at the first call that acts as the agent.
+ */
+export function createApiClient(config: Pick<RunConfig, "apiUrl" | "signer">): TenderApi {
+  try {
+    return new ApiClient({ baseUrl: config.apiUrl, signer: config.signer });
+  } catch (error) {
+    const sentence = error instanceof Error ? error.message : "the API client refused it";
+    throw new CliError(`TENDER_API_URL: ${sentence}`);
+  }
+}
+
 function makeSolver(config: RunConfig, seedsDir: string, log: (line: string) => void): Solver {
   switch (config.solver) {
     case "llm": {
@@ -411,8 +445,8 @@ function makeSolver(config: RunConfig, seedsDir: string, log: (line: string) => 
 
 export interface CliOptions {
   /**
-   * Where the Tender API client comes from, the one part the bin cannot build yet. It is called
-   * once the key has been checked, and may throw a `CliError`.
+   * Where the Tender API client comes from: `createApiClient`, for the bin. It is called once the
+   * key has been checked, and may throw a `CliError`.
    */
   createApi: (config: RunConfig) => TenderApi;
   /** Where `.env` and `.env.deploy.<network>` are. The repository root by default. */

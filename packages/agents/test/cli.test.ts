@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { KeyPair } from "@tender/client";
-import type { TenderApi } from "@tender/shared";
+import { SIGN_IN_MESSAGE, type TenderApi } from "@tender/shared";
 import { afterEach, expect, test, vi } from "vitest";
 import { AGENT_NAMES, AGENTS, agentVariables } from "../src/agents";
 import {
@@ -13,6 +13,7 @@ import {
   CliError,
   type CliOptions,
   checkAgentKey,
+  createApiClient,
   main,
   parseCli,
   type RunConfig,
@@ -20,6 +21,7 @@ import {
   readRunConfig,
 } from "../src/cli";
 import type { RunAgentOptions } from "../src/runner";
+import { startFakeApi } from "./fake-api";
 import { startFakeLlm } from "./fake-llm";
 import { contextOf, taskSpec } from "./helpers";
 
@@ -860,21 +862,121 @@ test("a_key_that_reaches_a_message_is_cut_out_of_it", async () => {
   expect(said(result)).toBe("run-agent: broken with <redacted> and <redacted>");
 });
 
-test("the_api_client_that_is_not_there_yet_stops_the_agent_after_its_key_is_checked", async () => {
+test("an_api_client_that_cannot_be_made_stops_the_agent_after_its_key_is_checked", async () => {
   const result = await start(ARGS, {
     createApi: () => {
-      throw new CliError(
-        "the Tender API client is not available yet: ApiClient (plan 03 task 12b)",
-      );
+      throw new CliError("TENDER_API_URL: the API base URL must not carry a query");
     },
   });
 
   expect(result.code).toBe(1);
   expect(result.err).toEqual([
-    "run-agent: the Tender API client is not available yet: ApiClient (plan 03 task 12b)",
+    "run-agent: TENDER_API_URL: the API base URL must not carry a query",
   ]);
   // The key was checked first, and the loop never started.
   expect(result.calls).toEqual(["makeClient", "viewAccessKey", "createApi"]);
+});
+
+// ---- The Tender API client --------------------------------------------------------------------
+
+test("what_the_api_client_refuses_in_a_base_is_said_in_its_own_words_and_quotes_nothing", async () => {
+  const cases: Array<[string, string, string]> = [
+    [
+      "plain http to a host that is not this machine",
+      "http://api.tender.example",
+      "an ApiClient with a signer needs an https baseUrl, or http to localhost, 127.0.0.1 or [::1]",
+    ],
+    [
+      "a user name and a password",
+      "https://user:SECRET-1@api.tender.example",
+      "the API base URL must not carry a user name or password",
+    ],
+    [
+      "a query",
+      "https://api.tender.example/?key=SECRET-2",
+      "the API base URL must not carry a query",
+    ],
+    [
+      "a fragment",
+      "https://api.tender.example/#SECRET-3",
+      "the API base URL must not carry a fragment",
+    ],
+    [
+      "an empty path segment",
+      "https://api.tender.example//tender",
+      "the API base URL must not have an empty path segment (//)",
+    ],
+    [
+      "a repeated version",
+      "https://api.tender.example/v1/v1",
+      "the API base URL must not repeat /v1",
+    ],
+    [
+      "a host that ends in a dot",
+      "https://api.tender.example./",
+      "the API base URL must not have a host that ends in a dot",
+    ],
+  ];
+  for (const [what, apiUrl, sentence] of cases) {
+    const result = await start(ARGS, {
+      env: { ...ENV, TENDER_API_URL: apiUrl },
+      createApi: createApiClient,
+    });
+
+    expect(result.code, what).toBe(1);
+    // The client's sentence, after the variable it is about, and no word of the URL it was given.
+    expect(said(result), what).toMatch(/^run-agent: TENDER_API_URL: /);
+    expect(said(result), what).toContain(sentence);
+    expect(said(result), what).not.toMatch(/SECRET|user:|tender\.example/);
+    // It stops the agent where the API client is made: after the key check, before the loop.
+    expect(result.calls, what).toEqual(["makeClient", "viewAccessKey", "createApi"]);
+    expect(result.out, what).toEqual([]);
+  }
+});
+
+test("run_agent_acts_through_the_api_client_at_the_base_it_is_given_as_the_agent", async () => {
+  // The API sits under a path, as the base allows, and the agent is given it with the slash and the
+  // version that `canonicalBase` takes off.
+  const api = await startFakeApi("/tender");
+  try {
+    let health: unknown;
+    let refusal: unknown;
+    const result = await start(ARGS, {
+      env: { ...ENV, TENDER_API_URL: `${api.base}/v1/` },
+      createApi: createApiClient,
+      loop: async (options) => {
+        health = await options.api.health();
+        refusal = await options.api.start(1n).catch((error: unknown) => error);
+      },
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.err).toEqual([]);
+    // Every request went under the base, with the version once.
+    expect(health).toMatchObject({ ok: true });
+    expect(api.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "GET /tender/v1/health",
+      "POST /tender/v1/auth/challenge",
+      "POST /tender/v1/auth/verify",
+    ]);
+    // It signed in as the agent: its account, the public half of its key, for this base. The fake
+    // refused the signature (it knows no account), and the call failed with the API's answer.
+    expect(api.requests[2]?.body).toMatchObject({
+      account_id: ACCOUNT,
+      public_key: AGENT_PUBLIC,
+      message: SIGN_IN_MESSAGE,
+      recipient: api.base,
+    });
+    expect(refusal).toMatchObject({ name: "ApiError", status: 401 });
+    // The private key went nowhere: not in the sign-in, and not in the agent's output.
+    const sent = JSON.stringify(api.requests);
+    for (const piece of piecesOf(AGENT_KEY)) {
+      expect(sent).not.toContain(piece);
+      expect([...result.out, ...result.err].join("\n")).not.toContain(piece);
+    }
+  } finally {
+    await api.stop();
+  }
 });
 
 // ---- Stopping ---------------------------------------------------------------------------------
@@ -949,4 +1051,30 @@ test("the_bin_exits_1_with_the_usage_for_a_bad_command_line", { timeout: 120_000
     stdout: "",
     stderr: `run-agent: unknown agent: use one of analyst, coder, extractor\n${USAGE}\n`,
   });
+});
+
+test("the_bin_acts_through_the_api_client_and_says_what_it_refuses", {
+  timeout: 120_000,
+}, async () => {
+  // On the sandbox the agent's key is not asked about, and nothing here reaches a network: the API
+  // client is made, and refuses a base that is plain http to a host that is not this machine, before
+  // the agent lists a task. The environment is the whole of the bin's.
+  const result = await runBin(
+    ["--agent", "analyst", "--solver", "offline", "--network", "sandbox"],
+    {
+      TENDER_CONTRACT: "tender.sandbox",
+      TENDER_API_URL: "http://api.tender.example",
+      NEAR_RPC_URL: "http://127.0.0.1:1",
+      AGENT_ANALYST_ACCOUNT: "analyst.sandbox",
+      AGENT_ANALYST_PRIVATE_KEY: AGENT_KEY.toString(),
+    },
+  );
+
+  expect(result.code).toBe(1);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toMatch(
+    /^run-agent: TENDER_API_URL: an ApiClient with a signer needs an https baseUrl, or http to localhost, 127\.0\.0\.1 or \[::1\]/,
+  );
+  for (const piece of piecesOf(AGENT_KEY)) expect(result.stderr).not.toContain(piece);
+  expect(result.stderr).not.toContain("api.tender.example");
 });
