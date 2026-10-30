@@ -30,6 +30,12 @@ export interface ApiDeps {
   /** Accounts the team runs. Posters and entrants among them are labelled as ours. */
   teamAccounts: string[];
   /**
+   * The account the team's Judge signs in as (`JUDGE_ACCOUNT`). Only it may upload a scorecard that
+   * carries the Judge's name in `judge.software` (`isJudgeBranded`). When it is not set, every such
+   * scorecard is refused.
+   */
+  judgeAccount?: string;
+  /**
    * Origins of the web app, which the browser may call the API from (`PUBLIC_WEB_URL`, split at
    * commas). A trailing slash or a path is dropped. On the sandbox network every origin is
    * allowed whatever this holds; elsewhere an empty list allows none.
