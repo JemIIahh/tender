@@ -2,7 +2,7 @@ import { lstatSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Signer, TenderClient } from "@tender/client";
-import { AccountIdSchema, NETWORKS, type NetworkId } from "@tender/shared";
+import { AccountIdSchema, canonicalBase, NETWORKS, type NetworkId } from "@tender/shared";
 import { KeyPair, type KeyPairString } from "near-api-js";
 import { urlCredentials } from "./secrets";
 import { defaultStateDir } from "./state";
@@ -25,7 +25,10 @@ export class ConfigError extends Error {
 export interface McpConfig {
   network: NetworkId;
   contractId: string;
-  /** Where the Tender API is. */
+  /**
+   * Where the Tender API is, as `canonicalBase` writes it: the scheme and the host in lower case, and
+   * no trailing slash and no `/v1`. It is also whom the sign-in is signed for.
+   */
   apiUrl: string;
   /** The chain's RPC, when the environment names one: the sandbox has no default. */
   rpcUrl?: string;
@@ -51,7 +54,9 @@ type Env = Readonly<Record<string, string | undefined>>;
 /** What a variable must be, as the message about a wrong one says it. */
 const AN_ACCOUNT = "a NEAR account id";
 const A_URL = "an http(s) URL";
-const AN_API_URL = "an https URL, or an http URL to localhost, 127.0.0.1 or [::1]";
+const AN_API_URL =
+  "an https URL, or an http URL to localhost, 127.0.0.1 or [::1], without a user name, password, " +
+  "query or fragment";
 
 /**
  * The value of `name` without the space around it, or undefined when it is not set. A variable set
@@ -83,15 +88,24 @@ function asHttpUrl(value: string): string | undefined {
 /**
  * The hosts that plain `http:` may go to: this machine. The API takes a bearer token, so every
  * other host needs `https:`. These are the three forms in which `new URL` leaves a loopback host;
- * another address in 127.0.0.0/8 is refused rather than guessed at.
+ * another address in 127.0.0.0/8 is refused rather than guessed at. They are the three that
+ * `ApiClient` takes, and a test holds the two to the same answer.
  */
 const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
+/**
+ * The API's base URL as the API client reads it: `canonicalBase` of `value`, which is what the
+ * client calls and whom its sign-in is signed for, so a value it would refuse is refused here, at
+ * start-up, with a message that names the variable. `canonicalBase` refuses a user name or a
+ * password, a query, a fragment, a host with a dot at its end and the like; this adds the rule that
+ * plain `http:` goes only to this machine. The reason `canonicalBase` gives is not passed on.
+ */
 function asApiUrl(value: string): string | undefined {
   try {
-    const { protocol, hostname } = new URL(value);
-    if (protocol === "https:") return value;
-    return protocol === "http:" && LOOPBACK_HOSTS.has(hostname) ? value : undefined;
+    const base = canonicalBase(value);
+    const { protocol, hostname } = new URL(base);
+    if (protocol === "https:") return base;
+    return protocol === "http:" && LOOPBACK_HOSTS.has(hostname) ? base : undefined;
   } catch {
     return undefined;
   }
@@ -245,7 +259,8 @@ function requireOwnDirectory(dir: string, home: string): void {
  * - Required: `TENDER_NETWORK`, `TENDER_CONTRACT`, `TENDER_API_URL`, `TENDER_ACCOUNT` and
  *   `TENDER_PRIVATE_KEY`; and `NEAR_RPC_URL` on the sandbox, which has no RPC of its own. The other
  *   networks use theirs unless `NEAR_RPC_URL` names another. `TENDER_API_URL` is `https:`, or
- *   `http:` to this machine only, since the API is signed in to with a bearer token.
+ *   `http:` to this machine only, since the API is signed in to with a bearer token, and it is
+ *   what `canonicalBase` takes (no user name, query or fragment), as the API client reads it.
  * - Optional: `TENDER_STATE_DIR` (default: `defaultStateDir`, under `home`; a leading `~` is
  *   expanded to `home`), `TENDER_FILES_DIR` (an absolute path, `~` expanded likewise, of a
  *   directory that only the user can write to: see `requireOwnDirectory`; default: none, and then

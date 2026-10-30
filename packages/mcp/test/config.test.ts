@@ -13,8 +13,8 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import type { TenderClient } from "@tender/client";
-import { type ConfigView, computeCommitment, sha256Hex } from "@tender/shared";
+import { ApiClient, type TenderClient } from "@tender/client";
+import { type ConfigView, canonicalBase, computeCommitment, sha256Hex } from "@tender/shared";
 import { KeyPair } from "near-api-js";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
@@ -44,6 +44,10 @@ const ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const BIN = "packages/mcp/bin/tender-mcp.ts";
 
 const KEY = KeyPair.fromRandom("ed25519");
+/** What a TENDER_API_URL that is refused is told it must be. */
+const AN_API_URL =
+  "an https URL, or an http URL to localhost, 127.0.0.1 or [::1], without a user name, password, " +
+  "query or fragment";
 /** What the bin needs, and nothing it does not. */
 const ENV = {
   TENDER_NETWORK: "testnet",
@@ -155,7 +159,7 @@ test("wrong_values_are_named_and_never_quoted", () => {
   expect(message).toBe(
     "TENDER_NETWORK must be one of sandbox, testnet, mainnet; " +
       "TENDER_CONTRACT must be a NEAR account id; " +
-      "TENDER_API_URL must be an https URL, or an http URL to localhost, 127.0.0.1 or [::1]; " +
+      `TENDER_API_URL must be ${AN_API_URL}; ` +
       "TENDER_ACCOUNT must be a NEAR account id; " +
       "TENDER_PRIVATE_KEY must be an access key, as ed25519:<base58>; " +
       "NEAR_RPC_URL must be an http(s) URL; " +
@@ -174,21 +178,14 @@ test("wrong_values_are_named_and_never_quoted", () => {
 
 test("the_api_url_is_https_unless_it_is_on_this_machine", () => {
   // The API takes a bearer token, which plain http would carry across the network in the clear.
-  const refusal =
-    "TENDER_API_URL must be an https URL, or an http URL to localhost, 127.0.0.1 or [::1]";
+  const refusal = `TENDER_API_URL must be ${AN_API_URL}`;
   const apiUrl = (value: string) => readConfig({ ...ENV, TENDER_API_URL: value }, home).apiUrl;
 
-  for (const url of ["https://api.tender.example", "https://api.tender.example:8443/v1"]) {
+  for (const url of ["https://api.tender.example", "https://api.tender.example:8443"]) {
     expect(apiUrl(url)).toBe(url);
   }
   // A local API for development is plain http, and that stays possible.
-  for (const url of [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000/v1",
-    "http://[::1]:3000",
-    "http://LOCALHOST:3000",
-    "http://user:pass@localhost:3000",
-  ]) {
+  for (const url of ["http://localhost:3000", "http://127.0.0.1:3000", "http://[::1]:3000"]) {
     expect(apiUrl(url)).toBe(url);
   }
 
@@ -219,6 +216,118 @@ test("the_api_url_is_https_unless_it_is_on_this_machine", () => {
   expect(readConfig({ ...ENV, NEAR_RPC_URL: "http://rpc.tender.example:3030" }, home).rpcUrl).toBe(
     "http://rpc.tender.example:3030",
   );
+});
+
+test("the_api_url_is_read_as_canonical_base_reads_it", () => {
+  // The base is where the client calls and whom its sign-in is signed for, so it is the one spelling
+  // that `canonicalBase` writes: the scheme and the host in lower case, the default port left out,
+  // and no trailing slash and no final /v1.
+  const apiUrl = (value: string) => readConfig({ ...ENV, TENDER_API_URL: value }, home).apiUrl;
+  const spellings: Array<[written: string, base: string]> = [
+    ["https://api.tender.example/", "https://api.tender.example"],
+    ["https://api.tender.example/v1", "https://api.tender.example"],
+    ["https://api.tender.example/v1/", "https://api.tender.example"],
+    ["https://API.Tender.Example:443/v1/", "https://api.tender.example"],
+    ["https://api.tender.example:8443/v1", "https://api.tender.example:8443"],
+    ["https://host.example/tender/v1", "https://host.example/tender"],
+    ["http://LOCALHOST:3000", "http://localhost:3000"],
+    ["http://127.0.0.1:3000/v1", "http://127.0.0.1:3000"],
+    ["http://[::1]:3000/", "http://[::1]:3000"],
+  ];
+  for (const [written, base] of spellings) {
+    expect(apiUrl(written), written).toBe(base);
+    expect(canonicalBase(apiUrl(written)), written).toBe(apiUrl(written));
+  }
+
+  // What `canonicalBase` refuses is refused, with this file's words and not its own.
+  const refusal = `TENDER_API_URL must be ${AN_API_URL}`;
+  for (const url of [
+    "http://user:pass@localhost:3000",
+    "https://user:SECRETPASS@api.tender.example",
+    "https://user@api.tender.example",
+    "https://api.tender.example/?key=SECRETKEY",
+    "https://api.tender.example?",
+    "https://api.tender.example/#top",
+    "https://api.tender.example#",
+    "https://api.tender.example./",
+    "https://api.tender.example//v1",
+    "https://api.tender.example/v1/v1",
+    "https://",
+  ]) {
+    const message = failureOf({ ...ENV, TENDER_API_URL: url });
+    expect(message, url).toBe(refusal);
+    for (const secret of ["SECRETPASS", "SECRETKEY", "canonical"]) {
+      expect(message, url).not.toContain(secret);
+    }
+  }
+});
+
+test("the_config_and_the_api_client_take_the_same_api_urls", () => {
+  // The bin builds `new ApiClient({ baseUrl: config.apiUrl, signer: config.signer })` once the
+  // config is read. A URL that the config takes and the client refuses would stop the server after
+  // its start-up message; one that the client takes and the config refuses is turned back for
+  // nothing. So the two give one answer to each URL here, and the client's own loopback list, which
+  // this file cannot read, is held to the config's.
+  const verdict: Array<[url: string, taken: boolean]> = [
+    ["https://api.tender.example", true],
+    ["https://api.tender.example/", true],
+    ["https://api.tender.example/v1", true],
+    ["https://API.tender.example:443/v1/", true],
+    ["https://api.tender.example:8443/tender/v1", true],
+    ["http://localhost:8787", true],
+    ["http://LOCALHOST:8787/v1/", true],
+    ["http://127.0.0.1:8787", true],
+    ["http://[::1]:8787", true],
+    ["http://api.tender.example", false],
+    ["http://127.0.0.2:8787", false],
+    ["http://0.0.0.0:8787", false],
+    ["http://[::2]:8787", false],
+    ["http://localhost.evil.example", false],
+    ["https://user:pw@api.tender.example", false],
+    ["https://user@api.tender.example", false],
+    ["https://api.tender.example/?key=1", false],
+    ["https://api.tender.example?", false],
+    ["https://api.tender.example/#top", false],
+    ["https://api.tender.example#", false],
+    ["https://api.tender.example./", false],
+    ["https://api.tender.example:8443./", false],
+    ["https://api.tender.example//v1", false],
+    ["https://api.tender.example/v1/v1", false],
+    ["ftp://api.tender.example", false],
+    ["ws://localhost:8787", false],
+    ["https://", false],
+    ["api.tender.example", false],
+    ["not a url", false],
+  ];
+  const asksConfig = (url: string) => {
+    try {
+      return readConfig({ ...ENV, TENDER_API_URL: url }, home);
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      return undefined;
+    }
+  };
+  for (const [url, taken] of verdict) {
+    const config = asksConfig(url);
+    let clientTakes = true;
+    try {
+      new ApiClient({
+        baseUrl: url,
+        signer: { accountId: "alice.testnet", privateKey: KEY.toString() },
+      });
+    } catch {
+      clientTakes = false;
+    }
+    expect(config !== undefined, `config: ${url}`).toBe(taken);
+    expect(clientTakes, `client: ${url}`).toBe(taken);
+    // And what the config hands on is what the bin gives the client, which takes it as it is.
+    if (config !== undefined) {
+      expect(
+        () => new ApiClient({ baseUrl: config.apiUrl, signer: config.signer }),
+        url,
+      ).not.toThrow();
+    }
+  }
 });
 
 test("the_sandbox_needs_an_rpc_url_and_the_others_do_not", () => {
