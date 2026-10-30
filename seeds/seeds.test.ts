@@ -179,6 +179,22 @@ async function expectItemCountFixed(slug: string, array: string, extra: unknown)
   expect(result.score, result.reasons.join("; ")).toBeLessThan(criteria.min_score);
 }
 
+/**
+ * `answer` must fall under the pass mark because the key's assertion on `path` fails: the answer
+ * fits the schema, so a reason that starts with `path` is the key refusing it.
+ */
+async function expectKeyRefuses(slug: string, answer: unknown, path: string): Promise<void> {
+  const { criteria, heldout } = load(slug);
+  const bytes = new TextEncoder().encode(JSON.stringify(answer));
+  const result = await scoreAnswer(criteria, heldout, bytes);
+  const why = result.reasons.join("; ");
+  expect(result.score, why).toBeLessThan(criteria.min_score);
+  expect(
+    result.reasons.some((reason) => reason.startsWith(`${path} `)),
+    `no reason for ${path}: ${why}`,
+  ).toBe(true);
+}
+
 test("the_ten_p0_seeds_are_all_there", () => {
   const missing = Object.keys(P0_SEEDS).filter((slug) => !SLUGS.includes(slug));
   expect(missing, "seeds missing from seeds/").toEqual([]);
@@ -387,4 +403,30 @@ test("meeting_actions_extract_fixes_the_action_count", async () => {
     task: "look at the logging costs",
     due: null,
   });
+});
+
+/** One wrong value for each of the four fields of the invoice's first line. */
+const MISREAD_FIRST_LINES: [field: string, wrong: string | number][] = [
+  ["description", "Pallet wrap"],
+  ["quantity", 21],
+  ["unit_price", 228],
+  ["amount", 19],
+];
+
+test.each(MISREAD_FIRST_LINES)("invoice_extract_checks_the_first_line_%s", async (field, wrong) => {
+  // The key did not look at line_items[0], so a solver that misread the first line was still paid
+  // in full. It asserts the whole item now, and each of the four values counts.
+  const answer = JSON.parse(utf8(load("invoice-extract").solution)) as {
+    line_items: Record<string, unknown>[];
+  };
+  const [first, ...rest] = answer.line_items;
+  const misread = { ...answer, line_items: [{ ...first, [field]: wrong }, ...rest] };
+  await expectKeyRefuses("invoice-extract", misread, "$.line_items[0]");
+});
+
+test("invoice_extract_checks_its_customer", async () => {
+  // The customer is the company that is billed. The key did not assert it, so a solver that put the
+  // vendor there (the other company on the page) was still paid in full.
+  const answer = JSON.parse(utf8(load("invoice-extract").solution)) as { vendor: string };
+  await expectKeyRefuses("invoice-extract", { ...answer, customer: answer.vendor }, "$.customer");
 });
