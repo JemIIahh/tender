@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseEnv } from "node:util";
 import { type LocalChain, startLocalChain, TenderClient } from "@tender/client";
+import type { SessionLock } from "@tender/db";
 import { sha256Hex } from "@tender/shared";
+import { KeyPair } from "near-api-js";
 import { afterAll, beforeAll, expect, test, vi } from "vitest";
 import { addRoleKey } from "./keeper-key";
-import { type ServeOptions, type Services, startServices } from "./serve";
+import { checkKeeperKey, type ServeOptions, type Services, startServices } from "./serve";
 
 // The services process as `pnpm serve` starts it, against a local chain, with the index in an
 // in-memory PGlite: the indexer on the RPC source, the API on a free port, and the keeper when its
@@ -214,6 +216,57 @@ test("serve_starts_the_keeper_when_its_key_is_set", async () => {
   expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([]);
 
   await services.stop();
+});
+
+test("the_keeper_key_check_reads_what_the_node_says_of_each_key", async () => {
+  // The check that guards the keeper off the sandbox, against the RPC's own answers: the scoped
+  // key the key script added is taken, and the account's full-access key and a key it does not
+  // have are refused.
+  const accountId = chain.accounts.keeper.accountId;
+  const keeper = (privateKey: string) => ({ accountId, privateKey, intervalMs: undefined });
+  await expect(
+    checkKeeperKey(reader, keeper(keeperKey), chain.contractId),
+  ).resolves.toBeUndefined();
+  await expect(
+    checkKeeperKey(reader, keeper(chain.accounts.keeper.privateKey), chain.contractId),
+  ).rejects.toThrow(/^KEEPER_PRIVATE_KEY is a full-access key of keeper\.sandbox /);
+  await expect(
+    checkKeeperKey(reader, keeper(KeyPair.fromRandom("ed25519").toString()), chain.contractId),
+  ).rejects.toThrow(/^KEEPER_PRIVATE_KEY is not a key of keeper\.sandbox /);
+});
+
+test("the_keeper_and_the_indexer_wait_together_for_the_lock", async () => {
+  // Another process holds the lock until `free` is set: then this one takes it, and starts the
+  // indexer and the keeper together, so that only one process sends the keeper's calls.
+  let free = false;
+  const release = vi.fn(async () => undefined);
+  const held: SessionLock = { lost: new AbortController().signal, release };
+  const tryLock = vi.fn(async () => (free ? held : null));
+  const lines: string[] = [];
+  const services = await serve(envFor(keeperEnv(500)), lines, { tryLock });
+
+  expect(lines).toContain(
+    "indexer: another services process holds the indexer lock; serving the API, and starting " +
+      "the indexer and the keeper once the lock is free",
+  );
+  expect(lines.filter((line) => line.startsWith("serve: keeper on"))).toEqual([]);
+  // The API serves meanwhile, with nothing indexed.
+  const waiting = await health(services.url);
+  expect(waiting.status).toBe(200);
+  expect(waiting.body.indexed_height).toBe("0");
+
+  free = true;
+  await until(
+    "the indexer applies a block",
+    async () => BigInt((await health(services.url)).body.indexed_height) > 0n,
+    20_000,
+  );
+  expect(lines).toContain("indexer: took the indexer lock; started the indexer and the keeper");
+  expect(lines).toContain(`serve: keeper on, as ${chain.accounts.keeper.accountId}`);
+
+  await services.stop();
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(lines.at(-1)).toBe("serve: stopped");
 });
 
 test("stop_leaves_the_port_closed_and_every_loop_resolved", async () => {

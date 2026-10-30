@@ -1,8 +1,21 @@
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { type ApiServer, createApp, startApiServer, startKeeper } from "@tender/api";
+import {
+  type ApiServer,
+  createApp,
+  startApiServer,
+  startKeeper,
+  withinDeadline,
+} from "@tender/api";
 import { keyKindOf, TenderClient } from "@tender/client";
-import { type Db, migrate, openDb, type SessionLock, tryAdvisoryLock } from "@tender/db";
+import {
+  type Db,
+  LockNotHeldError,
+  migrate,
+  openDb,
+  type SessionLock,
+  tryAdvisoryLock,
+} from "@tender/db";
 import { startIndexer } from "@tender/indexer";
 import { AccountIdSchema, NETWORKS, type NetworkId } from "@tender/shared";
 import { parseKey } from "./deploy";
@@ -16,8 +29,10 @@ import { loadEnv, REPO_ROOT, readEnvFile } from "./lib/env";
  *              URL PUBLIC_API_URL, which sign-in is bound to (P03-R28)
  *   indexer    follows the chain into the database; on Postgres only while this process holds
  *              the indexer lock, so that one process at a time writes to the index (P03-R25)
- *   keeper     voids and cleans up tasks, when KEEPER_PRIVATE_KEY is set; off the sandbox the key
- *              must be a function-call key limited to Tender, which the chain is asked about first
+ *   keeper     voids and cleans up tasks, when KEEPER_PRIVATE_KEY is set, and runs with the
+ *              indexer, under the same lock, so that no two processes send the same calls; off the
+ *              sandbox its key must be a function-call key limited to Tender, which the chain is
+ *              asked about first
  *
  * Plans 04 and 05 add the Telegram notifier and bot, and the Judge, each when its variables are
  * set (see the places marked "task W" below).
@@ -411,30 +426,12 @@ function aborted(signal: AbortSignal): Promise<void> {
   });
 }
 
-/** What `within` rejects with when its time is up. */
-class NoAnswerInTime extends Error {
-  constructor(ms: number) {
-    super(`no answer within ${ms} ms`);
-    this.name = "NoAnswerInTime";
-  }
-}
-
 /**
- * What `promise` resolves to, or a rejection with `NoAnswerInTime` once `ms` have passed. The
- * timer goes either way.
+ * What a line says of why the indexer lock was not taken, or was lost. A `LockNotHeldError` is
+ * ours and is said in full, with the variable to look at; anything else as `describe` says it.
  */
-async function within<T>(ms: number, promise: Promise<T>): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new NoAnswerInTime(ms)), ms);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
+function lockTrouble(error: unknown): string {
+  return error instanceof LockNotHeldError ? `${error.message} (DATABASE_URL)` : describe(error);
 }
 
 // ---- The indexer lock -------------------------------------------------------------------------
@@ -449,6 +446,8 @@ export interface WhileLockedOptions {
   tryLock: () => Promise<SessionLock | null>;
   /** Starts what the lock guards. */
   start: () => Stoppable;
+  /** What `start` starts, as the lines name it: "the indexer" unless given. */
+  guards?: string;
   log: (line: string) => void;
   /** How long to wait before each new try, in milliseconds. Default 5 s. */
   retryMs?: number;
@@ -456,19 +455,22 @@ export interface WhileLockedOptions {
 
 /**
  * Runs `start` only while this process holds the lock, so that one process at a time writes to
- * the index (P03-R25). The first try is made before this resolves, and if it takes the lock,
- * `start` runs before this resolves too: what either throws is thrown here, a failure to start.
+ * the index (P03-R25), and keeps it. The first try is made before this resolves, and if it takes
+ * the lock, `start` runs before this resolves too: what either throws is thrown here, a failure to
+ * start.
  *
  * While another process holds the lock, this one says so once, and tries again every `retryMs`. A
  * try that fails, such as one the database does not answer, is logged and made again. Once the
  * lock is taken, `start` runs; if it throws then, that is logged and nothing more is tried. When
- * the lock is lost, what runs is stopped and the lock let go, and the waiting begins again.
+ * the lock is lost, what runs is stopped and the lock let go, the reason is logged, and the
+ * waiting begins again.
  *
  * `stop` stops what runs and then lets the lock go, or ends the waiting.
  */
 export async function runWhileLocked(opts: WhileLockedOptions): Promise<Stoppable> {
   const { log } = opts;
   const retryMs = opts.retryMs ?? LOCK_RETRY_MS;
+  const guards = opts.guards ?? "the indexer";
   const stopping = new AbortController();
   // Whether this wait has said that another process holds the lock: once is enough.
   let said = false;
@@ -477,7 +479,7 @@ export async function runWhileLocked(opts: WhileLockedOptions): Promise<Stoppabl
     said = true;
     log(
       "indexer: another services process holds the indexer lock; serving the API, " +
-        "and indexing once the lock is free",
+        `and starting ${guards} once the lock is free`,
     );
   };
 
@@ -510,7 +512,7 @@ export async function runWhileLocked(opts: WhileLockedOptions): Promise<Stoppabl
         await taken.release();
       } catch (error) {
         log(
-          `WARN indexer: cannot try the indexer lock (${describe(error)}); ` +
+          `WARN indexer: cannot take the indexer lock (${lockTrouble(error)}); ` +
             `trying again in ${retryMs / 1000} s`,
         );
       }
@@ -527,11 +529,11 @@ export async function runWhileLocked(opts: WhileLockedOptions): Promise<Stoppabl
         try {
           running = opts.start();
         } catch (error) {
-          log(`ERROR indexer: cannot start (${messageOf(error)}); not indexing`);
+          log(`ERROR indexer: cannot start ${guards} (${messageOf(error)}); not trying again`);
           await lock.release();
           return;
         }
-        log("indexer: took the indexer lock");
+        log(`indexer: took the indexer lock; started ${guards}`);
       }
       const held: SessionLock = lock;
       const lost = await Promise.race([
@@ -543,10 +545,11 @@ export async function runWhileLocked(opts: WhileLockedOptions): Promise<Stoppabl
       await held.release();
       lock = null;
       if (!lost) return;
-      log(
-        "WARN indexer: lost the indexer lock, as its connection to the database ended; " +
-          "stopped indexing until the lock is taken again",
-      );
+      const why =
+        held.lost.reason instanceof LockNotHeldError
+          ? `: ${lockTrouble(held.lost.reason)}`
+          : `, as its connection to the database failed (${describe(held.lost.reason)})`;
+      log(`WARN indexer: lost the indexer lock${why}; stopped ${guards} until it is taken again`);
     }
   };
 
@@ -581,7 +584,10 @@ export async function checkKeeperKey(
     `adds a function-call key limited to ${contractId} and writes it there.`;
   let found: Awaited<ReturnType<TenderClient["viewAccessKey"]>>;
   try {
-    found = await within(KEY_CHECK_DEADLINE_MS, client.viewAccessKey(keeper.accountId, publicKey));
+    found = await withinDeadline(
+      KEY_CHECK_DEADLINE_MS,
+      client.viewAccessKey(keeper.accountId, publicKey),
+    );
   } catch (error) {
     throw new Error(
       `cannot ask the chain what KEEPER_PRIVATE_KEY may do (${describe(error)}), and the keeper ` +
@@ -618,6 +624,11 @@ export interface ServeOptions {
   deploymentsDir?: string;
   /** How long `stop` lets the requests in flight finish before it cuts them. Default: 2 s. */
   closeGraceMs?: number;
+  /**
+   * For tests: how the indexer lock is tried, whatever the database. Default: the session lock of
+   * a Postgres database (`tryAdvisoryLock`), and no lock for PGlite, which one process alone opens.
+   */
+  tryLock?: () => Promise<SessionLock | null>;
 }
 
 export interface Services {
@@ -646,8 +657,8 @@ async function openIndex(url: string): Promise<Db> {
 
 /**
  * Starts the services of `env` (see the top of this file), and resolves once they run: the API
- * listens, the indexer runs or waits for its lock, and the keeper runs if it is to. The
- * environment is checked first (`readServeConfig`), and off the sandbox the keeper's key too,
+ * listens, and the indexer, with the keeper if it is to run, runs or waits for the indexer lock.
+ * The environment is checked first (`readServeConfig`), and off the sandbox the keeper's key too,
  * before anything starts. What fails to start is thrown, after what had started is stopped.
  */
 export async function startServices(
@@ -661,22 +672,26 @@ export async function startServices(
   // One client reads the chain for the API and the indexer.
   const client = new TenderClient({ network, contractId, rpcUrl });
 
-  let keeperClient: TenderClient | undefined;
-  if (config.keeper !== undefined) {
-    if (network !== "sandbox") await checkKeeperKey(client, config.keeper, contractId);
-    const { accountId, privateKey } = config.keeper;
-    keeperClient = new TenderClient({
-      network,
-      contractId,
-      rpcUrl,
-      signer: { accountId, privateKey },
-    });
+  if (config.keeper !== undefined && network !== "sandbox") {
+    await checkKeeperKey(client, config.keeper, contractId);
   }
+  const keeper =
+    config.keeper === undefined
+      ? undefined
+      : {
+          config: config.keeper,
+          client: new TenderClient({
+            network,
+            contractId,
+            rpcUrl,
+            signer: { accountId: config.keeper.accountId, privateKey: config.keeper.privateKey },
+          }),
+        };
 
   const db = await openIndex(config.database.url);
   let api: ApiServer | undefined;
-  let indexer: Stoppable | undefined;
-  let keeper: { stop: AbortController; done: Promise<void> } | undefined;
+  /** The indexer and the keeper, with the lock they run under, if any. */
+  let work: Stoppable | undefined;
 
   /** Stops what has started, in order, going on past a failure, and throws the first one. */
   const stopAll = async (): Promise<void> => {
@@ -690,11 +705,8 @@ export async function startServices(
     };
     await step(() => api?.close());
     // Task W: stop the Telegram bot and notifier, and the Judge, here.
-    await step(async () => {
-      keeper?.stop.abort();
-      await keeper?.done;
-    });
-    await step(() => indexer?.stop());
+    // The keeper, then the indexer, then the lock.
+    await step(() => work?.stop());
     await step(() => db.close());
     if (failures.length > 0) throw failures[0];
   };
@@ -721,32 +733,55 @@ export async function startServices(
     );
     log(`serve: API at ${api.url}, called at ${publicUrl} (${network}, ${contractId})`);
 
-    const startIndexing = () =>
-      startIndexer(env, { db, client, log, deploymentsDir: options.deploymentsDir });
-    // PGlite is one process's own database, so it needs no lock.
-    indexer =
-      config.database.kind === "postgres"
-        ? await runWhileLocked({
-            tryLock: () => tryAdvisoryLock(config.database.url, INDEXER_LOCK_KEY),
-            start: startIndexing,
-            log,
-          })
-        : startIndexing();
-
-    if (config.keeper !== undefined && keeperClient !== undefined) {
-      const stop = new AbortController();
-      const done = startKeeper({
+    // The indexer and the keeper start and stop together, so that the keeper runs only where
+    // the index is written: two keepers would send the same calls, and pay for the ones that lose.
+    const startWork = (): Stoppable => {
+      const indexer = startIndexer(env, {
         db,
-        client: keeperClient,
-        intervalMs: config.keeper.intervalMs,
-        signal: stop.signal,
+        client,
         log,
+        deploymentsDir: options.deploymentsDir,
       });
-      keeper = { stop, done };
-      log(`serve: keeper on, as ${config.keeper.accountId}`);
-    } else {
-      log("serve: keeper off (KEEPER_PRIVATE_KEY is not set)");
-    }
+      if (keeper === undefined) return indexer;
+      const stopKeeper = new AbortController();
+      let keeping: Promise<void>;
+      try {
+        keeping = startKeeper({
+          db,
+          client: keeper.client,
+          intervalMs: keeper.config.intervalMs,
+          signal: stopKeeper.signal,
+          log,
+        });
+      } catch (error) {
+        void indexer.stop();
+        throw error;
+      }
+      log(`serve: keeper on, as ${keeper.config.accountId}`);
+      return {
+        async stop() {
+          stopKeeper.abort();
+          await keeping;
+          await indexer.stop();
+        },
+      };
+    };
+    if (keeper === undefined) log("serve: keeper off (KEEPER_PRIVATE_KEY is not set)");
+    // PGlite is one process's own database, so it needs no lock.
+    const tryLock =
+      options.tryLock ??
+      (config.database.kind === "postgres"
+        ? () => tryAdvisoryLock(config.database.url, INDEXER_LOCK_KEY)
+        : undefined);
+    work =
+      tryLock === undefined
+        ? startWork()
+        : await runWhileLocked({
+            tryLock,
+            start: startWork,
+            guards: keeper === undefined ? "the indexer" : "the indexer and the keeper",
+            log,
+          });
     // Task W: start the Telegram notifier and bot, and the Judge, here, each when its
     // variables are set.
   } catch (error) {
@@ -829,7 +864,8 @@ async function main(): Promise<void> {
 
   try {
     env = serveEnv();
-    services = await startServices(env);
+    // Every line the services write passes through `redact` too, as what is printed of an error.
+    services = await startServices(env, { log: (line) => console.log(redact(line, env)) });
   } catch (error) {
     console.error(`serve: ${redact(messageOf(error), env)}`);
     process.exit(1);

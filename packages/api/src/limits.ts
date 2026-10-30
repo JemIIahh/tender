@@ -1,3 +1,4 @@
+import { isIPv4, isIPv6 } from "node:net";
 import { getConnInfo } from "@hono/node-server/conninfo";
 import type { Context, Env, MiddlewareHandler } from "hono";
 import { HTTPException } from "hono/http-exception";
@@ -101,26 +102,81 @@ export function rateLimit<E extends Env>(
 const NO_CONNECTION = "no-connection";
 
 /**
- * The address a request comes from, as the rate limits count it. Without a proxy it is the
- * socket's remote address (`@hono/node-server`'s conninfo). Behind `trustedProxyHops` proxies,
- * each of which adds the address it saw to `X-Forwarded-For`, it is read from that header: with
- * `chain` the header's entries followed by the socket's address, the client is
+ * An IPv4 address, as in `1.2.3.4`, and the three places one is looked for: alone with a port, at
+ * the end of an IPv6 address, and mapped into one.
+ */
+const IPV4 = String.raw`\d{1,3}(?:\.\d{1,3}){3}`;
+const IPV4_WITH_PORT = new RegExp(`^(${IPV4}):\\d+$`);
+const IPV4_AT_END = new RegExp(`(${IPV4})$`);
+const IPV4_MAPPED = new RegExp(`^::ffff:(${IPV4})$`, "i");
+
+/**
+ * An `X-Forwarded-For` entry as an address alone: some proxies write the port too, as in
+ * `1.2.3.4:5678` or `[2001:db8::1]:443`, and each connection would count on its own.
+ */
+function withoutPort(entry: string): string {
+  const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(entry);
+  if (bracketed?.[1] !== undefined) return bracketed[1];
+  return IPV4_WITH_PORT.exec(entry)?.[1] ?? entry;
+}
+
+/** The eight 16-bit groups of an IPv6 address. An IPv4 address at its end is the last two. */
+function groupsOf(address: string): number[] {
+  let text = address;
+  const tail = IPV4_AT_END.exec(text);
+  if (tail?.[1] !== undefined) {
+    const [a = 0, b = 0, c = 0, d = 0] = tail[1].split(".").map(Number);
+    text = `${text.slice(0, tail.index)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head = "", rest] = text.split("::");
+  const left = head === "" ? [] : head.split(":");
+  const right = rest === undefined || rest === "" ? [] : rest.split(":");
+  const zeros = rest === undefined ? [] : Array<string>(8 - left.length - right.length).fill("0");
+  return [...left, ...zeros, ...right].map((group) => Number.parseInt(group, 16));
+}
+
+/**
+ * What a client address is counted as. An IPv4 address is itself, and so is the one an IPv6 socket
+ * gives for an IPv4 client (`::ffff:1.2.3.4`). An IPv6 address is its /64, which is what a host
+ * is usually given: it could otherwise take a new address, and a new allowance, for each request.
+ * Anything else, such as a name that a proxy wrote, is as it is.
+ */
+function counted(address: string): string {
+  // A zone, as in fe80::1%eth0, names the interface, not the client.
+  const bare = address.replace(/%.*$/, "");
+  const mapped = IPV4_MAPPED.exec(bare)?.[1];
+  if (mapped !== undefined) return mapped;
+  if (isIPv4(bare) || !isIPv6(bare)) return address;
+  const prefix = groupsOf(bare).slice(0, 4);
+  return `${prefix.map((group) => group.toString(16)).join(":")}::/64`;
+}
+
+/**
+ * The client a request comes from, as the rate limits count it. Without a proxy it is the socket's
+ * remote address (`@hono/node-server`'s conninfo). Behind `trustedProxyHops` proxies, each of
+ * which adds the address it saw to `X-Forwarded-For`, it is read from that header: with `chain`
+ * the header's entries followed by the socket's address, the client is
  * `chain[chain.length - 1 - trustedProxyHops]`, or `chain[0]` when the chain is shorter. So the
- * entries a client writes itself, which come before the ones the proxies add, never decide it.
+ * entries a client writes itself, which come before the ones the proxies add, never decide it. A
+ * `trustedProxyHops` that is no whole number from 0 counts as 0: the socket's address, which no
+ * header can forge.
  *
- * A request with no connection, such as one made with `app.request()` in a test, has no address:
- * all of them share one key.
+ * Each entry loses a port it carries, and the address is then counted as `counted` says: an IPv6
+ * client by its /64. A request with no connection, such as one made with `app.request()` in a
+ * test, has no address: all of them share one key.
  */
 export function clientKey(c: Context, trustedProxyHops: number): string {
+  const hops =
+    Number.isSafeInteger(trustedProxyHops) && trustedProxyHops >= 0 ? trustedProxyHops : 0;
   const bindings = c.env as { incoming?: unknown } | undefined;
   if (bindings?.incoming === undefined) return NO_CONNECTION;
   const socket = getConnInfo(c).remote.address;
   if (socket === undefined) return NO_CONNECTION;
-  if (trustedProxyHops === 0) return socket;
+  if (hops === 0) return counted(socket);
   const forwarded = (c.req.header("X-Forwarded-For") ?? "")
     .split(",")
-    .map((entry) => entry.trim())
+    .map((entry) => withoutPort(entry.trim()))
     .filter((entry) => entry !== "");
   const chain = [...forwarded, socket];
-  return chain[chain.length - 1 - trustedProxyHops] ?? chain[0] ?? socket;
+  return counted(chain[chain.length - 1 - hops] ?? chain[0] ?? socket);
 }

@@ -3,11 +3,17 @@
 .env*
 **/.env*
 .tender
-# Installed or built on the machine, and made again in the image.
+# Installed, built or written on the machine, as in .gitignore, and made again in the image.
 node_modules
 **/node_modules
-contract/target
-apps/web/.next
+**/target
+**/.next
+**/coverage
+**/*.log
+!packages/shared/test/fixtures/**/*.log
+**/*.tsbuildinfo
+apps/web/test-results
+apps/web/playwright-report
 # Local data and the working records of the repository.
 .data
 .git

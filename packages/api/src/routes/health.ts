@@ -1,39 +1,14 @@
 import { Hono } from "hono";
+import { withinDeadline } from "../deadline";
 import type { ApiDeps } from "../deps";
 import type { ErrorBody, HealthResponse } from "../format";
 import { RETRY_SOON } from "../limits";
 
-/** How long the chain has to give its final height, in milliseconds. */
-const FINAL_HEIGHT_DEADLINE_MS = 5_000;
-
-/** What the chain's answer is given up on with when the deadline comes first. */
-class NoAnswerInTime extends Error {
-  constructor(ms: number) {
-    super(`no answer within ${ms} ms`);
-    this.name = "NoAnswerInTime";
-  }
-}
-
 /**
- * The chain's final height, or a rejection with `NoAnswerInTime` once `ms` have passed. The RPC
- * client retries a node that does not answer for minutes, which no monitor waits for. The call
- * cannot be cancelled: one that is given up on settles on its own, and the race, which subscribes
- * to it, drops what it says then. The timer is cleared however the race ends.
+ * How long the chain has to give its final height, in milliseconds. The RPC client retries a node
+ * that does not answer for minutes, which no monitor waits for.
  */
-async function finalHeightWithin(deps: ApiDeps, ms: number): Promise<bigint> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      // Called as a method, because a `TenderClient` reads its own fields.
-      deps.client.finalHeight(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new NoAnswerInTime(ms)), ms);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+const FINAL_HEIGHT_DEADLINE_MS = 5_000;
 
 /**
  * `GET /v1/health`: whether the API can read the database and the chain, and how far the index is
@@ -55,7 +30,8 @@ export function healthRoutes(deps: ApiDeps, options: { deadlineMs?: number } = {
 
     let final: bigint;
     try {
-      final = await finalHeightWithin(deps, deadlineMs);
+      // Called as a method, because a `TenderClient` reads its own fields.
+      final = await withinDeadline(deadlineMs, deps.client.finalHeight());
     } catch (error) {
       // Only the kind of error is logged: the text of an RPC error can name an endpoint with a key.
       console.error(

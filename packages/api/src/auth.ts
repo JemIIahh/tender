@@ -9,6 +9,7 @@ import {
 } from "@tender/client";
 import { sha256Hex } from "@tender/shared";
 import type { Context } from "hono";
+import { withinDeadline } from "./deadline";
 import { type ApiDeps, nowNs } from "./deps";
 import type { ErrorBody } from "./format";
 import { unavailableForNow } from "./limits";
@@ -118,19 +119,12 @@ export async function createChallenge(deps: ApiDeps): Promise<ChallengeResponse>
  */
 const KEY_LOOKUP_DEADLINE_MS = 5_000;
 
-/** What a lookup fails with when `KEY_LOOKUP_DEADLINE_MS` has passed. */
-class NoAnswerInTime extends Error {
-  constructor() {
-    super(`no answer within ${KEY_LOOKUP_DEADLINE_MS} ms`);
-    this.name = "NoAnswerInTime";
-  }
-}
-
 /**
  * The chain could not say whether a key is on an account: its call failed, or gave no answer
- * within `KEY_LOOKUP_DEADLINE_MS`. `cause` is the call's own error, or `NoAnswerInTime`. It is the
- * one error `lookUpKey` throws, so that whoever asked can tell a chain that is not answering from
- * a fault of our own. It is not to be logged whole: see `logLookupFailure`.
+ * within `KEY_LOOKUP_DEADLINE_MS`. `cause` is the call's own error, or `withinDeadline`'s
+ * `NoAnswerInTime`. It is the one error `lookUpKey` throws, so that whoever asked can tell a
+ * chain that is not answering from a fault of our own. It is not to be logged whole: see
+ * `logLookupFailure`.
  */
 class KeyLookupFailed extends Error {
   constructor(cause: unknown) {
@@ -140,30 +134,22 @@ class KeyLookupFailed extends Error {
 }
 
 /**
- * `deps.client.viewAccessKey`, with `KEY_LOOKUP_DEADLINE_MS` to answer. It rejects with a
- * `KeyLookupFailed` if the call fails, and if the deadline comes first. The call itself cannot be
- * cancelled: one that is given up on settles on its own, and what it says then is dropped. The
- * race subscribes to it, so a failure after the deadline is not an unhandled rejection. The timer
- * is cleared however the question ends.
+ * `deps.client.viewAccessKey`, with `KEY_LOOKUP_DEADLINE_MS` to answer (`withinDeadline`). It
+ * rejects with a `KeyLookupFailed` if the call fails, and if the deadline comes first.
  */
 async function lookUpKey(
   deps: ApiDeps,
   account: string,
   publicKey: string,
 ): Promise<{ permission: KeyPermission } | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
-      // Called as a method, because a `TenderClient` reads its own fields.
+    // Called as a method, because a `TenderClient` reads its own fields.
+    return await withinDeadline(
+      KEY_LOOKUP_DEADLINE_MS,
       deps.client.viewAccessKey(account, publicKey),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new NoAnswerInTime()), KEY_LOOKUP_DEADLINE_MS);
-      }),
-    ]);
+    );
   } catch (error) {
     throw new KeyLookupFailed(error);
-  } finally {
-    clearTimeout(timer);
   }
 }
 

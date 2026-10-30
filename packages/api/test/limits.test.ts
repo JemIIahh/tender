@@ -178,6 +178,44 @@ test("client_key_reads_the_socket_and_trusts_only_the_proxies_entries", async ()
   expect(none).not.toBe("1.2.3.4");
 });
 
+test("client_key_counts_an_ipv6_client_by_its_64_and_drops_ports", async () => {
+  // An IPv6 client is its /64, however its address is written.
+  const v6 = "2001:db8:1:2::/64";
+  for (const address of [
+    "2001:db8:1:2:aaaa:bbbb:cccc:dddd",
+    "2001:db8:1:2::1",
+    "2001:0db8:0001:0002:0000:0000:0000:0009",
+    "2001:DB8:1:2::FFFF",
+    "2001:db8:1:2::5%eth0",
+  ]) {
+    expect(await keyOf(0, undefined, address), address).toBe(v6);
+  }
+  expect(await keyOf(0, undefined, "2001:db8:1:3::1")).toBe("2001:db8:1:3::/64");
+  expect(await keyOf(0, undefined, "::1")).toBe("0:0:0:0::/64");
+  expect(await keyOf(0, undefined, "64:ff9b::198.51.100.1")).toBe("64:ff9b:0:0::/64");
+  // An IPv4 client of a socket that listens on IPv6 is its IPv4 address, and not the one /64
+  // that every such client is in.
+  expect(await keyOf(0, undefined, "::ffff:203.0.113.7")).toBe("203.0.113.7");
+  expect(await keyOf(0, undefined, "::FFFF:203.0.113.8")).toBe("203.0.113.8");
+
+  // The same for an entry of X-Forwarded-For, which loses a port a proxy wrote.
+  expect(await keyOf(1, "1.2.3.4:5678")).toBe("1.2.3.4");
+  expect(await keyOf(1, "6.6.6.6, 1.2.3.4:5678")).toBe("1.2.3.4");
+  expect(await keyOf(1, "[2001:db8:1:2::7]:443")).toBe(v6);
+  expect(await keyOf(1, "[2001:db8:1:2::7]")).toBe(v6);
+  expect(await keyOf(1, "2001:db8:1:2::7")).toBe(v6);
+  expect(await keyOf(2, "[2001:db8:1:2::7]:443, 10.0.0.8:1234")).toBe(v6);
+  // What is no address stays as the proxy wrote it.
+  expect(await keyOf(1, "unknown")).toBe("unknown");
+});
+
+test("client_key_takes_a_count_of_proxies_that_is_no_whole_number_as_none", async () => {
+  // None means the socket's address, which the header cannot change.
+  for (const hops of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+    expect(await keyOf(hops, "6.6.6.6, 1.2.3.4"), String(hops)).toBe("10.0.0.9");
+  }
+});
+
 // ---- Retry-After ------------------------------------------------------------------------------
 
 /** The body of `POST /v1/auth/verify` for a fresh key signing `ch`, as a wallet would. */

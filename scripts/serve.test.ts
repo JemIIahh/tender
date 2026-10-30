@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { KeyPermission } from "@tender/client";
-import type { SessionLock } from "@tender/db";
+import { LockNotHeldError, type SessionLock } from "@tender/db";
 import { KeyPair, type KeyPairString } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
 import {
@@ -401,12 +401,14 @@ test("the_keeper_key_check_takes_only_a_function_call_key_limited_to_tender", as
 
 // ---- The indexer lock -------------------------------------------------------------------------
 
-/** A lock that is held until `lose` or `release`. */
+/** A lock that is held until `lose` or `release`. `lose` gives the reason, as the real one does. */
 function fakeLock() {
   const lost = new AbortController();
   const release = vi.fn(async () => undefined);
   const lock: SessionLock = { lost: lost.signal, release };
-  return { lock, release, lose: () => lost.abort() };
+  const lose = (reason: unknown = new Error("Connection terminated unexpectedly")) =>
+    lost.abort(reason);
+  return { lock, release, lose };
 }
 
 /** What `start` is given: it counts the starts and stops of what it starts. */
@@ -443,21 +445,22 @@ test("the_indexer_waits_for_the_lock_saying_so_once_and_starts_when_it_is_taken"
   const indexing = await runWhileLocked({
     tryLock,
     start,
+    guards: "the indexer and the keeper",
     log: (line) => lines.push(line),
     retryMs: 5,
   });
   // Another process holds the lock: nothing runs, and that is said, once, before this resolves.
   expect(events).toEqual([]);
   expect(lines).toEqual([
-    "indexer: another services process holds the indexer lock; serving the API, and indexing " +
-      "once the lock is free",
+    "indexer: another services process holds the indexer lock; serving the API, and starting " +
+      "the indexer and the keeper once the lock is free",
   ]);
 
   await vi.waitFor(() => expect(events).toEqual(["start"]));
   expect(tryLock).toHaveBeenCalledTimes(5);
   expect(lines.slice(1)).toEqual([
-    "WARN indexer: cannot try the indexer lock (Error ECONNREFUSED); trying again in 0.005 s",
-    "indexer: took the indexer lock",
+    "WARN indexer: cannot take the indexer lock (Error ECONNREFUSED); trying again in 0.005 s",
+    "indexer: took the indexer lock; started the indexer and the keeper",
   ]);
 
   // Stopping stops the indexer, and only then lets the lock go.
@@ -487,16 +490,16 @@ test("the_indexer_stops_when_the_lock_is_lost_and_waits_for_it_again", async () 
   expect(events).toEqual(["start"]);
   expect(lines).toEqual(["indexer: this process holds the indexer lock"]);
 
-  // Its connection ends: the indexer stops, the lock is let go, and the waiting begins again.
-  first.lose();
+  // Its connection fails: the indexer stops, the lock is let go, and the waiting begins again.
+  first.lose(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }));
   await vi.waitFor(() => expect(events).toEqual(["start", "stop", "start"]));
   expect(first.release).toHaveBeenCalledTimes(1);
   expect(lines.slice(1)).toEqual([
-    "WARN indexer: lost the indexer lock, as its connection to the database ended; stopped " +
-      "indexing until the lock is taken again",
-    "indexer: another services process holds the indexer lock; serving the API, and indexing " +
-      "once the lock is free",
-    "indexer: took the indexer lock",
+    "WARN indexer: lost the indexer lock, as its connection to the database failed " +
+      "(Error ECONNRESET); stopped the indexer until it is taken again",
+    "indexer: another services process holds the indexer lock; serving the API, and starting " +
+      "the indexer once the lock is free",
+    "indexer: took the indexer lock; started the indexer",
   ]);
 
   await indexing.stop();
@@ -533,10 +536,56 @@ test("the_lock_is_let_go_when_the_indexer_fails_to_start", async () => {
     retryMs: 5,
   });
   await vi.waitFor(() => expect(later.release).toHaveBeenCalledTimes(1));
-  expect(lines.at(-1)).toBe(`ERROR indexer: cannot start (${refused.message}); not indexing`);
+  expect(lines.at(-1)).toBe(
+    `ERROR indexer: cannot start the indexer (${refused.message}); not trying again`,
+  );
   await new Promise((resolve) => setTimeout(resolve, 30));
   expect(tryLock).toHaveBeenCalledTimes(2);
   await indexing.stop();
+});
+
+test("a_lock_that_its_session_does_not_hold_points_at_database_url", async () => {
+  // Behind a pooler in transaction mode. At startup that is a failure to start.
+  const notHeld = new LockNotHeldError();
+  await expect(
+    runWhileLocked({
+      tryLock: async () => {
+        throw notHeld;
+      },
+      start: counted().start,
+      log: () => undefined,
+    }),
+  ).rejects.toBe(notHeld);
+
+  // Later, a check that finds the lock gone stops what runs, and so does each try that finds the
+  // same; the lines say why, and what to look at.
+  const first = fakeLock();
+  const answers: Array<() => Promise<SessionLock | null>> = [
+    async () => first.lock,
+    async () => {
+      throw new LockNotHeldError();
+    },
+  ];
+  const tryLock = vi.fn(() => (answers.shift() ?? (async () => null))());
+  const { events, start } = counted();
+  const lines: string[] = [];
+  const indexing = await runWhileLocked({
+    tryLock,
+    start,
+    log: (line) => lines.push(line),
+    retryMs: 5,
+  });
+  first.lose(new LockNotHeldError());
+  await vi.waitFor(() => expect(tryLock.mock.calls.length).toBeGreaterThanOrEqual(3));
+  await indexing.stop();
+  expect(events).toEqual(["start", "stop"]);
+  expect(lines.slice(0, 3)).toEqual([
+    "indexer: this process holds the indexer lock",
+    `WARN indexer: lost the indexer lock: ${notHeld.message} (DATABASE_URL); stopped the ` +
+      "indexer until it is taken again",
+    `WARN indexer: cannot take the indexer lock (${notHeld.message} (DATABASE_URL)); trying ` +
+      "again in 0.005 s",
+  ]);
 });
 
 test("stopping_while_waiting_for_the_lock_ends_the_wait", async () => {

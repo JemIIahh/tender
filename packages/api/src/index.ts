@@ -1,4 +1,5 @@
 export { createApp } from "./app";
+export { NoAnswerInTime, withinDeadline } from "./deadline";
 export type { ApiDeps, ChainReader } from "./deps";
 export type {
   AccountEntriesResponse,
