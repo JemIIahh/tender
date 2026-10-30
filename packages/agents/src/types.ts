@@ -21,7 +21,9 @@ export interface Solver {
   /**
    * Whether the answers are written in advance and not worked out, as the offline and weak solvers
    * read theirs from files. A scripted agent is labelled as such wherever it is shown (spec:
-   * "Honesty"), so a solver says so about itself and a caller does not have to remember.
+   * "Honesty"), so a solver says so about itself and a caller does not have to remember. The runner
+   * also asks a scripted solver before it signals `start` on a task, since the answer costs
+   * nothing and a task with no answer is then never announced; any other solver is asked after.
    */
   scripted: boolean;
   /**
@@ -29,7 +31,9 @@ export interface Solver {
    * know the task, or its own answer failed the shape the brief asks for. The runner then leaves
    * the task alone for the rest of the run and commits nothing. An answer is committed to as it
    * is, so a solver checks its output before it returns it. A solver that throws is treated as one
-   * that returned null, and the error is logged.
+   * that returned null, and the error is logged. So is one that takes longer than the runner's
+   * `solveTimeoutMs` (default 120 s): the runner stops waiting, but it cannot cancel the call, so a
+   * solver that makes network calls bounds them itself.
    */
   solve(ctx: TaskContext): Promise<Uint8Array | null>;
 }

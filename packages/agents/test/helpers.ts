@@ -6,6 +6,7 @@ import {
   sha256Hex,
   type TaskDetail,
   type TaskDetailResponse,
+  type TaskEntry,
   type TaskOutcome,
   type TaskSummary,
 } from "@tender/shared";
@@ -52,6 +53,18 @@ export interface TaskSpec {
   documents: boolean;
   /** The brief hash the chain holds. Default: a hash of the id. */
   briefHash?: string;
+  /** The task's poster. Default: `POSTER`. */
+  poster?: string;
+  /** The task's verifier. Default: `JUDGE`. */
+  verifier?: string;
+  /** The only accounts the task takes entries from; empty for any. Default: empty. */
+  invited?: string[];
+  /** The most entries the task takes; 0 for no cap. Default: 0. */
+  maxEntries?: number;
+  /** How many entries the task has. Default: 0. */
+  commitCount?: number;
+  /** The entries the index shows in the task. Default: none. */
+  entries?: TaskEntry[];
 }
 
 /** The task a test asks for, with the rest as a task that has just been posted and accepted. */
@@ -76,14 +89,14 @@ export function taskSummary(spec: TaskSpec): TaskSummary {
     token: TOKEN,
     reward: "1000000",
     phase: spec.phase,
-    poster: POSTER,
-    verifier: JUDGE,
+    poster: spec.poster ?? POSTER,
+    verifier: spec.verifier ?? JUDGE,
     created_at: "1000000000",
     commit_deadline: "2000000000",
     reveal_deadline: "3000000000",
     pick_deadline: "4000000000",
     fallback_deadline: "5000000000",
-    commit_count: 0,
+    commit_count: spec.commitCount ?? 0,
     reveal_count: 0,
     working_count: 0,
     judge_status: spec.judgeStatus,
@@ -101,9 +114,9 @@ export function taskDetail(spec: TaskSpec): TaskDetail {
     brief_hash: spec.briefHash ?? sha256Hex(`brief of task ${spec.id}`),
     criteria_hash: sha256Hex(`criteria of task ${spec.id}`),
     heldout_commitment: null,
-    max_entries: 0,
+    max_entries: spec.maxEntries ?? 0,
     max_winners: 1,
-    invited: [],
+    invited: spec.invited ?? [],
     fee_bps: 500,
     outcome: spec.outcome,
   };
@@ -114,7 +127,7 @@ export function taskDetailResponse(spec: TaskSpec): TaskDetailResponse {
     task: taskDetail(spec),
     brief: spec.documents ? BRIEF : null,
     criteria: spec.documents ? CRITERIA : null,
-    entries: [],
+    entries: spec.entries ?? [],
     funders: [],
     children: [],
     scorecard: null,
@@ -123,6 +136,20 @@ export function taskDetailResponse(spec: TaskSpec): TaskDetailResponse {
 
 export function contextOf(spec: TaskSpec): TaskContext {
   return { task: taskDetail(spec), brief: BRIEF, criteria: CRITERIA };
+}
+
+/** An entry of `ACCOUNT` as the index shows it in a task: committed, not revealed unless said. */
+export function taskEntry(overrides: Partial<TaskEntry> = {}): TaskEntry {
+  return {
+    account: ACCOUNT,
+    entry_index: 0,
+    committed_height: "1000",
+    content_hash: null,
+    uri: null,
+    revealed: false,
+    is_team: false,
+    ...overrides,
+  };
 }
 
 /** A pick that pays `winner` all of the reward but the fee. */

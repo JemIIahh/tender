@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { TenderError, type TxResult } from "@tender/client";
 import { createStateStore, type Draft, type StateStore } from "@tender/mcp";
 import {
+  type AccountEntry,
   ApiError,
   computeCommitment,
   type EntryView,
@@ -31,6 +32,7 @@ import {
   type TaskSpec,
   TOKEN,
   taskDetailResponse,
+  taskEntry,
   taskSpec,
   taskSummary,
   voided,
@@ -47,9 +49,10 @@ const ANSWER_BASE64 = Buffer.from(ANSWER).toString("base64");
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 /** The 1 KiB of contract storage that the runner asks for before it commits, in yoctoNEAR. */
 const ONE_KIB = STORAGE_BYTE_COST * 1024n;
+/** Room for every entry that a test makes in one tick, with the reveals each one owes. */
 const ROOMY: StorageView = {
-  total: `${ONE_KIB * 2n}`,
-  available: `${ONE_KIB * 2n}`,
+  total: `${ONE_KIB * 64n}`,
+  available: `${ONE_KIB * 64n}`,
   used_bytes: "0",
 };
 
@@ -84,6 +87,25 @@ class World {
     const last = page.at(-1);
     const more = rest.length > page.length && last !== undefined;
     return { tasks: page.map(taskSummary), next_cursor: more ? String(last.id) : null };
+  }
+
+  /** What `GET /v1/entries` gives for `account`: its entries, as the index has them. */
+  entriesOf(account: string): AccountEntry[] {
+    return [...this.tasks.values()].flatMap((spec) =>
+      (spec.entries ?? [])
+        .filter((entry) => entry.account === account)
+        .map((entry) => ({
+          task_id: String(spec.id),
+          title: `Task ${spec.id}`,
+          phase: spec.phase,
+          revealed: entry.revealed,
+          won: false,
+          entry_index: entry.entry_index,
+          committed_height: entry.committed_height,
+          content_hash: entry.content_hash,
+          uri: entry.uri,
+        })),
+    );
   }
 }
 
@@ -131,6 +153,7 @@ interface Harness {
   logs: string[];
   listTasks: Mock<TenderApi["listTasks"]>;
   getTask: Mock<TenderApi["getTask"]>;
+  listEntries: Mock<TenderApi["listEntries"]>;
   start: Mock<TenderApi["start"]>;
   upload: Mock<TenderApi["uploadBlob"]>;
   commit: Mock<AgentChain["commit"]>;
@@ -151,8 +174,13 @@ interface Harness {
   restart(): void;
 }
 
+/**
+ * The agent, its fakes and its directory. `scripted` is whether the solver says it answers from
+ * files, which decides whether the runner asks it before `start` or after (default: it does).
+ */
 async function harness(
   answer: (ctx: TaskContext) => Uint8Array | null | Promise<Uint8Array | null> = () => ANSWER,
+  { scripted = true }: { scripted?: boolean } = {},
 ): Promise<Harness> {
   const dir = await mkdtemp(join(tmpdir(), "tender-agent-"));
   dirs.push(dir);
@@ -164,6 +192,9 @@ async function harness(
     const spec = world.tasks.get(Number(id));
     return spec === undefined ? null : taskDetailResponse(spec);
   });
+  const listEntries = vi.fn<TenderApi["listEntries"]>(async (account) => ({
+    entries: world.entriesOf(account),
+  }));
   const start = vi.fn<TenderApi["start"]>(async () => ({ ok: true, working_count: 1 }));
   const upload = vi.fn<TenderApi["uploadBlob"]>(async (blob) => {
     // Stored by hash, so the same bytes are the same blob however often they are sent.
@@ -177,7 +208,7 @@ async function harness(
     uploadBlob: upload,
     listAgents: unexpected("listAgents"),
     getAgent: unexpected("getAgent"),
-    listEntries: unexpected("listEntries"),
+    listEntries,
     health: unexpected("health"),
     getScorecard: unexpected("getScorecard"),
     getBlob: unexpected("getBlob"),
@@ -207,7 +238,7 @@ async function harness(
   };
 
   const solve = vi.fn<Solver["solve"]>(async (ctx) => answer(ctx));
-  const solver: Solver = { name: "test", scripted: true, solve };
+  const solver: Solver = { name: "test", scripted, solve };
 
   const h: Harness = {
     dir,
@@ -218,6 +249,7 @@ async function harness(
     logs,
     listTasks,
     getTask,
+    listEntries,
     start,
     upload,
     commit,
@@ -342,12 +374,12 @@ test("skips_rejected_and_unmatched_tags", async () => {
   await h.tick();
   await h.tick();
 
-  // One listing for each tag, by the API's own filter.
+  // One listing for each tag, by the API's own filter, a page of the most it gives.
   expect(h.listTasks.mock.calls).toEqual([
-    [{ phase: "open", tag: "regex" }],
-    [{ phase: "open", tag: "json" }],
-    [{ phase: "open", tag: "regex" }],
-    [{ phase: "open", tag: "json" }],
+    [{ phase: "open", tag: "regex", limit: 50 }],
+    [{ phase: "open", tag: "json", limit: 50 }],
+    [{ phase: "open", tag: "regex", limit: 50 }],
+    [{ phase: "open", tag: "json", limit: 50 }],
   ]);
   // The tasks of other tags are not looked at, and the rejected one is not even fetched.
   expect(new Set(idsOf(h.getTask))).toEqual(new Set([3n, 4n, 5n]));
@@ -383,33 +415,48 @@ test("a_task_without_reason_is_skipped_all_the_same", async () => {
 });
 
 test("null_solution_marks_seen", async () => {
-  const h = await harness(() => null);
-  h.world.add({ id: 7 });
+  // A scripted solver is asked before `start`, so a task it has no answer to is never announced.
+  // Any other is asked after it, and the announcement has been made.
+  for (const scripted of [true, false]) {
+    const h = await harness(() => null, { scripted });
+    h.world.add({ id: 7 });
 
-  await h.tick();
-  await h.tick();
+    await h.tick();
+    await h.tick();
 
-  expect(h.solve).toHaveBeenCalledTimes(1);
-  expect(h.start).toHaveBeenCalledTimes(1);
-  expect(h.commit).not.toHaveBeenCalled();
-  // Nothing was committed to, so nothing is kept.
-  expect(await h.state.listDrafts()).toEqual([]);
-  expect(h.logs.filter((line) => line === "alice: no answer for task 7")).toHaveLength(1);
+    expect(h.solve, `scripted ${scripted}`).toHaveBeenCalledTimes(1);
+    expect(h.start, `scripted ${scripted}`).toHaveBeenCalledTimes(scripted ? 0 : 1);
+    expect(h.commit, `scripted ${scripted}`).not.toHaveBeenCalled();
+    // Nothing was committed to, so nothing is kept.
+    expect(await h.state.listDrafts(), `scripted ${scripted}`).toEqual([]);
+    expect(h.logs.filter((line) => line === "alice: no answer for task 7")).toHaveLength(1);
+  }
 });
 
 test("a_solver_that_throws_is_logged_and_not_asked_again", async () => {
-  const h = await harness(() => {
-    throw new TypeError("the model said https://llm.test/?key=SECRET is down");
-  });
-  h.world.add({ id: 7 });
+  // A scripted solver and a model, each failing from inside a promise and failing at once.
+  for (const scripted of [true, false]) {
+    for (const atOnce of [false, true]) {
+      const what = `scripted ${scripted}, ${atOnce ? "at once" : "in a promise"}`;
+      const h = await harness(undefined, { scripted });
+      h.world.add({ id: 7 });
+      const failure = new TypeError("the model said https://llm.test/?key=SECRET is down");
+      h.solve.mockImplementation(() => {
+        if (atOnce) throw failure;
+        return Promise.reject(failure);
+      });
 
-  await h.tick();
-  await h.tick();
+      await h.tick();
+      await h.tick();
 
-  expect(h.solve).toHaveBeenCalledTimes(1);
-  expect(h.commit).not.toHaveBeenCalled();
-  expect(h.logs).toContain("ERROR alice: the test solver failed on task 7 (TypeError)");
-  expect(h.logs.join("\n")).not.toContain("SECRET");
+      expect(h.solve, what).toHaveBeenCalledTimes(1);
+      // A scripted solver is asked before `start`, which then has nothing to announce.
+      expect(h.start, what).toHaveBeenCalledTimes(scripted ? 0 : 1);
+      expect(h.commit, what).not.toHaveBeenCalled();
+      expect(h.logs, what).toEqual(["ERROR alice: the test solver failed on task 7 (TypeError)"]);
+      expect(h.logs.join("\n"), what).not.toContain("SECRET");
+    }
+  }
 });
 
 test("hands_the_solver_the_task_its_brief_and_its_criteria", async () => {
@@ -422,6 +469,149 @@ test("hands_the_solver_the_task_its_brief_and_its_criteria", async () => {
   expect(ctx?.task).toEqual(taskDetailResponse(task).task);
   expect(ctx?.brief).toEqual(taskDetailResponse(task).brief);
   expect(ctx?.criteria).toEqual(taskDetailResponse(task).criteria);
+});
+
+test("a_scripted_solver_is_asked_before_start_and_start_goes_out_only_for_an_answer", async () => {
+  // The solver has an answer for task 2 and none for task 1: a stranger's task is not announced.
+  const h = await harness((ctx) => (ctx.task.id === "2" ? ANSWER : null));
+  h.world.add({ id: 1 });
+  h.world.add({ id: 2 });
+
+  await h.tick();
+  await h.tick();
+
+  expect(idsOf(h.start)).toEqual([2n]);
+  expect(idsOf(h.commit)).toEqual([2n]);
+  // Each task is asked once, the task with no answer included: it is seen all the same.
+  expect(h.solve).toHaveBeenCalledTimes(2);
+  expect(h.logs).toContain("alice: no answer for task 1");
+  // Task 2 is the newest and goes first: solve, then start, then commit.
+  const order = (mock: { mock: { invocationCallOrder: number[] } }) =>
+    mock.mock.invocationCallOrder[0] ?? 0;
+  expect(order(h.solve)).toBeLessThan(order(h.start));
+  expect(order(h.start)).toBeLessThan(order(h.commit));
+});
+
+test("a_model_solver_is_asked_after_start", async () => {
+  const h = await harness(undefined, { scripted: false });
+  h.world.add({ id: 7 });
+
+  await h.tick();
+
+  expect(idsOf(h.commit)).toEqual([7n]);
+  expect(h.start.mock.invocationCallOrder[0]).toBeLessThan(
+    h.solve.mock.invocationCallOrder[0] ?? 0,
+  );
+});
+
+test("a_scripted_task_whose_start_fails_is_asked_again_next_tick", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  h.start.mockRejectedValueOnce(new ApiError(503, { error: "unavailable", message: "x" }));
+
+  await h.tick();
+  expect(h.logs).toContain("ERROR alice: task 7 failed (ApiError 503 unavailable)");
+  expect(h.commit).not.toHaveBeenCalled();
+
+  // Asking a scripted solver costs nothing, so the task is asked and started again.
+  await h.tick();
+  expect(idsOf(h.commit)).toEqual([7n]);
+  expect(h.solve).toHaveBeenCalledTimes(2);
+  expect(h.start).toHaveBeenCalledTimes(2);
+
+  await h.tick();
+  expect(h.solve).toHaveBeenCalledTimes(2);
+});
+
+// A solver that never settles, such as a model call stuck on a hung socket, is given up on.
+test("a_solver_that_does_not_answer_in_time_is_given_up_on", async () => {
+  for (const scripted of [true, false]) {
+    const what = `scripted ${scripted}`;
+    const h = await harness(() => new Promise<Uint8Array | null>(() => {}), { scripted });
+    h.state = memoryState();
+    h.world.add({ id: 7 });
+    vi.useFakeTimers();
+
+    const ticking = h.tick();
+    await vi.advanceTimersByTimeAsync(119_999);
+    expect(h.logs, what).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await ticking;
+
+    // Like a null answer, but said: nothing is committed to, and the timer is gone.
+    expect(h.logs, what).toEqual(["ERROR alice: the test solver took over 120000 ms on task 7"]);
+    expect(h.commit, what).not.toHaveBeenCalled();
+    expect(h.start, what).toHaveBeenCalledTimes(scripted ? 0 : 1);
+    expect(vi.getTimerCount(), what).toBe(0);
+
+    // The task is seen: the solver is not asked a second time in the run.
+    await h.tick();
+    expect(h.solve, what).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  }
+});
+
+test("the_time_a_solver_has_is_an_option", async () => {
+  const h = await harness(() => new Promise<Uint8Array | null>(() => {}));
+  h.state = memoryState();
+  h.world.add({ id: 7 });
+  vi.useFakeTimers();
+
+  const ticking = agentTick({ ...h.options(), solveTimeoutMs: 50, memory: h.memory });
+  await vi.advanceTimersByTimeAsync(49);
+  expect(h.logs).toEqual([]);
+  await vi.advanceTimersByTimeAsync(1);
+  await ticking;
+
+  expect(h.logs).toEqual(["ERROR alice: the test solver took over 50 ms on task 7"]);
+});
+
+test("an_answer_that_comes_after_the_limit_is_dropped_and_so_is_a_late_failure", async () => {
+  // The first solver answers late; the second fails late. Neither is committed to, and the late
+  // failure is not an unhandled rejection (which would fail the run).
+  for (const how of ["answers", "fails"] as const) {
+    let finish: () => void = () => {};
+    const h = await harness(
+      () =>
+        new Promise<Uint8Array | null>((resolve, reject) => {
+          finish = how === "answers" ? () => resolve(ANSWER) : () => reject(new Error("late"));
+        }),
+    );
+    h.state = memoryState();
+    h.world.add({ id: 7 });
+    vi.useFakeTimers();
+
+    const ticking = h.tick();
+    await vi.advanceTimersByTimeAsync(120_000);
+    await ticking;
+    finish();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(h.commit, how).not.toHaveBeenCalled();
+    expect(h.logs, how).toEqual(["ERROR alice: the test solver took over 120000 ms on task 7"]);
+    vi.useRealTimers();
+  }
+});
+
+test("the_timer_of_a_solve_is_cleared_however_the_solver_ends", async () => {
+  const h = await harness();
+  h.state = memoryState();
+  for (const id of [1, 2, 3]) h.world.add({ id });
+  // Task 1 answers, task 2 fails in a promise and task 3 fails at once.
+  h.solve.mockImplementation((ctx) => {
+    if (ctx.task.id === "3") throw new TypeError("at once");
+    return ctx.task.id === "2" ? Promise.reject(new TypeError("later")) : Promise.resolve(ANSWER);
+  });
+  vi.useFakeTimers();
+
+  await h.tick();
+
+  expect(idsOf(h.commit)).toEqual([1n]);
+  expect(h.logs.filter((line) => line.startsWith("ERROR"))).toEqual([
+    "ERROR alice: the test solver failed on task 3 (TypeError)",
+    "ERROR alice: the test solver failed on task 2 (TypeError)",
+  ]);
+  expect(vi.getTimerCount()).toBe(0);
 });
 
 test("skips_commit_when_storage_low", async () => {
@@ -473,8 +663,117 @@ test("storage_for_a_kibibyte_is_enough_and_one_yocto_less_is_not", async () => {
   expect(h.logs).toContain(`WARN storage low account=${ACCOUNT} available=${ONE_KIB - 1n}`);
 });
 
-test("a_start_that_fails_is_tried_again_and_costs_no_model_call", async () => {
+/** What `n` bytes of contract storage cost, in yoctoNEAR. */
+const bytes = (n: bigint) => STORAGE_BYTE_COST * n;
+/** A balance with `n` bytes of contract storage free. */
+const free = (n: bigint, less = 0n): StorageView => ({
+  total: `${bytes(n)}`,
+  available: `${bytes(n) - less}`,
+  used_bytes: "0",
+});
+/** What each reveal still owed adds to the 1 KiB a new entry needs: 36 bytes and a 256-byte URI. */
+const OWED = 292n;
+
+/**
+ * An agent that owes two reveals. Task 1 is open and task 2 is in its window, and neither is
+ * revealed (the reveal of task 2 fails). Three drafts owe nothing: task 3 is revealed, the window
+ * of task 4 has passed and task 5 is settled.
+ */
+async function owingTwoReveals(): Promise<Harness> {
   const h = await harness();
+  const [, two, three, four, five] = [1, 2, 3, 4, 5].map((id) => h.world.add({ id }));
+  await h.tick();
+  if (two === undefined || three === undefined || four === undefined || five === undefined) {
+    throw new Error("the tasks are missing");
+  }
+  two.phase = "revealing";
+  three.phase = "revealing";
+  four.phase = "judging";
+  Object.assign(five, { phase: "settled", outcome: picked(5, OTHER) });
+  h.reveal.mockImplementation(async (taskId) => {
+    if (taskId === 2n) throw new Error("rpc down");
+    return tx("reveal-tx");
+  });
+  await h.tick();
+  expect(idsOf(h.reveal)).toEqual([2n, 3n]);
+  return h;
+}
+
+test("storage_must_also_cover_the_reveals_the_agent_owes", async () => {
+  // Two reveals are owed: 1 KiB and two URIs' worth is what the next entry needs.
+  const enough = await owingTwoReveals();
+  enough.world.add({ id: 6 });
+  enough.storage.mockResolvedValue(free(1024n + 2n * OWED));
+  await enough.tick();
+  expect(idsOf(enough.commit)).toContain(6n);
+
+  // A yocto less and it is turned down, with the balance said.
+  const short = await owingTwoReveals();
+  short.world.add({ id: 6 });
+  short.storage.mockResolvedValue(free(1024n + 2n * OWED, 1n));
+  await short.tick();
+  expect(idsOf(short.commit)).not.toContain(6n);
+  expect(short.logs).toContain(
+    `WARN storage low account=${ACCOUNT} available=${bytes(1024n + 2n * OWED) - 1n}`,
+  );
+});
+
+test("a_commit_made_in_the_tick_is_a_reveal_owed_by_the_next_task_of_the_tick", async () => {
+  const h = await harness();
+  h.world.add({ id: 1 });
+  h.world.add({ id: 2 });
+  // Room for one entry, and for a second only if the first owed nothing.
+  h.storage.mockResolvedValue(free(1024n + OWED, 1n));
+
+  await h.tick();
+
+  // Newest first: task 2 is entered, and then task 1 needs 1024 + 292 bytes.
+  expect(idsOf(h.commit)).toEqual([2n]);
+  expect(h.logs.filter((line) => line.startsWith("WARN"))).toEqual([
+    `WARN storage low account=${ACCOUNT} available=${bytes(1024n + OWED) - 1n}`,
+  ]);
+});
+
+test("a_draft_given_up_owes_no_reveal", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  await crashInsideTheCommit(h);
+  h.restart();
+  // The contract refuses the resend for good, in a task that is still open. The draft is dead,
+  // and the storage that a new entry needs is 1 KiB and nothing for the draft's reveal.
+  h.commit.mockRejectedValueOnce(new TenderError("E_AUTH", "E_AUTH: the poster may not enter"));
+  h.world.add({ id: 8 });
+  h.storage.mockResolvedValue(free(1024n));
+
+  await h.tick();
+
+  expect(h.logs).toContain(
+    "ERROR alice: commit to task 7 refused for good (TenderError E_AUTH), the draft is dead",
+  );
+  expect(idsOf(h.commit)).toEqual([7n, 7n, 8n]);
+});
+
+test("a_draft_still_waiting_for_its_commit_owes_a_reveal", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  await crashInsideTheCommit(h);
+  h.restart();
+  // The resend fails the way a node that is down does: the draft is neither on the chain nor dead,
+  // and it will be sent again, so its reveal is owed like any other.
+  h.commit.mockRejectedValueOnce(new Error("fetch failed"));
+  h.world.add({ id: 8 });
+  h.storage.mockResolvedValue(free(1024n));
+
+  await h.tick();
+
+  expect(idsOf(h.commit)).toEqual([7n, 7n]);
+  expect(h.logs).toContain(`WARN storage low account=${ACCOUNT} available=${bytes(1024n)}`);
+});
+
+test("a_start_that_fails_is_tried_again_and_costs_no_model_call", async () => {
+  // The solver is a model here: `start` comes first, and a task that cannot be started costs no
+  // call.
+  const h = await harness(undefined, { scripted: false });
   h.world.add({ id: 7 });
   h.start.mockRejectedValueOnce(new ApiError(503, { error: "unavailable", message: "x" }));
 
@@ -554,9 +853,9 @@ test("follows_the_cursor_through_every_page", async () => {
   await h.tick();
 
   expect(h.listTasks.mock.calls).toEqual([
-    [{ phase: "open", tag: "regex" }],
-    [{ phase: "open", tag: "regex", cursor: "4" }],
-    [{ phase: "open", tag: "regex", cursor: "2" }],
+    [{ phase: "open", tag: "regex", limit: 50 }],
+    [{ phase: "open", tag: "regex", limit: 50, cursor: "4" }],
+    [{ phase: "open", tag: "regex", limit: 50, cursor: "2" }],
   ]);
   expect(idsOf(h.commit)).toEqual([1n, 2n, 3n, 4n, 5n]);
 });
@@ -568,6 +867,212 @@ test("a_cursor_that_never_ends_does_not_end_the_tick_for_good", async () => {
   await h.tick();
 
   expect(h.listTasks).toHaveBeenCalledTimes(10);
+});
+
+// ---- What the API says is checked -------------------------------------------------------------
+
+test("a_listing_that_ignores_the_tag_is_not_trusted", async () => {
+  const h = await harness();
+  h.world.add({ id: 1 });
+  h.world.add({ id: 2, tags: ["poetry"] });
+  h.world.add({ id: 3, tags: ["poetry", "coding"] });
+  // An API that ignores the tag it was asked for gives every open task.
+  h.listTasks.mockImplementation(async () => ({
+    tasks: [...h.world.tasks.values()].map(taskSummary),
+    next_cursor: null,
+  }));
+
+  await h.tick();
+
+  // Only the task with the tag is looked at, started and answered, and the others are counted.
+  expect(idsOf(h.getTask)).toEqual([1n]);
+  expect(idsOf(h.start)).toEqual([1n]);
+  expect(idsOf(h.commit)).toEqual([1n]);
+  expect(h.logs).toContain("WARN alice: the API listed 2 tasks without the tag regex, skipped");
+
+  h.world.tasks.delete(3);
+  h.logs.length = 0;
+  await h.tick();
+  expect(h.logs).toEqual(["WARN alice: the API listed 1 task without the tag regex, skipped"]);
+});
+
+test("a_page_is_cut_to_the_50_tasks_asked_for", async () => {
+  const h = await harness();
+  for (let id = 1; id <= 60; id++) h.world.add({ id });
+  // An API that gives 60 in a page, whatever limit it was asked for. Newest first: 60 down to 1.
+  h.listTasks.mockImplementationOnce(async () => ({
+    tasks: [...h.world.tasks.values()].sort((a, b) => b.id - a.id).map(taskSummary),
+    next_cursor: null,
+  }));
+
+  await h.tick();
+
+  const entered = idsOf(h.commit);
+  expect(entered).toHaveLength(50);
+  expect(entered[0]).toBe(11n);
+  expect(entered.at(-1)).toBe(60n);
+});
+
+test("an_id_that_is_not_a_task_id_is_skipped_with_a_warning", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  // `BigInt` reads each of the first five as 7, and the sixth is more than a u64. The last one
+  // carries an escape sequence, which the log must not pass on.
+  const spelled = ["07", " 7 ", "0x7", "+7", "7\n", "18446744073709551616", "7\u001b[31m"];
+  h.listTasks.mockResolvedValueOnce({
+    tasks: spelled.map((id) => ({ ...taskSummary(task), id })),
+    next_cursor: null,
+  });
+
+  await h.tick();
+
+  expect(h.getTask).not.toHaveBeenCalled();
+  expect(h.start).not.toHaveBeenCalled();
+  expect(h.solve).not.toHaveBeenCalled();
+  expect(await h.state.listDrafts()).toEqual([]);
+  const warnings = h.logs.filter((line) => line.startsWith("WARN"));
+  expect(warnings).toHaveLength(spelled.length);
+  expect(warnings[0]).toBe("WARN alice: skipping a listed task whose id is not a task id (07)");
+  expect(warnings[1]).toBe("WARN alice: skipping a listed task whose id is not a task id (7)");
+  expect(warnings.at(-1)).toBe(
+    "WARN alice: skipping a listed task whose id is not a task id (7 [31m)",
+  );
+  expect(h.logs.filter((line) => /\p{Cc}/u.test(line))).toEqual([]);
+});
+
+test("a_detail_for_another_task_is_not_acted_on", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  // The brief and the criteria are those of task 8: the solver would answer one task and the
+  // agent would enter another.
+  h.getTask.mockImplementationOnce(async () => taskDetailResponse(taskSpec({ id: 8 })));
+
+  await h.tick();
+
+  expect(h.logs).toEqual(["WARN alice: skipping task 7, the API answered with another task"]);
+  expect(h.start).not.toHaveBeenCalled();
+  expect(h.solve).not.toHaveBeenCalled();
+  expect(h.commit).not.toHaveBeenCalled();
+
+  // Nothing is remembered of it: the API may answer right the next time.
+  await h.tick();
+  expect(idsOf(h.commit)).toEqual([7n]);
+});
+
+test("a_detail_for_another_task_does_not_settle_or_reveal_a_draft", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  await h.tick();
+  task.phase = "revealing";
+  // The API answers for task 7 with the detail of task 8, which is settled and was lost.
+  h.getTask.mockImplementationOnce(async () =>
+    taskDetailResponse(taskSpec({ id: 8, phase: "settled", outcome: picked(8, OTHER) })),
+  );
+
+  await h.tick();
+
+  expect(h.logs).toContain("WARN alice: task 7 not tended, the API answered with another task");
+  expect(h.logs.filter((line) => /: (won|lost|refunded) /.test(line))).toEqual([]);
+  expect(h.reveal).not.toHaveBeenCalled();
+
+  // The draft was not given up for the run: the next tick reveals it.
+  await h.tick();
+  expect(idsOf(h.reveal)).toEqual([7n]);
+});
+
+test("a_draft_whose_task_id_is_not_a_task_id_is_not_tended", async () => {
+  const h = await harness();
+  // A store that does not check ids, as the real one does.
+  h.state = memoryState();
+  const contentHash = sha256Hex(ANSWER);
+  const salt = "a".repeat(64);
+  await h.state.saveDraft({
+    taskId: "07",
+    contentBase64: ANSWER_BASE64,
+    contentHash,
+    salt,
+    commitment: computeCommitment(7n, ACCOUNT, contentHash, salt),
+    committedAt: new Date().toISOString(),
+  });
+
+  await h.tick();
+
+  expect(h.getTask).not.toHaveBeenCalled();
+  expect(h.logs).toEqual(["WARN alice: skipping a draft whose task id is not a task id (07)"]);
+});
+
+// ---- Tasks the agent is turned down from ------------------------------------------------------
+
+test("a_task_the_contract_would_refuse_is_skipped_before_start_and_the_solver", async () => {
+  const refused: Array<[Partial<TaskSpec>, string]> = [
+    [{ poster: ACCOUNT }, "the agent is its poster"],
+    [{ verifier: ACCOUNT }, "the agent is its verifier"],
+    [{ invited: [OTHER] }, "it takes invited entrants only and the agent is not one"],
+    [{ maxEntries: 3, commitCount: 3 }, "it has all the entries it takes"],
+    [{ maxEntries: 3, commitCount: 4 }, "it has all the entries it takes"],
+  ];
+  for (const [spec, why] of refused) {
+    const h = await harness(undefined, { scripted: false });
+    h.world.add({ id: 7, ...spec });
+
+    await h.tick();
+    await h.tick();
+
+    expect(h.logs, why).toEqual([`alice: skipping task 7, ${why}`]);
+    // Neither the board nor a model nor the storage view was bothered, and it is seen: not fetched
+    // a second time.
+    expect(h.start, why).not.toHaveBeenCalled();
+    expect(h.solve, why).not.toHaveBeenCalled();
+    expect(h.storage, why).not.toHaveBeenCalled();
+    expect(h.getTask, why).toHaveBeenCalledTimes(1);
+  }
+});
+
+test("a_task_the_contract_takes_the_agent_in_is_entered", async () => {
+  const h = await harness();
+  h.world.add({ id: 1, invited: [OTHER, ACCOUNT] });
+  h.world.add({ id: 2, maxEntries: 3, commitCount: 2 });
+  h.world.add({ id: 3, maxEntries: 0, commitCount: 99 });
+  h.world.add({ id: 4, poster: OTHER });
+
+  await h.tick();
+
+  expect(idsOf(h.commit)).toEqual([1n, 2n, 3n, 4n]);
+  expect(h.logs.filter((line) => line.includes("skipping"))).toEqual([]);
+});
+
+test("a_task_rejected_since_the_listing_is_skipped_on_the_fresher_detail", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7, judgeStatus: "pending" });
+  // The listing is a moment old: it says pending, and by the time the task is fetched it is not.
+  h.listTasks.mockResolvedValueOnce({ tasks: [taskSummary(task)], next_cursor: null });
+  Object.assign(task, { judgeStatus: "rejected", judgeReason: "the criteria cannot be compiled" });
+
+  await h.tick();
+  await h.tick();
+
+  expect(h.logs).toEqual([
+    "alice: skipping task 7, the Judge rejected it: the criteria cannot be compiled",
+  ]);
+  expect(h.start).not.toHaveBeenCalled();
+  expect(h.storage).not.toHaveBeenCalled();
+  // Seen, as the listing's verdict would have made it: not fetched again.
+  expect(h.getTask).toHaveBeenCalledTimes(1);
+});
+
+test("format_characters_and_bidi_controls_are_stripped_from_a_reason", async () => {
+  const h = await harness();
+  // A right-to-left override, an isolate, a zero-width space and a line separator.
+  h.world.add({
+    id: 1,
+    judgeStatus: "rejected",
+    judgeReason: "abc\u202Edef\u2066ghi\u200Bjkl\u2028mno",
+  });
+
+  await h.tick();
+
+  expect(h.logs).toEqual(["alice: skipping task 1, the Judge rejected it: abc def ghi jkl mno"]);
+  expect(h.logs.filter((line) => /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(line))).toEqual([]);
 });
 
 // ---- A commit that did not land ---------------------------------------------------------------
@@ -602,6 +1107,25 @@ async function crashBeforeTheMark(h: Harness): Promise<Draft> {
   };
   void h.tick();
   await vi.waitFor(() => expect(saves).toBe(2));
+  const draft = await createStateStore(h.dir).getDraft("7");
+  if (draft === null) throw new Error("the crash left no draft");
+  expect(draft.committedAt).toBeUndefined();
+  expect(h.entries.get("7")?.commitment).toBe(draft.commitment);
+  return draft;
+}
+
+/**
+ * The process dies after the commit has landed, inside the call that sent it: the chain has the
+ * entry, the call never returns, and the draft on disk does not say that the commit went through.
+ * Returns that draft.
+ */
+async function crashAfterTheCommitLanded(h: Harness): Promise<Draft> {
+  h.commit.mockImplementationOnce(async (taskId, commitment) => {
+    h.entries.set(String(taskId), entryView(taskId, commitment));
+    return new Promise<TxResult>(() => {});
+  });
+  void h.tick();
+  await vi.waitFor(() => expect(h.commit).toHaveBeenCalledTimes(1));
   const draft = await createStateStore(h.dir).getDraft("7");
   if (draft === null) throw new Error("the crash left no draft");
   expect(draft.committedAt).toBeUndefined();
@@ -691,6 +1215,88 @@ test("a_commit_found_on_chain_in_the_reveal_window_is_revealed_in_the_same_tick"
     unmarked.salt,
     expect.any(String),
   );
+  expect(await h.state.getDraft("7")).toMatchObject({
+    committedAt: expect.stringMatching(ISO),
+    revealedUri: expect.any(String),
+  });
+});
+
+test("a_commit_that_landed_before_a_crash_is_revealed_though_its_draft_was_never_marked", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  const saved = await crashAfterTheCommitLanded(h);
+
+  // The next process finds a draft that is not marked, asks the chain, and does not send it again.
+  h.restart();
+  await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.logs).toEqual(["alice: the commit to task 7 was on chain already"]);
+  expect(h.reveal).not.toHaveBeenCalled();
+
+  // Then the window opens, and the draft is uploaded and revealed with its own hash and salt.
+  task.phase = "revealing";
+  await h.tick();
+  const uri = `https://api.test/v1/blobs/${sha256Hex(ANSWER)}`;
+  expect(h.upload).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledWith(7n, saved.contentHash, saved.salt, uri);
+  expect(await h.state.getDraft("7")).toEqual({
+    ...saved,
+    committedAt: expect.stringMatching(ISO),
+    revealedUri: uri,
+  });
+});
+
+test("a_draft_whose_mark_cannot_be_written_is_revealed_all_the_same", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  const real = h.state;
+  let saves = 0;
+  // The first save is the draft before the commit. Every save after it, a mark, fails.
+  h.state = {
+    ...real,
+    saveDraft: async (draft) => {
+      if (++saves > 1) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      await real.saveDraft(draft);
+    },
+  };
+
+  await h.tick();
+  const unmarked =
+    "ERROR alice: task 7 committed, but its draft could not be marked (Error ENOSPC)";
+  expect(h.logs).toEqual(["alice: committed to task 7 tx=commit-tx", unmarked]);
+  expect((await real.getDraft("7"))?.committedAt).toBeUndefined();
+
+  // In its window the chain is asked, as the draft does not say. It has the commit, and the reveal
+  // goes out though the mark cannot be written, and the disk is complained of each time.
+  task.phase = "revealing";
+  await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledTimes(1);
+  expect((await real.getDraft("7"))?.revealedUri).toBeDefined();
+  expect(h.logs.filter((line) => line === unmarked)).toHaveLength(2);
+
+  // Revealed, the draft is not asked about again.
+  await h.tick();
+  expect(h.getEntry).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledTimes(1);
+});
+
+test("a_commit_that_landed_is_revealed_by_a_process_that_comes_back_after_the_commit_window", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  const saved = await crashAfterTheCommitLanded(h);
+
+  // The commit window closed while the process was down. That ends the sending of commits and
+  // nothing else: the chain has the entry, so the draft is not given up.
+  task.phase = "revealing";
+  h.restart();
+  await h.tick();
+
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledWith(7n, saved.contentHash, saved.salt, expect.any(String));
+  expect(h.logs.filter((line) => line.startsWith("ERROR"))).toEqual([]);
   expect(await h.state.getDraft("7")).toMatchObject({
     committedAt: expect.stringMatching(ISO),
     revealedUri: expect.any(String),
@@ -796,6 +1402,52 @@ test("a_commit_that_fails_for_now_is_sent_again_on_a_later_tick", async () => {
   }
 });
 
+test("a_commit_that_keeps_failing_is_sent_again_five_times_and_then_given_up", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  // A node that is down: no code, so nothing in it says the commit will never go through.
+  h.commit.mockRejectedValue(new Error("fetch failed"));
+
+  // The send that enters the task, and five resends. The first is not a resend.
+  for (let tick = 0; tick < 6; tick++) await h.tick();
+  const failed = "ERROR alice: commit to task 7 failed (Error)";
+  expect(h.commit).toHaveBeenCalledTimes(6);
+  expect(h.logs).toEqual(Array(6).fill(failed));
+
+  // The next tick asks the chain once more, finds nothing, and gives the draft up, once.
+  await h.tick();
+  const dead = "ERROR alice: commit to task 7 did not go through in 5 resends, the draft is dead";
+  expect(h.logs.at(-1)).toBe(dead);
+  await h.tick();
+  await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(6);
+  expect(h.logs.filter((line) => line === dead)).toHaveLength(1);
+  expect(h.logs).toHaveLength(7);
+
+  // Dead is for the run: a restart starts the count again.
+  h.restart();
+  await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(7);
+});
+
+test("a_commit_that_goes_through_on_the_fifth_resend_is_not_given_up", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  const down = new Error("fetch failed");
+  // The first send and four resends fail, and the fifth resend lands.
+  for (let failure = 0; failure < 5; failure++) h.commit.mockRejectedValueOnce(down);
+
+  for (let tick = 0; tick < 6; tick++) await h.tick();
+
+  expect(h.commit).toHaveBeenCalledTimes(6);
+  expect(h.logs.at(-1)).toBe("alice: committed to task 7 tx=commit-tx (sent again)");
+  expect(h.logs.filter((line) => line.includes("dead"))).toEqual([]);
+  expect((await h.state.getDraft("7"))?.committedAt).toMatch(ISO);
+
+  await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(6);
+});
+
 test("a_resend_waits_for_storage_and_says_so_once", async () => {
   const h = await harness();
   h.world.add({ id: 7 });
@@ -853,6 +1505,26 @@ test("a_lookup_that_fails_in_the_reveal_window_holds_the_reveal_back_one_tick", 
     unmarked.salt,
     expect.any(String),
   );
+});
+
+test("a_commit_that_is_not_known_to_have_landed_is_not_reported_on", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  await crashInsideTheCommit(h);
+  Object.assign(task, { phase: "settled", outcome: picked(7, OTHER) });
+  h.restart();
+  h.getEntry.mockRejectedValueOnce(new Error("rpc down"));
+
+  // The chain cannot say whether the agent ever entered, so nothing is said of how it ended.
+  await h.tick();
+  expect(h.logs).toEqual(["ERROR alice: the entry in task 7 cannot be read (Error)"]);
+
+  // The chain has no entry of the draft, and the commit window is over: dead, and still not
+  // reported on, since it is an entry the agent never made.
+  await h.tick();
+  await h.tick();
+  expect(h.logs.filter((line) => /: (won|lost|refunded) /.test(line))).toEqual([]);
+  expect(h.logs.filter((line) => line.includes("the draft is dead"))).toHaveLength(1);
 });
 
 test("an_entry_with_another_commitment_is_not_the_drafts", async () => {
@@ -1122,6 +1794,51 @@ test("logs_won_lost_refunded", async () => {
   expect(h.logs.filter((line) => /: (won|lost|refunded) /.test(line))).toEqual(outcomes);
 });
 
+test("never_revealed_is_said_only_when_the_api_and_the_chain_both_say_so", async () => {
+  // The agent was away for the reveal windows, or revealed and lost the mark: the draft of no task
+  // says it was revealed, and only the API and the chain can tell.
+  const h = await harness();
+  const tasks = [1, 2, 3, 4].map((id) => h.world.add({ id }));
+  await h.tick();
+  const uri = "https://api.test/v1/blobs/x";
+  const contentHash = sha256Hex(ANSWER);
+  // Task 1: the API shows the reveal. Task 2: the chain does, and the API has not caught up.
+  // Task 3: neither, though the API shows another entrant's reveal. Task 4: the API has not, and
+  // the chain cannot be read.
+  const [one, two, three, four] = tasks;
+  if (one === undefined || two === undefined || three === undefined || four === undefined) {
+    throw new Error("the tasks are missing");
+  }
+  one.entries = [taskEntry({ revealed: true, uri, content_hash: contentHash })];
+  for (const task of [two, four]) task.entries = [taskEntry()];
+  three.entries = [
+    taskEntry({ account: OTHER, revealed: true, uri, content_hash: contentHash }),
+    taskEntry(),
+  ];
+  const onChain = h.entries.get("2");
+  if (onChain === undefined) throw new Error("no entry on chain");
+  h.entries.set("2", { ...onChain, uri, content_hash: contentHash });
+  h.getEntry.mockImplementation(async (taskId) => {
+    if (taskId === 4n) throw new Error("rpc down");
+    return h.entries.get(String(taskId)) ?? null;
+  });
+  for (const task of tasks)
+    Object.assign(task, { phase: "settled", outcome: picked(task.id, OTHER) });
+
+  await h.tick();
+
+  expect(h.logs.filter((line) => /: lost /.test(line))).toEqual([
+    "alice: lost task 1",
+    "alice: lost task 2",
+    "alice: lost task 3 (never revealed)",
+    // Not known, so not said.
+    "alice: lost task 4",
+  ]);
+  // The chain is asked only where the API does not show the reveal.
+  expect(idsOf(h.getEntry)).toEqual([2n, 3n, 4n]);
+  expect(h.logs).toContain("ERROR alice: the entry in task 4 cannot be read (Error)");
+});
+
 test("a_settled_task_the_agent_never_entered_is_not_reported", async () => {
   const h = await harness();
   const task = h.world.add({ id: 7 });
@@ -1181,6 +1898,104 @@ test("an_unreadable_draft_is_named_and_does_not_stop_the_other_tasks", async () 
   expect(h.logs).toContain("ERROR alice: task 9 failed (Error)");
   // The file is as it was.
   expect(await createStateStore(h.dir).getDraft("10")).not.toBeNull();
+});
+
+test("a_corrupt_draft_does_not_hold_back_a_reveal_that_is_due", async () => {
+  const h = await harness();
+  const damaged = h.world.add({ id: 9 });
+  const healthy = h.world.add({ id: 10 });
+  await h.tick();
+
+  // Both windows open and the index shows the agent's entries, unrevealed. Then one draft file goes
+  // bad, so that the store refuses to list any.
+  for (const task of [damaged, healthy]) Object.assign(task, { phase: "revealing" });
+  for (const task of [damaged, healthy]) task.entries = [taskEntry()];
+  const broken = join(h.dir, "drafts", "9.json");
+  await writeFile(broken, "not json");
+  // Entries that are none of its business: not in the window yet, revealed already, with no draft.
+  h.world.add({ id: 11, tags: ["poetry"], entries: [taskEntry()] });
+  h.world.add({
+    id: 12,
+    tags: ["poetry"],
+    phase: "revealing",
+    entries: [taskEntry({ revealed: true })],
+  });
+  h.world.add({ id: 13, tags: ["poetry"], phase: "revealing", entries: [taskEntry()] });
+  // And one the API spells as no task id, which is not used to read a file.
+  h.listEntries.mockImplementationOnce(async (account) => ({
+    entries: [
+      ...h.world.entriesOf(account),
+      { ...h.world.entriesOf(account)[0], task_id: "07" } as AccountEntry,
+    ],
+  }));
+  const getDraft = vi.spyOn(h.state, "getDraft");
+  h.getTask.mockClear();
+
+  await h.tick();
+
+  // The healthy draft is revealed, and the broken one costs only its own task.
+  expect(h.listEntries).toHaveBeenCalledWith(ACCOUNT);
+  expect(idsOf(h.reveal)).toEqual([10n]);
+  expect((await createStateStore(h.dir).getDraft("10"))?.revealedUri).toBeDefined();
+  expect(h.logs).toContain(
+    `ERROR alice: the drafts cannot be read (draft file ${broken} is corrupt: it is not valid JSON)`,
+  );
+  expect(h.logs).toContain("ERROR alice: task 9 failed (Error)");
+  expect(getDraft.mock.calls.map(([id]) => id)).toEqual(["9", "10", "13"]);
+  expect(idsOf(h.getTask)).toEqual([10n]);
+});
+
+test("the_entries_are_not_asked_for_while_the_drafts_can_be_read", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  await h.tick();
+  task.phase = "revealing";
+  await h.tick();
+
+  expect(h.reveal).toHaveBeenCalledTimes(1);
+  expect(h.listEntries).not.toHaveBeenCalled();
+});
+
+test("entries_that_cannot_be_listed_leave_the_open_tasks_to_the_tick", async () => {
+  const h = await harness();
+  h.world.add({ id: 9 });
+  h.world.add({ id: 10 });
+  await mkdir(join(h.dir, "drafts"), { recursive: true });
+  await writeFile(join(h.dir, "drafts", "9.json"), "not json");
+  h.listEntries.mockRejectedValue(new ApiError(503, { error: "unavailable", message: "x" }));
+
+  await h.tick();
+
+  expect(h.logs).toContain(
+    "ERROR alice: the entries of the account cannot be listed (ApiError 503 unavailable)",
+  );
+  expect(idsOf(h.commit)).toEqual([10n]);
+});
+
+test("the_entries_set_the_storage_owed_while_the_drafts_cannot_be_read", async () => {
+  const h = await harness();
+  h.world.add({ id: 9 });
+  await mkdir(join(h.dir, "drafts"), { recursive: true });
+  await writeFile(join(h.dir, "drafts", "9.json"), "not json");
+  // Two entries of the agent that are not revealed, one open and one in its window, and a third
+  // that is.
+  h.world.add({ id: 1, tags: ["poetry"], entries: [taskEntry()] });
+  h.world.add({ id: 2, tags: ["poetry"], phase: "revealing", entries: [taskEntry()] });
+  h.world.add({
+    id: 3,
+    tags: ["poetry"],
+    phase: "revealing",
+    entries: [taskEntry({ revealed: true })],
+  });
+  h.world.add({ id: 10 });
+  h.storage.mockResolvedValue(free(1024n + 2n * OWED, 1n));
+
+  await h.tick();
+
+  expect(idsOf(h.commit)).toEqual([]);
+  expect(h.logs).toContain(
+    `WARN storage low account=${ACCOUNT} available=${bytes(1024n + 2n * OWED) - 1n}`,
+  );
 });
 
 test("a_client_without_a_signer_cannot_tick", async () => {
@@ -1318,7 +2133,7 @@ test("a_tick_that_throws_is_logged_and_the_loop_goes_on", async () => {
   expect(h.logs.filter((line) => line === "ERROR alice: tick failed (TypeError)")).toHaveLength(2);
 });
 
-test("refuses_a_client_without_a_signer_and_a_poll_interval_setTimeout_cannot_keep", async () => {
+test("refuses_a_client_without_a_signer_and_a_wait_setTimeout_cannot_keep", async () => {
   const h = await harness();
   // Aborted, so that a call that is not refused ends at once and does not run for good.
   const controller = new AbortController();
@@ -1332,6 +2147,16 @@ test("refuses_a_client_without_a_signer_and_a_poll_interval_setTimeout_cannot_ke
     await expect(runAgent({ ...h.options(), pollMs, signal }), `pollMs ${pollMs}`).rejects.toThrow(
       RangeError,
     );
+  }
+  for (const solveTimeoutMs of [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+    await expect(
+      runAgent({ ...h.options(), solveTimeoutMs, signal }),
+      `solveTimeoutMs ${solveTimeoutMs}`,
+    ).rejects.toThrow(RangeError);
+    await expect(
+      agentTick({ ...h.options(), solveTimeoutMs }),
+      `solveTimeoutMs ${solveTimeoutMs}`,
+    ).rejects.toThrow(RangeError);
   }
   // Nothing ran for any of them.
   expect(h.logs).toEqual([]);

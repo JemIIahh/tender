@@ -2,17 +2,21 @@ import { Buffer } from "node:buffer";
 import type { TenderClient } from "@tender/client";
 import type { Draft, StateStore } from "@tender/mcp";
 import {
+  type AccountEntry,
   ApiError,
   computeCommitment,
   type EntryView,
   ErrorBodySchema,
   type ListTasksFilter,
+  MAX_URI_BYTES,
   randomSalt,
   sha256Hex,
   storageShortfall,
   type TaskDetail,
+  type TaskDetailResponse,
   type TaskSummary,
   type TenderApi,
+  U64StringSchema,
 } from "@tender/shared";
 import type { Solver, TaskContext } from "./types";
 
@@ -29,26 +33,58 @@ import type { Solver, TaskContext } from "./types";
 //   not marked committed is taken neither for sent nor for lost: the chain is asked
 //   (`recoverCommit`). If it has the commit, the draft is marked. If not, and the task is still
 //   open, the same commitment is sent again from the draft, never with a new solve. If the commit
-//   window is over, or the contract refuses for good, the draft is dead and is let alone (P05-R14);
+//   window is over with no commit of the draft on the chain, if the contract refuses for good, or
+//   if five resends have failed, the draft is dead and is let alone (P05-R14). A draft whose
+//   commit is on the chain is never dead: it is revealed whenever its window is open, marked or
+//   not, and however late the agent comes back to it;
 // - a draft is never replaced. A task with a draft is not entered again, in this run or after a
 //   restart, because a second commit with another salt would replace the one the draft opens;
 // - the reveal is driven by the drafts and not by what the run remembers, so a restart picks up
 //   every entry where it stopped. The upload comes first and the reveal second, so a crash between
 //   the two leaves a draft that is still unrevealed, and the next tick does both again: the upload
-//   is idempotent (the API stores bytes by their hash) and the reveal is only sent once.
+//   is idempotent (the API stores bytes by their hash) and the reveal is only sent once;
+// - one draft file that cannot be read does not stop the reveals of the others: the account's
+//   entries, as the API lists them, say which reveals are due, and each draft is read by itself.
+//
+// What the API says is checked where a check is cheap (review M3), so that a broken one cannot
+// make the agent start and solve every task it lists, or enter a task under another spelling of its
+// id: a page is cut to the 50 tasks asked for, a task must carry the tag it was listed under, an id
+// must be a u64 as the contract writes one, and the detail that answers for a task must be its own.
 
 /** How long `runAgent` waits after a tick ends before the next one starts, by default. */
 const DEFAULT_POLL_MS = 15_000;
+/** How long the runner waits for a solver to answer one task, by default. */
+const DEFAULT_SOLVE_TIMEOUT_MS = 120_000;
 /** The longest wait `setTimeout` keeps: it runs anything above this after 1 ms instead. */
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 /**
- * How many pages of one tag's open tasks a tick reads. The API gives 20 a page, so this is 200
- * tasks, far more than a board has open at once. The bound is for an API that never stops giving
- * a cursor, which would keep a tick from ever ending.
+ * How many tasks the runner asks for in a page of a listing, and takes from one: the most the API
+ * gives (its default is 20).
+ */
+const PAGE_SIZE = 50;
+/**
+ * How many pages of one tag's open tasks a tick reads. A page is 50 tasks, so this is 500, far more
+ * than a board has open at once. The bound is for an API that never stops giving a cursor, which
+ * would keep a tick from ever ending.
  */
 const MAX_PAGES = 10;
 /** The most code points of the Judge's reason that a log line carries. */
 const MAX_REASON_CHARS = 200;
+/** The most code points of an id that a log line carries when the id is not a task id. */
+const MAX_ID_CHARS = 40;
+/** How many times a draft's commit is sent again in a run before the draft is given up. */
+const MAX_RESENDS = 5;
+/**
+ * The contract storage that the agent must have free before it enters a task (R22), in bytes: 1
+ * KiB, room for the entry's commit and its reveal.
+ */
+const STORAGE_FLOOR_BYTES = 1024n;
+/**
+ * What each reveal the agent still owes adds to that floor (review M1), in bytes: the dearest
+ * reveal, which writes 36 bytes and a URI of at most `MAX_URI_BYTES`. A run of commits made each at
+ * the floor would leave the last reveals without storage, and their windows do not wait.
+ */
+const STORAGE_PER_OWED_BYTES = 36n + BigInt(MAX_URI_BYTES);
 /** What a code looks like: the contract's (`E_AUTH`), Node's (`ECONNREFUSED`), the API's (`not_open`). */
 const CODE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 /**
@@ -61,7 +97,8 @@ const CODE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
  *
  * `E_STORAGE` is not among them, as a top-up makes it come right. Neither is a failure with no
  * code (a node that is down, a timeout) or one the client could not name (`E_UNKNOWN`): none of
- * these is known to repeat, and the commit is tried again until its window ends.
+ * these is known to repeat, and the commit is tried again until its window ends, or until
+ * `MAX_RESENDS` tries have failed.
  */
 const REFUSED_FOR_GOOD: ReadonlySet<string> = new Set([
   "E_NOT_FOUND",
@@ -73,6 +110,8 @@ const REFUSED_FOR_GOOD: ReadonlySet<string> = new Set([
   "E_ARGS",
 ]);
 const NO_SIGNER = "this agent's client has no signer, so it can neither commit nor reveal";
+/** What a solve gives when the solver is not done in time. */
+const TIMED_OUT = Symbol("timed out");
 
 /**
  * What the runner needs of a `TenderClient` (X-12): the account it signs as, the two transactions
@@ -92,19 +131,27 @@ export type AgentChain = Pick<
 export class AgentMemory {
   /**
    * Tasks the agent is done with for this run: it committed to them, or it will not: the Judge
-   * rejected the task, the solver had no answer or failed, or the storage was too low to commit.
+   * rejected the task, the contract would refuse the agent, the solver had no answer or failed or
+   * took too long, or the storage was too low to commit.
    */
   readonly seen = new Set<string>();
   /** Tasks whose outcome has been logged. */
   readonly settled = new Set<string>();
   /**
    * Tasks whose draft is dead for this run: its commit is not on the chain and cannot be, as the
-   * contract refused it for good or the commit window is over. Nothing more is done for them. A
-   * draft has no slot to say so on disk, so a restart judges each of them again.
+   * contract refused it for good, the commit window is over, or five resends failed. Nothing more
+   * is done for them. A draft has no slot to say so on disk, so a restart judges each of them
+   * again.
    */
   readonly dead = new Set<string>();
   /** Tasks whose low storage has been warned of, so that a later tick does not say it again. */
   readonly warned = new Set<string>();
+  /**
+   * How many times the commit of each draft has been sent again in this run, by task. A resend is
+   * one that the recovery of a draft makes (`recoverCommit`); the send that enters a task is not
+   * one. A restart starts the count again.
+   */
+  readonly resends = new Map<string, number>();
 }
 
 export interface AgentTickOptions {
@@ -118,6 +165,14 @@ export interface AgentTickOptions {
   /** The tags of the tasks the agent looks for. A task counts if its brief carries any of them. */
   tags: readonly string[];
   solver: Solver;
+  /**
+   * How long the runner waits for the solver to answer one task before it gives up on it, in
+   * milliseconds, from 1 to 2^31 - 1. A solver that runs out of time is treated like one that has
+   * no answer: the task is left alone for the rest of the run, and the error is logged. Without a
+   * limit, a solver stuck on a hung socket would hold the tick for good, and with it every reveal
+   * that falls due. Default: 120 s.
+   */
+  solveTimeoutMs?: number;
   /**
    * Receives the agent's lines. `WARN` and `ERROR` lines say something is wrong; the rest say what
    * the agent did. An error line names the error and its code and never quotes its message, which
@@ -149,9 +204,16 @@ interface Run {
   state: StateStore;
   tags: readonly string[];
   solver: Solver;
+  solveTimeoutMs: number;
   log: (message: string) => void;
   signal: AbortSignal | undefined;
   memory: AgentMemory;
+  /**
+   * How many reveals the agent owes so far in this tick (review M1): the drafts that are not
+   * revealed and whose task is open or revealing, counted as the tick goes through them, and each
+   * commit made since. It sets how much storage the next entry needs.
+   */
+  owed: number;
 }
 
 /** The text of `error`'s code if it has one that looks like a code, else undefined. */
@@ -185,13 +247,32 @@ function describe(error: unknown): string {
 }
 
 /**
- * `text` as one line of at most 200 code points, for a log. The Judge's reason is text from a
- * stranger's task, and a newline or an escape sequence in it would write lines of its own.
+ * `text` as one line of at most `max` code points (default 200), for a log. The Judge's reason is
+ * text from a stranger's task, and a newline, an escape sequence or a bidi control in it would
+ * write lines of its own or reorder the line it is in: the control characters (`Cc`), the format
+ * characters (`Cf`, among them the bidi controls) and the line and paragraph separators go.
  */
-function oneLine(text: string): string {
-  const flat = text.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " ").trim();
+function oneLine(text: string, max = MAX_REASON_CHARS): string {
+  const flat = text.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").trim();
   const points = [...flat];
-  return points.length > MAX_REASON_CHARS ? `${points.slice(0, MAX_REASON_CHARS).join("")}…` : flat;
+  return points.length > max ? `${points.slice(0, max).join("")}…` : flat;
+}
+
+/**
+ * Whether `id` is a task id as the contract writes one: a u64 in decimal, with no sign, no space
+ * and no leading zero. `BigInt` reads "07", " 7 " and "0x7" as 7 too, and the store's file name is
+ * the id as given, so a task that a listing spelled another way would be entered a second time
+ * under a new salt (review M3).
+ */
+function isTaskId(id: string): boolean {
+  return U64StringSchema.safeParse(id).success;
+}
+
+/** Throws a `RangeError` unless `ms` is a wait that `setTimeout` keeps. */
+function checkMs(name: string, ms: number): void {
+  if (!Number.isFinite(ms) || ms < 1 || ms > MAX_TIMEOUT_MS) {
+    throw new RangeError(`${name} must be from 1 to ${MAX_TIMEOUT_MS} milliseconds`);
+  }
 }
 
 /** Every open task tagged `tag`, page after page, newest first. */
@@ -200,9 +281,12 @@ async function listOpen(api: TenderApi, tag: string): Promise<TaskSummary[]> {
   let cursor: string | undefined;
   for (let page = 0; page < MAX_PAGES; page++) {
     const filter: ListTasksFilter =
-      cursor === undefined ? { phase: "open", tag } : { phase: "open", tag, cursor };
+      cursor === undefined
+        ? { phase: "open", tag, limit: PAGE_SIZE }
+        : { phase: "open", tag, limit: PAGE_SIZE, cursor };
     const found = await api.listTasks(filter);
-    tasks.push(...found.tasks);
+    // A page is what was asked for. An API that gives more is not taken at its word.
+    tasks.push(...found.tasks.slice(0, PAGE_SIZE));
     if (found.next_cursor === null) break;
     cursor = found.next_cursor;
   }
@@ -212,22 +296,36 @@ async function listOpen(api: TenderApi, tag: string): Promise<TaskSummary[]> {
 // ---- Entering tasks ---------------------------------------------------------------------------
 
 /**
- * Looks for the open tasks of each tag and enters those the agent can answer. A task goes through
- * these steps, and the first that says no ends it:
+ * Looks for the open tasks of each tag and enters those the agent can answer. A task that the
+ * listing shows without the tag it was listed under is skipped, since the API was asked for that
+ * tag only (a count of them is logged). Any other goes through these steps, and the first that
+ * says no ends it:
  *
- * 1. The Judge rejected it (`judge_status` "rejected"): logged with its reason, once.
- * 2. The agent has a draft for it already: it is the agent's, and the drafts take it from here.
- * 3. The index shows it no longer open, or without its brief or criteria: left for the next tick.
- * 4. The agent's storage on the contract is below what a commit and a reveal need (R22): logged as
- *    a warning. A function-call key cannot top it up, so the agent can only wait for someone to.
- * 5. `start`, the signal that the agent is working on it, then the solver. No answer: logged.
- * 6. The answer is committed to (`commit`). If the commit does not end well, the draft it saved is
+ * 1. Its id is not a task id (review M3): logged as a warning.
+ * 2. The Judge rejected it (`judge_status` "rejected"): logged with its reason, once.
+ * 3. The agent has a draft for it already: it is the agent's, and the drafts take it from here.
+ * 4. The index no longer shows it open, or without its brief or criteria: left for the next tick.
+ *    So is a detail that is another task's (review M3), with a warning.
+ * 5. The detail says the Judge rejected it: as in step 2 (review M7), as the detail is fresher.
+ * 6. The contract would refuse the agent (review M4): it is the task's poster or verifier, the
+ *    task takes invited entrants only and the agent is not one, or the task is full. Logged.
+ * 7. The agent's storage on the contract is below what a commit and a reveal need (R22), with the
+ *    reveals it already owes (review M1): logged as a warning. A function-call key cannot top it
+ *    up, so the agent can only wait for someone to.
+ * 8. The solver, and `start`, the signal that the agent is working on the task. A scripted solver
+ *    answers from files, which costs nothing and has no side effect (review M6): it is asked
+ *    first, and `start` goes out only for a task it has an answer to, so that the agent does not
+ *    announce itself on strangers' tasks it will not enter. Any other solver is a model call, and
+ *    `start` comes first. No answer, an error and a solver that takes too long (`solveTimeoutMs`)
+ *    are logged.
+ * 9. The answer is committed to (`commit`). If the commit does not end well, the draft it saved is
  *    settled by the next ticks (`recoverCommit`): the answer is not solved for again.
  *
- * A task is `seen` once step 4 has turned it down and once `start` has gone through, whatever
- * happens after, so a solver is asked at most once per task in a run and a failing task cannot cost
- * a model call every tick. A failure before that is a call that did not go through, and the task
- * is looked at again next tick.
+ * A task is `seen` once step 2, 3, 5, 6 or 7 has turned it down and once the solver has been asked
+ * (for a scripted solver with an answer: once `start` has gone through), whatever happens after,
+ * so a solver is asked at most once per task in a run and a failing task cannot cost a model call
+ * every tick. Steps 1 and 4 and a call that fails leave the task unseen: it is looked at again
+ * next tick, and nothing of a task id that is not one is kept.
  */
 async function enterTasks(run: Run): Promise<void> {
   // A task carries several tags and is listed under each: it is looked at once per tick.
@@ -244,8 +342,15 @@ async function enterTasks(run: Run): Promise<void> {
       );
       continue;
     }
+    let strays = 0;
     for (const summary of open) {
       if (run.signal?.aborted) return;
+      // The listing was asked for this tag. A task without it is not the agent's to answer, and
+      // an API that ignores the filter would otherwise make the agent start and solve all of them.
+      if (!summary.tags.includes(tag)) {
+        strays += 1;
+        continue;
+      }
       if (looked.has(summary.id) || run.memory.seen.has(summary.id)) continue;
       looked.add(summary.id);
       try {
@@ -254,7 +359,44 @@ async function enterTasks(run: Run): Promise<void> {
         run.log(`ERROR ${run.name}: task ${summary.id} failed (${describe(error)})`);
       }
     }
+    if (strays > 0) {
+      const tasks = strays === 1 ? "task" : "tasks";
+      run.log(
+        `WARN ${run.name}: the API listed ${strays} ${tasks} without the tag ${tag}, skipped`,
+      );
+    }
   }
+}
+
+/**
+ * Whether the Judge has rejected `task`, by what the listing or the detail says. If so, the task
+ * is seen and the skip is logged with the Judge's reason, flattened to one line.
+ */
+function rejectedByTheJudge(run: Run, task: TaskSummary): boolean {
+  if (task.judge_status !== "rejected") return false;
+  run.memory.seen.add(task.id);
+  const reason = task.judge_reason === null ? "" : `: ${oneLine(task.judge_reason)}`;
+  run.log(`${run.name}: skipping task ${task.id}, the Judge rejected it${reason}`);
+  return true;
+}
+
+/**
+ * Why the contract is sure to refuse the agent's commit to `task`, if it is (review M4), else null.
+ * All of it is in the detail: the poster and the verifier may not enter (`E_AUTH`), a task with an
+ * invite list takes the invited only (`E_INVITE`), and a task with a cap on entries that has
+ * reached it takes no more (`E_FULL`, which holds for good, as entrants cannot leave). Without the
+ * check each one costs a `start`, a solve and a draft that dies at the first commit.
+ */
+function refusalOf(run: Run, task: TaskDetail): string | null {
+  if (task.poster === run.account) return "the agent is its poster";
+  if (task.verifier === run.account) return "the agent is its verifier";
+  if (task.invited.length > 0 && !task.invited.includes(run.account)) {
+    return "it takes invited entrants only and the agent is not one";
+  }
+  if (task.max_entries > 0 && task.commit_count >= task.max_entries) {
+    return "it has all the entries it takes";
+  }
+  return null;
 }
 
 /** One task of `enterTasks`. Throws for what is not the task's fault; the caller logs it. */
@@ -262,12 +404,13 @@ async function enter(run: Run, summary: TaskSummary): Promise<void> {
   const { id } = summary;
   const { memory } = run;
 
-  if (summary.judge_status === "rejected") {
-    memory.seen.add(id);
-    const reason = summary.judge_reason === null ? "" : `: ${oneLine(summary.judge_reason)}`;
-    run.log(`${run.name}: skipping task ${id}, the Judge rejected it${reason}`);
+  if (!isTaskId(id)) {
+    const shown = oneLine(id, MAX_ID_CHARS);
+    run.log(`WARN ${run.name}: skipping a listed task whose id is not a task id (${shown})`);
     return;
   }
+
+  if (rejectedByTheJudge(run, summary)) return;
 
   // Not `memory`: a restart has none, and the draft holds the salt of a commitment that may be on
   // chain. Entering again would save a new salt over it, and the reveal could never open the commit.
@@ -279,9 +422,24 @@ async function enter(run: Run, summary: TaskSummary): Promise<void> {
   const found = await run.api.getTask(BigInt(id));
   if (found === null) return;
   const { task, brief, criteria } = found;
+  // The solver answers the brief in the detail, and the commit goes under `id`: a detail that is
+  // another task's would have the agent answer one task and enter another.
+  if (task.id !== id) {
+    run.log(`WARN ${run.name}: skipping task ${id}, the API answered with another task`);
+    return;
+  }
+  // The listing is a moment old, and so is the verdict in it: the detail is fresher. `start` and
+  // the commit would refuse a task past its window as well.
+  if (rejectedByTheJudge(run, task)) return;
   if (brief === null || criteria === null) return;
-  // The listing is a moment old. `start` and the commit would refuse a task past its window.
   if (task.phase !== "open") return;
+
+  const refusal = refusalOf(run, task);
+  if (refusal !== null) {
+    memory.seen.add(id);
+    run.log(`${run.name}: skipping task ${id}, ${refusal}`);
+    return;
+  }
 
   // R22 (P05-P2): an entry that runs out of storage cannot reveal, and its window does not wait.
   // Checked here, ahead of `start` and the solver, rather than at the commit itself: an agent
@@ -291,24 +449,57 @@ async function enter(run: Run, summary: TaskSummary): Promise<void> {
     return;
   }
 
-  await run.api.start(BigInt(id));
-  memory.seen.add(id);
-
   const ctx: TaskContext = { task, brief, criteria };
   let content: Uint8Array | null;
+  if (run.solver.scripted) {
+    // Review M6: a scripted solver reads its answer from a file, so asking is free, and a
+    // stranger's task that it has no answer to is not announced. A `start` that fails leaves the
+    // task unseen, and the next tick asks again.
+    content = await ask(run, id, ctx);
+    if (content === null) {
+      memory.seen.add(id);
+      return;
+    }
+    await run.api.start(BigInt(id));
+    memory.seen.add(id);
+  } else {
+    await run.api.start(BigInt(id));
+    memory.seen.add(id);
+    content = await ask(run, id, ctx);
+    if (content === null) return;
+  }
+  await commit(run, id, content);
+}
+
+/**
+ * Asks the solver for the answer to task `id`, and gives up on it after `solveTimeoutMs` (review
+ * M2). Returns the bytes, or null if the solver has no answer, failed or took too long; the reason
+ * is logged. A solver cannot be stopped, so one that gives up late is let go: the race has settled
+ * by then, and its late answer or error is dropped.
+ */
+async function ask(run: Run, id: string, ctx: TaskContext): Promise<Uint8Array | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), run.solveTimeoutMs);
+  });
+  let answer: Uint8Array | null | typeof TIMED_OUT;
   try {
-    content = await run.solver.solve(ctx);
+    answer = await Promise.race([run.solver.solve(ctx), late]);
   } catch (error) {
     run.log(
       `ERROR ${run.name}: the ${run.solver.name} solver failed on task ${id} (${describe(error)})`,
     );
-    return;
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
-  if (content === null) {
-    run.log(`${run.name}: no answer for task ${id}`);
-    return;
+  if (answer === TIMED_OUT) {
+    const limit = `${run.solveTimeoutMs} ms`;
+    run.log(`ERROR ${run.name}: the ${run.solver.name} solver took over ${limit} on task ${id}`);
+    return null;
   }
-  await commit(run, id, content);
+  if (answer === null) run.log(`${run.name}: no answer for task ${id}`);
+  return answer;
 }
 
 /**
@@ -329,6 +520,8 @@ async function commit(run: Run, id: string, content: Uint8Array): Promise<void> 
   };
 
   await run.state.saveDraft(draft);
+  // The entry owes a reveal from here on, whether or not the commit goes through at once.
+  run.owed += 1;
   await sendCommit(run, draft, false);
 }
 
@@ -363,7 +556,8 @@ async function sendCommit(run: Run, draft: Draft, again: boolean): Promise<boole
 
 /**
  * Marks `draft` committed, at the time the agent learned of it (for a commit found on the chain,
- * not when it landed). A failure is logged and changes nothing: the chain has the commit.
+ * not when it landed). A failure is logged and changes nothing: the chain has the commit, and a
+ * draft that is not marked is asked about again, and revealed all the same once the chain says so.
  */
 async function markCommitted(run: Run, draft: Draft): Promise<void> {
   try {
@@ -386,6 +580,20 @@ function markDead(run: Run, id: string, why: string): void {
 }
 
 /**
+ * The agent's entry in task `id` on the chain, in an object so that no entry (`null`) is not
+ * mistaken for an entry that could not be read (`undefined`, logged). The chain is the authority
+ * on an entry: the API's index trails it by a few blocks, and its entries carry no commitment.
+ */
+async function lookUp(run: Run, id: string): Promise<{ entry: EntryView | null } | undefined> {
+  try {
+    return { entry: await run.client.getEntry(BigInt(id), run.account) };
+  } catch (error) {
+    run.log(`ERROR ${run.name}: the entry in task ${id} cannot be read (${describe(error)})`);
+    return undefined;
+  }
+}
+
+/**
  * Settles a draft that is not marked committed (P05-R14). Its commit was cut short by a crash, or
  * failed in a way that said nothing of the chain, or went through and was not marked. The chain
  * knows which, and is asked (`get_entry`) before anything is sent. `task` is what the index shows
@@ -393,12 +601,15 @@ function markDead(run: Run, id: string, why: string): void {
  *
  * - The account has an entry with the draft's commitment: the commit landed, and the draft is
  *   marked committed. This is the only way to learn it, as the contract has no "already
- *   committed" error: a second commit by the same account succeeds and replaces the first.
+ *   committed" error: a second commit by the same account succeeds and replaces the first. It is
+ *   asked before the phase of the task, so that a draft whose commit is on the chain is never
+ *   given up, however late the agent comes back to it.
  * - It has none (or one with another commitment, which the draft's replaces) and the task is
- *   open: the draft's own commitment is sent again. It carries the draft's salt and hash, so that
- *   it opens with the draft's work, and no solver is asked.
+ *   open: the draft's own commitment is sent again, at most `MAX_RESENDS` times in a run. It
+ *   carries the draft's salt and hash, so that it opens with the draft's work, and no solver is
+ *   asked.
  * - It has none and the task is no longer open: the commit deadline has passed, nothing can be
- *   sent or revealed, and the draft is dead.
+ *   sent or revealed, and the draft is dead. So it is when the resends are used up.
  *
  * Returns whether the commit is on the chain, which is when the draft may be revealed. A lookup
  * that fails, a storage balance too low to commit (R22) and a send that fails in a way that may
@@ -408,13 +619,9 @@ function markDead(run: Run, id: string, why: string): void {
 async function recoverCommit(run: Run, draft: Draft, task: TaskDetail): Promise<boolean> {
   const id = draft.taskId;
 
-  let entry: EntryView | null;
-  try {
-    entry = await run.client.getEntry(BigInt(id), run.account);
-  } catch (error) {
-    run.log(`ERROR ${run.name}: the entry in task ${id} cannot be read (${describe(error)})`);
-    return false;
-  }
+  const looked = await lookUp(run, id);
+  if (looked === undefined) return false;
+  const { entry } = looked;
   if (entry !== null && entry.commitment === draft.commitment) {
     run.log(`${run.name}: the commit to task ${id} was on chain already`);
     await markCommitted(run, draft);
@@ -426,18 +633,27 @@ async function recoverCommit(run: Run, draft: Draft, task: TaskDetail): Promise<
     markDead(run, id, why);
     return false;
   }
+  const resent = run.memory.resends.get(id) ?? 0;
+  if (resent >= MAX_RESENDS) {
+    markDead(run, id, `commit to task ${id} did not go through in ${MAX_RESENDS} resends`);
+    return false;
+  }
   if (await storageLow(run, id)) return false;
+  run.memory.resends.set(id, resent + 1);
   return sendCommit(run, draft, true);
 }
 
 /**
- * Whether the agent's storage on the contract is below what a commit and a reveal need (R22). It
- * reads the balance now, and warns once for each task if it is short. A function-call key cannot
- * top the account up, so the agent can only wait for someone to.
+ * Whether the agent's storage on the contract is below what a new entry needs (R22): 1 KiB, and
+ * the storage of the reveal of each entry the agent owes already (review M1: the drafts that are
+ * still to be revealed, and the commits made earlier in the tick). It reads the balance now, and
+ * warns once for each task if it is short. A function-call key cannot top the account up, so the
+ * agent can only wait for someone to.
  */
 async function storageLow(run: Run, id: string): Promise<boolean> {
   const storage = await run.client.storageBalanceOf(run.account);
-  if (storageShortfall(storage) <= 0n) return false;
+  const needed = STORAGE_FLOOR_BYTES + BigInt(run.owed) * STORAGE_PER_OWED_BYTES;
+  if (storageShortfall(storage, needed) <= 0n) return false;
   if (!run.memory.warned.has(id)) {
     run.memory.warned.add(id);
     run.log(`WARN storage low account=${run.account} available=${storage?.available ?? "0"}`);
@@ -461,6 +677,10 @@ async function storageLow(run: Run, id: string): Promise<boolean> {
  * stopped the draft from being marked is found by `recoverCommit`, and the reveal follows in the
  * same pass. A dead draft is let alone: it is not revealed, and no outcome is logged for an entry
  * the agent never made.
+ *
+ * The store refuses to list the drafts if one file is not a draft, and a reveal's window does not
+ * wait for someone to fix it. So when the list is refused the error is logged, and the reveals
+ * that are due are found another way (`tendRevealing`).
  */
 async function tendDrafts(run: Run): Promise<void> {
   let drafts: Draft[];
@@ -471,38 +691,97 @@ async function tendDrafts(run: Run): Promise<void> {
     // this one is logged whole: it is how the operator learns which draft file to fix.
     const why = error instanceof Error ? oneLine(error.message) : typeof error;
     run.log(`ERROR ${run.name}: the drafts cannot be read (${why})`);
+    await tendRevealing(run);
     return;
   }
 
   for (const draft of drafts) {
     if (run.signal?.aborted) return;
-    const { taskId } = draft;
-    if (run.memory.settled.has(taskId) || run.memory.dead.has(taskId)) continue;
+    await tendOne(run, draft);
+  }
+}
+
+/**
+ * The drafts that are due a reveal when the store cannot list them (review I1). The account's
+ * entries, as the API lists them, name the tasks in their reveal window whose entry is not
+ * revealed; the draft of each is read by its own, so that the one file that cannot be read costs
+ * only its own task, and tended as usual. The entries also say how many reveals the agent owes,
+ * which sets the storage that new entries need (review M1), since the drafts are not there to
+ * count.
+ */
+async function tendRevealing(run: Run): Promise<void> {
+  let entries: AccountEntry[];
+  try {
+    entries = (await run.api.listEntries(run.account)).entries;
+  } catch (error) {
+    run.log(`ERROR ${run.name}: the entries of the account cannot be listed (${describe(error)})`);
+    return;
+  }
+
+  for (const entry of entries) {
+    if (run.signal?.aborted) return;
+    // The id is the API's word: it is used only once it is known to be a task id.
+    if (entry.phase !== "revealing" || entry.revealed || !isTaskId(entry.task_id)) continue;
+    let draft: Draft | null;
     try {
-      await tendDraft(run, draft);
+      draft = await run.state.getDraft(entry.task_id);
     } catch (error) {
-      run.log(`ERROR ${run.name}: task ${draft.taskId} failed (${describe(error)})`);
+      run.log(`ERROR ${run.name}: task ${entry.task_id} failed (${describe(error)})`);
+      continue;
     }
+    if (draft !== null) await tendOne(run, draft);
+  }
+
+  const owed = entries.filter(
+    (entry) => !entry.revealed && (entry.phase === "open" || entry.phase === "revealing"),
+  );
+  run.owed = Math.max(run.owed, owed.length);
+}
+
+/** One draft of `tendDrafts`: skipped if it is dead or settled, and a failure is its own. */
+async function tendOne(run: Run, draft: Draft): Promise<void> {
+  const { taskId } = draft;
+  if (run.memory.settled.has(taskId) || run.memory.dead.has(taskId)) return;
+  try {
+    await tendDraft(run, draft);
+  } catch (error) {
+    run.log(`ERROR ${run.name}: task ${taskId} failed (${describe(error)})`);
   }
 }
 
 async function tendDraft(run: Run, draft: Draft): Promise<void> {
-  const found = await run.api.getTask(BigInt(draft.taskId));
+  const id = draft.taskId;
+  if (!isTaskId(id)) {
+    const shown = oneLine(id, MAX_ID_CHARS);
+    run.log(`WARN ${run.name}: skipping a draft whose task id is not a task id (${shown})`);
+    return;
+  }
+  const found = await run.api.getTask(BigInt(id));
   // The index does not know the task (yet): there is nothing to compare the draft with.
   if (found === null) return;
   const { task } = found;
+  // The phase and the outcome of another task would have the draft revealed early, or its task
+  // reported settled for the rest of the run.
+  if (task.id !== id) {
+    run.log(`WARN ${run.name}: task ${id} not tended, the API answered with another task`);
+    return;
+  }
 
   let revealed = draft.revealedUri !== undefined;
   // A revealed draft was committed. One that is neither revealed nor marked committed may or may
   // not have its commit on the chain, and nothing is revealed or sent before that is known.
-  if (!revealed && draft.committedAt === undefined) {
-    if (!(await recoverCommit(run, draft, task))) return;
+  const committed =
+    revealed || draft.committedAt !== undefined || (await recoverCommit(run, draft, task));
+  if (committed && !revealed && task.phase === "revealing") revealed = await reveal(run, draft);
+
+  if (committed && task.outcome !== null) {
+    await logOutcome(run, found, revealed);
+    run.memory.settled.add(id);
+    return;
   }
-  if (!revealed && task.phase === "revealing") revealed = await reveal(run, draft);
-  if (task.outcome !== null) {
-    logOutcome(run, task, revealed);
-    run.memory.settled.add(draft.taskId);
-  }
+  // Review M1: what is still to be revealed holds back storage for the reveal.
+  const live = task.phase === "open" || task.phase === "revealing";
+  if (!revealed && live && !run.memory.dead.has(id)) run.owed += 1;
 }
 
 /**
@@ -569,10 +848,26 @@ async function reveal(run: Run, draft: Draft): Promise<boolean> {
 }
 
 /**
+ * Whether the agent's entry in the task is revealed, by the API's entries and, if they do not show
+ * it, by the chain's: the index trails the chain, and a revealed entry may not be shown yet.
+ * `undefined` if the chain could not be read.
+ */
+async function entryRevealed(run: Run, found: TaskDetailResponse): Promise<boolean | undefined> {
+  if (found.entries.some((entry) => entry.account === run.account && entry.revealed)) return true;
+  const looked = await lookUp(run, found.task.id);
+  if (looked === undefined) return undefined;
+  return looked.entry !== null && looked.entry.uri !== null;
+}
+
+/**
  * Logs how a settled task ended for the agent: `won` with what it was paid, `lost` (it was not
  * among the winners, and if it never revealed, that is said), or `refunded` (the task was voided).
+ * `revealed` is what the draft says. A draft that does not say so may have lost its mark after
+ * the reveal went through, so "never revealed" is said only when the API and the chain agree that
+ * the entry is not revealed (review M7), and not at all if the chain cannot be read.
  */
-function logOutcome(run: Run, task: TaskDetail, revealed: boolean): void {
+async function logOutcome(run: Run, found: TaskDetailResponse, revealed: boolean): Promise<void> {
+  const { task } = found;
   const { outcome } = task;
   if (outcome === null) return;
   if (outcome.kind === "voided") {
@@ -582,9 +877,10 @@ function logOutcome(run: Run, task: TaskDetail, revealed: boolean): void {
   const win = outcome.winners.find((winner) => winner.account === run.account);
   if (win !== undefined) {
     run.log(`${run.name}: won task ${task.id} amount=${win.amount} token=${task.token}`);
-  } else {
-    run.log(`${run.name}: lost task ${task.id}${revealed ? "" : " (never revealed)"}`);
+    return;
   }
+  const never = !revealed && (await entryRevealed(run, found)) === false;
+  run.log(`${run.name}: lost task ${task.id}${never ? " (never revealed)" : ""}`);
 }
 
 // ---- The loop ---------------------------------------------------------------------------------
@@ -597,14 +893,14 @@ function logOutcome(run: Run, task: TaskDetail, revealed: boolean): void {
  *
  * Nothing that goes wrong with one task or one draft stops the tick: it is logged, and the tick
  * goes on with the next. A step that cannot be taken (the API is down) is logged and left to the
- * next tick. It throws only when the client has no signer. Pass `signal` to have it end before it
- * starts on its next task or draft; the one in hand is seen through, so that a commit that went
- * out has its draft marked.
+ * next tick. It throws only when the client has no signer, or `solveTimeoutMs` is not a wait that
+ * `setTimeout` keeps. Pass `signal` to have it end before it starts on its next task or draft; the
+ * one in hand is seen through, so that a commit that went out has its draft marked.
  *
  * Known limits, accepted (P05-R14):
  *
  * - A solver that takes long delays the agent's later tasks in the same tick, and a reveal that
- *   falls due during a solve waits for the tick to end.
+ *   falls due during a solve waits for the tick to end. A solve is bounded by `solveTimeoutMs`.
  * - A `won`, `lost` or `refunded` line is logged again for each settled draft after a restart, as
  *   a draft has no slot to say its outcome was logged.
  * - The storage view is read once for a task, before the solver is asked, and not again before
@@ -612,12 +908,17 @@ function logOutcome(run: Run, task: TaskDetail, revealed: boolean): void {
  * - A draft is dead for the run only, as it has no slot to say so either: a restart judges it
  *   again, which costs a lookup and, for a task still open, one more refused commit and one more
  *   ERROR line.
+ * - One process owns a state directory (review M5): nothing locks it, and two runners on one
+ *   directory (or a runner beside the MCP server's `commit_result`) can interleave their commits
+ *   so that a draft's salt no longer opens the commitment on the chain.
  *
  * `runAgent` calls this in a loop; it is exported so that a test can run one tick at a time.
  */
 export async function agentTick(opts: AgentTickOptions): Promise<void> {
   const account = opts.client.accountId;
   if (account === undefined) throw new Error(NO_SIGNER);
+  const solveTimeoutMs = opts.solveTimeoutMs ?? DEFAULT_SOLVE_TIMEOUT_MS;
+  checkMs("solveTimeoutMs", solveTimeoutMs);
   const run: Run = {
     name: opts.name,
     account,
@@ -626,9 +927,11 @@ export async function agentTick(opts: AgentTickOptions): Promise<void> {
     state: opts.state,
     tags: opts.tags,
     solver: opts.solver,
+    solveTimeoutMs,
     log: opts.log ?? console.log,
     signal: opts.signal,
     memory: opts.memory ?? new AgentMemory(),
+    owed: 0,
   };
   await tendDrafts(run);
   await enterTasks(run);
@@ -654,12 +957,14 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 /**
  * Runs the agent: a tick (`agentTick`) now, and again `pollMs` (default 15 s) after each tick
  * ends, until `signal` aborts. The wait starts when a tick ends, so ticks never overlap, however
- * long a solver takes. A tick that throws is logged and the loop goes on.
+ * long a solver takes (up to `solveTimeoutMs`, default 120 s, for each task). A tick that throws is
+ * logged and the loop goes on.
  *
  * An abort during the wait ends the loop at once. An abort during a tick lets the task in hand
  * finish first, and the tick starts on no other. A signal that is aborted already runs no tick. The
  * returned promise resolves once the loop has stopped. It rejects only at once, without running a
- * tick, for a client with no signer or a `pollMs` that `setTimeout` cannot keep.
+ * tick, for a client with no signer or for a `pollMs` or `solveTimeoutMs` that `setTimeout` cannot
+ * keep.
  *
  * The first line says which account the agent signs as, and whether its solver is scripted, so
  * that a run of the team's scripted agents cannot be mistaken for something else.
@@ -667,9 +972,9 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 export async function runAgent(o: RunAgentOptions): Promise<void> {
   const { signal } = o;
   const pollMs = o.pollMs ?? DEFAULT_POLL_MS;
-  if (!Number.isFinite(pollMs) || pollMs < 1 || pollMs > MAX_TIMEOUT_MS) {
-    throw new RangeError(`pollMs must be from 1 to ${MAX_TIMEOUT_MS} milliseconds`);
-  }
+  checkMs("pollMs", pollMs);
+  // Refused here and not left to the first tick, which would throw it again every time.
+  checkMs("solveTimeoutMs", o.solveTimeoutMs ?? DEFAULT_SOLVE_TIMEOUT_MS);
   const account = o.client.accountId;
   if (account === undefined) throw new Error(NO_SIGNER);
 
