@@ -99,7 +99,9 @@ async function stopNode(sandbox: Sandbox): Promise<void> {
   } finally {
     clearTimeout(timer);
   }
-  await rm(sandbox.homeDir, { recursive: true, force: true });
+  // A node slowed by a busy machine can still be writing (a state snapshot) as the directory goes,
+  // which fails the removal with ENOTEMPTY; rm retries that, and EBUSY, on its own.
+  await rm(sandbox.homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
 
 /**
