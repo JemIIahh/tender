@@ -356,8 +356,10 @@ async function listOpen(api: TenderApi, tag: string): Promise<TaskSummary[]> {
 /**
  * Looks for the open tasks of each tag and enters those the agent can answer. A task that the
  * listing shows without the tag it was listed under is skipped, since the API was asked for that
- * tag only (a count of them is logged). Any other goes through these steps, and the first that
- * says no ends it:
+ * tag only (a count of them is logged). A solver that is not available (`Solver.available`: it has
+ * used up its requests for the hour) is asked before each task, and for a task it takes on none of
+ * the steps below is taken: the task is left as it is, not announced and not seen, and a later tick
+ * looks at it again. Any other task goes through these steps, and the first that says no ends it:
  *
  * 1. Its id is not a task id (review M3): logged as a warning.
  * 2. The Judge rejected it (`judge_status` "rejected"): logged with its reason, once.
@@ -382,8 +384,8 @@ async function listOpen(api: TenderApi, tag: string): Promise<TaskSummary[]> {
  * A task is `seen` once step 2, 3, 5, 6 or 7 has turned it down and once the solver has been asked
  * (for a scripted solver with an answer: once `start` has gone through), whatever happens after,
  * so a solver is asked at most once per task in a run and a failing task cannot cost a model call
- * every tick. Steps 1 and 4 and a call that fails leave the task unseen: it is looked at again
- * next tick, and nothing of a task id that is not one is kept.
+ * every tick. Steps 1 and 4, a solver that is not available and a call that fails leave the task
+ * unseen: it is looked at again next tick, and nothing of a task id that is not one is kept.
  */
 async function enterTasks(run: Run): Promise<void> {
   // A task carries several tags and is listed under each: it is looked at once per tick.
@@ -461,6 +463,12 @@ function refusalOf(run: Run, task: TaskDetail): string | null {
 async function enter(run: Run, summary: TaskSummary): Promise<void> {
   const { id } = summary;
   const { memory } = run;
+
+  // First of all, and for every task, since a solver can use up its last request in the middle of a
+  // tick. A solver at its limit costs the API and the chain no call, and the task is left as it is,
+  // unannounced and unseen, for a tick at which the solver has room. One that throws here has it
+  // logged for the task by the caller, and the task is left as it is too.
+  if (run.solver.available?.() === false) return;
 
   if (!isTaskId(id)) {
     const shown = oneLine(id, MAX_ID_CHARS);

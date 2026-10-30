@@ -27,6 +27,14 @@ export interface Solver {
    */
   scripted: boolean;
   /**
+   * Whether the solver can take on a task now. False means it cannot yet, as when it has used up the
+   * requests it may make in the hour: the runner then leaves every task as it is, not announced
+   * (`start`) and not seen, and a later tick enters it once this says true again. Without it a solver
+   * is always available. The runner asks before each task, so it must be cheap, must not throw (an
+   * error is logged for the task, which is left as it is), and must not use up what `solve` does.
+   */
+  available?(): boolean;
+  /**
    * The bytes to enter `ctx.task` with, or null when the solver has no answer to give: it does not
    * know the task, or its own answer failed the shape the brief asks for. The runner then leaves
    * the task alone for the rest of the run and commits nothing. An answer is committed to as it
