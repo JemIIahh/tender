@@ -8,6 +8,9 @@ export default defineConfig({
       {
         test: {
           name: "unit",
+          // A busy machine can take longer than the defaults to start an in-process database.
+          testTimeout: 15_000,
+          hookTimeout: 60_000,
           include: ["test/**/*.test.ts"],
         },
       },
