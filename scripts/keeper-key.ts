@@ -42,6 +42,12 @@ import { loadEnv, REPO_ROOT } from "./lib/env";
  * never to delete the key: an account without a full-access key is locked for good, and the deploy
  * made one (`<ROLE>_FULL_ACCESS_KEY`, which a service must never hold) for each account.
  *
+ * A `<ROLE>_PRIVATE_KEY` that is the same key as any other full-access key in the env files, the
+ * `*_FULL_ACCESS_KEY` of another account or the contract's, or `DEPLOY_PARENT_PRIVATE_KEY`, is
+ * refused before the chain is asked anything: the variable was filled in with the wrong key, and
+ * adding it would give the service a secret with full access to another account. The error names
+ * both variables, and the owner removes the variable alone.
+ *
  * The variable is read from `.env` and the network's file, the network's winning, as the services
  * read it. A value in `.env` is the owner's, so it is used as it is and nothing is written.
  *
@@ -246,6 +252,35 @@ function isWanted(
   return have.length === want.length && have.every((name, i) => name === want[i]);
 }
 
+/** The variable of the owner's parent account key, which the deploy reads from `.env`. */
+const PARENT_KEY_VARIABLE = "DEPLOY_PARENT_PRIVATE_KEY";
+
+/** Whether the variable holds a full-access key: one of the deploy's, the contract's among them. */
+const isFullAccessVariable = (name: string) =>
+  name.endsWith("_FULL_ACCESS_KEY") || name === PARENT_KEY_VARIABLE;
+
+/**
+ * The first variable, by name and other than `except`, that holds a full-access key whose public
+ * half is `publicKey`. A value that is no key is passed over, and never shown.
+ */
+function holderOfFullAccessKey(
+  env: Record<string, string>,
+  publicKey: string,
+  except: string,
+): string | undefined {
+  return Object.keys(env)
+    .filter((name) => name !== except && isFullAccessVariable(name))
+    .sort()
+    .find((name) => {
+      try {
+        const key = KeyPair.fromString((env[name] ?? "").trim() as KeyPairString);
+        return key.getPublicKey().toString() === publicKey;
+      } catch {
+        return false;
+      }
+    });
+}
+
 /** Throws, without showing it, unless `contractId` is an account id. */
 function checkContract(contractId: string, what: string): void {
   if (!AccountIdSchema.safeParse(contractId).success) throw new Error(notAccountId(what));
@@ -254,7 +289,8 @@ function checkContract(contractId: string, what: string): void {
 /**
  * Adds the role's function-call key to its account and returns what was done; see the top of this
  * file for the rules. Throws, before anything is written or sent, if the target is mainnet, if the
- * contract or the role's account is no account id, if a key in the env file is no key, if the node
+ * contract or the role's account is no account id, if a key in the env file is no key, if
+ * `<ROLE>_PRIVATE_KEY` is the same key as another full-access key of the env files, if the node
  * is on mainnet (or, for a testnet target, on any chain but testnet), or if `<ROLE>_PRIVATE_KEY` is
  * on the chain with another permission. Throws, before a new key is made, if
  * `<ROLE>_FULL_ACCESS_KEY` is not a full-access key of the account. No message shows a private key
@@ -285,6 +321,22 @@ export async function addRoleKey(
   // has the variable, empty, for the owner to fill in.
   const storedValue = (env[keyVar] ?? "").trim();
   const stored = storedValue === "" ? undefined : parseKey(storedValue, keyVar);
+  if (stored !== undefined) {
+    // The service key is a function-call key of the role's own account. If it is a full-access key
+    // that the env files hold, the variable was filled in with the wrong key (P02-R27), and the
+    // script would add it to this account: the service would sign with a secret that has full access
+    // to another one. The role's own full-access key is left to the check against the chain below.
+    const publicKey = stored.getPublicKey().toString();
+    const holder = holderOfFullAccessKey(env, publicKey, fullKeyVar);
+    if (holder !== undefined) {
+      throw new Error(
+        `${keyVar} holds ${publicKey}, which is the same key as ${holder}, a full-access key. A ` +
+          "service must hold a function-call key of its own, so this script will not add that one. " +
+          `Remove only the ${keyVar} line from the env file, and run this script again to make ` +
+          "one. Do not delete any key from an account.",
+      );
+    }
+  }
 
   const chain = options.chain ?? new NearChain(target);
   // The network is a label the caller chose; the chain id is what the node says it is.
