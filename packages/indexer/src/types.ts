@@ -9,3 +9,8 @@ export interface IndexedBlock {
   timestampNs: bigint;
   receipts: ReceiptOutcome[];
 }
+
+/** Yields indexed blocks in strictly ascending height order, from `fromHeight` on, until `signal` aborts. */
+export interface BlockSource {
+  blocks(fromHeight: bigint, signal: AbortSignal): AsyncIterable<IndexedBlock>;
+}
