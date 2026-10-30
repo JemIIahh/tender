@@ -372,6 +372,39 @@ test("a_startup_failure_prints_on_one_line_without_secrets", () => {
   ).toBe("Error: sent Authorization: Bearer <redacted> and failed");
 });
 
+test("the_secrets_include_the_credentials_of_the_rpc_url", () => {
+  const key = KEY.toString();
+  const body = key.slice("ed25519:".length);
+  // A provider's URL can carry a password, a key in its query or a token in its path.
+  const password = "word-word-word";
+  const queryValue = "query-query-1234";
+  const pathToken = "ab12ab12ab12ab12ab12";
+  const url = `https://user:${password}@rpc.example.com/v2/${pathToken}?apiKey=${queryValue}&network=mainnet`;
+  const config = readConfig({ ...ENV, NEAR_RPC_URL: url }, home);
+
+  const secrets = secretsOf(config);
+
+  // The key first, then what the URL holds; the user name, the network and the host are not secrets.
+  expect(secrets).toEqual([key, body, password, queryValue, pathToken]);
+  // So a failure that quotes the URL's pieces has them cut out, as the key is.
+  expect(
+    describeFailure(new Error(`bad gateway: ${password}, ${queryValue}, ${pathToken}`), secrets),
+  ).toBe("Error: bad gateway: <redacted>, <redacted>, <redacted>");
+
+  // A URL with nothing secret in it adds nothing, and neither does none.
+  for (const plain of [
+    "https://rpc.testnet.near.org",
+    "https://rpc.example.com/?key=1",
+    "http://127.0.0.1:3030",
+  ]) {
+    expect(secretsOf(readConfig({ ...ENV, NEAR_RPC_URL: plain }, home)), plain).toEqual([
+      key,
+      body,
+    ]);
+  }
+  expect(secretsOf(readConfig(ENV, home))).toEqual([key, body]);
+});
+
 /** What the bin did with `env` as its whole environment. */
 async function runBin(env: Record<string, string>) {
   try {

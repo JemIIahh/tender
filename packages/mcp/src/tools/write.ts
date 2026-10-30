@@ -26,6 +26,7 @@ import {
   U128StringSchema,
 } from "@tender/shared";
 import { z } from "zod";
+import { secretCheck } from "../secrets";
 import type { McpDeps } from "../server";
 import { type Draft, isDraftOf } from "../state";
 import {
@@ -66,7 +67,9 @@ import {
 // only inside the one directory that the user named (`filesDir`, from `TENDER_FILES_DIR`), and
 // none at all when there is none (P04-R1). Work that holds one of the server's own secrets is
 // refused, whether it came as text or as a file, since the scrubber sees what a tool says and never
-// what a reveal uploads.
+// what a reveal uploads. The secret is looked for as it is and in the usual disguises (best effort),
+// where the work comes in (a commit), where a draft's commit is sent again, and a last time just
+// before a reveal uploads the work: a draft may hold what an earlier check did not see.
 //
 // PICKS. A scorecard is public, immutable and hashed on chain, and it says who made it. The API
 // serves whichever one a pick names without reading that field, so `pick_winners` is where a
@@ -330,11 +333,15 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     }
   }
 
-  /** Whether `bytes` hold any secret of the server, which a reveal would make public. */
-  function holdsSecret(bytes: Uint8Array): boolean {
-    const work = Buffer.from(bytes);
-    // An empty string is in every text, and is no secret.
-    return secrets.some((secret) => secret !== "" && work.includes(secret));
+  /**
+   * Whether `bytes` hold any secret of the server, which a reveal would make public: as it is or in
+   * a disguise (best effort; see `secretCheck`).
+   */
+  const holdsSecret = secretCheck(secrets);
+
+  /** The work that a draft holds. */
+  function workOf(draft: Draft): Uint8Array {
+    return new Uint8Array(Buffer.from(draft.contentBase64, "base64"));
   }
 
   /** The draft of `taskId`, or null. A draft that another account made is refused, not returned. */
@@ -620,6 +627,18 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           .join(" "),
       );
     }
+    // The commit is about to be sent again, for work that the draft holds and this call has not
+    // seen. If that work holds a secret, the entry would be one that only a reveal that publishes
+    // the secret can use.
+    if (holdsSecret(workOf(draft))) {
+      throw new ToolError(
+        "SECRET_IN_CONTENT",
+        `the draft saved for task ${draft.taskId} holds a secret that this server was given (such as ` +
+          "its private key), and reveal_result would publish it, so its commit was not sent. " +
+          "Nothing was sent or spent. A draft cannot be changed: remove it from this server's " +
+          "state directory to commit other work for this task",
+      );
+    }
     await ensureStorage("commit and reveal");
     return sendCommit(draft, note);
   }
@@ -653,7 +672,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "A task that the API does not know is refused with NO_TASK, before anything is made or " +
         "spent (one posted a moment ago may need a few seconds to appear). A result that holds this " +
         "server's private key, or another secret it was given, is refused with SECRET_IN_CONTENT, " +
-        "since reveal_result publishes the work. The work and a random salt are saved in a draft " +
+        "since reveal_result publishes the work. The check is best effort: it finds a secret as it " +
+        "is and in the usual disguises (base64, hex, raw bytes, split over lines, UTF-16), and " +
+        "not in every way it could be hidden. The work and a random salt are saved in a draft " +
         "on this machine BEFORE the transaction is sent, so a crash loses nothing. If a call " +
         "fails or the server stops, call commit_result again with the same content: it finds out " +
         "whether the commit landed and finishes it with the same salt, and sends nothing if it " +
@@ -786,11 +807,22 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
 
     // What goes up must be what was committed. A draft file that was changed on disk would reveal
     // a hash with other bytes behind it, which scores nothing and gives the work away.
-    const bytes = new Uint8Array(Buffer.from(draft.contentBase64, "base64"));
+    const bytes = workOf(draft);
     if (sha256Hex(bytes) !== draft.contentHash) {
       throw new ToolError(
         "DRAFT_CORRUPT",
         `the work saved for task ${taskId} no longer matches its hash, so it was not revealed`,
+      );
+    }
+    // The last look before the work becomes public. A draft can hold what the commit did not see: it
+    // may have been saved by a server that checked less, or under another key.
+    if (holdsSecret(bytes)) {
+      throw new ToolError(
+        "SECRET_IN_CONTENT",
+        `the work saved for task ${taskId} holds a secret that this server was given (such as its ` +
+          "private key), and revealing it would publish the secret. Nothing was uploaded or sent. " +
+          "A committed result cannot be changed through this server, so this entry stays " +
+          "unrevealed while the secret is in it",
       );
     }
     let stored: { sha256: string; uri: string };
@@ -857,7 +889,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       description:
         "Reveal the result you committed to with commit_result, once the commit window has closed " +
         "and before the reveal deadline. It uploads the saved work, which becomes public, and sends " +
-        "the reveal with the salt that proves it is the work you committed to. If a call fails " +
+        "the reveal with the salt that proves it is the work you committed to. The work is looked " +
+        "at once more for this server's secrets before it goes up (SECRET_IN_CONTENT, best effort " +
+        "as at commit), and then nothing is uploaded or sent. If a call fails " +
         "part way, call it again: the upload is repeatable, and a reveal that already went " +
         "through is recognised, even after the reveal deadline. Needs a draft from commit_result " +
         "on this machine (NO_DRAFT otherwise). The draft lives in this server's state directory: " +

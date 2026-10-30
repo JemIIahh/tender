@@ -3,6 +3,7 @@ import { isAbsolute, join } from "node:path";
 import type { Signer, TenderClient } from "@tender/client";
 import { AccountIdSchema, NETWORKS, type NetworkId } from "@tender/shared";
 import { KeyPair, type KeyPairString } from "near-api-js";
+import { urlCredentials } from "./secrets";
 import { defaultStateDir } from "./state";
 import { scrub } from "./tools/format";
 
@@ -253,12 +254,17 @@ export async function resolveDefaultToken(
 }
 
 /**
- * What must never be printed: the private key, and the part of it after the curve's name, which a
- * library may quote on its own.
+ * What must never be printed or published: the private key, the part of it after the curve's name,
+ * which a library may quote on its own, and the credentials in the RPC URL (a password, a key in
+ * its query, a token in its path), if it has any: see `urlCredentials`.
  */
-export function secretsOf(config: Pick<McpConfig, "signer">): string[] {
+export function secretsOf(config: Pick<McpConfig, "signer" | "rpcUrl">): string[] {
   const { privateKey } = config.signer;
-  return [privateKey, privateKey.slice(privateKey.indexOf(":") + 1)];
+  return [
+    privateKey,
+    privateKey.slice(privateKey.indexOf(":") + 1),
+    ...(config.rpcUrl === undefined ? [] : urlCredentials(config.rpcUrl)),
+  ];
 }
 
 /**

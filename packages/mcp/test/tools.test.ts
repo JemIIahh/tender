@@ -38,7 +38,9 @@ import {
   type TaskSummary,
   type TenderApi,
 } from "@tender/shared";
+import { baseEncode } from "near-api-js";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { secretsOf } from "../src/config";
 import { createMcpServer, type McpChain, type McpDeps } from "../src/server";
 import { createStateStore, type Draft, type StateStore } from "../src/state";
 
@@ -462,8 +464,10 @@ test("commit_result_says_where_files_come_from_and_that_a_commit_stays", async (
     expect(tool).toMatch(/ALREADY_COMMITTED/);
     // The task's own limit applies as well as the server's.
     expect(tool).toMatch(/output\.max_bytes/);
-    // The result is published by the reveal, so it may not hold the server's own secrets.
+    // The result is published by the reveal, so it may not hold the server's own secrets. The
+    // check is best effort, and says so.
     expect(tool).toMatch(/SECRET_IN_CONTENT/);
+    expect(tool).toMatch(/best[- ]effort/i);
     // A task that the API does not know is refused, and a task posted a moment ago may be unknown.
     expect(tool).toMatch(/NO_TASK/);
   }
@@ -1023,6 +1027,10 @@ const NEEDS_FULL_ACCESS_KEY =
 /** What a key and its base58 body look like to the scrubber. */
 const SECRET_KEY = "ed25519:5zQ9fakeKeyMaterialForTheScrubber";
 const SECRET_BODY = SECRET_KEY.slice("ed25519:".length);
+// A key as near-api-js writes one, which `SECRET_KEY` is not: its base58 decodes to 64 bytes, the
+// 32 of the seed and the 32 of the public half, and the disguises of a copy are worked out from them.
+const KEY_BYTES = Uint8Array.from({ length: 64 }, (_, at) => (at * 37 + 11) % 256);
+const REAL_KEY = `ed25519:${baseEncode(KEY_BYTES)}`;
 /** The least storage that lets an account commit and reveal: 1,024 bytes at 10^19 yoctoNEAR each. */
 const STORAGE_NEEDED = 1024n * 10n ** 19n;
 
@@ -3941,6 +3949,169 @@ test("commit_refuses_a_result_that_holds_a_secret_of_the_server", async () => {
     const answer = await call("commit_result", { task_id: "7", content });
     expect(answer.isError, content).toBe(false);
     await rm(join(dir, "drafts", "7.json"), { force: true });
+  }
+});
+
+/** Some ways that a result could hold `REAL_KEY` without its text: encoded, in lines, in UTF-16. */
+function disguisedKeys(): Array<[how: string, copy: Buffer]> {
+  const text = Buffer.from(REAL_KEY);
+  const raw = Buffer.from(KEY_BYTES);
+  const base64OfText = text.toString("base64");
+  return [
+    ["the key as it is", text],
+    ["the key in base64", Buffer.from(base64OfText)],
+    ["the key in hex", Buffer.from(text.toString("hex"))],
+    ["the key in URL-safe base64", Buffer.from(text.toString("base64url"))],
+    ["the key's bytes in base64", Buffer.from(raw.toString("base64"))],
+    ["the key's bytes in hex", Buffer.from(raw.toString("hex"))],
+    ["the key's bytes in capital hex", Buffer.from(raw.toString("hex").toUpperCase())],
+    ["the key's seed in hex", Buffer.from(raw.subarray(0, 32).toString("hex"))],
+    [
+      "a note that holds the key, all in base64",
+      Buffer.from(Buffer.from(`my notes: ${REAL_KEY}, thanks`).toString("base64")),
+    ],
+    ["base64 in lines of 20", Buffer.from(base64OfText.replace(/(.{20})/g, "$1\r\n"))],
+    ["hex in pairs", Buffer.from(raw.toString("hex").replace(/(..)/g, "$1 "))],
+    ["the key in UTF-16", Buffer.from(REAL_KEY, "utf16le")],
+    ["the key's raw bytes", raw],
+  ];
+}
+
+/** A draft of task `taskId` for work that is `content`, committed unless `committed` is false. */
+function draftHolding(taskId: string, content: Uint8Array, committed = true): Draft {
+  const contentHash = sha256Hex(content);
+  return {
+    taskId,
+    contentBase64: Buffer.from(content).toString("base64"),
+    contentHash,
+    salt: SALT,
+    commitment: computeCommitment(BigInt(taskId), ACCOUNT, contentHash, SALT),
+    ...(committed && { committedAt: "2026-11-04T09:30:00.000Z" }),
+  };
+}
+
+test("commit_refuses_a_copy_of_a_secret_in_a_disguise", async () => {
+  // The check is best effort, but a copy is not hidden by the usual ways: encoded in base64 or hex,
+  // as raw bytes, spread over lines, or in UTF-16. The key here is the one the server signs with.
+  const files = await makeFilesDir();
+  const secrets = secretsOf({ signer: { accountId: ACCOUNT, privateKey: REAL_KEY } });
+  const { call, chain, api } = await connectWrite({
+    keyKind: "full_access",
+    filesDir: files,
+    secrets,
+  });
+  chain.storageBalanceOf.mockResolvedValue(null);
+
+  const copies = disguisedKeys();
+  for (const [how, copy] of copies) {
+    // As text, if it is text; and as a file, which can hold any bytes.
+    const inputs: Array<[string, Record<string, string>]> = [];
+    if (Buffer.from(copy.toString("utf8")).equals(copy)) {
+      inputs.push(["content", { content: copy.toString("utf8") }]);
+    }
+    await writeFile(join(files, "copy.bin"), copy);
+    inputs.push(["file", { file_path: join(files, "copy.bin") }]);
+
+    for (const [via, input] of inputs) {
+      const answer = await call("commit_result", { task_id: "7", ...input });
+
+      expect(answer.isError, `${how} as ${via}`).toBe(true);
+      expect(answer.text, `${how} as ${via}`).toMatch(/^SECRET_IN_CONTENT: /);
+      expect(answer.text, `${how} as ${via}`).not.toContain(REAL_KEY);
+    }
+  }
+  // Nothing was looked up, spent, saved or sent.
+  expect(api.getTask).not.toHaveBeenCalled();
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+
+  // What is not the secret goes through: the public half, in the same disguises, and other bytes.
+  const publicHalf = Buffer.from(KEY_BYTES.subarray(32));
+  const harmless = [
+    `ed25519:${baseEncode(publicHalf)}`,
+    publicHalf.toString("base64"),
+    publicHalf.toString("hex"),
+    Buffer.from("a plain answer about keys").toString("base64"),
+    "ed25519: the curve, and no key",
+  ];
+  for (const content of harmless) {
+    const answer = await call("commit_result", { task_id: "7", content });
+    expect(answer.isError, content).toBe(false);
+    await rm(join(dir, "drafts", "7.json"), { force: true });
+  }
+});
+
+test("reveal_refuses_work_that_holds_a_secret_and_uploads_nothing", async () => {
+  // A draft can hold a copy that the commit did not see: it was saved before the check was as
+  // strong, or under another key. The reveal looks again, just before the work goes up.
+  const secrets = secretsOf({ signer: { accountId: ACCOUNT, privateKey: REAL_KEY } });
+  const { call, callJson, chain, api } = await connectWrite({ secrets });
+
+  let taskId = 40;
+  for (const [how, copy] of disguisedKeys()) {
+    const id = String(++taskId);
+    const draft = draftHolding(id, copy);
+    await state.saveDraft(draft);
+
+    const answer = await call("reveal_result", { task_id: id });
+
+    expect(answer.isError, how).toBe(true);
+    expect(answer.text, how).toMatch(/^SECRET_IN_CONTENT: /);
+    expect(answer.text, how).toContain(`task ${id}`);
+    expect(answer.text, how).not.toContain(REAL_KEY);
+    // Left as it was: not revealed, and not retired either, so that a changed key can reveal it.
+    expect(await draftOf(id), how).toEqual(draft);
+  }
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+  expect(api.getTask).not.toHaveBeenCalled();
+  expect(chain.reveal).not.toHaveBeenCalled();
+
+  // Work that holds no secret is revealed as before.
+  await state.saveDraft(draftHolding("60", Buffer.from("a plain answer")));
+  expect(await callJson("reveal_result", { task_id: "60" })).toMatchObject({
+    tx_hash: "TX_REVEAL",
+  });
+  expect(api.uploadBlob).toHaveBeenCalledTimes(1);
+});
+
+test("a_pending_draft_that_holds_a_secret_is_not_sent_again", async () => {
+  // The commit of a draft that may not have reached the chain is sent again by the next call. If
+  // the draft holds a secret, that would only make an entry that cannot be revealed without
+  // publishing it, so it is not sent, and nothing is spent on it.
+  const secrets = secretsOf({ signer: { accountId: ACCOUNT, privateKey: REAL_KEY } });
+  const draft = draftHolding("7", Buffer.from(Buffer.from(REAL_KEY).toString("base64")), false);
+  await state.saveDraft(draft);
+  const { call, callJson, chain } = await connectWrite({ keyKind: "full_access", secrets });
+  chain.storageBalanceOf.mockResolvedValue(null);
+
+  // The content given now is harmless; the draft that is finished is not.
+  const refused = await call("commit_result", { task_id: "7", content: "something harmless" });
+
+  expect(refused.isError).toBe(true);
+  expect(refused.text).toMatch(/^SECRET_IN_CONTENT: .*draft saved for task 7.*not sent/);
+  expect(refused.text).not.toContain(REAL_KEY);
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(await draftOf("7")).toEqual(draft);
+
+  // A commit that is on chain already is only marked: nothing is sent, so there is nothing to stop.
+  chain.getEntry.mockResolvedValue(entryView(draft.commitment));
+  const found = await callJson("commit_result", { task_id: "7", content: "something harmless" });
+  expect(found).toMatchObject({ commitment: draft.commitment, tx_hash: null });
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect((await draftOf("7")).committedAt).toMatch(ISO);
+});
+
+test("the_descriptions_say_that_the_secret_check_is_best_effort", async () => {
+  const { mcp } = await connect({});
+  const { tools } = await mcp.listTools();
+  for (const name of ["commit_result", "reveal_result"]) {
+    const description = tools.find((tool) => tool.name === name)?.description ?? "";
+    expect(description, name).toMatch(/SECRET_IN_CONTENT/);
+    expect(description, name).toMatch(/best[- ]effort/i);
   }
 });
 
