@@ -26,9 +26,9 @@ import type { RequireAuth } from "./routes/blobs";
 // whether that key is still on the account and may still sign in, so a key that is removed takes
 // its tokens with it, within a minute, and not at the end of their 12 hours.
 //
-// Each question to the chain has 5 seconds. A chain that does not answer in time is a 503 for the
-// caller to try again later, at sign-in and at the check of a token alike, and not a request that
-// waits for the RPC client to give up on its own, which takes minutes.
+// Each question to the chain has 5 seconds. A chain that does not answer in time, or whose call
+// fails, is a 503 for the caller to try again later, at sign-in and at the check of a token alike,
+// and not a request that waits for the RPC client to give up on its own, which takes minutes.
 
 /** What the wallet signs, and for whom. The wallet shows both to its user before it signs. */
 const SIGN_IN_MESSAGE = "Sign in to Tender";
@@ -116,19 +116,25 @@ export async function createChallenge(deps: ApiDeps): Promise<ChallengeResponse>
  */
 const KEY_LOOKUP_DEADLINE_MS = 5_000;
 
-/** The chain did not say within `KEY_LOOKUP_DEADLINE_MS`. */
-class KeyLookupTimeout extends Error {
-  constructor() {
-    super(`the chain did not say within ${KEY_LOOKUP_DEADLINE_MS} ms whether the key is there`);
-    this.name = "KeyLookupTimeout";
+/**
+ * The chain could not say whether a key is on an account: its call failed, or gave no answer
+ * within `KEY_LOOKUP_DEADLINE_MS`. `cause` is the call's own error, or the deadline. It is the one
+ * error `lookUpKey` throws, so that whoever asked can tell a chain that is not answering from a
+ * fault of our own.
+ */
+class KeyLookupFailed extends Error {
+  constructor(cause: unknown) {
+    super("the chain could not say whether the key is there", { cause });
+    this.name = "KeyLookupFailed";
   }
 }
 
 /**
- * `deps.client.viewAccessKey`, with `KEY_LOOKUP_DEADLINE_MS` to answer, after which this rejects
- * with a `KeyLookupTimeout`. The call itself cannot be cancelled: one that is given up on settles
- * on its own, and what it says then is dropped. The race subscribes to it, so a failure after the
- * deadline is not an unhandled rejection. The timer is cleared however the question ends.
+ * `deps.client.viewAccessKey`, with `KEY_LOOKUP_DEADLINE_MS` to answer. It rejects with a
+ * `KeyLookupFailed` if the call fails, and if the deadline comes first. The call itself cannot be
+ * cancelled: one that is given up on settles on its own, and what it says then is dropped. The
+ * race subscribes to it, so a failure after the deadline is not an unhandled rejection. The timer
+ * is cleared however the question ends.
  */
 async function lookUpKey(
   deps: ApiDeps,
@@ -141,9 +147,14 @@ async function lookUpKey(
       // Called as a method, because a `TenderClient` reads its own fields.
       deps.client.viewAccessKey(account, publicKey),
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new KeyLookupTimeout()), KEY_LOOKUP_DEADLINE_MS);
+        timer = setTimeout(
+          () => reject(new Error(`no answer within ${KEY_LOOKUP_DEADLINE_MS} ms`)),
+          KEY_LOOKUP_DEADLINE_MS,
+        );
       }),
     ]);
+  } catch (error) {
+    throw new KeyLookupFailed(error);
   } finally {
     clearTimeout(timer);
   }
@@ -155,11 +166,12 @@ function unavailable(): never {
 }
 
 /**
- * What a sign-in does with the failure of its lookup: a chain that did not answer in time is a
- * 503, and as nothing was spent the challenge is still good. Any other failure goes on as it is.
+ * What a sign-in does with the failure of its lookup: a chain that could not say is a 503, and as
+ * nothing was spent the challenge is still good. A failure that is not the chain's is ours, and
+ * goes on as it is, to be a 500.
  */
-function unavailableIfNoAnswer(error: unknown): never {
-  if (!(error instanceof KeyLookupTimeout)) throw error;
+function unavailableIfLookupFailed(error: unknown): never {
+  if (!(error instanceof KeyLookupFailed)) throw error;
   console.error("api: cannot check the key of a sign-in:", error);
   return unavailable();
 }
@@ -168,9 +180,9 @@ function unavailableIfNoAnswer(error: unknown): never {
 
 /**
  * Trades a signed challenge for a token, or throws the `AuthError` that says why not. Any other
- * error is not the caller's: the chain could not be read, or the database failed. A chain that
- * gives no answer in 5 seconds is thrown as the 503 (`unavailable`) that tells the caller to try
- * again.
+ * error is not the caller's: the database failed, or there is a fault of ours. The exception is a
+ * chain that cannot say whether the key is there, because its call failed or gave no answer in 5
+ * seconds: that is thrown as the 503 (`unavailable`) that tells the caller to try again.
  *
  * `verifyNep413` does not look at `message`, so it is held to the one the challenge carries here.
  * The challenge has to be live before the key is looked up, because that lookup is a call to the
@@ -197,7 +209,7 @@ export async function signIn(deps: ApiDeps, request: SignInRequest): Promise<Sig
       contractId: deps.contractId,
       expectedRecipient: SIGN_IN_RECIPIENT,
     },
-  ).catch(unavailableIfNoAnswer);
+  ).catch(unavailableIfLookupFailed);
 
   const issued = await issueToken(deps, request.nonce, proved);
   if (issued === null) throw new AuthError("bad_nonce");

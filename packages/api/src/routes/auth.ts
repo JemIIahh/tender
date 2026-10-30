@@ -34,9 +34,9 @@ const VerifySchema = z.strictObject({
  * - `POST /v1/auth/challenge`: a single-use nonce to sign, good for 5 minutes.
  * - `POST /v1/auth/verify`: the signed challenge, for a bearer token that lasts 12 hours. A
  *   sign-in that is refused gets a 401 with a code (`bad_nonce`, `wrong_recipient`,
- *   `bad_signature`, `key_not_found` or `key_not_allowed`) and a fixed text. When the chain does
- *   not say within 5 seconds whether the key is there, the answer is a 503 (`unavailable`) and
- *   the challenge is not spent.
+ *   `bad_signature`, `key_not_found` or `key_not_allowed`) and a fixed text. When the chain
+ *   cannot say whether the key is there, because its call failed or gave no answer within 5
+ *   seconds, the answer is a 503 (`unavailable`) and the challenge is not spent.
  *
  * The routes that need an account are behind `requireAuth`, which the caller mounts them with.
  */

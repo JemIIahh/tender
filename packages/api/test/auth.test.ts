@@ -650,9 +650,10 @@ test("every_auth_error_is_a_fixed_401", async () => {
   expect(await tokenRows()).toEqual([]);
 });
 
-test("chain_failure_is_a_500_and_keeps_the_challenge", async () => {
-  // A chain that is down is not the caller's fault: the answer is a 500 that says nothing of the
-  // fault, and the same challenge works when the chain is back.
+test("chain_failure_is_a_503_and_keeps_the_challenge", async () => {
+  // A chain that is down is not the caller's fault, and a sign-in is not given on a guess: the
+  // answer is the 503 that a token check gets, with nothing of the fault in it, and the same
+  // challenge works when the chain is back.
   const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
   const down = fakeClient({
     viewAccessKey: async () => {
@@ -664,11 +665,42 @@ test("chain_failure_is_a_500_and_keeps_the_challenge", async () => {
   const body = await signChallenge(key, ch);
 
   const failed = await post<ErrorBody>(appWith({ client: down }), "/v1/auth/verify", body);
-  expect(failed.status).toBe(500);
-  expect(failed.body).toEqual({ error: "internal", message: "internal error" });
+  expect(failed.status).toBe(503);
+  expect(failed.body).toEqual(UNAVAILABLE);
+  expect(failed.headers.get("www-authenticate")).toBeNull();
   expect(JSON.stringify(failed.body)).not.toContain("marker-rpc");
   expect(log).toHaveBeenCalled();
   expect(await tokenRows()).toEqual([]);
+  expect((await challengeRows()).map((row) => row.used)).toEqual([false]);
+
+  const retried = await post<SignInResponse>(appWith(), "/v1/auth/verify", body);
+  expect(retried.status).toBe(200);
+});
+
+test("a_fault_that_is_not_the_chains_is_a_500_and_keeps_the_challenge", async () => {
+  // Only the call to the chain is the chain's to fail. Anything else that goes wrong in a sign-in
+  // is a fault of ours and stays a 500, so that it is seen and not told to be tried again. Here
+  // the answer of the chain cannot be read: its `permission` throws when `verifyNep413` reads it,
+  // after the lookup has ended.
+  const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const unreadable = fakeClient({
+    viewAccessKey: async () => ({
+      get permission(): KeyPermission {
+        throw new Error("marker fault of ours");
+      },
+    }),
+  });
+  const key = KeyPair.fromRandom("ed25519");
+  const ch = await challenge(appWith());
+  const body = await signChallenge(key, ch);
+
+  const failed = await post<ErrorBody>(appWith({ client: unreadable }), "/v1/auth/verify", body);
+  expect(failed.status).toBe(500);
+  expect(failed.body).toEqual({ error: "internal", message: "internal error" });
+  expect(JSON.stringify(failed.body)).not.toContain("marker");
+  expect(log).toHaveBeenCalled();
+  expect(await tokenRows()).toEqual([]);
+  expect((await challengeRows()).map((row) => row.used)).toEqual([false]);
 
   const retried = await post<SignInResponse>(appWith(), "/v1/auth/verify", body);
   expect(retried.status).toBe(200);
