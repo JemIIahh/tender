@@ -7,6 +7,19 @@ import type { NetworkId } from "@tender/shared";
 /** The repository root, where the env files and `deployments/` live. */
 export const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
+/**
+ * The variables of dotenv text. The trailing spaces and tabs of every line are dropped first:
+ * node's `parseEnv` reads `KEY= ` (a blank value and a stray space) as a value that runs on into
+ * the next line, so the next line's variable is gone and its text is KEY's value.
+ */
+export function parseEnvText(text: string): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(parseEnv(text.replace(/[ \t]+$/gm, ""))).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
+}
+
 /** The variables of a dotenv file; none if the file does not exist. */
 function readEnvFile(path: string): Record<string, string> {
   let text: string;
@@ -16,11 +29,7 @@ function readEnvFile(path: string): Record<string, string> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw error;
   }
-  return Object.fromEntries(
-    Object.entries(parseEnv(text)).filter(
-      (entry): entry is [string, string] => entry[1] !== undefined,
-    ),
-  );
+  return parseEnvText(text);
 }
 
 /**
