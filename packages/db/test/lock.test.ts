@@ -26,23 +26,23 @@ function abortedWithin(signal: AbortSignal, ms: number): Promise<void> {
   });
 }
 
-/** The `options` a pg client sends the server at connect. */
-const optionsOf = (client: pg.Client | undefined) =>
-  (client as unknown as { connectionParameters: { options?: string } } | undefined)
-    ?.connectionParameters.options;
+/** What the lock's session runs first, once it is connected. */
+const SET_IDLE_TIMEOUT = "set idle_session_timeout = '30s'";
 
 describe("tryAdvisoryLock on a fake connection", () => {
   afterEach(() => vi.restoreAllMocks());
 
   /**
    * Replaces the connection of every `pg.Client`: `connect` fails with `connectError` if given, the
-   * lock query answers `locked` on session `PID`, and each look at `pg_locks` answers what `held`
-   * gives, by default that session `PID` holds the lock. `end` emits 'end', as pg does.
+   * idle timeout is refused with `setError` if given, the lock query answers `locked` on session
+   * `PID`, and each look at `pg_locks` answers what `held` gives, by default that session `PID`
+   * holds the lock. `end` emits 'end', as pg does.
    */
   function fakeConnection(
     options: {
       locked?: boolean;
       connectError?: Error;
+      setError?: Error;
       held?: (look: number) => Promise<{ held: boolean; pid: number }>;
     } = {},
   ) {
@@ -59,6 +59,10 @@ describe("tryAdvisoryLock on a fake connection", () => {
       values?: unknown[],
     ) => {
       queries.push({ text, values });
+      if (text === SET_IDLE_TIMEOUT) {
+        if (options.setError) throw options.setError;
+        return { rows: [] };
+      }
       if (text.includes("pg_try_advisory_lock")) {
         return { rows: [{ locked: options.locked ?? true, pid: PID }] };
       }
@@ -76,13 +80,19 @@ describe("tryAdvisoryLock on a fake connection", () => {
     const { queries, ended } = fakeConnection();
     const lock = await tryAdvisoryLock(URL_OF_NONE, KEY, { checkEveryMs: 60_000 });
     expect(lock).not.toBeNull();
-    // The lock is taken, and at once seen to be held by the session that took it.
-    expect(queries.map((query) => query.values)).toEqual([[KEY.toString()], [KEY.toString()]]);
-    expect(queries[0]?.text).toBe(
+    // The session's idle timeout is set, the lock is taken, and at once seen to be held by the
+    // session that took it.
+    expect(queries.map((query) => query.values)).toEqual([
+      undefined,
+      [KEY.toString()],
+      [KEY.toString()],
+    ]);
+    expect(queries[0]?.text).toBe(SET_IDLE_TIMEOUT);
+    expect(queries[1]?.text).toBe(
       "select pg_try_advisory_lock($1::bigint) as locked, pg_backend_pid() as pid",
     );
-    expect(queries[1]?.text).toContain("from pg_locks");
-    expect(queries[1]?.text).toContain("pid = pg_backend_pid()");
+    expect(queries[2]?.text).toContain("from pg_locks");
+    expect(queries[2]?.text).toContain("pid = pg_backend_pid()");
     expect(lock?.lost.aborted).toBe(false);
 
     const releasing = lock?.release();
@@ -93,16 +103,61 @@ describe("tryAdvisoryLock on a fake connection", () => {
     expect(lock?.lost.aborted).toBe(false);
   });
 
-  it("asks_the_server_to_end_the_session_once_it_is_idle", async () => {
-    const { clients } = fakeConnection();
-    (await tryAdvisoryLock(URL_OF_NONE, KEY, { checkEveryMs: 60_000 }))?.release();
-    expect(optionsOf(clients[0])).toBe("-c idle_session_timeout=30s");
+  it("sets_the_sessions_idle_timeout_and_says_nothing_when_the_server_takes_it", async () => {
+    const { queries } = fakeConnection();
+    const lines: string[] = [];
+    const lock = await tryAdvisoryLock(URL_OF_NONE, KEY, {
+      checkEveryMs: 60_000,
+      log: (line) => lines.push(line),
+    });
+    expect(lock).not.toBeNull();
+    expect(queries[0]?.text).toBe(SET_IDLE_TIMEOUT);
+    expect(lines).toEqual([]);
+    await lock?.release();
+  });
 
-    // Options the URL has are kept, and the setting comes after them.
-    const scoped = new URL(URL_OF_NONE);
-    scoped.searchParams.set("options", "-c search_path=t_abc");
-    (await tryAdvisoryLock(scoped.toString(), KEY, { checkEveryMs: 60_000 }))?.release();
-    expect(optionsOf(clients[1])).toBe("-c search_path=t_abc -c idle_session_timeout=30s");
+  it("takes_the_lock_without_the_idle_timeout_when_the_server_refuses_it", async () => {
+    // As a server before Postgres 14 answers: one statement fails, and the session goes on.
+    const refused = Object.assign(
+      new Error('unrecognized configuration parameter "idle_session_timeout"'),
+      { severity: "ERROR", code: "42704" },
+    );
+    const { queries } = fakeConnection({ setError: refused });
+    const lines: string[] = [];
+    const lock = await tryAdvisoryLock(URL_OF_NONE, KEY, {
+      checkEveryMs: 60_000,
+      log: (line) => lines.push(line),
+    });
+    expect(lock).not.toBeNull();
+    expect(lock?.lost.aborted).toBe(false);
+    expect(queries.map((query) => query.text.split("\n")[0])).toEqual([
+      SET_IDLE_TIMEOUT,
+      "select pg_try_advisory_lock($1::bigint) as locked, pg_backend_pid() as pid",
+      "select exists (",
+    ]);
+    // One WARN, which names the setting and the error's code, and nothing of the URL.
+    expect(lines).toEqual([
+      "WARN database: the server refused idle_session_timeout for the advisory lock's session " +
+        "(Error 42704); the lock is taken without it, so a holder the server cannot reach keeps " +
+        "it until the server finds the connection gone",
+    ]);
+    for (const part of ["tester", "secret", "localhost"]) {
+      expect(lines.join("\n")).not.toContain(part);
+    }
+    await lock?.release();
+  });
+
+  it("fails_the_try_when_the_connection_fails_at_the_idle_timeout", async () => {
+    // No severity: the server did not answer, the connection failed, and no lock is taken on it.
+    const failed = new Error("Connection terminated unexpectedly");
+    const { ended, queries } = fakeConnection({ setError: failed });
+    const lines: string[] = [];
+    await expect(
+      tryAdvisoryLock(URL_OF_NONE, KEY, { log: (line) => lines.push(line) }),
+    ).rejects.toBe(failed);
+    expect(queries).toHaveLength(1);
+    expect(lines).toEqual([]);
+    expect(ended).toHaveBeenCalledTimes(1);
   });
 
   it("is_null_when_another_session_holds_the_lock", async () => {
@@ -220,10 +275,15 @@ describe.skipIf(!POSTGRES_URL)("tryAdvisoryLock on postgres", () => {
     // A key of this run alone: 48 random bits, so the server keeps it in classid and objid.
     const key = BigInt(`0x${randomBytes(6).toString("hex")}`);
 
-    // Taking it means the server took the connection's options (idle_session_timeout) and found the
-    // lock on the session at once. The checks every 100 ms go on finding it there.
-    const first = await tryAdvisoryLock(url, key, { checkEveryMs: 100 });
+    // The server takes the session's idle timeout, as every Postgres from 14 on does, and the lock
+    // is found on the session at once. The checks every 100 ms go on finding it there.
+    const lines: string[] = [];
+    const first = await tryAdvisoryLock(url, key, {
+      checkEveryMs: 100,
+      log: (line) => lines.push(line),
+    });
     if (first === null) throw new Error("a free lock was not taken");
+    expect(lines).toEqual([]);
     await new Promise((resolve) => setTimeout(resolve, 600));
     expect(first.lost.aborted).toBe(false);
     expect(await tryAdvisoryLock(url, key)).toBeNull();

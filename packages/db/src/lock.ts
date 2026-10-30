@@ -46,18 +46,24 @@ export interface AdvisoryLockOptions {
    * in milliseconds. Default 10 s.
    */
   timeoutMs?: number;
+  /**
+   * Receives the one line the lock writes, a WARN when the server refuses the session's idle
+   * timeout. Default: `console.log`.
+   */
+  log?: (line: string) => void;
 }
 
 const CHECK_EVERY_MS = 5_000;
 const TIMEOUT_MS = 10_000;
 
 /**
- * What the server is told at connect: to end the lock's session once it has been idle for 30 s.
- * A holder checks its lock every 5 s, so only one that has gone silent, such as one on the far side
- * of a network partition, is ended, and its lock let go, rather than after the hours that TCP
- * takes to notice. It has stopped what the lock guards by then: its own checks fail within 15 s.
+ * What the lock's session is told once it is connected: that the server is to end it after 30 s
+ * of idleness. A holder checks its lock every 5 s, so only one that has gone silent, such as one
+ * on the far side of a network partition, is ended, and its lock let go, rather than after the
+ * hours that TCP takes to notice. It has stopped what the lock guards by then: its own checks fail
+ * within 15 s.
  */
-const IDLE_SESSION_TIMEOUT = "-c idle_session_timeout=30s";
+const SET_IDLE_TIMEOUT = "set idle_session_timeout = '30s'";
 
 /**
  * Whether the session holds advisory lock `$1`, and which session it is. The server keeps a bigint
@@ -72,19 +78,13 @@ const HELD = `select exists (
   ) as held, pg_backend_pid() as pid`;
 
 /**
- * The connection settings of the lock's client: `url`, with `IDLE_SESSION_TIMEOUT` after whatever
- * `options` the URL has, since the URL's own `options` would replace a client's.
+ * What a line says of an error of the server's: its name, and its SQLSTATE when it has one. Never
+ * its message, which another kind of error could fill with a URL.
  */
-function connectionOf(url: string): { connectionString: string; options?: string } {
-  const parsed = URL.parse(url);
-  // A URL that does not parse here has no `options` that could be read and kept.
-  if (parsed === null) return { connectionString: url, options: IDLE_SESSION_TIMEOUT };
-  const options = parsed.searchParams.get("options");
-  parsed.searchParams.set(
-    "options",
-    options === null ? IDLE_SESSION_TIMEOUT : `${options} ${IDLE_SESSION_TIMEOUT}`,
-  );
-  return { connectionString: parsed.toString() };
+function describe(error: unknown): string {
+  if (!(error instanceof Error)) return typeof error;
+  const { code } = error as { code?: unknown };
+  return typeof code === "string" ? `${error.name} ${code}` : error.name;
 }
 
 /**
@@ -95,8 +95,10 @@ function connectionOf(url: string): { connectionString: string; options?: string
  * password), and with a `LockNotHeldError` when the lock, once taken, is not on the connection's
  * session. The connection is closed in each of these cases.
  *
- * The server ends the session once it has been idle for 30 s (`idle_session_timeout`, Postgres 14
- * and later). While the lock is held it is checked every `checkEveryMs`: the session must still be
+ * Once connected, the session asks the server to end it after 30 s of idleness
+ * (`idle_session_timeout`). A server that refuses, as one before Postgres 14 does, or a pooler that
+ * blocks the setting, gets one WARN on `log`, which names the setting, and the lock is taken
+ * without it. While the lock is held it is checked every `checkEveryMs`: the session must still be
  * the one that took the lock, and hold it. A check that fails, or takes longer than `timeoutMs`,
  * counts as losing the lock, as does any error or end of the connection, since a server that
  * restarted has forgotten the session without a word to a client that is not talking to it.
@@ -107,8 +109,9 @@ export async function tryAdvisoryLock(
   options: AdvisoryLockOptions = {},
 ): Promise<SessionLock | null> {
   const timeoutMs = options.timeoutMs ?? TIMEOUT_MS;
+  const log = options.log ?? console.log;
   const client = new Client({
-    ...connectionOf(url),
+    connectionString: url,
     connectionTimeoutMillis: timeoutMs,
     query_timeout: timeoutMs,
   });
@@ -134,6 +137,18 @@ export async function tryAdvisoryLock(
   let pid: number;
   try {
     await client.connect();
+    try {
+      await client.query(SET_IDLE_TIMEOUT);
+    } catch (error) {
+      // A refusal is the server's answer, which has a severity, and fails that one statement: the
+      // session is still good. Anything else, such as a connection that failed, fails the try.
+      if (typeof (error as { severity?: unknown } | null)?.severity !== "string") throw error;
+      log(
+        `WARN database: the server refused idle_session_timeout for the advisory lock's session ` +
+          `(${describe(error)}); the lock is taken without it, so a holder the server cannot reach ` +
+          "keeps it until the server finds the connection gone",
+      );
+    }
     const { rows } = await client.query<{ locked: boolean; pid: number }>(
       "select pg_try_advisory_lock($1::bigint) as locked, pg_backend_pid() as pid",
       [key.toString()],

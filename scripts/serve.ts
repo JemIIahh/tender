@@ -767,11 +767,19 @@ export async function startServices(
       };
     };
     if (keeper === undefined) log("serve: keeper off (KEEPER_PRIVATE_KEY is not set)");
+    // The one line the lock writes, a server that refuses its session's idle timeout, is said once
+    // and not at each try of a process that waits for the lock.
+    let refusalSaid = false;
+    const lockLog = (line: string) => {
+      if (refusalSaid) return;
+      refusalSaid = true;
+      log(line);
+    };
     // PGlite is one process's own database, so it needs no lock.
     const tryLock =
       options.tryLock ??
       (config.database.kind === "postgres"
-        ? () => tryAdvisoryLock(config.database.url, INDEXER_LOCK_KEY)
+        ? () => tryAdvisoryLock(config.database.url, INDEXER_LOCK_KEY, { log: lockLog })
         : undefined);
     work =
       tryLock === undefined
