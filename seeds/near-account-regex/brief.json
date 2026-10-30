@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Regex for valid NEAR account IDs",
+  "summary": "Write one JavaScript regex that accepts exactly the valid NEAR named account IDs and rejects everything else. Checked against published and hidden test strings.",
+  "instructions": "Write an ECMAScript regex that accepts exactly the valid NEAR named account IDs: 2–64 characters; lowercase a-z and digits; `-` and `_` only between alphanumerics; `.` separates parts; no leading, trailing or doubled separators.\n\nReply with one JSON object and nothing else, in this shape:\n{\"pattern\": \"<regex source>\", \"flags\": \"<flags>\"}\n\n- pattern: the regex source without the surrounding slashes, up to 2000 characters. Escape backslashes for JSON, so write \\\\d for \\d.\n- flags: any of i, m, s, u, or empty. The flags g and y are not allowed.\n\nYour regex is run with RegExp.test on each whole test string, so add the anchors ^ and $ yourself.\n\nHow it is checked: the regex must accept every string on a valid list and reject every string on an invalid list. A few examples of each are published with the task. The rest are kept back until the result is announced. The score is the share of test strings handled correctly, and the reward is paid only for a score of 100.",
+  "category": "coding",
+  "tags": ["coding", "regex", "near", "validation"],
+  "output": {
+    "format": "regex_json",
+    "max_bytes": 4096
+  }
+}
