@@ -21,18 +21,26 @@ interface DeadlineRow {
  * One pass of the Judge over the tasks that name `deps.judgeAccount` as their verifier. First
  * intake (`intakeTask`) for every task with no `judge_status` or a `pending` one, then judging
  * (`judgeTask`) for every `accepted` task the database has no outcome for and whose deadlines put
- * the clock in its judging window. A task accepted by the first pass can be judged in the second.
- * Intake goes in id order. Judging goes earliest pick deadline first (P05-R18), and each task has
- * a slice of the tick (20 s) before the next one's turn: one with many slow entries takes up again
- * on the next tick, from what it had found out (`deps.memory`), so that it cannot keep the others
- * from their pick deadlines. What the Judge keeps of a task that is no longer in its judging
- * window goes. Last, a `waiting: …` reason is cleared from every task that can no longer be
- * judged (`clearStaleWaits`), which a Judge that was not running when the wait ended leaves.
+ * the clock in its judging window: the due tasks. A task accepted by the first pass can be judged
+ * in the second. Intake goes in id order. Judging goes earliest pick deadline first (P05-R18). A
+ * task with much to do gives way at the end of its slice of the tick (20 s) when another due task
+ * waits for a turn: one after it in this pass, or one that gave way before it. It takes up again on
+ * its next turn from what it had found out (`deps.memory`), so that it cannot keep the others from
+ * their pick deadlines. A lone busy task goes on until it is done or reaches its stop line. What
+ * the Judge keeps of a task that is no longer due goes. Last, a `waiting: …` reason is cleared
+ * from every task that can no longer be judged (`clearStaleWaits`), which a Judge that was not
+ * running when the wait ended leaves.
+ *
+ * It resolves with whether a task gave way, so that the next tick starts at once. A task that gave
+ * way is back after the others' turns, which the last stretch before its stop line (two slices,
+ * see `judgeEntries`) covers for two busy tasks whatever the window: with three or more, a task
+ * with a short pick window can come back after its pick deadline, and its fallback window
+ * applies.
  *
  * A task that throws, as on a chain or database error, is logged, and the pass goes on with the
  * next task. The clock is read again for the judging pass: intake can take a while.
  */
-export async function judgeTick(deps: JudgeDeps): Promise<void> {
+export async function judgeTick(deps: JudgeDeps): Promise<boolean> {
   const clock = deps.now ?? (() => new Date());
   // `order by t.id`: the output column `id` is text, which would sort "10" before "9".
   const waiting = await deps.db.query<{ id: string }>(
@@ -59,22 +67,30 @@ export async function judgeTick(deps: JudgeDeps): Promise<void> {
       order by t.pick_deadline, t.id`,
     [deps.judgeAccount],
   );
-  const judging = new Set<string>();
-  for (const row of accepted) {
+  // The database's view of the window, which only chooses what to look at: `judgeTask` decides
+  // from the chain.
+  const dueAt = (row: DeadlineRow, atNs: bigint) =>
+    phaseAt({ ...row, settled: false }, atNs) === "judging";
+  const due = accepted.filter((row) => dueAt(row, nowNs));
+  const gaveWay: DeadlineRow[] = [];
+  for (const [i, row] of due.entries()) {
+    const othersWaiting = () => {
+      const atNs = BigInt(clock().getTime()) * NS_PER_MS;
+      return [...due.slice(i + 1), ...gaveWay].some((other) => dueAt(other, atNs));
+    };
     try {
-      // The database's view of the window, which only chooses what to look at: `judgeTask`
-      // decides from the chain.
-      if (phaseAt({ ...row, settled: false }, nowNs) !== "judging") continue;
-      judging.add(row.id);
-      await judgeTask(deps, BigInt(row.id));
+      const judged = await judgeTask(deps, BigInt(row.id), { othersWaiting });
+      if (judged === "yielded") gaveWay.push(row);
     } catch (error) {
       console.error(`judge: judging task ${row.id} failed (${describeError(error)})`);
     }
   }
+  const judging = new Set(due.map((row) => row.id));
   for (const id of deps.memory?.progress.keys() ?? []) {
     if (!judging.has(id)) deps.memory?.progress.delete(id);
   }
   await clearStaleWaits(deps, nowNs);
+  return gaveWay.length > 0;
 }
 
 /** A memory with nothing in it yet. */
@@ -84,10 +100,10 @@ export function newJudgeMemory(): JudgeMemory {
 
 /**
  * Runs `judgeTick` now, and again `intervalMs` (default 10 s) after each tick ends, until `signal`
- * aborts. The ticks share one `JudgeMemory`, `deps.memory` or a new one, and one `WarmWorker`,
- * `deps.warm` or one started with the loop, so that a score worker is loaded before a task needs
- * one. The wait starts when a tick ends, so ticks never overlap, however long one takes. A tick
- * that throws is logged and the loop goes on.
+ * aborts: at once, when a task gave way in the tick (P05-R18). The ticks share one `JudgeMemory`,
+ * `deps.memory` or a new one, and one `WarmWorker`, `deps.warm` or one started with the loop, so
+ * that a score worker is loaded before a task needs one. The wait starts when a tick ends, so
+ * ticks never overlap, however long one takes. A tick that throws is logged and the loop goes on.
  *
  * An abort during the wait ends the loop at once. An abort during a tick lets the tick finish
  * first, so that a pick it sent is seen through. A signal that is aborted already runs no tick.
@@ -113,14 +129,16 @@ export function startJudge(
     };
     const run = async () => {
       ticking = true;
+      let gaveWay = false;
       try {
-        await judgeTick(ticked);
+        gaveWay = await judgeTick(ticked);
       } catch (error) {
         console.error(`judge: tick failed (${describeError(error)})`);
       }
       ticking = false;
       if (signal.aborted) finish();
-      else timer = setTimeout(run, intervalMs);
+      // A task that gave way takes up again at once, not after the wait.
+      else timer = setTimeout(run, gaveWay ? 0 : intervalMs);
     };
 
     // `once` removes the listener when it fires. An abort during a tick is seen after the tick.

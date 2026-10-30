@@ -79,8 +79,9 @@ export interface ScoringLimits {
   compileBudgetMs?: number;
   /**
    * How long one task's entries are fetched and scored in one tick before the Judge moves on to
-   * the next task: 20 s by default (P05-R18). The task takes up again where it was on a later tick,
-   * which needs a `JudgeMemory`: without one, a task is judged in one go.
+   * the next task, when another waits for its turn: 20 s by default (P05-R18). The task takes up
+   * again where it was on a later tick, which needs a `JudgeMemory`: without one, a task is judged
+   * in one go.
    */
   sliceMs?: number;
 }
@@ -96,9 +97,10 @@ export interface JudgeMemory {
    */
   checks: Map<string, { ok: true } | { ok: false; reason: string }>;
   /**
-   * What judging each task the Judge is part way through has found out, by task id. A task whose
-   * slice of a tick ran out takes up again from here (P05-R18), as does one whose pick failed. It
-   * goes once the task is picked or settled, is never judged, or is out of its judging window.
+   * What judging each task the Judge is part way through has found out, by task id. A task that
+   * gave way at the end of its slice takes up again from here (P05-R18), as does one whose pick
+   * failed. It goes once the task is picked or settled, is never judged, or is out of its judging
+   * window.
    */
   progress: Map<string, TaskProgress>;
 }
@@ -117,6 +119,18 @@ export interface TaskProgress {
    * fails is the machine's load, not the criteria's fault, and does not reject them.
    */
   compiled: boolean;
+}
+
+/**
+ * What the loop tells a task about its turn in a tick (P05-R18). A `judgeTask` call without one has
+ * no other task waiting for a turn.
+ */
+export interface JudgeTurn {
+  /**
+   * Whether another due task waits for a turn in this tick. A task gives way at the end of its
+   * slice only then: a lone busy task goes on until it is done or reaches its stop line.
+   */
+  othersWaiting(): boolean;
 }
 
 /** Everything the Judge needs. Nothing in it reads the environment: the caller resolves that. */

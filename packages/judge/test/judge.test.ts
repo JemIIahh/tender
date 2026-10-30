@@ -2310,32 +2310,26 @@ test("judge_tick_goes_on_after_a_task_fails", async () => {
   ]);
 });
 
-test("a_task_with_many_slow_entries_cannot_keep_another_from_its_pick", {
-  timeout: 60_000,
-}, async () => {
-  // P05-R18. Task 8 has nine entries, and slow ones: scoring one moves the Judge's clock on 4 s.
-  // Its pick deadline comes first, at NOW + 60 s, and its stop line is NOW + 52 s. Task 7 has two
-  // entries, and its pick deadline is NOW + 62 s; its pick window is long, so its stop line is
-  // 30 s before that, at NOW + 32 s. Judged in one go, task 8 would take until NOW + 36 s, and task
-  // 7, judged after it, would get to no entry before its stop line and not be picked. Each task
-  // has a slice of 10 s a tick, and the loop waits 10 s between ticks.
-  let seconds = 0;
-  const atSecond = (n: number) => (NOW_NS + BigInt(n) * SECOND_NS).toString();
+/** A time `seconds` from NOW, as the chain gives a deadline. */
+const atSecond = (seconds: number) => (NOW_NS + BigInt(seconds) * SECOND_NS).toString();
+
+/**
+ * Tasks of the Judge's, accepted, each with held-out checks of its own (they are single-use), and
+ * with each answer stored as its entrant's result: `posted` gives each task's id, deadlines and
+ * answers, which commit in that order. The chain knows them all. A pick settles its task, on chain
+ * and in the database, as the indexer would record it, and is recorded with the `second()` it was
+ * sent at.
+ */
+async function postTasks(
+  posted: [id: string, deadlines: Partial<TaskView>, answers: string[]][],
+  second: () => number,
+) {
   const criteriaHash = await putCriteria(db, EXACT);
-  const posted: [id: string, deadlines: Partial<TaskView>, answers: string[]][] = [
-    [
-      "8",
-      { reveal_deadline: atSecond(-20), pick_deadline: atSecond(60) },
-      ["42", "41", " 42", "40", "42 ", "39", "\t42", "38", "forty-two"],
-    ],
-    ["7", { reveal_deadline: atSecond(-300), pick_deadline: atSecond(62) }, ["Forty-Two", "43"]],
-  ];
   const tasks: { view: TaskView; entries: EntryView[] }[] = [];
   for (const [id, deadlines, answers] of posted) {
     const view = taskView({
       id,
       criteria_hash: criteriaHash,
-      // Held-out checks of its own for each task: they are single-use.
       heldout_commitment: await putHeldout(db, {
         exact: { expected: ["42", "forty-two", `task ${id}`] },
       }),
@@ -2350,7 +2344,6 @@ test("a_task_with_many_slow_entries_cannot_keep_another_from_its_pick", {
     }
     tasks.push({ view, entries });
   }
-  // The chain: a pick settles its task, and is recorded with the second it was sent at.
   const views = new Map(tasks.map(({ view }) => [view.id, view]));
   const picks: [taskId: bigint, second: number][] = [];
   const chain = {
@@ -2359,24 +2352,59 @@ test("a_task_with_many_slow_entries_cannot_keep_another_from_its_pick", {
       async (id: bigint) => tasks.find(({ view }) => view.id === String(id))?.entries ?? [],
     ),
     pick: vi.fn<JudgeChain["pick"]>(async (taskId, winners, scorecardHash, scorecardUri) => {
-      picks.push([taskId, seconds]);
+      picks.push([taskId, second()]);
       const view = views.get(String(taskId));
       if (view === undefined) throw new Error(`no task ${taskId}`);
-      const paid = winners.map((winner) => ({ ...winner, amount: "1" }));
-      views.set(view.id, {
-        ...view,
-        phase: "settled",
-        outcome: {
-          kind: "picked",
-          winners: paid,
-          fee: "0",
-          scorecard_hash: scorecardHash,
-          scorecard_uri: scorecardUri,
-        },
-      });
+      const outcome = {
+        kind: "picked" as const,
+        winners: winners.map((winner) => ({ ...winner, amount: "1" })),
+        fee: "0",
+        scorecard_hash: scorecardHash,
+        scorecard_uri: scorecardUri,
+      };
+      views.set(view.id, { ...view, phase: "settled", outcome });
+      await db.query("update tasks set outcome = $2 where id = $1", [
+        taskId,
+        JSON.stringify(outcome),
+      ]);
       return {};
     }),
   } satisfies JudgeChain;
+  return { tasks, chain, picks };
+}
+
+/** A chain with the picks it was sent. */
+type PickedChain = { pick: { mock: { calls: Parameters<JudgeChain["pick"]>[] } } };
+
+/** The scorecards that `chain`'s picks point at, in the order of the picks. */
+async function scorecardsOf(chain: PickedChain) {
+  return Promise.all(
+    chain.pick.mock.calls.map(async ([, , sha]) => {
+      const blob = await getBlob(db, sha);
+      return ScorecardSchema.parse(JSON.parse(text(blob?.bytes ?? new Uint8Array())));
+    }),
+  );
+}
+
+test("a_task_with_many_slow_entries_cannot_keep_another_from_its_pick", {
+  timeout: 60_000,
+}, async () => {
+  // P05-R18. Task 8 has nine entries, and slow ones: scoring one moves the Judge's clock on 4 s.
+  // Its pick deadline comes first, at NOW + 60 s, and its stop line is NOW + 52 s. Task 7 has two
+  // entries, and its pick deadline is NOW + 62 s; its pick window is long, so its stop line is
+  // 30 s before that, at NOW + 32 s. Judged in one go, task 8 would take until NOW + 36 s, and task
+  // 7, judged after it, would get to no entry before its stop line and not be picked. Each task
+  // has a slice of 10 s a tick when another waits for its turn.
+  let seconds = 0;
+  const posted: [id: string, deadlines: Partial<TaskView>, answers: string[]][] = [
+    [
+      "8",
+      { reveal_deadline: atSecond(-20), pick_deadline: atSecond(60) },
+      ["42", "41", " 42", "40", "42 ", "39", "\t42", "38", "forty-two"],
+    ],
+    ["7", { reveal_deadline: atSecond(-300), pick_deadline: atSecond(62) }, ["Forty-Two", "43"]],
+  ];
+  const { tasks, chain, picks } = await postTasks(posted, () => seconds);
   // Each entry's content, by text, as the database is asked for it, and as it is scored.
   const textOf = new Map(
     tasks.flatMap(({ entries }) => entries).map((e, i) => [e.content_hash, i] as const),
@@ -2408,8 +2436,9 @@ test("a_task_with_many_slow_entries_cannot_keep_another_from_its_pick", {
   const wrong = { score: 0, passed: false, reasons: ["expected one of 3 accepted answers"] };
 
   // The first tick judges task 8 first, as its pick deadline comes first. Its slice is over three
-  // entries in, at NOW + 12 s, and it gives way: task 7 is scored and picked at NOW + 20 s.
-  await judgeTick(deps);
+  // entries in, at NOW + 12 s, and it gives way to task 7, which is scored and picked at NOW +
+  // 20 s. A task gave way, so the next tick is to start at once.
+  expect(await judgeTick(deps)).toBe(true);
   expect(chain.getTask.mock.calls).toEqual([[8n], [7n]]);
   expect(scored).toEqual(["42", "41", " 42", "Forty-Two", "43"]);
   expect(picks).toEqual([[7n, 20]]);
@@ -2418,15 +2447,13 @@ test("a_task_with_many_slow_entries_cannot_keep_another_from_its_pick", {
   expect(kept?.scored).toBe(3);
   expect([...(kept?.results.values() ?? [])]).toEqual([right, wrong, right]);
 
-  // The next tick, 10 s on, task 8 takes up where it was: nothing it found out is fetched or
-  // scored again. Its slice is over at NOW + 42 s, 10 s before its stop line, which is less than
-  // two slices: the last stretch before the line is one turn, so it scores the rest, and is picked
-  // at NOW + 54 s.
-  seconds += 10;
-  await judgeTick(deps);
+  // On the next tick task 8 takes up where it was: nothing it found out is fetched or scored
+  // again. It is the only task left, so nothing cuts it short: it scores the rest, and is picked at
+  // NOW + 44 s.
+  expect(await judgeTick(deps)).toBe(false);
   expect(picks).toEqual([
     [7n, 20],
-    [8n, 54],
+    [8n, 44],
   ]);
   expect(scored).toEqual(["42", "41", " 42", "Forty-Two", "43", ...answersInOrder.slice(3, 9)]);
   // Each content was read once, but the six that task 8 read on the first tick and had no time to
@@ -2435,12 +2462,7 @@ test("a_task_with_many_slow_entries_cannot_keep_another_from_its_pick", {
   expect(reads.toSorted()).toEqual([...answersInOrder, ...twice].toSorted());
   // Both tasks are settled, and the Judge keeps nothing of them.
   expect(memory.progress.size).toBe(0);
-  const cards = await Promise.all(
-    chain.pick.mock.calls.map(async ([, , sha]) => {
-      const blob = await getBlob(db, sha);
-      return ScorecardSchema.parse(JSON.parse(text(blob?.bytes ?? new Uint8Array())));
-    }),
-  );
+  const cards = await scorecardsOf(chain);
   expect(cards.map((card) => [card.task_id, card.winners])).toEqual([
     ["7", [{ account: "t7e1.test.near", bps: 10_000 }]],
     [
@@ -2458,9 +2480,102 @@ test("a_task_with_many_slow_entries_cannot_keep_another_from_its_pick", {
   ]);
 });
 
+test("three_busy_tasks_take_turns_and_each_is_picked_before_its_deadline", {
+  timeout: 120_000,
+}, async () => {
+  // P05-R18, through the loop itself. Three tasks with many slow entries: scoring one moves the
+  // Judge's clock on 4 s, and a slice is 10 s. Task 9's pick deadline comes first, at NOW + 70 s,
+  // with its stop line at NOW + 62 s; then task 8's at NOW + 80 s and task 7's at NOW + 90 s, whose
+  // long windows put their stop lines 30 s before them, at NOW + 50 s and NOW + 60 s. Judged one
+  // after another, task 9 would take until NOW + 60 s, and tasks 8 and 7 would get no pick.
+  let seconds = 0;
+  const answers = (n: number) =>
+    Array.from({ length: n }, (_, i) => (i % 2 === 0 ? `${" ".repeat(i)}42` : `${40 - i}`));
+  const { chain, picks } = await postTasks(
+    [
+      ["9", { reveal_deadline: atSecond(-10), pick_deadline: atSecond(70) }, answers(15)],
+      ["8", { reveal_deadline: atSecond(-300), pick_deadline: atSecond(80) }, answers(6)],
+      ["7", { reveal_deadline: atSecond(-300), pick_deadline: atSecond(90) }, answers(6)],
+    ],
+    () => seconds,
+  );
+  everyScorerCalls(() => {
+    seconds += 4;
+  });
+  const controller = new AbortController();
+  const loop = startJudge({
+    ...judgeDeps(db, chain, {
+      now: () => new Date(NOW.getTime() + seconds * 1_000),
+      scoringLimits: { sliceMs: 10_000 },
+    }),
+    // Ten minutes between ticks: only ticks that start at once can pick these in time.
+    intervalMs: 600_000,
+    signal: controller.signal,
+  });
+  await vi.waitFor(() => expect(picks).toHaveLength(3), { timeout: 60_000, interval: 50 });
+  controller.abort();
+  await loop;
+
+  // The first tick gives each task a slice of three entries, earliest pick deadline first, and
+  // each gives way to the others. The next one starts at once. In it task 9 has less than two
+  // slices left before its stop line, so it scores on to the line, seven more; tasks 8 and 7 are
+  // past theirs, and are picked from the three each of them scored. All three are picked at NOW +
+  // 64 s, before their deadlines.
+  expect(chain.getTask.mock.calls).toEqual([[9n], [8n], [7n], [9n], [8n], [7n]]);
+  expect(picks).toEqual([
+    [9n, 64],
+    [8n, 64],
+    [7n, 64],
+  ]);
+  const notScored = "not scored before the pick deadline";
+  const cards = await scorecardsOf(chain);
+  expect(
+    cards.map((card) => [
+      card.task_id,
+      card.entries.filter((e) => !e.reasons.includes(notScored)).length,
+      card.entries.length,
+    ]),
+  ).toEqual([
+    ["9", 10, 15],
+    ["8", 3, 6],
+    ["7", 3, 6],
+  ]);
+});
+
+test("a_lone_busy_task_is_never_cut", { timeout: 60_000 }, async () => {
+  // P05-R18: a task gives way at the end of its slice only to another due task. Task 7 has nine
+  // slow entries, 4 s each against a slice of 10 s, and task 8 is not due yet: its reveals are
+  // still open. No task waits, so task 7 is judged in one turn of 36 s and picked, and the next
+  // tick is to wait as usual.
+  let seconds = 0;
+  const { chain, picks } = await postTasks(
+    [
+      ["7", {}, ["42", "41", " 42", "40", "42 ", "39", "\t42", "38", "forty-two"]],
+      ["8", { reveal_deadline: atSecond(60), pick_deadline: atSecond(600) }, ["42"]],
+    ],
+    () => seconds,
+  );
+  let scores = 0;
+  everyScorerCalls(() => {
+    scores++;
+    seconds += 4;
+  });
+  const deps = judgeDeps(db, chain, {
+    now: () => new Date(NOW.getTime() + seconds * 1_000),
+    memory: newJudgeMemory(),
+    scoringLimits: { sliceMs: 10_000 },
+  });
+
+  expect(await judgeTick(deps)).toBe(false);
+  expect(picks).toEqual([[7n, 36]]);
+  expect(scores).toBe(9);
+  expect(chain.getTask.mock.calls).toEqual([[7n]]);
+});
+
 test("each_turn_finds_out_one_result_at_least", { timeout: 60_000 }, async () => {
-  // A slice of 0 ms: a task's turn is over as soon as it has found something out, and the task
-  // takes up from there on its next turn. Each turn scores one entry, and none is scored twice.
+  // A slice of 0 ms, with another task waiting for its turn: a task's turn is over as soon as it
+  // has found something out, and the task takes up from there on its next turn. Each turn scores
+  // one entry, and none is scored twice.
   const { chain } = await postJudged([
     ["alice.test.near", "42", 10n],
     ["bob.test.near", "41", 11n],
@@ -2472,12 +2587,13 @@ test("each_turn_finds_out_one_result_at_least", { timeout: 60_000 }, async () =>
   });
   const memory = newJudgeMemory();
   const deps = judgeDeps(db, chain, { memory, scoringLimits: { sliceMs: 0 } });
+  const turn = { othersWaiting: () => true };
 
-  expect(await judgeTask(deps, 7n)).toBe("skipped");
+  expect(await judgeTask(deps, 7n, turn)).toBe("yielded");
   expect(scored).toEqual(["42"]);
-  expect(await judgeTask(deps, 7n)).toBe("skipped");
+  expect(await judgeTask(deps, 7n, turn)).toBe("yielded");
   expect(scored).toEqual(["42", "41"]);
-  expect(await judgeTask(deps, 7n)).toBe("picked");
+  expect(await judgeTask(deps, 7n, turn)).toBe("picked");
   expect(scored).toEqual(["42", "41", " 42"]);
   expect((await picked(chain)).winners).toEqual([
     { account: "alice.test.near", bps: 7000 },
@@ -2489,10 +2605,11 @@ test("each_turn_finds_out_one_result_at_least", { timeout: 60_000 }, async () =>
 test("a_task_back_past_its_stop_line_is_picked_from_what_it_found_out", {
   timeout: 60_000,
 }, async () => {
-  // A task gives way after one entry (a slice of 0 ms), and its next turn comes only past its stop
-  // line, NOW + 9.5 minutes, when nothing more is scored. What it found out before stands: it is
-  // picked from that, and the entry it did not get to is not scored. The Judge was not late for
-  // every entry, so this is no `judging started too late` (P05-R13).
+  // A task gives way after one entry (a slice of 0 ms, with another task waiting), and its next
+  // turn comes only past its stop line, NOW + 9.5 minutes, when nothing more is scored. What it
+  // found out before stands: it is picked from that, and the entry it did not get to is not
+  // scored. The Judge was not late for every entry, so this is no `judging started too late`
+  // (P05-R13).
   const { chain } = await postJudged([
     ["alice.test.near", "42", 10n],
     ["bob.test.near", " 42", 11n],
@@ -2500,10 +2617,12 @@ test("a_task_back_past_its_stop_line_is_picked_from_what_it_found_out", {
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
   const memory = newJudgeMemory();
   const scoringLimits = { sliceMs: 0 };
+  const turn = { othersWaiting: () => true };
 
-  expect(await judgeTask(judgeDeps(db, chain, { memory, scoringLimits }), 7n)).toBe("skipped");
+  const first = judgeDeps(db, chain, { memory, scoringLimits });
+  expect(await judgeTask(first, 7n, turn)).toBe("yielded");
   const late = judgeDeps(db, chain, { now: at(9.6), memory, scoringLimits });
-  expect(await judgeTask(late, 7n)).toBe("picked");
+  expect(await judgeTask(late, 7n, turn)).toBe("picked");
 
   const card = await picked(chain);
   expect(card.winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);

@@ -245,11 +245,13 @@ test("a_compile_longer_than_an_entrys_limit_is_not_charged_to_any_entry", {
   timeout: 180_000,
 }, async () => {
   // The review's shape: a leaf of 100 properties that the schema refers to 100 times, which Ajv
-  // writes out at each reference. It takes over a second to compile, and V8 compiles what Ajv
-  // wrote on its first run, which costs some hundred milliseconds more: an entry that paid for
-  // that would time out at the 500 ms each one has here. The worker does it all before it takes
-  // an entry. Mallory's string makes the poster's pattern backtrack without end, and times out;
-  // the entry after it gets a new worker, which compiles again first, and is scored.
+  // writes out at each reference. It takes over a second to compile: an entry that paid for that
+  // would time out at the 500 ms each one has here. The worker does it all before it takes an
+  // entry. V8's own compile of what Ajv wrote, on its first run, costs about 230 ms more, which is
+  // under that limit on an idle machine, so this does not pin the warm-up that pays for it before
+  // any entry: json_schema.test.ts does. Mallory's string makes the poster's pattern backtrack
+  // without end, and times out; the entry after it gets a new worker, which compiles again first,
+  // and is scored.
   const leaf: Record<string, unknown> = {};
   for (let i = 0; i < 100; i++) leaf[`q${i}`] = { type: "integer", minimum: i, maximum: i + 9 };
   const properties: Record<string, unknown> = {
