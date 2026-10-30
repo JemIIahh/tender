@@ -69,6 +69,15 @@ export async function applyBlock(db: Db, block: IndexedBlock, opts: ApplyOptions
   });
 }
 
+/** The height of the last block applied for `cursorSource`, or null before the first. */
+export async function cursorHeight(db: Db, cursorSource: string): Promise<bigint | null> {
+  const [row] = await db.query<{ height: string }>(
+    "select height::text as height from chain_cursor where source = $1",
+    [cursorSource],
+  );
+  return row ? BigInt(row.height) : null;
+}
+
 type Data<Name extends TenderEvent["event"]> = Extract<TenderEvent, { event: Name }>["data"];
 
 /** The task an event is about: `data.task_id`, or `data.id` for task_created. Null if it has none. */
@@ -142,8 +151,11 @@ const U128_MAX = (2n ** 128n - 1n).toString();
 /** U+FFFD, the Unicode replacement character. */
 const REPLACEMENT = String.fromCodePoint(0xfffd);
 
-/** `value` with every NUL in a string replaced by U+FFFD, in nested arrays and objects as well. */
-function withoutNul<T>(value: T): T {
+/**
+ * `value` with every NUL in a string replaced by U+FFFD, in nested arrays and objects as well.
+ * Reconcile cleans the views it stores with it too.
+ */
+export function withoutNul<T>(value: T): T {
   if (typeof value === "string") return value.replaceAll("\u0000", REPLACEMENT) as T;
   if (Array.isArray(value)) return value.map((item) => withoutNul(item)) as T;
   if (typeof value === "object" && value !== null) {
@@ -188,6 +200,26 @@ async function taskRow(db: Db, taskId: string): Promise<TaskRow | undefined> {
 }
 
 async function taskCreated(db: Db, d: Data<"task_created">, height: bigint): Promise<void> {
+  if (!(await insertTask(db, d, height))) return;
+  // The poster pays the whole reward, and is the only funder until someone tops it up.
+  await db.query(
+    `insert into funders (task_id, account, amount) values ($1, $2, $3)
+     on conflict (task_id, account) do nothing`,
+    [d.id, d.poster, d.reward],
+  );
+}
+
+/**
+ * Inserts the row of the task that `d` describes, created at block `height`, with no commit, no
+ * reveal and no outcome, unless the index holds the task already. Returns whether it inserted it.
+ * It inserts no funder: `task_created` makes the poster the first, and reconcile copies the
+ * funders from the chain. Every string of `d` must be free of NUL (see `withoutNul`).
+ */
+export async function insertTask(
+  db: Db,
+  d: Data<"task_created">,
+  height: bigint,
+): Promise<boolean> {
   // The brief tells the title, the category and the tags. They are filled only from a public blob
   // of kind brief that is a valid brief; the task is indexed all the same when there is none.
   const parsed = BriefSchema.safeParse(await readPublicJsonBlob(db, d.brief_hash, "brief"));
@@ -228,13 +260,7 @@ async function taskCreated(db: Db, d: Data<"task_created">, height: bigint): Pro
       height,
     ],
   );
-  if (created.length === 0) return;
-  // The poster pays the whole reward, and is the only funder until someone tops it up.
-  await db.query(
-    `insert into funders (task_id, account, amount) values ($1, $2, $3)
-     on conflict (task_id, account) do nothing`,
-    [d.id, d.poster, d.reward],
-  );
+  return created.length > 0;
 }
 
 async function taskToppedUp(db: Db, d: Data<"task_topped_up">): Promise<void> {
