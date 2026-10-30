@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import {
   type AccountEntriesResponse,
   type AgentDetailResponse,
@@ -18,7 +19,7 @@ import {
 import { KeyPair, KeyPairEd25519, type Provider } from "near-api-js";
 import * as nearNep413 from "near-api-js/nep413";
 import { afterEach, expect, test, vi } from "vitest";
-import { ApiClient } from "../src/index";
+import { ApiClient, type ApiClientOptions, ApiTimeoutError } from "../src/index";
 
 // `ApiClient` over a fake API. The fake's `fetch` notes each call (with the `this` it was called
 // with) and answers it from the routes a test gives it. Its sign-in is the real protocol: it
@@ -42,6 +43,7 @@ const HASH = "ab".repeat(32);
 const U64_MAX = 2n ** 64n - 1n;
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -174,6 +176,8 @@ interface Call {
   body: string | undefined;
   /** What the request said to do with a redirect: `fetch` follows one unless it is told not to. */
   redirect: RequestRedirect | undefined;
+  /** The signal that cancels the request: the client gives each its own. */
+  signal: AbortSignal | undefined;
 }
 
 type Handler = (call: Call) => Response | Promise<Response>;
@@ -326,6 +330,7 @@ function fakeApi() {
       headers: new Headers(init?.headers),
       body: typeof init?.body === "string" ? init.body : undefined,
       redirect: init?.redirect,
+      signal: init?.signal ?? undefined,
     };
     api.calls.push(call);
     const route = `${call.method} ${call.url.pathname}`;
@@ -377,13 +382,17 @@ function serveBoard(api: FakeApi): void {
   );
 }
 
-/** A client of `api` that signs in as `ACCOUNT` and tells the time by the fake's clock. */
-function clientOf(api: FakeApi): ApiClient {
+/**
+ * A client of `api` that signs in as `ACCOUNT` and tells the time by the fake's clock, with the
+ * options of `over` laid over those.
+ */
+function clientOf(api: FakeApi, over: Partial<ApiClientOptions> = {}): ApiClient {
   return new ApiClient({
     baseUrl: BASE,
     signer: SIGNER,
     fetchImpl: api.fetch,
     now: () => api.clock.now,
+    ...over,
   });
 }
 
@@ -1555,4 +1564,430 @@ test("the_clock_is_called_as_a_function_of_its_own", async () => {
 
   expect(seen.length).toBeGreaterThan(0);
   expect(seen).toEqual(seen.map(() => undefined));
+});
+
+// ---- Timeouts ---------------------------------------------------------------------------------
+
+// What a request that is not answered comes to. The stand-in answers nothing, and does not look at
+// the signal it is given either, as a `fetch` of someone else's might not: the caller is let go
+// of by the client, not by the stand-in. The clock of `setTimeout` is the test's, so that none of
+// this waits, or depends on how busy the machine is. (Against a real server and a real `fetch`
+// it is timeouts.test.ts.)
+
+/** An answer that never comes. */
+const unanswered = () => new Promise<Response>(() => undefined);
+
+/** Every request but the two of the sign-in. */
+const NOT_THE_SIGN_IN = /^(?:GET|POST) \/v1\/(?!auth\/)/;
+
+function fakeTimers(): void {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+}
+
+/**
+ * The milliseconds on the clock of `setTimeout` that it takes for `promise` to settle, which are
+ * moved a millisecond at a time: the work that comes before (a sign-in) runs between the steps.
+ * It fails if `promise` is still not settled after `limit` of them.
+ */
+async function msUntilSettled(promise: Promise<unknown>, limit: number): Promise<number> {
+  let settled = false;
+  const note = () => {
+    settled = true;
+  };
+  promise.then(note, note);
+  let elapsed = 0;
+  while (!settled && elapsed < limit) {
+    await vi.advanceTimersByTimeAsync(1);
+    elapsed++;
+  }
+  if (!settled) throw new Error(`the call was still out after ${limit} ms`);
+  return elapsed;
+}
+
+/** Every call of the client that sends a request of its own, by the name of its method. */
+const CALLS: Array<[string, (client: ApiClient) => Promise<unknown>]> = [
+  ["listTasks", (client) => client.listTasks()],
+  ["getTask", (client) => client.getTask(7n)],
+  ["listAgents", (client) => client.listAgents()],
+  ["getAgent", (client) => client.getAgent(ACCOUNT)],
+  ["listEntries", (client) => client.listEntries(ACCOUNT)],
+  ["health", (client) => client.health()],
+  ["getScorecard", (client) => client.getScorecard(3n)],
+  ["getBlob", (client) => client.getBlob(BLOB_HASH)],
+  ["uploadBlob", (client) => client.uploadBlob(FILE)],
+  ["uploadHeldout", (client) => client.uploadHeldout(HASH, BLOB)],
+  ["start", (client) => client.start(7n)],
+  ["telegramLink", (client) => client.telegramLink()],
+];
+
+test("every_request_gives_up_when_its_time_is_out_and_the_error_names_the_method", async () => {
+  fakeTimers();
+  const timeoutMs = 50;
+  for (const [name, call] of CALLS) {
+    const api = fakeApi();
+    api.on(NOT_THE_SIGN_IN, unanswered);
+
+    const outcome = rejection(call(clientOf(api, { timeoutMs })));
+    const took = await msUntilSettled(outcome, 10 * timeoutMs);
+    const error = await outcome;
+
+    // It was the method's own request that never came, after a sign-in that went through, and the
+    // time it took is the time it was given: the sign-in takes none of it.
+    expect(error, name).toBeInstanceOf(ApiTimeoutError);
+    expect(error, name).not.toBeInstanceOf(ApiError);
+    expect((error as Error).message, name).toBe(`ApiClient.${name} timed out after 50 ms`);
+    expect((error as ApiTimeoutError).name, name).toBe("ApiTimeoutError");
+    expect((error as ApiTimeoutError).method, name).toBe(name);
+    expect((error as ApiTimeoutError).timeoutMs, name).toBe(timeoutMs);
+    expect(took, name).toBeGreaterThanOrEqual(timeoutMs);
+    expect(took, name).toBeLessThan(timeoutMs + 20);
+    const sent = api.calls.filter((sent) => !sent.url.pathname.includes("/auth/"));
+    expect(sent, name).toHaveLength(1);
+  }
+});
+
+test("a_sign_in_that_never_comes_is_a_timeout_of_the_sign_in", async () => {
+  fakeTimers();
+  for (const route of ["POST /v1/auth/challenge", "POST /v1/auth/verify"]) {
+    const api = fakeApi();
+    api.on(route, unanswered);
+
+    const outcome = rejection(clientOf(api, { timeoutMs: 50 }).start(7n));
+    await msUntilSettled(outcome, 500);
+    const error = await outcome;
+
+    expect(error, route).toBeInstanceOf(ApiTimeoutError);
+    expect((error as Error).message, route).toBe("ApiClient.signIn timed out after 50 ms");
+    // The call itself was not sent, as it had no token to send.
+    expect(api.to("/v1/tasks/7/start"), route).toHaveLength(0);
+  }
+});
+
+test("calls_that_wait_for_a_sign_in_that_never_comes_all_fail_with_it", async () => {
+  fakeTimers();
+  const api = fakeApi();
+  serveBoard(api);
+  // The first challenge is never answered, and the ones after it are.
+  let asked = 0;
+  api.beforeChallenge = () =>
+    ++asked === 1 ? new Promise<void>(() => undefined) : Promise.resolve();
+  const client = clientOf(api, { timeoutMs: 1_000 });
+
+  const calls = [client.start(7n), client.telegramLink(), client.uploadBlob(FILE)].map(rejection);
+  await vi.advanceTimersByTimeAsync(1_000);
+  for (const error of await Promise.all(calls)) {
+    expect(error).toBeInstanceOf(ApiTimeoutError);
+    expect((error as Error).message).toBe("ApiClient.signIn timed out after 1000 ms");
+  }
+  // They shared the one sign-in, and so the one request that was out of time.
+  expect(api.challenges).toBe(1);
+
+  // Nothing of it stuck: the next call signs in again, and goes through.
+  expect(await client.start(7n)).toEqual(STARTED);
+  expect(api.challenges).toBe(2);
+});
+
+test("the_time_is_30_seconds_unless_it_is_set", async () => {
+  fakeTimers();
+  const api = fakeApi();
+  api.on("GET /v1/health", unanswered);
+
+  let settled = false;
+  const outcome = rejection(clientOf(api).health());
+  outcome.then(() => {
+    settled = true;
+  });
+  await vi.advanceTimersByTimeAsync(29_999);
+  expect(settled).toBe(false);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(settled).toBe(true);
+  const error = (await outcome) as ApiTimeoutError;
+  expect(error).toBeInstanceOf(ApiTimeoutError);
+  expect(error.message).toBe("ApiClient.health timed out after 30000 ms");
+  expect(error.timeoutMs).toBe(30_000);
+
+  // A time that is set is the time the request has.
+  settled = false;
+  const patient = rejection(clientOf(api, { timeoutMs: 5_000 }).health());
+  patient.then(() => {
+    settled = true;
+  });
+  await vi.advanceTimersByTimeAsync(4_999);
+  expect(settled).toBe(false);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(settled).toBe(true);
+  expect(((await patient) as Error).message).toBe("ApiClient.health timed out after 5000 ms");
+});
+
+test("a_request_that_is_answered_in_time_is_answered", async () => {
+  fakeTimers();
+  const api = fakeApi();
+  // The answers come after a wait on the same clock: the first 49 ms into the 50 a request has,
+  // the second 51 ms in.
+  const waits = [49, 51];
+  api.on(
+    "GET /v1/health",
+    () =>
+      new Promise<Response>((resolve) => {
+        setTimeout(() => resolve(json(HEALTH)), waits.shift());
+      }),
+  );
+  const client = clientOf(api, { timeoutMs: 50 });
+
+  const early = client.health();
+  await vi.advanceTimersByTimeAsync(49);
+  expect(await early).toEqual(HEALTH);
+  expect(vi.getTimerCount()).toBe(0);
+
+  const late = rejection(client.health());
+  await vi.advanceTimersByTimeAsync(50);
+  expect(await late).toBeInstanceOf(ApiTimeoutError);
+});
+
+test("a_request_is_told_to_stop_when_its_time_is_out", async () => {
+  fakeTimers();
+  const api = fakeApi();
+  // A stand-in that does look at its signal: it fails with the reason the signal aborts with, as
+  // `fetch` does.
+  api.on(
+    "GET /v1/health",
+    (call) =>
+      new Promise<Response>((_, reject) => {
+        call.signal?.addEventListener("abort", () => reject(call.signal?.reason), { once: true });
+      }),
+  );
+
+  const outcome = rejection(clientOf(api, { timeoutMs: 1_000 }).health());
+  await vi.advanceTimersByTimeAsync(1_000);
+  const error = await outcome;
+
+  expect(error).toBeInstanceOf(ApiTimeoutError);
+  const call = nth(api.to("/v1/health"), 0);
+  expect(call.signal?.aborted).toBe(true);
+  expect(call.signal?.reason).toBe(error);
+});
+
+test("every_request_has_a_signal_of_its_own_and_an_answered_one_is_not_aborted", async () => {
+  const api = fakeApi();
+  serveBoard(api);
+  await callEveryMethod(clientOf(api));
+
+  const signals = api.calls.map((call) => call.signal);
+  expect(api.calls).toHaveLength(14);
+  for (const signal of signals) expect(signal).toBeInstanceOf(AbortSignal);
+  expect(new Set(signals).size).toBe(signals.length);
+  // A request that was answered is not cancelled afterwards, and nothing is left listening to it.
+  expect(signals.map((signal) => signal?.aborted)).toEqual(signals.map(() => false));
+  for (const signal of signals) {
+    expect(signal && getEventListeners(signal, "abort")).toHaveLength(0);
+  }
+});
+
+test("no_timer_is_left_behind_however_a_request_ends", async () => {
+  fakeTimers();
+  const api = fakeApi();
+  serveBoard(api);
+  const client = clientOf(api);
+
+  await callEveryMethod(client);
+  expect(vi.getTimerCount(), "after answers").toBe(0);
+
+  api.on(/^GET \/v1\/tasks$/, () => json(UNAUTHORIZED, 401));
+  await rejection(client.listTasks());
+  expect(vi.getTimerCount(), "after an error status").toBe(0);
+
+  api.on("GET /v1/health", () => {
+    throw new Error("the network is down");
+  });
+  await rejection(client.health());
+  expect(vi.getTimerCount(), "after a fetch that fails").toBe(0);
+
+  api.on("GET /v1/entries", unanswered);
+  const outcome = rejection(client.listEntries(ACCOUNT));
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(await outcome).toBeInstanceOf(ApiTimeoutError);
+  expect(vi.getTimerCount(), "after a timeout").toBe(0);
+});
+
+test("a_request_sent_again_after_a_401_has_a_time_of_its_own", async () => {
+  fakeTimers();
+  const api = fakeApi();
+  // The first request is refused, as a token that was revoked is, and the one sent after the new
+  // sign-in is not answered.
+  let sent = 0;
+  api.on(/^POST \/v1\/tasks\/\d+\/start$/, () =>
+    ++sent === 1 ? json(UNAUTHORIZED, 401) : new Promise<Response>(() => undefined),
+  );
+  const outcome = rejection(clientOf(api, { timeoutMs: 50 }).start(7n));
+  await msUntilSettled(outcome, 500);
+  const error = await outcome;
+
+  expect(error).toBeInstanceOf(ApiTimeoutError);
+  expect((error as Error).message).toBe("ApiClient.start timed out after 50 ms");
+  expect(api.to("/v1/tasks/7/start")).toHaveLength(2);
+  expect(api.challenges).toBe(2);
+});
+
+test("a_request_that_is_out_of_time_is_not_sent_again_and_the_token_stays", async () => {
+  fakeTimers();
+  const api = fakeApi();
+  serveBoard(api);
+  let hang = true;
+  api.on(
+    /^POST \/v1\/tasks\/\d+\/start$/,
+    api.signedIn(() => (hang ? unanswered() : json(STARTED))),
+  );
+  const client = clientOf(api, { timeoutMs: 50 });
+
+  const outcome = rejection(client.start(7n));
+  await msUntilSettled(outcome, 500);
+  expect(await outcome).toBeInstanceOf(ApiTimeoutError);
+  // Sent once, on the one token: a timeout is no 401, and the request is not sent again.
+  expect(api.to("/v1/tasks/7/start")).toHaveLength(1);
+  expect(api.tokens).toEqual(["token-1"]);
+
+  // The token is still the client's: the next call is sent on it, with no sign-in.
+  hang = false;
+  expect(await client.start(7n)).toEqual(STARTED);
+  expect(api.tokens).toEqual(["token-1"]);
+  expect(api.challenges).toBe(1);
+  expect(api.to("/v1/tasks/7/start")).toHaveLength(2);
+});
+
+test("an_answer_that_comes_after_the_time_is_out_is_dropped", async () => {
+  fakeTimers();
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const api = fakeApi();
+    const late = deferred();
+    // A stand-in that goes on after the time is out, and fails then: nothing is left to hear it.
+    api.on("GET /v1/health", async () => {
+      await late.promise;
+      throw new Error("the connection was reset");
+    });
+    const outcome = rejection(clientOf(api, { timeoutMs: 50 }).health());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await outcome).toBeInstanceOf(ApiTimeoutError);
+
+    late.resolve();
+    // Unhandled rejections are reported when the turn is over, which is a real one.
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  expect(unhandled).toEqual([]);
+});
+
+test("the_signal_of_the_client_ends_a_call_with_its_own_reason", async () => {
+  fakeTimers();
+  const reason = new Error("shutting down");
+
+  // Already aborted: nothing is sent, and nothing is started that has to be put away.
+  const before = fakeApi();
+  serveBoard(before);
+  const refused = await rejection(clientOf(before, { signal: AbortSignal.abort(reason) }).health());
+  expect(refused).toBe(reason);
+  expect(before.calls).toHaveLength(0);
+  expect(vi.getTimerCount()).toBe(0);
+
+  // Aborted while a request is waiting: the call fails with that reason, which is no timeout, the
+  // request is told to stop, and nothing is left running.
+  const api = fakeApi();
+  api.on("GET /v1/health", unanswered);
+  const stopped = new AbortController();
+  const outcome = rejection(clientOf(api, { signal: stopped.signal, timeoutMs: 60_000 }).health());
+  await vi.advanceTimersByTimeAsync(10);
+  expect(api.calls).toHaveLength(1);
+  stopped.abort(reason);
+  expect(await outcome).toBe(reason);
+  expect(nth(api.calls, 0).signal?.aborted).toBe(true);
+  expect(nth(api.calls, 0).signal?.reason).toBe(reason);
+  expect(vi.getTimerCount()).toBe(0);
+
+  // A client that has seen its signal abort refuses what it is asked after.
+  const later = await rejection(clientOf(api, { signal: stopped.signal }).health());
+  expect(later).toBe(reason);
+  expect(api.calls).toHaveLength(1);
+
+  // A token that is held does not get a call past it: the client has been told to stop.
+  const held = fakeApi();
+  serveBoard(held);
+  const ending = new AbortController();
+  const holder = clientOf(held, { signal: ending.signal });
+  expect(await holder.signIn()).toBe("token-1");
+  ending.abort(reason);
+  expect(await rejection(holder.signIn())).toBe(reason);
+  expect(await rejection(holder.start(7n))).toBe(reason);
+  expect(held.to("/v1/tasks/7/start")).toHaveLength(0);
+});
+
+test("the_signal_of_the_client_ends_the_calls_in_flight_and_a_sign_in_they_share", async () => {
+  fakeTimers();
+  const reason = new Error("shutting down");
+  const api = fakeApi();
+  api.on("POST /v1/auth/challenge", unanswered);
+  const stopped = new AbortController();
+  const client = clientOf(api, { signal: stopped.signal });
+
+  const calls = [client.start(7n), client.telegramLink()].map(rejection);
+  await vi.advanceTimersByTimeAsync(10);
+  stopped.abort(reason);
+
+  expect(await Promise.all(calls)).toEqual([reason, reason]);
+  // They shared the one sign-in, which was cancelled with them.
+  expect(api.to("/v1/auth/challenge")).toHaveLength(1);
+  expect(nth(api.to("/v1/auth/challenge"), 0).signal?.aborted).toBe(true);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test("a_client_with_a_signal_puts_no_listener_on_it_for_its_requests", async () => {
+  fakeTimers();
+  const api = fakeApi();
+  api.on(NOT_THE_SIGN_IN, unanswered);
+  const stopped = new AbortController();
+  const client = clientOf(api, { signal: stopped.signal, timeoutMs: 1_000 });
+  const listeners = () => getEventListeners(stopped.signal, "abort").length;
+  const before = listeners();
+
+  // Many requests at once, as an agent makes them: they do not each hang a listener on the
+  // signal, which Node reports as a leak from the eleventh.
+  const outcomes = Array.from({ length: 25 }, () => rejection(client.getTask(7n)));
+  await vi.advanceTimersByTimeAsync(10);
+  expect(api.calls).toHaveLength(25);
+  expect(listeners()).toBe(before);
+
+  await vi.advanceTimersByTimeAsync(1_000);
+  for (const error of await Promise.all(outcomes)) expect(error).toBeInstanceOf(ApiTimeoutError);
+  // It was the time that was out, and the signal of the client is as it was.
+  expect(stopped.signal.aborted).toBe(false);
+  expect(listeners()).toBe(before);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test("the_time_is_a_number_of_milliseconds_that_a_timer_can_keep", () => {
+  const MAX = 2 ** 31 - 1;
+  const refused: unknown[] = [
+    0,
+    -1,
+    0.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    MAX + 1,
+    "30000",
+    null,
+    true,
+  ];
+  for (const timeoutMs of refused) {
+    const error = thrown(() => new ApiClient({ baseUrl: BASE, timeoutMs: timeoutMs as number }));
+    expect(error, String(timeoutMs)).toBeInstanceOf(RangeError);
+    expect((error as Error).message, String(timeoutMs)).toBe(
+      `ApiClient: timeoutMs must be a number of milliseconds from 1 to ${MAX}, not ${String(timeoutMs)}`,
+    );
+  }
+  for (const timeoutMs of [1, 30_000, 60.5, MAX, undefined]) {
+    expect(() => new ApiClient({ baseUrl: BASE, timeoutMs }), String(timeoutMs)).not.toThrow();
+  }
 });

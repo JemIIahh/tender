@@ -50,6 +50,30 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 /** A nonce as the API makes it: 32 bytes in base64, which is 43 characters and one `=`. */
 const NONCE_SHAPE = /^[A-Za-z0-9+/]{43}=$/;
 
+/** How long a request may take unless `timeoutMs` says otherwise. */
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/** The longest wait `setTimeout` keeps: it runs anything above this after 1 ms instead. */
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
+/**
+ * A request that was not answered in time. It names the method of the client that sent it, which
+ * is `signIn` for the two requests of a sign-in, and the time it was given. It holds nothing else:
+ * not the URL, and not a word of what the server sent or of what was sent to it. It is not an
+ * `ApiError`, as the server did not answer.
+ */
+export class ApiTimeoutError extends Error {
+  readonly method: string;
+  readonly timeoutMs: number;
+
+  constructor(method: string, timeoutMs: number) {
+    super(`ApiClient.${method} timed out after ${timeoutMs} ms`);
+    this.name = "ApiTimeoutError";
+    this.method = method;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export interface ApiClientOptions {
   /**
    * Where the API is served, as `PUBLIC_API_URL` has it: `https://api.example`. The client adds
@@ -76,6 +100,19 @@ export interface ApiClientOptions {
    * Default: `Date.now`. It is called as a function of its own, like `fetchImpl`.
    */
   now?: () => number;
+  /**
+   * How long one request may take, from when it is sent to the last byte of its answer, in
+   * milliseconds: from 1 to 2147483647. Default: 30000. A request that is not answered in time is
+   * cancelled, and its call fails with an `ApiTimeoutError`. The time is that of each request and
+   * not of a call: a call that has to sign in first sends three.
+   */
+  timeoutMs?: number;
+  /**
+   * Cancels the calls of this client. A request in flight is cancelled and its call fails with the
+   * reason of the signal, and a call made once it has aborted fails with that reason before it
+   * sends anything. It works with `timeoutMs`: whichever comes first ends the request.
+   */
+  signal?: AbortSignal;
 }
 
 /** A bearer token, and the time (ms since the epoch) from which the client no longer uses it. */
@@ -127,23 +164,27 @@ function toBase64(bytes: Uint8Array): string {
 }
 
 /**
- * The `init` of a GET. No request of the client follows a redirect, this one or a POST: the API
- * never redirects, and the server at `baseUrl` could use one to send what a request holds (the
- * signature of a sign-in, a brief, the bearer token) on to a place of its choosing, over plain
- * http even. A redirect fails the request with the error `fetch` gives for it.
+ * The `init` of a GET, which `signal` cancels. No request of the client follows a redirect, this
+ * one or a POST: the API never redirects, and the server at `baseUrl` could use one to send what a
+ * request holds (the signature of a sign-in, a brief, the bearer token) on to a place of its
+ * choosing, over plain http even. A redirect fails the request with the error `fetch` gives for it.
  */
-function get(): RequestInit {
-  return { redirect: "error" };
+function get(signal: AbortSignal): RequestInit {
+  return { redirect: "error", signal };
 }
 
-/** The `init` of a POST: signed in as the owner of `token` if there is one, with `body` as JSON. */
-function post(token?: string, body?: unknown): RequestInit {
+/**
+ * The `init` of a POST, which `signal` cancels: signed in as the owner of `token` if there is one,
+ * with `body` as JSON.
+ */
+function post(signal: AbortSignal, token?: string, body?: unknown): RequestInit {
   const headers: Record<string, string> = {};
   if (token !== undefined) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   return {
     method: "POST",
     redirect: "error",
+    signal,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   };
@@ -176,6 +217,22 @@ function requireSecure(baseUrl: string): void {
   throw new Error(
     "an ApiClient with a signer needs an https baseUrl, or http to localhost, 127.0.0.1 or [::1]: over plain http the sign-in can be swapped and the bearer token is sent in the clear",
   );
+}
+
+/**
+ * The time a request has: `timeoutMs`, or the default if it is not set. Anything that is set and
+ * is not a number from 1 to what a timer keeps is a mistake: `setTimeout` would turn it into a
+ * wait of a millisecond, and every request would fail at once. It is refused with an error that
+ * names the option, when the client is made.
+ */
+function timeoutOf(timeoutMs: number | undefined): number {
+  if (timeoutMs === undefined) return DEFAULT_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TIMEOUT_MS) {
+    throw new RangeError(
+      `ApiClient: timeoutMs must be a number of milliseconds from 1 to ${MAX_TIMEOUT_MS}, not ${String(timeoutMs)}`,
+    );
+  }
+  return timeoutMs;
 }
 
 /** Whether `nonce` is one the API could have made: 32 bytes in the one base64 spelling of them. */
@@ -254,6 +311,14 @@ async function readCapped(res: Response, limit: number): Promise<Uint8Array | nu
  * A client with a signer needs an https `baseUrl` (http only to this machine), as the signature
  * and the token go to it, and no request follows a redirect, so the server cannot send them on.
  *
+ * Every request has `timeoutMs` to be answered in full, 30 seconds unless it is set, and is
+ * cancelled when that is out. The call then fails with an `ApiTimeoutError` that names the method.
+ * That holds for a `fetchImpl` that never looks at the signal it is given, too: the call is let go
+ * of at the time, and whatever the `fetchImpl` does after that is dropped. The signal of the
+ * client, if it has one, ends the requests in flight and refuses the calls made after it. A
+ * timeout is no answer of the API: it is not retried, and the token the client holds stays good.
+ * A sign-in that times out fails the calls waiting for it, and the next call signs in again.
+ *
  * An `ApiError` holds the body of the answer for the caller to read, and for a sign-in that can be
  * the bearer token. So nothing here logs a body or puts one in a message.
  */
@@ -261,6 +326,8 @@ export class ApiClient implements TenderApi {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly now: () => number;
+  private readonly timeoutMs: number;
+  private readonly callerSignal: AbortSignal | undefined;
   private readonly accountId: string | undefined;
   private readonly keyPair: KeyPair | undefined;
   private session: Session | undefined;
@@ -273,6 +340,8 @@ export class ApiClient implements TenderApi {
     // on each call, so a test that fakes the clock after this is built is seen.
     const clock = opts.now;
     this.now = clock === undefined ? () => Date.now() : () => clock();
+    this.timeoutMs = timeoutOf(opts.timeoutMs);
+    this.callerSignal = opts.signal;
     if (opts.signer !== undefined) {
       requireSecure(this.baseUrl);
       this.accountId = opts.signer.accountId;
@@ -292,12 +361,16 @@ export class ApiClient implements TenderApi {
       limit: filter.limit,
       cursor: filter.cursor,
     });
-    return fetchJson(this.url(`/tasks${query}`), ListTasksResponseSchema, get(), this.fetchImpl);
+    return this.timed("listTasks", (signal) =>
+      fetchJson(this.url(`/tasks${query}`), ListTasksResponseSchema, get(signal), this.fetchImpl),
+    );
   }
 
   getTask(id: bigint): Promise<TaskDetailResponse | null> {
     return orNull(
-      fetchJson(this.url(`/tasks/${id}`), TaskDetailResponseSchema, get(), this.fetchImpl),
+      this.timed("getTask", (signal) =>
+        fetchJson(this.url(`/tasks/${id}`), TaskDetailResponseSchema, get(signal), this.fetchImpl),
+      ),
     );
   }
 
@@ -308,38 +381,48 @@ export class ApiClient implements TenderApi {
       limit: filter.limit,
       cursor: filter.cursor,
     });
-    return fetchJson(this.url(`/agents${query}`), ListAgentsResponseSchema, get(), this.fetchImpl);
+    return this.timed("listAgents", (signal) =>
+      fetchJson(this.url(`/agents${query}`), ListAgentsResponseSchema, get(signal), this.fetchImpl),
+    );
   }
 
   // Async, so that an `account` that cannot be put in a path (a lone surrogate) rejects, as every
   // other failure does, and does not throw before a promise is returned.
   async getAgent(account: string): Promise<AgentDetailResponse | null> {
     return orNull(
-      fetchJson(
-        this.url(`/agents/${encodeURIComponent(account)}`),
-        AgentDetailResponseSchema,
-        get(),
-        this.fetchImpl,
+      this.timed("getAgent", (signal) =>
+        fetchJson(
+          this.url(`/agents/${encodeURIComponent(account)}`),
+          AgentDetailResponseSchema,
+          get(signal),
+          this.fetchImpl,
+        ),
       ),
     );
   }
 
   listEntries(account: string): Promise<AccountEntriesResponse> {
-    return fetchJson(
-      this.url(`/entries${queryOf({ account })}`),
-      AccountEntriesResponseSchema,
-      get(),
-      this.fetchImpl,
+    return this.timed("listEntries", (signal) =>
+      fetchJson(
+        this.url(`/entries${queryOf({ account })}`),
+        AccountEntriesResponseSchema,
+        get(signal),
+        this.fetchImpl,
+      ),
     );
   }
 
   health(): Promise<HealthResponse> {
-    return fetchJson(this.url("/health"), HealthResponseSchema, get(), this.fetchImpl);
+    return this.timed("health", (signal) =>
+      fetchJson(this.url("/health"), HealthResponseSchema, get(signal), this.fetchImpl),
+    );
   }
 
   getScorecard(taskId: bigint): Promise<Scorecard | null> {
     return orNull(
-      fetchJson(this.url(`/scorecards/${taskId}`), ScorecardSchema, get(), this.fetchImpl),
+      this.timed("getScorecard", (signal) =>
+        fetchJson(this.url(`/scorecards/${taskId}`), ScorecardSchema, get(signal), this.fetchImpl),
+      ),
     );
   }
 
@@ -349,30 +432,33 @@ export class ApiClient implements TenderApi {
    * answer, never data. The API stores at most `MAX_RESULT_BYTES` in a blob, and an answer of any
    * status is read only up to that: a larger one is an `ApiError` too, and the rest of it is not
    * read. This is the one request that does not go through `fetchJson`, as the answer is not JSON.
+   * Its time is for the whole of it, the bytes included.
    */
   async getBlob(sha256: string): Promise<Uint8Array | null> {
     // A local, so that it is called as a function of its own and not as a method of the client.
     const doFetch = this.fetchImpl ?? fetch;
-    const res = await doFetch(this.url(`/blobs/${encodeURIComponent(sha256)}`), get());
-    const bytes = await readCapped(res, MAX_RESULT_BYTES);
-    if (bytes === null) {
-      throw new ApiError(
-        res.status,
-        null,
-        `the blob ${sha256} is larger than the API allows, which is ${MAX_RESULT_BYTES} bytes`,
-      );
-    }
-    if (res.status === 404) return null;
-    if (!res.ok) throw new ApiError(res.status, bodyOf(new TextDecoder().decode(bytes)));
-    const actual = sha256Hex(bytes);
-    if (actual !== sha256) {
-      throw new ApiError(
-        res.status,
-        null,
-        `the bytes served for blob ${sha256} do not match it, they hash to ${actual}`,
-      );
-    }
-    return bytes;
+    return this.timed("getBlob", async (signal) => {
+      const res = await doFetch(this.url(`/blobs/${encodeURIComponent(sha256)}`), get(signal));
+      const bytes = await readCapped(res, MAX_RESULT_BYTES);
+      if (bytes === null) {
+        throw new ApiError(
+          res.status,
+          null,
+          `the blob ${sha256} is larger than the API allows, which is ${MAX_RESULT_BYTES} bytes`,
+        );
+      }
+      if (res.status === 404) return null;
+      if (!res.ok) throw new ApiError(res.status, bodyOf(new TextDecoder().decode(bytes)));
+      const actual = sha256Hex(bytes);
+      if (actual !== sha256) {
+        throw new ApiError(
+          res.status,
+          null,
+          `the bytes served for blob ${sha256} do not match it, they hash to ${actual}`,
+        );
+      }
+      return bytes;
+    });
   }
 
   // ---- Calls that act as the signer's account -------------------------------------------------
@@ -386,40 +472,45 @@ export class ApiClient implements TenderApi {
       // Undefined when there is none, and JSON leaves it out: the API takes a u64 string or no key.
       task_id: blob.taskId?.toString(),
     };
-    return this.signedIn((token) =>
-      fetchJson(this.url("/blobs"), BlobUploadResponseSchema, post(token, body), this.fetchImpl),
+    return this.signedIn("uploadBlob", (token, signal) =>
+      fetchJson(
+        this.url("/blobs"),
+        BlobUploadResponseSchema,
+        post(signal, token, body),
+        this.fetchImpl,
+      ),
     );
   }
 
   async uploadHeldout(commitment: string, bytes: Uint8Array): Promise<void> {
     const body = { commitment, content_base64: toBase64(bytes) };
-    await this.signedIn((token) =>
+    await this.signedIn("uploadHeldout", (token, signal) =>
       fetchJson(
         this.url("/heldout"),
         HeldoutUploadResponseSchema,
-        post(token, body),
+        post(signal, token, body),
         this.fetchImpl,
       ),
     );
   }
 
   start(taskId: bigint): Promise<StartResponse> {
-    return this.signedIn((token) =>
+    return this.signedIn("start", (token, signal) =>
       fetchJson(
         this.url(`/tasks/${taskId}/start`),
         StartResponseSchema,
-        post(token),
+        post(signal, token),
         this.fetchImpl,
       ),
     );
   }
 
   telegramLink(): Promise<TelegramLinkResponse> {
-    return this.signedIn((token) =>
+    return this.signedIn("telegramLink", (token, signal) =>
       fetchJson(
         this.url("/telegram/link"),
         TelegramLinkResponseSchema,
-        post(token),
+        post(signal, token),
         this.fetchImpl,
       ),
     );
@@ -431,9 +522,11 @@ export class ApiClient implements TenderApi {
    * A bearer token that is good now: the one kept from the last sign-in while it is more than 5
    * minutes from its expiry, else the token of a new sign-in (challenge, signature, verify). Calls
    * made while a sign-in is under way wait for it and get its token. A sign-in that fails leaves
-   * nothing behind, so the next call tries again.
+   * nothing behind, so the next call tries again. Once the signal of the client has aborted it
+   * fails with the reason of that, as every call does, though a token is held.
    */
   signIn(): Promise<string> {
+    if (this.callerSignal?.aborted) return Promise.reject(this.callerSignal.reason);
     const session = this.session;
     if (session !== undefined && this.now() < session.refreshAt) {
       return Promise.resolve(session.token);
@@ -449,11 +542,8 @@ export class ApiClient implements TenderApi {
     if (accountId === undefined || keyPair === undefined) {
       throw new Error("this ApiClient has no signer, so it cannot sign in");
     }
-    const challenge = await fetchJson(
-      this.url("/auth/challenge"),
-      ChallengeResponseSchema,
-      post(),
-      this.fetchImpl,
+    const challenge = await this.timed("signIn", (signal) =>
+      fetchJson(this.url("/auth/challenge"), ChallengeResponseSchema, post(signal), this.fetchImpl),
     );
     const { message, nonce, recipient } = challenge;
     // The server chose all three, and the key signs them: only a Tender sign-in for this API is
@@ -466,18 +556,21 @@ export class ApiClient implements TenderApi {
     // The signature is of the SHA-256 of the NEP-413 bytes, the same digest `verifyNep413` checks.
     const digest = hexToBytes(sha256Hex(serializeNep413({ message, nonce, recipient })));
     const { signature, publicKey } = keyPair.sign(digest);
-    const issued = await fetchJson(
-      this.url("/auth/verify"),
-      SignInResponseSchema,
-      post(undefined, {
-        account_id: accountId,
-        public_key: publicKey.toString(),
-        signature: toBase64(signature),
-        nonce,
-        message,
-        recipient,
-      }),
-      this.fetchImpl,
+    const verification = {
+      account_id: accountId,
+      public_key: publicKey.toString(),
+      signature: toBase64(signature),
+      nonce,
+      message,
+      recipient,
+    };
+    const issued = await this.timed("signIn", (signal) =>
+      fetchJson(
+        this.url("/auth/verify"),
+        SignInResponseSchema,
+        post(signal, undefined, verification),
+        this.fetchImpl,
+      ),
     );
     this.session = {
       token: issued.token,
@@ -495,24 +588,68 @@ export class ApiClient implements TenderApi {
   }
 
   /**
-   * Runs `send` with a token. If the API answers it with a 401, the token is dropped, a new one is
-   * signed in for and `send` runs once more; the answer of that second run is final. A 401 from
-   * the sign-in itself is not retried: the key was refused, and `signIn` throws that.
+   * Runs `send` with a token, as the request of `method` (see `timed`). If the API answers it with
+   * a 401, the token is dropped, a new one is signed in for and `send` runs once more, as a request
+   * of its own; the answer of that second run is final. A 401 from the sign-in itself is not
+   * retried: the key was refused, and `signIn` throws that. A request that is out of time is not
+   * a 401, and leaves the token as it was.
    */
-  private async signedIn<T>(send: (token: string) => Promise<T>): Promise<T> {
+  private async signedIn<T>(
+    method: string,
+    send: (token: string, signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
     const token = await this.signIn();
     try {
-      return await send(token);
+      return await this.timed(method, (signal) => send(token, signal));
     } catch (error) {
       if (!isUnauthorized(error)) throw error;
       this.forget(token);
     }
     const fresh = await this.signIn();
     try {
-      return await send(fresh);
+      return await this.timed(method, (signal) => send(fresh, signal));
     } catch (error) {
       if (isUnauthorized(error)) this.forget(fresh);
       throw error;
+    }
+  }
+
+  /**
+   * Runs `send`, which makes one request with the signal it is given, and gives its result. The
+   * signal aborts when `timeoutMs` has passed, with an `ApiTimeoutError` for `method`, and when
+   * the signal of the client does, with the reason of that. Either way the call fails with that
+   * reason at once, and does not wait for `send`: a `fetchImpl` is not bound to look at its
+   * signal, and one that never answers must not hold a caller for ever. (A `fetch` that does look
+   * at it cancels the request, and the connection with it.) What `send` does after that, it does
+   * unobserved. If the signal of the client has aborted already, the call fails before `send` is
+   * called.
+   *
+   * The timer and the listener are put away however the request ends.
+   */
+  private async timed<T>(method: string, send: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    this.callerSignal?.throwIfAborted();
+    const timeout = new AbortController();
+    // The signal of the client is combined, and not listened to for each request: one client has
+    // any number of requests in flight, and Node warns of a leak when a signal has more than ten
+    // listeners.
+    const signal =
+      this.callerSignal === undefined
+        ? timeout.signal
+        : AbortSignal.any([timeout.signal, this.callerSignal]);
+    const timer = setTimeout(() => {
+      timeout.abort(new ApiTimeoutError(method, this.timeoutMs));
+    }, this.timeoutMs);
+    let interrupt: (reason: unknown) => void = () => undefined;
+    const interrupted = new Promise<never>((_, reject) => {
+      interrupt = reject;
+    });
+    const onAbort = () => interrupt(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      return await Promise.race([send(signal), interrupted]);
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
     }
   }
 
