@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { KeyPair } from "@tender/client";
 import type { TenderApi } from "@tender/shared";
-import { KeyPair } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
 import { AGENT_NAMES, AGENTS, agentVariables } from "../src/agents";
 import {

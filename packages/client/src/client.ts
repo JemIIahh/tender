@@ -38,6 +38,10 @@ import type { KeyPermission } from "./nep413";
 import { receiptsFromTx, type TxReceiptsOutcome } from "./outcome";
 import { defaultQueue } from "./queue";
 
+// Re-exported from near-api-js so that a package that only has to read a key (the agents' command
+// takes the public half of a private key) need not depend on near-api-js for that.
+export { KeyPair, type KeyPairString } from "near-api-js";
+
 /** An account and its private key, as near-api-js writes keys: `ed25519:<base58>`. */
 export interface Signer {
   accountId: string;

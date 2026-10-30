@@ -334,6 +334,73 @@ test("fenced_output_is_unwrapped", async () => {
   expect(decode(await solver.solve(textTask(256)))).toBe(middle);
 });
 
+// What a reasoning model thought comes first in its message, as `<think>...</think>`. It has a fence
+// of its own in it here, to show that the thinking is taken off before the fence is looked for.
+const THINK =
+  "<think>\nThree numbers and two dots. Perhaps a ```json fence? No: the object.\n</think>";
+
+test("a_reasoning_models_think_block_is_taken_off_before_the_checks", async () => {
+  const cases: Array<[string, () => TaskContext, string, string | null]> = [
+    // The answer after the block is checked as if it were the whole message, fence and all.
+    [
+      "a fenced regex answer",
+      regexTask,
+      `${THINK}\n\n\`\`\`json\n{"pattern":"^a$","flags":""}\n\`\`\``,
+      '{"pattern":"^a$","flags":""}',
+    ],
+    [
+      "a regex answer right after the block",
+      regexTask,
+      `${THINK}{"pattern":"^a$","flags":""}`,
+      '{"pattern":"^a$","flags":""}',
+    ],
+    ["json", jsonTask, `${THINK}\n{"total": 5}`, '{"total": 5}'],
+    // The space after the block goes with it. Any other space is the model's, and a text answer
+    // is sent as it wrote it.
+    ["text", textTask, `${THINK}\n\n  42 `, "42 "],
+    [
+      "code",
+      codeTask,
+      `${THINK}\nfunction solve(a, b) { return a + b; }`,
+      "function solve(a, b) { return a + b; }",
+    ],
+    ["space before the block", jsonTask, `\n \t${THINK}\n{"total": 5}`, '{"total": 5}'],
+    ["an empty block", jsonTask, '<think></think>{"total": 5}', '{"total": 5}'],
+    // A block with nothing after it is no answer, in any format.
+    ["a block and nothing else, json", jsonTask, THINK, null],
+    ["a block and nothing else, regex", regexTask, THINK, null],
+    ["a block and nothing else, code", codeTask, THINK, null],
+    ["a block and nothing else, text", textTask, THINK, null],
+    ["a block and space", textTask, `${THINK}\n \n`, null],
+    // A block that never closes: the model was still thinking when it stopped. A text task takes any
+    // words for an answer, and these are not.
+    ["a block that never closes, text", textTask, "<think>I am still working this out", null],
+    ["a block that never closes, json", jsonTask, '<think>{"total": 5}', null],
+    // One block that opens the message is taken off. Anything else is left for the check to judge.
+    ["two blocks", jsonTask, `${THINK}${THINK}{"total": 5}`, null],
+    ["a block after the answer", jsonTask, `{"total": 5}\n${THINK}`, null],
+    ["a block that does not open the message", jsonTask, `Sure.\n${THINK}\n{"total": 5}`, null],
+  ];
+  for (const [what, make, reply, expected] of cases) {
+    const { solver } = await setUp(reply);
+
+    const answer = await solver.solve(make());
+
+    expect(decode(answer), what).toBe(expected);
+  }
+
+  // The thinking is not the answer, so it is not held to the answer's rules: it may be far over the
+  // limit, and a lone surrogate in it does no harm.
+  const long = `<think>${"x".repeat(5000)}\ud800</think>ok`;
+  const { solver } = await setUp(long);
+  expect(decode(await solver.solve(textTask(2)))).toBe("ok");
+  // And the answer after it is held to them: over the limit, or with a lone surrogate, it is null.
+  const over = await setUp(`${THINK}okay`);
+  expect(decode(await over.solver.solve(textTask(2)))).toBeNull();
+  const lone = checkAnswer(`${THINK}ab\ud800`, textTask().brief, textTask().criteria);
+  expect(lone).toBeNull();
+});
+
 test("oversize_output_returns_null", async () => {
   // The brief's own limit, in bytes of UTF-8 and not in characters.
   const limit = 10;
