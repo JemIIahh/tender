@@ -54,11 +54,30 @@ const FORMAT_OF_KIND: Partial<Record<PublicCriteria["kind"], string>> = {
   json_schema: "json",
 };
 
+/**
+ * The values of a json_schema solution that the key does not check, and why each may stay that
+ * way. The audit of the keys lets nothing else go unchecked: a wrong value anywhere else must cost
+ * the reward, or a wrong answer is paid in full.
+ */
+const UNCHECKED_VALUES: Record<string, { match: RegExp; why: string }[]> = {
+  "meeting-actions-extract": [
+    {
+      match: /^\$\.actions\[\d+\]\.task$/,
+      why: "free text in the solver's own words, as the brief says: an equality check would turn away a good paraphrase, and the owner and the due date carry the facts",
+    },
+  ],
+};
+
 const path = (slug: string, name: string) => join(SEEDS_DIR, slug, name);
 const readBytes = (slug: string, name: string): Buffer => readFileSync(path(slug, name));
 const readJson = (slug: string, name: string): unknown =>
   JSON.parse(readBytes(slug, name).toString("utf8"));
 const utf8 = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
+
+/** The seeds whose key reads the values of a JSON answer by path. */
+const JSON_SCHEMA_SLUGS = SLUGS.filter(
+  (slug) => (readJson(slug, "criteria.json") as { kind?: unknown }).kind === "json_schema",
+);
 
 /** A seed's documents, once the schemas have read them, and the solution's bytes. */
 function load(slug: string) {
@@ -179,20 +198,89 @@ async function expectItemCountFixed(slug: string, array: string, extra: unknown)
   expect(result.score, result.reasons.join("; ")).toBeLessThan(criteria.min_score);
 }
 
+/** A key or an index on the way into a JSON document. */
+type Step = string | number;
+
+/** The assertion path of the value that `steps` lead to: `$`, then `.key` and `[n]`. */
+const pathOf = (steps: Step[]): string =>
+  `$${steps.map((step) => (typeof step === "number" ? `[${step}]` : `.${step}`)).join("")}`;
+
+/** Every value of `document` that is not an object or an array, with the steps that lead to it. */
+function leavesOf(document: unknown, steps: Step[] = []): { steps: Step[]; value: unknown }[] {
+  if (Array.isArray(document) || (typeof document === "object" && document !== null)) {
+    const children = Object.entries(document);
+    if (children.length === 0) throw new Error(`${pathOf(steps)} is empty, so it has no value`);
+    return children.flatMap(([key, child]) =>
+      leavesOf(child, [...steps, Array.isArray(document) ? Number(key) : key]),
+    );
+  }
+  return [{ steps, value: document }];
+}
+
+/** `document` with the value at `steps` replaced by `value`. */
+function replaceAt(document: unknown, steps: Step[], value: unknown): unknown {
+  const [step, ...rest] = steps;
+  if (step === undefined) return value;
+  if (Array.isArray(document)) {
+    return document.map((item, i) => (i === step ? replaceAt(item, rest, value) : item));
+  }
+  const object = document as Record<string, unknown>;
+  return { ...object, [step]: replaceAt(object[step], rest, value) };
+}
+
 /**
- * `answer` must fall under the pass mark because the key's assertion on `path` fails: the answer
- * fits the schema, so a reason that starts with `path` is the key refusing it.
+ * Other values for `value`, one change each, the likeliest first: the next number, the other
+ * boolean, a date for a null (a deadline the notes do not give), or the string with one digit or
+ * letter changed, from the last one back. A schema's patterns and formats let some of these
+ * through and not others, so the caller tries them in turn.
  */
-async function expectKeyRefuses(slug: string, answer: unknown, path: string): Promise<void> {
-  const { criteria, heldout } = load(slug);
-  const bytes = new TextEncoder().encode(JSON.stringify(answer));
-  const result = await scoreAnswer(criteria, heldout, bytes);
-  const why = result.reasons.join("; ");
-  expect(result.score, why).toBeLessThan(criteria.min_score);
-  expect(
-    result.reasons.some((reason) => reason.startsWith(`${path} `)),
-    `no reason for ${path}: ${why}`,
-  ).toBe(true);
+function otherValues(value: unknown): unknown[] {
+  if (typeof value === "number") return [value + 1, value - 1];
+  if (typeof value === "boolean") return [!value];
+  if (value === null) return ["2026-01-01", "x"];
+  if (typeof value !== "string")
+    throw new Error(`no other value to try for ${JSON.stringify(value)}`);
+  const chars = [...value];
+  const alphabets = ["0123456789", "abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"];
+  return chars
+    .map((char, i) =>
+      [...(alphabets.find((alphabet) => alphabet.includes(char)) ?? "")]
+        .filter((other) => other !== char)
+        .map((other) => [...chars.slice(0, i), other, ...chars.slice(i + 1)].join("")),
+    )
+    .reverse()
+    .flat();
+}
+
+/** Whether `reason` says that an assertion on the value at `at`, or on one that holds it, failed. */
+function refusesValueAt(reason: string, at: string): boolean {
+  const asserted = /^(\$\S*) expected /.exec(reason)?.[1];
+  return (
+    asserted !== undefined &&
+    (at === asserted || at.startsWith(`${asserted}.`) || at.startsWith(`${asserted}[`))
+  );
+}
+
+/**
+ * Whether the key notices a wrong value at `steps` of the solution. Other values are tried in turn
+ * until the schema lets one through, and then either an assertion on that value refuses the answer
+ * (the key checks it) or the answer is paid (it does not).
+ */
+function keyChecksValueAt(
+  criteria: Parameters<typeof scoreJsonSchema>[0],
+  key: Parameters<typeof scoreJsonSchema>[1],
+  solution: unknown,
+  steps: Step[],
+  value: unknown,
+): boolean {
+  const at = pathOf(steps);
+  for (const other of otherValues(value)) {
+    const bytes = new TextEncoder().encode(JSON.stringify(replaceAt(solution, steps, other)));
+    const result = scoreJsonSchema(criteria, key, bytes);
+    if (result.score >= criteria.min_score) return false;
+    if (result.reasons.some((reason) => refusesValueAt(reason, at))) return true;
+  }
+  throw new Error(`no other value for ${at} fits the schema, so the key was not tried on it`);
 }
 
 test("the_ten_p0_seeds_are_all_there", () => {
@@ -405,28 +493,37 @@ test("meeting_actions_extract_fixes_the_action_count", async () => {
   });
 });
 
-/** One wrong value for each of the four fields of the invoice's first line. */
-const MISREAD_FIRST_LINES: [field: string, wrong: string | number][] = [
-  ["description", "Pallet wrap"],
-  ["quantity", 21],
-  ["unit_price", 228],
-  ["amount", 19],
-];
+describe.each(JSON_SCHEMA_SLUGS)("json_schema seed %s", (slug) => {
+  test("every_value_of_the_solution_is_checked_by_the_key", () => {
+    // A value that the key does not look at can be wrong and still be paid in full, and a judge
+    // reading the scorecard sees a wrong answer rewarded. So each value of the solution, changed to
+    // another that the schema accepts, has to cost the reward, unless UNCHECKED_VALUES says why not.
+    const { criteria, heldout, solution } = load(slug);
+    if (criteria.kind !== "json_schema" || !("json_schema" in heldout)) {
+      throw new Error(`${slug} is not a json_schema seed`);
+    }
+    const answer: unknown = JSON.parse(utf8(solution));
+    const excuses = UNCHECKED_VALUES[slug] ?? [];
 
-test.each(MISREAD_FIRST_LINES)("invoice_extract_checks_the_first_line_%s", async (field, wrong) => {
-  // The key did not look at line_items[0], so a solver that misread the first line was still paid
-  // in full. It asserts the whole item now, and each of the four values counts.
-  const answer = JSON.parse(utf8(load("invoice-extract").solution)) as {
-    line_items: Record<string, unknown>[];
-  };
-  const [first, ...rest] = answer.line_items;
-  const misread = { ...answer, line_items: [{ ...first, [field]: wrong }, ...rest] };
-  await expectKeyRefuses("invoice-extract", misread, "$.line_items[0]");
-});
+    const values = leavesOf(answer).map(({ steps, value }) => ({
+      at: pathOf(steps),
+      checked: keyChecksValueAt(criteria, heldout.json_schema, answer, steps, value),
+    }));
+    const excused = (at: string) => excuses.some(({ match }) => match.test(at));
 
-test("invoice_extract_checks_its_customer", async () => {
-  // The customer is the company that is billed. The key did not assert it, so a solver that put the
-  // vendor there (the other company on the page) was still paid in full.
-  const answer = JSON.parse(utf8(load("invoice-extract").solution)) as { vendor: string };
-  await expectKeyRefuses("invoice-extract", { ...answer, customer: answer.vendor }, "$.customer");
+    expect(
+      values.filter(({ at, checked }) => !checked && !excused(at)).map(({ at }) => at),
+      "values that can be wrong in an answer that is paid in full",
+    ).toEqual([]);
+    expect(
+      values.filter(({ at, checked }) => checked && excused(at)).map(({ at }) => at),
+      "values the key checks after all, which UNCHECKED_VALUES excuses for nothing",
+    ).toEqual([]);
+    expect(
+      excuses
+        .filter(({ match }) => !values.some(({ at }) => match.test(at)))
+        .map(({ match }) => String(match)),
+      "excuses in UNCHECKED_VALUES that match no value of the solution",
+    ).toEqual([]);
+  });
 });
