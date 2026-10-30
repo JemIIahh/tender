@@ -16,6 +16,7 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { validator } from "hono/validator";
 import { afterAll, beforeAll, beforeEach, expect, test } from "vitest";
+import { z } from "zod";
 import { handleError } from "../src/format";
 import {
   type AgentDetailResponse,
@@ -24,6 +25,7 @@ import {
   type ErrorBody,
   type TaskDetailResponse,
 } from "../src/index";
+import { publicDocument } from "../src/queries";
 import { type AuthVariables, blobRoutes, type RequireAuth } from "../src/routes/blobs";
 import { resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 
@@ -1237,6 +1239,63 @@ test("scorecard_route_hides_a_private_scorecard", async () => {
   await apply(taskLine(4), eventLine("picked", { task_id: "4", scorecard_hash: asResult }));
   expect((await get("/v1/scorecards/4", app)).status).toBe(404);
   expect((await getBlob(deps.db, hash))?.isPublic).toBe(true);
+});
+
+test("public_document_is_returned_as_parsed_from_its_bytes", async () => {
+  // A schema that builds a new object cannot keep an own `__proto__` key, and a document that lost
+  // a key no longer hashes to the bytes that were stored. `z.record` is such a schema.
+  const copying = z.record(z.string(), z.unknown());
+  const text = '{"__proto__":{"seen":true},"b":2}';
+  expect(Object.hasOwn(copying.parse(JSON.parse(text)), "__proto__")).toBe(false);
+
+  const hash = await putBlob(deps.db, {
+    kind: "scorecard",
+    contentType: "application/json",
+    bytes: utf8(text),
+    isPublic: true,
+  });
+  const document = await publicDocument(deps.db, hash, "scorecard", copying);
+  expect(document).not.toBeNull();
+  expect(Object.hasOwn(document ?? {}, "__proto__")).toBe(true);
+  expect(sha256Hex(canonicalJson(document))).toBe(hash);
+
+  // The schema still decides whether it is returned at all, and so do the kind and the visibility.
+  expect(await publicDocument(deps.db, hash, "scorecard", z.array(z.unknown()))).toBeNull();
+  expect(await publicDocument(deps.db, hash, "brief", copying)).toBeNull();
+  await setBlobPublic(deps.db, hash, false);
+  expect(await publicDocument(deps.db, hash, "scorecard", copying)).toBeNull();
+});
+
+test("scorecard_with_proto_key_is_never_served_with_the_key_missing", async () => {
+  await seedLifecycle(deps.db);
+  // `JSON.parse` makes `__proto__` an own key, which an object literal or an assignment would not.
+  const heldout: unknown = JSON.parse('{"exact":{"expected":["42"]},"__proto__":{"seen":true}}');
+  expect(Object.keys(heldout as object)).toContain("__proto__");
+  const bytes = canonicalJson(
+    scorecardOf("3", { heldout, heldout_commitment: sha256Hex(canonicalJson(heldout)) }),
+  );
+  const hash = await putBlob(deps.db, {
+    kind: "scorecard",
+    contentType: "application/json",
+    bytes,
+    uploader: judge,
+    isPublic: true,
+  });
+  await apply(taskLine(3), eventLine("picked", { task_id: "3", scorecard_hash: hash }));
+  const app = createApp(deps);
+
+  // `JsonValueSchema` refuses an own `__proto__` key (packages/shared/src/criteria.ts), so the
+  // scorecard is not served at all, which is better than served without the key and with bytes that
+  // no longer hash to `scorecard_hash`. If that rule is lifted, this is the round trip: a 200 whose
+  // bytes are the stored ones.
+  const res = await get("/v1/scorecards/3", app);
+  expect(res.status).toBe(404);
+  expect(res.headers.get("cache-control")).toBe("no-store");
+
+  // The blob route sends the stored bytes whole: it hands out bytes and reads no document.
+  const blob = await get(`/v1/blobs/${hash}`, app);
+  expect(blob.bytes).toEqual(bytes);
+  expect(sha256Hex(blob.bytes)).toBe(hash);
 });
 
 test("a_hash_that_is_not_64_lowercase_hex_is_404", async () => {

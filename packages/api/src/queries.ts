@@ -265,8 +265,13 @@ async function scorecardOf(db: Db, taskId: string, hash: string | null): Promise
  * `schema`; otherwise null. A hash on chain is whatever the poster or the verifier wrote, so it
  * can name any blob in the store, a held-out document that is still private among them. Kind and
  * visibility are conditions of the query, so a blob that does not qualify is never read at all.
+ *
+ * `schema` decides only whether the document is returned. What is returned is the document as
+ * `JSON.parse` made it, not the copy that `schema` builds: a schema that creates a new object
+ * cannot keep an own `__proto__` key (it would set the prototype, or be skipped), and a document
+ * that lost a key no longer hashes to the bytes that were stored.
  */
-async function publicDocument<T>(
+export async function publicDocument<T>(
   db: Db,
   sha256: string,
   kind: BlobKind,
@@ -283,8 +288,7 @@ async function publicDocument<T>(
   } catch {
     return null;
   }
-  const parsed = schema.safeParse(json);
-  return parsed.success ? parsed.data : null;
+  return schema.safeParse(json).success ? (json as T) : null;
 }
 
 // ---- Agents -----------------------------------------------------------------------------------
