@@ -617,8 +617,11 @@ describe.each(JSON_SCHEMA_SLUGS)("json_schema seed %s", (slug) => {
 /**
  * Regexes a careless solver would write for the regex seeds, each breaking one rule of its brief.
  * The Judge scores a regex seed on its held-out cases alone (P05-R4), so a rule that no held-out
- * case tests pays every regex that breaks it. None of these may reach the pass mark.
+ * case tests pays every regex that breaks it. None of these may reach the pass mark, and each must
+ * still score at least `NEAR_MISS_SCORE`: a regex that stops compiling (0), turns into "^$" (about
+ * 50) or into some other wrong regex is not paid either, and then it tests nothing.
  */
+const NEAR_MISS_SCORE = 90;
 const KNOWN_WRONG_REGEXES: Record<string, { why: string; pattern: string }[]> = {
   "iso-date-regex": [
     {
@@ -694,6 +697,14 @@ const KNOWN_WRONG_REGEXES: Record<string, { why: string; pattern: string }[]> = 
       why: "[redacted]",
       pattern: "[redacted]",
     },
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+    },
   ],
 };
 
@@ -702,10 +713,14 @@ describe.each(Object.keys(KNOWN_WRONG_REGEXES))("regex seed %s", (slug) => {
     const { criteria, heldout } = load(slug);
 
     const paid: string[] = [];
+    const broken: string[] = [];
     for (const { why, pattern } of KNOWN_WRONG_REGEXES[slug] ?? []) {
       const answer = new TextEncoder().encode(JSON.stringify({ pattern, flags: "" }));
-      if ((await scoreAnswer(criteria, heldout, answer)).passed) paid.push(why);
+      const result = await scoreAnswer(criteria, heldout, answer);
+      if (result.passed) paid.push(why);
+      if (result.score < NEAR_MISS_SCORE) broken.push(`${why} (scores ${result.score})`);
     }
     expect(paid, "wrong regexes that the held-out cases pay in full").toEqual([]);
+    expect(broken, "known-wrong regexes that are no longer near-misses").toEqual([]);
   });
 });
