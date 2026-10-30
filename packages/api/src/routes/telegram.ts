@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { Hono } from "hono";
 import type { ApiDeps } from "../deps";
 import { fail } from "../format";
+import { rateLimit, rateLimitsOf } from "../limits";
 import type { AuthVariables, RequireAuth } from "./blobs";
 
 /** `POST /v1/telegram/link`. `expires_at` is ISO 8601 in UTC to the millisecond. */
@@ -25,20 +26,28 @@ const NOT_CACHED = { "Cache-Control": "no-store" };
  * account. The person opens it, Telegram starts the bot with the nonce, and the bot spends the
  * nonce (`linkWithNonce` in `@tender/telegram`) and links the chat to the account it was made for.
  * Without `deps.telegramBotUsername` there is no bot to link to: the answer is a 503, and nothing
- * is written.
+ * is written. It carries no `Retry-After`: that is a setting, and asking again changes nothing.
  *
  * A link is good for 10 minutes. The time is the database's own, not `deps.now`: the bot spends a
  * nonce only while `expires_at > now()`, so the one clock that writes the expiry is the one that
  * reads it, and the `expires_at` that is answered is the stored one. The same transaction deletes
  * the nonces that expired more than an hour ago, so the table does not grow with the calls.
+ *
+ * An account gets 10 links in 10 minutes unless `deps.rateLimits` says otherwise; past that the
+ * answer is a 429 (`rate_limited`) with `Retry-After`, and no nonce is made.
  */
 export function telegramRoutes(
   deps: ApiDeps,
   requireAuth: RequireAuth,
 ): Hono<{ Variables: AuthVariables }> {
   const app = new Hono<{ Variables: AuthVariables }>();
+  // After sign-in, which is what says whose request it is.
+  const perAccount = rateLimit<{ Variables: AuthVariables }>(
+    rateLimitsOf(deps.rateLimits).telegramLink,
+    (c) => c.var.account,
+  );
 
-  app.post("/telegram/link", requireAuth, async (c) => {
+  app.post("/telegram/link", requireAuth, perAccount, async (c) => {
     const bot = deps.telegramBotUsername;
     if (!bot) return fail(503, "unavailable", "Telegram linking is not set up");
 

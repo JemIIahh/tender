@@ -10,7 +10,8 @@ import {
 import { sha256Hex } from "@tender/shared";
 import type { Context } from "hono";
 import { type ApiDeps, nowNs } from "./deps";
-import { type ErrorBody, fail } from "./format";
+import type { ErrorBody } from "./format";
+import { unavailableForNow } from "./limits";
 import type { RequireAuth } from "./routes/blobs";
 
 // NEP-413 sign-in. A user or an agent asks for a challenge, signs it with an access key of its
@@ -27,8 +28,9 @@ import type { RequireAuth } from "./routes/blobs";
 // its tokens with it, within a minute, and not at the end of their 12 hours.
 //
 // Each question to the chain has 5 seconds. A chain that does not answer in time, or whose call
-// fails, is a 503 for the caller to try again later, at sign-in and at the check of a token alike,
-// and not a request that waits for the RPC client to give up on its own, which takes minutes.
+// fails, is a 503 with `Retry-After: 5` for the caller to try again later, at sign-in and at the
+// check of a token alike, and not a request that waits for the RPC client to give up on its own,
+// which takes minutes.
 
 /** What the wallet signs, and for whom. The wallet shows both to its user before it signs. */
 const SIGN_IN_MESSAGE = "Sign in to Tender";
@@ -178,9 +180,12 @@ function logLookupFailure(whose: string, error: unknown): void {
   console.error(`api: cannot check the key of ${whose} (${kind})`);
 }
 
-/** The answer to a request that needs the chain to say something about a key, and it cannot. */
+/**
+ * The answer to a request that needs the chain to say something about a key, and it cannot: a 503
+ * that says to try again in 5 seconds.
+ */
 function unavailable(): never {
-  return fail(503, "unavailable", "cannot check your key right now");
+  return unavailableForNow("cannot check your key right now");
 }
 
 /**

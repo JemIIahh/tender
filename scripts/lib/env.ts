@@ -21,7 +21,7 @@ export function parseEnvText(text: string): Record<string, string> {
 }
 
 /** The variables of a dotenv file; none if the file does not exist. */
-function readEnvFile(path: string): Record<string, string> {
+export function readEnvFile(path: string): Record<string, string> {
   let text: string;
   try {
     text = readFileSync(path, "utf8");

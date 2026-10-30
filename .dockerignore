@@ -1,0 +1,14 @@
+# What the services image is built without. Secrets first: env files, wherever they are, and the
+# MCP server's state.
+.env*
+**/.env*
+.tender
+# Installed or built on the machine, and made again in the image.
+node_modules
+**/node_modules
+contract/target
+apps/web/.next
+# Local data and the working records of the repository.
+.data
+.git
+.superpowers
