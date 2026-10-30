@@ -32,7 +32,7 @@ export type DocumentsCheck =
   | { ok: true; documents: TaskDocuments }
   | { ok: false; status: "pending" | "rejected"; reason: string };
 
-/** What a task's documents are checked against. A `TaskView` has these, and so does a `tasks` row. */
+/** What a task's documents are checked against: fields of a `TaskView`, and of a `tasks` row. */
 type TaskTerms = Pick<TaskView, "poster" | "criteria_hash" | "heldout_commitment" | "created_at">;
 
 /** The most bytes a criteria or held-out document may have: what the blob store takes at once. */

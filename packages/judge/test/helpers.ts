@@ -65,9 +65,18 @@ export async function testDb(): Promise<Db> {
   return db;
 }
 
+/**
+ * The result uploads the API has recorded (P03-R17), as `sha256 task account`. `putResult` adds
+ * to them, and the `resultUploaded` of `judgeDeps` reads them.
+ */
+const uploads = new Set<string>();
+const upload = (sha256: string, taskId: bigint, account: string) =>
+  `${sha256} ${taskId} ${account}`;
+
 /** Empties the two tables the Judge works with, so one database can serve a whole test file. */
 export async function resetDb(db: Db): Promise<void> {
   await db.exec("truncate tasks, blobs");
+  uploads.clear();
 }
 
 /** Stores `view` as the indexer would have, with the Judge's `judge_status` already `status`. */
@@ -145,15 +154,26 @@ export function putHeldout(db: Db, heldout: unknown, uploader = POSTER): Promise
   });
 }
 
-/** Stores an entry's answer as `POST /v1/blobs` kind `result` does: private until served. */
-export function putResult(db: Db, text: string, uploader: string): Promise<string> {
-  return putBlob(db, {
+/**
+ * Stores an entry's answer as `POST /v1/blobs` kind `result` does: private until served, and
+ * recorded as `uploader`'s upload for task `taskId`. Identical answers share one blob, and each
+ * uploader has a record of its own.
+ */
+export async function putResult(
+  db: Db,
+  text: string,
+  uploader: string,
+  taskId = 7n,
+): Promise<string> {
+  const sha256 = await putBlob(db, {
     kind: "result",
     contentType: "text/plain",
     bytes: new TextEncoder().encode(text),
     uploader,
     isPublic: false,
   });
+  uploads.add(upload(sha256, taskId, uploader));
+  return sha256;
 }
 
 /** Whether the blob stored under `sha256` is public. */
@@ -211,7 +231,10 @@ export const NO_NETWORK: FetchIo = {
   },
 };
 
-/** The deps of a test Judge: `JUDGE` at `NOW`, with `TEAM_POSTER` on the team and no network. */
+/**
+ * The deps of a test Judge: `JUDGE` at `NOW`, with `TEAM_POSTER` on the team, the result uploads
+ * that `putResult` recorded, and no network.
+ */
 export function judgeDeps(db: Db, client: JudgeChain, over: Partial<JudgeDeps> = {}): JudgeDeps {
   return {
     db,
@@ -219,6 +242,7 @@ export function judgeDeps(db: Db, client: JudgeChain, over: Partial<JudgeDeps> =
     judgeAccount: JUDGE,
     teamAccounts: [TEAM_POSTER],
     publicUrl: PUBLIC_URL,
+    resultUploaded: async (sha256, taskId, account) => uploads.has(upload(sha256, taskId, account)),
     now: () => NOW,
     fetchIo: NO_NETWORK,
     ...over,

@@ -62,7 +62,7 @@ export async function fetchEntryContent(
  * The hash in `uri` when it is one of our own blob URIs; `null` when it is under our blob path
  * but names no hash; `undefined` when it is not ours.
  */
-function ownBlobHash(publicUrl: string, uri: string): string | null | undefined {
+export function ownBlobHash(publicUrl: string, uri: string): string | null | undefined {
   const prefix = `${publicUrl.replace(/\/+$/, "")}/v1/blobs/`;
   if (!uri.startsWith(prefix)) return undefined;
   const sha256 = uri.slice(prefix.length);

@@ -58,6 +58,14 @@ export interface JudgeDeps {
   teamAccounts: string[];
   /** The base URL the API is served at. Blob URIs under it are read from `db`. */
   publicUrl: string;
+  /**
+   * Whether `account` uploaded the bytes that hash to `sha256` as its result for task `taskId`
+   * (P03-R17). One of our own blob URIs counts as an entry's content only when this is true: a
+   * hash is on chain for anyone to name once it is revealed, and a result the entrant did not
+   * upload is someone else's work, private until its own task's reveals close. It throws when it
+   * cannot tell, and the task is judged again on a later tick.
+   */
+  resultUploaded(sha256: string, taskId: bigint, account: string): Promise<boolean>;
   /** The model that scores `rubric` tasks, from P1 on. */
   llm?: { baseUrl: string; apiKey: string; model: string; headers?: Record<string, string> };
   /** The clock. Defaults to the wall clock. */

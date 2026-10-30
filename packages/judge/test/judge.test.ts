@@ -256,7 +256,7 @@ test("mismatched_or_missing_content_scores_zero", async () => {
   const extra = [
     // Reveals the hash of other bytes than its URI serves.
     entry("mismatch.test.near", sha256Hex("forty-two"), blobUri(stored), 1n),
-    // Points at a blob that nobody stored.
+    // Points at a blob that nobody stored, so nobody uploaded it either.
     entry("missing.test.near", sha256Hex("42 "), blobUri(sha256Hex("42 ")), 2n),
     // A server that answers 404, with words of its own that the reason does not repeat.
     entry("gone.test.near", sha256Hex("42"), "http://files.example/gone", 3n),
@@ -280,14 +280,64 @@ test("mismatched_or_missing_content_scores_zero", async () => {
   expect(card.winners).toEqual([{ account: "honest.test.near", bps: 10_000 }]);
   expect(card.scorecard.entries.map((e) => [e.account, e.score, e.passed, e.reasons])).toEqual([
     ["mismatch.test.near", 0, false, ["content hash mismatch"]],
-    ["missing.test.near", 0, false, ["content unavailable: not found"]],
+    ["missing.test.near", 0, false, ["content unavailable: not uploaded by the entrant"]],
     ["gone.test.near", 0, false, ["content unavailable: http status 404"]],
     ["down.test.near", 0, false, ["content unavailable: fetch failed"]],
-    ["peek.test.near", 0, false, ["content unavailable: not found"]],
+    ["peek.test.near", 0, false, ["content unavailable: not uploaded by the entrant"]],
     ["honest.test.near", 0, true, ["expected one of 2 accepted answers"]],
   ]);
   // Those checks are still private: judging this task publishes its own held-out checks only.
   expect(await isPublic(db, othersHeldout)).toBe(false);
+});
+
+test("our_blob_uris_count_only_with_the_entrants_upload", async () => {
+  // Alice uploaded her answer for this task and revealed it, so its hash is on chain. Mallory never
+  // had the bytes: she reveals alice's hash and our URI. Bob uploaded his answer, but for another
+  // task. Both come first on the tie-break, and neither may win with bytes that are not theirs.
+  const bobs = await putResult(db, "forty-two", "bob.test.near", 8n);
+  const extra = [
+    entry("mallory.test.near", sha256Hex("42"), blobUri(sha256Hex("42")), 10n),
+    entry("bob.test.near", bobs, blobUri(bobs), 11n),
+    // Content on another host is not in our store, and has no upload to look for.
+    entry("carol.test.near", sha256Hex("42"), "http://files.example/42", 13n),
+  ];
+  const { chain } = await postJudged([["alice.test.near", "42", 12n]], { extra });
+  const { io } = fakeNetwork({ "files.example": [PUBLIC_IP] }, { "files.example/42": ok("42") });
+  const deps = judgeDeps(db, chain, { fetchIo: io });
+  const resultUploaded = vi.spyOn(deps, "resultUploaded");
+
+  expect(await judgeTask(deps, 7n)).toBe("picked");
+
+  const card = await picked(chain);
+  expect(card.winners).toEqual([
+    { account: "alice.test.near", bps: 7000 },
+    { account: "carol.test.near", bps: 3000 },
+  ]);
+  expect(card.scorecard.entries.map((e) => [e.account, e.passed, e.reasons])).toEqual([
+    ["alice.test.near", true, []],
+    ["carol.test.near", true, []],
+    ["mallory.test.near", false, ["content unavailable: not uploaded by the entrant"]],
+    ["bob.test.near", false, ["content unavailable: not uploaded by the entrant"]],
+  ]);
+  expect(resultUploaded.mock.calls).toEqual(
+    expect.arrayContaining([
+      [sha256Hex("42"), 7n, "alice.test.near"],
+      [sha256Hex("42"), 7n, "mallory.test.near"],
+      [bobs, 7n, "bob.test.near"],
+    ]),
+  );
+  expect(resultUploaded).toHaveBeenCalledTimes(3);
+
+  // When the records cannot be read, nothing is judged on a guess: the error goes to the loop. (The
+  // fake chain still shows the task unsettled.)
+  const unreadable = judgeDeps(db, chain, {
+    fetchIo: io,
+    resultUploaded: async () => {
+      throw new Error("connection terminated");
+    },
+  });
+  await expect(judgeTask(unreadable, 7n)).rejects.toThrow("connection terminated");
+  expect(chain.pick).toHaveBeenCalledTimes(1);
 });
 
 test("judge_is_idempotent_after_settlement", async () => {
@@ -828,7 +878,7 @@ test("judge_tick_takes_a_task_from_intake_to_pick", async () => {
 test("judge_tick_goes_on_after_a_task_fails", async () => {
   const criteriaHash = await putCriteria(db, EXACT);
   const commitment = await putHeldout(db, HELDOUT);
-  const sha = await putResult(db, "42", "alice.test.near");
+  const sha = await putResult(db, "42", "alice.test.near", 8n);
   const views = ["7", "8"].map((id) =>
     taskView({ id, criteria_hash: criteriaHash, heldout_commitment: commitment }),
   );
@@ -859,7 +909,9 @@ test("judge_tick_goes_on_after_a_task_fails", async () => {
   await judgeTick(judgeDeps(db, chain));
 
   expect(error).toHaveBeenCalledWith(expect.stringMatching(/^judge: judging task 7 failed/));
-  expect(pick.mock.calls.map(([taskId]) => taskId)).toEqual([8n]);
+  expect(pick.mock.calls.map(([taskId, winners]) => [taskId, winners])).toEqual([
+    [8n, [{ account: "alice.test.near", bps: 10_000 }]],
+  ]);
 });
 
 /**

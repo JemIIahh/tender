@@ -1,6 +1,6 @@
 import { putBlob, setBlobPublic } from "@tender/db";
 import { type EntryView, type Heldout, phaseOfTaskView, sha256Hex } from "@tender/shared";
-import { fetchEntryContent } from "./fetch";
+import { fetchEntryContent, ownBlobHash } from "./fetch";
 import { loadDocuments, type P0Criteria } from "./intake";
 import type { HeldoutOf } from "./kinds/common";
 import { scoreExact } from "./kinds/exact";
@@ -36,14 +36,16 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  * final block the chain answered from, which is after every reveal that can land.
  *
  * Each revealed entry's content is fetched (`fetchEntryContent`) and must hash to the entry's
- * `content_hash`. One that cannot be fetched (`content unavailable: …`) or that does not match
- * (`content hash mismatch`) scores 0 and never passes, whatever the pass mark, so it cannot be
- * paid. The rest are scored by `scoreEntry`; a scorer that throws scores that entry 0 (`scoring
- * failed`). Then the entries are ranked, the winners chosen, and the scorecard built from exactly
- * the winners `pick` is sent. The scorecard is stored as a public blob, the held-out checks are
- * made public, and `pick` is called with the scorecard's hash and URI, in that order, so that the
- * pick never points at something that cannot be read. A retry stores the same scorecard again
- * unless the clock moved: its bytes depend on the entries and `generated_at` only.
+ * `content_hash`; one of our own blob URIs counts only when `deps.resultUploaded` says the entrant
+ * uploaded it for this task. One that cannot be fetched or does not count (`content unavailable:
+ * …`), or that does not match (`content hash mismatch`), scores 0 and never passes, whatever the
+ * pass mark, so it cannot be paid. The rest are scored by `scoreEntry`; a scorer that throws
+ * scores that entry 0 (`scoring failed`). Then the entries are ranked, the winners chosen, and the
+ * scorecard built from exactly the winners `pick` is sent. The scorecard is stored as a public
+ * blob, the held-out checks are made public, and `pick` is called with the scorecard's hash and
+ * URI, in that order, so that the pick never points at something that cannot be read. A retry
+ * stores the same scorecard again unless the clock moved: its bytes depend on the entries and
+ * `generated_at` only.
  *
  * Database and chain read errors are thrown, for the loop to log; nothing is settled.
  */
@@ -78,7 +80,7 @@ export async function judgeTask(
   const revealed = (await deps.client.getAllEntries(taskId)).filter(isRevealed);
   const fetched = await inParallel(revealed, FETCHES_AT_ONCE, async (entry) => ({
     entry,
-    content: await contentOf(deps, entry),
+    content: await contentOf(deps, taskId, entry),
   }));
   const scored: ScoredEntry[] = [];
   // One entry at a time: the regex sandbox runs on this thread.
@@ -218,8 +220,18 @@ async function scoreContent(
   }
 }
 
-/** The bytes that `entry` revealed, or the reason the Judge has none it can score. */
-async function contentOf(deps: JudgeDeps, entry: RevealedEntry): Promise<Uint8Array | string> {
+/** The bytes that `entry` of task `taskId` revealed, or the reason the Judge has none to score. */
+async function contentOf(
+  deps: JudgeDeps,
+  taskId: bigint,
+  entry: RevealedEntry,
+): Promise<Uint8Array | string> {
+  // Our own store keeps results private until their task's reveals close. Naming a hash that is
+  // in it does not make the result yours: only one the entrant uploaded for this task counts.
+  const own = ownBlobHash(deps.publicUrl, entry.uri);
+  if (typeof own === "string" && !(await deps.resultUploaded(own, taskId, entry.account))) {
+    return "content unavailable: not uploaded by the entrant";
+  }
   const fetched = await fetchEntryContent(deps, entry.uri);
   if ("error" in fetched) return `content unavailable: ${fetched.error}`;
   // The hash of the exact bytes fetched, never of anything parsed from them.
