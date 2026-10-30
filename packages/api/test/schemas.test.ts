@@ -8,6 +8,7 @@ import {
   FIXTURE_BRIEF,
   FIXTURE_OPTIONS,
 } from "@tender/indexer/testing";
+import type * as Shared from "@tender/shared";
 import {
   AccountEntriesResponseSchema,
   AgentDetailResponseSchema,
@@ -36,9 +37,14 @@ import {
 import type { Hono } from "hono";
 import { Account, KeyPair, KeyPairSigner, type Provider } from "near-api-js";
 import * as nearNep413 from "near-api-js/nep413";
-import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, expectTypeOf, test, vi } from "vitest";
 import type { z } from "zod";
-import { type ApiDeps, createApp, type TaskOutcome } from "../src/index";
+import type { ChallengeResponse, SignInResponse } from "../src/auth";
+import type * as Api from "../src/format";
+import { type ApiDeps, createApp } from "../src/index";
+import type { StartResponse } from "../src/routes/start";
+import type { TelegramLinkResponse } from "../src/routes/telegram";
+import type { EventMessage } from "../src/sse";
 import { fakeClient, resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 
 // The drift test of `@tender/shared`'s API schemas (src/api.ts). The web app, the MCP server and
@@ -248,7 +254,7 @@ async function seedBoard(): Promise<void> {
     fee: "50000",
     scorecard_hash: sha256Hex("a scorecard nobody uploaded"),
     scorecard_uri: "ipfs://scorecard",
-  } satisfies TaskOutcome;
+  } satisfies Api.TaskOutcome;
   const reconciledVoid = {
     kind: "voided",
     task_id: "7",
@@ -257,7 +263,7 @@ async function seedBoard(): Promise<void> {
     reason: "expired",
     scorecard_hash: null,
     scorecard_uri: null,
-  } satisfies TaskOutcome;
+  } satisfies Api.TaskOutcome;
   for (const outcome of [reconciledPick, reconciledVoid]) {
     await deps.db.query("update tasks set outcome = $2::jsonb where id = $1::numeric", [
       outcome.task_id,
@@ -664,4 +670,82 @@ test("error_bodies_match_the_error_body_schema", async () => {
 
   // And the stream turns clients away with the same body when it is full.
   failsWith(await get(appWith({ maxSseStreams: 0 }), "/v1/events"), 503, "unavailable", "full");
+});
+
+// ---- Types ------------------------------------------------------------------------------------
+
+// The routes send the types of `src/format.ts` and of the route modules, and the clients read the
+// same responses as the types of the schemas in `@tender/shared`. Each pair below has to be the
+// same type: each side fits the other, and both have the same keys, since a key that only one side
+// has, and that is optional there, would fit either way. These assertions do nothing when the tests
+// run. `pnpm typecheck` checks them, in this package's own tsconfig (it includes `test`), and
+// fails here when either side drifts. (The 503 body of `GET /v1/health` has no API type: the route
+// builds it in place. It is held to its route by the tests above.)
+
+/** `true` if `A` and `B` fit each other and have the same keys, and otherwise what is wrong. */
+type Pair<A, B> = [A] extends [B]
+  ? [B] extends [A]
+    ? [keyof A] extends [keyof B]
+      ? [keyof B] extends [keyof A]
+        ? true
+        : "a key only the schema's type has"
+      : "a key only the API's type has"
+    : "the schema's type does not fit the API's"
+  : "the API's type does not fit the schema's";
+
+/**
+ * The schemas are wider than the API's types in one place, on purpose: `by_source` is any string
+ * there, so that a source added later does not fail a client that predates it, and the API's type
+ * says "reconcile", the only source there is. `Replace` gives a schema's type with that one key
+ * narrowed, so that all the rest of an outcome is still held to the API's type both ways. It
+ * never adds a key, so a schema that has lost one shows as a key only the API's type has. That
+ * the API's type fits the schema as it is follows, since a narrower type fits a wider one.
+ */
+type Replace<T, Over> = { [K in keyof T]: K extends keyof Over ? Over[K] : T[K] };
+type SchemaOutcome = Replace<Shared.TaskOutcome, { by_source: "reconcile" | undefined }>;
+type SchemaTaskDetail = Replace<Shared.TaskDetail, { outcome: SchemaOutcome | null }>;
+type SchemaTaskDetailResponse = Replace<Shared.TaskDetailResponse, { task: SchemaTaskDetail }>;
+
+/** One kind of outcome. Each has optional keys of its own, which the union's `keyof` hides. */
+type Kind<T, K extends string> = Extract<T, { kind: K }>;
+
+test("api_types_and_schema_types_are_the_same_type_both_ways", () => {
+  // `src/format.ts`.
+  expectTypeOf<Pair<Api.HealthResponse, Shared.HealthResponse>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.TaskSummary, Shared.TaskSummary>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.TaskEntry, Shared.TaskEntry>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.TaskFunder, Shared.TaskFunder>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.ListTasksResponse, Shared.ListTasksResponse>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.AgentSummary, Shared.AgentSummary>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.ListAgentsResponse, Shared.ListAgentsResponse>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.AgentRecentEntry, Shared.AgentRecentEntry>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.AgentDetailResponse, Shared.AgentDetailResponse>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.AccountEntry, Shared.AccountEntry>>().toEqualTypeOf<true>();
+  expectTypeOf<
+    Pair<Api.AccountEntriesResponse, Shared.AccountEntriesResponse>
+  >().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.BlobUploadResponse, Shared.BlobUploadResponse>>().toEqualTypeOf<true>();
+  expectTypeOf<
+    Pair<Api.HeldoutUploadResponse, Shared.HeldoutUploadResponse>
+  >().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.ErrorIssue, Shared.ErrorIssue>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.ErrorBody, Shared.ErrorBody>>().toEqualTypeOf<true>();
+
+  // The types that hold an outcome, with `by_source` narrowed (see `Replace`).
+  expectTypeOf<Pair<Api.TaskOutcome, SchemaOutcome>>().toEqualTypeOf<true>();
+  expectTypeOf<
+    Pair<Kind<Api.TaskOutcome, "picked">, Kind<SchemaOutcome, "picked">>
+  >().toEqualTypeOf<true>();
+  expectTypeOf<
+    Pair<Kind<Api.TaskOutcome, "voided">, Kind<SchemaOutcome, "voided">>
+  >().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.TaskDetail, SchemaTaskDetail>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.TaskDetailResponse, SchemaTaskDetailResponse>>().toEqualTypeOf<true>();
+
+  // The route modules.
+  expectTypeOf<Pair<ChallengeResponse, Shared.ChallengeResponse>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<SignInResponse, Shared.SignInResponse>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<StartResponse, Shared.StartResponse>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<TelegramLinkResponse, Shared.TelegramLink>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<EventMessage, Shared.SseEventData>>().toEqualTypeOf<true>();
 });
