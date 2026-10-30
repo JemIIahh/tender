@@ -453,9 +453,9 @@ test("judge_fails_closed_when_its_criteria_are_gone", async () => {
 });
 
 test("judge_fails_closed_when_its_heldout_checks_were_used_first", async () => {
-  // Intake accepted the task. Then an earlier task with the same held-out commitment reached the
-  // database late, so these checks are not this task's to use: judging fails closed, and does not
-  // publish them.
+  // Intake accepted the task. Then an earlier task of the same poster, with the same held-out
+  // commitment, reached the database late, so these checks are not this task's to use: judging
+  // fails closed, and does not publish them. (`taskView` posts both as `POSTER`.)
   const { view, chain, commitment } = await postJudged([["alice.test.near", "42", 10n]]);
   await insertTask(
     db,

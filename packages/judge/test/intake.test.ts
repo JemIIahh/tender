@@ -415,8 +415,9 @@ test("intake_rejects_heldout_from_non_poster", async () => {
 });
 
 test("intake_rejects_heldout_checks_already_used", async () => {
-  // Judging a task publishes its held-out checks, so a set of checks is good for one task: the
-  // one with the lowest id. Intake of a later task may run first, and it is rejected all the same.
+  // Judging a task publishes its held-out checks, so a set of checks is good for one of its
+  // poster's tasks: the one with the lowest id. Intake of a later task may run first, and it is
+  // rejected all the same. (`taskView` posts every task as `POSTER`.)
   const criteriaHash = await putCriteria(db, EXACT);
   const shared = await putHeldout(db, EXACT_HELDOUT);
   for (const id of ["1", "2", "3"]) {
@@ -450,6 +451,41 @@ test("intake_rejects_heldout_checks_already_used", async () => {
   }
   expect(await intakeTask(deps, 10n)).toBe("rejected");
   expect(await judgeRow(db, 10)).toEqual(usedBy(9));
+});
+
+test("intake_counts_only_the_posters_own_earlier_use", async () => {
+  // A commitment is public once its task is posted, so a stranger can post a task with it first
+  // and take a lower id (P05-R7). The checks under it are not the stranger's upload, so that task
+  // is never judged and never publishes them: it does not use them up.
+  const criteriaHash = await putCriteria(db, EXACT);
+  const commitment = await putHeldout(db, EXACT_HELDOUT);
+  const posted: [string, string][] = [
+    ["1", "stranger.test.near"],
+    ["2", POSTER],
+    ["3", POSTER],
+  ];
+  for (const [id, poster] of posted) {
+    await insertTask(
+      db,
+      taskView({ id, poster, criteria_hash: criteriaHash, heldout_commitment: commitment }),
+    );
+  }
+  const deps = judgeDeps(db, fakeChain(null));
+
+  expect(await intakeTask(deps, 2n)).toBe("accepted");
+  expect(await judgeRow(db, 2)).toEqual({ judge_status: "accepted", judge_reason: null });
+  // The stranger's task fails on whose upload the checks are, as before.
+  expect(await intakeTask(deps, 1n)).toBe("rejected");
+  expect(await judgeRow(db, 1)).toEqual({
+    judge_status: "rejected",
+    judge_reason: "held-out checks were not uploaded by the poster",
+  });
+  // The poster's own reuse is still refused, and names the poster's first task.
+  expect(await intakeTask(deps, 3n)).toBe("rejected");
+  expect(await judgeRow(db, 3)).toEqual({
+    judge_status: "rejected",
+    judge_reason: "held-out checks already used by task 2",
+  });
 });
 
 test("intake_only_judges_its_own_tasks", async () => {

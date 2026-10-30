@@ -42,7 +42,7 @@ type TaskTerms = Pick<
 interface Stored {
   criteria: StoredBlob | null;
   heldout: StoredBlob | null;
-  /** The lowest id of an earlier task that commits to the same held-out checks, or `null`. */
+  /** The lowest id of the poster's earlier tasks with the same held-out commitment, or `null`. */
   earlierUse: string | null;
 }
 
@@ -92,9 +92,12 @@ const CHECK_FAILED = "criteria could not be checked";
  * - `exact` or `json_schema` without held-out checks: `held-out checks required for kind {k}`;
  * - a `json_schema` schema with a reference through a built-in member (see `refersToBuiltIn`), or
  *   one that `checkJsonSchemaUsable` refuses, with its reason;
- * - a `heldout_commitment` that a task with a lower id, of any verifier, commits to as well:
- *   `held-out checks already used by task {id}`, naming the lowest. Held-out checks are
- *   single-use, as judging a task publishes them;
+ * - a `heldout_commitment` that an earlier task of the same poster (a lower id, of any verifier)
+ *   commits to as well: `held-out checks already used by task {id}`, naming the lowest. Held-out
+ *   checks are single-use, as judging a task publishes them. Another poster's task with the same
+ *   commitment does not count (P05-R7): the checks are not its poster's upload, so it is never
+ *   judged and never publishes them, and a stranger who posted one first must not block the
+ *   poster's own;
  * - held-out checks that are stored under the commitment but not as the poster's `heldout` blob,
  *   that are over 262_144 bytes, that do not fit `HeldoutSchema`, that are of another kind than
  *   the criteria, that hold a surrogate half with no partner, or whose bytes are not their
@@ -141,8 +144,8 @@ export async function intakeTask(
 /**
  * Reads the criteria and held-out checks that `task` commits to from the blob store, and checks
  * them as `intakeTask` does. Judging reads them again with this, from the hashes the chain holds,
- * so a task whose held-out checks turn out to be an earlier task's (one the indexer stored late)
- * fails closed instead of being judged with answers that may be out.
+ * so a task whose held-out checks turn out to be used by an earlier task of its poster (one the
+ * indexer stored late) fails closed instead of being judged with answers that may be out.
  *
  * With `waitForHeldout`, held-out checks that are not stored yet make the task `pending` for 10
  * minutes from its `created_at`. Without it they are missing at once. A database error is thrown;
@@ -160,7 +163,7 @@ export async function loadDocuments(
   };
   if (task.heldout_commitment !== null) {
     stored.heldout = await getBlob(db, task.heldout_commitment);
-    stored.earlierUse = await earlierUseOf(db, task.heldout_commitment, task.id);
+    stored.earlierUse = await earlierUseOf(db, task.heldout_commitment, task.id, task.poster);
   }
   try {
     return checkDocuments(task, stored, policy);
@@ -170,12 +173,22 @@ export async function loadDocuments(
   }
 }
 
-/** The lowest id of a task before task `id`, of any verifier, that commits to `commitment`. */
-async function earlierUseOf(db: Db, commitment: string, id: string): Promise<string | null> {
+/**
+ * The lowest id of a task before task `id` that `poster` posted, of any verifier, and that commits
+ * to `commitment`, or `null`. Only the poster's own tasks count (P05-R7): once a commitment is on
+ * chain anyone can post a task with it, and that task can never publish the checks.
+ */
+async function earlierUseOf(
+  db: Db,
+  commitment: string,
+  id: string,
+  poster: string,
+): Promise<string | null> {
   // Ids are numeric: `min` and `<` compare them as numbers, and only the result is text.
   const [row] = await db.query<{ id: string | null }>(
-    "select min(id)::text as id from tasks where heldout_commitment = $1 and id < $2",
-    [commitment, BigInt(id)],
+    `select min(id)::text as id from tasks
+      where heldout_commitment = $1 and id < $2 and poster = $3`,
+    [commitment, BigInt(id), poster],
   );
   return row?.id ?? null;
 }
@@ -212,8 +225,9 @@ function checkDocuments(
   }
   if (task.heldout_commitment === null) return { ok: true, documents: { criteria, heldout: null } };
 
-  // Held-out checks are single-use. The Judge publishes them when it judges the first task that
-  // commits to them, so a later task with the same commitment has its answers out, or will.
+  // Held-out checks are single-use. The Judge publishes them when it judges the first of the
+  // poster's tasks that commits to them, so a later one with the same commitment has its answers
+  // out, or will. A stranger's task that took the commitment first cannot publish them.
   if (stored.earlierUse !== null) {
     return rejected(`held-out checks already used by task ${stored.earlierUse}`);
   }
