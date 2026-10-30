@@ -10,7 +10,10 @@ export interface NeardataOptions {
   concurrency?: number;
   /** Milliseconds to wait, once caught up, before asking for a newer final block. Default 1000. */
   pollMs?: number;
-  /** For tests. Default: the global `fetch`. */
+  /**
+   * For tests. Default: the global `fetch`. A replacement must follow redirects, and drop
+   * `Authorization` from one that leads to another origin, as WHATWG fetch does.
+   */
   fetchImpl?: typeof fetch;
   /** Told about every failed request, just before it is tried again. */
   log?: (message: string) => void;
@@ -38,10 +41,16 @@ type Stopped = typeof STOPPED;
  * yielded up to the final height it asks for it again: if that shows nothing new it waits `pollMs`
  * and asks once more, and so on until a newer block is final.
  *
- * A block is left out only when neardata says there is none at that height (see `blockAt`). Every
- * other failure is retried, after a wait of 0.5, 1, 2, 4, 8, 8... s, for as long as `signal` has
- * not aborted: an HTTP error of any status, a network error, no answer in 10 s, an answer that is
- * not a block or not the block asked for. Not getting a block shows as lag, never as a gap.
+ * A block is left out only when neardata says there is none at that height (see `blockAt`) and the
+ * chain agrees. Every block names its parent (`prev_height`), so a block whose parent was left out
+ * shows that this was wrong, as when a server that is behind answers `null` for a height that
+ * exists. The parent is then asked for again, waiting and retrying until neardata has it, and is
+ * yielded before the block that named it. A height wrongly left out at the end of what neardata has
+ * so far is found when the block after it comes: late, never lost.
+ *
+ * Every other failure is retried, after a wait of 0.5, 1, 2, 4, 8, 8... s, for as long as `signal`
+ * has not aborted: an HTTP error of any status, a network error, no answer in 10 s, an answer that
+ * is not a block or not the block asked for. Not getting a block shows as lag, never as a gap.
  *
  * When `signal` aborts, the iteration ends (it does not throw) and the requests in flight are
  * cancelled. They are too when the caller leaves its loop early.
@@ -116,8 +125,41 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
   const fetchFinalHeight = (stop: AbortSignal) =>
     fetchUntilRead(`${baseUrl}/v0/last_block/final`, stop, finalHeightOf);
 
+  const blockUrl = (height: bigint) => `${baseUrl}/v0/block/${height}`;
+
   const fetchBlock = (height: bigint, stop: AbortSignal) =>
-    fetchUntilRead(`${baseUrl}/v0/block/${height}`, stop, (json) => blockAt(height, json));
+    fetchUntilRead(blockUrl(height), stop, (json) => blockAt(height, json));
+
+  /** The block at a height that has one; asked for again while neardata says it has none. */
+  const fetchExistingBlock = (height: bigint, stop: AbortSignal) =>
+    fetchUntilRead(blockUrl(height), stop, (json) => existingBlockAt(height, json));
+
+  /**
+   * The blocks to yield for `block`, lowest height first: `block` itself, after the blocks that
+   * the chain puts between it and `delivered`, the height of the last block yielded. A block names
+   * its parent, so a parent above `delivered` is a height that was left out as having no block,
+   * wrongly: it is fetched again, and so on up the chain of its parents. Usually that is just
+   * `[block]`. A block that names no parent cannot be checked. STOPPED if `stop` aborts first.
+   */
+  async function withMissingAncestors(
+    block: ReadBlock,
+    delivered: bigint,
+    stop: AbortSignal,
+  ): Promise<ReadBlock[] | Stopped> {
+    const chain = [block];
+    let lowest = block;
+    while (lowest.prevHeight !== null && lowest.prevHeight > delivered) {
+      const parent = lowest.prevHeight;
+      log?.(
+        `neardata: block ${lowest.height} follows block ${parent}, which was skipped; fetching it again`,
+      );
+      const found = await fetchExistingBlock(parent, stop);
+      if (found === STOPPED) return STOPPED;
+      chain.unshift(found);
+      lowest = found;
+    }
+    return chain;
+  }
 
   async function* blocks(
     fromHeight: bigint,
@@ -131,6 +173,10 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
     signal.addEventListener("abort", abort, { once: true });
     try {
       let next = fromHeight;
+      // The height of the last block yielded; before the first, the one below `fromHeight`, so that
+      // a first block may name a parent below `fromHeight` and no other. Kept across polls, which
+      // `next` (the first height not requested yet) cannot be.
+      let lastDelivered = fromHeight - 1n;
       while (!stop.signal.aborted) {
         const final = await fetchFinalHeight(stop.signal);
         if (final === STOPPED) return;
@@ -143,7 +189,7 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
         // those that are not yielded yet, lowest height first. The head stays in it while it is
         // awaited, so `concurrency` caps the requests in flight, and a place frees up only when
         // the head has come: blocks that arrive early wait for the ones before them.
-        const queue: Array<Promise<IndexedBlock | null | Stopped>> = [];
+        const queue: Array<Promise<ReadBlock | null | Stopped>> = [];
         let requested = next;
         const refill = () => {
           while (queue.length < concurrency && requested <= final) {
@@ -157,12 +203,23 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
         };
         refill();
         for (let head = queue[0]; head !== undefined; head = queue[0]) {
-          const block = await head;
+          const answer = await head;
           queue.shift();
-          if (block === STOPPED || stop.signal.aborted) return;
-          // Before the yield, so that the next request is under way while the caller uses `block`.
+          if (answer === STOPPED || stop.signal.aborted) return;
+          // What to yield for this height: nothing if it has no block, else the block, after any
+          // parents that were left out before it. This is the one place where the blocks are seen
+          // in order, so it is where "left out" can be told from "not yet reached". It runs before
+          // `refill` so that a request it makes counts toward `concurrency`.
+          const chain =
+            answer === null ? [] : await withMissingAncestors(answer, lastDelivered, stop.signal);
+          if (chain === STOPPED || stop.signal.aborted) return;
+          // Before the yield, so that the next request is under way while the caller uses a block.
           refill();
-          if (block !== null) yield block;
+          for (const block of chain) {
+            if (stop.signal.aborted) return; // the caller aborted while it had the block before
+            lastDelivered = block.height;
+            yield block.indexed;
+          }
         }
         next = final + 1n;
       }
@@ -265,6 +322,7 @@ interface ReadBlock {
   height: bigint;
   /** The height of the block before it, null if the response does not say. */
   prevHeight: bigint | null;
+  /** What the source yields for the block. */
   indexed: IndexedBlock;
 }
 
@@ -276,6 +334,11 @@ function readBlock(json: unknown): ReadBlock {
     header.prev_height === undefined || header.prev_height === null
       ? null
       : heightField(header.prev_height, "block.header.prev_height");
+  // A parent is below its child. Besides being true, it is what ends the walk back from a block to
+  // the parents left out before it (`withMissingAncestors`): every step goes down.
+  if (prevHeight !== null && prevHeight >= height) {
+    throw malformed("block.header.prev_height is not below block.header.height");
+  }
   // The `timestamp` beside it is a JSON number, which JSON.parse cannot hold exactly at 1.7e18.
   const timestamp = text(header.timestamp_nanosec, "block.header.timestamp_nanosec");
   if (!/^\d+$/.test(timestamp)) throw malformed("block.header.timestamp_nanosec is not a number");
@@ -299,8 +362,8 @@ function readBlock(json: unknown): ReadBlock {
 }
 
 /**
- * The block that neardata answered `GET /v0/block/{height}` with, or null if there is no block at
- * `height`. Throws if the answer cannot be trusted to be the block at `height`.
+ * The block that neardata answered `GET /v0/block/{height}` with, or null if neardata says there is
+ * none at `height`. Throws if the answer cannot be trusted to be the block at `height`.
  *
  * Neardata says a height has no block (the chain skipped it) with a JSON `null`. The design notes
  * (spec 7.1) add that such a height may redirect instead, and a redirect that lands on the block
@@ -308,11 +371,27 @@ function readBlock(json: unknown): ReadBlock {
  * agrees: the block comes later than `height`, and its parent is earlier than `height`, so that
  * nothing lies between them. Any other block than the one asked for is not yielded and not
  * skipped, but asked for again.
+ *
+ * That is what neardata says, which a server that is behind can get wrong. The source checks it
+ * against the blocks that follow: see `withMissingAncestors`.
  */
-function blockAt(height: bigint, json: unknown): IndexedBlock | null {
+function blockAt(height: bigint, json: unknown): ReadBlock | null {
   if (json === null) return null;
   const block = readBlock(json);
-  if (block.height === height) return block.indexed;
+  if (block.height === height) return block;
   if (block.height > height && block.prevHeight !== null && block.prevHeight < height) return null;
   throw new Error(`asked for block ${height} and got block ${block.height}`);
+}
+
+/**
+ * `blockAt` for a height that has a block, because a block after it names it as its parent. An
+ * answer that there is none (null, or the block after it) is then a server that is behind, and is
+ * an error, so that the request is made again.
+ */
+function existingBlockAt(height: bigint, json: unknown): ReadBlock {
+  const block = blockAt(height, json);
+  if (block === null) {
+    throw new Error(`the chain has a block ${height}, but neardata answers as if it had none`);
+  }
+  return block;
 }
