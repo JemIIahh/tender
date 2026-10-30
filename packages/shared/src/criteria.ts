@@ -116,7 +116,8 @@ const common = {
  *
  * - `exact`: the answer is compared with the held-out answers after the `normalize` steps.
  * - `json_schema`: the answer must fit `schema`; the held-out assertions check values in it.
- * - `regex_cases`: the answer is a regex that must handle the example strings (and the held-out ones).
+ * - `regex_cases`: the answer is a regex judged on the held-out cases when there are any, else on
+ *   the example strings.
  * - `tests`: the answer is code that must pass the example cases (and the held-out ones).
  * - `rubric`: an LLM scores the answer against weighted criteria. There is no held-out part.
  */

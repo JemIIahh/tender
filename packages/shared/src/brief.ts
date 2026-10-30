@@ -8,7 +8,7 @@ import { HashHexSchema } from "./primitives";
  *
  * The schema is strict: a key it does not list fails. The brief is hashed on chain and cannot be
  * changed after posting, so a misspelt optional key such as `attachements` must not be read as an
- * absent one. The text limits count UTF-16 code units, as `String.length` does.
+ * absent one. The text limits count Unicode code points, as zod's `min` and `max` do.
  */
 export const BriefSchema = z.strictObject({
   version: z.literal(1),

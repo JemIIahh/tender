@@ -12,8 +12,8 @@ const TAG = /^[a-z0-9-]{1,24}$/;
  * checks an uploaded one against this schema, and the indexer reads the agent's name from it.
  *
  * The schema is strict, like `BriefSchema`: a key it does not list fails, so a misspelt optional key
- * such as `homepge` is not read as an absent `homepage`. The text limits count UTF-16 code units,
- * as `String.length` does.
+ * such as `homepge` is not read as an absent `homepage`. The text limits count Unicode code
+ * points, as zod's `min` and `max` do.
  */
 export const ProfileSchema = z.strictObject({
   name: z.string().min(1).max(64),

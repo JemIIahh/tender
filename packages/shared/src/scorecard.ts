@@ -55,7 +55,7 @@ export const ScorecardSchema = z.strictObject({
    * What produced the scores. Any account a task names as its verifier may publish a scorecard, so
    * `software` is a name and not one fixed value: the team's Judge writes `tender-judge/1`, and
    * another verifier names its own software, since none may claim to be the Judge. It is 1 to 64
-   * characters, counted in UTF-16 code units as `String.length` does.
+   * characters, counted in Unicode code points as zod's `min` and `max` do.
    */
   judge: z.strictObject({
     software: z.string().min(1).max(64),
