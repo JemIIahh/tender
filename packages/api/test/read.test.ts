@@ -502,6 +502,21 @@ test("task_detail_includes_entries_brief_and_children", async () => {
   ]);
 });
 
+test("task_children_in_numeric_order", async () => {
+  await seedLifecycle(deps.db);
+  // Created out of order, with ids that sort differently as text ("10", "100", "9"): the children
+  // come back by id as a number, neither as they were created nor as text.
+  await apply(
+    taskLine(100, { parent: "1" }),
+    taskLine(9, { parent: "1" }),
+    taskLine(10, { parent: "1" }),
+  );
+
+  const res = await get<TaskDetailResponse>("/v1/tasks/1");
+  expect(res.status).toBe(200);
+  expect(res.body.children).toEqual(["9", "10", "100"]);
+});
+
 test("task_detail_returns_the_documents_the_task_points_at", async () => {
   const criteria: PublicCriteria = {
     kind: "exact",

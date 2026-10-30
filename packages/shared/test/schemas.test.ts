@@ -1343,8 +1343,6 @@ test("canonical_json_is_compact_utf8", () => {
   expect([...canonicalJson("\u{1f600}")]).toEqual([0x22, 0xf0, 0x9f, 0x98, 0x80, 0x22]);
   // The quote, the backslash and control characters are escaped, and nothing else is.
   expect(text(canonicalJson('a"b\\c\nd\u0001'))).toBe('"a\\"b\\\\c\\nd\\u0001"');
-  // A lone surrogate cannot be written as UTF-8, so it is escaped.
-  expect(text(canonicalJson("\ud800"))).toBe('"\\ud800"');
   // Numbers use the shortest round-trip form; -0 is 0.
   expect(text(canonicalJson([1, 1.5, -0, 1e21, 0.1, 100]))).toBe("[1,1.5,0,1e+21,0.1,100]");
   expect(text(canonicalJson([null, true, false, "", {}]))).toBe('[null,true,false,"",{}]');
@@ -1448,6 +1446,56 @@ test("canonical_json_escapes_keys_as_strings", () => {
   expect(JSON.parse(text(bytes))).toEqual(doc);
   // A key and a value are escaped alike.
   expect(text(canonicalJson({ [keys[0] ?? ""]: keys[0] }))).toBe(String.raw`{"a\"b":"a\"b"}`);
+});
+
+test("canonical_json_rejects_lone_surrogates", () => {
+  // A lone surrogate has no UTF-8 form: TextEncoder would write U+FFFD for it, and RFC 8785
+  // requires refusing a string that is not well-formed Unicode. JSON.stringify would escape it
+  // (\ud800) instead, so canonicalJson refuses it itself.
+  const high = "\ud800";
+  const low = "\udc00";
+  const smile = "\u{1f600}";
+  const bad: [string, unknown][] = [
+    ["a lone high surrogate", high],
+    ["a lone low surrogate", low],
+    ["a low surrogate before a high one", `${low}${high}`],
+    ["a high surrogate at the end", `ab${high}`],
+    ["a high surrogate before a letter", `${high}a`],
+    ["a low surrogate after a whole pair", `${smile}${low}`],
+    ["a lone surrogate in an array", ["ok", [high]]],
+    ["a lone surrogate in an object", { a: { b: low } }],
+    ["a lone surrogate as a key", { [high]: 1 }],
+    ["a lone surrogate inside a key", { [`a${low}b`]: 1 }],
+    ["a lone surrogate as a key of a nested object", { a: [{ [low]: "ok" }] }],
+  ];
+  for (const [what, value] of bad) expect(() => canonicalJson(value), what).toThrow(TypeError);
+
+  // The message says where: the place of the string, or of the object that has the key.
+  expect(() => canonicalJson({ a: [{ b: high }] })).toThrow(
+    /a string with a lone surrogate.* at \$\.a\[0\]\.b$/,
+  );
+  expect(() => canonicalJson({ a: [{ [high]: 1 }] })).toThrow(
+    /a key with a lone surrogate.* at \$\.a\[0\]$/,
+  );
+  expect(() => canonicalJson(low)).toThrow(/a string with a lone surrogate.* at \$$/);
+
+  // A pair is well formed, written as one character or as its two units, in a value or a key.
+  expect(text(canonicalJson(smile))).toBe(`"${smile}"`);
+  expect(text(canonicalJson("😀"))).toBe(`"${smile}"`);
+  expect(text(canonicalJson({ [smile]: [smile] }))).toBe(`{"${smile}":["${smile}"]}`);
+
+  // A member that is undefined is absent, and so is its key: there is nothing to refuse.
+  expect(text(canonicalJson({ [high]: undefined, a: 1 }))).toBe('{"a":1}');
+});
+
+test("canonical_json_writes_an_own_proto_key_like_any_other", () => {
+  // `JSON.parse` makes `__proto__` an own key, where an assignment would set the prototype. The
+  // key is written, in its place by code unit (the underscore sorts before the lower-case letters).
+  const parsed = JSON.parse('{"b":1,"__proto__":{"x":2},"a":0}');
+  expect(Object.hasOwn(parsed, "__proto__")).toBe(true);
+  expect(Object.getPrototypeOf(parsed)).toBe(Object.prototype);
+  expect(text(canonicalJson(parsed))).toBe('{"__proto__":{"x":2},"a":0,"b":1}');
+  expect(text(canonicalJson(JSON.parse('{"__proto__":1}')))).toBe('{"__proto__":1}');
 });
 
 test("canonical_json_rejects_the_holes_of_a_sparse_array", () => {

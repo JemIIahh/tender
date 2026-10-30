@@ -1,3 +1,4 @@
+import { STATUS_CODES } from "node:http";
 import {
   AccountIdSchema,
   type Brief,
@@ -8,8 +9,10 @@ import {
   type TenderEvent,
   U64StringSchema,
 } from "@tender/shared";
+import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import type { z } from "zod";
 
 // The shapes of everything the read routes send, and the checks of what they receive.
 //
@@ -204,26 +207,118 @@ export interface AccountEntriesResponse {
   entries: AccountEntry[];
 }
 
-/** The body of every error response. `error` is a code to branch on, `message` is for people. */
+/**
+ * `POST /v1/blobs`. `sha256` is the hash of the stored bytes, which is what a brief, a criteria
+ * document or a scorecard is pinned by on chain; `uri` is where the API serves them, and what a
+ * task or a reveal points at.
+ */
+export interface BlobUploadResponse {
+  sha256: string;
+  uri: string;
+}
+
+/** `POST /v1/heldout`. */
+export interface HeldoutUploadResponse {
+  ok: true;
+}
+
+/** One fault of a document that failed its schema, as zod reports it. `path` leads to the fault. */
+export interface ErrorIssue {
+  path: Array<string | number>;
+  message: string;
+  code: string;
+}
+
+/**
+ * The body of every error response. `error` is a code to branch on, `message` is for people. A
+ * request whose body does not fit its schema also lists `issues`, at most `MAX_ISSUES` of them.
+ */
 export interface ErrorBody {
   error: string;
   message: string;
+  issues?: ErrorIssue[];
 }
+
+/** How many issues an `ErrorBody` lists, and how long the message of one may be. */
+export const MAX_ISSUES = 20;
+const MAX_ISSUE_MESSAGE = 200;
 
 // ---- Errors -----------------------------------------------------------------------------------
 
 /** Stops the request with `status` and an `ErrorBody`. `app.onError` sends it. */
-export function fail(status: ContentfulStatusCode, error: string, message: string): never {
-  const body: ErrorBody = { error, message };
+export function fail(
+  status: ContentfulStatusCode,
+  error: string,
+  message: string,
+  issues?: ErrorIssue[],
+): never {
+  const body: ErrorBody = issues === undefined ? { error, message } : { error, message, issues };
   throw new HTTPException(status, { res: Response.json(body, { status }), message });
 }
 
-export function badRequest(message: string): never {
-  return fail(400, "bad_request", message);
+export function badRequest(message: string, issues?: ErrorIssue[]): never {
+  return fail(400, "bad_request", message, issues);
 }
 
 export function notFound(message: string): never {
   return fail(404, "not_found", message);
+}
+
+/**
+ * The JSON in the body of the request, or a 400 when the body is not JSON. Only the parser's
+ * `SyntaxError` is the caller's mistake. Anything else the read throws is a fault of ours or of the
+ * connection, and goes to `handleError` as it is, to be logged and answered as a 500.
+ */
+export async function readJson(c: Context): Promise<unknown> {
+  try {
+    return await c.req.json();
+  } catch (error) {
+    if (error instanceof SyntaxError) return badRequest("body is not valid JSON");
+    throw error;
+  }
+}
+
+/**
+ * The first `MAX_ISSUES` faults of a failed parse, as an `ErrorBody` lists them. Zod quotes the
+ * request in one message, the one for a key the schema does not have, and that is told in words of
+ * ours instead. Every other message is cut at `MAX_ISSUE_MESSAGE`, in case one grows long.
+ */
+export function issuesOf(error: z.ZodError): ErrorIssue[] {
+  return error.issues.slice(0, MAX_ISSUES).map((issue) => ({
+    path: issue.path.map((part) => (typeof part === "number" ? part : String(part))),
+    message:
+      issue.code === "unrecognized_keys"
+        ? `unrecognized ${issue.keys.length === 1 ? "key" : "keys"}`
+        : issue.message.slice(0, MAX_ISSUE_MESSAGE),
+    code: issue.code,
+  }));
+}
+
+/**
+ * `app.onError`: answers whatever a route or a middleware threw with an `ErrorBody`, and adds no
+ * word of the request to it.
+ *
+ * - An `HTTPException` with a response of its own, such as `fail()` throws, sends that response.
+ * - One without, such as `hono/validator` throws for a body it cannot parse, answers with its
+ *   status and the name of that status (`403`: `forbidden`). Its message is not used: some of
+ *   Hono's quote the request.
+ * - Anything else is a bug: it is logged and answered as a 500 that says nothing about it. That
+ *   includes a `SyntaxError`, which only `readJson` turns into a 400, for the body it reads.
+ */
+export function handleError(error: Error, c: Context): Response {
+  if (error instanceof HTTPException) {
+    if (error.res) return error.getResponse();
+    if (error.status >= 500) console.error("api: unhandled error:", error);
+    const reason = STATUS_CODES[error.status] ?? "Error";
+    const body: ErrorBody = {
+      error: reason.toLowerCase().replaceAll(" ", "_"),
+      message: reason.toLowerCase(),
+    };
+    return Response.json(body, { status: error.status });
+  }
+  console.error("api: unhandled error:", error);
+  const body: ErrorBody = { error: "internal", message: "internal error" };
+  return c.json(body, 500);
 }
 
 // ---- Query strings ----------------------------------------------------------------------------
