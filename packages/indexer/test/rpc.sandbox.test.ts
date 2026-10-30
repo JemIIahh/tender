@@ -56,6 +56,20 @@ async function firstHeight(): Promise<bigint> {
   return earliest ? BigInt(earliest) + 100n : 1n;
 }
 
+/** Each height from `from` on that `blocks` leaves out has no block on the node: none was lost. */
+async function expectNoneSkipped(from: bigint, blocks: IndexedBlock[]) {
+  let next = from;
+  for (const block of blocks) {
+    for (; next < block.height; next++) {
+      const error = await provider.viewBlock({ blockId: Number(next) }).catch((e) => e);
+      expect(error, `the source left out block ${next}, which the node has`).toBeInstanceOf(
+        UnknownBlockError,
+      );
+    }
+    next = block.height + 1n;
+  }
+}
+
 /** The TenderError that `call` fails with. Any other outcome fails the test. */
 async function failure(call: Promise<unknown>): Promise<TenderError> {
   try {
@@ -114,6 +128,8 @@ test("rpc_source_sees_tender_events_including_failures", async () => {
     }
   }
 
+  await expectNoneSkipped(from, blocks);
+
   // No receipt is read twice.
   const receipts = blocks.flatMap((block) => block.receipts);
   expect(new Set(receipts.map((r) => r.receiptId)).size).toBe(receipts.length);
@@ -152,8 +168,8 @@ test("rpc_source_follows_the_chain_tip", async () => {
       poster.deposit(chain.tokenId, 3n),
     ]);
 
-    // The heights run on one by one, so none is skipped while the source follows the tip.
-    expect(blocks.map((b) => b.height)).toEqual(blocks.map((_, i) => start + BigInt(i)));
+    // None is skipped while the source follows the tip.
+    await expectNoneSkipped(start, blocks);
     const receipts = blocks.flatMap((block) => block.receipts);
     expect(receipts).toEqual(expect.arrayContaining(sent.receipts));
     expect(extractEvents(receipts, chain.contractId)).toEqual(sent.events);
