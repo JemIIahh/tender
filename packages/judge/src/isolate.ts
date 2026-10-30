@@ -278,8 +278,8 @@ export interface WorkerScorers {
 /**
  * The worker's side, which `score-worker.ts` runs: `job` is its `workerData`, and each request on
  * `port` is answered on it. A request is `{ id, request }`, and its answer `{ id, answer }`, with
- * the same id: the host takes any answer to another one, or to none, for a crash. Once the worker is
- * set up it answers request 0, its start, with `ready`.
+ * the same id: the host takes any answer to another one, or to none, for a crash. Once the worker
+ * is set up it answers request 0, its start, with `ready`.
  *
  * A score job is first asked to compile the criteria (`compile`), and answers as the check does:
  * `{ ok: true }`, or `{ ok: false, reason }` when the criteria cannot be scored with, or

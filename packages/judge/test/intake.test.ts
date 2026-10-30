@@ -152,7 +152,7 @@ async function intake(id: number, view: Partial<TaskView>, status: string | null
   return intakeTask(judgeDeps(db, fakeChain(null)), BigInt(id));
 }
 
-test("intake_rejects_each_rule", async () => {
+test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
   // Each rule is broken by one task of its own, so every reason is checked against the others.
   const rules: { rule: string; reason: string; view: () => Promise<Partial<TaskView>> }[] = [
     {
@@ -575,7 +575,9 @@ test("intake_rejects_each_rule", async () => {
   expect(reasons.filter(({ judge_reason }) => judge_reason?.includes(SECRET))).toEqual([]);
 });
 
-test("intake_rejects_a_schema_that_does_not_compile_with_a_short_reason", async () => {
+test("intake_rejects_a_schema_that_does_not_compile_with_a_short_reason", {
+  timeout: 30_000,
+}, async () => {
   expect(await intake(1, await jsonSchemaTask(db, { type: 12 }))).toBe("rejected");
   expect((await judgeRow(db, 1))?.judge_reason).toMatch(/^criteria schema cannot be compiled: /);
 

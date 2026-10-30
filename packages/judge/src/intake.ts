@@ -367,11 +367,11 @@ function shapeProblem(criteria: P0Criteria): string | null {
 /**
  * The criteria check's other part: whether Ajv compiles and runs the schema
  * (`checkJsonSchemaUsable`), in a worker within `policy.compileBudgetMs` (2 s by default:
- * `checkJsonSchemaIsolated`). Judging gives the compile 4 times intake's time, so that criteria that
- * compiled in time at intake are not refused because the machine is busier. The outcome is kept in
- * `policy.checks` by criteria hash and budget, and taken from there the next time: the check is
- * the same, and so is what comes of it. It rejects when the check crashes its worker, and with
- * `ScorerUnavailableError` when the worker cannot be started; neither is kept.
+ * `checkJsonSchemaIsolated`). Judging gives the compile 4 times intake's time, so that criteria
+ * that compiled in time at intake are not refused because the machine is busier. The outcome is
+ * kept in `policy.checks` by criteria hash and budget, and taken from there the next time: the
+ * check is the same, and so is what comes of it. It rejects when the check crashes its worker, and
+ * with `ScorerUnavailableError` when the worker cannot be started; neither is kept.
  */
 async function compileProblem(
   criteria: P0Criteria,
