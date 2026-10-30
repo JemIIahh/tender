@@ -150,6 +150,8 @@ function StorageSection({
 }) {
   const heading = useRef<HTMLHeadingElement>(null);
   const wasUnset = useRef(storage === null);
+  // Taking storage back with none to take sends a transaction that does nothing: it is off then.
+  const takeBackOff = running !== null || storage === null || storage.available === 0n;
   // The button that set the account up is gone once it is: the focus goes to the section, which
   // is where what it did is told, and not to the top of the document.
   useEffect(() => {
@@ -193,11 +195,14 @@ function StorageSection({
             <dt className="text-neutral-700">Free to take back</dt>
             <dd data-testid="storage-available">{describeNear(storage.available)}</dd>
           </dl>
+          {/* `aria-disabled` does not stop a press, so the handler has the same condition. */}
           <button
             key="take-back"
             type="button"
-            aria-disabled={running !== null || storage.available === 0n}
-            onClick={onWithdraw}
+            aria-disabled={takeBackOff}
+            onClick={() => {
+              if (!takeBackOff) onWithdraw();
+            }}
             className={SECONDARY}
           >
             {running === "storage" ? "Waiting for your wallet…" : "Withdraw unused storage"}
@@ -239,9 +244,20 @@ function AmountForm({
   notice: ReactNode;
 }) {
   const id = useId();
-  const [selected, setSelected] = useState("");
+  // The token an amount is typed for (or the person chose), or null while the form shows the first
+  // of the list, which is free to change. Once an amount is typed it is for the token that was
+  // shown, and stays with it however the list is ordered.
+  const [selected, setSelected] = useState<string | null>(null);
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  if (selected !== null && !rows.some((candidate) => candidate.token === selected)) {
+    // The token the amount was for has left the list: the amount goes with it, and does not turn
+    // into an amount of another token. (React takes a state change made while rendering this
+    // component and renders again at once.)
+    setSelected(null);
+    setText("");
+    setError(null);
+  }
   const row = rows.find((candidate) => candidate.token === selected) ?? rows[0];
   const max = row === undefined ? null : source === "vault" ? row.vault : row.wallet;
 
@@ -293,7 +309,10 @@ function AmountForm({
               <input
                 id={`${id}-amount`}
                 value={text}
-                onChange={(event) => setText(event.currentTarget.value)}
+                onChange={(event) => {
+                  setText(event.currentTarget.value);
+                  setSelected(row.token);
+                }}
                 inputMode="decimal"
                 autoComplete="off"
                 autoCapitalize="none"
@@ -340,12 +359,16 @@ export function WalletView({
   // The read that counts. An answer to an earlier one is dropped: strict mode starts two, an
   // action reads again while a slow read is on its way, and another account is another page.
   const latest = useRef(0);
+  // The account the page is for now. A read for another one (a delayed one, or one that an action
+  // began for an account that has since been left) is not made, and its answer is not taken.
+  const shown = useRef<string | null>(accountId);
   const later = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const connection = useRef<HTMLHeadingElement>(null);
   const connected = useRef(accountId !== null);
 
   /** `quiet`: read again without taking the page away, as after an action or for the notice. */
   const load = useCallback((account: string, quiet: boolean) => {
+    if (account !== shown.current) return;
     const request = ++latest.current;
     setPanel((was) => {
       if (quiet) {
@@ -376,7 +399,10 @@ export function WalletView({
   }, []);
 
   useEffect(() => {
+    shown.current = accountId;
     setNotice(null);
+    // The read that was to come after an action is for the account that did it.
+    clearTimeout(later.current);
     if (accountId === null) {
       // Drop any read still on its way: it is for an account that is gone.
       latest.current++;
@@ -490,11 +516,12 @@ export function WalletView({
       },
     );
 
-  const takeBackStorage = (available: bigint) =>
+  // No amount in the words: what was taken back is what the balances above show, read again.
+  const takeBackStorage = () =>
     send(
       "storage",
       async () => [storageWithdrawCall(config.contractId)],
-      () => `Took back ${describeNear(available)} of unused storage.`,
+      () => "Took back your unused storage.",
     );
 
   const noticeFor = (action: ActionId) =>
@@ -589,7 +616,7 @@ export function WalletView({
               </>
             }
             onSetUp={setUp}
-            onWithdraw={() => panel.data.storage && takeBackStorage(panel.data.storage.available)}
+            onWithdraw={takeBackStorage}
           />
 
           <BalancesSection rows={panel.data.rows} />

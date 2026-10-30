@@ -106,7 +106,7 @@ test("register_deposit_withdraw_round_trip", async ({ page }) => {
 
   // What is left of the storage deposit comes back too.
   await page.getByRole("button", { name: "Withdraw unused storage" }).click();
-  await expect(page.getByTestId("notice")).toContainText("of unused storage.");
+  await expect(page.getByTestId("notice")).toHaveText("Took back your unused storage.");
   await expect(page.getByTestId("storage-available")).toHaveText("0.00 NEAR");
 
   // Disconnecting leaves the connect button, with nothing of the account on the page.

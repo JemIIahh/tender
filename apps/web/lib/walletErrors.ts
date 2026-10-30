@@ -89,6 +89,17 @@ export class SignInRefused extends Error {
   }
 }
 
+/**
+ * The wallet session a sign-in began in is over: the wallet was disconnected, signed itself out or
+ * was connected as another account before the sign-in was done. Its token is not kept.
+ */
+export class WalletSessionEnded extends Error {
+  constructor() {
+    super("the wallet session ended before the sign-in was done");
+    this.name = "WalletSessionEnded";
+  }
+}
+
 /** The wallet signed a sign-in as another account than the one that is connected. */
 export class WalletAccountMismatch extends Error {
   constructor() {
@@ -100,7 +111,7 @@ export class WalletAccountMismatch extends Error {
 const WALLET_ACTION_WORDS: Record<WalletError["action"], string> = {
   connect: "Couldn't connect the wallet. Try again.",
   disconnect: "Couldn't disconnect the wallet. Try again.",
-  send: "The wallet didn't send that. Check the balances below, then try again.",
+  send: "The wallet reported a problem. Check the balances below before you try again.",
   sign: "The wallet didn't sign the message.",
 };
 
@@ -118,6 +129,9 @@ export function walletErrorMessage(error: unknown): string {
   }
   if (error instanceof SignInRefused) {
     return `Tender's sign-in request has the wrong ${error.field}, so nothing was signed.`;
+  }
+  if (error instanceof WalletSessionEnded) {
+    return "The wallet was disconnected or changed during sign-in, so you are not signed in. Try again with the wallet you want to use.";
   }
   if (error instanceof WalletAccountMismatch) {
     return "The wallet signed in as a different account than the one connected, so nothing was sent to Tender.";

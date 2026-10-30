@@ -9,6 +9,7 @@ import {
   toConnectorAction,
 } from "@tender/shared";
 import { useEffect, useMemo, useSyncExternalStore } from "react";
+import { sessionBegan, sessionEnded } from "./apiToken";
 import { config } from "./config";
 import {
   TransactionFailed,
@@ -275,8 +276,15 @@ export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
     for (const listener of [...listeners]) listener();
   }
 
-  function setSession(next: Session | null): void {
+  /**
+   * Takes `next` as the wallet session. The API token belongs to the session (lib/apiToken.ts), so
+   * it is dropped here, where the session ends, and not by whatever page is on screen. `restored`:
+   * the wallet of an earlier visit, taken up again, which keeps the token of the same account.
+   */
+  function setSession(next: Session | null, restored = false): void {
     session = next;
+    if (next === null) sessionEnded();
+    else sessionBegan(next.accountId, restored);
     publish({
       accountId: next?.accountId ?? null,
       canSignMessage: next !== null && canSign(next.wallet),
@@ -284,11 +292,20 @@ export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
   }
 
   function getProvider(): Promise<WalletProvider> {
-    provider ??= makeProvider().catch((error: unknown) => {
-      // Forget a provider that could not be made, so that the next try makes it again.
-      provider = null;
-      throw error;
-    });
+    provider ??= makeProvider()
+      .then((made) => {
+        // One listener for each provider, here where it is made: a provider that failed to load at
+        // first and loads on a later try has to be heard for a sign-out just the same.
+        made.subscribe((next) => {
+          if (next === null) setSession(null);
+        });
+        return made;
+      })
+      .catch((error: unknown) => {
+        // Forget a provider that could not be made, so that the next try makes it again.
+        provider = null;
+        throw error;
+      });
     return provider;
   }
 
@@ -296,14 +313,11 @@ export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
     starting ??= (async () => {
       try {
         const wallets = await getProvider();
-        wallets.subscribe((next) => {
-          if (next === null) setSession(null);
-        });
         const restoring = wallets
           .restore()
           .then((restored) => {
             // A wallet connected in the meantime stays.
-            if (session === null && restored !== null) setSession(restored);
+            if (session === null && restored !== null) setSession(restored, true);
           })
           .catch((error: unknown) => console.error(error));
         await settleWithin(restoring, RESTORE_PATIENCE_MS);
@@ -312,6 +326,8 @@ export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
         // the Connect button, and pressing it says why.
         console.error(error);
       } finally {
+        // No wallet session to go on with: a token kept from the earlier visit has none to belong to.
+        if (session === null) sessionEnded();
         publish({ ready: true });
       }
     })();

@@ -85,7 +85,7 @@ test("config_refuses_an_api_url_that_canonical_base_refuses", () => {
   }
 });
 
-test("config_api_url_error_does_not_quote_a_password", () => {
+test("config_api_url_error_from_canonical_base_does_not_quote_the_address", () => {
   let message = "";
   try {
     readConfig({ ...BASE, NEXT_PUBLIC_API_URL: "https://user:hunter2@api.tender.example" });
@@ -94,6 +94,16 @@ test("config_api_url_error_does_not_quote_a_password", () => {
   }
   expect(message).toMatch(/NEXT_PUBLIC_API_URL/);
   expect(message).not.toContain("hunter2");
+});
+
+test("config_api_url_error_for_a_value_that_is_not_http_shows_the_value", () => {
+  // `httpUrl` runs first and says what it got, so that the variable can be put right. That is the
+  // reason a password does not belong in a NEXT_PUBLIC_* value: it ships in the page all the same.
+  for (const value of ["ftp://api.tender.example", "not a url"]) {
+    expect(() => readConfig({ ...BASE, NEXT_PUBLIC_API_URL: value }), value).toThrow(
+      `NEXT_PUBLIC_API_URL must be an http(s) URL, got ${JSON.stringify(value)}`,
+    );
+  }
 });
 
 test("config_keeps_the_rpc_url_as_it_is_written", () => {

@@ -306,7 +306,7 @@ test("the_token_lives_in_memory_and_in_session_storage_and_never_in_local_storag
   expect(reloaded.result.current.token).toBe(TOKEN);
 });
 
-test("a_token_is_for_the_account_that_signed_in_and_goes_with_it", async () => {
+test("a_token_is_given_only_to_the_account_that_signed_in", async () => {
   fakeApi();
   const { result, rerender } = renderHook(() => useApiToken());
   await act(async () => {
@@ -314,34 +314,14 @@ test("a_token_is_for_the_account_that_signed_in_and_goes_with_it", async () => {
   });
   expect(result.current.token).toBe(TOKEN);
 
-  // The wallet is connected as someone else: the token is not theirs, and is dropped.
+  // The wallet is shown as someone else, or as no one yet: the token is not theirs, and not given.
+  // Dropping it is for the wallet store, where a session ends (test/token-session.test.tsx).
   setWallet({ accountId: "bob.testnet" });
   rerender();
   expect(result.current.token).toBeNull();
-  await vi.waitFor(() => expect(sessionStorage.getItem("tender.apiToken")).toBeNull());
-
-  // And it does not come back when Alice does.
-  setWallet();
-  rerender();
-  expect(result.current.token).toBeNull();
-});
-
-test("disconnecting_the_wallet_drops_the_token_but_looking_for_it_does_not", async () => {
-  fakeApi();
-  const { result, rerender } = renderHook(() => useApiToken());
-  await act(async () => {
-    await result.current.signIn();
-  });
-
-  // While the page is still looking for the wallet from an earlier visit, no account means nothing.
   setWallet({ ready: false, accountId: null, canSignMessage: false });
   rerender();
-  expect(sessionStorage.getItem("tender.apiToken")).not.toBeNull();
-
-  setWallet({ ready: true, accountId: null, canSignMessage: false });
-  rerender();
   expect(result.current.token).toBeNull();
-  await vi.waitFor(() => expect(sessionStorage.getItem("tender.apiToken")).toBeNull());
 });
 
 test("a_token_that_has_expired_is_not_given", async () => {

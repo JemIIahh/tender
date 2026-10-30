@@ -176,5 +176,8 @@ test("the_app_never_writes_to_local_storage_and_the_token_module_never_logs", ()
     .map((file) => relative(WEB, file));
   expect(offenders).toEqual([]);
 
-  expect(read("lib/auth.ts")).not.toMatch(/\bconsole\./);
+  // The token is signed in for by lib/auth.ts and kept by lib/apiToken.ts: neither logs.
+  for (const file of ["lib/auth.ts", "lib/apiToken.ts"]) {
+    expect(read(file), file).not.toMatch(/\bconsole\./);
+  }
 });

@@ -574,6 +574,43 @@ test("a_build_with_no_wallet_says_so_when_asked_to_connect_and_tries_again_each_
   expect(store.getSnapshot().accountId).toBe(ALICE);
 });
 
+test("a_wallet_library_that_loaded_on_a_later_try_is_heard_when_it_signs_out", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const wallet = chainWallet(new FakeChain(CONTRACT, []), ALICE);
+  const provider = fakeProvider({ wallet, accountId: ALICE });
+  let made = 0;
+  const store = createWalletStore(async () => {
+    made++;
+    if (made === 1) throw new WalletUnavailable();
+    return provider;
+  });
+
+  // The library did not load with the page: ready, with a Connect button, and no provider to hear.
+  await store.start();
+  expect(store.getSnapshot()).toEqual({ ready: true, accountId: null, canSignMessage: false });
+  // It loads when Connect is pressed...
+  await store.connect();
+  expect(store.getSnapshot().accountId).toBe(ALICE);
+
+  // ...and the wallet signing itself out is heard all the same.
+  provider.signOut();
+  expect(store.getSnapshot()).toEqual({ ready: true, accountId: null, canSignMessage: false });
+});
+
+test("a_provider_is_listened_to_once_however_often_the_store_uses_it", async () => {
+  const wallet = chainWallet(new FakeChain(CONTRACT, []), ALICE);
+  const provider = fakeProvider({ wallet, accountId: ALICE });
+  const subscribe = vi.spyOn(provider, "subscribe");
+  const store = createWalletStore(async () => provider);
+
+  await store.start();
+  await store.connect();
+  await store.disconnect();
+  await store.connect();
+
+  expect(subscribe).toHaveBeenCalledTimes(1);
+});
+
 // ---- near-connect -------------------------------------------------------------------------------
 
 // The library is replaced by a connector that does what the test says. It is the library that

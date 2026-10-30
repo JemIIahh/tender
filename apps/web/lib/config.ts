@@ -59,7 +59,9 @@ export function readConfig(env: PublicEnv): WebConfig {
   httpUrl("NEXT_PUBLIC_API_URL", api);
   // The address the page calls and the recipient it has a wallet sign (lib/auth.ts) are one string,
   // so a spelling that `canonicalBase` refuses is refused here, and one it rewrites is used
-  // rewritten. Its messages never quote the address, which can hold a password.
+  // rewritten. The messages of `canonicalBase` quote nothing; those of `httpUrl` above quote the
+  // whole value, whatever it holds, when it does not parse or is not http(s). A password does not
+  // belong in a NEXT_PUBLIC_* value in any case: it ships in the page.
   let apiUrl: string;
   try {
     apiUrl = canonicalBase(api);

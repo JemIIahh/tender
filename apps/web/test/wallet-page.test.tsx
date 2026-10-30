@@ -1,8 +1,8 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { WalletView } from "../components/WalletView";
-import type { WalletStore } from "../lib/wallet";
+import type { Session, WalletStore } from "../lib/wallet";
 import { createWalletStore } from "../lib/wallet";
 import { FakeChain, FakeNode, fakeFetch } from "./fakeChain";
 import { type ChainWallet, chainWallet, fakeProvider } from "./walletDoubles";
@@ -14,6 +14,7 @@ import { type ChainWallet, chainWallet, fakeProvider } from "./walletDoubles";
 const CONTRACT = "tender.testnet";
 const USDC = "tusdc.testnet";
 const ALICE = "alice.testnet";
+const BOB = "bob.testnet";
 
 // The page reads the wallet from `lib/wallet`; the tests hand it a store of their own.
 const holder = vi.hoisted(() => ({ store: undefined as unknown as WalletStore }));
@@ -157,13 +158,42 @@ test("register_deposit_withdraw_round_trip_on_the_page", async () => {
     "Withdrew 2.00 tUSDC to your wallet.",
   );
 
-  // Take back the storage that is not used.
+  // Take back the storage that is not used. The notice names no amount: the page's reading of it
+  // is from before the press, and the figure above is read again after.
   await user.click(await button("Withdraw unused storage"));
   await waitFor(() =>
     expect(screen.getByTestId("storage-available").textContent).toBe("0.00 NEAR"),
   );
   expect(chain.calls.at(-1)).toMatchObject({ methodName: "storage_withdraw", deposit: 1n });
   expect(chain.calls.at(-1)?.args).toEqual({});
+  expect(within(section("Storage with Tender")).getByTestId("notice").textContent).toBe(
+    "Took back your unused storage.",
+  );
+});
+
+test("withdraw_unused_storage_with_none_to_take_back_sends_nothing", async () => {
+  const { chain, wallet, user } = setup({ connected: true });
+  render(<WalletView />);
+  await user.click(await button("Set up account"));
+  await waitFor(() => expect(screen.getByTestId("storage-total").textContent).toBe("0.05 NEAR"));
+  await user.click(await button("Withdraw unused storage"));
+  await waitFor(() =>
+    expect(screen.getByTestId("storage-available").textContent).toBe("0.00 NEAR"),
+  );
+  expect(wallet.sent).toHaveLength(2);
+  const takeBack = screen.getByRole("button", { name: "Withdraw unused storage" });
+  expect(takeBack.getAttribute("aria-disabled")).toBe("true");
+
+  // `aria-disabled` does not stop a press: this one is a click, and a keyboard's Enter is the same.
+  await user.click(takeBack);
+  takeBack.focus();
+  await user.keyboard("{Enter}");
+
+  expect(wallet.sent).toHaveLength(2);
+  expect(chain.calls.map((call) => call.methodName)).toEqual([
+    "storage_deposit",
+    "storage_withdraw",
+  ]);
 });
 
 test("withdraw_adds_token_registration_when_missing_on_the_page", async () => {
@@ -314,7 +344,7 @@ test("a_wallet_that_refuses_is_told_in_words_logged_and_the_page_goes_on", async
 
   const notice = await screen.findByRole("alert");
   expect(notice.textContent).toBe(
-    "The wallet didn't send that. Check the balances below, then try again.",
+    "The wallet reported a problem. Check the balances below before you try again.",
   );
   // The original, with its cause, for a developer; nothing of it on the page.
   const logged = vi.mocked(console.error).mock.calls.flat();
@@ -430,4 +460,157 @@ test("a_token_that_will_not_say_what_the_account_holds_shows_a_dash_and_the_page
 
   expect(textOf(row, "wallet-balance")).toBe("— tusdc.testnet");
   expect(textOf(row, "vault-balance")).toBe("0.00 tUSDC");
+});
+
+// ---- The page follows the account, and what is typed follows its token --------------------------
+
+/** A page whose wallet connects as Alice, and as Bob when it is asked again. Alice has 3 test USDC in her vault, Bob 7. */
+async function setupTwoAccounts() {
+  const chain = new FakeChain(CONTRACT, [{ token: USDC }]);
+  chain.fundVault(ALICE, USDC, 3_000_000n);
+  chain.fundVault(BOB, USDC, 7_000_000n);
+  const alice = chainWallet(chain, ALICE);
+  const bob = chainWallet(chain, BOB);
+  const queue: Session[] = [
+    { wallet: alice, accountId: ALICE },
+    { wallet: bob, accountId: BOB },
+  ];
+  const provider = fakeProvider({ wallet: alice, accountId: ALICE });
+  provider.connect = async () => queue.shift() ?? null;
+  holder.store = createWalletStore(async () => provider);
+  await holder.store.connect();
+  vi.stubGlobal("fetch", fakeFetch("http://rpc.test", new FakeNode(chain)));
+  return { chain, alice, user: userEvent.setup() };
+}
+
+/** The wallet is disconnected and connected as Bob, as from the wallet's own screen. */
+const switchToBob = () =>
+  act(async () => {
+    await holder.store.disconnect();
+    await holder.store.connect();
+  });
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("the_second_read_after_an_action_is_not_made_for_an_account_that_has_been_left", async () => {
+  const { user } = await setupTwoAccounts();
+  render(<WalletView laterRefreshMs={250} />);
+  expect(textOf(await screen.findByTestId("token-row"), "vault-balance")).toBe("3.00 tUSDC");
+  await user.click(await button("Withdraw unused storage"));
+  await screen.findByText("Took back your unused storage.");
+
+  // Alice's second read is on its way. The wallet is Bob's before it comes.
+  await switchToBob();
+  await waitFor(() => expect(screen.getByTestId("account-id").textContent).toBe(BOB));
+  await waitFor(() =>
+    expect(textOf(screen.getByTestId("token-row"), "vault-balance")).toBe("7.00 tUSDC"),
+  );
+  await sleep(600);
+
+  expect(screen.getByTestId("account-id").textContent).toBe(BOB);
+  expect(textOf(screen.getByTestId("token-row"), "vault-balance")).toBe("7.00 tUSDC");
+});
+
+test("an_action_that_ends_after_the_account_changed_does_not_read_the_old_balances_back", async () => {
+  const { alice, user } = await setupTwoAccounts();
+  // Alice's wallet keeps its dialog open until the test closes it.
+  const run = alice.signAndSendTransactions.bind(alice);
+  let close: () => void = () => {};
+  alice.signAndSendTransactions = (params) =>
+    new Promise((resolve) => {
+      close = () => resolve(run(params));
+    });
+  render(<WalletView laterRefreshMs={50} />);
+  await screen.findByTestId("token-row");
+  await user.click(await button("Withdraw unused storage"));
+  await button("Waiting for your wallet…");
+
+  await switchToBob();
+  await waitFor(() =>
+    expect(textOf(screen.getByTestId("token-row"), "vault-balance")).toBe("7.00 tUSDC"),
+  );
+  close();
+  await waitFor(() => expect(screen.queryByText("Waiting for your wallet…")).toBeNull());
+  await sleep(300);
+
+  expect(screen.getByTestId("account-id").textContent).toBe(BOB);
+  expect(textOf(screen.getByTestId("token-row"), "vault-balance")).toBe("7.00 tUSDC");
+});
+
+/** Alice's vault holds only the second of two tokens; she holds 20 of the first herself. */
+function setupTwoTokens() {
+  const first = "tusdc.a.testnet";
+  const second = "tusdc.b.testnet";
+  const chain = new FakeChain(CONTRACT, [{ token: first }, { token: second }]);
+  chain.fundVault(ALICE, second, 5_000_000n);
+  chain.give(first, ALICE, 20_000_000n);
+  chain.give(second, CONTRACT, 5_000_000n);
+  const wallet = chainWallet(chain, ALICE);
+  holder.store = createWalletStore(async () =>
+    fakeProvider({ wallet, accountId: ALICE }, { restored: true }),
+  );
+  vi.stubGlobal("fetch", fakeFetch("http://rpc.test", new FakeNode(chain)));
+  return { chain, first, second, user: userEvent.setup() };
+}
+
+test("an_amount_typed_for_a_token_stays_with_it_when_another_token_joins_the_list", async () => {
+  const { chain, first, second, user } = setupTwoTokens();
+  render(<WalletView />);
+  await screen.findAllByTestId("token-row");
+  const withdrawForm = section("Withdraw");
+  const token = within(withdrawForm).getByLabelText("Token") as HTMLSelectElement;
+  const amount = within(withdrawForm).getByLabelText("Amount") as HTMLInputElement;
+  // Only the second token has anything in the vault: it is the only one to take out.
+  expect(token.value).toBe(second);
+  await user.type(amount, "3");
+
+  // The first token gets a vault balance, and is ahead of the second in the list.
+  const addForm = section("Add funds");
+  await user.type(within(addForm).getByLabelText("Amount"), "4");
+  await user.click(within(addForm).getByRole("button", { name: "Add funds" }));
+  await waitFor(() =>
+    expect(
+      within(withdrawForm)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual([first, second]),
+  );
+
+  // The form still has the second token and the 3 that was typed for it.
+  expect(token.value).toBe(second);
+  expect(amount.value).toBe("3");
+  await user.click(within(withdrawForm).getByRole("button", { name: "Withdraw" }));
+  await within(withdrawForm).findByText("Withdrew 3.00 tUSDC to your wallet.");
+  expect(chain.calls.at(-1)).toMatchObject({ methodName: "withdraw" });
+  expect(chain.calls.at(-1)?.args).toMatchObject({ token: second, amount: "3000000" });
+});
+
+test("an_amount_typed_for_a_token_that_leaves_the_list_is_not_kept_for_another", async () => {
+  const { chain, first, second, user } = setupTwoTokens();
+  chain.fundVault(ALICE, first, 2_000_000n);
+  chain.give(first, CONTRACT, 2_000_000n);
+  render(<WalletView />);
+  await screen.findAllByTestId("token-row");
+  const withdrawForm = section("Withdraw");
+  const token = within(withdrawForm).getByLabelText("Token") as HTMLSelectElement;
+  const amount = within(withdrawForm).getByLabelText("Amount") as HTMLInputElement;
+  await user.selectOptions(token, second);
+  await user.type(amount, "3");
+
+  // The second token's vault balance goes (taken out elsewhere), and the page reads again.
+  chain.vault.get(ALICE)?.set(second, 0n);
+  const addForm = section("Add funds");
+  await user.type(within(addForm).getByLabelText("Amount"), "1");
+  await user.click(within(addForm).getByRole("button", { name: "Add funds" }));
+  await waitFor(() =>
+    expect(
+      within(withdrawForm)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual([first]),
+  );
+
+  // The 3 was for the second token. The first does not get it.
+  expect(token.value).toBe(first);
+  expect(amount.value).toBe("");
 });
