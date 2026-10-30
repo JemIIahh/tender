@@ -217,8 +217,9 @@ export async function getTaskDetail(
         order by (f.account = t.poster) desc, f.amount desc, f.account collate "C"`,
       [taskId],
     ),
+    // `tasks.id`, not `id`: a bare name in `order by` is the output column, which is text.
     db.query<{ id: string }>(
-      "select id::text as id from tasks where parent = $1::numeric order by id",
+      "select id::text as id from tasks where parent = $1::numeric order by tasks.id",
       [taskId],
     ),
     publicDocument(db, task.brief_hash, "brief", BriefSchema),
