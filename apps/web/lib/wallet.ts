@@ -309,8 +309,9 @@ export function createWalletStore(
 
   /**
    * The wallet session is over, or there is none to go on with, and the token goes with it. `tell`:
-   * the session ended here, so the other tabs are told. One that another tab ended is not told on:
-   * that tab told them all.
+   * the session ended here (a Disconnect, the wallet signing itself out), so the other tabs are
+   * told. They are not told of one that another tab ended, which told them all, nor of a wallet
+   * that was not found or could not be looked for: that says nothing of their sessions.
    */
   function endSession(tell: boolean): void {
     session = null;
@@ -362,12 +363,15 @@ export function createWalletStore(
               // A wallet connected in the meantime stays.
               if (session !== null) return;
               if (restored !== null) beginSession(restored, true);
-              // No wallet, so no session in any tab: they are told.
-              else endSession(true);
+              // No wallet: this tab has no session to go on with. The other tabs are not told.
+              // near-connect also says "no wallet" when its wallet list did not download, and a
+              // guess is no reason to sign them out. A session ends for them when it is
+              // disconnected, when the wallet signs itself out, or when a Connect replaces it.
+              else endSession(false);
             },
             (error: unknown) => {
               console.error(error);
-              // Not looked at, so not known to be over for the other tabs: they are left alone.
+              // Not looked at: the same for this tab, and the other tabs are left alone.
               if (session === null) endSession(false);
             },
           )

@@ -91,12 +91,13 @@ test("a_wallet_the_person_connects_is_told_to_the_other_tabs_as_whoever_it_is", 
     const tabs = fakeTabs();
     const store = createWalletStore(async () => fakeProvider(sessionFor(accountId)), tabs.open);
     await store.start();
-    const before = tabs.told;
+    // (A restore that found no wallet told no one.)
+    expect(tabs.told).toBe(0);
 
     await store.connect();
 
     expect(store.getSnapshot().accountId).toBe(accountId);
-    expect(tabs.told - before, accountId).toBe(1);
+    expect(tabs.told, accountId).toBe(1);
   }
 });
 
@@ -107,12 +108,11 @@ test("a_dialog_closed_without_a_wallet_tells_no_one", async () => {
     tabs.open,
   );
   await store.start();
-  const before = tabs.told;
 
   await store.connect();
 
   expect(store.getSnapshot().accountId).toBeNull();
-  expect(tabs.told).toBe(before);
+  expect(tabs.told).toBe(0);
 });
 
 test("a_disconnect_tells_the_other_tabs_once_whether_or_not_the_wallet_reports_its_sign_out", async () => {
@@ -179,16 +179,6 @@ test("a_wallet_found_again_after_a_reload_tells_no_one", async () => {
   expect(tabs.told).toBe(0);
 });
 
-test("a_restore_that_finds_no_wallet_tells_the_other_tabs", async () => {
-  const tabs = fakeTabs();
-  const store = createWalletStore(async () => fakeProvider(sessionFor(ALICE)), tabs.open);
-
-  await store.start();
-
-  expect(store.getSnapshot()).toEqual({ ready: true, accountId: null, canSignMessage: false });
-  expect(tabs.told).toBe(1);
-});
-
 test("a_restore_that_fails_tells_no_one_but_this_tab_goes_on_without_the_token_it_kept", async () => {
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   const tabs = fakeTabs();
@@ -244,24 +234,6 @@ test("a_restore_still_on_its_way_when_the_page_stops_waiting_tells_no_one_and_ke
   expect(store.getSnapshot().accountId).toBe(ALICE);
   expect(tabs.told).toBe(0);
   expect(heldToken()?.token).toBe(`tok-${ALICE}`);
-});
-
-test("a_restore_that_finds_no_wallet_after_the_page_stopped_waiting_tells_the_other_tabs_and_drops_the_token", async () => {
-  vi.useFakeTimers();
-  const tabs = fakeTabs();
-  const slow = slowRestore(sessionFor(ALICE));
-  const store = createWalletStore(async () => slow.provider, tabs.open);
-  keepToken(tokenFor(ALICE), signInTicket());
-  const starting = store.start();
-  await vi.advanceTimersByTimeAsync(9000);
-  await starting;
-  expect(heldToken()).not.toBeNull();
-
-  slow.found(null);
-  await vi.advanceTimersByTimeAsync(0);
-
-  expect(tabs.told).toBe(1);
-  expect(heldToken()).toBeNull();
 });
 
 // ---- What a store does when another tab tells it -----------------------------------------------
@@ -424,14 +396,31 @@ for (const accountId of [ALICE, BOB]) {
   });
 }
 
-test("a_tab_that_loads_and_finds_no_wallet_leaves_the_others_with_no_session_and_no_token", async () => {
+test("a_restore_that_finds_no_wallet_leaves_the_session_and_token_of_another_tab_alone", async () => {
   const one = await connectedTab();
+  // One more listener on the channel, which keeps everything posted on it.
+  const heard: unknown[] = [];
+  const watcher = new BroadcastChannel("tender.wallet");
+  lines.push(watcher);
+  watcher.onmessage = (event) => heard.push(event.data);
+  // A tab that loads with the token of the visit before, and finds no wallet.
   const two = await openTab(fakeProvider(sessionFor(ALICE)));
+  two.signIn(ALICE);
 
   await two.store.start();
 
-  await eventually(() => expect(one.store.getSnapshot()).toEqual(NO_SESSION));
-  expect(one.token()).toBeNull();
+  // It has no session and no token of its own any more...
+  expect(two.store.getSnapshot()).toEqual(NO_SESSION);
+  expect(two.token()).toBeNull();
+  // ...and told no one: a message posted now arrives after anything it posted on the way.
+  const probe = new BroadcastChannel("tender.wallet");
+  lines.push(probe);
+  probe.postMessage("probe");
+  await eventually(() => expect(heard).toContain("probe"));
+  await arrive();
+  expect(heard).toEqual(["probe"]);
+  expect(one.store.getSnapshot().accountId).toBe(ALICE);
+  expect(one.token()?.token).toBe(`tok-${ALICE}`);
   expect(one.provider.disconnects).toBe(0);
 });
 
