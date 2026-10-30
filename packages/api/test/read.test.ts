@@ -424,6 +424,7 @@ test("task_detail_includes_entries_brief_and_children", async () => {
     reveal_count: 2,
     working_count: 0,
     judge_status: null,
+    judge_reason: null,
     is_team_poster: false,
     parent: null,
     outcome_kind: "picked",

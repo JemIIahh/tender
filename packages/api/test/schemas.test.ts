@@ -156,6 +156,9 @@ const CRITERIA: PublicCriteria = {
   normalize: ["trim"],
 };
 
+/** What the Judge says when it turns a task away. */
+const REFUSAL = "kind rubric is limited to team tasks in v1";
+
 function scorecardOf(taskId: string, criteriaHash: string): Scorecard {
   return {
     version: 1,
@@ -201,7 +204,7 @@ async function putDocument(kind: "criteria" | "scorecard", document: unknown): P
  * | 1  | settled, topped up by carol, task 2 is its child | pick by the judge, no scorecard stored      |
  * | 2  | open; alice has committed and not revealed       | none                                        |
  * | 3  | settled; criteria and scorecard blobs are stored | pick by the judge                           |
- * | 4  | settled                                          | void by `void_task`: no `by`, no scorecard  |
+ * | 4  | settled; the Judge refused it at intake          | void by `void_task`: no `by`, no scorecard  |
  * | 5  | settled                                          | empty pick by the judge, with refunds       |
  * | 6  | settled                                          | pick the index took from the chain's view   |
  * | 7  | settled                                          | void the index took from the chain's view   |
@@ -259,8 +262,13 @@ async function seedBoard(): Promise<void> {
       JSON.stringify(outcome),
     ]);
   }
-  // The rows no event writes: what the Judge made of a task, and who said they are working on it.
+  // The rows no event writes: what the Judge made of a task and why, and who said they are working
+  // on it.
   await deps.db.query("update tasks set judge_status = 'accepted' where id = 2");
+  await deps.db.query(
+    "update tasks set judge_status = 'rejected', judge_reason = $1 where id = 4",
+    [REFUSAL],
+  );
   await deps.db.query("insert into working (task_id, account) values (2, $1), (2, $2)", [
     alice,
     bob,
@@ -311,9 +319,15 @@ test("task_routes_match_their_schemas", async () => {
     phase: "open",
     working_count: 2,
     judge_status: "accepted",
+    judge_reason: null,
     is_team_poster: true,
     parent: "1",
     outcome_kind: null,
+  });
+  // A task the Judge turned away says so in the list, and why.
+  expect(board.tasks.find((task) => task.id === "4")).toMatchObject({
+    judge_status: "rejected",
+    judge_reason: REFUSAL,
   });
 
   // A page that is not the last has a cursor, and a filtered list is the same schema.
@@ -348,10 +362,12 @@ test("task_routes_match_their_schemas", async () => {
   ]);
   expect(one?.task.outcome).toMatchObject({ kind: "picked", by: judge });
   expect(two?.entries).toMatchObject([{ account: alice, revealed: false, content_hash: null }]);
+  expect(two?.task).toMatchObject({ judge_status: "accepted", judge_reason: null });
   expect(three?.criteria).toEqual(CRITERIA);
   expect(three?.scorecard?.task_id).toBe("3");
   expect(four?.task.outcome).toMatchObject({ kind: "voided", reason: "expired", by: null });
   expect(four?.task.outcome).toHaveProperty("refunds");
+  expect(four?.task).toMatchObject({ judge_status: "rejected", judge_reason: REFUSAL });
   expect(five?.task.outcome).toMatchObject({ kind: "voided", reason: "no_award", by: judge });
   expect(six?.task.outcome).toMatchObject({ kind: "picked", by: null, by_source: "reconcile" });
   expect(seven?.task.outcome).toMatchObject({ kind: "voided", by: null, by_source: "reconcile" });

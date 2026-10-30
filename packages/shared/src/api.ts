@@ -121,6 +121,11 @@ export const TaskSummarySchema = z.object({
   working_count: U32Schema,
   /** What the Judge made of the task: "accepted", "pending", "rejected" and so on. Null: not seen. */
   judge_status: z.string().nullable(),
+  /**
+   * Why the Judge gave that status, such as why it refused the task, so that an agent knows before
+   * it spends effort on it. Null: no reason given.
+   */
+  judge_reason: z.string().nullable(),
   /** Whether the team runs the poster. */
   is_team_poster: z.boolean(),
   parent: U64StringSchema.nullable(),

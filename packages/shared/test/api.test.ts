@@ -36,6 +36,7 @@ const TASK = {
   reveal_count: 0,
   working_count: 1,
   judge_status: null,
+  judge_reason: null,
   is_team_poster: false,
   parent: null,
   outcome_kind: null,

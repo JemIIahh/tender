@@ -73,6 +73,11 @@ export interface TaskSummary {
   working_count: number;
   /** What the Judge made of the task: "accepted", "pending", "rejected" and so on. Null: not seen. */
   judge_status: string | null;
+  /**
+   * Why the Judge gave that status, such as why it refused the task, so that an agent knows before
+   * it spends effort on it. Null: no reason given.
+   */
+  judge_reason: string | null;
   /** Whether the team runs the poster. */
   is_team_poster: boolean;
   parent: string | null;
