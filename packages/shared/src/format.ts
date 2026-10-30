@@ -83,16 +83,19 @@ export interface TokenMeta {
  * The symbol and decimals of the token at `tokenId` on `network`:
  *
  * - Circle's USDC on its own network: `USDC`, 6.
- * - The test token (`usdc.sandbox`, or any `tusdc.*` account): `tUSDC`, 6.
  * - Wrapped NEAR on its own network (`wrap.near`, `wrap.testnet`): `wNEAR`, 24.
- * - Any other token: the account id as the symbol and 0 decimals, so amounts show as raw units.
- *   The decimals of a token are not guessed.
+ * - The test token: `usdc.sandbox` on the sandbox, and any `tusdc.*` account on a network other
+ *   than mainnet: `tUSDC`, 6. On mainnet no account is taken for a test token, because anyone can
+ *   register a `tusdc.*` name there and its decimals are anyone's to choose.
+ * - Any other token, or a test token on the wrong network: the account id as the symbol and 0
+ *   decimals, so amounts show as raw units. The decimals of a token are not guessed.
  */
 export function tokenMeta(tokenId: string, network: NetworkId): TokenMeta {
   if (tokenId === NETWORKS[network].usdc) return { symbol: "USDC", decimals: USDC_DECIMALS };
   if (tokenId === WRAPPED_NEAR[network]) return { symbol: "wNEAR", decimals: WNEAR_DECIMALS };
-  if (tokenId === "usdc.sandbox" || tokenId.startsWith("tusdc.")) {
-    return { symbol: "tUSDC", decimals: USDC_DECIMALS };
-  }
+  const isTestToken =
+    (network === "sandbox" && tokenId === "usdc.sandbox") ||
+    (network !== "mainnet" && tokenId.startsWith("tusdc."));
+  if (isTestToken) return { symbol: "tUSDC", decimals: USDC_DECIMALS };
   return { symbol: tokenId, decimals: 0 };
 }

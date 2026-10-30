@@ -8,6 +8,11 @@
   "files": {
     "includes": ["**", "!**/node_modules", "!contract", "!docs", "!.superpowers", "!pnpm-lock.yaml"]
   },
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
+  },
   "formatter": {
     "enabled": true,
     "indentStyle": "space",
@@ -19,5 +24,24 @@
     "rules": {
       "preset": "recommended"
     }
-  }
+  },
+  "overrides": [
+    {
+      "includes": ["apps/web/**", "!apps/web/e2e/**", "!apps/web/test/**", "!apps/web/*.config.*"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "paths": {
+                  "@tender/client": "The web app imports only `@tender/client/outcome` (P06-P3): the root also exports Node-only modules that must not reach the browser bundle."
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

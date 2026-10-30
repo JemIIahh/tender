@@ -1,0 +1,436 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { type extractEvents, NETWORKS } from "@tender/shared";
+import { KeyPair } from "near-api-js";
+import { afterEach, describe, expect, expectTypeOf, test } from "vitest";
+import { TenderClient, TenderError, toTxResult } from "../src/index";
+
+const CONTRACT = "tender.test.near";
+const BLOCK = { block_hash: "6kSpdaiEGudXLa4p43ALXFHCu96ozdEJ3c8KsCuajXyj", block_height: 34 };
+
+interface RpcRequest {
+  method: string;
+  params: Record<string, unknown>;
+}
+
+const servers: ReturnType<typeof createServer>[] = [];
+afterEach(async () => {
+  await Promise.all(
+    servers.splice(0).map((s) => new Promise((resolve) => s.close(() => resolve(undefined)))),
+  );
+});
+
+/**
+ * A JSON-RPC endpoint on localhost that answers each request with `answer(request)`: an object
+ * with `result` or `error`, sent with HTTP 200 the way nearcore sends its errors (near-api-js
+ * retries a 5xx, which would only slow the test down).
+ */
+async function fakeRpc(answer: (request: RpcRequest) => object) {
+  const requests: RpcRequest[] = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      const request = JSON.parse(body) as RpcRequest & { id: string };
+      requests.push(request);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: request.id, ...answer(request) }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  servers.push(server);
+  const client = new TenderClient({
+    network: "testnet",
+    contractId: CONTRACT,
+    rpcUrl: `http://127.0.0.1:${port}`,
+  });
+  return { client, requests };
+}
+
+/** What `call_function` returns: the view's JSON as an array of bytes. */
+const viewResult = (value: unknown) => ({
+  result: { result: [...Buffer.from(JSON.stringify(value))], logs: [], ...BLOCK },
+});
+
+/** The view method and its decoded arguments, of a `call_function` query. */
+function viewCall(request: RpcRequest) {
+  const { params } = request;
+  return {
+    method: params.method_name as string,
+    args: JSON.parse(Buffer.from(params.args_base64 as string, "base64").toString()),
+  };
+}
+
+const PUBLIC_KEY = "ed25519:8oM18aZ1sUM15npryCGoe2CdL4PphfsarZdJysVfiVXs";
+
+function taskView(fields: { commit_count: number; cleaned: number }) {
+  return {
+    id: "7",
+    poster: "poster.test.near",
+    token: "usdc.test.near",
+    reward: "1000000",
+    fee_bps: 500,
+    brief_uri: "ipfs://brief",
+    brief_hash: "29a8825bd242f14386ee528d76e0e8f1e38f3c8c4047d7b2d6df7493368a17d0",
+    criteria_hash: "262d517bffd06484e2341b4a379c7f4fa4be9284a9a82631c03420953d60bd67",
+    heldout_commitment: null,
+    verifier: "judge.test.near",
+    created_at: "1793307169820229000",
+    commit_deadline: "1793307289820229000",
+    reveal_deadline: "1793307409820229000",
+    pick_deadline: "1793307529820229000",
+    fallback_deadline: "1793307649820229000",
+    max_entries: 0,
+    max_winners: 1,
+    invited: [],
+    parent: null,
+    reveal_count: 0,
+    funders: [{ account: "poster.test.near", amount: "1000000" }],
+    outcome: { kind: "voided", reason: "no_reveals", scorecard_hash: null, scorecard_uri: null },
+    phase: "settled",
+    ...fields,
+  };
+}
+
+function entryView(index: number) {
+  return {
+    task_id: "7",
+    account: `e${index}.test.near`,
+    index,
+    commitment: "f8ea8d0472958708781004e27f609f4ac0087a4820e165d819a2ee4812098c0e",
+    committed_at_block: "65",
+    content_hash: null,
+    uri: null,
+  };
+}
+
+/** A task with `commitCount` entries, of which only the indexes in `present` are left. */
+function entriesChain(commitCount: number, cleaned: number, present: (index: number) => boolean) {
+  return (request: RpcRequest) => {
+    const { method, args } = viewCall(request);
+    if (method === "get_task") return viewResult(taskView({ commit_count: commitCount, cleaned }));
+    // The contract's paging: the limit is clamped to 1..=50, and the page stops at the last index.
+    const end = Math.min(args.from_index + Math.min(Math.max(args.limit, 1), 50), commitCount);
+    const page = [];
+    for (let i = args.from_index; i < end; i++) if (present(i)) page.push(entryView(i));
+    return viewResult(page);
+  };
+}
+
+describe("TenderClient construction", () => {
+  test("a_sandbox_client_needs_the_chain_rpc_url", () => {
+    expect(NETWORKS.sandbox.rpcUrl).toBe("");
+    expect(() => new TenderClient({ network: "sandbox", contractId: "tender.sandbox" })).toThrow(
+      /no RPC URL for network sandbox.*LocalChain\.rpcUrl/,
+    );
+    expect(
+      () => new TenderClient({ network: "testnet", contractId: CONTRACT, rpcUrl: "" }),
+    ).toThrow(/no RPC URL/);
+  });
+
+  test("the_network_url_is_the_default", () => {
+    const client = new TenderClient({ network: "testnet", contractId: CONTRACT });
+    expect(client.rpcUrl).toBe(NETWORKS.testnet.rpcUrl);
+    expect(client.contractId).toBe(CONTRACT);
+    expect(client.accountId).toBeUndefined();
+    const local = new TenderClient({
+      network: "sandbox",
+      contractId: "tender.sandbox",
+      rpcUrl: "http://127.0.0.1:3030",
+    });
+    expect(local.rpcUrl).toBe("http://127.0.0.1:3030");
+  });
+
+  test("a_signer_sets_the_account", () => {
+    const client = new TenderClient({
+      network: "testnet",
+      contractId: CONTRACT,
+      signer: {
+        accountId: "alice.test.near",
+        privateKey: KeyPair.fromRandom("ed25519").toString(),
+      },
+    });
+    expect(client.accountId).toBe("alice.test.near");
+  });
+
+  test("send_without_a_signer_throws", async () => {
+    const client = new TenderClient({ network: "testnet", contractId: CONTRACT });
+    await expect(client.voidTask(1n)).rejects.toThrow(/no signer/);
+  });
+});
+
+describe("views", () => {
+  test("read_the_last_final_block_and_validate", async () => {
+    const config = {
+      owner: "owner.test.near",
+      pending_owner: null,
+      treasury: "treasury.test.near",
+      fee_bps: 500,
+      min_window_secs: 60,
+      max_window_secs: 1_209_600,
+      paused: false,
+      version: 1,
+      tokens: [],
+    };
+    const { client, requests } = await fakeRpc(() => viewResult(config));
+    expect(await client.getConfig()).toEqual(config);
+    expect(requests[0]?.params).toMatchObject({
+      request_type: "call_function",
+      account_id: CONTRACT,
+      method_name: "get_config",
+      finality: "final",
+    });
+  });
+
+  test("a_view_that_breaks_its_schema_is_an_error", async () => {
+    // A u128 as a JSON number loses digits, and is refused.
+    const { client } = await fakeRpc(() =>
+      viewResult({ ...taskView({ commit_count: 0, cleaned: 0 }), reward: 1e6 }),
+    );
+    await expect(client.getTask(7n)).rejects.toThrow();
+  });
+
+  test("a_missing_value_is_null", async () => {
+    const { client, requests } = await fakeRpc(() => viewResult(null));
+    expect(await client.getTask(7n)).toBeNull();
+    expect(await client.getEntry(7n, "alice.test.near")).toBeNull();
+    expect(await client.getAgent("alice.test.near")).toBeNull();
+    expect(await client.storageBalanceOf("alice.test.near")).toBeNull();
+    expect(await client.ftStorageBalanceOf("usdc.test.near", "alice.test.near")).toBeNull();
+    expect(requests.map(viewCall)).toEqual([
+      { method: "get_task", args: { task_id: "7" } },
+      { method: "get_entry", args: { task_id: "7", account_id: "alice.test.near" } },
+      { method: "get_agent", args: { account_id: "alice.test.near" } },
+      { method: "storage_balance_of", args: { account_id: "alice.test.near" } },
+      { method: "storage_balance_of", args: { account_id: "alice.test.near" } },
+    ]);
+    expect(requests[4]?.params.account_id).toBe("usdc.test.near");
+  });
+
+  test("amounts_and_counts_are_bigints", async () => {
+    const { client } = await fakeRpc((request) => {
+      const { method } = viewCall(request);
+      return viewResult(
+        method === "task_count"
+          ? "18446744073709551615"
+          : "340282366920938463463374607431768211455",
+      );
+    });
+    expect(await client.taskCount()).toBe(2n ** 64n - 1n);
+    expect(await client.balanceOf("alice.test.near", "usdc.test.near")).toBe(2n ** 128n - 1n);
+    expect(await client.ftBalanceOf("usdc.test.near", "alice.test.near")).toBe(2n ** 128n - 1n);
+  });
+
+  test("the_final_block_gives_height_and_time", async () => {
+    const { client, requests } = await fakeRpc(() => ({
+      result: { header: { height: 120, timestamp_nanosec: "1793307169820229123" } },
+    }));
+    expect(await client.finalHeight()).toBe(120n);
+    expect(await client.blockTimestampNs()).toBe(1793307169820229123n);
+    for (const request of requests) {
+      expect(request).toMatchObject({ method: "block", params: { finality: "final" } });
+    }
+  });
+});
+
+describe("getAllEntries", () => {
+  test("pages_from_the_cleaned_count_to_the_last_index", async () => {
+    const { client, requests } = await fakeRpc(entriesChain(130, 60, () => true));
+    const entries = await client.getAllEntries(7n);
+    expect(entries.map((e) => e.index)).toEqual(Array.from({ length: 70 }, (_, i) => 60 + i));
+    const pages = requests.map(viewCall).filter((c) => c.method === "get_entries");
+    expect(pages.map((c) => c.args)).toEqual([
+      { task_id: "7", from_index: 60, limit: 50 },
+      { task_id: "7", from_index: 110, limit: 50 },
+    ]);
+  });
+
+  test("does_not_stop_at_an_empty_page", async () => {
+    // Nothing is left of the first 50 indexes, although the task says none were cleaned.
+    const { client } = await fakeRpc(entriesChain(120, 0, (i) => i >= 50 && i % 2 === 0));
+    const entries = await client.getAllEntries(7n);
+    expect(entries.map((e) => e.index)).toEqual(Array.from({ length: 35 }, (_, i) => 50 + 2 * i));
+  });
+
+  test("a_missing_task_has_no_entries", async () => {
+    const { client, requests } = await fakeRpc(() => viewResult(null));
+    expect(await client.getAllEntries(7n)).toEqual([]);
+    expect(requests).toHaveLength(1);
+  });
+});
+
+describe("viewAccessKey", () => {
+  test("passes_the_permission_through_unmodified", async () => {
+    // A variant KeyPermission does not name: the verifier, not the client, decides what to allow.
+    const permission = {
+      GasKeyFunctionCall: {
+        allowance: null,
+        balance: "0",
+        method_names: [],
+        num_nonces: 1,
+        receiver_id: CONTRACT,
+      },
+    };
+    const { client, requests } = await fakeRpc(() => ({
+      result: { ...BLOCK, nonce: 29_000_000, permission },
+    }));
+    expect(await client.viewAccessKey("alice.test.near", PUBLIC_KEY)).toEqual({ permission });
+    expect(requests[0]).toMatchObject({
+      method: "query",
+      params: {
+        request_type: "view_access_key",
+        account_id: "alice.test.near",
+        public_key: PUBLIC_KEY,
+        finality: "final",
+      },
+    });
+  });
+
+  test("a_missing_key_is_null", async () => {
+    // nearcore 2.13.4 answers this way, for an account without the key and for a missing account.
+    const { client } = await fakeRpc(() => ({
+      result: {
+        ...BLOCK,
+        error: `access key ${PUBLIC_KEY} does not exist while viewing`,
+        logs: [],
+      },
+    }));
+    expect(await client.viewAccessKey("alice.test.near", PUBLIC_KEY)).toBeNull();
+  });
+
+  test("a_missing_key_in_the_structured_error_form_is_null", async () => {
+    const { client } = await fakeRpc(() => ({
+      error: {
+        name: "HANDLER_ERROR",
+        cause: { name: "UNKNOWN_ACCESS_KEY", info: { public_key: PUBLIC_KEY, ...BLOCK } },
+        code: -32000,
+        message: "Server error",
+      },
+    }));
+    expect(await client.viewAccessKey("alice.test.near", PUBLIC_KEY)).toBeNull();
+  });
+
+  test("a_missing_account_is_null", async () => {
+    const { client } = await fakeRpc(() => ({
+      error: {
+        name: "HANDLER_ERROR",
+        cause: {
+          name: "UNKNOWN_ACCOUNT",
+          info: { requested_account_id: "nobody.test.near", ...BLOCK },
+        },
+        code: -32000,
+        message: "Server error",
+      },
+    }));
+    expect(await client.viewAccessKey("nobody.test.near", PUBLIC_KEY)).toBeNull();
+  });
+
+  test.each([
+    [{ name: "HANDLER_ERROR", cause: { name: "UNKNOWN_BLOCK", info: {} } }],
+    [{ name: "HANDLER_ERROR", cause: { name: "NO_SYNCED_BLOCKS", info: {} } }],
+    [
+      {
+        name: "INTERNAL_ERROR",
+        cause: { name: "INTERNAL_ERROR", info: { error_message: "boom" } },
+      },
+    ],
+  ])("any_other_rpc_error_is_thrown %j", async (error) => {
+    const { client } = await fakeRpc(() => ({ error: { ...error, code: -32000, message: "x" } }));
+    await expect(client.viewAccessKey("alice.test.near", PUBLIC_KEY)).rejects.toThrow();
+  });
+});
+
+describe("toTxResult", () => {
+  const base64 = (text: string) => Buffer.from(text).toString("base64");
+  const event = (name: string, data: object) =>
+    `EVENT_JSON:${JSON.stringify({ standard: "tender", version: "1.0.0", event: name, data: [data] })}`;
+  const voided = event("voided", {
+    task_id: "7",
+    reason: "no_reveals",
+    by: null,
+    refunds: [{ account: "poster.test.near", amount: "1000000" }],
+    scorecard_hash: null,
+    scorecard_uri: null,
+  });
+  const withdraw = event("withdraw", {
+    account: "bob.test.near",
+    token: "usdc.test.near",
+    amount: "5",
+    to: "bob.test.near",
+  });
+  const response = (status: unknown) => ({
+    status,
+    transaction: { hash: "TX" },
+    receipts_outcome: [
+      {
+        id: "R1",
+        outcome: { executor_id: CONTRACT, status: { SuccessValue: "" }, logs: [voided, "note"] },
+      },
+      // A failed receipt keeps its logs, and they are not events.
+      { id: "R2", outcome: { executor_id: CONTRACT, status: { Failure: {} }, logs: [withdraw] } },
+      // Another contract can log what looks like a Tender event.
+      {
+        id: "R3",
+        outcome: { executor_id: "evil.test.near", status: { SuccessValue: "" }, logs: [withdraw] },
+      },
+    ],
+  });
+
+  test("a_success_returns_the_events_and_the_value", () => {
+    const result = toTxResult(response({ SuccessValue: base64('"7"') }), CONTRACT);
+    expect(result.txHash).toBe("TX");
+    expect(result.returnValue).toBe("7");
+    expect(result.events).toMatchObject([{ event: "voided", receiptId: "R1", logIndex: 0 }]);
+    // The type has the receipt id and the log index too, which consumers deduplicate on.
+    expectTypeOf(result.events).toEqualTypeOf<ReturnType<typeof extractEvents>>();
+    expect(result.receipts.map((r) => r.status)).toEqual(["success", "failure", "success"]);
+  });
+
+  test("the_return_value_is_decoded_json", () => {
+    expect(toTxResult(response({ SuccessValue: base64("false") }), CONTRACT).returnValue).toBe(
+      false,
+    );
+    expect(toTxResult(response({ SuccessValue: base64("1") }), CONTRACT).returnValue).toBe(1);
+    expect(toTxResult(response({ SuccessValue: "" }), CONTRACT).returnValue).toBeUndefined();
+    expect(toTxResult(response({ SuccessValue: base64("not json") }), CONTRACT).returnValue).toBe(
+      "not json",
+    );
+  });
+
+  test("a_failure_throws_the_code", () => {
+    const panic =
+      "Smart contract panicked: E_AUTH: the poster and the verifier cannot enter task 7";
+    const failure = {
+      ActionError: { index: 0, kind: { FunctionCallError: { ExecutionError: panic } } },
+    };
+    let thrown: unknown;
+    try {
+      toTxResult(response({ Failure: failure }), CONTRACT);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(TenderError);
+    expect(thrown).toMatchObject({ code: "E_AUTH", message: panic, txHash: "TX", cause: failure });
+  });
+
+  test("a_failure_without_a_panic_is_unknown", () => {
+    const failure = {
+      ActionError: { index: 0, kind: { AccountDoesNotExist: { account_id: CONTRACT } } },
+    };
+    expect(() => toTxResult(response({ Failure: failure }), CONTRACT)).toThrow(
+      expect.objectContaining({ code: "E_UNKNOWN", message: JSON.stringify(failure) }),
+    );
+  });
+
+  test.each([["Started"], ["NotStarted"], [{}], [null], [{ SuccessValue: 1 }]])(
+    "an_unfinished_or_unknown_status_throws %j",
+    (status) => {
+      expect(() => toTxResult(response(status), CONTRACT)).toThrow(
+        expect.objectContaining({ code: "E_UNKNOWN", txHash: "TX" }),
+      );
+    },
+  );
+});

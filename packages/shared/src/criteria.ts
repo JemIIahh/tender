@@ -6,11 +6,65 @@ const BPS_WHOLE = 10_000;
 const MAX_SPLIT_SHARES = 5;
 const SPLIT_RULE = `a split is "winner_take_all", "equal", or 1 to ${MAX_SPLIT_SHARES} whole shares in basis points, each above 0, that add up to ${BPS_WHOLE}`;
 
+/** How many arrays and objects a JSON value in a document may be nested in, one inside another. */
+const MAX_JSON_DEPTH = 64;
+
 /**
- * Any JSON value, typed `unknown` because the Judge only compares these. `undefined`, NaN and the
+ * Any JSON value, typed `unknown` because the Judge only compares these: null, a boolean, a finite
+ * number, a string, or an array or plain object of such values. `undefined`, NaN and the
  * infinities are not JSON, so they fail, and a missing key fails like `undefined` does.
+ *
+ * It also fails a value nested more than 64 levels deep, and an object with an own `__proto__` key.
+ * A schema that builds a new object cannot keep such a key (it would set the prototype, or skip
+ * the key), and a document that lost a key hashes differently from the one that was sent. So
+ * parsing returns the value it was given, not a copy, and never recurses: a value nested
+ * thousands of levels deep fails like any other.
  */
-export const JsonValueSchema: z.ZodType<unknown> = z.json();
+export const JsonValueSchema: z.ZodType<unknown> = z.custom<unknown>(
+  isJsonValue,
+  `expected a JSON value, at most ${MAX_JSON_DEPTH} levels deep and with no "__proto__" key`,
+);
+
+/** Walks `root` with a stack of its own, so that nesting cannot overflow the call stack. */
+function isJsonValue(root: unknown): boolean {
+  // Each entry is a value and the number of arrays and objects around it.
+  const pending: Array<[value: unknown, depth: number]> = [[root, 0]];
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    const [value, depth] = next;
+    if (value === null || typeof value === "string" || typeof value === "boolean") continue;
+    if (typeof value === "number") {
+      if (Number.isFinite(value)) continue;
+      return false;
+    }
+    if (typeof value !== "object" || depth >= MAX_JSON_DEPTH) return false;
+
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        const item: unknown = value[i];
+        // A hole of a sparse array reads as `undefined`. Stopping here also keeps an array that
+        // claims a length of billions from being walked to the end.
+        if (item === undefined) return false;
+        pending.push([item, depth + 1]);
+      }
+    } else {
+      const prototype = Object.getPrototypeOf(value);
+      if (prototype !== Object.prototype && prototype !== null) return false;
+      const record = value as Record<string, unknown>;
+      const keys = Object.keys(record);
+      if (keys.includes("__proto__") || Object.getOwnPropertySymbols(record).length > 0)
+        return false;
+      for (const key of keys) pending.push([record[key], depth + 1]);
+    }
+  }
+  return true;
+}
+
+/** A JSON object: a `JsonValueSchema` value that is neither an array nor a scalar. */
+const JsonObjectSchema = JsonValueSchema.refine(
+  (value): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value),
+  "expected a JSON object",
+);
 
 /** How a task's entries are scored. */
 export const CriteriaKindSchema = z.enum([
@@ -75,7 +129,7 @@ export const PublicCriteriaSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("json_schema"),
     ...common,
-    schema: z.record(z.string(), JsonValueSchema),
+    schema: JsonObjectSchema,
   }),
   z.strictObject({
     kind: z.literal("regex_cases"),
@@ -100,6 +154,28 @@ export const PublicCriteriaSchema = z.discriminatedUnion("kind", [
 ]);
 export type PublicCriteria = z.infer<typeof PublicCriteriaSchema>;
 
+const ExactHeldoutSchema = z.strictObject({ expected: z.array(z.string()).min(1) });
+const JsonSchemaHeldoutSchema = z.strictObject({
+  assertions: z.array(z.strictObject({ path: z.string().min(1), equals: JsonValueSchema })).min(1),
+});
+const RegexCasesHeldoutSchema = z.strictObject({
+  match: z.array(z.string()),
+  no_match: z.array(z.string()),
+});
+const TestsHeldoutSchema = z.strictObject({
+  cases: z.array(z.strictObject({ input: JsonValueSchema, output: JsonValueSchema })).min(1),
+});
+
+/** A held-out document: one key, the criteria kind, whose value has that kind's shape. */
+export type Heldout =
+  | { exact: z.infer<typeof ExactHeldoutSchema> }
+  | { json_schema: z.infer<typeof JsonSchemaHeldoutSchema> }
+  | { regex_cases: z.infer<typeof RegexCasesHeldoutSchema> }
+  | { tests: z.infer<typeof TestsHeldoutSchema> };
+
+const HELDOUT_RULE =
+  "a held-out document has exactly one key: exact, json_schema, regex_cases or tests";
+
 /**
  * The held-out half of a task's criteria: the hidden answers and cases the Judge scores with. It
  * is stored as `canonicalJson` bytes, the task's `heldout_commitment` on chain is the SHA-256 of
@@ -108,29 +184,25 @@ export type PublicCriteria = z.infer<typeof PublicCriteriaSchema>;
  * An object with exactly one key, the criteria kind, whose value has that kind's shape:
  * `{"regex_cases": {"match": [...], "no_match": [...]}}`. A `rubric` has no held-out document.
  * The schema checks the shape; `heldoutMatchesCriteria` checks that the kind is the task's.
+ *
+ * The key picks the shape, so a mistake inside it is reported where it is, such as a missing
+ * `regex_cases.no_match`, and not as a failure to match any of the four.
  */
-export const HeldoutSchema = z.union([
-  z.strictObject({ exact: z.strictObject({ expected: z.array(z.string()).min(1) }) }),
-  z.strictObject({
-    json_schema: z.strictObject({
-      assertions: z
-        .array(z.strictObject({ path: z.string().min(1), equals: JsonValueSchema }))
-        .min(1),
-    }),
-  }),
-  z.strictObject({
-    regex_cases: z.strictObject({ match: z.array(z.string()), no_match: z.array(z.string()) }),
-  }),
-  z.strictObject({
-    tests: z.strictObject({
-      cases: z.array(z.strictObject({ input: JsonValueSchema, output: JsonValueSchema })).min(1),
-    }),
-  }),
-]);
-export type Heldout = z.infer<typeof HeldoutSchema>;
-
-/** The kinds that have a held-out document. */
-export type HeldoutKind = Exclude<CriteriaKind, "rubric">;
+export const HeldoutSchema = z
+  .strictObject({
+    exact: z.exactOptional(ExactHeldoutSchema),
+    json_schema: z.exactOptional(JsonSchemaHeldoutSchema),
+    regex_cases: z.exactOptional(RegexCasesHeldoutSchema),
+    tests: z.exactOptional(TestsHeldoutSchema),
+  })
+  // Checked last, once the keys that are there are known and well formed, so it is the only
+  // thing reported for `{}` and for two kinds at once.
+  .refine((document) => Object.keys(document).length === 1, {
+    error: HELDOUT_RULE,
+    when: (payload) => payload.issues.length === 0,
+  })
+  // Exactly one of the four keys is set, so the document is one member of `Heldout`.
+  .transform((document) => document as Heldout);
 
 /**
  * Whether `heldout` is of the kind `criteria` asks for. A held-out document that is valid on its
