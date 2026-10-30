@@ -336,7 +336,11 @@ test("start_with_valid_nonce_links", async () => {
 test("start_with_used_or_expired_nonce_rejected", async () => {
   await seedLinkNonce(db, "nonce-used", "used.near", { used: true });
   await seedLinkNonce(db, "nonce-expired", "expired.near", { expiresInMs: -60_000 });
-  await seedLinkNonce(db, "nonce-just-expired", "just-expired.near", { expiresInMs: -1_000 });
+  // Expired the moment it was minted, by the database's own clock: no margin for a clock to miss.
+  await db.query("insert into tg_link_nonces (nonce, account, expires_at) values ($1, $2, now())", [
+    "nonce-just-expired",
+    "just-expired.near",
+  ]);
 
   // Missing (no payload at all), unknown, used and expired nonces all get the same answer, so the
   // reply does not tell a guesser which of them it hit.
@@ -765,6 +769,36 @@ test("watches_sent_at_once_cannot_pass_the_cap", async () => {
   expect(replies.filter((text) => text.startsWith("Watching "))).toHaveLength(1);
   expect(replies.filter((text) => text.startsWith("Not watching "))).toHaveLength(4);
   expect(await tagsOf(chat)).toHaveLength(WATCH_LIMIT);
+});
+
+test("the_watch_cap_does_not_rely_on_the_servers_default_isolation", async () => {
+  // The advisory lock lines /watch commands up, and the count behind it must then see what the
+  // command ahead committed. READ COMMITTED does; at REPEATABLE READ the first query, which is the
+  // lock, fixes the snapshot before the wait, and the count would miss it. So the transaction has to
+  // ask for READ COMMITTED itself. This one reads its own level just before it commits.
+  const levels: string[] = [];
+  const spied: Db = {
+    ...db,
+    tx: (fn) =>
+      db.tx(async (tx) => {
+        const result = await fn(tx);
+        const rows = await tx.query<{ level: string }>(
+          "select current_setting('transaction_isolation') as level",
+        );
+        levels.push(rows[0]?.level ?? "");
+        return result;
+      }),
+  };
+
+  await db.exec("set default_transaction_isolation to 'repeatable read'");
+  try {
+    const reply = await say(newChat(), "/watch isolation-check", botOn(spied));
+    expect(reply).toBe(watching("isolation-check"));
+  } finally {
+    await db.exec("set default_transaction_isolation to 'read committed'");
+  }
+
+  expect(levels).toEqual(["read committed"]);
 });
 
 test("unwatch_removes_only_that_tag", async () => {

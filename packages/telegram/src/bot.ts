@@ -289,9 +289,16 @@ function tagRule(command: "watch" | "unwatch"): string {
  * Postgres releases when the transaction ends. The key is a pair: `WATCH_LOCK`, and a hash of the
  * chat id. A pair is a key space of its own, apart from the single number that `migrate` locks, and
  * two chats whose ids hash alike only make one command wait for the other.
+ *
+ * The lock only helps if the count behind it sees what the command ahead committed. `db.tx` sends
+ * a plain `begin`, which takes the server's default isolation level. At REPEATABLE READ or above
+ * the first query, here the lock, fixes the snapshot before the wait, and the count would still
+ * see 19 tags. So the transaction asks for READ COMMITTED, as its first statement: Postgres refuses
+ * to change the level once a query has run.
  */
 async function addWatch(db: Db, chatId: number, tag: string): Promise<boolean> {
   return db.tx(async (tx) => {
+    await tx.exec("set transaction isolation level read committed");
     await tx.query("select pg_advisory_xact_lock($1::int4, hashtext($2::text))", [
       WATCH_LOCK,
       String(chatId),
