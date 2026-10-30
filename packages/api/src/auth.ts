@@ -116,11 +116,19 @@ export async function createChallenge(deps: ApiDeps): Promise<ChallengeResponse>
  */
 const KEY_LOOKUP_DEADLINE_MS = 5_000;
 
+/** What a lookup fails with when `KEY_LOOKUP_DEADLINE_MS` has passed. */
+class NoAnswerInTime extends Error {
+  constructor() {
+    super(`no answer within ${KEY_LOOKUP_DEADLINE_MS} ms`);
+    this.name = "NoAnswerInTime";
+  }
+}
+
 /**
  * The chain could not say whether a key is on an account: its call failed, or gave no answer
- * within `KEY_LOOKUP_DEADLINE_MS`. `cause` is the call's own error, or the deadline. It is the one
- * error `lookUpKey` throws, so that whoever asked can tell a chain that is not answering from a
- * fault of our own.
+ * within `KEY_LOOKUP_DEADLINE_MS`. `cause` is the call's own error, or `NoAnswerInTime`. It is the
+ * one error `lookUpKey` throws, so that whoever asked can tell a chain that is not answering from
+ * a fault of our own. It is not to be logged whole: see `logLookupFailure`.
  */
 class KeyLookupFailed extends Error {
   constructor(cause: unknown) {
@@ -147,10 +155,7 @@ async function lookUpKey(
       // Called as a method, because a `TenderClient` reads its own fields.
       deps.client.viewAccessKey(account, publicKey),
       new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`no answer within ${KEY_LOOKUP_DEADLINE_MS} ms`)),
-          KEY_LOOKUP_DEADLINE_MS,
-        );
+        timer = setTimeout(() => reject(new NoAnswerInTime()), KEY_LOOKUP_DEADLINE_MS);
       }),
     ]);
   } catch (error) {
@@ -158,6 +163,19 @@ async function lookUpKey(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Logs that the chain could not be asked about the key of `whose`, with the name of what went
+ * wrong and nothing else. The text of an RPC error can name an endpoint with a key in it, and so
+ * can the `cause` of a `KeyLookupFailed`, which is the error: neither is logged, and
+ * `routes/health.ts` logs only the name in the same way. A thing that is thrown and is no error
+ * has no name, and gives its type.
+ */
+function logLookupFailure(whose: string, error: unknown): void {
+  const cause = error instanceof KeyLookupFailed ? error.cause : error;
+  const kind = cause instanceof Error ? cause.name : typeof cause;
+  console.error(`api: cannot check the key of ${whose} (${kind})`);
 }
 
 /** The answer to a request that needs the chain to say something about a key, and it cannot. */
@@ -172,7 +190,7 @@ function unavailable(): never {
  */
 function unavailableIfLookupFailed(error: unknown): never {
   if (!(error instanceof KeyLookupFailed)) throw error;
-  console.error("api: cannot check the key of a sign-in:", error);
+  logLookupFailure("a sign-in", error);
   return unavailable();
 }
 
@@ -320,9 +338,11 @@ type KeyCheck =
  * asked more than once a minute per token: a good answer is kept for a minute, by the clock in
  * `deps`, and requests that come while the chain is being asked share that one question. A key
  * that is removed therefore stops signing in within a minute of its removal, since the last good
- * answer was given before it. An answer that is not good is not kept: a token whose key is gone
- * is deleted, and a chain that cannot answer, because it failed or because it gave no answer in
- * time, is asked again by the next request.
+ * answer was given before it. An answer is dated from the moment the chain was asked, and from the
+ * moment it answered if the clock went back in between, whichever reading is the earlier, so that
+ * a minute from its date is never more than a minute from the question. An answer that is not
+ * good is not kept: a token whose key is gone is deleted, and a chain that cannot answer, because
+ * it failed or because it gave no answer in time, is asked again by the next request.
  */
 function keyChecker(deps: ApiDeps) {
   // Good answers by token hash, the oldest first: a token that is checked again moves to the end,
@@ -335,21 +355,27 @@ function keyChecker(deps: ApiDeps) {
     hash: string,
     account: string,
     publicKey: string,
-    now: bigint,
+    asked: bigint,
   ): Promise<KeyCheck> {
     let found: { permission: KeyPermission } | null;
     try {
       found = await lookUpKey(deps, account, publicKey);
     } catch (error) {
-      console.error("api: cannot check the key of a signed-in token:", error);
+      logLookupFailure("a signed-in token", error);
       return { status: "unavailable" };
     }
+    // The answer is dated from the question, and not from its arrival: the chain may have said it
+    // at any time between them, so the earlier time is the one that can be relied on. If the clock
+    // went back meanwhile, the reading on arrival is the smaller, and it is the date by the clock
+    // as it now stands.
+    const arrived = nowNs(deps);
+    const at = arrived < asked ? arrived : asked;
     const keyKind = found === null ? null : keyKindOf(found.permission, deps.contractId);
     good.delete(hash);
     if (keyKind === null) return { status: "revoked" };
-    good.set(hash, { at: now, keyKind });
+    good.set(hash, { at, keyKind });
     for (const [oldHash, old] of good) {
-      if (isFresh(old.at, now)) break;
+      if (isFresh(old.at, arrived)) break;
       good.delete(oldHash);
     }
     return { status: "qualifies", keyKind };
@@ -391,6 +417,10 @@ function unauthorized(c: Context): Response {
  * pass, and is not held against its key either. The kind a route sees is the lower of the one the
  * token was issued for and the one the key has now, so a token never gains from a key that is
  * changed, and loses with it.
+ *
+ * The clock is read twice. The first reading, before the row is read, is the time the request
+ * began, and the token must not have expired by it. The check of the key is given a second, after
+ * the row is in: a slow read of the row must not make an answer that has gone stale look fresh.
  */
 export function requireAuth(deps: ApiDeps): RequireAuth {
   const checkKey = keyChecker(deps);
@@ -409,7 +439,7 @@ export function requireAuth(deps: ApiDeps): RequireAuth {
     // A kind this code does not know was written by something else: it signs nothing in.
     if (hash === undefined || !row || !isKeyKind(row.key_kind)) return unauthorized(c);
 
-    const check = await checkKey(hash, row.account, row.public_key, now);
+    const check = await checkKey(hash, row.account, row.public_key, nowNs(deps));
     if (check.status === "unavailable") return unavailable();
     if (check.status === "revoked") {
       await deps.db.query("delete from auth_tokens where token_sha256 = $1", [hash]);
