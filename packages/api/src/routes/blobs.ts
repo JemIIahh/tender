@@ -43,7 +43,7 @@ export type AuthVariables = { account: string; keyKind: "full_access" | "functio
 
 /**
  * The middleware that signs a request in: it sets `c.var.account` and `c.var.keyKind`, or answers
- * 401 itself.
+ * 401 itself, or 503 when it cannot check that the key of the token is still there.
  */
 export type RequireAuth = MiddlewareHandler<{ Variables: AuthVariables }>;
 

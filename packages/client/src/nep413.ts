@@ -211,8 +211,10 @@ function signatureVerifies(key: PublicKey, digest: Uint8Array, signature: Uint8A
 /**
  * The policy: a FullAccess key, or a FunctionCall key limited to the Tender contract. Every other
  * answer is refused, including the RPC's gas-key variants and anything of an unexpected shape.
+ * It is exported so that whoever asks again whether a signed-in key still qualifies, as the API
+ * does for its tokens, asks the same question as the sign-in did.
  */
-function keyKindOf(permission: unknown, contractId: string): Nep413Result["keyKind"] | null {
+export function keyKindOf(permission: unknown, contractId: string): Nep413Result["keyKind"] | null {
   if (permission === "FullAccess") return "full_access";
   const variant = asRecord(permission);
   if (variant === null) return null;

@@ -8,7 +8,7 @@ import * as nearNep413 from "near-api-js/nep413";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { type ChallengeResponse, requireAuth, type SignInResponse } from "../src/auth";
 import { handleError } from "../src/format";
-import { type ApiDeps, createApp, type ErrorBody } from "../src/index";
+import { type ApiDeps, type ChainReader, createApp, type ErrorBody } from "../src/index";
 import type { AuthVariables } from "../src/routes/blobs";
 import { fakeClient, resetDb, TEST_NOW, testDeps } from "./helpers";
 
@@ -220,6 +220,44 @@ async function challengeRows() {
   );
 }
 
+async function blobCount(): Promise<number> {
+  const [row] = await deps.db.query<{ n: number }>("select count(*)::int as n from blobs");
+  return row?.n ?? 0;
+}
+
+/** `whoami` with `token` when the clock says `at`. */
+function whoamiAt(app: Hono<{ Variables: AuthVariables }>, token: string, at: bigint) {
+  nowNs = at;
+  return whoami(app, `Bearer ${token}`);
+}
+
+/**
+ * A chain that changes under a running API. Every key on it has `permission` (null: no key), it
+ * records each lookup, and `failing` makes the lookups throw.
+ */
+interface LiveChain {
+  permission: KeyPermission | null;
+  failing: boolean;
+  lookups: Array<[string, string]>;
+  client: ChainReader;
+}
+
+function liveChain(permission: KeyPermission | null = "FullAccess"): LiveChain {
+  const chain: LiveChain = {
+    permission,
+    failing: false,
+    lookups: [],
+    client: fakeClient({
+      viewAccessKey: async (account, key) => {
+        chain.lookups.push([account, key]);
+        if (chain.failing) throw new Error("rpc down at https://marker-rpc.example/?key=secret");
+        return chain.permission === null ? null : { permission: chain.permission };
+      },
+    }),
+  };
+  return chain;
+}
+
 // ---- Sign-in ----------------------------------------------------------------------------------
 
 test("challenge_then_verify_issues_token", async () => {
@@ -403,7 +441,7 @@ test("function_call_key_for_tender_accepted", async () => {
   const [row] = await tokenRows();
   expect(row).toMatchObject({ account: bob, key_kind: "function_call" });
   // Requests signed in with it see the kind of the key.
-  const who = await whoami(probe(), `Bearer ${reply.body.token}`);
+  const who = await whoami(probe({ client }), `Bearer ${reply.body.token}`);
   expect(await who.json()).toEqual({ account: bob, key_kind: "function_call" });
 });
 
@@ -616,8 +654,7 @@ test("bearer_required_on_protected_routes", async () => {
     }
   }
   // Nothing was stored for a request that was refused.
-  const [count] = await deps.db.query<{ n: number }>("select count(*)::int as n from blobs");
-  expect(count?.n).toBe(2);
+  expect(await blobCount()).toBe(2);
 
   // Not even a body that is too large or not JSON gets further than the refusal.
   const junk = await post<ErrorBody>(app, "/v1/blobs", "x".repeat(500_000));
@@ -702,6 +739,172 @@ test("a_token_of_an_unknown_kind_signs_nothing_in", async () => {
 
   expect(reply.status).toBe(401);
   expect(await reply.json()).toEqual(UNAUTHORIZED);
+});
+
+// ---- A token lives as long as its key ---------------------------------------------------------
+
+test("a_token_stops_working_within_a_minute_of_its_key_going", async () => {
+  const chain = liveChain();
+  const app = probe({ client: chain.client });
+  const { token, key } = await signIn(appWith({ client: chain.client }));
+  chain.lookups.length = 0;
+
+  // While the key is there the token works. The key is asked about on the account the token was
+  // issued to, in its canonical spelling.
+  expect((await whoamiAt(app, token, TEST_NOW)).status).toBe(200);
+  expect(chain.lookups).toEqual([[alice, key.getPublicKey().toString()]]);
+
+  // The key goes. The last check was good, so the token lives until a minute after it.
+  chain.permission = null;
+  expect((await whoamiAt(app, token, TEST_NOW + MINUTE - 1n)).status).toBe(200);
+  const refused = await whoamiAt(app, token, TEST_NOW + MINUTE);
+  expect(refused.status).toBe(401);
+  expect(await refused.json()).toEqual(UNAUTHORIZED);
+  expect(refused.headers.get("www-authenticate")).toBe("Bearer");
+  expect(await tokenRows()).toEqual([]);
+
+  // A token that is gone costs the chain nothing.
+  const asked = chain.lookups.length;
+  expect((await whoamiAt(app, token, TEST_NOW + MINUTE + SECOND)).status).toBe(401);
+  expect(chain.lookups.length).toBe(asked);
+});
+
+test("a_checked_key_is_not_asked_about_again_within_a_minute", async () => {
+  const chain = liveChain();
+  const app = probe({ client: chain.client });
+  const { token } = await signIn(appWith({ client: chain.client }));
+  chain.lookups.length = 0;
+
+  // One lookup answers the minute after it, up to but not including its end. Then the next
+  // request asks again.
+  const times = [
+    0n,
+    SECOND,
+    MINUTE - 1n,
+    MINUTE,
+    MINUTE + 30n * SECOND,
+    2n * MINUTE - 1n,
+    2n * MINUTE,
+  ];
+  const asked: number[] = [];
+  for (const at of times) {
+    expect((await whoamiAt(app, token, TEST_NOW + at)).status, `${at}`).toBe(200);
+    asked.push(chain.lookups.length);
+  }
+  expect(asked).toEqual([1, 1, 1, 2, 2, 2, 3]);
+
+  // A clock that goes back does not stretch the minute: a check from the future is no check.
+  expect((await whoamiAt(app, token, TEST_NOW)).status).toBe(200);
+  expect(chain.lookups.length).toBe(4);
+});
+
+test("a_burst_of_requests_on_one_token_asks_the_chain_once", async () => {
+  const chain = liveChain();
+  const { token } = await signIn(appWith({ client: chain.client }));
+  chain.lookups.length = 0;
+
+  // The lookup is held until a second one is made, which is what this test is against, or for
+  // 150 ms, which is how long the one lookup that is right takes.
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+    setTimeout(resolve, 150);
+  });
+  const slow = fakeClient({
+    viewAccessKey: async (account, key) => {
+      chain.lookups.push([account, key]);
+      if (chain.lookups.length > 1) release();
+      await held;
+      return { permission: "FullAccess" };
+    },
+  });
+  const app = probe({ client: slow });
+
+  const replies = await Promise.all(
+    Array.from({ length: 6 }, () => whoami(app, `Bearer ${token}`)),
+  );
+
+  expect(replies.map((reply) => reply.status)).toEqual([200, 200, 200, 200, 200, 200]);
+  expect(chain.lookups.length).toBe(1);
+});
+
+test("an_rpc_failure_is_a_503_and_not_a_pass", async () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const chain = liveChain();
+  const app = appWith({ client: chain.client });
+  const { token } = await signIn(app);
+  const upload = UPLOADS[0]?.[1];
+
+  // The chain cannot say whether the key is there: the request is not served, and the answer says
+  // nothing of why. It is not a 401, since nothing is wrong with the token.
+  chain.failing = true;
+  const failed = await post<ErrorBody>(app, "/v1/blobs", upload, bearer(token));
+  expect(failed.status).toBe(503);
+  expect(failed.body).toEqual({ error: "unavailable", message: "cannot check your key right now" });
+  expect(failed.headers.get("www-authenticate")).toBeNull();
+  expect(JSON.stringify(failed.body)).not.toContain("marker-rpc");
+  expect(log).toHaveBeenCalled();
+  expect(await blobCount()).toBe(0);
+  // The token is not held against its key for the chain's fault, and works again when it is back.
+  expect(await tokenRows()).toHaveLength(1);
+  chain.failing = false;
+  expect((await post(app, "/v1/blobs", upload, bearer(token))).status).toBe(200);
+
+  // A check a minute old is no check: with the chain down again the token does not pass. Within
+  // the minute nothing is asked, so the chain being down changes nothing.
+  chain.failing = true;
+  nowNs = TEST_NOW + MINUTE - 1n;
+  expect((await post(app, "/v1/blobs", upload, bearer(token))).status).toBe(200);
+  nowNs = TEST_NOW + MINUTE;
+  const stale = await post<ErrorBody>(app, "/v1/blobs", upload, bearer(token));
+  expect(stale.status).toBe(503);
+  expect(stale.body.error).toBe("unavailable");
+});
+
+test("a_function_call_key_whose_scope_changed_is_refused", async () => {
+  const chain = liveChain(functionCallTo(FIXTURE_CONTRACT));
+  const app = probe({ client: chain.client });
+  const { token } = await signIn(appWith({ client: chain.client }));
+
+  const before = await whoamiAt(app, token, TEST_NOW);
+  expect(await before.json()).toEqual({ account: alice, key_kind: "function_call" });
+
+  // The key is taken off the account and put back, limited to another contract.
+  chain.permission = functionCallTo("other.test.near");
+  const after = await whoamiAt(app, token, TEST_NOW + MINUTE);
+  expect(after.status).toBe(401);
+  expect(await after.json()).toEqual(UNAUTHORIZED);
+  expect(await tokenRows()).toEqual([]);
+});
+
+test("a_token_never_carries_more_than_its_key_has_or_had", async () => {
+  const tender = functionCallTo(FIXTURE_CONTRACT);
+  // The key when the token is issued, the key a minute later, and what the token is then: its
+  // kind, or null for refused. A token is the lower of the two kinds, and refused when the key
+  // no longer qualifies.
+  const cases: Array<[KeyPermission, KeyPermission | null, string | null]> = [
+    ["FullAccess", "FullAccess", "full_access"],
+    ["FullAccess", tender, "function_call"],
+    [tender, "FullAccess", "function_call"],
+    [tender, tender, "function_call"],
+    ["FullAccess", functionCallTo("other.test.near"), null],
+    ["FullAccess", null, null],
+    [tender, null, null],
+  ];
+
+  for (const [issued, later, expected] of cases) {
+    const name = `${JSON.stringify(issued)}, then ${JSON.stringify(later)}`;
+    await resetDb(deps.db);
+    nowNs = TEST_NOW;
+    const chain = liveChain(issued);
+    const { token } = await signIn(appWith({ client: chain.client }));
+
+    chain.permission = later;
+    const reply = await whoamiAt(probe({ client: chain.client }), token, TEST_NOW + MINUTE);
+
+    if (expected === null) expect(reply.status, name).toBe(401);
+    else expect(await reply.json(), name).toEqual({ account: alice, key_kind: expected });
+  }
 });
 
 // ---- Housekeeping -----------------------------------------------------------------------------

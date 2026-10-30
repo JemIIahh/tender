@@ -1,9 +1,16 @@
 import { randomBytes } from "node:crypto";
-import { AuthError, type AuthErrorCode, type Nep413Result, verifyNep413 } from "@tender/client";
+import {
+  AuthError,
+  type AuthErrorCode,
+  type KeyPermission,
+  keyKindOf,
+  type Nep413Result,
+  verifyNep413,
+} from "@tender/client";
 import { sha256Hex } from "@tender/shared";
 import type { Context } from "hono";
 import { type ApiDeps, nowNs } from "./deps";
-import type { ErrorBody } from "./format";
+import { type ErrorBody, fail } from "./format";
 import type { RequireAuth } from "./routes/blobs";
 
 // NEP-413 sign-in. A user or an agent asks for a challenge, signs it with an access key of its
@@ -14,6 +21,10 @@ import type { RequireAuth } from "./routes/blobs";
 // The state is two tables. A challenge is a nonce that is spent once. A token is stored as the
 // SHA-256 of what was handed out, so a copy of the database cannot be used to sign in. Both
 // expire by the clock in `deps`, and the database's own is never read, so a test moves time.
+//
+// A token also lasts only as long as the key that signed in: `requireAuth` asks the chain again
+// whether that key is still on the account and may still sign in, so a key that is removed takes
+// its tokens with it, within a minute, and not at the end of their 12 hours.
 
 /** What the wallet signs, and for whom. The wallet shows both to its user before it signs. */
 const SIGN_IN_MESSAGE = "Sign in to Tender";
@@ -201,33 +212,126 @@ const isKeyKind = (value: string): value is KeyKind => Object.hasOwn(KEY_KINDS, 
 /** `Bearer <token>`. The scheme is case-insensitive; a token is exactly as long as a token is. */
 const BEARER = new RegExp(`^bearer +([A-Za-z0-9_-]{${TOKEN_CHARS}})$`, "i");
 
+/** How long the chain's answer about the key of a token is good for, before it is asked again. */
+const RECHECK_NS = 60n * 1_000_000_000n;
+
+/** An answer is good for a minute from the time it was asked. A clock that went back has none. */
+function isFresh(at: bigint, now: bigint): boolean {
+  const age = now - at;
+  return age >= 0n && age < RECHECK_NS;
+}
+
+/** What the chain said about the key of a token. */
+type KeyCheck =
+  | { status: "qualifies"; keyKind: KeyKind }
+  // The key is gone, or is no longer one that may sign in.
+  | { status: "revoked" }
+  // The chain could not say.
+  | { status: "unavailable" };
+
+/**
+ * Asks the chain whether the key behind a token still qualifies, by the policy that sign-in
+ * applied to it (`keyKindOf`), so that a token lives only as long as its key. The chain is not
+ * asked more than once a minute per token: a good answer is kept for a minute, by the clock in
+ * `deps`, and requests that come while the chain is being asked share that one question. A key
+ * that is removed therefore stops signing in within a minute of its removal, since the last good
+ * answer was given before it. An answer that is not good is not kept: a token whose key is gone
+ * is deleted, and a chain that cannot answer is asked again by the next request.
+ */
+function keyChecker(deps: ApiDeps) {
+  // Good answers by token hash, the oldest first: a token that is checked again moves to the end,
+  // and every good answer drops what has outlived its minute from the front, so the map stays
+  // about as large as the set of tokens in use.
+  const good = new Map<string, { at: bigint; keyKind: KeyKind }>();
+  const asking = new Map<string, Promise<KeyCheck>>();
+
+  async function ask(
+    hash: string,
+    account: string,
+    publicKey: string,
+    now: bigint,
+  ): Promise<KeyCheck> {
+    let found: { permission: KeyPermission } | null;
+    try {
+      found = await deps.client.viewAccessKey(account, publicKey);
+    } catch (error) {
+      console.error("api: cannot check the key of a signed-in token:", error);
+      return { status: "unavailable" };
+    }
+    const keyKind = found === null ? null : keyKindOf(found.permission, deps.contractId);
+    good.delete(hash);
+    if (keyKind === null) return { status: "revoked" };
+    good.set(hash, { at: now, keyKind });
+    for (const [oldHash, old] of good) {
+      if (isFresh(old.at, now)) break;
+      good.delete(oldHash);
+    }
+    return { status: "qualifies", keyKind };
+  }
+
+  return (hash: string, account: string, publicKey: string, now: bigint): Promise<KeyCheck> => {
+    const kept = good.get(hash);
+    if (kept !== undefined && isFresh(kept.at, now)) {
+      return Promise.resolve({ status: "qualifies", keyKind: kept.keyKind });
+    }
+    let check = asking.get(hash);
+    if (check === undefined) {
+      check = ask(hash, account, publicKey, now).finally(() => asking.delete(hash));
+      asking.set(hash, check);
+    }
+    return check;
+  };
+}
+
+/** The answer to a request that cannot be signed in, whatever the reason: always this one. */
+function unauthorized(c: Context): Response {
+  const body: ErrorBody = {
+    error: "unauthorized",
+    message: "sign in with a bearer token from POST /v1/auth/verify",
+  };
+  return c.json(body, 401, WWW_AUTHENTICATE);
+}
+
 /**
  * The middleware that signs a request in: it reads `Authorization: Bearer <token>`, finds the hash
  * of the token among the tokens that have not expired, and sets `c.var.account` and
  * `c.var.keyKind` for the route. A request that cannot be signed in for whatever reason gets the
  * same 401, so the answer does not tell a token that never existed from one that has run out.
+ *
+ * A token lives only as long as its key. The key is asked about again, at most once a minute per
+ * token (`keyChecker`). When it is gone, or no longer qualifies, the token is deleted and the
+ * request is refused as above. When the chain cannot say, the request gets a 503 and the token is
+ * kept: a token that cannot be checked does not pass, and is not held against its key either. The
+ * kind a route sees is the lower of the one the token was issued for and the one the key has now,
+ * so a token never gains from a key that is changed, and loses with it.
  */
 export function requireAuth(deps: ApiDeps): RequireAuth {
+  const checkKey = keyChecker(deps);
   return async (c, next) => {
+    const now = nowNs(deps);
     const token = BEARER.exec(c.req.header("Authorization") ?? "")?.[1];
+    const hash = token === undefined ? undefined : sha256Hex(token);
     const [row] =
-      token === undefined
+      hash === undefined
         ? []
-        : await deps.db.query<{ account: string; key_kind: string }>(
-            `select account, key_kind from auth_tokens
+        : await deps.db.query<{ account: string; public_key: string; key_kind: string }>(
+            `select account, public_key, key_kind from auth_tokens
               where token_sha256 = $1 and expires_at > $2::timestamptz`,
-            [sha256Hex(token), isoAt(nowNs(deps))],
+            [hash, isoAt(now)],
           );
     // A kind this code does not know was written by something else: it signs nothing in.
-    if (!row || !isKeyKind(row.key_kind)) {
-      const body: ErrorBody = {
-        error: "unauthorized",
-        message: "sign in with a bearer token from POST /v1/auth/verify",
-      };
-      return c.json(body, 401, WWW_AUTHENTICATE);
+    if (hash === undefined || !row || !isKeyKind(row.key_kind)) return unauthorized(c);
+
+    const check = await checkKey(hash, row.account, row.public_key, now);
+    if (check.status === "unavailable") {
+      return fail(503, "unavailable", "cannot check your key right now");
+    }
+    if (check.status === "revoked") {
+      await deps.db.query("delete from auth_tokens where token_sha256 = $1", [hash]);
+      return unauthorized(c);
     }
     c.set("account", row.account);
-    c.set("keyKind", row.key_kind);
+    c.set("keyKind", row.key_kind === "full_access" ? check.keyKind : "function_call");
     await next();
   };
 }
