@@ -75,14 +75,6 @@ export interface ApiClientOptions {
   now?: () => number;
 }
 
-/**
- * A list filter whose cursor can be null, which is no cursor. The `next_cursor` of the last page is
- * null, and a caller can hand back whatever it was given.
- */
-type WithNullCursor<F extends { cursor?: string | null }> = Omit<F, "cursor"> & {
-  cursor?: string | null;
-};
-
 /** A bearer token, and the time (ms since the epoch) from which the client no longer uses it. */
 interface Session {
   token: string;
@@ -267,7 +259,7 @@ export class ApiClient implements TenderApi {
 
   // ---- Public reads ---------------------------------------------------------------------------
 
-  listTasks(filter: WithNullCursor<ListTasksFilter> = {}): Promise<ListTasksResponse> {
+  listTasks(filter: ListTasksFilter = {}): Promise<ListTasksResponse> {
     const query = queryOf({
       phase: filter.phase,
       tag: filter.tag,
@@ -291,7 +283,7 @@ export class ApiClient implements TenderApi {
     );
   }
 
-  listAgents(filter: WithNullCursor<ListAgentsFilter> = {}): Promise<ListAgentsResponse> {
+  listAgents(filter: ListAgentsFilter = {}): Promise<ListAgentsResponse> {
     const query = queryOf({
       tag: filter.tag,
       asp: filter.asp,
