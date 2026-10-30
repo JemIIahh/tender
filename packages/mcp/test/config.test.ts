@@ -4,11 +4,14 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
+  readlinkSync,
   realpathSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,15 +30,18 @@ import {
 } from "../src/config";
 import { createStateStore } from "../src/state";
 
-// `lstatSync` and `realpathSync` are wrapped, so that a test can describe a way of directories that a
-// disk cannot be made to have (a parent that root owns, one that another user owns). They do the real
-// thing until a test says not to.
+// `lstatSync`, `readlinkSync` and `realpathSync.native` are wrapped, so that a test can describe a
+// way of directories that a disk cannot be made to have (a parent that root owns, one that another
+// user owns). They do the real thing until a test says not to.
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
     lstatSync: vi.fn(actual.lstatSync),
-    realpathSync: vi.fn(actual.realpathSync),
+    readlinkSync: vi.fn(actual.readlinkSync),
+    realpathSync: Object.assign(vi.fn(actual.realpathSync), {
+      native: vi.fn(actual.realpathSync.native),
+    }),
   };
 });
 
@@ -57,16 +63,19 @@ const ENV = {
   TENDER_PRIVATE_KEY: KEY.toString(),
 };
 
-// A home of its own for each test, so that nothing is ever read from or written to the real one.
+// A home of its own for each test, so that nothing is ever read from or written to the real one. It
+// is a real path (a temp dir can be under a link, as /var is on macOS), since the files directory
+// comes back from `readConfig` as one and the tests compare it to what they made.
 let home: string;
 
 beforeEach(async () => {
-  home = await mkdtemp(join(tmpdir(), "tender-mcp-home-"));
+  home = await realpath(await mkdtemp(join(tmpdir(), "tender-mcp-home-")));
 });
 
 afterEach(async () => {
   vi.mocked(lstatSync).mockReset();
-  vi.mocked(realpathSync).mockReset();
+  vi.mocked(readlinkSync).mockReset();
+  vi.mocked(realpathSync.native).mockReset();
   await rm(home, { recursive: true, force: true });
 });
 
@@ -510,16 +519,16 @@ test("a_files_dir_that_is_not_there_or_is_no_directory_is_refused", () => {
   expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "nothing") })).not.toContain(home);
 });
 
-test("a_files_dir_may_be_reached_through_a_link_if_where_it_leads_is_the_users_alone", () => {
-  // `lstat` does not follow a link, so a link on the way is judged as a link (it must be the user's
-  // or root's) and the place it leads to is looked at by its real path as well.
+test("a_files_dir_may_be_reached_through_a_link_and_is_kept_as_where_it_leads", () => {
+  // P04-R3: the link is followed here, once, and what is kept is the real path, so that the link
+  // is never followed again. It must be the user's or root's, and where it leads is looked at.
   const real = makeDir(home, "real");
   const files = makeDir(real, "files");
   symlinkSync(real, join(home, "link"), "dir");
   symlinkSync(files, join(home, "files-link"), "dir");
 
   for (const through of [join(home, "link", "files"), join(home, "files-link")]) {
-    expect(readConfig({ ...ENV, TENDER_FILES_DIR: through }, home).filesDir, through).toBe(through);
+    expect(readConfig({ ...ENV, TENDER_FILES_DIR: through }, home).filesDir, through).toBe(files);
   }
   // The link is the user's, and the place it leads to is open to a group: refused.
   chmodSync(real, 0o775);
@@ -529,15 +538,97 @@ test("a_files_dir_may_be_reached_through_a_link_if_where_it_leads_is_the_users_a
   expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "files-link") })).toMatch(SHARED);
 });
 
+test("a_chain_of_links_is_refused_if_a_name_in_it_is_looked_up_where_others_can_write", () => {
+  // N1. `~/work -> wd/l2 -> ~/target`: the way as it is written (a link of the user's) and the real
+  // path (`~/target`, the user's) both pass, but whoever can write in `wd` can point `l2` at any
+  // place, and so move the directory. A name that is looked up on the way to a link's target counts
+  // as much as one on the way to the link.
+  const target = makeDir(home, "target");
+  const work = join(home, "work");
+  const outside = mkdtempSync(join(tmpdir(), "tender-mcp-wd-"));
+  try {
+    // The probe as it was found: `wd` is outside the home and open to everybody.
+    chmodSync(outside, 0o777);
+    symlinkSync(target, join(outside, "l2"), "dir");
+    symlinkSync(join(outside, "l2"), work, "dir");
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: work })).toMatch(SHARED);
+    // Pointed at the home, as it could be: the same answer, and the home is never what is kept.
+    rmSync(join(outside, "l2"));
+    symlinkSync(home, join(outside, "l2"), "dir");
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: work })).toMatch(SHARED);
+    // A link straight into `wd` was refused before (the real path is in `wd`), and still is.
+    mkdirSync(join(outside, "sub"), { mode: 0o700 });
+    symlinkSync(join(outside, "sub"), join(home, "direct"), "dir");
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "direct") })).toMatch(SHARED);
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+  }
+
+  // The same chain inside the home, where the one thing that differs is the mode of the middle.
+  const middle = makeDir(home, "middle", 0o777);
+  symlinkSync(target, join(middle, "l2"), "dir");
+  const chain = join(home, "chain");
+  symlinkSync(join(middle, "l2"), chain, "dir");
+  const env = { ...ENV, TENDER_FILES_DIR: chain };
+  expect(failureOf(env)).toMatch(SHARED);
+  chmodSync(middle, 0o775);
+  expect(failureOf(env)).toMatch(SHARED);
+  // Closed, every name on the way is the user's alone, and what is kept is where the chain ends.
+  chmodSync(middle, 0o700);
+  expect(readConfig(env, home).filesDir).toBe(target);
+  // A relative link in the middle is followed from the directory it is in.
+  rmSync(chain);
+  symlinkSync(join("middle", "l2"), chain, "dir");
+  expect(readConfig(env, home).filesDir).toBe(target);
+  chmodSync(middle, 0o777);
+  expect(failureOf(env)).toMatch(SHARED);
+});
+
+test("a_files_dir_is_followed_the_way_the_kernel_follows_it", () => {
+  // `..` goes up from where the names before it lead, and not from where they are written. After a
+  // link, `l/..` is the parent of the link's target: `a/l/../files` is `b/files` here, and `a/files`,
+  // which is open to everybody, is not what is looked at.
+  const a = makeDir(home, "a");
+  const b = makeDir(home, "b");
+  symlinkSync(makeDir(b, "c"), join(a, "l"), "dir");
+  const theirs = makeDir(b, "files");
+  makeDir(a, "files", 0o777);
+  expect(readConfig({ ...ENV, TENDER_FILES_DIR: `${a}/l/../files` }, home).filesDir).toBe(theirs);
+  // `.`, a doubled slash and a trailing slash are only ways of writing the same place.
+  expect(readConfig({ ...ENV, TENDER_FILES_DIR: `${b}//./files/` }, home).filesDir).toBe(theirs);
+
+  // A link that leads back to itself, and a chain of more links than a kernel follows, lead nowhere.
+  symlinkSync(join(home, "loop"), join(home, "loop"), "dir");
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "loop") })).toBe(MISSING);
+  const hops = (count: number): string => {
+    let to = theirs;
+    for (let at = count; at > 0; at--) {
+      const name = join(home, `hop${count}-${at}`);
+      symlinkSync(to, name, "dir");
+      to = name;
+    }
+    return to;
+  };
+  expect(readConfig({ ...ENV, TENDER_FILES_DIR: hops(5) }, home).filesDir).toBe(theirs);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: hops(40) })).toBe(MISSING);
+});
+
 test("files_dir_and_the_directories_above_it_belong_to_the_user_or_to_root", () => {
   const me = process.getuid?.();
   if (me === undefined) return;
   const other = me + 1;
-  const found = (uid: number, mode: number, kind: "dir" | "link" | "file" = "dir") => ({
+  const found = (
+    uid: number,
+    mode: number,
+    kind: "dir" | "link" | "file" = "dir",
+    target = "",
+  ) => ({
     uid,
     mode: { dir: 0o40000, link: 0o120000, file: 0o100000 }[kind] | mode,
     isDirectory: () => kind === "dir",
     isSymbolicLink: () => kind === "link",
+    target,
+    vanishes: false,
   });
   type Found = ReturnType<typeof found>;
   const FILES = "/srv/tender/files";
@@ -548,26 +639,32 @@ test("files_dir_and_the_directories_above_it_belong_to_the_user_or_to_root", () 
     "/": found(0, 0o755),
   });
   /**
-   * What `readConfig` makes of FILES on a disk that has `entries` and nothing else, under the home
-   * `at`, where `leads` says where each path leads (to itself, unless it is a link).
+   * What `readConfig` makes of `dir` on a disk that has `entries` and nothing else, under the home
+   * `at`. `leads` says what the kernel's `realpath` makes of a path (itself, unless a test says it
+   * leads elsewhere). An entry that `vanishes` is there for the first look at it and not after.
    */
   const verdict = (
     entries: Record<string, Found>,
     at = "/home/me",
     leads: (path: string) => string = (path) => path,
+    dir = FILES,
   ): string | undefined => {
+    const looks = new Map<string, number>();
     vi.mocked(lstatSync).mockImplementation(((path: string) => {
       const entry = entries[path];
-      if (entry === undefined) {
+      const looked = (looks.get(path) ?? 0) + 1;
+      looks.set(path, looked);
+      if (entry === undefined || (entry.vanishes && looked > 1)) {
         throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${path}'`), {
           code: "ENOENT",
         });
       }
       return entry;
     }) as never);
-    vi.mocked(realpathSync).mockImplementation(((path: string) => leads(path)) as never);
+    vi.mocked(readlinkSync).mockImplementation(((path: string) => entries[path]?.target) as never);
+    vi.mocked(realpathSync.native).mockImplementation(((path: string) => leads(path)) as never);
     try {
-      return readConfig({ ...ENV, TENDER_FILES_DIR: FILES }, at).filesDir;
+      return readConfig({ ...ENV, TENDER_FILES_DIR: dir }, at).filesDir;
     } catch (error) {
       return (error as Error).message;
     }
@@ -594,52 +691,123 @@ test("files_dir_and_the_directories_above_it_belong_to_the_user_or_to_root", () 
   expect(verdict({ ...clean(), "/srv": found(other, 0o777) }, "/srv")).toMatch(SHARED);
   expect(verdict({ ...clean(), "/srv": found(other, 0o777) }, FILES)).toBe(FILES);
 
-  // A link is judged as a link: the user's or root's will do, another user's will not.
-  expect(verdict({ ...clean(), [FILES]: found(me, 0o777, "link") })).toBe(FILES);
-  expect(verdict({ ...clean(), [FILES]: found(0, 0o777, "link") })).toBe(FILES);
-  expect(verdict({ ...clean(), [FILES]: found(other, 0o777, "link") })).toMatch(SHARED);
-  expect(verdict({ ...clean(), "/srv/tender": found(other, 0o777, "link") })).toMatch(SHARED);
-
-  // A link that leads to another place: that place is looked at, up to the root, and not the way
-  // to the link. (Nothing but the link's own owner and its parents is asked of the link.)
+  // A link is judged as a link: the user's or root's will do, another user's will not. Where it
+  // leads is what is kept, and that place is looked at, up to the root.
   const away = (path: string) => (path === FILES ? "/data/files" : path);
-  const leading = (): Record<string, Found> => ({
+  const leading = (linkOwner: number): Record<string, Found> => ({
     ...clean(),
-    [FILES]: found(me, 0o777, "link"),
+    [FILES]: found(linkOwner, 0o777, "link", "/data/files"),
     "/data/files": found(me, 0o700),
     "/data": found(0, 0o755),
   });
-  expect(verdict(leading(), "/home/me", away)).toBe(FILES);
-  expect(verdict({ ...leading(), "/data/files": found(other, 0o700) }, "/home/me", away)).toMatch(
+  expect(verdict(leading(me), "/home/me", away)).toBe("/data/files");
+  expect(verdict(leading(0), "/home/me", away)).toBe("/data/files");
+  expect(verdict(leading(other), "/home/me", away)).toMatch(SHARED);
+  const there = (entries: Record<string, Found>) => verdict(entries, "/home/me", away);
+  expect(there({ ...leading(me), "/data/files": found(other, 0o700) })).toMatch(SHARED);
+  expect(there({ ...leading(me), "/data/files": found(me, 0o770) })).toMatch(SHARED);
+  expect(there({ ...leading(me), "/data": found(other, 0o755) })).toMatch(SHARED);
+  expect(there({ ...leading(me), "/data": found(0, 0o777) })).toMatch(SHARED);
+  // A link in a directory above the files directory is judged as a link too.
+  const around = (path: string) => (path === FILES ? "/srv/real/files" : path);
+  const moved = (linkOwner: number): Record<string, Found> => ({
+    ...clean(),
+    "/srv/tender": found(linkOwner, 0o777, "link", "/srv/real"),
+    "/srv/real": found(0, 0o755),
+    "/srv/real/files": found(me, 0o700),
+  });
+  expect(verdict(moved(me), "/home/me", around)).toBe("/srv/real/files");
+  expect(verdict(moved(other), "/home/me", around)).toMatch(SHARED);
+
+  // A link whose target is reached through another link (N1): a directory in which either is
+  // looked up counts, and so does the owner of the second link.
+  const chained = (hop: number, owner = me): Record<string, Found> => ({
+    ...leading(me),
+    [FILES]: found(me, 0o777, "link", "/hop/l2"),
+    "/hop": found(0, hop),
+    "/hop/l2": found(owner, 0o777, "link", "/data/files"),
+  });
+  expect(there(chained(0o755))).toBe("/data/files");
+  expect(there(chained(0o775))).toMatch(SHARED);
+  expect(there(chained(0o777))).toMatch(SHARED);
+  expect(there(chained(0o755, other))).toMatch(SHARED);
+
+  // Under a home that sits in a directory open to everybody, the way to the home is not looked at,
+  // but a name that is looked up beside it is, even in that directory: a link that comes back to the
+  // home through the open directory, by a name that is not the home's.
+  const OPEN = "/open/me/files";
+  const inOpen = (): Record<string, Found> => ({
+    "/": found(0, 0o755),
+    "/open": found(0, 0o777),
+    "/open/me": found(me, 0o700),
+    "/open/me/inside": found(me, 0o700),
+    [OPEN]: found(me, 0o700),
+  });
+  const via = (target: string, more: Record<string, Found> = {}): Record<string, Found> => ({
+    ...inOpen(),
+    ...more,
+    [OPEN]: found(me, 0o777, "link", target),
+  });
+  const leadsTo = (real: string) => (path: string) => (path === OPEN ? real : path);
+  expect(verdict(inOpen(), "/open/me", undefined, OPEN)).toBe(OPEN);
+  expect(verdict(via("/open/me/inside"), "/open/me", leadsTo("/open/me/inside"), OPEN)).toBe(
+    "/open/me/inside",
+  );
+  const back = via("/open/evil", { "/open/evil": found(me, 0o777, "link", "/open/me/inside") });
+  expect(verdict(back, "/open/me", leadsTo("/open/me/inside"), OPEN)).toMatch(SHARED);
+
+  // Not under the home, nothing is left out, up to the root: not the root either, though the way
+  // starts with a name that is on the way to the home as well.
+  const BESIDE = "/home/shared/files";
+  const beside = (): Record<string, Found> => ({
+    "/": found(0, 0o755),
+    "/home": found(0, 0o755),
+    "/home/me": found(me, 0o700),
+    "/home/shared": found(me, 0o700),
+    [BESIDE]: found(me, 0o700),
+  });
+  expect(verdict(beside(), "/home/me", undefined, BESIDE)).toBe(BESIDE);
+  expect(verdict({ ...beside(), "/": found(other, 0o755) }, "/home/me", undefined, BESIDE)).toMatch(
     SHARED,
   );
-  expect(verdict({ ...leading(), "/data/files": found(me, 0o770) }, "/home/me", away)).toMatch(
+  expect(verdict({ ...beside(), "/home": found(0, 0o775) }, "/home/me", undefined, BESIDE)).toMatch(
     SHARED,
   );
-  expect(verdict({ ...leading(), "/data": found(other, 0o755) }, "/home/me", away)).toMatch(SHARED);
-  expect(verdict({ ...leading(), "/data": found(0, 0o777) }, "/home/me", away)).toMatch(SHARED);
-  // A way that lstat found and that cannot be followed to a real path is refused as missing.
+
+  // A link that leads back to itself leads nowhere.
+  expect(verdict({ ...clean(), [FILES]: found(me, 0o777, "link", FILES) })).toBe(MISSING);
+  // A way that was followed and that the kernel cannot follow to a real path is refused as missing.
   const vanished = () => {
     throw Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
   };
   expect(verdict(clean(), "/home/me", vanished)).toBe(MISSING);
+  // The kernel leads somewhere else than the way that was followed: something moved in between.
+  let asks = 0;
+  const flips = (path: string) => (path === FILES && asks++ === 0 ? "/data/files" : path);
+  expect(verdict(clean(), "/home/me", flips)).toMatch(SHARED);
 
-  // A directory that is not there, or is a file, is refused; a parent that cannot be read, too.
+  // A directory that is not there, or is a file, is refused; so is a way with a name that is not
+  // there. A directory that is there for the first look and gone for the second is refused too.
   const { [FILES]: _gone, ...without } = clean();
   expect(verdict(without)).toBe(MISSING);
   expect(verdict({ ...clean(), [FILES]: found(me, 0o600, "file") })).toBe(MISSING);
   const { "/srv": _hidden, ...unseen } = clean();
-  expect(verdict(unseen)).toMatch(SHARED);
+  expect(verdict(unseen)).toBe(MISSING);
+  expect(verdict({ ...clean(), [FILES]: { ...found(me, 0o700), vanishes: true } })).toBe(MISSING);
+  expect(verdict({ ...clean(), "/srv": { ...found(0, 0o755), vanishes: true } })).toMatch(SHARED);
 });
 
-test("files_dir_is_not_looked_at_where_there_are_no_user_ids", () => {
-  // Windows has no owner or mode of the kind: nothing is compared, and the disk is not asked.
+test("files_dir_is_kept_as_its_real_path_where_there_are_no_user_ids", () => {
+  // Windows has no owner or mode of the kind: nothing is compared, and the disk is not asked about
+  // them. The real path is kept all the same, and a directory that is not there cannot be.
   const original = Object.getOwnPropertyDescriptor(process, "getuid");
   Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
   try {
-    const files = join(home, "not-there-and-not-looked-for");
-    expect(readConfig({ ...ENV, TENDER_FILES_DIR: files }, home).filesDir).toBe(files);
+    const open = makeDir(home, "open", 0o777);
+    symlinkSync(open, join(home, "link"), "dir");
+    expect(readConfig({ ...ENV, TENDER_FILES_DIR: join(home, "link") }, home).filesDir).toBe(open);
     expect(lstatSync).not.toHaveBeenCalled();
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "not-there") })).toBe(MISSING);
   } finally {
     if (original !== undefined) Object.defineProperty(process, "getuid", original);
   }

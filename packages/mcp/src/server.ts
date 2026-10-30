@@ -60,11 +60,12 @@ export interface McpDeps {
   /** The account that `verifier: "judge"` means. */
   judgeAccount?: string;
   /**
-   * The one directory that `commit_result` may read a file from (P04-R1), as the user wrote it.
-   * A file is read only if it is a regular file whose real path, with every link followed, is
-   * inside this directory's. Not set means that no file is read at all. The bin gets it from
-   * `readConfig`, which accepts only a directory that nobody but the user (and root) can write to
-   * (P04-R2); a caller that builds the deps by hand answers for that itself.
+   * The one directory that `commit_result` may read a file from (P04-R1), as a real path: it is used
+   * as it is and never looked up again (P04-R3), so a path with a link in it reads nothing. A file
+   * is read only if it is a regular file whose real path, with every link followed, is inside it.
+   * Not set means that no file is read at all. The bin gets it from `readConfig`, which looks the
+   * directory up once, and accepts only one that nobody but the user (and root) can write to
+   * (P04-R2); a caller that builds the deps by hand answers for both itself.
    */
   filesDir?: string;
   /** How an open file is traced back to a path. Not set means the process's own (the real one). */

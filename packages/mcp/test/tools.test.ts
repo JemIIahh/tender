@@ -38,9 +38,9 @@ import {
   type TaskSummary,
   type TenderApi,
 } from "@tender/shared";
-import { baseEncode } from "near-api-js";
+import { baseEncode, KeyPair } from "near-api-js";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { secretsOf } from "../src/config";
+import { readConfig, secretsOf } from "../src/config";
 import { createMcpServer, type McpChain, type McpDeps, type OpenFileLookup } from "../src/server";
 import { createStateStore, type Draft, type StateStore } from "../src/state";
 
@@ -1148,11 +1148,15 @@ async function connectWrite(overrides: Partial<McpDeps> = {}) {
   return { ...kit, ...session };
 }
 
-/** A directory for the files that a test lets the server read, inside the test's own root. */
+/**
+ * A directory for the files that a test lets the server read, inside the test's own root, as a real
+ * path: that is what the server is given (P04-R3), and a temp dir can be under a link, as /var is
+ * on macOS.
+ */
 async function makeFilesDir(): Promise<string> {
   const files = join(root, "files");
   await mkdir(files, { recursive: true });
-  return files;
+  return await realpath(files);
 }
 
 /** The one answer to a file that cannot be read from the files directory, whatever the reason. */
@@ -1568,54 +1572,111 @@ test("file_outside_the_files_dir_is_refused", async () => {
   expect(await state.getDraft("7")).toBeNull();
 });
 
-test("the_files_dir_may_be_reached_by_another_path_to_the_same_place", async () => {
+test("a_file_may_be_named_by_another_path_to_the_same_place", async () => {
   // /tmp and /private/tmp are one place, and so are a directory and a link to it. What is compared
-  // is where the paths lead, so neither way round turns a file away, and neither lets one in.
+  // is where a file's path leads, so neither way of naming a file turns it away, and neither lets
+  // one in.
   const files = await makeFilesDir();
   await writeFile(join(files, "a.txt"), "alias");
   const alias = join(root, "alias");
   await symlink(files, alias, "dir");
+  const { call, callJson } = await connectWrite({ filesDir: files });
 
   let taskId = 0;
-  for (const [configured, named] of [
-    [alias, join(files, "a.txt")],
-    [files, join(alias, "a.txt")],
-    [alias, join(alias, "a.txt")],
-  ] as const) {
+  for (const named of [
+    join(files, "a.txt"),
+    join(alias, "a.txt"),
+    `${files}/../files/a.txt`,
+    `${alias}/../alias/a.txt`,
+  ]) {
     taskId++;
-    const { callJson } = await connectWrite({ filesDir: configured });
-    const answer = await callJson("commit_result", {
-      task_id: String(taskId),
-      file_path: named,
-    });
-    expect(answer, `${configured} ${named}`).toMatchObject({ content_hash: sha256Hex("alias") });
+    const answer = await callJson("commit_result", { task_id: String(taskId), file_path: named });
+    expect(answer, named).toMatchObject({ content_hash: sha256Hex("alias") });
   }
 
-  // A file that is not there is refused like any other, by whichever name the directory has. (The
-  // directory's real name is the one that the alias leads to.)
-  const real = await realpath(files);
-  for (const [configured, named] of [
-    [files, join(files, "gone.txt")],
-    [alias, join(real, "gone.txt")],
-    [alias, join(alias, "gone.txt")],
-    // The directory as it was written may have a doubled slash or a ..; it is read as it leads.
-    [`${alias}//`, join(alias, "gone.txt")],
-    [`${root}/files/../files`, join(files, "gone.txt")],
-  ] as const) {
-    const { call } = await connectWrite({ filesDir: configured });
+  // A file that is not there is refused like any other, by whichever name it is asked for.
+  for (const named of [join(files, "gone.txt"), join(alias, "gone.txt"), `${alias}//gone.txt`]) {
     const missing = await call("commit_result", { task_id: "8", file_path: named });
-    expect(missing, `${configured} ${named}`).toEqual({ isError: true, text: UNREADABLE });
+    expect(missing, named).toEqual({ isError: true, text: UNREADABLE });
   }
 
   // A link to a directory is a way in only for what it leads to: outside stays outside.
-  await mkdir(join(root, "elsewhere"));
-  await writeFile(join(root, "elsewhere", "b.txt"), "elsewhere");
-  const { call } = await connectWrite({ filesDir: alias });
-  const out = await call("commit_result", {
-    task_id: "9",
-    file_path: join(root, "elsewhere", "b.txt"),
-  });
-  expect(out).toEqual({ isError: true, text: UNREADABLE });
+  const elsewhere = join(root, "elsewhere");
+  await mkdir(elsewhere);
+  await writeFile(join(elsewhere, "b.txt"), "elsewhere");
+  const outside = join(root, "outside");
+  await symlink(elsewhere, outside, "dir");
+  for (const named of [join(elsewhere, "b.txt"), join(outside, "b.txt")]) {
+    const out = await call("commit_result", { task_id: "9", file_path: named });
+    expect(out, named).toEqual({ isError: true, text: UNREADABLE });
+  }
+});
+
+test("a_files_dir_with_a_link_in_it_is_not_looked_through", async () => {
+  // P04-R3: the directory is the real path that `readConfig` found, and the server does not look it
+  // up again. One with a link in it, which `readConfig` never gives, is not followed to the place it
+  // leads to: no file's real path lies under a link's name, so nothing is read.
+  const files = await makeFilesDir();
+  await writeFile(join(files, "a.txt"), "alias");
+  const alias = join(root, "alias");
+  await symlink(files, alias, "dir");
+  const { call, chain } = await connectWrite({ filesDir: alias });
+
+  for (const named of [join(files, "a.txt"), join(alias, "a.txt")]) {
+    const answer = await call("commit_result", { task_id: "7", file_path: named });
+    expect(answer, named).toEqual({ isError: true, text: UNREADABLE });
+  }
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+});
+
+test("a_link_changed_after_start_up_does_not_move_the_files_dir", async () => {
+  // P04-R3: `readConfig` looks the directory up once, and the server reads from the real path it
+  // found. Here the user wrote a link, and it is pointed at another directory afterwards, as whoever
+  // can write where it is could do. The files directory stays where it was.
+  const home = await realpath(root);
+  const kept = join(home, "kept");
+  const moved = join(home, "moved");
+  for (const [dir, content] of [
+    [kept, "kept"],
+    [moved, "moved"],
+  ] as const) {
+    await mkdir(dir);
+    await chmod(dir, 0o700);
+    await writeFile(join(dir, "a.txt"), content);
+  }
+  const link = join(home, "work");
+  await symlink(kept, link, "dir");
+  const config = readConfig(
+    {
+      TENDER_NETWORK: "testnet",
+      TENDER_CONTRACT: "tender.testnet",
+      TENDER_API_URL: "https://api.tender.example",
+      TENDER_ACCOUNT: ACCOUNT,
+      TENDER_PRIVATE_KEY: KeyPair.fromRandom("ed25519").toString(),
+      TENDER_FILES_DIR: link,
+    },
+    home,
+  );
+  expect(config.filesDir).toBe(kept);
+
+  await unlink(link);
+  await symlink(moved, link, "dir");
+
+  const { call, callJson } = await connectWrite({ filesDir: config.filesDir });
+  // Where the link leads now is outside the directory that was kept: a file there is not read,
+  // however it is named.
+  for (const [taskId, named] of [
+    ["1", join(link, "a.txt")],
+    ["2", join(moved, "a.txt")],
+  ] as const) {
+    const answer = await call("commit_result", { task_id: taskId, file_path: named });
+    expect(answer, named).toEqual({ isError: true, text: UNREADABLE });
+  }
+  // The directory that was kept is still the one that files are read from.
+  expect(
+    await callJson("commit_result", { task_id: "3", file_path: join(kept, "a.txt") }),
+  ).toMatchObject({ content_hash: sha256Hex("kept") });
 });
 
 test("a_files_dir_written_with_a_slash_or_as_the_root_still_holds_what_it_should", async () => {
@@ -1647,9 +1708,10 @@ test("a_files_dir_written_with_a_slash_or_as_the_root_still_holds_what_it_should
   }
 });
 
-test("a_files_dir_that_is_not_there_reads_nothing_and_says_so", async () => {
-  // A directory that was named and does not exist (a typo, a drive that is not mounted) must not
-  // turn into "anything goes": the tool says what is wrong with it.
+test("a_files_dir_that_is_gone_since_start_up_reads_nothing", async () => {
+  // `readConfig` refuses a directory that is not there. One that is gone since (a drive that is
+  // unmounted), or that a caller who builds the deps by hand never made, must not turn into
+  // "anything goes": a file in it is refused like any file that cannot be read.
   const nowhere = join(root, "nowhere");
   const { call, callJson, chain } = await connectWrite({ filesDir: nowhere });
 
@@ -1658,9 +1720,7 @@ test("a_files_dir_that_is_not_there_reads_nothing_and_says_so", async () => {
     file_path: join(nowhere, "answer.txt"),
   });
 
-  expect(answer.isError).toBe(true);
-  expect(answer.text).toMatch(/^FILE_UNREADABLE: .*files are read from .*cannot be used: .*ENOENT/);
-  expect(answer.text).toContain(nowhere);
+  expect(answer).toEqual({ isError: true, text: UNREADABLE });
   expect(chain.commit).not.toHaveBeenCalled();
   expect(await state.getDraft("7")).toBeNull();
   // Text does not need the directory.

@@ -1,6 +1,6 @@
-import { lstatSync, realpathSync, type Stats } from "node:fs";
+import { lstatSync, readlinkSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, sep } from "node:path";
 import type { Signer, TenderClient } from "@tender/client";
 import { AccountIdSchema, canonicalBase, NETWORKS, type NetworkId } from "@tender/shared";
 import { KeyPair, type KeyPairString } from "near-api-js";
@@ -39,9 +39,10 @@ export interface McpConfig {
   /** Where the drafts are kept: an absolute path unless the environment gave a relative one. */
   stateDir: string;
   /**
-   * The one directory that `commit_result` may read a file from (P04-R1), an absolute path that
-   * only the user can write to (P04-R2; see `requireOwnDirectory`). Not set means that no file is
-   * read, and a result is given as text.
+   * The one directory that `commit_result` may read a file from (P04-R1): its real path, looked up
+   * once at start-up and never again (P04-R3), of a directory that only the user can write to
+   * (P04-R2; see `pinFilesDir`). If the path as it was written had a link in it, this is where the
+   * link led. Not set means that no file is read, and a result is given as text.
    */
   filesDir?: string;
   judgeAccount?: string;
@@ -161,34 +162,71 @@ function isWithin(dir: string, path: string): boolean {
   return path === dir || path.startsWith(dir.endsWith(sep) ? dir : dir + sep);
 }
 
+/** How many links one path may lead through. The kernels give up on a loop at about this many. */
+const MAX_LINKS = 32;
+
+/** A path followed to the place it leads to. */
+interface Way {
+  /** Where the path leads: absolute, with no link, `.` or `..` in it. */
+  real: string;
+  /** Every name that was looked up on the way, as the path to it. The links followed are among them. */
+  entries: string[];
+}
+
 /**
- * `start` and each directory above it, nearest first, as far as `top`, which is `start` or one of
- * its parents. With no `top` the walk goes up to the root.
+ * Where the absolute `path` leads, found the way the kernel finds it: from the root, one name at a
+ * time. A link is read where it stands and its target is followed in place (from the root when the
+ * target is absolute, else from the directory the link is in), and `..` goes up from the place that
+ * the names before it lead to, which is not where they are written to be when one of them is a link.
+ * A path that leads nowhere (a name that is not there, a loop, more than `MAX_LINKS` links) gets
+ * nothing.
  */
-function directoriesUp(start: string, top: string | undefined): string[] {
-  const chain = [start];
-  for (let at = start; at !== top; ) {
-    const parent = dirname(at);
-    if (parent === at) break;
-    chain.push(parent);
-    at = parent;
+function wayTo(path: string): Way | undefined {
+  const entries: string[] = [];
+  // The names still to look up, the next one last: the target of a link goes in front of them.
+  const names = path.split(sep).reverse();
+  let real: string = sep;
+  let links = 0;
+  for (let name = names.pop(); name !== undefined; name = names.pop()) {
+    if (name === "" || name === ".") continue;
+    if (name === "..") {
+      real = dirname(real);
+      continue;
+    }
+    const entry = join(real, name);
+    entries.push(entry);
+    let found: Stats;
+    try {
+      found = lstatSync(entry);
+    } catch {
+      return undefined;
+    }
+    if (!found.isSymbolicLink()) {
+      real = entry;
+      continue;
+    }
+    links += 1;
+    if (links > MAX_LINKS) return undefined;
+    let target: string;
+    try {
+      target = readlinkSync(entry);
+    } catch {
+      return undefined;
+    }
+    if (isAbsolute(target)) real = sep;
+    names.push(...target.split(sep).reverse());
   }
-  return chain;
-}
-
-/** `home` if `path` is in it (or is it), else nothing: where a walk up from `path` stops. */
-function topFor(path: string, home: string | undefined): string | undefined {
-  return home !== undefined && isWithin(home, path) ? home : undefined;
+  return { real, entries };
 }
 
 /**
- * What is wrong with a way to a directory, if anything: `chain` lists the directory and then each
- * one above it. A link is judged as a link, since `lstat` does not follow it: whoever owns it can
- * point it elsewhere, so it must be the user's or root's, and the place it leads to is looked at
- * separately, by its real path.
+ * What is wrong with the way to a directory, if anything. `paths` lists the directory itself, and
+ * then the others to look at: each directory in which a name is looked up on the way to it, and each
+ * link on the way. A link is judged as a link, since `lstat` does not follow it: whoever owns it can
+ * point it elsewhere, so it must be the user's or root's.
  */
-function faultIn(chain: readonly string[], me: number): "missing" | "shared" | undefined {
-  for (const [at, path] of chain.entries()) {
+function faultIn(paths: readonly string[], me: number): "missing" | "shared" | undefined {
+  for (const [at, path] of paths.entries()) {
     let found: Stats;
     try {
       found = lstatSync(path);
@@ -210,47 +248,71 @@ function faultIn(chain: readonly string[], me: number): "missing" | "shared" | u
 }
 
 /**
- * Refuses a `TENDER_FILES_DIR` in which somebody else could change a name (ruling P04-R2).
- * `commit_result` looks a path up and then opens the file, and whoever can write in the directory
- * can swap a name for a link in between, even back and forth between the server's looks. The checks
- * in `readLocalFile` narrow that and cannot close it everywhere, so the directory must be the
- * user's alone: owned by the user, and neither it nor any directory above it writable by a group or
- * by others (`mode & 0o022`). The directories above it may be root's, and are looked at up to the
- * user's home, or up to / when the directory is not under it. So a directory under /tmp, which
- * anybody can write in, is refused, and one in the user's home that was made with a group-writable
- * mode is too.
+ * The real path of `dir`, if `dir` is a directory that only the user can write to; that real path is
+ * what the server keeps, and reads files from (ruling P04-R3). It is looked up here, once. A link in
+ * the way that the user wrote can be pointed elsewhere by whoever can write where it is, so the
+ * server reads from the place the link led to at start-up and never follows the link again.
  *
- * `lstat` is used on each, and a link in the way is judged as a link; its target is checked as well,
- * by its real path. Where the platform has no user ids (Windows) there is no owner to compare, and
- * nothing is checked. A directory that is not there is refused: it could be made by anyone later.
+ * What it must be (ruling P04-R2). `commit_result` looks a path up and then opens the file, and
+ * whoever can write in the directory can swap a name for a link in between, even back and forth
+ * between the server's looks. The checks in `readLocalFile` narrow that and cannot close it
+ * everywhere, so the directory must be the user's alone: owned by the user, and neither it nor any
+ * directory on the way to it writable by a group or by others (`mode & 0o022`, the sticky bit or
+ * not). The directories above it may be root's, who can change anything anyway. So a directory under
+ * /tmp, which anybody can write in, is refused, and so is one in the user's home that was made with
+ * a group-writable mode.
+ *
+ * The way to it is every directory in which a name is looked up, and `dir` is followed name by name
+ * (`wayTo`) to find them. That is not the written path and the real path only: a link leads to a
+ * target that is itself a path, and so may lead through another link, and a directory in which that
+ * second link is looked up is not on either of the two. Whoever can write there can point the link
+ * elsewhere, and the directory with it. So the directories on the way to every link's target are
+ * looked at as well, and a link on the way must be the user's or root's.
+ *
+ * When the directory is under the user's home directory, the way stops there: the names that lead
+ * to the home directory, and the directories above it, are not looked at, since where the home
+ * directory is on the machine is not for this check to judge. (A name that is looked up beside
+ * them, such as the target of a link, is looked at.) When it is not under the home, nothing is
+ * left out, up to the root.
+ *
+ * Last, the real path that the kernel gives for `dir` (`realpath`, as `readLocalFile` asks it of
+ * every file) must be the one that was followed. If not, something changed while it was looked at,
+ * and the directory is refused.
+ *
+ * Where the platform has no user ids (Windows) there is no owner to compare, and the way is not
+ * looked at; the real path is kept all the same. A directory that is not there is refused: it could
+ * be made by anyone later.
  */
-function requireOwnDirectory(dir: string, home: string): void {
+function pinFilesDir(dir: string, home: string): string {
   const me = process.getuid?.();
-  if (me === undefined) return;
-
-  // As written, and then where it leads: a link in the way is a name that can be pointed elsewhere.
-  const written = resolve(dir);
-  const homeWritten = isAbsolute(home) ? resolve(home) : undefined;
-  let fault = faultIn(directoriesUp(written, topFor(written, homeWritten)), me);
-  if (fault === undefined) {
-    let real: string;
-    try {
-      real = realpathSync(written);
-    } catch {
-      throw new ConfigError(FILES_DIR_MISSING);
+  let followed: string | undefined;
+  if (me !== undefined) {
+    const way = wayTo(dir);
+    if (way === undefined) throw new ConfigError(FILES_DIR_MISSING);
+    // The top, if the directory is under the home directory: the way to the home is not looked at.
+    const homeReal = isAbsolute(home) ? wayTo(home)?.real : undefined;
+    const top = homeReal !== undefined && isWithin(homeReal, way.real) ? homeReal : undefined;
+    const looked = new Set<string>();
+    for (const entry of way.entries) {
+      if (top !== undefined && isWithin(entry, top)) continue;
+      looked.add(dirname(entry));
+      looked.add(entry);
     }
-    if (real !== written) {
-      let homeReal: string | undefined;
-      try {
-        homeReal = realpathSync(home);
-      } catch {
-        homeReal = undefined;
-      }
-      fault = faultIn(directoriesUp(real, topFor(real, homeReal)), me);
-    }
+    const fault = faultIn([way.real, ...looked], me);
+    if (fault === "missing") throw new ConfigError(FILES_DIR_MISSING);
+    if (fault === "shared") throw new ConfigError(FILES_DIR_SHARED);
+    followed = way.real;
   }
-  if (fault === "missing") throw new ConfigError(FILES_DIR_MISSING);
-  if (fault === "shared") throw new ConfigError(FILES_DIR_SHARED);
+  let pinned: string;
+  let again: string;
+  try {
+    pinned = realpathSync.native(dir);
+    again = followed === undefined ? pinned : realpathSync.native(followed);
+  } catch {
+    throw new ConfigError(FILES_DIR_MISSING);
+  }
+  if (again !== pinned) throw new ConfigError(FILES_DIR_SHARED);
+  return pinned;
 }
 
 /**
@@ -263,8 +325,9 @@ function requireOwnDirectory(dir: string, home: string): void {
  *   what `canonicalBase` takes (no user name, query or fragment), as the API client reads it.
  * - Optional: `TENDER_STATE_DIR` (default: `defaultStateDir`, under `home`; a leading `~` is
  *   expanded to `home`), `TENDER_FILES_DIR` (an absolute path, `~` expanded likewise, of a
- *   directory that only the user can write to: see `requireOwnDirectory`; default: none, and then
- *   `commit_result` takes no file), `TENDER_JUDGE_ACCOUNT` and `TENDER_TOKEN`.
+ *   directory that only the user can write to: see `pinFilesDir`, which looks it up once and gives
+ *   its real path; default: none, and then `commit_result` takes no file), `TENDER_JUDGE_ACCOUNT`
+ *   and `TENDER_TOKEN`.
  *
  * A variable that is set to nothing is not set. Every fault is reported at once, in one line that
  * names the variables: the ones missing, then the ones whose values are wrong.
@@ -315,8 +378,7 @@ export function readConfig(env: Env, home: string = homedir()): McpConfig {
   const configuredFilesDir = setting(env, "TENDER_FILES_DIR");
   try {
     if (configuredFilesDir !== undefined) {
-      filesDir = absoluteFilesDir(configuredFilesDir, home);
-      requireOwnDirectory(filesDir, home);
+      filesDir = pinFilesDir(absoluteFilesDir(configuredFilesDir, home), home);
     }
   } catch (error) {
     if (!(error instanceof ConfigError)) throw error;

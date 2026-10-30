@@ -67,7 +67,9 @@ import {
 // it, so a file path is a way to publish whatever the server can read. The server therefore reads
 // only inside the one directory that the user named (`filesDir`, from `TENDER_FILES_DIR`), and
 // none at all when there is none (P04-R1). That directory must be the user's alone (`readConfig`,
-// P04-R2), and on Linux the open file is traced back to a path through its descriptor
+// P04-R2), and `readConfig` gives its real path, looked up once at start-up: files are read inside
+// that path, and what the user wrote is never followed again, so that a link changed later moves
+// nothing (P04-R3). On Linux the open file is traced back to a path through its descriptor
 // (`OpenFileLookup`). Work that holds one of the server's own secrets is
 // refused, whether it came as text or as a file, since the scrubber sees what a tool says and never
 // what a reveal uploads. The secret is looked for as it is and in the usual disguises (best effort),
@@ -214,9 +216,12 @@ const PROCESS_FILES: OpenFileLookup = {
 
 /**
  * The bytes of the file at `path`, at most `limit` of them, if it is a regular file inside
- * `filesDir` (P04-R1). Where a path leads is what counts, and not how it is written: `realpath`
- * follows every link and every `..`, and the file's real path must lie under the directory's real
- * path, so that no link, `..` or other name for the same place gets a file out of the directory.
+ * `filesDir` (P04-R1). That is a real path, which `readConfig` looked up once at start-up (P04-R3):
+ * it is used as it is and never looked up here, so that a link changed since cannot move it. Where
+ * a file's path leads is what counts, and not how it is written: `realpath` follows every link and
+ * every `..`, and the file's real path must lie under the directory, so that no link, `..` or other
+ * name for the same place gets a file out of the directory. (A `filesDir` with a link in it, which
+ * `readConfig` never gives, reads nothing: no file's real path lies under it.)
  *
  * Three gaps are closed after that. The path is looked up and the file opened a moment later, and a
  * folder on the way could be swapped for a link in between; so once the file is open, the path is
@@ -230,12 +235,12 @@ const PROCESS_FILES: OpenFileLookup = {
  * and forth between the looks, so that each look finds what it expects. On macOS, and on any
  * platform without the descriptor, somebody who can already write in your own directory can still
  * race the check. `readConfig` refuses a directory that anyone but the user (or root) can write in,
- * which limits that somebody to you.
+ * or can reach by a name that anyone else can change, which limits that somebody to you.
  *
  * A path that leads nowhere, out, or to a file that fails any check gets `unreadable()` and
  * nothing more, and nothing is said about a file (what it is, how big) until it has passed them all.
- * (A file that passes may still fail to open or to be read, and says why. The directory is the
- * user's to get right, and its own faults are named.)
+ * (A file that passes may still fail to open or to be read, and says why. The directory's own
+ * faults are named when the server starts, by `readConfig`.)
  */
 async function readLocalFile(
   path: string,
@@ -251,16 +256,7 @@ async function readLocalFile(
     );
   }
   if (!isAbsolute(path)) throw new ToolError("BAD_INPUT", "file_path must be an absolute path");
-  let directory: string;
-  try {
-    directory = await realpath(filesDir);
-  } catch (error) {
-    throw new ToolError(
-      "FILE_UNREADABLE",
-      `the directory that files are read from (${filesDir}) cannot be used: ${errorText(error)}`,
-    );
-  }
-  const real = await realInside(path, directory);
+  const real = await realInside(path, filesDir);
 
   let handle: FileHandle;
   try {
@@ -282,12 +278,12 @@ async function readLocalFile(
       } catch {
         throw unreadable();
       }
-      if (!isInside(directory, opened)) throw unreadable();
+      if (!isInside(filesDir, opened)) throw unreadable();
     }
     // Whole numbers (bigint), so that inodes beyond 2^53 are told apart too.
     const stats = await handle.stat({ bigint: true });
     // Is the file that is open the one the path leads to now, and is that inside still?
-    const again = await realInside(path, directory);
+    const again = await realInside(path, filesDir);
     let there: BigIntStats;
     try {
       there = await stat(again, { bigint: true });
