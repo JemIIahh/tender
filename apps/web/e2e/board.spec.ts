@@ -1,4 +1,5 @@
 import { expect, type Page, test } from "@playwright/test";
+import { AT, SECOND } from "../test/tasks";
 import {
   API_URL,
   COMMUNITY_TITLE,
@@ -37,10 +38,16 @@ const PHONE = { width: 375, height: 812 };
  */
 const ROUTES: Record<string, (page: Page) => Promise<void>> = {
   "/": (page) => expect(page.getByTestId("task-card")).toHaveCount(TASKS.length),
+  // An open task with its timeline and its entries.
+  "/tasks/2": (page) => expect(page.getByTestId("phase-timeline")).toBeVisible(),
+  // A settled one with every part of the page, each as wide as the data can be (fixtures.ts).
+  "/tasks/3": (page) => expect(page.getByTestId("recompute")).toBeVisible(),
 };
 
 test("phone_width_has_no_horizontal_scroll", async ({ page }) => {
   await page.setViewportSize(PHONE);
+  // The moment the commit window of task 2 is open, so that its page has a live countdown on it.
+  await page.clock.install({ time: new Date(Number((AT.commit - 20n * SECOND) / 1_000_000n)) });
   await routeApi(page);
 
   for (const [route, loaded] of Object.entries(ROUTES)) {
@@ -115,4 +122,29 @@ test("silent_api_ends_in_an_error_state_and_retry_loads_the_board", async ({ pag
   await retry.click();
   await expect(page.getByTestId("task-card")).toHaveCount(TASKS.length);
   await expect(error).toHaveCount(0);
+});
+
+test("board_filters_by_phase_and_tag_and_leads_to_the_task_page", async ({ page }) => {
+  await routeApi(page);
+  await page.goto("/");
+  await expect(page.getByTestId("task-card")).toHaveCount(TASKS.length);
+
+  // No fixture task is settled.
+  await page.getByRole("button", { name: "Settled" }).click();
+  await expect(page.getByText("No tasks match these filters.")).toBeVisible();
+  await page.getByRole("button", { name: "All" }).click();
+  await expect(page.getByTestId("task-card")).toHaveCount(TASKS.length);
+
+  // A tag, typed and sent with the Enter key.
+  await page.getByRole("textbox", { name: "Tag" }).fill("Regex");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("task-card")).toHaveCount(1);
+  await expect(card(page, REGEX_TITLE)).toBeVisible();
+  await page.getByRole("button", { name: "Clear" }).click();
+  await expect(page.getByTestId("task-card")).toHaveCount(TASKS.length);
+
+  // The title of a card is the way to its page.
+  await page.getByRole("link", { name: REGEX_TITLE }).click();
+  await expect(page).toHaveURL(/\/tasks\/2$/);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(REGEX_TITLE);
 });

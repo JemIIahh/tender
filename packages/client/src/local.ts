@@ -99,7 +99,9 @@ async function stopNode(sandbox: Sandbox): Promise<void> {
   } finally {
     clearTimeout(timer);
   }
-  await rm(sandbox.homeDir, { recursive: true, force: true });
+  // A node slowed by a busy machine can still be writing (a state snapshot) as the directory goes,
+  // which fails the removal with ENOTEMPTY; rm retries that, and EBUSY, on its own.
+  await rm(sandbox.homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
 
 /**
@@ -164,6 +166,9 @@ const setTokenCall: TenderCall = {
 export async function startLocalChain(opts: { minWindowSecs?: number } = {}): Promise<LocalChain> {
   const minWindowSecs = opts.minWindowSecs ?? NETWORKS.sandbox.minWindowSecs;
   const [tenderWasm, tokenWasm] = await Promise.all([readWasm(TENDER_WASM), readWasm(TOKEN_WASM)]);
+  // near-sandbox waits NEAR_RPC_TIMEOUT_SECS (default 10) for a new node to answer; a busy machine
+  // needs longer, so a minute unless the caller chose otherwise.
+  process.env.NEAR_RPC_TIMEOUT_SECS ??= "60";
   const sandbox = await Sandbox.start({ version: NEARCORE_VERSION });
   let accounts: Record<LocalRole, Signer>;
   try {

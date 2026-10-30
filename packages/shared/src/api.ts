@@ -378,18 +378,32 @@ export type EventMessage = z.infer<typeof EventMessageSchema>;
 
 // ---- Fetching ---------------------------------------------------------------------------------
 
-/** The text of a failure that has a status and a body: the status, and the error code if any. */
+/**
+ * What an error code of the API looks like: a lower case letter, then up to 39 more of them, digits
+ * and underscores, as in `not_found` and `payload_too_large`. `ErrorBodySchema` takes any string in
+ * `error`, because a client has to read what a server sent, but only a code goes into a message.
+ */
+const ERROR_CODE = /^[a-z][a-z0-9_]{0,39}$/;
+
+/**
+ * The text of a failure that has a status and a body: the status, and the error code if the body
+ * has one. A message is read by people and by agents, and the `error` field of a body is for the
+ * server to fill: free text a server chose in it must not reach either through an error, so what is
+ * not a code is left out of the message (it stays in the body, for the code that reads that).
+ */
 function failureMessage(status: number, body: unknown): string {
   const error = ErrorBodySchema.safeParse(body);
-  return `request failed with status ${status}${error.success ? ` (${error.data.error})` : ""}`;
+  const code = error.success && ERROR_CODE.test(error.data.error) ? error.data.error : undefined;
+  return `request failed with status ${status}${code === undefined ? "" : ` (${code})`}`;
 }
 
 /**
  * What `fetchJson` throws for an answer it cannot hand back: any answer that is not a 2xx, and a
  * 2xx whose body is not JSON or does not fit its schema. `status` is the HTTP status and `body` the
  * body: the parsed JSON when the text was JSON, else the text. When the body is our own error body
- * (`ErrorBodySchema`) its `error` code is in the message. A request that fails before there is an
- * answer (offline, refused, aborted) is not an `ApiError`: it is thrown as it came.
+ * (`ErrorBodySchema`) and its `error` is a code (`ERROR_CODE`), the code is in the message; any
+ * other text in that field is not. A request that fails before there is an answer (offline,
+ * refused, aborted) is not an `ApiError`: it is thrown as it came.
  *
  * The `body` of a 2xx that was rejected is the answer as it came, and it can hold a secret: for a
  * sign-in it is the bearer token. So `body` is not an enumerable property, and `console.log(error)`
