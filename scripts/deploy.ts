@@ -203,7 +203,7 @@ function plan(parentId: string): Record<MemberName, Member> {
 }
 
 /** The private key `value` holds. Throws without showing it, whatever is wrong with it. */
-function parseKey(value: string, what: string): KeyPair {
+export function parseKey(value: string, what: string): KeyPair {
   try {
     const key = KeyPair.fromString(value as KeyPairString);
     key.getPublicKey();
@@ -217,7 +217,7 @@ function parseKey(value: string, what: string): KeyPair {
  * `.env.deploy.<network>`: the keys the script makes, and the one fact it has to remember between
  * runs. Only this file is read, never `.env`: a key in `.env` is a key of something else.
  */
-class DeployEnv {
+export class DeployEnv {
   /** The file's name, for messages. */
   readonly name: string;
   private exists: boolean;
