@@ -4,6 +4,7 @@ import {
   getBlob,
   type NewBlob,
   putBlob,
+  recordResultUpload,
   type StoredBlob,
   setBlobPublic,
 } from "@tender/db";
@@ -95,9 +96,11 @@ const HeldoutUploadSchema = z.strictObject({
  *
  * - `POST /v1/blobs` (signed in): stores a brief, criteria, scorecard or profile, which anyone may
  *   read at once, or an entrant's result, which no one may read until the task that revealed it
- *   first has closed its reveals. The task it was sent for decides nothing. A scorecard is taken
- *   only from the verifier or the poster of its task, and only once the task's reveal deadline
- *   has passed.
+ *   first has closed its reveals. A reveal counts only if the account that made it uploaded the
+ *   result for that task, so every upload of a result is recorded for its account and task. The
+ *   task a result was sent for decides nothing else. A scorecard is taken only from the verifier
+ *   or the poster of its task, and only once the reveal deadline has passed, the task's own and
+ *   that of every task that uses the same held-out document.
  * - `POST /v1/heldout` (signed in): stores a held-out document, which nobody may read.
  * - `GET /v1/blobs/:sha256`: the bytes of a blob that may be read.
  * - `GET /v1/scorecards/:task_id`: the scorecard the task was settled with.
@@ -135,6 +138,11 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     // Its first uploader may have stored it as private, which keeps the indexer from reading it.
     // The one uploading it now holds the bytes, so making it public gives nothing away.
     if (blob.isPublic && !stored.isPublic) await setBlobPublic(deps.db, sha256, true);
+    // Whoever sends the bytes holds them, whether they are new or stored already as a result, by
+    // anyone. A reveal of these bytes counts for the task it is made in only with this record.
+    if (blob.kind === "result" && blob.taskId !== undefined) {
+      await recordResultUpload(deps.db, { sha256, taskId: blob.taskId, account });
+    }
 
     const body: BlobUploadResponse = { sha256, uri: `${deps.publicUrl}/v1/blobs/${sha256}` };
     return c.json(body);
@@ -179,10 +187,25 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
   });
 
   app.get("/scorecards/:task_id", async (c) => {
-    const scorecard = await getScorecard(deps.db, c.req.param("task_id"));
+    const taskId = c.req.param("task_id");
+    const scorecard = await getScorecard(deps.db, taskId);
     if (scorecard === null) return notServed(c, "scorecard");
-    // The canonical bytes of the document, which are the bytes that were stored.
-    return served(c, canonicalJson(scorecard), "application/json");
+    let bytes: Uint8Array;
+    try {
+      // The canonical bytes of the document, which are the bytes that were stored.
+      bytes = canonicalJson(scorecard);
+    } catch (error) {
+      // A row stored before the canonical form refused a lone surrogate parses but cannot be
+      // written again. That is nothing the caller did, and the route has no scorecard to serve: the
+      // answer is the one for a scorecard that is not there. Only the kind of error is logged,
+      // since its text names places in the document. The task id is a u64: `getScorecard` finds
+      // a scorecard for no other.
+      console.warn(
+        `api: scorecard of task ${taskId} is not served, it cannot be written as canonical JSON (${error instanceof Error ? error.name : typeof error})`,
+      );
+      return notServed(c, "scorecard");
+    }
+    return served(c, bytes, "application/json");
   });
 
   return app;
@@ -325,8 +348,11 @@ async function requireEntry(db: Db, taskId: string, account: string): Promise<vo
 /**
  * A scorecard is the verifier's, or the poster's when the poster picks after the pick window, and
  * it is for a task whose reveal deadline has passed: before that, entries can still be revealed
- * and there is nothing to settle. The account's right is looked at first, so an account that has
- * none is told so whatever the time is.
+ * and there is nothing to settle. It also waits for every other task that uses the same held-out
+ * document (the same `heldout_commitment`), since the scorecard shows that document: published
+ * before one of them has closed its reveals, it would give away the answers. A task with no
+ * held-out shares none. The account's right is looked at first, so an account that has none is
+ * told so whatever the time is.
  */
 async function requireScorecardRight(
   deps: ApiDeps,
@@ -334,9 +360,16 @@ async function requireScorecardRight(
   account: string,
 ): Promise<void> {
   const [task] = await deps.db.query<{ poster: string; verifier: string; closed: boolean }>(
-    `select poster, verifier, reveal_deadline <= $2::numeric as closed
-       from tasks
-      where id = $1::numeric`,
+    `select t.poster, t.verifier,
+            (t.reveal_deadline <= $2::numeric
+             and not exists (
+               select 1
+                 from tasks o
+                where o.heldout_commitment = t.heldout_commitment
+                  and o.reveal_deadline > $2::numeric
+             )) as closed
+       from tasks t
+      where t.id = $1::numeric`,
     [taskId, nowNs(deps)],
   );
   if (!task) return notFound("no such task");
@@ -369,16 +402,21 @@ async function store(db: Db, blob: NewBlob): Promise<{ sha256: string; stored: S
  * Whether the API may serve `blob`, which is stored under `sha256`. A result is served by what was
  * revealed, not by who sent it: from the reveal deadline of the task that revealed `sha256` first
  * (the contract's rule, `now >= reveal_deadline`), the first being the earliest `revealed` event
- * in the index with that `content_hash`: by block height, and by the order the index stored them
- * in within a block. The order of storing alone would not do, since the index may apply a block
- * after later ones, such as a gap it fills in afterwards. No such event, no bytes.
+ * in the index with that `content_hash` and an upload behind it: by block height, and by the order
+ * the index stored them in within a block. The order of storing alone would not do, since the index
+ * may apply a block after later ones, such as a gap it fills in afterwards. No such event, no bytes.
  *
- * Only the first reveal counts. The contract checks a reveal against its commitment and not the
- * bytes, so once a hash is on chain anyone whose commit window is open can commit to it and reveal
- * it in a task of their own. That copy cannot bring the bytes out before the first task's deadline
- * and cannot hold them back after it. The task the row was stored for counts for nothing either:
- * bytes sent for a task that closes later are not held back, and bytes sent for one that has
- * closed are not brought out, when the first task to reveal them is another.
+ * A reveal has an upload behind it when the account that made it also uploaded these bytes for the
+ * task it revealed them in (`result_uploads`). The contract checks a reveal against its commitment
+ * and not the bytes, and a hash is public as soon as a transaction names it, one that failed
+ * included, so anyone whose commit window is open can commit to it and reveal it in a task of their
+ * own. A copy has no bytes to upload, and without an upload it counts for nothing: it cannot bring
+ * the bytes out before the deadline of the task that has them, and cannot hold them back after it.
+ *
+ * Only the first reveal that counts decides. The task the row was stored for counts for nothing
+ * either: bytes sent for a task that closes later are not held back, and bytes sent for one that
+ * has closed are not brought out, when the first task to reveal them is another. If that task is
+ * not in the index, nothing is served until it is: a later reveal does not stand in for it.
  *
  * Anything else is served while it is public: a held-out document is not, until it is made so.
  */
@@ -391,7 +429,15 @@ async function mayServe(deps: ApiDeps, sha256: string, blob: StoredBlob): Promis
         where t.id = (
                 select e.task_id
                   from events e
-                 where e.event = 'revealed' and e.data->>'content_hash' = $1
+                 where e.event = 'revealed'
+                   and e.data->>'content_hash' = $1
+                   and exists (
+                         select 1
+                           from result_uploads u
+                          where u.sha256 = $1
+                            and u.task_id = e.task_id
+                            and u.account = e.data->>'account'
+                       )
                  order by e.height, e.id
                  limit 1
               )

@@ -60,6 +60,7 @@ const TABLES = [
   "entries",
   "agents",
   "blobs",
+  "result_uploads",
   "working",
   "auth_challenges",
   "auth_tokens",
