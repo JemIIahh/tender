@@ -1415,7 +1415,8 @@ test("a_compile_that_fails_after_one_fitted_leaves_the_rest_unscored", {
   // The criteria's first compile fits, and every one after it takes 4 s, in any worker, against
   // judging's budget of 2 s: the machine's load, say. Bob's entry loops, and its worker is
   // stopped; the next worker cannot compile the criteria in time. That is not the criteria's
-  // fault, so they are not refused. Cat's entry is not scored (`scoring unavailable`), and the
+  // fault, so they are not refused. Judged with no memory, there is no later turn to try again
+  // on, as in a task's last stretch: cat's entry is not scored (`scoring unavailable`), and the
   // task is picked from alice's and bob's, with one WARN.
   const { chain } = await postJudged(
     [
@@ -1452,9 +1453,10 @@ test("a_compile_that_fails_after_one_fitted_and_before_any_score_does_not_pick",
   timeout: 60_000,
 }, async () => {
   // As above, but no entry was scored: the first compile fitted, and then the scorer could not be
-  // run (the Judge's own trouble), so the task was left for the next tick. On that tick the
-  // compile overruns. A pick would pay nobody for that: there is none, nothing is published, and
-  // the task is left to its fallback window, with one WARN, as when judging starts too late.
+  // run (the Judge's own trouble), so the task was left for the next tick. That tick comes in the
+  // task's last stretch, at NOW + 9 minutes, 30 s before its stop line, and the compile overruns.
+  // A pick would pay nobody for that: there is none, nothing is published, and the task is left
+  // to its fallback window, with one WARN, as when judging starts too late.
   const { chain, commitment } = await postJudged(
     [
       ["alice.test.near", "rogue:unavailable", 10n],
@@ -1473,7 +1475,7 @@ test("a_compile_that_fails_after_one_fitted_and_before_any_score_does_not_pick",
   expect(await judgeTask(deps, 7n)).toBe("skipped");
   expect(memory.progress.get("7")?.compiled).toBe(true);
   nextScorerFrom(ROGUE_WORKER);
-  expect(await judgeTask(deps, 7n)).toBe("skipped");
+  expect(await judgeTask({ ...deps, now: at(9) }, 7n)).toBe("skipped");
 
   expect(chain.pick).not.toHaveBeenCalled();
   expect(await scorecardCount()).toBe(0);
@@ -1489,6 +1491,90 @@ test("a_compile_that_fails_after_one_fitted_and_before_any_score_does_not_pick",
     [
       "judge: WARN task 7: a worker could not compile the criteria again before any entry was scored; it is not picked, and is left to its fallback window",
     ],
+  ]);
+});
+
+/**
+ * Task 7, with json_schema criteria whose second compile, in any worker, takes 4 s, against
+ * judging's budget of 1 s, and three entries: alice's and bob's right, cat's wrong.
+ */
+async function postSlowSecondCompile() {
+  const dir = mkdtempSync(join(tmpdir(), "tender-judge-"));
+  onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+  return postJudged(
+    [
+      ["alice.test.near", '{"x":1}', 10n],
+      ["bob.test.near", '{"x": 1}', 11n],
+      ["cat.test.near", '{"x":2}', 12n],
+    ],
+    {
+      criteria: jsonSchemaCriteria({ title: `rogue:slow-nth:2:4000:${join(dir, "compiles")}` }),
+      heldout: X_IS_1,
+    },
+  );
+}
+
+test("a_recompile_overrun_ends_the_turn_while_there_is_time", { timeout: 60_000 }, async () => {
+  // Turns of one entry each (a slice of 0 ms), each with a scorer of its own, which compiles the
+  // criteria. The second turn's compile overruns: the machine's load, which may pass. With more
+  // than two slices left before the stop line, that turn just ends, with a WARN, and the task is
+  // tried again on its next turn, whose compile fits. Every entry is scored.
+  const { chain } = await postSlowSecondCompile();
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const deps = judgeDeps(db, chain, {
+    memory: newJudgeMemory(),
+    scoringLimits: { compileBudgetMs: 250, sliceMs: 0 },
+  });
+
+  const turns: string[] = [];
+  for (let turn = 0; turn < 4; turn++) {
+    nextScorerFrom(ROGUE_WORKER);
+    turns.push(await judgeTask(deps, 7n));
+  }
+  expect(turns).toEqual(["yielded", "yielded", "yielded", "picked"]);
+  expect(warn.mock.calls).toEqual([
+    [
+      "judge: WARN task 7: a worker could not compile the criteria again; trying again on its next turn",
+    ],
+  ]);
+  const card = await picked(chain);
+  expect(card.scorecard.entries.map((e) => [e.account, e.score])).toEqual([
+    ["alice.test.near", 100],
+    ["bob.test.near", 100],
+    ["cat.test.near", 0],
+  ]);
+});
+
+test("a_recompile_overrun_in_the_last_stretch_picks_from_what_was_scored", {
+  timeout: 60_000,
+}, async () => {
+  // The first turn scores alice's entry. The second comes in the task's last stretch, at NOW + 8.5
+  // minutes, a minute before its stop line with slices of a minute, and its compile overruns.
+  // There is no time to try again: the entries left are not scored (`scoring unavailable`), and
+  // the task is picked from alice's, with one WARN.
+  const { chain } = await postSlowSecondCompile();
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const memory = newJudgeMemory();
+  const limits = (sliceMs: number) => ({ compileBudgetMs: 250, sliceMs });
+
+  nextScorerFrom(ROGUE_WORKER);
+  const first = judgeDeps(db, chain, { memory, scoringLimits: limits(0) });
+  expect(await judgeTask(first, 7n)).toBe("yielded");
+  nextScorerFrom(ROGUE_WORKER);
+  const last = judgeDeps(db, chain, { memory, now: at(8.5), scoringLimits: limits(60_000) });
+  expect(await judgeTask(last, 7n)).toBe("picked");
+
+  expect(warn.mock.calls).toEqual([
+    [
+      "judge: WARN task 7: a worker could not compile the criteria again, so the entries left are not scored",
+    ],
+  ]);
+  const card = await picked(chain);
+  expect(card.winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
+  expect(card.scorecard.entries.map((e) => [e.account, e.score, e.reasons])).toEqual([
+    ["alice.test.near", 100, []],
+    ["bob.test.near", 0, ["scoring unavailable"]],
+    ["cat.test.near", 0, ["scoring unavailable"]],
   ]);
 });
 

@@ -98,10 +98,12 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   line: one that runs past the line leaves judging to start past it, and then the task is not
  *   picked and nothing is published. Only the first compile in a score worker for the task can
  *   refuse the criteria: once one has compiled them, a worker that cannot compile them again is
- *   the machine's load, not the criteria's fault. The entries left then have no score (`scoring
- *   unavailable`), with one `WARN`, and the task is picked from those scored. Or the criteria or
- *   held-out checks that the chain names cannot be read or used (they passed intake, so they are
- *   gone or changed), and its status becomes `failed_closed` with the reason.
+ *   the machine's load, not the criteria's fault. While more than two slices are left before the
+ *   stop line, the turn ends there, with a `WARN`, and the task is tried again on its next turn
+ *   (`yielded`). In its last stretch, the entries left have no score (`scoring unavailable`), with
+ *   one `WARN`, and the task is picked from those scored. Or the criteria or held-out checks that
+ *   the chain names cannot be read or used (they passed intake, so they are gone or changed), and
+ *   its status becomes `failed_closed` with the reason.
  *
  * The task is read from the chain first, every time, so a `pick` that landed before a crash shows
  * as an outcome and nothing is done again. It must be in `judging` both by `deps.now` and by the
@@ -215,8 +217,16 @@ export async function judgeTask(
     const reason = clampReason(judged.rejected);
     return forget(deps, taskId, await refuse(deps, taskId, "rejected", reason));
   }
-  // P05-R18, P05-R19: its slice is over; it takes up again on its next turn.
-  if (judged.yielded) return "yielded";
+  // P05-R18, P05-R19: its slice is over; it takes up again on its next turn. So it does after a
+  // worker could not compile the criteria again while there was time: that may be load, which
+  // passes.
+  if (judged.yielded) {
+    if (judged.unavailable) {
+      const why = "a worker could not compile the criteria again";
+      console.warn(`judge: WARN task ${taskId}: ${why}; trying again on its next turn`);
+    }
+    return "yielded";
+  }
   // P05-R13, P05-R16: when the Judge's own lateness left every entry unscored (it started past the
   // stop line, or its workers could not be made ready before it), a pick would pay nobody for it.
   // The task is left to its fallback window. When the entrants' fetches and scores used the time,
@@ -224,8 +234,9 @@ export async function judgeTask(
   if (judged.late && judged.scored === 0 && judged.unscored > 0) {
     return notJudged(deps, taskId, TOO_LATE, "judging started too late to score any entry");
   }
-  // A worker could not compile the criteria again: the machine's load, not the criteria's fault.
-  // The entries left have no score, and the task is picked from those scored, if any were.
+  // A worker could not compile the criteria again, in the task's last stretch: the machine's load,
+  // not the criteria's fault. The entries left have no score, and the task is picked from those
+  // scored, if any were.
   if (judged.unavailable) {
     const why = "a worker could not compile the criteria again";
     if (judged.scored === 0) {
@@ -304,8 +315,9 @@ interface Judged {
   /** Why the criteria cannot be scored with, when the scorer found so; nothing is scored then. */
   rejected: string | null;
   /**
-   * Whether a worker could not compile the criteria again, after one had: the entries left then
-   * have no score (`scoring unavailable`).
+   * Whether a worker could not compile the criteria again, after one had. While there was time
+   * the turn ended there (`yielded`); in the last stretch the entries left have no score
+   * (`scoring unavailable`).
    */
   unavailable: boolean;
   /**
@@ -341,8 +353,9 @@ interface Judged {
  * pick deadline`, unless its content was scored already, for an entry before it: that costs
  * nothing, and it shares the score, past the line too. A fetch or a score that fails within its
  * own limit is that entry's, as before. Once a worker cannot compile the criteria again
- * (`unavailable`), nothing more is fetched or scored, and the entries with no result have none:
- * `scoring unavailable`.
+ * (`unavailable`), nothing more is fetched or scored. While more than two slices are left before
+ * the stop line, the turn ends there (`yielded`), and the task is tried again on its next turn; in
+ * its last stretch, the entries with no result have none: `scoring unavailable`.
  *
  * A task's turn in a tick is a slice (P05-R18, P05-R19): once 20 s have gone to its entries, no
  * fetch or score starts, and it gives way (`yielded`), whether or not another task waits, to be
@@ -376,11 +389,8 @@ async function judgeEntries(
   const judging: Judging = {
     progress,
     leftMs: () => Number(stopLine - BigInt(clock().getTime()) * NS_PER_MS) / 1e6,
-    sliceOver: () =>
-      deps.memory !== undefined &&
-      judging.found > 0 &&
-      clock().getTime() >= sliceEnd &&
-      judging.leftMs() > 2 * sliceMs,
+    hasTime: () => deps.memory !== undefined && judging.leftMs() > 2 * sliceMs,
+    sliceOver: () => judging.found > 0 && clock().getTime() >= sliceEnd && judging.hasTime(),
     found: 0,
     late: false,
     rejected: null,
@@ -440,6 +450,11 @@ interface Judging {
   progress: TaskProgress;
   /** The time left before the stop line, in milliseconds, by the Judge's clock. */
   leftMs: () => number;
+  /**
+   * Whether a turn of the task's can end and be taken up again on the next tick: the Judge keeps
+   * what it found out (`JudgeMemory`), and more than two slices are left before the stop line.
+   */
+  hasTime: () => boolean;
   /** Whether the task's slice of the tick is used up, and it gives way (P05-R18). */
   sliceOver: () => boolean;
   /** How many results it has found out on this tick. */
@@ -512,6 +527,8 @@ async function judgeBatch(
         judging.rejected = scoring.reason;
       } else if (scoring.kind === "unavailable") {
         judging.unavailable = true;
+        // Load, which may pass: while there is time, the turn ends, and the next one tries again.
+        if (judging.hasTime()) judging.yielded = true;
       }
       // `cut`: the stop line came while it was scored, and it has no score.
     }

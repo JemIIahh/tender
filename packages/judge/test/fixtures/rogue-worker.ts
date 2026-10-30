@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { parentPort } from "node:worker_threads";
 import { serveWorker } from "../../src/isolate";
 import { checkJsonSchemaUsable } from "../../src/kinds/json_schema";
@@ -40,6 +40,14 @@ function roguePrepare(...task: Parameters<typeof prepareScorer>): ReturnType<typ
     const mark = path.join(":");
     if (existsSync(mark)) busyFor(Number(ms));
     else writeFileSync(mark, "");
+  }
+  // `rogue:slow-nth:{n}:{ms}:{path}`: the n-th compile, in any worker, takes this long, and the
+  // others do not. Each compile adds a byte to the file at the path, which counts them.
+  if (title.startsWith("rogue:slow-nth:")) {
+    const [n, ms, ...path] = title.slice("rogue:slow-nth:".length).split(":");
+    const mark = path.join(":");
+    appendFileSync(mark, "x");
+    if (statSync(mark).size === Number(n)) busyFor(Number(ms));
   }
   if (title === "rogue:compile-throws") throw new RangeError("thrown by the compile");
   const prepared = prepareScorer(...task);
