@@ -8,10 +8,10 @@ import { MAX_RESULT_BYTES } from "@tender/shared";
 import type { FetchIo, JudgeDeps, TransportInit } from "./types";
 
 /** How long fetching an entry from another host may take, every redirect and the body included. */
-const TIMEOUT_MS = 10_000;
+export const FETCH_TIMEOUT_MS = 10_000;
 /**
  * How long connecting to one address may take, TLS included, before the next address is tried.
- * It counts against `TIMEOUT_MS` like the rest.
+ * It counts against the fetch's time like the rest.
  */
 const CONNECT_TIMEOUT_MS = 3_000;
 /** How many redirects are followed. */
@@ -39,8 +39,9 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
  *   (with TLS set up, for https) is given up as failed. One that takes it and then hangs uses up
  *   the time limit.
  * - Redirects are followed at most 3 times, and each is resolved and checked like the first
- *   request. The whole of it has 10 s, and the body at most 262_144 bytes: the limits are kept
- *   while the body streams, and a body that is too large is not read to its end.
+ *   request. The whole of it has `timeoutMs` (10 s, and no more), and the body at most 262_144
+ *   bytes: the limits are kept while the body streams, and a body that is too large is not read to
+ *   its end. A fetch that runs out of time is `timed out`, and stops where it is.
  *
  * The bytes are what the store or the server holds, not parsed or decoded: the caller hashes
  * exactly these. `io` defaults to `deps.fetchIo`, and that to the network. A database error is
@@ -50,6 +51,7 @@ export async function fetchEntryContent(
   deps: Pick<JudgeDeps, "db" | "publicUrl" | "fetchIo">,
   uri: string,
   io: FetchIo = deps.fetchIo ?? NETWORK,
+  timeoutMs = FETCH_TIMEOUT_MS,
 ): Promise<Uint8Array | { error: string }> {
   const own = ownBlobHash(deps.publicUrl, uri);
   if (own !== undefined) {
@@ -59,7 +61,7 @@ export async function fetchEntryContent(
   if (url === null || !isPlainHttp(url)) return { error: "unsupported uri" };
 
   const deadline = new AbortController();
-  const timer = setTimeout(() => deadline.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => deadline.abort(), Math.min(timeoutMs, FETCH_TIMEOUT_MS));
   try {
     return await fetchFrom(url, io, deadline.signal);
   } finally {

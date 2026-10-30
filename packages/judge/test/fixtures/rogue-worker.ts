@@ -2,63 +2,80 @@ import { parentPort, workerData } from "node:worker_threads";
 import { serveWorker } from "../../src/isolate";
 import { checkJsonSchemaUsable } from "../../src/kinds/json_schema";
 import { runInSandbox } from "../../src/sandbox";
-import { ScorerUnavailableError, scorerFor } from "../../src/score";
+import { prepareScorer, ScorerUnavailableError } from "../../src/score";
+import type { EntryScore } from "../../src/types";
 import { MALFORMED } from "./malformed";
 
 // A score worker for the isolation tests that misbehaves on cue. An entry whose content is one of
-// the cues below, or a schema whose `title` is one, makes it do what the cue says; anything else
-// is scored and checked as the Judge's own worker does it. It is a worker's entry: tests start it,
-// and never import it.
+// the cues below, or a json_schema schema whose `title` is one, makes it do what the cue says;
+// anything else is scored, compiled and checked as the Judge's own worker does it. It is a worker's
+// entry: tests start it, and never import it.
 
 // What the loops count, without end.
 const counter = { spins: 0 };
 
-function rogueScorerFor(...task: Parameters<typeof scorerFor>): ReturnType<typeof scorerFor> {
-  const score = scorerFor(...task);
-  return async (content) => {
-    const cue = new TextDecoder().decode(content);
-    if (cue.startsWith("rogue:malformed:")) {
-      return MALFORMED[Number(cue.slice("rogue:malformed:".length))] as never;
+/** Keeps the thread busy for `ms` milliseconds, as a slow compile does. */
+function busyFor(ms: number): void {
+  const until = Date.now() + ms;
+  while (Date.now() < until) counter.spins++;
+}
+
+/** The `title` of a json_schema schema, where the compile and check cues go. */
+function titleOf(schema: Record<string, unknown>): string {
+  return typeof schema.title === "string" ? schema.title : "";
+}
+
+function roguePrepare(...task: Parameters<typeof prepareScorer>): ReturnType<typeof prepareScorer> {
+  const [criteria] = task;
+  const title = criteria.kind === "json_schema" ? titleOf(criteria.schema) : "";
+  // A compile that takes this many milliseconds, and one that crashes.
+  if (title.startsWith("rogue:slow:")) busyFor(Number(title.slice("rogue:slow:".length)));
+  if (title === "rogue:compile-throws") throw new RangeError("thrown by the compile");
+  const prepared = prepareScorer(...task);
+  return { problem: prepared.problem, score: (content) => rogueScore(content, prepared.score) };
+}
+
+async function rogueScore(
+  content: Uint8Array,
+  score: (content: Uint8Array) => Promise<EntryScore>,
+): Promise<EntryScore> {
+  const cue = new TextDecoder().decode(content);
+  if (cue.startsWith("rogue:malformed:")) {
+    return MALFORMED[Number(cue.slice("rogue:malformed:".length))] as never;
+  }
+  switch (cue) {
+    case "rogue:loop":
+      for (;;) counter.spins++;
+    case "rogue:alloc": {
+      const kept: number[][] = [];
+      for (;;) kept.push(new Array(100_000).fill(kept.length));
     }
-    switch (cue) {
-      case "rogue:loop":
-        for (;;) counter.spins++;
-      case "rogue:alloc": {
-        const kept: number[][] = [];
-        for (;;) kept.push(new Array(100_000).fill(kept.length));
-      }
-      case "rogue:recurse": {
-        const down = (depth: number): number => down(depth + 1) + 1;
-        return { score: down(0), passed: false, reasons: [] };
-      }
-      case "rogue:sandbox-recursion": {
-        // Which stack runs out first: the engine's own check, or the thread's.
-        const ran = await runInSandbox("function f() { f() } f()", {
-          timeoutMs: 2_000,
-          memoryBytes: 32 * 1024 * 1024,
-        });
-        return { score: 0, passed: false, reasons: [ran.ok ? "it ran" : ran.message] };
-      }
-      case "rogue:throw":
-        throw new TypeError("thrown by the scorer");
-      case "rogue:unavailable":
-        throw new ScorerUnavailableError("the scorer cannot run");
-      case "rogue:exit":
-        return process.exit(0);
-      default:
-        return score(content);
+    case "rogue:recurse": {
+      const down = (depth: number): number => down(depth + 1) + 1;
+      return { score: down(0), passed: false, reasons: [] };
     }
-  };
+    case "rogue:sandbox-recursion": {
+      // Which stack runs out first: the engine's own check, or the thread's.
+      const ran = await runInSandbox("function f() { f() } f()", {
+        timeoutMs: 2_000,
+        memoryBytes: 32 * 1024 * 1024,
+      });
+      return { score: 0, passed: false, reasons: [ran.ok ? "it ran" : ran.message] };
+    }
+    case "rogue:throw":
+      throw new TypeError("thrown by the scorer");
+    case "rogue:unavailable":
+      throw new ScorerUnavailableError("the scorer cannot run");
+    case "rogue:exit":
+      return process.exit(0);
+    default:
+      return score(content);
+  }
 }
 
 function rogueCheck(schema: Record<string, unknown>): ReturnType<typeof checkJsonSchemaUsable> {
-  const title = typeof schema.title === "string" ? schema.title : "";
-  if (title.startsWith("rogue:slow:")) {
-    // A compile that takes this many milliseconds, and then the real check.
-    const until = Date.now() + Number(title.slice("rogue:slow:".length));
-    while (Date.now() < until) counter.spins++;
-    return checkJsonSchemaUsable(schema);
-  }
+  const title = titleOf(schema);
+  if (title.startsWith("rogue:slow:")) busyFor(Number(title.slice("rogue:slow:".length)));
   switch (title) {
     case "rogue:loop":
       for (;;) counter.spins++;
@@ -73,6 +90,6 @@ function rogueCheck(schema: Record<string, unknown>): ReturnType<typeof checkJso
 
 if (parentPort === null) throw new Error("rogue-worker.ts runs only as a worker");
 serveWorker(parentPort, workerData, {
-  scorerFor: rogueScorerFor,
+  prepareScorer: roguePrepare,
   checkJsonSchemaUsable: rogueCheck,
 });

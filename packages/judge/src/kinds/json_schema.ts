@@ -53,21 +53,25 @@ export function scoreJsonSchema(
   h: JsonSchemaHeldout,
   content: Uint8Array,
 ): EntryScore {
-  return jsonSchemaScorer(c, h)(content);
+  return jsonSchemaScorer(c, h).score(content);
 }
 
 /**
  * `scoreJsonSchema` for the entries of one task, scored one after another: the schema is compiled
- * once, for the first entry that is JSON, and that validator checks every entry after it. A
- * schema near the size cap takes a few hundred milliseconds to compile. Ajv's validators keep
- * nothing of one document for the next, so each entry scores as it would on its own.
+ * once, now, and that validator checks every entry. A schema near the size cap takes a few hundred
+ * milliseconds to compile. Ajv's validators keep nothing of one document for the next, so each
+ * entry scores as it would on its own.
+ *
+ * `problem` is why the schema cannot be used, or `null`: it does not compile, or it is an
+ * `$async` schema. `score` then scores every document that is JSON 0 with that reason, as
+ * `scoreJsonSchema` does; the Judge does not score such a task at all.
  */
 export function jsonSchemaScorer(
   c: JsonSchemaCriteria,
   h: JsonSchemaHeldout,
-): (content: Uint8Array) => EntryScore {
-  let compiled: Compiled | undefined;
-  return (content) => {
+): { problem: string | null; score: (content: Uint8Array) => EntryScore } {
+  const compiled = compile(c.schema);
+  const score = (content: Uint8Array): EntryScore => {
     const text = decodeUtf8(content);
     if (text === null) return scored(c, 0, ["not valid UTF-8"]);
 
@@ -78,7 +82,6 @@ export function jsonSchemaScorer(
       return scored(c, 0, ["not JSON"]);
     }
 
-    compiled ??= compile(c.schema);
     const schemaErrors = checkSchema(compiled, document);
     if (schemaErrors !== null) return scored(c, 0, schemaErrors);
 
@@ -92,13 +95,14 @@ export function jsonSchemaScorer(
     });
     const rounded = Math.round((100 * (total - failed.length)) / total);
     // 100 means that every check passed. With 200 checks or more, one failure would round up to it.
-    const score = failed.length > 0 ? Math.min(rounded, 99) : rounded;
+    const result = failed.length > 0 ? Math.min(rounded, 99) : rounded;
     return scored(
       c,
-      score,
+      result,
       failed.map(({ path, equals }) => `${path} expected ${JSON.stringify(equals)}`),
     );
   };
+  return { problem: "reason" in compiled ? compiled.reason : null, score };
 }
 
 /**

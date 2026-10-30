@@ -4,7 +4,7 @@ import { type MessagePort, type TransferListItem, Worker } from "node:worker_thr
 import type { Heldout } from "@tender/shared";
 import type { P0Criteria } from "./intake";
 import { checkJsonSchemaUsable } from "./kinds/json_schema";
-import { ScorerUnavailableError, scorerFor } from "./score";
+import { type PreparedScorer, prepareScorer, ScorerUnavailableError } from "./score";
 import type { EntryScore } from "./types";
 
 // Every scorer the Judge runs runs here, in a worker thread with hard limits (P05-R1), so that an
@@ -19,14 +19,14 @@ import type { EntryScore } from "./types";
 const ENTRY_TIMEOUT_MS = 5_000;
 /**
  * How long compiling a `json_schema` schema and its trial run may take, by default: intake's
- * budget. Judging gives the same check 4 times as long (see `judgeTask`).
+ * budget. Judging gives the same check, and the compile in a score worker, 4 times as long (see
+ * `judgeTask`).
  */
 export const COMPILE_BUDGET_MS = 2_000;
 /**
  * How long a worker may take to load the scorers, about 130 ms when the machine is idle. Loading
  * is the Judge's own cost, and is not counted against an entry's time or a schema's: the limits
- * start when the work is sent to a worker that is ready. A start and an entry's limit together
- * fit inside the 30 s that judging leaves before the pick deadline of a long pick window.
+ * start when the work is sent to a worker that is ready.
  */
 const START_TIMEOUT_MS = 10_000;
 /**
@@ -42,14 +42,18 @@ const TIMED_OUT = "scoring timed out";
 const OUT_OF_MEMORY = "scoring ran out of memory";
 const FAILED = "scoring failed";
 const TOO_SLOW = "criteria schema is not supported: it takes too long to compile";
+/** Why criteria are refused when compiling them crashes the worker: intake's reason for that. */
+const NOT_CHECKED = "criteria could not be checked";
 
 // The messages of the protocol, besides the requests and the answers.
-/** What a worker sends once it has loaded the scorers and can take work. */
+/** What a worker sends once it has loaded the scorers. */
 const READY = "ready";
-/** What a score worker sends instead of a score when the scorer cannot be run at all. */
+/** What a score worker sends instead of an answer when the scorer cannot be run at all. */
 const UNAVAILABLE = "unavailable";
 /** What a check worker is sent to run its check. */
 const CHECK = "check";
+/** What a score worker is sent, once, to compile the criteria before it takes any entry. */
+const COMPILE = "compile";
 
 /** The work a worker is started for, as its `workerData`. */
 export type Job =
@@ -64,73 +68,148 @@ export interface WorkerOptions {
   startTimeoutMs?: number;
 }
 
+/** What came of asking a task's scorer for one entry's score. */
+export type Scoring =
+  /** The entry's score. A failure of its own (time, memory, a crash) is a 0 with the reason. */
+  | { kind: "scored"; score: EntryScore }
+  /** The stop line came while the entry was being scored: it has no score. */
+  | { kind: "cut" }
+  /**
+   * The stop line came while the Judge's own work ran, before the entry was sent: a worker was
+   * loading, or compiling the criteria.
+   */
+  | { kind: "late" }
+  /**
+   * The criteria cannot be scored with: they do not compile, not within the budget, or crash the
+   * worker that compiles them. That is no entry's doing.
+   */
+  | { kind: "rejected"; reason: string };
+
 /** What the scorer of one task's entries does. */
 export interface TaskScorer {
   /**
-   * The score of one entry's content. It resolves whatever the content does: an entry whose
-   * scoring takes longer than the limit (5 s) scores 0 (`scoring timed out`), one whose scorer
-   * runs out of memory too (`scoring ran out of memory`), and one that makes the worker crash,
-   * or answer with anything but a score, scores 0 as well (`scoring failed`). The worker is
-   * stopped after each of these, and the next entry gets a new one. It rejects with
-   * `ScorerUnavailableError` when the scorer cannot be run at all: no worker can be started, or
-   * the scorer says so (the regex sandbox could not be loaded, say), which is the Judge's trouble.
-   * Entries are scored one at a time, in the order they are asked for.
+   * Scores one entry's content. `leftMs` is the time left before the stop line, which no part of
+   * the work may run past (P05-R15): starting a worker and compiling the criteria, when a new
+   * worker is needed, then the entry's own scoring. Each of them has the smaller of its own limit
+   * and the time left.
+   *
+   * - `scored`: the entry's score. An entry whose scoring takes longer than its limit (5 s)
+   *   scores 0 (`scoring timed out`), one whose scorer runs out of memory too (`scoring ran out of
+   *   memory`), and one that makes the worker crash, or answer with anything but a score, scores
+   *   0 as well (`scoring failed`). The worker is stopped after each of these.
+   * - `cut`: the time left ran out while the entry was being scored, before its own limit did.
+   * - `late`: the time left ran out while a worker loaded or compiled the criteria (P05-R17: no
+   *   entry pays for the compile).
+   * - `rejected`: the criteria cannot be scored with (see `Scoring`).
+   *
+   * It rejects with `ScorerUnavailableError` when the scorer cannot be run at all: no worker can
+   * be started, one takes longer than its own start limit, or the scorer says so (the regex sandbox
+   * could not be loaded, say), which is the Judge's trouble. Entries are scored one at a time, in
+   * the order they are asked for.
    */
-  score(content: Uint8Array): Promise<EntryScore>;
+  score(content: Uint8Array, leftMs?: number): Promise<Scoring>;
   /** Stops the worker. Resolves once no worker of this scorer is left. */
   close(): Promise<void>;
 }
 
 /**
- * The scorer of one task's entries: one worker for the task, which scores them one after another
- * (it compiles a `json_schema` schema once, for all of them), and is never shared with another
- * task. Only the criteria, the held-out document and each entry's bytes go to the worker, and
- * only a score comes back: `{ score, passed, reasons }`, with a whole `score` from 0 to 100,
- * `passed` that is what the criteria's `min_score` makes of it, and reasons that are strings.
- * Anything else is a crash.
+ * The scorer of one task's entries: one worker for the task, which compiles the criteria once,
+ * before any entry (within `compileBudgetMs`, 2 s by default), and then scores the entries one
+ * after another. It is never shared with another task. A worker that is stopped after an entry's
+ * failure is replaced by one that compiles the criteria again, under the same budget. Only the
+ * criteria, the held-out document and each entry's bytes go to the worker, and only a score
+ * comes back: `{ score, passed, reasons }`, with a whole `score` from 0 to 100, `passed` that is
+ * what the criteria's `min_score` makes of it, and reasons that are strings. Anything else is a
+ * crash.
  *
- * `onCrash` is told of each crash, with the error when there is one. Nothing is started until an
- * entry is scored.
+ * `onCrash` is told of each crash an entry causes, with the error when there is one. Nothing is
+ * started until an entry is scored.
  */
 export function openTaskScorer(
   task: { criteria: P0Criteria; heldout: Heldout | null },
-  options: WorkerOptions & { entryTimeoutMs?: number; onCrash?: (error: unknown) => void } = {},
+  options: WorkerOptions & {
+    entryTimeoutMs?: number;
+    compileBudgetMs?: number;
+    onCrash?: (error: unknown) => void;
+  } = {},
 ): TaskScorer {
   const job: Job = { job: "score", criteria: task.criteria, heldout: task.heldout };
   const timeoutMs = options.entryTimeoutMs ?? ENTRY_TIMEOUT_MS;
+  const startTimeoutMs = options.startTimeoutMs ?? START_TIMEOUT_MS;
+  const compileBudgetMs = options.compileBudgetMs ?? COMPILE_BUDGET_MS;
   let lane: Lane | undefined;
   /** Each worker that has been stopped, until it has ended. */
   const stopped: Promise<unknown>[] = [];
   /** The last request: each one waits for the one before it. */
   let last: Promise<unknown> = Promise.resolve();
 
+  const stop = (worker: Lane) => stopped.push(worker.stop());
   const drop = () => {
-    if (lane !== undefined) stopped.push(lane.stop());
+    if (lane !== undefined) stop(lane);
     lane = undefined;
   };
-  const crashed = (error: unknown): EntryScore => {
+  const crashed = (error: unknown): Scoring => {
     drop();
     options.onCrash?.(error);
-    return zero(FAILED);
+    return scored(zero(FAILED));
   };
 
-  const scoreOne = async (content: Uint8Array): Promise<EntryScore> => {
+  /** A worker that has loaded and compiled the criteria, or why there is none, by `left()`. */
+  const ready = async (left: () => number): Promise<Lane | Scoring> => {
+    const loadMs = Math.min(startTimeoutMs, left());
+    if (loadMs <= 0) return { kind: "late" };
+    const started = await Lane.start(job, options, loadMs);
+    if (started === "timeout") {
+      if (loadMs < startTimeoutMs) return { kind: "late" };
+      throw new ScorerUnavailableError("a score worker did not start in time");
+    }
+    const compileMs = Math.min(compileBudgetMs, left());
+    if (compileMs <= 0) {
+      stop(started);
+      return { kind: "late" };
+    }
+    const outcome = await started.ask(COMPILE, [], compileMs);
+    if (outcome.kind === "answer" && outcome.value === UNAVAILABLE) {
+      stop(started);
+      throw new ScorerUnavailableError("the scorer could not be run");
+    }
+    const usable = outcome.kind === "answer" ? usabilityOf(outcome.value) : null;
+    if (usable !== null) {
+      if (usable.ok) return started;
+      stop(started);
+      return { kind: "rejected", reason: usable.reason };
+    }
+    stop(started);
+    // A crash, or something else for an answer.
+    if (outcome.kind !== "timeout") return { kind: "rejected", reason: NOT_CHECKED };
+    // Its own budget, or the stop line, which came first.
+    return compileMs < compileBudgetMs ? { kind: "late" } : { kind: "rejected", reason: TOO_SLOW };
+  };
+
+  const scoreOne = async (content: Uint8Array, leftMs: number): Promise<Scoring> => {
+    const until = performance.now() + leftMs;
+    const left = () => until - performance.now();
     if (lane === undefined || !lane.alive) {
       drop();
-      lane = await Lane.start(job, options);
+      const started = await ready(left);
+      if (!(started instanceof Lane)) return started;
+      lane = started;
     }
+    const limitMs = Math.min(timeoutMs, left());
+    if (limitMs <= 0) return { kind: "cut" };
     // A copy of exactly these bytes, moved to the worker rather than copied again. `content` can
     // be a view into a larger buffer, all of which would be copied.
     const bytes = new Uint8Array(content);
-    const outcome = await lane.ask(bytes, [bytes.buffer], timeoutMs);
+    const outcome = await lane.ask(bytes, [bytes.buffer], limitMs);
     switch (outcome.kind) {
       case "timeout":
         drop();
-        return zero(TIMED_OUT);
+        // Its own limit, or the stop line, which came first.
+        return limitMs < timeoutMs ? { kind: "cut" } : scored(zero(TIMED_OUT));
       case "error":
         if (!isOutOfMemory(outcome.error)) return crashed(outcome.error);
         drop();
-        return zero(OUT_OF_MEMORY);
+        return scored(zero(OUT_OF_MEMORY));
       case "exit":
         return crashed(new ScoreWorkerError(`the score worker exited (code ${outcome.code})`));
       case "answer": {
@@ -139,14 +218,16 @@ export function openTaskScorer(
           throw new ScorerUnavailableError("the scorer could not be run");
         }
         const score = entryScoreOf(outcome.value, task.criteria.min_score);
-        return score ?? crashed(new ScoreWorkerError("the score worker sent something else"));
+        if (score === null)
+          return crashed(new ScoreWorkerError("the score worker sent something else"));
+        return scored(score);
       }
     }
   };
 
   return {
-    score(content) {
-      const result = last.then(() => scoreOne(content));
+    score(content, leftMs = Number.POSITIVE_INFINITY) {
+      const result = last.then(() => scoreOne(content, leftMs));
       last = result.catch(() => undefined);
       return result;
     },
@@ -172,7 +253,9 @@ export async function checkJsonSchemaIsolated(
   schema: Record<string, unknown>,
   options: WorkerOptions & { budgetMs?: number } = {},
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const lane = await Lane.start({ job: "check", schema }, options);
+  const startTimeoutMs = options.startTimeoutMs ?? START_TIMEOUT_MS;
+  const lane = await Lane.start({ job: "check", schema }, options, startTimeoutMs);
+  if (lane === "timeout") throw new ScorerUnavailableError("a check worker did not start in time");
   try {
     const outcome = await lane.ask(CHECK, [], options.budgetMs ?? COMPILE_BUDGET_MS);
     if (outcome.kind === "timeout") return { ok: false, reason: TOO_SLOW };
@@ -188,23 +271,28 @@ export async function checkJsonSchemaIsolated(
 
 /** The scorers a worker runs. A test can pass ones that misbehave on cue. */
 export interface WorkerScorers {
-  scorerFor: typeof scorerFor;
+  prepareScorer: typeof prepareScorer;
   checkJsonSchemaUsable: typeof checkJsonSchemaUsable;
 }
 
 /**
  * The worker's side, which `score-worker.ts` runs: `job` is its `workerData`, and each request on
- * `port` is answered on it. A score job takes an entry's bytes and answers with the score, or
- * with `unavailable` when the scorer throws `ScorerUnavailableError`; a check job answers each
- * request with `checkJsonSchemaUsable` of its schema. Once it is set up it sends `ready`.
+ * `port` is answered on it. Once it is set up it sends `ready`.
  *
- * Anything else a scorer or the check throws ends the worker with that error, which its host takes
- * for a crash: nothing is left to run in a worker whose state is in doubt.
+ * A score job is first asked to compile the criteria (`compile`), and answers as the check does:
+ * `{ ok: true }`, or `{ ok: false, reason }` when the criteria cannot be scored with, or
+ * `unavailable` when the scorer cannot be made at all (`ScorerUnavailableError`). Then each request
+ * is an entry's bytes, answered with the score, or with `unavailable` when the scorer throws
+ * `ScorerUnavailableError`. A check job answers each request with `checkJsonSchemaUsable` of its
+ * schema.
+ *
+ * Anything else a scorer, the compile or the check throws ends the worker with that error, which
+ * its host takes for a crash: nothing is left to run in a worker whose state is in doubt.
  */
 export function serveWorker(
   port: MessagePort,
   job: Job,
-  scorers: WorkerScorers = { scorerFor, checkJsonSchemaUsable },
+  scorers: WorkerScorers = { prepareScorer, checkJsonSchemaUsable },
 ): void {
   const crash = (error: unknown) =>
     process.nextTick(() => {
@@ -213,9 +301,23 @@ export function serveWorker(
   if (job.job === "check") {
     port.on("message", () => port.postMessage(scorers.checkJsonSchemaUsable(job.schema)));
   } else {
-    const score = scorers.scorerFor(job.criteria, job.heldout);
-    port.on("message", (content: Uint8Array) => {
-      score(content)
+    let prepared: PreparedScorer | undefined;
+    port.on("message", (request: unknown) => {
+      if (request === COMPILE) {
+        try {
+          prepared = scorers.prepareScorer(job.criteria, job.heldout);
+        } catch (error) {
+          if (!(error instanceof ScorerUnavailableError)) throw error;
+          port.postMessage(UNAVAILABLE);
+          return;
+        }
+        const { problem } = prepared;
+        port.postMessage(problem === null ? { ok: true } : { ok: false, reason: problem });
+        return;
+      }
+      if (prepared === undefined) throw new Error("an entry came before the criteria compiled");
+      prepared
+        .score(request as Uint8Array)
         .then((result) => port.postMessage(result))
         .catch((error: unknown) => {
           if (error instanceof ScorerUnavailableError) port.postMessage(UNAVAILABLE);
@@ -255,11 +357,15 @@ class Lane {
   }
 
   /**
-   * A worker started on `job`, once it has loaded the scorers. It rejects with
-   * `ScorerUnavailableError` when the worker cannot be started, fails while it loads, or takes
-   * longer than the start timeout.
+   * A worker started on `job`, once it has loaded the scorers, or `timeout` when it has not
+   * within `timeoutMs` (it is stopped then). It rejects with `ScorerUnavailableError` when the
+   * worker cannot be started, or fails while it loads.
    */
-  static async start(job: Job, options: WorkerOptions): Promise<Lane> {
+  static async start(
+    job: Job,
+    options: WorkerOptions,
+    timeoutMs: number,
+  ): Promise<Lane | "timeout"> {
     let lane: Lane;
     try {
       const worker = new Worker(options.workerUrl ?? SCORE_WORKER, {
@@ -271,9 +377,10 @@ class Lane {
     } catch (error) {
       throw new ScorerUnavailableError("a score worker could not be started", { cause: error });
     }
-    const outcome = await lane.next(options.startTimeoutMs ?? START_TIMEOUT_MS);
+    const outcome = await lane.next(timeoutMs);
     if (outcome.kind === "answer" && outcome.value === READY) return lane;
     await lane.stop();
+    if (outcome.kind === "timeout") return "timeout";
     throw new ScorerUnavailableError("a score worker could not be started", {
       cause: outcome.kind === "error" ? outcome.error : outcome,
     });
@@ -373,6 +480,10 @@ function isOutOfMemory(error: unknown): boolean {
     error !== null &&
     Reflect.get(error, "code") === "ERR_WORKER_OUT_OF_MEMORY"
   );
+}
+
+function scored(score: EntryScore): Scoring {
+  return { kind: "scored", score };
 }
 
 /** A score of 0 that does not pass, whatever the pass mark: the entry could not be scored. */
