@@ -1,6 +1,6 @@
 import { constants as fsConstants } from "node:fs";
-import { type FileHandle, open } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { type FileHandle, open, realpath } from "node:fs/promises";
+import { isAbsolute, resolve, sep } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { TenderError, type TxResult } from "@tender/client";
@@ -60,6 +60,11 @@ import {
 //
 // MONEY. `deposit`, `withdraw` and `post_task` attach a deposit, which only a full-access key may.
 // With any other key they answer `NEEDS_FULL_ACCESS_KEY` before they upload or send anything.
+//
+// FILES. `commit_result` takes its work as text or as a file, and `reveal_result` later publishes
+// it, so a file path is a way to publish whatever the server can read. The server therefore reads
+// only inside the one directory that the user named (`filesDir`, from `TENDER_FILES_DIR`), and
+// none at all when there is none (P04-R1).
 
 /** The most bytes a result may have: a brief's `output.max_bytes` can be no more. */
 const MAX_RESULT = MAX_RESULT_BYTES;
@@ -145,15 +150,67 @@ function asAmount(value: string, token: string, network: NetworkId): bigint {
   );
 }
 
-/** The bytes of a local file, at most `limit` of them, read without trusting what the path is. */
-async function readLocalFile(path: string, limit: number): Promise<Uint8Array> {
-  if (!isAbsolute(path)) {
-    throw new ToolError("BAD_INPUT", "file_path must be an absolute path");
+/**
+ * Whether `path` lies under `dir` (and is not `dir`), going by how the two are written: neither is
+ * looked up. Whole path segments are compared, so that `/files-evil` is not under `/files`.
+ */
+function isInside(dir: string, path: string): boolean {
+  const start = resolve(dir);
+  return resolve(path).startsWith(start.endsWith(sep) ? start : start + sep);
+}
+
+/**
+ * The bytes of the file at `path`, at most `limit` of them, if it is a regular file inside
+ * `filesDir` (P04-R1). Where a path leads is what counts, and not how it is written: `realpath`
+ * follows every link and every `..`, and the file's real path must lie under the directory's real
+ * path, so that no link, `..` or other name for the same place gets a file out of the directory.
+ * A path outside is turned away with the same answer whether or not anything is there, so that the
+ * tool is no way to look around the disk.
+ */
+async function readLocalFile(
+  path: string,
+  limit: number,
+  filesDir: string | undefined,
+): Promise<Uint8Array> {
+  if (filesDir === undefined) {
+    throw new ToolError(
+      "FILES_DIR_NOT_SET",
+      "file_path is not available: this server was not given a directory to read files from. " +
+        "Set TENDER_FILES_DIR to one, or pass the result as content.",
+    );
   }
+  if (!isAbsolute(path)) throw new ToolError("BAD_INPUT", "file_path must be an absolute path");
+  const notAllowed = new ToolError(
+    "FILE_NOT_ALLOWED",
+    `file_path must be a file inside ${filesDir}`,
+  );
+  let directory: string;
+  try {
+    directory = await realpath(filesDir);
+  } catch (error) {
+    throw new ToolError(
+      "FILE_UNREADABLE",
+      `the directory that files are read from (${filesDir}) cannot be used: ${errorText(error)}`,
+    );
+  }
+  let real: string;
+  try {
+    real = await realpath(path);
+  } catch (error) {
+    // Outside the directory, the reason is not told: it would say what exists there.
+    if (!isInside(directory, path) && !isInside(filesDir, path)) throw notAllowed;
+    throw new ToolError("FILE_UNREADABLE", errorText(error));
+  }
+  if (!isInside(directory, real)) throw notAllowed;
+
   let handle: FileHandle;
   try {
-    // Non-blocking, so that opening a named pipe cannot hang until somebody writes to it.
-    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    // Non-blocking, so that opening a named pipe cannot hang until somebody writes to it, and never
+    // through a link, so that a path swapped for one since the check is not followed.
+    handle = await open(
+      real,
+      fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW,
+    );
   } catch (error) {
     throw new ToolError("FILE_UNREADABLE", errorText(error));
   }
@@ -188,7 +245,7 @@ function tooLarge(size: number, limit: number): ToolError {
 
 /** Registers the write tools on `server`. */
 export function registerWriteTools(server: McpServer, deps: McpDeps): void {
-  const { api, client, state, network, accountId, contractId } = deps;
+  const { api, client, state, network, accountId, contractId, filesDir } = deps;
   const secrets = deps.secrets ?? [];
   const minWindowSecs = NETWORKS[network].minWindowSecs;
 
@@ -264,15 +321,17 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
    * Makes sure that `accountId` has the storage for an entry: 1,024 bytes of contract state, which
    * a commit and a reveal need (an entry that runs out cannot reveal, and its window does not wait).
    * A full-access key pays the shortfall in, and 0.01 NEAR more. Any other key cannot attach the
-   * deposit, so the call stops and says who must.
+   * deposit, so the call stops and says who must. Returns the yoctoNEAR that were added, 0 if none
+   * had to be.
    */
-  async function ensureStorage(): Promise<void> {
+  async function ensureStorage(): Promise<bigint> {
     const view = await client.storageBalanceOf(accountId);
     const shortfall = storageShortfall(view);
-    if (shortfall === 0n) return;
+    if (shortfall === 0n) return 0n;
     if (deps.keyKind === "full_access") {
-      await client.storageDeposit(shortfall + STORAGE_TOP_UP_MARGIN);
-      return;
+      const added = shortfall + STORAGE_TOP_UP_MARGIN;
+      await client.storageDeposit(added);
+      return added;
     }
     const has =
       view === null ? "no storage deposit" : `${view.available} yoctoNEAR of free storage`;
@@ -416,8 +475,30 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     );
   }
 
-  /** A first commit for a task: the storage, then the draft, then the commit. */
+  /**
+   * What the task allows a result to have: the `output.max_bytes` of its brief, which the API
+   * serves and the contract does not know. When the API cannot say, the answer is why, and the
+   * commit goes on, as it did before the limit was checked: a commit does not hang on an API.
+   */
+  async function taskLimit(taskId: string): Promise<{ max: number } | { unknown: string }> {
+    let detail: Awaited<ReturnType<typeof api.getTask>>;
+    try {
+      detail = await api.getTask(BigInt(taskId));
+    } catch {
+      return { unknown: "the API did not answer" };
+    }
+    const max = detail?.brief?.output.max_bytes;
+    return max === undefined ? { unknown: "the API has no brief for this task yet" } : { max };
+  }
+
+  /** A first commit for a task: the task's limit, the storage, then the draft, then the commit. */
   async function commitNew(taskId: string, bytes: Uint8Array): Promise<CallToolResult> {
+    // The limit comes before anything is spent: work that its task will not take can be committed
+    // and never revealed, and the storage top-up below would be paid for nothing.
+    const allowed = await taskLimit(taskId);
+    if ("max" in allowed && bytes.length > allowed.max) {
+      throw new ToolError("TOO_LARGE", `the task allows at most ${allowed.max} bytes`);
+    }
     await ensureStorage();
     const contentHash = sha256Hex(bytes);
     const salt = randomSalt();
@@ -431,7 +512,12 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     // The draft goes to disk first. Once the commit is sent it may land at any moment, and without
     // the salt the entry could never be revealed.
     await state.saveDraft(draft);
-    return sendCommit(draft);
+    return sendCommit(
+      draft,
+      "unknown" in allowed
+        ? `the task's own size limit could not be checked (${allowed.unknown})`
+        : undefined,
+    );
   }
 
   /** A draft whose commit may or may not have reached the chain: find out, then finish it. */
@@ -465,6 +551,14 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     return sendCommit(draft, note);
   }
 
+  const resultSource =
+    filesDir === undefined
+      ? "Give the result as content (the text); file_path is not available on this server, which " +
+        "has no directory to read files from"
+      : "Give exactly one of content (the text) and file_path (an absolute path to a file inside " +
+        `${filesDir}, the only place this server reads files from; its bytes are what you commit ` +
+        "and what reveal_result will publish)";
+
   server.registerTool(
     "commit_result",
     {
@@ -472,16 +566,17 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       description:
         "Commit to your result for a task while it is open. Only a hash goes on chain; the work " +
         "stays secret until you call reveal_result after the commit window closes (reveal_opens_at). " +
-        "Give exactly one of content (the text) and file_path (an absolute path to a file on this " +
-        "machine; its bytes are what you commit and what reveal_result will publish), at most " +
-        `${MAX_RESULT} bytes. The work and a random salt are saved in a draft on this machine ` +
-        "BEFORE the transaction is sent, so a crash loses nothing. If a call fails or the server " +
-        "stops, call commit_result again with the same content: it finds out whether the commit " +
-        "landed and finishes it with the same salt, and sends nothing if it is done. A task takes " +
-        "one result here: once committed it cannot be replaced from this server. A key that " +
-        "cannot attach a deposit refuses with STORAGE_LOW when your storage in the contract is " +
-        "low; a full-access key tops it up first. The draft lives in this server's state " +
-        "directory: two servers on one account's state directory are not supported.",
+        `${resultSource}, at most ${MAX_RESULT} bytes and no more than the task allows ` +
+        "(output.max_bytes in its brief; TOO_LARGE if it is more, before anything is sent). The " +
+        "work and a random salt are saved in a draft on this machine BEFORE the transaction is " +
+        "sent, so a crash loses nothing. If a call fails or the server stops, call commit_result " +
+        "again with the same content: it finds out whether the commit landed and finishes it with " +
+        "the same salt, and sends nothing if it is done. Once committed, an answer cannot be " +
+        "changed through this server: a task takes one result here, and a call with other content " +
+        "is refused with ALREADY_COMMITTED. A key that cannot attach a deposit refuses with " +
+        "STORAGE_LOW when your storage in the contract is low; a full-access key tops it up " +
+        "first. The draft lives in this server's state directory: two servers on one account's " +
+        "state directory are not supported.",
       inputSchema: {
         task_id: TaskId,
         content: z
@@ -491,7 +586,13 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         file_path: z
           .string()
           .optional()
-          .describe("Absolute path of a file holding the result. Leave out when using content"),
+          .describe(
+            filesDir === undefined
+              ? "File reading is not available on this server (it has no directory to read files " +
+                  "from): give content"
+              : `Absolute path of a file inside ${filesDir} holding the result. Leave out when ` +
+                  "using content",
+          ),
       },
       annotations: IDEMPOTENT,
     },
@@ -504,7 +605,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       }
       const bytes = hasContent
         ? new TextEncoder().encode(content)
-        : await readLocalFile(file_path ?? "", MAX_RESULT);
+        : await readLocalFile(file_path ?? "", MAX_RESULT, filesDir);
       if (bytes.length > MAX_RESULT) throw tooLarge(bytes.length, MAX_RESULT);
 
       return withTaskLock(task_id, async () => {
@@ -886,9 +987,10 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       description:
         "Move tokens from your account into your vault in Tender, where post_task takes rewards " +
         'from. amount is a whole number of the token\'s smallest unit: for USDC "1000000" is 1 ' +
-        "USDC. You need a storage deposit with Tender first (commit_result with a full-access key " +
-        "makes one); without it the deposit is refunded and this tool says so. Needs a " +
-        "full-access key.",
+        "USDC. Tender takes a deposit only for an account with a storage deposit, so the tool " +
+        "adds the NEAR for one from your account first when you have too little (the answer's " +
+        "note says how much). A deposit that Tender refuses is refunded and this tool says so. " +
+        "Needs a full-access key.",
       inputSchema: {
         amount: z.string().describe("A whole number of the token's smallest unit"),
         token: z
@@ -903,6 +1005,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       const token = asAccount(input.token ?? deps.defaultToken, "token");
       const amount = asAmount(input.amount, token, network);
 
+      // Tender credits a deposit only to an account whose storage balance has room for the token's
+      // slot, and refunds it otherwise: a fresh poster's first deposit would come straight back.
+      const registered = await ensureStorage();
       const sent = await client.deposit(token, amount);
       let credited = 0n;
       for (const event of sent.events) {
@@ -919,8 +1024,8 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         throw new ToolError(
           "DEPOSIT_REFUSED",
           `Tender refunded the deposit and credited nothing (transaction ${sent.txHash}). The ` +
-            `usual cause is that ${accountId} has no storage deposit with Tender yet, or that the ` +
-            "token is not enabled: balance shows both",
+            "usual cause is that the token is not enabled in Tender: balance lists the tokens " +
+            "it takes",
         );
       }
       return jsonResult({
@@ -928,6 +1033,11 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         token,
         credited: credited.toString(),
         credited_formatted: formatAmount(credited, token, network),
+        ...(registered > 0n && {
+          note:
+            `added ${formatNear(registered)} to your storage deposit in ${contractId} first, ` +
+            "which a deposit needs",
+        }),
       });
     }),
   );

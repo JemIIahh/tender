@@ -72,6 +72,7 @@ test("config_reads_the_environment", () => {
     TENDER_NETWORK: " mainnet\n",
     NEAR_RPC_URL: "https://rpc.example.com/?key=1",
     TENDER_STATE_DIR: "/srv/tender-state",
+    TENDER_FILES_DIR: "/srv/tender-files",
     TENDER_JUDGE_ACCOUNT: "judge.testnet",
     TENDER_TOKEN: "usdc.testnet",
   };
@@ -79,6 +80,7 @@ test("config_reads_the_environment", () => {
     network: "mainnet",
     rpcUrl: "https://rpc.example.com/?key=1",
     stateDir: "/srv/tender-state",
+    filesDir: "/srv/tender-files",
     judgeAccount: "judge.testnet",
     token: "usdc.testnet",
   });
@@ -97,10 +99,18 @@ test("empty_values_count_as_unset", () => {
 
   // The optional ones set to nothing are not set: the state goes to the default place.
   const config = readConfig(
-    { ...ENV, TENDER_STATE_DIR: "", TENDER_JUDGE_ACCOUNT: "", TENDER_TOKEN: "", NEAR_RPC_URL: "" },
+    {
+      ...ENV,
+      TENDER_STATE_DIR: "",
+      TENDER_FILES_DIR: "",
+      TENDER_JUDGE_ACCOUNT: "",
+      TENDER_TOKEN: "",
+      NEAR_RPC_URL: "",
+    },
     home,
   );
   expect(config.stateDir).toBe(join(home, ".tender", "testnet", "alice.testnet"));
+  expect(config).not.toHaveProperty("filesDir");
   expect(config).not.toHaveProperty("judgeAccount");
   expect(config).not.toHaveProperty("token");
   expect(config).not.toHaveProperty("rpcUrl");
@@ -233,6 +243,53 @@ test("state_dir_tilde_is_expanded", async () => {
   // With no home to expand to, it says so rather than writing under the current directory.
   expect(() => expandHome("~/state", "")).toThrow(/home directory is not known/);
   expect(expandHome("~/state", homedir())).toBe(join(homedir(), "state"));
+});
+
+test("files_dir_is_an_absolute_path_or_nothing", () => {
+  // P04-R1: the one directory commit_result may read a file from. Nothing set means no files.
+  const filesDir = (value: string) =>
+    readConfig({ ...ENV, TENDER_FILES_DIR: value }, home).filesDir;
+
+  expect(readConfig(ENV, home)).not.toHaveProperty("filesDir");
+  for (const unset of ["", "   "]) expect(filesDir(unset)).toBeUndefined();
+
+  expect(filesDir("/srv/tender-files")).toBe("/srv/tender-files");
+  // Space around the value is not part of it, and a leading ~ is the home directory, as in
+  // TENDER_STATE_DIR: a config file holds `~/...` and no shell expands it there.
+  expect(filesDir(" /srv/tender-files \n")).toBe("/srv/tender-files");
+  expect(filesDir("~/results")).toBe(join(home, "results"));
+  expect(filesDir("~")).toBe(home);
+
+  // A relative path would mean the directory the client happened to start the server in. The
+  // message names the variable and does not quote what it was given.
+  for (const bad of ["results", "./results", "../results", "a~b/~c"]) {
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: bad }), bad).toBe(
+      "TENDER_FILES_DIR must be an absolute path",
+    );
+  }
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: "~bob/results" })).toBe(
+    "TENDER_FILES_DIR must not start with ~user: only ~ and ~/ are expanded",
+  );
+  expect(() => expandHome("~/results", "", "TENDER_FILES_DIR")).toThrow(
+    "TENDER_FILES_DIR starts with ~, but the home directory is not known",
+  );
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: "relative/SECRETPATH" })).not.toContain(
+    "SECRETPATH",
+  );
+
+  // It is reported with the other faults, after the ones that come before it.
+  expect(
+    failureOf({
+      ...ENV,
+      TENDER_NETWORK: "devnet",
+      TENDER_STATE_DIR: "~bob/state",
+      TENDER_FILES_DIR: "results",
+    }),
+  ).toBe(
+    "TENDER_NETWORK must be one of sandbox, testnet, mainnet; " +
+      "TENDER_STATE_DIR must not start with ~user: only ~ and ~/ are expanded; " +
+      "TENDER_FILES_DIR must be an absolute path",
+  );
 });
 
 /** A contract whose token list is `tokens`, as `get_config` reports it. */

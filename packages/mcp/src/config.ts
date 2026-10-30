@@ -33,6 +33,11 @@ export interface McpConfig {
   publicKey: string;
   /** Where the drafts are kept: an absolute path unless the environment gave a relative one. */
   stateDir: string;
+  /**
+   * The one directory that `commit_result` may read a file from (P04-R1), an absolute path. Not set
+   * means that no file is read, and a result is given as text.
+   */
+  filesDir?: string;
   judgeAccount?: string;
   /** The token that `TENDER_TOKEN` names, if it does. See `resolveDefaultToken`. */
   token?: string;
@@ -104,21 +109,26 @@ function asKey(value: string): { privateKey: string; publicKey: string } | undef
  * file such as an MCP client's `.mcp.json` can hold `~/...` in `TENDER_STATE_DIR`, but no shell
  * expands it there, and the state store would take it for a directory named `~` under the current
  * directory. `~user` is refused for the same reason, since it would be taken for that. Any other
- * path is returned as it is.
+ * path is returned as it is. `variable` is the name that a refusal gives.
  */
-export function expandHome(path: string, home: string): string {
+export function expandHome(path: string, home: string, variable = "TENDER_STATE_DIR"): string {
   if (path !== "~" && !path.startsWith("~/")) {
     if (path.startsWith("~")) {
-      throw new ConfigError(
-        "TENDER_STATE_DIR must not start with ~user: only ~ and ~/ are expanded",
-      );
+      throw new ConfigError(`${variable} must not start with ~user: only ~ and ~/ are expanded`);
     }
     return path;
   }
   if (!isAbsolute(home)) {
-    throw new ConfigError("TENDER_STATE_DIR starts with ~, but the home directory is not known");
+    throw new ConfigError(`${variable} starts with ~, but the home directory is not known`);
   }
   return path === "~" ? home : join(home, path.slice(2));
+}
+
+/** `TENDER_FILES_DIR` as an absolute path (a leading `~` is the home directory). */
+function absoluteFilesDir(value: string, home: string): string {
+  const path = expandHome(value, home, "TENDER_FILES_DIR");
+  if (!isAbsolute(path)) throw new ConfigError("TENDER_FILES_DIR must be an absolute path");
+  return path;
 }
 
 /**
@@ -129,7 +139,8 @@ export function expandHome(path: string, home: string): string {
  *   networks use theirs unless `NEAR_RPC_URL` names another. `TENDER_API_URL` is `https:`, or
  *   `http:` to this machine only, since the API is signed in to with a bearer token.
  * - Optional: `TENDER_STATE_DIR` (default: `defaultStateDir`, under `home`; a leading `~` is
- *   expanded to `home`), `TENDER_JUDGE_ACCOUNT` and `TENDER_TOKEN`.
+ *   expanded to `home`), `TENDER_FILES_DIR` (an absolute path, `~` expanded likewise; default:
+ *   none, and then `commit_result` takes no file), `TENDER_JUDGE_ACCOUNT` and `TENDER_TOKEN`.
  *
  * A variable that is set to nothing is not set. Every fault is reported at once, in one line that
  * names the variables: the ones missing, then the ones whose values are wrong.
@@ -176,6 +187,15 @@ export function readConfig(env: Env, home: string = homedir()): McpConfig {
     wrong.push(error.message);
   }
 
+  let filesDir: string | undefined;
+  const configuredFilesDir = setting(env, "TENDER_FILES_DIR");
+  try {
+    if (configuredFilesDir !== undefined) filesDir = absoluteFilesDir(configuredFilesDir, home);
+  } catch (error) {
+    if (!(error instanceof ConfigError)) throw error;
+    wrong.push(error.message);
+  }
+
   if (
     missing.length > 0 ||
     wrong.length > 0 ||
@@ -202,6 +222,7 @@ export function readConfig(env: Env, home: string = homedir()): McpConfig {
     signer: { accountId, privateKey: key.privateKey },
     publicKey: key.publicKey,
     stateDir,
+    ...(filesDir !== undefined && { filesDir }),
     ...(judgeAccount !== undefined && { judgeAccount }),
     ...(token !== undefined && { token }),
   };

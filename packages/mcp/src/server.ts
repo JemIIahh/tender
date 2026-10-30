@@ -48,6 +48,12 @@ export interface McpDeps {
   /** The account that `verifier: "judge"` means. */
   judgeAccount?: string;
   /**
+   * The one directory that `commit_result` may read a file from (P04-R1), as the user wrote it.
+   * A file is read only if it is a regular file whose real path, with every link followed, is
+   * inside this directory's. Not set means that no file is read at all.
+   */
+  filesDir?: string;
+  /**
    * Strings that no tool may ever answer with, such as the private key and its base58 body. A
    * failed tool's text has them cut out; a bearer token and a URL are cut whether listed or not.
    */

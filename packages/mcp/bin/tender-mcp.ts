@@ -56,6 +56,7 @@ async function main(): Promise<void> {
     keyKind,
     defaultToken,
     judgeAccount: config.judgeAccount,
+    filesDir: config.filesDir,
     secrets,
   });
 

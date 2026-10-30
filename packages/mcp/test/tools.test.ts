@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -372,6 +373,35 @@ test("lists_expected_write_tools", async () => {
       destructiveHint: false,
       idempotentHint: true,
     });
+  }
+});
+
+test("commit_result_says_where_files_come_from_and_that_a_commit_stays", async () => {
+  // What an agent reads is all it has to go on: where file_path may point, and what a commit means.
+  const files = await makeFilesDir();
+  const describeCommit = async (overrides: Partial<McpDeps>) => {
+    const { mcp } = await connect(overrides);
+    const { tools } = await mcp.listTools();
+    const tool = tools.find((candidate) => candidate.name === "commit_result");
+    const file = tool?.inputSchema.properties?.file_path as { description?: string } | undefined;
+    return { tool: tool?.description ?? "", file: file?.description ?? "" };
+  };
+
+  const allowed = await describeCommit({ filesDir: files });
+  expect(allowed.tool).toContain(files);
+  expect(allowed.file).toContain(files);
+
+  const refused = await describeCommit({});
+  expect(refused.tool).toMatch(/file_path is not available/);
+  expect(refused.tool).not.toContain(files);
+  expect(refused.file).toMatch(/not available/);
+
+  for (const { tool } of [allowed, refused]) {
+    // Once committed, an answer stays: this server does not replace one.
+    expect(tool).toMatch(/cannot be changed/);
+    expect(tool).toMatch(/ALREADY_COMMITTED/);
+    // The task's own limit applies as well as the server's.
+    expect(tool).toMatch(/output\.max_bytes/);
   }
 });
 
@@ -1041,6 +1071,21 @@ async function connectWrite(overrides: Partial<McpDeps> = {}) {
   return { ...kit, ...session };
 }
 
+/** A directory for the files that a test lets the server read, inside the test's own root. */
+async function makeFilesDir(): Promise<string> {
+  const files = join(root, "files");
+  await mkdir(files, { recursive: true });
+  return files;
+}
+
+/** A task whose brief lets a result have `maxBytes` bytes. */
+function detailAllowing(maxBytes: number): TaskDetailResponse {
+  return {
+    ...makeDetail([]),
+    brief: { ...BRIEF, output: { ...BRIEF.output, max_bytes: maxBytes } },
+  };
+}
+
 /** The draft of `taskId`, which the test expects to be there. */
 async function draftOf(taskId: string): Promise<Draft> {
   const draft = await state.getDraft(taskId);
@@ -1128,9 +1173,10 @@ test("commit_saves_draft_before_sending", async () => {
 });
 
 test("commit_requires_exactly_one_input", async () => {
-  const file = join(root, "answer.txt");
+  const files = await makeFilesDir();
+  const file = join(files, "answer.txt");
   await writeFile(file, "from a file");
-  const { call, callJson, chain } = await connectWrite();
+  const { call, callJson, chain } = await connectWrite({ filesDir: files });
 
   // Neither, both, and the empty strings a client may fill an unused field with.
   for (const args of [
@@ -1159,8 +1205,11 @@ test("commit_requires_exactly_one_input", async () => {
 });
 
 test("content_over_limit_rejected", async () => {
-  const { call, callJson, chain } = await connectWrite();
+  const files = await makeFilesDir();
+  const { call, callJson, chain, api } = await connectWrite({ filesDir: files });
   const limit = 262_144;
+  // The task allows as much as any task may, so that only the server's own limit is in play.
+  api.getTask.mockResolvedValue(detailAllowing(limit));
 
   // One byte over. The limit is on bytes, not characters: an "é" is two.
   for (const content of ["a".repeat(limit + 1), "é".repeat(limit / 2 + 1)]) {
@@ -1175,7 +1224,7 @@ test("content_over_limit_rejected", async () => {
 
   // Exactly the limit goes through, in text and in a file.
   await callJson("commit_result", { task_id: "7", content: "é".repeat(limit / 2) });
-  const file = join(root, "big.bin");
+  const file = join(files, "big.bin");
   await writeFile(file, Buffer.alloc(limit, 7));
   await callJson("commit_result", { task_id: "8", file_path: file });
   expect((await draftOf("8")).contentHash).toBe(sha256Hex(Buffer.alloc(limit, 7)));
@@ -1187,10 +1236,97 @@ test("content_over_limit_rejected", async () => {
   expect(await state.getDraft("9")).toBeNull();
 });
 
+test("commit_refuses_what_the_task_does_not_allow", async () => {
+  // A brief says how big a result may be, and the contract does not know it: work that is too big
+  // for its task could be committed and never revealed. So the task's limit is read first.
+  const { call, callJson, chain, api } = await connectWrite({ keyKind: "full_access" });
+  chain.storageBalanceOf.mockResolvedValue(null);
+
+  // The fixture's brief allows 4,096 bytes. The limit is on bytes, not characters.
+  for (const content of ["a".repeat(4097), "é".repeat(2049)]) {
+    expect(await call("commit_result", { task_id: "7", content })).toEqual({
+      isError: true,
+      text: "TOO_LARGE: the task allows at most 4096 bytes",
+    });
+  }
+  expect(api.getTask).toHaveBeenCalledWith(7n);
+  // Nothing was spent, saved or sent for it, not even the storage top-up that precedes a commit.
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+
+  // Exactly as much as the task allows goes through.
+  chain.storageBalanceOf.mockResolvedValue(ROOMY);
+  await callJson("commit_result", { task_id: "7", content: "a".repeat(4096) });
+  expect(chain.commit).toHaveBeenCalledTimes(1);
+
+  // It is this task's limit that counts: another task, another limit.
+  api.getTask.mockResolvedValue(detailAllowing(10));
+  const small = await call("commit_result", { task_id: "8", content: "12345678901" });
+  expect(small).toEqual({ isError: true, text: "TOO_LARGE: the task allows at most 10 bytes" });
+  expect(api.getTask).toHaveBeenLastCalledWith(8n);
+  await callJson("commit_result", { task_id: "8", content: "1234567890" });
+});
+
+test("commit_reads_the_task_limit_before_it_spends_on_storage", async () => {
+  const { callJson, chain, api } = await connectWrite({ keyKind: "full_access" });
+  chain.storageBalanceOf.mockResolvedValue(null);
+
+  await callJson("commit_result", { task_id: "7", content: "a" });
+
+  const [lookedUp] = api.getTask.mock.invocationCallOrder;
+  const [toppedUp] = chain.storageDeposit.mock.invocationCallOrder;
+  expect(lookedUp).toBeDefined();
+  expect(toppedUp).toBeDefined();
+  expect(lookedUp ?? Number.MAX_SAFE_INTEGER).toBeLessThan(toppedUp ?? 0);
+});
+
+test("a_task_limit_the_api_cannot_give_is_noted_and_does_not_stop_the_commit", async () => {
+  // The brief is the API's to give. When it cannot, the commit goes on as it did before the limit
+  // was checked, and the answer says what was not checked, in words that carry nothing the API said.
+  const leak = "fetch to https://api.example/?key=URLKEY failed (Bearer abc123.DEF)";
+  const cases: Array<[string, (api: ReturnType<typeof writeKit>["api"]) => void, RegExp]> = [
+    [
+      "the API does not answer",
+      (api) => api.getTask.mockRejectedValue(new Error(leak)),
+      /size limit could not be checked \(the API did not answer\)/,
+    ],
+    [
+      "the API does not know the task",
+      (api) => api.getTask.mockResolvedValue(null),
+      /size limit could not be checked \(the API has no brief for this task yet\)/,
+    ],
+    [
+      "the API has no brief yet",
+      (api) => api.getTask.mockResolvedValue({ ...makeDetail([]), brief: null }),
+      /size limit could not be checked \(the API has no brief for this task yet\)/,
+    ],
+  ];
+
+  let taskId = 0;
+  for (const [why, arrange, note] of cases) {
+    taskId++;
+    const { callJson, chain, api } = await connectWrite();
+    arrange(api);
+    const answer = await callJson("commit_result", { task_id: String(taskId), content: "a" });
+    expect(answer, why).toMatchObject({ tx_hash: "TX_COMMIT" });
+    expect(answer, why).toHaveProperty("note", expect.stringMatching(note));
+    expect(JSON.stringify(answer), why).not.toMatch(/URLKEY|abc123|api\.example/);
+    expect(chain.commit, why).toHaveBeenCalledTimes(1);
+  }
+
+  // A limit that is known leaves no note.
+  const known = await connectWrite();
+  expect(await known.callJson("commit_result", { task_id: "9", content: "a" })).not.toHaveProperty(
+    "note",
+  );
+});
+
 test("commit_from_a_file_needs_a_readable_regular_file_at_an_absolute_path", async () => {
-  const { call, chain } = await connectWrite();
-  await writeFile(join(root, "answer.txt"), "x");
-  await mkdir(join(root, "folder"));
+  const files = await makeFilesDir();
+  const { call, chain } = await connectWrite({ filesDir: files });
+  await writeFile(join(files, "answer.txt"), "x");
 
   expect((await call("commit_result", { task_id: "7", file_path: "answer.txt" })).text).toMatch(
     /^BAD_INPUT: file_path must be an absolute path/,
@@ -1198,13 +1334,228 @@ test("commit_from_a_file_needs_a_readable_regular_file_at_an_absolute_path", asy
   expect((await call("commit_result", { task_id: "7", file_path: "~/answer.txt" })).text).toMatch(
     /^BAD_INPUT: file_path must be an absolute path/,
   );
-  expect(
-    (await call("commit_result", { task_id: "7", file_path: join(root, "folder") })).text,
-  ).toMatch(/^BAD_INPUT: file_path is not a regular file/);
-  const missing = await call("commit_result", { task_id: "7", file_path: join(root, "gone.txt") });
+  const missing = await call("commit_result", { task_id: "7", file_path: join(files, "gone.txt") });
   expect(missing.isError).toBe(true);
   expect(missing.text).toMatch(/^FILE_UNREADABLE: .*ENOENT/);
 
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+});
+
+test("file_inside_the_files_dir_is_committed", async () => {
+  // P04-R1: the directory the user named is the whole of what the tool reads from, and everything
+  // under it is fair game, by any way of writing its path that ends up there.
+  const files = await makeFilesDir();
+  await mkdir(join(files, "sub"));
+  await writeFile(join(files, "answer.txt"), "from a file");
+  await writeFile(join(files, "sub", "deep.txt"), "deeper");
+  // A name that starts with two dots is a name, and not a way up.
+  await writeFile(join(files, "..dots"), "dots");
+  await symlink(join(files, "answer.txt"), join(files, "sub", "link.txt"));
+  const { callJson } = await connectWrite({ filesDir: files });
+
+  const cases: Array<[path: string, content: string]> = [
+    [join(files, "answer.txt"), "from a file"],
+    [join(files, "sub", "deep.txt"), "deeper"],
+    [join(files, "..dots"), "dots"],
+    // Up and down again, and a doubled slash: where the path ends up is what counts.
+    [`${files}/sub/../answer.txt`, "from a file"],
+    [`${files}//answer.txt`, "from a file"],
+    // A link that stays inside leads to a file that is inside.
+    [join(files, "sub", "link.txt"), "from a file"],
+  ];
+  let taskId = 0;
+  for (const [path, content] of cases) {
+    taskId++;
+    const answer = await callJson("commit_result", { task_id: String(taskId), file_path: path });
+    expect(answer, path).toMatchObject({ content_hash: sha256Hex(content) });
+    expect((await draftOf(String(taskId))).contentBase64, path).toBe(
+      Buffer.from(content).toString("base64"),
+    );
+  }
+});
+
+test("file_outside_the_files_dir_is_refused", async () => {
+  // A prompt-injected agent must not be able to commit and then reveal ~/.ssh or an env file.
+  const files = await makeFilesDir();
+  const outside = join(root, "outside");
+  const lookalike = join(root, "files-evil");
+  for (const place of [outside, lookalike]) {
+    await mkdir(place);
+    await writeFile(join(place, "secret.txt"), "TOP SECRET");
+  }
+  await symlink(join(outside, "secret.txt"), join(files, "link.txt"));
+  await symlink(outside, join(files, "linkdir"), "dir");
+  await symlink(`../outside/secret.txt`, join(files, "relative-link.txt"));
+  const { call, chain } = await connectWrite({ filesDir: files });
+
+  const refused: Array<[why: string, path: string]> = [
+    ["plainly outside", join(outside, "secret.txt")],
+    ["up and out with ..", `${files}/../outside/secret.txt`],
+    ["up and out after going down", `${files}/linkdir/../outside/secret.txt`],
+    ["a name that only starts like the directory's", join(lookalike, "secret.txt")],
+    ["a link to a file outside", join(files, "link.txt")],
+    ["a link with a relative target", join(files, "relative-link.txt")],
+    ["a link to a directory outside", join(files, "linkdir", "secret.txt")],
+    ["outside and not there", join(outside, "gone.txt")],
+    ["outside, not there, and reached with ..", `${files}/../outside/gone.txt`],
+    ["the directory itself", files],
+    ["the directory with a dot", `${files}/.`],
+    ["the directory above it", `${files}/..`],
+  ];
+  const texts = new Set<string>();
+  for (const [why, path] of refused) {
+    const answer = await call("commit_result", { task_id: "7", file_path: path });
+    expect(answer.isError, why).toBe(true);
+    expect(answer.text, why).toMatch(/^FILE_NOT_ALLOWED: file_path must be a file inside /);
+    expect(answer.text, why).toContain(files);
+    expect(answer.text, why).not.toContain("TOP SECRET");
+    texts.add(answer.text);
+  }
+  // Outside, a file that is there and one that is not get the same answer, so that the tool is no
+  // way to find out what is on the disk.
+  expect(texts.size).toBe(1);
+
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+});
+
+test("the_files_dir_may_be_reached_by_another_path_to_the_same_place", async () => {
+  // /tmp and /private/tmp are one place, and so are a directory and a link to it. What is compared
+  // is where the paths lead, so neither way round turns a file away, and neither lets one in.
+  const files = await makeFilesDir();
+  await writeFile(join(files, "a.txt"), "alias");
+  const alias = join(root, "alias");
+  await symlink(files, alias, "dir");
+
+  let taskId = 0;
+  for (const [configured, named] of [
+    [alias, join(files, "a.txt")],
+    [files, join(alias, "a.txt")],
+    [alias, join(alias, "a.txt")],
+  ] as const) {
+    taskId++;
+    const { callJson } = await connectWrite({ filesDir: configured });
+    const answer = await callJson("commit_result", {
+      task_id: String(taskId),
+      file_path: named,
+    });
+    expect(answer, `${configured} ${named}`).toMatchObject({ content_hash: sha256Hex("alias") });
+  }
+
+  // A file that is not there is said to be missing, by whichever name the directory has: it is
+  // inside, and only the outside is kept dark. (The directory's real name is the one that the
+  // alias leads to.)
+  const real = await realpath(files);
+  for (const [configured, named] of [
+    [files, join(files, "gone.txt")],
+    [alias, join(real, "gone.txt")],
+    [alias, join(alias, "gone.txt")],
+    // The directory as it was written may have a doubled slash or a ..; it is read as it leads.
+    [`${alias}//`, join(alias, "gone.txt")],
+    [`${root}/files/../files`, join(files, "gone.txt")],
+  ] as const) {
+    const { call } = await connectWrite({ filesDir: configured });
+    const missing = await call("commit_result", { task_id: "8", file_path: named });
+    expect(missing.text, `${configured} ${named}`).toMatch(/^FILE_UNREADABLE: .*ENOENT/);
+  }
+
+  // A link to a directory is a way in only for what it leads to: outside stays outside.
+  await mkdir(join(root, "elsewhere"));
+  await writeFile(join(root, "elsewhere", "b.txt"), "elsewhere");
+  const { call } = await connectWrite({ filesDir: alias });
+  const out = await call("commit_result", {
+    task_id: "9",
+    file_path: join(root, "elsewhere", "b.txt"),
+  });
+  expect(out.text).toMatch(/^FILE_NOT_ALLOWED: /);
+});
+
+test("a_files_dir_written_with_a_slash_or_as_the_root_still_holds_what_it_should", async () => {
+  // Segments are compared, not text: a trailing slash changes nothing, `/files-evil` is not under
+  // `/files/`, and the root is a directory that holds everything.
+  const files = await makeFilesDir();
+  await writeFile(join(files, "a.txt"), "slash");
+  const lookalike = join(root, "files-evil");
+  await mkdir(lookalike);
+  await writeFile(join(lookalike, "secret.txt"), "TOP SECRET");
+
+  let taskId = 0;
+  for (const configured of [`${files}/`, `${files}//`, "/"]) {
+    taskId++;
+    const { callJson } = await connectWrite({ filesDir: configured });
+    const answer = await callJson("commit_result", {
+      task_id: String(taskId),
+      file_path: join(files, "a.txt"),
+    });
+    expect(answer, configured).toMatchObject({ content_hash: sha256Hex("slash") });
+  }
+  for (const configured of [files, `${files}/`]) {
+    const { call } = await connectWrite({ filesDir: configured });
+    const refused = await call("commit_result", {
+      task_id: "9",
+      file_path: join(lookalike, "secret.txt"),
+    });
+    expect(refused.text, configured).toMatch(/^FILE_NOT_ALLOWED: /);
+  }
+});
+
+test("a_files_dir_that_is_not_there_reads_nothing_and_says_so", async () => {
+  // A directory that was named and does not exist (a typo, a drive that is not mounted) must not
+  // turn into "anything goes": the tool says what is wrong with it.
+  const nowhere = join(root, "nowhere");
+  const { call, callJson, chain } = await connectWrite({ filesDir: nowhere });
+
+  const answer = await call("commit_result", {
+    task_id: "7",
+    file_path: join(nowhere, "answer.txt"),
+  });
+
+  expect(answer.isError).toBe(true);
+  expect(answer.text).toMatch(/^FILE_UNREADABLE: .*files are read from .*cannot be used: .*ENOENT/);
+  expect(answer.text).toContain(nowhere);
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+  // Text does not need the directory.
+  expect(await callJson("commit_result", { task_id: "7", content: "inline" })).toMatchObject({
+    content_hash: sha256Hex("inline"),
+  });
+});
+
+test("file_path_is_refused_when_no_files_dir_is_set", async () => {
+  // Without TENDER_FILES_DIR the tool reads no file at all, wherever the path points.
+  const file = join(root, "answer.txt");
+  await writeFile(file, "x");
+  const { call, callJson, chain } = await connectWrite();
+
+  for (const path of [file, "answer.txt", "/etc/hosts"]) {
+    const answer = await call("commit_result", { task_id: "7", file_path: path });
+    expect(answer.isError, path).toBe(true);
+    expect(answer.text, path).toMatch(/^FILES_DIR_NOT_SET: .*TENDER_FILES_DIR.*content/);
+  }
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+
+  // The text itself is not affected.
+  expect(await callJson("commit_result", { task_id: "7", content: "inline" })).toMatchObject({
+    content_hash: sha256Hex("inline"),
+  });
+});
+
+test("a_directory_or_a_fifo_is_not_a_file_to_commit", async () => {
+  // Inside the directory and still no file: a folder, and a named pipe that would hang a read.
+  const files = await makeFilesDir();
+  await mkdir(join(files, "folder"));
+  execFileSync("mkfifo", [join(files, "pipe")]);
+  const { call, chain } = await connectWrite({ filesDir: files });
+
+  for (const path of [join(files, "folder"), join(files, "pipe")]) {
+    const answer = await call("commit_result", { task_id: "7", file_path: path });
+    expect(answer.isError, path).toBe(true);
+    expect(answer.text, path).toMatch(/^BAD_INPUT: file_path is not a regular file/);
+  }
   expect(chain.commit).not.toHaveBeenCalled();
   expect(await state.getDraft("7")).toBeNull();
 });
@@ -2306,16 +2657,86 @@ test("deposit_and_withdraw_take_raw_amounts_of_the_default_token", async () => {
 });
 
 test("a_deposit_that_tender_refused_is_not_reported_as_made", async () => {
-  // Tender refunds a deposit it will not take (no storage balance, a token that is not allowed),
-  // and the transaction still succeeds: there is no `deposit` event, and the amount taken is 0.
+  // Tender refunds a deposit it will not take (a token that is not enabled), and the transaction
+  // still succeeds: there is no `deposit` event, and the amount taken is 0.
   const { call, chain } = await connectWrite({ keyKind: "full_access" });
   chain.deposit.mockResolvedValue(tx("TX_REFUNDED", { returnValue: "0" }));
 
   const answer = await call("deposit", { amount: "2500000" });
 
   expect(answer.isError).toBe(true);
-  expect(answer.text).toMatch(/^DEPOSIT_REFUSED: .*refund.*storage/);
+  expect(answer.text).toMatch(/^DEPOSIT_REFUSED: .*refund.*token is not enabled/);
   expect(answer.text).toContain("TX_REFUNDED");
+  // Storage is registered first now, so it is no longer named as the likely cause.
+  expect(answer.text).not.toContain("no storage deposit");
+});
+
+test("deposit_registers_storage_first", async () => {
+  // Tender takes a deposit only for an account with a storage balance that has room for the
+  // token's slot, and refunds it otherwise. A fresh poster's first deposit must not be that.
+  const { callJson, chain } = await connectWrite({ keyKind: "full_access" });
+  chain.storageBalanceOf.mockResolvedValue(null);
+
+  const first = await callJson("deposit", { amount: "2500000" });
+
+  // The registration is the (1,024 + 133) bytes of a first entry and 0.01 NEAR on top (X-6, P04-P2),
+  // and it goes in before the tokens do.
+  expect(chain.storageBalanceOf).toHaveBeenCalledWith(ACCOUNT);
+  expect(chain.storageDeposit).toHaveBeenCalledExactlyOnceWith(
+    11_570_000_000_000_000_000_000n + 10n ** 22n,
+  );
+  expect(chain.deposit).toHaveBeenCalledExactlyOnceWith(USDC, 2_500_000n);
+  const [registered] = chain.storageDeposit.mock.invocationCallOrder;
+  const [deposited] = chain.deposit.mock.invocationCallOrder;
+  expect(registered ?? Number.MAX_SAFE_INTEGER).toBeLessThan(deposited ?? 0);
+  // The agent is told that NEAR was spent for it.
+  expect(first).toMatchObject({ tx_hash: "TX_DEPOSIT", credited: "2500000" });
+  expect(first).toHaveProperty(
+    "note",
+    expect.stringMatching(/added 0\.02157 NEAR to your storage deposit in tender\.testnet first/),
+  );
+
+  // Room in the storage balance, or a registered account with too little: only the second tops up.
+  chain.storageDeposit.mockClear();
+  chain.storageBalanceOf.mockResolvedValue(ROOMY);
+  const again = await callJson("deposit", { amount: "5" });
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(again).not.toHaveProperty("note");
+
+  chain.storageBalanceOf.mockResolvedValue({
+    total: "10000000000000000000000",
+    available: (STORAGE_NEEDED - 1n).toString(),
+    used_bytes: "1000",
+  });
+  await callJson("deposit", { amount: "5" });
+  expect(chain.storageDeposit).toHaveBeenCalledExactlyOnceWith(1n + 10n ** 22n);
+});
+
+test("deposit_stops_when_storage_cannot_be_registered", async () => {
+  const { call, chain } = await connectWrite({ keyKind: "full_access" });
+  chain.storageBalanceOf.mockResolvedValue(null);
+  chain.storageDeposit.mockRejectedValue(new Error("not enough NEAR on the account"));
+
+  const answer = await call("deposit", { amount: "2500000" });
+
+  // No tokens move for an account that Tender would refuse them from.
+  expect(answer).toEqual({ isError: true, text: "ERROR: not enough NEAR on the account" });
+  expect(chain.deposit).not.toHaveBeenCalled();
+});
+
+test("a_deposit_that_is_refused_up_front_spends_nothing_on_storage", async () => {
+  // The amount and the token are checked before the storage is, so a typo costs no NEAR.
+  const { call, chain } = await connectWrite({ keyKind: "full_access" });
+  chain.storageBalanceOf.mockResolvedValue(null);
+
+  expect((await call("deposit", { amount: "1.5" })).text).toMatch(/^BAD_AMOUNT: /);
+  expect((await call("deposit", { amount: "5", token: "Not An Account" })).text).toMatch(
+    /^BAD_INPUT: /,
+  );
+
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.deposit).not.toHaveBeenCalled();
 });
 
 test("a_withdrawal_the_token_refused_is_not_reported_as_paid", async () => {
@@ -2509,6 +2930,11 @@ test("the_lookups_the_api_only_lends_may_fail_without_failing_the_tool", async (
 
   const committed = await callJson("commit_result", { task_id: "7", content: "a" });
   expect(committed).toMatchObject({ tx_hash: "TX_COMMIT", reveal_opens_at: null });
+  // What the commit could not check is said, since the task's size limit comes from the same place.
+  expect(committed).toHaveProperty(
+    "note",
+    expect.stringMatching(/size limit could not be checked/),
+  );
 
   const revealed = await callJson("reveal_result", { task_id: "7" });
   expect(revealed).toMatchObject({ tx_hash: "TX_REVEAL" });
