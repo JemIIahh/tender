@@ -1970,6 +1970,8 @@ test("scorecard_waits_for_every_task_sharing_its_heldout", async () => {
 
   // A scorecard shows the held-out document its task was judged against. Tasks 2 and 3 use the same
   // one and close their reveals a minute apart. Task 4 has a held-out of its own, and closes later.
+  // All of them are the poster's: the task of another account does not count
+  // (a_strangers_copy_of_a_heldout_does_not_hold_a_scorecard_back).
   const minute = REVEAL_DEADLINE + 60n * SECOND;
   const hour = REVEAL_DEADLINE + 3600n * SECOND;
   const shared = sha256Hex("a held-out document that two tasks use");
@@ -2012,6 +2014,44 @@ test("scorecard_waits_for_every_task_sharing_its_heldout", async () => {
     });
   await apply(withoutHeldout(5, hour), withoutHeldout(6, hour + 3600n * SECOND));
   expect((await post("/v1/blobs", upload(scorecardOf("5")), judge)).status).toBe(200);
+});
+
+test("a_strangers_copy_of_a_heldout_does_not_hold_a_scorecard_back", async () => {
+  const tooEarly = { error: "too_early", message: "the task's reveal window has not closed" };
+  const upload = (document: Scorecard) => blobBody("scorecard", canonicalJson(document));
+
+  // The commitment of a held-out is public once its task is posted, so anyone can put it in a task
+  // of their own, with a reveal deadline as far away as they like. The wait is for a poster who
+  // reuses their own held-out. The Judge takes a held-out only from the poster of a task, so a task
+  // of another account can never be judged against it, and has no answers to be given away.
+  // Tasks 2 and 3 are the poster's and close a minute apart. Carol's task 4 copies their commitment
+  // and closes eleven days after.
+  const minute = REVEAL_DEADLINE + 60n * SECOND;
+  const faraway = REVEAL_DEADLINE + 1_000_000n * SECOND;
+  const shared = sha256Hex("a held-out document that a stranger copied");
+  await openTask(2, REVEAL_DEADLINE, [], { heldout_commitment: shared });
+  await openTask(3, minute, [], { heldout_commitment: shared });
+  await openTask(4, faraway, [], { heldout_commitment: shared, poster: carol });
+
+  // The poster's own task 3 holds the scorecard of task 2 back until it closes.
+  nowNs = REVEAL_DEADLINE;
+  const early = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("2")), judge);
+  expect([early.status, early.body]).toEqual([409, tooEarly]);
+  nowNs = minute - 1n;
+  expect((await post("/v1/blobs", upload(scorecardOf("2")), poster)).status).toBe(409);
+  expect(await blobCount()).toBe(0);
+
+  // Carol's task has days to run, and holds nothing back.
+  nowNs = minute;
+  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(scorecardOf("3")), poster)).status).toBe(200);
+  expect(await blobCount()).toBe(2);
+
+  // Her own task waits for its own reveal window, like any other.
+  const own = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("4")), judge);
+  expect([own.status, own.body]).toEqual([409, tooEarly]);
+  nowNs = faraway;
+  expect((await post("/v1/blobs", upload(scorecardOf("4")), judge)).status).toBe(200);
 });
 
 test("scorecard_route_hides_a_stored_scorecard_it_cannot_write_again", async () => {

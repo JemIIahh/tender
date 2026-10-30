@@ -100,7 +100,7 @@ const HeldoutUploadSchema = z.strictObject({
  *   result for that task, so every upload of a result is recorded for its account and task. The
  *   task a result was sent for decides nothing else. A scorecard is taken only from the verifier
  *   or the poster of its task, and only once the reveal deadline has passed, the task's own and
- *   that of every task that uses the same held-out document.
+ *   that of every task of the same poster that uses the same held-out document.
  * - `POST /v1/heldout` (signed in): stores a held-out document, which nobody may read.
  * - `GET /v1/blobs/:sha256`: the bytes of a blob that may be read.
  * - `GET /v1/scorecards/:task_id`: the scorecard the task was settled with.
@@ -348,11 +348,14 @@ async function requireEntry(db: Db, taskId: string, account: string): Promise<vo
 /**
  * A scorecard is the verifier's, or the poster's when the poster picks after the pick window, and
  * it is for a task whose reveal deadline has passed: before that, entries can still be revealed
- * and there is nothing to settle. It also waits for every other task that uses the same held-out
- * document (the same `heldout_commitment`), since the scorecard shows that document: published
- * before one of them has closed its reveals, it would give away the answers. A task with no
- * held-out shares none. The account's right is looked at first, so an account that has none is
- * told so whatever the time is.
+ * and there is nothing to settle. It also waits for every other task of the same poster that uses
+ * the same held-out document (the same `heldout_commitment`), since the scorecard shows that
+ * document: published before one of them has closed its reveals, it would give away the answers.
+ * A task with no held-out shares none. Only the poster's own tasks count. A commitment is public,
+ * so anyone can put it in a task with a far-off deadline, but the Judge takes a held-out only from
+ * the poster of a task: a task of anyone else can never be judged against it, and holding the
+ * scorecard back for it would hand a stranger the means to stall the verifier. The account's right
+ * is looked at first, so an account that has none is told so whatever the time is.
  */
 async function requireScorecardRight(
   deps: ApiDeps,
@@ -366,6 +369,7 @@ async function requireScorecardRight(
                select 1
                  from tasks o
                 where o.heldout_commitment = t.heldout_commitment
+                  and o.poster = t.poster
                   and o.reveal_deadline > $2::numeric
              )) as closed
        from tasks t
