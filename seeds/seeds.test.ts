@@ -93,6 +93,33 @@ async function scoreAnswer(
   );
 }
 
+/** Every string inside `value`, in however many arrays and objects. Object keys are not strings. */
+function stringsIn(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(stringsIn);
+  if (typeof value === "object" && value !== null) return Object.values(value).flatMap(stringsIn);
+  return [];
+}
+
+/**
+ * The strings of a held-out document that its scorer compares letter for letter: every string in
+ * a json_schema assertion, and the answers of an exact task whose criteria do not lowercase. A
+ * regex case is a test vector, and the case of a letter is often what it tests.
+ */
+function caseSensitiveStrings(criteria: PublicCriteria, heldout: Heldout): string[] {
+  if ("json_schema" in heldout) {
+    return heldout.json_schema.assertions.flatMap(({ equals }) => stringsIn(equals));
+  }
+  if (
+    "exact" in heldout &&
+    criteria.kind === "exact" &&
+    !criteria.normalize.includes("lowercase")
+  ) {
+    return heldout.exact.expected;
+  }
+  return [];
+}
+
 /**
  * The cases a regex answer gets wrong in V8, the engine of Node and of the browsers. The Judge
  * scores in QuickJS, but a solver tries its pattern in V8 first, so a seed's own solution must
@@ -243,6 +270,21 @@ describe.each(SLUGS)("seed %s", (slug) => {
         "example lines in the brief that show a held-out answer",
       ).toEqual([]);
     }
+  });
+
+  test("held_out_strings_keep_the_briefs_letter_case", () => {
+    const { brief, criteria, heldout } = load(slug);
+
+    // An agent echoes the brief's wording. If the brief prints "ACME LTD" and the key expects
+    // "Acme Ltd", a correct copy is marked wrong, and nothing in the brief says how to avoid it.
+    // A string that the brief does not contain in any case (a date worked out, a total) is fine.
+    const text = [brief.title, brief.summary, brief.instructions].join("\n");
+    expect(
+      caseSensitiveStrings(criteria, heldout).filter(
+        (held) => !text.includes(held) && text.toLowerCase().includes(held.toLowerCase()),
+      ),
+      "held-out strings that the brief spells in another letter case",
+    ).toEqual([]);
   });
 
   test("documents_round_trip_as_canonical_json", () => {
