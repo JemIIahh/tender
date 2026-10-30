@@ -1,6 +1,10 @@
+export { fetchEntryContent } from "./fetch";
+export { intakeTask } from "./intake";
+export { judgeTask, type ScoreInput, ScorerUnavailableError, scoreEntry } from "./judge";
 export { scoreExact } from "./kinds/exact";
 export { checkJsonSchemaUsable, scoreJsonSchema } from "./kinds/json_schema";
 export { scoreRegexCases } from "./kinds/regex_cases";
+export { judgeTick, startJudge } from "./loop";
 export { chooseWinners, rankEntries, type ScoredEntry } from "./rank";
 export { buildScorecard } from "./scorecard";
-export type { EntryScore } from "./types";
+export type { EntryScore, FetchIo, JudgeChain, JudgeDeps } from "./types";
