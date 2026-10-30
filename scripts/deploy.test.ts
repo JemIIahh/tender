@@ -1,5 +1,8 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync, statSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -10,10 +13,13 @@ import { afterEach, expect, test, vi } from "vitest";
 import {
   type Deployment,
   deploy,
+  laneLimit,
   loadTarget,
   main,
   orAlreadyInitialised,
   readDeployment,
+  runLanes,
+  type Step,
 } from "./deploy";
 import { REPO_ROOT } from "./lib/env";
 
@@ -22,10 +28,38 @@ import { REPO_ROOT } from "./lib/env";
 // `.env.deploy.testnet` on this machine can never make a test deploy for real.
 
 const dirs: string[] = [];
+const servers: Server[] = [];
 
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  await Promise.all(
+    servers.splice(0).map(
+      (server) =>
+        new Promise<void>((resolve) => {
+          server.closeAllConnections();
+          server.close(() => resolve());
+        }),
+    ),
+  );
 });
+
+/** A node on a free local port that answers every request with `chainId` as its chain. */
+async function nodeOnChain(chainId: string): Promise<string> {
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      const { id } = JSON.parse(body) as { id: unknown };
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ jsonrpc: "2.0", id, result: { chain_id: chainId } }));
+    });
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+}
 
 /** A new directory holding the given files, whose names may have directories in them. */
 async function dirWith(files: Record<string, string>): Promise<string> {
@@ -37,6 +71,9 @@ async function dirWith(files: Record<string, string>): Promise<string> {
   }
   return dir;
 }
+
+/** Shaped like a key, and recognisable in any output: it must never be printed. */
+const LEAKY = "ed25519:LEAKY-KEY-MATERIAL-that-must-never-be-printed";
 
 const NOW = new Date("2026-10-30T09:15:00Z");
 const PARENT = "tender-dev-20261030.testnet";
@@ -95,6 +132,38 @@ test("cli_treats_a_blank_parent_account_as_unset", async () => {
   expect(code).toBe(1);
   expect(err).toContain(NEAR_CLI_COMMAND);
   expect(fake).not.toHaveBeenCalled();
+});
+
+test("cli_never_prints_a_key_that_sits_in_the_parent_account_variable", async () => {
+  const layouts: Array<[string, Record<string, string>]> = [
+    [
+      "the two values swapped",
+      {
+        ".env.deploy.testnet": `DEPLOY_PARENT_ACCOUNT=${LEAKY}\nDEPLOY_PARENT_PRIVATE_KEY=${PARENT}\n`,
+      },
+    ],
+    [
+      // Node's parser alone reads the key's line as the account's value here.
+      "a space after the = on the account line",
+      { ".env.deploy.testnet": `DEPLOY_PARENT_ACCOUNT= \nDEPLOY_PARENT_PRIVATE_KEY=${LEAKY}\n` },
+    ],
+    [
+      "that layout with the key in .env as well",
+      {
+        ".env": `DEPLOY_PARENT_PRIVATE_KEY=${LEAKY}\n`,
+        ".env.deploy.testnet": `DEPLOY_PARENT_ACCOUNT= \nDEPLOY_PARENT_PRIVATE_KEY=${LEAKY}\n`,
+      },
+    ],
+  ];
+  for (const [what, files] of layouts) {
+    const { code, out, err, deploy: fake } = await runCli(files, ["--network", "testnet"]);
+
+    expect(code, what).toBe(1);
+    expect(err, what).toContain("DEPLOY_PARENT_ACCOUNT");
+    // Neither stream shows the key, or any part of it.
+    expect(`${out.join("\n")}\n${err}`, what).not.toContain("LEAKY");
+    expect(fake, what).not.toHaveBeenCalled();
+  }
 });
 
 test("cli_names_the_missing_parent_key_and_nothing_else", async () => {
@@ -224,27 +293,147 @@ test("deploy_checks_the_env_file_and_the_keys_before_it_uses_the_network", async
     );
   };
 
-  // An env file of another deployment, whose accounts are under another parent.
-  expect(await attempt("TENDER_ACCOUNT=tender.elsewhere.sandbox\n")).toMatch(
-    /\.env\.deploy\.sandbox names tender\.elsewhere\.sandbox as TENDER_ACCOUNT.*tender\.sandbox/s,
+  // An env file of another deployment, whose accounts are under another parent: the message says
+  // whose keys it holds, and to move it aside. It never reads as an order to delete it.
+  const elsewhere = await attempt(
+    `TENDER_CONTRACT=tender.elsewhere.sandbox\nTENDER_CONTRACT_PRIVATE_KEY=${goodKey}\n`,
   );
+  expect(elsewhere).toMatch(
+    /\.env\.deploy\.sandbox names tender\.elsewhere\.sandbox as TENDER_CONTRACT, but this deploy's account is tender\.sandbox/,
+  );
+  expect(elsewhere).toMatch(/move it aside \(it holds the keys of tender\.elsewhere\.sandbox\)/);
+  expect(elsewhere).not.toMatch(/fresh|delete|remove/i);
+  expect(elsewhere).not.toContain(goodKey);
+  // A value that is no account id may be a key, so it is not shown.
+  const keyInPlace = await attempt(`TENDER_CONTRACT=${LEAKY}\n`);
+  expect(keyInPlace).toMatch(/names something that is no account id as TENDER_CONTRACT/);
+  expect(keyInPlace).toMatch(/move it aside \(it may hold keys\)/);
+  expect(keyInPlace).not.toContain("LEAKY");
   // A stored key that is no key: named, but never shown.
   const damaged = await attempt(
-    "TENDER_ACCOUNT=tender.sandbox\nTENDER_PRIVATE_KEY=not-a-key-at-all\n",
+    "TENDER_CONTRACT=tender.sandbox\nTENDER_CONTRACT_PRIVATE_KEY=not-a-key-at-all\n",
   );
   expect(damaged).toMatch(
-    /TENDER_PRIVATE_KEY in \.env\.deploy\.sandbox is not a valid private key/,
+    /TENDER_CONTRACT_PRIVATE_KEY in \.env\.deploy\.sandbox is not a valid private key/,
   );
   expect(damaged).not.toContain("not-a-key-at-all");
   // The same for the parent's.
   const noKey = await attempt("", { accountId: "sandbox", privateKey: "not-the-parents-key" });
   expect(noKey).toMatch(/the parent's key is not a valid private key/);
   expect(noKey).not.toContain("not-the-parents-key");
+  // A parent account that is no account id may be a key that landed in the wrong variable: the
+  // message names the variable, and does not show the value, whichever of the two is wrong.
+  const keyAsAccount = await attempt("", { accountId: LEAKY, privateKey: goodKey });
+  expect(keyAsAccount).toMatch(/^DEPLOY_PARENT_ACCOUNT is not a valid NEAR account id/);
+  expect(keyAsAccount).toMatch(/space follows the =/);
+  expect(keyAsAccount).not.toContain("LEAKY");
+  const swapped = await attempt("", { accountId: LEAKY, privateKey: "sandbox" });
+  expect(swapped).toMatch(/the parent's key is not a valid private key/);
+  expect(swapped).not.toContain("LEAKY");
   // A parent whose sub-accounts would have ids longer than NEAR allows: the first is named.
   const long = "p".repeat(60);
   expect(await attempt("", { accountId: long, privateKey: goodKey })).toMatch(
     /^tender\.p+ is not a valid account id/,
   );
+});
+
+test("deploy_makes_an_existing_env_file_private_even_when_it_goes_no_further", async () => {
+  // The owner makes .env.deploy.<network> by hand, with the parent's key in it, and gets 0644.
+  const text = "# made by hand\nDEPLOY_PARENT_ACCOUNT=sandbox\n";
+  const dir = await dirWith({ ".env.deploy.sandbox": text });
+  const path = join(dir, ".env.deploy.sandbox");
+  await chmod(path, 0o644);
+
+  // Refused at once, so nothing is appended; the mode is changed all the same.
+  const parent = { accountId: "sandbox", privateKey: "not a key" };
+  await expect(
+    deploy({ network: "sandbox", rpcUrl: "http://127.0.0.1:9", parent, minWindowSecs: 5 }, { dir }),
+  ).rejects.toThrow(/not a valid private key/);
+
+  expect(statSync(path).mode & 0o777).toBe(0o600);
+  expect(await readFile(path, "utf8")).toBe(text);
+});
+
+test("deploy_refuses_the_record_of_another_deployment_before_it_uses_the_network", async () => {
+  const other = { ...RECORD, network: "sandbox", contract: "tender.elsewhere.sandbox" };
+  const text = `${JSON.stringify(other, null, 2)}\n`;
+  const dir = await dirWith({ "deployments/sandbox.json": text });
+  const parent = { accountId: "sandbox", privateKey: KeyPair.fromRandom("ed25519").toString() };
+
+  // Port 9 answers nothing, so a request to it would fail with another message.
+  const error = await deploy(
+    { network: "sandbox", rpcUrl: "http://127.0.0.1:9", parent, minWindowSecs: 5 },
+    { dir },
+  ).then(
+    () => "deployed",
+    (e: Error) => e.message,
+  );
+
+  expect(error).toMatch(
+    /is the record of another deployment \(contract tender\.elsewhere\.sandbox/,
+  );
+  expect(error).toMatch(/Move it aside/);
+  expect(error).not.toMatch(/fresh|delete|remove/i);
+  expect(await readFile(join(dir, "deployments", "sandbox.json"), "utf8")).toBe(text);
+  expect(existsSync(join(dir, ".env.deploy.sandbox"))).toBe(false);
+});
+
+test("deploy_asks_the_node_which_chain_it_is_on_and_refuses_mainnet", async () => {
+  const parent = { accountId: "sandbox", privateKey: KeyPair.fromRandom("ed25519").toString() };
+  const attempt = async (network: "sandbox" | "testnet", chainId: string) =>
+    deploy(
+      { network, rpcUrl: await nodeOnChain(chainId), parent, minWindowSecs: 5 },
+      { dir: await dirWith({}) },
+    ).then(
+      () => "deployed",
+      (e: Error) => e.message,
+    );
+
+  // A mainnet node is refused whatever the target calls it.
+  for (const network of ["sandbox", "testnet"] as const) {
+    expect(await attempt(network, "mainnet")).toMatch(/mainnet.*plan 07.*chain id "mainnet"/s);
+  }
+  // A testnet deploy needs a testnet node.
+  expect(await attempt("testnet", "localnet")).toMatch(
+    /testnet deploy, but the node answered with chain id "localnet"/,
+  );
+});
+
+test("run_lanes_runs_at_most_the_limit_of_lanes_at_once_and_still_runs_them_all", async () => {
+  let running = 0;
+  let peak = 0;
+  const step = (label: string, fails = false): Step => ({
+    label,
+    async run() {
+      running += 1;
+      peak = Math.max(peak, running);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      running -= 1;
+      if (fails) throw new Error(`${label} failed`);
+      return "OK";
+    },
+  });
+  const lanes = (failing: number) =>
+    Array.from({ length: 11 }, (_, i) => [step(`a${i}`, i === failing), step(`b${i}`)]);
+
+  const lines: string[] = [];
+  await runLanes(lanes(-1), (line) => lines.push(line), 3);
+  expect(peak).toBe(3);
+  expect(lines).toHaveLength(22);
+
+  // Without a limit they all go at once.
+  peak = 0;
+  await runLanes(lanes(-1), () => {});
+  expect(peak).toBe(11);
+
+  // A lane that fails stops there; the others, queued behind the limit or not, go on to the end.
+  const after: string[] = [];
+  await expect(runLanes(lanes(0), (line) => after.push(line), 2)).rejects.toThrow(/^a0: a0 failed/);
+  expect(after).toHaveLength(20);
+
+  // Testnet's public RPC is the one that gets the cap.
+  expect(laneLimit("testnet")).toBe(3);
+  expect(laneLimit("sandbox")).toBe(Number.POSITIVE_INFINITY);
 });
 
 test("or_already_initialised_turns_e_initialized_into_null_and_keeps_every_other_failure", async () => {

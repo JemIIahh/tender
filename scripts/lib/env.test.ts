@@ -50,6 +50,30 @@ test("load_env_reads_dotenv_syntax", async () => {
   });
 });
 
+test("blank_value_with_trailing_space_does_not_swallow_the_next_line", async () => {
+  // Node's parseEnv alone reads "A= \nB=1" as A="B=1" and loses B. A tab does the same.
+  const dir = await dirWith({
+    ".env": "SPACE= \nTAB=\t\nKEPT=1\nMORE=two words  \n",
+    ".env.deploy.testnet": "DEPLOY_PARENT_ACCOUNT= \r\nDEPLOY_PARENT_PRIVATE_KEY=the-key\r\n",
+  });
+
+  expect(loadEnv("testnet", { dir })).toEqual({
+    SPACE: "",
+    TAB: "",
+    KEPT: "1",
+    MORE: "two words",
+    DEPLOY_PARENT_ACCOUNT: "",
+    DEPLOY_PARENT_PRIVATE_KEY: "the-key",
+  });
+  // A blank is still a missing key to anything that requires it, and the key after it is found.
+  expect(() => loadEnv("testnet", { dir, required: ["DEPLOY_PARENT_ACCOUNT"] })).toThrow(
+    /missing keys for network testnet: DEPLOY_PARENT_ACCOUNT /,
+  );
+  expect(loadEnv("testnet", { dir, required: ["DEPLOY_PARENT_PRIVATE_KEY"] })).toMatchObject({
+    DEPLOY_PARENT_PRIVATE_KEY: "the-key",
+  });
+});
+
 test("load_env_is_empty_when_neither_file_exists", async () => {
   expect(loadEnv("testnet", { dir: await dirWith({}) })).toEqual({});
 });

@@ -41,22 +41,25 @@ const TGAS = 10n ** 12n;
 /** The code hash of an account that has no contract. */
 const NO_CODE = "11111111111111111111111111111111";
 
+const roleVars = (stem: string) => [`${stem}_ACCOUNT`, `${stem}_PRIVATE_KEY`] as const;
+
 /**
- * The accounts the deploy creates under its parent and the stems of the variables it writes their
- * keys to (`<STEM>_ACCOUNT`, `<STEM>_PRIVATE_KEY`). Written out here, not imported, because the
- * names are what the other scripts read.
+ * The accounts the deploy creates under its parent and the variables it writes their ids and keys
+ * to. Written out here, not imported, because the names are what the other scripts read. Tender's
+ * are TENDER_CONTRACT and TENDER_CONTRACT_PRIVATE_KEY (ruling P02-R25): TENDER_ACCOUNT and
+ * TENDER_PRIVATE_KEY are the MCP signer's, and the deploy never writes them.
  */
 const MEMBERS = [
-  ["tender", "TENDER"],
-  ["treasury", "TREASURY"],
-  ["judge", "JUDGE"],
-  ["keeper", "KEEPER"],
-  ["tusdc", "TUSDC"],
-  ["poster", "POSTER"],
-  ["analyst", "AGENT_ANALYST"],
-  ["coder", "AGENT_CODER"],
-  ["extractor", "AGENT_EXTRACTOR"],
-  ["lead", "AGENT_LEAD"],
+  ["tender", "TENDER_CONTRACT", "TENDER_CONTRACT_PRIVATE_KEY"],
+  ["treasury", ...roleVars("TREASURY")],
+  ["judge", ...roleVars("JUDGE")],
+  ["keeper", ...roleVars("KEEPER")],
+  ["tusdc", ...roleVars("TUSDC")],
+  ["poster", ...roleVars("POSTER")],
+  ["analyst", ...roleVars("AGENT_ANALYST")],
+  ["coder", ...roleVars("AGENT_CODER")],
+  ["extractor", ...roleVars("AGENT_EXTRACTOR")],
+  ["lead", ...roleVars("AGENT_LEAD")],
 ] as const;
 
 const tenderWasm = await readFile(join(REPO_ROOT, "contract", "res", "tender.wasm"));
@@ -196,14 +199,17 @@ test("deploy_writes_every_account_and_its_full_access_key_to_the_env_file", asyn
   const env = parseEnv(await readFile(envPath, "utf8"));
 
   // Exactly the variables the other scripts read, and one more that the deploy reads itself.
-  const names = MEMBERS.flatMap(([, stem]) => [`${stem}_ACCOUNT`, `${stem}_PRIVATE_KEY`]);
+  const names = MEMBERS.flatMap(([, accountVar, keyVar]) => [accountVar, keyVar]);
   expect(Object.keys(env).sort()).toEqual([...names, "DEPLOY_TENDER_HEIGHT"].sort());
+  // The MCP signer's names are not the deploy's to write: the network file wins over .env.
+  expect(env).not.toHaveProperty("TENDER_ACCOUNT");
+  expect(env).not.toHaveProperty("TENDER_PRIVATE_KEY");
 
   const keys = new Set<string>();
-  for (const [name, stem] of MEMBERS) {
+  for (const [name, accountVar, keyVar] of MEMBERS) {
     const accountId = `${name}.sandbox`;
-    expect(env[`${stem}_ACCOUNT`]).toBe(accountId);
-    const privateKey = env[`${stem}_PRIVATE_KEY`] as string;
+    expect(env[accountVar]).toBe(accountId);
+    const privateKey = env[keyVar] as string;
     keys.add(privateKey);
     // It is a key of that account, with full access.
     const publicKey = KeyPair.fromString(privateKey as KeyPairString)
@@ -336,6 +342,57 @@ test("deploy_does_not_overwrite_the_record_of_another_deployment", async () => {
   expect(JSON.parse(await readFile(path, "utf8"))).toEqual(other);
 });
 
+test("deploy_refuses_the_record_of_another_deployment_for_a_fresh_parent_before_it_spends", async () => {
+  // A new parent deploys everything anew, so the run used to end by writing its record over the
+  // one in deployments/: the canonical record, which the skeleton and the indexer read.
+  const parent = await fundedAccount("newer", 100n * NEAR);
+  const dir = await newDir();
+  const path = join(dir, "deployments", "sandbox.json");
+  await mkdir(join(dir, "deployments"));
+  await writeFile(path, `${JSON.stringify(first.deployment, null, 2)}\n`);
+  const before = await readFile(path);
+  const lines: string[] = [];
+
+  await expect(
+    deploy(targetFor(parent, "usdc.sandbox"), { dir, log: (l) => lines.push(l) }),
+  ).rejects.toThrow(/is the record of another deployment \(contract tender\.sandbox/);
+
+  // Refused before the first transaction: nothing printed, no key written, no account made, and
+  // the record is what it was, byte for byte.
+  expect(lines).toEqual([]);
+  expect(existsSync(join(dir, ".env.deploy.sandbox"))).toBe(false);
+  await expect(provider.viewAccount({ accountId: "tender.newer.sandbox" })).rejects.toThrow();
+  expect((await readFile(path)).equals(before)).toBe(true);
+});
+
+test("deploy_stops_before_it_sends_when_the_env_file_does_not_read_back_as_written", async () => {
+  // A line written by hand that ends in "= " makes node's parser take the next line as its value.
+  // The deploy appends right after that line, so its first variable is the one that goes missing.
+  const parent = await fundedAccount("swallow", 100n * NEAR);
+  const dir = await newDir();
+  await writeFile(join(dir, ".env.deploy.sandbox"), "NOTE= \n");
+  const lines: string[] = [];
+
+  const error = await deploy(targetFor(parent, "usdc.sandbox"), {
+    dir,
+    log: (l) => lines.push(l),
+  }).catch((e: unknown) => e);
+
+  expect(error).toBeInstanceOf(Error);
+  const message = (error as Error).message;
+  expect(message).toMatch(
+    /\.env\.deploy\.sandbox does not read back as written \(.*TENDER_CONTRACT\)/,
+  );
+  // The key that was appended is not in the message, and the chain was not touched.
+  const keyLine = (await readFile(join(dir, ".env.deploy.sandbox"), "utf8")).match(
+    /^TENDER_CONTRACT_PRIVATE_KEY=(.+)$/m,
+  );
+  expect(keyLine?.[1]).toBeDefined();
+  expect(message).not.toContain(keyLine?.[1] ?? "");
+  expect(lines).toEqual([]);
+  await expect(provider.viewAccount({ accountId: "tender.swallow.sandbox" })).rejects.toThrow();
+});
+
 test("deploy_refuses_a_parent_that_cannot_pay_before_it_creates_anything", async () => {
   const poor = await fundedAccount("poor", 5n * NEAR);
   const dir = await newDir();
@@ -376,7 +433,7 @@ test("deploy_refuses_an_account_that_runs_other_code_before_it_creates_anything"
   await sendAs(tender, tender.accountId, [actions.deployContract(tokenWasm)]);
   await writeFile(
     join(dir, ".env.deploy.sandbox"),
-    `TENDER_ACCOUNT=${tender.accountId}\nTENDER_PRIVATE_KEY=${tender.privateKey}\n`,
+    `TENDER_CONTRACT=${tender.accountId}\nTENDER_CONTRACT_PRIVATE_KEY=${tender.privateKey}\n`,
   );
 
   await expect(runDeploy(parent, "usdc.sandbox", dir)).rejects.toThrow(
@@ -390,7 +447,7 @@ test("deploy_names_the_key_it_lacks_for_an_account_that_exists", async () => {
   // tender.sandbox exists, but this directory has no env file.
   const lost = await newDir();
   await expect(runDeploy(root, "usdc.sandbox", lost)).rejects.toThrow(
-    /tender\.sandbox exists, but TENDER_PRIVATE_KEY is not in \.env\.deploy\.sandbox/,
+    /tender\.sandbox exists, but TENDER_CONTRACT_PRIVATE_KEY is not in \.env\.deploy\.sandbox/,
   );
   expect(existsSync(join(lost, ".env.deploy.sandbox"))).toBe(false);
 
@@ -399,11 +456,13 @@ test("deploy_names_the_key_it_lacks_for_an_account_that_exists", async () => {
   const stranger = KeyPair.fromRandom("ed25519").toString();
   await writeFile(
     join(wrong, ".env.deploy.sandbox"),
-    `TENDER_ACCOUNT=tender.sandbox\nTENDER_PRIVATE_KEY=${stranger}\n`,
+    `TENDER_CONTRACT=tender.sandbox\nTENDER_CONTRACT_PRIVATE_KEY=${stranger}\n`,
   );
   const error = await runDeploy(root, "usdc.sandbox", wrong).catch((e: unknown) => e);
   expect(error).toBeInstanceOf(Error);
-  expect((error as Error).message).toMatch(/TENDER_PRIVATE_KEY .* is not a full-access key/);
+  expect((error as Error).message).toMatch(
+    /TENDER_CONTRACT_PRIVATE_KEY .* is not a full-access key/,
+  );
   // The message names the variable, never the key.
   expect((error as Error).message).not.toContain(stranger);
 });
@@ -417,15 +476,15 @@ test("deploy_uses_the_key_an_interrupted_run_left_for_an_account_it_never_made",
   const envPath = join(dir, ".env.deploy.sandbox");
   await writeFile(
     envPath,
-    `TENDER_ACCOUNT=tender.crash.sandbox\nTENDER_PRIVATE_KEY=${key.toString()}\n`,
+    `TENDER_CONTRACT=tender.crash.sandbox\nTENDER_CONTRACT_PRIVATE_KEY=${key.toString()}\n`,
   );
 
   const { lines } = await runDeploy(parent, "usdc.sandbox", dir);
 
   expect(lines).toContain("OK create tender.crash.sandbox");
   const text = await readFile(envPath, "utf8");
-  expect(text.match(/^TENDER_PRIVATE_KEY=/gm)).toHaveLength(1);
-  expect(parseEnv(text).TENDER_PRIVATE_KEY).toBe(key.toString());
+  expect(text.match(/^TENDER_CONTRACT_PRIVATE_KEY=/gm)).toHaveLength(1);
+  expect(parseEnv(text).TENDER_CONTRACT_PRIVATE_KEY).toBe(key.toString());
   const crashed = new TenderClient({
     network: "sandbox",
     contractId: "tender.crash.sandbox",

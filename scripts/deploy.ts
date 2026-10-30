@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFile, chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { parseArgs, parseEnv } from "node:util";
 import { type Signer, TenderClient, TenderError, toTxResult } from "@tender/client";
@@ -27,7 +27,7 @@ import {
   type KeyPairString,
 } from "near-api-js";
 import { AccountDoesNotExistError } from "near-api-js/rpc-errors";
-import { loadEnv, REPO_ROOT } from "./lib/env";
+import { loadEnv, parseEnvText, REPO_ROOT } from "./lib/env";
 
 /**
  * The deploy script. Under one parent account it creates the team's ten accounts, deploys the test
@@ -42,12 +42,15 @@ import { loadEnv, REPO_ROOT } from "./lib/env";
  *
  * Each step prints `OK <step>` when it did the work and `SKIP <step> (exists)` when the chain
  * already had it, so a run that stopped half way, or one made again after it finished, does what is
- * left and nothing more. Steps that sign with different keys run side by side.
+ * left and nothing more. Steps that sign with different keys run side by side (three at a time on
+ * testnet, whose public RPC answers a burst with 429s).
  *
  * The parent is the contract's owner. Its key signs the account creations and the owner's calls;
  * every other transaction is signed by the account it concerns, with the key the script made for it.
  * Those keys are appended to `.env.deploy.<network>` (mode 0600, git-ignored) before the accounts
- * exist, under the names the other scripts read, and are never printed.
+ * exist, under the names the other scripts read, and are never printed. The contract's own are
+ * `TENDER_CONTRACT` and `TENDER_CONTRACT_PRIVATE_KEY`; see `MEMBERS` for why they are not
+ * `TENDER_ACCOUNT` and `TENDER_PRIVATE_KEY`.
  *
  * `pnpm deploy:testnet` is the command line. The mainnet deploy belongs to plan 07.
  */
@@ -124,21 +127,49 @@ const MAINNET_REFUSED =
   "mainnet is not deployed by this script: plan 07 owns the mainnet deploy, which needs the owner's approval";
 
 /**
- * The accounts the deploy creates under its parent, in the order it creates them. `stem` begins
- * the names of the variables that hold the account and its key in `.env.deploy.<network>`:
- * `<stem>_ACCOUNT` and `<stem>_PRIVATE_KEY`. Plan 05's seed and agent scripts read these.
+ * What is said when the parent's account id is no account id. The value is never in it: it may be
+ * a private key that landed in the wrong variable, and what is printed ends up in logs.
+ */
+const PARENT_ACCOUNT_INVALID =
+  "DEPLOY_PARENT_ACCOUNT is not a valid NEAR account id (its value is not shown, since a private " +
+  "key may have been put there). It must be an account id such as my-account.testnet, " +
+  "and DEPLOY_PARENT_PRIVATE_KEY the key. Also check that no space follows the = on its line: " +
+  "some parsers then read the next line as its value.";
+
+/**
+ * The names of the variables that hold an account and its key in `.env.deploy.<network>`:
+ * `<STEM>_ACCOUNT` and `<STEM>_PRIVATE_KEY`. Plan 05's seed and agent scripts read these.
+ */
+const roleVars = (stem: string) => ({
+  accountVar: `${stem}_ACCOUNT`,
+  keyVar: `${stem}_PRIVATE_KEY`,
+});
+
+/**
+ * The accounts the deploy creates under its parent, in the order it creates them, with what each
+ * starts with and the variables of `.env.deploy.<network>` that hold its id and its key.
+ *
+ * Tender's are `TENDER_CONTRACT` and `TENDER_CONTRACT_PRIVATE_KEY` (ruling P02-R25), never the
+ * `TENDER_ACCOUNT` and `TENDER_PRIVATE_KEY` of the MCP signer in `.env.example`: `loadEnv` lets the
+ * network file win over `.env`, so those two would replace the signer with the contract's own
+ * full-access key.
  */
 const MEMBERS = [
-  { name: "tender", stem: "TENDER", balance: TENDER_BALANCE },
-  { name: "treasury", stem: "TREASURY", balance: ACCOUNT_BALANCE },
-  { name: "judge", stem: "JUDGE", balance: ACCOUNT_BALANCE },
-  { name: "keeper", stem: "KEEPER", balance: ACCOUNT_BALANCE },
-  { name: "tusdc", stem: "TUSDC", balance: ACCOUNT_BALANCE },
-  { name: "poster", stem: "POSTER", balance: ACCOUNT_BALANCE },
-  { name: "analyst", stem: "AGENT_ANALYST", balance: ACCOUNT_BALANCE },
-  { name: "coder", stem: "AGENT_CODER", balance: ACCOUNT_BALANCE },
-  { name: "extractor", stem: "AGENT_EXTRACTOR", balance: ACCOUNT_BALANCE },
-  { name: "lead", stem: "AGENT_LEAD", balance: ACCOUNT_BALANCE },
+  {
+    name: "tender",
+    accountVar: "TENDER_CONTRACT",
+    keyVar: "TENDER_CONTRACT_PRIVATE_KEY",
+    balance: TENDER_BALANCE,
+  },
+  { name: "treasury", ...roleVars("TREASURY"), balance: ACCOUNT_BALANCE },
+  { name: "judge", ...roleVars("JUDGE"), balance: ACCOUNT_BALANCE },
+  { name: "keeper", ...roleVars("KEEPER"), balance: ACCOUNT_BALANCE },
+  { name: "tusdc", ...roleVars("TUSDC"), balance: ACCOUNT_BALANCE },
+  { name: "poster", ...roleVars("POSTER"), balance: ACCOUNT_BALANCE },
+  { name: "analyst", ...roleVars("AGENT_ANALYST"), balance: ACCOUNT_BALANCE },
+  { name: "coder", ...roleVars("AGENT_CODER"), balance: ACCOUNT_BALANCE },
+  { name: "extractor", ...roleVars("AGENT_EXTRACTOR"), balance: ACCOUNT_BALANCE },
+  { name: "lead", ...roleVars("AGENT_LEAD"), balance: ACCOUNT_BALANCE },
 ] as const;
 
 type MemberName = (typeof MEMBERS)[number]["name"];
@@ -154,12 +185,12 @@ interface Member {
 }
 
 function plan(parentId: string): Record<MemberName, Member> {
-  const members = MEMBERS.map(({ name, stem, balance }): Member => {
+  const members = MEMBERS.map(({ name, accountVar, keyVar, balance }): Member => {
     const id = `${name}.${parentId}`;
     if (!AccountIdSchema.safeParse(id).success) {
       throw new Error(`${id} is not a valid account id (NEAR's longest is 64 characters)`);
     }
-    return { name, id, balance, accountVar: `${stem}_ACCOUNT`, keyVar: `${stem}_PRIVATE_KEY` };
+    return { name, id, balance, accountVar, keyVar };
   });
   return Object.fromEntries(members.map((m) => [m.name, m])) as Record<MemberName, Member>;
 }
@@ -194,23 +225,25 @@ class DeployEnv {
     this.name = name;
     this.exists = text !== null;
     this.endsWithNewline = text === null || text === "" || text.endsWith("\n");
-    this.values = Object.fromEntries(
-      Object.entries(parseEnv(text ?? "")).filter(
-        (entry): entry is [string, string] => entry[1] !== undefined,
-      ),
-    );
+    this.values = parseEnvText(text ?? "");
   }
 
+  /**
+   * Opens the env file of a network. A file that exists is made readable by its owner alone first:
+   * the owner makes it by hand, with the parent's key in it, and gets mode 0644 more often than
+   * not. If the deploy then stops before it appends anything, that is the mode it stays in.
+   */
   static async open(dir: string, network: NetworkId): Promise<DeployEnv> {
     const name = `.env.deploy.${network}`;
     const path = join(dir, name);
     try {
-      return new DeployEnv(path, name, await readFile(path, "utf8"));
+      await chmod(path, 0o600);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT")
         return new DeployEnv(path, name, null);
       throw error;
     }
+    return new DeployEnv(path, name, await readFile(path, "utf8"));
   }
 
   /** The variable's value, or undefined if it is missing or blank. */
@@ -219,7 +252,11 @@ class DeployEnv {
     return value === undefined || value === "" ? undefined : value;
   }
 
-  /** Appends the variables to the file, which only the owner may read, and returns once it is written. */
+  /**
+   * Appends the variables to the file, and returns once they are on disk and read back as written.
+   * The deploy sends nothing to the chain before that, so a key is never lost to a crash, or to a
+   * parser that read its line as something else.
+   */
   async add(entries: ReadonlyArray<readonly [string, string]>): Promise<void> {
     let text = `${entries.map(([key, value]) => `${key}=${value}`).join("\n")}\n`;
     if (!this.exists) {
@@ -227,10 +264,33 @@ class DeployEnv {
     } else if (!this.endsWithNewline) {
       text = `\n${text}`;
     }
-    await appendFile(this.path, text, { mode: 0o600 });
-    await chmod(this.path, 0o600);
+    const file = await open(this.path, "a", 0o600);
+    try {
+      await file.chmod(0o600);
+      await file.appendFile(text);
+      await file.datasync();
+    } finally {
+      await file.close();
+    }
     this.exists = true;
     this.endsWithNewline = true;
+
+    // Read back with node's parser as it is, without the tolerance of `parseEnvText`: any other
+    // reader of the file may use it. A line above that ends in `= ` makes it take the next line as
+    // its value, and that line's variable is lost. Every variable the file is known to hold is
+    // checked, the new ones and the old, so that the line at fault is found on any run.
+    const back = parseEnv(await readFile(this.path, "utf8"));
+    const expected = { ...this.values, ...Object.fromEntries(entries) };
+    const lost = Object.entries(expected)
+      .filter(([key, value]) => back[key] !== value)
+      .map(([key]) => key);
+    if (lost.length > 0) {
+      throw new Error(
+        `${this.name} does not read back as written (${lost.join(", ")}). A line that ends in ` +
+          '"= " (a space after the =) makes node read the next line as its value: fix that ' +
+          "line and run the deploy again.",
+      );
+    }
     for (const [key, value] of entries) this.values[key] = value;
   }
 }
@@ -348,10 +408,10 @@ function signerOf(ctx: Context, member: Member): Signer {
   return { accountId: member.id, privateKey };
 }
 
-type Outcome = "OK" | "SKIP";
+export type Outcome = "OK" | "SKIP";
 
 /** One line of output, and the work behind it. */
-interface Step {
+export interface Step {
   label: string;
   run(): Promise<Outcome>;
 }
@@ -394,13 +454,34 @@ async function runLane(steps: readonly Step[], log: (line: string) => void) {
 }
 
 /**
- * Runs the lanes side by side, each lane's steps in order. A lane whose step fails stops there; the
- * others go on to their end, and then the failures are thrown, so that a run that stops leaves as
- * much done as it can. Lanes must not share a signing key, since one key sends one transaction at a
- * time.
+ * How many lanes run at once: all of them on a local chain, and a few on testnet, whose public RPC
+ * answers a burst of requests with 429s.
  */
-async function runLanes(lanes: ReadonlyArray<readonly Step[]>, log: (line: string) => void) {
-  const results = await Promise.all(lanes.map((lane) => runLane(lane, log)));
+export function laneLimit(network: NetworkId): number {
+  return network === "testnet" ? 3 : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Runs the lanes side by side, at most `limit` at once, each lane's steps in order. A lane whose
+ * step fails stops there; the others go on to their end, and then the failures are thrown, so that
+ * a run that stops leaves as much done as it can. Lanes must not share a signing key, since one
+ * key sends one transaction at a time.
+ */
+export async function runLanes(
+  lanes: ReadonlyArray<readonly Step[]>,
+  log: (line: string) => void,
+  limit: number = Number.POSITIVE_INFINITY,
+): Promise<void> {
+  const results: Array<StepFailure | null> = lanes.map(() => null);
+  let next = 0;
+  const worker = async () => {
+    while (next < lanes.length) {
+      const index = next++;
+      results[index] = await runLane(lanes[index] ?? [], log);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, lanes.length) }, worker));
+
   const failures = results.filter((r): r is StepFailure => r !== null);
   if (failures.length === 1 && failures[0] !== undefined) throw failures[0];
   if (failures.length > 1) throw new StepsFailed(failures);
@@ -436,11 +517,29 @@ function codeFor(ctx: Context, member: Member): string | undefined {
 
 /**
  * What can be checked before the first transaction, so that a deploy that cannot succeed leaves
- * nothing behind: the parent's key is a full-access key of the parent, the USDC account exists, no
- * account of the deploy holds other code, and the parent can pay for the accounts still to make.
+ * nothing behind: the record in `deployments/` is this deployment's or absent, the node is on the
+ * chain the target names, the parent's key is a full-access key of the parent, the USDC account
+ * exists, no account of the deploy holds other code, and the parent can pay for the accounts still
+ * to make.
  */
 async function preflight(ctx: Context): Promise<void> {
   const { chain, parent, usdc } = ctx;
+
+  // What needs no network comes first. The run would replace a record of another deployment when
+  // it ends; it must not get as far as spending anything.
+  await existingRecord(ctx);
+
+  // The network is a label the caller chose; the chain id is what the node says it is.
+  const { chain_id: chainId } = await chain.provider.viewNodeStatus();
+  if (chainId === "mainnet") {
+    throw new Error(`${MAINNET_REFUSED} (the node answered with chain id "mainnet")`);
+  }
+  if (ctx.network === "testnet" && chainId !== "testnet") {
+    throw new Error(
+      `this is a testnet deploy, but the node answered with chain id ${JSON.stringify(String(chainId).slice(0, 40))}`,
+    );
+  }
+
   const parentKey = parseKey(parent.privateKey, "the parent's key").getPublicKey().toString();
   const key = await chain.reader.viewAccessKey(parent.accountId, parentKey);
   if (key === null) {
@@ -734,17 +833,11 @@ function sameDeployment(a: Deployment, b: Deployment): boolean {
   return identity(a) === identity(b);
 }
 
-/**
- * Writes the record, or finds it written. The deploy block is the one this run made, or else the
- * one an earlier run kept in the env file when it deployed Tender; a run that stopped after that
- * block and before the record does not forget it.
- */
-async function recordDeployment(
-  ctx: Context,
-): Promise<{ outcome: Outcome; deployment: Deployment }> {
-  const { members, network, env } = ctx;
-  const candidate = (deployHeight: string): Deployment => ({
-    network,
+/** The record of the deployment this run makes, with the block it names and the time it is made. */
+function deploymentOf(ctx: Context, deployHeight: string): Deployment {
+  const { members } = ctx;
+  return {
+    network: ctx.network,
     contract: members.tender.id,
     tokens:
       ctx.usdc === undefined
@@ -757,18 +850,40 @@ async function recordDeployment(
     wasmSha256: ctx.wasm.tenderSha256,
     deployHeight,
     deployedAt: new Date().toISOString(),
-  });
+  };
+}
 
+/**
+ * The record already in `deployments/<network>.json`, or null if there is none. Throws if it is
+ * another deployment's: its contract, tokens or accounts differ from this one's. That record is
+ * what the skeleton and the indexer read, so no run replaces it, whatever it deployed.
+ */
+async function existingRecord(ctx: Context): Promise<Deployment | null> {
+  const existing = await readDeployment(ctx.network, ctx.dir);
+  if (existing !== null && !sameDeployment(existing, deploymentOf(ctx, existing.deployHeight))) {
+    throw new Error(
+      `${deploymentPath(ctx.network, ctx.dir)} is the record of another deployment (contract ` +
+        `${existing.contract}; its tokens or accounts differ from this one's). Move it aside to ` +
+        "record this deployment.",
+    );
+  }
+  return existing;
+}
+
+/**
+ * Writes the record, or finds it written. The deploy block is the one this run made, or else the
+ * one an earlier run kept in the env file when it deployed Tender; a run that stopped after that
+ * block and before the record does not forget it.
+ */
+async function recordDeployment(
+  ctx: Context,
+): Promise<{ outcome: Outcome; deployment: Deployment }> {
+  const { members, network, env } = ctx;
   const path = deploymentPath(network, ctx.dir);
-  const existing = await readDeployment(network, ctx.dir);
-  // A record is kept unless this run deployed Tender anew, which makes its block stale.
+  // The record of this deployment is kept as it is, unless this run deployed Tender anew and so
+  // knows a block that the record does not.
+  const existing = await existingRecord(ctx);
   if (existing !== null && ctx.tenderHeight === undefined) {
-    if (!sameDeployment(existing, candidate(existing.deployHeight))) {
-      throw new Error(
-        `${path} is the record of another deployment (contract ${existing.contract}; its tokens or ` +
-          "accounts differ from this one's). Remove it to record this deployment.",
-      );
-    }
     return { outcome: "SKIP", deployment: existing };
   }
 
@@ -781,9 +896,27 @@ async function recordDeployment(
         `height> in ${env.name}.`,
     );
   }
-  const deployment = candidate(deployHeight);
+  const deployment = deploymentOf(ctx, deployHeight);
   await writeDeployment(path, deployment);
   return { outcome: "OK", deployment };
+}
+
+/** A value from the env file, if it is an account id. Any other may be a key, so it is not shown. */
+function shown(value: string): string {
+  return AccountIdSchema.safeParse(value).success ? value : "something that is no account id";
+}
+
+/**
+ * For the message about an env file of another deployment: whose keys it holds, by account id.
+ * Only ids are listed, since a file written by hand may hold a key where an id belongs.
+ */
+function holdsKeysOf(env: DeployEnv, members: Record<MemberName, Member>): string {
+  const ids = Object.values(members).flatMap((member) => {
+    const id = env.get(member.accountVar);
+    const hasKey = env.get(member.keyVar) !== undefined;
+    return id !== undefined && hasKey && AccountIdSchema.safeParse(id).success ? [id] : [];
+  });
+  return ids.length > 0 ? `it holds the keys of ${ids.join(", ")}` : "it may hold keys";
 }
 
 /**
@@ -791,9 +924,12 @@ async function recordDeployment(
  * record that it wrote to `deployments/<network>.json`. See the top of this file for the steps.
  *
  * Throws a `StepFailure` (or `StepsFailed`) naming the steps that failed; what the other steps did
- * stays done, and a second run carries on. Before anything is sent it throws if the env file names
- * other accounts or holds a bad key, the parent's key is not a full-access key of the parent, the
- * USDC account is missing, an account of the deploy holds other code, or the parent cannot pay.
+ * stays done, and a second run carries on. Before anything is sent it throws if the parent's
+ * account id is no account id, the env file names other accounts or holds a bad key, the record in
+ * `deployments/` is another deployment's, the node is on mainnet (or, for a testnet target, on any
+ * chain but testnet), the parent's key is not a full-access key of the parent, the USDC account is
+ * missing, an account of the deploy holds other code, or the parent cannot pay. None of these
+ * messages shows the parent's key or the value of a variable.
  */
 export async function deploy(
   target: DeployTarget,
@@ -808,21 +944,31 @@ export async function deploy(
   }
   const dir = options.dir ?? REPO_ROOT;
   const log = options.log ?? console.log;
+  const limit = laneLimit(network);
+
+  // The env file is opened first, and made private, whatever else turns out to be wrong.
+  const env = await DeployEnv.open(dir, network);
+
+  // Then the parent, with nothing printed from it: whatever sits in these two variables may be
+  // the key, and the account id goes into the id of every account the deploy makes.
+  parseKey(parent.privateKey, "the parent's key");
+  if (!AccountIdSchema.safeParse(parent.accountId).success) {
+    throw new Error(PARENT_ACCOUNT_INVALID);
+  }
 
   const members = plan(parent.accountId);
-  const env = await DeployEnv.open(dir, network);
   for (const member of Object.values(members)) {
     const named = env.get(member.accountVar);
     if (named !== undefined && named !== member.id) {
       throw new Error(
-        `${env.name} names ${named} as ${member.accountVar}, but this deploy's account is ` +
-          `${member.id}: the file belongs to another deployment. Use a fresh one.`,
+        `${env.name} names ${shown(named)} as ${member.accountVar}, but this deploy's account is ` +
+          `${member.id}. The file belongs to another deployment: move it aside ` +
+          `(${holdsKeysOf(env, members)}) and run the deploy again.`,
       );
     }
     const key = env.get(member.keyVar);
     if (key !== undefined) parseKey(key, `${member.keyVar} in ${env.name}`);
   }
-  parseKey(parent.privateKey, "the parent's key");
 
   const ctx: Context = {
     network,
@@ -840,7 +986,7 @@ export async function deploy(
   await preflight(ctx);
 
   // The parent makes the accounts, one after another: it is one key.
-  await runLanes([Object.values(members).map((member) => createStep(ctx, member))], log);
+  await runLanes([Object.values(members).map((member) => createStep(ctx, member))], log, limit);
 
   // The contracts: each account deploys to itself, and the two go side by side.
   await runLanes(
@@ -872,6 +1018,7 @@ export async function deploy(
       ],
     ],
     log,
+    limit,
   );
 
   // The rest is one lane for the owner (its storage first: `set_token` is charged to it), one for
@@ -889,7 +1036,7 @@ export async function deploy(
   const others = Object.values(members)
     .filter((member) => member !== tender)
     .map((member) => [storageStep(ctx, signerOf(ctx, member))]);
-  await runLanes([owner, tenderAccount, ...others], log);
+  await runLanes([owner, tenderAccount, ...others], log, limit);
 
   const label = `record deployments/${network}.json`;
   try {
@@ -932,8 +1079,9 @@ function parentSetup(now: Date): string {
 /**
  * The target for `network` from the command line: for testnet, the network's RPC URL, window and
  * USDC, and the parent from `DEPLOY_PARENT_ACCOUNT` and `DEPLOY_PARENT_PRIVATE_KEY` in `.env` or
- * `.env.deploy.testnet` of `dir`. Throws a `UsageError` for every other network and for a parent
- * that is not set up; it reads no more than those two files and uses no network.
+ * `.env.deploy.testnet` of `dir`. Throws a `UsageError` for every other network, for a parent that
+ * is not set up, and for a parent account that is no account id (without showing it: it may be the
+ * key). It reads no more than those two files and uses no network.
  */
 export function loadTarget(
   network: string | undefined,
@@ -956,6 +1104,7 @@ export function loadTarget(
   if (account === undefined || account === "") {
     throw new UsageError(parentSetup(options.now ?? new Date()));
   }
+  if (!AccountIdSchema.safeParse(account).success) throw new UsageError(PARENT_ACCOUNT_INVALID);
   const env = loadEnv("testnet", { dir, required: ["DEPLOY_PARENT_PRIVATE_KEY"] });
   const config = NETWORKS.testnet;
   return {
