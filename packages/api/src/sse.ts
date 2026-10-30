@@ -1,3 +1,4 @@
+import type { ServerResponse } from "node:http";
 import type { Db } from "@tender/db";
 import { Hono } from "hono";
 import { type SSEStreamingApi, streamSSE } from "hono/streaming";
@@ -15,16 +16,44 @@ import { type ErrorBody, parseU64 } from "./format";
 // of a block in one transaction: they become visible in the order of their ids, so a stream that
 // has read up to an id has missed nothing below it. The ids have gaps (a rolled-back transaction
 // uses up its ids), so a stream asks for `id > last`, never for `last + 1`.
+//
+// A stream does not live for ever. The place it holds is given back only when its loop ends, and a
+// client that has stopped reading (a stalled connection, a half-open one) leaves that loop waiting
+// in a write that no one will take, so it would hold the place until it chose to go. So the server
+// ends every stream after about ten minutes. A client that is reading sees the stream end cleanly
+// and reconnects with the last id it got, which costs it nothing.
 
 /** How a stream keeps time. The API uses `DEFAULT_TIMING`; a test passes a shorter one. */
 export interface SseTiming {
   /** Milliseconds between two looks at the table. */
   pollMs: number;
-  /** Milliseconds between two `: ping` comments, which keep an idle connection from being closed. */
+  /**
+   * Milliseconds of waiting between two `: ping` comments, which keep an idle connection from being
+   * closed. The time a look at the table takes is not counted, so on a slow database a ping comes
+   * a little later than this.
+   */
   pingMs: number;
+  /**
+   * Milliseconds a stream lives before the server ends it, give or take a fifth, so that streams
+   * that were opened together do not all end, and all come back, at the same moment.
+   */
+  lifetimeMs: number;
+  /**
+   * Milliseconds a stream that the server has ended is given to finish being sent. After that its
+   * connection is destroyed, if it is still open.
+   */
+  closeGraceMs: number;
 }
 
-const DEFAULT_TIMING: SseTiming = { pollMs: 1_000, pingMs: 15_000 };
+const DEFAULT_TIMING: SseTiming = {
+  pollMs: 1_000,
+  pingMs: 15_000,
+  lifetimeMs: 600_000,
+  closeGraceMs: 10_000,
+};
+
+/** How far a stream's lifetime may stray from `lifetimeMs`, either way, as a fraction of it. */
+const LIFETIME_SPREAD = 0.2;
 
 /** The most events one look at the table reads. */
 const PAGE = 100;
@@ -87,16 +116,22 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /**
- * Sends the events after `after` as they appear, until the client goes. Each pass reads at most
- * `PAGE` events, in id order, sends them, and waits `pollMs`. So a stream puts one small query a
- * second on the database whatever it has to send, which is what the cap on streams relies on, and
- * one that is far behind catches up `PAGE` events a second. Every `pingMs` of waiting it sends a
- * comment, so that a proxy sees traffic on a stream that has nothing to say.
+ * Sends the events after `after` as they appear, until the client goes or the stream's lifetime
+ * is over. Each pass reads at most `PAGE` events, in id order, sends them, and waits `pollMs`. So a
+ * stream puts one small query a second on the database whatever it has to send, which is what the
+ * cap on streams relies on, and one that is far behind catches up `PAGE` events a second. Every
+ * `pingMs` of waiting it sends a comment, so that a proxy sees traffic on a stream that has
+ * nothing to say.
  *
  * `hangup` is the request's signal. Hono ends a stream when the response body is cancelled, which
  * the server does when the client leaves, but not when the client left before the response was
  * handed to the server: there is nothing to cancel, and the stream would run for ever. The signal
  * is aborted in both cases.
+ *
+ * The lifetime is `timing.lifetimeMs`, give or take a fifth. When it is over the stream is
+ * aborted, which is what lets go of a write that is waiting for a client that has stopped reading
+ * (the loop is stuck in it, and no hang-up will come to end it, as the client has not gone), and
+ * `onExpire` is called, so that the caller can see to the connection.
  */
 async function pump(
   db: Db,
@@ -104,6 +139,7 @@ async function pump(
   timing: SseTiming,
   hangup: AbortSignal,
   after: bigint,
+  onExpire: () => void,
 ): Promise<void> {
   // The waits end the moment the stream is aborted, so that no timer outlives the client.
   const stopped = new AbortController();
@@ -111,6 +147,13 @@ async function pump(
   const onHangup = () => stream.abort();
   if (hangup.aborted) stream.abort();
   else hangup.addEventListener("abort", onHangup, { once: true });
+
+  // Nothing that can throw lies between this timer and the `try` that clears it.
+  const lifetime = timing.lifetimeMs * (1 - LIFETIME_SPREAD + 2 * LIFETIME_SPREAD * Math.random());
+  const expiry = setTimeout(() => {
+    stream.abort();
+    onExpire();
+  }, Math.round(lifetime));
 
   try {
     let last = after;
@@ -150,8 +193,25 @@ async function pump(
       }
     }
   } finally {
+    clearTimeout(expiry);
     hangup.removeEventListener("abort", onHangup);
   }
+}
+
+/**
+ * Destroys `connection` once `graceMs` have passed, unless the response has been sent by then.
+ * Aborting a stream frees its place, but a client that stopped reading would keep the connection,
+ * and everything queued on it, until it chose to close it; a client that is only slow has the
+ * grace to take what is left, and sees the stream end cleanly. `connection` is the server's
+ * response, which a real server gives to the app and a direct call such as `app.request` does
+ * not, so there may be none.
+ */
+function destroyUnlessFinished(connection: ServerResponse | undefined, graceMs: number): void {
+  if (connection === undefined) return;
+  // Unreferenced: a grace that is still running is no reason to keep the process alive.
+  setTimeout(() => {
+    if (!connection.writableFinished) connection.destroy();
+  }, graceMs).unref();
 }
 
 /**
@@ -165,17 +225,28 @@ async function pump(
  * the newest event when it is given neither. The header comes first because it is what a browser
  * sends when it reconnects, to the address it opened, which still carries the `since` it opened
  * with. Both are checked when both are given: an id that is no canonical u64 is a 400, whose text
- * is fixed and does not repeat it.
+ * is fixed and does not repeat it. An id beyond the newest event is taken to be the newest. A
+ * client can only hold ids that were committed, so such an id comes from a database that has been
+ * reset, or from another environment, and waiting for ids that the table will not reach for a
+ * long time would help no one. Against a read replica that lags behind, the same rule gives
+ * repeats, not skips: the client is sent again what it already has, and loses nothing.
  *
- * At most `deps.maxSseStreams` (200) streams are open in a process. Past that the answer is a
- * 503 with `Retry-After: 5`. `HEAD` is answered with the headers and no stream: Hono hands it to
- * this route and then drops the body without reading it, so a stream opened for it would never
- * end.
+ * A `: ping` comment follows about every 15 seconds of waiting, a little later when the database is
+ * slow, as the time a poll takes is not counted. After about ten minutes (between 8 and 12) the
+ * server ends the stream, for the reason given at the head of this file; a client that is reading
+ * sees it end and reconnects with the last id it got. If its connection is still open 10 seconds
+ * after that, because the client is not reading, it is destroyed.
+ *
+ * At most `deps.maxSseStreams` (200) streams are open in a process. Past that, or if that is not
+ * a number, the answer is a 503 with `Retry-After: 5`. `HEAD` is answered with the headers and no
+ * stream: Hono hands it to this route and then drops the body without reading it, so a stream
+ * opened for it would never end.
  *
  * A failure after the stream has begun cannot change the status. The stream ends, the error is
  * logged and the client, which reconnects with the id it has, loses nothing.
  */
-export function eventRoutes(deps: ApiDeps, timing: SseTiming = DEFAULT_TIMING): Hono {
+export function eventRoutes(deps: ApiDeps, timing: Partial<SseTiming> = {}): Hono {
+  const clock: SseTiming = { ...DEFAULT_TIMING, ...timing };
   const app = new Hono();
   // The streams open now. It belongs to this app: one app is one process in production.
   let open = 0;
@@ -191,7 +262,11 @@ export function eventRoutes(deps: ApiDeps, timing: SseTiming = DEFAULT_TIMING): 
       });
     }
 
-    if (open >= (deps.maxSseStreams ?? DEFAULT_MAX_STREAMS)) {
+    // Asked as "is there room" and not as "is it full": a cap that is not a number (`NaN`, from a
+    // setting that was not there) is never full by the second way of asking, and lets every
+    // stream in.
+    const room = open < (deps.maxSseStreams ?? DEFAULT_MAX_STREAMS);
+    if (!room) {
       const body: ErrorBody = {
         error: "unavailable",
         message: "too many event streams are open, try again shortly",
@@ -210,9 +285,12 @@ export function eventRoutes(deps: ApiDeps, timing: SseTiming = DEFAULT_TIMING): 
     };
     try {
       const after = await startAfter(deps.db, lastEventId ?? since);
+      const connection = (c.env as { outgoing?: ServerResponse } | undefined)?.outgoing;
       return streamSSE(c, async (stream) => {
         try {
-          await pump(deps.db, stream, timing, c.req.raw.signal, after);
+          await pump(deps.db, stream, clock, c.req.raw.signal, after, () =>
+            destroyUnlessFinished(connection, clock.closeGraceMs),
+          );
         } catch (error) {
           console.error("api: events: a stream ended on an error:", error);
         } finally {

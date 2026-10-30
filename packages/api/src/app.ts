@@ -18,6 +18,12 @@ import { eventRoutes } from "./sse";
 const ALLOWED_HEADERS = ["Authorization", "Content-Type", "Last-Event-ID"];
 
 /**
+ * The response headers browser code may read, beyond the few that any response allows: how long to
+ * wait before asking again, when the event stream has no room.
+ */
+const EXPOSED_HEADERS = ["Retry-After"];
+
+/**
  * The Tender API. The chain is the source of truth and the database is the cache the indexer
  * fills, so these routes read the database, except for the chain height that `/v1/health` reports.
  * Routes are mounted one per line, each module adding the paths of its own under `/v1`.
@@ -32,6 +38,7 @@ export function createApp(deps: ApiDeps): Hono {
     cors({
       origin: deps.network === "sandbox" ? "*" : deps.webOrigins.map(toOrigin),
       allowHeaders: ALLOWED_HEADERS,
+      exposeHeaders: EXPOSED_HEADERS,
       maxAge: 600,
     }),
   );

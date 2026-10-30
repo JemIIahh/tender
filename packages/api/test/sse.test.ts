@@ -1,3 +1,7 @@
+import { once } from "node:events";
+import type { Server } from "node:http";
+import net from "node:net";
+import { serve } from "@hono/node-server";
 import type { Db } from "@tender/db";
 import { FIXTURE_ACCOUNTS } from "@tender/indexer/testing";
 import { Hono } from "hono";
@@ -13,16 +17,22 @@ import { resetDb, seedLifecycle, testDeps } from "./helpers";
 // database that waits for nothing, so that the clock alone drives the stream. The events are rows
 // of `events` written with explicit ids, which is what the indexer leaves behind and what makes the
 // gaps in the ids that this route has to cope with; the payload test reads the lifecycle that the
-// indexer wrote from the captured logs instead.
+// indexer wrote from the captured logs instead. The tests of what only a real server does (a client
+// that leaves while the route is still starting, one that stops reading) serve the app on the
+// loopback interface and talk to it over raw connections.
 
 const { alice } = FIXTURE_ACCOUNTS;
 
+const MINUTE = 60_000;
+
+// A test names only the part of the timing it needs and the rest is the API's own, so the lifetime
+// of a stream (ten minutes, which only the tests of the lifetime wait for) is not repeated in each.
 /** A stream that polls every 10 ms and, for the length of any test, never pings. */
-const QUICK: SseTiming = { pollMs: 10, pingMs: 60_000 };
+const QUICK: Partial<SseTiming> = { pollMs: 10, pingMs: 60_000 };
 /** One that polls every 10 ms and pings every 60. */
-const PINGING: SseTiming = { pollMs: 10, pingMs: 60 };
-/** The timing of the real API: a poll each second and a ping every 15. */
-const DEFAULT_TIMING: SseTiming = { pollMs: 1_000, pingMs: 15_000 };
+const PINGING: Partial<SseTiming> = { pollMs: 10, pingMs: 60 };
+/** The poll and the ping of the real API: a poll each second and a ping every 15. */
+const DEFAULT_TIMING: Partial<SseTiming> = { pollMs: 1_000, pingMs: 15_000 };
 
 let deps: ApiDeps;
 
@@ -39,14 +49,18 @@ beforeEach(async () => {
 /** Every stream a test opened, so that none outlives it and polls on. */
 const opened: Listener[] = [];
 
+/** Whatever else a test opened that has to be closed when it is over: servers and connections. */
+const cleanups: Array<() => void | Promise<void>> = [];
+
 afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   await Promise.all(opened.splice(0).map((listener) => listener.cancel()));
+  await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
 /** The event routes alone, under `/v1`, with the API's error handler. */
-function appWith(over: Partial<ApiDeps> = {}, timing: SseTiming = QUICK): Hono {
+function appWith(over: Partial<ApiDeps> = {}, timing: Partial<SseTiming> = QUICK): Hono {
   const app = new Hono();
   app.onError(handleError);
   app.route("/v1", eventRoutes({ ...deps, ...over }, timing));
@@ -264,19 +278,23 @@ function watched(over: { before?: (n: number, sql: string) => Promise<void> | un
 }
 
 /**
- * A database with no events in it that waits for nothing, so that a fake clock alone drives a
- * stream. It counts the polls, which are the statements that are not the one that looks for the
- * newest id.
+ * A database with no events in it, bar the `firstPoll` that the first poll finds, that waits for
+ * nothing, so that a fake clock alone drives a stream. It counts the polls, which are the
+ * statements that are not the one that looks for the newest id.
  */
-function idleDb() {
+function idleDb(firstPoll: unknown[] = []) {
   const sqls: string[] = [];
+  let polled = false;
   const unused = async () => {
     throw new Error("the stream has no use for this");
   };
   const db: Db = {
     query: async <T>(sql: string) => {
       sqls.push(sql);
-      return (/max\(id\)/.test(sql) ? [{ max: "0" }] : []) as T[];
+      if (/max\(id\)/.test(sql)) return [{ max: "0" }] as T[];
+      const found = polled ? [] : firstPoll;
+      polled = true;
+      return found as T[];
     },
     exec: unused,
     tx: unused,
@@ -666,8 +684,8 @@ test("sse_leaves_no_timer_behind_a_client_that_leaves", async () => {
   const stream = listen(await app.request("/v1/events"));
   await vi.advanceTimersByTimeAsync(3_000);
   expect(polls()).toBe(4);
-  // The stream waits on one timer, for its next poll.
-  expect(vi.getTimerCount()).toBe(1);
+  // The stream has two timers: one for its next poll, and one for the end of its lifetime.
+  expect(vi.getTimerCount()).toBe(2);
 
   await stream.cancel();
   await vi.advanceTimersByTimeAsync(0);
@@ -758,6 +776,160 @@ test("sse_a_head_request_opens_no_stream", async () => {
   expect(stream.ended).toBe(false);
 });
 
+// ---- The lifetime -----------------------------------------------------------------------------
+
+test("sse_a_stream_ends_at_its_lifetime_and_its_connection_goes_after_the_grace", async () => {
+  // The API's own timing: ten minutes, with the random part of the lifetime pinned to the middle
+  // of its spread, and then ten seconds of grace. `connection` stands in for the response that a
+  // real server hands to the app, and that `app.request` does not have.
+  const { db, polls } = idleDb();
+  const app = createApp({ ...deps, db, maxSseStreams: 1 });
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const connection = { writableFinished: false, destroy: vi.fn() };
+  const stream = listen(await app.request("/v1/events", {}, { outgoing: connection }));
+
+  await vi.advanceTimersByTimeAsync(10 * MINUTE - 1);
+  expect(stream.ended).toBe(false);
+  expect(polls()).toBeGreaterThan(500);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(stream.ended).toBe(true);
+
+  // The stream polls no more, and the one timer that is left is the grace. Until it is over the
+  // connection is left to finish.
+  expect(vi.getTimerCount()).toBe(1);
+  const polled = polls();
+  await vi.advanceTimersByTimeAsync(10_000 - 1);
+  expect(connection.destroy).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(1);
+  expect(connection.destroy).toHaveBeenCalledTimes(1);
+  expect(polls()).toBe(polled);
+  expect(vi.getTimerCount()).toBe(0);
+
+  // The only place there is was given back.
+  const next = await app.request("/v1/events");
+  expect(next.status).toBe(200);
+  listen(next);
+});
+
+test("sse_lifetimes_are_spread_a_fifth_either_way", async () => {
+  // Streams that were opened together do not end, and come back, together: the shortest lives 8
+  // minutes, the longest 12, and one in the middle 10.
+  const { db } = idleDb();
+  const app = appWith({ db }, { pollMs: MINUTE, pingMs: 60 * MINUTE });
+  const random = vi.spyOn(Math, "random");
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const streams: Listener[] = [];
+  for (const draw of [0, 0.5, 1]) {
+    random.mockReturnValue(draw);
+    streams.push(listen(await app.request("/v1/events")));
+  }
+  const ended = () => streams.map((stream) => stream.ended);
+
+  await vi.advanceTimersByTimeAsync(8 * MINUTE - 1);
+  expect(ended()).toEqual([false, false, false]);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(ended()).toEqual([true, false, false]);
+  await vi.advanceTimersByTimeAsync(2 * MINUTE - 1);
+  expect(ended()).toEqual([true, false, false]);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(ended()).toEqual([true, true, false]);
+  await vi.advanceTimersByTimeAsync(2 * MINUTE - 1);
+  expect(ended()).toEqual([true, true, false]);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(ended()).toEqual([true, true, true]);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test("sse_a_connection_that_finishes_within_the_grace_is_left_alone", async () => {
+  // A client that is slow, and not gone, has the grace to take what is left of the stream.
+  const { db } = idleDb();
+  const app = appWith({ db }, { pollMs: 1_000, pingMs: 15_000, lifetimeMs: 60_000 });
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const connection = { writableFinished: false, destroy: vi.fn() };
+  const stream = listen(await app.request("/v1/events", {}, { outgoing: connection }));
+
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(stream.ended).toBe(true);
+  connection.writableFinished = true;
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(connection.destroy).not.toHaveBeenCalled();
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test("sse_a_client_that_leaves_before_the_lifetime_is_not_followed_by_a_grace", async () => {
+  // The lifetime timer is cleared with the stream, so a client that has left cannot be followed
+  // by a grace for a connection that is already closed.
+  const { db } = idleDb();
+  const app = appWith({ db }, { pollMs: 1_000, pingMs: 15_000, lifetimeMs: 60_000 });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const connection = { writableFinished: false, destroy: vi.fn() };
+  const stream = listen(await app.request("/v1/events", {}, { outgoing: connection }));
+  await vi.advanceTimersByTimeAsync(5_000);
+
+  await stream.cancel();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(vi.getTimerCount()).toBe(0);
+  await vi.advanceTimersByTimeAsync(2 * MINUTE);
+  expect(connection.destroy).not.toHaveBeenCalled();
+});
+
+test("sse_a_reader_that_stopped_reading_loses_its_place_at_the_lifetime", async () => {
+  // Nothing reads the response, so after a message or two the stream's write waits for a reader
+  // that does not come. The loop is stuck in it: no poll follows, and no hang-up will end it, as
+  // the client has not gone. Only the lifetime lets go of the write, and so of the place.
+  const rows = Array.from({ length: 20 }, (_, i) => ({
+    id: String(i + 1),
+    event: "committed",
+    data: { task_id: "1", pad: "x".repeat(10_000) },
+    height: String(1_000 + i),
+    task_id: "1",
+  }));
+  const { db, polls } = idleDb(rows);
+  const app = appWith({ db, maxSseStreams: 1 }, DEFAULT_TIMING);
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const unread = await app.request("/v1/events?since=0");
+  expect(unread.status).toBe(200);
+
+  await vi.advanceTimersByTimeAsync(10 * MINUTE - 1);
+  expect(polls()).toBe(1);
+  const refused = await app.request("/v1/events");
+  expect(refused.status).toBe(503);
+
+  await vi.advanceTimersByTimeAsync(1);
+  const next = await app.request("/v1/events");
+  expect(next.status).toBe(200);
+  listen(next);
+  await unread.body?.cancel();
+});
+
+test("sse_a_client_that_is_ended_at_its_lifetime_picks_up_where_it_was", async () => {
+  // What a browser does when the server ends the stream: it sees the end, reconnects with the id
+  // of the last message it got, and is sent what came after it, once.
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  const app = appWith({}, { pollMs: 10, pingMs: 60_000, lifetimeMs: 200 });
+  await addEvents(...eventsWithIds(1, 2, 3));
+
+  const res = await app.request("/v1/events?since=0");
+  const reader = res.body?.getReader();
+  if (reader === undefined) throw new Error("the response has no body");
+  const decoder = new TextDecoder();
+  let text = "";
+  // A read that fails would throw: the stream has to come to its end, and not to an error.
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+  }
+  expect(ids(parseFrames(text).frames)).toEqual(["1", "2", "3"]);
+
+  await addEvents(...eventsWithIds(4, 5));
+  const again = await open(app, "/v1/events", { "Last-Event-ID": "3" });
+  expect(ids(await again.take(2))).toEqual(["4", "5"]);
+});
+
 // ---- The cap ----------------------------------------------------------------------------------
 
 test("sse_cap_answers_503_with_retry_after", async () => {
@@ -801,6 +973,61 @@ test("sse_cap_of_zero_refuses_every_stream", async () => {
   expect(res.headers.get("retry-after")).toBe("5");
 });
 
+test("sse_cap_that_is_not_a_number_refuses_every_stream", async () => {
+  // `Number(process.env.SETTING)` is NaN when the setting is not there, and NaN is neither more
+  // nor less than anything: a cap that cannot be read has to shut the streams out, and not let
+  // every one in.
+  for (const cap of [Number.NaN, -1, Number.NEGATIVE_INFINITY]) {
+    const res = await appWith({ maxSseStreams: cap }).request("/v1/events");
+    expect(res.status, String(cap)).toBe(503);
+    expect(res.headers.get("retry-after"), String(cap)).toBe("5");
+  }
+});
+
+test("sse_cap_holds_against_requests_that_arrive_together", async () => {
+  // Twenty requests are in the route at once, and each finds out where to begin before its stream
+  // starts. The place is taken before that wait, so exactly five get one.
+  const app = appWith({ maxSseStreams: 5 });
+  const answers = await Promise.all(Array.from({ length: 20 }, () => app.request("/v1/events")));
+  const accepted = answers.filter((res) => res.status === 200);
+  const refused = answers.filter((res) => res.status === 503);
+  for (const res of accepted) listen(res);
+  expect(accepted).toHaveLength(5);
+  expect(refused).toHaveLength(15);
+  for (const res of refused) expect(res.headers.get("retry-after")).toBe("5");
+});
+
+test("sse_cap_counts_a_stream_that_is_still_finding_where_to_begin", async () => {
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let reachedQuery: () => void = () => undefined;
+  const reached = new Promise<void>((resolve) => {
+    reachedQuery = resolve;
+  });
+  const { db } = watched({
+    before: (n) => {
+      if (n !== 1) return undefined;
+      reachedQuery();
+      return held;
+    },
+  });
+  const app = appWith({ db, maxSseStreams: 1 });
+
+  // The first request is waiting for the newest id when the second one comes.
+  const first = app.request("/v1/events");
+  await reached;
+  const second = await app.request("/v1/events");
+  expect(second.status).toBe(503);
+  expect(second.headers.get("retry-after")).toBe("5");
+
+  release();
+  const answer = await first;
+  expect(answer.status).toBe(200);
+  listen(answer);
+});
+
 test("sse_a_stream_that_fails_frees_its_place", async () => {
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   await addEvents(...eventsWithIds(1, 2));
@@ -841,6 +1068,146 @@ test("sse_a_failure_before_the_stream_is_a_500_and_frees_its_place", async () =>
   }
 });
 
+// ---- On a real server -------------------------------------------------------------------------
+
+// `app.request` is no server: it has no connection to lose and no signal that a client has gone.
+// These tests serve the app with the server the API runs on, over the loopback interface, and
+// talk to it over raw connections, so that a client can leave, or stop reading, when they choose.
+// Nothing in them waits long, and nothing leaves the machine.
+
+/**
+ * Serves `app` on a port of its own on the loopback interface. `sockets` holds the server's end of
+ * each connection made to it, in the order they came. The server is closed when the test is over.
+ */
+async function serveOnLoopback(app: Hono) {
+  const sockets: net.Socket[] = [];
+  const server = await new Promise<Server>((resolve) => {
+    const started = serve({ fetch: app.fetch, port: 0, hostname: "127.0.0.1" }, () =>
+      resolve(started as Server),
+    );
+  });
+  server.on("connection", (socket) => sockets.push(socket));
+  cleanups.push(
+    () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  );
+  return { port: (server.address() as net.AddressInfo).port, sockets };
+}
+
+/** A client that sends a bare `GET` for the stream, and that reads the answer only if `reads`. */
+function rawClient(port: number, path: string, reads = true): net.Socket {
+  const client = net.connect(port, "127.0.0.1");
+  client.on("error", () => undefined);
+  cleanups.push(() => void client.destroy());
+  if (!reads) client.pause();
+  client.write(`GET ${path} HTTP/1.1\r\nHost: localhost\r\n\r\n`);
+  return client;
+}
+
+/** The server's end of the first connection, once there is one. */
+async function firstConnection(sockets: net.Socket[]): Promise<net.Socket> {
+  await waitFor(() => sockets.length > 0, "the connection to reach the server");
+  const [socket] = sockets;
+  if (socket === undefined) throw new Error("no connection");
+  return socket;
+}
+
+test("sse_a_client_that_leaves_while_the_route_is_starting_leaves_nothing_behind", async () => {
+  // The client goes while the route is still asking for the newest id, before there is a response
+  // for the server to cancel. What ends the stream that was about to begin is the request's own
+  // signal, which this server raises (and which `app.request` never does).
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let reachedQuery: () => void = () => undefined;
+  const reached = new Promise<void>((resolve) => {
+    reachedQuery = resolve;
+  });
+  const { db, polls } = watched({
+    before: (n) => {
+      if (n !== 1) return undefined;
+      reachedQuery();
+      return held;
+    },
+  });
+  const { port, sockets } = await serveOnLoopback(appWith({ db, maxSseStreams: 1 }));
+
+  const client = rawClient(port, "/v1/events");
+  await reached;
+  const connection = await firstConnection(sockets);
+  client.destroy();
+  if (!connection.destroyed) await once(connection, "close");
+  release();
+
+  // No poll follows, though the stream would have polled ten times in this while ...
+  await sleep(100);
+  expect(polls()).toBe(0);
+  // ... and the only place there is, is free.
+  const hangup = new AbortController();
+  cleanups.push(() => hangup.abort());
+  const next = await fetch(`http://127.0.0.1:${port}/v1/events`, { signal: hangup.signal });
+  expect(next.status).toBe(200);
+});
+
+test("sse_a_client_that_stopped_reading_loses_its_place_and_its_connection", async () => {
+  // Megabyte messages, far more than the two ends of a connection can hold between them, to a
+  // client that reads nothing: the server's write has to wait for it. The stream's loop is stuck
+  // there, so it makes no second poll, and only its lifetime lets it go. The place is free again
+  // from then on, while the client still holds its connection open; the connection is destroyed
+  // later, once the grace is over.
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  const rows = Array.from({ length: 64 }, (_, i) => ({
+    id: String(i + 1),
+    event: "committed",
+    data: { task_id: "1", pad: "x".repeat(1_000_000) },
+    height: String(1_000 + i),
+    task_id: "1",
+  }));
+  const { db, polls } = idleDb(rows);
+  const lifetimeMs = 300;
+  const closeGraceMs = 400;
+  const timing = { pollMs: 20, pingMs: 60_000, lifetimeMs, closeGraceMs };
+  const { port, sockets } = await serveOnLoopback(appWith({ db, maxSseStreams: 1 }, timing));
+
+  const started = Date.now();
+  rawClient(port, "/v1/events?since=0", false);
+  const connection = await firstConnection(sockets);
+  let destroyedAt = 0;
+  connection.once("close", () => {
+    destroyedAt = Date.now();
+  });
+
+  // Stuck in the write: one poll, and no more, however long it has been.
+  await waitFor(() => polls() >= 1, "the first poll");
+  await sleep(100);
+  expect(polls()).toBe(1);
+
+  // At the lifetime the place is free again, though the client is still there.
+  const hangup = new AbortController();
+  cleanups.push(() => hangup.abort());
+  let freedAt = 0;
+  for (let tries = 0; tries < 300 && freedAt === 0; tries++) {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/events`, { signal: hangup.signal });
+    if (res.status === 200) {
+      freedAt = Date.now();
+    } else {
+      await res.body?.cancel();
+      await sleep(10);
+    }
+  }
+  expect(freedAt).toBeGreaterThan(0);
+
+  // The connection goes later, and not before the grace is over. Were the place only freed by the
+  // connection's going, the two would come the other way round.
+  await waitFor(() => destroyedAt > 0, "the connection to be destroyed");
+  expect(freedAt).toBeLessThan(destroyedAt);
+  expect(destroyedAt - started).toBeGreaterThanOrEqual(lifetimeMs + closeGraceMs - 50);
+});
+
 // ---- Through the whole API --------------------------------------------------------------------
 
 test("sse_is_served_by_the_api_to_other_origins", async () => {
@@ -868,4 +1235,15 @@ test("sse_is_served_by_the_api_to_other_origins", async () => {
   expect(preflight.headers.get("access-control-allow-headers")?.toLowerCase()).toContain(
     "last-event-id",
   );
+});
+
+test("sse_a_refusal_can_be_read_by_the_web_app_with_its_retry_after", async () => {
+  const app = createApp({ ...deps, maxSseStreams: 0, webOrigins: ["https://tender.example"] });
+  const res = await app.request("/v1/events", { headers: { Origin: "https://tender.example" } });
+  expect(res.status).toBe(503);
+  expect(res.headers.get("retry-after")).toBe("5");
+  // A script on another origin may read only the few headers that every response allows, unless
+  // the response says it may read more.
+  const exposed = res.headers.get("access-control-expose-headers") ?? "";
+  expect(exposed.toLowerCase()).toContain("retry-after");
 });
