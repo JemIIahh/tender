@@ -79,13 +79,13 @@ export interface ApiClientOptions {
    * Where the API is served, as `PUBLIC_API_URL` has it: `https://api.example`. The client adds
    * `/v1`, so a trailing slash and a trailing `/v1` are both dropped. It is read once, by
    * `canonicalBase`, when the client is made, and a base that `canonicalBase` refuses (a query, a
-   * fragment, a user name or password, an empty path segment `//`, a repeated `/v1`, or no host)
-   * throws then, with a signer or without one. Every request and the recipient of the sign-in come
-   * from that one reading. With a `signer` it must be https, or http to this machine (`localhost`,
-   * `127.0.0.1` or `[::1]`): the signature and the bearer token travel to it. It is also whom the
-   * sign-in is signed for (the scheme, the host, the port if that is not the default, and the
-   * path), so it has to name the API as the API's own `PUBLIC_API_URL` does: an API reached under
-   * another name, an address in place of its domain, say, is refused at sign-in.
+   * fragment, a user name or password, an empty path segment `//`, a repeated `/v1`, a dot at the
+   * end of the host, or no host) throws then, with a signer or without one. Every request and the
+   * recipient of the sign-in come from that one reading. With a `signer` it must be https, or http
+   * to this machine (`localhost`, `127.0.0.1` or `[::1]`): the signature and the bearer token travel
+   * to it. It is also whom the sign-in is signed for (the scheme, the host, the port if that is not
+   * the default, and the path), so it has to name the API as the API's own `PUBLIC_API_URL` does: an
+   * API reached under another name, an address in place of its domain, say, is refused at sign-in.
    */
   baseUrl: string;
   /**
@@ -314,7 +314,9 @@ async function readCapped(res: Response, limit: number): Promise<Uint8Array | nu
  * A sign-in that times out fails the calls waiting for it, and the next call signs in again.
  *
  * An `ApiError` holds the body of the answer for the caller to read, and for a sign-in that can be
- * the bearer token. So nothing here logs a body or puts one in a message.
+ * the bearer token. So nothing here logs a body or puts one in a message. The `error` field of a
+ * body is in the message only when it is a code such as `not_found`, and never as a sentence: text
+ * a server chose must not reach an agent through an error.
  */
 export class ApiClient implements TenderApi {
   /** `canonicalBase` of the `baseUrl` given: where the routes are, and the recipient of a sign-in. */

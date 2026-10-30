@@ -21,7 +21,8 @@ export const SIGN_IN_MESSAGE = "Sign in to Tender";
  * `https://host.example/tender`. The result is its own base: this gives it back unchanged.
  *
  * Text that would give two spellings of one base, or a base that is not where the routes are, is
- * refused: a URL that is not absolute or has no host, a user name or a password, a query, a
+ * refused: a URL that is not absolute or has no host, a host that ends in a dot (`api.example.` is
+ * the server that `api.example` is, and another string), a user name or a password, a query, a
  * fragment (a bare `?` or `#` counts), an empty path segment (`//`), and a `/v1` that is still
  * there once the final one is off (`/v1/v1`, where it could not be said which is the version). Each
  * refusal names the problem and does not quote the URL, which can hold a password.
@@ -40,6 +41,13 @@ export function canonicalBase(url: string): string {
   }
   if (parsed === undefined || parsed.host === "") {
     throw new Error("the API base URL must be an absolute URL with a host");
+  }
+  // A name with its root dot reaches the server the name without it does, so one API would have two
+  // bases. The parser has done its work on the host by now (a full stop beyond ASCII, `%2E` and a
+  // dot after an IDN name have all become `.`), and it takes the dot off an IPv4 address itself.
+  // The port is not part of `hostname`, so `api.example.:8443` is seen too.
+  if (parsed.hostname.endsWith(".")) {
+    throw new Error("the API base URL must not have a host that ends in a dot");
   }
   if (parsed.username !== "" || parsed.password !== "") {
     throw new Error("the API base URL must not carry a user name or password");

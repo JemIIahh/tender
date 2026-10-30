@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { KeyPair } from "near-api-js";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { ApiClient, type ApiClientOptions, ApiTimeoutError } from "../src/index";
 
 // What the timeout comes to against a real server. A server that takes a request and never
@@ -9,13 +9,29 @@ import { ApiClient, type ApiClientOptions, ApiTimeoutError } from "../src/index"
 // client gives up on it, and the request it sent is cancelled, so that the connection does not
 // stay open on both sides. (That every method has the timeout, what it says and how it counts is
 // held in api.test.ts, over a fake `fetch`; this is the real `fetch` and the real sockets.)
+//
+// These tests run on real time, and the machine they run on may be busy: the gates of this repo run
+// several test files at once. So a request that must be answered, such as the control, the sign-in
+// and the calls that follow a timeout, has all of `TIMEOUT_MS` to be, and the first request of the
+// process, which starts `fetch` up and opens a connection, is made before any of them is timed.
 
 const ACCOUNT = "alice.test.near";
-/** Short enough not to slow the run down, long enough for a request that is answered on a busy machine. */
-const TIMEOUT_MS = 500;
+/**
+ * How long a request may take here. One that must be answered has all of it, and one that must time
+ * out takes all of it, so it is a middle: two seconds is long for a loopback request, even on a
+ * machine at a high load (a bare first `fetch` took up to 339 ms at a load average of 50 to 77, and
+ * a warm one 105 ms), and the five tests take about nine seconds together.
+ */
+const TIMEOUT_MS = 2_000;
 const HOUR = 3_600_000;
 /** The most a wait for something the server does may take. A test that needs it has failed. */
-const PATIENCE_MS = 5_000;
+const PATIENCE_MS = 10_000;
+/** The path of the request that warms a server up, which the server answers and does not note. */
+const WARM_UP = "/warm-up";
+
+// A test here waits out `TIMEOUT_MS` once, and the default of 5 s leaves a machine that is busy too
+// little room beyond that.
+vi.setConfig({ testTimeout: 15_000 });
 
 /** What a route does: answers, never answers, or answers and then stops in the middle. */
 type Mode = "answer" | "hang" | "stall";
@@ -61,6 +77,17 @@ async function until(done: () => boolean, what: string): Promise<void> {
   }
 }
 
+/**
+ * Makes the first request to `url`, the one that is not any test's. The first `fetch` of a process
+ * starts the runtime's client up and opens its first connection, and the first request to a new
+ * server opens one more: done here, they are not part of what a test times, and the connection is
+ * kept for the requests of the client that follow.
+ */
+async function warmUp(url: string): Promise<void> {
+  const res = await fetch(`${url}${WARM_UP}`);
+  await res.arrayBuffer();
+}
+
 /** What a call rejected with: the test fails if it resolved. */
 async function rejection(promise: Promise<unknown>): Promise<unknown> {
   try {
@@ -75,6 +102,11 @@ async function rejection(promise: Promise<unknown>): Promise<unknown> {
 async function serveApi(): Promise<Api> {
   const api: Api = { url: "", hits: [], modes: new Map() };
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    if (req.url === WARM_UP) {
+      req.resume();
+      res.writeHead(204).end();
+      return;
+    }
     const hit: Hit = { method: req.method ?? "", url: req.url ?? "", closed: false };
     res.on("close", () => {
       hit.closed = true;
@@ -124,6 +156,7 @@ async function serveApi(): Promise<Api> {
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   api.url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  await warmUp(api.url);
   return api;
 }
 
@@ -168,11 +201,13 @@ test("an_answer_that_stops_in_the_middle_is_given_up_on_too", async () => {
   api.modes.set("GET /v1/tasks", "stall");
   api.modes.set(`GET /v1/blobs/${"ab".repeat(32)}`, "stall");
 
-  const read = await rejection(client.listTasks());
+  // Both at once, so that the test waits for one timeout and not for two.
+  const [read, blob] = await Promise.all([
+    rejection(client.listTasks()),
+    rejection(client.getBlob("ab".repeat(32))),
+  ]);
   expect(read).toBeInstanceOf(ApiTimeoutError);
   expect((read as Error).message).toBe(`ApiClient.listTasks timed out after ${TIMEOUT_MS} ms`);
-
-  const blob = await rejection(client.getBlob("ab".repeat(32)));
   expect(blob).toBeInstanceOf(ApiTimeoutError);
   expect((blob as Error).message).toBe(`ApiClient.getBlob timed out after ${TIMEOUT_MS} ms`);
 

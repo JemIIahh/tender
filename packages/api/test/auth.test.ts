@@ -491,16 +491,18 @@ test("a_signature_for_another_path_of_the_same_host_is_refused", async () => {
 });
 
 test("a_public_url_that_is_no_base_is_a_fault_and_stores_no_challenge", async () => {
-  // `canonicalBase` takes no URL that has no host, or that would be read two ways: a user, a query,
-  // a fragment, an empty path segment or a repeated `/v1`. There is no one to sign for. That is the
-  // deployment's fault, and so a 500 that is seen, and not a challenge for a recipient that is
-  // nothing or that a client reads another way.
+  // `canonicalBase` takes no URL that has no host, or that would be read two ways: a host with a dot
+  // at the end, a user, a query, a fragment, an empty path segment or a repeated `/v1`. There is no
+  // one to sign for. That is the deployment's fault, and so a 500 that is seen, and not a challenge
+  // for a recipient that is nothing or that a client reads another way.
   const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
   const publicUrls = [
     "",
     "api.test",
     "/v1",
     "file:///api",
+    "https://api.test.",
+    "https://api.test.:8443/tender",
     "https://api.test/v1/v1",
     "https://api.test//",
     "https://api.test/tender//v1",
@@ -531,7 +533,12 @@ test("a_public_url_that_is_no_base_fails_a_verify_too_and_spends_nothing", async
   const ch = await challenge(appWith());
   const body = await signChallenge(KeyPair.fromRandom("ed25519"), ch);
 
-  for (const publicUrl of ["https://api.test/v1/v1", "https://api.test//", "https://api.test/?x"]) {
+  for (const publicUrl of [
+    "https://api.test/v1/v1",
+    "https://api.test//",
+    "https://api.test/?x",
+    "https://api.test.",
+  ]) {
     const failed = await post<ErrorBody>(appWith({ publicUrl }), "/v1/auth/verify", body);
     expect(failed.status, publicUrl).toBe(500);
     expect(failed.body, publicUrl).toEqual({ error: "internal", message: "internal error" });

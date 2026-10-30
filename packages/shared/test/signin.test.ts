@@ -9,6 +9,7 @@ import { canonicalBase, SIGN_IN_MESSAGE } from "../src/index";
 /** What `canonicalBase` says when it refuses a URL: the problem, and nothing of the URL. */
 const REFUSED = {
   noHost: "the API base URL must be an absolute URL with a host",
+  rootDot: "the API base URL must not have a host that ends in a dot",
   user: "the API base URL must not carry a user name or password",
   query: "the API base URL must not carry a query",
   fragment: "the API base URL must not carry a fragment",
@@ -71,11 +72,13 @@ const BASES: Array<[string, string]> = [
   ["https://host.example/ten der", "https://host.example/ten%20der"],
   // The path is what tells two APIs of one host apart.
   ["https://host.example/other", "https://host.example/other"],
-  // A name with its root dot is another name.
-  ["https://api.example./", "https://api.example."],
   ["http://localhost", "http://localhost"],
   ["http://localhost:8787", "http://localhost:8787"],
   ["http://127.0.0.1:3000/v1", "http://127.0.0.1:3000"],
+  // A dot at the end of an IPv4 address is the parser's to take off: it is the address, not a name
+  // with its root dot (which is refused, below).
+  ["http://127.0.0.1.:8787/", "http://127.0.0.1:8787"],
+  ["https://0x7f.1.", "https://127.0.0.1"],
   // An address of IPv6 in brackets, in its short form.
   ["http://[::1]:8787", "http://[::1]:8787"],
   ["http://[0:0:0:0:0:0:0:1]", "http://[::1]"],
@@ -108,6 +111,8 @@ test("a_base_is_its_own_base_and_has_nothing_that_reads_two_ways", () => {
     const afterScheme = base.slice(base.indexOf("//") + 2);
     expect(afterScheme, url).not.toMatch(/[?#@]|\/\//);
     expect(afterScheme, url).not.toMatch(/\/$|\/v1$/);
+    // Nor does the host end in a dot, which would be a second spelling of the host without it.
+    expect(new URL(base).hostname, url).not.toMatch(/\.$/);
   }
 });
 
@@ -180,6 +185,25 @@ test("a_url_that_would_be_read_two_ways_is_refused_and_the_problem_is_named", ()
     ["https://host.example/a//b", REFUSED.emptySegment],
     ["https://host.example/..//x", REFUSED.emptySegment],
     ["tender://host.example//x", REFUSED.emptySegment],
+    // A name with its root dot: the same server as without it, so two bases for one API.
+    ["https://api.example./", REFUSED.rootDot],
+    ["https://api.example.", REFUSED.rootDot],
+    ["https://api.example.:8443/tender", REFUSED.rootDot],
+    ["https://API.Example./tender/v1/", REFUSED.rootDot],
+    ["HTTPS://API.EXAMPLE.:443/", REFUSED.rootDot],
+    ["http://localhost.", REFUSED.rootDot],
+    ["http://localhost.:8787", REFUSED.rootDot],
+    ["https://v1./v1", REFUSED.rootDot],
+    ["https://api.example..", REFUSED.rootDot],
+    ["https://.", REFUSED.rootDot],
+    ["tender://host.example./x", REFUSED.rootDot],
+    // The parser has done its work on the host before this looks: a name in letters beyond ASCII,
+    // a full stop beyond ASCII and a percent-encoded dot all end in the same dot.
+    ["https://bücher.example.", REFUSED.rootDot],
+    ["https://xn--bcher-kva.example./x", REFUSED.rootDot],
+    ["https://api.example\u3002", REFUSED.rootDot],
+    ["https://api.example%2E/x", REFUSED.rootDot],
+    ["https://api.example%2e", REFUSED.rootDot],
     // A query, even an empty one.
     ["https://host.example/tender?x=1", REFUSED.query],
     ["https://host.example?x=1", REFUSED.query],
@@ -201,8 +225,13 @@ test("a_url_that_would_be_read_two_ways_is_refused_and_the_problem_is_named", ()
     ["https://someone:@host.example/tender", REFUSED.user],
     ["https://host.example:443@other.example/tender", REFUSED.user],
     ["https://host.example:secret@other.example", REFUSED.user],
-    // More than one problem: the user is named first, then the query, then the fragment, then an
-    // empty segment, and the repeat last.
+    // More than one problem: the host is named first (no host, then a dot at the end of it), then the
+    // user, then the query, then the fragment, then an empty segment, and the repeat last.
+    ["https://someone@api.example./x?y#z", REFUSED.rootDot],
+    ["https://api.example./x?y", REFUSED.rootDot],
+    ["https://api.example./x#z", REFUSED.rootDot],
+    ["https://api.example.//x", REFUSED.rootDot],
+    ["https://api.example./v1/v1", REFUSED.rootDot],
     ["https://someone@host.example/x?y#z", REFUSED.user],
     ["https://host.example/x?y#z", REFUSED.query],
     ["https://host.example//x#z", REFUSED.fragment],
@@ -253,6 +282,45 @@ test("whatever_makes_a_base_read_two_ways_is_refused_whichever_base_it_is_added_
       const url = `${scheme}//${user}${rest}`;
       expect(refusalOf(url).message, url).toBe(REFUSED.user);
     }
+  }
+});
+
+test("a_name_with_its_root_dot_is_refused_whichever_base_it_is_written_into", () => {
+  // The review's pair: `https://api.example.` and `https://api.example` reach one server and were
+  // two bases. Only one is a base now, the one without the dot, wherever the dot would go.
+  const names = [
+    "https://api.example",
+    "https://host.example/tender",
+    "https://host.example:8443/a/b",
+    "http://localhost",
+    "http://localhost:8787/v1",
+    "https://v1",
+    "https://bücher.example/Tender",
+  ];
+  for (const name of names) {
+    const { protocol, hostname, port, pathname } = new URL(name);
+    const rest = `${port === "" ? "" : `:${port}`}${pathname === "/" ? "" : pathname}`;
+    const base = canonicalBase(name);
+    // The name is a base, and so is any spelling of it that does not have the dot.
+    expect(canonicalBase(`${protocol}//${hostname}${rest}`), name).toBe(base);
+    // With the dot, in front of the port, the path, a trailing slash or nothing: refused.
+    for (const dotted of [
+      `${protocol}//${hostname}.${rest}`,
+      `${protocol}//${hostname}.${rest}/`,
+      `${protocol}//${hostname}.${rest}/v1`,
+      `${protocol}//${hostname.toUpperCase()}.${rest}`,
+      `${protocol}//${hostname}..${rest}`,
+    ]) {
+      expect(refusalOf(dotted).message, dotted).toBe(REFUSED.rootDot);
+    }
+  }
+  // An address is not a name: IPv4 with a dot at the end is the address, which the parser says, and
+  // there is one base for it. (IPv6 has no spelling with one.)
+  for (const address of ["http://127.0.0.1:8787", "https://192.0.2.7/tender", "http://127.0.0.1"]) {
+    const base = canonicalBase(address);
+    const { protocol, hostname, port, pathname } = new URL(address);
+    const rest = `${port === "" ? "" : `:${port}`}${pathname === "/" ? "" : pathname}`;
+    expect(canonicalBase(`${protocol}//${hostname}.${rest}`), address).toBe(base);
   }
 });
 
@@ -380,6 +448,7 @@ test("any_spelling_is_refused_or_is_one_base_that_is_called_and_signed_for", () 
     expect(afterScheme, url).not.toMatch(/[?#@\s]/);
     expect(afterScheme, url).not.toContain("//");
     expect(afterScheme, url).not.toMatch(/\/$|\/v1$/);
+    expect(new URL(base).hostname, url).not.toMatch(/\.$/);
     // The parser moves nothing of `<base>/v1/x`: it is called at that address and no other.
     expect(new URL(`${base}/v1/x`).href, url).toBe(`${base}/v1/x`);
     // The scheme and the host in capitals are the same base.
@@ -401,6 +470,7 @@ test("a_refusal_names_the_problem_and_does_not_quote_the_url", () => {
     "https://secret.example/hunter2//x",
     "https://secret.example/v1/hunter2/v1/v1",
     "https://someone:hunter2@",
+    "https://hunter2.secret.example./x",
     "hunter2.secret.example",
   ];
   const known = Object.values(REFUSED);
