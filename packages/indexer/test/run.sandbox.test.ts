@@ -164,10 +164,11 @@ test("indexer_follows_local_chain_end_to_end", async () => {
       outcomeFromEvent(taskId, view.outcome, chain.accounts.judge.accountId),
     );
 
-    // Both entries are revealed, as the chain has them.
+    // Both entries are revealed, as the chain has them, in its entrant order. Alice and bob commit
+    // side by side, so either can come first.
     const entries = await entriesOf(db, taskId);
     expect(entries).toEqual(await reader.getAllEntries(taskId));
-    expect(entries.map((entry) => entry.uri)).toEqual([
+    expect(entries.map((entry) => entry.uri).sort()).toEqual([
       `skeleton://${chain.accounts.alice.accountId}`,
       `skeleton://${chain.accounts.bob.accountId}`,
     ]);
