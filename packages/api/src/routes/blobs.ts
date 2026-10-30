@@ -87,6 +87,7 @@ const HeldoutUploadSchema = z.strictObject({
  *
  * - `POST /v1/blobs` (signed in): stores a brief, criteria, scorecard or profile, which anyone may
  *   read at once, or an entrant's result, which nobody may read before the task's reveal deadline.
+ *   Bytes that are the result of two tasks wait for the later of the two deadlines.
  * - `POST /v1/heldout` (signed in): stores a held-out document, which nobody may read.
  * - `GET /v1/blobs/:sha256`: the bytes of a blob that may be read.
  * - `GET /v1/scorecards/:task_id`: the scorecard the task was settled with.
@@ -124,6 +125,10 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     // Its first uploader may have stored it as private, which keeps the indexer from reading it.
     // The one uploading it now holds the bytes, so making it public gives nothing away.
     if (blob.isPublic && !stored.isPublic) await setBlobPublic(deps.db, sha256, true);
+    // The same bytes may be the result of another task than the one that stored them first.
+    if (blob.kind === "result" && blob.taskId !== undefined) {
+      await bindToLatestDeadline(deps.db, sha256, blob.taskId);
+    }
 
     const body: BlobUploadResponse = { sha256, uri: `${deps.publicUrl}/v1/blobs/${sha256}` };
     return c.json(body);
@@ -335,11 +340,35 @@ async function store(db: Db, blob: NewBlob): Promise<{ sha256: string; stored: S
   return { sha256, stored };
 }
 
+/**
+ * Binds the result stored under `sha256` to the one of its task and `taskId` that reveals later.
+ * The same bytes can be the result of more than one task, but they are one row with one task, and
+ * that task's reveal deadline says when they may be read. They must not be read before the deadline
+ * of any task they were sent for, so a send for a task that reveals later moves the row there, and
+ * a send for one that reveals earlier, or at the same time, leaves it where it is. The comparison
+ * is in the statement, so two sends that race cannot undo each other: Postgres checks it again
+ * against the row as the other one left it. A row bound to no known task has no deadline to move
+ * later and stays unserved. Nothing else of the row changes. The sender has an entry on `taskId`:
+ * `blobOf` has checked.
+ */
+async function bindToLatestDeadline(db: Db, sha256: string, taskId: bigint): Promise<void> {
+  await db.query(
+    `update blobs
+        set task_id = $2::numeric
+      where sha256 = $1
+        and kind = 'result'
+        and (select reveal_deadline from tasks where tasks.id = $2::numeric)
+          > (select reveal_deadline from tasks where tasks.id = blobs.task_id)`,
+    [sha256, taskId],
+  );
+}
+
 // ---- Reads ------------------------------------------------------------------------------------
 
 /**
- * Whether the API may serve `blob`. A result waits for the reveal deadline of its task (the
- * contract's rule, `now >= reveal_deadline`), and is never served without a task that has one.
+ * Whether the API may serve `blob`. A result waits for the reveal deadline of its task, the latest
+ * of those it was sent for (the contract's rule, `now >= reveal_deadline`), and is never served
+ * without a task that has one.
  * Anything else is served while it is public: a held-out document is not, until it is made so.
  */
 async function mayServe(deps: ApiDeps, blob: StoredBlob): Promise<boolean> {

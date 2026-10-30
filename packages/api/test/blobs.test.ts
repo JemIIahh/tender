@@ -269,6 +269,14 @@ test("result_is_served_only_through_its_own_task", async () => {
   expect((await get(`/v1/blobs/${early.body.sha256}`)).status).toBe(200);
   expect((await get(`/v1/blobs/${noTask}`)).status).toBe(404);
   expect((await get(`/v1/blobs/${lostTask}`)).status).toBe(404);
+
+  // Sending their bytes as the result of a task does not give them a deadline either. A row is moved
+  // to a later deadline, and one bound to no known task has none to move from.
+  for (const text of ["no task", "lost task"]) {
+    expect((await post("/v1/blobs", resultBody(text, "1"), alice)).status, text).toBe(200);
+  }
+  expect((await get(`/v1/blobs/${noTask}`)).status).toBe(404);
+  expect((await get(`/v1/blobs/${lostTask}`)).status).toBe(404);
 });
 
 test("upload_too_large_413", async () => {
@@ -901,33 +909,60 @@ test("brief_and_profile_are_stored_public", async () => {
   expect((await get(`/v1/blobs/${hash}`)).bytes).toEqual(draft);
 });
 
-test("result_first_writer_governs_when_it_is_served", async () => {
+test("result_visibility_never_earlier_than_any_uploaders_deadline", async () => {
   await seedLifecycle(deps.db);
-  // Task 2 reveals 1000 seconds after task 1.
+  // Task 2 reveals 1000 seconds after task 1. Alice entered task 1 and carol entered task 2.
   const late = REVEAL_DEADLINE + 1000n * SECOND;
   await apply(
     taskLine(2, {
       reveal_deadline: late.toString(),
       pick_deadline: (late + 60n * SECOND).toString(),
+      fallback_deadline: (late + 120n * SECOND).toString(),
     }),
     eventLine("committed", { task_id: "2", account: carol, block_height: "130" }),
   );
 
-  // Alice and carol send the same bytes for their tasks. The blob is one row, and it is task 1's.
-  const first = await post("/v1/blobs", resultBody("42", "1"), alice);
-  const second = await post("/v1/blobs", resultBody("42", "2"), carol);
-  expect(second.status).toBe(200);
-  expect(second.body).toEqual(first.body);
-  expect(await rowOf(first.body.sha256)).toMatchObject({
-    kind: "result",
-    task_id: "1",
-    uploader: alice,
-    is_public: false,
-  });
-  nowNs = REVEAL_DEADLINE - 1n;
-  expect((await get(`/v1/blobs/${first.body.sha256}`)).status).toBe(404);
+  // The same bytes sent for both tasks are one row. Whichever task they were sent for first, they
+  // wait for the later deadline, and nothing else about the row changes.
+  const forTask1 = { task: "1", by: alice };
+  const forTask2 = { task: "2", by: carol };
+  const orders = [
+    { name: "task 1 first", first: forTask1, second: forTask2 },
+    { name: "task 2 first", first: forTask2, second: forTask1 },
+  ];
+  for (const { name, first, second } of orders) {
+    const text = `the same answer, ${name}`;
+    const sent = await post("/v1/blobs", resultBody(text, first.task), first.by);
+    const again = await post("/v1/blobs", resultBody(text, second.task), second.by);
+    expect(again.status, name).toBe(200);
+    expect(again.body, name).toEqual(sent.body);
+    expect(await rowOf(sent.body.sha256), name).toMatchObject({
+      kind: "result",
+      content_type: "text/plain",
+      task_id: "2",
+      uploader: first.by,
+      is_public: false,
+    });
+
+    const path = `/v1/blobs/${sent.body.sha256}`;
+    for (const at of [TEST_NOW, REVEAL_DEADLINE, late - 1n]) {
+      nowNs = at;
+      expect((await get(path)).status, `${name} at ${at}`).toBe(404);
+    }
+    nowNs = late;
+    const shown = await get(path);
+    expect(shown.status, name).toBe(200);
+    expect(shown.text(), name).toBe(text);
+  }
+
+  // A result is sent for a task by its entrants only, so no one else can hold a result back with a
+  // task of their own: alice did not enter task 2, she is refused, and the row stays task 1's.
+  const mine = await post("/v1/blobs", resultBody("alice only", "1"), alice);
+  const refused = await post<ErrorBody>("/v1/blobs", resultBody("alice only", "2"), alice);
+  expect(refused.status).toBe(403);
+  expect(await rowOf(mine.body.sha256)).toMatchObject({ task_id: "1" });
   nowNs = REVEAL_DEADLINE;
-  expect((await get(`/v1/blobs/${first.body.sha256}`)).status).toBe(200);
+  expect((await get(`/v1/blobs/${mine.body.sha256}`)).status).toBe(200);
 });
 
 test("upload_envelope_is_checked", async () => {
