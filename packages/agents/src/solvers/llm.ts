@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import type { Brief, PublicCriteria } from "@tender/shared";
 import OpenAI from "openai";
 import type { Solver, TaskContext } from "../types";
@@ -14,6 +15,11 @@ import { answerLimit, canAnswer, checkAnswer, entryOf } from "./shape";
 //   as the runner's own limit would leave it (the runner's wait cannot cancel a solver), and a
 //   failed call is not tried again: the runner asks a solver once for a task in a run, so that a
 //   failing task cannot cost a model call every tick, and a retry here would ask twice.
+// - At most `maxCallsPerHour` requests in any hour, 30 unless told otherwise. The key's credits are
+//   money, and every open task of an agent's tags costs a call, so a poster who opens many tasks
+//   would spend them. Over the limit the solver makes no request and gives no answer (null), and
+//   warns once an hour. A request counts when it is made, also when it fails or runs out of time (the
+//   model may have charged for it); a task declined before it is asked does not.
 // - The prompt holds the task and nothing else: the brief's words, the answer format and its limit,
 //   and the public criteria with their examples. It holds no key, no variable of the environment,
 //   no account, no hash and no URL of the task's own record.
@@ -28,6 +34,10 @@ import { answerLimit, canAnswer, checkAnswer, entryOf } from "./shape";
 const DEFAULT_TIMEOUT_MS = 90_000;
 /** The longest wait `setTimeout` keeps: it runs anything above this after 1 ms instead. */
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+/** How many requests the solver makes in an hour, by default. */
+const DEFAULT_MAX_CALLS_PER_HOUR = 30;
+/** How long a request counts against the hour's limit. */
+const HOUR_MS = 3_600_000;
 /**
  * How many tokens the model may write in one answer, thinking included. A bound on what a question
  * can cost whatever the model does; an answer it cut short is no answer (`contentOf`).
@@ -55,6 +65,20 @@ export interface LlmSolverOptions {
    * with `TIMEOUT`. Default: 90 s, under the runner's 120 s.
    */
   timeoutMs?: number;
+  /**
+   * The most requests to the model in any hour, a whole number from 1. A task that would be over it
+   * gets no request and no answer (null). An hour slides: a request counts until an hour after it
+   * was made, whether it worked or not. Default: 30.
+   */
+  maxCallsPerHour?: number;
+  /** Receives the solver's warnings, one line each. Default: `console.log`, as the runner's. */
+  log?: (line: string) => void;
+  /**
+   * The clock the hour is counted by, in milliseconds from any starting point. Default: a monotonic
+   * clock, which a change of the system's time cannot move: that would lift the limit, or hold the
+   * solver back for as long as the change was.
+   */
+  now?: () => number;
 }
 
 /** Why a model call failed. The code is what a log line shows of it. */
@@ -214,13 +238,17 @@ function isHttpUrl(value: string): boolean {
  * the wrong option. Throws a `TypeError` or `RangeError` naming the option.
  *
  * `solve` returns the answer as bytes, or null when the task is one it cannot answer (`canAnswer`),
- * or too large to send, or the model's reply is no answer in the brief's format (`checkAnswer`). It
- * throws an `LlmError` when the call fails.
+ * or too large to send, or the hour's requests are used up (`maxCallsPerHour`), or the model's reply
+ * is no answer in the brief's format (`checkAnswer`). It throws an `LlmError` when the call fails.
  */
 export function createLlmSolver(o: LlmSolverOptions): Solver {
   const timeoutMs = o.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_TIMEOUT_MS) {
     throw new RangeError(`createLlmSolver: timeoutMs must be from 1 to ${MAX_TIMEOUT_MS}`);
+  }
+  const maxCalls = o.maxCallsPerHour ?? DEFAULT_MAX_CALLS_PER_HOUR;
+  if (!Number.isSafeInteger(maxCalls) || maxCalls < 1) {
+    throw new RangeError("createLlmSolver: maxCallsPerHour must be a whole number from 1");
   }
   if (!isHttpUrl(o.baseUrl)) {
     throw new TypeError("createLlmSolver: baseUrl must be an http(s) URL");
@@ -253,6 +281,38 @@ export function createLlmSolver(o: LlmSolverOptions): Solver {
     // Its own log lines would quote requests, which hold a stranger's task and the caller's headers.
     logLevel: "off",
   });
+
+  const now = o.now ?? (() => performance.now());
+  const log = o.log ?? console.log;
+  /** When each request of the last hour was made, the oldest first: never more than `maxCalls`. */
+  const calls: number[] = [];
+  /** When the limit last warned. */
+  let warnedAt: number | undefined;
+
+  /**
+   * Takes one of the hour's requests if one is left, and says whether it did. The hour slides, so
+   * that no hour at all holds more than `maxCalls` requests; a fixed grid of hours would let twice as
+   * many through round the edge between two. The count and the taking are one step with no wait in
+   * it, so two questions at once cannot both take the last one. At the limit it warns, once an hour.
+   */
+  function takeCall(): boolean {
+    const at = now();
+    const live = calls.findIndex((made) => made > at - HOUR_MS);
+    calls.splice(0, live === -1 ? calls.length : live);
+    if (calls.length < maxCalls) {
+      calls.push(at);
+      return true;
+    }
+    if (warnedAt === undefined || at - warnedAt >= HOUR_MS) {
+      warnedAt = at;
+      const minutes = Math.max(1, Math.ceil(((calls[0] ?? at) + HOUR_MS - at) / 60_000));
+      log(
+        `WARN llm solver: the limit of ${maxCalls} model calls an hour is reached, so it asks ` +
+          `the model nothing and answers no task for ${minutes} more min`,
+      );
+    }
+    return false;
+  }
 
   /** What a failed call is called: the cause, and nothing that the call was made with. */
   function failureOf(error: unknown, timedOut: boolean): LlmError {
@@ -300,6 +360,9 @@ export function createLlmSolver(o: LlmSolverOptions): Solver {
       if (!canAnswer(ctx.brief, ctx.criteria)) return null;
       const prompt = buildPrompt(ctx);
       if (prompt === null) return null;
+      // The last way to say no without asking: a task declined above neither uses a request of the
+      // hour nor warns of the limit.
+      if (!takeCall()) return null;
       const reply = await ask(prompt);
       return reply === null ? null : checkAnswer(reply, ctx.brief, ctx.criteria);
     },

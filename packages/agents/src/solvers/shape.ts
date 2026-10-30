@@ -6,7 +6,7 @@ import { type Brief, MAX_RESULT_BYTES, type PublicCriteria } from "@tender/share
 // the format would enter a task with work the Judge scores 0, at the cost of a commit and a reveal,
 // so the LLM solver checks its answer first and gives none (null) when the check fails.
 //
-// The rules are the Judge's own for each format and no more: `regex_json` is what `scoreRegexCases`
+// The rules are the Judge's own for each format or stricter: `regex_json` is what `scoreRegexCases`
 // reads, `json` what `scoreJsonSchema` parses, and `code_js` the script that `scoreTests` puts a call
 // after. What the model wrote is data: nothing here runs it. The answer that passes is the model's
 // own text, byte for byte, apart from the code fence and the space around it (a number written
@@ -30,6 +30,12 @@ const LONE_SURROGATE = /\p{Surrogate}/u;
 const THINK_BLOCK = /^\s*<think>[\s\S]*?<\/think>\s*/;
 /** The start of such a block, whether it is closed or not. */
 const THINK_OPEN = /^\s*<think>/;
+/**
+ * How many bytes a reply may have beyond the limit of the answer in it: room for the thinking that
+ * a reasoning model sends first, which is not held to that limit. A reply with more is dropped
+ * unread (`checkAnswer`), as a server can make a reply as large as it likes.
+ */
+const MAX_THINKING_BYTES = 1_048_576;
 /** A function name that can be checked for: a plain identifier, in ASCII. */
 const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 /** A reply that is one fenced block and nothing else: the fence, its body, the closing fence. */
@@ -56,9 +62,17 @@ export function entryOf(brief: Brief, criteria: PublicCriteria): string | undefi
     : undefined;
 }
 
-/** Whether `name` is one that `definesName` can look for. */
+/**
+ * Whether `name` is one that `definesName` can look for: a plain identifier that `let` accepts in a
+ * script of either kind. An answer may open with `"use strict"`, and then a `let` of `eval`,
+ * `arguments`, `public`, `yield` or `interface` (names that only strict code reserves) is an error
+ * of its own, which `definesName` would take for the name being declared already, so that a script
+ * that never defines it would pass.
+ */
 function checkable(name: string): boolean {
-  return IDENTIFIER.test(name) && compiles(`let ${name};`);
+  return (
+    IDENTIFIER.test(name) && compiles(`let ${name};`) && compiles(`"use strict"; let ${name};`)
+  );
 }
 
 /**
@@ -66,10 +80,11 @@ function checkable(name: string): boolean {
  * `const`, a class or a destructuring, which is how the Judge's call `(name)(input)` finds it.
  *
  * It asks the parser and runs nothing: a `let name;` put after the script is a SyntaxError (an early
- * error, found when the script is compiled) exactly when the script has declared `name` already.
- * So a mention in a comment or a string is no declaration, and neither is a function of that name
- * inside another function, or a method of an object. What it cannot see is a definition made by
- * assignment (`globalThis.name = ...`), which the prompt does not ask for.
+ * error, found when the script is compiled) exactly when the script has declared `name` already,
+ * for a `name` that `checkable` has passed. So a mention in a comment or a string is no declaration,
+ * and neither is a function of that name inside another function, or a method of an object. What it
+ * cannot see is a definition made by assignment (`globalThis.name = ...`), which the prompt does not
+ * ask for.
  */
 function definesName(source: string, name: string): boolean {
   return !compiles(`${source}\n;let ${name};`);
@@ -177,13 +192,17 @@ function codeAnswer(text: string, entry: string | undefined): string | null {
  * - `code_js`: JavaScript that compiles as a script (no `import`, `export` or top-level `return`)
  *   and, for `tests` criteria, declares the function `entry` they name, trimmed. It is never run.
  *
- * And in every format the answer is at most `answerLimit(brief)` bytes of UTF-8.
+ * And in every format the answer is at most `answerLimit(brief)` bytes of UTF-8. A reply of more
+ * than that and 1 MiB, the room for the thinking, is no answer, and none of it is read.
  */
 export function checkAnswer(
   reply: string,
   brief: Brief,
   criteria: PublicCriteria,
 ): Uint8Array | null {
+  // The server decides how large the reply is. Past the answer's limit and the room for thinking,
+  // the reply is dropped before any of the checks below reads it.
+  if (Buffer.byteLength(reply) > answerLimit(brief) + MAX_THINKING_BYTES) return null;
   // The thinking is not the answer: it is not checked, and it does not count against the limit.
   const message = withoutThinking(reply);
   if (message === null) return null;

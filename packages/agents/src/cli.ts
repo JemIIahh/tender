@@ -18,6 +18,10 @@ import type { Solver } from "./types";
 //
 //   pnpm exec tsx packages/agents/bin/run-agent.ts --agent analyst --solver llm --network testnet
 //
+// The model costs credits, so the llm solver asks it at most 30 times an hour. The flag
+// `--max-llm-calls-per-hour N` sets another limit (`maxCallsPerHour` of `createLlmSolver`); the
+// scripted solvers cost nothing and refuse it.
+//
 // What it reads. The variables come from `.env` and `.env.deploy.<network>` in the repository root,
 // the network's winning, and the process's own variables win over both, so that a host's settings
 // override the files (`pnpm serve` reads its environment the same way):
@@ -49,7 +53,8 @@ type SolverName = (typeof SOLVERS)[number];
 
 const USAGE =
   `usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent ${AGENT_NAMES.join("|")} ` +
-  `--solver ${SOLVERS.join("|")} --network ${Object.keys(NETWORKS).join("|")}`;
+  `--solver ${SOLVERS.join("|")} --network ${Object.keys(NETWORKS).join("|")} ` +
+  "[--max-llm-calls-per-hour N]";
 
 /** A failure whose message is the command line's own and safe to print: it holds no value of the environment. */
 export class CliError extends Error {
@@ -59,20 +64,38 @@ export class CliError extends Error {
   }
 }
 
-/** A value for a message: quoted, and cut short so that a long one cannot flood a terminal. */
-const shown = (value: unknown) => JSON.stringify(String(value).slice(0, 40));
-
 // ---- The command line -------------------------------------------------------------------------
 
 export interface CliArgs {
   agent: AgentConfig;
   solver: SolverName;
   network: NetworkId;
+  /** The llm solver's limit on requests to the model, when the flag sets one. */
+  maxLlmCallsPerHour?: number;
 }
 
-/** The flags, checked. Throws a `CliError` that says what is wrong and shows the usage. */
+/**
+ * The call limit of a flag: digits, a whole number from 1. Why a value is refused is not said, as
+ * it can be anything that was pasted.
+ */
+function asCallLimit(value: string): number | undefined {
+  if (!/^[0-9]+$/.test(value)) return undefined;
+  const limit = Number(value);
+  return Number.isSafeInteger(limit) && limit >= 1 ? limit : undefined;
+}
+
+/**
+ * The flags, checked. Throws a `CliError` that says what is wrong and shows the usage. It never
+ * shows a value of the command line: an unknown name, or a number it cannot read, can be a key that
+ * was pasted into the wrong flag, and the usage lists what is known.
+ */
 export function parseCli(args: readonly string[]): CliArgs {
-  let values: { agent?: string; solver?: string; network?: string };
+  let values: {
+    agent?: string;
+    solver?: string;
+    network?: string;
+    "max-llm-calls-per-hour"?: string;
+  };
   try {
     values = parseArgs({
       args: [...args],
@@ -80,6 +103,7 @@ export function parseCli(args: readonly string[]): CliArgs {
         agent: { type: "string" },
         solver: { type: "string" },
         network: { type: "string" },
+        "max-llm-calls-per-hour": { type: "string" },
       },
     }).values;
   } catch (error) {
@@ -96,20 +120,29 @@ export function parseCli(args: readonly string[]): CliArgs {
     throw new CliError(`missing ${missing.join(", ")}\n${USAGE}`);
   }
   if (!isAgentName(agent)) {
-    throw new CliError(
-      `unknown agent ${shown(agent)}: use one of ${AGENT_NAMES.join(", ")}\n${USAGE}`,
-    );
+    throw new CliError(`unknown agent: use one of ${AGENT_NAMES.join(", ")}\n${USAGE}`);
   }
   if (!(SOLVERS as readonly string[]).includes(solver)) {
-    throw new CliError(
-      `unknown solver ${shown(solver)}: use one of ${SOLVERS.join(", ")}\n${USAGE}`,
-    );
+    throw new CliError(`unknown solver: use one of ${SOLVERS.join(", ")}\n${USAGE}`);
   }
   if (!Object.hasOwn(NETWORKS, network)) {
-    const known = Object.keys(NETWORKS).join(", ");
-    throw new CliError(`unknown network ${shown(network)}: use one of ${known}\n${USAGE}`);
+    throw new CliError(`unknown network: use one of ${Object.keys(NETWORKS).join(", ")}\n${USAGE}`);
   }
-  return { agent: AGENTS[agent], solver: solver as SolverName, network: network as NetworkId };
+
+  const flagged = values["max-llm-calls-per-hour"];
+  const maxLlmCallsPerHour = flagged === undefined ? undefined : asCallLimit(flagged);
+  if (flagged !== undefined && maxLlmCallsPerHour === undefined) {
+    throw new CliError(`--max-llm-calls-per-hour must be a whole number from 1\n${USAGE}`);
+  }
+  if (flagged !== undefined && solver !== "llm") {
+    throw new CliError(`--max-llm-calls-per-hour is for --solver llm only\n${USAGE}`);
+  }
+  return {
+    agent: AGENTS[agent],
+    solver: solver as SolverName,
+    network: network as NetworkId,
+    ...(maxLlmCallsPerHour !== undefined && { maxLlmCallsPerHour }),
+  };
 }
 
 // ---- The environment --------------------------------------------------------------------------
@@ -361,12 +394,13 @@ export async function checkAgentKey(
 /** The client the agent signs with, and the chain read that checks its key. */
 export type CliClient = AgentChain & KeyReader;
 
-function makeSolver(config: RunConfig, seedsDir: string): Solver {
+function makeSolver(config: RunConfig, seedsDir: string, log: (line: string) => void): Solver {
   switch (config.solver) {
     case "llm": {
-      // `readRunConfig` requires the three when the solver is `llm`.
+      // `readRunConfig` requires the three when the solver is `llm`. The solver's warnings go where
+      // the agent's lines do.
       if (config.llm === undefined) throw new CliError("the llm solver needs LLM_* settings");
-      return createLlmSolver(config.llm);
+      return createLlmSolver({ ...config.llm, maxCallsPerHour: config.maxLlmCallsPerHour, log });
     }
     case "offline":
       return createOfflineSolver(seedsDir);
@@ -454,7 +488,7 @@ export async function main(args: readonly string[], options: CliOptions): Promis
       await checkAgentKey(client, config, options.keyCheckMs);
     }
     const api = options.createApi(config);
-    const solver = makeSolver(config, options.seedsDir ?? join(REPO_ROOT, "seeds"));
+    const solver = makeSolver(config, options.seedsDir ?? join(REPO_ROOT, "seeds"), out);
     const state = createStateStore(
       defaultStateDir(config.network, config.signer.accountId, options.home),
     );

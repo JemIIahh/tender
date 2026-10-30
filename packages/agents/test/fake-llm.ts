@@ -23,14 +23,17 @@ export interface RecordedRequest {
  *   model stopped, such as `length` (null to leave it out, as some servers do);
  * - `{ status, body }`: an HTTP failure, with an error body;
  * - `{ raw }`: a 200 whose JSON is `raw`, for an answer that is no chat completion;
- * - `"hang"`: no answer at all, the connection left open.
+ * - `"hang"`: no answer at all, the connection left open;
+ * - `"stall"`: the status line, the headers and the start of a body, and then nothing, the
+ *   connection left open: a server that fell silent in the middle of its answer.
  */
 export type FakeReply =
   | string
   | { content: string | null; finishReason?: string | null }
   | { status: number; body?: unknown }
   | { raw: unknown }
-  | "hang";
+  | "hang"
+  | "stall";
 
 export interface FakeLlm {
   /** What to give the solver as its base URL: `http://127.0.0.1:<port>/v1`. */
@@ -38,8 +41,8 @@ export interface FakeLlm {
   /** Every request, in the order they arrived. */
   requests: RecordedRequest[];
   /**
-   * Resolves once `count` requests that the fake never answered have been dropped by their client,
-   * and rejects after 5 seconds if they have not been: a cancelled call closes its connection.
+   * Resolves once `count` requests whose answer the fake never finished have been dropped by their
+   * client, and rejects after 5 seconds if they have not been: a cancelled call closes its connection.
    */
   dropped(count?: number): Promise<void>;
   stop(): Promise<void>;
@@ -112,6 +115,12 @@ export async function startFakeLlm(script: FakeReply | FakeReply[]): Promise<Fak
 
       const reply = replies[Math.min(requests.length, replies.length) - 1] ?? "";
       if (reply === "hang") return;
+      if (reply === "stall") {
+        // No content-length, so the body is open-ended: the client has a 200 and waits for the rest.
+        response.writeHead(200, { "content-type": "application/json" });
+        response.write('{"id":"chatcmpl-fake","object":"chat.completion","choices":[');
+        return;
+      }
       let status = 200;
       let payload: unknown;
       if (typeof reply === "string") payload = completion(recorded.body?.model, reply, "stop");

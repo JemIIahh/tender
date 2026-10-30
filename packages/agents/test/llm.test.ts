@@ -243,6 +243,25 @@ test("solver_bounds_its_own_call", async () => {
   expect(llm.requests).toHaveLength(1);
 });
 
+test("solver_bounds_a_call_whose_answer_stalls_midway", async () => {
+  // The headers and the start of the body arrive, and then nothing. The wait for the rest of the
+  // body is under the timeout too, and not only the wait for the headers.
+  const { llm, solver } = await setUp("stall", { timeoutMs: 300 });
+  const started = Date.now();
+
+  const failure = await solver.solve(regexTask()).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+
+  expect(failure).toBeInstanceOf(LlmError);
+  expect(failure).toMatchObject({ name: "LlmError", code: "TIMEOUT" });
+  expect(Date.now() - started).toBeLessThan(5_000);
+  // Cancelled, not abandoned: the connection was closed with the answer unfinished.
+  await llm.dropped(1);
+  expect(llm.requests).toHaveLength(1);
+});
+
 test("prompt_holds_no_secrets", async () => {
   vi.stubEnv("LLM_API_KEY", "env-llm-key-CANARY-1");
   vi.stubEnv("AGENT_ANALYST_PRIVATE_KEY", "ed25519:CANARY-AGENT-KEY-2");
@@ -427,6 +446,25 @@ test("oversize_output_returns_null", async () => {
   expect(await over.solver.solve(task("json", JSON_CRITERIA, {}, fits.length - 1))).toBeNull();
 });
 
+test("a_reply_over_the_limit_by_more_than_the_room_for_thinking_is_dropped_unread", () => {
+  // A reasoning model's thinking is not held to the answer's limit, but a server can send a reply
+  // as large as it likes: past the limit and 1 MiB, nothing in it is looked at. Here the answer in
+  // it is fine ("ok" fits), so the size alone decides.
+  const limit = 10;
+  const room = 1_048_576;
+  const thinking = (bytes: number) =>
+    `<think>${"x".repeat(bytes - "<think></think>ok".length)}</think>ok`;
+
+  const edge = checkAnswer(thinking(limit + room), textBrief(limit), EXACT_CRITERIA);
+  expect(decode(edge)).toBe("ok");
+  expect(checkAnswer(thinking(limit + room + 1), textBrief(limit), EXACT_CRITERIA)).toBeNull();
+  // The room is counted in bytes of UTF-8, as the limit is: a character of two bytes costs two.
+  const wide = `<think>${"é".repeat(room / 2)}</think>ok`;
+  expect(checkAnswer(wide, textBrief(limit), EXACT_CRITERIA)).toBeNull();
+  // And it comes on top of the brief's limit, whatever that is.
+  expect(checkAnswer(thinking(5_000 + room), textBrief(5_000), EXACT_CRITERIA)).not.toBeNull();
+});
+
 function textBrief(maxBytes: number): Brief {
   return { ...BRIEF, output: { format: "text", max_bytes: maxBytes } };
 }
@@ -492,12 +530,32 @@ test("code_js_must_define_entry", async () => {
   expect(await bad.solver.solve(codeTask(RUBRIC_CRITERIA))).toBeNull();
 
   // A function name the solver cannot check for is a task it cannot answer: it does not ask the
-  // model, which would spend credits on an answer that could never be accepted.
-  for (const entry of ["a b", "x.y", "solve()", "class", "1st", ""]) {
+  // model, which would spend credits on an answer that could never be accepted. That includes the
+  // names that only strict code reserves. An answer may open with "use strict", and then the check's
+  // own `let` of the name does not compile, which would pass for the name being defined.
+  const strictOnly = [
+    "eval",
+    "arguments",
+    "public",
+    "yield",
+    "interface",
+    "static",
+    "implements",
+    "package",
+    "private",
+    "protected",
+  ];
+  for (const entry of ["a b", "x.y", "solve()", "class", "1st", "", ...strictOnly]) {
     const odd = await setUp("function solve() {}");
     const ctx = codeTask({ ...TESTS_CRITERIA, entry } as PublicCriteria);
     expect(await odd.solver.solve(ctx), entry).toBeNull();
     expect(odd.llm.requests, entry).toHaveLength(0);
+  }
+  // The answer that used to pass for each of them: strict code that defines something else.
+  for (const entry of strictOnly) {
+    const criteria = { ...TESTS_CRITERIA, entry } as PublicCriteria;
+    const brief = codeTask(criteria).brief;
+    expect(checkAnswer('"use strict";\nfunction other() {}', brief, criteria), entry).toBeNull();
   }
 });
 
@@ -702,6 +760,12 @@ test("the_factory_refuses_options_it_cannot_use_without_showing_a_value", () => 
     [{ timeoutMs: -5 }, /timeoutMs/],
     [{ timeoutMs: Number.NaN }, /timeoutMs/],
     [{ timeoutMs: 2 ** 31 }, /timeoutMs/],
+    [{ maxCallsPerHour: 0 }, /maxCallsPerHour/],
+    [{ maxCallsPerHour: -3 }, /maxCallsPerHour/],
+    [{ maxCallsPerHour: 1.5 }, /maxCallsPerHour/],
+    [{ maxCallsPerHour: Number.NaN }, /maxCallsPerHour/],
+    [{ maxCallsPerHour: Number.POSITIVE_INFINITY }, /maxCallsPerHour/],
+    [{ maxCallsPerHour: 2 ** 53 }, /maxCallsPerHour/],
     [{ headers: { "bad header name": "x" } }, /headers/],
     [{ headers: { "x-ok": "line\nbreak-SECRET-VALUE" } }, /headers/],
   ];
@@ -717,8 +781,154 @@ test("the_factory_refuses_options_it_cannot_use_without_showing_a_value", () => 
       expect(text).not.toContain("SECRET-VALUE");
     }
   }
-  // The defaults are fine: 90 seconds, and no headers.
+  // The defaults are fine: 90 seconds, 30 requests an hour, and no headers.
   expect(() => createLlmSolver(ok)).not.toThrow();
+  expect(() => createLlmSolver({ ...ok, maxCallsPerHour: 1 })).not.toThrow();
+});
+
+// ---- The hourly limit ---------------------------------------------------------------------------
+
+const MINUTE = 60_000;
+const ANSWER = '{"pattern":"^a$","flags":""}';
+const ATTACHMENT = {
+  name: "data.csv",
+  uri: "https://files.example/data.csv",
+  sha256: "a".repeat(64),
+};
+
+test("the_solver_asks_the_model_at_most_a_set_number_of_times_in_any_hour_and_warns_once_an_hour", async () => {
+  const start = 5_000_000;
+  let clock = start;
+  const at = (minutes: number) => {
+    clock = start + minutes * MINUTE;
+  };
+  const lines: string[] = [];
+  const { llm, solver } = await setUp(ANSWER, {
+    maxCallsPerHour: 2,
+    now: () => clock,
+    log: (line) => lines.push(line),
+  });
+  const answered = async () => (await solver.solve(regexTask())) !== null;
+
+  // Two requests are the hour's, and are made.
+  at(0);
+  expect(await answered()).toBe(true);
+  at(1);
+  expect(await answered()).toBe(true);
+  expect(llm.requests).toHaveLength(2);
+  expect(lines).toEqual([]);
+
+  // The third is over: no request and no answer, and one warning that says the limit and the wait.
+  at(2);
+  expect(await answered()).toBe(false);
+  expect(llm.requests).toHaveLength(2);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toMatch(/^WARN llm solver: the limit of 2 model calls an hour is reached/);
+  expect(lines[0]).toContain("for 58 more min");
+
+  // Asking on within the hour changes nothing, and does not warn again.
+  at(30);
+  expect(await answered()).toBe(false);
+  at(59);
+  expect(await answered()).toBe(false);
+  expect(llm.requests).toHaveLength(2);
+  expect(lines).toHaveLength(1);
+
+  // A request is used up until an hour after it was made. At 60 the first is an hour old and the
+  // second is not: one request is free, and not two.
+  at(60);
+  expect(await answered()).toBe(true);
+  expect(await answered()).toBe(false);
+  expect(llm.requests).toHaveLength(3);
+  // 58 minutes since the warning is not the hour yet.
+  expect(lines).toHaveLength(1);
+  // At 61 the second is an hour old too, and the hour holds only the one made at 60.
+  at(61);
+  expect(await answered()).toBe(true);
+  expect(llm.requests).toHaveLength(4);
+
+  // At 62 the hour is full again (60 and 61), and it is an hour since the warning: warned again.
+  at(62);
+  expect(await answered()).toBe(false);
+  expect(llm.requests).toHaveLength(4);
+  expect(lines).toHaveLength(2);
+  expect(lines[1]).toContain("for 58 more min");
+  // And as before, once an hour.
+  at(100);
+  expect(await answered()).toBe(false);
+  expect(lines).toHaveLength(2);
+
+  // The warning shows the limit and the wait and nothing the solver was made with.
+  for (const line of lines) {
+    expect(line).not.toContain(KEY);
+    expect(line).not.toContain(llm.baseUrl);
+    expect(line).not.toContain(MODEL);
+  }
+});
+
+test("a_request_that_failed_counts_against_the_hour_and_a_task_that_was_declined_does_not", async () => {
+  const lines: string[] = [];
+  const { llm, solver } = await setUp([{ status: 500 }, ANSWER], {
+    maxCallsPerHour: 2,
+    now: () => 1_000,
+    log: (line) => lines.push(line),
+  });
+  const withFile = () => regexTask({ attachments: [ATTACHMENT] });
+
+  // Declined before the model is asked: it uses nothing of the hour.
+  expect(await solver.solve(withFile())).toBeNull();
+  expect(await solver.solve(withFile())).toBeNull();
+  expect(llm.requests).toHaveLength(0);
+
+  // A request that fails was made, and the model may have charged for it: it counts.
+  const failure = await solver.solve(regexTask()).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  expect(failure).toMatchObject({ name: "LlmError", code: "HTTP_500" });
+  expect(decode(await solver.solve(regexTask()))).toBe(ANSWER);
+  expect(llm.requests).toHaveLength(2);
+  expect(lines).toEqual([]);
+
+  // The hour is used up. A task it would decline anyway says nothing of the limit...
+  expect(await solver.solve(withFile())).toBeNull();
+  expect(lines).toEqual([]);
+  // ... and a task it could have answered gets no request, and the one warning of the hour.
+  expect(await solver.solve(regexTask())).toBeNull();
+  expect(llm.requests).toHaveLength(2);
+  expect(lines).toHaveLength(1);
+});
+
+test("two_questions_at_once_cannot_both_take_the_last_request_of_the_hour", async () => {
+  const lines: string[] = [];
+  const { llm, solver } = await setUp(ANSWER, {
+    maxCallsPerHour: 1,
+    now: () => 1_000,
+    log: (line) => lines.push(line),
+  });
+
+  const answers = await Promise.all([solver.solve(regexTask()), solver.solve(regexTask())]);
+
+  expect(answers.filter((answer) => answer !== null)).toHaveLength(1);
+  expect(llm.requests).toHaveLength(1);
+  expect(lines).toHaveLength(1);
+});
+
+test("the_default_limit_is_30_requests_an_hour_by_the_clock_of_the_process", {
+  timeout: 60_000,
+}, async () => {
+  const lines: string[] = [];
+  const { llm, solver } = await setUp(ANSWER, { log: (line) => lines.push(line) });
+
+  for (let asked = 1; asked <= 30; asked += 1) {
+    expect(await solver.solve(regexTask()), `request ${asked}`).not.toBeNull();
+  }
+  expect(lines).toEqual([]);
+
+  expect(await solver.solve(regexTask())).toBeNull();
+  expect(llm.requests).toHaveLength(30);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain("the limit of 30 model calls an hour");
 });
 
 // ---- The real seeds -----------------------------------------------------------------------------

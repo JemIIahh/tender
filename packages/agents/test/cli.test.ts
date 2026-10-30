@@ -55,6 +55,9 @@ const LLM_ENV: Record<string, string> = {
   LLM_MODEL: "test-org/test-model-7",
 };
 const ARGS = ["--agent", "analyst", "--solver", "offline", "--network", "testnet"];
+const LLM_ARGS = ["--agent", "analyst", "--solver", "llm", "--network", "testnet"];
+const USAGE =
+  "usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent analyst|coder|extractor --solver llm|offline|weak --network sandbox|testnet|mainnet [--max-llm-calls-per-hour N]";
 const KEY_COMMAND =
   "pnpm exec tsx scripts/keeper-key.ts --network testnet --role agent --agent analyst";
 
@@ -574,6 +577,40 @@ test("the_llm_solver_the_command_makes_asks_the_model_the_environment_names", as
   }
 });
 
+test("the_hourly_limit_of_the_flag_reaches_the_llm_solver_and_its_warning_the_commands_output", async () => {
+  const reply = JSON.stringify({ pattern: "^\\d+\\.\\d+\\.\\d+$", flags: "" });
+  const llm = await startFakeLlm(reply);
+  try {
+    const env = { ...ENV, LLM_BASE_URL: llm.baseUrl, LLM_API_KEY: LLM_KEY, LLM_MODEL: "env-model" };
+    const answers: Array<Uint8Array | null> = [];
+    const result = await start([...LLM_ARGS, "--max-llm-calls-per-hour", "2"], {
+      env,
+      loop: async (options) => {
+        for (let id = 1; id <= 3; id += 1) {
+          answers.push(await options.solver.solve(contextOf(taskSpec({ id }))));
+        }
+      },
+    });
+
+    expect(result.code).toBe(0);
+    // Two of the three tasks are asked of the model and the third is not: no request, no answer.
+    expect(answers.map((answer) => answer !== null)).toEqual([true, true, false]);
+    expect(llm.requests).toHaveLength(2);
+    // The solver's warning is a line of the agent's own output, and says the limit that was set.
+    expect(result.out).toHaveLength(1);
+    expect(result.out[0]).toMatch(/^WARN llm solver: the limit of 2 model calls an hour/);
+    expect(result.err).toEqual([]);
+    expect([...result.out, ...result.err].join("\n")).not.toContain(LLM_KEY);
+    expect(result.makeClient.mock.calls[0]?.[0]).toMatchObject({ maxLlmCallsPerHour: 2 });
+
+    // With no flag the config carries no limit, and the solver's own default (30) applies.
+    const plain = await start(LLM_ARGS, { env });
+    expect(plain.makeClient.mock.calls[0]?.[0]).not.toHaveProperty("maxLlmCallsPerHour");
+  } finally {
+    await llm.stop();
+  }
+});
+
 test("the_environment_comes_from_the_files_and_the_process_wins", async () => {
   const dir = await dirWith({
     ".env": [
@@ -658,38 +695,73 @@ test("read_run_config_trims_the_values_and_reads_the_model_for_the_llm_solver_on
     llm: { baseUrl: LLM_ENV.LLM_BASE_URL, apiKey: LLM_KEY, model: LLM_ENV.LLM_MODEL },
   });
   expect(llm).not.toHaveProperty("rpcUrl");
+  expect(llm).not.toHaveProperty("maxLlmCallsPerHour");
 
   const offline = readRunConfig(parseCli(ARGS), spaced);
   expect(offline).not.toHaveProperty("llm");
+
+  // The call limit of the flag is carried along as the number it is.
+  const capped = readRunConfig(parseCli([...LLM_ARGS, "--max-llm-calls-per-hour", "7"]), spaced);
+  expect(capped.maxLlmCallsPerHour).toBe(7);
 });
 
 // ---- The command line -------------------------------------------------------------------------
 
 test("a_bad_command_line_is_a_usage_error_that_runs_nothing", async () => {
-  const usage =
-    "usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent analyst|coder|extractor --solver llm|offline|weak --network sandbox|testnet|mainnet";
+  const key = "ed25519:SECRETGARBAGE000";
   const cases: Array<[string[], RegExp]> = [
     [[], /^run-agent: missing --agent, --solver, --network\n/],
     [["--agent", "analyst", "--network", "testnet"], /^run-agent: missing --solver\n/],
+    // An unknown name is not quoted back, however harmless it looks: it can be a key that was
+    // pasted into the wrong flag. The usage that follows lists the names that are known.
     [
       ["--agent", "nobody", "--solver", "offline", "--network", "testnet"],
-      /^run-agent: unknown agent "nobody": use one of analyst, coder, extractor\n/,
+      /^run-agent: unknown agent: use one of analyst, coder, extractor\n/,
     ],
     [
       ["--agent", "lead", "--solver", "offline", "--network", "testnet"],
-      /^run-agent: unknown agent "lead"/,
+      /^run-agent: unknown agent: use one of analyst, coder, extractor\n/,
     ],
     [
       ["--agent", "analyst", "--solver", "gpt", "--network", "testnet"],
-      /^run-agent: unknown solver "gpt": use one of llm, offline, weak\n/,
+      /^run-agent: unknown solver: use one of llm, offline, weak\n/,
     ],
     [
       ["--agent", "analyst", "--solver", "offline", "--network", "devnet"],
-      /^run-agent: unknown network "devnet": use one of sandbox, testnet, mainnet\n/,
+      /^run-agent: unknown network: use one of sandbox, testnet, mainnet\n/,
     ],
     [
       ["--agent", "analyst", "--solver", "offline", "--network", "constructor"],
-      /^run-agent: unknown network "constructor"/,
+      /^run-agent: unknown network: use one of sandbox, testnet, mainnet\n/,
+    ],
+    [
+      ["--agent", key, "--solver", "offline", "--network", "testnet"],
+      /^run-agent: unknown agent: use one of analyst, coder, extractor\n/,
+    ],
+    [
+      ["--agent", "analyst", "--solver", key, "--network", "testnet"],
+      /^run-agent: unknown solver: use one of llm, offline, weak\n/,
+    ],
+    [
+      ["--agent", "analyst", "--solver", "offline", "--network", key],
+      /^run-agent: unknown network: use one of sandbox, testnet, mainnet\n/,
+    ],
+    // The call limit is a whole number from 1, in digits, and the llm solver's alone. A value that
+    // is none of that is not quoted back either. (Written with `=`: node refuses a value that starts
+    // with a dash when it is a separate argument, and says so without quoting it.)
+    ...["0", "-1", "1.5", "1e3", " 5", "5 ", "five", "", "99999999999999999999", key].map(
+      (value): [string[], RegExp] => [
+        [...LLM_ARGS, `--max-llm-calls-per-hour=${value}`],
+        /^run-agent: --max-llm-calls-per-hour must be a whole number from 1\n/,
+      ],
+    ),
+    [
+      [...LLM_ARGS, "--max-llm-calls-per-hour", "-1"],
+      /^run-agent: cannot read the command line \(TypeError ERR_PARSE_ARGS_INVALID_OPTION_VALUE\)\n/,
+    ],
+    [
+      [...ARGS, "--max-llm-calls-per-hour", "5"],
+      /^run-agent: --max-llm-calls-per-hour is for --solver llm only\n/,
     ],
     [
       [...ARGS, "--key", "x"],
@@ -710,11 +782,18 @@ test("a_bad_command_line_is_a_usage_error_that_runs_nothing", async () => {
 
     expect(result.code, args.join(" ")).toBe(1);
     expect(said(result), args.join(" ")).toMatch(message);
-    expect(said(result), args.join(" ")).toContain(usage);
+    expect(said(result), args.join(" ")).toContain(USAGE);
     expect(said(result), args.join(" ")).not.toContain("SECRETGARBAGE");
     expect(result.out).toEqual([]);
     expect(result.calls, args.join(" ")).toEqual([]);
   }
+
+  // Nothing of an unknown name is in what it says, down to the last character: the message is the
+  // same for a key as for a word.
+  const unknown = await start(["--agent", key, "--solver", "offline", "--network", "testnet"]);
+  expect(said(unknown)).toBe(
+    `run-agent: unknown agent: use one of analyst, coder, extractor\n${USAGE}`,
+  );
 });
 
 test("parse_cli_returns_the_agent_the_solver_and_the_network", () => {
@@ -724,6 +803,16 @@ test("parse_cli_returns_the_agent_the_solver_and_the_network", () => {
     network: "sandbox",
   });
   expect(() => parseCli(["--agent", "analyst"])).toThrow(CliError);
+
+  // The call limit is there only when the flag sets it, and is a number.
+  expect(parseCli([...LLM_ARGS, "--max-llm-calls-per-hour", "12"])).toEqual({
+    agent: AGENTS.analyst,
+    solver: "llm",
+    network: "testnet",
+    maxLlmCallsPerHour: 12,
+  });
+  expect(parseCli(["--max-llm-calls-per-hour=007", ...LLM_ARGS]).maxLlmCallsPerHour).toBe(7);
+  expect(parseCli(LLM_ARGS)).not.toHaveProperty("maxLlmCallsPerHour");
 });
 
 // ---- Failures ---------------------------------------------------------------------------------
@@ -849,15 +938,15 @@ test("the_bin_exits_1_with_the_usage_for_a_bad_command_line", { timeout: 120_000
   // A command line that fails before any env file is read, so that nothing on this machine can change
   // what happens.
   const result = await runBin(
-    ["--agent", "nobody", "--solver", "offline", "--network", "testnet"],
+    ["--agent", "ed25519:SECRETGARBAGE000", "--solver", "offline", "--network", "testnet"],
     {},
   );
 
+  // The agent is a key pasted into the wrong flag: the message is the same as for any unknown name,
+  // and says nothing of the value.
   expect(result).toEqual({
     code: 1,
     stdout: "",
-    stderr:
-      'run-agent: unknown agent "nobody": use one of analyst, coder, extractor\n' +
-      "usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent analyst|coder|extractor --solver llm|offline|weak --network sandbox|testnet|mainnet\n",
+    stderr: `run-agent: unknown agent: use one of analyst, coder, extractor\n${USAGE}\n`,
   });
 });
