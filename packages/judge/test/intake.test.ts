@@ -76,6 +76,9 @@ const TESTS = {
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
 const REFERENCE_NOT_A_FRAGMENT =
   'criteria schema is not supported: a reference must start with "#"';
+const REFERENCE_INTO_DATA =
+  "criteria schema is not supported: a reference points into const, enum, examples or default";
+const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at the root";
 /** Text from someone's private answer, which no public reason may quote. */
 const SECRET = "secret-part-of-someone-elses-private-answer";
 const HAS_HELDOUT_MISMATCH = "has_heldout does not match the task's held-out commitment";
@@ -306,11 +309,10 @@ test("intake_rejects_each_rule", async () => {
           $ref: "root.json#/$defs/s/type/length",
         }),
     },
+    // P05-R9: the schema is one resource, named only at its root.
     {
-      // Inside `a`, which has an `$id` of its own, `#/allOf/length` is the length of a's array;
-      // the root has no `allOf` at all.
-      rule: "a fragment, walked through the resource it is in",
-      reason: BUILT_IN_REFERENCE,
+      rule: "an $id below the root",
+      reason: ID_BELOW_ROOT,
       view: () =>
         jsonSchemaTask(db, {
           type: "object",
@@ -319,8 +321,43 @@ test("intake_rejects_each_rule", async () => {
           },
         }),
     },
-    // The re-review's probe B: an `$id` of "" or "#" names the resource it is in, so the walk goes
-    // on from the root, where `allOf` is an array and `s.type` a string.
+    {
+      rule: "a root $id with a fragment",
+      reason: "criteria schema is not supported: the root $id must not have a fragment",
+      view: () => jsonSchemaTask(db, { $id: "https://t.example/root.json#foo", type: "object" }),
+    },
+    {
+      // The review of d75de82: Ajv compiles what such a pointer finds as a schema, though it is
+      // data to the walk.
+      rule: "a pointer into examples",
+      reason: REFERENCE_INTO_DATA,
+      view: () =>
+        jsonSchemaTask(db, {
+          type: "object",
+          examples: [{ type: "number" }],
+          properties: { x: { $ref: "#/examples/0" } },
+        }),
+    },
+    {
+      rule: "a pointer into default",
+      reason: REFERENCE_INTO_DATA,
+      view: () =>
+        jsonSchemaTask(db, {
+          type: "object",
+          default: { type: "number" },
+          properties: { x: { $ref: "#/default" } },
+        }),
+    },
+    {
+      rule: "a pointer into the default of a schema below the root",
+      reason: REFERENCE_INTO_DATA,
+      view: () =>
+        jsonSchemaTask(db, {
+          type: "object",
+          properties: { a: { default: { type: "number" } }, b: { $ref: "#/properties/a/default" } },
+        }),
+    },
+    // The re-review's probe B: an `$id` of "" or "#" is still an `$id` below the root.
     ...[
       ['$id "" on the schema with the $ref', { $id: "", $ref: "#/allOf/length" }],
       ['$id "#" on the schema with the $ref', { $id: "#", $ref: "#/allOf/length" }],
@@ -328,7 +365,7 @@ test("intake_rejects_each_rule", async () => {
       ['$id "" and a step into a string', { $id: "", $ref: "#/$defs/s/type/length" }],
     ].map(([rule, total]) => ({
       rule: String(rule),
-      reason: BUILT_IN_REFERENCE,
+      reason: ID_BELOW_ROOT,
       view: () =>
         jsonSchemaTask(db, {
           type: "object",
@@ -467,22 +504,39 @@ test("intake_accepts_the_p0_kinds", async () => {
       { $defs: { total: { type: "number" } }, $ref: "#/$defs/total" },
       { json_schema: { assertions: [{ path: "$", equals: 42 }] } },
     ),
-    // A fragment inside a resource with an `$id` of its own names that resource's keys: Ajv takes
-    // `#/$defs/n` there as a's number, not the root's string.
+    // The common shapes P05-R9 keeps: a root `$id` that is a URL, with or without a bare `#`;
+    // `#/$defs/x` and `#/definitions/x`; `#` for the whole schema; and a pointer through a
+    // property that is named `default`.
     await jsonSchemaTask(
       db,
       {
-        $defs: { n: { type: "string" } },
+        $id: "https://example.com/schemas/order.json",
         type: "object",
-        properties: {
-          a: {
-            $id: "https://t.example/a.json",
-            $defs: { n: { type: "number" } },
-            allOf: [{ $ref: "#/$defs/n" }],
-          },
-        },
+        $defs: { item: { type: "string" } },
+        properties: { a: { $ref: "#/$defs/item" } },
       },
       { json_schema: { assertions: [{ path: "$", equals: 43 }] } },
+    ),
+    await jsonSchemaTask(
+      db,
+      {
+        $id: "https://example.com/schemas/tree.json#",
+        type: "object",
+        definitions: { item: { type: "string" } },
+        properties: {
+          a: { $ref: "#/definitions/item" },
+          children: { type: "array", items: { $ref: "#" } },
+        },
+      },
+      { json_schema: { assertions: [{ path: "$", equals: 45 }] } },
+    ),
+    await jsonSchemaTask(
+      db,
+      {
+        type: "object",
+        properties: { default: { type: "string" }, b: { $ref: "#/properties/default" } },
+      },
+      { json_schema: { assertions: [{ path: "$", equals: 46 }] } },
     ),
     // What reads like a reference inside data is data: the values of const, enum, examples and
     // default are no schemas, whatever names they hold.

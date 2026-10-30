@@ -77,6 +77,10 @@ const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names 
 const REFERENCE_NOT_A_FRAGMENT =
   'criteria schema is not supported: a reference must start with "#"';
 const REFERENCE_UNDECODABLE = "criteria schema is not supported: a reference cannot be decoded";
+const REFERENCE_INTO_DATA =
+  "criteria schema is not supported: a reference points into const, enum, examples or default";
+const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at the root";
+const ROOT_ID_FRAGMENT = "criteria schema is not supported: the root $id must not have a fragment";
 const HELDOUT_WAITING = "waiting for held-out checks";
 const HELDOUT_MISSING = "held-out checks missing";
 const HELDOUT_NOT_THE_POSTERS = "held-out checks were not uploaded by the poster";
@@ -105,9 +109,10 @@ const CHECK_FAILED = "criteria could not be checked";
  *   in v1` (C16); from the team: `kind {k} is not available yet`, as P0 has no scorer for either;
  * - `has_heldout` that does not match whether the task has a `heldout_commitment`;
  * - `exact` or `json_schema` without held-out checks: `held-out checks required for kind {k}`;
- * - a `json_schema` schema with a reference that is not a fragment of it, or that goes through a
- *   built-in member (see `referenceProblem`), or one that `checkJsonSchemaUsable` refuses, with
- *   its reason;
+ * - a `json_schema` schema with an `$id` below its root, a root `$id` with a fragment, or a
+ *   reference that is not a fragment of it, that goes through a built-in member or that points
+ *   into data (see `referenceProblem`), or one that `checkJsonSchemaUsable` refuses, with its
+ *   reason;
  * - a `heldout_commitment` that an earlier task of the same poster (a lower id, of any verifier)
  *   commits to as well: `held-out checks already used by task {id}`, naming the lowest. Held-out
  *   checks are single-use, as judging a task publishes them. Another poster's task with the same
@@ -321,71 +326,71 @@ function parseJson(bytes: Uint8Array): unknown {
 }
 
 /**
- * Why `schema` has a reference (`$ref`, `$dynamicRef`, `$recursiveRef`) that is not supported, or
- * `null` when it has none. Ajv looks the names in a reference up on plain objects, so
- * `#/constructor` finds `Object.prototype.constructor` and `#/allOf/length` the length of an
- * array, and the schema then fails on every document, or worse takes every document as a fit.
- * `checkJsonSchemaUsable` catches the first only.
+ * Why `schema` names itself or refers to something in a way that is not supported, or `null`.
+ * Ajv looks the names in a reference up on plain objects, so `#/constructor` finds
+ * `Object.prototype.constructor` and `#/allOf/length` the length of an array, and the schema then
+ * fails on every document, or worse takes every document as a fit; `checkJsonSchemaUsable`
+ * catches the first only. The rules are simple and strict rather than a model of how Ajv resolves
+ * references, which would have to be exact to be safe (P05-R9):
  *
- * - A reference must be a fragment, starting with `#`. Nothing outside the schema resolves, and a
- *   URI before the `#` can lead Ajv into a resource that the walk below would not find. A few rare
- *   shapes that Ajv takes are refused with it: a reference to a resource embedded by its `$id`
- *   (`"$ref": "address"`), and an absolute reference to the schema itself.
+ * - `$id` is allowed only at the root, so the whole schema is one resource and every reference
+ *   resolves against its root. An `$id` in a schema below the root is refused, whatever it says;
+ *   a property named `$id` is a name, not a schema's `$id`. A root `$id` must not have a fragment,
+ *   beyond a bare `#`.
+ * - A reference (`$ref`, `$dynamicRef`, `$recursiveRef`) must be a fragment, starting with `#`:
+ *   nothing outside the schema resolves. Some rare shapes that Ajv takes are refused with it: an
+ *   absolute reference to the schema itself, and, with the rule above, any embedded resource.
  * - Each name in the fragment, decoded as Ajv decodes it (percent-encoding, then `~1` and `~0` in
  *   a JSON pointer), must not be that of an `Object.prototype` member: the anchor, or each
  *   segment of a JSON pointer. A fragment that cannot be decoded is refused too.
- * - A JSON pointer is walked through the schema resource the reference is in (the closest schema
- *   whose `$id` names one: not `""` or `"#"`, which name the resource they are in), and each step
- *   must be an own key of an object or an index of an array: `#/allOf/length` is refused,
- *   `#/$defs/total` is not. A step that finds nothing ends the walk, as Ajv refuses a reference it
- *   cannot resolve on its own.
+ * - A JSON pointer is walked from the root (see `pointerProblem`): each step must be an own key of
+ *   an object or an index of an array, and none may go into the value of `const`, `enum`,
+ *   `examples` or `default`. `#/allOf/length` and `#/examples/0` are refused, `#/$defs/total` is
+ *   not.
  *
  * The values of `const`, `enum`, `examples` and `default` are data, not schemas, so a `"$ref"` in
- * them is no reference and is not looked at. That holds where they are keywords, in a schema, and
- * not where they are names, as in `properties`, whose values are schemas.
+ * them is no reference and is not looked at, nor is an `$id` in them. That holds where they are
+ * keywords, in a schema, and not where they are names, as in `properties`, whose values are
+ * schemas.
  *
  * The criteria schema caps a document's nesting at 64, and the walk keeps its own stack.
  */
 function referenceProblem(schema: Record<string, unknown>): string | null {
-  // Each entry is a value; whether it maps names to schemas, as `properties` does, rather than
-  // being a schema or a list of them; and the schema resource it is in.
-  const pending: [value: unknown, names: boolean, resource: object][] = [[schema, false, schema]];
+  // Nothing may follow the first `#` of the root's `$id`.
+  const rootId = typeof schema.$id === "string" ? schema.$id : "";
+  const hash = rootId.indexOf("#");
+  if (hash >= 0 && hash < rootId.length - 1) return ROOT_ID_FRAGMENT;
+  // Each entry is a value, and whether it maps names to schemas, as `properties` does, rather than
+  // being a schema or a list of them.
+  const pending: [value: unknown, names: boolean][] = [[schema, false]];
   for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
-    const [value, names, resource] = next;
+    const [value, names] = next;
     if (typeof value !== "object" || value === null) continue;
     if (Array.isArray(value)) {
-      for (const item of value) pending.push([item, false, resource]);
+      for (const item of value) pending.push([item, false]);
       continue;
     }
     const node = value as Record<string, unknown>;
     if (names) {
-      for (const member of Object.values(node)) pending.push([member, false, resource]);
+      for (const member of Object.values(node)) pending.push([member, false]);
       continue;
     }
-    const base = startsResource(node.$id) ? node : resource;
+    if (node !== schema && Object.hasOwn(node, "$id")) return ID_BELOW_ROOT;
     for (const [key, member] of Object.entries(node)) {
       if (DATA_KEYWORDS.has(key)) continue;
       if (REFERENCE_KEYWORDS.has(key) && typeof member === "string") {
-        const problem = problemOf(member, base);
+        const problem = problemOf(member, schema);
         if (problem !== null) return problem;
       } else {
-        pending.push([member, NAMED_SCHEMA_KEYWORDS.has(key), base]);
+        pending.push([member, NAMED_SCHEMA_KEYWORDS.has(key)]);
       }
     }
   }
   return null;
 }
 
-/**
- * Whether a schema's `$id` starts a schema resource of its own. Ajv drops a trailing `#` (or `#/`)
- * from an `$id` and keeps its base for one that is left empty, so `""` and `"#"` do not.
- */
-function startsResource(id: unknown): boolean {
-  return typeof id === "string" && id.replace(/#\/?$/, "") !== "";
-}
-
-/** Why `reference`, made inside `resource`, is not supported, or `null`. See `referenceProblem`. */
-function problemOf(reference: string, resource: object): string | null {
+/** Why `reference`, made in `root`, is not supported, or `null`. See `referenceProblem`. */
+function problemOf(reference: string, root: Record<string, unknown>): string | null {
   if (!reference.startsWith("#")) return REFERENCE_NOT_A_FRAGMENT;
   const fragment = reference.slice(1);
   const isPointer = fragment.startsWith("/");
@@ -401,28 +406,36 @@ function problemOf(reference: string, resource: object): string | null {
     return REFERENCE_UNDECODABLE;
   }
   if (names.some((name) => Object.hasOwn(Object.prototype, name))) return BUILT_IN_REFERENCE;
-  if (isPointer && !walksOwnKeys(resource, names)) return BUILT_IN_REFERENCE;
-  return null;
+  return isPointer ? pointerProblem(root, names) : null;
 }
 
 /**
- * Whether each step of `path` from `start` is an own key of an object or an index of an array,
- * until a step finds nothing. A step into anything else (a string, a number, a boolean, null) is
- * not: what Ajv found there would be a member of its prototype, or an error.
+ * Why the JSON pointer `path`, from `root`, is not supported, or `null`. Each step must be an own
+ * key of an object or an index of an array: a step into anything else (a string, a number, a
+ * boolean, null) finds a member of its prototype, or an error. And no step may go into the value of
+ * `const`, `enum`, `examples` or `default` in a schema: Ajv would compile what is there as a
+ * schema, though the walk above passes it over as data. Under `properties` and the other keywords
+ * that map names to schemas, such a key is a name, and the step is fine. A step that finds nothing
+ * ends the walk, as Ajv refuses a reference it cannot resolve on its own.
  */
-function walksOwnKeys(start: object, path: readonly string[]): boolean {
-  let current: unknown = start;
+function pointerProblem(root: Record<string, unknown>, path: readonly string[]): string | null {
+  let current: unknown = root;
+  // Whether `current` maps names to schemas, rather than being a schema.
+  let names = false;
   for (const step of path) {
     if (Array.isArray(current)) {
-      if (!ARRAY_INDEX.test(step)) return false;
+      if (!ARRAY_INDEX.test(step)) return BUILT_IN_REFERENCE;
       current = current[Number(step)];
+      names = false;
     } else if (typeof current === "object" && current !== null) {
-      if (!Object.hasOwn(current, step)) return true;
+      if (!Object.hasOwn(current, step)) return null;
+      if (!names && DATA_KEYWORDS.has(step)) return REFERENCE_INTO_DATA;
       current = (current as Record<string, unknown>)[step];
+      names = !names && NAMED_SCHEMA_KEYWORDS.has(step);
     } else {
-      return false;
+      return BUILT_IN_REFERENCE;
     }
-    if (current === undefined) return true;
+    if (current === undefined) return null;
   }
-  return true;
+  return null;
 }
