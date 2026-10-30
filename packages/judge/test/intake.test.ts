@@ -74,6 +74,10 @@ const TESTS = {
 };
 
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
+const REFERENCE_NOT_A_FRAGMENT =
+  'criteria schema is not supported: a reference must start with "#"';
+/** Text from someone's private answer, which no public reason may quote. */
+const SECRET = "secret-part-of-someone-elses-private-answer";
 const HAS_HELDOUT_MISMATCH = "has_heldout does not match the task's held-out commitment";
 /** More than the largest document intake reads. */
 const TOO_LONG = "a".repeat(262_144);
@@ -154,6 +158,41 @@ test("intake_rejects_each_rule", async () => {
       view: async () => ({ criteria_hash: await putCriteria(db, { ...REGEX, version: 2 }) }),
     },
     {
+      // The review's probe: someone's private result, shaped like criteria, whose schema names a
+      // secret. Read as criteria, Ajv quoted the secret in the public reason.
+      rule: "a criteria_hash that names someone's private result",
+      reason: "criteria not found or invalid",
+      view: async () => ({
+        criteria_hash: await putBlob(db, {
+          kind: "result",
+          contentType: "application/json",
+          bytes: canonicalJson({ ...JSON_SCHEMA, schema: { $ref: `#/$defs/${SECRET}` } }),
+          uploader: "alice.test.near",
+          isPublic: false,
+        }),
+      }),
+    },
+    {
+      rule: "criteria stored as a criteria blob that is not public",
+      reason: "criteria not found or invalid",
+      view: async () => ({
+        criteria_hash: await putBlob(db, {
+          kind: "criteria",
+          contentType: "application/json",
+          bytes: canonicalJson({ ...REGEX, min_score: 99 }),
+          uploader: POSTER,
+          isPublic: false,
+        }),
+      }),
+    },
+    {
+      rule: "criteria stored as a public blob of another kind",
+      reason: "criteria not found or invalid",
+      view: async () => ({
+        criteria_hash: await putRaw(db, "brief", canonicalJson({ ...REGEX, min_score: 98 })),
+      }),
+    },
+    {
       rule: "criteria larger than 262_144 bytes",
       reason: "criteria too large",
       view: async () => ({
@@ -232,9 +271,58 @@ test("intake_rejects_each_rule", async () => {
         jsonSchemaTask(db, { $defs: {}, properties: { a: { $ref: "#/$defs/toString" } } }),
     },
     {
-      rule: "a $ref with no fragment that names an Object.prototype member",
-      reason: BUILT_IN_REFERENCE,
+      rule: "a $ref with a URI before its fragment",
+      reason: REFERENCE_NOT_A_FRAGMENT,
       view: () => jsonSchemaTask(db, { $ref: "hasOwnProperty#" }),
+    },
+    // The review's three: a URI before the pointer took Ajv through a built-in member that a walk
+    // of the fragment's own resource did not find.
+    {
+      rule: "a $ref into the root by its $id",
+      reason: REFERENCE_NOT_A_FRAGMENT,
+      view: () =>
+        jsonSchemaTask(db, {
+          $id: "https://t.example/root.json",
+          allOf: [{}],
+          $ref: "root.json#/allOf/length",
+        }),
+    },
+    {
+      rule: "a $ref into a resource inside the schema",
+      reason: REFERENCE_NOT_A_FRAGMENT,
+      view: () =>
+        jsonSchemaTask(db, {
+          $defs: { x: { $id: "https://t.example/x.json", allOf: [{}] } },
+          $ref: "https://t.example/x.json#/allOf/length",
+        }),
+    },
+    {
+      rule: "a $ref by $id into a string",
+      reason: REFERENCE_NOT_A_FRAGMENT,
+      view: () =>
+        jsonSchemaTask(db, {
+          $id: "https://t.example/root.json",
+          $defs: { s: { type: "string" } },
+          $ref: "root.json#/$defs/s/type/length",
+        }),
+    },
+    {
+      // Inside `a`, which has an `$id` of its own, `#/allOf/length` is the length of a's array;
+      // the root has no `allOf` at all.
+      rule: "a fragment, walked through the resource it is in",
+      reason: BUILT_IN_REFERENCE,
+      view: () =>
+        jsonSchemaTask(db, {
+          type: "object",
+          properties: {
+            a: { $id: "https://t.example/a.json", allOf: [{}, { $ref: "#/allOf/length" }] },
+          },
+        }),
+    },
+    {
+      rule: "a $ref whose fragment cannot be decoded",
+      reason: "criteria schema is not supported: a reference cannot be decoded",
+      view: () => jsonSchemaTask(db, { $ref: "#/%E0%A4%A" }),
     },
     {
       rule: "a $dynamicRef to an anchor that names an Object.prototype member",
@@ -304,6 +392,9 @@ test("intake_rejects_each_rule", async () => {
       judge_reason: reason,
     });
   }
+  // No reason quotes what a private blob holds.
+  const reasons = await db.query<{ judge_reason: string | null }>("select judge_reason from tasks");
+  expect(reasons.filter(({ judge_reason }) => judge_reason?.includes(SECRET))).toEqual([]);
 });
 
 test("intake_rejects_a_schema_that_does_not_compile_with_a_short_reason", async () => {
@@ -334,6 +425,23 @@ test("intake_accepts_the_p0_kinds", async () => {
       db,
       { $defs: { total: { type: "number" } }, $ref: "#/$defs/total" },
       { json_schema: { assertions: [{ path: "$", equals: 42 }] } },
+    ),
+    // A fragment inside a resource with an `$id` of its own names that resource's keys: Ajv takes
+    // `#/$defs/n` there as a's number, not the root's string.
+    await jsonSchemaTask(
+      db,
+      {
+        $defs: { n: { type: "string" } },
+        type: "object",
+        properties: {
+          a: {
+            $id: "https://t.example/a.json",
+            $defs: { n: { type: "number" } },
+            allOf: [{ $ref: "#/$defs/n" }],
+          },
+        },
+      },
+      { json_schema: { assertions: [{ path: "$", equals: 43 }] } },
     ),
     // regex_cases may go without held-out checks: the published examples are the cases then.
     { criteria_hash: await putCriteria(db, REGEX) },

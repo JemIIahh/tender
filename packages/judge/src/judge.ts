@@ -46,7 +46,7 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *
  * Each revealed entry's content is fetched (`fetchEntryContent`) and must hash to the entry's
  * `content_hash`; one of our own blob URIs counts only when `deps.resultUploaded` says the entrant
- * uploaded it for this task. One that cannot be fetched or does not count (`content unavailable:
+ * may use those bytes for this task. One that cannot be fetched or does not count (`content unavailable:
  * …`), or that does not match (`content hash mismatch`), scores 0 and never passes, whatever the
  * pass mark, so it cannot be paid. The rest are scored by `scoreEntry`; a scorer that throws
  * scores that entry 0 (`scoring failed`). Then the entries are ranked, the winners chosen, and the
@@ -95,7 +95,7 @@ export async function judgeTask(
   const revealed = (await deps.client.getAllEntries(taskId)).filter(isRevealed);
   const fetched = await inParallel(revealed, FETCHES_AT_ONCE, async (entry) => ({
     entry,
-    content: await contentOf(deps, taskId, entry),
+    content: await contentOf(deps, taskId, entry, nowNs),
   }));
   const scored: ScoredEntry[] = [];
   // One entry at a time: the regex sandbox runs on this thread.
@@ -241,17 +241,21 @@ async function scoreContent(
   }
 }
 
-/** The bytes that `entry` of task `taskId` revealed, or the reason the Judge has none to score. */
+/**
+ * The bytes that `entry` of task `taskId` revealed, or the reason the Judge has none to score.
+ * `nowNs` is the Judge's clock, for `resultUploaded`.
+ */
 async function contentOf(
   deps: JudgeDeps,
   taskId: bigint,
   entry: RevealedEntry,
+  nowNs: bigint,
 ): Promise<Uint8Array | string> {
   // Our own store keeps results private until their task's reveals close. Revealing a hash that
-  // is in it does not make the result yours: only bytes the entrant uploaded for this task count.
-  // The record is asked first, before the store is read; it may be for another task.
+  // is in it does not make the result yours: only bytes the entrant may use for this task count.
+  // That is asked first, before the store is read; an upload may be for another task.
   const ours = typeof ownBlobHash(deps.publicUrl, entry.uri) === "string";
-  if (ours && !(await deps.resultUploaded(entry.content_hash, taskId, entry.account))) {
+  if (ours && !(await deps.resultUploaded(entry.content_hash, taskId, entry.account, nowNs))) {
     return "content unavailable: not uploaded for this task";
   }
   const fetched = await fetchEntryContent(deps, entry.uri);

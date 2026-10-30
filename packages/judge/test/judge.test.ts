@@ -1,3 +1,5 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { type TenderClient, TenderError } from "@tender/client";
 import { type Db, getBlob, putBlob } from "@tender/db";
 import {
@@ -8,6 +10,7 @@ import {
   type TaskView,
 } from "@tender/shared";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
+import { pinnedFetch } from "../src/fetch";
 import {
   type FetchIo,
   fetchEntryContent,
@@ -135,11 +138,15 @@ async function scorecardCount(): Promise<number> {
 
 /**
  * A network that exists only in the test. `hosts` says what each name resolves to; `routes`
- * answers a request by the Host it names and its path, and a request with no route fails as an
- * unreachable server does. Each lookup and each request is recorded, the request with the URL it
- * was sent to and its Host header.
+ * answers a request by the Host it names and its path, and a request with no route, or sent to
+ * one of the `down` addresses, fails as an unreachable server does. Each lookup and each request
+ * is recorded, the request with the URL it was sent to and its Host header.
  */
-function fakeNetwork(hosts: Record<string, string[]>, routes: Record<string, () => Response> = {}) {
+function fakeNetwork(
+  hosts: Record<string, string[]>,
+  routes: Record<string, () => Response> = {},
+  down: readonly string[] = [],
+) {
   const lookups: string[] = [];
   const requests: { url: string; host: string | null }[] = [];
   const io: FetchIo = {
@@ -152,11 +159,13 @@ function fakeNetwork(hosts: Record<string, string[]>, routes: Record<string, () 
       return addresses;
     },
     fetchImpl: async (input, init) => {
-      const url = input instanceof Request ? input.url : String(input);
+      const url = new URL(input instanceof Request ? input.url : String(input));
       const host = new Headers(init?.headers).get("host");
-      requests.push({ url, host });
-      const route = routes[`${host}${new URL(url).pathname}`];
-      if (route === undefined) throw new TypeError("fetch failed");
+      requests.push({ url: url.href, host });
+      const route = routes[`${host}${url.pathname}`];
+      if (route === undefined || down.includes(url.hostname.replace(/^\[(.*)\]$/, "$1"))) {
+        throw new TypeError("fetch failed");
+      }
       return route();
     },
   };
@@ -353,14 +362,14 @@ test("our_blob_uris_count_only_when_uploaded_for_this_task", async () => {
     ["bob.test.near", 0, false, ["content unavailable: not uploaded for this task"]],
   ]);
   // Each entry with one of our URIs is looked up by the hash it revealed, not by the URI, for this
-  // task.
+  // task, at the Judge's own time.
   expect(resultUploaded.mock.calls).toEqual(
     expect.arrayContaining([
-      [sha256Hex("42"), 7n, "alice.test.near"],
-      [sha256Hex("42"), 7n, "dan.test.near"],
-      [eves, 7n, "eve.test.near"],
-      [sha256Hex("42"), 7n, "mallory.test.near"],
-      [bobs, 7n, "bob.test.near"],
+      [sha256Hex("42"), 7n, "alice.test.near", NOW_NS],
+      [sha256Hex("42"), 7n, "dan.test.near", NOW_NS],
+      [eves, 7n, "eve.test.near", NOW_NS],
+      [sha256Hex("42"), 7n, "mallory.test.near", NOW_NS],
+      [bobs, 7n, "bob.test.near", NOW_NS],
     ]),
   );
   expect(resultUploaded).toHaveBeenCalledTimes(5);
@@ -795,6 +804,88 @@ test("fetch_follows_at_most_three_redirects_and_checks_each", async () => {
     error: "too many redirects",
   });
   expect(requests).toHaveLength(4);
+});
+
+test("fetch_tries_the_next_checked_address_when_one_cannot_be_reached", async () => {
+  // A host with an IPv6 and an IPv4 address, whose IPv6 cannot be reached from here: the request
+  // goes to the IPv4 one next, with the same Host. A status is an answer, and no other address is
+  // asked. When none can be reached, the fetch fails.
+  const v6 = "2606:4700:4700::1111";
+  const { io, requests } = fakeNetwork(
+    {
+      "dual.example": [v6, PUBLIC_IP],
+      "busy.example": [OTHER_PUBLIC_IP, PUBLIC_IP],
+      "dark.example": ["8.8.8.8", "1.1.1.1"],
+    },
+    {
+      "dual.example/a": ok("42"),
+      "busy.example/a": () => new Response("busy", { status: 503 }),
+      "dark.example/a": ok("42"),
+    },
+    [v6, "8.8.8.8", "1.1.1.1"],
+  );
+  const deps = judgeDeps(db, fakeChain(null));
+
+  expect(await fetchEntryContent(deps, "http://dual.example/a", io)).toEqual(bytes("42"));
+  expect(requests).toEqual([
+    { url: `http://[${v6}]/a`, host: "dual.example" },
+    { url: `http://${PUBLIC_IP}/a`, host: "dual.example" },
+  ]);
+
+  requests.length = 0;
+  expect(await fetchEntryContent(deps, "http://busy.example/a", io)).toEqual({
+    error: "http status 503",
+  });
+  expect(requests).toHaveLength(1);
+
+  requests.length = 0;
+  expect(await fetchEntryContent(deps, "http://dark.example/a", io)).toEqual({
+    error: "fetch failed",
+  });
+  expect(requests.map(({ url }) => url)).toEqual(["http://8.8.8.8/a", "http://1.1.1.1/a"]);
+});
+
+test("the_default_transport_goes_to_the_address_and_names_the_host", async () => {
+  // A server in this process, on loopback, which is not the network. The URL holds the address and
+  // the host header a name that cannot resolve (`.invalid` never does), so the request reached the
+  // server only by going to the address.
+  const seen: { host?: string; encoding?: string; path?: string }[] = [];
+  let closed = 0;
+  const server = createServer((request, response) => {
+    seen.push({
+      host: request.headers.host,
+      encoding: request.headers["accept-encoding"],
+      path: request.url,
+    });
+    // `/hold` is never answered.
+    if (request.url === "/hold") request.socket.on("close", () => closed++);
+    else response.end("42");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  try {
+    const response = await pinnedFetch(`http://127.0.0.1:${port}/answer?v=1`, {
+      headers: { host: "judge.invalid" },
+      redirect: "manual",
+    });
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes("42"));
+    expect(seen).toEqual([{ host: "judge.invalid", encoding: "identity", path: "/answer?v=1" }]);
+
+    // An abort stops a request that is never answered, and closes its connection.
+    const controller = new AbortController();
+    const held = pinnedFetch(`http://127.0.0.1:${port}/hold`, {
+      headers: { host: "judge.invalid" },
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    controller.abort();
+    await expect(held).rejects.toThrow();
+    await vi.waitFor(() => expect(closed).toBe(1));
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 test("fetch_caps_the_body_while_it_streams", async () => {

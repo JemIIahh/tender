@@ -63,6 +63,9 @@ const CRITERIA_INVALID = "criteria not found or invalid";
 const CRITERIA_TOO_LARGE = "criteria too large";
 const HAS_HELDOUT_MISMATCH = "has_heldout does not match the task's held-out commitment";
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
+const REFERENCE_NOT_A_FRAGMENT =
+  'criteria schema is not supported: a reference must start with "#"';
+const REFERENCE_UNDECODABLE = "criteria schema is not supported: a reference cannot be decoded";
 const HELDOUT_WAITING = "waiting for held-out checks";
 const HELDOUT_MISSING = "held-out checks missing";
 const HELDOUT_NOT_THE_POSTERS = "held-out checks were not uploaded by the poster";
@@ -83,15 +86,17 @@ const CHECK_FAILED = "criteria could not be checked";
  * looked at again, and is decided as soon as its held-out checks arrive or its time runs out.
  *
  * What makes a task `rejected`, in this order, with the reason given:
- * - criteria that are not stored under `criteria_hash`, or that are not UTF-8 JSON that fits
- *   `PublicCriteriaSchema`: `criteria not found or invalid`; criteria over 262_144 bytes:
- *   `criteria too large`;
+ * - criteria that are not stored under `criteria_hash` as a public `criteria` blob, or that are
+ *   not UTF-8 JSON that fits `PublicCriteriaSchema`: `criteria not found or invalid`; criteria
+ *   over 262_144 bytes: `criteria too large`. Bytes of another kind or visibility under the hash,
+ *   such as someone's private result, are not read, so nothing of them reaches a reason;
  * - `rubric` or `tests` from a poster outside `teamAccounts`: `kind {k} is limited to team tasks
  *   in v1` (C16); from the team: `kind {k} is not available yet`, as P0 has no scorer for either;
  * - `has_heldout` that does not match whether the task has a `heldout_commitment`;
  * - `exact` or `json_schema` without held-out checks: `held-out checks required for kind {k}`;
- * - a `json_schema` schema with a reference through a built-in member (see `refersToBuiltIn`), or
- *   one that `checkJsonSchemaUsable` refuses, with its reason;
+ * - a `json_schema` schema with a reference that is not a fragment of it, or that goes through a
+ *   built-in member (see `referenceProblem`), or one that `checkJsonSchemaUsable` refuses, with
+ *   its reason;
  * - a `heldout_commitment` that an earlier task of the same poster (a lower id, of any verifier)
  *   commits to as well: `held-out checks already used by task {id}`, naming the lowest. Held-out
  *   checks are single-use, as judging a task publishes them. Another poster's task with the same
@@ -199,7 +204,12 @@ function checkDocuments(
   policy: { teamAccounts: readonly string[]; nowNs: bigint; waitForHeldout: boolean },
 ): DocumentsCheck {
   const { criteria: criteriaBlob, heldout: heldoutBlob } = stored;
-  if (criteriaBlob === null) return rejected(CRITERIA_INVALID);
+  // Criteria are public: agents work from them, and anyone checks a scorecard against them. Bytes
+  // of any other kind under the hash, or private ones, such as someone's result, are not read:
+  // what a reason quotes of them would make them public.
+  if (criteriaBlob === null || criteriaBlob.kind !== "criteria" || !criteriaBlob.isPublic) {
+    return rejected(CRITERIA_INVALID);
+  }
   if (criteriaBlob.bytes.byteLength > MAX_DOCUMENT_BYTES) return rejected(CRITERIA_TOO_LARGE);
   const parsed = PublicCriteriaSchema.safeParse(parseJson(criteriaBlob.bytes));
   if (!parsed.success) return rejected(CRITERIA_INVALID);
@@ -219,7 +229,8 @@ function checkDocuments(
     return rejected(`held-out checks required for kind ${criteria.kind}`);
   }
   if (criteria.kind === "json_schema") {
-    if (refersToBuiltIn(criteria.schema)) return rejected(BUILT_IN_REFERENCE);
+    const problem = referenceProblem(criteria.schema);
+    if (problem !== null) return rejected(problem);
     const usable = checkJsonSchemaUsable(criteria.schema);
     if (!usable.ok) return rejected(clampReason(usable.reason));
   }
@@ -299,24 +310,26 @@ function parseJson(bytes: Uint8Array): unknown {
 }
 
 /**
- * Whether `schema` has a reference (`$ref`, `$dynamicRef`, `$recursiveRef`) that Ajv would
- * resolve through a member it inherits, rather than through the schema's own keys. Ajv looks the
- * names in a reference up on plain objects, so `#/constructor` finds `Object.prototype.constructor`
- * and `#/allOf/length` the length of an array, and the schema then fails on every document, or
- * worse takes every document as a fit. `checkJsonSchemaUsable` catches the first only.
+ * Why `schema` has a reference (`$ref`, `$dynamicRef`, `$recursiveRef`) that is not supported, or
+ * `null` when it has none. Ajv looks the names in a reference up on plain objects, so
+ * `#/constructor` finds `Object.prototype.constructor` and `#/allOf/length` the length of an
+ * array, and the schema then fails on every document, or worse takes every document as a fit.
+ * `checkJsonSchemaUsable` catches the first only.
  *
- * Every name in a reference counts, decoded as Ajv decodes it (percent-encoding, then `~1` and
- * `~0` in a JSON pointer): the segments of the URI before `#`, the anchor after it, or each
- * segment of a JSON pointer. A name of an `Object.prototype` member is refused wherever it is. A
- * JSON pointer with no URI before it is also walked through the schema resource the reference is
- * in (the closest object with an `$id`, or the whole schema), and each step must be an own key of
- * an object or an index of an array: `#/allOf/length` is refused, `#/$defs/total` is not. A step
- * that finds nothing ends the walk, as Ajv refuses a reference it cannot resolve on its own. A
- * reference whose percent-encoding cannot be decoded is refused.
+ * - A reference must be a fragment, starting with `#`. Nothing outside the schema resolves, so
+ *   no use is lost, and a URI before the `#` can lead Ajv into a resource that the walk below
+ *   would not find.
+ * - Each name in the fragment, decoded as Ajv decodes it (percent-encoding, then `~1` and `~0` in
+ *   a JSON pointer), must not be that of an `Object.prototype` member: the anchor, or each
+ *   segment of a JSON pointer. A fragment that cannot be decoded is refused too.
+ * - A JSON pointer is walked through the schema resource the reference is in (the closest object
+ *   with an `$id`, or the whole schema), and each step must be an own key of an object or an index
+ *   of an array: `#/allOf/length` is refused, `#/$defs/total` is not. A step that finds nothing
+ *   ends the walk, as Ajv refuses a reference it cannot resolve on its own.
  *
  * The criteria schema caps a document's nesting at 64, and the walk keeps its own stack.
  */
-function refersToBuiltIn(schema: Record<string, unknown>): boolean {
+function referenceProblem(schema: Record<string, unknown>): string | null {
   // Each entry is a value, and the schema resource it is in.
   const pending: [value: unknown, resource: object][] = [[schema, schema]];
   for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
@@ -330,38 +343,35 @@ function refersToBuiltIn(schema: Record<string, unknown>): boolean {
     const base = typeof node.$id === "string" ? node : resource;
     for (const [key, member] of Object.entries(node)) {
       if (REFERENCE_KEYWORDS.has(key) && typeof member === "string") {
-        if (namesBuiltIn(member, base)) return true;
+        const problem = problemOf(member, base);
+        if (problem !== null) return problem;
       } else {
         pending.push([member, base]);
       }
     }
   }
-  return false;
+  return null;
 }
 
-/** Whether `reference`, made inside `resource`, names a built-in member. See `refersToBuiltIn`. */
-function namesBuiltIn(reference: string, resource: object): boolean {
-  const hash = reference.indexOf("#");
-  const uri = hash < 0 ? reference : reference.slice(0, hash);
-  const fragment = hash < 0 ? "" : reference.slice(hash + 1);
+/** Why `reference`, made inside `resource`, is not supported, or `null`. See `referenceProblem`. */
+function problemOf(reference: string, resource: object): string | null {
+  if (!reference.startsWith("#")) return REFERENCE_NOT_A_FRAGMENT;
+  const fragment = reference.slice(1);
   const isPointer = fragment.startsWith("/");
-  let uriNames: string[];
-  let fragmentNames: string[];
+  let names: string[];
   try {
-    uriNames = uri.split("/").map((segment) => decodeURIComponent(segment));
-    fragmentNames = isPointer
+    names = isPointer
       ? fragment
           .slice(1)
           .split("/")
           .map((segment) => decodeURIComponent(segment).replace(/~1/g, "/").replace(/~0/g, "~"))
       : [decodeURIComponent(fragment)];
   } catch {
-    return true;
+    return REFERENCE_UNDECODABLE;
   }
-  if ([...uriNames, ...fragmentNames].some((name) => Object.hasOwn(Object.prototype, name))) {
-    return true;
-  }
-  return uri === "" && isPointer && !walksOwnKeys(resource, fragmentNames);
+  if (names.some((name) => Object.hasOwn(Object.prototype, name))) return BUILT_IN_REFERENCE;
+  if (isPointer && !walksOwnKeys(resource, names)) return BUILT_IN_REFERENCE;
+  return null;
 }
 
 /**

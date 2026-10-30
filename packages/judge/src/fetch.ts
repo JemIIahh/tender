@@ -28,7 +28,8 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
  * - Anything else must be an http(s) URL with no login in it. Its host is resolved first, and
  *   every address it resolves to must be a public unicast address (`isPublicAddress`), or it is
  *   `address not allowed`. The request then goes to an address that was checked, not to the name,
- *   so the name cannot be made to point somewhere else in between (DNS rebinding).
+ *   so the name cannot be made to point somewhere else in between (DNS rebinding). When one
+ *   cannot be reached, the next of them is tried.
  * - Redirects are followed at most 3 times, and each is resolved and checked like the first
  *   request. The whole of it has 10 s, and the body at most 262_144 bytes: the limits are kept
  *   while the body streams, and a body that is too large is not read to its end.
@@ -107,21 +108,11 @@ async function fetchFrom(
         return { error: signal.aborted ? "timed out" : "host not found" };
       }
     }
-    const [address] = addresses;
-    if (address === undefined) return { error: "host not found" };
+    if (addresses.length === 0) return { error: "host not found" };
     if (!addresses.every(isPublicAddress)) return { error: "address not allowed" };
 
-    let response: Response;
-    try {
-      const request = io.fetchImpl(pinned(url, address), {
-        headers: { host: url.host },
-        redirect: "manual",
-        signal,
-      });
-      response = await beforeAbort(request, signal);
-    } catch {
-      return { error: signal.aborted ? "timed out" : "fetch failed" };
-    }
+    const response = await requestFromAny(url, [...new Set(addresses)], io, signal);
+    if ("error" in response) return response;
 
     if (REDIRECT_STATUSES.has(response.status)) {
       discard(response);
@@ -140,6 +131,34 @@ async function fetchFrom(
     }
     return readBody(response, signal);
   }
+}
+
+/**
+ * The response to `url` from the first of `addresses` that answers, all of them checked. While a
+ * request fails, with an error and not a status, the next address is tried, within the same
+ * deadline: a request sent to an address gives up the fallback between IPv6 and IPv4 that one
+ * sent to a name has, so a host with both whose IPv6 cannot be reached from here still answers. A
+ * status is an answer, and no other address is asked.
+ */
+async function requestFromAny(
+  url: URL,
+  addresses: readonly string[],
+  io: FetchIo,
+  signal: AbortSignal,
+): Promise<Response | { error: string }> {
+  for (const address of addresses) {
+    try {
+      const request = io.fetchImpl(pinned(url, address), {
+        headers: { host: url.host },
+        redirect: "manual",
+        signal,
+      });
+      return await beforeAbort(request, signal);
+    } catch {
+      if (signal.aborted) return { error: "timed out" };
+    }
+  }
+  return { error: "fetch failed" };
 }
 
 /** The host of `url` as a resolver or a socket takes it: an IPv6 address without its brackets. */
@@ -327,8 +346,10 @@ const NETWORK: FetchIo = {
  * the address in the URL. Only what `fetchFrom` uses is supported: the headers and the signal. It
  * never follows a redirect, and it asks for the body as it is (`accept-encoding: identity`), so
  * the bytes read are the bytes the server holds and nothing is decompressed past the size cap.
+ *
+ * Exported for its own test; the Judge uses it through the default `FetchIo`.
  */
-async function pinnedFetch(input: string | URL | Request, init: RequestInit = {}) {
+export async function pinnedFetch(input: string | URL | Request, init: RequestInit = {}) {
   const url = new URL(input instanceof Request ? input.url : input);
   const headers = new Headers(init.headers);
   const host = headers.get("host") ?? url.host;

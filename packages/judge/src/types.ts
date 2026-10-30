@@ -34,8 +34,13 @@ export interface JudgeChain {
 
 /**
  * How the Judge reaches other hosts for an entry's content. The default is the system resolver
- * and a transport that connects to the address it is given; tests pass fakes, and never the
- * network.
+ * and the Judge's own transport, which connects to the address it is given. Tests pass fakes, and
+ * never the network.
+ *
+ * In production leave `JudgeDeps.fetchIo` unset. Passing the global `fetch` as `fetchImpl` breaks
+ * every https entry: it drops the `host` header, so the server is not named, and checks the
+ * certificate against the address in the URL, which no certificate is for. Every such entry would
+ * score 0.
  */
 export interface FetchIo {
   /** Every address `host` resolves to, as text: `93.184.216.34`, `2606:4700::6810:84e5`. */
@@ -59,18 +64,22 @@ export interface JudgeDeps {
   /** The base URL the API is served at. Blob URIs under it are read from `db`. */
   publicUrl: string;
   /**
-   * Whether `account` uploaded the bytes that hash to `sha256` as its result for task `taskId`
-   * (P03-R17). An entry whose URI is one of our own blob URIs counts only when this is true of the
-   * `content_hash` it revealed: a hash is on chain for anyone to copy once it is revealed, and a
-   * result the entrant did not upload for this task is someone else's work, private until its own
-   * task's reveals close. It throws when it cannot tell, and the task is judged again on a later
-   * tick.
+   * Whether `account` may use the bytes that hash to `sha256` as its result for task `taskId` at
+   * `nowNs`, the Judge's own clock (`now`) in nanoseconds: a record of its upload of them for the
+   * task exists (P03-R17), or the bytes are public by then (P03-R23). The API's `resultUsable` is
+   * this. An entry whose URI is one of our own blob URIs counts only when it is true of the
+   * `content_hash` the entry revealed: a hash is on chain for anyone to copy once it is revealed,
+   * and a private result the entrant did not upload for this task is someone else's work. It
+   * throws when it cannot tell, and the task is judged again on a later tick.
    */
-  resultUploaded(sha256: string, taskId: bigint, account: string): Promise<boolean>;
+  resultUploaded(sha256: string, taskId: bigint, account: string, nowNs: bigint): Promise<boolean>;
   /** The model that scores `rubric` tasks, from P1 on. */
   llm?: { baseUrl: string; apiKey: string; model: string; headers?: Record<string, string> };
   /** The clock. Defaults to the wall clock. */
   now?: () => Date;
-  /** How entries hosted elsewhere are fetched. Defaults to the network; see `FetchIo`. */
+  /**
+   * How entries hosted elsewhere are fetched, for tests. Leave it unset in production: the default
+   * is the network, through the Judge's own transport (see `FetchIo`).
+   */
   fetchIo?: FetchIo;
 }
