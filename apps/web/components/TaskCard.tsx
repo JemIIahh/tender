@@ -7,10 +7,9 @@ import { TeamBadge } from "./TeamBadge";
 
 /**
  * A task on the board: its title, which is the link to its page, the phase it is in, its reward and
- * who posted it. The phase is the one the API worked out when it answered. `onTag` makes each tag a
- * button that filters the board by it.
+ * who posted it. The phase is the one the API worked out when it answered.
  */
-export function TaskCard({ task, onTag }: { task: TaskSummary; onTag?: (tag: string) => void }) {
+export function TaskCard({ task }: { task: TaskSummary }) {
   return (
     <li data-testid="task-card" className="rounded border border-neutral-300 p-4">
       <h2 className="font-semibold wrap-anywhere">
@@ -37,19 +36,7 @@ export function TaskCard({ task, onTag }: { task: TaskSummary; onTag?: (tag: str
         <ul className="mt-2 flex flex-wrap gap-2" aria-label="Tags">
           {task.tags.map((tag) => (
             <li key={tag}>
-              {onTag === undefined ? (
-                <span className="rounded border border-neutral-400 px-1.5 py-0.5 text-xs">
-                  {tag}
-                </span>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => onTag(tag)}
-                  className="min-h-8 rounded border border-neutral-400 px-2 text-xs"
-                >
-                  {tag}
-                </button>
-              )}
+              <span className="rounded border border-neutral-400 px-1.5 py-0.5 text-xs">{tag}</span>
             </li>
           ))}
         </ul>

@@ -339,6 +339,112 @@ test("events_give_back_the_stream_a_probe_opened", async () => {
   expect(signal?.aborted).toBe(true);
 });
 
+test("events_reopen_after_the_backoff_when_the_probe_never_answers", async () => {
+  vi.useFakeTimers();
+  // A server that turned the stream away may not answer the probe either, and this one never does,
+  // not even when the request is cut off.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => new Promise<Response>(() => {})),
+  );
+  connect();
+
+  FakeEventSource.latest.failForGood();
+  // The probe is given five seconds, and then the backoff of a second is waited as usual.
+  await vi.advanceTimersByTimeAsync(5999);
+  expect(FakeEventSource.instances).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1);
+
+  expect(FakeEventSource.instances).toHaveLength(2);
+  expect(FakeEventSource.latest.url).toBe(STREAM);
+});
+
+test("events_cut_off_a_probe_that_is_not_answered_in_five_seconds", async () => {
+  vi.useFakeTimers();
+  // A request that hangs, as a real one does, until it is aborted.
+  let signal: AbortSignal | undefined;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      (_url: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          signal = init?.signal ?? undefined;
+          signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        }),
+    ),
+  );
+  connect();
+
+  FakeEventSource.latest.failForGood();
+  await vi.advanceTimersByTimeAsync(4999);
+  expect(signal?.aborted).toBe(false);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(signal?.aborted).toBe(true);
+
+  // Without a Retry-After the backoff decides, and it was a second.
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(FakeEventSource.instances).toHaveLength(2);
+});
+
+test("events_double_the_backoff_after_a_probe_that_timed_out", async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => new Promise<Response>(() => {})),
+  );
+  connect();
+
+  // Each failure costs the five seconds of the probe and then the backoff: 1, 2, 4 seconds.
+  const waits: number[] = [];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const before = FakeEventSource.instances.length;
+    FakeEventSource.latest.failForGood();
+    let waited = 0;
+    while (FakeEventSource.instances.length === before) {
+      await vi.advanceTimersByTimeAsync(500);
+      waited += 500;
+      if (waited > 60_000) throw new Error("it never reconnected");
+    }
+    waits.push(waited);
+  }
+
+  expect(waits).toEqual([6000, 7000, 9000]);
+});
+
+test("events_leave_no_timer_behind_once_the_probe_has_answered", async () => {
+  vi.useFakeTimers();
+  stubFetch(() => refused(503, { "Retry-After": "2" }));
+  connect();
+
+  FakeEventSource.latest.failForGood();
+  await vi.advanceTimersByTimeAsync(0);
+
+  // The wait before the reopen is pending, and not the five seconds the probe was given.
+  expect(vi.getTimerCount()).toBe(1);
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(FakeEventSource.instances).toHaveLength(2);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test("events_close_while_the_probe_waits_and_nothing_is_left_running", async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => new Promise<Response>(() => {})),
+  );
+  const { stream } = connect();
+  FakeEventSource.latest.failForGood();
+  await vi.advanceTimersByTimeAsync(2000);
+
+  stream.close();
+  await vi.advanceTimersByTimeAsync(60_000);
+
+  expect(FakeEventSource.instances).toHaveLength(1);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
 test("events_do_not_resume_from_an_id_that_is_no_u64", async () => {
   vi.useFakeTimers();
   const { source } = connect();

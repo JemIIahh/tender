@@ -156,17 +156,17 @@ test("countdown_counts_down_to_the_deadline_and_stops_at_zero", () => {
 test("scrub_positions_run_over_five_equal_zones", () => {
   const task = summary();
   // Each zone is a fifth of the scale: the four windows, then the time after the last one.
-  expect(SCRUB_MAX).toBe(1000);
+  expect(SCRUB_MAX).toBe(100);
   expect(nsAtScrub(task, 0)).toBe(AT.created);
-  expect(nsAtScrub(task, 200)).toBe(AT.commit);
-  expect(nsAtScrub(task, 400)).toBe(AT.reveal);
-  expect(nsAtScrub(task, 600)).toBe(AT.pick);
-  expect(nsAtScrub(task, 800)).toBe(AT.fallback);
+  expect(nsAtScrub(task, 20)).toBe(AT.commit);
+  expect(nsAtScrub(task, 40)).toBe(AT.reveal);
+  expect(nsAtScrub(task, 60)).toBe(AT.pick);
+  expect(nsAtScrub(task, 80)).toBe(AT.fallback);
   // Inside a zone it is linear in time: half of the 300 s reveal window is 150 s.
-  expect(nsAtScrub(task, 300)).toBe(AT.commit + 150n * SECOND);
+  expect(nsAtScrub(task, 30)).toBe(AT.commit + 150n * SECOND);
   // The last zone is as long as the fallback window, and a position past the scale is its end.
-  expect(nsAtScrub(task, 1000)).toBe(AT.fallback + 600n * SECOND);
-  expect(nsAtScrub(task, 5000)).toBe(AT.fallback + 600n * SECOND);
+  expect(nsAtScrub(task, 100)).toBe(AT.fallback + 600n * SECOND);
+  expect(nsAtScrub(task, 500)).toBe(AT.fallback + 600n * SECOND);
   expect(nsAtScrub(task, -5)).toBe(AT.created);
 });
 
@@ -174,7 +174,7 @@ test("every_scrub_position_lands_in_its_zones_phase", () => {
   const task = summary();
   const zones = ["open", "revealing", "judging", "fallback", "expired"];
   for (let position = 0; position <= SCRUB_MAX; position++) {
-    const zone = Math.min(Math.floor(position / 200), 4);
+    const zone = Math.min(Math.floor(position / 20), 4);
     expect(phaseByClock(task, nsAtScrub(task, position)), `position ${position}`).toBe(zones[zone]);
   }
 });
@@ -183,15 +183,15 @@ test("scrub_of_is_where_a_moment_sits_on_the_scale", () => {
   const task = summary();
   expect(scrubOf(task, AT.created - 99n * SECOND)).toBe(0);
   expect(scrubOf(task, AT.created)).toBe(0);
-  expect(scrubOf(task, AT.commit)).toBe(200);
-  expect(scrubOf(task, AT.commit + 150n * SECOND)).toBe(300);
-  expect(scrubOf(task, AT.fallback)).toBe(800);
+  expect(scrubOf(task, AT.commit)).toBe(20);
+  expect(scrubOf(task, AT.commit + 150n * SECOND)).toBe(30);
+  expect(scrubOf(task, AT.fallback)).toBe(80);
   expect(scrubOf(task, AT.fallback + 600n * SECOND)).toBe(SCRUB_MAX);
   expect(scrubOf(task, AT.fallback + 99_999n * SECOND)).toBe(SCRUB_MAX);
   // It never puts a moment in a later zone than the clock does: a ns before a deadline is still
   // inside the window it closes.
-  expect(scrubOf(task, AT.commit - 1n)).toBeLessThan(200);
-  expect(scrubOf(task, AT.reveal - 1n)).toBeLessThan(400);
+  expect(scrubOf(task, AT.commit - 1n)).toBeLessThan(20);
+  expect(scrubOf(task, AT.reveal - 1n)).toBeLessThan(40);
 });
 
 test("scrub_of_undoes_ns_at_scrub", () => {
@@ -202,7 +202,7 @@ test("scrub_of_undoes_ns_at_scrub", () => {
 });
 
 test("scrub_of_is_within_a_step_of_ns_at_scrub_for_any_window", () => {
-  // Windows that do not divide by 200: the inverse can be a step short, never a step over.
+  // Windows that do not divide by 20: the inverse can be a step short, never a step over.
   const task = summary({
     created_at: "1000000000000000000",
     commit_deadline: "1000000007000000001",
@@ -235,11 +235,11 @@ test("scrubber_shows_rule_per_phase", () => {
 
   // One position in each zone, and the rule of the phase the position falls in.
   const expected: Array<[number, string]> = [
-    [100, "entries are sealed"],
-    [300, "reveal or forfeit"],
-    [500, "verifier picks"],
-    [700, "poster may pick"],
-    [900, "anyone can refund"],
+    [10, "entries are sealed"],
+    [30, "reveal or forfeit"],
+    [50, "verifier picks"],
+    [70, "poster may pick"],
+    [90, "anyone can refund"],
   ];
   for (const [position, headline] of expected) {
     dragTo(position);
@@ -267,14 +267,14 @@ test("scrubber_previews_without_changing_what_is_live", () => {
   expect(screen.queryByTestId("preview-status")).toBeNull();
   expect(screen.queryByRole("button", { name: /back to now/i })).toBeNull();
 
-  dragTo(700);
+  dragTo(70);
 
   // Previewing the middle of the fallback window: 600 + 300 + 600 + 300 = 1800 s after posting.
   // The live line has not moved.
   expect(rule()).toBe("poster may pick");
   expect(screen.getByTestId("preview-status").textContent).toMatch(/preview/i);
   expect(screen.getByTestId("preview-status").textContent).toContain("30m 0s after posting");
-  expect(onScrub).toHaveBeenLastCalledWith(nsAtScrub(TIMELINE_TASK, 700));
+  expect(onScrub).toHaveBeenLastCalledWith(nsAtScrub(TIMELINE_TASK, 70));
   expect(live()).toContain("3m 20s");
 });
 
@@ -282,7 +282,7 @@ test("scrubber_goes_back_to_now", async () => {
   const onScrub = vi.fn();
   render(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.created + SECOND} onScrub={onScrub} />);
 
-  dragTo(900);
+  dragTo(90);
   expect(rule()).toBe("anyone can refund");
   await userEvent.click(screen.getByRole("button", { name: /back to now/i }));
 
@@ -293,16 +293,16 @@ test("scrubber_goes_back_to_now", async () => {
 
 test("scrubber_follows_the_clock_until_it_is_touched", () => {
   const { rerender } = render(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.commit - SECOND} />);
-  expect((scrubber() as HTMLInputElement).value).toBe("199");
+  expect((scrubber() as HTMLInputElement).value).toBe("19");
 
   rerender(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.commit + 150n * SECOND} />);
-  expect((scrubber() as HTMLInputElement).value).toBe("300");
+  expect((scrubber() as HTMLInputElement).value).toBe("30");
   expect(rule()).toBe("reveal or forfeit");
 
   // Once it is dragged the position is the person's, and the clock moving on does not take it back.
-  dragTo(50);
+  dragTo(5);
   rerender(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.reveal + 10n * SECOND} />);
-  expect((scrubber() as HTMLInputElement).value).toBe("50");
+  expect((scrubber() as HTMLInputElement).value).toBe("5");
   expect(rule()).toBe("entries are sealed");
 });
 
@@ -317,7 +317,7 @@ test("scrubber_marks_the_live_window_and_the_previewed_one", () => {
   expect(state("open")).toBe("none");
   expect(state("revealing")).toBe("live");
 
-  dragTo(500);
+  dragTo(50);
 
   expect(state("revealing")).toBe("live");
   expect(state("judging")).toBe("preview");
@@ -365,7 +365,7 @@ test("timeline_of_a_settled_task_says_settled_and_still_previews_the_clock", () 
   expect(states.every((state) => state === "none")).toBe(true);
 
   // The scrubber still answers what the rule was at another moment, and says it is a what-if.
-  dragTo(300);
+  dragTo(30);
   expect(rule()).toBe("reveal or forfeit");
   expect(screen.getByTestId("preview-status").textContent).toMatch(/already settled/i);
 });
@@ -380,12 +380,42 @@ test("scrubber_is_a_slider_a_keyboard_can_use", () => {
   expect(slider.min).toBe("0");
   expect(slider.max).toBe(String(SCRUB_MAX));
   expect(slider.step).toBe("1");
+  // A zone is twenty presses of an arrow key, and not two hundred.
+  expect(SCRUB_MAX / 5).toBe(20);
   expect(slider.disabled).toBe(false);
   expect(slider.tabIndex).toBeGreaterThanOrEqual(0);
   expect(screen.getByLabelText(/preview/i)).toBe(slider);
 
-  dragTo(300);
+  dragTo(30);
   const text = slider.getAttribute("aria-valuetext") ?? "";
   expect(text).toMatch(/reveal/i);
   expect(text).toContain("reveal or forfeit");
+});
+
+test("scrubber_text_does_not_change_while_it_follows_the_clock", () => {
+  const { rerender } = render(
+    <PhaseTimeline task={TIMELINE_TASK} nowNs={AT.commit + 10n * SECOND} />,
+  );
+  const text = () => scrubber().getAttribute("aria-valuetext");
+  const before = text();
+
+  // The clock moves on inside the same window: the thumb may move, and what a screen reader would
+  // say about it must not, or it says it every second.
+  rerender(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.commit + 11n * SECOND} />);
+  rerender(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.commit + 42n * SECOND} />);
+
+  expect(text()).toBe(before);
+  expect(before).toBe("Now, reveal window: reveal or forfeit");
+  expect(before).not.toMatch(/after posting/);
+});
+
+test("scrubber_text_says_how_long_after_posting_once_a_moment_is_previewed", () => {
+  render(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.commit + 10n * SECOND} />);
+
+  // The middle of the fallback window, which the person chose, so the text can be exact.
+  dragTo(70);
+
+  expect(scrubber().getAttribute("aria-valuetext")).toBe(
+    "Preview, fallback window, 30m 0s after posting: poster may pick",
+  );
 });

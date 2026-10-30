@@ -29,22 +29,45 @@ type More =
 type Board =
   | { status: "loading" }
   | { status: "error"; message: string; retrying: boolean }
-  | { status: "ready"; tasks: TaskSummary[]; next: string | null; more: More };
+  | {
+      status: "ready";
+      tasks: TaskSummary[];
+      next: string | null;
+      more: More;
+      /** The person has read on from the first page, so the last page is a place they have reached. */
+      paged: boolean;
+    };
 
 type Ready = Extract<Board, { status: "ready" }>;
+
+/**
+ * What stands where "Load more" was, once the last page is in. The button had the focus, and a
+ * button that is taken off the page drops it to the top of the document, so the line takes it. If
+ * the person has already moved on to something else, they are left there.
+ */
+function NoMoreTasks() {
+  const line = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    const focused = document.activeElement;
+    if (focused === null || focused === document.body) line.current?.focus();
+  }, []);
+  return (
+    <p ref={line} tabIndex={-1} className="text-sm">
+      No more tasks
+    </p>
+  );
+}
 
 function BoardBody({
   board,
   filtered,
   onRetry,
   onMore,
-  onTag,
 }: {
   board: Board;
   filtered: boolean;
   onRetry: () => void;
   onMore: (from: Ready) => void;
-  onTag: (tag: string) => void;
 }) {
   switch (board.status) {
     case "loading":
@@ -59,10 +82,14 @@ function BoardBody({
         <>
           <ul className="grid gap-3">
             {board.tasks.map((task) => (
-              <TaskCard key={task.id} task={task} onTag={onTag} />
+              <TaskCard key={task.id} task={task} />
             ))}
           </ul>
-          {board.next === null ? null : board.more.state === "error" ? (
+          {board.next === null ? (
+            board.paged ? (
+              <NoMoreTasks />
+            ) : null
+          ) : board.more.state === "error" ? (
             <ErrorState
               message={board.more.message}
               retrying={board.more.retrying}
@@ -111,6 +138,7 @@ export default function Home() {
             tasks: page.tasks,
             next: page.next_cursor,
             more: { state: "idle" },
+            paged: false,
           });
         }
       },
@@ -145,6 +173,7 @@ export default function Home() {
           tasks: [...from.tasks, ...page.tasks],
           next: page.next_cursor,
           more: { state: "idle" },
+          paged: true,
         });
       },
       (error) => {
@@ -241,7 +270,6 @@ export default function Home() {
         filtered={filtered}
         onRetry={() => load(filters)}
         onMore={loadMore}
-        onTag={filterByTag}
       />
     </div>
   );

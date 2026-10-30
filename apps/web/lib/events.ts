@@ -12,6 +12,8 @@ const STREAM_URL = `${config.apiUrl}/v1/events`;
 const MIN_BACKOFF_MS = 1_000;
 /** The longest wait between two tries, and the longest a `Retry-After` is taken at its word. */
 const MAX_BACKOFF_MS = 30_000;
+/** How long the probe for `Retry-After` is given to answer, before the stream is reopened without it. */
+const PROBE_TIMEOUT_MS = 5_000;
 
 /**
  * Every event the contract logs, by name. The API names each message of the stream with its event
@@ -64,18 +66,29 @@ function retryAfterMs(header: string | null): number | undefined {
  * `Retry-After: 5` when it is full, and lets the page read that header (CORS exposes it).
  *
  * If the server lets this request in, that opens a stream nobody wants, so it is cut off as soon
- * as the headers are here, whatever they say. Undefined if there was no answer or no header.
+ * as the headers are here, whatever they say. A server that turned the stream away may not answer
+ * this request either, and the reopen waits for it, so it is cut off after `PROBE_TIMEOUT_MS` too.
+ * Undefined if there was no answer or no header.
+ *
+ * Being cut off (by the timer, or by `controller.abort()` from outside) ends the wait at once,
+ * whether or not the `fetch` takes the abort to heart: the reopen never depends on it.
  */
 async function askHowLongToWait(controller: AbortController): Promise<number | undefined> {
+  const { signal } = controller;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const cutOff = new Promise<undefined>((resolve) => {
+    signal.addEventListener("abort", () => resolve(undefined), { once: true });
+    timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  });
   try {
-    const response = await fetch(STREAM_URL, {
-      headers: { Accept: "text/event-stream" },
-      signal: controller.signal,
-    });
-    return retryAfterMs(response.headers.get("Retry-After"));
+    const asked = fetch(STREAM_URL, { headers: { Accept: "text/event-stream" }, signal }).then(
+      (response) => retryAfterMs(response.headers.get("Retry-After")),
+    );
+    return await Promise.race([asked, cutOff]);
   } catch {
     return undefined;
   } finally {
+    clearTimeout(timer);
     controller.abort();
   }
 }
@@ -89,8 +102,8 @@ async function askHowLongToWait(controller: AbortController): Promise<number | u
  * - When the server answers with something that is not a stream (a 503 when it is full, a 500),
  *   the browser gives up for good: the `EventSource` is `CLOSED`. This waits and opens a new one,
  *   at `?since=` the last id it got. The wait doubles from a second to 30 seconds, and is at least
- *   what `Retry-After` asks for, which is read with a request of its own. It starts at a second
- *   again once a connection opens.
+ *   what `Retry-After` asks for, which is read with a request of its own that is given five
+ *   seconds to answer. It starts at a second again once a connection opens.
  * - A message that is not an event the contract logs is dropped, and logged.
  */
 export function connectEvents({ onEvent, onResync }: EventHandlers): EventStream {

@@ -146,10 +146,19 @@ test("scrubber_previews_each_rule_from_the_keyboard", async ({ page }) => {
     .toBe(true);
   const asked = reads();
 
-  // Home, then Page Up (a tenth of the scale each): one zone of the timeline per two presses.
+  // Home, then the arrow keys, a position at a time: a zone of the timeline is twenty presses, so
+  // nineteen from the start are still in the commit window, and the twentieth is in the next.
   await slider.focus();
   await page.keyboard.press("Home");
   await expect(page.getByTestId("preview-status")).toBeVisible();
+  for (let i = 0; i < 19; i++) await page.keyboard.press("ArrowRight");
+  await expect(rule).toHaveText("entries are sealed");
+  await page.keyboard.press("ArrowRight");
+  await expect(rule).toHaveText("reveal or forfeit");
+
+  // Home again, then Page Up (a tenth of the scale each): one zone per two presses.
+  await page.keyboard.press("Home");
+  await expect(rule).toHaveText("entries are sealed");
   const stops: Array<[presses: number, headline: string]> = [
     [3, "reveal or forfeit"],
     [2, "verifier picks"],

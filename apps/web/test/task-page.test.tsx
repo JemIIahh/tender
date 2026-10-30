@@ -167,18 +167,67 @@ test("task_page_shows_an_error_state_that_retries_and_logs_the_error", async () 
   expect(api.count(TASK_PATH)).toBe(2);
 });
 
-test("task_page_shows_an_error_state_when_the_verifier_cannot_be_read", async () => {
-  quietLog();
+test("task_page_shows_the_task_and_says_so_when_the_verifier_record_cannot_be_read", async () => {
+  const log = quietLog();
   fakeApi(
     routes(
       () => detail(),
       () => json({ error: "internal", message: "x" }, 500),
     ),
   );
-  render(<TaskView id="7" />);
 
-  // A page that cannot say who judges the task does not pretend to be whole.
-  expect((await screen.findByRole("alert")).textContent).toContain("500");
+  await open();
+
+  // The task is what the person came for, and all of it is there.
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Extract invoice totals");
+  expect(screen.getByTestId("entry-summary")).toBeTruthy();
+  expect(screen.queryByRole("alert")).toBeNull();
+  // One section says what is missing, and still names the verifier. It does not claim that the
+  // account is no agent, which it does not know.
+  const record = within(screen.getByTestId("verifier-record"));
+  expect(record.getByText("Verifier record unavailable")).toBeTruthy();
+  expect(record.getByText(VERIFIER)).toBeTruthy();
+  expect(record.queryByTestId("picks-made")).toBeNull();
+  expect(record.queryByText(/no record/i)).toBeNull();
+  // The original error is in the console.
+  expect(log).toHaveBeenCalledTimes(1);
+});
+
+test("task_page_takes_the_new_task_when_only_the_verifier_record_fails_on_asking_again", async () => {
+  quietLog();
+  let agentFails = false;
+  let committed = 2;
+  const api = fakeApi({
+    [TASK_PATH]: () =>
+      json(
+        detail(
+          {},
+          {
+            entries: Array.from({ length: committed }, (_, i) =>
+              entry(`agent${i}.testnet`, { entry_index: i }),
+            ),
+          },
+        ),
+      ),
+    [AGENT_PATH]: () =>
+      agentFails ? json({ error: "internal", message: "x" }, 500) : json(agentDetail()),
+  });
+  await open();
+  const stream = FakeEventSource.latest;
+  act(() => stream.open());
+  await waitFor(() => expect(api.count(TASK_PATH)).toBe(2));
+  expect(screen.getByTestId("picks-made")).toBeTruthy();
+
+  agentFails = true;
+  committed = 3;
+  act(() => stream.send("committed", message("committed", "7", committedData("7")), "11"));
+
+  await waitFor(() =>
+    expect(screen.getByTestId("entry-summary").textContent).toBe("3 committed · 0 revealed"),
+  );
+  expect(screen.getByText("Verifier record unavailable")).toBeTruthy();
+  // The task itself is current, so there is no notice that it may be out of date.
+  expect(screen.queryByRole("alert")).toBeNull();
 });
 
 // ---- What it shows ----------------------------------------------------------------------------

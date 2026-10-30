@@ -1,13 +1,23 @@
 import { canonicalJson, type Scorecard as ScorecardDocument } from "@tender/shared";
+import { useMemo } from "react";
 import { formatBps } from "../lib/bps";
 
 /**
  * The held-out document as a download: the same bytes that were hashed into the commitment, which
  * are its canonical JSON. A reader runs `shasum -a 256` on the file and compares.
+ *
+ * Undefined for a document that cannot be written that way. The verifier wrote it, and JSON can
+ * hold what the canonical form refuses (a lone surrogate in a string): the index may keep such a
+ * document from before it asked for canonical bytes. The page shows the rest without it.
  */
-function heldoutHref(heldout: unknown): string {
-  const text = new TextDecoder().decode(canonicalJson(heldout));
-  return `data:application/json;charset=utf-8,${encodeURIComponent(text)}`;
+function heldoutHref(heldout: unknown): string | undefined {
+  try {
+    const text = new TextDecoder().decode(canonicalJson(heldout));
+    return `data:application/json;charset=utf-8,${encodeURIComponent(text)}`;
+  } catch (error) {
+    console.error("scorecard: the held-out document cannot be written as canonical JSON", error);
+    return undefined;
+  }
 }
 
 /**
@@ -29,6 +39,9 @@ export function Scorecard({
 }) {
   const expected = commitment === undefined ? scorecard.heldout_commitment : commitment;
   const claimed = scorecard.heldout_commitment;
+  // The page draws again every second, for its countdowns, and the document can be 256 KiB.
+  const heldout = scorecard.heldout;
+  const href = useMemo(() => (heldout === null ? undefined : heldoutHref(heldout)), [heldout]);
 
   return (
     <section data-testid="scorecard" className="grid gap-4">
@@ -56,9 +69,10 @@ export function Scorecard({
             </tr>
           </thead>
           <tbody>
-            {scorecard.entries.map((entry) => (
+            {scorecard.entries.map((entry, i) => (
               <tr
-                key={entry.account}
+                // biome-ignore lint/suspicious/noArrayIndexKey: the verifier writes the document, and two rows can name the same account
+                key={`${entry.account}:${i}`}
                 data-testid="score-row"
                 className="border-t border-neutral-300 align-top"
               >
@@ -96,8 +110,13 @@ export function Scorecard({
           <p className="text-sm">No winner: nothing was awarded.</p>
         ) : (
           <ul className="grid gap-1 text-sm">
-            {scorecard.winners.map((winner) => (
-              <li key={winner.account} data-testid="scorecard-winner" className="wrap-anywhere">
+            {scorecard.winners.map((winner, i) => (
+              <li
+                // biome-ignore lint/suspicious/noArrayIndexKey: the verifier writes the document, and two winners can name the same account
+                key={`${winner.account}:${i}`}
+                data-testid="scorecard-winner"
+                className="wrap-anywhere"
+              >
                 {`${winner.account} · ${formatBps(winner.bps)}`}
               </li>
             ))}
@@ -115,12 +134,10 @@ export function Scorecard({
             </p>
             {scorecard.heldout === null ? (
               <p>The verifier has not published the held-out document.</p>
+            ) : href === undefined ? (
+              <p>The held-out document cannot be written out as a file.</p>
             ) : (
-              <a
-                href={heldoutHref(scorecard.heldout)}
-                download="heldout.json"
-                className="w-fit underline"
-              >
+              <a href={href} download="heldout.json" className="w-fit underline">
                 Held-out document (JSON)
               </a>
             )}

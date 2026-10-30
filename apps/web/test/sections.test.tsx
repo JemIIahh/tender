@@ -1,6 +1,6 @@
 import { canonicalJson, type PublicCriteria, sha256Hex, type TaskOutcome } from "@tender/shared";
 import { render, screen, within } from "@testing-library/react";
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { BriefSection } from "../components/BriefSection";
 import { CriteriaSection } from "../components/CriteriaSection";
 import { Payouts } from "../components/Payouts";
@@ -8,6 +8,10 @@ import { PHASE_LABELS, PhaseChip } from "../components/PhaseChip";
 import { Scorecard } from "../components/Scorecard";
 import { formatBps } from "../lib/bps";
 import { detail, HASH_A, HASH_B, HASH_C, POSTER, scorecard, TOKEN, VERIFIER } from "./tasks";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 // ---- Basis points -----------------------------------------------------------------------------
 
@@ -307,6 +311,54 @@ test("scorecard_links_the_held_out_document_as_the_bytes_that_were_hashed", () =
   // Keys in order and no spaces: the canonical form, which is what the commitment is the hash of.
   expect(bytes).toBe('{"regex_cases":{"match":["alice.near"],"no_match":["-bad"]}}');
   expect(sha256Hex(bytes)).toBe(commitment);
+});
+
+test("scorecard_shows_the_rest_and_no_link_when_the_held_out_document_cannot_be_written_out", () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  // JSON can escape a lone surrogate, and the canonical form refuses to write one.
+  const heldout = { note: `x${String.fromCharCode(0xd800)}y` };
+
+  render(<Scorecard scorecard={scorecard({ heldout })} />);
+
+  expect(screen.queryByRole("link")).toBeNull();
+  expect(screen.getByText("The held-out document cannot be written out as a file.")).toBeTruthy();
+  // The scorecard is still there, and so is the line to recompute the commitment by.
+  expect(screen.getAllByTestId("score-row")).toHaveLength(2);
+  expect(screen.getByTestId("recompute")).toBeTruthy();
+  // The original error goes to the console, where a developer looks.
+  expect(log).toHaveBeenCalledTimes(1);
+});
+
+test("scorecard_writes_the_held_out_document_once_however_often_the_page_draws", () => {
+  const decode = vi.spyOn(TextDecoder.prototype, "decode");
+  const card = scorecard();
+  const { rerender } = render(<Scorecard scorecard={card} commitment={HASH_A} />);
+  const written = decode.mock.calls.length;
+  expect(written).toBeGreaterThan(0);
+
+  // The page draws again every second for its countdowns: the same document each time.
+  rerender(<Scorecard scorecard={card} commitment={HASH_A} />);
+  rerender(<Scorecard scorecard={{ ...card }} commitment={HASH_A} />);
+  expect(decode.mock.calls.length).toBe(written);
+
+  // Another document is written again.
+  rerender(<Scorecard scorecard={{ ...card, heldout: { other: true } }} commitment={HASH_A} />);
+  expect(decode.mock.calls.length).toBeGreaterThan(written);
+});
+
+test("scorecard_lists_two_rows_that_name_the_same_account", () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  const [alice] = scorecard().entries;
+  if (!alice) throw new Error("the builder has an entry");
+  const share = { account: alice.account, bps: 5000 };
+
+  // The verifier writes the document, and the schema does not make accounts unique.
+  render(<Scorecard scorecard={scorecard({ entries: [alice, alice], winners: [share, share] })} />);
+
+  expect(screen.getAllByTestId("score-row")).toHaveLength(2);
+  expect(screen.getAllByTestId("scorecard-winner")).toHaveLength(2);
+  // React logs two children with one key when there is a clash.
+  expect(log).not.toHaveBeenCalled();
 });
 
 test("scorecard_asks_for_the_hash_the_task_has_on_chain_and_flags_a_scorecard_that_differs", () => {

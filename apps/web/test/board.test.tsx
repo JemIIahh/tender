@@ -394,16 +394,14 @@ test("board_does_not_ask_for_a_tag_the_api_would_refuse", async () => {
   expect(screen.queryByRole("alert")).toBeNull();
 });
 
-test("board_filters_by_the_tag_of_a_card_when_it_is_pressed", async () => {
-  const api = fakeApi(json(page(TASK)));
+test("board_shows_the_tags_of_a_card_as_text_and_not_as_buttons", async () => {
+  fakeApi(json(page(TASK)));
   render(<Home />);
   const card = within(await screen.findByTestId("task-card"));
 
-  await userEvent.click(card.getByRole("button", { name: "json" }));
-
-  await waitFor(() => expect(api.urls).toHaveLength(2));
-  expect(query(api, 1).get("tag")).toBe("json");
-  expect((screen.getByLabelText("Tag") as HTMLInputElement).value).toBe("json");
+  // The Tag field is the one way to filter by a tag.
+  expect(card.getByText("json")).toBeTruthy();
+  expect(card.queryByRole("button")).toBeNull();
 });
 
 test("board_says_when_no_task_matches_the_filters", async () => {
@@ -450,8 +448,9 @@ test("board_loads_the_next_page_with_the_cursor_the_api_gave", async () => {
   await screen.findByText("An older task");
   expect(query(api, 1).get("cursor")).toBe("7");
   expect(screen.getAllByTestId("task-card")).toHaveLength(2);
-  // That was the last page.
+  // That was the last page: a line stands where the button was.
   expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+  expect(screen.getByText("No more tasks")).toBeTruthy();
 });
 
 test("board_has_no_load_more_on_the_last_page", async () => {
@@ -460,7 +459,9 @@ test("board_has_no_load_more_on_the_last_page", async () => {
 
   await screen.findByTestId("task-card");
 
+  // Nothing was read on from, so there is nothing to say the end of.
   expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+  expect(screen.queryByText("No more tasks")).toBeNull();
 });
 
 test("board_keeps_its_tasks_when_the_next_page_fails_and_offers_a_retry", async () => {
@@ -484,4 +485,46 @@ test("board_keeps_its_tasks_when_the_next_page_fails_and_offers_a_retry", async 
   await screen.findByText("An older task");
   expect(screen.queryByRole("alert")).toBeNull();
   expect(query(api, 2).get("cursor")).toBe("7");
+  // The retry button had the focus, and is gone with the last page.
+  expect(document.activeElement).toBe(screen.getByText("No more tasks"));
+});
+
+test("board_moves_the_focus_to_the_line_that_replaces_load_more", async () => {
+  fakeApi(
+    json({ tasks: [TASK], next_cursor: "7" }),
+    json({ tasks: [{ ...TASK, id: "6", title: "An older task" }], next_cursor: null }),
+  );
+  render(<Home />);
+  await screen.findByTestId("task-card");
+
+  await userEvent.click(screen.getByRole("button", { name: "Load more" }));
+
+  const line = await screen.findByText("No more tasks");
+  // A button taken off the page drops the focus to the top of the document: the line takes it.
+  expect(document.activeElement).toBe(line);
+});
+
+test("board_leaves_the_focus_where_the_person_went_while_the_last_page_loaded", async () => {
+  const pending: Array<(response: Response) => void> = [];
+  const answers = [json({ tasks: [TASK], next_cursor: "7" })];
+  vi.stubGlobal(
+    "fetch",
+    () =>
+      new Promise<Response>((resolve) => {
+        const first = answers.shift();
+        if (first) resolve(first);
+        else pending.push(resolve);
+      }),
+  );
+  render(<Home />);
+  await screen.findByTestId("task-card");
+  await userEvent.click(screen.getByRole("button", { name: "Load more" }));
+  await waitFor(() => expect(pending).toHaveLength(1));
+  // While the page is on its way the person goes on to the tag field and starts to type.
+  await userEvent.click(screen.getByLabelText("Tag"));
+
+  pending[0]?.(json({ tasks: [{ ...TASK, id: "6", title: "An older task" }], next_cursor: null }));
+
+  await screen.findByText("No more tasks");
+  expect(document.activeElement).toBe(screen.getByLabelText("Tag"));
 });

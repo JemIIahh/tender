@@ -23,8 +23,11 @@ import { VerifierRecord } from "./VerifierRecord";
 
 interface Loaded {
   data: TaskDetailResponse;
-  /** The task's verifier as an agent, or null if it never registered as one. */
-  verifier: AgentSummary | null;
+  /**
+   * The task's verifier as an agent: null if it never registered as one, and "unavailable" if its
+   * profile could not be read just now. The task is the page, and the profile is a section of it.
+   */
+  verifier: AgentSummary | null | "unavailable";
 }
 
 /** An answer that could not be had again: what was shown stays, with this above it. */
@@ -43,8 +46,14 @@ type State =
 async function fetchTask(id: string): Promise<Loaded | null> {
   const data = await api.getTask(id);
   if (data === null) return null;
-  const record = await api.getAgent(data.task.verifier);
-  return { data, verifier: record?.agent ?? null };
+  try {
+    const record = await api.getAgent(data.task.verifier);
+    return { data, verifier: record?.agent ?? null };
+  } catch (error) {
+    // The section says what is missing; the original goes to the console, where a developer looks.
+    console.error(error);
+    return { data, verifier: "unavailable" };
+  }
 }
 
 function Funders({ funders, token }: Pick<TaskDetailResponse, "funders"> & { token: string }) {
@@ -101,6 +110,7 @@ function ReadyView({
   // The phase by the clock, so that a window ends on the page when it ends in the contract.
   const phase = phaseOfTask(task, nowNs);
   const scorecardHash = task.outcome?.scorecard_hash ?? null;
+  const record = loaded.verifier === "unavailable" ? null : loaded.verifier;
 
   return (
     <article className="grid gap-8">
@@ -142,10 +152,11 @@ function ReadyView({
       <EntryList entries={entries} phase={phase} />
       <VerifierRecord
         account={task.verifier}
-        isTeam={loaded.verifier?.is_team ?? false}
-        picks_made={loaded.verifier?.picks_made ?? null}
-        voids_after_reveals={loaded.verifier?.voids_after_reveals ?? null}
+        isTeam={record?.is_team ?? false}
+        picks_made={record?.picks_made ?? null}
+        voids_after_reveals={record?.voids_after_reveals ?? null}
         isPoster={task.poster === task.verifier}
+        unavailable={loaded.verifier === "unavailable"}
       />
       {scorecard !== null ? (
         <Scorecard scorecard={scorecard} commitment={task.heldout_commitment} />
@@ -174,8 +185,9 @@ function ReadyView({
 /**
  * A task's page. It loads the task from the API, then its verifier, and asks again whenever the
  * event stream reports something on this task, so that an entry or a reveal appears without a
- * reload. If asking again fails, what is shown stays, with a notice that it may be out of date.
- * The phase and its countdown follow the clock.
+ * reload. If asking again fails, what is shown stays, with a notice that it may be out of date. If
+ * only the verifier's profile cannot be read, the task is shown and that section says so. The
+ * phase and its countdown follow the clock.
  */
 export function TaskView({ id }: { id: string }) {
   const [state, setState] = useState<State>({ status: "loading" });

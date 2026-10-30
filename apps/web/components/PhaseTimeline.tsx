@@ -94,9 +94,12 @@ export function PhaseTimeline({
   };
 
   const elapsed = (ns: bigint) => `${formatDuration(ns - created)} after posting`;
+  // Following the clock, the thumb moves by itself and its text must not change every second, or a
+  // screen reader says it each time: the elapsed time is only in the text of a preview, which
+  // changes when the person moves the slider.
   const valueText =
     previewNs === null
-      ? `Now, ${WINDOW_NAMES[shown]}, ${elapsed(nowNs)}: ${rule.headline}`
+      ? `Now, ${WINDOW_NAMES[shown]}: ${rule.headline}`
       : `Preview, ${WINDOW_NAMES[shown]}, ${elapsed(previewNs)}: ${rule.headline}`;
 
   return (

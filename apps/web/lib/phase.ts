@@ -133,12 +133,13 @@ export const WINDOW_LABELS: Record<WindowPhase | "expired", string> = {
 // ---- The scrubber -----------------------------------------------------------------------------
 
 /**
- * The scrubber's scale runs from 0 to this. It is cut into five equal zones: the four windows, and
- * after them the time past the last deadline, where the rule is that anyone can refund. A scale
- * that gave each window its share of the time would leave the reveal window, often the shortest, a
- * sliver that cannot be seen or hit on a phone.
+ * The scrubber's scale runs from 0 to this, a position a step. It is cut into five equal zones: the
+ * four windows, and after them the time past the last deadline, where the rule is that anyone can
+ * refund. A scale that gave each window its share of the time would leave the reveal window, often
+ * the shortest, a sliver that cannot be seen or hit on a phone. A hundred positions are few enough
+ * for the arrow keys to cross a zone in twenty presses.
  */
-export const SCRUB_MAX = 1000;
+export const SCRUB_MAX = 100;
 const ZONES = 5;
 const ZONE_STEPS = SCRUB_MAX / ZONES;
 
@@ -155,7 +156,7 @@ function zones(task: TaskWindows): Array<[bigint, bigint]> {
 
 /**
  * The moment a position on the scrubber stands for. It is linear in time inside a zone, so the
- * start of a zone is the deadline that opens it: 200 is the commit deadline, 400 the reveal
+ * start of a zone is the deadline that opens it: 20 is the commit deadline, 40 the reveal
  * deadline, and so on. A position outside the scale, or that is not a number, is the nearest end.
  */
 export function nsAtScrub(task: TaskWindows, position: number): bigint {

@@ -208,3 +208,23 @@ test("verifier_record_says_when_the_contract_keeps_none", () => {
   expect(screen.queryByTestId("picks-made")).toBeNull();
   expect(screen.queryByTestId("voids-after-reveals")).toBeNull();
 });
+
+test("verifier_record_says_when_the_profile_could_not_be_read", () => {
+  // Not the same as a verifier that never registered: that is a fact, and this is a failure.
+  render(
+    <VerifierRecord
+      account="judge.tender-team.testnet"
+      isTeam={false}
+      picks_made={null}
+      voids_after_reveals={null}
+      isPoster
+      unavailable
+    />,
+  );
+
+  expect(screen.getByText("Verifier record unavailable")).toBeTruthy();
+  expect(screen.queryByText(/no record/i)).toBeNull();
+  expect(screen.queryByTestId("picks-made")).toBeNull();
+  // What the task itself says is still said.
+  expect(screen.getByText("Poster judges their own task")).toBeTruthy();
+});

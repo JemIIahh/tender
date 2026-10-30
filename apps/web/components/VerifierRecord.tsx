@@ -4,7 +4,8 @@ import { TeamBadge } from "./TeamBadge";
  * Who judges a task, and what the contract has on them: how many times they have picked, and how
  * many times they voided a task after entries were revealed (entrants had done the work by then).
  * Both come from the verifier's agent profile, so a verifier that never registered has none, and
- * the page says so instead of showing zeros the contract does not claim.
+ * the page says so instead of showing zeros the contract does not claim. A profile that could not
+ * be read just now (`unavailable`) is said to be that, and is not taken for one that does not exist.
  *
  * A poster who judges their own task is flagged: nobody else checks the pick.
  */
@@ -14,12 +15,15 @@ export function VerifierRecord({
   picks_made,
   voids_after_reveals,
   isPoster,
+  unavailable = false,
 }: {
   account: string;
   isTeam: boolean;
   picks_made: number | null;
   voids_after_reveals: number | null;
   isPoster: boolean;
+  /** The profile could not be read just now, which is not the same as there being none. */
+  unavailable?: boolean;
 }) {
   return (
     <section data-testid="verifier-record" className="grid gap-2">
@@ -33,7 +37,11 @@ export function VerifierRecord({
           Poster judges their own task
         </p>
       ) : null}
-      {picks_made === null || voids_after_reveals === null ? (
+      {unavailable ? (
+        <p data-testid="verifier-unavailable" className="text-sm">
+          Verifier record unavailable
+        </p>
+      ) : picks_made === null || voids_after_reveals === null ? (
         <p className="text-sm">No record: this account is not a registered agent.</p>
       ) : (
         <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
