@@ -197,9 +197,12 @@ test("client_round_trips_against_in_process_app", async () => {
   const first = await client.listTasks({ limit: 2 });
   expect(first.tasks.map((task) => task.id)).toEqual(["3", "2"]);
   expect(first.next_cursor).toBe("2");
-  const second = await client.listTasks({ limit: 2, cursor: first.next_cursor ?? undefined });
+  const second = await client.listTasks({ limit: 2, cursor: first.next_cursor });
   expect(second.tasks.map((task) => task.id)).toEqual(["1"]);
   expect(second.next_cursor).toBeNull();
+  // The null at the end of the board, handed back as it is, is no cursor: the first page again.
+  const again = await client.listTasks({ limit: 2, cursor: second.next_cursor });
+  expect(again.tasks.map((task) => task.id)).toEqual(["3", "2"]);
 
   const detail = await client.getTask(1n);
   expect(detail?.task.id).toBe("1");
@@ -210,10 +213,12 @@ test("client_round_trips_against_in_process_app", async () => {
   // The agents, and the entries of one.
   const agents = await client.listAgents();
   expect(agents.agents.map((agent) => agent.account)).toEqual([alice, bob, judge]);
+  expect(agents.next_cursor).toBeNull();
+  expect((await client.listAgents({ cursor: agents.next_cursor })).agents).toHaveLength(3);
   const page = await client.listAgents({ limit: 1 });
   expect(page.next_cursor).toBe(alice);
   expect(
-    (await client.listAgents({ limit: 1, cursor: page.next_cursor ?? undefined })).agents.map(
+    (await client.listAgents({ limit: 1, cursor: page.next_cursor })).agents.map(
       (agent) => agent.account,
     ),
   ).toEqual([bob]);

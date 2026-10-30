@@ -39,6 +39,7 @@ const U64_MAX = 2n ** 64n - 1n;
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 // ---- Answers ----------------------------------------------------------------------------------
@@ -436,6 +437,36 @@ test("requests_go_to_the_paths_and_queries_of_the_api", async () => {
   // The reads are public: no sign-in, and no token sent.
   expect(api.challenges).toBe(0);
   expect(api.calls.every((call) => call.headers.get("Authorization") === null)).toBe(true);
+});
+
+test("a_null_cursor_is_no_cursor", async () => {
+  const api = fakeApi();
+  serveBoard(api);
+  const client = clientOf(api);
+
+  // The `next_cursor` of the last page is null, and a caller hands it back as it is. That asks for
+  // the first page, as no cursor does: it is not sent, as the text "null" or as anything else.
+  await client.listTasks({ cursor: null });
+  await client.listTasks({ limit: 5, cursor: null });
+  await client.listAgents({ cursor: null });
+  await client.listAgents({ tag: "extraction", cursor: null });
+  const page = await client.listAgents();
+  expect(page.next_cursor).toBeNull();
+  await client.listAgents({ cursor: page.next_cursor });
+  // A cursor that is there goes out.
+  await client.listTasks({ cursor: "123" });
+  await client.listAgents({ cursor: ACCOUNT });
+
+  expect(api.calls.map((call) => call.url.href)).toEqual([
+    `${BASE}/v1/tasks`,
+    `${BASE}/v1/tasks?limit=5`,
+    `${BASE}/v1/agents`,
+    `${BASE}/v1/agents?tag=extraction`,
+    `${BASE}/v1/agents`,
+    `${BASE}/v1/agents`,
+    `${BASE}/v1/tasks?cursor=123`,
+    `${BASE}/v1/agents?cursor=alice.test.near`,
+  ]);
 });
 
 test("ids_above_two_to_the_53_go_out_as_exact_decimal_strings", async () => {
@@ -875,6 +906,92 @@ test("a_429_is_an_api_error_and_is_not_retried", async () => {
   signIns.on("POST /v1/auth/challenge", limited);
   expect((await apiError(clientOf(signIns).signIn())).status).toBe(429);
   expect(signIns.calls).toHaveLength(1);
+});
+
+interface Failure {
+  name: string;
+  /** The routes that answer with the secret in the answer. */
+  routes: Array<[string, Handler]>;
+  call: (client: ApiClient) => Promise<unknown>;
+  /** Whether the error holds the answer as its body, and so the secret is in it. */
+  holdsAnswer: boolean;
+}
+
+test("a_failure_is_never_logged_and_puts_no_answer_in_a_message", async () => {
+  // An `ApiError` holds the body of the answer for the caller to read, and for a sign-in that can
+  // be the bearer token. The client must not log a body, nor build a message out of one.
+  const SECRET = "s3cret-token-that-must-not-be-printed";
+  const wrong =
+    (status: number, body: string): Handler =>
+    () =>
+      new Response(body, { status });
+  const failures: Failure[] = [
+    {
+      name: "a sign-in whose answer does not fit",
+      routes: [["POST /v1/auth/verify", () => json({ token: SECRET, key_kind: "full_access" })]],
+      call: (client) => client.signIn(),
+      holdsAnswer: true,
+    },
+    {
+      name: "a sign-in whose answer is not JSON",
+      routes: [["POST /v1/auth/verify", wrong(200, `token=${SECRET}`)]],
+      call: (client) => client.signIn(),
+      holdsAnswer: true,
+    },
+    {
+      name: "a sign-in that is refused",
+      routes: [
+        ["POST /v1/auth/verify", () => json({ error: "key_not_found", message: SECRET }, 401)],
+      ],
+      call: (client) => client.signIn(),
+      holdsAnswer: true,
+    },
+    {
+      name: "a call as the account, answered with what does not fit",
+      routes: [["POST /v1/tasks/7/start", () => json({ ok: true, working_count: SECRET })]],
+      call: (client) => client.start(7n),
+      holdsAnswer: true,
+    },
+    {
+      name: "a call as the account, answered with a 500",
+      routes: [["POST /v1/tasks/7/start", wrong(500, SECRET)]],
+      call: (client) => client.start(7n),
+      holdsAnswer: true,
+    },
+    {
+      name: "a read, answered with a 502",
+      routes: [["GET /v1/tasks", wrong(502, SECRET)]],
+      call: (client) => client.listTasks(),
+      holdsAnswer: true,
+    },
+    {
+      name: "a blob, answered with a 500",
+      routes: [[`GET /v1/blobs/${HASH}`, wrong(500, SECRET)]],
+      call: (client) => client.getBlob(HASH),
+      holdsAnswer: true,
+    },
+    {
+      name: "a blob whose bytes are not the ones asked for",
+      routes: [[`GET /v1/blobs/${HASH}`, wrong(200, SECRET)]],
+      call: (client) => client.getBlob(HASH),
+      holdsAnswer: false,
+    },
+  ];
+  const logs = (["log", "info", "warn", "error", "debug", "trace"] as const).map((level) =>
+    vi.spyOn(console, level),
+  );
+
+  for (const { name, routes, call, holdsAnswer } of failures) {
+    const api = fakeApi();
+    for (const [route, handler] of routes) api.on(route, handler);
+    const error = await apiError(call(clientOf(api)));
+
+    expect(error.message, name).not.toContain(SECRET);
+    expect(error.stack ?? "", name).not.toContain(SECRET);
+    // The caller can still read the answer, so what is checked above is not an empty thing.
+    expect(JSON.stringify(error.body).includes(SECRET), name).toBe(holdsAnswer);
+  }
+  for (const log of logs) expect(log.mock.calls).toEqual([]);
 });
 
 // ---- get_blob ---------------------------------------------------------------------------------

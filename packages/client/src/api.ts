@@ -64,6 +64,14 @@ export interface ApiClientOptions {
   now?: () => number;
 }
 
+/**
+ * A list filter whose cursor can be null, which is no cursor. The `next_cursor` of the last page is
+ * null, and a caller can hand back whatever it was given.
+ */
+type WithNullCursor<F extends { cursor?: string | null }> = Omit<F, "cursor"> & {
+  cursor?: string | null;
+};
+
 /** A bearer token, and the time (ms since the epoch) from which the client no longer uses it. */
 interface Session {
   token: string;
@@ -89,11 +97,11 @@ async function orNull<T>(promise: Promise<T>): Promise<T | null> {
   }
 }
 
-/** The `?name=value&...` of the fields that are set, or nothing if none is. */
-function queryOf(fields: Record<string, string | number | bigint | undefined>): string {
+/** The `?name=value&...` of the fields that are set, or nothing if none is. Null is not set. */
+function queryOf(fields: Record<string, string | number | bigint | null | undefined>): string {
   const query = new URLSearchParams();
   for (const [name, value] of Object.entries(fields)) {
-    if (value !== undefined) query.set(name, String(value));
+    if (value !== undefined && value !== null) query.set(name, String(value));
   }
   const text = query.toString();
   return text === "" ? "" : `?${text}`;
@@ -139,6 +147,9 @@ function isUnauthorized(error: unknown): boolean {
  * signature for a bearer token. The token is kept until 5 minutes before it expires; calls that
  * come while it is being fetched share that one sign-in. A request the API refuses with a 401 has
  * the token dropped, signs in again and is sent once more, and a second 401 is thrown.
+ *
+ * An `ApiError` holds the body of the answer for the caller to read, and for a sign-in that can be
+ * the bearer token. So nothing here logs a body or puts one in a message.
  */
 export class ApiClient implements TenderApi {
   private readonly baseUrl: string;
@@ -164,7 +175,7 @@ export class ApiClient implements TenderApi {
 
   // ---- Public reads ---------------------------------------------------------------------------
 
-  listTasks(filter: ListTasksFilter = {}): Promise<ListTasksResponse> {
+  listTasks(filter: WithNullCursor<ListTasksFilter> = {}): Promise<ListTasksResponse> {
     const query = queryOf({
       phase: filter.phase,
       tag: filter.tag,
@@ -188,7 +199,7 @@ export class ApiClient implements TenderApi {
     );
   }
 
-  listAgents(filter: ListAgentsFilter = {}): Promise<ListAgentsResponse> {
+  listAgents(filter: WithNullCursor<ListAgentsFilter> = {}): Promise<ListAgentsResponse> {
     const query = queryOf({
       tag: filter.tag,
       asp: filter.asp,
