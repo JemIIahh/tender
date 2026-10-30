@@ -1,6 +1,8 @@
+import { StreamableHTTPTransport } from "@hono/mcp";
 import { type ServerType, serve } from "@hono/node-server";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolResultSchema, LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 import { putBlob } from "@tender/db";
 import { applyBlock } from "@tender/indexer";
@@ -114,6 +116,9 @@ async function seedBoard(): Promise<void> {
 const cleanups: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+  // A test that fails halfway leaves its fake timers and its spies behind.
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
@@ -207,6 +212,17 @@ const post = async (
     },
     body,
   });
+
+/**
+ * `promise`, or a failure if it has not settled after `ms`: for a request that may go unanswered.
+ */
+function within<T>(ms: number, promise: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what}: no answer within ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
 
 // ---- Tests ------------------------------------------------------------------------------------
 
@@ -541,8 +557,12 @@ test("mcp_is_stateless_and_answers_post_only", async () => {
   );
   expect(init.status).toBe(200);
   expect(init.headers.get("mcp-session-id")).toBeNull();
+  // The tools never change, and with no stream there is no way to tell a client that they did.
   expect(await init.json()).toMatchObject({
-    result: { serverInfo: { name: "tender-remote", version: "1.0.0" } },
+    result: {
+      serverInfo: { name: "tender-remote", version: "1.0.0" },
+      capabilities: { tools: { listChanged: false } },
+    },
   });
 
   const listed = await post(app, rpc("tools/list"));
@@ -606,7 +626,7 @@ test("mcp_refuses_a_body_over_64_kib", async () => {
   }
 });
 
-test("mcp_refuses_a_batch_of_more_than_10_messages", async () => {
+test("mcp_refuses_every_batch", async () => {
   const app = createApp(deps);
   const getTask = (id: number) => ({
     jsonrpc: "2.0",
@@ -614,62 +634,212 @@ test("mcp_refuses_a_batch_of_more_than_10_messages", async () => {
     method: "tools/call",
     params: { name: "get_task", arguments: { task_id: "1" } },
   });
-  const notify = () => ({ jsonrpc: "2.0", method: "notifications/initialized" });
-  const batch = (size: number, message: (n: number) => unknown = getTask): string =>
-    JSON.stringify(Array.from({ length: size }, (_, i) => message(i + 1)));
+  const cancel = (requestId: number) => ({
+    jsonrpc: "2.0",
+    method: "notifications/cancelled",
+    params: { requestId },
+  });
 
+  // A request and the cancellation of it in one POST is never answered by the transport, which
+  // answers when the server sends an answer, and the server sends none for a cancelled request. A
+  // client could hold a connection open for as long as it liked. Batching is no part of the
+  // protocol since 2025-06-18 and the SDK's client never sends one, so none is accepted.
   const query = vi.spyOn(deps.db, "query");
   try {
-    // A batch of up to ten is answered, with one answer to each call. (The transport answers a
-    // batch of one with the bare answer and not an array of one.)
-    for (const size of [1, 2, 10]) {
-      const res = await post(app, batch(size));
-      expect(res.status, `${size} calls`).toBe(200);
-      const body: unknown = await res.json();
-      const answers = (Array.isArray(body) ? body : [body]) as Array<{
-        id: number;
-        result: { isError?: boolean };
-      }>;
-      expect(answers.map(({ id }) => id).sort((a, b) => a - b)).toEqual(
-        Array.from({ length: size }, (_, i) => i + 1),
-      );
-      for (const { result } of answers) expect(result.isError ?? false).toBe(false);
-    }
-    expect(query).toHaveBeenCalled();
-    // The messages of a batch are counted, whether or not they ask for an answer.
-    expect((await post(app, batch(10, notify))).status, "10 notifications").toBe(202);
-
-    // An eleventh message is turned away, and the others with it: none is answered, so the
-    // database is not asked, and the body is not even read as JSON-RPC.
-    query.mockClear();
-    for (const [what, body] of [
-      ["calls", batch(11)],
-      ["notifications", batch(11, notify)],
-      ["numbers", batch(11, (n) => n)],
-      ["a hundred calls", batch(100)],
-    ] as const) {
-      const res = await post(app, body);
+    const batches: Array<[what: string, batch: unknown[]]> = [
+      [
+        "a request and its cancellation",
+        [{ jsonrpc: "2.0", id: 1, method: "tools/list" }, cancel(1)],
+      ],
+      ["a call and its cancellation", [getTask(1), cancel(1)]],
+      ["a batch of one", [getTask(1)]],
+      ["two calls", [getTask(1), getTask(2)]],
+      ["eleven calls", Array.from({ length: 11 }, (_, i) => getTask(i + 1))],
+      ["no message", []],
+    ];
+    for (const [what, batch] of batches) {
+      const res = await within(2_000, post(app, JSON.stringify(batch)), what);
       expect(res.status, what).toBe(400);
       expect(await res.json(), what).toEqual({
         jsonrpc: "2.0",
-        error: { code: -32600, message: "a batch holds at most 10 messages" },
+        error: { code: -32600, message: "a batch is not accepted, send one message" },
         id: null,
       });
     }
+    // Refused whole: not even the call that comes before its cancellation is run.
     expect(query).not.toHaveBeenCalled();
   } finally {
     query.mockRestore();
   }
 
-  // A body that is not JSON, or no body, is still refused by the transport, as it was before the
-  // body was read here; and a single message is no batch.
-  for (const body of ["{not json", ""]) {
-    const res = await post(app, body);
-    expect(res.status, JSON.stringify(body)).toBe(400);
-    expect(await res.json()).toMatchObject({ jsonrpc: "2.0", error: { code: -32700 }, id: null });
-  }
+  // The same over a socket, where a connection that is not answered stays open.
+  const { server, url } = await listen(app);
+  cleanups.push(() => stop(server));
+  const overSocket = await within(
+    2_000,
+    fetch(`${url}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify([getTask(1), cancel(1)]),
+    }),
+    "a call and its cancellation, over a socket",
+  );
+  expect(overSocket.status).toBe(400);
+  await overSocket.arrayBuffer();
+
+  // One message is no batch. A cancellation on its own has nothing to cancel in a server with no
+  // session, and is accepted and ignored.
   const listed = await post(app, rpc("tools/list"));
   expect(listed.status).toBe(200);
+  const cancelled = await within(2_000, post(app, JSON.stringify(cancel(1))), "a cancellation");
+  expect(cancelled.status).toBe(202);
+});
+
+test("mcp_gives_up_on_a_request_the_transport_never_answers", async () => {
+  // The transport answers a request when the server sends its answer, and the server may never
+  // send one. The wait is bounded at 30 s: then the handler says so and closes what it opened.
+  const app = createApp(deps);
+  let reach: () => void = () => undefined;
+  const reached = new Promise<void>((resolve) => {
+    reach = resolve;
+  });
+  vi.spyOn(StreamableHTTPTransport.prototype, "handleRequest").mockImplementation(() => {
+    reach();
+    return new Promise<Response | undefined>(() => undefined);
+  });
+  const close = vi.spyOn(McpServer.prototype, "close");
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+
+  let answered = false;
+  const pending = post(app, rpc("tools/list")).then((res) => {
+    answered = true;
+    return res;
+  });
+  await reached;
+
+  // Not a moment before the bound.
+  await vi.advanceTimersByTimeAsync(29_999);
+  expect(answered).toBe(false);
+  expect(close).not.toHaveBeenCalled();
+
+  await vi.advanceTimersByTimeAsync(1);
+  const res = await pending;
+  expect(res.status).toBe(504);
+  expect(await res.json()).toEqual({
+    jsonrpc: "2.0",
+    error: { code: -32001, message: "the request took too long" },
+    id: null,
+  });
+  expect(close).toHaveBeenCalledTimes(1);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test("mcp_leaves_no_timer_behind_an_answer", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const res = await post(createApp(deps), rpc("tools/list"));
+  expect(res.status).toBe(200);
+  // The bound on the wait began with the request and ended with its answer.
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+test("mcp_echoes_nothing_the_caller_sent", async () => {
+  const app = createApp(deps);
+  const send = async (body: string): Promise<{ status: number; text: string }> => {
+    const res = await post(app, body);
+    return { status: res.status, text: await res.text() };
+  };
+  const message = (extra: Record<string, unknown>): string =>
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", ...extra });
+  // The same request written with two canaries of different lengths: an answer that does not
+  // change with the canary holds no part of it, not its text and not its length.
+  const canaries = ["CANARY_a1b2c3", "CANARY_d4e5f6g7h8"] as const;
+  const unchanged = async (what: string, body: (canary: string) => string) => {
+    const [first, second] = [await send(body(canaries[0])), await send(body(canaries[1]))];
+    expect(first, what).toEqual(second);
+    expect(first.text, what).not.toContain("CANARY_");
+    return first;
+  };
+
+  // A tool that does not exist is a tool error of ours, as it is to a client of the SDK.
+  const unknown = await unchanged("an unknown tool", (canary) =>
+    rpc("tools/call", { name: canary, arguments: { [canary]: canary } }),
+  );
+  expect(unknown.status).toBe(200);
+  expect(JSON.parse(unknown.text)).toEqual({
+    jsonrpc: "2.0",
+    id: 1,
+    result: { isError: true, content: [{ type: "text", text: "no such tool" }] },
+  });
+  const client = await connect(app);
+  expect(await call(client, canaries[0], {})).toEqual({ isError: true, text: "no such tool" });
+  // Sent as a notification it has no answer to give, and is accepted like any other.
+  const silent = await send(
+    JSON.stringify({ jsonrpc: "2.0", method: "tools/call", params: { name: canaries[0] } }),
+  );
+  expect(silent.status).toBe(202);
+
+  // What is no message: the answer is one fixed error. The SDK and the transport would dump their
+  // schema and quote the key, the text or the value that they did not like. (V8 quotes the start
+  // of a text that is not JSON when its first character is wrong.)
+  const refusals: Array<[what: string, body: (canary: string) => string, code: number]> = [
+    ["a text that is not JSON", (canary) => `hello ${canary}`, -32700],
+    ["no body", () => "", -32700],
+    ["an unknown key", (canary) => message({ [canary]: 1 }), -32600],
+    ["a version that is not 2.0", (canary) => message({ jsonrpc: canary }), -32600],
+    ["a method that is no string", (canary) => message({ method: { [canary]: 1 } }), -32600],
+    ["an id that is no string or integer", (canary) => message({ id: { [canary]: 1 } }), -32600],
+    ["params that are no object", (canary) => message({ params: canary }), -32600],
+    [
+      "a response in place of a request",
+      (canary) => JSON.stringify({ jsonrpc: "2.0", id: 1, result: { [canary]: 1 } }),
+      -32600,
+    ],
+    ["a body that is a string", (canary) => JSON.stringify(canary), -32600],
+  ];
+  for (const [what, body, code] of refusals) {
+    const refused = await unchanged(what, body);
+    expect(refused.status, what).toBe(400);
+    // No `data`: the error is a code and a message.
+    expect(JSON.parse(refused.text), what).toEqual({
+      jsonrpc: "2.0",
+      error: { code, message: expect.any(String) },
+      id: null,
+    });
+  }
+  for (const body of ["null", "5", "true", "[]"]) {
+    const refused = await send(body);
+    expect(refused.status, body).toBe(400);
+    expect(JSON.parse(refused.text), body).toMatchObject({ error: { code: -32600 }, id: null });
+  }
+
+  // What the SDK answers by itself has none of it either: a method it does not know, and the keys
+  // it does not know in the params and in the arguments of a call, which it drops.
+  const method = await unchanged("an unknown method", (canary) => message({ method: canary }));
+  expect(JSON.parse(method.text)).toEqual({
+    jsonrpc: "2.0",
+    id: 1,
+    error: { code: -32601, message: "Method not found" },
+  });
+  const params = await unchanged("an unknown key in the params", (canary) =>
+    rpc("tools/call", { name: "get_task", arguments: { task_id: "1" }, [canary]: 1 }),
+  );
+  const args = await unchanged("an unknown key in the arguments", (canary) =>
+    rpc("tools/call", { name: "get_task", arguments: { task_id: "1", [canary]: 1 } }),
+  );
+  for (const answer of [params, args]) {
+    expect(JSON.parse(answer.text).result.isError ?? false).toBe(false);
+  }
+});
+
+test("every_listed_tool_is_known_to_the_handler", async () => {
+  // The handler answers a call to a name that is not one of the server's tools itself, from a
+  // list of the names, so the list has to hold every tool that `tools/list` shows.
+  const client = await connect();
+  const { tools } = await client.listTools();
+  expect(tools.length).toBeGreaterThan(0);
+  for (const { name } of tools) {
+    expect((await call(client, name, {})).text, name).not.toBe("no such tool");
+  }
 });
 
 test("mcp_is_outside_the_cors_block", async () => {

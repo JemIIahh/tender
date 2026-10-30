@@ -25,20 +25,27 @@ import { getAgentDetail, getScorecard, getTaskDetail, listAgents, listTasks } fr
 //
 // The server is stateless: there is no session and nothing outlives a request, so any instance of
 // the API can answer any request and a client needs no `initialize` before its calls. Each request
-// gets a server and a transport of its own, because a stateless transport cannot be shared. Clients
-// all number their requests from the same start, so two requests in flight carry the same JSON-RPC
-// id, and the SDK's own transport refuses a second request ("Stateless transport cannot be reused
-// across requests"). The answer is one JSON document and never a stream, so a GET has nothing to
-// open and a DELETE nothing to end.
+// gets a server and a transport of its own. The transport of @hono/mcp hands an answer to the
+// request that has the JSON-RPC id of the answer, and clients all number their requests from the
+// same start, so on a transport shared by two requests in flight both would carry the same id and
+// either could be answered with the result of the other. (The SDK's own stateless transport
+// refuses a second request outright, which this one does not.) The answer is one JSON document and
+// never a stream, so a GET has nothing to open and a DELETE nothing to end.
 //
 // The SDK checks the arguments of a call against the input schemas before a tool runs, and answers
 // a call that does not fit with a tool error. That check keeps a bad id from reaching the database,
 // where the error would quote it. The SDK also sends the message of whatever a tool throws to the
 // caller, which is why `answer` catches first.
 //
-// A request may hold a batch of JSON-RPC messages, and every message of it is a call of its own.
-// A batch is refused when it holds more than `MAX_BATCH`, before the transport answers any of it,
-// so that one request cannot ask for as many queries as its body has room for.
+// The body is read before the transport sees it, and the transport is handed what was read. The SDK
+// and the transport answer what they reject with a message that quotes it (the name of a tool they
+// do not know, the key they did not expect, the text they could not parse), so the envelope of a
+// message and the name of a tool are checked here, and the answer is a message of ours. A batch is
+// refused: the transport answers when the server sends its answer, and the server sends none for a
+// request that a `notifications/cancelled` of the same batch cancelled, so a batch could hold a
+// connection open for as long as its sender liked. Batching left the protocol in 2025-06-18 and the
+// SDK's client sends none. The wait for an answer ends at a bound too, so a request that goes
+// unanswered for any other reason cannot hold a connection either.
 
 /**
  * Where the server answers. It is no `/v1` route, so the CORS block of `/v1` does not cover it: MCP
@@ -49,8 +56,8 @@ const MCP_PATH = "/mcp";
 /** The most a request may carry. A call is a few hundred bytes, so this is generous. */
 const MAX_BODY_BYTES = 65_536;
 
-/** The most messages a request may carry as a JSON-RPC batch. */
-const MAX_BATCH = 10;
+/** How long a request waits for its answer, in milliseconds. A query takes a few. */
+const REQUEST_TIMEOUT_MS = 30_000;
 
 // ---- Inputs -----------------------------------------------------------------------------------
 
@@ -121,6 +128,29 @@ async function answer<T extends object>(
     return toolError("internal error");
   }
 }
+
+// ---- Messages ---------------------------------------------------------------------------------
+
+/**
+ * The envelope of a JSON-RPC request or of a notification, and nothing more. The SDK checks it too,
+ * but answers a bad one with a dump of its schema that quotes what it was sent. A response is no
+ * message this server takes, since it sends no request that one could answer.
+ */
+const Envelope = z.strictObject({
+  jsonrpc: z.literal("2.0"),
+  id: z.union([z.string(), z.int()]).optional(),
+  method: z.string(),
+  params: z.record(z.string(), z.unknown()).optional(),
+});
+
+/** The tools `createServer` registers. A call to any other name is answered without the SDK. */
+const TOOL_NAMES: ReadonlySet<string> = new Set([
+  "list_tasks",
+  "get_task",
+  "get_scorecard",
+  "list_agents",
+  "get_agent",
+]);
 
 // ---- Server -----------------------------------------------------------------------------------
 
@@ -205,6 +235,10 @@ function createServer(deps: ApiDeps): McpServer {
       answer("get_agent", () => getAgentDetail(deps.db, account, nowNs(deps)), "no such agent"),
   );
 
+  // The SDK says `listChanged: true` of any server that has tools. These never change, and a
+  // server with no stream could not tell a client if they did.
+  server.server.registerCapabilities({ tools: { listChanged: false } });
+
   return server;
 }
 
@@ -214,9 +248,9 @@ function rpcError(code: number, message: string) {
 }
 
 /**
- * Mounts the server at `/mcp`. A POST carries a JSON-RPC message of at most `MAX_BODY_BYTES`, or a
- * batch of at most `MAX_BATCH` of them; any other method is a 405, since a stateless server has no
- * stream to open and no session to end.
+ * Mounts the server at `/mcp`. A POST carries one JSON-RPC message of at most `MAX_BODY_BYTES`, and
+ * is answered within `REQUEST_TIMEOUT_MS`; any other method is a 405, since a stateless server has
+ * no stream to open and no session to end.
  */
 export function mountMcp(app: Hono, deps: ApiDeps): void {
   app.post(
@@ -226,12 +260,22 @@ export function mountMcp(app: Hono, deps: ApiDeps): void {
       onError: (c) => c.json(rpcError(-32600, "request body too large"), 413),
     }),
     async (c) => {
-      // The body is read here so that a batch can be counted before any of it is answered, and the
-      // transport is handed what was read. A body that is not JSON is left to the transport: it
-      // reads the body again and refuses it, as it would have without this.
       const body: unknown = await c.req.json().catch(() => undefined);
-      if (Array.isArray(body) && body.length > MAX_BATCH) {
-        return c.json(rpcError(-32600, `a batch holds at most ${MAX_BATCH} messages`), 400);
+      if (body === undefined) return c.json(rpcError(-32700, "the body is not JSON"), 400);
+      if (Array.isArray(body)) {
+        return c.json(rpcError(-32600, "a batch is not accepted, send one message"), 400);
+      }
+      const message = Envelope.safeParse(body);
+      if (!message.success) {
+        return c.json(rpcError(-32600, "not a JSON-RPC request or notification"), 400);
+      }
+      const { id, method, params } = message.data;
+      const tool = params?.name;
+      const callsUnknownTool =
+        method === "tools/call" && typeof tool === "string" && !TOOL_NAMES.has(tool);
+      // A call with no id is a notification, which has no answer to give.
+      if (callsUnknownTool && id !== undefined) {
+        return c.json({ jsonrpc: "2.0", id, result: toolError("no such tool") });
       }
 
       const server = createServer(deps);
@@ -239,11 +283,18 @@ export function mountMcp(app: Hono, deps: ApiDeps): void {
       // answer with a JSON document in place of an event stream.
       const transport = new StreamableHTTPTransport({ enableJsonResponse: true });
       await server.connect(transport);
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const response = await transport.handleRequest(c, body);
+        // The transport answers when the server sends its answer, and a server may never send one.
+        const timeout = new Promise<null>((resolve) => {
+          timer = setTimeout(resolve, REQUEST_TIMEOUT_MS, null);
+        });
+        const response = await Promise.race([transport.handleRequest(c, body), timeout]);
+        if (response === null) return c.json(rpcError(-32001, "the request took too long"), 504);
         if (response === undefined) throw new Error("the transport made no response");
         return response;
       } finally {
+        clearTimeout(timer);
         await server.close();
       }
     },
