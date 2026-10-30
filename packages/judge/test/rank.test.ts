@@ -6,7 +6,13 @@ import {
   type TaskView,
 } from "@tender/shared";
 import { expect, test } from "vitest";
-import { buildScorecard, chooseWinners, rankEntries, type ScoredEntry } from "../src/index";
+import {
+  buildScorecard,
+  chooseWinners,
+  rankEntries,
+  type ScoredEntry,
+  scoreJsonSchema,
+} from "../src/index";
 
 // The shared package has no name for the type of a split, so it is taken from the criteria.
 type Split = PublicCriteria["split"];
@@ -408,8 +414,40 @@ function scorecardInput(overrides: Partial<ScorecardInput> = {}): ScorecardInput
   };
 }
 
+/**
+ * `scorecardInput` for a task whose held-out part is `heldout`, committed to the way it is on
+ * chain: the task and the scorecard both carry the SHA-256 of the document's canonical bytes.
+ */
+function heldoutInput(heldout: unknown, overrides: Partial<ScorecardInput> = {}): ScorecardInput {
+  const commitment = sha256Hex(canonicalJson(heldout));
+  return scorecardInput({
+    task: { ...TASK, heldout_commitment: commitment },
+    heldout,
+    heldoutCommitment: commitment,
+    ...overrides,
+  });
+}
+
 /** The scorecard as a reader gets it: the bytes parsed as JSON, with nothing converted back. */
 const published = (bytes: Uint8Array): Record<string, unknown> => JSON.parse(text(bytes));
+
+/** The bytes of a scorecard with one entry, scored with `reasons`. */
+function scoredWith(...reasons: string[]): Uint8Array {
+  const crowded = { ...entry("amy.near", 10), reasons };
+  return buildScorecard(scorecardInput({ ranked: [freeze(crowded)], winners: [] }));
+}
+
+/** The reasons that scorecard gives its one entry. */
+function reasonsIn(bytes: Uint8Array): string[] {
+  const [first] = (published(bytes) as { entries: { reasons: string[] }[] }).entries;
+  return first?.reasons ?? [];
+}
+
+/**
+ * A `\uD800` to `\uDFFF` escape in JSON text, which is how a string with a surrogate half that has
+ * no partner is written. The backslash must not itself be escaped: `\\ud800` is the text of one.
+ */
+const SURROGATE_ESCAPE = /(?<!\\)(?:\\\\)*\\u[dD][89a-fA-F][0-9a-fA-F]{2}/;
 
 /** `value` with the keys of every plain object put in the opposite order. */
 function reverseKeys<T>(value: T): T {
@@ -498,6 +536,7 @@ test("scorecard_fields_come_from_the_inputs", () => {
     published(
       buildScorecard(
         scorecardInput({
+          task: { ...TASK, heldout_commitment: null },
           kind: "rubric",
           heldout: null,
           heldoutCommitment: null,
@@ -529,9 +568,9 @@ test("scorecard_publishes_the_heldout_document_exactly", () => {
   expect(JSON.stringify(heldout)).toContain('"__proto__"');
   const commitment = sha256Hex(canonicalJson(heldout));
 
-  const bytes = buildScorecard(
-    scorecardInput({ kind: "json_schema", heldout, heldoutCommitment: commitment }),
-  );
+  // The hash check that `buildScorecard` makes is made on the document as given too, so this
+  // document, which a copy would change, is not refused as a mismatch.
+  const bytes = buildScorecard(heldoutInput(heldout, { kind: "json_schema" }));
 
   const shown = (published(bytes) as { heldout: unknown }).heldout;
   expect(sha256Hex(canonicalJson(shown))).toBe(commitment);
@@ -564,52 +603,192 @@ test("scorecard_numbers_follow_r19", () => {
 });
 
 test("scorecard_reasons_are_clamped", () => {
-  /** The reasons the scorecard gives an entry that was scored with `reasons`. */
-  const reasonsOf = (...reasons: string[]): string[] => {
-    const crowded = { ...entry("amy.near", 10), reasons };
-    const bytes = buildScorecard(scorecardInput({ ranked: [freeze(crowded)], winners: [] }));
-    const [first] = (published(bytes) as { entries: { reasons: string[] }[] }).entries;
-    return first?.reasons ?? [];
-  };
+  // The pattern that finds surrogate escapes in the bytes: it finds an escape, and not the text
+  // of one that a backslash escaped, and it stops at the edges of the surrogate range.
+  expect(SURROGATE_ESCAPE.test('"\\ud800"')).toBe(true);
+  expect(SURROGATE_ESCAPE.test('"\\uDFFF"')).toBe(true);
+  expect(SURROGATE_ESCAPE.test('"\\\\ud800"')).toBe(false);
+  expect(SURROGATE_ESCAPE.test('"\\ud7ff \\ue000 \\u0041"')).toBe(false);
 
   // At most 3 reasons: the first 3, in order.
-  expect(reasonsOf("one", "two", "three", "four", "five")).toEqual(["one", "two", "three"]);
-  expect(reasonsOf()).toEqual([]);
+  expect(reasonsIn(scoredWith("one", "two", "three", "four", "five"))).toEqual([
+    "one",
+    "two",
+    "three",
+  ]);
+  expect(reasonsIn(scoredWith())).toEqual([]);
 
   // A reason of 200 code points or fewer is kept as it is. 200 emoji are 400 UTF-16 units, so
   // they show that it is code points that are counted.
   const kept = ["e".repeat(200), "😀".repeat(200), ""];
-  expect(reasonsOf(...kept)).toEqual(kept);
+  expect(reasonsIn(scoredWith(...kept))).toEqual(kept);
 
-  // A longer one is cut to its first 199 code points and ends with `…`: 200 in all.
-  const cut: [string, string, string][] = [
+  // A surrogate half with no partner: a high one should lead a pair and a low one end it.
+  const HIGH = "\ud800";
+  const LOW = "\udc00";
+  const REPLACEMENT = "\uFFFD";
+  const cases: [string, string, string][] = [
+    // A longer reason is cut to its first 199 code points and ends with `…`: 200 in all.
     ["201 letters", "y".repeat(201), `${"y".repeat(199)}…`],
     // Cutting at 199 UTF-16 units would leave half of the first emoji, a surrogate with no partner.
     ["a pair at the cut", `${"x".repeat(198)}${"😀".repeat(3)}`, `${"x".repeat(198)}😀…`],
     ["201 emoji", "😀".repeat(201), `${"😀".repeat(199)}…`],
     ["300,000 letters", "k".repeat(300_000), `${"k".repeat(199)}…`],
+
+    // A reason an agent shaped can hold such a half: Ajv names the keys of the agent's JSON in its
+    // messages, and a key written as the escape \ud800 is one. JSON that a standard reader accepts
+    // has none, so each is replaced by U+FFFD, one for one, and the limit of 200 stays what it was.
+    ["a lone high half", HIGH, REPLACEMENT],
+    ["a lone low half", LOW, REPLACEMENT],
+    // A low half and then a high half is the wrong way round for a pair: both are alone.
+    ["two halves the wrong way round", `${LOW}${HIGH}`, `${REPLACEMENT}${REPLACEMENT}`],
+    ["a message about a key", `/${HIGH} must be string`, `/${REPLACEMENT} must be string`],
+    // A pair is a character like any other and stays whole, next to a half or not.
+    ["a pair", `${HIGH}${LOW}`, "\u{10000}"],
+    ["a lone half before a pair", `${HIGH}😀`, `${REPLACEMENT}😀`],
+    // 199 emoji and a half are 200 code points but 399 UTF-16 units: kept, not cut, and repaired.
+    ["a lone half as the 200th", `${"😀".repeat(199)}${HIGH}`, `${"😀".repeat(199)}${REPLACEMENT}`],
+    // The cut keeps the first 199 code points, so a half that is the 199th stays (as U+FFFD).
+    [
+      "a lone high half as code point 199",
+      `${"x".repeat(198)}${HIGH}${"y".repeat(5)}`,
+      `${"x".repeat(198)}${REPLACEMENT}…`,
+    ],
+    [
+      "a lone low half as code point 199",
+      `${"x".repeat(198)}${LOW}${"y".repeat(5)}`,
+      `${"x".repeat(198)}${REPLACEMENT}…`,
+    ],
+    [
+      "a lone half and a pair at the cut",
+      `${"x".repeat(197)}${HIGH}😀tail`,
+      `${"x".repeat(197)}${REPLACEMENT}😀…`,
+    ],
+    ["a lone half past the cut", `${"x".repeat(250)}${HIGH}`, `${"x".repeat(199)}…`],
   ];
-  for (const [label, reason, expected] of cut) {
-    const clamped = reasonsOf(reason)[0] ?? "";
+  for (const [label, reason, expected] of cases) {
+    const bytes = scoredWith(reason);
+    const clamped = reasonsIn(bytes)[0] ?? "";
 
     expect(clamped, label).toBe(expected);
-    expect(codePoints(clamped), label).toBe(200);
+    // 200 code points at most, and a reason that fits keeps all of its own.
+    expect(codePoints(clamped), label).toBe(Math.min(codePoints(reason), 200));
     expect(/\p{Cs}/u.test(clamped), `${label}: a surrogate with no partner`).toBe(false);
+    expect(SURROGATE_ESCAPE.test(text(bytes)), `${label}: an escape in the bytes`).toBe(false);
   }
+});
+
+test("scorecard_has_no_lone_surrogate_from_the_keys_of_an_answer", () => {
+  // The case that matters: an agent's answer is JSON whose only key is the escape \ud800. Ajv
+  // names the key in its message, so the scorer's reason carries the lone surrogate, and
+  // `JSON.stringify` would write it into the scorecard as an escape that a strict JSON reader
+  // (Rust's serde_json, say) refuses, so that the whole scorecard could not be read.
+  const criteria: Extract<PublicCriteria, { kind: "json_schema" }> = {
+    kind: "json_schema",
+    version: 1,
+    min_score: MIN_SCORE,
+    split: "winner_take_all",
+    has_heldout: true,
+    schema: { type: "object", additionalProperties: { type: "string" } },
+  };
+  const heldout = { json_schema: { assertions: [{ path: "$.x", equals: "y" }] } };
+  const answer = new TextEncoder().encode('{"\\ud800": 1}');
+  const scored = scoreJsonSchema(criteria, heldout.json_schema, answer);
+  // Control: the scorer does hand over a reason with the half in it.
+  expect(scored.reasons.some((reason) => /\p{Cs}/u.test(reason))).toBe(true);
+
+  const bytes = buildScorecard(
+    heldoutInput(heldout, {
+      kind: "json_schema",
+      ranked: [{ ...entry("amy.near", 0), ...scored }],
+      winners: [],
+    }),
+  );
+
+  expect(SURROGATE_ESCAPE.test(text(bytes))).toBe(false);
+  // What the scorecard says is what the scorer said, with U+FFFD for the half.
+  expect(reasonsIn(bytes)).toEqual(
+    scored.reasons.slice(0, 3).map((reason) => reason.replace(/\p{Cs}/gu, "\uFFFD")),
+  );
+});
+
+test("scorecard_hashes_must_match_the_task", () => {
+  // The task says what its criteria and held-out part hash to, and the Judge is handed the same
+  // hashes again with the documents. If the two disagree, or the held-out document is not the
+  // one committed to, nobody could check the scorecard, so it throws and nothing is published.
+  const other = sha256Hex("not the hash on chain");
+  const noHeldout = { ...TASK, heldout_commitment: null };
+
+  const refused: [string, Partial<ScorecardInput>, RegExp][] = [
+    [
+      "criteria that are not the task's",
+      { criteriaHash: other },
+      /criteriaHash is not the criteria_hash of task 42/,
+    ],
+    [
+      "a commitment that is not the task's",
+      { heldoutCommitment: other },
+      /heldoutCommitment is not the heldout_commitment of task 42/,
+    ],
+    [
+      "no commitment, for a task that has one",
+      { heldoutCommitment: null, heldout: null },
+      /heldoutCommitment is not the heldout_commitment of task 42/,
+    ],
+    [
+      "a commitment, for a task that has none",
+      { task: noHeldout },
+      /heldoutCommitment is not the heldout_commitment of task 42/,
+    ],
+    [
+      "a document that is not the one committed to",
+      { heldout: { exact: { expected: ["43", "forty-three"] } } },
+      /held-out document does not hash to heldoutCommitment/,
+    ],
+    [
+      "a document and no commitment",
+      { task: noHeldout, heldoutCommitment: null },
+      /held-out document does not hash to heldoutCommitment/,
+    ],
+    [
+      "a commitment and no document",
+      { heldout: null },
+      /heldoutCommitment is set but there is no held-out document/,
+    ],
+  ];
+  for (const [label, overrides, message] of refused) {
+    expect(() => buildScorecard(scorecardInput(overrides)), label).toThrow(message);
+  }
+
+  // Controls: hashes that agree build, with a document and without one. A document with a
+  // `__proto__` key is hashed as it was given: see
+  // scorecard_publishes_the_heldout_document_exactly.
+  expect(() => buildScorecard(scorecardInput())).not.toThrow();
+  expect(() =>
+    buildScorecard(
+      scorecardInput({ task: noHeldout, kind: "rubric", heldout: null, heldoutCommitment: null }),
+    ),
+  ).not.toThrow();
 });
 
 test("scorecard_rejects_what_the_schema_rejects", () => {
   // A scorecard that does not fit the schema is a bug in the Judge, not something an agent wrote:
-  // it throws, naming the field, and nothing is published.
+  // it throws, naming the field, and nothing is published. The names are in quotes, as the schema
+  // writes a path, so that only the schema's error can match: the task's hashes are checked too.
+  const capitals = "AB".repeat(32);
   const refused: [string, Partial<ScorecardInput>, RegExp][] = [
-    ["a share of 0", { winners: [{ account: "amy.near", bps: 0 }] }, /bps/],
-    ["a share above a whole", { winners: [{ account: "amy.near", bps: 10_001 }] }, /bps/],
-    ["a share that is not whole", { winners: [{ account: "amy.near", bps: 99.5 }] }, /bps/],
-    ["a hash in capitals", { criteriaHash: "AB".repeat(32) }, /criteria_hash/],
-    ["a block below 0", { ranked: [entry("amy.near", 70, -1n)] }, /committed_at_block/],
-    ["a block above u64", { ranked: [entry("amy.near", 70, 2n ** 64n)] }, /committed_at_block/],
-    ["a score above 100", { ranked: [entry("amy.near", 101)] }, /score/],
-    ["a held-out part that is not JSON", { heldout: { exact: undefined } }, /heldout/],
+    ["a share of 0", { winners: [{ account: "amy.near", bps: 0 }] }, /"bps"/],
+    ["a share above a whole", { winners: [{ account: "amy.near", bps: 10_001 }] }, /"bps"/],
+    ["a share that is not whole", { winners: [{ account: "amy.near", bps: 99.5 }] }, /"bps"/],
+    [
+      "a hash in capitals",
+      { task: { ...TASK, criteria_hash: capitals }, criteriaHash: capitals },
+      /"criteria_hash"/,
+    ],
+    ["a block below 0", { ranked: [entry("amy.near", 70, -1n)] }, /"committed_at_block"/],
+    ["a block above u64", { ranked: [entry("amy.near", 70, 2n ** 64n)] }, /"committed_at_block"/],
+    ["a score above 100", { ranked: [entry("amy.near", 101)] }, /"score"/],
+    ["a held-out part that is not JSON", { heldout: { exact: undefined } }, /"heldout"/],
     ["a clock that is not a time", { now: new Date(Number.NaN) }, /Invalid time value/],
   ];
 
