@@ -139,11 +139,15 @@ function fullAccessKeysIn(envText: string): string[] {
  * Checks that `height` is the block of `accountId`'s deploy: the account has no code the block
  * before, and has it in the block itself. A transaction that an account sends to itself runs in the
  * block that holds it, so that block is the first with the code.
+ *
+ * The block before is the deploy block's parent, found by its hash, not `height - 1`: a height
+ * whose producer missed its slot has no block, which a busy machine makes likely on the sandbox.
  */
 async function expectDeployBlock(accountId: string, height: string, wasm: Uint8Array) {
-  const at = (blockId: number) =>
+  const at = (blockId: number | string) =>
     provider.viewAccount({ accountId, blockQuery: { blockId } }).then((a) => a.code_hash);
-  expect(await at(Number(height) - 1)).toBe(NO_CODE);
+  const { header } = await provider.viewBlock({ blockId: Number(height) });
+  expect(await at(header.prev_hash)).toBe(NO_CODE);
   expect(await at(Number(height))).toBe(codeHashOf(wasm));
 }
 
