@@ -1,5 +1,6 @@
 import { phaseAt } from "@tender/shared";
 import { intakeTask } from "./intake";
+import { WarmWorker } from "./isolate";
 import { clearStaleWaits, describeError, judgeTask } from "./judge";
 import type { JudgeDeps, JudgeMemory } from "./types";
 
@@ -83,26 +84,32 @@ export function newJudgeMemory(): JudgeMemory {
 
 /**
  * Runs `judgeTick` now, and again `intervalMs` (default 10 s) after each tick ends, until `signal`
- * aborts. The ticks share one `JudgeMemory`, `deps.memory` or a new one. The wait starts when a
- * tick ends, so ticks never overlap, however long one takes. A tick that throws is logged and the
- * loop goes on.
+ * aborts. The ticks share one `JudgeMemory`, `deps.memory` or a new one, and one `WarmWorker`,
+ * `deps.warm` or one started with the loop, so that a score worker is loaded before a task needs
+ * one. The wait starts when a tick ends, so ticks never overlap, however long one takes. A tick
+ * that throws is logged and the loop goes on.
  *
  * An abort during the wait ends the loop at once. An abort during a tick lets the tick finish
  * first, so that a pick it sent is seen through. A signal that is aborted already runs no tick.
- * The returned promise resolves once the loop has stopped, and never rejects.
+ * The returned promise resolves once the loop has stopped, and the warm worker it started with
+ * it, and never rejects.
  */
 export function startJudge(
   deps: JudgeDeps & { intervalMs?: number; signal: AbortSignal },
 ): Promise<void> {
   const { intervalMs = DEFAULT_INTERVAL_MS, signal } = deps;
-  const ticked: JudgeDeps = { ...deps, memory: deps.memory ?? newJudgeMemory() };
+  if (signal.aborted) return Promise.resolve();
+  const warm = deps.warm ?? new WarmWorker();
+  const ticked: JudgeDeps = { ...deps, memory: deps.memory ?? newJudgeMemory(), warm };
   return new Promise<void>((resolve) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let ticking = false;
 
     const finish = () => {
       clearTimeout(timer);
-      resolve();
+      // One it was given is the giver's to stop.
+      const stopped = deps.warm === undefined ? warm.close() : Promise.resolve();
+      void stopped.then(resolve, resolve);
     };
     const run = async () => {
       ticking = true;
@@ -116,10 +123,6 @@ export function startJudge(
       else timer = setTimeout(run, intervalMs);
     };
 
-    if (signal.aborted) {
-      finish();
-      return;
-    }
     // `once` removes the listener when it fires. An abort during a tick is seen after the tick.
     signal.addEventListener(
       "abort",

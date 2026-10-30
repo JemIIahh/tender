@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
 import { type AddressInfo, createServer as createNetServer, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type TenderClient, TenderError } from "@tender/client";
 import { type Db, getBlob, putBlob, setBlobPublic } from "@tender/db";
 import {
@@ -21,7 +24,12 @@ import {
   newJudgeMemory,
   startJudge,
 } from "../src/index";
-import { checkJsonSchemaIsolated, openTaskScorer, type TaskScorer } from "../src/isolate";
+import {
+  checkJsonSchemaIsolated,
+  openTaskScorer,
+  type TaskScorer,
+  WarmWorker,
+} from "../src/isolate";
 import {
   at,
   blobUri,
@@ -61,6 +69,18 @@ const isolate = await vi.importActual<typeof import("../src/isolate")>("../src/i
 /** A worker that misbehaves on cue (see fixtures/rogue-worker.ts), and one that is not there. */
 const ROGUE_WORKER = new URL("./fixtures/rogue-worker.ts", import.meta.url);
 const NO_WORKER = new URL("./fixtures/no-such-worker.ts", import.meta.url);
+/** The Judge's own worker, 3 s slower to load. */
+const SLOW_WORKER = new URL("./fixtures/slow-start-worker.ts", import.meta.url);
+
+/**
+ * A path for the rogue worker's `rogue:slow-again` cue, which makes every compile after the first
+ * one slow: in a directory of its own, which goes when the test ends.
+ */
+function slowAgainMark(): string {
+  const dir = mkdtempSync(join(tmpdir(), "tender-judge-"));
+  onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+  return join(dir, "compiled");
+}
 
 /** Makes the next task's scorer start its workers from `workerUrl`. */
 function nextScorerFrom(workerUrl: URL) {
@@ -81,6 +101,9 @@ function nextScorerCalls(each: (leftMs: number | undefined) => void) {
         each(leftMs);
         return real.score(content, leftMs);
       },
+      get compiled() {
+        return real.compiled;
+      },
       close: () => real.close(),
     };
   });
@@ -97,6 +120,9 @@ function everyScorerCalls(each: (content: Uint8Array) => void) {
       score: (content, leftMs) => {
         each(content);
         return real.score(content, leftMs);
+      },
+      get compiled() {
+        return real.compiled;
       },
       close: () => real.close(),
     };
@@ -1066,6 +1092,34 @@ test("a_short_window_with_the_midpoint_wait_is_scored_and_picked", {
   ]);
 });
 
+test("a_short_window_is_picked_when_workers_are_slow_to_start", { timeout: 60_000 }, async () => {
+  // The 10 s window above, judged at its middle, 2 s before its stop line, where a worker takes 3 s
+  // more to load. Judging that has to start one cannot score in time, and does not pick. The
+  // Judge keeps one loaded ahead (`WarmWorker`), started when it starts: judging takes it, and
+  // compiles the criteria and scores within the 2 s, and picks.
+  const window: Partial<TaskView> = {
+    reveal_deadline: (NOW_NS - SECOND_NS).toString(),
+    pick_deadline: (NOW_NS + 9n * SECOND_NS).toString(),
+  };
+  const atMiddle = () => new Date(NOW.getTime() + 4_000);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const cold = await postJudged([["alice.test.near", "42", 10n]], { view: window });
+  await postSharing(cold.view, "9", NOW_NS + 4n * SECOND_NS);
+  nextScorerFrom(SLOW_WORKER);
+  expect(await judgeTask(judgeDeps(db, cold.chain, { now: atMiddle }), 7n)).toBe("skipped");
+  expect(cold.chain.pick).not.toHaveBeenCalled();
+  expect(warn.mock.calls).toEqual([[TOO_LATE_WARN]]);
+
+  await resetDb(db);
+  const warm = new WarmWorker({ workerUrl: SLOW_WORKER });
+  onTestFinished(() => warm.close());
+  const { view, chain } = await postJudged([["alice.test.near", "42", 10n]], { view: window });
+  await postSharing(view, "9", NOW_NS + 4n * SECOND_NS);
+  expect(await warm.ready()).toBe(true);
+  expect(await judgeTask(judgeDeps(db, chain, { now: atMiddle, warm }), 7n)).toBe("picked");
+  expect((await picked(chain)).winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
+});
+
 test("judging_that_starts_past_the_stop_line_does_not_pick", async () => {
   // P05-R13: this task's stop line is 30 s before its pick deadline, at NOW + 9.5 minutes. A tick
   // that starts past it can score nothing, and a pick would pay nobody for the Judge's own
@@ -1317,6 +1371,89 @@ test("a_compile_that_fails_at_judging_rejects_the_task", { timeout: 60_000 }, as
     expect(await isPublic(db, commitment)).toBe(false);
   }
   expect(warn).toHaveBeenCalledTimes(cases.length);
+});
+
+test("a_compile_that_fails_after_one_fitted_leaves_the_rest_unscored", {
+  timeout: 60_000,
+}, async () => {
+  // The criteria's first compile fits, and every one after it takes 4 s, in any worker, against
+  // judging's budget of 2 s: the machine's load, say. Bob's entry loops, and its worker is
+  // stopped; the next worker cannot compile the criteria in time. That is not the criteria's
+  // fault, so they are not refused. Cat's entry is not scored (`scoring unavailable`), and the
+  // task is picked from alice's and bob's, with one WARN.
+  const { chain } = await postJudged(
+    [
+      ["alice.test.near", '{"x":1}', 10n],
+      ["bob.test.near", "rogue:loop", 11n],
+      ["cat.test.near", '{"x": 1}', 12n],
+    ],
+    {
+      criteria: jsonSchemaCriteria({ title: `rogue:slow-again:4000:${slowAgainMark()}` }),
+      heldout: X_IS_1,
+    },
+  );
+  nextScorerFrom(ROGUE_WORKER);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const scoringLimits = { entryTimeoutMs: 1_000, compileBudgetMs: 500 };
+
+  expect(await judgeTask(judgeDeps(db, chain, { scoringLimits }), 7n)).toBe("picked");
+  const card = await picked(chain);
+  expect(card.winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
+  expect(card.scorecard.entries.map((e) => [e.account, e.score, e.reasons])).toEqual([
+    ["alice.test.near", 100, []],
+    ["bob.test.near", 0, ["scoring timed out"]],
+    ["cat.test.near", 0, ["scoring unavailable"]],
+  ]);
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: null });
+  expect(warn.mock.calls).toEqual([
+    [
+      "judge: WARN task 7: a worker could not compile the criteria again, so the entries left are not scored",
+    ],
+  ]);
+});
+
+test("a_compile_that_fails_after_one_fitted_and_before_any_score_does_not_pick", {
+  timeout: 60_000,
+}, async () => {
+  // As above, but no entry was scored: the first compile fitted, and then the scorer could not be
+  // run (the Judge's own trouble), so the task was left for the next tick. On that tick the
+  // compile overruns. A pick would pay nobody for that: there is none, nothing is published, and
+  // the task is left to its fallback window, with one WARN, as when judging starts too late.
+  const { chain, commitment } = await postJudged(
+    [
+      ["alice.test.near", "rogue:unavailable", 10n],
+      ["bob.test.near", '{"x":1}', 11n],
+    ],
+    {
+      criteria: jsonSchemaCriteria({ title: `rogue:slow-again:4000:${slowAgainMark()}` }),
+      heldout: X_IS_1,
+    },
+  );
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const memory = newJudgeMemory();
+  const deps = judgeDeps(db, chain, { memory, scoringLimits: { compileBudgetMs: 500 } });
+
+  nextScorerFrom(ROGUE_WORKER);
+  expect(await judgeTask(deps, 7n)).toBe("skipped");
+  expect(memory.progress.get("7")?.compiled).toBe(true);
+  nextScorerFrom(ROGUE_WORKER);
+  expect(await judgeTask(deps, 7n)).toBe("skipped");
+
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(await scorecardCount()).toBe(0);
+  expect(await isPublic(db, commitment)).toBe(false);
+  expect(await judgeRow(db, 7)).toEqual({
+    judge_status: "accepted",
+    judge_reason: "not judged: scoring was unavailable before any entry was scored",
+  });
+  expect(warn.mock.calls).toEqual([
+    [
+      "judge: WARN task 7: a scorer could not be run (ScorerUnavailableError); trying again next tick",
+    ],
+    [
+      "judge: WARN task 7: a worker could not compile the criteria again before any entry was scored; it is not picked, and is left to its fallback window",
+    ],
+  ]);
 });
 
 test("a_duplicate_past_the_stop_line_shares_the_score", { timeout: 60_000 }, async () => {
@@ -2404,9 +2541,10 @@ function countingDb() {
   return { db, state };
 }
 
-test("start_judge_ticks_until_aborted", async () => {
+test("start_judge_ticks_until_aborted", { timeout: 30_000 }, async () => {
   const { db: counting, state } = countingDb();
   const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const before = workers();
   vi.useFakeTimers();
   try {
     // A tick that throws is logged, and the next tick runs 10 s after it ended.
@@ -2414,6 +2552,8 @@ test("start_judge_ticks_until_aborted", async () => {
     const controller = new AbortController();
     let stopped = false;
     const loop = startJudge({ ...judgeDeps(counting, fakeChain(null)), signal: controller.signal });
+    // The warm worker the loop starts.
+    expect(workers()).toBe(before + 1);
     void loop.then(() => {
       stopped = true;
     });
@@ -2425,10 +2565,12 @@ test("start_judge_ticks_until_aborted", async () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(state.ticks).toBe(2);
 
-    // An abort during the wait stops the loop at once.
+    // An abort during the wait stops the loop at once: no timer has to run for it, and the warm
+    // worker it started is stopped with it.
     controller.abort();
-    await vi.advanceTimersByTimeAsync(0);
+    await loop;
     expect(stopped).toBe(true);
+    expect(workers()).toBe(before);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(state.ticks).toBe(2);
 
@@ -2440,7 +2582,7 @@ test("start_judge_ticks_until_aborted", async () => {
   }
 });
 
-test("start_judge_never_overlaps_ticks", async () => {
+test("start_judge_never_overlaps_ticks", { timeout: 30_000 }, async () => {
   const { db: counting, state } = countingDb();
   vi.useFakeTimers();
   try {
@@ -2479,7 +2621,7 @@ test("start_judge_never_overlaps_ticks", async () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(stopped).toBe(false);
     release();
-    await vi.advanceTimersByTimeAsync(0);
+    await loop;
     expect(stopped).toBe(true);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(state.ticks).toBe(3);

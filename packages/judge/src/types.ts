@@ -1,5 +1,6 @@
 import type { Db } from "@tender/db";
 import type { EntryView, TaskView } from "@tender/shared";
+import type { WarmWorker } from "./isolate";
 
 /** How one revealed entry scored against a task's criteria. */
 export interface EntryScore {
@@ -111,6 +112,11 @@ export interface TaskProgress {
   results: Map<string, EntryScore>;
   /** How many of those the scorer scored. */
   scored: number;
+  /**
+   * Whether a worker has compiled the task's criteria to score with. From then on a compile that
+   * fails is the machine's load, not the criteria's fault, and does not reject them.
+   */
+  compiled: boolean;
 }
 
 /** Everything the Judge needs. Nothing in it reads the environment: the caller resolves that. */
@@ -146,4 +152,9 @@ export interface JudgeDeps {
   scoringLimits?: ScoringLimits;
   /** What the Judge keeps between ticks (see `JudgeMemory`). */
   memory?: JudgeMemory;
+  /**
+   * A score worker kept loaded for the next task's scorer (see `WarmWorker`). `startJudge` makes
+   * one. Without it, each scorer starts its own workers.
+   */
+  warm?: WarmWorker;
 }

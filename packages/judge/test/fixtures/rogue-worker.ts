@@ -1,4 +1,5 @@
-import { parentPort, workerData } from "node:worker_threads";
+import { existsSync, writeFileSync } from "node:fs";
+import { parentPort } from "node:worker_threads";
 import { serveWorker } from "../../src/isolate";
 import { checkJsonSchemaUsable } from "../../src/kinds/json_schema";
 import { runInSandbox } from "../../src/sandbox";
@@ -32,6 +33,14 @@ function roguePrepare(...task: Parameters<typeof prepareScorer>): ReturnType<typ
   const title = criteria.kind === "json_schema" ? titleOf(criteria.schema) : "";
   // A compile that takes this many milliseconds, and one that crashes.
   if (title.startsWith("rogue:slow:")) busyFor(Number(title.slice("rogue:slow:".length)));
+  // `rogue:slow-again:{ms}:{path}`: a compile that takes this long from the second time on, in
+  // any worker. The first one leaves a file at the path to say it has been.
+  if (title.startsWith("rogue:slow-again:")) {
+    const [ms, ...path] = title.slice("rogue:slow-again:".length).split(":");
+    const mark = path.join(":");
+    if (existsSync(mark)) busyFor(Number(ms));
+    else writeFileSync(mark, "");
+  }
   if (title === "rogue:compile-throws") throw new RangeError("thrown by the compile");
   const prepared = prepareScorer(...task);
   return { problem: prepared.problem, score: (content) => rogueScore(content, prepared.score) };
@@ -104,7 +113,7 @@ function rogueCheck(schema: Record<string, unknown>): ReturnType<typeof checkJso
 }
 
 if (parentPort === null) throw new Error("rogue-worker.ts runs only as a worker");
-serveWorker(parentPort, workerData, {
+serveWorker(parentPort, {
   prepareScorer: roguePrepare,
   checkJsonSchemaUsable: rogueCheck,
 });

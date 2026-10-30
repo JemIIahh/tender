@@ -1,14 +1,18 @@
 import { execFile } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { Heldout } from "@tender/shared";
-import { expect, test, vi } from "vitest";
+import { expect, onTestFinished, test, vi } from "vitest";
 import type { P0Criteria } from "../src/intake";
 import {
   checkJsonSchemaIsolated,
   openTaskScorer,
   type Scoring,
+  WarmWorker,
   type WorkerOptions,
 } from "../src/isolate";
 import { ScorerUnavailableError, scoreEntry } from "../src/score";
@@ -20,6 +24,8 @@ import { MALFORMED } from "./fixtures/malformed";
 // hold on a busy machine.
 
 const ROGUE = new URL("./fixtures/rogue-worker.ts", import.meta.url);
+/** The Judge's own worker, 3 s slower to load. */
+const SLOW_START = new URL("./fixtures/slow-start-worker.ts", import.meta.url);
 const run = promisify(execFile);
 
 const EXACT: P0Criteria = {
@@ -236,7 +242,7 @@ test("the_time_left_bounds_each_part_of_the_work", { timeout: 30_000 }, async ()
 });
 
 test("a_compile_longer_than_an_entrys_limit_is_not_charged_to_any_entry", {
-  timeout: 60_000,
+  timeout: 180_000,
 }, async () => {
   // The review's shape: a leaf of 100 properties that the schema refers to 100 times, which Ajv
   // writes out at each reference. It takes over a second to compile, and V8 compiles what Ajv
@@ -257,7 +263,8 @@ test("a_compile_longer_than_an_entrys_limit_is_not_charged_to_any_entry", {
   };
   const scorer = openTaskScorer(
     { criteria: jsonSchema(schema), heldout: X_IS_1 },
-    { entryTimeoutMs: 500, compileBudgetMs: 60_000 },
+    // The compile's budget is not what this is about: room enough for a machine that is very busy.
+    { entryTimeoutMs: 500, compileBudgetMs: 120_000 },
   );
   const backtracking = `{"x":1,"s":"${"a".repeat(40)}!"}`;
   for (const [content, scoring] of [
@@ -269,6 +276,59 @@ test("a_compile_longer_than_an_entrys_limit_is_not_charged_to_any_entry", {
     expect(await scorer.score(bytes(content)), content.slice(0, 20)).toEqual(scoring);
   }
   await scorer.close();
+});
+
+test("a_warm_worker_is_ready_when_a_scorer_needs_one", { timeout: 60_000 }, async () => {
+  // Workers that take 3 s more to load, and scorers that wait 1 s for one. A scorer that starts
+  // its own cannot score. One that takes the warm worker, loaded ahead, can, and taking it starts
+  // the next one loading, for the scorer after it. Closing it leaves no worker.
+  const before = workers();
+  const own = openTaskScorer(EXACT_TASK, { workerUrl: SLOW_START, startTimeoutMs: 1_000 });
+  await expect(own.score(bytes("42"))).rejects.toThrow(ScorerUnavailableError);
+  await own.close();
+
+  const warm = new WarmWorker({ workerUrl: SLOW_START });
+  try {
+    for (const answer of ["42", "41"]) {
+      expect(await warm.ready()).toBe(true);
+      const scorer = openTaskScorer(EXACT_TASK, { warm, startTimeoutMs: 1_000 });
+      expect(await scorer.score(bytes(answer))).toEqual(answer === "42" ? RIGHT : WRONG);
+      await scorer.close();
+    }
+  } finally {
+    await warm.close();
+  }
+  expect(workers()).toBe(before);
+});
+
+test("only_a_tasks_first_compile_can_reject_its_criteria", { timeout: 60_000 }, async () => {
+  // The second compile of these criteria, and every one after it, takes 4 s in any worker, and the
+  // budget is 2 s. The first compile fits. When an entry's loop gets its worker stopped, the next
+  // worker cannot compile them in time: that is load, not the criteria (`unavailable`). So it is
+  // for a scorer opened for a task whose criteria compiled on an earlier tick. Only a task's first
+  // compile refuses them.
+  const mark = join(mkdtempSync(join(tmpdir(), "tender-judge-")), "compiled");
+  onTestFinished(() => rmSync(dirname(mark), { recursive: true, force: true }));
+  const task = {
+    criteria: jsonSchema({ title: `rogue:slow-again:4000:${mark}`, type: "object" }),
+    heldout: X_IS_1,
+  };
+  const options = { workerUrl: ROGUE, compileBudgetMs: 2_000, onCrash: () => undefined };
+  const scorer = openTaskScorer(task, { ...options, entryTimeoutMs: 1_000 });
+  expect(scorer.compiled).toBe(false);
+  expect(await scorer.score(bytes('{"x":1}'))).toEqual(RIGHT);
+  expect(scorer.compiled).toBe(true);
+  expect(await scorer.score(bytes("rogue:loop"))).toEqual(failed("scoring timed out"));
+  expect(await scorer.score(bytes('{"x":1}'))).toEqual({ kind: "unavailable" });
+  await scorer.close();
+
+  const later = openTaskScorer(task, { ...options, compiled: true });
+  expect(await later.score(bytes('{"x":1}'))).toEqual({ kind: "unavailable" });
+  await later.close();
+  const first = openTaskScorer(task, options);
+  expect(await first.score(bytes('{"x":1}'))).toEqual({ kind: "rejected", reason: TOO_SLOW });
+  expect(first.compiled).toBe(false);
+  await first.close();
 });
 
 test("the_criteria_compile_before_any_entry", { timeout: 60_000 }, async () => {
@@ -362,9 +422,9 @@ test("no_worker_is_left_after_a_task", { timeout: 60_000 }, async () => {
 });
 
 test("under_tsx_the_workers_load_and_nothing_is_left_running", { timeout: 90_000 }, async () => {
-  // The tsx CLI, as `pnpm serve` runs the Judge: the workers inherit its loader. The script
-  // prints the workers and timers still running once its scorers are closed, and must then exit
-  // by itself, which it cannot while a worker or a timer is left.
+  // The tsx CLI, as `pnpm serve` runs the Judge: the workers inherit its loader, a warm one's too.
+  // The script prints the workers and timers still running once its scorers and the warm worker
+  // are closed, and must then exit by itself, which it cannot while a worker or a timer is left.
   const cli = createRequire(import.meta.url).resolve("tsx/cli");
   const script = fileURLToPath(new URL("./fixtures/score-under-tsx.ts", import.meta.url));
   const { stdout } = await run(process.execPath, [cli, script], { timeout: 60_000 });
@@ -376,6 +436,7 @@ test("under_tsx_the_workers_load_and_nothing_is_left_running", { timeout: 90_000
       failed("scoring failed"),
       RIGHT,
       scored({ score: 0, passed: false, reasons: [] }),
+      RIGHT,
     ],
     check: { ok: true },
     left: [],

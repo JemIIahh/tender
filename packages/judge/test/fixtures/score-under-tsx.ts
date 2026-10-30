@@ -1,10 +1,11 @@
 import type { P0Criteria } from "../../src/intake";
-import { checkJsonSchemaIsolated, openTaskScorer } from "../../src/isolate";
+import { checkJsonSchemaIsolated, openTaskScorer, WarmWorker } from "../../src/isolate";
 
 // Run by isolate.test.ts with the tsx CLI, the way `pnpm serve` runs the Judge, so that the
 // workers load TypeScript through the loader they inherit. It scores a few entries with the
-// Judge's own worker and with the rogue one, closes both, prints what came of it with the
-// workers and timers still running, and is expected to exit by itself.
+// Judge's own worker, with the rogue one, and with a warm worker loaded ahead, closes them all,
+// prints what came of it with the workers and timers still running, and is expected to exit by
+// itself.
 
 const criteria: P0Criteria = {
   version: 1,
@@ -32,9 +33,15 @@ const scores = [
   // The worker's environment, which is empty.
   await rogue.score(bytes("rogue:env")),
 ];
+const warm = new WarmWorker();
+await warm.ready();
+const warmed = openTaskScorer(task, { warm });
+scores.push(await warmed.score(bytes("42")));
 const check = await checkJsonSchemaIsolated({ type: "object" });
 await judges.close();
 await rogue.close();
+await warmed.close();
+await warm.close();
 
 const left = process
   .getActiveResourcesInfo()
