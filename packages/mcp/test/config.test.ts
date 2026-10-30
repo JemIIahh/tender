@@ -1,5 +1,13 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +26,18 @@ import {
   secretsOf,
 } from "../src/config";
 import { createStateStore } from "../src/state";
+
+// `lstatSync` and `realpathSync` are wrapped, so that a test can describe a way of directories that a
+// disk cannot be made to have (a parent that root owns, one that another user owns). They do the real
+// thing until a test says not to.
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    lstatSync: vi.fn(actual.lstatSync),
+    realpathSync: vi.fn(actual.realpathSync),
+  };
+});
 
 const run = promisify(execFile);
 const ROOT = fileURLToPath(new URL("../../..", import.meta.url));
@@ -41,13 +61,15 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.mocked(lstatSync).mockReset();
+  vi.mocked(realpathSync).mockReset();
   await rm(home, { recursive: true, force: true });
 });
 
-/** The message `readConfig` fails with. */
-function failureOf(env: Record<string, string>): string {
+/** The message `readConfig` fails with, for the home `at` (the test's own, unless another is given). */
+function failureOf(env: Record<string, string>, at: string = home): string {
   try {
-    readConfig(env, home);
+    readConfig(env, at);
   } catch (error) {
     expect(error).toBeInstanceOf(ConfigError);
     return (error as ConfigError).message;
@@ -67,12 +89,14 @@ test("config_reads_the_environment", () => {
   });
 
   // Everything, with space around the values as a hand-edited file has.
+  const filesDir = join(home, "tender-files");
+  mkdirSync(filesDir, { mode: 0o700 });
   const everything = {
     ...ENV,
     TENDER_NETWORK: " mainnet\n",
     NEAR_RPC_URL: "https://rpc.example.com/?key=1",
     TENDER_STATE_DIR: "/srv/tender-state",
-    TENDER_FILES_DIR: "/srv/tender-files",
+    TENDER_FILES_DIR: filesDir,
     TENDER_JUDGE_ACCOUNT: "judge.testnet",
     TENDER_TOKEN: "usdc.testnet",
   };
@@ -80,7 +104,7 @@ test("config_reads_the_environment", () => {
     network: "mainnet",
     rpcUrl: "https://rpc.example.com/?key=1",
     stateDir: "/srv/tender-state",
-    filesDir: "/srv/tender-files",
+    filesDir,
     judgeAccount: "judge.testnet",
     token: "usdc.testnet",
   });
@@ -253,10 +277,14 @@ test("files_dir_is_an_absolute_path_or_nothing", () => {
   expect(readConfig(ENV, home)).not.toHaveProperty("filesDir");
   for (const unset of ["", "   "]) expect(filesDir(unset)).toBeUndefined();
 
-  expect(filesDir("/srv/tender-files")).toBe("/srv/tender-files");
+  // (The directory is there, and the user's own: see the tests that follow.)
+  const tenderFiles = join(home, "tender-files");
+  mkdirSync(tenderFiles, { mode: 0o700 });
+  mkdirSync(join(home, "results"), { mode: 0o700 });
+  expect(filesDir(tenderFiles)).toBe(tenderFiles);
   // Space around the value is not part of it, and a leading ~ is the home directory, as in
   // TENDER_STATE_DIR: a config file holds `~/...` and no shell expands it there.
-  expect(filesDir(" /srv/tender-files \n")).toBe("/srv/tender-files");
+  expect(filesDir(` ${tenderFiles} \n`)).toBe(tenderFiles);
   expect(filesDir("~/results")).toBe(join(home, "results"));
   expect(filesDir("~")).toBe(home);
 
@@ -290,6 +318,222 @@ test("files_dir_is_an_absolute_path_or_nothing", () => {
       "TENDER_STATE_DIR must not start with ~user: only ~ and ~/ are expanded; " +
       "TENDER_FILES_DIR must be an absolute path",
   );
+});
+
+/** A directory `name` under `parent`, with exactly `mode` (a umask does not change what chmod sets). */
+function makeDir(parent: string, name: string, mode = 0o700): string {
+  const path = join(parent, name);
+  mkdirSync(path);
+  chmodSync(path, mode);
+  return path;
+}
+
+/** What `readConfig` says of a TENDER_FILES_DIR that others could write in, or that is not there. */
+const SHARED = /^TENDER_FILES_DIR must be a directory that only you can write to: /;
+const MISSING = "TENDER_FILES_DIR must be a directory that exists";
+
+test("files_dir_must_be_a_directory_that_only_the_user_can_write_to", () => {
+  // P04-R2: whoever can write in the directory can race a file read's checks, so it is the user's
+  // alone. First the mode of the directory itself: nothing for a group or for others to write.
+  const files = makeDir(home, "files");
+  const env = { ...ENV, TENDER_FILES_DIR: files };
+  for (const [mode, accepted] of [
+    [0o700, true],
+    [0o750, true],
+    [0o755, true],
+    [0o775, false],
+    [0o757, false],
+    [0o770, false],
+    [0o707, false],
+    [0o720, false],
+    [0o702, false],
+    [0o777, false],
+  ] as const) {
+    chmodSync(files, mode);
+    if (accepted) expect(readConfig(env, home).filesDir, mode.toString(8)).toBe(files);
+    else expect(failureOf(env), mode.toString(8)).toMatch(SHARED);
+  }
+
+  // Then a directory above it, up to the home, and the home itself.
+  chmodSync(files, 0o700);
+  const inner = makeDir(files, "inner");
+  const innerEnv = { ...ENV, TENDER_FILES_DIR: inner };
+  expect(readConfig(innerEnv, home).filesDir).toBe(inner);
+  chmodSync(files, 0o775);
+  expect(failureOf(innerEnv)).toMatch(SHARED);
+  chmodSync(files, 0o700);
+  chmodSync(home, 0o775);
+  expect(failureOf(env)).toMatch(SHARED);
+  chmodSync(home, 0o700);
+  expect(readConfig(env, home).filesDir).toBe(files);
+
+  // The message names the variable and the rule, and no path.
+  chmodSync(files, 0o777);
+  expect(failureOf(env)).not.toContain(home);
+  // It is reported with the other faults, in order.
+  expect(failureOf({ ...env, TENDER_NETWORK: "devnet" })).toMatch(
+    /^TENDER_NETWORK must be one of sandbox, testnet, mainnet; TENDER_FILES_DIR must be a directory that only you can write to: /,
+  );
+});
+
+test("files_dir_is_looked_at_up_to_the_home_directory_or_else_up_to_the_root", () => {
+  // A directory above the home is not looked at: this one is open to everybody, as /tmp is.
+  const open = makeDir(home, "open", 0o777);
+  const mine = makeDir(open, "me");
+  const files = makeDir(mine, "files");
+  const env = { ...ENV, TENDER_FILES_DIR: files };
+  expect(readConfig(env, mine).filesDir).toBe(files);
+  // The home itself is the top (and the only one, for the directory that is the home).
+  expect(readConfig({ ...ENV, TENDER_FILES_DIR: mine }, mine).filesDir).toBe(mine);
+
+  // Under no home of the user's, the way goes on up through `me` to the open directory.
+  expect(failureOf(env, join(home, "elsewhere"))).toMatch(SHARED);
+  chmodSync(open, 0o755);
+  expect(readConfig(env, home).filesDir).toBe(files);
+});
+
+test("a_files_dir_that_is_not_there_or_is_no_directory_is_refused", () => {
+  // It could be made by anybody later, with any mode, so it is refused now.
+  writeFileSync(join(home, "plain"), "x");
+  for (const bad of ["nothing", "plain", join("nothing", "deeper"), join("plain", "deeper")]) {
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, bad) }), bad).toBe(MISSING);
+  }
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "nothing") })).not.toContain(home);
+});
+
+test("a_files_dir_may_be_reached_through_a_link_if_where_it_leads_is_the_users_alone", () => {
+  // `lstat` does not follow a link, so a link on the way is judged as a link (it must be the user's
+  // or root's) and the place it leads to is looked at by its real path as well.
+  const real = makeDir(home, "real");
+  const files = makeDir(real, "files");
+  symlinkSync(real, join(home, "link"), "dir");
+  symlinkSync(files, join(home, "files-link"), "dir");
+
+  for (const through of [join(home, "link", "files"), join(home, "files-link")]) {
+    expect(readConfig({ ...ENV, TENDER_FILES_DIR: through }, home).filesDir, through).toBe(through);
+  }
+  // The link is the user's, and the place it leads to is open to a group: refused.
+  chmodSync(real, 0o775);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "link", "files") })).toMatch(SHARED);
+  chmodSync(real, 0o700);
+  chmodSync(files, 0o775);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "files-link") })).toMatch(SHARED);
+});
+
+test("files_dir_and_the_directories_above_it_belong_to_the_user_or_to_root", () => {
+  const me = process.getuid?.();
+  if (me === undefined) return;
+  const other = me + 1;
+  const found = (uid: number, mode: number, kind: "dir" | "link" | "file" = "dir") => ({
+    uid,
+    mode: { dir: 0o40000, link: 0o120000, file: 0o100000 }[kind] | mode,
+    isDirectory: () => kind === "dir",
+    isSymbolicLink: () => kind === "link",
+  });
+  type Found = ReturnType<typeof found>;
+  const FILES = "/srv/tender/files";
+  const clean = (): Record<string, Found> => ({
+    [FILES]: found(me, 0o700),
+    "/srv/tender": found(0, 0o755),
+    "/srv": found(0, 0o755),
+    "/": found(0, 0o755),
+  });
+  /**
+   * What `readConfig` makes of FILES on a disk that has `entries` and nothing else, under the home
+   * `at`, where `leads` says where each path leads (to itself, unless it is a link).
+   */
+  const verdict = (
+    entries: Record<string, Found>,
+    at = "/home/me",
+    leads: (path: string) => string = (path) => path,
+  ): string | undefined => {
+    vi.mocked(lstatSync).mockImplementation(((path: string) => {
+      const entry = entries[path];
+      if (entry === undefined) {
+        throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${path}'`), {
+          code: "ENOENT",
+        });
+      }
+      return entry;
+    }) as never);
+    vi.mocked(realpathSync).mockImplementation(((path: string) => leads(path)) as never);
+    try {
+      return readConfig({ ...ENV, TENDER_FILES_DIR: FILES }, at).filesDir;
+    } catch (error) {
+      return (error as Error).message;
+    }
+  };
+
+  // Directories above it may be root's, or the user's.
+  expect(verdict(clean())).toBe(FILES);
+  expect(verdict({ ...clean(), "/srv/tender": found(me, 0o700) })).toBe(FILES);
+  // The directory itself must be the user's: not root's, not another user's.
+  expect(verdict({ ...clean(), [FILES]: found(0, 0o700) })).toMatch(SHARED);
+  expect(verdict({ ...clean(), [FILES]: found(other, 0o700) })).toMatch(SHARED);
+  // Any directory above it must be the user's or root's, however high.
+  for (const above of ["/srv/tender", "/srv", "/"]) {
+    expect(verdict({ ...clean(), [above]: found(other, 0o755) }), above).toMatch(SHARED);
+  }
+  // And not open to a group or to others, however high; the sticky bit is no excuse.
+  for (const above of ["/srv/tender", "/srv", "/"]) {
+    for (const mode of [0o775, 0o757, 0o1777]) {
+      expect(verdict({ ...clean(), [above]: found(0, mode) }), `${above} ${mode}`).toMatch(SHARED);
+    }
+  }
+  // The way stops at the home, and at the root otherwise.
+  expect(verdict({ ...clean(), "/": found(other, 0o777) }, "/srv")).toBe(FILES);
+  expect(verdict({ ...clean(), "/srv": found(other, 0o777) }, "/srv")).toMatch(SHARED);
+  expect(verdict({ ...clean(), "/srv": found(other, 0o777) }, FILES)).toBe(FILES);
+
+  // A link is judged as a link: the user's or root's will do, another user's will not.
+  expect(verdict({ ...clean(), [FILES]: found(me, 0o777, "link") })).toBe(FILES);
+  expect(verdict({ ...clean(), [FILES]: found(0, 0o777, "link") })).toBe(FILES);
+  expect(verdict({ ...clean(), [FILES]: found(other, 0o777, "link") })).toMatch(SHARED);
+  expect(verdict({ ...clean(), "/srv/tender": found(other, 0o777, "link") })).toMatch(SHARED);
+
+  // A link that leads to another place: that place is looked at, up to the root, and not the way
+  // to the link. (Nothing but the link's own owner and its parents is asked of the link.)
+  const away = (path: string) => (path === FILES ? "/data/files" : path);
+  const leading = (): Record<string, Found> => ({
+    ...clean(),
+    [FILES]: found(me, 0o777, "link"),
+    "/data/files": found(me, 0o700),
+    "/data": found(0, 0o755),
+  });
+  expect(verdict(leading(), "/home/me", away)).toBe(FILES);
+  expect(verdict({ ...leading(), "/data/files": found(other, 0o700) }, "/home/me", away)).toMatch(
+    SHARED,
+  );
+  expect(verdict({ ...leading(), "/data/files": found(me, 0o770) }, "/home/me", away)).toMatch(
+    SHARED,
+  );
+  expect(verdict({ ...leading(), "/data": found(other, 0o755) }, "/home/me", away)).toMatch(SHARED);
+  expect(verdict({ ...leading(), "/data": found(0, 0o777) }, "/home/me", away)).toMatch(SHARED);
+  // A way that lstat found and that cannot be followed to a real path is refused as missing.
+  const vanished = () => {
+    throw Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" });
+  };
+  expect(verdict(clean(), "/home/me", vanished)).toBe(MISSING);
+
+  // A directory that is not there, or is a file, is refused; a parent that cannot be read, too.
+  const { [FILES]: _gone, ...without } = clean();
+  expect(verdict(without)).toBe(MISSING);
+  expect(verdict({ ...clean(), [FILES]: found(me, 0o600, "file") })).toBe(MISSING);
+  const { "/srv": _hidden, ...unseen } = clean();
+  expect(verdict(unseen)).toMatch(SHARED);
+});
+
+test("files_dir_is_not_looked_at_where_there_are_no_user_ids", () => {
+  // Windows has no owner or mode of the kind: nothing is compared, and the disk is not asked.
+  const original = Object.getOwnPropertyDescriptor(process, "getuid");
+  Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+  try {
+    const files = join(home, "not-there-and-not-looked-for");
+    expect(readConfig({ ...ENV, TENDER_FILES_DIR: files }, home).filesDir).toBe(files);
+    expect(lstatSync).not.toHaveBeenCalled();
+  } finally {
+    if (original !== undefined) Object.defineProperty(process, "getuid", original);
+  }
 });
 
 /** A contract whose token list is `tokens`, as `get_config` reports it. */

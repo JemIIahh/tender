@@ -1,4 +1,4 @@
-import { constants as fsConstants } from "node:fs";
+import { type BigIntStats, constants as fsConstants } from "node:fs";
 import { type FileHandle, open, realpath, stat } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -27,7 +27,7 @@ import {
 } from "@tender/shared";
 import { z } from "zod";
 import { secretCheck } from "../secrets";
-import type { McpDeps } from "../server";
+import type { McpDeps, OpenFileLookup } from "../server";
 import { type Draft, isDraftOf } from "../state";
 import {
   describeError,
@@ -65,7 +65,9 @@ import {
 // FILES. `commit_result` takes its work as text or as a file, and `reveal_result` later publishes
 // it, so a file path is a way to publish whatever the server can read. The server therefore reads
 // only inside the one directory that the user named (`filesDir`, from `TENDER_FILES_DIR`), and
-// none at all when there is none (P04-R1). Work that holds one of the server's own secrets is
+// none at all when there is none (P04-R1). That directory must be the user's alone (`readConfig`,
+// P04-R2), and on Linux the open file is traced back to a path through its descriptor
+// (`OpenFileLookup`). Work that holds one of the server's own secrets is
 // refused, whether it came as text or as a file, since the scrubber sees what a tool says and never
 // what a reveal uploads. The secret is looked for as it is and in the usual disguises (best effort),
 // where the work comes in (a commit), where a draft's commit is sent again, and a last time just
@@ -202,27 +204,42 @@ async function realInside(path: string, directory: string): Promise<string> {
   return real;
 }
 
+/** The real lookup of an open file: on Linux, `/proc/self/fd/N` is where the kernel has file N. */
+const PROCESS_FILES: OpenFileLookup = {
+  platform: process.platform,
+  pathOf: (fd) => realpath(`/proc/self/fd/${fd}`),
+};
+
 /**
  * The bytes of the file at `path`, at most `limit` of them, if it is a regular file inside
  * `filesDir` (P04-R1). Where a path leads is what counts, and not how it is written: `realpath`
  * follows every link and every `..`, and the file's real path must lie under the directory's real
  * path, so that no link, `..` or other name for the same place gets a file out of the directory.
  *
- * Two gaps are closed after that. The path is looked up and the file opened a moment later, and a
+ * Three gaps are closed after that. The path is looked up and the file opened a moment later, and a
  * folder on the way could be swapped for a link in between; so once the file is open, the path is
  * looked up again, and must still lead inside, to the very file that is open (the same device and
- * inode). And a hard link inside the directory to a file outside it leads nowhere that a path shows,
- * so a file with more than one name counts as outside.
+ * inode). A hard link inside the directory to a file outside it leads nowhere that a path shows, so
+ * a file with more than one name counts as outside; the count is read at both looks, since a name
+ * made after the first shows only in the second. And on Linux the kernel is asked where the open
+ * file is (`openFiles`), which is a look at the descriptor and not at a name, and must be inside.
  *
- * A path that leads nowhere, out, or to a file that fails either check gets `unreadable()` and
- * nothing more, and nothing is said about a file (what it is, how big) until it has passed both. (A
- * file that passes may still fail to open or to be read, and says why. The directory is the user's
- * to get right, and its own faults are named.)
+ * What is left (P04-R2). Looking a path up again is a look at a name, and a name can be swapped back
+ * and forth between the looks, so that each look finds what it expects. On macOS, and on any
+ * platform without the descriptor, somebody who can already write in your own directory can still
+ * race the check. `readConfig` refuses a directory that anyone but the user (or root) can write in,
+ * which limits that somebody to you.
+ *
+ * A path that leads nowhere, out, or to a file that fails any check gets `unreadable()` and
+ * nothing more, and nothing is said about a file (what it is, how big) until it has passed them all.
+ * (A file that passes may still fail to open or to be read, and says why. The directory is the
+ * user's to get right, and its own faults are named.)
  */
 async function readLocalFile(
   path: string,
   limit: number,
   filesDir: string | undefined,
+  openFiles: OpenFileLookup,
 ): Promise<Uint8Array> {
   if (filesDir === undefined) {
     throw new ToolError(
@@ -255,19 +272,30 @@ async function readLocalFile(
     throw new ToolError("FILE_UNREADABLE", errorText(error));
   }
   try {
+    // Where the kernel has the open file, if it can say (Linux): the descriptor cannot be swapped.
+    if (openFiles.platform === "linux") {
+      let opened: string;
+      try {
+        opened = await openFiles.pathOf(handle.fd);
+      } catch {
+        throw unreadable();
+      }
+      if (!isInside(directory, opened)) throw unreadable();
+    }
     // Whole numbers (bigint), so that inodes beyond 2^53 are told apart too.
     const stats = await handle.stat({ bigint: true });
     // Is the file that is open the one the path leads to now, and is that inside still?
     const again = await realInside(path, directory);
-    let there: { dev: bigint; ino: bigint };
+    let there: BigIntStats;
     try {
       there = await stat(again, { bigint: true });
     } catch {
       throw unreadable();
     }
     if (there.dev !== stats.dev || there.ino !== stats.ino) throw unreadable();
-    // Another name for the file may be outside. (A folder's link count does not count names.)
-    if (stats.nlink > 1n && !stats.isDirectory()) throw unreadable();
+    // Another name for the file may be outside. (A folder's link count does not count names.) The
+    // later look counts too: a name made since the first shows only in it.
+    if ((stats.nlink > 1n || there.nlink > 1n) && !stats.isDirectory()) throw unreadable();
     if (!stats.isFile()) throw new ToolError("BAD_INPUT", "file_path is not a regular file");
     if (stats.size > BigInt(limit)) throw tooLarge(Number(stats.size), limit);
     // One byte more than the limit, so that a file that grew since the `stat` is still caught.
@@ -712,7 +740,12 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       }
       const bytes = hasContent
         ? new TextEncoder().encode(content)
-        : await readLocalFile(file_path ?? "", MAX_RESULT, filesDir);
+        : await readLocalFile(
+            file_path ?? "",
+            MAX_RESULT,
+            filesDir,
+            deps.openFiles ?? PROCESS_FILES,
+          );
       if (bytes.length > MAX_RESULT) throw tooLarge(bytes.length, MAX_RESULT);
       if (holdsSecret(bytes)) {
         // The text never says which secret, or where in the work it is.

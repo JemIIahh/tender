@@ -41,7 +41,7 @@ import {
 import { baseEncode } from "near-api-js";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { secretsOf } from "../src/config";
-import { createMcpServer, type McpChain, type McpDeps } from "../src/server";
+import { createMcpServer, type McpChain, type McpDeps, type OpenFileLookup } from "../src/server";
 import { createStateStore, type Draft, type StateStore } from "../src/state";
 
 // `open` and `stat` are wrapped, so that a test can change the disk between the server's look at a
@@ -2011,6 +2011,131 @@ test("a_file_that_is_gone_by_the_second_look_gets_the_one_answer", async () => {
   expect(chain.commit).not.toHaveBeenCalled();
   expect(await state.getDraft("7")).toBeNull();
   expect(await state.getDraft("8")).toBeNull();
+});
+
+test("a_link_made_since_the_first_look_is_seen_by_the_second", async () => {
+  // The link count is read at both looks. A name made between them (a hard link from a place that
+  // somebody can reach) shows only in the second, so the first look's count is not enough (P04-R2).
+  const files = await makeFilesDir();
+  const file = join(files, "a.txt");
+  await writeFile(file, "inside");
+  const { call, callJson, chain } = await connectWrite({ filesDir: files });
+  const actual = await realFs();
+
+  vi.mocked(stat).mockImplementationOnce(async (path, options) => {
+    await link(file, join(files, "alias.txt"));
+    return actual.stat(path, { ...options, bigint: true });
+  });
+  const answer = await call("commit_result", { task_id: "7", file_path: file });
+
+  expect(answer).toEqual({ isError: true, text: UNREADABLE });
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+
+  // With the new name gone, the same look finds one name, and the file is read.
+  await unlink(join(files, "alias.txt"));
+  expect(await callJson("commit_result", { task_id: "8", file_path: file })).toMatchObject({
+    content_hash: sha256Hex("inside"),
+  });
+});
+
+/** A lookup that poses as `platform` and says that every open file is at `where`. */
+function lookup(
+  platform: NodeJS.Platform,
+  where: (fd: number) => Promise<string>,
+): OpenFileLookup & { pathOf: ReturnType<typeof vi.fn<(fd: number) => Promise<string>>> } {
+  return { platform, pathOf: vi.fn(where) };
+}
+
+test("on_linux_the_open_file_must_be_inside_by_its_descriptor", async () => {
+  // The kernel can say where an open file is, and a swap of names cannot change that (P04-R2).
+  const files = await makeFilesDir();
+  const file = join(files, "a.txt");
+  await writeFile(file, "inside");
+  const outside = join(root, "outside");
+  await mkdir(outside);
+  await writeFile(join(outside, "a.txt"), "TOP SECRET");
+  const real = await realpath(file);
+
+  // Where it is, it is read: and the kernel was asked about the descriptor of the file that is open.
+  const honest = lookup("linux", async () => real);
+  let opened = -1;
+  await aroundTheOpen(files, {
+    after: async (handle) => {
+      opened = handle.fd;
+    },
+  });
+  const first = await connectWrite({ filesDir: files, openFiles: honest });
+  expect(await first.callJson("commit_result", { task_id: "1", file_path: file })).toMatchObject({
+    content_hash: sha256Hex("inside"),
+  });
+  expect(opened).toBeGreaterThan(2);
+  expect(honest.pathOf).toHaveBeenCalledTimes(1);
+  expect(honest.pathOf).toHaveBeenCalledWith(opened);
+
+  // Anywhere else it is refused, with the one answer, and nothing is made.
+  const elsewhere: Array<[why: string, where: (fd: number) => Promise<string>]> = [
+    ["a file outside", async () => join(outside, "a.txt")],
+    ["a folder beside the directory, named like it", async () => `${files}-twin${sep}a.txt`],
+    ["the directory itself", async () => real.slice(0, real.lastIndexOf(sep))],
+    ["a place that cannot be said", () => Promise.reject(new Error("ENOENT: /proc/self/fd/9"))],
+  ];
+  let taskId = 1;
+  for (const [why, where] of elsewhere) {
+    taskId++;
+    const lost = lookup("linux", where);
+    const { call, chain } = await connectWrite({ filesDir: files, openFiles: lost });
+
+    const answer = await call("commit_result", { task_id: String(taskId), file_path: file });
+
+    expect(answer, why).toEqual({ isError: true, text: UNREADABLE });
+    expect(lost.pathOf, why).toHaveBeenCalledTimes(1);
+    expect(chain.commit, why).not.toHaveBeenCalled();
+    expect(await state.getDraft(String(taskId)), why).toBeNull();
+  }
+
+  // On any other platform the kernel is not asked, whatever it would have said.
+  for (const platform of ["darwin", "win32", "freebsd"] as const) {
+    taskId++;
+    const never = lookup(platform, async () => join(outside, "a.txt"));
+    const { callJson } = await connectWrite({ filesDir: files, openFiles: never });
+    expect(
+      await callJson("commit_result", { task_id: String(taskId), file_path: file }),
+      platform,
+    ).toMatchObject({ content_hash: sha256Hex("inside") });
+    expect(never.pathOf, platform).not.toHaveBeenCalled();
+  }
+});
+
+test("the_descriptor_catches_a_swap_that_every_name_agrees_to", async () => {
+  // A folder is swapped for a link that leads out, the file is opened through it, and the swap is
+  // undone: the path leads inside again, and the second look finds the opened file's own device
+  // and inode (here the look is made to say so, as a swap of the file itself could). The names all
+  // agree, and only the kernel's word for where the open file is gives it away.
+  const files = await makeFilesDir();
+  const outside = join(root, "outside");
+  await mkdir(outside);
+  await writeFile(join(outside, "a.txt"), "TOP SECRET");
+  const folder = join(files, "folder");
+  await mkdir(folder);
+  await writeFile(join(folder, "a.txt"), "inside");
+  const actual = await realFs();
+  const leads = lookup("linux", async () => join(await realpath(outside), "a.txt"));
+  const { call, chain } = await connectWrite({ filesDir: files, openFiles: leads });
+  await aroundTheOpen(files, {
+    before: () => swapForLink(folder, outside),
+    after: () => swapBack(folder),
+  });
+  vi.mocked(stat).mockImplementationOnce((_path, options) =>
+    actual.stat(join(outside, "a.txt"), { ...options, bigint: true }),
+  );
+
+  const answer = await call("commit_result", { task_id: "7", file_path: join(folder, "a.txt") });
+
+  expect(answer).toEqual({ isError: true, text: UNREADABLE });
+  expect(leads.pathOf).toHaveBeenCalledTimes(1);
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
 });
 
 test("commit_checks_storage_buffer", async () => {

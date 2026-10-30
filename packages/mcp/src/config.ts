@@ -1,5 +1,6 @@
+import { lstatSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Signer, TenderClient } from "@tender/client";
 import { AccountIdSchema, NETWORKS, type NetworkId } from "@tender/shared";
 import { KeyPair, type KeyPairString } from "near-api-js";
@@ -35,8 +36,9 @@ export interface McpConfig {
   /** Where the drafts are kept: an absolute path unless the environment gave a relative one. */
   stateDir: string;
   /**
-   * The one directory that `commit_result` may read a file from (P04-R1), an absolute path. Not set
-   * means that no file is read, and a result is given as text.
+   * The one directory that `commit_result` may read a file from (P04-R1), an absolute path that
+   * only the user can write to (P04-R2; see `requireOwnDirectory`). Not set means that no file is
+   * read, and a result is given as text.
    */
   filesDir?: string;
   judgeAccount?: string;
@@ -132,6 +134,111 @@ function absoluteFilesDir(value: string, home: string): string {
   return path;
 }
 
+// The messages about TENDER_FILES_DIR's owner and mode name the variable and never a path: which
+// directory is at fault is for the user to find.
+const FILES_DIR_MISSING = "TENDER_FILES_DIR must be a directory that exists";
+const FILES_DIR_SHARED =
+  "TENDER_FILES_DIR must be a directory that only you can write to: it must be owned by you, and " +
+  "it and every directory above it, up to your home directory (or up to / when it is not under " +
+  "your home), must be owned by you or by root and not writable by a group or by others";
+
+/** Whether `path` is `dir` or lies under it, going by how the two are written. */
+function isWithin(dir: string, path: string): boolean {
+  return path === dir || path.startsWith(dir.endsWith(sep) ? dir : dir + sep);
+}
+
+/**
+ * `start` and each directory above it, nearest first, as far as `top`, which is `start` or one of
+ * its parents. With no `top` the walk goes up to the root.
+ */
+function directoriesUp(start: string, top: string | undefined): string[] {
+  const chain = [start];
+  for (let at = start; at !== top; ) {
+    const parent = dirname(at);
+    if (parent === at) break;
+    chain.push(parent);
+    at = parent;
+  }
+  return chain;
+}
+
+/** `home` if `path` is in it (or is it), else nothing: where a walk up from `path` stops. */
+function topFor(path: string, home: string | undefined): string | undefined {
+  return home !== undefined && isWithin(home, path) ? home : undefined;
+}
+
+/**
+ * What is wrong with a way to a directory, if anything: `chain` lists the directory and then each
+ * one above it. A link is judged as a link, since `lstat` does not follow it: whoever owns it can
+ * point it elsewhere, so it must be the user's or root's, and the place it leads to is looked at
+ * separately, by its real path.
+ */
+function faultIn(chain: readonly string[], me: number): "missing" | "shared" | undefined {
+  for (const [at, path] of chain.entries()) {
+    let found: Stats;
+    try {
+      found = lstatSync(path);
+    } catch {
+      return at === 0 ? "missing" : "shared";
+    }
+    const ours = found.uid === me;
+    const root = found.uid === 0;
+    if (found.isSymbolicLink()) {
+      if (!ours && !root) return "shared";
+      continue;
+    }
+    if (!found.isDirectory()) return at === 0 ? "missing" : "shared";
+    // The directory itself is the user's. One above it may be root's, who can change anything anyway.
+    if (!(ours || (root && at > 0))) return "shared";
+    if ((found.mode & 0o022) !== 0) return "shared";
+  }
+  return undefined;
+}
+
+/**
+ * Refuses a `TENDER_FILES_DIR` in which somebody else could change a name (ruling P04-R2).
+ * `commit_result` looks a path up and then opens the file, and whoever can write in the directory
+ * can swap a name for a link in between, even back and forth between the server's looks. The checks
+ * in `readLocalFile` narrow that and cannot close it everywhere, so the directory must be the
+ * user's alone: owned by the user, and neither it nor any directory above it writable by a group or
+ * by others (`mode & 0o022`). The directories above it may be root's, and are looked at up to the
+ * user's home, or up to / when the directory is not under it. So a directory under /tmp, which
+ * anybody can write in, is refused, and one in the user's home that was made with a group-writable
+ * mode is too.
+ *
+ * `lstat` is used on each, and a link in the way is judged as a link; its target is checked as well,
+ * by its real path. Where the platform has no user ids (Windows) there is no owner to compare, and
+ * nothing is checked. A directory that is not there is refused: it could be made by anyone later.
+ */
+function requireOwnDirectory(dir: string, home: string): void {
+  const me = process.getuid?.();
+  if (me === undefined) return;
+
+  // As written, and then where it leads: a link in the way is a name that can be pointed elsewhere.
+  const written = resolve(dir);
+  const homeWritten = isAbsolute(home) ? resolve(home) : undefined;
+  let fault = faultIn(directoriesUp(written, topFor(written, homeWritten)), me);
+  if (fault === undefined) {
+    let real: string;
+    try {
+      real = realpathSync(written);
+    } catch {
+      throw new ConfigError(FILES_DIR_MISSING);
+    }
+    if (real !== written) {
+      let homeReal: string | undefined;
+      try {
+        homeReal = realpathSync(home);
+      } catch {
+        homeReal = undefined;
+      }
+      fault = faultIn(directoriesUp(real, topFor(real, homeReal)), me);
+    }
+  }
+  if (fault === "missing") throw new ConfigError(FILES_DIR_MISSING);
+  if (fault === "shared") throw new ConfigError(FILES_DIR_SHARED);
+}
+
 /**
  * The server's settings from `env`, checked.
  *
@@ -140,8 +247,9 @@ function absoluteFilesDir(value: string, home: string): string {
  *   networks use theirs unless `NEAR_RPC_URL` names another. `TENDER_API_URL` is `https:`, or
  *   `http:` to this machine only, since the API is signed in to with a bearer token.
  * - Optional: `TENDER_STATE_DIR` (default: `defaultStateDir`, under `home`; a leading `~` is
- *   expanded to `home`), `TENDER_FILES_DIR` (an absolute path, `~` expanded likewise; default:
- *   none, and then `commit_result` takes no file), `TENDER_JUDGE_ACCOUNT` and `TENDER_TOKEN`.
+ *   expanded to `home`), `TENDER_FILES_DIR` (an absolute path, `~` expanded likewise, of a
+ *   directory that only the user can write to: see `requireOwnDirectory`; default: none, and then
+ *   `commit_result` takes no file), `TENDER_JUDGE_ACCOUNT` and `TENDER_TOKEN`.
  *
  * A variable that is set to nothing is not set. Every fault is reported at once, in one line that
  * names the variables: the ones missing, then the ones whose values are wrong.
@@ -191,7 +299,10 @@ export function readConfig(env: Env, home: string = homedir()): McpConfig {
   let filesDir: string | undefined;
   const configuredFilesDir = setting(env, "TENDER_FILES_DIR");
   try {
-    if (configuredFilesDir !== undefined) filesDir = absoluteFilesDir(configuredFilesDir, home);
+    if (configuredFilesDir !== undefined) {
+      filesDir = absoluteFilesDir(configuredFilesDir, home);
+      requireOwnDirectory(filesDir, home);
+    }
   } catch (error) {
     if (!(error instanceof ConfigError)) throw error;
     wrong.push(error.message);

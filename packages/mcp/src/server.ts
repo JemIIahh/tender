@@ -29,6 +29,18 @@ export type McpChain = Pick<
   | "registerAgent"
 >;
 
+/**
+ * How the path of an open file is found from its descriptor. Only Linux can say, through
+ * `/proc/self/fd`, where the kernel has the file that is open; so that is the one platform where
+ * `commit_result` asks (P04-R2). It is a parameter so that a test can pose as Linux, or as another
+ * platform, and say where a file is.
+ */
+export interface OpenFileLookup {
+  platform: NodeJS.Platform;
+  /** The real path of the file open as `fd`. Rejects when that cannot be said. */
+  pathOf(fd: number): Promise<string>;
+}
+
 /** Everything the server needs from outside. The bin builds it from the environment. */
 export interface McpDeps {
   /** The chain: what the tools read from the contract, and the transactions they send to it. */
@@ -50,9 +62,13 @@ export interface McpDeps {
   /**
    * The one directory that `commit_result` may read a file from (P04-R1), as the user wrote it.
    * A file is read only if it is a regular file whose real path, with every link followed, is
-   * inside this directory's. Not set means that no file is read at all.
+   * inside this directory's. Not set means that no file is read at all. The bin gets it from
+   * `readConfig`, which accepts only a directory that nobody but the user (and root) can write to
+   * (P04-R2); a caller that builds the deps by hand answers for that itself.
    */
   filesDir?: string;
+  /** How an open file is traced back to a path. Not set means the process's own (the real one). */
+  openFiles?: OpenFileLookup;
   /**
    * Strings that no tool may ever answer with, such as the private key, its base58 body and the
    * credentials in the RPC URL (`secretsOf`). A failed tool's text has them cut out, and so has any
