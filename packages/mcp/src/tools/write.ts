@@ -12,6 +12,7 @@ import {
   computeCommitment,
   HeldoutSchema,
   heldoutMatchesCriteria,
+  isJudgeBranded,
   MAX_RESULT_BYTES,
   NETWORKS,
   type NetworkId,
@@ -74,11 +75,12 @@ import {
 // before a reveal uploads the work: a draft may hold what an earlier check did not see.
 //
 // PICKS. A scorecard is public, immutable and hashed on chain, and it says who made it. The API
-// serves whichever one a pick names without reading that field, so `pick_winners` is where a
-// scorecard is held to its picker: it must name the account that signs, and only the Judge's
-// account may name the Judge's software. The contract's rules for the winners (`E_WINNERS`) are
-// checked before the upload too, since a pick that the chain then refuses would leave the scorecard
-// public all the same.
+// holds a scorecard to the account that uploads it (P03-R29): it must name that account as its
+// verifier, and only the Judge's account may use the Judge's name. `pick_winners` makes the same
+// checks first, so that a scorecard the API would refuse is refused here with the reason, before
+// anything is sent. The contract's rules for the winners (`E_WINNERS`) are checked before the
+// upload too, since a pick that the chain then refuses would leave the scorecard public all the
+// same.
 
 /** The most bytes a result may have: a brief's `output.max_bytes` can be no more. */
 const MAX_RESULT = MAX_RESULT_BYTES;
@@ -105,11 +107,6 @@ const REFUSED_FOR_GOOD: ReadonlySet<string> = new Set([
 ]);
 /** How long the reason stored with a retired draft may be. */
 const MAX_REASON = 300;
-/**
- * A `judge.software` that claims to be the team's Judge, which writes `tender-judge/1`. The name is
- * free text, so it is matched in any case and after spaces.
- */
-const JUDGE_SOFTWARE = /^\s*tender-judge/i;
 /** What the winners' shares of a pick add up to, in basis points. */
 const BPS_WHOLE = 10_000;
 
@@ -1161,8 +1158,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "revealed entry scored: make it yourself from the entries (task_entries), with verifier " +
         "set to your own account and judge.software naming your own software, because a " +
         "scorecard is published in the name of whoever picks with it (SCORECARD_MISMATCH " +
-        "otherwise; software that starts with tender-judge is the Judge account's alone). " +
-        "get_scorecard shows the shape, but what it returns is the Judge's, so do not reuse it. " +
+        "otherwise; software named tender-judge, in any case and with or without punctuation, is " +
+        "the Judge account's alone). get_scorecard shows the shape, but what it returns was made " +
+        "by that task's verifier (the Judge, for a task the Judge scores), so do not reuse it. " +
         "The scorecard is checked, published and its hash goes on chain with the pick. winners " +
         "must be exactly the scorecard's winners: each account and its share in basis points of " +
         "the reward after the fee. A non-empty list must add up to exactly 10000, name each " +
@@ -1193,7 +1191,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           `the scorecard is for task ${card.data.task_id}, not task ${task_id}`,
         );
       }
-      // Nothing downstream reads these two fields, so this is where they are held to the picker.
+      // The API holds these two fields to the uploader as well (P03-R29): they are checked here first.
       if (card.data.verifier !== accountId) {
         throw new ToolError(
           "SCORECARD_MISMATCH",
@@ -1203,11 +1201,14 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
             "Judge's from get_scorecard included",
         );
       }
-      if (JUDGE_SOFTWARE.test(card.data.judge.software) && accountId !== deps.judgeAccount) {
+      // The name is only a brand, and what the API holds to the Judge's account (P03-R29). Whose the
+      // scorecard is, is the account that it names, and never what its software is called.
+      if (isJudgeBranded(card.data.judge.software) && card.data.verifier !== deps.judgeAccount) {
         throw new ToolError(
           "SCORECARD_MISMATCH",
-          "the scorecard's judge.software starts with tender-judge, which only the Judge's " +
-            "account may use: name your own software",
+          "the scorecard's judge.software names the Tender Judge (tender-judge, in any case and " +
+            "with or without punctuation), which only the Judge's account may use: name your own " +
+            "software",
         );
       }
       const same =

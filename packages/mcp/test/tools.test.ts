@@ -3309,8 +3309,9 @@ test("pick_winners_publishes_only_the_scorecard_of_the_account_that_picks", asyn
 });
 
 test("only_the_judge_account_may_publish_a_scorecard_in_the_judge_software", async () => {
-  // The schema says that none but the Judge may claim to be the Judge, and nothing downstream reads
-  // `judge.software`: a verifier's scorecard that claims it would read as the Judge's own.
+  // None but the Judge may claim to be the Judge: a verifier's scorecard that claims it would read as
+  // the Judge's own. The API refuses it (P03-R29), and the server says so first, with the same rule
+  // (`isJudgeBranded` of @tender/shared: the name in any case, with or without punctuation).
   const winners = [{ account: ACCOUNT, bps: 10_000 }];
   const arrange = async (overrides: Partial<McpDeps>) => {
     const kit = await connectWrite(overrides);
@@ -3322,7 +3323,11 @@ test("only_the_judge_account_may_publish_a_scorecard_in_the_judge_software", asy
     "tender-judge",
     "tender-judge-2/beta",
     "Tender-Judge/1",
-    " tender-judge/1",
+    "Tender_Judge",
+    "TENDERJUDGE-x",
+    "tender.judge/2",
+    "t.e.n.d.e.r-judge",
+    "tender/judge",
   ];
 
   // Not the Judge's account: refused, whether the server knows a Judge account or not.
@@ -3338,9 +3343,27 @@ test("only_the_judge_account_may_publish_a_scorecard_in_the_judge_software", asy
     expect(chain.pick).not.toHaveBeenCalled();
   }
 
-  // Names that only mention it, or are some other software's, are free to use.
+  // A name with a space or a look-alike character is no software name at all: the schema refuses it
+  // before the brand is looked at, and nothing is published.
+  const odd = await arrange({ judgeAccount: "judge.testnet" });
+  for (const software of [
+    " tender-judge/1",
+    "tender\u2010judge/1",
+    "tender\u200djudge/1",
+    "tender judge",
+  ]) {
+    const scorecard = { ...SCORECARD, judge: { software, model: null } };
+    const answer = await odd.call("pick_winners", { task_id: "7", winners, scorecard });
+    expect(answer.isError, software).toBe(true);
+    expect(answer.text, software).toMatch(/^INVALID_SCORECARD: /);
+  }
+  expect(odd.api.uploadBlob).not.toHaveBeenCalled();
+
+  // Names that only mention it, or are some other software's, are free to use. So is an ASCII
+  // look-alike (`t3nder-judge`) that the brand rule does not catch: which scorecard is the Judge's is
+  // told by the account it names, and never by what its software is called.
   const free = await arrange({ judgeAccount: "judge.testnet" });
-  for (const software of ["not-tender-judge/1", "my-judge/1", "judge", "a"]) {
+  for (const software of ["not-tender-judge/1", "my-judge/1", "judge", "a", "t3nder-judge"]) {
     const scorecard = { ...SCORECARD, judge: { software, model: null } };
     expect((await free.call("pick_winners", { task_id: "7", winners, scorecard })).isError).toBe(
       false,
