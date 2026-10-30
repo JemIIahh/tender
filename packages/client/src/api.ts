@@ -19,8 +19,11 @@ import {
   type ListTasksFilter,
   type ListTasksResponse,
   ListTasksResponseSchema,
+  MAX_RESULT_BYTES,
   type Scorecard,
   ScorecardSchema,
+  SIGN_IN_MESSAGE,
+  SIGN_IN_RECIPIENT,
   SignInResponseSchema,
   type StartResponse,
   StartResponseSchema,
@@ -41,10 +44,18 @@ const TOKEN_MARGIN_MS = 5 * 60 * 1000;
 /** How many bytes go to `String.fromCharCode` in one call, which takes them as arguments. */
 const BASE64_CHUNK = 0x8000;
 
+/** Hosts that are this machine, where plain http cannot be read or changed on the way. */
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/** A nonce as the API makes it: 32 bytes in base64, which is 43 characters and one `=`. */
+const NONCE_SHAPE = /^[A-Za-z0-9+/]{43}=$/;
+
 export interface ApiClientOptions {
   /**
-   * Where the API is served, as `PUBLIC_API_URL` has it: `https://api.example`, with no `/v1`. The
-   * client adds that, and drops a trailing slash.
+   * Where the API is served, as `PUBLIC_API_URL` has it: `https://api.example`. The client adds
+   * `/v1`, so a trailing slash and a trailing `/v1` are both dropped. With a `signer` it must be
+   * https, or http to this machine (`localhost`, `127.0.0.1` or `[::1]`): the signature and the
+   * bearer token travel to it.
    */
   baseUrl: string;
   /**
@@ -132,6 +143,81 @@ function isUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
 }
 
+/** `url` without its trailing slashes, and then without a trailing `/v1`, which the client adds. */
+function baseOf(url: string): string {
+  // The character before `/v1` is not a slash, so that the host of `https://v1` is not taken for it.
+  return url.replace(/\/+$/, "").replace(/([^/])\/v1$/, "$1");
+}
+
+/**
+ * Throws unless `baseUrl` is https, or http to this machine. A client with a signer sends the
+ * server a signature and then its bearer token: over plain http to another host the challenge can
+ * be swapped on the way and the token can be read.
+ */
+function requireSecure(baseUrl: string): void {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new Error("baseUrl is not an absolute URL");
+  }
+  if (url.protocol === "https:") return;
+  if (url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname)) return;
+  throw new Error(
+    "an ApiClient with a signer needs an https baseUrl, or http to localhost, 127.0.0.1 or [::1]: over plain http the sign-in can be swapped and the bearer token is sent in the clear",
+  );
+}
+
+/** Whether `nonce` is one the API could have made: 32 bytes in the one base64 spelling of them. */
+function isNonce(nonce: string): boolean {
+  return NONCE_SHAPE.test(nonce) && btoa(atob(nonce)) === nonce;
+}
+
+/**
+ * Why a challenge is not signed. It names the field and never quotes it: the text comes from a
+ * server that is not trusted, and an error is read by people and by agents.
+ */
+function refusal(field: "message" | "recipient" | "nonce"): Error {
+  return new Error(
+    `refusing to sign the API's sign-in challenge: its ${field} is not that of a Tender sign-in`,
+  );
+}
+
+/**
+ * The body of `res` as bytes, or null if it is more than `limit` bytes. A body that is too big is
+ * given up on as soon as that is known: from the `Content-Length` it declares, and else, as that
+ * can be absent or wrong, by counting while it is read. The rest of it is not read: the stream is
+ * cancelled.
+ */
+async function readCapped(res: Response, limit: number): Promise<Uint8Array | null> {
+  const declared = res.headers.get("Content-Length");
+  if (declared !== null && /^\d+$/.test(declared) && Number(declared) > limit) {
+    await res.body?.cancel().catch(() => undefined);
+    return null;
+  }
+  const reader = res.body?.getReader();
+  if (reader === undefined) return new Uint8Array(0);
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return bytes;
+}
+
 /**
  * The Tender API as a program calls it: `TenderApi`, over HTTP. The MCP server, the reference
  * agents and the seed script read and write the board through it.
@@ -148,6 +234,11 @@ function isUnauthorized(error: unknown): boolean {
  * come while it is being fetched share that one sign-in. A request the API refuses with a 401 has
  * the token dropped, signs in again and is sent once more, and a second 401 is thrown.
  *
+ * The server at `baseUrl` is not trusted with the key. A challenge is signed only if its message
+ * and recipient are `SIGN_IN_MESSAGE` and `SIGN_IN_RECIPIENT` and its nonce is 32 bytes in base64;
+ * any other is refused, with nothing signed. And a client with a signer needs an https `baseUrl`
+ * (http only to this machine), as the signature and the token go to it.
+ *
  * An `ApiError` holds the body of the answer for the caller to read, and for a sign-in that can be
  * the bearer token. So nothing here logs a body or puts one in a message.
  */
@@ -161,13 +252,14 @@ export class ApiClient implements TenderApi {
   private signingIn: Promise<string> | undefined;
 
   constructor(opts: ApiClientOptions) {
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = baseOf(opts.baseUrl);
     this.fetchImpl = opts.fetchImpl;
     // The clock is called as a function of its own, like `fetch`. The default looks `Date.now` up
     // on each call, so a test that fakes the clock after this is built is seen.
     const clock = opts.now;
     this.now = clock === undefined ? () => Date.now() : () => clock();
     if (opts.signer !== undefined) {
+      requireSecure(this.baseUrl);
       this.accountId = opts.signer.accountId;
       this.keyPair = KeyPair.fromString(opts.signer.privateKey as KeyPairString);
     }
@@ -249,20 +341,24 @@ export class ApiClient implements TenderApi {
   /**
    * The bytes of the blob stored under `sha256`. The store is addressed by content, so the bytes
    * are hashed and must give `sha256`: bytes that do not are an `ApiError` with the status of the
-   * answer, never data. This is the one request that does not go through `fetchJson`, as the
-   * answer is not JSON.
+   * answer, never data. The API stores at most `MAX_RESULT_BYTES` in a blob, and an answer of any
+   * status is read only up to that: a larger one is an `ApiError` too, and the rest of it is not
+   * read. This is the one request that does not go through `fetchJson`, as the answer is not JSON.
    */
   async getBlob(sha256: string): Promise<Uint8Array | null> {
     // A local, so that it is called as a function of its own and not as a method of the client.
     const doFetch = this.fetchImpl ?? fetch;
     const res = await doFetch(this.url(`/blobs/${encodeURIComponent(sha256)}`));
-    if (!res.ok) {
-      // Read to its end either way, so that the connection is free for the next request.
-      const body = bodyOf(await res.text());
-      if (res.status === 404) return null;
-      throw new ApiError(res.status, body);
+    const bytes = await readCapped(res, MAX_RESULT_BYTES);
+    if (bytes === null) {
+      throw new ApiError(
+        res.status,
+        null,
+        `the blob ${sha256} is larger than the API allows, which is ${MAX_RESULT_BYTES} bytes`,
+      );
     }
-    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (res.status === 404) return null;
+    if (!res.ok) throw new ApiError(res.status, bodyOf(new TextDecoder().decode(bytes)));
     const actual = sha256Hex(bytes);
     if (actual !== sha256) {
       throw new ApiError(
@@ -355,6 +451,11 @@ export class ApiClient implements TenderApi {
       this.fetchImpl,
     );
     const { message, nonce, recipient } = challenge;
+    // The server chose all three, and the key signs them: only a Tender sign-in is signed, and
+    // nothing a server that is not Tender's would put in its place.
+    if (message !== SIGN_IN_MESSAGE) throw refusal("message");
+    if (recipient !== SIGN_IN_RECIPIENT) throw refusal("recipient");
+    if (!isNonce(nonce)) throw refusal("nonce");
     // The signature is of the SHA-256 of the NEP-413 bytes, the same digest `verifyNep413` checks.
     const digest = hexToBytes(sha256Hex(serializeNep413({ message, nonce, recipient })));
     const { signature, publicKey } = keyPair.sign(digest);

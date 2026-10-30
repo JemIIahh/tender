@@ -7,7 +7,7 @@ import {
   type Nep413Result,
   verifyNep413,
 } from "@tender/client";
-import { sha256Hex } from "@tender/shared";
+import { SIGN_IN_MESSAGE, SIGN_IN_RECIPIENT, sha256Hex } from "@tender/shared";
 import type { Context } from "hono";
 import { type ApiDeps, nowNs } from "./deps";
 import { type ErrorBody, fail } from "./format";
@@ -29,10 +29,6 @@ import type { RequireAuth } from "./routes/blobs";
 // Each question to the chain has 5 seconds. A chain that does not answer in time, or whose call
 // fails, is a 503 for the caller to try again later, at sign-in and at the check of a token alike,
 // and not a request that waits for the RPC client to give up on its own, which takes minutes.
-
-/** What the wallet signs, and for whom. The wallet shows both to its user before it signs. */
-const SIGN_IN_MESSAGE = "Sign in to Tender";
-const SIGN_IN_RECIPIENT = "tender";
 
 const NONCE_BYTES = 32;
 const TOKEN_BYTES = 32;

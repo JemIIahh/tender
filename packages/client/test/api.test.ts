@@ -7,6 +7,7 @@ import {
   type HealthResponse,
   type ListAgentsResponse,
   type ListTasksResponse,
+  MAX_RESULT_BYTES,
   type Scorecard,
   type StartResponse,
   sha256Hex,
@@ -14,7 +15,7 @@ import {
   type TaskSummary,
   type TelegramLinkResponse,
 } from "@tender/shared";
-import { KeyPair, type Provider } from "near-api-js";
+import { KeyPair, KeyPairEd25519, type Provider } from "near-api-js";
 import * as nearNep413 from "near-api-js/nep413";
 import { afterEach, expect, test, vi } from "vitest";
 import { ApiClient } from "../src/index";
@@ -27,7 +28,7 @@ import { ApiClient } from "../src/index";
 // API and of the client together. The round trip against the real app is
 // packages/api/test/apiclient.test.ts.
 
-const BASE = "http://api.test";
+const BASE = "https://api.test";
 const ACCOUNT = "alice.test.near";
 const KEY = KeyPair.fromRandom("ed25519");
 const SIGNER = { accountId: ACCOUNT, privateKey: KEY.toString() };
@@ -251,6 +252,7 @@ function fakeApi() {
       message: "Sign in to Tender",
       recipient: "tender",
       expires_at: new Date(api.clock.now + 5 * MINUTE).toISOString(),
+      ...api.tamper?.(api.challenges),
     });
   }
 
@@ -284,6 +286,8 @@ function fakeApi() {
     refuseSignIns: false,
     /** Runs when a challenge is asked for, before it is answered. */
     beforeChallenge: undefined as (() => Promise<void>) | undefined,
+    /** Fields to put in place of the ones of the `count`th challenge, as a server of its own would. */
+    tamper: undefined as ((count: number) => Record<string, unknown> | undefined) | undefined,
     fetch: undefined as unknown as typeof fetch,
 
     on(route: string | RegExp, handler: Handler): void {
@@ -386,6 +390,16 @@ async function apiError(promise: Promise<unknown>): Promise<ApiError> {
   return error as ApiError;
 }
 
+/** What `fn` threw: the test fails if it returned. */
+function thrown(fn: () => unknown): unknown {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  throw new Error("expected the call to throw, and it returned");
+}
+
 const FILE = { kind: "brief", contentType: "application/json", bytes: BLOB } as const;
 
 // ---- Requests ---------------------------------------------------------------------------------
@@ -466,6 +480,42 @@ test("a_null_cursor_is_no_cursor", async () => {
     `${BASE}/v1/agents`,
     `${BASE}/v1/tasks?cursor=123`,
     `${BASE}/v1/agents?cursor=alice.test.near`,
+  ]);
+});
+
+test("the_base_url_is_normalized", async () => {
+  // The client adds `/v1`, so a base that has it, or a slash, or both, is the same base.
+  const cases: Array<[string, string]> = [
+    ["https://api.test", "https://api.test/v1/health"],
+    ["https://api.test/", "https://api.test/v1/health"],
+    ["https://api.test//", "https://api.test/v1/health"],
+    ["https://api.test/v1", "https://api.test/v1/health"],
+    ["https://api.test/v1/", "https://api.test/v1/health"],
+    ["http://localhost:8787/v1", "http://localhost:8787/v1/health"],
+    // A path the API is mounted under is kept.
+    ["https://api.test/tender", "https://api.test/tender/v1/health"],
+    ["https://api.test/tender/v1/", "https://api.test/tender/v1/health"],
+    // Only a whole last segment is `/v1`, and the host is not a segment.
+    ["https://api.test/v10", "https://api.test/v10/v1/health"],
+    ["https://api.test/xv1", "https://api.test/xv1/v1/health"],
+    ["https://v1", "https://v1/v1/health"],
+  ];
+  for (const [baseUrl, expected] of cases) {
+    const api = fakeApi();
+    // Whatever the path in front of it, the answer is a good one: it is the request that is checked.
+    api.on(/^GET .*\/health$/, () => json(HEALTH));
+    await new ApiClient({ baseUrl, fetchImpl: api.fetch }).health();
+    expect(nth(api.calls, 0).url.href, baseUrl).toBe(expected);
+  }
+
+  // A client that signs in goes to the same places, the sign-in included.
+  const api = fakeApi();
+  serveBoard(api);
+  await new ApiClient({ baseUrl: `${BASE}/v1/`, signer: SIGNER, fetchImpl: api.fetch }).start(7n);
+  expect(api.calls.map((call) => call.url.pathname)).toEqual([
+    "/v1/auth/challenge",
+    "/v1/auth/verify",
+    "/v1/tasks/7/start",
   ]);
 });
 
@@ -823,6 +873,129 @@ test("a_malformed_key_fails_when_the_client_is_made", () => {
   expect(() => new ApiClient({ baseUrl: BASE, signer })).toThrow("Invalid encoded key format");
 });
 
+// ---- Who the key signs for --------------------------------------------------------------------
+
+test("only_a_challenge_that_is_tenders_own_is_signed", async () => {
+  // The server at `baseUrl` chooses the message, the recipient and the nonce, and the key signs
+  // them. If it is not Tender's, it must not get a signature of its own choosing. The signature is
+  // watched: a refusal has to come before it.
+  const sign = vi.spyOn(KeyPairEd25519.prototype, "sign");
+  const bytes = (length: number) => Buffer.alloc(length, 1).toString("base64");
+  const wrong: Array<[string, Record<string, string>, string]> = [
+    ["another recipient", { recipient: "evil.near" }, "recipient"],
+    ["the recipient in other letters", { recipient: "Tender" }, "recipient"],
+    ["the recipient with a space", { recipient: "tender " }, "recipient"],
+    ["no recipient", { recipient: "" }, "recipient"],
+    ["another message", { message: "Send 1000 NEAR to evil.near" }, "message"],
+    ["the message in other letters", { message: "sign in to tender" }, "message"],
+    ["the message with a space", { message: "Sign in to Tender " }, "message"],
+    ["no message", { message: "" }, "message"],
+    ["a nonce of 31 bytes", { nonce: bytes(31) }, "nonce"],
+    ["a nonce of 33 bytes", { nonce: bytes(33) }, "nonce"],
+    ["a nonce without its padding", { nonce: bytes(32).replace(/=+$/, "") }, "nonce"],
+    ["a nonce in base64url", { nonce: `${"-".repeat(43)}=` }, "nonce"],
+    ["a nonce with a space", { nonce: ` ${"A".repeat(42)}=` }, "nonce"],
+    [
+      "a nonce in a spelling of the bytes that is not the one",
+      { nonce: `${"A".repeat(42)}B=` },
+      "nonce",
+    ],
+    ["no nonce", { nonce: "" }, "nonce"],
+  ];
+
+  for (const [name, fields, field] of wrong) {
+    const api = fakeApi();
+    serveBoard(api);
+    api.tamper = () => fields;
+
+    // Through a call that acts as the account, so that nothing is sent after the refusal either.
+    const error = await rejection(clientOf(api).start(7n));
+    expect(error, name).toBeInstanceOf(Error);
+    expect(error, name).not.toBeInstanceOf(ApiError);
+    // It names the field, and none of what the server put in it.
+    expect((error as Error).message, name).toBe(
+      `refusing to sign the API's sign-in challenge: its ${field} is not that of a Tender sign-in`,
+    );
+    expect(api.verifies, name).toBe(0);
+    expect(api.to("/v1/tasks/7/start"), name).toHaveLength(0);
+  }
+  expect(sign).not.toHaveBeenCalled();
+
+  // A challenge that is Tender's own is signed by the same client: the watch sees it.
+  const api = fakeApi();
+  serveBoard(api);
+  expect(await clientOf(api).signIn()).toBe("token-1");
+  expect(sign).toHaveBeenCalledTimes(1);
+});
+
+test("a_refused_challenge_leaves_nothing_behind", async () => {
+  const api = fakeApi();
+  serveBoard(api);
+  // The first challenge is not Tender's, and the second is.
+  api.tamper = (count) => (count === 1 ? { recipient: "evil.near" } : undefined);
+  const client = clientOf(api);
+
+  await rejection(client.signIn());
+  expect(await client.signIn()).toBe("token-1");
+  expect(api.challenges).toBe(2);
+});
+
+test("a_signer_needs_https_unless_the_host_is_this_machine", async () => {
+  const refused = [
+    "http://example.com",
+    "http://api.test:8787",
+    "http://192.168.1.10:8787",
+    "http://0.0.0.0:8787",
+    "http://[::ffff:127.0.0.1]:8787",
+    // Names that start or end like a local one, or hide it in the user, the path or the query.
+    "http://localhost.example.com",
+    "http://127.0.0.1.example.com",
+    "http://notlocalhost",
+    "http://localhost@example.com",
+    "http://example.com/localhost",
+    "http://example.com/?127.0.0.1",
+    // Local, but not http.
+    "ftp://localhost",
+    "ws://127.0.0.1:8787",
+    // Not an absolute URL.
+    "localhost:8787",
+    "api.example",
+    "",
+  ];
+  const accepted = [
+    "https://api.example",
+    "https://api.example/v1/",
+    "https://api.example:8443/tender",
+    "https://localhost:8787",
+    "http://localhost",
+    "http://localhost:8787",
+    "http://127.0.0.1:3000",
+    "http://[::1]:8787",
+    "HTTP://LOCALHOST:8787",
+  ];
+
+  for (const baseUrl of refused) {
+    const error = thrown(() => new ApiClient({ baseUrl, signer: SIGNER }));
+    expect(error, baseUrl).toBeInstanceOf(Error);
+    expect((error as Error).message, baseUrl).toMatch(/baseUrl/);
+  }
+  for (const baseUrl of accepted) {
+    expect(() => new ApiClient({ baseUrl, signer: SIGNER }), baseUrl).not.toThrow();
+  }
+  // The message does not quote the URL, which can hold a password.
+  const quoted = thrown(
+    () => new ApiClient({ baseUrl: "http://user:hunter2@example.com", signer: SIGNER }),
+  );
+  expect((quoted as Error).message).not.toContain("hunter2");
+
+  // Without a signer nothing secret is sent, and the public reads go over plain http.
+  const api = fakeApi();
+  serveBoard(api);
+  const open = new ApiClient({ baseUrl: "http://example.com", fetchImpl: api.fetch });
+  expect(await open.health()).toEqual(HEALTH);
+  expect(nth(api.calls, 0).url.href).toBe("http://example.com/v1/health");
+});
+
 // ---- Answers that are not the good one --------------------------------------------------------
 
 test("null_on_404_and_api_error_otherwise", async () => {
@@ -1012,6 +1185,111 @@ test("a_blob_whose_bytes_do_not_hash_to_the_hash_asked_for_throws", async () => 
   expect(error.message).toContain("do not match");
   expect(error.message).toContain(HASH);
   expect(error.message).toContain(BLOB_HASH);
+});
+
+const CHUNK = 16_384;
+/** More than a client that does not stop at the cap would read. */
+const GOES_ON = 4 * MAX_RESULT_BYTES;
+
+/**
+ * A body of `total` bytes of zeroes in chunks of 16 KiB, and then it ends. `seen` says how many
+ * were pulled out of it and whether the reader cancelled it. A client that does not stop at the
+ * cap reads all of `total`.
+ */
+function zeroes(total: number) {
+  const seen = { pulled: 0, cancelled: false };
+  const chunk = new Uint8Array(CHUNK);
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      const size = Math.min(CHUNK, total - seen.pulled);
+      if (size <= 0) {
+        controller.close();
+        return;
+      }
+      seen.pulled += size;
+      controller.enqueue(chunk.subarray(0, size));
+    },
+    cancel() {
+      seen.cancelled = true;
+    },
+  });
+  return { body, seen };
+}
+
+test("a_blob_of_the_most_the_api_stores_is_read_however_it_comes", async () => {
+  const api = fakeApi();
+  const client = clientOf(api);
+  const bytes = Uint8Array.from({ length: MAX_RESULT_BYTES }, (_, i) => (i * 5 + 1) % 256);
+  const hash = sha256Hex(bytes);
+  const inPieces = () =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let at = 0; at < bytes.length; at += 10_000) {
+          controller.enqueue(bytes.slice(at, at + 10_000));
+        }
+        controller.close();
+      },
+    });
+
+  // In one piece, with its length declared, and in pieces with none: the cap itself is allowed.
+  const answers = [
+    () => new Response(bytes),
+    () => new Response(bytes, { headers: { "Content-Length": String(bytes.length) } }),
+    () => new Response(inPieces()),
+  ];
+  for (const answer of answers) {
+    api.on(`GET /v1/blobs/${hash}`, answer);
+    expect(await client.getBlob(hash)).toEqual(bytes);
+  }
+
+  // An answer with no body at all is an empty blob.
+  const empty = sha256Hex(new Uint8Array());
+  api.on(`GET /v1/blobs/${empty}`, () => new Response(null));
+  expect(await client.getBlob(empty)).toEqual(new Uint8Array());
+});
+
+test("a_blob_over_the_cap_is_refused_and_not_read_to_its_end", async () => {
+  const api = fakeApi();
+  const client = clientOf(api);
+  const tooBig = `the blob ${HASH} is larger than the API allows, which is ${MAX_RESULT_BYTES} bytes`;
+  const refused = (answer: () => Response) => {
+    api.on(`GET /v1/blobs/${HASH}`, answer);
+    return apiError(client.getBlob(HASH));
+  };
+
+  // One byte over the cap.
+  const one = await refused(() => new Response(new Uint8Array(MAX_RESULT_BYTES + 1)));
+  expect(one.status).toBe(200);
+  expect(one.message).toBe(tooBig);
+
+  // A body that goes on, with no length declared: given up on once it passes the cap, and cancelled.
+  const endless = zeroes(GOES_ON);
+  expect((await refused(() => new Response(endless.body))).message).toBe(tooBig);
+  expect(endless.seen.cancelled).toBe(true);
+  expect(endless.seen.pulled).toBeLessThan(2 * MAX_RESULT_BYTES);
+
+  // A length declared over the cap: refused before the body is read. The stream has been started
+  // on, one chunk ahead of anyone reading it, and no more.
+  const declared = zeroes(GOES_ON);
+  const headers = { "Content-Length": String(MAX_RESULT_BYTES + 1) };
+  expect((await refused(() => new Response(declared.body, { headers }))).message).toBe(tooBig);
+  expect(declared.seen.cancelled).toBe(true);
+  expect(declared.seen.pulled).toBeLessThanOrEqual(2 * CHUNK);
+
+  // A length that lies: what is read decides, and not what the header says.
+  const lying = zeroes(GOES_ON);
+  const small = { "Content-Length": "10" };
+  expect((await refused(() => new Response(lying.body, { headers: small }))).message).toBe(tooBig);
+  expect(lying.seen.cancelled).toBe(true);
+  expect(lying.seen.pulled).toBeLessThan(2 * MAX_RESULT_BYTES);
+
+  // An answer that is an error is read up to the cap too, and keeps its status.
+  const failing = zeroes(GOES_ON);
+  const error = await refused(() => new Response(failing.body, { status: 500 }));
+  expect(error.status).toBe(500);
+  expect(error.message).toBe(tooBig);
+  expect(failing.seen.cancelled).toBe(true);
+  expect(failing.seen.pulled).toBeLessThan(2 * MAX_RESULT_BYTES);
 });
 
 // ---- fetch ------------------------------------------------------------------------------------
