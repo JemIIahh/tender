@@ -431,19 +431,25 @@ export function WalletView({
   /**
    * Runs one action, one at a time. `task` gives the words for what it came to, or null for
    * nothing to say; what it throws is worded, logged, and shown by the control that started it.
+   * What it came to is told only while the page is still for the account the action began under:
+   * Alice's withdrawal that ends after the wallet became Bob's is no news for Bob's page.
    */
   const run = async (action: ActionId, task: () => Promise<string | null>): Promise<boolean> => {
     if (busy.current) return false;
     busy.current = true;
+    const account = shown.current;
+    const tell = (told: Notice) => {
+      if (shown.current === account) setNotice(told);
+    };
     setRunning(action);
     setNotice(null);
     try {
       const text = await task();
-      if (text !== null) setNotice({ action, kind: "done", text });
+      if (text !== null) tell({ action, kind: "done", text });
       return true;
     } catch (error) {
       console.error(error);
-      setNotice({ action, kind: "failed", text: walletErrorMessage(error) });
+      tell({ action, kind: "failed", text: walletErrorMessage(error) });
       return false;
     } finally {
       busy.current = false;

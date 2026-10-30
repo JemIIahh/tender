@@ -511,15 +511,20 @@ test("the_second_read_after_an_action_is_not_made_for_an_account_that_has_been_l
   expect(textOf(screen.getByTestId("token-row"), "vault-balance")).toBe("7.00 tUSDC");
 });
 
+/** A wallet whose dialog stays open until the test ends it: with the transaction, or a refusal. */
+function holdDialog(wallet: ChainWallet) {
+  const run = wallet.signAndSendTransactions.bind(wallet);
+  let end = { close() {}, refuse(_error: Error) {} };
+  wallet.signAndSendTransactions = (params) =>
+    new Promise((resolve, reject) => {
+      end = { close: () => resolve(run(params)), refuse: reject };
+    });
+  return { close: () => end.close(), refuse: (error: Error) => end.refuse(error) };
+}
+
 test("an_action_that_ends_after_the_account_changed_does_not_read_the_old_balances_back", async () => {
   const { alice, user } = await setupTwoAccounts();
-  // Alice's wallet keeps its dialog open until the test closes it.
-  const run = alice.signAndSendTransactions.bind(alice);
-  let close: () => void = () => {};
-  alice.signAndSendTransactions = (params) =>
-    new Promise((resolve) => {
-      close = () => resolve(run(params));
-    });
+  const dialog = holdDialog(alice);
   render(<WalletView laterRefreshMs={50} />);
   await screen.findByTestId("token-row");
   await user.click(await button("Withdraw unused storage"));
@@ -529,12 +534,64 @@ test("an_action_that_ends_after_the_account_changed_does_not_read_the_old_balanc
   await waitFor(() =>
     expect(textOf(screen.getByTestId("token-row"), "vault-balance")).toBe("7.00 tUSDC"),
   );
-  close();
+  dialog.close();
   await waitFor(() => expect(screen.queryByText("Waiting for your wallet…")).toBeNull());
   await sleep(300);
 
   expect(screen.getByTestId("account-id").textContent).toBe(BOB);
   expect(textOf(screen.getByTestId("token-row"), "vault-balance")).toBe("7.00 tUSDC");
+});
+
+test("what_an_action_came_to_is_not_told_on_the_page_of_another_account", async () => {
+  const { chain, alice, user } = await setupTwoAccounts();
+  const dialog = holdDialog(alice);
+  render(<WalletView />);
+  await screen.findByTestId("token-row");
+  await user.click(await button("Withdraw unused storage"));
+  await button("Waiting for your wallet…");
+
+  // The wallet becomes Bob's while Alice's transaction waits for its approval, and then it goes
+  // through.
+  await switchToBob();
+  await waitFor(() =>
+    expect(textOf(screen.getByTestId("token-row"), "vault-balance")).toBe("7.00 tUSDC"),
+  );
+  dialog.close();
+  await waitFor(() => expect(screen.queryByText("Waiting for your wallet…")).toBeNull());
+
+  // It ran, and Bob's page has no word of it: not "Took back your unused storage.", not any notice.
+  expect(chain.calls.map((call) => [call.signer, call.methodName])).toEqual([
+    [ALICE, "storage_withdraw"],
+  ]);
+  expect(screen.getByTestId("account-id").textContent).toBe(BOB);
+  expect(screen.queryByTestId("notice")).toBeNull();
+
+  // What Bob does himself is told as before.
+  await user.click(await button("Withdraw unused storage"));
+  expect(await screen.findByText("Took back your unused storage.")).toBeDefined();
+});
+
+test("a_failure_that_comes_after_the_account_changed_is_logged_and_not_told_on_the_new_page", async () => {
+  const { alice, user } = await setupTwoAccounts();
+  const dialog = holdDialog(alice);
+  render(<WalletView />);
+  await screen.findByTestId("token-row");
+  await user.click(await button("Withdraw unused storage"));
+  await button("Waiting for your wallet…");
+  await switchToBob();
+  await waitFor(() =>
+    expect(textOf(screen.getByTestId("token-row"), "vault-balance")).toBe("7.00 tUSDC"),
+  );
+
+  const closed = new Error("User closed the window");
+  dialog.refuse(closed);
+  await waitFor(() => expect(screen.queryByText("Waiting for your wallet…")).toBeNull());
+
+  // "Check the balances below" would be about Bob's balances. The original is in the console.
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByTestId("notice")).toBeNull();
+  const logged = vi.mocked(console.error).mock.calls.flat();
+  expect(logged.some((entry) => (entry as Error).cause === closed)).toBe(true);
 });
 
 /** Alice's vault holds only the second of two tokens; she holds 20 of the first herself. */
