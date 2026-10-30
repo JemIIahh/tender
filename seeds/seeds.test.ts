@@ -472,7 +472,7 @@ test("product_table_extract_fixes_the_product_count", async () => {
 });
 
 test("invoice_extract_fixes_the_line_item_count", async () => {
-  // The key asserts line_items[1] to line_items[3], so a solver that lists the VAT row under the
+  // The key asserts line_items[0] to line_items[3], so a solver that lists the VAT row under the
   // table as a line of its own would match every one of them. The public schema fixes the count.
   await expectItemCountFixed("invoice-extract", "line_items", {
     description: "VAT (7.5%)",
@@ -491,6 +491,29 @@ test("meeting_actions_extract_fixes_the_action_count", async () => {
     task: "look at the logging costs",
     due: null,
   });
+});
+
+test("invoice_extract_brief_says_descriptions_are_copied_as_written", () => {
+  // The key compares a description letter for letter, "(per day)" included, so the brief has to say
+  // that it is copied as written. Otherwise a solver that shortens it loses the reward unfairly.
+  const { brief, heldout } = load("invoice-extract");
+  if (!("json_schema" in heldout)) throw new Error("invoice-extract is not a json_schema seed");
+  const [prose = "", data = ""] = brief.instructions.split("-----BEGIN DATA-----");
+  expect(prose).toMatch(/\bcopy\b[^.\n]*\bdescription\b[^.\n]*\bas written\b/i);
+
+  // And each description the key holds is a whole cell of the table, as the data prints it. The
+  // columns are two spaces or more apart, so the first cell of a row ends at the first such gap.
+  const kept = heldout.json_schema.assertions.flatMap(({ equals }) =>
+    typeof equals === "object" && equals !== null && "description" in equals
+      ? [equals.description]
+      : [],
+  );
+  const firstCells = data.split("\n").map((line) => line.split(/ {2,}/)[0]);
+  expect(kept.length, "descriptions held out").toBeGreaterThan(0);
+  expect(
+    kept.filter((description) => !firstCells.includes(String(description))),
+    "held-out descriptions that are not a cell of the table",
+  ).toEqual([]);
 });
 
 describe.each(JSON_SCHEMA_SLUGS)("json_schema seed %s", (slug) => {
