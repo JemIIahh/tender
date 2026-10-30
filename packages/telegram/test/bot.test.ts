@@ -3,7 +3,15 @@ import type { ApiCallFn, Bot, Transformer } from "grammy";
 import type { Chat, Update, UserFromGetMe } from "grammy/types";
 import { afterAll, beforeAll, expect, test, vi } from "vitest";
 import { type Alert, createBot, resolveRecipients } from "../src/index";
-import { linkChat, openTestDb, seedLinkNonce, seedTask, watchTag } from "./helpers";
+import {
+  linkChat,
+  openTestDb,
+  seedAgent,
+  seedEntry,
+  seedLinkNonce,
+  seedTask,
+  watchTag,
+} from "./helpers";
 
 // The bot runs against one migrated database, opened once because a PGlite takes close to a second
 // to open. Its Telegram API is fake: a transformer installed after `createBot`'s own wraps them (the
@@ -61,6 +69,17 @@ function linked(account: string): string {
 
 function notLinked(verb: "mute" | "unmute"): string {
   return `This chat is not linked to an account, so there is nothing to ${verb}. Open ${LINK_PAGE} and tap “Link Telegram” to link one. To stop tag alerts, send /unwatch with the tag.`;
+}
+
+/** How many tags one chat can watch (P04-R7). */
+const WATCH_LIMIT = 20;
+
+function watching(tag: string): string {
+  return `Watching <b>${tag}</b>. New tasks with this tag are sent to this chat. /unwatch ${tag} to stop.`;
+}
+
+function watchFull(tag: string): string {
+  return `Not watching <b>${tag}</b>: this chat already watches ${WATCH_LIMIT} tags, the most one chat can. Send /unwatch with a tag you no longer need, then /watch ${tag} again.`;
 }
 
 // The fake Telegram.
@@ -687,6 +706,67 @@ test("watch_validates_tag", async () => {
   expect(await tagsOf(chat)).toEqual([...good].sort());
 });
 
+test("a_chat_watches_at_most_twenty_tags", async () => {
+  const chat = newChat();
+  const bystander = newChat();
+  const tags = Array.from(
+    { length: WATCH_LIMIT },
+    (_, i) => `limit-${String(i + 1).padStart(2, "0")}`,
+  );
+  await watchTag(db, bystander, "limit-01");
+
+  for (const tag of tags) expect(await say(chat, `/watch ${tag}`), tag).toBe(watching(tag));
+  expect(await tagsOf(chat)).toEqual(tags);
+
+  // The 21st is refused, with the number and the way out, and the chat's tags stay as they were.
+  expect(await say(chat, "/watch limit-21")).toBe(watchFull("limit-21"));
+  expect(await say(chat, "/watch limit-21")).toBe(watchFull("limit-21"));
+  expect(await tagsOf(chat)).toEqual(tags);
+
+  // A tag the chat already watches is not a new one, so a full chat can still say it.
+  expect(await say(chat, "/watch limit-07")).toBe(watching("limit-07"));
+  expect(await tagsOf(chat)).toEqual(tags);
+
+  // Something that is not a tag hears the tag rule, full or not.
+  expect(await say(chat, "/watch Limit-22")).toBe(WATCH_USAGE);
+
+  // The cap is the chat's own: another chat, with a tag of the same name, is nowhere near it.
+  expect(await say(bystander, "/watch limit-21")).toBe(watching("limit-21"));
+  expect(await tagsOf(bystander)).toEqual(["limit-01", "limit-21"]);
+
+  // Room made with /unwatch is room, and once it is used the chat is full again.
+  expect(await say(chat, "/unwatch limit-01")).toBe("Stopped watching <b>limit-01</b>.");
+  expect(await say(chat, "/watch limit-21")).toBe(watching("limit-21"));
+  expect(await say(chat, "/watch limit-22")).toBe(watchFull("limit-22"));
+  expect(await tagsOf(chat)).toEqual([...tags.slice(1), "limit-21"]);
+
+  // /stop clears the watches, and with them the cap.
+  await say(chat, "/stop");
+  expect(await say(chat, "/watch limit-22")).toBe(watching("limit-22"));
+});
+
+test("watches_sent_at_once_cannot_pass_the_cap", async () => {
+  // One tag short of full, then five new tags at once: one fits, the other four do not.
+  const chat = newChat();
+  for (let i = 1; i < WATCH_LIMIT; i++) await watchTag(db, chat, `burst-${i}`);
+  const before = calls.length;
+
+  await Promise.all(
+    ["a", "b", "c", "d", "e"].map((name) =>
+      bot.handleUpdate(messageIn(privateChat(chat), `/watch burst-new-${name}`)),
+    ),
+  );
+
+  const replies = calls
+    .slice(before)
+    .filter((call) => call.payload.chat_id === chat)
+    .map((call) => String(call.payload.text));
+  expect(replies).toHaveLength(5);
+  expect(replies.filter((text) => text.startsWith("Watching "))).toHaveLength(1);
+  expect(replies.filter((text) => text.startsWith("Not watching "))).toHaveLength(4);
+  expect(await tagsOf(chat)).toHaveLength(WATCH_LIMIT);
+});
+
 test("unwatch_removes_only_that_tag", async () => {
   const chat = newChat();
   const other = newChat();
@@ -861,6 +941,129 @@ test("status_lists_latest_tasks", async () => {
   expect(reply).toContain(taskLine("311", "Expired", "expired"));
 });
 
+/** What /status says to a chat linked to `account`, alerts on and no tags watched, with `tasks`. */
+function statusOf(account: string, tasks: string[]): string {
+  return [
+    `Account: <b>${account}</b>`,
+    "Alerts: on",
+    "Watching: no tags",
+    "",
+    "<b>Latest tasks</b>",
+    ...tasks,
+  ].join("\n");
+}
+
+test("status_puts_task_numbers_in_numeric_order", async () => {
+  // The latest three of 9, 10, 11, 100 and 101 are the three largest numbers. As text, "9" sorts
+  // after "101", and the query would hand back 9, 101, 100.
+  const chat = newChat();
+  const account = "digits.near";
+  await linkChat(db, chat, account);
+  for (const id of ["9", "10", "11", "100", "101"]) {
+    await seedTaskIn("open", id, account, `Task ${id}`);
+  }
+
+  expect(await say(chat, "/status")).toBe(
+    statusOf(account, [
+      taskLine("101", "Task 101", "open"),
+      taskLine("100", "Task 100", "open"),
+      taskLine("11", "Task 11", "open"),
+    ]),
+  );
+});
+
+test("status_lists_the_tasks_an_account_entered", async () => {
+  // A plain entrant, which posted nothing: its latest tasks are the ones it entered, whoever posted them.
+  const account = "entrant.near";
+  const chat = newChat();
+  await linkChat(db, chat, account);
+  await seedTaskIn("expired", "401", "poster-a.near", "Fourth, so left out");
+  await seedTaskIn("fallback", "402", "poster-a.near", "Third");
+  await seedTaskIn("open", "403", "poster-b.near", "Entered by someone else");
+  await seedTaskIn("settled", "404", "poster-b.near", null);
+  await seedTaskIn("revealing", "405", "poster-a.near", "Entered by several");
+  await seedTaskIn("open", "406", "poster-c.near", "Nobody entered");
+  for (const id of ["401", "402", "404", "405"]) await seedEntry(db, id, account);
+  await seedEntry(db, "403", "someone-else.near");
+  await seedEntry(db, "405", "someone-else.near");
+
+  expect(await say(chat, "/status")).toBe(
+    statusOf(account, [
+      taskLine("405", "Entered by several", "revealing"),
+      taskLine("404", "Task #404", "settled"),
+      taskLine("402", "Third", "fallback"),
+    ]),
+  );
+});
+
+test("status_lists_the_tasks_the_agents_of_an_asp_entered", async () => {
+  // acme.near is an ASP: bot-one and bot-two are its agents, and bot.rival.near is another's.
+  // loose.acme.near has the name but no agents row, so it is nobody's agent.
+  const asp = "acme.near";
+  await seedAgent(db, "bot-one.acme.near", { asp });
+  await seedAgent(db, "bot-two.acme.near", { asp });
+  await seedAgent(db, "bot.rival.near", { asp: "rival.near" });
+  await seedTaskIn("open", "509", "poster-x.near", "Entered by a rival's agent");
+  await seedTaskIn("open", "508", "poster-x.near", "Entered by a stranger");
+  await seedTaskIn("judging", "507", "poster-x.near", "Entered by both agents");
+  await seedTaskIn("open", "506", "poster-y.near", "Entered by the ASP itself");
+  await seedTaskIn("settled", "505", asp, "Posted by the ASP");
+  await seedTaskIn("fallback", "504", "poster-x.near", "Entered by bot-two, fourth");
+  await seedTaskIn("revealing", "503", "poster-x.near", "Entered by bot-one");
+  await seedEntry(db, "509", "bot.rival.near");
+  await seedEntry(db, "508", "loose.acme.near");
+  await seedEntry(db, "507", "bot-one.acme.near");
+  await seedEntry(db, "507", "bot-two.acme.near");
+  await seedEntry(db, "506", asp);
+  await seedEntry(db, "504", "bot-two.acme.near");
+  await seedEntry(db, "503", "bot-one.acme.near");
+
+  // The ASP's chat sees the three rules at once: what its agents entered (507, once although both
+  // agents did), what it entered (506) and what it posted (505). The fourth is cut off, and the
+  // rival's agent and the stranger are not its business even though they are newer.
+  const owner = newChat();
+  await linkChat(db, owner, asp);
+  expect(await say(owner, "/status")).toBe(
+    statusOf(asp, [
+      taskLine("507", "Entered by both agents", "judging"),
+      taskLine("506", "Entered by the ASP itself", "open"),
+      taskLine("505", "Posted by the ASP", "settled"),
+    ]),
+  );
+
+  // It runs one way. An agent's chat sees what that agent entered, and nothing of its sibling's
+  // (504) or its ASP's (506, 505).
+  const agent = newChat();
+  await linkChat(db, agent, "bot-one.acme.near");
+  expect(await say(agent, "/status")).toBe(
+    statusOf("bot-one.acme.near", [
+      taskLine("507", "Entered by both agents", "judging"),
+      taskLine("503", "Entered by bot-one", "revealing"),
+    ]),
+  );
+});
+
+test("a_full_status_fits_in_one_telegram_message", async () => {
+  // The most /status can say: a 64-character account, the 20 tags a chat can watch at 24 characters
+  // each, and three tasks with 20-digit numbers and 120-character titles of nothing but quotes,
+  // which escape to six characters apiece. Telegram takes 4096 characters, counted after the HTML is
+  // parsed, so the length of the HTML itself is a limit it cannot pass.
+  const account = "a".repeat(64);
+  const chat = newChat();
+  await linkChat(db, chat, account, { muted: true });
+  for (let i = 0; i < WATCH_LIMIT; i++) {
+    await watchTag(db, chat, `${"t".repeat(22)}${String(i).padStart(2, "0")}`);
+  }
+  for (const id of ["18446744073709551613", "18446744073709551614", "18446744073709551615"]) {
+    await seedTaskIn("revealing", id, account, '"'.repeat(120));
+  }
+
+  const reply = await say(chat, "/status");
+
+  expect(reply.match(/<a /g)).toHaveLength(3);
+  expect(reply.length).toBeLessThan(4096);
+});
+
 test("status_shows_mute_and_an_account_without_tasks", async () => {
   const chat = newChat();
   await linkChat(db, chat, "quiet.near", { muted: true });
@@ -871,7 +1074,7 @@ test("status_shows_mute_and_an_account_without_tasks", async () => {
       "Alerts: muted (/unmute to resume)",
       "Watching: no tags",
       "",
-      "No tasks posted yet.",
+      "No tasks yet.",
     ].join("\n"),
   );
 });

@@ -34,6 +34,16 @@ const GROUP_REFUSED = "group_refused";
 /** How many of an account's tasks `/status` lists. */
 const STATUS_TASKS = 3;
 
+/**
+ * How many tags one chat can watch. `/status` lists every one of them, and a Telegram message holds
+ * 4096 characters. Twenty tags of 24 characters take about 530 of those, which leaves the rest of
+ * the reply, three tasks with the longest titles a brief allows among it, well inside.
+ */
+const MAX_WATCHES = 20;
+
+/** The first half of the key of the advisory lock that lines up the `/watch` commands of a chat. */
+const WATCH_LOCK = 0x57415443;
+
 const NS_PER_MS = 1_000_000n;
 
 /**
@@ -151,25 +161,30 @@ export function createBot(deps: BotDeps): Bot {
         watching,
         "",
         ...(tasks.length === 0
-          ? ["No tasks posted yet."]
+          ? ["No tasks yet."]
           : ["<b>Latest tasks</b>", ...tasks.map((task) => taskLine(task, webUrl, nowNs))]),
       ].join("\n"),
     );
   });
 
   // /watch and /unwatch need no link: a chat that only watches tags hears them, and /unwatch is the
-  // way such a chat stops, since /mute needs a linked account to mute.
+  // way such a chat stops, since /mute needs a linked account to mute. A chat watches at most
+  // `MAX_WATCHES` tags; /unwatch makes room.
   bot.command("watch", async (ctx) => {
     const tag = ctx.match.trim();
     if (!TAG.test(tag)) {
       await answer(ctx, tagRule("watch"));
       return;
     }
-    await db.query("insert into tg_watches (chat_id, tag) values ($1, $2) on conflict do nothing", [
-      ctx.chat.id,
-      tag,
-    ]);
     const shown = escapeHtml(tag);
+    const watched = await addWatch(db, ctx.chat.id, tag);
+    if (!watched) {
+      await answer(
+        ctx,
+        `Not watching <b>${shown}</b>: this chat already watches ${MAX_WATCHES} tags, the most one chat can. Send /unwatch with a tag you no longer need, then /watch ${shown} again.`,
+      );
+      return;
+    }
     await answer(
       ctx,
       `Watching <b>${shown}</b>. New tasks with this tag are sent to this chat. /unwatch ${shown} to stop.`,
@@ -265,6 +280,37 @@ function tagRule(command: "watch" | "unwatch"): string {
 }
 
 /**
+ * Makes `chatId` watch `tag` and returns true, or returns false and changes nothing if the chat
+ * already watches `MAX_WATCHES` tags and `tag` is not one of them. A tag the chat already watches
+ * is not a new one, so a full chat that asks for it again is told yes.
+ *
+ * The count and the insert are one step for a chat. Two transactions that both count 19 tags would
+ * each add one and leave 21, so every `/watch` first takes an advisory lock on the chat, which
+ * Postgres releases when the transaction ends. The key is a pair: `WATCH_LOCK`, and a hash of the
+ * chat id. A pair is a key space of its own, apart from the single number that `migrate` locks, and
+ * two chats whose ids hash alike only make one command wait for the other.
+ */
+async function addWatch(db: Db, chatId: number, tag: string): Promise<boolean> {
+  return db.tx(async (tx) => {
+    await tx.query("select pg_advisory_xact_lock($1::int4, hashtext($2::text))", [
+      WATCH_LOCK,
+      String(chatId),
+    ]);
+    const watched = await tx.query<{ tag: string }>(
+      "select tag from tg_watches where chat_id = $1",
+      [chatId],
+    );
+    if (watched.some((row) => row.tag === tag)) return true;
+    if (watched.length >= MAX_WATCHES) return false;
+    await tx.query("insert into tg_watches (chat_id, tag) values ($1, $2) on conflict do nothing", [
+      chatId,
+      tag,
+    ]);
+    return true;
+  });
+}
+
+/**
  * Spends `nonce` to link `chatId` to the account it was minted for, and returns that account. It
  * returns null, and changes nothing, if the nonce does not exist, is used up or has expired.
  *
@@ -304,20 +350,32 @@ interface TaskRow {
 }
 
 /**
- * The `STATUS_TASKS` latest tasks that `account` posted, newest first. Ids count up in the order
- * tasks are created, so the highest ids are the latest. A task is settled once it has an outcome.
+ * The `STATUS_TASKS` latest tasks that `account` is involved in, newest first: the ones it posted,
+ * the ones it entered, and the ones entered by an agent whose ASP (`agents.asp`) it is, so that the
+ * owner of an ASP sees the work of its agents. A task is listed once, however many of its entries
+ * count. Ids count up in the order tasks are created, so the highest ids are the latest. A task is
+ * settled once it has an outcome.
+ *
+ * `order by` names `t.id` with its table: a bare `id` would be the output column of that name,
+ * which is text, and text puts task 9 after task 10.
  */
 async function latestTasks(db: Db, account: string): Promise<TaskRow[]> {
   return db.query<TaskRow>(
-    `select id::text as id, title,
-            commit_deadline::text as commit_deadline,
-            reveal_deadline::text as reveal_deadline,
-            pick_deadline::text as pick_deadline,
-            fallback_deadline::text as fallback_deadline,
-            outcome is not null as settled
-     from tasks
-     where poster = $1
-     order by id desc
+    `select t.id::text as id, t.title,
+            t.commit_deadline::text as commit_deadline,
+            t.reveal_deadline::text as reveal_deadline,
+            t.pick_deadline::text as pick_deadline,
+            t.fallback_deadline::text as fallback_deadline,
+            t.outcome is not null as settled
+     from tasks t
+     where t.poster = $1
+        or exists (
+          select 1
+          from entries e
+          left join agents a on a.account = e.account
+          where e.task_id = t.id and (e.account = $1 or a.asp = $1)
+        )
+     order by t.id desc
      limit $2`,
     [account, STATUS_TASKS],
   );
