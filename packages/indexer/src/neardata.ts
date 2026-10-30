@@ -15,7 +15,11 @@ export interface NeardataOptions {
    * `Authorization` from one that leads to another origin, as WHATWG fetch does.
    */
   fetchImpl?: typeof fetch;
-  /** Told about every failed request, just before it is tried again. */
+  /**
+   * Told about each failed request just before it is tried again, about each block fetched again
+   * because the block after it names it as its parent, and, in a line that has `WARN` in it, about
+   * a block that does not follow the one yielded before it.
+   */
   log?: (message: string) => void;
 }
 
@@ -37,16 +41,19 @@ type Stopped = typeof STOPPED;
  * `blocks(from, signal)` asks for the final height (`GET /v0/last_block/final`), fetches the
  * heights from `from` to it (`GET /v0/block/{height}`) `concurrency` at a time, and yields them in
  * height order, whatever order they arrive in. A fetch is started as soon as a place in the window
- * is free, so at most `concurrency` blocks are in flight or waiting to be yielded. When it has
- * yielded up to the final height it asks for it again: if that shows nothing new it waits `pollMs`
- * and asks once more, and so on until a newer block is final.
+ * is free, so at most `concurrency` requests are in flight, and about as many blocks are fetched
+ * and waiting to be yielded (more while parents that were left out are fetched again: see below).
+ * When it has yielded up to the final height it asks for it again: if that shows nothing new it
+ * waits `pollMs` and asks once more, and so on until a newer block is final.
  *
  * A block is left out only when neardata says there is none at that height (see `blockAt`) and the
  * chain agrees. Every block names its parent (`prev_height`), so a block whose parent was left out
  * shows that this was wrong, as when a server that is behind answers `null` for a height that
  * exists. The parent is then asked for again, waiting and retrying until neardata has it, and is
  * yielded before the block that named it. A height wrongly left out at the end of what neardata has
- * so far is found when the block after it comes: late, never lost.
+ * so far is found when the block after it comes: late, never lost. A block that names a parent
+ * below the last block yielded is yielded all the same, with a `WARN` to `log`: only a fork, or a
+ * server that disagrees with itself, can cause that.
  *
  * Every other failure is retried, after a wait of 0.5, 1, 2, 4, 8, 8... s, for as long as `signal`
  * has not aborted: an HTTP error of any status, a network error, no answer in 10 s, an answer that
@@ -217,6 +224,20 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
           refill();
           for (const block of chain) {
             if (stop.signal.aborted) return; // the caller aborted while it had the block before
+            // By now a block's parent is not above `lastDelivered`. Below it, the block yielded
+            // last is no ancestor of this one: a fork, or a server that disagrees with itself. That
+            // cannot be mended from here, so the block is yielded all the same, and the log told.
+            // Not for the first block (`lastDelivered >= fromHeight` is "a block was yielded"):
+            // its parent may be any height below `fromHeight`, such as when a gap comes before it.
+            if (
+              lastDelivered >= fromHeight &&
+              block.prevHeight !== null &&
+              block.prevHeight < lastDelivered
+            ) {
+              log?.(
+                `neardata: WARN block ${block.height} names block ${block.prevHeight} as its parent, below block ${lastDelivered} that was yielded before it; yielding it anyway`,
+              );
+            }
             lastDelivered = block.height;
             yield block.indexed;
           }
