@@ -226,11 +226,12 @@ async function contentOf(
   taskId: bigint,
   entry: RevealedEntry,
 ): Promise<Uint8Array | string> {
-  // Our own store keeps results private until their task's reveals close. Naming a hash that is
-  // in it does not make the result yours: only one the entrant uploaded for this task counts.
-  const own = ownBlobHash(deps.publicUrl, entry.uri);
-  if (typeof own === "string" && !(await deps.resultUploaded(own, taskId, entry.account))) {
-    return "content unavailable: not uploaded by the entrant";
+  // Our own store keeps results private until their task's reveals close. Revealing a hash that
+  // is in it does not make the result yours: only bytes the entrant uploaded for this task count.
+  // The record is asked first, before the store is read; it may be for another task.
+  const ours = typeof ownBlobHash(deps.publicUrl, entry.uri) === "string";
+  if (ours && !(await deps.resultUploaded(entry.content_hash, taskId, entry.account))) {
+    return "content unavailable: not uploaded for this task";
   }
   const fetched = await fetchEntryContent(deps, entry.uri);
   if ("error" in fetched) return `content unavailable: ${fetched.error}`;

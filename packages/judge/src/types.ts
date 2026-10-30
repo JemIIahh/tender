@@ -60,10 +60,11 @@ export interface JudgeDeps {
   publicUrl: string;
   /**
    * Whether `account` uploaded the bytes that hash to `sha256` as its result for task `taskId`
-   * (P03-R17). One of our own blob URIs counts as an entry's content only when this is true: a
-   * hash is on chain for anyone to name once it is revealed, and a result the entrant did not
-   * upload is someone else's work, private until its own task's reveals close. It throws when it
-   * cannot tell, and the task is judged again on a later tick.
+   * (P03-R17). An entry whose URI is one of our own blob URIs counts only when this is true of the
+   * `content_hash` it revealed: a hash is on chain for anyone to copy once it is revealed, and a
+   * result the entrant did not upload for this task is someone else's work, private until its own
+   * task's reveals close. It throws when it cannot tell, and the task is judged again on a later
+   * tick.
    */
   resultUploaded(sha256: string, taskId: bigint, account: string): Promise<boolean>;
   /** The model that scores `rubric` tasks, from P1 on. */

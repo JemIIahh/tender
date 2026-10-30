@@ -250,12 +250,15 @@ test("judge_no_award_when_none_pass", async () => {
 test("mismatched_or_missing_content_scores_zero", async () => {
   // A pass mark of 0, so that every entry the Judge could check passes, even with a score of 0.
   const criteria = { ...EXACT, min_score: 0, split: "winner_take_all" };
-  const stored = await putResult(db, "42", "mismatch.test.near");
+  // The entrant uploaded both answers for this task, so the record for the hash it revealed is
+  // there, but the URI it revealed serves the other one.
+  const served = await putResult(db, "42", "mismatch.test.near");
+  const revealed = await putResult(db, "forty-two", "mismatch.test.near");
   // Another task's held-out checks, private, under a hash that its task shows on chain.
   const othersHeldout = await putHeldout(db, { exact: { expected: ["another task's answer"] } });
   const extra = [
     // Reveals the hash of other bytes than its URI serves.
-    entry("mismatch.test.near", sha256Hex("forty-two"), blobUri(stored), 1n),
+    entry("mismatch.test.near", revealed, blobUri(served), 1n),
     // Points at a blob that nobody stored, so nobody uploaded it either.
     entry("missing.test.near", sha256Hex("42 "), blobUri(sha256Hex("42 ")), 2n),
     // A server that answers 404, with words of its own that the reason does not repeat.
@@ -280,56 +283,44 @@ test("mismatched_or_missing_content_scores_zero", async () => {
   expect(card.winners).toEqual([{ account: "honest.test.near", bps: 10_000 }]);
   expect(card.scorecard.entries.map((e) => [e.account, e.score, e.passed, e.reasons])).toEqual([
     ["mismatch.test.near", 0, false, ["content hash mismatch"]],
-    ["missing.test.near", 0, false, ["content unavailable: not uploaded by the entrant"]],
+    ["missing.test.near", 0, false, ["content unavailable: not uploaded for this task"]],
     ["gone.test.near", 0, false, ["content unavailable: http status 404"]],
     ["down.test.near", 0, false, ["content unavailable: fetch failed"]],
-    ["peek.test.near", 0, false, ["content unavailable: not uploaded by the entrant"]],
+    ["peek.test.near", 0, false, ["content unavailable: not uploaded for this task"]],
     ["honest.test.near", 0, true, ["expected one of 2 accepted answers"]],
   ]);
   // Those checks are still private: judging this task publishes its own held-out checks only.
   expect(await isPublic(db, othersHeldout)).toBe(false);
 });
 
-test("our_blob_uris_count_only_with_the_entrants_upload", async () => {
-  // Alice uploaded her answer for this task and revealed it, so its hash is on chain. Mallory never
-  // had the bytes: she reveals alice's hash and our URI. Bob uploaded his answer, but for another
-  // task. Both come first on the tie-break, and neither may win with bytes that are not theirs.
+test("our_blob_uris_count_only_when_uploaded_for_this_task", async () => {
+  // Alice and dan each uploaded the same answer for this task, and revealed it. Its hash is on
+  // chain from alice's reveal on, and mallory, who never had the bytes, copied it with our URI.
+  // Bob uploaded his answer, but for another task. Mallory and bob come first on the tie-break, and
+  // neither may win with bytes that were not uploaded by them for this task.
   const bobs = await putResult(db, "forty-two", "bob.test.near", 8n);
+  // Eve uploaded her own answer for this task, revealed its hash, and pointed the URI at alice's
+  // blob. The record she has is for the hash she revealed, so the bytes are read, and they do not
+  // match it.
+  const eves = await putResult(db, "41", "eve.test.near");
   const extra = [
+    entry("eve.test.near", eves, blobUri(sha256Hex("42")), 9n),
     entry("mallory.test.near", sha256Hex("42"), blobUri(sha256Hex("42")), 10n),
     entry("bob.test.near", bobs, blobUri(bobs), 11n),
     // Content on another host is not in our store, and has no upload to look for.
-    entry("carol.test.near", sha256Hex("42"), "http://files.example/42", 13n),
+    entry("carol.test.near", sha256Hex("42"), "http://files.example/42", 14n),
   ];
-  const { chain } = await postJudged([["alice.test.near", "42", 12n]], { extra });
-  const { io } = fakeNetwork({ "files.example": [PUBLIC_IP] }, { "files.example/42": ok("42") });
-  const deps = judgeDeps(db, chain, { fetchIo: io });
-  const resultUploaded = vi.spyOn(deps, "resultUploaded");
-
-  expect(await judgeTask(deps, 7n)).toBe("picked");
-
-  const card = await picked(chain);
-  expect(card.winners).toEqual([
-    { account: "alice.test.near", bps: 7000 },
-    { account: "carol.test.near", bps: 3000 },
-  ]);
-  expect(card.scorecard.entries.map((e) => [e.account, e.passed, e.reasons])).toEqual([
-    ["alice.test.near", true, []],
-    ["carol.test.near", true, []],
-    ["mallory.test.near", false, ["content unavailable: not uploaded by the entrant"]],
-    ["bob.test.near", false, ["content unavailable: not uploaded by the entrant"]],
-  ]);
-  expect(resultUploaded.mock.calls).toEqual(
-    expect.arrayContaining([
-      [sha256Hex("42"), 7n, "alice.test.near"],
-      [sha256Hex("42"), 7n, "mallory.test.near"],
-      [bobs, 7n, "bob.test.near"],
-    ]),
+  const { chain } = await postJudged(
+    [
+      ["alice.test.near", "42", 12n],
+      ["dan.test.near", "42", 13n],
+    ],
+    { extra },
   );
-  expect(resultUploaded).toHaveBeenCalledTimes(3);
+  const { io } = fakeNetwork({ "files.example": [PUBLIC_IP] }, { "files.example/42": ok("42") });
 
-  // When the records cannot be read, nothing is judged on a guess: the error goes to the loop. (The
-  // fake chain still shows the task unsettled.)
+  // A tick on which the records cannot be read: nothing is judged on a guess, no entry is scored 0
+  // for it, and the error goes to the loop.
   const unreadable = judgeDeps(db, chain, {
     fetchIo: io,
     resultUploaded: async () => {
@@ -337,7 +328,40 @@ test("our_blob_uris_count_only_with_the_entrants_upload", async () => {
     },
   });
   await expect(judgeTask(unreadable, 7n)).rejects.toThrow("connection terminated");
-  expect(chain.pick).toHaveBeenCalledTimes(1);
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(await scorecardCount()).toBe(0);
+
+  // The next tick can read them.
+  const deps = judgeDeps(db, chain, { fetchIo: io });
+  const resultUploaded = vi.spyOn(deps, "resultUploaded");
+  expect(await judgeTask(deps, 7n)).toBe("picked");
+
+  // Alice and dan both score, and fill the two places of the split.
+  const card = await picked(chain);
+  expect(card.winners).toEqual([
+    { account: "alice.test.near", bps: 7000 },
+    { account: "dan.test.near", bps: 3000 },
+  ]);
+  expect(card.scorecard.entries.map((e) => [e.account, e.score, e.passed, e.reasons])).toEqual([
+    ["alice.test.near", 100, true, []],
+    ["dan.test.near", 100, true, []],
+    ["carol.test.near", 100, true, []],
+    ["eve.test.near", 0, false, ["content hash mismatch"]],
+    ["mallory.test.near", 0, false, ["content unavailable: not uploaded for this task"]],
+    ["bob.test.near", 0, false, ["content unavailable: not uploaded for this task"]],
+  ]);
+  // Each entry with one of our URIs is looked up by the hash it revealed, not by the URI, for this
+  // task.
+  expect(resultUploaded.mock.calls).toEqual(
+    expect.arrayContaining([
+      [sha256Hex("42"), 7n, "alice.test.near"],
+      [sha256Hex("42"), 7n, "dan.test.near"],
+      [eves, 7n, "eve.test.near"],
+      [sha256Hex("42"), 7n, "mallory.test.near"],
+      [bobs, 7n, "bob.test.near"],
+    ]),
+  );
+  expect(resultUploaded).toHaveBeenCalledTimes(5);
 });
 
 test("judge_is_idempotent_after_settlement", async () => {
