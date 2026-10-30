@@ -36,9 +36,12 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   judging hit trouble of the Judge's own, which it logs as a `WARN` and leaves for the next
  *   tick: a scorer that could not run, a scorecard that could not be built, a `pick` that failed.
  *   `E_SETTLED` from `pick` means someone settled the task first, and is not logged.
- * - `failed_closed`: the criteria or held-out checks that the chain names cannot be read or used
- *   (they passed intake, so they are gone or changed). The task is never judged: its status
- *   becomes `failed_closed` with the reason, and the poster's fallback window applies.
+ * - `failed_closed`: the task is never judged, and the poster's fallback window applies. Either
+ *   its criteria fail the criteria check now (P05-R12: the check intake runs, run again before
+ *   any entry is scored, as a rule may be newer than the task's intake), and its status becomes
+ *   `rejected` with the reason and one `WARN`. Or the criteria or held-out checks that the chain
+ *   names cannot be read or used (they passed intake, so they are gone or changed), and its
+ *   status becomes `failed_closed` with the reason.
  *
  * The task is read from the chain first, every time, so a `pick` that landed before a crash shows
  * as an outcome and nothing is done again. It must be in `judging` both by `deps.now` and by the
@@ -78,11 +81,20 @@ export async function judgeTask(
     waitForHeldout: false,
   });
   if (!loaded.ok) {
-    await deps.db.query(
-      `update tasks set judge_status = 'failed_closed', judge_reason = $2
-        where id = $1 and judge_status = 'accepted'`,
-      [taskId, loaded.reason],
+    // P05-R12: criteria that fail the check intake runs, run again now, are refused as intake
+    // would refuse them today, and not scored. Anything else means the documents cannot be used.
+    const status = loaded.criteriaCheck === true ? "rejected" : "failed_closed";
+    const changed = await deps.db.query(
+      `update tasks set judge_status = $2, judge_reason = $3
+        where id = $1 and judge_status = 'accepted'
+        returning id`,
+      [taskId, status, loaded.reason],
     );
+    if (status === "rejected" && changed.length > 0) {
+      console.warn(
+        `judge: WARN task ${taskId}: rejected at judging, its criteria fail the criteria check now`,
+      );
+    }
     return "failed_closed";
   }
   const { criteria, heldout } = loaded.documents;

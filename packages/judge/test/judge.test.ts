@@ -14,12 +14,14 @@ import { pinnedFetch } from "../src/fetch";
 import {
   type FetchIo,
   fetchEntryContent,
+  intakeTask,
   type JudgeChain,
   judgeTask,
   judgeTick,
   startJudge,
 } from "../src/index";
 import { scoreExact } from "../src/kinds/exact";
+import { checkJsonSchemaUsable } from "../src/kinds/json_schema";
 import { runInSandbox } from "../src/sandbox";
 import {
   at,
@@ -52,6 +54,10 @@ vi.mock("../src/sandbox", async (importOriginal) => {
 vi.mock("../src/kinds/exact", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/kinds/exact")>();
   return { ...actual, scoreExact: vi.fn(actual.scoreExact) };
+});
+vi.mock("../src/kinds/json_schema", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/kinds/json_schema")>();
+  return { ...actual, checkJsonSchemaUsable: vi.fn(actual.checkJsonSchemaUsable) };
 });
 
 const EXACT = {
@@ -461,6 +467,71 @@ test("judge_fails_closed_when_its_criteria_are_gone", async () => {
   expect(await scorecardCount()).toBe(0);
   // It is not judged again: the poster's fallback window applies.
   expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
+});
+
+const DYNAMIC_REFERENCE =
+  "criteria schema is not supported: $dynamicRef and $recursiveRef are not supported, use $ref";
+/** json_schema criteria over `schema`, whose held-out check is that `$.x` is 1. */
+const jsonSchemaCriteria = (schema: object) => ({
+  version: 1,
+  kind: "json_schema",
+  min_score: 100,
+  split: "winner_take_all",
+  has_heldout: true,
+  schema,
+});
+const X_IS_1 = { json_schema: { assertions: [{ path: "$.x", equals: 1 }] } };
+
+test("judge_rejects_criteria_that_fail_the_criteria_check_now", async () => {
+  // P05-R12: the task was accepted under an older rule, which let $dynamicRef through; Ajv would
+  // check `t` against the root, so `t: "text"` would score 100. The criteria check runs again
+  // before any entry is scored, and the task is not judged: it is rejected with the reason, and
+  // one WARN. No pick, so its funders get their refund through the fallback window.
+  const schema = {
+    $defs: { n: { type: "number" } },
+    properties: { t: { $dynamicRef: "#/$defs/n" } },
+  };
+  const { chain, commitment } = await postJudged([["alice.test.near", '{"x":1,"t":"text"}', 10n]], {
+    criteria: jsonSchemaCriteria(schema),
+    heldout: X_IS_1,
+  });
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("failed_closed");
+  expect(await judgeRow(db, 7)).toEqual({
+    judge_status: "rejected",
+    judge_reason: DYNAMIC_REFERENCE,
+  });
+  expect(chain.getAllEntries).not.toHaveBeenCalled();
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(await scorecardCount()).toBe(0);
+  expect(await isPublic(db, commitment)).toBe(false);
+
+  // A rejected task is not looked at again, and the WARN is not repeated.
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
+  expect(warn.mock.calls).toEqual([
+    [expect.stringMatching(/^judge: WARN task 7: rejected at judging, its criteria fail/)],
+  ]);
+});
+
+test("judge_runs_the_criteria_check_intake_ran_again_before_scoring", async () => {
+  // The same check, the same function, on both paths: criteria that pass the real check at intake
+  // and fail it at judging time (here the compile step, as a newer Ajv or rule might) are rejected.
+  const criteriaHash = await putCriteria(db, jsonSchemaCriteria({ type: "object" }));
+  const view = taskView({
+    criteria_hash: criteriaHash,
+    heldout_commitment: await putHeldout(db, X_IS_1),
+  });
+  await insertTask(db, view);
+  const chain = fakeChain(view, []);
+  expect(await intakeTask(judgeDeps(db, chain), 7n)).toBe("accepted");
+  vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+  const refusal = "criteria schema cannot be compiled: refused at judging time";
+  vi.mocked(checkJsonSchemaUsable).mockReturnValueOnce({ ok: false, reason: refusal });
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("failed_closed");
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "rejected", judge_reason: refusal });
+  expect(chain.pick).not.toHaveBeenCalled();
 });
 
 test("judge_fails_closed_when_its_heldout_checks_were_used_first", async () => {

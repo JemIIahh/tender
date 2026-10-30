@@ -488,6 +488,24 @@ test("intake_rejects_each_rule", async () => {
       reason: DYNAMIC_REFERENCE,
       view: () => jsonSchemaTask(db, recursionProbe("$dynamicRef")),
     },
+    // The security review of 0b3af35: under a keyword that maps names to schemas, a member named
+    // like a data keyword is a schema, and is walked as one, so a dynamic reference in it is found.
+    ...["dependencies", "dependentSchemas", "patternProperties", "$defs"].flatMap((container) =>
+      ["const", "enum", "default", "examples"].flatMap((name) =>
+        [
+          ["$dynamicRef", "#/$defs/n"],
+          ["$recursiveRef", "#"],
+        ].map(([keyword, target]) => ({
+          rule: `a ${keyword} in a ${container} member named ${name}`,
+          reason: DYNAMIC_REFERENCE,
+          view: () =>
+            jsonSchemaTask(db, {
+              $defs: { n: { type: "number" } },
+              [container]: { [name]: { [String(keyword)]: target } },
+            }),
+        })),
+      ),
+    ),
     {
       rule: "a $ref to a member every array has",
       reason: REFERENCE_NOT_ALLOWED,
@@ -627,6 +645,16 @@ test("intake_accepts_the_p0_kinds", async () => {
     await jsonSchemaTask(db, recursionProbe("$ref"), {
       json_schema: { assertions: [{ path: "$", equals: 48 }] },
     }),
+    // `dependencies` as written for property dependencies: a list of names, no schema at all.
+    await jsonSchemaTask(
+      db,
+      {
+        type: "object",
+        properties: { a: { type: "string" }, b: { type: "string" } },
+        dependencies: { a: ["b"] },
+      },
+      { json_schema: { assertions: [{ path: "$", equals: 49 }] } },
+    ),
     // What reads like a reference inside data is data: the values of const, enum, examples and
     // default are no schemas, whatever names they hold.
     await jsonSchemaTask(

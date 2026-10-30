@@ -30,7 +30,13 @@ export interface TaskDocuments {
 /** A task's documents, or why the task cannot be judged: yet (`pending`), or ever (`rejected`). */
 export type DocumentsCheck =
   | { ok: true; documents: TaskDocuments }
-  | { ok: false; status: "pending" | "rejected"; reason: string };
+  | {
+      ok: false;
+      status: "pending" | "rejected";
+      reason: string;
+      /** Set when the criteria failed `criteriaProblem`, the check of what a schema may do. */
+      criteriaCheck?: true;
+    };
 
 /** What a task's documents are checked against: fields of a `TaskView`, and of a `tasks` row. */
 type TaskTerms = Pick<
@@ -173,7 +179,9 @@ export async function intakeTask(
  * Reads the criteria and held-out checks that `task` commits to from the blob store, and checks
  * them as `intakeTask` does. Judging reads them again with this, from the hashes the chain holds,
  * so a task whose held-out checks turn out to be used by an earlier task of its poster (one the
- * indexer stored late) fails closed instead of being judged with answers that may be out.
+ * indexer stored late) fails closed instead of being judged with answers that may be out, and
+ * criteria that fail `criteriaProblem` now, under rules newer than the task's intake, are not
+ * scored: such a result has `criteriaCheck` set.
  *
  * With `waitForHeldout`, held-out checks that are not stored yet make the task `pending` for 10
  * minutes from its `created_at`. Without it they are missing at once. A database error is thrown;
@@ -251,12 +259,14 @@ function checkDocuments(
   if (criteria.kind !== "regex_cases" && !criteria.has_heldout) {
     return rejected(`held-out checks required for kind ${criteria.kind}`);
   }
-  if (criteria.kind === "json_schema") {
-    const problem = referenceProblem(criteria.schema);
-    if (problem !== null) return rejected(problem);
-    const usable = checkJsonSchemaUsable(criteria.schema);
-    if (!usable.ok) return rejected(clampReason(usable.reason));
+  let problem: string | null;
+  try {
+    problem = criteriaProblem(criteria);
+  } catch {
+    problem = CHECK_FAILED;
   }
+  if (problem !== null)
+    return { ok: false, status: "rejected", reason: problem, criteriaCheck: true };
   if (task.heldout_commitment === null) return { ok: true, documents: { criteria, heldout: null } };
 
   // Held-out checks are single-use. The Judge publishes them when it judges the first of the
@@ -300,6 +310,21 @@ function checkDocuments(
 
 function rejected(reason: string): DocumentsCheck {
   return { ok: false, status: "rejected", reason };
+}
+
+/**
+ * Why the schema of `criteria` cannot be used, or `null`: what it may name and refer to
+ * (`referenceProblem`: `$id`, references, dynamic references), and then whether Ajv compiles and
+ * runs it (`checkJsonSchemaUsable`). Only `json_schema` criteria have a schema. Intake runs it, and
+ * judging runs it again through `loadDocuments` before any entry is scored (P05-R12), so that a
+ * task accepted under an older rule is not scored under a check it no longer passes.
+ */
+function criteriaProblem(criteria: P0Criteria): string | null {
+  if (criteria.kind !== "json_schema") return null;
+  const reference = referenceProblem(criteria.schema);
+  if (reference !== null) return reference;
+  const usable = checkJsonSchemaUsable(criteria.schema);
+  return usable.ok ? null : clampReason(usable.reason);
 }
 
 /**
