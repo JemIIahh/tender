@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, parseEnv } from "node:util";
 import {
   ApiClient,
+  ApiTimeoutError,
   KeyPair,
   type KeyPairString,
   keyKindOf,
@@ -11,7 +12,13 @@ import {
   TenderClient,
 } from "@tender/client";
 import { createStateStore, defaultStateDir } from "@tender/mcp";
-import { AccountIdSchema, NETWORKS, type NetworkId, type TenderApi } from "@tender/shared";
+import {
+  AccountIdSchema,
+  ApiError,
+  NETWORKS,
+  type NetworkId,
+  type TenderApi,
+} from "@tender/shared";
 import { AGENT_NAMES, AGENTS, type AgentConfig, agentVariables, isAgentName } from "./agents";
 import { type AgentChain, runAgent } from "./runner";
 import { createLlmSolver } from "./solvers/llm";
@@ -36,9 +43,10 @@ import type { Solver } from "./types";
 //   TENDER_CONTRACT       the Tender contract (the deploy writes it)
 //   TENDER_API_URL        where the Tender API is, named as the API's own PUBLIC_API_URL names it. The
 //                         agent signs in for exactly that base, so another spelling of the same
-//                         server (an address in place of its domain) is refused at the first
-//                         sign-in, which is when the agent first acts, not when it starts. It must
-//                         be https, or http to localhost, 127.0.0.1 or [::1] (`createApiClient`)
+//                         server (an address in place of its domain) is refused at the sign-in
+//                         that the agent makes when it starts, and the line says so (a warning:
+//                         the agent starts all the same). It must be https, or http to localhost,
+//                         127.0.0.1 or [::1] (`createApiClient`)
 //   NEAR_RPC_URL          the chain's RPC; needed on the sandbox, which has none of its own
 //   AGENT_<NAME>_ACCOUNT  the agent's account (the deploy writes it)
 //   AGENT_<NAME>_PRIVATE_KEY
@@ -325,13 +333,21 @@ export function readRunConfig(args: CliArgs, env: Env): RunConfig {
 
 // ---- The agent's key --------------------------------------------------------------------------
 
+/** What an error code looks like: a letter, then up to 63 letters, digits and underscores. */
+const CODE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+/** The `code` of `value` if it has one that looks like a code. */
+function codeIn(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { code } = value as { code?: unknown };
+  return typeof code === "string" && CODE.test(code) ? code : undefined;
+}
+
 /** What a log line or a message says of an error that is not ours: its name and code, never its message. */
 function describe(error: unknown): string {
   if (!(error instanceof Error)) return typeof error;
-  const { code } = error as { code?: unknown };
-  return typeof code === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(code)
-    ? `${error.name} ${code}`
-    : error.name;
+  const code = codeIn(error);
+  return code === undefined ? error.name : `${error.name} ${code}`;
 }
 
 /** `promise`, or a `TimeoutError` after `ms`. The loser of the race is let go. */
@@ -417,7 +433,7 @@ export type CliClient = AgentChain & KeyReader;
  * after the variable they are about. Any other error of a run is shown by name and code alone.
  *
  * What the client cannot know when it is made is that the base is the API's own spelling of itself.
- * It finds out at the first sign-in, which is at the first call that acts as the agent.
+ * It finds out at a sign-in, which `main` makes once when the agent starts (`signInAtStart`).
  */
 export function createApiClient(config: Pick<RunConfig, "apiUrl" | "signer">): TenderApi {
   try {
@@ -446,7 +462,8 @@ function makeSolver(config: RunConfig, seedsDir: string, log: (line: string) => 
 export interface CliOptions {
   /**
    * Where the Tender API client comes from: `createApiClient`, for the bin. It is called once the
-   * key has been checked, and may throw a `CliError`.
+   * key has been checked, and may throw a `CliError`. `main` signs the client in (`signIn`) once
+   * before the loop starts, and warns if that fails.
    */
   createApi: (config: RunConfig) => TenderApi;
   /** Where `.env` and `.env.deploy.<network>` are. The repository root by default. */
@@ -486,17 +503,82 @@ function defaultClient(config: RunConfig): CliClient {
  * Every string in `secrets` is cut out all the same.
  */
 function describeFailure(error: unknown, secrets: readonly string[]): string {
-  let text = error instanceof CliError ? error.message : describe(error);
+  const text = error instanceof CliError ? error.message : describe(error);
+  return `run-agent: ${redacted(text, secrets)}`;
+}
+
+/** `text` with every string of `secrets` cut out of it. */
+function redacted(text: string, secrets: readonly string[]): string {
+  let result = text;
   for (const secret of secrets) {
-    if (secret !== "") text = text.replaceAll(secret, "<redacted>");
+    if (secret !== "") result = result.replaceAll(secret, "<redacted>");
   }
-  return `run-agent: ${text}`;
+  return result;
+}
+
+// ---- The first sign-in ------------------------------------------------------------------------
+
+/** How the sentence of `ApiClient` begins when it will not sign a challenge that is not for its base. */
+const CHALLENGE_REFUSAL = "refusing to sign the API's sign-in challenge: ";
+
+/**
+ * What the log says of a sign-in that failed. The client's own sentences are shown as they are:
+ * they name the problem and quote nothing that a server sent or the client was given. They are the
+ * status and code of an `ApiError`, the time of an `ApiTimeoutError`, and the refusal to sign a
+ * challenge that is not for the base, which is what a base spelt otherwise than the API's own
+ * gets. Any other error is its name and its code, or its cause's, since `fetch` puts the socket's
+ * there (`ECONNREFUSED`); never its message, which can quote a URL with a key in it.
+ */
+function signInFailure(error: unknown): string {
+  if (error instanceof ApiError || error instanceof ApiTimeoutError) return error.message;
+  if (error instanceof Error && error.message.startsWith(CHALLENGE_REFUSAL)) return error.message;
+  if (!(error instanceof Error)) return describe(error);
+  const code = codeIn(error) ?? codeIn(error.cause);
+  return code === undefined ? error.name : `${error.name} ${code}`;
+}
+
+/**
+ * Signs the agent in once, as it starts, so that a base that is not the API's own spelling of
+ * itself shows its sentence now, and not as an error that the loop logs by name alone at its first
+ * call that acts. The client times each of its requests out (`timeoutMs`), so this does not wait
+ * for ever, and the stop signal ends the wait at once all the same. A sign-in that fails is one
+ * line (a warning) and not a stop: an API that is down for a while is no reason for the agent not
+ * to start, and its first call that acts signs in again. One that works leaves its token with the
+ * client, which the calls then use.
+ */
+async function signInAtStart(
+  api: TenderApi,
+  signal: AbortSignal,
+  log: (line: string) => void,
+  secrets: readonly string[],
+): Promise<void> {
+  let release = () => {};
+  const stopped = new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const onAbort = () => resolve();
+    signal.addEventListener("abort", onAbort, { once: true });
+    release = () => signal.removeEventListener("abort", onAbort);
+  });
+  try {
+    await Promise.race([api.signIn(), stopped]);
+  } catch (error) {
+    // Once the agent is stopped there is no one to tell.
+    if (!signal.aborted) {
+      log(redacted(`WARN run-agent: sign-in failed at start: ${signInFailure(error)}`, secrets));
+    }
+  } finally {
+    release();
+  }
 }
 
 /**
  * Runs the command line and returns the exit code: 0 after the agent was stopped, 1 for anything
  * that kept it from starting or ended it. The order is the flags, the environment, the agent's
- * key (off the sandbox), the Tender API client, the solver, and then the loop.
+ * key (off the sandbox), the Tender API client, the solver, one sign-in to the API, and then the
+ * loop.
  */
 export async function main(args: readonly string[], options: CliOptions): Promise<number> {
   const out = options.out ?? console.log;
@@ -526,6 +608,8 @@ export async function main(args: readonly string[], options: CliOptions): Promis
     const state = createStateStore(
       defaultStateDir(config.network, config.signer.accountId, options.home),
     );
+    const signal = options.signal ?? stop.signal;
+    await signInAtStart(api, signal, out, secrets);
 
     await (options.run ?? runAgent)({
       name: config.agent.name,
@@ -535,7 +619,7 @@ export async function main(args: readonly string[], options: CliOptions): Promis
       tags: config.agent.tags,
       solver,
       log: out,
-      signal: options.signal ?? stop.signal,
+      signal,
     });
     return 0;
   } catch (error) {

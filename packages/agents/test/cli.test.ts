@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { KeyPair } from "@tender/client";
-import { SIGN_IN_MESSAGE, type TenderApi } from "@tender/shared";
+import { ApiClient, ApiTimeoutError, KeyPair } from "@tender/client";
+import { ApiError, SIGN_IN_MESSAGE, type TenderApi } from "@tender/shared";
 import { afterEach, expect, test, vi } from "vitest";
 import { AGENT_NAMES, AGENTS, agentVariables } from "../src/agents";
 import {
@@ -21,7 +21,7 @@ import {
   readRunConfig,
 } from "../src/cli";
 import type { RunAgentOptions } from "../src/runner";
-import { startFakeApi } from "./fake-api";
+import { FAKE_TOKEN, type FakeApi, REFUSAL_TEXT, startFakeApi } from "./fake-api";
 import { startFakeLlm } from "./fake-llm";
 import { contextOf, taskSpec } from "./helpers";
 
@@ -139,7 +139,13 @@ async function start(args: string[], setup: Setup = {}) {
   const out: string[] = [];
   const err: string[] = [];
   const calls: string[] = [];
-  const api = {} as TenderApi;
+  // The agent signs in once when it starts, and the stand-in lets it.
+  const api = {
+    signIn: vi.fn(async () => {
+      calls.push("signIn");
+      return "token";
+    }),
+  } as unknown as TenderApi;
 
   const viewAccessKey = vi.fn(async (_account: string, _publicKey: string): Promise<Found> => {
     calls.push("viewAccessKey");
@@ -319,8 +325,9 @@ test("run_agent_starts_with_a_function_call_key_limited_to_tender", async () => 
   expect(result.code).toBe(0);
   expect(result.err).toEqual([]);
   expect(result.out).toEqual(["a line from the agent"]);
-  // In this order: the client is made, the key is checked, and only then is there an API client.
-  expect(result.calls).toEqual(["makeClient", "viewAccessKey", "createApi", "run"]);
+  // In this order: the client is made, the key is checked, only then is there an API client, which
+  // signs in once, and the loop starts.
+  expect(result.calls).toEqual(["makeClient", "viewAccessKey", "createApi", "signIn", "run"]);
 
   const options = result.loop.mock.calls[0]?.[0];
   expect(options?.client).toBe(result.client);
@@ -384,7 +391,7 @@ test("the_sandbox_is_not_asked_what_the_key_may_do", async () => {
 
   expect(result.code).toBe(0);
   expect(result.viewAccessKey).not.toHaveBeenCalled();
-  expect(result.calls).toEqual(["makeClient", "createApi", "run"]);
+  expect(result.calls).toEqual(["makeClient", "createApi", "signIn", "run"]);
   expect(result.makeClient.mock.calls[0]?.[0]).toMatchObject({
     network: "sandbox",
     rpcUrl: "http://127.0.0.1:3030",
@@ -952,22 +959,31 @@ test("run_agent_acts_through_the_api_client_at_the_base_it_is_given_as_the_agent
 
     expect(result.code).toBe(0);
     expect(result.err).toEqual([]);
-    // Every request went under the base, with the version once.
+    // Every request went under the base, with the version once. The agent's own sign-in, made as it
+    // starts, is the first; the fake refused its signature (it knows no account), so nothing was
+    // kept, and the loop's call that acts signed in again.
     expect(health).toMatchObject({ ok: true });
     expect(api.requests.map((request) => `${request.method} ${request.path}`)).toEqual([
+      "POST /tender/v1/auth/challenge",
+      "POST /tender/v1/auth/verify",
       "GET /tender/v1/health",
       "POST /tender/v1/auth/challenge",
       "POST /tender/v1/auth/verify",
     ]);
-    // It signed in as the agent: its account, the public half of its key, for this base. The fake
-    // refused the signature (it knows no account), and the call failed with the API's answer.
-    expect(api.requests[2]?.body).toMatchObject({
-      account_id: ACCOUNT,
-      public_key: AGENT_PUBLIC,
-      message: SIGN_IN_MESSAGE,
-      recipient: api.base,
-    });
+    // Both signed in as the agent: its account, the public half of its key, for this base. The
+    // call failed with the API's answer.
+    for (const verify of [api.requests[1], api.requests[4]]) {
+      expect(verify?.body).toMatchObject({
+        account_id: ACCOUNT,
+        public_key: AGENT_PUBLIC,
+        message: SIGN_IN_MESSAGE,
+        recipient: api.base,
+      });
+    }
     expect(refusal).toMatchObject({ name: "ApiError", status: 401 });
+    expect(result.out).toEqual([
+      "WARN run-agent: sign-in failed at start: request failed with status 401 (unauthorized)",
+    ]);
     // The private key went nowhere: not in the sign-in, and not in the agent's output.
     const sent = JSON.stringify(api.requests);
     for (const piece of piecesOf(AGENT_KEY)) {
@@ -977,6 +993,208 @@ test("run_agent_acts_through_the_api_client_at_the_base_it_is_given_as_the_agent
   } finally {
     await api.stop();
   }
+});
+
+// ---- The first sign-in ------------------------------------------------------------------------
+
+/** The requests a fake API saw, as `METHOD path`. */
+const seenBy = (api: FakeApi) => api.requests.map((request) => `${request.method} ${request.path}`);
+
+test("the_agent_signs_in_once_as_it_starts_and_the_loop_finds_the_token_kept", async () => {
+  const api = await startFakeApi("/tender", { accept: true });
+  try {
+    let atStart: string[] = [];
+    let later: string | undefined;
+    const result = await start(ARGS, {
+      env: { ...ENV, TENDER_API_URL: api.base },
+      createApi: createApiClient,
+      loop: async (options) => {
+        // The sign-in is done before the loop is given anything to do...
+        atStart = seenBy(api);
+        // ... and a call that acts finds its token, and signs in no more.
+        later = await options.api.signIn();
+      },
+    });
+
+    expect(result.code).toBe(0);
+    expect(atStart).toEqual(["POST /tender/v1/auth/challenge", "POST /tender/v1/auth/verify"]);
+    expect(later).toBe(FAKE_TOKEN);
+    expect(seenBy(api)).toHaveLength(2);
+    // A sign-in that worked is no news, and its token is no one's business.
+    expect(result.out).toEqual([]);
+    expect(result.err).toEqual([]);
+  } finally {
+    await api.stop();
+  }
+});
+
+test("a_sign_in_that_fails_as_the_agent_starts_is_one_warning_and_the_agent_starts_all_the_same", async () => {
+  const live = await startFakeApi("/tender");
+  // An API that calls itself by another name than the base it is reached at.
+  const renamed = await startFakeApi("/tender", { recipient: "https://api.tender.example/tender" });
+  const stalled = await startFakeApi("/tender", { hang: true });
+  const gone = await startFakeApi("/tender");
+  const goneBase = gone.base;
+  await gone.stop();
+  try {
+    const cases: Array<{
+      what: string;
+      base: string;
+      api?: FakeApi;
+      timeoutMs?: number;
+      requests?: string[];
+      said: string;
+    }> = [
+      {
+        what: "the API refuses the key",
+        base: live.base,
+        api: live,
+        requests: ["POST /tender/v1/auth/challenge", "POST /tender/v1/auth/verify"],
+        said: "request failed with status 401 (unauthorized)",
+      },
+      {
+        // The one the client can only find out by asking: the sentence is the client's own, and
+        // nothing was signed.
+        what: "the base is not what the API calls itself",
+        base: renamed.base,
+        api: renamed,
+        requests: ["POST /tender/v1/auth/challenge"],
+        said: "refusing to sign the API's sign-in challenge: its recipient is not this client's baseUrl",
+      },
+      {
+        what: "the API does not answer in time",
+        base: stalled.base,
+        api: stalled,
+        timeoutMs: 150,
+        requests: ["POST /tender/v1/auth/challenge"],
+        said: "ApiClient.signIn timed out after 150 ms",
+      },
+      { what: "nothing is listening", base: goneBase, said: "TypeError ECONNREFUSED" },
+    ];
+    for (const { what, base, api, timeoutMs, requests, said: line } of cases) {
+      const result = await start(ARGS, {
+        env: { ...ENV, TENDER_API_URL: base },
+        createApi:
+          timeoutMs === undefined
+            ? createApiClient
+            : (config) =>
+                new ApiClient({ baseUrl: config.apiUrl, signer: config.signer, timeoutMs }),
+      });
+
+      // The agent started all the same, and said so in one line, which is the client's sentence or
+      // the error's name and code: no address, no key and no body.
+      expect(result.code, what).toBe(0);
+      expect(result.err, what).toEqual([]);
+      expect(result.out, what).toEqual([`WARN run-agent: sign-in failed at start: ${line}`]);
+      expect(result.calls, what).toEqual(["makeClient", "viewAccessKey", "createApi", "run"]);
+      if (api !== undefined) expect(seenBy(api), what).toEqual(requests);
+      const shown = result.out.join("\n");
+      expect(shown, what).not.toContain("127.0.0.1");
+      expect(shown, what).not.toContain(REFUSAL_TEXT);
+      for (const piece of piecesOf(AGENT_KEY)) expect(shown, what).not.toContain(piece);
+    }
+  } finally {
+    await Promise.all([live.stop(), renamed.stop(), stalled.stop()]);
+  }
+});
+
+test("a_sign_in_error_that_is_not_the_clients_is_shown_by_name_and_code_and_never_by_message", async () => {
+  const cases: Array<[string, unknown, string]> = [
+    [
+      "an error with a code",
+      Object.assign(new Error(`GET https://rpc.example/?key=LEAK-1 ${AGENT_KEY.toString()}`), {
+        code: "ECONNRESET",
+      }),
+      "Error ECONNRESET",
+    ],
+    [
+      "a fetch that failed, with the socket's code in its cause",
+      new TypeError("fetch failed for https://rpc.example/?key=LEAK-2", {
+        cause: Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:443 LEAK-3"), {
+          code: "ECONNREFUSED",
+        }),
+      }),
+      "TypeError ECONNREFUSED",
+    ],
+    ["a code that is a sentence", Object.assign(new Error("x"), { code: "not a code" }), "Error"],
+    ["a thrown string", `the key is ${AGENT_KEY.toString()}`, "string"],
+  ];
+  for (const [what, thrown, shown] of cases) {
+    const result = await start(ARGS, {
+      createApi: () =>
+        ({
+          signIn: async () => {
+            throw thrown;
+          },
+        }) as unknown as TenderApi,
+    });
+
+    expect(result.code, what).toBe(0);
+    expect(result.out, what).toEqual([`WARN run-agent: sign-in failed at start: ${shown}`]);
+    const output = [...result.out, ...result.err].join("\n");
+    expect(output, what).not.toMatch(/LEAK/);
+    for (const piece of piecesOf(AGENT_KEY)) expect(output, what).not.toContain(piece);
+  }
+
+  // The client's own sentences are shown as they are, and a key that is in one all the same is cut.
+  const sentence = await start(ARGS, {
+    createApi: () =>
+      ({
+        signIn: async () => {
+          throw new ApiError(500, null, `broken with ${AGENT_KEY.toString()}`);
+        },
+      }) as unknown as TenderApi,
+  });
+  expect(sentence.out).toEqual(["WARN run-agent: sign-in failed at start: broken with <redacted>"]);
+  const timeout = await start(ARGS, {
+    createApi: () =>
+      ({
+        signIn: async () => {
+          throw new ApiTimeoutError("signIn", 30_000);
+        },
+      }) as unknown as TenderApi,
+  });
+  expect(timeout.out).toEqual([
+    "WARN run-agent: sign-in failed at start: ApiClient.signIn timed out after 30000 ms",
+  ]);
+});
+
+test("an_agent_that_is_stopped_while_it_signs_in_does_not_wait_for_the_sign_in", async () => {
+  const stop = new AbortController();
+  const timer = setTimeout(() => stop.abort(), 20);
+  try {
+    const result = await start(ARGS, {
+      signal: stop.signal,
+      // A sign-in that never ends: the client would give up on it at its own timeout.
+      createApi: () => ({ signIn: () => new Promise<string>(() => {}) }) as unknown as TenderApi,
+      loop: async (options) => {
+        expect(options.signal.aborted).toBe(true);
+      },
+    });
+
+    // The loop was started with the stop signal given, and ended at once; there is no one to warn.
+    expect(result.code).toBe(0);
+    expect(result.out).toEqual([]);
+    expect(result.err).toEqual([]);
+    expect(result.calls).toContain("run");
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // A sign-in that fails once the agent is stopped is not reported either.
+  const stopped = new AbortController();
+  stopped.abort();
+  const quiet = await start(ARGS, {
+    signal: stopped.signal,
+    createApi: () =>
+      ({
+        signIn: async () => {
+          throw new TypeError("fetch failed");
+        },
+      }) as unknown as TenderApi,
+  });
+  expect(quiet.code).toBe(0);
+  expect(quiet.out).toEqual([]);
 });
 
 // ---- Stopping ---------------------------------------------------------------------------------
