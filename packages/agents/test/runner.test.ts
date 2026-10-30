@@ -6,6 +6,7 @@ import { createStateStore, type Draft, type StateStore } from "@tender/mcp";
 import {
   ApiError,
   computeCommitment,
+  type EntryView,
   type ListTasksFilter,
   type ListTasksResponse,
   STORAGE_BYTE_COST,
@@ -24,6 +25,7 @@ import {
 import type { Solver, TaskContext } from "../src/types";
 import {
   ACCOUNT,
+  entryView,
   OTHER,
   picked,
   type TaskSpec,
@@ -134,6 +136,9 @@ interface Harness {
   commit: Mock<AgentChain["commit"]>;
   reveal: Mock<AgentChain["reveal"]>;
   storage: Mock<AgentChain["storageBalanceOf"]>;
+  getEntry: Mock<AgentChain["getEntry"]>;
+  /** What the fake chain holds of the agent: its entry in each task a commit has landed for. */
+  entries: Map<string, EntryView>;
   solve: Mock<Solver["solve"]>;
   client: AgentChain;
   api: TenderApi;
@@ -181,14 +186,24 @@ async function harness(
     signIn: unexpected("signIn"),
   };
 
-  const commit = vi.fn<AgentChain["commit"]>(async () => tx("commit-tx"));
+  // A commit that goes through leaves an entry on the chain, which `getEntry` then shows. One that
+  // fails or never returns leaves none.
+  const entries = new Map<string, EntryView>();
+  const commit = vi.fn<AgentChain["commit"]>(async (taskId, commitment) => {
+    entries.set(String(taskId), entryView(taskId, commitment));
+    return tx("commit-tx");
+  });
   const reveal = vi.fn<AgentChain["reveal"]>(async () => tx("reveal-tx"));
   const storage = vi.fn<AgentChain["storageBalanceOf"]>(async () => ROOMY);
+  const getEntry = vi.fn<AgentChain["getEntry"]>(
+    async (taskId) => entries.get(String(taskId)) ?? null,
+  );
   const client: AgentChain = {
     accountId: ACCOUNT,
     commit,
     reveal,
     storageBalanceOf: storage,
+    getEntry,
   };
 
   const solve = vi.fn<Solver["solve"]>(async (ctx) => answer(ctx));
@@ -208,6 +223,8 @@ async function harness(
     commit,
     reveal,
     storage,
+    getEntry,
+    entries,
     solve,
     client,
     api,
@@ -307,27 +324,6 @@ test("draft_saved_before_commit", async () => {
     ...onDisk,
     committedAt: expect.stringMatching(ISO),
   });
-});
-
-test("a_commit_that_fails_leaves_its_draft_and_is_not_sent_again", async () => {
-  const h = await harness();
-  h.world.add({ id: 7 });
-  h.commit.mockRejectedValueOnce(new TenderError("E_PHASE", "E_PHASE: task 7 is not open"));
-
-  await h.tick();
-  const draft = await h.state.getDraft("7");
-  expect(draft).toMatchObject({ taskId: "7", contentHash: sha256Hex(ANSWER) });
-  expect(draft?.committedAt).toBeUndefined();
-  expect(h.logs).toContain("ERROR alice: commit to task 7 failed (TenderError E_PHASE)");
-
-  // Neither this run nor the next one enters the task again: the draft's salt is not replaced
-  // by another commit, and the solver is not paid for twice.
-  await h.tick();
-  h.restart();
-  await h.tick();
-  expect(h.commit).toHaveBeenCalledTimes(1);
-  expect(h.solve).toHaveBeenCalledTimes(1);
-  expect(await h.state.getDraft("7")).toEqual(draft);
 });
 
 test("skips_rejected_and_unmatched_tags", async () => {
@@ -574,6 +570,317 @@ test("a_cursor_that_never_ends_does_not_end_the_tick_for_good", async () => {
   expect(h.listTasks).toHaveBeenCalledTimes(10);
 });
 
+// ---- A commit that did not land ---------------------------------------------------------------
+
+/**
+ * The process dies inside the commit, before it lands: the call never returns, and the tick is
+ * left hanging, as a killed process leaves its work. Returns the draft it left on disk, which does
+ * not say that the commit went through.
+ */
+async function crashInsideTheCommit(h: Harness): Promise<Draft> {
+  h.commit.mockImplementationOnce(() => new Promise(() => {}));
+  void h.tick();
+  await vi.waitFor(() => expect(h.commit).toHaveBeenCalledTimes(1));
+  const draft = await createStateStore(h.dir).getDraft("7");
+  if (draft === null) throw new Error("the crash left no draft");
+  expect(draft.committedAt).toBeUndefined();
+  expect(h.entries.size).toBe(0);
+  return draft;
+}
+
+/**
+ * The process dies after the commit has landed, on the way to marking the draft: the chain has the
+ * entry, and the draft on disk does not say so. Returns that draft.
+ */
+async function crashBeforeTheMark(h: Harness): Promise<Draft> {
+  const real = h.state;
+  let saves = 0;
+  // The first save is the draft before the commit. The second is the mark, and never returns.
+  h.state = {
+    ...real,
+    saveDraft: (draft) => (++saves === 2 ? new Promise<void>(() => {}) : real.saveDraft(draft)),
+  };
+  void h.tick();
+  await vi.waitFor(() => expect(saves).toBe(2));
+  const draft = await createStateStore(h.dir).getDraft("7");
+  if (draft === null) throw new Error("the crash left no draft");
+  expect(draft.committedAt).toBeUndefined();
+  expect(h.entries.get("7")?.commitment).toBe(draft.commitment);
+  return draft;
+}
+
+test("crash_after_save_before_commit_resends_the_same_commitment", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  const saved = await crashInsideTheCommit(h);
+
+  // The next process finds a draft that is not marked committed and asks the chain, which has no
+  // entry. The task is open, so the draft's own commitment goes out again, and no solver is asked.
+  h.restart();
+  await h.tick();
+
+  expect(h.getEntry).toHaveBeenCalledWith(7n, ACCOUNT);
+  expect(h.commit).toHaveBeenCalledTimes(2);
+  expect(h.commit.mock.calls[1]).toEqual(h.commit.mock.calls[0]);
+  expect(h.commit).toHaveBeenLastCalledWith(7n, saved.commitment);
+  expect(h.solve).toHaveBeenCalledTimes(1);
+  expect(h.start).toHaveBeenCalledTimes(1);
+  expect(h.logs).toEqual(["alice: committed to task 7 tx=commit-tx (sent again)"]);
+  // The draft is what it was, with the salt and the hash it had, and now it is marked.
+  expect(await h.state.getDraft("7")).toEqual({
+    ...saved,
+    committedAt: expect.stringMatching(ISO),
+  });
+
+  // Marked, it is taken at its word: the chain is not asked again and nothing is sent.
+  await h.tick();
+  expect(h.getEntry).toHaveBeenCalledTimes(1);
+  expect(h.commit).toHaveBeenCalledTimes(2);
+
+  // And what the chain holds is what the draft's salt opens.
+  task.phase = "revealing";
+  await h.tick();
+  expect(h.entries.get("7")?.commitment).toBe(
+    computeCommitment(7n, ACCOUNT, saved.contentHash, saved.salt),
+  );
+  expect(h.reveal).toHaveBeenCalledWith(7n, saved.contentHash, saved.salt, expect.any(String));
+});
+
+test("already_committed_counts_as_committed", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  const unmarked = await crashBeforeTheMark(h);
+
+  // The next process asks the chain, which has the entry with the draft's commitment. The commit is
+  // not sent a second time (the contract would take it for a replacement), and the draft is marked.
+  h.restart();
+  await h.tick();
+
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.logs).toEqual([
+    "alice: committed to task 7 tx=commit-tx",
+    "alice: the commit to task 7 was on chain already",
+  ]);
+  expect(await h.state.getDraft("7")).toEqual({
+    ...unmarked,
+    committedAt: expect.stringMatching(ISO),
+  });
+
+  // Nothing about it is an error, in its reveal window either.
+  task.phase = "revealing";
+  await h.tick();
+  expect(h.reveal).toHaveBeenCalledTimes(1);
+  expect(h.logs.filter((line) => line.startsWith("ERROR"))).toEqual([]);
+});
+
+test("a_commit_found_on_chain_in_the_reveal_window_is_revealed_in_the_same_tick", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  const unmarked = await crashBeforeTheMark(h);
+
+  // The window moved on while the process was down.
+  task.phase = "revealing";
+  h.restart();
+  await h.tick();
+
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledWith(
+    7n,
+    unmarked.contentHash,
+    unmarked.salt,
+    expect.any(String),
+  );
+  expect(await h.state.getDraft("7")).toMatchObject({
+    committedAt: expect.stringMatching(ISO),
+    revealedUri: expect.any(String),
+  });
+});
+
+// The refusals of a commit that a second try meets again: the contract's, and the client's own.
+const REFUSED_FOR_GOOD = [
+  "E_NOT_FOUND",
+  "E_PHASE",
+  "E_AUTH",
+  "E_INVITE",
+  "E_HASH",
+  "E_FULL",
+  "E_ARGS",
+];
+
+test("permanent_refusal_marks_the_draft_dead_and_logs_once", async () => {
+  for (const code of REFUSED_FOR_GOOD) {
+    for (const atResend of [false, true]) {
+      const what = `${code} at the ${atResend ? "resend" : "first send"}`;
+      const h = await harness();
+      const task = h.world.add({ id: 7 });
+      if (atResend) await crashInsideTheCommit(h);
+      h.commit.mockRejectedValue(new TenderError(code, `${code}: refused`));
+      if (atResend) h.restart();
+
+      await h.tick();
+      await h.tick();
+      await h.tick();
+
+      // Said once, with its code, and never tried again. No solver was asked a second time.
+      const dead = `ERROR alice: commit to task 7 refused for good (TenderError ${code}), the draft is dead`;
+      expect(h.logs, what).toEqual([dead]);
+      expect(h.commit, what).toHaveBeenCalledTimes(atResend ? 2 : 1);
+      expect(h.solve, what).toHaveBeenCalledTimes(1);
+
+      // Nothing is done for it to the end of the task, and the end says nothing of it.
+      task.phase = "revealing";
+      await h.tick();
+      Object.assign(task, { phase: "settled", outcome: picked(7, OTHER) });
+      await h.tick();
+      expect(h.upload, what).not.toHaveBeenCalled();
+      expect(h.reveal, what).not.toHaveBeenCalled();
+      expect(h.logs, what).toEqual([dead]);
+    }
+  }
+});
+
+test("past_commit_deadline_without_entry_is_dead", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  await crashInsideTheCommit(h);
+
+  // The commit window closes while the process is down: nothing can be sent for the draft now.
+  task.phase = "revealing";
+  h.restart();
+  await h.tick();
+  await h.tick();
+
+  const dead =
+    "ERROR alice: task 7 has no commit of its draft on chain and its commit window is over, the draft is dead";
+  expect(h.logs).toEqual([dead]);
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.upload).not.toHaveBeenCalled();
+  expect(h.reveal).not.toHaveBeenCalled();
+
+  // It stays dead to the end of the task, and the end says nothing of it.
+  Object.assign(task, { phase: "settled", outcome: picked(7, OTHER) });
+  await h.tick();
+  expect(h.logs).toEqual([dead]);
+});
+
+test("a_commit_that_fails_for_now_is_sent_again_on_a_later_tick", async () => {
+  // A node that is down, a balance that someone can top up, a failure the client cannot name: none
+  // of them is known to repeat.
+  const failures: Array<[unknown, string]> = [
+    [new Error("fetch failed"), "Error"],
+    [new TenderError("E_STORAGE", "E_STORAGE: not registered"), "TenderError E_STORAGE"],
+    [new TenderError("E_UNKNOWN", "a failure the client cannot name"), "TenderError E_UNKNOWN"],
+  ];
+  for (const [failure, shown] of failures) {
+    const h = await harness();
+    h.world.add({ id: 7 });
+    h.commit.mockRejectedValueOnce(failure);
+
+    await h.tick();
+    const draft = await h.state.getDraft("7");
+    expect(draft?.committedAt, shown).toBeUndefined();
+    expect(h.logs, shown).toEqual([`ERROR alice: commit to task 7 failed (${shown})`]);
+
+    // The next tick sends the draft's commitment again. No solver is asked a second time.
+    await h.tick();
+    expect(h.commit.mock.calls[1], shown).toEqual([7n, draft?.commitment]);
+    expect(h.solve, shown).toHaveBeenCalledTimes(1);
+    expect(h.logs.at(-1), shown).toBe("alice: committed to task 7 tx=commit-tx (sent again)");
+    expect(await h.state.getDraft("7"), shown).toEqual({
+      ...draft,
+      committedAt: expect.stringMatching(ISO),
+    });
+    await h.tick();
+    expect(h.commit, shown).toHaveBeenCalledTimes(2);
+  }
+});
+
+test("a_resend_waits_for_storage_and_says_so_once", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  const saved = await crashInsideTheCommit(h);
+  h.restart();
+  h.storage.mockResolvedValue({ total: "0", available: "0", used_bytes: "0" });
+
+  await h.tick();
+  await h.tick();
+
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.logs).toEqual([`WARN storage low account=${ACCOUNT} available=0`]);
+
+  // Someone tops the account up, and the next tick sends.
+  h.storage.mockResolvedValue(ROOMY);
+  await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(2);
+  expect(h.commit).toHaveBeenLastCalledWith(7n, saved.commitment);
+});
+
+test("a_lookup_that_fails_sends_nothing_and_is_tried_again", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  const saved = await crashInsideTheCommit(h);
+  h.restart();
+  h.getEntry.mockRejectedValueOnce(new Error("rpc down"));
+
+  await h.tick();
+
+  // Not knowing is neither a reason to send nor a reason to give up.
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.logs).toEqual(["ERROR alice: the entry in task 7 cannot be read (Error)"]);
+
+  await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(2);
+  expect(h.commit).toHaveBeenLastCalledWith(7n, saved.commitment);
+});
+
+test("a_lookup_that_fails_in_the_reveal_window_holds_the_reveal_back_one_tick", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  const unmarked = await crashBeforeTheMark(h);
+  task.phase = "revealing";
+  h.restart();
+  h.getEntry.mockRejectedValueOnce(new Error("rpc down"));
+
+  // Whether the commit is on chain is not known, so nothing is revealed yet. The next tick finds out.
+  await h.tick();
+  expect(h.reveal).not.toHaveBeenCalled();
+  await h.tick();
+  expect(h.reveal).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledWith(
+    7n,
+    unmarked.contentHash,
+    unmarked.salt,
+    expect.any(String),
+  );
+});
+
+test("an_entry_with_another_commitment_is_not_the_drafts", async () => {
+  // While the task is open, the draft's commitment replaces it, as the contract allows.
+  const early = await harness();
+  early.world.add({ id: 7 });
+  const saved = await crashInsideTheCommit(early);
+  early.entries.set("7", entryView(7n, sha256Hex("another commitment")));
+  early.restart();
+  await early.tick();
+  expect(early.commit).toHaveBeenLastCalledWith(7n, saved.commitment);
+  expect(early.entries.get("7")?.commitment).toBe(saved.commitment);
+
+  // Past the commit deadline nothing can replace it, and the draft cannot open it.
+  const late = await harness();
+  const task = late.world.add({ id: 7 });
+  await crashInsideTheCommit(late);
+  late.entries.set("7", entryView(7n, sha256Hex("another commitment")));
+  task.phase = "revealing";
+  late.restart();
+  await late.tick();
+  expect(late.commit).toHaveBeenCalledTimes(1);
+  expect(late.reveal).not.toHaveBeenCalled();
+  expect(late.logs).toEqual([
+    "ERROR alice: task 7 has no commit of its draft on chain and its commit window is over, the draft is dead",
+  ]);
+});
+
 // ---- Revealing --------------------------------------------------------------------------------
 
 test("reveals_only_in_window", async () => {
@@ -616,6 +923,8 @@ test("reveals_only_in_window", async () => {
   await h.tick();
   expect(h.upload).toHaveBeenCalledTimes(1);
   expect(h.reveal).toHaveBeenCalledTimes(1);
+  // A draft marked committed is taken at its word: the chain is not asked about it.
+  expect(h.getEntry).not.toHaveBeenCalled();
 });
 
 test("a_reveal_survives_a_restart", async () => {

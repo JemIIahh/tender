@@ -1,5 +1,6 @@
 import {
   type Brief,
+  type EntryView,
   type Phase,
   type PublicCriteria,
   sha256Hex,
@@ -146,5 +147,18 @@ export function voided(taskId: number, reason: "no_reveals" | "no_award" | "expi
     by: null,
     scorecard_hash: null,
     scorecard_uri: null,
+  };
+}
+
+/** `ACCOUNT`'s entry in task `taskId` as the chain shows it: committed with `commitment`, not revealed. */
+export function entryView(taskId: bigint, commitment: string): EntryView {
+  return {
+    task_id: String(taskId),
+    account: ACCOUNT,
+    index: 0,
+    commitment,
+    committed_at_block: "1000",
+    content_hash: null,
+    uri: null,
   };
 }

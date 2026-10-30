@@ -4,6 +4,7 @@ import type { Draft, StateStore } from "@tender/mcp";
 import {
   ApiError,
   computeCommitment,
+  type EntryView,
   ErrorBodySchema,
   type ListTasksFilter,
   randomSalt,
@@ -24,7 +25,11 @@ import type { Solver, TaskContext } from "./types";
 // keeps its draft on disk through the `StateStore` and works from it:
 //
 // - the draft is saved, and so on disk, before the commit is sent. A crash after the commit left
-//   the salt behind; a crash before it left a draft the chain knows nothing of, which costs nothing;
+//   the salt behind; a crash before it left a draft the chain may know nothing of. A draft that is
+//   not marked committed is taken neither for sent nor for lost: the chain is asked
+//   (`recoverCommit`). If it has the commit, the draft is marked. If not, and the task is still
+//   open, the same commitment is sent again from the draft, never with a new solve. If the commit
+//   window is over, or the contract refuses for good, the draft is dead and is let alone (P05-R14);
 // - a draft is never replaced. A task with a draft is not entered again, in this run or after a
 //   restart, because a second commit with another salt would replace the one the draft opens;
 // - the reveal is driven by the drafts and not by what the run remembers, so a restart picks up
@@ -46,13 +51,38 @@ const MAX_PAGES = 10;
 const MAX_REASON_CHARS = 200;
 /** What a code looks like: the contract's (`E_AUTH`), Node's (`ECONNREFUSED`), the API's (`not_open`). */
 const CODE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+/**
+ * The failures of a commit that a second try meets again (P05-R14), by the code they carry. The
+ * contract's own, from the rules of `commit`: no such task (`E_NOT_FOUND`), the task is past its
+ * commit deadline (`E_PHASE`), the agent is its poster or its verifier (`E_AUTH`), it takes
+ * invited entrants only and the agent is not one (`E_INVITE`), the commitment is not 64 lowercase
+ * hex characters (`E_HASH`), and the task is full (`E_FULL`: entrants cannot leave, so no place
+ * frees up). And the client's own `E_ARGS`, for arguments the contract cannot read.
+ *
+ * `E_STORAGE` is not among them, as a top-up makes it come right. Neither is a failure with no
+ * code (a node that is down, a timeout) or one the client could not name (`E_UNKNOWN`): none of
+ * these is known to repeat, and the commit is tried again until its window ends.
+ */
+const REFUSED_FOR_GOOD: ReadonlySet<string> = new Set([
+  "E_NOT_FOUND",
+  "E_PHASE",
+  "E_AUTH",
+  "E_INVITE",
+  "E_HASH",
+  "E_FULL",
+  "E_ARGS",
+]);
 const NO_SIGNER = "this agent's client has no signer, so it can neither commit nor reveal";
 
 /**
  * What the runner needs of a `TenderClient` (X-12): the account it signs as, the two transactions
- * of an entry, and the storage view for R22. Tests pass a fake with these members.
+ * of an entry, the storage view for R22, and the entry view that tells whether a commit landed
+ * (P05-R14). Tests pass a fake with these members.
  */
-export type AgentChain = Pick<TenderClient, "accountId" | "commit" | "reveal" | "storageBalanceOf">;
+export type AgentChain = Pick<
+  TenderClient,
+  "accountId" | "commit" | "reveal" | "storageBalanceOf" | "getEntry"
+>;
 
 /**
  * What a run remembers from one tick to the next. It is only a cache of decisions already made,
@@ -67,6 +97,14 @@ export class AgentMemory {
   readonly seen = new Set<string>();
   /** Tasks whose outcome has been logged. */
   readonly settled = new Set<string>();
+  /**
+   * Tasks whose draft is dead for this run: its commit is not on the chain and cannot be, as the
+   * contract refused it for good or the commit window is over. Nothing more is done for them. A
+   * draft has no slot to say so on disk, so a restart judges each of them again.
+   */
+  readonly dead = new Set<string>();
+  /** Tasks whose low storage has been warned of, so that a later tick does not say it again. */
+  readonly warned = new Set<string>();
 }
 
 export interface AgentTickOptions {
@@ -123,6 +161,12 @@ function codeOf(error: unknown): string | undefined {
   return typeof code === "string" && CODE.test(code) ? code : undefined;
 }
 
+/** Whether `error` is a failure of a commit that a second try would meet again. */
+function refusedForGood(error: unknown): boolean {
+  const code = codeOf(error);
+  return code !== undefined && REFUSED_FOR_GOOD.has(code);
+}
+
 /**
  * What a log line says of an error: its name and its code, or for an `ApiError` its status and
  * the API's own error code. Never its message (P03-R16): a message can quote the URL of the RPC or
@@ -177,7 +221,8 @@ async function listOpen(api: TenderApi, tag: string): Promise<TaskSummary[]> {
  * 4. The agent's storage on the contract is below what a commit and a reveal need (R22): logged as
  *    a warning. A function-call key cannot top it up, so the agent can only wait for someone to.
  * 5. `start`, the signal that the agent is working on it, then the solver. No answer: logged.
- * 6. The answer is committed to (`commit`).
+ * 6. The answer is committed to (`commit`). If the commit does not end well, the draft it saved is
+ *    settled by the next ticks (`recoverCommit`): the answer is not solved for again.
  *
  * A task is `seen` once step 4 has turned it down and once `start` has gone through, whatever
  * happens after, so a solver is asked at most once per task in a run and a failing task cannot cost
@@ -241,10 +286,8 @@ async function enter(run: Run, summary: TaskSummary): Promise<void> {
   // R22 (P05-P2): an entry that runs out of storage cannot reveal, and its window does not wait.
   // Checked here, ahead of `start` and the solver, rather than at the commit itself: an agent
   // that cannot commit then neither announces itself on the task nor spends a model call on it.
-  const storage = await run.client.storageBalanceOf(run.account);
-  if (storageShortfall(storage) > 0n) {
+  if (await storageLow(run, id)) {
     memory.seen.add(id);
-    run.log(`WARN storage low account=${run.account} available=${storage?.available ?? "0"}`);
     return;
   }
 
@@ -269,12 +312,12 @@ async function enter(run: Run, summary: TaskSummary): Promise<void> {
 }
 
 /**
- * Enters task `id` with `content`: saves the draft, sends the commit, then marks the draft
- * committed. The draft is on disk (`saveDraft` writes and syncs a temp file and renames it) before
- * the commit leaves, which is the whole of the crash safety of the commit half.
+ * Enters task `id` with `content`: saves the draft, then sends the commit (`sendCommit`). The draft
+ * is on disk (`saveDraft` writes and syncs a temp file and renames it) before the commit leaves,
+ * which is the whole of the crash safety of the commit half. What a crash or a failed send leaves
+ * behind, `recoverCommit` settles.
  */
 async function commit(run: Run, id: string, content: Uint8Array): Promise<void> {
-  const taskId = BigInt(id);
   const contentHash = sha256Hex(content);
   const salt = randomSalt();
   const draft: Draft = {
@@ -282,29 +325,124 @@ async function commit(run: Run, id: string, content: Uint8Array): Promise<void> 
     contentBase64: Buffer.from(content).toString("base64"),
     contentHash,
     salt,
-    commitment: computeCommitment(taskId, run.account, contentHash, salt),
+    commitment: computeCommitment(BigInt(id), run.account, contentHash, salt),
   };
 
   await run.state.saveDraft(draft);
+  await sendCommit(run, draft, false);
+}
+
+// ---- Settling a commit ------------------------------------------------------------------------
+
+/**
+ * Sends the commit of `draft`, and marks the draft committed once it has gone through. `again` says
+ * the send repeats one that did not end well, for the log. Returns whether the commit went through.
+ *
+ * A failure that a second try would meet again (`REFUSED_FOR_GOOD`) makes the draft dead. Any
+ * other is logged and left for a later tick: a transaction that failed to finish does not say
+ * whether it reached the chain, and sending the draft's commitment again is harmless, as a commit
+ * by an account that has an entry only replaces the entry's commitment, here with the same one.
+ */
+async function sendCommit(run: Run, draft: Draft, again: boolean): Promise<boolean> {
+  const id = draft.taskId;
   let txHash: string;
   try {
-    txHash = (await run.client.commit(taskId, draft.commitment)).txHash;
+    txHash = (await run.client.commit(BigInt(id), draft.commitment)).txHash;
   } catch (error) {
-    // The draft stays: whether the commit reached the chain is not known to a transaction that
-    // failed to finish, and a draft that was never committed does no harm (see `tendDrafts`).
-    run.log(`ERROR ${run.name}: commit to task ${id} failed (${describe(error)})`);
-    return;
+    if (refusedForGood(error)) {
+      markDead(run, id, `commit to task ${id} refused for good (${describe(error)})`);
+    } else {
+      run.log(`ERROR ${run.name}: commit to task ${id} failed (${describe(error)})`);
+    }
+    return false;
   }
-  run.log(`${run.name}: committed to task ${id} tx=${txHash}`);
+  run.log(`${run.name}: committed to task ${id} tx=${txHash}${again ? " (sent again)" : ""}`);
+  await markCommitted(run, draft);
+  return true;
+}
 
+/**
+ * Marks `draft` committed, at the time the agent learned of it (for a commit found on the chain,
+ * not when it landed). A failure is logged and changes nothing: the chain has the commit.
+ */
+async function markCommitted(run: Run, draft: Draft): Promise<void> {
   try {
     await run.state.saveDraft({ ...draft, committedAt: new Date().toISOString() });
   } catch (error) {
-    // The commit is on chain all the same, and the reveal does not wait for this mark.
     run.log(
-      `ERROR ${run.name}: task ${id} committed, but its draft could not be marked (${describe(error)})`,
+      `ERROR ${run.name}: task ${draft.taskId} committed, but its draft could not be marked (${describe(error)})`,
     );
   }
+}
+
+/**
+ * Gives the draft of task `id` up for this run, and says why (P05-R14). That is said once, as
+ * `tendDrafts` lets a dead draft alone from then on: it is neither sent nor revealed nor reported
+ * on, and its task is not entered again.
+ */
+function markDead(run: Run, id: string, why: string): void {
+  run.memory.dead.add(id);
+  run.log(`ERROR ${run.name}: ${why}, the draft is dead`);
+}
+
+/**
+ * Settles a draft that is not marked committed (P05-R14). Its commit was cut short by a crash, or
+ * failed in a way that said nothing of the chain, or went through and was not marked. The chain
+ * knows which, and is asked (`get_entry`) before anything is sent. `task` is what the index shows
+ * of the draft's task.
+ *
+ * - The account has an entry with the draft's commitment: the commit landed, and the draft is
+ *   marked committed. This is the only way to learn it, as the contract has no "already
+ *   committed" error: a second commit by the same account succeeds and replaces the first.
+ * - It has none (or one with another commitment, which the draft's replaces) and the task is
+ *   open: the draft's own commitment is sent again. It carries the draft's salt and hash, so that
+ *   it opens with the draft's work, and no solver is asked.
+ * - It has none and the task is no longer open: the commit deadline has passed, nothing can be
+ *   sent or revealed, and the draft is dead.
+ *
+ * Returns whether the commit is on the chain, which is when the draft may be revealed. A lookup
+ * that fails, a storage balance too low to commit (R22) and a send that fails in a way that may
+ * pass leave the draft for a later tick. A send the contract refuses for good makes it dead
+ * (`sendCommit`).
+ */
+async function recoverCommit(run: Run, draft: Draft, task: TaskDetail): Promise<boolean> {
+  const id = draft.taskId;
+
+  let entry: EntryView | null;
+  try {
+    entry = await run.client.getEntry(BigInt(id), run.account);
+  } catch (error) {
+    run.log(`ERROR ${run.name}: the entry in task ${id} cannot be read (${describe(error)})`);
+    return false;
+  }
+  if (entry !== null && entry.commitment === draft.commitment) {
+    run.log(`${run.name}: the commit to task ${id} was on chain already`);
+    await markCommitted(run, draft);
+    return true;
+  }
+
+  if (task.phase !== "open") {
+    const why = `task ${id} has no commit of its draft on chain and its commit window is over`;
+    markDead(run, id, why);
+    return false;
+  }
+  if (await storageLow(run, id)) return false;
+  return sendCommit(run, draft, true);
+}
+
+/**
+ * Whether the agent's storage on the contract is below what a commit and a reveal need (R22). It
+ * reads the balance now, and warns once for each task if it is short. A function-call key cannot
+ * top the account up, so the agent can only wait for someone to.
+ */
+async function storageLow(run: Run, id: string): Promise<boolean> {
+  const storage = await run.client.storageBalanceOf(run.account);
+  if (storageShortfall(storage) <= 0n) return false;
+  if (!run.memory.warned.has(id)) {
+    run.memory.warned.add(id);
+    run.log(`WARN storage low account=${run.account} available=${storage?.available ?? "0"}`);
+  }
+  return true;
 }
 
 // ---- Revealing and settling -------------------------------------------------------------------
@@ -312,14 +450,17 @@ async function commit(run: Run, id: string, content: Uint8Array): Promise<void> 
 /**
  * Goes through every draft the agent holds, oldest task first:
  *
+ * - a draft not marked committed is settled first (`recoverCommit`): the chain is asked, and the
+ *   commit is marked, sent again or given up;
  * - a draft that is not revealed, for a task in its reveal window, is revealed;
  * - a draft whose task has settled is logged as `won`, `lost` or `refunded`, once.
  *
- * It works from the drafts and from what the API says of their tasks, and from nothing the run
- * remembers apart from which outcomes it has logged, so it finishes the work of a run that was
- * killed. It does not wait for `committedAt`: the commit can have gone through just before a crash
- * stopped the draft from being marked, and the reveal must not be lost to that. A draft whose
- * commit never reached the chain makes the reveal fail until its window ends, which is logged.
+ * It works from the drafts and from what the API and the chain say of their tasks, and from nothing
+ * the run remembers apart from which outcomes it has logged and which drafts are dead, so it
+ * finishes the work of a run that was killed. A commit that went through just before a crash
+ * stopped the draft from being marked is found by `recoverCommit`, and the reveal follows in the
+ * same pass. A dead draft is let alone: it is not revealed, and no outcome is logged for an entry
+ * the agent never made.
  */
 async function tendDrafts(run: Run): Promise<void> {
   let drafts: Draft[];
@@ -335,7 +476,8 @@ async function tendDrafts(run: Run): Promise<void> {
 
   for (const draft of drafts) {
     if (run.signal?.aborted) return;
-    if (run.memory.settled.has(draft.taskId)) continue;
+    const { taskId } = draft;
+    if (run.memory.settled.has(taskId) || run.memory.dead.has(taskId)) continue;
     try {
       await tendDraft(run, draft);
     } catch (error) {
@@ -351,6 +493,11 @@ async function tendDraft(run: Run, draft: Draft): Promise<void> {
   const { task } = found;
 
   let revealed = draft.revealedUri !== undefined;
+  // A revealed draft was committed. One that is neither revealed nor marked committed may or may
+  // not have its commit on the chain, and nothing is revealed or sent before that is known.
+  if (!revealed && draft.committedAt === undefined) {
+    if (!(await recoverCommit(run, draft, task))) return;
+  }
   if (!revealed && task.phase === "revealing") revealed = await reveal(run, draft);
   if (task.outcome !== null) {
     logOutcome(run, task, revealed);
@@ -443,15 +590,28 @@ function logOutcome(run: Run, task: TaskDetail, revealed: boolean): void {
 // ---- The loop ---------------------------------------------------------------------------------
 
 /**
- * One pass of the agent: first the drafts it holds (reveals that are due, outcomes to log), then
- * the open tasks to enter. The reveals come first because they have a deadline and a solver can
- * take minutes: a reveal never waits behind the work of the same tick.
+ * One pass of the agent: first the drafts it holds (commits to settle, reveals that are due,
+ * outcomes to log), then the open tasks to enter. The drafts come first because they have a
+ * deadline and a solver can take minutes: a reveal that is due when the tick starts never waits
+ * behind the work of the same tick.
  *
  * Nothing that goes wrong with one task or one draft stops the tick: it is logged, and the tick
  * goes on with the next. A step that cannot be taken (the API is down) is logged and left to the
  * next tick. It throws only when the client has no signer. Pass `signal` to have it end before it
  * starts on its next task or draft; the one in hand is seen through, so that a commit that went
  * out has its draft marked.
+ *
+ * Known limits, accepted (P05-R14):
+ *
+ * - A solver that takes long delays the agent's later tasks in the same tick, and a reveal that
+ *   falls due during a solve waits for the tick to end.
+ * - A `won`, `lost` or `refunded` line is logged again for each settled draft after a restart, as
+ *   a draft has no slot to say its outcome was logged.
+ * - The storage view is read once for a task, before the solver is asked, and not again before
+ *   the commit.
+ * - A draft is dead for the run only, as it has no slot to say so either: a restart judges it
+ *   again, which costs a lookup and, for a task still open, one more refused commit and one more
+ *   ERROR line.
  *
  * `runAgent` calls this in a loop; it is exported so that a test can run one tick at a time.
  */
