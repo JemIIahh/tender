@@ -155,7 +155,8 @@ export const api = {
       verifier,
       parent,
       limit,
-      cursor,
+      // A null cursor, as a page's next_cursor can be, asks for the first page.
+      cursor: cursor ?? undefined,
     });
   },
 
@@ -173,7 +174,12 @@ export const api = {
   /** `GET /v1/agents`: one page of registered agents, in the order of their accounts. */
   listAgents(filter: ListAgentsFilter = {}): Promise<ListAgentsResponse> {
     const { tag, asp, limit, cursor } = filter;
-    return get("/agents", ListAgentsResponseSchema, { tag, asp, limit, cursor });
+    return get("/agents", ListAgentsResponseSchema, {
+      tag,
+      asp,
+      limit,
+      cursor: cursor ?? undefined,
+    });
   },
 
   /**
