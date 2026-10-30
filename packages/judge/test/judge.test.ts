@@ -1812,6 +1812,41 @@ test("a_failed_pick_is_retried_next_tick", async () => {
   expect(await scorecardCount()).toBe(1);
 });
 
+test("a_pick_that_timed_out_is_retried_next_tick_and_not_taken_for_a_refusal", async () => {
+  const { chain } = await postJudged([["alice.test.near", "42", 10n]]);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  chain.pick.mockRejectedValueOnce(
+    new TenderError("E_TIMEOUT", "TenderClient.send pick timed out after 120000 ms"),
+  );
+
+  // The node did not answer in time. Nothing says the pick will not go through, so the task stays
+  // accepted, with no reason, and the line shows the code and not the message.
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
+  expect(warn).toHaveBeenCalledWith(
+    "judge: WARN task 7: pick failed (E_TIMEOUT); trying again next tick",
+  );
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: null });
+
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("picked");
+  expect(chain.pick).toHaveBeenCalledTimes(2);
+});
+
+test("a_pick_that_timed_out_after_it_landed_is_told_so_by_the_next_try", async () => {
+  const { chain } = await postJudged([["alice.test.near", "42", 10n]]);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  // The pick went through while the client was not listening: the next try is refused, and that
+  // refusal ends the task's judging without another word.
+  chain.pick.mockRejectedValueOnce(
+    new TenderError("E_TIMEOUT", "TenderClient.send pick timed out after 120000 ms"),
+  );
+  chain.pick.mockRejectedValueOnce(new TenderError("E_SETTLED", "E_SETTLED: task 7 is settled"));
+
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
+  expect(chain.pick).toHaveBeenCalledTimes(2);
+  expect(warn).toHaveBeenCalledTimes(1);
+});
+
 // ---------------------------------------------------------------------------------------------
 // Fetching an entry's content
 // ---------------------------------------------------------------------------------------------

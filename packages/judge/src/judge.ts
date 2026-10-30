@@ -105,9 +105,10 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   the chain names cannot be read or used (they passed intake, so they are gone or changed), and
  *   its status becomes `failed_closed` with the reason.
  *
- * The task is read from the chain first, every time, so a `pick` that landed before a crash shows
- * as an outcome and nothing is done again. It must be in `judging` both by `deps.now` and by the
- * final block the chain answered from, which is after every reveal that can land.
+ * The task is read from the chain first, every time, so a `pick` that landed before a crash, or
+ * whose answer never came (`E_TIMEOUT`, after which it may have landed all the same), shows as an
+ * outcome and nothing is done again. It must be in `judging` both by `deps.now` and by the final
+ * block the chain answered from, which is after every reveal that can land.
  *
  * Each revealed entry's content is fetched (`fetchEntryContent`) and must hash to the entry's
  * `content_hash`; one of our own blob URIs counts only when `deps.resultUploaded` says the entrant
