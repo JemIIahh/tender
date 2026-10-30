@@ -231,9 +231,25 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
       view: async () => ({ criteria_hash: await putCriteria(db, TESTS) }),
     },
     {
-      rule: "rubric from the team, which has no scorer yet",
-      reason: "kind rubric is not available yet",
-      view: async () => ({ poster: TEAM_POSTER, criteria_hash: await putCriteria(db, RUBRIC) }),
+      // A rubric is graded by a model against public weights: it has no held-out part to commit to.
+      rule: "rubric from the team that says it has held-out checks",
+      reason: "kind rubric has no held-out checks",
+      view: async () => ({
+        poster: TEAM_POSTER,
+        criteria_hash: await putCriteria(db, { ...RUBRIC, has_heldout: true }),
+        // Never stored: the rule is found before the checks are looked for. (Storing a document
+        // that a later row leaves out would accept that row.)
+        heldout_commitment: sha256Hex("held-out checks of a rubric"),
+      }),
+    },
+    {
+      rule: "rubric from the team with a held-out commitment, though it says it has none",
+      reason: HAS_HELDOUT_MISMATCH,
+      view: async () => ({
+        poster: TEAM_POSTER,
+        criteria_hash: await putCriteria(db, RUBRIC),
+        heldout_commitment: sha256Hex("held-out checks of a rubric"),
+      }),
     },
     {
       rule: "tests from the team, which has no scorer yet",
@@ -685,6 +701,15 @@ test("intake_accepts_the_p0_kinds", { timeout: 30_000 }, async () => {
     expect(await intake(i + 1, view), `task ${i + 1}`).toBe("accepted");
     expect(await judgeRow(db, i + 1)).toEqual({ judge_status: "accepted", judge_reason: null });
   }
+});
+
+test("intake_accepts_a_rubric_from_the_team_and_needs_no_model", async () => {
+  // A rubric has no schema to compile and no held-out checks to wait for, so a team task is
+  // accepted at once, and nothing is asked of the model: whether the Judge has one is for judging
+  // to find (the task fails closed there when it has none).
+  const view = { poster: TEAM_POSTER, criteria_hash: await putCriteria(db, RUBRIC) };
+  expect(await intake(1, view)).toBe("accepted");
+  expect(await judgeRow(db, 1)).toEqual({ judge_status: "accepted", judge_reason: null });
 });
 
 test("the_probe_shapes_with_ref_check_what_they_point_to", () => {
