@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "kind": "regex_cases",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "examples": {
+    "match": ["1.2.3", "2.0.0-rc.1", "0.1.0+build.5"],
+    "no_match": ["1.2", "v1.2.3", "1.2.3.4"]
+  }
+}

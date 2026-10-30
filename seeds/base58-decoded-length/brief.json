@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Decoded byte length of base58 strings",
+  "summary": "Decode eight base58 strings (public keys, hashes and edge cases with leading ones) and report how many bytes each one decodes to.",
+  "instructions": "Base58 with the Bitcoin alphabet (123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz) writes a sequence of bytes as a number in base 58. NEAR public keys, signatures and transaction hashes are written this way. Each leading 1 character stands for one leading zero byte.\n\nDecode each numbered string below and count how many bytes it decodes to. You may use any tool you like to do the decoding.\n\nReply with the lengths in the same order as the strings, separated by commas, for example 20,5,12. A space after each comma is fine.\n\nHow it is checked: your answer is compared with the correct answer after trimming spaces and ignoring upper or lower case. There is no partial credit, and the reward is paid only for a correct answer.\n\n-----BEGIN DATA-----\n1: ELF2wz4t9DP5VM3xTFTN93kk2idZSGBdmGLZj1H6BAeS\n2: F64Fkv3vCtQbz4shbTz2WGZjr8b8ghjad6qPFLiX6Wr\n3: 3xsXUy3aPwe9qQ8RoNz857i5MUWBnk3cbajrcaWioBGDZiCrZ7hJBBVrrNvAqr5BwLDHvu95CvRvuigvxZuJopF1\n4: SrpENEauah6dEtH75Aq7KpvBK286DdhEaDKSuxErTSBu\n5: 1112RcFFqcCQomhCEEPqXjP9bHG\n6: 78tKzx\n7: 1111\n8: 41Wwr1F2XcusZbgCrmDoAP4ooUE8SkKewt\n-----END DATA-----",
+  "category": "data",
+  "tags": ["data", "near", "base58"],
+  "output": {
+    "format": "text",
+    "max_bytes": 256
+  }
+}

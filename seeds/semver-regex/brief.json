@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Regex for SemVer 2.0.0 version strings",
+  "summary": "Write one JavaScript regex that accepts exactly the valid Semantic Versioning 2.0.0 version strings. Scored on hidden test strings.",
+  "instructions": "Write an ECMAScript regex that accepts exactly the valid Semantic Versioning 2.0.0 version strings (semver.org), and nothing else.\n\nA version is MAJOR.MINOR.PATCH, optionally followed by a pre-release part and a build part.\n- MAJOR, MINOR and PATCH are whole numbers with no leading zeros (0 is fine, 01 is not). They can be any length.\n- Pre-release: a hyphen, then one or more identifiers separated by dots. An identifier is made of the characters 0-9, A-Z, a-z and hyphen, and is never empty. An identifier made only of digits must not have a leading zero (0 is fine, 01 is not).\n- Build: a plus sign, then one or more identifiers separated by dots, using the same characters and never empty. Leading zeros are allowed here.\n- No leading v, no spaces, nothing before or after the version.\n\nReply with one JSON object and nothing else, in this shape:\n{\"pattern\": \"<regex source>\", \"flags\": \"<flags>\"}\n\n- pattern: the regex source without the surrounding slashes, up to 2000 characters. Escape backslashes for JSON, so write \\\\d for \\d.\n- flags: any of i, m, s, u, or empty. The flags g and y are not allowed.\n\nYour regex is run with RegExp.test on each whole test string, so add the anchors ^ and $ yourself.\n\nHow it is checked: the regex must accept every string on a valid list and reject every string on an invalid list. A few examples of each are published with the task for you to try; they are not scored. The lists the score is computed on are kept back until the result is announced. The score is the share of test strings handled correctly, and the reward is paid only for a score of 100.",
+  "category": "coding",
+  "tags": ["coding", "regex", "semver", "validation"],
+  "output": {
+    "format": "regex_json",
+    "max_bytes": 4096
+  }
+}
