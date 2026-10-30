@@ -9,6 +9,7 @@ import {
   formatTokenAmount,
   HeldoutSchema,
   heldoutMatchesCriteria,
+  type ListTasksResponse,
   NETWORKS,
   type NetworkId,
   PublicCriteriaSchema,
@@ -29,16 +30,24 @@ import { loadEnv, REPO_ROOT } from "./lib/env";
  * (which serves them to nobody until the task is judged), and posts the task with its hashes. It
  * prints one line as each seed is dealt with, and as the poster is topped up:
  *
- *   DEPOSITED <amount> NEAR for storage     the storage balance was short, and the poster added to it
- *   DEPOSITED <amount> <symbol>             the vault was short, and the poster put in the difference
- *   SKIP <slug> (held-out already public)   the seed was judged and its checks are out: not posted
- *   SEEDED <slug> task=<id>                 the seed is posted
- *   FAILED <slug>                           the run stopped at this seed; the ones before it are posted
+ *   DEPOSITED <amount> NEAR for storage        storage was short, and the poster added to it
+ *   DEPOSITED <amount> <symbol>                the vault was short, and the poster put in the rest
+ *   SKIP <slug> (held-out already public)      judged, and its checks are out: not posted
+ *   SKIP <slug> (already posted as task <id>)  up already, and not settled: not posted again
+ *   SEEDED <slug> task=<id>                    posted
+ *   FAILED <slug>                              the run stopped here; the seeds before it are posted
  *
  * Held-out checks are single-use (P05-P12). A task's checks are published in its scorecard when it
  * is judged, so a seed whose commitment the API serves already is skipped, and never posted again.
- * Only that case is known: a seed that was posted and is still open looks the same as one never
- * posted, so after a run that stopped half way, run again with `--only` and the slugs left.
+ *
+ * Running the script again posts nothing twice. Before it pays or uploads anything, it asks the API
+ * for the poster's tasks, page after page, and reads the brief hash of each one that has not
+ * settled (the list leaves the brief out; the task has it). A seed whose brief is one of those is
+ * up already, and is skipped, so a run that stopped half way is finished by running it again. A
+ * settled task does not count: its seed can be posted again, as long as its checks are not public.
+ * A task that ran out its windows and that no one has voided is not settled. It still holds its
+ * reward, so its seed waits for the void. The API's index trails the chain by a block or two, and
+ * a run that starts the moment another ends may not see the tasks of that one yet.
  *
  * What the poster pays. A task's reward moves from the poster's vault into escrow, and the contract
  * refuses a task the vault cannot pay for. Each task is also recorded on the contract, and the
@@ -87,7 +96,10 @@ export type SeedChain = Pick<
 export interface SeedOptions {
   /** Signs as the poster, with a full-access key: a post and a deposit each attach 1 yoctoNEAR. */
   client: SeedChain;
-  /** Signed in as the poster. */
+  /**
+   * Signed in as the poster. Asked which held-out checks are public and which tasks the poster has
+   * up, and given the uploads.
+   */
   api: TenderApi;
   network: NetworkId;
   /** The posting account: a seed whose verifier is `"poster"` resolves to it. */
@@ -511,14 +523,59 @@ async function post(o: SeedOptions, seed: Prepared): Promise<bigint> {
   return taskId;
 }
 
+/** The most tasks the API puts in a page of its list. */
+const LIST_PAGE = 50;
+
+/**
+ * The poster's tasks that have not settled, by the hash of their brief: for each hash, the id of
+ * the oldest such task. The API lists a poster's tasks newest first and without their briefs, so
+ * this pages through the list, and then asks for each task that has not settled to read its brief
+ * hash. A settled task is not asked for, since it does not count. An API that fails to answer
+ * stops the run, and so does one whose list does not end or names a task it does not know: a
+ * list that could not be read in full is not a list of nothing.
+ */
+async function unsettledBriefs(api: TenderApi, poster: string): Promise<Map<string, bigint>> {
+  const ids = new Set<bigint>();
+  const cursors = new Set<string>();
+  let cursor: string | null = null;
+  do {
+    const page: ListTasksResponse = await api.listTasks({ poster, limit: LIST_PAGE, cursor });
+    for (const task of page.tasks) {
+      // The API lists the poster's tasks only; the check keeps out a task that is not.
+      if (task.poster === poster && task.phase !== "settled") ids.add(BigInt(task.id));
+    }
+    cursor = page.next_cursor;
+    if (cursor !== null) {
+      if (cursors.has(cursor)) {
+        throw new Error(
+          `the list of the tasks of ${poster} does not end: cursor ${cursor} came twice`,
+        );
+      }
+      cursors.add(cursor);
+    }
+  } while (cursor !== null);
+
+  const briefs = new Map<string, bigint>();
+  // The oldest first, so that it is the one a brief that was posted more than once is named by.
+  for (const id of [...ids].sort((a, b) => Number(a - b))) {
+    const found = await api.getTask(id);
+    if (found === null) {
+      throw new Error(`the API lists task ${id} of ${poster}, and has no such task`);
+    }
+    if (!briefs.has(found.task.brief_hash)) briefs.set(found.task.brief_hash, id);
+  }
+  return briefs;
+}
+
 /**
  * Posts the seeds of `seedsDir` (or those of `only`), in slug order, and gives the ones it posted
  * with the ids of their tasks. A seed that is skipped is not among them. See the top of this file
  * for what each seed goes through, what the script prints, and how the vault is funded.
  *
  * Throws, naming the seed, if its files are wrong; if the poster's wallet cannot cover the rewards
- * the vault lacks; and with the API's or the chain's own error if either refuses a step. The seeds
- * posted before a failure stay posted.
+ * the vault lacks; if the API's list of the poster's tasks cannot be read in full; and with the
+ * API's or the chain's own error if either refuses a step. The seeds posted before a failure stay
+ * posted, and running the script again finishes the rest.
  */
 export async function seed(o: SeedOptions): Promise<SeededTask[]> {
   const log = o.log ?? console.log;
@@ -545,7 +602,19 @@ export async function seed(o: SeedOptions): Promise<SeededTask[]> {
   for (const { slug, heldout } of seeds) {
     if (heldout !== undefined && (await o.api.getBlob(heldout.hash)) !== null) judged.add(slug);
   }
-  const toPost = seeds.filter(({ slug }) => !judged.has(slug));
+  const unjudged = seeds.filter(({ slug }) => !judged.has(slug));
+
+  // A seed the poster has up already, and that has not settled, is not posted again. Nothing is
+  // asked when no seed is left to post.
+  const earlier = new Map<string, bigint>();
+  if (unjudged.length > 0) {
+    const briefs = await unsettledBriefs(o.api, o.poster);
+    for (const { slug, brief } of unjudged) {
+      const id = briefs.get(brief.hash);
+      if (id !== undefined) earlier.set(slug, id);
+    }
+  }
+  const toPost = unjudged.filter(({ slug }) => !earlier.has(slug));
 
   // The poster pays for what it posts: NEAR for the storage, then tokens for the rewards. The
   // storage comes first, since a vault slot is paid for out of it too.
@@ -561,6 +630,11 @@ export async function seed(o: SeedOptions): Promise<SeededTask[]> {
     const { slug } = prepared;
     if (judged.has(slug)) {
       log(`SKIP ${slug} (held-out already public)`);
+      continue;
+    }
+    const earlierId = earlier.get(slug);
+    if (earlierId !== undefined) {
+      log(`SKIP ${slug} (already posted as task ${earlierId})`);
       continue;
     }
     let taskId: bigint;

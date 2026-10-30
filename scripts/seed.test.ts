@@ -7,9 +7,12 @@ import {
   ApiError,
   canonicalJson,
   NETWORKS,
+  type Phase,
   type PostTaskInput,
   type StorageView,
   sha256Hex,
+  type TaskDetailResponse,
+  type TaskSummary,
   type TenderApi,
 } from "@tender/shared";
 import { KeyPair } from "near-api-js";
@@ -161,17 +164,122 @@ interface Upload {
   uri: string;
 }
 
+/** A task the API knows of, as far as the script looks at one. */
+interface Listed {
+  id: bigint;
+  poster: string;
+  briefHash: string;
+  phase: Phase;
+}
+
+/** The task of `poster` whose brief is that of seed `slug`, in `phase`. */
+const listedOf = (id: bigint, slug: string, phase: Phase, poster = POSTER): Listed => ({
+  id,
+  poster,
+  briefHash: hashOf(briefOf(slug)),
+  phase,
+});
+
+/** The list leaves a task's brief out, as the API's does. */
+function summaryOf(task: Listed): TaskSummary {
+  return {
+    id: `${task.id}`,
+    title: null,
+    category: null,
+    tags: [],
+    token: TOKEN,
+    reward: "250000",
+    phase: task.phase,
+    poster: task.poster,
+    verifier: JUDGE,
+    created_at: "1",
+    commit_deadline: "2",
+    reveal_deadline: "3",
+    pick_deadline: "4",
+    fallback_deadline: "5",
+    commit_count: 0,
+    reveal_count: 0,
+    working_count: 0,
+    judge_status: null,
+    judge_reason: null,
+    is_team_poster: false,
+    parent: null,
+    outcome_kind: null,
+  };
+}
+
+function detailOf(task: Listed): TaskDetailResponse {
+  return {
+    task: {
+      ...summaryOf(task),
+      brief_uri: `https://api.test/v1/blobs/${task.briefHash}`,
+      brief_hash: task.briefHash,
+      criteria_hash: "c".repeat(64),
+      heldout_commitment: null,
+      max_entries: 0,
+      max_winners: 1,
+      invited: [],
+      fee_bps: 500,
+      outcome: null,
+    },
+    brief: null,
+    criteria: null,
+    entries: [],
+    funders: [],
+    children: [],
+    scorecard: null,
+  };
+}
+
 interface ApiOptions {
   /** The hashes the API serves, as it serves a blob that is public. */
   served?: ReadonlySet<string>;
   /** What `uploadBlob` says it stored the bytes as, in place of their hash. */
   storedAs?: string;
+  /** Tasks the API lists besides those that were posted through the fake chain. */
+  tasks?: readonly Listed[];
+  /** The tasks that were posted through the fake chain. A world supplies them. */
+  posted?: () => readonly Listed[];
+  /** The most tasks a page holds, whatever limit is asked for: a server may give fewer. */
+  pageSize?: number;
+  /** Lists the tasks of every poster, whatever poster is asked for. */
+  ignorePoster?: boolean;
+  /** Gives the same cursor to every page, so that the list never ends. */
+  stuck?: boolean;
+  /** The tasks `getTask` does not know, though they are listed. */
+  vanished?: ReadonlySet<bigint>;
 }
 
 /** The API, as far as the seed script uses it. `trace` hears every call, in order. */
 function fakeApi(trace: string[], options: ApiOptions = {}) {
   const uploads: Upload[] = [];
   const heldouts: { commitment: string; bytes: Uint8Array }[] = [];
+  const known = () => [...(options.tasks ?? []), ...(options.posted?.() ?? [])];
+  // Newest first, a cursor that is the id of the last task of the page before (exclusive), and no
+  // cursor after the last page: the way the API's list pages.
+  let pages = 0;
+  const listTasks = vi.fn<TenderApi["listTasks"]>(async (filter = {}) => {
+    trace.push("listTasks");
+    // A script that cannot stop asking would spin without ever yielding to a test's timeout.
+    if (++pages > 100) throw new Error("the fake API was asked for more than 100 pages");
+    if (options.stuck) return { tasks: [], next_cursor: "9" };
+    const matching = known()
+      .filter((task) => options.ignorePoster || !filter.poster || task.poster === filter.poster)
+      .filter((task) => !filter.cursor || task.id < BigInt(filter.cursor))
+      .sort((a, b) => Number(b.id - a.id));
+    const size = Math.min(filter.limit ?? 20, options.pageSize ?? 50);
+    const page = matching.slice(0, size);
+    const last = page.at(-1);
+    return {
+      tasks: page.map(summaryOf),
+      next_cursor: matching.length > size && last !== undefined ? `${last.id}` : null,
+    };
+  });
+  const getTask = vi.fn<TenderApi["getTask"]>(async (id) => {
+    trace.push("getTask");
+    const task = known().find((candidate) => candidate.id === id);
+    return task === undefined || options.vanished?.has(id) ? null : detailOf(task);
+  });
   const getBlob = vi.fn<TenderApi["getBlob"]>(async (sha256) => {
     trace.push("getBlob");
     return options.served?.has(sha256) ? new Uint8Array([1]) : null;
@@ -188,8 +296,8 @@ function fakeApi(trace: string[], options: ApiOptions = {}) {
     heldouts.push({ commitment, bytes });
   });
   const api: TenderApi = {
-    listTasks: unexpected("listTasks"),
-    getTask: unexpected("getTask"),
+    listTasks,
+    getTask,
     listAgents: unexpected("listAgents"),
     getAgent: unexpected("getAgent"),
     listEntries: unexpected("listEntries"),
@@ -202,7 +310,7 @@ function fakeApi(trace: string[], options: ApiOptions = {}) {
     telegramLink: unexpected("telegramLink"),
     signIn: unexpected("signIn"),
   };
-  return { api, uploads, heldouts, getBlob, uploadBlob, uploadHeldout };
+  return { api, uploads, heldouts, getBlob, uploadBlob, uploadHeldout, listTasks, getTask };
 }
 
 interface ChainOptions {
@@ -229,6 +337,8 @@ function fakeChain(trace: string[], options: ChainOptions = {}) {
   let storage: StorageView | null = options.storage === undefined ? ROOMY : options.storage;
   const posts: PostTaskInput[] = [];
   let lastId = 0n;
+  // The failure comes once: a call that follows it, after a run was stopped, goes through.
+  let failing = options.failPost;
 
   const balanceOf = vi.fn<SeedChain["balanceOf"]>(async (_account, token) => {
     trace.push("balanceOf");
@@ -268,7 +378,11 @@ function fakeChain(trace: string[], options: ChainOptions = {}) {
   });
   const postTask = vi.fn<SeedChain["postTask"]>(async (input) => {
     trace.push("postTask");
-    if (options.failPost?.call === posts.length + 1) throw options.failPost.error;
+    if (failing?.call === posts.length + 1) {
+      const { error } = failing;
+      failing = undefined;
+      throw error;
+    }
     const held = vault.get(input.token) ?? 0n;
     if (held < input.reward)
       throw new TenderError("E_FUNDS", "E_FUNDS: insufficient vault balance");
@@ -301,40 +415,75 @@ function fakeChain(trace: string[], options: ChainOptions = {}) {
   };
 }
 
-interface RunOptions extends Partial<Omit<SeedOptions, "client" | "api">> {
+/** What `seed` is given besides the client and the API, which the tests make. */
+type PlayOptions = Partial<Omit<SeedOptions, "client" | "api">>;
+
+interface RunOptions extends PlayOptions {
   chain?: ChainOptions;
   api?: ApiOptions;
 }
 
-/**
- * `seed` on a directory of seeds, against a fake chain and a fake API, on testnet with the test
- * token and no record of a deployment. `spec` is the seeds to write into a new directory, the path
- * of one that exists, or null for the repository's own. `result` is what the call returned, or
- * `failure` what it threw.
- */
-async function run(spec: Record<string, SeedSpec> | string | null, options: RunOptions = {}) {
-  const dir =
-    spec === null || typeof spec === "string" ? (spec ?? undefined) : await seedsDir(spec);
+/** A fake chain and a fake API that know of each other: what the one posts, the other lists. */
+interface World {
+  /** Every call to either, in order. */
+  trace: string[];
+  /** Every line the script printed. */
+  lines: string[];
+  chain: ReturnType<typeof fakeChain>;
+  api: ReturnType<typeof fakeApi>;
+}
+
+function worldOf(options: Pick<RunOptions, "chain" | "api"> = {}): World {
   const trace: string[] = [];
-  const lines: string[] = [];
   const chain = fakeChain(trace, options.chain);
-  const api = fakeApi(trace, options.api);
-  const { chain: _chain, api: _api, ...rest } = options;
+  // A task posted through the chain is on the API's list at once, in the phase a new task is in.
+  const posted = (): Listed[] =>
+    chain.posts.map((post, i) => ({
+      id: BigInt(i + 1),
+      poster: POSTER,
+      briefHash: post.briefHash,
+      phase: "open",
+    }));
+  const api = fakeApi(trace, { ...options.api, posted });
+  return { trace, lines: [], chain, api };
+}
+
+/**
+ * One call of `seed` in `world`, on testnet with the test token and no record of a deployment.
+ * `result` is what it returned, or `failure` what it threw. `trace` and `lines` are those of this
+ * call alone, so that a second call in the same world can be told from the first.
+ */
+async function play(world: World, dir: string | undefined, options: PlayOptions = {}) {
+  const calls = world.trace.length;
+  const printed = world.lines.length;
   const settled = await seed({
-    client: chain.client,
-    api: api.api,
+    client: world.chain.client,
+    api: world.api.api,
     network: "testnet",
     poster: POSTER,
     judgeAccount: JUDGE,
     tokenId: TOKEN,
     seedsDir: dir,
-    log: (line) => lines.push(line),
-    ...rest,
+    log: (line) => world.lines.push(line),
+    ...options,
   }).then(
     (result) => ({ result, failure: undefined }),
     (failure: unknown) => ({ result: undefined, failure }),
   );
-  return { ...settled, dir, trace, lines, chain, api };
+  return { ...settled, trace: world.trace.slice(calls), lines: world.lines.slice(printed) };
+}
+
+/**
+ * `seed` on a directory of seeds, in a new world. `spec` is the seeds to write into a new
+ * directory, the path of one that exists, or null for the repository's own.
+ */
+async function run(spec: Record<string, SeedSpec> | string | null, options: RunOptions = {}) {
+  const dir =
+    spec === null || typeof spec === "string" ? (spec ?? undefined) : await seedsDir(spec);
+  const world = worldOf(options);
+  const { chain: _chain, api: _api, ...rest } = options;
+  const played = await play(world, dir, rest);
+  return { ...played, dir, chain: world.chain, api: world.api };
 }
 
 /** What a run did to the API and the chain: nothing at all. */
@@ -714,6 +863,7 @@ test("when_every_seed_was_judged_nothing_is_posted_and_the_poster_pays_nothing",
     "SKIP alpha (held-out already public)",
     "SKIP beta (held-out already public)",
   ]);
+  // Only the two questions about the checks: with nothing left to post, no list of tasks is read.
   expect(trace).toEqual(["getBlob", "getBlob"]);
 });
 
@@ -824,8 +974,9 @@ test("the_storage_balance_is_topped_up_before_the_vault_and_before_anything_is_u
 
   expect(chain.storageDeposit.mock.calls).toEqual([[bytes(2_400n)]]);
   expect(lines[0]).toBe("DEPOSITED 0.024 NEAR for storage");
-  // The questions about the held-out checks come first; then the poster is topped up; then seeds.
-  expect(trace.filter((call) => call !== "getBlob").slice(0, 5)).toEqual([
+  // The questions to the API come first; then the poster is topped up; then the seeds go up.
+  const questions = ["getBlob", "listTasks", "getTask"];
+  expect(trace.filter((call) => !questions.includes(call)).slice(0, 5)).toEqual([
     "storageBalanceOf",
     "storageDeposit",
     "balanceOf",
@@ -863,6 +1014,209 @@ test("the_storage_a_run_needs_grows_with_the_tasks_it_posts_and_not_with_those_i
   );
 
   expect(chain.storageDeposit.mock.calls).toEqual([[bytes(100n)]]);
+});
+
+// ---- Seeds that are posted already --------------------------------------------------------------
+
+test("a_second_run_over_the_same_seeds_posts_nothing_and_pays_nothing", async () => {
+  const dir = await seedsDir({ alpha: {}, beta: {} });
+  const world = worldOf();
+
+  const first = await play(world, dir);
+  const second = await play(world, dir);
+
+  expect(first.result).toEqual([
+    { slug: "alpha", taskId: 1n },
+    { slug: "beta", taskId: 2n },
+  ]);
+  expect(second.result).toEqual([]);
+  expect(second.lines).toEqual([
+    "SKIP alpha (already posted as task 1)",
+    "SKIP beta (already posted as task 2)",
+  ]);
+  // It asked what is public, then for the poster's tasks, then for the brief of each of them: it
+  // paid, uploaded and posted nothing.
+  expect(second.trace).toEqual(["getBlob", "getBlob", "listTasks", "getTask", "getTask"]);
+  expect(world.chain.posts).toHaveLength(2);
+  expect(world.chain.deposit).toHaveBeenCalledTimes(1);
+  expect(world.api.uploads).toHaveLength(4);
+  expect(world.api.heldouts).toHaveLength(2);
+});
+
+test("a_run_that_stopped_half_way_is_finished_by_running_it_again", async () => {
+  const dir = await seedsDir({ alpha: {}, beta: {}, gamma: {} });
+  const stop = new TenderError("E_STORAGE", "E_STORAGE: insufficient storage balance");
+  const world = worldOf({ chain: { failPost: { call: 2, error: stop } } });
+
+  const first = await play(world, dir);
+  const second = await play(world, dir);
+
+  expect(first.failure).toBe(stop);
+  expect(first.lines).toEqual(["DEPOSITED 0.75 tUSDC", "SEEDED alpha task=1", "FAILED beta"]);
+  // alpha is up, so it is not posted twice; the vault still holds the rewards of the two left.
+  expect(second.lines).toEqual([
+    "SKIP alpha (already posted as task 1)",
+    "SEEDED beta task=2",
+    "SEEDED gamma task=3",
+  ]);
+  expect(second.result).toEqual([
+    { slug: "beta", taskId: 2n },
+    { slug: "gamma", taskId: 3n },
+  ]);
+  expect(world.chain.deposit).toHaveBeenCalledTimes(1);
+});
+
+test("a_task_that_has_settled_does_not_stop_its_seed_from_being_posted_again", async () => {
+  const settled = listedOf(100n, "alpha", "settled");
+
+  const { result, lines, api } = await run({ alpha: {} }, { api: { tasks: [settled] } });
+
+  expect(result).toEqual([{ slug: "alpha", taskId: 1n }]);
+  expect(lines).toEqual(["DEPOSITED 0.25 tUSDC", "SEEDED alpha task=1"]);
+  // Only a task that has not settled could stand in the way, so the settled one is not asked about.
+  expect(api.getTask).not.toHaveBeenCalled();
+});
+
+test("a_task_in_any_phase_but_settled_counts_as_posted", async () => {
+  // An expired task has not settled either: it holds its reward until someone voids it.
+  for (const phase of ["open", "revealing", "judging", "fallback", "expired"] as const) {
+    const { result, lines, chain } = await run(
+      { alpha: {} },
+      { api: { tasks: [listedOf(100n, "alpha", phase)] } },
+    );
+
+    expect(result, phase).toEqual([]);
+    expect(lines, phase).toEqual(["SKIP alpha (already posted as task 100)"]);
+    expect(chain.deposit, phase).not.toHaveBeenCalled();
+    expect(chain.postTask, phase).not.toHaveBeenCalled();
+  }
+});
+
+test("a_settled_task_whose_heldout_is_public_still_keeps_its_seed_from_being_posted_again", async () => {
+  const served = new Set([hashOf(heldoutOf("alpha"))]);
+
+  const { result, lines } = await run(
+    { alpha: {} },
+    { api: { served, tasks: [listedOf(100n, "alpha", "settled")] } },
+  );
+
+  // The single-use rule (P05-P12) holds whatever the lookup finds.
+  expect(result).toEqual([]);
+  expect(lines).toEqual(["SKIP alpha (held-out already public)"]);
+});
+
+test("a_seed_that_is_judged_is_skipped_for_its_public_checks_whether_or_not_it_is_up", async () => {
+  const served = new Set([hashOf(heldoutOf("alpha"))]);
+  const tasks = [listedOf(100n, "alpha", "open"), listedOf(101n, "beta", "open")];
+
+  const { lines } = await run({ alpha: {}, beta: {} }, { api: { served, tasks } });
+
+  expect(lines).toEqual([
+    "SKIP alpha (held-out already public)",
+    "SKIP beta (already posted as task 101)",
+  ]);
+});
+
+test("the_oldest_task_that_has_not_settled_is_the_one_named", async () => {
+  const tasks = [
+    listedOf(9n, "alpha", "open"),
+    listedOf(3n, "alpha", "settled"),
+    listedOf(7n, "alpha", "judging"),
+  ];
+
+  const { lines, api } = await run({ alpha: {} }, { api: { tasks } });
+
+  expect(lines).toEqual(["SKIP alpha (already posted as task 7)"]);
+  // The settled task is not asked about; the others are, oldest first.
+  expect(api.getTask.mock.calls.map(([id]) => id)).toEqual([7n, 9n]);
+});
+
+test("a_task_of_another_poster_does_not_stand_in_the_way", async () => {
+  const theirs = listedOf(100n, "alpha", "open", `someone.${PARENT}`);
+
+  const asked = await run({ alpha: {} }, { api: { tasks: [theirs] } });
+  const ignored = await run({ alpha: {} }, { api: { tasks: [theirs], ignorePoster: true } });
+
+  for (const { result, lines } of [asked, ignored]) {
+    expect(result).toEqual([{ slug: "alpha", taskId: 1n }]);
+    expect(lines).toEqual(["DEPOSITED 0.25 tUSDC", "SEEDED alpha task=1"]);
+  }
+  // It asks for the poster's tasks, in the biggest pages the API gives ...
+  expect(asked.api.listTasks).toHaveBeenCalledWith({ poster: POSTER, limit: 50, cursor: null });
+  // ... and keeps a task of someone else out even when the API lists it all the same.
+  expect(ignored.api.getTask).not.toHaveBeenCalled();
+});
+
+test("the_posters_tasks_are_read_page_after_page_to_the_last", async () => {
+  // Six tasks, the oldest of them the seed's, and an API that gives two to a page.
+  const tasks = [
+    listedOf(100n, "alpha", "open"),
+    ...[101n, 102n, 103n, 104n, 105n].map((id) => listedOf(id, `other-${id}`, "open")),
+  ];
+
+  const { lines, api } = await run({ alpha: {} }, { api: { tasks, pageSize: 2 } });
+
+  expect(lines).toEqual(["SKIP alpha (already posted as task 100)"]);
+  // Newest first, each page from the cursor of the one before, until there is none.
+  expect(api.listTasks.mock.calls.map(([filter]) => filter?.cursor)).toEqual([null, "104", "102"]);
+  expect(api.getTask.mock.calls.map(([id]) => id)).toEqual([100n, 101n, 102n, 103n, 104n, 105n]);
+});
+
+test("a_seed_that_is_posted_already_is_not_paid_for_again", async () => {
+  // beta alone needs one task and one vault slot, 1,800 bytes of storage, and 1,700 are free.
+  const { result, lines, chain } = await run(
+    { alpha: {}, beta: {} },
+    { api: { tasks: [listedOf(100n, "alpha", "open")] }, chain: { storage: storageOf(1_700n) } },
+  );
+
+  expect(result).toEqual([{ slug: "beta", taskId: 1n }]);
+  expect(chain.storageDeposit.mock.calls).toEqual([[bytes(100n)]]);
+  expect(chain.deposit.mock.calls).toEqual([[TOKEN, 250_000n]]);
+  expect(lines).toEqual([
+    "DEPOSITED 0.001 NEAR for storage",
+    "DEPOSITED 0.25 tUSDC",
+    "SKIP alpha (already posted as task 100)",
+    "SEEDED beta task=1",
+  ]);
+});
+
+test("an_api_that_fails_to_list_the_posters_tasks_stops_the_run_before_anything_is_paid", async () => {
+  const dir = await seedsDir({ alpha: {}, beta: {} });
+  const world = worldOf();
+  const outage = new ApiError(503, { error: "unavailable", message: "no" });
+  world.api.listTasks.mockImplementationOnce(async () => {
+    world.trace.push("listTasks");
+    throw outage;
+  });
+
+  const { failure, trace, lines } = await play(world, dir);
+
+  // "No tasks" is not what it said, so nothing was paid, uploaded or posted on the strength of it.
+  expect(failure).toBe(outage);
+  expect(trace).toEqual(["getBlob", "getBlob", "listTasks"]);
+  expect(lines).toEqual([]);
+});
+
+test("a_list_that_never_ends_is_an_error_and_not_a_hang", async () => {
+  const { failure, trace } = await run({ alpha: {} }, { api: { stuck: true } });
+
+  expect((failure as Error).message).toBe(
+    `the list of the tasks of ${POSTER} does not end: cursor 9 came twice`,
+  );
+  expect(trace).toEqual(["getBlob", "listTasks", "listTasks"]);
+});
+
+test("a_listed_task_that_the_api_then_does_not_know_stops_the_run", async () => {
+  const { failure, trace } = await run(
+    { alpha: {} },
+    { api: { tasks: [listedOf(100n, "other", "open")], vanished: new Set([100n]) } },
+  );
+
+  expect((failure as Error).message).toBe(
+    `the API lists task 100 of ${POSTER}, and has no such task`,
+  );
+  expect(trace).not.toContain("deposit");
+  expect(trace).not.toContain("postTask");
 });
 
 // ---- Failures -----------------------------------------------------------------------------------

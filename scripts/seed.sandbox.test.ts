@@ -6,11 +6,13 @@ import {
   NETWORKS,
   parseTokenAmount,
   sha256Hex,
+  type TaskDetailResponse,
+  type TaskSummary,
   type TaskView,
   type TenderApi,
 } from "@tender/shared";
 import { afterAll, beforeAll, expect, test } from "vitest";
-import { seed } from "./seed";
+import { type SeedWindows, seed } from "./seed";
 
 // The seed script against a local chain with Tender and a test token on it, and a fake API that
 // keeps what is uploaded and says where it is served. What the chain holds of each task is read
@@ -65,17 +67,90 @@ interface Blob {
   bytes: Uint8Array;
 }
 
+/** A task of the chain as the API's list gives it, which leaves the brief out. */
+function summaryOf(task: TaskView): TaskSummary {
+  return {
+    id: task.id,
+    title: null,
+    category: null,
+    tags: [],
+    token: task.token,
+    reward: task.reward,
+    phase: task.phase,
+    poster: task.poster,
+    verifier: task.verifier,
+    created_at: task.created_at,
+    commit_deadline: task.commit_deadline,
+    reveal_deadline: task.reveal_deadline,
+    pick_deadline: task.pick_deadline,
+    fallback_deadline: task.fallback_deadline,
+    commit_count: task.commit_count,
+    reveal_count: task.reveal_count,
+    working_count: 0,
+    judge_status: null,
+    judge_reason: null,
+    is_team_poster: false,
+    parent: task.parent,
+    outcome_kind: task.outcome?.kind ?? null,
+  };
+}
+
+/** A task of the chain as the API's page of one task gives it, which has the brief's hash. */
+function detailOf(task: TaskView): TaskDetailResponse {
+  return {
+    task: {
+      ...summaryOf(task),
+      brief_uri: task.brief_uri,
+      brief_hash: task.brief_hash,
+      criteria_hash: task.criteria_hash,
+      heldout_commitment: task.heldout_commitment,
+      max_entries: task.max_entries,
+      max_winners: task.max_winners,
+      invited: task.invited,
+      fee_bps: task.fee_bps,
+      outcome: null,
+    },
+    brief: null,
+    criteria: null,
+    entries: [],
+    funders: task.funders,
+    children: [],
+    scorecard: null,
+  };
+}
+
 /**
  * The API as far as the script uses it: it keeps every blob and held-out document it is given and
  * serves the URI `https://api.test/v1/blobs/<sha256>`. The held-out documents named in `served`
- * count as public already, as one that was judged is.
+ * count as public already, as one that was judged is. Its tasks are the chain's, listed the way the
+ * API lists them (newest first, for a poster, in pages), so that what the script finds of the
+ * poster's tasks is what the chain holds.
  */
 function recordingApi(served: ReadonlySet<string> = new Set()) {
   const blobs: Blob[] = [];
   const heldouts: { commitment: string; bytes: Uint8Array }[] = [];
   const api: TenderApi = {
-    listTasks: unexpected("listTasks"),
-    getTask: unexpected("getTask"),
+    listTasks: async (filter = {}) => {
+      const count = await reader.taskCount();
+      const all: TaskView[] = [];
+      for (let from = 1n; from <= count; from += 50n)
+        all.push(...(await reader.getTasks(from, 50)));
+      const matching = all
+        .filter((task) => !filter.poster || task.poster === filter.poster)
+        .filter((task) => !filter.cursor || BigInt(task.id) < BigInt(filter.cursor))
+        .sort((a, b) => Number(BigInt(b.id) - BigInt(a.id)));
+      const size = filter.limit ?? 20;
+      const page = matching.slice(0, size);
+      const last = page.at(-1);
+      return {
+        tasks: page.map(summaryOf),
+        next_cursor: matching.length > size && last !== undefined ? last.id : null,
+      };
+    },
+    getTask: async (id) => {
+      const task = await reader.getTask(id);
+      return task === null ? null : detailOf(task);
+    },
     listAgents: unexpected("listAgents"),
     getAgent: unexpected("getAgent"),
     listEntries: unexpected("listEntries"),
@@ -157,9 +232,51 @@ async function expectPosted(id: bigint, slug: string, who: Who, blobs: readonly 
   expect(task.parent, slug).toBeNull();
   // The poster funded all of it, and nobody has entered yet.
   expect(task.funders, slug).toEqual([{ account: who.poster, amount: reward }]);
-  expect(task.phase, slug).toBe("open");
   expect(task.commit_count, slug).toBe(0);
+  // A task with the shortest windows may be past its commit window by the time it is read back.
+  if (who.windows === undefined) expect(task.phase, slug).toBe("open");
+  else expect(task.phase, slug).not.toBe("settled");
   return task;
+}
+
+/** One run of the script as `role`, with a new recording API. */
+async function seedAs(role: Role, only: string[], extra: { windows?: SeedWindows } = {}) {
+  const { api, blobs, heldouts } = recordingApi();
+  const lines: string[] = [];
+  const posted = await seed({
+    client: clientOf(role),
+    api,
+    network: chain.network,
+    poster: chain.accounts[role].accountId,
+    judgeAccount: chain.accounts.judge.accountId,
+    tokenId: chain.tokenId,
+    only,
+    log: (line) => lines.push(line),
+    ...extra,
+  });
+  return { posted, lines, blobs, heldouts };
+}
+
+/** What a run can change on the chain: how many tasks there are, and what `role` holds. */
+async function holdings(role: Role) {
+  const account = chain.accounts[role].accountId;
+  return {
+    tasks: await reader.taskCount(),
+    wallet: await reader.ftBalanceOf(chain.tokenId, account),
+    vault: await reader.balanceOf(account, chain.tokenId),
+    storage: await reader.storageBalanceOf(account),
+  };
+}
+
+/** Waits until task `id` is in one of `phases`, as the chain works its phase out. */
+async function waitForPhase(id: bigint, phases: readonly string[]) {
+  const giveUp = Date.now() + 60_000;
+  for (;;) {
+    const task = await reader.getTask(id);
+    if (task !== null && phases.includes(task.phase)) return;
+    if (Date.now() > giveUp) throw new Error(`task ${id} is not ${phases.join(" or ")} yet`);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
 }
 
 test("two_seeds_are_posted_and_each_task_reads_back_as_its_files_say", async () => {
@@ -384,4 +501,88 @@ test("a_poster_whose_wallet_cannot_cover_the_rewards_posts_nothing_and_is_told_w
   expect(await reader.taskCount()).toBe(countBefore);
   expect(blobs).toEqual([]);
   expect(heldouts).toEqual([]);
+});
+
+test("a_second_run_posts_nothing_again_and_a_seed_added_to_it_is_the_only_one_posted", async () => {
+  const bob = chain.accounts.bob.accountId;
+
+  const first = await seedAs("bob", ["distinct-signers-count", "meeting-actions-extract"]);
+  const afterFirst = await holdings("bob");
+  const second = await seedAs("bob", ["distinct-signers-count", "meeting-actions-extract"]);
+  const afterSecond = await holdings("bob");
+
+  const [one, two] = first.posted;
+  if (one === undefined || two === undefined) throw new Error("the first run posted too little");
+  expect(first.lines).toEqual([
+    "DEPOSITED 1.00 tUSDC",
+    `SEEDED distinct-signers-count task=${one.taskId}`,
+    `SEEDED meeting-actions-extract task=${two.taskId}`,
+  ]);
+  // The second run found both tasks on the chain. It paid, uploaded and posted nothing.
+  expect(second.posted).toEqual([]);
+  expect(second.lines).toEqual([
+    `SKIP distinct-signers-count (already posted as task ${one.taskId})`,
+    `SKIP meeting-actions-extract (already posted as task ${two.taskId})`,
+  ]);
+  expect(second.blobs).toEqual([]);
+  expect(second.heldouts).toEqual([]);
+  expect(afterSecond).toEqual(afterFirst);
+
+  // A run that adds a third seed posts that one, and pays for that one alone.
+  const third = await seedAs("bob", [
+    "distinct-signers-count",
+    "meeting-actions-extract",
+    "sum-of-transfers",
+  ]);
+  const added = afterSecond.tasks + 1n;
+  expect(third.posted).toEqual([{ slug: "sum-of-transfers", taskId: added }]);
+  expect(third.lines).toEqual([
+    "DEPOSITED 0.25 tUSDC",
+    `SKIP distinct-signers-count (already posted as task ${one.taskId})`,
+    `SKIP meeting-actions-extract (already posted as task ${two.taskId})`,
+    `SEEDED sum-of-transfers task=${added}`,
+  ]);
+  await expectPosted(added, "sum-of-transfers", { poster: bob }, third.blobs);
+  expect(await reader.taskCount()).toBe(added);
+});
+
+test("a_task_that_was_voided_has_settled_and_its_seed_can_be_posted_again", async () => {
+  const lead = chain.accounts.lead.accountId;
+  const shortest = NETWORKS.sandbox.minWindowSecs;
+  const windows = {
+    commit_secs: shortest,
+    reveal_secs: shortest,
+    pick_secs: shortest,
+    fallback_secs: shortest,
+  };
+  const slug = "product-table-extract";
+
+  const first = await seedAs("lead", [slug], { windows });
+  const [posted] = first.posted;
+  if (posted === undefined) throw new Error("the first run posted nothing");
+  expect(first.lines).toEqual(["DEPOSITED 0.50 tUSDC", `SEEDED ${slug} task=${posted.taskId}`]);
+  const skipped = [`SKIP ${slug} (already posted as task ${posted.taskId})`];
+
+  // While the task is open the seed is up, and a run leaves it alone.
+  expect((await seedAs("lead", [slug], { windows })).lines).toEqual(skipped);
+
+  // Nobody enters. Once the reveal window is over the task is waiting for a pick, which is not
+  // settled either: the seed is still up.
+  await waitForPhase(posted.taskId, ["judging", "fallback", "expired"]);
+  expect((await seedAs("lead", [slug], { windows })).lines).toEqual(skipped);
+
+  // Anyone can void a task that nobody revealed to. It settles, and its reward is back in the vault.
+  await clientOf("lead").voidTask(posted.taskId);
+  const voided = await reader.getTask(posted.taskId);
+  expect(voided?.phase).toBe("settled");
+  expect(voided?.outcome?.kind).toBe("voided");
+  expect(await reader.balanceOf(lead, chain.tokenId)).toBe(500_000n);
+
+  // The seed is posted again, as a task of its own, with the refund and not a new deposit.
+  const countBefore = await reader.taskCount();
+  const again = await seedAs("lead", [slug], { windows });
+  expect(again.posted).toEqual([{ slug, taskId: countBefore + 1n }]);
+  expect(again.lines).toEqual([`SEEDED ${slug} task=${countBefore + 1n}`]);
+  await expectPosted(countBefore + 1n, slug, { poster: lead, windows }, again.blobs);
+  expect(await reader.balanceOf(lead, chain.tokenId)).toBe(0n);
 });
