@@ -996,6 +996,136 @@ test("the_default_limit_is_30_requests_an_hour_by_the_clock_of_the_process", {
   expect(lines[0]).toContain("the limit of 30 model calls an hour");
 });
 
+// ---- The size of a reply ------------------------------------------------------------------------
+
+const MIB = 1_048_576;
+/** What the solver reads of a reply to `textTask(256)`: the answer, the room for thinking, the JSON. */
+const TEXT_REPLY_LIMIT = 256 + MIB + 65_536;
+const TOO_LARGE_MESSAGE =
+  "the model server's reply is larger than the solver reads, and the request was cancelled";
+
+/** What a promise rejects with, or undefined if it does not. */
+const rejection = (promise: Promise<unknown>): Promise<unknown> =>
+  promise.then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+
+test("a_reply_that_streams_past_the_limit_is_cut_off_while_it_streams_and_fails_with_a_fixed_code", async () => {
+  // 64 MiB, chunked, with no length to refuse it by: only the count of the bytes as they come can
+  // stop it. The limit of a 256-byte answer is a little over 1 MiB.
+  const total = 64 * MIB;
+  const { llm, solver } = await setUp({ stream: total }, { timeoutMs: 30_000 });
+
+  const failure = await rejection(solver.solve(textTask(256)));
+
+  // A fixed code and a fixed message: nothing the server sent, and nothing it was reached by.
+  expect(failure).toBeInstanceOf(LlmError);
+  expect(failure).toMatchObject({
+    name: "LlmError",
+    code: "REPLY_TOO_LARGE",
+    message: TOO_LARGE_MESSAGE,
+  });
+  // The request was cancelled while the reply was still coming: the fake saw the connection close
+  // with most of the reply unsent, and the solver did not wait for the rest. Without the limit all
+  // of it goes out.
+  await llm.dropped(1);
+  expect(llm.streamedBytes()).toBeLessThan(total / 2);
+  expect(llm.requests).toHaveLength(1);
+});
+
+test("a_reply_that_declares_a_length_over_the_limit_is_refused_before_its_body_is_read", async () => {
+  const cases: Array<[string, FakeReply]> = [
+    // Says 50 MB and sends a few bytes and stops: without the check the solver waits for the rest
+    // until its timeout, which is why the timeout is long here.
+    ["a length it does not keep to", { declares: 50_000_000 }],
+    // Says 64 MiB and keeps to it.
+    ["a length it keeps to", { stream: 64 * MIB, declared: true }],
+  ];
+  for (const [what, reply] of cases) {
+    const { llm, solver } = await setUp(reply, { timeoutMs: 30_000 });
+    const started = Date.now();
+
+    const failure = await rejection(solver.solve(textTask(256)));
+
+    expect(failure, what).toMatchObject({
+      name: "LlmError",
+      code: "REPLY_TOO_LARGE",
+      message: TOO_LARGE_MESSAGE,
+    });
+    expect(Date.now() - started, what).toBeLessThan(10_000);
+    // Cancelled at the headers: the connection closed, and little of the body went out.
+    await llm.dropped(1);
+    expect(llm.streamedBytes(), what).toBeLessThan(32 * MIB);
+  }
+});
+
+test("the_limit_is_the_answers_limit_the_room_for_thinking_and_the_json_and_not_a_byte_more", async () => {
+  // A reply a byte over what `textTask(256)` allows.
+  const { solver } = await setUp({ stream: TEXT_REPLY_LIMIT + 1 });
+
+  // For a task whose answer may be 256 bytes it is a byte too many: cut off.
+  expect(await rejection(solver.solve(textTask(256)))).toMatchObject({ code: "REPLY_TOO_LARGE" });
+  // The limit is the task's, so the same reply to a task that allows a longer answer is read whole.
+  // It is no answer all the same, being larger than the text may be (the second layer, `checkAnswer`):
+  // null, and not an error. And the solver is none the worse for the cut.
+  expect(await solver.solve(textTask(4096))).toBeNull();
+
+  // At the limit exactly it is read whole, then too: null from the second layer, and written to
+  // the end, not cut.
+  const edge = await setUp({ stream: TEXT_REPLY_LIMIT });
+  expect(await edge.solver.solve(textTask(256))).toBeNull();
+  expect(edge.llm.streamedBytes()).toBe(TEXT_REPLY_LIMIT);
+
+  // A declared length is held to the same limit: at it the reply is read, a byte over it is refused.
+  const declaredAt = await setUp({ stream: TEXT_REPLY_LIMIT, declared: true });
+  expect(await declaredAt.solver.solve(textTask(256))).toBeNull();
+  const declaredOver = await setUp({ stream: TEXT_REPLY_LIMIT + 1, declared: true });
+  expect(await rejection(declaredOver.solver.solve(textTask(256)))).toMatchObject({
+    code: "REPLY_TOO_LARGE",
+  });
+
+  // Questions that overlap each have their own limit.
+  const both = await setUp({ stream: TEXT_REPLY_LIMIT + 1 });
+  const [tight, roomy] = await Promise.allSettled([
+    both.solver.solve(textTask(256)),
+    both.solver.solve(textTask(4096)),
+  ]);
+  expect(tight).toMatchObject({ status: "rejected", reason: { code: "REPLY_TOO_LARGE" } });
+  expect(roomy).toEqual({ status: "fulfilled", value: null });
+});
+
+test("an_error_reply_is_held_to_the_same_limit", async () => {
+  // A failing server can send a body as large as it likes too. It is the size that is reported,
+  // whatever the status was.
+  const { llm, solver } = await setUp({ status: 502, body: "x".repeat(2 * MIB) });
+
+  const failure = await rejection(solver.solve(textTask(256)));
+
+  expect(failure).toMatchObject({
+    name: "LlmError",
+    code: "REPLY_TOO_LARGE",
+    message: TOO_LARGE_MESSAGE,
+  });
+  expect(llm.requests).toHaveLength(1);
+});
+
+test("a_reply_with_the_most_thinking_the_solver_allows_is_read_and_answered_and_one_byte_more_is_not", async () => {
+  const limit = 10;
+  const thinking = (bytes: number) =>
+    `<think>${"x".repeat(bytes - "<think></think>ok".length)}</think>ok`;
+
+  // The reply's text is as long as the answer's limit and the room for thinking allow: the JSON
+  // round it is under what the first layer allows too, so it is read whole and the answer is "ok".
+  const fits = await setUp(thinking(limit + MIB));
+  expect(decode(await fits.solver.solve(textTask(limit)))).toBe("ok");
+
+  // A byte more of thinking is more than the second layer allows: no answer, and no error, since
+  // it is within what the first layer reads.
+  const over = await setUp(thinking(limit + MIB + 1));
+  expect(await over.solver.solve(textTask(limit))).toBeNull();
+});
+
 // ---- The real seeds -----------------------------------------------------------------------------
 
 test("the_checks_accept_the_winning_answer_of_every_real_seed_and_the_prompt_carries_its_task", async () => {

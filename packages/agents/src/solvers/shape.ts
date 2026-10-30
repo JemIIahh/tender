@@ -33,9 +33,10 @@ const THINK_OPEN = /^\s*<think>/;
 /**
  * How many bytes a reply may have beyond the limit of the answer in it: room for the thinking that
  * a reasoning model sends first, which is not held to that limit. A reply with more is dropped
- * unread (`checkAnswer`), as a server can make a reply as large as it likes.
+ * unread (`checkAnswer`), as a server can make a reply as large as it likes. The LLM solver stops
+ * reading a server's reply a little past this, while it streams in (`replyLimit` of `llm.ts`).
  */
-const MAX_THINKING_BYTES = 1_048_576;
+export const MAX_THINKING_BYTES = 1_048_576;
 /** A function name that can be checked for: a plain identifier, in ASCII. */
 const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 /** A reply that is one fenced block and nothing else: the fence, its body, the closing fence. */

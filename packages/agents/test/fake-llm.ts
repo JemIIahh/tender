@@ -1,4 +1,9 @@
-import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import {
+  createServer,
+  type IncomingHttpHeaders,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import type { AddressInfo } from "node:net";
 
 // A stand-in for an OpenAI-compatible model server (NEAR AI Cloud is one): `POST /v1/chat/completions`
@@ -25,13 +30,21 @@ export interface RecordedRequest {
  * - `{ raw }`: a 200 whose JSON is `raw`, for an answer that is no chat completion;
  * - `"hang"`: no answer at all, the connection left open;
  * - `"stall"`: the status line, the headers and the start of a body, and then nothing, the
- *   connection left open: a server that fell silent in the middle of its answer.
+ *   connection left open: a server that fell silent in the middle of its answer;
+ * - `{ stream }`: a 200 whose JSON is a completion of exactly that many bytes (a long text in its
+ *   message), written in pieces as the client takes them, so that a client that hangs up stops it;
+ *   `streamedBytes` counts what was written. Open-ended (chunked) unless `declared` is set, which
+ *   gives it a Content-Length that says how long it is;
+ * - `{ declares }`: a 200 whose Content-Length declares that many bytes, of which it sends a few
+ *   and then falls silent with the connection open: a server that says more than it sends.
  */
 export type FakeReply =
   | string
   | { content: string | null; finishReason?: string | null }
   | { status: number; body?: unknown }
   | { raw: unknown }
+  | { stream: number; declared?: boolean }
+  | { declares: number }
   | "hang"
   | "stall";
 
@@ -45,6 +58,8 @@ export interface FakeLlm {
    * client, and rejects after 5 seconds if they have not been: a cancelled call closes its connection.
    */
   dropped(count?: number): Promise<void>;
+  /** How many bytes of `{ stream }` replies the fake has written so far, all requests together. */
+  streamedBytes(): number;
   stop(): Promise<void>;
 }
 
@@ -79,6 +94,60 @@ function completion(model: unknown, content: string | null, finishReason: string
   };
 }
 
+/** The start and the end of a completion whose text is `a` all through, between the two. */
+const STREAM_HEAD =
+  '{"id":"chatcmpl-fake","object":"chat.completion","created":1700000000,"model":"m",' +
+  '"choices":[{"index":0,"message":{"role":"assistant","content":"';
+const STREAM_TAIL = '"},"finish_reason":"stop"}]}';
+const PIECE_BYTES = 65_536;
+const FILLER = Buffer.alloc(PIECE_BYTES, "a");
+
+/** Resolves when `response` can take more, or is closed. */
+function drained(response: ServerResponse): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      response.off("drain", done);
+      response.off("close", done);
+      resolve();
+    };
+    response.on("drain", done);
+    response.on("close", done);
+  });
+}
+
+/**
+ * Writes a completion of exactly `size` bytes in pieces, each once the one before has gone out, and
+ * stops when the client has hung up. `wrote` is told each piece's length as it is handed over.
+ */
+async function streamCompletion(
+  response: ServerResponse,
+  size: number,
+  declared: boolean,
+  wrote: (bytes: number) => void,
+): Promise<void> {
+  const text = size - STREAM_HEAD.length - STREAM_TAIL.length;
+  if (text < 0) throw new Error(`a streamed completion is at least ${size - text} bytes`);
+  response.writeHead(
+    200,
+    declared
+      ? { "content-type": "application/json", "content-length": String(size) }
+      : { "content-type": "application/json" },
+  );
+  const pieces = function* (): Generator<Buffer> {
+    yield Buffer.from(STREAM_HEAD);
+    for (let left = text; left > 0; left -= PIECE_BYTES) {
+      yield FILLER.subarray(0, Math.min(PIECE_BYTES, left));
+    }
+    yield Buffer.from(STREAM_TAIL);
+  };
+  for (const piece of pieces()) {
+    if (response.destroyed) return;
+    wrote(piece.length);
+    if (!response.write(piece)) await drained(response);
+  }
+  response.end();
+}
+
 /**
  * Starts the fake. `script` is the list of replies, one for each request in turn; once it runs out
  * the last one is given again, so a one-reply script answers every request alike.
@@ -87,6 +156,7 @@ export async function startFakeLlm(script: FakeReply | FakeReply[]): Promise<Fak
   const replies = Array.isArray(script) ? script : [script];
   const requests: RecordedRequest[] = [];
   let droppedCount = 0;
+  let streamed = 0;
   const waiting: Array<{ count: number; resolve: () => void }> = [];
 
   const server: Server = createServer((request, response) => {
@@ -119,6 +189,21 @@ export async function startFakeLlm(script: FakeReply | FakeReply[]): Promise<Fak
         // No content-length, so the body is open-ended: the client has a 200 and waits for the rest.
         response.writeHead(200, { "content-type": "application/json" });
         response.write('{"id":"chatcmpl-fake","object":"chat.completion","choices":[');
+        return;
+      }
+      if (typeof reply === "object" && "stream" in reply) {
+        await streamCompletion(response, reply.stream, reply.declared === true, (bytes) => {
+          streamed += bytes;
+        });
+        return;
+      }
+      if (typeof reply === "object" && "declares" in reply) {
+        // The length is the lie: a few bytes go out and no more, with the connection left open.
+        response.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": String(reply.declares),
+        });
+        response.write('{"id":"chatcmpl-fake",');
         return;
       }
       let status = 200;
@@ -161,6 +246,7 @@ export async function startFakeLlm(script: FakeReply | FakeReply[]): Promise<Fak
         });
       });
     },
+    streamedBytes: () => streamed,
     async stop() {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));

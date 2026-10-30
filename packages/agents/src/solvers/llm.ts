@@ -1,9 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import type { Brief, PublicCriteria } from "@tender/shared";
-import OpenAI from "openai";
+import OpenAI, { type ClientOptions } from "openai";
 import type { Solver, TaskContext } from "../types";
-import { answerLimit, canAnswer, checkAnswer, entryOf } from "./shape";
+import { answerLimit, canAnswer, checkAnswer, entryOf, MAX_THINKING_BYTES } from "./shape";
 
 // The solver that thinks: it asks a model for the answer to a task, and gives the runner that answer
 // only if it has the shape the brief asks for (`checkAnswer`). The model is any OpenAI-compatible
@@ -22,6 +22,12 @@ import { answerLimit, canAnswer, checkAnswer, entryOf } from "./shape";
 //   anyway it makes no request and gives no answer (null). It warns once an hour. A request counts
 //   when it is made, also when it fails or runs out of time (the model may have charged for it); a
 //   task declined before it is asked does not.
+// - A reply is read up to a limit and no further: the answer's limit, the room for a reasoning
+//   model's thinking, and the JSON round the text. The client buffers a whole reply before anything
+//   can be checked, and a server can send as much as it likes, so the limit is held while the reply
+//   streams in: a declared Content-Length over it is refused at the headers, the bytes are counted
+//   as they come, and the request is cancelled when the total passes it. The check on the text
+//   itself (`checkAnswer`) stays behind it as a second layer.
 // - The prompt holds the task and nothing else: the brief's words, the answer format and its limit,
 //   and the public criteria with their examples. It holds no key, no variable of the environment,
 //   no account, no hash and no URL of the task's own record.
@@ -51,6 +57,11 @@ const MAX_COMPLETION_TOKENS = 16_384;
  * a blob (256 KiB), and a stranger's task does not get to spend the key's credits on that.
  */
 const MAX_TASK_BYTES = 65_536;
+/**
+ * How many bytes of a reply the JSON round the model's text may take beyond the text: the
+ * completion's id, model and usage, and the escapes in the text.
+ */
+const JSON_OVERHEAD_BYTES = 65_536;
 
 export interface LlmSolverOptions {
   /** The base URL of the OpenAI-compatible API: the requests go to `{baseUrl}/chat/completions`. */
@@ -85,13 +96,20 @@ export interface LlmSolverOptions {
 }
 
 /** Why a model call failed. The code is what a log line shows of it. */
-export type LlmErrorCode = "TIMEOUT" | "REQUEST_FAILED" | "BAD_RESPONSE" | `HTTP_${number}`;
+export type LlmErrorCode =
+  | "TIMEOUT"
+  | "REPLY_TOO_LARGE"
+  | "REQUEST_FAILED"
+  | "BAD_RESPONSE"
+  | `HTTP_${number}`;
 
 /**
  * A model call that failed. Its message is the solver's own and holds nothing the call was made
  * with or got back, so it is safe to print; the runner prints the name and the code only.
  *
  * - `TIMEOUT`: no complete answer within `timeoutMs`; the request was cancelled;
+ * - `REPLY_TOO_LARGE`: the server's reply is over what the solver reads, by the length it declared
+ *   or by the bytes that came, whatever its status; the request was cancelled;
  * - `HTTP_<status>`: the server refused or failed (`HTTP_401` is a key it does not accept);
  * - `REQUEST_FAILED`: the server could not be reached, or its reply could not be read;
  * - `BAD_RESPONSE`: the server answered, and what it sent is no chat completion.
@@ -226,6 +244,82 @@ function contentOf(completion: OpenAI.Chat.Completions.ChatCompletion): string |
   return typeof content === "string" ? content : null;
 }
 
+/**
+ * The most bytes of the server's reply that the solver reads for a task: the answer's limit, the
+ * room for the thinking that comes before it (`MAX_THINKING_BYTES`), and the JSON round the text.
+ * The reply's text is held to its own, smaller limit by `checkAnswer`; this one is what the solver
+ * will read of a reply at all.
+ */
+function replyLimit(brief: Brief): number {
+  return answerLimit(brief) + MAX_THINKING_BYTES + JSON_OVERHEAD_BYTES;
+}
+
+/** The error of a reply that passed its limit. Fixed: nothing the server sent is in it. */
+function replyTooLarge(): LlmError {
+  return new LlmError(
+    "REPLY_TOO_LARGE",
+    "the model server's reply is larger than the solver reads, and the request was cancelled",
+  );
+}
+
+/**
+ * A `fetch` that hands the client at most `limit` bytes of a reply. The client reads a whole reply
+ * into memory before anything of it can be checked, so the limit is held while the bytes come in:
+ *
+ * - a reply that declares a Content-Length over the limit is refused as soon as its headers are
+ *   in, and none of its body is read;
+ * - any other reply is counted as its body streams, and is cut off when the total passes the limit.
+ *   What is counted is what the body hands over, after any decompression, so a small reply that
+ *   unpacks into a large one is cut as well.
+ *
+ * Both call `exceeded` first, which cancels the request through the caller's controller: the
+ * connection is closed, and the server's sending stops. Both are the same error in the end.
+ */
+function cappedFetch(limit: number, exceeded: () => void): NonNullable<ClientOptions["fetch"]> {
+  return async (input, init) => {
+    const response = await fetch(input, init);
+    const declared = response.headers.get("content-length")?.trim();
+    if (declared !== undefined && /^\d+$/.test(declared) && Number(declared) > limit) {
+      exceeded();
+      void response.body?.cancel().catch(() => undefined);
+      throw replyTooLarge();
+    }
+    if (response.body === null) return response;
+
+    const reader = response.body.getReader();
+    let total = 0;
+    const counted = new ReadableStream<Uint8Array>(
+      {
+        // Read on demand, one chunk for each read of the client's, so that the count is of what
+        // the client has taken and the server is held back by the connection while it is not.
+        async pull(controller) {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.close();
+            return;
+          }
+          total += value.byteLength;
+          if (total > limit) {
+            exceeded();
+            void reader.cancel().catch(() => undefined);
+            controller.error(replyTooLarge());
+            return;
+          }
+          controller.enqueue(value);
+        },
+        // The client giving up on the body (the request was cancelled) gives up on the source's.
+        cancel: (reason) => reader.cancel(reason).catch(() => undefined),
+      },
+      { highWaterMark: 0 },
+    );
+    return new Response(counted, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  };
+}
+
 function isHttpUrl(value: string): boolean {
   try {
     const { protocol } = new URL(value);
@@ -269,7 +363,8 @@ export function createLlmSolver(o: LlmSolverOptions): Solver {
   }
 
   const model = o.model;
-  const client = new OpenAI({
+  /** What each question's client is made with, bar the `fetch` that holds the reply to its limit. */
+  const clientOptions: ClientOptions = {
     baseURL: o.baseUrl,
     apiKey: o.apiKey,
     defaultHeaders: o.headers,
@@ -284,7 +379,7 @@ export function createLlmSolver(o: LlmSolverOptions): Solver {
     maxRetries: 0,
     // Its own log lines would quote requests, which hold a stranger's task and the caller's headers.
     logLevel: "off",
-  });
+  };
 
   const now = o.now ?? (() => performance.now());
   const log = o.log ?? console.log;
@@ -339,9 +434,27 @@ export function createLlmSolver(o: LlmSolverOptions): Solver {
     return new LlmError("REQUEST_FAILED", "the request to the model server failed");
   }
 
-  /** One question to the model, cancelled at the timeout. The reply's text, or null (`contentOf`). */
-  async function ask(prompt: { system: string; user: string }): Promise<string | null> {
+  /**
+   * One question to the model, cancelled at the timeout, and whose reply is read up to `limit`
+   * bytes. The reply's text, or null (`contentOf`). The client is made for the question, as the
+   * limit is the task's and questions can overlap.
+   */
+  async function ask(
+    prompt: { system: string; user: string },
+    limit: number,
+  ): Promise<string | null> {
     const controller = new AbortController();
+    // Set by the client's `fetch` just before it cancels the request through `controller` for a
+    // reply that is over `limit`. The cancelling is then not taken for a timeout, and the reply
+    // is not taken for a server's failure, however the client words what it saw.
+    let tooLarge = false;
+    const client = new OpenAI({
+      ...clientOptions,
+      fetch: cappedFetch(limit, () => {
+        tooLarge = true;
+        controller.abort();
+      }),
+    });
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const completion = await client.chat.completions.create(
@@ -357,7 +470,7 @@ export function createLlmSolver(o: LlmSolverOptions): Solver {
       );
       return contentOf(completion);
     } catch (error) {
-      throw failureOf(error, controller.signal.aborted);
+      throw tooLarge ? replyTooLarge() : failureOf(error, controller.signal.aborted);
     } finally {
       clearTimeout(timer);
     }
@@ -376,7 +489,7 @@ export function createLlmSolver(o: LlmSolverOptions): Solver {
       // The last way to say no without asking: a task declined above neither uses a request of the
       // hour nor warns of the limit.
       if (!takeCall()) return null;
-      const reply = await ask(prompt);
+      const reply = await ask(prompt, replyLimit(ctx.brief));
       return reply === null ? null : checkAnswer(reply, ctx.brief, ctx.criteria);
     },
   };
