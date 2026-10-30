@@ -75,7 +75,8 @@ export interface McpDeps {
    * error text in an answer that succeeded; a bearer token and a URL are cut whether listed or not.
    * `commit_result` refuses a result that holds one, since a reveal would publish it, and
    * `reveal_result` looks again at the work it is about to upload: as it is or in a disguise
-   * (best effort; see `secretCheck`).
+   * (best effort; see `secretCheck`). So do the tools that publish a document (`post_task`,
+   * `pick_winners` and `register_agent`), before anything is uploaded or paid.
    */
   secrets?: readonly string[];
 }

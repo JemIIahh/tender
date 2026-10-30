@@ -1,6 +1,7 @@
+import { canonicalJson } from "@tender/shared";
 import { baseDecode, baseEncode } from "near-api-js";
 import { expect, test } from "vitest";
-import { secretCheck, urlCredentials } from "../src/secrets";
+import { documentText, secretCheck, urlCredentials } from "../src/secrets";
 
 // A private key as near-api-js writes it: `ed25519:` and the base58 of 64 bytes, the 32 of the seed
 // and the 32 of the public half. The bytes are made up (and the same on every run).
@@ -492,4 +493,74 @@ test("a_credential_is_kept_at_eight_characters_and_not_at_seven", () => {
   expect(urlCredentials("https://user123:pass123@rpc.example.com/")).toEqual([]);
   // The written spelling can be long enough where the unescaped one is not, and each is judged alone.
   expect(urlCredentials("https://rpc.example.com/?key=a%40b%40c%40")).toEqual(["a%40b%40c%40"]);
+});
+
+// ---- Documents -------------------------------------------------------------------------------
+
+/** The text of `document` as a reader has it, as a string. */
+const textOf = (document: unknown) => Buffer.from(documentText(document)).toString("utf8");
+
+test("the_text_of_a_document_is_its_keys_and_strings_one_to_a_line_in_order", () => {
+  expect(textOf("just a string")).toBe("just a string");
+  expect(
+    textOf({ title: "T", tags: ["a", "b"], output: { format: "json", max_bytes: 4096 } }),
+  ).toBe(["title", "T", "tags", "a", "b", "output", "format", "json", "max_bytes"].join("\n"));
+  // Arrays of arrays and of objects are opened too, each member in its place.
+  expect(textOf([["x", { k: ["y"] }], "z"])).toBe(["x", "k", "y", "z"].join("\n"));
+  // The numbers, the booleans and null are not text, and a key whose value is one still is.
+  expect(textOf({ n: 1, ok: true, none: null, s: "kept" })).toBe(
+    ["n", "ok", "none", "s", "kept"].join("\n"),
+  );
+  // No text at all is no bytes at all.
+  for (const empty of [{}, [], null, 7, true, undefined]) {
+    expect(documentText(empty), String(empty)).toHaveLength(0);
+  }
+  // Anything that is no JSON value is let alone, and the strings around it are kept.
+  const odd = { f: () => 1, big: 10n, s: Symbol("x"), text: "kept" };
+  expect(textOf(odd)).toBe(["f", "big", "s", "text", "kept"].join("\n"));
+});
+
+test("the_escapes_of_a_document_are_read_in_its_text", () => {
+  const note = 'one\ntwo\tthree\u0000four\r\n"five" \\ six';
+  // The bytes spell a line break, a tab and a NUL out; the text has the characters.
+  const bytes = Buffer.from(canonicalJson({ note })).toString("utf8");
+  expect(bytes).toContain("one\\ntwo\\tthree\\u0000four");
+  expect(textOf({ note })).toBe(`note\n${note}`);
+});
+
+test("a_copy_that_the_escapes_of_json_hide_is_found_in_the_text_of_the_document", () => {
+  // The key in base64, wrapped over lines as a PEM block is. In the bytes of a document each break
+  // is a backslash and a letter in the middle of it, so the bytes alone show nothing; the text does.
+  const wrapped = text(KEY, "base64").replace(/(.{20})/g, "$1\n");
+  // And the key's text in UTF-16, whose NULs are six characters each in the bytes.
+  const utf16 = Buffer.from(KEY, "utf16le").toString("utf8");
+  for (const [how, note] of [
+    ["wrapped base64", `see below\n${wrapped}`],
+    ["wrapped with CR LF", text(KEY, "base64").replace(/(.{20})/g, "$1\r\n")],
+    ["tabs between pieces", KEY.replace(/(.{12})/g, "$1\t")],
+    ["UTF-16", utf16],
+  ] as const) {
+    const document = { title: "t", instructions: note, tags: [] };
+    expect(holds(canonicalJson(document)), `${how}: the bytes`).toBe(false);
+    expect(holds(documentText(document)), `${how}: the text`).toBe(true);
+  }
+});
+
+test("a_secret_is_found_in_a_key_of_a_document_and_in_a_deep_one", () => {
+  expect(holds(documentText({ schema: { properties: { [KEY]: { type: "string" } } } }))).toBe(true);
+  // The text of a document that is nested a hundred thousand deep is made without a stack of calls.
+  let deep: unknown = ["the end", KEY];
+  for (let level = 0; level < 100_000; level++) deep = { next: deep };
+  expect(holds(documentText(deep))).toBe(true);
+  // A document with nothing of the secret in it holds none, whatever is around it.
+  expect(holds(documentText({ title: "t", instructions: `ed25519:${BODY.slice(1)}` }))).toBe(false);
+});
+
+test("a_document_that_holds_itself_is_read_once", () => {
+  const loop: Record<string, unknown> = { name: "round" };
+  loop.again = [loop, { inner: loop }];
+  expect(textOf(loop)).toBe(["name", "round", "again", "inner"].join("\n"));
+  // An object that comes up twice is read where it first comes, and not again.
+  const twice = { x: "once" };
+  expect(textOf({ a: twice, b: [twice] })).toBe(["a", "x", "once", "b"].join("\n"));
 });

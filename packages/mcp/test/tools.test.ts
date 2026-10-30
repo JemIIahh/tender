@@ -4253,10 +4253,187 @@ test("a_pending_draft_that_holds_a_secret_is_not_sent_again", async () => {
   expect((await draftOf("7")).committedAt).toMatch(ISO);
 });
 
+/** The copies of `REAL_KEY` that can sit in the text of a document: the ones that are text. */
+function textualCopies(): Array<[how: string, copy: string]> {
+  const copies: Array<[string, string]> = [];
+  for (const [how, bytes] of disguisedKeys()) {
+    const text = bytes.toString("utf8");
+    if (Buffer.from(text).equals(bytes)) copies.push([how, text]);
+  }
+  return copies;
+}
+
+test("documents_that_hold_a_secret_are_refused_before_anything_is_uploaded_or_paid", async () => {
+  // A brief, the criteria, a held-out part, a scorecard and a profile are words that an agent wrote
+  // and that are published, so each is looked at for the server's secrets, as it is and in the usual
+  // disguises, before the first upload and before the first payment. The key here is the one the
+  // server signs with. Some disguises are whole only in the text of the document: a line break is
+  // an escape in its bytes.
+  const secrets = secretsOf({ signer: { accountId: ACCOUNT, privateKey: REAL_KEY } });
+  const { call, chain, api } = await connectWrite({
+    keyKind: "full_access",
+    judgeAccount: "judge.testnet",
+    secrets,
+  });
+  chain.storageBalanceOf.mockResolvedValue(null);
+  api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+
+  const { heldout: _heldout, ...noHeldout } = POST_ARGS;
+  const rubric = (criterion: string) => ({
+    ...noHeldout,
+    criteria: {
+      version: 1,
+      kind: "rubric",
+      min_score: 80,
+      split: "winner_take_all",
+      has_heldout: false,
+      rubric: [{ criterion, weight: 1 }],
+    },
+  });
+  const documents: Array<
+    [what: string, tool: string, make: (text: string) => Record<string, unknown>]
+  > = [
+    ["the brief", "post_task", (text) => ({ ...POST_ARGS, instructions: text })],
+    ["the public criteria", "post_task", rubric],
+    [
+      "the held-out document",
+      "post_task",
+      (text) => ({ ...POST_ARGS, heldout: { exact: { expected: [text] } } }),
+    ],
+    [
+      "the scorecard",
+      "pick_winners",
+      (text) => ({
+        task_id: "7",
+        winners: SCORECARD.winners,
+        scorecard: {
+          ...SCORECARD,
+          entries: SCORECARD.entries.map((entry) => ({ ...entry, reasons: [text] })),
+        },
+      }),
+    ],
+    ["the profile", "register_agent", (text) => ({ ...PROFILE, description: text })],
+  ];
+
+  for (const [what, tool, make] of documents) {
+    for (const [how, copy] of textualCopies()) {
+      const answer = await call(tool, make(copy));
+      const label = `${how} in ${what}`;
+
+      expect(answer.isError, label).toBe(true);
+      expect(answer.text, label).toMatch(
+        new RegExp(`^SECRET_IN_CONTENT: ${what} holds a secret.*${tool} would upload it`),
+      );
+      // It never quotes what it found.
+      expect(answer.text, label).not.toContain(REAL_KEY);
+      expect(answer.text, label).not.toContain(baseEncode(KEY_BYTES));
+    }
+  }
+  // Nothing was uploaded, asked of the API or the chain, paid or sent.
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+  expect(api.uploadHeldout).not.toHaveBeenCalled();
+  expect(api.getTask).not.toHaveBeenCalled();
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.postTask).not.toHaveBeenCalled();
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(chain.registerAgent).not.toHaveBeenCalled();
+
+  // The same documents without a secret go up, and so do texts that only look like one: the public
+  // half of the key in the same disguises, and the curve's name.
+  const publicHalf = Buffer.from(KEY_BYTES.subarray(32));
+  const harmless = [
+    `ed25519:${baseEncode(publicHalf)}`,
+    publicHalf.toString("base64"),
+    publicHalf.toString("hex"),
+    "ed25519: the curve, and no key",
+  ];
+  for (const text of harmless) {
+    for (const [what, tool, make] of documents) {
+      const answer = await call(tool, make(text));
+      expect(answer.isError, `${text} in ${what}: ${answer.text}`).toBe(false);
+    }
+  }
+  expect(api.uploadBlob).toHaveBeenCalled();
+  expect(chain.postTask).toHaveBeenCalled();
+  expect(chain.pick).toHaveBeenCalled();
+  expect(chain.registerAgent).toHaveBeenCalled();
+});
+
+test("a_secret_in_a_later_document_of_a_task_stops_the_first_from_going_up", async () => {
+  // post_task uploads a brief, the criteria and a held-out part. A secret in any of them stops all:
+  // not the first upload, and not the one before the payment.
+  const secrets = secretsOf({ signer: { accountId: ACCOUNT, privateKey: REAL_KEY } });
+  const { call, chain, api } = await connectWrite({
+    keyKind: "full_access",
+    judgeAccount: "judge.testnet",
+    secrets,
+  });
+
+  const answer = await call("post_task", {
+    ...POST_ARGS,
+    heldout: { exact: { expected: [`the answer is ${REAL_KEY}`] } },
+  });
+
+  expect(answer.isError).toBe(true);
+  expect(answer.text).toMatch(/^SECRET_IN_CONTENT: the held-out document holds a secret/);
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+  expect(api.uploadHeldout).not.toHaveBeenCalled();
+  expect(chain.postTask).not.toHaveBeenCalled();
+
+  // And the same task without it is posted, brief first, held-out part next, money last.
+  expect((await call("post_task", POST_ARGS)).isError).toBe(false);
+  expect(api.uploadBlob).toHaveBeenCalledTimes(2);
+  expect(api.uploadHeldout).toHaveBeenCalledTimes(1);
+  expect(chain.postTask).toHaveBeenCalledTimes(1);
+});
+
+test("a_secret_made_of_digits_is_found_in_the_bytes_of_a_document", async () => {
+  // The text of a document has no numbers, and its bytes do, so a secret that is a number (a numeric
+  // password, say) is found only in the bytes that go up.
+  const { call, api, chain } = await connectWrite({
+    keyKind: "full_access",
+    judgeAccount: "judge.testnet",
+    secrets: ["246813579135"],
+  });
+  const { heldout: _heldout, ...noHeldout } = POST_ARGS;
+  const tests = (input: number) => ({
+    ...noHeldout,
+    criteria: {
+      version: 1,
+      kind: "tests",
+      min_score: 80,
+      split: "winner_take_all",
+      has_heldout: false,
+      language: "js",
+      entry: "solve",
+      examples: [{ input, output: 1 }],
+    },
+  });
+
+  const refused = await call("post_task", tests(246_813_579_135));
+
+  expect(refused.isError).toBe(true);
+  expect(refused.text).toMatch(/^SECRET_IN_CONTENT: the public criteria holds a secret/);
+  expect(refused.text).not.toContain("246813579135");
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+  expect(chain.postTask).not.toHaveBeenCalled();
+
+  // A number that is not the secret goes up, even one that is most of it.
+  expect((await call("post_task", tests(24_681_357_913))).isError).toBe(false);
+  expect(chain.postTask).toHaveBeenCalledTimes(1);
+});
+
 test("the_descriptions_say_that_the_secret_check_is_best_effort", async () => {
   const { mcp } = await connect({});
   const { tools } = await mcp.listTools();
-  for (const name of ["commit_result", "reveal_result"]) {
+  for (const name of [
+    "commit_result",
+    "reveal_result",
+    "post_task",
+    "pick_winners",
+    "register_agent",
+  ]) {
     const description = tools.find((tool) => tool.name === name)?.description ?? "";
     expect(description, name).toMatch(/SECRET_IN_CONTENT/);
     expect(description, name).toMatch(/best[- ]effort/i);

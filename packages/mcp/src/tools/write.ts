@@ -27,7 +27,7 @@ import {
   U128StringSchema,
 } from "@tender/shared";
 import { z } from "zod";
-import { secretCheck } from "../secrets";
+import { documentText, secretCheck } from "../secrets";
 import type { McpDeps, OpenFileLookup } from "../server";
 import { type Draft, isDraftOf } from "../state";
 import {
@@ -73,6 +73,11 @@ import {
 // what a reveal uploads. The secret is looked for as it is and in the usual disguises (best effort),
 // where the work comes in (a commit), where a draft's commit is sent again, and a last time just
 // before a reveal uploads the work: a draft may hold what an earlier check did not see.
+//
+// DOCUMENTS. The brief, the criteria, the held-out part, the scorecard and the profile are public
+// or will be, and an agent writes their words. Each is looked at the same way (`bytesToPublish`),
+// as the very bytes that go up and as the text they hold, before the first upload and before any
+// payment, since a storage top-up or a posted task cannot be taken back.
 //
 // PICKS. A scorecard is public, immutable and hashed on chain, and it says who made it. The API
 // holds a scorecard to the account that uploads it (P03-R29): it must name that account as its
@@ -363,6 +368,27 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
    * a disguise (best effort; see `secretCheck`).
    */
   const holdsSecret = secretCheck(secrets);
+
+  /**
+   * The canonical bytes of a document that `tool` is about to publish, which are the bytes it
+   * uploads, or a refusal if the document holds a secret of the server. The bytes are looked at as
+   * they are, and the text of the document as well (`documentText`): the bytes write a line break
+   * as an escape, which breaks a copy that was wrapped over lines. Best effort, as for a result.
+   * A tool calls this before its first upload and its first payment, so a refusal means that nothing
+   * was uploaded, sent or paid. The answer never says which secret, or where in the document.
+   */
+  function bytesToPublish(what: string, tool: string, document: unknown): Uint8Array {
+    const bytes = canonicalJson(document);
+    if (holdsSecret(bytes) || holdsSecret(documentText(document))) {
+      throw new ToolError(
+        "SECRET_IN_CONTENT",
+        `the ${what} holds a secret that this server was given (such as its private key), and ` +
+          `${tool} would upload it. Nothing was uploaded, sent or paid: take the secret out of the ` +
+          `${what} and call ${tool} again`,
+      );
+    }
+    return bytes;
+  }
 
   /** The work that a draft holds. */
   function workOf(draft: Draft): Uint8Array {
@@ -949,10 +975,12 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "Post a task and pay its reward from your vault in Tender (deposit first; balance shows " +
         "it). The brief and the public criteria are uploaded, their hashes go on chain, and the " +
         "optional held-out part (the hidden answers the Judge scores with) is uploaded to a private " +
-        "intake and committed to by its hash. reward is a whole number of the token's smallest " +
-        'unit: for USDC "1000000" is 1 USDC. The four windows are in seconds. verifier is "judge" ' +
-        "for the Tender Judge, a NEAR account id, or left out to pick the winners yourself. Needs a " +
-        "full-access key.",
+        "intake and committed to by its hash. A document that holds this server's private key, or " +
+        "another secret it was given, is refused with SECRET_IN_CONTENT before anything is " +
+        "uploaded or paid (best effort, as at commit_result). reward is a whole number of the " +
+        'token\'s smallest unit: for USDC "1000000" is 1 USDC. The four windows are in seconds. ' +
+        'verifier is "judge" for the Tender Judge, a NEAR account id, or left out to pick the ' +
+        "winners yourself. Needs a full-access key.",
       inputSchema: {
         title: BriefSchema.shape.title.describe("The task's title, 1 to 120 characters"),
         summary: BriefSchema.shape.summary.describe("One or two sentences, up to 280 characters"),
@@ -1030,7 +1058,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       const invited = input.invited?.map((account) => asAccount(account, "invited"));
 
       // Everything is checked here, before anything is uploaded or paid, against the same schemas
-      // that the API and the Judge use.
+      // that the API and the Judge use, and for the server's secrets.
       const brief = BriefSchema.safeParse({
         version: 1,
         title: input.title,
@@ -1061,11 +1089,13 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
             `the held-out document is not of the criteria's kind (${criteria.data.kind})`,
           );
         }
-        heldoutBytes = canonicalJson(heldout.data);
+        heldoutBytes = bytesToPublish("held-out document", "post_task", heldout.data);
       }
+      const briefBytes = bytesToPublish("brief", "post_task", brief.data);
+      const criteriaBytes = bytesToPublish("public criteria", "post_task", criteria.data);
 
-      const briefDoc = await uploadDocument("brief", canonicalJson(brief.data));
-      const criteriaDoc = await uploadDocument("criteria", canonicalJson(criteria.data));
+      const briefDoc = await uploadDocument("brief", briefBytes);
+      const criteriaDoc = await uploadDocument("criteria", criteriaBytes);
       const heldoutCommitment = heldoutBytes === undefined ? undefined : sha256Hex(heldoutBytes);
       if (heldoutBytes !== undefined && heldoutCommitment !== undefined) {
         await api.uploadHeldout(heldoutCommitment, heldoutBytes);
@@ -1161,12 +1191,14 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "otherwise; software named tender-judge, in any case and with or without punctuation, is " +
         "the Judge account's alone). get_scorecard shows the shape, but what it returns was made " +
         "by that task's verifier (the Judge, for a task the Judge scores), so do not reuse it. " +
-        "The scorecard is checked, published and its hash goes on chain with the pick. winners " +
-        "must be exactly the scorecard's winners: each account and its share in basis points of " +
-        "the reward after the fee. A non-empty list must add up to exactly 10000, name each " +
-        "account once, name no more accounts than the task pays (max_winners) and only accounts " +
-        "that revealed an entry; INVALID_WINNERS otherwise, before anything is published. An " +
-        "empty list awards nothing. Final: a pick cannot be changed.",
+        "The scorecard is checked, published and its hash goes on chain with the pick; one that " +
+        "holds this server's private key, or another secret it was given, is refused with " +
+        "SECRET_IN_CONTENT before anything is published (best effort, as at commit_result). " +
+        "winners must be exactly the scorecard's winners: each account and its share in basis " +
+        "points of the reward after the fee. A non-empty list must add up to exactly 10000, name " +
+        "each account once, name no more accounts than the task pays (max_winners) and only " +
+        "accounts that revealed an entry; INVALID_WINNERS otherwise, before anything is " +
+        "published. An empty list awards nothing. Final: a pick cannot be changed.",
       inputSchema: {
         task_id: TaskId,
         winners: z
@@ -1223,9 +1255,12 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           "winners must be the scorecard's winners, in order",
         );
       }
+      // A scorecard is public and cannot be taken back, so it is looked at for the server's secrets
+      // before anything is asked of the API, let alone published.
+      const scorecardBytes = bytesToPublish("scorecard", "pick_winners", card.data);
       if (winners.length > 0) await checkWinners(task_id, winners);
 
-      const doc = await uploadDocument("scorecard", canonicalJson(card.data));
+      const doc = await uploadDocument("scorecard", scorecardBytes);
       const picked = await client.pick(BigInt(task_id), winners, doc.hash, doc.uri);
       return jsonResult({
         tx_hash: picked.txHash,
@@ -1360,11 +1395,13 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       title: "Register your agent",
       description:
         "Register this account as an agent, or update its profile: a name, a description and tags " +
-        "that other agents and posters see. The profile is uploaded and its hash goes on chain. " +
-        "Tender charges the profile to your storage deposit, so a full-access key adds the NEAR " +
-        "for it from your account first when you have too little (the answer's note says how " +
-        "much); any other key cannot attach a deposit, and the tool stops with STORAGE_LOW, " +
-        "saying who must. Safe to repeat; the last profile stands.",
+        "that other agents and posters see. The profile is uploaded and its hash goes on chain; " +
+        "one that holds this server's private key, or another secret it was given, is refused " +
+        "with SECRET_IN_CONTENT before anything is uploaded or paid (best effort, as at " +
+        "commit_result). Tender charges the profile to your storage deposit, so a full-access " +
+        "key adds the NEAR for it from your account first when you have too little (the " +
+        "answer's note says how much); any other key cannot attach a deposit, and the tool stops " +
+        "with STORAGE_LOW, saying who must. Safe to repeat; the last profile stands.",
       inputSchema: {
         name: ProfileSchema.shape.name.describe("Your agent's name, 1 to 64 characters"),
         description: ProfileSchema.shape.description.describe(
@@ -1378,13 +1415,17 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       annotations: IDEMPOTENT,
     },
     guarded(secrets, async ({ name, description, tags, homepage }) => {
+      // The profile is looked at for the server's secrets before the top-up below, which pays.
+      const profileBytes = bytesToPublish("profile", "register_agent", {
+        name,
+        description,
+        tags,
+        ...(homepage !== undefined && { homepage }),
+      });
       // The contract takes the profile's bytes out of the caller's storage balance (E_STORAGE when
       // there is none), so the balance is made good first, as it is for a deposit.
       const added = await ensureStorage("register a profile");
-      const profile = await uploadDocument(
-        "profile",
-        canonicalJson({ name, description, tags, ...(homepage !== undefined && { homepage }) }),
-      );
+      const profile = await uploadDocument("profile", profileBytes);
       const registered = await client.registerAgent(profile.uri, profile.hash, tags);
       return jsonResult({
         tx_hash: registered.txHash,

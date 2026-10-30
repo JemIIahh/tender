@@ -10,6 +10,9 @@ import { baseDecode, baseEncode } from "near-api-js";
 // taken out (white space, and the NULs between the letters of UTF-16 text), for every copy that is
 // text: wrapped base64, hex in pairs, a key one letter to a line, and UTF-16 of either order are
 // whole again. And in lower case, for hex, whose digits are the same in either.
+//
+// A document is JSON, whose bytes write a line break as an escape, so it is looked at twice: as the
+// bytes that go up, and as the text it holds (`documentText`).
 
 /**
  * A secret shorter than this is looked for as it is and not in disguise: too many texts hold a
@@ -147,6 +150,36 @@ export function secretCheck(secrets: readonly string[]): (bytes: Uint8Array) => 
     const lower = lowerCased(unbroken);
     return hexList.some((needle) => lower.includes(needle));
   };
+}
+
+/**
+ * The text of a JSON document as a reader has it: every key and every string, one to a line, in the
+ * order of the document, with the escapes read. The bytes of a document write a line break or a tab
+ * as a backslash and a letter, and a NUL as six characters, so a copy that was wrapped over lines,
+ * or that has NULs between its letters as UTF-16 text does, is whole again only in this reading. The
+ * numbers and the rest are left out, and so is anything that is no JSON value. It walks with a
+ * stack of its own, since a document can be nested deep, and meets a shared object once.
+ */
+export function documentText(document: unknown): Uint8Array {
+  const lines: string[] = [];
+  const seen = new Set<object>();
+  // Each item is a string to write down or a value to open. The last one goes first, so the members
+  // of an array or an object are pushed backwards (a key above its value) to come out in order.
+  const pending: unknown[] = [document];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value === "string") {
+      lines.push(value);
+    } else if (typeof value === "object" && value !== null && !seen.has(value)) {
+      seen.add(value);
+      if (Array.isArray(value)) {
+        for (let at = value.length - 1; at >= 0; at--) pending.push(value[at]);
+      } else {
+        for (const [key, member] of Object.entries(value).reverse()) pending.push(member, key);
+      }
+    }
+  }
+  return Buffer.from(lines.join("\n"));
 }
 
 // ---- Credentials in a URL --------------------------------------------------------------------
