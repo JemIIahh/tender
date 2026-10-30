@@ -12,7 +12,7 @@ import {
   FIXTURE_OPTIONS,
 } from "@tender/indexer/testing";
 import { ApiError, canonicalJson, type Scorecard, sha256Hex } from "@tender/shared";
-import type { Hono } from "hono";
+import { Hono } from "hono";
 import { KeyPair } from "near-api-js";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "vitest";
 import { type ApiDeps, createApp } from "../src/index";
@@ -116,7 +116,7 @@ type Handler = (request: Request) => Response | Promise<Response>;
 /**
  * Serves what `build` makes of the URL it is served at, on an ephemeral port of the loopback
  * interface. The port is known only once it is bound, and the API signs a sign-in for its own
- * host, port included: so the app is made after the server is, from the URL it is at.
+ * base URL, port included: so the app is made after the server is, from the URL it is at.
  */
 function listen(build: (url: string) => Handler): Promise<{ server: ServerType; url: string }> {
   return new Promise((resolve) => {
@@ -158,11 +158,12 @@ async function connect(over: Partial<ApiDeps> = {}) {
 }
 
 /** A client of the API at `url`, as alice, with a key of its own and the time the API keeps. */
-function clientOf(url: string) {
+function clientOf(url: string, fetchImpl?: typeof fetch) {
   const key = KeyPair.fromRandom("ed25519");
   const client = new ApiClient({
     baseUrl: url,
     signer: { accountId: alice, privateKey: key.toString() },
+    fetchImpl,
     now: () => Number(TEST_NOW / 1_000_000n),
   });
   return { client, key };
@@ -360,8 +361,8 @@ test("a_sign_in_the_api_refuses_is_an_api_error_and_is_not_retried", async () =>
 
 /**
  * A server at an address of its own that passes every request on to the API at `target`, as a
- * hostile `baseUrl` would. With `renamed` it also names itself as the recipient of the challenges
- * it passes back. `passed` lists what it was asked.
+ * hostile `baseUrl` would. With `renamed` it also names itself, by its base URL, as the recipient
+ * of the challenges it passes back. `passed` lists what it was asked.
  */
 function relayTo(target: string, passed: string[], renamed: boolean): (url: string) => Handler {
   return (url) => async (request) => {
@@ -377,7 +378,7 @@ function relayTo(target: string, passed: string[], renamed: boolean): (url: stri
     const text = await upstream.text();
     const answer =
       renamed && pathname === "/v1/auth/challenge"
-        ? JSON.stringify({ ...JSON.parse(text), recipient: new URL(url).host })
+        ? JSON.stringify({ ...JSON.parse(text), recipient: url })
         : text;
     return new Response(answer, {
       status: upstream.status,
@@ -397,19 +398,19 @@ test("a_server_that_passes_the_apis_challenge_on_gets_no_token", async () => {
     return { ...clientOf(relay.url), passed };
   };
 
-  // As the API made it, the challenge names the API's host, and this client called the relay's:
-  // it signs nothing, so the relay has no signature to present to the API, and does not ask. (An
-  // API whose public URL is not the address its clients call looks the same to a client.)
+  // As the API made it, the challenge names the API's base URL, and this client called the
+  // relay's: it signs nothing, so the relay has no signature to present to the API, and does not
+  // ask. (An API whose public URL is not the address its clients call looks the same to a client.)
   const plain = await viaRelay(false);
   const refused = await rejection(plain.client.signIn());
   expect(refused).not.toBeInstanceOf(ApiError);
   expect((refused as Error).message).toBe(
-    "refusing to sign the API's sign-in challenge: its recipient is not the host of baseUrl",
+    "refusing to sign the API's sign-in challenge: its recipient is not this client's baseUrl",
   );
   expect(plain.passed).toEqual(["POST /v1/auth/challenge"]);
 
-  // Renamed to the relay's own host, the challenge is signed, for that host. The API takes a
-  // signature for its own host only, so what the relay passes on to it is refused.
+  // Renamed to the relay's own base URL, the challenge is signed, for that. The API takes a
+  // signature for its own base URL only, so what the relay passes on to it is refused.
   const renamed = await viaRelay(true);
   const error = await apiError(renamed.client.signIn());
   expect(error.status).toBe(401);
@@ -419,4 +420,53 @@ test("a_server_that_passes_the_apis_challenge_on_gets_no_token", async () => {
   // By neither way was a token made, for anyone.
   expect(await count("auth_tokens")).toBe(0);
   expect(await count("auth_challenges")).toBe(2);
+});
+
+test("two_apis_under_paths_of_one_host_do_not_take_each_others_sign_ins", async () => {
+  // Two real APIs, /a and /b of one server and so of one host, on one database: all that tells a
+  // sign-in to one from a sign-in to the other is whom it is signed for.
+  const both = await listen((url) => {
+    const root = new Hono();
+    root.route("/a", createApp({ ...deps, publicUrl: `${url}/a` }));
+    root.route("/b", createApp({ ...deps, publicUrl: `${url}/b` }));
+    return (request) => root.fetch(request);
+  });
+  cleanups.push(() => stop(both.server));
+
+  // A path in the public URL is no obstacle to signing in to either.
+  for (const path of ["/a", "/b"]) {
+    expect(await clientOf(`${both.url}${path}`).client.signIn(), path).toMatch(
+      /^[A-Za-z0-9_-]{43}$/,
+    );
+  }
+  expect(await count("auth_tokens")).toBe(2);
+  await deps.db.exec("truncate auth_challenges, auth_tokens");
+
+  const verifyAt = (path: string, body: string) =>
+    fetch(`${both.url}${path}/v1/auth/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+  for (const [from, to] of [
+    ["/a", "/b"],
+    ["/b", "/a"],
+  ] as const) {
+    // What a client signs for `from`, caught on its way: the verify is not sent.
+    let signed: string | undefined;
+    const caught = ((input, init) => {
+      if (!String(input).endsWith("/auth/verify")) return fetch(input, init);
+      signed = String(init?.body);
+      return Promise.reject(new Error("held back"));
+    }) as typeof fetch;
+    await rejection(clientOf(`${both.url}${from}`, caught).client.signIn());
+    expect(signed, from).toBeDefined();
+
+    // The other API refuses it, though it knows the nonce, and the one it is for takes it.
+    const refused = await verifyAt(to, signed as string);
+    expect(refused.status, `${from} signed, shown at ${to}`).toBe(401);
+    expect(await refused.json()).toMatchObject({ error: "wrong_recipient" });
+    const taken = await verifyAt(from, signed as string);
+    expect(taken.status, `${from} signed, shown at ${from}`).toBe(200);
+  }
 });

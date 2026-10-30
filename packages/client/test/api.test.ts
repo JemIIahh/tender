@@ -22,16 +22,16 @@ import { ApiClient } from "../src/index";
 
 // `ApiClient` over a fake API. The fake's `fetch` notes each call (with the `this` it was called
 // with) and answers it from the routes a test gives it. Its sign-in is the real protocol: it
-// issues a nonce and names its own host as the recipient, and accepts a verify only if the
-// recipient is that host and the signature holds, which near-api-js checks. That is its own
+// issues a nonce and names its own base URL as the recipient, and accepts a verify only if the
+// recipient is that and the signature holds, which near-api-js checks. That is its own
 // NEP-413, not the serializer of `@tender/client` that the client signs with, so the two are held
 // against each other. The clock is a field, so that a test can move the time of the
 // API and of the client together. The round trip against the real app is
 // packages/api/test/apiclient.test.ts.
 
 const BASE = "https://api.test";
-/** Whom a sign-in to `BASE` is signed for: the host of the API's own URL. */
-const HOST = "api.test";
+/** Whom a sign-in to `BASE` is signed for: the API's own base URL, as it spells it. */
+const RECIPIENT = "https://api.test";
 const ACCOUNT = "alice.test.near";
 const KEY = KeyPair.fromRandom("ed25519");
 const SIGNER = { accountId: ACCOUNT, privateKey: KEY.toString() };
@@ -236,7 +236,7 @@ async function signatureHolds(body: VerifyBody): Promise<boolean> {
 
 /**
  * A stand-in for the API. Sign-in is answered by the fake itself: it knows `ACCOUNT` and `KEY`,
- * names `host` as the recipient of its challenges, takes a sign-in for that host only, and hands
+ * names `recipient` in its challenges, takes a sign-in for that only, and hands
  * out `token-1`, `token-2` and so on, each good for 12 hours from `clock.now`. Any other
  * route is answered by the handlers given to `on`; the latest one that matches wins, and a route
  * that none matches is a 404. A handler for a route named exactly (`"POST /v1/auth/challenge"`)
@@ -256,7 +256,7 @@ function fakeApi() {
     return json({
       nonce,
       message: "Sign in to Tender",
-      recipient: api.host,
+      recipient: api.recipient,
       expires_at: new Date(api.clock.now + 5 * MINUTE).toISOString(),
       ...api.tamper?.(api.challenges),
     });
@@ -270,8 +270,8 @@ function fakeApi() {
     if (body.account_id !== ACCOUNT || body.public_key !== KEY.getPublicKey().toString()) {
       return json(refusal("key_not_found"), 401);
     }
-    // As the real API does: only a signature for its own host is taken.
-    if (body.recipient !== api.host) return json(refusal("wrong_recipient"), 401);
+    // As the real API does: only a signature for its own base URL is taken.
+    if (body.recipient !== api.recipient) return json(refusal("wrong_recipient"), 401);
     if (!(await signatureHolds(body))) return json(refusal("bad_signature"), 401);
     const token = `token-${api.tokens.length + 1}`;
     api.tokens.push(token);
@@ -288,8 +288,8 @@ function fakeApi() {
     /** The tokens handed out, in order. */
     tokens: [] as string[],
     clock: { now: START },
-    /** Whom the fake names in its challenges and holds a sign-in to: the host of its own URL. */
-    host: HOST,
+    /** Whom the fake names in its challenges and holds a sign-in to: its own base URL. */
+    recipient: RECIPIENT,
     challenges: 0,
     verifies: 0,
     /** Answers every verify with a 401. */
@@ -658,8 +658,8 @@ test("sign_in_sends_a_signature_that_nep413_accepts", async () => {
   expect(sent.account_id).toBe(ACCOUNT);
   expect(sent.public_key).toBe(KEY.getPublicKey().toString());
   expect(sent.message).toBe("Sign in to Tender");
-  // Whom it is signed for is the host of the API's URL, which is `BASE`.
-  expect(sent.recipient).toBe(HOST);
+  // Whom it is signed for is the API's own base URL, which is `BASE`.
+  expect(sent.recipient).toBe(RECIPIENT);
 
   // The check is not vacuous: the same signature is refused for anything else.
   expect(await signatureHolds(sent)).toBe(true);
@@ -894,7 +894,7 @@ const REFUSED = {
   message:
     "refusing to sign the API's sign-in challenge: its message is not that of a Tender sign-in",
   recipient:
-    "refusing to sign the API's sign-in challenge: its recipient is not the host of baseUrl",
+    "refusing to sign the API's sign-in challenge: its recipient is not this client's baseUrl",
   nonce: "refusing to sign the API's sign-in challenge: its nonce is not that of a Tender sign-in",
 };
 
@@ -905,16 +905,29 @@ test("only_a_challenge_that_is_this_apis_own_is_signed", async () => {
   const sign = vi.spyOn(KeyPairEd25519.prototype, "sign");
   const bytes = (length: number) => Buffer.alloc(length, 1).toString("base64");
   const wrong: Array<[string, Record<string, string>, keyof typeof REFUSED]> = [
-    // The recipient is the host of `BASE`, spelled as the API spells it: `api.test`.
-    ["another host", { recipient: "evil.near" }, "recipient"],
+    // The recipient is `BASE`, spelled as the API spells it: `https://api.test`.
+    ["another API", { recipient: "https://evil.test" }, "recipient"],
     ["the recipient every API used to have", { recipient: "tender" }, "recipient"],
-    ["the host in capitals", { recipient: "API.TEST" }, "recipient"],
-    ["the host with a space", { recipient: "api.test " }, "recipient"],
-    ["the host with a port the URL does not have", { recipient: "api.test:8443" }, "recipient"],
-    ["the host with its scheme", { recipient: "https://api.test" }, "recipient"],
-    ["the host with a path", { recipient: "api.test/v1" }, "recipient"],
-    ["a host that ends with it", { recipient: "evil.api.test" }, "recipient"],
-    ["a host that starts with it", { recipient: "api.test.evil.example" }, "recipient"],
+    ["the host alone", { recipient: "api.test" }, "recipient"],
+    ["the base in capitals", { recipient: "https://API.TEST" }, "recipient"],
+    ["the base with a space", { recipient: "https://api.test " }, "recipient"],
+    ["the base with a trailing slash", { recipient: "https://api.test/" }, "recipient"],
+    [
+      "the base with a port the URL does not have",
+      { recipient: "https://api.test:8443" },
+      "recipient",
+    ],
+    ["the base over http", { recipient: "http://api.test" }, "recipient"],
+    ["the base with the version it sits under", { recipient: "https://api.test/v1" }, "recipient"],
+    ["a path on the same host", { recipient: "https://api.test/other" }, "recipient"],
+    ["a host that ends with it", { recipient: "https://evil.api.test" }, "recipient"],
+    ["a host that starts with it", { recipient: "https://api.test.evil.example" }, "recipient"],
+    ["the base with something in front", { recipient: "xhttps://api.test" }, "recipient"],
+    [
+      "the base after another address",
+      { recipient: "https://evil.test/https://api.test" },
+      "recipient",
+    ],
     ["no recipient", { recipient: "" }, "recipient"],
     ["another message", { message: "Send 1000 NEAR to evil.near" }, "message"],
     ["the message in other letters", { message: "sign in to tender" }, "message"],
@@ -970,7 +983,7 @@ test("a_refused_challenge_leaves_nothing_behind", async () => {
 
 test("a_challenge_relayed_from_another_api_is_not_signed", async () => {
   // A server that is not the API asks the real API for a challenge and passes it on. Its message
-  // and nonce are good, and its recipient is the real API's host. If the client signed it, the
+  // and nonce are good, and its recipient is the real API's base URL. If the client signed it, the
   // server could present the signature to the real API as the client's own sign-in.
   const sign = vi.spyOn(KeyPairEd25519.prototype, "sign");
   const real = fakeApi();
@@ -990,13 +1003,13 @@ test("a_challenge_relayed_from_another_api_is_not_signed", async () => {
   expect(passive.verifies).toBe(0);
   expect(passive.to("/v1/tasks/7/start")).toHaveLength(0);
 
-  // Naming itself instead, the server gets the client to sign for the server's own host. The real
-  // API takes a signature for its own host only, so what the server passes on to it is refused,
-  // and no token is made.
+  // Naming itself instead, the server gets the client to sign for the server's own base URL. The
+  // real API takes a signature for its own base URL only, so what the server passes on to it is
+  // refused, and no token is made.
   const active = fakeApi();
   active.on("POST /v1/auth/challenge", async () => {
     const challenge = await (await relayed()).json();
-    return json({ ...challenge, recipient: "evil.test" });
+    return json({ ...challenge, recipient: "https://evil.test" });
   });
   active.on("POST /v1/auth/verify", (call) =>
     real.fetch(`${BASE}/v1/auth/verify`, { method: "POST", body: call.body }),
@@ -1009,56 +1022,88 @@ test("a_challenge_relayed_from_another_api_is_not_signed", async () => {
   expect(real.tokens).toEqual([]);
 });
 
-test("the_recipient_is_the_host_of_the_base_url", async () => {
-  // Whom the API names, for the URL a client calls it at: the host, in lower case, with the port
-  // only if it is not the default of the scheme. Nothing else of the URL is part of it.
+test("a_challenge_of_another_path_on_the_same_host_is_not_signed", async () => {
+  // Two APIs can be served under paths of one host. The one at /other is relayed to a client of
+  // the one at /tender: the host is the same, and the base URL is not.
+  const sign = vi.spyOn(KeyPairEd25519.prototype, "sign");
+  const clientAt = (baseUrl: string, api: FakeApi) =>
+    new ApiClient({ baseUrl, signer: SIGNER, fetchImpl: api.fetch, now: () => api.clock.now });
+
+  for (const baseUrl of ["https://host.example/tender", "https://host.example/tender/v1/"]) {
+    const relayed = fakeApi();
+    relayed.recipient = "https://host.example/other";
+    const error = await rejection(clientAt(baseUrl, relayed).signIn());
+    expect(error, baseUrl).not.toBeInstanceOf(ApiError);
+    expect((error as Error).message, baseUrl).toBe(REFUSED.recipient);
+    expect(relayed.verifies, baseUrl).toBe(0);
+    expect(sign).not.toHaveBeenCalled();
+
+    // The challenge of the API at this path is signed, and so is the same one under the version.
+    const own = fakeApi();
+    own.recipient = "https://host.example/tender";
+    expect(await clientAt(baseUrl, own).signIn(), baseUrl).toBe("token-1");
+    const verify = own.calls.find((call) => call.url.pathname.endsWith("/auth/verify"));
+    expect(verify?.url.pathname, baseUrl).toBe("/tender/v1/auth/verify");
+    expect(JSON.parse(verify?.body ?? "null").recipient, baseUrl).toBe(own.recipient);
+    sign.mockClear();
+  }
+});
+
+test("the_recipient_is_the_base_url", async () => {
+  // Whom the API names, for the URL a client calls it at: the scheme and host in lower case, the
+  // port only if it is not the default of the scheme, and the path without a trailing slash or a
+  // final /v1. Nothing else of the URL is part of it.
   const named: Array<[string, string]> = [
-    ["https://api.test", "api.test"],
-    ["https://api.test/v1/", "api.test"],
-    ["https://api.test/tender/v1", "api.test"],
-    ["https://API.Test", "api.test"],
-    ["https://api.test:443", "api.test"],
-    ["https://api.test:8443/tender", "api.test:8443"],
-    ["https://someone:secret@api.test", "api.test"],
-    ["http://localhost", "localhost"],
-    ["http://localhost:8787", "localhost:8787"],
-    ["HTTP://LOCALHOST:80", "localhost"],
-    ["http://127.0.0.1:3000/v1", "127.0.0.1:3000"],
-    ["http://[::1]:8787", "[::1]:8787"],
-    ["https://bücher.example", "xn--bcher-kva.example"],
+    ["https://api.test", "https://api.test"],
+    ["https://api.test/v1/", "https://api.test"],
+    ["https://API.Test", "https://api.test"],
+    ["https://api.test:443", "https://api.test"],
+    ["https://api.test:8443/tender", "https://api.test:8443/tender"],
+    ["https://host.example/tender/v1", "https://host.example/tender"],
+    ["https://someone:secret@api.test", "https://api.test"],
+    ["http://localhost", "http://localhost"],
+    ["http://localhost:8787", "http://localhost:8787"],
+    ["HTTP://LOCALHOST:80", "http://localhost"],
+    ["http://127.0.0.1:3000/v1", "http://127.0.0.1:3000"],
+    ["http://[::1]:8787", "http://[::1]:8787"],
+    ["https://bücher.example", "https://xn--bcher-kva.example"],
   ];
   const clientAt = (baseUrl: string, api: FakeApi) =>
     new ApiClient({ baseUrl, signer: SIGNER, fetchImpl: api.fetch, now: () => api.clock.now });
 
-  for (const [baseUrl, host] of named) {
+  for (const [baseUrl, recipient] of named) {
     const api = fakeApi();
-    api.host = host;
+    api.recipient = recipient;
     expect(await clientAt(baseUrl, api).signIn(), baseUrl).toBe("token-1");
-    // What was signed, and sent, is that host.
+    // What was signed, and sent, is that.
     const verify = api.calls.find((call) => call.url.pathname.endsWith("/auth/verify"));
-    expect(JSON.parse(verify?.body ?? "null").recipient, baseUrl).toBe(host);
+    expect(JSON.parse(verify?.body ?? "null").recipient, baseUrl).toBe(recipient);
   }
 
   // Any other spelling is refused, with nothing signed: not the wrong port, nor the default one
-  // written out, nor capitals, nor a path or a URL where a host belongs.
+  // written out, nor capitals, nor a path that is not the base's, nor a host where a base belongs.
   const sign = vi.spyOn(KeyPairEd25519.prototype, "sign");
   const other: Array<[string, string]> = [
-    ["https://api.test:8443/tender", "api.test"],
-    ["https://api.test:8443", "api.test:8444"],
-    ["https://api.test", "api.test:443"],
-    ["https://api.test/tender", "api.test/tender"],
-    ["https://api.test", "https://api.test"],
-    ["https://api.test", "api.test."],
-    ["https://API.Test", "API.Test"],
-    ["http://localhost:8787", "localhost"],
-    ["http://[::1]:8787", "::1"],
+    ["https://api.test:8443/tender", "https://api.test"],
+    ["https://api.test:8443", "https://api.test:8444"],
+    ["https://api.test", "https://api.test:443"],
+    ["https://api.test/tender", "https://api.test"],
+    ["https://api.test", "https://api.test/tender"],
+    ["https://api.test", "https://api.test/"],
+    ["https://api.test", "https://api.test/v1"],
+    ["https://api.test", "api.test"],
+    ["https://api.test", "http://api.test"],
+    ["https://api.test", "https://api.test."],
+    ["https://API.Test", "https://API.Test"],
+    ["http://localhost:8787", "http://localhost"],
+    ["http://[::1]:8787", "http://[::1]"],
   ];
-  for (const [baseUrl, host] of other) {
+  for (const [baseUrl, recipient] of other) {
     const api = fakeApi();
-    api.host = host;
+    api.recipient = recipient;
     const error = await rejection(clientAt(baseUrl, api).signIn());
-    expect((error as Error).message, `${baseUrl} named as ${host}`).toBe(REFUSED.recipient);
-    expect(api.verifies, `${baseUrl} named as ${host}`).toBe(0);
+    expect((error as Error).message, `${baseUrl} named as ${recipient}`).toBe(REFUSED.recipient);
+    expect(api.verifies, `${baseUrl} named as ${recipient}`).toBe(0);
   }
   expect(sign).not.toHaveBeenCalled();
 });

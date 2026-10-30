@@ -55,10 +55,10 @@ export interface ApiClientOptions {
    * Where the API is served, as `PUBLIC_API_URL` has it: `https://api.example`. The client adds
    * `/v1`, so a trailing slash and a trailing `/v1` are both dropped. With a `signer` it must be
    * https, or http to this machine (`localhost`, `127.0.0.1` or `[::1]`): the signature and the
-   * bearer token travel to it. Its host, and its port if that is not the default, are also whom
-   * the sign-in is signed for (`signInRecipientOf`), so they have to be those of the API's own
-   * `PUBLIC_API_URL`: an API reached under another name, an address in place of its domain, say,
-   * is refused at sign-in.
+   * bearer token travel to it. It is also whom the sign-in is signed for (`signInRecipientOf`:
+   * the scheme, the host, the port if that is not the default, and the path), so it has to name
+   * the API as the API's own `PUBLIC_API_URL` does: an API reached under another name, an
+   * address in place of its domain, say, is refused at sign-in.
    */
   baseUrl: string;
   /**
@@ -186,11 +186,11 @@ function isNonce(nonce: string): boolean {
 /**
  * Why a challenge is not signed. It names the field and never quotes it: the text comes from a
  * server that is not trusted, and an error is read by people and by agents. A recipient that is
- * not the host of `baseUrl` can also be an API whose `PUBLIC_API_URL` is not the host it is called
- * at, which is why the error says what the recipient should have been.
+ * not `baseUrl` can also be an API whose `PUBLIC_API_URL` is not the address it is called at,
+ * which is why the error says what the recipient should have been.
  */
 function refusal(field: "message" | "recipient" | "nonce"): Error {
-  const wanted = field === "recipient" ? "the host of baseUrl" : "that of a Tender sign-in";
+  const wanted = field === "recipient" ? "this client's baseUrl" : "that of a Tender sign-in";
   return new Error(`refusing to sign the API's sign-in challenge: its ${field} is not ${wanted}`);
 }
 
@@ -246,10 +246,11 @@ async function readCapped(res: Response, limit: number): Promise<Uint8Array | nu
  * the token dropped, signs in again and is sent once more, and a second 401 is thrown.
  *
  * The server at `baseUrl` is not trusted with the key. A challenge is signed only if its message
- * is `SIGN_IN_MESSAGE`, its recipient is the host of `baseUrl` (`signInRecipientOf`) and its nonce
- * is 32 bytes in base64; any other is refused, with nothing signed. The recipient is what ties a
- * signature to this API: a server that hands over the challenge of another API, to use there what
- * the key signs, is refused because that challenge names the host of the other API and not its own.
+ * is `SIGN_IN_MESSAGE`, its recipient is `baseUrl` as the API names itself (`signInRecipientOf`)
+ * and its nonce is 32 bytes in base64; any other is refused, with nothing signed. The recipient
+ * is what ties a signature to this API: a server that hands over the challenge of another API, to
+ * use there what the key signs, is refused because that challenge names the base of the other
+ * API and not this one's, even when the other is under another path of the same host.
  * A client with a signer needs an https `baseUrl` (http only to this machine), as the signature
  * and the token go to it, and no request follows a redirect, so the server cannot send them on.
  *
@@ -457,8 +458,8 @@ export class ApiClient implements TenderApi {
     const { message, nonce, recipient } = challenge;
     // The server chose all three, and the key signs them: only a Tender sign-in for this API is
     // signed, and nothing a server that is not Tender's would put in its place. The recipient is
-    // the host of `baseUrl`, as the API puts the host of its own public URL there. A server that
-    // passes on the challenge of another API, to use there what the key signs, names that API.
+    // `baseUrl`, as the API puts its own public URL there. A server that passes on the challenge
+    // of another API, to use there what the key signs, names that API.
     if (message !== SIGN_IN_MESSAGE) throw refusal("message");
     if (recipient !== signInRecipientOf(this.baseUrl)) throw refusal("recipient");
     if (!isNonce(nonce)) throw refusal("nonce");

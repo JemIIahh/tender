@@ -8,26 +8,35 @@
 export const SIGN_IN_MESSAGE = "Sign in to Tender";
 
 /**
- * Whom the wallet signs it for: the API itself, named by the host of its URL, in lower case, with
- * the port only when it is not the default of the scheme. `https://API.example:443/v1/` and
- * `https://api.example` are both `api.example`, and `http://127.0.0.1:8787` is `127.0.0.1:8787`.
- * The scheme, the user and the path are not part of it.
+ * Whom the wallet signs it for: the API itself, named by its base URL. That is the scheme and the
+ * host in lower case, the port only when it is not the default of the scheme, and the path with
+ * its trailing slashes and a final `/v1` (which the routes sit under) taken off. The query, the
+ * fragment and the user are no part of it. `https://API.example:443/v1/` is `https://api.example`,
+ * `http://127.0.0.1:8787` is itself, and `https://host.example/tender/v1` is
+ * `https://host.example/tender`.
  *
  * The API takes it from its own `publicUrl` and a client from its `baseUrl`, so the two have to
- * name the same host. A name that every API shared would let a server hand a client the challenge
- * of another API and then use, there, what the client signed. A signature for this host is good at
- * this host only.
+ * name the same base. A name that every API shared would let a server hand a client the challenge
+ * of another API and then use, there, what the client signed. A host alone would not do for two
+ * APIs under paths of one host, and the scheme tells an API from the same address over http. A
+ * signature for one base is good at that base only.
  *
  * Throws for text that is not an absolute URL with a host. The error does not quote the URL, which
  * can hold a password.
  */
 export function signInRecipientOf(url: string): string {
-  let host = "";
+  let parsed: URL | undefined;
   try {
-    host = new URL(url).host.toLowerCase();
+    parsed = new URL(url);
   } catch {
     // Not a URL at all: refused below, as a URL with no host is.
   }
-  if (host === "") throw new Error("a sign-in recipient is the host of an absolute URL");
-  return host;
+  const host = parsed?.host.toLowerCase() ?? "";
+  if (parsed === undefined || host === "") {
+    throw new Error("a sign-in recipient needs an absolute URL with a host");
+  }
+  // The path is the parser's: dot segments are gone, and a URL with no path has `/`.
+  let path = parsed.pathname.replace(/\/+$/, "");
+  if (path.endsWith("/v1")) path = path.slice(0, -"/v1".length).replace(/\/+$/, "");
+  return `${parsed.protocol}//${host}${path}`;
 }

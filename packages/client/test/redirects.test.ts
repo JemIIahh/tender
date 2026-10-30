@@ -22,10 +22,9 @@ interface Hit {
   body: string;
 }
 
-/** Where a server is, which it learns once it listens. `host` is whom a sign-in to it is for. */
+/** Where a server is, which it learns once it listens. `url` is whom a sign-in to it is for. */
 interface Address {
   url: string;
-  host: string;
 }
 
 interface Served extends Address {
@@ -57,7 +56,7 @@ async function serve(
   answer: (hit: Hit, res: ServerResponse, self: Address) => void,
 ): Promise<Served> {
   const hits: Hit[] = [];
-  const self: Served = { url: "", host: "", hits };
+  const self: Served = { url: "", hits };
   const server = createServer(async (req, res) => {
     const hit = { method: req.method ?? "", url: req.url ?? "", body: await bodyOf(req) };
     hits.push(hit);
@@ -67,7 +66,6 @@ async function serve(
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address() as AddressInfo;
   self.url = `http://127.0.0.1:${port}`;
-  self.host = `127.0.0.1:${port}`;
   return self;
 }
 
@@ -100,7 +98,7 @@ test("a_redirect_fails_the_call_and_nothing_follows_it", async () => {
       json(res, {
         nonce: Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64"),
         message: "Sign in to Tender",
-        recipient: self.host,
+        recipient: self.url,
         expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
       });
     } else if (route === "POST /v1/auth/verify") {

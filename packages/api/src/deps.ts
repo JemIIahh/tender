@@ -26,9 +26,10 @@ export interface ApiDeps {
   /** The Tender contract the indexer follows. */
   contractId: string;
   /**
-   * The base URL the API is served at, with no trailing slash. Blob URIs are built from it, and its
-   * host is whom every sign-in is signed for (`signInRecipientOf`): a client signs in only if that
-   * is the host it called, so it has to be the host the clients use.
+   * The base URL the API is served at, with no trailing slash. Blob URIs are built from it, and it
+   * is whom every sign-in is signed for (`signInRecipientOf`: its scheme, host and path, without
+   * a trailing `/v1`): a client signs in only if its own base URL names the same, so it has to be
+   * the address the clients use.
    */
   publicUrl: string;
   /** Accounts the team runs. Posters and entrants among them are labelled as ours. */
