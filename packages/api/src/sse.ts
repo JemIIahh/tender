@@ -199,6 +199,29 @@ async function pump(
 }
 
 /**
+ * The timing of the streams of one `eventRoutes`: the defaults, with the fields of `override` that
+ * are set laid over them. A field that is `undefined` is not set, as a setting that is not there
+ * arrives that way and must not replace a default with nothing. A field that is set to anything but
+ * a positive, finite number is a mistake: `setTimeout` turns it into a wait of a millisecond, so a
+ * stream would poll without pause, or end at once. It is refused here, with an error that names
+ * the field, when the routes are made, and not found out by the first client.
+ */
+function resolveTiming(override: Partial<SseTiming>): SseTiming {
+  const timing = { ...DEFAULT_TIMING };
+  for (const field of Object.keys(timing) as Array<keyof SseTiming>) {
+    const value = override[field];
+    if (value === undefined) continue;
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new RangeError(
+        `eventRoutes: ${field} must be a positive, finite number of milliseconds, not ${String(value)}`,
+      );
+    }
+    timing[field] = value;
+  }
+  return timing;
+}
+
+/**
  * Destroys `connection` once `graceMs` have passed, unless the response has been sent by then.
  * Aborting a stream frees its place, but a client that stopped reading would keep the connection,
  * and everything queued on it, until it chose to close it; a client that is only slow has the
@@ -244,9 +267,12 @@ function destroyUnlessFinished(connection: ServerResponse | undefined, graceMs: 
  *
  * A failure after the stream has begun cannot change the status. The stream ends, the error is
  * logged and the client, which reconnects with the id it has, loses nothing.
+ *
+ * `timing` is for a test, which shortens the waits. It sets the fields it names; see `resolveTiming`
+ * for what is made of the rest, and for what is refused.
  */
 export function eventRoutes(deps: ApiDeps, timing: Partial<SseTiming> = {}): Hono {
-  const clock: SseTiming = { ...DEFAULT_TIMING, ...timing };
+  const clock = resolveTiming(timing);
   const app = new Hono();
   // The streams open now. It belongs to this app: one app is one process in production.
   let open = 0;

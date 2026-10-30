@@ -909,7 +909,9 @@ test("sse_a_client_that_is_ended_at_its_lifetime_picks_up_where_it_was", async (
   // What a browser does when the server ends the stream: it sees the end, reconnects with the id
   // of the last message it got, and is sent what came after it, once.
   vi.spyOn(Math, "random").mockReturnValue(0.5);
-  const app = appWith({}, { pollMs: 10, pingMs: 60_000, lifetimeMs: 200 });
+  // A whole second, for what takes a few milliseconds: the lifetime must not run out on a busy
+  // machine before the first poll has been answered, or the stream ends with nothing sent.
+  const app = appWith({}, { pollMs: 10, pingMs: 60_000, lifetimeMs: 1_000 });
   await addEvents(...eventsWithIds(1, 2, 3));
 
   const res = await app.request("/v1/events?since=0");
@@ -928,6 +930,88 @@ test("sse_a_client_that_is_ended_at_its_lifetime_picks_up_where_it_was", async (
   await addEvents(...eventsWithIds(4, 5));
   const again = await open(app, "/v1/events", { "Last-Event-ID": "3" });
   expect(ids(await again.take(2))).toEqual(["4", "5"]);
+}, 15_000);
+
+// ---- The timing -------------------------------------------------------------------------------
+
+test("sse_a_timing_that_is_undefined_leaves_the_default_in_place", async () => {
+  // A setting that is not there arrives as `undefined`. It must leave the default where it is, and
+  // not turn it into nothing: a stream that polls every millisecond, or that ends after one.
+  const { db, polls } = idleDb();
+  const unset = {
+    pollMs: undefined,
+    pingMs: undefined,
+    lifetimeMs: undefined,
+    closeGraceMs: undefined,
+  };
+  const app = appWith({ db }, unset);
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const connection = { writableFinished: false, destroy: vi.fn() };
+  const stream = listen(await app.request("/v1/events", {}, { outgoing: connection }));
+
+  // A poll each second ...
+  await vi.advanceTimersByTimeAsync(999);
+  expect(polls()).toBe(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(polls()).toBe(2);
+  // ... a ping at 15 seconds ...
+  await vi.advanceTimersByTimeAsync(13_999);
+  expect(stream.frames).toEqual([]);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(stream.frames).toEqual([{ comment: "ping" }]);
+  // ... the end of the stream at ten minutes ...
+  await vi.advanceTimersByTimeAsync(10 * MINUTE - 15_000 - 1);
+  expect(stream.ended).toBe(false);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(stream.ended).toBe(true);
+  // ... and the end of its connection ten seconds later.
+  await vi.advanceTimersByTimeAsync(10_000 - 1);
+  expect(connection.destroy).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(1);
+  expect(connection.destroy).toHaveBeenCalledTimes(1);
+});
+
+test("sse_a_timing_that_is_no_positive_finite_number_is_refused", () => {
+  // Such a wait is turned into a millisecond by `setTimeout`, so the streams would poll without
+  // pause or end at once. The routes refuse it when they are made, and the error names the field
+  // that is wrong and no other.
+  const fields = ["pollMs", "pingMs", "lifetimeMs", "closeGraceMs"] as const;
+  const refused = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1, -0.5];
+  for (const field of fields) {
+    for (const value of refused) {
+      const timing: Partial<SseTiming> = {};
+      timing[field] = value;
+      let thrown: unknown;
+      try {
+        eventRoutes(deps, timing);
+      } catch (error) {
+        thrown = error;
+      }
+      const what = `${field} ${value}`;
+      expect(thrown, what).toBeInstanceOf(RangeError);
+      const message = String((thrown as RangeError).message);
+      expect(message, what).toContain(field);
+      for (const other of fields.filter((name) => name !== field)) {
+        expect(message, what).not.toContain(other);
+      }
+    }
+  }
+
+  // What is not a number at all, as a setting read from the environment would be.
+  for (const value of ["1000", "", null, {}]) {
+    expect(() => eventRoutes(deps, { pollMs: value as unknown as number }), String(value)).toThrow(
+      RangeError,
+    );
+  }
+
+  // Anything that is a positive finite number, and anything that is left out, is accepted.
+  expect(() => eventRoutes(deps)).not.toThrow();
+  expect(() => eventRoutes(deps, {})).not.toThrow();
+  expect(() => eventRoutes(deps, { pollMs: undefined })).not.toThrow();
+  expect(() =>
+    eventRoutes(deps, { pollMs: 1, pingMs: 0.5, lifetimeMs: 1, closeGraceMs: 1 }),
+  ).not.toThrow();
 });
 
 // ---- The cap ----------------------------------------------------------------------------------
@@ -1146,30 +1230,82 @@ test("sse_a_client_that_leaves_while_the_route_is_starting_leaves_nothing_behind
   // No poll follows, though the stream would have polled ten times in this while ...
   await sleep(100);
   expect(polls()).toBe(0);
-  // ... and the only place there is, is free.
+  // ... and the only place there is, is free. It is given back when the query that was held has
+  // returned, which on a busy machine may take longer than the wait above, so it is asked for until
+  // it is free. A refusal opens no stream: what has been polled before the attempt that gets in is
+  // what the stream that was left polled, and that is nothing.
   const hangup = new AbortController();
   cleanups.push(() => hangup.abort());
-  const next = await fetch(`http://127.0.0.1:${port}/v1/events`, { signal: hangup.signal });
-  expect(next.status).toBe(200);
-});
+  let status = 0;
+  let polledBefore = -1;
+  for (const deadline = Date.now() + 3_000; status !== 200 && Date.now() < deadline; ) {
+    polledBefore = polls();
+    const res = await fetch(`http://127.0.0.1:${port}/v1/events`, { signal: hangup.signal });
+    status = res.status;
+    if (status !== 200) {
+      await res.body?.cancel();
+      await sleep(10);
+    }
+  }
+  expect(status).toBe(200);
+  expect(polledBefore).toBe(0);
+}, 15_000);
 
-test("sse_a_client_that_stopped_reading_loses_its_place_and_its_connection", async () => {
-  // Megabyte messages, far more than the two ends of a connection can hold between them, to a
-  // client that reads nothing: the server's write has to wait for it. The stream's loop is stuck
-  // there, so it makes no second poll, and only its lifetime lets it go. The place is free again
-  // from then on, while the client still holds its connection open; the connection is destroyed
-  // later, once the grace is over.
-  vi.spyOn(Math, "random").mockReturnValue(0.5);
-  const rows = Array.from({ length: 64 }, (_, i) => ({
+/** Megabyte messages, far more than the two ends of a connection can hold between them. */
+function megabyteRows() {
+  return Array.from({ length: 64 }, (_, i) => ({
     id: String(i + 1),
     event: "committed",
     data: { task_id: "1", pad: "x".repeat(1_000_000) },
     height: String(1_000 + i),
     task_id: "1",
   }));
-  const { db, polls } = idleDb(rows);
+}
+
+test("sse_a_client_that_stopped_reading_loses_its_place_while_it_keeps_its_connection", async () => {
+  // To a client that reads nothing, the server's write has to wait for it. The stream's loop is
+  // stuck there, so it makes no second poll, and only its lifetime lets it go. The place is free
+  // again from then on, while the client still holds its connection open: the connection has the
+  // grace to go in, and the grace here is far longer than anything that is waited for, so that the
+  // order of the two does not depend on how quick the machine is. Were the place only freed by the
+  // connection's going, it would not be free in the time that this waits for it.
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  const { db, polls } = idleDb(megabyteRows());
+  const timing = { pollMs: 20, pingMs: 60_000, lifetimeMs: 300, closeGraceMs: 60_000 };
+  const { port, sockets } = await serveOnLoopback(appWith({ db, maxSseStreams: 1 }, timing));
+
+  rawClient(port, "/v1/events?since=0", false);
+  const connection = await firstConnection(sockets);
+
+  // Stuck in the write: one poll, and no more, however long it has been.
+  await waitFor(() => polls() >= 1, "the first poll");
+  await sleep(100);
+  expect(polls()).toBe(1);
+
+  // At the lifetime the place is free again, though the client is still there.
+  const hangup = new AbortController();
+  cleanups.push(() => hangup.abort());
+  let freed = false;
+  for (const deadline = Date.now() + 3_000; !freed && Date.now() < deadline; ) {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/events`, { signal: hangup.signal });
+    if (res.status === 200) {
+      freed = true;
+    } else {
+      await res.body?.cancel();
+      await sleep(10);
+    }
+  }
+  expect(freed).toBe(true);
+  expect(connection.destroyed).toBe(false);
+}, 15_000);
+
+test("sse_a_connection_that_is_not_read_is_destroyed_once_the_grace_is_over", async () => {
+  // The same client, with a short grace. It is destroyed, and not before the lifetime and the grace
+  // are both over. How long after is not asserted: a busy machine may be late.
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
+  const { db, polls } = idleDb(megabyteRows());
   const lifetimeMs = 300;
-  const closeGraceMs = 400;
+  const closeGraceMs = 200;
   const timing = { pollMs: 20, pingMs: 60_000, lifetimeMs, closeGraceMs };
   const { port, sockets } = await serveOnLoopback(appWith({ db, maxSseStreams: 1 }, timing));
 
@@ -1181,32 +1317,10 @@ test("sse_a_client_that_stopped_reading_loses_its_place_and_its_connection", asy
     destroyedAt = Date.now();
   });
 
-  // Stuck in the write: one poll, and no more, however long it has been.
   await waitFor(() => polls() >= 1, "the first poll");
-  await sleep(100);
-  expect(polls()).toBe(1);
-
-  // At the lifetime the place is free again, though the client is still there.
-  const hangup = new AbortController();
-  cleanups.push(() => hangup.abort());
-  let freedAt = 0;
-  for (let tries = 0; tries < 300 && freedAt === 0; tries++) {
-    const res = await fetch(`http://127.0.0.1:${port}/v1/events`, { signal: hangup.signal });
-    if (res.status === 200) {
-      freedAt = Date.now();
-    } else {
-      await res.body?.cancel();
-      await sleep(10);
-    }
-  }
-  expect(freedAt).toBeGreaterThan(0);
-
-  // The connection goes later, and not before the grace is over. Were the place only freed by the
-  // connection's going, the two would come the other way round.
-  await waitFor(() => destroyedAt > 0, "the connection to be destroyed");
-  expect(freedAt).toBeLessThan(destroyedAt);
+  await waitFor(() => destroyedAt > 0, "the connection to be destroyed", 10_000);
   expect(destroyedAt - started).toBeGreaterThanOrEqual(lifetimeMs + closeGraceMs - 50);
-});
+}, 15_000);
 
 // ---- Through the whole API --------------------------------------------------------------------
 
