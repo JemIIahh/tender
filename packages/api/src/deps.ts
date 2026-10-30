@@ -39,6 +39,12 @@ export interface ApiDeps {
   telegramBotUsername?: string;
   /** The current time in nanoseconds since the epoch. Default: the wall clock. */
   now?: () => bigint;
+  /**
+   * The most event streams (`GET /v1/events`) this process keeps open at once, a whole number from
+   * 0. Each one polls the database, so this bounds that load. Past it the answer is a 503 with
+   * `Retry-After`, and so it is for a value that is not a number. Default: 200.
+   */
+  maxSseStreams?: number;
 }
 
 /** The time, in nanoseconds, that `deps` says it is. */
