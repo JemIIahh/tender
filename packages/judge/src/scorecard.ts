@@ -30,12 +30,9 @@ const MAX_REASON_CODE_POINTS = 200;
  * document), so that a scorecard nobody could check is never published. The block of an entry is
  * written as a decimal string, as the views write every u64.
  *
- * `heldout` is written as it is given, so pass the document as it was parsed from its bytes
- * (`JSON.parse`), not a copy a schema made of it. A copy loses an own `__proto__` key, and the
- * schema does not look at the value under one, so in `heldout` only `canonicalJson` checks that
- * subtree. It throws on a bigint, a function, NaN, a `Date` or a `Map`, but it counts a member that
- * is `undefined` as absent and writes an instance of a class as a plain object. For the output of
- * `JSON.parse` that changes nothing, and it is why the input has to be exactly that.
+ * `heldout` is the document that `heldoutCommitment` stands for, as parsed from its bytes, and it
+ * is written as it is given. It has to be a value that the shared `JsonValueSchema` takes (JSON
+ * only, with no `__proto__` key and not nested too deeply), and this throws when it is not.
  *
  * An agent does write the text of a reason: Ajv, for one, puts the keys of the agent's JSON in its
  * messages. So each entry keeps at most 3 reasons, each at most 200 code points; one that is
@@ -76,11 +73,9 @@ export function buildScorecard(input: {
     generated_at: input.now.toISOString(),
     judge: { software: "tender-judge/1", model: input.model },
   };
-  // Checked against the schema, but written from the object built here, not from the schema's
-  // copy: a copy made by assignment loses an own `__proto__` key of the held-out document, and the
-  // document would no longer hash to its commitment. The schema neither checks nor copies the
-  // value under such a key, so in `heldout` only `canonicalJson` checks that subtree, which is why
-  // the document has to be what `JSON.parse` gave.
+  // The schema and the hash checks look at the scorecard built here, and the bytes are written
+  // from that same object, not from the copy the schema returns, so that what is published is what
+  // was checked.
   ScorecardSchema.parse(scorecard);
   checkHashes(input.task, input.criteriaHash, input.heldoutCommitment, input.heldout);
   return canonicalJson(scorecard);
@@ -110,7 +105,7 @@ function checkHashes(
     }
     return;
   }
-  // The document as given, not a copy, is what was committed to.
+  // The commitment is the SHA-256 of the document's canonical bytes.
   if (sha256Hex(canonicalJson(heldout)) !== heldoutCommitment) {
     throw new Error("the held-out document does not hash to heldoutCommitment");
   }

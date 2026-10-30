@@ -559,21 +559,36 @@ test("scorecard_fields_come_from_the_inputs", () => {
 });
 
 test("scorecard_publishes_the_heldout_document_exactly", () => {
-  // Anyone can hash the published document and compare it with `heldout_commitment`. A key such
-  // as `__proto__` is valid JSON, and an own property once parsed, but a copy made by assignment
-  // (a schema's, say) loses it, and the check would then fail for a document that was committed.
-  const equals = '{"__proto__":{"a":1},"constructor":2,"10":3,"9":4}';
+  // Anyone can hash the published document and compare it with `heldout_commitment`. Keys that
+  // JavaScript treats in a way of its own, such as `constructor` and the integer-like `10` and `9`
+  // (an object lists those first, in numeric order), must come out of the bytes as the document
+  // had them.
+  const equals = '{"constructor":2,"10":3,"9":4}';
   const heldout = JSON.parse(`{"json_schema":{"assertions":[{"path":"$.x","equals":${equals}}]}}`);
-  // Control: the document does carry the key.
-  expect(JSON.stringify(heldout)).toContain('"__proto__"');
   const commitment = sha256Hex(canonicalJson(heldout));
 
-  // The hash check that `buildScorecard` makes is made on the document as given too, so this
-  // document, which a copy would change, is not refused as a mismatch.
   const bytes = buildScorecard(heldoutInput(heldout, { kind: "json_schema" }));
 
   const shown = (published(bytes) as { heldout: unknown }).heldout;
   expect(sha256Hex(canonicalJson(shown))).toBe(commitment);
+  expect(shown).toEqual(heldout);
+});
+
+test("scorecard_refuses_a_heldout_document_with_a_proto_key", () => {
+  // The shared JSON rules refuse an own `__proto__` key: a schema that builds a new object cannot
+  // keep one, and a document that lost a key hashes differently from the one that was committed.
+  // So such a document is not published even when its hash is the commitment, and the commitment
+  // here is its own: nothing but the schema can be what refuses it.
+  const equals = '{"__proto__":{"a":1}}';
+  const heldout = JSON.parse(`{"json_schema":{"assertions":[{"path":"$.x","equals":${equals}}]}}`);
+  // Control: the document does carry the key, as a key of its own.
+  expect(Object.keys(heldout.json_schema.assertions[0].equals)).toEqual(["__proto__"]);
+
+  const input = heldoutInput(heldout, { kind: "json_schema" });
+  expect(input.heldoutCommitment).toBe(sha256Hex(canonicalJson(heldout)));
+  expect(input.heldoutCommitment).toBe(input.task.heldout_commitment);
+
+  expect(() => buildScorecard(input)).toThrow(/"heldout"[\s\S]*__proto__/);
 });
 
 test("scorecard_numbers_follow_r19", () => {
@@ -760,9 +775,7 @@ test("scorecard_hashes_must_match_the_task", () => {
     expect(() => buildScorecard(scorecardInput(overrides)), label).toThrow(message);
   }
 
-  // Controls: hashes that agree build, with a document and without one. A document with a
-  // `__proto__` key is hashed as it was given: see
-  // scorecard_publishes_the_heldout_document_exactly.
+  // Controls: hashes that agree build, with a document and without one.
   expect(() => buildScorecard(scorecardInput())).not.toThrow();
   expect(() =>
     buildScorecard(
