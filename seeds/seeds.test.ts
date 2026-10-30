@@ -136,6 +136,49 @@ function v8Misses(answer: Uint8Array, cases: { match: string[]; no_match: string
   ];
 }
 
+/**
+ * Holds an extract seed to its item count. A held-out assertion reads one path, so a key that
+ * asserts an array's items one by one cannot see an item added after the last. The public schema
+ * has to fix the count at the solution's, and this shows that it does: with `extra` added at the end
+ * of `array`, the solution still scores 100 once the schema's bounds on that array are taken away,
+ * and falls under the pass mark with them.
+ */
+async function expectItemCountFixed(slug: string, array: string, extra: unknown): Promise<void> {
+  const { criteria, heldout, solution } = load(slug);
+  if (criteria.kind !== "json_schema" || !("json_schema" in heldout)) {
+    throw new Error(`${slug} is not a json_schema seed`);
+  }
+  const answer = JSON.parse(utf8(solution)) as Record<string, unknown>;
+  const items = answer[array];
+  if (!Array.isArray(items)) throw new Error(`${slug}'s solution has no ${array} array`);
+
+  // The key reaches the solution's last item and no further, so the count it knows is the solution's.
+  const reached = heldout.json_schema.assertions.flatMap(({ path }) => {
+    const index = new RegExp(`^\\$\\.${array}\\[(\\d+)\\]`).exec(path)?.[1];
+    return index === undefined ? [] : [Number(index) + 1];
+  });
+  expect(Math.max(...reached), "the key's last item is the solution's last").toBe(items.length);
+
+  const properties = criteria.schema.properties as Record<string, Record<string, unknown>>;
+  const { minItems, maxItems, ...withoutBounds } = properties[array] ?? {};
+  const extended = new TextEncoder().encode(
+    JSON.stringify({ ...answer, [array]: [...items, extra] }),
+  );
+
+  // Take the bounds away and the schema and the key pay the extended answer in full ...
+  const looseCriteria = {
+    ...criteria,
+    schema: { ...criteria.schema, properties: { ...properties, [array]: withoutBounds } },
+  };
+  const loose = scoreJsonSchema(looseCriteria, heldout.json_schema, extended);
+  expect(loose.score, loose.reasons.join("; ")).toBe(100);
+
+  // ... so the count is all that stands between that answer and the reward.
+  expect({ minItems, maxItems }).toEqual({ minItems: items.length, maxItems: items.length });
+  const result = await scoreAnswer(criteria, heldout, extended);
+  expect(result.score, result.reasons.join("; ")).toBeLessThan(criteria.min_score);
+}
+
 test("the_ten_p0_seeds_are_all_there", () => {
   const missing = Object.keys(P0_SEEDS).filter((slug) => !SLUGS.includes(slug));
   expect(missing, "seeds missing from seeds/").toEqual([]);
@@ -316,30 +359,32 @@ test("product_table_extract_fixes_the_product_count", async () => {
   // The key asserts products[0] to products[8] and excluded_skus, and an assertion cannot see an
   // extra products[9], so a solver that keeps the discontinued item and puts it last would match
   // every one of them. The public schema fixes the count to close that.
-  const { criteria, heldout, solution } = load("product-table-extract");
-  if (criteria.kind !== "json_schema" || !("json_schema" in heldout)) {
-    throw new Error("product-table-extract is not a json_schema seed");
-  }
-
-  // The count is the number of products the key asserts, at least and at most.
-  const asserted = heldout.json_schema.assertions.filter(({ path }) =>
-    /^\$\.products\[\d+\]$/.test(path),
-  ).length;
-  const { products } = criteria.schema.properties as { products: Record<string, unknown> };
-  expect({ minItems: products.minItems, maxItems: products.maxItems }).toEqual({
-    minItems: asserted,
-    maxItems: asserted,
+  await expectItemCountFixed("product-table-extract", "products", {
+    sku: "RM-1080",
+    name: 'Laptop sleeve 15"',
+    price_kobo: 1599900,
+    stock: 0,
   });
+});
 
-  const discontinued = { sku: "RM-1080", name: 'Laptop sleeve 15"', price_kobo: 1599900, stock: 0 };
-  const answer = JSON.parse(utf8(solution)) as { products: unknown[] };
-  const kept = new TextEncoder().encode(
-    JSON.stringify({ ...answer, products: [...answer.products, discontinued] }),
-  );
+test("invoice_extract_fixes_the_line_item_count", async () => {
+  // The key asserts line_items[1] to line_items[3], so a solver that lists the VAT row under the
+  // table as a line of its own would match every one of them. The public schema fixes the count.
+  await expectItemCountFixed("invoice-extract", "line_items", {
+    description: "VAT (7.5%)",
+    quantity: 1,
+    unit_price: 102.17,
+    amount: 102.17,
+  });
+});
 
-  // Without the count, the key alone pays this answer in full. That is what the schema must stop.
-  const keyOnly = scoreJsonSchema({ ...criteria, schema: {} }, heldout.json_schema, kept);
-  expect(keyOnly.score, "the key alone cannot see the extra item").toBe(100);
-  const result = await scoreAnswer(criteria, heldout, kept);
-  expect(result.score, result.reasons.join("; ")).toBeLessThan(criteria.min_score);
+test("meeting_actions_extract_fixes_the_action_count", async () => {
+  // The key asserts action_count 8 and actions[0] to actions[7], so a solver that lists the item the
+  // notes only float (Ada, "may look at the logging costs") yet counts the eight real ones would
+  // match every one of them. The public schema fixes the count of actions.
+  await expectItemCountFixed("meeting-actions-extract", "actions", {
+    owner: "Ada",
+    task: "look at the logging costs",
+    due: null,
+  });
 });
