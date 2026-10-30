@@ -1,8 +1,9 @@
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseEnv } from "node:util";
+import { agentVariables } from "@tender/agents";
 import { TenderError } from "@tender/client";
 import { NETWORKS } from "@tender/shared";
 import { KeyPair } from "near-api-js";
@@ -45,6 +46,9 @@ const PARENT = "tender-dev-20261030.testnet";
 const CONTRACT = `tender.${PARENT}`;
 const KEEPER = `keeper.${PARENT}`;
 const JUDGE = `judge.${PARENT}`;
+const ANALYST = `analyst.${PARENT}`;
+const CODER = `coder.${PARENT}`;
+const EXTRACTOR = `extractor.${PARENT}`;
 const TARGET: KeyTarget = {
   network: "testnet",
   rpcUrl: "http://127.0.0.1:9",
@@ -52,9 +56,12 @@ const TARGET: KeyTarget = {
 };
 const ENV_FILE = ".env.deploy.testnet";
 
-/** The full-access keys the deploy made for the two accounts. */
+/** The full-access keys the deploy made for the accounts: the keeper's, the judge's and the agents'. */
 const keeperFull = KeyPair.fromRandom("ed25519");
 const judgeFull = KeyPair.fromRandom("ed25519");
+const analystFull = KeyPair.fromRandom("ed25519");
+const coderFull = KeyPair.fromRandom("ed25519");
+const extractorFull = KeyPair.fromRandom("ed25519");
 
 /** Shaped like a key, and recognisable in any output: it must never be printed. */
 const LEAKY = "ed25519:LEAKY-KEY-MATERIAL-that-must-never-be-printed";
@@ -74,10 +81,27 @@ function deployed(extra = ""): string {
     .join("\n")}\n`;
 }
 
+/** The lines the deploy adds for the reference agents, to go after the keeper's and judge's. */
+function agentsDeployed(extra = ""): string {
+  return deployed(
+    [
+      `AGENT_ANALYST_ACCOUNT=${ANALYST}`,
+      `AGENT_ANALYST_FULL_ACCESS_KEY=${analystFull.toString()}`,
+      `AGENT_CODER_ACCOUNT=${CODER}`,
+      `AGENT_CODER_FULL_ACCESS_KEY=${coderFull.toString()}`,
+      `AGENT_EXTRACTOR_ACCOUNT=${EXTRACTOR}`,
+      `AGENT_EXTRACTOR_FULL_ACCESS_KEY=${extractorFull.toString()}`,
+      extra,
+    ]
+      .filter((line) => line !== "")
+      .join("\n"),
+  );
+}
+
 type Added = Parameters<KeyChain["addFunctionCallKey"]>[0];
 
 /**
- * A chain with the two accounts and their full-access keys on it. It remembers the keys that are
+ * A chain with the accounts and their full-access keys on it. It remembers the keys that are
  * added to it, and reports the chain id it is given. `beforeAdd` runs when a key is being added,
  * before the key is on the chain.
  */
@@ -87,6 +111,9 @@ function fakeChain(
   const keys = new Map<string, ChainPermission>([
     [`${KEEPER} ${keeperFull.getPublicKey()}`, "FullAccess"],
     [`${JUDGE} ${judgeFull.getPublicKey()}`, "FullAccess"],
+    [`${ANALYST} ${analystFull.getPublicKey()}`, "FullAccess"],
+    [`${CODER} ${coderFull.getPublicKey()}`, "FullAccess"],
+    [`${EXTRACTOR} ${extractorFull.getPublicKey()}`, "FullAccess"],
   ]);
   const added: Added[] = [];
   const asked: string[] = [];
@@ -132,6 +159,29 @@ async function run(
   const result = await addRoleKey(role, target, { dir, log: (line) => lines.push(line), chain });
   return { lines, result };
 }
+
+/** Adds the key of the agent called `agent`, with the lines it printed. */
+async function runAgentKey(
+  agent: string,
+  dir: string,
+  chain: KeyChain,
+  target: KeyTarget = TARGET,
+): Promise<Run> {
+  const lines: string[] = [];
+  const result = await addRoleKey("agent", target, {
+    dir,
+    log: (line) => lines.push(line),
+    chain,
+    agent,
+  });
+  return { lines, result };
+}
+
+/** The public half of a private key. */
+const publicKeyOf = (privateKey: string) =>
+  KeyPair.fromString(privateKey as `ed25519:${string}`)
+    .getPublicKey()
+    .toString();
 
 /** The variables of the env file in `dir`, read as node reads them. */
 async function envOf(dir: string): Promise<Record<string, string | undefined>> {
@@ -663,6 +713,375 @@ test("key_script_gives_the_judge_the_methods_of_a_pick_and_leaves_the_keeper_alo
   expect(keys.has(`${KEEPER} ${keeperKey.getPublicKey()}`)).toBe(false);
 });
 
+// ---- The agent role -----------------------------------------------------------------------------
+
+test("key_script_gives_each_agent_a_key_for_commit_and_reveal_under_its_own_name", async () => {
+  const keeperKey = KeyPair.fromRandom("ed25519");
+  const dir = await dirWith({
+    [ENV_FILE]: agentsDeployed(`KEEPER_PRIVATE_KEY=${keeperKey.toString()}`),
+  });
+  const { chain, added, keys } = fakeChain();
+
+  const analyst = await runAgentKey("analyst", dir, chain);
+  const coder = await runAgentKey("coder", dir, chain);
+
+  // A function-call key limited to Tender and the two methods of an entry, added to the agent's own
+  // account and signed with that account's full-access key.
+  expect(added).toEqual([
+    {
+      signer: { accountId: ANALYST, privateKey: analystFull.toString() },
+      publicKey: analyst.result.publicKey,
+      contractId: CONTRACT,
+      methods: ["commit", "reveal"],
+    },
+    {
+      signer: { accountId: CODER, privateKey: coderFull.toString() },
+      publicKey: coder.result.publicKey,
+      contractId: CONTRACT,
+      methods: ["commit", "reveal"],
+    },
+  ]);
+  expect(analyst.result).toEqual({
+    outcome: "OK",
+    accountId: ANALYST,
+    publicKey: analyst.result.publicKey,
+  });
+  expect(coder.result).toEqual({
+    outcome: "OK",
+    accountId: CODER,
+    publicKey: coder.result.publicKey,
+  });
+  expect(analyst.result.publicKey).not.toBe(coder.result.publicKey);
+  expect(analyst.lines).toEqual([
+    `OK add agent analyst key ${analyst.result.publicKey} to ${ANALYST}`,
+  ]);
+  expect(coder.lines).toEqual([`OK add agent coder key ${coder.result.publicKey} to ${CODER}`]);
+
+  // Each key is in the file under its agent's name and reads back as the key that was added. The
+  // keeper's variable is as it was, and no key went to any account but the two agents'.
+  const env = await envOf(dir);
+  expect(publicKeyOf(env.AGENT_ANALYST_PRIVATE_KEY ?? "")).toBe(analyst.result.publicKey);
+  expect(publicKeyOf(env.AGENT_CODER_PRIVATE_KEY ?? "")).toBe(coder.result.publicKey);
+  expect(env.AGENT_EXTRACTOR_PRIVATE_KEY).toBeUndefined();
+  expect(env.KEEPER_PRIVATE_KEY).toBe(keeperKey.toString());
+  expect(env.JUDGE_PRIVATE_KEY).toBeUndefined();
+  expect(statSync(join(dir, ENV_FILE)).mode & 0o777).toBe(0o600);
+  const heldBy = (account: string) =>
+    [...keys.keys()].filter((key) => key.startsWith(`${account} `)).length;
+  expect([KEEPER, JUDGE, ANALYST, CODER, EXTRACTOR].map(heldBy)).toEqual([1, 1, 2, 2, 1]);
+
+  // What was printed shows the public keys, and no private key of either kind.
+  const printed = [...analyst.lines, ...coder.lines].join("\n");
+  const secrets = [
+    env.AGENT_ANALYST_PRIVATE_KEY,
+    env.AGENT_CODER_PRIVATE_KEY,
+    analystFull.toString(),
+    coderFull.toString(),
+  ];
+  for (const secret of secrets) expect(printed).not.toContain(secretOf(secret ?? ""));
+});
+
+test("key_script_is_idempotent_for_an_agent", async () => {
+  const dir = await dirWith({ [ENV_FILE]: agentsDeployed() });
+  const { chain, added } = fakeChain();
+  const first = await runAgentKey("analyst", dir, chain);
+  const afterFirst = await readFile(join(dir, ENV_FILE), "utf8");
+
+  const second = await runAgentKey("analyst", dir, chain);
+
+  expect(second.result).toEqual({ ...first.result, outcome: "SKIP" });
+  expect(second.lines).toEqual([
+    `SKIP add agent analyst key ${first.result.publicKey} to ${ANALYST} (exists)`,
+  ]);
+  expect(added).toHaveLength(1);
+  expect(await readFile(join(dir, ENV_FILE), "utf8")).toBe(afterFirst);
+});
+
+test("key_script_adds_the_agent_key_the_file_holds_when_the_chain_lacks_it_and_makes_no_new_one", async () => {
+  const stored = KeyPair.fromRandom("ed25519");
+  const dir = await dirWith({
+    [ENV_FILE]: agentsDeployed(`AGENT_ANALYST_PRIVATE_KEY=${stored.toString()}`),
+  });
+  const text = await readFile(join(dir, ENV_FILE), "utf8");
+  const { chain, added } = fakeChain();
+
+  const { result } = await runAgentKey("analyst", dir, chain);
+
+  expect(result.outcome).toBe("OK");
+  expect(result.publicKey).toBe(stored.getPublicKey().toString());
+  expect(added.map((a) => a.publicKey)).toEqual([stored.getPublicKey().toString()]);
+  expect(await readFile(join(dir, ENV_FILE), "utf8")).toBe(text);
+});
+
+test("key_script_refuses_an_agents_stored_key_with_another_permission_and_says_to_remove_it", async () => {
+  const stored = KeyPair.fromRandom("ed25519");
+  const fc = (over: Record<string, unknown>): ChainPermission => ({
+    FunctionCall: {
+      receiver_id: CONTRACT,
+      method_names: ["commit", "reveal"],
+      allowance: null,
+      ...over,
+    },
+  });
+  const cases: Array<[string, ChainPermission, RegExp]> = [
+    [
+      "another receiver",
+      fc({ receiver_id: "other.testnet" }),
+      /function-call key to other\.testnet/,
+    ],
+    [
+      "one method more",
+      fc({ method_names: ["commit", "reveal", "void_task"] }),
+      /commit, reveal, void_task/,
+    ],
+    ["one method less", fc({ method_names: ["commit"] }), /for commit with/],
+    ["an allowance", fc({ allowance: "1000000000000000000000000" }), /with an allowance/],
+    ["every method", fc({ method_names: [] }), /for any method with unlimited allowance/],
+  ];
+  for (const [what, permission, message] of cases) {
+    const dir = await dirWith({
+      [ENV_FILE]: agentsDeployed(`AGENT_ANALYST_PRIVATE_KEY=${stored.toString()}`),
+    });
+    const text = await readFile(join(dir, ENV_FILE), "utf8");
+    const { chain, keys, added } = fakeChain();
+    keys.set(`${ANALYST} ${stored.getPublicKey()}`, permission);
+
+    const error = await runAgentKey("analyst", dir, chain).then(
+      () => "ran",
+      (e: Error) => e.message,
+    );
+
+    expect(error, what).toMatch(message);
+    // What the key should have been is said in the agent's terms.
+    expect(error, what).toContain(
+      `not a function-call key to ${CONTRACT} for commit, reveal with unlimited allowance`,
+    );
+    expect(error, what).toContain(
+      "remove that key from the account and the AGENT_ANALYST_PRIVATE_KEY line from the env file, and run it again",
+    );
+    expect(error, what).toContain(stored.getPublicKey().toString());
+    expect(error, what).not.toContain(secretOf(stored.toString()));
+    expect(added, what).toEqual([]);
+    expect(await readFile(join(dir, ENV_FILE), "utf8"), what).toBe(text);
+  }
+});
+
+test("key_script_never_advises_deleting_an_agents_full_access_key_when_the_service_key_is_it", async () => {
+  const dir = await dirWith({
+    [ENV_FILE]: agentsDeployed(`AGENT_ANALYST_PRIVATE_KEY=${analystFull.toString()}`),
+  });
+  const text = await readFile(join(dir, ENV_FILE), "utf8");
+  const { chain, added } = fakeChain();
+
+  const error = await runAgentKey("analyst", dir, chain).then(
+    () => "ran",
+    (e: Error) => e.message,
+  );
+
+  expect(error).toContain(`AGENT_ANALYST_PRIVATE_KEY holds ${analystFull.getPublicKey()}`);
+  expect(error).toContain("is the same key as AGENT_ANALYST_FULL_ACCESS_KEY");
+  expect(error).toContain(`a full-access key on ${ANALYST}`);
+  expect(error).toContain("Remove only the AGENT_ANALYST_PRIVATE_KEY line from the env file");
+  expect(error).toContain("Do not delete the key from the account");
+  expect(error).not.toMatch(/remove (that|the|this) key from the account/i);
+  expect(error).not.toContain(secretOf(analystFull.toString()));
+  expect(added).toEqual([]);
+  expect(await readFile(join(dir, ENV_FILE), "utf8")).toBe(text);
+});
+
+test("key_script_refuses_an_agent_key_that_is_a_full_access_key_of_another_account", async () => {
+  // The mix-up of P02-R27 as it can happen between agents: the analyst's variable is filled in with
+  // the full-access key of the coder, the judge, the keeper or the owner. The analyst's account has
+  // no such key, so the script would add it there, and the analyst would sign with a secret that has
+  // full access to another account.
+  const parent = KeyPair.fromRandom("ed25519");
+  const cases: Array<[string, string, KeyPair]> = [
+    ["the coder's key", "AGENT_CODER_FULL_ACCESS_KEY", coderFull],
+    ["the judge's key", "JUDGE_FULL_ACCESS_KEY", judgeFull],
+    ["the keeper's key", "KEEPER_FULL_ACCESS_KEY", keeperFull],
+    ["the owner's parent key", "DEPLOY_PARENT_PRIVATE_KEY", parent],
+  ];
+  for (const [what, holder, key] of cases) {
+    const dir = await dirWith({
+      ".env": `DEPLOY_PARENT_PRIVATE_KEY=${parent.toString()}\n`,
+      [ENV_FILE]: agentsDeployed(`AGENT_ANALYST_PRIVATE_KEY=${key.toString()}`),
+    });
+    const text = await readFile(join(dir, ENV_FILE), "utf8");
+    const { chain, added, asked } = fakeChain();
+
+    const error = await runAgentKey("analyst", dir, chain).then(
+      () => "ran",
+      (e: Error) => e.message,
+    );
+
+    // Both variables are named, and the key is shown by its public half alone.
+    expect(error, what).toContain("AGENT_ANALYST_PRIVATE_KEY");
+    expect(error, what).toContain(holder);
+    expect(error, what).toContain(key.getPublicKey().toString());
+    expect(error, what).not.toContain(secretOf(key.toString()));
+    expect(error, what).toContain(
+      "Remove only the AGENT_ANALYST_PRIVATE_KEY line from the env file",
+    );
+    expect(error, what).not.toMatch(/remove (that|the|this) key from the account/i);
+    // Nothing is written, and the chain is not even asked.
+    expect(added, what).toEqual([]);
+    expect(asked, what).toEqual([]);
+    expect(await readFile(join(dir, ENV_FILE), "utf8"), what).toBe(text);
+  }
+});
+
+test("key_script_names_what_an_agents_env_file_lacks_and_never_shows_a_value", async () => {
+  const attempt = async (files: Record<string, string>) => {
+    const dir = await dirWith(files);
+    const { chain, added, asked } = fakeChain();
+    const error = await runAgentKey("coder", dir, chain).then(
+      () => "ran",
+      (e: Error) => e.message,
+    );
+    // Nothing reaches the chain, whatever is wrong.
+    expect(added).toEqual([]);
+    expect(asked).toEqual([]);
+    return error;
+  };
+  const withCoder = (over: Record<string, string>) => {
+    const values: Record<string, string> = {
+      TENDER_CONTRACT: CONTRACT,
+      AGENT_CODER_ACCOUNT: CODER,
+      AGENT_CODER_FULL_ACCESS_KEY: coderFull.toString(),
+      ...over,
+    };
+    return {
+      [ENV_FILE]: `${Object.entries(values)
+        .map(([name, value]) => `${name}=${value}`)
+        .join("\n")}\n`,
+    };
+  };
+
+  // The coder's two variables are missing: the keeper's and judge's, or another agent's, are no help.
+  const absent =
+    /missing keys for network testnet: AGENT_CODER_ACCOUNT, AGENT_CODER_FULL_ACCESS_KEY/;
+  expect(await attempt({ [ENV_FILE]: deployed() })).toMatch(absent);
+  expect(
+    await attempt({
+      [ENV_FILE]: `AGENT_ANALYST_ACCOUNT=${ANALYST}\nAGENT_ANALYST_FULL_ACCESS_KEY=${analystFull.toString()}\n`,
+    }),
+  ).toMatch(absent);
+
+  // A key that landed in the account variable may be the real thing: it is not shown.
+  const keyInPlace = await attempt(withCoder({ AGENT_CODER_ACCOUNT: LEAKY }));
+  expect(keyInPlace).toMatch(/^AGENT_CODER_ACCOUNT is not a valid NEAR account id/);
+  expect(keyInPlace).not.toContain("LEAKY");
+
+  // Keys that are no keys: named, but never shown.
+  for (const name of ["AGENT_CODER_FULL_ACCESS_KEY", "AGENT_CODER_PRIVATE_KEY"]) {
+    const message = await attempt(withCoder({ [name]: "not-a-key-at-all" }));
+    expect(message, name).toMatch(new RegExp(`^${name} is not a valid private key`));
+    expect(message, name).not.toContain("not-a-key-at-all");
+  }
+});
+
+test("key_script_checks_an_agents_full_access_key_before_it_writes_anything", async () => {
+  const cases: Array<[string, (keys: Map<string, ChainPermission>) => void, RegExp]> = [
+    [
+      "a key the account lacks",
+      (keys) => keys.delete(`${ANALYST} ${analystFull.getPublicKey()}`),
+      /AGENT_ANALYST_FULL_ACCESS_KEY is not a key of analyst\.tender-dev-20261030\.testnet/,
+    ],
+    [
+      "a function-call key",
+      (keys) =>
+        keys.set(`${ANALYST} ${analystFull.getPublicKey()}`, {
+          FunctionCall: { receiver_id: CONTRACT, method_names: [] },
+        }),
+      /AGENT_ANALYST_FULL_ACCESS_KEY is a function-call key of analyst\.tender-dev-20261030\.testnet/,
+    ],
+  ];
+  for (const [what, damage, message] of cases) {
+    const dir = await dirWith({ [ENV_FILE]: agentsDeployed() });
+    const text = await readFile(join(dir, ENV_FILE), "utf8");
+    const { chain, keys, added } = fakeChain();
+    damage(keys);
+
+    await expect(runAgentKey("analyst", dir, chain), what).rejects.toThrow(message);
+
+    // No service key was made for an account the script cannot add it to.
+    expect(added, what).toEqual([]);
+    expect(await readFile(join(dir, ENV_FILE), "utf8"), what).toBe(text);
+  }
+});
+
+test("key_script_takes_only_the_name_of_an_agent_and_stops_before_it_reads_or_writes_anything", async () => {
+  // The name becomes part of the names of variables. A directory without an env file shows that the
+  // script is out before it opens one: opening makes the file.
+  const dir = await dirWith({});
+  const { chain, added, asked } = fakeChain();
+  const names = [
+    "",
+    "Analyst",
+    "1coder",
+    "my-agent",
+    "agent.one",
+    "analyst ",
+    "analyst\n",
+    "a".repeat(21),
+    "../../etc",
+    LEAKY,
+  ];
+  for (const name of names) {
+    const error = await runAgentKey(name, dir, chain).then(
+      () => "ran",
+      (e: Error) => e.message,
+    );
+    const shown = JSON.stringify(name);
+    expect(error, shown).toMatch(/^--agent must be a name of lowercase letters and digits/);
+    // The value is not in the message, whatever it is.
+    expect(error, shown).not.toContain("LEAKY");
+    expect(error, shown).not.toContain("etc");
+  }
+
+  // No name at all, and a name for a role that has none of its own.
+  await expect(addRoleKey("agent", TARGET, { dir, chain })).rejects.toThrow(
+    "the agent role needs the name of an agent: --agent <name>",
+  );
+  for (const role of ["keeper", "judge"] as const) {
+    await expect(addRoleKey(role, TARGET, { dir, chain, agent: "analyst" })).rejects.toThrow(
+      "--agent goes with --role agent only",
+    );
+  }
+  expect(asked).toEqual([]);
+  expect(added).toEqual([]);
+  expect(existsSync(join(dir, ENV_FILE))).toBe(false);
+
+  // The longest name the deploy could give an agent gets as far as its variables.
+  const longest = "a".repeat(20);
+  await expect(runAgentKey(longest, dir, chain)).rejects.toThrow(
+    `missing keys for network testnet: AGENT_${longest.toUpperCase()}_ACCOUNT`,
+  );
+});
+
+test("key_script_writes_the_variable_the_agents_command_reads", async () => {
+  // `run-agent` signs with `AGENT_<NAME>_PRIVATE_KEY` of the account in `AGENT_<NAME>_ACCOUNT`. The
+  // script must read the deploy's variables for an agent and write the key to that very name.
+  const agents = {
+    analyst: [ANALYST, analystFull],
+    coder: [CODER, coderFull],
+    extractor: [EXTRACTOR, extractorFull],
+  } as const;
+  for (const [name, [account, full]] of Object.entries(agents)) {
+    const vars = agentVariables(name);
+    const dir = await dirWith({
+      [ENV_FILE]: deployed(
+        [`${vars.account}=${account}`, `${vars.fullAccessKey}=${full.toString()}`].join("\n"),
+      ),
+    });
+
+    const { result } = await runAgentKey(name, dir, fakeChain().chain);
+
+    expect(result.accountId, name).toBe(account);
+    expect(publicKeyOf((await envOf(dir))[vars.privateKey] ?? ""), name).toBe(result.publicKey);
+  }
+});
+
 test("key_script_makes_an_existing_env_file_private_even_when_it_goes_no_further", async () => {
   // The owner makes the file by hand, with keys in it, and gets mode 0644 more often than not.
   const dir = await dirWith({
@@ -797,6 +1216,44 @@ test("cli_takes_the_role_from_the_flag", async () => {
   expect(other.code).toBe(1);
   expect(other.err).toMatch(/unknown role "treasury".*keeper or judge/s);
   expect(other.addKey).not.toHaveBeenCalled();
+});
+
+test("cli_takes_the_agent_role_with_the_name_of_the_agent", async () => {
+  const files = { [ENV_FILE]: deployed() };
+  const agent = await runCli(files, [
+    "--network",
+    "testnet",
+    "--role",
+    "agent",
+    "--agent",
+    "analyst",
+  ]);
+  expect(agent.code).toBe(0);
+  expect(agent.addKey).toHaveBeenCalledTimes(1);
+  expect(agent.addKey.mock.calls[0]?.[0]).toBe("agent");
+  expect(agent.addKey.mock.calls[0]?.[2]).toMatchObject({ dir: agent.dir, agent: "analyst" });
+
+  // The other roles are asked for as they always were, with no name.
+  const judge = await runCli(files, ["--network", "testnet", "--role", "judge"]);
+  expect(judge.addKey.mock.calls[0]?.[2]).not.toHaveProperty("agent");
+
+  // A name that is missing, wrong or on the wrong role is a usage error, before a file is read.
+  const cases: Array<[string[], RegExp]> = [
+    [["--role", "agent"], /needs the name of an agent: --agent <name>.*usage:/s],
+    [["--role", "keeper", "--agent", "analyst"], /--agent goes with --role agent only.*usage:/s],
+    [["--agent", "analyst"], /--agent goes with --role agent only/],
+    [["--role", "agent", "--agent", "Analyst"], /--agent must be a name of lowercase letters/],
+    [["--role", "agent", "--agent", LEAKY], /--agent must be a name of lowercase letters/],
+    [["--role", "agent", "--agent"], /agent/],
+  ];
+  for (const [args, message] of cases) {
+    const { code, err, out, addKey } = await runCli({}, ["--network", "testnet", ...args]);
+    expect(code, args.join(" ")).toBe(1);
+    expect(err, args.join(" ")).toMatch(message);
+    expect(err, args.join(" ")).not.toContain("LEAKY");
+    expect(out).toEqual([]);
+    expect(addKey).not.toHaveBeenCalled();
+  }
 });
 
 test("cli_refuses_mainnet_the_sandbox_and_anything_else_without_touching_the_chain", async () => {

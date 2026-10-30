@@ -3,7 +3,13 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseEnv } from "node:util";
-import { type LocalChain, type Signer, startLocalChain, TenderClient } from "@tender/client";
+import {
+  keyKindOf,
+  type LocalChain,
+  type Signer,
+  startLocalChain,
+  TenderClient,
+} from "@tender/client";
 import {
   Account,
   actions,
@@ -16,8 +22,8 @@ import { afterAll, beforeAll, expect, test } from "vitest";
 import { addRoleKey, type KeyTarget } from "./keeper-key";
 
 // The script's function against a local chain with Tender on it: the keys it adds are the ones the
-// chain reports, with the permission a keeper or a judge needs and no more. The env files are
-// temporary ones, written the way the deploy writes them, for the chain's own accounts.
+// chain reports, with the permission a keeper, a judge or an agent needs and no more. The env files
+// are temporary ones, written the way the deploy writes them, for the chain's own accounts.
 
 let chain: LocalChain;
 /** Reads the chain's access keys. */
@@ -56,6 +62,25 @@ async function deployedDir(): Promise<string> {
       `KEEPER_FULL_ACCESS_KEY=${keeper.privateKey}`,
       `JUDGE_ACCOUNT=${judge.accountId}`,
       `JUDGE_FULL_ACCESS_KEY=${judge.privateKey}`,
+    ].join("\n")}\n`,
+    { mode: 0o600 },
+  );
+  return dir;
+}
+
+/** A new directory with the env file the deploy leaves for two agents, on the chain's alice and bob. */
+async function agentsDir(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "tender-keeper-key-sandbox-"));
+  dirs.push(dir);
+  const { alice, bob } = chain.accounts;
+  await writeFile(
+    join(dir, ENV_FILE),
+    `${[
+      `TENDER_CONTRACT=${chain.contractId}`,
+      `AGENT_ANALYST_ACCOUNT=${alice.accountId}`,
+      `AGENT_ANALYST_FULL_ACCESS_KEY=${alice.privateKey}`,
+      `AGENT_CODER_ACCOUNT=${bob.accountId}`,
+      `AGENT_CODER_FULL_ACCESS_KEY=${bob.privateKey}`,
     ].join("\n")}\n`,
     { mode: 0o600 },
   );
@@ -222,4 +247,99 @@ test("key_script_runs_again_without_a_new_key_and_restores_a_key_the_chain_lost"
   });
   expect(await readFile(join(dir, ENV_FILE), "utf8")).toBe(text);
   expect(await linesSetting(dir, "KEEPER_PRIVATE_KEY")).toBe(1);
+});
+
+test("key_script_adds_keys_with_the_permission_of_an_agent", async () => {
+  const dir = await agentsDir();
+  const lines: string[] = [];
+  const log = (line: string) => lines.push(line);
+  const { alice, bob } = chain.accounts;
+
+  const analyst = await addRoleKey("agent", target, { dir, log, agent: "analyst" });
+  const coder = await addRoleKey("agent", target, { dir, log, agent: "coder" });
+
+  // The chain reports a function-call key limited to Tender, with the two methods of an entry and
+  // no cap on the allowance, and the deploy's full-access key beside it, untouched. The first is the
+  // kind of key `run-agent` starts with, and the second the kind it refuses.
+  const accounts = [
+    [analyst, alice],
+    [coder, bob],
+  ] as const;
+  for (const [added, account] of accounts) {
+    expect(added.outcome).toBe("OK");
+    expect(added.accountId).toBe(account.accountId);
+    const found = await reader.viewAccessKey(account.accountId, added.publicKey);
+    expect(found).toEqual({
+      permission: {
+        FunctionCall: {
+          receiver_id: chain.contractId,
+          method_names: ["commit", "reveal"],
+          allowance: null,
+        },
+      },
+    });
+    expect(keyKindOf(found?.permission, chain.contractId)).toBe("function_call");
+    const full = await reader.viewAccessKey(account.accountId, publicKeyOf(account.privateKey));
+    expect(full?.permission).toBe("FullAccess");
+    expect(keyKindOf(full?.permission, chain.contractId)).toBe("full_access");
+  }
+
+  // Each private key is in the file under its agent's name, and the file is private to its owner.
+  const env = await envOf(dir);
+  expect(publicKeyOf(env.AGENT_ANALYST_PRIVATE_KEY ?? "")).toBe(analyst.publicKey);
+  expect(publicKeyOf(env.AGENT_CODER_PRIVATE_KEY ?? "")).toBe(coder.publicKey);
+  expect(statSync(join(dir, ENV_FILE)).mode & 0o777).toBe(0o600);
+
+  // What was printed names the public keys and shows no private one, of the new keys or the old.
+  expect(lines).toEqual([
+    `OK add agent analyst key ${analyst.publicKey} to ${alice.accountId}`,
+    `OK add agent coder key ${coder.publicKey} to ${bob.accountId}`,
+  ]);
+  const secrets = [
+    env.AGENT_ANALYST_PRIVATE_KEY,
+    env.AGENT_CODER_PRIVATE_KEY,
+    alice.privateKey,
+    bob.privateKey,
+  ];
+  for (const secret of secrets) {
+    expect(lines.join("\n")).not.toContain((secret ?? "").slice("ed25519:".length));
+  }
+
+  // The key does the agent's work: the chain lets it call `commit` and `reveal`, and the contract
+  // answers for a task that is not there. It lets it call no other method of Tender, and nothing of
+  // another contract.
+  const scoped = clientWith({
+    accountId: alice.accountId,
+    privateKey: env.AGENT_ANALYST_PRIVATE_KEY ?? "",
+  });
+  await expect(scoped.commit(999_999n, "0".repeat(64))).rejects.toMatchObject({
+    code: "E_NOT_FOUND",
+  });
+  await expect(
+    scoped.reveal(999_999n, "0".repeat(64), "0".repeat(32), "x://y"),
+  ).rejects.toMatchObject({ code: "E_NOT_FOUND" });
+  await expect(scoped.voidTask(999_999n)).rejects.toThrow(
+    "Access key does not allow method void_task",
+  );
+  await expect(
+    scoped.pick(999_999n, [{ account: alice.accountId, bps: 10_000 }], "0".repeat(64), "x://y"),
+  ).rejects.toThrow("Access key does not allow method pick");
+  await expect(
+    scoped.send({
+      receiverId: chain.tokenId,
+      methodName: "ft_transfer",
+      args: { receiver_id: bob.accountId, amount: "1" },
+      gas: 30n * TGAS,
+      deposit: 0n,
+    }),
+  ).rejects.toThrow(
+    `Access key receiver ${chain.contractId} does not match transaction receiver ${chain.tokenId}`,
+  );
+
+  // The key belongs to its account: the coder's account does not take the analyst's.
+  const wrongAccount = clientWith({
+    accountId: bob.accountId,
+    privateKey: env.AGENT_ANALYST_PRIVATE_KEY ?? "",
+  });
+  await expect(wrongAccount.commit(999_999n, "0".repeat(64))).rejects.toThrow();
 });

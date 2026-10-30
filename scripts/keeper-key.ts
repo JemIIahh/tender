@@ -13,20 +13,26 @@ import { DeployEnv, type EnvWriter, type Outcome, parseKey, UsageError } from ".
 import { loadEnv, REPO_ROOT } from "./lib/env";
 
 /**
- * The key script. A service that signs for the keeper or the judge does not hold that account's
- * full-access key, which can do anything with it, down to deleting it. It holds a function-call key
- * the owner adds with this script: limited to Tender, to the methods the role calls, and with no cap
- * on its allowance, since a key that runs out of allowance stops a service in the middle of its work
- * (rulings P02-R27, X-7).
+ * The key script. A service that signs for the keeper, the judge or an agent does not hold that
+ * account's full-access key, which can do anything with it, down to deleting it. It holds a
+ * function-call key the owner adds with this script: limited to Tender, to the methods the role
+ * calls, and with no cap on its allowance, since a key that runs out of allowance stops a service
+ * in the middle of its work (rulings P02-R27, X-7).
  *
  *   keeper   void_task, cleanup
  *   judge    pick, pick_attested
+ *   agent    commit, reveal
+ *
+ * The agent role takes the agent's name, `--agent analyst` for instance, and works on the account
+ * the deploy made for it: its variables are `AGENT_<NAME>_ACCOUNT` and so on, in capitals. The
+ * reference agents are analyst, coder and extractor, and the deploy makes a lead as well.
  *
  * For a role the script reads `<ROLE>_ACCOUNT` and `<ROLE>_FULL_ACCESS_KEY`, which the deploy wrote
- * to `.env.deploy.<network>`, signs with that key, and adds the new one to the account. It prints
- * `OK add <role> key <public key> to <account>` when it did, and `SKIP add ... (exists)` when the
- * key was there already, and nothing else. The private key is never printed, anywhere: it goes to
- * the same file as `<ROLE>_PRIVATE_KEY`, which is what the service reads.
+ * to `.env.deploy.<network>` (`<ROLE>` is KEEPER, JUDGE or AGENT_<NAME>), signs with that key, and
+ * adds the new one to the account. It prints `OK add <role> key <public key> to <account>` when it
+ * did (for an agent the role reads `agent analyst`), and `SKIP add ... (exists)` when the key was
+ * there already, and nothing else. The private key is never printed, anywhere: it goes to the same
+ * file as `<ROLE>_PRIVATE_KEY`, which is what the service reads.
  *
  * The file is written the way the deploy writes it: mode 0600, the key appended and synced to disk
  * and read back before the chain is asked to take it, so that a key is never lost to a crash, and
@@ -55,16 +61,55 @@ import { loadEnv, REPO_ROOT } from "./lib/env";
  * with the chain id `mainnet`, whatever the target calls it.
  *
  *   pnpm exec tsx scripts/keeper-key.ts --network testnet [--role keeper|judge]
+ *   pnpm exec tsx scripts/keeper-key.ts --network testnet --role agent --agent <name>
  */
 
-export type Role = "keeper" | "judge";
+export type Role = "keeper" | "judge" | "agent";
 
-const ROLES: Readonly<Record<Role, { stem: string; methods: readonly string[] }>> = {
-  keeper: { stem: "KEEPER", methods: ["void_task", "cleanup"] },
-  judge: { stem: "JUDGE", methods: ["pick", "pick_attested"] },
+/** What a role's key is for, and where its variables are. */
+interface RoleSpec {
+  /** The variables are `<stem>_ACCOUNT`, `<stem>_FULL_ACCESS_KEY` and `<stem>_PRIVATE_KEY`. */
+  stem: string;
+  /** The methods the key may call, and no others. */
+  methods: readonly string[];
+  /** What the script calls the role in the line it prints. */
+  label: string;
+}
+
+const FIXED_ROLES: Readonly<Record<"keeper" | "judge", RoleSpec>> = {
+  keeper: { stem: "KEEPER", methods: ["void_task", "cleanup"], label: "keeper" },
+  judge: { stem: "JUDGE", methods: ["pick", "pick_attested"], label: "judge" },
 };
 
-const isRole = (value: string): value is Role => Object.hasOwn(ROLES, value);
+/** An agent enters tasks and nothing else: it commits to an answer and later reveals it. */
+const AGENT_METHODS: readonly string[] = ["commit", "reveal"];
+
+/** An agent's name as the deploy makes it: the label of its sub-account, and the stem's tail. */
+const AGENT_NAME = /^[a-z][a-z0-9]{0,19}$/;
+
+const isRole = (value: string): value is Role =>
+  value === "agent" || Object.hasOwn(FIXED_ROLES, value);
+
+/**
+ * The spec of `role`, for the agent called `agent` when the role is `agent`. Throws, without showing
+ * the name, if an agent role has no name or a name that is no agent's, or if another role has one.
+ * The name becomes part of variable names, so only the form of the deploy's agents is let through.
+ */
+function specOf(role: Role, agent: string | undefined): RoleSpec {
+  if (role !== "agent") {
+    if (agent !== undefined) throw new Error("--agent goes with --role agent only");
+    return FIXED_ROLES[role];
+  }
+  if (agent === undefined)
+    throw new Error("the agent role needs the name of an agent: --agent <name>");
+  if (!AGENT_NAME.test(agent)) {
+    throw new Error(
+      "--agent must be a name of lowercase letters and digits that starts with a letter, 20 at " +
+        "most (its value is not shown)",
+    );
+  }
+  return { stem: `AGENT_${agent.toUpperCase()}`, methods: AGENT_METHODS, label: `agent ${agent}` };
+}
 
 /** How the env file names this script: in the header of a file it makes, and in what it says to run. */
 const WRITER: EnvWriter = { script: "scripts/keeper-key.ts", rerun: "this script" };
@@ -123,6 +168,8 @@ export interface KeyTarget {
 }
 
 export interface AddKeyOptions {
+  /** The agent's name, for the agent role (`analyst`) and for no other role. */
+  agent?: string;
   /** Where `.env` and `.env.deploy.<network>` are. The repository root by default. */
   dir?: string;
   /** Receives the `OK` or `SKIP` line, and nothing else. Default: `console.log`. */
@@ -289,6 +336,7 @@ function checkContract(contractId: string, what: string): void {
 /**
  * Adds the role's function-call key to its account and returns what was done; see the top of this
  * file for the rules. Throws, before anything is written or sent, if the target is mainnet, if the
+ * role is `agent` and `options.agent` is no agent's name (or another role has one), if the
  * contract or the role's account is no account id, if a key in the env file is no key, if
  * `<ROLE>_PRIVATE_KEY` is the same key as another full-access key of the env files, if the node
  * is on mainnet (or, for a testnet target, on any chain but testnet), or if `<ROLE>_PRIVATE_KEY` is
@@ -303,9 +351,9 @@ export async function addRoleKey(
 ): Promise<KeyResult> {
   const { network, contractId } = target;
   if (network === "mainnet") throw new Error(MAINNET_REFUSED);
+  const { stem, methods, label } = specOf(role, options.agent);
   const dir = options.dir ?? REPO_ROOT;
   const log = options.log ?? console.log;
-  const { stem, methods } = ROLES[role];
   const accountVar = `${stem}_ACCOUNT`;
   const fullKeyVar = `${stem}_FULL_ACCESS_KEY`;
   const keyVar = `${stem}_PRIVATE_KEY`;
@@ -367,7 +415,7 @@ export async function addRoleKey(
           }),
         );
       }
-      log(`SKIP add ${role} key ${publicKey} to ${accountId} (exists)`);
+      log(`SKIP add ${label} key ${publicKey} to ${accountId} (exists)`);
       return { outcome: "SKIP", accountId, publicKey };
     }
   }
@@ -397,13 +445,15 @@ export async function addRoleKey(
     contractId,
     methods,
   });
-  log(`OK add ${role} key ${publicKey} to ${accountId}`);
+  log(`OK add ${label} key ${publicKey} to ${accountId}`);
   return { outcome: "OK", accountId, publicKey };
 }
 
 // The command line.
 
-const USAGE = "usage: pnpm exec tsx scripts/keeper-key.ts --network testnet [--role keeper|judge]";
+const USAGE =
+  "usage: pnpm exec tsx scripts/keeper-key.ts --network testnet " +
+  "[--role keeper|judge | --role agent --agent <name>]";
 
 /**
  * The target for `network` from the command line: for testnet, the network's RPC URL and the
@@ -456,21 +506,38 @@ export async function main(args: readonly string[], options: CliOptions = {}): P
   const out = options.out ?? console.log;
   const err = options.err ?? console.error;
   try {
-    let values: { network?: string; role?: string };
+    let values: { network?: string; role?: string; agent?: string };
     try {
       values = parseArgs({
         args: [...args],
-        options: { network: { type: "string" }, role: { type: "string" } },
+        options: {
+          network: { type: "string" },
+          role: { type: "string" },
+          agent: { type: "string" },
+        },
       }).values;
     } catch (error) {
       throw new UsageError(`${error instanceof Error ? error.message : String(error)}\n${USAGE}`);
     }
     const role = values.role ?? "keeper";
     if (!isRole(role)) {
-      throw new UsageError(`unknown role ${JSON.stringify(role)}: use keeper or judge\n${USAGE}`);
+      throw new UsageError(
+        `unknown role ${JSON.stringify(role)}: use keeper or judge (or agent, with --agent <name>)\n${USAGE}`,
+      );
+    }
+    try {
+      // The rules for the agent's name are the function's own: asked now, the command line fails
+      // with the usage before it reads a file.
+      specOf(role, values.agent);
+    } catch (error) {
+      throw new UsageError(`${error instanceof Error ? error.message : String(error)}\n${USAGE}`);
     }
     const target = loadTarget(values.network, options);
-    await (options.addKey ?? addRoleKey)(role, target, { dir: options.dir, log: out });
+    await (options.addKey ?? addRoleKey)(role, target, {
+      dir: options.dir,
+      log: out,
+      ...(values.agent !== undefined && { agent: values.agent }),
+    });
     return 0;
   } catch (error) {
     err(error instanceof UsageError ? error.message : describeFailure(error));
