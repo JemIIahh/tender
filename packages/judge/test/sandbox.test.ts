@@ -82,8 +82,13 @@ test("a_loop_in_reading_the_value_times_out", { timeout: 10_000 }, async () => {
   }
 });
 
-test("memory_bomb_contained", { timeout: 10_000 }, async () => {
-  const result = await run("let a=[];while(true)a.push(new Array(1e6))");
+test("memory_bomb_contained", { timeout: 20_000 }, async () => {
+  // A tight memory budget and a long time budget: the bomb runs out of memory at its first
+  // allocation, so a loaded machine cannot turn this into a timeout.
+  const result = await runInSandbox("let a=[];while(true)a.push(new Array(1e6))", {
+    timeoutMs: 15_000,
+    memoryBytes: 4 * 1024 * 1024,
+  });
   expect(result.ok).toBe(false);
   expect(["memory", "exception"]).toContain(result.ok ? undefined : result.error);
 
