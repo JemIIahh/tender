@@ -100,6 +100,8 @@ const unreachable = new Set<string>();
 let sendDelayMs = 0;
 /** While set, the next send waits for it: a send that is stuck. Later sends are not held. */
 let gate: Promise<void> | null = null;
+/** Runs as each call to Telegram arrives: a test that needs time to pass during a tick sets it. */
+let onSend: (() => void) | undefined;
 let sending = 0;
 let mostSending = 0;
 
@@ -108,6 +110,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const fakeTelegram: Transformer = async (_prev, method, payload) => {
   const sent = payload as unknown as Record<string, unknown>;
   calls.push({ method, payload: sent });
+  onSend?.();
   sending += 1;
   mostSending = Math.max(mostSending, sending);
   const held = gate;
@@ -206,6 +209,7 @@ beforeEach(async () => {
   unreachable.clear();
   sendDelayMs = 0;
   gate = null;
+  onSend = undefined;
   sending = 0;
   mostSending = 0;
   height = 1000n;
@@ -262,10 +266,10 @@ function tick(options: TickOptions = {}): Promise<Message[]> {
 }
 
 /** `database` with every statement for which `fails` says yes rejected, as a dead connection does. */
-function failingWhen(database: Db, fails: (sql: string) => boolean): Db {
+function failingWhen(database: Db, fails: (sql: string, params?: unknown[]) => boolean): Db {
   return {
     query: <T = Record<string, unknown>>(sql: string, params?: unknown[]) =>
-      fails(sql)
+      fails(sql, params)
         ? Promise.reject(new Error("database unavailable"))
         : database.query<T>(sql, params),
     exec: (sql) => database.exec(sql),
@@ -487,6 +491,28 @@ test("titles_fall_back_to_the_task_number_and_stay_on_one_line", async () => {
   expect(sent[0]?.text).toContain("agent.near started “Task #99”");
 });
 
+test("what_people_wrote_is_escaped_at_the_send", async () => {
+  // renderAlert escapes, and render.test.ts has its cases. This pins that what reaches Telegram is
+  // the escaped text, for a task's title and for an agent's name.
+  const title = "Fix <b>bold</b> & co";
+  const agent = "a<i>&co.near";
+  await linkChat(db, 11, poster);
+  await tick();
+  await apply(created("7", OPEN));
+  await db.query("update tasks set title = $1 where id = 7", [title]);
+
+  const announced = await tick();
+  expect(announced[0]?.text).toContain("<b>New task</b> · Fix &lt;b&gt;bold&lt;/b&gt; &amp; co");
+  expect(announced[0]?.text).not.toContain(title);
+
+  await startWorking("7", agent, clock - MINUTE);
+  const working = await tick();
+  expect(working[0]?.text).toContain(
+    "<b>Agent working</b> · a&lt;i&gt;&amp;co.near started “Fix &lt;b&gt;bold&lt;/b&gt; &amp; co”",
+  );
+  expect(working[0]?.text).not.toContain(agent);
+});
+
 // ---------------------------------------------------------------------------------------------
 // The stream: the cursor, its start, its order.
 
@@ -690,6 +716,12 @@ test("blocked_chat_is_unlinked", async () => {
 
   await apply(created("7", OPEN));
   expect(lines(await tick())).toEqual(["42 New task #7", "43 New task #7", "77 New task #7"]);
+  // Each unlink leaves one line, so that "why did this chat go quiet" has an answer.
+  const unlinks = logged();
+  expect(unlinks).toHaveLength(2);
+  expect(unlinks[0]).toContain("chat 42");
+  expect(unlinks[0]).toContain("403: Forbidden: bot was blocked by the user");
+  expect(unlinks[1]).toContain("chat 77");
   // Chats 42 and 77 lost their links and watches; chat 43 keeps its own.
   const links = await db.query<{ chat_id: string }>("select chat_id::text from tg_links");
   expect(links).toEqual([{ chat_id: "43" }]);
@@ -706,6 +738,7 @@ test("blocked_chat_is_unlinked", async () => {
   expect(callsPerChat("42")).toBe(1);
   expect(callsPerChat("77")).toBe(1);
   expect(callsPerChat("43")).toBe(2);
+  expect(logged()).toEqual([]); // nothing more to say about the chats that are gone
 });
 
 test("other_send_errors_are_logged_and_not_retried", async () => {
@@ -782,6 +815,81 @@ test("a_recipient_error_skips_only_that_alert", async () => {
   expect(logs[0]).toContain("new_task for task 1");
   expect(await cursor()).toBe("2");
   expect(await tick()).toEqual([]);
+  expect(logged()).toEqual([]);
+});
+
+test("a_recipient_lookup_that_fails_is_tried_again", async () => {
+  // A blip in the database, such as a deadlock victim, is not a row that can never be read. The
+  // alert is one the cursor is about to pass for good, so it is worth another try.
+  await linkChat(db, 11, poster);
+  await tick();
+  await apply(created("7", OPEN));
+  let lookups = 0;
+  const blips = failingWhen(db, (sql) => sql.includes("direct_accounts") && ++lookups <= 2);
+
+  expect(lines(await tick({ database: blips }))).toEqual(["11 New task #7"]);
+  expect(lookups).toBe(3); // two failures, then the answer
+  expect(await cursor()).toBe("1");
+});
+
+test("a_recipient_lookup_that_keeps_failing_is_given_up_on_after_three_tries", async () => {
+  await linkChat(db, 11, poster);
+  await tick();
+  await apply(created("1", OPEN), created("2", OPEN));
+  let tries = 0; // at the recipients of task 1, which are never found
+  const poisoned = failingWhen(db, (sql, params) => {
+    const task1 = sql.includes("direct_accounts") && params?.[0] === "1";
+    if (task1) tries += 1;
+    return task1;
+  });
+
+  expect(lines(await tick({ database: poisoned }))).toEqual(["11 New task #2"]);
+  expect(tries).toBe(3);
+  const logs = logged();
+  expect(logs).toHaveLength(1); // the tries before the last are not news
+  expect(logs[0]).toContain("new_task for task 1");
+  expect(await cursor()).toBe("2");
+});
+
+test("a_deadline_that_is_not_a_number_skips_only_its_alert", async () => {
+  // The chain cannot write NaN, but the column can hold it. The database makes the late-task check
+  // and does not stumble on it. `renderAlert` refuses the deadline, which is that alert's error.
+  await linkChat(db, 11, poster);
+  await tick();
+  await apply(created("1", OPEN), created("2", OPEN));
+  await db.query("update tasks set commit_deadline = 'NaN' where id = 1");
+
+  expect(lines(await tick())).toEqual(["11 New task #2"]);
+  const logs = logged();
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain("new_task for task 1");
+  expect(await cursor()).toBe("2");
+});
+
+test("events_that_cannot_make_an_alert_are_logged_and_skipped", async () => {
+  await linkChat(db, 11, poster);
+  await tick();
+  // Rows that the indexer would not write but the table can hold. Each is logged and passed over.
+  const insert = (receipt: string, data: unknown, taskId: string | null) =>
+    db.query(
+      `insert into events (height, block_ts, receipt_id, log_index, event, data, task_id)
+       values (1, 1, $1, 0, 'committed', $2::jsonb, $3::numeric)`,
+      [receipt, JSON.stringify(data), taskId],
+    );
+  const committed = fixtureData("committed");
+  await insert("not-an-event", { nonsense: true }, "7"); // the data is no `committed`
+  await insert("no-task", { ...committed, task_id: "7" }, null); // the column names no task
+  await insert("no-row", { ...committed, task_id: "404" }, "404"); // the index has no task 404
+  await apply(created("7", OPEN)); // and news behind them
+
+  expect(lines(await tick())).toEqual(["11 New task #7"]);
+  const logs = logged();
+  expect(logs).toHaveLength(3);
+  expect(logs[0]).toMatch(/event 1 \(committed\).*malformed/);
+  expect(logs[1]).toMatch(/event 2 \(committed\).*malformed/);
+  expect(logs[2]).toMatch(/event 3 \(committed\).*task 404/);
+  expect(await cursor()).toBe("4");
+  expect(await tick()).toEqual([]); // and they are not met again
   expect(logged()).toEqual([]);
 });
 
@@ -985,6 +1093,34 @@ test("deadlines_are_compared_exactly", async () => {
   ]);
 });
 
+test("timers_read_the_clock_after_a_slow_event_phase", async () => {
+  // Sends behind a backlog can take minutes. The timers run on the time it is when they start, not
+  // the time the tick began: reveal_closing is a window of ten minutes.
+  const reveal = T0 + 2 * HOUR;
+  await seedTask(db, {
+    id: "7",
+    poster: "poster.near",
+    created_at: ns(T0),
+    commit_deadline: ns(T0 + HOUR),
+    reveal_deadline: ns(reveal),
+    commit_count: 1,
+  });
+  await seedEntry(db, "7", "bot.near");
+  await linkChat(db, 103, "bot.near");
+  await linkChat(db, 11, poster);
+  expect(await tickAt(T0 + 10 * MINUTE)).toEqual([]); // the first run
+
+  await apply(created("8", schedule(T0, T0 + 5 * HOUR, T0 + 6 * HOUR)));
+  // The tick begins 11 minutes before the reveal window of task 7 ends, so it is not closing yet.
+  // The first send takes six minutes, which leaves five.
+  onSend = () => {
+    clock = reveal - 5 * MINUTE;
+  };
+  const sent = await tickAt(reveal - 11 * MINUTE);
+  expect(lines(sent)).toEqual(["11 New task #8", "103 Reveal now #7", "103 Reveal closing #7"]);
+  expect(sent[2]?.text).toContain("5 min left to reveal");
+});
+
 // ---------------------------------------------------------------------------------------------
 // The loop.
 
@@ -1146,7 +1282,7 @@ test("an_aborted_signal_runs_no_tick", async () => {
 // ---------------------------------------------------------------------------------------------
 // The web URL: checked once, when the notifier starts.
 
-/** The options of a notifier on `webUrl` that stays stopped, because its signal is aborted already. */
+/** The options of a notifier on `webUrl` that stays stopped: its signal is aborted already. */
 function stoppedOn(webUrl: string): NotifierOptions {
   const controller = new AbortController();
   controller.abort();
@@ -1227,4 +1363,51 @@ test("a_web_url_is_escaped_in_the_links_it_makes", async () => {
   expect(sent?.text).toContain(
     '<a href="https://tender.example:8443/a&amp;b&quot;c/tasks/7">Open task</a>',
   );
+});
+
+/** The message that `startNotifier` throws for `webUrl`. */
+function refusal(webUrl: string): string {
+  try {
+    startNotifier(stoppedOn(webUrl));
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  throw new Error(`startNotifier took ${JSON.stringify(webUrl)}`);
+}
+
+test("a_web_url_with_whitespace_or_a_login_is_refused", async () => {
+  // The URL is joined into every link as text: a blank in it is in every link, and a login in it
+  // is shown to everyone who gets a message.
+  const blanks = [
+    "https://tender.example ",
+    "https://tender.example\n",
+    "https://tender.example/my app",
+    "https://tender.example/a\tb", // the URL parser drops the tab, the link would keep it
+  ];
+  for (const webUrl of blanks) {
+    expect(refusal(webUrl), JSON.stringify(webUrl)).toMatch(/^webUrl must not contain whitespace/);
+  }
+  const logins = [
+    "https://user:secret@tender.example",
+    "https://user@tender.example/app/", // no password
+    "https://:secret@tender.example", // no username
+  ];
+  for (const webUrl of logins) {
+    expect(refusal(webUrl), webUrl).toMatch(/^webUrl must not contain a username or password/);
+  }
+
+  // A message that quotes the URL leaves the password out: it is a secret, and the message goes to
+  // the logs. Whichever rule refuses the URL, the password is not in it.
+  const withPassword = [
+    "https://user:secret@tender.example",
+    "https://user:secret@/app", // no host
+    "https://user:secret@tender.example/?ref=tg", // a query
+    "https://user:secret@tender.example/my app", // a blank
+  ];
+  for (const webUrl of withPassword) {
+    expect(refusal(webUrl), webUrl).not.toContain("secret");
+  }
+
+  // An @ in the path is no login.
+  await expect(startNotifier(stoppedOn("https://tender.example/@tender"))).resolves.toBeUndefined();
 });

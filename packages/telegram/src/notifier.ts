@@ -18,18 +18,24 @@ import { type RenderContext, renderAlert } from "./render";
  * - The clock, for what no event announces: `reveal_open`, `reveal_closing` and the two
  *   `deadline_reminder`s. Every tick looks at every task and relies on the dedupe below.
  *
- * An alert goes to each chat that `resolveRecipients` names, at most once per chat. The chat's row
- * in `tg_sent` is claimed before the message is sent and a failed send keeps it, so a restart, or
- * two notifiers at once, can lose a message but never send one twice. The claim, not the cursor,
- * is what makes the notifier safe to restart: a tick that dies halfway is run again from the old
- * cursor, and the alerts it already sent are skipped.
+ * An alert goes to each chat that `resolveRecipients` names. The notifier asks Telegram to send it
+ * at most once per chat: the chat's row in `tg_sent` is claimed before the request and a failed
+ * send keeps it, so a restart, or two notifiers at once, can lose a message but never make the
+ * notifier send one twice. The claim, not the cursor, makes the notifier safe to restart: a tick
+ * that dies halfway is run again from the old cursor, and the alerts it already sent are skipped.
+ *
+ * The bot's transport is another matter. `createBot` installs `autoRetry`, which repeats a request
+ * after a network error or a 5xx answer, so a message that Telegram took but did not confirm can
+ * reach a chat twice. The notifier cannot see that; the bot's setup has to settle it.
  *
  * What goes wrong, and what the notifier does about it:
  * - A `webUrl` that task links cannot be made from is refused by `startNotifier` before any tick.
  * - An alert that cannot be rendered or addressed (see `deliver`) is logged and dropped, and the
- *   tick goes on.
+ *   tick goes on. Its recipients are asked for up to three times first: a blip in the database
+ *   fails like a row that cannot be read, and an event alert is not looked at again.
  * - A send that fails is logged and not retried; the bot's `autoRetry` has already waited out a
- *   flood wait. A 403 means the chat blocked the bot, or the bot was kicked: the chat is unlinked.
+ *   flood wait. A 403 means the chat blocked the bot, or the bot was kicked: the chat is unlinked,
+ *   with a line in the log.
  * - A database error stops the tick, which the loop logs. The next tick starts from the old cursor.
  *
  * Times are the contract's: nanoseconds since the Unix epoch. They are bigints here and numeric in
@@ -48,7 +54,10 @@ export interface NotifierTickOptions {
   webUrl: string;
   /** The network the tasks live on. The symbol and decimals of a token depend on it. */
   network: NetworkId;
-  /** The clock. Defaults to the wall clock. */
+  /**
+   * The clock. Defaults to the wall clock. A tick reads it at its start and again before the
+   * timers, which can come minutes later.
+   */
   now?: () => Date;
 }
 
@@ -76,6 +85,8 @@ const WORKING_WINDOW_MS = 10 * 60_000;
 const REVEAL_CLOSING_NS = 10n * NS_PER_MINUTE;
 /** How long before the commit deadline each reminder goes out, in hours. */
 const REMINDER_HOURS = [24, 1] as const;
+/** How many times an alert's recipients are asked for before the alert is given up. */
+const RECIPIENT_TRIES = 3;
 
 /** Every message is Telegram HTML, and none unfurls the links in it. */
 const SEND_OPTIONS = { parse_mode: "HTML", link_preview_options: { is_disabled: true } } as const;
@@ -93,20 +104,26 @@ interface Tick {
 }
 
 /**
- * One pass over the events, the working signals and the clock, run with the time that
- * `opts.now` gives at the start. See the top of this file for what it does.
+ * One pass over the events, the working signals and the clock. The first two run on the time that
+ * `opts.now` gives at the start, and the timers on the time it gives when they begin: the sends
+ * behind a backlog of events can take minutes. See the top of this file for what it does.
  */
 export async function notifierTick(opts: NotifierTickOptions): Promise<void> {
-  const now = (opts.now ?? (() => new Date()))();
-  const tick: Tick = {
+  const clock = opts.now ?? (() => new Date());
+  const tick = tickAt(opts, clock());
+  await eventAlerts(tick);
+  await workingAlerts(tick);
+  await timerAlerts(tickAt(opts, clock()));
+}
+
+/** What a tick works with, for the time `now`. */
+function tickAt(opts: NotifierTickOptions, now: Date): Tick {
+  return {
     db: opts.db,
     bot: opts.bot,
     render: { webUrl: opts.webUrl, network: opts.network, now },
     nowNs: BigInt(now.getTime()) * NS_PER_MS,
   };
-  await eventAlerts(tick);
-  await workingAlerts(tick);
-  await timerAlerts(tick);
 }
 
 /**
@@ -161,23 +178,40 @@ export function startNotifier(opts: NotifierOptions): Promise<void> {
 }
 
 /**
- * Throws unless `webUrl` is an http(s) URL with a host and no query or fragment. Every link in a
- * message is `webUrl` and then `/tasks/<id>`, joined as text: a query or fragment would swallow
- * that path, and another scheme, such as `tg://`, which acts on the reader's account, would make
- * every link an action.
+ * Throws unless `webUrl` is an http(s) URL with a host, and with no query, fragment, whitespace or
+ * login. Every link in a message is `webUrl` and then `/tasks/<id>`, joined as text. A query or
+ * fragment would swallow that path, a blank would be in every link, and a login would be shown to
+ * everyone who gets a message. Another scheme, such as `tg://`, which acts on the reader's account,
+ * would make every link an action.
  */
 function checkWebUrl(webUrl: string): void {
+  const url = URL.parse(webUrl);
   // The text is what links are made of, so the text must start `http://` or `https://`. The URL
   // parser also takes `https:host` and leading blanks, which a joined link would carry along. For
   // these two schemes it fails on a missing host, so a URL that parses has one.
-  if (!/^https?:\/\//i.test(webUrl) || URL.parse(webUrl) === null) {
-    throw new Error(`webUrl must be an http(s) URL with a host, got ${JSON.stringify(webUrl)}`);
+  if (url === null || !/^https?:\/\//i.test(webUrl)) {
+    throw new Error(`webUrl must be an http(s) URL with a host, got ${shown(webUrl)}`);
   }
-  // A `?` or `#` starts a query or a fragment. The parser's `search` and `hash` read "" for an empty
-  // one, so it is the text that is checked.
+  // A `?` or `#` starts a query or a fragment. The parser's `search` and `hash` read "" for an
+  // empty one, so it is the text that is checked.
   if (/[?#]/.test(webUrl)) {
-    throw new Error(`webUrl must have no query or fragment, got ${JSON.stringify(webUrl)}`);
+    throw new Error(`webUrl must have no query or fragment, got ${shown(webUrl)}`);
   }
+  // The parser also drops tabs and line breaks and trims the ends, so here too it is the text.
+  if (/\s/.test(webUrl)) {
+    throw new Error(`webUrl must not contain whitespace, got ${shown(webUrl)}`);
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw new Error(`webUrl must not contain a username or password, got ${shown(webUrl)}`);
+  }
+}
+
+/**
+ * `webUrl` as an error message shows it. An `@` may start a login, which is a secret, and the
+ * message goes to the logs, so a URL with one is not shown.
+ */
+function shown(webUrl: string): string {
+  return webUrl.includes("@") ? "(not shown, it has an @)" : JSON.stringify(webUrl);
 }
 
 // The event stream.
@@ -245,12 +279,15 @@ interface TaskRow {
   tags: string[];
   commit_deadline: string;
   commit_count: number;
+  /** Whether entries are over: the commit deadline is not after the tick's time. */
+  closed: boolean;
 }
 
 /**
  * The alert that `row` makes, or null if it makes none. That is so for an event of another kind,
- * for a `committed` that replaces an entry, for a `new_task` whose commit window is over (nobody
- * can enter any more), and for a task the index does not hold, which `resolveRecipients` could not
+ * for a `committed` that replaces an entry, and for a `new_task` whose commit window is over
+ * (nobody can enter any more). It is so, with a line in the log, for an event that is malformed or
+ * names no task, and for a task the index does not hold, which `resolveRecipients` could not
  * address anyway.
  *
  * The task's id is `events.task_id`, which the indexer fills from `data.task_id`, or from `data.id`
@@ -266,19 +303,27 @@ async function alertOf(tick: Tick, row: EventRow): Promise<Alert | null> {
     console.error(`telegram notifier: skipped event ${row.id} (${row.event}): it is malformed`);
     return null;
   }
+  // The database compares the deadline with now: a value that is no number is then the alert's
+  // error, in `renderAlert`, and not a reason to stop the stream.
   const [task] = await tick.db.query<TaskRow>(
     `select title, token, reward::text as reward, tags,
-            commit_deadline::text as commit_deadline, commit_count
+            commit_deadline::text as commit_deadline, commit_count,
+            commit_deadline <= $2::numeric as closed
      from tasks where id = $1::numeric`,
-    [taskId],
+    [taskId, tick.nowNs],
   );
-  if (task === undefined) return null;
+  if (task === undefined) {
+    console.error(
+      `telegram notifier: skipped event ${row.id} (${row.event}): no task ${taskId} in the index`,
+    );
+    return null;
+  }
 
   const event = parsed.data;
   const title = titleOf(task.title, taskId);
   switch (event.event) {
     case "task_created":
-      if (tick.nowNs >= BigInt(task.commit_deadline)) return null;
+      if (task.closed) return null;
       return {
         kind: "new_task",
         taskId,
@@ -451,7 +496,7 @@ async function deliver(tick: Tick, alert: Alert): Promise<void> {
   let chats: string[];
   try {
     text = renderAlert(alert, tick.render);
-    chats = await resolveRecipients(tick.db, alert);
+    chats = await recipientsOf(tick.db, alert);
   } catch (error) {
     console.error(`telegram notifier: skipped ${alert.kind} for task ${alert.taskId}:`, error);
     return;
@@ -461,12 +506,29 @@ async function deliver(tick: Tick, alert: Alert): Promise<void> {
 }
 
 /**
+ * `resolveRecipients`, asked up to `RECIPIENT_TRIES` times, and its last error if every try fails.
+ * A blip in the database, such as a deadlock victim or a dropped connection, fails like a row that
+ * cannot be read, and an event alert that is skipped is not looked at again: the cursor passes it.
+ * A row that really cannot be read fails every time, so it costs two more queries and is skipped.
+ */
+async function recipientsOf(db: Db, alert: Alert): Promise<string[]> {
+  for (let attempt = 1; attempt < RECIPIENT_TRIES; attempt++) {
+    try {
+      return await resolveRecipients(db, alert);
+    } catch {
+      // Ask again. The last try is outside the loop, and its error is the caller's.
+    }
+  }
+  return resolveRecipients(db, alert);
+}
+
+/**
  * Sends `text` to `chat`, if `key` was not claimed for the chat before. The claim is made first and
- * a failed send keeps it, so a chat hears an alert at most once.
+ * a failed send keeps it, so the notifier asks for an alert to reach a chat at most once.
  *
  * Telegram answers 403 when the user blocked the bot or the bot was kicked from a group. The chat
- * cannot be reached, so its link and its tag watches go, and the next alert does not try it. Any
- * other failure is logged, and the tick goes on with the next chat.
+ * cannot be reached, so its link and its tag watches go, a line in the log says so, and the next
+ * alert does not try it. Any other failure is logged, and the tick goes on with the next chat.
  */
 async function sendOnce(tick: Tick, chat: string, key: string, text: string): Promise<void> {
   const claimed = await tick.db.query(
@@ -482,6 +544,8 @@ async function sendOnce(tick: Tick, chat: string, key: string, text: string): Pr
         await tx.query("delete from tg_links where chat_id = $1", [chat]);
         await tx.query("delete from tg_watches where chat_id = $1", [chat]);
       });
+      // The message only, as below: a GrammyError also carries the payload, which holds the text.
+      console.error(`telegram notifier: unlinked chat ${chat}: ${error.message}`);
       return;
     }
     // The message only: a GrammyError also carries the payload, which holds the text sent.
