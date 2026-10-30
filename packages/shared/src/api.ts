@@ -346,30 +346,30 @@ export type StartResponse = z.infer<typeof StartResponseSchema>;
  * `POST /v1/telegram/link`. `url` opens the bot in Telegram with a one-time nonce; `expires_at` is
  * ISO 8601 in UTC to the millisecond.
  */
-export const TelegramLinkSchema = z.object({
+export const TelegramLinkResponseSchema = z.object({
   url: z.string(),
   expires_at: z.iso.datetime(),
 });
-export type TelegramLink = z.infer<typeof TelegramLinkSchema>;
+export type TelegramLinkResponse = z.infer<typeof TelegramLinkResponseSchema>;
 
 // ---- Events -----------------------------------------------------------------------------------
 
 /**
- * The JSON in the `data` line of each message of `GET /v1/events`. `event` and `data` are the
- * event as the contract logged it; `height` is the block it was logged in, and `task_id` the task
- * it is about, null for an event that is about none, such as an agent registering.
+ * A message of `GET /v1/events`: the JSON in its `data` line. `event` and `data` are the event as
+ * the contract logged it; `height` is the block it was logged in, and `task_id` the task it is
+ * about, null for an event that is about none, such as an agent registering.
  *
  * `event` is any name and `data` any object on purpose: a stream can carry an event that a client
  * written before it existed has no schema for, and that must not fail the message. Consumers
  * narrow it with `TenderEventSchema`: parse `{ event, data }` to read a known event.
  */
-export const SseEventDataSchema = z.object({
+export const EventMessageSchema = z.object({
   event: z.string(),
   data: z.record(z.string(), z.unknown()),
   height: U64StringSchema,
   task_id: U64StringSchema.nullable(),
 });
-export type SseEventData = z.infer<typeof SseEventDataSchema>;
+export type EventMessage = z.infer<typeof EventMessageSchema>;
 
 // ---- Fetching ---------------------------------------------------------------------------------
 

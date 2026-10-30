@@ -524,11 +524,11 @@ const SAMPLES: { [name in SchemaName]: Sample[] } = {
     { body: { token: "a-bearer-token", expires_at: SOON, key_kind: "full_access" } },
   ],
   StartResponseSchema: [{ body: { ok: true, working_count: 3 } }],
-  TelegramLinkSchema: [
+  TelegramLinkResponseSchema: [
     { body: { url: "https://t.me/tender_test_bot?start=abc", expires_at: SOON } },
   ],
   // `data` is any object on purpose, so the sample leaves it empty.
-  SseEventDataSchema: [{ body: { event: "task_created", data: {}, height: "90", task_id: "7" } }],
+  EventMessageSchema: [{ body: { event: "task_created", data: {}, height: "90", task_id: "7" } }],
 };
 
 /** The path to every key of `value`, at every depth. An array is entered at its first item. */

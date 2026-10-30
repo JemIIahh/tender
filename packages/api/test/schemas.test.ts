@@ -16,6 +16,7 @@ import {
   ChallengeResponseSchema,
   canonicalJson,
   ErrorBodySchema,
+  EventMessageSchema,
   HealthResponseSchema,
   HealthUnavailableSchema,
   HeldoutUploadResponseSchema,
@@ -26,11 +27,10 @@ import {
   type Scorecard,
   ScorecardSchema,
   SignInResponseSchema,
-  SseEventDataSchema,
   StartResponseSchema,
   sha256Hex,
   TaskDetailResponseSchema,
-  TelegramLinkSchema,
+  TelegramLinkResponseSchema,
   type TenderEvent,
   TenderEventSchema,
 } from "@tender/shared";
@@ -524,7 +524,7 @@ test("sign_in_uploads_start_and_telegram_link_match_their_schemas", async () => 
 
   const link = await post(app, "/v1/telegram/link", undefined, token);
   expect(link.status).toBe(200);
-  const { url, expires_at } = fits(TelegramLinkSchema, link.body, "POST /v1/telegram/link");
+  const { url, expires_at } = fits(TelegramLinkResponseSchema, link.body, "POST /v1/telegram/link");
   expect(url).toMatch(new RegExp(`^https://t\\.me/${BOT}\\?start=`));
   expect(new Date(expires_at).getTime()).toBeGreaterThan(Date.now());
 });
@@ -596,7 +596,7 @@ test("event_stream_messages_match_their_schema", async () => {
   expect(frames).toHaveLength(count);
 
   const messages = frames.map((frame) => {
-    const message = fits(SseEventDataSchema, JSON.parse(frame.data), `event ${frame.id}`);
+    const message = fits(EventMessageSchema, JSON.parse(frame.data), `event ${frame.id}`);
     // The frame's own `event:` line names the same event as its data.
     expect(frame.event, `event ${frame.id}`).toBe(message.event);
     // The data is the contract's event, which `TenderEventSchema` reads as it is.
@@ -746,6 +746,6 @@ test("api_types_and_schema_types_are_the_same_type_both_ways", () => {
   expectTypeOf<Pair<ChallengeResponse, Shared.ChallengeResponse>>().toEqualTypeOf<true>();
   expectTypeOf<Pair<SignInResponse, Shared.SignInResponse>>().toEqualTypeOf<true>();
   expectTypeOf<Pair<StartResponse, Shared.StartResponse>>().toEqualTypeOf<true>();
-  expectTypeOf<Pair<TelegramLinkResponse, Shared.TelegramLink>>().toEqualTypeOf<true>();
-  expectTypeOf<Pair<EventMessage, Shared.SseEventData>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<TelegramLinkResponse, Shared.TelegramLinkResponse>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<EventMessage, Shared.EventMessage>>().toEqualTypeOf<true>();
 });
