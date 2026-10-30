@@ -9,7 +9,7 @@ import {
   type KeyPairString,
   PublicKey,
 } from "near-api-js";
-import { DeployEnv, type Outcome, parseKey, UsageError } from "./deploy";
+import { DeployEnv, type EnvWriter, type Outcome, parseKey, UsageError } from "./deploy";
 import { loadEnv, REPO_ROOT } from "./lib/env";
 
 /**
@@ -37,6 +37,11 @@ import { loadEnv, REPO_ROOT } from "./lib/env";
  *   not on the chain (the run stopped there)  that same key is added, and no other is made
  *   on the chain with another permission      an error: the script will not widen or narrow a key
  *
+ * The error tells the owner to take a function-call key off the account along with the variable.
+ * For any other key, a full-access one above all, it tells them to remove the variable alone and
+ * never to delete the key: an account without a full-access key is locked for good, and the deploy
+ * made one (`<ROLE>_FULL_ACCESS_KEY`, which a service must never hold) for each account.
+ *
  * The variable is read from `.env` and the network's file, the network's winning, as the services
  * read it. A value in `.env` is the owner's, so it is used as it is and nothing is written.
  *
@@ -54,6 +59,9 @@ const ROLES: Readonly<Record<Role, { stem: string; methods: readonly string[] }>
 };
 
 const isRole = (value: string): value is Role => Object.hasOwn(ROLES, value);
+
+/** How the env file names this script: in the header of a file it makes, and in what it says to run. */
+const WRITER: EnvWriter = { script: "scripts/keeper-key.ts", rerun: "this script" };
 
 const MAINNET_REFUSED =
   "mainnet is not handled by this script: plan 07 owns the mainnet keys, which need the owner's approval";
@@ -167,16 +175,61 @@ class NearChain implements KeyChain {
   }
 }
 
+type FunctionCallPermission = Extract<ChainPermission, { FunctionCall: unknown }>;
+
+function isFunctionCall(permission: ChainPermission): permission is FunctionCallPermission {
+  return typeof permission === "object" && permission !== null && "FunctionCall" in permission;
+}
+
 /** The sentence for a key's permission, in the terms of this script. */
 function describePermission(permission: ChainPermission): string {
   if (permission === "FullAccess") return "a full-access key";
-  if (typeof permission === "object" && permission !== null && "FunctionCall" in permission) {
+  if (isFunctionCall(permission)) {
     const { receiver_id: receiver, method_names: methods, allowance } = permission.FunctionCall;
     const cap =
       allowance === null || allowance === undefined ? "unlimited allowance" : "an allowance";
-    return `a function-call key to ${receiver} for ${methods.join(", ")} with ${cap}`;
+    // On NEAR a key with no methods listed may call any of them.
+    const calls = methods.length === 0 ? "any method" : methods.join(", ");
+    return `a function-call key to ${receiver} for ${calls} with ${cap}`;
   }
   return "a key of another kind";
+}
+
+/**
+ * What is said of a stored service key that is on the chain with a permission the script does not
+ * add, and the advice for the owner. A function-call key comes off the account without a loss. Any
+ * other kind may be the way into the account: an account whose last full-access key is deleted is
+ * locked for good, and the deploy made only one. So for those the owner is told to remove the
+ * variable alone, and never to delete the key. `sameAsFullKey` is the mix-up that P02-R27 is about,
+ * the deploy's own full-access key put under the service's name.
+ */
+function refusedStoredKey(found: {
+  keyVar: string;
+  fullKeyVar: string;
+  accountId: string;
+  publicKey: string;
+  permission: ChainPermission;
+  sameAsFullKey: boolean;
+  wanted: ChainPermission;
+}): string {
+  const { keyVar, fullKeyVar, accountId, publicKey, permission, sameAsFullKey, wanted } = found;
+  const is = sameAsFullKey
+    ? `the same key as ${fullKeyVar}: ${describePermission(permission)}`
+    : describePermission(permission);
+  const head = `${keyVar} holds ${publicKey}, which is ${is} on ${accountId}, not ${describePermission(wanted)}.`;
+  if (isFunctionCall(permission) && !sameAsFullKey) {
+    return (
+      `${head} This script does not change a key: remove that key from the account and the ` +
+      `${keyVar} line from the env file, and run it again.`
+    );
+  }
+  let why = "this script cannot tell what it is for";
+  if (permission === "FullAccess") why = "an account without a full-access key is locked for good";
+  else if (sameAsFullKey) why = `${fullKeyVar} names it`;
+  return (
+    `${head} A service must hold a function-call key. Remove only the ${keyVar} line from the ` +
+    `env file, and run this script again to make one. Do not delete the key from the account: ${why}.`
+  );
 }
 
 /** Whether the permission is the one the script adds: to `contractId`, for exactly `methods`. */
@@ -185,9 +238,7 @@ function isWanted(
   contractId: string,
   methods: readonly string[],
 ): boolean {
-  if (typeof permission !== "object" || permission === null || !("FunctionCall" in permission)) {
-    return false;
-  }
+  if (!isFunctionCall(permission)) return false;
   const { receiver_id: receiver, method_names: names, allowance } = permission.FunctionCall;
   if (receiver !== contractId || (allowance !== null && allowance !== undefined)) return false;
   const have = [...new Set(names)].sort();
@@ -224,7 +275,7 @@ export async function addRoleKey(
   const keyVar = `${stem}_PRIVATE_KEY`;
 
   // The env file is opened first, and made private, whatever else turns out to be wrong.
-  const file = await DeployEnv.open(dir, network);
+  const file = await DeployEnv.open(dir, network, WRITER);
   checkContract(contractId, "the contract");
   const env = loadEnv(network, { dir, required: [accountVar, fullKeyVar] });
   const accountId = (env[accountVar] ?? "").trim();
@@ -252,13 +303,16 @@ export async function addRoleKey(
     const onChain = await chain.viewAccessKey(accountId, publicKey);
     if (onChain !== null) {
       if (!isWanted(onChain.permission, contractId, methods)) {
-        const wanted: ChainPermission = {
-          FunctionCall: { receiver_id: contractId, method_names: methods },
-        };
         throw new Error(
-          `${keyVar} holds ${publicKey}, which is ${describePermission(onChain.permission)} on ` +
-            `${accountId}, not ${describePermission(wanted)}. This script does not change a key: ` +
-            "remove the key from the account and the variable from the env file, and run it again.",
+          refusedStoredKey({
+            keyVar,
+            fullKeyVar,
+            accountId,
+            publicKey,
+            permission: onChain.permission,
+            sameAsFullKey: publicKey === fullKey.getPublicKey().toString(),
+            wanted: { FunctionCall: { receiver_id: contractId, method_names: methods } },
+          }),
         );
       }
       log(`SKIP add ${role} key ${publicKey} to ${accountId} (exists)`);

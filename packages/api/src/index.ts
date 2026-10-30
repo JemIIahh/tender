@@ -23,7 +23,7 @@ export type {
   KeeperTickResult,
   StartKeeperOptions,
 } from "./keeper";
-export { keeperTick, startKeeper } from "./keeper";
+export { KeeperMemory, keeperTick, startKeeper } from "./keeper";
 export type { AgentFilter, TaskFilter } from "./queries";
 export {
   getAgentDetail,

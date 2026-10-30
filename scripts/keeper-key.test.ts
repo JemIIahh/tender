@@ -7,6 +7,7 @@ import { TenderError } from "@tender/client";
 import { NETWORKS } from "@tender/shared";
 import { KeyPair } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
+import { DeployEnv } from "./deploy";
 import {
   addRoleKey,
   type ChainPermission,
@@ -291,7 +292,7 @@ test("key_script_takes_a_blank_service_key_for_none", async () => {
   ).toBe(result.publicKey);
 });
 
-test("key_script_refuses_a_stored_key_that_the_chain_has_with_another_permission", async () => {
+test("key_script_refuses_a_stored_function_call_key_with_another_permission_and_says_to_remove_it", async () => {
   const stored = KeyPair.fromRandom("ed25519");
   const fc = (over: Record<string, unknown>): ChainPermission => ({
     FunctionCall: {
@@ -302,7 +303,6 @@ test("key_script_refuses_a_stored_key_that_the_chain_has_with_another_permission
     },
   });
   const cases: Array<[string, ChainPermission, RegExp]> = [
-    ["a full-access key", "FullAccess", /a full-access key/],
     [
       "another receiver",
       fc({ receiver_id: "other.testnet" }),
@@ -315,6 +315,8 @@ test("key_script_refuses_a_stored_key_that_the_chain_has_with_another_permission
     ],
     ["one method less", fc({ method_names: ["void_task"] }), /for void_task with/],
     ["an allowance", fc({ allowance: "1000000000000000000000000" }), /with an allowance/],
+    // An empty list means every method on NEAR, and is said so.
+    ["every method", fc({ method_names: [] }), /for any method with unlimited allowance/],
   ];
   for (const [what, permission, message] of cases) {
     const dir = await dirWith({ [ENV_FILE]: deployed(`KEEPER_PRIVATE_KEY=${stored.toString()}`) });
@@ -328,8 +330,82 @@ test("key_script_refuses_a_stored_key_that_the_chain_has_with_another_permission
     );
 
     expect(error, what).toMatch(message);
+    expect(error, what).not.toContain("for  with");
+    // A function-call key comes off the account without a loss: that is the advice for it.
+    expect(error, what).toContain(
+      "remove that key from the account and the KEEPER_PRIVATE_KEY line from the env file, and run it again",
+    );
     expect(error, what).toContain("KEEPER_PRIVATE_KEY");
     expect(error, what).toContain(stored.getPublicKey().toString());
+    expect(error, what).not.toContain(secretOf(stored.toString()));
+    expect(added, what).toEqual([]);
+    expect(await readFile(join(dir, ENV_FILE), "utf8"), what).toBe(text);
+  }
+});
+
+test("key_script_never_advises_deleting_the_full_access_key_when_the_service_key_is_it", async () => {
+  // The mix-up that P02-R27 is about: the full-access key of the deploy, put under the service's
+  // name. "Remove the key from the account" would delete the only way into the account for good.
+  const roles = [
+    ["keeper", KEEPER, keeperFull],
+    ["judge", JUDGE, judgeFull],
+  ] as const;
+  for (const [role, account, full] of roles) {
+    const stem = role.toUpperCase();
+    const dir = await dirWith({ [ENV_FILE]: deployed(`${stem}_PRIVATE_KEY=${full.toString()}`) });
+    const text = await readFile(join(dir, ENV_FILE), "utf8");
+    const { chain, added } = fakeChain();
+
+    const error = await run(role, dir, chain).then(
+      () => "ran",
+      (e: Error) => e.message,
+    );
+
+    expect(error, role).toContain(`${stem}_PRIVATE_KEY holds ${full.getPublicKey()}`);
+    // It says whose key it is, and what is wrong with it.
+    expect(error, role).toContain(`is the same key as ${stem}_FULL_ACCESS_KEY`);
+    expect(error, role).toContain(`a full-access key on ${account}`);
+    // The advice is for the variable, and against touching the account.
+    expect(error, role).toContain(`Remove only the ${stem}_PRIVATE_KEY line from the env file`);
+    expect(error, role).toContain("Do not delete the key from the account");
+    expect(error, role).not.toMatch(/remove (that|the|this) key from the account/i);
+    expect(error, role).not.toContain(secretOf(full.toString()));
+    // Nothing was changed, on the chain or in the file.
+    expect(added, role).toEqual([]);
+    expect(await readFile(join(dir, ENV_FILE), "utf8"), role).toBe(text);
+  }
+});
+
+test("key_script_says_to_remove_the_variable_alone_for_any_stored_key_that_is_no_function_call_key", async () => {
+  const stored = KeyPair.fromRandom("ed25519");
+  const cases: Array<[string, ChainPermission, RegExp]> = [
+    // A full-access key of the owner's, which is not the one of the deploy.
+    ["another full-access key", "FullAccess", /which is a full-access key on keeper\./],
+    // A kind the script does not know, such as a key for paying gas that a newer node reports.
+    [
+      "a key of another kind",
+      { GasKeyFullAccess: { balance: "1", num_nonces: 1 } } as unknown as ChainPermission,
+      /which is a key of another kind on keeper\./,
+    ],
+  ];
+  for (const [what, permission, message] of cases) {
+    const dir = await dirWith({ [ENV_FILE]: deployed(`KEEPER_PRIVATE_KEY=${stored.toString()}`) });
+    const text = await readFile(join(dir, ENV_FILE), "utf8");
+    const { chain, keys, added } = fakeChain();
+    keys.set(`${KEEPER} ${stored.getPublicKey()}`, permission);
+
+    const error = await run("keeper", dir, chain).then(
+      () => "ran",
+      (e: Error) => e.message,
+    );
+
+    expect(error, what).toMatch(message);
+    expect(error, what).toContain(stored.getPublicKey().toString());
+    // It is not the deploy's key, so it does not say so.
+    expect(error, what).not.toContain("is the same key as");
+    expect(error, what).toContain("Remove only the KEEPER_PRIVATE_KEY line from the env file");
+    expect(error, what).toContain("Do not delete the key from the account");
+    expect(error, what).not.toMatch(/remove (that|the|this) key from the account/i);
     expect(error, what).not.toContain(secretOf(stored.toString()));
     expect(added, what).toEqual([]);
     expect(await readFile(join(dir, ENV_FILE), "utf8"), what).toBe(text);
@@ -520,9 +596,51 @@ test("key_script_stops_before_the_chain_when_the_env_file_does_not_read_back", a
   const dir = await dirWith({ [ENV_FILE]: deployed("PADDED= \nNEXT=value") });
   const { chain, added } = fakeChain();
 
-  await expect(run("keeper", dir, chain)).rejects.toThrow(/does not read back as written/);
+  const error = await run("keeper", dir, chain).then(
+    () => "ran",
+    (e: Error) => e.message,
+  );
 
+  expect(error).toMatch(/does not read back as written/);
+  // The owner is told to run this script again, not the deploy, which has nothing to do with it.
+  expect(error).toMatch(/fix that line and run this script again\.$/);
+  expect(error).not.toContain("run the deploy again");
   expect(added).toEqual([]);
+});
+
+test("key_script_names_itself_in_the_header_of_an_env_file_it_creates", async () => {
+  // The owner keeps the keys in `.env`, so there is no network file yet: the script makes it.
+  const dir = await dirWith({ ".env": deployed() });
+  const { chain } = fakeChain();
+
+  await run("keeper", dir, chain);
+
+  const text = await readFile(join(dir, ENV_FILE), "utf8");
+  expect(text.split("\n")[0]).toBe(
+    "# Written by scripts/keeper-key.ts. It holds private keys: never commit this file.",
+  );
+  expect(text).not.toContain("scripts/deploy.ts");
+  expect(statSync(join(dir, ENV_FILE)).mode & 0o777).toBe(0o600);
+  expect((await envOf(dir)).KEEPER_PRIVATE_KEY).toMatch(/^ed25519:/);
+});
+
+test("the_deploys_env_file_says_what_it_always_has_when_it_is_given_no_writer", async () => {
+  // `DeployEnv` takes the name of the script that writes through it, for the header of a file it
+  // makes and for what an error says to run again. The deploy passes none, and its text is unchanged.
+  const dir = await dirWith({});
+  const file = await DeployEnv.open(dir, "testnet");
+
+  await file.add([["SOME_NAME", "some-value"]]);
+
+  expect((await readFile(join(dir, ENV_FILE), "utf8")).split("\n")[0]).toBe(
+    "# Written by scripts/deploy.ts. It holds private keys: never commit this file.",
+  );
+
+  await writeFile(join(dir, ENV_FILE), "PADDED= \nNEXT=value\n");
+  const again = await DeployEnv.open(dir, "testnet");
+  await expect(again.add([["MORE", "value"]])).rejects.toThrow(
+    /does not read back as written .* fix that line and run the deploy again\.$/s,
+  );
 });
 
 test("key_script_does_not_touch_the_mainnet_file", async () => {

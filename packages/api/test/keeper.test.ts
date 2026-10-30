@@ -1,7 +1,7 @@
 import { type TenderClient, TenderError } from "@tender/client";
 import { type Db, migrate, openDb } from "@tender/db";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
-import { type KeeperChain, keeperTick, startKeeper } from "../src/index";
+import { type KeeperChain, KeeperMemory, keeperTick, startKeeper } from "../src/index";
 import { resetDb, seedLifecycle } from "./helpers";
 
 // The keeper's decisions, against a database and a chain that is a fake. Nothing here starts a
@@ -483,7 +483,7 @@ test("keeper_logs_any_other_failure_by_name_and_code_alone_and_goes_on", async (
   expect(lines.join("\n")).not.toMatch(/rpc\.example|SECRET|apiKey/);
 });
 
-test("keeper_logs_a_failed_read_and_reads_the_next_task", async () => {
+test("keeper_logs_a_failed_read_by_name_and_code_alone_and_reads_no_more_that_tick", async () => {
   const settled = { kind: "picked", at: REVEAL } as const;
   for (const id of [1, 2]) await addTask({ id, commitCount: 1, settled });
   const { chain, calls } = fakeChain(
@@ -501,12 +501,11 @@ test("keeper_logs_a_failed_read_and_reads_the_next_task", async () => {
 
   const result = await keeperTick({ db, client: chain, now: () => REVEAL + SECOND, log });
 
-  expect(idsOf(calls, "getTask")).toEqual([1n, 2n]);
-  expect(result.cleaned).toEqual([2n]);
-  expect(lines).toEqual([
-    "ERROR keeper: get_task task 1 failed (Error ETIMEDOUT)",
-    "keeper: cleaned task 2",
-  ]);
+  // The chain may be down, and then every read would fail the same way and log a line of its own:
+  // one failed read ends the reading for the tick.
+  expect(idsOf(calls, "getTask")).toEqual([1n]);
+  expect(result).toEqual({ voided: [], cleaned: [] });
+  expect(lines).toEqual(["ERROR keeper: get_task task 1 failed (Error ETIMEDOUT)"]);
 });
 
 test("keeper_sends_nothing_more_once_the_signal_aborts", async () => {
@@ -531,6 +530,252 @@ test("keeper_sends_nothing_more_once_the_signal_aborts", async () => {
 
   expect(idsOf(calls, "voidTask")).toEqual([1n, 2n]);
   expect(result.voided).toEqual([1n, 2n]);
+});
+
+// ---- What it remembers --------------------------------------------------------------------------
+
+/** Runs the ticks of a keeper that has a memory, at a fixed time, and says nothing. */
+function ticker(chain: KeeperChain, now: bigint) {
+  const memory = new KeeperMemory();
+  return () => keeperTick({ db, client: chain, now: () => now, log: () => {}, memory });
+}
+
+test("keeper_does_not_read_a_settled_task_that_took_no_entries", async () => {
+  const settled = { kind: "voided", at: REVEAL } as const;
+  await addTask({ id: 1, commitCount: 0, settled });
+  await addTask({ id: 2, commitCount: 3, settled });
+  const { chain, calls } = fakeChain({ "2": { cleaned: 0, commit_count: 3 } });
+
+  await keeperTick({ db, client: chain, now: () => REVEAL + SECOND, log: () => {} });
+
+  // Task 1 has nothing to clean, so it costs no read, on this tick or on any.
+  expect(idsOf(calls, "getTask")).toEqual([2n]);
+});
+
+test("keeper_never_reads_a_task_again_once_it_has_found_it_clean", async () => {
+  const settled = { kind: "picked", at: REVEAL } as const;
+  for (const id of [1, 2]) await addTask({ id, commitCount: 2, settled });
+  const views = {
+    "1": { cleaned: 2, commit_count: 2 },
+    "2": { cleaned: 0, commit_count: 2 },
+  };
+  const { chain, calls } = fakeChain(views);
+  const tick = ticker(chain, REVEAL + SECOND);
+  const readsOf = async () => {
+    calls.length = 0;
+    await tick();
+    return idsOf(calls, "getTask");
+  };
+
+  expect(await readsOf()).toEqual([1n, 2n]);
+  // Task 1 was clean, and a settled task takes no more entries: it stays so. Task 2 is read again.
+  expect(await readsOf()).toEqual([2n]);
+  // Until a read finds it clean too, which is the last time.
+  views["2"] = { cleaned: 2, commit_count: 2 };
+  expect(await readsOf()).toEqual([2n]);
+  expect(idsOf(calls, "cleanup")).toEqual([]);
+  expect(await readsOf()).toEqual([]);
+  expect(calls).toEqual([]);
+});
+
+test("keeper_reads_a_clean_task_again_on_every_tick_without_a_memory", async () => {
+  const settled = { kind: "picked", at: REVEAL } as const;
+  await addTask({ id: 1, commitCount: 2, settled });
+  const { chain, calls } = fakeChain({ "1": { cleaned: 2, commit_count: 2 } });
+
+  for (let tick = 0; tick < 3; tick++) {
+    await keeperTick({ db, client: chain, now: () => REVEAL + SECOND, log: () => {} });
+  }
+
+  expect(idsOf(calls, "getTask")).toEqual([1n, 1n, 1n]);
+});
+
+test("keeper_leaves_a_void_that_failed_alone_for_the_next_10_ticks", async () => {
+  await addTask({ id: 1 });
+  const { chain, calls } = fakeChain(
+    {},
+    {
+      voidTask: () => {
+        throw new TenderError("E_NOT_FOUND", "Smart contract panicked: E_NOT_FOUND: 1");
+      },
+    },
+  );
+  const tick = ticker(chain, LONG_AFTER);
+
+  const sent: number[] = [];
+  for (let n = 1; n <= 13; n++) {
+    await tick();
+    sent.push(idsOf(calls, "voidTask").length);
+  }
+
+  // Sent on tick 1; left alone on ticks 2 to 11; sent again on tick 12, and left alone after that.
+  expect(sent).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2]);
+});
+
+test("keeper_does_not_leave_alone_a_void_that_lost_the_race", async () => {
+  await addTask({ id: 1 });
+  const { chain, calls } = fakeChain(
+    {},
+    {
+      voidTask: () => {
+        throw new TenderError("E_SETTLED", "Smart contract panicked: E_SETTLED: 1");
+      },
+    },
+  );
+  const tick = ticker(chain, LONG_AFTER);
+
+  for (let n = 1; n <= 3; n++) await tick();
+
+  // The index shows the task unsettled until it catches up, which is soon: it is tried each tick.
+  expect(idsOf(calls, "voidTask")).toEqual([1n, 1n, 1n]);
+});
+
+test("keeper_leaves_a_cleanup_that_failed_alone_for_the_next_10_ticks", async () => {
+  await addTask({ id: 1, commitCount: 2, settled: { kind: "picked", at: REVEAL } });
+  const { chain, calls } = fakeChain(
+    { "1": { cleaned: 0, commit_count: 2 } },
+    {
+      cleanup: () => {
+        throw new TenderError("E_LIMIT", "Smart contract panicked: E_LIMIT: 1");
+      },
+    },
+  );
+  const tick = ticker(chain, REVEAL + SECOND);
+
+  const sent: Array<[number, number]> = [];
+  for (let n = 1; n <= 13; n++) {
+    await tick();
+    sent.push([idsOf(calls, "getTask").length, idsOf(calls, "cleanup").length]);
+  }
+
+  // A task being left alone is not read either: there is nothing to do with the answer.
+  const once: [number, number] = [1, 1];
+  const twice: [number, number] = [2, 2];
+  expect(sent).toEqual([...Array(11).fill(once), twice, twice]);
+});
+
+test("keeper_does_not_leave_alone_a_cleanup_that_lost_the_race", async () => {
+  await addTask({ id: 1, commitCount: 2, settled: { kind: "picked", at: REVEAL } });
+  const { chain, calls } = fakeChain(
+    { "1": { cleaned: 0, commit_count: 2 } },
+    {
+      cleanup: () => {
+        throw new TenderError("E_PHASE", "Smart contract panicked: E_PHASE: not settled");
+      },
+    },
+  );
+  const tick = ticker(chain, REVEAL + SECOND);
+
+  for (let n = 1; n <= 3; n++) await tick();
+
+  expect(idsOf(calls, "cleanup")).toEqual([1n, 1n, 1n]);
+});
+
+test("keeper_gets_to_the_rest_when_ten_tasks_keep_failing", async () => {
+  for (let id = 1; id <= 12; id++) await addTask({ id });
+  await addTask({ id: 101, commitCount: 2, settled: { kind: "picked", at: LONG_AFTER - SECOND } });
+  // Ten tasks of an index of another deployment: the chain has none of them. Tried in id order,
+  // they would take every void slot of every tick, and leave nothing for the rest.
+  const { chain, calls } = fakeChain(
+    { "101": { cleaned: 0, commit_count: 2 } },
+    {
+      voidTask: (id) => {
+        if (id <= 10n)
+          throw new TenderError("E_NOT_FOUND", `Smart contract panicked: E_NOT_FOUND: ${id}`);
+      },
+    },
+  );
+  const tick = ticker(chain, LONG_AFTER);
+
+  const first = await tick();
+  expect(idsOf(calls, "voidTask")).toEqual([1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n, 10n]);
+  expect(first).toEqual({ voided: [], cleaned: [] });
+
+  calls.length = 0;
+  const second = await tick();
+  expect(idsOf(calls, "voidTask")).toEqual([11n, 12n]);
+  expect(idsOf(calls, "cleanup")).toEqual([101n]);
+  expect(second).toEqual({ voided: [11n, 12n], cleaned: [101n] });
+});
+
+test("keeper_reads_no_more_after_a_failed_read_and_leaves_that_task_alone_for_10_ticks", async () => {
+  const settled = { kind: "picked", at: REVEAL } as const;
+  for (const id of [1, 2, 3]) await addTask({ id, commitCount: 1, settled });
+  const { chain, calls } = fakeChain(
+    { "2": { cleaned: 0, commit_count: 1 }, "3": { cleaned: 0, commit_count: 1 } },
+    {
+      getTask: (id) => {
+        if (id === 1n) throw Object.assign(new Error("timed out"), { code: "ETIMEDOUT" });
+      },
+    },
+  );
+  const tick = ticker(chain, REVEAL + SECOND);
+
+  // Tick 1: the read of task 1 fails and ends the reading.
+  await tick();
+  expect(calls).toEqual([{ method: "getTask", id: 1n }]);
+
+  // Tick 2: task 1 is left alone, and the others are read and cleaned. A task whose read keeps
+  // failing does not end the reading of every tick after it.
+  calls.length = 0;
+  const second = await tick();
+  expect(idsOf(calls, "getTask")).toEqual([2n, 3n]);
+  expect(second.cleaned).toEqual([2n, 3n]);
+
+  // Ticks 3 to 11 leave it alone; tick 12 tries it again, and that read ends the tick as before.
+  calls.length = 0;
+  for (let n = 3; n <= 11; n++) await tick();
+  expect(idsOf(calls, "getTask")).not.toContain(1n);
+  calls.length = 0;
+  await tick();
+  expect(calls).toEqual([{ method: "getTask", id: 1n }]);
+});
+
+test("keeper_leaves_a_settled_task_that_is_not_on_the_chain_alone_for_10_ticks", async () => {
+  await addTask({ id: 1, commitCount: 2, settled: { kind: "picked", at: REVEAL } });
+  const { chain, calls } = fakeChain();
+  const tick = ticker(chain, REVEAL + SECOND);
+
+  const reads: number[] = [];
+  for (let n = 1; n <= 13; n++) {
+    await tick();
+    reads.push(idsOf(calls, "getTask").length);
+  }
+
+  // The index may be of another deployment, whose tasks the chain will never show.
+  expect(reads).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2]);
+});
+
+// ---- A log that throws --------------------------------------------------------------------------
+
+test("keeper_does_its_whole_tick_when_the_log_throws", async () => {
+  for (const id of [1, 2, 3]) await addTask({ id });
+  await addTask({ id: 4, commitCount: 1, settled: { kind: "picked", at: LONG_AFTER } });
+  const { chain, calls } = fakeChain(
+    { "4": { cleaned: 0, commit_count: 1 } },
+    {
+      voidTask: (id) => {
+        if (id === 2n) throw new TenderError("E_AUTH", "no");
+      },
+    },
+  );
+  let logged = 0;
+
+  const result = await keeperTick({
+    db,
+    client: chain,
+    now: () => LONG_AFTER,
+    log: () => {
+      logged += 1;
+      throw new Error("the log sink is down");
+    },
+  });
+
+  // Every action of the tick was sent, though each line the keeper wrote about one threw.
+  expect(idsOf(calls, "voidTask")).toEqual([1n, 2n, 3n]);
+  expect(idsOf(calls, "cleanup")).toEqual([4n]);
+  expect(result).toEqual({ voided: [1n, 3n], cleaned: [4n] });
+  expect(logged).toBe(4);
 });
 
 // ---- The clock and the log ----------------------------------------------------------------------
@@ -653,6 +898,83 @@ test("start_keeper_logs_a_tick_that_throws_and_ticks_again", async () => {
   await vi.advanceTimersByTimeAsync(1_000);
   expect(asked).toBe(3);
   expect(lines).toHaveLength(1);
+
+  controller.abort();
+  await done;
+});
+
+test("start_keeper_goes_on_ticking_and_stops_cleanly_when_the_log_throws", async () => {
+  vi.useFakeTimers();
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => void unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const controller = new AbortController();
+    let asked = 0;
+    // The first tick fails, so that the keeper has a line to write about it, and the line throws.
+    const flaky = stubDb(async () => {
+      asked += 1;
+      if (asked === 1) throw new Error("db down");
+    });
+    let logged = 0;
+
+    const done = startKeeper({
+      db: flaky,
+      client: idleChain,
+      intervalMs: 1_000,
+      signal: controller.signal,
+      log: () => {
+        logged += 1;
+        throw new Error("the log sink is down");
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(logged).toBe(1);
+
+    // It carries on: two more ticks, each asking twice and finding nothing to do.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(asked).toBe(1 + 2 + 2);
+
+    controller.abort();
+    await done;
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    // A rejection that nothing handled surfaces once the real event loop turns.
+    vi.useRealTimers();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    process.off("unhandledRejection", onUnhandled);
+  }
+  expect(unhandled).toEqual([]);
+});
+
+test("start_keeper_remembers_between_ticks_what_failed", async () => {
+  vi.useFakeTimers();
+  const controller = new AbortController();
+  // One expired task, and no settled one; the chain refuses its void.
+  const oneExpired = stubDb(async (sql) => (sql.includes("join events") ? [] : [{ id: "7" }]));
+  const voids: bigint[] = [];
+  const refusing: KeeperChain = {
+    getTask: async () => null,
+    voidTask: async (id) => {
+      voids.push(id);
+      throw new TenderError("E_NOT_FOUND", "Smart contract panicked: E_NOT_FOUND: 7");
+    },
+    cleanup: async () => undefined,
+  };
+
+  const done = startKeeper({
+    db: oneExpired,
+    client: refusing,
+    intervalMs: 1_000,
+    signal: controller.signal,
+    log: () => {},
+  });
+
+  // Ticks run at 0 s, 1 s, 2 s... The void is sent on the first and left alone for the next 10.
+  await vi.advanceTimersByTimeAsync(10_999);
+  expect(voids).toEqual([7n]);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(voids).toEqual([7n, 7n]);
 
   controller.abort();
   await done;

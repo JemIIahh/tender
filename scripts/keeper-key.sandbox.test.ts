@@ -41,6 +41,7 @@ afterAll(async () => {
 });
 
 const ENV_FILE = ".env.deploy.sandbox";
+const TGAS = 1_000_000_000_000n;
 
 /** A new directory with the env file the deploy leaves for the chain's keeper and judge. */
 async function deployedDir(): Promise<string> {
@@ -144,7 +145,9 @@ test("key_script_adds_keys_with_the_permission_of_a_keeper_and_of_a_judge", asyn
   }
 
   // The key does the keeper's work: the chain lets it call `void_task` and `cleanup`, and the
-  // contract answers for a task that is not there. It does not let it call anything else.
+  // contract answers for a task that is not there. It lets it call no other method of Tender, and
+  // nothing of another contract. (The permission above, which is exact, is what says it can do no
+  // more than call.)
   const scoped = clientWith({
     accountId: keeper.accountId,
     privateKey: env.KEEPER_PRIVATE_KEY ?? "",
@@ -154,6 +157,32 @@ test("key_script_adds_keys_with_the_permission_of_a_keeper_and_of_a_judge", asyn
   await expect(
     scoped.pick(999_999n, [{ account: keeper.accountId, bps: 10_000 }], "0".repeat(64), "x://y"),
   ).rejects.toThrow("Access key does not allow method pick");
+  // Another receiver: the token the tasks are paid in. The key attaches no deposit, so that the
+  // receiver is what the chain refuses, and not the 1 yoctoNEAR that `ft_transfer` asks for.
+  await expect(
+    scoped.send({
+      receiverId: chain.tokenId,
+      methodName: "ft_transfer",
+      args: { receiver_id: chain.accounts.alice.accountId, amount: "1" },
+      gas: 30n * TGAS,
+      deposit: 0n,
+    }),
+  ).rejects.toThrow(
+    `Access key receiver ${chain.contractId} does not match transaction receiver ${chain.tokenId}`,
+  );
+
+  // The judge's key is the other way round: the contract takes its `pick`, and the chain refuses the
+  // keeper's methods.
+  const judging = clientWith({
+    accountId: judge.accountId,
+    privateKey: env.JUDGE_PRIVATE_KEY ?? "",
+  });
+  await expect(
+    judging.pick(999_999n, [{ account: judge.accountId, bps: 10_000 }], "0".repeat(64), "x://y"),
+  ).rejects.toMatchObject({ code: "E_NOT_FOUND" });
+  await expect(judging.voidTask(999_999n)).rejects.toThrow(
+    "Access key does not allow method void_task",
+  );
 });
 
 test("key_script_runs_again_without_a_new_key_and_restores_a_key_the_chain_lost", async () => {
