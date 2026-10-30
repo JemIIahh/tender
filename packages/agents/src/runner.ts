@@ -32,11 +32,17 @@ import type { Solver, TaskContext } from "./types";
 //   the salt behind; a crash before it left a draft the chain may know nothing of. A draft that is
 //   not marked committed is taken neither for sent nor for lost: the chain is asked
 //   (`recoverCommit`). If it has the commit, the draft is marked. If not, and the task is still
-//   open, the same commitment is sent again from the draft, never with a new solve. If the commit
+//   open, the same commitment is sent again from the draft, never with a new solve. If the reveal
 //   window is over with no commit of the draft on the chain, if the contract refuses for good, or
 //   if five resends have failed, the draft is dead and is let alone (P05-R14). A draft whose
 //   commit is on the chain is never dead: it is revealed whenever its window is open, marked or
-//   not, and however late the agent comes back to it;
+//   not, and however late the agent comes back to it. The chain is read at its last final block,
+//   which trails the newest by about two, so a commit that has just landed can be missing from the
+//   view for a moment. That is why a draft with no commit in view is given up only once the reveal
+//   window is over, and not when the commit window ends (review N1);
+// - a draft is the agent's only if its commitment is the one that the agent's account, the task,
+//   the draft's hash and its salt give. A draft that another account made, in a state directory
+//   that the two share, is dead for this run, and nothing is sent or revealed for it (review N3);
 // - a draft is never replaced. A task with a draft is not entered again, in this run or after a
 //   restart, because a second commit with another salt would replace the one the draft opens;
 // - the reveal is driven by the drafts and not by what the run remembers, so a restart picks up
@@ -99,6 +105,12 @@ const CODE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
  * code (a node that is down, a timeout) or one the client could not name (`E_UNKNOWN`): none of
  * these is known to repeat, and the commit is tried again until its window ends, or until
  * `MAX_RESENDS` tries have failed.
+ *
+ * `E_PHASE` counts only for a commit that is sent for the first time (`refusedForGood`). A resend
+ * can meet it with the earlier send in a block that is not final yet, so that it says nothing of
+ * whether the commit is on the chain (review N1). The other six cannot be met by a commit that
+ * has landed: the first send would have been refused for the same reason, or, for `E_FULL`, the
+ * account would hold an entry and be let in.
  */
 const REFUSED_FOR_GOOD: ReadonlySet<string> = new Set([
   "E_NOT_FOUND",
@@ -139,13 +151,18 @@ export class AgentMemory {
   readonly settled = new Set<string>();
   /**
    * Tasks whose draft is dead for this run: its commit is not on the chain and cannot be, as the
-   * contract refused it for good, the commit window is over, or five resends failed. Nothing more
-   * is done for them. A draft has no slot to say so on disk, so a restart judges each of them
-   * again.
+   * contract refused it for good, the reveal window is over, or five resends failed; or the draft
+   * is not the account's (review N3). Nothing more is done for them. A draft has no slot to say so
+   * on disk, so a restart judges each of them again.
    */
   readonly dead = new Set<string>();
   /** Tasks whose low storage has been warned of, so that a later tick does not say it again. */
   readonly warned = new Set<string>();
+  /**
+   * Tasks whose draft has no commit in view in the task's reveal window, which has been said once
+   * (review N1). The draft is looked for again each tick until the window is over.
+   */
+  readonly waiting = new Set<string>();
   /**
    * How many times the commit of each draft has been sent again in this run, by task. A resend is
    * one that the recovery of a draft makes (`recoverCommit`); the send that enters a task is not
@@ -211,9 +228,16 @@ interface Run {
   /**
    * How many reveals the agent owes so far in this tick (review M1): the drafts that are not
    * revealed and whose task is open or revealing, counted as the tick goes through them, and each
-   * commit made since. It sets how much storage the next entry needs.
+   * commit made since. It sets how much storage the next entry needs. It is whole before the first
+   * entry is made or the first commit is sent again, since both wait for the pass over the drafts
+   * to end (review N2).
    */
   owed: number;
+  /**
+   * The drafts whose commit is to be sent again (`recoverCommit`), in the order they were found.
+   * They are sent once the pass over the drafts is done (`tendDrafts`), when `owed` is whole.
+   */
+  due: Draft[];
 }
 
 /** The text of `error`'s code if it has one that looks like a code, else undefined. */
@@ -223,10 +247,16 @@ function codeOf(error: unknown): string | undefined {
   return typeof code === "string" && CODE.test(code) ? code : undefined;
 }
 
-/** Whether `error` is a failure of a commit that a second try would meet again. */
-function refusedForGood(error: unknown): boolean {
+/**
+ * Whether `error`, the failure of a commit, is one that a second try would meet again. `again` says
+ * the commit repeats an earlier send: for that, `E_PHASE` is no verdict (review N1). The commit
+ * window ended since, and the earlier send may have landed just before it, in a block the view
+ * of the chain cannot show yet. The next tick looks again.
+ */
+function refusedForGood(error: unknown, again: boolean): boolean {
   const code = codeOf(error);
-  return code !== undefined && REFUSED_FOR_GOOD.has(code);
+  if (code === undefined || !REFUSED_FOR_GOOD.has(code)) return false;
+  return !(again && code === "E_PHASE");
 }
 
 /**
@@ -266,6 +296,28 @@ function oneLine(text: string, max = MAX_REASON_CHARS): string {
  */
 function isTaskId(id: string): boolean {
   return U64StringSchema.safeParse(id).success;
+}
+
+/**
+ * Whether `draft` was made by `account` (review N3): its commitment is the one that the account,
+ * its task, its content hash and its salt give. A state directory that two accounts share holds a
+ * draft of each under the task's one file name, and the commitment of another account's draft is
+ * one this account cannot open: sent, it would give the account an entry that no reveal can
+ * match. A draft whose parts make no commitment at all is nobody's. This is the MCP server's check
+ * (`DRAFT_NOT_YOURS`) as well.
+ */
+function isDraftOf(draft: Draft, account: string): boolean {
+  try {
+    const commitment = computeCommitment(
+      BigInt(draft.taskId),
+      account,
+      draft.contentHash,
+      draft.salt,
+    );
+    return commitment === draft.commitment;
+  } catch {
+    return false;
+  }
 }
 
 /** Throws a `RangeError` unless `ms` is a wait that `setTimeout` keeps. */
@@ -535,6 +587,8 @@ async function commit(run: Run, id: string, content: Uint8Array): Promise<void> 
  * other is logged and left for a later tick: a transaction that failed to finish does not say
  * whether it reached the chain, and sending the draft's commitment again is harmless, as a commit
  * by an account that has an entry only replaces the entry's commitment, here with the same one.
+ * `E_PHASE` is that kind of failure for a resend too (review N1): the commit window has ended
+ * since the send before, and that send may have landed just inside it. The next tick looks.
  */
 async function sendCommit(run: Run, draft: Draft, again: boolean): Promise<boolean> {
   const id = draft.taskId;
@@ -542,7 +596,7 @@ async function sendCommit(run: Run, draft: Draft, again: boolean): Promise<boole
   try {
     txHash = (await run.client.commit(BigInt(id), draft.commitment)).txHash;
   } catch (error) {
-    if (refusedForGood(error)) {
+    if (refusedForGood(error, again)) {
       markDead(run, id, `commit to task ${id} refused for good (${describe(error)})`);
     } else {
       run.log(`ERROR ${run.name}: commit to task ${id} failed (${describe(error)})`);
@@ -605,16 +659,23 @@ async function lookUp(run: Run, id: string): Promise<{ entry: EntryView | null }
  *   asked before the phase of the task, so that a draft whose commit is on the chain is never
  *   given up, however late the agent comes back to it.
  * - It has none (or one with another commitment, which the draft's replaces) and the task is
- *   open: the draft's own commitment is sent again, at most `MAX_RESENDS` times in a run. It
+ *   open: the draft's own commitment is to be sent again, at most `MAX_RESENDS` times in a run. It
  *   carries the draft's salt and hash, so that it opens with the draft's work, and no solver is
- *   asked.
- * - It has none and the task is no longer open: the commit deadline has passed, nothing can be
- *   sent or revealed, and the draft is dead. So it is when the resends are used up.
+ *   asked. The send is not made here but queued (`Run.due`) for the end of the pass over the
+ *   drafts (`resend`), so that the storage it needs is judged with every reveal owed (review N2).
+ * - It has none and the task is in its reveal window: the commit window is over, so nothing can
+ *   be sent, but the commit may be there all the same. The view is of the last final block, and a
+ *   commit that landed one or two blocks ago is not in it yet. The draft is kept and looked up
+ *   again next tick (review N1).
+ * - It has none and the reveal window is over too: a commit that had landed would be final long
+ *   since, so there is none, nothing can be sent or revealed, and the draft is dead. So it is
+ *   when the resends are used up. A task whose entries the keeper has cleaned up (`cleanup`,
+ *   after the task has settled) shows none either, so a draft first looked at after that is
+ *   given up as well, though it may have been entered (review N4).
  *
  * Returns whether the commit is on the chain, which is when the draft may be revealed. A lookup
- * that fails, a storage balance too low to commit (R22) and a send that fails in a way that may
- * pass leave the draft for a later tick. A send the contract refuses for good makes it dead
- * (`sendCommit`).
+ * that fails and a draft waiting for its resend or for the commit to show leave it for a later
+ * tick.
  */
 async function recoverCommit(run: Run, draft: Draft, task: TaskDetail): Promise<boolean> {
   const id = draft.taskId;
@@ -628,31 +689,57 @@ async function recoverCommit(run: Run, draft: Draft, task: TaskDetail): Promise<
     return true;
   }
 
+  if (task.phase === "revealing") {
+    if (!run.memory.waiting.has(id)) {
+      run.memory.waiting.add(id);
+      run.log(
+        `${run.name}: task ${id} has no commit of its draft on chain yet, looking again until its reveal window is over`,
+      );
+    }
+    return false;
+  }
   if (task.phase !== "open") {
-    const why = `task ${id} has no commit of its draft on chain and its commit window is over`;
+    const why = `task ${id} has no commit of its draft on chain and its reveal window is over`;
     markDead(run, id, why);
     return false;
   }
-  const resent = run.memory.resends.get(id) ?? 0;
-  if (resent >= MAX_RESENDS) {
+  if ((run.memory.resends.get(id) ?? 0) >= MAX_RESENDS) {
     markDead(run, id, `commit to task ${id} did not go through in ${MAX_RESENDS} resends`);
     return false;
   }
-  if (await storageLow(run, id)) return false;
-  run.memory.resends.set(id, resent + 1);
-  return sendCommit(run, draft, true);
+  run.due.push(draft);
+  return false;
+}
+
+/**
+ * Sends the commit of a draft that `recoverCommit` found missing from the chain, once the pass over
+ * the drafts is done (review N2). The send enters the agent's account in a task, which needs the
+ * storage of an entry (R22), and the drafts that come after this one in the pass owe reveals
+ * that the storage must cover too. Judged with the count of the drafts so far, a resend could
+ * take storage from the reveals of the drafts it was ahead of.
+ *
+ * The draft's own reveal is in `owed` (it is not revealed, and its task is open) and in the 1 KiB
+ * of the entry, so the count the storage check takes leaves it out. A draft that the contract
+ * refuses for good owes no reveal after all.
+ */
+async function resend(run: Run, draft: Draft): Promise<void> {
+  const id = draft.taskId;
+  if (await storageLow(run, id, Math.max(0, run.owed - 1))) return;
+  run.memory.resends.set(id, (run.memory.resends.get(id) ?? 0) + 1);
+  await sendCommit(run, draft, true);
+  if (run.memory.dead.has(id)) run.owed -= 1;
 }
 
 /**
  * Whether the agent's storage on the contract is below what a new entry needs (R22): 1 KiB, and
- * the storage of the reveal of each entry the agent owes already (review M1: the drafts that are
- * still to be revealed, and the commits made earlier in the tick). It reads the balance now, and
- * warns once for each task if it is short. A function-call key cannot top the account up, so the
- * agent can only wait for someone to.
+ * the storage of the reveal of each of the `owed` entries the agent has already (review M1: the
+ * drafts that are still to be revealed, and the commits made earlier in the tick; by default all
+ * that the tick has counted). It reads the balance now, and warns once for each task if it is
+ * short. A function-call key cannot top the account up, so the agent can only wait for someone to.
  */
-async function storageLow(run: Run, id: string): Promise<boolean> {
+async function storageLow(run: Run, id: string, owed = run.owed): Promise<boolean> {
   const storage = await run.client.storageBalanceOf(run.account);
-  const needed = STORAGE_FLOOR_BYTES + BigInt(run.owed) * STORAGE_PER_OWED_BYTES;
+  const needed = STORAGE_FLOOR_BYTES + BigInt(owed) * STORAGE_PER_OWED_BYTES;
   if (storageShortfall(storage, needed) <= 0n) return false;
   if (!run.memory.warned.has(id)) {
     run.memory.warned.add(id);
@@ -666,10 +753,12 @@ async function storageLow(run: Run, id: string): Promise<boolean> {
 /**
  * Goes through every draft the agent holds, oldest task first:
  *
+ * - a draft that is not the account's is dead, and nothing is done for it (`isDraftOf`);
  * - a draft not marked committed is settled first (`recoverCommit`): the chain is asked, and the
- *   commit is marked, sent again or given up;
+ *   commit is marked, kept for the next tick, queued to be sent again or given up;
  * - a draft that is not revealed, for a task in its reveal window, is revealed;
- * - a draft whose task has settled is logged as `won`, `lost` or `refunded`, once.
+ * - a draft whose task has settled is logged as `won`, `lost` or `refunded`, once;
+ * - then, with every draft counted, the commits that were queued are sent again (`resend`).
  *
  * It works from the drafts and from what the API and the chain say of their tasks, and from nothing
  * the run remembers apart from which outcomes it has logged and which drafts are dead, so it
@@ -699,6 +788,12 @@ async function tendDrafts(run: Run): Promise<void> {
     if (run.signal?.aborted) return;
     await tendOne(run, draft);
   }
+  // Review N2: a resend makes an entry that takes storage, and the reveals of the drafts it was
+  // ahead of in the pass must be counted before it is judged. The ones in `due` are in the count.
+  for (const draft of run.due) {
+    if (run.signal?.aborted) return;
+    await resendOne(run, draft);
+  }
 }
 
 /**
@@ -708,34 +803,53 @@ async function tendDrafts(run: Run): Promise<void> {
  * only its own task, and tended as usual. The entries also say how many reveals the agent owes,
  * which sets the storage that new entries need (review M1), since the drafts are not there to
  * count.
+ *
+ * The answer is the API's word, and a broken one costs what it breaks (review N5): a body whose
+ * entries are no list is logged and the tick goes on to the open tasks, and an entry that cannot
+ * be read is logged without keeping the others from being tended. Only reveals are the fallback's
+ * business, so a commit that a draft is waiting to have sent again is left for a tick that can
+ * read the drafts.
  */
 async function tendRevealing(run: Run): Promise<void> {
   let entries: AccountEntry[];
   try {
-    entries = (await run.api.listEntries(run.account)).entries;
+    const listed = await run.api.listEntries(run.account);
+    if (!Array.isArray(listed.entries)) throw new TypeError("the entries are not a list");
+    entries = listed.entries;
   } catch (error) {
     run.log(`ERROR ${run.name}: the entries of the account cannot be listed (${describe(error)})`);
     return;
   }
 
+  let owed = 0;
   for (const entry of entries) {
     if (run.signal?.aborted) return;
-    // The id is the API's word: it is used only once it is known to be a task id.
-    if (entry.phase !== "revealing" || entry.revealed || !isTaskId(entry.task_id)) continue;
-    let draft: Draft | null;
     try {
-      draft = await run.state.getDraft(entry.task_id);
+      if (entry.revealed) continue;
+      if (entry.phase === "open") owed += 1;
+      if (entry.phase === "revealing") {
+        owed += 1;
+        await tendDue(run, entry.task_id);
+      }
     } catch (error) {
-      run.log(`ERROR ${run.name}: task ${entry.task_id} failed (${describe(error)})`);
-      continue;
+      run.log(`ERROR ${run.name}: an entry of the account cannot be read (${describe(error)})`);
     }
-    if (draft !== null) await tendOne(run, draft);
   }
+  run.owed = Math.max(run.owed, owed);
+}
 
-  const owed = entries.filter(
-    (entry) => !entry.revealed && (entry.phase === "open" || entry.phase === "revealing"),
-  );
-  run.owed = Math.max(run.owed, owed.length);
+/** The draft of task `taskId`, which the API's entries name as due a reveal, tended by itself. */
+async function tendDue(run: Run, taskId: string): Promise<void> {
+  // The id is the API's word: it is used only once it is known to be a task id.
+  if (!isTaskId(taskId)) return;
+  let draft: Draft | null;
+  try {
+    draft = await run.state.getDraft(taskId);
+  } catch (error) {
+    run.log(`ERROR ${run.name}: task ${taskId} failed (${describe(error)})`);
+    return;
+  }
+  if (draft !== null) await tendOne(run, draft);
 }
 
 /** One draft of `tendDrafts`: skipped if it is dead or settled, and a failure is its own. */
@@ -749,11 +863,25 @@ async function tendOne(run: Run, draft: Draft): Promise<void> {
   }
 }
 
+/** One send again of `tendDrafts`: a failure is its own, as in `tendOne`. */
+async function resendOne(run: Run, draft: Draft): Promise<void> {
+  try {
+    await resend(run, draft);
+  } catch (error) {
+    run.log(`ERROR ${run.name}: task ${draft.taskId} failed (${describe(error)})`);
+  }
+}
+
 async function tendDraft(run: Run, draft: Draft): Promise<void> {
   const id = draft.taskId;
   if (!isTaskId(id)) {
     const shown = oneLine(id, MAX_ID_CHARS);
     run.log(`WARN ${run.name}: skipping a draft whose task id is not a task id (${shown})`);
+    return;
+  }
+  // Review N3: before anything is sent, uploaded or revealed for it, and before the API is asked.
+  if (!isDraftOf(draft, run.account)) {
+    markDead(run, id, `the draft saved for task ${id} was not made by ${run.account}`);
     return;
   }
   const found = await run.api.getTask(BigInt(id));
@@ -850,13 +978,14 @@ async function reveal(run: Run, draft: Draft): Promise<boolean> {
 /**
  * Whether the agent's entry in the task is revealed, by the API's entries and, if they do not show
  * it, by the chain's: the index trails the chain, and a revealed entry may not be shown yet.
- * `undefined` if the chain could not be read.
+ * `undefined` if the chain could not be read, or no longer has the entry: the keeper's `cleanup`
+ * deletes the entries of a settled task, revealed or not, so none says nothing (review N4).
  */
 async function entryRevealed(run: Run, found: TaskDetailResponse): Promise<boolean | undefined> {
   if (found.entries.some((entry) => entry.account === run.account && entry.revealed)) return true;
   const looked = await lookUp(run, found.task.id);
-  if (looked === undefined) return undefined;
-  return looked.entry !== null && looked.entry.uri !== null;
+  if (looked === undefined || looked.entry === null) return undefined;
+  return looked.entry.uri !== null;
 }
 
 /**
@@ -864,7 +993,8 @@ async function entryRevealed(run: Run, found: TaskDetailResponse): Promise<boole
  * among the winners, and if it never revealed, that is said), or `refunded` (the task was voided).
  * `revealed` is what the draft says. A draft that does not say so may have lost its mark after
  * the reveal went through, so "never revealed" is said only when the API and the chain agree that
- * the entry is not revealed (review M7), and not at all if the chain cannot be read.
+ * the entry is not revealed (review M7), and not at all if the chain cannot be read or has cleaned
+ * the entry up (review N4).
  */
 async function logOutcome(run: Run, found: TaskDetailResponse, revealed: boolean): Promise<void> {
   const { task } = found;
@@ -908,9 +1038,18 @@ async function logOutcome(run: Run, found: TaskDetailResponse, revealed: boolean
  * - A draft is dead for the run only, as it has no slot to say so either: a restart judges it
  *   again, which costs a lookup and, for a task still open, one more refused commit and one more
  *   ERROR line.
+ * - A draft with no commit in view in its task's reveal window costs a lookup each tick until the
+ *   window is over (review N1). A commit that never landed is given up only then.
  * - One process owns a state directory (review M5): nothing locks it, and two runners on one
  *   directory (or a runner beside the MCP server's `commit_result`) can interleave their commits
- *   so that a draft's salt no longer opens the commitment on the chain.
+ *   so that a draft's salt no longer opens the commitment on the chain. A directory shared by
+ *   two accounts is caught where the drafts differ in who made them: a draft of another account
+ *   is dead (review N3), and its task is never entered from here.
+ * - The keeper's `cleanup` deletes the entries of a settled task from the chain (review N4). A
+ *   draft that was never marked and is first looked at after that is given up as having no
+ *   commit on chain, whether or not it ever had one, and no outcome line is written for it. A
+ *   draft that is marked but not revealed is not called "never revealed" once the chain has no
+ *   entry to show it by.
  *
  * `runAgent` calls this in a loop; it is exported so that a test can run one tick at a time.
  */
@@ -932,6 +1071,7 @@ export async function agentTick(opts: AgentTickOptions): Promise<void> {
     signal: opts.signal,
     memory: opts.memory ?? new AgentMemory(),
     owed: 0,
+    due: [],
   };
   await tendDrafts(run);
   await enterTasks(run);
