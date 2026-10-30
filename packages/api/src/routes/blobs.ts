@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import {
   type Db,
   getBlob,
+  hasResultUpload,
   type NewBlob,
   putBlob,
   recordResultUpload,
@@ -97,7 +98,8 @@ const HeldoutUploadSchema = z.strictObject({
  * - `POST /v1/blobs` (signed in): stores a brief, criteria, scorecard or profile, which anyone may
  *   read at once, or an entrant's result, which no one may read until the task that revealed it
  *   first has closed its reveals. A reveal counts only if the account that made it uploaded the
- *   result for that task, so every upload of a result is recorded for its account and task. The
+ *   result for that task, so an upload of a result is recorded for its account and task, unless the
+ *   bytes are served already: then anyone can read them, and holding them proves nothing. The
  *   task a result was sent for decides nothing else. A scorecard is taken only from the verifier
  *   or the poster of its task, and only once the reveal deadline has passed, the task's own and
  *   that of every task of the same poster that uses the same held-out document.
@@ -139,8 +141,15 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     // The one uploading it now holds the bytes, so making it public gives nothing away.
     if (blob.isPublic && !stored.isPublic) await setBlobPublic(deps.db, sha256, true);
     // Whoever sends the bytes holds them, whether they are new or stored already as a result, by
-    // anyone. A reveal of these bytes counts for the task it is made in only with this record.
-    if (blob.kind === "result" && blob.taskId !== undefined) {
+    // anyone. A reveal of these bytes counts for the task it is made in only with this record. But
+    // not once they are served: they are public then, so sending them shows nothing, and a record
+    // made then would let a copier put its own later deadline in front of the first and hide the
+    // bytes again. The upload is answered the same either way.
+    if (
+      blob.kind === "result" &&
+      blob.taskId !== undefined &&
+      !(await mayServe(deps.db, sha256, stored, nowNs(deps)))
+    ) {
       await recordResultUpload(deps.db, { sha256, taskId: blob.taskId, account });
     }
 
@@ -182,7 +191,9 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
   app.get("/blobs/:sha256", async (c) => {
     const sha256 = c.req.param("sha256");
     const blob = HashHexSchema.safeParse(sha256).success ? await getBlob(deps.db, sha256) : null;
-    if (blob === null || !(await mayServe(deps, sha256, blob))) return notServed(c, "blob");
+    if (blob === null || !(await mayServe(deps.db, sha256, blob, nowNs(deps)))) {
+      return notServed(c, "blob");
+    }
     return served(c, blob.bytes, servedType(blob.contentType));
   });
 
@@ -403,19 +414,23 @@ async function store(db: Db, blob: NewBlob): Promise<{ sha256: string; stored: S
 // ---- Reads ------------------------------------------------------------------------------------
 
 /**
- * Whether the API may serve `blob`, which is stored under `sha256`. A result is served by what was
- * revealed, not by who sent it: from the reveal deadline of the task that revealed `sha256` first
- * (the contract's rule, `now >= reveal_deadline`), the first being the earliest `revealed` event
- * in the index with that `content_hash` and an upload behind it: by block height, and by the order
- * the index stored them in within a block. The order of storing alone would not do, since the index
- * may apply a block after later ones, such as a gap it fills in afterwards. No such event, no bytes.
+ * Whether the API may serve `blob`, which is stored under `sha256`, at `now` (nanoseconds). A result
+ * is served by what was revealed, not by who sent it: from the reveal deadline of the task that
+ * revealed `sha256` first (the contract's rule, `now >= reveal_deadline`), the first being the
+ * earliest `revealed` event in the index with that `content_hash` and an upload behind it: by block
+ * height, and by the order the index stored them in within a block. The order of storing alone would
+ * not do, since the index may apply a block after later ones, such as a gap it fills in afterwards.
+ * No such event, no bytes.
  *
  * A reveal has an upload behind it when the account that made it also uploaded these bytes for the
- * task it revealed them in (`result_uploads`). The contract checks a reveal against its commitment
- * and not the bytes, and a hash is public as soon as a transaction names it, one that failed
- * included, so anyone whose commit window is open can commit to it and reveal it in a task of their
- * own. A copy has no bytes to upload, and without an upload it counts for nothing: it cannot bring
- * the bytes out before the deadline of the task that has them, and cannot hold them back after it.
+ * task it revealed them in (`result_uploads`), and did so while they were not served: the upload
+ * route records nothing for bytes it serves already. The contract checks a reveal against its
+ * commitment and not the bytes, and a hash is public as soon as a transaction names it, one that
+ * failed included, so anyone whose commit window is open can commit to it and reveal it in a task of
+ * their own. A copy has no bytes to upload while they are hidden, and without an upload it counts
+ * for nothing: it cannot bring the bytes out before the deadline of the task that has them. Once
+ * they are out it cannot send them for its own task, which closes later, to put that deadline in
+ * front of the first one and hide them again.
  *
  * Only the first reveal that counts decides. The task the row was stored for counts for nothing
  * either: bytes sent for a task that closes later are not held back, and bytes sent for one that
@@ -424,9 +439,9 @@ async function store(db: Db, blob: NewBlob): Promise<{ sha256: string; stored: S
  *
  * Anything else is served while it is public: a held-out document is not, until it is made so.
  */
-async function mayServe(deps: ApiDeps, sha256: string, blob: StoredBlob): Promise<boolean> {
+async function mayServe(db: Db, sha256: string, blob: StoredBlob, now: bigint): Promise<boolean> {
   if (blob.kind !== "result") return blob.isPublic;
-  const [reveal] = await deps.db.query<{ closed: boolean }>(
+  const [reveal] = await db.query<{ closed: boolean }>(
     `select exists (
        select 1
          from tasks t
@@ -447,9 +462,34 @@ async function mayServe(deps: ApiDeps, sha256: string, blob: StoredBlob): Promis
               )
           and t.reveal_deadline <= $2::numeric
      ) as closed`,
-    [sha256, nowNs(deps)],
+    [sha256, now],
   );
   return reveal?.closed === true;
+}
+
+/**
+ * Whether the bytes hashing to `sha256` may be used as the result that `account` revealed in the
+ * task, at `now` (nanoseconds since the epoch, as `ApiDeps.now` gives it): when `account` uploaded
+ * them for that task, or when the API serves them to anyone at `now`. It is for what reads our own
+ * blob URIs, as the Judge does.
+ *
+ * While the bytes are hidden, only an upload makes them an entrant's. A copier has the hash, which
+ * is on chain for all to read, and not the bytes, so it cannot score with bytes that someone else
+ * uploaded. Once they are served they are as public as any URL, and a reveal of them is as good
+ * with no upload as with one: an entrant who sent the same bytes after that has no record, since
+ * the upload route makes none then, and is not wrong to have them. A hash the store does not hold
+ * is usable by no one, and nor is a held-out document, which it holds and never serves.
+ */
+export async function resultUsable(
+  db: Db,
+  sha256: string,
+  taskId: bigint,
+  account: string,
+  now: bigint,
+): Promise<boolean> {
+  if (await hasResultUpload(db, sha256, taskId, account)) return true;
+  const blob = await getBlob(db, sha256);
+  return blob !== null && (await mayServe(db, sha256, blob, now));
 }
 
 /** The `Content-Type` a stored blob is served with. Text is declared UTF-8, so no one has to guess. */

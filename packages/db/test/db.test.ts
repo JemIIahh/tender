@@ -1032,7 +1032,7 @@ describe.each(targets)("db on $name", (target) => {
     const first = await uploadedAt();
     expect(first).toBeInstanceOf(Date);
     await recordResultUpload(db, { sha256: sha, taskId: 7n, account: "alice.near" });
-    await recordResultUpload(db, { sha256: sha, taskId: "7", account: "alice.near" });
+    await recordResultUpload(db, { sha256: sha, taskId: 7n, account: "alice.near" });
     expect(await uploads()).toEqual([{ task_id: "7", account: "alice.near" }]);
     expect(await uploadedAt()).toEqual(first);
 
@@ -1048,15 +1048,33 @@ describe.each(targets)("db on $name", (target) => {
     expect(await hasResultUpload(db, sha, 8n, "alice.near")).toBe(true);
     expect(await hasResultUpload(db, sha, 8n, "bob.near")).toBe(false);
 
-    // A task id is a u64, so it reaches past 2^53, and bigint and decimal text name the same task.
+    // A task id is a u64, so it reaches past 2^53, and a bigint keeps every digit of it.
     await recordResultUpload(db, { sha256: sha, taskId: 2n ** 64n - 1n, account: "alice.near" });
-    expect(await hasResultUpload(db, sha, "18446744073709551615", "alice.near")).toBe(true);
     expect(await hasResultUpload(db, sha, 2n ** 64n - 1n, "alice.near")).toBe(true);
-    expect(await hasResultUpload(db, sha, "18446744073709551614", "alice.near")).toBe(false);
+    expect(await hasResultUpload(db, sha, 2n ** 64n - 2n, "alice.near")).toBe(false);
     expect((await uploads()).at(-1)).toEqual({
       task_id: "18446744073709551615",
       account: "alice.near",
     });
+  });
+
+  it("a_task_id_that_is_not_a_bigint_is_refused", async () => {
+    // The column rounds a fraction: "2.5" would be stored as task 3 and, asked for as 2.5, not be
+    // found. A number loses digits past 2^53. Only a bigint is taken, whatever a caller's types say,
+    // and nothing is written for the others.
+    const sha = "5d".repeat(32);
+    for (const taskId of ["2.5", "3", "03", "", 3, 2.5, undefined, null]) {
+      const id = taskId as never;
+      await expect(
+        recordResultUpload(db, { sha256: sha, taskId: id, account: "alice.near" }),
+      ).rejects.toThrow(TypeError);
+      await expect(hasResultUpload(db, sha, id, "alice.near")).rejects.toThrow(TypeError);
+    }
+    const [row] = await db.query<{ n: number }>(
+      "select count(*)::int as n from result_uploads where sha256 = $1",
+      [sha],
+    );
+    expect(row?.n).toBe(0);
   });
 });
 
