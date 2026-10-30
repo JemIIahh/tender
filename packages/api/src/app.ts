@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import type { ApiDeps } from "./deps";
 import { type ErrorBody, toOrigin } from "./format";
+import { mountMcp } from "./mcp";
 import { agentRoutes } from "./routes/agents";
 import { entryRoutes } from "./routes/entries";
 import { healthRoutes } from "./routes/health";
@@ -34,6 +35,9 @@ export function createApp(deps: ApiDeps): Hono {
   app.route("/v1", taskRoutes(deps));
   app.route("/v1", agentRoutes(deps));
   app.route("/v1", entryRoutes(deps));
+
+  // Not under /v1: the MCP clients are not browsers, so the CORS block above does not apply.
+  mountMcp(app, deps);
 
   app.notFound((c) => {
     const body: ErrorBody = { error: "not_found", message: "no such route" };
