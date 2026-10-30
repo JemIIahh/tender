@@ -1,13 +1,15 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { extractEvents, parseEventLog } from "@tender/shared";
 import { NotSyncedYetError, UnknownChunkError } from "near-api-js/rpc-errors";
 import { afterEach, expect, test } from "vitest";
-import { createRpcSource, type IndexedBlock } from "../src/index";
+import { BlocksLostError, createRpcSource, type IndexedBlock } from "../src/index";
+import { eventLine } from "./fixtures/blocks";
 
 // `createRpcSource` against a fake node that speaks JSON-RPC over HTTP, for what a sandbox does not
 // produce: a height with no block, a block the node has lost, a chunk from an earlier block, a
-// receipt listed twice, and the errors that must not be skipped. rpc.sandbox.test.ts runs the
-// source on a real nearcore.
+// receipt listed twice, an answer from before a transaction is final, and the errors that must not
+// be skipped. rpc.sandbox.test.ts runs the source on a real nearcore.
 
 const EMPTY_TX_ROOT = "11111111111111111111111111111111";
 const FAILURE = { Failure: { ActionError: { index: 0, kind: "boom" } } };
@@ -61,6 +63,8 @@ interface Chain {
   errors?: Record<string, object>;
   /** Holds back every answer about a transaction until this settles. */
   gate?: Promise<void>;
+  /** What a transaction's status says it has reached, if not FINAL: a node that answers early. */
+  finalExecutionStatus?: string;
 }
 interface Call {
   method: string;
@@ -145,7 +149,7 @@ async function serve(chain: Chain) {
       if (!target || p.wait_until !== "FINAL") throw new Error(`unexpected ${JSON.stringify(p)}`);
       return {
         result: {
-          final_execution_status: "FINAL",
+          final_execution_status: chain.finalExecutionStatus ?? "FINAL",
           status: { SuccessValue: "" },
           receipts_outcome: target.outcomes.map((o) => ({
             id: o.id,
@@ -193,6 +197,11 @@ const finalReads = (calls: Call[]) =>
   blockParams(calls).filter((p) => p.finality === "final").length;
 const chunksAsked = (calls: Call[]) =>
   calls.filter((c) => c.method === "chunk").map((c) => (c.params as [string])[0]);
+/** The hashes of the transactions whose status was asked for. */
+const txsAsked = (calls: Call[]) =>
+  calls
+    .filter((c) => c.method === "EXPERIMENTAL_tx_status")
+    .map((c) => (c.params as { tx_hash: string }).tx_hash);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -204,6 +213,16 @@ async function take(rpcUrl: string, from: bigint, count: number): Promise<Indexe
     if (blocks.length === count) break;
   }
   return blocks;
+}
+
+/** What `take` throws. A source that does not fail fails the test. */
+async function failure(rpcUrl: string, from: bigint, count: number): Promise<unknown> {
+  try {
+    await take(rpcUrl, from, count);
+  } catch (error) {
+    return error;
+  }
+  throw new Error("expected the source to fail");
 }
 
 test("skips_a_height_the_node_has_no_block_for", async () => {
@@ -243,15 +262,22 @@ test("does_not_skip_blocks_the_node_has_lost", async () => {
 
   // The node has lost block 2, and answers for it as for a height that never had a block. Block 3
   // says its parent is block 2, so block 2 is not skipped: the source ends there, not at block 4.
+  // The error is a BlocksLostError that says which heights, for a runner to restart on.
   chain.lost = [2];
-  await expect(take(rpcUrl, 1n, 4)).rejects.toThrow(
+  const lost = await failure(rpcUrl, 1n, 4);
+  expect(lost).toBeInstanceOf(BlocksLostError);
+  expect(lost).toMatchObject({ from: 2n, to: 2n, parent: 2n });
+  expect((lost as Error).message).toContain(
     "the node has no block for heights 2 to 2, but block 3 follows block 2",
   );
   expect(heightsAsked(calls)).toEqual([1, 2, 3]);
 
   // The same when it starts at a block that the node has lost, as after a long time away.
   chain.lost = [1, 2];
-  await expect(take(rpcUrl, 1n, 4)).rejects.toThrow(
+  const longGone = await failure(rpcUrl, 1n, 4);
+  expect(longGone).toBeInstanceOf(BlocksLostError);
+  expect(longGone).toMatchObject({ from: 1n, to: 2n, parent: 2n });
+  expect((longGone as Error).message).toContain(
     "the node has no block for heights 1 to 2, but block 3 follows block 2",
   );
 
@@ -281,6 +307,16 @@ test("checks_a_gap_that_reaches_the_final_block_when_the_next_one_comes", async 
   // Block 4 comes final, and says that its parent is block 3, which the source skipped.
   await expect(reading).rejects.toThrow("heights 3 to 3, but block 4 follows block 3");
   expect(heights).toEqual([1n, 2n]);
+});
+
+test("starts_at_block_1_when_asked_for_block_0", async () => {
+  const empty = [chunk("chunk-empty")];
+  // A chain whose first block is 5, not 0. As with the genesis block of a current node, the first
+  // block gives its parent as height 0. A scan from 0 must not take that for a lost block.
+  const { rpcUrl, calls } = await serve({ final: 7, blocks: { 5: empty, 6: empty, 7: empty } });
+  expect((await take(rpcUrl, 0n, 3)).map((b) => b.height)).toEqual([5n, 6n, 7n]);
+  // Block 0 is never asked for: genesis holds no transactions.
+  expect(heightsAsked(calls)).toEqual([1, 2, 3, 4, 5, 6, 7]);
 });
 
 test("reads_only_up_to_the_final_block_and_follows_it", async () => {
@@ -323,15 +359,18 @@ test("reads_the_chunks_a_block_included_that_have_transactions", async () => {
 });
 
 test("returns_each_receipt_once_failed_ones_with_their_logs", async () => {
-  const log = 'EVENT_JSON:{"standard":"tender"}';
-  const failed: Outcome = { id: "r2", executor: "tender.near", status: FAILURE, logs: [log] };
+  // A failed receipt keeps the logs it wrote before it failed, a valid event line among them.
+  const deposited = eventLine("deposit");
+  const created = eventLine("task_created");
+  const logged: Outcome = { ...ok("r1"), logs: [deposited] };
+  const failed: Outcome = { id: "r2", executor: "tender.near", status: FAILURE, logs: [created] };
   const { rpcUrl } = await serve({
     final: 1,
     blocks: {
       1: [
         chunk(
           "chunk-a",
-          tx("a", ok("r1", "token.near"), failed),
+          tx("a", logged, failed),
           // A receipt listed again by another transaction comes out once.
           tx("b", failed, ok("r3", "poster.near")),
         ),
@@ -340,10 +379,37 @@ test("returns_each_receipt_once_failed_ones_with_their_logs", async () => {
   });
   const [block] = await take(rpcUrl, 1n, 1);
   expect(block?.receipts).toEqual([
-    { receiptId: "r1", executorId: "token.near", status: "success", logs: [] },
-    { receiptId: "r2", executorId: "tender.near", status: "failure", logs: [log] },
+    { receiptId: "r1", executorId: "tender.near", status: "success", logs: [deposited] },
+    { receiptId: "r2", executorId: "tender.near", status: "failure", logs: [created] },
     { receiptId: "r3", executorId: "poster.near", status: "success", logs: [] },
   ]);
+  // The events come from the receipt that succeeded alone. The line of the failed one is a valid
+  // event, and counts for none.
+  expect(parseEventLog(created)?.event).toBe("task_created");
+  const events = extractEvents(block?.receipts ?? [], "tender.near");
+  expect(events.map((e) => [e.event, e.receiptId])).toEqual([["deposit", "r1"]]);
+});
+
+test("ends_when_the_node_answers_before_the_transaction_is_final", async () => {
+  // A node, or a proxy that drops `wait_until`, answers at once. The receipts have not run, so they
+  // show as Unknown, which reads as a failure: their events would be lost for good.
+  const unrun: Outcome = { id: "r1", executor: "tender.near", status: "Unknown" };
+  const { rpcUrl } = await serve({
+    final: 2,
+    blocks: { 1: [chunk("chunk-a", tx("a", unrun))], 2: [chunk("chunk-empty")] },
+    finalExecutionStatus: "INCLUDED",
+  });
+  const heights: bigint[] = [];
+  const reading = (async () => {
+    for await (const block of createRpcSource({ rpcUrl }).blocks(1n, AbortSignal.timeout(4_000))) {
+      heights.push(block.height);
+    }
+  })();
+  await expect(reading).rejects.toThrow(
+    "the status of transaction a as INCLUDED, not FINAL: its receipts may not have run",
+  );
+  // The block is not handed over with receipts that are failures only in appearance.
+  expect(heights).toEqual([]);
 });
 
 test("an_error_that_is_not_an_unknown_block_ends_the_source_and_skips_nothing", async () => {
@@ -424,4 +490,29 @@ test("nothing_comes_out_after_the_abort", async () => {
   controller.abort();
   release();
   expect(await next).toEqual({ done: true, value: undefined });
+});
+
+test("stops_between_the_transactions_of_a_block_when_aborted", async () => {
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { rpcUrl, calls } = await serve({
+    final: 1,
+    blocks: { 1: [chunk("chunk-a", tx("a", ok("r1")), tx("b", ok("r2")))] },
+    gate,
+  });
+  const controller = new AbortController();
+  const next = createRpcSource({ rpcUrl })
+    .blocks(1n, controller.signal)
+    [Symbol.asyncIterator]()
+    .next();
+
+  // The abort comes while the source waits for the first transaction's status. It does not go on
+  // to ask for the second's.
+  while (txsAsked(calls).length === 0) await sleep(5);
+  controller.abort();
+  release();
+  expect(await next).toEqual({ done: true, value: undefined });
+  expect(txsAsked(calls)).toEqual(["a"]);
 });
