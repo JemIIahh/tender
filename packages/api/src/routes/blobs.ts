@@ -94,10 +94,10 @@ const HeldoutUploadSchema = z.strictObject({
  * The blob store and the held-out intake.
  *
  * - `POST /v1/blobs` (signed in): stores a brief, criteria, scorecard or profile, which anyone may
- *   read at once, or an entrant's result, which no one may read until some entrant has revealed it
- *   in a task whose reveals have closed. The task it was sent for decides nothing. A scorecard is
- *   taken only from the verifier or the poster of its task, and only once the task's reveal
- *   deadline has passed.
+ *   read at once, or an entrant's result, which no one may read until the task that revealed it
+ *   first has closed its reveals. The task it was sent for decides nothing. A scorecard is taken
+ *   only from the verifier or the poster of its task, and only once the task's reveal deadline
+ *   has passed.
  * - `POST /v1/heldout` (signed in): stores a held-out document, which nobody may read.
  * - `GET /v1/blobs/:sha256`: the bytes of a blob that may be read.
  * - `GET /v1/scorecards/:task_id`: the scorecard the task was settled with.
@@ -367,11 +367,17 @@ async function store(db: Db, blob: NewBlob): Promise<{ sha256: string; stored: S
 
 /**
  * Whether the API may serve `blob`, which is stored under `sha256`. A result is served by what was
- * revealed, not by who sent it: once some entry in the index has `sha256` as its `content_hash`, in
- * a task whose reveals have closed (the contract's rule, `now >= reveal_deadline`). The task the
- * row was stored for decides nothing. Sending bytes for a task that closes later cannot hold back
- * bytes that a closed task revealed, and sending them for one that has closed cannot bring out
- * bytes that are revealed in a task that has not.
+ * revealed, not by who sent it: from the reveal deadline of the task that revealed `sha256` first
+ * (the contract's rule, `now >= reveal_deadline`), the first being the earliest `revealed` event
+ * in the index with that `content_hash`. No such event, no bytes.
+ *
+ * Only the first reveal counts. The contract checks a reveal against its commitment and not the
+ * bytes, so once a hash is on chain anyone whose commit window is open can commit to it and reveal
+ * it in a task of their own. That copy cannot bring the bytes out before the first task's deadline
+ * and cannot hold them back after it. The task the row was stored for counts for nothing either:
+ * bytes sent for a task that closes later are not held back, and bytes sent for one that has
+ * closed are not brought out, when the first task to reveal them is another.
+ *
  * Anything else is served while it is public: a held-out document is not, until it is made so.
  */
 async function mayServe(deps: ApiDeps, sha256: string, blob: StoredBlob): Promise<boolean> {
@@ -379,9 +385,15 @@ async function mayServe(deps: ApiDeps, sha256: string, blob: StoredBlob): Promis
   const [reveal] = await deps.db.query<{ closed: boolean }>(
     `select exists (
        select 1
-         from entries e
-         join tasks t on t.id = e.task_id
-        where e.content_hash = $1 and t.reveal_deadline <= $2::numeric
+         from tasks t
+        where t.id = (
+                select e.task_id
+                  from events e
+                 where e.event = 'revealed' and e.data->>'content_hash' = $1
+                 order by e.id
+                 limit 1
+              )
+          and t.reveal_deadline <= $2::numeric
      ) as closed`,
     [sha256, nowNs(deps)],
   );

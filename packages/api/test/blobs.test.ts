@@ -247,9 +247,9 @@ const NOT_FOUND = { error: "not_found", message: expect.any(String) };
 
 // ---- The brief's tests ------------------------------------------------------------------------
 
-// A result is served by what was revealed, not by who sent it: once some entry in the index has the
-// hash of the bytes as its `content_hash`, in a task whose reveals have closed. The task a result
-// was sent for decides nothing.
+// A result is served by what was revealed, not by who sent it: from the reveal deadline of the task
+// that revealed the hash first. A reveal of the same hash in another task, later, changes nothing,
+// and neither does the task a result was sent for.
 
 test("result_hidden_until_reveal_deadline", async () => {
   await seedLifecycle(deps.db);
@@ -389,6 +389,66 @@ test("a_far_future_upload_cannot_delay_a_revealed_result", async () => {
   expect((await get(`/v1/blobs/${stored.body.sha256}`)).status).toBe(404);
   nowNs = soon;
   expect((await get(`/v1/blobs/${stored.body.sha256}`)).status).toBe(200);
+});
+
+test("a_copy_reveal_in_a_faster_task_cannot_publish_early", async () => {
+  await seedLifecycle(deps.db);
+  // Task 2 closes its reveals at `slow`. Task 3 closes them at `fast`, before it, and has no entry
+  // yet: its commit window is open. Carol enters task 2.
+  const slow = REVEAL_DEADLINE + 1_000n * SECOND;
+  const fast = REVEAL_DEADLINE + 500n * SECOND;
+  await openTask(2, slow, [carol]);
+  await openTask(3, fast, []);
+
+  // Carol reveals in task 2, which puts the hash of her answer on chain for anyone to read. Alice
+  // commits to that hash in task 3, with a salt of her own, and reveals it there. The contract
+  // checks the commitment and not the bytes, so the reveal is good, and her task closes first.
+  const hash = await reveal(2, carol, "the answer is 42");
+  await apply(eventLine("committed", { task_id: "3", account: alice, block_height: "140" }));
+  expect(await reveal(3, alice, "the answer is 42")).toBe(hash);
+  const put = await post("/v1/blobs", resultBody("the answer is 42", "2"), carol);
+  expect(put.body.sha256).toBe(hash);
+  const path = `/v1/blobs/${hash}`;
+
+  // The bytes wait for the task that revealed the hash first, not for task 3, whose deadline passes
+  // with nothing served.
+  for (const at of [TEST_NOW, fast - 1n, fast, fast + 1n, slow - 1n]) {
+    nowNs = at;
+    const hidden = await get(path);
+    expect(hidden.status, `at ${at}`).toBe(404);
+    expect(JSON.parse(hidden.text())).toMatchObject(NOT_FOUND);
+    expect(hidden.headers.get("cache-control"), `at ${at}`).toBe("no-store");
+  }
+  for (const at of [slow, slow + 1n, slow + 3600n * SECOND]) {
+    nowNs = at;
+    const shown = await get(path);
+    expect(shown.status, `at ${at}`).toBe(200);
+    expect(shown.text()).toBe("the answer is 42");
+  }
+});
+
+test("a_copy_reveal_in_a_slower_task_cannot_delay_it", async () => {
+  await seedLifecycle(deps.db);
+  // Task 3 closes its reveals at `soon` and task 2, which has the lower id, at `far`. Alice reveals
+  // in task 3 first, and carol reveals the same hash in task 2 after her.
+  const far = REVEAL_DEADLINE + 1_000_000n * SECOND;
+  const soon = REVEAL_DEADLINE + 500n * SECOND;
+  await openTask(2, far, [carol]);
+  await openTask(3, soon, [alice]);
+  const hash = await reveal(3, alice, "first answer");
+  expect(await reveal(2, carol, "first answer")).toBe(hash);
+  expect((await post("/v1/blobs", resultBody("first answer", "3"), alice)).body.sha256).toBe(hash);
+  const path = `/v1/blobs/${hash}`;
+
+  // It is the first reveal that counts, not the lowest task id and not the latest deadline.
+  nowNs = soon - 1n;
+  expect((await get(path)).status).toBe(404);
+  for (const at of [soon, soon + SECOND, far - 1n, far]) {
+    nowNs = at;
+    const shown = await get(path);
+    expect(shown.status, `at ${at}`).toBe(200);
+    expect(shown.text()).toBe("first answer");
+  }
 });
 
 test("upload_too_large_413", async () => {
