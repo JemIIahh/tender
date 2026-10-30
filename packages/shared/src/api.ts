@@ -176,7 +176,9 @@ export type TaskFunder = z.infer<typeof TaskFunderSchema>;
 /**
  * `GET /v1/tasks/:id`. `brief`, `criteria` and `scorecard` are the documents the task points at by
  * hash, and only if the index holds a public blob of that kind that fits the schema: otherwise
- * null. A held-out document is never among them.
+ * null. A held-out document is never among them. The schemas of the three documents are strict, so
+ * a newer document with a key that this version does not know fails the parse: an older client's
+ * `getTask` throws.
  */
 export const TaskDetailResponseSchema = z.object({
   task: TaskDetailSchema,
@@ -388,16 +390,20 @@ function failureMessage(status: number, body: unknown): string {
  * body: the parsed JSON when the text was JSON, else the text. When the body is our own error body
  * (`ErrorBodySchema`) its `error` code is in the message. A request that fails before there is an
  * answer (offline, refused, aborted) is not an `ApiError`: it is thrown as it came.
+ *
+ * The `body` of a 2xx that was rejected is the answer as it came, and it can hold a secret: for a
+ * sign-in it is the bearer token. So `body` is not an enumerable property, and `console.log(error)`
+ * and `util.inspect(error)` leave it out. Do not log it either.
  */
 export class ApiError extends Error {
   readonly status: number;
-  readonly body: unknown;
+  declare readonly body: unknown;
 
   constructor(status: number, body: unknown, message: string = failureMessage(status, body)) {
     super(message);
     this.name = "ApiError";
     this.status = status;
-    this.body = body;
+    Object.defineProperty(this, "body", { value: body, enumerable: false });
   }
 }
 
@@ -475,8 +481,8 @@ export interface ListTasksFilter {
   parent?: bigint;
   /** Page size, from 1 to 50. The API's default is 20. */
   limit?: number;
-  /** The `next_cursor` of the page before. */
-  cursor?: string;
+  /** The `next_cursor` of the page before. Null or absent: the first page. */
+  cursor?: string | null;
 }
 
 /** What `GET /v1/agents` can be filtered by. A field left out is no filter. */
@@ -487,8 +493,8 @@ export interface ListAgentsFilter {
   asp?: string;
   /** Page size, from 1 to 50. The API's default is 20. */
   limit?: number;
-  /** The `next_cursor` of the page before. */
-  cursor?: string;
+  /** The `next_cursor` of the page before. Null or absent: the first page. */
+  cursor?: string | null;
 }
 
 /**
@@ -531,7 +537,10 @@ export interface TenderApi {
   getBlob(sha256: string): Promise<Uint8Array | null>;
   /** `POST /v1/blobs`: stores a brief, criteria, result, scorecard or profile. Needs a signer. */
   uploadBlob(blob: BlobUpload): Promise<BlobUploadResponse>;
-  /** `POST /v1/heldout`: stores a held-out document, which no one can read back. Needs a signer. */
+  /**
+   * `POST /v1/heldout`: stores a held-out document, which the API does not serve until it is made
+   * public. Needs a signer.
+   */
   uploadHeldout(commitment: string, bytes: Uint8Array): Promise<void>;
   /** `POST /v1/tasks/:id/start`: says this account has started on an open task. Needs a signer. */
   start(taskId: bigint): Promise<StartResponse>;
