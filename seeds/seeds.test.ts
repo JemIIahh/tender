@@ -615,9 +615,9 @@ describe.each(JSON_SCHEMA_SLUGS)("json_schema seed %s", (slug) => {
 });
 
 /**
- * Regexes a careless solver would write for the two regex seeds, each breaking one rule of its
- * brief. The Judge scores a regex seed on its held-out cases alone (P05-R4), so a rule that no
- * held-out case tests pays every regex that breaks it. None of these may reach the pass mark.
+ * Regexes a careless solver would write for the regex seeds, each breaking one rule of its brief.
+ * The Judge scores a regex seed on its held-out cases alone (P05-R4), so a rule that no held-out
+ * case tests pays every regex that breaks it. None of these may reach the pass mark.
  */
 const KNOWN_WRONG_REGEXES: Record<string, { why: string; pattern: string }[]> = {
   "iso-date-regex": [
@@ -687,6 +687,12 @@ const KNOWN_WRONG_REGEXES: Record<string, { why: string; pattern: string }[]> = 
       why: "[redacted]",
       pattern:
         "[redacted]",
+    },
+  ],
+  "near-account-regex": [
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
     },
   ],
 };

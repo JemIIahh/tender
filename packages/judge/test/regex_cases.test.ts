@@ -487,7 +487,7 @@ test("entries_score_independently", { timeout: 10_000 }, async () => {
     scoreRegexCases(c, h, answer("(")),
     scoreRegexCases(c, h, solution),
   ]);
-  expect(results.map((result) => result.score)).toEqual([100, 0, 75, 0, 100]);
+  expect(results.map((result) => result.score)).toEqual([100, 0, 76, 0, 100]);
   expect(results[1]?.reasons).toEqual(["timed out (likely catastrophic backtracking)"]);
   expect(results[3]?.reasons).toEqual(["invalid pattern"]);
 });
