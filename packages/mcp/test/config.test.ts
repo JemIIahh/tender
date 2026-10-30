@@ -120,7 +120,8 @@ test("wrong_values_are_named_and_never_quoted", () => {
 
   expect(message).toBe(
     "TENDER_NETWORK must be one of sandbox, testnet, mainnet; " +
-      "TENDER_CONTRACT must be a NEAR account id; TENDER_API_URL must be an http(s) URL; " +
+      "TENDER_CONTRACT must be a NEAR account id; " +
+      "TENDER_API_URL must be an https URL, or an http URL to localhost, 127.0.0.1 or [::1]; " +
       "TENDER_ACCOUNT must be a NEAR account id; " +
       "TENDER_PRIVATE_KEY must be an access key, as ed25519:<base58>; " +
       "NEAR_RPC_URL must be an http(s) URL; " +
@@ -134,6 +135,55 @@ test("wrong_values_are_named_and_never_quoted", () => {
   expect(failureOf({ ...ENV, TENDER_NETWORK: "devnet", TENDER_ACCOUNT: "" })).toBe(
     "missing environment variable: TENDER_ACCOUNT; " +
       "TENDER_NETWORK must be one of sandbox, testnet, mainnet",
+  );
+});
+
+test("the_api_url_is_https_unless_it_is_on_this_machine", () => {
+  // The API takes a bearer token, which plain http would carry across the network in the clear.
+  const refusal =
+    "TENDER_API_URL must be an https URL, or an http URL to localhost, 127.0.0.1 or [::1]";
+  const apiUrl = (value: string) => readConfig({ ...ENV, TENDER_API_URL: value }, home).apiUrl;
+
+  for (const url of ["https://api.tender.example", "https://api.tender.example:8443/v1"]) {
+    expect(apiUrl(url)).toBe(url);
+  }
+  // A local API for development is plain http, and that stays possible.
+  for (const url of [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000/v1",
+    "http://[::1]:3000",
+    "http://LOCALHOST:3000",
+    "http://user:pass@localhost:3000",
+  ]) {
+    expect(apiUrl(url)).toBe(url);
+  }
+
+  // Anything else on http is refused, however much of it looks local: a name that starts or ends
+  // like one, a loopback name in the path or the user part, and addresses that are not the three.
+  for (const url of [
+    "http://api.tender.example",
+    "http://localhost.evil.example",
+    "http://127.0.0.1.evil.example",
+    "http://evil.example/localhost",
+    "http://localhost@evil.example",
+    "http://evil.example#127.0.0.1",
+    "http://127.0.0.2:3000",
+    "http://0.0.0.0:3000",
+    "http://[::2]:3000",
+  ]) {
+    expect(failureOf({ ...ENV, TENDER_API_URL: url }), url).toBe(refusal);
+  }
+  // Other schemes, and values that are no URL, are refused as they were.
+  for (const url of ["ftp://api.tender.example", "ws://localhost:3000", "api.tender.example"]) {
+    expect(failureOf({ ...ENV, TENDER_API_URL: url }), url).toBe(refusal);
+  }
+  // The refusal does not quote the value, which can hold a key.
+  expect(failureOf({ ...ENV, TENDER_API_URL: "http://evil.example/?key=SECRETKEY" })).not.toContain(
+    "SECRETKEY",
+  );
+  // The RPC carries signed transactions and no bearer token, and is not held to this.
+  expect(readConfig({ ...ENV, NEAR_RPC_URL: "http://rpc.tender.example:3030" }, home).rpcUrl).toBe(
+    "http://rpc.tender.example:3030",
   );
 });
 
@@ -259,6 +309,10 @@ test("a_startup_failure_prints_on_one_line_without_secrets", () => {
   // An empty secret cuts nothing, and not everything.
   expect(describeFailure(new Error("fine"), [""])).toBe("Error: fine");
   expect(describeFailure("a string", [])).toBe("a string");
+  // A bearer token is cut by its shape, as it is in the tools' errors, since no list names it.
+  expect(
+    describeFailure(new Error("sent Authorization: Bearer abc123.DEF-456_ghi= and failed")),
+  ).toBe("Error: sent Authorization: Bearer <redacted> and failed");
 });
 
 /** What the bin did with `env` as its whole environment. */

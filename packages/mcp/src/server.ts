@@ -4,21 +4,38 @@ import type { NetworkId, TenderApi } from "@tender/shared";
 import type { KeyKind } from "./keys";
 import type { StateStore } from "./state";
 import { registerReadTools } from "./tools/read";
+import { registerWriteTools } from "./tools/write";
 
 /**
  * What the tools call of the chain client, and nothing more, so that a test hands the server a
  * plain object. A tool that needs another method adds it here; the real `TenderClient` has them
  * all.
  */
-export type McpChain = Pick<TenderClient, "getConfig" | "balanceOf" | "storageBalanceOf">;
+export type McpChain = Pick<
+  TenderClient,
+  // Views: the contract's token list, the vault and storage balances, and one entry.
+  | "getConfig"
+  | "balanceOf"
+  | "storageBalanceOf"
+  | "getEntry"
+  // Senders: what the write tools sign and send.
+  | "storageDeposit"
+  | "commit"
+  | "reveal"
+  | "postTask"
+  | "pick"
+  | "deposit"
+  | "withdraw"
+  | "registerAgent"
+>;
 
 /** Everything the server needs from outside. The bin builds it from the environment. */
 export interface McpDeps {
-  /** The chain: vault and storage balances, the contract's token list. */
+  /** The chain: what the tools read from the contract, and the transactions they send to it. */
   client: McpChain;
-  /** The Tender API, for the board, the entries and the scorecards. */
+  /** The Tender API: the board, the entries and the scorecards, and where documents and work go. */
   api: TenderApi;
-  /** The local drafts of the entries this server committed. */
+  /** The local drafts of the entries this server committed. Two servers must not share one. */
   state: StateStore;
   network: NetworkId;
   contractId: string;
@@ -30,6 +47,11 @@ export interface McpDeps {
   defaultToken: string;
   /** The account that `verifier: "judge"` means. */
   judgeAccount?: string;
+  /**
+   * Strings that no tool may ever answer with, such as the private key and its base58 body. A
+   * failed tool's text has them cut out; a bearer token and a URL are cut whether listed or not.
+   */
+  secrets?: readonly string[];
 }
 
 /** The server's name and version, as an MCP client sees them when it connects. */
@@ -42,5 +64,6 @@ const SERVER_INFO = { name: "tender", version: "1.0.0" } as const;
 export function createMcpServer(deps: McpDeps): McpServer {
   const server = new McpServer(SERVER_INFO);
   registerReadTools(server, deps);
+  registerWriteTools(server, deps);
   return server;
 }

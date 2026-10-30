@@ -4,7 +4,7 @@ import type { Signer, TenderClient } from "@tender/client";
 import { AccountIdSchema, NETWORKS, type NetworkId } from "@tender/shared";
 import { KeyPair, type KeyPairString } from "near-api-js";
 import { defaultStateDir } from "./state";
-import { scrubUrls } from "./tools/format";
+import { scrub } from "./tools/format";
 
 // What the bin reads from the environment, and what it does with it. It lives here and not in the
 // bin so that a test can hand it an environment without starting a process.
@@ -43,6 +43,7 @@ type Env = Readonly<Record<string, string | undefined>>;
 /** What a variable must be, as the message about a wrong one says it. */
 const AN_ACCOUNT = "a NEAR account id";
 const A_URL = "an http(s) URL";
+const AN_API_URL = "an https URL, or an http URL to localhost, 127.0.0.1 or [::1]";
 
 /**
  * The value of `name` without the space around it, or undefined when it is not set. A variable set
@@ -66,6 +67,23 @@ function asHttpUrl(value: string): string | undefined {
   try {
     const { protocol } = new URL(value);
     return protocol === "http:" || protocol === "https:" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The hosts that plain `http:` may go to: this machine. The API takes a bearer token, so every
+ * other host needs `https:`. These are the three forms in which `new URL` leaves a loopback host;
+ * another address in 127.0.0.0/8 is refused rather than guessed at.
+ */
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+function asApiUrl(value: string): string | undefined {
+  try {
+    const { protocol, hostname } = new URL(value);
+    if (protocol === "https:") return value;
+    return protocol === "http:" && LOOPBACK_HOSTS.has(hostname) ? value : undefined;
   } catch {
     return undefined;
   }
@@ -108,7 +126,8 @@ export function expandHome(path: string, home: string): string {
  *
  * - Required: `TENDER_NETWORK`, `TENDER_CONTRACT`, `TENDER_API_URL`, `TENDER_ACCOUNT` and
  *   `TENDER_PRIVATE_KEY`; and `NEAR_RPC_URL` on the sandbox, which has no RPC of its own. The other
- *   networks use theirs unless `NEAR_RPC_URL` names another.
+ *   networks use theirs unless `NEAR_RPC_URL` names another. `TENDER_API_URL` is `https:`, or
+ *   `http:` to this machine only, since the API is signed in to with a bearer token.
  * - Optional: `TENDER_STATE_DIR` (default: `defaultStateDir`, under `home`; a leading `~` is
  *   expanded to `home`), `TENDER_JUDGE_ACCOUNT` and `TENDER_TOKEN`.
  *
@@ -137,7 +156,7 @@ export function readConfig(env: Env, home: string = homedir()): McpConfig {
 
   const network = read("TENDER_NETWORK", asNetwork, `one of ${Object.keys(NETWORKS).join(", ")}`);
   const contractId = read("TENDER_CONTRACT", asAccount, AN_ACCOUNT);
-  const apiUrl = read("TENDER_API_URL", asHttpUrl, A_URL);
+  const apiUrl = read("TENDER_API_URL", asApiUrl, AN_API_URL);
   const accountId = read("TENDER_ACCOUNT", asAccount, AN_ACCOUNT);
   const key = read("TENDER_PRIVATE_KEY", asKey, "an access key, as ed25519:<base58>");
   const rpcUrl = read("NEAR_RPC_URL", asHttpUrl, A_URL, network === "sandbox");
@@ -223,16 +242,13 @@ export function secretsOf(config: Pick<McpConfig, "signer">): string[] {
 
 /**
  * A failure that stopped the server from starting, as the one line the bin prints. Every string in
- * `secrets` is cut out of it, a URL is replaced by `<url>`, and line breaks become spaces, so that
- * what a library puts into its message cannot print a key.
+ * `secrets` is cut out of it, a bearer token and a URL are replaced (`scrub`), and line breaks
+ * become spaces, so that what a library puts into its message cannot print a key.
  */
 export function describeFailure(error: unknown, secrets: readonly string[] = []): string {
   let text: string;
   if (error instanceof ConfigError) text = error.message;
   else if (error instanceof Error) text = `${error.name}: ${error.message}`;
   else text = String(error);
-  for (const secret of secrets) {
-    if (secret !== "") text = text.replaceAll(secret, "<redacted>");
-  }
-  return scrubUrls(text).replace(/\s+/g, " ").trim();
+  return scrub(text, secrets).replace(/\s+/g, " ").trim();
 }

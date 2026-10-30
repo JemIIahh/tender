@@ -56,6 +56,7 @@ async function main(): Promise<void> {
     keyKind,
     defaultToken,
     judgeAccount: config.judgeAccount,
+    secrets,
   });
 
   // The session is over when the client closes our stdin, or a signal asks us to stop. Without
