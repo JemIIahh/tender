@@ -1,4 +1,6 @@
 import { expect, expectTypeOf, test, vi } from "vitest";
+import type { z } from "zod";
+import * as api from "../src/api";
 import {
   ApiError,
   fetchJson,
@@ -11,7 +13,8 @@ import {
 // `fetchJson` and the response schemas, over a fake `fetch`. The API's own test
 // (packages/api/test/schemas.test.ts) holds every schema to what its route really sends; these
 // tests are about what `fetchJson` does with an answer, and a few shapes a route can only send
-// after the indexer has been repaired from the chain.
+// after the indexer has been repaired from the chain. The last test holds each schema to the keys
+// it requires.
 
 const URL_OF_LIST = "http://api.test/v1/tasks";
 const HASH = "ab".repeat(32);
@@ -329,4 +332,251 @@ test("task_outcome_accepts_the_shapes_the_index_stores", () => {
   expect(TaskOutcomeSchema.safeParse({ ...picked, scorecard_hash: null }).success).toBe(false);
   expect(TaskOutcomeSchema.safeParse({ ...voided, kind: "settled" }).success).toBe(false);
   expect(TaskOutcomeSchema.safeParse({ ...picked, fee: 50_000 }).success).toBe(false);
+});
+
+// ---- Required keys ----------------------------------------------------------------------------
+
+// The drift test feeds each schema the bodies its route really sends, and those always have every
+// key, so it cannot see a key that has been made optional by mistake. This holds the other side:
+// for each response schema it takes a valid sample, deletes each key in turn, at every depth, and
+// expects the parse to fail. The keys that are optional by design are listed with their sample, and
+// those must parse without.
+
+const ALICE = "alice.test.near";
+const JUDGE = "judge.test.near";
+const POSTER = "poster.test.near";
+const CONTRACT = "tender.test.near";
+const SOON = "2026-10-30T10:15:00.000Z";
+
+const TASK_DETAIL = {
+  ...TASK,
+  brief_uri: "ipfs://brief",
+  brief_hash: HASH,
+  criteria_hash: HASH,
+  heldout_commitment: null,
+  max_entries: 2,
+  max_winners: 1,
+  invited: [ALICE],
+  fee_bps: 500,
+  outcome: null,
+};
+const ENTRY = {
+  account: ALICE,
+  entry_index: 0,
+  committed_height: "65",
+  content_hash: HASH,
+  uri: "ipfs://work",
+  revealed: true,
+  is_team: false,
+};
+const FUNDER = { account: POSTER, amount: "1000000" };
+const AGENT = {
+  account: ALICE,
+  asp: null,
+  name: "Alice",
+  tags: ["extraction"],
+  profile_uri: "ipfs://profile",
+  profile_hash: HASH,
+  registered_height: "50",
+  entries: 2,
+  reveals: 1,
+  wins: 1,
+  // A map by token: its keys are data, not part of a schema, so the sample leaves it empty.
+  earned: {},
+  picks_made: 0,
+  voids_after_reveals: 0,
+  is_team: false,
+};
+const RECENT_ENTRY = {
+  task_id: "7",
+  title: "Extract invoice totals",
+  phase: "open",
+  revealed: false,
+  won: false,
+};
+const ISSUE = { path: ["title"], message: "Required", code: "invalid_type" };
+const PICKED = {
+  kind: "picked",
+  task_id: "7",
+  by: JUDGE,
+  by_source: "reconcile",
+  winners: [{ account: ALICE, bps: 10_000, amount: "950000" }],
+  fee: "50000",
+  scorecard_hash: HASH,
+  scorecard_uri: "ipfs://scorecard",
+};
+const VOIDED = {
+  kind: "voided",
+  task_id: "7",
+  reason: "expired",
+  by: null,
+  by_source: "reconcile",
+  refunds: [{ account: POSTER, amount: "1000000" }],
+  scorecard_hash: null,
+  scorecard_uri: null,
+};
+
+/** The name of each schema that `src/api.ts` exports. A new one has to be given samples below. */
+type SchemaName = Extract<keyof typeof api, `${string}Schema`>;
+
+interface Sample {
+  /** A valid response. */
+  body: unknown;
+  /** Keys that may be left out, written as `a.b.0.c`: an array is entered at its first item. */
+  optional?: string[];
+}
+
+const SAMPLES: { [name in SchemaName]: Sample[] } = {
+  ErrorIssueSchema: [{ body: ISSUE }],
+  // Only a request whose body did not fit its schema lists `issues`.
+  ErrorBodySchema: [
+    {
+      body: { error: "bad_request", message: "the body does not fit", issues: [ISSUE] },
+      optional: ["issues"],
+    },
+  ],
+  TaskOutcomeSchema: [
+    // `by_source` is on an outcome that the index took from the chain's view, and on no other.
+    { body: PICKED, optional: ["by_source"] },
+    // That view has no `refunds` either.
+    { body: VOIDED, optional: ["by_source", "refunds"] },
+  ],
+  TaskSummarySchema: [{ body: TASK }],
+  TaskDetailSchema: [{ body: TASK_DETAIL }],
+  TaskEntrySchema: [{ body: ENTRY }],
+  TaskFunderSchema: [{ body: FUNDER }],
+  TaskDetailResponseSchema: [
+    {
+      body: {
+        task: TASK_DETAIL,
+        brief: null,
+        criteria: null,
+        entries: [ENTRY],
+        funders: [FUNDER],
+        children: ["8"],
+        scorecard: null,
+      },
+    },
+  ],
+  ListTasksResponseSchema: [{ body: PAGE }],
+  AgentSummarySchema: [{ body: AGENT }],
+  ListAgentsResponseSchema: [{ body: { agents: [AGENT], next_cursor: ALICE } }],
+  AgentRecentEntrySchema: [{ body: RECENT_ENTRY }],
+  AgentDetailResponseSchema: [{ body: { agent: AGENT, recent_entries: [RECENT_ENTRY] } }],
+  AccountEntrySchema: [
+    {
+      body: {
+        ...RECENT_ENTRY,
+        entry_index: 0,
+        committed_height: "65",
+        content_hash: null,
+        uri: null,
+      },
+    },
+  ],
+  AccountEntriesResponseSchema: [
+    {
+      body: {
+        entries: [
+          {
+            ...RECENT_ENTRY,
+            entry_index: 0,
+            committed_height: "65",
+            content_hash: HASH,
+            uri: "ipfs://work",
+          },
+        ],
+      },
+    },
+  ],
+  HealthResponseSchema: [
+    {
+      body: {
+        ok: true,
+        network: "testnet",
+        contract: CONTRACT,
+        indexed_height: "90",
+        chain_final_height: "100",
+        lag_blocks: "10",
+      },
+    },
+  ],
+  HealthUnavailableSchema: [
+    {
+      body: {
+        ok: false,
+        error: "chain_unavailable",
+        message: "the final height of the chain cannot be read",
+        network: "testnet",
+        contract: CONTRACT,
+        indexed_height: "90",
+      },
+    },
+  ],
+  BlobUploadResponseSchema: [{ body: { sha256: HASH, uri: `http://api.test/v1/blobs/${HASH}` } }],
+  HeldoutUploadResponseSchema: [{ body: { ok: true } }],
+  ChallengeResponseSchema: [
+    {
+      body: { nonce: "AAAA", message: "Sign in to Tender", recipient: CONTRACT, expires_at: SOON },
+    },
+  ],
+  SignInResponseSchema: [
+    { body: { token: "a-bearer-token", expires_at: SOON, key_kind: "full_access" } },
+  ],
+  StartResponseSchema: [{ body: { ok: true, working_count: 3 } }],
+  TelegramLinkSchema: [
+    { body: { url: "https://t.me/tender_test_bot?start=abc", expires_at: SOON } },
+  ],
+  // `data` is any object on purpose, so the sample leaves it empty.
+  SseEventDataSchema: [{ body: { event: "task_created", data: {}, height: "90", task_id: "7" } }],
+};
+
+/** The path to every key of `value`, at every depth. An array is entered at its first item. */
+function keyPaths(value: unknown, path: string[] = []): string[][] {
+  if (Array.isArray(value)) return value.length === 0 ? [] : keyPaths(value[0], [...path, "0"]);
+  if (typeof value !== "object" || value === null) return [];
+  return Object.entries(value).flatMap(([key, child]) => [
+    [...path, key],
+    ...keyPaths(child, [...path, key]),
+  ]);
+}
+
+/** A copy of `body` without the key at `path`. */
+function without(body: unknown, path: string[]): unknown {
+  const copy: unknown = JSON.parse(JSON.stringify(body));
+  let holder = copy as Record<string, unknown>;
+  for (const step of path.slice(0, -1)) holder = holder[step] as Record<string, unknown>;
+  const key = path[path.length - 1];
+  if (key !== undefined) Reflect.deleteProperty(holder, key);
+  return copy;
+}
+
+test("every_key_of_a_response_schema_is_required_unless_listed_as_optional", () => {
+  // Every schema of src/api.ts has samples, so a new one cannot go unchecked.
+  const exported = Object.entries(api).filter(([name]) => name.endsWith("Schema"));
+  expect(Object.keys(SAMPLES).sort()).toEqual(exported.map(([name]) => name).sort());
+
+  for (const [name, value] of exported) {
+    const schema = value as z.ZodType;
+    for (const [index, { body, optional = [] }] of SAMPLES[name as SchemaName].entries()) {
+      const label = `${name} sample ${index}`;
+      // The sample is a valid response, and parses to a copy of itself.
+      expect(schema.parse(body), label).toEqual(body);
+
+      const paths = keyPaths(body);
+      // Each optional key is one the sample has, so the list cannot go stale.
+      for (const key of optional) {
+        expect(
+          paths.map((path) => path.join(".")),
+          `${label}: ${key}`,
+        ).toContain(key);
+      }
+
+      for (const path of paths) {
+        const key = path.join(".");
+        const parsed = schema.safeParse(without(body, path));
+        expect(parsed.success, `${label} without ${key}`).toBe(optional.includes(key));
+      }
+    }
+  }
 });
