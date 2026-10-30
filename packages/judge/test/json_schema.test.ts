@@ -99,7 +99,25 @@ const TREE_SCHEMA = {
 };
 
 const NOT_COMPILED = /^criteria schema cannot be compiled: /;
+const NOT_SUPPORTED = /^criteria schema is not supported: /;
 const NOT_EVALUATED = /^criteria schema cannot be evaluated: /;
+
+/** The documents `checkJsonSchemaUsable` evaluates a schema on: the smallest of each JSON type. */
+const TRIALS = { null: null, boolean: true, number: 0, string: "", array: [], object: {} };
+
+/**
+ * A schema that throws when it is evaluated on a document of `type`, and only then. (It is parsed
+ * from JSON text because Biome takes a `then` in an object literal for a thenable; to the schema
+ * it is a keyword.)
+ */
+function throwsOnlyOn(type: string): Record<string, unknown> {
+  return JSON.parse(`{"if":{"type":"${type}"},"then":{"$dynamicRef":"#constructor"}}`);
+}
+
+/** Scores `document` against `schema` with one held-out check that holds for it. */
+function scoreOn(schema: Record<string, unknown>, document: unknown): EntryScore {
+  return scoreJsonSchema(criteria(schema), heldout(check("$", document)), json(document));
+}
 
 /**
  * Schemas that cannot be used to score, with the start of the reason given for each. Some do not
@@ -123,11 +141,11 @@ const UNUSABLE: Record<string, { schema: Record<string, unknown>; reason: RegExp
   },
   "an async schema": {
     schema: { $async: true, type: "object", required: ["x"] },
-    reason: NOT_COMPILED,
+    reason: NOT_SUPPORTED,
   },
   "an async schema whose flag is not literally true": {
     schema: { $async: "yes", type: "object", required: ["x"] },
-    reason: NOT_COMPILED,
+    reason: NOT_SUPPORTED,
   },
   "a dynamic reference to constructor": {
     schema: { $dynamicRef: "#constructor" },
@@ -473,14 +491,9 @@ test("schema_check_rejects_unusable_schemas", async () => {
     reason: expect.stringMatching(NOT_EVALUATED),
   });
 
-  // A schema may throw for some types of document only, so the trial has one of each type. Here
-  // `then` is evaluated for documents of one type. (It is parsed from JSON text because Biome takes
-  // a `then` in an object literal for a thenable; to the schema it is a keyword.)
-  for (const type of ["null", "boolean", "number", "string", "array", "object"]) {
-    const reachedByOneType = JSON.parse(
-      `{"if":{"type":"${type}"},"then":{"$dynamicRef":"#constructor"}}`,
-    );
-    expect(checkJsonSchemaUsable(reachedByOneType).ok, type).toBe(false);
+  // A schema may throw for some types of document only, so the trial has one of each type.
+  for (const type of Object.keys(TRIALS)) {
+    expect(checkJsonSchemaUsable(throwsOnlyOn(type)).ok, type).toBe(false);
   }
 
   // Schemas the scorer can use. A trial document that does not fit is no reason to refuse, and
@@ -496,6 +509,83 @@ test("schema_check_rejects_unusable_schemas", async () => {
   ];
   for (const schema of workable) expect(checkJsonSchemaUsable(schema)).toEqual({ ok: true });
   expect(warn).not.toHaveBeenCalled();
+});
+
+test("unreadable_schema_errors_score_zero", () => {
+  // `$dynamicRef` to a name every object has makes Ajv call Object.prototype.isPrototypeOf. It
+  // returns false for a number and has no `errors` of its own, and Ajv adds those to its list all
+  // the same: after the type error comes `undefined`. Nothing can be told from such a list.
+  const schema = { properties: { p: { type: "string", $dynamicRef: "#isPrototypeOf" } } };
+  const unreadable =
+    "criteria schema cannot be evaluated: the schema reported an error that is not an object";
+
+  // An ordinary wrong answer: a number or null where the schema wants a string.
+  for (const document of [{ p: 5 }, { p: null }]) {
+    expect(scoreOn(schema, document), JSON.stringify(document)).toEqual({
+      score: 0,
+      passed: false,
+      reasons: [unreadable],
+    });
+  }
+  // The schema is only at fault where a document reaches it: one without `p` fits.
+  expect(scoreOn(schema, {})).toEqual({ score: 100, passed: true, reasons: [] });
+});
+
+test("schema_check_reads_errors_as_the_scorer_does", () => {
+  // The same list of errors, met by a trial document: only `null` does not fit here, and the check
+  // has to read the errors of a document that does not fit, as the scorer does.
+  const schema = JSON.parse(
+    '{"if":{"type":"null"},"then":{"type":"string","$dynamicRef":"#isPrototypeOf"}}',
+  );
+
+  const verdict = checkJsonSchemaUsable(schema);
+  if (verdict.ok) throw new Error("the check should refuse this schema");
+  expect(verdict.reason).toMatch(NOT_EVALUATED);
+  // The scorer gives the same reason for that document, and scores the others as usual.
+  expect(scoreOn(schema, null)).toEqual({ score: 0, passed: false, reasons: [verdict.reason] });
+  expect(scoreOn(schema, {})).toEqual({ score: 100, passed: true, reasons: [] });
+});
+
+test("schema_check_and_scorer_agree", () => {
+  // A schema the check refuses whatever the document: the scorer scores every trial document 0,
+  // and the first of them (the one the check met first) gets the check's own reason.
+  for (const [label, { schema, reason }] of Object.entries(UNUSABLE)) {
+    const verdict = checkJsonSchemaUsable(schema);
+    if (verdict.ok) throw new Error(`${label}: the check should refuse this schema`);
+    for (const [type, trial] of Object.entries(TRIALS)) {
+      const result = scoreOn(schema, trial);
+      expect(result.score, `${label}, ${type}`).toBe(0);
+      expect(result.reasons, `${label}, ${type}`).toEqual([expect.stringMatching(reason)]);
+    }
+    expect(scoreOn(schema, TRIALS.null).reasons, label).toEqual([verdict.reason]);
+  }
+
+  // A schema that fails for one type of document only: the check refuses it, the scorer gives the
+  // document of that type the check's reason, and documents of the other types are scored as usual.
+  for (const [type, trial] of Object.entries(TRIALS)) {
+    const schema = throwsOnlyOn(type);
+    const verdict = checkJsonSchemaUsable(schema);
+    if (verdict.ok) throw new Error(`${type}: the check should refuse this schema`);
+    expect(scoreOn(schema, trial), type).toEqual({
+      score: 0,
+      passed: false,
+      reasons: [verdict.reason],
+    });
+    for (const [other, document] of Object.entries(TRIALS)) {
+      if (other !== type) expect(scoreOn(schema, document).score, `${type}, ${other}`).toBe(100);
+    }
+  }
+
+  // A schema that refers to itself without end overflows the stack. The scorer cannot tell that
+  // from a document nested too deeply, and says so for every document.
+  expect(checkJsonSchemaUsable({ $ref: "#" }).ok).toBe(false);
+  for (const [type, trial] of Object.entries(TRIALS)) {
+    expect(scoreOn({ $ref: "#" }, trial), type).toEqual({
+      score: 0,
+      passed: false,
+      reasons: ["too deeply nested to validate"],
+    });
+  }
 });
 
 test("formats_are_enforced", () => {

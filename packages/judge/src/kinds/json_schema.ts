@@ -1,5 +1,5 @@
 import type { Heldout, PublicCriteria } from "@tender/shared";
-import Ajv2020, { type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
+import Ajv2020, { type ValidateFunction } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import type { EntryScore } from "../types";
 
@@ -19,6 +19,9 @@ const MISSING = Symbol("missing");
 /** What `checkJsonSchemaUsable` runs a schema on: the smallest document of each JSON type. */
 const TRIAL_DOCUMENTS: unknown[] = [null, true, 0, "", [], {}];
 
+/** What running a schema on one document came to: it fits, it does not (and why), or it threw. */
+type Run = { fits: true } | { fits: false; errors: string[] } | { error: unknown };
+
 /**
  * Scores a `json_schema` entry. The bytes must be valid UTF-8 holding one JSON document that fits
  * the criteria's schema (JSON Schema 2020-12, with the standard formats such as `date`);
@@ -33,12 +36,15 @@ const TRIAL_DOCUMENTS: unknown[] = [null, true, 0, "", [], {}];
  * found is not deeply equal to `equals`: objects by key set, whatever the order, arrays by order.
  * A missing key is not `null`.
  *
- * Pure and total: any bytes give a score, and none of them can make this throw. A document nested
- * so deeply that validating it overflows the stack scores 0, and so does every document when the
- * schema itself cannot be used: it does not compile, it is an `$async` schema, or it throws when
- * it is evaluated (the criteria say what a task asks for, and a task that asks for something that
- * cannot be checked pays nobody). `checkJsonSchemaUsable` lets task intake find such a schema
- * before any agent enters.
+ * Pure, and total in the bytes: whatever an agent wrote, this returns a score and does not throw.
+ * A document scores 0, with a reason, when it is nested so deeply that validating it overflows the
+ * stack, and when it makes the schema throw or leave errors that cannot be read. Every document
+ * scores 0 when the schema does not compile or is an `$async` schema. The criteria say what a task
+ * asks for, and a task that asks for something that cannot be checked pays nobody.
+ *
+ * `checkJsonSchemaUsable` lets task intake turn such a task away before any agent enters, but it
+ * only tries a few small documents. A schema that fails on others passes it, and the scorer scores
+ * those documents 0 and the rest as usual.
  */
 export function scoreJsonSchema(
   c: JsonSchemaCriteria,
@@ -77,13 +83,17 @@ export function scoreJsonSchema(
 }
 
 /**
- * Whether `scoreJsonSchema` can use `schema` to score anything. Task intake can use this to turn
- * a task away before any agent enters it, rather than let every entry score 0.
+ * Whether `scoreJsonSchema` can work with `schema`, for task intake to turn a task away before any
+ * agent enters it, rather than let every entry score 0. It compiles the schema with the scorer's
+ * own Ajv options, refuses what the scorer refuses (an `$async` schema), and evaluates the schema
+ * on a small document of each JSON type, the way the scorer evaluates an entry: the same function
+ * runs the schema and reads its errors.
  *
- * It compiles the schema with the scorer's own Ajv options, refuses what the scorer refuses (an
- * `$async` schema), and runs the schema on a few small documents, which finds the schemas that
- * throw when they are evaluated. It cannot reach every part of a schema. One that throws only on
- * some documents passes this check, and the scorer scores such a document 0.
+ * `ok: false` means that the scorer scores 0 the document that made the check fail (every
+ * document, when the schema does not compile or is `$async`). `ok: true` is not a promise that
+ * every answer can be scored. A schema that fails only on documents with certain contents, such
+ * as a wrong type in one property, passes, and the scorer scores such a document 0 and the rest
+ * as usual.
  */
 export function checkJsonSchemaUsable(
   schema: Record<string, unknown>,
@@ -98,7 +108,7 @@ export function checkJsonSchemaUsable(
   return { ok: true };
 }
 
-/** The reasons `document` does not fit `schema`, or `null` when it fits. */
+/** The reasons `document` scores 0 against `schema`, or `null` when it fits. */
 function checkSchema(schema: Record<string, unknown>, document: unknown): string[] | null {
   const compiled = compile(schema);
   if ("reason" in compiled) return [compiled.reason];
@@ -112,8 +122,7 @@ function checkSchema(schema: Record<string, unknown>, document: unknown): string
       run.error instanceof RangeError ? "too deeply nested to validate" : cannotEvaluate(run.error),
     ];
   }
-  if (run.fits) return null;
-  return (compiled.validate.errors ?? []).slice(0, MAX_SCHEMA_ERRORS).map(formatError);
+  return run.fits ? null : run.errors;
 }
 
 /** `schema` compiled, or why it cannot be used. */
@@ -130,19 +139,30 @@ function compile(
   // document, so every document would fit, and the Promise rejects, unhandled, for the ones that
   // do not. Ajv sets the flag to exactly `true`, for any truthy `$async`.
   if ((validate as { $async?: boolean }).$async === true) {
-    return { reason: 'criteria schema cannot be compiled: "$async" schemas are not supported' };
+    return { reason: 'criteria schema is not supported: it is an "$async" schema' };
   }
   return { validate };
 }
 
-/** Runs `validate` on `document`: whether it fits, or what the schema threw. */
-function validateOnce(
-  validate: ValidateFunction,
-  document: unknown,
-): { fits: boolean } | { error: unknown } {
+/**
+ * Runs `validate` on `document` and reads the outcome: that it fits, or the first errors as
+ * reasons, or what the schema threw. Reading the errors is part of running the schema, so it is
+ * inside the same guard. They are the schema's own output: a dynamic reference to a name every
+ * object has (`#isPrototypeOf`) makes Ajv put `undefined` among them. The scorer and
+ * `checkJsonSchemaUsable` both run a schema through here.
+ */
+function validateOnce(validate: ValidateFunction, document: unknown): Run {
   try {
     // Only `true` fits. Nothing that is merely truthy does.
-    return { fits: validate(document) === true };
+    if (validate(document) === true) return { fits: true };
+
+    const errors = (validate.errors ?? []).slice(0, MAX_SCHEMA_ERRORS);
+    // A schema that reports something that is not an error cannot be trusted with the rest of
+    // its report, so the run fails instead of making up the reasons.
+    if (!errors.every(isObject)) {
+      throw new TypeError("the schema reported an error that is not an object");
+    }
+    return { fits: false, errors: errors.map(formatError) };
   } catch (error) {
     return { error };
   }
@@ -183,9 +203,18 @@ function newAjv(): Ajv2020 {
   return ajv;
 }
 
-/** An Ajv error as `instancePath message`; the document itself has no path. */
-function formatError(error: ErrorObject): string {
-  return `${error.instancePath} ${error.message ?? error.keyword}`.trim();
+/**
+ * An Ajv error as `instancePath message`; the document itself has no path. Total, as a second
+ * guard behind `validateOnce`: what the schema leaves in its list of errors is not always an error
+ * object, or one with all of its fields, and this describes it instead of throwing.
+ */
+function formatError(error: unknown): string {
+  if (!isObject(error)) return "unreadable error";
+  const { instancePath, message, keyword } = error;
+  return [instancePath, message ?? keyword]
+    .filter((part): part is string => typeof part === "string")
+    .join(" ")
+    .trim();
 }
 
 /** What `path` finds in `document`, or `MISSING`. */
