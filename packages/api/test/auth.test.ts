@@ -1,5 +1,7 @@
 import { Buffer } from "node:buffer";
+import { format } from "node:util";
 import type { AuthErrorCode, KeyPermission } from "@tender/client";
+import type { Db } from "@tender/db";
 import { FIXTURE_ACCOUNTS, FIXTURE_BRIEF, FIXTURE_CONTRACT } from "@tender/indexer/testing";
 import { canonicalJson, sha256Hex } from "@tender/shared";
 import { Hono } from "hono";
@@ -1042,6 +1044,84 @@ test("a_token_never_carries_more_than_its_key_has_or_had", async () => {
   }
 });
 
+test("a_slow_read_of_the_token_does_not_make_an_old_answer_look_new", async () => {
+  const chain = liveChain();
+  const { token } = await signIn(appWith({ client: chain.client }));
+  // A database that takes 20 s to read the token when `slow` says so: the clock of the API moves
+  // while the read is waited for.
+  let slow = false;
+  const db: Db = {
+    query: async <T>(sql: string, params?: unknown[]) => {
+      const rows = await deps.db.query<T>(sql, params);
+      if (slow && sql.includes("select") && sql.includes("from auth_tokens")) nowNs += 20n * SECOND;
+      return rows;
+    },
+    exec: (sql) => deps.db.exec(sql),
+    tx: (fn) => deps.db.tx(fn),
+    close: () => deps.db.close(),
+  };
+  const app = probe({ client: chain.client, db });
+  chain.lookups.length = 0;
+
+  // Checked at +0, the answer is good until +60 s.
+  expect((await whoamiAt(app, token, TEST_NOW)).status).toBe(200);
+  expect(chain.lookups).toHaveLength(1);
+
+  // A request that starts at +30 s and waits 20 s for the row is served at +50 s, still on it.
+  slow = true;
+  expect((await whoamiAt(app, token, TEST_NOW + 30n * SECOND)).status).toBe(200);
+  expect(chain.lookups).toHaveLength(1);
+
+  // The key goes. A request that starts at +59 s, inside the minute, is served at +79 s, outside
+  // it, and so it asks the chain.
+  chain.permission = null;
+  const refused = await whoamiAt(app, token, TEST_NOW + 59n * SECOND);
+  expect(refused.status).toBe(401);
+  expect(await refused.json()).toEqual(UNAUTHORIZED);
+  expect(chain.lookups).toHaveLength(2);
+  expect(await tokenRows()).toEqual([]);
+});
+
+test("an_answer_is_dated_from_the_question_and_never_from_after_it", async () => {
+  const chain = liveChain();
+  const { token } = await signIn(appWith({ client: chain.client }));
+  // A chain that moves the clock of the API by `drift` while it answers.
+  let drift = 0n;
+  const client = fakeClient({
+    viewAccessKey: (account, key) => {
+      nowNs += drift;
+      return chain.client.viewAccessKey(account, key);
+    },
+  });
+  /** How many times the chain has been asked, once `app` has served `token` at `at`. */
+  const lookupsAfter = async (app: ReturnType<typeof probe>, at: bigint) => {
+    expect((await whoamiAt(app, token, at)).status, `${at}`).toBe(200);
+    return chain.lookups.length;
+  };
+  chain.lookups.length = 0;
+
+  // Asked at +0 and answered at +4 s, the answer is good for the minute from the question, up
+  // to +60 s, and not for the minute from its arrival.
+  drift = 4n * SECOND;
+  const forward = probe({ client });
+  const seenForward: number[] = [];
+  for (const at of [0n, MINUTE - 1n, MINUTE]) {
+    seenForward.push(await lookupsAfter(forward, TEST_NOW + at));
+  }
+  expect(seenForward).toEqual([1, 1, 2]);
+
+  // Asked at +200 s and answered at +100 s, because the clock went back while the chain was
+  // answering, the answer is dated by the clock as it now stands: good from +100 s to +160 s.
+  chain.lookups.length = 0;
+  drift = -100n * SECOND;
+  const backward = probe({ client });
+  const seenBackward: number[] = [];
+  for (const at of [200n * SECOND, 130n * SECOND, 160n * SECOND - 1n, 160n * SECOND]) {
+    seenBackward.push(await lookupsAfter(backward, TEST_NOW + at));
+  }
+  expect(seenBackward).toEqual([1, 1, 1, 2]);
+});
+
 // ---- A chain that does not answer -------------------------------------------------------------
 
 test("a_key_check_that_gets_no_answer_in_5s_is_a_503", async () => {
@@ -1058,7 +1138,9 @@ test("a_key_check_that_gets_no_answer_in_5s_is_a_503", async () => {
   expect(await refused.json()).toEqual(UNAVAILABLE);
   expect(refused.headers.get("www-authenticate")).toBeNull();
   expect(chain.lookups).toHaveLength(1);
-  expect(log).toHaveBeenCalled();
+  expect(log).toHaveBeenCalledWith(
+    "api: cannot check the key of a signed-in token (NoAnswerInTime)",
+  );
 
   // The lookup that was given up on ends on its own, and a failure then is nobody's to handle.
   expect(await unhandledAfterLateFailure(chain)).toEqual([]);
@@ -1085,7 +1167,7 @@ test("a_sign_in_that_gets_no_key_answer_in_5s_is_a_503_and_keeps_its_challenge",
   expect(refused.body).toEqual(UNAVAILABLE);
   expect(refused.headers.get("www-authenticate")).toBeNull();
   expect(chain.lookups).toHaveLength(1);
-  expect(log).toHaveBeenCalled();
+  expect(log).toHaveBeenCalledWith("api: cannot check the key of a sign-in (NoAnswerInTime)");
 
   // Nothing was spent or stored. The lookup that was given up on ends on its own, as above.
   expect(await tokenRows()).toEqual([]);
@@ -1131,6 +1213,51 @@ test("a_lookup_inside_the_deadline_is_used_and_leaves_no_timer_behind", async ()
   nowNs = TEST_NOW + MINUTE;
   expect((await whoami(checked, `Bearer ${signed.body.token}`)).status).toBe(503);
   expect(vi.getTimerCount()).toBe(0);
+});
+
+test("a_failed_lookup_logs_the_name_of_the_error_and_not_its_text", async () => {
+  // Spies on every level, so that no way of logging gets by.
+  const spies = (["log", "info", "warn", "error", "debug"] as const).map((level) =>
+    vi.spyOn(console, level).mockImplementation(() => undefined),
+  );
+  // The text of an RPC error can name an endpoint with a key in it, and so can the error it was
+  // caused by. A thing that is thrown and is no error has no name, only a type.
+  const failures: Array<[string, () => unknown]> = [
+    [
+      "TypedError",
+      () =>
+        Object.assign(
+          new Error("rpc down at https://marker-rpc.example/?key=secret", {
+            cause: new Error("connect refused: https://marker-rpc.example/?key=secret"),
+          }),
+          { name: "TypedError" },
+        ),
+    ],
+    ["string", () => "rpc down at https://marker-rpc.example/?key=secret"],
+  ];
+  const { token } = await signIn(appWith());
+
+  for (const [name, failure] of failures) {
+    spies.forEach((spy) => {
+      spy.mockClear();
+    });
+    const down = fakeClient({
+      viewAccessKey: () => Promise.reject(failure()),
+    });
+    const ch = await challenge(appWith());
+    const body = await signChallenge(KeyPair.fromRandom("ed25519"), ch);
+
+    const rechecked = await whoami(probe({ client: down }), `Bearer ${token}`);
+    const signedIn = await post(appWith({ client: down }), "/v1/auth/verify", body);
+
+    expect([rechecked.status, signedIn.status]).toEqual([503, 503]);
+    // One line for each failure, with the name of what went wrong in it and nothing else.
+    const lines = spies.flatMap((spy) => spy.mock.calls.map((args) => format(...args)));
+    expect(lines).toEqual([
+      `api: cannot check the key of a signed-in token (${name})`,
+      `api: cannot check the key of a sign-in (${name})`,
+    ]);
+  }
 });
 
 // ---- Housekeeping -----------------------------------------------------------------------------
