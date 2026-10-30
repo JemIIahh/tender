@@ -1,6 +1,7 @@
 import type { Heldout, PublicCriteria } from "@tender/shared";
 import { afterEach, expect, test, vi } from "vitest";
 import { checkJsonSchemaUsable, type EntryScore, scoreJsonSchema } from "../src/index";
+import { jsonSchemaScorer } from "../src/kinds/json_schema";
 
 type JsonSchemaCriteria = Extract<PublicCriteria, { kind: "json_schema" }>;
 // `Heldout` is a union, so `Heldout["json_schema"]` does not compile: pick the member first.
@@ -651,6 +652,27 @@ test("non_finite_numbers_fail", () => {
     passed: false,
     reasons: ["/total must be number", "/count must be integer"],
   });
+});
+
+test("the_validator_is_compiled_before_the_first_document", () => {
+  // The review's shape: a leaf of 100 properties that the schema refers to 100 times, which Ajv
+  // writes out at each reference. V8 compiles what Ajv wrote on its first run, which takes some
+  // hundred milliseconds here. jsonSchemaScorer runs it on the trial documents itself, so that the
+  // first document an entrant sends is scored as quickly as the rest.
+  const leaf: Record<string, unknown> = {};
+  for (let i = 0; i < 100; i++) leaf[`q${i}`] = { type: "integer", minimum: i, maximum: i + 9 };
+  const properties: Record<string, unknown> = {};
+  for (let i = 0; i < 100; i++) properties[`p${i}`] = { $ref: "#/$defs/leaf" };
+  const schema = {
+    type: "object",
+    $defs: { leaf: { type: "object", properties: leaf } },
+    properties,
+  };
+  const scorer = jsonSchemaScorer(criteria(schema), heldout(check("$.x", 1)));
+  expect(scorer.problem).toBeNull();
+  const started = performance.now();
+  expect(scorer.score(json({ x: 1 }))).toEqual({ score: 100, passed: true, reasons: [] });
+  expect(performance.now() - started).toBeLessThan(100);
 });
 
 test("deep_nesting_scores_zero", () => {

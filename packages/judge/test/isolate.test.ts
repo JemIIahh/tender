@@ -235,6 +235,42 @@ test("the_time_left_bounds_each_part_of_the_work", { timeout: 30_000 }, async ()
   await slow.close();
 });
 
+test("a_compile_longer_than_an_entrys_limit_is_not_charged_to_any_entry", {
+  timeout: 60_000,
+}, async () => {
+  // The review's shape: a leaf of 100 properties that the schema refers to 100 times, which Ajv
+  // writes out at each reference. It takes over a second to compile, and V8 compiles what Ajv
+  // wrote on its first run, which costs some hundred milliseconds more: an entry that paid for
+  // that would time out at the 500 ms each one has here. The worker does it all before it takes
+  // an entry. Mallory's string makes the poster's pattern backtrack without end, and times out;
+  // the entry after it gets a new worker, which compiles again first, and is scored.
+  const leaf: Record<string, unknown> = {};
+  for (let i = 0; i < 100; i++) leaf[`q${i}`] = { type: "integer", minimum: i, maximum: i + 9 };
+  const properties: Record<string, unknown> = {
+    s: { type: "string", pattern: "^(a+)+$" },
+  };
+  for (let i = 0; i < 100; i++) properties[`p${i}`] = { $ref: "#/$defs/leaf" };
+  const schema = {
+    type: "object",
+    $defs: { leaf: { type: "object", properties: leaf } },
+    properties,
+  };
+  const scorer = openTaskScorer(
+    { criteria: jsonSchema(schema), heldout: X_IS_1 },
+    { entryTimeoutMs: 500, compileBudgetMs: 60_000 },
+  );
+  const backtracking = `{"x":1,"s":"${"a".repeat(40)}!"}`;
+  for (const [content, scoring] of [
+    ['{"x":1}', RIGHT],
+    [backtracking, failed("scoring timed out")],
+    ['{"x":1}', RIGHT],
+    ['{"x":2}', failed("$.x expected 1")],
+  ] as const) {
+    expect(await scorer.score(bytes(content)), content.slice(0, 20)).toEqual(scoring);
+  }
+  await scorer.close();
+});
+
 test("the_criteria_compile_before_any_entry", { timeout: 60_000 }, async () => {
   // P05-R17: a worker compiles the criteria before it takes an entry, within its compile budget,
   // so a compile of 2 s costs the first entry nothing of its 1 s. A worker that replaces one an

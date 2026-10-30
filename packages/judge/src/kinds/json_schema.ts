@@ -58,19 +58,25 @@ export function scoreJsonSchema(
 
 /**
  * `scoreJsonSchema` for the entries of one task, scored one after another: the schema is compiled
- * once, now, and that validator checks every entry. A schema near the size cap takes a few hundred
- * milliseconds to compile. Ajv's validators keep nothing of one document for the next, so each
- * entry scores as it would on its own.
+ * once, now, and that validator checks every entry. Ajv's validators keep nothing of one document
+ * for the next, so each entry scores as it would on its own.
  *
- * `problem` is why the schema cannot be used, or `null`: it does not compile, or it is an
- * `$async` schema. `score` then scores every document that is JSON 0 with that reason, as
- * `scoreJsonSchema` does; the Judge does not score such a task at all.
+ * The compile is all done here, before any entry: Ajv writes the validator, and the trial run of
+ * `checkJsonSchemaUsable` runs it once on each small document, which makes V8 compile the code
+ * Ajv wrote, as it otherwise would on the first entry. A schema near the size cap takes a few
+ * hundred milliseconds to compile, and a small one that Ajv inlines many times over takes seconds.
+ *
+ * `problem` is why the schema cannot be used, or `null`: what `checkJsonSchemaUsable` refuses (it
+ * does not compile, is an `$async` schema, or throws on a trial document). The Judge does not
+ * score such a task at all. `score` still scores as `scoreJsonSchema` does: every document that is
+ * JSON 0 when the schema does not compile, and any other on its own.
  */
 export function jsonSchemaScorer(
   c: JsonSchemaCriteria,
   h: JsonSchemaHeldout,
 ): { problem: string | null; score: (content: Uint8Array) => EntryScore } {
   const compiled = compile(c.schema);
+  const problem = "reason" in compiled ? compiled.reason : trialProblem(compiled.validate);
   const score = (content: Uint8Array): EntryScore => {
     const text = decodeUtf8(content);
     if (text === null) return scored(c, 0, ["not valid UTF-8"]);
@@ -102,7 +108,7 @@ export function jsonSchemaScorer(
       failed.map(({ path, equals }) => `${path} expected ${JSON.stringify(equals)}`),
     );
   };
-  return { problem: "reason" in compiled ? compiled.reason : null, score };
+  return { problem, score };
 }
 
 /**
@@ -123,12 +129,20 @@ export function checkJsonSchemaUsable(
 ): { ok: true } | { ok: false; reason: string } {
   const compiled = compile(schema);
   if ("reason" in compiled) return { ok: false, reason: compiled.reason };
+  const problem = trialProblem(compiled.validate);
+  return problem === null ? { ok: true } : { ok: false, reason: problem };
+}
 
+/**
+ * Why `validate` cannot be used, or `null`: what it throws on the smallest document of a JSON
+ * type, run the way an entry is. The first run of a validator is also when V8 compiles it.
+ */
+function trialProblem(validate: ValidateFunction): string | null {
   for (const trial of TRIAL_DOCUMENTS) {
-    const run = validateOnce(compiled.validate, trial);
-    if ("error" in run) return { ok: false, reason: cannotEvaluate(run.error) };
+    const run = validateOnce(validate, trial);
+    if ("error" in run) return cannotEvaluate(run.error);
   }
-  return { ok: true };
+  return null;
 }
 
 /** The reasons `document` scores 0 against the `compiled` schema, or `null` when it fits. */

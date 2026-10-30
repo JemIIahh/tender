@@ -39,9 +39,9 @@ export async function scoreEntry(input: ScoreInput): Promise<EntryScore> {
 /** The scorer of one task's entries, prepared: see `prepareScorer`. */
 export interface PreparedScorer {
   /**
-   * Why the criteria cannot be scored with, or `null`: a `json_schema` schema that does not
-   * compile, or is `$async`. `score` then scores every entry that is JSON 0 with that reason, as
-   * `scoreJsonSchema` does; the Judge does not score such a task at all.
+   * Why the criteria cannot be scored with, or `null`: a `json_schema` schema that the criteria
+   * check refuses (`checkJsonSchemaUsable`). The Judge does not score such a task at all; `score`
+   * still scores as `scoreJsonSchema` does.
    */
   problem: string | null;
   score(content: Uint8Array): Promise<EntryScore>;
@@ -50,8 +50,9 @@ export interface PreparedScorer {
 /**
  * The scorer of one task's entries: `scoreEntry` with the criteria and the held-out document
  * fixed, for entries scored one after another. Every scorer the Judge runs is called from here and
- * nowhere else. A `json_schema` schema is compiled now, once, before any entry, and not again for
- * each (`jsonSchemaScorer`), so that no entry pays for it.
+ * nowhere else. A `json_schema` schema is compiled now, once, and run on the check's trial
+ * documents, before any entry and not again for each (`jsonSchemaScorer`), so that no entry pays
+ * for any of the compile, V8's included.
  *
  * It throws `ScorerUnavailableError` when the held-out document has no part for the kind that
  * needs one, a slip of the Judge's own.
