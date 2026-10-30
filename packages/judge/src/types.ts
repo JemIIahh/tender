@@ -1,5 +1,6 @@
 import type { Db } from "@tender/db";
 import type { EntryView, TaskView } from "@tender/shared";
+import type { WorkerSource } from "./isolate";
 
 /** How one revealed entry scored against a task's criteria. */
 export interface EntryScore {
@@ -40,7 +41,7 @@ export interface JudgeChain {
  * In production leave `JudgeDeps.fetchIo` unset. Passing the global `fetch` as `fetchImpl` breaks
  * every https entry: it drops the `host` header, so the server is not named, and checks the
  * certificate against the address in the URL, which no certificate is for. Every such entry would
- * score 0.
+ * score 0. It ignores `connectSignal` too.
  */
 export interface FetchIo {
   /** Every address `host` resolves to, as text: `93.184.216.34`, `2606:4700::6810:84e5`. */
@@ -50,7 +51,74 @@ export interface FetchIo {
    * Judge has checked, and the `host` header names the server: the request's Host, and for
    * https the name sent to the server and the one its certificate must be for.
    */
-  fetchImpl: typeof fetch;
+  fetchImpl: (input: URL, init: TransportInit) => Promise<Response>;
+}
+
+/** What `FetchIo.fetchImpl` is given with a request: what `fetch` takes, and one signal more. */
+export interface TransportInit extends RequestInit {
+  /**
+   * Aborts when connecting to the address has taken too long: 3 s, while `signal` bounds the
+   * whole fetch. Until the connection is made (for https, until TLS is set up), the transport
+   * gives up when it aborts and rejects, so that the Judge can try the next address. Once it is
+   * made, the transport ignores it.
+   */
+  connectSignal?: AbortSignal;
+}
+
+/**
+ * How long scoring may take (P05-R1), for tests. Leave it unset in production: the defaults are
+ * the Judge's limits.
+ */
+export interface ScoringLimits {
+  /** How long one entry's scoring may take in its worker: 5 s by default. */
+  entryTimeoutMs?: number;
+  /**
+   * How long a `json_schema` schema may take to compile and pass its trial run at intake: 2 s by
+   * default. Judging gives the same check 4 times as long.
+   */
+  compileBudgetMs?: number;
+  /**
+   * How long one task's entries are fetched and scored in one tick before the Judge moves on: 20 s
+   * by default (P05-R18, P05-R19). The task takes up again where it was on the next tick, which
+   * needs a `JudgeMemory`: without one, a task is judged in one go.
+   */
+  sliceMs?: number;
+}
+
+/**
+ * What a running Judge keeps between its ticks, in memory only, and never an entry's bytes.
+ * `startJudge` makes one; a call made without one keeps nothing.
+ */
+export interface JudgeMemory {
+  /**
+   * What the criteria check (`checkJsonSchemaUsable`, run in a worker) came to, by criteria hash
+   * and budget: a task that waits, or is judged again, does not start a worker for it each tick.
+   * Only what the schema itself decides is kept, never a refusal for time, which is load.
+   */
+  checks: Map<string, { ok: true } | { ok: false; reason: string }>;
+  /**
+   * What judging each task the Judge is part way through has found out, by task id. A task that
+   * gave way at the end of its slice takes up again from here (P05-R18), as does one whose pick
+   * failed. It goes once the task is picked or settled, is never judged, or is out of its judging
+   * window.
+   */
+  progress: Map<string, TaskProgress>;
+}
+
+/** What judging one task has found out of its entries so far: never their bytes. */
+export interface TaskProgress {
+  /**
+   * The result of each content scored, or turned away, by its content hash and URI: its score and
+   * reasons. Whether an entrant may use a content is asked again on each tick: it is the entrant's.
+   */
+  results: Map<string, EntryScore>;
+  /** How many of those the scorer scored. */
+  scored: number;
+  /**
+   * Whether a worker has compiled the task's criteria to score with. From then on a compile that
+   * fails is the machine's load, not the criteria's fault, and does not reject them.
+   */
+  compiled: boolean;
 }
 
 /** Everything the Judge needs. Nothing in it reads the environment: the caller resolves that. */
@@ -82,4 +150,13 @@ export interface JudgeDeps {
    * is the network, through the Judge's own transport (see `FetchIo`).
    */
   fetchIo?: FetchIo;
+  /** Shorter time limits for scoring, for tests (see `ScoringLimits`). */
+  scoringLimits?: ScoringLimits;
+  /** What the Judge keeps between ticks (see `JudgeMemory`). */
+  memory?: JudgeMemory;
+  /**
+   * Where a task's scorer, and its criteria check at judging, take a worker kept loaded for them
+   * (a `WarmWorker`). `startJudge` makes one. Without it, each starts its own.
+   */
+  warm?: WorkerSource;
 }

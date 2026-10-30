@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HeldoutSchema, type PublicCriteria, PublicCriteriaSchema } from "@tender/shared";
 import { expect, test, vi } from "vitest";
-import { scoreRegexCases } from "../src/index";
+import { ScorerUnavailableError, scoreEntry, scoreRegexCases } from "../src/index";
 import type { HeldoutOf } from "../src/kinds/common";
 import { runInSandbox } from "../src/sandbox";
 
@@ -435,6 +435,17 @@ test("out_of_memory_is_named", async () => {
   // The engine runs out of memory while it runs this regex. It says so with a message of its own
   // ("out of memory in regexp execution"), and the reason must still be the one for memory.
   expect(await score("(?:|){2147483647}", ["x"], [])).toEqual(zero("ran out of memory"));
+});
+
+test("a_sandbox_that_cannot_start_makes_the_scorer_unavailable", async () => {
+  // The engine cannot be loaded: that is the Judge's trouble, not the entry's. The regex scorer
+  // rejects, and `scoreEntry`, which every scorer the Judge runs goes through, says why with
+  // `ScorerUnavailableError`, so that the task is judged again later and no entry scores 0 for it.
+  // The next run has an engine.
+  vi.mocked(runInSandbox).mockRejectedValueOnce(new Error("the engine could not be loaded"));
+  const input = { criteria: criteria({ match: ["a"] }), heldout: null, content: answer("^a$") };
+  await expect(scoreEntry(input)).rejects.toBeInstanceOf(ScorerUnavailableError);
+  expect(await scoreEntry(input)).toEqual({ score: 100, passed: true, reasons: [] });
 });
 
 test("sandbox_failures_become_reasons", async () => {

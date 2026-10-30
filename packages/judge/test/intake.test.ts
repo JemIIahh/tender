@@ -1,8 +1,8 @@
 import { type BlobKind, type Db, putBlob } from "@tender/db";
 import { canonicalJson, sha256Hex, type TaskView } from "@tender/shared";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
-import { intakeTask, scoreJsonSchema } from "../src/index";
-import { checkJsonSchemaUsable } from "../src/kinds/json_schema";
+import { intakeTask, newJudgeMemory, ScorerUnavailableError, scoreJsonSchema } from "../src/index";
+import { checkJsonSchemaIsolated, TOO_SLOW_TO_COMPILE } from "../src/isolate";
 import {
   at,
   fakeChain,
@@ -21,10 +21,11 @@ import {
   testDb,
 } from "./helpers";
 
-// The real check runs unless a test makes it throw, with `mockImplementationOnce`.
-vi.mock("../src/kinds/json_schema", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/kinds/json_schema")>();
-  return { ...actual, checkJsonSchemaUsable: vi.fn(actual.checkJsonSchemaUsable) };
+// The real check runs, in its worker, unless a test makes it fail with `mockRejectedValueOnce`.
+// (`mockClear` before counting calls: the mock keeps them from one test to the next.)
+vi.mock("../src/isolate", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/isolate")>();
+  return { ...actual, checkJsonSchemaIsolated: vi.fn(actual.checkJsonSchemaIsolated) };
 });
 
 const EXACT = {
@@ -151,7 +152,7 @@ async function intake(id: number, view: Partial<TaskView>, status: string | null
   return intakeTask(judgeDeps(db, fakeChain(null)), BigInt(id));
 }
 
-test("intake_rejects_each_rule", async () => {
+test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
   // Each rule is broken by one task of its own, so every reason is checked against the others.
   const rules: { rule: string; reason: string; view: () => Promise<Partial<TaskView>> }[] = [
     {
@@ -574,7 +575,9 @@ test("intake_rejects_each_rule", async () => {
   expect(reasons.filter(({ judge_reason }) => judge_reason?.includes(SECRET))).toEqual([]);
 });
 
-test("intake_rejects_a_schema_that_does_not_compile_with_a_short_reason", async () => {
+test("intake_rejects_a_schema_that_does_not_compile_with_a_short_reason", {
+  timeout: 30_000,
+}, async () => {
   expect(await intake(1, await jsonSchemaTask(db, { type: 12 }))).toBe("rejected");
   expect((await judgeRow(db, 1))?.judge_reason).toMatch(/^criteria schema cannot be compiled: /);
 
@@ -589,7 +592,8 @@ test("intake_rejects_a_schema_that_does_not_compile_with_a_short_reason", async 
   expect([...reason]).toHaveLength(200);
 });
 
-test("intake_accepts_the_p0_kinds", async () => {
+// Each json_schema task here starts a worker for its schema check.
+test("intake_accepts_the_p0_kinds", { timeout: 30_000 }, async () => {
   const accepted: Partial<TaskView>[] = [
     {
       criteria_hash: await putCriteria(db, EXACT),
@@ -739,6 +743,82 @@ test("intake_pending_then_accepted_when_heldout_arrives", async () => {
   });
 });
 
+test("a_pending_task_starts_no_worker_and_a_check_is_kept", { timeout: 60_000 }, async () => {
+  // While a task waits for its held-out checks, the compile part of the criteria check, which
+  // needs a worker, waits too: the checks that cost little run, and a schema they refuse is turned
+  // away at once. Once the checks are in, the compile check runs; its outcome is kept in the
+  // Judge's memory, so a second task with the same criteria does not start a worker for it.
+  vi.mocked(checkJsonSchemaIsolated).mockClear();
+  const memory = newJudgeMemory();
+  const deps = judgeDeps(db, fakeChain(null), { memory });
+  const criteriaHash = await putCriteria(db, JSON_SCHEMA);
+  const checks = [
+    { json_schema: { assertions: [{ path: "$.total", equals: 1 }] } },
+    { json_schema: { assertions: [{ path: "$.total", equals: 2 }] } },
+  ];
+  for (const [i, heldout] of checks.entries()) {
+    await insertTask(
+      db,
+      taskView({
+        id: `${i + 1}`,
+        criteria_hash: criteriaHash,
+        heldout_commitment: sha256Hex(canonicalJson(heldout)),
+        created_at: (NOW_NS - MINUTE_NS).toString(),
+      }),
+    );
+  }
+
+  for (let tick = 0; tick < 3; tick++) expect(await intakeTask(deps, 1n)).toBe("pending");
+  expect(checkJsonSchemaIsolated).not.toHaveBeenCalled();
+  // A reference the shape check refuses is no reason to wait.
+  await insertTask(
+    db,
+    taskView({
+      id: "3",
+      criteria_hash: await putCriteria(db, { ...JSON_SCHEMA, schema: { $ref: "#/constructor" } }),
+      heldout_commitment: sha256Hex("never sent"),
+      created_at: (NOW_NS - MINUTE_NS).toString(),
+    }),
+  );
+  expect(await intakeTask(deps, 3n)).toBe("rejected");
+  expect(checkJsonSchemaIsolated).not.toHaveBeenCalled();
+
+  for (const heldout of checks) await putHeldout(db, heldout);
+  expect(await intakeTask(deps, 1n)).toBe("accepted");
+  expect(await intakeTask(deps, 2n)).toBe("accepted");
+  expect(checkJsonSchemaIsolated).toHaveBeenCalledTimes(1);
+});
+
+test("a_check_refused_for_time_is_not_kept", { timeout: 60_000 }, async () => {
+  // A schema that ran past its compile budget, on a busy machine say, is refused, but that is not
+  // kept: it is the machine's load as much as the schema. The next task with the same criteria is
+  // checked again, and accepted. A refusal that the schema decides is kept: a second task with
+  // the same broken criteria is refused without a check.
+  vi.mocked(checkJsonSchemaIsolated).mockClear();
+  vi.mocked(checkJsonSchemaIsolated).mockResolvedValueOnce({
+    ok: false,
+    reason: TOO_SLOW_TO_COMPILE,
+  });
+  const deps = judgeDeps(db, fakeChain(null), { memory: newJudgeMemory() });
+  const heldout = (n: number) => ({ json_schema: { assertions: [{ path: "$.x", equals: n }] } });
+  const posted: [schema: Record<string, unknown>, status: string][] = [
+    [{ type: "object" }, "rejected"],
+    [{ type: "object" }, "accepted"],
+    [{ type: 12 }, "rejected"],
+    [{ type: 12 }, "rejected"],
+  ];
+  for (const [i, [schema, status]] of posted.entries()) {
+    await insertTask(
+      db,
+      taskView({ id: `${i + 1}`, ...(await jsonSchemaTask(db, schema, heldout(i))) }),
+    );
+    expect(await intakeTask(deps, BigInt(i + 1)), `task ${i + 1}`).toBe(status);
+  }
+  expect((await judgeRow(db, 1))?.judge_reason).toBe(TOO_SLOW_TO_COMPILE);
+  expect((await judgeRow(db, 4))?.judge_reason).toMatch(/^criteria schema cannot be compiled: /);
+  expect(checkJsonSchemaIsolated).toHaveBeenCalledTimes(3);
+});
+
 test("intake_rejects_heldout_from_non_poster", async () => {
   const reason = "held-out checks were not uploaded by the poster";
   // Someone else holds the bytes and uploaded them first. Blobs are content-addressed and the
@@ -882,16 +962,30 @@ test("intake_does_not_reconsider_a_decided_task", async () => {
 });
 
 test("intake_rejects_a_task_whose_check_throws", async () => {
-  // A check that throws, a RangeError from a document nested too deeply say, rejects the task
-  // with a fixed reason instead of stopping intake.
-  vi.mocked(checkJsonSchemaUsable).mockImplementationOnce(() => {
-    throw new RangeError("Maximum call stack size exceeded");
-  });
+  // A check that throws, or crashes its worker (a RangeError from a document nested too deeply,
+  // or an out-of-memory, say), rejects the task with a fixed reason instead of stopping intake.
+  vi.mocked(checkJsonSchemaIsolated).mockRejectedValueOnce(
+    new RangeError("Maximum call stack size exceeded"),
+  );
   expect(await intake(1, await jsonSchemaTask(db, JSON_SCHEMA.schema))).toBe("rejected");
   expect(await judgeRow(db, 1)).toEqual({
     judge_status: "rejected",
     judge_reason: "criteria could not be checked",
   });
+});
+
+test("intake_leaves_a_task_undecided_when_no_check_worker_can_start", async () => {
+  // A worker that cannot be started is the Judge's trouble, like a database that cannot be read:
+  // the task stays undecided, and the next tick tries again.
+  vi.mocked(checkJsonSchemaIsolated).mockRejectedValueOnce(
+    new ScorerUnavailableError("a score worker could not be started"),
+  );
+  await insertTask(db, taskView({ id: "1", ...(await jsonSchemaTask(db, JSON_SCHEMA.schema)) }));
+  await expect(intakeTask(judgeDeps(db, fakeChain(null)), 1n)).rejects.toBeInstanceOf(
+    ScorerUnavailableError,
+  );
+  expect(await judgeRow(db, 1)).toEqual({ judge_status: null, judge_reason: null });
+  expect(await intakeTask(judgeDeps(db, fakeChain(null)), 1n)).toBe("accepted");
 });
 
 test("intake_leaves_a_task_undecided_when_the_database_fails", async () => {
