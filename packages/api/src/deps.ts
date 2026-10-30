@@ -4,8 +4,9 @@ import type { NetworkId } from "@tender/shared";
 
 /**
  * The two chain reads the API makes: the height of the last final block (`/v1/health`) and the
- * permission of an access key (sign-in). `TenderClient` has both and satisfies this interface;
- * tests pass a fake, so the API type-checks and runs without a chain.
+ * permission of an access key (sign-in, and the check that the key of a token is still there).
+ * `TenderClient` has both and satisfies this interface; tests pass a fake, so the API
+ * type-checks and runs without a chain.
  */
 export interface ChainReader {
   /** The height of the last final block. */

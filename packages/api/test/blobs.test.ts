@@ -31,9 +31,10 @@ import { type AuthVariables, blobRoutes, type RequireAuth } from "../src/routes/
 import { resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 
 // The blob store and the held-out intake. The upload routes are mounted on an app of their own
-// with `stubAuth`, which reads the signed-in account from a header, because sign-in is a later task;
-// `createApp` has a placeholder that refuses every upload, and `uploads_are_refused_without_sign_in`
-// holds it to that. The two GET routes need no sign-in and are also read through `createApp`.
+// with `stubAuth`, which reads the signed-in account from a header, so these tests do not sign in;
+// sign-in has `auth.test.ts`, and `uploads_are_refused_without_sign_in` holds `createApp` to
+// refusing a request without a bearer token. The two GET routes need no sign-in and are also read
+// through `createApp`.
 //
 // The data is the lifecycle of `@tender/indexer/testing`: task 1 has the poster, the judge as its
 // verifier, and alice and bob as entrants. Its reveal deadline is `REVEAL_DEADLINE`, and the clock
@@ -885,7 +886,8 @@ test("same_bytes_same_sha", async () => {
 // ---- The addendum's tests ---------------------------------------------------------------------
 
 test("uploads_are_refused_without_sign_in", async () => {
-  // The real app: until sign-in exists nobody can upload, whatever they send.
+  // The real app: without a bearer token from a sign-in nobody can upload, whatever they send. A
+  // header that stands in for sign-in in these tests is nothing to the real one.
   const app = createApp(deps);
   const tries: Array<[string, unknown]> = [
     ["/v1/blobs", blobBody("brief", canonicalJson(FIXTURE_BRIEF))],
@@ -895,6 +897,7 @@ test("uploads_are_refused_without_sign_in", async () => {
     const signedIn: Array<Record<string, string>> = [
       {},
       { authorization: "Bearer anything" },
+      { authorization: `Bearer ${"A".repeat(43)}` },
       { "x-test-account": alice },
     ];
     for (const headers of signedIn) {
@@ -904,9 +907,10 @@ test("uploads_are_refused_without_sign_in", async () => {
         body: JSON.stringify(body),
       });
       expect(res.status, path).toBe(401);
+      expect(res.headers.get("www-authenticate")).toBe("Bearer");
       expect(await res.json()).toEqual({
         error: "unauthorized",
-        message: "sign-in is not available yet",
+        message: "sign in with a bearer token from POST /v1/auth/verify",
       });
     }
   }

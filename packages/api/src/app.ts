@@ -1,10 +1,12 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { requireAuth } from "./auth";
 import type { ApiDeps } from "./deps";
 import { type ErrorBody, handleError, toOrigin } from "./format";
 import { mountMcp } from "./mcp";
 import { agentRoutes } from "./routes/agents";
-import { blobRoutes, signInUnavailable } from "./routes/blobs";
+import { authRoutes } from "./routes/auth";
+import { blobRoutes } from "./routes/blobs";
 import { entryRoutes } from "./routes/entries";
 import { healthRoutes } from "./routes/health";
 import { taskRoutes } from "./routes/tasks";
@@ -35,7 +37,8 @@ export function createApp(deps: ApiDeps): Hono {
   app.route("/v1", taskRoutes(deps));
   app.route("/v1", agentRoutes(deps));
   app.route("/v1", entryRoutes(deps));
-  app.route("/v1", blobRoutes(deps, signInUnavailable));
+  app.route("/v1", authRoutes(deps));
+  app.route("/v1", blobRoutes(deps, requireAuth(deps)));
 
   // Not under /v1: the MCP clients are not browsers, so the CORS block above does not apply.
   mountMcp(app, deps);

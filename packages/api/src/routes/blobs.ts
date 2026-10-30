@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import type { Nep413Result } from "@tender/client";
 import {
   type Db,
   getBlob,
@@ -35,17 +36,17 @@ import {
 } from "../format";
 import { getScorecard } from "../queries";
 
-/** What sign-in leaves for a route to read: the account the request is signed in as. */
-export type AuthVariables = { account: string };
+/**
+ * What sign-in leaves for a route to read: the account the request is signed in as, and the kind
+ * of key it signed in with.
+ */
+export type AuthVariables = { account: string; keyKind: Nep413Result["keyKind"] };
 
-/** The middleware that signs a request in: it sets `c.var.account`, or answers 401 itself. */
+/**
+ * The middleware that signs a request in: it sets `c.var.account` and `c.var.keyKind`, or answers
+ * 401 itself, or 503 when it cannot check that the key of the token is still there.
+ */
 export type RequireAuth = MiddlewareHandler<{ Variables: AuthVariables }>;
-
-/** Stands in for sign-in until it exists (plan 03 Task 7): it refuses every request that needs it. */
-export const signInUnavailable: RequireAuth = async (c) => {
-  const body: ErrorBody = { error: "unauthorized", message: "sign-in is not available yet" };
-  return c.json(body, 401);
-};
 
 type BlobApp = Hono<{ Variables: AuthVariables }>;
 
