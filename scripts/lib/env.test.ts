@@ -39,14 +39,14 @@ test("load_env_reads_dotenv_syntax", async () => {
     ".env.deploy.testnet": [
       "# written by deploy",
       'POSTER_ACCOUNT="poster.dev.testnet"',
-      "POSTER_PRIVATE_KEY=ed25519:abc123",
+      "POSTER_FULL_ACCESS_KEY=ed25519:abc123",
       "",
     ].join("\n"),
   });
 
   expect(loadEnv("testnet", { dir })).toEqual({
     POSTER_ACCOUNT: "poster.dev.testnet",
-    POSTER_PRIVATE_KEY: "ed25519:abc123",
+    POSTER_FULL_ACCESS_KEY: "ed25519:abc123",
   });
 });
 

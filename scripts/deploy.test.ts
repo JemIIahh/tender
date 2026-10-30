@@ -296,7 +296,7 @@ test("deploy_checks_the_env_file_and_the_keys_before_it_uses_the_network", async
   // An env file of another deployment, whose accounts are under another parent: the message says
   // whose keys it holds, and to move it aside. It never reads as an order to delete it.
   const elsewhere = await attempt(
-    `TENDER_CONTRACT=tender.elsewhere.sandbox\nTENDER_CONTRACT_PRIVATE_KEY=${goodKey}\n`,
+    `TENDER_CONTRACT=tender.elsewhere.sandbox\nTENDER_CONTRACT_FULL_ACCESS_KEY=${goodKey}\n`,
   );
   expect(elsewhere).toMatch(
     /\.env\.deploy\.sandbox names tender\.elsewhere\.sandbox as TENDER_CONTRACT, but this deploy's account is tender\.sandbox/,
@@ -311,10 +311,10 @@ test("deploy_checks_the_env_file_and_the_keys_before_it_uses_the_network", async
   expect(keyInPlace).not.toContain("LEAKY");
   // A stored key that is no key: named, but never shown.
   const damaged = await attempt(
-    "TENDER_CONTRACT=tender.sandbox\nTENDER_CONTRACT_PRIVATE_KEY=not-a-key-at-all\n",
+    "TENDER_CONTRACT=tender.sandbox\nTENDER_CONTRACT_FULL_ACCESS_KEY=not-a-key-at-all\n",
   );
   expect(damaged).toMatch(
-    /TENDER_CONTRACT_PRIVATE_KEY in \.env\.deploy\.sandbox is not a valid private key/,
+    /TENDER_CONTRACT_FULL_ACCESS_KEY in \.env\.deploy\.sandbox is not a valid private key/,
   );
   expect(damaged).not.toContain("not-a-key-at-all");
   // The same for the parent's.
@@ -335,6 +335,30 @@ test("deploy_checks_the_env_file_and_the_keys_before_it_uses_the_network", async
   expect(await attempt("", { accountId: long, privateKey: goodKey })).toMatch(
     /^tender\.p+ is not a valid account id/,
   );
+});
+
+test("deploy_does_not_read_the_signing_keys_of_the_services", async () => {
+  // <STEM>_PRIVATE_KEY is the key a service signs with, a function-call key that the owner adds
+  // (ruling P02-R27); the deploy's own keys are <STEM>_FULL_ACCESS_KEY. The deploy neither checks
+  // nor adopts the former, so a value there that is no key is no business of its. The record of
+  // another deployment stops it right after the checks of the env file, before the network.
+  const other = { ...RECORD, network: "sandbox", contract: "tender.elsewhere.sandbox" };
+  const dir = await dirWith({
+    ".env.deploy.sandbox":
+      "JUDGE_PRIVATE_KEY=not-a-key-at-all\nTENDER_CONTRACT_PRIVATE_KEY=nor-is-this\n",
+    "deployments/sandbox.json": `${JSON.stringify(other, null, 2)}\n`,
+  });
+  const parent = { accountId: "sandbox", privateKey: KeyPair.fromRandom("ed25519").toString() };
+
+  const error = await deploy(
+    { network: "sandbox", rpcUrl: "http://127.0.0.1:9", parent, minWindowSecs: 5 },
+    { dir },
+  ).then(
+    () => "deployed",
+    (e: Error) => e.message,
+  );
+
+  expect(error).toMatch(/is the record of another deployment/);
 });
 
 test("deploy_makes_an_existing_env_file_private_even_when_it_goes_no_further", async () => {
