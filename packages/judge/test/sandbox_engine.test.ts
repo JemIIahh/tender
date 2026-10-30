@@ -17,6 +17,18 @@ async function freshSandbox() {
   return { runInSandbox, loads: vi.mocked(newQuickJSWASMModule) };
 }
 
+/** The host's stack running out in the middle of a call into the engine, in every run on it. */
+function overflowWhenEvaluating(runtime: QuickJSRuntime) {
+  const newContext = runtime.newContext.bind(runtime);
+  runtime.newContext = (...args) => {
+    const context = newContext(...args);
+    context.evalCode = () => {
+      throw new RangeError("Maximum call stack size exceeded");
+    };
+    return context;
+  };
+}
+
 /** A real engine whose runtimes are handed to `sabotage` as they are made. */
 async function sabotagedEngine(sabotage: (runtime: QuickJSRuntime) => void) {
   const actual = await vi.importActual<typeof import("quickjs-emscripten")>("quickjs-emscripten");
@@ -64,17 +76,7 @@ test("a_failed_load_is_tried_again", async () => {
 
 test("a_failure_inside_the_engine_replaces_it", async () => {
   const { runInSandbox, loads } = await freshSandbox();
-  // The host's stack running out, in the middle of a call into the engine.
-  const { engine, runtimes } = await sabotagedEngine((runtime) => {
-    const newContext = runtime.newContext.bind(runtime);
-    runtime.newContext = (...args) => {
-      const context = newContext(...args);
-      context.evalCode = () => {
-        throw new RangeError("Maximum call stack size exceeded");
-      };
-      return context;
-    };
-  });
+  const { engine, runtimes } = await sabotagedEngine(overflowWhenEvaluating);
   loads.mockResolvedValueOnce(engine);
 
   expect(await runInSandbox("1 + 1", LIMITS)).toEqual({
@@ -91,6 +93,45 @@ test("a_failure_inside_the_engine_replaces_it", async () => {
   expect(await runInSandbox("1 + 1", LIMITS)).toEqual({ ok: true, value: 2 });
   expect(loads).toHaveBeenCalledTimes(2);
   expect(runtimes).toHaveLength(1);
+});
+
+test("runs_waiting_for_a_dropped_engine_use_the_next_one", async () => {
+  const { runInSandbox, loads } = await freshSandbox();
+  const { engine, runtimes } = await sabotagedEngine(overflowWhenEvaluating);
+  loads.mockResolvedValueOnce(engine);
+
+  // Runs that start together wait for one load and resume one after another. The first one damages
+  // the engine and drops it before the other two get to run, and they must not run on it: every
+  // run on this engine fails, so one that did would show.
+  const results = await Promise.all([
+    runInSandbox("1 + 1", LIMITS),
+    runInSandbox("2 + 2", LIMITS),
+    runInSandbox("3 + 3", LIMITS),
+  ]);
+  expect(results).toEqual([
+    { ok: false, error: "exception", message: "RangeError: Maximum call stack size exceeded" },
+    { ok: true, value: 4 },
+    { ok: true, value: 6 },
+  ]);
+  // Only the first run was on the damaged engine. The other two used the second load, which they
+  // shared.
+  expect(runtimes).toHaveLength(1);
+  expect(loads).toHaveBeenCalledTimes(2);
+});
+
+test("a_runtime_that_cannot_start_replaces_the_engine", async () => {
+  const { runInSandbox, loads } = await freshSandbox();
+  const { engine } = await sabotagedEngine(() => {});
+  engine.newRuntime = () => {
+    throw new Error("memory access out of bounds");
+  };
+  loads.mockResolvedValueOnce(engine);
+
+  // No code ran, so this is the host's trouble and the one other case that rejects. The engine is
+  // in no state to be asked again, though.
+  await expect(runInSandbox("1 + 1", LIMITS)).rejects.toThrow("memory access out of bounds");
+  expect(await runInSandbox("1 + 1", LIMITS)).toEqual({ ok: true, value: 2 });
+  expect(loads).toHaveBeenCalledTimes(2);
 });
 
 test("a_failure_to_free_replaces_the_engine", async () => {

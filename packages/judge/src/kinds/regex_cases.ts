@@ -40,8 +40,9 @@ const MAX_CASE_LENGTH = 60;
  * The regex runs only inside the sandbox (WebAssembly QuickJS, 2 s and 32 MiB for the whole
  * entry), never in this process: the pattern is not compiled here, not even to check it, and
  * reaches the sandbox as a JSON string, with the cases, in a fixed program. A regex that
- * backtracks without end, or one the sandbox's engine does not accept, costs the entry its score
- * and nothing else. The engine is QuickJS's, so a pattern is judged by its rules, not V8's.
+ * backtracks without end, or one the sandbox's engine does not accept, scores 0 for its entry and
+ * changes no other entry's score. The engine is QuickJS's, so a pattern is judged by its rules,
+ * not V8's.
  *
  * The sandbox blocks this thread while it runs: for as long as 2 seconds, on a regex that uses
  * its budget.
@@ -165,6 +166,8 @@ function sandboxFailure(failure: Extract<SandboxResult, { ok: false }>): string 
     case "timeout":
       return "timed out (likely catastrophic backtracking)";
     case "memory":
+      // Code could fake this label, but the program is fixed and has no `try` or `throw`: only
+      // the engine can have raised the error behind it.
       return "ran out of memory";
     case "exception":
       // The program throws nothing of its own: a SyntaxError is `new RegExp` refusing the pattern.

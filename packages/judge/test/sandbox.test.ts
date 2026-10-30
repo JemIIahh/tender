@@ -91,6 +91,33 @@ test("memory_bomb_contained", { timeout: 10_000 }, async () => {
   expect(await run("new Array(1e6).length")).toEqual({ ok: true, value: 1_000_000 });
 });
 
+test("out_of_memory_in_a_regex_is_memory", async () => {
+  // The engine runs out of its budget in two places for a regex, with two messages that are not
+  // the one a plain allocation gives: while the regex runs, and while it is compiled.
+  expect(await run('new RegExp("(?:|){2147483647}").test("x")')).toEqual({
+    ok: false,
+    error: "memory",
+    message: "InternalError: out of memory in regexp execution",
+  });
+  const tightBudget = { timeoutMs: 2_000, memoryBytes: 1024 * 1024 };
+  expect(await runInSandbox('new RegExp("\\\\p{L}".repeat(400), "iu")', tightBudget)).toEqual({
+    ok: false,
+    error: "memory",
+    message: "SyntaxError: out of memory",
+  });
+
+  // Errors that only mention it are exceptions, and so is every other SyntaxError.
+  for (const thrown of [
+    'new Error("out of memory")',
+    'new RangeError("out of memory")',
+    'new SyntaxError("out of memory in a pattern")',
+    'new InternalError("not out of memory")',
+  ]) {
+    expect(await run(`throw ${thrown}`), thrown).toMatchObject({ ok: false, error: "exception" });
+  }
+  expect(await run('new RegExp("(")')).toMatchObject({ ok: false, error: "exception" });
+});
+
 test("exceptions_are_reported", async () => {
   // An error is described as `name: message`: the regex scorer tells a SyntaxError by it.
   expect(await run("throw new Error('boom')")).toEqual({
@@ -182,7 +209,8 @@ test("deep_recursion_is_contained", { timeout: 20_000 }, async () => {
   // Recursion that nothing stops. Depending on the thread's stack, the engine ends it with a
   // stack overflow of its own or the host's stack runs out first, and the engine is left in the
   // middle of a call: freeing that runtime would abort the whole module for the rest of the
-  // process. A run ends in an exception whichever way, and the runs after it are not affected.
+  // process. A run ends in an exception whichever way, and the results of the runs that follow it
+  // are not affected: one after another here, and in one batch in the test after this one.
   const recursion = [
     "function f() { f() } f()",
     "const o = { get x() { return o.x } }; o.x",
@@ -204,4 +232,18 @@ test("deep_recursion_is_contained", { timeout: 20_000 }, async () => {
     await runInSandbox("while(true){}", { timeoutMs: 200, memoryBytes: 32 * 1024 * 1024 }),
   ).toMatchObject({ ok: false, error: "timeout" });
   expect(performance.now() - started).toBeLessThan(1_500);
+});
+
+test("deep_recursion_does_not_break_the_runs_beside_it", { timeout: 20_000 }, async () => {
+  // Runs that start together share the engine until one of them damages it. Twenty recursions
+  // damage it twenty times in a batch, and the runs between them are as good as any others.
+  const codes = Array.from({ length: 40 }, (_, i) =>
+    i % 2 === 0 ? "function f() { f() } f()" : `[${i}, ${i} * 2]`,
+  );
+  const results = await Promise.all(codes.map((code) => run(code)));
+  results.forEach((result, i) => {
+    expect(result, codes[i]).toMatchObject(
+      i % 2 === 0 ? { ok: false, error: "exception" } : { ok: true, value: [i, i * 2] },
+    );
+  });
 });

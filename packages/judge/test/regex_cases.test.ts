@@ -431,6 +431,12 @@ test("sandbox_answer_is_checked", async () => {
   });
 });
 
+test("out_of_memory_is_named", async () => {
+  // The engine runs out of memory while it runs this regex. It says so with a message of its own
+  // ("out of memory in regexp execution"), and the reason must still be the one for memory.
+  expect(await score("(?:|){2147483647}", ["x"], [])).toEqual(zero("ran out of memory"));
+});
+
 test("sandbox_failures_become_reasons", async () => {
   const fail = (error: "timeout" | "memory" | "exception", message: string) =>
     vi.mocked(runInSandbox).mockResolvedValueOnce({ ok: false, error, message });
@@ -438,7 +444,7 @@ test("sandbox_failures_become_reasons", async () => {
 
   fail("timeout", "InternalError: interrupted");
   expect(await reasonFor()).toEqual(["timed out (likely catastrophic backtracking)"]);
-  fail("memory", "InternalError: out of memory");
+  fail("memory", "InternalError: out of memory in regexp execution");
   expect(await reasonFor()).toEqual(["ran out of memory"]);
 
   // A SyntaxError is the pattern's fault. Any other exception is the evaluation's.
@@ -471,7 +477,9 @@ test("sandbox_failures_become_reasons", async () => {
 test("entries_score_independently", { timeout: 10_000 }, async () => {
   const { c, h, solution, weak } = nearAccountSeed();
 
-  // Scored together, as the Judge will: a slow or broken entry does not touch its neighbours.
+  // Scored together, as the Judge will. Each entry gets a runtime and a budget of its own, so a
+  // slow or broken entry cannot change what its neighbours score. It can delay them, since the
+  // engine runs on this thread.
   const results = await Promise.all([
     scoreRegexCases(c, h, solution),
     scoreRegexCases(c, h, answer("^(a+)+$")),
