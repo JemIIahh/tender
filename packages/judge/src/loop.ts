@@ -21,8 +21,12 @@ interface DeadlineRow {
  * intake (`intakeTask`) for every task with no `judge_status` or a `pending` one, then judging
  * (`judgeTask`) for every `accepted` task the database has no outcome for and whose deadlines put
  * the clock in its judging window. A task accepted by the first pass can be judged in the second.
- * Tasks go in id order. Last, a `waiting: …` reason is cleared from every task that can no longer
- * be judged (`clearStaleWaits`), which a Judge that was not running when the wait ended leaves.
+ * Intake goes in id order. Judging goes earliest pick deadline first (P05-R18), and each task has
+ * a slice of the tick (20 s) before the next one's turn: one with many slow entries takes up again
+ * on the next tick, from what it had found out (`deps.memory`), so that it cannot keep the others
+ * from their pick deadlines. What the Judge keeps of a task that is no longer in its judging
+ * window goes. Last, a `waiting: …` reason is cleared from every task that can no longer be
+ * judged (`clearStaleWaits`), which a Judge that was not running when the wait ended leaves.
  *
  * A task that throws, as on a chain or database error, is logged, and the pass goes on with the
  * next task. The clock is read again for the judging pass: intake can take a while.
@@ -51,31 +55,37 @@ export async function judgeTick(deps: JudgeDeps): Promise<void> {
             t.fallback_deadline::text as fallback_deadline
        from tasks t
       where t.verifier = $1 and t.judge_status = 'accepted' and t.outcome is null
-      order by t.id`,
+      order by t.pick_deadline, t.id`,
     [deps.judgeAccount],
   );
+  const judging = new Set<string>();
   for (const row of accepted) {
     try {
       // The database's view of the window, which only chooses what to look at: `judgeTask`
       // decides from the chain.
       if (phaseAt({ ...row, settled: false }, nowNs) !== "judging") continue;
+      judging.add(row.id);
       await judgeTask(deps, BigInt(row.id));
     } catch (error) {
       console.error(`judge: judging task ${row.id} failed (${describeError(error)})`);
     }
+  }
+  for (const id of deps.memory?.progress.keys() ?? []) {
+    if (!judging.has(id)) deps.memory?.progress.delete(id);
   }
   await clearStaleWaits(deps, nowNs);
 }
 
 /** A memory with nothing in it yet. */
 export function newJudgeMemory(): JudgeMemory {
-  return { checks: new Map() };
+  return { checks: new Map(), progress: new Map() };
 }
 
 /**
  * Runs `judgeTick` now, and again `intervalMs` (default 10 s) after each tick ends, until `signal`
- * aborts. The ticks share one `JudgeMemory`, `deps.memory` or a new one. The wait starts when a tick ends, so ticks never overlap, however long one takes. A
- * tick that throws is logged and the loop goes on.
+ * aborts. The ticks share one `JudgeMemory`, `deps.memory` or a new one. The wait starts when a
+ * tick ends, so ticks never overlap, however long one takes. A tick that throws is logged and the
+ * loop goes on.
  *
  * An abort during the wait ends the loop at once. An abort during a tick lets the tick finish
  * first, so that a pick it sent is seen through. A signal that is aborted already runs no tick.

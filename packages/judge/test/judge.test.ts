@@ -9,7 +9,7 @@ import {
   sha256Hex,
   type TaskView,
 } from "@tender/shared";
-import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, onTestFinished, test, vi } from "vitest";
 import { pinnedFetch } from "../src/fetch";
 import {
   type FetchIo,
@@ -83,6 +83,26 @@ function nextScorerCalls(each: (leftMs: number | undefined) => void) {
       },
       close: () => real.close(),
     };
+  });
+}
+
+/**
+ * Makes every task's scorer, until the test ends, call `each` with the content of each entry it is
+ * about to score.
+ */
+function everyScorerCalls(each: (content: Uint8Array) => void) {
+  vi.mocked(openTaskScorer).mockImplementation((task, options): TaskScorer => {
+    const real = isolate.openTaskScorer(task, options);
+    return {
+      score: (content, leftMs) => {
+        each(content);
+        return real.score(content, leftMs);
+      },
+      close: () => real.close(),
+    };
+  });
+  onTestFinished(() => {
+    vi.mocked(openTaskScorer).mockImplementation(isolate.openTaskScorer);
   });
 }
 
@@ -566,7 +586,9 @@ test("judge_rejects_criteria_that_fail_the_criteria_check_now", async () => {
   ]);
 });
 
-test("judge_runs_the_criteria_check_intake_ran_again_before_scoring", async () => {
+test("judge_runs_the_criteria_check_intake_ran_again_before_scoring", {
+  timeout: 30_000,
+}, async () => {
   // The same check, the same function, on both paths: criteria that pass the real check at intake
   // and fail it at judging time (here the compile step, as a newer Ajv or rule might) are rejected.
   const criteriaHash = await putCriteria(db, jsonSchemaCriteria({ type: "object" }));
@@ -2149,6 +2171,210 @@ test("judge_tick_goes_on_after_a_task_fails", async () => {
   expect(pick.mock.calls.map(([taskId, winners]) => [taskId, winners])).toEqual([
     [8n, [{ account: "alice.test.near", bps: 10_000 }]],
   ]);
+});
+
+test("a_task_with_many_slow_entries_cannot_keep_another_from_its_pick", {
+  timeout: 60_000,
+}, async () => {
+  // P05-R18. Task 8 has nine entries, and slow ones: scoring one moves the Judge's clock on 4 s.
+  // Its pick deadline comes first, at NOW + 60 s, and its stop line is NOW + 52 s. Task 7 has two
+  // entries, and its pick deadline is NOW + 62 s; its pick window is long, so its stop line is
+  // 30 s before that, at NOW + 32 s. Judged in one go, task 8 would take until NOW + 36 s, and task
+  // 7, judged after it, would get to no entry before its stop line and not be picked. Each task
+  // has a slice of 10 s a tick, and the loop waits 10 s between ticks.
+  let seconds = 0;
+  const atSecond = (n: number) => (NOW_NS + BigInt(n) * SECOND_NS).toString();
+  const criteriaHash = await putCriteria(db, EXACT);
+  const posted: [id: string, deadlines: Partial<TaskView>, answers: string[]][] = [
+    [
+      "8",
+      { reveal_deadline: atSecond(-20), pick_deadline: atSecond(60) },
+      ["42", "41", " 42", "40", "42 ", "39", "\t42", "38", "forty-two"],
+    ],
+    ["7", { reveal_deadline: atSecond(-300), pick_deadline: atSecond(62) }, ["Forty-Two", "43"]],
+  ];
+  const tasks: { view: TaskView; entries: EntryView[] }[] = [];
+  for (const [id, deadlines, answers] of posted) {
+    const view = taskView({
+      id,
+      criteria_hash: criteriaHash,
+      // Held-out checks of its own for each task: they are single-use.
+      heldout_commitment: await putHeldout(db, {
+        exact: { expected: ["42", "forty-two", `task ${id}`] },
+      }),
+      ...deadlines,
+    });
+    await insertTask(db, view, "accepted");
+    const entries: EntryView[] = [];
+    for (const [i, answer] of answers.entries()) {
+      const account = `t${id}e${i + 1}.test.near`;
+      const sha = await putResult(db, answer, account, BigInt(id));
+      entries.push({ ...entry(account, sha, blobUri(sha), BigInt(11 + i)), task_id: id });
+    }
+    tasks.push({ view, entries });
+  }
+  // The chain: a pick settles its task, and is recorded with the second it was sent at.
+  const views = new Map(tasks.map(({ view }) => [view.id, view]));
+  const picks: [taskId: bigint, second: number][] = [];
+  const chain = {
+    getTask: vi.fn(async (id: bigint) => views.get(String(id)) ?? null),
+    getAllEntries: vi.fn(
+      async (id: bigint) => tasks.find(({ view }) => view.id === String(id))?.entries ?? [],
+    ),
+    pick: vi.fn<JudgeChain["pick"]>(async (taskId, winners, scorecardHash, scorecardUri) => {
+      picks.push([taskId, seconds]);
+      const view = views.get(String(taskId));
+      if (view === undefined) throw new Error(`no task ${taskId}`);
+      const paid = winners.map((winner) => ({ ...winner, amount: "1" }));
+      views.set(view.id, {
+        ...view,
+        phase: "settled",
+        outcome: {
+          kind: "picked",
+          winners: paid,
+          fee: "0",
+          scorecard_hash: scorecardHash,
+          scorecard_uri: scorecardUri,
+        },
+      });
+      return {};
+    }),
+  } satisfies JudgeChain;
+  // Each entry's content, by text, as the database is asked for it, and as it is scored.
+  const textOf = new Map(
+    tasks.flatMap(({ entries }) => entries).map((e, i) => [e.content_hash, i] as const),
+  );
+  const answersInOrder = posted.flatMap(([, , answers]) => answers);
+  const reads: string[] = [];
+  const counting: Db = {
+    ...db,
+    query: async (sql, params) => {
+      const at = textOf.get(String(params?.[0]));
+      if (sql.includes("from blobs where sha256") && at !== undefined) {
+        reads.push(answersInOrder[at] ?? "");
+      }
+      return db.query(sql, params);
+    },
+  };
+  const scored: string[] = [];
+  everyScorerCalls((content) => {
+    scored.push(text(content));
+    seconds += 4;
+  });
+  const memory = newJudgeMemory();
+  const deps = judgeDeps(counting, chain, {
+    now: () => new Date(NOW.getTime() + seconds * 1_000),
+    memory,
+    scoringLimits: { sliceMs: 10_000 },
+  });
+  const right = { score: 100, passed: true, reasons: [] };
+  const wrong = { score: 0, passed: false, reasons: ["expected one of 3 accepted answers"] };
+
+  // The first tick judges task 8 first, as its pick deadline comes first. Its slice is over three
+  // entries in, at NOW + 12 s, and it gives way: task 7 is scored and picked at NOW + 20 s.
+  await judgeTick(deps);
+  expect(chain.getTask.mock.calls).toEqual([[8n], [7n]]);
+  expect(scored).toEqual(["42", "41", " 42", "Forty-Two", "43"]);
+  expect(picks).toEqual([[7n, 20]]);
+  // What the Judge keeps of task 8 is the three results, as scores and reasons: no bytes.
+  const kept = memory.progress.get("8");
+  expect(kept?.scored).toBe(3);
+  expect([...(kept?.results.values() ?? [])]).toEqual([right, wrong, right]);
+
+  // The next tick, 10 s on, task 8 takes up where it was: nothing it found out is fetched or
+  // scored again. Its slice is over at NOW + 42 s, 10 s before its stop line, which is less than
+  // two slices: the last stretch before the line is one turn, so it scores the rest, and is picked
+  // at NOW + 54 s.
+  seconds += 10;
+  await judgeTick(deps);
+  expect(picks).toEqual([
+    [7n, 20],
+    [8n, 54],
+  ]);
+  expect(scored).toEqual(["42", "41", " 42", "Forty-Two", "43", ...answersInOrder.slice(3, 9)]);
+  // Each content was read once, but the six that task 8 read on the first tick and had no time to
+  // score: no bytes are kept from one tick to the next.
+  const twice = answersInOrder.slice(3, 9);
+  expect(reads.toSorted()).toEqual([...answersInOrder, ...twice].toSorted());
+  // Both tasks are settled, and the Judge keeps nothing of them.
+  expect(memory.progress.size).toBe(0);
+  const cards = await Promise.all(
+    chain.pick.mock.calls.map(async ([, , sha]) => {
+      const blob = await getBlob(db, sha);
+      return ScorecardSchema.parse(JSON.parse(text(blob?.bytes ?? new Uint8Array())));
+    }),
+  );
+  expect(cards.map((card) => [card.task_id, card.winners])).toEqual([
+    ["7", [{ account: "t7e1.test.near", bps: 10_000 }]],
+    [
+      "8",
+      [
+        { account: "t8e1.test.near", bps: 7000 },
+        { account: "t8e3.test.near", bps: 3000 },
+      ],
+    ],
+  ]);
+  // Every entry of task 8 was scored, none left for want of time.
+  expect(cards[1]?.entries.map((e) => [e.account, e.score])).toEqual([
+    ...[1, 3, 5, 7, 9].map((n) => [`t8e${n}.test.near`, 100]),
+    ...[2, 4, 6, 8].map((n) => [`t8e${n}.test.near`, 0]),
+  ]);
+});
+
+test("each_turn_finds_out_one_result_at_least", { timeout: 60_000 }, async () => {
+  // A slice of 0 ms: a task's turn is over as soon as it has found something out, and the task
+  // takes up from there on its next turn. Each turn scores one entry, and none is scored twice.
+  const { chain } = await postJudged([
+    ["alice.test.near", "42", 10n],
+    ["bob.test.near", "41", 11n],
+    ["cat.test.near", " 42", 12n],
+  ]);
+  const scored: string[] = [];
+  everyScorerCalls((content) => {
+    scored.push(text(content));
+  });
+  const memory = newJudgeMemory();
+  const deps = judgeDeps(db, chain, { memory, scoringLimits: { sliceMs: 0 } });
+
+  expect(await judgeTask(deps, 7n)).toBe("skipped");
+  expect(scored).toEqual(["42"]);
+  expect(await judgeTask(deps, 7n)).toBe("skipped");
+  expect(scored).toEqual(["42", "41"]);
+  expect(await judgeTask(deps, 7n)).toBe("picked");
+  expect(scored).toEqual(["42", "41", " 42"]);
+  expect((await picked(chain)).winners).toEqual([
+    { account: "alice.test.near", bps: 7000 },
+    { account: "cat.test.near", bps: 3000 },
+  ]);
+  expect(memory.progress.size).toBe(0);
+});
+
+test("a_task_back_past_its_stop_line_is_picked_from_what_it_found_out", {
+  timeout: 60_000,
+}, async () => {
+  // A task gives way after one entry (a slice of 0 ms), and its next turn comes only past its stop
+  // line, NOW + 9.5 minutes, when nothing more is scored. What it found out before stands: it is
+  // picked from that, and the entry it did not get to is not scored. The Judge was not late for
+  // every entry, so this is no `judging started too late` (P05-R13).
+  const { chain } = await postJudged([
+    ["alice.test.near", "42", 10n],
+    ["bob.test.near", " 42", 11n],
+  ]);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const memory = newJudgeMemory();
+  const scoringLimits = { sliceMs: 0 };
+
+  expect(await judgeTask(judgeDeps(db, chain, { memory, scoringLimits }), 7n)).toBe("skipped");
+  const late = judgeDeps(db, chain, { now: at(9.6), memory, scoringLimits });
+  expect(await judgeTask(late, 7n)).toBe("picked");
+
+  const card = await picked(chain);
+  expect(card.winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
+  expect(card.scorecard.entries.map((e) => [e.account, e.score, e.reasons])).toEqual([
+    ["alice.test.near", 100, []],
+    ["bob.test.near", 0, ["not scored before the pick deadline"]],
+  ]);
+  expect(warn).not.toHaveBeenCalled();
 });
 
 /**

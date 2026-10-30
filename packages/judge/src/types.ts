@@ -76,6 +76,12 @@ export interface ScoringLimits {
    * default. Judging gives the same check 4 times as long.
    */
   compileBudgetMs?: number;
+  /**
+   * How long one task's entries are fetched and scored in one tick before the Judge moves on to
+   * the next task: 20 s by default (P05-R18). The task takes up again where it was on a later tick,
+   * which needs a `JudgeMemory`: without one, a task is judged in one go.
+   */
+  sliceMs?: number;
 }
 
 /**
@@ -88,6 +94,23 @@ export interface JudgeMemory {
    * and budget: a task that waits, or is judged again, does not start a worker for it each tick.
    */
   checks: Map<string, { ok: true } | { ok: false; reason: string }>;
+  /**
+   * What judging each task the Judge is part way through has found out, by task id. A task whose
+   * slice of a tick ran out takes up again from here (P05-R18), as does one whose pick failed. It
+   * goes once the task is picked or settled, is never judged, or is out of its judging window.
+   */
+  progress: Map<string, TaskProgress>;
+}
+
+/** What judging one task has found out of its entries so far: never their bytes. */
+export interface TaskProgress {
+  /**
+   * The result of each content scored, or turned away, by its content hash and URI: its score and
+   * reasons. Whether an entrant may use a content is asked again on each tick: it is the entrant's.
+   */
+  results: Map<string, EntryScore>;
+  /** How many of those the scorer scored. */
+  scored: number;
 }
 
 /** Everything the Judge needs. Nothing in it reads the environment: the caller resolves that. */

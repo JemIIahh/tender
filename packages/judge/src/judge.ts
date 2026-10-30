@@ -6,7 +6,7 @@ import { COMPILE_BUDGET_MS, openTaskScorer, type TaskScorer } from "./isolate";
 import { chooseWinners, rankEntries, type ScoredEntry } from "./rank";
 import { ScorerUnavailableError } from "./score";
 import { buildScorecard, clampReason } from "./scorecard";
-import type { EntryScore, JudgeDeps } from "./types";
+import type { EntryScore, JudgeDeps, TaskProgress } from "./types";
 
 /**
  * How many entries whose contents are in our own store are taken at a time: no more contents
@@ -27,6 +27,12 @@ const NS_PER_S = 1_000_000_000n;
  * time left before the pick deadline (P05-R15).
  */
 const PICK_LATENCY_NS = 2n * NS_PER_S;
+/**
+ * How long one task's entries are judged in one tick before the next task's turn (P05-R18): no
+ * fetch or score starts after it, and the task takes up again on the next tick from what it has
+ * found out.
+ */
+const SLICE_MS = 20_000;
 /**
  * The time judging leaves before the pick deadline, when it starts nothing new: a tenth of the
  * pick window, and no less than 3 s or more than 30 s (P05-R13).
@@ -68,7 +74,9 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   the Judge's lateness, and is left to its fallback window; that is one `WARN`, and its
  *   `judge_reason` from then on. When the entrants' own fetches and scores used the time, the task
  *   is picked from what was found out. Or the pick could no longer land before the pick deadline
- *   (P05-R15): nothing is published, and it is the same.
+ *   (P05-R15): nothing is published, and it is the same. Or the task's slice of the tick ran out
+ *   with entries still to judge (P05-R18), and it takes up again on the next tick from what it
+ *   found out, which the Judge keeps (`JudgeMemory`) until the task is settled.
  * - `failed_closed`: the task is never judged, and the poster's fallback window applies. Either
  *   its criteria fail the criteria check now (P05-R12: the check intake runs, run again before
  *   any entry is scored, as a rule may be newer than the task's intake, with 4 times intake's
@@ -89,9 +97,10 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  * whatever the pass mark, so it cannot be paid. The rest are scored in a worker of the task's own
  * (`openTaskScorer`), which compiles the criteria before it takes an entry, with at most 5 s for
  * each: an entry whose scoring times out, runs out of memory or crashes the worker scores 0 with
- * the reason why, and the other entries are scored as usual. In what order the entries are fetched and scored, and which are left unscored so that
- * the pick lands before the pick deadline, is `judgeEntries`'s; a task with no entries is picked
- * as before, and one with some scored is picked from those. Then the entries are ranked, the
+ * the reason why, and the other entries are scored as usual. In what order the entries are
+ * fetched and scored, how long one tick spends on them, and which are left unscored so that the
+ * pick lands before the pick deadline, is `judgeEntries`'s; a task with no entries is picked as
+ * before, and one with some scored is picked from those. Then the entries are ranked, the
  * winners chosen, and the scorecard built from exactly the winners `pick` is sent. The scorecard
  * is stored as a public blob, the held-out checks are made public, and `pick` is called with the
  * scorecard's hash and URI, in that order, so that the pick never points at something that cannot
@@ -108,11 +117,13 @@ export async function judgeTask(
   const nowNs = BigInt(clock().getTime()) * NS_PER_MS;
   const task = await deps.client.getTask(taskId);
   if (task === null || task.outcome !== null || task.verifier !== deps.judgeAccount) {
-    return "skipped";
+    return forget(deps, taskId, "skipped");
   }
-  if (task.phase !== "judging" || phaseOfTaskView(task, nowNs) !== "judging") return "skipped";
+  if (task.phase !== "judging" || phaseOfTaskView(task, nowNs) !== "judging") {
+    return forget(deps, taskId, "skipped");
+  }
   const row = await judgeRowOf(deps, taskId);
-  if (row?.judge_status !== "accepted") return "skipped";
+  if (row?.judge_status !== "accepted") return forget(deps, taskId, "skipped");
 
   // Publishing the held-out checks hands out the answers of another task of the poster's that
   // commits to them, so while one still takes reveals, this task may wait. Asked first, so that a
@@ -136,7 +147,7 @@ export async function judgeTask(
     // P05-R12: criteria that fail the check intake runs, run again now, are refused as intake
     // would refuse them today, and not scored. Anything else means the documents cannot be used.
     const status = loaded.criteriaCheck === true ? "rejected" : "failed_closed";
-    return refuse(deps, taskId, status, loaded.reason);
+    return forget(deps, taskId, await refuse(deps, taskId, status, loaded.reason));
   }
   const { criteria, heldout } = loaded.documents;
 
@@ -154,9 +165,15 @@ export async function judgeTask(
       },
     },
   );
+  // What earlier ticks found out of these entries, when they did not get through them all.
+  let progress = deps.memory?.progress.get(task.id);
+  if (progress === undefined) {
+    progress = { results: new Map(), scored: 0 };
+    deps.memory?.progress.set(task.id, progress);
+  }
   let judged: Judged;
   try {
-    judged = await judgeEntries(deps, task, revealed, scorer, nowNs);
+    judged = await judgeEntries(deps, task, revealed, scorer, nowNs, progress);
   } catch (error) {
     if (!(error instanceof ScorerUnavailableError)) throw error;
     return retryLater(taskId, `a scorer could not be run (${describeError(error)})`);
@@ -166,8 +183,11 @@ export async function judgeTask(
   // P05-R17: criteria that do not compile for scoring, or not within the budget, are refused as
   // the criteria check refuses them, and no entry is scored 0 for it.
   if (judged.rejected !== null) {
-    return refuse(deps, taskId, "rejected", clampReason(judged.rejected));
+    const reason = clampReason(judged.rejected);
+    return forget(deps, taskId, await refuse(deps, taskId, "rejected", reason));
   }
+  // P05-R18: its turn in this tick is over; it takes up again on the next from what it found out.
+  if (judged.yielded) return "skipped";
   // P05-R13, P05-R16: when the Judge's own lateness left every entry unscored (it started past the
   // stop line, or its workers could not be made ready before it), a pick would pay nobody for it.
   // The task is left to its fallback window. When the entrants' fetches and scores used the time,
@@ -221,10 +241,11 @@ export async function judgeTask(
   try {
     await deps.client.pick(taskId, winners, sha256, uri);
   } catch (error) {
-    if (codeOf(error) === "E_SETTLED") return "skipped";
+    if (codeOf(error) === "E_SETTLED") return forget(deps, taskId, "skipped");
+    // What was found out stays, and the next try picks with it.
     return retryLater(taskId, `pick failed (${describeError(error)})`);
   }
-  return winners.length === 0 ? "no_award" : "picked";
+  return forget(deps, taskId, winners.length === 0 ? "no_award" : "picked");
 }
 
 /** What judging a task's entries came to. */
@@ -233,7 +254,7 @@ interface Judged {
   entries: ScoredEntry[];
   /** How many entries were left unscored at the stop line. */
   unscored: number;
-  /** How many contents the scorer scored, whatever came of each. */
+  /** How many contents the scorer scored, whatever came of each, on this tick or earlier ones. */
   scored: number;
   /**
    * Whether the Judge's own lateness used up the time: judging started past the stop line, or a
@@ -242,6 +263,11 @@ interface Judged {
   late: boolean;
   /** Why the criteria cannot be scored with, when the scorer found so; nothing is scored then. */
   rejected: string | null;
+  /**
+   * Whether the task's slice of the tick ran out, before its stop line, with entries still to
+   * judge (P05-R18). Those have no score yet, and get one on a later tick.
+   */
+  yielded: boolean;
 }
 
 /**
@@ -269,6 +295,16 @@ interface Judged {
  * nothing, and it shares the score, past the line too. A fetch or a score that fails within its
  * own limit is that entry's, as before.
  *
+ * A task's turn in a tick is a slice (P05-R18): once 20 s have gone to its entries, no fetch or
+ * score starts, and it is `yielded`, to be taken up on the next tick from `progress`, what this
+ * tick and earlier ones found out, without fetching or scoring any of that again. Contents fetched
+ * in the turn and not yet scored are let go, as `progress` keeps no bytes. A fetch or a score
+ * under way goes on, within its own limit and the stop line. A turn finds out one result at least,
+ * whatever its slice, so that a task always gets on, and it is not cut short within two slices of
+ * the stop line: the last stretch before the line is one turn, so that a task that gives way is
+ * back before its line. Without a `JudgeMemory` there is nothing to take up from, and a task is
+ * judged in one turn.
+ *
  * It throws what `resultUploaded` and the database throw, and `ScorerUnavailableError`.
  */
 async function judgeEntries(
@@ -277,34 +313,59 @@ async function judgeEntries(
   entries: readonly RevealedEntry[],
   scorer: TaskScorer,
   nowNs: bigint,
+  progress: TaskProgress,
 ): Promise<Judged> {
   const clock = deps.now ?? (() => new Date());
   const stopLine = stopLineOf(task);
-  /** The time left before the stop line, in milliseconds, by the Judge's clock. */
-  const leftMs = () => Number(stopLine - BigInt(clock().getTime()) * NS_PER_MS) / 1e6;
-  const judging: Judging = { results: new Map(), scored: 0, late: false, rejected: null };
+  const sliceMs = deps.scoringLimits?.sliceMs ?? SLICE_MS;
+  const sliceEnd = clock().getTime() + sliceMs;
+  const judging: Judging = {
+    progress,
+    leftMs: () => Number(stopLine - BigInt(clock().getTime()) * NS_PER_MS) / 1e6,
+    sliceOver: () =>
+      deps.memory !== undefined &&
+      judging.found > 0 &&
+      clock().getTime() >= sliceEnd &&
+      judging.leftMs() > 2 * sliceMs,
+    found: 0,
+    late: false,
+    rejected: null,
+    yielded: false,
+  };
   // Judging that starts past the line scores nothing, through no doing of the entrants'.
-  if (entries.length > 0 && leftMs() <= 0) judging.late = true;
+  if (entries.length > 0 && judging.leftMs() <= 0) judging.late = true;
+  const taskId = BigInt(task.id);
   const ours = (entry: RevealedEntry) => ownBlobHash(deps.publicUrl, entry.uri) !== undefined;
   const groups: [RevealedEntry[], number][] = [
     [entries.filter(ours).toSorted(inCommitOrder), OURS_PER_BATCH],
     [entries.filter((entry) => !ours(entry)).toSorted(inCommitOrder), ELSEWHERE_PER_BATCH],
   ];
-  const judged: Judged = { entries: [], unscored: 0, scored: 0, late: false, rejected: null };
+  const entryScores: ScoredEntry[] = [];
+  let unscored = 0;
+  const outcome = (): Judged => ({
+    entries: entryScores,
+    unscored,
+    scored: progress.scored,
+    late: judging.late,
+    rejected: judging.rejected,
+    yielded: judging.yielded,
+  });
   for (const [group, perBatch] of groups) {
     for (let first = 0; first < group.length; first += perBatch) {
       const batch = group.slice(first, first + perBatch);
       let scores: (EntryScore | undefined)[] = [];
       if (judging.rejected === null) {
         scores =
-          leftMs() > 0 && !judging.late
-            ? await judgeBatch(deps, BigInt(task.id), batch, scorer, judging, leftMs, nowNs)
-            : await knownScores(deps, BigInt(task.id), batch, judging.results, nowNs);
+          judging.leftMs() > 0 && !judging.late
+            ? await judgeBatch(deps, taskId, batch, scorer, judging, nowNs)
+            : await knownScores(deps, taskId, batch, progress.results, nowNs);
       }
+      // The rest waits for the task's next turn.
+      if (judging.yielded) return outcome();
       batch.forEach((entry, i) => {
         const score = scores[i];
-        if (score === undefined) judged.unscored++;
-        judged.entries.push({
+        if (score === undefined) unscored++;
+        entryScores.push({
           account: entry.account,
           contentHash: entry.content_hash,
           uri: entry.uri,
@@ -314,25 +375,29 @@ async function judgeEntries(
       });
     }
   }
-  return { ...judged, scored: judging.scored, late: judging.late, rejected: judging.rejected };
+  return outcome();
 }
 
-/** What judging a task's entries has found out so far. */
+/** Where judging a task's entries stands, in one tick. */
 interface Judging {
-  /** The score of each content scored, or turned away, so far, by `contentKey`. */
-  results: Map<string, EntryScore>;
-  /** How many contents the scorer scored. */
-  scored: number;
+  /** What it has found out, on this tick and earlier ones. */
+  progress: TaskProgress;
+  /** The time left before the stop line, in milliseconds, by the Judge's clock. */
+  leftMs: () => number;
+  /** Whether the task's slice of the tick is used up, and its turn over (P05-R18). */
+  sliceOver: () => boolean;
+  /** How many results it has found out on this tick. */
+  found: number;
   /** See `Judged`. */
   late: boolean;
   rejected: string | null;
+  yielded: boolean;
 }
 
 /**
  * The scores of one batch of entries of task `taskId`, `undefined` for each that has none: it was
- * not reached before the stop line, or the line cut its fetch or its score short. `judging` has
- * what earlier batches found out, and gets this one's. `leftMs` is the time left before the stop
- * line.
+ * not reached before the stop line, the line cut its fetch or its score short, or the task's turn
+ * is over (`judging.yielded`). `judging` has what was found out before, and gets this batch's.
  */
 async function judgeBatch(
   deps: JudgeDeps,
@@ -340,10 +405,18 @@ async function judgeBatch(
   batch: readonly RevealedEntry[],
   scorer: TaskScorer,
   judging: Judging,
-  leftMs: () => number,
   nowNs: bigint,
 ): Promise<(EntryScore | undefined)[]> {
-  const { results } = judging;
+  const { progress } = judging;
+  const found = (key: string, score: EntryScore) => {
+    progress.results.set(key, score);
+    judging.found++;
+  };
+  /** Whether the task's turn is over (P05-R18): then nothing more starts on this tick. */
+  const turnOver = () => {
+    if (!judging.yielded && judging.sliceOver()) judging.yielded = true;
+    return judging.yielded;
+  };
   const allowed = await inParallel(batch, FETCHES_AT_ONCE, (entry) =>
     mayUse(deps, taskId, entry, nowNs),
   );
@@ -351,25 +424,29 @@ async function judgeBatch(
   const wanted = new Map<string, RevealedEntry>();
   batch.forEach((entry, i) => {
     const key = contentKey(entry);
-    if (allowed[i] === true && !results.has(key) && !wanted.has(key)) wanted.set(key, entry);
+    if (allowed[i] === true && !progress.results.has(key) && !wanted.has(key)) {
+      wanted.set(key, entry);
+    }
   });
+  if (wanted.size > 0 && turnOver()) return [];
   const fetched = await inParallel([...wanted], FETCHES_AT_ONCE, async ([key, entry]) => {
-    const left = leftMs();
+    const left = judging.leftMs();
     return { key, content: left > 0 ? await contentOf(deps, entry, left) : undefined };
   });
   for (const item of fetched) {
     if (typeof item.content === "string") {
-      results.set(item.key, zero(item.content));
+      found(item.key, zero(item.content));
     } else if (
       item.content !== undefined &&
-      leftMs() > 0 &&
+      judging.leftMs() > 0 &&
       !judging.late &&
-      judging.rejected === null
+      judging.rejected === null &&
+      !turnOver()
     ) {
-      const scoring = await scorer.score(item.content, leftMs());
+      const scoring = await scorer.score(item.content, judging.leftMs());
       if (scoring.kind === "scored") {
-        results.set(item.key, scoring.score);
-        judging.scored++;
+        found(item.key, scoring.score);
+        progress.scored++;
       } else if (scoring.kind === "late") {
         judging.late = true;
       } else if (scoring.kind === "rejected") {
@@ -381,7 +458,7 @@ async function judgeBatch(
     item.content = undefined;
   }
   return batch.map((entry, i) =>
-    allowed[i] === true ? results.get(contentKey(entry)) : zero(NOT_UPLOADED),
+    allowed[i] === true ? progress.results.get(contentKey(entry)) : zero(NOT_UPLOADED),
   );
 }
 
@@ -394,7 +471,7 @@ async function knownScores(
   deps: JudgeDeps,
   taskId: bigint,
   batch: readonly RevealedEntry[],
-  results: Map<string, EntryScore>,
+  results: ReadonlyMap<string, EntryScore>,
   nowNs: bigint,
 ): Promise<(EntryScore | undefined)[]> {
   return inParallel(batch, FETCHES_AT_ONCE, async (entry) => {
@@ -647,6 +724,15 @@ async function inParallel<T, R>(
 function retryLater(taskId: bigint, why: string): "skipped" {
   console.warn(`judge: WARN task ${taskId}: ${why}; trying again next tick`);
   return "skipped";
+}
+
+/**
+ * Drops what judging task `taskId` found out (P05-R18), as it is settled or is not the Judge's to
+ * judge, and says `result`.
+ */
+function forget<T>(deps: JudgeDeps, taskId: bigint, result: T): T {
+  deps.memory?.progress.delete(String(taskId));
+  return result;
 }
 
 /** The contract's code on an error from the chain (`TenderError`), or `null`. */

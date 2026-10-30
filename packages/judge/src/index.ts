@@ -15,5 +15,6 @@ export type {
   JudgeDeps,
   JudgeMemory,
   ScoringLimits,
+  TaskProgress,
   TransportInit,
 } from "./types";
