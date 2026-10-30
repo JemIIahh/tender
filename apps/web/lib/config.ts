@@ -1,9 +1,12 @@
-import { AccountIdSchema, NETWORKS, type NetworkId } from "@tender/shared";
+import { AccountIdSchema, canonicalBase, NETWORKS, type NetworkId } from "@tender/shared";
 
 /** What the web app is built for. Every value comes from a `NEXT_PUBLIC_*` variable (.env.example). */
 export interface WebConfig {
   network: NetworkId;
-  /** The origin of the Tender API, with no trailing slash and no `/v1`. */
+  /**
+   * The base of the Tender API, in the one spelling `canonicalBase` gives: where its routes are
+   * (`<apiUrl>/v1/...`) and whom a sign-in is signed for. It has no trailing slash and no `/v1`.
+   */
   apiUrl: string;
   /** The NEAR JSON-RPC endpoint the browser reads views from. It ships in the page: it is public. */
   rpcUrl: string;
@@ -53,11 +56,15 @@ export function readConfig(env: PublicEnv): WebConfig {
   }
 
   const api = env.NEXT_PUBLIC_API_URL?.trim() ?? "";
-  const apiUrl = httpUrl("NEXT_PUBLIC_API_URL", api);
-  if (apiUrl.search !== "" || apiUrl.hash !== "") {
-    throw new Error(
-      `NEXT_PUBLIC_API_URL must have no query or fragment, got ${JSON.stringify(api)}`,
-    );
+  httpUrl("NEXT_PUBLIC_API_URL", api);
+  // The address the page calls and the recipient it has a wallet sign (lib/auth.ts) are one string,
+  // so a spelling that `canonicalBase` refuses is refused here, and one it rewrites is used
+  // rewritten. Its messages never quote the address, which can hold a password.
+  let apiUrl: string;
+  try {
+    apiUrl = canonicalBase(api);
+  } catch (error) {
+    throw new Error(`NEXT_PUBLIC_API_URL: ${(error as Error).message}`);
   }
 
   const contractId = env.NEXT_PUBLIC_CONTRACT?.trim() ?? "";
@@ -81,7 +88,7 @@ export function readConfig(env: PublicEnv): WebConfig {
 
   return {
     network,
-    apiUrl: api.replace(/\/+$/, ""),
+    apiUrl,
     rpcUrl,
     contractId,
     devWallet: network === "sandbox" && env.NEXT_PUBLIC_DEV_WALLET?.trim() === "1",

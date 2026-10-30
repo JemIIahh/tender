@@ -1,4 +1,4 @@
-import { NETWORKS } from "@tender/shared";
+import { canonicalBase, NETWORKS } from "@tender/shared";
 import { expect, test } from "vitest";
 import { config, readConfig } from "../lib/config";
 
@@ -48,13 +48,52 @@ test("config_drops_the_trailing_slash_of_the_api_url", () => {
   expect(readConfig({ ...BASE, NEXT_PUBLIC_API_URL: "https://api.tender.example/" }).apiUrl).toBe(
     "https://api.tender.example",
   );
-  expect(readConfig({ ...BASE, NEXT_PUBLIC_API_URL: "http://localhost:8787//" }).apiUrl).toBe(
-    "http://localhost:8787",
-  );
   // A path stays: the API can sit behind one.
   expect(readConfig({ ...BASE, NEXT_PUBLIC_API_URL: "https://tender.example/api/" }).apiUrl).toBe(
     "https://tender.example/api",
   );
+});
+
+test("config_api_url_is_the_one_spelling_a_sign_in_is_signed_for", () => {
+  // The address the page calls and the recipient it signs for are one string, so the API url is
+  // `canonicalBase` of what is written: host in lower case, the scheme's own port left out, and
+  // the `/v1` the routes sit under left off.
+  for (const [written, canonical] of [
+    ["https://API.Tender.example:443/", "https://api.tender.example"],
+    ["http://localhost:8787", "http://localhost:8787"],
+    ["https://tender.example/api/v1/", "https://tender.example/api"],
+  ] as const) {
+    const { apiUrl } = readConfig({ ...BASE, NEXT_PUBLIC_API_URL: written });
+    expect(apiUrl, written).toBe(canonical);
+    expect(canonicalBase(apiUrl), written).toBe(apiUrl);
+  }
+});
+
+test("config_refuses_an_api_url_that_canonical_base_refuses", () => {
+  for (const url of [
+    "http://localhost:8787//",
+    "https://tender.example/api//v1",
+    "https://api.tender.example./",
+    "https://api.tender.example/v1/v1",
+    "https://api.tender.example?",
+    "https://api.tender.example/#",
+    "https://user:secret@api.tender.example",
+  ]) {
+    expect(() => readConfig({ ...BASE, NEXT_PUBLIC_API_URL: url }), url).toThrow(
+      /NEXT_PUBLIC_API_URL/,
+    );
+  }
+});
+
+test("config_api_url_error_does_not_quote_a_password", () => {
+  let message = "";
+  try {
+    readConfig({ ...BASE, NEXT_PUBLIC_API_URL: "https://user:hunter2@api.tender.example" });
+  } catch (error) {
+    message = (error as Error).message;
+  }
+  expect(message).toMatch(/NEXT_PUBLIC_API_URL/);
+  expect(message).not.toContain("hunter2");
 });
 
 test("config_keeps_the_rpc_url_as_it_is_written", () => {

@@ -1,0 +1,519 @@
+import type { TxReceiptsOutcome } from "@tender/client/outcome";
+import { receiptsFromTx } from "@tender/client/outcome";
+import {
+  AccountIdSchema,
+  type ConnectorFunctionCallAction,
+  extractEvents,
+  type TenderCall,
+  type TenderEvent,
+  toConnectorAction,
+} from "@tender/shared";
+import { useEffect, useMemo, useSyncExternalStore } from "react";
+import { config } from "./config";
+import {
+  TransactionFailed,
+  WalletCannotSign,
+  WalletError,
+  WalletNotConnected,
+  WalletResultUnreadable,
+  WalletUnavailable,
+} from "./walletErrors";
+
+// The wallet, as the pages use it. One store holds the connected account for the whole page: every
+// component that calls `useWallet` sees the same one, and a wallet connects once. What sits behind
+// the store is a `WalletProvider`: near-connect for the real wallets, and in a sandbox build, if
+// it is switched on, the dev wallet (lib/devWallet.ts). Both give the store a `SigningWallet`,
+// which is the part of near-connect's wallet interface this app calls, so a transaction is grouped,
+// sent and read back by the same code whoever signs it.
+//
+// The wallet's answers are not trusted. A transaction result is checked for the fields this file
+// reads before it is used, and what a page does next does not rest on it: the pages read their
+// balances back from the node.
+
+/** A wallet, as far as this app uses it. near-connect's `NearWalletBase` has all of this. */
+export interface SigningWallet {
+  manifest?: { features?: { signMessage?: boolean } };
+  signAndSendTransactions(params: {
+    transactions: TransactionRequest[];
+    signerId?: string;
+  }): Promise<unknown>;
+  signMessage(params: {
+    message: string;
+    recipient: string;
+    nonce: Uint8Array;
+    signerId?: string;
+  }): Promise<unknown>;
+}
+
+/** One transaction for a wallet to sign: calls to a single account, run in order. */
+export interface TransactionRequest {
+  receiverId: string;
+  actions: ConnectorFunctionCallAction[];
+}
+
+/** A wallet and the account it is connected as. */
+export interface Session {
+  wallet: SigningWallet;
+  accountId: string;
+}
+
+/** Where a store gets its wallet. */
+export interface WalletProvider {
+  /** The session from an earlier visit, or null if there is none. */
+  restore(): Promise<Session | null>;
+  /** Has the person pick a wallet and sign in: null if they closed the dialog without one. */
+  connect(): Promise<Session | null>;
+  disconnect(session: Session): Promise<void>;
+  /** `listener(null)` when the wallet signs out by itself. Returns what stops the listening. */
+  subscribe(listener: (session: Session | null) => void): () => void;
+}
+
+/** What the pages can read about the wallet. */
+export interface WalletState {
+  /** Whether the wallet from an earlier visit has been looked for. Before then nothing is known. */
+  ready: boolean;
+  /** The account that is connected, or null. */
+  accountId: string | null;
+  /** Whether the connected wallet can sign a message (NEP-413). Signing in to the API needs it. */
+  canSignMessage: boolean;
+}
+
+export interface SendResult {
+  /** The Tender events the transactions logged, in order. */
+  events: TenderEvent[];
+  /** The hash of each transaction, in the order they were sent. */
+  txHashes: string[];
+}
+
+export interface SignMessageInput {
+  message: string;
+  recipient: string;
+  nonce: Uint8Array;
+}
+
+export interface SignedMessageResult {
+  accountId: string;
+  /** `ed25519:<base58>`, as the wallet gave it. */
+  publicKey: string;
+  /** Base64, as the wallet gave it. */
+  signature: string;
+}
+
+export interface WalletActions {
+  /** Has the person pick a wallet and sign in. Closing the dialog is not an error. */
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  /**
+   * Has the wallet sign and send `calls`, and gives back what they logged. Consecutive calls to
+   * one account are one transaction; the transactions run in the order given. Throws
+   * `WalletNotConnected`, `WalletError` for a wallet that threw or was closed, `TransactionFailed`
+   * for one that failed on the network, and `WalletResultUnreadable` for an answer it can't read.
+   */
+  signAndSend(calls: readonly TenderCall[]): Promise<SendResult>;
+  /** Has the wallet sign a message (NEP-413). Throws `WalletCannotSign` if it can't. */
+  signMessage(input: SignMessageInput): Promise<SignedMessageResult>;
+}
+
+export type UseWallet = WalletState & WalletActions;
+
+/**
+ * How long a page waits for the wallet from an earlier visit before it shows the person a Connect
+ * button. near-connect loads its wallet list from the network first and has no limit of its own.
+ * A wallet that turns up later is still taken.
+ */
+const RESTORE_PATIENCE_MS = 8000;
+
+/** Groups `calls` into the transactions that carry them: consecutive calls to one receiver join. */
+export function groupCalls(calls: readonly TenderCall[]): TransactionRequest[] {
+  const transactions: TransactionRequest[] = [];
+  for (const call of calls) {
+    const last = transactions.at(-1);
+    if (last !== undefined && last.receiverId === call.receiverId) {
+      last.actions.push(toConnectorAction(call));
+    } else {
+      transactions.push({ receiverId: call.receiverId, actions: [toConnectorAction(call)] });
+    }
+  }
+  return transactions;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const isString = (value: unknown): value is string => typeof value === "string";
+
+/** Whether the wallet says in its manifest that it can sign a message. */
+function canSign(wallet: SigningWallet): boolean {
+  return wallet.manifest?.features?.signMessage === true;
+}
+
+/** What the contract panicked with, such as `E_FUNDS`, from the `Failure` of a final status. */
+function panicCode(failure: unknown): string | null {
+  let text: string;
+  try {
+    text = JSON.stringify(failure) ?? "";
+  } catch {
+    return null;
+  }
+  return /Smart contract panicked: (E_[A-Z_]+)/.exec(text)?.[1] ?? null;
+}
+
+interface ReadOutcome {
+  hash: string;
+  receipts: TxReceiptsOutcome;
+}
+
+/**
+ * One transaction's final outcome, as a wallet hands it over. Only the fields read are checked: the
+ * hash, a status that says how it ended, and the receipts with the logs the events come from. A
+ * failed status throws `TransactionFailed`, and so does a status that is not a success: only
+ * `SuccessValue` is one, as for a receipt (`receiptsFromTx`).
+ */
+function readOutcome(value: unknown): ReadOutcome {
+  if (!isRecord(value) || !isRecord(value.transaction) || !Array.isArray(value.receipts_outcome)) {
+    throw new WalletResultUnreadable("transaction");
+  }
+  const hash = value.transaction.hash;
+  if (!isString(hash) || hash === "") throw new WalletResultUnreadable("transaction");
+
+  const receipts: TxReceiptsOutcome["receipts_outcome"][number][] = [];
+  for (const receipt of value.receipts_outcome) {
+    if (!isRecord(receipt) || !isString(receipt.id) || !isRecord(receipt.outcome)) {
+      throw new WalletResultUnreadable("transaction");
+    }
+    const { executor_id: executorId, logs, status } = receipt.outcome;
+    if (!isString(executorId) || !Array.isArray(logs) || !logs.every(isString)) {
+      throw new WalletResultUnreadable("transaction");
+    }
+    receipts.push({ id: receipt.id, outcome: { executor_id: executorId, status, logs } });
+  }
+
+  const status = value.status;
+  if (isRecord(status) && "Failure" in status) {
+    throw new TransactionFailed(hash, panicCode(status.Failure));
+  }
+  if (!isRecord(status) || !isString(status.SuccessValue)) {
+    throw new WalletResultUnreadable("transaction");
+  }
+  return { hash, receipts: { receipts_outcome: receipts } };
+}
+
+/**
+ * The transactions' outcomes, one for each that was sent, as a wallet gives them back. A wallet
+ * that stopped at a transaction that failed has no outcome for those after it: the failure is the
+ * answer, and it is found before the count is.
+ */
+function readOutcomes(result: unknown, sent: number): SendResult {
+  // A wallet may answer one transaction with its outcome and not a list of one.
+  const list = Array.isArray(result) ? result : isRecord(result) ? [result] : null;
+  if (list === null) throw new WalletResultUnreadable("transaction");
+  const outcomes = list.map(readOutcome);
+  if (outcomes.length !== sent) throw new WalletResultUnreadable("transaction");
+  return {
+    events: outcomes.flatMap(({ receipts }) =>
+      extractEvents(receiptsFromTx(receipts), config.contractId),
+    ),
+    txHashes: outcomes.map(({ hash }) => hash),
+  };
+}
+
+/** A signature, as a wallet hands it over. */
+function readSigned(value: unknown): SignedMessageResult {
+  if (
+    !isRecord(value) ||
+    !isString(value.accountId) ||
+    !isString(value.publicKey) ||
+    !isString(value.signature) ||
+    value.signature === ""
+  ) {
+    throw new WalletResultUnreadable("signature");
+  }
+  return {
+    accountId: value.accountId,
+    publicKey: value.publicKey,
+    signature: value.signature,
+  };
+}
+
+/** Resolves when `promise` settles or `ms` pass, whichever is first. Never rejects. */
+function settleWithin(promise: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    promise.then(done, done);
+  });
+}
+
+const SERVER_STATE: WalletState = { ready: false, accountId: null, canSignMessage: false };
+
+/**
+ * A wallet store over the provider that `makeProvider` makes the first time one is needed. The
+ * page uses the one at the end of this file; a test builds its own over a provider of its own.
+ */
+export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
+  let state: WalletState = SERVER_STATE;
+  let session: Session | null = null;
+  let provider: Promise<WalletProvider> | null = null;
+  let starting: Promise<void> | null = null;
+  let connecting: Promise<void> | null = null;
+  const listeners = new Set<() => void>();
+
+  function publish(next: Partial<WalletState>): void {
+    const merged = { ...state, ...next };
+    if (
+      merged.ready === state.ready &&
+      merged.accountId === state.accountId &&
+      merged.canSignMessage === state.canSignMessage
+    ) {
+      return;
+    }
+    state = merged;
+    for (const listener of [...listeners]) listener();
+  }
+
+  function setSession(next: Session | null): void {
+    session = next;
+    publish({
+      accountId: next?.accountId ?? null,
+      canSignMessage: next !== null && canSign(next.wallet),
+    });
+  }
+
+  function getProvider(): Promise<WalletProvider> {
+    provider ??= makeProvider().catch((error: unknown) => {
+      // Forget a provider that could not be made, so that the next try makes it again.
+      provider = null;
+      throw error;
+    });
+    return provider;
+  }
+
+  function start(): Promise<void> {
+    starting ??= (async () => {
+      try {
+        const wallets = await getProvider();
+        wallets.subscribe((next) => {
+          if (next === null) setSession(null);
+        });
+        const restoring = wallets
+          .restore()
+          .then((restored) => {
+            // A wallet connected in the meantime stays.
+            if (session === null && restored !== null) setSession(restored);
+          })
+          .catch((error: unknown) => console.error(error));
+        await settleWithin(restoring, RESTORE_PATIENCE_MS);
+      } catch (error) {
+        // A build with no wallet to offer, or a wallet library that did not load: the page shows
+        // the Connect button, and pressing it says why.
+        console.error(error);
+      } finally {
+        publish({ ready: true });
+      }
+    })();
+    return starting;
+  }
+
+  function connect(): Promise<void> {
+    connecting ??= (async () => {
+      try {
+        await start();
+        if (session !== null) return;
+        const next = await (await getProvider()).connect();
+        if (next !== null) setSession(next);
+      } finally {
+        connecting = null;
+      }
+    })();
+    return connecting;
+  }
+
+  async function disconnect(): Promise<void> {
+    const current = session;
+    if (current === null) return;
+    await (await getProvider()).disconnect(current);
+    if (session === current) setSession(null);
+  }
+
+  async function signAndSend(calls: readonly TenderCall[]): Promise<SendResult> {
+    if (calls.length === 0) throw new RangeError("there are no calls to send");
+    const current = session;
+    if (current === null) throw new WalletNotConnected();
+    const transactions = groupCalls(calls);
+    let result: unknown;
+    try {
+      result = await current.wallet.signAndSendTransactions({
+        transactions,
+        signerId: current.accountId,
+      });
+    } catch (cause) {
+      throw new WalletError("send", cause);
+    }
+    return readOutcomes(result, transactions.length);
+  }
+
+  async function signMessage(input: SignMessageInput): Promise<SignedMessageResult> {
+    const current = session;
+    if (current === null) throw new WalletNotConnected();
+    if (!canSign(current.wallet)) throw new WalletCannotSign();
+    let result: unknown;
+    try {
+      result = await current.wallet.signMessage({ ...input, signerId: current.accountId });
+    } catch (cause) {
+      throw new WalletError("sign", cause);
+    }
+    return readSigned(result);
+  }
+
+  return {
+    subscribe(listener: () => void): () => void {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    getSnapshot: (): WalletState => state,
+    getServerSnapshot: (): WalletState => SERVER_STATE,
+    start,
+    connect,
+    disconnect,
+    signAndSend,
+    signMessage,
+  };
+}
+
+export type WalletStore = ReturnType<typeof createWalletStore>;
+
+// ---- near-connect ------------------------------------------------------------------------------
+
+/** What near-connect throws when no wallet was connected before. Neither is a failure. */
+const NO_SESSION = ["No wallet selected", "No accounts found"];
+
+/** What near-connect rejects with when the person closes its wallet dialog. */
+const DIALOG_CLOSED = "User rejected";
+
+/** The session of `connected` (near-connect's `getConnectedWallet`), if its account is one. */
+function sessionOf(connected: {
+  wallet: SigningWallet;
+  accounts: ReadonlyArray<{ accountId: string }>;
+}): Session {
+  const accountId = connected.accounts[0]?.accountId;
+  if (accountId === undefined || !AccountIdSchema.safeParse(accountId).success) {
+    throw new TypeError("the wallet reported an account that is not a NEAR account id");
+  }
+  return { wallet: connected.wallet, accountId };
+}
+
+/**
+ * near-connect as a provider. The library touches `window` as it loads, so it is imported when the
+ * first page needs a wallet and not before.
+ */
+export async function connectorProvider(network: "mainnet" | "testnet"): Promise<WalletProvider> {
+  let library: typeof import("@hot-labs/near-connect");
+  try {
+    library = await import("@hot-labs/near-connect");
+  } catch (cause) {
+    throw new WalletError("connect", cause);
+  }
+  // No filter on features: a wallet that can't sign a message may still send transactions.
+  const connector = new library.NearConnector({ network });
+
+  return {
+    async restore() {
+      try {
+        return sessionOf(await connector.getConnectedWallet());
+      } catch (error) {
+        if (error instanceof Error && NO_SESSION.includes(error.message)) return null;
+        console.error(error);
+        return null;
+      }
+    },
+
+    async connect() {
+      try {
+        await connector.connect();
+      } catch (error) {
+        if (error instanceof Error && error.message === DIALOG_CLOSED) return null;
+        throw new WalletError("connect", error);
+      }
+      try {
+        return sessionOf(await connector.getConnectedWallet());
+      } catch (cause) {
+        throw new WalletError("connect", cause);
+      }
+    },
+
+    async disconnect() {
+      try {
+        await connector.disconnect();
+      } catch (cause) {
+        throw new WalletError("disconnect", cause);
+      }
+    },
+
+    subscribe(listener) {
+      const onSignOut = () => listener(null);
+      connector.on("wallet:signOut", onSignOut);
+      return () => connector.off("wallet:signOut", onSignOut);
+    },
+  };
+}
+
+// ---- The dev wallet ----------------------------------------------------------------------------
+
+/**
+ * The dev wallet's module, or null when this build has none. `process.env.NEXT_PUBLIC_NETWORK` is
+ * spelled out in full, because Next puts the value in at build time only where it finds that
+ * text, and then drops the branch that can't run. In a testnet or mainnet build the `import` is
+ * in the dropped branch, so the module (and near-api-js, which only it uses) never reaches the
+ * browser's code. `config.devWallet` is worked out when the page runs, and so can't do this alone.
+ * test/source-rules.test.ts keeps this text and the module's own guard in place.
+ */
+export function loadDevWallet(): Promise<typeof import("./devWallet") | null> {
+  return process.env.NEXT_PUBLIC_NETWORK !== "sandbox"
+    ? Promise.resolve(null)
+    : config.devWallet
+      ? import("./devWallet")
+      : Promise.resolve(null);
+}
+
+async function createProvider(): Promise<WalletProvider> {
+  const dev = await loadDevWallet();
+  if (dev !== null) return dev.createDevProvider();
+  if (config.network === "sandbox") throw new WalletUnavailable();
+  return connectorProvider(config.network);
+}
+
+/** The wallet of this page. */
+export const walletStore: WalletStore = createWalletStore(createProvider);
+
+/**
+ * The wallet of `store`, for a client component. It starts looking for the wallet from an earlier
+ * visit when the first component that uses it mounts; until `ready` is true, `accountId` being
+ * null means nothing yet.
+ */
+export function useWalletStore(store: WalletStore): UseWallet {
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getServerSnapshot);
+  useEffect(() => {
+    void store.start();
+  }, [store]);
+  return useMemo(
+    () => ({
+      ...state,
+      connect: store.connect,
+      disconnect: store.disconnect,
+      signAndSend: store.signAndSend,
+      signMessage: store.signMessage,
+    }),
+    [state, store],
+  );
+}
+
+/** The connected wallet of this page, for a client component. */
+export function useWallet(): UseWallet {
+  return useWalletStore(walletStore);
+}

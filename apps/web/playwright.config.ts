@@ -1,5 +1,5 @@
 import { defineConfig, devices } from "@playwright/test";
-import { API_URL } from "./e2e/fixtures";
+import { API_URL, RPC_URL } from "./e2e/fixtures";
 
 // Next must not send telemetry when e2e starts `next dev` or `next start`.
 process.env.NEXT_TELEMETRY_DISABLED = "1";
@@ -26,6 +26,8 @@ export default defineConfig({
     env: {
       NEXT_PUBLIC_NETWORK: "testnet",
       NEXT_PUBLIC_API_URL: API_URL,
+      // Never the real node: a read that no spec answers fails to connect (e2e/walletStub.ts).
+      NEXT_PUBLIC_RPC_URL: RPC_URL,
       NEXT_PUBLIC_CONTRACT: "tender.tender-team.testnet",
     },
   },
