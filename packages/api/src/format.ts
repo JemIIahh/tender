@@ -87,14 +87,25 @@ export interface TaskSummary {
 type EventData<Name extends TenderEvent["event"]> = Extract<TenderEvent, { event: Name }>["data"];
 
 /**
+ * Who made the call that settled a task, and how the index knows. `by` is null when `void_task`
+ * voided the task, and also when the index never saw the event and took the outcome from the
+ * chain's view, which has no `by`: `by_source` is "reconcile" then, and absent otherwise.
+ */
+interface SettledBy {
+  by: string | null;
+  by_source?: "reconcile";
+}
+
+/**
  * How a settled task ended: the `picked` or `voided` event as the contract logged it, with its
- * `kind`. `by` is the account that made the call. For a pick it tells a verifier's pick from the
- * poster's after the pick deadline; the chain's own view of an outcome has no `by`. For a void it
- * is null when `void_task` voided the task.
+ * `kind`. `by` is the account that made the call; for a pick it tells a verifier's pick from the
+ * poster's after the pick deadline. An outcome taken from the chain's view has no `by` (see
+ * `SettledBy`), and a void taken that way has no `refunds` either.
  */
 export type TaskOutcome =
-  | ({ kind: "picked" } & EventData<"picked">)
-  | ({ kind: "voided" } & EventData<"voided">);
+  | ({ kind: "picked" } & Omit<EventData<"picked">, "by"> & SettledBy)
+  | ({ kind: "voided" } & Omit<EventData<"voided">, "by" | "refunds"> &
+      SettledBy & { refunds?: EventData<"voided">["refunds"] });
 
 /** A task with everything the task page needs from the row itself. */
 export interface TaskDetail extends TaskSummary {

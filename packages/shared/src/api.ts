@@ -135,10 +135,9 @@ export type TaskSummary = z.infer<typeof TaskSummarySchema>;
 
 /**
  * A task with everything a task page needs from the row itself: the summary, the terms and the
- * outcome. It is the `task` of a `TaskDetail`. (The API's own types call this part `TaskDetail`
- * and the whole response `TaskDetailResponse`.)
+ * outcome. It is the `task` of a `TaskDetailResponse`.
  */
-export const TaskFullSchema = TaskSummarySchema.extend({
+export const TaskDetailSchema = TaskSummarySchema.extend({
   /** A uri: any text of 1 to 256 bytes, as the chain has it. */
   brief_uri: z.string(),
   brief_hash: HashHexSchema,
@@ -152,7 +151,7 @@ export const TaskFullSchema = TaskSummarySchema.extend({
   fee_bps: U16Schema,
   outcome: TaskOutcomeSchema.nullable(),
 });
-export type TaskFull = z.infer<typeof TaskFullSchema>;
+export type TaskDetail = z.infer<typeof TaskDetailSchema>;
 
 /** One entry of a task. `content_hash` and `uri` are null until the entry is revealed. */
 export const TaskEntrySchema = z.object({
@@ -176,8 +175,8 @@ export type TaskFunder = z.infer<typeof TaskFunderSchema>;
  * hash, and only if the index holds a public blob of that kind that fits the schema: otherwise
  * null. A held-out document is never among them.
  */
-export const TaskDetailSchema = z.object({
-  task: TaskFullSchema,
+export const TaskDetailResponseSchema = z.object({
+  task: TaskDetailSchema,
   brief: BriefSchema.nullable(),
   criteria: PublicCriteriaSchema.nullable(),
   /** In the order the agents committed. */
@@ -188,7 +187,7 @@ export const TaskDetailSchema = z.object({
   children: z.array(U64StringSchema),
   scorecard: ScorecardSchema.nullable(),
 });
-export type TaskDetail = z.infer<typeof TaskDetailSchema>;
+export type TaskDetailResponse = z.infer<typeof TaskDetailResponseSchema>;
 
 /** `GET /v1/tasks`. `next_cursor` is the id to pass as `cursor` for the next page, null at the end. */
 export const ListTasksResponseSchema = z.object({
@@ -242,11 +241,11 @@ export const AgentRecentEntrySchema = z.object({
 export type AgentRecentEntry = z.infer<typeof AgentRecentEntrySchema>;
 
 /** `GET /v1/agents/:account`. `recent_entries` are the latest 20, newest commit first. */
-export const AgentDetailSchema = z.object({
+export const AgentDetailResponseSchema = z.object({
   agent: AgentSummarySchema,
   recent_entries: z.array(AgentRecentEntrySchema),
 });
-export type AgentDetail = z.infer<typeof AgentDetailSchema>;
+export type AgentDetailResponse = z.infer<typeof AgentDetailResponseSchema>;
 
 // ---- Entries ----------------------------------------------------------------------------------
 
@@ -260,13 +259,13 @@ export const AccountEntrySchema = AgentRecentEntrySchema.extend({
 export type AccountEntry = z.infer<typeof AccountEntrySchema>;
 
 /** `GET /v1/entries?account=`: every entry of the account, newest commit first. */
-export const ListEntriesResponseSchema = z.object({ entries: z.array(AccountEntrySchema) });
-export type ListEntriesResponse = z.infer<typeof ListEntriesResponseSchema>;
+export const AccountEntriesResponseSchema = z.object({ entries: z.array(AccountEntrySchema) });
+export type AccountEntriesResponse = z.infer<typeof AccountEntriesResponseSchema>;
 
 // ---- Health -----------------------------------------------------------------------------------
 
 /** `GET /v1/health` when the API can read the database and the chain. */
-export const HealthSchema = z.object({
+export const HealthResponseSchema = z.object({
   ok: z.literal(true),
   network: z.string(),
   contract: AccountIdSchema,
@@ -277,7 +276,7 @@ export const HealthSchema = z.object({
   /** `chain_final_height - indexed_height`, and "0" if the index is not behind. */
   lag_blocks: U64StringSchema,
 });
-export type Health = z.infer<typeof HealthSchema>;
+export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 
 /**
  * `GET /v1/health` when the chain's final height cannot be read: a 503 whose body is an error body
@@ -361,8 +360,8 @@ export type TelegramLink = z.infer<typeof TelegramLinkSchema>;
  * it is about, null for an event that is about none, such as an agent registering.
  *
  * `event` is any name and `data` any object on purpose: a stream can carry an event that a client
- * written before it existed has no schema for, and that must not fail the message. To read a known
- * event, parse `{ event, data }` with `TenderEventSchema`.
+ * written before it existed has no schema for, and that must not fail the message. Consumers
+ * narrow it with `TenderEventSchema`: parse `{ event, data }` to read a known event.
  */
 export const SseEventDataSchema = z.object({
   event: z.string(),

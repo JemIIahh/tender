@@ -9,16 +9,16 @@ import {
   FIXTURE_OPTIONS,
 } from "@tender/indexer/testing";
 import {
-  AgentDetailSchema,
+  AccountEntriesResponseSchema,
+  AgentDetailResponseSchema,
   BlobUploadResponseSchema,
   ChallengeResponseSchema,
   canonicalJson,
   ErrorBodySchema,
-  HealthSchema,
+  HealthResponseSchema,
   HealthUnavailableSchema,
   HeldoutUploadResponseSchema,
   ListAgentsResponseSchema,
-  ListEntriesResponseSchema,
   ListTasksResponseSchema,
   type Phase,
   type PublicCriteria,
@@ -28,7 +28,7 @@ import {
   SseEventDataSchema,
   StartResponseSchema,
   sha256Hex,
-  TaskDetailSchema,
+  TaskDetailResponseSchema,
   TelegramLinkSchema,
   type TenderEvent,
   TenderEventSchema,
@@ -38,7 +38,7 @@ import { Account, KeyPair, KeyPairSigner, type Provider } from "near-api-js";
 import * as nearNep413 from "near-api-js/nep413";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import type { z } from "zod";
-import { type ApiDeps, createApp } from "../src/index";
+import { type ApiDeps, createApp, type TaskOutcome } from "../src/index";
 import { fakeClient, resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 
 // The drift test of `@tender/shared`'s API schemas (src/api.ts). The web app, the MCP server and
@@ -210,7 +210,9 @@ async function putDocument(kind: "criteria" | "scorecard", document: unknown): P
  * | 7  | settled                                          | void the index took from the chain's view   |
  *
  * The last two are what `reconcile` writes for an outcome it did not see happen: `by` is null,
- * `by_source` says why, and a void has no `refunds` (`outcomeFromView` in the indexer).
+ * `by_source` says why, and a void has no `refunds` (`outcomeFromView` in the indexer). The API's
+ * own `TaskOutcome` type has to accept them, which `satisfies` checks when the tests are
+ * type-checked.
  */
 async function seedBoard(): Promise<void> {
   await seedLifecycle(deps.db, { teamAccounts: [judge] });
@@ -246,7 +248,7 @@ async function seedBoard(): Promise<void> {
     fee: "50000",
     scorecard_hash: sha256Hex("a scorecard nobody uploaded"),
     scorecard_uri: "ipfs://scorecard",
-  };
+  } satisfies TaskOutcome;
   const reconciledVoid = {
     kind: "voided",
     task_id: "7",
@@ -255,7 +257,7 @@ async function seedBoard(): Promise<void> {
     reason: "expired",
     scorecard_hash: null,
     scorecard_uri: null,
-  };
+  } satisfies TaskOutcome;
   for (const outcome of [reconciledPick, reconciledVoid]) {
     await deps.db.query("update tasks set outcome = $2::jsonb where id = $1::numeric", [
       outcome.task_id,
@@ -344,7 +346,7 @@ test("task_routes_match_their_schemas", async () => {
   const detail = async (id: string) => {
     const reply = await get(app, `/v1/tasks/${id}`);
     expect(reply.status, `task ${id}`).toBe(200);
-    return fits(TaskDetailSchema, reply.body, `GET /v1/tasks/${id}`);
+    return fits(TaskDetailResponseSchema, reply.body, `GET /v1/tasks/${id}`);
   };
   const [one, two, three, four, five, six, seven] = await Promise.all(
     ["1", "2", "3", "4", "5", "6", "7"].map(detail),
@@ -416,7 +418,7 @@ test("agent_and_entry_routes_match_their_schemas", async () => {
   const detail = async (account: string) => {
     const reply = await get(app, `/v1/agents/${account}`);
     expect(reply.status, account).toBe(200);
-    return fits(AgentDetailSchema, reply.body, `GET /v1/agents/${account}`);
+    return fits(AgentDetailResponseSchema, reply.body, `GET /v1/agents/${account}`);
   };
   const aliceDetail = await detail(alice);
   expect(aliceDetail.recent_entries).toEqual([
@@ -427,7 +429,7 @@ test("agent_and_entry_routes_match_their_schemas", async () => {
 
   const entries = await get(app, `/v1/entries?account=${alice}`);
   expect(entries.status).toBe(200);
-  const mine = fits(ListEntriesResponseSchema, entries.body, "GET /v1/entries");
+  const mine = fits(AccountEntriesResponseSchema, entries.body, "GET /v1/entries");
   expect(
     mine.entries.map((entry) => [entry.task_id, entry.revealed, entry.content_hash === null]),
   ).toEqual([
@@ -435,7 +437,7 @@ test("agent_and_entry_routes_match_their_schemas", async () => {
     ["1", true, false],
   ]);
   const empty = await get(app, `/v1/entries?account=${carol}`);
-  expect(fits(ListEntriesResponseSchema, empty.body, "no entries")).toEqual({ entries: [] });
+  expect(fits(AccountEntriesResponseSchema, empty.body, "no entries")).toEqual({ entries: [] });
 });
 
 // ---- Health -----------------------------------------------------------------------------------
@@ -445,7 +447,7 @@ test("health_matches_its_schemas", async () => {
 
   const ok = await get(appWith(), "/v1/health");
   expect(ok.status).toBe(200);
-  expect(fits(HealthSchema, ok.body, "GET /v1/health")).toMatchObject({
+  expect(fits(HealthResponseSchema, ok.body, "GET /v1/health")).toMatchObject({
     ok: true,
     indexed_height: "90",
     chain_final_height: "100",
