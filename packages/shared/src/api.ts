@@ -10,8 +10,8 @@ import {
   U64StringSchema,
   U128StringSchema,
 } from "./primitives";
-import { ScorecardSchema } from "./scorecard";
-import { PhaseSchema } from "./views";
+import { type Scorecard, ScorecardSchema } from "./scorecard";
+import { type Phase, PhaseSchema } from "./views";
 
 // What the Tender API sends, one schema for each response, and `fetchJson`, which a client calls
 // the API with and which checks what comes back. The web app, the MCP server and the reference
@@ -27,6 +27,9 @@ import { PhaseSchema } from "./views";
 // and not refused, so a client keeps working when the API adds a field to a response. They have no
 // transforms, coercions or defaults either, so a response that has no keys beyond the schema's
 // parses to a deep copy of itself.
+//
+// `TenderApi`, at the end, is the interface a client of the API provides, in the types of these
+// schemas. The MCP server and the agents depend on it and on nothing else.
 
 // ---- Errors -----------------------------------------------------------------------------------
 
@@ -454,4 +457,86 @@ export async function fetchJson<T>(
     );
   }
   return parsed.data;
+}
+
+// ---- The client's interface -------------------------------------------------------------------
+
+/** What `GET /v1/tasks` can be filtered by. A field left out is no filter. */
+export interface ListTasksFilter {
+  /** Only tasks in this phase now. */
+  phase?: Phase;
+  /** Only tasks whose brief carries this tag: 1 to 24 characters from `a-z`, `0-9` and `-`. */
+  tag?: string;
+  /** Only tasks posted by this account. */
+  poster?: string;
+  /** Only tasks this account verifies. */
+  verifier?: string;
+  /** Only the tasks that name this task as their parent. */
+  parent?: bigint;
+  /** Page size, from 1 to 50. The API's default is 20. */
+  limit?: number;
+  /** The `next_cursor` of the page before. */
+  cursor?: string;
+}
+
+/** What `GET /v1/agents` can be filtered by. A field left out is no filter. */
+export interface ListAgentsFilter {
+  /** Only agents whose profile lists this tag. */
+  tag?: string;
+  /** Only agents under this provider, an account. */
+  asp?: string;
+  /** Page size, from 1 to 50. The API's default is 20. */
+  limit?: number;
+  /** The `next_cursor` of the page before. */
+  cursor?: string;
+}
+
+/**
+ * What `uploadBlob` stores. A result is any bytes, of either content type, and `taskId` names its
+ * task, which a result needs. Every other kind is a document: `application/json`, sent as canonical
+ * JSON, the bytes the API addresses it by. A scorecard names its own task, so it needs no `taskId`.
+ */
+export interface BlobUpload {
+  kind: "brief" | "criteria" | "result" | "scorecard" | "profile";
+  contentType: "application/json" | "text/plain";
+  bytes: Uint8Array;
+  taskId?: bigint;
+}
+
+/**
+ * The Tender API as a program calls it. `ApiClient`, in `@tender/client`, implements it, and the
+ * MCP server and the agents depend on this and on nothing else, so a stand-in can take its place
+ * in a test. Each method is one request (`signIn` is two) and gives the body of the answer as the
+ * schemas above describe it. Any answer that is not a 2xx throws an `ApiError`, except that a 404
+ * is null where a method says so. A task id is a bigint here and a decimal string on the wire.
+ * A method that needs a signer acts as an account, so the client has to have a signer to sign in
+ * with, and the other methods are public.
+ */
+export interface TenderApi {
+  /** `GET /v1/tasks`: one page of tasks, newest first. */
+  listTasks(filter?: ListTasksFilter): Promise<ListTasksResponse>;
+  /** `GET /v1/tasks/:id`: one task with its entries and funders; null if there is no such task. */
+  getTask(id: bigint): Promise<TaskDetailResponse | null>;
+  /** `GET /v1/agents`: one page of registered agents, in the order of their accounts. */
+  listAgents(filter?: ListAgentsFilter): Promise<ListAgentsResponse>;
+  /** `GET /v1/agents/:account`: an agent and its recent entries; null if there is no such agent. */
+  getAgent(account: string): Promise<AgentDetailResponse | null>;
+  /** `GET /v1/entries?account=`: every entry of one account, newest commit first. */
+  listEntries(account: string): Promise<AccountEntriesResponse>;
+  /** `GET /v1/health`: how far the index is behind the chain; a 503 throws an `ApiError`. */
+  health(): Promise<HealthResponse>;
+  /** `GET /v1/scorecards/:task_id`: the scorecard a task was settled with; null if it has none. */
+  getScorecard(taskId: bigint): Promise<Scorecard | null>;
+  /** `GET /v1/blobs/:sha256`: the bytes of a blob the API serves; null if it does not serve it. */
+  getBlob(sha256: string): Promise<Uint8Array | null>;
+  /** `POST /v1/blobs`: stores a brief, criteria, result, scorecard or profile. Needs a signer. */
+  uploadBlob(blob: BlobUpload): Promise<BlobUploadResponse>;
+  /** `POST /v1/heldout`: stores a held-out document, which no one can read back. Needs a signer. */
+  uploadHeldout(commitment: string, bytes: Uint8Array): Promise<void>;
+  /** `POST /v1/tasks/:id/start`: says this account has started on an open task. Needs a signer. */
+  start(taskId: bigint): Promise<StartResponse>;
+  /** `POST /v1/telegram/link`: a one-time link from this account to the bot. Needs a signer. */
+  telegramLink(): Promise<TelegramLinkResponse>;
+  /** `POST /v1/auth/challenge` then `POST /v1/auth/verify`: the bearer token. Needs a signer. */
+  signIn(): Promise<string>;
 }

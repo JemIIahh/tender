@@ -3,18 +3,22 @@ import type { z } from "zod";
 import * as api from "../src/api";
 import {
   ApiError,
+  type BlobUpload,
   fetchJson,
+  type ListAgentsFilter,
+  type ListTasksFilter,
   ListTasksResponseSchema,
   type StartResponse,
   StartResponseSchema,
   TaskOutcomeSchema,
+  type TenderApi,
 } from "../src/index";
 
 // `fetchJson` and the response schemas, over a fake `fetch`. The API's own test
 // (packages/api/test/schemas.test.ts) holds every schema to what its route really sends; these
 // tests are about what `fetchJson` does with an answer, and a few shapes a route can only send
-// after the indexer has been repaired from the chain. The last test holds each schema to the keys
-// it requires.
+// after the indexer has been repaired from the chain. The last two tests hold each schema to the
+// keys it requires, and `TenderApi` to its methods.
 
 const URL_OF_LIST = "http://api.test/v1/tasks";
 const HASH = "ab".repeat(32);
@@ -579,4 +583,62 @@ test("every_key_of_a_response_schema_is_required_unless_listed_as_optional", () 
       }
     }
   }
+});
+
+// ---- TenderApi --------------------------------------------------------------------------------
+
+test("a_client_with_the_listed_methods_satisfies_tender_api", async () => {
+  // A stand-in with the thirteen methods, as the test of the MCP server or of an agent would
+  // write one. `satisfies` is checked by tsc and does nothing at run time: a method that
+  // `TenderApi` gains or loses, or gives other types, fails `pnpm typecheck` here.
+  const standIn = {
+    listTasks: async (_filter?: ListTasksFilter) => ({ tasks: [], next_cursor: null }),
+    getTask: async (_id: bigint) => null,
+    listAgents: async (_filter?: ListAgentsFilter) => ({ agents: [], next_cursor: null }),
+    getAgent: async (_account: string) => null,
+    listEntries: async (_account: string) => ({ entries: [] }),
+    health: async () => ({
+      ok: true,
+      network: "testnet",
+      contract: "tender.test.near",
+      indexed_height: "90",
+      chain_final_height: "91",
+      lag_blocks: "1",
+    }),
+    getScorecard: async (_taskId: bigint) => null,
+    getBlob: async (_sha256: string) => null,
+    uploadBlob: async (_blob: BlobUpload) => ({
+      sha256: HASH,
+      uri: `http://api.test/v1/blobs/${HASH}`,
+    }),
+    uploadHeldout: async (_commitment: string, _bytes: Uint8Array) => {},
+    start: async (_taskId: bigint) => ({ ok: true, working_count: 1 }),
+    telegramLink: async () => ({ url: "https://t.me/tender_test_bot?start=abc", expires_at: SOON }),
+    signIn: async () => "a-bearer-token",
+  } satisfies TenderApi;
+  const tender: TenderApi = standIn;
+
+  // Called as a lane will call it, so that tsc checks the arguments against `TenderApi`: every
+  // filter field the routes read, and a result as text.
+  await tender.listTasks({
+    phase: "open",
+    tag: "extraction",
+    poster: "poster.test.near",
+    verifier: "judge.test.near",
+    parent: 7n,
+    limit: 20,
+    cursor: "7",
+  });
+  await tender.listAgents({
+    tag: "extraction",
+    asp: "asp.test.near",
+    limit: 20,
+    cursor: "agent.test.near",
+  });
+  await tender.uploadBlob({
+    kind: "result",
+    contentType: "text/plain",
+    bytes: new Uint8Array(),
+    taskId: 7n,
+  });
 });
