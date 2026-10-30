@@ -1,8 +1,9 @@
+import { execFile, spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseEnv } from "node:util";
+import { parseEnv, promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { type LocalChain, type Signer, startLocalChain, TenderClient } from "@tender/client";
@@ -21,6 +22,10 @@ import { type Services, startServices } from "../../../scripts/serve";
 // Every server gets an environment built here from nothing: the TENDER_* names and NEAR_RPC_URL
 // that it needs, and PATH and a throw-away HOME. The parent's environment, a developer's secrets
 // among it, never reaches one.
+//
+// A server goes with its client: when the client's end of the pipe closes, because the client ended
+// or died, the server exits. Two of the tests start a server on their own, with no client library
+// between, to close its stdin, and to kill the launcher that the docs give.
 
 const ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const BIN = join(ROOT, "packages/mcp/bin/tender-mcp.ts");
@@ -40,7 +45,7 @@ let work: string;
 /** The HOME of every server: an empty directory, so that nothing of the developer's is read. */
 let home: string;
 /** Where each account's server keeps its drafts. */
-let stateDirs: Record<"poster" | "alice" | "bob", string>;
+let stateDirs: Record<"poster" | "alice" | "bob" | "orphan", string>;
 /** Alice's function-call key, as the key script wrote it. */
 let aliceKey: Signer;
 const serviceLines: string[] = [];
@@ -54,6 +59,7 @@ beforeAll(async () => {
     poster: join(work, "state", "poster"),
     alice: join(work, "state", "alice"),
     bob: join(work, "state", "bob"),
+    orphan: join(work, "state", "orphan"),
   };
   await Promise.all(
     [home, keys, deployments, ...Object.values(stateDirs)].map((dir) =>
@@ -112,6 +118,7 @@ afterAll(async () => {
   await Promise.allSettled(servers.map((server) => server.client.close()));
   // A test that failed half way must not leave a server behind.
   for (const server of servers) if (server.isAlive()) process.kill(server.pid, "SIGKILL");
+  for (const pid of leftovers) if (isRunning(pid)) process.kill(pid, "SIGKILL");
   await services?.stop();
   await chain?.stop();
   if (work) await rm(work, { recursive: true, force: true });
@@ -298,6 +305,107 @@ function isRunning(pid: number): boolean {
   }
 }
 
+/** The pids of processes that a test started on its own, to end if the test did not. */
+const leftovers: number[] = [];
+
+/**
+ * A server started on its own, with no client library between: the test holds the process and its
+ * stdio, and says to the server, in the protocol's own lines, what it needs said.
+ */
+function spawnServer(signer: Signer, stateDir: string, launch: Launch = DIRECT) {
+  const child = spawn(launch.command, launch.args, {
+    cwd: ROOT,
+    env: environmentOf(signer, stateDir, launch.variables),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const { pid } = child;
+  if (pid === undefined) throw new Error(`could not start ${launch.command}`);
+  leftovers.push(pid);
+  const written: string[] = [];
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  const ready = new Promise<void>((resolve, reject) => {
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      written.push(String(chunk));
+      if (written.join("").includes("tender-mcp: serving")) resolve();
+    });
+    void exited.then(() => reject(new Error(`the server ended: ${written.join("").trim()}`)));
+  });
+  // A test that failed before it awaited this must not die of the rejection.
+  ready.catch(() => undefined);
+
+  // stdout is the protocol, one JSON message to a line. A line that is not one throws here, and the
+  // run fails: nothing but the protocol may be written to stdout.
+  const answers = new Map<number, unknown>();
+  let partial = "";
+  child.stdout.on("data", (chunk: Buffer | string) => {
+    const lines = (partial + String(chunk)).split("\n");
+    partial = lines.pop() ?? "";
+    for (const line of lines) {
+      const message: unknown = JSON.parse(line);
+      const id = z.object({ id: z.number() }).safeParse(message);
+      if (id.success) answers.set(id.data.id, message);
+    }
+  });
+  const say = (message: Record<string, unknown>) =>
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
+  let nextId = 1;
+  return {
+    pid,
+    ready,
+    exited,
+    closeInput: () => child.stdin.end(),
+    notify: (method: string) => say({ method }),
+    async request(method: string, params: Record<string, unknown>): Promise<unknown> {
+      const id = nextId++;
+      say({ id, method, params });
+      await until(`the server answers ${method}`, async () => answers.has(id), 10_000);
+      return answers.get(id);
+    },
+  };
+}
+
+/**
+ * Uses a server the way a client does: it starts the session and has a tool run, so that the server
+ * has asked the chain a question and holds whatever the chain client keeps open. Returns the kind of
+ * key that `balance` reports.
+ */
+async function use(server: ReturnType<typeof spawnServer>): Promise<string> {
+  await server.request("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "tender-e2e", version: "1.0.0" },
+  });
+  server.notify("notifications/initialized");
+  const Answer = z.object({
+    result: z.object({ content: z.array(z.object({ text: z.string() })) }),
+  });
+  const answer = Answer.parse(
+    await server.request("tools/call", { name: "balance", arguments: {} }),
+  );
+  return z.object({ key_kind: z.string() }).parse(JSON.parse(answer.result.content[0]?.text ?? ""))
+    .key_kind;
+}
+
+const run = promisify(execFile);
+
+/** The pids of everything that `pid` started and that still runs: its children, and theirs. */
+async function descendantsOf(pid: number): Promise<number[]> {
+  const { stdout } = await run("ps", ["-A", "-o", "pid=,ppid="]);
+  const parents = new Map<number, number>();
+  for (const line of stdout.split("\n")) {
+    const [child, parent] = line.trim().split(/\s+/).map(Number);
+    if (child !== undefined && parent !== undefined) parents.set(child, parent);
+  }
+  const found: number[] = [];
+  for (let layer = [pid]; layer.length > 0; ) {
+    layer = [...parents].filter(([, parent]) => layer.includes(parent)).map(([child]) => child);
+    found.push(...layer);
+  }
+  return found;
+}
+
 // ---- What the tools answer --------------------------------------------------------------------
 
 interface OwnEntry {
@@ -435,12 +543,19 @@ test("reveal_survives_restart", async () => {
     entries: [{ account: aliceKey.accountId, revealed: true, uri: revealed.uri }],
   });
 
-  // The agent key does what the key script gave it, and no more (docs/MCP.md): the tools that move
-  // money refuse before anything is sent, and the chain refuses a method that the key does not list.
+  // The agent key does what the key script gave it, and no more (docs/MCP.md). The tools that move
+  // money refuse before anything is sent. So do the tools that call a method that the key does not
+  // list, before the scorecard or the profile goes up: the chain would refuse those calls, but only
+  // after both had been made public.
   await expect(call(second, "deposit", { amount: "1" })).rejects.toThrow("NEEDS_FULL_ACCESS_KEY");
   await expect(
+    call(second, "pick_winners", { task_id: taskId, winners: [], scorecard: {} }),
+  ).rejects.toThrow(
+    /KEY_CANNOT_CALL: pick_winners needs a key that may call pick on .*\. This server's key is a function-call key that lists commit, reveal\./,
+  );
+  await expect(
     call(second, "register_agent", { name: "alice", description: "Answers 42.", tags: ["e2e"] }),
-  ).rejects.toThrow("Access key does not allow method register_agent");
+  ).rejects.toThrow(/KEY_CANNOT_CALL: register_agent needs a key that may call register_agent /);
 
   // Neither of alice's servers wrote the key anywhere, and the services logged no error.
   const keyBody = aliceKey.privateKey.slice("ed25519:".length);
@@ -469,5 +584,41 @@ test("the_launch_in_the_docs_starts_the_server", async () => {
   // line on stderr is the server's own.
   expect(server.stderr()).toBe(
     `tender-mcp: serving ${chain.accounts.bob.accountId} on sandbox (full_access key)\n`,
+  );
+});
+
+test("the_server_exits_when_its_client_closes_its_input", async () => {
+  // A client that ends or dies closes the server's stdin. A server that stayed would keep the
+  // account's state directory, which has no lock, from the next one.
+  const server = spawnServer(chain.accounts.bob, stateDirs.orphan);
+  await server.ready;
+  expect(await use(server)).toBe("full_access");
+  expect(isRunning(server.pid)).toBe(true);
+
+  server.closeInput();
+
+  const ended = await Promise.race([server.exited, sleep(3_000).then(() => "still running")]);
+  expect(ended, "3 s after its stdin closed").toEqual({ code: 0, signal: null });
+  expect(isRunning(server.pid)).toBe(false);
+});
+
+test("a_killed_launcher_leaves_no_server_behind", async () => {
+  // The launch in the docs is pnpm, which runs tsx, which runs node, and the server is the node
+  // process. If the client kills the launcher, the pipe that the server reads is closed on the
+  // client's side, and the server must see that and go, though nothing signalled it.
+  const launcher = spawnServer(chain.accounts.bob, stateDirs.orphan, await launchOfDocs());
+  await launcher.ready;
+  expect(await use(launcher)).toBe("full_access");
+  const behind = await descendantsOf(launcher.pid);
+  leftovers.push(...behind);
+  expect(behind.length, "the server runs behind the launcher").toBeGreaterThan(0);
+
+  process.kill(launcher.pid, "SIGKILL");
+  await launcher.exited;
+
+  await until(
+    "the processes behind the launcher have ended",
+    async () => behind.every((pid) => !isRunning(pid)),
+    5_000,
   );
 });

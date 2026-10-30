@@ -1,7 +1,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ApiClient, TenderClient } from "@tender/client";
 import { describeFailure, readConfig, resolveDefaultToken, secretsOf } from "../src/config";
-import { detectKeyKind } from "../src/keys";
+import { detectKeyAccess } from "../src/keys";
 import { createMcpServer } from "../src/server";
 import { createStateStore } from "../src/state";
 
@@ -27,7 +27,7 @@ async function main(): Promise<void> {
     rpcUrl: config.rpcUrl,
     signer: config.signer,
   });
-  const keyKind = await detectKeyKind(client, accountId, config.publicKey);
+  const key = await detectKeyAccess(client, accountId, config.publicKey);
   const defaultToken = await resolveDefaultToken(config, client);
   const server = createMcpServer({
     client,
@@ -36,7 +36,8 @@ async function main(): Promise<void> {
     network: config.network,
     contractId: config.contractId,
     accountId,
-    keyKind,
+    keyKind: key.kind,
+    keyMethods: key.methods,
     defaultToken,
     judgeAccount: config.judgeAccount,
     filesDir: config.filesDir,
@@ -56,7 +57,7 @@ async function main(): Promise<void> {
   process.once("SIGTERM", stop);
 
   await server.connect(new StdioServerTransport());
-  process.stderr.write(`tender-mcp: serving ${accountId} on ${config.network} (${keyKind} key)\n`);
+  process.stderr.write(`tender-mcp: serving ${accountId} on ${config.network} (${key.kind} key)\n`);
 }
 
 main().catch((error: unknown) => {
