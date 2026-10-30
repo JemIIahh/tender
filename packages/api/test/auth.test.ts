@@ -354,7 +354,8 @@ test("challenge_then_verify_issues_token", async () => {
   expect(issued.body).toEqual({
     nonce: expect.any(String),
     message: "Sign in to Tender",
-    recipient: "tender",
+    // The API's own host: `testDeps` serves at `http://api.test`.
+    recipient: "api.test",
     expires_at: isoOf(TEST_NOW + 5n * MINUTE),
   });
   // The nonce is 32 random bytes in the one base64 spelling that `btoa` writes.
@@ -414,6 +415,60 @@ test("every_challenge_is_its_own", async () => {
   expect((await challengeRows()).map((row) => row.nonce).sort()).toEqual(
     [first.nonce, second.nonce].sort(),
   );
+});
+
+test("the_challenge_names_the_host_of_the_public_url", async () => {
+  // Whom a sign-in is signed for is this API, by the host of its public URL: in lower case, with
+  // the port only if it is not the default of the scheme, and nothing else of the URL. A client
+  // signs a challenge only if that is the host it called, so a challenge that is passed on to a
+  // client of another host is not signed, and what is signed for another host is not taken here.
+  const named: Array<[string, string]> = [
+    ["http://api.test", "api.test"],
+    ["https://api.tender.example", "api.tender.example"],
+    ["https://API.Tender.Example/", "api.tender.example"],
+    ["https://api.tender.example:443", "api.tender.example"],
+    ["https://api.tender.example:8443/base", "api.tender.example:8443"],
+    ["http://127.0.0.1:8787", "127.0.0.1:8787"],
+    ["http://localhost:80", "localhost"],
+    ["http://[::1]:8787", "[::1]:8787"],
+  ];
+  for (const [publicUrl, recipient] of named) {
+    const app = appWith({ publicUrl });
+
+    const ch = await challenge(app);
+    expect(ch.recipient, publicUrl).toBe(recipient);
+    const taken = await post<SignInResponse>(
+      app,
+      "/v1/auth/verify",
+      await signChallenge(KeyPair.fromRandom("ed25519"), ch),
+    );
+    expect(taken.status, publicUrl).toBe(200);
+
+    // The same challenge, signed for the host of another API, is refused.
+    const other = recipient === "api.test" ? "api.other.example" : "api.test";
+    const refused = await post<ErrorBody>(
+      app,
+      "/v1/auth/verify",
+      await signChallenge(KeyPair.fromRandom("ed25519"), await challenge(app), {
+        recipient: other,
+      }),
+    );
+    expect(refused.status, publicUrl).toBe(401);
+    expect(refused.body.error, publicUrl).toBe("wrong_recipient");
+  }
+});
+
+test("a_public_url_with_no_host_is_a_fault_and_stores_no_challenge", async () => {
+  // Without a host there is no one to sign for. That is the deployment's fault, and so a 500 that
+  // is seen, and not a challenge for a recipient that is nothing.
+  const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  for (const publicUrl of ["", "api.test", "/v1", "file:///api"]) {
+    const failed = await post<ErrorBody>(appWith({ publicUrl }), "/v1/auth/challenge");
+    expect(failed.status, publicUrl).toBe(500);
+    expect(failed.body, publicUrl).toEqual({ error: "internal", message: "internal error" });
+  }
+  expect(log).toHaveBeenCalled();
+  expect(await challengeRows()).toEqual([]);
 });
 
 test("nonce_replay_rejected", async () => {
@@ -595,6 +650,28 @@ test("every_auth_error_is_a_fixed_401", async () => {
     "another recipient": {
       code: "wrong_recipient",
       send: (ch) => signChallenge(key, ch, { account, recipient: "evil" }),
+    },
+    // The challenge is this API's and the signature is good, but it is for another API: a host that
+    // is not this one, however close the spelling.
+    "another API's host": {
+      code: "wrong_recipient",
+      send: (ch) => signChallenge(key, ch, { account, recipient: "api.other.example" }),
+    },
+    "the recipient every API used to have": {
+      code: "wrong_recipient",
+      send: (ch) => signChallenge(key, ch, { account, recipient: "tender" }),
+    },
+    "this host with a port it does not have": {
+      code: "wrong_recipient",
+      send: (ch) => signChallenge(key, ch, { account, recipient: "api.test:8443" }),
+    },
+    "this host in capitals": {
+      code: "wrong_recipient",
+      send: (ch) => signChallenge(key, ch, { account, recipient: "API.TEST" }),
+    },
+    "this host as a URL": {
+      code: "wrong_recipient",
+      send: (ch) => signChallenge(key, ch, { account, recipient: "http://api.test" }),
     },
     "another message, signed correctly": {
       code: "bad_signature",

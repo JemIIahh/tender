@@ -23,11 +23,11 @@ import {
   type Scorecard,
   ScorecardSchema,
   SIGN_IN_MESSAGE,
-  SIGN_IN_RECIPIENT,
   SignInResponseSchema,
   type StartResponse,
   StartResponseSchema,
   sha256Hex,
+  signInRecipientOf,
   type TaskDetailResponse,
   TaskDetailResponseSchema,
   type TelegramLinkResponse,
@@ -55,7 +55,10 @@ export interface ApiClientOptions {
    * Where the API is served, as `PUBLIC_API_URL` has it: `https://api.example`. The client adds
    * `/v1`, so a trailing slash and a trailing `/v1` are both dropped. With a `signer` it must be
    * https, or http to this machine (`localhost`, `127.0.0.1` or `[::1]`): the signature and the
-   * bearer token travel to it.
+   * bearer token travel to it. Its host, and its port if that is not the default, are also whom
+   * the sign-in is signed for (`signInRecipientOf`), so they have to be those of the API's own
+   * `PUBLIC_API_URL`: an API reached under another name, an address in place of its domain, say,
+   * is refused at sign-in.
    */
   baseUrl: string;
   /**
@@ -123,12 +126,27 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(text);
 }
 
+/**
+ * The `init` of a GET. No request of the client follows a redirect, this one or a POST: the API
+ * never redirects, and the server at `baseUrl` could use one to send what a request holds (the
+ * signature of a sign-in, a brief, the bearer token) on to a place of its choosing, over plain
+ * http even. A redirect fails the request with the error `fetch` gives for it.
+ */
+function get(): RequestInit {
+  return { redirect: "error" };
+}
+
 /** The `init` of a POST: signed in as the owner of `token` if there is one, with `body` as JSON. */
 function post(token?: string, body?: unknown): RequestInit {
   const headers: Record<string, string> = {};
   if (token !== undefined) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  return { method: "POST", headers, body: body === undefined ? undefined : JSON.stringify(body) };
+  return {
+    method: "POST",
+    redirect: "error",
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  };
 }
 
 function isUnauthorized(error: unknown): boolean {
@@ -167,12 +185,13 @@ function isNonce(nonce: string): boolean {
 
 /**
  * Why a challenge is not signed. It names the field and never quotes it: the text comes from a
- * server that is not trusted, and an error is read by people and by agents.
+ * server that is not trusted, and an error is read by people and by agents. A recipient that is
+ * not the host of `baseUrl` can also be an API whose `PUBLIC_API_URL` is not the host it is called
+ * at, which is why the error says what the recipient should have been.
  */
 function refusal(field: "message" | "recipient" | "nonce"): Error {
-  return new Error(
-    `refusing to sign the API's sign-in challenge: its ${field} is not that of a Tender sign-in`,
-  );
+  const wanted = field === "recipient" ? "the host of baseUrl" : "that of a Tender sign-in";
+  return new Error(`refusing to sign the API's sign-in challenge: its ${field} is not ${wanted}`);
 }
 
 /**
@@ -227,9 +246,12 @@ async function readCapped(res: Response, limit: number): Promise<Uint8Array | nu
  * the token dropped, signs in again and is sent once more, and a second 401 is thrown.
  *
  * The server at `baseUrl` is not trusted with the key. A challenge is signed only if its message
- * and recipient are `SIGN_IN_MESSAGE` and `SIGN_IN_RECIPIENT` and its nonce is 32 bytes in base64;
- * any other is refused, with nothing signed. And a client with a signer needs an https `baseUrl`
- * (http only to this machine), as the signature and the token go to it.
+ * is `SIGN_IN_MESSAGE`, its recipient is the host of `baseUrl` (`signInRecipientOf`) and its nonce
+ * is 32 bytes in base64; any other is refused, with nothing signed. The recipient is what ties a
+ * signature to this API: a server that hands over the challenge of another API, to use there what
+ * the key signs, is refused because that challenge names the host of the other API and not its own.
+ * A client with a signer needs an https `baseUrl` (http only to this machine), as the signature
+ * and the token go to it, and no request follows a redirect, so the server cannot send them on.
  *
  * An `ApiError` holds the body of the answer for the caller to read, and for a sign-in that can be
  * the bearer token. So nothing here logs a body or puts one in a message.
@@ -269,17 +291,12 @@ export class ApiClient implements TenderApi {
       limit: filter.limit,
       cursor: filter.cursor,
     });
-    return fetchJson(
-      this.url(`/tasks${query}`),
-      ListTasksResponseSchema,
-      undefined,
-      this.fetchImpl,
-    );
+    return fetchJson(this.url(`/tasks${query}`), ListTasksResponseSchema, get(), this.fetchImpl);
   }
 
   getTask(id: bigint): Promise<TaskDetailResponse | null> {
     return orNull(
-      fetchJson(this.url(`/tasks/${id}`), TaskDetailResponseSchema, undefined, this.fetchImpl),
+      fetchJson(this.url(`/tasks/${id}`), TaskDetailResponseSchema, get(), this.fetchImpl),
     );
   }
 
@@ -290,12 +307,7 @@ export class ApiClient implements TenderApi {
       limit: filter.limit,
       cursor: filter.cursor,
     });
-    return fetchJson(
-      this.url(`/agents${query}`),
-      ListAgentsResponseSchema,
-      undefined,
-      this.fetchImpl,
-    );
+    return fetchJson(this.url(`/agents${query}`), ListAgentsResponseSchema, get(), this.fetchImpl);
   }
 
   // Async, so that an `account` that cannot be put in a path (a lone surrogate) rejects, as every
@@ -305,7 +317,7 @@ export class ApiClient implements TenderApi {
       fetchJson(
         this.url(`/agents/${encodeURIComponent(account)}`),
         AgentDetailResponseSchema,
-        undefined,
+        get(),
         this.fetchImpl,
       ),
     );
@@ -315,18 +327,18 @@ export class ApiClient implements TenderApi {
     return fetchJson(
       this.url(`/entries${queryOf({ account })}`),
       AccountEntriesResponseSchema,
-      undefined,
+      get(),
       this.fetchImpl,
     );
   }
 
   health(): Promise<HealthResponse> {
-    return fetchJson(this.url("/health"), HealthResponseSchema, undefined, this.fetchImpl);
+    return fetchJson(this.url("/health"), HealthResponseSchema, get(), this.fetchImpl);
   }
 
   getScorecard(taskId: bigint): Promise<Scorecard | null> {
     return orNull(
-      fetchJson(this.url(`/scorecards/${taskId}`), ScorecardSchema, undefined, this.fetchImpl),
+      fetchJson(this.url(`/scorecards/${taskId}`), ScorecardSchema, get(), this.fetchImpl),
     );
   }
 
@@ -340,7 +352,7 @@ export class ApiClient implements TenderApi {
   async getBlob(sha256: string): Promise<Uint8Array | null> {
     // A local, so that it is called as a function of its own and not as a method of the client.
     const doFetch = this.fetchImpl ?? fetch;
-    const res = await doFetch(this.url(`/blobs/${encodeURIComponent(sha256)}`));
+    const res = await doFetch(this.url(`/blobs/${encodeURIComponent(sha256)}`), get());
     const bytes = await readCapped(res, MAX_RESULT_BYTES);
     if (bytes === null) {
       throw new ApiError(
@@ -443,10 +455,12 @@ export class ApiClient implements TenderApi {
       this.fetchImpl,
     );
     const { message, nonce, recipient } = challenge;
-    // The server chose all three, and the key signs them: only a Tender sign-in is signed, and
-    // nothing a server that is not Tender's would put in its place.
+    // The server chose all three, and the key signs them: only a Tender sign-in for this API is
+    // signed, and nothing a server that is not Tender's would put in its place. The recipient is
+    // the host of `baseUrl`, as the API puts the host of its own public URL there. A server that
+    // passes on the challenge of another API, to use there what the key signs, names that API.
     if (message !== SIGN_IN_MESSAGE) throw refusal("message");
-    if (recipient !== SIGN_IN_RECIPIENT) throw refusal("recipient");
+    if (recipient !== signInRecipientOf(this.baseUrl)) throw refusal("recipient");
     if (!isNonce(nonce)) throw refusal("nonce");
     // The signature is of the SHA-256 of the NEP-413 bytes, the same digest `verifyNep413` checks.
     const digest = hexToBytes(sha256Hex(serializeNep413({ message, nonce, recipient })));

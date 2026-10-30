@@ -111,13 +111,31 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-/** Serves `app` on an ephemeral port of the loopback interface. */
-function listen(app: Hono): Promise<{ server: ServerType; url: string }> {
+type Handler = (request: Request) => Response | Promise<Response>;
+
+/**
+ * Serves what `build` makes of the URL it is served at, on an ephemeral port of the loopback
+ * interface. The port is known only once it is bound, and the API signs a sign-in for its own
+ * host, port included: so the app is made after the server is, from the URL it is at.
+ */
+function listen(build: (url: string) => Handler): Promise<{ server: ServerType; url: string }> {
   return new Promise((resolve) => {
-    const server = serve({ fetch: app.fetch, hostname: "127.0.0.1", port: 0 }, (info) =>
-      resolve({ server, url: `http://127.0.0.1:${info.port}` }),
+    let handler: Handler | undefined;
+    const server = serve(
+      { fetch: (request) => (handler as Handler)(request), hostname: "127.0.0.1", port: 0 },
+      (info) => {
+        const url = `http://127.0.0.1:${info.port}`;
+        handler = build(url);
+        resolve({ server, url });
+      },
     );
   });
+}
+
+/** The app, as the API would be served at `url`: its public URL is where it is. */
+function appAt(url: string, over: Partial<ApiDeps> = {}): Handler {
+  const app: Hono = createApp({ ...deps, publicUrl: url, ...over });
+  return (request) => app.fetch(request);
 }
 
 function stop(server: ServerType): Promise<void> {
@@ -128,13 +146,19 @@ function stop(server: ServerType): Promise<void> {
 }
 
 /**
- * A client of the app, which is served for the test and closed after it. It signs in as alice with
- * a key of its own, which the app's chain stub accepts (`over.client` changes that), and keeps the
- * time the API keeps.
+ * A client of the app, which is served for the test and closed after it. The app's public URL is
+ * the address it is served at, as a deployed API's is the address its clients call (`over` can
+ * change that too). The client signs in as alice with a key of its own, which the app's chain stub
+ * accepts (`over.client` changes that), and keeps the time the API keeps.
  */
 async function connect(over: Partial<ApiDeps> = {}) {
-  const { server, url } = await listen(createApp({ ...deps, ...over }));
+  const { server, url } = await listen((url) => appAt(url, over));
   cleanups.push(() => stop(server));
+  return { ...clientOf(url), url };
+}
+
+/** A client of the API at `url`, as alice, with a key of its own and the time the API keeps. */
+function clientOf(url: string) {
   const key = KeyPair.fromRandom("ed25519");
   const client = new ApiClient({
     baseUrl: url,
@@ -150,20 +174,26 @@ async function count(table: "auth_challenges" | "auth_tokens"): Promise<number> 
 }
 
 /** What the promise rejected with: the test fails if it resolved. */
-async function apiError(promise: Promise<unknown>): Promise<ApiError> {
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
   try {
     await promise;
   } catch (error) {
-    expect(error).toBeInstanceOf(ApiError);
-    return error as ApiError;
+    return error;
   }
   throw new Error("expected the call to reject, and it resolved");
+}
+
+/** What the promise rejected with, which is an `ApiError`: the test fails if it resolved. */
+async function apiError(promise: Promise<unknown>): Promise<ApiError> {
+  const error = await rejection(promise);
+  expect(error).toBeInstanceOf(ApiError);
+  return error as ApiError;
 }
 
 // ---- Tests ------------------------------------------------------------------------------------
 
 test("client_round_trips_against_in_process_app", async () => {
-  const { client, key } = await connect();
+  const { client, key, url } = await connect();
 
   // Signs in with the key of its signer: the API issues a token for alice and that key.
   const token = await client.signIn();
@@ -177,7 +207,7 @@ test("client_round_trips_against_in_process_app", async () => {
   const stored = await client.uploadBlob({ kind: "brief", contentType: "application/json", bytes });
   expect(stored).toEqual({
     sha256: sha256Hex(bytes),
-    uri: `${deps.publicUrl}/v1/blobs/${sha256Hex(bytes)}`,
+    uri: `${url}/v1/blobs/${sha256Hex(bytes)}`,
   });
   expect(await client.getBlob(stored.sha256)).toEqual(bytes);
   expect(await client.getBlob(sha256Hex("never stored"))).toBeNull();
@@ -324,4 +354,69 @@ test("a_sign_in_the_api_refuses_is_an_api_error_and_is_not_retried", async () =>
   expect(error.body).toMatchObject({ error: "key_not_found" });
   expect(await count("auth_challenges")).toBe(1);
   expect(await count("auth_tokens")).toBe(0);
+});
+
+// ---- A server that is not the API ---------------------------------------------------------------
+
+/**
+ * A server at an address of its own that passes every request on to the API at `target`, as a
+ * hostile `baseUrl` would. With `renamed` it also names itself as the recipient of the challenges
+ * it passes back. `passed` lists what it was asked.
+ */
+function relayTo(target: string, passed: string[], renamed: boolean): (url: string) => Handler {
+  return (url) => async (request) => {
+    const { pathname, search } = new URL(request.url);
+    passed.push(`${request.method} ${pathname}`);
+    const body = request.method === "POST" ? await request.text() : "";
+    const upstream = await fetch(`${target}${pathname}${search}`, {
+      method: request.method,
+      headers: { "Content-Type": "application/json" },
+      body: body === "" ? undefined : body,
+      redirect: "error",
+    });
+    const text = await upstream.text();
+    const answer =
+      renamed && pathname === "/v1/auth/challenge"
+        ? JSON.stringify({ ...JSON.parse(text), recipient: new URL(url).host })
+        : text;
+    return new Response(answer, {
+      status: upstream.status,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+}
+
+test("a_server_that_passes_the_apis_challenge_on_gets_no_token", async () => {
+  const api = await listen((url) => appAt(url));
+  cleanups.push(() => stop(api.server));
+  /** A client at a relay of the API, and what the relay is asked. */
+  const viaRelay = async (renamed: boolean) => {
+    const passed: string[] = [];
+    const relay = await listen(relayTo(api.url, passed, renamed));
+    cleanups.push(() => stop(relay.server));
+    return { ...clientOf(relay.url), passed };
+  };
+
+  // As the API made it, the challenge names the API's host, and this client called the relay's:
+  // it signs nothing, so the relay has no signature to present to the API, and does not ask. (An
+  // API whose public URL is not the address its clients call looks the same to a client.)
+  const plain = await viaRelay(false);
+  const refused = await rejection(plain.client.signIn());
+  expect(refused).not.toBeInstanceOf(ApiError);
+  expect((refused as Error).message).toBe(
+    "refusing to sign the API's sign-in challenge: its recipient is not the host of baseUrl",
+  );
+  expect(plain.passed).toEqual(["POST /v1/auth/challenge"]);
+
+  // Renamed to the relay's own host, the challenge is signed, for that host. The API takes a
+  // signature for its own host only, so what the relay passes on to it is refused.
+  const renamed = await viaRelay(true);
+  const error = await apiError(renamed.client.signIn());
+  expect(error.status).toBe(401);
+  expect(error.body).toMatchObject({ error: "wrong_recipient" });
+  expect(renamed.passed).toEqual(["POST /v1/auth/challenge", "POST /v1/auth/verify"]);
+
+  // By neither way was a token made, for anyone.
+  expect(await count("auth_tokens")).toBe(0);
+  expect(await count("auth_challenges")).toBe(2);
 });

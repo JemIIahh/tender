@@ -7,7 +7,7 @@ import {
   type Nep413Result,
   verifyNep413,
 } from "@tender/client";
-import { SIGN_IN_MESSAGE, SIGN_IN_RECIPIENT, sha256Hex } from "@tender/shared";
+import { SIGN_IN_MESSAGE, sha256Hex, signInRecipientOf } from "@tender/shared";
 import type { Context } from "hono";
 import { type ApiDeps, nowNs } from "./deps";
 import { type ErrorBody, fail } from "./format";
@@ -48,7 +48,7 @@ export interface ChallengeResponse {
   nonce: string;
   /** What the wallet signs. */
   message: string;
-  /** Whom the wallet signs it for. */
+  /** Whom the wallet signs it for: this API, by the host of its public URL (`signInRecipientOf`). */
   recipient: string;
   expires_at: string;
 }
@@ -84,8 +84,15 @@ function isoAt(ns: bigint, plusMs = 0): string {
  * Issues a challenge. Nothing identifies the caller, so anyone can ask. A challenge is good for 5
  * minutes and its row is kept for an hour after that. The same transaction deletes the challenges
  * and tokens that expired more than an hour ago, so the tables do not grow with the calls.
+ *
+ * It names this API as its recipient, by the host of `deps.publicUrl`, so that what a client signs
+ * is good here and nowhere else: a server that passes this challenge on to a client at another
+ * host gets nothing, as the client signs only for the host it called, and `signIn` accepts only a
+ * signature for this one.
  */
 export async function createChallenge(deps: ApiDeps): Promise<ChallengeResponse> {
+  // First, so that a public URL with no host is a fault before a challenge is stored.
+  const recipient = signInRecipientOf(deps.publicUrl);
   const now = nowNs(deps);
   const nonce = randomBytes(NONCE_BYTES).toString("base64");
   const expiresAt = isoAt(now, CHALLENGE_TTL_MS);
@@ -100,7 +107,7 @@ export async function createChallenge(deps: ApiDeps): Promise<ChallengeResponse>
       expiresAt,
     ]);
   });
-  return { nonce, message: SIGN_IN_MESSAGE, recipient: SIGN_IN_RECIPIENT, expires_at: expiresAt };
+  return { nonce, message: SIGN_IN_MESSAGE, recipient, expires_at: expiresAt };
 }
 
 // ---- Asking the chain -------------------------------------------------------------------------
@@ -199,6 +206,9 @@ function unavailableIfLookupFailed(error: unknown): never {
  * seconds: that is thrown as the 503 (`unavailable`) that tells the caller to try again.
  *
  * `verifyNep413` does not look at `message`, so it is held to the one the challenge carries here.
+ * It is held to the recipient the challenge names, which is this API's host (`signInRecipientOf`
+ * of `deps.publicUrl`): a signature made for another host is `wrong_recipient`.
+ *
  * The challenge has to be live before the key is looked up, because that lookup is a call to the
  * chain, and one is not spent on a nonce that was never issued or has run out. That first look
  * does not spend it. Spending is `issueToken`'s, in the transaction that stores the token, and it
@@ -221,7 +231,7 @@ export async function signIn(deps: ApiDeps, request: SignInRequest): Promise<Sig
     {
       viewAccessKey: (account, key) => lookUpKey(deps, account, key),
       contractId: deps.contractId,
-      expectedRecipient: SIGN_IN_RECIPIENT,
+      expectedRecipient: signInRecipientOf(deps.publicUrl),
     },
   ).catch(unavailableIfLookupFailed);
 

@@ -226,7 +226,7 @@ test("wrong_recipient_rejected", async () => {
   const forOtherApp = await signIn({ recipient: "evil.app" });
   await expectAuthError(verifyNep413(forOtherApp.input, deps), "wrong_recipient");
 
-  // Signed for Tender, but the request names another recipient.
+  // Signed for the recipient that is expected, but the request names another.
   const { input } = await signIn();
   for (const recipient of ["evil.app", "Tender", "tender ", " tender", "tende", "tender2", ""]) {
     await expectAuthError(verifyNep413({ ...input, recipient }, deps), "wrong_recipient");
