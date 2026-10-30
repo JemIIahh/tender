@@ -24,16 +24,23 @@ export interface KeeperChain {
 /** The two chores of the keeper, as the memory and the log name them. */
 type Chore = "void_task" | "cleanup";
 
-/** How many ticks a task whose call failed is left alone for the first time. */
+/**
+ * How many ticks a task whose call failed is left alone for: the first time the contract refuses
+ * it, and every time it fails in another way.
+ */
 const SKIP_TICKS = 10;
-/** The most ticks it is left alone for: 2880 is a day at the default interval of 30 s. */
+/** The most ticks it is left alone for as the contract keeps refusing it: a day at 30 s a tick. */
 const MAX_SKIP_TICKS = 2880;
 
-/** A chore that failed for a task: how many times in a row, and when it is next tried. */
+/** A chore that failed for a task: how often the contract refused it, and when it is retried. */
 interface Failure {
   chore: Chore;
   id: bigint;
-  times: number;
+  /**
+   * How many times the contract has refused the chore since it last went through. A failure of
+   * another kind does not count, and does not reset the count either.
+   */
+  refusals: number;
   /** The first tick at which the chore is tried again. */
   retryAt: number;
 }
@@ -46,11 +53,16 @@ interface Failure {
  *   entries: it is not read again;
  * - a task whose `void_task` lost with `E_SETTLED` is settled on the chain for good, however long
  *   the index takes to show it: it is not tried again;
- * - a task whose `void_task` or `cleanup` failed for a reason other than a lost race, or whose
- *   read failed or found no task, is left alone for the next 10 ticks. Each time the same chore
- *   fails again the wait doubles, up to 2880 ticks (a day at 30 s), and it is 10 again once the
- *   chore goes through. Otherwise tasks that the chain keeps refusing, such as the rows of another
- *   deployment's index, would take every slot of every tick and leave none for the rest.
+ * - a task whose `void_task` or `cleanup` the contract refused, other than by a lost race, or which
+ *   the chain says it does not have, is left alone for the next 10 ticks. Each time the contract
+ *   refuses the same chore again the wait doubles, up to 2880 ticks (a day at 30 s), and it is 10
+ *   again once the chore goes through. Otherwise tasks that the chain keeps refusing, such as the
+ *   rows of another deployment's index, would take every slot of every tick and leave none for the
+ *   rest;
+ * - a task whose call or read failed in any other way, such as a node that cannot be reached or a
+ *   transaction that has not finished, is left alone for the next 10 ticks, however often that
+ *   happens, and the wait that refusals built up stays as it was. That says nothing of the task:
+ *   after an outage every task is back within about 10 ticks.
  *
  * It holds something only for tasks the index still lists (`forget`), so it does not grow with
  * every task that ever failed or was found clean. `startKeeper` keeps one for the whole run. A tick
@@ -107,12 +119,26 @@ export class KeeperMemory {
     this.failures.delete(`${chore} ${id}`);
   }
 
-  /** The chore failed, or the read for it did: the task is left alone twice as long as last time. */
+  /**
+   * The contract refused the chore, or says it has no such task: the task is left alone twice as
+   * long as the last time it was refused, from 10 ticks up to 2880.
+   */
+  refused(chore: Chore, id: bigint): void {
+    const key = `${chore} ${id}`;
+    const refusals = (this.failures.get(key)?.refusals ?? 0) + 1;
+    const skip = Math.min(SKIP_TICKS * 2 ** (refusals - 1), MAX_SKIP_TICKS);
+    this.failures.set(key, { chore, id, refusals, retryAt: this.ticks + skip + 1 });
+  }
+
+  /**
+   * The chore, or the read for it, failed in a way that says nothing of the task, such as a node
+   * that cannot be reached: the task is left alone for 10 ticks, however often that happens. What
+   * refusals have counted is kept as it was.
+   */
   failed(chore: Chore, id: bigint): void {
     const key = `${chore} ${id}`;
-    const times = (this.failures.get(key)?.times ?? 0) + 1;
-    const skip = Math.min(SKIP_TICKS * 2 ** (times - 1), MAX_SKIP_TICKS);
-    this.failures.set(key, { chore, id, times, retryAt: this.ticks + skip + 1 });
+    const refusals = this.failures.get(key)?.refusals ?? 0;
+    this.failures.set(key, { chore, id, refusals, retryAt: this.ticks + SKIP_TICKS + 1 });
   }
 
   /**
@@ -217,10 +243,22 @@ function quiet(log: (message: string) => void): (message: string) => void {
 }
 
 /**
- * How a call went: it went through, another caller got there first (`settled` when the task is
- * settled, which is final; `lost` when the phase had changed, which may not stay so), or it failed.
+ * How a call went: it went through; another caller got there first (`settled` when the task is
+ * settled, which is final; `lost` when the phase had changed, which may not stay so); the contract
+ * refused it (`refused`); or it failed in another way (`failed`), which says nothing of the task.
  */
-type Attempt = "sent" | "lost" | "settled" | "failed";
+type Attempt = "sent" | "lost" | "settled" | "refused" | "failed";
+
+/**
+ * Whether `error`, which is not a lost race, is the contract refusing the call: a `TenderError`,
+ * which the client throws for a transaction that failed on chain, whose code names a refusal.
+ * `E_UNKNOWN` is no such code: it is what the client calls a transaction that has no final outcome
+ * yet (the RPC's doing), and a failure whose text it does not know. Nor is anything thrown before
+ * the transaction ran, by near-api-js or the network: a timeout, a refused connection, a 5xx.
+ */
+function isRefusal(error: unknown): boolean {
+  return error instanceof TenderError && error.code !== "E_UNKNOWN";
+}
 
 /**
  * Sends one call. A lost race is logged at debug level and any other failure as an error; neither
@@ -241,7 +279,7 @@ async function attempt(
       return error.code === "E_SETTLED" ? "settled" : "lost";
     }
     log(`ERROR keeper: ${method} task ${id} failed (${describe(error)})`);
-    return "failed";
+    return isRefusal(error) ? "refused" : "failed";
   }
 }
 
@@ -312,9 +350,11 @@ async function settledTasks(db: Db, now: bigint): Promise<bigint[]> {
  *
  * With a `memory` (as `startKeeper` runs it) a task found with nothing left to clean is not read
  * again, and a task whose void lost with `E_SETTLED` is not voided again. A task whose call or read
- * failed, other than by a lost race, is left alone for the next 10 ticks, and for twice as long
- * each time the same call fails again (see `KeeperMemory`), so that tasks the chain keeps refusing
- * cannot hold every slot.
+ * failed, other than by a lost race, is left alone for the next 10 ticks. It is left alone for
+ * twice as long each time the contract refuses the same call again (see `KeeperMemory`), so that
+ * tasks the chain keeps refusing cannot hold every slot; a failure of the node or the network
+ * keeps it at 10, so that after an outage every task is back within about 10 ticks. Without a
+ * `memory` a tick is for a one-off run; a long run should pass one (`startKeeper` does).
  *
  * Rejects only when the index cannot be read. Pass `signal` to have it end before its next call.
  */
@@ -348,6 +388,8 @@ export async function keeperTick(opts: KeeperTickOptions): Promise<KeeperTickRes
     } else if (sent === "settled") {
       // The index will say so in time; until then the task is not tried again.
       memory.foundSettled(id);
+    } else if (sent === "refused") {
+      memory.refused("void_task", id);
     } else if (sent === "failed") {
       memory.failed("void_task", id);
     }
@@ -372,7 +414,8 @@ export async function keeperTick(opts: KeeperTickOptions): Promise<KeeperTickRes
     }
     failedReads = 0;
     if (view === null) {
-      memory.failed("cleanup", id);
+      // The chain's own answer that it has no such task, as it would give a call: a refusal.
+      memory.refused("cleanup", id);
       continue;
     }
     if (view.cleaned >= view.commit_count) {
@@ -385,6 +428,8 @@ export async function keeperTick(opts: KeeperTickOptions): Promise<KeeperTickRes
       memory.succeeded("cleanup", id);
       result.cleaned.push(id);
       log(`keeper: cleaned task ${id}`);
+    } else if (sent === "refused") {
+      memory.refused("cleanup", id);
     } else if (sent === "failed") {
       memory.failed("cleanup", id);
     }

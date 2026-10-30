@@ -899,6 +899,110 @@ test("keeper_starts_the_skip_again_from_10_ticks_once_the_call_goes_through", as
   expect(attempts).toEqual([1, 12, 33, 34, 45, 66]);
 });
 
+// ---- Only the contract's refusals double the skip -----------------------------------------------
+
+/** What near-api-js throws when the node cannot be reached: an error, not a `TenderError`. */
+const unreachable = () => {
+  throw Object.assign(new TypeError("fetch failed"), { code: "ECONNREFUSED" });
+};
+
+/** Every 11th tick: sent on one tick, left alone for the 10 after it. */
+const EVERY_11TH_TICK = [1, 12, 23, 34, 45, 56, 67];
+
+/**
+ * Ticks `ticks` times with a memory, at `now`, and returns the numbers of the ticks that sent the
+ * chain `method`. Unlike `voidAttempts` it reads the database, so it keeps to a few dozen ticks.
+ */
+async function ticksCalling(
+  chain: KeeperChain,
+  calls: Call[],
+  method: Call["method"],
+  now: bigint,
+  ticks: number,
+): Promise<number[]> {
+  const tick = ticker(chain, now);
+  const numbers: number[] = [];
+  for (let n = 1; n <= ticks; n++) {
+    const before = idsOf(calls, method).length;
+    await tick();
+    if (idsOf(calls, method).length > before) numbers.push(n);
+  }
+  return numbers;
+}
+
+test("keeper_tries_a_void_every_11th_tick_while_the_node_cannot_be_reached", async () => {
+  // An outage says nothing of the task: after it, the task is back within about 10 ticks.
+  expect(await voidAttempts(70, unreachable)).toEqual(EVERY_11TH_TICK);
+  // The contract refusing the same call backs off: left alone 10, 20, 40 ticks.
+  expect(await voidAttempts(80, refused)).toEqual([1, 12, 33, 74]);
+});
+
+test("keeper_keeps_the_10_tick_skip_when_the_client_cannot_name_the_failure", async () => {
+  // `E_UNKNOWN` is a transaction that has not finished, or a failure whose text the client does not
+  // know: neither is a refusal of the contract's, which it would be right to back off from.
+  const noFinalOutcome = () => {
+    throw new TenderError(
+      "E_UNKNOWN",
+      'transaction tx-1 has no final outcome; its status is "Started"',
+      { txHash: "tx-1" },
+    );
+  };
+  const unnamed = () => {
+    throw new TenderError("E_UNKNOWN", "Exceeded the prepaid gas.", { txHash: "tx-2" });
+  };
+
+  expect(await voidAttempts(70, noFinalOutcome)).toEqual(EVERY_11TH_TICK);
+  expect(await voidAttempts(70, unnamed)).toEqual(EVERY_11TH_TICK);
+});
+
+test("keeper_does_not_let_an_outage_move_the_wait_that_refusals_built_up", async () => {
+  // Refused on ticks 1 and 12, so the wait is 10 and then 20. The node is down on tick 33, which
+  // costs 10 ticks and neither resets the wait nor doubles it; refused again on tick 44, it is 40,
+  // then 80 and 160.
+  const attempts = await voidAttempts(170, (call) => {
+    if (call === 3) unreachable();
+    refused();
+  });
+
+  expect(attempts).toEqual([1, 12, 33, 44, 85, 166]);
+});
+
+test("keeper_reads_a_task_every_11th_tick_while_its_reads_fail", async () => {
+  await addTask({ id: 1, commitCount: 1, settled: { kind: "picked", at: REVEAL } });
+  const { chain, calls } = fakeChain({}, { getTask: unreachable });
+
+  expect(await ticksCalling(chain, calls, "getTask", REVEAL + SECOND, 70)).toEqual(EVERY_11TH_TICK);
+});
+
+test("keeper_reads_a_task_that_the_chain_does_not_have_after_longer_and_longer_waits", async () => {
+  await addTask({ id: 1, commitCount: 1, settled: { kind: "picked", at: REVEAL } });
+  // No view: the chain answers that it has no task 1, as it does for the rows of another
+  // deployment. That is the contract's own answer, like the E_NOT_FOUND it gives to a void, and it
+  // stays so: a refusal, which backs off.
+  const { chain, calls } = fakeChain();
+
+  expect(await ticksCalling(chain, calls, "getTask", REVEAL + SECOND, 80)).toEqual([1, 12, 33, 74]);
+});
+
+test("keeper_sends_cleanup_every_11th_tick_in_an_outage_and_backs_off_when_refused", async () => {
+  await addTask({ id: 1, commitCount: 1, settled: { kind: "picked", at: REVEAL } });
+  const views = { "1": { cleaned: 0, commit_count: 1 } };
+
+  const down = fakeChain(views, { cleanup: unreachable });
+  expect(await ticksCalling(down.chain, down.calls, "cleanup", REVEAL + SECOND, 70)).toEqual(
+    EVERY_11TH_TICK,
+  );
+
+  const refusing = fakeChain(views, {
+    cleanup: () => {
+      throw new TenderError("E_LIMIT", "Smart contract panicked: E_LIMIT: 1");
+    },
+  });
+  expect(
+    await ticksCalling(refusing.chain, refusing.calls, "cleanup", REVEAL + SECOND, 80),
+  ).toEqual([1, 12, 33, 74]);
+});
+
 test("keeper_forgets_a_failure_once_the_task_leaves_the_window", async () => {
   await addTask({ id: 1 });
   const { chain, calls } = fakeChain({}, { voidTask: refused });
