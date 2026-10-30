@@ -899,6 +899,71 @@ test("a_request_that_failed_counts_against_the_hour_and_a_task_that_was_declined
   expect(lines).toHaveLength(1);
 });
 
+test("the_solver_says_it_is_not_available_while_the_hour_is_full_and_asking_takes_nothing", async () => {
+  const start = 5_000_000;
+  let clock = start;
+  const at = (minutes: number) => {
+    clock = start + minutes * MINUTE;
+  };
+  const lines: string[] = [];
+  const { llm, solver } = await setUp(ANSWER, {
+    maxCallsPerHour: 2,
+    now: () => clock,
+    log: (line) => lines.push(line),
+  });
+  const available = () => solver.available?.();
+  const answered = async () => (await solver.solve(regexTask())) !== null;
+
+  // Asking takes no request of the hour: ask as often as you like, and both are still there.
+  at(0);
+  for (let asked = 0; asked < 5; asked += 1) expect(available()).toBe(true);
+  expect(await answered()).toBe(true);
+  at(1);
+  expect(available()).toBe(true);
+  expect(await answered()).toBe(true);
+  expect(llm.requests).toHaveLength(2);
+  expect(lines).toEqual([]);
+
+  // The hour is full. The runner stops calling `solve` then, so this is where the warning comes
+  // from, once: with the limit and the wait, and without the model's name, its key or its address.
+  at(2);
+  expect(available()).toBe(false);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toMatch(/^WARN llm solver: the limit of 2 model calls an hour is reached/);
+  expect(lines[0]).toContain("for 58 more min");
+  for (const secret of [KEY, llm.baseUrl, MODEL]) expect(lines[0]).not.toContain(secret);
+  // Neither asking again nor a `solve` all the same warns a second time, or makes a request.
+  at(30);
+  expect(available()).toBe(false);
+  expect(await answered()).toBe(false);
+  at(59);
+  expect(available()).toBe(false);
+  expect(lines).toHaveLength(1);
+  expect(llm.requests).toHaveLength(2);
+
+  // A request counts until an hour after it was made. At 60 the first is an hour old and the
+  // second is not: one is free, and no more.
+  at(60);
+  expect(available()).toBe(true);
+  expect(available()).toBe(true);
+  expect(await answered()).toBe(true);
+  expect(available()).toBe(false);
+  expect(llm.requests).toHaveLength(3);
+  expect(lines).toHaveLength(1);
+  at(61);
+  expect(available()).toBe(true);
+  expect(await answered()).toBe(true);
+
+  // At 62 the hour is full again and it is an hour since the warning: warned again, once, by
+  // whichever of the two notices first.
+  at(62);
+  expect(await answered()).toBe(false);
+  expect(available()).toBe(false);
+  expect(lines).toHaveLength(2);
+  expect(lines[1]).toContain("for 58 more min");
+  expect(llm.requests).toHaveLength(4);
+});
+
 test("two_questions_at_once_cannot_both_take_the_last_request_of_the_hour", async () => {
   const lines: string[] = [];
   const { llm, solver } = await setUp(ANSWER, {

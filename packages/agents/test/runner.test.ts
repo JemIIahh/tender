@@ -504,6 +504,93 @@ test("a_model_solver_is_asked_after_start", async () => {
   );
 });
 
+// A solver that is at its limit (the model solver, when its hour's requests are used up) says so
+// with `available`. The task it cannot take is left as it is, and is entered once the solver can.
+test("a_solver_that_is_not_available_leaves_a_task_unannounced_and_unseen_until_it_is", async () => {
+  for (const scripted of [false, true]) {
+    const what = `scripted ${scripted}`;
+    const h = await harness(undefined, { scripted });
+    let room = false;
+    h.solver.available = () => room;
+    h.world.add({ id: 7 });
+
+    await h.tick();
+    await h.tick();
+
+    // The task costs nothing while the solver is full: it is not announced, not asked, not even
+    // looked up, and the run does not remember it as turned down.
+    expect(h.start, what).not.toHaveBeenCalled();
+    expect(h.solve, what).not.toHaveBeenCalled();
+    expect(h.getTask, what).not.toHaveBeenCalled();
+    expect(h.storage, what).not.toHaveBeenCalled();
+    expect(h.commit, what).not.toHaveBeenCalled();
+    expect(h.memory.seen.has("7"), what).toBe(false);
+    expect(h.logs, what).toEqual([]);
+
+    // Room again: the next tick enters the task as if it had only just been listed.
+    room = true;
+    await h.tick();
+    expect(idsOf(h.start), what).toEqual([7n]);
+    expect(h.solve, what).toHaveBeenCalledTimes(1);
+    expect(idsOf(h.commit), what).toEqual([7n]);
+    expect(h.logs, what).toContain("alice: committed to task 7 tx=commit-tx");
+  }
+});
+
+test("a_solver_is_asked_before_every_task_so_one_that_fills_up_mid_tick_leaves_the_rest", async () => {
+  const h = await harness(undefined, { scripted: false });
+  // One request is left, and the solver uses it for the first task it is given.
+  let room = 1;
+  h.solver.available = () => room > 0;
+  h.solve.mockImplementation(async () => {
+    room -= 1;
+    return ANSWER;
+  });
+  // The listing is newest first: 9, 8, 7.
+  for (const id of [7, 8, 9]) h.world.add({ id });
+
+  await h.tick();
+
+  expect(idsOf(h.start)).toEqual([9n]);
+  expect(idsOf(h.commit)).toEqual([9n]);
+  expect(h.memory.seen.has("8")).toBe(false);
+  expect(h.memory.seen.has("7")).toBe(false);
+
+  // A request is free again: the next task in line goes, and the one after it waits its turn.
+  room = 1;
+  await h.tick();
+  expect(idsOf(h.start)).toEqual([8n, 9n]);
+  expect(idsOf(h.commit)).toEqual([8n, 9n]);
+  expect(h.solve).toHaveBeenCalledTimes(2);
+  expect(h.memory.seen.has("7")).toBe(false);
+
+  // And a solver that never says it is full is never held back.
+  room = Number.POSITIVE_INFINITY;
+  await h.tick();
+  expect(idsOf(h.commit)).toEqual([7n, 8n, 9n]);
+});
+
+test("a_solver_whose_availability_check_throws_leaves_the_task_as_it_is_and_the_error_is_logged", async () => {
+  const h = await harness(undefined, { scripted: false });
+  let broken = true;
+  h.solver.available = () => {
+    if (broken) throw new TypeError("https://rpc.example/?apikey=SECRET");
+    return true;
+  };
+  h.world.add({ id: 7 });
+
+  await h.tick();
+
+  // Named by its type and never quoted (P03-R16); the task was neither announced nor given up on.
+  expect(h.logs).toEqual(["ERROR alice: task 7 failed (TypeError)"]);
+  expect(h.start).not.toHaveBeenCalled();
+  expect(h.memory.seen.has("7")).toBe(false);
+
+  broken = false;
+  await h.tick();
+  expect(idsOf(h.commit)).toEqual([7n]);
+});
+
 test("a_scripted_task_whose_start_fails_is_asked_again_next_tick", async () => {
   const h = await harness();
   h.world.add({ id: 7 });

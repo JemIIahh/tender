@@ -17,9 +17,11 @@ import { answerLimit, canAnswer, checkAnswer, entryOf } from "./shape";
 //   failing task cannot cost a model call every tick, and a retry here would ask twice.
 // - At most `maxCallsPerHour` requests in any hour, 30 unless told otherwise. The key's credits are
 //   money, and every open task of an agent's tags costs a call, so a poster who opens many tasks
-//   would spend them. Over the limit the solver makes no request and gives no answer (null), and
-//   warns once an hour. A request counts when it is made, also when it fails or runs out of time (the
-//   model may have charged for it); a task declined before it is asked does not.
+//   would spend them. Over the limit the solver says it is not available (`available`), so that the
+//   runner leaves a task alone, unannounced, until a request is an hour old; asked to solve one
+//   anyway it makes no request and gives no answer (null). It warns once an hour. A request counts
+//   when it is made, also when it fails or runs out of time (the model may have charged for it); a
+//   task declined before it is asked does not.
 // - The prompt holds the task and nothing else: the brief's words, the answer format and its limit,
 //   and the public criteria with their examples. It holds no key, no variable of the environment,
 //   no account, no hash and no URL of the task's own record.
@@ -66,9 +68,10 @@ export interface LlmSolverOptions {
    */
   timeoutMs?: number;
   /**
-   * The most requests to the model in any hour, a whole number from 1. A task that would be over it
-   * gets no request and no answer (null). An hour slides: a request counts until an hour after it
-   * was made, whether it worked or not. Default: 30.
+   * The most requests to the model in any hour, a whole number from 1. At the limit the solver is
+   * not available (`Solver.available`), and a task it is asked to solve all the same gets no request
+   * and no answer (null). An hour slides: a request counts until an hour after it was made, whether
+   * it worked or not. Default: 30.
    */
   maxCallsPerHour?: number;
   /** Receives the solver's warnings, one line each. Default: `console.log`, as the runner's. */
@@ -240,6 +243,7 @@ function isHttpUrl(value: string): boolean {
  * `solve` returns the answer as bytes, or null when the task is one it cannot answer (`canAnswer`),
  * or too large to send, or the hour's requests are used up (`maxCallsPerHour`), or the model's reply
  * is no answer in the brief's format (`checkAnswer`). It throws an `LlmError` when the call fails.
+ * `available` says whether the hour has a request left, and takes none.
  */
 export function createLlmSolver(o: LlmSolverOptions): Solver {
   const timeoutMs = o.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -290,28 +294,34 @@ export function createLlmSolver(o: LlmSolverOptions): Solver {
   let warnedAt: number | undefined;
 
   /**
-   * Takes one of the hour's requests if one is left, and says whether it did. The hour slides, so
-   * that no hour at all holds more than `maxCalls` requests; a fixed grid of hours would let twice as
-   * many through round the edge between two. The count and the taking are one step with no wait in
-   * it, so two questions at once cannot both take the last one. At the limit it warns, once an hour.
+   * Whether the hour has a request left at `at`, without taking it. The hour slides, so that no hour
+   * at all holds more than `maxCalls` requests; a fixed grid of hours would let twice as many
+   * through round the edge between two. At the limit it warns, once an hour, whoever asks.
    */
-  function takeCall(): boolean {
-    const at = now();
+  function hasRoom(at: number): boolean {
     const live = calls.findIndex((made) => made > at - HOUR_MS);
     calls.splice(0, live === -1 ? calls.length : live);
-    if (calls.length < maxCalls) {
-      calls.push(at);
-      return true;
-    }
+    if (calls.length < maxCalls) return true;
     if (warnedAt === undefined || at - warnedAt >= HOUR_MS) {
       warnedAt = at;
       const minutes = Math.max(1, Math.ceil(((calls[0] ?? at) + HOUR_MS - at) / 60_000));
       log(
-        `WARN llm solver: the limit of ${maxCalls} model calls an hour is reached, so it asks ` +
-          `the model nothing and answers no task for ${minutes} more min`,
+        `WARN llm solver: the limit of ${maxCalls} model calls an hour is reached, so it takes ` +
+          `on no task for ${minutes} more min`,
       );
     }
     return false;
+  }
+
+  /**
+   * Takes one of the hour's requests if one is left, and says whether it did. The count and the
+   * taking are one step with no wait in it, so two questions at once cannot both take the last one.
+   */
+  function takeCall(): boolean {
+    const at = now();
+    if (!hasRoom(at)) return false;
+    calls.push(at);
+    return true;
   }
 
   /** What a failed call is called: the cause, and nothing that the call was made with. */
@@ -356,6 +366,9 @@ export function createLlmSolver(o: LlmSolverOptions): Solver {
   return {
     name: "llm",
     scripted: false,
+    // The runner asks before it announces a task, so that a task the solver cannot ask the model
+    // about is left for a later tick and not announced and then dropped. It takes no request.
+    available: () => hasRoom(now()),
     async solve(ctx) {
       if (!canAnswer(ctx.brief, ctx.criteria)) return null;
       const prompt = buildPrompt(ctx);
