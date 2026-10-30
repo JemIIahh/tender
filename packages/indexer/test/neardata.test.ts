@@ -324,12 +324,15 @@ function seeded(seed: number): () => number {
   };
 }
 
-/** Serves every height up to `last` after a random delay, and watches how many are in flight. */
-function slowChain(last: number, seed: number) {
+/**
+ * Serves every height up to `last` after a random delay, and watches how many are in flight.
+ * `nullOnce`, if given, is a height that has a block but answers null the first time it is asked.
+ */
+function slowChain(last: number, seed: number, nullOnce?: number) {
   const random = seeded(seed);
   const answered: number[] = [];
   const watch = { inFlight: 0, peak: 0 };
-  const server = fakeServer(async ({ path }) => {
+  const server = fakeServer(async ({ path, n }) => {
     if (path === FINAL) return json(chainBlock(last));
     const height = heightOf(path);
     watch.inFlight += 1;
@@ -337,7 +340,7 @@ function slowChain(last: number, seed: number) {
     await new Promise((resolve) => setTimeout(resolve, random() * 20));
     watch.inFlight -= 1;
     answered.push(height);
-    return json(chainBlock(height));
+    return json(height === nullOnce && n === 1 ? null : chainBlock(height));
   });
   return { server, answered, watch };
 }
@@ -365,6 +368,20 @@ test("concurrency_caps_requests_in_flight", async () => {
 
     expect(heightsOf(got)).toEqual(range(500, 539));
     expect(watch.peak).toBe(concurrency);
+  }
+});
+
+test("concurrency_caps_requests_in_flight_during_a_refetch", async () => {
+  // The same, with 520 answering null the first time. Fetching it again, when 521 names it, is one
+  // request more: it has to take the place of one the window would have started, not come on top.
+  for (const concurrency of [1, 2, 3, 12]) {
+    const { server, watch } = slowChain(539, concurrency, 520);
+
+    const got = await take(source(server, { concurrency }), 500n, 40);
+
+    expect(heightsOf(got), `concurrency ${concurrency}`).toEqual(range(500, 539));
+    expect(server.count(blockPath(520)), `concurrency ${concurrency}: 520 asked twice`).toBe(2);
+    expect(watch.peak, `concurrency ${concurrency}`).toBe(concurrency);
   }
 });
 
@@ -398,6 +415,9 @@ test("a_genuinely_skipped_height_still_skips", async () => {
     ["the first several heights", 10, 13, [10, 11], [12, 13]],
     ["several in a row", 10, 16, [12, 13, 14], [10, 11, 15, 16]],
     ["every other height", 10, 14, [11, 13], [10, 12, 14]],
+    // The run starts after a gap: 8 and 9 are never asked for, but the first block names 7. That
+    // is below `fromHeight - 1`, and is no cause for a warning, as nothing was yielded before it.
+    ["a gap before the start", 10, 12, [8, 9], [10, 11, 12]],
   ];
   for (const [name, from, final, skipped, yielded] of cases) {
     fakeClock();
@@ -505,6 +525,34 @@ test("null_for_an_existing_height_is_refetched", async () => {
   await finished;
 });
 
+test("two_null_heights_in_a_row_are_both_refetched", async () => {
+  fakeClock();
+  const lines: string[] = [];
+  // 11 and 12 both have a block and both answer null the first time. 13 names 12, and 12 names 11,
+  // so the way back from 13 is two parents long, and the second one is found only by the block
+  // that was fetched for the first.
+  const server = fakeServer(({ path, n }) => {
+    if (path === FINAL) return json(chainBlock(13));
+    const height = heightOf(path);
+    return (height === 11 || height === 12) && n === 1 ? json(null) : json(chainBlock(height));
+  });
+  const src = source(server, { log: (line) => lines.push(line) });
+  const { ctrl, heights, finished } = run(src, 10n);
+
+  await settle();
+
+  expect(heights).toEqual([10, 11, 12, 13]);
+  expect(server.count(blockPath(11))).toBe(2);
+  expect(server.count(blockPath(12))).toBe(2);
+  expect(server.blockRequests()).toBe(6);
+  expect(lines).toHaveLength(2);
+  expect(lines[0]).toMatch(/block 13.*block 12/);
+  expect(lines[1]).toMatch(/block 12.*block 11/);
+
+  ctrl.abort();
+  await finished;
+});
+
 test("first_block_checked_against_from_height", async () => {
   fakeClock();
   // Nothing was yielded yet to check the first block against, so its parent is checked against
@@ -588,6 +636,32 @@ test("a_null_at_the_tip_is_refetched_when_the_next_block_arrives", async () => {
   expect(heights).toEqual([10, 11, 12, 13]);
   expect(server.count(blockPath(12))).toBe(2);
   expect(server.count(blockPath(13))).toBe(1);
+
+  ctrl.abort();
+  await finished;
+});
+
+test("a_block_naming_a_parent_below_the_last_one_yielded_is_yielded_and_warned_about", async () => {
+  fakeClock();
+  const lines: string[] = [];
+  // 11 names 9 as its parent, although 10 was yielded just before it, so 10 is no ancestor of 11:
+  // a fork, or a server that disagrees with itself. The source cannot tell which is right, and
+  // does not stop for it: the block comes, and the log is told.
+  const server = fakeServer(({ path }) => {
+    if (path === FINAL) return json(chainBlock(12));
+    const height = heightOf(path);
+    return json(height === 11 ? chainBlock(11, { prev: 9 }) : chainBlock(height));
+  });
+  const src = source(server, { log: (line) => lines.push(line) });
+  const { ctrl, heights, finished } = run(src, 10n);
+
+  await settle();
+
+  expect(heights).toEqual([10, 11, 12]);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toMatch(/WARN.*block 11.*block 9.*block 10/);
+  // Nothing was fetched again, and 12, which names 11, is as it should be.
+  expect(server.blockRequests()).toBe(3);
 
   ctrl.abort();
   await finished;
@@ -875,6 +949,50 @@ test("stops_on_abort_while_waiting_to_poll", async () => {
   expect(vi.getTimerCount()).toBe(0);
 });
 
+test("stops_on_abort_during_a_refetch", async () => {
+  // 12 answered null the first time, so 13 (held, with 14 and 15 fetched behind it) sends the
+  // source back for it. The abort comes while that second request is in flight, or while it waits
+  // to be made a third time.
+  const cases: Array<
+    [
+      name: string,
+      reply: (signal: AbortSignal) => Response | Promise<Response>,
+      cancelled: string[],
+    ]
+  > = [
+    ["in flight", hang, [blockPath(12)]],
+    ["waiting to retry", () => json(null), []],
+  ];
+  for (const [name, reply, cancelled] of cases) {
+    fakeClock();
+    const gaveUp: string[] = [];
+    const server = fakeServer(({ path, n, signal }) => {
+      if (path === FINAL) return json(chainBlock(15));
+      const height = heightOf(path);
+      if (height !== 12) return json(chainBlock(height));
+      if (n === 1) return json(null);
+      signal.addEventListener("abort", () => gaveUp.push(path), { once: true });
+      return reply(signal);
+    });
+    const { ctrl, heights, finished } = run(source(server), 10n);
+    await settle();
+    expect(heights, name).toEqual([10, 11]);
+    expect(server.count(blockPath(12)), `${name}: 12 is being fetched again`).toBe(2);
+    expect(vi.getTimerCount(), `${name}: the 10 s limit, or the 0.5 s wait`).toBe(1);
+
+    ctrl.abort();
+    await finished; // rejects if the iteration threw
+
+    expect(gaveUp, `${name}: the request is cancelled`).toEqual(cancelled);
+    expect(vi.getTimerCount(), `${name}: no timer is left`).toBe(0);
+    const requests = server.calls.length;
+    await tick(60_000);
+    expect(server.calls.length, `${name}: nothing is asked for afterwards`).toBe(requests);
+    expect(heights, `${name}: the held blocks are not delivered`).toEqual([10, 11]);
+    vi.useRealTimers();
+  }
+});
+
 test("stops_between_blocks_even_when_more_are_ready", async () => {
   const server = fakeServer(({ path }) =>
     json(path === FINAL ? chainBlock(20) : chainBlock(heightOf(path))),
@@ -888,6 +1006,28 @@ test("stops_between_blocks_even_when_more_are_ready", async () => {
   }
 
   expect(got).toEqual([10]);
+  const requests = server.calls.length;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(server.calls.length).toBe(requests);
+});
+
+test("stops_between_the_blocks_of_a_walk_back", async () => {
+  // 12 answered null the first time, so 13 is held while 12 is fetched again, and the two are
+  // yielded one after the other. The caller aborts when it has 12: 13 is fetched, not delivered.
+  const server = fakeServer(({ path, n }) => {
+    if (path === FINAL) return json(chainBlock(16));
+    const height = heightOf(path);
+    return height === 12 && n === 1 ? json(null) : json(chainBlock(height));
+  });
+  const ctrl = new AbortController();
+  const got: number[] = [];
+
+  for await (const block of source(server).blocks(10n, ctrl.signal)) {
+    got.push(Number(block.height));
+    if (block.height === 12n) ctrl.abort();
+  }
+
+  expect(got).toEqual([10, 11, 12]);
   const requests = server.calls.length;
   await new Promise((resolve) => setTimeout(resolve, 50));
   expect(server.calls.length).toBe(requests);
