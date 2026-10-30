@@ -78,6 +78,18 @@ export interface ScoringLimits {
   compileBudgetMs?: number;
 }
 
+/**
+ * What a running Judge keeps between its ticks, in memory only, and never an entry's bytes.
+ * `startJudge` makes one; a call made without one keeps nothing.
+ */
+export interface JudgeMemory {
+  /**
+   * What the criteria check (`checkJsonSchemaUsable`, run in a worker) came to, by criteria hash
+   * and budget: a task that waits, or is judged again, does not start a worker for it each tick.
+   */
+  checks: Map<string, { ok: true } | { ok: false; reason: string }>;
+}
+
 /** Everything the Judge needs. Nothing in it reads the environment: the caller resolves that. */
 export interface JudgeDeps {
   db: Db;
@@ -109,4 +121,6 @@ export interface JudgeDeps {
   fetchIo?: FetchIo;
   /** Shorter time limits for scoring, for tests (see `ScoringLimits`). */
   scoringLimits?: ScoringLimits;
+  /** What the Judge keeps between ticks (see `JudgeMemory`). */
+  memory?: JudgeMemory;
 }

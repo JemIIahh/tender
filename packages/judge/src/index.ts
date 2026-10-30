@@ -4,7 +4,7 @@ export { judgeTask } from "./judge";
 export { scoreExact } from "./kinds/exact";
 export { checkJsonSchemaUsable, scoreJsonSchema } from "./kinds/json_schema";
 export { scoreRegexCases } from "./kinds/regex_cases";
-export { judgeTick, startJudge } from "./loop";
+export { judgeTick, newJudgeMemory, startJudge } from "./loop";
 export { chooseWinners, rankEntries, type ScoredEntry } from "./rank";
 export { type ScoreInput, ScorerUnavailableError, scoreEntry } from "./score";
 export { buildScorecard } from "./scorecard";
@@ -13,6 +13,7 @@ export type {
   FetchIo,
   JudgeChain,
   JudgeDeps,
+  JudgeMemory,
   ScoringLimits,
   TransportInit,
 } from "./types";

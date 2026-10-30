@@ -9,10 +9,10 @@ import {
   sha256Hex,
   type TaskView,
 } from "@tender/shared";
-import { checkJsonSchemaIsolated } from "./isolate";
+import { COMPILE_BUDGET_MS, checkJsonSchemaIsolated } from "./isolate";
 import { ScorerUnavailableError } from "./score";
 import { clampReason } from "./scorecard";
-import type { JudgeDeps } from "./types";
+import type { JudgeDeps, JudgeMemory } from "./types";
 
 /** The criteria the Judge can score in P0: `exact`, `json_schema` and `regex_cases`. */
 export type P0Criteria = Extract<PublicCriteria, { kind: "exact" | "json_schema" | "regex_cases" }>;
@@ -35,7 +35,7 @@ export type DocumentsCheck =
       ok: false;
       status: "pending" | "rejected";
       reason: string;
-      /** Set when the criteria failed `criteriaProblem`, the check of what a schema may do. */
+      /** Set when the criteria failed the criteria check (`shapeProblem`, `compileProblem`). */
       criteriaCheck?: true;
     };
 
@@ -63,6 +63,8 @@ interface Policy {
    * default. Judging passes 4 times intake's.
    */
   compileBudgetMs?: number;
+  /** Where the outcomes of the compile check are kept, by criteria hash and budget, if anywhere. */
+  checks?: JudgeMemory["checks"];
 }
 
 /** The most bytes a criteria or held-out document may have: what the blob store takes at once. */
@@ -155,7 +157,9 @@ const CHECK_FAILED = "criteria could not be checked";
  *
  * Held-out checks that are not stored yet leave the task `pending` (`waiting for held-out
  * checks`) for 10 minutes from its `created_at`, and then it is `rejected` (`held-out checks
- * missing`). Anything that throws while the documents are checked, a RangeError included,
+ * missing`). While it waits, the schema's compile check, which needs a worker, is not run yet,
+ * and the reasons that come after it are not given: the cheap checks before it are. Anything that
+ * throws while the documents are checked, a RangeError included,
  * rejects the task with a fixed reason, and so does a check that crashes its worker. A database
  * error is thrown instead, and so is a worker that cannot be started (`ScorerUnavailableError`):
  * neither says anything about the task, and the next tick tries again. Every reason is at most 200
@@ -181,6 +185,7 @@ export async function intakeTask(
     nowNs,
     waitForHeldout: true,
     compileBudgetMs: deps.scoringLimits?.compileBudgetMs,
+    checks: deps.memory?.checks,
   });
   const [status, reason] = checked.ok
     ? (["accepted", null] as const)
@@ -199,11 +204,12 @@ export async function intakeTask(
  * them as `intakeTask` does. Judging reads them again with this, from the hashes the chain holds,
  * so a task whose held-out checks turn out to be used by an earlier task of its poster (one the
  * indexer stored late) fails closed instead of being judged with answers that may be out, and
- * criteria that fail `criteriaProblem` now, under rules newer than the task's intake, are not
+ * criteria that fail the criteria check now, under rules newer than the task's intake, are not
  * scored: such a result has `criteriaCheck` set.
  *
  * With `waitForHeldout`, held-out checks that are not stored yet make the task `pending` for 10
- * minutes from its `created_at`. Without it they are missing at once. A database error is thrown,
+ * minutes from its `created_at`, and the compile part of the criteria check waits for them: a
+ * pending task starts no worker. Without it they are missing at once. A database error is thrown,
  * and so is `ScorerUnavailableError` when the worker of the schema check cannot be started;
  * anything else that goes wrong is a `rejected` result with its reason.
  */
@@ -282,13 +288,25 @@ async function checkDocuments(
   }
   let problem: string | null;
   try {
-    problem = await criteriaProblem(criteria, policy.compileBudgetMs);
+    problem = shapeProblem(criteria);
+  } catch {
+    problem = CHECK_FAILED;
+  }
+  if (problem !== null) return criteriaRefused(problem);
+  // A task whose held-out checks have not come yet waits before anything costs a worker: its
+  // poster has 10 minutes from posting to send them.
+  const waited = policy.nowNs - BigInt(task.created_at);
+  const stillComing = policy.waitForHeldout && waited < HELDOUT_WAIT_NS;
+  if (task.heldout_commitment !== null && heldoutBlob === null && stillComing) {
+    return { ok: false, status: "pending", reason: HELDOUT_WAITING };
+  }
+  try {
+    problem = await compileProblem(criteria, task.criteria_hash, policy);
   } catch (error) {
     if (error instanceof ScorerUnavailableError) throw error;
     problem = CHECK_FAILED;
   }
-  if (problem !== null)
-    return { ok: false, status: "rejected", reason: problem, criteriaCheck: true };
+  if (problem !== null) return criteriaRefused(problem);
   if (task.heldout_commitment === null) return { ok: true, documents: { criteria, heldout: null } };
 
   // Held-out checks are single-use. The Judge publishes them when it judges the first of the
@@ -297,13 +315,8 @@ async function checkDocuments(
   if (stored.earlierUse !== null) {
     return rejected(`held-out checks already used by task ${stored.earlierUse}`);
   }
-  if (heldoutBlob === null) {
-    const waited = policy.nowNs - BigInt(task.created_at);
-    if (policy.waitForHeldout && waited < HELDOUT_WAIT_NS) {
-      return { ok: false, status: "pending", reason: HELDOUT_WAITING };
-    }
-    return rejected(HELDOUT_MISSING);
-  }
+  // Their 10 minutes are over, or this is judging, which does not wait.
+  if (heldoutBlob === null) return rejected(HELDOUT_MISSING);
   // Blobs are content-addressed and the first upload of some bytes decides their kind and
   // uploader. Checks that someone else stored first can never become the poster's.
   if (heldoutBlob.kind !== "heldout" || heldoutBlob.uploader !== task.poster) {
@@ -334,25 +347,45 @@ function rejected(reason: string): DocumentsCheck {
   return { ok: false, status: "rejected", reason };
 }
 
+/** Criteria that fail the criteria check (`shapeProblem`, `compileProblem`), for `reason`. */
+function criteriaRefused(reason: string): DocumentsCheck {
+  return { ok: false, status: "rejected", reason, criteriaCheck: true };
+}
+
 /**
- * Why the schema of `criteria` cannot be used, or `null`: what it may name and refer to
- * (`referenceProblem`: `$id`, references, dynamic references), and then whether Ajv compiles and
- * runs it (`checkJsonSchemaUsable`), in a worker within `compileBudgetMs` (2 s by default:
- * `checkJsonSchemaIsolated`). Only `json_schema` criteria have a schema. Intake runs it, and
- * judging runs it again through `loadDocuments` before any entry is scored (P05-R12), so that a
- * task accepted under an older rule is not scored under a check it no longer passes. The check is
- * the same; judging only gives the compile 4 times intake's time, so that criteria that compiled
- * in time at intake are not refused because the machine is busier. It rejects when the check
- * crashes its worker, and with `ScorerUnavailableError` when the worker cannot be started.
+ * The criteria check, in two parts: why the schema of `criteria` cannot be used, or `null`. This
+ * part is what it may name and refer to (`referenceProblem`: `$id`, references, dynamic
+ * references), checked on this thread; `compileProblem` is the other. Only `json_schema` criteria
+ * have a schema. Intake runs the check, and judging runs it again through `loadDocuments` before
+ * any entry is scored (P05-R12), so that a task accepted under an older rule is not scored under a
+ * check it no longer passes.
  */
-async function criteriaProblem(
+function shapeProblem(criteria: P0Criteria): string | null {
+  return criteria.kind === "json_schema" ? referenceProblem(criteria.schema) : null;
+}
+
+/**
+ * The criteria check's other part: whether Ajv compiles and runs the schema
+ * (`checkJsonSchemaUsable`), in a worker within `policy.compileBudgetMs` (2 s by default:
+ * `checkJsonSchemaIsolated`). Judging gives the compile 4 times intake's time, so that criteria that
+ * compiled in time at intake are not refused because the machine is busier. The outcome is kept in
+ * `policy.checks` by criteria hash and budget, and taken from there the next time: the check is
+ * the same, and so is what comes of it. It rejects when the check crashes its worker, and with
+ * `ScorerUnavailableError` when the worker cannot be started; neither is kept.
+ */
+async function compileProblem(
   criteria: P0Criteria,
-  compileBudgetMs: number | undefined,
+  criteriaHash: string,
+  policy: Policy,
 ): Promise<string | null> {
   if (criteria.kind !== "json_schema") return null;
-  const reference = referenceProblem(criteria.schema);
-  if (reference !== null) return reference;
-  const usable = await checkJsonSchemaIsolated(criteria.schema, { budgetMs: compileBudgetMs });
+  const budgetMs = policy.compileBudgetMs ?? COMPILE_BUDGET_MS;
+  const key = `${criteriaHash} ${budgetMs}`;
+  let usable = policy.checks?.get(key);
+  if (usable === undefined) {
+    usable = await checkJsonSchemaIsolated(criteria.schema, { budgetMs });
+    policy.checks?.set(key, usable);
+  }
   return usable.ok ? null : clampReason(usable.reason);
 }
 

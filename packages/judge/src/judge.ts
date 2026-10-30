@@ -114,6 +114,15 @@ export async function judgeTask(
   const row = await judgeRowOf(deps, taskId);
   if (row?.judge_status !== "accepted") return "skipped";
 
+  // Publishing the held-out checks hands out the answers of another task of the poster's that
+  // commits to them, so while one still takes reveals, this task may wait. Asked first, so that a
+  // task that waits costs little (no documents are read, and no worker is started for the
+  // criteria check), and again just before publishing: the indexer may store such a task while
+  // this one is judged.
+  const sharing = await sharingTaskStillRevealing(deps.db, task, nowNs);
+  if (sharing !== null) return waitFor(deps, taskId, sharing);
+  if (row.judge_reason?.startsWith(WAITING) === true) await stopWaiting(deps, taskId);
+
   const compileBudgetMs =
     JUDGING_COMPILE_BUDGET_FACTOR * (deps.scoringLimits?.compileBudgetMs ?? COMPILE_BUDGET_MS);
   const loaded = await loadDocuments(deps.db, task, {
@@ -121,6 +130,7 @@ export async function judgeTask(
     nowNs,
     waitForHeldout: false,
     compileBudgetMs,
+    checks: deps.memory?.checks,
   });
   if (!loaded.ok) {
     // P05-R12: criteria that fail the check intake runs, run again now, are refused as intake
@@ -129,13 +139,6 @@ export async function judgeTask(
     return refuse(deps, taskId, status, loaded.reason);
   }
   const { criteria, heldout } = loaded.documents;
-  // Publishing the held-out checks hands out the answers of another task of the poster's that
-  // commits to them, so while one still takes reveals, this task may wait. Asked here, so that a
-  // task that waits costs little, and again just before publishing: the indexer may store such
-  // a task while this one is judged.
-  const sharing = await sharingTaskStillRevealing(deps.db, task, nowNs);
-  if (sharing !== null) return waitFor(deps, taskId, sharing);
-  if (row.judge_reason?.startsWith(WAITING) === true) await stopWaiting(deps, taskId);
 
   const revealed = (await deps.client.getAllEntries(taskId)).filter(isRevealed);
   const scorer = openTaskScorer(
@@ -262,7 +265,9 @@ interface Judged {
  * time left, and one that the line cuts short is let go. The line is drawn from the task's own
  * deadlines, as P05-R8's wait can leave judging only the second half of the window. An entry not
  * scored by then scores 0 and does not pass, and the scorecard says why: `not scored before the
- * pick deadline`. A fetch or a score that fails within its own limit is that entry's, as before.
+ * pick deadline`, unless its content was scored already, for an entry before it: that costs
+ * nothing, and it shares the score, past the line too. A fetch or a score that fails within its
+ * own limit is that entry's, as before.
  *
  * It throws what `resultUploaded` and the database throw, and `ScorerUnavailableError`.
  */
@@ -289,10 +294,13 @@ async function judgeEntries(
   for (const [group, perBatch] of groups) {
     for (let first = 0; first < group.length; first += perBatch) {
       const batch = group.slice(first, first + perBatch);
-      const going = leftMs() > 0 && !judging.late && judging.rejected === null;
-      const scores = going
-        ? await judgeBatch(deps, BigInt(task.id), batch, scorer, judging, leftMs, nowNs)
-        : [];
+      let scores: (EntryScore | undefined)[] = [];
+      if (judging.rejected === null) {
+        scores =
+          leftMs() > 0 && !judging.late
+            ? await judgeBatch(deps, BigInt(task.id), batch, scorer, judging, leftMs, nowNs)
+            : await knownScores(deps, BigInt(task.id), batch, judging.results, nowNs);
+      }
       batch.forEach((entry, i) => {
         const score = scores[i];
         if (score === undefined) judged.unscored++;
@@ -375,6 +383,25 @@ async function judgeBatch(
   return batch.map((entry, i) =>
     allowed[i] === true ? results.get(contentKey(entry)) : zero(NOT_UPLOADED),
   );
+}
+
+/**
+ * The scores of a batch that judging no longer works on, as the stop line has passed: an entry
+ * whose content was scored or turned away already shares that, which costs no fetch and no score,
+ * once its entrant may use it (`mayUse`). The rest have none.
+ */
+async function knownScores(
+  deps: JudgeDeps,
+  taskId: bigint,
+  batch: readonly RevealedEntry[],
+  results: Map<string, EntryScore>,
+  nowNs: bigint,
+): Promise<(EntryScore | undefined)[]> {
+  return inParallel(batch, FETCHES_AT_ONCE, async (entry) => {
+    const known = results.get(contentKey(entry));
+    if (known === undefined) return undefined;
+    return (await mayUse(deps, taskId, entry, nowNs)) ? known : zero(NOT_UPLOADED);
+  });
 }
 
 /**

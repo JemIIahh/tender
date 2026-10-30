@@ -1,7 +1,7 @@
 import { phaseAt } from "@tender/shared";
 import { intakeTask } from "./intake";
 import { clearStaleWaits, describeError, judgeTask } from "./judge";
-import type { JudgeDeps } from "./types";
+import type { JudgeDeps, JudgeMemory } from "./types";
 
 /** How long `startJudge` waits after a tick before the next one starts, by default. */
 const DEFAULT_INTERVAL_MS = 10_000;
@@ -67,9 +67,14 @@ export async function judgeTick(deps: JudgeDeps): Promise<void> {
   await clearStaleWaits(deps, nowNs);
 }
 
+/** A memory with nothing in it yet. */
+export function newJudgeMemory(): JudgeMemory {
+  return { checks: new Map() };
+}
+
 /**
  * Runs `judgeTick` now, and again `intervalMs` (default 10 s) after each tick ends, until `signal`
- * aborts. The wait starts when a tick ends, so ticks never overlap, however long one takes. A
+ * aborts. The ticks share one `JudgeMemory`, `deps.memory` or a new one. The wait starts when a tick ends, so ticks never overlap, however long one takes. A
  * tick that throws is logged and the loop goes on.
  *
  * An abort during the wait ends the loop at once. An abort during a tick lets the tick finish
@@ -80,6 +85,7 @@ export function startJudge(
   deps: JudgeDeps & { intervalMs?: number; signal: AbortSignal },
 ): Promise<void> {
   const { intervalMs = DEFAULT_INTERVAL_MS, signal } = deps;
+  const ticked: JudgeDeps = { ...deps, memory: deps.memory ?? newJudgeMemory() };
   return new Promise<void>((resolve) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let ticking = false;
@@ -91,7 +97,7 @@ export function startJudge(
     const run = async () => {
       ticking = true;
       try {
-        await judgeTick(deps);
+        await judgeTick(ticked);
       } catch (error) {
         console.error(`judge: tick failed (${describeError(error)})`);
       }

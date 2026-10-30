@@ -277,7 +277,9 @@ export interface WorkerScorers {
 
 /**
  * The worker's side, which `score-worker.ts` runs: `job` is its `workerData`, and each request on
- * `port` is answered on it. Once it is set up it sends `ready`.
+ * `port` is answered on it. A request is `{ id, request }`, and its answer `{ id, answer }`, with
+ * the same id: the host takes any answer to another one, or to none, for a crash. Once the worker is
+ * set up it answers request 0, its start, with `ready`.
  *
  * A score job is first asked to compile the criteria (`compile`), and answers as the check does:
  * `{ ok: true }`, or `{ ok: false, reason }` when the criteria cannot be scored with, or
@@ -298,34 +300,36 @@ export function serveWorker(
     process.nextTick(() => {
       throw error;
     });
-  if (job.job === "check") {
-    port.on("message", () => port.postMessage(scorers.checkJsonSchemaUsable(job.schema)));
-  } else {
-    let prepared: PreparedScorer | undefined;
-    port.on("message", (request: unknown) => {
-      if (request === COMPILE) {
-        try {
-          prepared = scorers.prepareScorer(job.criteria, job.heldout);
-        } catch (error) {
-          if (!(error instanceof ScorerUnavailableError)) throw error;
-          port.postMessage(UNAVAILABLE);
-          return;
-        }
-        const { problem } = prepared;
-        port.postMessage(problem === null ? { ok: true } : { ok: false, reason: problem });
+  const answer = (id: number, value: unknown) => port.postMessage({ id, answer: value });
+  let prepared: PreparedScorer | undefined;
+  port.on("message", (message: unknown) => {
+    const { id, request } = message as { id: number; request: unknown };
+    if (job.job === "check") {
+      answer(id, scorers.checkJsonSchemaUsable(job.schema));
+      return;
+    }
+    if (request === COMPILE) {
+      try {
+        prepared = scorers.prepareScorer(job.criteria, job.heldout);
+      } catch (error) {
+        if (!(error instanceof ScorerUnavailableError)) throw error;
+        answer(id, UNAVAILABLE);
         return;
       }
-      if (prepared === undefined) throw new Error("an entry came before the criteria compiled");
-      prepared
-        .score(request as Uint8Array)
-        .then((result) => port.postMessage(result))
-        .catch((error: unknown) => {
-          if (error instanceof ScorerUnavailableError) port.postMessage(UNAVAILABLE);
-          else crash(error);
-        });
-    });
-  }
-  port.postMessage(READY);
+      const { problem } = prepared;
+      answer(id, problem === null ? { ok: true } : { ok: false, reason: problem });
+      return;
+    }
+    if (prepared === undefined) throw new Error("an entry came before the criteria compiled");
+    prepared
+      .score(request as Uint8Array)
+      .then((result) => answer(id, result))
+      .catch((error: unknown) => {
+        if (error instanceof ScorerUnavailableError) answer(id, UNAVAILABLE);
+        else crash(error);
+      });
+  });
+  answer(0, READY);
 }
 
 /** A score worker that did not keep to the protocol: it exited, or sent something unexpected. */
@@ -344,6 +348,10 @@ type Outcome =
 class Lane {
   /** Settles the request in flight, if there is one. */
   private waiting: ((outcome: Outcome) => void) | undefined;
+  /** The id of the request in flight, which its answer must name. */
+  private awaited: number | undefined;
+  /** The id of the last request sent. The start is request 0. */
+  private sent = 0;
   /** How the worker ended: an error, or its exit. */
   private ended: Outcome | undefined;
   private stopping: Promise<unknown> | undefined;
@@ -353,7 +361,22 @@ class Lane {
     worker.on("error", (error: unknown) => this.end({ kind: "error", error }));
     worker.on("messageerror", (error: unknown) => this.end({ kind: "error", error }));
     worker.on("exit", (code: number) => this.end({ kind: "exit", code }));
-    worker.on("message", (value: unknown) => this.waiting?.({ kind: "answer", value }));
+    worker.on("message", (message: unknown) => this.receive(message));
+  }
+
+  /**
+   * An answer to the request in flight settles it. Anything else, an answer to another request or
+   * to none, or a message that is no answer at all, is a worker that does not keep to the
+   * protocol: it is taken for a crash, of the request in flight if there is one, and stopped.
+   */
+  private receive(message: unknown): void {
+    const id = isObject(message) && Object.hasOwn(message, "answer") ? message.id : undefined;
+    if (this.waiting === undefined || id !== this.awaited) {
+      this.end({ kind: "error", error: new ScoreWorkerError("the worker answered out of turn") });
+      void this.stop();
+      return;
+    }
+    this.waiting({ kind: "answer", value: (message as { answer: unknown }).answer });
   }
 
   /**
@@ -372,12 +395,15 @@ class Lane {
         workerData: job,
         execArgv: workerExecArgv(),
         resourceLimits: RESOURCE_LIMITS,
+        // None of the Judge's environment, its keys included: the scorers need none of it, and
+        // nor does tsx's loader (its cache goes to the temporary directory an empty one gives).
+        env: {},
       });
       lane = new Lane(worker);
     } catch (error) {
       throw new ScorerUnavailableError("a score worker could not be started", { cause: error });
     }
-    const outcome = await lane.next(timeoutMs);
+    const outcome = await lane.next(0, timeoutMs);
     if (outcome.kind === "answer" && outcome.value === READY) return lane;
     await lane.stop();
     if (outcome.kind === "timeout") return "timeout";
@@ -396,10 +422,11 @@ class Lane {
    * Anything but an answer stops the worker.
    */
   ask(request: unknown, transfer: TransferListItem[], timeoutMs: number): Promise<Outcome> {
-    const outcome = this.next(timeoutMs);
+    this.sent++;
+    const outcome = this.next(this.sent, timeoutMs);
     if (this.ended === undefined) {
       try {
-        this.worker.postMessage(request, transfer);
+        this.worker.postMessage({ id: this.sent, request }, transfer);
       } catch (error) {
         this.end({ kind: "error", error });
       }
@@ -407,18 +434,20 @@ class Lane {
     return outcome;
   }
 
-  /** The next thing the worker comes to, or a timeout after `timeoutMs`. */
-  private next(timeoutMs: number): Promise<Outcome> {
+  /** What the worker comes to for request `id`, or a timeout after `timeoutMs`. */
+  private next(id: number, timeoutMs: number): Promise<Outcome> {
     if (this.ended !== undefined) return Promise.resolve(this.ended);
     return new Promise<Outcome>((resolve) => {
       const settle = (outcome: Outcome) => {
         clearTimeout(timer);
         this.waiting = undefined;
+        this.awaited = undefined;
         if (outcome.kind !== "answer") void this.stop();
         resolve(outcome);
       };
       const timer = setTimeout(() => settle({ kind: "timeout" }), timeoutMs);
       this.waiting = settle;
+      this.awaited = id;
     });
   }
 
@@ -464,6 +493,10 @@ function entryScoreOf(value: unknown, minScore: number): EntryScore | null {
     copied.push(reason);
   }
   return { score, passed, reasons: copied };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** `value` as the check's result, when it is one. Otherwise `null`. */

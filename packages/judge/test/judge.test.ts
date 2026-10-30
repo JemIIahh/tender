@@ -18,6 +18,7 @@ import {
   type JudgeChain,
   judgeTask,
   judgeTick,
+  newJudgeMemory,
   startJudge,
 } from "../src/index";
 import { checkJsonSchemaIsolated, openTaskScorer, type TaskScorer } from "../src/isolate";
@@ -1294,6 +1295,73 @@ test("a_compile_that_fails_at_judging_rejects_the_task", { timeout: 60_000 }, as
     expect(await isPublic(db, commitment)).toBe(false);
   }
   expect(warn).toHaveBeenCalledTimes(cases.length);
+});
+
+test("a_duplicate_past_the_stop_line_shares_the_score", { timeout: 60_000 }, async () => {
+  // Thirty-two answers of ours fill the first batch, and the Judge's clock passes the stop line
+  // (NOW + 9.5 minutes) while the last of them is scored. The batch after it starts past the line.
+  // One late entrant uploaded the first entrant's answer, which is scored already: sharing that
+  // costs nothing, and it gets the score, past the line too. The other sent a new one, and is not
+  // scored.
+  const answers: Answer[] = Array.from({ length: 32 }, (_, i) => [
+    `e${String(i).padStart(2, "0")}.test.near`,
+    i === 0 ? "42" : `wrong ${i}`,
+    BigInt(100 + i),
+  ]);
+  const extra: EntryView[] = [];
+  const lates: [account: string, answer: string][] = [
+    ["late1.test.near", "42"],
+    ["late2.test.near", "43"],
+  ];
+  for (const [late, answer] of lates) {
+    const sha = await putResult(db, answer, late);
+    extra.push(entry(late, sha, blobUri(sha), 200n));
+  }
+  const { chain } = await postJudged(answers, { extra });
+  let minutes = 0;
+  let scored = 0;
+  nextScorerCalls(() => {
+    scored++;
+    if (scored === 32) minutes = 9.6;
+  });
+
+  expect(await judgeTask(judgeDeps(db, chain, { now: () => at(minutes)() }), 7n)).toBe("picked");
+  const card = await picked(chain);
+  expect(card.winners).toEqual([
+    { account: "e00.test.near", bps: 7000 },
+    { account: "late1.test.near", bps: 3000 },
+  ]);
+  const late = card.scorecard.entries.filter((e) => e.account.startsWith("late"));
+  expect(late.map((e) => [e.account, e.score, e.reasons])).toEqual([
+    ["late1.test.near", 100, []],
+    ["late2.test.near", 0, ["not scored before the pick deadline"]],
+  ]);
+  expect(scored).toBe(32);
+});
+
+test("a_waiting_task_starts_no_worker_and_a_check_is_kept", { timeout: 60_000 }, async () => {
+  // A task that waits (P05-R8) reads no documents and starts no worker for the criteria check,
+  // however many ticks it waits. Once it is judged, the check's outcome is kept in the Judge's
+  // memory: when the pick fails and the task is judged again, the check is not run again.
+  const { view, chain } = await postJudged([["alice.test.near", '{"x":1}', 10n]], {
+    criteria: jsonSchemaCriteria({ type: "object" }),
+    heldout: X_IS_1,
+  });
+  await postSharing(view, "9", NOW_NS + 4n * MINUTE_NS);
+  vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  vi.mocked(checkJsonSchemaIsolated).mockClear();
+  const memory = newJudgeMemory();
+
+  for (const minutes of [0, 1, 2, 3]) {
+    const deps = judgeDeps(db, chain, { now: at(minutes), memory });
+    expect(await judgeTask(deps, 7n)).toBe("skipped");
+  }
+  expect(checkJsonSchemaIsolated).not.toHaveBeenCalled();
+
+  chain.pick.mockRejectedValueOnce(new TenderError("E_UNKNOWN", "no final outcome"));
+  expect(await judgeTask(judgeDeps(db, chain, { now: at(4), memory }), 7n)).toBe("skipped");
+  expect(await judgeTask(judgeDeps(db, chain, { now: at(4), memory }), 7n)).toBe("picked");
+  expect(checkJsonSchemaIsolated).toHaveBeenCalledTimes(1);
 });
 
 test("tasks_the_judge_was_not_late_for_are_picked_as_before", { timeout: 60_000 }, async () => {

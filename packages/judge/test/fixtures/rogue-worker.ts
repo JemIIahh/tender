@@ -13,6 +13,8 @@ import { MALFORMED } from "./malformed";
 
 // What the loops count, without end.
 const counter = { spins: 0 };
+/** How many entries this worker has been asked to score. */
+let seen = 0;
 
 /** Keeps the thread busy for `ms` milliseconds, as a slow compile does. */
 function busyFor(ms: number): void {
@@ -39,6 +41,7 @@ async function rogueScore(
   content: Uint8Array,
   score: (content: Uint8Array) => Promise<EntryScore>,
 ): Promise<EntryScore> {
+  seen++;
   const cue = new TextDecoder().decode(content);
   if (cue.startsWith("rogue:malformed:")) {
     return MALFORMED[Number(cue.slice("rogue:malformed:".length))] as never;
@@ -68,6 +71,18 @@ async function rogueScore(
       throw new ScorerUnavailableError("the scorer cannot run");
     case "rogue:exit":
       return process.exit(0);
+    case "rogue:wrong-id":
+      // An answer to a request that was never sent, before the answer to this one.
+      parentPort?.postMessage({ id: 1e9, answer: { score: 100, passed: true, reasons: [] } });
+      return score(content);
+    case "rogue:twice":
+      // The answer, and then one more message that answers nothing.
+      setTimeout(() => parentPort?.postMessage({ id: 1e9, answer: null }), 10);
+      return score(content);
+    case "rogue:seen":
+      return { score: 0, passed: false, reasons: [`${seen} seen`] };
+    case "rogue:env":
+      return { score: 0, passed: false, reasons: Object.keys(process.env) };
     default:
       return score(content);
   }

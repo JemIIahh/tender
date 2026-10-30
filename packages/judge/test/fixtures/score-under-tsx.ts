@@ -29,6 +29,8 @@ const scores = [
   await rogue.score(bytes("rogue:loop")),
   await rogue.score(bytes("rogue:recurse")),
   await rogue.score(bytes("42")),
+  // The worker's environment, which is empty.
+  await rogue.score(bytes("rogue:env")),
 ];
 const check = await checkJsonSchemaIsolated({ type: "object" });
 await judges.close();

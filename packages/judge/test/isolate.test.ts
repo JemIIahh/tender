@@ -308,6 +308,32 @@ test("the_criteria_compile_before_any_entry", { timeout: 60_000 }, async () => {
   }
 });
 
+test("an_answer_out_of_turn_is_a_crash", { timeout: 60_000 }, async () => {
+  // Each request carries an id, and its answer the same one. An answer to a request that was
+  // never sent, while one is in flight, is that one's crash. A message that comes when nothing is
+  // asked ends the worker, and the next entry gets a new one: its count starts again.
+  const onCrash = vi.fn();
+  const before = workers();
+  const scorer = openTaskScorer(EXACT_TASK, { workerUrl: ROGUE, onCrash });
+  expect(await scorer.score(bytes("rogue:wrong-id"))).toEqual(failed("scoring failed"));
+  expect(onCrash.mock.calls.map(([error]) => error.name)).toEqual(["ScoreWorkerError"]);
+  expect(await scorer.score(bytes("rogue:seen"))).toEqual(failed("1 seen"));
+  expect(await scorer.score(bytes("rogue:twice"))).toEqual(WRONG);
+  await vi.waitFor(() => expect(workers()).toBe(before), { timeout: 10_000 });
+  expect(await scorer.score(bytes("rogue:seen"))).toEqual(failed("1 seen"));
+  expect(onCrash).toHaveBeenCalledTimes(1);
+  await scorer.close();
+});
+
+test("a_worker_has_none_of_the_judges_environment", { timeout: 30_000 }, async () => {
+  // The scorers need none of it, the Judge's keys among it, and nor does tsx's loader.
+  const scorer = openTaskScorer(EXACT_TASK, { workerUrl: ROGUE });
+  expect(await scorer.score(bytes("rogue:env"))).toEqual(
+    scored({ score: 0, passed: false, reasons: [] }),
+  );
+  await scorer.close();
+});
+
 test("no_worker_is_left_after_a_task", { timeout: 60_000 }, async () => {
   const before = workers();
   const scorer = openTaskScorer(EXACT_TASK, {
@@ -343,7 +369,14 @@ test("under_tsx_the_workers_load_and_nothing_is_left_running", { timeout: 90_000
   const script = fileURLToPath(new URL("./fixtures/score-under-tsx.ts", import.meta.url));
   const { stdout } = await run(process.execPath, [cli, script], { timeout: 60_000 });
   expect(JSON.parse(stdout)).toEqual({
-    scores: [RIGHT, WRONG, failed("scoring timed out"), failed("scoring failed"), RIGHT],
+    scores: [
+      RIGHT,
+      WRONG,
+      failed("scoring timed out"),
+      failed("scoring failed"),
+      RIGHT,
+      scored({ score: 0, passed: false, reasons: [] }),
+    ],
     check: { ok: true },
     left: [],
   });
@@ -352,7 +385,7 @@ test("under_tsx_the_workers_load_and_nothing_is_left_running", { timeout: 90_000
 test("a_heavy_json_schema_entry_times_out_within_the_limit", { timeout: 60_000 }, async () => {
   // `uniqueItems` over items with no type compares every pair of them: an honest schema, and a
   // document of 256 KiB of small arrays that takes about 9 s to check here (224 KiB of them took
-  // about 5.7 s). The entry has the default 5 s.
+  // about 5.7 s). The entry has 1 s, so that the outcome does not hang on how fast the machine is.
   const items: number[][][] = [];
   for (let size = 2; size + `[[${items.length}]],`.length <= 262_144; ) {
     size += `[[${items.length}]],`.length;
@@ -360,15 +393,18 @@ test("a_heavy_json_schema_entry_times_out_within_the_limit", { timeout: 60_000 }
   }
   const heavy = bytes(JSON.stringify(items));
   expect(heavy.byteLength).toBeLessThanOrEqual(262_144);
-  const scorer = openTaskScorer({
-    criteria: jsonSchema({ type: "array", uniqueItems: true }),
-    heldout: { json_schema: { assertions: [{ path: "$[0][0][0]", equals: 0 }] } },
-  });
+  const scorer = openTaskScorer(
+    {
+      criteria: jsonSchema({ type: "array", uniqueItems: true }),
+      heldout: { json_schema: { assertions: [{ path: "$[0][0][0]", equals: 0 }] } },
+    },
+    { entryTimeoutMs: 1_000 },
+  );
   expect(await scorer.score(bytes("[[[0]],[[1]]]"))).toEqual(RIGHT);
 
   const started = performance.now();
   expect(await scorer.score(heavy)).toEqual(failed("scoring timed out"));
-  expect(performance.now() - started).toBeLessThan(5_000 + 2_500);
+  expect(performance.now() - started).toBeLessThan(1_000 + 2_500);
   await scorer.close();
 });
 

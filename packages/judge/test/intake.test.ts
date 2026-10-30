@@ -1,7 +1,7 @@
 import { type BlobKind, type Db, putBlob } from "@tender/db";
 import { canonicalJson, sha256Hex, type TaskView } from "@tender/shared";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
-import { intakeTask, ScorerUnavailableError, scoreJsonSchema } from "../src/index";
+import { intakeTask, newJudgeMemory, ScorerUnavailableError, scoreJsonSchema } from "../src/index";
 import { checkJsonSchemaIsolated } from "../src/isolate";
 import {
   at,
@@ -22,6 +22,7 @@ import {
 } from "./helpers";
 
 // The real check runs, in its worker, unless a test makes it fail with `mockRejectedValueOnce`.
+// (`mockClear` before counting calls: the mock keeps them from one test to the next.)
 vi.mock("../src/isolate", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/isolate")>();
   return { ...actual, checkJsonSchemaIsolated: vi.fn(actual.checkJsonSchemaIsolated) };
@@ -738,6 +739,52 @@ test("intake_pending_then_accepted_when_heldout_arrives", async () => {
     judge_status: "rejected",
     judge_reason: "held-out checks missing",
   });
+});
+
+test("a_pending_task_starts_no_worker_and_a_check_is_kept", { timeout: 60_000 }, async () => {
+  // While a task waits for its held-out checks, the compile part of the criteria check, which
+  // needs a worker, waits too: the checks that cost little run, and a schema they refuse is turned
+  // away at once. Once the checks are in, the compile check runs; its outcome is kept in the
+  // Judge's memory, so a second task with the same criteria does not start a worker for it.
+  vi.mocked(checkJsonSchemaIsolated).mockClear();
+  const memory = newJudgeMemory();
+  const deps = judgeDeps(db, fakeChain(null), { memory });
+  const criteriaHash = await putCriteria(db, JSON_SCHEMA);
+  const checks = [
+    { json_schema: { assertions: [{ path: "$.total", equals: 1 }] } },
+    { json_schema: { assertions: [{ path: "$.total", equals: 2 }] } },
+  ];
+  for (const [i, heldout] of checks.entries()) {
+    await insertTask(
+      db,
+      taskView({
+        id: `${i + 1}`,
+        criteria_hash: criteriaHash,
+        heldout_commitment: sha256Hex(canonicalJson(heldout)),
+        created_at: (NOW_NS - MINUTE_NS).toString(),
+      }),
+    );
+  }
+
+  for (let tick = 0; tick < 3; tick++) expect(await intakeTask(deps, 1n)).toBe("pending");
+  expect(checkJsonSchemaIsolated).not.toHaveBeenCalled();
+  // A reference the shape check refuses is no reason to wait.
+  await insertTask(
+    db,
+    taskView({
+      id: "3",
+      criteria_hash: await putCriteria(db, { ...JSON_SCHEMA, schema: { $ref: "#/constructor" } }),
+      heldout_commitment: sha256Hex("never sent"),
+      created_at: (NOW_NS - MINUTE_NS).toString(),
+    }),
+  );
+  expect(await intakeTask(deps, 3n)).toBe("rejected");
+  expect(checkJsonSchemaIsolated).not.toHaveBeenCalled();
+
+  for (const heldout of checks) await putHeldout(db, heldout);
+  expect(await intakeTask(deps, 1n)).toBe("accepted");
+  expect(await intakeTask(deps, 2n)).toBe("accepted");
+  expect(checkJsonSchemaIsolated).toHaveBeenCalledTimes(1);
 });
 
 test("intake_rejects_heldout_from_non_poster", async () => {
