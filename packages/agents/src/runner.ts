@@ -33,13 +33,15 @@ import type { Solver, TaskContext } from "./types";
 //   not marked committed is taken neither for sent nor for lost: the chain is asked
 //   (`recoverCommit`). If it has the commit, the draft is marked. If not, and the task is still
 //   open, the same commitment is sent again from the draft, never with a new solve. If the reveal
-//   window is over with no commit of the draft on the chain, if the contract refuses for good, or
-//   if five resends have failed, the draft is dead and is let alone (P05-R14). A draft whose
-//   commit is on the chain is never dead: it is revealed whenever its window is open, marked or
-//   not, and however late the agent comes back to it. The chain is read at its last final block,
-//   which trails the newest by about two, so a commit that has just landed can be missing from the
-//   view for a moment. That is why a draft with no commit in view is given up only once the reveal
-//   window is over, and not when the commit window ends (review N1);
+//   window is over with no commit of the draft on the chain, or if the contract refuses for good,
+//   the draft is dead and is let alone (P05-R14). A draft whose commit is on the chain is never
+//   dead: it is revealed whenever its window is open, marked or not, and however late the agent
+//   comes back to it. The chain is read at its last final block, which trails the newest by about
+//   two, so a commit that has just landed can be missing from the view for a moment. That is why a
+//   draft with no commit in view is given up only once the reveal window is over, and not when the
+//   commit window ends (review N1). Nor do five failed resends give it up: the commit is not sent
+//   again after them, but the last may have landed, so the draft is looked for all the same
+//   (review R1);
 // - a draft is the agent's only if its commitment is the one that the agent's account, the task,
 //   the draft's hash and its salt give. A draft that another account made, in a state directory
 //   that the two share, is dead for this run, and nothing is sent or revealed for it (review N3);
@@ -78,7 +80,10 @@ const MAX_PAGES = 10;
 const MAX_REASON_CHARS = 200;
 /** The most code points of an id that a log line carries when the id is not a task id. */
 const MAX_ID_CHARS = 40;
-/** How many times a draft's commit is sent again in a run before the draft is given up. */
+/**
+ * How many times a draft's commit is sent again in a run before the runner stops sending it. The
+ * draft is not given up for that (review R1): it is looked for to the end of the reveal window.
+ */
 const MAX_RESENDS = 5;
 /**
  * The contract storage that the agent must have free before it enters a task (R22), in bytes: 1
@@ -104,7 +109,7 @@ const CODE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
  * `E_STORAGE` is not among them, as a top-up makes it come right. Neither is a failure with no
  * code (a node that is down, a timeout) or one the client could not name (`E_UNKNOWN`): none of
  * these is known to repeat, and the commit is tried again until its window ends, or until
- * `MAX_RESENDS` tries have failed.
+ * `MAX_RESENDS` resends have failed.
  *
  * `E_PHASE` counts only for a commit that is sent for the first time (`refusedForGood`). A resend
  * can meet it with the earlier send in a block that is not final yet, so that it says nothing of
@@ -151,22 +156,23 @@ export class AgentMemory {
   readonly settled = new Set<string>();
   /**
    * Tasks whose draft is dead for this run: its commit is not on the chain and cannot be, as the
-   * contract refused it for good, the reveal window is over, or five resends failed; or the draft
-   * is not the account's (review N3). Nothing more is done for them. A draft has no slot to say so
-   * on disk, so a restart judges each of them again.
+   * contract refused it for good or the reveal window is over; or the draft is not the account's
+   * (review N3). Nothing more is done for them. A draft has no slot to say so on disk, so a restart
+   * judges each of them again.
    */
   readonly dead = new Set<string>();
   /** Tasks whose low storage has been warned of, so that a later tick does not say it again. */
   readonly warned = new Set<string>();
   /**
-   * Tasks whose draft has no commit in view in the task's reveal window, which has been said once
-   * (review N1). The draft is looked for again each tick until the window is over.
+   * Tasks whose draft has no commit in view and is looked for again each tick until the task's
+   * reveal window is over, which has been said once: in the reveal window itself (review N1), or in
+   * the commit window once the resends are used up (review R1).
    */
   readonly waiting = new Set<string>();
   /**
    * How many times the commit of each draft has been sent again in this run, by task. A resend is
    * one that the recovery of a draft makes (`recoverCommit`); the send that enters a task is not
-   * one. A restart starts the count again.
+   * one. At `MAX_RESENDS` the commit is not sent again. A restart starts the count again.
    */
   readonly resends = new Map<string, number>();
 }
@@ -663,15 +669,18 @@ async function lookUp(run: Run, id: string): Promise<{ entry: EntryView | null }
  *   carries the draft's salt and hash, so that it opens with the draft's work, and no solver is
  *   asked. The send is not made here but queued (`Run.due`) for the end of the pass over the
  *   drafts (`resend`), so that the storage it needs is judged with every reveal owed (review N2).
+ *   Once the resends are used up nothing more is sent, but the draft is not given up: the last
+ *   send may have landed in a block that is not final yet, and a dead draft would lose its
+ *   reveal. It is kept and looked up each tick like one in the reveal window (review R1).
  * - It has none and the task is in its reveal window: the commit window is over, so nothing can
  *   be sent, but the commit may be there all the same. The view is of the last final block, and a
  *   commit that landed one or two blocks ago is not in it yet. The draft is kept and looked up
  *   again next tick (review N1).
  * - It has none and the reveal window is over too: a commit that had landed would be final long
- *   since, so there is none, nothing can be sent or revealed, and the draft is dead. So it is
- *   when the resends are used up. A task whose entries the keeper has cleaned up (`cleanup`,
- *   after the task has settled) shows none either, so a draft first looked at after that is
- *   given up as well, though it may have been entered (review N4).
+ *   since, so there is none, nothing can be sent or revealed, and the draft is dead. A task whose
+ *   entries the keeper has cleaned up (`cleanup`, after the task has settled) shows none either,
+ *   so a draft first looked at after that is given up as well, though it may have been entered
+ *   (review N4).
  *
  * Returns whether the commit is on the chain, which is when the draft may be revealed. A lookup
  * that fails and a draft waiting for its resend or for the commit to show leave it for a later
@@ -704,7 +713,14 @@ async function recoverCommit(run: Run, draft: Draft, task: TaskDetail): Promise<
     return false;
   }
   if ((run.memory.resends.get(id) ?? 0) >= MAX_RESENDS) {
-    markDead(run, id, `commit to task ${id} did not go through in ${MAX_RESENDS} resends`);
+    // Review R1: said once, as the draft is looked for from here to the end of the reveal window,
+    // and the line of the reveal window (above) would only repeat it.
+    if (!run.memory.waiting.has(id)) {
+      run.memory.waiting.add(id);
+      run.log(
+        `ERROR ${run.name}: commit to task ${id} did not go through in ${MAX_RESENDS} resends, not sending it again, looking for it until its reveal window is over`,
+      );
+    }
     return false;
   }
   run.due.push(draft);
@@ -1039,7 +1055,8 @@ async function logOutcome(run: Run, found: TaskDetailResponse, revealed: boolean
  *   again, which costs a lookup and, for a task still open, one more refused commit and one more
  *   ERROR line.
  * - A draft with no commit in view in its task's reveal window costs a lookup each tick until the
- *   window is over (review N1). A commit that never landed is given up only then.
+ *   window is over (review N1), and so does one whose five resends are used up, from the tick that
+ *   finds them so (review R1). A commit that never landed is given up only when the window is over.
  * - One process owns a state directory (review M5): nothing locks it, and two runners on one
  *   directory (or a runner beside the MCP server's `commit_result`) can interleave their commits
  *   so that a draft's salt no longer opens the commitment on the chain. A directory shared by

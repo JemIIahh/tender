@@ -1417,6 +1417,9 @@ const WAITING =
 /** The line that gives a draft up once the reveal window is over with no commit of it in view. */
 const GIVEN_UP =
   "ERROR alice: task 7 has no commit of its draft on chain and its reveal window is over, the draft is dead";
+/** The line that says the resends of a draft are used up, so that it is only looked for from then. */
+const STOPPED =
+  "ERROR alice: commit to task 7 did not go through in 5 resends, not sending it again, looking for it until its reveal window is over";
 
 test("past_commit_deadline_without_entry_is_dead", async () => {
   // Past the commit deadline and past the reveal window too (review N1): a commit that had landed
@@ -1583,7 +1586,7 @@ test("a_commit_that_fails_for_now_is_sent_again_on_a_later_tick", async () => {
   }
 });
 
-test("a_commit_that_keeps_failing_is_sent_again_five_times_and_then_given_up", async () => {
+test("a_commit_that_keeps_failing_is_sent_again_five_times_and_then_only_looked_for", async () => {
   const h = await harness();
   h.world.add({ id: 7 });
   // A node that is down: no code, so nothing in it says the commit will never go through.
@@ -1595,20 +1598,90 @@ test("a_commit_that_keeps_failing_is_sent_again_five_times_and_then_given_up", a
   expect(h.commit).toHaveBeenCalledTimes(6);
   expect(h.logs).toEqual(Array(6).fill(failed));
 
-  // The next tick asks the chain once more, finds nothing, and gives the draft up, once.
+  // The next tick asks the chain once more, finds nothing, and sends no more, which is said once.
+  // It is not the end of the draft (review R1): the last resend may have landed, so the chain is
+  // asked on every tick from here on.
   await h.tick();
-  const dead = "ERROR alice: commit to task 7 did not go through in 5 resends, the draft is dead";
-  expect(h.logs.at(-1)).toBe(dead);
+  expect(h.logs.at(-1)).toBe(STOPPED);
   await h.tick();
   await h.tick();
   expect(h.commit).toHaveBeenCalledTimes(6);
-  expect(h.logs.filter((line) => line === dead)).toHaveLength(1);
+  expect(h.logs.filter((line) => line === STOPPED)).toHaveLength(1);
   expect(h.logs).toHaveLength(7);
+  expect(h.logs.filter((line) => line.includes("dead"))).toEqual([]);
+  // One lookup for each tick but the first, which entered the task.
+  expect(h.getEntry).toHaveBeenCalledTimes(8);
 
-  // Dead is for the run: a restart starts the count again.
+  // The count is the run's: a restart starts it again.
   h.restart();
   await h.tick();
   expect(h.commit).toHaveBeenCalledTimes(7);
+});
+
+test("a_draft_whose_resends_are_used_up_is_retired_once_the_reveal_window_closes", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  h.commit.mockRejectedValue(new Error("fetch failed"));
+  for (let tick = 0; tick < 7; tick++) await h.tick();
+  expect(h.logs.at(-1)).toBe(STOPPED);
+  expect(h.commit).toHaveBeenCalledTimes(6);
+
+  // The commit window ends. The draft is still looked for, and nothing more is said of it.
+  task.phase = "revealing";
+  await h.tick();
+  await h.tick();
+  expect(h.getEntry).toHaveBeenCalledTimes(8);
+  expect(h.logs).toHaveLength(7);
+  expect(h.commit).toHaveBeenCalledTimes(6);
+
+  // The reveal window ends with no commit in view: now it is dead, once, and let alone.
+  task.phase = "judging";
+  await h.tick();
+  await h.tick();
+  expect(h.logs.filter((line) => line.includes("dead"))).toEqual([GIVEN_UP]);
+  expect(h.getEntry).toHaveBeenCalledTimes(9);
+  expect(h.commit).toHaveBeenCalledTimes(6);
+  expect(h.upload).not.toHaveBeenCalled();
+  expect(h.reveal).not.toHaveBeenCalled();
+});
+
+test("a_fifth_resend_that_lands_but_shows_two_ticks_later_is_still_revealed", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  // A node that is down for the send that enters the task and for the first four resends.
+  h.commit.mockRejectedValue(new Error("fetch failed"));
+  for (let tick = 0; tick < 5; tick++) await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(5);
+
+  // The fifth resend lands, but the connection drops before the answer: the call fails, the entry is
+  // on the chain, and the view of the last final block does not show it for the next two lookups.
+  h.commit.mockImplementationOnce(async (taskId, commitment) => {
+    h.entries.set(String(taskId), entryView(taskId, commitment));
+    throw new Error("fetch failed");
+  });
+  await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(6);
+  const saved = await h.state.getDraft("7");
+  if (saved === null) throw new Error("the draft is missing");
+  expect(saved.committedAt).toBeUndefined();
+  h.getEntry.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
+
+  // The resends are used up, so nothing is sent, and the draft is not given up either (review R1).
+  await h.tick();
+  await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(6);
+  expect(h.logs.filter((line) => line.includes("dead"))).toEqual([]);
+
+  // Then the entry shows, the draft is marked, and its reveal goes out in its window.
+  await h.tick();
+  expect(h.logs.at(-1)).toBe("alice: the commit to task 7 was on chain already");
+  expect((await h.state.getDraft("7"))?.committedAt).toMatch(ISO);
+  task.phase = "revealing";
+  await h.tick();
+  expect(h.reveal).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledWith(7n, saved.contentHash, saved.salt, expect.any(String));
+  expect(h.commit).toHaveBeenCalledTimes(6);
+  expect(h.logs.filter((line) => line.includes("dead"))).toEqual([]);
 });
 
 test("a_commit_that_goes_through_on_the_fifth_resend_is_not_given_up", async () => {
