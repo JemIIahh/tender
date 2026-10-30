@@ -83,7 +83,7 @@ async function seedBoard(): Promise<void> {
         committed_at_block: "65",
         score: 100,
         passed: true,
-        reasons: ["matches the expected value"],
+        reasons: ["matches the expected value", "naïve ✓ but exact"],
       },
     ],
     winners: [{ account: alice, bps: 10_000 }],
@@ -169,6 +169,26 @@ function documentOf<T>(reply: Reply): T {
   return JSON.parse(reply.text) as T;
 }
 
+/** Every page of a list tool, each asked for with the `next_cursor` of the one before. */
+async function pagesOf<T extends { next_cursor: string | null }>(
+  client: Client,
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<T[]> {
+  const pages: T[] = [];
+  let cursor: string | null = null;
+  do {
+    const page: T = documentOf<T>(
+      await call(client, tool, cursor === null ? args : { ...args, cursor }),
+    );
+    pages.push(page);
+    cursor = page.next_cursor;
+    // The board is a few rows, so a walk that goes on is a cursor that does not move.
+    expect(pages.length, `pages of ${tool}`).toBeLessThanOrEqual(10);
+  } while (cursor !== null);
+  return pages;
+}
+
 // Raw requests, for what the client hides: the headers, the status codes and the session.
 const rpc = (method: string, params: Record<string, unknown> = {}, id = 1): string =>
   JSON.stringify({ jsonrpc: "2.0", id, method, params });
@@ -202,10 +222,10 @@ test("mcp_lists_tools_and_calls_list_tasks", async () => {
     tools.map((tool) => [tool.name, Object.keys(tool.inputSchema.properties ?? {}).sort()]),
   );
   expect(inputs).toEqual({
-    list_tasks: ["limit", "phase", "tag"],
+    list_tasks: ["cursor", "limit", "phase", "tag"],
     get_task: ["task_id"],
     get_scorecard: ["task_id"],
-    list_agents: ["tag"],
+    list_agents: ["cursor", "limit", "tag"],
     get_agent: ["account"],
   });
   const listTasks = tools.find((tool) => tool.name === "list_tasks");
@@ -214,6 +234,11 @@ test("mcp_lists_tools_and_calls_list_tasks", async () => {
     limit: { type: "integer", minimum: 1, maximum: 50, default: 20 },
   });
   expect(listTasks?.inputSchema.required ?? []).toEqual([]);
+  const listAgents = tools.find((tool) => tool.name === "list_agents");
+  expect(listAgents?.inputSchema.properties).toMatchObject({
+    limit: { type: "integer", minimum: 1, maximum: 50, default: 20 },
+  });
+  expect(listAgents?.inputSchema.required ?? []).toEqual([]);
   for (const name of ["get_task", "get_scorecard"]) {
     expect(tools.find((tool) => tool.name === name)?.inputSchema.required).toEqual(["task_id"]);
   }
@@ -257,7 +282,15 @@ test("bad_input_is_a_tool_error", async () => {
       ["list_tasks", { limit: 51 }, "limit"],
       ["list_tasks", { limit: 1.5 }, "limit"],
       ["list_tasks", { limit: "twenty" }, "limit"],
+      ["list_tasks", { cursor: "007" }, "cursor"],
+      ["list_tasks", { cursor: "18446744073709551616" }, "cursor"],
+      ["list_tasks", { cursor: "1; drop table tasks" }, "cursor"],
+      ["list_tasks", { cursor: 3 }, "cursor"],
       ["list_agents", { tag: "Not A Tag" }, "tag"],
+      ["list_agents", { limit: 0 }, "limit"],
+      ["list_agents", { limit: 51 }, "limit"],
+      ["list_agents", { cursor: "UPPER" }, "cursor"],
+      ["list_agents", { cursor: "a".repeat(65) }, "cursor"],
     ];
     for (const [tool, args, field] of bad) {
       const reply = await call(client, tool, args);
@@ -302,11 +335,14 @@ test("tools_return_the_documents_of_the_rest_routes", async () => {
       "/v1/tasks?phase=settled&tag=extraction",
     ],
     ["list_tasks", { limit: 1 }, "/v1/tasks?limit=1"],
+    ["list_tasks", { limit: 1, cursor: "3" }, "/v1/tasks?limit=1&cursor=3"],
     ["get_task", { task_id: SCORECARD_TASK }, `/v1/tasks/${SCORECARD_TASK}`],
     ["get_task", { task_id: "2" }, "/v1/tasks/2"],
     ["list_agents", {}, "/v1/agents"],
     ["list_agents", { tag: "regex" }, "/v1/agents?tag=regex"],
     ["list_agents", { tag: "nothing" }, "/v1/agents?tag=nothing"],
+    ["list_agents", { limit: 2 }, "/v1/agents?limit=2"],
+    ["list_agents", { limit: 2, cursor: alice }, `/v1/agents?limit=2&cursor=${alice}`],
     ["get_agent", { account: alice }, `/v1/agents/${alice}`],
   ];
   for (const [tool, args, path] of cases) {
@@ -330,14 +366,80 @@ test("tools_return_the_documents_of_the_rest_routes", async () => {
   );
   expect(nobody).toEqual({ agents: [], next_cursor: null });
 
-  // A scorecard is held to the copy in the task's own page: both are what `getScorecard` returns.
+  // A scorecard is the document of the task's own page: both are what `getScorecard` returns. Its
+  // text is not the page's, since a scorecard is written in canonical form (the next test).
   const detail = JSON.parse(await rest(`/v1/tasks/${SCORECARD_TASK}`)) as TaskDetailResponse;
   expect(detail.scorecard).toMatchObject({
     task_id: SCORECARD_TASK,
     winners: [{ account: alice }],
   });
   const scorecard = await call(client, "get_scorecard", { task_id: SCORECARD_TASK });
-  expect(scorecard.text).toBe(JSON.stringify(detail.scorecard));
+  expect(documentOf<Scorecard>(scorecard)).toEqual(detail.scorecard);
+});
+
+test("list_tasks_and_list_agents_page_by_cursor", async () => {
+  const client = await connect();
+  const taskIds = (page: ListTasksResponse): string[] => page.tasks.map((task) => task.id);
+  const accounts = (page: ListAgentsResponse): string[] =>
+    page.agents.map((agent) => agent.account);
+
+  // Two to a page: the second page starts where the first ended, and no row is on both.
+  const tasks1 = documentOf<ListTasksResponse>(await call(client, "list_tasks", { limit: 2 }));
+  expect(taskIds(tasks1)).toEqual(["3", "2"]);
+  expect(tasks1.next_cursor).toBe("2");
+  const tasks2 = documentOf<ListTasksResponse>(
+    await call(client, "list_tasks", { limit: 2, cursor: tasks1.next_cursor }),
+  );
+  expect(taskIds(tasks2)).toEqual(["1"]);
+  expect(tasks2.next_cursor).toBeNull();
+
+  const everyone = accounts(documentOf<ListAgentsResponse>(await call(client, "list_agents")));
+  expect(everyone).toHaveLength(3);
+  const agents1 = documentOf<ListAgentsResponse>(await call(client, "list_agents", { limit: 2 }));
+  expect(accounts(agents1)).toEqual(everyone.slice(0, 2));
+  expect(agents1.next_cursor).toBe(everyone[1]);
+  const agents2 = documentOf<ListAgentsResponse>(
+    await call(client, "list_agents", { limit: 2, cursor: agents1.next_cursor }),
+  );
+  expect(accounts(agents2)).toEqual(everyone.slice(2));
+  expect(agents2.next_cursor).toBeNull();
+
+  // Whatever the size of a page, the pages together are the list, each row once.
+  for (const limit of [1, 2, 3]) {
+    const taskPages = await pagesOf<ListTasksResponse>(client, "list_tasks", { limit });
+    expect(taskPages.flatMap(taskIds), `tasks, ${limit} to a page`).toEqual(["3", "2", "1"]);
+    const agentPages = await pagesOf<ListAgentsResponse>(client, "list_agents", { limit });
+    expect(agentPages.flatMap(accounts), `agents, ${limit} to a page`).toEqual(everyone);
+  }
+
+  // A cursor past the last row is an empty page and not an error.
+  expect(documentOf(await call(client, "list_tasks", { cursor: "1" }))).toEqual({
+    tasks: [],
+    next_cursor: null,
+  });
+  expect(documentOf(await call(client, "list_agents", { cursor: "zzzz" }))).toEqual({
+    agents: [],
+    next_cursor: null,
+  });
+});
+
+test("get_scorecard_returns_the_bytes_its_hash_covers", async () => {
+  const app = createApp(deps);
+  const client = await connect(app);
+
+  // The chain keeps the SHA-256 of the scorecard's bytes, and the task's page shows it.
+  const res = await app.request(`/v1/tasks/${SCORECARD_TASK}`);
+  const { task } = (await res.json()) as TaskDetailResponse;
+  if (task.outcome?.kind !== "picked") throw new Error(`task ${SCORECARD_TASK} was not picked`);
+
+  const reply = await call(client, "get_scorecard", { task_id: SCORECARD_TASK });
+  expect(reply.isError, reply.text).toBe(false);
+  expect(sha256Hex(reply.text)).toBe(task.outcome.scorecard_hash);
+  // They are the canonical bytes (sorted keys, no whitespace) of a document that holds characters
+  // outside ASCII, so the text has been through UTF-8 and back unchanged.
+  expect(reply.text).toContain("naïve ✓");
+  const parsed: unknown = JSON.parse(reply.text);
+  expect(new TextDecoder().decode(canonicalJson(parsed))).toBe(reply.text);
 });
 
 test("a_missing_task_agent_or_scorecard_is_a_tool_error", async () => {
@@ -502,6 +604,72 @@ test("mcp_refuses_a_body_over_64_kib", async () => {
     expect(res.status).toBe(status);
     await res.arrayBuffer();
   }
+});
+
+test("mcp_refuses_a_batch_of_more_than_10_messages", async () => {
+  const app = createApp(deps);
+  const getTask = (id: number) => ({
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name: "get_task", arguments: { task_id: "1" } },
+  });
+  const notify = () => ({ jsonrpc: "2.0", method: "notifications/initialized" });
+  const batch = (size: number, message: (n: number) => unknown = getTask): string =>
+    JSON.stringify(Array.from({ length: size }, (_, i) => message(i + 1)));
+
+  const query = vi.spyOn(deps.db, "query");
+  try {
+    // A batch of up to ten is answered, with one answer to each call. (The transport answers a
+    // batch of one with the bare answer and not an array of one.)
+    for (const size of [1, 2, 10]) {
+      const res = await post(app, batch(size));
+      expect(res.status, `${size} calls`).toBe(200);
+      const body: unknown = await res.json();
+      const answers = (Array.isArray(body) ? body : [body]) as Array<{
+        id: number;
+        result: { isError?: boolean };
+      }>;
+      expect(answers.map(({ id }) => id).sort((a, b) => a - b)).toEqual(
+        Array.from({ length: size }, (_, i) => i + 1),
+      );
+      for (const { result } of answers) expect(result.isError ?? false).toBe(false);
+    }
+    expect(query).toHaveBeenCalled();
+    // The messages of a batch are counted, whether or not they ask for an answer.
+    expect((await post(app, batch(10, notify))).status, "10 notifications").toBe(202);
+
+    // An eleventh message is turned away, and the others with it: none is answered, so the
+    // database is not asked, and the body is not even read as JSON-RPC.
+    query.mockClear();
+    for (const [what, body] of [
+      ["calls", batch(11)],
+      ["notifications", batch(11, notify)],
+      ["numbers", batch(11, (n) => n)],
+      ["a hundred calls", batch(100)],
+    ] as const) {
+      const res = await post(app, body);
+      expect(res.status, what).toBe(400);
+      expect(await res.json(), what).toEqual({
+        jsonrpc: "2.0",
+        error: { code: -32600, message: "a batch holds at most 10 messages" },
+        id: null,
+      });
+    }
+    expect(query).not.toHaveBeenCalled();
+  } finally {
+    query.mockRestore();
+  }
+
+  // A body that is not JSON, or no body, is still refused by the transport, as it was before the
+  // body was read here; and a single message is no batch.
+  for (const body of ["{not json", ""]) {
+    const res = await post(app, body);
+    expect(res.status, JSON.stringify(body)).toBe(400);
+    expect(await res.json()).toMatchObject({ jsonrpc: "2.0", error: { code: -32700 }, id: null });
+  }
+  const listed = await post(app, rpc("tools/list"));
+  expect(listed.status).toBe(200);
 });
 
 test("mcp_is_outside_the_cors_block", async () => {

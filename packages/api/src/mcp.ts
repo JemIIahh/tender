@@ -1,7 +1,13 @@
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { AccountIdSchema, BriefSchema, PhaseSchema, U64StringSchema } from "@tender/shared";
+import {
+  AccountIdSchema,
+  BriefSchema,
+  canonicalJson,
+  PhaseSchema,
+  U64StringSchema,
+} from "@tender/shared";
 import type { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
@@ -12,7 +18,10 @@ import { getAgentDetail, getScorecard, getTaskDetail, listAgents, listTasks } fr
 // The remote MCP server: the read routes of the API as five tools, for the agents that browse the
 // board before they enter a task. It only reads, and it holds no key. Each tool answers with the
 // document that the matching REST route sends, built by the same function in `queries.ts` and
-// written as JSON text, so a u64 or a u128 stays a string (R19).
+// written as JSON text, so a u64 or a u128 stays a string (R19). The scorecard is written as
+// `canonicalJson` text instead: those are the bytes that the `scorecard_hash` on chain is the
+// SHA-256 of, so a client can check what it was given. The two lists page as the REST routes do,
+// the `next_cursor` of one page being the `cursor` of the next.
 //
 // The server is stateless: there is no session and nothing outlives a request, so any instance of
 // the API can answer any request and a client needs no `initialize` before its calls. Each request
@@ -26,6 +35,10 @@ import { getAgentDetail, getScorecard, getTaskDetail, listAgents, listTasks } fr
 // a call that does not fit with a tool error. That check keeps a bad id from reaching the database,
 // where the error would quote it. The SDK also sends the message of whatever a tool throws to the
 // caller, which is why `answer` catches first.
+//
+// A request may hold a batch of JSON-RPC messages, and every message of it is a call of its own.
+// A batch is refused when it holds more than `MAX_BATCH`, before the transport answers any of it,
+// so that one request cannot ask for as many queries as its body has room for.
 
 /**
  * Where the server answers. It is no `/v1` route, so the CORS block of `/v1` does not cover it: MCP
@@ -35,6 +48,9 @@ const MCP_PATH = "/mcp";
 
 /** The most a request may carry. A call is a few hundred bytes, so this is generous. */
 const MAX_BODY_BYTES = 65_536;
+
+/** The most messages a request may carry as a JSON-RPC batch. */
+const MAX_BATCH = 10;
 
 // ---- Inputs -----------------------------------------------------------------------------------
 
@@ -63,11 +79,21 @@ const LimitInput = z
   .max(MAX_LIMIT)
   .default(DEFAULT_LIMIT)
   .describe(`How many to return, from 1 to ${MAX_LIMIT}.`);
+// Tasks are paged by id and agents by account, as the REST routes page them.
+const CURSOR_HELP =
+  "Where to continue: the next_cursor of the previous page. Leave it out for the first page.";
+const TaskCursorInput = U64StringSchema.describe(CURSOR_HELP).optional();
+const AgentCursorInput = AccountIdSchema.describe(CURSOR_HELP).optional();
 
 // ---- Answers ----------------------------------------------------------------------------------
 
-function toolJson(document: object): CallToolResult {
-  return { content: [{ type: "text", text: JSON.stringify(document) }] };
+function toolText(text: string): CallToolResult {
+  return { content: [{ type: "text", text }] };
+}
+
+/** The text of the `canonicalJson` bytes of `document`, which its hash on chain is the hash of. */
+function canonicalText(document: object): string {
+  return new TextDecoder().decode(canonicalJson(document));
 }
 
 /** A failed call. `message` must quote nothing the caller sent. */
@@ -76,18 +102,20 @@ function toolError(message: string): CallToolResult {
 }
 
 /**
- * The answer of the tool `tool`: the document `read` returns, as JSON text, or the tool error
- * `absent` when it returns null. A failure of `read` is logged and answered with a bare "internal
- * error": the message of a database error can quote a value or name a host, as in `app.onError`.
+ * The answer of the tool `tool`: the document `read` returns, written by `write` (default: as JSON
+ * text), or the tool error `absent` when it returns null. A failure of `read` or `write` is logged
+ * and answered with a bare "internal error": the message of a database error can quote a value or
+ * name a host, as in `app.onError`.
  */
-async function answer(
+async function answer<T extends object>(
   tool: string,
-  read: () => Promise<object | null>,
+  read: () => Promise<T | null>,
   absent = "not found",
+  write: (document: T) => string = (document) => JSON.stringify(document),
 ): Promise<CallToolResult> {
   try {
     const document = await read();
-    return document === null ? toolError(absent) : toolJson(document);
+    return document === null ? toolError(absent) : toolText(write(document));
   } catch (error) {
     console.error(`api: mcp: ${tool} failed:`, error);
     return toolError("internal error");
@@ -107,12 +135,17 @@ function createServer(deps: ApiDeps): McpServer {
     "list_tasks",
     {
       description: "List tasks, newest first, optionally only those in one phase or with one tag.",
-      inputSchema: { phase: PhaseInput, tag: TaskTagInput, limit: LimitInput },
+      inputSchema: {
+        phase: PhaseInput,
+        tag: TaskTagInput,
+        limit: LimitInput,
+        cursor: TaskCursorInput,
+      },
       annotations: READ_ONLY,
     },
-    ({ phase, tag, limit }) =>
+    ({ phase, tag, limit, cursor }) =>
       answer("list_tasks", () =>
-        listTasks(deps.db, { phase, tag, limit }, nowNs(deps), deps.teamAccounts),
+        listTasks(deps.db, { phase, tag, limit, cursor }, nowNs(deps), deps.teamAccounts),
       ),
   );
 
@@ -136,12 +169,17 @@ function createServer(deps: ApiDeps): McpServer {
     "get_scorecard",
     {
       description:
-        "Get the public scorecard a task was settled with: each entry's score and the winners.",
+        "Get a task's public scorecard as the canonical JSON that its scorecard_hash covers.",
       inputSchema: { task_id: TaskIdInput },
       annotations: READ_ONLY,
     },
     ({ task_id }) =>
-      answer("get_scorecard", () => getScorecard(deps.db, task_id), "no scorecard for this task"),
+      answer(
+        "get_scorecard",
+        () => getScorecard(deps.db, task_id),
+        "no scorecard for this task",
+        canonicalText,
+      ),
   );
 
   server.registerTool(
@@ -149,10 +187,11 @@ function createServer(deps: ApiDeps): McpServer {
     {
       description:
         "List registered agents with their entry and win counts, optionally only those with one tag.",
-      inputSchema: { tag: AgentTagInput },
+      inputSchema: { tag: AgentTagInput, limit: LimitInput, cursor: AgentCursorInput },
       annotations: READ_ONLY,
     },
-    ({ tag }) => answer("list_agents", () => listAgents(deps.db, { tag, limit: DEFAULT_LIMIT })),
+    ({ tag, limit, cursor }) =>
+      answer("list_agents", () => listAgents(deps.db, { tag, limit, cursor })),
   );
 
   server.registerTool(
@@ -175,8 +214,9 @@ function rpcError(code: number, message: string) {
 }
 
 /**
- * Mounts the server at `/mcp`. A POST carries a JSON-RPC message of at most `MAX_BODY_BYTES`; any
- * other method is a 405, since a stateless server has no stream to open and no session to end.
+ * Mounts the server at `/mcp`. A POST carries a JSON-RPC message of at most `MAX_BODY_BYTES`, or a
+ * batch of at most `MAX_BATCH` of them; any other method is a 405, since a stateless server has no
+ * stream to open and no session to end.
  */
 export function mountMcp(app: Hono, deps: ApiDeps): void {
   app.post(
@@ -186,13 +226,21 @@ export function mountMcp(app: Hono, deps: ApiDeps): void {
       onError: (c) => c.json(rpcError(-32600, "request body too large"), 413),
     }),
     async (c) => {
+      // The body is read here so that a batch can be counted before any of it is answered, and the
+      // transport is handed what was read. A body that is not JSON is left to the transport: it
+      // reads the body again and refuses it, as it would have without this.
+      const body: unknown = await c.req.json().catch(() => undefined);
+      if (Array.isArray(body) && body.length > MAX_BATCH) {
+        return c.json(rpcError(-32600, `a batch holds at most ${MAX_BATCH} messages`), 400);
+      }
+
       const server = createServer(deps);
       // No `sessionIdGenerator` makes the transport stateless, and `enableJsonResponse` makes it
       // answer with a JSON document in place of an event stream.
       const transport = new StreamableHTTPTransport({ enableJsonResponse: true });
       await server.connect(transport);
       try {
-        const response = await transport.handleRequest(c);
+        const response = await transport.handleRequest(c, body);
         if (response === undefined) throw new Error("the transport made no response");
         return response;
       } finally {
