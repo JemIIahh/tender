@@ -33,7 +33,18 @@ export type DocumentsCheck =
   | { ok: false; status: "pending" | "rejected"; reason: string };
 
 /** What a task's documents are checked against: fields of a `TaskView`, and of a `tasks` row. */
-type TaskTerms = Pick<TaskView, "poster" | "criteria_hash" | "heldout_commitment" | "created_at">;
+type TaskTerms = Pick<
+  TaskView,
+  "id" | "poster" | "criteria_hash" | "heldout_commitment" | "created_at"
+>;
+
+/** What the database holds for a task's documents. */
+interface Stored {
+  criteria: StoredBlob | null;
+  heldout: StoredBlob | null;
+  /** The lowest id of an earlier task that commits to the same held-out checks, or `null`. */
+  earlierUse: string | null;
+}
 
 /** The most bytes a criteria or held-out document may have: what the blob store takes at once. */
 const MAX_DOCUMENT_BYTES = 262_144;
@@ -81,6 +92,9 @@ const CHECK_FAILED = "criteria could not be checked";
  * - `exact` or `json_schema` without held-out checks: `held-out checks required for kind {k}`;
  * - a `json_schema` schema with a reference through a built-in member (see `refersToBuiltIn`), or
  *   one that `checkJsonSchemaUsable` refuses, with its reason;
+ * - a `heldout_commitment` that a task with a lower id, of any verifier, commits to as well:
+ *   `held-out checks already used by task {id}`, naming the lowest. Held-out checks are
+ *   single-use, as judging a task publishes them;
  * - held-out checks that are stored under the commitment but not as the poster's `heldout` blob,
  *   that are over 262_144 bytes, that do not fit `HeldoutSchema`, that are of another kind than
  *   the criteria, that hold a surrogate half with no partner, or whose bytes are not their
@@ -97,7 +111,8 @@ export async function intakeTask(
   taskId: bigint,
 ): Promise<"accepted" | "pending" | "rejected"> {
   const [task] = await deps.db.query<TaskTerms & { judge_status: string | null }>(
-    `select poster, criteria_hash, heldout_commitment, created_at::text as created_at, judge_status
+    `select id::text as id, poster, criteria_hash, heldout_commitment,
+            created_at::text as created_at, judge_status
        from tasks where id = $1 and verifier = $2`,
     [taskId, deps.judgeAccount],
   );
@@ -125,7 +140,9 @@ export async function intakeTask(
 
 /**
  * Reads the criteria and held-out checks that `task` commits to from the blob store, and checks
- * them as `intakeTask` does. Judging reads them again with this, from the hashes the chain holds.
+ * them as `intakeTask` does. Judging reads them again with this, from the hashes the chain holds,
+ * so a task whose held-out checks turn out to be an earlier task's (one the indexer stored late)
+ * fails closed instead of being judged with answers that may be out.
  *
  * With `waitForHeldout`, held-out checks that are not stored yet make the task `pending` for 10
  * minutes from its `created_at`. Without it they are missing at once. A database error is thrown;
@@ -136,23 +153,39 @@ export async function loadDocuments(
   task: TaskTerms,
   policy: { teamAccounts: readonly string[]; nowNs: bigint; waitForHeldout: boolean },
 ): Promise<DocumentsCheck> {
-  const criteria = await getBlob(db, task.criteria_hash);
-  const heldout =
-    task.heldout_commitment === null ? null : await getBlob(db, task.heldout_commitment);
+  const stored: Stored = {
+    criteria: await getBlob(db, task.criteria_hash),
+    heldout: null,
+    earlierUse: null,
+  };
+  if (task.heldout_commitment !== null) {
+    stored.heldout = await getBlob(db, task.heldout_commitment);
+    stored.earlierUse = await earlierUseOf(db, task.heldout_commitment, task.id);
+  }
   try {
-    return checkDocuments(task, criteria, heldout, policy);
+    return checkDocuments(task, stored, policy);
   } catch {
     // Whatever made a check throw, the task is not judged, and the loop goes on.
     return rejected(CHECK_FAILED);
   }
 }
 
+/** The lowest id of a task before task `id`, of any verifier, that commits to `commitment`. */
+async function earlierUseOf(db: Db, commitment: string, id: string): Promise<string | null> {
+  // Ids are numeric: `min` and `<` compare them as numbers, and only the result is text.
+  const [row] = await db.query<{ id: string | null }>(
+    "select min(id)::text as id from tasks where heldout_commitment = $1 and id < $2",
+    [commitment, BigInt(id)],
+  );
+  return row?.id ?? null;
+}
+
 function checkDocuments(
   task: TaskTerms,
-  criteriaBlob: StoredBlob | null,
-  heldoutBlob: StoredBlob | null,
+  stored: Stored,
   policy: { teamAccounts: readonly string[]; nowNs: bigint; waitForHeldout: boolean },
 ): DocumentsCheck {
+  const { criteria: criteriaBlob, heldout: heldoutBlob } = stored;
   if (criteriaBlob === null) return rejected(CRITERIA_INVALID);
   if (criteriaBlob.bytes.byteLength > MAX_DOCUMENT_BYTES) return rejected(CRITERIA_TOO_LARGE);
   const parsed = PublicCriteriaSchema.safeParse(parseJson(criteriaBlob.bytes));
@@ -179,6 +212,11 @@ function checkDocuments(
   }
   if (task.heldout_commitment === null) return { ok: true, documents: { criteria, heldout: null } };
 
+  // Held-out checks are single-use. The Judge publishes them when it judges the first task that
+  // commits to them, so a later task with the same commitment has its answers out, or will.
+  if (stored.earlierUse !== null) {
+    return rejected(`held-out checks already used by task ${stored.earlierUse}`);
+  }
   if (heldoutBlob === null) {
     const waited = policy.nowNs - BigInt(task.created_at);
     if (policy.waitForHeldout && waited < HELDOUT_WAIT_NS) {

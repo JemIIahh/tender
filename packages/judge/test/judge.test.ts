@@ -452,6 +452,30 @@ test("judge_fails_closed_when_its_criteria_are_gone", async () => {
   expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
 });
 
+test("judge_fails_closed_when_its_heldout_checks_were_used_first", async () => {
+  // Intake accepted the task. Then an earlier task with the same held-out commitment reached the
+  // database late, so these checks are not this task's to use: judging fails closed, and does not
+  // publish them.
+  const { view, chain, commitment } = await postJudged([["alice.test.near", "42", 10n]]);
+  await insertTask(
+    db,
+    taskView({
+      id: "3",
+      verifier: "other-judge.test.near",
+      criteria_hash: view.criteria_hash,
+      heldout_commitment: commitment,
+    }),
+  );
+
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("failed_closed");
+  expect(await judgeRow(db, 7)).toEqual({
+    judge_status: "failed_closed",
+    judge_reason: "held-out checks already used by task 3",
+  });
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(await isPublic(db, commitment)).toBe(false);
+});
+
 test("a_scorer_that_cannot_start_is_retried_next_tick", async () => {
   const { chain } = await postJudged([["alice.test.near", '{"pattern":"^a$"}', 10n]], {
     criteria: REGEX,
@@ -901,11 +925,15 @@ test("judge_tick_takes_a_task_from_intake_to_pick", async () => {
 
 test("judge_tick_goes_on_after_a_task_fails", async () => {
   const criteriaHash = await putCriteria(db, EXACT);
-  const commitment = await putHeldout(db, HELDOUT);
+  // Held-out checks of its own for each task: they are single-use.
+  const checksOf = (id: string) => putHeldout(db, { exact: { expected: ["42", `task ${id}`] } });
   const sha = await putResult(db, "42", "alice.test.near", 8n);
-  const views = ["7", "8"].map((id) =>
-    taskView({ id, criteria_hash: criteriaHash, heldout_commitment: commitment }),
-  );
+  const views: TaskView[] = [];
+  for (const id of ["7", "8"]) {
+    views.push(
+      taskView({ id, criteria_hash: criteriaHash, heldout_commitment: await checksOf(id) }),
+    );
+  }
   for (const view of views) await insertTask(db, view, "accepted");
   // A task in its reveal window by the database's deadlines, which the tick does not judge yet.
   await insertTask(
@@ -913,7 +941,7 @@ test("judge_tick_goes_on_after_a_task_fails", async () => {
     taskView({
       id: "9",
       criteria_hash: criteriaHash,
-      heldout_commitment: commitment,
+      heldout_commitment: await checksOf("9"),
       reveal_deadline: views[0]?.pick_deadline,
     }),
     "accepted",

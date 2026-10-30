@@ -7,6 +7,7 @@ import {
   at,
   fakeChain,
   insertTask,
+  JUDGE,
   judgeDeps,
   judgeRow,
   MINUTE_NS,
@@ -91,10 +92,14 @@ function putRaw(db: Db, kind: BlobKind, content: Uint8Array, uploader = POSTER):
 }
 
 /** A json_schema task with `schema`, and its held-out checks, stored. */
-async function jsonSchemaTask(db: Db, schema: Record<string, unknown>): Promise<Partial<TaskView>> {
+async function jsonSchemaTask(
+  db: Db,
+  schema: Record<string, unknown>,
+  heldout: object = JSON_SCHEMA_HELDOUT,
+): Promise<Partial<TaskView>> {
   return {
     criteria_hash: await putCriteria(db, { ...JSON_SCHEMA, schema }),
-    heldout_commitment: await putHeldout(db, JSON_SCHEMA_HELDOUT),
+    heldout_commitment: await putHeldout(db, heldout),
   };
 }
 
@@ -246,7 +251,7 @@ test("intake_rejects_each_rule", async () => {
       reason: "held-out checks are for another kind",
       view: async () => ({
         criteria_hash: await putCriteria(db, EXACT),
-        heldout_commitment: await putHeldout(db, REGEX_HELDOUT),
+        heldout_commitment: await putHeldout(db, { regex_cases: { match: ["x"], no_match: [] } }),
       }),
     },
     {
@@ -323,8 +328,13 @@ test("intake_accepts_the_p0_kinds", async () => {
       heldout_commitment: await putHeldout(db, EXACT_HELDOUT),
     },
     await jsonSchemaTask(db, JSON_SCHEMA.schema),
-    // A $ref to a definition of its own is no built-in member.
-    await jsonSchemaTask(db, { $defs: { total: { type: "number" } }, $ref: "#/$defs/total" }),
+    // A $ref to a definition of its own is no built-in member. (Checks of its own, too: held-out
+    // checks are single-use.)
+    await jsonSchemaTask(
+      db,
+      { $defs: { total: { type: "number" } }, $ref: "#/$defs/total" },
+      { json_schema: { assertions: [{ path: "$", equals: 42 }] } },
+    ),
     // regex_cases may go without held-out checks: the published examples are the cases then.
     { criteria_hash: await putCriteria(db, REGEX) },
     {
@@ -402,6 +412,44 @@ test("intake_rejects_heldout_from_non_poster", async () => {
     expect(await intakeTask(deps, id)).toBe("rejected");
     expect(await judgeRow(db, id)).toEqual({ judge_status: "rejected", judge_reason: reason });
   }
+});
+
+test("intake_rejects_heldout_checks_already_used", async () => {
+  // Judging a task publishes its held-out checks, so a set of checks is good for one task: the
+  // one with the lowest id. Intake of a later task may run first, and it is rejected all the same.
+  const criteriaHash = await putCriteria(db, EXACT);
+  const shared = await putHeldout(db, EXACT_HELDOUT);
+  for (const id of ["1", "2", "3"]) {
+    await insertTask(db, taskView({ id, criteria_hash: criteriaHash, heldout_commitment: shared }));
+  }
+  const deps = judgeDeps(db, fakeChain(null));
+  const usedBy = (id: number) => ({
+    judge_status: "rejected",
+    judge_reason: `held-out checks already used by task ${id}`,
+  });
+
+  expect(await intakeTask(deps, 2n)).toBe("rejected");
+  expect(await judgeRow(db, 2)).toEqual(usedBy(1));
+  expect(await intakeTask(deps, 1n)).toBe("accepted");
+  expect(await judgeRow(db, 1)).toEqual({ judge_status: "accepted", judge_reason: null });
+  // A third is told of the first, whatever became of the second.
+  expect(await intakeTask(deps, 3n)).toBe("rejected");
+  expect(await judgeRow(db, 3)).toEqual(usedBy(1));
+
+  // Ids compare as numbers, 9 before 10, and an earlier task counts whoever its verifier is.
+  const other = await putHeldout(db, { exact: { expected: ["another answer"] } });
+  const verifiers: [string, string][] = [
+    ["9", "other-judge.test.near"],
+    ["10", JUDGE],
+  ];
+  for (const [id, verifier] of verifiers) {
+    await insertTask(
+      db,
+      taskView({ id, verifier, criteria_hash: criteriaHash, heldout_commitment: other }),
+    );
+  }
+  expect(await intakeTask(deps, 10n)).toBe("rejected");
+  expect(await judgeRow(db, 10)).toEqual(usedBy(9));
 });
 
 test("intake_only_judges_its_own_tasks", async () => {
