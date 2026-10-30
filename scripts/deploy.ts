@@ -203,7 +203,7 @@ function plan(parentId: string): Record<MemberName, Member> {
 }
 
 /** The private key `value` holds. Throws without showing it, whatever is wrong with it. */
-function parseKey(value: string, what: string): KeyPair {
+export function parseKey(value: string, what: string): KeyPair {
   try {
     const key = KeyPair.fromString(value as KeyPairString);
     key.getPublicKey();
@@ -213,11 +213,21 @@ function parseKey(value: string, what: string): KeyPair {
   }
 }
 
+/** The script that writes to a `DeployEnv`, as the file and the errors about it name it. */
+export interface EnvWriter {
+  /** The script's path, for the header of a file it makes. */
+  script: string;
+  /** What the owner is told to run again when the file does not read back: "the deploy". */
+  rerun: string;
+}
+
+const DEPLOY_WRITER: EnvWriter = { script: "scripts/deploy.ts", rerun: "the deploy" };
+
 /**
  * `.env.deploy.<network>`: the keys the script makes, and the one fact it has to remember between
  * runs. Only this file is read, never `.env`: a key in `.env` is a key of something else.
  */
-class DeployEnv {
+export class DeployEnv {
   /** The file's name, for messages. */
   readonly name: string;
   private exists: boolean;
@@ -228,6 +238,7 @@ class DeployEnv {
     readonly path: string,
     name: string,
     text: string | null,
+    private readonly writer: EnvWriter,
   ) {
     this.name = name;
     this.exists = text !== null;
@@ -238,19 +249,24 @@ class DeployEnv {
   /**
    * Opens the env file of a network. A file that exists is made readable by its owner alone first:
    * the owner makes it by hand, with the parent's key in it, and gets mode 0644 more often than
-   * not. If the deploy then stops before it appends anything, that is the mode it stays in.
+   * not. If the deploy then stops before it appends anything, that is the mode it stays in. The
+   * `writer` is the script that adds to the file; the deploy, which is the default, names itself.
    */
-  static async open(dir: string, network: NetworkId): Promise<DeployEnv> {
+  static async open(
+    dir: string,
+    network: NetworkId,
+    writer: EnvWriter = DEPLOY_WRITER,
+  ): Promise<DeployEnv> {
     const name = `.env.deploy.${network}`;
     const path = join(dir, name);
     try {
       await chmod(path, 0o600);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT")
-        return new DeployEnv(path, name, null);
+        return new DeployEnv(path, name, null, writer);
       throw error;
     }
-    return new DeployEnv(path, name, await readFile(path, "utf8"));
+    return new DeployEnv(path, name, await readFile(path, "utf8"), writer);
   }
 
   /** The variable's value, or undefined if it is missing or blank. */
@@ -267,7 +283,7 @@ class DeployEnv {
   async add(entries: ReadonlyArray<readonly [string, string]>): Promise<void> {
     let text = `${entries.map(([key, value]) => `${key}=${value}`).join("\n")}\n`;
     if (!this.exists) {
-      text = `# Written by scripts/deploy.ts. It holds private keys: never commit this file.\n${text}`;
+      text = `# Written by ${this.writer.script}. It holds private keys: never commit this file.\n${text}`;
     } else if (!this.endsWithNewline) {
       text = `\n${text}`;
     }
@@ -295,7 +311,7 @@ class DeployEnv {
       throw new Error(
         `${this.name} does not read back as written (${lost.join(", ")}). A line that ends in ` +
           '"= " (a space after the =) makes node read the next line as its value: fix that ' +
-          "line and run the deploy again.",
+          `line and run ${this.writer.rerun} again.`,
       );
     }
     for (const [key, value] of entries) this.values[key] = value;

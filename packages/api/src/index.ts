@@ -17,6 +17,13 @@ export type {
   TaskOutcome,
   TaskSummary,
 } from "./format";
+export type {
+  KeeperChain,
+  KeeperTickOptions,
+  KeeperTickResult,
+  StartKeeperOptions,
+} from "./keeper";
+export { KeeperMemory, keeperTick, startKeeper } from "./keeper";
 export type { AgentFilter, TaskFilter } from "./queries";
 export {
   getAgentDetail,
