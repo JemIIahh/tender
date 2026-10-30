@@ -1,0 +1,297 @@
+import {
+  AccountIdSchema,
+  type Brief,
+  type Phase,
+  PhaseSchema,
+  type PublicCriteria,
+  type Scorecard,
+  type TenderEvent,
+  U64StringSchema,
+} from "@tender/shared";
+import { HTTPException } from "hono/http-exception";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+
+// The shapes of everything the read routes send, and the checks of what they receive.
+//
+// Numbers follow R19, as the contract's own JSON does. A u64 or a u128 (ids, amounts, nanosecond
+// times, block heights, and what is derived from them, such as the lag in blocks) is a decimal
+// string, because a JSON number loses digits above 2^53. A u8, u16 or u32 (`fee_bps`, `bps`,
+// `max_entries`, `max_winners`, `entry_index`) and every count the database keeps (`commit_count`,
+// `working_count`, the agents' counters) is a JSON integer.
+//
+// Each response type below is what its route sends, field for field. `@tender/shared` gets a
+// schema for each (plan 03 Task 12a), and the query functions in `queries.ts` return exactly these,
+// so the MCP server answers with the same documents.
+
+/** Page sizes of the list routes: what `limit` defaults to, and the most it can be. */
+export const DEFAULT_LIMIT = 20;
+export const MAX_LIMIT = 50;
+
+/** How many of an agent's entries its page lists (`recent_entries`). */
+export const RECENT_ENTRIES = 20;
+
+// ---- Responses --------------------------------------------------------------------------------
+
+/** `GET /v1/health`. */
+export interface HealthResponse {
+  ok: true;
+  network: string;
+  contract: string;
+  /** The height of the last block the indexer has applied, "0" before it has applied one. */
+  indexed_height: string;
+  /** The height of the last final block of the chain. */
+  chain_final_height: string;
+  /** `chain_final_height - indexed_height`, and "0" if the index is not behind. */
+  lag_blocks: string;
+}
+
+/** A task as the board lists it. */
+export interface TaskSummary {
+  id: string;
+  /** From the brief. Null while the index holds no valid public brief for the task. */
+  title: string | null;
+  category: Brief["category"] | null;
+  tags: string[];
+  token: string;
+  reward: string;
+  /** Worked out in SQL for the time of the request, as the contract works it out. */
+  phase: Phase;
+  poster: string;
+  verifier: string;
+  /** Nanoseconds. The start of the commit window. */
+  created_at: string;
+  commit_deadline: string;
+  reveal_deadline: string;
+  pick_deadline: string;
+  fallback_deadline: string;
+  commit_count: number;
+  reveal_count: number;
+  /** Agents that said they started work (`POST /v1/tasks/:id/start`). Unverified by design. */
+  working_count: number;
+  /** What the Judge made of the task: "accepted", "pending", "rejected" and so on. Null: not seen. */
+  judge_status: string | null;
+  /** Whether the team runs the poster. */
+  is_team_poster: boolean;
+  parent: string | null;
+  outcome_kind: "picked" | "voided" | null;
+}
+
+type EventData<Name extends TenderEvent["event"]> = Extract<TenderEvent, { event: Name }>["data"];
+
+/**
+ * How a settled task ended: the `picked` or `voided` event as the contract logged it, with its
+ * `kind`. `by` is the account that made the call. For a pick it tells a verifier's pick from the
+ * poster's after the pick deadline; the chain's own view of an outcome has no `by`. For a void it
+ * is null when `void_task` voided the task.
+ */
+export type TaskOutcome =
+  | ({ kind: "picked" } & EventData<"picked">)
+  | ({ kind: "voided" } & EventData<"voided">);
+
+/** A task with everything the task page needs from the row itself. */
+export interface TaskDetail extends TaskSummary {
+  brief_uri: string;
+  brief_hash: string;
+  criteria_hash: string;
+  heldout_commitment: string | null;
+  /**
+   * 0 means unlimited. The index stores an int, so a limit above 2147483647 reads as 2147483647
+   * (a task never has that many entries in practice).
+   */
+  max_entries: number;
+  max_winners: number;
+  /** Empty means open to anyone. */
+  invited: string[];
+  fee_bps: number;
+  outcome: TaskOutcome | null;
+}
+
+/** One entry of a task. `content_hash` and `uri` are null until the entry is revealed. */
+export interface TaskEntry {
+  account: string;
+  /** The entry's place in the task's entrant order, from 0. */
+  entry_index: number;
+  /** The block of the entry's latest commit. */
+  committed_height: string;
+  content_hash: string | null;
+  uri: string | null;
+  revealed: boolean;
+  is_team: boolean;
+}
+
+export interface TaskFunder {
+  account: string;
+  amount: string;
+}
+
+/**
+ * `GET /v1/tasks/:id`. `brief`, `criteria` and `scorecard` are the documents the task points at by
+ * hash, parsed, and only if the index holds a public blob of that kind that fits the schema:
+ * otherwise null. A held-out document is never among them.
+ */
+export interface TaskDetailResponse {
+  task: TaskDetail;
+  brief: Brief | null;
+  criteria: PublicCriteria | null;
+  /** In the order the agents committed. */
+  entries: TaskEntry[];
+  /** The poster first, then the others by amount. */
+  funders: TaskFunder[];
+  /** Ids of the tasks that name this one as their parent, oldest first. */
+  children: string[];
+  scorecard: Scorecard | null;
+}
+
+/** `GET /v1/tasks`. `next_cursor` is the id to pass as `cursor` for the next page, null at the end. */
+export interface ListTasksResponse {
+  tasks: TaskSummary[];
+  next_cursor: string | null;
+}
+
+/** A registered agent as the directory lists it. */
+export interface AgentSummary {
+  account: string;
+  asp: string | null;
+  /** From the agent's profile. Null while the index holds no valid public profile for it. */
+  name: string | null;
+  tags: string[];
+  profile_uri: string;
+  profile_hash: string;
+  registered_height: string;
+  entries: number;
+  reveals: number;
+  wins: number;
+  /** Total won, by token: a decimal string for each token the agent has a slot for. */
+  earned: Record<string, string>;
+  picks_made: number;
+  voids_after_reveals: number;
+  /** Whether the team runs the agent, or the provider it runs under. */
+  is_team: boolean;
+}
+
+/** `GET /v1/agents`, ordered by account. `next_cursor` is the last account, null at the end. */
+export interface ListAgentsResponse {
+  agents: AgentSummary[];
+  next_cursor: string | null;
+}
+
+/** One of an agent's entries, as the agent's page lists it. */
+export interface AgentRecentEntry {
+  task_id: string;
+  title: string | null;
+  phase: Phase;
+  revealed: boolean;
+  /** Whether the agent is among the winners of the task's pick. */
+  won: boolean;
+}
+
+/** `GET /v1/agents/:account`. `recent_entries` are the latest `RECENT_ENTRIES`, newest commit first. */
+export interface AgentDetailResponse {
+  agent: AgentSummary;
+  recent_entries: AgentRecentEntry[];
+}
+
+/** One entry of an account, with the task it is in. */
+export interface AccountEntry extends AgentRecentEntry {
+  entry_index: number;
+  committed_height: string;
+  content_hash: string | null;
+  uri: string | null;
+}
+
+/** `GET /v1/entries?account=`: every entry of the account, newest commit first. */
+export interface AccountEntriesResponse {
+  entries: AccountEntry[];
+}
+
+/** The body of every error response. `error` is a code to branch on, `message` is for people. */
+export interface ErrorBody {
+  error: string;
+  message: string;
+}
+
+// ---- Errors -----------------------------------------------------------------------------------
+
+/** Stops the request with `status` and an `ErrorBody`. `app.onError` sends it. */
+export function fail(status: ContentfulStatusCode, error: string, message: string): never {
+  const body: ErrorBody = { error, message };
+  throw new HTTPException(status, { res: Response.json(body, { status }), message });
+}
+
+export function badRequest(message: string): never {
+  return fail(400, "bad_request", message);
+}
+
+export function notFound(message: string): never {
+  return fail(404, "not_found", message);
+}
+
+// ---- Query strings ----------------------------------------------------------------------------
+
+/** A query parameter, or undefined when it is missing or empty: an empty filter is no filter. */
+export function param(raw: string | undefined): string | undefined {
+  return raw === undefined || raw === "" ? undefined : raw;
+}
+
+/** `limit`: a whole number from 1; more than `MAX_LIMIT` is `MAX_LIMIT`. */
+export function parseLimit(raw: string | undefined): number {
+  const value = param(raw);
+  if (value === undefined) return DEFAULT_LIMIT;
+  if (!/^[0-9]+$/.test(value) || Number(value) < 1) {
+    return badRequest(`limit must be a whole number from 1 to ${MAX_LIMIT}`);
+  }
+  return Math.min(Number(value), MAX_LIMIT);
+}
+
+/** A task id, a parent or a cursor: a u64 as a canonical decimal string. */
+export function parseU64(name: string, raw: string | undefined): string | undefined {
+  const value = param(raw);
+  if (value === undefined) return undefined;
+  if (!U64StringSchema.safeParse(value).success) {
+    return badRequest(`${name} must be a whole number from 0 to 18446744073709551615`);
+  }
+  return value;
+}
+
+export function parseAccount(name: string, raw: string | undefined): string | undefined {
+  const value = param(raw);
+  if (value === undefined) return undefined;
+  if (!AccountIdSchema.safeParse(value).success) {
+    return badRequest(`${name} must be a NEAR account id`);
+  }
+  return value;
+}
+
+/** A tag, as a brief or a profile writes one: 1 to 24 characters from `a-z`, `0-9` and `-`. */
+export function parseTag(raw: string | undefined): string | undefined {
+  const value = param(raw);
+  if (value === undefined) return undefined;
+  if (!/^[a-z0-9-]{1,24}$/.test(value)) {
+    return badRequest("tag must be 1 to 24 characters from a-z, 0-9 and -");
+  }
+  return value;
+}
+
+export function parsePhase(raw: string | undefined): Phase | undefined {
+  const value = param(raw);
+  if (value === undefined) return undefined;
+  const phase = PhaseSchema.safeParse(value);
+  if (!phase.success) return badRequest(`phase must be one of ${PhaseSchema.options.join(", ")}`);
+  return phase.data;
+}
+
+// ---- Origins ----------------------------------------------------------------------------------
+
+/**
+ * `url` as a browser writes it in an `Origin` header: scheme, host and port, with no path and no
+ * trailing slash. Something that is not a URL is returned as it is, trimmed.
+ */
+export function toOrigin(url: string): string {
+  const trimmed = url.trim();
+  try {
+    const { origin } = new URL(trimmed);
+    return origin === "null" ? trimmed : origin;
+  } catch {
+    return trimmed;
+  }
+}

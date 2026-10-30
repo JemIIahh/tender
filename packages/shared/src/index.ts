@@ -7,5 +7,8 @@ export * from "./criteria";
 export * from "./events";
 export * from "./format";
 export * from "./hash";
+export * from "./phase";
+export * from "./profile";
 export * from "./scorecard";
+export * from "./storage";
 export * from "./views";

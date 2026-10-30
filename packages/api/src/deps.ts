@@ -1,0 +1,46 @@
+import type { KeyPermission } from "@tender/client";
+import type { Db } from "@tender/db";
+import type { NetworkId } from "@tender/shared";
+
+/**
+ * The two chain reads the API makes: the height of the last final block (`/v1/health`) and the
+ * permission of an access key (sign-in). `TenderClient` has both and satisfies this interface;
+ * tests pass a fake, so the API type-checks and runs without a chain.
+ */
+export interface ChainReader {
+  /** The height of the last final block. */
+  finalHeight(): Promise<bigint>;
+  /** The permission of the key `publicKey` on `accountId`, or null when the account has no such key. */
+  viewAccessKey(
+    accountId: string,
+    publicKey: string,
+  ): Promise<{ permission: KeyPermission } | null>;
+}
+
+/** Everything `createApp` needs. No route reads the environment: the caller resolves it into this. */
+export interface ApiDeps {
+  db: Db;
+  client: ChainReader;
+  network: NetworkId;
+  /** The Tender contract the indexer follows. */
+  contractId: string;
+  /** The base URL the API is served at, with no trailing slash. Blob URIs are built from it. */
+  publicUrl: string;
+  /** Accounts the team runs. Posters and entrants among them are labelled as ours. */
+  teamAccounts: string[];
+  /**
+   * Origins of the web app, which the browser may call the API from (`PUBLIC_WEB_URL`, split at
+   * commas). A trailing slash or a path is dropped. On the sandbox network every origin is
+   * allowed whatever this holds; elsewhere an empty list allows none.
+   */
+  webOrigins: string[];
+  /** The Telegram bot's username as in `t.me/<username>`. Without it, linking answers 503. */
+  telegramBotUsername?: string;
+  /** The current time in nanoseconds since the epoch. Default: the wall clock. */
+  now?: () => bigint;
+}
+
+/** The time, in nanoseconds, that `deps` says it is. */
+export function nowNs(deps: Pick<ApiDeps, "now">): bigint {
+  return deps.now ? deps.now() : BigInt(Date.now()) * 1_000_000n;
+}

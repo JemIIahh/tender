@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit -p . && pnpm -r exec tsc --noEmit",
+    "typecheck": "tsc --noEmit -p . && NEXT_TELEMETRY_DISABLED=1 pnpm --filter @tender/web exec next typegen && pnpm -r exec tsc --noEmit",
     "lint": "biome check .",
     "skeleton": "tsx scripts/skeleton.ts",
     "demo:local": "tsx scripts/demo-local.ts",
