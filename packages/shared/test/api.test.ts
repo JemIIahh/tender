@@ -1,3 +1,4 @@
+import { inspect } from "node:util";
 import { expect, expectTypeOf, test, vi } from "vitest";
 import type { z } from "zod";
 import * as api from "../src/api";
@@ -8,6 +9,7 @@ import {
   type ListAgentsFilter,
   type ListTasksFilter,
   ListTasksResponseSchema,
+  SignInResponseSchema,
   type StartResponse,
   StartResponseSchema,
   TaskOutcomeSchema,
@@ -17,8 +19,8 @@ import {
 // `fetchJson` and the response schemas, over a fake `fetch`. The API's own test
 // (packages/api/test/schemas.test.ts) holds every schema to what its route really sends; these
 // tests are about what `fetchJson` does with an answer, and a few shapes a route can only send
-// after the indexer has been repaired from the chain. The last two tests hold each schema to the
-// keys it requires, and `TenderApi` to its methods.
+// after the indexer has been repaired from the chain. The tests near the end hold each schema to
+// the keys it requires and to the kinds of value it takes, and `TenderApi` to its methods.
 
 const URL_OF_LIST = "http://api.test/v1/tasks";
 const HASH = "ab".repeat(32);
@@ -210,6 +212,34 @@ test("fetch_json_throws_api_error_for_a_2xx_that_fails_the_schema", async () => 
   expect(error.status).toBe(200);
   expect(error.body).toBe("<html>captive portal</html>");
   expect(error.message).toContain("not JSON");
+});
+
+test("an_api_error_does_not_print_the_body_of_the_answer", async () => {
+  // A sign-in answer that an older client cannot read, such as one with a new kind of key. It is
+  // a 2xx, so the error keeps its body as it came, and the body holds the bearer token.
+  const secret = "bearer-token-that-must-not-be-printed";
+  const answer = { token: secret, expires_at: "2026-10-30T10:15:00.000Z", key_kind: "new_kind" };
+  const { fetch } = answering(200, JSON.stringify(answer));
+  const error = await apiError(
+    fetchJson("http://api.test/v1/auth/verify", SignInResponseSchema, undefined, fetch),
+  );
+
+  // The code that needs the body can read it.
+  expect(error.body).toEqual(answer);
+  // But it is an own property that does not show: not among the keys, not in what `console.log`
+  // prints, not in JSON, and not in the message.
+  expect(Object.keys(error)).not.toContain("body");
+  expect(Object.getOwnPropertyDescriptor(error, "body")?.enumerable).toBe(false);
+  for (const shown of [
+    inspect(error),
+    inspect(error, { depth: null }),
+    inspect({ error }, { depth: null }),
+    JSON.stringify(error),
+    String(error),
+    error.message,
+  ]) {
+    expect(shown).not.toContain(secret);
+  }
 });
 
 test("fetch_json_lets_a_network_error_through_unchanged", async () => {
@@ -585,6 +615,66 @@ test("every_key_of_a_response_schema_is_required_unless_listed_as_optional", () 
   }
 });
 
+/** Every leaf of `value` with the path to it. An array is entered at its first item. */
+function leaves(value: unknown, path: string[] = []): Array<{ path: string[]; value: unknown }> {
+  if (Array.isArray(value)) return value.length === 0 ? [] : leaves(value[0], [...path, "0"]);
+  if (typeof value === "object" && value !== null) {
+    return Object.entries(value).flatMap(([key, child]) => leaves(child, [...path, key]));
+  }
+  return [{ path, value }];
+}
+
+/** A copy of `body` with the value at `path` replaced by `to`. */
+function withValue(body: unknown, path: string[], to: unknown): unknown {
+  const copy: unknown = JSON.parse(JSON.stringify(body));
+  let holder = copy as Record<string, unknown>;
+  for (const step of path.slice(0, -1)) holder = holder[step] as Record<string, unknown>;
+  const key = path[path.length - 1];
+  if (key !== undefined) holder[key] = to;
+  return copy;
+}
+
+test("every_decimal_string_and_count_of_a_response_schema_refuses_a_value_of_another_kind", () => {
+  // R19 for every schema, not only for a task row. A leaf of a sample that is a canonical decimal
+  // string is a u64 or a u128, and has to refuse a JSON number and a decimal with a leading zero.
+  // A leaf that is an integer is a count, and has to refuse text and a fraction. (A free-form map,
+  // `earned` or `data`, is empty in its sample, so it has no leaves to swap.)
+  const exported = Object.entries(api).filter(([name]) => name.endsWith("Schema"));
+  const swapped: string[] = [];
+  for (const [name, value] of exported) {
+    const schema = value as z.ZodType;
+    for (const [index, { body }] of SAMPLES[name as SchemaName].entries()) {
+      for (const { path, value: leaf } of leaves(body)) {
+        let instead: unknown[] = [];
+        if (typeof leaf === "string" && /^(0|[1-9][0-9]*)$/.test(leaf)) {
+          instead = [Number(leaf), "007"];
+        } else if (typeof leaf === "number" && Number.isInteger(leaf)) {
+          instead = ["1", 1.5];
+        }
+        for (const to of instead) {
+          const label = `${name} sample ${index}: ${path.join(".")} as ${JSON.stringify(to)}`;
+          expect(schema.safeParse(withValue(body, path, to)).success, label).toBe(false);
+        }
+        if (instead.length > 0) swapped.push(`${name}.${path.join(".")}`);
+      }
+    }
+  }
+  // The walk reaches the leaves of nested objects and of arrays, in schemas of every route.
+  expect(swapped).toEqual(
+    expect.arrayContaining([
+      "ListTasksResponseSchema.tasks.0.reward",
+      "TaskDetailResponseSchema.children.0",
+      "TaskOutcomeSchema.winners.0.amount",
+      "TaskOutcomeSchema.winners.0.bps",
+      "AgentSummarySchema.registered_height",
+      "AccountEntrySchema.committed_height",
+      "AccountEntrySchema.entry_index",
+      "HealthResponseSchema.indexed_height",
+      "EventMessageSchema.height",
+    ]),
+  );
+});
+
 // ---- TenderApi --------------------------------------------------------------------------------
 
 test("a_client_with_the_listed_methods_satisfies_tender_api", async () => {
@@ -635,6 +725,11 @@ test("a_client_with_the_listed_methods_satisfies_tender_api", async () => {
     limit: 20,
     cursor: "agent.test.near",
   });
+  // A page's `next_cursor` goes back in as it is, null (the end, or the first page) included.
+  const tasks = await tender.listTasks();
+  await tender.listTasks({ cursor: tasks.next_cursor });
+  const agents = await tender.listAgents();
+  await tender.listAgents({ cursor: agents.next_cursor });
   await tender.uploadBlob({
     kind: "result",
     contentType: "text/plain",
