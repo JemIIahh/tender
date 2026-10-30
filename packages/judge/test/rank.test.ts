@@ -519,6 +519,24 @@ test("scorecard_fields_come_from_the_inputs", () => {
   });
 });
 
+test("scorecard_publishes_the_heldout_document_exactly", () => {
+  // Anyone can hash the published document and compare it with `heldout_commitment`. A key such
+  // as `__proto__` is valid JSON, and an own property once parsed, but a copy made by assignment
+  // (a schema's, say) loses it, and the check would then fail for a document that was committed.
+  const equals = '{"__proto__":{"a":1},"constructor":2,"10":3,"9":4}';
+  const heldout = JSON.parse(`{"json_schema":{"assertions":[{"path":"$.x","equals":${equals}}]}}`);
+  // Control: the document does carry the key.
+  expect(JSON.stringify(heldout)).toContain('"__proto__"');
+  const commitment = sha256Hex(canonicalJson(heldout));
+
+  const bytes = buildScorecard(
+    scorecardInput({ kind: "json_schema", heldout, heldoutCommitment: commitment }),
+  );
+
+  const shown = (published(bytes) as { heldout: unknown }).heldout;
+  expect(sha256Hex(canonicalJson(shown))).toBe(commitment);
+});
+
 test("scorecard_numbers_follow_r19", () => {
   // Above 2^53 a JSON number loses digits, so ids and blocks are written as decimal strings.
   const last = 2n ** 64n - 1n;

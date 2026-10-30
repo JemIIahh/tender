@@ -24,7 +24,9 @@ const MAX_REASON_CODE_POINTS = 200;
  *
  * The scorecard has to fit `ScorecardSchema`, and this throws when it does not. That is a bug in
  * the Judge, not something an agent wrote, and nothing that fails to parse may be published. The
- * block of an entry is written as a decimal string, as the views write every u64.
+ * block of an entry is written as a decimal string, as the views write every u64. `heldout` is
+ * written as it is given, so pass the document as it was parsed from its bytes (`JSON.parse`),
+ * not a copy a schema made of it.
  *
  * An agent does write the text of a reason: Ajv, for one, puts the keys of the agent's JSON in its
  * messages. So each entry keeps at most 3 reasons, each at most 200 code points; one that is
@@ -63,7 +65,11 @@ export function buildScorecard(input: {
     generated_at: input.now.toISOString(),
     judge: { software: "tender-judge/1", model: input.model },
   };
-  return canonicalJson(ScorecardSchema.parse(scorecard));
+  // Checked against the schema, but written from the object built here, not from the schema's
+  // copy: a copy made by assignment loses an own `__proto__` key of the held-out document, and the
+  // document would no longer hash to its commitment.
+  ScorecardSchema.parse(scorecard);
+  return canonicalJson(scorecard);
 }
 
 /** `reason`, or its first 199 code points and `…` when it has more than 200. */
