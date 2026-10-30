@@ -67,10 +67,15 @@ const CRITERIA: PublicCriteria = {
 
 const HELDOUT = { exact: { expected: ["[1050]"] } };
 
+/**
+ * A scorecard that ACCOUNT made as the verifier of task 7: it names ACCOUNT, and software of its
+ * own. A scorecard is published in the name of the account that picks with it, so this is the only
+ * kind that `pick_winners` takes from ACCOUNT.
+ */
 const SCORECARD: Scorecard = {
   version: 1,
   task_id: "7",
-  verifier: "judge.testnet",
+  verifier: ACCOUNT,
   kind: "exact",
   criteria_hash: "22".repeat(32),
   heldout_commitment: "33".repeat(32),
@@ -89,6 +94,13 @@ const SCORECARD: Scorecard = {
   ],
   winners: [{ account: ACCOUNT, bps: 10_000 }],
   generated_at: "2026-11-04T12:00:00.000Z",
+  judge: { software: "alice-checker/1", model: null },
+};
+
+/** The scorecard of the team's Judge: another account's, with the software only the Judge names. */
+const JUDGE_SCORECARD: Scorecard = {
+  ...SCORECARD,
+  verifier: "judge.testnet",
   judge: { software: "tender-judge/1", model: null },
 };
 
@@ -158,6 +170,24 @@ function makeDetail(
     children: ["9"],
     scorecard: null,
   };
+}
+
+/** A task in which each of `accounts` has revealed an entry, as the API lists them. */
+function revealedBy(
+  accounts: string[],
+  task: Partial<TaskDetailResponse["task"]> = {},
+): TaskDetailResponse {
+  return makeDetail(
+    accounts.map((account, index) =>
+      makeEntry(account, {
+        entry_index: index,
+        content_hash: "55".repeat(32),
+        uri: `${BLOBS}/${account}`,
+        revealed: true,
+      }),
+    ),
+    task,
+  );
 }
 
 const CONFIG: ConfigView = {
@@ -402,6 +432,8 @@ test("commit_result_says_where_files_come_from_and_that_a_commit_stays", async (
     expect(tool).toMatch(/ALREADY_COMMITTED/);
     // The task's own limit applies as well as the server's.
     expect(tool).toMatch(/output\.max_bytes/);
+    // The result is published by the reveal, so it may not hold the server's own secrets.
+    expect(tool).toMatch(/SECRET_IN_CONTENT/);
   }
 });
 
@@ -882,11 +914,11 @@ test("get_scorecard_returns_the_scorecard_or_says_there_is_none", async () => {
   const getScorecard = vi.fn<TenderApi["getScorecard"]>();
   const { call } = await connect({ api: fakeApi({ getScorecard }) });
 
-  getScorecard.mockResolvedValue(SCORECARD);
+  getScorecard.mockResolvedValue(JUDGE_SCORECARD);
   const found = await call("get_scorecard", { task_id: "7" });
   expect(getScorecard).toHaveBeenCalledWith(7n);
   expect(found.isError).toBe(false);
-  expect(JSON.parse(found.text)).toEqual(SCORECARD);
+  expect(JSON.parse(found.text)).toEqual(JUDGE_SCORECARD);
 
   getScorecard.mockResolvedValue(null);
   expect(await call("get_scorecard", { task_id: "8" })).toEqual({
@@ -1025,6 +1057,11 @@ function entryView(commitment: string): EntryView {
     content_hash: null,
     uri: null,
   };
+}
+
+/** The entry of `draft` once it is revealed: the chain has the work's hash and the uri on it. */
+function revealedEntryView(draft: Draft, uri: string): EntryView {
+  return { ...entryView(draft.commitment), content_hash: draft.contentHash, uri };
 }
 
 /**
@@ -1624,8 +1661,9 @@ test("fc_key_commit_with_low_storage_refuses", async () => {
     const answer = await call("commit_result", { task_id: "7", content: "a" });
     expect(answer.isError).toBe(true);
     expect(answer.text).toMatch(/^STORAGE_LOW: /);
-    // It says whom to ask, what to call, and how much is missing.
+    // It says whom to ask, what to call, and how much is missing, for what it was to be spent.
     expect(answer.text).toContain(ACCOUNT);
+    expect(answer.text).toMatch(/more to commit and reveal\./);
     expect(answer.text).toContain(`storage_deposit on the contract with account_id ${ACCOUNT}`);
     expect(answer.text).toContain(view === null ? "11570000000000000000000" : "yoctoNEAR");
   }
@@ -1640,6 +1678,31 @@ test("fc_key_commit_with_low_storage_refuses", async () => {
     /^STORAGE_LOW: /,
   );
   expect(unknown.chain.commit).not.toHaveBeenCalled();
+});
+
+test("a_pending_commit_that_needs_storage_stops_and_keeps_its_draft", async () => {
+  // The draft of a commit that may not have landed is finished with its own commitment, and the
+  // storage is made good first, as for a new one: a key that cannot pay is told so in the same words.
+  const draft = makeDraft("7");
+  await state.saveDraft(draft);
+  const { call, chain } = await connectWrite({ keyKind: "function_call" });
+  chain.storageBalanceOf.mockResolvedValue(null);
+
+  const answer = await call("commit_result", { task_id: "7", content: "answer for task 7" });
+
+  expect(answer.isError).toBe(true);
+  expect(answer.text).toMatch(/^STORAGE_LOW: .*more to commit and reveal\./);
+  // The chain was asked and does not have the commit; nothing was sent and the draft is as it was.
+  expect(chain.getEntry).toHaveBeenCalledExactlyOnceWith(7n, ACCOUNT);
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await draftOf("7")).toEqual(draft);
+
+  // A full-access key pays, and the same draft goes out.
+  const full = await connectWrite({ keyKind: "full_access" });
+  full.chain.storageBalanceOf.mockResolvedValue(null);
+  await full.callJson("commit_result", { task_id: "7", content: "answer for task 7" });
+  expect(full.chain.storageDeposit).toHaveBeenCalledTimes(1);
+  expect(full.chain.commit).toHaveBeenCalledExactlyOnceWith(7n, draft.commitment);
 });
 
 test("commit_after_crash_resends_same_commitment", async () => {
@@ -1874,7 +1937,10 @@ test("contract_error_code_surfaces", async () => {
     [
       "pick_winners",
       { task_id: "7", winners: [{ account: ACCOUNT, bps: 10_000 }], scorecard: SCORECARD },
-      () => chain.pick.mockRejectedValue(refusal("E_AUTH", "only the verifier can pick")),
+      () => {
+        api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+        chain.pick.mockRejectedValue(refusal("E_AUTH", "only the verifier can pick"));
+      },
     ],
     [
       "deposit",
@@ -2053,18 +2119,100 @@ test("reveal_retry_after_a_failure_uploads_again_and_reveals_once", async () => 
 
 test("reveal_after_a_crash_between_the_reveal_and_the_mark", async () => {
   // The reveal went through, then the process died before the draft was marked. The next call
-  // uploads and reveals again, is told the entry is revealed (E_REVEALED), and marks the draft.
+  // uploads and reveals again, is told the entry is revealed (E_REVEALED), asks the chain, and marks
+  // the draft with the uri that the chain has on the entry.
   const draft = makeDraft("7", { committedAt: "2026-11-04T09:30:00.000Z" });
   await state.saveDraft(draft);
   const { callJson, chain } = await connectWrite();
+  const onChain = `${BLOBS}/the-first-upload`;
   chain.reveal.mockRejectedValueOnce(new TenderError("E_REVEALED", "E_REVEALED: already revealed"));
+  chain.getEntry.mockResolvedValue(revealedEntryView(draft, onChain));
 
   const answer = await callJson("reveal_result", { task_id: "7" });
 
-  const uri = `${BLOBS}/${draft.contentHash}`;
-  expect(answer).toMatchObject({ uri, tx_hash: null });
+  expect(chain.getEntry).toHaveBeenCalledExactlyOnceWith(7n, ACCOUNT);
+  expect(answer).toMatchObject({ uri: onChain, tx_hash: null });
   expect(answer).toHaveProperty("note", expect.stringMatching(/revealed already/));
-  expect((await draftOf("7")).revealedUri).toBe(uri);
+  expect((await draftOf("7")).revealedUri).toBe(onChain);
+});
+
+test("a_reveal_that_landed_is_recognised_after_the_reveal_deadline", async () => {
+  // The contract checks the phase before it checks for a second reveal, so once the window has
+  // closed a retry of a reveal that landed is answered E_PHASE and not E_REVEALED. The entry on
+  // chain says what happened: it holds this draft's work.
+  const draft = makeDraft("7", { committedAt: "2026-11-04T09:30:00.000Z" });
+  await state.saveDraft(draft);
+  const { callJson, chain, mcp } = await connectWrite();
+  const onChain = `${BLOBS}/the-first-upload`;
+  chain.reveal.mockRejectedValue(
+    new TenderError("E_PHASE", "E_PHASE: task 7 is not in its reveal window"),
+  );
+  chain.getEntry.mockResolvedValue(revealedEntryView(draft, onChain));
+
+  // The description promises it, so that an agent knows to call again after the deadline.
+  const { tools } = await mcp.listTools();
+  expect(tools.find((tool) => tool.name === "reveal_result")?.description).toMatch(
+    /even after the reveal deadline/,
+  );
+
+  const answer = await callJson("reveal_result", { task_id: "7" });
+
+  expect(chain.reveal).toHaveBeenCalledTimes(1);
+  expect(answer).toMatchObject({ uri: onChain, tx_hash: null });
+  expect(answer).toHaveProperty("note", expect.stringMatching(/revealed already/));
+  expect(await draftOf("7")).toEqual({ ...draft, revealedUri: onChain });
+
+  // Once marked, a further call sends nothing and asks nothing.
+  chain.getEntry.mockClear();
+  expect(await callJson("reveal_result", { task_id: "7" })).toMatchObject({
+    uri: onChain,
+    tx_hash: null,
+  });
+  expect(chain.reveal).toHaveBeenCalledTimes(1);
+  expect(chain.getEntry).not.toHaveBeenCalled();
+});
+
+test("a_reveal_the_contract_refused_is_an_error_unless_the_chain_holds_this_work", async () => {
+  const draft = makeDraft("7", { committedAt: "2026-11-04T09:30:00.000Z" });
+  const late = new TenderError("E_PHASE", "E_PHASE: task 7 is not in its reveal window");
+  const elsewhere = revealedEntryView(draft, `${BLOBS}/other`);
+  const answers: Array<[string, () => Promise<EntryView | null>]> = [
+    ["no entry", async () => null],
+    ["an entry that is not revealed", async () => entryView(draft.commitment)],
+    [
+      "an entry revealed with other work",
+      async () => ({ ...elsewhere, content_hash: "ee".repeat(32) }),
+    ],
+    [
+      "a chain that cannot be asked",
+      async () => {
+        throw new Error("RPC is down");
+      },
+    ],
+  ];
+
+  for (const [what, answer] of answers) {
+    await state.saveDraft(draft);
+    const { call, chain } = await connectWrite();
+    chain.reveal.mockRejectedValue(late);
+    chain.getEntry.mockImplementation(answer);
+
+    // The reveal's own refusal is what the agent reads, and nothing is marked.
+    const refused = await call("reveal_result", { task_id: "7" });
+    expect(refused, what).toEqual({
+      isError: true,
+      text: "E_PHASE: task 7 is not in its reveal window",
+    });
+    expect((await draftOf("7")).revealedUri, what).toBeUndefined();
+  }
+
+  // A failure that is not the contract's says nothing about the entry, and nothing asks the chain.
+  await state.saveDraft(draft);
+  const { call, chain } = await connectWrite();
+  chain.reveal.mockRejectedValue(new Error("socket hang up"));
+  expect((await call("reveal_result", { task_id: "7" })).text).toMatch(/^ERROR: socket hang up/);
+  expect(chain.getEntry).not.toHaveBeenCalled();
+  expect((await draftOf("7")).revealedUri).toBeUndefined();
 });
 
 test("reveal_whose_draft_cannot_be_marked_is_retried", async () => {
@@ -2086,9 +2234,11 @@ test("reveal_whose_draft_cannot_be_marked_is_retried", async () => {
 
   // The next call, with a disk that works, finds it revealed and marks it.
   const second = await connectWrite();
+  const uri = `${BLOBS}/${draft.contentHash}`;
   second.chain.reveal.mockRejectedValueOnce(new TenderError("E_REVEALED", "E_REVEALED: done"));
+  second.chain.getEntry.mockResolvedValue(revealedEntryView(draft, uri));
   await second.callJson("reveal_result", { task_id: "7" });
-  expect((await draftOf("7")).revealedUri).toBe(`${BLOBS}/${draft.contentHash}`);
+  expect((await draftOf("7")).revealedUri).toBe(uri);
 });
 
 test("a_revealed_draft_is_not_revealed_again", async () => {
@@ -2464,6 +2614,7 @@ test("fc_key_spend_tools_explain_and_skip_tx", async () => {
 
 test("pick_winners_uploads_the_scorecard_then_picks", async () => {
   const { callJson, chain, api } = await connectWrite({ keyKind: "function_call" });
+  api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
   const winners = [{ account: ACCOUNT, bps: 10_000 }];
 
   const answer = await callJson("pick_winners", { task_id: "7", winners, scorecard: SCORECARD });
@@ -2479,16 +2630,45 @@ test("pick_winners_uploads_the_scorecard_then_picks", async () => {
   expect(api.uploadBlob.mock.invocationCallOrder[0]).toBeLessThan(
     chain.pick.mock.invocationCallOrder[0] ?? 0,
   );
+  // The task's entries are read before anything is published: that is what the winners are held to.
+  expect(api.getTask).toHaveBeenCalledWith(7n);
+  expect(api.getTask.mock.invocationCallOrder[0]).toBeLessThan(
+    api.uploadBlob.mock.invocationCallOrder[0] ?? 0,
+  );
   expect(answer).toEqual({
     tx_hash: "TX_PICK",
     scorecard_uri: `${BLOBS}/${hash}`,
     scorecard_hash: hash,
   });
 
-  // A pick that awards nothing is a scorecard with no winners.
+  // A pick that awards nothing is a scorecard with no winners, and has no entry to look up.
+  api.getTask.mockClear();
   const none = { ...SCORECARD, winners: [] };
   await callJson("pick_winners", { task_id: "7", winners: [], scorecard: none });
   expect(chain.pick.mock.calls[1]?.[1]).toEqual([]);
+  expect(api.getTask).not.toHaveBeenCalled();
+});
+
+test("pick_winners_pays_a_split_that_the_contract_takes", async () => {
+  const { callJson, chain, api } = await connectWrite();
+  api.getTask.mockResolvedValue(revealedBy([ACCOUNT, OTHER], { max_winners: 2 }));
+  const winners = [
+    { account: ACCOUNT, bps: 6_000 },
+    { account: OTHER, bps: 4_000 },
+  ];
+
+  await callJson("pick_winners", {
+    task_id: "7",
+    winners,
+    scorecard: { ...SCORECARD, winners },
+  });
+
+  expect(chain.pick).toHaveBeenCalledExactlyOnceWith(
+    7n,
+    winners,
+    expect.stringMatching(HEX64),
+    expect.any(String),
+  );
 });
 
 test("pick_winners_checks_the_scorecard_before_it_publishes_it", async () => {
@@ -2545,6 +2725,205 @@ test("pick_winners_checks_the_scorecard_before_it_publishes_it", async () => {
   expect(chain.pick).not.toHaveBeenCalled();
 });
 
+test("pick_winners_publishes_only_the_scorecard_of_the_account_that_picks", async () => {
+  // A scorecard is public, immutable and hashed on chain, and it says who made it. The API serves
+  // whichever one the pick names without reading that field, so this tool is where it is held to:
+  // a pick by alice cannot publish a scorecard that says bob, or the Judge, scored the task.
+  const { call, chain, api } = await connectWrite({
+    keyKind: "function_call",
+    judgeAccount: "judge.testnet",
+  });
+  api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+  const winners = [{ account: ACCOUNT, bps: 10_000 }];
+
+  for (const [whose, scorecard] of [
+    ["another verifier's", { ...SCORECARD, verifier: OTHER }],
+    // What get_scorecard returns for a task the Judge scored, copied in whole.
+    ["the Judge's", JUDGE_SCORECARD],
+  ] as const) {
+    const answer = await call("pick_winners", { task_id: "7", winners, scorecard });
+    expect(answer.isError, whose).toBe(true);
+    expect(answer.text, whose).toMatch(/^SCORECARD_MISMATCH: .*verifier/);
+    // It names both accounts, so that the agent can see what to change.
+    expect(answer.text, whose).toContain(scorecard.verifier);
+    expect(answer.text, whose).toContain(ACCOUNT);
+  }
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+  expect(chain.pick).not.toHaveBeenCalled();
+
+  // Its own is taken, and so is a scorecard that names the poster, who may pick after the verifier's
+  // window: it is whoever picks that signs.
+  const poster = await connectWrite({ accountId: POSTER, judgeAccount: "judge.testnet" });
+  poster.api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+  expect(
+    (
+      await poster.call("pick_winners", {
+        task_id: "7",
+        winners,
+        scorecard: { ...SCORECARD, verifier: POSTER },
+      })
+    ).isError,
+  ).toBe(false);
+  expect(poster.chain.pick).toHaveBeenCalledTimes(1);
+});
+
+test("only_the_judge_account_may_publish_a_scorecard_in_the_judge_software", async () => {
+  // The schema says that none but the Judge may claim to be the Judge, and nothing downstream reads
+  // `judge.software`: a verifier's scorecard that claims it would read as the Judge's own.
+  const winners = [{ account: ACCOUNT, bps: 10_000 }];
+  const arrange = async (overrides: Partial<McpDeps>) => {
+    const kit = await connectWrite(overrides);
+    kit.api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+    return kit;
+  };
+  const claims = [
+    "tender-judge/1",
+    "tender-judge",
+    "tender-judge-2/beta",
+    "Tender-Judge/1",
+    " tender-judge/1",
+  ];
+
+  // Not the Judge's account: refused, whether the server knows a Judge account or not.
+  for (const judgeAccount of ["judge.testnet", undefined]) {
+    const { call, chain, api } = await arrange({ judgeAccount });
+    for (const software of claims) {
+      const scorecard = { ...SCORECARD, judge: { software, model: null } };
+      const answer = await call("pick_winners", { task_id: "7", winners, scorecard });
+      expect(answer.isError, software).toBe(true);
+      expect(answer.text, software).toMatch(/^SCORECARD_MISMATCH: .*tender-judge/);
+    }
+    expect(api.uploadBlob).not.toHaveBeenCalled();
+    expect(chain.pick).not.toHaveBeenCalled();
+  }
+
+  // Names that only mention it, or are some other software's, are free to use.
+  const free = await arrange({ judgeAccount: "judge.testnet" });
+  for (const software of ["not-tender-judge/1", "my-judge/1", "judge", "a"]) {
+    const scorecard = { ...SCORECARD, judge: { software, model: null } };
+    expect((await free.call("pick_winners", { task_id: "7", winners, scorecard })).isError).toBe(
+      false,
+    );
+  }
+
+  // The Judge's own account does name it. Here the server signs as the Judge.
+  const asJudge = await arrange({ accountId: "judge.testnet", judgeAccount: "judge.testnet" });
+  const answer = await asJudge.call("pick_winners", {
+    task_id: "7",
+    winners,
+    scorecard: JUDGE_SCORECARD,
+  });
+  expect(answer.isError, answer.text).toBe(false);
+  expect(asJudge.chain.pick).toHaveBeenCalledTimes(1);
+});
+
+test("pick_winners_checks_the_contracts_winner_rules_before_it_publishes_anything", async () => {
+  // The contract refuses a pick whose winners break its rules (E_WINNERS), and by then the scorecard
+  // would be public and could not be taken back. The same rules are checked first.
+  const pays = (...accounts: string[]) => revealedBy(accounts, { max_winners: 2 });
+  const w = (account: string, bps: number) => ({ account, bps });
+  const cases: Array<[string, TaskDetailResponse | null, ReturnType<typeof w>[], RegExp]> = [
+    [
+      "shares that add up to less",
+      pays(ACCOUNT, OTHER),
+      [w(ACCOUNT, 5_000), w(OTHER, 4_000)],
+      /^INVALID_WINNERS: .*9000.*exactly 10000/,
+    ],
+    [
+      "shares that add up to more",
+      pays(ACCOUNT, OTHER),
+      [w(ACCOUNT, 6_000), w(OTHER, 5_000)],
+      /^INVALID_WINNERS: .*11000.*exactly 10000/,
+    ],
+    [
+      "one share that is not the whole",
+      pays(ACCOUNT),
+      [w(ACCOUNT, 9_999)],
+      /^INVALID_WINNERS: .*9999.*exactly 10000/,
+    ],
+    [
+      "an account named twice",
+      pays(ACCOUNT, OTHER),
+      [w(ACCOUNT, 5_000), w(ACCOUNT, 5_000)],
+      /^INVALID_WINNERS: .*alice\.testnet.*more than once/,
+    ],
+    [
+      "more winners than the task pays",
+      pays(ACCOUNT, OTHER, "carol.testnet"),
+      [w(ACCOUNT, 4_000), w(OTHER, 3_000), w("carol.testnet", 3_000)],
+      /^INVALID_WINNERS: .*at most 2 winners.*3/,
+    ],
+    [
+      "a winner with no entry",
+      pays(ACCOUNT),
+      [w("carol.testnet", 10_000)],
+      /^INVALID_WINNERS: .*carol\.testnet.*no revealed entry/,
+    ],
+    [
+      "a second winner with no entry",
+      pays(ACCOUNT, OTHER),
+      [w(ACCOUNT, 5_000), w("carol.testnet", 5_000)],
+      /^INVALID_WINNERS: .*carol\.testnet.*no revealed entry/,
+    ],
+    [
+      "a winner whose entry is not revealed",
+      makeDetail([makeEntry(ACCOUNT, { revealed: false })]),
+      [w(ACCOUNT, 10_000)],
+      /^INVALID_WINNERS: .*alice\.testnet.*no revealed entry/,
+    ],
+    [
+      "a revealed entry that is another account's",
+      pays(OTHER),
+      [w(ACCOUNT, 10_000)],
+      /^INVALID_WINNERS: .*alice\.testnet.*no revealed entry/,
+    ],
+    ["a task the API does not know", null, [w(ACCOUNT, 10_000)], /^NO_TASK: .*task 7/],
+  ];
+  for (const [what, detail, winners, expected] of cases) {
+    const { call, chain, api } = await connectWrite();
+    api.getTask.mockResolvedValue(detail);
+
+    const answer = await call("pick_winners", {
+      task_id: "7",
+      winners,
+      scorecard: { ...SCORECARD, winners },
+    });
+
+    expect(answer.isError, what).toBe(true);
+    expect(answer.text, what).toMatch(expected);
+    expect(api.uploadBlob, what).not.toHaveBeenCalled();
+    expect(chain.pick, what).not.toHaveBeenCalled();
+  }
+
+  // The task cannot be read: nothing is published on a guess.
+  const down = await connectWrite();
+  down.api.getTask.mockRejectedValue(new ApiError(503, { error: "unavailable", message: "later" }));
+  const answer = await down.call("pick_winners", {
+    task_id: "7",
+    winners: [w(ACCOUNT, 10_000)],
+    scorecard: SCORECARD,
+  });
+  expect(answer.isError).toBe(true);
+  expect(answer.text).toMatch(/^API_ERROR: /);
+  expect(down.api.uploadBlob).not.toHaveBeenCalled();
+  expect(down.chain.pick).not.toHaveBeenCalled();
+});
+
+test("pick_winners_says_what_a_scorecard_must_be_and_how_shares_add_up", async () => {
+  const { mcp } = await connect();
+  const { tools } = await mcp.listTools();
+  const description = tools.find((tool) => tool.name === "pick_winners")?.description ?? "";
+
+  // The shares are not "up to" 10000: they are exactly 10000.
+  expect(description).toMatch(/exactly 10000/);
+  expect(description).not.toMatch(/10000 is all of it/);
+  // The scorecard is the picker's own, and get_scorecard (the Judge's) is for its shape.
+  expect(description).toMatch(/verifier/);
+  expect(description).toMatch(/your own|your account/);
+  expect(description).toMatch(/tender-judge/);
+  expect(description).toMatch(/INVALID_WINNERS/);
+});
+
 test("register_agent_uploads_the_profile_then_registers", async () => {
   const { callJson, chain, api } = await connectWrite({ keyKind: "function_call" });
   const profile = {
@@ -2592,6 +2971,88 @@ test("register_agent_uploads_the_profile_then_registers", async () => {
       true,
     );
   }
+});
+
+const PROFILE = { name: "Alice", description: "An agent", tags: ["data"] };
+
+test("register_agent_registers_storage_first", async () => {
+  // The contract charges the profile to the caller's storage balance (E_STORAGE without one), as
+  // it does for a deposit, so the balance is made good before anything is uploaded or sent.
+  const { callJson, chain, api } = await connectWrite({ keyKind: "full_access" });
+  chain.storageBalanceOf.mockResolvedValue(null);
+
+  const first = await callJson("register_agent", PROFILE);
+
+  expect(chain.storageBalanceOf).toHaveBeenCalledWith(ACCOUNT);
+  expect(chain.storageDeposit).toHaveBeenCalledExactlyOnceWith(
+    11_570_000_000_000_000_000_000n + 10n ** 22n,
+  );
+  const [registered] = chain.storageDeposit.mock.invocationCallOrder;
+  expect(registered ?? Number.MAX_SAFE_INTEGER).toBeLessThan(
+    api.uploadBlob.mock.invocationCallOrder[0] ?? 0,
+  );
+  expect(registered ?? Number.MAX_SAFE_INTEGER).toBeLessThan(
+    chain.registerAgent.mock.invocationCallOrder[0] ?? 0,
+  );
+  // The agent is told that NEAR was spent for it.
+  expect(first).toMatchObject({ tx_hash: "TX_AGENT" });
+  expect(first).toHaveProperty(
+    "note",
+    expect.stringMatching(/added 0\.02157 NEAR to your storage deposit in tender\.testnet first/),
+  );
+
+  // Room in the storage balance: nothing is added, and nothing is said.
+  chain.storageDeposit.mockClear();
+  chain.storageBalanceOf.mockResolvedValue(ROOMY);
+  const again = await callJson("register_agent", PROFILE);
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(again).not.toHaveProperty("note");
+
+  // A top-up that fails stops the registration before the profile goes up.
+  const stuck = await connectWrite({ keyKind: "full_access" });
+  stuck.chain.storageBalanceOf.mockResolvedValue(null);
+  stuck.chain.storageDeposit.mockRejectedValue(new Error("not enough NEAR on the account"));
+  expect(await stuck.call("register_agent", PROFILE)).toEqual({
+    isError: true,
+    text: "ERROR: not enough NEAR on the account",
+  });
+  expect(stuck.api.uploadBlob).not.toHaveBeenCalled();
+  expect(stuck.chain.registerAgent).not.toHaveBeenCalled();
+});
+
+test("register_agent_with_a_key_that_cannot_pay_says_who_must", async () => {
+  // A function-call key may register (it attaches no deposit) but cannot top its storage up, so the
+  // tool says whom to ask, as a commit does, in words that fit what it was doing.
+  for (const keyKind of ["function_call", "unknown"] as const) {
+    const { call, chain, api } = await connectWrite({ keyKind });
+    chain.storageBalanceOf.mockResolvedValue(null);
+
+    const answer = await call("register_agent", PROFILE);
+
+    expect(answer.isError, keyKind).toBe(true);
+    expect(answer.text, keyKind).toMatch(/^STORAGE_LOW: /);
+    expect(answer.text, keyKind).toContain(
+      `storage_deposit on the contract with account_id ${ACCOUNT}`,
+    );
+    expect(answer.text, keyKind).toMatch(/more to register a profile\./);
+    expect(answer.text, keyKind).not.toMatch(/commit and reveal/);
+    expect(chain.storageDeposit).not.toHaveBeenCalled();
+    expect(api.uploadBlob).not.toHaveBeenCalled();
+    expect(chain.registerAgent).not.toHaveBeenCalled();
+  }
+
+  // With enough storage the same key registers.
+  const roomy = await connectWrite({ keyKind: "function_call" });
+  expect((await roomy.call("register_agent", PROFILE)).isError).toBe(false);
+});
+
+test("register_agent_says_that_it_adds_the_storage_it_needs", async () => {
+  const { mcp } = await connect();
+  const { tools } = await mcp.listTools();
+  const description = tools.find((tool) => tool.name === "register_agent")?.description ?? "";
+
+  expect(description).toMatch(/storage deposit/);
+  expect(description).toMatch(/STORAGE_LOW/);
 });
 
 test("deposit_and_withdraw_take_raw_amounts_of_the_default_token", async () => {
@@ -2807,7 +3268,10 @@ test("write_errors_never_contain_secrets", async () => {
     [
       "pick_winners",
       { task_id: "7", winners: [{ account: ACCOUNT, bps: 10_000 }], scorecard: SCORECARD },
-      () => chain.pick.mockRejectedValue(new Error(leak)),
+      () => {
+        api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+        chain.pick.mockRejectedValue(new Error(leak));
+      },
     ],
   ];
   for (const [name, args, arrange] of failures) {
@@ -2829,14 +3293,21 @@ test("write_errors_never_contain_secrets", async () => {
     expect(answer.text, name).toContain("<url>");
   }
 
-  // The key is not a path out of a draft's error either: the store names a file and never quotes it.
+  // A draft's error does not carry the draft either: the store names a file and never quotes it.
+  // The salt and the work are not among the server's secrets, so the scrubber would not cut them:
+  // this fails if the store ever quotes the file.
+  const salt = "9f".repeat(32);
+  const work = "the work that nobody may read before the reveal";
   await writeFile(
     join(dir, "drafts", "6.json"),
-    JSON.stringify({ taskId: "6", salt: SECRET_BODY }),
+    JSON.stringify({ taskId: "6", salt, contentBase64: Buffer.from(work).toString("base64") }),
   );
   const corrupt = await call("reveal_result", { task_id: "6" });
   expect(corrupt.isError).toBe(true);
-  expect(corrupt.text).not.toContain(SECRET_BODY);
+  expect(corrupt.text).toMatch(/^DRAFT_UNREADABLE: .*6\.json is corrupt/);
+  expect(corrupt.text).not.toContain(salt);
+  expect(corrupt.text).not.toContain(work);
+  expect(corrupt.text).not.toContain(Buffer.from(work).toString("base64"));
 
   // A server told no secrets still cuts the bearer tokens and the URLs.
   const bare = await connectWrite({ keyKind: "full_access" });
@@ -2922,6 +3393,149 @@ test("a_commit_whose_draft_cannot_be_marked_is_found_on_chain_next_time", async 
   expect((await draftOf("7")).committedAt).toMatch(ISO);
 });
 
+test("the_notes_about_a_draft_that_could_not_be_marked_never_carry_a_secret", async () => {
+  // These notes ride in an answer that succeeded, so no `guarded` cuts them: they are cleaned as a
+  // failure's text is, whatever the disk's error says.
+  const leak = `cannot write with ${SECRET_KEY} (${SECRET_BODY}) at https://rpc.example.com/?apiKey=URLKEY, Bearer abc123.DEF-456_ghi=`;
+  const secrets = [SECRET_KEY, SECRET_BODY];
+  const expectClean = (note: string) => {
+    for (const secret of [SECRET_KEY, SECRET_BODY, "URLKEY", "abc123", "rpc.example.com"]) {
+      expect(note, secret).not.toContain(secret);
+    }
+    expect(note).toContain("<redacted>");
+    expect(note).toContain("<url>");
+  };
+
+  // A commit that landed, and a draft that cannot be marked committed.
+  const cannotMarkCommit: StateStore = {
+    ...state,
+    saveDraft: async (draft) => {
+      if (draft.committedAt !== undefined) throw new Error(leak);
+      await state.saveDraft(draft);
+    },
+  };
+  const committing = await connectWrite({ state: cannotMarkCommit, secrets });
+  const committed = (await committing.callJson("commit_result", {
+    task_id: "7",
+    content: "a",
+  })) as { note: string };
+  expect(committed.note).toMatch(/could not be marked as committed/);
+  expectClean(committed.note);
+
+  // A reveal that landed, and a draft that cannot be marked revealed.
+  await state.saveDraft(makeDraft("8", { committedAt: "2026-11-04T09:30:00.000Z" }));
+  const cannotMarkReveal: StateStore = {
+    ...state,
+    markRevealed: async () => {
+      throw new Error(leak);
+    },
+  };
+  const revealing = await connectWrite({ state: cannotMarkReveal, secrets });
+  const revealed = (await revealing.callJson("reveal_result", { task_id: "8" })) as {
+    note: string;
+  };
+  expect(revealed.note).toMatch(/could not be marked as revealed/);
+  expectClean(revealed.note);
+});
+
+test("the_draft_errors_the_read_tools_report_never_carry_a_secret", async () => {
+  // `draft_error` and `drafts_error` ride in answers that succeeded, as the notes above do.
+  const leak = `cannot read ${SECRET_KEY} (${SECRET_BODY}) at https://rpc.example.com/?apiKey=URLKEY, Bearer abc123.DEF-456_ghi=`;
+  const cannotRead: StateStore = {
+    ...state,
+    getDraft: async () => {
+      throw new Error(`${leak} (one draft)`);
+    },
+    listDrafts: async () => {
+      throw new Error(`${leak} (all drafts)`);
+    },
+  };
+  const entry = {
+    task_id: "7",
+    title: "Task 7",
+    phase: "revealing" as const,
+    revealed: false,
+    won: false,
+    entry_index: 0,
+    committed_height: "30",
+    content_hash: null,
+    uri: null,
+  };
+  const { callJson } = await connect({
+    state: cannotRead,
+    secrets: [SECRET_KEY, SECRET_BODY],
+    api: fakeApi({
+      getTask: async () => makeDetail([]),
+      listEntries: async () => ({ entries: [entry] }),
+    }),
+  });
+  const expectClean = (text: string) => {
+    for (const secret of [SECRET_KEY, SECRET_BODY, "URLKEY", "abc123", "rpc.example.com"]) {
+      expect(text, secret).not.toContain(secret);
+    }
+    expect(text).toContain("<redacted>");
+    expect(text).toContain("<url>");
+  };
+
+  const task = (await callJson("get_task", { task_id: "7" })) as {
+    own_entry: { draft_error: string };
+  };
+  expect(task.own_entry.draft_error).toContain("(one draft)");
+  expectClean(task.own_entry.draft_error);
+
+  // Both the failure of the listing and the failure of the entry's own draft are in the answer.
+  const mine = (await callJson("my_entries")) as { drafts_error: string };
+  expect(mine.drafts_error).toContain("(all drafts)");
+  expect(mine.drafts_error).toContain("(one draft)");
+  expectClean(mine.drafts_error);
+});
+
+test("commit_refuses_a_result_that_holds_a_secret_of_the_server", async () => {
+  // reveal_result publishes the work, and the scrubber only ever sees what a tool says. A result
+  // that holds the private key, or another secret the server was given, would be made public by it.
+  const files = await makeFilesDir();
+  await writeFile(join(files, "notes.txt"), `my key: ${SECRET_KEY}\n`);
+  await writeFile(join(files, "body.txt"), `just the body ${SECRET_BODY}`);
+  const { call, chain, api } = await connectWrite({
+    keyKind: "full_access",
+    filesDir: files,
+    // An empty string in the list is no secret, and must not stop every commit.
+    secrets: [SECRET_KEY, SECRET_BODY, "another-api-key-value", ""],
+  });
+  chain.storageBalanceOf.mockResolvedValue(null);
+
+  const attempts: Array<[string, Record<string, string>]> = [
+    ["the key in the text", { content: `here it is: ${SECRET_KEY}` }],
+    ["its body alone", { content: SECRET_BODY }],
+    ["another secret the server holds", { content: "token=another-api-key-value;" }],
+    ["the key in a file", { file_path: join(files, "notes.txt") }],
+    ["its body in a file", { file_path: join(files, "body.txt") }],
+  ];
+  for (const [what, input] of attempts) {
+    const answer = await call("commit_result", { task_id: "7", ...input });
+
+    expect(answer.isError, what).toBe(true);
+    expect(answer.text, what).toMatch(/^SECRET_IN_CONTENT: /);
+    // It never quotes what it found.
+    for (const secret of [SECRET_KEY, SECRET_BODY, "another-api-key-value"]) {
+      expect(answer.text, what).not.toContain(secret);
+    }
+  }
+  // Nothing was looked up, spent, saved or sent.
+  expect(api.getTask).not.toHaveBeenCalled();
+  expect(chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+
+  // A result without one goes through, and text that merely resembles a key does.
+  for (const content of ["forty-two", "ed25519:not-the-key", "5zQ9fake"]) {
+    const answer = await call("commit_result", { task_id: "7", content });
+    expect(answer.isError, content).toBe(false);
+    await rm(join(dir, "drafts", "7.json"), { force: true });
+  }
+});
+
 test("the_lookups_the_api_only_lends_may_fail_without_failing_the_tool", async () => {
   // reveal_opens_at and the content type are conveniences from the API; the chain and the draft are
   // all that a commit and a reveal need.
@@ -2951,6 +3565,7 @@ test("a_document_the_api_stored_under_another_hash_is_not_sent_to_the_chain", as
     judgeAccount: "judge.testnet",
   });
   api.uploadBlob.mockResolvedValue({ sha256: "ee".repeat(32), uri: `${BLOBS}/${"ee".repeat(32)}` });
+  api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
 
   const attempts: Array<[string, Record<string, unknown>]> = [
     ["post_task", POST_ARGS],

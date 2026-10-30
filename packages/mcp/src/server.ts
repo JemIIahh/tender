@@ -55,7 +55,9 @@ export interface McpDeps {
   filesDir?: string;
   /**
    * Strings that no tool may ever answer with, such as the private key and its base58 body. A
-   * failed tool's text has them cut out; a bearer token and a URL are cut whether listed or not.
+   * failed tool's text has them cut out, and so has any error text in an answer that succeeded; a
+   * bearer token and a URL are cut whether listed or not. `commit_result` refuses a result that
+   * holds one, since a reveal would publish it.
    */
   secrets?: readonly string[];
 }

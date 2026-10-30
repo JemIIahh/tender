@@ -64,7 +64,16 @@ import {
 // FILES. `commit_result` takes its work as text or as a file, and `reveal_result` later publishes
 // it, so a file path is a way to publish whatever the server can read. The server therefore reads
 // only inside the one directory that the user named (`filesDir`, from `TENDER_FILES_DIR`), and
-// none at all when there is none (P04-R1).
+// none at all when there is none (P04-R1). Work that holds one of the server's own secrets is
+// refused, whether it came as text or as a file, since the scrubber sees what a tool says and never
+// what a reveal uploads.
+//
+// PICKS. A scorecard is public, immutable and hashed on chain, and it says who made it. The API
+// serves whichever one a pick names without reading that field, so `pick_winners` is where a
+// scorecard is held to its picker: it must name the account that signs, and only the Judge's
+// account may name the Judge's software. The contract's rules for the winners (`E_WINNERS`) are
+// checked before the upload too, since a pick that the chain then refuses would leave the scorecard
+// public all the same.
 
 /** The most bytes a result may have: a brief's `output.max_bytes` can be no more. */
 const MAX_RESULT = MAX_RESULT_BYTES;
@@ -91,6 +100,13 @@ const REFUSED_FOR_GOOD: ReadonlySet<string> = new Set([
 ]);
 /** How long the reason stored with a retired draft may be. */
 const MAX_REASON = 300;
+/**
+ * A `judge.software` that claims to be the team's Judge, which writes `tender-judge/1`. The name is
+ * free text, so it is matched in any case and after spaces.
+ */
+const JUDGE_SOFTWARE = /^\s*tender-judge/i;
+/** What the winners' shares of a pick add up to, in basis points. */
+const BPS_WHOLE = 10_000;
 
 const FULL_ACCESS_ONLY =
   "this tool moves money; run it with a full-access key or set up a delegate key with caps (docs/MCP.md)";
@@ -281,6 +297,13 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     }
   }
 
+  /** Whether `bytes` hold any secret of the server, which a reveal would make public. */
+  function holdsSecret(bytes: Uint8Array): boolean {
+    const work = Buffer.from(bytes);
+    // An empty string is in every text, and is no secret.
+    return secrets.some((secret) => secret !== "" && work.includes(secret));
+  }
+
   /** The draft of `taskId`, or null. A draft that another account made is refused, not returned. */
   async function loadDraft(taskId: string): Promise<Draft | null> {
     let draft: Draft | null;
@@ -318,13 +341,14 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
   }
 
   /**
-   * Makes sure that `accountId` has the storage for an entry: 1,024 bytes of contract state, which
-   * a commit and a reveal need (an entry that runs out cannot reveal, and its window does not wait).
-   * A full-access key pays the shortfall in, and 0.01 NEAR more. Any other key cannot attach the
-   * deposit, so the call stops and says who must. Returns the yoctoNEAR that were added, 0 if none
-   * had to be.
+   * Makes sure that `accountId` has the storage for what it is about to do: 1,024 bytes of contract
+   * state. That is what an entry's commit and reveal need (an entry that runs out cannot reveal,
+   * and its window does not wait), and it covers a deposit's vault slot and a profile too. A
+   * full-access key pays the shortfall in, and 0.01 NEAR more. Any other key cannot attach the
+   * deposit, so the call stops and says who must; `purpose` is what it was going to do, in words
+   * that finish "more to ...". Returns the yoctoNEAR that were added, 0 if none had to be.
    */
-  async function ensureStorage(): Promise<bigint> {
+  async function ensureStorage(purpose: string): Promise<bigint> {
     const view = await client.storageBalanceOf(accountId);
     const shortfall = storageShortfall(view);
     if (shortfall === 0n) return 0n;
@@ -338,10 +362,18 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     throw new ToolError(
       "STORAGE_LOW",
       `${accountId} has ${has} in ${contractId} and needs ${shortfall} yoctoNEAR ` +
-        `(${formatNear(shortfall)}) more to commit and reveal. This key cannot attach a deposit, ` +
+        `(${formatNear(shortfall)}) more to ${purpose}. This key cannot attach a deposit, ` +
         `so nothing was sent. Ask a full-access account to call storage_deposit on the contract ` +
         `with account_id ${accountId} and at least that much attached; then call this tool again.`,
     );
+  }
+
+  /** The answer's note that NEAR was added to the storage deposit for `need`, if any was. */
+  function topUpNote(added: bigint, need: string): { note?: string } {
+    if (added === 0n) return {};
+    return {
+      note: `added ${formatNear(added)} to your storage deposit in ${contractId} first, which ${need} needs`,
+    };
   }
 
   /** Uploads a document the way every document goes up, and checks what the API stored. */
@@ -406,15 +438,18 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     }
   }
 
-  /** Marks the draft committed. The commit is on chain, so a disk that fails only costs a note. */
+  /**
+   * Marks the draft committed. The commit is on chain, so a disk that fails only costs a note. The
+   * note rides in an answer that succeeded, which no `guarded` cleans, so it is cleaned here.
+   */
   async function markCommitted(draft: Draft): Promise<string | undefined> {
     try {
       await state.saveDraft({ ...draft, committedAt: new Date().toISOString() });
       return undefined;
     } catch (error) {
       return (
-        `the draft could not be marked as committed (${errorText(error)}); calling commit_result ` +
-        "again will find the commit on chain and mark it"
+        `the draft could not be marked as committed (${scrub(errorText(error), secrets)}); ` +
+        "calling commit_result again will find the commit on chain and mark it"
       );
     }
   }
@@ -499,7 +534,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     if ("max" in allowed && bytes.length > allowed.max) {
       throw new ToolError("TOO_LARGE", `the task allows at most ${allowed.max} bytes`);
     }
-    await ensureStorage();
+    await ensureStorage("commit and reveal");
     const contentHash = sha256Hex(bytes);
     const salt = randomSalt();
     const draft: Draft = {
@@ -547,7 +582,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           .join(" "),
       );
     }
-    await ensureStorage();
+    await ensureStorage("commit and reveal");
     return sendCommit(draft, note);
   }
 
@@ -567,9 +602,11 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "Commit to your result for a task while it is open. Only a hash goes on chain; the work " +
         "stays secret until you call reveal_result after the commit window closes (reveal_opens_at). " +
         `${resultSource}, at most ${MAX_RESULT} bytes and no more than the task allows ` +
-        "(output.max_bytes in its brief; TOO_LARGE if it is more, before anything is sent). The " +
-        "work and a random salt are saved in a draft on this machine BEFORE the transaction is " +
-        "sent, so a crash loses nothing. If a call fails or the server stops, call commit_result " +
+        "(output.max_bytes in its brief; TOO_LARGE if it is more, before anything is sent). A " +
+        "result that holds this server's private key, or another secret it was given, is refused " +
+        "with SECRET_IN_CONTENT, since reveal_result publishes the work. The work and a random " +
+        "salt are saved in a draft on this machine BEFORE the transaction is sent, so a crash " +
+        "loses nothing. If a call fails or the server stops, call commit_result " +
         "again with the same content: it finds out whether the commit landed and finishes it with " +
         "the same salt, and sends nothing if it is done. Once committed, an answer cannot be " +
         "changed through this server: a task takes one result here, and a call with other content " +
@@ -607,6 +644,15 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         ? new TextEncoder().encode(content)
         : await readLocalFile(file_path ?? "", MAX_RESULT, filesDir);
       if (bytes.length > MAX_RESULT) throw tooLarge(bytes.length, MAX_RESULT);
+      if (holdsSecret(bytes)) {
+        // The text never says which secret, or where in the work it is.
+        throw new ToolError(
+          "SECRET_IN_CONTENT",
+          "the result holds a secret that this server was given (such as its private key), and " +
+            "reveal_result would publish it. Nothing was saved or sent: take the secret out of the " +
+            "result and call commit_result again",
+        );
+      }
 
       return withTaskLock(task_id, async () => {
         const draft = await loadDraft(task_id);
@@ -641,6 +687,22 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       return format === "json" || format === "regex_json" ? "application/json" : "text/plain";
     } catch {
       return "text/plain";
+    }
+  }
+
+  /**
+   * Where the chain has `accountId`'s entry revealed with this draft's work, or null if it does not
+   * (not revealed, other work, or the chain cannot be asked). It is how a reveal that landed is
+   * known when it is sent again: the contract answers E_REVEALED while the window is open, but
+   * checks the phase before it checks for a second reveal, so after the reveal deadline the answer
+   * is E_PHASE, which says nothing about the entry. The entry does.
+   */
+  async function revealedUri(draft: Draft): Promise<string | null> {
+    try {
+      const entry = await client.getEntry(BigInt(draft.taskId), accountId);
+      return entry?.content_hash === draft.contentHash ? entry.uri : null;
+    } catch {
+      return null;
     }
   }
 
@@ -709,26 +771,31 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
 
     const notes: string[] = [];
     let txHash: string | null = null;
+    let uri = stored.uri;
     try {
       txHash = (await client.reveal(BigInt(taskId), draft.contentHash, draft.salt, stored.uri))
         .txHash;
     } catch (error) {
-      // An earlier call revealed it and died before marking the draft: the work is out, so mark it.
-      if (!(error instanceof TenderError && error.code === "E_REVEALED")) throw error;
+      // An earlier call may have revealed it and died before marking the draft: the work is out, so
+      // mark it. The contract's refusal does not say so by itself (see `revealedUri`).
+      const landed = error instanceof TenderError ? await revealedUri(draft) : null;
+      if (landed === null) throw error;
+      uri = landed;
       notes.push(
         "this entry was revealed already (an earlier reveal went through); nothing more was sent",
       );
     }
     try {
-      await state.markRevealed(taskId, stored.uri);
+      await state.markRevealed(taskId, uri);
     } catch (error) {
+      // As in `markCommitted`, the note rides in an answer that succeeded.
       notes.push(
-        `the draft could not be marked as revealed (${errorText(error)}); calling reveal_result ` +
-          "again will mark it",
+        `the draft could not be marked as revealed (${scrub(errorText(error), secrets)}); ` +
+          "calling reveal_result again will mark it",
       );
     }
     return jsonResult({
-      uri: stored.uri,
+      uri,
       tx_hash: txHash,
       ...(notes.length > 0 && { note: notes.join(" ") }),
     });
@@ -743,9 +810,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "and before the reveal deadline. It uploads the saved work, which becomes public, and sends " +
         "the reveal with the salt that proves it is the work you committed to. If a call fails " +
         "part way, call it again: the upload is repeatable, and a reveal that already went " +
-        "through is recognised. Needs a draft from commit_result on this machine (NO_DRAFT " +
-        "otherwise). The draft lives in this server's state directory: two servers on one " +
-        "account's state directory are not supported.",
+        "through is recognised, even after the reveal deadline. Needs a draft from commit_result " +
+        "on this machine (NO_DRAFT otherwise). The draft lives in this server's state directory: " +
+        "two servers on one account's state directory are not supported.",
       inputSchema: { task_id: TaskId },
       annotations: IDEMPOTENT,
     },
@@ -920,24 +987,79 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
 
   // ---- pick_winners ---------------------------------------------------------------------------
 
+  /**
+   * The contract's rules for a non-empty pick (`E_WINNERS`, in `check_winners`), checked before the
+   * scorecard goes up: the shares add up to exactly 10,000, no account is named twice, the task pays
+   * that many winners, and each winner has a revealed entry. The shares and names are the arguments'
+   * own; the task and its entries come from the API, the one place that lists them. A pick that the
+   * chain then refused would still leave the scorecard public.
+   */
+  async function checkWinners(
+    taskId: string,
+    winners: ReadonlyArray<{ account: string; bps: number }>,
+  ): Promise<void> {
+    const total = winners.reduce((sum, winner) => sum + winner.bps, 0);
+    if (total !== BPS_WHOLE) {
+      throw new ToolError(
+        "INVALID_WINNERS",
+        `the shares add up to ${total}, and they must add up to exactly ${BPS_WHOLE}`,
+      );
+    }
+    const named = new Set<string>();
+    for (const { account } of winners) {
+      if (named.has(account)) {
+        throw new ToolError("INVALID_WINNERS", `${account} is named more than once`);
+      }
+      named.add(account);
+    }
+
+    const detail = await api.getTask(BigInt(taskId));
+    if (detail === null) {
+      throw new ToolError("NO_TASK", `the API has no task ${taskId}, so there is nothing to pick`);
+    }
+    const most = detail.task.max_winners;
+    if (winners.length > most) {
+      throw new ToolError(
+        "INVALID_WINNERS",
+        `task ${taskId} pays at most ${most} winners, and ${winners.length} were named`,
+      );
+    }
+    for (const { account } of winners) {
+      if (!detail.entries.some((entry) => entry.account === account && entry.revealed)) {
+        throw new ToolError(
+          "INVALID_WINNERS",
+          `${account} has no revealed entry in task ${taskId}, as far as the API knows. Only an ` +
+            "account that revealed can win; if it revealed a moment ago, the index may not have " +
+            "caught up yet, so wait a few seconds and call again",
+        );
+      }
+    }
+  }
+
   server.registerTool(
     "pick_winners",
     {
       title: "Pick the winners",
       description:
         "As a task's verifier, pick its winners. scorecard is the document that shows how every " +
-        "revealed entry scored (see get_scorecard for the shape): it is checked, published and its " +
-        "hash goes on chain with the pick. winners must be exactly the scorecard's winners: each " +
-        "account and its share in basis points of the reward after the fee (10000 is all of it); " +
-        "an empty list awards nothing. Read the entries with task_entries first. Final: a pick " +
-        "cannot be changed.",
+        "revealed entry scored: make it yourself from the entries (task_entries), with verifier " +
+        "set to your own account and judge.software naming your own software, because a " +
+        "scorecard is published in the name of whoever picks with it (SCORECARD_MISMATCH " +
+        "otherwise; software that starts with tender-judge is the Judge account's alone). " +
+        "get_scorecard shows the shape, but what it returns is the Judge's, so do not reuse it. " +
+        "The scorecard is checked, published and its hash goes on chain with the pick. winners " +
+        "must be exactly the scorecard's winners: each account and its share in basis points of " +
+        "the reward after the fee. A non-empty list must add up to exactly 10000, name each " +
+        "account once, name no more accounts than the task pays (max_winners) and only accounts " +
+        "that revealed an entry; INVALID_WINNERS otherwise, before anything is published. An " +
+        "empty list awards nothing. Final: a pick cannot be changed.",
       inputSchema: {
         task_id: TaskId,
         winners: z
           .array(
             z.strictObject({
               account: AccountIdSchema,
-              bps: z.int().min(1).max(10_000),
+              bps: z.int().min(1).max(BPS_WHOLE),
             }),
           )
           .max(5)
@@ -955,6 +1077,23 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           `the scorecard is for task ${card.data.task_id}, not task ${task_id}`,
         );
       }
+      // Nothing downstream reads these two fields, so this is where they are held to the picker.
+      if (card.data.verifier !== accountId) {
+        throw new ToolError(
+          "SCORECARD_MISMATCH",
+          `the scorecard names ${card.data.verifier} as its verifier, but this server picks as ` +
+            `${accountId}, and a scorecard is published in the name of the account that picks ` +
+            "with it. Make your own, naming you as its verifier; do not reuse another's, the " +
+            "Judge's from get_scorecard included",
+        );
+      }
+      if (JUDGE_SOFTWARE.test(card.data.judge.software) && accountId !== deps.judgeAccount) {
+        throw new ToolError(
+          "SCORECARD_MISMATCH",
+          "the scorecard's judge.software starts with tender-judge, which only the Judge's " +
+            "account may use: name your own software",
+        );
+      }
       const same =
         card.data.winners.length === winners.length &&
         card.data.winners.every(
@@ -967,6 +1106,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           "winners must be the scorecard's winners, in order",
         );
       }
+      if (winners.length > 0) await checkWinners(task_id, winners);
 
       const doc = await uploadDocument("scorecard", canonicalJson(card.data));
       const picked = await client.pick(BigInt(task_id), winners, doc.hash, doc.uri);
@@ -1007,7 +1147,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
 
       // Tender credits a deposit only to an account whose storage balance has room for the token's
       // slot, and refunds it otherwise: a fresh poster's first deposit would come straight back.
-      const registered = await ensureStorage();
+      const registered = await ensureStorage("make a deposit");
       const sent = await client.deposit(token, amount);
       let credited = 0n;
       for (const event of sent.events) {
@@ -1033,11 +1173,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         token,
         credited: credited.toString(),
         credited_formatted: formatAmount(credited, token, network),
-        ...(registered > 0n && {
-          note:
-            `added ${formatNear(registered)} to your storage deposit in ${contractId} first, ` +
-            "which a deposit needs",
-        }),
+        ...topUpNote(registered, "a deposit"),
       });
     }),
   );
@@ -1108,7 +1244,10 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       description:
         "Register this account as an agent, or update its profile: a name, a description and tags " +
         "that other agents and posters see. The profile is uploaded and its hash goes on chain. " +
-        "Safe to repeat; the last profile stands.",
+        "Tender charges the profile to your storage deposit, so a full-access key adds the NEAR " +
+        "for it from your account first when you have too little (the answer's note says how " +
+        "much); any other key cannot attach a deposit, and the tool stops with STORAGE_LOW, " +
+        "saying who must. Safe to repeat; the last profile stands.",
       inputSchema: {
         name: ProfileSchema.shape.name.describe("Your agent's name, 1 to 64 characters"),
         description: ProfileSchema.shape.description.describe(
@@ -1122,6 +1261,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       annotations: IDEMPOTENT,
     },
     guarded(secrets, async ({ name, description, tags, homepage }) => {
+      // The contract takes the profile's bytes out of the caller's storage balance (E_STORAGE when
+      // there is none), so the balance is made good first, as it is for a deposit.
+      const added = await ensureStorage("register a profile");
       const profile = await uploadDocument(
         "profile",
         canonicalJson({ name, description, tags, ...(homepage !== undefined && { homepage }) }),
@@ -1131,6 +1273,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         tx_hash: registered.txHash,
         profile_uri: profile.uri,
         profile_hash: profile.hash,
+        ...topUpNote(added, "a profile"),
       });
     }),
   );

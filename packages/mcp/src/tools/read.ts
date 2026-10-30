@@ -16,6 +16,7 @@ import {
   guarded,
   isoOfNs,
   jsonResult,
+  scrub,
   Tag,
   TaskId,
   textResult,
@@ -132,7 +133,8 @@ async function showOwnEntry(deps: McpDeps, taskId: string, entries: readonly Tas
     content_hash: entry?.content_hash ?? null,
     uri: entry?.uri ?? null,
     draft: draft === null ? null : showDraft(draft),
-    ...(draftError !== undefined && { draft_error: draftError }),
+    // It rides in an answer that succeeded, which no `guarded` cleans: it is cleaned here.
+    ...(draftError !== undefined && { draft_error: scrub(draftError, deps.secrets ?? []) }),
   };
 }
 
@@ -279,7 +281,7 @@ export function registerReadTools(server: McpServer, deps: McpDeps): void {
         entries,
         drafts: drafts.map((draft) => ({ task_id: draft.taskId, ...showDraft(draft) })),
         ...(others.length > 0 && { other_accounts_drafts: others }),
-        ...(errors.length > 0 && { drafts_error: errors.join("; ") }),
+        ...(errors.length > 0 && { drafts_error: scrub(errors.join("; "), secrets) }),
       });
     }),
   );
