@@ -6,7 +6,7 @@ import { COMPILE_BUDGET_MS, openTaskScorer, type TaskScorer, TaskWorkers } from 
 import { chooseWinners, rankEntries, type ScoredEntry } from "./rank";
 import { ScorerUnavailableError } from "./score";
 import { buildScorecard, clampReason } from "./scorecard";
-import type { EntryScore, JudgeDeps, JudgeTurn, TaskProgress } from "./types";
+import type { EntryScore, JudgeDeps, TaskProgress } from "./types";
 
 /**
  * How many entries whose contents are in our own store are taken at a time: no more contents
@@ -28,9 +28,9 @@ const NS_PER_S = 1_000_000_000n;
  */
 const PICK_LATENCY_NS = 2n * NS_PER_S;
 /**
- * How long one task's entries are judged in one tick before the next task's turn, when another
- * task waits for one (P05-R18): no fetch or score starts after it, and the task takes up again on
- * the next tick from what it has found out.
+ * How long one task's entries are judged in one tick (P05-R18, P05-R19): no fetch or score starts
+ * after it, and the task takes up again on the next tick, which starts at once, from what it has
+ * found out.
  */
 const SLICE_MS = 20_000;
 /**
@@ -86,8 +86,8 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   when a worker could not compile the criteria again, after one had (see `failed_closed`),
  *   before any entry was scored.
  * - `yielded`: nothing was settled. The task's slice of the tick ran out with entries still to
- *   judge while another due task waited for a turn (`turn`, P05-R18). It takes up again on its next
- *   turn from what it found out, which the Judge keeps (`JudgeMemory`) until the task is settled.
+ *   judge (P05-R18, P05-R19). It takes up again on its next turn from what it found out, which the
+ *   Judge keeps (`JudgeMemory`) until the task is settled.
  * - `failed_closed`: the task is never judged, and the poster's fallback window applies. Either
  *   its criteria fail the criteria check now (P05-R12: the check intake runs, run again before
  *   any entry is scored, as a rule may be newer than the task's intake, with 4 times intake's
@@ -131,7 +131,6 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
 export async function judgeTask(
   deps: JudgeDeps,
   taskId: bigint,
-  turn?: JudgeTurn,
 ): Promise<"picked" | "no_award" | "skipped" | "failed_closed" | "yielded"> {
   const clock = deps.now ?? (() => new Date());
   const nowNs = BigInt(clock().getTime()) * NS_PER_MS;
@@ -198,8 +197,7 @@ export async function judgeTask(
       },
     });
     try {
-      const othersWaiting = () => turn?.othersWaiting() ?? false;
-      judged = await judgeEntries(deps, task, revealed, scorer, nowNs, progress, othersWaiting);
+      judged = await judgeEntries(deps, task, revealed, scorer, nowNs, progress);
     } catch (error) {
       if (!(error instanceof ScorerUnavailableError)) throw error;
       return retryLater(taskId, `a scorer could not be run (${describeError(error)})`);
@@ -217,7 +215,7 @@ export async function judgeTask(
     const reason = clampReason(judged.rejected);
     return forget(deps, taskId, await refuse(deps, taskId, "rejected", reason));
   }
-  // P05-R18: it gave way to a task that waits; it takes up again from what it found out.
+  // P05-R18, P05-R19: its slice is over; it takes up again on its next turn.
   if (judged.yielded) return "yielded";
   // P05-R13, P05-R16: when the Judge's own lateness left every entry unscored (it started past the
   // stop line, or its workers could not be made ready before it), a pick would pay nobody for it.
@@ -346,18 +344,20 @@ interface Judged {
  * (`unavailable`), nothing more is fetched or scored, and the entries with no result have none:
  * `scoring unavailable`.
  *
- * A task's turn in a tick is a slice when another due task waits for one (`othersWaiting`,
- * P05-R18): once 20 s have gone to its entries, no fetch or score starts, and it gives way
- * (`yielded`), to be taken up on its next turn from `progress`, what this turn and earlier ones
- * found out, without fetching or scoring any of that again. A lone busy task goes on until it is
- * done or reaches its stop line. Contents fetched in the turn and not yet scored are let go, as
- * `progress` keeps no bytes, and are fetched again on its next turn. A fetch or a score under way
- * goes on, within its own limit and the stop line, so a slice can run over by one of them: a score
- * (5 s), a round of fetches (10 s), or a worker's compile of the criteria (the judging budget). A
- * turn finds out one result at least, whatever its slice, so that a task always gets on, and it is
- * not cut short within two slices of the stop line: the last stretch before the line is one turn,
- * so that a task that gives way is back before its line. Without a `JudgeMemory` there is nothing
- * to take up from, and a task is judged in one turn.
+ * A task's turn in a tick is a slice (P05-R18, P05-R19): once 20 s have gone to its entries, no
+ * fetch or score starts, and it gives way (`yielded`), whether or not another task waits, to be
+ * taken up on its next turn from `progress`, what this turn and earlier ones found out, without
+ * fetching or scoring any of that again. The next tick starts at once, with intake first, so that
+ * a task that came due or was posted during the turn joins it. A lone busy task so takes turn
+ * after turn until it is done, and pays a compile of the criteria for each. Contents fetched in
+ * the turn and not yet scored are let go, as `progress` keeps no bytes, and are fetched again on
+ * its next turn. A fetch or a score under way goes on, within its own limit and the stop line, so
+ * a slice can run over by one of them: a score (5 s), a round of fetches (10 s), or a worker's
+ * compile of the criteria (the judging budget). A turn finds out one result at least, whatever
+ * its slice, so that a task always gets on, and it is not cut short within two slices of the stop
+ * line: the last stretch before the line is one turn, which the tasks behind it wait for (see
+ * `judgeTick` for what that costs them). Without a `JudgeMemory` there is nothing to take up
+ * from, and a task is judged in one turn.
  *
  * It throws what `resultUploaded` and the database throw, and `ScorerUnavailableError`.
  */
@@ -368,7 +368,6 @@ async function judgeEntries(
   scorer: TaskScorer,
   nowNs: bigint,
   progress: TaskProgress,
-  othersWaiting: () => boolean,
 ): Promise<Judged> {
   const clock = deps.now ?? (() => new Date());
   const stopLine = stopLineOf(task);
@@ -381,8 +380,7 @@ async function judgeEntries(
       deps.memory !== undefined &&
       judging.found > 0 &&
       clock().getTime() >= sliceEnd &&
-      judging.leftMs() > 2 * sliceMs &&
-      othersWaiting(),
+      judging.leftMs() > 2 * sliceMs,
     found: 0,
     late: false,
     rejected: null,
@@ -586,9 +584,9 @@ async function contentOf(
 /**
  * When judging `task` stops starting work, in nanoseconds: the pick deadline less a tenth of the
  * pick window, made 3 s when it is less and 30 s when it is more (P05-R13). A 10 s window, as the
- * local sandbox has, gets 3 s; a 600 s window gets 30 s.
+ * local sandbox has, gets 3 s; a 600 s window gets 30 s. The loop orders its pass by it.
  */
-function stopLineOf(task: TaskView): bigint {
+export function stopLineOf(task: { pick_deadline: string; reveal_deadline: string }): bigint {
   const pick = BigInt(task.pick_deadline);
   // Bigints, which `Math.min` and `Math.max` do not take.
   let margin = (pick - BigInt(task.reveal_deadline)) / 10n;

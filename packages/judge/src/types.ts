@@ -78,10 +78,9 @@ export interface ScoringLimits {
    */
   compileBudgetMs?: number;
   /**
-   * How long one task's entries are fetched and scored in one tick before the Judge moves on to
-   * the next task, when another waits for its turn: 20 s by default (P05-R18). The task takes up
-   * again where it was on a later tick, which needs a `JudgeMemory`: without one, a task is judged
-   * in one go.
+   * How long one task's entries are fetched and scored in one tick before the Judge moves on: 20 s
+   * by default (P05-R18, P05-R19). The task takes up again where it was on the next tick, which
+   * needs a `JudgeMemory`: without one, a task is judged in one go.
    */
   sliceMs?: number;
 }
@@ -94,6 +93,7 @@ export interface JudgeMemory {
   /**
    * What the criteria check (`checkJsonSchemaUsable`, run in a worker) came to, by criteria hash
    * and budget: a task that waits, or is judged again, does not start a worker for it each tick.
+   * Only what the schema itself decides is kept, never a refusal for time, which is load.
    */
   checks: Map<string, { ok: true } | { ok: false; reason: string }>;
   /**
@@ -119,18 +119,6 @@ export interface TaskProgress {
    * fails is the machine's load, not the criteria's fault, and does not reject them.
    */
   compiled: boolean;
-}
-
-/**
- * What the loop tells a task about its turn in a tick (P05-R18). A `judgeTask` call without one has
- * no other task waiting for a turn.
- */
-export interface JudgeTurn {
-  /**
-   * Whether another due task waits for a turn in this tick. A task gives way at the end of its
-   * slice only then: a lone busy task goes on until it is done or reaches its stop line.
-   */
-  othersWaiting(): boolean;
 }
 
 /** Everything the Judge needs. Nothing in it reads the environment: the caller resolves that. */

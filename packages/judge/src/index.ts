@@ -15,7 +15,6 @@ export type {
   JudgeChain,
   JudgeDeps,
   JudgeMemory,
-  JudgeTurn,
   ScoringLimits,
   TaskProgress,
   TransportInit,

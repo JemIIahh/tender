@@ -2,7 +2,7 @@ import { type BlobKind, type Db, putBlob } from "@tender/db";
 import { canonicalJson, sha256Hex, type TaskView } from "@tender/shared";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { intakeTask, newJudgeMemory, ScorerUnavailableError, scoreJsonSchema } from "../src/index";
-import { checkJsonSchemaIsolated } from "../src/isolate";
+import { checkJsonSchemaIsolated, TOO_SLOW_TO_COMPILE } from "../src/isolate";
 import {
   at,
   fakeChain,
@@ -787,6 +787,36 @@ test("a_pending_task_starts_no_worker_and_a_check_is_kept", { timeout: 60_000 },
   expect(await intakeTask(deps, 1n)).toBe("accepted");
   expect(await intakeTask(deps, 2n)).toBe("accepted");
   expect(checkJsonSchemaIsolated).toHaveBeenCalledTimes(1);
+});
+
+test("a_check_refused_for_time_is_not_kept", { timeout: 60_000 }, async () => {
+  // A schema that ran past its compile budget, on a busy machine say, is refused, but that is not
+  // kept: it is the machine's load as much as the schema. The next task with the same criteria is
+  // checked again, and accepted. A refusal that the schema decides is kept: a second task with
+  // the same broken criteria is refused without a check.
+  vi.mocked(checkJsonSchemaIsolated).mockClear();
+  vi.mocked(checkJsonSchemaIsolated).mockResolvedValueOnce({
+    ok: false,
+    reason: TOO_SLOW_TO_COMPILE,
+  });
+  const deps = judgeDeps(db, fakeChain(null), { memory: newJudgeMemory() });
+  const heldout = (n: number) => ({ json_schema: { assertions: [{ path: "$.x", equals: n }] } });
+  const posted: [schema: Record<string, unknown>, status: string][] = [
+    [{ type: "object" }, "rejected"],
+    [{ type: "object" }, "accepted"],
+    [{ type: 12 }, "rejected"],
+    [{ type: 12 }, "rejected"],
+  ];
+  for (const [i, [schema, status]] of posted.entries()) {
+    await insertTask(
+      db,
+      taskView({ id: `${i + 1}`, ...(await jsonSchemaTask(db, schema, heldout(i))) }),
+    );
+    expect(await intakeTask(deps, BigInt(i + 1)), `task ${i + 1}`).toBe(status);
+  }
+  expect((await judgeRow(db, 1))?.judge_reason).toBe(TOO_SLOW_TO_COMPILE);
+  expect((await judgeRow(db, 4))?.judge_reason).toMatch(/^criteria schema cannot be compiled: /);
+  expect(checkJsonSchemaIsolated).toHaveBeenCalledTimes(3);
 });
 
 test("intake_rejects_heldout_from_non_poster", async () => {

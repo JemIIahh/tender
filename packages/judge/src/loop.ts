@@ -1,7 +1,7 @@
 import { phaseAt } from "@tender/shared";
 import { intakeTask } from "./intake";
 import { WarmWorker } from "./isolate";
-import { clearStaleWaits, describeError, judgeTask } from "./judge";
+import { clearStaleWaits, describeError, judgeTask, stopLineOf } from "./judge";
 import type { JudgeDeps, JudgeMemory } from "./types";
 
 /** How long `startJudge` waits after a tick before the next one starts, by default. */
@@ -22,20 +22,24 @@ interface DeadlineRow {
  * intake (`intakeTask`) for every task with no `judge_status` or a `pending` one, then judging
  * (`judgeTask`) for every `accepted` task the database has no outcome for and whose deadlines put
  * the clock in its judging window: the due tasks. A task accepted by the first pass can be judged
- * in the second. Intake goes in id order. Judging goes earliest pick deadline first (P05-R18). A
- * task with much to do gives way at the end of its slice of the tick (20 s) when another due task
- * waits for a turn: one after it in this pass, or one that gave way before it. It takes up again on
- * its next turn from what it had found out (`deps.memory`), so that it cannot keep the others from
- * their pick deadlines. A lone busy task goes on until it is done or reaches its stop line. What
- * the Judge keeps of a task that is no longer due goes. Last, a `waiting: …` reason is cleared
- * from every task that can no longer be judged (`clearStaleWaits`), which a Judge that was not
- * running when the wait ended leaves.
+ * in the second. Intake goes in id order. Judging goes earliest stop line first (`stopLineOf`),
+ * the order in which the tasks run out of time, and then by id. A busy task's turn ends at its
+ * slice of the tick (20 s) whenever more than two slices are left before its stop line, whether or
+ * not another task waits (P05-R18, P05-R19), and it takes up again on its next turn from what it
+ * found out (`deps.memory`). What the Judge keeps of a task that is no longer due goes. Last, a
+ * `waiting: …` reason is cleared from every task that can no longer be judged
+ * (`clearStaleWaits`), which a Judge that was not running when the wait ended leaves.
  *
- * It resolves with whether a task gave way, so that the next tick starts at once. A task that gave
- * way is back after the others' turns, which the last stretch before its stop line (two slices,
- * see `judgeEntries`) covers for two busy tasks whatever the window: with three or more, a task
- * with a short pick window can come back after its pick deadline, and its fallback window
- * applies.
+ * It resolves with whether a task's turn ended at its slice, so that the next tick starts at once
+ * (`startJudge`), intake first: a task that came due, or was posted, during a turn joins the next
+ * pass. What that guarantees is that no task holds the Judge for more than a slice, and the work
+ * under way at its end, while it has more than two slices left before its stop line. It does not
+ * guarantee that each task gets to its stop line. A task within two slices of its line runs to it
+ * uncut, and a task waiting behind it whose own line comes before the end of that stretch, as can
+ * happen with two busy tasks, comes back past its line: it is then picked from what it found out.
+ * When the wait also takes it past its pick deadline, as with a margin shorter than the wait, it
+ * is not picked, and its fallback window applies. A due task that only waits (P05-R8) costs a
+ * pass a quick look; no turn depends on it.
  *
  * A task that throws, as on a chain or database error, is logged, and the pass goes on with the
  * next task. The clock is read again for the judging pass: intake can take a while.
@@ -63,34 +67,35 @@ export async function judgeTick(deps: JudgeDeps): Promise<boolean> {
             t.reveal_deadline::text as reveal_deadline, t.pick_deadline::text as pick_deadline,
             t.fallback_deadline::text as fallback_deadline
        from tasks t
-      where t.verifier = $1 and t.judge_status = 'accepted' and t.outcome is null
-      order by t.pick_deadline, t.id`,
+      where t.verifier = $1 and t.judge_status = 'accepted' and t.outcome is null`,
     [deps.judgeAccount],
   );
   // The database's view of the window, which only chooses what to look at: `judgeTask` decides
   // from the chain.
-  const dueAt = (row: DeadlineRow, atNs: bigint) =>
-    phaseAt({ ...row, settled: false }, atNs) === "judging";
-  const due = accepted.filter((row) => dueAt(row, nowNs));
-  const gaveWay: DeadlineRow[] = [];
-  for (const [i, row] of due.entries()) {
-    const othersWaiting = () => {
-      const atNs = BigInt(clock().getTime()) * NS_PER_MS;
-      return [...due.slice(i + 1), ...gaveWay].some((other) => dueAt(other, atNs));
-    };
+  const due = accepted
+    .filter((row) => phaseAt({ ...row, settled: false }, nowNs) === "judging")
+    .map((row) => ({ row, stopLine: stopLineOf(row), id: BigInt(row.id) }))
+    .sort((a, b) => compare(a.stopLine, b.stopLine) || compare(a.id, b.id));
+  let gaveWay = false;
+  for (const { row, id } of due) {
     try {
-      const judged = await judgeTask(deps, BigInt(row.id), { othersWaiting });
-      if (judged === "yielded") gaveWay.push(row);
+      if ((await judgeTask(deps, id)) === "yielded") gaveWay = true;
     } catch (error) {
       console.error(`judge: judging task ${row.id} failed (${describeError(error)})`);
     }
   }
-  const judging = new Set(due.map((row) => row.id));
+  const judging = new Set(due.map(({ row }) => row.id));
   for (const id of deps.memory?.progress.keys() ?? []) {
     if (!judging.has(id)) deps.memory?.progress.delete(id);
   }
   await clearStaleWaits(deps, nowNs);
-  return gaveWay.length > 0;
+  return gaveWay;
+}
+
+/** The order of two bigints, for `sort`. */
+function compare(a: bigint, b: bigint): number {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
 }
 
 /** A memory with nothing in it yet. */

@@ -9,7 +9,12 @@ import {
   sha256Hex,
   type TaskView,
 } from "@tender/shared";
-import { COMPILE_BUDGET_MS, checkJsonSchemaIsolated, type TaskWorkers } from "./isolate";
+import {
+  COMPILE_BUDGET_MS,
+  checkJsonSchemaIsolated,
+  type TaskWorkers,
+  TOO_SLOW_TO_COMPILE,
+} from "./isolate";
 import { ScorerUnavailableError } from "./score";
 import { clampReason } from "./scorecard";
 import type { JudgeDeps, JudgeMemory } from "./types";
@@ -375,8 +380,10 @@ function shapeProblem(criteria: P0Criteria): string | null {
  * `checkJsonSchemaIsolated`). Judging gives the compile 4 times intake's time, so that criteria
  * that compiled in time at intake are not refused because the machine is busier. The outcome is
  * kept in `policy.checks` by criteria hash and budget, and taken from there the next time: the
- * check is the same, and so is what comes of it. It rejects when the check crashes its worker, and
- * with `ScorerUnavailableError` when the worker cannot be started; neither is kept.
+ * check is the same, and so is what comes of it. A refusal for time (`TOO_SLOW_TO_COMPILE`) is
+ * not kept: it is the machine's load as much as the schema's, and a later check may pass. It
+ * rejects when the check crashes its worker, and with `ScorerUnavailableError` when the worker
+ * cannot be started; neither is kept.
  */
 async function compileProblem(
   criteria: P0Criteria,
@@ -389,7 +396,7 @@ async function compileProblem(
   let usable = policy.checks?.get(key);
   if (usable === undefined) {
     usable = await checkJsonSchemaIsolated(criteria.schema, { budgetMs, workers: policy.workers });
-    policy.checks?.set(key, usable);
+    if (usable.ok || usable.reason !== TOO_SLOW_TO_COMPILE) policy.checks?.set(key, usable);
   }
   return usable.ok ? null : clampReason(usable.reason);
 }

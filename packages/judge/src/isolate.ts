@@ -42,7 +42,11 @@ const SCORE_WORKER = new URL("./score-worker.ts", import.meta.url);
 const TIMED_OUT = "scoring timed out";
 const OUT_OF_MEMORY = "scoring ran out of memory";
 const FAILED = "scoring failed";
-const TOO_SLOW = "criteria schema is not supported: it takes too long to compile";
+/**
+ * Why criteria are refused when compiling them overran the budget. That is the machine's load as
+ * much as the schema's, so it is never kept as the check's outcome.
+ */
+export const TOO_SLOW_TO_COMPILE = "criteria schema is not supported: it takes too long to compile";
 /** Why criteria are refused when compiling them crashes the worker: intake's reason for that. */
 const NOT_CHECKED = "criteria could not be checked";
 
@@ -218,7 +222,8 @@ export function openTaskScorer(
     if (compiled) return { kind: "unavailable" };
     if (usable !== null) return { kind: "rejected", reason: usable.reason };
     // Over its budget, or a crash, or something else for an answer.
-    return { kind: "rejected", reason: outcome.kind === "timeout" ? TOO_SLOW : NOT_CHECKED };
+    const reason = outcome.kind === "timeout" ? TOO_SLOW_TO_COMPILE : NOT_CHECKED;
+    return { kind: "rejected", reason };
   };
 
   const scoreOne = async (content: Uint8Array, leftMs: number): Promise<Scoring> => {
@@ -299,7 +304,7 @@ export async function checkJsonSchemaIsolated(
   let kept = false;
   try {
     const outcome = await lane.ask({ check: schema }, [], options.budgetMs ?? COMPILE_BUDGET_MS);
-    if (outcome.kind === "timeout") return { ok: false, reason: TOO_SLOW };
+    if (outcome.kind === "timeout") return { ok: false, reason: TOO_SLOW_TO_COMPILE };
     const usable = outcome.kind === "answer" ? usabilityOf(outcome.value) : null;
     if (usable?.ok === true && options.workers !== undefined) {
       options.workers.keep(lane);
