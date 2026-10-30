@@ -68,16 +68,23 @@ const UNCHECKED_VALUES: Record<string, { match: RegExp; why: string }[]> = {
   ],
 };
 
-const path = (slug: string, name: string) => join(SEEDS_DIR, slug, name);
-const readBytes = (slug: string, name: string): Buffer => readFileSync(path(slug, name));
+const seedPath = (slug: string, name: string) => join(SEEDS_DIR, slug, name);
+const readBytes = (slug: string, name: string): Buffer => readFileSync(seedPath(slug, name));
 const readJson = (slug: string, name: string): unknown =>
   JSON.parse(readBytes(slug, name).toString("utf8"));
 const utf8 = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
 
-/** The seeds whose key reads the values of a JSON answer by path. */
-const JSON_SCHEMA_SLUGS = SLUGS.filter(
-  (slug) => (readJson(slug, "criteria.json") as { kind?: unknown }).kind === "json_schema",
-);
+/**
+ * The seeds whose key reads the values of a JSON answer by path. This runs when the file is
+ * loaded, before any test, so a folder with no criteria.json is named here and not left to a bare
+ * ENOENT that stops every test in the file.
+ */
+const JSON_SCHEMA_SLUGS = SLUGS.filter((slug) => {
+  if (!existsSync(seedPath(slug, "criteria.json"))) {
+    throw new Error(`seeds/${slug} has no criteria.json, so its kind of check is unknown`);
+  }
+  return (readJson(slug, "criteria.json") as { kind?: unknown }).kind === "json_schema";
+});
 
 /** A seed's documents, once the schemas have read them, and the solution's bytes. */
 function load(slug: string) {
@@ -112,11 +119,11 @@ async function scoreAnswer(
   );
 }
 
-/** Every string inside `value`, in however many arrays and objects. Object keys are not strings. */
-function stringsIn(value: unknown): string[] {
-  if (typeof value === "string") return [value];
-  if (Array.isArray(value)) return value.flatMap(stringsIn);
-  if (typeof value === "object" && value !== null) return Object.values(value).flatMap(stringsIn);
+/** Every string and number inside `value`, in however many arrays and objects. Keys are not values. */
+function scalarsIn(value: unknown): (string | number)[] {
+  if (typeof value === "string" || typeof value === "number") return [value];
+  if (Array.isArray(value)) return value.flatMap(scalarsIn);
+  if (typeof value === "object" && value !== null) return Object.values(value).flatMap(scalarsIn);
   return [];
 }
 
@@ -127,7 +134,9 @@ function stringsIn(value: unknown): string[] {
  */
 function caseSensitiveStrings(criteria: PublicCriteria, heldout: Heldout): string[] {
   if ("json_schema" in heldout) {
-    return heldout.json_schema.assertions.flatMap(({ equals }) => stringsIn(equals));
+    return heldout.json_schema.assertions
+      .flatMap(({ equals }) => scalarsIn(equals))
+      .filter((value) => typeof value === "string");
   }
   if (
     "exact" in heldout &&
@@ -288,7 +297,7 @@ test("the_ten_p0_seeds_are_all_there", () => {
   expect(missing, "seeds missing from seeds/").toEqual([]);
 
   const lacking = Object.keys(P0_SEEDS).flatMap((slug) =>
-    SEED_FILES.filter((name) => !existsSync(path(slug, name))).map((name) => `${slug}/${name}`),
+    SEED_FILES.filter((name) => !existsSync(seedPath(slug, name))).map((name) => `${slug}/${name}`),
   );
   expect(lacking, "files missing from the P0 seeds").toEqual([]);
 
@@ -307,6 +316,9 @@ describe.each(SLUGS)("seed %s", (slug) => {
     const { criteria, heldout } = load(slug);
 
     expect(criteria.has_heldout, "has_heldout").toBe(true);
+    // Every brief says the reward goes only to a perfect answer, and the known-wrong regexes
+    // below are refused on that pass mark alone: lower it and a near-miss is paid.
+    expect(criteria.min_score, "min_score").toBe(100);
     expect(heldoutMatchesCriteria(criteria, heldout), "held-out kind is the criteria's").toBe(true);
   });
 
@@ -361,7 +373,7 @@ describe.each(SLUGS)("seed %s", (slug) => {
   });
 
   test("weak_answer_scores_below_the_solution", async ({ skip }) => {
-    if (!existsSync(path(slug, "weak.txt"))) return skip("this seed has no weak answer");
+    if (!existsSync(seedPath(slug, "weak.txt"))) return skip("this seed has no weak answer");
     const { criteria, heldout, solution } = load(slug);
 
     const best = await scoreAnswer(criteria, heldout, solution);
@@ -369,6 +381,12 @@ describe.each(SLUGS)("seed %s", (slug) => {
     expect(weak.score).toBeLessThan(best.score);
     // A weak answer is meant to lose. If it passed, a task with only that entry would pay it.
     expect(weak.passed, "weak answer passes").toBe(false);
+    // It is also meant to show partial credit, which only a kind with scores between 0 and 100
+    // can give. An answer the schema turns away, or a pattern that fails to compile, scores 0 and
+    // shows the scorecard no more than an empty entry does.
+    if (criteria.kind !== "exact") {
+      expect(weak.score, `weak answer's score (${weak.reasons.join("; ")})`).toBeGreaterThan(0);
+    }
   });
 
   test("answers_fit_the_briefs_output_rules", () => {
@@ -377,7 +395,7 @@ describe.each(SLUGS)("seed %s", (slug) => {
     const format = FORMAT_OF_KIND[criteria.kind];
     if (format !== undefined) expect(brief.output.format).toBe(format);
     expect(solution.byteLength, "solution.txt bytes").toBeLessThanOrEqual(brief.output.max_bytes);
-    if (existsSync(path(slug, "weak.txt"))) {
+    if (existsSync(seedPath(slug, "weak.txt"))) {
       expect(readBytes(slug, "weak.txt").byteLength, "weak.txt bytes").toBeLessThanOrEqual(
         brief.output.max_bytes,
       );
@@ -387,7 +405,6 @@ describe.each(SLUGS)("seed %s", (slug) => {
   test("public_examples_are_not_held_out", () => {
     const { brief, criteria, heldout } = load(slug);
 
-    // A json_schema seed publishes a schema and no examples, so there is nothing to compare.
     if (criteria.kind === "regex_cases" && "regex_cases" in heldout) {
       const hidden = [...heldout.regex_cases.match, ...heldout.regex_cases.no_match];
       const shown = [...criteria.examples.match, ...criteria.examples.no_match];
@@ -417,6 +434,33 @@ describe.each(SLUGS)("seed %s", (slug) => {
         "example lines in the brief that show a held-out answer",
       ).toEqual([]);
     }
+
+    if (criteria.kind === "json_schema" && "json_schema" in heldout) {
+      // A json_schema task publishes a schema and no examples, but its brief explains the rules
+      // with values of its own ("8,000.50 naira is [redacted] kobo"), and one of them can be a value
+      // the key holds. Nothing the key asserts may be shown in the words above the data block: the
+      // data is the question. Short values are left out, as they turn up in any text ("Ada" in
+      // "adapt", 2 in "2 decimals"): a string of 4 characters or more, a number of 4 digits or more.
+      const prose = [
+        brief.title,
+        brief.summary,
+        brief.instructions.split("-----BEGIN DATA-----")[0] ?? "",
+      ].join("\n");
+      const text = prose.toLowerCase();
+      // "8,000.50" is the number 8000.5: thousands commas go, and every other number is read whole.
+      const shown = new Set(
+        (prose.replace(/(\d),(?=\d{3}\b)/g, "$1").match(/\d+(?:\.\d+)?/g) ?? []).map(Number),
+      );
+      const held = heldout.json_schema.assertions.flatMap(({ equals }) => scalarsIn(equals));
+      expect(
+        held.filter((value) =>
+          typeof value === "string"
+            ? value.length >= 4 && text.includes(value.toLowerCase())
+            : String(value).replace(/\D/g, "").length >= 4 && shown.has(value),
+        ),
+        "held-out values that the brief shows above the data",
+      ).toEqual([]);
+    }
   });
 
   test("held_out_strings_keep_the_briefs_letter_case", () => {
@@ -436,10 +480,9 @@ describe.each(SLUGS)("seed %s", (slug) => {
 
   test("documents_round_trip_as_canonical_json", () => {
     // The poster script uploads `canonicalJson` bytes, the upload route refuses any other, and the
-    // hash on chain is the SHA-256 of them. So each document must read back as itself and come
-    // out the same when written again. For the three the schemas cover, a parse must not change
-    // them either (a default added, a key dropped): a reader who parses and hashes again would
-    // get another hash than the one on chain.
+    // hash on chain is the SHA-256 of them. So each document must read back as itself. For the
+    // three the schemas cover, a parse must not change them either (a default added, a key
+    // dropped): a reader who parses and hashes again would get another hash than the one on chain.
     const schemas = {
       "brief.json": BriefSchema,
       "criteria.json": PublicCriteriaSchema,
@@ -450,7 +493,6 @@ describe.each(SLUGS)("seed %s", (slug) => {
       const document = readJson(slug, name);
       const canonical = utf8(canonicalJson(document));
       expect(JSON.parse(canonical), name).toEqual(document);
-      expect(utf8(canonicalJson(JSON.parse(canonical))), name).toBe(canonical);
       if (name !== "task.json") {
         const parsed = schemas[name].parse(JSON.parse(canonical));
         expect(utf8(canonicalJson(parsed)), `${name} after a schema parse`).toBe(canonical);
@@ -491,6 +533,27 @@ test("meeting_actions_extract_fixes_the_action_count", async () => {
     task: "look at the logging costs",
     due: null,
   });
+});
+
+test("meeting_actions_extract_refuses_a_blank_task", async () => {
+  // The brief says the task is "not checked word for word", so no assertion reads it, and the
+  // schema is all that stands between an action with an empty task and the reward.
+  const { criteria, heldout, solution } = load("meeting-actions-extract");
+  const answer: unknown = JSON.parse(utf8(solution));
+
+  for (const blank of ["", " ", "\t\n", "\u00a0"]) {
+    const blanked = replaceAt(answer, ["actions", 0, "task"], blank);
+    const result = await scoreAnswer(
+      criteria,
+      heldout,
+      new TextEncoder().encode(JSON.stringify(blanked)),
+    );
+    expect(result.score, `a task of ${JSON.stringify(blank)}`).toBe(0);
+    expect(
+      result.reasons.join("; "),
+      `why a task of ${JSON.stringify(blank)} is refused`,
+    ).toContain("/actions/0/task");
+  }
 });
 
 test("invoice_extract_brief_says_descriptions_are_copied_as_written", () => {
@@ -548,5 +611,95 @@ describe.each(JSON_SCHEMA_SLUGS)("json_schema seed %s", (slug) => {
         .map(({ match }) => String(match)),
       "excuses in UNCHECKED_VALUES that match no value of the solution",
     ).toEqual([]);
+  });
+});
+
+/**
+ * Regexes a careless solver would write for the two regex seeds, each breaking one rule of its
+ * brief. The Judge scores a regex seed on its held-out cases alone (P05-R4), so a rule that no
+ * held-out case tests pays every regex that breaks it. None of these may reach the pass mark.
+ */
+const KNOWN_WRONG_REGEXES: Record<string, { why: string; pattern: string }[]> = {
+  "iso-date-regex": [
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+  ],
+  "semver-regex": [
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+  ],
+};
+
+describe.each(Object.keys(KNOWN_WRONG_REGEXES))("regex seed %s", (slug) => {
+  test("known_wrong_regexes_are_not_paid", async () => {
+    const { criteria, heldout } = load(slug);
+
+    const paid: string[] = [];
+    for (const { why, pattern } of KNOWN_WRONG_REGEXES[slug] ?? []) {
+      const answer = new TextEncoder().encode(JSON.stringify({ pattern, flags: "" }));
+      if ((await scoreAnswer(criteria, heldout, answer)).passed) paid.push(why);
+    }
+    expect(paid, "wrong regexes that the held-out cases pay in full").toEqual([]);
   });
 });
