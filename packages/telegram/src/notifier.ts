@@ -25,6 +25,7 @@ import { type RenderContext, renderAlert } from "./render";
  * cursor, and the alerts it already sent are skipped.
  *
  * What goes wrong, and what the notifier does about it:
+ * - A `webUrl` that task links cannot be made from is refused by `startNotifier` before any tick.
  * - An alert that cannot be rendered or addressed (see `deliver`) is logged and dropped, and the
  *   tick goes on.
  * - A send that fails is logged and not retried; the bot's `autoRetry` has already waited out a
@@ -40,7 +41,10 @@ export interface NotifierTickOptions {
   db: Db;
   /** The bot to send with. Only its `api` is used. */
   bot: Bot;
-  /** Where the web app is served, such as `https://tender.example`. Alerts link to its task pages. */
+  /**
+   * Where the web app is served, such as `https://tender.example`. Alerts link to its task pages.
+   * `startNotifier` checks it once; `notifierTick` takes it as given.
+   */
   webUrl: string;
   /** The network the tasks live on. The symbol and decimals of a token depend on it. */
   network: NetworkId;
@@ -113,8 +117,12 @@ export async function notifierTick(opts: NotifierTickOptions): Promise<void> {
  * An abort during the wait ends the loop at once. An abort during a tick lets the tick finish
  * first, so that a message already claimed is sent and the cursor moves. A signal that is aborted
  * already runs no tick. The returned promise resolves once the loop has stopped, and never rejects.
+ *
+ * `webUrl` is checked first, once (see `checkWebUrl`), and a bad one makes this call throw before
+ * anything runs: a server that is set up wrong should fail when it starts, not send broken links.
  */
 export function startNotifier(opts: NotifierOptions): Promise<void> {
+  checkWebUrl(opts.webUrl);
   const { intervalMs = DEFAULT_INTERVAL_MS, signal } = opts;
   return new Promise<void>((resolve) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -150,6 +158,26 @@ export function startNotifier(opts: NotifierOptions): Promise<void> {
     );
     void run();
   });
+}
+
+/**
+ * Throws unless `webUrl` is an http(s) URL with a host and no query or fragment. Every link in a
+ * message is `webUrl` and then `/tasks/<id>`, joined as text: a query or fragment would swallow
+ * that path, and another scheme, such as `tg://`, which acts on the reader's account, would make
+ * every link an action.
+ */
+function checkWebUrl(webUrl: string): void {
+  // The text is what links are made of, so the text must start `http://` or `https://`. The URL
+  // parser also takes `https:host` and leading blanks, which a joined link would carry along. For
+  // these two schemes it fails on a missing host, so a URL that parses has one.
+  if (!/^https?:\/\//i.test(webUrl) || URL.parse(webUrl) === null) {
+    throw new Error(`webUrl must be an http(s) URL with a host, got ${JSON.stringify(webUrl)}`);
+  }
+  // A `?` or `#` starts a query or a fragment. The parser's `search` and `hash` read "" for an empty
+  // one, so it is the text that is checked.
+  if (/[?#]/.test(webUrl)) {
+    throw new Error(`webUrl must have no query or fragment, got ${JSON.stringify(webUrl)}`);
+  }
 }
 
 // The event stream.

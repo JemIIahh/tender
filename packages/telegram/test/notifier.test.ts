@@ -1142,3 +1142,89 @@ test("an_aborted_signal_runs_no_tick", async () => {
   });
   expect(await cursor()).toBeUndefined();
 });
+
+// ---------------------------------------------------------------------------------------------
+// The web URL: checked once, when the notifier starts.
+
+/** The options of a notifier on `webUrl` that stays stopped, because its signal is aborted already. */
+function stoppedOn(webUrl: string): NotifierOptions {
+  const controller = new AbortController();
+  controller.abort();
+  return { db, bot, webUrl, network: NETWORK, now, signal: controller.signal };
+}
+
+test("a_web_url_that_is_not_an_http_url_with_a_host_is_refused", async () => {
+  const refused = [
+    "",
+    "tender.example",
+    "//tender.example",
+    "/tasks",
+    "ftp://tender.example",
+    "javascript:alert(1)",
+    "tg://resolve?domain=tender_bot", // a link that acts on the reader's account
+    "https:tender.example", // the parser accepts it, but joined with /tasks/1 it is no link
+    " https://tender.example", // the parser trims the blank, a joined link keeps it
+    "https://", // no host
+    "https:///",
+    "http://:3000",
+  ];
+  for (const webUrl of refused) {
+    expect(() => startNotifier(stoppedOn(webUrl)), webUrl).toThrow(
+      /^webUrl must be an http\(s\) URL with a host/,
+    );
+  }
+
+  // It throws from the call itself, before a tick: nothing here would stop the loop if it ran.
+  const live = new AbortController();
+  try {
+    const bad = { ...stoppedOn("ftp://tender.example"), signal: live.signal };
+    expect(() => startNotifier(bad)).toThrow();
+    await sleep(50);
+    expect(await cursor()).toBeUndefined();
+    expect(calls).toHaveLength(0);
+  } finally {
+    live.abort();
+  }
+
+  // What is wanted gets through: a port, a path in front of the task pages, any case of the scheme.
+  const accepted = [
+    "http://localhost:3000",
+    "https://tender.example/app/",
+    "HTTPS://Tender.Example",
+  ];
+  for (const webUrl of accepted) {
+    await expect(startNotifier(stoppedOn(webUrl)), webUrl).resolves.toBeUndefined();
+  }
+});
+
+test("a_web_url_with_a_query_or_fragment_is_refused", () => {
+  // Every link is the URL and then `/tasks/<id>`, so `?ref=tg` would swallow the path.
+  const refused = [
+    "https://tender.example?ref=tg",
+    "https://tender.example/?ref=tg",
+    "https://tender.example/app?x=1#top",
+    "https://tender.example/#top",
+    "https://tender.example/?", // an empty query is one too, though the parser's `search` reads ""
+    "https://tender.example/#",
+  ];
+  for (const webUrl of refused) {
+    expect(() => startNotifier(stoppedOn(webUrl)), webUrl).toThrow(
+      /^webUrl must have no query or fragment/,
+    );
+  }
+});
+
+test("a_web_url_is_escaped_in_the_links_it_makes", async () => {
+  // Nothing in the rules keeps `&` or `"` out of a path, and a `"` would end the link's attribute
+  // early. Telegram reads the entities back, so the reader gets the URL as it was written.
+  await linkChat(db, 11, poster);
+  await withLoop({ webUrl: 'https://tender.example:8443/a&b"c/' }, async () => {
+    await firstTickDone();
+    await apply(created("7", OPEN));
+    await until(() => calls.length === 1, "the new-task alert");
+  });
+  const [sent] = drain();
+  expect(sent?.text).toContain(
+    '<a href="https://tender.example:8443/a&amp;b&quot;c/tasks/7">Open task</a>',
+  );
+});
