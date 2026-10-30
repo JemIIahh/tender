@@ -74,10 +74,8 @@ const TESTS = {
 };
 
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
-const REFERENCE_NOT_A_FRAGMENT =
-  'criteria schema is not supported: a reference must start with "#"';
-const REFERENCE_INTO_DATA =
-  "criteria schema is not supported: a reference points into const, enum, examples or default";
+const REFERENCE_NOT_ALLOWED =
+  'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry';
 const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at the root";
 /** Text from someone's private answer, which no public reason may quote. */
 const SECRET = "secret-part-of-someone-elses-private-answer";
@@ -257,14 +255,15 @@ test("intake_rejects_each_rule", async () => {
       reason: 'criteria schema is not supported: it is an "$async" schema',
       view: () => jsonSchemaTask(db, { $async: true, type: "object" }),
     },
+    // P05-R10: a reference is "#", or names an entry of the root's $defs or definitions.
     {
-      rule: "a $ref whose JSON pointer names an Object.prototype member",
-      reason: BUILT_IN_REFERENCE,
+      rule: "a $ref to a member of the root itself",
+      reason: REFERENCE_NOT_ALLOWED,
       view: () => jsonSchemaTask(db, { $ref: "#/constructor" }),
     },
     {
       rule: "the same name, percent-encoded",
-      reason: BUILT_IN_REFERENCE,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () => jsonSchemaTask(db, { $ref: "#/%63onstructor" }),
     },
     {
@@ -274,15 +273,68 @@ test("intake_rejects_each_rule", async () => {
         jsonSchemaTask(db, { $defs: {}, properties: { a: { $ref: "#/$defs/toString" } } }),
     },
     {
+      rule: "a $defs entry named after an Object.prototype member, though it is defined",
+      reason: BUILT_IN_REFERENCE,
+      view: () =>
+        jsonSchemaTask(db, {
+          $defs: { constructor: { type: "string" } },
+          properties: { a: { $ref: "#/$defs/constructor" } },
+        }),
+    },
+    // The review of ac7f8a2: a pointer that lands on a map of names, an array or a number.
+    {
+      rule: "a $ref to a map of names",
+      reason: REFERENCE_NOT_ALLOWED,
+      view: () =>
+        jsonSchemaTask(db, { properties: { a: { type: "string" } }, $ref: "#/properties" }),
+    },
+    {
+      rule: "a $ref into an array of schemas",
+      reason: REFERENCE_NOT_ALLOWED,
+      view: () => jsonSchemaTask(db, { allOf: [{ type: "string" }], $ref: "#/allOf/0" }),
+    },
+    {
+      // Ajv would land on x's map of names. The entry named "x/properties" (`x~1properties` in a
+      // pointer) is a decoy for a reading of the rest of the pointer as one name.
+      rule: "a $ref past a $defs entry",
+      reason: REFERENCE_NOT_ALLOWED,
+      view: () =>
+        jsonSchemaTask(db, {
+          $defs: { x: { properties: { a: { type: "string" } } }, "x/properties": true },
+          $ref: "#/$defs/x/properties",
+        }),
+    },
+    {
+      rule: "a $defs entry that is an array",
+      reason: REFERENCE_NOT_ALLOWED,
+      view: () => jsonSchemaTask(db, { $defs: { x: [{ type: "string" }] }, $ref: "#/$defs/x" }),
+    },
+    {
+      rule: "a $defs entry that is a number",
+      reason: REFERENCE_NOT_ALLOWED,
+      view: () => jsonSchemaTask(db, { $defs: { x: 5 }, $ref: "#/$defs/x" }),
+    },
+    {
+      rule: "a $ref to a $defs entry that is not there",
+      reason: REFERENCE_NOT_ALLOWED,
+      view: () => jsonSchemaTask(db, { $defs: { y: { type: "string" } }, $ref: "#/$defs/x" }),
+    },
+    {
+      // A percent-escape is refused, not decoded, so that the name read here is the one Ajv reads:
+      // Ajv would look up `a`, not the `%61` that is defined.
+      rule: "a $defs name that is percent-encoded",
+      reason: REFERENCE_NOT_ALLOWED,
+      view: () => jsonSchemaTask(db, { $defs: { "%61": { type: "string" } }, $ref: "#/$defs/%61" }),
+    },
+    {
       rule: "a $ref with a URI before its fragment",
-      reason: REFERENCE_NOT_A_FRAGMENT,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () => jsonSchemaTask(db, { $ref: "hasOwnProperty#" }),
     },
-    // The review's three: a URI before the pointer took Ajv through a built-in member that a walk
-    // of the fragment's own resource did not find.
+    // The first review's three: a URI before a pointer took Ajv through a built-in member.
     {
       rule: "a $ref into the root by its $id",
-      reason: REFERENCE_NOT_A_FRAGMENT,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () =>
         jsonSchemaTask(db, {
           $id: "https://t.example/root.json",
@@ -292,7 +344,7 @@ test("intake_rejects_each_rule", async () => {
     },
     {
       rule: "a $ref into a resource inside the schema",
-      reason: REFERENCE_NOT_A_FRAGMENT,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () =>
         jsonSchemaTask(db, {
           $defs: { x: { $id: "https://t.example/x.json", allOf: [{}] } },
@@ -301,7 +353,7 @@ test("intake_rejects_each_rule", async () => {
     },
     {
       rule: "a $ref by $id into a string",
-      reason: REFERENCE_NOT_A_FRAGMENT,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () =>
         jsonSchemaTask(db, {
           $id: "https://t.example/root.json",
@@ -330,7 +382,7 @@ test("intake_rejects_each_rule", async () => {
       // The review of d75de82: Ajv compiles what such a pointer finds as a schema, though it is
       // data to the walk.
       rule: "a pointer into examples",
-      reason: REFERENCE_INTO_DATA,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () =>
         jsonSchemaTask(db, {
           type: "object",
@@ -340,7 +392,7 @@ test("intake_rejects_each_rule", async () => {
     },
     {
       rule: "a pointer into default",
-      reason: REFERENCE_INTO_DATA,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () =>
         jsonSchemaTask(db, {
           type: "object",
@@ -350,7 +402,7 @@ test("intake_rejects_each_rule", async () => {
     },
     {
       rule: "a pointer into the default of a schema below the root",
-      reason: REFERENCE_INTO_DATA,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () =>
         jsonSchemaTask(db, {
           type: "object",
@@ -378,7 +430,7 @@ test("intake_rejects_each_rule", async () => {
     {
       // Data keywords are skipped only as keywords: under `properties` a name is just a name.
       rule: "a property named default, whose schema is still walked",
-      reason: BUILT_IN_REFERENCE,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () =>
         jsonSchemaTask(db, {
           type: "object",
@@ -388,7 +440,7 @@ test("intake_rejects_each_rule", async () => {
     },
     {
       rule: "a $ref to a resource embedded by its $id",
-      reason: REFERENCE_NOT_A_FRAGMENT,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () =>
         jsonSchemaTask(db, {
           $id: "https://example.com/schemas/order",
@@ -399,17 +451,17 @@ test("intake_rejects_each_rule", async () => {
     },
     {
       rule: "a $ref whose fragment cannot be decoded",
-      reason: "criteria schema is not supported: a reference cannot be decoded",
+      reason: REFERENCE_NOT_ALLOWED,
       view: () => jsonSchemaTask(db, { $ref: "#/%E0%A4%A" }),
     },
     {
-      rule: "a $dynamicRef to an anchor that names an Object.prototype member",
-      reason: BUILT_IN_REFERENCE,
+      rule: "a $dynamicRef to an anchor",
+      reason: REFERENCE_NOT_ALLOWED,
       view: () => jsonSchemaTask(db, { $dynamicRef: "#isPrototypeOf" }),
     },
     {
       rule: "a $ref to a member every array has",
-      reason: BUILT_IN_REFERENCE,
+      reason: REFERENCE_NOT_ALLOWED,
       view: () => jsonSchemaTask(db, { allOf: [{}], $ref: "#/allOf/length" }),
     },
     {
@@ -479,13 +531,13 @@ test("intake_rejects_a_schema_that_does_not_compile_with_a_short_reason", async 
   expect(await intake(1, await jsonSchemaTask(db, { type: 12 }))).toBe("rejected");
   expect((await judgeRow(db, 1))?.judge_reason).toMatch(/^criteria schema cannot be compiled: /);
 
-  // Ajv names the reference it cannot resolve, and a poster can make that as long as the
+  // Ajv names the meta-schema it cannot find, and a poster can make that as long as the
   // criteria. The reason keeps the first 199 code points and an ellipsis.
-  const ref = `#/$defs/${"x".repeat(10_000)}`;
-  expect(await intake(2, await jsonSchemaTask(db, { $ref: ref }))).toBe("rejected");
+  const metaSchema = `https://t.example/${"x".repeat(10_000)}`;
+  expect(await intake(2, await jsonSchemaTask(db, { $schema: metaSchema }))).toBe("rejected");
   const reason = (await judgeRow(db, 2))?.judge_reason ?? "";
   expect(reason).toMatch(
-    /^criteria schema cannot be compiled: can't resolve reference #\/\$defs\/x+…$/,
+    /^criteria schema cannot be compiled: no schema with key or ref "https:\/\/t\.example\/x+…$/,
   );
   expect([...reason]).toHaveLength(200);
 });
@@ -504,9 +556,9 @@ test("intake_accepts_the_p0_kinds", async () => {
       { $defs: { total: { type: "number" } }, $ref: "#/$defs/total" },
       { json_schema: { assertions: [{ path: "$", equals: 42 }] } },
     ),
-    // The common shapes P05-R9 keeps: a root `$id` that is a URL, with or without a bare `#`;
-    // `#/$defs/x` and `#/definitions/x`; `#` for the whole schema; and a pointer through a
-    // property that is named `default`.
+    // The shapes P05-R9 and P05-R10 keep: a root `$id` that is a URL, with or without a bare `#`;
+    // `#/$defs/x` and `#/definitions/x`; `#` for the whole schema; and entry names with `~1` and
+    // `~0` in them, one of them a boolean schema.
     await jsonSchemaTask(
       db,
       {
@@ -534,7 +586,8 @@ test("intake_accepts_the_p0_kinds", async () => {
       db,
       {
         type: "object",
-        properties: { default: { type: "string" }, b: { $ref: "#/properties/default" } },
+        $defs: { "a/b": { type: "string" }, "c~d": true },
+        properties: { x: { $ref: "#/$defs/a~1b" }, y: { $ref: "#/$defs/c~0d" } },
       },
       { json_schema: { assertions: [{ path: "$", equals: 46 }] } },
     ),

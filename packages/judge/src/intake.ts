@@ -64,8 +64,11 @@ const NAMED_SCHEMA_KEYWORDS = new Set([
   "dependentSchemas",
   "dependencies",
 ]);
-/** An index of an array in a JSON pointer, as Ajv reads one: no sign, no leading zero. */
-const ARRAY_INDEX = /^(?:0|[1-9][0-9]*)$/;
+/**
+ * A reference to one entry of the root's `$defs` or `definitions`: the keyword, and the entry's
+ * name as one JSON-pointer segment, `~` escapes and all.
+ */
+const DEFS_REFERENCE = /^#\/(\$defs|definitions)\/([^/]*)$/;
 /** A surrogate half with no partner. With the `u` flag a pair is one code point, not two halves. */
 const LONE_SURROGATE = /\p{Cs}/u;
 
@@ -74,11 +77,8 @@ const CRITERIA_INVALID = "criteria not found or invalid";
 const CRITERIA_TOO_LARGE = "criteria too large";
 const HAS_HELDOUT_MISMATCH = "has_heldout does not match the task's held-out commitment";
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
-const REFERENCE_NOT_A_FRAGMENT =
-  'criteria schema is not supported: a reference must start with "#"';
-const REFERENCE_UNDECODABLE = "criteria schema is not supported: a reference cannot be decoded";
-const REFERENCE_INTO_DATA =
-  "criteria schema is not supported: a reference points into const, enum, examples or default";
+const REFERENCE_NOT_ALLOWED =
+  'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry';
 const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at the root";
 const ROOT_ID_FRAGMENT = "criteria schema is not supported: the root $id must not have a fragment";
 const HELDOUT_WAITING = "waiting for held-out checks";
@@ -110,9 +110,8 @@ const CHECK_FAILED = "criteria could not be checked";
  * - `has_heldout` that does not match whether the task has a `heldout_commitment`;
  * - `exact` or `json_schema` without held-out checks: `held-out checks required for kind {k}`;
  * - a `json_schema` schema with an `$id` below its root, a root `$id` with a fragment, or a
- *   reference that is not a fragment of it, that goes through a built-in member or that points
- *   into data (see `referenceProblem`), or one that `checkJsonSchemaUsable` refuses, with its
- *   reason;
+ *   reference other than `#` and one to an entry of its `$defs` or `definitions` (see
+ *   `referenceProblem`), or one that `checkJsonSchemaUsable` refuses, with its reason;
  * - a `heldout_commitment` that an earlier task of the same poster (a lower id, of any verifier)
  *   commits to as well: `held-out checks already used by task {id}`, naming the lowest. Held-out
  *   checks are single-use, as judging a task publishes them. Another poster's task with the same
@@ -328,25 +327,22 @@ function parseJson(bytes: Uint8Array): unknown {
 /**
  * Why `schema` names itself or refers to something in a way that is not supported, or `null`.
  * Ajv looks the names in a reference up on plain objects, so `#/constructor` finds
- * `Object.prototype.constructor` and `#/allOf/length` the length of an array, and the schema then
- * fails on every document, or worse takes every document as a fit; `checkJsonSchemaUsable`
- * catches the first only. The rules are simple and strict rather than a model of how Ajv resolves
- * references, which would have to be exact to be safe (P05-R9):
+ * `Object.prototype.constructor` and `#/allOf/length` the length of an array, and a pointer can
+ * also land on a map of names, an array or data, which Ajv then compiles as a schema of its own
+ * reading; the schema fails on every document, or worse takes every document as a fit.
+ * `checkJsonSchemaUsable` catches the first only. So what may be named, and how, is an allow-list
+ * rather than a model of how Ajv resolves references, which would have to be exact to be safe
+ * (P05-R9, P05-R10):
  *
- * - `$id` is allowed only at the root, so the whole schema is one resource and every reference
- *   resolves against its root. An `$id` in a schema below the root is refused, whatever it says;
- *   a property named `$id` is a name, not a schema's `$id`. A root `$id` must not have a fragment,
- *   beyond a bare `#`.
- * - A reference (`$ref`, `$dynamicRef`, `$recursiveRef`) must be a fragment, starting with `#`:
- *   nothing outside the schema resolves. Some rare shapes that Ajv takes are refused with it: an
- *   absolute reference to the schema itself, and, with the rule above, any embedded resource.
- * - Each name in the fragment, decoded as Ajv decodes it (percent-encoding, then `~1` and `~0` in
- *   a JSON pointer), must not be that of an `Object.prototype` member: the anchor, or each
- *   segment of a JSON pointer. A fragment that cannot be decoded is refused too.
- * - A JSON pointer is walked from the root (see `pointerProblem`): each step must be an own key of
- *   an object or an index of an array, and none may go into the value of `const`, `enum`,
- *   `examples` or `default`. `#/allOf/length` and `#/examples/0` are refused, `#/$defs/total` is
- *   not.
+ * - `$id` is allowed only at the root, so the whole schema is one resource. An `$id` in a schema
+ *   below the root is refused, whatever it says; a property named `$id` is a name, not a schema's
+ *   `$id`. A root `$id` must not have a fragment, beyond a bare `#`.
+ * - A reference (`$ref`, `$dynamicRef`, `$recursiveRef`) is exactly `#`, the whole schema, or
+ *   `#/$defs/{name}` or `#/definitions/{name}`, where the name is one pointer segment (with `~1`
+ *   and `~0` decoded, and no `%`) and an own key of the root's `$defs` or `definitions`, whose
+ *   value is a schema: an object or a boolean. That is what written schemas use. A name of an
+ *   `Object.prototype` member, such as `constructor`, is refused even when it is defined. Anything
+ *   else is refused: an anchor, a URI, a pointer anywhere else, a missing entry.
  *
  * The values of `const`, `enum`, `examples` and `default` are data, not schemas, so a `"$ref"` in
  * them is no reference and is not looked at, nor is an `$id` in them. That holds where they are
@@ -391,51 +387,21 @@ function referenceProblem(schema: Record<string, unknown>): string | null {
 
 /** Why `reference`, made in `root`, is not supported, or `null`. See `referenceProblem`. */
 function problemOf(reference: string, root: Record<string, unknown>): string | null {
-  if (!reference.startsWith("#")) return REFERENCE_NOT_A_FRAGMENT;
-  const fragment = reference.slice(1);
-  const isPointer = fragment.startsWith("/");
-  let names: string[];
-  try {
-    names = isPointer
-      ? fragment
-          .slice(1)
-          .split("/")
-          .map((segment) => decodeURIComponent(segment).replace(/~1/g, "/").replace(/~0/g, "~"))
-      : [decodeURIComponent(fragment)];
-  } catch {
-    return REFERENCE_UNDECODABLE;
+  if (reference === "#") return null;
+  const [, keyword, segment] = DEFS_REFERENCE.exec(reference) ?? [];
+  // A `%` is refused rather than decoded, so that the name looked up here is the very one Ajv
+  // looks up: it percent-decodes a fragment as it resolves it.
+  if (keyword === undefined || segment === undefined || segment.includes("%")) {
+    return REFERENCE_NOT_ALLOWED;
   }
-  if (names.some((name) => Object.hasOwn(Object.prototype, name))) return BUILT_IN_REFERENCE;
-  return isPointer ? pointerProblem(root, names) : null;
+  const name = segment.replace(/~1/g, "/").replace(/~0/g, "~");
+  if (Object.hasOwn(Object.prototype, name)) return BUILT_IN_REFERENCE;
+  const entries = Object.hasOwn(root, keyword) ? root[keyword] : undefined;
+  if (!isPlainObject(entries) || !Object.hasOwn(entries, name)) return REFERENCE_NOT_ALLOWED;
+  const target = entries[name];
+  return typeof target === "boolean" || isPlainObject(target) ? null : REFERENCE_NOT_ALLOWED;
 }
 
-/**
- * Why the JSON pointer `path`, from `root`, is not supported, or `null`. Each step must be an own
- * key of an object or an index of an array: a step into anything else (a string, a number, a
- * boolean, null) finds a member of its prototype, or an error. And no step may go into the value of
- * `const`, `enum`, `examples` or `default` in a schema: Ajv would compile what is there as a
- * schema, though the walk above passes it over as data. Under `properties` and the other keywords
- * that map names to schemas, such a key is a name, and the step is fine. A step that finds nothing
- * ends the walk, as Ajv refuses a reference it cannot resolve on its own.
- */
-function pointerProblem(root: Record<string, unknown>, path: readonly string[]): string | null {
-  let current: unknown = root;
-  // Whether `current` maps names to schemas, rather than being a schema.
-  let names = false;
-  for (const step of path) {
-    if (Array.isArray(current)) {
-      if (!ARRAY_INDEX.test(step)) return BUILT_IN_REFERENCE;
-      current = current[Number(step)];
-      names = false;
-    } else if (typeof current === "object" && current !== null) {
-      if (!Object.hasOwn(current, step)) return null;
-      if (!names && DATA_KEYWORDS.has(step)) return REFERENCE_INTO_DATA;
-      current = (current as Record<string, unknown>)[step];
-      names = !names && NAMED_SCHEMA_KEYWORDS.has(step);
-    } else {
-      return BUILT_IN_REFERENCE;
-    }
-    if (current === undefined) return null;
-  }
-  return null;
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
