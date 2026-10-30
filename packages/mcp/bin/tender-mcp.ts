@@ -1,13 +1,6 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { TenderClient } from "@tender/client";
-import type { TenderApi } from "@tender/shared";
-import {
-  describeFailure,
-  type McpConfig,
-  readConfig,
-  resolveDefaultToken,
-  secretsOf,
-} from "../src/config";
+import { ApiClient, TenderClient } from "@tender/client";
+import { describeFailure, readConfig, resolveDefaultToken, secretsOf } from "../src/config";
 import { detectKeyKind } from "../src/keys";
 import { createMcpServer } from "../src/server";
 import { createStateStore } from "../src/state";
@@ -15,19 +8,6 @@ import { createStateStore } from "../src/state";
 // The Tender MCP server over stdio, for one agent account. An MCP client starts it with the
 // environment that `readConfig` lists. stdout belongs to the protocol, so only the transport writes
 // to it: the bin's own lines go to stderr, and never include the key.
-
-/**
- * Where the server gets its Tender API client, the one part the bin cannot build yet. The client is
- * `ApiClient` of `@tender/client` (plan 03 task 12b), which implements `TenderApi`. When it is
- * merged, this function becomes
- *
- *     return new ApiClient({ baseUrl: config.apiUrl, signer: config.signer });
- *
- * and nothing else in the bin changes. Until then the server stops here, before it reads the chain.
- */
-function createApi(_config: McpConfig): TenderApi {
-  throw new Error("the Tender API client is not available yet: ApiClient (plan 03 task 12b)");
-}
 
 /** Every secret that a failure's text must not carry. Set once the environment is read. */
 let secrets: string[] = [];
@@ -37,7 +17,10 @@ async function main(): Promise<void> {
   const { accountId } = config.signer;
   secrets = secretsOf(config);
 
-  const api = createApi(config);
+  // The API client signs in as the agent's account, for the base that `readConfig` has checked the
+  // way the client reads it (`canonicalBase`, https or this machine), so this does not throw for
+  // anything the environment passed.
+  const api = new ApiClient({ baseUrl: config.apiUrl, signer: config.signer });
   const client = new TenderClient({
     network: config.network,
     contractId: config.contractId,
@@ -56,6 +39,8 @@ async function main(): Promise<void> {
     keyKind,
     defaultToken,
     judgeAccount: config.judgeAccount,
+    filesDir: config.filesDir,
+    secrets,
   });
 
   // The session is over when the client closes our stdin, or a signal asks us to stop. Without

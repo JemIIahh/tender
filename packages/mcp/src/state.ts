@@ -2,7 +2,13 @@ import { randomBytes } from "node:crypto";
 import { chmod, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { AccountIdSchema, NETWORKS, type NetworkId, U64StringSchema } from "@tender/shared";
+import {
+  AccountIdSchema,
+  computeCommitment,
+  NETWORKS,
+  type NetworkId,
+  U64StringSchema,
+} from "@tender/shared";
 import { z } from "zod";
 
 // The drafts of an agent that commits to tasks. A commit puts only a hash on chain, so the work and
@@ -15,7 +21,9 @@ import { z } from "zod";
 // - path safe: the task id becomes part of a file name, so it must be a u64 in decimal first.
 //
 // The caller picks the directory, and `defaultStateDir` gives the usual one. Calls for one task are
-// expected one after another, as commit and reveal are, and the store does not lock.
+// expected one after another, as commit and reveal are, and the store does not lock: the MCP tools
+// queue their calls for a task in the one process, and two processes on one directory are not
+// supported.
 
 /** The owner may read and write a draft file, and nobody else may do anything. */
 const FILE_MODE = 0o600;
@@ -43,6 +51,11 @@ export interface Draft {
   committedAt?: string;
   /** Where the revealed work was uploaded. Unset until the reveal has gone through. */
   revealedUri?: string;
+  /**
+   * Set when the contract refused this draft's commit for good (see `markDead`). A dead draft is
+   * kept, so that the agent can read why, and is never sent or revealed again.
+   */
+  dead?: { reason: string; at: string };
 }
 
 export interface StateStore {
@@ -62,8 +75,13 @@ export interface StateStore {
   /** Records where the work was revealed, keeping the rest. Rejects if there is no draft. */
   markRevealed(taskId: string, uri: string): Promise<void>;
   /**
-   * Every draft, revealed or not, by task number. A caller that wants the ones still to reveal
-   * filters on `revealedUri`. Rejects if any file is not a readable draft.
+   * Retires the draft: records why the contract refused its commit for good and when, keeping the
+   * rest. A draft that is dead already keeps its first reason. Rejects if there is no draft.
+   */
+  markDead(taskId: string, reason: string): Promise<void>;
+  /**
+   * Every draft, revealed, dead or not, by task number. A caller that wants the ones still to
+   * reveal filters on `revealedUri` and `dead`. Rejects if any file is not a readable draft.
    */
   listDrafts(): Promise<Draft[]>;
 }
@@ -77,6 +95,7 @@ const DraftSchema: z.ZodType<Draft> = z.object({
   commitment: z.string(),
   committedAt: z.string().optional(),
   revealedUri: z.string().optional(),
+  dead: z.object({ reason: z.string(), at: z.string() }).optional(),
 });
 
 /** A value for an error message: quoted, and cut short so a huge one cannot flood a log. */
@@ -91,6 +110,26 @@ function show(value: unknown): string {
 function assertTaskId(taskId: string): void {
   if (!U64StringSchema.safeParse(taskId).success) {
     throw new Error(`invalid task id ${show(taskId)}: expected a u64 as a decimal string`);
+  }
+}
+
+/**
+ * Whether `draft` was made by `accountId`: its commitment is the one that `accountId`, its task,
+ * its content hash and its salt give. A state directory that two accounts share holds a draft of
+ * each under the task's one file name, and a tool must not extend or reveal the other's. A draft
+ * whose parts do not make a commitment at all is nobody's.
+ */
+export function isDraftOf(draft: Draft, accountId: string): boolean {
+  try {
+    const commitment = computeCommitment(
+      BigInt(draft.taskId),
+      accountId,
+      draft.contentHash,
+      draft.salt,
+    );
+    return commitment === draft.commitment;
+  } catch {
+    return false;
   }
 }
 
@@ -263,6 +302,20 @@ export function createStateStore(dir: string): StateStore {
         throw new Error(`no draft for task ${taskId}`);
       }
       await writeDraft({ ...draft, revealedUri: uri });
+    },
+
+    async markDead(taskId, reason) {
+      assertTaskId(taskId);
+      if (typeof reason !== "string") {
+        throw new TypeError("markDead needs the reason the draft was retired for");
+      }
+      const draft = await readDraft(taskId);
+      if (draft === null) {
+        throw new Error(`no draft for task ${taskId}`);
+      }
+      // The first reason is the one that matters: a mark that is repeated must not hide it.
+      if (draft.dead !== undefined) return;
+      await writeDraft({ ...draft, dead: { reason, at: new Date().toISOString() } });
     },
 
     async listDrafts() {

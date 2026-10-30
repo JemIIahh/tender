@@ -13,7 +13,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { computeCommitment, type NetworkId, sha256Hex } from "@tender/shared";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { createStateStore, type Draft, defaultStateDir } from "../src/state";
+import { createStateStore, type Draft, defaultStateDir, isDraftOf } from "../src/state";
 
 // Only `rename` is wrapped, so that a test can make it fail the way a crash would. Every other
 // function is the real one, and so is `rename` until a test says otherwise.
@@ -122,6 +122,80 @@ test("mark_revealed_records_the_uri_and_keeps_the_rest", async () => {
   expect(await readdir(draftsDir)).toEqual(["3.json"]);
 });
 
+test("mark_dead_retires_a_draft_and_keeps_the_rest", async () => {
+  const store = createStateStore(dir);
+  const draft = makeDraft("3");
+  await store.saveDraft(draft);
+  const before = Date.now();
+
+  // A missing reason would retire the draft with nothing to say why.
+  await expect(store.markDead("3", undefined as unknown as string)).rejects.toThrow(/reason/);
+  expect(await store.getDraft("3")).toEqual(draft);
+
+  await store.markDead("3", "E_PHASE: task 3 is not open for commits");
+
+  const dead = await store.getDraft("3");
+  expect(dead).toEqual({
+    ...draft,
+    dead: { reason: "E_PHASE: task 3 is not open for commits", at: expect.any(String) },
+  });
+  // The time is ISO 8601, and it is the time of the mark.
+  const at = dead?.dead?.at ?? "";
+  expect(at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  expect(Date.parse(at)).toBeGreaterThanOrEqual(before - 1000);
+  expect(Date.parse(at)).toBeLessThanOrEqual(Date.now() + 1000);
+  expect(await createStateStore(dir).getDraft("3")).toEqual(dead);
+
+  // The first reason is the one that stays: a retried mark must not hide why the draft died.
+  await store.markDead("3", "E_AUTH: some later reason");
+  expect(await store.getDraft("3")).toEqual(dead);
+
+  // The other marks keep it too, and it does not make the draft a list entry of its own.
+  await store.markRevealed("3", "https://tender.example/blobs/abc");
+  expect(await store.getDraft("3")).toEqual({
+    ...dead,
+    revealedUri: "https://tender.example/blobs/abc",
+  });
+  expect(await store.listDrafts()).toHaveLength(1);
+
+  // With no draft there is nothing to retire, and no file is made up for it.
+  await expect(store.markDead("4", "E_PHASE: closed")).rejects.toThrow(/no draft for task 4/);
+  expect(await readdir(draftsDir)).toEqual(["3.json"]);
+});
+
+test("a_dead_mark_is_checked_like_the_rest_of_a_draft", async () => {
+  const store = createStateStore(dir);
+  const good = makeDraft("6");
+  const dead = { reason: "E_HASH: wrong", at: "2026-11-04T10:00:00.000Z" };
+
+  // Saved with a mark, it comes back with it.
+  await store.saveDraft({ ...good, dead });
+  expect(await store.getDraft("6")).toEqual({ ...good, dead });
+
+  // A mark that lacks its reason or its time, or has them mistyped, is refused both ways.
+  for (const bad of [{ reason: "x" }, { at: "x" }, { reason: 5, at: "x" }, "dead", null]) {
+    await expect(store.saveDraft({ ...good, dead: bad } as unknown as Draft)).rejects.toThrow(
+      /invalid draft/,
+    );
+    await writeFile(join(draftsDir, "6.json"), JSON.stringify({ ...good, dead: bad }));
+    await expect(store.getDraft("6")).rejects.toThrow(/corrupt/);
+  }
+});
+
+test("a_draft_belongs_to_the_account_whose_commitment_it_holds", () => {
+  const draft = makeDraft("7");
+
+  expect(isDraftOf(draft, ACCOUNT)).toBe(true);
+  // The same task under another account, as in a state directory two accounts share.
+  expect(isDraftOf(draft, "bob.test.near")).toBe(false);
+  // A draft whose parts do not agree is nobody's, and asking never throws.
+  expect(isDraftOf({ ...draft, salt: "c3".repeat(32) }, ACCOUNT)).toBe(false);
+  expect(isDraftOf({ ...draft, contentHash: "ee".repeat(32) }, ACCOUNT)).toBe(false);
+  expect(isDraftOf({ ...draft, commitment: "ee".repeat(32) }, ACCOUNT)).toBe(false);
+  expect(isDraftOf({ ...draft, contentHash: "not hex", salt: "" }, ACCOUNT)).toBe(false);
+  expect(isDraftOf({ ...draft, taskId: "not a number" }, ACCOUNT)).toBe(false);
+});
+
 test("atomic_write_never_leaves_partial_file", async () => {
   const store = createStateStore(dir);
   const file = join(draftsDir, "7.json");
@@ -149,6 +223,12 @@ test("atomic_write_never_leaves_partial_file", async () => {
   // Marking a reveal rewrites the draft, so it must be just as safe.
   vi.mocked(rename).mockRejectedValueOnce(killed);
   await expect(store.markRevealed("7", "https://tender.example/blobs/abc")).rejects.toBe(killed);
+  expect(await readFile(file, "utf8")).toBe(before);
+  expect(await readdir(draftsDir)).toEqual(["7.json"]);
+
+  // So must retiring one.
+  vi.mocked(rename).mockRejectedValueOnce(killed);
+  await expect(store.markDead("7", "E_PHASE: closed")).rejects.toBe(killed);
   expect(await readFile(file, "utf8")).toBe(before);
   expect(await readdir(draftsDir)).toEqual(["7.json"]);
 });
@@ -256,6 +336,10 @@ test("rejects_task_ids_that_are_not_u64_decimals", async () => {
     await expect(
       store.markRevealed(taskId, "https://tender.example/blobs/abc"),
       `markRevealed(${JSON.stringify(taskId)})`,
+    ).rejects.toThrow(/invalid task id/);
+    await expect(
+      store.markDead(taskId, "E_PHASE: closed"),
+      `markDead(${JSON.stringify(taskId)})`,
     ).rejects.toThrow(/invalid task id/);
   }
   // Every one was refused before the disk was touched, so none of them made a file anywhere.

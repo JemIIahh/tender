@@ -128,6 +128,14 @@ function memoryState(): StateStore {
       if (draft === undefined) throw new Error(`no draft for task ${taskId}`);
       drafts.set(taskId, { ...draft, revealedUri: uri });
     },
+    async markDead(taskId, reason) {
+      const draft = drafts.get(taskId);
+      if (draft === undefined) throw new Error(`no draft for task ${taskId}`);
+      // A draft that is dead already keeps its first reason, as in the real store.
+      if (draft.dead === undefined) {
+        drafts.set(taskId, { ...draft, dead: { reason, at: new Date().toISOString() } });
+      }
+    },
     async listDrafts() {
       return [...drafts.values()];
     },
