@@ -6,7 +6,9 @@ import { ApiClient, TenderClient, TenderError, type TxResult } from "@tender/cli
 import {
   ApiError,
   canonicalJson,
+  type HealthResponse,
   NETWORKS,
+  type NetworkId,
   type Phase,
   type PostTaskInput,
   type StorageView,
@@ -157,6 +159,15 @@ const ROOMY: StorageView = {
 /** A wallet that holds more than any test spends. */
 const RICH = 10n ** 12n;
 
+/** `bytes` of contract storage, in yoctoNEAR. */
+const storageBytes = (count: bigint) => count * 10n ** 19n;
+
+const storageOf = (free: bigint): StorageView => ({
+  total: `${storageBytes(free)}`,
+  available: `${storageBytes(free)}`,
+  used_bytes: "83",
+});
+
 interface Upload {
   kind: string;
   contentType: string;
@@ -169,14 +180,28 @@ interface Listed {
   id: bigint;
   poster: string;
   briefHash: string;
+  /** Null: the task has no held-out checks. */
+  heldoutCommitment: string | null;
   phase: Phase;
 }
 
-/** The task of `poster` whose brief is that of seed `slug`, in `phase`. */
-const listedOf = (id: bigint, slug: string, phase: Phase, poster = POSTER): Listed => ({
+interface ListedOptions {
+  poster?: string;
+  /** The seed whose held-out checks the task carries: its own seed's by default. Null: none. */
+  heldout?: string | null;
+}
+
+/** The task of `poster` whose brief is that of seed `slug`, in `phase`, with the checks of a seed. */
+const listedOf = (
+  id: bigint,
+  slug: string,
+  phase: Phase,
+  { poster = POSTER, heldout = slug }: ListedOptions = {},
+): Listed => ({
   id,
   poster,
   briefHash: hashOf(briefOf(slug)),
+  heldoutCommitment: heldout === null ? null : hashOf(heldoutOf(heldout)),
   phase,
 });
 
@@ -215,7 +240,7 @@ function detailOf(task: Listed): TaskDetailResponse {
       brief_uri: `https://api.test/v1/blobs/${task.briefHash}`,
       brief_hash: task.briefHash,
       criteria_hash: "c".repeat(64),
-      heldout_commitment: null,
+      heldout_commitment: task.heldoutCommitment,
       max_entries: 0,
       max_winners: 1,
       invited: [],
@@ -248,6 +273,10 @@ interface ApiOptions {
   stuck?: boolean;
   /** The tasks `getTask` does not know, though they are listed. */
   vanished?: ReadonlySet<bigint>;
+  /** What the API says it serves, in place of the testnet and the contract of the tests. */
+  serves?: Partial<Pick<HealthResponse, "network" | "contract">>;
+  /** `health` fails with this, as an API does that cannot read the chain. */
+  unhealthy?: Error;
 }
 
 /** The API, as far as the seed script uses it. `trace` hears every call, in order. */
@@ -280,6 +309,19 @@ function fakeApi(trace: string[], options: ApiOptions = {}) {
     const task = known().find((candidate) => candidate.id === id);
     return task === undefined || options.vanished?.has(id) ? null : detailOf(task);
   });
+  const health = vi.fn<TenderApi["health"]>(async () => {
+    trace.push("health");
+    if (options.unhealthy) throw options.unhealthy;
+    return {
+      ok: true,
+      network: "testnet",
+      contract: CONTRACT,
+      indexed_height: "100",
+      chain_final_height: "100",
+      lag_blocks: "0",
+      ...options.serves,
+    };
+  });
   const getBlob = vi.fn<TenderApi["getBlob"]>(async (sha256) => {
     trace.push("getBlob");
     return options.served?.has(sha256) ? new Uint8Array([1]) : null;
@@ -301,7 +343,7 @@ function fakeApi(trace: string[], options: ApiOptions = {}) {
     listAgents: unexpected("listAgents"),
     getAgent: unexpected("getAgent"),
     listEntries: unexpected("listEntries"),
-    health: unexpected("health"),
+    health,
     getScorecard: unexpected("getScorecard"),
     getBlob,
     uploadBlob,
@@ -310,7 +352,7 @@ function fakeApi(trace: string[], options: ApiOptions = {}) {
     telegramLink: unexpected("telegramLink"),
     signIn: unexpected("signIn"),
   };
-  return { api, uploads, heldouts, getBlob, uploadBlob, uploadHeldout, listTasks, getTask };
+  return { api, uploads, heldouts, health, getBlob, uploadBlob, uploadHeldout, listTasks, getTask };
 }
 
 interface ChainOptions {
@@ -328,6 +370,9 @@ interface ChainOptions {
   accountId?: string;
   /** The client has no signer. */
   unsigned?: boolean;
+  /** The network and the contract the client is set for, in place of the testnet and the tests'. */
+  network?: NetworkId;
+  contractId?: string;
 }
 
 /** A chain with a vault, a wallet and a storage balance for the poster, which `trace` hears. */
@@ -393,6 +438,8 @@ function fakeChain(trace: string[], options: ChainOptions = {}) {
   });
 
   const client: SeedChain = {
+    network: options.network ?? "testnet",
+    contractId: options.contractId ?? CONTRACT,
     accountId: options.unsigned ? undefined : (options.accountId ?? POSTER),
     postTask,
     balanceOf,
@@ -442,6 +489,7 @@ function worldOf(options: Pick<RunOptions, "chain" | "api"> = {}): World {
       id: BigInt(i + 1),
       poster: POSTER,
       briefHash: post.briefHash,
+      heldoutCommitment: post.heldoutCommitment ?? null,
       phase: "open",
     }));
   const api = fakeApi(trace, { ...options.api, posted });
@@ -489,6 +537,12 @@ async function run(spec: Record<string, SeedSpec> | string | null, options: RunO
 /** What a run did to the API and the chain: nothing at all. */
 const UNTOUCHED: string[] = [];
 
+/** A seed the run posted, and the task it became. */
+const seeded = (slug: string, taskId: bigint) => ({ slug, taskId, status: "posted" as const });
+
+/** A seed the run left alone because the poster has this task for it. */
+const existing = (slug: string, taskId: bigint) => ({ slug, taskId, status: "existing" as const });
+
 // ---- What goes up, and in what order ------------------------------------------------------------
 
 test("seed_uploads_the_brief_then_the_criteria_then_the_heldout_and_posts_their_canonical_bytes", async () => {
@@ -533,7 +587,7 @@ test("seed_uploads_the_brief_then_the_criteria_then_the_heldout_and_posts_their_
       maxWinners: 1,
     },
   ]);
-  expect(result).toEqual([{ slug: "alpha", taskId: 1n }]);
+  expect(result).toEqual([seeded("alpha", 1n)]);
   // The vault was empty, so the reward went in first.
   expect(lines).toEqual(["DEPOSITED 0.25 tUSDC", "SEEDED alpha task=1"]);
 });
@@ -555,7 +609,7 @@ test("the_heldout_commitment_is_the_sha256_of_the_canonical_bytes_that_were_stor
 test("a_seed_without_a_heldout_part_is_posted_with_no_commitment_and_nothing_stored", async () => {
   const { result, chain, api } = await run({ rubric: { criteria: RUBRIC, heldout: null } });
 
-  expect(result).toEqual([{ slug: "rubric", taskId: 1n }]);
+  expect(result).toEqual([seeded("rubric", 1n)]);
   expect(chain.posts[0]?.heldoutCommitment).toBeUndefined();
   expect(chain.posts[0]?.criteriaHash).toBe(hashOf(RUBRIC));
   expect(api.uploadHeldout).not.toHaveBeenCalled();
@@ -566,11 +620,7 @@ test("a_seed_without_a_heldout_part_is_posted_with_no_commitment_and_nothing_sto
 test("seeds_go_in_slug_order_whatever_order_the_folder_lists_them_in", async () => {
   const { result, lines } = await run({ gamma: {}, alpha: {}, beta: {} });
 
-  expect(result).toEqual([
-    { slug: "alpha", taskId: 1n },
-    { slug: "beta", taskId: 2n },
-    { slug: "gamma", taskId: 3n },
-  ]);
+  expect(result).toEqual([seeded("alpha", 1n), seeded("beta", 2n), seeded("gamma", 3n)]);
   expect(lines).toEqual([
     "DEPOSITED 0.75 tUSDC",
     "SEEDED alpha task=1",
@@ -585,7 +635,7 @@ test("a_folder_that_is_a_file_is_not_a_seed", async () => {
 
   const { result } = await run(dir);
 
-  expect(result).toEqual([{ slug: "alpha", taskId: 1n }]);
+  expect(result).toEqual([seeded("alpha", 1n)]);
 });
 
 // ---- The verifier -------------------------------------------------------------------------------
@@ -783,10 +833,7 @@ test("only_posts_the_seeds_it_names_in_slug_order", async () => {
 
   const { result, chain, api } = await run(dir, { only: ["gamma", "alpha"] });
 
-  expect(result).toEqual([
-    { slug: "alpha", taskId: 1n },
-    { slug: "gamma", taskId: 2n },
-  ]);
+  expect(result).toEqual([seeded("alpha", 1n), seeded("gamma", 2n)]);
   expect(chain.posts).toHaveLength(2);
   // beta's held-out checks were never stored.
   expect(api.heldouts.map((h) => h.commitment)).toEqual([
@@ -834,10 +881,7 @@ test("a_seed_whose_heldout_is_already_public_is_skipped_and_the_others_are_poste
     "SKIP beta (held-out already public)",
     "SEEDED gamma task=2",
   ]);
-  expect(result).toEqual([
-    { slug: "alpha", taskId: 1n },
-    { slug: "gamma", taskId: 2n },
-  ]);
+  expect(result).toEqual([seeded("alpha", 1n), seeded("gamma", 2n)]);
   // Nothing of beta went up, and the vault was filled for two rewards, not three.
   expect(api.heldouts.map((h) => h.commitment)).toEqual([
     hashOf(heldoutOf("alpha")),
@@ -858,13 +902,15 @@ test("when_every_seed_was_judged_nothing_is_posted_and_the_poster_pays_nothing",
 
   const { result, lines, trace } = await run({ alpha: {}, beta: {} }, { api: { served } });
 
+  // The poster has no task for either, so there is no task to name.
   expect(result).toEqual([]);
   expect(lines).toEqual([
     "SKIP alpha (held-out already public)",
     "SKIP beta (held-out already public)",
   ]);
-  // Only the two questions about the checks: with nothing left to post, no list of tasks is read.
-  expect(trace).toEqual(["getBlob", "getBlob"]);
+  // Which API it is, the two questions about the checks, and the poster's tasks: nothing was paid,
+  // uploaded or posted.
+  expect(trace).toEqual(["health", "getBlob", "getBlob", "listTasks"]);
 });
 
 test("an_api_that_fails_to_say_whether_the_heldout_is_public_stops_the_run", async () => {
@@ -892,7 +938,7 @@ test("an_api_that_fails_to_say_whether_the_heldout_is_public_stops_the_run", asy
   ).rejects.toBe(outage);
 
   // "Not public" is not what it said, so no seed was posted on the strength of it.
-  expect(trace).toEqual(["getBlob"]);
+  expect(trace).toEqual(["health", "getBlob"]);
 });
 
 // ---- The vault ----------------------------------------------------------------------------------
@@ -940,8 +986,65 @@ test("a_wallet_that_cannot_cover_the_shortfall_stops_the_run_and_says_how_much_i
       `its wallet holds 1.00 tUSDC of ${TOKEN}, so 0.54 tUSDC more is missing`,
   );
   // Nothing was deposited, uploaded or posted.
-  expect(trace).not.toContain("deposit");
-  expect(trace.filter((call) => call.startsWith("upload") || call === "postTask")).toEqual([]);
+  expect(trace.filter((call) => /deposit|upload|postTask/i.test(call))).toEqual([]);
+});
+
+test("a_wallet_that_falls_short_moves_nothing_not_even_the_near_for_the_storage", async () => {
+  // The storage balance is short too. A poster who paid for the storage first would have paid.
+  const { failure, trace, chain } = await run(
+    { alpha: {}, beta: {} },
+    { chain: { storage: storageOf(1_000n), wallet: new Map([[TOKEN, 100_000n]]) } },
+  );
+
+  expect((failure as Error).message).toBe(
+    `the vault of ${POSTER} holds 0.00 tUSDC and the seeds need 0.50 tUSDC; ` +
+      `its wallet holds 0.10 tUSDC of ${TOKEN}, so 0.40 tUSDC more is missing`,
+  );
+  // The storage balance, the vault and the wallet were read, and that was all.
+  expect(trace.slice(-3)).toEqual(["storageBalanceOf", "balanceOf", "ftBalanceOf"]);
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.deposit).not.toHaveBeenCalled();
+  expect(trace.filter((call) => /deposit|upload|postTask/i.test(call))).toEqual([]);
+});
+
+test("every_token_is_checked_before_any_is_deposited_and_each_that_falls_short_is_named", async () => {
+  const dir = await dirWith({
+    "deployments/testnet.json": JSON.stringify(deployment("testnet", TOKEN, USDC)),
+  });
+  const spec = {
+    alpha: { task: taskWith({ token: "usdc", reward: "1.00" }) },
+    beta: { task: taskWith({ token: "tusdc", reward: "0.50" }) },
+  };
+  const attempt = (wallet: Array<[string, bigint]>) =>
+    run(spec, {
+      tokenId: undefined,
+      dir,
+      chain: { storage: storageOf(1_000n), wallet: new Map(wallet) },
+    });
+  const usdcShort =
+    `the vault of ${POSTER} holds 0.00 USDC and the seeds need 1.00 USDC; ` +
+    `its wallet holds 0.40 USDC of ${USDC}, so 0.60 USDC more is missing`;
+  const tusdcShort =
+    `the vault of ${POSTER} holds 0.00 tUSDC and the seeds need 0.50 tUSDC; ` +
+    `its wallet holds 0.10 tUSDC of ${TOKEN}, so 0.40 tUSDC more is missing`;
+
+  // The wallet of the first token covers its reward, and still it is not deposited: the second
+  // token falls short, and the run moves nothing.
+  const one = await attempt([[TOKEN, 100_000n]]);
+  expect((one.failure as Error).message).toBe(tusdcShort);
+
+  // Both fall short: both are said, in the order of the seeds, one to a line.
+  const both = await attempt([
+    [USDC, 400_000n],
+    [TOKEN, 100_000n],
+  ]);
+  expect((both.failure as Error).message).toBe(`${usdcShort}\n${tusdcShort}`);
+
+  for (const { chain, trace } of [one, both]) {
+    expect(chain.storageDeposit).not.toHaveBeenCalled();
+    expect(chain.deposit).not.toHaveBeenCalled();
+    expect(trace.filter((call) => /deposit|upload|postTask/i.test(call))).toEqual([]);
+  }
 });
 
 test("a_deposit_that_tender_hands_back_stops_the_run_before_anything_is_uploaded", async () => {
@@ -956,15 +1059,6 @@ test("a_deposit_that_tender_hands_back_stops_the_run_before_anything_is_uploaded
 
 // ---- The storage balance ------------------------------------------------------------------------
 
-/** `bytes` of contract storage, in yoctoNEAR. */
-const bytes = (count: bigint) => count * 10n ** 19n;
-
-const storageOf = (free: bigint): StorageView => ({
-  total: `${bytes(free)}`,
-  available: `${bytes(free)}`,
-  used_bytes: "83",
-});
-
 test("the_storage_balance_is_topped_up_before_the_vault_and_before_anything_is_uploaded", async () => {
   // Two tasks cost at most 2 * 1,600 bytes, and a vault slot 200: 3,400. The balance holds 1,000.
   const { chain, lines, trace } = await run(
@@ -972,15 +1066,16 @@ test("the_storage_balance_is_topped_up_before_the_vault_and_before_anything_is_u
     { chain: { storage: storageOf(1_000n) } },
   );
 
-  expect(chain.storageDeposit.mock.calls).toEqual([[bytes(2_400n)]]);
+  expect(chain.storageDeposit.mock.calls).toEqual([[storageBytes(2_400n)]]);
   expect(lines[0]).toBe("DEPOSITED 0.024 NEAR for storage");
-  // The questions to the API come first; then the poster is topped up; then the seeds go up.
-  const questions = ["getBlob", "listTasks", "getTask"];
+  // The questions to the API come first. Then the poster is read in full (storage, vault, wallet)
+  // and topped up the same way round, and only then do the seeds go up.
+  const questions = ["health", "getBlob", "listTasks", "getTask"];
   expect(trace.filter((call) => !questions.includes(call)).slice(0, 5)).toEqual([
     "storageBalanceOf",
-    "storageDeposit",
     "balanceOf",
     "ftBalanceOf",
+    "storageDeposit",
     "deposit",
   ]);
   expect(trace.indexOf("storageDeposit")).toBeLessThan(trace.indexOf("uploadBlob brief"));
@@ -1000,7 +1095,7 @@ test("a_poster_that_never_deposited_registers_with_the_deposit_that_covers_its_t
   const { chain, lines } = await run({ alpha: {}, beta: {} }, { chain: { storage: null } });
 
   // 3,400 bytes, and up to 133 more for the account's own record, as storageShortfall allows.
-  expect(chain.storageDeposit.mock.calls).toEqual([[bytes(3_533n)]]);
+  expect(chain.storageDeposit.mock.calls).toEqual([[storageBytes(3_533n)]]);
   expect(lines[0]).toBe("DEPOSITED 0.03533 NEAR for storage");
 });
 
@@ -1013,10 +1108,10 @@ test("the_storage_a_run_needs_grows_with_the_tasks_it_posts_and_not_with_those_i
     { api: { served }, chain: { storage: storageOf(1_700n) } },
   );
 
-  expect(chain.storageDeposit.mock.calls).toEqual([[bytes(100n)]]);
+  expect(chain.storageDeposit.mock.calls).toEqual([[storageBytes(100n)]]);
 });
 
-// ---- Seeds that are posted already --------------------------------------------------------------
+// ---- Seeds that are posted already, and checks that are spent -----------------------------------
 
 test("a_second_run_over_the_same_seeds_posts_nothing_and_pays_nothing", async () => {
   const dir = await seedsDir({ alpha: {}, beta: {} });
@@ -1025,18 +1120,16 @@ test("a_second_run_over_the_same_seeds_posts_nothing_and_pays_nothing", async ()
   const first = await play(world, dir);
   const second = await play(world, dir);
 
-  expect(first.result).toEqual([
-    { slug: "alpha", taskId: 1n },
-    { slug: "beta", taskId: 2n },
-  ]);
-  expect(second.result).toEqual([]);
+  expect(first.result).toEqual([seeded("alpha", 1n), seeded("beta", 2n)]);
+  // Nothing was posted, and the caller is told which task each seed is.
+  expect(second.result).toEqual([existing("alpha", 1n), existing("beta", 2n)]);
   expect(second.lines).toEqual([
-    "SKIP alpha (already posted as task 1)",
-    "SKIP beta (already posted as task 2)",
+    "SKIP alpha (held-out already used by task 1)",
+    "SKIP beta (held-out already used by task 2)",
   ]);
-  // It asked what is public, then for the poster's tasks, then for the brief of each of them: it
-  // paid, uploaded and posted nothing.
-  expect(second.trace).toEqual(["getBlob", "getBlob", "listTasks", "getTask", "getTask"]);
+  // It asked which API it has, what is public, then for the poster's tasks and for each of them:
+  // it paid, uploaded and posted nothing.
+  expect(second.trace).toEqual(["health", "getBlob", "getBlob", "listTasks", "getTask", "getTask"]);
   expect(world.chain.posts).toHaveLength(2);
   expect(world.chain.deposit).toHaveBeenCalledTimes(1);
   expect(world.api.uploads).toHaveLength(4);
@@ -1055,54 +1148,80 @@ test("a_run_that_stopped_half_way_is_finished_by_running_it_again", async () => 
   expect(first.lines).toEqual(["DEPOSITED 0.75 tUSDC", "SEEDED alpha task=1", "FAILED beta"]);
   // alpha is up, so it is not posted twice; the vault still holds the rewards of the two left.
   expect(second.lines).toEqual([
-    "SKIP alpha (already posted as task 1)",
+    "SKIP alpha (held-out already used by task 1)",
     "SEEDED beta task=2",
     "SEEDED gamma task=3",
   ]);
-  expect(second.result).toEqual([
-    { slug: "beta", taskId: 2n },
-    { slug: "gamma", taskId: 3n },
-  ]);
+  expect(second.result).toEqual([existing("alpha", 1n), seeded("beta", 2n), seeded("gamma", 3n)]);
   expect(world.chain.deposit).toHaveBeenCalledTimes(1);
 });
 
-test("a_task_that_has_settled_does_not_stop_its_seed_from_being_posted_again", async () => {
-  const settled = listedOf(100n, "alpha", "settled");
-
-  const { result, lines, api } = await run({ alpha: {} }, { api: { tasks: [settled] } });
-
-  expect(result).toEqual([{ slug: "alpha", taskId: 1n }]);
-  expect(lines).toEqual(["DEPOSITED 0.25 tUSDC", "SEEDED alpha task=1"]);
-  // Only a task that has not settled could stand in the way, so the settled one is not asked about.
-  expect(api.getTask).not.toHaveBeenCalled();
-});
-
-test("a_task_in_any_phase_but_settled_counts_as_posted", async () => {
-  // An expired task has not settled either: it holds its reward until someone voids it.
-  for (const phase of ["open", "revealing", "judging", "fallback", "expired"] as const) {
-    const { result, lines, chain } = await run(
+test("a_task_of_the_poster_with_the_same_heldout_stops_its_seed_in_every_phase_settled_too", async () => {
+  // The Judge refuses a task whose checks an earlier task of the poster carries, whatever phase
+  // that task is in: a settled task, or one that was voided, has spent its checks as well.
+  for (const phase of ["open", "revealing", "judging", "fallback", "expired", "settled"] as const) {
+    const { result, lines, chain, api } = await run(
       { alpha: {} },
       { api: { tasks: [listedOf(100n, "alpha", phase)] } },
     );
 
-    expect(result, phase).toEqual([]);
-    expect(lines, phase).toEqual(["SKIP alpha (already posted as task 100)"]);
+    expect(result, phase).toEqual([existing("alpha", 100n)]);
+    expect(lines, phase).toEqual(["SKIP alpha (held-out already used by task 100)"]);
     expect(chain.deposit, phase).not.toHaveBeenCalled();
+    expect(chain.storageDeposit, phase).not.toHaveBeenCalled();
     expect(chain.postTask, phase).not.toHaveBeenCalled();
+    // The list does not say what checks a task carries, so the task is read whatever its phase.
+    expect(api.getTask, phase).toHaveBeenCalledWith(100n);
   }
 });
 
-test("a_settled_task_whose_heldout_is_public_still_keeps_its_seed_from_being_posted_again", async () => {
+test("a_task_with_other_documents_but_the_same_heldout_stops_the_seed_all_the_same", async () => {
+  // What counts is the commitment: the Judge looks at nothing else of the earlier task.
+  const tasks = [listedOf(100n, "other", "settled", { heldout: "alpha" })];
+
+  const { result, lines } = await run({ alpha: {} }, { api: { tasks } });
+
+  expect(result).toEqual([existing("alpha", 100n)]);
+  expect(lines).toEqual(["SKIP alpha (held-out already used by task 100)"]);
+});
+
+test("a_task_with_the_brief_of_the_seed_and_other_heldout_does_not_stop_it", async () => {
+  // A seed whose checks were rewritten is a task of its own, whatever its brief.
+  const tasks = [listedOf(100n, "alpha", "open", { heldout: "other" })];
+
+  const { result, lines } = await run({ alpha: {} }, { api: { tasks } });
+
+  expect(result).toEqual([seeded("alpha", 1n)]);
+  expect(lines).toEqual(["DEPOSITED 0.25 tUSDC", "SEEDED alpha task=1"]);
+});
+
+test("the_oldest_task_with_the_checks_is_the_one_named_whatever_its_phase", async () => {
+  const tasks = [
+    listedOf(9n, "alpha", "open"),
+    listedOf(3n, "alpha", "settled"),
+    listedOf(7n, "alpha", "judging"),
+  ];
+
+  const { lines, api } = await run({ alpha: {} }, { api: { tasks } });
+
+  // The Judge names the lowest id, and so does the script. Every task is read, oldest first.
+  expect(lines).toEqual(["SKIP alpha (held-out already used by task 3)"]);
+  expect(api.getTask.mock.calls.map(([id]) => id)).toEqual([3n, 7n, 9n]);
+});
+
+test("a_seed_whose_heldout_is_public_is_skipped_for_that_and_still_gets_the_task_that_used_it", async () => {
   const served = new Set([hashOf(heldoutOf("alpha"))]);
 
-  const { result, lines } = await run(
+  const { result, lines, chain } = await run(
     { alpha: {} },
     { api: { served, tasks: [listedOf(100n, "alpha", "settled")] } },
   );
 
-  // The single-use rule (P05-P12) holds whatever the lookup finds.
-  expect(result).toEqual([]);
+  // Public is the reason that is printed: the single-use rule (P05-P12) holds whatever the lookup
+  // finds. The settled task is the one the caller can look the seed up by.
+  expect(result).toEqual([existing("alpha", 100n)]);
   expect(lines).toEqual(["SKIP alpha (held-out already public)"]);
+  expect(chain.postTask).not.toHaveBeenCalled();
 });
 
 test("a_seed_that_is_judged_is_skipped_for_its_public_checks_whether_or_not_it_is_up", async () => {
@@ -1113,32 +1232,19 @@ test("a_seed_that_is_judged_is_skipped_for_its_public_checks_whether_or_not_it_i
 
   expect(lines).toEqual([
     "SKIP alpha (held-out already public)",
-    "SKIP beta (already posted as task 101)",
+    "SKIP beta (held-out already used by task 101)",
   ]);
 });
 
-test("the_oldest_task_that_has_not_settled_is_the_one_named", async () => {
-  const tasks = [
-    listedOf(9n, "alpha", "open"),
-    listedOf(3n, "alpha", "settled"),
-    listedOf(7n, "alpha", "judging"),
-  ];
-
-  const { lines, api } = await run({ alpha: {} }, { api: { tasks } });
-
-  expect(lines).toEqual(["SKIP alpha (already posted as task 7)"]);
-  // The settled task is not asked about; the others are, oldest first.
-  expect(api.getTask.mock.calls.map(([id]) => id)).toEqual([7n, 9n]);
-});
-
 test("a_task_of_another_poster_does_not_stand_in_the_way", async () => {
-  const theirs = listedOf(100n, "alpha", "open", `someone.${PARENT}`);
+  const theirs = listedOf(100n, "alpha", "open", { poster: `someone.${PARENT}` });
 
   const asked = await run({ alpha: {} }, { api: { tasks: [theirs] } });
   const ignored = await run({ alpha: {} }, { api: { tasks: [theirs], ignorePoster: true } });
 
+  // The Judge looks at the poster's own tasks only: someone else may post the same checks.
   for (const { result, lines } of [asked, ignored]) {
-    expect(result).toEqual([{ slug: "alpha", taskId: 1n }]);
+    expect(result).toEqual([seeded("alpha", 1n)]);
     expect(lines).toEqual(["DEPOSITED 0.25 tUSDC", "SEEDED alpha task=1"]);
   }
   // It asks for the poster's tasks, in the biggest pages the API gives ...
@@ -1156,7 +1262,7 @@ test("the_posters_tasks_are_read_page_after_page_to_the_last", async () => {
 
   const { lines, api } = await run({ alpha: {} }, { api: { tasks, pageSize: 2 } });
 
-  expect(lines).toEqual(["SKIP alpha (already posted as task 100)"]);
+  expect(lines).toEqual(["SKIP alpha (held-out already used by task 100)"]);
   // Newest first, each page from the cursor of the one before, until there is none.
   expect(api.listTasks.mock.calls.map(([filter]) => filter?.cursor)).toEqual([null, "104", "102"]);
   expect(api.getTask.mock.calls.map(([id]) => id)).toEqual([100n, 101n, 102n, 103n, 104n, 105n]);
@@ -1169,15 +1275,78 @@ test("a_seed_that_is_posted_already_is_not_paid_for_again", async () => {
     { api: { tasks: [listedOf(100n, "alpha", "open")] }, chain: { storage: storageOf(1_700n) } },
   );
 
-  expect(result).toEqual([{ slug: "beta", taskId: 1n }]);
-  expect(chain.storageDeposit.mock.calls).toEqual([[bytes(100n)]]);
+  expect(result).toEqual([existing("alpha", 100n), seeded("beta", 1n)]);
+  expect(chain.storageDeposit.mock.calls).toEqual([[storageBytes(100n)]]);
   expect(chain.deposit.mock.calls).toEqual([[TOKEN, 250_000n]]);
   expect(lines).toEqual([
     "DEPOSITED 0.001 NEAR for storage",
     "DEPOSITED 0.25 tUSDC",
-    "SKIP alpha (already posted as task 100)",
+    "SKIP alpha (held-out already used by task 100)",
     "SEEDED beta task=1",
   ]);
+});
+
+test("a_seed_without_checks_is_skipped_for_a_task_with_its_brief_that_has_not_settled", async () => {
+  const rubric = { rubric: { criteria: RUBRIC, heldout: null } };
+  const up = (phase: Phase) => ({
+    api: { tasks: [listedOf(100n, "rubric", phase, { heldout: null })] },
+  });
+
+  // It has no commitment to go by, so the brief decides: a task that is up stands for the seed ...
+  const open = await run(rubric, up("open"));
+  expect(open.result).toEqual([existing("rubric", 100n)]);
+  expect(open.lines).toEqual(["SKIP rubric (already posted as task 100)"]);
+  expect(open.chain.postTask).not.toHaveBeenCalled();
+
+  // ... and one that has settled spent no checks, so the seed can be posted again.
+  const settled = await run(rubric, up("settled"));
+  expect(settled.result).toEqual([seeded("rubric", 1n)]);
+  expect(settled.lines).toEqual(["DEPOSITED 0.25 tUSDC", "SEEDED rubric task=1"]);
+});
+
+test("the_result_gives_each_seed_a_task_stands_for_in_slug_order_and_how_it_came_to_be", async () => {
+  const served = new Set([hashOf(heldoutOf("delta")), hashOf(heldoutOf("echo"))]);
+  const tasks = [listedOf(40n, "alpha", "settled"), listedOf(41n, "delta", "open")];
+
+  const { result, lines } = await run(
+    { alpha: {}, beta: {}, delta: {}, echo: {} },
+    { api: { served, tasks } },
+  );
+
+  // alpha is spent by task 40, beta is posted now, delta is public and has task 41. echo is
+  // public, and no task of the poster carries its checks: there is no task to name, so no entry.
+  expect(result).toEqual([existing("alpha", 40n), seeded("beta", 1n), existing("delta", 41n)]);
+  expect(lines).toEqual([
+    "DEPOSITED 0.25 tUSDC",
+    "SKIP alpha (held-out already used by task 40)",
+    "SEEDED beta task=1",
+    "SKIP delta (held-out already public)",
+    "SKIP echo (held-out already public)",
+  ]);
+});
+
+test("seeds_that_share_their_heldout_checks_are_refused_before_anything_is_asked", async () => {
+  // beta's file holds the document that alpha's does, written another way: one set of checks.
+  const { failure, trace, lines } = await run({
+    alpha: {},
+    beta: { heldout: '{"exact":\n{"expected": ["alpha"]}}' },
+    gamma: { heldout: heldoutOf("alpha") },
+  });
+
+  expect((failure as Error).message).toBe(
+    "alpha, beta, gamma share their held-out checks, and the Judge takes a poster's checks once: give each seed its own",
+  );
+  expect(trace).toEqual(UNTOUCHED);
+  expect(lines).toEqual([]);
+});
+
+test("seeds_that_share_their_checks_are_fine_when_only_one_of_them_is_posted", async () => {
+  const spec = { alpha: {}, beta: { heldout: heldoutOf("alpha") } };
+
+  const { result, failure } = await run(spec, { only: ["beta"] });
+
+  expect(failure).toBeUndefined();
+  expect(result).toEqual([seeded("beta", 1n)]);
 });
 
 test("an_api_that_fails_to_list_the_posters_tasks_stops_the_run_before_anything_is_paid", async () => {
@@ -1193,7 +1362,7 @@ test("an_api_that_fails_to_list_the_posters_tasks_stops_the_run_before_anything_
 
   // "No tasks" is not what it said, so nothing was paid, uploaded or posted on the strength of it.
   expect(failure).toBe(outage);
-  expect(trace).toEqual(["getBlob", "getBlob", "listTasks"]);
+  expect(trace).toEqual(["health", "getBlob", "getBlob", "listTasks"]);
   expect(lines).toEqual([]);
 });
 
@@ -1203,7 +1372,7 @@ test("a_list_that_never_ends_is_an_error_and_not_a_hang", async () => {
   expect((failure as Error).message).toBe(
     `the list of the tasks of ${POSTER} does not end: cursor 9 came twice`,
   );
-  expect(trace).toEqual(["getBlob", "listTasks", "listTasks"]);
+  expect(trace).toEqual(["health", "getBlob", "listTasks", "listTasks"]);
 });
 
 test("a_listed_task_that_the_api_then_does_not_know_stops_the_run", async () => {
@@ -1215,8 +1384,55 @@ test("a_listed_task_that_the_api_then_does_not_know_stops_the_run", async () => 
   expect((failure as Error).message).toBe(
     `the API lists task 100 of ${POSTER}, and has no such task`,
   );
-  expect(trace).not.toContain("deposit");
-  expect(trace).not.toContain("postTask");
+  expect(trace.filter((call) => /deposit|upload|postTask/i.test(call))).toEqual([]);
+});
+
+// ---- Which deployment ---------------------------------------------------------------------------
+
+test("an_api_of_another_deployment_is_refused_with_both_named_before_anything_else_is_asked", async () => {
+  const elsewhere = `tender.elsewhere.${PARENT}`;
+  const cases = [
+    {
+      what: "the API serves another network",
+      options: { api: { serves: { network: "sandbox" } } },
+      message: `the API serves ${CONTRACT} on sandbox, but the client is set for ${CONTRACT} on testnet`,
+    },
+    {
+      what: "the API serves another contract",
+      options: { api: { serves: { contract: elsewhere } } },
+      message: `the API serves ${elsewhere} on testnet, but the client is set for ${CONTRACT} on testnet`,
+    },
+    {
+      what: "the client is set for another contract",
+      options: { chain: { contractId: elsewhere } },
+      message: `the API serves ${CONTRACT} on testnet, but the client is set for ${elsewhere} on testnet`,
+    },
+    {
+      what: "the client is set for another network",
+      options: { chain: { network: "sandbox" as const } },
+      message: `the API serves ${CONTRACT} on testnet, but the client is set for ${CONTRACT} on sandbox`,
+    },
+  ];
+
+  for (const { what, options, message } of cases) {
+    const { failure, trace, lines } = await run({ alpha: {} }, options);
+
+    expect((failure as Error).message, what).toBe(
+      `${message}: they have to be the same deployment`,
+    );
+    // Only the API was asked who it is: nothing was checked, listed, paid, uploaded or posted.
+    expect(trace, what).toEqual(["health"]);
+    expect(lines, what).toEqual([]);
+  }
+});
+
+test("an_api_that_cannot_say_which_deployment_it_is_stops_the_run", async () => {
+  const outage = new ApiError(503, { error: "chain_unavailable", message: "no" });
+
+  const { failure, trace } = await run({ alpha: {} }, { api: { unhealthy: outage } });
+
+  expect(failure).toBe(outage);
+  expect(trace).toEqual(["health"]);
 });
 
 // ---- Failures -----------------------------------------------------------------------------------
@@ -1264,6 +1480,21 @@ test("a_client_that_is_not_the_poster_is_refused_before_anything_is_asked", asyn
 
   expect(other.trace).toEqual(UNTOUCHED);
   expect(unsigned.trace).toEqual(UNTOUCHED);
+});
+
+test("seed_refuses_mainnet_whether_the_option_or_the_client_says_it_and_before_it_reads_a_file", async () => {
+  // The folder of seeds does not exist: a run that got as far as reading it would fail on that.
+  const nowhere = join(tmpdir(), "tender-seeds-that-do-not-exist");
+  const byOption = await run(nowhere, { network: "mainnet" });
+  const byClient = await run(nowhere, { chain: { network: "mainnet" } });
+
+  for (const { failure, trace, lines } of [byOption, byClient]) {
+    expect((failure as Error).message).toBe(
+      "mainnet is not seeded by this script: plan 07 owns the mainnet launch, which needs the owner's approval",
+    );
+    expect(trace).toEqual(UNTOUCHED);
+    expect(lines).toEqual([]);
+  }
 });
 
 // ---- Seeds that are wrong -----------------------------------------------------------------------
@@ -1375,11 +1606,11 @@ test("no_secret_reaches_a_log_line_or_an_error_of_a_run_that_succeeds_or_fails",
   // show that nothing the script prints or throws comes from them.
   const secretive = { privateKey: LEAKY, token: LEAKY };
   const dir = await seedsDir({ alpha: {}, beta: {} });
-  const attempt = async (chain: ChainOptions) => {
+  const attempt = async (chain: ChainOptions, served: ApiOptions = {}) => {
     const trace: string[] = [];
     const lines: string[] = [];
     const fake = fakeChain(trace, chain);
-    const { api } = fakeApi(trace);
+    const { api } = fakeApi(trace, served);
     const failure = await seed({
       client: Object.assign(fake.client, secretive),
       api: Object.assign(api, secretive),
@@ -1402,8 +1633,9 @@ test("no_secret_reaches_a_log_line_or_an_error_of_a_run_that_succeeds_or_fails",
   const failed = await attempt({
     failPost: { call: 1, error: new TenderError("E_AUTH", "E_AUTH: attach exactly 1 yoctoNEAR") },
   });
+  const elsewhere = await attempt({}, { serves: { network: "mainnet" } });
 
-  for (const output of [ok, poor, refused, failed]) {
+  for (const output of [ok, poor, refused, failed, elsewhere]) {
     expect(output).not.toContain("LEAKY");
     expect(output).not.toContain("ed25519");
   }
@@ -1412,6 +1644,7 @@ test("no_secret_reaches_a_log_line_or_an_error_of_a_run_that_succeeds_or_fails",
   expect(poor).toContain("more is missing");
   expect(refused).toContain("did not take the deposit");
   expect(failed).toContain("FAILED alpha");
+  expect(elsewhere).toContain("they have to be the same deployment");
 });
 
 // ---- The seeds of the repository ----------------------------------------------------------------
@@ -1431,6 +1664,7 @@ test("the_ten_seeds_of_the_repository_are_posted_in_slug_order_with_the_hashes_o
   expect(failure).toBeUndefined();
   expect(slugs).toHaveLength(10);
   expect(result?.map((posted) => posted.slug)).toEqual(slugs);
+  expect(result?.map((posted) => posted.status)).toEqual(slugs.map(() => "posted"));
   expect(lines.filter((line) => line.startsWith("SEEDED "))).toHaveLength(10);
   expect(chain.posts.map((post) => post.briefHash)).toEqual(
     slugs.map((slug) => hashOf(fileOf(slug, "brief.json"))),
@@ -1478,7 +1712,7 @@ async function runCli(
   args: string[],
   stand: typeof seed = async (o) => {
     o.log?.("SEEDED alpha task=1");
-    return [{ slug: "alpha", taskId: 1n }];
+    return [seeded("alpha", 1n)];
   },
 ) {
   const dir = await dirWith(files);

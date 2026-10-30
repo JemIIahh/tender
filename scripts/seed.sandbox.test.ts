@@ -124,7 +124,7 @@ function detailOf(task: TaskView): TaskDetailResponse {
  * serves the URI `https://api.test/v1/blobs/<sha256>`. The held-out documents named in `served`
  * count as public already, as one that was judged is. Its tasks are the chain's, listed the way the
  * API lists them (newest first, for a poster, in pages), so that what the script finds of the
- * poster's tasks is what the chain holds.
+ * poster's tasks is what the chain holds. It says it serves the chain's network and contract.
  */
 function recordingApi(served: ReadonlySet<string> = new Set()) {
   const blobs: Blob[] = [];
@@ -154,7 +154,14 @@ function recordingApi(served: ReadonlySet<string> = new Set()) {
     listAgents: unexpected("listAgents"),
     getAgent: unexpected("getAgent"),
     listEntries: unexpected("listEntries"),
-    health: unexpected("health"),
+    health: async () => ({
+      ok: true,
+      network: chain.network,
+      contract: chain.contractId,
+      indexed_height: "1",
+      chain_final_height: "1",
+      lag_blocks: "0",
+    }),
     getScorecard: unexpected("getScorecard"),
     getBlob: async (sha256) => (served.has(sha256) ? new Uint8Array([1]) : null),
     uploadBlob: async ({ kind, bytes }) => {
@@ -301,8 +308,8 @@ test("two_seeds_are_posted_and_each_task_reads_back_as_its_files_say", async () 
   // In slug order, whatever order `only` names them in.
   const first = countBefore + 1n;
   expect(posted).toEqual([
-    { slug: "invoice-extract", taskId: first },
-    { slug: "near-account-regex", taskId: first + 1n },
+    { slug: "invoice-extract", taskId: first, status: "posted" },
+    { slug: "near-account-regex", taskId: first + 1n, status: "posted" },
   ]);
   expect(await reader.taskCount()).toBe(countBefore + 2n);
   expect(lines).toEqual([
@@ -456,8 +463,9 @@ test("a_seed_whose_heldout_is_public_is_not_posted_and_its_reward_stays_with_the
     log: (line) => lines.push(line),
   });
 
-  // iso-date-regex pays 1.50 and semver-regex 1.00: only the first is paid for and posted.
-  expect(posted).toEqual([{ slug: "iso-date-regex", taskId: countBefore + 1n }]);
+  // iso-date-regex pays 1.50 and semver-regex 1.00: only the first is paid for and posted. The
+  // poster has no task with the checks of semver-regex, so there is no task to name for it.
+  expect(posted).toEqual([{ slug: "iso-date-regex", taskId: countBefore + 1n, status: "posted" }]);
   // The seeds go in slug order, so the one that is posted comes before the one that is skipped.
   expect(lines).toEqual([
     "DEPOSITED 1.50 tUSDC",
@@ -473,12 +481,14 @@ test("a_seed_whose_heldout_is_public_is_not_posted_and_its_reward_stays_with_the
   );
 });
 
-test("a_poster_whose_wallet_cannot_cover_the_rewards_posts_nothing_and_is_told_what_is_missing", async () => {
-  // The keeper opens with storage and no tokens at all.
+test("a_poster_whose_wallet_cannot_cover_the_rewards_posts_nothing_and_moves_nothing", async () => {
+  // The keeper opens with 0.1 NEAR of storage, which does not cover ten tasks, and with no tokens
+  // at all. A script that paid for the storage first would have paid before it found the wallet
+  // empty.
   const keeper = chain.accounts.keeper;
   const client = clientOf("keeper");
   const { api, blobs, heldouts } = recordingApi();
-  const countBefore = await reader.taskCount();
+  const before = await holdings("keeper");
 
   const failure = await seed({
     client,
@@ -487,7 +497,6 @@ test("a_poster_whose_wallet_cannot_cover_the_rewards_posts_nothing_and_is_told_w
     poster: keeper.accountId,
     judgeAccount: chain.accounts.judge.accountId,
     tokenId: chain.tokenId,
-    only: ["near-account-regex"],
     log: () => {},
   }).then(
     () => undefined,
@@ -495,10 +504,11 @@ test("a_poster_whose_wallet_cannot_cover_the_rewards_posts_nothing_and_is_told_w
   );
 
   expect((failure as Error).message).toBe(
-    `the vault of ${keeper.accountId} holds 0.00 tUSDC and the seeds need 1.00 tUSDC; ` +
-      `its wallet holds 0.00 tUSDC of ${chain.tokenId}, so 1.00 tUSDC more is missing`,
+    `the vault of ${keeper.accountId} holds 0.00 tUSDC and the seeds need 7.00 tUSDC; ` +
+      `its wallet holds 0.00 tUSDC of ${chain.tokenId}, so 7.00 tUSDC more is missing`,
   );
-  expect(await reader.taskCount()).toBe(countBefore);
+  // The tasks, the wallet, the vault and the storage balance are what they were.
+  expect(await holdings("keeper")).toEqual(before);
   expect(blobs).toEqual([]);
   expect(heldouts).toEqual([]);
 });
@@ -518,11 +528,16 @@ test("a_second_run_posts_nothing_again_and_a_seed_added_to_it_is_the_only_one_po
     `SEEDED distinct-signers-count task=${one.taskId}`,
     `SEEDED meeting-actions-extract task=${two.taskId}`,
   ]);
-  // The second run found both tasks on the chain. It paid, uploaded and posted nothing.
-  expect(second.posted).toEqual([]);
+  // The second run found both tasks on the chain, by the checks they carry. It paid, uploaded and
+  // posted nothing, and gave back the tasks.
+  const stand = [
+    { slug: "distinct-signers-count", taskId: one.taskId, status: "existing" },
+    { slug: "meeting-actions-extract", taskId: two.taskId, status: "existing" },
+  ];
+  expect(second.posted).toEqual(stand);
   expect(second.lines).toEqual([
-    `SKIP distinct-signers-count (already posted as task ${one.taskId})`,
-    `SKIP meeting-actions-extract (already posted as task ${two.taskId})`,
+    `SKIP distinct-signers-count (held-out already used by task ${one.taskId})`,
+    `SKIP meeting-actions-extract (held-out already used by task ${two.taskId})`,
   ]);
   expect(second.blobs).toEqual([]);
   expect(second.heldouts).toEqual([]);
@@ -535,18 +550,21 @@ test("a_second_run_posts_nothing_again_and_a_seed_added_to_it_is_the_only_one_po
     "sum-of-transfers",
   ]);
   const added = afterSecond.tasks + 1n;
-  expect(third.posted).toEqual([{ slug: "sum-of-transfers", taskId: added }]);
+  expect(third.posted).toEqual([
+    ...stand,
+    { slug: "sum-of-transfers", taskId: added, status: "posted" },
+  ]);
   expect(third.lines).toEqual([
     "DEPOSITED 0.25 tUSDC",
-    `SKIP distinct-signers-count (already posted as task ${one.taskId})`,
-    `SKIP meeting-actions-extract (already posted as task ${two.taskId})`,
+    `SKIP distinct-signers-count (held-out already used by task ${one.taskId})`,
+    `SKIP meeting-actions-extract (held-out already used by task ${two.taskId})`,
     `SEEDED sum-of-transfers task=${added}`,
   ]);
   await expectPosted(added, "sum-of-transfers", { poster: bob }, third.blobs);
   expect(await reader.taskCount()).toBe(added);
 });
 
-test("a_task_that_was_voided_has_settled_and_its_seed_can_be_posted_again", async () => {
+test("a_task_that_was_voided_has_settled_and_still_keeps_its_seed_from_being_posted_again", async () => {
   const lead = chain.accounts.lead.accountId;
   const shortest = NETWORKS.sandbox.minWindowSecs;
   const windows = {
@@ -561,15 +579,20 @@ test("a_task_that_was_voided_has_settled_and_its_seed_can_be_posted_again", asyn
   const [posted] = first.posted;
   if (posted === undefined) throw new Error("the first run posted nothing");
   expect(first.lines).toEqual(["DEPOSITED 0.50 tUSDC", `SEEDED ${slug} task=${posted.taskId}`]);
-  const skipped = [`SKIP ${slug} (already posted as task ${posted.taskId})`];
+  const skipped = [`SKIP ${slug} (held-out already used by task ${posted.taskId})`];
+  const stands = [{ slug, taskId: posted.taskId, status: "existing" }];
+  const leftAlone = async () => {
+    const run = await seedAs("lead", [slug], { windows });
+    expect(run.lines).toEqual(skipped);
+    expect(run.posted).toEqual(stands);
+  };
 
   // While the task is open the seed is up, and a run leaves it alone.
-  expect((await seedAs("lead", [slug], { windows })).lines).toEqual(skipped);
+  await leftAlone();
 
-  // Nobody enters. Once the reveal window is over the task is waiting for a pick, which is not
-  // settled either: the seed is still up.
+  // Nobody enters. Once the reveal window is over the task is waiting for a pick: the same.
   await waitForPhase(posted.taskId, ["judging", "fallback", "expired"]);
-  expect((await seedAs("lead", [slug], { windows })).lines).toEqual(skipped);
+  await leftAlone();
 
   // Anyone can void a task that nobody revealed to. It settles, and its reward is back in the vault.
   await clientOf("lead").voidTask(posted.taskId);
@@ -578,11 +601,11 @@ test("a_task_that_was_voided_has_settled_and_its_seed_can_be_posted_again", asyn
   expect(voided?.outcome?.kind).toBe("voided");
   expect(await reader.balanceOf(lead, chain.tokenId)).toBe(500_000n);
 
-  // The seed is posted again, as a task of its own, with the refund and not a new deposit.
+  // The task has settled, and its seed is still not posted again: the Judge refuses a task whose
+  // checks an earlier task of the poster carries, whatever phase that task is in, so the second
+  // task would be stuck. The refund stays in the vault, and no task is added.
   const countBefore = await reader.taskCount();
-  const again = await seedAs("lead", [slug], { windows });
-  expect(again.posted).toEqual([{ slug, taskId: countBefore + 1n }]);
-  expect(again.lines).toEqual([`SEEDED ${slug} task=${countBefore + 1n}`]);
-  await expectPosted(countBefore + 1n, slug, { poster: lead, windows }, again.blobs);
-  expect(await reader.balanceOf(lead, chain.tokenId)).toBe(0n);
+  await leftAlone();
+  expect(await reader.taskCount()).toBe(countBefore);
+  expect(await reader.balanceOf(lead, chain.tokenId)).toBe(500_000n);
 });
