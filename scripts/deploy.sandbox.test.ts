@@ -408,6 +408,34 @@ test("deploy_names_the_key_it_lacks_for_an_account_that_exists", async () => {
   expect((error as Error).message).not.toContain(stranger);
 });
 
+test("deploy_uses_the_key_an_interrupted_run_left_for_an_account_it_never_made", async () => {
+  // A run that wrote tender's key to the env file and stopped before it made the account: the
+  // next run makes the account with that key, so no key on disk is ever for an account without it.
+  const parent = await fundedAccount("crash", 100n * NEAR);
+  const dir = await newDir();
+  const key = KeyPair.fromRandom("ed25519");
+  const envPath = join(dir, ".env.deploy.sandbox");
+  await writeFile(
+    envPath,
+    `TENDER_ACCOUNT=tender.crash.sandbox\nTENDER_PRIVATE_KEY=${key.toString()}\n`,
+  );
+
+  const { lines } = await runDeploy(parent, "usdc.sandbox", dir);
+
+  expect(lines).toContain("OK create tender.crash.sandbox");
+  const text = await readFile(envPath, "utf8");
+  expect(text.match(/^TENDER_PRIVATE_KEY=/gm)).toHaveLength(1);
+  expect(parseEnv(text).TENDER_PRIVATE_KEY).toBe(key.toString());
+  const crashed = new TenderClient({
+    network: "sandbox",
+    contractId: "tender.crash.sandbox",
+    rpcUrl: node.rpcUrl,
+  });
+  expect(
+    await crashed.viewAccessKey("tender.crash.sandbox", key.getPublicKey().toString()),
+  ).toEqual({ permission: "FullAccess" });
+});
+
 test("deploy_resumes_after_a_step_fails_and_still_knows_the_deploy_block", async () => {
   // The deploy stops half way when the USDC account is there but holds no token: registering
   // Tender with it fails. The other lanes carry on to the end.
