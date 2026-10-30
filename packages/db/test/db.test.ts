@@ -10,9 +10,11 @@ import {
   type BlobKind,
   type Db,
   getBlob,
+  hasResultUpload,
   migrate,
   openDb,
   putBlob,
+  recordResultUpload,
   setBlobPublic,
 } from "../src/index";
 
@@ -24,6 +26,9 @@ const POSTGRES_URL = process.env.TEST_DATABASE_URL || undefined;
 
 const U128_MAX = "340282366920938463463374607431768211455";
 const MINUTE = { timeout: 60_000 };
+
+// The migrations of this package, in the order they apply.
+const MIGRATIONS = ["0001_init.sql", "0002_result_uploads.sql"];
 
 // Stands for a secret (a held-out answer, blob bytes) in the error tests: as text, and as hex, which
 // is how Postgres prints the bytes of a bytea.
@@ -212,20 +217,33 @@ const SCHEMA: Record<string, string[]> = {
   tg_watches: ["chat_id bigint", "tag text"],
   tg_sent: ["chat_id bigint", "dedupe_key text", "sent_at timestamp with time zone = now()"],
   worker_cursor: ["name text", "event_id bigint"],
+  // Migration 0002.
+  result_uploads: [
+    "sha256 text",
+    "task_id numeric(40,0)",
+    "account text",
+    "uploaded_at timestamp with time zone = now()",
+  ],
 };
 
-// Primary keys, uniqueness and the four task indexes, as "table: kind (columns)".
+// Primary keys, uniqueness and every index, as "table: kind (columns)". An index on an expression
+// shows the expression in place of a column, and a partial one ends with its condition.
 const KEYS = [
+  "agents: index (asp)",
   "agents: primary key (account)",
   "auth_challenges: primary key (nonce)",
   "auth_tokens: primary key (token_sha256)",
   "blobs: primary key (sha256)",
   "chain_cursor: primary key (source)",
+  "entries: index (account)",
+  "entries: index (content_hash)",
   "entries: primary key (task_id, account)",
   "events: index (task_id)",
+  "events: index ((data ->> 'content_hash'::text)) where (event = 'revealed'::text)",
   "events: primary key (id)",
   "events: unique (receipt_id, log_index)",
   "funders: primary key (task_id, account)",
+  "result_uploads: primary key (sha256, task_id, account)",
   "schema_migrations: primary key (name)",
   "tasks: index (commit_deadline)",
   "tasks: primary key (id)",
@@ -270,16 +288,26 @@ async function describeSchema(db: Db) {
     lines.push(`${col} ${type}${notnull ? "" : "?"}${def}`);
     tables[tbl] = lines;
   }
-  const keyRows = await db.query<{ tbl: string; pk: boolean; uniq: boolean; cols: string }>(
+  // `pg_get_indexdef` with a column number prints that column, or the expression an index is on.
+  const keyRows = await db.query<{
+    tbl: string;
+    pk: boolean;
+    uniq: boolean;
+    cols: string;
+    cond: string | null;
+  }>(
     `select c.relname as tbl, i.indisprimary as pk, i.indisunique as uniq,
-            (select string_agg(a.attname, ', ' order by k.ord)
-               from unnest(i.indkey::int2[]) with ordinality as k(attnum, ord)
-               join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum) as cols
+            (select string_agg(pg_get_indexdef(i.indexrelid, k.ord::int, true), ', ' order by k.ord)
+               from generate_series(1, i.indnatts) as k(ord)) as cols,
+            pg_get_expr(i.indpred, i.indrelid) as cond
        from pg_index i join pg_class c on c.oid = i.indrelid
       where c.relnamespace = current_schema()::regnamespace`,
   );
   const keys = keyRows
-    .map((k) => `${k.tbl}: ${k.pk ? "primary key" : k.uniq ? "unique" : "index"} (${k.cols})`)
+    .map((k) => {
+      const kind = k.pk ? "primary key" : k.uniq ? "unique" : "index";
+      return `${k.tbl}: ${kind} (${k.cols})${k.cond === null ? "" : ` where ${k.cond}`}`;
+    })
     .sort();
   const constraintRows = await db.query<{ tbl: string; def: string }>(
     `select c.relname as tbl, pg_get_constraintdef(k.oid) as def
@@ -432,13 +460,15 @@ describe.each(targets)("db on $name", (target) => {
   it("migrate_is_idempotent", MINUTE, async () => {
     const { db: empty, dispose } = await target.fresh();
     try {
-      // Two services starting together apply the migration once between them.
+      // Two services starting together apply the migrations once between them.
       const concurrent = await Promise.all([migrate(empty), migrate(empty)]);
-      expect(concurrent.map((applied) => applied.length).sort()).toEqual([0, 1]);
-      expect(concurrent.flat()).toEqual(["0001_init.sql"]);
+      expect(concurrent.map((applied) => applied.length).sort()).toEqual([0, MIGRATIONS.length]);
+      expect(concurrent.flat()).toEqual(MIGRATIONS);
       expect(await migrate(empty)).toEqual([]);
-      const recorded = await empty.query("select name, applied_at from schema_migrations");
-      expect(recorded).toEqual([{ name: "0001_init.sql", applied_at: expect.any(Date) }]);
+      const recorded = await empty.query(
+        "select name, applied_at from schema_migrations order by name",
+      );
+      expect(recorded).toEqual(MIGRATIONS.map((name) => ({ name, applied_at: expect.any(Date) })));
     } finally {
       await dispose();
     }
@@ -970,6 +1000,82 @@ describe.each(targets)("db on $name", (target) => {
     expect(await getBlob(db, createHash("sha256").update(bad).digest("hex"))).toBeNull();
     expect(await getBlob(db, "ab".repeat(32))).toBeNull();
   });
+
+  it("result_uploads_are_recorded_once_per_hash_task_and_account", async () => {
+    const sha = "5a".repeat(32);
+    const uploads = () =>
+      db.query<{ task_id: string; account: string }>(
+        `select task_id::text as task_id, account from result_uploads
+          where sha256 = $1 order by result_uploads.task_id, account`,
+        [sha],
+      );
+    const uploadedAt = async () => {
+      const [row] = await db.query<{ uploaded_at: Date }>(
+        "select uploaded_at from result_uploads where sha256 = $1 and task_id = 7 and account = 'alice.near'",
+        [sha],
+      );
+      return row?.uploaded_at;
+    };
+
+    expect(await hasResultUpload(db, sha, 7n, "alice.near")).toBe(false);
+    await expect(
+      recordResultUpload(db, { sha256: sha, taskId: 7n, account: "alice.near" }),
+    ).resolves.toBeUndefined();
+    expect(await hasResultUpload(db, sha, 7n, "alice.near")).toBe(true);
+
+    // The record is of one hash, one task and one account: change any of them and there is none.
+    expect(await hasResultUpload(db, "5b".repeat(32), 7n, "alice.near")).toBe(false);
+    expect(await hasResultUpload(db, sha, 8n, "alice.near")).toBe(false);
+    expect(await hasResultUpload(db, sha, 7n, "bob.near")).toBe(false);
+
+    // Recorded again, it is still one row, and the row is the one that was there: the first upload.
+    const first = await uploadedAt();
+    expect(first).toBeInstanceOf(Date);
+    await recordResultUpload(db, { sha256: sha, taskId: 7n, account: "alice.near" });
+    await recordResultUpload(db, { sha256: sha, taskId: 7n, account: "alice.near" });
+    expect(await uploads()).toEqual([{ task_id: "7", account: "alice.near" }]);
+    expect(await uploadedAt()).toEqual(first);
+
+    // Another account, or another task, is a record of its own.
+    await recordResultUpload(db, { sha256: sha, taskId: 7n, account: "bob.near" });
+    await recordResultUpload(db, { sha256: sha, taskId: 8n, account: "alice.near" });
+    expect(await uploads()).toEqual([
+      { task_id: "7", account: "alice.near" },
+      { task_id: "7", account: "bob.near" },
+      { task_id: "8", account: "alice.near" },
+    ]);
+    expect(await hasResultUpload(db, sha, 7n, "bob.near")).toBe(true);
+    expect(await hasResultUpload(db, sha, 8n, "alice.near")).toBe(true);
+    expect(await hasResultUpload(db, sha, 8n, "bob.near")).toBe(false);
+
+    // A task id is a u64, so it reaches past 2^53, and a bigint keeps every digit of it.
+    await recordResultUpload(db, { sha256: sha, taskId: 2n ** 64n - 1n, account: "alice.near" });
+    expect(await hasResultUpload(db, sha, 2n ** 64n - 1n, "alice.near")).toBe(true);
+    expect(await hasResultUpload(db, sha, 2n ** 64n - 2n, "alice.near")).toBe(false);
+    expect((await uploads()).at(-1)).toEqual({
+      task_id: "18446744073709551615",
+      account: "alice.near",
+    });
+  });
+
+  it("a_task_id_that_is_not_a_bigint_is_refused", async () => {
+    // The column rounds a fraction: "2.5" would be stored as task 3 and, asked for as 2.5, not be
+    // found. A number loses digits past 2^53. Only a bigint is taken, whatever a caller's types say,
+    // and nothing is written for the others.
+    const sha = "5d".repeat(32);
+    for (const taskId of ["2.5", "3", "03", "", 3, 2.5, undefined, null]) {
+      const id = taskId as never;
+      await expect(
+        recordResultUpload(db, { sha256: sha, taskId: id, account: "alice.near" }),
+      ).rejects.toThrow(TypeError);
+      await expect(hasResultUpload(db, sha, id, "alice.near")).rejects.toThrow(TypeError);
+    }
+    const [row] = await db.query<{ n: number }>(
+      "select count(*)::int as n from result_uploads where sha256 = $1",
+      [sha],
+    );
+    expect(row?.n).toBe(0);
+  });
 });
 
 describe("openDb", () => {
@@ -993,7 +1099,7 @@ describe("openDb", () => {
     const url = `pglite:${join(base, "nested", "data")}`;
     try {
       const first = await openDb(url);
-      expect(await migrate(first)).toEqual(["0001_init.sql"]);
+      expect(await migrate(first)).toEqual(MIGRATIONS);
       const sha = await putBlob(first, {
         kind: "brief",
         contentType: "text/plain",

@@ -26,3 +26,4 @@ export {
   listEntriesByAccount,
   listTasks,
 } from "./queries";
+export { resultUsable } from "./routes/blobs";

@@ -1,5 +1,16 @@
 import { Buffer } from "node:buffer";
-import { getBlob, putBlob, setBlobPublic } from "@tender/db";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  getBlob,
+  hasResultUpload,
+  migrate,
+  openDb,
+  putBlob,
+  recordResultUpload,
+  setBlobPublic,
+} from "@tender/db";
 import { applyBlock } from "@tender/indexer";
 import {
   BOB_ENTRY,
@@ -24,6 +35,7 @@ import {
   type ApiDeps,
   createApp,
   type ErrorBody,
+  resultUsable,
   type TaskDetailResponse,
 } from "../src/index";
 import { publicDocument } from "../src/queries";
@@ -188,13 +200,22 @@ function taskLine(id: number, over: Record<string, string> = {}): string {
   return eventLine("task_created", { id: String(id), ...over });
 }
 
-/** Creates task `id`, whose reveals close at `deadline`, and has each of `entrants` commit to it. */
-async function openTask(id: number, deadline: bigint, entrants: string[]): Promise<void> {
+/**
+ * Creates task `id`, whose reveals close at `deadline`, and has each of `entrants` commit to it.
+ * `over` replaces fields of the captured task, such as its `heldout_commitment`.
+ */
+async function openTask(
+  id: number,
+  deadline: bigint,
+  entrants: string[],
+  over: Record<string, string> = {},
+): Promise<void> {
   await apply(
     taskLine(id, {
       reveal_deadline: deadline.toString(),
       pick_deadline: (deadline + 60n * SECOND).toString(),
       fallback_deadline: (deadline + 120n * SECOND).toString(),
+      ...over,
     }),
     ...entrants.map((account) =>
       eventLine("committed", { task_id: String(id), account, block_height: "130" }),
@@ -202,18 +223,21 @@ async function openTask(id: number, deadline: bigint, entrants: string[]): Promi
   );
 }
 
-/** Has `account` reveal `content` in task `id`, as the chain logs it, and returns its hash. */
-async function reveal(id: number, account: string, content: string): Promise<string> {
+/** The log line of `account` revealing `content` in task `id`, as the chain logs it. */
+function revealLine(id: number, account: string, content: string): string {
   const contentHash = sha256Hex(content);
-  await apply(
-    eventLine("revealed", {
-      task_id: String(id),
-      account,
-      content_hash: contentHash,
-      uri: `http://api.test/v1/blobs/${contentHash}`,
-    }),
-  );
-  return contentHash;
+  return eventLine("revealed", {
+    task_id: String(id),
+    account,
+    content_hash: contentHash,
+    uri: `http://api.test/v1/blobs/${contentHash}`,
+  });
+}
+
+/** Has `account` reveal `content` in task `id`, in a block of its own, and returns its hash. */
+async function reveal(id: number, account: string, content: string): Promise<string> {
+  await apply(revealLine(id, account, content));
+  return sha256Hex(content);
 }
 
 interface Row {
@@ -249,8 +273,10 @@ const NOT_FOUND = { error: "not_found", message: expect.any(String) };
 // ---- The brief's tests ------------------------------------------------------------------------
 
 // A result is served by what was revealed, not by who sent it: from the reveal deadline of the task
-// that revealed the hash first. A reveal of the same hash in another task, later, changes nothing,
-// and neither does the task a result was sent for.
+// that revealed the hash first, among the reveals whose account also uploaded the bytes for that
+// task. A reveal of the same hash in another task, later, changes nothing, and neither does the
+// task a result was sent for. A reveal with no upload behind it counts for nothing (the tests of
+// the upload records, at the end).
 
 test("result_hidden_until_reveal_deadline", async () => {
   await seedLifecycle(deps.db);
@@ -343,11 +369,13 @@ test("revealed_result_is_served_after_its_tasks_deadline", async () => {
   }
 
   // The deadline that counts is the one of the task that revealed the bytes. Alice sent them for
-  // task 1, which has closed by now, but they were revealed in task 3, which closes later.
+  // task 1, which has closed by now, but carol revealed them in task 3, which closes later, and sent
+  // them for it too.
   const soon = REVEAL_DEADLINE + 500n * SECOND;
   await openTask(3, soon, [carol]);
   await reveal(3, carol, "carol work");
   const early = await post("/v1/blobs", resultBody("carol work", "1"), alice);
+  expect((await post("/v1/blobs", resultBody("carol work", "3"), carol)).body).toEqual(early.body);
   for (const [at, status] of [
     [REVEAL_DEADLINE + SECOND, 404],
     [soon - 1n, 404],
@@ -480,8 +508,12 @@ test("the_first_reveal_is_the_earliest_by_height_even_if_applied_late", async ()
     { task_id: "2", height: "200" },
   ]);
 
+  // Both sent the bytes for their task, so both reveals count and the order is what decides.
   const put = await post("/v1/blobs", resultBody("the answer is 42", "2"), carol);
   expect(put.body.sha256).toBe(hash);
+  expect((await post("/v1/blobs", resultBody("the answer is 42", "3"), alice)).body).toEqual(
+    put.body,
+  );
   const path = `/v1/blobs/${hash}`;
 
   // The first reveal is the one at the lower height, so the bytes wait for task 2, not for task 3.
@@ -672,9 +704,11 @@ test("scorecard_upload_waits_for_the_reveal_deadline", async () => {
   const base = await seed();
   const tooEarly = { error: "too_early", message: "the task's reveal window has not closed" };
   const upload = (document: Scorecard) => blobBody("scorecard", canonicalJson(document));
-  // Task 2 closes its reveals a minute after task 1, and has the same verifier and poster.
+  // Task 2 closes its reveals a minute after task 1, and has the same verifier and poster, but not
+  // the same held-out document, which would make task 1 wait for it
+  // (scorecard_waits_for_every_task_sharing_its_heldout).
   const later = REVEAL_DEADLINE + 60n * SECOND;
-  await openTask(2, later, [alice]);
+  await openTask(2, later, [alice], { heldout_commitment: sha256Hex("the held-out of task 2") });
 
   // A nanosecond before the deadline of its task, the verifier and the poster are both told to
   // wait, and nothing is stored.
@@ -1648,5 +1682,648 @@ test("a_hash_that_is_not_64_lowercase_hex_is_404", async () => {
     expect(res.status, bad).toBe(404);
     expect(res.headers.get("cache-control"), bad).toBe("no-store");
     expect(JSON.parse(res.text()), bad).toMatchObject(NOT_FOUND);
+  }
+});
+
+// ---- Result upload records (P03-R17) ----------------------------------------------------------
+
+// A reveal puts a hash on chain for anyone to read, so it says nothing of who holds the bytes. The
+// API records who uploaded which bytes for which task, and counts a reveal only when the account
+// that made it uploaded the bytes for the task it revealed them in. A copy of a hash has no upload.
+
+/** Who is recorded as having uploaded `sha256`, and for which task. */
+function uploadsOf(sha256: string): Promise<Array<{ task_id: string; account: string }>> {
+  return deps.db.query(
+    `select task_id::text as task_id, account from result_uploads
+      where sha256 = $1 order by result_uploads.task_id, account`,
+    [sha256],
+  );
+}
+
+async function uploadCount(): Promise<number> {
+  const [row] = await deps.db.query<{ n: number }>("select count(*)::int as n from result_uploads");
+  return row?.n ?? 0;
+}
+
+/** The reveals of `sha256` in the order the API takes them: by height, then by the event's id. */
+function revealsOf(sha256: string): Promise<Array<{ task_id: string; height: string }>> {
+  return deps.db.query(
+    `select task_id::text as task_id, height::text as height from events
+      where event = 'revealed' and data->>'content_hash' = $1
+      order by events.height, events.id`,
+    [sha256],
+  );
+}
+
+/** Asserts that the result is a 404 that no cache keeps at each of `times`. */
+async function expectHiddenAt(
+  sha256: string,
+  times: bigint[],
+  app: App = appWith(),
+): Promise<void> {
+  for (const at of times) {
+    nowNs = at;
+    const res = await get(`/v1/blobs/${sha256}`, app);
+    expect(res.status, `at ${at}`).toBe(404);
+    expect(JSON.parse(res.text()), `at ${at}`).toMatchObject(NOT_FOUND);
+    expect(res.headers.get("cache-control"), `at ${at}`).toBe("no-store");
+  }
+}
+
+/** Asserts that the result is served, with `text` for its bytes, at each of `times`. */
+async function expectServedAt(
+  sha256: string,
+  times: bigint[],
+  text: string,
+  app: App = appWith(),
+): Promise<void> {
+  for (const at of times) {
+    nowNs = at;
+    const res = await get(`/v1/blobs/${sha256}`, app);
+    expect(res.status, `at ${at}`).toBe(200);
+    expect(res.text(), `at ${at}`).toBe(text);
+  }
+}
+
+test("an_upload_is_recorded_for_its_task_and_account", async () => {
+  const base = await seed();
+  await openTask(2, REVEAL_DEADLINE, [carol]);
+  const hash = sha256Hex("shared work");
+  expect(await uploadCount()).toBe(0);
+
+  // New bytes are stored, and recorded for the account that sent them and the task they name.
+  const first = await post("/v1/blobs", resultBody("shared work", "1"), alice);
+  expect(first.body.sha256).toBe(hash);
+  expect(await uploadsOf(hash)).toEqual([{ task_id: "1", account: alice }]);
+  expect(await hasResultUpload(deps.db, hash, 1n, alice)).toBe(true);
+  expect(await hasResultUpload(deps.db, hash, 2n, alice)).toBe(false);
+
+  // The same upload again is the same record.
+  expect((await post("/v1/blobs", resultBody("shared work", "1"), alice)).status).toBe(200);
+  expect(await uploadsOf(hash)).toEqual([{ task_id: "1", account: alice }]);
+
+  // Bytes already stored as a result, by anyone, are recorded for every account that sends them
+  // after, for the task each names, for as long as they are not served (the tests of P03-R22, at the
+  // end). There is still one blob, and it is alice's.
+  expect((await post("/v1/blobs", resultBody("shared work", "1"), bob)).status).toBe(200);
+  expect((await post("/v1/blobs", resultBody("shared work", "2"), carol)).status).toBe(200);
+  expect(await uploadsOf(hash)).toEqual([
+    { task_id: "1", account: alice },
+    { task_id: "1", account: bob },
+    { task_id: "2", account: carol },
+  ]);
+  expect(await blobCount()).toBe(base + 1);
+  expect(await rowOf(hash)).toMatchObject({ kind: "result", task_id: "1", uploader: alice });
+});
+
+test("a_refused_upload_records_nothing", async () => {
+  const base = await seed();
+  const refused = async (body: unknown, account: string, status: number) => {
+    const res = await post<ErrorBody>("/v1/blobs", body, account);
+    expect(res.status, JSON.stringify(res.body)).toBe(status);
+  };
+
+  // No entry on the task is a 403, no such task a 404, and a body that is wrong a 400.
+  await refused(resultBody("an answer", "1"), carol, 403);
+  await refused(resultBody("an answer", "77"), alice, 404);
+  await refused(resultBody("an answer", undefined), alice, 400);
+  await refused(resultBody("an answer", "1", { content_base64: "QUJD\n" }), alice, 400);
+
+  // Bytes that are stored as another kind are a 409. The brief itself is no result, and has no record.
+  const brief = canonicalJson({ ...FIXTURE_BRIEF, title: "Also an answer" });
+  expect((await post("/v1/blobs", blobBody("brief", brief), alice)).status).toBe(200);
+  await refused(resultBody(brief, "1", { content_type: "application/json" }), alice, 409);
+
+  expect(await uploadCount()).toBe(0);
+  expect(await blobCount()).toBe(base + 1);
+});
+
+test("a_copy_reveal_without_an_upload_never_publishes", async () => {
+  await seedLifecycle(deps.db);
+  // Carol enters task 2, which closes its reveals at `slow`. Alice enters task 3, which closes them
+  // at `fast`, before it. Carol has the bytes and sends them for her task. Alice has only the hash.
+  const slow = REVEAL_DEADLINE + 1_000n * SECOND;
+  const fast = REVEAL_DEADLINE + 500n * SECOND;
+  await openTask(2, slow, [carol]);
+  await openTask(3, fast, [alice]);
+  const waiting = [TEST_NOW, fast - 1n, fast, fast + 1n, slow - 1n];
+  const served = [slow, slow + 1n, slow + 3600n * SECOND];
+
+  // Alice's copy of the hash lands in the same block as carol's reveal, ahead of it, so it has the
+  // lower event id and is the first reveal of the hash. With no upload behind it, it counts for
+  // nothing: the bytes wait for the task of carol, who has them.
+  const answer = "the answer is 42";
+  const hash = sha256Hex(answer);
+  expect((await post("/v1/blobs", resultBody(answer, "2"), carol)).body.sha256).toBe(hash);
+  await apply(revealLine(3, alice, answer), revealLine(2, carol, answer));
+  const sameBlock = await revealsOf(hash);
+  expect(sameBlock.map((r) => r.task_id)).toEqual(["3", "2"]);
+  expect(sameBlock[0]?.height).toBe(sameBlock[1]?.height);
+  await expectHiddenAt(hash, waiting);
+  await expectServedAt(hash, served, answer);
+
+  // So does a copy in a block of its own before carol's.
+  const other = "another answer";
+  const otherHash = sha256Hex(other);
+  await post("/v1/blobs", resultBody(other, "2"), carol);
+  await reveal(3, alice, other);
+  await reveal(2, carol, other);
+  expect((await revealsOf(otherHash)).map((r) => r.task_id)).toEqual(["3", "2"]);
+  await expectHiddenAt(otherHash, waiting);
+  await expectServedAt(otherHash, served, other);
+});
+
+test("an_upload_backs_only_the_reveal_of_its_own_account_and_task", async () => {
+  await seedLifecycle(deps.db);
+  const far = REVEAL_DEADLINE + 1_000n * SECOND;
+  const soon = REVEAL_DEADLINE + 500n * SECOND;
+  await openTask(2, far, [carol, alice]);
+  await openTask(3, soon, [carol]);
+
+  // Carol sends her result for task 2, and for no other task. Alice entered task 2 as well, and
+  // carol entered task 3.
+  const answer = "the answer is 42";
+  const hash = (await post("/v1/blobs", resultBody(answer, "2"), carol)).body.sha256;
+  expect(await uploadsOf(hash)).toEqual([{ task_id: "2", account: carol }]);
+
+  // Alice reveals the hash in task 2, where the bytes were sent, but they were not sent by her. Carol
+  // reveals it in task 3, where she sent nothing. An upload backs the reveal of the same account in
+  // the same task, and neither of these, so the bytes are not served at any time.
+  await reveal(3, carol, answer);
+  await reveal(2, alice, answer);
+  expect((await revealsOf(hash)).map((r) => r.task_id)).toEqual(["3", "2"]);
+  await expectHiddenAt(hash, [TEST_NOW, soon, soon + 1n, far, far + 1_000_000n * SECOND]);
+
+  // Carol's reveal in task 2 is the one that is backed, and the bytes are served from its deadline.
+  await reveal(2, carol, answer);
+  await expectHiddenAt(hash, [soon, far - 1n]);
+  await expectServedAt(hash, [far, far + 1n], answer);
+});
+
+test("a_failed_reveal_is_not_published_by_a_copy", async () => {
+  await seedLifecycle(deps.db);
+  const far = REVEAL_DEADLINE + 1_000n * SECOND;
+  const soon = REVEAL_DEADLINE + 500n * SECOND;
+  await openTask(2, far, [carol]);
+  await openTask(3, soon, [alice]);
+
+  // Carol sends her result for task 2, and her reveal never lands: it ran late or out of gas, and
+  // the indexer skips a failed receipt. The hash is in the arguments of her transaction all the
+  // same, so alice commits to it in task 3 and reveals it there, without the bytes.
+  const answer = "the answer is 42";
+  const hash = (await post("/v1/blobs", resultBody(answer, "2"), carol)).body.sha256;
+  expect(await reveal(3, alice, answer)).toBe(hash);
+  expect((await revealsOf(hash)).map((r) => r.task_id)).toEqual(["3"]);
+
+  // The bytes are not served: not when alice's task closes, not when carol's does, not after.
+  await expectHiddenAt(hash, [
+    TEST_NOW,
+    soon - 1n,
+    soon,
+    soon + 1n,
+    far,
+    far + 1_000_000n * SECOND,
+  ]);
+
+  // Alice's copy did not take anything from carol. If her reveal does land after all (the index was
+  // only slow to see it), the bytes are served from the deadline of her task.
+  await reveal(2, carol, answer);
+  await expectHiddenAt(hash, [soon, far - 1n]);
+  await expectServedAt(hash, [far, far + 1n], answer);
+});
+
+test("identical_uploads_by_two_entrants_both_count", async () => {
+  await seedLifecycle(deps.db);
+  const far = REVEAL_DEADLINE + 1_000n * SECOND;
+  const soon = REVEAL_DEADLINE + 500n * SECOND;
+  await openTask(2, far, [carol]);
+  await openTask(3, soon, [alice]);
+
+  // Carol and alice have the same bytes, and each sends them for the task she entered. There is one
+  // blob, carol's since she sent it first, and a record for each of them.
+  const shared = "the same answer";
+  const hash = sha256Hex(shared);
+  const first = await post("/v1/blobs", resultBody(shared, "2"), carol);
+  const second = await post("/v1/blobs", resultBody(shared, "3"), alice);
+  expect(second.body).toEqual(first.body);
+  expect(await rowOf(hash)).toMatchObject({ task_id: "2", uploader: carol });
+  expect(await uploadsOf(hash)).toEqual([
+    { task_id: "2", account: carol },
+    { task_id: "3", account: alice },
+  ]);
+
+  // Alice sent them second but reveals first, and her reveal counts: the bytes are served when her
+  // task closes, though the blob is carol's.
+  await reveal(3, alice, shared);
+  await reveal(2, carol, shared);
+  await expectHiddenAt(hash, [TEST_NOW, soon - 1n]);
+  await expectServedAt(hash, [soon, far - 1n, far], shared);
+
+  // Carol, who sent them first, can be the first to reveal as well. Alice's reveal is backed by an
+  // upload too but comes after, so the bytes wait for the task of carol, which closes later.
+  const other = "a second shared answer";
+  const otherHash = sha256Hex(other);
+  await post("/v1/blobs", resultBody(other, "2"), carol);
+  await post("/v1/blobs", resultBody(other, "3"), alice);
+  await reveal(2, carol, other);
+  await reveal(3, alice, other);
+  await expectHiddenAt(otherHash, [TEST_NOW, soon, soon + 1n, far - 1n]);
+  await expectServedAt(otherHash, [far, far + 1n], other);
+});
+
+test("a_first_reveal_in_an_unindexed_task_keeps_the_bytes_hidden", async () => {
+  await seedLifecycle(deps.db);
+  const soon = REVEAL_DEADLINE + 500n * SECOND;
+  const late = REVEAL_DEADLINE + 900n * SECOND;
+  await openTask(3, soon, [carol]);
+
+  // Alice revealed the bytes first, in task 7, which the index does not hold. She uploaded them for
+  // it when it did: the upload route takes a result only for a task the index knows, so that record
+  // is put in directly. Carol reveals them in task 3, which the index holds, and uploads them.
+  const answer = "the answer is 42";
+  const hash = await reveal(7, alice, answer);
+  await recordResultUpload(deps.db, { sha256: hash, taskId: 7n, account: alice });
+  await reveal(3, carol, answer);
+  expect((await post("/v1/blobs", resultBody(answer, "3"), carol)).body.sha256).toBe(hash);
+  expect((await revealsOf(hash)).map((r) => r.task_id)).toEqual(["7", "3"]);
+
+  // The first reveal is in a task whose deadline the index cannot tell, so nothing is served, not
+  // even from the deadline of task 3, the first one that it does know.
+  await expectHiddenAt(hash, [TEST_NOW, soon - 1n, soon, late, late + 1_000_000n * SECOND]);
+
+  // Once the index has task 7, the bytes are served from its deadline.
+  await openTask(7, late, []);
+  await expectHiddenAt(hash, [soon, late - 1n]);
+  await expectServedAt(hash, [late, late + 1n], answer);
+});
+
+test("reveals_in_one_block_are_ordered_by_event_id", async () => {
+  await seedLifecycle(deps.db);
+  const far = REVEAL_DEADLINE + 1_000n * SECOND;
+  const soon = REVEAL_DEADLINE + 500n * SECOND;
+  await openTask(2, far, [carol]);
+  await openTask(3, soon, [alice]);
+
+  // Carol and alice both have the bytes, and reveal them in the same block. Their reveals are at one
+  // height, so the order in which the index stored them is what says which came first.
+  const bytes = { carol: "carol is first", alice: "alice is first" };
+  for (const answer of Object.values(bytes)) {
+    await post("/v1/blobs", resultBody(answer, "2"), carol);
+    await post("/v1/blobs", resultBody(answer, "3"), alice);
+  }
+  await apply(revealLine(2, carol, bytes.carol), revealLine(3, alice, bytes.carol));
+  await apply(revealLine(3, alice, bytes.alice), revealLine(2, carol, bytes.alice));
+
+  const carolHash = sha256Hex(bytes.carol);
+  const carolFirst = await revealsOf(carolHash);
+  expect(carolFirst.map((r) => r.task_id)).toEqual(["2", "3"]);
+  expect(carolFirst[0]?.height).toBe(carolFirst[1]?.height);
+  const aliceHash = sha256Hex(bytes.alice);
+  const aliceFirst = await revealsOf(aliceHash);
+  expect(aliceFirst.map((r) => r.task_id)).toEqual(["3", "2"]);
+  expect(aliceFirst[0]?.height).toBe(aliceFirst[1]?.height);
+
+  // The lower id wins the tie, whichever of the two tasks closes first.
+  await expectHiddenAt(carolHash, [TEST_NOW, soon, soon + 1n, far - 1n]);
+  await expectServedAt(carolHash, [far, far + 1n], bytes.carol);
+  await expectHiddenAt(aliceHash, [TEST_NOW, soon - 1n]);
+  await expectServedAt(aliceHash, [soon, far], bytes.alice);
+});
+
+test("scorecard_waits_for_every_task_sharing_its_heldout", async () => {
+  const tooEarly = { error: "too_early", message: "the task's reveal window has not closed" };
+  const upload = (document: Scorecard) => blobBody("scorecard", canonicalJson(document));
+
+  // A scorecard shows the held-out document its task was judged against. Tasks 2 and 3 use the same
+  // one and close their reveals a minute apart. Task 4 has a held-out of its own, and closes later.
+  // All of them are the poster's: the task of another account does not count
+  // (a_strangers_copy_of_a_heldout_does_not_hold_a_scorecard_back).
+  const minute = REVEAL_DEADLINE + 60n * SECOND;
+  const hour = REVEAL_DEADLINE + 3600n * SECOND;
+  const shared = sha256Hex("a held-out document that two tasks use");
+  await openTask(2, REVEAL_DEADLINE, [], { heldout_commitment: shared });
+  await openTask(3, minute, [], { heldout_commitment: shared });
+  await openTask(4, hour, [], { heldout_commitment: sha256Hex("a held-out document of its own") });
+
+  // Task 2 has closed its reveals but task 3, which shares its held-out, has not: publishing the
+  // scorecard of task 2 would give the answers to a task that still takes reveals. The verifier and
+  // the poster are told to wait, and whoever has no right to upload is told that first.
+  nowNs = REVEAL_DEADLINE;
+  for (const account of [judge, poster]) {
+    const early = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("2")), account);
+    expect([early.status, early.body], account).toEqual([409, tooEarly]);
+  }
+  const stranger = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("2")), alice);
+  expect([stranger.status, stranger.body.error]).toEqual([403, "forbidden"]);
+  nowNs = minute - 1n;
+  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(409);
+  expect(await blobCount()).toBe(0);
+
+  // When task 3 closes, both may publish. Task 4 is still open, and shares nothing with them.
+  nowNs = minute;
+  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(scorecardOf("3")), poster)).status).toBe(200);
+  const own = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("4")), judge);
+  expect([own.status, own.body]).toEqual([409, tooEarly]);
+  nowNs = hour;
+  expect((await post("/v1/blobs", upload(scorecardOf("4")), judge)).status).toBe(200);
+  expect(await blobCount()).toBe(3);
+
+  // Tasks that have no held-out share none: task 5 is not held back for task 6, which has none either.
+  const withoutHeldout = (id: number, deadline: bigint) =>
+    eventLine("task_created", {
+      id: String(id),
+      heldout_commitment: null,
+      reveal_deadline: deadline.toString(),
+      pick_deadline: (deadline + 60n * SECOND).toString(),
+      fallback_deadline: (deadline + 120n * SECOND).toString(),
+    });
+  await apply(withoutHeldout(5, hour), withoutHeldout(6, hour + 3600n * SECOND));
+  expect((await post("/v1/blobs", upload(scorecardOf("5")), judge)).status).toBe(200);
+});
+
+test("a_strangers_copy_of_a_heldout_does_not_hold_a_scorecard_back", async () => {
+  const tooEarly = { error: "too_early", message: "the task's reveal window has not closed" };
+  const upload = (document: Scorecard) => blobBody("scorecard", canonicalJson(document));
+
+  // The commitment of a held-out is public once its task is posted, so anyone can put it in a task
+  // of their own, with a reveal deadline as far away as they like. The wait is for a poster who
+  // reuses their own held-out. The Judge takes a held-out only from the poster of a task, so a task
+  // of another account can never be judged against it, and has no answers to be given away.
+  // Tasks 2 and 3 are the poster's and close a minute apart. Carol's task 4 copies their commitment
+  // and closes eleven days after.
+  const minute = REVEAL_DEADLINE + 60n * SECOND;
+  const faraway = REVEAL_DEADLINE + 1_000_000n * SECOND;
+  const shared = sha256Hex("a held-out document that a stranger copied");
+  await openTask(2, REVEAL_DEADLINE, [], { heldout_commitment: shared });
+  await openTask(3, minute, [], { heldout_commitment: shared });
+  await openTask(4, faraway, [], { heldout_commitment: shared, poster: carol });
+
+  // The poster's own task 3 holds the scorecard of task 2 back until it closes.
+  nowNs = REVEAL_DEADLINE;
+  const early = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("2")), judge);
+  expect([early.status, early.body]).toEqual([409, tooEarly]);
+  nowNs = minute - 1n;
+  expect((await post("/v1/blobs", upload(scorecardOf("2")), poster)).status).toBe(409);
+  expect(await blobCount()).toBe(0);
+
+  // Carol's task has days to run, and holds nothing back.
+  nowNs = minute;
+  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(scorecardOf("3")), poster)).status).toBe(200);
+  expect(await blobCount()).toBe(2);
+
+  // Her own task waits for its own reveal window, like any other.
+  const own = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("4")), judge);
+  expect([own.status, own.body]).toEqual([409, tooEarly]);
+  nowNs = faraway;
+  expect((await post("/v1/blobs", upload(scorecardOf("4")), judge)).status).toBe(200);
+});
+
+test("scorecard_route_hides_a_stored_scorecard_it_cannot_write_again", async () => {
+  await seedLifecycle(deps.db);
+  const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const errored = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    // A row from before the canonical form refused a lone surrogate: JSON.stringify wrote it as an
+    // escape, and it parses, but it can no longer be written as canonical JSON.
+    const document = scorecardOf("3", {
+      entries: [
+        {
+          account: alice,
+          content_hash: sha256Hex("x"),
+          uri: "ipfs://x",
+          committed_at_block: "65",
+          score: 10,
+          passed: false,
+          reasons: ["a\ud800b"],
+        },
+      ],
+    });
+    expect(() => canonicalJson(document)).toThrow(/lone surrogate/);
+    const bytes = utf8(JSON.stringify(document));
+    const hash = await putBlob(deps.db, {
+      kind: "scorecard",
+      contentType: "application/json",
+      bytes,
+      uploader: judge,
+      isPublic: true,
+    });
+    await apply(taskLine(3), eventLine("picked", { task_id: "3", scorecard_hash: hash }));
+    const app = createApp(deps);
+
+    // Not a 500: the same answer as for a scorecard that is not there, and one warning. It names the
+    // task and the kind of error and nothing of the document: the text of the error says where in it.
+    const res = await get("/v1/scorecards/3", app);
+    expect(res.status).toBe(404);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(JSON.parse(res.text())).toEqual({ error: "not_found", message: "no such scorecard" });
+    expect(warned).toHaveBeenCalledTimes(1);
+    expect(warned).toHaveBeenCalledWith(
+      "api: scorecard of task 3 is not served, it cannot be written as canonical JSON (TypeError)",
+    );
+    expect(errored).not.toHaveBeenCalled();
+    // Task 1 was settled with a scorecard that was never stored. It is the same answer, unwarned.
+    const absent = await get("/v1/scorecards/1", app);
+    expect([absent.status, absent.text()]).toEqual([404, res.text()]);
+    expect(warned).toHaveBeenCalledTimes(1);
+
+    // The stored bytes are still the blob's, which hands out bytes and reads no document.
+    expect((await get(`/v1/blobs/${hash}`, app)).bytes).toEqual(bytes);
+  } finally {
+    warned.mockRestore();
+    errored.mockRestore();
+  }
+});
+
+// ---- Records only before publication (P03-R22) ------------------------------------------------
+
+// Bytes that are served are public, so sending them proves nothing: anyone can read them. The upload
+// route records an upload only while the bytes are not served. Otherwise a copier whose reveal of the
+// hash came first could read the published bytes and send them for its own task, which closes later.
+// Its reveal would then be the first one that counts, and the bytes would be hidden again.
+
+test("an_upload_of_published_bytes_records_nothing", async () => {
+  await seedLifecycle(deps.db);
+  const soon = REVEAL_DEADLINE + 500n * SECOND;
+  const far = REVEAL_DEADLINE + 1_000n * SECOND;
+  await openTask(2, soon, [carol]);
+  await openTask(3, far, [alice]);
+
+  // Carol has the bytes and sends them for her task. Alice has only the hash, and reveals it in her
+  // task, which closes later, before carol's reveal lands. Hers is the first reveal, and no upload
+  // backs it, so the bytes wait for the task of carol.
+  const answer = "the answer is 42";
+  const hash = (await post("/v1/blobs", resultBody(answer, "2"), carol)).body.sha256;
+  await reveal(3, alice, answer);
+  await reveal(2, carol, answer);
+  expect((await revealsOf(hash)).map((r) => r.task_id)).toEqual(["3", "2"]);
+  await expectHiddenAt(hash, [TEST_NOW, soon - 1n]);
+
+  // At carol's deadline the bytes are out, and any cache may keep them for a year. Alice reads them
+  // and sends them for her own task. She is told it went through, and nothing is recorded for her.
+  nowNs = soon;
+  const published = await get(`/v1/blobs/${hash}`);
+  expect(published.status).toBe(200);
+  expect(published.headers.get("cache-control")).toBe(CACHE_CONTROL);
+  const copy = await post("/v1/blobs", resultBody(published.text(), "3"), alice);
+  expect([copy.status, copy.body.sha256]).toEqual([200, hash]);
+  expect(await hasResultUpload(deps.db, hash, 3n, alice)).toBe(false);
+  expect(await uploadsOf(hash)).toEqual([{ task_id: "2", account: carol }]);
+
+  // So her reveal did not become the first one that counts, and the bytes stay served: not hidden
+  // again from carol's deadline to her own.
+  await expectServedAt(hash, [soon, soon + 1n, far - 1n, far], answer);
+});
+
+test("an_upload_is_recorded_until_the_moment_the_bytes_are_served", async () => {
+  await seedLifecycle(deps.db);
+  const soon = REVEAL_DEADLINE + 500n * SECOND;
+  const far = REVEAL_DEADLINE + 1_000n * SECOND;
+  await openTask(2, soon, [carol]);
+  await openTask(3, far, [alice, bob]);
+
+  // Carol's reveal is the only one, so her bytes are served when her task closes, at `soon`.
+  const answer = "the answer is 42";
+  const hash = (await post("/v1/blobs", resultBody(answer, "2"), carol)).body.sha256;
+  await reveal(2, carol, answer);
+
+  // Bob and alice have the same bytes, each from work of their own. Bob sends them in the last
+  // instant that they are hidden, and is recorded. Alice sends them in the first instant that they
+  // are out, and is not. Both are told it went through.
+  nowNs = soon - 1n;
+  expect((await post("/v1/blobs", resultBody(answer, "3"), bob)).status).toBe(200);
+  nowNs = soon;
+  expect((await post("/v1/blobs", resultBody(answer, "3"), alice)).status).toBe(200);
+  expect(await uploadsOf(hash)).toEqual([
+    { task_id: "2", account: carol },
+    { task_id: "3", account: bob },
+  ]);
+});
+
+test("a_result_is_usable_by_its_uploader_while_hidden_and_by_anyone_once_served", async () => {
+  await seedLifecycle(deps.db);
+  const soon = REVEAL_DEADLINE + 500n * SECOND;
+  const far = REVEAL_DEADLINE + 1_000n * SECOND;
+  await openTask(2, soon, [carol]);
+  await openTask(3, far, [alice, bob]);
+
+  // Carol sends her bytes for her task and reveals them. Alice reveals the hash in hers, without them.
+  const answer = "the answer is 42";
+  const hash = (await post("/v1/blobs", resultBody(answer, "2"), carol)).body.sha256;
+  await reveal(2, carol, answer);
+  await reveal(3, alice, answer);
+  const usable = (taskId: bigint, account: string, at: bigint) =>
+    resultUsable(deps.db, hash, taskId, account, at);
+
+  // While the bytes are hidden, only an upload makes them usable: that of the same account, for the
+  // same task. A copy of the hash is not an upload.
+  for (const at of [TEST_NOW, soon - 1n]) {
+    expect(await usable(2n, carol, at), `carol, task 2, at ${at}`).toBe(true);
+    expect(await usable(3n, alice, at), `alice, task 3, at ${at}`).toBe(false);
+    expect(await usable(3n, bob, at), `bob, task 3, at ${at}`).toBe(false);
+    expect(await usable(2n, alice, at), `alice, task 2, at ${at}`).toBe(false);
+    expect(await usable(3n, carol, at), `carol, task 3, at ${at}`).toBe(false);
+  }
+
+  // Once the API serves them they are as public as any URL, and a reveal of them is as good with no
+  // record as with one. Alice never sent them, and bob sends them now, after they are out.
+  nowNs = soon;
+  expect((await post("/v1/blobs", resultBody(answer, "3"), bob)).status).toBe(200);
+  for (const at of [soon, far, far + 1_000_000n * SECOND]) {
+    expect(await usable(2n, carol, at), `carol, task 2, at ${at}`).toBe(true);
+    expect(await usable(3n, alice, at), `alice, task 3, at ${at}`).toBe(true);
+    expect(await usable(3n, bob, at), `bob, task 3, at ${at}`).toBe(true);
+  }
+  expect(await uploadsOf(hash)).toEqual([{ task_id: "2", account: carol }]);
+
+  // Bytes the store does not hold are usable by no one. Nor is a held-out document, which it holds
+  // and serves to no one.
+  const heldout = await post(
+    "/v1/heldout",
+    { commitment: HELDOUT_HASH, content_base64: b64(HELDOUT_BYTES) },
+    poster,
+  );
+  expect(heldout.status).toBe(200);
+  expect(await resultUsable(deps.db, sha256Hex("not stored"), 2n, carol, far)).toBe(false);
+  expect(await resultUsable(deps.db, HELDOUT_HASH, 2n, poster, far)).toBe(false);
+});
+
+test("a_result_stored_before_the_records_is_served_after_the_upgrade", async () => {
+  // A database that was set up before the records existed: migration 0001 alone, with no table of
+  // them.
+  const dir = await mkdtemp(join(tmpdir(), "tender-0001-"));
+  const old = await openDb("pglite:memory");
+  try {
+    await copyFile(
+      new URL("../../db/migrations/0001_init.sql", import.meta.url),
+      join(dir, "0001_init.sql"),
+    );
+    expect(await migrate(old, dir)).toEqual(["0001_init.sql"]);
+    await seedLifecycle(old);
+    const applyOld = (...lines: string[]) =>
+      applyBlock(old, blockOf(nextHeight++, lines), FIXTURE_OPTIONS);
+
+    // Carol entered task 2, which closes its reveals at `soon`. She sent her result for it, and the
+    // upload route of that time stored what it stored: a private row, with her and the task.
+    const soon = REVEAL_DEADLINE + 500n * SECOND;
+    await applyOld(
+      taskLine(2, {
+        reveal_deadline: soon.toString(),
+        pick_deadline: (soon + 60n * SECOND).toString(),
+        fallback_deadline: (soon + 120n * SECOND).toString(),
+      }),
+      eventLine("committed", { task_id: "2", account: carol, block_height: "130" }),
+    );
+    const answer = "the answer is 42";
+    const hash = await putBlob(old, {
+      kind: "result",
+      contentType: "text/plain",
+      bytes: utf8(answer),
+      taskId: 2n,
+      uploader: carol,
+      isPublic: false,
+    });
+    await old.query("update blobs set created_at = $2 where sha256 = $1", [
+      hash,
+      "2026-10-01T09:00:00Z",
+    ]);
+    await applyOld(revealLine(2, carol, answer));
+
+    // Rows that are not a result with a task and an uploader are no one's upload of a result.
+    const others = [
+      { kind: "brief", bytes: canonicalJson({ ...FIXTURE_BRIEF, title: "Not a result" }) },
+      { kind: "heldout", bytes: HELDOUT_BYTES, uploader: poster },
+      { kind: "scorecard", bytes: canonicalJson(scorecardOf("2")), taskId: 2n, uploader: judge },
+      { kind: "result", bytes: utf8("sent by no one"), taskId: 2n, uploader: undefined },
+      { kind: "result", bytes: utf8("sent for no task"), taskId: undefined },
+    ] as const;
+    for (const other of others) {
+      await putBlob(old, {
+        contentType: "application/json",
+        uploader: carol,
+        isPublic: false,
+        ...other,
+      });
+    }
+
+    // The upgrade gives the result its record: carol's, for task 2, from the time she sent it.
+    expect(await migrate(old)).toEqual(["0002_result_uploads.sql"]);
+    expect(
+      await old.query(
+        "select sha256, task_id::text as task_id, account, uploaded_at from result_uploads",
+      ),
+    ).toEqual([
+      { sha256: hash, task_id: "2", account: carol, uploaded_at: new Date("2026-10-01T09:00:00Z") },
+    ]);
+
+    // So her reveal is still backed, and the bytes are served from the deadline of her task as
+    // before: hidden until it, served from it.
+    const app = appWith({ db: old });
+    await expectHiddenAt(hash, [TEST_NOW, soon - 1n], app);
+    await expectServedAt(hash, [soon, soon + 1n], answer, app);
+  } finally {
+    await old.close();
+    await rm(dir, { recursive: true, force: true });
   }
 });
