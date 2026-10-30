@@ -58,7 +58,10 @@ interface Policy {
   teamAccounts: readonly string[];
   nowNs: bigint;
   waitForHeldout: boolean;
-  /** How long a `json_schema` schema may take to compile and pass its trial run (2 s). */
+  /**
+   * How long a `json_schema` schema may take to compile and pass its trial run: 2 s at intake by
+   * default. Judging passes 4 times intake's.
+   */
   compileBudgetMs?: number;
 }
 
@@ -116,7 +119,8 @@ const CHECK_FAILED = "criteria could not be checked";
  * the reason in `judge_reason`, so that agents see it before they work: why the task is rejected,
  * or what it waits for while `pending`, and `null` once it is accepted. Judging may set it again on
  * an accepted task, while it waits for another task to close its reveals (`waiting: …`), and
- * clears it when the wait ends or the task can no longer be judged.
+ * clears it when the wait ends or the task can no longer be judged; and for good when it got to
+ * the task too late to score any entry (`not judged: …`, P05-R13).
  * Only a task that names `deps.judgeAccount` as its verifier is looked at. One the database does
  * not have yet, or that names another verifier, is left alone and comes back `pending`.
  *
@@ -335,10 +339,11 @@ function rejected(reason: string): DocumentsCheck {
  * (`referenceProblem`: `$id`, references, dynamic references), and then whether Ajv compiles and
  * runs it (`checkJsonSchemaUsable`), in a worker within `compileBudgetMs` (2 s by default:
  * `checkJsonSchemaIsolated`). Only `json_schema` criteria have a schema. Intake runs it, and
- * judging runs it again through `loadDocuments` before any entry is scored, under the same budget
- * (P05-R12), so that a task accepted under an older rule is not scored under a check it no longer
- * passes. It rejects when the check crashes its worker, and with `ScorerUnavailableError` when the
- * worker cannot be started.
+ * judging runs it again through `loadDocuments` before any entry is scored (P05-R12), so that a
+ * task accepted under an older rule is not scored under a check it no longer passes. The check is
+ * the same; judging only gives the compile 4 times intake's time, so that criteria that compiled
+ * in time at intake are not refused because the machine is busier. It rejects when the check
+ * crashes its worker, and with `ScorerUnavailableError` when the worker cannot be started.
  */
 async function criteriaProblem(
   criteria: P0Criteria,

@@ -2,7 +2,7 @@ import { type Db, putBlob, setBlobPublic } from "@tender/db";
 import { type EntryView, phaseOfTaskView, sha256Hex, type TaskView } from "@tender/shared";
 import { fetchEntryContent, ownBlobHash } from "./fetch";
 import { loadDocuments } from "./intake";
-import { openTaskScorer, type TaskScorer } from "./isolate";
+import { COMPILE_BUDGET_MS, openTaskScorer, type TaskScorer } from "./isolate";
 import { chooseWinners, rankEntries, type ScoredEntry } from "./rank";
 import { ScorerUnavailableError } from "./score";
 import { buildScorecard } from "./scorecard";
@@ -12,11 +12,24 @@ import type { EntryScore, JudgeDeps } from "./types";
 const ENTRIES_PER_BATCH = 32;
 /** How many entries' contents are fetched at once. */
 const FETCHES_AT_ONCE = 8;
-/** The least time judging leaves before the pick deadline: it starts nothing new after that. */
-const MIN_MARGIN_NS = 30n * 1_000_000_000n;
 const NS_PER_MS = 1_000_000n;
+const NS_PER_S = 1_000_000_000n;
+/**
+ * The time judging leaves before the pick deadline, when it starts nothing new: a tenth of the
+ * pick window, and no less than 3 s or more than 30 s (P05-R13).
+ */
+const MIN_MARGIN_NS = 3n * NS_PER_S;
+const MAX_MARGIN_NS = 30n * NS_PER_S;
+/**
+ * How many times intake's budget judging gives the criteria check. The check is the same
+ * (P05-R12); only the time differs, so that criteria that compiled in time at intake are not
+ * refused at judging because the machine is busier.
+ */
+const JUDGING_COMPILE_BUDGET_FACTOR = 4;
 const NOT_SCORED = "not scored before the pick deadline";
 const NOT_UPLOADED = "content unavailable: not uploaded for this task";
+/** The `judge_reason` of a task that judging got to too late to score any entry (P05-R13). */
+const TOO_LATE = "not judged: judging started too late to score any entry";
 
 /** An entry that has revealed its content's hash and where the content is. */
 type RevealedEntry = EntryView & { content_hash: string; uri: string };
@@ -33,13 +46,18 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   task's answers; the wait is a `WARN` once and the task's `judge_reason` until it ends. Or
  *   judging hit trouble of the Judge's own, which it logs as a `WARN` and leaves for the next
  *   tick: a scorer that could not run, a scorecard that could not be built, a `pick` that failed.
- *   `E_SETTLED` from `pick` means someone settled the task first, and is not logged.
+ *   `E_SETTLED` from `pick` means someone settled the task first, and is not logged. Or the task
+ *   has entries, and the stop line before its pick deadline came before the scorer scored any of
+ *   them (P05-R13): judging started too late, after the line or with workers that could not start
+ *   until then. It is not picked, as a pick would pay nobody for the Judge's lateness, and is left
+ *   to its fallback window; that is one `WARN`, and its `judge_reason` from then on.
  * - `failed_closed`: the task is never judged, and the poster's fallback window applies. Either
  *   its criteria fail the criteria check now (P05-R12: the check intake runs, run again before
- *   any entry is scored, as a rule may be newer than the task's intake), and its status becomes
- *   `rejected` with the reason and one `WARN`. Or the criteria or held-out checks that the chain
- *   names cannot be read or used (they passed intake, so they are gone or changed), and its
- *   status becomes `failed_closed` with the reason.
+ *   any entry is scored, as a rule may be newer than the task's intake, with 4 times intake's
+ *   time for the compile so that a busy machine does not refuse what compiled at intake), and its
+ *   status becomes `rejected` with the reason and one `WARN`. Or the criteria or held-out checks
+ *   that the chain names cannot be read or used (they passed intake, so they are gone or changed),
+ *   and its status becomes `failed_closed` with the reason.
  *
  * The task is read from the chain first, every time, so a `pick` that landed before a crash shows
  * as an outcome and nothing is done again. It must be in `judging` both by `deps.now` and by the
@@ -53,7 +71,8 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  * (`openTaskScorer`), with at most 5 s for each: an entry whose scoring times out, runs out of
  * memory or crashes the worker scores 0 with the reason why, and the other entries are scored as
  * usual. In what order the entries are fetched and scored, and which are left unscored so that
- * the pick lands before the pick deadline, is `judgeEntries`'s. Then the entries are ranked, the
+ * the pick lands before the pick deadline, is `judgeEntries`'s; a task with no entries is picked
+ * as before, and one with some scored is picked from those. Then the entries are ranked, the
  * winners chosen, and the scorecard built from exactly the winners `pick` is sent. The scorecard
  * is stored as a public blob, the held-out checks are made public, and `pick` is called with the
  * scorecard's hash and URI, in that order, so that the pick never points at something that cannot
@@ -80,7 +99,8 @@ export async function judgeTask(
     teamAccounts: deps.teamAccounts,
     nowNs,
     waitForHeldout: false,
-    compileBudgetMs: deps.scoringLimits?.compileBudgetMs,
+    compileBudgetMs:
+      JUDGING_COMPILE_BUDGET_FACTOR * (deps.scoringLimits?.compileBudgetMs ?? COMPILE_BUDGET_MS),
   });
   if (!loaded.ok) {
     // P05-R12: criteria that fail the check intake runs, run again now, are refused as intake
@@ -120,17 +140,20 @@ export async function judgeTask(
       },
     },
   );
-  let scored: ScoredEntry[];
+  let judged: Judged;
   try {
-    scored = await judgeEntries(deps, task, revealed, scorer, nowNs);
+    judged = await judgeEntries(deps, task, revealed, scorer, nowNs);
   } catch (error) {
     if (!(error instanceof ScorerUnavailableError)) throw error;
     return retryLater(taskId, `a scorer could not be run (${describeError(error)})`);
   } finally {
     await scorer.close();
   }
+  // P05-R13: when the stop line came before the scorer could score anything, a pick would pay
+  // nobody for the Judge's own lateness. The task is left to its fallback window.
+  if (judged.unscored > 0 && judged.scored === 0) return tooLate(deps, taskId);
 
-  const ranked = rankEntries(scored);
+  const ranked = rankEntries(judged.entries);
   // The one list of winners: the scorecard states it and `pick` pays it.
   const winners = chooseWinners(ranked, criteria, task.max_winners);
   let scorecard: Uint8Array;
@@ -175,8 +198,18 @@ export async function judgeTask(
   return winners.length === 0 ? "no_award" : "picked";
 }
 
+/** What judging a task's entries came to. */
+interface Judged {
+  /** The score of each entry, for `judgeTask` to rank. */
+  entries: ScoredEntry[];
+  /** How many entries were left unscored at the stop line. */
+  unscored: number;
+  /** How many contents the scorer scored, whatever came of each. */
+  scored: number;
+}
+
 /**
- * The scores of task `task`'s revealed `entries`, one for each, for `judgeTask` to rank.
+ * Scores task `task`'s revealed `entries`, one score for each.
  *
  * The entries are taken in commit order, the earliest committed first (within a block by account,
  * as the ranking breaks a tie), 32 at a time. A batch's contents are fetched 8 at a time and then
@@ -187,12 +220,12 @@ export async function judgeTask(
  * the Judge's clock `nowNs`) is asked of each entry all the same: it is the entrant's, not the
  * content's.
  *
- * No fetch and no score starts once the clock reaches the stop line: the pick deadline less the
- * larger of 30 s and a tenth of the pick window (from the reveal deadline to the pick deadline),
- * which leaves time for the work in flight and for the pick. The line is drawn from the task's own
- * deadlines, as P05-R8's wait can leave judging only the second half of the window. An entry not
- * scored by then scores 0 and does not pass, and the scorecard says why: `not scored before the
- * pick deadline`.
+ * No fetch and no score starts once the clock reaches the stop line: the pick deadline less a
+ * tenth of the pick window (from the reveal deadline to the pick deadline), and no less than 3 s
+ * or more than 30 s (P05-R13), which leaves time for the work in flight and for the pick. The line
+ * is drawn from the task's own deadlines, as P05-R8's wait can leave judging only the second half
+ * of the window. An entry not scored by then scores 0 and does not pass, and the scorecard says
+ * why: `not scored before the pick deadline`.
  *
  * It throws what `resultUploaded` and the database throw, and `ScorerUnavailableError`.
  */
@@ -202,35 +235,41 @@ async function judgeEntries(
   entries: readonly RevealedEntry[],
   scorer: TaskScorer,
   nowNs: bigint,
-): Promise<ScoredEntry[]> {
+): Promise<Judged> {
   const clock = deps.now ?? (() => new Date());
   const stopLine = stopLineOf(task);
   const inTime = () => BigInt(clock().getTime()) * NS_PER_MS < stopLine;
   // The score of each content scored so far, by `contentKey`.
   const results = new Map<string, EntryScore>();
   const ordered = entries.toSorted(inCommitOrder);
-  const scored: ScoredEntry[] = [];
+  const judged: Judged = { entries: [], unscored: 0, scored: 0 };
   for (let first = 0; first < ordered.length; first += ENTRIES_PER_BATCH) {
     const batch = ordered.slice(first, first + ENTRIES_PER_BATCH);
-    const scores = inTime()
-      ? await judgeBatch(deps, BigInt(task.id), batch, scorer, results, inTime, nowNs)
-      : [];
+    let scores: (EntryScore | undefined)[] = [];
+    if (inTime()) {
+      const ran = await judgeBatch(deps, BigInt(task.id), batch, scorer, results, inTime, nowNs);
+      scores = ran.scores;
+      judged.scored += ran.scored;
+    }
     batch.forEach((entry, i) => {
-      scored.push({
+      const score = scores[i];
+      if (score === undefined) judged.unscored++;
+      judged.entries.push({
         account: entry.account,
         contentHash: entry.content_hash,
         uri: entry.uri,
         committedAtBlock: BigInt(entry.committed_at_block),
-        ...(scores[i] ?? zero(NOT_SCORED)),
+        ...(score ?? zero(NOT_SCORED)),
       });
     });
   }
-  return scored;
+  return judged;
 }
 
 /**
  * The scores of one batch of entries of task `taskId`, `undefined` for each that was not scored in
- * time. `results` has the score of each content scored before, and gets those of this batch.
+ * time, and how many contents the scorer scored for it. `results` has the score of each content
+ * scored before, and gets those of this batch.
  */
 async function judgeBatch(
   deps: JudgeDeps,
@@ -240,7 +279,7 @@ async function judgeBatch(
   results: Map<string, EntryScore>,
   inTime: () => boolean,
   nowNs: bigint,
-): Promise<(EntryScore | undefined)[]> {
+): Promise<{ scores: (EntryScore | undefined)[]; scored: number }> {
   const allowed = await inParallel(batch, FETCHES_AT_ONCE, (entry) =>
     mayUse(deps, taskId, entry, nowNs),
   );
@@ -254,17 +293,20 @@ async function judgeBatch(
     key,
     content: inTime() ? await contentOf(deps, entry) : undefined,
   }));
+  let scored = 0;
   for (const item of fetched) {
     if (typeof item.content === "string") results.set(item.key, zero(item.content));
     else if (item.content !== undefined && inTime()) {
       results.set(item.key, await scorer.score(item.content));
+      scored++;
     }
     // The score is all that is kept of it.
     item.content = undefined;
   }
-  return batch.map((entry, i) =>
+  const scores = batch.map((entry, i) =>
     allowed[i] === true ? results.get(contentKey(entry)) : zero(NOT_UPLOADED),
   );
+  return { scores, scored };
 }
 
 /**
@@ -294,15 +336,38 @@ async function contentOf(deps: JudgeDeps, entry: RevealedEntry): Promise<Uint8Ar
 }
 
 /**
- * When judging `task` stops starting work, in nanoseconds: the pick deadline less the larger of
- * 30 s and a tenth of the pick window.
+ * When judging `task` stops starting work, in nanoseconds: the pick deadline less a tenth of the
+ * pick window, made 3 s when it is less and 30 s when it is more (P05-R13). A 10 s window, as the
+ * local sandbox has, gets 3 s; a 600 s window gets 30 s.
  */
 function stopLineOf(task: TaskView): bigint {
   const pick = BigInt(task.pick_deadline);
-  // Bigints, which `Math.max` does not take.
+  // Bigints, which `Math.min` and `Math.max` do not take.
   let margin = (pick - BigInt(task.reveal_deadline)) / 10n;
   if (margin < MIN_MARGIN_NS) margin = MIN_MARGIN_NS;
+  if (margin > MAX_MARGIN_NS) margin = MAX_MARGIN_NS;
   return pick - margin;
+}
+
+/**
+ * Records that task `taskId` was not judged, as judging started too late to score any of its
+ * entries (P05-R13), and says nothing was settled: no pick, so the task goes to its fallback
+ * window, which refunds it unless its poster picks. The `WARN` goes out once, on the first tick
+ * that finds it so: the reason in the row (`not judged: …`) is what later ticks compare with, as
+ * for a wait.
+ */
+async function tooLate(deps: JudgeDeps, taskId: bigint): Promise<"skipped"> {
+  const changed = await deps.db.query(
+    `update tasks set judge_reason = $2
+      where id = $1 and judge_status = 'accepted' and judge_reason is distinct from $2
+      returning id`,
+    [taskId, TOO_LATE],
+  );
+  if (changed.length > 0) {
+    const why = "it is not picked, and is left to its fallback window";
+    console.warn(`judge: WARN task ${taskId}: judging started too late to score any entry; ${why}`);
+  }
+  return "skipped";
 }
 
 /** The earlier commit first; in the same block, the smaller account, as `rankEntries` has it. */

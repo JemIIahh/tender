@@ -10,17 +10,23 @@ import type { EntryScore } from "./types";
 // Every scorer the Judge runs runs here, in a worker thread with hard limits (P05-R1), so that an
 // entry, criteria or held-out checks that make a scorer loop, recurse or allocate without end cost
 // that entry its score and nothing more. The Judge's thread only sends the documents and the
-// entry's bytes, and checks what comes back.
+// entry's bytes, and checks what comes back. A worker is not a wall around memory, though: V8 can
+// still abort the whole process when one allocation outruns the heap limit before the worker is
+// stopped (megabyte strings built in a tight loop do), and memory outside the heap, such as
+// ArrayBuffers and WebAssembly's, has no limit here.
 
 /** How long scoring one entry may take, by default. */
 const ENTRY_TIMEOUT_MS = 5_000;
-/** How long compiling a `json_schema` schema and its trial run may take, by default. */
-const COMPILE_BUDGET_MS = 2_000;
+/**
+ * How long compiling a `json_schema` schema and its trial run may take, by default: intake's
+ * budget. Judging gives the same check 4 times as long (see `judgeTask`).
+ */
+export const COMPILE_BUDGET_MS = 2_000;
 /**
  * How long a worker may take to load the scorers, about 130 ms when the machine is idle. Loading
  * is the Judge's own cost, and is not counted against an entry's time or a schema's: the limits
  * start when the work is sent to a worker that is ready. A start and an entry's limit together
- * stay well inside the 30 s that judging leaves before a pick deadline.
+ * fit inside the 30 s that judging leaves before the pick deadline of a long pick window.
  */
 const START_TIMEOUT_MS = 10_000;
 /**

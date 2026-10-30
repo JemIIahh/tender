@@ -52,7 +52,14 @@ function rogueScorerFor(...task: Parameters<typeof scorerFor>): ReturnType<typeo
 }
 
 function rogueCheck(schema: Record<string, unknown>): ReturnType<typeof checkJsonSchemaUsable> {
-  switch (schema.title) {
+  const title = typeof schema.title === "string" ? schema.title : "";
+  if (title.startsWith("rogue:slow:")) {
+    // A compile that takes this many milliseconds, and then the real check.
+    const until = Date.now() + Number(title.slice("rogue:slow:".length));
+    while (Date.now() < until) counter.spins++;
+    return checkJsonSchemaUsable(schema);
+  }
+  switch (title) {
     case "rogue:loop":
       for (;;) counter.spins++;
     case "rogue:throw":

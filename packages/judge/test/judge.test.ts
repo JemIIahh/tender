@@ -580,7 +580,7 @@ test("a_schema_that_compiles_past_the_budget_is_rejected_at_intake_and_at_judgin
 }, async () => {
   const tooSlow = "criteria schema is not supported: it takes too long to compile";
   const criteriaHash = await putCriteria(db, jsonSchemaCriteria(slowSchema()));
-  // At intake: compiling and trying it takes longer than the budget, cut to 50 ms here.
+  // At intake: compiling and trying it takes longer than the budget, cut to 25 ms here.
   await insertTask(
     db,
     taskView({
@@ -591,12 +591,12 @@ test("a_schema_that_compiles_past_the_budget_is_rejected_at_intake_and_at_judgin
       }),
     }),
   );
-  const short = { scoringLimits: { compileBudgetMs: 50 } };
+  const short = { scoringLimits: { compileBudgetMs: 25 } };
   expect(await intakeTask(judgeDeps(db, fakeChain(null), short), 6n)).toBe("rejected");
   expect(await judgeRow(db, 6)).toEqual({ judge_status: "rejected", judge_reason: tooSlow });
 
-  // At judging (P05-R12): a task accepted under a budget it met is checked again, under the
-  // Judge's budget now, before any entry is read, and refused as intake would refuse it.
+  // At judging (P05-R12): a task accepted under a budget it met is checked again before any entry
+  // is read, with 4 times intake's budget (100 ms here, still too little), and refused.
   const view = taskView({
     criteria_hash: criteriaHash,
     heldout_commitment: await putHeldout(db, X_IS_1),
@@ -612,6 +612,47 @@ test("a_schema_that_compiles_past_the_budget_is_rejected_at_intake_and_at_judgin
   expect(chain.getAllEntries).not.toHaveBeenCalled();
   expect(chain.pick).not.toHaveBeenCalled();
   expect(warn).toHaveBeenCalledTimes(1);
+});
+
+test("judging_gives_the_compile_check_four_times_intakes_budget", { timeout: 60_000 }, async () => {
+  // A compile that takes 500 ms, injected through the rogue worker, and intake's budget cut to
+  // 250 ms: intake refuses it, and judging, with 1 s, does not. A busy machine cannot refuse at
+  // judging what compiled in time at intake; the check is the same on both paths (P05-R12).
+  const criteria = jsonSchemaCriteria({ title: "rogue:slow:500", type: "object" });
+  vi.mocked(checkJsonSchemaIsolated).mockClear();
+  for (let i = 0; i < 2; i++) {
+    vi.mocked(checkJsonSchemaIsolated).mockImplementationOnce((schema, options) =>
+      isolate.checkJsonSchemaIsolated(schema, { ...options, workerUrl: ROGUE_WORKER }),
+    );
+  }
+  const budget = { scoringLimits: { compileBudgetMs: 250 } };
+
+  await insertTask(
+    db,
+    taskView({
+      id: "6",
+      criteria_hash: await putCriteria(db, criteria),
+      heldout_commitment: await putHeldout(db, {
+        json_schema: { assertions: [{ path: "$.x", equals: 6 }] },
+      }),
+    }),
+  );
+  expect(await intakeTask(judgeDeps(db, fakeChain(null), budget), 6n)).toBe("rejected");
+  expect(await judgeRow(db, 6)).toEqual({
+    judge_status: "rejected",
+    judge_reason: "criteria schema is not supported: it takes too long to compile",
+  });
+
+  const { chain } = await postJudged([["alice.test.near", '{"x":1}', 10n]], {
+    criteria,
+    heldout: X_IS_1,
+  });
+  expect(await judgeTask(judgeDeps(db, chain, budget), 7n)).toBe("picked");
+  expect((await picked(chain)).winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
+  expect(vi.mocked(checkJsonSchemaIsolated).mock.calls.map(([, options]) => options)).toEqual([
+    { budgetMs: 250 },
+    { budgetMs: 1_000 },
+  ]);
 });
 
 test("judge_fails_closed_when_its_heldout_checks_were_used_first", async () => {
@@ -851,10 +892,10 @@ test("an_entry_whose_scoring_times_out_scores_zero_and_the_others_are_scored", {
 
 test("judge_scores_in_commit_order_until_the_stop_line_and_picks_from_those", async () => {
   // Ten answers, revealed in entrant order and committed in another. Scoring one moves the
-  // Judge's clock on by 1.5 minutes. The pick window runs from a minute before NOW to 10 minutes
-  // after it, so the stop line is a tenth of it (66 s) before the pick deadline: NOW + 8.9
-  // minutes. Six entries are scored, the six committed first; the right answers committed after
-  // them cannot win, and the scorecard says why.
+  // Judge's clock on by 1.6 minutes. The pick window runs from a minute before NOW to 10 minutes
+  // after it, and a tenth of it is 66 s, so the stop line is 30 s, the most, before the pick
+  // deadline: NOW + 9.5 minutes. Six entries are scored, the six committed first; the right
+  // answers committed after them cannot win, and the scorecard says why.
   const answers: Answer[] = [
     ["late1.test.near", "42", 20n],
     ["early1.test.near", "41", 11n],
@@ -872,7 +913,7 @@ test("judge_scores_in_commit_order_until_the_stop_line_and_picks_from_those", as
   let scores = 0;
   nextScorerCalls(() => {
     scores++;
-    minutes += 1.5;
+    minutes += 1.6;
   });
 
   const deps = judgeDeps(db, chain, { now: () => at(minutes)() });
@@ -899,32 +940,147 @@ test("judge_scores_in_commit_order_until_the_stop_line_and_picks_from_those", as
   ]);
 });
 
+/** The reason, and the one `WARN`, of a task that judging got to too late (P05-R13). */
+const TOO_LATE = "not judged: judging started too late to score any entry";
+const TOO_LATE_WARN =
+  "judge: WARN task 7: judging started too late to score any entry; it is not picked, and is left to its fallback window";
+
 test("the_stop_line_is_drawn_from_the_pick_window", async () => {
-  // A tenth of the pick window before the pick deadline, or 30 s when that is more. A millisecond
-  // before the line the entry is scored; at the line nothing is, and nobody can be paid.
-  const MINUTE_MS = 60_000;
+  // A tenth of the pick window before the pick deadline, and no less than 3 s or more than 30 s
+  // (P05-R13). A millisecond before the line the entry is scored and picked; at the line nothing
+  // can be scored, and the task is not picked.
   const windows = [
-    // From a minute before NOW to 10 minutes after: a tenth is 66 s.
-    { pickMinutes: 10, stopMs: 10 * MINUTE_MS - 66_000 },
-    // To 3 minutes after: a tenth is 24 s, less than 30 s.
-    { pickMinutes: 3, stopMs: 3 * MINUTE_MS - 30_000 },
+    // From a minute before NOW, taskView's reveal deadline, to 10 minutes after it: a tenth is
+    // 66 s, and the most is 30 s.
+    { pickMs: 10 * 60_000, marginMs: 30_000 },
+    // To 3 minutes after: a tenth, 24 s.
+    { pickMs: 3 * 60_000, marginMs: 24_000 },
   ];
-  for (const { pickMinutes, stopMs } of windows) {
-    for (const [atMs, outcome, scorecard] of [
-      [stopMs - 1, "picked", [100, true, []]],
-      [stopMs, "no_award", [0, false, ["not scored before the pick deadline"]]],
-    ] as const) {
-      await resetDb(db);
-      const pick_deadline = (NOW_NS + BigInt(pickMinutes) * MINUTE_NS).toString();
-      const { chain } = await postJudged([["alice.test.near", "42", 10n]], {
-        view: { pick_deadline },
-      });
-      const deps = judgeDeps(db, chain, { now: () => new Date(NOW.getTime() + atMs) });
-      expect(await judgeTask(deps, 7n), `${pickMinutes} minutes, at ${atMs} ms`).toBe(outcome);
-      const [entry] = (await picked(chain)).scorecard.entries;
-      expect([entry?.score, entry?.passed, entry?.reasons]).toEqual(scorecard);
-    }
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const judgeAt = async (view: Partial<TaskView>, atMs: number) => {
+    await resetDb(db);
+    const { chain } = await postJudged([["alice.test.near", "42", 10n]], { view });
+    const deps = judgeDeps(db, chain, { now: () => new Date(NOW.getTime() + atMs) });
+    return { outcome: await judgeTask(deps, 7n), chain };
+  };
+  const cases = [
+    ...windows.map(({ pickMs, marginMs }) => ({
+      view: { pick_deadline: (NOW_NS + BigInt(pickMs) * 1_000_000n).toString() },
+      stopMs: pickMs - marginMs,
+    })),
+    {
+      // A window of 10 s, as the local sandbox has, from a second before NOW: a tenth is 1 s, and
+      // the least is 3 s.
+      view: {
+        reveal_deadline: (NOW_NS - 1_000_000_000n).toString(),
+        pick_deadline: (NOW_NS + 9_000_000_000n).toString(),
+      },
+      stopMs: 9_000 - 3_000,
+    },
+  ];
+  for (const { view, stopMs } of cases) {
+    const scored = await judgeAt(view, stopMs - 1);
+    expect(scored.outcome, `${stopMs - 1} ms`).toBe("picked");
+    expect((await picked(scored.chain)).winners).toEqual([
+      { account: "alice.test.near", bps: 10_000 },
+    ]);
+    const late = await judgeAt(view, stopMs);
+    expect(late.outcome, `${stopMs} ms`).toBe("skipped");
+    expect(late.chain.pick).not.toHaveBeenCalled();
   }
+  expect(warn.mock.calls).toEqual(cases.map(() => [TOO_LATE_WARN]));
+});
+
+test("a_short_window_with_the_midpoint_wait_is_scored_and_picked", async () => {
+  // P05-R13: a pick window of 10 s, as the local sandbox has, from a second before NOW. The task
+  // waits (P05-R8) for another task of its poster's that shares its held-out checks and closes its
+  // reveals at the middle of the window, 4 s after NOW. The stop line is 3 s before the pick
+  // deadline, at NOW + 6 s: judging that starts at the middle has 2 s, and picks.
+  const SECOND_NS = 1_000_000_000n;
+  const { view, chain } = await postJudged([["alice.test.near", "42", 10n]], {
+    view: {
+      reveal_deadline: (NOW_NS - SECOND_NS).toString(),
+      pick_deadline: (NOW_NS + 9n * SECOND_NS).toString(),
+    },
+  });
+  await postSharing(view, "9", NOW_NS + 4n * SECOND_NS);
+  vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const atSecond = (seconds: number) => () => new Date(NOW.getTime() + seconds * 1_000);
+
+  expect(await judgeTask(judgeDeps(db, chain, { now: atSecond(3) }), 7n)).toBe("skipped");
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(await judgeTask(judgeDeps(db, chain, { now: atSecond(4) }), 7n)).toBe("picked");
+  const card = await picked(chain);
+  expect(card.winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
+  expect(card.scorecard.entries.map((e) => [e.account, e.score])).toEqual([
+    ["alice.test.near", 100],
+  ]);
+});
+
+test("judging_that_starts_past_the_stop_line_does_not_pick", async () => {
+  // P05-R13: this task's stop line is 30 s before its pick deadline, at NOW + 9.5 minutes. A tick
+  // that starts past it can score nothing, and a pick would pay nobody for the Judge's own
+  // lateness. There is none: no scorecard, the held-out checks stay private, and the task is left
+  // to its fallback window, which refunds it unless its poster picks. One WARN, whatever the
+  // ticks before the pick deadline, and the reason in the row.
+  const { chain, commitment } = await postJudged([["alice.test.near", "42", 10n]]);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+  for (const minutes of [9.5, 9.7, 9.9]) {
+    expect(await judgeTask(judgeDeps(db, chain, { now: at(minutes) }), 7n)).toBe("skipped");
+  }
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(await scorecardCount()).toBe(0);
+  expect(await isPublic(db, commitment)).toBe(false);
+  expect(warn.mock.calls).toEqual([[TOO_LATE_WARN]]);
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: TOO_LATE });
+});
+
+test("judging_that_scores_nothing_before_the_stop_line_does_not_pick", async () => {
+  // A tick that starts in time, whose clock passes the stop line while the entry's content is
+  // fetched: nothing is scored, and the task is not picked, as when judging starts past the line.
+  // A task with some entries scored is picked from those
+  // (judge_scores_in_commit_order_until_the_stop_line_and_picks_from_those).
+  let minutes = 0;
+  const extra = [entry("alice.test.near", sha256Hex("42"), "http://files.example/42", 10n)];
+  const { chain } = await postJudged([], { extra });
+  const { io } = fakeNetwork(
+    { "files.example": [PUBLIC_IP] },
+    {
+      "files.example/42": () => {
+        minutes = 9.5;
+        return new Response("42");
+      },
+    },
+  );
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+  const deps = judgeDeps(db, chain, { fetchIo: io, now: () => at(minutes)() });
+  expect(await judgeTask(deps, 7n)).toBe("skipped");
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(warn.mock.calls).toEqual([[TOO_LATE_WARN]]);
+});
+
+test("tasks_the_judge_was_not_late_for_are_picked_as_before", async () => {
+  // A task with no entries past the stop line: nobody to pay, and nothing the Judge could have
+  // scored. The empty pick refunds it at once, as before P05-R13.
+  const empty = await postJudged([]);
+  expect(await judgeTask(judgeDeps(db, empty.chain, { now: at(9.5) }), 7n)).toBe("no_award");
+  expect((await picked(empty.chain)).scorecard.entries).toEqual([]);
+
+  // A task whose entries were all turned away for their own faults, in time: nothing was left
+  // for the stop line, and the scorecard says why each scores 0.
+  await resetDb(db);
+  const missing = sha256Hex("never uploaded");
+  const unusable = await postJudged([], {
+    extra: [entry("mallory.test.near", missing, blobUri(missing), 10n)],
+  });
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  expect(await judgeTask(judgeDeps(db, unusable.chain), 7n)).toBe("no_award");
+  expect((await picked(unusable.chain)).scorecard.entries.map((e) => e.reasons)).toEqual([
+    ["content unavailable: not uploaded for this task"],
+  ]);
+  expect(warn).not.toHaveBeenCalled();
 });
 
 test("entries_with_the_same_uri_and_hash_are_fetched_and_scored_once", async () => {

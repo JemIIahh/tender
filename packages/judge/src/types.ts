@@ -71,7 +71,10 @@ export interface TransportInit extends RequestInit {
 export interface ScoringLimits {
   /** How long one entry's scoring may take in its worker: 5 s by default. */
   entryTimeoutMs?: number;
-  /** How long a `json_schema` schema may take to compile and pass its trial run: 2 s by default. */
+  /**
+   * How long a `json_schema` schema may take to compile and pass its trial run at intake: 2 s by
+   * default. Judging gives the same check 4 times as long.
+   */
   compileBudgetMs?: number;
 }
 
