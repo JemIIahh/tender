@@ -1,8 +1,9 @@
 import type { Session, SigningWallet, TransactionRequest, WalletProvider } from "../lib/wallet";
+import type { OpenTabLink } from "../lib/walletTabs";
 import type { FakeChain } from "./fakeChain";
 
-// Wallets for the tests: one that runs what it is sent on a `FakeChain`, and a provider that hands
-// a store the session a test chooses.
+// Wallets for the tests: one that runs what it is sent on a `FakeChain`, a provider that hands a
+// store the session a test chooses, and a line to the other tabs that a test holds both ends of.
 
 /** What a wallet was asked to send, as it was asked. */
 export interface SentBatch {
@@ -88,4 +89,35 @@ export function fakeProvider(
     },
   };
   return provider;
+}
+
+export interface FakeTabs {
+  /** What a store is given as its line to the other tabs. */
+  open: OpenTabLink;
+  /** How many lines the store opened, and how many times it told the other tabs. */
+  opened: number;
+  told: number;
+  /** Plays another tab telling this one that its wallet session changed. */
+  hear(): void;
+}
+
+/** A line to the other tabs that records what the store tells them, and can tell the store. */
+export function fakeTabs(): FakeTabs {
+  let changed: () => void = () => {};
+  const tabs: FakeTabs = {
+    opened: 0,
+    told: 0,
+    open(onChanged) {
+      tabs.opened++;
+      changed = onChanged;
+      return {
+        tell() {
+          tabs.told++;
+        },
+        close() {},
+      };
+    },
+    hear: () => changed(),
+  };
+  return tabs;
 }

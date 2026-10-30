@@ -207,3 +207,27 @@ test("wallet_page_fits_a_phone_and_shows_the_keyboard_focus", async ({ page }) =
   }
   expect(reached).toEqual(expect.arrayContaining(["Disconnect", "Add funds", "Withdraw"]));
 });
+
+test("a_disconnect_in_one_tab_signs_the_other_tab_out", async ({ context, page }) => {
+  // The wallet's session is the browser's: a second tab of the site finds the wallet the first
+  // connected. The tabs tell each other when a session ends, so the second does not go on showing
+  // an account the wallet has signed out of.
+  const chain = new FakeChain(CONTRACT, [{ token: TOKEN }]);
+  chain.give(TOKEN, ALICE, TUSDC(5));
+  await installWallet(page, chain, { account: ALICE });
+  await connect(page);
+  await expect(row(page).getByTestId("wallet-balance")).toHaveText("5.00 tUSDC");
+
+  const other = await context.newPage();
+  await installWallet(other, chain, { account: ALICE });
+  await other.goto("/wallet");
+  await expect(other.getByTestId("account-id")).toHaveText(ALICE);
+  await expect(row(other).getByTestId("wallet-balance")).toHaveText("5.00 tUSDC");
+
+  await page.getByRole("button", { name: "Disconnect" }).click();
+
+  await expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible();
+  await expect(other.getByRole("button", { name: "Connect wallet" })).toBeVisible();
+  await expect(other.getByTestId("account-id")).toHaveCount(0);
+  await expect(other.getByTestId("token-row")).toHaveCount(0);
+});

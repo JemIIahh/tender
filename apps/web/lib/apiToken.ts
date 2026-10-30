@@ -7,9 +7,10 @@
 //
 // It belongs to the wallet session it was signed in under, and goes when the session does: the
 // store calls `sessionEnded` and `sessionBegan` from where it holds the session, so the token is
-// dropped by a disconnect, a sign-out from the wallet itself and a switch of account whether or not
-// any page that uses the token is on screen. A sign-in carries a ticket for the session it began
-// in, and a token that comes back from a sign-in for a session that is over is not kept.
+// dropped by a disconnect, a sign-out from the wallet itself, a sign-out or a new connect in
+// another tab (lib/walletTabs.ts) and a switch of account whether or not any page that uses the
+// token is on screen. A sign-in carries a ticket for the session it began in, and a token that
+// comes back from a sign-in for a session that is over is not kept.
 
 /** Where the token is kept for the tab. */
 const STORAGE_KEY = "tender.apiToken";
@@ -117,7 +118,10 @@ export function sessionBegan(accountId: string, continued: boolean): void {
   if (held !== null && !(continued && held.accountId === accountId)) keep(null);
 }
 
-/** The wallet session is over: a disconnect, a sign-out from the wallet, or none to be found. */
+/**
+ * The wallet session is over: a disconnect, a sign-out from the wallet or from another tab, or none
+ * to be found.
+ */
 export function sessionEnded(): void {
   clearApiToken();
 }
