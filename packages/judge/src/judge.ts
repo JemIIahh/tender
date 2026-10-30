@@ -30,12 +30,12 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   task at once.
  * - `skipped`: nothing was settled. The task is not one to judge now: the chain has no such task,
  *   it is settled, it names another verifier, it is not in its judging window, or intake did not
- *   accept it. Or it waits, with a `WARN` each tick, for another task of its poster's with the
- *   same held-out checks to close its reveals, since publishing the checks would hand out that
- *   task's answers. Or judging hit trouble of the Judge's own, which it logs as a `WARN` and
- *   leaves for the next tick: a scorer that could not run, a scorecard that could not be built, a
- *   `pick` that failed. `E_SETTLED` from `pick` means someone settled the task first, and is not
- *   logged.
+ *   accept it. Or it waits for another task of its poster's with the same held-out checks to close
+ *   its reveals (see `sharingTaskStillRevealing`), since publishing the checks would hand out that
+ *   task's answers; the wait is a `WARN` once and the task's `judge_reason` until it ends. Or
+ *   judging hit trouble of the Judge's own, which it logs as a `WARN` and leaves for the next
+ *   tick: a scorer that could not run, a scorecard that could not be built, a `pick` that failed.
+ *   `E_SETTLED` from `pick` means someone settled the task first, and is not logged.
  * - `failed_closed`: the criteria or held-out checks that the chain names cannot be read or used
  *   (they passed intake, so they are gone or changed). The task is never judged: its status
  *   becomes `failed_closed` with the reason, and the poster's fallback window applies.
@@ -46,15 +46,15 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *
  * Each revealed entry's content is fetched (`fetchEntryContent`) and must hash to the entry's
  * `content_hash`; one of our own blob URIs counts only when `deps.resultUploaded` says the entrant
- * may use those bytes for this task. One that cannot be fetched or does not count (`content unavailable:
- * …`), or that does not match (`content hash mismatch`), scores 0 and never passes, whatever the
- * pass mark, so it cannot be paid. The rest are scored by `scoreEntry`; a scorer that throws
- * scores that entry 0 (`scoring failed`). Then the entries are ranked, the winners chosen, and the
- * scorecard built from exactly the winners `pick` is sent. The scorecard is stored as a public
- * blob, the held-out checks are made public, and `pick` is called with the scorecard's hash and
- * URI, in that order, so that the pick never points at something that cannot be read. A retry
- * stores the same scorecard again unless the clock moved: its bytes depend on the entries and
- * `generated_at` only.
+ * may use those bytes for this task. One that cannot be fetched or does not count (`content
+ * unavailable: …`), or that does not match (`content hash mismatch`), scores 0 and never passes,
+ * whatever the pass mark, so it cannot be paid. The rest are scored by `scoreEntry`; a scorer that
+ * throws scores that entry 0 (`scoring failed`). Then the entries are ranked, the winners chosen,
+ * and the scorecard built from exactly the winners `pick` is sent. The scorecard is stored as a
+ * public blob, the held-out checks are made public, and `pick` is called with the scorecard's
+ * hash and URI, in that order, so that the pick never points at something that cannot be read. A
+ * retry stores the same scorecard again unless the clock moved: its bytes depend on the entries
+ * and `generated_at` only.
  *
  * Database and chain read errors are thrown, for the loop to log; nothing is settled.
  */
@@ -69,7 +69,8 @@ export async function judgeTask(
     return "skipped";
   }
   if (task.phase !== "judging" || phaseOfTaskView(task, nowNs) !== "judging") return "skipped";
-  if ((await judgeStatusOf(deps, taskId)) !== "accepted") return "skipped";
+  const row = await judgeRowOf(deps, taskId);
+  if (row?.judge_status !== "accepted") return "skipped";
 
   const loaded = await loadDocuments(deps.db, task, {
     teamAccounts: deps.teamAccounts,
@@ -85,12 +86,13 @@ export async function judgeTask(
     return "failed_closed";
   }
   const { criteria, heldout } = loaded.documents;
-  // Publishing the held-out checks hands out the answers of any other task of the poster's that
-  // commits to them, so while one still takes reveals, this task waits. Asked here, so that a
+  // Publishing the held-out checks hands out the answers of another task of the poster's that
+  // commits to them, so while one still takes reveals, this task may wait. Asked here, so that a
   // task that waits costs little, and again just before publishing: the indexer may store such
   // a task while this one is judged.
   const sharing = await sharingTaskStillRevealing(deps.db, task, nowNs);
-  if (sharing !== null) return waitForReveals(taskId, sharing);
+  if (sharing !== null) return waitFor(deps, taskId, sharing);
+  if (row.judge_reason?.startsWith(WAITING) === true) await stopWaiting(deps, taskId);
 
   const revealed = (await deps.client.getAllEntries(taskId)).filter(isRevealed);
   const fetched = await inParallel(revealed, FETCHES_AT_ONCE, async (entry) => ({
@@ -140,7 +142,7 @@ export async function judgeTask(
     task,
     BigInt(clock().getTime()) * NS_PER_MS,
   );
-  if (stillSharing !== null) return waitForReveals(taskId, stillSharing);
+  if (stillSharing !== null) return waitFor(deps, taskId, stillSharing);
   const sha256 = await putBlob(deps.db, {
     kind: "scorecard",
     contentType: "application/json",
@@ -270,11 +272,19 @@ function isRevealed(entry: EntryView): entry is RevealedEntry {
 }
 
 /**
- * The lowest id of another task of `task`'s poster that commits to the same held-out checks and
- * still takes reveals at `nowNs`, or `null`, as always for a task without held-out checks. Judging
- * `task` publishes the checks, and with them that task's answers, whoever its verifier is and
- * whatever intake made of it. Only the poster's own tasks count: anyone can post a task with a
- * commitment once it is on chain, and a stranger must not be able to stall this one.
+ * The task `task` waits for before it publishes its held-out checks, or `null`: the lowest id of
+ * another task of `task`'s poster that commits to the same checks and still takes reveals at
+ * `nowNs`. Judging `task` publishes the checks, and with them that task's answers, whoever its
+ * verifier is and whatever intake made of it. Only the poster's own tasks count: anyone can post a
+ * task with a commitment once it is on chain, and a stranger must not be able to stall this one.
+ *
+ * The wait never costs `task` its pick window (P05-R8). A sharing task counts only when its
+ * reveals close by the middle of `task`'s pick window, which leaves the Judge half of the window at
+ * least. One whose reveals close later is not waited for: `task` is judged, and the checks are
+ * published while that task still takes reveals. Its poster did that, by reusing the checks, and
+ * a poster must not be able to keep an accepted task from being picked, which would leave its
+ * winners to the poster's fallback window. Nothing is waited for once the checks are public, after
+ * a pick that failed say: there is nothing left to keep.
  */
 async function sharingTaskStillRevealing(
   db: Db,
@@ -282,29 +292,65 @@ async function sharingTaskStillRevealing(
   nowNs: bigint,
 ): Promise<string | null> {
   if (task.heldout_commitment === null) return null;
-  // Ids and deadlines are numeric: `min`, `<>` and `>` compare them as numbers.
+  const [blob] = await db.query<{ is_public: boolean }>(
+    "select is_public from blobs where sha256 = $1",
+    [task.heldout_commitment],
+  );
+  if (blob?.is_public === true) return null;
+  const reveal = BigInt(task.reveal_deadline);
+  const latest = reveal + (BigInt(task.pick_deadline) - reveal) / 2n;
+  // Ids and deadlines are numeric: `min`, `<>`, `>` and `<=` compare them as numbers.
   const [row] = await db.query<{ id: string | null }>(
     `select min(id)::text as id from tasks
-      where poster = $1 and heldout_commitment = $2 and id <> $3 and reveal_deadline > $4`,
-    [task.poster, task.heldout_commitment, BigInt(task.id), nowNs],
+      where poster = $1 and heldout_commitment = $2 and id <> $3
+        and reveal_deadline > $4 and reveal_deadline <= $5`,
+    [task.poster, task.heldout_commitment, BigInt(task.id), nowNs, latest],
   );
   return row?.id ?? null;
 }
 
-/** Logs that the task waits for task `sharing` to close its reveals, and says nothing settled. */
-function waitForReveals(taskId: bigint, sharing: string): "skipped" {
-  return retryLater(
-    taskId,
-    `its held-out checks are task ${sharing}'s too, and that task still takes reveals`,
+/** How a waiting task's `judge_reason` starts. */
+const WAITING = "waiting: ";
+
+/**
+ * Records that task `taskId` waits for task `sharing`, as its `judge_reason` (`waiting: held-out
+ * checks shared with task {id}`), and says nothing was settled. The `WARN` goes out once, on the
+ * tick the wait starts (or comes to another task), and not on every tick after it: the reason in
+ * the row is what the next tick compares with.
+ */
+async function waitFor(deps: JudgeDeps, taskId: bigint, sharing: string): Promise<"skipped"> {
+  const reason = `${WAITING}held-out checks shared with task ${sharing}`;
+  const changed = await deps.db.query(
+    `update tasks set judge_reason = $2
+      where id = $1 and judge_status = 'accepted' and judge_reason is distinct from $2
+      returning id`,
+    [taskId, reason],
+  );
+  if (changed.length > 0) {
+    const why = "it shares the held-out checks and still takes reveals";
+    console.warn(`judge: WARN task ${taskId}: waiting for task ${sharing}: ${why}`);
+  }
+  return "skipped";
+}
+
+/** Clears the waiting reason of task `taskId`, as its judging goes on. */
+async function stopWaiting(deps: JudgeDeps, taskId: bigint): Promise<void> {
+  await deps.db.query(
+    `update tasks set judge_reason = null
+      where id = $1 and judge_status = 'accepted' and judge_reason like $2`,
+    [taskId, `${WAITING}%`],
   );
 }
 
-async function judgeStatusOf(deps: JudgeDeps, taskId: bigint): Promise<string | null | undefined> {
-  const [row] = await deps.db.query<{ judge_status: string | null }>(
-    "select judge_status from tasks where id = $1",
+async function judgeRowOf(
+  deps: JudgeDeps,
+  taskId: bigint,
+): Promise<{ judge_status: string | null; judge_reason: string | null } | undefined> {
+  const [row] = await deps.db.query<{ judge_status: string | null; judge_reason: string | null }>(
+    "select judge_status, judge_reason from tasks where id = $1",
     [taskId],
   );
-  return row?.judge_status;
+  return row;
 }
 
 /** `fn` of each item, at most `limit` at a time, in the order of `items`. */

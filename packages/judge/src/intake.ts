@@ -53,6 +53,17 @@ const HELDOUT_WAIT_NS = 10n * 60n * 1_000_000_000n;
 const NS_PER_MS = 1_000_000n;
 /** The keywords whose value is a reference to a schema. */
 const REFERENCE_KEYWORDS = new Set(["$ref", "$dynamicRef", "$recursiveRef"]);
+/** The keywords whose value is data, not a schema: what is in it is never a reference. */
+const DATA_KEYWORDS = new Set(["const", "enum", "examples", "default"]);
+/** The keywords whose value maps names to schemas: its keys are names, not keywords. */
+const NAMED_SCHEMA_KEYWORDS = new Set([
+  "properties",
+  "patternProperties",
+  "$defs",
+  "definitions",
+  "dependentSchemas",
+  "dependencies",
+]);
 /** An index of an array in a JSON pointer, as Ajv reads one: no sign, no leading zero. */
 const ARRAY_INDEX = /^(?:0|[1-9][0-9]*)$/;
 /** A surrogate half with no partner. With the `u` flag a pair is one code point, not two halves. */
@@ -316,41 +327,61 @@ function parseJson(bytes: Uint8Array): unknown {
  * array, and the schema then fails on every document, or worse takes every document as a fit.
  * `checkJsonSchemaUsable` catches the first only.
  *
- * - A reference must be a fragment, starting with `#`. Nothing outside the schema resolves, so
- *   no use is lost, and a URI before the `#` can lead Ajv into a resource that the walk below
- *   would not find.
+ * - A reference must be a fragment, starting with `#`. Nothing outside the schema resolves, and a
+ *   URI before the `#` can lead Ajv into a resource that the walk below would not find. A few rare
+ *   shapes that Ajv takes are refused with it: a reference to a resource embedded by its `$id`
+ *   (`"$ref": "address"`), and an absolute reference to the schema itself.
  * - Each name in the fragment, decoded as Ajv decodes it (percent-encoding, then `~1` and `~0` in
  *   a JSON pointer), must not be that of an `Object.prototype` member: the anchor, or each
  *   segment of a JSON pointer. A fragment that cannot be decoded is refused too.
- * - A JSON pointer is walked through the schema resource the reference is in (the closest object
- *   with an `$id`, or the whole schema), and each step must be an own key of an object or an index
- *   of an array: `#/allOf/length` is refused, `#/$defs/total` is not. A step that finds nothing
- *   ends the walk, as Ajv refuses a reference it cannot resolve on its own.
+ * - A JSON pointer is walked through the schema resource the reference is in (the closest schema
+ *   whose `$id` names one: not `""` or `"#"`, which name the resource they are in), and each step
+ *   must be an own key of an object or an index of an array: `#/allOf/length` is refused,
+ *   `#/$defs/total` is not. A step that finds nothing ends the walk, as Ajv refuses a reference it
+ *   cannot resolve on its own.
+ *
+ * The values of `const`, `enum`, `examples` and `default` are data, not schemas, so a `"$ref"` in
+ * them is no reference and is not looked at. That holds where they are keywords, in a schema, and
+ * not where they are names, as in `properties`, whose values are schemas.
  *
  * The criteria schema caps a document's nesting at 64, and the walk keeps its own stack.
  */
 function referenceProblem(schema: Record<string, unknown>): string | null {
-  // Each entry is a value, and the schema resource it is in.
-  const pending: [value: unknown, resource: object][] = [[schema, schema]];
+  // Each entry is a value; whether it maps names to schemas, as `properties` does, rather than
+  // being a schema or a list of them; and the schema resource it is in.
+  const pending: [value: unknown, names: boolean, resource: object][] = [[schema, false, schema]];
   for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
-    const [value, resource] = next;
+    const [value, names, resource] = next;
     if (typeof value !== "object" || value === null) continue;
     if (Array.isArray(value)) {
-      for (const item of value) pending.push([item, resource]);
+      for (const item of value) pending.push([item, false, resource]);
       continue;
     }
     const node = value as Record<string, unknown>;
-    const base = typeof node.$id === "string" ? node : resource;
+    if (names) {
+      for (const member of Object.values(node)) pending.push([member, false, resource]);
+      continue;
+    }
+    const base = startsResource(node.$id) ? node : resource;
     for (const [key, member] of Object.entries(node)) {
+      if (DATA_KEYWORDS.has(key)) continue;
       if (REFERENCE_KEYWORDS.has(key) && typeof member === "string") {
         const problem = problemOf(member, base);
         if (problem !== null) return problem;
       } else {
-        pending.push([member, base]);
+        pending.push([member, NAMED_SCHEMA_KEYWORDS.has(key), base]);
       }
     }
   }
   return null;
+}
+
+/**
+ * Whether a schema's `$id` starts a schema resource of its own. Ajv drops a trailing `#` (or `#/`)
+ * from an `$id` and keeps its base for one that is left empty, so `""` and `"#"` do not.
+ */
+function startsResource(id: unknown): boolean {
+  return typeof id === "string" && id.replace(/#\/?$/, "") !== "";
 }
 
 /** Why `reference`, made inside `resource`, is not supported, or `null`. See `referenceProblem`. */

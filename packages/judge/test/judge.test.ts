@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { type TenderClient, TenderError } from "@tender/client";
-import { type Db, getBlob, putBlob } from "@tender/db";
+import { type Db, getBlob, putBlob, setBlobPublic } from "@tender/db";
 import {
   canonicalJson,
   type EntryView,
@@ -487,46 +487,62 @@ test("judge_fails_closed_when_its_heldout_checks_were_used_first", async () => {
   expect(await isPublic(db, commitment)).toBe(false);
 });
 
+/**
+ * The middle of task 7's pick window, as `taskView` sets it: reveals close a minute before `NOW`
+ * and picks end 10 minutes after, so the middle is 4.5 minutes after `NOW`. A task sharing task
+ * 7's held-out checks is waited for only when its reveals close by then (P05-R8).
+ */
+const PICK_WINDOW_MIDDLE_NS = NOW_NS - MINUTE_NS + (11n * MINUTE_NS) / 2n;
+
+/** Stores the poster's task `id`, of another verifier, sharing task 7's checks until `revealNs`. */
+async function postSharing(
+  view: TaskView,
+  id: string,
+  revealNs: bigint,
+  over: Partial<TaskView> = {},
+) {
+  await insertTask(
+    db,
+    taskView({
+      id,
+      verifier: "other-judge.test.near",
+      criteria_hash: view.criteria_hash,
+      heldout_commitment: view.heldout_commitment,
+      reveal_deadline: revealNs.toString(),
+      ...over,
+    }),
+  );
+}
+
+const WAITING_FOR_9 = "waiting: held-out checks shared with task 9";
+
 test("judge_waits_while_a_task_sharing_its_heldout_checks_takes_reveals", async () => {
   // The poster's later task 9 commits to the same held-out checks and names another verifier, so
   // this Judge's intake never saw it. Judging task 7 would publish the checks, and with them task
-  // 9's answers, while task 9 still takes reveals: task 7 waits, and nothing is fetched, stored or
-  // published, and no entry is scored.
+  // 9's answers, while task 9 still takes reveals, and those close before the middle of task 7's
+  // pick window: task 7 waits. Nothing is fetched, stored, published or scored.
   const { view, chain, commitment } = await postJudged([["alice.test.near", "42", 10n]]);
-  const sharing = { criteria_hash: view.criteria_hash, heldout_commitment: commitment };
-  await insertTask(
-    db,
-    taskView({
-      id: "9",
-      verifier: "other-judge.test.near",
-      reveal_deadline: (NOW_NS + 5n * MINUTE_NS).toString(),
-      ...sharing,
-    }),
-  );
+  await postSharing(view, "9", NOW_NS + 4n * MINUTE_NS);
   // A stranger's task with the same commitment does not hold it up: it can never publish them.
-  await insertTask(
-    db,
-    taskView({
-      id: "11",
-      poster: "stranger.test.near",
-      reveal_deadline: (NOW_NS + 60n * MINUTE_NS).toString(),
-      ...sharing,
-    }),
-  );
+  await postSharing(view, "11", NOW_NS + 4n * MINUTE_NS, { poster: "stranger.test.near" });
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
-  expect(warn).toHaveBeenCalledWith(
-    expect.stringMatching(/^judge: WARN task 7: its held-out checks are task 9's too/),
-  );
+  for (const minutes of [0, 1, 3.99]) {
+    expect(await judgeTask(judgeDeps(db, chain, { now: at(minutes) }), 7n)).toBe("skipped");
+  }
+  // One line for the whole wait, and the reason shows meanwhile.
+  expect(warn.mock.calls).toEqual([
+    [expect.stringMatching(/^judge: WARN task 7: waiting for task 9: it shares the held-out/)],
+  ]);
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: WAITING_FOR_9 });
   expect(chain.getAllEntries).not.toHaveBeenCalled();
   expect(chain.pick).not.toHaveBeenCalled();
   expect(await scorecardCount()).toBe(0);
   expect(await isPublic(db, commitment)).toBe(false);
-  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: null });
 
-  // Task 9's reveals close at its deadline, inside task 7's pick window, and task 7 is judged.
-  expect(await judgeTask(judgeDeps(db, chain, { now: at(5) }), 7n)).toBe("picked");
+  // Task 9's reveals close at its deadline, and task 7 is judged; its reason is cleared.
+  expect(await judgeTask(judgeDeps(db, chain, { now: at(4) }), 7n)).toBe("picked");
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: null });
   expect(await isPublic(db, commitment)).toBe(true);
 });
 
@@ -536,16 +552,7 @@ test("judge_looks_again_for_a_task_sharing_its_heldout_checks_before_publishing"
   const { view, chain, commitment } = await postJudged([["alice.test.near", "42", 10n]]);
   const entries = chain.getAllEntries.getMockImplementation();
   chain.getAllEntries.mockImplementationOnce(async (taskId) => {
-    await insertTask(
-      db,
-      taskView({
-        id: "9",
-        verifier: "other-judge.test.near",
-        criteria_hash: view.criteria_hash,
-        heldout_commitment: commitment,
-        reveal_deadline: (NOW_NS + 5n * MINUTE_NS).toString(),
-      }),
-    );
+    await postSharing(view, "9", NOW_NS + 4n * MINUTE_NS);
     return (await entries?.(taskId)) ?? [];
   });
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -553,11 +560,56 @@ test("judge_looks_again_for_a_task_sharing_its_heldout_checks_before_publishing"
   expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
   expect(chain.getAllEntries).toHaveBeenCalledTimes(1);
   expect(warn).toHaveBeenCalledWith(
-    expect.stringMatching(/^judge: WARN task 7: its held-out checks are task 9's too/),
+    expect.stringMatching(/^judge: WARN task 7: waiting for task 9/),
   );
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: WAITING_FOR_9 });
   expect(chain.pick).not.toHaveBeenCalled();
   expect(await scorecardCount()).toBe(0);
   expect(await isPublic(db, commitment)).toBe(false);
+});
+
+test("a_task_sharing_the_heldout_checks_cannot_cost_this_one_its_pick_window", async () => {
+  // The re-review's probe A: the poster posts task 9 with task 7's commitment, and its reveals
+  // close after task 7's pick deadline. Were task 7 to wait, it would never be picked, and its
+  // winners would be left to the poster's fallback window. It is judged and picked now, and the
+  // checks are published while task 9 still takes reveals, which its poster brought about.
+  const { view, chain, commitment } = await postJudged([["alice.test.near", "42", 10n]]);
+  await postSharing(view, "9", NOW_NS + 11n * MINUTE_NS);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("picked");
+  expect((await picked(chain)).winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
+  expect(await isPublic(db, commitment)).toBe(true);
+  expect(warn).not.toHaveBeenCalled();
+});
+
+test("judge_waits_for_a_sharing_task_only_up_to_the_middle_of_its_pick_window", async () => {
+  // Reveals that close at the middle of the window itself are waited for; one nanosecond later,
+  // they are not.
+  const { view, chain } = await postJudged([["alice.test.near", "42", 10n]]);
+  vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  await postSharing(view, "9", PICK_WINDOW_MIDDLE_NS);
+
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: WAITING_FOR_9 });
+
+  await db.query("update tasks set reveal_deadline = $1 where id = 9", [
+    PICK_WINDOW_MIDDLE_NS + 1n,
+  ]);
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("picked");
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: null });
+});
+
+test("judge_does_not_wait_once_its_heldout_checks_are_public", async () => {
+  // The re-review's probe E: a pick that failed has published the checks already, so a sharing
+  // task that closes its reveals in time is not waited for: there is nothing left to keep.
+  const { view, chain, commitment } = await postJudged([["alice.test.near", "42", 10n]]);
+  await postSharing(view, "9", NOW_NS + 4n * MINUTE_NS);
+  await setBlobPublic(db, commitment, true);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("picked");
+  expect(warn).not.toHaveBeenCalled();
 });
 
 test("a_scorer_that_cannot_start_is_retried_next_tick", async () => {
@@ -809,20 +861,24 @@ test("fetch_follows_at_most_three_redirects_and_checks_each", async () => {
 test("fetch_tries_the_next_checked_address_when_one_cannot_be_reached", async () => {
   // A host with an IPv6 and an IPv4 address, whose IPv6 cannot be reached from here: the request
   // goes to the IPv4 one next, with the same Host. A status is an answer, and no other address is
-  // asked. When none can be reached, the fetch fails.
+  // asked. One address of each family is tried, however many the name has, and when neither can
+  // be reached, the fetch fails.
   const v6 = "2606:4700:4700::1111";
+  const otherV6 = "2606:4700:4700::1001";
   const { io, requests } = fakeNetwork(
     {
       "dual.example": [v6, PUBLIC_IP],
       "busy.example": [OTHER_PUBLIC_IP, PUBLIC_IP],
       "dark.example": ["8.8.8.8", "1.1.1.1"],
+      "many.example": [v6, otherV6, "8.8.8.8", "1.1.1.1", "9.9.9.9"],
     },
     {
       "dual.example/a": ok("42"),
       "busy.example/a": () => new Response("busy", { status: 503 }),
       "dark.example/a": ok("42"),
+      "many.example/a": ok("42"),
     },
-    [v6, "8.8.8.8", "1.1.1.1"],
+    [v6, otherV6, "8.8.8.8", "1.1.1.1", "9.9.9.9"],
   );
   const deps = judgeDeps(db, fakeChain(null));
 
@@ -842,7 +898,13 @@ test("fetch_tries_the_next_checked_address_when_one_cannot_be_reached", async ()
   expect(await fetchEntryContent(deps, "http://dark.example/a", io)).toEqual({
     error: "fetch failed",
   });
-  expect(requests.map(({ url }) => url)).toEqual(["http://8.8.8.8/a", "http://1.1.1.1/a"]);
+  expect(requests.map(({ url }) => url)).toEqual(["http://8.8.8.8/a"]);
+
+  requests.length = 0;
+  expect(await fetchEntryContent(deps, "http://many.example/a", io)).toEqual({
+    error: "fetch failed",
+  });
+  expect(requests.map(({ url }) => url)).toEqual([`http://[${v6}]/a`, "http://8.8.8.8/a"]);
 });
 
 test("the_default_transport_goes_to_the_address_and_names_the_host", async () => {

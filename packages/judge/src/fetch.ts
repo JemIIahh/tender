@@ -28,8 +28,10 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
  * - Anything else must be an http(s) URL with no login in it. Its host is resolved first, and
  *   every address it resolves to must be a public unicast address (`isPublicAddress`), or it is
  *   `address not allowed`. The request then goes to an address that was checked, not to the name,
- *   so the name cannot be made to point somewhere else in between (DNS rebinding). When one
- *   cannot be reached, the next of them is tried.
+ *   so the name cannot be made to point somewhere else in between (DNS rebinding). The first
+ *   address of each family is tried, at most one IPv6 and one IPv4: when the request to one fails
+ *   with an error, the other is tried. An address that takes the connection and then hangs uses
+ *   up the time limit.
  * - Redirects are followed at most 3 times, and each is resolved and checked like the first
  *   request. The whole of it has 10 s, and the body at most 262_144 bytes: the limits are kept
  *   while the body streams, and a body that is too large is not read to its end.
@@ -111,7 +113,7 @@ async function fetchFrom(
     if (addresses.length === 0) return { error: "host not found" };
     if (!addresses.every(isPublicAddress)) return { error: "address not allowed" };
 
-    const response = await requestFromAny(url, [...new Set(addresses)], io, signal);
+    const response = await requestFromAny(url, onePerFamily(addresses), io, signal);
     if ("error" in response) return response;
 
     if (REDIRECT_STATUSES.has(response.status)) {
@@ -131,6 +133,20 @@ async function fetchFrom(
     }
     return readBody(response, signal);
   }
+}
+
+/**
+ * The first address of each family in `addresses`, in the order they come: one IPv6 and one IPv4
+ * at most. A name can resolve to any number of addresses, and each try is a connection the Judge
+ * makes; one of each family is all the fallback needs.
+ */
+function onePerFamily(addresses: readonly string[]): string[] {
+  const first = new Map<number, string>();
+  for (const address of addresses) {
+    const family = isIP(address);
+    if (!first.has(family)) first.set(family, address);
+  }
+  return [...first.values()];
 }
 
 /**

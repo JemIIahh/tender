@@ -319,6 +319,47 @@ test("intake_rejects_each_rule", async () => {
           },
         }),
     },
+    // The re-review's probe B: an `$id` of "" or "#" names the resource it is in, so the walk goes
+    // on from the root, where `allOf` is an array and `s.type` a string.
+    ...[
+      ['$id "" on the schema with the $ref', { $id: "", $ref: "#/allOf/length" }],
+      ['$id "#" on the schema with the $ref', { $id: "#", $ref: "#/allOf/length" }],
+      ['$id "" on an ancestor', { $id: "", anyOf: [{ $ref: "#/allOf/length" }] }],
+      ['$id "" and a step into a string', { $id: "", $ref: "#/$defs/s/type/length" }],
+    ].map(([rule, total]) => ({
+      rule: String(rule),
+      reason: BUILT_IN_REFERENCE,
+      view: () =>
+        jsonSchemaTask(db, {
+          type: "object",
+          required: ["total"],
+          allOf: [{}],
+          $defs: { s: { type: "string" } },
+          properties: { total: total as object },
+        }),
+    })),
+    {
+      // Data keywords are skipped only as keywords: under `properties` a name is just a name.
+      rule: "a property named default, whose schema is still walked",
+      reason: BUILT_IN_REFERENCE,
+      view: () =>
+        jsonSchemaTask(db, {
+          type: "object",
+          allOf: [{}],
+          properties: { default: { $ref: "#/allOf/length" } },
+        }),
+    },
+    {
+      rule: "a $ref to a resource embedded by its $id",
+      reason: REFERENCE_NOT_A_FRAGMENT,
+      view: () =>
+        jsonSchemaTask(db, {
+          $id: "https://example.com/schemas/order",
+          type: "object",
+          $defs: { addr: { $id: "address", type: "object" } },
+          properties: { shipTo: { $ref: "address" } },
+        }),
+    },
     {
       rule: "a $ref whose fragment cannot be decoded",
       reason: "criteria schema is not supported: a reference cannot be decoded",
@@ -442,6 +483,21 @@ test("intake_accepts_the_p0_kinds", async () => {
         },
       },
       { json_schema: { assertions: [{ path: "$", equals: 43 }] } },
+    ),
+    // What reads like a reference inside data is data: the values of const, enum, examples and
+    // default are no schemas, whatever names they hold.
+    await jsonSchemaTask(
+      db,
+      {
+        type: "object",
+        properties: {
+          link: { const: { $ref: "other.json" } },
+          kind: { enum: [{ $ref: "#/constructor" }] },
+          spec: { type: "object", default: { $ref: "./pet.yaml" } },
+        },
+        examples: [{ spec: { $ref: "./pet.yaml" } }],
+      },
+      { json_schema: { assertions: [{ path: "$", equals: 44 }] } },
     ),
     // regex_cases may go without held-out checks: the published examples are the cases then.
     { criteria_hash: await putCriteria(db, REGEX) },
