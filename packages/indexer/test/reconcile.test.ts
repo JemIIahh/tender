@@ -464,6 +464,64 @@ test("a_stored_outcome_of_the_other_kind_is_replaced_as_if_it_were_missing", asy
   expect(task?.settled_height).toBeNull();
 });
 
+test("a_stale_view_with_fewer_commits_keeps_the_count_and_the_next_entry_its_index", async () => {
+  // Alice committed to task 2 at block 96. A node further behind than the margin answers as of
+  // before that. Counts only grow on chain, so its view is stale: lowered to it, the count would
+  // give the next commit alice's index.
+  await seedLifecycle(db);
+  await apply(created(2, 95));
+  await apply(blockOf(96, [eventLine("committed", { task_id: "2", block_height: "96" })]));
+  await apply(blockOf(96 + SKEW, []));
+  const stale = lifecycleChain({
+    final: 96n,
+    tasks: [TASK_1, openTask(2)],
+    agents: AGENTS.map((agent) => (agent.account === alice ? { ...agent, entries: 2 } : agent)),
+  });
+  const lines: string[] = [];
+
+  expect(await reconcileWith(stale, lines)).toEqual({ inserted: 0, updated: 0 });
+  expect(lines).toEqual([
+    "WARN reconcile task=2 field=commit_count kept: the view is lower, and counts only grow",
+  ]);
+  expect(await taskOf("2")).toMatchObject({ commit_count: 1 });
+
+  // Bob commits next, and takes index 1, after alice's 0.
+  const commit = eventLine("committed", {
+    task_id: "2",
+    account: bob,
+    commitment: BOB_ENTRY.commitment,
+    block_height: "117",
+  });
+  await apply(blockOf(117, [commit]));
+  expect(await taskOf("2")).toMatchObject({ commit_count: 2 });
+  expect((await entriesOf("2")).map((entry) => [entry.account, entry.entry_index])).toEqual([
+    [alice, 0],
+    [bob, 1],
+  ]);
+});
+
+test("an_agent_view_raises_what_it_has_more_of_and_lowers_nothing", async () => {
+  // Ahead of the index on alice's entries, and behind on her win and its earned slot: the entries
+  // are raised, and the rest kept, since every counter and every slot only grows on chain.
+  await seed();
+  const view: AgentView = { ...ALICE, entries: 2, wins: 0, earned: [] };
+  const chain = lifecycleChain({
+    agents: AGENTS.map((agent) => (agent.account === alice ? view : agent)),
+  });
+  const lines: string[] = [];
+
+  expect(await reconcileWith(chain, lines)).toEqual({ inserted: 0, updated: 1 });
+  expect(lines).toEqual([
+    `WARN reconcile agent=${alice} field=entries`,
+    `WARN reconcile agent=${alice} field=wins kept: the view is lower, and counts only grow`,
+    `WARN reconcile agent=${alice} field=earned kept: the view is lower, and counts only grow`,
+  ]);
+  const [row] = await db.query("select entries, wins, earned from agents where account = $1", [
+    alice,
+  ]);
+  expect(row).toEqual({ entries: 2, wins: 1, earned: { [FIXTURE_TOKEN]: "665003" } });
+});
+
 test("an_outcome_is_never_cleared_by_a_view_without_one", async () => {
   // A view from a node further behind than the margin, or of another chain, can lack the outcome.
   // An outcome is final on chain, so such a view is stale: the row keeps its outcome, `by` and all.
@@ -672,14 +730,16 @@ test("only_the_50_newest_tasks_and_the_unsettled_ones_are_compared", async () =>
     tasks.push(openTask(id));
   }
   await apply(blockOf(152 + SKEW, []));
-  await db.query("update tasks set commit_count = 9 where id in (1, 2)");
+  // Each missed a commit that the chain shows.
+  await db.query("update tasks set commit_count = 0 where id = 1");
+  tasks[1] = { ...openTask(2), commit_count: 1 };
   const lines: string[] = [];
 
   const chain = lifecycleChain({ final: 152n, tasks });
   expect(await reconcileWith(chain, lines)).toEqual({ inserted: 0, updated: 1 });
   expect(lines).toEqual(["WARN reconcile task=2 field=commit_count"]);
-  expect(await taskOf("1")).toMatchObject({ commit_count: 9 });
-  expect(await taskOf("2")).toMatchObject({ commit_count: 0 });
+  expect(await taskOf("1")).toMatchObject({ commit_count: 0 });
+  expect(await taskOf("2")).toMatchObject({ commit_count: 1 });
 });
 
 test("a_late_start_fills_in_the_tasks_and_agent_counters_it_never_saw", async () => {

@@ -50,6 +50,10 @@ const SKEW_BLOCKS = 20n;
  */
 const TOO_FAR_BEHIND = 200n;
 
+/** Why a field that differs from its view is kept, as the WARN line says it. */
+const OUTCOME_IS_FINAL = "the view has none, and an outcome is final";
+const COUNTS_ONLY_GROW = "the view is lower, and counts only grow";
+
 /** The fields of an `OutcomeView`, `kind` first: all that a pass compares of an outcome. */
 const OUTCOME_FIELDS = ["kind", "winners", "fee", "scorecard_hash", "scorecard_uri", "reason"];
 /** The counters of an agent row, in the order of the view, which a pass compares. */
@@ -111,8 +115,12 @@ const AGENT_FIELDS = [
  * It never takes an outcome away. An outcome is final on chain, so a view without one, of a task
  * whose row has one, is stale: that gets a WARN, and the row stays as it is. Nor does it keep an
  * outcome of the other kind, which cannot be this task's: that one is replaced as if the row had
- * none. Nor does it delete a row: an inserted task's funders and entries are written over from the
- * views, and any the views lack (`cleanup` removes entries from the chain) are kept.
+ * none. Nor does it lower a count (P03-R21): `commit_count`, `reveal_count` and every counter of an
+ * agent only grow on chain, and so does each slot of `earned`, so a view with less is stale and
+ * gets a WARN, `kept: the view is lower, and counts only grow`; a count the view has more of is
+ * raised. Lowered, a task's count would give its next entry the index of one it has. Nor does it
+ * delete a row: an inserted task's funders and entries are written over from the views, and any
+ * the views lack (`cleanup` removes entries from the chain) are kept.
  *
  * A task that the index holds and the chain does not, and that has no event after `since`, gets a
  * WARN and is left as it is: the index is then of another chain or contract.
@@ -192,18 +200,19 @@ export async function reconcile(
     const repair = await withIndexLock(db, () => repairTask(db, id, view, since));
     if (repair.fields.length > 0) result.updated += 1;
     for (const field of repair.fields) log(`WARN reconcile task=${id} field=${field}`);
-    if (repair.staleOutcome) {
-      log(
-        `WARN reconcile task=${id} field=outcome kept: the view has none, and an outcome is final`,
-      );
+    for (const { field, why } of repair.kept) {
+      log(`WARN reconcile task=${id} field=${field} kept: ${why}`);
     }
     if (repair.notOnChain) log(`WARN reconcile task=${id} is not on the chain`);
   }
   if (signal?.aborted) return result;
   const repaired = await withIndexLock(db, () => repairAgents(db, agents, since));
-  for (const { account, fields } of repaired) {
-    result.updated += 1;
+  for (const { account, fields, kept } of repaired) {
+    if (fields.length > 0) result.updated += 1;
     for (const field of fields) log(`WARN reconcile agent=${account} field=${field}`);
+    for (const field of kept) {
+      log(`WARN reconcile agent=${account} field=${field} kept: ${COUNTS_ONLY_GROW}`);
+    }
   }
   return result;
 }
@@ -422,8 +431,8 @@ const isObject = (value: unknown): value is Json =>
 interface TaskRepair {
   /** The fields that differed and were repaired, each as its WARN line names it. */
   fields: string[];
-  /** Whether the row has an outcome that the view lacks, and kept it. */
-  staleOutcome: boolean;
+  /** The fields that differed and were kept, since the view is stale, with why. */
+  kept: Array<{ field: string; why: string }>;
   /** Whether the index holds the task, and the chain has none by its id. */
   notOnChain: boolean;
 }
@@ -434,7 +443,7 @@ interface TaskRepair {
  */
 function repairTask(db: Db, id: bigint, view: TaskView | null, since: bigint): Promise<TaskRepair> {
   return db.tx(async (tx) => {
-    const none: TaskRepair = { fields: [], staleOutcome: false, notOnChain: false };
+    const none: TaskRepair = { fields: [], kept: [], notOnChain: false };
     if (await taskChangedSince(tx, `${id}`, since)) return none;
     if (view === null) {
       const held = await tx.query("select 1 from tasks where id = $1", [id]);
@@ -453,13 +462,22 @@ function repairTask(db: Db, id: bigint, view: TaskView | null, since: bigint): P
     if (row === undefined) return none;
 
     const fields: string[] = [];
-    if (row.commit_count !== view.commit_count) fields.push("commit_count");
-    if (row.reveal_count !== view.reveal_count) fields.push("reveal_count");
+    const kept: TaskRepair["kept"] = [];
+    // Raised, never lowered: a view with fewer is stale (P03-R21).
+    const counts = { commit_count: row.commit_count, reveal_count: row.reveal_count };
+    for (const field of ["commit_count", "reveal_count"] as const) {
+      if (view[field] > row[field]) {
+        fields.push(field);
+        counts[field] = view[field];
+      } else if (view[field] < row[field]) {
+        kept.push({ field, why: COUNTS_ONLY_GROW });
+      }
+    }
     if (fields.length > 0) {
       await tx.query("update tasks set commit_count = $2, reveal_count = $3 where id = $1", [
         view.id,
-        view.commit_count,
-        view.reveal_count,
+        counts.commit_count,
+        counts.reveal_count,
       ]);
     }
 
@@ -471,11 +489,10 @@ function repairTask(db: Db, id: bigint, view: TaskView | null, since: bigint): P
         view.id,
         outcomeFromView(view),
       ]);
-    let staleOutcome = false;
     if (view.outcome === null) {
       // Final on chain: an outcome that the view lacks is the view's to catch up on, not the row's
       // to lose. A JSON null is no outcome, only one that reads as settled.
-      if (stored !== null) staleOutcome = true;
+      if (stored !== null) kept.push({ field: "outcome", why: OUTCOME_IS_FINAL });
       else if (row.has_outcome) {
         fields.push("outcome");
         await storeFromView();
@@ -497,7 +514,7 @@ function repairTask(db: Db, id: bigint, view: TaskView | null, since: bigint): P
         ]);
       }
     }
-    return { fields, staleOutcome, notOnChain: false };
+    return { fields, kept, notOnChain: false };
   });
 }
 
@@ -528,14 +545,15 @@ interface AgentRow {
 }
 
 /**
- * Brings each agent's counters in line with its view, but for an agent that has an event after
- * `since`. Returns the agents repaired, each with the fields that differed.
+ * Brings each agent's counters up to its view, but for an agent that has an event after `since`.
+ * A counter, or a slot of `earned`, is raised where the view has more and kept where it has less
+ * (P03-R21). Returns the agents whose counters differed, each with the fields raised and kept.
  */
 function repairAgents(
   db: Db,
   views: AgentView[],
   since: bigint,
-): Promise<Array<{ account: string; fields: string[] }>> {
+): Promise<Array<{ account: string; fields: string[]; kept: string[] }>> {
   return db.tx(async (tx) => {
     if (views.length === 0) return [];
     const changed = new Set(
@@ -546,7 +564,7 @@ function repairAgents(
         )
       ).map((row) => row.account),
     );
-    const repaired: Array<{ account: string; fields: string[] }> = [];
+    const repaired: Array<{ account: string; fields: string[]; kept: string[] }> = [];
     for (const view of views) {
       if (changed.has(view.account)) continue;
       const [row] = await tx.query<AgentRow>(
@@ -555,28 +573,71 @@ function repairAgents(
         [view.account],
       );
       if (row === undefined) continue;
-      // The view lists one slot per token; the row keeps them as an object of token to amount.
-      const earned = Object.fromEntries(view.earned.map((slot) => [slot.token, slot.amount]));
-      const want = { ...view, earned };
-      const fields = AGENT_FIELDS.filter((field) => !isDeepStrictEqual(row[field], want[field]));
-      if (fields.length === 0) continue;
-      await tx.query(
-        `update agents
-            set entries = $2, reveals = $3, wins = $4, earned = $5, picks_made = $6,
-                voids_after_reveals = $7
-          where account = $1`,
-        [
-          view.account,
-          view.entries,
-          view.reveals,
-          view.wins,
-          JSON.stringify(earned),
-          view.picks_made,
-          view.voids_after_reveals,
-        ],
-      );
-      repaired.push({ account: view.account, fields });
+      const next = { ...row };
+      const fields: string[] = [];
+      const kept: string[] = [];
+      for (const field of AGENT_FIELDS) {
+        if (field === "earned") {
+          const earned = mergeEarned(row.earned, view.earned);
+          if (!isDeepStrictEqual(row.earned, earned.slots)) {
+            fields.push(field);
+            next.earned = earned.slots;
+          }
+          if (earned.lower) kept.push(field);
+        } else if (view[field] > row[field]) {
+          fields.push(field);
+          next[field] = view[field];
+        } else if (view[field] < row[field]) {
+          kept.push(field);
+        }
+      }
+      if (fields.length === 0 && kept.length === 0) continue;
+      if (fields.length > 0) {
+        await tx.query(
+          `update agents
+              set entries = $2, reveals = $3, wins = $4, earned = $5, picks_made = $6,
+                  voids_after_reveals = $7
+            where account = $1`,
+          [
+            view.account,
+            next.entries,
+            next.reveals,
+            next.wins,
+            JSON.stringify(next.earned),
+            next.picks_made,
+            next.voids_after_reveals,
+          ],
+        );
+      }
+      repaired.push({ account: view.account, fields, kept });
     }
     return repaired;
   });
+}
+
+/**
+ * The row's `earned` slots (token to amount) with the view's merged in, each at the larger amount:
+ * on chain a slot only opens, and only grows. `lower` says whether the view lacks a slot of the
+ * row, or has less in one. A row's slot that is not an amount is replaced by the view's.
+ */
+function mergeEarned(
+  row: unknown,
+  view: AgentView["earned"],
+): { slots: Record<string, string>; lower: boolean } {
+  const slots: Record<string, string> = {};
+  if (isObject(row)) {
+    for (const [token, amount] of Object.entries(row)) {
+      if (typeof amount === "string" && /^\d+$/.test(amount)) slots[token] = amount;
+    }
+  }
+  const held = { ...slots };
+  let lower = false;
+  for (const { token, amount } of view) {
+    const have = held[token];
+    if (have === undefined || BigInt(amount) > BigInt(have)) slots[token] = amount;
+    else if (BigInt(amount) < BigInt(have)) lower = true;
+  }
+  const listed = new Set(view.map((slot) => slot.token));
+  if (Object.keys(held).some((token) => !listed.has(token))) lower = true;
+  return { slots, lower };
 }
