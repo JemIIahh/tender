@@ -658,7 +658,7 @@ test("error_bodies_match_the_error_body_schema", async () => {
     signature: "",
     nonce: "not-a-challenge",
     message: "Sign in to Tender",
-    recipient: "tender",
+    recipient: "http://api.test",
   });
   failsWith(refused, 401, "bad_nonce", "a sign-in that is refused");
 
