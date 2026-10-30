@@ -3,6 +3,7 @@ import { receiptsFromTx } from "@tender/client/outcome";
 import type { ReceiptOutcome } from "@tender/shared";
 import { JsonRpcProvider } from "near-api-js";
 import { UnknownBlockError } from "near-api-js/rpc-errors";
+import { IndexerError } from "./errors";
 import type { BlockSource, IndexedBlock } from "./types";
 
 /** The `tx_root` of a chunk without transactions: 32 zero bytes in base58. */
@@ -18,7 +19,7 @@ type NodeBlock = Awaited<ReturnType<JsonRpcProvider["viewBlock"]>>;
  * of it, so a restart from the last block applied reads the run again. That works once a node that
  * is behind has caught up, and fails the same way if the node has pruned the run.
  */
-export class BlocksLostError extends Error {
+export class BlocksLostError extends IndexerError {
   readonly from: bigint;
   readonly to: bigint;
   /** The height of the parent of block `to + 1`, from `from` to `to`. */
@@ -174,7 +175,7 @@ async function indexBlock(
       // A node, or a proxy that drops `wait_until`, may answer before the receipts have run. They
       // would show as failures, and their events be lost for good.
       if (status.final_execution_status !== "FINAL") {
-        throw new Error(
+        throw new IndexerError(
           `the node answered the status of transaction ${tx.hash} as ` +
             `${status.final_execution_status}, not FINAL: its receipts may not have run`,
         );

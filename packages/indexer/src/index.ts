@@ -1,5 +1,6 @@
 // apply.ts also holds what reconcile shares with it, which stays inside the package.
 export { type ApplyOptions, applyBlock } from "./apply";
+export * from "./errors";
 export * from "./neardata";
 export * from "./reconcile";
 export * from "./rpc";
