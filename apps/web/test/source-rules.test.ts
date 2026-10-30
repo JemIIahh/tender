@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 
 // Rules about the web app's source that a reviewer would otherwise have to remember.
@@ -113,4 +113,71 @@ test("no_page_sets_inner_html", () => {
   );
 
   expect(offenders).toEqual([]);
+});
+
+// ---- The dev wallet and the token stay where they belong (06-T3) -------------------------------
+
+const read = (path: string) => readFileSync(join(WEB, path), "utf8");
+
+test("the_dev_wallet_is_imported_by_one_line_of_the_app_and_it_is_behind_the_sandbox_test", () => {
+  // A line that imports the module, as a value: not a comment, not a type.
+  const importers = appSources()
+    .filter((file) => !file.endsWith("lib/devWallet.ts"))
+    .flatMap((file) =>
+      readFileSync(file, "utf8")
+        .split("\n")
+        .filter(
+          (line) =>
+            /["']\.{1,2}\/(?:lib\/)?devWallet["']/.test(line) &&
+            !/^\s*(?:\*|\/\/)/.test(line) &&
+            !/\bimport type\b|typeof import/.test(line),
+        )
+        .map(() => relative(WEB, file)),
+    );
+  expect(importers).toEqual(["lib/wallet.ts"]);
+
+  // Next puts a build's network into the code where `process.env.NEXT_PUBLIC_NETWORK` is spelled
+  // out, and drops the branch that can't run. The import must be in the branch that runs in the
+  // sandbox only; `config.devWallet` is worked out at run time and can't do that.
+  const wallet = read("lib/wallet.ts");
+  const loader = wallet.slice(wallet.indexOf("export function loadDevWallet"));
+  expect(loader).toMatch(
+    /process\.env\.NEXT_PUBLIC_NETWORK !== "sandbox"\s*\?\s*Promise\.resolve\(null\)\s*:/,
+  );
+  // (The type in the signature also says `import("./devWallet")`; the value is after a `?`.)
+  expect(loader.search(/\?\s*import\("\.\/devWallet"\)/)).toBeGreaterThan(
+    loader.indexOf('NEXT_PUBLIC_NETWORK !== "sandbox"'),
+  );
+});
+
+test("the_dev_wallet_key_and_account_are_read_in_one_module_and_only_under_the_sandbox_test", () => {
+  const holders = appSources()
+    .filter((file) => /NEXT_PUBLIC_DEV_WALLET_(?:KEY|ACCOUNT)/.test(readFileSync(file, "utf8")))
+    .map((file) => relative(WEB, file));
+  expect(holders).toEqual(["lib/devWallet.ts"]);
+
+  const dev = read("lib/devWallet.ts");
+  // Two reads, both in the sandbox's branch of a condition Next can settle at build time: a build
+  // for another network holds neither value.
+  expect(dev.match(/process\.env\.NEXT_PUBLIC_DEV_WALLET_(?:KEY|ACCOUNT)/g)).toHaveLength(2);
+  expect(dev).toMatch(
+    /process\.env\.NEXT_PUBLIC_NETWORK === "sandbox"\s*\?\s*\{[^}]*process\.env\.NEXT_PUBLIC_DEV_WALLET_ACCOUNT[^}]*process\.env\.NEXT_PUBLIC_DEV_WALLET_KEY[^}]*\}\s*:\s*\{/,
+  );
+  // And the module makes no wallet for any other network, whatever is in the environment.
+  expect(dev).toMatch(
+    /if \(process\.env\.NEXT_PUBLIC_NETWORK !== "sandbox"\) \{\s*throw new Error/,
+  );
+});
+
+test("the_app_never_writes_to_local_storage_and_the_token_module_never_logs", () => {
+  // Local storage is read by every later visit to the page, and the API token is a secret.
+  const offenders = appSources()
+    .filter((file) => /\blocalStorage\s*[.[]/.test(readFileSync(file, "utf8")))
+    .map((file) => relative(WEB, file));
+  expect(offenders).toEqual([]);
+
+  // The token is signed in for by lib/auth.ts and kept by lib/apiToken.ts: neither logs.
+  for (const file of ["lib/auth.ts", "lib/apiToken.ts"]) {
+    expect(read(file), file).not.toMatch(/\bconsole\./);
+  }
 });

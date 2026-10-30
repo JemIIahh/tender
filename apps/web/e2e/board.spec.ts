@@ -9,6 +9,7 @@ import {
   TASKS,
   TEAM_LABEL,
 } from "./fixtures";
+import { routeWalletManifest } from "./walletStub";
 
 const card = (page: Page, title: string) =>
   page.getByTestId("task-card").filter({ hasText: title });
@@ -34,7 +35,7 @@ const PHONE = { width: 375, height: 812 };
 
 /**
  * The routes to look at on a phone, each with a way to tell that the page has loaded. A later task
- * adds its own: "/agents", "/wallet", "/post" and "/telegram" are not here until they exist.
+ * adds its own: "/agents", "/post" and "/telegram" are not here until they exist.
  */
 const ROUTES: Record<string, (page: Page) => Promise<void>> = {
   "/": (page) => expect(page.getByTestId("task-card")).toHaveCount(TASKS.length),
@@ -42,6 +43,8 @@ const ROUTES: Record<string, (page: Page) => Promise<void>> = {
   "/tasks/2": (page) => expect(page.getByTestId("phase-timeline")).toBeVisible(),
   // A settled one with every part of the page, each as wide as the data can be (fixtures.ts).
   "/tasks/3": (page) => expect(page.getByTestId("recompute")).toBeVisible(),
+  // Signed out: the connected page is looked at on a phone in wallet.spec.ts.
+  "/wallet": (page) => expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible(),
 };
 
 test("phone_width_has_no_horizontal_scroll", async ({ page }) => {
@@ -49,6 +52,7 @@ test("phone_width_has_no_horizontal_scroll", async ({ page }) => {
   // The moment the commit window of task 2 is open, so that its page has a live countdown on it.
   await page.clock.install({ time: new Date(Number((AT.commit - 20n * SECOND) / 1_000_000n)) });
   await routeApi(page);
+  await routeWalletManifest(page);
 
   for (const [route, loaded] of Object.entries(ROUTES)) {
     await page.goto(route);

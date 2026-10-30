@@ -21,6 +21,8 @@ import { agent, detail, entry, revealed, scorecard } from "../test/tasks";
  * instead of reaching a real server.
  */
 export const API_URL = "http://api.test";
+/** The same for the RPC node the browser reads the chain from (walletStub.ts answers for it). */
+export const RPC_URL = "http://rpc.test";
 
 const TEAM = "tender-team.testnet";
 const TEAM_POSTER = `poster.${TEAM}`;
