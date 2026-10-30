@@ -11,6 +11,8 @@
     "properties": {
       "products": {
         "type": "array",
+        "minItems": 9,
+        "maxItems": 9,
         "items": {
           "type": "object",
           "additionalProperties": false,

@@ -311,3 +311,35 @@ describe.each(SLUGS)("seed %s", (slug) => {
     }
   });
 });
+
+test("product_table_extract_fixes_the_product_count", async () => {
+  // The key asserts products[0] to products[8] and excluded_skus, and an assertion cannot see an
+  // extra products[9], so a solver that keeps the discontinued item and puts it last would match
+  // every one of them. The public schema fixes the count to close that.
+  const { criteria, heldout, solution } = load("product-table-extract");
+  if (criteria.kind !== "json_schema" || !("json_schema" in heldout)) {
+    throw new Error("product-table-extract is not a json_schema seed");
+  }
+
+  // The count is the number of products the key asserts, at least and at most.
+  const asserted = heldout.json_schema.assertions.filter(({ path }) =>
+    /^\$\.products\[\d+\]$/.test(path),
+  ).length;
+  const { products } = criteria.schema.properties as { products: Record<string, unknown> };
+  expect({ minItems: products.minItems, maxItems: products.maxItems }).toEqual({
+    minItems: asserted,
+    maxItems: asserted,
+  });
+
+  const discontinued = { sku: "RM-1080", name: 'Laptop sleeve 15"', price_kobo: 1599900, stock: 0 };
+  const answer = JSON.parse(utf8(solution)) as { products: unknown[] };
+  const kept = new TextEncoder().encode(
+    JSON.stringify({ ...answer, products: [...answer.products, discontinued] }),
+  );
+
+  // Without the count, the key alone pays this answer in full. That is what the schema must stop.
+  const keyOnly = scoreJsonSchema({ ...criteria, schema: {} }, heldout.json_schema, kept);
+  expect(keyOnly.score, "the key alone cannot see the extra item").toBe(100);
+  const result = await scoreAnswer(criteria, heldout, kept);
+  expect(result.score, result.reasons.join("; ")).toBeLessThan(criteria.min_score);
+});
