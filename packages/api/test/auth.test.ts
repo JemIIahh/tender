@@ -435,12 +435,14 @@ test("nonce_replay_rejected", async () => {
 
 test("parallel_verifies_issue_one_token", async () => {
   // Both requests pass the signature and key checks before either spends the nonce: they wait
-  // in the lookup until both are there, so the spend is what has to let one of them through.
+  // in the lookup until both are there, so the spend is what has to let one of them through. The
+  // wait ends by itself after 2 s, so that a request that never gets there fails the count below
+  // and does not hang the test.
   let arrived = 0;
   let release: () => void = () => undefined;
   const both = new Promise<void>((resolve) => {
     release = resolve;
-    setTimeout(resolve, 250);
+    setTimeout(resolve, 2_000);
   });
   const client = fakeClient({
     viewAccessKey: async () => {
@@ -460,6 +462,9 @@ test("parallel_verifies_issue_one_token", async () => {
 
   const replies = await Promise.all(bodies.map((body) => post(app, "/v1/auth/verify", body)));
 
+  // Both got as far as the lookup. Had the second been turned away before it, at the read of the
+  // challenge, the answers below would be the same and no race would have been run.
+  expect(arrived).toBe(2);
   expect(replies.map((reply) => reply.status).sort()).toEqual([200, 401]);
   const refused = replies.find((reply) => reply.status === 401);
   expect(refused?.body).toEqual({ error: "bad_nonce", message: REFUSALS.bad_nonce });
@@ -568,6 +573,22 @@ test("every_auth_error_is_a_fixed_401", async () => {
     "a nonce that is not 32 bytes in canonical base64": {
       code: "bad_nonce",
       send: async (ch) => ({ ...(await signChallenge(key, ch, { account })), nonce: "abc" }),
+    },
+    // As long as a nonce is, with one character of it a NUL, which a database cannot store.
+    "a nonce with a NUL in it": {
+      code: "bad_nonce",
+      send: async (ch) => ({
+        ...(await signChallenge(key, ch, { account })),
+        nonce: `${ch.nonce.slice(0, 42)}\u0000=`,
+      }),
+    },
+    // The nonce of a live challenge, with more after it.
+    "a nonce of the wrong length": {
+      code: "bad_nonce",
+      send: async (ch) => ({
+        ...(await signChallenge(key, ch, { account })),
+        nonce: `${ch.nonce}AAAA`,
+      }),
     },
     "another recipient": {
       code: "wrong_recipient",

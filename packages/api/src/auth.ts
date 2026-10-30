@@ -204,8 +204,19 @@ export async function signIn(deps: ApiDeps, request: SignInRequest): Promise<Sig
   return issued;
 }
 
-/** Throws `bad_nonce` unless `nonce` is a challenge that is unused and unexpired. Spends none. */
+/**
+ * A nonce as `createChallenge` writes it: `NONCE_BYTES` (32) bytes in base64, which is 43
+ * characters and a `=`.
+ */
+const NONCE_SHAPE = /^[A-Za-z0-9+/]{43}=$/;
+
+/**
+ * Throws `bad_nonce` unless `nonce` is a challenge that is unused and unexpired. Spends none. The
+ * nonce is the caller's text and is checked for its shape before the database sees it, which
+ * refuses some text (a NUL) with an error that would be a 500: no such nonce was ever issued.
+ */
 async function requireLiveChallenge(deps: ApiDeps, nonce: string): Promise<void> {
+  if (!NONCE_SHAPE.test(nonce)) throw new AuthError("bad_nonce");
   const rows = await deps.db.query(
     "select 1 from auth_challenges where nonce = $1 and not used and expires_at > $2::timestamptz",
     [nonce, isoAt(nowNs(deps))],

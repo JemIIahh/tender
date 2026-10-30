@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import type { Nep413Result } from "@tender/client";
 import {
   type Db,
   getBlob,
@@ -39,7 +40,7 @@ import { getScorecard } from "../queries";
  * What sign-in leaves for a route to read: the account the request is signed in as, and the kind
  * of key it signed in with.
  */
-export type AuthVariables = { account: string; keyKind: "full_access" | "function_call" };
+export type AuthVariables = { account: string; keyKind: Nep413Result["keyKind"] };
 
 /**
  * The middleware that signs a request in: it sets `c.var.account` and `c.var.keyKind`, or answers
