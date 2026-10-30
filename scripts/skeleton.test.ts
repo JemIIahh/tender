@@ -4,13 +4,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { type LocalChain, TenderError } from "@tender/client";
-import { afterEach, expect, test } from "vitest";
+import {
+  type LocalChain,
+  type Signer,
+  startLocalChain,
+  TenderClient,
+  TenderError,
+} from "@tender/client";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { describeFailure, loadTestnetTarget, runSkeleton } from "./skeleton";
 
 // The testnet half of the skeleton cannot run here, so its setup is checked on its own: which keys
 // it asks for, what it reads them into, and how it fails before anything touches the network. The
-// command line's failures are checked here too, since they need no chain.
+// command line's failures are checked here too, since they need no chain, and so is what becomes
+// of a chain when a step fails: a fake one stands in for the node.
+
+// Only `startLocalChain` is replaced, so that a test hands the skeleton a fake chain to start.
+vi.mock("@tender/client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tender/client")>()),
+  startLocalChain: vi.fn(),
+}));
+const start = vi.mocked(startLocalChain);
 
 const run = promisify(execFile);
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -45,6 +59,10 @@ async function rootWith(env: Record<string, string>, deployment?: string): Promi
   }
   return dir;
 }
+
+beforeEach(() => {
+  start.mockReset();
+});
 
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
@@ -132,4 +150,87 @@ test("the_command_line_fails_with_a_message_and_a_non_zero_exit", async () => {
       "skeleton failed: --network must be sandbox or testnet, not mainnet",
     ),
   });
+});
+
+// The chain's lifecycle when a step fails. The fake chain's keys are not keys, so the run fails at
+// once and offline: building the poster's client throws, before any request is made.
+
+const NOT_A_KEY = "not-a-key";
+/** Never contacted. It only has to be a URL, since a client without one fails for that instead. */
+const FAKE_RPC = "http://127.0.0.1:1";
+
+/** A local chain with the given `stop`, whose every role has a private key that is not a key. */
+function fakeChain(stop: LocalChain["stop"]): LocalChain {
+  const signer = (name: string): Signer => ({
+    accountId: `${name}.sandbox`,
+    privateKey: NOT_A_KEY,
+  });
+  return {
+    network: "sandbox",
+    rpcUrl: FAKE_RPC,
+    contractId: "tender.sandbox",
+    tokenId: "usdc.sandbox",
+    accounts: {
+      owner: signer("owner"),
+      treasury: signer("treasury"),
+      judge: signer("judge"),
+      keeper: signer("keeper"),
+      poster: signer("poster"),
+      alice: signer("alice"),
+      bob: signer("bob"),
+      lead: signer("lead"),
+    },
+    stop,
+  };
+}
+
+/**
+ * The error that building a client with the fake chain's keys throws, which is what the run fails
+ * with. Taken from the client itself, so the test does not repeat the wording of its library.
+ */
+function keyError(): Error {
+  try {
+    new TenderClient({
+      network: "sandbox",
+      contractId: "tender.sandbox",
+      rpcUrl: FAKE_RPC,
+      signer: { accountId: "poster.sandbox", privateKey: NOT_A_KEY },
+    });
+  } catch (error) {
+    if (error instanceof Error) return error;
+    throw error;
+  }
+  throw new Error(
+    "a client was built with a private key that is not one, so the run would not fail",
+  );
+}
+
+test("a_failed_run_stops_the_chain_it_started_once", async () => {
+  const stop = vi.fn(() => Promise.resolve());
+  start.mockResolvedValue(fakeChain(stop));
+
+  await expect(runSkeleton({ network: "sandbox" })).rejects.toThrow(keyError());
+
+  expect(start).toHaveBeenCalledTimes(1);
+  expect(stop).toHaveBeenCalledTimes(1);
+});
+
+test("a_failed_run_reports_its_failure_and_not_a_failed_teardown", async () => {
+  const stop = vi.fn(() => Promise.reject(new Error("the node would not stop")));
+  start.mockResolvedValue(fakeChain(stop));
+
+  await expect(runSkeleton({ network: "sandbox" })).rejects.toThrow(keyError());
+
+  expect(stop).toHaveBeenCalledTimes(1);
+});
+
+test("a_failed_run_leaves_a_given_chain_running", async () => {
+  const stop = vi.fn(() => Promise.resolve());
+
+  await expect(runSkeleton({ network: "sandbox", chain: fakeChain(stop) })).rejects.toThrow(
+    keyError(),
+  );
+
+  expect(stop).not.toHaveBeenCalled();
+  expect(start).not.toHaveBeenCalled();
 });
