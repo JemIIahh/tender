@@ -40,9 +40,12 @@ const NS_PER_MS = 1_000_000n;
  * The bot behind the Telegram alerts: it links a chat to a NEAR account and lets the chat watch
  * tags, mute itself and look at its state. It sends nothing on its own; the notifier does that.
  *
- * It works in private chats only. The first message from any other kind of chat gets one refusal,
- * which `tg_sent` remembers across restarts, and everything after it is ignored, so that no group
- * can ever be linked to an account and told about its tasks.
+ * It acts on direct messages only: plain `message` updates from a private chat, sent by the person
+ * on the other end of it. Every other update is dropped without an answer, business updates among
+ * them (their private chat belongs to a business's customer, who never talked to the bot), and so
+ * are edits, channel posts and callback queries. The first message from a group or supergroup gets
+ * one refusal, which `tg_sent` remembers across restarts, and everything after it is ignored, so
+ * that no group can ever be linked to an account and told about its tasks.
  *
  * Every reply is Telegram HTML with link previews off, and everything a person or an account chose
  * goes through `escapeHtml`. A failure in a handler is logged and dropped, because an error that
@@ -73,19 +76,32 @@ export function createBot(deps: BotDeps): Bot {
     }
   });
 
-  // Private chats only. This runs before every command, so no command can act for a group.
+  // The gate, before every command. Only a plain `message` update gets past it, and only from a
+  // private chat that the sender is the other end of. Everything else is dropped without an answer:
+  // - A business update (`business_message`, `edited_business_message`, `business_connection`)
+  //   names a private chat that belongs to a business's customer. The customer never spoke to the
+  //   bot, so no command there may act for that chat, whoever typed it. grammY's `command` filter
+  //   happens not to match those updates; the gate does not leave that to a library default.
+  // - In a private chat the sender and the chat are the same id, so a message from anyone else, or
+  //   from nobody, did not come from the chat.
+  // - Edits, channel posts and callback queries are not commands this bot answers.
+  // Middleware added to the returned bot after this one therefore sees direct messages only.
   bot.use(async (ctx, next) => {
-    const { chat } = ctx;
-    if (chat === undefined || chat.type === "private") return next();
-    // Only a message can be answered. Other updates from a group, such as the bot being added to
-    // it or removed from it, are not.
-    if (ctx.message === undefined && ctx.channelPost === undefined) return;
-    // Record first, then send: at most one refusal per chat, even if two messages arrive at once.
-    const first = await db.query(
-      "insert into tg_sent (chat_id, dedupe_key) values ($1, $2) on conflict do nothing returning chat_id",
-      [chat.id, GROUP_REFUSED],
-    );
-    if (first.length > 0) await answer(ctx, "Tender alerts work in private chats only.");
+    const message = ctx.message;
+    if (message === undefined || ctx.businessConnectionId !== undefined) return;
+    const { chat } = message;
+    if (chat.type !== "private") {
+      // A group or supergroup. Record first, then send: at most one refusal per chat, even if two
+      // messages arrive at once. Nothing else a group says ever reaches a command.
+      const first = await db.query(
+        "insert into tg_sent (chat_id, dedupe_key) values ($1, $2) on conflict do nothing returning chat_id",
+        [chat.id, GROUP_REFUSED],
+      );
+      if (first.length > 0) await answer(ctx, "Tender alerts work in private chats only.");
+      return;
+    }
+    if (message.from?.id !== chat.id) return;
+    return next();
   });
 
   bot.command("start", async (ctx) => {

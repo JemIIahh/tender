@@ -126,20 +126,68 @@ function textOf(text: string) {
   return { text, ...entities };
 }
 
-function messageIn(chat: Chat, text: string): Update {
+/** The kinds of update that hold a message. */
+type MessageUpdate =
+  | "message"
+  | "edited_message"
+  | "channel_post"
+  | "edited_channel_post"
+  | "business_message"
+  | "edited_business_message";
+
+/**
+ * An update of `kind` that holds `text` in `chat`. The sender is the person on the other end of a
+ * private chat, and somebody else in a group, unless `from` says who (`null` for nobody). A
+ * business update names the business connection it came through, a channel post has no sender, and
+ * `extra` adds fields to the message.
+ */
+function updateOf(
+  kind: MessageUpdate,
+  chat: Chat,
+  text: string,
+  {
+    from = chat.type === "private" ? chat.id : 42,
+    extra = {},
+  }: { from?: number | null; extra?: object } = {},
+): Update {
   updateCounter += 1;
-  const from = { id: chat.type === "private" ? chat.id : 42, is_bot: false, first_name: "Ada" };
-  return {
-    update_id: updateCounter,
-    message: { message_id: updateCounter, date: 1_793_250_000, chat, from, ...textOf(text) },
-  } as Update;
+  const sender =
+    from === null || kind.endsWith("channel_post")
+      ? {}
+      : { from: { id: from, is_bot: false, first_name: "Ada" } };
+  const message = {
+    message_id: updateCounter,
+    date: 1_793_250_000,
+    chat,
+    ...sender,
+    ...(kind.includes("business") ? { business_connection_id: "bc-1" } : {}),
+    ...(kind.startsWith("edited") ? { edit_date: 1_793_250_100 } : {}),
+    ...textOf(text),
+    ...extra,
+  };
+  return { update_id: updateCounter, [kind]: message } as Update;
+}
+
+function messageIn(chat: Chat, text: string): Update {
+  return updateOf("message", chat, text);
 }
 
 function channelPostIn(chat: Chat, text: string): Update {
+  return updateOf("channel_post", chat, text);
+}
+
+/** The update Telegram sends when `chat` removes the bot. */
+function kickedFrom(chat: Chat): Update {
   updateCounter += 1;
   return {
     update_id: updateCounter,
-    channel_post: { message_id: updateCounter, date: 1_793_250_000, chat, ...textOf(text) },
+    my_chat_member: {
+      chat,
+      from: { id: 42, is_bot: false, first_name: "Ada" },
+      date: 1_793_250_200,
+      old_chat_member: { status: "member", user: BOT_INFO },
+      new_chat_member: { status: "kicked", user: BOT_INFO, until_date: 0 },
+    },
   } as Update;
 }
 
@@ -162,9 +210,14 @@ function assertTelegramHtml(html: string): void {
 }
 
 function chatOf(update: Update): number {
-  const chat = (update.message ?? update.channel_post)?.chat;
-  if (chat === undefined) throw new Error("this helper only builds messages and channel posts");
-  return chat.id;
+  const message =
+    update.message ??
+    update.edited_message ??
+    update.channel_post ??
+    update.business_message ??
+    update.edited_business_message;
+  if (message === undefined) throw new Error("this update holds no message");
+  return message.chat.id;
 }
 
 /**
@@ -185,6 +238,13 @@ async function deliver(update: Update, via: Bot = bot): Promise<string[]> {
   return made
     .filter((call) => call.payload.chat_id === chat)
     .map((call) => String(call.payload.text));
+}
+
+/** Feeds `update` to the bot and fails if the bot sends anything at all because of it. */
+async function expectIgnored(update: Update, via: Bot = bot): Promise<void> {
+  const before = calls.length;
+  await via.handleUpdate(update);
+  expect(calls.slice(before), `what the bot sent for ${JSON.stringify(update)}`).toEqual([]);
 }
 
 /** What the bot answers to `text` in the private chat `chat`; it must answer exactly once. */
@@ -388,18 +448,14 @@ test("group_chat_refused_once", async () => {
   const toBusy = calls.filter((call) => call.payload.chat_id === busy.id);
   expect(toBusy.map((call) => call.payload.text)).toEqual([PRIVATE_ONLY]);
 
-  // Every other kind of chat gets its own single refusal.
+  // A plain group, the other kind of group, gets its own single refusal.
   const plain = groupChat(-4_001, "group");
   expect(await deliver(messageIn(plain, "/help"))).toEqual([PRIVATE_ONLY]);
   expect(await deliver(messageIn(plain, "/help"))).toEqual([]);
-  const channel = groupChat(-1_001_000_000_002, "channel");
-  expect(await deliver(channelPostIn(channel, "/help"))).toEqual([PRIVATE_ONLY]);
-  expect(await deliver(channelPostIn(channel, "/help"))).toEqual([]);
   expect(await sentKeys(plain.id)).toEqual(["group_refused"]);
-  expect(await sentKeys(channel.id)).toEqual(["group_refused"]);
 
   // Nothing a group said did anything: no link, no watch.
-  for (const chat of [group.id, plain.id, channel.id]) {
+  for (const chat of [group.id, plain.id]) {
     expect(await linkOf(chat)).toBeNull();
     expect(await tagsOf(chat)).toEqual([]);
   }
@@ -409,24 +465,9 @@ test("a_group_update_that_is_not_a_message_gets_no_refusal", async () => {
   // Only a new message can be answered. Edits, and the bot being removed from the group (where a
   // reply would only fail), are ignored and do not use up the group's one refusal.
   const group = groupChat(-1_001_000_000_005, "supergroup");
-  const person = { id: 42, is_bot: false, first_name: "Ada" };
-  const edited = {
-    update_id: ++updateCounter,
-    edited_message: { ...messageIn(group, "/help").message, edit_date: 1_793_250_100 },
-  } as Update;
-  const removed = {
-    update_id: ++updateCounter,
-    my_chat_member: {
-      chat: group,
-      from: person,
-      date: 1_793_250_200,
-      old_chat_member: { status: "member", user: BOT_INFO },
-      new_chat_member: { status: "kicked", user: BOT_INFO, until_date: 0 },
-    },
-  } as Update;
 
-  await bot.handleUpdate(edited);
-  await bot.handleUpdate(removed);
+  await expectIgnored(updateOf("edited_message", group, "/help"));
+  await expectIgnored(kickedFrom(group));
 
   expect(calls.filter((call) => call.payload.chat_id === group.id)).toEqual([]);
   expect(await sentKeys(group.id)).toEqual([]);
@@ -445,6 +486,167 @@ test("a_group_cannot_link_or_spend_a_nonce", async () => {
   // The person it was minted for can still use it in their private chat.
   const chat = newChat();
   expect(await say(chat, "/start nonce-for-group")).toBe(linked("group-target.near"));
+});
+
+// Only a direct message acts. A private chat that turns up in any other kind of update, or in a
+// message whose sender is not the person in that chat, is not a conversation with the bot, so
+// nothing said there changes anything or gets an answer.
+
+test("a_channel_post_is_ignored", async () => {
+  const channel = groupChat(-1_001_000_000_002, "channel");
+
+  for (const text of ["/help", "/start nonce-x", "/watch research", "/stop", "hello"]) {
+    await expectIgnored(channelPostIn(channel, text));
+  }
+
+  // Not even a refusal: a channel is not a chat anyone can link.
+  expect(await sentKeys(channel.id)).toEqual([]);
+  expect(await linkOf(channel.id)).toBeNull();
+  expect(await tagsOf(channel.id)).toEqual([]);
+});
+
+test("business_messages_change_nothing", async () => {
+  // A business account that has connected the bot writes in its customers' private chats, and those
+  // updates name the customer's chat. The customer never spoke to the bot, so no command in such an
+  // update may act for that chat, whoever typed it.
+  const business = 424_242;
+  const customer = newChat();
+  const stranger = newChat();
+  await linkChat(db, customer, "customer.near");
+  await watchTag(db, customer, "alpha");
+  await seedLinkNonce(db, "nonce-business", "business-target.near");
+  const inCustomerChat = privateChat(customer);
+  const inStrangerChat = privateChat(stranger);
+
+  for (const update of [
+    updateOf("business_message", inCustomerChat, "/stop", { from: business }),
+    updateOf("business_message", inCustomerChat, "/stop", { from: customer }),
+    updateOf("business_message", inCustomerChat, "/mute", { from: business }),
+    updateOf("business_message", inCustomerChat, "/watch beta", { from: customer }),
+    updateOf("business_message", inStrangerChat, "/start nonce-business", { from: business }),
+    updateOf("business_message", inStrangerChat, "/start nonce-business", { from: stranger }),
+    updateOf("edited_business_message", inCustomerChat, "/stop", { from: business }),
+    updateOf("edited_business_message", inStrangerChat, "/start nonce-business", {
+      from: business,
+    }),
+  ]) {
+    await expectIgnored(update);
+  }
+
+  expect(await linkOf(customer)).toEqual({ account: "customer.near", muted: false });
+  expect(await tagsOf(customer)).toEqual(["alpha"]);
+  expect(await linkOf(stranger)).toBeNull();
+  expect(await nonceUsed("nonce-business")).toBe(false);
+});
+
+test("a_message_that_names_a_business_connection_is_ignored", async () => {
+  // Telegram sends business messages as `business_message`, never as `message`. If one came as a
+  // message anyway, the connection it names would still make it a chat the bot is not in.
+  const chat = newChat();
+  await linkChat(db, chat, "connected.near");
+  await seedLinkNonce(db, "nonce-connected", "connected-target.near");
+  const other = newChat();
+  const named = { extra: { business_connection_id: "bc-1" } };
+
+  await expectIgnored(updateOf("message", privateChat(chat), "/stop", named));
+  await expectIgnored(updateOf("message", privateChat(other), "/start nonce-connected", named));
+
+  expect(await linkOf(chat)).toEqual({ account: "connected.near", muted: false });
+  expect(await linkOf(other)).toBeNull();
+  expect(await nonceUsed("nonce-connected")).toBe(false);
+});
+
+test("an_edited_command_is_ignored", async () => {
+  const chat = newChat();
+  await linkChat(db, chat, "edit.near");
+  await watchTag(db, chat, "alpha");
+
+  for (const text of ["/stop", "/mute", "/unwatch alpha", "/help"]) {
+    await expectIgnored(updateOf("edited_message", privateChat(chat), text));
+  }
+
+  expect(await linkOf(chat)).toEqual({ account: "edit.near", muted: false });
+  expect(await tagsOf(chat)).toEqual(["alpha"]);
+});
+
+test("a_private_message_not_from_the_chat_is_ignored", async () => {
+  // In a private chat the sender is the person on the other end of it, so their ids are the same.
+  // A message in the chat from somebody else, or from nobody, did not come from the chat.
+  const chat = newChat();
+  const elsewhere = newChat();
+  await linkChat(db, chat, "mismatch.near");
+  await seedLinkNonce(db, "nonce-mismatch", "mismatch-target.near");
+
+  for (const text of ["/stop", "/mute", "/watch alpha", "/status", "/help"]) {
+    await expectIgnored(updateOf("message", privateChat(chat), text, { from: chat + 7 }));
+    await expectIgnored(updateOf("message", privateChat(chat), text, { from: null }));
+  }
+  const start = "/start nonce-mismatch";
+  await expectIgnored(updateOf("message", privateChat(elsewhere), start, { from: elsewhere + 7 }));
+  await expectIgnored(updateOf("message", privateChat(elsewhere), start, { from: null }));
+
+  expect(await linkOf(chat)).toEqual({ account: "mismatch.near", muted: false });
+  expect(await tagsOf(chat)).toEqual([]);
+  expect(await linkOf(elsewhere)).toBeNull();
+  expect(await nonceUsed("nonce-mismatch")).toBe(false);
+  // The same chat, with the sender it should have, is served.
+  expect(await say(chat, "/mute")).toBe(MUTED);
+});
+
+test("only_a_direct_private_message_gets_past_the_gate", async () => {
+  // grammY's `command` filter happens not to match business or edited updates, so the tests above
+  // would pass with no gate at all, and would go on passing if the gate let those updates through.
+  // This one watches the gate itself: a tripwire behind the gate and the commands hears every
+  // update that was neither refused nor taken by a command. Only the one direct message may.
+  const fresh = botOn(db);
+  const reached: number[] = [];
+  fresh.use((ctx) => {
+    reached.push(ctx.update.update_id);
+  });
+  const chat = privateChat(newChat());
+  const person = { id: chat.id, is_bot: false, first_name: "Ada" };
+  const direct = messageIn(chat, "just saying hello");
+  const group = groupChat(-1_001_000_000_006, "supergroup");
+  const channel = groupChat(-1_001_000_000_007, "channel");
+
+  const others: Update[] = [
+    updateOf("message", chat, "hello", { from: chat.id + 7 }),
+    updateOf("message", chat, "hello", { from: null }),
+    updateOf("message", chat, "hello", { extra: { business_connection_id: "bc-1" } }),
+    updateOf("edited_message", chat, "hello"),
+    updateOf("business_message", chat, "hello", { from: 424_242 }),
+    updateOf("edited_business_message", chat, "hello", { from: 424_242 }),
+    updateOf("message", group, "hello"),
+    updateOf("edited_message", group, "hello"),
+    updateOf("channel_post", channel, "hello"),
+    updateOf("edited_channel_post", channel, "hello"),
+    kickedFrom(chat),
+    kickedFrom(group),
+    {
+      update_id: ++updateCounter,
+      callback_query: {
+        id: "cb-1",
+        from: person,
+        chat_instance: "ci-1",
+        data: "stop",
+        message: messageIn(chat, "hello").message,
+      },
+    } as Update,
+    {
+      update_id: ++updateCounter,
+      business_connection: {
+        id: "bc-1",
+        user: { id: 424_242, is_bot: false, first_name: "Biz" },
+        user_chat_id: 424_242,
+        date: 1_793_250_000,
+        is_enabled: true,
+      },
+    } as Update,
+  ];
+
+  for (const update of [direct, ...others]) await fresh.handleUpdate(update);
+
+  expect(reached).toEqual([direct.update_id]);
 });
 
 // Tags.
