@@ -113,9 +113,10 @@ function checkHashes(
 
 /**
  * `reason` made well-formed, or its first 199 code points and `…` when it has more than 200. Only
- * the start of the text is read, however long an agent made it.
+ * the start of the text is read, however long an agent made it. Intake clamps the reasons it
+ * records for a task with it too.
  */
-function clampReason(reason: string): string {
+export function clampReason(reason: string): string {
   // A string has no more code points than UTF-16 units, so this one is short enough as it is.
   if (reason.length <= MAX_REASON_CODE_POINTS) return wellFormed(reason);
 
