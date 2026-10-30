@@ -5,10 +5,15 @@ import { BlockList, isIP } from "node:net";
 import { Readable } from "node:stream";
 import { type Db, getBlob } from "@tender/db";
 import { MAX_RESULT_BYTES } from "@tender/shared";
-import type { FetchIo, JudgeDeps } from "./types";
+import type { FetchIo, JudgeDeps, TransportInit } from "./types";
 
 /** How long fetching an entry from another host may take, every redirect and the body included. */
 const TIMEOUT_MS = 10_000;
+/**
+ * How long connecting to one address may take, TLS included, before the next address is tried.
+ * It counts against `TIMEOUT_MS` like the rest.
+ */
+const CONNECT_TIMEOUT_MS = 3_000;
 /** How many redirects are followed. */
 const MAX_REDIRECTS = 3;
 /** The statuses that send a client to the `Location` of the response. */
@@ -30,8 +35,9 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
  *   `address not allowed`. The request then goes to an address that was checked, not to the name,
  *   so the name cannot be made to point somewhere else in between (DNS rebinding). The first
  *   address of each family is tried, at most one IPv6 and one IPv4: when the request to one fails
- *   with an error, the other is tried. An address that takes the connection and then hangs uses
- *   up the time limit.
+ *   with an error, the other is tried. An address that does not take the connection within 3 s
+ *   (with TLS set up, for https) is given up as failed. One that takes it and then hangs uses up
+ *   the time limit.
  * - Redirects are followed at most 3 times, and each is resolved and checked like the first
  *   request. The whole of it has 10 s, and the body at most 262_144 bytes: the limits are kept
  *   while the body streams, and a body that is too large is not read to its end.
@@ -155,6 +161,10 @@ function onePerFamily(addresses: readonly string[]): string[] {
  * deadline: a request sent to an address gives up the fallback between IPv6 and IPv4 that one
  * sent to a name has, so a host with both whose IPv6 cannot be reached from here still answers. A
  * status is an answer, and no other address is asked.
+ *
+ * Each request has 3 s to connect (`connectSignal`): an address that drops the connection
+ * attempt, as an unreachable one often does, would use up the whole deadline otherwise, and the
+ * next address would never be tried.
  */
 async function requestFromAny(
   url: URL,
@@ -163,15 +173,20 @@ async function requestFromAny(
   signal: AbortSignal,
 ): Promise<Response | { error: string }> {
   for (const address of addresses) {
+    const connect = new AbortController();
+    const timer = setTimeout(() => connect.abort(), CONNECT_TIMEOUT_MS);
     try {
       const request = io.fetchImpl(pinned(url, address), {
         headers: { host: url.host },
         redirect: "manual",
         signal,
+        connectSignal: connect.signal,
       });
       return await beforeAbort(request, signal);
     } catch {
       if (signal.aborted) return { error: "timed out" };
+    } finally {
+      clearTimeout(timer);
     }
   }
   return { error: "fetch failed" };
@@ -359,13 +374,15 @@ const NETWORK: FetchIo = {
  * and nowhere else, whatever the name resolves to by then.
  *
  * Node's own `fetch` cannot do this: it drops a `host` header, and checks a certificate against
- * the address in the URL. Only what `fetchFrom` uses is supported: the headers and the signal. It
- * never follows a redirect, and it asks for the body as it is (`accept-encoding: identity`), so
- * the bytes read are the bytes the server holds and nothing is decompressed past the size cap.
+ * the address in the URL. Only what `fetchFrom` uses is supported: the headers, the signal and
+ * `connectSignal`, which ends the request when it aborts before the connection is made (with TLS
+ * set up, for https). It never follows a redirect, and it asks for the body as it is
+ * (`accept-encoding: identity`), so the bytes read are the bytes the server holds and nothing is
+ * decompressed past the size cap.
  *
  * Exported for its own test; the Judge uses it through the default `FetchIo`.
  */
-export async function pinnedFetch(input: string | URL | Request, init: RequestInit = {}) {
+export async function pinnedFetch(input: string | URL | Request, init: TransportInit = {}) {
   const url = new URL(input instanceof Request ? input.url : input);
   const headers = new Headers(init.headers);
   const host = headers.get("host") ?? url.host;
@@ -385,6 +402,19 @@ export async function pinnedFetch(input: string | URL | Request, init: RequestIn
       // A connection of its own, closed after the response, so none is left open to be reused.
       agent: false,
     });
+    const connect = init.connectSignal;
+    if (connect?.aborted === true) {
+      request.destroy(new Error("connect timed out"));
+    } else if (connect !== undefined) {
+      const giveUp = () => request.destroy(new Error("connect timed out"));
+      const connected = () => connect.removeEventListener("abort", giveUp);
+      connect.addEventListener("abort", giveUp, { once: true });
+      // With an agent of its own, the socket comes before it connects.
+      request.once("socket", (socket) =>
+        socket.once(secure ? "secureConnect" : "connect", connected),
+      );
+      request.once("close", connected);
+    }
     request.on("error", reject);
     request.on("response", (message) => {
       try {

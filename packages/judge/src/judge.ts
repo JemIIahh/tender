@@ -1,24 +1,22 @@
 import { type Db, putBlob, setBlobPublic } from "@tender/db";
-import {
-  type EntryView,
-  type Heldout,
-  phaseOfTaskView,
-  sha256Hex,
-  type TaskView,
-} from "@tender/shared";
+import { type EntryView, phaseOfTaskView, sha256Hex, type TaskView } from "@tender/shared";
 import { fetchEntryContent, ownBlobHash } from "./fetch";
-import { loadDocuments, type P0Criteria } from "./intake";
-import type { HeldoutOf } from "./kinds/common";
-import { scoreExact } from "./kinds/exact";
-import { scoreJsonSchema } from "./kinds/json_schema";
-import { scoreRegexCases } from "./kinds/regex_cases";
+import { loadDocuments } from "./intake";
+import { openTaskScorer, type TaskScorer } from "./isolate";
 import { chooseWinners, rankEntries, type ScoredEntry } from "./rank";
+import { ScorerUnavailableError } from "./score";
 import { buildScorecard } from "./scorecard";
 import type { EntryScore, JudgeDeps } from "./types";
 
+/** How many entries are taken at a time: no more contents than this are held at once. */
+const ENTRIES_PER_BATCH = 32;
 /** How many entries' contents are fetched at once. */
 const FETCHES_AT_ONCE = 8;
+/** The least time judging leaves before the pick deadline: it starts nothing new after that. */
+const MIN_MARGIN_NS = 30n * 1_000_000_000n;
 const NS_PER_MS = 1_000_000n;
+const NOT_SCORED = "not scored before the pick deadline";
+const NOT_UPLOADED = "content unavailable: not uploaded for this task";
 
 /** An entry that has revealed its content's hash and where the content is. */
 type RevealedEntry = EntryView & { content_hash: string; uri: string };
@@ -51,13 +49,16 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  * `content_hash`; one of our own blob URIs counts only when `deps.resultUploaded` says the entrant
  * may use those bytes for this task. One that cannot be fetched or does not count (`content
  * unavailable: …`), or that does not match (`content hash mismatch`), scores 0 and never passes,
- * whatever the pass mark, so it cannot be paid. The rest are scored by `scoreEntry`; a scorer that
- * throws scores that entry 0 (`scoring failed`). Then the entries are ranked, the winners chosen,
- * and the scorecard built from exactly the winners `pick` is sent. The scorecard is stored as a
- * public blob, the held-out checks are made public, and `pick` is called with the scorecard's
- * hash and URI, in that order, so that the pick never points at something that cannot be read. A
- * retry stores the same scorecard again unless the clock moved: its bytes depend on the entries
- * and `generated_at` only.
+ * whatever the pass mark, so it cannot be paid. The rest are scored in a worker of the task's own
+ * (`openTaskScorer`), with at most 5 s for each: an entry whose scoring times out, runs out of
+ * memory or crashes the worker scores 0 with the reason why, and the other entries are scored as
+ * usual. In what order the entries are fetched and scored, and which are left unscored so that
+ * the pick lands before the pick deadline, is `judgeEntries`'s. Then the entries are ranked, the
+ * winners chosen, and the scorecard built from exactly the winners `pick` is sent. The scorecard
+ * is stored as a public blob, the held-out checks are made public, and `pick` is called with the
+ * scorecard's hash and URI, in that order, so that the pick never points at something that cannot
+ * be read. A retry stores the same scorecard again unless the clock moved: its bytes depend on the
+ * entries and `generated_at` only.
  *
  * Database and chain read errors are thrown, for the loop to log; nothing is settled.
  */
@@ -79,6 +80,7 @@ export async function judgeTask(
     teamAccounts: deps.teamAccounts,
     nowNs,
     waitForHeldout: false,
+    compileBudgetMs: deps.scoringLimits?.compileBudgetMs,
   });
   if (!loaded.ok) {
     // P05-R12: criteria that fail the check intake runs, run again now, are refused as intake
@@ -107,26 +109,25 @@ export async function judgeTask(
   if (row.judge_reason?.startsWith(WAITING) === true) await stopWaiting(deps, taskId);
 
   const revealed = (await deps.client.getAllEntries(taskId)).filter(isRevealed);
-  const fetched = await inParallel(revealed, FETCHES_AT_ONCE, async (entry) => ({
-    entry,
-    content: await contentOf(deps, taskId, entry, nowNs),
-  }));
-  const scored: ScoredEntry[] = [];
-  // One entry at a time: the regex sandbox runs on this thread.
-  for (const { entry, content } of fetched) {
-    let score: EntryScore;
-    try {
-      score = await scoreContent(criteria, heldout, content);
-    } catch (error) {
-      return retryLater(taskId, `a scorer could not be run (${describeError(error)})`);
-    }
-    scored.push({
-      account: entry.account,
-      contentHash: entry.content_hash,
-      uri: entry.uri,
-      committedAtBlock: BigInt(entry.committed_at_block),
-      ...score,
-    });
+  const scorer = openTaskScorer(
+    { criteria, heldout },
+    {
+      entryTimeoutMs: deps.scoringLimits?.entryTimeoutMs,
+      onCrash: (error) => {
+        console.warn(
+          `judge: WARN task ${taskId}: scoring an entry failed (${describeError(error)})`,
+        );
+      },
+    },
+  );
+  let scored: ScoredEntry[];
+  try {
+    scored = await judgeEntries(deps, task, revealed, scorer, nowNs);
+  } catch (error) {
+    if (!(error instanceof ScorerUnavailableError)) throw error;
+    return retryLater(taskId, `a scorer could not be run (${describeError(error)})`);
+  } finally {
+    await scorer.close();
   }
 
   const ranked = rankEntries(scored);
@@ -175,108 +176,152 @@ export async function judgeTask(
 }
 
 /**
- * The scorer could not be run at all, such as the regex sandbox when its engine cannot be
- * loaded. That is the Judge's trouble and not the entry's, so the task is judged again on a later
- * tick, and no entry is scored 0 for it.
- */
-export class ScorerUnavailableError extends Error {
-  override name = "ScorerUnavailableError";
-}
-
-/** What `scoreEntry` scores: an entry's content, against the task's checked documents. */
-export interface ScoreInput {
-  criteria: P0Criteria;
-  /** The held-out document as parsed from its bytes, or `null` when the task has none. */
-  heldout: Heldout | null;
-  /** The bytes the entry revealed, already checked against its `content_hash`. */
-  content: Uint8Array;
-}
-
-/**
- * Scores one entry by the kind of its task's criteria. Every scorer the Judge runs is called from
- * here and nowhere else, so that running them apart, in a worker with a hard time limit, is a
- * change to this one function.
+ * The scores of task `task`'s revealed `entries`, one for each, for `judgeTask` to rank.
  *
- * It resolves with the entry's score whatever the content is. It rejects with
- * `ScorerUnavailableError` when the scorer cannot be run at all, and with whatever else a scorer
- * throws, which the caller scores 0 for that entry alone.
+ * The entries are taken in commit order, the earliest committed first (within a block by account,
+ * as the ranking breaks a tie), 32 at a time. A batch's contents are fetched 8 at a time and then
+ * scored one after another by `scorer`, and each is let go once it is scored: no more than 32 are
+ * held at once, and only their scores are kept, so memory stays bounded however many entries the
+ * task has (`max_entries` 0 sets no limit). Entries with the same URI and content hash share one
+ * fetch and one score. Whether an entrant may use one of our own blobs (`resultUploaded`, asked at
+ * the Judge's clock `nowNs`) is asked of each entry all the same: it is the entrant's, not the
+ * content's.
+ *
+ * No fetch and no score starts once the clock reaches the stop line: the pick deadline less the
+ * larger of 30 s and a tenth of the pick window (from the reveal deadline to the pick deadline),
+ * which leaves time for the work in flight and for the pick. The line is drawn from the task's own
+ * deadlines, as P05-R8's wait can leave judging only the second half of the window. An entry not
+ * scored by then scores 0 and does not pass, and the scorecard says why: `not scored before the
+ * pick deadline`.
+ *
+ * It throws what `resultUploaded` and the database throw, and `ScorerUnavailableError`.
  */
-export async function scoreEntry(input: ScoreInput): Promise<EntryScore> {
-  const { criteria: c, heldout, content } = input;
-  switch (c.kind) {
-    case "exact":
-      return scoreExact(c, heldoutPart(heldout, "exact"), content);
-    case "json_schema":
-      return scoreJsonSchema(c, heldoutPart(heldout, "json_schema"), content);
-    case "regex_cases": {
-      const cases = heldout === null ? null : heldoutPart(heldout, "regex_cases");
-      try {
-        return await scoreRegexCases(c, cases, content);
-      } catch (error) {
-        // It rejects only when the sandbox cannot be started.
-        throw new ScorerUnavailableError("the regex sandbox could not be started", {
-          cause: error,
-        });
-      }
+async function judgeEntries(
+  deps: JudgeDeps,
+  task: TaskView,
+  entries: readonly RevealedEntry[],
+  scorer: TaskScorer,
+  nowNs: bigint,
+): Promise<ScoredEntry[]> {
+  const clock = deps.now ?? (() => new Date());
+  const stopLine = stopLineOf(task);
+  const inTime = () => BigInt(clock().getTime()) * NS_PER_MS < stopLine;
+  // The score of each content scored so far, by `contentKey`.
+  const results = new Map<string, EntryScore>();
+  const ordered = entries.toSorted(inCommitOrder);
+  const scored: ScoredEntry[] = [];
+  for (let first = 0; first < ordered.length; first += ENTRIES_PER_BATCH) {
+    const batch = ordered.slice(first, first + ENTRIES_PER_BATCH);
+    const scores = inTime()
+      ? await judgeBatch(deps, BigInt(task.id), batch, scorer, results, inTime, nowNs)
+      : [];
+    batch.forEach((entry, i) => {
+      scored.push({
+        account: entry.account,
+        contentHash: entry.content_hash,
+        uri: entry.uri,
+        committedAtBlock: BigInt(entry.committed_at_block),
+        ...(scores[i] ?? zero(NOT_SCORED)),
+      });
+    });
+  }
+  return scored;
+}
+
+/**
+ * The scores of one batch of entries of task `taskId`, `undefined` for each that was not scored in
+ * time. `results` has the score of each content scored before, and gets those of this batch.
+ */
+async function judgeBatch(
+  deps: JudgeDeps,
+  taskId: bigint,
+  batch: readonly RevealedEntry[],
+  scorer: TaskScorer,
+  results: Map<string, EntryScore>,
+  inTime: () => boolean,
+  nowNs: bigint,
+): Promise<(EntryScore | undefined)[]> {
+  const allowed = await inParallel(batch, FETCHES_AT_ONCE, (entry) =>
+    mayUse(deps, taskId, entry, nowNs),
+  );
+  // The contents that this batch is the first to need, each once.
+  const wanted = new Map<string, RevealedEntry>();
+  batch.forEach((entry, i) => {
+    const key = contentKey(entry);
+    if (allowed[i] === true && !results.has(key) && !wanted.has(key)) wanted.set(key, entry);
+  });
+  const fetched = await inParallel([...wanted], FETCHES_AT_ONCE, async ([key, entry]) => ({
+    key,
+    content: inTime() ? await contentOf(deps, entry) : undefined,
+  }));
+  for (const item of fetched) {
+    if (typeof item.content === "string") results.set(item.key, zero(item.content));
+    else if (item.content !== undefined && inTime()) {
+      results.set(item.key, await scorer.score(item.content));
     }
+    // The score is all that is kept of it.
+    item.content = undefined;
   }
+  return batch.map((entry, i) =>
+    allowed[i] === true ? results.get(contentKey(entry)) : zero(NOT_UPLOADED),
+  );
 }
 
 /**
- * The part of `heldout` for `kind`. Intake checked that the document is of the criteria's kind,
- * and that `exact` and `json_schema` have one, so a missing part is a slip of the Judge's own.
+ * Whether the entrant of `entry`, of task `taskId`, may use what it revealed. Our own store keeps
+ * results private until their task's reveals close, and revealing a hash that is in it does not
+ * make the result yours: one of our own blob URIs counts only for bytes the entrant may use for
+ * this task (`resultUploaded`, at the Judge's clock `nowNs`). That is asked before the store is
+ * read; an upload may be for another task. Any other URI is the entrant's to name.
  */
-function heldoutPart<K extends "exact" | "json_schema" | "regex_cases">(
-  heldout: Heldout | null,
-  kind: K,
-): HeldoutOf<K> {
-  if (heldout === null || !Object.hasOwn(heldout, kind)) {
-    throw new ScorerUnavailableError(`the held-out checks have no ${kind} part`);
-  }
-  return (heldout as unknown as Record<K, HeldoutOf<K>>)[kind];
-}
-
-/**
- * The score of one entry, from its content or from the reason it has none. Content that could not
- * be fetched or checked scores 0 and does not pass. A scorer that throws scores the entry 0; a
- * scorer that cannot run rejects, with `ScorerUnavailableError`.
- */
-async function scoreContent(
-  criteria: P0Criteria,
-  heldout: Heldout | null,
-  content: Uint8Array | string,
-): Promise<EntryScore> {
-  if (typeof content === "string") return { score: 0, passed: false, reasons: [content] };
-  try {
-    return await scoreEntry({ criteria, heldout, content });
-  } catch (error) {
-    if (error instanceof ScorerUnavailableError) throw error;
-    return { score: 0, passed: false, reasons: ["scoring failed"] };
-  }
-}
-
-/**
- * The bytes that `entry` of task `taskId` revealed, or the reason the Judge has none to score.
- * `nowNs` is the Judge's clock, for `resultUploaded`.
- */
-async function contentOf(
+async function mayUse(
   deps: JudgeDeps,
   taskId: bigint,
   entry: RevealedEntry,
   nowNs: bigint,
-): Promise<Uint8Array | string> {
-  // Our own store keeps results private until their task's reveals close. Revealing a hash that
-  // is in it does not make the result yours: only bytes the entrant may use for this task count.
-  // That is asked first, before the store is read; an upload may be for another task.
+): Promise<boolean> {
   const ours = typeof ownBlobHash(deps.publicUrl, entry.uri) === "string";
-  if (ours && !(await deps.resultUploaded(entry.content_hash, taskId, entry.account, nowNs))) {
-    return "content unavailable: not uploaded for this task";
-  }
+  return !ours || (await deps.resultUploaded(entry.content_hash, taskId, entry.account, nowNs));
+}
+
+/** The bytes at `entry`'s URI when they hash to its `content_hash`, or why there are none. */
+async function contentOf(deps: JudgeDeps, entry: RevealedEntry): Promise<Uint8Array | string> {
   const fetched = await fetchEntryContent(deps, entry.uri);
   if ("error" in fetched) return `content unavailable: ${fetched.error}`;
   // The hash of the exact bytes fetched, never of anything parsed from them.
   if (sha256Hex(fetched) !== entry.content_hash) return "content hash mismatch";
   return fetched;
+}
+
+/**
+ * When judging `task` stops starting work, in nanoseconds: the pick deadline less the larger of
+ * 30 s and a tenth of the pick window.
+ */
+function stopLineOf(task: TaskView): bigint {
+  const pick = BigInt(task.pick_deadline);
+  // Bigints, which `Math.max` does not take.
+  let margin = (pick - BigInt(task.reveal_deadline)) / 10n;
+  if (margin < MIN_MARGIN_NS) margin = MIN_MARGIN_NS;
+  return pick - margin;
+}
+
+/** The earlier commit first; in the same block, the smaller account, as `rankEntries` has it. */
+function inCommitOrder(a: RevealedEntry, b: RevealedEntry): number {
+  const blockA = BigInt(a.committed_at_block);
+  const blockB = BigInt(b.committed_at_block);
+  if (blockA !== blockB) return blockA < blockB ? -1 : 1;
+  if (a.account !== b.account) return a.account < b.account ? -1 : 1;
+  return 0;
+}
+
+/** What entries with the same content have in common: the content hash and the URI. */
+function contentKey(entry: RevealedEntry): string {
+  return JSON.stringify([entry.content_hash, entry.uri]);
+}
+
+/** A score of 0 that does not pass, whatever the pass mark: it cannot be paid. */
+function zero(reason: string): EntryScore {
+  return { score: 0, passed: false, reasons: [reason] };
 }
 
 function isRevealed(entry: EntryView): entry is RevealedEntry {

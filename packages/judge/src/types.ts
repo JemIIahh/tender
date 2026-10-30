@@ -40,7 +40,7 @@ export interface JudgeChain {
  * In production leave `JudgeDeps.fetchIo` unset. Passing the global `fetch` as `fetchImpl` breaks
  * every https entry: it drops the `host` header, so the server is not named, and checks the
  * certificate against the address in the URL, which no certificate is for. Every such entry would
- * score 0.
+ * score 0. It ignores `connectSignal` too.
  */
 export interface FetchIo {
   /** Every address `host` resolves to, as text: `93.184.216.34`, `2606:4700::6810:84e5`. */
@@ -50,7 +50,29 @@ export interface FetchIo {
    * Judge has checked, and the `host` header names the server: the request's Host, and for
    * https the name sent to the server and the one its certificate must be for.
    */
-  fetchImpl: typeof fetch;
+  fetchImpl: (input: URL, init: TransportInit) => Promise<Response>;
+}
+
+/** What `FetchIo.fetchImpl` is given with a request: what `fetch` takes, and one signal more. */
+export interface TransportInit extends RequestInit {
+  /**
+   * Aborts when connecting to the address has taken too long: 3 s, while `signal` bounds the
+   * whole fetch. Until the connection is made (for https, until TLS is set up), the transport
+   * gives up when it aborts and rejects, so that the Judge can try the next address. Once it is
+   * made, the transport ignores it.
+   */
+  connectSignal?: AbortSignal;
+}
+
+/**
+ * How long scoring may take (P05-R1), for tests. Leave it unset in production: the defaults are
+ * the Judge's limits.
+ */
+export interface ScoringLimits {
+  /** How long one entry's scoring may take in its worker: 5 s by default. */
+  entryTimeoutMs?: number;
+  /** How long a `json_schema` schema may take to compile and pass its trial run: 2 s by default. */
+  compileBudgetMs?: number;
 }
 
 /** Everything the Judge needs. Nothing in it reads the environment: the caller resolves that. */
@@ -82,4 +104,6 @@ export interface JudgeDeps {
    * is the network, through the Judge's own transport (see `FetchIo`).
    */
   fetchIo?: FetchIo;
+  /** Shorter time limits for scoring, for tests (see `ScoringLimits`). */
+  scoringLimits?: ScoringLimits;
 }

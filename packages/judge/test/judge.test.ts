@@ -1,5 +1,5 @@
-import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
+import { createServer, type ServerResponse } from "node:http";
+import { type AddressInfo, createServer as createNetServer, type Socket } from "node:net";
 import { type TenderClient, TenderError } from "@tender/client";
 import { type Db, getBlob, putBlob, setBlobPublic } from "@tender/db";
 import {
@@ -20,9 +20,7 @@ import {
   judgeTick,
   startJudge,
 } from "../src/index";
-import { scoreExact } from "../src/kinds/exact";
-import { checkJsonSchemaUsable } from "../src/kinds/json_schema";
-import { runInSandbox } from "../src/sandbox";
+import { checkJsonSchemaIsolated, openTaskScorer, type TaskScorer } from "../src/isolate";
 import {
   at,
   blobUri,
@@ -46,19 +44,43 @@ import {
   testDb,
 } from "./helpers";
 
-// The real sandbox and the real exact scorer run unless a test queues something else for them.
-vi.mock("../src/sandbox", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/sandbox")>();
-  return { ...actual, runInSandbox: vi.fn(actual.runInSandbox) };
+// The scorers run in workers, out of reach of a mock in this file. What starts the workers is
+// real unless a test queues something else for it: a worker that misbehaves on cue, one that
+// cannot be loaded, or a scorer that also moves the clock.
+vi.mock("../src/isolate", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/isolate")>();
+  return {
+    ...actual,
+    openTaskScorer: vi.fn(actual.openTaskScorer),
+    checkJsonSchemaIsolated: vi.fn(actual.checkJsonSchemaIsolated),
+  };
 });
-vi.mock("../src/kinds/exact", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/kinds/exact")>();
-  return { ...actual, scoreExact: vi.fn(actual.scoreExact) };
-});
-vi.mock("../src/kinds/json_schema", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/kinds/json_schema")>();
-  return { ...actual, checkJsonSchemaUsable: vi.fn(actual.checkJsonSchemaUsable) };
-});
+const isolate = await vi.importActual<typeof import("../src/isolate")>("../src/isolate");
+
+/** A worker that misbehaves on cue (see fixtures/rogue-worker.ts), and one that is not there. */
+const ROGUE_WORKER = new URL("./fixtures/rogue-worker.ts", import.meta.url);
+const NO_WORKER = new URL("./fixtures/no-such-worker.ts", import.meta.url);
+
+/** Makes the next task's scorer start its workers from `workerUrl`. */
+function nextScorerFrom(workerUrl: URL) {
+  vi.mocked(openTaskScorer).mockImplementationOnce((task, options) =>
+    isolate.openTaskScorer(task, { ...options, workerUrl }),
+  );
+}
+
+/** Makes the next task's scorer call `each` before it scores an entry. */
+function nextScorerCalls(each: () => void) {
+  vi.mocked(openTaskScorer).mockImplementationOnce((task, options): TaskScorer => {
+    const real = isolate.openTaskScorer(task, options);
+    return {
+      score: (content) => {
+        each();
+        return real.score(content);
+      },
+      close: () => real.close(),
+    };
+  });
+}
 
 const EXACT = {
   version: 1,
@@ -104,16 +126,22 @@ type Answer = [account: string, text: string, block: bigint];
 /**
  * Task 7, accepted at intake and in its judging window at `NOW`: `criteria` and `heldout` (the
  * exact task above unless given) are stored, and so is each answer, as its entrant's result blob.
- * `extra` entries are revealed after them, as they are.
+ * `extra` entries are revealed after them, as they are. `view` changes the task.
  */
 async function postJudged(
   answers: Answer[],
-  o: { criteria?: object; heldout?: object | null; extra?: EntryView[] } = {},
+  o: {
+    criteria?: object;
+    heldout?: object | null;
+    extra?: EntryView[];
+    view?: Partial<TaskView>;
+  } = {},
 ) {
   const heldout = o.heldout === undefined ? HELDOUT : o.heldout;
   const view = taskView({
     criteria_hash: await putCriteria(db, o.criteria ?? EXACT),
     heldout_commitment: heldout === null ? null : await putHeldout(db, heldout),
+    ...o.view,
   });
   await insertTask(db, view, "accepted");
   const entries: EntryView[] = [];
@@ -141,6 +169,10 @@ async function scorecardCount(): Promise<number> {
   const rows = await db.query("select 1 from blobs where kind = 'scorecard'");
   return rows.length;
 }
+
+/** How many workers are running: each shows as a `MessagePort`, which vitest does not use. */
+const workers = (): number =>
+  process.getActiveResourcesInfo().filter((type) => type === "MessagePort").length;
 
 /**
  * A network that exists only in the test. `hosts` says what each name resolves to; `routes`
@@ -528,10 +560,58 @@ test("judge_runs_the_criteria_check_intake_ran_again_before_scoring", async () =
   vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
   const refusal = "criteria schema cannot be compiled: refused at judging time";
-  vi.mocked(checkJsonSchemaUsable).mockReturnValueOnce({ ok: false, reason: refusal });
+  vi.mocked(checkJsonSchemaIsolated).mockResolvedValueOnce({ ok: false, reason: refusal });
   expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("failed_closed");
   expect(await judgeRow(db, 7)).toEqual({ judge_status: "rejected", judge_reason: refusal });
   expect(chain.pick).not.toHaveBeenCalled();
+});
+
+/** A schema near the size cap: it takes a few hundred milliseconds to compile and try. */
+function slowSchema(): Record<string, unknown> {
+  const properties: Record<string, unknown> = {};
+  for (let i = 0; i < 3_000; i++) {
+    properties[`p${i}`] = { type: "string", pattern: "^[a-z]{1,8}$", maxLength: 8 };
+  }
+  return { type: "object", properties };
+}
+
+test("a_schema_that_compiles_past_the_budget_is_rejected_at_intake_and_at_judging", {
+  timeout: 60_000,
+}, async () => {
+  const tooSlow = "criteria schema is not supported: it takes too long to compile";
+  const criteriaHash = await putCriteria(db, jsonSchemaCriteria(slowSchema()));
+  // At intake: compiling and trying it takes longer than the budget, cut to 50 ms here.
+  await insertTask(
+    db,
+    taskView({
+      id: "6",
+      criteria_hash: criteriaHash,
+      heldout_commitment: await putHeldout(db, {
+        json_schema: { assertions: [{ path: "$.p0", equals: "a" }] },
+      }),
+    }),
+  );
+  const short = { scoringLimits: { compileBudgetMs: 50 } };
+  expect(await intakeTask(judgeDeps(db, fakeChain(null), short), 6n)).toBe("rejected");
+  expect(await judgeRow(db, 6)).toEqual({ judge_status: "rejected", judge_reason: tooSlow });
+
+  // At judging (P05-R12): a task accepted under a budget it met is checked again, under the
+  // Judge's budget now, before any entry is read, and refused as intake would refuse it.
+  const view = taskView({
+    criteria_hash: criteriaHash,
+    heldout_commitment: await putHeldout(db, X_IS_1),
+  });
+  await insertTask(db, view);
+  const chain = fakeChain(view, []);
+  const long = { scoringLimits: { compileBudgetMs: 60_000 } };
+  expect(await intakeTask(judgeDeps(db, chain, long), 7n)).toBe("accepted");
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+  expect(await judgeTask(judgeDeps(db, chain, short), 7n)).toBe("failed_closed");
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "rejected", judge_reason: tooSlow });
+  expect(chain.getAllEntries).not.toHaveBeenCalled();
+  expect(chain.pick).not.toHaveBeenCalled();
+  expect(warn).toHaveBeenCalledTimes(1);
 });
 
 test("judge_fails_closed_when_its_heldout_checks_were_used_first", async () => {
@@ -684,34 +764,41 @@ test("judge_does_not_wait_once_its_heldout_checks_are_public", async () => {
 });
 
 test("a_scorer_that_cannot_start_is_retried_next_tick", async () => {
-  const { chain } = await postJudged([["alice.test.near", '{"pattern":"^a$"}', 10n]], {
-    criteria: REGEX,
-    heldout: null,
-  });
+  const { chain } = await postJudged(
+    [
+      ["alice.test.near", '{"pattern":"^a$"}', 10n],
+      ["zed.test.near", "rogue:unavailable", 11n],
+    ],
+    { criteria: REGEX, heldout: null },
+  );
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-  vi.mocked(runInSandbox).mockRejectedValueOnce(new Error("the engine could not be loaded"));
 
-  // The sandbox could not be started: that is the Judge's trouble, so the entry is not scored 0
-  // and nothing is picked.
-  expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
+  // A score worker that cannot be loaded, and a scorer that says it cannot run, as the regex
+  // sandbox does when its engine cannot be loaded (the rogue worker does it for zed's entry).
+  // That is the Judge's trouble, so no entry is scored 0 for it, and nothing is picked.
+  for (const workerUrl of [NO_WORKER, ROGUE_WORKER]) {
+    nextScorerFrom(workerUrl);
+    expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("skipped");
+  }
   expect(chain.pick).not.toHaveBeenCalled();
   expect(await scorecardCount()).toBe(0);
-  expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^judge: WARN task 7: /));
+  const retried =
+    "judge: WARN task 7: a scorer could not be run (ScorerUnavailableError); trying again next tick";
+  expect(warn.mock.calls).toEqual([[retried], [retried]]);
 
-  // The next tick has a sandbox, and judges the task.
+  // The next tick has a worker that runs, and judges the task.
   expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("picked");
   expect((await picked(chain)).winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
 });
 
 test("a_scorer_that_throws_scores_that_entry_zero", async () => {
+  // Alice's entry makes the scorer throw, in the rogue worker; bob's is scored as usual.
   const { chain } = await postJudged([
-    ["alice.test.near", "42", 10n],
+    ["alice.test.near", "rogue:throw", 10n],
     ["bob.test.near", "42", 11n],
   ]);
-  // The first entry scored makes the scorer throw.
-  vi.mocked(scoreExact).mockImplementationOnce(() => {
-    throw new RangeError("Maximum call stack size exceeded");
-  });
+  nextScorerFrom(ROGUE_WORKER);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
   expect(await judgeTask(judgeDeps(db, chain), 7n)).toBe("picked");
 
@@ -720,6 +807,210 @@ test("a_scorer_that_throws_scores_that_entry_zero", async () => {
   expect(card.scorecard.entries.map((e) => [e.account, e.score, e.passed, e.reasons])).toEqual([
     ["bob.test.near", 100, true, []],
     ["alice.test.near", 0, false, ["scoring failed"]],
+  ]);
+  // One line for the crash: the error's name, and nothing of what it says.
+  expect(warn.mock.calls).toEqual([["judge: WARN task 7: scoring an entry failed (TypeError)"]]);
+});
+
+test("an_entry_whose_scoring_times_out_scores_zero_and_the_others_are_scored", {
+  timeout: 60_000,
+}, async () => {
+  // The poster's pattern backtracks without end on mallory's string: V8's regex engine, run by
+  // Ajv in the worker. Mallory's entry has its time (1 s here) and scores 0. That is no trouble
+  // of the task's: the other entries are scored, by a new worker, and the task is picked.
+  const criteria = jsonSchemaCriteria({
+    type: "object",
+    required: ["x"],
+    properties: { x: { type: "integer" }, s: { type: "string", pattern: "^(a+)+$" } },
+  });
+  const { chain } = await postJudged(
+    [
+      ["mallory.test.near", `{"x":1,"s":"${"a".repeat(40)}!"}`, 9n],
+      ["alice.test.near", '{"x":1,"s":"aaaa"}', 10n],
+      ["bob.test.near", '{"x":2}', 11n],
+    ],
+    { criteria, heldout: X_IS_1 },
+  );
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const before = workers();
+
+  const deps = judgeDeps(db, chain, { scoringLimits: { entryTimeoutMs: 1_000 } });
+  expect(await judgeTask(deps, 7n)).toBe("picked");
+
+  const card = await picked(chain);
+  expect(card.winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
+  expect(card.scorecard.entries.map((e) => [e.account, e.score, e.passed, e.reasons])).toEqual([
+    ["alice.test.near", 100, true, []],
+    ["mallory.test.near", 0, false, ["scoring timed out"]],
+    ["bob.test.near", 0, false, ["$.x expected 1"]],
+  ]);
+  expect(warn).not.toHaveBeenCalled();
+  // The task's workers are gone with it.
+  expect(workers()).toBe(before);
+});
+
+test("judge_scores_in_commit_order_until_the_stop_line_and_picks_from_those", async () => {
+  // Ten answers, revealed in entrant order and committed in another. Scoring one moves the
+  // Judge's clock on by 1.5 minutes. The pick window runs from a minute before NOW to 10 minutes
+  // after it, so the stop line is a tenth of it (66 s) before the pick deadline: NOW + 8.9
+  // minutes. Six entries are scored, the six committed first; the right answers committed after
+  // them cannot win, and the scorecard says why.
+  const answers: Answer[] = [
+    ["late1.test.near", "42", 20n],
+    ["early1.test.near", "41", 11n],
+    ["early2.test.near", " 42", 12n],
+    ["late2.test.near", "forty-two", 21n],
+    ["early3.test.near", "40", 13n],
+    ["early4.test.near", "42 ", 14n],
+    ["late3.test.near", " forty-two ", 22n],
+    ["early5.test.near", "\t42", 15n],
+    ["early6.test.near", "39", 16n],
+    ["late4.test.near", "42\n", 23n],
+  ];
+  const { chain } = await postJudged(answers);
+  let minutes = 0;
+  let scores = 0;
+  nextScorerCalls(() => {
+    scores++;
+    minutes += 1.5;
+  });
+
+  const deps = judgeDeps(db, chain, { now: () => at(minutes)() });
+  expect(await judgeTask(deps, 7n)).toBe("picked");
+
+  expect(scores).toBe(6);
+  const card = await picked(chain);
+  expect(card.winners).toEqual([
+    { account: "early2.test.near", bps: 7000 },
+    { account: "early4.test.near", bps: 3000 },
+  ]);
+  const notScored = ["not scored before the pick deadline"];
+  expect(card.scorecard.entries.map((e) => [e.account, e.score, e.passed, e.reasons])).toEqual([
+    ["early2.test.near", 100, true, []],
+    ["early4.test.near", 100, true, []],
+    ["early5.test.near", 100, true, []],
+    ["early1.test.near", 0, false, ["expected one of 2 accepted answers"]],
+    ["early3.test.near", 0, false, ["expected one of 2 accepted answers"]],
+    ["early6.test.near", 0, false, ["expected one of 2 accepted answers"]],
+    ["late1.test.near", 0, false, notScored],
+    ["late2.test.near", 0, false, notScored],
+    ["late3.test.near", 0, false, notScored],
+    ["late4.test.near", 0, false, notScored],
+  ]);
+});
+
+test("the_stop_line_is_drawn_from_the_pick_window", async () => {
+  // A tenth of the pick window before the pick deadline, or 30 s when that is more. A millisecond
+  // before the line the entry is scored; at the line nothing is, and nobody can be paid.
+  const MINUTE_MS = 60_000;
+  const windows = [
+    // From a minute before NOW to 10 minutes after: a tenth is 66 s.
+    { pickMinutes: 10, stopMs: 10 * MINUTE_MS - 66_000 },
+    // To 3 minutes after: a tenth is 24 s, less than 30 s.
+    { pickMinutes: 3, stopMs: 3 * MINUTE_MS - 30_000 },
+  ];
+  for (const { pickMinutes, stopMs } of windows) {
+    for (const [atMs, outcome, scorecard] of [
+      [stopMs - 1, "picked", [100, true, []]],
+      [stopMs, "no_award", [0, false, ["not scored before the pick deadline"]]],
+    ] as const) {
+      await resetDb(db);
+      const pick_deadline = (NOW_NS + BigInt(pickMinutes) * MINUTE_NS).toString();
+      const { chain } = await postJudged([["alice.test.near", "42", 10n]], {
+        view: { pick_deadline },
+      });
+      const deps = judgeDeps(db, chain, { now: () => new Date(NOW.getTime() + atMs) });
+      expect(await judgeTask(deps, 7n), `${pickMinutes} minutes, at ${atMs} ms`).toBe(outcome);
+      const [entry] = (await picked(chain)).scorecard.entries;
+      expect([entry?.score, entry?.passed, entry?.reasons]).toEqual(scorecard);
+    }
+  }
+});
+
+test("entries_with_the_same_uri_and_hash_are_fetched_and_scored_once", async () => {
+  // Two entrants name the same file elsewhere; a third names it by another URI. Two more each
+  // uploaded the same answer here, which is one blob with one URI.
+  const extra = [
+    entry("a.test.near", sha256Hex("42"), "http://files.example/42", 10n),
+    entry("b.test.near", sha256Hex("42"), "http://files.example/42", 11n),
+    entry("c.test.near", sha256Hex("42"), "http://files.example/42?copy", 12n),
+  ];
+  const { chain } = await postJudged(
+    [
+      ["d.test.near", "42", 13n],
+      ["e.test.near", "42", 14n],
+    ],
+    { extra },
+  );
+  const { io, requests } = fakeNetwork(
+    { "files.example": [PUBLIC_IP] },
+    { "files.example/42": ok("42") },
+  );
+  let scores = 0;
+  nextScorerCalls(() => {
+    scores++;
+  });
+  const deps = judgeDeps(db, chain, { fetchIo: io });
+  const resultUploaded = vi.spyOn(deps, "resultUploaded");
+
+  expect(await judgeTask(deps, 7n)).toBe("picked");
+
+  // One fetch and one score for each content; each entrant's upload is looked up all the same.
+  expect(requests.map(({ url }) => url)).toEqual([
+    `http://${PUBLIC_IP}/42`,
+    `http://${PUBLIC_IP}/42?copy`,
+  ]);
+  expect(scores).toBe(3);
+  expect(resultUploaded).toHaveBeenCalledTimes(2);
+  const card = await picked(chain);
+  expect(card.scorecard.entries.map((e) => [e.account, e.score])).toEqual(
+    ["a", "b", "c", "d", "e"].map((name) => [`${name}.test.near`, 100]),
+  );
+  expect(card.winners).toEqual([
+    { account: "a.test.near", bps: 7000 },
+    { account: "b.test.near", bps: 3000 },
+  ]);
+});
+
+test("entries_are_fetched_and_scored_32_at_a_time", { timeout: 30_000 }, async () => {
+  // Seventy entrants, each with a file of its own elsewhere, and two late ones that name the
+  // first entrant's file. A batch is scored before the next one is fetched, so no more than 32
+  // contents are held at once, and the late two share the first one's score.
+  const files = Array.from({ length: 70 }, (_, i) => `${i}`);
+  const extra = files.map((name, i) =>
+    entry(
+      `e${name.padStart(2, "0")}.test.near`,
+      sha256Hex(name),
+      `http://files.example/${name}`,
+      BigInt(100 + i),
+    ),
+  );
+  for (const late of ["late1", "late2"]) {
+    extra.push(entry(`${late}.test.near`, sha256Hex("0"), "http://files.example/0", 200n));
+  }
+  const { chain } = await postJudged([], { extra });
+  const network = fakeNetwork(
+    { "files.example": [PUBLIC_IP] },
+    Object.fromEntries(files.map((name) => [`files.example/${name}`, ok(name)])),
+  );
+  let scored = 0;
+  let mostHeld = 0;
+  nextScorerCalls(() => {
+    mostHeld = Math.max(mostHeld, network.requests.length - scored);
+    scored++;
+  });
+
+  expect(await judgeTask(judgeDeps(db, chain, { fetchIo: network.io }), 7n)).toBe("picked");
+
+  expect(network.requests).toHaveLength(70);
+  expect(scored).toBe(70);
+  expect(mostHeld).toBe(32);
+  const card = await picked(chain);
+  expect(card.winners).toEqual([{ account: "e42.test.near", bps: 10_000 }]);
+  const late = card.scorecard.entries.filter((e) => e.account.startsWith("late"));
+  expect(late.map((e) => [e.account, e.score, e.reasons])).toEqual([
+    ["late1.test.near", 0, ["expected one of 2 accepted answers"]],
+    ["late2.test.near", 0, ["expected one of 2 accepted answers"]],
   ]);
 });
 
@@ -976,6 +1267,90 @@ test("fetch_tries_the_next_checked_address_when_one_cannot_be_reached", async ()
     error: "fetch failed",
   });
   expect(requests.map(({ url }) => url)).toEqual([`http://[${v6}]/a`, "http://8.8.8.8/a"]);
+});
+
+test("fetch_gives_up_on_an_address_that_does_not_connect_and_tries_the_next", async () => {
+  // A host whose IPv6 address never completes the connection, as one that drops the attempt
+  // does. The transport gives up on it when `connectSignal` aborts, 3 s in, and the IPv4 address
+  // answers, well within the 10 s of the whole fetch.
+  const v6 = "2606:4700:4700::1111";
+  const requests: string[] = [];
+  const io: FetchIo = {
+    lookup: async () => [v6, PUBLIC_IP],
+    fetchImpl: (url, init) => {
+      requests.push(url.href);
+      if (url.hostname !== `[${v6}]`) return Promise.resolve(new Response("42"));
+      return new Promise<Response>((_, reject) => {
+        init.connectSignal?.addEventListener("abort", () => reject(new TypeError("fetch failed")));
+      });
+    },
+  };
+  const deps = judgeDeps(db, fakeChain(null));
+
+  vi.useFakeTimers();
+  try {
+    let settled = false;
+    const result = fetchEntryContent(deps, "http://dual.example/a", io).finally(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(settled).toBe(false);
+    expect(requests).toEqual([`http://[${v6}]/a`]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await result).toEqual(bytes("42"));
+    expect(requests).toEqual([`http://[${v6}]/a`, `http://${PUBLIC_IP}/a`]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("the_default_transport_gives_up_on_a_connection_that_is_not_made", async () => {
+  // A server that takes the TCP connection and never says a word, so TLS is never set up: the
+  // request ends when its `connectSignal` aborts, and the connection is closed.
+  const sockets: Socket[] = [];
+  let closed = 0;
+  const silent = createNetServer((socket) => {
+    sockets.push(socket);
+    // It reads what comes, so that it sees the connection end.
+    socket.resume();
+    socket.on("close", () => closed++);
+  });
+  // A server that answers when the test says so.
+  const held: ServerResponse[] = [];
+  const answering = createServer((_request, response) => held.push(response));
+  for (const server of [silent, answering]) {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  }
+  const portOf = (server: { address(): unknown }) => (server.address() as AddressInfo).port;
+  const waitLong = { timeout: 5_000 };
+  try {
+    const connect = new AbortController();
+    const attempt = pinnedFetch(`https://127.0.0.1:${portOf(silent)}/a`, {
+      headers: { host: "judge.invalid" },
+      connectSignal: connect.signal,
+    });
+    await vi.waitFor(() => expect(sockets).toHaveLength(1), waitLong);
+    connect.abort();
+    await expect(attempt).rejects.toThrow();
+    await vi.waitFor(() => expect(closed).toBe(1), waitLong);
+
+    // Once the connection is made, `connectSignal` no longer counts: the request goes on.
+    const late = new AbortController();
+    const answered = pinnedFetch(`http://127.0.0.1:${portOf(answering)}/a`, {
+      headers: { host: "judge.invalid" },
+      connectSignal: late.signal,
+    });
+    await vi.waitFor(() => expect(held).toHaveLength(1), waitLong);
+    late.abort();
+    held[0]?.end("42");
+    expect(await (await answered).text()).toBe("42");
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    answering.closeAllConnections();
+    for (const server of [silent, answering]) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
 });
 
 test("the_default_transport_goes_to_the_address_and_names_the_host", async () => {

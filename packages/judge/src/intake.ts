@@ -9,7 +9,8 @@ import {
   sha256Hex,
   type TaskView,
 } from "@tender/shared";
-import { checkJsonSchemaUsable } from "./kinds/json_schema";
+import { checkJsonSchemaIsolated } from "./isolate";
+import { ScorerUnavailableError } from "./score";
 import { clampReason } from "./scorecard";
 import type { JudgeDeps } from "./types";
 
@@ -50,6 +51,15 @@ interface Stored {
   heldout: StoredBlob | null;
   /** The lowest id of the poster's earlier tasks with the same held-out commitment, or `null`. */
   earlierUse: string | null;
+}
+
+/** What a task's documents are checked by. */
+interface Policy {
+  teamAccounts: readonly string[];
+  nowNs: bigint;
+  waitForHeldout: boolean;
+  /** How long a `json_schema` schema may take to compile and pass its trial run (2 s). */
+  compileBudgetMs?: number;
 }
 
 /** The most bytes a criteria or held-out document may have: what the blob store takes at once. */
@@ -125,7 +135,9 @@ const CHECK_FAILED = "criteria could not be checked";
  * - `exact` or `json_schema` without held-out checks: `held-out checks required for kind {k}`;
  * - a `json_schema` schema with an `$id` below its root, a root `$id` with a fragment, or a
  *   reference other than `#` and one to an entry of its `$defs` or `definitions` (see
- *   `referenceProblem`), or one that `checkJsonSchemaUsable` refuses, with its reason;
+ *   `referenceProblem`), or one that `checkJsonSchemaUsable` refuses, with its reason. That check
+ *   compiles the schema and tries it, in a worker with a budget of 2 s, and a schema that takes
+ *   longer is refused: `criteria schema is not supported: it takes too long to compile`;
  * - a `heldout_commitment` that an earlier task of the same poster (a lower id, of any verifier)
  *   commits to as well: `held-out checks already used by task {id}`, naming the lowest. Held-out
  *   checks are single-use, as judging a task publishes them. Another poster's task with the same
@@ -140,8 +152,10 @@ const CHECK_FAILED = "criteria could not be checked";
  * Held-out checks that are not stored yet leave the task `pending` (`waiting for held-out
  * checks`) for 10 minutes from its `created_at`, and then it is `rejected` (`held-out checks
  * missing`). Anything that throws while the documents are checked, a RangeError included,
- * rejects the task with a fixed reason. A database error is thrown instead: it says nothing about
- * the task, and the next tick tries again. Every reason is at most 200 code points.
+ * rejects the task with a fixed reason, and so does a check that crashes its worker. A database
+ * error is thrown instead, and so is a worker that cannot be started (`ScorerUnavailableError`):
+ * neither says anything about the task, and the next tick tries again. Every reason is at most 200
+ * code points.
  */
 export async function intakeTask(
   deps: JudgeDeps,
@@ -162,6 +176,7 @@ export async function intakeTask(
     teamAccounts: deps.teamAccounts,
     nowNs,
     waitForHeldout: true,
+    compileBudgetMs: deps.scoringLimits?.compileBudgetMs,
   });
   const [status, reason] = checked.ok
     ? (["accepted", null] as const)
@@ -184,13 +199,14 @@ export async function intakeTask(
  * scored: such a result has `criteriaCheck` set.
  *
  * With `waitForHeldout`, held-out checks that are not stored yet make the task `pending` for 10
- * minutes from its `created_at`. Without it they are missing at once. A database error is thrown;
+ * minutes from its `created_at`. Without it they are missing at once. A database error is thrown,
+ * and so is `ScorerUnavailableError` when the worker of the schema check cannot be started;
  * anything else that goes wrong is a `rejected` result with its reason.
  */
 export async function loadDocuments(
   db: Db,
   task: TaskTerms,
-  policy: { teamAccounts: readonly string[]; nowNs: bigint; waitForHeldout: boolean },
+  policy: Policy,
 ): Promise<DocumentsCheck> {
   const stored: Stored = {
     criteria: await getBlob(db, task.criteria_hash),
@@ -202,8 +218,9 @@ export async function loadDocuments(
     stored.earlierUse = await earlierUseOf(db, task.heldout_commitment, task.id, task.poster);
   }
   try {
-    return checkDocuments(task, stored, policy);
-  } catch {
+    return await checkDocuments(task, stored, policy);
+  } catch (error) {
+    if (error instanceof ScorerUnavailableError) throw error;
     // Whatever made a check throw, the task is not judged, and the loop goes on.
     return rejected(CHECK_FAILED);
   }
@@ -229,11 +246,11 @@ async function earlierUseOf(
   return row?.id ?? null;
 }
 
-function checkDocuments(
+async function checkDocuments(
   task: TaskTerms,
   stored: Stored,
-  policy: { teamAccounts: readonly string[]; nowNs: bigint; waitForHeldout: boolean },
-): DocumentsCheck {
+  policy: Policy,
+): Promise<DocumentsCheck> {
   const { criteria: criteriaBlob, heldout: heldoutBlob } = stored;
   // Criteria are public: agents work from them, and anyone checks a scorecard against them. Bytes
   // of any other kind under the hash, or private ones, such as someone's result, are not read:
@@ -261,8 +278,9 @@ function checkDocuments(
   }
   let problem: string | null;
   try {
-    problem = criteriaProblem(criteria);
-  } catch {
+    problem = await criteriaProblem(criteria, policy.compileBudgetMs);
+  } catch (error) {
+    if (error instanceof ScorerUnavailableError) throw error;
     problem = CHECK_FAILED;
   }
   if (problem !== null)
@@ -315,15 +333,21 @@ function rejected(reason: string): DocumentsCheck {
 /**
  * Why the schema of `criteria` cannot be used, or `null`: what it may name and refer to
  * (`referenceProblem`: `$id`, references, dynamic references), and then whether Ajv compiles and
- * runs it (`checkJsonSchemaUsable`). Only `json_schema` criteria have a schema. Intake runs it, and
- * judging runs it again through `loadDocuments` before any entry is scored (P05-R12), so that a
- * task accepted under an older rule is not scored under a check it no longer passes.
+ * runs it (`checkJsonSchemaUsable`), in a worker within `compileBudgetMs` (2 s by default:
+ * `checkJsonSchemaIsolated`). Only `json_schema` criteria have a schema. Intake runs it, and
+ * judging runs it again through `loadDocuments` before any entry is scored, under the same budget
+ * (P05-R12), so that a task accepted under an older rule is not scored under a check it no longer
+ * passes. It rejects when the check crashes its worker, and with `ScorerUnavailableError` when the
+ * worker cannot be started.
  */
-function criteriaProblem(criteria: P0Criteria): string | null {
+async function criteriaProblem(
+  criteria: P0Criteria,
+  compileBudgetMs: number | undefined,
+): Promise<string | null> {
   if (criteria.kind !== "json_schema") return null;
   const reference = referenceProblem(criteria.schema);
   if (reference !== null) return reference;
-  const usable = checkJsonSchemaUsable(criteria.schema);
+  const usable = await checkJsonSchemaIsolated(criteria.schema, { budgetMs: compileBudgetMs });
   return usable.ok ? null : clampReason(usable.reason);
 }
 

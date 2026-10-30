@@ -21,6 +21,8 @@ const TRIAL_DOCUMENTS: unknown[] = [null, true, 0, "", [], {}];
 
 /** What running a schema on one document came to: it fits, it does not (and why), or it threw. */
 type Run = { fits: true } | { fits: false; errors: string[] } | { error: unknown };
+/** A schema compiled, or why it cannot be used. */
+type Compiled = { validate: ValidateFunction } | { reason: string };
 
 /**
  * Scores a `json_schema` entry. The bytes must be valid UTF-8 holding one JSON document that fits
@@ -51,35 +53,52 @@ export function scoreJsonSchema(
   h: JsonSchemaHeldout,
   content: Uint8Array,
 ): EntryScore {
-  const text = decodeUtf8(content);
-  if (text === null) return scored(c, 0, ["not valid UTF-8"]);
+  return jsonSchemaScorer(c, h)(content);
+}
 
-  let document: unknown;
-  try {
-    document = JSON.parse(text);
-  } catch {
-    return scored(c, 0, ["not JSON"]);
-  }
+/**
+ * `scoreJsonSchema` for the entries of one task, scored one after another: the schema is compiled
+ * once, for the first entry that is JSON, and that validator checks every entry after it. A
+ * schema near the size cap takes a few hundred milliseconds to compile. Ajv's validators keep
+ * nothing of one document for the next, so each entry scores as it would on its own.
+ */
+export function jsonSchemaScorer(
+  c: JsonSchemaCriteria,
+  h: JsonSchemaHeldout,
+): (content: Uint8Array) => EntryScore {
+  let compiled: Compiled | undefined;
+  return (content) => {
+    const text = decodeUtf8(content);
+    if (text === null) return scored(c, 0, ["not valid UTF-8"]);
 
-  const schemaErrors = checkSchema(c.schema, document);
-  if (schemaErrors !== null) return scored(c, 0, schemaErrors);
+    let document: unknown;
+    try {
+      document = JSON.parse(text);
+    } catch {
+      return scored(c, 0, ["not JSON"]);
+    }
 
-  const total = h.assertions.length;
-  // The held-out schema asks for one assertion at least. Without one, 100 × 0 / 0 would be NaN.
-  if (total === 0) return scored(c, 0, ["held-out document has no assertions"]);
+    compiled ??= compile(c.schema);
+    const schemaErrors = checkSchema(compiled, document);
+    if (schemaErrors !== null) return scored(c, 0, schemaErrors);
 
-  const failed = h.assertions.filter(({ path, equals }) => {
-    const found = resolve(document, path);
-    return found === MISSING || !deepEqual(found, equals);
-  });
-  const rounded = Math.round((100 * (total - failed.length)) / total);
-  // 100 means that every check passed. With 200 checks or more, one failure would round up to it.
-  const score = failed.length > 0 ? Math.min(rounded, 99) : rounded;
-  return scored(
-    c,
-    score,
-    failed.map(({ path, equals }) => `${path} expected ${JSON.stringify(equals)}`),
-  );
+    const total = h.assertions.length;
+    // The held-out schema asks for one assertion at least. Without one, 100 × 0 / 0 would be NaN.
+    if (total === 0) return scored(c, 0, ["held-out document has no assertions"]);
+
+    const failed = h.assertions.filter(({ path, equals }) => {
+      const found = resolve(document, path);
+      return found === MISSING || !deepEqual(found, equals);
+    });
+    const rounded = Math.round((100 * (total - failed.length)) / total);
+    // 100 means that every check passed. With 200 checks or more, one failure would round up to it.
+    const score = failed.length > 0 ? Math.min(rounded, 99) : rounded;
+    return scored(
+      c,
+      score,
+      failed.map(({ path, equals }) => `${path} expected ${JSON.stringify(equals)}`),
+    );
+  };
 }
 
 /**
@@ -108,9 +127,8 @@ export function checkJsonSchemaUsable(
   return { ok: true };
 }
 
-/** The reasons `document` scores 0 against `schema`, or `null` when it fits. */
-function checkSchema(schema: Record<string, unknown>, document: unknown): string[] | null {
-  const compiled = compile(schema);
+/** The reasons `document` scores 0 against the `compiled` schema, or `null` when it fits. */
+function checkSchema(compiled: Compiled, document: unknown): string[] | null {
   if ("reason" in compiled) return [compiled.reason];
 
   const run = validateOnce(compiled.validate, document);
@@ -126,9 +144,7 @@ function checkSchema(schema: Record<string, unknown>, document: unknown): string
 }
 
 /** `schema` compiled, or why it cannot be used. */
-function compile(
-  schema: Record<string, unknown>,
-): { validate: ValidateFunction } | { reason: string } {
+function compile(schema: Record<string, unknown>): Compiled {
   let validate: ValidateFunction;
   try {
     validate = newAjv().compile(schema);

@@ -1,8 +1,8 @@
 import { type BlobKind, type Db, putBlob } from "@tender/db";
 import { canonicalJson, sha256Hex, type TaskView } from "@tender/shared";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
-import { intakeTask, scoreJsonSchema } from "../src/index";
-import { checkJsonSchemaUsable } from "../src/kinds/json_schema";
+import { intakeTask, ScorerUnavailableError, scoreJsonSchema } from "../src/index";
+import { checkJsonSchemaIsolated } from "../src/isolate";
 import {
   at,
   fakeChain,
@@ -21,10 +21,10 @@ import {
   testDb,
 } from "./helpers";
 
-// The real check runs unless a test makes it throw, with `mockImplementationOnce`.
-vi.mock("../src/kinds/json_schema", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/kinds/json_schema")>();
-  return { ...actual, checkJsonSchemaUsable: vi.fn(actual.checkJsonSchemaUsable) };
+// The real check runs, in its worker, unless a test makes it fail with `mockRejectedValueOnce`.
+vi.mock("../src/isolate", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/isolate")>();
+  return { ...actual, checkJsonSchemaIsolated: vi.fn(actual.checkJsonSchemaIsolated) };
 });
 
 const EXACT = {
@@ -589,7 +589,8 @@ test("intake_rejects_a_schema_that_does_not_compile_with_a_short_reason", async 
   expect([...reason]).toHaveLength(200);
 });
 
-test("intake_accepts_the_p0_kinds", async () => {
+// Each json_schema task here starts a worker for its schema check.
+test("intake_accepts_the_p0_kinds", { timeout: 30_000 }, async () => {
   const accepted: Partial<TaskView>[] = [
     {
       criteria_hash: await putCriteria(db, EXACT),
@@ -882,16 +883,30 @@ test("intake_does_not_reconsider_a_decided_task", async () => {
 });
 
 test("intake_rejects_a_task_whose_check_throws", async () => {
-  // A check that throws, a RangeError from a document nested too deeply say, rejects the task
-  // with a fixed reason instead of stopping intake.
-  vi.mocked(checkJsonSchemaUsable).mockImplementationOnce(() => {
-    throw new RangeError("Maximum call stack size exceeded");
-  });
+  // A check that throws, or crashes its worker (a RangeError from a document nested too deeply,
+  // or an out-of-memory, say), rejects the task with a fixed reason instead of stopping intake.
+  vi.mocked(checkJsonSchemaIsolated).mockRejectedValueOnce(
+    new RangeError("Maximum call stack size exceeded"),
+  );
   expect(await intake(1, await jsonSchemaTask(db, JSON_SCHEMA.schema))).toBe("rejected");
   expect(await judgeRow(db, 1)).toEqual({
     judge_status: "rejected",
     judge_reason: "criteria could not be checked",
   });
+});
+
+test("intake_leaves_a_task_undecided_when_no_check_worker_can_start", async () => {
+  // A worker that cannot be started is the Judge's trouble, like a database that cannot be read:
+  // the task stays undecided, and the next tick tries again.
+  vi.mocked(checkJsonSchemaIsolated).mockRejectedValueOnce(
+    new ScorerUnavailableError("a score worker could not be started"),
+  );
+  await insertTask(db, taskView({ id: "1", ...(await jsonSchemaTask(db, JSON_SCHEMA.schema)) }));
+  await expect(intakeTask(judgeDeps(db, fakeChain(null)), 1n)).rejects.toBeInstanceOf(
+    ScorerUnavailableError,
+  );
+  expect(await judgeRow(db, 1)).toEqual({ judge_status: null, judge_reason: null });
+  expect(await intakeTask(judgeDeps(db, fakeChain(null)), 1n)).toBe("accepted");
 });
 
 test("intake_leaves_a_task_undecided_when_the_database_fails", async () => {
