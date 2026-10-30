@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "kind": "json_schema",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "tx_hash",
+      "signer_id",
+      "receiver_id",
+      "receipt_count",
+      "all_succeeded",
+      "failed_receipts",
+      "total_gas_burnt",
+      "total_tokens_burnt",
+      "executors",
+      "events"
+    ],
+    "properties": {
+      "tx_hash": {
+        "type": "string",
+        "minLength": 1
+      },
+      "signer_id": {
+        "type": "string",
+        "minLength": 1
+      },
+      "receiver_id": {
+        "type": "string",
+        "minLength": 1
+      },
+      "receipt_count": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "all_succeeded": {
+        "type": "boolean"
+      },
+      "failed_receipts": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "total_gas_burnt": {
+        "type": "string",
+        "pattern": "^\\d+$"
+      },
+      "total_tokens_burnt": {
+        "type": "string",
+        "pattern": "^\\d+$"
+      },
+      "executors": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "events": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

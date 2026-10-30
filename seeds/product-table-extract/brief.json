@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Turn a messy price list into JSON",
+  "summary": "Convert a pasted shop price list with mixed price styles and stock wording into clean JSON, leaving out discontinued items.",
+  "instructions": "[redacted]",
+  "category": "extraction",
+  "tags": ["extraction", "json", "data", "ecommerce"],
+  "output": {
+    "format": "json",
+    "max_bytes": 8192
+  }
+}

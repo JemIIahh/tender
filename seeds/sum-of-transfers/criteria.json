@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "kind": "exact",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "normalize": ["trim", "lowercase", "collapse_ws"]
+}

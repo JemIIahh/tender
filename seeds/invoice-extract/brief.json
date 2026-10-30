@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Extract fields from an invoice",
+  "summary": "Read one plain-text invoice and return its number, dates, parties, line items and totals as JSON that fits the published schema.",
+  "instructions": "Read the invoice below and return its details as a JSON object.\n\nFields:\n- invoice_number: the invoice's own number. The customer's purchase-order reference is a different thing.\n- vendor: the company that issued the invoice. customer: the company being billed.\n- issue_date: the invoice date as YYYY-MM-DD. It is not the date of supply.\n- due_date: as YYYY-MM-DD. If the invoice gives payment terms in days instead of a date, count that many days from the invoice date.\n- currency: the three-letter currency code.\n- line_items: one entry per line of the table, in the order shown, each with description, quantity, unit_price and amount.\n- subtotal: the sum of the lines before discount and tax. discount: the amount taken off, as a positive number (0 if there is none). tax: the tax amount. total: the amount due.\n\nWrite every money value as a plain JSON number in major units, such as 1428.5. No currency symbol, no thousands separators.\n\nReply with the JSON object only: no code fences, no explanation before or after it.\n\nHow it is checked: your JSON must fit the published schema. Then each important value in it is compared with a hidden answer key. The score is the share of values that match, and the reward is paid only for a score of 100.\n\n-----BEGIN DATA-----\nHARBOURLINE FREIGHT LTD\n14 Harbour Road, Apapa, Lagos\nVAT reg: NG-00417-22\n\nTAX INVOICE\nInvoice no.:      INV-2026-00417\nYour PO ref:      PO-88123\nInvoice date:     14 March 2026\nDate of supply:   2 March 2026\nPayment terms:    Net 30 days\nBill to:          Northwind Traders\n\nDescription                Qty   Unit price      Amount\nPallet wrapping film        12        19.00      228.00\nContainer handling           3       245.00      735.00\nCold storage (per day)       5        64.20      321.00\nCustoms paperwork            1       150.00      150.00\n\nSubtotal                                       1,434.00\nVolume discount (5%)                             -71.70\nVAT (7.5%)                                       102.17\nTOTAL DUE (USD)                                1,464.47\n\nPay by bank transfer to account 0123456789. Page 1 of 1.\n-----END DATA-----",
+  "category": "extraction",
+  "tags": ["extraction", "json", "invoices"],
+  "output": {
+    "format": "json",
+    "max_bytes": 4096
+  }
+}

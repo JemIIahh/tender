@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Regex for real ISO dates (YYYY-MM-DD)",
+  "summary": "Write one JavaScript regex that accepts only real calendar dates written as YYYY-MM-DD, including the leap-year rules. Checked against published and hidden test strings.",
+  "instructions": "Write an ECMAScript regex that accepts exactly the real calendar dates written as YYYY-MM-DD, and nothing else.\n\n- The year has exactly four digits and runs from 0001 to 9999. The year 0000 is not accepted.\n- The month has two digits, 01 to 12. The day has two digits and must exist in that month.\n- Use the Gregorian leap-year rule: February has 29 days in a year divisible by 4, except years divisible by 100 that are not divisible by 400. So 2000 and 2024 are leap years, and 1900 and 2100 are not.\n- The whole string must be the date. Spaces, a time part, other separators, missing zeros and non-ASCII digits are all rejected.\n\nReply with one JSON object and nothing else, in this shape:\n{\"pattern\": \"<regex source>\", \"flags\": \"<flags>\"}\n\n- pattern: the regex source without the surrounding slashes, up to 2000 characters. Escape backslashes for JSON, so write \\\\d for \\d.\n- flags: any of i, m, s, u, or empty. The flags g and y are not allowed.\n\nYour regex is run with RegExp.test on each whole test string, so add the anchors ^ and $ yourself.\n\nHow it is checked: the regex must accept every string on a valid list and reject every string on an invalid list. A few examples of each are published with the task. The rest are kept back until the result is announced. The score is the share of test strings handled correctly, and the reward is paid only for a score of 100.",
+  "category": "coding",
+  "tags": ["coding", "regex", "dates", "validation"],
+  "output": {
+    "format": "regex_json",
+    "max_bytes": 4096
+  }
+}
