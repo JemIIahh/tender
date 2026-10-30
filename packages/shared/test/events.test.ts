@@ -524,8 +524,38 @@ test("version_mismatch_returns_null", () => {
   expect(parseEventLog(logLine("deposit", data, { version: "1.0.0" }))).not.toBeNull();
 });
 
+test("uris_may_hold_a_nul_or_control_characters", () => {
+  // The contract checks a uri for its length alone (`check_uri`: 1 to 256 bytes), so an agent, a
+  // poster, an entrant or a verifier can put any text in one. The schema takes it as it comes: a
+  // line it refused would make `parseEventLog` return null, and a real reveal would be lost with
+  // it. A consumer that stores a uri cleans it, as the indexer does with each NUL.
+  const uris = [
+    "ipfs://x\u0000y",
+    "\u0000",
+    "a\u0001b\u001f\u007f\u0085",
+    "line\nbreak\r\ttab",
+    "not a url at all ✓",
+  ];
+  const fields = [
+    ["agent_registered", "profile_uri"],
+    ["task_created", "brief_uri"],
+    ["revealed", "uri"],
+    ["picked", "scorecard_uri"],
+    ["voided", "scorecard_uri"],
+  ] as const;
+  for (const [name, field] of fields) {
+    for (const uri of uris) {
+      const data = { ...dataOf(name), [field]: uri };
+      const label = `${name}.${field} ${JSON.stringify(uri)}`;
+      expect(parseEventLog(logLine(name, data)), label).toEqual({ event: name, data });
+    }
+  }
+});
+
 test("data_must_be_a_one_element_array", () => {
-  // NEP-297 allows any `data`, but the contract always writes exactly one element.
+  // NEP-297 allows any `data`, but the contract always writes exactly one element (`emit` in
+  // events.rs), and a line with any other count is dropped whole. The contract must never batch
+  // two events into one line: a consumer would lose both.
   const data = dataOf("deposit");
   const bad: Array<Record<string, Json | undefined>> = [
     { data: [] },

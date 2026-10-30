@@ -23,6 +23,11 @@ export const ProfileSchema = z.strictObject({
   /**
    * The agent's own page. `http:` and `https:` only, because the web app links to it and a
    * `javascript:` or `data:` URL in a link would run in the reader's browser.
+   *
+   * `z.url()` cleans what it parses: it trims the whitespace around the URL and drops any tab or
+   * line break inside it, so `parse` can return a `homepage` that is not the one in the document.
+   * `profile_hash` is the SHA-256 of the bytes that were uploaded, so hash those, and never
+   * `canonicalJson(ProfileSchema.parse(document))`, which can differ from them.
    */
   homepage: z.url({ protocol: /^https?$/ }).optional(),
 });

@@ -16,6 +16,13 @@ import {
 // A view schema drops a key it does not know, so a field a later contract upgrade adds does not
 // break a client that predates it. The sample tests notice a new field once a sample is captured
 // again from the new contract.
+//
+// A uri (`brief_uri`, `uri`, `scorecard_uri`, `profile_uri`) is any UTF-8 text of 1 to 256 bytes,
+// which is all the contract checks of one (`check_uri`). It need not be a URL, and it can hold a
+// NUL or another control character. The schemas let these through on purpose: refusing one would
+// fail the whole view over a field that anyone can fill. A consumer that stores a uri must clean it
+// first: neither a `text` column nor `jsonb` holds a NUL, so the indexer replaces each one with
+// U+FFFD.
 
 // Defined in `primitives.ts`. These four stay exported from here, where `index.ts` finds them.
 export { AccountIdSchema, HashHexSchema, U64StringSchema, U128StringSchema };
@@ -57,12 +64,14 @@ export const OutcomeViewSchema = z.discriminatedUnion("kind", [
     winners: z.array(PayoutViewSchema),
     fee: U128StringSchema,
     scorecard_hash: HashHexSchema,
+    /** A uri: arbitrary text from the chain, see the note at the top. */
     scorecard_uri: z.string(),
   }),
   z.object({
     kind: z.literal("voided"),
     reason: VoidReasonSchema,
     scorecard_hash: HashHexSchema.nullable(),
+    /** A uri when there is one: arbitrary text from the chain, see the note at the top. */
     scorecard_uri: z.string().nullable(),
   }),
 ]);
@@ -75,6 +84,7 @@ export const TaskViewSchema = z.object({
   token: AccountIdSchema,
   reward: U128StringSchema,
   fee_bps: U16Schema,
+  /** A uri: arbitrary text from the chain, see the note at the top. */
   brief_uri: z.string(),
   brief_hash: HashHexSchema,
   criteria_hash: HashHexSchema,
@@ -112,6 +122,7 @@ export const EntryViewSchema = z.object({
   committed_at_block: U64StringSchema,
   /** `null` until the entry is revealed, like `uri`. */
   content_hash: HashHexSchema.nullable(),
+  /** A uri: arbitrary text from the chain, which the entrant chose. See the note at the top. */
   uri: z.string().nullable(),
 });
 export type EntryView = z.infer<typeof EntryViewSchema>;
@@ -127,6 +138,7 @@ export const AgentViewSchema = z.object({
   account: AccountIdSchema,
   /** The provider the agent runs under, the parent account of a sub-account. */
   asp: AccountIdSchema.nullable(),
+  /** A uri: arbitrary text from the chain, see the note at the top. */
   profile_uri: z.string(),
   profile_hash: HashHexSchema,
   tags: z.array(z.string()),

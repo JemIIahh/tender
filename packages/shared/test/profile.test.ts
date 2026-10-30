@@ -170,8 +170,29 @@ test("profile_homepage_must_be_http_or_https", () => {
 });
 
 test("profile_hash_does_not_change_through_the_schema", () => {
-  // The schema adds, drops and rewrites nothing in a document it accepts, so hashing what it
-  // returns gives the hash of what went in.
+  // The schema adds and drops nothing, and rewrites nothing in a document whose homepage has no
+  // whitespace in it, so hashing what it returns gives the hash of what went in. A homepage with
+  // whitespace is the exception, and the next test holds it.
   const parsed = ProfileSchema.parse(profile);
   expect(sha256Hex(canonicalJson(parsed))).toBe(sha256Hex(canonicalJson(profile)));
+});
+
+test("profile_homepage_is_cleaned_by_the_schema_so_the_hash_is_of_the_raw_bytes", () => {
+  // `z.url()` trims the whitespace around a URL and drops a tab or a line break inside it. Such a
+  // profile still parses, but into another document than the one written, so `parse` cannot give
+  // back the bytes that `profile_hash` pins: hash the bytes that were uploaded.
+  const url = "https://regex-ranger.example/agent";
+  for (const homepage of [
+    `${url}\t`,
+    ` ${url}`,
+    `${url}\r\n`,
+    "https://regex-ranger.example/ag\tent",
+  ]) {
+    const written = changed({ homepage });
+    const parsed = ProfileSchema.parse(written);
+    expect(parsed.homepage, JSON.stringify(homepage)).toBe(url);
+    expect(sha256Hex(canonicalJson(parsed)), JSON.stringify(homepage)).not.toBe(
+      sha256Hex(canonicalJson(written)),
+    );
+  }
 });
