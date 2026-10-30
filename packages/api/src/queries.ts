@@ -103,6 +103,7 @@ function summaryColumns(now: string, team: string): string {
     t.reveal_count,
     (select count(*)::int from working w where w.task_id = t.id) as working_count,
     t.judge_status,
+    t.judge_reason,
     (t.poster = any(${team}::text[])
       or exists (select 1 from agents pa where pa.account = t.poster and pa.is_team))
       as is_team_poster,
