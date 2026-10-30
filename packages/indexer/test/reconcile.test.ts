@@ -243,6 +243,75 @@ test("a_missing_task_comes_back_with_its_funders_entries_and_an_outcome_by_nobod
   expect(lines).toEqual(["WARN reconcile task=1 inserted from the chain"]);
 });
 
+test("a_nul_in_a_view_is_stored_as_u_fffd_and_agrees_with_the_chain_after", async () => {
+  // The contract checks a URI's length only, so the views can hand back a NUL, which neither a
+  // text nor a jsonb column takes. Stored as it came, it would fail the insert on every pass.
+  await seedLifecycle(db);
+  await forget(LIFECYCLE_TASK_ID);
+  const withNul = (text: string) => `${text}\u0000`;
+  const outcome = TASK_1.outcome?.kind === "picked" ? TASK_1.outcome : undefined;
+  if (outcome === undefined) throw new Error("task 1 of the samples is not picked");
+  const [aliceEntry, bobEntry] = ENTRIES_1;
+  if (aliceEntry === undefined || bobEntry === undefined) throw new Error("two entries expected");
+  const chain = lifecycleChain({
+    tasks: [
+      {
+        ...TASK_1,
+        brief_uri: withNul(TASK_1.brief_uri),
+        outcome: { ...outcome, scorecard_uri: withNul(outcome.scorecard_uri) },
+      },
+    ],
+    entries: { "1": [{ ...aliceEntry, uri: "ipfs://alice\u0000work" }, bobEntry] },
+  });
+  const lines: string[] = [];
+
+  expect(await reconcileWith(chain, lines)).toEqual({ inserted: 1, updated: 0 });
+  const [entry] = await entriesOf(LIFECYCLE_TASK_ID);
+  expect(entry?.uri).toBe("ipfs://alice\u{fffd}work");
+  const task = await taskOf(LIFECYCLE_TASK_ID);
+  expect(task?.brief_uri).toBe(`${TASK_1.brief_uri}\u{fffd}`);
+  expect(task?.outcome).toMatchObject({ scorecard_uri: `${outcome.scorecard_uri}\u{fffd}` });
+
+  // The next pass compares the chain's NUL with the stored U+FFFD as the same, as applyBlock
+  // stores it, and has nothing to repair.
+  expect(await reconcileWith(chain, lines)).toEqual({ inserted: 0, updated: 0 });
+  expect(lines).toEqual(["WARN reconcile task=1 inserted from the chain"]);
+});
+
+test("a_u32_beyond_an_int_column_is_stored_clamped_and_agrees_with_the_chain_after", async () => {
+  // u32 on chain, int in the index: past 2147483647 the insert would fail on every pass.
+  const U32_MAX = 4_294_967_295;
+  const INT_MAX = 2_147_483_647;
+  await seedLifecycle(db);
+  await forget(LIFECYCLE_TASK_ID);
+  const [aliceEntry, bobEntry] = ENTRIES_1;
+  if (aliceEntry === undefined || bobEntry === undefined) throw new Error("two entries expected");
+  const chain = lifecycleChain({
+    tasks: [{ ...TASK_1, max_entries: U32_MAX, commit_count: U32_MAX }],
+    entries: { "1": [aliceEntry, { ...bobEntry, index: U32_MAX }] },
+    agents: AGENTS.map((agent) => (agent.account === alice ? { ...agent, wins: U32_MAX } : agent)),
+  });
+  const lines: string[] = [];
+
+  expect(await reconcileWith(chain, lines)).toEqual({ inserted: 1, updated: 1 });
+  expect(await taskOf(LIFECYCLE_TASK_ID)).toMatchObject({
+    max_entries: INT_MAX,
+    commit_count: INT_MAX,
+  });
+  expect((await entriesOf(LIFECYCLE_TASK_ID)).map((entry) => entry.entry_index)).toEqual([
+    0,
+    INT_MAX,
+  ]);
+  const [agent] = await db.query("select wins from agents where account = $1", [alice]);
+  expect(agent).toEqual({ wins: INT_MAX });
+
+  expect(await reconcileWith(chain, lines)).toEqual({ inserted: 0, updated: 0 });
+  expect(lines).toEqual([
+    "WARN reconcile task=1 inserted from the chain",
+    `WARN reconcile agent=${alice} field=wins`,
+  ]);
+});
+
 test("a_task_the_chain_does_not_have_is_warned_about_and_kept", async () => {
   await seedLifecycle(db);
   const before = await snapshot();

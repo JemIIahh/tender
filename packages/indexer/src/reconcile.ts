@@ -2,7 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import type { Db } from "@tender/db";
 import type { AgentView, EntryView, NetworkId, OutcomeView, TaskView } from "@tender/shared";
-import { cursorHeight, insertTask, withoutNul } from "./apply";
+import { cursorHeight, insertTask, toInt, withoutNul } from "./apply";
 import { withIndexLock } from "./lock";
 
 /** The reads of the chain that reconcile makes. `TenderClient` has them all. */
@@ -72,6 +72,11 @@ const AGENT_FIELDS = [
  * one no `refunds`, and an inserted task's `created_height` is the final height that the pass read,
  * by which it had been created.
  *
+ * A view is taken as `applyBlock` takes an event, as soon as it is read: a NUL in a string, which
+ * the contract lets into a URI, becomes U+FFFD, and a u32 above what an int column holds becomes
+ * 2147483647. It is compared in that form too, so a row stored that way agrees with the chain, and
+ * no view fails its write, or reads as a mismatch, on every pass.
+ *
  * The views show the chain at its final height, which the index trails. Compared as they come, a
  * commit the index has not reached yet would look missed, and a repair would count it twice once
  * the index applied it. So a pass reads the index's height first, then the views, then waits (up to
@@ -104,20 +109,22 @@ export async function reconcile(
   for (const id of await missingTaskIds(db, await chain.taskCount())) {
     if (signal?.aborted) return result;
     const view = await chain.getTask(id);
-    if (view !== null) missing.push({ view, entries: await chain.getAllEntries(id) });
+    if (view === null) continue;
+    const entries = (await chain.getAllEntries(id)).map(storableEntry);
+    missing.push({ view: storableTask(view), entries });
   }
   const tasks: TaskView[] = [];
   for (const id of await taskIdsToCompare(db)) {
     if (signal?.aborted) return result;
     const view = await chain.getTask(id);
-    if (view !== null) tasks.push(view);
+    if (view !== null) tasks.push(storableTask(view));
     else log(`WARN reconcile task=${id} is not on the chain`);
   }
   const agents: AgentView[] = [];
   for (const account of await recentAgents(db)) {
     if (signal?.aborted) return result;
     const view = await chain.getAgent(account);
-    if (view !== null) agents.push(view);
+    if (view !== null) agents.push(storableAgent(view));
   }
 
   // Every view above shows the chain at this height or below.
@@ -153,6 +160,36 @@ export async function reconcile(
     for (const field of fields) log(`WARN reconcile agent=${account} field=${field}`);
   }
   return result;
+}
+
+/**
+ * `view` as the index stores it (see `reconcile`): no NUL, and its counts clamped to an int.
+ * `max_entries` is clamped by `insertTask`, as for an event.
+ */
+function storableTask(view: TaskView): TaskView {
+  const task = withoutNul(view);
+  return {
+    ...task,
+    commit_count: toInt(task.commit_count),
+    reveal_count: toInt(task.reveal_count),
+  };
+}
+
+function storableEntry(view: EntryView): EntryView {
+  const entry = withoutNul(view);
+  return { ...entry, index: toInt(entry.index) };
+}
+
+function storableAgent(view: AgentView): AgentView {
+  const agent = withoutNul(view);
+  return {
+    ...agent,
+    entries: toInt(agent.entries),
+    reveals: toInt(agent.reveals),
+    wins: toInt(agent.wins),
+    picks_made: toInt(agent.picks_made),
+    voids_after_reveals: toInt(agent.voids_after_reveals),
+  };
 }
 
 /**
@@ -247,7 +284,7 @@ async function taskChangedSince(db: Db, id: string, since: bigint): Promise<bool
 /**
  * Inserts the task of `view`, with `entries`, unless it has an event after `since` (then the
  * runner has inserted it, or it changed while the views were read) or the index holds it. Returns
- * whether it inserted it.
+ * whether it inserted it. The views are storable already (`storableTask`, `storableEntry`).
  */
 function insertMissingTask(
   db: Db,
@@ -258,26 +295,24 @@ function insertMissingTask(
 ): Promise<boolean> {
   return db.tx(async (tx) => {
     if (await taskChangedSince(tx, view.id, since)) return false;
-    // A URI is only length-checked on chain, so a view can hold a NUL, which no column takes.
-    const task = withoutNul(view);
-    if (!(await insertTask(tx, task, createdHeight))) return false;
+    if (!(await insertTask(tx, view, createdHeight))) return false;
     // Rows of a task row that was deleted by hand would be left over: the views are all of it.
-    await tx.query("delete from funders where task_id = $1", [task.id]);
-    await tx.query("delete from entries where task_id = $1", [task.id]);
-    for (const funder of task.funders) {
+    await tx.query("delete from funders where task_id = $1", [view.id]);
+    await tx.query("delete from entries where task_id = $1", [view.id]);
+    for (const funder of view.funders) {
       await tx.query("insert into funders (task_id, account, amount) values ($1, $2, $3)", [
-        task.id,
+        view.id,
         funder.account,
         funder.amount,
       ]);
     }
-    for (const entry of withoutNul(entries)) {
+    for (const entry of entries) {
       await tx.query(
         `insert into entries (task_id, account, entry_index, commitment, committed_height,
                               content_hash, uri)
          values ($1, $2, $3, $4, $5, $6, $7)`,
         [
-          task.id,
+          view.id,
           entry.account,
           entry.index,
           entry.commitment,
@@ -289,7 +324,7 @@ function insertMissingTask(
     }
     await tx.query(
       "update tasks set commit_count = $2, reveal_count = $3, outcome = $4 where id = $1",
-      [task.id, task.commit_count, task.reveal_count, outcomeFromView(task)],
+      [view.id, view.commit_count, view.reveal_count, outcomeFromView(view)],
     );
     return true;
   });

@@ -143,13 +143,19 @@ async function project(
 
 // What the tables cannot hold of what the chain allows, so that no event fails a projection. A
 // failed projection rolls its block back, and the same block fails again on every retry.
+// Reconcile stores the chain's views through the same two helpers, `withoutNul` and `toInt`.
 // - A URI is only length-checked on chain, so it may contain a NUL, which neither text nor jsonb
 //   stores. A brief title or a profile name, read from a blob, may too.
-// - max_entries is a u32 on chain, and the column an int.
+// - max_entries is a u32 on chain, and the column an int. So are the counts of a view.
 const INT_MAX = 2_147_483_647;
 const U128_MAX = (2n ** 128n - 1n).toString();
 /** U+FFFD, the Unicode replacement character. */
 const REPLACEMENT = String.fromCodePoint(0xfffd);
+
+/** A u32 of the chain as an int column holds it: anything above 2147483647 is 2147483647. */
+export function toInt(value: number): number {
+  return Math.min(value, INT_MAX);
+}
 
 /**
  * `value` with every NUL in a string replaced by U+FFFD, in nested arrays and objects as well.
@@ -250,7 +256,7 @@ export async function insertTask(
       d.reveal_deadline,
       d.pick_deadline,
       d.fallback_deadline,
-      Math.min(d.max_entries, INT_MAX),
+      toInt(d.max_entries),
       d.max_winners,
       JSON.stringify(d.invited),
       d.parent,
