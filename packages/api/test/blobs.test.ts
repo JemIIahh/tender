@@ -16,9 +16,9 @@ import { canonicalJson, type PublicCriteria, type Scorecard, sha256Hex } from "@
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { validator } from "hono/validator";
-import { afterAll, beforeAll, beforeEach, expect, test } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { z } from "zod";
-import { handleError } from "../src/format";
+import { handleError, readJson } from "../src/format";
 import {
   type AgentDetailResponse,
   type ApiDeps,
@@ -508,6 +508,9 @@ test("result_upload_requires_entry_403", async () => {
 
 test("scorecard_upload_only_by_verifier_or_poster", async () => {
   const base = await seed();
+  // The reveal window of task 1 has closed, which a scorecard waits for
+  // (scorecard_upload_waits_for_the_reveal_deadline).
+  nowNs = REVEAL_DEADLINE;
   const upload = (document: Scorecard, over = {}) =>
     blobBody("scorecard", canonicalJson(document), over);
 
@@ -557,6 +560,54 @@ test("scorecard_upload_only_by_verifier_or_poster", async () => {
     uploader: judge,
     is_public: true,
   });
+});
+
+test("scorecard_upload_waits_for_the_reveal_deadline", async () => {
+  const base = await seed();
+  const tooEarly = { error: "too_early", message: "the task's reveal window has not closed" };
+  const upload = (document: Scorecard) => blobBody("scorecard", canonicalJson(document));
+  // Task 2 closes its reveals a minute after task 1, and has the same verifier and poster.
+  const later = REVEAL_DEADLINE + 60n * SECOND;
+  await openTask(2, later, [alice]);
+
+  // A nanosecond before the deadline of its task, the verifier and the poster are both told to
+  // wait, and nothing is stored.
+  nowNs = REVEAL_DEADLINE - 1n;
+  for (const account of [judge, poster]) {
+    const early = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("1")), account);
+    expect(early.status, account).toBe(409);
+    expect(early.body, account).toEqual(tooEarly);
+  }
+  expect(await blobCount()).toBe(base);
+
+  // What is wrong in itself, and what the account may not do, are answered as they were: the clock
+  // is looked at last.
+  const pretty = blobBody("scorecard", utf8(JSON.stringify(scorecardOf("1"), null, 2)));
+  const notCanonical = await post<ErrorBody>("/v1/blobs", pretty, judge);
+  expect([notCanonical.status, notCanonical.body.message]).toEqual([400, "not canonical JSON"]);
+  const nameless = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("1")), alice);
+  expect([nameless.status, nameless.body.error]).toEqual([403, "forbidden"]);
+  const unknown = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("77")), judge);
+  expect([unknown.status, unknown.body.error]).toEqual([404, "not_found"]);
+  expect(await blobCount()).toBe(base);
+
+  // The deadline is the moment the window closes, as the contract has it (`now >= reveal_deadline`).
+  nowNs = REVEAL_DEADLINE;
+  expect((await post("/v1/blobs", upload(scorecardOf("1")), judge)).status).toBe(200);
+  nowNs = REVEAL_DEADLINE + 1n;
+  const byPoster = upload(scorecardOf("1", { generated_at: "2026-10-30T11:00:00Z" }));
+  expect((await post("/v1/blobs", byPoster, poster)).status).toBe(200);
+  expect(await blobCount()).toBe(base + 2);
+
+  // Each task has a deadline of its own: task 2 is still open, though task 1 is not.
+  const open = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("2")), judge);
+  expect(open.status).toBe(409);
+  expect(open.body).toEqual(tooEarly);
+  nowNs = later - 1n;
+  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(409);
+  nowNs = later;
+  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(200);
+  expect(await blobCount()).toBe(base + 3);
 });
 
 test("heldout_hash_must_match_commitment", async () => {
@@ -775,6 +826,8 @@ test("uploads_are_refused_without_sign_in", async () => {
 
 test("json_kinds_must_be_canonical", async () => {
   const base = await seed();
+  // The scorecard is for task 1, whose reveal window has closed.
+  nowNs = REVEAL_DEADLINE;
   const documents: Array<[UploadKind, unknown]> = [
     ["brief", FIXTURE_BRIEF],
     ["criteria", CRITERIA],
@@ -827,8 +880,14 @@ test("json_kinds_must_be_canonical", async () => {
   const duplicate = `{"version":1,"version":1,${new TextDecoder().decode(canonicalJson(FIXTURE_BRIEF)).slice(1)}`;
   expect((await post("/v1/blobs", blobBody("brief", utf8(duplicate)), alice)).status).toBe(400);
 
-  // Text that is not UTF-8, or not JSON, is not canonical JSON either.
-  for (const bytes of [new Uint8Array([0xff, 0xfe, 0x7b, 0x7d]), utf8("{"), utf8("")]) {
+  // Text that is not UTF-8, or not JSON, is not canonical JSON either. A surrogate written as three
+  // bytes is not UTF-8.
+  for (const bytes of [
+    new Uint8Array([0xff, 0xfe, 0x7b, 0x7d]),
+    new Uint8Array([0x22, 0xed, 0xa0, 0x80, 0x22]),
+    utf8("{"),
+    utf8(""),
+  ]) {
     const res = await post<ErrorBody>("/v1/blobs", blobBody("brief", bytes), alice);
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: "bad_request", message: "not canonical JSON" });
@@ -846,6 +905,54 @@ test("json_kinds_must_be_canonical", async () => {
       .replace('"max_bytes":4096', '"max_bytes":1e999'),
   );
   expect((await post("/v1/blobs", blobBody("brief", infinite), alice)).status).toBe(400);
+
+  // Spellings of a document that the canonical form does not write that way. `-0` is the number 0.
+  // A lone surrogate can be escaped in JSON but has no UTF-8 form, so the canonical form refuses a
+  // string or a key that holds one (RFC 8785), and no text that spells one is canonical.
+  const textOf = (document: unknown) => new TextDecoder().decode(canonicalJson(document));
+  const spelled: Array<[string, UploadKind, string, string]> = [
+    [
+      "a number written -0",
+      "criteria",
+      textOf({ ...CRITERIA, min_score: 0 }).replace('"min_score":0', '"min_score":-0'),
+      alice,
+    ],
+    [
+      "a lone surrogate in a string",
+      "profile",
+      textOf({ ...FIXTURE_PROFILE, name: "NAME" }).replace("NAME", String.raw`a\ud800b`),
+      alice,
+    ],
+    [
+      "a lone surrogate in a key",
+      "scorecard",
+      textOf(scorecardOf("1", { heldout: { KEY: 1 } })).replace('"KEY"', String.raw`"\udc00"`),
+      judge,
+    ],
+  ];
+  for (const [name, kind, spelling, account] of spelled) {
+    const res = await post<ErrorBody>("/v1/blobs", blobBody(kind, utf8(spelling)), account);
+    expect(res.status, name).toBe(400);
+    expect(res.body, name).toEqual({ error: "bad_request", message: "not canonical JSON" });
+  }
+  // An own `__proto__` key is no key of any document, and the schemas say so before the form is
+  // looked at: this is a fault of the document, not of its spelling.
+  const withProto: Array<[UploadKind, string, string]> = [
+    ["brief", textOf(FIXTURE_BRIEF).replace("{", '{"__proto__":1,'), alice],
+    [
+      "scorecard",
+      textOf(scorecardOf("1", { heldout: { KEY: 1 } })).replace('"KEY"', '"__proto__"'),
+      judge,
+    ],
+  ];
+  for (const [kind, spelling, account] of withProto) {
+    const res = await post<ErrorBody>("/v1/blobs", blobBody(kind, utf8(spelling)), account);
+    expect(res.status, kind).toBe(400);
+    expect(res.body.message, kind).toContain("does not fit its schema");
+    expect(res.body.issues?.length, kind).toBeGreaterThan(0);
+  }
+  // Nothing of the above was stored.
+  expect(await blobCount()).toBe(base + 2);
 
   // The JSON kinds are JSON.
   const asText = await post<ErrorBody>(
@@ -874,6 +981,15 @@ test("json_kinds_must_be_canonical", async () => {
   );
   expect(heldout.status).toBe(400);
   expect(heldout.body.message).toBe("not canonical JSON");
+  // A lone surrogate is refused there as well. The commitment is the hash of the bytes sent.
+  const lone = utf8(textOf({ exact: { expected: ["X"] } }).replace("X", String.raw`\ud800`));
+  const loneHeldout = await post<ErrorBody>(
+    "/v1/heldout",
+    { commitment: sha256Hex(lone), content_base64: b64(lone) },
+    poster,
+  );
+  expect(loneHeldout.status).toBe(400);
+  expect(loneHeldout.body.message).toBe("not canonical JSON");
 });
 
 test("kind_conflict_is_409", async () => {
@@ -1070,7 +1186,7 @@ test("body_limit_413", async () => {
     });
 
   for (const path of ["/v1/blobs", "/v1/heldout"]) {
-    // Over the limit, the body is refused before it is read: it would be a 400 as JSON.
+    // Over the limit, the body is refused before it is parsed: as JSON it would be a 400.
     const over = await send(path, "x".repeat(400_001));
     expect(over.status, path).toBe(413);
     expect(over.headers.get("content-type")).toContain("application/json");
@@ -1193,11 +1309,58 @@ test("malformed_json_body_is_400_json", async () => {
   expect(quoting.body.message).not.toContain("secret-token");
 });
 
+test("a_syntax_error_of_ours_is_a_500_and_is_logged", async () => {
+  // A body that is not JSON makes `c.req.json()` throw a `SyntaxError`, and `readJson` makes that a
+  // 400. A `SyntaxError` from anywhere else is a bug of the server, such as a parser it runs on its
+  // own data, and must not pass for the caller's mistake: it is a 500, and it is logged.
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const app = appWith();
+    app.get("/v1/probe/parse", () => {
+      throw new SyntaxError("Unexpected token in secret-token");
+    });
+    app.post("/v1/probe/read", async (c) => c.json({ read: await readJson(c) }));
+
+    const bug = await app.request("/v1/probe/parse");
+    expect(bug.status).toBe(500);
+    const text = await bug.text();
+    expect(JSON.parse(text)).toEqual({ error: "internal", message: "internal error" });
+    expect(text).not.toContain("secret-token");
+    expect(logged).toHaveBeenCalledTimes(1);
+
+    // A body that is not JSON is the caller's: a 400, and nothing is logged for it.
+    logged.mockClear();
+    const bad = await post<ErrorBody>("/v1/probe/read", "{", undefined, app);
+    expect(bad.status).toBe(400);
+    expect(bad.body).toEqual({ error: "bad_request", message: "body is not valid JSON" });
+    const good = await post<{ read: unknown }>("/v1/probe/read", '{"a":1}', undefined, app);
+    expect([good.status, good.body]).toEqual([200, { read: { a: 1 } }]);
+    expect(logged).not.toHaveBeenCalled();
+
+    // A body that cannot be read at all is no bad JSON either. It is not the caller's mistake to
+    // hide: a 500, and logged.
+    const broken = await app.request("/v1/probe/read", {
+      method: "POST",
+      body: new ReadableStream({
+        start: (controller) => controller.error(new Error("connection reset")),
+      }),
+      duplex: "half",
+    } as RequestInit);
+    expect(broken.status).toBe(500);
+    expect(await broken.json()).toEqual({ error: "internal", message: "internal error" });
+    expect(logged).toHaveBeenCalledTimes(1);
+  } finally {
+    logged.mockRestore();
+  }
+});
+
 // ---- The scorecard route ----------------------------------------------------------------------
 
 test("scorecard_route_serves_the_scorecard_of_a_settled_task", async () => {
   await seedLifecycle(deps.db);
   await apply(taskLine(2));
+  // Task 2 has the reveal deadline of the captured task, and a scorecard is uploaded after it.
+  nowNs = REVEAL_DEADLINE;
   const document = scorecardOf("2", {
     entries: [
       {

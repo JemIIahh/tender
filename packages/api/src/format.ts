@@ -265,6 +265,20 @@ export function notFound(message: string): never {
 }
 
 /**
+ * The JSON in the body of the request, or a 400 when the body is not JSON. Only the parser's
+ * `SyntaxError` is the caller's mistake. Anything else the read throws is a fault of ours or of the
+ * connection, and goes to `handleError` as it is, to be logged and answered as a 500.
+ */
+export async function readJson(c: Context): Promise<unknown> {
+  try {
+    return await c.req.json();
+  } catch (error) {
+    if (error instanceof SyntaxError) return badRequest("body is not valid JSON");
+    throw error;
+  }
+}
+
+/**
  * The first `MAX_ISSUES` faults of a failed parse, as an `ErrorBody` lists them. Zod quotes the
  * request in one message, the one for a key the schema does not have, and that is told in words of
  * ours instead. Every other message is cut at `MAX_ISSUE_MESSAGE`, in case one grows long.
@@ -288,8 +302,8 @@ export function issuesOf(error: z.ZodError): ErrorIssue[] {
  * - One without, such as `hono/validator` throws for a body it cannot parse, answers with its
  *   status and the name of that status (`403`: `forbidden`). Its message is not used: some of
  *   Hono's quote the request.
- * - A `SyntaxError` is what `c.req.json()` throws for a body that is not JSON.
- * - Anything else is a bug: it is logged and answered as a 500 that says nothing about it.
+ * - Anything else is a bug: it is logged and answered as a 500 that says nothing about it. That
+ *   includes a `SyntaxError`, which only `readJson` turns into a 400, for the body it reads.
  */
 export function handleError(error: Error, c: Context): Response {
   if (error instanceof HTTPException) {
@@ -301,10 +315,6 @@ export function handleError(error: Error, c: Context): Response {
       message: reason.toLowerCase(),
     };
     return Response.json(body, { status: error.status });
-  }
-  if (error instanceof SyntaxError) {
-    const body: ErrorBody = { error: "bad_request", message: "body is not valid JSON" };
-    return c.json(body, 400);
   }
   console.error("api: unhandled error:", error);
   const body: ErrorBody = { error: "internal", message: "internal error" };

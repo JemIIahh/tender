@@ -10,11 +10,13 @@
  *
  * Accepts null, booleans, finite numbers, strings, arrays and plain objects, meaning objects whose
  * prototype is `Object.prototype` or `null`. A property whose value is `undefined` counts as
- * absent, as in `JSON.stringify`. Anything else throws a `TypeError` that names the place, such as
- * `$.entries[0].score`: `undefined` in an array, NaN or an infinity, a bigint, a function, a
- * symbol, an object with no JSON form (a `Date`, a `Map`, an instance of any class) and a value
- * that contains itself. Write a `Date` as an ISO string and a u64 as a decimal string before
- * calling. An object may appear more than once, as long as it is not inside itself.
+ * absent, as in `JSON.stringify`, and so does its key. Anything else throws a `TypeError` that
+ * names the place, such as `$.entries[0].score`: `undefined` in an array, NaN or an infinity, a
+ * bigint, a function, a symbol, an object with no JSON form (a `Date`, a `Map`, an instance of any
+ * class), a value that contains itself, and a string or a key with a lone surrogate. RFC 8785
+ * requires refusing a lone surrogate, which is not well-formed Unicode and has no UTF-8 form, where
+ * `JSON.stringify` would escape it. Write a `Date` as an ISO string and a u64 as a decimal string
+ * before calling. An object may appear more than once, as long as it is not inside itself.
  */
 export function canonicalJson(value: unknown): Uint8Array {
   return new TextEncoder().encode(serialize(value, "$", new Set()));
@@ -25,6 +27,7 @@ function serialize(value: unknown, path: string, ancestors: Set<object>): string
   if (value === null) return "null";
   switch (typeof value) {
     case "string":
+      requireWellFormed(value, "a string", path);
       return JSON.stringify(value);
     case "boolean":
       return value ? "true" : "false";
@@ -65,9 +68,24 @@ function serializeObject(object: object, path: string, ancestors: Set<object>): 
   for (const key of Object.keys(record).sort()) {
     const member = record[key];
     if (member === undefined) continue;
+    requireWellFormed(key, "a key", path);
     members.push(`${JSON.stringify(key)}:${serialize(member, `${path}.${key}`, ancestors)}`);
   }
   return `{${members.join(",")}}`;
+}
+
+/**
+ * A surrogate that is not half of a pair: with the `u` flag a pair is one code point, so only a lone
+ * one is in the category. This is `!text.isWellFormed()`, which the ES2023 lib of this package does
+ * not declare.
+ */
+const LONE_SURROGATE = /\p{Surrogate}/u;
+
+/** Throws unless `text` is well-formed Unicode, which a string with a lone surrogate is not. */
+function requireWellFormed(text: string, what: "a string" | "a key", path: string): void {
+  if (LONE_SURROGATE.test(text)) {
+    throw new TypeError(`cannot write ${what} with a lone surrogate as JSON at ${path}`);
+  }
 }
 
 /** What to call an object that is not plain: `an instance of Date`, `an instance of Point`. */

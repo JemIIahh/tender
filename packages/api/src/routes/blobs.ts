@@ -31,6 +31,7 @@ import {
   type HeldoutUploadResponse,
   issuesOf,
   notFound,
+  readJson,
 } from "../format";
 import { getScorecard } from "../queries";
 
@@ -40,11 +41,18 @@ export type AuthVariables = { account: string };
 /** The middleware that signs a request in: it sets `c.var.account`, or answers 401 itself. */
 export type RequireAuth = MiddlewareHandler<{ Variables: AuthVariables }>;
 
+/** Stands in for sign-in until it exists (plan 03 Task 7): it refuses every request that needs it. */
+export const signInUnavailable: RequireAuth = async (c) => {
+  const body: ErrorBody = { error: "unauthorized", message: "sign-in is not available yet" };
+  return c.json(body, 401);
+};
+
 type BlobApp = Hono<{ Variables: AuthVariables }>;
 
 /**
  * The most a request body may hold, which is the largest content as base64 (a third more than
- * `MAX_CONTENT_BYTES`) and room for the rest of the JSON. A larger body is refused unread.
+ * `MAX_CONTENT_BYTES`) and room for the rest of the JSON. A larger body is refused before it is
+ * parsed.
  */
 const MAX_BODY_BYTES = 400_000;
 
@@ -87,7 +95,9 @@ const HeldoutUploadSchema = z.strictObject({
  *
  * - `POST /v1/blobs` (signed in): stores a brief, criteria, scorecard or profile, which anyone may
  *   read at once, or an entrant's result, which no one may read until some entrant has revealed it
- *   in a task whose reveals have closed. The task it was sent for decides nothing.
+ *   in a task whose reveals have closed. The task it was sent for decides nothing. A scorecard is
+ *   taken only from the verifier or the poster of its task, and only once the task's reveal
+ *   deadline has passed.
  * - `POST /v1/heldout` (signed in): stores a held-out document, which nobody may read.
  * - `GET /v1/blobs/:sha256`: the bytes of a blob that may be read.
  * - `GET /v1/scorecards/:task_id`: the scorecard the task was settled with.
@@ -116,9 +126,9 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
 
   app.post("/blobs", requireAuth, tooLarge, async (c) => {
     const account = c.var.account;
-    const upload = parse(UploadSchema, await c.req.json(), "the request body");
+    const upload = parse(UploadSchema, await readJson(c), "the request body");
     const bytes = decodeContent(upload.content_base64);
-    const blob = await blobOf(deps.db, upload, bytes, account);
+    const blob = await blobOf(deps, upload, bytes, account);
 
     const { sha256, stored } = await store(deps.db, blob);
     if (stored.kind !== blob.kind) return fail(409, "conflict", CONFLICT);
@@ -132,7 +142,7 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
 
   app.post("/heldout", requireAuth, tooLarge, async (c) => {
     const account = c.var.account;
-    const upload = parse(HeldoutUploadSchema, await c.req.json(), "the request body");
+    const upload = parse(HeldoutUploadSchema, await readJson(c), "the request body");
     const bytes = decodeContent(upload.content_base64);
     if (sha256Hex(bytes) !== upload.commitment) {
       return badRequest("the content does not hash to the commitment");
@@ -189,8 +199,10 @@ function parse<T>(schema: z.ZodType<T>, value: unknown, what: string): T {
 
 /**
  * The bytes that `text` stands for, or a 400 for text that is not base64 or a 413 for too many
- * bytes. Node's decoder skips what it cannot read (line breaks, the URL-safe letters, a missing
- * pad) and ignores stray bits, so the text is taken only if the bytes encode back to exactly it.
+ * bytes. Node's decoder is lenient: it skips characters it cannot read (line breaks, for one),
+ * decodes the URL-safe letters as base64url, accepts a missing pad and ignores stray bits. So the
+ * text is taken only if the bytes encode back to exactly it, and that round trip is what rejects
+ * them.
  */
 function decodeContent(text: string): Buffer {
   const bytes = Buffer.from(text, "base64");
@@ -227,7 +239,8 @@ function isCanonical(document: unknown, bytes: Uint8Array): boolean {
   try {
     return Buffer.compare(canonicalJson(document), bytes) === 0;
   } catch {
-    // `canonicalJson` throws for a value JSON cannot write, such as the Infinity that 1e999 parses to.
+    // `canonicalJson` throws for a value it cannot write: the Infinity that 1e999 parses to, or a
+    // string or a key with a lone surrogate, which JSON can escape.
     return false;
   }
 }
@@ -236,11 +249,12 @@ function isCanonical(document: unknown, bytes: Uint8Array): boolean {
  * The blob that `upload` asks to store, once its content is what the kind needs and the account
  * may upload it, or the error that says why not. The content is looked at first, so a request that
  * is wrong in itself is a 400 whoever sends it, and the account's right to send it is a 403 or a
- * 404 after that. Visibility is the kind's: all but a result are public, which is what lets the
- * indexer read a brief or a profile, and the API a scorecard.
+ * 404 after that. Whether it is the time for it comes last (a scorecard's 409). Visibility is the
+ * kind's: all but a result are public, which is what lets the indexer read a brief or a profile,
+ * and the API a scorecard.
  */
 async function blobOf(
-  db: Db,
+  deps: ApiDeps,
   upload: Upload,
   bytes: Uint8Array,
   account: string,
@@ -249,7 +263,7 @@ async function blobOf(
   if (kind === "result") {
     // Any bytes of either type: the entrant's own, and nobody's to check until the Judge reads them.
     if (upload.task_id === undefined) return badRequest("task_id is required for a result");
-    await requireEntry(db, upload.task_id, account);
+    await requireEntry(deps.db, upload.task_id, account);
     // The row records the task for information only: a result is served by what was revealed.
     return {
       kind,
@@ -270,7 +284,7 @@ async function blobOf(
     if (upload.task_id !== undefined && upload.task_id !== scorecard.task_id) {
       return badRequest("task_id is not the task of the scorecard");
     }
-    await requireVerifierOrPoster(db, scorecard.task_id, account);
+    await requireScorecardRight(deps, scorecard.task_id, account);
     return {
       kind,
       contentType: upload.content_type,
@@ -308,11 +322,22 @@ async function requireEntry(db: Db, taskId: string, account: string): Promise<vo
   }
 }
 
-/** A scorecard is the verifier's, or the poster's when the poster picks after the pick window. */
-async function requireVerifierOrPoster(db: Db, taskId: string, account: string): Promise<void> {
-  const [task] = await db.query<{ poster: string; verifier: string }>(
-    "select poster, verifier from tasks where id = $1::numeric",
-    [taskId],
+/**
+ * A scorecard is the verifier's, or the poster's when the poster picks after the pick window, and
+ * it is for a task whose reveal deadline has passed: before that, entries can still be revealed
+ * and there is nothing to settle. The account's right is looked at first, so an account that has
+ * none is told so whatever the time is.
+ */
+async function requireScorecardRight(
+  deps: ApiDeps,
+  taskId: string,
+  account: string,
+): Promise<void> {
+  const [task] = await deps.db.query<{ poster: string; verifier: string; closed: boolean }>(
+    `select poster, verifier, reveal_deadline <= $2::numeric as closed
+       from tasks
+      where id = $1::numeric`,
+    [taskId, nowNs(deps)],
   );
   if (!task) return notFound("no such task");
   if (account !== task.verifier && account !== task.poster) {
@@ -322,6 +347,7 @@ async function requireVerifierOrPoster(db: Db, taskId: string, account: string):
       "only the verifier or the poster of the task may upload its scorecard",
     );
   }
+  if (!task.closed) return fail(409, "too_early", "the task's reveal window has not closed");
 }
 
 /**
