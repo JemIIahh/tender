@@ -16,6 +16,9 @@ import { blockOf, FIXTURE_CONTRACT, FIXTURE_OPTIONS } from "./fixtures/blocks";
 // chain: nothing here reaches a network. The sandbox file runs them on a real chain.
 
 const TABLES = ["chain_cursor", "events", "tasks", "funders", "entries", "agents"];
+/** What an RPC error may quote: a URL, which can hold a key. No log line may show it (P03-R16). */
+const KEYED = "https://rpc.example.org/?apiKey=s3cret";
+const leaks = (lines: string[]) => lines.filter((line) => line.includes("s3cret"));
 
 let db: Db;
 const dirs: string[] = [];
@@ -169,7 +172,7 @@ test("logs_its_height_and_lag_every_60_s", async () => {
     close: async () => undefined,
   };
   const { source } = scripted([{ heights: [100] }]);
-  const finals = [130n, new Error("rpc down"), 140n];
+  const finals = [130n, new Error(`fetch failed for ${KEYED}`), 140n];
   const lines: string[] = [];
   const stop = new AbortController();
   const running = runIndexer({
@@ -192,9 +195,10 @@ test("logs_its_height_and_lag_every_60_s", async () => {
   await vi.advanceTimersByTimeAsync(120_000);
   expect(lines.filter((line) => line.startsWith("indexer height="))).toEqual([
     "indexer height=100 lag=30",
-    "indexer height=100 lag=unknown (Error: rpc down)",
+    "indexer height=100 lag=unknown (Error)",
     "indexer height=100 lag=40",
   ]);
+  expect(leaks(lines)).toEqual([]);
   stop.abort();
   await running;
 });
@@ -300,12 +304,47 @@ test("the_sandbox_starts_at_its_final_height_then_resumes_after_the_cursor", asy
   expect(lines).toContain("indexer: resuming after block 701");
 });
 
+test("the_sandbox_takes_its_final_height_again_for_a_restart_before_the_first_block", async () => {
+  // The first run fails before it applies a block. By the restart, 5 s on, the sandbox may have
+  // pruned the block it started from, and nothing was indexed from it: the restart takes the
+  // final height of its own time.
+  const env = {
+    TENDER_NETWORK: "sandbox",
+    TENDER_CONTRACT: FIXTURE_CONTRACT,
+    NEAR_RPC_URL: "http://127.0.0.1:1",
+  };
+  const finals = [700n, 900n];
+  const client = emptyChain(0n, {
+    network: "sandbox",
+    finalHeight: async () => finals.shift() ?? 900n,
+  });
+  const { source, asked } = scripted([{ error: new Error("not ready") }, { heights: [900] }]);
+  const lines: string[] = [];
+  const indexer = startIndexer(env, {
+    db,
+    client,
+    source,
+    deploymentsDir: await deployments(),
+    log: (line) => lines.push(line),
+  });
+  try {
+    await until("the restart asks for blocks", () => asked.length === 2, 9_000);
+    expect(asked).toEqual([700n, 900n]);
+    expect(lines.filter((line) => line.includes("the sandbox's final height"))).toEqual([
+      expect.stringMatching(/height 700$/),
+      expect.stringMatching(/height 900$/),
+    ]);
+  } finally {
+    await indexer.stop();
+  }
+}, 15_000);
+
 // ---- startIndexer: errors ---------------------------------------------------------------------
 
 test("an_error_restarts_it_from_the_cursor_and_a_repeat_warns", async () => {
   const { source, asked } = scripted([
     { heights: [100, 101], error: new BlocksLostError(102n, 104n, 102n) },
-    { error: new Error("still lost") },
+    { error: new Error(`fetch failed for ${KEYED}`) },
   ]);
   const lines: string[] = [];
   const indexer = startIndexer(testnetEnv({ INDEXER_START_HEIGHT: "100" }), {
@@ -325,11 +364,11 @@ test("an_error_restarts_it_from_the_cursor_and_a_repeat_warns", async () => {
     );
     expect(asked).toEqual([100n, 102n]);
     expect(lines.filter((line) => line.includes("restarting"))).toEqual([
-      "indexer: BlocksLostError: the node has no block for heights 102 to 104, but block 105 " +
-        "follows block 102: it has pruned them, or is behind; restarting from the cursor in 5 s",
-      "WARN indexer: failed 2 times in a row (Error: still lost); " +
-        "restarting from the cursor in 10 s",
+      "indexer: BlocksLostError (the node lacks blocks 102 to 104); " +
+        "restarting from the cursor in 5 s",
+      "WARN indexer: failed 2 times in a row (Error); restarting from the cursor in 10 s",
     ]);
+    expect(leaks(lines)).toEqual([]);
   } finally {
     // It is waiting to restart: stop ends the wait.
     const stopped = Date.now();
@@ -364,7 +403,7 @@ test("a_failed_reconcile_is_logged_and_indexing_goes_on", async () => {
   const lines: string[] = [];
   const client = emptyChain(0n, {
     taskCount: async () => {
-      throw new Error("rpc down");
+      throw new Error(`fetch failed for ${KEYED}`);
     },
   });
   const indexer = startIndexer(testnetEnv({ INDEXER_START_HEIGHT: "100" }), {
@@ -375,13 +414,33 @@ test("a_failed_reconcile_is_logged_and_indexing_goes_on", async () => {
     log: (line) => lines.push(line),
   });
   try {
-    await until("the failure is logged", () =>
-      lines.includes("WARN reconcile: failed (Error: rpc down)"),
-    );
+    await until("the failure is logged", () => lines.includes("WARN reconcile: failed (Error)"));
     await until("block 101 is applied", async () => (await cursor(TESTNET_CURSOR)) === 101n);
   } finally {
     await indexer.stop();
   }
+  expect(leaks(lines)).toEqual([]);
+});
+
+test("neardata's lines name NEARDATA_URL rather than quote it", async () => {
+  // Nothing listens on port 1, so every request fails at once, and neardata logs each retry with
+  // the URL it asked for. The base of that URL is NEARDATA_URL, which can hold a key.
+  const lines: string[] = [];
+  const indexer = startIndexer(
+    testnetEnv({ INDEXER_START_HEIGHT: "1", NEARDATA_URL: "http://127.0.0.1:1/s3cret/" }),
+    { db, client: emptyChain(0n), deploymentsDir: await deployments(), log: (l) => lines.push(l) },
+  );
+  try {
+    await until("neardata logs a failed request", () =>
+      lines.some((line) => line.startsWith("neardata: GET")),
+    );
+  } finally {
+    await indexer.stop();
+  }
+  expect(lines.find((line) => line.startsWith("neardata: GET"))).toMatch(
+    /^neardata: GET NEARDATA_URL\/v0\/last_block\/final failed/,
+  );
+  expect(leaks(lines)).toEqual([]);
 });
 
 test("it_names_the_variable_that_is_missing_or_wrong", () => {

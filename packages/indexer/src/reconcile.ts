@@ -38,6 +38,17 @@ const RECENT = 50;
 const CATCH_UP_MS = 60_000;
 /** How often the cursor is looked at while waiting for the index to catch up. */
 const CATCH_UP_POLL_MS = 250;
+/**
+ * How many blocks apart two answers about the chain may be, which a pass allows for (P03-R18).
+ * Off the sandbox the views and the final height come from a load-balanced RPC, whose nodes can be
+ * a few blocks apart, and the index follows neardata.
+ */
+const SKEW_BLOCKS = 20n;
+/**
+ * An index further than this short of the chain's final height is catching up, too far behind to
+ * get past it within a pass's wait: the pass reads no view.
+ */
+const TOO_FAR_BEHIND = 200n;
 
 /** The fields of an `OutcomeView`, `kind` first: all that a pass compares of an outcome. */
 const OUTCOME_FIELDS = ["kind", "winners", "fee", "scorecard_hash", "scorecard_uri", "reason"];
@@ -77,19 +88,34 @@ const AGENT_FIELDS = [
  * 2147483647. It is compared in that form too, so a row stored that way agrees with the chain, and
  * no view fails its write, or reads as a mismatch, on every pass.
  *
- * The views show the chain at its final height, which the index trails. Compared as they come, a
+ * The views show the chain at its final height, which the index trails, and off the sandbox they
+ * come from a load-balanced RPC whose nodes can be some blocks apart. Compared as they come, a
  * commit the index has not reached yet would look missed, and a repair would count it twice once
- * the index applied it. So a pass reads the index's height first, then the views, then waits (up to
- * `catchUpMs`) until the index has every block up to the final height read after the views, and
- * leaves alone any task or agent that has an event after the height it read first: whatever it read
- * of those may be from before that event or after it. All the others have not changed since then,
- * on the chain or in the index, and must agree. Each repair is made under the lock the runner
+ * the index applied it; an outcome a lagging node has not seen yet would look gone. So a pass:
+ *
+ * - reads the index's height C0 and, with it, its last event in a block 20 or more below C0;
+ * - reads the views;
+ * - waits (up to `catchUpMs`) until the index is at least 20 blocks past the final height that it
+ *   read after the views;
+ * - leaves alone every task and agent with an event after that last one: what it read of those
+ *   may be from before that event or after it.
+ *
+ * A view from anywhere between 20 blocks below C0 and 20 above the final height shows each of the
+ * others as the index has it, so they must agree. Each repair is made under the lock the runner
  * applies blocks under, so no block comes between its check and its write. So run it beside the
  * indexer of `db`, in the same process: with no indexer, the index stays short of a live chain's
- * final height and a pass repairs nothing, and the lock is only this process's.
+ * final height and a pass repairs nothing, and the lock is only this process's. A pass reads no
+ * view while the index holds no block, or is more than 200 blocks short of the chain's final
+ * height, which is too far to catch up within the wait; it logs a line, and repairs nothing.
  *
- * A task that the index holds and the chain does not gets a WARN, and is left as it is: the index
- * is then of another chain or contract.
+ * It never takes an outcome away. An outcome is final on chain, so a view without one, of a task
+ * whose row has one, is stale: that gets a WARN, and the row stays as it is. Nor does it keep an
+ * outcome of the other kind, which cannot be this task's: that one is replaced as if the row had
+ * none. Nor does it delete a row: an inserted task's funders and entries are written over from the
+ * views, and any the views lack (`cleanup` removes entries from the chain) are kept.
+ *
+ * A task that the index holds and the chain does not, and that has no event after `since`, gets a
+ * WARN and is left as it is: the index is then of another chain or contract.
  */
 export async function reconcile(
   db: Db,
@@ -101,9 +127,22 @@ export async function reconcile(
   const signal = opts.signal;
   const result: ReconcileResult = { inserted: 0, updated: 0 };
 
-  // Before the first view: whatever happened on the chain after this height, the index's events
-  // after it show. With no cursor, the index holds no block, and every event comes after.
-  const since = (await cursorHeight(db, source)) ?? -1n;
+  // Before the first view. What moved on the chain since 20 blocks below the index's height shows
+  // in the index's events after `since`, by the time it is 20 blocks past the final height.
+  const start = await startOfPass(db, source);
+  if (start === null) {
+    log("reconcile: the index holds no block yet; nothing repaired");
+    return result;
+  }
+  const behind = (await chain.finalHeight()) - start.height;
+  if (behind > TOO_FAR_BEHIND) {
+    log(
+      `reconcile: the index is at block ${start.height}, ${behind} blocks short of the chain's ` +
+        `final height ${start.height + behind}; nothing repaired`,
+    );
+    return result;
+  }
+  const { since } = start;
 
   const missing: Array<{ view: TaskView; entries: EntryView[] }> = [];
   for (const id of await missingTaskIds(db, await chain.taskCount())) {
@@ -113,12 +152,11 @@ export async function reconcile(
     const entries = (await chain.getAllEntries(id)).map(storableEntry);
     missing.push({ view: storableTask(view), entries });
   }
-  const tasks: TaskView[] = [];
+  const tasks: Array<{ id: bigint; view: TaskView | null }> = [];
   for (const id of await taskIdsToCompare(db)) {
     if (signal?.aborted) return result;
     const view = await chain.getTask(id);
-    if (view !== null) tasks.push(storableTask(view));
-    else log(`WARN reconcile task=${id} is not on the chain`);
+    tasks.push({ id, view: view === null ? null : storableTask(view) });
   }
   const agents: AgentView[] = [];
   for (const account of await recentAgents(db)) {
@@ -127,14 +165,16 @@ export async function reconcile(
     if (view !== null) agents.push(storableAgent(view));
   }
 
-  // Every view above shows the chain at this height or below.
+  // Every view above shows the chain at this height or below, give or take SKEW_BLOCKS.
   const final = await chain.finalHeight();
-  const reached = await indexReaches(db, source, final, opts.catchUpMs ?? CATCH_UP_MS, signal);
+  const target = final + SKEW_BLOCKS;
+  const reached = await indexReaches(db, source, target, opts.catchUpMs ?? CATCH_UP_MS, signal);
   if (reached !== true) {
     if (!signal?.aborted) {
-      const at = reached === null ? "holds no block yet" : `is at block ${reached}`;
+      const at = reached === null ? "holds no block" : `is at block ${reached}`;
       log(
-        `reconcile: the index ${at}, short of the chain's final height ${final}; nothing repaired`,
+        `reconcile: the index ${at}, short of block ${target}, ${SKEW_BLOCKS} past the chain's ` +
+          "final height; nothing repaired",
       );
     }
     return result;
@@ -147,11 +187,17 @@ export async function reconcile(
       log(`WARN reconcile task=${view.id} inserted from the chain`);
     }
   }
-  for (const view of tasks) {
+  for (const { id, view } of tasks) {
     if (signal?.aborted) return result;
-    const fields = await withIndexLock(db, () => repairTask(db, view, since));
-    if (fields.length > 0) result.updated += 1;
-    for (const field of fields) log(`WARN reconcile task=${view.id} field=${field}`);
+    const repair = await withIndexLock(db, () => repairTask(db, id, view, since));
+    if (repair.fields.length > 0) result.updated += 1;
+    for (const field of repair.fields) log(`WARN reconcile task=${id} field=${field}`);
+    if (repair.staleOutcome) {
+      log(
+        `WARN reconcile task=${id} field=outcome kept: the view has none, and an outcome is final`,
+      );
+    }
+    if (repair.notOnChain) log(`WARN reconcile task=${id} is not on the chain`);
   }
   if (signal?.aborted) return result;
   const repaired = await withIndexLock(db, () => repairAgents(db, agents, since));
@@ -193,8 +239,30 @@ function storableAgent(view: AgentView): AgentView {
 }
 
 /**
+ * The index's height, and the id of its last event in a block at least SKEW_BLOCKS below that
+ * height (0 if it has none), read in one statement. Null when the index holds no block yet.
+ */
+async function startOfPass(
+  db: Db,
+  source: string,
+): Promise<{ height: bigint; since: bigint } | null> {
+  const [row] = await db.query<{ height: string; since: string | null }>(
+    `select c.height::text as height,
+            (select e.id::text from events e
+              where e.height <= c.height - $2
+              order by e.id desc
+              limit 1) as since
+       from chain_cursor c
+      where c.source = $1`,
+    [source, SKEW_BLOCKS],
+  );
+  if (row === undefined) return null;
+  return { height: BigInt(row.height), since: BigInt(row.since ?? "0") };
+}
+
+/**
  * Waits until the index's cursor is at `height` or past it. Returns true then, or, once `ms` is up
- * or `signal` aborts, the height the cursor is at (null if there is none).
+ * or `signal` aborts, the height the cursor is at.
  */
 async function indexReaches(
   db: Db,
@@ -246,7 +314,7 @@ async function taskIdsToCompare(db: Db): Promise<bigint[]> {
 /**
  * The events that change an agent's row, as (event id, account) pairs: its registration, commits
  * and reveals, the picks it made or won, and the voids it made. `where` narrows the events, as in
- * `and e.height > $1`.
+ * `and e.id > $1`.
  */
 function agentEvents(where: string): string {
   return `
@@ -272,9 +340,12 @@ async function recentAgents(db: Db): Promise<string[]> {
   return rows.map((row) => row.account);
 }
 
-/** Whether the index holds an event of task `id` after block `since`. */
+/**
+ * Whether the index holds an event of task `id` after the event `since`. The one runner inserts
+ * the events block by block, so their ids go up with the blocks.
+ */
 async function taskChangedSince(db: Db, id: string, since: bigint): Promise<boolean> {
-  const rows = await db.query("select 1 from events where task_id = $1 and height > $2 limit 1", [
+  const rows = await db.query("select 1 from events where task_id = $1 and id > $2 limit 1", [
     id,
     since,
   ]);
@@ -285,6 +356,10 @@ async function taskChangedSince(db: Db, id: string, since: bigint): Promise<bool
  * Inserts the task of `view`, with `entries`, unless it has an event after `since` (then the
  * runner has inserted it, or it changed while the views were read) or the index holds it. Returns
  * whether it inserted it. The views are storable already (`storableTask`, `storableEntry`).
+ *
+ * A funder or an entry that the index holds already is written over from the views, and one the
+ * views lack is kept: `cleanup` removes entries from the chain, and the index may hold the only
+ * copy of one.
  */
 function insertMissingTask(
   db: Db,
@@ -296,21 +371,24 @@ function insertMissingTask(
   return db.tx(async (tx) => {
     if (await taskChangedSince(tx, view.id, since)) return false;
     if (!(await insertTask(tx, view, createdHeight))) return false;
-    // Rows of a task row that was deleted by hand would be left over: the views are all of it.
-    await tx.query("delete from funders where task_id = $1", [view.id]);
-    await tx.query("delete from entries where task_id = $1", [view.id]);
     for (const funder of view.funders) {
-      await tx.query("insert into funders (task_id, account, amount) values ($1, $2, $3)", [
-        view.id,
-        funder.account,
-        funder.amount,
-      ]);
+      await tx.query(
+        `insert into funders (task_id, account, amount) values ($1, $2, $3)
+         on conflict (task_id, account) do update set amount = excluded.amount`,
+        [view.id, funder.account, funder.amount],
+      );
     }
     for (const entry of entries) {
       await tx.query(
         `insert into entries (task_id, account, entry_index, commitment, committed_height,
                               content_hash, uri)
-         values ($1, $2, $3, $4, $5, $6, $7)`,
+         values ($1, $2, $3, $4, $5, $6, $7)
+         on conflict (task_id, account) do update set
+           entry_index = excluded.entry_index,
+           commitment = excluded.commitment,
+           committed_height = excluded.committed_height,
+           content_hash = excluded.content_hash,
+           uri = excluded.uri`,
         [
           view.id,
           entry.account,
@@ -341,13 +419,27 @@ type Json = Record<string, unknown>;
 const isObject = (value: unknown): value is Json =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+interface TaskRepair {
+  /** The fields that differed and were repaired, each as its WARN line names it. */
+  fields: string[];
+  /** Whether the row has an outcome that the view lacks, and kept it. */
+  staleOutcome: boolean;
+  /** Whether the index holds the task, and the chain has none by its id. */
+  notOnChain: boolean;
+}
+
 /**
- * Brings the row of `view`'s task in line with it, unless the task has an event after `since`.
- * Returns the fields that differed, each as its WARN line names it.
+ * Brings the row of task `id` in line with `view`, its view, unless the task has an event after
+ * `since`. A null `view` is a task that the chain does not have.
  */
-function repairTask(db: Db, view: TaskView, since: bigint): Promise<string[]> {
+function repairTask(db: Db, id: bigint, view: TaskView | null, since: bigint): Promise<TaskRepair> {
   return db.tx(async (tx) => {
-    if (await taskChangedSince(tx, view.id, since)) return [];
+    const none: TaskRepair = { fields: [], staleOutcome: false, notOnChain: false };
+    if (await taskChangedSince(tx, `${id}`, since)) return none;
+    if (view === null) {
+      const held = await tx.query("select 1 from tasks where id = $1", [id]);
+      return { ...none, notOnChain: held.length > 0 };
+    }
     const [row] = await tx.query<{
       commit_count: number;
       reveal_count: number;
@@ -358,7 +450,7 @@ function repairTask(db: Db, view: TaskView, since: bigint): Promise<string[]> {
          from tasks where id = $1`,
       [view.id],
     );
-    if (row === undefined) return [];
+    if (row === undefined) return none;
 
     const fields: string[] = [];
     if (row.commit_count !== view.commit_count) fields.push("commit_count");
@@ -371,21 +463,30 @@ function repairTask(db: Db, view: TaskView, since: bigint): Promise<string[]> {
       ]);
     }
 
-    // A JSON null, or anything else but an object, is no outcome; SQL NULL is none.
+    // A JSON null, or anything else but an object, is no outcome, and SQL NULL is none: both are
+    // read as unsettled. An outcome stored from the view has no `by` and no settled height.
     const stored = row.has_outcome && isObject(row.outcome) ? row.outcome : null;
-    if (view.outcome === null) {
-      if (row.has_outcome) {
-        fields.push("outcome");
-        await tx.query("update tasks set outcome = null, settled_height = null where id = $1", [
-          view.id,
-        ]);
-      }
-    } else if (stored === null) {
-      fields.push("outcome");
-      await tx.query("update tasks set outcome = $2 where id = $1", [
+    const storeFromView = () =>
+      tx.query("update tasks set outcome = $2, settled_height = null where id = $1", [
         view.id,
         outcomeFromView(view),
       ]);
+    let staleOutcome = false;
+    if (view.outcome === null) {
+      // Final on chain: an outcome that the view lacks is the view's to catch up on, not the row's
+      // to lose. A JSON null is no outcome, only one that reads as settled.
+      if (stored !== null) staleOutcome = true;
+      else if (row.has_outcome) {
+        fields.push("outcome");
+        await storeFromView();
+      }
+    } else if (stored === null) {
+      fields.push("outcome");
+      await storeFromView();
+    } else if (stored.kind !== view.outcome.kind) {
+      // The kind never changes on chain: this outcome is not the task's, nor its `by`.
+      fields.push("outcome.kind");
+      await storeFromView();
     } else {
       const differ = outcomeDifferences(stored, view.outcome);
       if (differ.length > 0) {
@@ -396,7 +497,7 @@ function repairTask(db: Db, view: TaskView, since: bigint): Promise<string[]> {
         ]);
       }
     }
-    return fields;
+    return { fields, staleOutcome, notOnChain: false };
   });
 }
 
@@ -407,14 +508,12 @@ function outcomeDifferences(stored: Json, chain: OutcomeView): string[] {
 }
 
 /**
- * `stored` with the view's fields in place of its own, and whatever else it had, such as `by` and
- * `task_id`, kept. A field of the view that the chain's outcome lacks goes, and so do the refunds
- * of a void, if the outcome is no longer one.
+ * `stored`, an outcome of the view's kind, with the view's fields in place of its own, and the rest
+ * of it (`by`, `task_id`, a void's `refunds`) kept. A field of the view that the chain's outcome
+ * lacks goes.
  */
 function mergeOutcome(stored: Json, chain: OutcomeView): Json {
-  const kept = Object.entries(stored).filter(
-    ([key]) => !OUTCOME_FIELDS.includes(key) && !(key === "refunds" && stored.kind !== chain.kind),
-  );
+  const kept = Object.entries(stored).filter(([key]) => !OUTCOME_FIELDS.includes(key));
   return { ...Object.fromEntries(kept), ...chain };
 }
 
@@ -442,7 +541,7 @@ function repairAgents(
     const changed = new Set(
       (
         await tx.query<{ account: string }>(
-          `select distinct account from (${agentEvents("and e.height > $1")}) t`,
+          `select distinct account from (${agentEvents("and e.id > $1")}) t`,
           [since],
         )
       ).map((row) => row.account),

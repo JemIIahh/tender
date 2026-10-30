@@ -282,6 +282,13 @@ test("reconcile_repairs_missing_task", async () => {
     });
     await alice.commit(taskId, computeCommitment(taskId, aliceId, sha256Hex("work"), randomSalt()));
     await caughtUp(db);
+    // A pass leaves alone what changed within 20 blocks of the index's height (the RPC skew it
+    // allows for): the index goes on that far past alice's registration and commit first.
+    const past = (await reader.finalHeight()) + 21n;
+    await until(`the index reaches block ${past}`, async () => {
+      const height = await indexedHeight(db);
+      return height !== null && height >= past;
+    });
     const before = await taskRow(db, taskId);
     expect(before).toMatchObject({ commit_count: 1, reveal_count: 0, settled: false });
     const entriesBefore = await entriesOf(db, taskId);

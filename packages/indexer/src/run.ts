@@ -9,7 +9,7 @@ import { type ApplyOptions, applyBlock, cursorHeight } from "./apply";
 import { withIndexLock } from "./lock";
 import { createNeardataSource } from "./neardata";
 import { type ReconcileChain, reconcile } from "./reconcile";
-import { createRpcSource } from "./rpc";
+import { BlocksLostError, createRpcSource } from "./rpc";
 import type { BlockSource } from "./types";
 
 export interface RunIndexerOptions extends ApplyOptions {
@@ -40,7 +40,7 @@ const LAG_LOG_MS = 60_000;
  *
  * With `finalHeight`, every 60 s it logs `indexer height=<h> lag=<final-h>`: `h` is the last block
  * applied (before the first, the one below where it started), and the lag is `unknown`, with the
- * error, when the final height cannot be read.
+ * error's name, when the final height cannot be read.
  */
 export async function runIndexer(opts: RunIndexerOptions): Promise<void> {
   const { db, source, signal, startHeight, finalHeight } = opts;
@@ -120,6 +120,8 @@ export interface Indexer {
 const FIRST_BACKOFF_MS = 5_000;
 const LONGEST_BACKOFF_MS = 60_000;
 const RECONCILE_EVERY_MS = 10 * 60_000;
+/** How often the first reconcile looks for the index's first block. */
+const FIRST_BLOCK_POLL_MS = 1_000;
 const DEPLOYMENTS_DIR = fileURLToPath(new URL("../../../deployments/", import.meta.url));
 
 /**
@@ -132,15 +134,16 @@ const DEPLOYMENTS_DIR = fileURLToPath(new URL("../../../deployments/", import.me
  * - **Start**: `INDEXER_START_HEIGHT`; else the `deployHeight` in the deploy script's record,
  *   `<deploymentsDir>/<network>.json`, if it is this contract's; else, on the sandbox only, the
  *   chain's final height when nothing is indexed yet (it prunes its old blocks within minutes),
- *   and after the cursor when something is. Off the sandbox, with neither, it throws, naming
- *   `INDEXER_START_HEIGHT`. The cursor goes first in any case: the runner reads from
- *   `max(cursor + 1, start)`.
+ *   taken again at each restart until a block is applied, and after the cursor once one is. Off
+ *   the sandbox, with neither, it throws, naming `INDEXER_START_HEIGHT`. The cursor goes first in
+ *   any case: the runner reads from `max(cursor + 1, start)`.
  * - **Failures**: the runner rejects with what the source throws, `BlocksLostError` included.
  *   The error is logged and the runner restarts from the cursor after 5 s, doubling to 60 s while
  *   restarts make no progress; each failure after the first in a row logs a WARN. An error that
- *   comes after `stop` is the shutdown, not a failure.
- * - **Reconcile** runs once at start and every 10 min after (see `reconcile`). Its errors are
- *   logged and never stop the indexer.
+ *   comes after `stop` is the shutdown, not a failure. A line names an error and never quotes its
+ *   message, which can hold a URL, and so a key (P03-R16).
+ * - **Reconcile** runs once the index holds its first block, and every 10 min after (see
+ *   `reconcile`). Its errors are logged and never stop the indexer.
  *
  * The cursor is `<network>:<contractId>`, as `reconcile` assumes. The environment is checked
  * first, and a value that is missing or wrong throws, naming the variable.
@@ -222,7 +225,6 @@ async function supervise(p: Supervised): Promise<void> {
   const { cursorSource, signal, log } = p;
   let db: Db | undefined;
   let reconciling: Promise<void> | undefined;
-  let startHeight: bigint | undefined;
   let failures = 0;
   try {
     while (!signal.aborted) {
@@ -232,7 +234,9 @@ async function supervise(p: Supervised): Promise<void> {
         db ??= await p.openDatabase();
         if (signal.aborted) break;
         reconciling ??= reconcileEvery(db, p.client, cursorSource, signal, log);
-        startHeight ??= await startHeightOf(db, p);
+        // Taken again at every start: on the sandbox, until a block is applied, the start moves
+        // on with the chain, which prunes the blocks behind it.
+        const startHeight = await startHeightOf(db, p);
         before = await cursorHeight(db, cursorSource);
         await runIndexer({
           db,
@@ -310,7 +314,10 @@ async function startHeightOf(db: Db, p: Supervised): Promise<bigint> {
   return final;
 }
 
-/** Runs `reconcile` now and every 10 min, until `signal` aborts. Never rejects. */
+/**
+ * Runs `reconcile` once the index holds a block, and every 10 min after, until `signal` aborts.
+ * Never rejects.
+ */
 async function reconcileEvery(
   db: Db,
   client: ReconcileChain,
@@ -318,6 +325,10 @@ async function reconcileEvery(
   signal: AbortSignal,
   log: (message: string) => void,
 ): Promise<void> {
+  // Before the first block a pass has no height to start from (see `reconcile`).
+  while (!signal.aborted && (await cursorHeight(db, cursorSource).catch(() => null)) === null) {
+    await pause(FIRST_BLOCK_POLL_MS, signal);
+  }
   while (!signal.aborted) {
     try {
       await reconcile(db, client, { cursorSource, log, signal });
@@ -337,8 +348,16 @@ async function pause(ms: number, signal: AbortSignal): Promise<void> {
   }
 }
 
+/**
+ * What a log line says of an error: its name and, for a BlocksLostError, its heights, in words of
+ * our own. Never its message, which can quote the RPC's or neardata's URL, and a URL can hold a key
+ * (P03-R16).
+ */
 function describe(error: unknown): string {
-  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  if (error instanceof BlocksLostError) {
+    return `${error.name} (the node lacks blocks ${error.from} to ${error.to})`;
+  }
+  return error instanceof Error ? error.name : typeof error;
 }
 
 // ---- the environment --------------------------------------------------------------------------
@@ -460,11 +479,14 @@ function sourceOf(
   }
   const baseUrl = setting(env, "NEARDATA_URL") ?? NETWORKS[config.network].neardataUrl;
   if (baseUrl === undefined) throw new Error("NEARDATA_URL must be set for the indexer");
+  // The source's lines quote the URLs it asks for, which begin with NEARDATA_URL as it keeps it,
+  // with no trailing slash. A URL can hold a key, so the lines name it instead (P03-R16).
+  const base = httpUrl("NEARDATA_URL", baseUrl).replace(/\/+$/, "");
   return createNeardataSource({
-    baseUrl: httpUrl("NEARDATA_URL", baseUrl),
+    baseUrl,
     apiKey: setting(env, "FASTNEAR_API_KEY"),
     pollMs: config.pollMs,
-    log,
+    log: (line) => log(line.replaceAll(base, "NEARDATA_URL")),
   });
 }
 
