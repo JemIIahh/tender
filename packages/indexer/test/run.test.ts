@@ -10,7 +10,7 @@ import {
   runIndexer,
   startIndexer,
 } from "../src/index";
-import { blockOf, FIXTURE_CONTRACT, FIXTURE_OPTIONS } from "./fixtures/blocks";
+import { blockOf, FIXTURE_CONTRACT, FIXTURE_OPTIONS, lifecycleBlocks } from "./fixtures/blocks";
 
 // The runner and its supervisor, on a PGlite database, with a scripted block source and a fake
 // chain: nothing here reaches a network. The sandbox file runs them on a real chain.
@@ -364,8 +364,8 @@ test("an_error_restarts_it_from_the_cursor_and_a_repeat_warns", async () => {
     );
     expect(asked).toEqual([100n, 102n]);
     expect(lines.filter((line) => line.includes("restarting"))).toEqual([
-      "indexer: BlocksLostError (the node lacks blocks 102 to 104); " +
-        "restarting from the cursor in 5 s",
+      "indexer: BlocksLostError: the node has no block for heights 102 to 104, but block 105 " +
+        "follows block 102: it has pruned them, or is behind; restarting from the cursor in 5 s",
       "WARN indexer: failed 2 times in a row (Error); restarting from the cursor in 10 s",
     ]);
     expect(leaks(lines)).toEqual([]);
@@ -378,6 +378,37 @@ test("an_error_restarts_it_from_the_cursor_and_a_repeat_warns", async () => {
   expect(asked).toHaveLength(2);
   expect(await cursor(TESTNET_CURSOR)).toBe(101n);
 }, 15_000);
+
+test("a_block_that_fails_on_the_database_is_logged_with_its_code_and_height", async () => {
+  // With no funders table, block 64's task_created fails on the database, and would on every try:
+  // the line says with which SQLSTATE, and on which block, and quotes no message of the database.
+  const broken = await openDb("pglite:memory");
+  await migrate(broken);
+  await broken.exec("drop table funders");
+  const source: BlockSource = {
+    async *blocks(from) {
+      for (const block of lifecycleBlocks()) if (block.height >= from) yield block;
+    },
+  };
+  const lines: string[] = [];
+  const indexer = startIndexer(testnetEnv({ INDEXER_START_HEIGHT: "60" }), {
+    db: broken,
+    client: emptyChain(0n),
+    source,
+    deploymentsDir: await deployments(),
+    log: (line) => lines.push(line),
+  });
+  try {
+    await until("the failure is logged", () => lines.some((line) => line.includes("restarting")));
+  } finally {
+    await indexer.stop();
+    await broken.close();
+  }
+  expect(lines.filter((line) => line.includes("restarting"))).toEqual([
+    "indexer: error (code 42P01) at block 64; restarting from the cursor in 5 s",
+  ]);
+  expect(lines.filter((line) => line.includes("does not exist"))).toEqual([]);
+});
 
 test("an_error_after_stop_is_the_shutdown_not_a_failure", async () => {
   const { source, asked } = scripted([

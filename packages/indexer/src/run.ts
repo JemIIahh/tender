@@ -6,10 +6,11 @@ import { TenderClient } from "@tender/client";
 import { type Db, migrate, openDb } from "@tender/db";
 import { AccountIdSchema, NETWORKS, type NetworkId, U64StringSchema } from "@tender/shared";
 import { type ApplyOptions, applyBlock, cursorHeight } from "./apply";
+import { ApplyBlockError, IndexerError } from "./errors";
 import { withIndexLock } from "./lock";
 import { createNeardataSource } from "./neardata";
 import { type ReconcileChain, reconcile } from "./reconcile";
-import { BlocksLostError, createRpcSource } from "./rpc";
+import { createRpcSource } from "./rpc";
 import type { BlockSource } from "./types";
 
 export interface RunIndexerOptions extends ApplyOptions {
@@ -33,10 +34,11 @@ const LAG_LOG_MS = 60_000;
  * hand is applied: each block is one transaction, with the cursor, so a run stopped anywhere
  * resumes after the last block it applied, and a block applied twice changes nothing.
  *
- * It rejects with whatever the source or `applyBlock` throws, and applies nothing after it. That
- * includes the RPC source's `BlocksLostError`, and its error on a transaction that is not final:
- * they stand for blocks the runner has not read, which it never skips. A restart from the cursor
- * reads them again; `startIndexer` makes it.
+ * It rejects with whatever the source throws, and applies nothing after it. That includes the RPC
+ * source's `BlocksLostError`, and its error on a transaction that is not final: they stand for
+ * blocks the runner has not read, which it never skips. A restart from the cursor reads them
+ * again; `startIndexer` makes it. When `applyBlock` fails, it rejects with an `ApplyBlockError`
+ * that names the block, with what `applyBlock` threw as its `cause`.
  *
  * With `finalHeight`, every 60 s it logs `indexer height=<h> lag=<final-h>`: `h` is the last block
  * applied (before the first, the one below where it started), and the lag is `unknown`, with the
@@ -57,7 +59,11 @@ export async function runIndexer(opts: RunIndexerOptions): Promise<void> {
   const stopLagLog = finalHeight ? logLag(finalHeight, () => height, log) : undefined;
   try {
     for await (const block of source.blocks(from, signal)) {
-      await withIndexLock(db, () => applyBlock(db, block, apply));
+      try {
+        await withIndexLock(db, () => applyBlock(db, block, apply));
+      } catch (error) {
+        throw new ApplyBlockError(block.height, error);
+      }
       height = block.height;
     }
   } finally {
@@ -140,8 +146,9 @@ const DEPLOYMENTS_DIR = fileURLToPath(new URL("../../../deployments/", import.me
  * - **Failures**: the runner rejects with what the source throws, `BlocksLostError` included.
  *   The error is logged and the runner restarts from the cursor after 5 s, doubling to 60 s while
  *   restarts make no progress; each failure after the first in a row logs a WARN. An error that
- *   comes after `stop` is the shutdown, not a failure. A line names an error and never quotes its
- *   message, which can hold a URL, and so a key (P03-R16).
+ *   comes after `stop` is the shutdown, not a failure. A line quotes the indexer's own errors, and
+ *   of any other gives the name and code only, never the message, which can hold a URL, and so a
+ *   key (P03-R16); of a block that fails, it gives the height.
  * - **Reconcile** runs once the index holds its first block, and every 10 min after (see
  *   `reconcile`). Its errors are logged and never stop the indexer.
  *
@@ -250,7 +257,7 @@ async function supervise(p: Supervised): Promise<void> {
           finalHeight: () => p.client.finalHeight(),
         });
         if (signal.aborted) break;
-        throw new Error("the block source ended before the indexer was stopped");
+        throw new IndexerError("the block source ended before the indexer was stopped");
       } catch (error) {
         // The node or the database going away as the indexer stops is the shutdown, not a failure.
         if (signal.aborted) break;
@@ -349,15 +356,17 @@ async function pause(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /**
- * What a log line says of an error: its name and, for a BlocksLostError, its heights, in words of
- * our own. Never its message, which can quote the RPC's or neardata's URL, and a URL can hold a key
- * (P03-R16).
+ * What a log line says of an error: one of the indexer's own in full, and of a block that failed,
+ * its height besides. Of any other error its name, and its `code` when that is a string (a
+ * SQLSTATE, or a system error's such as ECONNREFUSED), but never its message, which can quote the
+ * RPC's or neardata's URL, and a URL can hold a key (P03-R16).
  */
 function describe(error: unknown): string {
-  if (error instanceof BlocksLostError) {
-    return `${error.name} (the node lacks blocks ${error.from} to ${error.to})`;
-  }
-  return error instanceof Error ? error.name : typeof error;
+  if (error instanceof ApplyBlockError) return `${describe(error.cause)} at block ${error.height}`;
+  if (error instanceof IndexerError) return `${error.name}: ${error.message}`;
+  if (!(error instanceof Error)) return typeof error;
+  const { code } = error as { code?: unknown };
+  return typeof code === "string" ? `${error.name} (code ${code})` : error.name;
 }
 
 // ---- the environment --------------------------------------------------------------------------

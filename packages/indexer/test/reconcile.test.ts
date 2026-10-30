@@ -36,8 +36,10 @@ import {
 // the index and the chain disagree, and checks what reconcile repairs and what it logs.
 //
 // Reconcile leaves alone what changed within 20 blocks of the index's height (SKEW_BLOCKS), and
-// waits for the index to be 20 blocks past the chain's final height. So most tests put the index 20
-// empty blocks past the lifecycle (`seed`), and give the chain a final height 20 below the index.
+// waits for the index to be 20 blocks past both the chain's final height and its own. So most tests
+// put the index 20 empty blocks past the lifecycle (`seed`), give the chain a final height 20 below
+// the index, and let a runner move the index on, block by empty block, while a pass waits. A test
+// that orders blocks of its own around a pass turns the runner off.
 
 const { judge, alice, bob } = FIXTURE_ACCOUNTS;
 const TABLES = ["chain_cursor", "events", "tasks", "funders", "entries", "agents"];
@@ -146,17 +148,52 @@ function fake(chain: Chain): ReconcileChain {
   };
 }
 
-/** Reconciles the fixtures' index against `chain`, with the log lines going to `lines`. */
+/**
+ * Reconciles the fixtures' index against `chain`, with the log lines going to `lines`, while the
+ * runner goes on (`whileTheRunnerGoesOn`) unless `runner` is false.
+ */
 function reconcileWith(
   chain: Chain,
   lines: string[],
-  opts: ReconcileOptions = {},
+  { runner = true, ...opts }: ReconcileOptions & { runner?: boolean } = {},
 ): Promise<ReconcileResult> {
-  return reconcile(db, fake(chain), {
-    cursorSource: FIXTURE_OPTIONS.cursorSource,
-    log: (line) => lines.push(line),
-    ...opts,
-  });
+  const pass = () =>
+    reconcile(db, fake(chain), {
+      cursorSource: FIXTURE_OPTIONS.cursorSource,
+      log: (line) => lines.push(line),
+      ...opts,
+    });
+  return runner ? whileTheRunnerGoesOn(pass) : pass();
+}
+
+/** The index's height, or null before its first block. */
+async function cursorAt(): Promise<bigint | null> {
+  const [row] = await db.query<{ height: string }>(
+    "select height::text as height from chain_cursor where source = $1",
+    [FIXTURE_OPTIONS.cursorSource],
+  );
+  return row === undefined ? null : BigInt(row.height);
+}
+
+/**
+ * Runs `pass` while the runner goes on behind it, as a live indexer follows the chain: an empty
+ * block after the last one every few ms, until the pass is over. Empty blocks move the cursor and
+ * nothing else.
+ */
+async function whileTheRunnerGoesOn<T>(pass: () => Promise<T>): Promise<T> {
+  let over = false;
+  const runner = (async () => {
+    while (!over) {
+      await apply(blockOf(((await cursorAt()) ?? 0n) + 1n, []));
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+  })();
+  try {
+    return await pass();
+  } finally {
+    over = true;
+    await runner;
+  }
 }
 
 const apply = (block: ReturnType<typeof blockOf>) => applyBlock(db, block, FIXTURE_OPTIONS);
@@ -228,21 +265,18 @@ function applyLater(height: number, ms = 200): void {
   setTimeout(() => void apply(blockOf(height, [])), ms);
 }
 
-/** The rows of the projection, without the cursor and the events. */
+/** Every row but the cursor's, which the runner moves on while a pass waits. */
 async function projected() {
-  const { tasks, funders, entries, agents } = await snapshot();
-  return { tasks, funders, entries, agents };
+  const { chain_cursor: _cursor, ...rows } = await snapshot();
+  return rows;
 }
 
 /** Waits until the index's cursor is at `height` or past it. */
 async function cursorReaches(height: number): Promise<void> {
   const giveUpAt = Date.now() + 5_000;
   for (;;) {
-    const [row] = await db.query<{ height: string }>(
-      "select height::text as height from chain_cursor where source = $1",
-      [FIXTURE_OPTIONS.cursorSource],
-    );
-    if (row !== undefined && BigInt(row.height) >= BigInt(height)) return;
+    const at = await cursorAt();
+    if (at !== null && at >= BigInt(height)) return;
     if (Date.now() > giveUpAt) throw new Error(`the index did not reach block ${height}`);
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
@@ -250,12 +284,12 @@ async function cursorReaches(height: number): Promise<void> {
 
 test("an_index_that_agrees_with_the_chain_is_left_as_it_is", async () => {
   await seed();
-  const before = await snapshot();
+  const before = await projected();
   const lines: string[] = [];
 
   expect(await reconcileWith(lifecycleChain(), lines)).toEqual({ inserted: 0, updated: 0 });
   expect(lines).toEqual([]);
-  expect(await snapshot()).toEqual(before);
+  expect(await projected()).toEqual(before);
 });
 
 test("a_missing_task_comes_back_with_its_funders_entries_and_an_outcome_by_nobody", async () => {
@@ -376,14 +410,14 @@ test("a_u32_beyond_an_int_column_is_stored_clamped_and_agrees_with_the_chain_aft
 
 test("a_task_the_chain_does_not_have_is_warned_about_and_kept", async () => {
   await seed();
-  const before = await snapshot();
+  const before = await projected();
   const lines: string[] = [];
 
   // An index of another chain: this one has no task at all.
   const chain = lifecycleChain({ tasks: [], entries: {} });
   expect(await reconcileWith(chain, lines)).toEqual({ inserted: 0, updated: 0 });
   expect(lines).toEqual(["WARN reconcile task=1 is not on the chain"]);
-  expect(await snapshot()).toEqual(before);
+  expect(await projected()).toEqual(before);
 });
 
 test("a_task_without_an_outcome_is_stored_with_sql_null_and_a_json_null_is_repaired", async () => {
@@ -410,7 +444,7 @@ test("a_task_without_an_outcome_is_stored_with_sql_null_and_a_json_null_is_repai
 
 test("each_field_that_differs_is_repaired_with_a_warn_of_its_own_and_by_is_kept", async () => {
   await seed();
-  const before = await snapshot();
+  const before = await projected();
   await db.query(
     `update tasks
         set commit_count = 1,
@@ -426,7 +460,7 @@ test("each_field_that_differs_is_repaired_with_a_warn_of_its_own_and_by_is_kept"
     "WARN reconcile task=1 field=outcome.scorecard_uri",
   ]);
   // Back to what the events made, `by` and the height of the pick included.
-  expect(await snapshot()).toEqual(before);
+  expect(await projected()).toEqual(before);
 });
 
 test("a_pick_the_index_missed_is_stored_from_the_view_with_by_null", async () => {
@@ -526,7 +560,7 @@ test("an_outcome_is_never_cleared_by_a_view_without_one", async () => {
   // A view from a node further behind than the margin, or of another chain, can lack the outcome.
   // An outcome is final on chain, so such a view is stale: the row keeps its outcome, `by` and all.
   await seed();
-  const before = await snapshot();
+  const before = await projected();
   const lines: string[] = [];
   const stale = lifecycleChain({ tasks: [{ ...TASK_1, outcome: null, phase: "judging" }] });
 
@@ -534,7 +568,7 @@ test("an_outcome_is_never_cleared_by_a_view_without_one", async () => {
   expect(lines).toEqual([
     "WARN reconcile task=1 field=outcome kept: the view has none, and an outcome is final",
   ]);
-  expect(await snapshot()).toEqual(before);
+  expect(await projected()).toEqual(before);
 
   // A current view agrees with the row as it is, and the judge is still the one who picked.
   expect(await reconcileWith(lifecycleChain(), lines)).toEqual({ inserted: 0, updated: 0 });
@@ -555,7 +589,7 @@ test("a_view_from_up_to_20_blocks_before_the_index_repairs_nothing", async () =>
   applyLater(90 + SKEW);
   const lines: string[] = [];
 
-  expect(await reconcileWith(stale, lines, { catchUpMs: 5_000 })).toEqual({
+  expect(await reconcileWith(stale, lines, { catchUpMs: 5_000, runner: false })).toEqual({
     inserted: 0,
     updated: 0,
   });
@@ -587,7 +621,7 @@ test("a_view_from_up_to_20_blocks_past_the_final_height_repairs_nothing_early", 
   }, 200);
   const lines: string[] = [];
 
-  expect(await reconcileWith(chain, lines, { catchUpMs: 5_000 })).toEqual({
+  expect(await reconcileWith(chain, lines, { catchUpMs: 5_000, runner: false })).toEqual({
     inserted: 0,
     updated: 0,
   });
@@ -595,6 +629,43 @@ test("a_view_from_up_to_20_blocks_past_the_final_height_repairs_nothing_early", 
   expect(lines).toEqual([]);
   expect(await taskOf("2")).toMatchObject({ commit_count: 1 });
   expect(await entriesOf("2")).toMatchObject([{ account: bob, entry_index: 0 }]);
+});
+
+test("a_view_ahead_of_a_lagging_final_height_waits_for_the_index_to_pass_it", async () => {
+  // The index is at block 140, and the node that gives the final height lags at 120. A node that is
+  // current already shows bob's commit to task 2 at block 141. Raised to that commit now, task 2
+  // would count it twice once the index applied it, and give bob's entry index 1, for good: counts
+  // are never lowered. So the pass waits for 20 past the higher of the two, 160, by when the commit
+  // is in, and leaves task 2 and bob to a later pass.
+  await seedLifecycle(db);
+  await apply(created(2, 95));
+  await apply(blockOf(140, []));
+  const chain = lifecycleChain({
+    final: 120n,
+    tasks: [TASK_1, { ...openTask(2), commit_count: 1 }],
+    agents: AGENTS.map((agent) => (agent.account === bob ? { ...agent, entries: 2 } : agent)),
+  });
+  const commit = eventLine("committed", {
+    task_id: "2",
+    account: bob,
+    commitment: BOB_ENTRY.commitment,
+    block_height: "141",
+  });
+  setTimeout(() => {
+    void apply(blockOf(141, [commit])).then(() => apply(blockOf(160, [])));
+  }, 200);
+  const lines: string[] = [];
+
+  expect(await reconcileWith(chain, lines, { catchUpMs: 5_000, runner: false })).toEqual({
+    inserted: 0,
+    updated: 0,
+  });
+  await cursorReaches(160);
+  expect(lines).toEqual([]);
+  expect(await taskOf("2")).toMatchObject({ commit_count: 1 });
+  expect(await entriesOf("2")).toMatchObject([{ account: bob, entry_index: 0 }]);
+  const [agent] = await db.query("select entries from agents where account = $1", [bob]);
+  expect(agent).toEqual({ entries: 2 });
 });
 
 test("a_task_with_an_event_after_the_start_of_a_pass_waits_for_a_later_pass", async () => {
@@ -623,27 +694,28 @@ test("a_task_with_an_event_after_the_start_of_a_pass_waits_for_a_later_pass", as
   expect(await taskOf("1")).toMatchObject({ commit_count: 2 });
 });
 
-test("nothing_is_repaired_until_the_index_is_20_blocks_past_the_final_height", async () => {
+test("nothing_is_repaired_until_the_index_is_20_past_the_final_height_and_its_own", async () => {
   await seed();
   await db.query("update tasks set commit_count = 1 where id = 1");
   const lines: string[] = [];
 
-  // The views may show the chain up to 20 blocks past the final height they gave, 92, and the
-  // index is at 110: a commit at 111 or 112 would look like one that it missed.
+  // The views may show the chain up to 20 blocks past the final height they gave, 92, or past the
+  // index's own height, 110, if the node that gave 92 lags: a commit up to block 130 would look
+  // like one that the index missed.
   const chain = lifecycleChain({ final: 92n });
-  expect(await reconcileWith(chain, lines, { catchUpMs: 300 })).toEqual({
+  expect(await reconcileWith(chain, lines, { catchUpMs: 300, runner: false })).toEqual({
     inserted: 0,
     updated: 0,
   });
   expect(lines).toEqual([
-    "reconcile: the index is at block 110, short of block 112, 20 past the chain's final " +
-      "height; nothing repaired",
+    "reconcile: the index is at block 110, short of block 130, 20 past both the chain's final " +
+      "height and its own; nothing repaired",
   ]);
   expect(await taskOf("1")).toMatchObject({ commit_count: 1 });
 
   // Once the index gets there, the pass goes on.
-  applyLater(112);
-  expect(await reconcileWith(chain, lines, { catchUpMs: 5_000 })).toEqual({
+  applyLater(130);
+  expect(await reconcileWith(chain, lines, { catchUpMs: 5_000, runner: false })).toEqual({
     inserted: 0,
     updated: 1,
   });
@@ -655,7 +727,7 @@ test("a_pass_before_the_index_holds_a_block_reads_no_view", async () => {
   const chain = lifecycleChain();
   const lines: string[] = [];
 
-  expect(await reconcileWith(chain, lines, { catchUpMs: 300 })).toEqual({
+  expect(await reconcileWith(chain, lines, { catchUpMs: 300, runner: false })).toEqual({
     inserted: 0,
     updated: 0,
   });
@@ -671,7 +743,7 @@ test("a_pass_reads_no_view_while_the_index_is_too_far_behind_to_catch_up", async
   const chain = lifecycleChain({ final: 110n + 201n });
   const lines: string[] = [];
 
-  expect(await reconcileWith(chain, lines, { catchUpMs: 300 })).toEqual({
+  expect(await reconcileWith(chain, lines, { catchUpMs: 300, runner: false })).toEqual({
     inserted: 0,
     updated: 0,
   });
@@ -718,6 +790,39 @@ test("agent_counters_are_repaired_but_not_for_an_agent_with_a_newer_event", asyn
   });
   const [skipped] = await db.query("select picks_made from agents where account = $1", [judge]);
   expect(skipped).toEqual({ picks_made: 0 });
+});
+
+test("the_50_agent_slots_go_to_agents_that_the_pass_compares", async () => {
+  // 50 agents register in the 10 blocks before the index's height, and the margin leaves them all
+  // alone this pass. The 50 slots go to agents that it compares instead: the judge among them,
+  // whose pick the index missed.
+  await seedLifecycle(db);
+  await db.query("update agents set picks_made = 0 where account = $1", [judge]);
+  const busy: AgentView[] = Array.from({ length: 50 }, (_, i) => ({
+    ...ALICE,
+    account: `agent${i}.test.near`,
+    entries: 0,
+    reveals: 0,
+    wins: 0,
+    earned: [],
+    picks_made: 0,
+  }));
+  for (let height = 191; height <= 200; height++) {
+    const registering = busy.filter((_, i) => 191 + (i % 10) === height);
+    await apply(
+      blockOf(
+        height,
+        registering.map((agent) => eventLine("agent_registered", { account: agent.account })),
+      ),
+    );
+  }
+  const chain = lifecycleChain({ final: 200n, agents: [...AGENTS, ...busy] });
+  const lines: string[] = [];
+
+  expect(await reconcileWith(chain, lines)).toEqual({ inserted: 0, updated: 1 });
+  expect(lines).toEqual([`WARN reconcile agent=${judge} field=picks_made`]);
+  const [repaired] = await db.query("select picks_made from agents where account = $1", [judge]);
+  expect(repaired).toEqual({ picks_made: 1 });
 });
 
 test("only_the_50_newest_tasks_and_the_unsettled_ones_are_compared", async () => {

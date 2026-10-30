@@ -74,8 +74,8 @@ const AGENT_FIELDS = [
  *   That covers the tasks below the highest id, which an index that started late never saw;
  * - for the 50 newest tasks of the index and every one without an outcome, compares
  *   `commit_count`, `reveal_count` and the outcome with the chain;
- * - for the 50 agents of the index that its events updated last, compares the counters with
- *   `getAgent`;
+ * - for the 50 agents of the index that its events updated last, of those it does not leave alone
+ *   (see below), compares the counters with `getAgent`;
  * - logs `WARN reconcile task=<id> field=<f>` (or `agent=<account>`) for each field that differed,
  *   and repairs it, and `WARN reconcile task=<id> inserted from the chain` for each task inserted.
  *
@@ -99,18 +99,21 @@ const AGENT_FIELDS = [
  *
  * - reads the index's height C0 and, with it, its last event in a block 20 or more below C0;
  * - reads the views;
- * - waits (up to `catchUpMs`) until the index is at least 20 blocks past the final height that it
- *   read after the views;
+ * - waits (up to `catchUpMs`) until the index is at least 20 blocks past both the final height that
+ *   it read after the views and its own height then: the node that gave the final height may lag
+ *   the index, and the views come from nodes as current as the index;
  * - leaves alone every task and agent with an event after that last one: what it read of those
  *   may be from before that event or after it.
  *
- * A view from anywhere between 20 blocks below C0 and 20 above the final height shows each of the
- * others as the index has it, so they must agree. Each repair is made under the lock the runner
- * applies blocks under, so no block comes between its check and its write. So run it beside the
- * indexer of `db`, in the same process: with no indexer, the index stays short of a live chain's
- * final height and a pass repairs nothing, and the lock is only this process's. A pass reads no
- * view while the index holds no block, or is more than 200 blocks short of the chain's final
- * height, which is too far to catch up within the wait; it logs a line, and repairs nothing.
+ * A view from anywhere between 20 blocks below C0 and 20 above the later of the final height and
+ * the index shows each of the others as the index has it, so they must agree. A view from a node
+ * further ahead than that is beyond what a pass can tell: the client does not say at which block
+ * it read a view. Each repair is made under the lock the runner applies blocks under, so no block
+ * comes between its check and its write. So run it beside the indexer of `db`, in the same
+ * process: with no indexer, the index stays short of a live chain's final height and a pass
+ * repairs nothing, and the lock is only this process's. A pass reads no view while the index holds
+ * no block, or is more than 200 blocks short of the chain's final height, which is too far to
+ * catch up within the wait; it logs a line, and repairs nothing.
  *
  * It never takes an outcome away. An outcome is final on chain, so a view without one, of a task
  * whose row has one, is stale: that gets a WARN, and the row stays as it is. Nor does it keep an
@@ -167,22 +170,25 @@ export async function reconcile(
     tasks.push({ id, view: view === null ? null : storableTask(view) });
   }
   const agents: AgentView[] = [];
-  for (const account of await recentAgents(db)) {
+  for (const account of await recentAgents(db, since)) {
     if (signal?.aborted) return result;
     const view = await chain.getAgent(account);
     if (view !== null) agents.push(storableAgent(view));
   }
 
-  // Every view above shows the chain at this height or below, give or take SKEW_BLOCKS.
+  // Every view above shows the chain at the higher of these two or below, give or take SKEW_BLOCKS.
   const final = await chain.finalHeight();
-  const target = final + SKEW_BLOCKS;
+  // Of bigints, so no Math.max: the index's height, or the final height if that is higher.
+  let highest = (await cursorHeight(db, source)) ?? start.height;
+  if (final > highest) highest = final;
+  const target = highest + SKEW_BLOCKS;
   const reached = await indexReaches(db, source, target, opts.catchUpMs ?? CATCH_UP_MS, signal);
   if (reached !== true) {
     if (!signal?.aborted) {
       const at = reached === null ? "holds no block" : `is at block ${reached}`;
       log(
-        `reconcile: the index ${at}, short of block ${target}, ${SKEW_BLOCKS} past the chain's ` +
-          "final height; nothing repaired",
+        `reconcile: the index ${at}, short of block ${target}, ${SKEW_BLOCKS} past both the ` +
+          "chain's final height and its own; nothing repaired",
       );
     }
     return result;
@@ -337,14 +343,19 @@ function agentEvents(where: string): string {
      where e.event = 'picked' ${where}`;
 }
 
-/** The 50 agents of the index whose rows its events changed last, latest first. */
-async function recentAgents(db: Db): Promise<string[]> {
+/**
+ * The 50 agents of the index whose rows its events changed last, latest first, among those with no
+ * event after `since`. One with such an event is left alone this pass, and would only take a slot.
+ */
+async function recentAgents(db: Db, since: bigint): Promise<string[]> {
   const rows = await db.query<{ account: string }>(
     `select t.account from (${agentEvents("")}) t
        join agents a on a.account = t.account
       group by t.account
+     having max(t.id) <= $1
       order by max(t.id) desc
       limit ${RECENT}`,
+    [since],
   );
   return rows.map((row) => row.account);
 }
