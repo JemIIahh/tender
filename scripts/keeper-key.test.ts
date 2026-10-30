@@ -412,6 +412,95 @@ test("key_script_says_to_remove_the_variable_alone_for_any_stored_key_that_is_no
   }
 });
 
+test("key_script_refuses_a_service_key_that_is_the_full_access_key_of_another_account", async () => {
+  // The mix-up of P02-R27 across roles: the keeper's variable holds the judge's full-access key. The
+  // keeper's account has no such key, so the script would add it there as a function-call key, and
+  // the keeper's service would sign with a secret that has full access to the judge's account.
+  const dir = await dirWith({ [ENV_FILE]: deployed(`KEEPER_PRIVATE_KEY=${judgeFull.toString()}`) });
+  const text = await readFile(join(dir, ENV_FILE), "utf8");
+  const { chain, added, asked } = fakeChain();
+
+  const error = await run("keeper", dir, chain).then(
+    () => "ran",
+    (e: Error) => e.message,
+  );
+
+  // Both variables are named, and the key is shown by its public half alone.
+  expect(error).toContain("KEEPER_PRIVATE_KEY");
+  expect(error).toContain("JUDGE_FULL_ACCESS_KEY");
+  expect(error).toContain(judgeFull.getPublicKey().toString());
+  expect(error).not.toContain(secretOf(judgeFull.toString()));
+  // The advice is for the variable, and never to delete a key.
+  expect(error).toContain("Remove only the KEEPER_PRIVATE_KEY line from the env file");
+  expect(error).not.toMatch(/remove (that|the|this) key from the account/i);
+  // Nothing is written, and the chain is not even asked.
+  expect(added).toEqual([]);
+  expect(asked).toEqual([]);
+  expect(await readFile(join(dir, ENV_FILE), "utf8")).toBe(text);
+});
+
+test("key_script_refuses_a_service_key_that_is_the_parent_key_or_the_contracts_full_access_key", async () => {
+  const parent = KeyPair.fromRandom("ed25519");
+  const contract = KeyPair.fromRandom("ed25519");
+  const cases: Array<[string, "keeper" | "judge", string, KeyPair, Record<string, string>]> = [
+    // The owner's parent account key lives in `.env`, where the deploy reads it.
+    [
+      "the parent key under the judge",
+      "judge",
+      "DEPLOY_PARENT_PRIVATE_KEY",
+      parent,
+      {
+        ".env": `DEPLOY_PARENT_PRIVATE_KEY=${parent.toString()}\n`,
+        [ENV_FILE]: deployed(`JUDGE_PRIVATE_KEY=${parent.toString()}`),
+      },
+    ],
+    [
+      "the contract's key under the keeper",
+      "keeper",
+      "TENDER_CONTRACT_FULL_ACCESS_KEY",
+      contract,
+      {
+        [ENV_FILE]: deployed(
+          `TENDER_CONTRACT_FULL_ACCESS_KEY=${contract.toString()}\nKEEPER_PRIVATE_KEY=${contract.toString()}`,
+        ),
+      },
+    ],
+  ];
+  for (const [what, role, holder, key, files] of cases) {
+    const dir = await dirWith(files);
+    const text = await readFile(join(dir, ENV_FILE), "utf8");
+    const { chain, added, asked } = fakeChain();
+
+    const error = await run(role, dir, chain).then(
+      () => "ran",
+      (e: Error) => e.message,
+    );
+
+    expect(error, what).toContain(`${role.toUpperCase()}_PRIVATE_KEY`);
+    expect(error, what).toContain(holder);
+    expect(error, what).toContain(key.getPublicKey().toString());
+    expect(error, what).not.toContain(secretOf(key.toString()));
+    expect(error, what).toContain(
+      `Remove only the ${role.toUpperCase()}_PRIVATE_KEY line from the env file`,
+    );
+    expect(added, what).toEqual([]);
+    expect(asked, what).toEqual([]);
+    expect(await readFile(join(dir, ENV_FILE), "utf8"), what).toBe(text);
+  }
+});
+
+test("key_script_goes_on_when_another_full_access_variable_holds_no_key_and_never_shows_it", async () => {
+  // Only a key that is the same key is a clash: a value that is no key is somebody else's concern.
+  const dir = await dirWith({ [ENV_FILE]: deployed(`OWNER_FULL_ACCESS_KEY=${LEAKY}`) });
+  const { chain, added } = fakeChain();
+
+  const { lines, result } = await run("keeper", dir, chain);
+
+  expect(result.outcome).toBe("OK");
+  expect(added).toHaveLength(1);
+  expect(lines.join("\n")).not.toContain("LEAKY");
+});
+
 test("key_script_accepts_the_methods_of_the_key_in_any_order", async () => {
   const stored = KeyPair.fromRandom("ed25519");
   const dir = await dirWith({ [ENV_FILE]: deployed(`KEEPER_PRIVATE_KEY=${stored.toString()}`) });

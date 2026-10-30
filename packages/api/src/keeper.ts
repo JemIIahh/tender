@@ -21,8 +21,22 @@ export interface KeeperChain {
   cleanup(id: bigint, limit?: number): Promise<unknown>;
 }
 
-/** How many ticks a task whose call or read failed is left alone for. */
+/** The two chores of the keeper, as the memory and the log name them. */
+type Chore = "void_task" | "cleanup";
+
+/** How many ticks a task whose call failed is left alone for the first time. */
 const SKIP_TICKS = 10;
+/** The most ticks it is left alone for: 2880 is a day at the default interval of 30 s. */
+const MAX_SKIP_TICKS = 2880;
+
+/** A chore that failed for a task: how many times in a row, and when it is next tried. */
+interface Failure {
+  chore: Chore;
+  id: bigint;
+  times: number;
+  /** The first tick at which the chore is tried again. */
+  retryAt: number;
+}
 
 /**
  * What the keeper keeps from one tick to the next, so that it does not spend its reads and its 10
@@ -30,53 +44,93 @@ const SKIP_TICKS = 10;
  *
  * - a settled task found with nothing left to clean stays so, since a settled task takes no more
  *   entries: it is not read again;
+ * - a task whose `void_task` lost with `E_SETTLED` is settled on the chain for good, however long
+ *   the index takes to show it: it is not tried again;
  * - a task whose `void_task` or `cleanup` failed for a reason other than a lost race, or whose
- *   read failed or found no task, is left alone for the next 10 ticks. Otherwise 10 tasks that
- *   the chain keeps refusing, such as the rows of another deployment's index, would take every
- *   slot of every tick and leave none for the rest.
+ *   read failed or found no task, is left alone for the next 10 ticks. Each time the same chore
+ *   fails again the wait doubles, up to 2880 ticks (a day at 30 s), and it is 10 again once the
+ *   chore goes through. Otherwise tasks that the chain keeps refusing, such as the rows of another
+ *   deployment's index, would take every slot of every tick and leave none for the rest.
  *
- * `startKeeper` keeps one for the whole run. A tick that is given none remembers nothing.
+ * It holds something only for tasks the index still lists (`forget`), so it does not grow with
+ * every task that ever failed or was found clean. `startKeeper` keeps one for the whole run. A tick
+ * that is given none remembers nothing.
  */
 export class KeeperMemory {
   private ticks = 0;
+  /** The settled tasks found with nothing left to clean. */
   private readonly clean = new Set<bigint>();
-  /** The first tick at which a task that failed is tried again, by `<method> <id>`. */
-  private readonly retryAt = new Map<string, number>();
+  /** The tasks that `void_task` found settled. */
+  private readonly settled = new Set<bigint>();
+  private readonly failures = new Map<string, Failure>();
 
-  /** Starts a tick: counts it, and forgets the failures that have been left alone long enough. */
+  /** Starts a tick: counts it. */
   begin(): void {
     this.ticks += 1;
-    for (const [key, tick] of this.retryAt) {
-      if (tick <= this.ticks) this.retryAt.delete(key);
-    }
   }
 
-  /** Whether a read found the settled task with nothing left to clean. */
-  isClean(id: bigint): boolean {
-    return this.clean.has(id);
+  /** How many tasks it holds something for. */
+  get size(): number {
+    return this.clean.size + this.settled.size + this.failures.size;
   }
 
-  markClean(id: bigint): void {
-    this.clean.add(id);
+  /** Whether `chore` is left alone for the task now: it is known to be done, or it failed lately. */
+  isLeftAlone(chore: Chore, id: bigint): boolean {
+    if ((chore === "cleanup" ? this.clean : this.settled).has(id)) return true;
+    const failure = this.failures.get(`${chore} ${id}`);
+    return failure !== undefined && failure.retryAt > this.ticks;
   }
 
-  /** Whether a call of `method` for the task failed lately, and is left alone for now. */
-  isStuck(method: string, id: bigint): boolean {
-    return this.retryAt.has(`${method} ${id}`);
-  }
-
-  /** Leaves the task alone for the next `SKIP_TICKS` ticks. */
-  markStuck(method: string, id: bigint): void {
-    this.retryAt.set(`${method} ${id}`, this.ticks + SKIP_TICKS + 1);
-  }
-
-  /** How many tasks are left alone now for `method`. */
-  stuck(method: string): number {
-    let count = 0;
-    for (const key of this.retryAt.keys()) {
-      if (key.startsWith(`${method} `)) count += 1;
+  /** How many tasks `chore` is left alone for now. */
+  leftAlone(chore: Chore): number {
+    let count = (chore === "cleanup" ? this.clean : this.settled).size;
+    for (const failure of this.failures.values()) {
+      if (failure.chore === chore && failure.retryAt > this.ticks) count += 1;
     }
     return count;
+  }
+
+  /** The settled task has nothing left to clean, and never will. */
+  foundClean(id: bigint): void {
+    this.clean.add(id);
+    this.failures.delete(`cleanup ${id}`);
+  }
+
+  /** `void_task` found the task settled: it stays so. */
+  foundSettled(id: bigint): void {
+    this.settled.add(id);
+    this.failures.delete(`void_task ${id}`);
+  }
+
+  /** The chore went through: if it fails later, the wait starts from 10 ticks again. */
+  succeeded(chore: Chore, id: bigint): void {
+    this.failures.delete(`${chore} ${id}`);
+  }
+
+  /** The chore failed, or the read for it did: the task is left alone twice as long as last time. */
+  failed(chore: Chore, id: bigint): void {
+    const key = `${chore} ${id}`;
+    const times = (this.failures.get(key)?.times ?? 0) + 1;
+    const skip = Math.min(SKIP_TICKS * 2 ** (times - 1), MAX_SKIP_TICKS);
+    this.failures.set(key, { chore, id, times, retryAt: this.ticks + skip + 1 });
+  }
+
+  /**
+   * Forgets what it holds of the tasks of `chore` that a listing of the index no longer has: they
+   * left the window, or were settled. `listed` is the whole listing when `upTo` is left out, and
+   * otherwise the listing as far as task `upTo`, which a limit cut short: a task beyond it may
+   * still be listed, so it is kept.
+   */
+  forget(chore: Chore, listed: readonly bigint[], upTo?: bigint): void {
+    const present = new Set(listed);
+    const gone = (id: bigint) => !present.has(id) && (upTo === undefined || id <= upTo);
+    const known = chore === "cleanup" ? this.clean : this.settled;
+    for (const id of known) {
+      if (gone(id)) known.delete(id);
+    }
+    for (const [key, failure] of this.failures) {
+      if (failure.chore === chore && gone(failure.id)) this.failures.delete(key);
+    }
   }
 }
 
@@ -96,7 +150,8 @@ export interface KeeperTickOptions {
   signal?: AbortSignal;
   /**
    * What the keeper remembers between ticks; see `KeeperMemory`. `startKeeper` makes one if it is
-   * not given one. Without it, a tick starts from nothing.
+   * not given one. Without it, a tick starts from nothing: it cannot leave alone what failed in the
+   * ticks before, so tasks that always fail at the head of its queue are tried again each time.
    */
   memory?: KeeperMemory;
 }
@@ -116,6 +171,8 @@ export interface KeeperTickResult {
 
 /** The most calls to the chain, `void_task` and `cleanup`, that one tick sends. */
 const MAX_ACTIONS = 10;
+/** How many reads that fail in a row end the reading of a tick: the chain is likely down. */
+const MAX_FAILED_READS = 3;
 /** The entries one `cleanup` call goes through: the most the contract allows (`MAX_PAGE`). */
 const CLEANUP_BATCH = 50;
 /** How far back a settlement still gets its entries cleaned: 7 days, in nanoseconds. */
@@ -159,8 +216,11 @@ function quiet(log: (message: string) => void): (message: string) => void {
   };
 }
 
-/** How a call went: it went through, another caller got there first, or it failed. */
-type Attempt = "sent" | "lost" | "failed";
+/**
+ * How a call went: it went through, another caller got there first (`settled` when the task is
+ * settled, which is final; `lost` when the phase had changed, which may not stay so), or it failed.
+ */
+type Attempt = "sent" | "lost" | "settled" | "failed";
 
 /**
  * Sends one call. A lost race is logged at debug level and any other failure as an error; neither
@@ -168,7 +228,7 @@ type Attempt = "sent" | "lost" | "failed";
  */
 async function attempt(
   log: (message: string) => void,
-  method: string,
+  method: Chore,
   id: bigint,
   send: () => Promise<unknown>,
 ): Promise<Attempt> {
@@ -178,7 +238,7 @@ async function attempt(
   } catch (error) {
     if (error instanceof TenderError && LOST_RACE.has(error.code)) {
       log(`DEBUG keeper: ${method} task ${id} lost the race (${error.code})`);
-      return "lost";
+      return error.code === "E_SETTLED" ? "settled" : "lost";
     }
     log(`ERROR keeper: ${method} task ${id} failed (${describe(error)})`);
     return "failed";
@@ -237,8 +297,8 @@ async function settledTasks(db: Db, now: bigint): Promise<bigint[]> {
  * - with what is left of the 10, `cleanup` (50 entries) for each task that took entries and was
  *   settled in the last 7 days, whose chain view says `cleaned < commit_count`, the one settled
  *   longest ago first. The chain is read for each of them first, since the index does not hold
- *   `cleaned`; a read is not one of the 10. A read that fails ends the reading for the tick: if
- *   the chain is down, every read would fail the same way, and log a line of its own.
+ *   `cleaned`; a read is not one of the 10. Three reads that fail in a row end the reading for the
+ *   tick: if the chain is down, every read would fail the same way, and log a line of its own.
  *
  * A call that fails does not stop the tick, and counts against the 10. `E_SETTLED` and `E_PHASE`
  * mean another caller got there first and are logged at debug level; any other failure, a failed
@@ -251,8 +311,10 @@ async function settledTasks(db: Db, now: bigint): Promise<bigint[]> {
  * ago, so a task with more entries than 7 days of ticks can clean is left with the rest.
  *
  * With a `memory` (as `startKeeper` runs it) a task found with nothing left to clean is not read
- * again, and one whose call or read failed, other than by a lost race, is left alone for the next
- * 10 ticks, so that tasks the chain keeps refusing cannot hold every slot.
+ * again, and a task whose void lost with `E_SETTLED` is not voided again. A task whose call or read
+ * failed, other than by a lost race, is left alone for the next 10 ticks, and for twice as long
+ * each time the same call fails again (see `KeeperMemory`), so that tasks the chain keeps refusing
+ * cannot hold every slot.
  *
  * Rejects only when the index cannot be read. Pass `signal` to have it end before its next call.
  */
@@ -269,46 +331,62 @@ export async function keeperTick(opts: KeeperTickOptions): Promise<KeeperTickRes
 
   // A task that is left alone takes a row of the result and no action, so ask for that many rows
   // more: 10 that are not left alone are in it, however many are.
-  for (const id of await expiredTasks(db, now, MAX_ACTIONS + memory.stuck("void_task"))) {
-    if (memory.isStuck("void_task", id)) continue;
+  const limit = MAX_ACTIONS + memory.leftAlone("void_task");
+  const expired = await expiredTasks(db, now, limit);
+  // The rows are the lowest ids that are expired: every id below the last one is among them. A task
+  // that was left alone and is not among them has been settled in the index, and is forgotten.
+  memory.forget("void_task", expired, expired.length < limit ? undefined : expired.at(-1));
+  for (const id of expired) {
+    if (memory.isLeftAlone("void_task", id)) continue;
     if (!roomLeft()) return result;
     actions += 1;
     const sent = await attempt(log, "void_task", id, () => client.voidTask(id));
     if (sent === "sent") {
+      memory.succeeded("void_task", id);
       result.voided.push(id);
       log(`keeper: voided task ${id}`);
+    } else if (sent === "settled") {
+      // The index will say so in time; until then the task is not tried again.
+      memory.foundSettled(id);
     } else if (sent === "failed") {
-      memory.markStuck("void_task", id);
+      memory.failed("void_task", id);
     }
   }
 
   if (!roomLeft()) return result;
-  for (const id of await settledTasks(db, now)) {
+  const settled = await settledTasks(db, now);
+  memory.forget("cleanup", settled);
+  let failedReads = 0;
+  for (const id of settled) {
     if (!roomLeft()) return result;
-    if (memory.isClean(id) || memory.isStuck("cleanup", id)) continue;
+    if (memory.isLeftAlone("cleanup", id)) continue;
     let view: Awaited<ReturnType<KeeperChain["getTask"]>>;
     try {
       view = await client.getTask(id);
     } catch (error) {
       log(`ERROR keeper: get_task task ${id} failed (${describe(error)})`);
-      memory.markStuck("cleanup", id);
-      break;
+      memory.failed("cleanup", id);
+      failedReads += 1;
+      if (failedReads === MAX_FAILED_READS) break;
+      continue;
     }
+    failedReads = 0;
     if (view === null) {
-      memory.markStuck("cleanup", id);
+      memory.failed("cleanup", id);
       continue;
     }
     if (view.cleaned >= view.commit_count) {
-      memory.markClean(id);
+      memory.foundClean(id);
       continue;
     }
     actions += 1;
     const sent = await attempt(log, "cleanup", id, () => client.cleanup(id, CLEANUP_BATCH));
     if (sent === "sent") {
+      memory.succeeded("cleanup", id);
       result.cleaned.push(id);
       log(`keeper: cleaned task ${id}`);
     } else if (sent === "failed") {
-      memory.markStuck("cleanup", id);
+      memory.failed("cleanup", id);
     }
   }
   return result;
