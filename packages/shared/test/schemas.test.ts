@@ -1063,9 +1063,14 @@ test("scorecard_pins_version_tie_break_and_judge", () => {
   expect(failures(ScorecardSchema, { ...card, tie_break: "score desc, account asc" })).toEqual([
     "tie_break",
   ]);
-  expect(
-    failures(ScorecardSchema, { ...card, judge: { software: "tender-judge/2", model: null } }),
-  ).toEqual(["judge.software"]);
+  // `software` is a name of 1 to 64 characters, not one fixed value: scorecard.test.ts holds the
+  // names that pass. Here the empty name and one of 65 characters are refused.
+  for (const software of ["", "s".repeat(65)]) {
+    expect(
+      failures(ScorecardSchema, { ...card, judge: { software, model: null } }),
+      `${software.length} characters`,
+    ).toEqual(["judge.software"]);
+  }
   expect(failures(ScorecardSchema, { ...card, judge: { software: "tender-judge/1" } })).toEqual([
     "judge.model",
   ]);

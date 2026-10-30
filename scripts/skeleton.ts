@@ -89,17 +89,20 @@ const SANDBOX_WINDOW_SECS = 10;
 
 /**
  * The keys of `.env.deploy.testnet` the skeleton signs with, as the deploy script names them: the
- * poster and the judge by role, alice and bob by the reference agents `analyst` and `coder`.
+ * poster and the judge by role, alice and bob by the reference agents `analyst` and `coder`. The
+ * keys are the full-access ones the deploy made, `<STEM>_FULL_ACCESS_KEY`, because the skeleton
+ * mints, deposits and posts, which a function-call key limited to Tender cannot. The
+ * `<STEM>_PRIVATE_KEY` names are the services' own, and the skeleton never reads them.
  */
 const TESTNET_KEYS = [
   "POSTER_ACCOUNT",
-  "POSTER_PRIVATE_KEY",
+  "POSTER_FULL_ACCESS_KEY",
   "JUDGE_ACCOUNT",
-  "JUDGE_PRIVATE_KEY",
+  "JUDGE_FULL_ACCESS_KEY",
   "AGENT_ANALYST_ACCOUNT",
-  "AGENT_ANALYST_PRIVATE_KEY",
+  "AGENT_ANALYST_FULL_ACCESS_KEY",
   "AGENT_CODER_ACCOUNT",
-  "AGENT_CODER_PRIVATE_KEY",
+  "AGENT_CODER_FULL_ACCESS_KEY",
 ] as const;
 
 /** How long past its due time a wait for the chain's clock may run before it gives up. */
@@ -168,10 +171,10 @@ export async function loadTestnetTarget(dir: string = REPO_ROOT): Promise<Target
     network: "testnet",
     contractId: contract,
     tokenId: tusdc,
-    poster: { accountId: env.POSTER_ACCOUNT, privateKey: env.POSTER_PRIVATE_KEY },
-    judge: { accountId: env.JUDGE_ACCOUNT, privateKey: env.JUDGE_PRIVATE_KEY },
-    alice: { accountId: env.AGENT_ANALYST_ACCOUNT, privateKey: env.AGENT_ANALYST_PRIVATE_KEY },
-    bob: { accountId: env.AGENT_CODER_ACCOUNT, privateKey: env.AGENT_CODER_PRIVATE_KEY },
+    poster: { accountId: env.POSTER_ACCOUNT, privateKey: env.POSTER_FULL_ACCESS_KEY },
+    judge: { accountId: env.JUDGE_ACCOUNT, privateKey: env.JUDGE_FULL_ACCESS_KEY },
+    alice: { accountId: env.AGENT_ANALYST_ACCOUNT, privateKey: env.AGENT_ANALYST_FULL_ACCESS_KEY },
+    bob: { accountId: env.AGENT_CODER_ACCOUNT, privateKey: env.AGENT_CODER_FULL_ACCESS_KEY },
     windowSecs: NETWORKS.testnet.minWindowSecs,
   };
 }

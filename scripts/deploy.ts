@@ -47,10 +47,11 @@ import { loadEnv, parseEnvText, REPO_ROOT } from "./lib/env";
  *
  * The parent is the contract's owner. Its key signs the account creations and the owner's calls;
  * every other transaction is signed by the account it concerns, with the key the script made for it.
- * Those keys are appended to `.env.deploy.<network>` (mode 0600, git-ignored) before the accounts
- * exist, under the names the other scripts read, and are never printed. The contract's own are
- * `TENDER_CONTRACT` and `TENDER_CONTRACT_PRIVATE_KEY`; see `MEMBERS` for why they are not
- * `TENDER_ACCOUNT` and `TENDER_PRIVATE_KEY`.
+ * Those keys have full access. They are appended to `.env.deploy.<network>` (mode 0600, git-ignored)
+ * before the accounts exist, as `<STEM>_ACCOUNT` and `<STEM>_FULL_ACCESS_KEY`, and are never
+ * printed. The contract's own are `TENDER_CONTRACT` and `TENDER_CONTRACT_FULL_ACCESS_KEY`. The
+ * script never writes a `<STEM>_PRIVATE_KEY`, `TENDER_ACCOUNT` or `TENDER_PRIVATE_KEY`; see
+ * `roleVars` and `MEMBERS` for why.
  *
  * `pnpm deploy:testnet` is the command line. The mainnet deploy belongs to plan 07.
  */
@@ -138,27 +139,33 @@ const PARENT_ACCOUNT_INVALID =
 
 /**
  * The names of the variables that hold an account and its key in `.env.deploy.<network>`:
- * `<STEM>_ACCOUNT` and `<STEM>_PRIVATE_KEY`. Plan 05's seed and agent scripts read these.
+ * `<STEM>_ACCOUNT` and `<STEM>_FULL_ACCESS_KEY`. The key is the full-access key the deploy made for
+ * the account, and the name says so. `<STEM>_PRIVATE_KEY` is the key a service signs with, a
+ * function-call key limited to Tender that the owner adds (ruling P02-R27): the deploy never writes
+ * it, since `loadEnv` lets the network file win over `.env` and a full-access key under that name
+ * would replace the owner's. The scripts that sign as these accounts, such as the skeleton on
+ * testnet, read the full-access keys under these names.
  */
 const roleVars = (stem: string) => ({
   accountVar: `${stem}_ACCOUNT`,
-  keyVar: `${stem}_PRIVATE_KEY`,
+  keyVar: `${stem}_FULL_ACCESS_KEY`,
 });
 
 /**
  * The accounts the deploy creates under its parent, in the order it creates them, with what each
  * starts with and the variables of `.env.deploy.<network>` that hold its id and its key.
  *
- * Tender's are `TENDER_CONTRACT` and `TENDER_CONTRACT_PRIVATE_KEY` (ruling P02-R25), never the
- * `TENDER_ACCOUNT` and `TENDER_PRIVATE_KEY` of the MCP signer in `.env.example`: `loadEnv` lets the
- * network file win over `.env`, so those two would replace the signer with the contract's own
- * full-access key.
+ * Tender's are `TENDER_CONTRACT` and `TENDER_CONTRACT_FULL_ACCESS_KEY` (rulings P02-R25, P02-R27),
+ * never the `TENDER_ACCOUNT` and `TENDER_PRIVATE_KEY` of the MCP signer in `.env.example`: `loadEnv`
+ * lets the network file win over `.env`, so those two would replace the signer with the contract's
+ * own full-access key. That key can redeploy the contract, so it belongs on the owner's machine and
+ * on no host that runs a service.
  */
 const MEMBERS = [
   {
     name: "tender",
     accountVar: "TENDER_CONTRACT",
-    keyVar: "TENDER_CONTRACT_PRIVATE_KEY",
+    keyVar: "TENDER_CONTRACT_FULL_ACCESS_KEY",
     balance: TENDER_BALANCE,
   },
   { name: "treasury", ...roleVars("TREASURY"), balance: ACCOUNT_BALANCE },
@@ -179,7 +186,7 @@ interface Member {
   name: MemberName;
   id: string;
   balance: bigint;
-  /** The names of its variables in the env file. */
+  /** The names of its variables in the env file: the account id, and its full-access key. */
   accountVar: string;
   keyVar: string;
 }

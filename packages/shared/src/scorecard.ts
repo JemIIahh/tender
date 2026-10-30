@@ -49,10 +49,16 @@ export const ScorecardSchema = z.strictObject({
       bps: z.int().min(1).max(10_000),
     }),
   ),
-  /** When the Judge wrote the scorecard, ISO 8601 with a time zone. */
+  /** When the verifier wrote the scorecard, ISO 8601 with a time zone. */
   generated_at: z.iso.datetime({ offset: true }),
+  /**
+   * What produced the scores. Any account a task names as its verifier may publish a scorecard, so
+   * `software` is a name and not one fixed value: the team's Judge writes `tender-judge/1`, and
+   * another verifier names its own software, since none may claim to be the Judge. It is 1 to 64
+   * characters, counted in UTF-16 code units as `String.length` does.
+   */
   judge: z.strictObject({
-    software: z.literal("tender-judge/1"),
+    software: z.string().min(1).max(64),
     /** The model that scored a `rubric` task, `null` when none did. */
     model: z.string().nullable(),
   }),

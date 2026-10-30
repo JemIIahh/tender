@@ -41,16 +41,18 @@ const TGAS = 10n ** 12n;
 /** The code hash of an account that has no contract. */
 const NO_CODE = "11111111111111111111111111111111";
 
-const roleVars = (stem: string) => [`${stem}_ACCOUNT`, `${stem}_PRIVATE_KEY`] as const;
+const roleVars = (stem: string) => [`${stem}_ACCOUNT`, `${stem}_FULL_ACCESS_KEY`] as const;
 
 /**
  * The accounts the deploy creates under its parent and the variables it writes their ids and keys
- * to. Written out here, not imported, because the names are what the other scripts read. Tender's
- * are TENDER_CONTRACT and TENDER_CONTRACT_PRIVATE_KEY (ruling P02-R25): TENDER_ACCOUNT and
- * TENDER_PRIVATE_KEY are the MCP signer's, and the deploy never writes them.
+ * to. Written out here, not imported, because the names are what the other scripts read. The keys
+ * are full-access keys, so they are <STEM>_FULL_ACCESS_KEY and never <STEM>_PRIVATE_KEY, which is
+ * what a service signs with (ruling P02-R27). Tender's are TENDER_CONTRACT and
+ * TENDER_CONTRACT_FULL_ACCESS_KEY: TENDER_ACCOUNT and TENDER_PRIVATE_KEY are the MCP signer's, and
+ * the deploy never writes them.
  */
 const MEMBERS = [
-  ["tender", "TENDER_CONTRACT", "TENDER_CONTRACT_PRIVATE_KEY"],
+  ["tender", "TENDER_CONTRACT", "TENDER_CONTRACT_FULL_ACCESS_KEY"],
   ["treasury", ...roleVars("TREASURY")],
   ["judge", ...roleVars("JUDGE")],
   ["keeper", ...roleVars("KEEPER")],
@@ -126,10 +128,10 @@ async function runDeploy(parent: Signer, usdc: string, dir: string) {
 /** A line without its `OK ` or `SKIP ` and its ` (exists)`: the step it is about. */
 const stepOf = (line: string) => line.replace(/^(OK|SKIP) /, "").replace(/ \(exists\)$/, "");
 
-/** The private keys in an env file's text. */
-function privateKeysIn(envText: string): string[] {
+/** The full-access keys in an env file's text. */
+function fullAccessKeysIn(envText: string): string[] {
   return Object.entries(parseEnv(envText))
-    .filter(([name]) => name.endsWith("_PRIVATE_KEY"))
+    .filter(([name]) => name.endsWith("_FULL_ACCESS_KEY"))
     .map(([, value]) => value as string);
 }
 
@@ -201,7 +203,14 @@ test("deploy_writes_every_account_and_its_full_access_key_to_the_env_file", asyn
   // Exactly the variables the other scripts read, and one more that the deploy reads itself.
   const names = MEMBERS.flatMap(([, accountVar, keyVar]) => [accountVar, keyVar]);
   expect(Object.keys(env).sort()).toEqual([...names, "DEPLOY_TENDER_HEIGHT"].sort());
-  // The MCP signer's names are not the deploy's to write: the network file wins over .env.
+  // A full-access key sits under a _FULL_ACCESS_KEY name and under no other. A <STEM>_PRIVATE_KEY is
+  // the key a service signs with, a function-call key that the owner adds, and the network file
+  // wins over .env: a full-access key under that name would replace it.
+  expect(Object.keys(env).filter((name) => name.endsWith("_FULL_ACCESS_KEY"))).toHaveLength(
+    MEMBERS.length,
+  );
+  expect(Object.keys(env).filter((name) => name.endsWith("_PRIVATE_KEY"))).toEqual([]);
+  // The MCP signer's names are not the deploy's to write either.
   expect(env).not.toHaveProperty("TENDER_ACCOUNT");
   expect(env).not.toHaveProperty("TENDER_PRIVATE_KEY");
 
@@ -281,7 +290,7 @@ test("deploy_record_names_the_deploy_block_and_holds_no_secret", async () => {
 
   // No private key reached the record or the lines the script printed, the parent's included.
   const secrets = [
-    ...privateKeysIn(await readFile(join(mainDir, ".env.deploy.sandbox"), "utf8")),
+    ...fullAccessKeysIn(await readFile(join(mainDir, ".env.deploy.sandbox"), "utf8")),
     DEFAULT_PRIVATE_KEY,
   ];
   expect(secrets).toHaveLength(MEMBERS.length + 1);
@@ -385,7 +394,7 @@ test("deploy_stops_before_it_sends_when_the_env_file_does_not_read_back_as_writt
   );
   // The key that was appended is not in the message, and the chain was not touched.
   const keyLine = (await readFile(join(dir, ".env.deploy.sandbox"), "utf8")).match(
-    /^TENDER_CONTRACT_PRIVATE_KEY=(.+)$/m,
+    /^TENDER_CONTRACT_FULL_ACCESS_KEY=(.+)$/m,
   );
   expect(keyLine?.[1]).toBeDefined();
   expect(message).not.toContain(keyLine?.[1] ?? "");
@@ -433,7 +442,7 @@ test("deploy_refuses_an_account_that_runs_other_code_before_it_creates_anything"
   await sendAs(tender, tender.accountId, [actions.deployContract(tokenWasm)]);
   await writeFile(
     join(dir, ".env.deploy.sandbox"),
-    `TENDER_CONTRACT=${tender.accountId}\nTENDER_CONTRACT_PRIVATE_KEY=${tender.privateKey}\n`,
+    `TENDER_CONTRACT=${tender.accountId}\nTENDER_CONTRACT_FULL_ACCESS_KEY=${tender.privateKey}\n`,
   );
 
   await expect(runDeploy(parent, "usdc.sandbox", dir)).rejects.toThrow(
@@ -447,7 +456,7 @@ test("deploy_names_the_key_it_lacks_for_an_account_that_exists", async () => {
   // tender.sandbox exists, but this directory has no env file.
   const lost = await newDir();
   await expect(runDeploy(root, "usdc.sandbox", lost)).rejects.toThrow(
-    /tender\.sandbox exists, but TENDER_CONTRACT_PRIVATE_KEY is not in \.env\.deploy\.sandbox/,
+    /tender\.sandbox exists, but TENDER_CONTRACT_FULL_ACCESS_KEY is not in \.env\.deploy\.sandbox/,
   );
   expect(existsSync(join(lost, ".env.deploy.sandbox"))).toBe(false);
 
@@ -456,12 +465,12 @@ test("deploy_names_the_key_it_lacks_for_an_account_that_exists", async () => {
   const stranger = KeyPair.fromRandom("ed25519").toString();
   await writeFile(
     join(wrong, ".env.deploy.sandbox"),
-    `TENDER_CONTRACT=tender.sandbox\nTENDER_CONTRACT_PRIVATE_KEY=${stranger}\n`,
+    `TENDER_CONTRACT=tender.sandbox\nTENDER_CONTRACT_FULL_ACCESS_KEY=${stranger}\n`,
   );
   const error = await runDeploy(root, "usdc.sandbox", wrong).catch((e: unknown) => e);
   expect(error).toBeInstanceOf(Error);
   expect((error as Error).message).toMatch(
-    /TENDER_CONTRACT_PRIVATE_KEY .* is not a full-access key/,
+    /TENDER_CONTRACT_FULL_ACCESS_KEY .* is not a full-access key/,
   );
   // The message names the variable, never the key.
   expect((error as Error).message).not.toContain(stranger);
@@ -476,15 +485,15 @@ test("deploy_uses_the_key_an_interrupted_run_left_for_an_account_it_never_made",
   const envPath = join(dir, ".env.deploy.sandbox");
   await writeFile(
     envPath,
-    `TENDER_CONTRACT=tender.crash.sandbox\nTENDER_CONTRACT_PRIVATE_KEY=${key.toString()}\n`,
+    `TENDER_CONTRACT=tender.crash.sandbox\nTENDER_CONTRACT_FULL_ACCESS_KEY=${key.toString()}\n`,
   );
 
   const { lines } = await runDeploy(parent, "usdc.sandbox", dir);
 
   expect(lines).toContain("OK create tender.crash.sandbox");
   const text = await readFile(envPath, "utf8");
-  expect(text.match(/^TENDER_CONTRACT_PRIVATE_KEY=/gm)).toHaveLength(1);
-  expect(parseEnv(text).TENDER_CONTRACT_PRIVATE_KEY).toBe(key.toString());
+  expect(text.match(/^TENDER_CONTRACT_FULL_ACCESS_KEY=/gm)).toHaveLength(1);
+  expect(parseEnv(text).TENDER_CONTRACT_FULL_ACCESS_KEY).toBe(key.toString());
   const crashed = new TenderClient({
     network: "sandbox",
     contractId: "tender.crash.sandbox",

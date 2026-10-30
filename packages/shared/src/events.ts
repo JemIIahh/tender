@@ -23,6 +23,13 @@ const EVENT_PREFIX = "EVENT_JSON:";
 //   AccountId      a NEAR account id
 //   Option<T>      T, or null: the contract writes the key even when the value is None
 //   hash           64 lowercase hex characters, a SHA-256
+//   uri            `profile_uri`, `brief_uri`, `uri` and `scorecard_uri`, written `z.string()`
+//                  below: any UTF-8 text of 1 to 256 bytes, which is all the contract checks of
+//                  one (`check_uri`). It need not be a URL, and it can hold a NUL or another
+//                  control character. The schema lets these through on purpose: refusing one
+//                  makes `parseEventLog` return null, and the event is lost, a real reveal with
+//                  it. A consumer that stores a uri must clean it first: neither a `text` column
+//                  nor `jsonb` holds a NUL, so the indexer replaces each one with U+FFFD.
 
 /** One event: its name, and the single element of the `data` array that follows it in the log. */
 function variant<Name extends string, Data extends z.ZodRawShape>(event: Name, data: Data) {
@@ -48,6 +55,7 @@ export const TenderEventSchema = z.discriminatedUnion("event", [
   variant("deposit", { account, token: account, amount: u128, sender: account }),
   variant("withdraw", withdrawal),
   variant("withdraw_failed", withdrawal),
+  // `profile_uri`: arbitrary text from the chain, see "uri" in the legend above.
   variant("agent_registered", {
     account,
     asp: account.nullable(),
@@ -57,6 +65,7 @@ export const TenderEventSchema = z.discriminatedUnion("event", [
     updated: z.boolean(),
   }),
   // The new task as `get_task` shows it, so the id is `id` here and `task_id` in the other events.
+  // `brief_uri`: arbitrary text from the chain, see "uri" in the legend above.
   variant("task_created", {
     id: u64,
     poster: account,
@@ -87,7 +96,9 @@ export const TenderEventSchema = z.discriminatedUnion("event", [
     replaced: z.boolean(),
     block_height: u64,
   }),
+  // `uri`: arbitrary text from the chain, which any entrant can fill. See "uri" in the legend.
   variant("revealed", { task_id: u64, account, content_hash: hash, uri: z.string() }),
+  // `scorecard_uri`: arbitrary text from the chain, see "uri" in the legend above.
   variant("picked", {
     task_id: u64,
     by: account,
@@ -96,7 +107,8 @@ export const TenderEventSchema = z.discriminatedUnion("event", [
     scorecard_hash: hash,
     scorecard_uri: z.string(),
   }),
-  // `by` and the scorecard are null when `void_task` voided the task.
+  // `by` and the scorecard are null when `void_task` voided the task. `scorecard_uri` is arbitrary
+  // text from the chain when there is one, see "uri" in the legend above.
   variant("voided", {
     task_id: u64,
     reason: z.enum(["no_reveals", "no_award", "expired"]),
@@ -129,7 +141,13 @@ export const TenderEventSchema = z.discriminatedUnion("event", [
  */
 export type TenderEvent = z.infer<typeof TenderEventSchema>;
 
-/** The outside of a log line: the standard and version are checked, and `data` holds one element. */
+/**
+ * The outside of a log line: the standard and version are checked, and `data` holds one element.
+ *
+ * Every line the contract logs carries exactly one event (`emit` in `events.rs` writes a `data`
+ * array of one), and a line with any other count is dropped whole, not read for its first element.
+ * So the contract must never batch two events into one line: neither would reach a consumer.
+ */
 const LogEnvelope = z.object({
   standard: z.literal(EVENT_STANDARD),
   version: z.literal(EVENT_VERSION),

@@ -29,15 +29,17 @@ const start = vi.mocked(startLocalChain);
 const run = promisify(execFile);
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
+// The names the deploy script writes: the full-access key of each account, which the skeleton needs
+// to mint, deposit and post. The `_PRIVATE_KEY` names are the services' function-call keys.
 const KEYS = {
   POSTER_ACCOUNT: "poster.dev.testnet",
-  POSTER_PRIVATE_KEY: "ed25519:poster-key",
+  POSTER_FULL_ACCESS_KEY: "ed25519:poster-key",
   JUDGE_ACCOUNT: "judge.dev.testnet",
-  JUDGE_PRIVATE_KEY: "ed25519:judge-key",
+  JUDGE_FULL_ACCESS_KEY: "ed25519:judge-key",
   AGENT_ANALYST_ACCOUNT: "analyst.dev.testnet",
-  AGENT_ANALYST_PRIVATE_KEY: "ed25519:analyst-key",
+  AGENT_ANALYST_FULL_ACCESS_KEY: "ed25519:analyst-key",
   AGENT_CODER_ACCOUNT: "coder.dev.testnet",
-  AGENT_CODER_PRIVATE_KEY: "ed25519:coder-key",
+  AGENT_CODER_FULL_ACCESS_KEY: "ed25519:coder-key",
 };
 const DEPLOYMENT = {
   network: "testnet",
@@ -69,17 +71,46 @@ afterEach(async () => {
 });
 
 test("testnet_names_every_key_it_misses_before_it_reads_the_deployment", async () => {
-  const { POSTER_ACCOUNT, POSTER_PRIVATE_KEY } = KEYS;
+  const { POSTER_ACCOUNT, POSTER_FULL_ACCESS_KEY } = KEYS;
   // No deployment file either: the keys are what it reports.
-  const dir = await rootWith({ POSTER_ACCOUNT, POSTER_PRIVATE_KEY });
+  const dir = await rootWith({ POSTER_ACCOUNT, POSTER_FULL_ACCESS_KEY });
 
   await expect(loadTestnetTarget(dir)).rejects.toThrow(
     new Error(
-      "missing keys for network testnet: JUDGE_ACCOUNT, JUDGE_PRIVATE_KEY, " +
-        "AGENT_ANALYST_ACCOUNT, AGENT_ANALYST_PRIVATE_KEY, " +
-        "AGENT_CODER_ACCOUNT, AGENT_CODER_PRIVATE_KEY " +
+      "missing keys for network testnet: JUDGE_ACCOUNT, JUDGE_FULL_ACCESS_KEY, " +
+        "AGENT_ANALYST_ACCOUNT, AGENT_ANALYST_FULL_ACCESS_KEY, " +
+        "AGENT_CODER_ACCOUNT, AGENT_CODER_FULL_ACCESS_KEY " +
         "(set them in .env or .env.deploy.testnet)",
     ),
+  );
+});
+
+test("testnet_does_not_sign_with_the_function_call_keys_of_the_services", async () => {
+  // A <STEM>_PRIVATE_KEY is the key a service signs with. It cannot mint or deposit, and it is not
+  // what the deploy wrote, so the skeleton neither asks for it nor takes it in place of a missing
+  // full-access key.
+  const runtime = {
+    POSTER_PRIVATE_KEY: "ed25519:poster-fc-key",
+    JUDGE_PRIVATE_KEY: "ed25519:judge-fc-key",
+    AGENT_ANALYST_PRIVATE_KEY: "ed25519:analyst-fc-key",
+    AGENT_CODER_PRIVATE_KEY: "ed25519:coder-fc-key",
+  };
+  const withBoth = await rootWith({ ...runtime, ...KEYS }, JSON.stringify(DEPLOYMENT));
+  const target = await loadTestnetTarget(withBoth);
+  expect([target.poster, target.judge, target.alice, target.bob].map((s) => s.privateKey)).toEqual([
+    "ed25519:poster-key",
+    "ed25519:judge-key",
+    "ed25519:analyst-key",
+    "ed25519:coder-key",
+  ]);
+
+  const accountsOnly = Object.fromEntries(
+    Object.entries(KEYS).filter(([name]) => name.endsWith("_ACCOUNT")),
+  );
+  const onlyRuntime = await rootWith({ ...runtime, ...accountsOnly }, JSON.stringify(DEPLOYMENT));
+  await expect(loadTestnetTarget(onlyRuntime)).rejects.toThrow(
+    "missing keys for network testnet: POSTER_FULL_ACCESS_KEY, JUDGE_FULL_ACCESS_KEY, " +
+      "AGENT_ANALYST_FULL_ACCESS_KEY, AGENT_CODER_FULL_ACCESS_KEY ",
   );
 });
 

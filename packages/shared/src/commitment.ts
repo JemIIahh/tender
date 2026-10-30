@@ -1,4 +1,5 @@
 import { hexToBytes, sha256Hex } from "./hash";
+import { AccountIdSchema } from "./primitives";
 
 const U64_MAX = 2n ** 64n - 1n;
 const U64_BYTES = 8;
@@ -26,8 +27,9 @@ function array32(name: string, hex: string): Uint8Array {
  * where the content hash and the salt are 32 bytes each. Both must be given as exactly 64 lowercase
  * hex characters, the form the contract takes (its `parse_hash` rejects uppercase). Uppercase hex
  * would give a valid commitment, but revealing with the same strings would then fail with E_HASH,
- * so it is refused here. Throws if either string is anything else, or if the task id does not fit
- * a u64.
+ * so it is refused here. The account must be a NEAR account id (`AccountIdSchema`): `"Alice.near"`
+ * or `""` would give a commitment too, but no account could ever reveal it. Throws if either
+ * string is anything else, if the account is no account id, or if the task id does not fit a u64.
  */
 export function computeCommitment(
   taskId: bigint,
@@ -37,6 +39,9 @@ export function computeCommitment(
 ): string {
   if (taskId < 0n || taskId > U64_MAX) {
     throw new RangeError(`task id must fit a u64, got ${taskId}`);
+  }
+  if (!AccountIdSchema.safeParse(account).success) {
+    throw new Error("account must be a NEAR account id");
   }
   const contentHash = array32("content hash", contentHashHex);
   const salt = array32("salt", saltHex);
