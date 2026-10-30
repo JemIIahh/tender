@@ -451,6 +451,51 @@ test("a_copy_reveal_in_a_slower_task_cannot_delay_it", async () => {
   }
 });
 
+test("the_first_reveal_is_the_earliest_by_height_even_if_applied_late", async () => {
+  await seedLifecycle(deps.db);
+  // As in a_copy_reveal_in_a_faster_task_cannot_publish_early, task 2 closes late and task 3 early.
+  const slow = REVEAL_DEADLINE + 1_000n * SECOND;
+  const fast = REVEAL_DEADLINE + 500n * SECOND;
+  await openTask(2, slow, [carol]);
+  await openTask(3, fast, [alice]);
+
+  // Carol revealed in task 2 at height 200, and alice revealed the same hash in task 3 at height
+  // 300. The index applies the block of height 300 first, as it would if the block of height 200
+  // had been missing and were filled in afterwards. The reveal that is earlier on chain is the one
+  // with the higher id.
+  nextHeight = 300n;
+  const hash = await reveal(3, alice, "the answer is 42");
+  nextHeight = 200n;
+  expect(await reveal(2, carol, "the answer is 42")).toBe(hash);
+  const stored = await deps.db.query<{ task_id: string; height: string }>(
+    `select task_id::text as task_id, height::text as height
+       from events
+      where event = 'revealed' and data->>'content_hash' = $1
+      order by id`,
+    [hash],
+  );
+  expect(stored).toEqual([
+    { task_id: "3", height: "300" },
+    { task_id: "2", height: "200" },
+  ]);
+
+  const put = await post("/v1/blobs", resultBody("the answer is 42", "2"), carol);
+  expect(put.body.sha256).toBe(hash);
+  const path = `/v1/blobs/${hash}`;
+
+  // The first reveal is the one at the lower height, so the bytes wait for task 2, not for task 3.
+  for (const at of [TEST_NOW, fast - 1n, fast, fast + 1n, slow - 1n]) {
+    nowNs = at;
+    const hidden = await get(path);
+    expect(hidden.status, `at ${at}`).toBe(404);
+    expect(hidden.headers.get("cache-control"), `at ${at}`).toBe("no-store");
+  }
+  nowNs = slow;
+  const shown = await get(path);
+  expect(shown.status).toBe(200);
+  expect(shown.text()).toBe("the answer is 42");
+});
+
 test("upload_too_large_413", async () => {
   const base = await seed();
   const exactly = await post("/v1/blobs", resultBody(new Uint8Array(LIMIT).fill(0x61), "1"), alice);

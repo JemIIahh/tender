@@ -369,7 +369,9 @@ async function store(db: Db, blob: NewBlob): Promise<{ sha256: string; stored: S
  * Whether the API may serve `blob`, which is stored under `sha256`. A result is served by what was
  * revealed, not by who sent it: from the reveal deadline of the task that revealed `sha256` first
  * (the contract's rule, `now >= reveal_deadline`), the first being the earliest `revealed` event
- * in the index with that `content_hash`. No such event, no bytes.
+ * in the index with that `content_hash`: by block height, and by the order the index stored them
+ * in within a block. The order of storing alone would not do, since the index may apply a block
+ * after later ones, such as a gap it fills in afterwards. No such event, no bytes.
  *
  * Only the first reveal counts. The contract checks a reveal against its commitment and not the
  * bytes, so once a hash is on chain anyone whose commit window is open can commit to it and reveal
@@ -390,7 +392,7 @@ async function mayServe(deps: ApiDeps, sha256: string, blob: StoredBlob): Promis
                 select e.task_id
                   from events e
                  where e.event = 'revealed' and e.data->>'content_hash' = $1
-                 order by e.id
+                 order by e.height, e.id
                  limit 1
               )
           and t.reveal_deadline <= $2::numeric
