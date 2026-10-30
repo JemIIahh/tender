@@ -1239,7 +1239,11 @@ test("a_blob_of_the_most_the_api_stores_is_read_however_it_comes", async () => {
   ];
   for (const answer of answers) {
     api.on(`GET /v1/blobs/${hash}`, answer);
-    expect(await client.getBlob(hash)).toEqual(bytes);
+    const got = await client.getBlob(hash);
+    // Compared natively: `toEqual` takes a third of a second on this many bytes, and three of those
+    // run past the test timeout on a busy machine.
+    expect(got?.length).toBe(bytes.length);
+    expect(got && Buffer.compare(got, bytes)).toBe(0);
   }
 
   // An answer with no body at all is an empty blob.
