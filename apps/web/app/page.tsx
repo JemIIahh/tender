@@ -13,7 +13,7 @@ import { errorMessage } from "../lib/errors";
 
 type Board =
   | { status: "loading" }
-  | { status: "error"; message: string }
+  | { status: "error"; message: string; retrying: boolean }
   | { status: "ready"; tasks: TaskSummary[] };
 
 function TaskCard({ task }: { task: TaskSummary }) {
@@ -43,7 +43,7 @@ function BoardBody({ board, onRetry }: { board: Board; onRetry: () => void }) {
     case "loading":
       return <p role="status">Loading tasks…</p>;
     case "error":
-      return <ErrorState message={board.message} onRetry={onRetry} />;
+      return <ErrorState message={board.message} retrying={board.retrying} onRetry={onRetry} />;
     case "ready":
       return board.tasks.length === 0 ? (
         <p>No tasks yet.</p>
@@ -65,13 +65,21 @@ export default function Home() {
 
   const load = useCallback(() => {
     const request = ++latest.current;
-    setBoard({ status: "loading" });
+    // A retry leaves the error and its button where they are, so that the person who pressed it
+    // keeps their focus: a button that is taken off the page drops it to the top of the document.
+    setBoard((now) =>
+      now.status === "error" ? { ...now, retrying: true } : { status: "loading" },
+    );
     api.listTasks().then(
       (page) => {
         if (request === latest.current) setBoard({ status: "ready", tasks: page.tasks });
       },
       (error) => {
-        if (request === latest.current) setBoard({ status: "error", message: errorMessage(error) });
+        if (request !== latest.current) return;
+        // The person gets words (`errorMessage`); the original, with its status, its body and the
+        // field a schema refused, goes to the console, where a developer looks.
+        console.error(error);
+        setBoard({ status: "error", message: errorMessage(error), retrying: false });
       },
     );
   }, []);

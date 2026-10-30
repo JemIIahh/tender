@@ -5,7 +5,7 @@ export interface WebConfig {
   network: NetworkId;
   /** The origin of the Tender API, with no trailing slash and no `/v1`. */
   apiUrl: string;
-  /** The NEAR JSON-RPC endpoint the browser reads views from. */
+  /** The NEAR JSON-RPC endpoint the browser reads views from. It ships in the page: it is public. */
   rpcUrl: string;
   /** The account id of the Tender contract. */
   contractId: string;
@@ -67,7 +67,9 @@ export function readConfig(env: PublicEnv): WebConfig {
     );
   }
 
-  // An RPC URL can carry an API key in its query, so it is used as it is written.
+  // Used as it is written, because a provider may want a key in the query. Everything in this
+  // variable ships in the page, so such a key is public by construction: use one issued for
+  // browsers (limited to this site), never the FASTNEAR_API_KEY the services use.
   const rpc = env.NEXT_PUBLIC_RPC_URL?.trim() ?? "";
   if (rpc !== "") httpUrl("NEXT_PUBLIC_RPC_URL", rpc);
   const rpcUrl = rpc === "" ? NETWORKS[network].rpcUrl : rpc;

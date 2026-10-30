@@ -85,6 +85,26 @@ test("view_encodes_args_as_utf8", async () => {
   expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual({ account_id: "é→日本" });
 });
 
+test("view_writes_a_bigint_arg_as_a_decimal_string", async () => {
+  const sent = fakeRpc(json(returned("null")));
+
+  // R19: a u64 or a u128 is a decimal string in the contract's JSON, and `JSON.stringify` throws
+  // on a bigint.
+  await view("tender.testnet", "get_task", {
+    task_id: 7n,
+    amount: 2n ** 128n - 1n,
+    ids: [1n, 2n],
+    nested: { parent: 2n ** 64n - 1n, name: "x" },
+  });
+
+  expect(JSON.parse(fromBase64(String(sent[0]?.body.params.args_base64)))).toEqual({
+    task_id: "7",
+    amount: "340282366920938463463374607431768211455",
+    ids: ["1", "2"],
+    nested: { parent: "18446744073709551615", name: "x" },
+  });
+});
+
 test("view_decodes_the_result_bytes_as_json", async () => {
   fakeRpc(json(returned('{"total":"1000000","available":"250000"}')));
   expect(await view("tender.testnet", "storage_balance_of", { account_id: "a.near" })).toEqual({

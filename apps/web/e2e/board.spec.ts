@@ -47,16 +47,16 @@ test("phone_width_has_no_horizontal_scroll", async ({ page }) => {
     await page.goto(route);
     await loaded(page);
 
-    const scrollWidth = await page.evaluate(() => ({
+    const { client, ...scroll } = await page.evaluate(() => ({
+      client: document.documentElement.clientWidth,
       page: document.documentElement.scrollWidth,
       body: document.body.scrollWidth,
     }));
-    expect(scrollWidth.page, `${route}: the page is wider than the screen`).toBeLessThanOrEqual(
-      PHONE.width,
-    );
-    expect(scrollWidth.body, `${route}: the body is wider than the screen`).toBeLessThanOrEqual(
-      PHONE.width,
-    );
+    // The page has to fit the room it has: the screen, less the width of a scrollbar where one takes
+    // any (headed Chrome on Linux or Windows), which is what `clientWidth` is.
+    const room = Math.min(PHONE.width, client);
+    expect(scroll.page, `${route}: the page is wider than the screen`).toBeLessThanOrEqual(room);
+    expect(scroll.body, `${route}: the body is wider than the screen`).toBeLessThanOrEqual(room);
   }
 });
 
@@ -97,8 +97,22 @@ test("silent_api_ends_in_an_error_state_and_retry_loads_the_board", async ({ pag
   await expect(error).toContainText("too long");
   await expect(page.getByRole("status")).toHaveCount(0);
 
+  // Retry from the keyboard while the API is still silent. The error and its button stay on the
+  // page, and the button keeps the focus: a browser drops it from a button that goes away.
+  const retry = error.getByRole("button");
+  await retry.focus();
+  await page.keyboard.press("Enter");
+  await expect(retry).toHaveText("Retrying…");
+  await expect(retry).toBeFocused();
+  await expect(page.getByRole("status")).toHaveCount(0);
+
+  await page.clock.fastForward(20_000);
+  await expect(retry).toHaveText("Retry");
+  await expect(retry).toBeFocused();
+
+  // The API is back: the next try loads the board.
   silent = false;
-  await error.getByRole("button", { name: "Retry" }).click();
+  await retry.click();
   await expect(page.getByTestId("task-card")).toHaveCount(TASKS.length);
   await expect(error).toHaveCount(0);
 });

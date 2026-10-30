@@ -19,7 +19,9 @@ function apiErrorMessage(error: ApiError): string {
 /** Plain words for why a request failed, for an `ErrorState`. */
 export function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return apiErrorMessage(error);
-  if (error instanceof RpcError) return "The NEAR network did not answer. Try again in a moment.";
+  // An `RpcError` is an answer that was no use: a node that refused, a contract that panicked or a
+  // result that did not read. It says nothing of whether the network is up, so neither does this.
+  if (error instanceof RpcError) return "The NEAR network sent an answer this page can't use.";
   if ((error as { name?: unknown } | null)?.name === "TimeoutError") {
     return "That took too long. Check your connection and try again.";
   }

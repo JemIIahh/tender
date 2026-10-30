@@ -34,11 +34,27 @@ test("error_message_says_so_when_the_apis_answer_is_unreadable", () => {
   expect(message).not.toContain("schema");
 });
 
-test("error_message_for_the_chain_and_for_a_failed_request", () => {
-  expect(errorMessage(new RpcError("node says no"))).toMatch(/NEAR/);
+test("error_message_for_a_failed_request", () => {
   expect(errorMessage(new TypeError("Failed to fetch"))).toMatch(/can't reach/i);
   expect(errorMessage("a string")).toMatch(/can't reach/i);
   expect(errorMessage(undefined)).toMatch(/can't reach/i);
+});
+
+test("error_message_for_the_chain_is_about_its_answer_and_not_about_an_outage", () => {
+  // Each of these is an answer: the node refused, the contract panicked, the result did not read.
+  for (const reason of [
+    "the RPC node answered with status 429",
+    "wasm execution failed with error: FunctionCallError(HostError(GuestPanic",
+    "get_task returned text that is not JSON",
+  ]) {
+    const message = errorMessage(new RpcError(reason));
+
+    expect(message, reason).toMatch(/NEAR/);
+    expect(message, reason).toMatch(/answer/i);
+    expect(message, reason).not.toMatch(/did not answer|down|unavailable|reach/i);
+    // The node's own words are for the console, not for a reader.
+    expect(message, reason).not.toContain(reason);
+  }
 });
 
 test("error_message_for_a_request_that_took_too_long", () => {

@@ -69,6 +69,40 @@ test("amount_keeps_every_digit_of_the_largest_amount", () => {
   expect(container.textContent).toBe(`${max} mystery.token.near`);
 });
 
+test("amount_shows_a_missing_value_as_a_dash_with_the_token", () => {
+  for (const value of [null, undefined, ""]) {
+    const { container, unmount } = render(<Amount value={value} token="mystery.token.near" />);
+    expect(container.textContent, String(value)).toBe("— mystery.token.near");
+    unmount();
+  }
+});
+
+test("amount_shows_a_value_that_is_no_amount_as_it_was_written_with_the_tokens_id", () => {
+  // A `view` result is unchecked JSON: a malformed value must not take the page down with it.
+  for (const value of ["12x", "-5", "1.5", "1e3", " 7", "0x10", "\u0663", "NaN"]) {
+    // A token that is known is not named by its symbol: there is no telling what unit this is in.
+    const known = render(<Amount value={value} token={USDC_TESTNET} />);
+    expect(known.container.textContent, value).toBe(`${value} ${USDC_TESTNET}`);
+    known.unmount();
+
+    const unknown = render(<Amount value={value} token="mystery.token.near" />);
+    expect(unknown.container.textContent, value).toBe(`${value} mystery.token.near`);
+    unknown.unmount();
+  }
+});
+
+test("amount_still_scales_an_amount_next_to_one_that_is_none", () => {
+  const { container } = render(
+    <>
+      <Amount value="1250000" token={USDC_TESTNET} />
+      <Amount value={null} token={USDC_TESTNET} />
+      <Amount value="2500000" token={USDC_TESTNET} />
+    </>,
+  );
+
+  expect(container.textContent).toBe(`1.25 USDC— ${USDC_TESTNET}2.50 USDC`);
+});
+
 // ---- TeamBadge --------------------------------------------------------------------------------
 
 test("team_badge_labels_an_account_the_team_runs", () => {
@@ -92,8 +126,23 @@ test("error_state_shows_the_message_as_an_alert_with_a_retry_button", async () =
   render(<ErrorState message="Can't reach the server." onRetry={onRetry} />);
 
   expect(screen.getByRole("alert").textContent).toContain("Can't reach the server.");
-  await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+  const button = screen.getByRole("button", { name: "Retry" });
+  expect(button.getAttribute("aria-disabled")).not.toBe("true");
+  await userEvent.click(button);
   expect(onRetry).toHaveBeenCalledTimes(1);
+});
+
+test("error_state_while_retrying_reads_retrying_and_asks_for_nothing_more", async () => {
+  const onRetry = vi.fn();
+  render(<ErrorState message="Can't reach the server." onRetry={onRetry} retrying />);
+
+  const button = screen.getByRole("button", { name: "Retrying…" }) as HTMLButtonElement;
+  expect(button.getAttribute("aria-disabled")).toBe("true");
+  // Not `disabled`: a button that is can't hold the focus of the person who pressed it.
+  expect(button.disabled).toBe(false);
+  expect(screen.getByRole("alert").textContent).toContain("Can't reach the server.");
+  await userEvent.click(button);
+  expect(onRetry).not.toHaveBeenCalled();
 });
 
 // ---- Nav --------------------------------------------------------------------------------------

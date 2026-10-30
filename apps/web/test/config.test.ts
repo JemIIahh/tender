@@ -58,8 +58,9 @@ test("config_drops_the_trailing_slash_of_the_api_url", () => {
 });
 
 test("config_keeps_the_rpc_url_as_it_is_written", () => {
-  // A key in the query is how some providers are called.
-  const rpc = "https://rpc.example/?apiKey=public-key";
+  // Some providers take a key in the query. It ships in the page, so it has to be a key issued for
+  // browsers, never the FASTNEAR_API_KEY of the services.
+  const rpc = "https://rpc.example/?apiKey=browser-key";
   expect(readConfig({ ...BASE, NEXT_PUBLIC_RPC_URL: rpc }).rpcUrl).toBe(rpc);
 });
 

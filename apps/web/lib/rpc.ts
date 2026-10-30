@@ -13,6 +13,13 @@ export class RpcError extends Error {
   }
 }
 
+/**
+ * A bigint in `args` goes out as a decimal string, as R19 writes a u64 or a u128 in the contract's
+ * JSON. `JSON.stringify` alone throws on one.
+ */
+const bigintAsDecimal = (_key: string, value: unknown): unknown =>
+  typeof value === "bigint" ? value.toString() : value;
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -47,7 +54,8 @@ function returnedBytes(answer: unknown): number[] {
  * Calls the view `method` of `contractId` with `args` on the configured RPC node, at the last
  * final block: what it returns cannot be undone, as for `TenderClient.view`. The result is the
  * JSON the contract returned, unchecked; a caller that needs it to be right parses it with the
- * schemas of `@tender/shared`. A call that returns nothing gives `undefined`.
+ * schemas of `@tender/shared`. A call that returns nothing gives `undefined`. A bigint in `args`
+ * is sent as a decimal string.
  *
  * Throws an `RpcError` for an answer that is an error or is not a view's result. A request that
  * fails before there is an answer, or gets none in time (a `TimeoutError`), is thrown as it came.
@@ -62,7 +70,7 @@ export async function view<T>(contractId: string, method: string, args: object =
       finality: "final",
       account_id: contractId,
       method_name: method,
-      args_base64: toBase64(new TextEncoder().encode(JSON.stringify(args))),
+      args_base64: toBase64(new TextEncoder().encode(JSON.stringify(args, bigintAsDecimal))),
     },
   };
 

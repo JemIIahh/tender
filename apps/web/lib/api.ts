@@ -1,6 +1,7 @@
 import {
   type AccountEntriesResponse,
   AccountEntriesResponseSchema,
+  AccountIdSchema,
   type AgentDetailResponse,
   AgentDetailResponseSchema,
   ApiError,
@@ -29,6 +30,7 @@ import {
   TaskDetailResponseSchema,
   type TelegramLinkResponse,
   TelegramLinkResponseSchema,
+  U64StringSchema,
 } from "@tender/shared";
 import { toBase64 } from "./base64";
 import { config } from "./config";
@@ -44,6 +46,11 @@ import { withTimeout } from "./timeout";
 // says so. A request that fails before there is an answer (offline, refused) is thrown as it
 // came, and so is one that gets none in time: a `TimeoutError`. `errorMessage` (lib/errors.ts)
 // turns any of them into words for a person.
+//
+// An id is checked before anything is sent: a task id is a u64 as a decimal string, an account a
+// NEAR account id. A page's address can hold anything, `..` among it, and a string that is no id
+// is no task or agent, so a read of one thing gives null for it without asking. A call that has no
+// null to give throws an `Error` that names the value.
 
 /** How long a read may take before it is given up on. */
 const READ_TIMEOUT_MS = 15_000;
@@ -67,8 +74,27 @@ function url(path: string, query: Query = {}): string {
   return `${V1}${path}${text === "" ? "" : `?${text}`}`;
 }
 
-/** A task id or an account as one segment of a path: a page's address can hold anything. */
-const segment = (value: bigint | string): string => encodeURIComponent(String(value));
+/**
+ * `id` as the text of a task id, or undefined if it is none: a u64 as a decimal string. That is
+ * digits and nothing else, so what passes can go into a path as it is.
+ */
+function taskIdText(id: bigint | string): string | undefined {
+  const text = String(id);
+  return U64StringSchema.safeParse(text).success ? text : undefined;
+}
+
+/**
+ * `account` if it is a NEAR account id, else undefined. An id is lowercase letters and digits
+ * joined by `.`, `-` or `_`, so it needs no escape in a path, and `.` and `..` are not ids.
+ */
+function accountIdText(account: string): string | undefined {
+  return AccountIdSchema.safeParse(account).success ? account : undefined;
+}
+
+/** The error of a call that was given a value that is no id, thrown before any request. */
+function notAnId(call: string, what: string, value: unknown): never {
+  throw new Error(`${call}: ${JSON.stringify(String(value))} is not ${what}`);
+}
 
 function get<T>(path: string, schema: Schema<T>, query?: Query): Promise<T> {
   return withTimeout(READ_TIMEOUT_MS, (signal) => fetchJson(url(path, query), schema, { signal }));
@@ -135,10 +161,13 @@ export const api = {
 
   /**
    * `GET /v1/tasks/:id`: one task with its entries and funders; null if there is no such task. The
-   * id is a bigint, or the string an address holds: a string that is no id is no task, so null.
+   * id is a bigint, or the string an address holds: a string that is no id is no task, so null,
+   * and nothing is sent.
    */
-  getTask(id: bigint | string): Promise<TaskDetailResponse | null> {
-    return orNull(get(`/tasks/${segment(id)}`, TaskDetailResponseSchema));
+  async getTask(id: bigint | string): Promise<TaskDetailResponse | null> {
+    const task = taskIdText(id);
+    if (task === undefined) return null;
+    return orNull(get(`/tasks/${task}`, TaskDetailResponseSchema));
   },
 
   /** `GET /v1/agents`: one page of registered agents, in the order of their accounts. */
@@ -147,19 +176,33 @@ export const api = {
     return get("/agents", ListAgentsResponseSchema, { tag, asp, limit, cursor });
   },
 
-  /** `GET /v1/agents/:account`: an agent and its recent entries; null if there is no such agent. */
-  getAgent(account: string): Promise<AgentDetailResponse | null> {
-    return orNull(get(`/agents/${segment(account)}`, AgentDetailResponseSchema));
+  /**
+   * `GET /v1/agents/:account`: an agent and its recent entries; null if there is no such agent. A
+   * string that is no account id is no agent, so null, and nothing is sent.
+   */
+  async getAgent(account: string): Promise<AgentDetailResponse | null> {
+    const agent = accountIdText(account);
+    if (agent === undefined) return null;
+    return orNull(get(`/agents/${agent}`, AgentDetailResponseSchema));
   },
 
-  /** `GET /v1/entries?account=`: every entry of one account, newest commit first. */
-  listEntries(account: string): Promise<AccountEntriesResponse> {
-    return get("/entries", AccountEntriesResponseSchema, { account });
+  /**
+   * `GET /v1/entries?account=`: every entry of one account, newest commit first. It throws for a
+   * string that is no account id, as the API would answer 400, without asking.
+   */
+  async listEntries(account: string): Promise<AccountEntriesResponse> {
+    const owner = accountIdText(account) ?? notAnId("listEntries", "a NEAR account id", account);
+    return get("/entries", AccountEntriesResponseSchema, { account: owner });
   },
 
-  /** `GET /v1/scorecards/:task_id`: the scorecard a task was settled with; null if it has none. */
-  getScorecard(taskId: bigint | string): Promise<Scorecard | null> {
-    return orNull(get(`/scorecards/${segment(taskId)}`, ScorecardSchema));
+  /**
+   * `GET /v1/scorecards/:task_id`: the scorecard a task was settled with; null if it has none, as
+   * for an id that is no task id.
+   */
+  async getScorecard(taskId: bigint | string): Promise<Scorecard | null> {
+    const task = taskIdText(taskId);
+    if (task === undefined) return null;
+    return orNull(get(`/scorecards/${task}`, ScorecardSchema));
   },
 
   /** `GET /v1/health`: how far the index is behind the chain; a 503 throws an `ApiError`. */
@@ -209,9 +252,13 @@ export const api = {
     });
   },
 
-  /** `POST /v1/tasks/:id/start`: says this account has started on an open task. Needs a token. */
-  start(token: string, taskId: bigint | string): Promise<StartResponse> {
-    return post(`/tasks/${segment(taskId)}/start`, StartResponseSchema, { token });
+  /**
+   * `POST /v1/tasks/:id/start`: says this account has started on an open task. Needs a token. It
+   * throws for an id that is no task id, without asking.
+   */
+  async start(token: string, taskId: bigint | string): Promise<StartResponse> {
+    const task = taskIdText(taskId) ?? notAnId("start", "a task id", taskId);
+    return post(`/tasks/${task}/start`, StartResponseSchema, { token });
   },
 
   /** `POST /v1/telegram/link`: a one-time link from this account to the bot. Needs a token. */

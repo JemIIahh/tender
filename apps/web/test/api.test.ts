@@ -209,14 +209,6 @@ test("get_task_reads_one_task_by_a_bigint_or_a_string_id", async () => {
   expect(calls.map((c) => c.url)).toEqual([`${BASE}/tasks/7`, `${BASE}/tasks/7`]);
 });
 
-test("get_task_keeps_an_id_from_the_address_inside_its_path", async () => {
-  const calls = fakeApi({ error: "not_found", message: "no such task" }, 404);
-
-  expect(await api.getTask("../health?x=1#y")).toBeNull();
-
-  expect(calls[0]?.url).toBe(`${BASE}/tasks/..%2Fhealth%3Fx%3D1%23y`);
-});
-
 test("reads_of_one_thing_give_null_when_the_api_has_none", async () => {
   fakeApi({ error: "not_found", message: "no such thing" }, 404);
 
@@ -477,6 +469,120 @@ test("a_refused_write_throws_with_the_apis_error_body", async () => {
   expect(error).toBeInstanceOf(ApiError);
   expect(error.status).toBe(409);
   expect(error.body).toEqual(refusal);
+});
+
+// ---- Ids --------------------------------------------------------------------------------------
+
+// A page's address can hold anything. `..` and `.` are the two that a URL parser reads as a step up
+// in the path, even when they are written as `%2E%2E`.
+
+/** What an address can hold that is no task id: a u64 is digits, with no sign or leading zero. */
+const NOT_TASK_IDS = [
+  "",
+  ".",
+  "..",
+  "%2E%2E",
+  "abc",
+  "-1",
+  "1.5",
+  "007",
+  "1e3",
+  " 7",
+  "7 ",
+  "7/start",
+  "../health?x=1#y",
+  "18446744073709551616",
+  "\u0663",
+];
+
+/** ... and what is no account id: 2 to 64 lowercase letters and digits, joined by `.`, `-` or `_`. */
+const NOT_ACCOUNTS = [
+  "",
+  ".",
+  "..",
+  "%2E%2E",
+  "a",
+  "Alice.near",
+  "alice..near",
+  "alice near",
+  "alice.near/start",
+  "../health?x=1#y",
+  "a".repeat(65),
+];
+
+test("reads_of_one_task_give_null_for_an_id_that_is_none_and_ask_nothing", async () => {
+  const calls = fakeApi(TASK_DETAIL);
+
+  for (const id of [...NOT_TASK_IDS, -1n, 2n ** 64n]) {
+    expect(await api.getTask(id), `getTask ${id}`).toBeNull();
+    expect(await api.getScorecard(id), `getScorecard ${id}`).toBeNull();
+  }
+
+  expect(calls).toHaveLength(0);
+});
+
+test("a_read_of_one_agent_gives_null_for_an_account_that_is_none_and_asks_nothing", async () => {
+  const calls = fakeApi(AGENT_DETAIL);
+
+  for (const account of NOT_ACCOUNTS) {
+    expect(await api.getAgent(account), `getAgent ${account}`).toBeNull();
+  }
+
+  expect(calls).toHaveLength(0);
+});
+
+test("a_call_with_no_null_to_give_throws_for_an_id_that_is_none_and_asks_nothing", async () => {
+  const calls = fakeApi({ ok: true, working_count: 1 });
+
+  for (const id of [...NOT_TASK_IDS, -1n, 2n ** 64n]) {
+    await expect(api.start(TOKEN, id), `start ${id}`).rejects.toThrow(
+      /start: ".*" is not a task id/,
+    );
+  }
+  for (const account of NOT_ACCOUNTS) {
+    await expect(api.listEntries(account), `listEntries ${account}`).rejects.toThrow(
+      /listEntries: ".*" is not a NEAR account id/,
+    );
+  }
+
+  expect(calls).toHaveLength(0);
+});
+
+test("the_error_for_an_id_that_is_none_names_the_call_and_the_value", async () => {
+  fakeApi({});
+
+  await expect(api.start(TOKEN, "..")).rejects.toThrow('start: ".." is not a task id');
+  await expect(api.listEntries("Bob")).rejects.toThrow(
+    'listEntries: "Bob" is not a NEAR account id',
+  );
+});
+
+test("the_ids_that_are_valid_reach_their_paths_as_they_are_written", async () => {
+  const tasks = fakeApi(TASK_DETAIL);
+  await api.getTask("0");
+  await api.getTask("18446744073709551615");
+  await api.getTask(2n ** 64n - 1n);
+  expect(tasks.map((c) => c.url)).toEqual([
+    `${BASE}/tasks/0`,
+    `${BASE}/tasks/18446744073709551615`,
+    `${BASE}/tasks/18446744073709551615`,
+  ]);
+
+  const scorecards = fakeApi(SCORECARD);
+  await api.getScorecard("18446744073709551615");
+  expect(scorecards.map((c) => c.url)).toEqual([`${BASE}/scorecards/18446744073709551615`]);
+
+  const implicit = "0f".repeat(32);
+  const agents = fakeApi(AGENT_DETAIL);
+  for (const account of ["alice.test.near", "a-b_c.d.testnet", "ab", implicit]) {
+    await api.getAgent(account);
+  }
+  expect(agents.map((c) => c.url)).toEqual([
+    `${BASE}/agents/alice.test.near`,
+    `${BASE}/agents/a-b_c.d.testnet`,
+    `${BASE}/agents/ab`,
+    `${BASE}/agents/${implicit}`,
+  ]);
 });
 
 // ---- Waiting ----------------------------------------------------------------------------------
