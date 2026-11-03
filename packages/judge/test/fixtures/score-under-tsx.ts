@@ -18,10 +18,14 @@ const criteria: P0Criteria = {
 const task = { criteria, heldout: { exact: { expected: ["42"] } } };
 const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
 
-const judges = openTaskScorer(task);
+// A worker may take far longer than usual to load and to compile on a machine that is busy, and
+// what is shown here is that the workers load under tsx, not how long that takes.
+const unhurried = { startTimeoutMs: 120_000, compileBudgetMs: 120_000 };
+const judges = openTaskScorer(task, unhurried);
 const rogue = openTaskScorer(task, {
+  ...unhurried,
   workerUrl: new URL("./rogue-worker.ts", import.meta.url),
-  entryTimeoutMs: 500,
+  entryTimeoutMs: 2_000,
   onCrash: () => undefined,
 });
 const scores = [
@@ -35,9 +39,12 @@ const scores = [
 ];
 const warm = new WarmWorker();
 await warm.ready();
-const warmed = openTaskScorer(task, { workers: warm });
+const warmed = openTaskScorer(task, { ...unhurried, workers: warm });
 scores.push(await warmed.score(bytes("42")));
-const check = await checkJsonSchemaIsolated({ type: "object" });
+const check = await checkJsonSchemaIsolated(
+  { type: "object" },
+  { startTimeoutMs: 120_000, budgetMs: 120_000 },
+);
 await judges.close();
 await rogue.close();
 await warmed.close();

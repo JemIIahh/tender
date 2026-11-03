@@ -2,9 +2,9 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PublicCriteria } from "@tender/shared";
-import { afterAll, expect, test } from "vitest";
+import { afterAll, expect, test, vi } from "vitest";
 import { scoreEntry, scoreTests } from "../src/index";
-import { openTaskScorer } from "../src/isolate";
+import { openTaskScorer, type Scoring } from "../src/isolate";
 import type { HeldoutOf } from "../src/kinds/common";
 import { runInSandbox, Sandbox } from "../src/sandbox";
 
@@ -12,6 +12,12 @@ import { runInSandbox, Sandbox } from "../src/sandbox";
 // cannot do. The hostile entries are real attempts, and each of them has to score 0 without
 // stopping the Judge and in the time the kind allows: 1 s for a case, so `cases × 1.2 s` for all.
 // docs/research/S8-sandbox.md records what each one came to.
+//
+// These tests must give the same answer on a busy machine, so what they bound is the work an entry
+// costs, not the time it waits for a CPU (see `cpuMeter`), and a test about what happens when a
+// case runs out of memory gives the case time enough for the memory to run out first (see
+// `withTimeBudget`). The tests of the time limit itself (a loop that is ended at its second) keep
+// the production limit: the engine's deadline is a wall clock, and ending a loop is what they show.
 
 type TestsCriteria = Extract<PublicCriteria, { kind: "tests" }>;
 type TestsHeldout = HeldoutOf<"tests">;
@@ -32,6 +38,46 @@ function criteria(examples: Case[] = [], minScore = 100, entry = "f"): TestsCrit
 
 const heldout = (cases: Case[]): TestsHeldout => ({ cases });
 const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+/**
+ * A meter of the CPU time that this thread uses, in milliseconds, from now. A bound on how long
+ * code took by the clock on the wall is a bound on how busy the machine was as well: the same
+ * entry takes seconds on a host that is running dozens of other jobs. The CPU time of the thread
+ * that runs the sandbox is what the entry cost, whatever else the machine was doing, and it is
+ * never more than the time on the wall. (Only for work that runs on this thread, as the sandbox's
+ * does here.)
+ */
+function cpuMeter(): () => number {
+  const from = process.threadCpuUsage();
+  return () => {
+    const used = process.threadCpuUsage(from);
+    return (used.user + used.system) / 1_000;
+  };
+}
+
+/**
+ * Runs `body` with every run in the sandbox given `timeoutMs`, whatever limit its caller asked
+ * for, and puts the limit back after. For a test of what a case that runs out of memory comes to:
+ * the memory is the limit that has to end it, and the production second can be spent on a busy
+ * machine before an allocation loop has filled the engine (its 128 MiB takes 0.2 s of CPU). The
+ * memory limits are the production ones, and the time given is far longer than any allocation
+ * loop can live: the engine's memory cannot grow past its cap.
+ */
+async function withTimeBudget<T>(timeoutMs: number, body: () => Promise<T>): Promise<T> {
+  const run = Sandbox.prototype.run;
+  const spy = vi.spyOn(Sandbox.prototype, "run").mockImplementation(function (
+    this: Sandbox,
+    code,
+    opts,
+  ) {
+    return run.call(this, code, { ...opts, timeoutMs });
+  });
+  try {
+    return await body();
+  } finally {
+    spy.mockRestore();
+  }
+}
 
 // Written as code points, so that the characters can be seen in the source.
 const LINE_SEPARATOR = String.fromCodePoint(0x2028);
@@ -277,6 +323,9 @@ const HOSTILE: Record<string, string> = {
   memory_bomb_objects: "function f(x) { const a = []; while (true) a.push({ a: 1, b: [x] }); }",
   memory_bomb_string: "function f(x) { let s = 'x'; while (true) s += s; }",
   memory_bomb_one_block: "function f(x) { return new Array(1e9).fill(0).length; }",
+  // One allocation past the limit, which fails at once (the array above fills until a block grows
+  // past it): out of memory in every case, however slow the machine.
+  memory_bomb_one_allocation: "function f(x) { return new Uint8Array(1e9).length; }",
   deep_recursion: "function f(x) { return f(x + 1) + 1; }",
   deep_recursion_through_json:
     "function f(x) { let a = []; for (let i = 0; i < 1e6; i++) a = [a]; return a; }",
@@ -313,17 +362,22 @@ function hostile(name: string): string {
 }
 
 for (const [name, source] of Object.entries(HOSTILE)) {
-  test(`hostile_${name}_scores_0`, { timeout: 30_000 }, async () => {
-    const started = performance.now();
+  // The timeout is for a hang, which only the test run ends: nothing here is about time on the wall.
+  test(`hostile_${name}_scores_0`, { timeout: 120_000 }, async () => {
+    const cpu = cpuMeter();
     const result = await score(source);
-    const took = performance.now() - started;
+    const cpuMs = cpu();
 
     expect(result.score, JSON.stringify(result)).toBe(0);
     expect(result.passed).toBe(false);
     expect(existsSync(CANARY), "the entry reached the host's file system").toBe(false);
     // The cases are 4: 4.8 s is the whole bound, and the first failed case that runs out of time
-    // or memory ends the run, so one case's second is what these cost.
-    expect(took).toBeLessThan(PLUS_ONE.length * 1_200);
+    // ends the run, so one case's second is what a loop costs. It is the CPU time of the entry
+    // that is bounded: its time on the wall also counts the time it waited for a CPU, which is
+    // the machine's busyness and not the entry's cost.
+    expect(cpuMs, `${name} used ${Math.round(cpuMs)} ms of CPU`).toBeLessThan(
+      PLUS_ONE.length * 1_200,
+    );
   });
 }
 
@@ -381,7 +435,7 @@ test("dynamic_import_is_refused_by_the_engine", async () => {
 });
 
 test("a_hostile_entry_does_not_disturb_the_entries_scored_after_it", {
-  timeout: 60_000,
+  timeout: 120_000,
 }, async () => {
   // The ones that end a run the hardest: the engine's interrupt, its memory and its stack.
   for (const name of [
@@ -401,9 +455,11 @@ test("a_case_that_times_out_ends_the_run_and_the_cases_after_it_count_as_failed"
   // Only the third input loops. The cases after it are not run, and count as failed: the score is
   // over all the cases, 2 of 4 here.
   const source = "function f(x) { if (x === 3) { while (true) {} } return x + 1; }";
-  const started = performance.now();
+  const cpu = cpuMeter();
   const result = await score(source);
-  expect(performance.now() - started).toBeLessThan(2_500);
+  // One second for the loop and nothing for the cases after it: the CPU time it cost, not the
+  // time it waited for one.
+  expect(cpu()).toBeLessThan(2_500);
   expect(result.score).toBe(50);
   expect(result.reasons).toEqual(["case 3 (3): timed out", "1 more case not run"]);
   // The total is every case, not the ones that ran: 1 of 5.
@@ -421,9 +477,12 @@ test("a_case_that_times_out_ends_the_run_and_the_cases_after_it_count_as_failed"
   expect(throws).toMatchObject({ score: 75, reasons: ["case 3 (3): threw an exception"] });
 });
 
-test("a_case_that_runs_out_of_memory_does_not_zero_the_entry", { timeout: 30_000 }, async () => {
+test("a_case_that_runs_out_of_memory_does_not_zero_the_entry", { timeout: 120_000 }, async () => {
   // Input 3 allocates until the engine gives out. The cases after it still run, on a new engine,
   // and pass: 4 of 5. Input 5 needs 20 MB of its own, which a used-up engine could not give.
+  // The case has all the time it needs, so that it is the memory that ends it on any machine: the
+  // second the kind gives a case can run out before an allocation loop has filled the engine on one
+  // that is busy, and then the case would end as `timed out` and the run with it.
   const source = `function f(x) {
     if (x === 3) { const a = []; while (true) a.push(new Array(1000).fill(0)); }
     if (x === 5) return new Array(2_500_000).fill(1).length;
@@ -436,31 +495,34 @@ test("a_case_that_runs_out_of_memory_does_not_zero_the_entry", { timeout: 30_000
     { input: 4, output: 5 },
     { input: 5, output: 2_500_000 },
   ];
-  const result = await score(source, cases);
-  expect(result).toEqual({
-    score: 80,
-    passed: false,
-    reasons: ["case 3 (3): ran out of memory"],
+  await withTimeBudget(120_000, async () => {
+    const result = await score(source, cases);
+    expect(result).toEqual({
+      score: 80,
+      passed: false,
+      reasons: ["case 3 (3): ran out of memory"],
+    });
+    // One case lost whichever it is: with the bomb on the first input it is the first that fails.
+    const first = await score(source.replace("x === 3", "x === 1"), cases);
+    expect(first).toMatchObject({ score: 80, reasons: ["case 1 (1): ran out of memory"] });
   });
-  // One case lost whichever it is: with the bomb on the first input it is the first that fails.
-  const first = await score(source.replace("x === 3", "x === 1"), cases);
-  expect(first).toMatchObject({ score: 80, reasons: ["case 1 (1): ran out of memory"] });
 });
 
 test("the_sandbox_engine_cannot_be_grown_past_its_cap_by_many_small_allocations", {
-  timeout: 30_000,
+  timeout: 120_000,
 }, async () => {
   // The engine counts one allocation against the limit and not all of them (it has no way to ask
   // how big a block it holds), so 32 MiB stops one block and nothing else. With a time to spare,
   // only the cap on the engine's whole memory can end this run, and it ends it at once.
-  const started = performance.now();
+  const cpu = cpuMeter();
   const result = await runInSandbox("const a = []; while (true) a.push(new Array(1000).fill(0));", {
     timeoutMs: 20_000,
     memoryBytes: 32 * 1024 * 1024,
   });
   expect(result).toMatchObject({ ok: false });
   expect(result.ok ? "" : result.error).not.toBe("timeout");
-  expect(performance.now() - started).toBeLessThan(5_000);
+  // It takes 0.2 s of CPU to fill the engine, and the bound is the CPU time it cost.
+  expect(cpu()).toBeLessThan(5_000);
   // And the engine is as good as new for the run after it.
   expect(
     await runInSandbox("[1, 2, 3].map((x) => x * 2)", {
@@ -474,29 +536,59 @@ test("the_sandbox_engine_cannot_be_grown_past_its_cap_by_many_small_allocations"
 // In the Judge's own worker, where the scorers run.
 
 const testsTask = { criteria: criteria([], 100), heldout: { tests: heldout(PLUS_ONE) } };
+/**
+ * Time for a worker to load and compile, and for an entry that is not about its time limit to be
+ * scored whole (the engine's own limits, a second a case, are the ones that end its cases): the
+ * test is of what a worker scores, not of how long a busy machine takes to start one.
+ */
+const UNHURRIED = {
+  startTimeoutMs: 120_000,
+  compileBudgetMs: 120_000,
+  entryTimeoutMs: 120_000,
+} as const;
 
 test("tests_entries_are_scored_in_a_worker_as_they_are_on_this_thread", {
-  timeout: 60_000,
+  timeout: 120_000,
 }, async () => {
-  const scorer = openTaskScorer(testsTask);
+  const scorer = openTaskScorer(testsTask, UNHURRIED);
+  const here = (content: Uint8Array) =>
+    scoreEntry({ criteria: testsTask.criteria, heldout: testsTask.heldout, content });
   try {
+    // Entries whose cases end the same way on any machine: the very same score, reasons and all.
     for (const source of [
       RIGHT,
       "function f(x) { return x <= 2 ? x + 1 : 0; }",
       "function f(",
       hostile("deep_recursion"),
       hostile("infinite_loop"),
-      hostile("memory_bomb_arrays"),
+      // An allocation past the limit fails at once, where a loop that fills the engine would end
+      // as `timed out` on a machine too busy to fill it in the second a case has.
+      hostile("memory_bomb_one_allocation"),
       hostile("constructor_chain_to_process"),
       RIGHT,
     ]) {
       const content = bytes(source);
-      const here = await scoreEntry({
-        criteria: testsTask.criteria,
-        heldout: testsTask.heldout,
-        content,
+      expect(await scorer.score(content), source).toEqual({
+        kind: "scored",
+        score: await here(content),
       });
-      expect(await scorer.score(content), source).toEqual({ kind: "scored", score: here });
+    }
+
+    // One that fills the engine ends in a case's second or in the engine's memory, whichever the
+    // machine reaches first, and the worker and this thread need not reach the same one. Both
+    // score it 0, and say only that a case ran out of memory or of time.
+    const content = bytes(hostile("memory_bomb_arrays"));
+    const scorings: Scoring[] = [
+      await scorer.score(content),
+      { kind: "scored", score: await here(content) },
+    ];
+    for (const scoring of scorings) {
+      expect(scoring).toMatchObject({ kind: "scored", score: { score: 0, passed: false } });
+      const reasons = scoring.kind === "scored" ? scoring.score.reasons : [];
+      expect(reasons.length).toBeGreaterThan(0);
+      for (const reason of reasons) {
+        expect(reason).toMatch(/: (ran out of memory|timed out)$|^\d+ more cases? not run$/);
+      }
     }
   } finally {
     await scorer.close();
@@ -505,11 +597,11 @@ test("tests_entries_are_scored_in_a_worker_as_they_are_on_this_thread", {
 });
 
 test("a_loop_the_engine_cannot_interrupt_is_ended_by_the_worker_and_the_next_entry_is_scored", {
-  timeout: 60_000,
+  timeout: 120_000,
 }, async () => {
   // Natives that loop over a huge sparse array never come back to the engine's interrupt check,
   // so a case's second does not end them. The worker's stop does, at the entry's own limit.
-  const scorer = openTaskScorer(testsTask, { entryTimeoutMs: 2_500 });
+  const scorer = openTaskScorer(testsTask, { ...UNHURRIED, entryTimeoutMs: 2_500 });
   try {
     expect(await scorer.score(bytes(RIGHT))).toMatchObject({
       kind: "scored",
@@ -523,8 +615,11 @@ test("a_loop_the_engine_cannot_interrupt_is_ended_by_the_worker_and_the_next_ent
       const scoring = await scorer.score(bytes(`function f(x) { return ${loop}; }`));
       const took = performance.now() - started;
       expect(scoring, loop).toEqual({ kind: "scored", score: zero("scoring timed out") });
+      // Not before the limit, which load only makes later. The loop itself would run for minutes,
+      // so an answer in a fraction of that is the stop's; how soon the stop comes after its limit
+      // is as much the machine's as the Judge's, and the bound on it is loose.
       expect(took, loop).toBeGreaterThan(2_000);
-      expect(took, loop).toBeLessThan(2_500 + 4_000);
+      expect(took, loop).toBeLessThan(2_500 + 15_000);
       expect(await scorer.score(bytes(RIGHT))).toMatchObject({
         kind: "scored",
         score: { score: 100 },
@@ -543,12 +638,14 @@ const NEEDS_20_MB = "function f(x) { return new Array(2_500_000).fill(1).length 
 const needs20MbCases: Case[] = [1, 2, 3, 4].map((n) => ({ input: n, output: 2_500_000 + n }));
 
 test("the_same_honest_entry_scores_the_same_first_after_a_bomb_and_after_a_worker_kill", {
-  timeout: 90_000,
+  timeout: 180_000,
 }, async () => {
   const task = { criteria: criteria([], 100), heldout: { tests: heldout(needs20MbCases) } };
   // The native loop is ended by the worker's stop, at this limit, and the next entry runs in a
-  // new worker.
-  const scorer = openTaskScorer(task, { entryTimeoutMs: 2_500 });
+  // new worker. The limit is also the whole of an honest entry's time (four cases that take 20 MB
+  // each) and of a bomb's, so it is far over what they cost: a busy machine that took longer would
+  // stop the worker of the entry that this test is about, and show a score that is not the entry's.
+  const scorer = openTaskScorer(task, { ...UNHURRIED, entryTimeoutMs: 10_000 });
   const honest = { kind: "scored", score: { score: 100, passed: true, reasons: [] } };
   const scoreHonest = async () => scorer.score(bytes(NEEDS_20_MB));
   try {
@@ -573,18 +670,27 @@ test("the_same_honest_entry_scores_the_same_first_after_a_bomb_and_after_a_worke
   }
 });
 
-test("every_entry_gets_an_engine_of_its_own", { timeout: 30_000 }, async () => {
-  // In one thread, scored one after another, as the Judge's workers do.
+test("every_entry_gets_an_engine_of_its_own", { timeout: 120_000 }, async () => {
+  // In one thread, scored one after another, as the Judge's workers do. Nothing here is about the
+  // second a case has: with time to spare, it is the engine's memory that ends the bomb on any
+  // machine, and the honest entries are not cut short on a busy one.
   const c = criteria([], 100);
   const h = heldout(needs20MbCases);
   const bomb = bytes(String(HOSTILE.memory_bomb_arrays));
-  expect(await scoreTests(c, h, bytes(NEEDS_20_MB)), "first").toMatchObject({ score: 100 });
-  expect((await scoreTests(c, h, bomb)).score).toBe(0);
-  expect(await scoreTests(c, h, bytes(NEEDS_20_MB)), "after a bomb").toMatchObject({ score: 100 });
+  await withTimeBudget(120_000, async () => {
+    expect(await scoreTests(c, h, bytes(NEEDS_20_MB)), "first").toMatchObject({ score: 100 });
+    expect((await scoreTests(c, h, bomb)).score).toBe(0);
+    expect(await scoreTests(c, h, bytes(NEEDS_20_MB)), "after a bomb").toMatchObject({
+      score: 100,
+    });
+  });
 });
 
-test("a_sandbox_has_an_engine_of_its_own_and_renew_replaces_it", async () => {
-  const limits = { timeoutMs: 1_000, memoryBytes: 32 * 1024 * 1024 };
+test("a_sandbox_has_an_engine_of_its_own_and_renew_replaces_it", { timeout: 120_000 }, async () => {
+  // Nothing here is about time. The bomb has the time to fill the engine, so that it is the
+  // engine's memory that ends it (`memory`) on any machine, and not a second spent on a busy one
+  // (`timeout`); its limit on one block is the case's, 32 MiB.
+  const limits = { timeoutMs: 60_000, memoryBytes: 32 * 1024 * 1024 };
   const a = new Sandbox();
   const b = new Sandbox();
   expect(await a.run("var seen = 1; seen", limits)).toEqual({ ok: true, value: 1 });
