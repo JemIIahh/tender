@@ -141,8 +141,10 @@ export function rateLimit<E extends Env>(
 /**
  * The bytes each key has spent, in a window of `limit.windowMs` that begins with the first bytes it
  * spends and holds at most `limit.limit` of them, kept in this process's memory. The windows are
- * kept in the order they began, which is the order they end in, so the ones that are over are
- * dropped from the front and the map holds only the keys that spent something lately.
+ * kept in the order they began, which is the order they end in while the wall clock runs forward,
+ * so the ones that are over are dropped from the front and the map holds only the keys that spent
+ * something lately. A clock that steps back breaks that order and leaves an ended window behind a
+ * live one, so a window is read only if it has not ended (`live`): one that has is no window.
  */
 class ByteWindows {
   readonly #windows = new Map<string, { spent: number; endsAt: number }>();
@@ -158,9 +160,22 @@ class ByteWindows {
       if (window.endsAt > now) break;
       this.#windows.delete(ended);
     }
-    const window = this.#windows.get(key);
+    const window = this.#live(key, now);
     if ((window?.spent ?? 0) + bytes <= this.limit.limit) return 0;
     return window === undefined ? this.limit.windowMs : window.endsAt - now;
+  }
+
+  /**
+   * `key`'s window if it has not ended by `now`. One that has (`endsAt <= now`) is no window: it is
+   * dropped, as the front of the map is, so that it neither reads as room nor takes more bytes.
+   * The clock stepping back can leave it behind a window that ends later, out of reach of the
+   * pruning at the front.
+   */
+  #live(key: string, now: number): { spent: number; endsAt: number } | undefined {
+    const window = this.#windows.get(key);
+    if (window === undefined || window.endsAt > now) return window;
+    this.#windows.delete(key);
+    return undefined;
   }
 
   /**
@@ -169,7 +184,7 @@ class ByteWindows {
    * nowhere: the next window begins empty whatever was taken from the last.
    */
   spend(key: string, bytes: number, now: number): () => void {
-    let window = this.#windows.get(key);
+    let window = this.#live(key, now);
     if (window === undefined) {
       window = { spent: 0, endsAt: now + this.limit.windowMs };
       this.#windows.set(key, window);
