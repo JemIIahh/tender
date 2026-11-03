@@ -9,6 +9,7 @@ import { parseEnv } from "node:util";
 import {
   ApiClient,
   type LocalChain,
+  registerWithBond,
   type Signer,
   startLocalChain,
   TenderClient,
@@ -461,7 +462,11 @@ async function postSeeds(
   );
 }
 
-/** Registers alice as an agent, with a profile the API holds, so that the directory has one. */
+/**
+ * Registers alice as an agent, with a profile the API holds, so that the directory has one.
+ * Registering takes the agent bond out of her vault (contract Task 16b), so the bond goes from her
+ * wallet into the vault first, which `registerWithBond` does.
+ */
 async function registerAgent(chain: LocalChain, apiUrl: string, signal: AbortSignal) {
   const { alice } = chain.accounts;
   const api = new ApiClient({ baseUrl: apiUrl, signer: alice, timeoutMs: API_TIMEOUT_MS, signal });
@@ -470,7 +475,11 @@ async function registerAgent(chain: LocalChain, apiUrl: string, signal: AbortSig
     contentType: "application/json",
     bytes: canonicalJson(AGENT_PROFILE),
   });
-  await clientOf(chain, alice).registerAgent(stored.uri, stored.sha256, AGENT_PROFILE.tags);
+  await registerWithBond(
+    clientOf(chain, alice),
+    { uri: stored.uri, hash: stored.sha256, tags: AGENT_PROFILE.tags },
+    { approve: () => true },
+  );
 }
 
 /** The test token's `mint`, which anyone may call for an account the token has registered. */
