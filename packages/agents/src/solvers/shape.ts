@@ -146,7 +146,13 @@ function isJson(text: string): boolean {
   }
 }
 
-/** `text` if it is `{"pattern": string, "flags": string}` and no more, with a pattern the Judge accepts. */
+/**
+ * `text` if it is `{"pattern": string, "flags": string}` and no more, with a pattern V8 compiles.
+ *
+ * That is not the Judge's test. It runs a pattern in QuickJS, which refuses some that V8 accepts:
+ * 255 or more capture groups, for one (QuickJS 0.32.0 refuses them with "too many captures"). Such
+ * an answer passes here and scores 0 (`invalid pattern`); the format rule in `llm.ts` says so.
+ */
 function regexAnswer(text: string): string | null {
   let parsed: unknown;
   try {
