@@ -1,4 +1,4 @@
-import { type Db, getBlob, type StoredBlob } from "@tender/db";
+import { type Db, getBlob, hasHeldoutUpload, type StoredBlob } from "@tender/db";
 import {
   canonicalJson,
   type Heldout,
@@ -58,6 +58,8 @@ type TaskTerms = Pick<
 interface Stored {
   criteria: StoredBlob | null;
   heldout: StoredBlob | null;
+  /** Whether the poster is among the accounts that uploaded the held-out document. */
+  heldoutFromPoster: boolean;
   /** The lowest id of the poster's earlier tasks with the same held-out commitment, or `null`. */
   earlierUse: string | null;
 }
@@ -258,10 +260,12 @@ export async function loadDocuments(
   const stored: Stored = {
     criteria: await getBlob(db, task.criteria_hash),
     heldout: null,
+    heldoutFromPoster: false,
     earlierUse: null,
   };
   if (task.heldout_commitment !== null) {
     stored.heldout = await getBlob(db, task.heldout_commitment);
+    stored.heldoutFromPoster = await hasHeldoutUpload(db, task.heldout_commitment, task.poster);
     stored.earlierUse = await earlierUseOf(db, task.heldout_commitment, task.id, task.poster);
   }
   try {
@@ -360,9 +364,10 @@ async function checkDocuments(
   }
   // Their 10 minutes are over, or this is judging, which does not wait.
   if (heldoutBlob === null) return rejected(HELDOUT_MISSING);
-  // Blobs are content-addressed and the first upload of some bytes decides their kind and
-  // uploader. Checks that someone else stored first can never become the poster's.
-  if (heldoutBlob.kind !== "heldout" || heldoutBlob.uploader !== task.poster) {
+  // Blobs are content-addressed and the first upload of some bytes decides their kind, and anyone
+  // who has the bytes can be first. The checks are the poster's when the poster is among the
+  // accounts that uploaded them as a held-out document (`heldout_uploads`), whoever was first.
+  if (heldoutBlob.kind !== "heldout" || !stored.heldoutFromPoster) {
     return rejected(HELDOUT_NOT_THE_POSTERS);
   }
   if (heldoutBlob.bytes.byteLength > MAX_DOCUMENT_BYTES) return rejected(HELDOUT_TOO_LARGE);
