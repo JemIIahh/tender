@@ -9,6 +9,7 @@ import { authRoutes } from "./routes/auth";
 import { blobRoutes } from "./routes/blobs";
 import { entryRoutes } from "./routes/entries";
 import { healthRoutes } from "./routes/health";
+import { questionRoutes } from "./routes/questions";
 import { startRoutes } from "./routes/start";
 import { taskRoutes } from "./routes/tasks";
 import { telegramRoutes } from "./routes/telegram";
@@ -53,6 +54,7 @@ export function createApp(deps: ApiDeps): Hono {
   const signedIn = requireAuth(deps);
   app.route("/v1", blobRoutes(deps, signedIn));
   app.route("/v1", startRoutes(deps, signedIn));
+  app.route("/v1", questionRoutes(deps, signedIn));
   app.route("/v1", telegramRoutes(deps, signedIn));
   app.route("/v1", eventRoutes(deps));
 

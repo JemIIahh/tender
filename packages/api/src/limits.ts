@@ -69,6 +69,13 @@ export interface RateLimits {
   heldoutBytesTotal: RateLimit;
   /** The bytes of the new rows `POST /v1/blobs` stores, for all accounts together. */
   blobBytesTotal: RateLimit;
+  /**
+   * Every write to a task's question board (ask, answer, hide, clarify), per signed-in account. A
+   * write that the board's own limits refuse still takes a lock on the events table, so this holds
+   * an account that keeps asking to the cost of one that does not. The limits on what a board
+   * keeps are `BOARD_LIMITS`, in `@tender/shared`.
+   */
+  board: RateLimit;
 }
 
 const HOUR_MS = 60 * 60_000;
@@ -85,6 +92,9 @@ export const DEFAULT_RATE_LIMITS: Readonly<RateLimits> = Object.freeze({
   uploadBytes: { limit: 8 * MIB, windowMs: 24 * HOUR_MS },
   heldoutBytesTotal: { limit: 128 * MIB, windowMs: HOUR_MS },
   blobBytesTotal: { limit: 256 * MIB, windowMs: HOUR_MS },
+  // A poster who answers a full board of 200 questions in one sitting makes 30 a minute for seven
+  // minutes; an agent asking makes a few an hour, and the board's own limits hold it to that.
+  board: { limit: 30, windowMs: 60_000 },
 });
 
 /** The limits in `over` where it has them, and the defaults for the rest. */
@@ -98,6 +108,7 @@ export function rateLimitsOf(over: Partial<RateLimits> | undefined): RateLimits 
     uploadBytes: over?.uploadBytes ?? DEFAULT_RATE_LIMITS.uploadBytes,
     heldoutBytesTotal: over?.heldoutBytesTotal ?? DEFAULT_RATE_LIMITS.heldoutBytesTotal,
     blobBytesTotal: over?.blobBytesTotal ?? DEFAULT_RATE_LIMITS.blobBytesTotal,
+    board: over?.board ?? DEFAULT_RATE_LIMITS.board,
   };
 }
 
@@ -233,6 +244,15 @@ function refuseFor(status: 429 | 503, body: ErrorBody, ms: number): never {
     res: Response.json(body, { status, headers: retryAfter(ms) }),
     message: body.message,
   });
+}
+
+/**
+ * Stops the request with a 429 (`rate_limited`) and a `Retry-After` of `seconds`, for a limit that
+ * a route works out itself, such as the board's per-hour counts, which only the database can
+ * decide. `app.onError` sends it.
+ */
+export function rateLimitedFor(message: string, seconds: number): never {
+  return refuseFor(429, { error: "rate_limited", message }, seconds * 1000);
 }
 
 /** The one key of a pool's own window. */

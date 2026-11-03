@@ -118,6 +118,7 @@ const TABLES = [
   "result_uploads",
   "heldout_uploads",
   "working",
+  "task_questions",
   "auth_challenges",
   "auth_tokens",
   "tg_links",
