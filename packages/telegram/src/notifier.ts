@@ -54,7 +54,10 @@ import { type RenderContext, renderAlert } from "./render";
  *     request never left the machine (connection refused, a DNS failure, an unreachable network).
  *     The claim is given back, and the next tick sends the alert. After a 401 that is the next
  *     tick of a bot with a good token: every alert waits, none is lost, and the log says plainly
- *     that the token is rejected, once for each tick, since the first 401 ends it.
+ *     that the token is rejected, once for each tick, since the first 401 ends it. After a 429 it
+ *     is the first tick once the wait is over: the 429 says for how long (`retry_after`), and until
+ *     then every tick ends before it begins (see `pausedUntil`), so that the bot is not asked while
+ *     it is told to be quiet, and nothing is logged for the ticks in between.
  *   - Telegram may have taken it: a timeout, a connection that broke after the request went out, a
  *     5xx. The claim stays and the alert is lost, with the same `alert lost:` line. That is the
  *     price of at most once, and it is bounded to the one message that was in flight.
@@ -122,6 +125,24 @@ const SEND_OPTIONS = { parse_mode: "HTML", link_preview_options: { is_disabled: 
 /** The events that make an alert. The rest of the stream (deposits, reveals, …) is not news. */
 const ALERTING = new Set(["task_created", "committed", "task_topped_up", "picked", "voided"]);
 
+/**
+ * Until when each bot may not be asked to send, in milliseconds since the epoch by the tick's clock.
+ * Telegram answered a send with a 429 and said how long to stay away (`parameters.retry_after`),
+ * and it asked for more than `createBot`'s `autoRetry` sits out, or was still at it after the last
+ * try. A tick that tried again at once would be told the same, and could lengthen the wait. So the
+ * ticks inside the wait end before they begin: they send nothing and leave the event cursor where
+ * it was. The events that came meanwhile are read when the wait is over, as the clock reads the
+ * reminders again then; a working signal that is over ten minutes old by then is not news.
+ *
+ * The wait is the bot's and not one chat's. A 429 that outlasts `autoRetry` is Telegram limiting the
+ * bot, and the tick ends at it for every chat. A hold for the chat alone would skip that chat's
+ * alerts in the next tick while the cursor moved past them, and an event alert is not looked at
+ * again.
+ *
+ * It lives in this process. A restart asks Telegram again, once, and a 429 sets the wait again.
+ */
+const pausedUntil = new WeakMap<Bot, number>();
+
 /** What one tick works with. */
 interface Tick {
   db: Db;
@@ -135,7 +156,8 @@ interface Tick {
 /**
  * One pass over the events, the working signals and the clock. Each alert is judged and worded on
  * the time it is when its turn comes: the sends behind a backlog of events can take minutes. See
- * the top of this file for what it does.
+ * the top of this file for what it does. While Telegram has told the bot to stay away (see
+ * `pausedUntil`) it does nothing, and returns.
  */
 export async function notifierTick(opts: NotifierTickOptions): Promise<void> {
   const tick: Tick = {
@@ -145,9 +167,19 @@ export async function notifierTick(opts: NotifierTickOptions): Promise<void> {
     network: opts.network,
     clock: opts.now ?? (() => new Date()),
   };
+  if (isPaused(tick)) return;
   await eventAlerts(tick);
   await workingAlerts(tick);
   await timerAlerts(tick);
+}
+
+/** Whether the bot was told to stay away and the wait is not over. A wait that is over is forgotten. */
+function isPaused(tick: Tick): boolean {
+  const until = pausedUntil.get(tick.bot);
+  if (until === undefined) return false;
+  if (tick.clock().getTime() < until) return true;
+  pausedUntil.delete(tick.bot);
+  return false;
 }
 
 /** The time it is now, as an alert is worded with it. */
@@ -627,6 +659,18 @@ function isTokenRejected(error: unknown): boolean {
   return error instanceof GrammyError && error.error_code === 401;
 }
 
+/**
+ * How long, in seconds, a 429 asks the bot to stay away: its `parameters.retry_after`, if that is a
+ * number above zero. A 429 that says nothing of the kind, or something that is no use, has none.
+ */
+function retryAfterOf(error: unknown): number | undefined {
+  if (!(error instanceof GrammyError) || error.error_code !== 429) return undefined;
+  const seconds: unknown = error.parameters.retry_after;
+  return typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
+    ? seconds
+    : undefined;
+}
+
 function failureOf(error: unknown): SendFailure {
   if (error instanceof GrammyError) {
     // A 429 and a 401 are alike: Telegram took nothing, and the alert is still to be sent.
@@ -693,7 +737,8 @@ async function giveBack(tick: Tick, chat: string, key: string): Promise<boolean>
  * - `not_taken`: the claim is given back, so that the next tick sends the alert, and the tick ends.
  *   If the claim cannot be given back the alert is lost, and says so. A 401 is one of these: the
  *   error that ends the tick says that Telegram rejected the bot's token, and, since the tick ends
- *   at the first, the loop logs that once for each tick and not once for each alert.
+ *   at the first, the loop logs that once for each tick and not once for each alert. So is a 429,
+ *   which also holds the bot back for as long as it asks (`pausedUntil`), when it says how long.
  * - `unsure`: the claim stays and the alert is lost, with a line, and the tick ends. Nothing more
  *   is claimed until the next tick, so a transport that is down costs the one message in flight.
  *
@@ -733,12 +778,20 @@ async function sendOnce(
       const took = isTokenRejected(error)
         ? "Telegram rejected the bot token (401)"
         : `Telegram did not take a send (${label})`;
+      // The wait starts at the answer, before the claim goes back: the database can be slow too.
+      const wait = retryAfterOf(error);
+      if (wait !== undefined) {
+        const until = tick.clock().getTime() + wait * 1000;
+        pausedUntil.set(tick.bot, Math.max(until, pausedUntil.get(tick.bot) ?? 0));
+      }
+      const pause = wait === undefined ? "" : `, nothing is sent for ${wait} s`;
       if (!(await giveBack(tick, chat, key))) {
         logLost(alert, `${label}; its claim could not be given back`);
-        throw new TransportFailed(`${took}; the tick ends here`);
+        throw new TransportFailed(`${took}; the tick ends here${pause}`);
       }
       throw new TransportFailed(
-        `${took}; the tick ends here, and the alert is tried again on the next` +
+        `${took}; the tick ends here${pause}, and the alert is tried again ` +
+          `${wait === undefined ? "on the next" : "after that"}` +
           (isTokenRejected(error) ? ", once the bot runs with a good token" : ""),
       );
     }
