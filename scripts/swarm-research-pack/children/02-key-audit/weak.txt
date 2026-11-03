@@ -1,0 +1,1 @@
+{"keys":6,"full_access":["k1","k5"],"function_call":4,"unlimited_allowance":["k3","k6"],"tender_methods":["commit","ft_transfer","post_task","reveal","top_up_task"]}

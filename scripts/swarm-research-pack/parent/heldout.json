@@ -1,0 +1,71 @@
+{
+  "json_schema": {
+    "assertions": [
+      {
+        "path": "$.parts[0].receipts",
+        "equals": 5
+      },
+      {
+        "path": "$.parts[0].total_tgas",
+        "equals": 35
+      },
+      {
+        "path": "$.parts[0].heaviest",
+        "equals": ["r2", "r4"]
+      },
+      {
+        "path": "$.parts[0].by_executor",
+        "equals": {
+          "alice.near": 4,
+          "tender.near": 24,
+          "usdc.near": 7
+        }
+      },
+      {
+        "path": "$.parts[1].keys",
+        "equals": 6
+      },
+      {
+        "path": "$.parts[1].full_access",
+        "equals": ["k1", "k5"]
+      },
+      {
+        "path": "$.parts[1].function_call",
+        "equals": 4
+      },
+      {
+        "path": "$.parts[1].unlimited_allowance",
+        "equals": ["k3", "k6"]
+      },
+      {
+        "path": "$.parts[1].tender_methods",
+        "equals": ["commit", "post_task", "reveal", "top_up_task"]
+      },
+      {
+        "path": "$.parts[2].events",
+        "equals": 7
+      },
+      {
+        "path": "$.parts[2].counts",
+        "equals": {
+          "task_created": 2,
+          "committed": 3,
+          "revealed": 1,
+          "picked": 1
+        }
+      },
+      {
+        "path": "$.parts[2].first",
+        "equals": "task_created"
+      },
+      {
+        "path": "$.parts[2].last",
+        "equals": "picked"
+      },
+      {
+        "path": "$.parts[2].most_common",
+        "equals": "committed"
+      }
+    ]
+  }
+}

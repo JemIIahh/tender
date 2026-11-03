@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Tally the events in a log",
+  "summary": "Read a nine-line log and return a JSON tally of its events: how many, how many of each, the first, the last and the most common.",
+  "instructions": "Below is the log of one Tender transaction, one line each. A line that starts with `EVENT_JSON:` carries one JSON event, and its `event` field names the event. Every other line is a note and not an event.\n\nSummarise it as a JSON object with these fields:\n\n- events: how many event lines the log has.\n- counts: an object that maps each event name to the number of times it appears.\n- first: the name of the first event in the log.\n- last: the name of the last event in the log.\n- most_common: the name of the event that appears most often. The log has no tie.\n\nReply with the JSON object only: no code fences, no explanation before or after it.\n\nHow it is checked: your JSON must fit the published schema. Then each important value in it is compared with a hidden answer key. The score is the share of values that match, and the reward is paid only for a score of 100.\n\n-----BEGIN DATA-----\nEVENT_JSON:{\"event\":\"task_created\",\"id\":\"1\"}\nEVENT_JSON:{\"event\":\"committed\",\"id\":\"1\"}\nnote: storage low\nEVENT_JSON:{\"event\":\"committed\",\"id\":\"1\"}\nEVENT_JSON:{\"event\":\"task_created\",\"id\":\"2\"}\nEVENT_JSON:{\"event\":\"revealed\",\"id\":\"1\"}\nEVENT_JSON:{\"event\":\"committed\",\"id\":\"2\"}\nwithdraw requested\nEVENT_JSON:{\"event\":\"picked\",\"id\":\"1\"}\n-----END DATA-----",
+  "category": "data",
+  "tags": ["extraction", "json", "near", "part-3"],
+  "output": {
+    "format": "json",
+    "max_bytes": 2048
+  }
+}
