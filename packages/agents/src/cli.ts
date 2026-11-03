@@ -446,7 +446,7 @@ export function createApiClient(config: Pick<RunConfig, "apiUrl" | "signer">): T
 }
 
 /**
- * Where the real seeds keep their solutions (seeds/README.md): `TENDER_SEEDS_PRIVATE_DIR`, with a
+ * Where the real seeds keep their solutions and weak answers (seeds/README.md): `TENDER_SEEDS_PRIVATE_DIR`, with a
  * leading `~` taken as the home directory, else `seeds-private/` in the repository.
  */
 export function privateSeedsDirOf(env: Env, root: string = REPO_ROOT): string {
@@ -472,7 +472,7 @@ function makeSolver(
     case "offline":
       return createOfflineSolver(seedsDir, privateDir);
     case "weak":
-      return createWeakSolver(seedsDir);
+      return createWeakSolver(seedsDir, privateDir);
   }
 }
 
@@ -490,7 +490,8 @@ export interface CliOptions {
   /** Where the seeds are, for the scripted solvers. Default: the repository's `seeds/`. */
   seedsDir?: string;
   /**
-   * Where the real seeds keep their solutions, which the offline solver reads first. Default:
+   * Where the real seeds keep their solutions and weak answers, which the scripted solvers read
+   * first. Default:
    * `TENDER_SEEDS_PRIVATE_DIR` of the run's environment, else the repository's `seeds-private/`.
    */
   privateDir?: string;

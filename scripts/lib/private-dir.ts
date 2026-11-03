@@ -6,17 +6,20 @@ import { fileURLToPath } from "node:url";
 /**
  * Where the private half of the 30 real seeds is kept. A seed's held-out checks are secret until
  * its task is judged (the scorecard then publishes them), and its `solution.txt` passes those
- * checks by construction, so a copy of it would win the task. Neither is in the repository:
- * `seeds/<slug>/` holds the public half of a seed, and
+ * checks by construction, so a copy of it would win the task. Its weak answer is a plausible one
+ * that is a few values off the solution, so it gives the solution away nearly as well. None of
+ * them is in the repository: `seeds/<slug>/` holds the public half of a seed (`task.json`,
+ * `brief.json`, `criteria.json`: the question), and
  *
  *   <private dir>/<slug>/heldout.json     the checks (a seed with `has_heldout` only)
  *   <private dir>/<slug>/solution.txt     a correct answer (every seed)
+ *   <private dir>/<slug>/weak.txt         a plausible answer that misses the pass mark (every seed)
  *   <private dir>/<slug>/scenarios.json   spoiled copies of the solution, as edits of its text
  *                                         (a rubric seed only; they quote the solution)
  *   <private dir>/<slug>/known-wrong.json the solution with one rule broken, as a few wrong
  *                                         answers (a regex_cases or tests seed only)
  *
- * the private half. (`weak.txt` is public: it is meant to lose.) The tracked demo set in
+ * the private half. The tracked demo set in
  * `scripts/demo-seeds/` and the swarm pack are the demos' own and public in full, and need none of
  * this.
  *
@@ -53,6 +56,10 @@ export const heldoutFileOf = (privateDir: string, slug: string): string =>
 export const solutionFileOf = (privateDir: string, slug: string): string =>
   join(privateDir, slug, "solution.txt");
 
+/** `<privateDir>/<slug>/weak.txt`. */
+export const weakFileOf = (privateDir: string, slug: string): string =>
+  join(privateDir, slug, "weak.txt");
+
 /** `<privateDir>/<slug>/scenarios.json`. */
 export const scenariosFileOf = (privateDir: string, slug: string): string =>
   join(privateDir, slug, "scenarios.json");
@@ -85,8 +92,8 @@ export function missingHeldouts(seedsDir: string, privateDir: string, slugs: str
 }
 
 /**
- * The seeds of `seedsDir`, from `slugs`, that lack a private file: the `solution.txt` of any seed
- * with a `criteria.json`, its `heldout.json` when it has a held-out part, its `scenarios.json`
+ * The seeds of `seedsDir`, from `slugs`, that lack a private file: the `solution.txt` and the
+ * `weak.txt` of any seed with a `criteria.json`, its `heldout.json` when it has a held-out part, its `scenarios.json`
  * when it is a rubric seed, or its `known-wrong.json` when it is a regex_cases or tests seed. Empty
  * when the directory is complete.
  */
@@ -102,6 +109,7 @@ export function missingPrivateFiles(
     return (
       noHeldout.has(slug) ||
       !existsSync(solutionFileOf(privateDir, slug)) ||
+      !existsSync(weakFileOf(privateDir, slug)) ||
       (criteria.kind === "rubric" && !existsSync(scenariosFileOf(privateDir, slug))) ||
       ((criteria.kind === "regex_cases" || criteria.kind === "tests") &&
         !existsSync(knownWrongFileOf(privateDir, slug)))

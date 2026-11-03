@@ -6,8 +6,8 @@ else. They are **demo-only**: never post them to testnet or mainnet, and nothing
 bounty.
 
 They exist so that a clean checkout can run the whole demo with nothing set up. The 30 real seeds
-in `seeds/` keep their held-out checks and their solutions out of the repository (see
-`seeds/README.md`), because a published solution would win the real task. These tasks are the
+in `seeds/` keep everything answer-like (held-out checks, solutions, weak answers) out of the
+repository (see `seeds/README.md`), because a published solution would win the real task. These tasks are the
 opposite on purpose: each one is complete in its folder, with its brief, criteria, held-out
 checks, a correct answer and a weak one all in the open. Their content and answers are different
 from the real seeds', and `scripts/demo-seeds.test.ts` checks that the two sets share none.

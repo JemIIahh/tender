@@ -27,6 +27,7 @@ import {
   PRIVATE_DIR_VARIABLE,
   privateDirOf,
   solutionFileOf,
+  weakFileOf,
 } from "./lib/private-dir";
 
 // The demo task set (scripts/demo-seeds/): a few small tasks that `pnpm demo:local`, the CI demo
@@ -277,11 +278,10 @@ describe("the demo set and the 30 real seeds share no content", () => {
       ),
     ).toEqual([]);
 
-    // The weak answers and the public examples of the real seeds are in the open, so they are
-    // compared too: a demo solution, or a demo held-out string, must not be one of them.
+    // The public examples of the real seeds are in the open, so they are compared too: a demo
+    // answer, or a demo held-out string, must not be one of them.
     const openReal = new Set<string>();
     for (const slug of REAL_SLUGS) {
-      openReal.add(text(REAL, slug, "weak.txt").trim());
       for (const one of contentOf(json(REAL, slug, "criteria.json"))) openReal.add(one);
     }
     for (const slug of DEMO_SLUGS) {
@@ -292,12 +292,13 @@ describe("the demo set and the 30 real seeds share no content", () => {
     }
   });
 
-  test("no_solution_and_no_held_out_content_is_shared", ({ skip }) => {
+  test("no_answer_and_no_held_out_content_is_shared", ({ skip }) => {
     if (MISSING_PRIVATE.length > 0) skip(PRIVATE_NOTE);
 
     const realSolutions = REAL_SLUGS.map((slug) =>
       readFileSync(solutionFileOf(PRIVATE_DIR, slug), "utf8"),
     );
+    const realWeak = REAL_SLUGS.map((slug) => readFileSync(weakFileOf(PRIVATE_DIR, slug), "utf8"));
     const realHeldoutContent = new Set<string>();
     for (const slug of REAL_SLUGS) {
       if (!existsSync(heldoutFileOf(PRIVATE_DIR, slug))) continue; // a rubric seed
@@ -306,10 +307,10 @@ describe("the demo set and the 30 real seeds share no content", () => {
       );
       for (const one of contentOf(document)) realHeldoutContent.add(one);
     }
-    const realWords = new Set(realSolutions.flatMap((one) => [...wordsOf(one)]));
-    const realJsonContent = new Set(
-      realSolutions.flatMap((one) => [...contentOf(jsonOrNull(one))]),
-    );
+    // A weak answer is a solution with a few values wrong, so its content counts as the solution's.
+    const realAnswers = [...realSolutions, ...realWeak];
+    const realWords = new Set(realAnswers.flatMap((one) => [...wordsOf(one)]));
+    const realJsonContent = new Set(realAnswers.flatMap((one) => [...contentOf(jsonOrNull(one))]));
 
     for (const slug of DEMO_SLUGS) {
       const solution = text(DEMO, slug, "solution.txt");
@@ -319,6 +320,14 @@ describe("the demo set and the 30 real seeds share no content", () => {
         realSolutions.some((one) => squeezed(one) === squeezed(solution)),
         `${slug}: solution`,
       ).toBe(false);
+      // The weak answers of the real seeds are private too, and neither of the demo's is one.
+      for (const name of ["solution.txt", "weak.txt"]) {
+        const demoAnswer = squeezed(text(DEMO, slug, name));
+        expect(
+          realWeak.some((one) => squeezed(one) === demoAnswer),
+          `${slug}/${name} is a weak answer of a real seed`,
+        ).toBe(false);
+      }
 
       const heldout = contentOf(json(DEMO, slug, "heldout.json"));
       expect(

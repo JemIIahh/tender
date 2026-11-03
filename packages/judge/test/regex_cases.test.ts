@@ -2,7 +2,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HeldoutSchema, type PublicCriteria, PublicCriteriaSchema } from "@tender/shared";
 import { expect, test, vi } from "vitest";
-import { heldoutFileOf, privateDirOf, solutionFileOf } from "../../../scripts/lib/private-dir";
+import {
+  heldoutFileOf,
+  privateDirOf,
+  solutionFileOf,
+  weakFileOf,
+} from "../../../scripts/lib/private-dir";
 import { ScorerUnavailableError, scoreEntry, scoreRegexCases } from "../src/index";
 import type { HeldoutOf } from "../src/kinds/common";
 import { runInSandbox } from "../src/sandbox";
@@ -57,17 +62,21 @@ function withCases(passing: number, failing: number) {
 }
 
 /**
- * Where the `near-account-regex` seed's held-out cases and solution are: not in the seed's folder,
- * which is public, but in the private directory (`TENDER_SEEDS_PRIVATE_DIR`, see seeds/README.md).
+ * Where the `near-account-regex` seed's held-out cases, solution and weak answer are: not in the
+ * seed's folder, which is public, but in the private directory (`TENDER_SEEDS_PRIVATE_DIR`, see
+ * seeds/README.md).
  */
 const NEAR_ACCOUNT_HELDOUT = heldoutFileOf(privateDirOf(), "near-account-regex");
 const NEAR_ACCOUNT_SOLUTION = solutionFileOf(privateDirOf(), "near-account-regex");
+const NEAR_ACCOUNT_WEAK = weakFileOf(privateDirOf(), "near-account-regex");
 /** Whether this machine has them. Where it has not (CI), the tests that score the seed are skipped. */
-const hasNearAccountSeed = existsSync(NEAR_ACCOUNT_HELDOUT) && existsSync(NEAR_ACCOUNT_SOLUTION);
+const hasNearAccountSeed = [NEAR_ACCOUNT_HELDOUT, NEAR_ACCOUNT_SOLUTION, NEAR_ACCOUNT_WEAK].every(
+  existsSync,
+);
 const seedTest = test.skipIf(!hasNearAccountSeed);
 if (!hasNearAccountSeed) {
   console.warn(
-    `regex_cases: held-out and solution for near-account-regex not found in ${privateDirOf()}; set TENDER_SEEDS_PRIVATE_DIR. ` +
+    `regex_cases: held-out, solution and weak answer for near-account-regex not found in ${privateDirOf()}; set TENDER_SEEDS_PRIVATE_DIR. ` +
       "The tests that score the seed are skipped.",
   );
 }
@@ -83,7 +92,7 @@ function nearAccountSeed() {
     c,
     h: h.regex_cases,
     solution: readFileSync(NEAR_ACCOUNT_SOLUTION),
-    weak: read("weak.txt"),
+    weak: readFileSync(NEAR_ACCOUNT_WEAK),
   };
 }
 

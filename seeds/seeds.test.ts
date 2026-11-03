@@ -34,6 +34,7 @@ import {
   privateDirOf,
   scenariosFileOf,
   solutionFileOf,
+  weakFileOf,
 } from "../scripts/lib/private-dir";
 import { dropOneGrader, STAND_IN, standInGrader, standInScore } from "./rubric-stand-in";
 
@@ -45,12 +46,12 @@ import { dropOneGrader, STAND_IN, standInGrader, standInScore } from "./rubric-s
 // against a fake model server that grades by a few plain checks (rubric-stand-in.ts).
 //
 // The private half of a seed is not in seeds/: its held-out checks are secret until a task is
-// judged, and its solution.txt passes those checks by construction, so a copy of it would win the
-// task. Both are read from the private directory (`TENDER_SEEDS_PRIVATE_DIR`, else `seeds-private/`,
-// see README.md). Where that has no file for a seed, which is every clean checkout and CI, a test
-// that has to score the seed's solution or its checks is skipped, with one message at the top of the
-// run; the tests that read only the public files (the schemas, the counts, the briefs, the weak
-// answers) run everywhere.
+// judged, its solution.txt passes those checks by construction, so a copy of it would win the
+// task, and its weak.txt is the solution with a few values wrong. All of them are read from the
+// private directory (`TENDER_SEEDS_PRIVATE_DIR`, else `seeds-private/`, see README.md). Where that
+// has no file for a seed, which is every clean checkout and CI, a test that has to score the seed's
+// answers or its checks is skipped, with one message at the top of the run; the tests that read
+// only the public files (the schemas, the counts, the briefs, the criteria) run everywhere.
 
 const SEEDS_DIR = import.meta.dirname;
 const SLUGS = readdirSync(SEEDS_DIR, { withFileTypes: true })
@@ -69,8 +70,8 @@ if (MISSING_PRIVATE.length > 0) {
   );
 }
 
-/** The public files of a seed. Its solution and held-out checks are not (see `PRIVATE_DIR`). */
-const SEED_FILES = ["task.json", "brief.json", "criteria.json", "weak.txt"];
+/** The public files of a seed: the question. Every answer-like file is private (`PRIVATE_DIR`). */
+const SEED_FILES = ["task.json", "brief.json", "criteria.json"];
 
 /** The ten P0 seeds (plan 05, Task 9) and the kind of check each one has. */
 const P0_SEEDS: Record<string, PublicCriteria["kind"]> = {
@@ -138,6 +139,7 @@ const readJson = (slug: string, name: string): unknown =>
   JSON.parse(readBytes(slug, name).toString("utf8"));
 const heldoutPath = (slug: string) => heldoutFileOf(PRIVATE_DIR, slug);
 const solutionPath = (slug: string) => solutionFileOf(PRIVATE_DIR, slug);
+const weakPath = (slug: string) => weakFileOf(PRIVATE_DIR, slug);
 const utf8 = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
 
 /**
@@ -154,9 +156,9 @@ const JSON_SCHEMA_SLUGS = SLUGS.filter((slug) => {
 
 /**
  * A seed's public documents, once the schemas have read them, and its private ones from the private
- * directory. `heldout` and `solution` are `null` when that has no file for the seed: `heldout` of a
- * rubric seed always, which has no checks, and both on a machine without the private directory. A
- * test that needs them takes the seed with `loadPrivate`.
+ * directory. `heldout`, `solution` and `weak` are `null` when that has no file for the seed:
+ * `heldout` of a rubric seed always, which has no checks, and all of them on a machine without the
+ * private directory. A test that needs them takes the seed with `loadPrivate`.
  */
 function load(slug: string) {
   return {
@@ -166,20 +168,25 @@ function load(slug: string) {
       ? HeldoutSchema.parse(JSON.parse(readFileSync(heldoutPath(slug), "utf8")))
       : null,
     solution: existsSync(solutionPath(slug)) ? readFileSync(solutionPath(slug)) : null,
+    weak: existsSync(weakPath(slug)) ? readFileSync(weakPath(slug)) : null,
   };
 }
 
 /**
- * `load`, for a test that scores the seed's solution or its held-out checks. It skips the test, as
- * `skip` does, when the private directory lacks the seed's solution or, for a seed with a held-out
- * part, its checks. Pass the `skip` of the test's context.
+ * `load`, for a test that scores the seed's answers or its held-out checks. It skips the test, as
+ * `skip` does, when the private directory lacks the seed's solution or weak answer or, for a seed
+ * with a held-out part, its checks. Pass the `skip` of the test's context.
  */
 function loadPrivate(slug: string, skip: (note?: string) => never) {
   const seed = load(slug);
-  if (seed.solution === null || (seed.criteria.has_heldout && seed.heldout === null)) {
+  if (
+    seed.solution === null ||
+    seed.weak === null ||
+    (seed.criteria.has_heldout && seed.heldout === null)
+  ) {
     skip(PRIVATE_NOTE);
   }
-  return { ...seed, solution: seed.solution as Buffer };
+  return { ...seed, solution: seed.solution as Buffer, weak: seed.weak as Buffer };
 }
 
 /**
@@ -598,11 +605,10 @@ describe.each(SLUGS)("seed %s", (slug) => {
   });
 
   test("weak_answer_scores_below_the_solution", async ({ skip }) => {
-    if (!existsSync(seedPath(slug, "weak.txt"))) return skip("this seed has no weak answer");
-    const { brief, criteria, heldout, solution } = loadPrivate(slug, skip);
+    const { brief, criteria, heldout, solution, weak: weakAnswer } = loadPrivate(slug, skip);
 
     const best = await scoreAnswer(criteria, heldout, solution, { slug, brief });
-    const weak = await scoreAnswer(criteria, heldout, readBytes(slug, "weak.txt"), { slug, brief });
+    const weak = await scoreAnswer(criteria, heldout, weakAnswer, { slug, brief });
     expect(weak.score).toBeLessThan(best.score);
     // A weak answer is meant to lose. If it passed, a task with only that entry would pay it.
     expect(weak.passed, "weak answer passes").toBe(false);
@@ -619,16 +625,12 @@ describe.each(SLUGS)("seed %s", (slug) => {
 
     const format = FORMAT_OF_KIND[criteria.kind];
     if (format !== undefined) expect(brief.output.format).toBe(format);
-    if (existsSync(seedPath(slug, "weak.txt"))) {
-      expect(readBytes(slug, "weak.txt").byteLength, "weak.txt bytes").toBeLessThanOrEqual(
-        brief.output.max_bytes,
-      );
-    }
   });
 
-  test("the_solution_fits_the_briefs_output_rules", ({ skip }) => {
-    const { brief, solution } = loadPrivate(slug, skip);
+  test("the_solution_and_the_weak_answer_fit_the_briefs_output_rules", ({ skip }) => {
+    const { brief, solution, weak } = loadPrivate(slug, skip);
     expect(solution.byteLength, "solution.txt bytes").toBeLessThanOrEqual(brief.output.max_bytes);
+    expect(weak.byteLength, "weak.txt bytes").toBeLessThanOrEqual(brief.output.max_bytes);
   });
 
   test("public_examples_are_not_held_out", ({ skip }) => {
@@ -1090,9 +1092,9 @@ describe.each(RUBRIC_SLUGS)("rubric seed %s", (slug) => {
   test("the_weak_answer_misses_several_criteria_and_a_nonsense_answer_misses_the_pass_mark", async ({
     skip,
   }) => {
-    const { brief, criteria, solution } = loadPrivate(slug, skip);
+    const { brief, criteria, solution, weak: weakAnswer } = loadPrivate(slug, skip);
     if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
-    const weak = utf8(readBytes(slug, "weak.txt"));
+    const weak = utf8(weakAnswer);
     const missed = criteria.rubric.filter(
       (_, i) => standInScore(slug, i, weak) < standInScore(slug, i, utf8(solution)),
     );

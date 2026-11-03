@@ -1,23 +1,24 @@
 Held-out checks are single-use: a task's held-out checks are published in its scorecard when the task is judged, so never post the same seed twice.
 
-A seed is a folder: `task.json` (reward, token, windows, winners, verifier), `brief.json`, `criteria.json` and `weak.txt` (a plausible, flawed answer). Those are public. The other half of a seed, a correct answer (`solution.txt`) and, for a seed whose `criteria.json` says `has_heldout: true`, its held-out checks (`heldout.json`), is **not in this folder**. A rubric seed has no held-out checks: a model scores it against the public criteria, so there is nothing to keep back, and `criteria.json` says `has_heldout: false`; its solution is private all the same. Rubric seeds are open tasks (no cap on entries); the Judge grades the first 50.
+A seed is a folder: `task.json` (reward, token, windows, winners, verifier), `brief.json` and `criteria.json`. Those are public: they are the question. Everything answer-like is **not in this folder**: a correct answer (`solution.txt`), a plausible, flawed one (`weak.txt`) and, for a seed whose `criteria.json` says `has_heldout: true`, its held-out checks (`heldout.json`). A rubric seed has no held-out checks: a model scores it against the public criteria, so there is nothing to keep back, and `criteria.json` says `has_heldout: false`; its answers are private all the same. Rubric seeds are open tasks (no cap on entries); the Judge grades the first 50.
 
 ## What is private, and where
 
-The held-out checks are secret until the task is judged, and a seed's `solution.txt` passes those checks by construction, so a copy of it in a public repository would win the real task. Neither is ever committed. They live in a private directory, one folder per seed:
+The held-out checks are secret until the task is judged, and a seed's `solution.txt` passes those checks by construction, so a copy of it in a public repository would win the real task. Its `weak.txt` is the solution with a few values wrong (in seven seeds, 65 to 87 percent of the same text), which is nearly as good. None of them is ever committed. They live in a private directory, one folder per seed:
 
     <private dir>/<slug>/heldout.json     the checks (a seed with has_heldout: true)
     <private dir>/<slug>/solution.txt     a correct answer (every seed)
+    <private dir>/<slug>/weak.txt         a plausible answer that misses the pass mark (every seed)
     <private dir>/<slug>/scenarios.json   spoiled copies of the solution (a rubric seed)
     <private dir>/<slug>/known-wrong.json the solution with one rule broken (a regex_cases or tests seed)
 
 - The private directory is `$TENDER_SEEDS_PRIVATE_DIR` when that is set (in the shell, or in `.env`; the shell wins). Otherwise it is `seeds-private/` of the repository, which `.gitignore` and `.dockerignore` leave out. A leading `~/` is the home directory.
-- Nothing reads a held-out file or a solution from `seeds/`. `seeds.test.ts` fails if a `heldout.json` or a `solution.txt` appears in a seed's folder.
+- Nothing reads a held-out file, a solution or a weak answer from `seeds/`. `seeds.test.ts` fails if anything but `task.json`, `brief.json` and `criteria.json` appears in a seed's folder.
 - `scenarios.json` belongs to the five rubric seeds. It lists entries that are the solution with one core element taken out (each a piece of the solution's text and what replaces it), which the tests use to show that the pass mark stops them. The pieces quote the solution, so they are private too: kept in the test file they would give the answer away a piece at a time.
 - `known-wrong.json` belongs to the ten regex_cases and tests seeds. It lists the regexes or functions a careless solver would write, each the solution with one rule of the brief broken, which the tests use to show that the held-out cases do not pay them. Each is one edit from the solution, so it is private too. A wrong answer that reveals nothing (an empty string, `Lorem.`) may stay in a public test.
 - `pnpm seed` reads the checks from the private directory. A seed whose file is not there stops the run before anything is posted, with `held-out for <slug> not found in <dir>; set TENDER_SEEDS_PRIVATE_DIR`: a task is never posted without its checks.
-- The scripted offline agent (`--solver offline`) answers a real seed with its `solution.txt` from the private directory, and does not answer one that is not there.
-- The tests that score a seed's solution or its checks (the solution passes, the weak and the known-wrong answers do not, the key checks every value) run when the private directory has the files, and are skipped, with one message, when it does not, which is every clean checkout and CI. The tests that read only the public files run everywhere: the schemas, the rubric rules, the counts (30 seeds, 25 with checks, 22.50 tUSDC), the briefs and criteria, the weak answers. A private directory that holds some of the files but not all is an error, not a skip.
+- The scripted agents answer a real seed from the private directory (`--solver offline` with its `solution.txt`, `--solver weak` with its `weak.txt`), and do not answer one that is not there.
+- The tests that score a seed's solution or its checks (the solution passes, the weak and the known-wrong answers do not, the key checks every value) run when the private directory has the files, and are skipped, with one message, when it does not, which is every clean checkout and CI. The tests that read only the public files run everywhere: the schemas, the rubric rules, the counts (30 seeds, 25 with checks, 22.50 tUSDC), the briefs and criteria. A private directory that holds some of the files but not all is an error, not a skip.
 - Tests that only need a task to have checks (posting the thirty seeds to a local chain) use stand-ins of the right kind from `synthetic-heldout.ts` when the real ones are not there. A stand-in scores nothing in earnest.
 
 ## The demo tasks are separate

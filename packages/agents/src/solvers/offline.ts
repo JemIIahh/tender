@@ -8,11 +8,12 @@ import type { Solver } from "../types";
 // the answer that wins, `weak.txt` the one that is meant to lose. They need no key, no network and
 // no model, which is what lets the local demo run on a clean machine.
 //
-// The 30 real seeds keep their `solution.txt` out of the repository, in a private directory
-// (seeds/README.md), because a copy of it would win the real task. A solver is told that directory
-// (`privateDir`) and looks there first; a seed folder that has its own `solution.txt`, as the
-// tracked demo tasks and the swarm pack do, is answered from the folder when the directory has
-// none. A seed with an answer in neither is not answered (null), as before.
+// The 30 real seeds keep their `solution.txt` and `weak.txt` out of the repository, in a private
+// directory (seeds/README.md): a copy of the first would win the real task, and the second is the
+// first with a few values wrong. A solver is told that directory (`privateDir`) and looks there
+// first; a seed folder that has its own answer files, as the tracked demo tasks and the swarm pack
+// do, is answered from the folder when the directory has none. A seed with an answer in neither is
+// not answered (null), as before.
 
 /** Whether `error` is a file system error with this code, such as `ENOENT`. */
 function hasCode(error: unknown, code: string): boolean {
@@ -59,7 +60,7 @@ function indexSeeds(seedsDir: string): Map<string, string> {
 
 /**
  * A solver that answers a task from the file `file` of its seed's folder (of the same folder in
- * `privateDir` first, for a `solution.txt`), if the task's brief hash is one of the seeds' (see
+ * `privateDir` first, if there is one), if the task's brief hash is one of the seeds' (see
  * `indexSeeds`), and returns null for any other task, and for a seed that has no such file (not
  * every seed has a weak answer). It reads `seedsDir` when it is made, so a directory that is not
  * there fails now and not on the first task, and it reads the answer again each time it is asked,
