@@ -18,6 +18,7 @@ import {
   type WindowPhase,
 } from "../lib/phase";
 import { Countdown } from "./Countdown";
+import { EYEBROW, PANEL, PANEL_TITLE, SECONDARY } from "./ui";
 
 /** What each window is called in a sentence. */
 const WINDOW_NAMES: Record<Phase, string> = {
@@ -103,16 +104,17 @@ export function PhaseTimeline({
       : `Preview, ${WINDOW_NAMES[shown]}, ${elapsed(previewNs)}: ${rule.headline}`;
 
   return (
-    <section
-      aria-labelledby={`${sliderId}-title`}
-      data-testid="phase-timeline"
-      className="grid gap-3"
-    >
-      <h2 id={`${sliderId}-title`} className="text-lg font-semibold">
-        Timeline
-      </h2>
+    <section aria-labelledby={`${sliderId}-title`} data-testid="phase-timeline" className={PANEL}>
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <h2 id={`${sliderId}-title`} className={PANEL_TITLE}>
+          Timeline
+        </h2>
+        <p data-testid="live-status" className="text-sm text-muted">
+          {liveStatus(live, openWindow, nowNs)}
+        </p>
+      </div>
 
-      <ol className="grid grid-cols-5 text-center text-xs">
+      <ol className="grid grid-cols-5 gap-1 text-center sm:gap-1.5">
         {ZONE_ORDER.map((zone) => {
           const window = windows.find((w) => w.phase === zone);
           const state = [
@@ -128,11 +130,15 @@ export function PhaseTimeline({
               data-phase={zone}
               data-state={state === "" ? "none" : state}
               aria-current={live === zone ? "step" : undefined}
-              className="border border-neutral-900 px-1 py-1.5 data-[state~=live]:bg-neutral-900 data-[state~=live]:text-white data-[state~=preview]:outline-2 data-[state~=preview]:-outline-offset-4 data-[state~=preview]:outline-dashed data-[state~=preview]:outline-neutral-500"
+              className="min-w-0 rounded-xl border border-line bg-ink px-0.5 py-2.5 text-muted sm:px-1 data-[state~=live]:border-bone data-[state~=live]:bg-bone data-[state~=live]:text-ink data-[state~=preview]:outline-2 data-[state~=preview]:-outline-offset-4 data-[state~=preview]:outline-bone/70 data-[state~=preview]:outline-dashed"
             >
-              <span className="block font-medium">{WINDOW_LABELS[zone]}</span>
+              <span className="block font-mono text-[9px] tracking-normal uppercase wrap-anywhere sm:text-[10.5px] sm:tracking-[0.14em]">
+                {WINDOW_LABELS[zone]}
+              </span>
               {window ? (
-                <span className="block">{formatSpan(window.endNs - window.startNs)}</span>
+                <span className="mt-0.5 block text-[13px] tabular-nums">
+                  {formatSpan(window.endNs - window.startNs)}
+                </span>
               ) : null}
             </li>
           );
@@ -140,7 +146,7 @@ export function PhaseTimeline({
       </ol>
 
       <div className="grid gap-1">
-        <label htmlFor={sliderId} className="text-sm text-neutral-700">
+        <label htmlFor={sliderId} className={EYEBROW}>
           Preview another moment
         </label>
         <input
@@ -152,36 +158,30 @@ export function PhaseTimeline({
           value={position}
           onChange={(event) => move(Number(event.currentTarget.value))}
           aria-valuetext={valueText}
-          className="h-10 w-full accent-neutral-900"
+          className="h-10 w-full cursor-pointer accent-seal"
         />
       </div>
 
-      <p data-testid="live-status" className="text-sm">
-        {liveStatus(live, openWindow, nowNs)}
-      </p>
-
       {previewNs !== null ? (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-          <p data-testid="preview-status" className="text-sm">
+          <p data-testid="preview-status" className="text-sm text-muted">
             Preview: {elapsed(previewNs)}
             {live === "settled" ? " (a what-if: this task is already settled)" : ""}
           </p>
-          <button
-            type="button"
-            onClick={() => move(null)}
-            className="min-h-11 rounded border border-neutral-900 px-4"
-          >
+          <button type="button" onClick={() => move(null)} className={SECONDARY}>
             Back to now
           </button>
         </div>
       ) : null}
 
-      <div className="rounded border border-neutral-300 p-3">
-        <p className="text-xs text-neutral-700">{previewNs === null ? "Rule now" : "Rule then"}</p>
-        <p data-testid="rule" className="text-lg font-semibold">
+      <div className="grid gap-1.5 rounded-xl border border-line bg-raised p-4">
+        <p className={EYEBROW}>
+          {previewNs === null ? "Rule now" : "Rule then"} <span className="text-seal">&gt;</span>
+        </p>
+        <p data-testid="rule" className="text-xl font-semibold tracking-tight text-bone">
           {rule.headline}
         </p>
-        <p className="text-sm">{rule.detail}</p>
+        <p className="text-sm text-muted">{rule.detail}</p>
       </div>
     </section>
   );

@@ -29,9 +29,9 @@ function Split({ seen, kept }: { seen: ReactNode; kept: ReactNode }) {
       <section
         data-testid="split-public"
         aria-labelledby="post-split-public"
-        className="grid min-w-0 content-start gap-3 rounded border border-neutral-300 p-4"
+        className="grid min-w-0 content-start gap-4 rounded-xl border border-line bg-ink p-4 sm:p-5"
       >
-        <h3 id="post-split-public" className="text-lg font-semibold">
+        <h3 id="post-split-public" className="text-lg font-semibold tracking-tight text-bone">
           What agents see
         </h3>
         {seen}
@@ -39,9 +39,13 @@ function Split({ seen, kept }: { seen: ReactNode; kept: ReactNode }) {
       <section
         data-testid="split-heldout"
         aria-labelledby="post-split-heldout"
-        className="grid min-w-0 content-start gap-3 rounded border-2 border-neutral-900 p-4"
+        className="grid min-w-0 content-start gap-4 rounded-xl border border-seal/45 bg-seal/[0.04] p-4 sm:p-5"
       >
-        <h3 id="post-split-heldout" className="text-lg font-semibold">
+        <h3
+          id="post-split-heldout"
+          className="flex items-center gap-2 text-lg font-semibold tracking-tight text-bone"
+        >
+          <span aria-hidden="true" className="size-2 shrink-0 rounded-full bg-seal" />
           Kept secret until payout
         </h3>
         {kept}
@@ -51,7 +55,7 @@ function Split({ seen, kept }: { seen: ReactNode; kept: ReactNode }) {
 }
 
 const Note = ({ children }: { children: ReactNode }) => (
-  <p className="text-sm text-neutral-700">{children}</p>
+  <p className="text-sm text-muted">{children}</p>
 );
 
 export function CriteriaStep(
@@ -122,14 +126,14 @@ export function CriteriaStep(
             kept={
               <>
                 <div id="post-assertions" tabIndex={-1} className="grid gap-3">
-                  <p className="font-medium">Values the Judge checks</p>
+                  <p className="font-medium text-bone">Values the Judge checks</p>
                   {form.assertions.map((row, i) => (
                     <fieldset
                       // biome-ignore lint/suspicious/noArrayIndexKey: a row has no identity but its place
                       key={i}
-                      className="grid min-w-0 gap-2 rounded border border-neutral-300 p-3"
+                      className="grid min-w-0 gap-3 rounded-xl border border-line p-3.5"
                     >
-                      <legend className="px-1 text-sm">{`Value ${i + 1}`}</legend>
+                      <legend className="px-1 font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase">{`Value ${i + 1}`}</legend>
                       <TextField
                         name={`assertion-${i}-path`}
                         label="Path"
@@ -227,7 +231,7 @@ export function CriteriaStep(
                   {...bindText(props, "heldoutNoMatch")}
                 />
                 {caution === null ? null : (
-                  <p data-testid="regex-caution" className="text-sm font-medium">
+                  <p data-testid="regex-caution" className="text-sm font-medium text-seal">
                     {caution}
                   </p>
                 )}
@@ -248,9 +252,9 @@ export function CriteriaStep(
                   <fieldset
                     // biome-ignore lint/suspicious/noArrayIndexKey: a row has no identity but its place
                     key={i}
-                    className="grid min-w-0 gap-2 rounded border border-neutral-300 p-3"
+                    className="grid min-w-0 gap-3 rounded-xl border border-line p-3.5"
                   >
-                    <legend className="px-1 text-sm">{`Point ${i + 1}`}</legend>
+                    <legend className="px-1 font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase">{`Point ${i + 1}`}</legend>
                     <TextField
                       name={`rubric-${i}-criterion`}
                       label="What to look for"
@@ -326,7 +330,7 @@ export function CriteriaStep(
         onChange={onKind}
         error={errors.kind}
       />
-      <p data-testid="answer-format" className="text-sm">
+      <p data-testid="answer-format" className="text-sm text-muted">
         {`Answers: ${FORMAT_PHRASE[form.outputFormat]} (set on Brief).`}
       </p>
 
@@ -345,7 +349,12 @@ export function CriteriaStep(
       {sides}
 
       {errors.heldout === undefined ? null : (
-        <p id="post-heldout" tabIndex={-1} data-testid="error-heldout" className="font-medium">
+        <p
+          id="post-heldout"
+          tabIndex={-1}
+          data-testid="error-heldout"
+          className="font-medium text-seal"
+        >
           {errors.heldout}
         </p>
       )}

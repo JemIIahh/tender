@@ -1,5 +1,7 @@
+import { Avatar } from "./Avatar";
 import { PosterJudges } from "./PosterJudges";
 import { TeamBadge } from "./TeamBadge";
+import { FACT_LABEL, FACTS, PANEL, PANEL_TITLE } from "./ui";
 
 /**
  * The two figures the contract keeps for a verifier: how many times it has picked, and how many
@@ -13,11 +15,15 @@ export function VerifierFigures({
   voids_after_reveals: number;
 }) {
   return (
-    <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-      <dt>Picks made</dt>
-      <dd data-testid="picks-made">{picks_made}</dd>
-      <dt>Voids after reveals</dt>
-      <dd data-testid="voids-after-reveals">{voids_after_reveals}</dd>
+    <dl className={FACTS}>
+      <dt className={FACT_LABEL}>Picks made</dt>
+      <dd data-testid="picks-made" className="tabular-nums">
+        {picks_made}
+      </dd>
+      <dt className={FACT_LABEL}>Voids after reveals</dt>
+      <dd data-testid="voids-after-reveals" className="tabular-nums">
+        {voids_after_reveals}
+      </dd>
     </dl>
   );
 }
@@ -58,21 +64,26 @@ export function VerifierRecord({
   unavailable?: boolean;
 }) {
   return (
-    <section data-testid="verifier-record" className="grid gap-2">
-      <h2 className="text-lg font-semibold">Verifier</h2>
-      {isJudge ? (
-        <p data-testid="verifier-name" className="font-medium">
-          Tender Judge
-        </p>
-      ) : null}
-      <TeamBadge account={account} isTeam={isTeam} />
+    <section data-testid="verifier-record" className={PANEL}>
+      <h2 className={PANEL_TITLE}>Verifier</h2>
+      <div className="flex min-w-0 items-center gap-3">
+        <Avatar account={account} size={34} />
+        <div className="grid min-w-0 gap-0.5">
+          {isJudge ? (
+            <p data-testid="verifier-name" className="font-medium text-bone">
+              Tender Judge
+            </p>
+          ) : null}
+          <TeamBadge account={account} isTeam={isTeam} />
+        </div>
+      </div>
       {isPoster ? <PosterJudges /> : null}
       {unavailable ? (
-        <p data-testid="verifier-unavailable" className="text-sm">
+        <p data-testid="verifier-unavailable" className="text-sm text-muted">
           Verifier record unavailable
         </p>
       ) : picks_made === null || voids_after_reveals === null ? (
-        <p data-testid="verifier-no-record" className="text-sm">
+        <p data-testid="verifier-no-record" className="text-sm text-muted">
           {isJudge
             ? "No pick record on chain yet."
             : "No record: this account is not a registered agent."}

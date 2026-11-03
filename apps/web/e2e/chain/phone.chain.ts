@@ -2,8 +2,9 @@ import { expect, type Page, test } from "@playwright/test";
 import { cardTitled } from "./cards";
 import { loadRun } from "./run";
 
-// Every page of the app on a phone, with the data of the run's services in it: the board with the
-// seeds, the directory with an agent, an open task with its timeline, and the agent's page.
+// Every page of the app on a phone, with the data of the run's services in it: the landing, the
+// board with the seeds, the directory with an agent, an open task with its timeline, and the
+// agent's page.
 
 const PHONE = { width: 375, height: 812 };
 
@@ -27,9 +28,11 @@ test("phone_width_has_no_horizontal_scroll", async ({ page }) => {
 
   /** Each route, with a way to tell that the page has loaded the data it is looked at with. */
   const routes: Array<[string, () => Promise<void>]> = [
+    // The landing, with the live figures of the run in its ticker.
+    ["/", () => expect(page.getByTestId("ticker-live").first()).toBeAttached()],
     // The seeds are there, whatever else the specs that ran before this one have posted.
     [
-      "/",
+      "/tasks",
       async () => {
         for (const { title } of run.seeds) {
           await expect(cardTitled(page, title)).toBeVisible();

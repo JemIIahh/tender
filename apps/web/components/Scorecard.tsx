@@ -1,6 +1,7 @@
 import { canonicalJson, isJudgeBranded, type Scorecard as ScorecardDocument } from "@tender/shared";
 import { useMemo } from "react";
 import { formatBps } from "../lib/bps";
+import { FACT_LABEL, PANEL, PANEL_TITLE, SECONDARY } from "./ui";
 
 /**
  * The held-out checks as a download: the same bytes that were hashed into the commitment, which
@@ -40,7 +41,7 @@ export function ScoredBy({
   const who = byJudge ? "the Tender Judge" : software;
   const rubric = scorecard.kind === "rubric";
   return (
-    <p data-testid="scored-by" className="text-sm wrap-anywhere">
+    <p data-testid="scored-by" className="text-sm text-muted wrap-anywhere">
       {`Scored by ${who}`}
       {rubric && model !== null ? ` with ${model}` : ""}
       {rubric ? ". Subjective: a model's judgement." : "."}
@@ -75,27 +76,27 @@ export function Scorecard({
   const href = useMemo(() => (heldout === null ? undefined : heldoutHref(heldout)), [heldout]);
 
   return (
-    <section data-testid="scorecard" className="grid gap-4">
-      <h2 className="text-lg font-semibold">Scorecard</h2>
+    <section data-testid="scorecard" className={PANEL}>
+      <h2 className={PANEL_TITLE}>Scorecard</h2>
       <ScoredBy scorecard={scorecard} judgeAccount={judgeAccount} />
 
       {scorecard.entries.length === 0 ? (
-        <p className="text-sm">No entry was scored.</p>
+        <p className="text-sm text-muted">No entry was scored.</p>
       ) : (
         <table className="w-full table-fixed text-sm">
           <caption className="sr-only">How each revealed entry scored</caption>
           <thead>
-            <tr className="text-left text-xs">
-              <th scope="col" className="w-[30%] px-1 py-1 font-medium">
+            <tr className="text-left font-mono text-[10px] tracking-[0.12em] text-muted uppercase sm:text-[10.5px]">
+              <th scope="col" className="w-[30%] px-1 pb-2 font-normal">
                 Entry
               </th>
-              <th scope="col" className="w-[14%] px-1 py-1 font-medium">
+              <th scope="col" className="w-[14%] px-1 pb-2 font-normal">
                 Score
               </th>
-              <th scope="col" className="w-[17%] px-1 py-1 font-medium">
+              <th scope="col" className="w-[17%] px-1 pb-2 font-normal">
                 Passed
               </th>
-              <th scope="col" className="px-1 py-1 font-medium">
+              <th scope="col" className="px-1 pb-2 font-normal">
                 Reasons
               </th>
             </tr>
@@ -106,21 +107,21 @@ export function Scorecard({
                 // biome-ignore lint/suspicious/noArrayIndexKey: the verifier writes the document, and two rows can name the same account
                 key={`${entry.account}:${i}`}
                 data-testid="score-row"
-                className="border-t border-neutral-300 align-top"
+                className="border-t border-line align-top"
               >
                 <th
                   scope="row"
-                  className="px-1 py-2 text-left font-mono text-xs font-normal wrap-anywhere sm:text-sm"
+                  className="px-1 py-3 text-left font-mono text-xs font-normal text-bone wrap-anywhere sm:text-[13px]"
                 >
                   {entry.account}
                 </th>
-                <td data-testid="score" className="px-1 py-2">
+                <td data-testid="score" className="px-1 py-3 text-bone tabular-nums">
                   {entry.score}
                 </td>
-                <td data-testid="passed" className="px-1 py-2">
+                <td data-testid="passed" className="px-1 py-3 text-bone">
                   {entry.passed ? "Yes" : "No"}
                 </td>
-                <td className="px-1 py-2">
+                <td className="px-1 py-3 text-muted">
                   <ul className="grid gap-1">
                     {entry.reasons.map((reason, i) => (
                       // biome-ignore lint/suspicious/noArrayIndexKey: reasons are a list in an order, and two can be the same text
@@ -136,12 +137,12 @@ export function Scorecard({
         </table>
       )}
 
-      <div className="grid gap-1">
-        <h3 className="font-medium">Winners</h3>
+      <div className="grid gap-2">
+        <h3 className={FACT_LABEL}>Winners</h3>
         {scorecard.winners.length === 0 ? (
-          <p className="text-sm">No winner: nothing was awarded.</p>
+          <p className="text-sm text-muted">No winner: nothing was awarded.</p>
         ) : (
-          <ul className="grid gap-1 text-sm">
+          <ul className="grid gap-1 text-sm text-bone">
             {scorecard.winners.map((winner, i) => (
               <li
                 // biome-ignore lint/suspicious/noArrayIndexKey: the verifier writes the document, and two winners can name the same account
@@ -156,12 +157,12 @@ export function Scorecard({
         )}
       </div>
 
-      <div className="grid gap-1 text-sm">
+      <div className="grid gap-3 rounded-xl border border-line bg-ink p-4 text-sm text-muted">
         {expected === null ? (
           <p>This task has no held-out checks.</p>
         ) : (
           <>
-            <p data-testid="recompute" className="font-mono wrap-anywhere">
+            <p data-testid="recompute" className="font-mono text-[13px] text-bone/90 wrap-anywhere">
               {`Recompute: sha256(held-out) must equal ${expected}`}
             </p>
             {scorecard.heldout === null ? (
@@ -169,14 +170,14 @@ export function Scorecard({
             ) : href === undefined ? (
               <p>The held-out checks cannot be written out as a file.</p>
             ) : (
-              <a href={href} download="heldout.json" className="w-fit underline">
+              <a href={href} download="heldout.json" className={SECONDARY}>
                 Held-out checks (JSON)
               </a>
             )}
           </>
         )}
         {claimed !== expected ? (
-          <p data-testid="commitment-mismatch" className="font-medium wrap-anywhere">
+          <p data-testid="commitment-mismatch" className="font-medium text-seal wrap-anywhere">
             {`The scorecard names the commitment ${claimed ?? "none"}, but the task commits to ${expected ?? "none"}.`}
           </p>
         ) : null}

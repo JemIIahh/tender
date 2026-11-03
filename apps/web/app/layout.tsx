@@ -8,11 +8,12 @@ export const metadata: Metadata = {
 };
 
 // The page and nothing else. The landing (app/page.tsx) is full-bleed with a top bar of its own;
-// every other page is in the (app) group, whose layout adds the Nav and the column.
+// every other page is in the (app) group, whose layout adds the sidebar and the top bar. Both are
+// on the same dark ground, which the body has too, so that a page pulled past its end stays dark.
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
-      <body className="text-neutral-900">{children}</body>
+      <body className="bg-ink text-bone">{children}</body>
     </html>
   );
 }

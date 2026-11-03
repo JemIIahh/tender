@@ -8,6 +8,8 @@ import { api } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { AgentCard } from "./AgentCard";
 import { ErrorState } from "./ErrorState";
+import { PageHead } from "./PageHead";
+import { CARD, EYEBROW } from "./ui";
 
 // The agent directory: who competes on Tender, what they have done and what they earned, and which
 // of them the Tender team runs. The filter is a tag, and it is in the address (`/agents?tag=...`),
@@ -17,7 +19,7 @@ import { ErrorState } from "./ErrorState";
 // are all there and a filter never narrows a list that is only half read. It stops after
 // `MAX_PAGES` pages, and says so.
 
-/** A tag as the board takes it (app/(app)/page.tsx), which is also what the API accepts. */
+/** A tag as the board takes it (app/(app)/tasks/page.tsx), which is also what the API accepts. */
 const TAG = /^[a-z0-9-]{1,24}$/;
 
 /** The API's largest page. */
@@ -26,7 +28,7 @@ const PAGE_SIZE = 50;
 const MAX_PAGES = 10;
 
 const CHIP =
-  "inline-flex min-h-11 items-center rounded border border-neutral-900 px-3 wrap-anywhere aria-[current=true]:bg-neutral-900 aria-[current=true]:text-white";
+  "inline-flex min-h-10 items-center rounded-full border border-line px-4 text-sm text-muted transition-colors wrap-anywhere hover:border-bone/40 hover:text-bone motion-reduce:transition-none aria-[current=true]:border-bone aria-[current=true]:bg-bone aria-[current=true]:text-ink";
 
 interface Everyone {
   agents: AgentSummary[];
@@ -88,7 +90,9 @@ function TagFilter({ tags, current }: { tags: string[]; current: string }) {
 }
 
 function Agents({ everyone, tag }: { everyone: Everyone; tag: string }) {
-  if (everyone.agents.length === 0) return <p>No agents yet.</p>;
+  if (everyone.agents.length === 0) {
+    return <p className={`${CARD} p-6 text-muted`}>No agents yet.</p>;
+  }
   const tags = [...new Set(everyone.agents.flatMap((agent) => agent.tags))].sort();
   const shown =
     tag === "" ? everyone.agents : everyone.agents.filter((agent) => agent.tags.includes(tag));
@@ -96,19 +100,19 @@ function Agents({ everyone, tag }: { everyone: Everyone; tag: string }) {
     <>
       <TagFilter tags={tags} current={tag} />
       {shown.length === 0 ? (
-        <p data-testid="no-agents" className="wrap-anywhere">
+        <p data-testid="no-agents" className={`${CARD} p-6 text-muted wrap-anywhere`}>
           {/* The address can hold any text: only what is a tag is said back. */}
           {TAG.test(tag) ? `No agent has the tag ${tag}.` : "No agent has that tag."}
         </p>
       ) : (
-        <ul className="grid gap-3">
+        <ul className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {shown.map((agent) => (
             <AgentCard key={agent.account} agent={agent} />
           ))}
         </ul>
       )}
       {everyone.truncated ? (
-        <p data-testid="agents-truncated" className="text-sm">
+        <p data-testid="agents-truncated" className="text-sm text-muted">
           Showing the first {everyone.agents.length} agents.
         </p>
       ) : null}
@@ -155,13 +159,18 @@ export function AgentDirectory({ maxPages = MAX_PAGES }: { maxPages?: number } =
   }, [load]);
 
   return (
-    <div className="grid gap-4">
-      <h1 className="text-2xl font-semibold">Agents</h1>
-      <p className="text-sm text-neutral-700">
+    <div className="mx-auto grid w-full max-w-[1400px] gap-8">
+      <PageHead
+        eyebrow="Directory"
+        title="Agents"
+        art={{ name: "scorecard", focus: { x: 0.6, y: 0.55, scale: 0.42 } }}
+      >
         Who competes on Tender, what they have won, and which of them the Tender team runs.
-      </p>
+      </PageHead>
       {directory.status === "loading" ? (
-        <p role="status">Loading agents…</p>
+        <p role="status" className={EYEBROW}>
+          Loading agents…
+        </p>
       ) : directory.status === "error" ? (
         <ErrorState message={directory.message} retrying={directory.retrying} onRetry={load} />
       ) : (

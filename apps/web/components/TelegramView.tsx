@@ -11,6 +11,8 @@ import { type Told, toldFor } from "../lib/told";
 import { useWaitedLong } from "../lib/waiting";
 import { useWallet } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErrors";
+import { PageHead } from "./PageHead";
+import { CARD, NOTICE, PRIMARY, SECONDARY, TEXT_LINK } from "./ui";
 
 // The Telegram page: what the alerts are, and one button that links this account to the Tender bot.
 // The button connects the wallet, and then signs in to the API (if the page has no token yet), asks
@@ -21,10 +23,6 @@ import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErr
 // no copy of it and never clears it (the wallet store drops it where the wallet session ends). A
 // token the API turns away is replaced by signing in again. The link carries a code that is a
 // secret until it is spent, so it is opened and shown as a link and never logged.
-
-const PRIMARY =
-  "min-h-11 w-fit rounded border border-neutral-900 bg-neutral-900 px-4 text-white aria-disabled:opacity-60";
-const SECONDARY = "min-h-11 w-fit rounded border border-neutral-900 px-4";
 
 /** What is said after the person stopped waiting: nothing was linked. */
 const STOPPED =
@@ -56,11 +54,7 @@ function LinkState({ link }: { link: MadeLink }) {
   const now = useNowNs();
   const expired = Date.parse(link.expiresAt) <= Number(now / 1_000_000n);
   return (
-    <div
-      role="status"
-      data-testid="link-state"
-      className="grid gap-1 rounded border border-neutral-900 p-3 text-sm"
-    >
+    <div role="status" data-testid="link-state" className={`${NOTICE} grid gap-1`}>
       {expired ? (
         <p>That link has expired. Press Link Telegram for a new one.</p>
       ) : (
@@ -70,7 +64,7 @@ function LinkState({ link }: { link: MadeLink }) {
             <time dateTime={link.expiresAt}>{timeOf(link.expiresAt)}</time>.
           </p>
           <p>
-            <a href={link.url} target="_blank" rel="noopener noreferrer" className="underline">
+            <a href={link.url} target="_blank" rel="noopener noreferrer" className={TEXT_LINK}>
               Open Telegram
             </a>{" "}
             if it did not open by itself, and press Start there.
@@ -192,38 +186,56 @@ export function TelegramView() {
   };
 
   return (
-    <div className="grid gap-6">
-      <h1 className="text-2xl font-semibold">Telegram alerts</h1>
+    <div className="mx-auto grid w-full max-w-4xl gap-6">
+      <PageHead
+        eyebrow="Account"
+        title="Telegram alerts"
+        art={{ name: "signal", focus: { x: 0.6, y: 0.55, scale: 0.42 } }}
+      />
 
-      <ul data-testid="alert-lines" className="grid list-disc gap-2 pl-5">
-        <li>Get messages about tasks you posted or your agents entered.</li>
-        <li>Send /watch research in the chat for new tasks with that tag.</li>
-        <li>Your wallet signs a message: no transaction, no fee.</li>
+      <ul data-testid="alert-lines" className="grid gap-3 sm:grid-cols-3">
+        {[
+          "Get messages about tasks you posted or your agents entered.",
+          "Send /watch research in the chat for new tasks with that tag.",
+          "Your wallet signs a message: no transaction, no fee.",
+        ].map((line) => (
+          <li key={line} className={`${CARD} flex gap-3 p-5 text-[15px] leading-relaxed text-bone`}>
+            <span aria-hidden="true" className="font-mono text-seal">
+              &gt;
+            </span>
+            {line}
+          </li>
+        ))}
       </ul>
 
-      <section className="grid gap-2">
+      <section className={`${CARD} grid gap-4 p-5 sm:p-6`}>
         {!ready ? (
-          <p role="status">Checking for your wallet…</p>
+          <p role="status" className="text-sm text-muted">
+            Checking for your wallet…
+          </p>
         ) : (
           <>
             {accountId === null ? (
-              <p>Connect a wallet to link Telegram.</p>
+              <p className="text-sm text-muted">Connect a wallet to link Telegram.</p>
             ) : (
-              <p className="flex flex-wrap items-baseline gap-x-2">
-                <span>Connected as</span>
-                <span data-testid="account-id" className="font-mono text-sm wrap-anywhere">
+              <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                <span className="text-sm text-muted">Connected as</span>
+                <span
+                  data-testid="account-id"
+                  className="font-mono text-sm text-bone wrap-anywhere"
+                >
                   {accountId}
                 </span>
               </p>
             )}
             {stuck ? (
-              <div className="grid gap-1 text-sm">
+              <div className={`${NOTICE} grid gap-1`}>
                 <p role="status" data-testid="cannot-sign">
                   {WALLET_CANNOT_SIGN_MESSAGE}
                 </p>
                 {/* The wallet page is where Disconnect is. */}
                 <p>
-                  <Link href="/wallet" className="underline">
+                  <Link href="/wallet" className={TEXT_LINK}>
                     Disconnect it on the Wallet page
                   </Link>
                 </p>
@@ -261,7 +273,7 @@ export function TelegramView() {
           <p
             role="alert"
             data-testid="link-error"
-            className="rounded border border-neutral-900 p-3 text-sm"
+            className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
           >
             {failed}
           </p>

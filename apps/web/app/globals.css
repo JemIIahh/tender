@@ -1,9 +1,96 @@
 @import "tailwindcss";
 
+/* The landing's colours (app/page.tsx): a dark base, bone for text and art, and one accent, the
+   red of sealing wax. Utilities such as bg-ink and text-seal come from these. */
+@theme {
+  --color-ink: #0a0a0b;
+  --color-panel: #111113;
+  --color-raised: #18181b;
+  --color-line: #26262a;
+  --color-bone: #eeebe4;
+  --color-muted: #9b9991;
+  --color-dim: #64625d;
+  --color-seal: #ff4b3e;
+  --color-paper: #e6e6e3;
+}
+
 @layer base {
   /* A ring that shows on the page and on a filled button alike. */
   :focus-visible {
     outline: 2px solid #171717;
     outline-offset: 2px;
+  }
+}
+
+/* ---- The landing and the app ------------------------------------------------------------------ */
+
+/* On the dark page the ring is bone, and on its light cards it is ink again. The app's pages
+   (app/(app)/layout.tsx) are on the same ground as the landing and take the same ring. */
+.landing :focus-visible,
+.app :focus-visible {
+  outline: 2px solid var(--color-bone);
+  outline-offset: 3px;
+}
+.landing .on-paper :focus-visible,
+.app .on-paper :focus-visible {
+  outline-color: var(--color-ink);
+}
+
+/* The app's top bar stays at the top of the screen: what the page scrolls to, or moves the focus
+   to, stops below it and not under it. */
+html:has(.app) {
+  scroll-padding-top: 5rem;
+}
+
+/* The browser draws the app's own controls (a select's list, a scrollbar, a date picker) dark. */
+.app {
+  color-scheme: dark;
+}
+.app .on-paper {
+  color-scheme: light;
+}
+
+/* Fine scanlines over the art. */
+.scanlines {
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 2px,
+    rgb(0 0 0 / 0.42) 2px,
+    rgb(0 0 0 / 0.42) 3px
+  );
+}
+
+/* The ticker: two copies of the same items side by side, moved left by one copy's width. */
+@keyframes ticker {
+  to {
+    transform: translateX(-50%);
+  }
+}
+.ticker-rail {
+  animation: ticker var(--ticker-duration, 60s) linear infinite;
+}
+.ticker:hover .ticker-rail {
+  animation-play-state: paused;
+}
+
+/* The caret of the typed code. */
+@keyframes caret {
+  50% {
+    opacity: 0;
+  }
+}
+.caret {
+  animation: caret 1s steps(1) infinite;
+}
+
+/* Reduced motion: nothing moves. The ticker can be scrolled by hand instead. */
+@media (prefers-reduced-motion: reduce) {
+  .ticker-rail,
+  .caret {
+    animation: none;
+  }
+  .ticker-viewport {
+    overflow-x: auto;
   }
 }

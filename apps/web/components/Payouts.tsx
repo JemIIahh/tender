@@ -1,6 +1,11 @@
 import type { TaskOutcome } from "@tender/shared";
 import { formatBps } from "../lib/bps";
 import { Amount } from "./Amount";
+import { PANEL, PANEL_TITLE } from "./ui";
+
+/** A row of a list of accounts and what each got. */
+const ROW =
+  "flex flex-wrap items-baseline gap-x-4 gap-y-1 border-t border-line py-3 first:border-t-0 first:pt-0 last:pb-0";
 
 type Voided = Extract<TaskOutcome, { kind: "voided" }>;
 
@@ -49,51 +54,59 @@ export function Payouts({
   verifier: string;
 }) {
   return (
-    <section data-testid="payouts" className="grid gap-3">
-      <h2 className="text-lg font-semibold">Payouts</h2>
-      <p data-testid="settled-by" className="font-medium wrap-anywhere">
+    <section data-testid="payouts" className={PANEL}>
+      <h2 className={PANEL_TITLE}>Payouts</h2>
+      <p data-testid="settled-by" className="font-medium text-bone wrap-anywhere">
         {settledBy(outcome, poster, verifier)}
       </p>
 
       {outcome.kind === "voided" ? (
-        <p data-testid="settled-why" className="text-sm">
+        <p data-testid="settled-why" className="text-sm text-muted">
           {WHY[outcome.reason]}
         </p>
       ) : null}
 
       {outcome.kind === "picked" ? (
         <>
-          <ul className="grid gap-2" aria-label="Winners">
+          <ul className="grid" aria-label="Winners">
             {outcome.winners.map((winner, i) => (
               <li
                 // biome-ignore lint/suspicious/noArrayIndexKey: the contract allows one share per account, but the page does not rely on it
                 key={`${winner.account}:${i}`}
                 data-testid="winner-row"
-                className="flex flex-wrap items-baseline gap-x-3 gap-y-1"
+                className={ROW}
               >
-                <span className="font-mono text-sm wrap-anywhere">{winner.account}</span>
-                <span>{formatBps(winner.bps)}</span>
-                <Amount value={winner.amount} token={token} />
+                <span className="min-w-0 font-mono text-[13px] text-bone wrap-anywhere">
+                  {winner.account}
+                </span>
+                <span className="text-muted">{formatBps(winner.bps)}</span>
+                <span className="ml-auto text-bone tabular-nums">
+                  <Amount value={winner.amount} token={token} />
+                </span>
               </li>
             ))}
           </ul>
-          <p data-testid="fee" className="text-sm">
+          <p data-testid="fee" className="text-sm text-muted">
             Fee: <Amount value={outcome.fee} token={token} />
           </p>
         </>
       ) : null}
 
       {outcome.kind === "voided" && outcome.refunds !== undefined && outcome.refunds.length > 0 ? (
-        <ul className="grid gap-2" aria-label="Refunds">
+        <ul className="grid" aria-label="Refunds">
           {outcome.refunds.map((refund, i) => (
             <li
               // biome-ignore lint/suspicious/noArrayIndexKey: a funder is listed once, but the page does not rely on it
               key={`${refund.account}:${i}`}
               data-testid="refund-row"
-              className="flex flex-wrap items-baseline gap-x-3 gap-y-1"
+              className={ROW}
             >
-              <span className="font-mono text-sm wrap-anywhere">{refund.account}</span>
-              <Amount value={refund.amount} token={token} />
+              <span className="min-w-0 font-mono text-[13px] text-bone wrap-anywhere">
+                {refund.account}
+              </span>
+              <span className="ml-auto text-bone tabular-nums">
+                <Amount value={refund.amount} token={token} />
+              </span>
             </li>
           ))}
         </ul>

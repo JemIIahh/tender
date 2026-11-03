@@ -34,6 +34,8 @@ import { useWallet } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErrors";
 import { Amount } from "./Amount";
 import { ErrorState } from "./ErrorState";
+import { PageHead } from "./PageHead";
+import { CARD, FACT_LABEL, FIELD, NOTICE, PANEL, PANEL_TITLE, PRIMARY, SECONDARY } from "./ui";
 
 // The wallet page: connect a wallet, set up the account with Tender, put tokens into the vault and
 // take them out. The balances are read from the chain through the browser's own RPC node, so they
@@ -66,10 +68,6 @@ interface Notice {
   text: string;
 }
 
-const PRIMARY =
-  "min-h-11 w-fit rounded border border-neutral-900 bg-neutral-900 px-4 text-white aria-disabled:opacity-60";
-const SECONDARY = "min-h-11 w-fit rounded border border-neutral-900 px-4 aria-disabled:opacity-60";
-
 /** Whether the keyboard focus has nowhere to be, which is what removing the focused element does. */
 function focusLost(): boolean {
   return document.activeElement === null || document.activeElement === document.body;
@@ -93,7 +91,11 @@ function NoticeLine({ notice }: { notice: Notice | null }) {
     <p
       role={notice.kind === "failed" ? "alert" : "status"}
       data-testid="notice"
-      className="rounded border border-neutral-900 p-3 text-sm"
+      className={
+        notice.kind === "failed"
+          ? "rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
+          : NOTICE
+      }
     >
       {notice.text}
     </p>
@@ -102,29 +104,35 @@ function NoticeLine({ notice }: { notice: Notice | null }) {
 
 function BalancesSection({ rows }: { rows: TokenRow[] }) {
   return (
-    <section className="grid gap-2">
-      <h2 className="text-lg font-semibold">Balances</h2>
+    <section className={PANEL}>
+      <h2 className={PANEL_TITLE}>Balances</h2>
       {rows.length === 0 ? (
-        <p>Tender lists no tokens yet.</p>
+        <p className="text-sm text-muted">Tender lists no tokens yet.</p>
       ) : (
-        <ul className="grid gap-2">
+        <ul className="grid gap-3 sm:grid-cols-2">
           {rows.map((row) => (
             <li
               key={row.token}
               data-testid="token-row"
-              className="grid gap-1 rounded border border-neutral-300 p-3"
+              className="grid min-w-0 gap-3 rounded-xl border border-line bg-ink p-4"
             >
-              <span className="font-mono text-sm wrap-anywhere">
+              <span className="font-mono text-xs text-muted wrap-anywhere">
                 {row.token}
                 {row.enabled ? "" : " (not taking deposits)"}
               </span>
-              <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
-                <dt className="text-neutral-700">In your vault</dt>
-                <dd data-testid="vault-balance">
+              <dl className="grid grid-cols-2 gap-3">
+                <dt className={`${FACT_LABEL} row-start-1`}>In your vault</dt>
+                <dd
+                  data-testid="vault-balance"
+                  className="text-lg text-bone tabular-nums wrap-anywhere"
+                >
                   <Amount value={row.vault.toString()} token={row.token} />
                 </dd>
-                <dt className="text-neutral-700">In your wallet</dt>
-                <dd data-testid="wallet-balance">
+                <dt className={`${FACT_LABEL} row-start-1`}>In your wallet</dt>
+                <dd
+                  data-testid="wallet-balance"
+                  className="text-lg text-bone tabular-nums wrap-anywhere"
+                >
                   <Amount value={row.wallet?.toString() ?? null} token={row.token} />
                 </dd>
               </dl>
@@ -165,13 +173,13 @@ function StorageSection({
   }, [storage]);
 
   return (
-    <section className="grid gap-2">
-      <h2 ref={heading} tabIndex={-1} className="text-lg font-semibold">
+    <section className={PANEL}>
+      <h2 ref={heading} tabIndex={-1} className={PANEL_TITLE}>
         Storage with Tender
       </h2>
       {storage === null ? (
         <>
-          <p>
+          <p className="text-sm text-muted">
             Your account is not set up with Tender yet. Setting it up deposits{" "}
             {describeNear(SETUP_DEPOSIT_YOCTO)} to pay for the space your balances take. What you
             don't use you can take back.
@@ -190,11 +198,15 @@ function StorageSection({
         </>
       ) : (
         <>
-          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
-            <dt className="text-neutral-700">Deposited</dt>
-            <dd data-testid="storage-total">{describeNear(storage.total)}</dd>
-            <dt className="text-neutral-700">Free to take back</dt>
-            <dd data-testid="storage-available">{describeNear(storage.available)}</dd>
+          <dl className="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-6 gap-y-2 text-sm">
+            <dt className={FACT_LABEL}>Deposited</dt>
+            <dd data-testid="storage-total" className="text-bone">
+              {describeNear(storage.total)}
+            </dd>
+            <dt className={FACT_LABEL}>Free to take back</dt>
+            <dd data-testid="storage-available" className="text-bone">
+              {describeNear(storage.available)}
+            </dd>
           </dl>
           {/* `aria-disabled` does not stop a press, so the handler has the same condition. */}
           <button
@@ -275,16 +287,18 @@ function AmountForm({
   };
 
   return (
-    <section className="grid gap-2">
-      <h2 className="text-lg font-semibold">{title}</h2>
-      <p>{intro}</p>
+    <section className={PANEL}>
+      <h2 className={PANEL_TITLE}>{title}</h2>
+      <p className="text-sm text-muted">{intro}</p>
       {unavailable !== null || row === undefined ? (
-        <p data-testid="form-unavailable">{unavailable}</p>
+        <p data-testid="form-unavailable" className="text-sm text-bone">
+          {unavailable}
+        </p>
       ) : (
         <form onSubmit={submit} className="grid gap-2">
-          <div className="flex flex-wrap items-end gap-2">
-            <div className="grid min-w-0 gap-1">
-              <label htmlFor={`${id}-token`} className="text-sm">
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="grid max-w-full min-w-0 gap-1.5">
+              <label htmlFor={`${id}-token`} className={FACT_LABEL}>
                 Token
               </label>
               <select
@@ -294,7 +308,7 @@ function AmountForm({
                   setSelected(event.currentTarget.value);
                   setError(null);
                 }}
-                className="min-h-11 max-w-full rounded border border-neutral-900 bg-white px-2"
+                className={`${FIELD} max-w-full font-mono text-sm`}
               >
                 {rows.map((candidate) => (
                   <option key={candidate.token} value={candidate.token}>
@@ -303,8 +317,8 @@ function AmountForm({
                 ))}
               </select>
             </div>
-            <div className="grid gap-1">
-              <label htmlFor={`${id}-amount`} className="text-sm">
+            <div className="grid gap-1.5">
+              <label htmlFor={`${id}-amount`} className={FACT_LABEL}>
                 Amount
               </label>
               <input
@@ -321,20 +335,20 @@ function AmountForm({
                 spellCheck={false}
                 aria-invalid={error !== null}
                 aria-describedby={error === null ? `${id}-have` : `${id}-have ${id}-error`}
-                className="min-h-11 w-40 rounded border border-neutral-900 px-2"
+                className={`${FIELD} w-40 tabular-nums`}
               />
             </div>
             <button type="submit" aria-disabled={anyRunning} className={PRIMARY}>
               {running ? "Waiting for your wallet…" : submitLabel}
             </button>
           </div>
-          <p id={`${id}-have`} className="text-sm">
+          <p id={`${id}-have`} className="text-sm text-muted">
             {source === "vault" ? "In your vault: " : "In your wallet: "}
             <Amount value={max?.toString() ?? null} token={row.token} />
           </p>
           {/* Not an alert: the page has one alert at a time, for what an action came to. */}
           {error === null ? null : (
-            <p id={`${id}-error`} data-testid="amount-error" className="text-sm">
+            <p id={`${id}-error`} data-testid="amount-error" className="text-sm text-seal">
               {error}
             </p>
           )}
@@ -538,18 +552,24 @@ export function WalletView({
     notice?.action === action ? <NoticeLine notice={notice} /> : null;
 
   return (
-    <div className="grid gap-6">
-      <h1 className="text-2xl font-semibold">Wallet</h1>
+    <div className="mx-auto grid w-full max-w-4xl gap-5">
+      <div className="pb-3">
+        <PageHead eyebrow="Account" title="Wallet" />
+      </div>
 
-      <section className="grid gap-2">
-        <h2 ref={connection} tabIndex={-1} className="text-lg font-semibold">
+      <section className={`${CARD} grid gap-4 p-5 sm:p-6`}>
+        <h2 ref={connection} tabIndex={-1} className={PANEL_TITLE}>
           Connection
         </h2>
         {!ready ? (
-          <p role="status">Checking for your wallet…</p>
+          <p role="status" className="text-sm text-muted">
+            Checking for your wallet…
+          </p>
         ) : accountId === null ? (
           <>
-            <p>Connect a wallet to see your balances and move funds.</p>
+            <p className="text-sm text-muted">
+              Connect a wallet to see your balances and move funds.
+            </p>
             <button
               key="connect"
               type="button"
@@ -567,14 +587,14 @@ export function WalletView({
           </>
         ) : (
           <>
-            <p className="flex flex-wrap items-baseline gap-x-2">
-              <span>Connected as</span>
-              <span data-testid="account-id" className="font-mono text-sm wrap-anywhere">
+            <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+              <span className="text-sm text-muted">Connected as</span>
+              <span data-testid="account-id" className="font-mono text-sm text-bone wrap-anywhere">
                 {accountId}
               </span>
             </p>
             {canSignMessage ? null : (
-              <p role="status" data-testid="cannot-sign" className="text-sm">
+              <p role="status" data-testid="cannot-sign" className={NOTICE}>
                 {WALLET_CANNOT_SIGN_MESSAGE}
               </p>
             )}
@@ -599,7 +619,9 @@ export function WalletView({
       </section>
 
       {accountId === null ? null : panel.status === "loading" ? (
-        <p role="status">{READING_BALANCES}</p>
+        <p role="status" className="text-sm text-muted">
+          {READING_BALANCES}
+        </p>
       ) : panel.status === "error" ? (
         <ErrorState
           message={panel.message}

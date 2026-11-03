@@ -18,6 +18,7 @@ import { awaitsJudge, isJudgeAccount, JUDGE_POLL_MS } from "../lib/judge";
 import { phaseOfTask } from "../lib/phase";
 import { view } from "../lib/rpc";
 import { Amount } from "./Amount";
+import { Avatar } from "./Avatar";
 import { BriefSection } from "./BriefSection";
 import { CriteriaSection } from "./CriteriaSection";
 import { EntryList } from "./EntryList";
@@ -28,6 +29,7 @@ import { PhaseChip } from "./PhaseChip";
 import { PhaseTimeline } from "./PhaseTimeline";
 import { Scorecard } from "./Scorecard";
 import { TeamBadge } from "./TeamBadge";
+import { EYEBROW, FACT_LABEL, PANEL, PANEL_TITLE, SECONDARY, TEXT_LINK } from "./ui";
 import { VerifierRecord } from "./VerifierRecord";
 
 interface Loaded {
@@ -114,17 +116,19 @@ const headingFor = (id: string): string =>
 function Funders({ funders, token }: Pick<TaskDetailResponse, "funders"> & { token: string }) {
   if (funders.length === 0) return null;
   return (
-    <section className="grid gap-2">
-      <h2 className="text-lg font-semibold">Funders</h2>
-      <ul className="grid gap-2">
+    <section className={PANEL}>
+      <h2 className={PANEL_TITLE}>Funders</h2>
+      <ul className="grid">
         {funders.map((funder) => (
           <li
             key={funder.account}
             data-testid="funder-row"
-            className="flex flex-wrap items-baseline gap-x-3 gap-y-1"
+            className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-t border-line py-3 first:border-t-0 first:pt-0 last:pb-0"
           >
-            <span className="font-mono text-sm wrap-anywhere">{funder.account}</span>
-            <Amount value={funder.amount} token={token} />
+            <span className="min-w-0 font-mono text-[13px] wrap-anywhere">{funder.account}</span>
+            <span className="tabular-nums">
+              <Amount value={funder.amount} token={token} />
+            </span>
           </li>
         ))}
       </ul>
@@ -135,12 +139,12 @@ function Funders({ funders, token }: Pick<TaskDetailResponse, "funders"> & { tok
 function Subtasks({ ids }: { ids: TaskDetailResponse["children"] }) {
   if (ids.length === 0) return null;
   return (
-    <section className="grid gap-2">
-      <h2 className="text-lg font-semibold">Subtasks</h2>
-      <ul className="grid gap-1">
+    <section className={PANEL}>
+      <h2 className={PANEL_TITLE}>Subtasks</h2>
+      <ul className="flex flex-wrap gap-2">
         {ids.map((id) => (
           <li key={id}>
-            <Link data-testid="child-link" href={`/tasks/${id}`} className="underline">
+            <Link data-testid="child-link" href={`/tasks/${id}`} className={SECONDARY}>
               Task #{id}
             </Link>
           </li>
@@ -173,26 +177,47 @@ function ReadyView({
   const isJudge = isJudgeAccount(task.verifier, judgeAccount);
 
   return (
-    <article className="grid gap-8">
-      <header className="grid gap-2">
-        <h1 className="text-2xl font-semibold wrap-anywhere">{task.title ?? UNTITLED_TASK}</h1>
-        <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-neutral-700">
-          <span>#{task.id}</span>
+    <article className="mx-auto grid w-full max-w-4xl gap-5">
+      <header className="grid gap-5 pb-3">
+        <p className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <PhaseChip phase={phase} />
-          <Amount value={task.reward} token={task.token} />
+          <span className={EYEBROW}>#{task.id}</span>
+          {task.category === null ? null : <span className={EYEBROW}>{task.category}</span>}
         </p>
-        <p data-testid="poster" className="flex flex-wrap items-baseline gap-x-2 text-sm">
-          <span className="text-neutral-700">Posted by</span>
-          <TeamBadge account={task.poster} isTeam={task.is_team_poster} />
-        </p>
-        <JudgeNote status={task.judge_status} reason={task.judge_reason} />
-        {task.parent === null ? null : (
-          <p className="text-sm">
-            Subtask of{" "}
-            <Link data-testid="parent-link" href={`/tasks/${task.parent}`} className="underline">
-              Task #{task.parent}
-            </Link>
-          </p>
+        <h1 className="text-3xl leading-[1.08] font-semibold tracking-[-0.03em] text-bone wrap-anywhere sm:text-[2.6rem]">
+          {task.title ?? UNTITLED_TASK}
+        </h1>
+        <div className="grid gap-px overflow-hidden rounded-2xl border border-line bg-line sm:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)]">
+          <div className="grid content-start gap-2 bg-panel p-5">
+            <p className={FACT_LABEL}>Reward</p>
+            <p className="text-2xl leading-tight font-medium tracking-[-0.02em] text-bone tabular-nums">
+              <Amount value={task.reward} token={task.token} />
+            </p>
+          </div>
+          <div className="grid content-start gap-2 bg-panel p-5">
+            <p className={FACT_LABEL}>Posted by</p>
+            <p data-testid="poster" className="flex min-w-0 items-center gap-3">
+              <Avatar account={task.poster} size={34} />
+              <TeamBadge account={task.poster} isTeam={task.is_team_poster} />
+            </p>
+          </div>
+        </div>
+        {task.judge_status === null && task.judge_reason === null && task.parent === null ? null : (
+          <div className="grid gap-1.5 text-sm text-muted">
+            <JudgeNote status={task.judge_status} reason={task.judge_reason} />
+            {task.parent === null ? null : (
+              <p>
+                Subtask of{" "}
+                <Link
+                  data-testid="parent-link"
+                  href={`/tasks/${task.parent}`}
+                  className={TEXT_LINK}
+                >
+                  Task #{task.parent}
+                </Link>
+              </p>
+            )}
+          </div>
         )}
       </header>
 
@@ -224,9 +249,9 @@ function ReadyView({
           judgeAccount={judgeAccount}
         />
       ) : scorecardHash === null ? null : (
-        <section className="grid gap-2">
-          <h2 className="text-lg font-semibold">Scorecard</h2>
-          <p data-testid="scorecard-missing" className="text-sm wrap-anywhere">
+        <section className={PANEL}>
+          <h2 className={PANEL_TITLE}>Scorecard</h2>
+          <p data-testid="scorecard-missing" className="text-sm text-muted wrap-anywhere">
             {`The scorecard is not available from this server. Its sha256 is ${scorecardHash}.`}
           </p>
         </section>
@@ -361,25 +386,29 @@ export function TaskView({
   }, [waitingOnIndex, load]);
 
   const heading = headingFor(id);
+  const plain = "mx-auto grid w-full max-w-4xl gap-6";
+  const title = "text-3xl font-semibold tracking-[-0.03em] text-bone sm:text-[2.6rem]";
   switch (state.status) {
     case "loading":
       return (
-        <div className="grid gap-4">
-          <h1 className="text-2xl font-semibold">{heading}</h1>
-          <p role="status">Loading task…</p>
+        <div className={plain}>
+          <h1 className={title}>{heading}</h1>
+          <p role="status" className={EYEBROW}>
+            Loading task…
+          </p>
         </div>
       );
     case "missing":
       return (
-        <div className="grid gap-4">
-          <h1 className="text-2xl font-semibold">{heading}</h1>
+        <div className={plain}>
+          <h1 className={title}>{heading}</h1>
           <Missing heading={heading} absence={state.absence} onCheck={() => load(true)} />
         </div>
       );
     case "error":
       return (
-        <div className="grid gap-4">
-          <h1 className="text-2xl font-semibold">{heading}</h1>
+        <div className={plain}>
+          <h1 className={title}>{heading}</h1>
           <ErrorState
             message={state.message}
             retrying={state.retrying}
@@ -410,19 +439,17 @@ function Missing({
   absence: Absence;
   onCheck: () => void;
 }) {
-  if (absence === "none") return <p>There is no task with this id.</p>;
+  if (absence === "none") {
+    return <p className={`${PANEL} text-muted`}>There is no task with this id.</p>;
+  }
   return (
-    <div className="grid gap-3">
-      <p role="status" data-testid="not-indexed">
+    <div className={PANEL}>
+      <p role="status" data-testid="not-indexed" className="text-bone">
         {absence === "on_chain"
           ? `${heading} is on chain. Tender's index hasn't caught up yet, so this page will fill in on its own.`
           : "There is no task with this id in Tender's index, and the chain could not be read to check. It may have been posted just now."}
       </p>
-      <button
-        type="button"
-        onClick={onCheck}
-        className="min-h-11 w-fit rounded border border-neutral-900 px-4"
-      >
+      <button type="button" onClick={onCheck} className={SECONDARY}>
         Check again
       </button>
     </div>

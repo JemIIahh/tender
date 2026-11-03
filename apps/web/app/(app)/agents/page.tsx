@@ -6,7 +6,13 @@ import { AgentDirectory } from "../../../components/AgentDirectory";
 // a page that is built ahead of time can only do under a Suspense boundary.
 export default function AgentsPage() {
   return (
-    <Suspense fallback={<p role="status">Loading agents…</p>}>
+    <Suspense
+      fallback={
+        <p role="status" className="font-mono text-[11px] tracking-[0.14em] text-muted uppercase">
+          Loading agents…
+        </p>
+      }
+    >
       <AgentDirectory />
     </Suspense>
   );

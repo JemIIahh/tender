@@ -306,6 +306,7 @@ async function bringUp(s: Stack, { webPort }: StackOptions): Promise<RunInfo> {
       },
       routes: [
         "/",
+        "/tasks",
         "/agents",
         "/wallet",
         "/post",

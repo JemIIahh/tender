@@ -3,7 +3,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode, useSyncExternalStore } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import Board from "../app/(app)/page";
+import Board from "../app/(app)/tasks/page";
 
 // The board over a fake API: what it shows for each state of the request, and how its filters
 // and its paging ask the API. The filters are in the address, which the tests hold in a tiny model
@@ -732,4 +732,36 @@ test("board_leaves_the_focus_where_the_person_went_while_the_last_page_loaded", 
 
   await screen.findByText("No more tasks");
   expect(document.activeElement).toBe(screen.getByLabelText("Tag"));
+});
+
+// ---- The featured card ------------------------------------------------------------------------
+
+test("board_features_the_open_task_with_the_top_reward_and_keeps_the_api_order", async () => {
+  fakeApi(
+    json(
+      page(
+        { ...TASK, id: "1", reward: "500000" },
+        { ...TASK, id: "2", reward: "2500000" },
+        // Larger, but not open any more: settled.
+        { ...TASK, id: "3", reward: "9000000", phase: "settled", outcome_kind: "picked" },
+      ),
+    ),
+  );
+
+  render(<Board />);
+
+  const cards = await screen.findAllByTestId("task-card");
+  // The order is the API's: featuring a card does not move it.
+  expect(cards.map((card) => within(card).getByRole("link").getAttribute("href"))).toEqual([
+    "/tasks/1",
+    "/tasks/2",
+    "/tasks/3",
+  ]);
+  expect(cards.map((card) => card.getAttribute("data-featured"))).toEqual([
+    "false",
+    "true",
+    "false",
+  ]);
+  expect(within(cards[1] as HTMLElement).getByText("Top reward")).toBeTruthy();
+  expect(within(cards[0] as HTMLElement).queryByText("Top reward")).toBeNull();
 });
