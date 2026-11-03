@@ -1452,7 +1452,7 @@ test("the_post_files_keep_no_drafts_never_clear_the_token_and_log_only_errors", 
   const web = join(import.meta.dirname, "..");
   const files = [
     ...readdirSync(join(web, "components/post")).map((name) => `components/post/${name}`),
-    "app/post/page.tsx",
+    "app/(app)/post/page.tsx",
     "lib/post.ts",
     "lib/postSubmit.ts",
   ];
