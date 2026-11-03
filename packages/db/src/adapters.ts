@@ -1,4 +1,8 @@
-import { mkdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { readFileSync, rmSync } from "node:fs";
+import { mkdir, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { hostname } from "node:os";
+import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { Pool, TypeOverrides, types } from "pg";
 
@@ -42,6 +46,9 @@ export interface Db {
    * Inside `fn`, use only the `tx` handle. On PGlite the outer `db` waits for this transaction
    * to end while `fn` waits for the outer `db`: a deadlock. On Postgres it would run on another
    * connection, outside the transaction.
+   * On Postgres it runs at READ COMMITTED, whatever the server's `default_transaction_isolation`
+   * is: the transactions of the services are written for that level, and at a stricter one they
+   * would fail with a serialization failure (40001) when they meet.
    * The handle stops working when the transaction ends. Called on a handle, `tx` opens a
    * savepoint, so the inner work can fail and roll back on its own.
    */
@@ -86,12 +93,30 @@ const CONNECT_TIMEOUT_MS = 10_000;
  * Opens a database. `pglite:memory` is an in-memory PGlite, `pglite:<dir>` a PGlite that keeps
  * its files in that directory (created when missing), and `postgres://…` (or `postgresql://…`) a
  * Postgres server reached through a connection pool.
+ *
+ * A PGlite directory is one process's own: PGlite keeps no lock on it, and two processes that open
+ * the same files corrupt them. So `openDb` takes a lock file in the directory (`tender.lock`) and
+ * throws a `PgliteInUseError` while another process, or this one, has the directory open. The
+ * holder renews the lock every 10 s (`PGLITE_LOCK_BEAT_MS`): the time the file was last touched is
+ * the heartbeat. `close` lets the lock go, and so does a process that ends by itself or by
+ * `process.exit`. A process that is killed leaves the lock, which counts as a leftover once it has
+ * gone 30 s without a beat (`PGLITE_LOCK_STALE_MS`): the next open is refused until then, and takes
+ * the directory over after.
+ *
+ * A holder that finds at a beat that its lock is gone, or is another process's (it was away for
+ * longer than the lock lasts, or someone deleted the lock), has lost the directory. It does not go
+ * on: every later call on the database fails with a `PgliteLockLostError`, the database is not shut
+ * down (PGlite's shutdown writes its files, which another process may have open now), and
+ * `options.pgliteLock.onLost` is told, so that the caller can end the process. Without it the
+ * error is printed with `console.error`.
+ *
+ * `options.pgliteLock` also sets other times, for tests.
  */
-export async function openDb(url: string): Promise<Db> {
+export async function openDb(url: string, options: OpenDbOptions = {}): Promise<Db> {
   if (url === "pglite:memory") return openPglite();
   if (url === "pglite:")
     throw new Error("pglite: needs a directory, as in pglite:<dir>, or pglite:memory");
-  if (url.startsWith("pglite:")) return openPglite(url.slice("pglite:".length));
+  if (url.startsWith("pglite:")) return openPglite(url.slice("pglite:".length), options.pgliteLock);
   if (url.startsWith("postgres://") || url.startsWith("postgresql://")) return openPostgres(url);
   // Only the scheme is named: a url can carry a password.
   const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url)?.[1] ?? "none";
@@ -100,7 +125,21 @@ export async function openDb(url: string): Promise<Db> {
   );
 }
 
-async function openPglite(dir?: string): Promise<Db> {
+export interface OpenDbOptions {
+  /** The lock on a `pglite:<dir>` directory: what is told of its loss, and its times. */
+  pgliteLock?: PgliteLockOptions;
+}
+
+/** The times default to what suits a service (`PGLITE_LOCK_BEAT_MS`, `PGLITE_LOCK_STALE_MS`). */
+export interface PgliteLockOptions extends Partial<PgliteLockTiming> {
+  /**
+   * Told once, if the lock on the directory is lost (see `openDb`). The database has stopped by
+   * then: the caller ends the process, or whatever uses the database.
+   */
+  onLost?: (error: PgliteLockLostError) => void;
+}
+
+async function openPglite(dir?: string, lock: PgliteLockOptions = {}): Promise<Db> {
   const options = {
     // PGlite returns a small int8 as a number and a large one as a bigint. Postgres drivers
     // return text. Text everywhere, so a bigserial or bigint column has one shape.
@@ -108,8 +147,305 @@ async function openPglite(dir?: string): Promise<Db> {
     serializers: { [JSON_TYPE]: jsonParam, [JSONB]: jsonParam },
   };
   if (dir === undefined) return makeDb(pgliteBackend(await PGlite.create(options)));
+  // Before the directory is made: times that cannot work leave nothing behind.
+  const timing = lockTiming(lock);
   await mkdir(dir, { recursive: true });
-  return makeDb(pgliteBackend(await PGlite.create(dir, options)));
+  let lost: PgliteLockLostError | undefined;
+  const unlock = await lockPgliteDir(dir, timing, (error) => {
+    lost ??= error;
+    if (lock.onLost === undefined) console.error(`ERROR database: ${error.message}`);
+    else lock.onLost(error);
+  });
+  try {
+    const pglite = await PGlite.create(dir, options);
+    return makeDb(pgliteBackend(pglite, { unlock, lost: () => lost }));
+  } catch (error) {
+    await unlock();
+    throw error;
+  }
+}
+
+// ---- The lock on a PGlite directory -----------------------------------------------------------
+
+/**
+ * The file in a PGlite directory that says a process has it open. PGlite ignores a file it does not
+ * know, including when it makes the directory.
+ */
+const PGLITE_LOCK_FILE = "tender.lock";
+/** How often the process that holds the lock on a PGlite directory touches its file. */
+export const PGLITE_LOCK_BEAT_MS = 10_000;
+/**
+ * How long a lock file may go untouched before it counts as a leftover: three beats, so that a
+ * beat or two can be late, as when the process is busy.
+ */
+export const PGLITE_LOCK_STALE_MS = 30_000;
+
+/** How a lock is kept alive (`beatMs`) and when it counts as left over (`staleMs`). */
+export interface PgliteLockTiming {
+  beatMs: number;
+  staleMs: number;
+}
+
+function lockTiming(over: Partial<PgliteLockTiming> = {}): PgliteLockTiming {
+  const { beatMs = PGLITE_LOCK_BEAT_MS, staleMs = PGLITE_LOCK_STALE_MS } = over;
+  if (!(Number.isFinite(beatMs) && beatMs > 0 && Number.isFinite(staleMs) && staleMs > beatMs)) {
+    throw new RangeError("pgliteLock: beatMs must be above 0, and staleMs above beatMs");
+  }
+  return { beatMs, staleMs };
+}
+
+/** The most the lock file is looked at before the directory is given up as taken. */
+const LOCK_ATTEMPTS = 3;
+/** The PGlite directories this process has open, by real path. */
+const pgliteDirsOpen = new Set<string>();
+/** The lock files this process holds, by real path, with the text it wrote in each. */
+const pgliteLocksHeld = new Map<string, { file: string; text: string }>();
+let removesLocksAtExit = false;
+
+/**
+ * The directory of a `pglite:<dir>` database is open in another process, or already in this one.
+ * The message names the directory, the process if the lock says which, and the file to delete only
+ * for a process that is known to be gone: a holder that still runs loses the directory to it.
+ */
+export class PgliteInUseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PgliteInUseError";
+  }
+}
+
+/**
+ * This process has lost the lock on its PGlite directory: the lock file is gone, or another process
+ * has made its own (see `openDb`). Every call on the database fails with it from then on.
+ */
+export class PgliteLockLostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PgliteLockLostError";
+  }
+}
+
+/** A lock file as it is now: its text, and when it was last touched. */
+interface LockFile {
+  text: string;
+  touchedMs: number;
+}
+
+/** What `file` says and when it was touched, or undefined once it is gone. */
+async function readLock(file: string): Promise<LockFile | undefined> {
+  try {
+    const touchedMs = (await stat(file)).mtimeMs;
+    return { text: await readFile(file, "utf8"), touchedMs };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Who a lock file says holds it, for the message. Whether the lock is held is not read from this: a
+ * pid comes back (a container that restarts runs under the same pids), so it says nothing about
+ * whether its process lives. The host is only shown when it looks like a host name, since the file
+ * is text from the disk.
+ */
+function holderOf(text: string): { pid: number; host: string } | undefined {
+  try {
+    const { pid, host } = JSON.parse(text) as { pid?: unknown; host?: unknown };
+    if (!Number.isSafeInteger(pid) || (pid as number) < 1) return undefined;
+    if (typeof host !== "string" || !/^[A-Za-z0-9._-]{1,253}$/.test(host)) return undefined;
+    return { pid: pid as number, host };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Seconds with one decimal at most, as in `30` or `0.4`. */
+const seconds = (ms: number) => String(Math.round(Math.max(0, ms) / 100) / 10);
+
+/**
+ * Takes the lock on the PGlite directory `dir`: a file made with the `wx` flag, which only one
+ * process can make, holding a random token (so that the holder can tell its own file from another's),
+ * its pid and its host. It returns the function that lets the lock go, which is safe to call twice
+ * and leaves a lock that another process has taken since. Until then the file is touched every
+ * `beatMs`.
+ *
+ * If the file is there already and was touched within `staleMs`, its holder lives and the
+ * directory is its own: this throws a `PgliteInUseError`. A file that was not is a leftover of a
+ * process that is gone, and is taken over, whatever pid it names. Two processes that take over the
+ * same leftover in the same instant can both end up with the directory: the file is removed only if
+ * it is still what was read, which leaves a window of microseconds.
+ *
+ * The beat runs on the event loop, so a process that does not return to it for `staleMs` (a query
+ * that long, a loop that never yields, a machine that sleeps) stops beating, and the next open
+ * takes the directory over from under it. The holder finds out at its next beat, when the file is
+ * gone or says another token: it has lost the directory, and `onLost` is told, once. The beat ends,
+ * and the file is left to whoever made it.
+ */
+async function lockPgliteDir(
+  dir: string,
+  timing: PgliteLockTiming,
+  onLost: (error: PgliteLockLostError) => void,
+): Promise<() => Promise<void>> {
+  const key = await realpath(dir);
+  const file = join(dir, PGLITE_LOCK_FILE);
+  if (pgliteDirsOpen.has(key)) {
+    throw new PgliteInUseError(
+      `the PGlite directory ${dir} is open already in this process: close it before opening it again`,
+    );
+  }
+  // Before anything else is awaited, so that two opens in this process cannot both pass.
+  pgliteDirsOpen.add(key);
+  const text = `${JSON.stringify({ token: randomUUID(), pid: process.pid, host: hostname() })}\n`;
+  try {
+    await claimLockFile(dir, file, text, timing.staleMs);
+  } catch (error) {
+    pgliteDirsOpen.delete(key);
+    throw error;
+  }
+  pgliteLocksHeld.set(key, { file, text });
+  removeLocksAtExit();
+  const beat = keepLockFresh(file, text, timing.beatMs, (found) =>
+    onLost(new PgliteLockLostError(lostWords(dir, found, timing.staleMs))),
+  );
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    try {
+      await beat.stop();
+      if ((await readLock(file))?.text === text) await rm(file, { force: true });
+    } catch {
+      // A lock that stays goes stale and is taken over.
+    } finally {
+      pgliteLocksHeld.delete(key);
+      pgliteDirsOpen.delete(key);
+    }
+  };
+}
+
+async function claimLockFile(
+  dir: string,
+  file: string,
+  text: string,
+  staleMs: number,
+): Promise<void> {
+  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
+    try {
+      await writeFile(file, text, { flag: "wx" });
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const held = await readLock(file);
+    if (held === undefined) continue;
+    // A time in the future, from a clock that was set back, is not stale: the lock is refused, and
+    // the message says how to clear it.
+    const idleMs = Date.now() - held.touchedMs;
+    if (idleMs <= staleMs) {
+      const holder = holderOf(held.text);
+      const who =
+        holder === undefined ? "another process" : `process ${holder.pid} on ${holder.host}`;
+      throw new PgliteInUseError(
+        `the PGlite directory ${dir} is in use by ${who} (its lock was renewed ${seconds(idleMs)} s ` +
+          `ago): only one process at a time opens it. Stop that process, or use another directory. ` +
+          `If that process is gone, its lock is taken over once it has gone ${seconds(staleMs)} s ` +
+          `without a renewal: try again then. Delete ${file} sooner only if you know that process ` +
+          `has ended: one that still runs finds its lock gone at its next renewal, and stops`,
+      );
+    }
+    // A leftover. Removed only if it is still the one that was read: another process may have taken
+    // it over since, or its holder may have woken up and renewed it.
+    const again = await readLock(file);
+    if (again?.text === held.text && again.touchedMs === held.touchedMs) {
+      await rm(file, { force: true });
+    }
+  }
+  throw new PgliteInUseError(
+    `the PGlite directory ${dir} is being taken by another process just now: try again`,
+  );
+}
+
+/** What a person is told of a lock that is lost: how, and what this process does about it. */
+function lostWords(dir: string, found: LockFile | undefined, staleMs: number): string {
+  const holder = found === undefined ? undefined : holderOf(found.text);
+  const how =
+    found === undefined
+      ? "its lock file is gone"
+      : holder === undefined
+        ? "another process has made its own lock there"
+        : `process ${holder.pid} on ${holder.host} has made its own lock there`;
+  return (
+    `the PGlite directory ${dir} is no longer this process's: ${how}. A lock that goes ` +
+    `${seconds(staleMs)} s without a beat is taken over, as when a process is suspended or busy. ` +
+    "This process stops using the directory: every later call on the database fails, and the " +
+    "database is not shut down, since that would write to files that another process may have open"
+  );
+}
+
+/**
+ * Touches `file` every `beatMs`, for as long as it still says `text`. A file that is gone, or says
+ * something else, is a lock that is lost: `lost` is told what the file says now, once, and the beat
+ * ends without touching it. A beat that fails is tried again at the next. The timer does not keep
+ * the process alive. `stop` returns once no beat is under way, so that none can tell of a loss
+ * after the holder has removed its lock.
+ */
+function keepLockFresh(
+  file: string,
+  text: string,
+  beatMs: number,
+  lost: (found: LockFile | undefined) => void,
+): { stop(): Promise<void> } {
+  let stopped = false;
+  let timer: NodeJS.Timeout | undefined;
+  let beating: Promise<void> = Promise.resolve();
+  const renew = async () => {
+    const found = await readLock(file);
+    if (stopped) return;
+    if (found?.text !== text) {
+      stopped = true;
+      lost(found);
+      return;
+    }
+    const now = new Date();
+    await utimes(file, now, now);
+  };
+  const schedule = () => {
+    timer = setTimeout(() => {
+      beating = renew()
+        .catch(() => undefined)
+        .then(() => {
+          if (!stopped) schedule();
+        });
+    }, beatMs);
+    timer.unref();
+  };
+  schedule();
+  return {
+    async stop() {
+      stopped = true;
+      clearTimeout(timer);
+      await beating;
+    },
+  };
+}
+
+/**
+ * Removes the lock files this process still holds when it ends, as `process.exit` or the end of
+ * its work do: a lock left behind would turn the next start away until it went stale. A signal that
+ * ends the process without a handler runs nothing, and neither does a kill.
+ */
+function removeLocksAtExit(): void {
+  if (removesLocksAtExit) return;
+  removesLocksAtExit = true;
+  process.on("exit", () => {
+    for (const { file, text } of pgliteLocksHeld.values()) {
+      try {
+        if (readFileSync(file, "utf8") === text) rmSync(file, { force: true });
+      } catch {
+        // It goes stale, and is taken over.
+      }
+    }
+  });
 }
 
 async function openPostgres(url: string): Promise<Db> {
@@ -215,18 +551,45 @@ async function scrubbed<T>(work: () => Promise<T>): Promise<T> {
   }
 }
 
-function pgliteBackend(pglite: PGlite): Backend {
+/**
+ * `lock.unlock` lets the lock on the PGlite directory go, once PGlite is closed. `lock.lost` says
+ * whether the lock is lost: then nothing more is run on the directory, which is another process's
+ * now, and it is not shut down, since that writes its files.
+ */
+function pgliteBackend(
+  pglite: PGlite,
+  lock?: { unlock: () => Promise<void>; lost: () => Error | undefined },
+): Backend {
+  const owned = () => {
+    const lost = lock?.lost();
+    if (lost !== undefined) throw lost;
+  };
   const sessionOn = (target: PgliteTarget): Session => ({
-    run: (sql, params) => scrubbed(async () => (await target.query<Row>(sql, params)).rows),
+    run: (sql, params) =>
+      scrubbed(async () => {
+        owned();
+        return (await target.query<Row>(sql, params)).rows;
+      }),
     script: (sql) =>
       scrubbed(async () => {
+        owned();
         await target.exec(sql);
       }),
   });
   return {
     ...sessionOn(pglite),
-    transaction: (fn) => scrubbed(() => pglite.transaction((tx) => fn(sessionOn(tx)))),
-    close: () => pglite.close(),
+    transaction: (fn) =>
+      scrubbed(async () => {
+        owned();
+        return await pglite.transaction((tx) => fn(sessionOn(tx)));
+      }),
+    close: async () => {
+      try {
+        if (lock?.lost() === undefined) await pglite.close();
+      } finally {
+        await lock?.unlock();
+      }
+    },
   };
 }
 
@@ -264,7 +627,8 @@ function postgresBackend(pool: Pool): Backend {
       let broken = false;
       const session = sessionOn(client);
       try {
-        await session.script("begin");
+        // READ COMMITTED whatever the server's default is: see `Db.tx`.
+        await session.script("begin isolation level read committed");
         const result = await fn(session);
         await session.script("commit");
         return result;

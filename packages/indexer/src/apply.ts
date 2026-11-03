@@ -5,7 +5,10 @@ import type { IndexedBlock } from "./types";
 export interface ApplyOptions {
   /** The Tender contract. Only receipts that ran on this account, and succeeded, are read. */
   contractId: string;
-  /** The `chain_cursor.source` this indexer advances, such as `testnet`. */
+  /**
+   * The `chain_cursor.source` this indexer advances: `<network>:<contractId>`, such as
+   * `testnet:tender.near`.
+   */
   cursorSource: string;
   /** Accounts the team runs. An agent is the team's if it, or its ASP, is one of them. */
   teamAccounts: string[];

@@ -57,10 +57,14 @@ export const FIXTURE_TOKEN = "token.test.near";
 /** The id of the task in `lifecycleBlocks`, as the captured `task_created` has it. */
 export const LIFECYCLE_TASK_ID = "1";
 
-/** `applyBlock` options for the fixtures: the fixture contract, no team accounts. */
+/**
+ * `applyBlock` options for the fixtures: the fixture contract, no team accounts. The cursor is the
+ * one an indexer of the fixture contract keeps on the sandbox, `<network>:<contractId>`, which the
+ * API's health reads for an app on the sandbox with `FIXTURE_CONTRACT`.
+ */
 export const FIXTURE_OPTIONS: ApplyOptions = {
   contractId: FIXTURE_CONTRACT,
-  cursorSource: "fixture",
+  cursorSource: `sandbox:${FIXTURE_CONTRACT}`,
   teamAccounts: [],
 };
 

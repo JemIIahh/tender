@@ -5,14 +5,19 @@ import type { ErrorBody, HealthResponse } from "../format";
 import { RETRY_SOON } from "../limits";
 
 /**
- * How long the chain has to give its final height, in milliseconds. The RPC client retries a node
- * that does not answer for minutes, which no monitor waits for.
+ * How long the chain has to give its final height, in milliseconds. The RPC client gives a read of
+ * the node 30 s (`rpcTimeoutMs`, unless it is set) before it cancels it with `E_TIMEOUT`, which is
+ * longer than a monitor waits.
  */
 const FINAL_HEIGHT_DEADLINE_MS = 5_000;
 
 /**
  * `GET /v1/health`: whether the API can read the database and the chain, and how far the index is
  * behind. A monitor reads `lag_blocks`; the API stays `ok` while the indexer catches up.
+ *
+ * The index is the cursor of this deployment, `<network>:<contractId>` as the indexer keeps it
+ * (`startIndexer`). A database serves one contract deploy, and the services refuse one that holds
+ * another's, but the cursor of another deploy would not say how far this one is.
  *
  * The chain has 5 seconds (`options.deadlineMs`, for tests) to give its final height. A chain that
  * fails or does not answer in time is a 503 with `Retry-After: 5`.
@@ -22,9 +27,10 @@ export function healthRoutes(deps: ApiDeps, options: { deadlineMs?: number } = {
   const app = new Hono();
 
   app.get("/health", async (c) => {
-    // One cursor per deployment, so the highest is the indexer's. None before the first block.
-    const [row] = await deps.db.query<{ height: string | null }>(
-      "select max(height)::text as height from chain_cursor",
+    // None before the first block.
+    const [row] = await deps.db.query<{ height: string }>(
+      "select height::text as height from chain_cursor where source = $1",
+      [`${deps.network}:${deps.contractId}`],
     );
     const indexed = BigInt(row?.height ?? "0");
 

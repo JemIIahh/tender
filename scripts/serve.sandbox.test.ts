@@ -1,19 +1,23 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { type ChildProcess, spawn } from "node:child_process";
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseEnv } from "node:util";
 import { ApiClient, type LocalChain, startLocalChain, TenderClient } from "@tender/client";
-import type { SessionLock } from "@tender/db";
+import { type Db, migrate, openDb, PgliteLockLostError, type SessionLock } from "@tender/db";
+import { IndexerError } from "@tender/indexer";
 import { sha256Hex } from "@tender/shared";
 import { BOT_COMMANDS } from "@tender/telegram";
 import { KeyPair } from "near-api-js";
 import { afterAll, beforeAll, expect, test, vi } from "vitest";
 import { addRoleKey } from "./keeper-key";
+import { REPO_ROOT } from "./lib/env";
 import {
   checkJudgeKey,
   checkKeeperKey,
+  exitOnFailure,
   type ServeOptions,
   type Services,
   startServices,
@@ -84,6 +88,10 @@ let keeperKey: string;
 let judgeKey: string;
 const running: Services[] = [];
 const fakes: FakeBotApi[] = [];
+/** Directories of the tests' own, such as a PGlite database's. */
+const dirs: string[] = [];
+/** The processes of `runServe`, which the end of the file kills if a test left them. */
+const children: ChildProcess[] = [];
 
 beforeAll(async () => {
   chain = await startLocalChain();
@@ -127,10 +135,11 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  for (const child of children) child.kill("SIGKILL");
   await Promise.all(running.map((services) => services.stop()));
   await Promise.all(fakes.map((fake) => fake.close()));
   await chain?.stop();
-  for (const dir of [deploymentsDir, keyDir]) {
+  for (const dir of [deploymentsDir, keyDir, ...dirs]) {
     if (dir) await rm(dir, { recursive: true, force: true });
   }
 });
@@ -312,10 +321,12 @@ function messageFrom(chat: number, text: string): FakeUpdate {
  * `push` handed it (a long poll waits up to 200 ms for one), `sendMessage` with the message it
  * made, and anything else with `true`. It drops the updates below the offset a poll sends, as
  * Telegram does once they are confirmed. A call that `hold` picks out is not answered until
- * `release` or `close`, as by a Telegram that does not answer.
+ * `release` or `close`, as by a Telegram that does not answer. A call that `refuse` picks out is
+ * answered with 401, as by a Telegram that does not take the token, once it is no longer held.
  */
 async function startFakeBotApi(
   hold: (call: BotCall) => boolean = () => false,
+  refuse: (call: BotCall) => boolean = () => false,
 ): Promise<FakeBotApi> {
   const calls: BotCall[] = [];
   let queued: FakeUpdate[] = [];
@@ -347,6 +358,10 @@ async function startFakeBotApi(
     const call = { method, payload };
     calls.push(call);
     if (holding(call)) await new Promise<void>((resolve) => held.add(resolve));
+    if (refuse(call)) {
+      answer(401, { ok: false, error_code: 401, description: "Unauthorized" });
+      return;
+    }
     switch (method) {
       case "getMe":
         answer(200, { ok: true, result: BOT_INFO });
@@ -580,7 +595,7 @@ test("serve_runs_the_bot_by_long_polling_and_the_notifier", async () => {
   // asks for messages only, and keeps the updates that came while no process polled.
   await until("the bot polls", async () => telegram.callsOf("getUpdates").length > 0, 10_000);
   expect(telegram.callsOf("setMyCommands").map((call) => call.payload)).toEqual([
-    { commands: BOT_COMMANDS },
+    { commands: BOT_COMMANDS, scope: { type: "all_private_chats" } },
   ]);
   expect(telegram.callsOf("getMe")).toHaveLength(1);
   expect(telegram.callsOf("deleteWebhook").map((call) => call.payload)).toEqual([
@@ -627,6 +642,7 @@ test("serve_takes_the_bots_updates_at_its_webhook", async () => {
   // Telegram is slow to give the bot its own details, until `release`.
   const telegram = await startFakeBotApi((call) => call.method === "getMe");
   const lines: string[] = [];
+  const before = loops.notifiers.length;
   const services = await serve(
     envFor(telegramEnv({ TELEGRAM_MODE: "webhook", TELEGRAM_WEBHOOK_SECRET: WEBHOOK_SECRET })),
     lines,
@@ -635,6 +651,9 @@ test("serve_takes_the_bots_updates_at_its_webhook", async () => {
   expect(lines).toContain(
     `serve: Telegram bot on, taking updates at POST ${TELEGRAM_WEBHOOK_PATH}, and the notifier`,
   );
+  // The notifier runs in this mode too.
+  const notifiers = loops.notifiers.slice(before);
+  expect(notifiers).toEqual([{ stopped: false }]);
   const chat = 4_343;
   const webhook = `${services.url}${TELEGRAM_WEBHOOK_PATH}`;
   const post = (secret?: string, body: BodyInit = JSON.stringify(messageFrom(chat, "/help"))) =>
@@ -711,15 +730,82 @@ test("serve_takes_the_bots_updates_at_its_webhook", async () => {
   const methods = new Set(telegram.calls.map((call) => call.method));
   expect([...methods].filter((method) => /Updates|Webhook/.test(method))).toEqual([]);
 
-  // Once stopped, the port takes no connection, and nothing calls Telegram or writes a line.
+  // Once stopped, the notifier has stopped, the port takes no connection, and nothing calls
+  // Telegram or writes a line, to the services' log or, as the notifier does, to the console.
+  const errors = vi.spyOn(console, "error");
+  try {
+    await services.stop();
+    expect(notifiers).toEqual([{ stopped: true }]);
+    expect(lines.at(-1)).toBe("serve: stopped");
+    expect(lines.filter((line) => /^(ERROR|WARN) telegram/.test(line))).toEqual([]);
+    const after = { lines: lines.length, calls: telegram.calls.length };
+    await sleep(1_000);
+    expect(await takesConnections(services.url)).toBe(false);
+    expect(lines).toHaveLength(after.lines);
+    expect(telegram.calls).toHaveLength(after.calls);
+    expect(errors).not.toHaveBeenCalled();
+  } finally {
+    errors.mockRestore();
+  }
+});
+
+test("the_webhook_says_the_bot_is_not_available_once_it_cannot_start", async () => {
+  // Telegram is slow to give the bot its own details, and then does not take its token.
+  const telegram = await startFakeBotApi(
+    (call) => call.method === "getMe",
+    (call) => call.method === "getMe",
+  );
+  const lines: string[] = [];
+  const services = await serve(
+    envFor(telegramEnv({ TELEGRAM_MODE: "webhook", TELEGRAM_WEBHOOK_SECRET: WEBHOOK_SECRET })),
+    lines,
+    { telegramApiRoot: telegram.apiRoot },
+  );
+  const post = async () => {
+    const res = await fetch(`${services.url}${TELEGRAM_WEBHOOK_PATH}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET,
+      },
+      body: JSON.stringify(messageFrom(4_545, "/help")),
+    });
+    return { status: res.status, body: await res.json() };
+  };
+  const unavailable = (message: string) => ({
+    status: 503,
+    body: { error: "unavailable", message },
+  });
+  await until(
+    "the services ask for the bot",
+    async () => telegram.callsOf("getMe").length > 0,
+    10_000,
+  );
+
+  // While Telegram has not answered, the bot is starting.
+  expect(await post()).toEqual(unavailable("the bot is starting"));
+
+  // Then Telegram turns the token down. The ERROR is logged, and nothing tries again: from then on
+  // the bot is not available, which is no longer "starting".
+  telegram.release();
+  await until(
+    "the ERROR is logged",
+    async () => lines.some((line) => line.startsWith("ERROR")),
+    10_000,
+  );
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([
+    "ERROR telegram: the bot cannot start (GrammyError 401: Telegram does not take " +
+      "TELEGRAM_BOT_TOKEN)",
+  ]);
+  expect(await post()).toEqual(unavailable("the bot is not available"));
+  expect(await post()).toEqual(unavailable("the bot is not available"));
+  // The rest of the services go on, and the bot said nothing.
+  expect((await health(services.url)).status).toBe(200);
+  expect(telegram.callsOf("sendMessage")).toEqual([]);
+  expect(telegram.callsOf("getMe")).toHaveLength(1);
+
   await services.stop();
   expect(lines.at(-1)).toBe("serve: stopped");
-  expect(lines.filter((line) => /^(ERROR|WARN) telegram/.test(line))).toEqual([]);
-  const after = { lines: lines.length, calls: telegram.calls.length };
-  await sleep(1_000);
-  expect(await takesConnections(services.url)).toBe(false);
-  expect(lines).toHaveLength(after.lines);
-  expect(telegram.calls).toHaveLength(after.calls);
 });
 
 test("stop_goes_on_without_a_telegram_that_does_not_answer", async () => {
@@ -854,3 +940,647 @@ test("stop_leaves_the_port_closed_and_every_loop_resolved", async () => {
     errors.mockRestore();
   }
 });
+
+// ---- The database ------------------------------------------------------------------------------
+
+test("serve_keeps_its_index_in_a_pglite_directory_that_one_process_has_open_at_a_time", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tender-serve-pglite-"));
+  dirs.push(dir);
+  const url = `pglite:${join(dir, "index")}`;
+  const lines: string[] = [];
+  const first = await serve(envFor({ DATABASE_URL: url }), lines);
+
+  // A second services process on the directory is refused with the reason, and the first goes on.
+  const second = lines.slice();
+  await expect(serve(envFor({ DATABASE_URL: url }), second)).rejects.toThrow(
+    /^the PGlite directory .* is open already in this process/,
+  );
+  expect(second.slice(lines.length)).toEqual([]);
+
+  const taskId = await postTask();
+  await until(
+    `the index holds task ${taskId}`,
+    async () => (await fetch(`${first.url}/v1/tasks/${taskId}`)).status === 200,
+    30_000,
+  );
+  await first.stop();
+
+  // Stopped, the services let the directory go. They start on it again with the index as it was,
+  // and the check of the database against the chain, which asks for the task count now, passes.
+  const restarted = await serve(envFor({ DATABASE_URL: url }), lines);
+  expect((await fetch(`${restarted.url}/v1/tasks/${taskId}`)).status).toBe(200);
+  expect(lines.filter((line) => /^indexer: resuming after block \d+$/.test(line))).toHaveLength(1);
+  await restarted.stop();
+});
+
+test("serve_refuses_a_database_that_holds_the_index_of_another_deploy", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tender-serve-pglite-"));
+  dirs.push(dir);
+  const url = `pglite:${join(dir, "index")}`;
+  // The index of another contract, as an earlier deploy left it.
+  const left = await openDb(url);
+  await migrate(left);
+  await left.query("insert into chain_cursor (source, height) values ($1, 12345)", [
+    "sandbox:old-deploy.sandbox",
+  ]);
+  await left.close();
+
+  const lines: string[] = [];
+  const failure = await serve(envFor({ DATABASE_URL: url }), lines).then(
+    () => undefined,
+    (error: unknown) => error as Error,
+  );
+  expect(failure?.message).toMatch(
+    /^the database holds the index of another deploy of Tender: its chain cursor is for "sandbox:old-deploy\.sandbox", and this deploy is "sandbox:/,
+  );
+  expect(failure?.message).toContain("one database per contract deploy");
+  // Nothing served from it, and what had started is stopped: the directory opens again.
+  expect(lines.filter((line) => line.startsWith("serve: API at"))).toEqual([]);
+  await (await openDb(url)).close();
+});
+
+// ---- The database against the chain ------------------------------------------------------------
+
+/**
+ * A PGlite directory of its own with a real index in it: a task the chain holds, and the cursor
+ * after its block. The first call makes it, by serving, posting a task and stopping; every call
+ * copies it, so that a test may change what it holds.
+ */
+let indexed: Promise<{ dir: string; taskId: bigint; cursor: bigint }> | undefined;
+async function indexedCopy(): Promise<{ url: string; taskId: bigint; cursor: bigint }> {
+  indexed ??= (async () => {
+    const base = await mkdtemp(join(tmpdir(), "tender-serve-master-"));
+    dirs.push(base);
+    const dir = join(base, "index");
+    const services = await serve(envFor({ DATABASE_URL: `pglite:${dir}` }), []);
+    const taskId = await postTask();
+    await until(
+      `the index holds task ${taskId}`,
+      async () => (await fetch(`${services.url}/v1/tasks/${taskId}`)).status === 200,
+      30_000,
+    );
+    await services.stop();
+    const db = await openDb(`pglite:${dir}`);
+    const [row] = await db.query<{ height: string }>(
+      "select height::text as height from chain_cursor",
+    );
+    await db.close();
+    return { dir, taskId, cursor: BigInt(row?.height ?? "0") };
+  })();
+  const { dir, taskId, cursor } = await indexed;
+  const base = await mkdtemp(join(tmpdir(), "tender-serve-copy-"));
+  dirs.push(base);
+  await cp(dir, join(base, "index"), { recursive: true });
+  return { url: `pglite:${join(base, "index")}`, taskId, cursor };
+}
+
+/** Changes what a copy of the index holds: `change` is given the database, which is closed after. */
+async function changing(url: string, change: (db: Db) => Promise<void>): Promise<void> {
+  const db = await openDb(url);
+  try {
+    await change(db);
+  } finally {
+    await db.close();
+  }
+}
+
+/** Stores a task of id `id` as the index would. */
+async function indexTask(db: Db, id: number): Promise<void> {
+  await db.query(
+    `insert into tasks (id, poster, token, reward, fee_bps, brief_uri, brief_hash, criteria_hash,
+       verifier, created_at, commit_deadline, reveal_deadline, pick_deadline, fallback_deadline,
+       max_entries, max_winners, invited, created_height)
+     values ($1, 'poster.test.near', 'token.test.near', 1, 0, 'uri', 'h', 'h', 'judge.test.near',
+       1, 1, 1, 1, 1, 1, 1, '[]', 1)`,
+    [id],
+  );
+}
+
+/** The reads of the chain that the check makes, over `reader`, failing as `fails` says. */
+function chainThatFails(fails: { final: number; count: number }) {
+  const asks = { final: 0, count: 0 };
+  const down = () => new Error("fetch failed for https://rpc.example.org/?apiKey=s3cret");
+  return {
+    asks,
+    chain: {
+      network: reader.network,
+      contractId: reader.contractId,
+      finalHeight: async () => {
+        asks.final += 1;
+        if (asks.final <= fails.final) throw down();
+        return reader.finalHeight();
+      },
+      taskCount: async () => {
+        asks.count += 1;
+        if (asks.count <= fails.count) throw down();
+        return reader.taskCount();
+      },
+    },
+  };
+}
+
+/**
+ * The reads of the chain that the check makes, over `reader`, with a node whose final block is `gap`
+ * blocks below `cursor` until `catchUp`, and the chain's own after.
+ */
+function chainThatLags(cursor: bigint, gap: bigint) {
+  const asks = { final: 0 };
+  let behind = true;
+  return {
+    asks,
+    catchUp: () => {
+      behind = false;
+    },
+    chain: {
+      network: reader.network,
+      contractId: reader.contractId,
+      finalHeight: async () => {
+        asks.final += 1;
+        return behind ? cursor - gap : reader.finalHeight();
+      },
+      taskCount: () => reader.taskCount(),
+    },
+  };
+}
+
+/**
+ * The reads of the chain that the check makes, over `reader`, whose first read of the task count
+ * says `short`, as a node of a load-balanced RPC that is a block or two behind the one that gave the
+ * final height does.
+ */
+function chainThatCountsShortOnce(short: bigint) {
+  const asks = { count: 0 };
+  return {
+    asks,
+    chain: {
+      network: reader.network,
+      contractId: reader.contractId,
+      finalHeight: () => reader.finalHeight(),
+      taskCount: async () => {
+        asks.count += 1;
+        return asks.count === 1 ? short : reader.taskCount();
+      },
+    },
+  };
+}
+
+/** Whether `promise` has not settled within `ms`. */
+const stillPending = (promise: Promise<unknown>, ms = 100): Promise<boolean> =>
+  Promise.race([promise.then(() => false), sleep(ms).then(() => true)]);
+
+/** The lines of `lines` that tell of a wait for the chain. */
+const waitsOf = (lines: string[]) =>
+  lines.filter((line) => line.startsWith("WARN indexer: cannot check the database"));
+
+test("serve_serves_while_the_chain_cannot_be_asked_and_indexes_once_it_can", async () => {
+  const { url, taskId, cursor } = await indexedCopy();
+  const flaky = chainThatFails({ final: 2, count: 1 });
+  const lines: string[] = [];
+  const services = await serve(envFor({ DATABASE_URL: url, ...keeperEnv(200) }), lines, {
+    deployment: { chain: flaky.chain, retryMs: 20, longestMs: 40 },
+  });
+
+  // The services are up on the first failed read: the API serves the index as it is, and none of
+  // the indexer, the keeper and the Judge has started, since nothing says yet whose index it is.
+  const early = lines.slice();
+  expect(early).toContain(
+    "WARN indexer: cannot check the database against the chain yet (cannot read the final " +
+      "block (Error)); trying again in 0.02 s",
+  );
+  expect(early.filter((line) => /^serve: API at/.test(line))).toHaveLength(1);
+  expect(early.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
+  expect(early.some((line) => line.startsWith("serve: keeper on"))).toBe(false);
+  const served = await health(services.url);
+  expect(served.status).toBe(200);
+  expect(BigInt(served.body.indexed_height)).toBe(cursor);
+  expect((await fetch(`${services.url}/v1/tasks/${taskId}`)).status).toBe(200);
+
+  // Once the node answers, the database is found to match, and they start.
+  await until(
+    "the keeper and the indexer start",
+    async () => lines.some((line) => line.startsWith("serve: keeper on")),
+    30_000,
+  );
+  expect(lines).toContain(
+    "indexer: the database matches the chain; starting the indexer and the keeper",
+  );
+  expect(lines.some((line) => line.startsWith("indexer: resuming after block"))).toBe(true);
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([]);
+  expect(flaky.asks.final).toBeGreaterThan(2);
+  expect(flaky.asks.count).toBeGreaterThan(1);
+  // What the failed reads quoted does not show.
+  expect(lines.filter((line) => line.includes("s3cret"))).toEqual([]);
+  await services.stop();
+});
+
+test("serve_ends_on_the_index_of_another_chain_once_two_reads_in_a_row_say_so", async () => {
+  const { url, cursor } = await indexedCopy();
+  // A task the chain has not made: the index of a contract that was made again under this name.
+  await changing(url, (db) => indexTask(db, 999));
+  const lines: string[] = [];
+  const services = await serve(envFor({ DATABASE_URL: url, ...keeperEnv(200) }), lines, {
+    deployment: { retryMs: 20, longestMs: 40 },
+  });
+
+  // The services are up on the first read that comes out short, which is not taken for the last:
+  // the API serves the index as it is, and none of the indexer and the keeper has started.
+  const waits = waitsOf(lines);
+  expect(waits).toHaveLength(1);
+  expect(waits[0]).toMatch(
+    /^WARN indexer: cannot check the database against the chain yet \(the node counts \d+ tasks, fewer than the 999 the database holds, though its final block, \d+, is past the last block the index took, \d+: reading again before the database is taken for another deploy's\); trying again in 0\.02 s$/,
+  );
+  expect(lines.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
+  expect(lines.some((line) => line.startsWith("serve: keeper on"))).toBe(false);
+
+  // The next read says the same, and the services cannot go on. They say why in the error, which is
+  // the refusal as a start would throw it, and no line of their own.
+  const error = await services.failed;
+  expect(error).toBeInstanceOf(IndexerError);
+  expect(error.message).toMatch(
+    /^the database holds task 999, but .* has made \d+ on sandbox, as read at its final block \d+, past the last block the index took \(\d+\), on 2 reads in a row\. Either the node at NEAR_RPC_URL is behind the chain: wait for it/,
+  );
+  expect(error.message).toContain(
+    "use a new database for this deploy (one database per contract deploy)",
+  );
+  expect(error.message).toContain("keep the old one");
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([]);
+
+  // Until the process ends, the API serves and nothing writes: the cursor stays where it was while
+  // the chain moves on.
+  await postTask();
+  await sleep(500);
+  const served = await health(services.url);
+  expect(served.status).toBe(200);
+  expect(BigInt(served.body.indexed_height)).toBe(cursor);
+  expect(lines.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
+  expect(lines.some((line) => line.startsWith("serve: keeper on"))).toBe(false);
+
+  // The process then ends with 1, and the services are stopped first: the database is let go.
+  const printed: string[] = [];
+  const exits: number[] = [];
+  await exitOnFailure(
+    services,
+    {
+      exit: (code) => {
+        exits.push(code);
+      },
+    },
+    { print: (line) => printed.push(line) },
+  );
+  expect(exits).toEqual([1]);
+  expect(printed).toEqual([`serve: ${error.message}`]);
+  expect(lines.at(-1)).toBe("serve: stopped");
+  await (await openDb(url)).close();
+});
+
+test("serve_does_not_take_one_short_count_for_the_index_of_another_chain", async () => {
+  const { url } = await indexedCopy();
+  // One read of the count comes out short, and the next is the chain's own.
+  const odd = chainThatCountsShortOnce(0n);
+  const lines: string[] = [];
+  const services = await serve(envFor({ DATABASE_URL: url, ...keeperEnv(200) }), lines, {
+    deployment: { chain: odd.chain, retryMs: 20, longestMs: 40 },
+  });
+
+  const waits = waitsOf(lines);
+  expect(waits).toHaveLength(1);
+  expect(waits[0]).toMatch(
+    /\(the node counts 0 tasks, fewer than the \d+ the database holds, though its final block, \d+, is past the last block the index took, \d+: reading again before the database is taken for another deploy's\)/,
+  );
+  // The second read agrees with the database: the indexer and the keeper start, and nothing ends.
+  await until(
+    "the keeper and the indexer start",
+    async () => lines.some((line) => line.startsWith("serve: keeper on")),
+    30_000,
+  );
+  expect(lines).toContain(
+    "indexer: the database matches the chain; starting the indexer and the keeper",
+  );
+  expect(odd.asks.count).toBe(2);
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([]);
+  expect(await stillPending(services.failed)).toBe(true);
+  await services.stop();
+});
+
+test("serve_refuses_an_index_that_is_ahead_of_the_chain_as_one_of_a_new_chain", async () => {
+  const { url, cursor } = await indexedCopy();
+  // The chain was started afresh under the same contract name: its blocks are below the cursor.
+  const ahead = cursor + 1_000_000n;
+  await changing(url, async (db) => {
+    await db.query("update chain_cursor set height = $1", [ahead]);
+  });
+  const lines: string[] = [];
+  // On the sandbox the node is the index's own source, so a block below the cursor is no lag: the
+  // first read refuses, and the start throws like any refusal to start.
+  const failure = await serve(envFor({ DATABASE_URL: url }), lines).then(
+    () => undefined,
+    (error: unknown) => error as Error,
+  );
+  expect(failure).toBeInstanceOf(IndexerError);
+  expect(failure?.message).toContain(
+    `the index took block ${ahead}, but the final block of sandbox at the node is`,
+  );
+  expect(failure?.message).toContain("a new chain under this contract name needs a new database");
+  // What had started is stopped, and nothing was written: the directory opens again.
+  expect(lines.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([]);
+  await (await openDb(url)).close();
+});
+
+test("serve_waits_for_a_node_behind_the_index_off_the_sandbox_and_says_so_now_and_then", async () => {
+  const { url, cursor } = await indexedCopy();
+  // A node 500 blocks below the index, as one that is catching up is. The check is given what a
+  // network off the sandbox gets: a skew of 20 blocks, and 100000 blocks before no lag explains it.
+  const lagging = chainThatLags(cursor, 500n);
+  const lines: string[] = [];
+  const services = await serve(envFor({ DATABASE_URL: url, ...keeperEnv(200) }), lines, {
+    deployment: {
+      chain: lagging.chain,
+      skewBlocks: 20n,
+      lagLimitBlocks: 100_000n,
+      retryMs: 20,
+      longestMs: 40,
+      behindWarnMs: 1_000,
+    },
+  });
+
+  const waits = waitsOf(lines);
+  expect(waits).toHaveLength(1);
+  expect(waits[0]).toContain(
+    `(the final block of the node, ${cursor - 500n}, is 500 blocks below the last block the index ` +
+      `took, ${cursor}: the node is behind, and is waited for)`,
+  );
+
+  // The wait goes on and says so again after a second, though the node is asked every 20 ms or so.
+  await until("the wait says so again", async () => waitsOf(lines).length >= 2, 10_000);
+  expect(lagging.asks.final).toBeGreaterThan(waitsOf(lines).length * 2);
+  // Meanwhile the API serves the index as it is, the services do not end, and nothing has started.
+  const served = await health(services.url);
+  expect(served.status).toBe(200);
+  expect(BigInt(served.body.indexed_height)).toBe(cursor);
+  expect(await stillPending(services.failed)).toBe(true);
+  expect(lines.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
+  expect(lines.some((line) => line.startsWith("serve: keeper on"))).toBe(false);
+
+  // Once the node has caught up, the database is found to match, and they start.
+  lagging.catchUp();
+  await until(
+    "the keeper and the indexer start",
+    async () => lines.some((line) => line.startsWith("serve: keeper on")),
+    30_000,
+  );
+  expect(lines).toContain(
+    "indexer: the database matches the chain; starting the indexer and the keeper",
+  );
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([]);
+  expect(await stillPending(services.failed)).toBe(true);
+  await services.stop();
+});
+
+test("stopping_ends_the_wait_for_a_chain_that_never_answers", async () => {
+  const { url } = await indexedCopy();
+  const down = chainThatFails({ final: Number.MAX_SAFE_INTEGER, count: 0 });
+  const lines: string[] = [];
+  const services = await serve(envFor({ DATABASE_URL: url }), lines, {
+    deployment: { chain: down.chain, retryMs: 20, longestMs: 40 },
+  });
+  await until("the node has been asked several times", async () => down.asks.final >= 5, 10_000);
+  expect((await health(services.url)).status).toBe(200);
+
+  const stopped = Date.now();
+  await services.stop();
+  expect(Date.now() - stopped).toBeLessThan(5_000);
+  // Nothing asks the node after the stop, and nothing was refused: the node was only waited for.
+  const asked = down.asks.final;
+  await sleep(300);
+  expect(down.asks.final).toBe(asked);
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([]);
+  expect(lines.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
+  expect(lines.at(-1)).toBe("serve: stopped");
+});
+
+// ---- The PGlite directory, lost -----------------------------------------------------------------
+
+/** What another process writes into a lock it has taken over. */
+const TAKEN_LOCK = `${JSON.stringify({ token: "another-process", pid: 4242, host: "some-host.local" })}\n`;
+
+test("serve_ends_on_a_pglite_directory_that_another_process_took_over", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tender-serve-pglite-"));
+  dirs.push(dir);
+  const index = join(dir, "index");
+  const lines: string[] = [];
+  // A beat every 40 ms and a lock that lasts 600 ms, so that a loss shows at once.
+  const services = await serve(envFor({ DATABASE_URL: `pglite:${index}` }), lines, {
+    pgliteLock: { beatMs: 40, staleMs: 600 },
+  });
+  expect((await health(services.url)).status).toBe(200);
+  // The beats go on, and lose nothing.
+  expect(await stillPending(services.failed, 300)).toBe(true);
+
+  // Another process takes the directory over, as it does from a holder that was away too long.
+  const lock = join(index, "tender.lock");
+  await writeFile(lock, TAKEN_LOCK);
+  const error = await services.failed;
+  expect(error).toBeInstanceOf(PgliteLockLostError);
+  expect(error.message).toContain(
+    `the PGlite directory ${index} is no longer this process's: process 4242 on some-host.local ` +
+      "has made its own lock there",
+  );
+
+  // The process ends with 1, through the same failure as a refusal that comes late. The stop does
+  // not touch the other process's lock, and lets this process's claim on the directory go.
+  const printed: string[] = [];
+  const exits: number[] = [];
+  await exitOnFailure(
+    services,
+    {
+      exit: (code) => {
+        exits.push(code);
+      },
+    },
+    { print: (line) => printed.push(line) },
+  );
+  expect(exits).toEqual([1]);
+  expect(printed).toEqual([`serve: ${error.message}`]);
+  expect(lines.at(-1)).toBe("serve: stopped");
+  expect(await readFile(lock, "utf8")).toBe(TAKEN_LOCK);
+  await rm(lock);
+  await (await openDb(`pglite:${index}`)).close();
+});
+
+// ---- The process itself ------------------------------------------------------------------------
+
+/**
+ * `scripts/serve.ts` as `pnpm serve` runs it, in a process of its own on `env` alone, so that
+ * nothing of this process's own reaches it. What it prints is kept, and `printed` and `end` wait
+ * for it, failing with everything it printed if it ends first or takes too long.
+ */
+function runServe(env: Record<string, string>) {
+  const child = spawn(process.execPath, ["--import", "tsx", "scripts/serve.ts"], {
+    cwd: REPO_ROOT,
+    env: { PATH: process.env.PATH ?? "", ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  children.push(child);
+  let stdout = "";
+  let stderr = "";
+  let ended: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  // "close", not "exit": by then everything the process printed has been read.
+  child.once("close", (code, signal) => {
+    ended = { code, signal };
+  });
+
+  const waitFor = async (what: string, check: () => boolean, ms: number): Promise<void> => {
+    try {
+      await until(
+        what,
+        async () => {
+          if (check()) return true;
+          if (ended !== undefined) throw new Error(`the process ended (${JSON.stringify(ended)})`);
+          return false;
+        },
+        ms,
+      );
+    } catch (error) {
+      throw new Error(
+        `${(error as Error).message} before ${what}\n--- stdout ---\n${stdout}--- stderr ---\n${stderr}`,
+      );
+    }
+  };
+  return {
+    child,
+    stdout: () => stdout,
+    stderr: () => stderr,
+    hasEnded: () => ended !== undefined,
+    /** Where the API listens, once the process has said so. */
+    apiUrl: () => /^serve: API at (\S+),/m.exec(stdout)?.[1],
+    /** Waits until a line of its output matches `pattern`. */
+    printed: (pattern: RegExp, ms = 90_000) =>
+      waitFor(`the process prints ${pattern}`, () => pattern.test(stdout), ms),
+    /** Waits until the process ends, and says how. */
+    async end(ms = 90_000) {
+      await waitFor("the process ends", () => ended !== undefined, ms);
+      return ended as NonNullable<typeof ended>;
+    },
+  };
+}
+
+test("the_process_exits_with_1_on_the_index_of_another_chain", async () => {
+  const { url } = await indexedCopy();
+  await changing(url, (db) => indexTask(db, 999));
+  const run = runServe(envFor({ DATABASE_URL: url }));
+  try {
+    // It serves for the first read, and ends with the second, two seconds later.
+    const { code } = await run.end();
+    expect(code, run.stderr()).toBe(1);
+    expect(run.stdout()).toMatch(/^serve: API at /m);
+    expect(run.stdout()).toMatch(
+      /^WARN indexer: cannot check the database against the chain yet \(the node counts \d+ tasks, fewer than the 999 /m,
+    );
+    expect(run.stdout()).not.toMatch(/^indexer: resuming/m);
+    expect(run.stderr()).toMatch(
+      /^serve: the database holds task 999, but .* has made \d+ on sandbox, as read at its final block \d+, past the last block the index took \(\d+\), on 2 reads in a row\. Either the node at NEAR_RPC_URL is behind the chain: wait for it/m,
+    );
+  } finally {
+    run.child.kill("SIGKILL");
+  }
+}, 180_000);
+
+test("the_process_exits_with_1_when_another_process_takes_its_pglite_directory", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tender-serve-pglite-"));
+  dirs.push(dir);
+  const index = join(dir, "index");
+  const run = runServe(envFor({ DATABASE_URL: `pglite:${index}` }));
+  try {
+    await run.printed(/^serve: API at /m);
+    const lock = join(index, "tender.lock");
+    await writeFile(lock, TAKEN_LOCK);
+    // The holder finds out at its next beat, which is every 10 s.
+    const { code } = await run.end(60_000);
+    expect(code, run.stderr()).toBe(1);
+    expect(run.stderr()).toContain(
+      `serve: the PGlite directory ${index} is no longer this process's: process 4242 on ` +
+        "some-host.local has made its own lock there",
+    );
+    // The other process's lock is as it left it.
+    expect(await readFile(lock, "utf8")).toBe(TAKEN_LOCK);
+  } finally {
+    run.child.kill("SIGKILL");
+  }
+}, 180_000);
+
+/**
+ * What `pnpm serve` reads for a testnet whose node is the local chain's, so that the check of the
+ * database against the chain has the defaults that a network off the sandbox gets. The index in
+ * `url` is made the testnet's, with its cursor at `cursor`.
+ */
+async function offSandbox(url: string, cursor: bigint): Promise<Record<string, string>> {
+  await changing(url, async (db) => {
+    await db.query("update chain_cursor set source = $1, height = $2", [
+      `testnet:${chain.contractId}`,
+      cursor,
+    ]);
+  });
+  return {
+    TENDER_NETWORK: "testnet",
+    TENDER_CONTRACT: chain.contractId,
+    NEAR_RPC_URL: chain.rpcUrl,
+    DATABASE_URL: url,
+    API_PORT: "0",
+    PUBLIC_API_URL: "http://127.0.0.1:3001",
+    INDEXER_START_HEIGHT: "1",
+  };
+}
+
+test("off_the_sandbox_the_process_waits_for_a_node_behind_the_index_and_ends_only_on_a_gap_no_lag_explains", async () => {
+  const final = await reader.finalHeight();
+
+  // A node 500 blocks behind the index, which is waited for. The first try is told, and the later
+  // ones are not for a minute.
+  const lagging = runServe(await offSandbox((await indexedCopy()).url, final + 500n));
+  try {
+    await lagging.printed(
+      /^WARN indexer: cannot check the database against the chain yet \(the final block of the node, \d+, is \d+ blocks below the last block the index took, \d+: the node is behind, and is waited for\); trying again in 2 s$/m,
+    );
+    // Past the second try, at 2 s: the wait does not end the process, and the API serves.
+    await sleep(3_000);
+    expect(lagging.hasEnded(), lagging.stderr()).toBe(false);
+    expect(
+      lagging.stdout().match(/^WARN indexer: cannot check the database against the chain yet/gm),
+    ).toHaveLength(1);
+    expect(lagging.stdout()).not.toMatch(/^indexer: resuming/m);
+    const apiUrl = lagging.apiUrl();
+    expect(apiUrl).toBeDefined();
+    expect((await health(apiUrl as string)).status).toBe(200);
+    // It stops when it is told to, and that is no failure.
+    lagging.child.kill("SIGTERM");
+    const { code } = await lagging.end(30_000);
+    expect(code, lagging.stderr()).toBe(0);
+  } finally {
+    lagging.child.kill("SIGKILL");
+  }
+
+  // A cursor 200000 blocks past the node's: no lag explains that, so the process ends with 1, and
+  // says that the node is most likely of another network. It says so after two reads in a row, the
+  // first told with a WARN, since the final height can come from a node of a load-balanced RPC
+  // that has just restarted.
+  const far = runServe(await offSandbox((await indexedCopy()).url, final + 200_000n));
+  try {
+    const { code } = await far.end();
+    expect(code, far.stderr()).toBe(1);
+    expect(far.stdout()).toMatch(
+      /^WARN indexer: cannot check the database against the chain yet \(the final block of the node, \d+, is \d+ blocks below the last block the index took, \d+, more than any lag explains: reading again before the node is taken for one of another network\); trying again in 2 s$/m,
+    );
+    expect(far.stderr()).toMatch(
+      /^serve: the index took block \d+, but the final block of testnet at the node is \d+, \d+ blocks below it, on 2 reads in a row\. No lag explains a gap that size: the node at NEAR_RPC_URL is most likely on another network than testnet\. Point NEAR_RPC_URL at a testnet node, and start the services again\. Or this is a new chain under the contract name /m,
+    );
+  } finally {
+    far.child.kill("SIGKILL");
+  }
+}, 240_000);
