@@ -65,6 +65,8 @@ export interface TaskSpec {
   commitCount?: number;
   /** The entries the index shows in the task. Default: none. */
   entries?: TaskEntry[];
+  /** When the task was created, in nanoseconds since the epoch. Default: "1000000000". */
+  createdAt?: string;
 }
 
 /** The task a test asks for, with the rest as a task that has just been posted and accepted. */
@@ -91,7 +93,7 @@ export function taskSummary(spec: TaskSpec): TaskSummary {
     phase: spec.phase,
     poster: spec.poster ?? POSTER,
     verifier: spec.verifier ?? JUDGE,
-    created_at: "1000000000",
+    created_at: spec.createdAt ?? "1000000000",
     commit_deadline: "2000000000",
     reveal_deadline: "3000000000",
     pick_deadline: "4000000000",
