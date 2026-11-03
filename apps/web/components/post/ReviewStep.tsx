@@ -354,14 +354,32 @@ export function ReviewStep(props: {
           </p>
         ) : null}
         {props.outcome?.kind === "sent" ? (
-          <p role="status" data-testid="post-sent">
-            Your wallet sent it, but Tender hasn't reported the new task. It may well be posted:
-            look for it on the{" "}
-            <a href="/" className="underline">
-              Tasks
-            </a>{" "}
-            page before you try again.
-          </p>
+          <div role="status" data-testid="post-sent" className="grid gap-2">
+            <p>
+              Your wallet sent it, but Tender hasn't reported the new task. It may well be posted:
+              look for it on the{" "}
+              {/* A tab of its own, as for an unknown outcome, so that the form on this page is
+                  not lost. */}
+              <a href="/tasks" target="_blank" rel="noreferrer" className="underline">
+                Tasks
+              </a>{" "}
+              page before you try again.
+            </p>
+            {props.outcome.txHashes.length === 0 ? null : (
+              <ul aria-label="Transactions" className="grid gap-1 text-sm">
+                {props.outcome.txHashes.map((hash, i) => (
+                  <li
+                    // biome-ignore lint/suspicious/noArrayIndexKey: the wallet lists the hashes, and could list one twice
+                    key={`${hash}-${i}`}
+                    data-testid="post-sent-hash"
+                    className="font-mono wrap-anywhere"
+                  >
+                    {hash}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         ) : null}
         {props.outcome?.kind === "unknown" ? (
           <div
@@ -372,7 +390,7 @@ export function ReviewStep(props: {
             <p>
               We couldn't tell whether the post went through. Check the{" "}
               {/* A tab of its own, so that the form on this page is not lost. */}
-              <a href="/" target="_blank" rel="noreferrer" className="underline">
+              <a href="/tasks" target="_blank" rel="noreferrer" className="underline">
                 Tasks
               </a>{" "}
               page before posting again.

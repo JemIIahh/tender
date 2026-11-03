@@ -945,7 +945,7 @@ test("a_wallet_that_fails_without_saying_whether_it_sent_locks_post_until_the_pe
   );
   // The Tasks page opens in a tab of its own, so that the form on this page is not lost.
   const link = within(unknown).getByRole("link", { name: "Tasks" });
-  expect(link.getAttribute("href")).toBe("/");
+  expect(link.getAttribute("href")).toBe("/tasks");
   expect(link.getAttribute("target")).toBe("_blank");
   expect(screen.queryByTestId("post-failure")).toBeNull();
   expect(screen.queryByTestId("post-sent")).toBeNull();
@@ -1502,9 +1502,37 @@ test("a_send_that_reports_no_new_task_does_not_redirect_and_cannot_be_pressed_ag
 
   const sent = await screen.findByTestId("post-sent");
   expect(sent.textContent).toContain("It may well be posted");
-  expect(within(sent).getByRole("link", { name: "Tasks" }).getAttribute("href")).toBe("/");
+  // The Tasks page opens in a tab of its own, as it does for an unknown outcome, so that the form
+  // on this page is not lost; and the transactions the wallet sent are shown, to look up.
+  const link = within(sent).getByRole("link", { name: "Tasks" });
+  expect(link.getAttribute("href")).toBe("/tasks");
+  expect(link.getAttribute("target")).toBe("_blank");
+  // The vault holds the reward, so the batch was one transaction: the post.
+  expect(
+    within(sent)
+      .getAllByTestId("post-sent-hash")
+      .map((hash) => hash.textContent),
+  ).toEqual(["tx1"]);
   expect(router.push).not.toHaveBeenCalled();
   expect(off(postButton())).toBe(true);
+});
+
+test("a_result_with_no_hashes_shows_none", async () => {
+  const { user, wallet } = setup({ vault: TUSDC(5) });
+  const send = wallet.signAndSendTransactions.bind(wallet);
+  wallet.signAndSendTransactions = async (params) => {
+    await send(params);
+    return "not an outcome" as never;
+  };
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  await user.click(await postReady());
+
+  // The wallet could not say how it went: there is nothing to show, and nothing is made up.
+  const sent = await screen.findByTestId("post-sent");
+  expect(within(sent).queryByTestId("post-sent-hash")).toBeNull();
+  expect(within(sent).getByRole("link", { name: "Tasks" }).getAttribute("target")).toBe("_blank");
 });
 
 // ---- The steps ----------------------------------------------------------------------------------
