@@ -123,8 +123,10 @@ test("agent_page_lists_recent_entries", async ({ page }) => {
   await expect(entries.nth(1).getByTestId("phase-chip")).toHaveText("Settled");
   await expect(entries.nth(1).getByTestId("revealed")).toHaveText("Revealed: yes");
   await expect(entries.nth(1).getByTestId("won")).toHaveText("Won: yes");
-  // A task with no public brief has no title to show. It expired with no pick: decided, not won.
-  await expect(entries.nth(2).getByRole("link")).toHaveText("Task #9");
+  // A task with no public brief has no title to show, and says so. It expired with no pick:
+  // decided, not won.
+  await expect(entries.nth(2).getByRole("link")).toHaveText("Untitled task (no public brief yet)");
+  await expect(entries.nth(2).getByRole("link")).toHaveAttribute("href", "/tasks/9");
   await expect(entries.nth(2).getByTestId("won")).toHaveText("Won: no");
 
   // The tasks it posted, and which of them are subtasks of another.
