@@ -91,7 +91,8 @@ async fn task_count(env: &Env) -> anyhow::Result<u128> {
 }
 
 /// The owner's setters, each with one key too many. `accept_owner` is left out: it takes no
-/// arguments, so the generated wrapper never reads any and has nothing to refuse.
+/// arguments, so the generated wrapper never reads any and has nothing to refuse. The same holds
+/// for `unregister_agent` and `claim_agent_bond`.
 #[tokio::test]
 async fn owner_setters_refuse_an_unknown_argument() -> anyhow::Result<()> {
     let env = setup(5).await?;
@@ -114,6 +115,9 @@ async fn owner_setters_refuse_an_unknown_argument() -> anyhow::Result<()> {
     });
     let pause = json!({ "paused": true });
     let propose = json!({ "new_owner": env.carol.id() });
+    let bond = json!({ "token": env.token.id(), "amount": "1000" });
+    let cooldown = json!({ "secs": "60" });
+    assert!(start["agent_bond_amount"].is_null());
 
     for (method, args) in [
         ("set_fee", &fee),
@@ -121,6 +125,8 @@ async fn owner_setters_refuse_an_unknown_argument() -> anyhow::Result<()> {
         ("set_token", &token),
         ("set_paused", &pause),
         ("propose_owner", &propose),
+        ("set_agent_bond", &bond),
+        ("set_agent_bond_cooldown", &cooldown),
     ] {
         assert_refuses_unknown_key(&env, owner, method, args, ONE_YOCTO).await?;
         assert_eq!(
@@ -130,13 +136,15 @@ async fn owner_setters_refuse_an_unknown_argument() -> anyhow::Result<()> {
         );
     }
 
-    // Without the extra key the same five calls go through, and each changes what it names.
+    // Without the extra key the same seven calls go through, and each changes what it names.
     for (method, args) in [
         ("set_fee", &fee),
         ("set_min_window", &window),
         ("set_token", &token),
         ("set_paused", &pause),
         ("propose_owner", &propose),
+        ("set_agent_bond", &bond),
+        ("set_agent_bond_cooldown", &cooldown),
     ] {
         done_clean(call(&env, owner, method, args.clone(), ONE_YOCTO).await?)?;
     }
@@ -147,6 +155,9 @@ async fn owner_setters_refuse_an_unknown_argument() -> anyhow::Result<()> {
     assert_eq!(end["tokens"][0]["max_reward"], "5000000000000");
     assert_eq!(end["paused"], true);
     assert_eq!(end["pending_owner"], env.carol.id().as_str());
+    assert_eq!(end["agent_bond_token"], env.token.id().as_str());
+    assert_eq!(end["agent_bond_amount"], "1000");
+    assert_eq!(end["agent_bond_cooldown_secs"], "60");
     Ok(())
 }
 

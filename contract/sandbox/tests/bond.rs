@@ -230,3 +230,47 @@ async fn function_call_key_cannot_register_unregister_or_claim() -> anyhow::Resu
     assert_eq!(event(&r, "committed")["account"], env.alice.id().as_str());
     Ok(())
 }
+
+/// One bond cannot seat a second account in a task whose commit window is still open, however
+/// short the cooldown: an open entry locks its agent's bond until that window closes (16b review
+/// M1, independent review L3). The cooldown here is 5 s and the commit window 600 s.
+#[tokio::test]
+async fn bond_is_locked_until_the_commit_window_closes() -> anyhow::Result<()> {
+    let env = setup(5).await?;
+    set_bond(&env).await?;
+    deposit(&env, &env.poster, REWARD).await?;
+    let mut long = task_json(&env, REWARD, env.judge.id(), 1);
+    long["commit_secs"] = json!(600);
+    let id = post(&env, &env.poster, long).await?;
+    let commit_deadline = num(&get_task(&env, id).await?["commit_deadline"]);
+
+    let dave = new_account(&env, "dave").await?;
+    storage_deposit(&env, &dave, STORAGE).await?;
+    deposit_for(&env, &env.poster, dave.id(), BOND).await?;
+    done_clean(register_agent_call(&env, &dave).await?)?;
+    commit_work(&env, &dave, id, b"dave's work").await?;
+    let agent = view(&env.tender, "get_agent", json!({ "account_id": dave.id() })).await?;
+    assert_eq!(num(&agent["locked_until"]), commit_deadline);
+
+    // dave leaves at once. The 5 s cooldown would let him claim at once; the lock does not.
+    let r = clean(call(&env, &dave, "unregister_agent", json!({}), ONE_YOCTO).await?)?;
+    assert_eq!(
+        num(&event(&r, "agent_unregistering")["claimable_at"]),
+        commit_deadline
+    );
+    let after_cooldown = now_ns(&env).await? + 10 * 1_000_000_000;
+    advance_to(&env, after_cooldown).await?;
+    let r = call(&env, &dave, "claim_agent_bond", json!({}), ONE_YOCTO).await?;
+    assert_fails_with(&r, "E_PHASE: ");
+    assert_eq!(vault_balance(&env, dave.id()).await?, 0);
+
+    // From the commit deadline he claims it, and the task takes no new entrant by then.
+    advance_to(&env, u64::try_from(commit_deadline)?).await?;
+    done_clean(call(&env, &dave, "claim_agent_bond", json!({}), ONE_YOCTO).await?)?;
+    assert_eq!(vault_balance(&env, dave.id()).await?, BOND);
+    let r = commit_call(&env, &env.bob, id, &seal(id, env.bob.id(), b"late")).await?;
+    assert_fails_with(&r, "E_PHASE: ");
+    assert_eq!(get_task(&env, id).await?["commit_count"], 1);
+    assert_conserved(&env, &[dave.id()]).await?;
+    Ok(())
+}

@@ -47,9 +47,8 @@ pub const MIN_WITHDRAW_GAS: Gas = Gas::from_tgas(35);
 /// Longest wait `set_agent_bond_cooldown` takes between `unregister_agent` and
 /// `claim_agent_bond`: four times the longest window, 56 days.
 pub const MAX_BOND_COOLDOWN_SECS: u64 = MAX_WINDOW_SECS as u64 * 4;
-/// The wait before the owner sets one: the longest window, 14 days. A bond then stays locked for
-/// at least any task's whole commit window after its agent stops entering, so one bond cannot
-/// seat a second account in the same task.
+/// The wait before the owner sets one: the longest window, 14 days. What stops one bond from
+/// seating a second account in a task is not this but each agent's `locked_until`.
 pub const DEFAULT_BOND_COOLDOWN_SECS: u64 = MAX_WINDOW_SECS as u64;
 
 /// Error codes. Every panic message starts with one, as `"<CODE>: <detail>"`.

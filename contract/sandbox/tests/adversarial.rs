@@ -750,7 +750,14 @@ async fn forty_nine_unbonded_fillers_refused() -> anyhow::Result<()> {
     );
     assert_eq!(get_task(&env, id).await?["commit_count"], 0);
 
-    // alice, registered before the bond was set, is an active agent, and enters.
+    // alice registered before the bond was set, so she holds none, and is refused too until she
+    // registers again, which takes the bond. Then she enters.
+    let sealed = seal(id, env.alice.id(), b"alice's work");
+    let r = commit_call(&env, &env.alice, id, &sealed).await?;
+    assert_fails_with(&r, "holds none: call register_agent to pay it");
+    deposit(&env, &env.alice, REWARD).await?;
+    let r = clean(register_agent_call(&env, &env.alice).await?)?;
+    assert_eq!(event(&r, "agent_bonded")["amount"], REWARD.to_string());
     commit_work(&env, &env.alice, id, b"alice's work").await?;
     assert_eq!(get_task(&env, id).await?["commit_count"], 1);
     assert_conserved(&env, &[]).await?;
