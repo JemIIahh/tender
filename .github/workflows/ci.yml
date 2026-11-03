@@ -115,3 +115,28 @@ jobs:
         run: pnpm test
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+  # The demo a judge runs on a clean machine (`pnpm demo:local`): a local chain, the services and
+  # two scripted agents, from a posted task to the Judge's pick. It needs no secret, env file,
+  # Postgres or model, so the job has none, and near-sandbox downloads nearcore's sandbox node the
+  # first time it starts, as in the node job. The demo prints DEMO OK as its last line, after
+  # everything it started has stopped, and the job passes only if that line is in its output.
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.26.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Run the demo
+        run: |
+          set -euo pipefail
+          pnpm demo:local | tee "$RUNNER_TEMP/demo.log"
+          grep -Fx 'DEMO OK' "$RUNNER_TEMP/demo.log"
