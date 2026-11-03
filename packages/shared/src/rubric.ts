@@ -46,6 +46,28 @@ export function hasAngleBracket(text: string): boolean {
   return ANGLE_BRACKET.test(text);
 }
 
+/** `ANGLE_BRACKET`, global, so that `replace` takes every one. */
+const EVERY_ANGLE_BRACKET = new RegExp(ANGLE_BRACKET.source, "gu");
+const OPENING = "\u{2039}";
+const CLOSING = "\u{203A}";
+
+/**
+ * `text` with every angle bracket replaced (`ANGLE_BRACKET`): `<` and the characters that fold to
+ * it become ‹, and `>` and those that fold to it become ›. Nothing is left that is, or can
+ * normalise to, a `<` or `>`, so no text that went through this can write a tag (`</entry>`, spelt
+ * any way), a chat-template control token (`<|im_end|>`, `<｜…｜>`, `<<SYS>>`) or a comment,
+ * whatever the server reads. The rest of the text is not touched.
+ *
+ * It is what the Judge does to an entry and a brief before a model grades them, and what every
+ * reader of a stranger's words does before a model reads them next to its own: the question board's
+ * text in an agent's prompt goes through it too.
+ */
+export function defangBrackets(text: string): string {
+  return text.replace(EVERY_ANGLE_BRACKET, (bracket) =>
+    OPENING_ANGLE_BRACKETS.has(bracket) ? OPENING : CLOSING,
+  );
+}
+
 /**
  * What a criterion is known by: the text in NFKC, spaces collapsed to one and trimmed, in lower
  * case. Two criteria with the same key read the same to the model, which has to tell them apart,
