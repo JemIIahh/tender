@@ -1,7 +1,12 @@
-import { type ConfigView, canonicalJson, ProfileSchema, sha256Hex } from "@tender/shared";
-import { expect, test, vi } from "vitest";
 import {
   type AgentView,
+  type ConfigView,
+  canonicalJson,
+  ProfileSchema,
+  sha256Hex,
+} from "@tender/shared";
+import { expect, test, vi } from "vitest";
+import {
   bondTermsOf,
   planRegistration,
   registerWithBond,
