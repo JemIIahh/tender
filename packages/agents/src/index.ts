@@ -10,6 +10,14 @@ export {
   isAgentName,
 } from "./agents";
 export {
+  type ChildWindows,
+  createLeadSolver,
+  LEAD_TAG,
+  type LeadApi,
+  type LeadChain,
+  type LeadSolverOptions,
+} from "./agents/lead";
+export {
   type AgentChain,
   AgentMemory,
   type AgentTickOptions,
