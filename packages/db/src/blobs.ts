@@ -29,14 +29,27 @@ export interface StoredBlob {
  * The table rejects a `kind` outside `BlobKind`.
  */
 export async function putBlob(db: Db, b: NewBlob): Promise<string> {
+  return (await insertBlob(db, b)).sha256;
+}
+
+/**
+ * `putBlob`, and whether this call stored a row: `created` is false when the hash was stored
+ * already, whatever its kind. Of calls that race with the same bytes, exactly one is told it
+ * stored them.
+ */
+export async function insertBlob(
+  db: Db,
+  b: NewBlob,
+): Promise<{ sha256: string; created: boolean }> {
   const sha256 = createHash("sha256").update(b.bytes).digest("hex");
-  await db.query(
+  const rows = await db.query(
     `insert into blobs (sha256, kind, content_type, bytes, task_id, uploader, is_public)
      values ($1, $2, $3, $4, $5, $6, $7)
-     on conflict (sha256) do nothing`,
+     on conflict (sha256) do nothing
+     returning sha256`,
     [sha256, b.kind, b.contentType, b.bytes, b.taskId ?? null, b.uploader ?? null, b.isPublic],
   );
-  return sha256;
+  return { sha256, created: rows.length > 0 };
 }
 
 /** The blob stored under `sha256`, or null. Visibility (`isPublic`) is the caller's to enforce. */

@@ -3,6 +3,7 @@ import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type Db,
   getBlob,
   hasHeldoutUpload,
   hasResultUpload,
@@ -2836,9 +2837,13 @@ const UPLOADED_TOO_MUCH: ErrorBody = {
   error: "rate_limited",
   message: "this account has uploaded too many bytes, try again later",
 };
-const UPLOADS_FULL: ErrorBody = {
+const BLOBS_USED_UP: ErrorBody = {
   error: "unavailable",
   message: "the API is taking no more uploads for now, try again later",
+};
+const HELDOUTS_USED_UP: ErrorBody = {
+  error: "unavailable",
+  message: "the API is taking no more held-out documents for now, try again later",
 };
 
 test("uploads_are_counted_per_account_across_both_routes", async () => {
@@ -2916,36 +2921,152 @@ test("upload_bytes_are_held_to_a_budget_for_each_account", async () => {
   }
 });
 
-test("uploads_are_a_503_once_the_process_has_taken_its_bytes", async () => {
+test("each_route_has_a_pool_of_its_own_and_the_team_is_held_to_neither", async () => {
   await seed();
   const size = briefOf("one").length;
+  const another = canonicalJson({ exact: { expected: ["43"] } });
   const app = appWith({
     teamAccounts: [carol],
     rateLimits: {
-      uploadBytes: { limit: size, windowMs: HOUR_MS },
-      uploadBytesTotal: { limit: 2 * size, windowMs: HOUR_MS },
+      blobBytesTotal: { limit: size, windowMs: HOUR_MS },
+      heldoutBytesTotal: { limit: HELDOUT_BYTES.length, windowMs: HOUR_MS },
     },
   });
-  const upload = (account: string, title: string) =>
+  const brief = (account: string, title: string) =>
+    post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf(title)), account, app);
+  const heldout = (account: string, bytes: Uint8Array) =>
+    post<ErrorBody>("/v1/heldout", heldoutBody(bytes), account, app);
+
+  // Alice's brief takes all that the route of the other kinds takes in its hour: the next new
+  // upload to it, by any account but the team's, is a 503 that says when the hour is over.
+  expect((await brief(alice, "one")).status).toBe(200);
+  const blobs = await blobCount();
+  expectRefused(await brief(bob, "two"), 503, BLOBS_USED_UP, HOUR_MS);
+  expect(await blobCount()).toBe(blobs);
+
+  // A flood of other uploads cannot stop a poster's held-out document: that route has a pool of
+  // its own. Used up in its turn, it refuses new held-out documents.
+  expect((await heldout(poster, HELDOUT_BYTES)).status).toBe(200);
+  expectRefused(await heldout(bob, another), 503, HELDOUTS_USED_UP, HOUR_MS);
+  expect(await heldoutUploadersOf(sha256Hex(another))).toEqual([]);
+
+  // The team's accounts are held to neither pool, and take from neither.
+  expect((await brief(carol, "car")).status).toBe(200);
+  expect((await heldout(carol, another)).status).toBe(200);
+  expect(await heldoutUploadersOf(sha256Hex(another))).toEqual([carol]);
+  expectRefused(await brief(bob, "two"), 503, BLOBS_USED_UP, HOUR_MS);
+});
+
+test("bytes_that_are_stored_already_cost_nothing", async () => {
+  await seed();
+  const size = briefOf("one").length;
+  const app = appWith({
+    rateLimits: {
+      uploadBytes: { limit: size, windowMs: HOUR_MS },
+      blobBytesTotal: { limit: 2 * size, windowMs: HOUR_MS },
+      heldoutBytesTotal: { limit: HELDOUT_BYTES.length, windowMs: HOUR_MS },
+    },
+  });
+  const brief = (account: string, title: string) =>
     post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf(title)), account, app);
 
-  expect((await upload(alice, "one")).status).toBe(200);
-  // Alice is over her own budget. What is refused takes nothing from the process's either, so
-  // bob still has the room that was left.
-  expectRefused(await upload(alice, "two"), 429, UPLOADED_TOO_MUCH, HOUR_MS);
-  expect((await upload(bob, "bob")).status).toBe(200);
+  // Alice's brief takes all of her budget. Sending it again, as she or anyone else may, stores no
+  // new row and costs nothing, so it is taken whatever is left.
+  expect((await brief(alice, "one")).status).toBe(200);
+  expect((await brief(alice, "one")).status).toBe(200);
+  expect((await brief(bob, "one")).status).toBe(200);
+  // So bob still has his whole budget, and the route a brief's worth of room.
+  expect((await brief(bob, "two")).status).toBe(200);
+  expectRefused(await brief(alice, "six"), 429, UPLOADED_TOO_MUCH, HOUR_MS);
 
-  // The process has taken all it takes in its hour. Every upload is a 503 that says when the hour
-  // is over, the team's included: that limit is the database's, whoever sends the bytes.
-  const blobs = await blobCount();
-  expectRefused(await upload(carol, "car"), 503, UPLOADS_FULL, HOUR_MS);
+  // The same for a held-out document: the second account to send it is recorded, for nothing.
+  const sent = heldoutBody(HELDOUT_BYTES);
+  expect((await post("/v1/heldout", sent, carol, app)).status).toBe(200);
+  expect((await post("/v1/heldout", sent, poster, app)).status).toBe(200);
+  expect(await heldoutUploadersOf(HELDOUT_HASH)).toEqual([carol, poster]);
+});
+
+test("of_two_uploads_of_the_same_new_bytes_at_once_only_the_one_that_stores_them_pays", async () => {
+  await seed();
+  const size = briefOf("one").length;
+  // Both uploads find the bytes not stored, and are charged, before either puts them: the puts are
+  // held until both have looked. The second put stores no row, and its upload is given back what
+  // it was charged.
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let lookups = 0;
+  const racing: Db = {
+    ...deps.db,
+    query: (async (sql: string, params?: unknown[]) => {
+      if (sql.includes("insert into blobs")) await held;
+      const rows = await deps.db.query(sql, params);
+      if (sql.includes("from blobs where sha256") && ++lookups === 2) release();
+      return rows;
+    }) as Db["query"],
+  };
+  const app = appWith({
+    db: racing,
+    rateLimits: { uploadBytes: { limit: 2 * size, windowMs: HOUR_MS } },
+  });
+  const send = (account: string, title: string) =>
+    post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf(title)), account, app);
+
+  const both = await Promise.all([send(alice, "duo"), send(bob, "duo")]);
+  expect(both.map((res) => res.status)).toEqual([200, 200]);
+  // Each had room for two briefs. The one that stored the bytes has room for one more and the
+  // other for two: three between them, where two would mean both had paid.
+  let more = 0;
+  for (const [account, titles] of [
+    [alice, ["al1", "al2"]],
+    [bob, ["bo1", "bo2"]],
+  ] as const) {
+    for (const title of titles) if ((await send(account, title)).status === 200) more += 1;
+  }
+  expect(more).toBe(3);
+});
+
+test("an_upload_that_is_refused_costs_nothing", async () => {
+  await seed();
+  const size = briefOf("one").length;
+  const app = appWith({
+    rateLimits: {
+      uploadBytes: { limit: size, windowMs: HOUR_MS },
+      blobBytesTotal: { limit: size, windowMs: HOUR_MS },
+    },
+  });
+  // Bytes stored as somebody's result before, which no route stores as a brief.
+  const taken = briefOf("tkn");
+  await putBlob(deps.db, {
+    kind: "result",
+    contentType: "application/json",
+    bytes: taken,
+    taskId: 1n,
+    uploader: alice,
+    isPublic: false,
+  });
+
+  // Carol is refused, over and over: a body that is no upload, a brief that is not canonical, bytes
+  // stored as another kind, a result for a task she has no entry on, content that is too large.
+  const refusals: Array<[unknown, number]> = [
+    [{ kind: "nonsense" }, 400],
+    [blobBody("brief", utf8(JSON.stringify(FIXTURE_BRIEF, null, 2))), 400],
+    [blobBody("brief", taken), 409],
+    [resultBody("an answer", "1"), 403],
+    [resultBody(new Uint8Array(LIMIT + 1), "1"), 413],
+  ];
+  for (const [body, status] of refusals) {
+    expect((await post("/v1/blobs", body, carol, app)).status).toBe(status);
+  }
+  // None of it was charged: her budget and the route's pool still have room for a brief.
+  expect((await post("/v1/blobs", blobBody("brief", briefOf("one")), carol, app)).status).toBe(200);
   expectRefused(
-    await post("/v1/heldout", heldoutBody(HELDOUT_BYTES), carol, app),
-    503,
-    UPLOADS_FULL,
+    await post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf("two")), carol, app),
+    429,
+    UPLOADED_TOO_MUCH,
     HOUR_MS,
   );
-  expect(await blobCount()).toBe(blobs);
 });
 
 test("an_upload_budget_lets_the_account_in_again_once_its_window_is_over", async () => {

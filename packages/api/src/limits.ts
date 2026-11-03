@@ -13,9 +13,11 @@ import type { ErrorBody } from "./format";
 // memory, which is enough because one services process runs per database (P03-R25). Past the
 // limit the answer is a 429 with `Retry-After`, the seconds until the caller's window ends.
 //
-// An upload is a row that stays for good, so the two upload routes are held to bytes as well
-// (`uploadBudget`): so many a day for each account, past which its uploads are 429s, and so many an
-// hour for the whole process, past which every upload is a 503 until the hour is over.
+// An upload is a row that stays for good, so the two upload routes are held to the bytes of the new
+// rows they store as well (`uploadBudget`): so many a day for each account, past which its uploads
+// are 429s, and so many an hour for all accounts together, one pool for held-out documents and one
+// for the rest, past which that route's uploads are 503s until the hour is over. The team's
+// accounts are held to none of these.
 //
 // A 503 that means the chain or the database cannot answer right now carries `Retry-After: 5`
 // too: what failed may well be back by then. A 503 that a setting causes, such as Telegram linking
@@ -53,12 +55,17 @@ export interface RateLimits {
   verify: RateLimit;
   /** `POST /v1/telegram/link`, per signed-in account. */
   telegramLink: RateLimit;
-  /** `POST /v1/blobs` and `POST /v1/heldout` together, per signed-in account. */
+  /** `POST /v1/blobs` and `POST /v1/heldout` together, per signed-in account: every request. */
   upload: RateLimit;
-  /** The bytes of content those two routes store, per signed-in account: `limit` counts bytes. */
+  /**
+   * The bytes of the new rows that those two routes store, per signed-in account: `limit` counts
+   * bytes. This and the two below hold every account but the team's.
+   */
   uploadBytes: RateLimit;
-  /** The bytes of content they store for all accounts together: `limit` counts bytes. */
-  uploadBytesTotal: RateLimit;
+  /** The bytes of the new rows `POST /v1/heldout` stores, for all accounts together. */
+  heldoutBytesTotal: RateLimit;
+  /** The bytes of the new rows `POST /v1/blobs` stores, for all accounts together. */
+  blobBytesTotal: RateLimit;
 }
 
 const HOUR_MS = 60 * 60_000;
@@ -69,8 +76,9 @@ export const DEFAULT_RATE_LIMITS: Readonly<RateLimits> = Object.freeze({
   verify: { limit: 30, windowMs: 60_000 },
   telegramLink: { limit: 10, windowMs: 10 * 60_000 },
   upload: { limit: 60, windowMs: HOUR_MS },
-  uploadBytes: { limit: 32 * MIB, windowMs: 24 * HOUR_MS },
-  uploadBytesTotal: { limit: 512 * MIB, windowMs: HOUR_MS },
+  uploadBytes: { limit: 8 * MIB, windowMs: 24 * HOUR_MS },
+  heldoutBytesTotal: { limit: 128 * MIB, windowMs: HOUR_MS },
+  blobBytesTotal: { limit: 256 * MIB, windowMs: HOUR_MS },
 });
 
 /** The limits in `over` where it has them, and the defaults for the rest. */
@@ -81,7 +89,8 @@ export function rateLimitsOf(over: Partial<RateLimits> | undefined): RateLimits 
     telegramLink: over?.telegramLink ?? DEFAULT_RATE_LIMITS.telegramLink,
     upload: over?.upload ?? DEFAULT_RATE_LIMITS.upload,
     uploadBytes: over?.uploadBytes ?? DEFAULT_RATE_LIMITS.uploadBytes,
-    uploadBytesTotal: over?.uploadBytesTotal ?? DEFAULT_RATE_LIMITS.uploadBytesTotal,
+    heldoutBytesTotal: over?.heldoutBytesTotal ?? DEFAULT_RATE_LIMITS.heldoutBytesTotal,
+    blobBytesTotal: over?.blobBytesTotal ?? DEFAULT_RATE_LIMITS.blobBytesTotal,
   };
 }
 
@@ -154,25 +163,46 @@ class ByteWindows {
     return window === undefined ? this.limit.windowMs : window.endsAt - now;
   }
 
-  /** Takes `bytes` from `key`'s window, which `wait` has said has room for them. */
-  spend(key: string, bytes: number, now: number): void {
-    const window = this.#windows.get(key);
+  /**
+   * Takes `bytes` from `key`'s window, which `wait` has said has room for them, and gives back the
+   * function that returns them to that window, once. Bytes returned after the window is over go
+   * nowhere: the next window begins empty whatever was taken from the last.
+   */
+  spend(key: string, bytes: number, now: number): () => void {
+    let window = this.#windows.get(key);
     if (window === undefined) {
-      this.#windows.set(key, { spent: bytes, endsAt: now + this.limit.windowMs });
-    } else {
-      window.spent += bytes;
+      window = { spent: 0, endsAt: now + this.limit.windowMs };
+      this.#windows.set(key, window);
     }
+    window.spent += bytes;
+    const taken = window;
+    let returned = false;
+    return () => {
+      if (returned) return;
+      returned = true;
+      taken.spent -= bytes;
+    };
   }
 }
+
+/** The two upload routes, which draw on pools of their own. */
+export type UploadRoute = "heldout" | "blobs";
 
 const UPLOADED_TOO_MUCH: ErrorBody = {
   error: "rate_limited",
   message: "this account has uploaded too many bytes, try again later",
 };
 
-const UPLOADS_FULL: ErrorBody = {
-  error: "unavailable",
-  message: "the API is taking no more uploads for now, try again later",
+/** What a route whose pool is used up answers. */
+const POOL_USED_UP: Record<UploadRoute, ErrorBody> = {
+  heldout: {
+    error: "unavailable",
+    message: "the API is taking no more held-out documents for now, try again later",
+  },
+  blobs: {
+    error: "unavailable",
+    message: "the API is taking no more uploads for now, try again later",
+  },
 };
 
 /** Stops the request with `status`, `body` and the `Retry-After` of `ms`. `app.onError` sends it. */
@@ -183,36 +213,48 @@ function refuseFor(status: 429 | 503, body: ErrorBody, ms: number): never {
   });
 }
 
-/** The one key of the process's own window. */
-const PROCESS = "process";
+/** The one key of a pool's own window. */
+const POOL = "pool";
 
 /**
- * The bytes of content the upload routes of one app may still store: `limits.uploadBytes` for each
- * signed-in account and `limits.uploadBytesTotal` for all of them together, both in this process's
- * memory, by the wall clock. `spend(account, bytes)` takes `bytes` from both before an upload is
- * stored, or stops the request: with a 429 (`rate_limited`) when the account has no room for them,
- * and else with a 503 (`unavailable`) when the process has none. Either carries the `Retry-After`
- * of the window that is full. Nothing is taken from either unless both have room, so an upload
- * that is refused for its bytes costs none.
+ * The bytes of new rows that the upload routes of one app may still store, in this process's
+ * memory and by the wall clock: `limits.uploadBytes` for each signed-in account, and for all
+ * accounts together `limits.heldoutBytesTotal` of held-out documents and `limits.blobBytesTotal` of
+ * the rest. The two pools are apart, so a flood of results or briefs cannot stop a held-out
+ * document, which a poster has to send within minutes of posting. The team's accounts
+ * (`teamAccounts`) are held to none of them.
  *
- * The team's accounts (`teamAccounts`) are held to no limit of an account. Their bytes count
- * towards the process's like any others: that limit is what keeps the database from filling, and
- * it holds whoever sends them.
+ * Only a new row costs anything: bytes that are stored already, and an upload that is refused,
+ * store none. `reserve(account, route, bytes)` is called once an upload is found good and its bytes
+ * are not stored yet. It takes them from the account's budget and from the route's pool, or stops
+ * the request: with a 429 (`rate_limited`) when the account has no room for them, and else with a
+ * 503 (`unavailable`) when the pool has none, each with the `Retry-After` of the window that is
+ * full. Nothing is taken unless both have room. It gives back the function that returns the bytes,
+ * for an upload that stores no row after all: another upload stored the same bytes meanwhile, or
+ * the store failed.
  */
 export function uploadBudget(limits: RateLimits, teamAccounts: readonly string[]) {
   const team = new Set(teamAccounts);
   const perAccount = new ByteWindows(limits.uploadBytes);
-  const total = new ByteWindows(limits.uploadBytesTotal);
+  const pools: Record<UploadRoute, ByteWindows> = {
+    heldout: new ByteWindows(limits.heldoutBytesTotal),
+    blobs: new ByteWindows(limits.blobBytesTotal),
+  };
   return {
-    spend(account: string, bytes: number): void {
+    reserve(account: string, route: UploadRoute, bytes: number): () => void {
+      if (team.has(account)) return () => {};
       const now = Date.now();
-      const exempt = team.has(account);
-      const accountWait = exempt ? 0 : perAccount.wait(account, bytes, now);
+      const pool = pools[route];
+      const accountWait = perAccount.wait(account, bytes, now);
       if (accountWait > 0) refuseFor(429, UPLOADED_TOO_MUCH, accountWait);
-      const totalWait = total.wait(PROCESS, bytes, now);
-      if (totalWait > 0) refuseFor(503, UPLOADS_FULL, totalWait);
-      if (!exempt) perAccount.spend(account, bytes, now);
-      total.spend(PROCESS, bytes, now);
+      const poolWait = pool.wait(POOL, bytes, now);
+      if (poolWait > 0) refuseFor(503, POOL_USED_UP[route], poolWait);
+      const returnToAccount = perAccount.spend(account, bytes, now);
+      const returnToPool = pool.spend(POOL, bytes, now);
+      return () => {
+        returnToAccount();
+        returnToPool();
+      };
     },
   };
 }

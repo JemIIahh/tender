@@ -12,6 +12,7 @@ import {
   getBlob,
   hasHeldoutUpload,
   hasResultUpload,
+  insertBlob,
   migrate,
   openDb,
   putBlob,
@@ -972,6 +973,27 @@ describe.each(targets)("db on $name", (target) => {
     await setBlobPublic(db, sha, false);
     expect((await getBlob(db, sha))?.isPublic).toBe(false);
     await expect(setBlobPublic(db, "0".repeat(64), true)).resolves.toBeUndefined();
+  });
+
+  it("insert_blob_says_whether_it_stored_a_row", async () => {
+    const blob = (text: string, kind: BlobKind = "brief") => ({
+      kind,
+      contentType: "application/json",
+      bytes: new TextEncoder().encode(text),
+      isPublic: true,
+    });
+    const first = await insertBlob(db, blob("insert me"));
+    const sha256 = createHash("sha256").update("insert me").digest("hex");
+    expect(first).toEqual({ sha256, created: true });
+    // Stored already, as the same kind or as another, is no new row.
+    expect(await insertBlob(db, blob("insert me"))).toEqual({ ...first, created: false });
+    expect(await insertBlob(db, blob("insert me", "result"))).toEqual({ ...first, created: false });
+
+    // Of calls that race with the same new bytes, exactly one stored them.
+    const racing = await Promise.all(
+      Array.from({ length: 5 }, () => insertBlob(db, blob("racing"))),
+    );
+    expect(racing.filter((put) => put.created)).toHaveLength(1);
   });
 
   it("blob_kind_checked", async () => {

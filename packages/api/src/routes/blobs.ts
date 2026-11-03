@@ -3,8 +3,8 @@ import {
   type Db,
   getBlob,
   hasResultUpload,
+  insertBlob,
   type NewBlob,
-  putBlob,
   recordHeldoutUpload,
   recordResultUpload,
   type StoredBlob,
@@ -39,7 +39,7 @@ import {
   notFound,
   readJson,
 } from "../format";
-import { rateLimit, rateLimitsOf, uploadBudget } from "../limits";
+import { rateLimit, rateLimitsOf, type UploadRoute, uploadBudget } from "../limits";
 import { getScorecard } from "../queries";
 
 type BlobApp = Hono<{ Variables: AuthVariables }>;
@@ -123,9 +123,10 @@ const HeldoutUploadSchema = z.strictObject({
  * result, which may be any bytes, could take the bytes of another kind first; a result that is the
  * canonical bytes of another kind of document is refused (`isDocumentOfAnotherKind`).
  *
- * Both upload routes are signed in, and share their limits (`rateLimits` in `deps`): `upload`
- * requests for each account, and the bytes `uploadBudget` allows, which the content is held to
- * once it is found good and before it is stored. The team's accounts have no limit of an account.
+ * Both upload routes are signed in and held to limits (`rateLimits` in `deps`): `upload` requests
+ * an account makes to either, every one of them counted, and the bytes of new rows that
+ * `uploadBudget` allows, which an upload is held to once it is found good and before its bytes are
+ * stored (`store`). Bytes stored already cost nothing. The team's accounts are held to neither.
  * `requireAuth` is the sign-in middleware, which the caller passes in.
  */
 export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
@@ -139,6 +140,9 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     (c) => team.has(c.var.account),
   );
   const budget = uploadBudget(limits, deps.teamAccounts);
+  /** What a new row of `bytes` that `account` sends by `route` is charged with. */
+  const charge = (account: string, route: UploadRoute, bytes: Uint8Array) => () =>
+    budget.reserve(account, route, bytes.length);
 
   // Refuses a body over `MAX_BODY_BYTES` as it arrives, before anything parses it. It comes after
   // sign-in on the routes, so a request that is not signed in is turned away without being read.
@@ -159,8 +163,7 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     const bytes = decodeContent(upload.content_base64);
     const blob = await blobOf(deps, upload, bytes, account);
 
-    budget.spend(account, bytes.length);
-    const { sha256, stored } = await store(deps.db, blob);
+    const { sha256, stored } = await store(deps.db, blob, charge(account, "blobs", bytes));
     if (stored.kind !== blob.kind) return fail(409, "conflict", CONFLICT);
     // Its first uploader may have stored it as private, which keeps the indexer from reading it.
     // The one uploading it now holds the bytes, so making it public gives nothing away.
@@ -191,14 +194,17 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     }
     checkDocument("the held-out document", bytes, HeldoutSchema);
 
-    budget.spend(account, bytes.length);
-    const { sha256, stored } = await store(deps.db, {
-      kind: "heldout",
-      contentType: "application/json",
-      bytes,
-      uploader: account,
-      isPublic: false,
-    });
+    const { sha256, stored } = await store(
+      deps.db,
+      {
+        kind: "heldout",
+        contentType: "application/json",
+        bytes,
+        uploader: account,
+        isPublic: false,
+      },
+      charge(account, "heldout", bytes),
+    );
     if (stored.kind !== "heldout") return fail(409, "conflict", CONFLICT);
     // The row keeps its first uploader, which anyone who has the bytes can be. The Judge takes a
     // task's held-out checks when its poster is among the accounts that sent them, so each one is
@@ -467,11 +473,30 @@ function requireOwnScorecard(deps: ApiDeps, scorecard: Scorecard, account: strin
 /**
  * Stores `blob` unless these bytes are stored already, and returns the row that holds them now.
  * The first upload wins and an existing row is never changed, so the row is not necessarily
- * `blob`: the caller compares. Reading it back after the put, not before, also settles two
- * uploads of the same bytes that race.
+ * `blob`: the caller compares. Reading it back after the put also settles two uploads of the same
+ * bytes that race.
+ *
+ * Only a new row costs anything. Bytes that are stored already, as any kind, are not charged, so a
+ * poster may send its documents again whatever its budget says, and a 409 that the stored row
+ * brings costs nothing. Bytes that are not are charged before they are put (`charge`, which may
+ * refuse them), and given back when the put stored no row after all: another upload stored them in
+ * the meantime, or the put failed.
  */
-async function store(db: Db, blob: NewBlob): Promise<{ sha256: string; stored: StoredBlob }> {
-  const sha256 = await putBlob(db, blob);
+async function store(
+  db: Db,
+  blob: NewBlob,
+  charge: () => () => void,
+): Promise<{ sha256: string; stored: StoredBlob }> {
+  const sha256 = sha256Hex(blob.bytes);
+  if ((await getBlob(db, sha256)) === null) {
+    const giveBack = charge();
+    let created = false;
+    try {
+      created = (await insertBlob(db, blob)).created;
+    } finally {
+      if (!created) giveBack();
+    }
+  }
   const stored = await getBlob(db, sha256);
   if (stored === null) throw new Error("a blob that was just stored is not there");
   return { sha256, stored };
