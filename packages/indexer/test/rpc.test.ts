@@ -1,15 +1,16 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { TenderError } from "@tender/client";
 import { extractEvents, parseEventLog } from "@tender/shared";
 import { NotSyncedYetError, UnknownChunkError } from "near-api-js/rpc-errors";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { BlocksLostError, createRpcSource, type IndexedBlock } from "../src/index";
 import { eventLine } from "./fixtures/blocks";
 
 // `createRpcSource` against a fake node that speaks JSON-RPC over HTTP, for what a sandbox does not
 // produce: a height with no block, a block the node has lost, a chunk from an earlier block, a
-// receipt listed twice, an answer from before a transaction is final, and the errors that must not
-// be skipped. rpc.sandbox.test.ts runs the source on a real nearcore.
+// receipt listed twice, an answer from before a transaction is final, a node that never answers,
+// and the errors that must not be skipped. rpc.sandbox.test.ts runs the source on a real nearcore.
 
 const EMPTY_TX_ROOT = "11111111111111111111111111111111";
 const FAILURE = { Failure: { ActionError: { index: 0, kind: "boom" } } };
@@ -515,4 +516,72 @@ test("stops_between_the_transactions_of_a_block_when_aborted", async () => {
   release();
   expect(await next).toEqual({ done: true, value: undefined });
   expect(txsAsked(calls)).toEqual(["a"]);
+});
+
+test("a_node_that_takes_a_read_and_never_answers_ends_the_source_with_E_TIMEOUT", async () => {
+  // Not `serve`: this node is no chain. It takes a request and leaves it without an answer.
+  const hits: Array<{ method: string; closed: boolean }> = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (part) => {
+      body += part;
+    });
+    req.on("end", () => {
+      const hit = { method: JSON.parse(body).method as string, closed: false };
+      res.on("close", () => {
+        hit.closed = true;
+      });
+      hits.push(hit);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  closers.push(
+    () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      }),
+  );
+  const rpcUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+  const source = createRpcSource({ rpcUrl, rpcTimeoutMs: 300 });
+  const started = performance.now();
+  const error = await source
+    .blocks(1n, AbortSignal.timeout(10_000))
+    [Symbol.asyncIterator]()
+    .next()
+    .then(
+      () => undefined,
+      (failed: unknown) => failed,
+    );
+
+  // The source ends with the read's own error, once the time is out and not before, and it names
+  // the read, not the node.
+  expect(performance.now() - started).toBeGreaterThanOrEqual(250);
+  expect(error).toBeInstanceOf(TenderError);
+  expect(error).toMatchObject({ code: "E_TIMEOUT" });
+  const message = (error as Error).message;
+  expect(message).toBe("RPC block source viewBlock timed out after 300 ms");
+  expect(message).not.toContain("127.0.0.1");
+
+  // The request was cancelled, its connection with it, and the source asked for nothing else.
+  await vi.waitFor(() => expect(hits[0]?.closed).toBe(true));
+  expect(hits.map((hit) => hit.method)).toEqual(["block"]);
+});
+
+test("rejects_a_read_time_that_is_not_a_whole_number_of_milliseconds", () => {
+  const rpcUrl = "http://127.0.0.1:1";
+  const bad = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648];
+  for (const rpcTimeoutMs of bad) {
+    expect(() => createRpcSource({ rpcUrl, rpcTimeoutMs }), String(rpcTimeoutMs)).toThrow(
+      RangeError,
+    );
+  }
+  expect(() => createRpcSource({ rpcUrl, rpcTimeoutMs: 0 })).toThrow(
+    "createRpcSource: rpcTimeoutMs must be a whole number of milliseconds from 1 to 2147483647, not 0",
+  );
+  // The ends of the range, and no time given, are taken.
+  for (const rpcTimeoutMs of [1, 30_000, 2_147_483_647, undefined]) {
+    expect(() => createRpcSource({ rpcUrl, rpcTimeoutMs }), String(rpcTimeoutMs)).not.toThrow();
+  }
 });

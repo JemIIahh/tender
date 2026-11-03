@@ -15,20 +15,24 @@ import {
   type TaskWorkers,
   TOO_SLOW_TO_COMPILE,
 } from "./isolate";
+import { type RubricCriteria, rubricProblem, rubricTaskProblem } from "./kinds/rubric";
 import { ScorerUnavailableError } from "./score";
 import { clampReason } from "./scorecard";
 import type { JudgeDeps, JudgeMemory } from "./types";
 
-/** The criteria the Judge can score in P0: `exact`, `json_schema` and `regex_cases`. */
+/**
+ * The criteria the Judge scores in a score worker: `exact`, `json_schema` and `regex_cases`. A
+ * `rubric` needs the network, so it is graded on the Judge's own thread (see `kinds/rubric.ts`).
+ */
 export type P0Criteria = Extract<PublicCriteria, { kind: "exact" | "json_schema" | "regex_cases" }>;
 
 /** A task's criteria and held-out checks, read and checked: what its entries are judged by. */
 export interface TaskDocuments {
-  criteria: P0Criteria;
+  criteria: P0Criteria | RubricCriteria;
   /**
    * The held-out document exactly as `JSON.parse` read it from its bytes, or `null` for a task
-   * without one. `HeldoutSchema` only checked it: zod's copy of a document can lose keys, and this
-   * is the document that is scored with and published.
+   * without one (a `rubric` has none). `HeldoutSchema` only checked it: zod's copy of a document
+   * can lose keys, and this is the document that is scored with and published.
    */
   heldout: Heldout | null;
 }
@@ -110,6 +114,10 @@ const LONE_SURROGATE = /\p{Cs}/u;
 const CRITERIA_INVALID = "criteria not found or invalid";
 const CRITERIA_TOO_LARGE = "criteria too large";
 const HAS_HELDOUT_MISMATCH = "has_heldout does not match the task's held-out commitment";
+const RUBRIC_TEAM_ONLY = "kind rubric is limited to team tasks in v1";
+const RUBRIC_HAS_NO_HELDOUT = "kind rubric has no held-out checks";
+const TESTS_TEAM_ONLY = "kind tests is limited to team tasks in v1";
+const TESTS_NOT_AVAILABLE = "kind tests is not available yet";
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
 const REFERENCE_NOT_ALLOWED =
   'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry (move the schema it points to into $defs)';
@@ -146,8 +154,19 @@ const CHECK_FAILED = "criteria could not be checked";
  *   over 262_144 bytes: `criteria too large`. Bytes of another kind or visibility under the hash,
  *   such as someone's private result, are not read, so nothing of them reaches a reason;
  * - `rubric` or `tests` from a poster outside `teamAccounts`: `kind {k} is limited to team tasks
- *   in v1` (C16); from the team: `kind {k} is not available yet`, as P0 has no scorer for either;
- * - `has_heldout` that does not match whether the task has a `heldout_commitment`;
+ *   in v1` (C16); `tests` from the team: `kind tests is not available yet`, as there is no scorer
+ *   for it. A `rubric` from the team is accepted when it passes the rules below, and judging
+ *   grades it with the model it is given (`JudgeDeps.llm`);
+ * - `has_heldout` that does not match whether the task has a `heldout_commitment`; `rubric` with
+ *   `has_heldout` set, as it has no held-out part: `kind rubric has no held-out checks`;
+ * - a `rubric` that a model cannot grade (`rubricProblem`): more than 20 criteria, or one that is
+ *   blank, longer than 200 characters or holds an angle bracket, or two that read the same once
+ *   normalised. Each has a reason of its own, and judging checks them again;
+ * - a `rubric` task that the Judge cannot grade before agents spend effort on it (C16, see
+ *   `rubricTaskProblem`), checked after the rules above and at intake only: the Judge has no model
+ *   (`no model is configured to grade rubric tasks`), its `max_entries` is not from 1 to 50 (`kind
+ *   rubric needs max_entries between 1 and 50`), or its brief cannot be read (`the task's brief
+ *   could not be read`);
  * - `exact` or `json_schema` without held-out checks: `held-out checks required for kind {k}`;
  * - a `json_schema` schema with an `$id` below its root, a root `$id` with a fragment, or a
  *   reference other than `#` and one to an entry of its `$defs` or `definitions` (see
@@ -179,9 +198,11 @@ export async function intakeTask(
   deps: JudgeDeps,
   taskId: bigint,
 ): Promise<"accepted" | "pending" | "rejected"> {
-  const [task] = await deps.db.query<TaskTerms & { judge_status: string | null }>(
+  const [task] = await deps.db.query<
+    TaskTerms & { brief_hash: string; max_entries: number; judge_status: string | null }
+  >(
     `select id::text as id, poster, criteria_hash, heldout_commitment,
-            created_at::text as created_at, judge_status
+            created_at::text as created_at, brief_hash, max_entries, judge_status
        from tasks where id = $1 and verifier = $2`,
     [taskId, deps.judgeAccount],
   );
@@ -190,13 +211,19 @@ export async function intakeTask(
   if (task.judge_status === "rejected" || task.judge_status === "failed_closed") return "rejected";
 
   const nowNs = BigInt((deps.now ?? (() => new Date()))().getTime()) * NS_PER_MS;
-  const checked = await loadDocuments(deps.db, task, {
+  let checked = await loadDocuments(deps.db, task, {
     teamAccounts: deps.teamAccounts,
     nowNs,
     waitForHeldout: true,
     compileBudgetMs: deps.scoringLimits?.compileBudgetMs,
     checks: deps.memory?.checks,
   });
+  // What a rubric task needs of the Judge and of the task itself, besides its criteria, is asked at
+  // intake alone: judging finds each again where it needs it, with a `WARN`.
+  if (checked.ok && checked.documents.criteria.kind === "rubric") {
+    const problem = await rubricTaskProblem(deps, task);
+    if (problem !== null) checked = rejected(problem);
+  }
   const [status, reason] = checked.ok
     ? (["accepted", null] as const)
     : [checked.status, checked.reason];
@@ -283,15 +310,21 @@ async function checkDocuments(
   if (!parsed.success) return rejected(CRITERIA_INVALID);
   const criteria = parsed.data;
 
-  if (criteria.kind === "rubric" || criteria.kind === "tests") {
-    return rejected(
-      policy.teamAccounts.includes(task.poster)
-        ? `kind ${criteria.kind} is not available yet`
-        : `kind ${criteria.kind} is limited to team tasks in v1`,
-    );
-  }
+  const team = policy.teamAccounts.includes(task.poster);
+  if (criteria.kind === "rubric" && !team) return rejected(RUBRIC_TEAM_ONLY);
+  if (criteria.kind === "tests") return rejected(team ? TESTS_NOT_AVAILABLE : TESTS_TEAM_ONLY);
   if (criteria.has_heldout !== (task.heldout_commitment !== null)) {
     return rejected(HAS_HELDOUT_MISMATCH);
+  }
+  // A rubric is graded by a model against its public weights: there is no held-out part, and no
+  // criteria check that needs a worker. What the model has to echo back must be something it can
+  // (`rubricProblem`), which is the criteria check of this kind, run again at judging (P05-R12).
+  // Whether the Judge has a model, and the task's own limits, are intake's to ask (`intakeTask`).
+  if (criteria.kind === "rubric") {
+    if (criteria.has_heldout) return rejected(RUBRIC_HAS_NO_HELDOUT);
+    const problem = rubricProblem(criteria);
+    if (problem !== null) return criteriaRefused(problem);
+    return { ok: true, documents: { criteria, heldout: null } };
   }
   if (criteria.kind !== "regex_cases" && !criteria.has_heldout) {
     return rejected(`held-out checks required for kind ${criteria.kind}`);

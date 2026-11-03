@@ -3,6 +3,7 @@ import { type EntryView, phaseOfTaskView, sha256Hex, type TaskView } from "@tend
 import { FETCH_TIMEOUT_MS, fetchEntryContent, ownBlobHash } from "./fetch";
 import { loadDocuments, type TaskDocuments } from "./intake";
 import { COMPILE_BUDGET_MS, openTaskScorer, type TaskScorer, TaskWorkers } from "./isolate";
+import { prepareRubric, RubricFailedClosedError } from "./kinds/rubric";
 import { chooseWinners, rankEntries, type ScoredEntry } from "./rank";
 import { ScorerUnavailableError } from "./score";
 import { buildScorecard, clampReason } from "./scorecard";
@@ -58,6 +59,11 @@ const NO_TIME_TO_PICK = "not judged: the pick could not land before the pick dea
  * entry was scored.
  */
 const NOTHING_SCORED = "not judged: scoring was unavailable before any entry was scored";
+/**
+ * The `judge_reason` of a rubric task that the Judge did not get to grade every entry of before the
+ * stop line: grading only some of the entries would be unfair, so it is not picked.
+ */
+const NOT_ALL_GRADED = "not judged: not every entry could be graded before the pick deadline";
 
 /** An entry that has revealed its content's hash and where the content is. */
 type RevealedEntry = EntryView & { content_hash: string; uri: string };
@@ -84,7 +90,9 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   scores used the time, the task is picked from what was found out. Or the pick could no longer
  *   land before the pick deadline (P05-R15): nothing is published, and it is the same. So it is
  *   when a worker could not compile the criteria again, after one had (see `failed_closed`),
- *   before any entry was scored.
+ *   before any entry was scored. So it is for a `rubric` task with an entry left ungraded at the
+ *   stop line: it is never picked from the entries that were graded, which would be unfair to the
+ *   rest (`not judged: not every entry could be graded before the pick deadline`).
  * - `yielded`: nothing was settled. The task's slice of the tick ran out with entries still to
  *   judge (P05-R18, P05-R19). It takes up again on its next turn from what it found out, which the
  *   Judge keeps (`JudgeMemory`) until the task is settled.
@@ -103,11 +111,18 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   (`yielded`). In its last stretch, the entries left have no score (`scoring unavailable`), with
  *   one `WARN`, and the task is picked from those scored. Or the criteria or held-out checks that
  *   the chain names cannot be read or used (they passed intake, so they are gone or changed), and
- *   its status becomes `failed_closed` with the reason.
+ *   its status becomes `failed_closed` with the reason. A `rubric` task fails closed too, for its
+ *   own reasons (see `kinds/rubric.ts`): the Judge has no model to grade it with
+ *   (`deps.llm`), it has more revealed entries than the Judge grades, its brief cannot be read, or
+ *   something in grading is not as asked: a request fails, the reply is not the JSON asked for, a
+ *   criterion is left out, repeated or made up, or an entry addresses the grader. Its status
+ *   becomes `failed_closed` with the reason and one `WARN`, nothing is published, and the poster's
+ *   fallback window applies.
  *
- * The task is read from the chain first, every time, so a `pick` that landed before a crash shows
- * as an outcome and nothing is done again. It must be in `judging` both by `deps.now` and by the
- * final block the chain answered from, which is after every reveal that can land.
+ * The task is read from the chain first, every time, so a `pick` that landed before a crash, or
+ * whose answer never came (`E_TIMEOUT`, after which it may have landed all the same), shows as an
+ * outcome and nothing is done again. It must be in `judging` both by `deps.now` and by the final
+ * block the chain answered from, which is after every reveal that can land.
  *
  * Each revealed entry's content is fetched (`fetchEntryContent`) and must hash to the entry's
  * `content_hash`; one of our own blob URIs counts only when `deps.resultUploaded` says the entrant
@@ -118,11 +133,14 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  * each: an entry whose scoring times out, runs out of memory or crashes the worker scores 0 with
  * the reason why, and the other entries are scored as usual. Each worker is one `deps.warm`
  * loaded ahead, when the Judge keeps one, so that loading it costs judging no time; the criteria
- * check takes one too, and hands it on to the scorer (`TaskWorkers`). In what order
- * the entries are fetched and scored, how long one tick spends on them, and which are left
- * unscored so that the pick lands before the pick deadline, is `judgeEntries`'s; a task with no
- * entries is picked as before, and one with some scored is picked from those. Then the entries
- * are ranked, the winners chosen, and the scorecard built from exactly the winners `pick` is sent.
+ * check takes one too, and hands it on to the scorer (`TaskWorkers`). A `rubric` task has no
+ * worker: a model grades its entries on this thread, an entry at a time (`prepareRubric`), and
+ * everything else here holds for it as for the others; its scorecard names the model
+ * (`judge.model`). In what order the entries are fetched and scored, how long one tick spends on
+ * them, and which are left unscored so that the pick lands before the pick deadline, is
+ * `judgeEntries`'s; a task with no entries is picked as before, and one with some scored is
+ * picked from those. Then the entries are ranked, the winners chosen, and the scorecard built
+ * from exactly the winners `pick` is sent.
  * The scorecard is stored as a public blob, the held-out checks are made public, and `pick` is
  * called with the scorecard's hash and URI, in that order, so that the pick never points at
  * something that cannot be read. A retry stores the same scorecard again unless the clock moved:
@@ -162,6 +180,8 @@ export async function judgeTask(
   const workers = new TaskWorkers(deps.warm);
   let documents: TaskDocuments;
   let judged: Judged;
+  // The model that graded a rubric task, for its scorecard; `null` for the kinds with none.
+  let model: string | null = null;
   try {
     const loaded = await loadDocuments(deps.db, task, {
       teamAccounts: deps.teamAccounts,
@@ -186,21 +206,41 @@ export async function judgeTask(
       progress = { results: new Map(), scored: 0, compiled: false };
       deps.memory?.progress.set(task.id, progress);
     }
-    const scorer = openTaskScorer(documents, {
-      entryTimeoutMs: deps.scoringLimits?.entryTimeoutMs,
-      // The worker compiles the criteria under the budget of the check just run (P05-R17).
-      compileBudgetMs,
-      workers,
-      compiled: progress.compiled,
-      onCrash: (error) => {
-        console.warn(
-          `judge: WARN task ${taskId}: scoring an entry failed (${describeError(error)})`,
-        );
-      },
-    });
+    let scorer: TaskScorer;
+    const kindCriteria = documents.criteria;
+    if (kindCriteria.kind === "rubric") {
+      // A rubric needs the network, so it is graded on this thread and not in a worker. It fails
+      // closed before any request when it cannot be graded at all.
+      const rubric = await prepareRubric(deps, task, kindCriteria, revealed.length);
+      if ("failedClosed" in rubric) {
+        return forget(deps, taskId, await failClosed(deps, taskId, rubric.failedClosed));
+      }
+      scorer = rubric.scorer;
+      model = rubric.model;
+    } else {
+      scorer = openTaskScorer(
+        { criteria: kindCriteria, heldout: documents.heldout },
+        {
+          entryTimeoutMs: deps.scoringLimits?.entryTimeoutMs,
+          // The worker compiles the criteria under the budget of the check just run (P05-R17).
+          compileBudgetMs,
+          workers,
+          compiled: progress.compiled,
+          onCrash: (error) => {
+            console.warn(
+              `judge: WARN task ${taskId}: scoring an entry failed (${describeError(error)})`,
+            );
+          },
+        },
+      );
+    }
     try {
       judged = await judgeEntries(deps, task, revealed, scorer, nowNs, progress);
     } catch (error) {
+      // Something in grading a rubric task was not as asked: it is never picked (spec 7.3).
+      if (error instanceof RubricFailedClosedError) {
+        return forget(deps, taskId, await failClosed(deps, taskId, error.reason));
+      }
       if (!(error instanceof ScorerUnavailableError)) throw error;
       return retryLater(taskId, `a scorer could not be run (${describeError(error)})`);
     } finally {
@@ -234,6 +274,12 @@ export async function judgeTask(
   if (judged.late && judged.scored === 0 && judged.unscored > 0) {
     return notJudged(deps, taskId, TOO_LATE, "judging started too late to score any entry");
   }
+  // A rubric is graded by comparing a model's judgement of every entry, so a task with entries
+  // left ungraded is not picked from the rest, as the others are: that would pick among some of
+  // the entries only. The poster's fallback window applies.
+  if (criteria.kind === "rubric" && judged.unscored > 0) {
+    return notJudged(deps, taskId, NOT_ALL_GRADED, "not every entry could be graded in time");
+  }
   // A worker could not compile the criteria again, in the task's last stretch: the machine's load,
   // not the criteria's fault. The entries left have no score, and the task is picked from those
   // scored, if any were.
@@ -258,7 +304,7 @@ export async function judgeTask(
       heldout,
       ranked,
       winners,
-      model: null,
+      model,
       now: clock(),
     });
   } catch (error) {
@@ -365,12 +411,16 @@ interface Judged {
  * after turn until it is done, and pays a compile of the criteria for each. Contents fetched in
  * the turn and not yet scored are let go, as `progress` keeps no bytes, and are fetched again on
  * its next turn. A fetch or a score under way goes on, within its own limit and the stop line, so
- * a slice can run over by one of them: a score (5 s), a round of fetches (10 s), or a worker's
- * compile of the criteria (the judging budget). A turn finds out one result at least, whatever
- * its slice, so that a task always gets on, and it is not cut short within two slices of the stop
- * line: the last stretch before the line is one turn, which the tasks behind it wait for (see
- * `judgeTick` for what that costs them). Without a `JudgeMemory` there is nothing to take up
- * from, and a task is judged in one turn.
+ * a slice can run over by one of them: a score (5 s), a round of fetches (10 s), a worker's
+ * compile of the criteria (the judging budget), or a rubric's request to the model (60 s, and the
+ * retry after a failure another 60 s or more). So a turn of a rubric task can hold the Judge for
+ * two or three minutes, and push the tasks behind it past their stop lines. That is safe: a task
+ * is picked from what it found out in time, if a pick can still land before its pick deadline (a
+ * rubric task only when it graded every entry), and is left to its fallback window if not. A turn
+ * finds out one result at least, whatever its slice, so that a task always gets on, and it is not
+ * cut short within two slices of the stop line: the last stretch before the line is one turn,
+ * which the tasks behind it wait for (see `judgeTick` for what that costs them). Without a
+ * `JudgeMemory` there is nothing to take up from, and a task is judged in one turn.
  *
  * It throws what `resultUploaded` and the database throw, and `ScorerUnavailableError`.
  */
@@ -660,6 +710,22 @@ async function refuse(
     );
   }
   return "failed_closed";
+}
+
+/**
+ * Records that task `taskId` fails closed: `failed_closed`, with `reason` (the words of the Judge's
+ * own, with nothing in them that a model or an entry wrote), and one `WARN`. It is never judged
+ * again and never picked, and its fallback window applies. Only a rubric task does this for what a
+ * model did or did not do.
+ */
+async function failClosed(
+  deps: JudgeDeps,
+  taskId: bigint,
+  reason: string,
+): Promise<"failed_closed"> {
+  const clamped = clampReason(reason);
+  console.warn(`judge: WARN task ${taskId}: failed closed, ${clamped}; it is never picked`);
+  return refuse(deps, taskId, "failed_closed", clamped);
 }
 
 /** The earlier commit first; in the same block, the smaller account, as `rankEntries` has it. */

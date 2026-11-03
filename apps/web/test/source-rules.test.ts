@@ -181,3 +181,25 @@ test("the_app_never_writes_to_local_storage_and_the_token_module_never_logs", ()
     expect(read(file), file).not.toMatch(/\bconsole\./);
   }
 });
+
+// ---- The tabs of a browser hear each other through one line (06-T3) ----------------------------
+
+test("the_page_store_has_the_line_to_the_other_tabs_and_nothing_else_opens_a_channel", () => {
+  // A store has no line to the other tabs unless it is given one, and the page's store is. A second
+  // store built anywhere else would be a tab the others can't reach, so only lib/wallet.ts builds
+  // one.
+  expect(read("lib/wallet.ts")).toMatch(
+    /export const walletStore: WalletStore = createWalletStore\(createProvider, linkTabs\);/,
+  );
+  const sourcesWith = (pattern: RegExp) =>
+    appSources()
+      .filter((file) => pattern.test(readFileSync(file, "utf8")))
+      .map((file) => relative(WEB, file));
+  expect(sourcesWith(/\bcreateWalletStore\(/)).toEqual(["lib/wallet.ts"]);
+
+  // The channel is opened in one module, which logs nothing; and what near-connect keeps in
+  // `localStorage` is its own, which this app does not read or listen to.
+  expect(sourcesWith(/\bBroadcastChannel\b/)).toEqual(["lib/walletTabs.ts"]);
+  expect(read("lib/walletTabs.ts")).not.toMatch(/\bconsole\./);
+  expect(sourcesWith(/selected-wallet/)).toEqual([]);
+});

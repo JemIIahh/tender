@@ -9,7 +9,7 @@ import {
   toConnectorAction,
 } from "@tender/shared";
 import { useEffect, useMemo, useSyncExternalStore } from "react";
-import { sessionBegan, sessionEnded } from "./apiToken";
+import { clearApiToken, sessionBegan, sessionEnded } from "./apiToken";
 import { config } from "./config";
 import {
   TransactionFailed,
@@ -19,6 +19,7 @@ import {
   WalletResultUnreadable,
   WalletUnavailable,
 } from "./walletErrors";
+import { linkTabs, noTabs, type OpenTabLink, type TabLink } from "./walletTabs";
 
 // The wallet, as the pages use it. One store holds the connected account for the whole page: every
 // component that calls `useWallet` sees the same one, and a wallet connects once. What sits behind
@@ -120,7 +121,8 @@ export type UseWallet = WalletState & WalletActions;
 /**
  * How long a page waits for the wallet from an earlier visit before it shows the person a Connect
  * button. near-connect loads its wallet list from the network first and has no limit of its own.
- * A wallet that turns up later is still taken.
+ * A wallet that turns up later is still taken, and keeps the token the tab held if it is the same
+ * account.
  */
 const RESTORE_PATIENCE_MS = 8000;
 
@@ -254,13 +256,22 @@ const SERVER_STATE: WalletState = { ready: false, accountId: null, canSignMessag
 /**
  * A wallet store over the provider that `makeProvider` makes the first time one is needed. The
  * page uses the one at the end of this file; a test builds its own over a provider of its own.
+ *
+ * `openTabs` is the store's line to the other tabs of the browser (lib/walletTabs.ts), opened when
+ * the store starts. A wallet session is the browser's and a token is the tab's, so a session that
+ * ends or changes in one tab ends in the others: each drops its token, and none asks the wallet.
+ * The page's store has the line; a store has none unless it is given one.
  */
-export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
+export function createWalletStore(
+  makeProvider: () => Promise<WalletProvider>,
+  openTabs: OpenTabLink = noTabs,
+) {
   let state: WalletState = SERVER_STATE;
   let session: Session | null = null;
   let provider: Promise<WalletProvider> | null = null;
   let starting: Promise<void> | null = null;
   let connecting: Promise<void> | null = null;
+  let tabs: TabLink | null = null;
   const listeners = new Set<() => void>();
 
   function publish(next: Partial<WalletState>): void {
@@ -276,19 +287,45 @@ export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
     for (const listener of [...listeners]) listener();
   }
 
+  /** The line to the other tabs, opened the first time it is wanted. */
+  function link(): TabLink {
+    tabs ??= openTabs(endedElsewhere);
+    return tabs;
+  }
+
   /**
    * Takes `next` as the wallet session. The API token belongs to the session (lib/apiToken.ts), so
-   * it is dropped here, where the session ends, and not by whatever page is on screen. `restored`:
-   * the wallet of an earlier visit, taken up again, which keeps the token of the same account.
+   * it is dropped here, where the session changes, and not by whatever page is on screen.
+   * `restored`: the wallet of an earlier visit, taken up again, which keeps the token of the same
+   * account and is no news to the other tabs. A wallet the person connected replaces the session
+   * they have, so they are told.
    */
-  function setSession(next: Session | null, restored = false): void {
+  function beginSession(next: Session, restored: boolean): void {
     session = next;
-    if (next === null) sessionEnded();
-    else sessionBegan(next.accountId, restored);
-    publish({
-      accountId: next?.accountId ?? null,
-      canSignMessage: next !== null && canSign(next.wallet),
-    });
+    sessionBegan(next.accountId, restored);
+    publish({ accountId: next.accountId, canSignMessage: canSign(next.wallet) });
+    if (!restored) link().tell();
+  }
+
+  /**
+   * The wallet session is over, or there is none to go on with, and the token goes with it. `tell`:
+   * the session ended here (a Disconnect, the wallet signing itself out), so the other tabs are
+   * told. They are not told of one that another tab ended, which told them all, nor of a wallet
+   * that was not found or could not be looked for: that says nothing of their sessions.
+   */
+  function endSession(tell: boolean): void {
+    session = null;
+    sessionEnded();
+    publish({ accountId: null, canSignMessage: false });
+    if (tell) link().tell();
+  }
+
+  /**
+   * Another tab said its wallet session ended or changed, so this tab's session is not the wallet's
+   * any more. It goes, and the wallet is not asked: that tab did.
+   */
+  function endedElsewhere(): void {
+    endSession(false);
   }
 
   function getProvider(): Promise<WalletProvider> {
@@ -297,7 +334,7 @@ export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
         // One listener for each provider, here where it is made: a provider that failed to load at
         // first and loads on a later try has to be heard for a sign-out just the same.
         made.subscribe((next) => {
-          if (next === null) setSession(null);
+          if (next === null) endSession(true);
         });
         return made;
       })
@@ -311,23 +348,41 @@ export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
 
   function start(): Promise<void> {
     starting ??= (async () => {
+      // Hearing the other tabs begins before the wallet is looked for.
+      link();
       try {
         const wallets = await getProvider();
+        // A token kept from the earlier visit is dropped only when the wallet is known not to
+        // come back: it looked and found none, or could not look. A restore that is still on its
+        // way when the page stops waiting leaves the token. It is not served without an account, a
+        // Connect drops it, and a wallet that does turn up keeps it for the same account only.
         const restoring = wallets
           .restore()
-          .then((restored) => {
-            // A wallet connected in the meantime stays.
-            if (session === null && restored !== null) setSession(restored, true);
-          })
+          .then(
+            (restored) => {
+              // A wallet connected in the meantime stays.
+              if (session !== null) return;
+              if (restored !== null) beginSession(restored, true);
+              // No wallet: this tab has no session to go on with. The other tabs are not told.
+              // near-connect also says "no wallet" when its wallet list did not download, and a
+              // guess is no reason to sign them out. A session ends for them when it is
+              // disconnected, when the wallet signs itself out, or when a Connect replaces it.
+              else endSession(false);
+            },
+            (error: unknown) => {
+              console.error(error);
+              // Not looked at: the same for this tab, and the other tabs are left alone.
+              if (session === null) endSession(false);
+            },
+          )
           .catch((error: unknown) => console.error(error));
         await settleWithin(restoring, RESTORE_PATIENCE_MS);
       } catch (error) {
         // A build with no wallet to offer, or a wallet library that did not load: the page shows
         // the Connect button, and pressing it says why.
         console.error(error);
+        if (session === null) endSession(false);
       } finally {
-        // No wallet session to go on with: a token kept from the earlier visit has none to belong to.
-        if (session === null) sessionEnded();
         publish({ ready: true });
       }
     })();
@@ -340,7 +395,7 @@ export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
         await start();
         if (session !== null) return;
         const next = await (await getProvider()).connect();
-        if (next !== null) setSession(next);
+        if (next !== null) beginSession(next, false);
       } finally {
         connecting = null;
       }
@@ -351,8 +406,12 @@ export function createWalletStore(makeProvider: () => Promise<WalletProvider>) {
   async function disconnect(): Promise<void> {
     const current = session;
     if (current === null) return;
+    // Tender's token goes first, whatever the wallet does: one that can't sign out still leaves
+    // this tab without it, and turns away a sign-in that is under way.
+    clearApiToken();
     await (await getProvider()).disconnect(current);
-    if (session === current) setSession(null);
+    // A wallet that reports its sign-out has ended the session by now, through the listener.
+    if (session === current) endSession(true);
   }
 
   async function signAndSend(calls: readonly TenderCall[]): Promise<SendResult> {
@@ -505,7 +564,7 @@ async function createProvider(): Promise<WalletProvider> {
 }
 
 /** The wallet of this page. */
-export const walletStore: WalletStore = createWalletStore(createProvider);
+export const walletStore: WalletStore = createWalletStore(createProvider, linkTabs);
 
 /**
  * The wallet of `store`, for a client component. It starts looking for the wallet from an earlier

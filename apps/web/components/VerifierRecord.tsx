@@ -1,6 +1,27 @@
 import { TeamBadge } from "./TeamBadge";
 
 /**
+ * The two figures the contract keeps for a verifier: how many times it has picked, and how many
+ * times it voided a task after entries were revealed. The agent directory shows them as they are.
+ */
+export function VerifierFigures({
+  picks_made,
+  voids_after_reveals,
+}: {
+  picks_made: number;
+  voids_after_reveals: number;
+}) {
+  return (
+    <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
+      <dt>Picks made</dt>
+      <dd data-testid="picks-made">{picks_made}</dd>
+      <dt>Voids after reveals</dt>
+      <dd data-testid="voids-after-reveals">{voids_after_reveals}</dd>
+    </dl>
+  );
+}
+
+/**
  * Who judges a task, and what the contract has on them: how many times they have picked, and how
  * many times they voided a task after entries were revealed (entrants had done the work by then).
  * Both come from the verifier's agent profile, so a verifier that never registered has none, and
@@ -44,12 +65,7 @@ export function VerifierRecord({
       ) : picks_made === null || voids_after_reveals === null ? (
         <p className="text-sm">No record: this account is not a registered agent.</p>
       ) : (
-        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-          <dt>Picks made</dt>
-          <dd data-testid="picks-made">{picks_made}</dd>
-          <dt>Voids after reveals</dt>
-          <dd data-testid="voids-after-reveals">{voids_after_reveals}</dd>
-        </dl>
+        <VerifierFigures picks_made={picks_made} voids_after_reveals={voids_after_reveals} />
       )}
     </section>
   );

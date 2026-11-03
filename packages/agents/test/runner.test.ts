@@ -1650,12 +1650,16 @@ test("a_resend_refused_with_E_PHASE_for_a_commit_that_never_landed_ends_with_the
 });
 
 test("a_commit_that_fails_for_now_is_sent_again_on_a_later_tick", async () => {
-  // A node that is down, a balance that someone can top up, a failure the client cannot name: none
-  // of them is known to repeat.
+  // A node that is down, a balance that someone can top up, a failure the client cannot name, a
+  // node that did not answer in time: none of them is known to repeat.
   const failures: Array<[unknown, string]> = [
     [new Error("fetch failed"), "Error"],
     [new TenderError("E_STORAGE", "E_STORAGE: not registered"), "TenderError E_STORAGE"],
     [new TenderError("E_UNKNOWN", "a failure the client cannot name"), "TenderError E_UNKNOWN"],
+    [
+      new TenderError("E_TIMEOUT", "TenderClient.send commit timed out after 120000 ms"),
+      "TenderError E_TIMEOUT",
+    ],
   ];
   for (const [failure, shown] of failures) {
     const h = await harness();
@@ -1679,6 +1683,34 @@ test("a_commit_that_fails_for_now_is_sent_again_on_a_later_tick", async () => {
     await h.tick();
     expect(h.commit, shown).toHaveBeenCalledTimes(2);
   }
+});
+
+test("a_commit_that_timed_out_after_it_landed_is_found_on_chain_and_not_sent_again", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  // The client gave up on the node's answer, and the node had the transaction: the entry is on the
+  // chain, and the call failed with `E_TIMEOUT` all the same.
+  h.commit.mockImplementationOnce(async (taskId, commitment) => {
+    h.entries.set(String(taskId), entryView(taskId, commitment));
+    throw new TenderError("E_TIMEOUT", "TenderClient.send commit timed out after 120000 ms");
+  });
+
+  // Not a verdict: the draft lives, and the line says what happened by the error's code alone.
+  await h.tick();
+  expect(h.logs).toEqual(["ERROR alice: commit to task 7 failed (TenderError E_TIMEOUT)"]);
+  expect((await h.state.getDraft("7"))?.committedAt).toBeUndefined();
+
+  // The next tick asks the chain before it sends anything, and finds the entry. A second commit
+  // would only replace it, and the draft is marked.
+  await h.tick();
+  expect(h.getEntry).toHaveBeenCalledWith(7n, ACCOUNT);
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.logs.at(-1)).toBe("alice: the commit to task 7 was on chain already");
+  expect((await h.state.getDraft("7"))?.committedAt).toEqual(expect.stringMatching(ISO));
+
+  task.phase = "revealing";
+  await h.tick();
+  expect(h.reveal).toHaveBeenCalledTimes(1);
 });
 
 test("a_commit_that_keeps_failing_is_sent_again_five_times_and_then_only_looked_for", async () => {
@@ -2113,6 +2145,31 @@ test("a_step_that_fails_is_retried_from_the_top", async () => {
   await h.tick();
   expect(h.reveal).toHaveBeenCalledTimes(2);
   expect((await h.state.getDraft("7"))?.revealedUri).toBeDefined();
+});
+
+test("a_reveal_that_times_out_is_tried_again_and_the_contract_says_if_it_landed", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  await h.tick();
+  task.phase = "revealing";
+
+  // The client gave up on the node's answer, and the reveal had landed all the same: the contract
+  // tells the next try so, and the draft is marked.
+  h.reveal.mockRejectedValueOnce(
+    new TenderError("E_TIMEOUT", "TenderClient.send reveal timed out after 120000 ms"),
+  );
+  h.reveal.mockRejectedValueOnce(
+    new TenderError("E_REVEALED", `E_REVEALED: ${ACCOUNT} has already revealed in task 7`),
+  );
+  await h.tick();
+  expect(h.logs).toContain("ERROR alice: reveal of task 7 failed (TenderError E_TIMEOUT)");
+  expect((await h.state.getDraft("7"))?.revealedUri).toBeUndefined();
+
+  await h.tick();
+  const uri = `https://api.test/v1/blobs/${sha256Hex(ANSWER)}`;
+  expect(h.reveal).toHaveBeenCalledTimes(2);
+  expect((await h.state.getDraft("7"))?.revealedUri).toBe(uri);
+  expect(h.logs).toContain(`alice: revealed task 7 (it had been revealed already) uri=${uri}`);
 });
 
 test("a_reveal_that_was_done_already_marks_the_draft", async () => {

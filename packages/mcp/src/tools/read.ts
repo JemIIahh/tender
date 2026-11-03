@@ -293,10 +293,14 @@ export function registerReadTools(server: McpServer, deps: McpDeps): void {
       description:
         "Your balance in Tender's vault for each token the contract lists, your storage balance " +
         "(null if you have never made a storage deposit), and key_kind, which says what this " +
-        "server's key may do. full_access may use every tool. function_call can start, commit, " +
-        "reveal, pick and register, but cannot attach a deposit, so deposit, withdraw and post_task " +
-        "refuse, and so does a commit that first needs a storage top-up. unknown is treated as " +
-        "function_call. Amounts are raw, in the smallest unit, as the write tools take them; the " +
+        "server's key may do. full_access may use every tool. function_call is a key limited to " +
+        "the Tender contract: it may call only the methods it lists (one that lists none may call " +
+        "any), and the usual agent key lists commit and reveal, so it can start_task, " +
+        "commit_result and reveal_result, while pick_winners and register_agent refuse with " +
+        "KEY_CANNOT_CALL. It cannot attach a deposit either, so deposit, withdraw and post_task " +
+        "refuse, and so does a commit that first needs a storage top-up. unknown means the key " +
+        "is not on the account or is limited to another contract: it can call nothing on Tender. " +
+        "Amounts are raw, in the smallest unit, as the write tools take them; the " +
         "fields ending _formatted show them in words.",
       annotations: READ_ONLY,
     },

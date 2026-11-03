@@ -53,8 +53,15 @@ export interface McpDeps {
   contractId: string;
   /** The account the server acts as. */
   accountId: string;
-  /** What the server's key may do; see `detectKeyKind`. */
+  /** What the server's key may do; see `detectKeyAccess`. */
   keyKind: KeyKind;
+  /**
+   * The methods of the contract that a `function_call` key lists (`detectKeyAccess`). Left out or
+   * empty means that it lists none, and a key that lists none may call any, as on the chain. The
+   * write tools check the key against the method they are about to call, before they upload or
+   * send anything (`keyMayCall`).
+   */
+  keyMethods?: readonly string[];
   /** The token the tools use when a call names none. */
   defaultToken: string;
   /** The account that `verifier: "judge"` means. */

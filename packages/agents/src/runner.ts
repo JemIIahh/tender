@@ -107,9 +107,10 @@ const CODE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
  * frees up). And the client's own `E_ARGS`, for arguments the contract cannot read.
  *
  * `E_STORAGE` is not among them, as a top-up makes it come right. Neither is a failure with no
- * code (a node that is down, a timeout) or one the client could not name (`E_UNKNOWN`): none of
- * these is known to repeat, and the commit is tried again until its window ends, or until
- * `MAX_RESENDS` resends have failed.
+ * code (a node that is down), one the client could not name (`E_UNKNOWN`) or one it gave up on
+ * (`E_TIMEOUT`: the node did not answer in time, and the commit may have landed): none of these is
+ * known to repeat, and the commit is tried again until its window ends, or until `MAX_RESENDS`
+ * resends have failed.
  *
  * `E_PHASE` counts only for a commit that is sent for the first time (`refusedForGood`). A resend
  * can meet it with the earlier send in a block that is not final yet, so that it says nothing of
@@ -598,9 +599,10 @@ async function commit(run: Run, id: string, content: Uint8Array): Promise<void> 
  * the send repeats one that did not end well, for the log. Returns whether the commit went through.
  *
  * A failure that a second try would meet again (`REFUSED_FOR_GOOD`) makes the draft dead. Any
- * other is logged and left for a later tick: a transaction that failed to finish does not say
- * whether it reached the chain, and sending the draft's commitment again is harmless, as a commit
- * by an account that has an entry only replaces the entry's commitment, here with the same one.
+ * other is logged and left for a later tick: a transaction that failed to finish, or that timed
+ * out (`E_TIMEOUT`), does not say whether it reached the chain (the next tick asks the chain,
+ * `recoverCommit`), and sending the draft's commitment again is harmless, as a commit by an
+ * account that has an entry only replaces the entry's commitment, here with the same one.
  * `E_PHASE` is that kind of failure for a resend too (review N1): the commit window has ended
  * since the send before, and that send may have landed just inside it. The next tick looks.
  */

@@ -1,5 +1,6 @@
 export * from "./api";
 export * from "./client";
+export * from "./deadline";
 export * from "./errors";
 export * from "./local";
 export * from "./nep413";

@@ -117,9 +117,9 @@ export async function createChallenge(deps: ApiDeps): Promise<ChallengeResponse>
 // ---- Asking the chain -------------------------------------------------------------------------
 
 /**
- * How long the chain has to say whether a key is on an account, in milliseconds. The RPC client
- * retries a node that does not answer for minutes, and nobody should wait that long to be told to
- * come back later.
+ * How long the chain has to say whether a key is on an account, in milliseconds. The client gives
+ * a read of the node `rpcTimeoutMs` (30 s unless it is set) before it fails with `E_TIMEOUT`, and
+ * nobody signing in should wait that long to be told to come back later.
  */
 const KEY_LOOKUP_DEADLINE_MS = 5_000;
 
