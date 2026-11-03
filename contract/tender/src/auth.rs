@@ -21,7 +21,17 @@
 //! (`assert_one_yocto`), which no function-call key can attach, so a delegate key can neither move
 //! money out nor raise its own caps. And `pick` refuses a call signed by a delegate key of the
 //! verifier or poster (`signed_by_delegate`), whatever methods the access key allows, so the key
-//! cannot award an escrow either; the account picks with any other key.
+//! cannot award an escrow either; the account picks with any other key. That refusal needs to see
+//! the key that signed, which the runtime shows only for a transaction the caller signs itself: in
+//! a NEP-366 meta-transaction the signer and its key are the relayer's. So `pick` first refuses
+//! any call whose signer is not the caller (independent review H1), and only then asks
+//! `signed_by_delegate`.
+//!
+//! The signer is read in two places only, `authorize_spend` and `pick`, both through
+//! `direct_signing_key`, and both require signer == predecessor before they trust the key. Every
+//! other method authorises the predecessor alone, and none of them lets a key do more than its
+//! account could: the methods that move money out or change caps need 1 yoctoNEAR, which no
+//! function-call key can attach, relayed or not.
 //!
 //! `spent` is written before the debit and the rest of the spending method. Every panic after it
 //! (`E_FUNDS`, `E_STORAGE`) fails the receipt, and NEAR rolls back all of a failed receipt's state
@@ -218,7 +228,8 @@ impl Tender {
 
     /// Whether this call was signed by one of `account`'s delegate keys and came straight from
     /// `account`: the lookup `authorize_spend` makes. `pick` refuses such a call, because a key
-    /// that may spend within caps must not also decide where an escrow goes.
+    /// that may spend within caps must not also decide where an escrow goes. It answers `false`
+    /// for a call that did not come straight from `account`, so `pick` refuses those first.
     pub(crate) fn signed_by_delegate(&self, account: &AccountId) -> bool {
         direct_signing_key(account).is_some_and(|key| self.delegates.contains_key(&key))
     }
