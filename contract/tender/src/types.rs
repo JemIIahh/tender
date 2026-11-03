@@ -264,6 +264,18 @@ pub struct DelegateCaps {
     pub spent: u128,
 }
 
+/// A delegate key's caps, as `get_delegate` returns them: the only token it may spend, the most
+/// it may spend on one task (`per_task_cap`) and in all (`total_cap`), and what it has spent so
+/// far. The amounts are decimal strings.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegateView {
+    pub token: AccountId,
+    pub per_task_cap: U128,
+    pub total_cap: U128,
+    pub spent: U128,
+}
+
 /// One allowlisted token, as shown by `get_config`.
 #[near(serializers = [json])]
 pub struct TokenConfigView {

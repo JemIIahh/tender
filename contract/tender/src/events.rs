@@ -2,7 +2,7 @@
 
 use near_sdk::json_types::{U128, U64};
 use near_sdk::serde::Serialize;
-use near_sdk::{env, serde_json, AccountId};
+use near_sdk::{env, serde_json, AccountId, PublicKey};
 
 use crate::types::{PayoutView, TaskView, VoidReason};
 
@@ -161,6 +161,28 @@ pub(crate) struct TaskToppedUp {
     pub funder: AccountId,
     pub amount: U128,
     pub reward: U128,
+}
+
+/// Data of `delegate_added`: `account` registered `public_key` (NEAR's text form, such as
+/// `ed25519:<base58>`) as a delegate key that may spend its vault in `token`, at most
+/// `per_task_cap` per task and `total_cap` in all (decimal strings). It replaces any caps the key
+/// had.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct DelegateAdded {
+    pub account: AccountId,
+    pub public_key: PublicKey,
+    pub token: AccountId,
+    pub per_task_cap: U128,
+    pub total_cap: U128,
+}
+
+/// Data of `delegate_removed`: `account` took back the caps of its delegate key `public_key`.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct DelegateRemoved {
+    pub account: AccountId,
+    pub public_key: PublicKey,
 }
 
 /// Data of `committed`: `account` entered task `task_id` with `commitment` (`replaced: false`), or

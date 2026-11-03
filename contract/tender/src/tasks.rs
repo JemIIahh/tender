@@ -200,7 +200,8 @@ impl Task {
 #[near]
 impl Tender {
     /// Posts a task, moving `reward` of `token` from the caller's vault into its escrow, and
-    /// returns its id. Called as `{"task": {...}}` with exactly 1 yoctoNEAR attached.
+    /// returns its id. Called as `{"task": {...}}` with exactly 1 yoctoNEAR attached, or with none
+    /// by a delegate key within its caps (`add_delegate`; see the `auth` module).
     ///
     /// The rules, checked in this order, each with its error code:
     /// - posting is not paused (`E_PAUSED`);
@@ -217,7 +218,8 @@ impl Tender {
     /// - a `parent`, if any, is a task the poster can hire for (`E_PARENT`; see `check_parent`):
     ///   it exists and is not settled, the poster has an entry on it, and this task's pick
     ///   window ends no later than the parent's commit window;
-    /// - the spend is authorised: 1 yoctoNEAR attached (`E_AUTH`);
+    /// - the spend is authorised: 1 yoctoNEAR attached, or no deposit from a delegate key whose
+    ///   token is `token`, with `reward` within its caps, which then count it (`E_AUTH`);
     /// - the caller's vault holds `reward` (`E_FUNDS`).
     ///
     /// The caller is the predecessor, never the signer. It is the poster, the only funder, and
@@ -317,8 +319,8 @@ impl Tender {
     }
 
     /// Moves `amount` of task `task_id`'s token from the caller's vault into the task's escrow,
-    /// which makes the caller one of its funders: a pooled bounty. Called with exactly 1
-    /// yoctoNEAR attached, as `post_task` is.
+    /// which makes the caller one of its funders: a pooled bounty. Called as `post_task` is: with
+    /// exactly 1 yoctoNEAR attached, or with none by a delegate key within its caps.
     ///
     /// The rules, checked in this order, each with its error code:
     /// - top-ups are not paused (`E_PAUSED`);
@@ -332,7 +334,8 @@ impl Tender {
     /// - the task's token is still enabled (`E_TOKEN`);
     /// - `amount` is more than 0, and the reward it makes is at most the token's `max_reward` as
     ///   it is now, and at most `MAX_REWARD_LIMIT` (`E_REWARD`);
-    /// - the spend is authorised: 1 yoctoNEAR attached (`E_AUTH`);
+    /// - the spend is authorised: 1 yoctoNEAR attached, or no deposit from a delegate key whose
+    ///   token is the task's, with `amount` within its caps, which then count it (`E_AUTH`);
     /// - the caller's vault holds `amount` (`E_FUNDS`).
     ///
     /// The caller is the predecessor, never the signer. If it funds the task already, the poster
