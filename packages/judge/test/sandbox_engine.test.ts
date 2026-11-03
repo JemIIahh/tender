@@ -68,7 +68,7 @@ test("a_failed_load_is_tried_again", async () => {
   const { runInSandbox, loads } = await freshSandbox();
   loads.mockRejectedValueOnce(new Error("the WebAssembly file is missing"));
 
-  // This is the one case that rejects: no code ran, and nothing about it is the code's fault.
+  // This is one of the two cases that reject: no code ran, and nothing about it is the code's fault.
   await expect(runInSandbox("1 + 1", LIMITS)).rejects.toThrow("the WebAssembly file is missing");
   expect(await runInSandbox("1 + 1", LIMITS)).toEqual({ ok: true, value: 2 });
   expect(loads).toHaveBeenCalledTimes(2);
@@ -127,7 +127,7 @@ test("a_runtime_that_cannot_start_replaces_the_engine", async () => {
   };
   loads.mockResolvedValueOnce(engine);
 
-  // No code ran, so this is the host's trouble and the one other case that rejects. The engine is
+  // No code ran, so this is the host's trouble and the other case that rejects. The engine is
   // in no state to be asked again, though.
   await expect(runInSandbox("1 + 1", LIMITS)).rejects.toThrow("memory access out of bounds");
   expect(await runInSandbox("1 + 1", LIMITS)).toEqual({ ok: true, value: 2 });

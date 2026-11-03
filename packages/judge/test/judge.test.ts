@@ -19,6 +19,7 @@ import {
   fetchEntryContent,
   intakeTask,
   type JudgeChain,
+  type JudgeDeps,
   judgeTask,
   judgeTick,
   newJudgeMemory,
@@ -784,7 +785,7 @@ test("judge_waits_while_a_task_sharing_its_heldout_checks_takes_reveals", async 
   // pick window: task 7 waits. Nothing is fetched, stored, published or scored.
   const { view, chain, commitment } = await postJudged([["alice.test.near", "42", 10n]]);
   await postSharing(view, "9", NOW_NS + 4n * MINUTE_NS);
-  // A stranger's task with the same commitment does not hold it up: it can never publish them.
+  // A stranger's task with the same commitment does not hold it up (P05-R7).
   await postSharing(view, "11", NOW_NS + 4n * MINUTE_NS, { poster: "stranger.test.near" });
   const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
@@ -2520,6 +2521,87 @@ test("judge_tick_takes_no_task_after_its_signal_aborts", async () => {
   expect(pick.mock.calls.map(([taskId, winners]) => [taskId, winners])).toEqual([
     [7n, [{ account: "alice.test.near", bps: 10_000 }]],
   ]);
+});
+
+test("intake_stops_at_its_budget_and_the_next_tick_takes_up_with_the_task_after_it", async () => {
+  // I5: a burst of new tasks must not hold up the judging pass. Every clock read moves the clock
+  // on by 2 s, a task's intake costs one read of its own, and the budget is 5 s: each tick takes
+  // in two tasks, then goes on to judging, and the next tick starts at once with the third.
+  const criteriaHash = await putCriteria(db, EXACT);
+  for (const id of ["1", "2", "3", "4", "5"]) {
+    const checks = await putHeldout(db, { exact: { expected: ["42", `task ${id}`] } });
+    await insertTask(db, taskView({ id, criteria_hash: criteriaHash, heldout_commitment: checks }));
+  }
+  let reads = 0;
+  const memory = newJudgeMemory();
+  const deps = judgeDeps(db, fakeChain(null), {
+    now: () => new Date(NOW.getTime() + 2_000 * reads++),
+    memory,
+    scoringLimits: { intakeBudgetMs: 5_000 },
+  });
+  const decided = async () =>
+    (
+      await db.query<{ id: string }>(
+        "select id::text as id from tasks where judge_status is not null order by id",
+      )
+    ).map(({ id }) => id);
+
+  expect(await judgeTick(deps)).toBe(true);
+  expect(await decided()).toEqual(["1", "2"]);
+  expect(memory.intakeFrom).toBe("3");
+
+  expect(await judgeTick(deps)).toBe(true);
+  expect(await decided()).toEqual(["1", "2", "3", "4"]);
+  expect(memory.intakeFrom).toBe("5");
+
+  // The last task is reached and the pass is whole: nothing waits, and the tick does not ask to
+  // start again at once.
+  expect(await judgeTick(deps)).toBe(false);
+  expect(await decided()).toEqual(["1", "2", "3", "4", "5"]);
+  expect(memory.intakeFrom).toBeNull();
+});
+
+test("an_intake_that_is_slow_every_time_does_not_keep_the_tasks_behind_it_from_being_taken_in", async () => {
+  // Task 1 fails every tick, as a check whose worker cannot start does, and spends the budget. It
+  // is tried again only after the tasks behind it have had their turn.
+  const criteriaHash = await putCriteria(db, EXACT);
+  for (const id of ["1", "2", "3"]) {
+    const checks = await putHeldout(db, { exact: { expected: ["42", `task ${id}`] } });
+    await insertTask(db, taskView({ id, criteria_hash: criteriaHash, heldout_commitment: checks }));
+  }
+  // The database fails for task 1 alone, as it does for a task whose intake cannot go on.
+  const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let reads = 0;
+  const base = judgeDeps(db, fakeChain(null), {
+    now: () => new Date(NOW.getTime() + 6_000 * reads++),
+    memory: newJudgeMemory(),
+    scoringLimits: { intakeBudgetMs: 5_000 },
+  });
+  const unreadable: Db = {
+    ...db,
+    query: async (sql, params) => {
+      if (sql.includes("from tasks where id = $1") && params?.[0] === 1n) {
+        throw new Error("database unavailable");
+      }
+      return db.query(sql, params);
+    },
+  };
+  const failing: JudgeDeps = { ...base, db: unreadable };
+
+  expect(await judgeTick(failing)).toBe(true);
+  expect(error).toHaveBeenCalledWith(expect.stringMatching(/^judge: intake of task 1 failed/));
+  expect(base.memory?.intakeFrom).toBe("2");
+  expect(await judgeRow(db, 2)).toEqual({ judge_status: null, judge_reason: null });
+
+  expect(await judgeTick(failing)).toBe(true);
+  expect(await judgeRow(db, 2)).toEqual({ judge_status: "accepted", judge_reason: null });
+  expect(base.memory?.intakeFrom).toBe("3");
+  expect(await judgeRow(db, 3)).toEqual({ judge_status: null, judge_reason: null });
+
+  expect(await judgeTick(failing)).toBe(true);
+  expect(await judgeRow(db, 3)).toEqual({ judge_status: "accepted", judge_reason: null });
+  // Round to task 1 again.
+  expect(base.memory?.intakeFrom).toBe("1");
 });
 
 /** A time `seconds` from NOW, as the chain gives a deadline. */

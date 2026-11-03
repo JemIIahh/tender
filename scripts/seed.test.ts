@@ -274,7 +274,7 @@ interface ApiOptions {
   /** The tasks `getTask` does not know, though they are listed. */
   vanished?: ReadonlySet<bigint>;
   /** What the API says it serves, in place of the testnet and the contract of the tests. */
-  serves?: Partial<Pick<HealthResponse, "network" | "contract">>;
+  serves?: Partial<Pick<HealthResponse, "network" | "contract" | "lag_blocks">>;
   /** `health` fails with this, as an API does that cannot read the chain. */
   unhealthy?: Error;
 }
@@ -763,7 +763,7 @@ test("a_token_that_has_no_answer_says_so_and_names_the_seed", async () => {
   // The sandbox has no USDC.
   const usdc = await run(
     { alpha: { task: taskWith({ token: "usdc" }) } },
-    { network: "sandbox", tokenId: undefined, dir: none },
+    { network: "sandbox", chain: { network: "sandbox" }, tokenId: undefined, dir: none },
   );
   expect((usdc.failure as Error).message).toBe(
     'alpha pays in "usdc", and there is none on sandbox: pass tokenId',
@@ -1407,11 +1407,6 @@ test("an_api_of_another_deployment_is_refused_with_both_named_before_anything_el
       options: { chain: { contractId: elsewhere } },
       message: `the API serves ${CONTRACT} on testnet, but the client is set for ${elsewhere} on testnet`,
     },
-    {
-      what: "the client is set for another network",
-      options: { chain: { network: "sandbox" as const } },
-      message: `the API serves ${CONTRACT} on testnet, but the client is set for ${CONTRACT} on sandbox`,
-    },
   ];
 
   for (const { what, options, message } of cases) {
@@ -1424,6 +1419,34 @@ test("an_api_of_another_deployment_is_refused_with_both_named_before_anything_el
     expect(trace, what).toEqual(["health"]);
     expect(lines, what).toEqual([]);
   }
+});
+
+test("a_client_set_for_another_network_than_the_seeds_is_refused_before_anything_is_asked", async () => {
+  // The token is chosen by the seeds' network and the API is checked against the client's: review
+  // M4's nit. They are one network, or nothing is read or asked.
+  const { failure, trace, lines } = await run({ alpha: {} }, { chain: { network: "sandbox" } });
+
+  expect((failure as Error).message).toBe(
+    "the seeds are for testnet, but the client is set for sandbox: they have to be the same network",
+  );
+  expect(trace).toEqual(UNTOUCHED);
+  expect(lines).toEqual([]);
+});
+
+test("an_index_more_than_10_blocks_behind_stops_the_run_before_anything_else_is_asked", async () => {
+  // Review M4. A stalled index misses the poster's latest tasks, so a seed that an earlier run
+  // posted would be posted again, and the Judge would turn the copy away. Ten blocks are let by.
+  const behind = await run({ alpha: {} }, { api: { serves: { lag_blocks: "11" } } });
+
+  expect((behind.failure as Error).message).toBe(
+    "the API's index is 11 blocks behind the chain, and its list of the poster's tasks may miss the latest ones, which would post a seed again: wait until it is at most 10 behind",
+  );
+  expect(behind.trace).toEqual(["health"]);
+  expect(behind.lines).toEqual([]);
+
+  const edge = await run({ alpha: {} }, { api: { serves: { lag_blocks: "10" } } });
+  expect(edge.failure).toBeUndefined();
+  expect(edge.trace).toContain("postTask");
 });
 
 test("an_api_that_cannot_say_which_deployment_it_is_stops_the_run", async () => {

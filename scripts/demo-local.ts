@@ -118,12 +118,13 @@ const BANNER = "Scripted demo agents run by the Tender team (offline solvers)";
  * sandbox takes none shorter than 5. The agents look every half second and a transaction takes two
  * or three, so 30 s lets both enter even on a slow machine, and the reveal window is wide enough
  * for an upload and a transaction. The Judge judges a task as soon as its reveal window is over: it
- * holds back only for another task of the same poster that shares the held-out checks and still
- * takes reveals (P05-R8), and the demo posts one task. Scoring a regex takes it a second or two,
- * and the pick window is wide so that a slow machine, whose scoring worker starts cold, has room
- * to spare before the Judge's stop line (a tenth of the window, from 3 s to 30 s, before the pick
- * deadline). A wide pick window costs the demo no time, since it ends at the pick. The fallback
- * window is the poster's, and the demo never gets there.
+ * holds back only for another task of the same poster that shares the held-out checks and
+ * whose reveals close by the middle of the pick window (P05-R8), and the demo posts one task.
+ * Scoring a regex takes it a second or two, and the pick window is wide so that a slow machine,
+ * whose scoring worker starts cold, has room to spare before the Judge's stop line (a tenth of
+ * the window, from 3 s to 30 s, before the pick deadline). A wide pick window costs the demo no
+ * time, since it ends at the pick. The fallback window is the poster's, and the demo never gets
+ * there.
  */
 const WINDOWS: SeedWindows = {
   commit_secs: 30,
@@ -762,13 +763,10 @@ async function demo(h: Harness): Promise<void> {
     throw new DemoError(`task ${taskId} was picked by ${outcome.by} and not by the Judge`);
   }
 
-  // The ranking is the scorecard's own: score descending, then the earlier commit, then the account.
-  const ranked = [...scorecard.entries].sort(
-    (a, b) =>
-      b.score - a.score ||
-      Number(BigInt(a.committed_at_block) - BigInt(b.committed_at_block)) ||
-      a.account.localeCompare(b.account),
-  );
+  // The scorecard lists its entries as ranked (`rankEntries`: score descending, then the earlier
+  // commit, then the account by UTF-16 code units), so its own order is the ranking. Sorting again
+  // here, with `localeCompare` for the tie-break, could disagree with it.
+  const ranked = scorecard.entries;
   const [winner, ...otherWinners] = outcome.winners;
   const winnerEntry = ranked.find((entry) => entry.account === winner?.account);
   const runnerUp = ranked.find((entry) => entry.account !== winner?.account);

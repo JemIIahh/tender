@@ -95,6 +95,9 @@ const TESTS = {
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
 const REFERENCE_NOT_ALLOWED =
   'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry (move the schema it points to into $defs)';
+// A pointer that is already to a $defs entry, where the entry is the problem (the #14 hint).
+const REFERENCE_TARGET_UNUSABLE =
+  'criteria schema is not supported: a reference points to a $defs or definitions entry that is not there, is not a schema, or has a "%" in its name';
 const DYNAMIC_REFERENCE =
   "criteria schema is not supported: $dynamicRef and $recursiveRef are not supported, use $ref";
 const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at the root";
@@ -102,7 +105,11 @@ const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at 
 const SECRET = "secret-part-of-someone-elses-private-answer";
 const HAS_HELDOUT_MISMATCH = "has_heldout does not match the task's held-out commitment";
 const NO_MODEL = "no model is configured to grade rubric tasks";
-const ENTRIES_NEEDED = "kind rubric needs max_entries between 1 and 50";
+const ENTRIES_NEEDED =
+  "kind rubric needs max_entries 0 for an open task, or 1 to 50 for an invite-only one";
+const MIN_SCORE_NEEDED = "kind rubric needs a min_score of at least 1";
+/** The accounts an invite-only task names. */
+const INVITED = ["alice.test.near", "bob.test.near"];
 const BRIEF_UNREADABLE = "the task's brief could not be read";
 const TOO_MANY_CRITERIA = "kind rubric has more than 20 criteria";
 const CRITERION_TOO_LONG = "kind rubric has a criterion of more than 200 characters";
@@ -191,8 +198,8 @@ const numbered = (n: number): string[] => Array.from({ length: n }, (_, i) => `c
 
 /**
  * A rubric task from the team that intake can take, given a Judge with a model (`LLM`): `criteria`
- * (the rubric above unless given), a brief that is stored, and room for 10 entries. `over` changes
- * the task.
+ * (the rubric above unless given), a brief that is stored, and no list of invited accounts and no
+ * cap on entries, which is the open task the post wizard posts (P05-R21). `over` changes the task.
  */
 async function rubricTask(
   criteria: object = RUBRIC,
@@ -202,7 +209,8 @@ async function rubricTask(
     poster: TEAM_POSTER,
     criteria_hash: await putCriteria(db, criteria),
     brief_hash: await putRaw(db, "brief", canonicalJson(BRIEF), TEAM_POSTER),
-    max_entries: 10,
+    max_entries: 0,
+    invited: [],
     ...over,
   };
 }
@@ -405,24 +413,46 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
       deps: { llm: { ...LLM, baseUrl: "ftp://models.example/v1" } },
       view: () => rubricTask(),
     },
+    // The entry terms (`rubricEntriesProblem`, P05-R21). An open task has no cap: the contract
+    // allows none (C24), and the Judge grades its first 50 entries. An invite-only task has a cap
+    // of 1 to 50.
     {
-      // `max_entries` 0 sets no limit, so honest entrants alone could pass 50 and sink the task.
-      rule: "rubric with max_entries 0",
+      rule: "open rubric task with a cap on entries",
       reason: ENTRIES_NEEDED,
       deps: { llm: LLM },
-      view: () => rubricTask(RUBRIC, { max_entries: 0 }),
+      view: () => rubricTask(RUBRIC, { max_entries: 10 }),
     },
     {
-      rule: "rubric with max_entries 51",
+      rule: "invite-only rubric task with max_entries 0",
       reason: ENTRIES_NEEDED,
       deps: { llm: LLM },
-      view: () => rubricTask(RUBRIC, { max_entries: 51 }),
+      view: () => rubricTask(RUBRIC, { max_entries: 0, invited: INVITED }),
     },
     {
-      rule: "rubric with max_entries far above the limit",
+      rule: "invite-only rubric task with max_entries 51",
       reason: ENTRIES_NEEDED,
       deps: { llm: LLM },
-      view: () => rubricTask(RUBRIC, { max_entries: 2_000_000_000 }),
+      view: () => rubricTask(RUBRIC, { max_entries: 51, invited: INVITED }),
+    },
+    {
+      rule: "invite-only rubric task with max_entries far above the limit",
+      reason: ENTRIES_NEEDED,
+      deps: { llm: LLM },
+      view: () => rubricTask(RUBRIC, { max_entries: 2_000_000_000, invited: INVITED }),
+    },
+    {
+      // P05-R20: a disqualified entry scores 0, and a pass mark of 0 would pass it.
+      rule: "rubric with a min_score of 0",
+      reason: MIN_SCORE_NEEDED,
+      deps: { llm: LLM },
+      view: () => rubricTask({ ...RUBRIC, min_score: 0 }),
+    },
+    {
+      // The criteria are asked first, then the pass mark.
+      rule: "rubric with a blank criterion and a min_score of 0",
+      reason: CRITERION_BLANK,
+      deps: { llm: LLM },
+      view: () => rubricTask({ ...rubricOf(" "), min_score: 0 }),
     },
     {
       rule: "rubric whose brief is not stored",
@@ -557,24 +587,24 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
     },
     {
       rule: "a $defs entry that is an array",
-      reason: REFERENCE_NOT_ALLOWED,
+      reason: REFERENCE_TARGET_UNUSABLE,
       view: () => jsonSchemaTask(db, { $defs: { x: [{ type: "string" }] }, $ref: "#/$defs/x" }),
     },
     {
       rule: "a $defs entry that is a number",
-      reason: REFERENCE_NOT_ALLOWED,
+      reason: REFERENCE_TARGET_UNUSABLE,
       view: () => jsonSchemaTask(db, { $defs: { x: 5 }, $ref: "#/$defs/x" }),
     },
     {
       rule: "a $ref to a $defs entry that is not there",
-      reason: REFERENCE_NOT_ALLOWED,
+      reason: REFERENCE_TARGET_UNUSABLE,
       view: () => jsonSchemaTask(db, { $defs: { y: { type: "string" } }, $ref: "#/$defs/x" }),
     },
     {
       // A percent-escape is refused, not decoded, so that the name read here is the one Ajv reads:
       // Ajv would look up `a`, not the `%61` that is defined.
       rule: "a $defs name that is percent-encoded",
-      reason: REFERENCE_NOT_ALLOWED,
+      reason: REFERENCE_TARGET_UNUSABLE,
       view: () => jsonSchemaTask(db, { $defs: { "%61": { type: "string" } }, $ref: "#/$defs/%61" }),
     },
     {
@@ -818,7 +848,9 @@ test("intake_rejects_a_schema_that_does_not_compile_with_a_short_reason", {
   // Ajv names the meta-schema it cannot find, and a poster can make that as long as the
   // criteria. The reason keeps the first 199 code points and an ellipsis.
   const metaSchema = `https://t.example/${"x".repeat(10_000)}`;
-  expect(await intake(2, await jsonSchemaTask(db, { $schema: metaSchema }))).toBe("rejected");
+  // Its own held-out checks: a task whose checks are used already is turned away for that first.
+  const own = { json_schema: { assertions: [{ path: "$.other", equals: 2 }] } };
+  expect(await intake(2, await jsonSchemaTask(db, { $schema: metaSchema }, own))).toBe("rejected");
   const reason = (await judgeRow(db, 2))?.judge_reason ?? "";
   expect(reason).toMatch(
     /^criteria schema cannot be compiled: no schema with key or ref "https:\/\/t\.example\/x+…$/,
@@ -923,17 +955,20 @@ test("intake_accepts_the_p0_kinds", { timeout: 30_000 }, async () => {
 
 test("intake_accepts_a_rubric_from_the_team_that_the_judge_can_grade", async () => {
   // A rubric has no schema to compile and no held-out checks to wait for, so a team task is
-  // accepted at once when the Judge has a model, the task takes from 1 to 50 entries, its brief
-  // reads and its criteria are within the limits, at the edge of each. Nothing is asked of the
-  // model: the URL below is a port nobody listens on.
+  // accepted at once when the Judge has a model, the task is open (no cap on entries: the Judge
+  // grades the first 50, P05-R21) or invite-only with a cap of 1 to 50, its brief reads and its
+  // criteria are within the limits, at the edge of each. Nothing is asked of the model: the URL
+  // below is a port nobody listens on.
   const edge = Array.from(
     { length: 20 },
     (_, i) => `${String(i).padStart(3, "0")}${"x".repeat(197)}`,
   );
   const accepted: Partial<TaskView>[] = [
     await rubricTask(),
-    await rubricTask(RUBRIC, { max_entries: 1 }),
-    await rubricTask(RUBRIC, { max_entries: 50 }),
+    await rubricTask(RUBRIC, { max_entries: 1, invited: INVITED }),
+    await rubricTask(RUBRIC, { max_entries: 50, invited: INVITED }),
+    // The lowest pass mark a rubric may have.
+    await rubricTask({ ...RUBRIC, min_score: 1 }),
     // 20 criteria of 200 characters each.
     await rubricTask(rubricOf(...edge)),
     // 200 characters that are 400 UTF-16 units.
@@ -962,7 +997,7 @@ test("intake_accepts_a_rubric_from_the_team_that_the_judge_can_grade", async () 
 
 test("intake_asks_a_rubric_task_for_a_model_only_once_it_is_otherwise_sound", async () => {
   // A rubric task from a poster outside the team is refused for that, with or without a model.
-  const view = { criteria_hash: await putCriteria(db, RUBRIC), max_entries: 10 };
+  const view = { criteria_hash: await putCriteria(db, RUBRIC) };
   expect(await intake(1, view, null, { llm: LLM })).toBe("rejected");
   expect(await judgeRow(db, 1)).toEqual({
     judge_status: "rejected",
@@ -1084,19 +1119,21 @@ test("a_pending_task_starts_no_worker_and_a_check_is_kept", { timeout: 60_000 },
 });
 
 test("a_check_refused_for_time_is_not_kept", { timeout: 60_000 }, async () => {
-  // A schema that ran past its compile budget, on a busy machine say, is refused, but that is not
-  // kept: it is the machine's load as much as the schema. The next task with the same criteria is
-  // checked again, and accepted. A refusal that the schema decides is kept: a second task with
-  // the same broken criteria is refused without a check.
+  // A schema that ran past its compile budget, on a busy machine say, is not refused for good
+  // (M1) and its outcome is not kept: it is the machine's load as much as the schema. The task
+  // stays pending and is checked again, and the next task with the same criteria is checked again,
+  // and accepted. A refusal that the schema decides is kept: a second task with the same broken
+  // criteria is refused without a check.
   vi.mocked(checkJsonSchemaIsolated).mockClear();
   vi.mocked(checkJsonSchemaIsolated).mockResolvedValueOnce({
     ok: false,
     reason: TOO_SLOW_TO_COMPILE,
   });
-  const deps = judgeDeps(db, fakeChain(null), { memory: newJudgeMemory() });
+  const memory = newJudgeMemory();
+  const deps = judgeDeps(db, fakeChain(null), { memory });
   const heldout = (n: number) => ({ json_schema: { assertions: [{ path: "$.x", equals: n }] } });
   const posted: [schema: Record<string, unknown>, status: string][] = [
-    [{ type: "object" }, "rejected"],
+    [{ type: "object" }, "pending"],
     [{ type: "object" }, "accepted"],
     [{ type: 12 }, "rejected"],
     [{ type: 12 }, "rejected"],
@@ -1108,8 +1145,18 @@ test("a_check_refused_for_time_is_not_kept", { timeout: 60_000 }, async () => {
     );
     expect(await intakeTask(deps, BigInt(i + 1)), `task ${i + 1}`).toBe(status);
   }
-  expect((await judgeRow(db, 1))?.judge_reason).toBe(TOO_SLOW_TO_COMPILE);
+  expect(await judgeRow(db, 1)).toEqual({
+    judge_status: "pending",
+    judge_reason: "the criteria check ran out of time, checking again",
+  });
+  expect(memory.overruns).toEqual(new Map([["1", 1]]));
   expect((await judgeRow(db, 4))?.judge_reason).toMatch(/^criteria schema cannot be compiled: /);
+  expect(checkJsonSchemaIsolated).toHaveBeenCalledTimes(3);
+
+  // The load is over: the check of task 1 comes from what task 2 found, and it is accepted.
+  expect(await intakeTask(deps, 1n)).toBe("accepted");
+  expect(await judgeRow(db, 1)).toEqual({ judge_status: "accepted", judge_reason: null });
+  expect(memory.overruns.size).toBe(0);
   expect(checkJsonSchemaIsolated).toHaveBeenCalledTimes(3);
 });
 
@@ -1146,6 +1193,48 @@ test("intake_rejects_heldout_from_non_poster", async () => {
   }
 });
 
+test("a_check_that_is_slow_every_time_is_tried_3_more_times_and_then_refused", {
+  timeout: 60_000,
+}, async () => {
+  vi.mocked(checkJsonSchemaIsolated).mockClear();
+  vi.mocked(checkJsonSchemaIsolated).mockResolvedValue({ ok: false, reason: TOO_SLOW_TO_COMPILE });
+  try {
+    const memory = newJudgeMemory();
+    const deps = judgeDeps(db, fakeChain(null), { memory });
+    await insertTask(db, taskView({ id: "1", ...(await jsonSchemaTask(db, { type: "object" })) }));
+    const retry = {
+      judge_status: "pending",
+      judge_reason: "the criteria check ran out of time, checking again",
+    };
+
+    for (const tick of [1, 2, 3]) {
+      expect(await intakeTask(deps, 1n), `tick ${tick}`).toBe("pending");
+      expect(await judgeRow(db, 1), `tick ${tick}`).toEqual(retry);
+      expect(memory.overruns.get("1"), `tick ${tick}`).toBe(tick);
+    }
+    // The fourth overrun is the last: the task is refused for the time, as a schema that cannot be
+    // checked in time for good, and the count goes with the decision.
+    expect(await intakeTask(deps, 1n)).toBe("rejected");
+    expect(await judgeRow(db, 1)).toEqual({
+      judge_status: "rejected",
+      judge_reason: TOO_SLOW_TO_COMPILE,
+    });
+    expect(memory.overruns.size).toBe(0);
+    expect(checkJsonSchemaIsolated).toHaveBeenCalledTimes(4);
+
+    // A Judge that keeps no memory cannot count, and refuses at the first overrun, as before.
+    const own = { json_schema: { assertions: [{ path: "$.y", equals: 2 }] } };
+    await insertTask(
+      db,
+      taskView({ id: "2", ...(await jsonSchemaTask(db, { type: "array" }, own)) }),
+    );
+    expect(await intakeTask(judgeDeps(db, fakeChain(null)), 2n)).toBe("rejected");
+    expect((await judgeRow(db, 2))?.judge_reason).toBe(TOO_SLOW_TO_COMPILE);
+  } finally {
+    vi.mocked(checkJsonSchemaIsolated).mockReset();
+  }
+});
+
 test("intake_takes_heldout_the_poster_sent_after_a_stranger", async () => {
   // A stranger who has the bytes, as anyone has those of a seed, stores them first, and the row
   // is the stranger's. The poster's own upload of them is recorded as well, and that is what
@@ -1176,6 +1265,46 @@ test("intake_takes_heldout_the_poster_sent_after_a_stranger", async () => {
   expect((await judgeRow(db, 3))?.judge_reason).toBe(
     "held-out checks were not uploaded by the poster",
   );
+});
+
+test("held_out_checks_that_are_used_or_missing_are_refused_before_a_worker_is_started", async () => {
+  // I5: the two refusals that need no worker come before the compile, which starts one.
+  vi.mocked(checkJsonSchemaIsolated).mockClear();
+  const deps = judgeDeps(db, fakeChain(null));
+  const shared = { json_schema: { assertions: [{ path: "$.x", equals: 1 }] } };
+  const first = await jsonSchemaTask(db, { type: "object" }, shared);
+  // Task 1 holds the checks. Task 2, the same poster's, repeats them: refused without a check.
+  await insertTask(db, taskView({ id: "1", ...first }));
+  await insertTask(
+    db,
+    taskView({ id: "2", ...(await jsonSchemaTask(db, { type: "array" }, shared)) }),
+  );
+  expect(await intakeTask(deps, 2n)).toBe("rejected");
+  expect(await judgeRow(db, 2)).toEqual({
+    judge_status: "rejected",
+    judge_reason: "held-out checks already used by task 1",
+  });
+  expect(checkJsonSchemaIsolated).not.toHaveBeenCalled();
+
+  // Checks that never came, once the 10 minutes are over: refused without a check as well.
+  await insertTask(
+    db,
+    taskView({
+      id: "3",
+      criteria_hash: await putCriteria(db, { ...JSON_SCHEMA, schema: { type: "string" } }),
+      heldout_commitment: sha256Hex("never sent"),
+    }),
+  );
+  expect(await intakeTask(deps, 3n)).toBe("rejected");
+  expect(await judgeRow(db, 3)).toEqual({
+    judge_status: "rejected",
+    judge_reason: "held-out checks missing",
+  });
+  expect(checkJsonSchemaIsolated).not.toHaveBeenCalled();
+
+  // Task 1 itself is checked, once.
+  expect(await intakeTask(deps, 1n)).toBe("accepted");
+  expect(checkJsonSchemaIsolated).toHaveBeenCalledTimes(1);
 });
 
 test("intake_rejects_heldout_checks_already_used", async () => {
@@ -1219,8 +1348,8 @@ test("intake_rejects_heldout_checks_already_used", async () => {
 
 test("intake_counts_only_the_posters_own_earlier_use", async () => {
   // A commitment is public once its task is posted, so a stranger can post a task with it first
-  // and take a lower id (P05-R7). The checks under it are not the stranger's upload, so that task
-  // is never judged and never publishes them: it does not use them up.
+  // and take a lower id (P05-R7). Only someone who holds the bytes already can have a copy
+  // judged, so that task must not use the poster's checks up.
   const criteriaHash = await putCriteria(db, EXACT);
   const commitment = await putHeldout(db, EXACT_HELDOUT);
   const posted: [string, string][] = [

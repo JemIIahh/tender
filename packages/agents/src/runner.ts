@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import type { TenderClient } from "@tender/client";
-import type { Draft, StateStore } from "@tender/mcp";
+import { type Draft, isDraftOf, type StateStore, staleReason } from "@tender/mcp";
 import {
   type AccountEntry,
   ApiError,
@@ -34,7 +34,8 @@ import type { Solver, TaskContext } from "./types";
 //   (`recoverCommit`). If it has the commit, the draft is marked. If not, and the task is still
 //   open, the same commitment is sent again from the draft, never with a new solve. If the reveal
 //   window is over with no commit of the draft on the chain, or if the contract refuses for good,
-//   the draft is dead and is let alone (P05-R14). A draft whose commit is on the chain is never
+//   the draft is dead and is let alone (P05-R14), which is written on the draft itself (`dead`, the
+//   MCP server's too), so that a restart lets it alone as well. A draft whose commit is on the chain is never
 //   dead: it is revealed whenever its window is open, marked or not, and however late the agent
 //   comes back to it. The chain is read at its last final block, which trails the newest by about
 //   two, so a commit that has just landed can be missing from the view for a moment. That is why a
@@ -44,9 +45,19 @@ import type { Solver, TaskContext } from "./types";
 //   (review R1);
 // - a draft is the agent's only if its commitment is the one that the agent's account, the task,
 //   the draft's hash and its salt give. A draft that another account made, in a state directory
-//   that the two share, is dead for this run, and nothing is sent or revealed for it (review N3);
-// - a draft is never replaced. A task with a draft is not entered again, in this run or after a
-//   restart, because a second commit with another salt would replace the one the draft opens;
+//   that the two share, is dead for this run, and nothing is sent or revealed for it (review N3).
+//   That one is not written on the file: the file is the other account's;
+// - a draft is bound to the task it was made for (P05 whole-branch review I4). Task ids count up
+//   from 1 on every contract, and a chain that is started again (every sandbox, a fresh deploy) hands
+//   them out once more, so the draft records the contract and the task's creation time
+//   (`contractId`, `taskCreatedAt`), and a draft whose record does not fit the task it meets is
+//   another task's (`staleReason`, as the MCP server tells them). Unless the chain shows an entry
+//   of the account with the draft's commitment, which proves the draft belongs, it is set aside,
+//   whole and kept (`setAside`), never sent or revealed, and the task is entered afresh if it is
+//   open. A draft that records nothing (one from before drafts were bound) is taken as it is;
+// - a draft is never replaced. A task with a draft of its own is not entered again, in this run or
+//   after a restart, because a second commit with another salt would replace the one the draft
+//   opens;
 // - the reveal is driven by the drafts and not by what the run remembers, so a restart picks up
 //   every entry where it stopped. The upload comes first and the reveal second, so a crash between
 //   the two leaves a draft that is still unrevealed, and the next tick does both again: the upload
@@ -132,13 +143,13 @@ const NO_SIGNER = "this agent's client has no signer, so it can neither commit n
 const TIMED_OUT = Symbol("timed out");
 
 /**
- * What the runner needs of a `TenderClient` (X-12): the account it signs as, the two transactions
- * of an entry, the storage view for R22, and the entry view that tells whether a commit landed
- * (P05-R14). Tests pass a fake with these members.
+ * What the runner needs of a `TenderClient` (X-12): the account it signs as, the contract it uses
+ * (a draft is bound to it), the two transactions of an entry, the storage view for R22, and the
+ * entry view that tells whether a commit landed (P05-R14). Tests pass a fake with these members.
  */
 export type AgentChain = Pick<
   TenderClient,
-  "accountId" | "commit" | "reveal" | "storageBalanceOf" | "getEntry"
+  "accountId" | "contractId" | "commit" | "reveal" | "storageBalanceOf" | "getEntry"
 >;
 
 /**
@@ -156,10 +167,11 @@ export class AgentMemory {
   /** Tasks whose outcome has been logged. */
   readonly settled = new Set<string>();
   /**
-   * Tasks whose draft is dead for this run: its commit is not on the chain and cannot be, as the
-   * contract refused it for good or the reveal window is over; or the draft is not the account's
-   * (review N3). Nothing more is done for them. A draft has no slot to say so on disk, so a restart
-   * judges each of them again.
+   * Tasks whose draft is dead: its commit is not on the chain and cannot be, as the contract
+   * refused it for good or the reveal window is over; or the draft is not the account's (review
+   * N3). Nothing more is done for them. A draft of the account's own is marked dead on disk as
+   * well (`Draft.dead`), and a restart lets it alone; a draft of another account is only dead for
+   * this run, as its file is not ours to write on, and a restart judges it again.
    */
   readonly dead = new Set<string>();
   /** Tasks whose low storage has been warned of, so that a later tick does not say it again. */
@@ -303,28 +315,6 @@ function oneLine(text: string, max = MAX_REASON_CHARS): string {
  */
 function isTaskId(id: string): boolean {
   return U64StringSchema.safeParse(id).success;
-}
-
-/**
- * Whether `draft` was made by `account` (review N3): its commitment is the one that the account,
- * its task, its content hash and its salt give. A state directory that two accounts share holds a
- * draft of each under the task's one file name, and the commitment of another account's draft is
- * one this account cannot open: sent, it would give the account an entry that no reveal can
- * match. A draft whose parts make no commitment at all is nobody's. This is the MCP server's check
- * (`DRAFT_NOT_YOURS`) as well.
- */
-function isDraftOf(draft: Draft, account: string): boolean {
-  try {
-    const commitment = computeCommitment(
-      BigInt(draft.taskId),
-      account,
-      draft.contentHash,
-      draft.salt,
-    );
-    return commitment === draft.commitment;
-  } catch {
-    return false;
-  }
 }
 
 /** Throws a `RangeError` unless `ms` is a wait that `setTimeout` keeps. */
@@ -481,9 +471,23 @@ async function enter(run: Run, summary: TaskSummary): Promise<void> {
 
   // Not `memory`: a restart has none, and the draft holds the salt of a commitment that may be on
   // chain. Entering again would save a new salt over it, and the reveal could never open the commit.
-  if ((await run.state.getDraft(id)) !== null) {
-    memory.seen.add(id);
-    return;
+  // Unless the draft is another task's with this number (`checkBinding`): a task is entered afresh
+  // only once that draft is set aside.
+  const draft = await run.state.getDraft(id);
+  if (draft !== null) {
+    // Another account's draft is not ours to look at, and `tendDrafts` is told of it.
+    if (isDraftOf(draft, run.account)) {
+      const binding = await checkBinding(run, draft, summary.created_at);
+      // The chain could not be asked: the task is looked at again next tick.
+      if (binding === "unknown") return;
+      if (binding === "stands") {
+        memory.seen.add(id);
+        return;
+      }
+    } else {
+      memory.seen.add(id);
+      return;
+    }
   }
 
   const found = await run.api.getTask(BigInt(id));
@@ -535,7 +539,7 @@ async function enter(run: Run, summary: TaskSummary): Promise<void> {
     content = await ask(run, id, ctx);
     if (content === null) return;
   }
-  await commit(run, id, content);
+  await commit(run, id, content, task.created_at);
 }
 
 /**
@@ -573,9 +577,10 @@ async function ask(run: Run, id: string, ctx: TaskContext): Promise<Uint8Array |
  * Enters task `id` with `content`: saves the draft, then sends the commit (`sendCommit`). The draft
  * is on disk (`saveDraft` writes and syncs a temp file and renames it) before the commit leaves,
  * which is the whole of the crash safety of the commit half. What a crash or a failed send leaves
- * behind, `recoverCommit` settles.
+ * behind, `recoverCommit` settles. The draft records the contract and `createdAt`, the creation time
+ * of the task as the API has it, which say whose task it is (`checkBinding`).
  */
-async function commit(run: Run, id: string, content: Uint8Array): Promise<void> {
+async function commit(run: Run, id: string, content: Uint8Array, createdAt: string): Promise<void> {
   const contentHash = sha256Hex(content);
   const salt = randomSalt();
   const draft: Draft = {
@@ -584,6 +589,8 @@ async function commit(run: Run, id: string, content: Uint8Array): Promise<void> 
     contentHash,
     salt,
     commitment: computeCommitment(BigInt(id), run.account, contentHash, salt),
+    contractId: run.client.contractId,
+    taskCreatedAt: createdAt,
   };
 
   await run.state.saveDraft(draft);
@@ -613,7 +620,7 @@ async function sendCommit(run: Run, draft: Draft, again: boolean): Promise<boole
     txHash = (await run.client.commit(BigInt(id), draft.commitment)).txHash;
   } catch (error) {
     if (refusedForGood(error, again)) {
-      markDead(run, id, `commit to task ${id} refused for good (${describe(error)})`);
+      await markDead(run, id, `commit to task ${id} refused for good (${describe(error)})`);
     } else {
       run.log(`ERROR ${run.name}: commit to task ${id} failed (${describe(error)})`);
     }
@@ -640,13 +647,81 @@ async function markCommitted(run: Run, draft: Draft): Promise<void> {
 }
 
 /**
- * Gives the draft of task `id` up for this run, and says why (P05-R14). That is said once, as
- * `tendDrafts` lets a dead draft alone from then on: it is neither sent nor revealed nor reported
- * on, and its task is not entered again.
+ * Gives the draft of task `id` up, and says why (P05-R14). That is said once, as `tendDrafts` lets a
+ * dead draft alone from then on: it is neither sent nor revealed nor reported on, and its task is
+ * not entered again. The reason is written on the draft (`StateStore.markDead`), so that a restart
+ * lets it alone too, unless `own` is false: the draft is another account's, the file is not ours
+ * to write on, and the run alone gives it up. A draft that cannot be marked is dead for this run all
+ * the same, and a restart judges it again.
  */
-function markDead(run: Run, id: string, why: string): void {
+async function markDead(run: Run, id: string, why: string, own = true): Promise<void> {
   run.memory.dead.add(id);
   run.log(`ERROR ${run.name}: ${why}, the draft is dead`);
+  if (!own) return;
+  try {
+    await run.state.markDead(id, why);
+  } catch (error) {
+    run.log(
+      `ERROR ${run.name}: the draft of task ${id} is dead, but could not be marked so (${describe(error)})`,
+    );
+  }
+}
+
+/**
+ * Forgets what the run knew of task `id`, as a draft was set aside and the number may be a task of
+ * another life of the chain: the new one is looked at from nothing.
+ */
+function forget(memory: AgentMemory, id: string): void {
+  memory.seen.delete(id);
+  memory.settled.delete(id);
+  memory.dead.delete(id);
+  memory.warned.delete(id);
+  memory.waiting.delete(id);
+  memory.resends.delete(id);
+}
+
+/**
+ * Whether `draft`, the account's own, is the draft of task `draft.taskId` as it stands, given
+ * `createdAt`, the task's creation time as the API has it now (P05 whole-branch review I4):
+ *
+ * - `stands`: nothing says it is another task's (`staleReason`: the contract and the creation time
+ *   it records fit, or it records too little to tell, as a draft from before drafts were bound), or
+ *   the chain holds an entry of the account with the draft's commitment, which proves that it
+ *   belongs here whatever the record says (the chain has the last word, as in the MCP server);
+ * - `aside`: it is another task's, and the chain does not hold its commitment. It has been set aside
+ *   with `StateStore.setAside`, whole and kept (it holds a work and a salt that are the other
+ *   chain's), and the run has forgotten the task, so that the task has no draft and is entered
+ *   afresh if it is open. Nothing is sent or revealed from it;
+ * - `unknown`: the chain could not be asked, or the draft could not be set aside. Nothing is done
+ *   for the draft or the task, and the next tick looks again. (The MCP server sets a draft aside
+ *   when the chain cannot be asked; the runner has a next tick, so it waits.)
+ */
+async function checkBinding(
+  run: Run,
+  draft: Draft,
+  createdAt: string,
+): Promise<"stands" | "aside" | "unknown"> {
+  const id = draft.taskId;
+  const reason = staleReason(draft, run.client.contractId, createdAt);
+  if (reason === null) return "stands";
+  const looked = await lookUp(run, id);
+  if (looked === undefined) return "unknown";
+  if (looked.entry !== null && looked.entry.commitment === draft.commitment) return "stands";
+  let kept: string | null;
+  try {
+    kept = await run.state.setAside(id);
+  } catch (error) {
+    run.log(
+      `ERROR ${run.name}: the draft saved for task ${id} is not this task's, and it could not be set aside, so nothing is done for task ${id} (${describe(error)})`,
+    );
+    return "unknown";
+  }
+  forget(run.memory, id);
+  const file = kept === null ? "" : `, kept whole as ${oneLine(kept, MAX_ID_CHARS)}`;
+  run.log(
+    `WARN ${run.name}: the draft saved for task ${id} is not this task's (${oneLine(reason)}), so it is set aside${file}`,
+  );
+  return "aside";
 }
 
 /**
@@ -719,7 +794,7 @@ async function recoverCommit(run: Run, draft: Draft, task: TaskDetail): Promise<
   }
   if (task.phase !== "open") {
     const why = `task ${id} has no commit of its draft on chain and its reveal window is over`;
-    markDead(run, id, why);
+    await markDead(run, id, why);
     return false;
   }
   if ((run.memory.resends.get(id) ?? 0) >= MAX_RESENDS) {
@@ -780,6 +855,8 @@ async function storageLow(run: Run, id: string, owed = run.owed): Promise<boolea
  * Goes through every draft the agent holds, oldest task first:
  *
  * - a draft that is not the account's is dead, and nothing is done for it (`isDraftOf`);
+ * - a draft that is dead on its file is let alone (`Draft.dead`);
+ * - a draft that is another task's with this number is set aside, and not tended (`checkBinding`);
  * - a draft not marked committed is settled first (`recoverCommit`): the chain is asked, and the
  *   commit is marked, kept for the next tick, queued to be sent again or given up;
  * - a draft that is not revealed, for a task in its reveal window, is revealed;
@@ -878,10 +955,16 @@ async function tendDue(run: Run, taskId: string): Promise<void> {
   if (draft !== null) await tendOne(run, draft);
 }
 
-/** One draft of `tendDrafts`: skipped if it is dead or settled, and a failure is its own. */
+/**
+ * One draft of `tendDrafts`: skipped if it is dead or settled, and a failure is its own. A draft is
+ * dead for the run (`AgentMemory.dead`) or on its file (`Draft.dead`), where an earlier run wrote
+ * it. A dead draft that is another task's does not hold its number: `enter` sets it aside when the
+ * number comes up as an open task (`checkBinding`).
+ */
 async function tendOne(run: Run, draft: Draft): Promise<void> {
   const { taskId } = draft;
   if (run.memory.settled.has(taskId) || run.memory.dead.has(taskId)) return;
+  if (draft.dead !== undefined) return;
   try {
     await tendDraft(run, draft);
   } catch (error) {
@@ -907,7 +990,7 @@ async function tendDraft(run: Run, draft: Draft): Promise<void> {
   }
   // Review N3: before anything is sent, uploaded or revealed for it, and before the API is asked.
   if (!isDraftOf(draft, run.account)) {
-    markDead(run, id, `the draft saved for task ${id} was not made by ${run.account}`);
+    await markDead(run, id, `the draft saved for task ${id} was not made by ${run.account}`, false);
     return;
   }
   const found = await run.api.getTask(BigInt(id));
@@ -920,6 +1003,9 @@ async function tendDraft(run: Run, draft: Draft): Promise<void> {
     run.log(`WARN ${run.name}: task ${id} not tended, the API answered with another task`);
     return;
   }
+  // I4: before the draft is sent, revealed or counted. A draft that is another task's, however
+  // far on it is, would send its commitment to this task, reveal into it, or log its outcome.
+  if ((await checkBinding(run, draft, task.created_at)) !== "stands") return;
 
   let revealed = draft.revealedUri !== undefined;
   // A revealed draft was committed. One that is neither revealed nor marked committed may or may
@@ -1061,9 +1147,9 @@ async function logOutcome(run: Run, found: TaskDetailResponse, revealed: boolean
  *   a draft has no slot to say its outcome was logged.
  * - The storage view is read once for a task, before the solver is asked, and not again before
  *   the commit.
- * - A draft is dead for the run only, as it has no slot to say so either: a restart judges it
- *   again, which costs a lookup and, for a task still open, one more refused commit and one more
- *   ERROR line.
+ * - A draft of another account's is dead for the run only, as its file is not the agent's to
+ *   write on: a restart judges it again, which costs a lookup. A draft of the agent's own that is
+ *   given up is marked dead on its file, and a restart lets it alone.
  * - A draft with no commit in view in its task's reveal window costs a lookup each tick until the
  *   window is over (review N1), and so does one whose five resends are used up, from the tick that
  *   finds them so (review R1). A commit that never landed is given up only when the window is over.

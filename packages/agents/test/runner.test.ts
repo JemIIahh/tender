@@ -1,8 +1,8 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TenderError, type TxResult } from "@tender/client";
-import { createStateStore, type Draft, type StateStore } from "@tender/mcp";
+import { createStateStore, DRAFTS_DIR, type Draft, type StateStore } from "@tender/mcp";
 import {
   type AccountEntry,
   ApiError,
@@ -44,6 +44,8 @@ import {
 // about files: the tests read them the way another process would. A "restart" is a new run (no
 // memory) on the same directory.
 
+/** The contract the fake client is set up for (`AgentChain.contractId`). */
+const CONTRACT = "tender.test.near";
 const ANSWER = new TextEncoder().encode('{"pattern":"^a$","flags":""}');
 const ANSWER_BASE64 = Buffer.from(ANSWER).toString("base64");
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -244,6 +246,7 @@ async function harness(
   );
   const client: AgentChain = {
     accountId: ACCOUNT,
+    contractId: CONTRACT,
     commit,
     reveal,
     storageBalanceOf: storage,
@@ -354,6 +357,9 @@ test("draft_saved_before_commit", async () => {
     taskId: "7",
     contentBase64: ANSWER_BASE64,
     contentHash: sha256Hex(ANSWER),
+    // Whose task it is (I4): the contract, and the task's creation time as the API had it.
+    contractId: CONTRACT,
+    taskCreatedAt: "1000000000",
   });
   // The commit is in flight, so the draft does not say it went through.
   expect(onDisk.committedAt).toBeUndefined();
@@ -2017,6 +2023,287 @@ test("a_draft_that_is_not_the_accounts_is_dead_and_nothing_is_sent_or_revealed_f
       expect(await h.state.getDraft("7"), label).toEqual(draft);
     }
   }
+});
+
+// ---- Drafts bound to their task and dead drafts on disk (plan 05 whole-branch review I4) -------
+
+/** The names of the files in the agent's drafts folder. */
+async function draftFiles(h: Harness): Promise<string[]> {
+  return (await readdir(join(h.dir, DRAFTS_DIR))).sort();
+}
+
+/**
+ * The chain is started again: the number 7 is a different task, created at another time, and the
+ * chain holds no entry. The agent's draft for the old 7 is on its disk.
+ */
+function newLifeOfTheChain(h: Harness, over: Partial<TaskSpec> = {}): TaskSpec {
+  h.entries.clear();
+  return h.world.add({ id: 7, createdAt: "9000000000", ...over });
+}
+
+test("a_draft_never_marked_committed_is_not_sent_to_the_task_that_has_its_number_on_a_new_chain", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  const old = await crashInsideTheCommit(h);
+  newLifeOfTheChain(h);
+
+  h.restart();
+  await h.tick();
+
+  // The old commitment is not sent to the new task, and the old draft is kept whole, not lost.
+  expect(h.commit).toHaveBeenCalledTimes(2);
+  expect(h.commit).not.toHaveBeenLastCalledWith(7n, old.commitment);
+  const files = await draftFiles(h);
+  expect(files).toHaveLength(2);
+  expect(files).toContain("7.json");
+  const kept = files.find((name) => name.startsWith("7.orphaned-"));
+  if (kept === undefined) throw new Error(`the old draft was not kept (${files.join(", ")})`);
+  const aside = JSON.parse(await readFile(join(h.dir, DRAFTS_DIR, kept), "utf8")) as Draft;
+  expect(aside).toEqual(old);
+
+  // The task was entered afresh: a new answer was asked for, and the new draft is bound to the
+  // new task and to nothing of the old one.
+  expect(h.solve).toHaveBeenCalledTimes(2);
+  const fresh = await h.state.getDraft("7");
+  expect(fresh).toMatchObject({
+    contractId: CONTRACT,
+    taskCreatedAt: "9000000000",
+    committedAt: expect.stringMatching(ISO),
+  });
+  expect(fresh?.commitment).not.toBe(old.commitment);
+  expect(fresh?.salt).not.toBe(old.salt);
+  expect(h.logs).toEqual([
+    expect.stringMatching(
+      /^WARN alice: the draft saved for task 7 is not this task's \(it was made for a task with this number that was created at another time.*\), so it is set aside, kept whole as 7\.orphaned-\d+\.json$/,
+    ),
+    "alice: committed to task 7 tx=commit-tx",
+  ]);
+
+  // And it is the new draft that is revealed, in the new task's window.
+  const fresh7 = h.world.tasks.get(7);
+  if (fresh7 === undefined) throw new Error("task 7 is missing");
+  fresh7.phase = "revealing";
+  await h.tick();
+  expect(h.reveal).toHaveBeenCalledTimes(1);
+  expect(h.reveal).toHaveBeenCalledWith(7n, fresh?.contentHash, fresh?.salt, expect.any(String));
+});
+
+test("a_revealed_draft_of_an_old_chain_does_not_keep_the_agent_out_of_the_new_task", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  await h.tick();
+  task.phase = "revealing";
+  await h.tick();
+  const old = await h.state.getDraft("7");
+  expect(old?.revealedUri).toBeDefined();
+  h.logs.length = 0;
+
+  // A new chain, a new task 7 that is open. The old draft is revealed and bound to the old task.
+  newLifeOfTheChain(h);
+  h.restart();
+  await h.tick();
+
+  expect(h.commit).toHaveBeenCalledTimes(2);
+  expect((await h.state.getDraft("7"))?.taskCreatedAt).toBe("9000000000");
+  expect((await h.state.getDraft("7"))?.revealedUri).toBeUndefined();
+  expect(await draftFiles(h)).toHaveLength(2);
+  expect(h.logs.filter((line) => line.startsWith("WARN"))).toHaveLength(1);
+});
+
+test("a_draft_that_is_dead_on_its_file_from_an_old_chain_does_not_keep_the_agent_out_of_the_new_task", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  h.commit.mockRejectedValueOnce(new TenderError("E_AUTH", "E_AUTH: refused"));
+  await h.tick();
+  expect((await h.state.getDraft("7"))?.dead).toBeDefined();
+
+  newLifeOfTheChain(h);
+  h.restart();
+  await h.tick();
+
+  // The dead draft belongs to the old life of the chain: it is set aside, and the number is entered.
+  expect(h.commit).toHaveBeenCalledTimes(2);
+  expect(h.solve).toHaveBeenCalledTimes(2);
+  const fresh = await h.state.getDraft("7");
+  expect(fresh?.dead).toBeUndefined();
+  expect(fresh?.taskCreatedAt).toBe("9000000000");
+});
+
+test("a_draft_for_another_contract_is_set_aside_and_the_chain_may_prove_otherwise", async () => {
+  // The same number and the same creation time on another contract: the record says it is not
+  // this task's. Unless the chain holds an entry with its commitment, which proves it is.
+  for (const proved of [false, true]) {
+    const h = await harness();
+    const task = h.world.add({ id: 7 });
+    const draft = draftFor(7, { contractId: "other.test.near", taskCreatedAt: "1000000000" });
+    await h.state.saveDraft({ ...draft, committedAt: new Date().toISOString() });
+    if (proved) h.entries.set("7", entryView(7n, draft.commitment));
+    task.phase = "revealing";
+
+    await h.tick();
+
+    if (proved) {
+      expect(h.reveal, "proved").toHaveBeenCalledTimes(1);
+      expect(h.logs.filter((line) => line.startsWith("WARN"))).toEqual([]);
+      expect(await draftFiles(h)).toEqual(["7.json"]);
+    } else {
+      expect(h.reveal, "unproved").not.toHaveBeenCalled();
+      expect(h.upload, "unproved").not.toHaveBeenCalled();
+      // It was set aside, and the task, in its reveal window, is not entered.
+      expect(h.commit, "unproved").not.toHaveBeenCalled();
+      expect(await h.state.getDraft("7")).toBeNull();
+      expect(await draftFiles(h)).toHaveLength(1);
+      expect(h.logs).toEqual([
+        expect.stringContaining(
+          `the draft saved for task 7 is not this task's (it was made for the contract "other.test.near"`,
+        ),
+      ]);
+    }
+  }
+});
+
+test("a_stale_draft_in_a_task_past_its_commit_window_is_set_aside_not_resent_or_revealed", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  await crashInsideTheCommit(h);
+  newLifeOfTheChain(h, { phase: "revealing" });
+  Object.assign(task, h.world.tasks.get(7));
+
+  h.restart();
+  await h.tick();
+  await h.tick();
+
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.upload).not.toHaveBeenCalled();
+  expect(h.reveal).not.toHaveBeenCalled();
+  expect(await h.state.getDraft("7")).toBeNull();
+  expect(h.logs.filter((line) => line.startsWith("WARN"))).toHaveLength(1);
+});
+
+test("a_stale_draft_is_kept_when_the_chain_cannot_be_asked_and_set_aside_when_it_can", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  await crashInsideTheCommit(h);
+  newLifeOfTheChain(h);
+  h.restart();
+  h.getEntry.mockRejectedValue(new Error("rpc down"));
+
+  await h.tick();
+
+  // Nothing was decided: the draft stands, the task is not entered over it and nothing is sent.
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(await draftFiles(h)).toEqual(["7.json"]);
+  expect(h.logs.filter((line) => line.startsWith("ERROR alice: the entry in task 7"))).not.toEqual(
+    [],
+  );
+
+  // The chain answers again.
+  h.getEntry.mockImplementation(async (taskId) => h.entries.get(String(taskId)) ?? null);
+  await h.tick();
+
+  expect(h.commit).toHaveBeenCalledTimes(2);
+  expect(await draftFiles(h)).toHaveLength(2);
+});
+
+test("a_draft_that_records_nothing_is_taken_as_it_is", async () => {
+  // One from before drafts were bound: it cannot be told from the task's own, and the chain is
+  // asked about it as always (P05-R14).
+  const h = await harness();
+  h.world.add({ id: 7 });
+  const unbound = draftFor(7);
+  await h.state.saveDraft(unbound);
+
+  await h.tick();
+
+  expect(h.getEntry).toHaveBeenCalledWith(7n, ACCOUNT);
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.commit).toHaveBeenLastCalledWith(7n, unbound.commitment);
+  expect(h.solve).not.toHaveBeenCalled();
+  expect(await draftFiles(h)).toEqual(["7.json"]);
+  expect(h.logs.filter((line) => line.startsWith("WARN"))).toEqual([]);
+});
+
+test("a_draft_given_up_is_written_dead_on_its_file_and_a_restart_lets_it_alone", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  h.commit.mockRejectedValue(new TenderError("E_AUTH", "E_AUTH: refused"));
+
+  await h.tick();
+
+  const draft = await h.state.getDraft("7");
+  expect(draft?.dead).toEqual({
+    reason: "commit to task 7 refused for good (TenderError E_AUTH)",
+    at: expect.stringMatching(ISO),
+  });
+
+  // A restart has no memory and the file says it: nothing is sent, asked of the chain or logged
+  // again, and the number is not entered over it.
+  h.restart();
+  h.logs.length = 0;
+  await h.tick();
+  task.phase = "revealing";
+  await h.tick();
+  Object.assign(task, { phase: "settled", outcome: picked(7, OTHER) });
+  await h.tick();
+
+  expect(h.commit).toHaveBeenCalledTimes(1);
+  expect(h.getEntry).not.toHaveBeenCalled();
+  expect(h.upload).not.toHaveBeenCalled();
+  expect(h.solve).toHaveBeenCalledTimes(1);
+  expect(h.logs).toEqual([]);
+  expect((await h.state.getDraft("7"))?.dead?.reason).toBe(draft?.dead?.reason);
+});
+
+test("a_draft_with_no_commit_on_chain_after_the_reveal_window_is_written_dead_too", async () => {
+  const h = await harness();
+  const task = h.world.add({ id: 7 });
+  await crashInsideTheCommit(h);
+  task.phase = "judging";
+
+  h.restart();
+  await h.tick();
+
+  expect((await h.state.getDraft("7"))?.dead?.reason).toBe(
+    "task 7 has no commit of its draft on chain and its reveal window is over",
+  );
+  h.restart();
+  h.logs.length = 0;
+  h.getEntry.mockClear();
+  await h.tick();
+  expect(h.getEntry).not.toHaveBeenCalled();
+  expect(h.logs).toEqual([]);
+});
+
+test("a_draft_of_another_account_is_dead_for_the_run_and_its_file_is_not_written_on", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  const theirs = draftFor(7, {}, OTHER);
+  await h.state.saveDraft(theirs);
+
+  await h.tick();
+
+  expect(await h.state.getDraft("7")).toEqual(theirs);
+});
+
+test("a_dead_mark_that_cannot_be_written_is_logged_and_the_draft_is_dead_for_the_run", async () => {
+  const h = await harness();
+  h.world.add({ id: 7 });
+  h.commit.mockRejectedValue(new TenderError("E_AUTH", "E_AUTH: refused"));
+  h.state = {
+    ...h.state,
+    markDead: async () => {
+      throw new Error("disk full");
+    },
+  };
+
+  await h.tick();
+  await h.tick();
+
+  expect(h.logs).toEqual([
+    "ERROR alice: commit to task 7 refused for good (TenderError E_AUTH), the draft is dead",
+    "ERROR alice: the draft of task 7 is dead, but could not be marked so (Error)",
+  ]);
+  expect(h.commit).toHaveBeenCalledTimes(1);
 });
 
 // ---- Revealing --------------------------------------------------------------------------------

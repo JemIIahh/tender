@@ -643,11 +643,20 @@ function refuseSharedHeldout(seeds: readonly Prepared[]): void {
   }
 }
 
+/** The most blocks the API's index may be behind the chain for the run to go on (review M4). */
+const MAX_INDEX_LAG_BLOCKS = 10n;
+
 /**
  * Stops the run when the API is not the client's. The API says which network and contract it
  * serves, and the tasks it lists, the checks it is asked about and the uploads it takes are those
  * of that contract. Both are names, not secrets, so the message shows them. An API that fails to
  * answer stops the run too.
+ *
+ * It stops while the API's index is more than `MAX_INDEX_LAG_BLOCKS` blocks behind the chain
+ * (review M4). The run goes by the poster's tasks as the API lists them, so a stalled index would
+ * miss the latest ones, and a seed that an earlier run posted would be posted again; the Judge
+ * would turn the copy away (its held-out checks are used), and its reward would sit in escrow
+ * until the keeper voided it.
  */
 async function checkApi(o: SeedOptions): Promise<void> {
   const served = await o.api.health();
@@ -655,6 +664,11 @@ async function checkApi(o: SeedOptions): Promise<void> {
   if (served.network !== network || served.contract !== contractId) {
     throw new Error(
       `the API serves ${served.contract} on ${served.network}, but the client is set for ${contractId} on ${network}: they have to be the same deployment`,
+    );
+  }
+  if (BigInt(served.lag_blocks) > MAX_INDEX_LAG_BLOCKS) {
+    throw new Error(
+      `the API's index is ${served.lag_blocks} blocks behind the chain, and its list of the poster's tasks may miss the latest ones, which would post a seed again: wait until it is at most ${MAX_INDEX_LAG_BLOCKS} behind`,
     );
   }
 }
@@ -692,9 +706,10 @@ const MAINNET_REFUSED =
  * of this file for what each seed goes through, what the script prints, and how the vault is
  * funded.
  *
- * Throws for mainnet, whether `network` or the client says it; if the client does not sign as the
- * poster; naming the seed, if its files are wrong, or two seeds share their held-out checks; if the
- * API is not the client's deployment; if the poster's wallet cannot cover the rewards the vault
+ * Throws for mainnet, whether `network` or the client says it; if `network` and the client's network
+ * differ; if the client does not sign as the poster; naming the seed, if its files are wrong, or
+ * two seeds share their held-out checks; if the API is not the client's deployment, or its index
+ * is more than 10 blocks behind the chain; if the poster's wallet cannot cover the rewards the vault
  * lacks; if the API's list of the poster's tasks cannot be read in full; and with the API's or the
  * chain's own error if either refuses a step. The seeds posted before a failure stay posted, and
  * running the script again finishes the rest.
@@ -702,6 +717,12 @@ const MAINNET_REFUSED =
 export async function seed(o: SeedOptions): Promise<SeededTask[]> {
   const log = o.log ?? console.log;
   if (o.network === "mainnet" || o.client.network === "mainnet") throw new Error(MAINNET_REFUSED);
+  // The token is chosen by `network` and the API is checked against the client's: one network.
+  if (o.network !== o.client.network) {
+    throw new Error(
+      `the seeds are for ${o.network}, but the client is set for ${o.client.network}: they have to be the same network`,
+    );
+  }
   // The vault, the post and the "poster" verifier must all be this one account's.
   if (o.client.accountId !== o.poster) {
     const signs = o.client.accountId === undefined ? "has no signer" : "signs as another account";

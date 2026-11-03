@@ -46,6 +46,12 @@ export type DocumentsCheck =
       reason: string;
       /** Set when the criteria failed the criteria check (`shapeProblem`, `compileProblem`). */
       criteriaCheck?: true;
+      /**
+       * Set when the criteria check ran out of its time budget (`TOO_SLOW_TO_COMPILE`): the
+       * machine's load as much as the schema's, so intake tries it again before it turns the task
+       * away (M1).
+       */
+      tooSlow?: true;
     };
 
 /** What a task's documents are checked against: fields of a `TaskView`, and of a `tasks` row. */
@@ -123,6 +129,10 @@ const TESTS_NOT_AVAILABLE = "kind tests is not available yet";
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
 const REFERENCE_NOT_ALLOWED =
   'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry (move the schema it points to into $defs)';
+// A reference that is already shaped like one to a `$defs` entry, where the entry is what is wrong:
+// moving the schema into `$defs` is not the fix.
+const REFERENCE_TARGET_UNUSABLE =
+  'criteria schema is not supported: a reference points to a $defs or definitions entry that is not there, is not a schema, or has a "%" in its name';
 const DYNAMIC_REFERENCE =
   "criteria schema is not supported: $dynamicRef and $recursiveRef are not supported, use $ref";
 const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at the root";
@@ -135,6 +145,14 @@ const HELDOUT_INVALID = "held-out checks invalid";
 const HELDOUT_OTHER_KIND = "held-out checks are for another kind";
 const HELDOUT_NOT_COMMITTED = "held-out checks do not match the commitment";
 const CHECK_FAILED = "criteria could not be checked";
+/** The `judge_reason` of a task whose criteria check ran out of time, while it is tried again. */
+const COMPILE_RETRY = "the criteria check ran out of time, checking again";
+/**
+ * How many times intake tries a criteria check again after it ran out of time before it turns the
+ * task away for it (M1): a load spike at intake must not reject an honest schema for good, and a
+ * schema that is slow every time must not be tried for ever.
+ */
+const MAX_COMPILE_RETRIES = 3;
 
 /**
  * Decides whether the Judge will judge task `taskId`, and records it in `tasks.judge_status`, with
@@ -161,26 +179,34 @@ const CHECK_FAILED = "criteria could not be checked";
  *   grades it with the model it is given (`JudgeDeps.llm`);
  * - `has_heldout` that does not match whether the task has a `heldout_commitment`; `rubric` with
  *   `has_heldout` set, as it has no held-out part: `kind rubric has no held-out checks`;
- * - a `rubric` that a model cannot grade (`rubricProblem`): more than 20 criteria, or one that is
- *   blank, longer than 200 characters or holds an angle bracket, or two that read the same once
- *   normalised. Each has a reason of its own, and judging checks them again;
+ * - a `rubric` that a model cannot grade, or whose pass mark a disqualified entry would reach
+ *   (`rubricProblem`, which holds the rules of @tender/shared): more than 20 criteria, or one that
+ *   is blank, longer than 200 characters or holds an angle bracket, or two that read the same once
+ *   normalised, or a `min_score` below 1 (P05-R20). Each has a reason of its own, and judging
+ *   checks them again;
  * - a `rubric` task that the Judge cannot grade before agents spend effort on it (C16, see
  *   `rubricTaskProblem`), checked after the rules above and at intake only: the Judge has no model
- *   (`no model is configured to grade rubric tasks`), its `max_entries` is not from 1 to 50 (`kind
- *   rubric needs max_entries between 1 and 50`), or its brief cannot be read (`the task's brief
- *   could not be read`);
+ *   (`no model is configured to grade rubric tasks`), its entry terms are neither an open task's
+ *   (no invited list and `max_entries` 0: the Judge grades its first 50 entries, P05-R21) nor an
+ *   invite-only task's (`max_entries` from 1 to 50), which is `kind rubric needs max_entries 0 for
+ *   an open task, or 1 to 50 for an invite-only one`, or its brief cannot be read (`the task's
+ *   brief could not be read`);
  * - `exact` or `json_schema` without held-out checks: `held-out checks required for kind {k}`;
  * - a `json_schema` schema with an `$id` below its root, a root `$id` with a fragment, or a
  *   reference other than `#` and one to an entry of its `$defs` or `definitions` (see
  *   `referenceProblem`), or one that `checkJsonSchemaUsable` refuses, with its reason. That check
  *   compiles the schema and tries it, in a worker with a budget of 2 s, and a schema that takes
- *   longer is refused: `criteria schema is not supported: it takes too long to compile`;
+ *   longer is refused: `criteria schema is not supported: it takes too long to compile`, but only
+ *   when it has run out of time on 4 checks in a row (M1). Until then the task stays `pending`
+ *   (`the criteria check ran out of time, checking again`), as a slow check says as much of the
+ *   machine's load as of the schema; a Judge with no memory (`JudgeDeps.memory`) cannot count, and
+ *   refuses it at once;
  * - a `heldout_commitment` that an earlier task of the same poster (a lower id, of any verifier)
  *   commits to as well: `held-out checks already used by task {id}`, naming the lowest. Held-out
  *   checks are single-use, as judging a task publishes them. Another poster's task with the same
- *   commitment does not count (P05-R7): the checks are not its poster's upload, so it is never
- *   judged and never publishes them, and a stranger who posted one first must not block the
- *   poster's own;
+ *   commitment does not count (P05-R7): once a commitment is on chain anyone can post a task
+ *   with it, and only someone who holds the bytes already can have a copy judged, which
+ *   publishes them. A stranger who posted one first must not block the poster's own;
  * - held-out checks that are stored under the commitment but not as the poster's `heldout` blob,
  *   that are over 262_144 bytes, that do not fit `HeldoutSchema`, that are of another kind than
  *   the criteria, that hold a surrogate half with no partner, or whose bytes are not their
@@ -189,22 +215,29 @@ const CHECK_FAILED = "criteria could not be checked";
  * Held-out checks that are not stored yet leave the task `pending` (`waiting for held-out
  * checks`) for 10 minutes from its `created_at`, and then it is `rejected` (`held-out checks
  * missing`). While it waits, the schema's compile check, which needs a worker, is not run yet,
- * and the reasons that come after it are not given: the cheap checks before it are. Anything that
- * throws while the documents are checked, a RangeError included,
- * rejects the task with a fixed reason, and so does a check that crashes its worker. A database
- * error is thrown instead, and so is a worker that cannot be started (`ScorerUnavailableError`):
- * neither says anything about the task, and the next tick tries again. Every reason is at most 200
- * code points.
+ * and the reasons that come after it are not given: the cheap checks before it are. Once the wait
+ * is over, the two reasons that need no worker, `held-out checks missing` and `held-out checks
+ * already used by task {id}`, are given before the compile check, so that a task that would be
+ * turned away for them costs no worker (I5). Anything that throws while the documents are
+ * checked, a RangeError included, rejects the task with a fixed reason, and so does a check that
+ * crashes its worker. A database error is thrown instead, and so is a worker that cannot be
+ * started (`ScorerUnavailableError`): neither says anything about the task, and the next tick
+ * tries again. Every reason is at most 200 code points.
  */
 export async function intakeTask(
   deps: JudgeDeps,
   taskId: bigint,
 ): Promise<"accepted" | "pending" | "rejected"> {
   const [task] = await deps.db.query<
-    TaskTerms & { brief_hash: string; max_entries: number; judge_status: string | null }
+    TaskTerms & {
+      brief_hash: string;
+      max_entries: number;
+      invited: string[];
+      judge_status: string | null;
+    }
   >(
     `select id::text as id, poster, criteria_hash, heldout_commitment,
-            created_at::text as created_at, brief_hash, max_entries, judge_status
+            created_at::text as created_at, brief_hash, max_entries, invited, judge_status
        from tasks where id = $1 and verifier = $2`,
     [taskId, deps.judgeAccount],
   );
@@ -226,9 +259,24 @@ export async function intakeTask(
     const problem = await rubricTaskProblem(deps, task);
     if (problem !== null) checked = rejected(problem);
   }
-  const [status, reason] = checked.ok
-    ? (["accepted", null] as const)
-    : [checked.status, checked.reason];
+  let status: "accepted" | "pending" | "rejected" = checked.ok ? "accepted" : checked.status;
+  let reason: string | null = checked.ok ? null : checked.reason;
+  // M1: a check that ran out of time says as much of the machine as of the schema. The task stays
+  // `pending` for a few ticks, counted in the Judge's memory, and is turned away if it is slow
+  // every time. Without a memory there is nothing to count with, and it is turned away at once.
+  const memory = deps.memory;
+  if (memory !== undefined) {
+    const id = `${taskId}`;
+    if (!checked.ok && checked.tooSlow === true) {
+      const overruns = (memory.overruns.get(id) ?? 0) + 1;
+      memory.overruns.set(id, overruns);
+      if (overruns <= MAX_COMPILE_RETRIES) {
+        status = "pending";
+        reason = COMPILE_RETRY;
+      }
+    }
+    if (status !== "pending") memory.overruns.delete(id);
+  }
   // Only an undecided task is written, so that two Judges at once cannot undo each other.
   await deps.db.query(
     `update tasks set judge_status = $3, judge_reason = $4
@@ -280,7 +328,8 @@ export async function loadDocuments(
 /**
  * The lowest id of a task before task `id` that `poster` posted, of any verifier, and that commits
  * to `commitment`, or `null`. Only the poster's own tasks count (P05-R7): once a commitment is on
- * chain anyone can post a task with it, and that task can never publish the checks.
+ * chain anyone can post a task with it, and only someone who holds the bytes already can have a
+ * copy judged. A stranger's task must neither use up the poster's checks nor hold up its wait.
  */
 async function earlierUseOf(
   db: Db,
@@ -347,22 +396,21 @@ async function checkDocuments(
   if (task.heldout_commitment !== null && heldoutBlob === null && stillComing) {
     return { ok: false, status: "pending", reason: HELDOUT_WAITING };
   }
+  // The refusals that cost a query and no worker come before the compile, which starts one (I5):
+  // checks that are already used, or missing with the wait over, are no reason to pay for it.
+  const cheap = cheapRefusal(task, stored);
+  if (cheap !== null) return rejected(cheap);
   try {
     problem = await compileProblem(criteria, task.criteria_hash, policy);
   } catch (error) {
     if (error instanceof ScorerUnavailableError) throw error;
     problem = CHECK_FAILED;
   }
-  if (problem !== null) return criteriaRefused(problem);
+  if (problem !== null) return criteriaRefused(problem, problem === TOO_SLOW_TO_COMPILE);
   if (task.heldout_commitment === null) return { ok: true, documents: { criteria, heldout: null } };
 
-  // Held-out checks are single-use. The Judge publishes them when it judges the first of the
-  // poster's tasks that commits to them, so a later one with the same commitment has its answers
-  // out, or will. A stranger's task that took the commitment first cannot publish them.
-  if (stored.earlierUse !== null) {
-    return rejected(`held-out checks already used by task ${stored.earlierUse}`);
-  }
-  // Their 10 minutes are over, or this is judging, which does not wait.
+  // Their 10 minutes are over, or this is judging, which does not wait. (A task whose checks are
+  // missing, or already used, was turned away before the compile: `cheapRefusal`.)
   if (heldoutBlob === null) return rejected(HELDOUT_MISSING);
   // Blobs are content-addressed and the first upload of some bytes decides their kind, and anyone
   // who has the bytes can be first. The checks are the poster's when the poster is among the
@@ -395,9 +443,32 @@ function rejected(reason: string): DocumentsCheck {
   return { ok: false, status: "rejected", reason };
 }
 
-/** Criteria that fail the criteria check (`shapeProblem`, `compileProblem`), for `reason`. */
-function criteriaRefused(reason: string): DocumentsCheck {
-  return { ok: false, status: "rejected", reason, criteriaCheck: true };
+/**
+ * Criteria that fail the criteria check (`shapeProblem`, `compileProblem`), for `reason`.
+ * `tooSlow` says the check ran out of time (`DocumentsCheck`).
+ */
+function criteriaRefused(reason: string, tooSlow = false): DocumentsCheck {
+  const refused = { ok: false, status: "rejected", reason, criteriaCheck: true } as const;
+  return tooSlow ? { ...refused, tooSlow: true } : refused;
+}
+
+/**
+ * Why a task with held-out checks is turned away without the compile check, which starts a worker,
+ * or `null` (I5). The same reasons the held-out part gives, asked first:
+ *
+ * - Held-out checks are single-use. The Judge publishes them when it judges the first of the
+ *   poster's tasks that commits to them, so a later one with the same commitment has its answers
+ *   out, or will: `held-out checks already used by task {id}`, naming the lowest. A stranger's
+ *   task that took the commitment first does not count (P05-R7): only someone who holds the
+ *   bytes already can have a copy judged.
+ * - The checks are not stored, and the wait for them is over (`checkDocuments` has returned
+ *   `pending` while it lasts): `held-out checks missing`.
+ */
+function cheapRefusal(task: TaskTerms, stored: Stored): string | null {
+  if (task.heldout_commitment === null) return null;
+  if (stored.earlierUse !== null)
+    return `held-out checks already used by task ${stored.earlierUse}`;
+  return stored.heldout === null ? HELDOUT_MISSING : null;
 }
 
 /**
@@ -490,7 +561,9 @@ function parseJson(bytes: Uint8Array): unknown {
  *   of the root's `$defs` or `definitions`, whose value is a schema: an object or a boolean. That
  *   is what written schemas use. A name of an `Object.prototype` member, such as `constructor`, is
  *   refused even when it is defined. Anything else is refused: an anchor, a URI, a pointer
- *   anywhere else, a missing entry. The reason says to move the schema into `$defs`.
+ *   anywhere else; for those the reason says to move the schema into `$defs`. A pointer that is
+ *   already to a `$defs` or `definitions` entry, but with a `%` in the name, no such entry or an
+ *   entry that is not a schema, has a reason of its own, as moving a schema is not the fix there.
  *
  * The values of `const`, `enum`, `examples` and `default` are data, not schemas, so a `"$ref"` in
  * them is no reference and is not looked at, nor is an `$id` in them. That holds where they are
@@ -540,15 +613,14 @@ function problemOf(reference: string, root: Record<string, unknown>): string | n
   const [, keyword, segment] = DEFS_REFERENCE.exec(reference) ?? [];
   // A `%` is refused rather than decoded, so that the name looked up here is the very one Ajv
   // looks up: it percent-decodes a fragment as it resolves it.
-  if (keyword === undefined || segment === undefined || segment.includes("%")) {
-    return REFERENCE_NOT_ALLOWED;
-  }
+  if (keyword === undefined || segment === undefined) return REFERENCE_NOT_ALLOWED;
+  if (segment.includes("%")) return REFERENCE_TARGET_UNUSABLE;
   const name = segment.replace(/~1/g, "/").replace(/~0/g, "~");
   if (Object.hasOwn(Object.prototype, name)) return BUILT_IN_REFERENCE;
   const entries = Object.hasOwn(root, keyword) ? root[keyword] : undefined;
-  if (!isPlainObject(entries) || !Object.hasOwn(entries, name)) return REFERENCE_NOT_ALLOWED;
+  if (!isPlainObject(entries) || !Object.hasOwn(entries, name)) return REFERENCE_TARGET_UNUSABLE;
   const target = entries[name];
-  return typeof target === "boolean" || isPlainObject(target) ? null : REFERENCE_NOT_ALLOWED;
+  return typeof target === "boolean" || isPlainObject(target) ? null : REFERENCE_TARGET_UNUSABLE;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

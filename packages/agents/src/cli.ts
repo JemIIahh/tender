@@ -574,6 +574,33 @@ async function signInAtStart(
   }
 }
 
+/** The streams and the exit that `exitWhenFlushed` ends a process with: the process's own. */
+export interface ExitIo {
+  stdout: Pick<NodeJS.WriteStream, "write">;
+  stderr: Pick<NodeJS.WriteStream, "write">;
+  exit: (code: number) => never;
+}
+
+/**
+ * Ends the process with `code` once everything written to stdout and stderr has gone out. A pipe
+ * takes writes asynchronously, and `process.exit` would cut what is still queued, so an empty
+ * write is waited for on each stream: writes to a stream complete in order, so its callback comes
+ * after the lines before it. The bin calls this after `main` (review M3), since a request that lost
+ * a race with the stop can otherwise hold the process open for up to the client's own timeout (30 s).
+ * `io` is for tests.
+ */
+export async function exitWhenFlushed(
+  code: number,
+  io: ExitIo = { stdout: process.stdout, stderr: process.stderr, exit: process.exit },
+): Promise<never> {
+  const flushed = (stream: ExitIo["stdout"]) =>
+    new Promise<void>((resolve) => {
+      stream.write("", () => resolve());
+    });
+  await Promise.all([flushed(io.stdout), flushed(io.stderr)]);
+  return io.exit(code);
+}
+
 /**
  * Runs the command line and returns the exit code: 0 after the agent was stopped, 1 for anything
  * that kept it from starting or ended it. The order is the flags, the environment, the agent's

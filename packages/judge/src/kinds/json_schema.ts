@@ -2,6 +2,7 @@ import type { Heldout, PublicCriteria } from "@tender/shared";
 import Ajv2020, { type ValidateFunction } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import type { EntryScore } from "../types";
+import { decodeUtf8, scored } from "./common";
 
 type JsonSchemaCriteria = Extract<PublicCriteria, { kind: "json_schema" }>;
 // `Heldout` is a union, so `Heldout["json_schema"]` does not compile: pick the member first.
@@ -16,6 +17,14 @@ const PATH = /^\$(?:\.[^.[]+|\[(?:0|[1-9]\d*)\])*$/;
 const SEGMENT = /\.([^.[]+)|\[(\d+)\]/g;
 /** What a path finds when it leads nowhere. Not `undefined` or `null`: `null` is a JSON value. */
 const MISSING = Symbol("missing");
+/**
+ * The reason of an entry that makes the schema throw when it is scored (review M6). Fixed: the
+ * entry's own keys can make the validator throw (a key named `valueOf` or `toString` breaks Ajv's
+ * `equal`), the engine's words differ between Node versions, which would make a scorecard re-derive
+ * differently, and they would blame the criteria for what the entry did. The check at intake says
+ * more (`cannotEvaluate`), since there the schema is what throws.
+ */
+const ENTRY_NOT_CHECKED = "the entry could not be checked against the schema";
 /** What `checkJsonSchemaUsable` runs a schema on: the smallest document of each JSON type. */
 const TRIAL_DOCUMENTS: unknown[] = [null, true, 0, "", [], {}];
 
@@ -40,7 +49,8 @@ type Compiled = { validate: ValidateFunction } | { reason: string };
  *
  * Pure, and total in the bytes: whatever an agent wrote, this returns a score and does not throw.
  * A document scores 0, with a reason, when it is nested so deeply that validating it overflows the
- * stack, and when it makes the schema throw or leave errors that cannot be read. Every document
+ * stack, and when it makes the schema throw or leave errors that cannot be read (the reason is
+ * fixed: `the entry could not be checked against the schema`). Every document
  * scores 0 when the schema does not compile or is an `$async` schema. The criteria say what a task
  * asks for, and a task that asks for something that cannot be checked pays nobody.
  *
@@ -122,7 +132,8 @@ export function jsonSchemaScorer(
  * document, when the schema does not compile or is `$async`). `ok: true` is not a promise that
  * every answer can be scored. A schema that fails only on documents with certain contents, such
  * as a wrong type in one property, passes, and the scorer scores such a document 0 and the rest
- * as usual.
+ * as usual. Nor does it check that any document can fit: a schema that no document satisfies
+ * (`{"not": {}}`) passes, and scores every entry 0.
  */
 export function checkJsonSchemaUsable(
   schema: Record<string, unknown>,
@@ -154,9 +165,7 @@ function checkSchema(compiled: Compiled, document: unknown): string[] | null {
     // Under a recursive schema Ajv recurses once per level of nesting, and JSON.parse reads
     // documents far deeper than the stack allows. Whatever else a schema does to throw, the
     // document it throws on scores 0 like any other that does not fit.
-    return [
-      run.error instanceof RangeError ? "too deeply nested to validate" : cannotEvaluate(run.error),
-    ];
+    return [run.error instanceof RangeError ? "too deeply nested to validate" : ENTRY_NOT_CHECKED];
   }
   return run.fits ? null : run.errors;
 }
@@ -292,17 +301,4 @@ function deepEqual(a: unknown, b: unknown): boolean {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** The text of `content`, or `null` when it is not valid UTF-8. */
-function decodeUtf8(content: Uint8Array): string | null {
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(content);
-  } catch {
-    return null;
-  }
-}
-
-function scored(c: JsonSchemaCriteria, score: number, reasons: string[]): EntryScore {
-  return { score, passed: score >= c.min_score, reasons };
 }

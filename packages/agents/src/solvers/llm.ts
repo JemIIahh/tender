@@ -156,6 +156,8 @@ function formatRules(brief: Brief, criteria: PublicCriteria): string {
         '- "pattern" is a JavaScript regular expression source, without the surrounding slashes, at most 2000 characters. Escape backslashes for JSON: write \\\\d for \\d.',
         '- "flags" is any of i, m, s, u, each at most once, or an empty string. Never use g or y.',
         "- The regex is tested with RegExp.test on each whole test string and is not anchored for you: add ^ and $ yourself where the task needs the whole string to match.",
+        // The Judge runs a pattern in QuickJS, and shape.ts only checks that V8 compiles it.
+        "- The regex is run by QuickJS, a small JavaScript engine, not by V8: keep to common syntax and to fewer than 255 capture groups (use (?:...) where you need no capture). A pattern QuickJS refuses scores 0.",
       ].join("\n");
     case "code_js": {
       const entry = entryOf(brief, criteria);
