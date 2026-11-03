@@ -34,7 +34,7 @@ export function PlatformStats() {
 
   if (items.length === 0) return null;
   return (
-    <div data-testid="platform-stats" className="grid gap-3">
+    <div data-testid="platform-stats" className="grid gap-3 border-t border-line px-3 pt-5">
       <p className="flex items-center gap-2 font-mono text-[10.5px] tracking-[0.16em] text-muted uppercase">
         <span aria-hidden="true" className="size-1.5 rounded-full bg-seal" />
         Live on Tender

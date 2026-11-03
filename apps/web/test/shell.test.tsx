@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test, vi } from "vitest";
 import { AppShell } from "../components/AppShell";
@@ -13,6 +13,23 @@ import { agent, summary } from "./tasks";
 
 const pathname = vi.hoisted(() => ({ current: "/tasks" }));
 vi.mock("next/navigation", () => ({ usePathname: () => pathname.current }));
+
+// The wallet as the top bar reads it: a store that nothing here starts, with the account a test
+// sets. The real one (lib/wallet.ts) would look for near-connect.
+const wallet = vi.hoisted(() => ({
+  state: { ready: true, accountId: null as string | null, canSignMessage: true },
+  listeners: new Set<() => void>(),
+}));
+vi.mock("../lib/wallet", () => ({
+  walletStore: {
+    subscribe: (listener: () => void) => {
+      wallet.listeners.add(listener);
+      return () => wallet.listeners.delete(listener);
+    },
+    getSnapshot: () => wallet.state,
+    getServerSnapshot: () => wallet.state,
+  },
+}));
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
@@ -32,6 +49,7 @@ function fakeApi(routes: Record<string, () => Response>): string[] {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  wallet.state = { ...wallet.state, accountId: null };
 });
 
 const HEALTH = {
@@ -64,6 +82,26 @@ test("shell_has_the_page_the_post_pill_and_the_way_to_the_wallet", () => {
   // The skip link leads past the sidebar to the page.
   expect(screen.getByRole("link", { name: "Skip to the page" }).getAttribute("href")).toBe("#main");
   expect(screen.getByRole("main").id).toBe("main");
+});
+
+test("shell_top_bar_names_the_connected_account_once_the_tab_has_one", () => {
+  fakeApi({});
+  render(
+    <AppShell>
+      <p>The page</p>
+    </AppShell>,
+  );
+  const banner = within(screen.getByRole("banner"));
+  expect(banner.getByRole("link", { name: "Connect wallet" })).toBeTruthy();
+
+  // A page connected the wallet: the same place now names the account, and still leads to the
+  // wallet page.
+  act(() => {
+    wallet.state = { ...wallet.state, accountId: "alice.testnet" };
+    for (const listener of wallet.listeners) listener();
+  });
+  expect(banner.queryByRole("link", { name: "Connect wallet" })).toBeNull();
+  expect(banner.getByRole("link", { name: "alice.testnet" }).getAttribute("href")).toBe("/wallet");
 });
 
 test("shell_menu_opens_and_closes_the_sidebar_on_a_phone", async () => {

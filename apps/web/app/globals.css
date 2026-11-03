@@ -36,6 +36,12 @@
   outline-color: var(--color-ink);
 }
 
+/* The app's top bar stays at the top of the screen: what the page scrolls to, or moves the focus
+   to, stops below it and not under it. */
+html:has(.app) {
+  scroll-padding-top: 5rem;
+}
+
 /* The browser draws the app's own controls (a select's list, a scrollbar, a date picker) dark. */
 .app {
   color-scheme: dark;

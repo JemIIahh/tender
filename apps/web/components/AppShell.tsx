@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { type ReactNode, useEffect, useId, useState } from "react";
+import { type ReactNode, useEffect, useId, useState, useSyncExternalStore } from "react";
+import { walletStore } from "../lib/wallet";
 import { Mark } from "./Mark";
 import { Nav } from "./Nav";
 import { PlatformStats } from "./PlatformStats";
@@ -26,8 +27,9 @@ function Wordmark() {
 
 /**
  * The frame of every page after the landing: a sidebar with the pages and a few live figures, a
- * top bar with "Post task" and the way to the wallet, and the page itself. On a phone the sidebar
- * is a menu that the top bar opens, over the page, and that closes when a page is chosen.
+ * top bar with "Post task" and the way to the wallet (the connected account, once a page has
+ * connected one), and the page itself. On a phone the sidebar is a menu that the top bar opens,
+ * over the page, and that closes when a page is chosen.
  *
  * The top bar comes first in the document, so that on a phone the open menu is the next thing the
  * keyboard reaches after the button that opened it.
@@ -38,6 +40,14 @@ export function AppShell({ children }: { children: ReactNode }) {
   // The page the menu was opened on. It is open only there: choosing a page closes it.
   const [openOn, setOpenOn] = useState<string | null>(null);
   const open = openOn === pathname;
+  // The wallet as far as this tab knows it, without looking for one: a page that needs the wallet
+  // starts the store (lib/wallet.ts), and the board, say, does not load a wallet only for the top
+  // bar. Until then, and while none is connected, the pill offers to connect one.
+  const { accountId } = useSyncExternalStore(
+    walletStore.subscribe,
+    walletStore.getSnapshot,
+    walletStore.getServerSnapshot,
+  );
 
   // Escape closes the menu, as it closes any menu.
   useEffect(() => {
@@ -92,9 +102,21 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Link href="/post" className={`${PRIMARY} ${BAR_PILL}`}>
             Post task
           </Link>
-          <Link href="/wallet" className={`${SECONDARY} ${BAR_PILL}`}>
-            Connect wallet
-          </Link>
+          {accountId === null ? (
+            <Link href="/wallet" className={`${SECONDARY} ${BAR_PILL}`}>
+              Connect wallet
+            </Link>
+          ) : (
+            <Link
+              href="/wallet"
+              title={accountId}
+              className={`${SECONDARY} ${BAR_PILL} max-w-[10rem] sm:max-w-60`}
+            >
+              <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-seal" />
+              {/* The account as it is written: an account id is lower case. */}
+              <span className="truncate text-xs tracking-normal normal-case">{accountId}</span>
+            </Link>
+          )}
         </div>
       </header>
 
@@ -107,7 +129,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Wordmark />
         </div>
         <Nav />
-        <div className="mt-auto border-t border-line px-3 pt-5">
+        <div className="mt-auto">
           <PlatformStats />
         </div>
       </aside>
