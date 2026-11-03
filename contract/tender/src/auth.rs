@@ -17,7 +17,9 @@
 //! of that key costs at most `total_cap` of one token. `withdraw`, `storage_withdraw`, the owner's
 //! setters, `add_delegate` and `remove_delegate` never come here: they require 1 yoctoNEAR
 //! (`assert_one_yocto`), which no function-call key can attach, so a delegate key can neither move
-//! money out nor raise its own caps.
+//! money out nor raise its own caps. And `pick` refuses a call signed by a delegate key of the
+//! verifier or poster (`signed_by_delegate`), whatever methods the access key allows, so the key
+//! cannot award an escrow either; the account picks with any other key.
 //!
 //! `spent` is written before the debit and the rest of the spending method. Every panic after it
 //! (`E_FUNDS`, `E_STORAGE`) fails the receipt, and NEAR rolls back all of a failed receipt's state
@@ -36,6 +38,19 @@ fn refused() -> ! {
         "{}: attach exactly 1 yoctoNEAR or use a delegate key within caps",
         err::E_AUTH
     ))
+}
+
+/// The key, in `delegates`, of the record that would make this call one by a delegate key of
+/// `account`: `(account, the public key that signed the transaction)`. `None` unless the call
+/// came straight from `account`, that is unless the signer and the predecessor are both
+/// `account`; through another contract the signing key is not `account`'s to vouch for.
+///
+/// `authorize_spend` and `pick` both look a delegate up this way, so a key counts as a delegate
+/// for refusing a pick exactly when it would count as one for spending.
+fn direct_signing_key(account: &AccountId) -> Option<(AccountId, PublicKey)> {
+    let signer = env::signer_account_id();
+    (signer == *account && signer == env::predecessor_account_id())
+        .then(|| (signer, env::signer_account_pk()))
 }
 
 impl DelegateCaps {
@@ -165,14 +180,13 @@ impl Tender {
         if attached == 1 {
             return;
         }
-        let signer = env::signer_account_id();
-        if attached != 0 || signer != env::predecessor_account_id() || signer != *account {
+        if attached != 0 {
             refused();
         }
-        let Some(caps) = self
-            .delegates
-            .get_mut(&(account.clone(), env::signer_account_pk()))
-        else {
+        let Some(key) = direct_signing_key(account) else {
+            refused()
+        };
+        let Some(caps) = self.delegates.get_mut(&key) else {
             refused()
         };
         if caps.token != *token {
@@ -198,6 +212,13 @@ impl Tender {
                 caps.spent
             )),
         }
+    }
+
+    /// Whether this call was signed by one of `account`'s delegate keys and came straight from
+    /// `account`: the lookup `authorize_spend` makes. `pick` refuses such a call, because a key
+    /// that may spend within caps must not also decide where an escrow goes.
+    pub(crate) fn signed_by_delegate(&self, account: &AccountId) -> bool {
+        direct_signing_key(account).is_some_and(|key| self.delegates.contains_key(&key))
     }
 }
 

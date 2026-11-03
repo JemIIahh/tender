@@ -53,6 +53,8 @@ impl Tender {
     /// - the task exists (`E_NOT_FOUND`);
     /// - it is not settled yet (`E_SETTLED`);
     /// - the caller is its verifier or its poster (`E_AUTH`);
+    /// - the call is not signed by one of the caller's delegate keys (`add_delegate`), which may
+    ///   spend within caps but never judge (`E_AUTH`);
     /// - the caller's window is open: the verifier's from `reveal_deadline` up to, but not
     ///   including, `pick_deadline`, and the poster's from there up to, but not including,
     ///   `fallback_deadline`. A poster who is also the verifier has both (`E_PHASE`);
@@ -85,7 +87,7 @@ impl Tender {
     /// amount.
     ///
     /// Picks work while the contract is paused, and attach no deposit, so a function-call key can
-    /// send them.
+    /// send them, as long as it is not a delegate key.
     #[deny_unknown_arguments]
     pub fn pick(
         &mut self,
@@ -104,6 +106,14 @@ impl Tender {
         if caller != task.verifier && caller != task.poster {
             env::panic_str(&format!(
                 "{}: only the verifier or the poster can pick task {id}",
+                err::E_AUTH
+            ));
+        }
+        // A key that may spend within caps must not also decide where an escrow goes, or a
+        // leaked one could award any task its account judges.
+        if self.signed_by_delegate(&caller) {
+            env::panic_str(&format!(
+                "{}: task {id} cannot be picked with a delegate key; sign with another key of {caller}",
                 err::E_AUTH
             ));
         }
@@ -424,7 +434,7 @@ mod tests {
     use near_sdk::json_types::{U128, U64};
     use near_sdk::serde_json::{self, json, Value};
     use near_sdk::test_utils::get_logs;
-    use near_sdk::{borsh, env, testing_env, AccountId, NearToken};
+    use near_sdk::{borsh, env, testing_env, AccountId, CurveType, NearToken, PublicKey};
 
     use super::split_reward;
     use crate::entries::commitment_of;
@@ -1130,6 +1140,63 @@ mod tests {
             .build());
         assert_eq!(pick_bob(&mut t), None);
         assert_eq!(balance(&t, "bob.test"), 950_000);
+    }
+
+    /// A key that may spend is never a key that judges. A pick, empty or not, signed by a delegate
+    /// key of the verifier in its window, or of the poster in the fallback window, is refused, so
+    /// a leaked delegate key costs at most its caps; the same accounts' other keys pick as before.
+    #[test]
+    fn delegate_key_cannot_pick() {
+        let key = |byte: u8| PublicKey::from_parts(CurveType::ED25519, vec![byte; 32]).unwrap();
+        let mut t = world();
+        let judged = post(&mut t, args());
+        let fallback = post(&mut t, args());
+        revealed(&mut t, judged, &["bob.test"]);
+        revealed(&mut t, fallback, &["bob.test"]);
+        // The judge and alice each register a delegate key, as an agent account does to post
+        // sub-tasks on its own.
+        for who in [JUDGE, "alice.test"] {
+            testing_env!(ctx(who).attached_deposit(ONE_YOCTO).build());
+            t.add_delegate(key(7), acct(USDC), U128(REWARD), U128(REWARD));
+        }
+        let pick_as =
+            |t: &mut Tender, who: &str, pk: PublicKey, id: u64, now: u64, list: Shares| {
+                testing_env!(ctx(who).signer_account_pk(pk).block_timestamp(now).build());
+                let (list, hash, uri) = (
+                    winners(list),
+                    SCORECARD_HASH.to_string(),
+                    SCORECARD_URI.to_string(),
+                );
+                match panic_message(|| t.pick(U64(id), list, hash, uri)) {
+                    Some(message) => Err(message),
+                    None => Ok(()),
+                }
+            };
+        let bob: Shares = &[("bob.test", 10_000)];
+        for (who, id, now) in [
+            (JUDGE, judged, REVEAL_DEADLINE),
+            ("alice.test", fallback, PICK_DEADLINE),
+        ] {
+            for list in [bob, &[]] {
+                let result = pick_as(&mut t, who, key(7), id, now, list);
+                let what = format!("{who}'s delegate key picking {list:?}");
+                let message = assert_rejected(result, "E_AUTH", &what);
+                assert_eq!(
+                    message,
+                    format!(
+                        "E_AUTH: task {id} cannot be picked with a delegate key; sign with \
+                         another key of {who}"
+                    )
+                );
+            }
+            assert_eq!(outcome(&t, id), None);
+        }
+        assert_eq!(balance(&t, "bob.test"), 0);
+
+        // Another key of the same account is no delegate, and picks.
+        pick_as(&mut t, JUDGE, key(9), judged, REVEAL_DEADLINE, bob).unwrap();
+        pick_as(&mut t, "alice.test", key(9), fallback, PICK_DEADLINE, bob).unwrap();
+        assert_eq!(balance(&t, "bob.test"), 2 * 950_000);
     }
 
     #[test]

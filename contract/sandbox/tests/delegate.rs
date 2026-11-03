@@ -276,6 +276,66 @@ mod delegate {
         Ok(())
     }
 
+    /// A key that may spend is never a key that judges. The judge's delegate key cannot pick, even
+    /// when its access key may call `pick`, so a leaked one cannot award the tasks the judge
+    /// verifies. The judge's full-access key can, and so can a function-call key of the judge
+    /// that is no delegate, which is how the Judge service signs its picks.
+    #[tokio::test]
+    async fn verifier_delegate_key_cannot_pick() -> anyhow::Result<()> {
+        let env = setup(5).await?;
+        let judge = &env.judge;
+        deposit(&env, &env.poster, 2 * REWARD).await?;
+        let mut ids = Vec::new();
+        let mut sealed = Vec::new();
+        for content in [b"first", b"other"] {
+            let id = post(&env, &env.poster, task_json(&env, REWARD, judge.id(), 1)).await?;
+            sealed.push(commit_work(&env, &env.alice, id, content).await?);
+            ids.push(id);
+        }
+        let delegate_key = function_call_key(&env, judge, &["post_task", "pick"]).await?;
+        done_clean(add_delegate(&env, judge, &delegate_key, PER_TASK, TOTAL, ONE_YOCTO).await?)?;
+        let picking_key = function_call_key(&env, judge, &["pick"]).await?;
+
+        let task = get_task(&env, ids[0]).await?;
+        advance_to(&env, deadline(&task, "commit_deadline")).await?;
+        for (id, (hash, salt)) in ids.iter().zip(&sealed) {
+            done_clean(reveal(&env, &env.alice, *id, hash, salt, "ipfs://alice").await?)?;
+        }
+        advance_to(&env, deadline(&task, "reveal_deadline")).await?;
+        assert_eq!(get_task(&env, ids[0]).await?["phase"], "judging");
+
+        // The delegate key is refused, for a pick and for an empty pick, and nothing changes.
+        let before = stored(&env).await?;
+        for winners in [vec![winner(&env.alice, 10_000)], vec![]] {
+            let r = pick(&env, &delegate_key, ids[0], winners).await?;
+            assert_fails_with(
+                &r,
+                &format!(
+                    "E_AUTH: task {} cannot be picked with a delegate key; sign with another key \
+                     of {}",
+                    ids[0],
+                    judge.id()
+                ),
+            );
+            assert!(events(&r).is_empty());
+        }
+        assert!(
+            stored(&env).await? == before,
+            "a refused pick changed storage"
+        );
+
+        // The judge's other keys pick: a function-call key that is no delegate, and its
+        // full-access key.
+        done_clean(pick(&env, &picking_key, ids[0], vec![winner(&env.alice, 10_000)]).await?)?;
+        done_clean(pick(&env, judge, ids[1], vec![winner(&env.alice, 10_000)]).await?)?;
+        assert_eq!(
+            vault_balance(&env, env.alice.id()).await?,
+            2 * (REWARD - fee_of(REWARD))
+        );
+        assert_conserved(&env, &[]).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn remove_delegate_revokes_the_key_and_refunds_storage() -> anyhow::Result<()> {
         let env = setup(5).await?;
