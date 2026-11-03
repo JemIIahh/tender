@@ -1,6 +1,6 @@
 import { type BigIntStats, constants as fsConstants } from "node:fs";
 import { type FileHandle, open, realpath, stat } from "node:fs/promises";
-import { isAbsolute, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { TenderError, type TxResult } from "@tender/client";
@@ -30,7 +30,7 @@ import { z } from "zod";
 import { keyMayCall } from "../keys";
 import { documentText, secretCheck } from "../secrets";
 import type { McpDeps, OpenFileLookup } from "../server";
-import { type Draft, isDraftOf, staleReason } from "../state";
+import { DRAFTS_DIR, type Draft, defaultStateRoot, isDraftOf, staleReason } from "../state";
 import {
   DATA_NOT_ORDERS,
   describeError,
@@ -90,9 +90,13 @@ import {
 // P04-R2), and `readConfig` gives its real path, looked up once at start-up: files are read inside
 // that path, and what the user wrote is never followed again, so that a link changed later moves
 // nothing (P04-R3). On Linux the open file is traced back to a path through its descriptor
-// (`OpenFileLookup`). Nothing inside the state directory is read, whatever `filesDir` is: it holds
-// every draft, and with it the unrevealed work and the salt of other tasks. Work that holds one of
-// the server's own secrets is
+// (`OpenFileLookup`). No state is read, whatever `filesDir` is, since a draft holds the unrevealed
+// work and the salt of a task, and a user may well point `filesDir` at a directory that holds the
+// state (the home directory, say). Three places are kept out (`keptOut`): this server's own state
+// directory; the root of the default ones, `~/.tender`, where every account on the machine keeps
+// its own; and any folder named `drafts`, which is the layout of every store (`{dir}/drafts/{id}`),
+// so that the state directory of another server, wherever it is, is covered too. Work that holds one
+// of the server's own secrets is
 // refused, whether it came as text or as a file, since the scrubber sees what a tool says and never
 // what a reveal uploads. The secret is looked for as it is and in the usual disguises (best effort),
 // where the work comes in (a commit), where a draft's commit is sent again, and a last time just
@@ -208,36 +212,76 @@ function isInside(dir: string, path: string): boolean {
 
 /**
  * The one answer to a file that cannot be read from the directory, whatever the reason: missing,
- * outside, a link that leads out, or a file with another name. A reason would say what is on the disk
- * beyond the directory, to anyone who can put a link inside it that leads out.
+ * outside, a link that leads out, a file with another name, or a place where Tender keeps its state.
+ * A reason would say what is on the disk beyond the directory, or in the state, to anyone who can
+ * put a link inside the directory that leads there. So the answer names every rule, and none of the
+ * facts: which of them held, and what the path leads to, it does not say.
  */
 function unreadable(): ToolError {
-  return new ToolError("FILE_UNREADABLE", "cannot read that file inside TENDER_FILES_DIR");
+  return new ToolError(
+    "FILE_UNREADABLE",
+    "cannot read that file inside TENDER_FILES_DIR. A file is refused when it is missing, outside " +
+      "the directory (or reached by a link that leads out), has a second hard link, or is in a " +
+      "Tender state directory (TENDER_STATE_DIR, or anything under ~/.tender) or in a folder named " +
+      "drafts; the answer does not say which",
+  );
 }
 
 /**
- * Whether the real path `real` is `stateDir` or lies in it. `stateDir` is looked up here, each time:
- * the store makes the directory when it first writes, and until then no file lies in it.
+ * Whether the real path `real` is a place where Tender keeps its state, and so is never read, any
+ * more than if it were outside the directory. That is a path with a folder named `drafts` on the way
+ * (in any letter case: a disk may not tell them apart), or one that is one of `places` or lies in it.
+ * The folder is the layout of every store (`{state dir}/drafts/{task id}.json`), so it covers the
+ * state directory of any server, wherever it is. The name of the file itself does not count: a file
+ * that is called `drafts` is no store. `places` are the state directory this server was given, its
+ * drafts folder, and the root of the default state directories (see `McpDeps.stateDir` and
+ * `McpDeps.stateRoot`). Each is looked up here, every time: the store makes its directories when
+ * it first writes, and until then no file lies in one, and a link in the way of one is followed.
  */
-async function inStateDir(real: string, stateDir: string): Promise<boolean> {
-  let where: string;
-  try {
-    where = await realpath(stateDir);
-  } catch {
-    where = resolve(stateDir);
+async function keptOut(real: string, places: readonly string[]): Promise<boolean> {
+  const folders = dirname(real).split(sep);
+  if (folders.some((name) => name.toLowerCase() === DRAFTS_DIR)) return true;
+  for (const place of places) {
+    let where: string;
+    try {
+      where = await realpath(place);
+    } catch {
+      where = resolve(place);
+    }
+    if (real === where || isInside(where, real)) return true;
   }
-  return real === where || isInside(where, real);
+  return false;
+}
+
+/**
+ * The places that `keptOut` is given, from the deps: the state directory they name and its drafts
+ * folder (which may be a link to another disk), and the root of the default state directories, the
+ * deps' own or `~/.tender`. A machine with no home directory has no default root to keep out.
+ */
+function placesKeptOut(deps: Pick<McpDeps, "stateDir" | "stateRoot">): string[] {
+  const places: string[] = [];
+  if (deps.stateDir !== undefined) places.push(deps.stateDir, join(deps.stateDir, DRAFTS_DIR));
+  let root = deps.stateRoot;
+  if (root === undefined) {
+    try {
+      root = defaultStateRoot();
+    } catch {
+      // No usable home directory, so no default state directories either.
+    }
+  }
+  if (root !== undefined) places.push(root);
+  return places;
 }
 
 /**
  * Where `path` leads (a real path), if that is a place under `directory` (a real path as well) and
- * not in `stateDir`, where the drafts are. A path that leads nowhere, one that leads out and one that
- * leads into the drafts get the same answer, `unreadable()`.
+ * not one that is kept out (`keptOut`). A path that leads nowhere, one that leads out and one that
+ * leads into the state get the same answer, `unreadable()`.
  */
 async function realInside(
   path: string,
   directory: string,
-  stateDir: string | undefined,
+  keepOut: readonly string[],
 ): Promise<string> {
   let real: string;
   try {
@@ -246,7 +290,7 @@ async function realInside(
     throw unreadable();
   }
   if (!isInside(directory, real)) throw unreadable();
-  if (stateDir !== undefined && (await inStateDir(real, stateDir))) throw unreadable();
+  if (await keptOut(real, keepOut)) throw unreadable();
   return real;
 }
 
@@ -273,10 +317,12 @@ const PROCESS_FILES: OpenFileLookup = {
  * made after the first shows only in the second. And on Linux the kernel is asked where the open
  * file is (`openFiles`), which is a look at the descriptor and not at a name, and must be inside.
  *
- * Nothing in `stateDir` is read, wherever `filesDir` is, and a link, a `..` or a second name does not
- * get a draft out of it: it is the real path that is judged, at each look and, on Linux, for the open
- * file. `filesDir` can be a directory that holds the state directory (the user's home, say), and the
- * drafts of the other tasks are in it under names that anyone with the task numbers can guess.
+ * Nothing that is kept out (`keptOut`: the state directory, the root of the default ones, any folder
+ * named `drafts`) is read, wherever `filesDir` is, and a link, a `..` or a second name does not get a
+ * draft out of it: it is the real path that is judged, at each of the three looks (before the open,
+ * at the open file's descriptor on Linux, and again once it is open). `filesDir` can be a directory
+ * that holds the state (the user's home, say), and the drafts of the tasks, of this account and of
+ * every other on the machine, are in it under names that anyone with the task numbers can guess.
  *
  * What is left (P04-R2). Looking a path up again is a look at a name, and a name can be swapped back
  * and forth between the looks, so that each look finds what it expects. On macOS, and on any
@@ -293,7 +339,7 @@ async function readLocalFile(
   path: string,
   limit: number,
   filesDir: string | undefined,
-  stateDir: string | undefined,
+  keepOut: readonly string[],
   openFiles: OpenFileLookup,
 ): Promise<Uint8Array> {
   if (filesDir === undefined) {
@@ -304,7 +350,7 @@ async function readLocalFile(
     );
   }
   if (!isAbsolute(path)) throw new ToolError("BAD_INPUT", "file_path must be an absolute path");
-  const real = await realInside(path, filesDir, stateDir);
+  const real = await realInside(path, filesDir, keepOut);
 
   let handle: FileHandle;
   try {
@@ -327,12 +373,12 @@ async function readLocalFile(
         throw unreadable();
       }
       if (!isInside(filesDir, opened)) throw unreadable();
-      if (stateDir !== undefined && (await inStateDir(opened, stateDir))) throw unreadable();
+      if (await keptOut(opened, keepOut)) throw unreadable();
     }
     // Whole numbers (bigint), so that inodes beyond 2^53 are told apart too.
     const stats = await handle.stat({ bigint: true });
     // Is the file that is open the one the path leads to now, and is that inside still?
-    const again = await realInside(path, filesDir, stateDir);
+    const again = await realInside(path, filesDir, keepOut);
     let there: BigIntStats;
     try {
       there = await stat(again, { bigint: true });
@@ -386,7 +432,8 @@ interface Loaded {
 
 /** Registers the write tools on `server`. */
 export function registerWriteTools(server: McpServer, deps: McpDeps): void {
-  const { api, client, state, network, accountId, contractId, filesDir, stateDir } = deps;
+  const { api, client, state, network, accountId, contractId, filesDir } = deps;
+  const keepOut = placesKeptOut(deps);
   const secrets = deps.secrets ?? [];
   const minWindowSecs = NETWORKS[network].minWindowSecs;
 
@@ -943,8 +990,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     filesDir === undefined
       ? ""
       : "A file that cannot be read from there (it is missing, or outside, or reached by a link that " +
-        "leads out, or it has a second hard link, or it is in this server's own state directory, " +
-        "where the drafts are) is refused with FILE_UNREADABLE, and the answer does not say which. ";
+        "leads out, or it has a second hard link, or it is in a Tender state directory, which is " +
+        "this server's own, anything under ~/.tender, or any folder named drafts) is refused with " +
+        "FILE_UNREADABLE, and the answer does not say which. ";
 
   server.registerTool(
     "commit_result",
@@ -1010,7 +1058,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
             file_path ?? "",
             MAX_RESULT,
             filesDir,
-            stateDir,
+            keepOut,
             deps.openFiles ?? PROCESS_FILES,
           );
       if (bytes.length > MAX_RESULT) throw tooLarge(bytes.length, MAX_RESULT);

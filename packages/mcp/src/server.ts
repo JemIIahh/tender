@@ -78,11 +78,20 @@ export interface McpDeps {
   /**
    * The directory the drafts are kept in (the bin passes `TENDER_STATE_DIR`'s). `commit_result`
    * reads no file inside it, whatever `filesDir` is: a draft file holds another task's unrevealed
-   * work and its salt, and `reveal_result` publishes what a commit took in. Not set means that
-   * nothing is kept out, so a caller that builds the deps by hand and sets `filesDir` answers for
-   * it. The path need not exist yet, nor be a real path: it is looked up at each call.
+   * work and its salt, and `reveal_result` publishes what a commit took in. Not set means that this
+   * directory is not named; the other places that are kept out (`stateRoot`, and any folder called
+   * `drafts`) are kept out all the same, so a caller that builds the deps by hand and sets
+   * `filesDir` need only name this one. The path need not exist yet, nor be a real path: it is
+   * looked up at each call.
    */
   stateDir?: string;
+  /**
+   * The directory that holds the default state directories of every account on this machine,
+   * `~/.tender` (`defaultStateRoot`). `commit_result` reads no file inside it either, whatever
+   * `filesDir` is: another account's drafts are as private as this server's own. Not set means the
+   * default root, and a test says where it is. The path need not exist, nor be a real path.
+   */
+  stateRoot?: string;
   /** How an open file is traced back to a path. Not set means the process's own (the real one). */
   openFiles?: OpenFileLookup;
   /**

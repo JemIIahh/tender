@@ -269,6 +269,19 @@ async function syncDirectory(path: string): Promise<void> {
 }
 
 /**
+ * The directory that holds every default state directory, for each network and each account:
+ * `{home}/.tender`, the parent of what `defaultStateDir` gives. `home` must be an absolute path (see
+ * `defaultStateDir`).
+ */
+export function defaultStateRoot(home: string = homedir()): string {
+  // An empty or relative home would put the state wherever the process happens to run.
+  if (!isAbsolute(home)) {
+    throw new Error(`the home directory must be an absolute path, got ${show(home)}`);
+  }
+  return join(home, ".tender");
+}
+
+/**
  * Where an agent's state lives unless the operator names another directory:
  * `{home}/.tender/{network}/{account}`. Each network and each account gets its own, so two agents
  * on one machine never share drafts. It returns a path and creates nothing: the store makes the
@@ -296,12 +309,15 @@ export function defaultStateDir(
   if (!AccountIdSchema.safeParse(account).success) {
     throw new Error(`invalid account ${show(account)}: expected a NEAR account id`);
   }
-  // An empty or relative home would put the state wherever the process happens to run.
-  if (!isAbsolute(home)) {
-    throw new Error(`the home directory must be an absolute path, got ${show(home)}`);
-  }
-  return join(home, ".tender", network, account);
+  return join(defaultStateRoot(home), network, account);
 }
+
+/**
+ * The folder, inside a state directory, that holds the drafts: `{dir}/drafts/{taskId}.json`. Every
+ * store has it, whatever its directory is called, so a path with a folder of this name on the way
+ * may be one of a store's.
+ */
+export const DRAFTS_DIR = "drafts";
 
 /**
  * The store for the drafts in `{dir}/drafts/{taskId}.json`. It creates `dir` on the first write,
@@ -315,7 +331,7 @@ export function createStateStore(dir: string): StateStore {
     throw new Error("the state directory must not be empty");
   }
   // Resolved now, so that a later `chdir` cannot move the store.
-  const draftsDir = join(resolve(dir), "drafts");
+  const draftsDir = join(resolve(dir), DRAFTS_DIR);
   const fileOf = (taskId: string) => join(draftsDir, `${taskId}${DRAFT_SUFFIX}`);
 
   async function readDraft(taskId: string): Promise<Draft | null> {

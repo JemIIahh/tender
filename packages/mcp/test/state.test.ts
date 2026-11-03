@@ -15,8 +15,10 @@ import { computeCommitment, type NetworkId, sha256Hex } from "@tender/shared";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   createStateStore,
+  DRAFTS_DIR,
   type Draft,
   defaultStateDir,
+  defaultStateRoot,
   isDraftOf,
   staleReason,
 } from "../src/state";
@@ -669,4 +671,27 @@ test("default_state_dir_needs_a_real_absolute_home", () => {
       `home ${JSON.stringify(home)}`,
     ).toThrow(/absolute/);
   }
+});
+
+test("the_default_state_root_is_the_parent_of_every_default_state_dir", async () => {
+  // commit_result keeps the whole root out of reach, so every default state directory must lie
+  // directly below it, two levels down.
+  expect(defaultStateRoot(root)).toBe(join(root, ".tender"));
+  for (const network of ["sandbox", "testnet", "mainnet"] as const) {
+    for (const account of ["alice.near", "a-b_c.d", "0123456789abcdef".repeat(4)]) {
+      const stateDir = defaultStateDir(network, account, root);
+
+      expect(dirname(dirname(stateDir)), `${network} ${account}`).toBe(defaultStateRoot(root));
+    }
+  }
+  // The home is the operating system's unless the caller says otherwise, and it must be absolute.
+  expect(defaultStateRoot()).toBe(join(homedir(), ".tender"));
+  for (const home of ["", "~", "relative/home"]) {
+    expect(() => defaultStateRoot(home), `home ${JSON.stringify(home)}`).toThrow(/absolute/);
+  }
+
+  // Every store keeps its drafts in the folder that the server keeps out by name.
+  await createStateStore(dir).saveDraft(makeDraft("7"));
+  expect(await readdir(dir)).toEqual([DRAFTS_DIR]);
+  expect(DRAFTS_DIR).toBe("drafts");
 });
