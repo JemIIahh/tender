@@ -12,8 +12,8 @@ import { routeWalletManifest, type SentBatch, STUB_WALLET_NAME } from "./walletS
 // What the transactions do is the model's (test/fakeChain.ts), when the wallet is given one; a
 // wallet with no chain sends nothing, and throws if it is asked to. What the signature is signed
 // with is made up: the fixture APIs (e2e/postApi.ts, e2e/agentsApi.ts) check that the page signed
-// the challenge it was given, not a key, which the API's own tests check. 06-T1b's specs of the
-// local chain use the dev wallet in the page instead (e2e/chain/).
+// the challenge it was given, not a key, which the API's own tests check. The specs of the
+// local chain (e2e/chain/) use the dev wallet in the page instead.
 
 const CORS = {
   "access-control-allow-origin": "*",

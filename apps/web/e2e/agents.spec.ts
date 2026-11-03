@@ -16,8 +16,8 @@ import { STUB_WALLET_NAME } from "./walletStub";
 
 // The agent directory, an agent's page, the verifier record on a task page and the Telegram page,
 // against the fixture API (e2e/fixtures.ts, e2e/agentsApi.ts) and a wallet that announces itself
-// the way an extension does (e2e/injectedWallet.ts). 06-T1b runs the same pages on a local chain,
-// with the services started with `TELEGRAM_BOT_USERNAME=tender_test_bot`.
+// the way an extension does (e2e/injectedWallet.ts). The same pages run on a local chain in
+// e2e/chain/, with the services started with `TELEGRAM_BOT_USERNAME=tender_test_bot`.
 
 const cards = (page: Page) => page.getByTestId("agent-card");
 const card = (page: Page, name: string) =>

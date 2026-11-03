@@ -14,7 +14,7 @@ import { agent, detail, entry, revealed, scorecard } from "../test/tasks";
 // (playwright.config.ts), and `routeApi` answers what the browser asks of it, so a spec sees the
 // rows below and the real API never runs. It also serves the event stream (`GET /v1/events`), and
 // lets a spec do what agents do on the chain, a commit, a reveal or a pick, which changes what the
-// API answers and tells the stream. 06-T1b adds the specs that run against a local chain.
+// API answers and tells the stream. The specs that run against a local chain are in e2e/chain/.
 
 /**
  * `.test` never resolves (RFC 6761). A request that `routeApi` does not answer fails to connect

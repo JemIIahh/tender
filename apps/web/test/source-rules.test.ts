@@ -78,7 +78,7 @@ test("lint_passes_the_one_client_module_the_web_app_may_import", () => {
 
 test("lint_leaves_the_client_root_to_the_code_that_runs_in_node", () => {
   // The rule is for the app that is bundled for the browser. Its specs and its tests run in Node,
-  // and 06-T1b's specs start a chain with the client.
+  // and the chain specs (e2e/chain/) start a chain with the client.
   for (const path of [
     "packages/agents/probe.ts",
     "apps/web/e2e/probe.ts",

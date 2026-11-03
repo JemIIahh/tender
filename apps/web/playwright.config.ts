@@ -14,10 +14,11 @@ export default defineConfig({
     baseURL,
     trace: "retain-on-failure",
   },
-  // The web server, for the specs that run against the fixture API (e2e/fixtures.ts). 06-T1b adds
-  // `globalSetup: "./e2e/global-setup.ts"`, which starts the chain, the services and the web
-  // server, and takes this block out. A server that is already on the port is an error, not a
-  // server to test: it would not have these values.
+  // The web server, for the specs that run against the fixture API (e2e/fixtures.ts). The specs
+  // against a local chain and the real services are a second suite with its own config
+  // (playwright.chain.config.ts), which starts its own stack and web server; this block belongs to
+  // the fixture suite only. A server that is already on the port is an error, not a server to
+  // test: it would not have these values.
   webServer: {
     command: "pnpm dev",
     url: baseURL,

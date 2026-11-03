@@ -12,7 +12,8 @@ import {
 
 // The task page against the fixture API (e2e/fixtures.ts), which serves the event stream too. The
 // page's clock is Playwright's: a spec sets the time and moves it, and the windows of a task end
-// when it says so. 06-T1b moves the first two specs onto a local chain.
+// when it says so. The same page against a local chain and the real services is in
+// e2e/chain/*.chain.ts (the second suite, playwright.chain.config.ts).
 
 const TASK = "/tasks/2";
 const JUDGE = "judge.tender-team.testnet";
