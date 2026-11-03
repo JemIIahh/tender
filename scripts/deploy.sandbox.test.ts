@@ -16,7 +16,7 @@ import {
   type KeyPairString,
 } from "near-api-js";
 import { afterAll, beforeAll, expect, test } from "vitest";
-import { type Deployment, deploy } from "./deploy";
+import { AGENT_BOND, type Deployment, deploy } from "./deploy";
 import { REPO_ROOT } from "./lib/env";
 
 // A bare local chain, with nothing deployed on it, and then the deploy script on top of it. The
@@ -252,6 +252,30 @@ test("deploy_inits_tender_by_its_own_account_and_the_token_for_the_poster", asyn
   ]);
   // The token's whole supply is the poster's.
   expect(await reader.ftBalanceOf("tusdc.sandbox", "poster.sandbox")).toBe(10n ** 12n);
+});
+
+test("deploy_sets_the_agent_bond_in_the_test_token_before_any_agent_registers", async () => {
+  // The owner's lane ends with the cooldown and then the bond, both in the first run's output.
+  expect(first.lines).toContain("OK set_agent_bond_cooldown 5");
+  expect(first.lines).toContain("OK set_agent_bond tusdc.sandbox 1000000");
+  const lines = first.lines;
+  expect(lines.indexOf("OK set_agent_bond_cooldown 5")).toBeLessThan(
+    lines.indexOf("OK set_agent_bond tusdc.sandbox 1000000"),
+  );
+  expect(lines.indexOf("OK set_token tusdc.sandbox")).toBeLessThan(
+    lines.indexOf("OK set_agent_bond tusdc.sandbox 1000000"),
+  );
+
+  // On a local chain the cooldown is the shortest window, the least the contract takes.
+  const config = await reader.getConfig();
+  expect(config).toMatchObject({
+    agent_bond_token: "tusdc.sandbox",
+    agent_bond_amount: String(AGENT_BOND),
+    agent_bond_cooldown_secs: "5",
+  });
+  expect(config.agent_bond_amount).toBe("1000000");
+  // The script registers no agent: it only sets the terms.
+  expect(await reader.getAgent("analyst.sandbox")).toBeNull();
 });
 
 test("deploy_registers_storage_for_everyone_and_tender_with_both_tokens", async () => {
@@ -543,4 +567,79 @@ test("deploy_resumes_after_a_step_fails_and_still_knows_the_deploy_block", async
   // The first run's deploy of Tender is the one the record names, though it was not made now.
   await expectDeployBlock("tender.resume.sandbox", deployment.deployHeight, tenderWasm);
   expect(deployment.tokens).toEqual({ tusdc: "tusdc.resume.sandbox", usdc: "ghost.sandbox" });
+});
+
+// These deploy again, under parents of their own, and come last: the sandbox forgets old blocks as
+// it runs, and the tests above read the blocks of the first deploy.
+test("deploy_run_again_leaves_a_bond_the_owner_changed", async () => {
+  const parent = await fundedAccount("bondown", 100n * NEAR);
+  const dir = await newDir();
+  const tender = new TenderClient({
+    network: "sandbox",
+    contractId: "tender.bondown.sandbox",
+    rpcUrl: node.rpcUrl,
+    signer: parent,
+  });
+  await deploy(targetFor(parent, "usdc.sandbox"), { dir, log: () => undefined });
+  expect(await tender.getConfig()).toMatchObject({
+    agent_bond_amount: "1000000",
+    agent_bond_cooldown_secs: "5",
+  });
+
+  // The owner raises the bond and lengthens the cooldown after the deploy.
+  await tender.setAgentBond("tusdc.bondown.sandbox", 2_500_000n);
+  await tender.setAgentBondCooldown(30);
+
+  // A deploy run again finds the bond set and puts nothing back.
+  const again: string[] = [];
+  await deploy(targetFor(parent, "usdc.sandbox"), { dir, log: (l) => again.push(l) });
+  expect(again).toContain("SKIP set_agent_bond_cooldown 5 (exists)");
+  expect(again).toContain("SKIP set_agent_bond tusdc.bondown.sandbox 1000000 (exists)");
+  expect(await tender.getConfig()).toMatchObject({
+    agent_bond_token: "tusdc.bondown.sandbox",
+    agent_bond_amount: "2500000",
+    agent_bond_cooldown_secs: "30",
+  });
+});
+
+test("deploy_takes_the_bond_and_cooldown_a_target_names", async () => {
+  const parent = await fundedAccount("bondset", 100n * NEAR);
+  const dir = await newDir();
+  const lines: string[] = [];
+  await deploy(
+    { ...targetFor(parent, "usdc.sandbox"), agentBond: { amount: 7_000_000n, cooldownSecs: 60 } },
+    { dir, log: (l) => lines.push(l) },
+  );
+  expect(lines).toContain("OK set_agent_bond_cooldown 60");
+  expect(lines).toContain("OK set_agent_bond tusdc.bondset.sandbox 7000000");
+  const tender = new TenderClient({
+    network: "sandbox",
+    contractId: "tender.bondset.sandbox",
+    rpcUrl: node.rpcUrl,
+  });
+  expect(await tender.getConfig()).toMatchObject({
+    agent_bond_token: "tusdc.bondset.sandbox",
+    agent_bond_amount: "7000000",
+    agent_bond_cooldown_secs: "60",
+  });
+});
+
+test("deploy_with_a_cooldown_below_the_shortest_window_fails_at_that_step_and_sets_no_bond", async () => {
+  const parent = await fundedAccount("bondlow", 100n * NEAR);
+  const dir = await newDir();
+  const lines: string[] = [];
+  await expect(
+    deploy(
+      { ...targetFor(parent, "usdc.sandbox"), agentBond: { cooldownSecs: 1 } },
+      { dir, log: (l) => lines.push(l) },
+    ),
+  ).rejects.toThrow(/set_agent_bond_cooldown 1.*E_WINDOW/s);
+  const tender = new TenderClient({
+    network: "sandbox",
+    contractId: "tender.bondlow.sandbox",
+    rpcUrl: node.rpcUrl,
+  });
+  // The contract's rule held, and the bond was not set after a failed cooldown.
+  expect((await tender.getConfig()).agent_bond_token).toBeNull();
+  expect(lines).not.toContain("OK set_agent_bond tusdc.bondlow.sandbox 1000000");
 });

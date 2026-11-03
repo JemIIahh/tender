@@ -11,6 +11,8 @@ import { NETWORKS } from "@tender/shared";
 import { KeyPair } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
 import {
+  AGENT_BOND,
+  bondTermsFor,
   type Deployment,
   deploy,
   laneLimit,
@@ -529,4 +531,29 @@ test("the_env_files_of_a_deploy_are_git_ignored", async () => {
     cwd: REPO_ROOT,
   });
   expect(stdout.trim().split("\n")).toEqual(names);
+});
+
+test("the_agent_bond_is_one_tusdc_with_a_cooldown_of_14_days_on_testnet_and_the_shortest_window_elsewhere", () => {
+  const testnet = NETWORKS.testnet;
+  const sandbox = NETWORKS.sandbox;
+  expect(AGENT_BOND).toBe(1_000_000n);
+  expect(bondTermsFor({ network: "testnet", minWindowSecs: testnet.minWindowSecs })).toEqual({
+    amount: 1_000_000n,
+    cooldownSecs: 14 * 24 * 60 * 60,
+  });
+  // A local chain: the least the contract takes, so that a test sees a bond come back.
+  expect(bondTermsFor({ network: "sandbox", minWindowSecs: sandbox.minWindowSecs })).toEqual({
+    amount: 1_000_000n,
+    cooldownSecs: sandbox.minWindowSecs,
+  });
+  // A target may name either or both; what it leaves out stays the default.
+  expect(
+    bondTermsFor({ network: "testnet", minWindowSecs: 60, agentBond: { amount: 5n } }),
+  ).toEqual({ amount: 5n, cooldownSecs: 14 * 24 * 60 * 60 });
+  expect(
+    bondTermsFor({ network: "sandbox", minWindowSecs: 5, agentBond: { cooldownSecs: 30 } }),
+  ).toEqual({ amount: 1_000_000n, cooldownSecs: 30 });
+  // The testnet cooldown is inside the contract's bounds: the window at the least, 56 days at most.
+  expect(14 * 24 * 60 * 60).toBeGreaterThanOrEqual(testnet.minWindowSecs);
+  expect(14 * 24 * 60 * 60).toBeLessThanOrEqual(56 * 24 * 60 * 60);
 });

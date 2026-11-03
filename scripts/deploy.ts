@@ -9,6 +9,8 @@ import {
   NETWORKS,
   type NetworkId,
   ONE_YOCTO,
+  setAgentBondCall,
+  setAgentBondCooldownCall,
   storageDepositCall,
   type TenderCall,
   tokenStorageDepositCall,
@@ -38,6 +40,8 @@ import { loadEnv, parseEnvText, REPO_ROOT } from "./lib/env";
  *   register <account> at <token>  Tender with the test token and, where there is one, with USDC
  *   storage <account> at <tender>  0.1 NEAR of storage with Tender for the owner and every account
  *   set_token <token>              the owner puts the test token, and USDC, on Tender's allowlist
+ *   set_agent_bond_cooldown <secs> the owner sets how long an agent waits to claim its bond back
+ *   set_agent_bond <token> <n>     the owner sets the bond that registering takes, in the test token
  *   record deployments/<n>.json    the contract, tokens, accounts, wasm hash and deploy block
  *
  * Each step prints `OK <step>` when it did the work and `SKIP <step> (exists)` when the chain
@@ -52,6 +56,19 @@ import { loadEnv, parseEnvText, REPO_ROOT } from "./lib/env";
  * printed. The contract's own are `TENDER_CONTRACT` and `TENDER_CONTRACT_FULL_ACCESS_KEY`. The
  * script never writes a `<STEM>_PRIVATE_KEY`, `TENDER_ACCOUNT` or `TENDER_PRIVATE_KEY`; see
  * `roleVars` and `MEMBERS` for why.
+ *
+ * THE AGENT BOND (contract Task 16b). Registering as an agent takes a refundable bond, and only a
+ * registered agent may enter an open task, so the bond is set here, by the last two steps of the
+ * owner's lane, before any agent can register (the script registers none). It is in the test token
+ * the deploy made: 1 tUSDC (1_000_000 of its smallest unit, at 6 decimals) on every network, and a
+ * cooldown (the wait from `unregister_agent` to `claim_agent_bond`) of 14 days on testnet, the
+ * contract's own default and the longest a task's window can be, so that a bond cannot be passed
+ * from account to account within one task. On a local chain the cooldown is the shortest window,
+ * the least the contract takes, so that a test sees a bond come back. A run that finds a bond set
+ * leaves it and the cooldown alone: the owner may have changed them since, and a deploy run again
+ * must not undo that. To change them later, the owner calls `set_agent_bond` and
+ * `set_agent_bond_cooldown`; a bond is never taken back to nothing, and each agent keeps the bond
+ * it paid.
  *
  * `pnpm deploy:testnet` is the command line. The mainnet deploy belongs to plan 07.
  */
@@ -69,6 +86,12 @@ export interface DeployTarget {
    * allowlist for rewards of 0.1 to 50 USDC. The account must exist.
    */
   usdc?: string;
+  /**
+   * The agent bond to set, if the defaults do not suit: `amount` in the smallest unit of the test
+   * token (default 1 tUSDC, `AGENT_BOND`), `cooldownSecs` from the shortest window to 56 days
+   * (default: 14 days on testnet, the shortest window elsewhere). See the top of the file.
+   */
+  agentBond?: { amount?: bigint; cooldownSecs?: number };
 }
 
 export interface DeployOptions {
@@ -114,6 +137,22 @@ const TOKEN_SUPPLY = 10n ** 12n;
 /** The rewards Tender accepts in each token, in its smallest unit. */
 const TUSDC_LIMITS = { min: 1n, max: 10n ** 12n };
 const USDC_LIMITS = { min: 100_000n, max: 50_000_000n };
+/** The bond that registering takes by default: 1 tUSDC, in the test token's smallest unit. */
+export const AGENT_BOND = 10n ** 6n;
+/** The amount and cooldown the owner's lane sets for `target`: its own, else the defaults. */
+export function bondTermsFor(
+  target: Pick<DeployTarget, "network" | "minWindowSecs" | "agentBond">,
+): { amount: bigint; cooldownSecs: number } {
+  return {
+    amount: target.agentBond?.amount ?? AGENT_BOND,
+    cooldownSecs:
+      target.agentBond?.cooldownSecs ??
+      (target.network === "testnet" ? TESTNET_BOND_COOLDOWN_SECS : target.minWindowSecs),
+  };
+}
+
+/** The default cooldown on testnet: 14 days, the contract's own default and its longest window. */
+export const TESTNET_BOND_COOLDOWN_SECS = 14 * 24 * 60 * 60;
 /** Gas for the `new` that comes with a deploy. What a call does not use is refunded. */
 const INIT_GAS = 100n * TGAS;
 const SET_TOKEN_GAS = 30n * TGAS;
@@ -416,6 +455,8 @@ interface Context {
   members: Record<MemberName, Member>;
   usdc: string | undefined;
   minWindowSecs: number;
+  /** What the owner's lane sets as the agent bond: in the test token, with its cooldown. */
+  bond: { token: string; amount: bigint; cooldownSecs: number };
   dir: string;
   chain: Chain;
   env: DeployEnv;
@@ -745,6 +786,46 @@ function setTokenStep(ctx: Context, token: string, limits: { min: bigint; max: b
   };
 }
 
+/**
+ * The bond is already set when the config names a token for it, and then neither step touches it:
+ * the owner may have changed the bond or the cooldown since the deploy, and there is no way back
+ * to no bond. A deploy that stopped between the two finds the cooldown set and the bond not, and
+ * sets the bond.
+ */
+async function bondIsSet(ctx: Context): Promise<boolean> {
+  return (await ctx.chain.reader.getConfig()).agent_bond_token !== null;
+}
+
+/** Sets how long an agent waits to claim its bond, as the owner, unless a bond is set already. */
+function setBondCooldownStep(ctx: Context): Step {
+  const tenderId = ctx.members.tender.id;
+  const { cooldownSecs } = ctx.bond;
+  return {
+    label: `set_agent_bond_cooldown ${cooldownSecs}`,
+    async run() {
+      const config = await ctx.chain.reader.getConfig();
+      if (config.agent_bond_token !== null) return "SKIP";
+      if (config.agent_bond_cooldown_secs === cooldownSecs.toString()) return "SKIP";
+      await ctx.chain.call(ctx.parent, setAgentBondCooldownCall(tenderId, cooldownSecs));
+      return "OK";
+    },
+  };
+}
+
+/** Sets the bond that registering takes, as the owner, unless a bond is set already. */
+function setBondStep(ctx: Context): Step {
+  const tenderId = ctx.members.tender.id;
+  const { token, amount } = ctx.bond;
+  return {
+    label: `set_agent_bond ${token} ${amount}`,
+    async run() {
+      if (await bondIsSet(ctx)) return "SKIP";
+      await ctx.chain.call(ctx.parent, setAgentBondCall(tenderId, token, amount));
+      return "OK";
+    },
+  };
+}
+
 /** The path of a network's record. */
 export function deploymentPath(network: NetworkId, dir: string = REPO_ROOT): string {
   return join(dir, "deployments", `${network}.json`);
@@ -999,6 +1080,7 @@ export async function deploy(
     members,
     usdc,
     minWindowSecs,
+    bond: { token: members.tusdc.id, ...bondTermsFor(target) },
     dir,
     chain: new Chain(network, rpcUrl, members.tender.id),
     env,
@@ -1050,6 +1132,10 @@ export async function deploy(
     storageStep(ctx, parent),
     setTokenStep(ctx, tusdc.id, TUSDC_LIMITS),
     ...(usdc === undefined ? [] : [setTokenStep(ctx, usdc, USDC_LIMITS)]),
+    // After the token, which the bond must be in; before the deploy ends, so that the bond is there
+    // when the first agent registers.
+    setBondCooldownStep(ctx),
+    setBondStep(ctx),
   ];
   const tenderAccount: Step[] = [
     registerStep(ctx, tusdc.id),
