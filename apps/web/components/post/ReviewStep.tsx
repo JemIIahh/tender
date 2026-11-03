@@ -101,6 +101,8 @@ export function ReviewStep(props: {
   onRecheck(): void;
   onBack(): void;
   onPost(): void;
+  /** The person has looked and wants to post although the last send's outcome is not known. */
+  onPostAnyway(): void;
 }) {
   const { form, limits, judgeAccount, tokenId, ready, accountId, canSignMessage, vault } = props;
   const reward = rewardOf(form, tokenId);
@@ -285,6 +287,27 @@ export function ReviewStep(props: {
             </a>{" "}
             page before you try again.
           </p>
+        ) : null}
+        {props.outcome?.kind === "unknown" ? (
+          <div
+            role="alert"
+            data-testid="post-unknown"
+            className="grid gap-3 rounded border border-neutral-900 p-3"
+          >
+            <p>
+              We couldn't tell whether the post went through. Check the{" "}
+              {/* A tab of its own, so that the form on this page is not lost. */}
+              <a href="/" target="_blank" rel="noreferrer" className="underline">
+                Tasks
+              </a>{" "}
+              page before posting again.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" onClick={props.onPostAnyway} className={SECONDARY}>
+                Post anyway
+              </button>
+            </div>
+          </div>
         ) : null}
 
         <div className="flex flex-wrap gap-2">

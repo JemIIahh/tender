@@ -325,6 +325,16 @@ export function PostWizard({
     }
   };
 
+  // The last send's outcome is not known and the person has looked: the lock comes off, and the
+  // balances are read again so that Review shows what they are now. The press has taken away the
+  // button that had the focus, so the focus goes to the heading that the Post button is under.
+  const postAnyway = () => {
+    if (outcome?.kind !== "unknown") return;
+    setOutcome(null);
+    setVaultNonce((n) => n + 1);
+    document.getElementById("post-ready")?.focus();
+  };
+
   // ---- The page --------------------------------------------------------------------------------
 
   const index = STEPS.findIndex(({ id }) => id === step);
@@ -394,6 +404,7 @@ export function PostWizard({
             onRecheck={() => setVaultNonce((n) => n + 1)}
             onBack={back}
             onPost={post}
+            onPostAnyway={postAnyway}
           />
         );
       }

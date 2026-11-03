@@ -22,6 +22,7 @@ import {
   WALLET_CANNOT_SIGN_MESSAGE,
   WalletCannotSign,
   WalletError,
+  WalletNotConnected,
   WalletResultUnreadable,
 } from "../lib/walletErrors";
 import { JUDGE, regexForm, SECRET, TOKEN } from "./postForms";
@@ -651,6 +652,89 @@ test("a_result_the_wallet_could_not_read_is_taken_for_sent_and_not_for_a_refusal
   await expect(submitPost(input(form), w.deps)).resolves.toEqual({ kind: "sent", txHashes: [] });
   // Nothing is said of the deposit, since nothing is known of it, and the vault is not read again.
   expect(w.log).toEqual(["blob:brief", "blob:criteria", "heldout", "vault", "send"]);
+});
+
+// A wallet that threw may have sent the transactions first: a window that closed after the
+// broadcast, a connection that dropped before the answer. Only a person who turned the request down
+// is known to have sent nothing.
+test.each([
+  ["a_window_that_closed", () => new WalletError("send", new Error("Wallet closed"))],
+  ["a_connection_that_dropped", () => new WalletError("send", new TypeError("Failed to fetch"))],
+  ["a_message_and_no_error", () => new WalletError("send", "connection lost")],
+  ["an_object_with_a_message", () => new WalletError("send", { message: "RPC request timed out" })],
+  ["nothing_said", () => new WalletError("send", undefined)],
+  [
+    "a_rejection_that_is_the_networks",
+    () => new WalletError("send", new Error("The transaction was rejected by the network")),
+  ],
+  ["an_error_that_is_not_the_wallets", () => new TypeError("Cannot read properties of undefined")],
+] as const)(
+  "a_send_that_fails_without_saying_whether_it_went_out_is_an_unknown_outcome_%s",
+  async (_name, make) => {
+    const form = regexForm({ amount: "5" });
+    const cause = make();
+    const w = world(form, {
+      send: async () => {
+        throw cause;
+      },
+    });
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      // It may well be posted, so it is an outcome and not a failure: the page keeps Post off.
+      await expect(submitPost(input(form), w.deps)).resolves.toEqual({ kind: "unknown" });
+      // What the wallet threw is for the console, as it was.
+      expect(spy).toHaveBeenCalledWith(cause);
+    } finally {
+      spy.mockRestore();
+    }
+    // The wallet was asked once. Nothing is read after, since nothing read would say what happened.
+    expect(w.log).toEqual(["blob:brief", "blob:criteria", "heldout", "vault", "send"]);
+    expect(w.sent).toHaveLength(1);
+  },
+);
+
+test.each([
+  ["User rejected"],
+  ["User cancelled the action"],
+  ["User canceled the request"],
+  ["User declined the transaction"],
+  ["User denied transaction signature"],
+  ["Transaction rejected by user"],
+  ["The user refused to sign"],
+] as const)(
+  "a_wallet_the_person_turned_down_is_a_refusal_and_not_an_unknown_outcome_%s",
+  async (words) => {
+    const form = regexForm({ amount: "5" });
+    // Wallets throw an error, a string or an object with a message.
+    for (const thrown of [new Error(words), words, { message: words }]) {
+      const w = world(form, {
+        send: async () => {
+          throw new WalletError("send", thrown);
+        },
+      });
+
+      const failure = (await rejection(submitPost(input(form), w.deps))) as SubmitFailure;
+
+      expect(failure.stage).toBe("wallet");
+      expect(failure.message).toBe(DID_NOT_FINISH);
+      expect(w.sent).toHaveLength(1);
+    }
+  },
+);
+
+test("a_wallet_that_is_not_connected_is_a_failure_with_nothing_sent", async () => {
+  const form = regexForm({ amount: "5" });
+  const w = world(form, {
+    send: async () => {
+      throw new WalletNotConnected();
+    },
+  });
+
+  const failure = (await rejection(submitPost(input(form), w.deps))) as SubmitFailure;
+
+  expect(failure.stage).toBe("wallet");
+  expect(failure.message).toBe("Connect a wallet first.");
 });
 
 test("a_wallet_connected_as_another_account_is_sent_nothing", async () => {

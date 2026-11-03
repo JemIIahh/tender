@@ -10,6 +10,7 @@ import {
   type PostLimits,
   PRESET_WINDOWS,
   type Preset,
+  RUBRIC_JUDGE_LIMIT,
   RUBRIC_JUDGE_NOTE,
   spanText,
   tokenOf,
@@ -223,9 +224,10 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
           ) : null}
         </RadioGroup>
         {form.kind === "rubric" && form.verifier === "judge" ? (
-          <p data-testid="rubric-judge-note" className="text-sm font-medium">
-            {RUBRIC_JUDGE_NOTE}
-          </p>
+          <div className="grid gap-1 text-sm font-medium">
+            <p data-testid="rubric-judge-note">{RUBRIC_JUDGE_NOTE}</p>
+            <p data-testid="rubric-judge-limit">{RUBRIC_JUDGE_LIMIT}</p>
+          </div>
         ) : null}
       </section>
     </div>

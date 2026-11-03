@@ -23,6 +23,7 @@ import type { SendResult } from "./wallet";
 import {
   TransactionFailed,
   WalletError,
+  WalletNotConnected,
   WalletResultUnreadable,
   WalletSessionEnded,
   walletErrorMessage,
@@ -124,7 +125,13 @@ export type SubmitResult =
    * and could not say how they went (no hashes then). It may well be posted; the page does not
    * offer to post it again.
    */
-  | { kind: "sent"; txHashes: string[] };
+  | { kind: "sent"; txHashes: string[] }
+  /**
+   * The wallet failed in a way that does not say whether it sent anything: a window that closed, a
+   * connection that dropped. The task may be posted. The page keeps Post off until the person has
+   * looked, and lets them post anyway.
+   */
+  | { kind: "unknown" };
 
 /**
  * What the contract's panics mean to a poster. Others are shown by their code. `E_STORAGE` is rare:
@@ -140,7 +147,7 @@ const PANIC_WORDS: Record<string, string> = {
   E_STORAGE: "Your storage with Tender ran short as the task was posted.",
 };
 
-/** A wallet that threw, or a transaction that failed with no code of the contract's. */
+/** A wallet the person turned down, or a transaction that failed with no contract code. */
 const WALLET_DID_NOT_FINISH =
   "The wallet didn't finish. A deposit may have gone through: check the Wallet page. Your documents are saved; press Post to try again.";
 
@@ -195,6 +202,35 @@ async function sendWords(
     return WALLET_DID_NOT_FINISH;
   }
   return walletErrorMessage(error);
+}
+
+/** The words of what a wallet threw: an error's message, a string, or an object's `message`. */
+function thrownWords(thrown: unknown): string {
+  if (typeof thrown === "string") return thrown;
+  if (typeof thrown === "object" && thrown !== null && "message" in thrown) {
+    return typeof thrown.message === "string" ? thrown.message : "";
+  }
+  return "";
+}
+
+/**
+ * Wallets word a refusal each their own way ("User rejected", "User cancelled the action",
+ * "Transaction rejected by user"), so a refusal is a message that names the user and a refusal.
+ */
+const USER_REFUSAL = /(?=.*\buser\b)(?=.*(?:reject|declin|den(?:y|ied)|cancel|refus))/is;
+
+/**
+ * Whether a send that threw is known to have ended without a post: a wallet that was not connected,
+ * a transaction that failed on the network, a person who turned the request down. Any other
+ * failure, a wallet window that closed or a connection that dropped included, may have come after
+ * the transactions were sent, so what became of the post is not known.
+ */
+function outcomeKnown(thrown: unknown): boolean {
+  return (
+    thrown instanceof WalletNotConnected ||
+    thrown instanceof TransactionFailed ||
+    (thrown instanceof WalletError && USER_REFUSAL.test(thrownWords(thrown.cause)))
+  );
 }
 
 /** The address a blob is read at has to be a web address the chain can hold. */
@@ -356,6 +392,12 @@ export async function submitPost(
     // to show for it: the page keeps Post off and tells the person to look.
     if (cause instanceof WalletResultUnreadable && cause.what === "transaction") {
       return { kind: "sent", txHashes: [] };
+    }
+    // A failure that does not say whether anything was sent is the same risk, from a wallet that
+    // threw and not one that answered: the page keeps Post off, and the person decides.
+    if (!outcomeKnown(cause)) {
+      console.error(cause);
+      return { kind: "unknown" };
     }
     throw new SubmitFailure(
       "wallet",

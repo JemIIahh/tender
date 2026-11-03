@@ -293,6 +293,8 @@ export function CriteriaStep(
                   type="button"
                   onClick={() => {
                     update({ rubric: [...form.rubric, { criterion: "", weight: "5" }] });
+                    // A point too many is said at once, not after the person has written it.
+                    touch("rubric");
                     focusAfter.current = `post-rubric-${form.rubric.length}-criterion`;
                   }}
                   className={SECONDARY}

@@ -24,6 +24,11 @@ import {
   PRESET_WINDOWS,
   parseTags,
   planPostCalls,
+  pointKey,
+  RUBRIC_JUDGE_LIMIT,
+  RUBRIC_JUDGE_MAX_ENTRIES,
+  RUBRIC_MAX_POINT_CHARS,
+  RUBRIC_MAX_POINTS,
   regexCaution,
   VAULT_SLOT_BYTES,
   windowsOf,
@@ -463,6 +468,136 @@ test("rubric_hidden_for_non_team", () => {
     "Rubric checks are for team accounts.",
   );
   expect(checkChecks(rubricForm(), { canRubric: true })).toEqual({});
+});
+
+// ---- What the Judge takes of a rubric -----------------------------------------------------------
+
+// The Judge turns a rubric task down at intake for these (packages/judge/src/kinds/rubric.ts,
+// `rubricProblem`), after the reward is in, so the Checks step says them first. The cases are the
+// Judge's own (its test of `rubricProblem`), as the step has to agree with it.
+
+const rubricOf = (...points: string[]): PostForm =>
+  rubricForm({ rubric: points.map((criterion) => ({ criterion, weight: "5" })) });
+const numbered = (count: number): string[] => Array.from({ length: count }, (_, i) => `point ${i}`);
+const rubricChecks = (form: PostForm) => checkChecks(form, { canRubric: true });
+
+const TOO_MANY = "Use at most 20 points.";
+const BLANK = "Say what to look for.";
+const BRACKET = "Leave out angle brackets, like < and >.";
+const tooLong = (count: number) => `Use 200 characters or fewer. This has ${count}.`;
+const sameAs = (place: number) => `This says the same as point ${place}.`;
+
+test("the_rubric_limits_are_the_judges", () => {
+  expect(RUBRIC_MAX_POINTS).toBe(20);
+  expect(RUBRIC_MAX_POINT_CHARS).toBe(200);
+});
+
+test.each([
+  ["twenty_points", rubricOf(...numbered(20)), {}],
+  ["twenty_one_points", rubricOf(...numbered(21)), { rubric: TOO_MANY }],
+  ["200_characters", rubricOf("x".repeat(200)), {}],
+  ["201_characters", rubricOf("x".repeat(201)), { "rubric-0-criterion": tooLong(201) }],
+  // Characters are counted as code points, as the Judge counts them: 200 emoji are 400 UTF-16 units.
+  ["200_emoji", rubricOf("\u{1F600}".repeat(200)), {}],
+  ["201_emoji", rubricOf("\u{1F600}".repeat(201)), { "rubric-0-criterion": tooLong(201) }],
+  // The point is counted as it is posted, trimmed.
+  ["200_characters_and_spaces", rubricOf(`  ${"x".repeat(200)}  `), {}],
+  ["spaces_and_a_weight", rubricOf("clear", "  \t "), { "rubric-1-criterion": BLANK }],
+  ["an_ideographic_space", rubricOf("clear", "\u{3000}"), { "rubric-1-criterion": BLANK }],
+  // A prefix, letters that only look alike and a word that is only close are other points.
+  ["a_prefix", rubricOf("clear", "clearer"), {}],
+  ["look_alike_letters", rubricOf("clear", "cl\u{0435}ar"), {}],
+  ["a_close_word", rubricOf("accurate", "accurate!"), {}],
+  // The single angle quotes that the Judge turns brackets into are not brackets themselves.
+  ["single_angle_quotes", rubricOf("a \u{2039}b\u{203A} c"), {}],
+] as const)("rubric_points_follow_the_judges_rules_%s", (_name, form, expected) => {
+  expect(rubricChecks(form)).toEqual(expected);
+});
+
+test.each([
+  ["less_than", "a<b"],
+  ["greater_than", "a>b"],
+  ["fullwidth_less_than", "a\u{FF1C}b"],
+  ["fullwidth_greater_than", "a\u{FF1E}b"],
+  ["small_less_than", "a\u{FE64}b"],
+  ["small_greater_than", "a\u{FE65}b"],
+  ["not_less_than", "a\u{226E}b"],
+  ["not_greater_than", "a\u{226F}b"],
+  ["tag_less_than", "a\u{E003C}b"],
+  ["tag_greater_than", "a\u{E003E}b"],
+  ["a_frame_tag", "</entry>"],
+  ["a_control_token", "<|im_start|>"],
+] as const)("a_point_with_an_angle_bracket_is_a_problem_%s", (_name, point) => {
+  expect(rubricChecks(rubricOf("fine", point))).toEqual({ "rubric-1-criterion": BRACKET });
+});
+
+test.each([
+  ["the_same_text", ["clear", "clear"]],
+  ["another_case", ["clear", "CLEAR"]],
+  ["other_spacing", ["very clear", " very \t clear "]],
+  ["fullwidth_letters", ["clear", "\u{FF43}lear"]],
+  ["a_ligature", ["fine", "\u{FB01}ne"]],
+] as const)("two_points_that_read_the_same_are_a_problem_%s", (_name, points) => {
+  expect(rubricChecks(rubricOf(...points))).toEqual({ "rubric-1-criterion": sameAs(1) });
+});
+
+test("a_repeat_says_which_point_it_repeats_by_its_place_in_the_list", () => {
+  // The empty row is left out of the rubric, but it has its place among the points on the page.
+  const form = rubricForm({
+    rubric: [
+      { criterion: "Clear", weight: "5" },
+      { criterion: "", weight: "" },
+      { criterion: " clear ", weight: "5" },
+      { criterion: "Short", weight: "5" },
+      { criterion: "SHORT", weight: "5" },
+      { criterion: "clear", weight: "5" },
+    ],
+  });
+
+  expect(rubricChecks(form)).toEqual({
+    "rubric-2-criterion": sameAs(1),
+    "rubric-4-criterion": sameAs(4),
+    "rubric-5-criterion": sameAs(1),
+  });
+});
+
+test("a_point_with_several_problems_names_one_in_the_order_the_judge_does", () => {
+  // A blank point, then a long one, then a bracket, then a repeat: the first that is broken.
+  const long = "x".repeat(201);
+  expect(rubricChecks(rubricOf(long, long))).toEqual({
+    "rubric-0-criterion": tooLong(201),
+    "rubric-1-criterion": tooLong(201),
+  });
+  expect(rubricChecks(rubricOf("a<b", "a<b"))).toEqual({
+    "rubric-0-criterion": BRACKET,
+    "rubric-1-criterion": BRACKET,
+  });
+  // The count is named as well as the points that have a problem.
+  expect(rubricChecks(rubricOf(...numbered(20), "POINT 0"))).toEqual({
+    rubric: TOO_MANY,
+    "rubric-20-criterion": sameAs(1),
+  });
+  // A weight that is wrong is its own problem.
+  const both = rubricForm({ rubric: [{ criterion: "a<b", weight: "11" }] });
+  expect(rubricChecks(both)).toEqual({
+    "rubric-0-criterion": BRACKET,
+    "rubric-0-weight": "Use a whole number from 1 to 10.",
+  });
+});
+
+test("point_keys_fold_case_width_and_space_as_the_judges_do", () => {
+  expect(pointKey("  Clear\tand \n CONCISE ")).toBe("clear and concise");
+  expect(pointKey("\u{FF23}lear")).toBe("clear");
+  expect(pointKey("\u{FB01}ne")).toBe("fine");
+  expect(pointKey("a\u{00A0}\u{2003}b")).toBe("a b");
+  expect(pointKey(" \t\n ")).toBe("");
+  expect(pointKey("cl\u{0435}ar")).not.toBe(pointKey("clear"));
+  expect(pointKey("accurate!")).not.toBe(pointKey("accurate"));
+});
+
+test("the_judge_is_said_to_score_the_first_fifty_entries_of_a_rubric_task", () => {
+  expect(RUBRIC_JUDGE_MAX_ENTRIES).toBe(50);
+  expect(RUBRIC_JUDGE_LIMIT).toBe("The Judge scores the first 50 entries.");
 });
 
 test("a_brief_is_checked_against_what_the_schema_allows", () => {

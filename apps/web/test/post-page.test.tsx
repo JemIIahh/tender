@@ -286,7 +286,7 @@ async function toReview(user: User, amount = "5"): Promise<void> {
   await stepHeading("Review");
 }
 
-const postButton = () => screen.getByRole("button", { name: /^Post/ });
+const postButton = () => screen.getByRole("button", { name: /^Post(ing| task)/ });
 
 /** The Post button once the page has read the account's balances and found nothing in the way. */
 async function postReady(): Promise<HTMLElement> {
@@ -736,6 +736,9 @@ test("a_wallet_that_refuses_keeps_the_uploads_and_the_form_and_a_second_try_goes
   );
   expect(router.push).not.toHaveBeenCalled();
   expect(wallet.sent).toEqual([]);
+  // A person who turned the request down sent nothing, so there is no lock and nothing to post anyway.
+  expect(screen.queryByTestId("post-unknown")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Post anyway" })).toBeNull();
   // The documents are saved with Tender; the form is as it was.
   expect(api.blobs).toHaveLength(2);
   expect(api.heldouts).toHaveLength(1);
@@ -761,6 +764,55 @@ test("a_wallet_that_refuses_keeps_the_uploads_and_the_form_and_a_second_try_goes
     api.heldouts[0]?.commitment,
   ]);
   expect(said()).not.toContain(SECRET);
+});
+
+test("a_wallet_that_fails_without_saying_whether_it_sent_locks_post_until_the_person_posts_anyway", async () => {
+  const { user, wallet, api, chain, said } = setup({ vault: TUSDC(5) });
+  const send = wallet.signAndSendTransactions.bind(wallet);
+  let failures = 1;
+  wallet.signAndSendTransactions = async (params) => {
+    // The wallet's window closes: nothing says whether it sent the transactions first.
+    if (failures-- > 0) throw new Error("Wallet closed");
+    return send(params);
+  };
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  await user.click(await postReady());
+
+  // The page can't say, so it says so, and tells the person to look before posting again.
+  const unknown = await screen.findByTestId("post-unknown");
+  expect(unknown.querySelector("p")?.textContent).toBe(
+    "We couldn't tell whether the post went through. Check the Tasks page before posting again.",
+  );
+  // The Tasks page opens in a tab of its own, so that the form on this page is not lost.
+  const link = within(unknown).getByRole("link", { name: "Tasks" });
+  expect(link.getAttribute("href")).toBe("/");
+  expect(link.getAttribute("target")).toBe("_blank");
+  expect(screen.queryByTestId("post-failure")).toBeNull();
+  expect(screen.queryByTestId("post-sent")).toBeNull();
+  expect(router.push).not.toHaveBeenCalled();
+  expect(off(postButton())).toBe(true);
+  expect(said()).toContain("Wallet closed");
+
+  // A press on the locked Post does nothing: no request, no batch.
+  const before = api.requests.length;
+  await user.click(postButton());
+  await settle();
+  expect(api.requests).toHaveLength(before);
+  expect(wallet.sent).toEqual([]);
+  expect(screen.getByTestId("post-unknown")).toBeDefined();
+
+  // The person has looked and posts anyway. The lock comes off, the balances are read again, and
+  // the focus is where the person reads on.
+  await user.click(screen.getByRole("button", { name: "Post anyway" }));
+  expect(screen.queryByTestId("post-unknown")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Post anyway" })).toBeNull();
+  expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Post it" }));
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+  expect(chain.tasks.size).toBe(1);
+  expect(wallet.sent).toHaveLength(1);
 });
 
 test("a_result_the_wallet_cannot_be_read_for_locks_post_and_a_second_press_does_nothing", async () => {
@@ -1169,8 +1221,11 @@ test("a_team_account_that_writes_a_rubric_is_told_how_the_judge_scores_it", asyn
   expect(RUBRIC_JUDGE_NOTE).toBe(
     "The Tender Judge scores rubric tasks with an AI model. Scores are subjective.",
   );
+  // And that it scores the first entries only, since the wizard posts no entry limit of its own.
+  expect(testId("rubric-judge-limit")).toBe("The Judge scores the first 50 entries.");
   await user.click(screen.getByRole("radio", { name: /^Me/ }));
   expect(screen.queryByTestId("rubric-judge-note")).toBeNull();
+  expect(screen.queryByTestId("rubric-judge-limit")).toBeNull();
 
   // And the held-out part is not sent: there is none.
   fill("Amount (tUSDC)", "5");
@@ -1184,6 +1239,106 @@ test("a_team_account_that_writes_a_rubric_is_told_how_the_judge_scores_it", asyn
     has_heldout: false,
     rubric: [{ criterion: "Says what changed", weight: 5 }],
   });
+});
+
+/** The inputs for what each point of the rubric looks for, in the order of the points. */
+const pointInputs = () => screen.getAllByLabelText("What to look for");
+const fillPoint = (i: number, value: string) =>
+  fireEvent.change(pointInputs()[i] as HTMLElement, { target: { value } });
+
+async function toRubric(user: User): Promise<void> {
+  await toChecks(user);
+  await user.click(await screen.findByRole("radio", { name: /^Rubric/ }));
+}
+
+test("a_point_the_judge_would_refuse_is_said_where_it_is_written_and_stops_next", async () => {
+  const { user } = setup({ agentIs: "team" });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toRubric(user);
+  fillPoint(0, "Says what changed");
+  await press(user, "Add a point");
+  await press(user, "Add a point");
+  const next = () => screen.getByRole("button", { name: "Next: Reward" });
+
+  // An angle bracket.
+  fillPoint(1, "Names the <file> that changed");
+  expect(testId("error-rubric-1-criterion")).toBe("Leave out angle brackets, like < and >.");
+  expect(pointInputs()[1]?.getAttribute("aria-invalid")).toBe("true");
+  // Too long, to the character: 200 is allowed and 201 is not.
+  fillPoint(1, "x".repeat(201));
+  expect(testId("error-rubric-1-criterion")).toBe("Use 200 characters or fewer. This has 201.");
+  fillPoint(1, "x".repeat(200));
+  expect(screen.queryByTestId("error-rubric-1-criterion")).toBeNull();
+  // The same as another point, as the Judge reads it: case, width and spaces do not tell them apart.
+  fillPoint(1, "Names the file");
+  fillPoint(2, "  \uFF33\uFF21\uFF39\uFF33 what\u3000changed ");
+  expect(testId("error-rubric-2-criterion")).toBe("This says the same as point 1.");
+  expect(screen.queryByTestId("error-rubric-0-criterion")).toBeNull();
+  expect(screen.queryByTestId("error-rubric-1-criterion")).toBeNull();
+
+  // The step does not go on, and Next takes the person to the point to put right.
+  expect(off(next())).toBe(true);
+  await user.click(next());
+  expect(document.activeElement).toBe(pointInputs()[2]);
+  expect(screen.queryByRole("heading", { level: 2, name: "Reward" })).toBeNull();
+
+  fillPoint(2, "Gives a reason");
+  expect(screen.queryByTestId("error-rubric-2-criterion")).toBeNull();
+  expect(off(next())).toBe(false);
+  await user.click(next());
+  await screen.findByLabelText("Amount (tUSDC)");
+});
+
+test("a_point_the_judge_would_refuse_that_is_not_the_last_one_is_found_by_its_place", async () => {
+  const { user } = setup({ agentIs: "team" });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toRubric(user);
+  fillPoint(0, "Says what changed");
+  await press(user, "Add a point");
+  await press(user, "Add a point");
+  fillPoint(1, "Names the file");
+  fillPoint(2, "Gives a reason");
+
+  // A point in the middle that is the same as the first is the one that is marked, and its number
+  // is the number on the page.
+  fillPoint(1, "says what CHANGED");
+  expect(testId("error-rubric-1-criterion")).toBe("This says the same as point 1.");
+  // Taking the first away leaves nothing for it to be the same as.
+  await press(user, "Remove point 1");
+  expect(screen.queryByTestId("error-rubric-0-criterion")).toBeNull();
+  expect(screen.queryByTestId("error-rubric-1-criterion")).toBeNull();
+  expect(off(screen.getByRole("button", { name: "Next: Reward" }))).toBe(false);
+});
+
+test("twenty_one_points_is_one_too_many_and_is_said_when_the_twenty_first_is_added", async () => {
+  const { user } = setup({ agentIs: "team" });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toRubric(user);
+  for (let i = 1; i < 20; i++) {
+    fireEvent.click(screen.getByRole("button", { name: "Add a point" }));
+  }
+  expect(pointInputs()).toHaveLength(20);
+  for (let i = 0; i < 20; i++) fillPoint(i, `Point number ${i + 1}`);
+  // Twenty is allowed.
+  expect(screen.queryByTestId("error-rubric")).toBeNull();
+  expect(off(screen.getByRole("button", { name: "Next: Reward" }))).toBe(false);
+
+  await press(user, "Add a point");
+  expect(pointInputs()).toHaveLength(21);
+  expect(testId("error-rubric")).toBe("Use at most 20 points.");
+  fillPoint(20, "Point number 21");
+  expect(off(screen.getByRole("button", { name: "Next: Reward" }))).toBe(true);
+
+  // Next goes to the list as a whole, since no one point is the wrong one.
+  await press(user, "Next: Reward");
+  expect(testId("error-rubric")).toBe("Use at most 20 points.");
+  expect(document.activeElement).toBe(document.getElementById("post-rubric"));
+  expect(screen.queryByRole("heading", { level: 2, name: "Reward" })).toBeNull();
+
+  await press(user, "Remove point 21");
+  expect(screen.queryByTestId("error-rubric")).toBeNull();
+  await press(user, "Next: Reward");
+  await screen.findByLabelText("Amount (tUSDC)");
 });
 
 test("a_rubric_is_dropped_when_the_account_stops_being_the_teams", async () => {
