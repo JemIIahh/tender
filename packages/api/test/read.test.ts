@@ -12,6 +12,7 @@ import {
   FIXTURE_OPTIONS,
   FIXTURE_PROFILE_HASH,
   FIXTURE_TOKEN,
+  fixtureData,
   lifecycleBlocks,
   putFixtureBlobs,
 } from "@tender/indexer/testing";
@@ -49,6 +50,9 @@ import { fakeClient, resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helper
 const { poster, judge, alice, bob, carol } = FIXTURE_ACCOUNTS;
 const SECOND = 1_000_000_000n;
 const U64_MAX = 2n ** 64n - 1n;
+
+/** The winners of the captured `picked` event, as a scorecard names them: account and share. */
+const PICKED_WINNERS = fixtureData("picked").winners.map(({ account, bps }) => ({ account, bps }));
 
 let deps: ApiDeps;
 let nowNs = TEST_NOW;
@@ -375,12 +379,21 @@ test("task_summary_labels_team_posters_and_counts_workers", async () => {
     expect(byId.get(id)?.judge_status, id).toBeNull();
   }
 
-  // A poster that is a registered agent flagged as the team's is the team's too, whether or not
-  // it is in this deployment's list.
+  // The label comes from this deployment's list at the time of the request, and from nothing the
+  // indexer stored: alice's agent row says the team runs her, and the list does not.
   await deps.db.query("update agents set is_team = true where account = $1", [alice]);
   await apply(taskLine(7, { poster: alice, ...windowsFor("open") }));
   const second = await get<ListTasksResponse>("/v1/tasks?limit=1", appWith());
-  expect(second.body.tasks[0]).toMatchObject({ id: "7", poster: alice, is_team_poster: true });
+  expect(second.body.tasks[0]).toMatchObject({ id: "7", poster: alice, is_team_poster: false });
+  // A poster that runs under a provider the team runs is the team's too (alice.test.near under
+  // test.near), whether or not it ever registered as an agent.
+  const underTeam = await get<ListTasksResponse>(
+    "/v1/tasks",
+    appWith({ teamAccounts: ["test.near"] }),
+  );
+  for (const task of underTeam.body.tasks) {
+    expect(task.is_team_poster, `task ${task.id} of ${task.poster}`).toBe(true);
+  }
 
   // A task whose brief the index could not read is still listed, without title, category or tags.
   expect(byId.get("6")).toMatchObject({ title: null, category: null, tags: [] });
@@ -518,6 +531,47 @@ test("task_children_in_numeric_order", async () => {
   expect(res.body.children).toEqual(["9", "10", "100"]);
 });
 
+test("task_pages_and_account_lists_have_a_bound", async () => {
+  // Entries cost nothing to make on testnet, so a page lists at most 500 of them, in entrant
+  // order; the task's commit_count says how many there are in all.
+  await apply(taskLine(2, { invited: [], max_entries: 0, ...windowsFor("open") }));
+  await deps.db.query(
+    `insert into entries (task_id, account, entry_index, commitment, committed_height)
+     select 2, 'sybil' || g || '.test.near', g, 'c', 1000 + g from generate_series(0, 500) g`,
+  );
+  await deps.db.query("update tasks set commit_count = 501 where id = 2");
+  // 501 tasks that name task 2 as their parent, as copies of it.
+  await deps.db.query(
+    `insert into tasks (id, poster, token, reward, fee_bps, brief_uri, brief_hash, criteria_hash,
+                        verifier, created_at, commit_deadline, reveal_deadline, pick_deadline,
+                        fallback_deadline, max_entries, max_winners, invited, parent, created_height)
+     select 1000 + g, poster, token, reward, fee_bps, brief_uri, brief_hash, criteria_hash,
+            verifier, created_at, commit_deadline, reveal_deadline, pick_deadline,
+            fallback_deadline, max_entries, max_winners, invited, 2, created_height
+       from tasks, generate_series(1, 501) g
+      where id = 2`,
+  );
+
+  const page = (await get<TaskDetailResponse>("/v1/tasks/2")).body;
+  expect(page.entries).toHaveLength(500);
+  expect(page.entries.at(-1)?.entry_index).toBe(499);
+  expect(page.task.commit_count).toBe(501);
+  // The children are the first 500, oldest first; the list of tasks pages through all of them.
+  expect(page.children).toHaveLength(500);
+  expect([page.children[0], page.children.at(-1)]).toEqual(["1001", "1500"]);
+  const last = await get<ListTasksResponse>("/v1/tasks?parent=2&limit=1");
+  expect(last.body.tasks[0]?.id).toBe("1501");
+
+  // An account's list is its newest 500 entries, newest commit first.
+  await deps.db.query(
+    `insert into entries (task_id, account, entry_index, commitment, committed_height)
+     select 1000 + g, 'busy.test.near', 0, 'c', 5000 + g from generate_series(1, 501) g`,
+  );
+  const busy = (await get<AccountEntriesResponse>("/v1/entries?account=busy.test.near")).body;
+  expect(busy.entries).toHaveLength(500);
+  expect([busy.entries[0]?.task_id, busy.entries.at(-1)?.task_id]).toEqual(["1501", "1002"]);
+});
+
 test("task_detail_returns_the_documents_the_task_points_at", async () => {
   const criteria: PublicCriteria = {
     kind: "exact",
@@ -553,7 +607,7 @@ test("task_detail_returns_the_documents_the_task_points_at", async () => {
         reasons: ["matches the expected value"],
       },
     ],
-    winners: [{ account: alice, bps: 10_000 }],
+    winners: PICKED_WINNERS,
     generated_at: "2026-10-30T10:00:00Z",
     judge: { software: "tender-judge/1", model: null },
   };
@@ -593,7 +647,7 @@ test("task_detail_reads_only_public_blobs_of_the_matching_kind", async () => {
     heldout: null,
     tie_break: "score desc, committed_at_block asc, account asc",
     entries: [],
-    winners: [],
+    winners: PICKED_WINNERS,
     generated_at: "2026-10-30T10:00:00Z",
     judge: { software: "tender-judge/1", model: null },
   });
@@ -743,10 +797,58 @@ test("phase_matches_contract_rules_at_boundaries", async () => {
 
 // ---- Agents -----------------------------------------------------------------------------------
 
+test("team_labels_follow_the_deployments_list_for_agents_entrants_and_posters", async () => {
+  // The indexer stored `is_team` for the judge when it read the registration, by the list it had
+  // then. The API labels by the list of the request, and by nothing stored.
+  await seedLifecycle(deps.db, { teamAccounts: [judge] });
+  // carol enters a task without registering as an agent, and so does an account whose parent is a
+  // top-level account, which makes no provider.
+  await apply(
+    taskLine(2, { invited: [], ...windowsFor("open") }),
+    eventLine("committed", { task_id: "2", account: carol, block_height: "120" }),
+    eventLine("committed", { task_id: "2", account: "dave.near", block_height: "121" }),
+  );
+  const labels = async (teamAccounts: string[]) => {
+    const app = appWith({ teamAccounts });
+    const agents = (await get<ListAgentsResponse>("/v1/agents", app)).body.agents;
+    const task = (await get<TaskDetailResponse>("/v1/tasks/2", app)).body;
+    const agent = (await get<AgentDetailResponse>(`/v1/agents/${judge}`, app)).body.agent;
+    return {
+      agents: Object.fromEntries(agents.map((a) => [a.account, a.is_team])),
+      entrants: Object.fromEntries(task.entries.map((e) => [e.account, e.is_team])),
+      poster: task.task.is_team_poster,
+      judge: agent.is_team,
+    };
+  };
+
+  // No list, no labels, whatever was stored.
+  expect(await labels([])).toEqual({
+    agents: { [alice]: false, [bob]: false, [judge]: false },
+    entrants: { [carol]: false, "dave.near": false },
+    poster: false,
+    judge: false,
+  });
+  // An account on the list is labelled wherever it shows, an agent or not.
+  expect(await labels([judge, carol])).toEqual({
+    agents: { [alice]: false, [bob]: false, [judge]: true },
+    entrants: { [carol]: true, "dave.near": false },
+    poster: false,
+    judge: true,
+  });
+  // So is every account that runs under a provider on the list, by the registry's rule: the
+  // fixtures' accounts are all under test.near. A top-level account, such as near, is no provider.
+  expect(await labels(["test.near", "near"])).toEqual({
+    agents: { [alice]: true, [bob]: true, [judge]: true },
+    entrants: { [carol]: true, "dave.near": false },
+    poster: true,
+    judge: true,
+  });
+});
+
 test("agents_list_filters_and_paginates", async () => {
   await seedLifecycle(deps.db, { teamAccounts: [judge] });
 
-  const all = await get<ListAgentsResponse>("/v1/agents");
+  const all = await get<ListAgentsResponse>("/v1/agents", appWith({ teamAccounts: [judge] }));
   expect(all.status).toBe(200);
   expect(all.body.next_cursor).toBeNull();
   // Ordered by account, ascending.

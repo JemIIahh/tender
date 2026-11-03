@@ -23,6 +23,7 @@ import {
   FIXTURE_OPTIONS,
   FIXTURE_PROFILE,
   FIXTURE_PROFILE_HASH,
+  fixtureData,
 } from "@tender/indexer/testing";
 import { intakeTask, type JudgeDeps } from "@tender/judge";
 import { canonicalJson, type PublicCriteria, type Scorecard, sha256Hex } from "@tender/shared";
@@ -176,6 +177,9 @@ const CRITERIA: PublicCriteria = {
   has_heldout: true,
   normalize: ["trim"],
 };
+
+/** The winners of the captured `picked` event, as a scorecard names them: account and share. */
+const PICKED_WINNERS = fixtureData("picked").winners.map(({ account, bps }) => ({ account, bps }));
 
 const HELDOUT = { exact: { expected: ["42"] } };
 const HELDOUT_BYTES = canonicalJson(HELDOUT);
@@ -1734,7 +1738,8 @@ test("scorecard_route_serves_the_scorecard_of_a_settled_task", async () => {
         reasons: ["matches the expected value"],
       },
     ],
-    winners: [{ account: alice, bps: 10_000 }],
+    // What the task's pick pays, below: a scorecard is served only beside its own payout.
+    winners: PICKED_WINNERS,
   });
   const bytes = canonicalJson(document);
   const stored = await post("/v1/blobs", blobBody("scorecard", bytes), judge);
@@ -1790,9 +1795,123 @@ test("scorecard_route_hides_a_scorecard_that_names_another_task", async () => {
   expect((await get("/v1/scorecards/9", app)).status).toBe(404);
 });
 
+/**
+ * The scorecard of task `id` wherever the API serves one: its route, the task's page and the MCP
+ * tool, each as the document it serves, or null for none. One function decides for all three
+ * (`getScorecard`), so they have to agree.
+ */
+async function servedScorecards(id: string): Promise<Array<Scorecard | null>> {
+  const app = createApp(deps);
+  const route = await get(`/v1/scorecards/${id}`, app);
+  const page = (await (await app.request(`/v1/tasks/${id}`)).json()) as TaskDetailResponse;
+  const call = await app.request("/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "get_scorecard", arguments: { task_id: id } },
+    }),
+  });
+  const { result } = (await call.json()) as {
+    result: { isError?: boolean; content: Array<{ text: string }> };
+  };
+  return [
+    route.status === 200 ? (JSON.parse(route.text()) as Scorecard) : null,
+    page.scorecard,
+    result.isError === true ? null : (JSON.parse(result.content[0]?.text ?? "") as Scorecard),
+  ];
+}
+
+/** Stores `document` as a public scorecard, as the Judge stores its own before it picks. */
+function publishCard(document: Scorecard): Promise<string> {
+  return putBlob(deps.db, {
+    kind: "scorecard",
+    contentType: "application/json",
+    bytes: canonicalJson(document),
+    taskId: BigInt(document.task_id),
+    uploader: document.verifier,
+    isPublic: true,
+  });
+}
+
+/** A `picked` line for task `id`, by `by`, paying `winners` (each with some amount). */
+function pickLine(
+  id: string,
+  by: string,
+  winners: Array<{ account: string; bps: number }>,
+  scorecardHash: string,
+): string {
+  return eventLine("picked", {
+    task_id: id,
+    by,
+    winners: winners.map((winner) => ({ ...winner, amount: "1000" })),
+    scorecard_hash: scorecardHash,
+  });
+}
+
+test("a_scorecard_is_served_only_beside_the_payout_it_names", async () => {
+  await seedLifecycle(deps.db);
+  await apply(taskLine(2), taskLine(3), taskLine(4));
+  const toAlice = [{ account: alice, bps: 10_000 }];
+
+  // The Judge published its card for task 2 before a pick that failed. In the fallback window the
+  // poster picks other winners with the Judge's hash: the card, which names the Judge as verifier
+  // and alice as the winner, must not be shown beside a payout to bob that the Judge never made.
+  const laundered = scorecardOf("2", { winners: toAlice });
+  await apply(pickLine("2", poster, [{ account: bob, bps: 10_000 }], await publishCard(laundered)));
+  expect(await servedScorecards("2")).toEqual([null, null, null]);
+
+  // A poster that pays exactly what the Judge's card says has the Judge's card shown: it is the
+  // truth of that payout.
+  const honoured = scorecardOf("3", { winners: toAlice });
+  await apply(pickLine("3", poster, toAlice, await publishCard(honoured)));
+  expect(await servedScorecards("3")).toEqual([honoured, honoured, honoured]);
+
+  // The same accounts and shares in another order are another pick.
+  const reordered = scorecardOf("4", { winners: PICKED_WINNERS });
+  await apply(pickLine("4", judge, PICKED_WINNERS.toReversed(), await publishCard(reordered)));
+  expect(await servedScorecards("4")).toEqual([null, null, null]);
+});
+
+test("a_scorecard_of_an_empty_pick_names_no_winners", async () => {
+  await seedLifecycle(deps.db);
+  await apply(taskLine(2), taskLine(3));
+  // A pick with no winners voids the task as `no_award`, with the scorecard it was made with.
+  const empty = scorecardOf("2");
+  await apply(eventLine("voided", { task_id: "2", scorecard_hash: await publishCard(empty) }));
+  expect(await servedScorecards("2")).toEqual([empty, empty, empty]);
+
+  // A card that names winners does not go with a payout of nothing.
+  const named = scorecardOf("3", { winners: [{ account: alice, bps: 10_000 }] });
+  await apply(eventLine("voided", { task_id: "3", scorecard_hash: await publishCard(named) }));
+  expect(await servedScorecards("3")).toEqual([null, null, null]);
+});
+
+test("a_scorecard_is_the_word_of_the_tasks_verifier_or_poster", async () => {
+  await seedLifecycle(deps.db);
+  await apply(taskLine(2), taskLine(3));
+  // A card that pays what the pick paid, for the task, in the name of an account that is neither
+  // its verifier nor its poster, is nobody's to show for it. (The upload route would not take it;
+  // the read holds to the same.)
+  const strangers = scorecardBy(carol, "2", { winners: PICKED_WINNERS });
+  await apply(pickLine("2", judge, PICKED_WINNERS, await publishCard(strangers)));
+  expect(await servedScorecards("2")).toEqual([null, null, null]);
+
+  // The poster's own card, for a pick it made in the fallback window, is shown.
+  const posters = scorecardBy(poster, "3", { winners: PICKED_WINNERS });
+  await apply(pickLine("3", poster, PICKED_WINNERS, await publishCard(posters)));
+  expect(await servedScorecards("3")).toEqual([posters, posters, posters]);
+});
+
 test("scorecard_route_hides_a_private_scorecard", async () => {
   await seedLifecycle(deps.db);
-  const document = scorecardOf("3", { heldout: HELDOUT, heldout_commitment: HELDOUT_HASH });
+  const document = scorecardOf("3", {
+    heldout: HELDOUT,
+    heldout_commitment: HELDOUT_HASH,
+    winners: PICKED_WINNERS,
+  });
   const hash = await putBlob(deps.db, {
     kind: "scorecard",
     contentType: "application/json",
@@ -1854,7 +1973,11 @@ test("scorecard_with_proto_key_is_never_served_with_the_key_missing", async () =
   const heldout: unknown = JSON.parse('{"exact":{"expected":["42"]},"__proto__":{"seen":true}}');
   expect(Object.keys(heldout as object)).toContain("__proto__");
   const bytes = canonicalJson(
-    scorecardOf("3", { heldout, heldout_commitment: sha256Hex(canonicalJson(heldout)) }),
+    scorecardOf("3", {
+      heldout,
+      heldout_commitment: sha256Hex(canonicalJson(heldout)),
+      winners: PICKED_WINNERS,
+    }),
   );
   const hash = await putBlob(deps.db, {
     kind: "scorecard",
@@ -2318,6 +2441,7 @@ test("scorecard_route_hides_a_stored_scorecard_it_cannot_write_again", async () 
           reasons: ["a\ud800b"],
         },
       ],
+      winners: PICKED_WINNERS,
     });
     expect(() => canonicalJson(document)).toThrow(/lone surrogate/);
     const bytes = utf8(JSON.stringify(document));

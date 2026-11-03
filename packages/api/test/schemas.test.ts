@@ -7,6 +7,7 @@ import {
   FIXTURE_ACCOUNTS,
   FIXTURE_BRIEF,
   FIXTURE_OPTIONS,
+  fixtureData,
 } from "@tender/indexer/testing";
 import type * as Shared from "@tender/shared";
 import {
@@ -165,6 +166,10 @@ const CRITERIA: PublicCriteria = {
 /** What the Judge says when it turns a task away. */
 const REFUSAL = "kind rubric is limited to team tasks in v1";
 
+/** The winners of the captured `picked` event, as a scorecard names them: account and share. */
+const PICKED_WINNERS = fixtureData("picked").winners.map(({ account, bps }) => ({ account, bps }));
+
+/** The scorecard of task `taskId`, which pays what the captured pick paid. */
 function scorecardOf(taskId: string, criteriaHash: string): Scorecard {
   return {
     version: 1,
@@ -186,7 +191,7 @@ function scorecardOf(taskId: string, criteriaHash: string): Scorecard {
         reasons: ["matches the expected value"],
       },
     ],
-    winners: [{ account: alice, bps: 10_000 }],
+    winners: PICKED_WINNERS,
     generated_at: "2026-10-30T10:00:00Z",
     judge: { software: "tender-judge/1", model: null },
   };
@@ -405,7 +410,7 @@ test("agent_and_entry_routes_match_their_schemas", async () => {
     taskLine(2, windowsFor("open")),
     eventLine("committed", { task_id: "2", account: alice, block_height: "120" }),
   );
-  const app = appWith();
+  const app = appWith({ teamAccounts: [judge] });
 
   const list = await get(app, "/v1/agents");
   expect(list.status).toBe(200);

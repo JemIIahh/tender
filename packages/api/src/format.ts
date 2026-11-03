@@ -33,6 +33,14 @@ export const MAX_LIMIT = 50;
 /** How many of an agent's entries its page lists (`recent_entries`). */
 export const RECENT_ENTRIES = 20;
 
+/**
+ * The most entries and child tasks a task's page lists, and the most entries `GET /v1/entries`
+ * lists for an account. Entries cost nothing to make on testnet, and a page without a bound could
+ * grow to megabytes. A task's `commit_count` is how many entries it has in all, and
+ * `GET /v1/tasks?parent=` pages through all of its children.
+ */
+export const MAX_LISTED = 500;
+
 // ---- Responses --------------------------------------------------------------------------------
 
 /** `GET /v1/health`. */
@@ -152,11 +160,11 @@ export interface TaskDetailResponse {
   task: TaskDetail;
   brief: Brief | null;
   criteria: PublicCriteria | null;
-  /** In the order the agents committed. */
+  /** In the order the agents committed: the first `MAX_LISTED` (`task.commit_count` in all). */
   entries: TaskEntry[];
   /** The poster first, then the others by amount. */
   funders: TaskFunder[];
-  /** Ids of the tasks that name this one as their parent, oldest first. */
+  /** Ids of the tasks that name this one as their parent, oldest first: the first `MAX_LISTED`. */
   children: string[];
   scorecard: Scorecard | null;
 }
@@ -218,7 +226,7 @@ export interface AccountEntry extends AgentRecentEntry {
   uri: string | null;
 }
 
-/** `GET /v1/entries?account=`: every entry of the account, newest commit first. */
+/** `GET /v1/entries?account=`: the newest `MAX_LISTED` entries of the account, newest first. */
 export interface AccountEntriesResponse {
   entries: AccountEntry[];
 }

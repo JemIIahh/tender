@@ -3,7 +3,10 @@ import { type ApiDeps, nowNs } from "../deps";
 import { badRequest, parseAccount } from "../format";
 import { listEntriesByAccount } from "../queries";
 
-/** `GET /v1/entries?account=`: every entry of one account, with the task each one is in. */
+/**
+ * `GET /v1/entries?account=`: the newest entries of one account (`MAX_LISTED`), with the task each
+ * one is in.
+ */
 export function entryRoutes(deps: ApiDeps): Hono {
   const app = new Hono();
 

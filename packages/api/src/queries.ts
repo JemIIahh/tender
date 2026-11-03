@@ -17,11 +17,13 @@ import {
   type ListAgentsResponse,
   type ListTasksResponse,
   MAX_LIMIT,
+  MAX_LISTED,
   RECENT_ENTRIES,
   type TaskDetail,
   type TaskDetailResponse,
   type TaskEntry,
   type TaskFunder,
+  type TaskOutcome,
   type TaskSummary,
 } from "./format";
 
@@ -81,6 +83,31 @@ function phaseSql(now: string): string {
   end`;
 }
 
+// ---- The team ---------------------------------------------------------------------------------
+
+/**
+ * The provider of `account`, a column, by the registry's rule (`asp_of` in
+ * contract/tender/src/registry.rs): the account's parent when the parent has two labels or more,
+ * as `acme.near` is of `bot1.acme.near`, and null otherwise, as for `alice.near`, whose parent is
+ * a top-level account. It is the `asp` the contract records when an agent registers, so it is the
+ * same for an account that registered and for one that never did.
+ */
+function providerSql(account: string): string {
+  return `substring(${account} from '^[^.]+[.](.+[.].+)$')`;
+}
+
+/**
+ * Whether the team runs `account`, a column: it is one of the team's accounts (`team`, a
+ * placeholder of a text array), or its provider is. It is worked out from the list of the request,
+ * for agents, entrants and posters alike, so a change to `TEAM_ACCOUNTS` shows at once, and an
+ * entrant or a poster that never registered as an agent is labelled as one that did. An account
+ * with no provider compares a null, which `coalesce` makes a no.
+ */
+function teamSql(account: string, team: string): string {
+  return `(${account} = any(${team}::text[])
+      or coalesce(${providerSql(account)} = any(${team}::text[]), false))`;
+}
+
 // ---- Tasks ------------------------------------------------------------------------------------
 
 /** The columns of a `TaskSummary` for the task row `t`. */
@@ -104,9 +131,7 @@ function summaryColumns(now: string, team: string): string {
     (select count(*)::int from working w where w.task_id = t.id) as working_count,
     t.judge_status,
     t.judge_reason,
-    (t.poster = any(${team}::text[])
-      or exists (select 1 from agents pa where pa.account = t.poster and pa.is_team))
-      as is_team_poster,
+    ${teamSql("t.poster", team)} as is_team_poster,
     t.parent::text as parent,
     t.outcome ->> 'kind' as outcome_kind`;
 }
@@ -139,8 +164,8 @@ export interface TaskFilter {
 
 /**
  * The tasks that fit `f`, newest id first, with each one's phase at `now` (nanoseconds).
- * `teamAccounts` are the accounts the team runs: a task whose poster is one of them, or a
- * registered agent flagged as the team's, has `is_team_poster`.
+ * `teamAccounts` are the accounts the team runs: a task whose poster is one of them, or runs under
+ * one as its provider (`teamSql`), has `is_team_poster`.
  */
 export async function listTasks(
   db: Db,
@@ -174,7 +199,9 @@ export async function listTasks(
 
 /**
  * One task with its entries, funders, children and the documents it points at, or null if the
- * index holds no such task (`id` is not a u64, or no task has it).
+ * index holds no such task (`id` is not a u64, or no task has it). It lists the first `MAX_LISTED`
+ * entries in entrant order, and as many children, oldest first: the task's `commit_count` is how
+ * many entries it has, and `listTasks` with `parent` pages through all of its children.
  */
 export async function getTaskDetail(
   db: Db,
@@ -203,12 +230,12 @@ export async function getTaskDetail(
               e.content_hash,
               e.uri,
               (e.content_hash is not null) as revealed,
-              (coalesce(a.is_team, false) or e.account = any($2::text[])) as is_team
+              ${teamSql("e.account", "$2")} as is_team
          from entries e
-         left join agents a on a.account = e.account
         where e.task_id = $1::numeric
-        order by e.entry_index`,
-      [taskId, [...teamAccounts]],
+        order by e.entry_index
+        limit $3::int`,
+      [taskId, [...teamAccounts], MAX_LISTED],
     ),
     db.query<TaskFunder>(
       `select f.account, f.amount::text as amount
@@ -220,12 +247,12 @@ export async function getTaskDetail(
     ),
     // `tasks.id`, not `id`: a bare name in `order by` is the output column, which is text.
     db.query<{ id: string }>(
-      "select id::text as id from tasks where parent = $1::numeric order by tasks.id",
-      [taskId],
+      "select id::text as id from tasks where parent = $1::numeric order by tasks.id limit $2::int",
+      [taskId, MAX_LISTED],
     ),
     publicDocument(db, task.brief_hash, "brief", BriefSchema),
     publicDocument(db, task.criteria_hash, "criteria", PublicCriteriaSchema),
-    scorecardOf(db, taskId, task.outcome?.scorecard_hash ?? null),
+    scorecardOf(db, task),
   ]);
 
   return {
@@ -240,25 +267,56 @@ export async function getTaskDetail(
 }
 
 /**
- * The scorecard the pick or the empty pick of task `taskId` points at, or null: the task has no
- * outcome or none with a scorecard, the index holds no public scorecard blob under that hash, the
- * blob does not fit `ScorecardSchema`, or it is the scorecard of another task.
+ * The scorecard task `taskId` was settled with, as `scorecardOf` finds it, or null. The REST routes
+ * and the MCP tools all read it here, or through `getTaskDetail`, which asks the same.
  */
 export async function getScorecard(db: Db, taskId: string | bigint): Promise<Scorecard | null> {
   const id = String(taskId);
   if (!U64StringSchema.safeParse(id).success) return null;
-  const [row] = await db.query<{ hash: string | null }>(
-    "select outcome ->> 'scorecard_hash' as hash from tasks where id = $1::numeric",
+  const [task] = await db.query<Settled>(
+    "select id::text as id, poster, verifier, outcome from tasks where id = $1::numeric",
     [id],
   );
-  return scorecardOf(db, id, row?.hash ?? null);
+  return task === undefined ? null : scorecardOf(db, task);
 }
 
-async function scorecardOf(db: Db, taskId: string, hash: string | null): Promise<Scorecard | null> {
-  if (hash === null) return null;
+/** What a scorecard is held to: the task's id, its two accounts and its outcome. */
+type Settled = Pick<TaskDetail, "id" | "poster" | "verifier" | "outcome">;
+
+/**
+ * The scorecard the pick or the empty pick of `task` points at, or null: the task has no outcome or
+ * none with a scorecard, the index holds no public scorecard blob under that hash, the blob does
+ * not fit `ScorecardSchema`, or it is not the card of this settlement.
+ *
+ * Whoever settles chooses the hash: the verifier, or the poster when it picks after the pick
+ * deadline. So the hash can name any public scorecard, the card of another task, or the card the
+ * Judge published before a pick of its own that failed, beside a payout the Judge did not make.
+ * A card is shown only when it is the task's (`task_id`), it is the word of the task's verifier or
+ * poster (`verifier`), and its winners are those the outcome paid, each account with its share in
+ * the same order, or none for an empty pick. A poster that pays exactly what the Judge's card says
+ * has the Judge's card shown, as it is the truth of that payout.
+ */
+async function scorecardOf(db: Db, task: Settled): Promise<Scorecard | null> {
+  const hash = task.outcome?.scorecard_hash ?? null;
+  if (task.outcome === null || hash === null) return null;
   const scorecard = await publicDocument(db, hash, "scorecard", ScorecardSchema);
-  // The verifier chooses the hash it settles with, so it can name a scorecard of another task.
-  return scorecard !== null && scorecard.task_id === taskId ? scorecard : null;
+  if (scorecard === null || scorecard.task_id !== task.id) return null;
+  if (scorecard.verifier !== task.verifier && scorecard.verifier !== task.poster) return null;
+  return samePayout(scorecard.winners, task.outcome) ? scorecard : null;
+}
+
+/**
+ * Whether `winners` are the accounts and shares that `outcome` paid, in its order: those of a pick,
+ * and none of a void. The outcome is the index's copy of the chain's, but it is read as JSON, so
+ * the check does not lean on its shape.
+ */
+function samePayout(winners: Scorecard["winners"], outcome: TaskOutcome): boolean {
+  const paid: unknown = outcome.kind === "picked" ? outcome.winners : [];
+  if (!Array.isArray(paid) || paid.length !== winners.length) return false;
+  return winners.every((winner, i) => {
+    const payout = paid[i] as { account?: unknown; bps?: unknown } | null | undefined;
+    return payout?.account === winner.account && payout?.bps === winner.bps;
+  });
 }
 
 /**
@@ -294,7 +352,9 @@ export async function publicDocument<T>(
 
 // ---- Agents -----------------------------------------------------------------------------------
 
-const AGENT_COLUMNS = `a.account,
+/** The columns of an `AgentSummary` for the agent row `a`, with `team` the team's accounts. */
+function agentColumns(team: string): string {
+  return `a.account,
     a.asp,
     a.name,
     a.tags,
@@ -307,7 +367,8 @@ const AGENT_COLUMNS = `a.account,
     a.earned,
     a.picks_made,
     a.voids_after_reveals,
-    a.is_team`;
+    ${teamSql("a.account", team)} as is_team`;
+}
 
 export interface AgentFilter {
   /** Only agents whose profile lists this tag. */
@@ -322,18 +383,23 @@ export interface AgentFilter {
 
 /**
  * The registered agents that fit `f`, ordered by account (byte order, so the order is the same on
- * every database). `is_team` is what the indexer stored when it read the registration.
+ * every database). An agent has `is_team` when it, or its provider, is one of `teamAccounts`.
  */
-export async function listAgents(db: Db, f: AgentFilter): Promise<ListAgentsResponse> {
+export async function listAgents(
+  db: Db,
+  f: AgentFilter,
+  teamAccounts: readonly string[],
+): Promise<ListAgentsResponse> {
   const limit = clampLimit(f.limit);
   const p = new SqlParams();
+  const teamP = p.add([...teamAccounts]);
   const where: string[] = [];
   if (f.tag !== undefined) where.push(`a.tags @> ${p.add(JSON.stringify([f.tag]))}::jsonb`);
   if (f.asp !== undefined) where.push(`a.asp = ${p.add(f.asp)}`);
   if (f.cursor !== undefined) where.push(`a.account collate "C" > ${p.add(f.cursor)}`);
 
   const rows = await db.query<AgentSummary>(
-    `select ${AGENT_COLUMNS}
+    `select ${agentColumns(teamP)}
        from agents a
       ${where.length > 0 ? `where ${where.join(" and ")}` : ""}
       order by a.account collate "C"
@@ -346,16 +412,17 @@ export async function listAgents(db: Db, f: AgentFilter): Promise<ListAgentsResp
 
 /**
  * A registered agent and the latest of its entries, with each task's phase at `now`, or null if
- * the account is no agent.
+ * the account is no agent. It is labelled as `listAgents` labels it, by `teamAccounts`.
  */
 export async function getAgentDetail(
   db: Db,
   account: string,
   now: bigint,
+  teamAccounts: readonly string[],
 ): Promise<AgentDetailResponse | null> {
   const [agent] = await db.query<AgentSummary>(
-    `select ${AGENT_COLUMNS} from agents a where a.account = $1`,
-    [account],
+    `select ${agentColumns("$2")} from agents a where a.account = $1`,
+    [account, [...teamAccounts]],
   );
   if (!agent) return null;
   const latest = await accountEntries(db, account, now, RECENT_ENTRIES);
@@ -374,22 +441,22 @@ export async function getAgentDetail(
 // ---- Entries ----------------------------------------------------------------------------------
 
 /**
- * Every entry of `account`, newest commit first, with each task's phase at `now`. An account that
- * never entered a task has none, whether or not it is a registered agent.
+ * The newest `MAX_LISTED` entries of `account`, newest commit first, with each task's phase at
+ * `now`. An account that never entered a task has none, whether or not it is a registered agent.
  */
 export async function listEntriesByAccount(
   db: Db,
   account: string,
   now: bigint,
 ): Promise<AccountEntriesResponse> {
-  return { entries: await accountEntries(db, account, now) };
+  return { entries: await accountEntries(db, account, now, MAX_LISTED) };
 }
 
 async function accountEntries(
   db: Db,
   account: string,
   now: bigint,
-  limit?: number,
+  limit: number,
 ): Promise<AccountEntry[]> {
   const p = new SqlParams();
   const nowP = `${p.add(now)}::numeric`;
@@ -411,7 +478,7 @@ async function accountEntries(
        join tasks t on t.id = e.task_id
       where e.account = ${accountP}
       order by e.committed_height desc, e.task_id desc
-      ${limit === undefined ? "" : `limit ${p.add(limit)}::int`}`,
+      limit ${p.add(limit)}::int`,
     p.values,
   );
 }
