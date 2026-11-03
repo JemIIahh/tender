@@ -28,3 +28,8 @@ export function scored(
 ): EntryScore {
   return { score, passed: score >= c.min_score, reasons };
 }
+
+/** A score of 0 that does not pass, whatever the pass mark: it cannot be paid. */
+export function zero(reason: string): EntryScore {
+  return { score: 0, passed: false, reasons: [reason] };
+}

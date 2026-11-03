@@ -87,8 +87,13 @@ export interface WorkerOptions {
 
 /** What came of asking a task's scorer for one entry's score. */
 export type Scoring =
-  /** The entry's score. A failure of its own (time, memory, a crash) is a 0 with the reason. */
-  | { kind: "scored"; score: EntryScore }
+  /**
+   * The entry's score. A failure of its own (time, memory, a crash) is a 0 with the reason.
+   * `graded` is set by a scorer that asks a model (`rubric`) when it did: `usable` when the score
+   * is from the model's reply, `disqualified` when the replies, or the server's refusal,
+   * disqualified the entry (a 0 that does not pass).
+   */
+  | { kind: "scored"; score: EntryScore; graded?: "usable" | "disqualified" }
   /** The stop line came while the entry was being scored: it has no score. */
   | { kind: "cut" }
   /**

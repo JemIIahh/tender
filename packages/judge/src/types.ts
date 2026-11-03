@@ -115,6 +115,13 @@ export interface TaskProgress {
   /** How many of those the scorer scored. */
   scored: number;
   /**
+   * For a `rubric` task, how many of those a model graded with a reply that could be used, and
+   * how many the replies (or the server's refusal) disqualified (P05-R20). A task in which the
+   * model was asked about contents and disqualified every one of them fails closed.
+   */
+  usable: number;
+  disqualified: number;
+  /**
    * Whether a worker has compiled the task's criteria to score with. From then on a compile that
    * fails is the machine's load, not the criteria's fault, and does not reject them.
    */

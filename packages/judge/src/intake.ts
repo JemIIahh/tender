@@ -159,14 +159,18 @@ const CHECK_FAILED = "criteria could not be checked";
  *   grades it with the model it is given (`JudgeDeps.llm`);
  * - `has_heldout` that does not match whether the task has a `heldout_commitment`; `rubric` with
  *   `has_heldout` set, as it has no held-out part: `kind rubric has no held-out checks`;
- * - a `rubric` that a model cannot grade (`rubricProblem`): more than 20 criteria, or one that is
- *   blank, longer than 200 characters or holds an angle bracket, or two that read the same once
- *   normalised. Each has a reason of its own, and judging checks them again;
+ * - a `rubric` that a model cannot grade, or whose pass mark a disqualified entry would reach
+ *   (`rubricProblem`, which holds the rules of @tender/shared): more than 20 criteria, or one that
+ *   is blank, longer than 200 characters or holds an angle bracket, or two that read the same once
+ *   normalised, or a `min_score` below 1 (P05-R20). Each has a reason of its own, and judging
+ *   checks them again;
  * - a `rubric` task that the Judge cannot grade before agents spend effort on it (C16, see
  *   `rubricTaskProblem`), checked after the rules above and at intake only: the Judge has no model
- *   (`no model is configured to grade rubric tasks`), its `max_entries` is not from 1 to 50 (`kind
- *   rubric needs max_entries between 1 and 50`), or its brief cannot be read (`the task's brief
- *   could not be read`);
+ *   (`no model is configured to grade rubric tasks`), its entry terms are neither an open task's
+ *   (no invited list and `max_entries` 0: the Judge grades its first 50 entries, P05-R21) nor an
+ *   invite-only task's (`max_entries` from 1 to 50), which is `kind rubric needs max_entries 0 for
+ *   an open task, or 1 to 50 for an invite-only one`, or its brief cannot be read (`the task's
+ *   brief could not be read`);
  * - `exact` or `json_schema` without held-out checks: `held-out checks required for kind {k}`;
  * - a `json_schema` schema with an `$id` below its root, a root `$id` with a fragment, or a
  *   reference other than `#` and one to an entry of its `$defs` or `definitions` (see
@@ -199,10 +203,15 @@ export async function intakeTask(
   taskId: bigint,
 ): Promise<"accepted" | "pending" | "rejected"> {
   const [task] = await deps.db.query<
-    TaskTerms & { brief_hash: string; max_entries: number; judge_status: string | null }
+    TaskTerms & {
+      brief_hash: string;
+      max_entries: number;
+      invited: string[];
+      judge_status: string | null;
+    }
   >(
     `select id::text as id, poster, criteria_hash, heldout_commitment,
-            created_at::text as created_at, brief_hash, max_entries, judge_status
+            created_at::text as created_at, brief_hash, max_entries, invited, judge_status
        from tasks where id = $1 and verifier = $2`,
     [taskId, deps.judgeAccount],
   );

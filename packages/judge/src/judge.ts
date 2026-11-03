@@ -3,7 +3,14 @@ import { type EntryView, phaseOfTaskView, sha256Hex, type TaskView } from "@tend
 import { FETCH_TIMEOUT_MS, fetchEntryContent, ownBlobHash } from "./fetch";
 import { loadDocuments, type TaskDocuments } from "./intake";
 import { COMPILE_BUDGET_MS, openTaskScorer, type TaskScorer, TaskWorkers } from "./isolate";
-import { prepareRubric, RubricFailedClosedError } from "./kinds/rubric";
+import { zero } from "./kinds/common";
+import {
+  LEFT_OUT,
+  NO_USABLE_REPLY,
+  prepareRubric,
+  RUBRIC_MAX_ENTRIES,
+  RubricFailedClosedError,
+} from "./kinds/rubric";
 import { chooseWinners, rankEntries, type ScoredEntry } from "./rank";
 import { ScorerUnavailableError } from "./score";
 import { buildScorecard, clampReason } from "./scorecard";
@@ -64,6 +71,12 @@ const NOTHING_SCORED = "not judged: scoring was unavailable before any entry was
  * stop line: grading only some of the entries would be unfair, so it is not picked.
  */
 const NOT_ALL_GRADED = "not judged: not every entry could be graded before the pick deadline";
+/**
+ * The `judge_reason` of a rubric task with more entries than the Judge grades, none of whose graded
+ * entries passed (P05-R21). An empty pick would refund the task at once, though the entries after
+ * the first ones were never graded, so it is not picked.
+ */
+const NONE_OF_THE_FIRST_PASSED = `not judged: none of the first ${RUBRIC_MAX_ENTRIES} entries passed, and the others were not scored`;
 
 /** An entry that has revealed its content's hash and where the content is. */
 type RevealedEntry = EntryView & { content_hash: string; uri: string };
@@ -92,7 +105,11 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   when a worker could not compile the criteria again, after one had (see `failed_closed`),
  *   before any entry was scored. So it is for a `rubric` task with an entry left ungraded at the
  *   stop line: it is never picked from the entries that were graded, which would be unfair to the
- *   rest (`not judged: not every entry could be graded before the pick deadline`).
+ *   rest (`not judged: not every entry could be graded before the pick deadline`). And so it is
+ *   for a `rubric` task with more entries than the Judge grades, none of whose graded entries
+ *   passed (P05-R21): an empty pick would refund it at once, though the entries after the first 50
+ *   were never graded (`not judged: none of the first 50 entries passed, and the others were not
+ *   scored`).
  * - `yielded`: nothing was settled. The task's slice of the tick ran out with entries still to
  *   judge (P05-R18, P05-R19). It takes up again on its next turn from what it found out, which the
  *   Judge keeps (`JudgeMemory`) until the task is settled.
@@ -111,13 +128,17 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  *   (`yielded`). In its last stretch, the entries left have no score (`scoring unavailable`), with
  *   one `WARN`, and the task is picked from those scored. Or the criteria or held-out checks that
  *   the chain names cannot be read or used (they passed intake, so they are gone or changed), and
- *   its status becomes `failed_closed` with the reason. A `rubric` task fails closed too, for its
- *   own reasons (see `kinds/rubric.ts`): the Judge has no model to grade it with
- *   (`deps.llm`), it has more revealed entries than the Judge grades, its brief cannot be read, or
- *   something in grading is not as asked: a request fails, the reply is not the JSON asked for, a
- *   criterion is left out, repeated or made up, or an entry addresses the grader. Its status
- *   becomes `failed_closed` with the reason and one `WARN`, nothing is published, and the poster's
- *   fallback window applies.
+ *   its status becomes `failed_closed` with the reason. A `rubric` task fails closed too, for what
+ *   no entrant can be blamed for (see `kinds/rubric.ts`, P05-R20): the Judge has no model to grade
+ *   it with (`deps.llm`), its brief cannot be read, a request cannot be sent or is not answered in
+ *   time, the server answers with an HTTP error other than 400 and 413, or what it sends is no
+ *   chat completion; and when the model was asked about its entries and every one of them was
+ *   disqualified, which is the model or its server and not every entrant at once (`every entry
+ *   the model was asked about was disqualified`). Its status becomes `failed_closed` with the
+ *   reason and one `WARN`, nothing is published, and the poster's fallback window applies. An
+ *   entry the model says addresses it, whose replies are twice not as asked, or whose request the
+ *   server refuses with HTTP 400 or 413, is disqualified on its own: it scores 0 and does not
+ *   pass, and the others are graded as usual.
  *
  * The task is read from the chain first, every time, so a `pick` that landed before a crash, or
  * whose answer never came (`E_TIMEOUT`, after which it may have landed all the same), shows as an
@@ -136,7 +157,11 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  * check takes one too, and hands it on to the scorer (`TaskWorkers`). A `rubric` task has no
  * worker: a model grades its entries on this thread, an entry at a time (`prepareRubric`), and
  * everything else here holds for it as for the others; its scorecard names the model
- * (`judge.model`). In what order the entries are fetched and scored, how long one tick spends on
+ * (`judge.model`). It grades the first 50 of its revealed entries in commit order (P05-R21),
+ * chosen before anything else orders them, and each entry after them is on the scorecard with a 0
+ * that does not pass and the rule for its reason (`not scored: the Judge scores the first 50
+ * entries of a rubric task`), with no share in the result of a graded entry of the same content.
+ * In what order the entries are fetched and scored, how long one tick spends on
  * them, and which are left unscored so that the pick lands before the pick deadline, is
  * `judgeEntries`'s; a task with no entries is picked as before, and one with some scored is
  * picked from those. Then the entries are ranked, the winners chosen, and the scorecard built
@@ -182,6 +207,8 @@ export async function judgeTask(
   let judged: Judged;
   // The model that graded a rubric task, for its scorecard; `null` for the kinds with none.
   let model: string | null = null;
+  // The entries of a rubric task after the first 50 in commit order, which are not scored.
+  let leftOut: RevealedEntry[] = [];
   try {
     const loaded = await loadDocuments(deps.db, task, {
       teamAccounts: deps.teamAccounts,
@@ -199,19 +226,24 @@ export async function judgeTask(
     }
     documents = loaded.documents;
 
-    const revealed = (await deps.client.getAllEntries(taskId)).filter(isRevealed);
+    let revealed = (await deps.client.getAllEntries(taskId)).filter(isRevealed);
     // What earlier ticks found out of these entries, when they did not get through them all.
     let progress = deps.memory?.progress.get(task.id);
     if (progress === undefined) {
-      progress = { results: new Map(), scored: 0, compiled: false };
+      progress = { results: new Map(), scored: 0, usable: 0, disqualified: 0, compiled: false };
       deps.memory?.progress.set(task.id, progress);
     }
     let scorer: TaskScorer;
     const kindCriteria = documents.criteria;
     if (kindCriteria.kind === "rubric") {
+      // P05-R21: the first 50 revealed entries in commit order are graded, chosen before anything
+      // else orders them (`judgeEntries` takes ours first), and the rest are not scored.
+      const ordered = revealed.toSorted(inCommitOrder);
+      revealed = ordered.slice(0, RUBRIC_MAX_ENTRIES);
+      leftOut = ordered.slice(RUBRIC_MAX_ENTRIES);
       // A rubric needs the network, so it is graded on this thread and not in a worker. It fails
       // closed before any request when it cannot be graded at all.
-      const rubric = await prepareRubric(deps, task, kindCriteria, revealed.length);
+      const rubric = await prepareRubric(deps, task, kindCriteria);
       if ("failedClosed" in rubric) {
         return forget(deps, taskId, await failClosed(deps, taskId, rubric.failedClosed));
       }
@@ -237,7 +269,8 @@ export async function judgeTask(
     try {
       judged = await judgeEntries(deps, task, revealed, scorer, nowNs, progress);
     } catch (error) {
-      // Something in grading a rubric task was not as asked: it is never picked (spec 7.3).
+      // Something in grading a rubric task that no entrant can be blamed for: it is never picked
+      // (spec 7.3, P05-R20).
       if (error instanceof RubricFailedClosedError) {
         return forget(deps, taskId, await failClosed(deps, taskId, error.reason));
       }
@@ -280,6 +313,19 @@ export async function judgeTask(
   if (criteria.kind === "rubric" && judged.unscored > 0) {
     return notJudged(deps, taskId, NOT_ALL_GRADED, "not every entry could be graded in time");
   }
+  // P05-R20: what one entry made the model do disqualifies that entry alone. A model that was asked
+  // about entries and could grade none of them is the model or its server, not every entrant at
+  // once, and the task fails closed. When nothing was asked (every entry it grades was unavailable,
+  // or not text), the rule is the deterministic one: no entry passed.
+  if (criteria.kind === "rubric" && judged.disqualified > 0 && judged.usable === 0) {
+    return forget(deps, taskId, await failClosed(deps, taskId, NO_USABLE_REPLY));
+  }
+  // P05-R21: an empty pick refunds the task at once, and the entries after the first 50 were never
+  // graded. When none of the first passed, the task is left to its fallback window instead.
+  if (leftOut.length > 0 && !judged.entries.some((entry) => entry.passed)) {
+    const why = `none of the first ${RUBRIC_MAX_ENTRIES} entries passed, and the others were not scored`;
+    return notJudged(deps, taskId, NONE_OF_THE_FIRST_PASSED, why);
+  }
   // A worker could not compile the criteria again, in the task's last stretch: the machine's load,
   // not the criteria's fault. The entries left have no score, and the task is picked from those
   // scored, if any were.
@@ -291,7 +337,11 @@ export async function judgeTask(
     console.warn(`judge: WARN task ${taskId}: ${why}, so the entries left are not scored`);
   }
 
-  const ranked = rankEntries(judged.entries);
+  // The entries after a rubric task's first 50 are on the scorecard too, with the rule for reason.
+  const ranked = rankEntries([
+    ...judged.entries,
+    ...leftOut.map((entry) => scoredEntry(entry, zero(LEFT_OUT))),
+  ]);
   // The one list of winners: the scorecard states it and `pick` pays it.
   const winners = chooseWinners(ranked, criteria, task.max_winners);
   let scorecard: Uint8Array;
@@ -353,6 +403,12 @@ interface Judged {
   unscored: number;
   /** How many contents the scorer scored, whatever came of each, on this tick or earlier ones. */
   scored: number;
+  /**
+   * Of those, for a `rubric` task: how many a model graded with a reply that could be used, and how
+   * many it disqualified (P05-R20).
+   */
+  usable: number;
+  disqualified: number;
   /**
    * Whether the Judge's own lateness used up the time: judging started past the stop line, or a
    * worker could not be loaded and its criteria compiled before it.
@@ -461,6 +517,8 @@ async function judgeEntries(
     entries: entryScores,
     unscored,
     scored: progress.scored,
+    usable: progress.usable,
+    disqualified: progress.disqualified,
     late: judging.late,
     rejected: judging.rejected,
     unavailable: judging.unavailable,
@@ -481,13 +539,8 @@ async function judgeEntries(
       batch.forEach((entry, i) => {
         const score = scores[i];
         if (score === undefined) unscored++;
-        entryScores.push({
-          account: entry.account,
-          contentHash: entry.content_hash,
-          uri: entry.uri,
-          committedAtBlock: BigInt(entry.committed_at_block),
-          ...(score ?? zero(judging.unavailable ? SCORING_UNAVAILABLE : NOT_SCORED)),
-        });
+        const none = zero(judging.unavailable ? SCORING_UNAVAILABLE : NOT_SCORED);
+        entryScores.push(scoredEntry(entry, score ?? none));
       });
     }
   }
@@ -571,6 +624,8 @@ async function judgeBatch(
       if (scoring.kind === "scored") {
         found(item.key, scoring.score);
         progress.scored++;
+        if (scoring.graded === "usable") progress.usable++;
+        if (scoring.graded === "disqualified") progress.disqualified++;
       } else if (scoring.kind === "late") {
         judging.late = true;
       } else if (scoring.kind === "rejected") {
@@ -742,9 +797,15 @@ function contentKey(entry: RevealedEntry): string {
   return JSON.stringify([entry.content_hash, entry.uri]);
 }
 
-/** A score of 0 that does not pass, whatever the pass mark: it cannot be paid. */
-function zero(reason: string): EntryScore {
-  return { score: 0, passed: false, reasons: [reason] };
+/** `entry` with `score`, as it is ranked and put on the scorecard. */
+function scoredEntry(entry: RevealedEntry, score: EntryScore): ScoredEntry {
+  return {
+    account: entry.account,
+    contentHash: entry.content_hash,
+    uri: entry.uri,
+    committedAtBlock: BigInt(entry.committed_at_block),
+    ...score,
+  };
 }
 
 function isRevealed(entry: EntryView): entry is RevealedEntry {

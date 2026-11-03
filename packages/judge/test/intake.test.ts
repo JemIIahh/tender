@@ -102,7 +102,11 @@ const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at 
 const SECRET = "secret-part-of-someone-elses-private-answer";
 const HAS_HELDOUT_MISMATCH = "has_heldout does not match the task's held-out commitment";
 const NO_MODEL = "no model is configured to grade rubric tasks";
-const ENTRIES_NEEDED = "kind rubric needs max_entries between 1 and 50";
+const ENTRIES_NEEDED =
+  "kind rubric needs max_entries 0 for an open task, or 1 to 50 for an invite-only one";
+const MIN_SCORE_NEEDED = "kind rubric needs a min_score of at least 1";
+/** The accounts an invite-only task names. */
+const INVITED = ["alice.test.near", "bob.test.near"];
 const BRIEF_UNREADABLE = "the task's brief could not be read";
 const TOO_MANY_CRITERIA = "kind rubric has more than 20 criteria";
 const CRITERION_TOO_LONG = "kind rubric has a criterion of more than 200 characters";
@@ -181,8 +185,8 @@ const numbered = (n: number): string[] => Array.from({ length: n }, (_, i) => `c
 
 /**
  * A rubric task from the team that intake can take, given a Judge with a model (`LLM`): `criteria`
- * (the rubric above unless given), a brief that is stored, and room for 10 entries. `over` changes
- * the task.
+ * (the rubric above unless given), a brief that is stored, and no list of invited accounts and no
+ * cap on entries, which is the open task the post wizard posts (P05-R21). `over` changes the task.
  */
 async function rubricTask(
   criteria: object = RUBRIC,
@@ -192,7 +196,8 @@ async function rubricTask(
     poster: TEAM_POSTER,
     criteria_hash: await putCriteria(db, criteria),
     brief_hash: await putRaw(db, "brief", canonicalJson(BRIEF), TEAM_POSTER),
-    max_entries: 10,
+    max_entries: 0,
+    invited: [],
     ...over,
   };
 }
@@ -395,24 +400,46 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
       deps: { llm: { ...LLM, baseUrl: "ftp://models.example/v1" } },
       view: () => rubricTask(),
     },
+    // The entry terms (`rubricEntriesProblem`, P05-R21). An open task has no cap: the contract
+    // allows none (C24), and the Judge grades its first 50 entries. An invite-only task has a cap
+    // of 1 to 50.
     {
-      // `max_entries` 0 sets no limit, so honest entrants alone could pass 50 and sink the task.
-      rule: "rubric with max_entries 0",
+      rule: "open rubric task with a cap on entries",
       reason: ENTRIES_NEEDED,
       deps: { llm: LLM },
-      view: () => rubricTask(RUBRIC, { max_entries: 0 }),
+      view: () => rubricTask(RUBRIC, { max_entries: 10 }),
     },
     {
-      rule: "rubric with max_entries 51",
+      rule: "invite-only rubric task with max_entries 0",
       reason: ENTRIES_NEEDED,
       deps: { llm: LLM },
-      view: () => rubricTask(RUBRIC, { max_entries: 51 }),
+      view: () => rubricTask(RUBRIC, { max_entries: 0, invited: INVITED }),
     },
     {
-      rule: "rubric with max_entries far above the limit",
+      rule: "invite-only rubric task with max_entries 51",
       reason: ENTRIES_NEEDED,
       deps: { llm: LLM },
-      view: () => rubricTask(RUBRIC, { max_entries: 2_000_000_000 }),
+      view: () => rubricTask(RUBRIC, { max_entries: 51, invited: INVITED }),
+    },
+    {
+      rule: "invite-only rubric task with max_entries far above the limit",
+      reason: ENTRIES_NEEDED,
+      deps: { llm: LLM },
+      view: () => rubricTask(RUBRIC, { max_entries: 2_000_000_000, invited: INVITED }),
+    },
+    {
+      // P05-R20: a disqualified entry scores 0, and a pass mark of 0 would pass it.
+      rule: "rubric with a min_score of 0",
+      reason: MIN_SCORE_NEEDED,
+      deps: { llm: LLM },
+      view: () => rubricTask({ ...RUBRIC, min_score: 0 }),
+    },
+    {
+      // The criteria are asked first, then the pass mark.
+      rule: "rubric with a blank criterion and a min_score of 0",
+      reason: CRITERION_BLANK,
+      deps: { llm: LLM },
+      view: () => rubricTask({ ...rubricOf(" "), min_score: 0 }),
     },
     {
       rule: "rubric whose brief is not stored",
@@ -913,17 +940,20 @@ test("intake_accepts_the_p0_kinds", { timeout: 30_000 }, async () => {
 
 test("intake_accepts_a_rubric_from_the_team_that_the_judge_can_grade", async () => {
   // A rubric has no schema to compile and no held-out checks to wait for, so a team task is
-  // accepted at once when the Judge has a model, the task takes from 1 to 50 entries, its brief
-  // reads and its criteria are within the limits, at the edge of each. Nothing is asked of the
-  // model: the URL below is a port nobody listens on.
+  // accepted at once when the Judge has a model, the task is open (no cap on entries: the Judge
+  // grades the first 50, P05-R21) or invite-only with a cap of 1 to 50, its brief reads and its
+  // criteria are within the limits, at the edge of each. Nothing is asked of the model: the URL
+  // below is a port nobody listens on.
   const edge = Array.from(
     { length: 20 },
     (_, i) => `${String(i).padStart(3, "0")}${"x".repeat(197)}`,
   );
   const accepted: Partial<TaskView>[] = [
     await rubricTask(),
-    await rubricTask(RUBRIC, { max_entries: 1 }),
-    await rubricTask(RUBRIC, { max_entries: 50 }),
+    await rubricTask(RUBRIC, { max_entries: 1, invited: INVITED }),
+    await rubricTask(RUBRIC, { max_entries: 50, invited: INVITED }),
+    // The lowest pass mark a rubric may have.
+    await rubricTask({ ...RUBRIC, min_score: 1 }),
     // 20 criteria of 200 characters each.
     await rubricTask(rubricOf(...edge)),
     // 200 characters that are 400 UTF-16 units.
@@ -952,7 +982,7 @@ test("intake_accepts_a_rubric_from_the_team_that_the_judge_can_grade", async () 
 
 test("intake_asks_a_rubric_task_for_a_model_only_once_it_is_otherwise_sound", async () => {
   // A rubric task from a poster outside the team is refused for that, with or without a model.
-  const view = { criteria_hash: await putCriteria(db, RUBRIC), max_entries: 10 };
+  const view = { criteria_hash: await putCriteria(db, RUBRIC) };
   expect(await intake(1, view, null, { llm: LLM })).toBe("rejected");
   expect(await judgeRow(db, 1)).toEqual({
     judge_status: "rejected",
