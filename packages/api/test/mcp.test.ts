@@ -641,7 +641,8 @@ test("mcp_counts_each_client_apart_and_behind_proxies_by_the_address_they_forwar
   // Without a proxy a client is its socket's address, and a header it writes changes nothing.
   const direct = createApp({ ...deps, rateLimits: limits });
   for (const forged of ["9.9.9.1", "9.9.9.2", undefined]) {
-    const headers = forged === undefined ? {} : { "x-forwarded-for": forged };
+    const headers: Record<string, string> =
+      forged === undefined ? {} : { "x-forwarded-for": forged };
     const status = (await listFrom(direct, "10.0.0.1", headers)).status;
     expect(status, `${forged}`).toBe(forged === undefined ? 429 : 200);
   }
