@@ -81,6 +81,10 @@ const FIXED_ROLES: Readonly<Record<"keeper" | "judge", RoleSpec>> = {
   judge: { stem: "JUDGE", methods: ["pick", "pick_attested"], label: "judge" },
 };
 
+/** The methods this script lets the key of `role` call, which `pnpm serve` checks a key for. */
+export const roleMethods = (role: "keeper" | "judge"): readonly string[] =>
+  FIXED_ROLES[role].methods;
+
 /** An agent enters tasks and nothing else: it commits to an answer and later reveals it. */
 const AGENT_METHODS: readonly string[] = ["commit", "reveal"];
 

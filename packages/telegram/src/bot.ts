@@ -23,7 +23,27 @@ export interface BotDeps {
    * contract counts them. Defaults to the wall clock.
    */
   now?: () => bigint;
+  /**
+   * The Bot API server the bot calls, with no trailing slash, as grammY's `client.apiRoot` takes
+   * it. Defaults to Telegram's own, `https://api.telegram.org`. Tests point it at a fake one.
+   */
+  apiRoot?: string;
 }
+
+/**
+ * The commands Telegram lists in the bot's menu (`setMyCommands`), in the order `/help` gives them.
+ * `/start` is not one: it comes with the link the web app makes, and Telegram shows its own button
+ * for it.
+ */
+export const BOT_COMMANDS: readonly { command: string; description: string }[] = [
+  { command: "status", description: "Your account, mute state, watched tags and latest tasks" },
+  { command: "watch", description: "Hear about new tasks with a tag, like /watch research" },
+  { command: "unwatch", description: "Stop hearing about a tag" },
+  { command: "mute", description: "Pause alerts" },
+  { command: "unmute", description: "Resume alerts" },
+  { command: "stop", description: "Unlink this chat and clear its watches" },
+  { command: "help", description: "What the bot does, and how to link an account" },
+];
 
 /** One tag, as the contract's `check_tags` and a brief's schema allow it. */
 const TAG = /^[a-z0-9-]{1,24}$/;
@@ -68,7 +88,10 @@ export function createBot(deps: BotDeps): Bot {
   const webUrl = deps.webUrl.replace(/\/+$/, "");
   const linkPage = escapeHtml(`${webUrl}/telegram`);
 
-  const bot = new Bot(deps.token, { botInfo: deps.botInfo });
+  const bot = new Bot(deps.token, {
+    botInfo: deps.botInfo,
+    ...(deps.apiRoot !== undefined && { client: { apiRoot: deps.apiRoot } }),
+  });
   // The throttler is installed last, so it is outermost and spaces messages out before they go
   // anywhere; autoRetry inside it waits out a flood wait without giving up the call's place.
   bot.api.config.use(autoRetry());

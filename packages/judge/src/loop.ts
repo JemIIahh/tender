@@ -33,18 +33,26 @@ interface DeadlineRow {
  * It resolves with whether a task's turn ended at its slice, so that the next tick starts at once
  * (`startJudge`), intake first: a task that came due, or was posted, during a turn joins the next
  * pass. What that guarantees is that no task holds the Judge for more than a slice, and the work
- * under way at its end, while it has more than two slices left before its stop line. It does not
- * guarantee that each task gets to its stop line. A task within two slices of its line runs to it
- * uncut, and a task waiting behind it whose own line comes before the end of that stretch, as can
- * happen with two busy tasks, comes back past its line: it is then picked from what it found out.
- * When the wait also takes it past its pick deadline, as with a margin shorter than the wait, it
- * is not picked, and its fallback window applies. A due task that only waits (P05-R8) costs a
- * pass a quick look; no turn depends on it.
+ * under way at its end, while it has more than two slices left before its stop line. That work is
+ * not always short: a score (5 s), a round of fetches (10 s), a worker's compile of the criteria
+ * (the judging budget), or a rubric's request to the model (60 s, and the retry after a failure
+ * another 60 s or more). So a turn of a rubric task can hold the Judge for two or three minutes
+ * (see `judgeTask`). It does not guarantee that each task gets to its stop line. A task within two
+ * slices of its line runs to it uncut, and a task waiting behind it whose own line comes before
+ * the end of that stretch, as can happen with two busy tasks, comes back past its line: it is then
+ * picked from what it found out. When the wait also takes it past its pick deadline, as with a
+ * margin shorter than the wait, it is not picked, and its fallback window applies. A due task that
+ * only waits (P05-R8) costs a pass a quick look; no turn depends on it.
  *
  * A task that throws, as on a chain or database error, is logged, and the pass goes on with the
  * next task. The clock is read again for the judging pass: intake can take a while.
+ *
+ * Once `signal` has aborted, the pass takes no further task: the one in hand finishes, so that a
+ * pick it sent is seen through, and the pass returns before the next intake or the next turn. On a
+ * lost indexer lock, that keeps this Judge from judging alongside the one that takes the lock over.
+ * The task in hand can take a while still: as long as the turn of a rubric task, above.
  */
-export async function judgeTick(deps: JudgeDeps): Promise<boolean> {
+export async function judgeTick(deps: JudgeDeps, signal?: AbortSignal): Promise<boolean> {
   const clock = deps.now ?? (() => new Date());
   // `order by t.id`: the output column `id` is text, which would sort "10" before "9".
   const waiting = await deps.db.query<{ id: string }>(
@@ -54,6 +62,7 @@ export async function judgeTick(deps: JudgeDeps): Promise<boolean> {
     [deps.judgeAccount],
   );
   for (const { id } of waiting) {
+    if (signal?.aborted) return false;
     try {
       await intakeTask(deps, BigInt(id));
     } catch (error) {
@@ -78,6 +87,7 @@ export async function judgeTick(deps: JudgeDeps): Promise<boolean> {
     .sort((a, b) => compare(a.stopLine, b.stopLine) || compare(a.id, b.id));
   let gaveWay = false;
   for (const { row, id } of due) {
+    if (signal?.aborted) return gaveWay;
     try {
       if ((await judgeTask(deps, id)) === "yielded") gaveWay = true;
     } catch (error) {
@@ -110,10 +120,10 @@ export function newJudgeMemory(): JudgeMemory {
  * that a score worker is loaded before a task needs one. The wait starts when a tick ends, so
  * ticks never overlap, however long one takes. A tick that throws is logged and the loop goes on.
  *
- * An abort during the wait ends the loop at once. An abort during a tick lets the tick finish
- * first, so that a pick it sent is seen through. A signal that is aborted already runs no tick.
- * The returned promise resolves once the loop has stopped, and the warm worker it started with
- * it, and never rejects.
+ * An abort during the wait ends the loop at once. An abort during a tick lets the task in hand
+ * finish, so that a pick it sent is seen through, and the tick takes no other (`judgeTick`). A
+ * signal that is aborted already runs no tick. The returned promise resolves once the loop has
+ * stopped, and the warm worker it started with it, and never rejects.
  */
 export function startJudge(
   deps: JudgeDeps & { intervalMs?: number; signal: AbortSignal },
@@ -139,7 +149,7 @@ export function startJudge(
       ticking = true;
       let gaveWay = false;
       try {
-        gaveWay = await judgeTick(ticked);
+        gaveWay = await judgeTick(ticked, signal);
       } catch (error) {
         console.error(`judge: tick failed (${describeError(error)})`);
       }
@@ -149,7 +159,8 @@ export function startJudge(
       else timer = setTimeout(run, gaveWay ? 0 : intervalMs);
     };
 
-    // `once` removes the listener when it fires. An abort during a tick is seen after the tick.
+    // `once` removes the listener when it fires. An abort during a tick is seen when the tick
+    // returns, after the task in hand.
     signal.addEventListener(
       "abort",
       () => {
