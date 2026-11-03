@@ -588,6 +588,73 @@ test("mcp_is_stateless_and_answers_post_only", async () => {
   }
 });
 
+/** The bindings `@hono/node-server` gives a request from `socket`, which is where `clientKey` reads. */
+const fromSocket = (socket: string) => ({
+  incoming: { socket: { remoteAddress: socket, remotePort: 4000, remoteFamily: "IPv4" } },
+});
+
+/** A tools/list request that arrives from `socket`, with `headers`. */
+const listFrom = (app: Hono, socket: string, headers: Record<string, string> = {}) =>
+  app.request(
+    "/mcp",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...headers,
+      },
+      body: rpc("tools/list"),
+    },
+    fromSocket(socket),
+  );
+
+test("mcp_is_limited_per_client_with_a_429_and_retry_after", async () => {
+  const app = createApp({ ...deps, rateLimits: { mcp: { limit: 3, windowMs: 60_000 } } });
+  for (const id of [1, 2, 3]) {
+    expect((await post(app, rpc("tools/list", {}, id))).status, `request ${id}`).toBe(200);
+  }
+
+  // Past the limit the answer is a 429 with the seconds until the window is over, whatever the
+  // request says: the body is not read, so the work of a server and a transport is not done.
+  for (const body of [rpc("tools/list"), "not json", JSON.stringify([1, 2])]) {
+    const limited = await post(app, body);
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toEqual({
+      error: "rate_limited",
+      message: "too many requests, try again later",
+    });
+    const retryAfter = Number(limited.headers.get("retry-after"));
+    expect(Number.isInteger(retryAfter)).toBe(true);
+    expect(retryAfter).toBeGreaterThanOrEqual(1);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+  }
+
+  // The methods that are refused anyway cost nothing, and are not counted.
+  expect((await app.request("/mcp", { method: "GET" })).status).toBe(405);
+});
+
+test("mcp_counts_each_client_apart_and_behind_proxies_by_the_address_they_forward", async () => {
+  const limits = { mcp: { limit: 2, windowMs: 60_000 } };
+
+  // Without a proxy a client is its socket's address, and a header it writes changes nothing.
+  const direct = createApp({ ...deps, rateLimits: limits });
+  for (const forged of ["9.9.9.1", "9.9.9.2", undefined]) {
+    const headers = forged === undefined ? {} : { "x-forwarded-for": forged };
+    const status = (await listFrom(direct, "10.0.0.1", headers)).status;
+    expect(status, `${forged}`).toBe(forged === undefined ? 429 : 200);
+  }
+  expect((await listFrom(direct, "10.0.0.2")).status).toBe(200);
+
+  // Behind one proxy the client is the address that proxy saw, and its socket is the proxy's own.
+  const proxied = createApp({ ...deps, rateLimits: limits, trustedProxyHops: 1 });
+  const via = (client: string) => listFrom(proxied, "10.0.0.9", { "x-forwarded-for": client });
+  expect((await via("203.0.113.1")).status).toBe(200);
+  expect((await via("203.0.113.1")).status).toBe(200);
+  expect((await via("203.0.113.1")).status).toBe(429);
+  expect((await via("203.0.113.2")).status).toBe(200);
+});
+
 test("mcp_refuses_a_body_over_64_kib", async () => {
   const app = createApp(deps);
   const callWithPad = (size: number): string => {

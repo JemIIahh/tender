@@ -8,7 +8,8 @@ import type { ErrorBody } from "./format";
 // How the API tells a caller to come back later.
 //
 // A few routes cost the API something for anyone who asks: a challenge is a row in the database, a
-// sign-in is a question to the chain, a Telegram link is a nonce. Each is held to a number of
+// sign-in is a question to the chain, a Telegram link is a nonce, an MCP request is a server and a
+// transport that may wait 30 seconds for an answer. Each is held to a number of
 // requests in a window, counted per client address or per signed-in account in this process's
 // memory, which is enough because one services process runs per database (P03-R25). Past the
 // limit the answer is a 429 with `Retry-After`, the seconds until the caller's window ends.
@@ -55,6 +56,8 @@ export interface RateLimits {
   verify: RateLimit;
   /** `POST /v1/telegram/link`, per signed-in account. */
   telegramLink: RateLimit;
+  /** `POST /mcp`, per client address: every request, whatever tool it calls. */
+  mcp: RateLimit;
   /** `POST /v1/blobs` and `POST /v1/heldout` together, per signed-in account: every request. */
   upload: RateLimit;
   /**
@@ -75,6 +78,9 @@ export const DEFAULT_RATE_LIMITS: Readonly<RateLimits> = Object.freeze({
   challenge: { limit: 30, windowMs: 60_000 },
   verify: { limit: 30, windowMs: 60_000 },
   telegramLink: { limit: 10, windowMs: 10 * 60_000 },
+  // 5 a second: an agent browsing the board makes a call or two a second at most, and a client that
+  // shares an address with others (a proxy left at 0 hops) has room beside them.
+  mcp: { limit: 300, windowMs: 60_000 },
   upload: { limit: 60, windowMs: HOUR_MS },
   uploadBytes: { limit: 8 * MIB, windowMs: 24 * HOUR_MS },
   heldoutBytesTotal: { limit: 128 * MIB, windowMs: HOUR_MS },
@@ -87,6 +93,7 @@ export function rateLimitsOf(over: Partial<RateLimits> | undefined): RateLimits 
     challenge: over?.challenge ?? DEFAULT_RATE_LIMITS.challenge,
     verify: over?.verify ?? DEFAULT_RATE_LIMITS.verify,
     telegramLink: over?.telegramLink ?? DEFAULT_RATE_LIMITS.telegramLink,
+    mcp: over?.mcp ?? DEFAULT_RATE_LIMITS.mcp,
     upload: over?.upload ?? DEFAULT_RATE_LIMITS.upload,
     uploadBytes: over?.uploadBytes ?? DEFAULT_RATE_LIMITS.uploadBytes,
     heldoutBytesTotal: over?.heldoutBytesTotal ?? DEFAULT_RATE_LIMITS.heldoutBytesTotal,
