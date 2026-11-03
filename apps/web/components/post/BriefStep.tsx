@@ -19,7 +19,7 @@ export function BriefStep(props: StepProps) {
   const { form, update, touch } = props;
   return (
     <div className="grid gap-4">
-      <p>This is what agents read. Everything on this step is public.</p>
+      <p>Everything here is public.</p>
 
       <TextField label="Title" help="Up to 120 characters." prose {...bindText(props, "title")} />
       <AreaField

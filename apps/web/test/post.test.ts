@@ -15,14 +15,17 @@ import {
   DocumentError,
   firstError,
   formatForKind,
+  fundingOf,
   KINDS,
   kindsFor,
   linesOf,
+  POST_TASK_BYTES,
   type PostForm,
   PRESET_WINDOWS,
   parseTags,
   planPostCalls,
   regexCaution,
+  VAULT_SLOT_BYTES,
   windowsOf,
 } from "../lib/post";
 import {
@@ -312,6 +315,113 @@ test("the_calls_are_refused_for_what_would_cost_money_to_get_wrong", () => {
   }
 });
 
+// ---- The storage a post needs -------------------------------------------------------------------
+
+/** What one byte of Tender storage costs, in yoctoNEAR. */
+const BYTE = 10n ** 19n;
+
+/** The plan for `form` when the vault holds `vaultBalance` and `free` yoctoNEAR of storage is free. */
+function planWithStorage(form: PostForm, vaultBalance: bigint, free: bigint) {
+  const docs = buildDocuments(form);
+  return planPostCalls({
+    form,
+    uris: { brief: `http://api.test/v1/blobs/${docs.briefHash}` },
+    hashes: docs,
+    vaultBalance,
+    storage: { total: 10n ** 24n, available: free },
+    contractId: CONTRACT,
+    tokenId: TOKEN,
+    judgeAccount: JUDGE,
+  });
+}
+
+const methods = (calls: ReturnType<typeof planFor>) => calls.map((call) => call.methodName);
+
+test("the_bytes_a_post_sets_aside_cover_what_the_contract_charges_for_the_biggest_one_it_writes", () => {
+  // The record is 40 + 1 + 8 + Borsh(Task) bytes, and 800 are held back for the outcome. A task
+  // from the wizard has a Borsh(Task) of 738 bytes at most (the review of 06-T4 derived it from
+  // contract/tender/src/tasks.rs and types.rs). The slot of a first deposit is 200 at most.
+  expect(POST_TASK_BYTES).toBeGreaterThanOrEqual(40n + 1n + 8n + 738n + 800n);
+  expect(VAULT_SLOT_BYTES).toBe(200n);
+});
+
+test("storage_is_topped_up_first_when_it_cannot_pay_for_the_post", () => {
+  const form = regexForm({ amount: "5" });
+
+  // The vault holds the reward, so the post is all there is: 1,600 bytes, and 1,000 are free.
+  const short = planWithStorage(form, 5_000_000n, 1_000n * BYTE);
+  expect(short.map((call) => [call.receiverId, call.methodName])).toEqual([
+    [CONTRACT, "storage_deposit"],
+    [CONTRACT, "post_task"],
+  ]);
+  // The 600 bytes that are missing, paid by whoever signs: no account is named.
+  expect(short[0]?.args).toEqual({});
+  expect(short[0]?.deposit).toBe(600n * BYTE);
+
+  // With a deposit too, the top-up comes first, then the deposit, then the post.
+  const both = planWithStorage(regexForm({ amount: "5" }), 2_000_000n, 1_000n * BYTE);
+  expect(both.map((call) => [call.receiverId, call.methodName])).toEqual([
+    [CONTRACT, "storage_deposit"],
+    [TOKEN, "ft_transfer_call"],
+    [CONTRACT, "post_task"],
+  ]);
+  expect(both[1]?.args).toEqual({ receiver_id: CONTRACT, amount: "3000000", msg: "" });
+});
+
+test("storage_that_pays_for_the_post_is_not_topped_up", () => {
+  const form = regexForm({ amount: "5" });
+
+  // Exactly what a post needs is enough; one byte less is a byte's price short.
+  expect(methods(planWithStorage(form, 5_000_000n, POST_TASK_BYTES * BYTE))).toEqual(["post_task"]);
+  const oneShort = planWithStorage(form, 5_000_000n, (POST_TASK_BYTES - 1n) * BYTE);
+  expect(methods(oneShort)).toEqual(["storage_deposit", "post_task"]);
+  expect(oneShort[0]?.deposit).toBe(BYTE);
+
+  // Plenty is no top-up either, and a plan made without a storage balance has none.
+  expect(methods(planWithStorage(form, 5_000_000n, 50_000n * BYTE))).toEqual(["post_task"]);
+  expect(methods(planFor(form, 0n))).toEqual(["ft_transfer_call", "post_task"]);
+});
+
+test("the_slot_of_a_first_deposit_is_paid_for_too_and_only_for_a_first_deposit", () => {
+  const form = regexForm({ amount: "5" });
+  const need = POST_TASK_BYTES + VAULT_SLOT_BYTES;
+
+  // The vault holds none of the token, so the deposit opens its slot: the post and the slot.
+  const first = planWithStorage(form, 0n, POST_TASK_BYTES * BYTE);
+  expect(methods(first)).toEqual(["storage_deposit", "ft_transfer_call", "post_task"]);
+  expect(first[0]?.deposit).toBe(VAULT_SLOT_BYTES * BYTE);
+  expect(methods(planWithStorage(form, 0n, need * BYTE))).toEqual([
+    "ft_transfer_call",
+    "post_task",
+  ]);
+
+  // The vault holds part of the reward, so the slot is there and the deposit adds none.
+  expect(methods(planWithStorage(form, 2_000_000n, POST_TASK_BYTES * BYTE))).toEqual([
+    "ft_transfer_call",
+    "post_task",
+  ]);
+  const short = planWithStorage(form, 2_000_000n, (POST_TASK_BYTES - 1n) * BYTE);
+  expect(short[0]?.deposit).toBe(BYTE);
+});
+
+test("funding_says_the_storage_the_post_will_add_by_the_same_rule", () => {
+  const data = (vault: bigint, free: bigint) => ({
+    storage: { total: 10n ** 24n, available: free },
+    rows: [{ token: TOKEN, enabled: true, vault, wallet: 100_000_000n as bigint | null }],
+  });
+
+  expect(fundingOf(data(0n, 1_000n * BYTE), TOKEN, 5_000_000n).storageTopUp).toBe(800n * BYTE);
+  expect(fundingOf(data(5_000_000n, 1_000n * BYTE), TOKEN, 5_000_000n).storageTopUp).toBe(
+    600n * BYTE,
+  );
+  expect(fundingOf(data(5_000_000n, 5_000n * BYTE), TOKEN, 5_000_000n).storageTopUp).toBe(0n);
+  // An account that is not set up is turned away, and no top-up is made up for it.
+  expect(fundingOf({ storage: null, rows: [] }, TOKEN, 5_000_000n)).toMatchObject({
+    storageTopUp: 0n,
+    problem: "Your account isn't set up with Tender yet. Set it up on the Wallet page first.",
+  });
+});
+
 // ---- Checks, step by step -----------------------------------------------------------------------
 
 test("amount_inputs_reject_invalid", () => {
@@ -481,6 +591,47 @@ test("heldout_checks_that_are_too_long_are_refused_without_being_quoted", () => 
   expect(Object.keys(errors)).toEqual(["heldout"]);
   expect(errors.heldout).toContain("256 KiB");
   expect(errors.heldout).not.toContain(SECRET);
+});
+
+test("a_public_document_the_api_would_refuse_is_a_problem_on_its_own_step", () => {
+  // A schema over the 256 KiB the API keeps: the Checks step says so, and not a 413 after the sign-in.
+  const schema = JSON.stringify({ type: "object", description: "x".repeat(300_000) });
+  const errors = checkChecks(jsonForm({ schema }), { canRubric: false });
+  expect(Object.keys(errors)).toEqual(["form"]);
+  expect(errors.form).toBe("The public checks are too long. The limit is 256 KiB.");
+
+  // So are the examples of a regex task, which are public.
+  const examples = Array.from({ length: 30_000 }, () => "alice.near").join("\n");
+  expect(checkChecks(regexForm({ examplesMatch: examples }), { canRubric: false }).form).toBe(
+    "The public checks are too long. The limit is 256 KiB.",
+  );
+
+  // The build refuses the same documents, in the same words.
+  expect(() => buildDocuments(jsonForm({ schema }))).toThrow(
+    "The public checks are too long. The limit is 256 KiB.",
+  );
+
+  // A schema that the shared schema turns down is said on the step too.
+  const proto = checkChecks(jsonForm({ schema: '{"__proto__": {"type": "object"}}' }), {
+    canRubric: false,
+  });
+  expect(proto.form).toContain("The public checks do not fit");
+});
+
+test("text_that_cannot_be_saved_is_a_problem_on_the_step_that_holds_it", () => {
+  // A lone surrogate is not text the documents can hold. Which field has it is not said, since a
+  // place in a document can be the person's own key: the step says whose document it is.
+  expect(checkBrief(regexForm({ title: "Tit\ud800le" }))).toEqual({
+    form: "A character in the brief can't be saved.",
+  });
+  expect(checkChecks(regexForm({ examplesMatch: "a\ud800" }), { canRubric: false })).toEqual({
+    form: "A character in the public checks can't be saved.",
+  });
+
+  // The held-out checks are named and never quoted.
+  const held = checkChecks(regexForm({ heldoutMatch: `${SECRET}\ud800` }), { canRubric: false });
+  expect(held).toEqual({ heldout: "A character in the held-out checks can't be saved." });
+  expect(JSON.stringify(held)).not.toContain(SECRET);
 });
 
 // ---- The reward and the windows -----------------------------------------------------------------

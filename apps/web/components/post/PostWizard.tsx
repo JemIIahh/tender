@@ -13,10 +13,8 @@ import {
   checkReward,
   type Errors,
   emptyForm,
-  FORMAT_PHRASE,
   firstError,
   formatForKind,
-  KINDS,
   type PostForm,
   type PostLimits,
   readPostLimits,
@@ -94,7 +92,6 @@ export function PostWizard({
   const [touched, setTouched] = useState<ReadonlySet<string>>(new Set());
   const [limits, setLimits] = useState<LimitsState>({ status: "loading" });
   const [canRubric, setCanRubric] = useState(false);
-  const [formatNote, setFormatNote] = useState<string | null>(null);
   const [vault, setVault] = useState<VaultState>({ status: "idle" });
   const [vaultNonce, setVaultNonce] = useState(0);
   const [running, setRunning] = useState<Stage | null>(null);
@@ -267,15 +264,10 @@ export function PostWizard({
     if (target !== undefined) go(target.id);
   };
 
+  // A kind that cannot score the format the answers have takes the format it can. The Checks step
+  // says which one it is now, from the form, so there is no note to keep.
   const pickKind = (kind: CheckKind) => {
-    const outputFormat = formatForKind(kind, form.outputFormat);
-    const label = KINDS.find((candidate) => candidate.kind === kind)?.label ?? kind;
-    update({ kind, outputFormat });
-    setFormatNote(
-      outputFormat === form.outputFormat
-        ? null
-        : `The answer format is now ${FORMAT_PHRASE[outputFormat]}, which ${label} needs.`,
-    );
+    update({ kind, outputFormat: formatForKind(kind, form.outputFormat) });
     touch("kind");
   };
 
@@ -338,18 +330,35 @@ export function PostWizard({
   const index = STEPS.findIndex(({ id }) => id === step);
   const props: StepProps = { form, update, errors: shown, touch };
 
+  // A problem that belongs to no one field: Tender is paused, or a document the step makes does not
+  // fit. It is shown above the step, and Next takes the focus to it.
+  const formProblem =
+    shown.form === undefined ? null : (
+      <p
+        id="post-form"
+        tabIndex={-1}
+        role="alert"
+        className="rounded border border-neutral-900 p-3"
+      >
+        {shown.form}
+      </p>
+    );
+
   const body = (() => {
     switch (step) {
       case "brief":
-        return <BriefStep {...props} />;
+        return (
+          <>
+            {formProblem}
+            <BriefStep {...props} />
+          </>
+        );
       case "checks":
         return (
-          <CriteriaStep
-            {...props}
-            canRubric={canRubric}
-            formatNote={formatNote}
-            onKind={pickKind}
-          />
+          <>
+            {formProblem}
+            <CriteriaStep {...props} canRubric={canRubric} onKind={pickKind} />
+          </>
         );
       case "reward":
         return limits.status === "loading" ? (
@@ -358,16 +367,7 @@ export function PostWizard({
           <ErrorState message={limits.message} retrying={limits.retrying} onRetry={loadLimits} />
         ) : (
           <>
-            {shown.form === undefined ? null : (
-              <p
-                id="post-form"
-                tabIndex={-1}
-                role="alert"
-                className="rounded border border-neutral-900 p-3"
-              >
-                {shown.form}
-              </p>
-            )}
+            {formProblem}
             <RewardStep {...props} limits={limits.limits} judgeAccount={judgeAccount} />
           </>
         );

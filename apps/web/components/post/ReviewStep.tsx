@@ -18,7 +18,7 @@ import {
   windowsText,
 } from "../../lib/post";
 import type { Stage, SubmitResult } from "../../lib/postSubmit";
-import { describeAmount, type VaultData } from "../../lib/vault";
+import { describeAmount, describeNear, type VaultData } from "../../lib/vault";
 import { WALLET_CANNOT_SIGN_MESSAGE } from "../../lib/walletErrors";
 import { ErrorState } from "../ErrorState";
 import { PRIMARY, SECONDARY } from "./ui";
@@ -110,6 +110,17 @@ export function ReviewStep(props: {
   const funding =
     vault.status === "ready" && reward !== null ? fundingOf(vault.data, tokenId, reward) : null;
 
+  // "—" where there is nothing to read: no wallet connected, or a read that failed. The words about
+  // reading are for a read that is under way.
+  const paidFrom =
+    funding !== null
+      ? funding.toDeposit === 0n
+        ? `Your vault: ${describeAmount(funding.inVault, tokenId)}, enough already.`
+        : `Your vault: ${describeAmount(funding.inVault, tokenId)}. Added from your wallet first: ${describeAmount(funding.toDeposit, tokenId)}.`
+      : reward !== null && vault.status === "loading"
+        ? "Reading your balances…"
+        : "—";
+
   // Why Post is off, in the order a person can put it right. A wallet that is not connected, or
   // cannot sign, has its own words below.
   const fundingProblem = funding?.problem ?? null;
@@ -143,10 +154,7 @@ export function ReviewStep(props: {
 
   return (
     <div className="grid gap-6">
-      <p>
-        Read it through. Once it is posted, the reward is held for the winner and the terms can't
-        change.
-      </p>
+      <p>Once posted, the terms can't change.</p>
 
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2">
         <Row id="review-title" label="Title">
@@ -157,12 +165,13 @@ export function ReviewStep(props: {
           {` · Tender keeps ${formatBps(limits.feeBps)} when it is paid out.`}
         </Row>
         <Row id="review-funding" label="Paid from">
-          {funding === null || reward === null
-            ? "Reading your balances…"
-            : funding.toDeposit === 0n
-              ? `Your vault: ${describeAmount(funding.inVault, tokenId)}, enough already.`
-              : `Your vault: ${describeAmount(funding.inVault, tokenId)}. Added from your wallet first: ${describeAmount(funding.toDeposit, tokenId)}.`}
+          {paidFrom}
         </Row>
+        {funding === null || funding.storageTopUp === 0n ? null : (
+          <Row id="review-storage" label="Storage">
+            {`Adds ${describeNear(funding.storageTopUp)} from your wallet first.`}
+          </Row>
+        )}
         <Row id="review-answer" label="Answers">
           {`${FORMAT_LABEL[form.outputFormat]}, up to ${Number(form.maxBytes.trim()).toLocaleString("en-US")} bytes`}
         </Row>
@@ -199,7 +208,7 @@ export function ReviewStep(props: {
           <p role="status">Checking for your wallet…</p>
         ) : accountId === null ? (
           <>
-            <p>Connect your wallet to post this task. Your answers above are kept.</p>
+            <p>Connect your wallet to post.</p>
             <button
               key="connect"
               type="button"

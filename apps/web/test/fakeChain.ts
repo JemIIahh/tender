@@ -22,6 +22,8 @@ const U128_MAX = 2n ** 128n - 1n;
 const MAX_WINDOW_SECS = 1_209_600;
 const MAX_WINNERS = 5;
 const OUTCOME_RESERVE_BYTES = 800n;
+/** `VAULT_SLOT_MAX_BYTES`: what a first deposit of a token charges the account it is for. */
+const VAULT_SLOT_BYTES = 200n;
 const MAX_URI_BYTES = 256;
 /** About what a task record takes besides its address. The model's own figure, not the contract's. */
 const TASK_RECORD_BYTES = 400n;
@@ -562,7 +564,19 @@ export class FakeChain {
       if (typeof named === "string") beneficiary = named;
       else accepted = false;
     }
-    if (!this.storage.has(beneficiary)) accepted = false;
+    const record = this.storage.get(beneficiary);
+    if (record === undefined) accepted = false;
+    // A token the beneficiary has no slot for yet gets one, and the slot is charged to the
+    // beneficiary's storage: a deposit whose slot it cannot pay for is handed back (vault.rs).
+    const opensSlot = !this.slots(beneficiary).has(token);
+    if (
+      accepted &&
+      opensSlot &&
+      record !== undefined &&
+      record.total - (record.usedBytes + VAULT_SLOT_BYTES) * BYTE_COST < 0n
+    ) {
+      accepted = false;
+    }
 
     const logs: string[] = [];
     if (accepted) {
@@ -571,6 +585,12 @@ export class FakeChain {
         this.contractId,
         (this.balances(token).get(this.contractId) ?? 0n) + amount,
       );
+      if (opensSlot && record !== undefined) {
+        this.storage.set(beneficiary, {
+          ...record,
+          usedBytes: record.usedBytes + VAULT_SLOT_BYTES,
+        });
+      }
       const slots = this.slots(beneficiary);
       slots.set(token, (slots.get(token) ?? 0n) + amount);
       logs.push(

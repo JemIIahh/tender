@@ -166,6 +166,8 @@ interface Options extends ApiOptions {
   paused?: boolean;
   /** The first read of the chain fails, as a dropped connection does. */
   limitsFailOnce?: boolean;
+  /** Every read of the vault fails (the limits are read as usual). */
+  vaultReadFails?: boolean;
 }
 
 interface World {
@@ -209,7 +211,9 @@ function setup(options: Options = {}): World {
   );
   let reads = 0;
   vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-    if (options.limitsFailOnce && String(input).startsWith("http://rpc.test") && reads++ === 0) {
+    const rpc = String(input).startsWith("http://rpc.test");
+    if (options.limitsFailOnce && rpc && reads++ === 0) throw new TypeError("Failed to fetch");
+    if (options.vaultReadFails && rpc && String(init?.body).includes('"balances_of"')) {
       throw new TypeError("Failed to fetch");
     }
     return route(input, init);
@@ -695,6 +699,8 @@ test("without_a_wallet_the_form_works_and_review_offers_connect", async () => {
   await toReview(user);
 
   expect(testId("review-account")).toBe("Not connected");
+  // Nothing is being read without a wallet, so the row does not say it is reading.
+  expect(testId("review-funding")).toBe("—");
   expect(screen.getByRole("button", { name: "Post task" }).getAttribute("aria-disabled")).toBe(
     "true",
   );
@@ -725,8 +731,9 @@ test("a_wallet_that_refuses_keeps_the_uploads_and_the_form_and_a_second_try_goes
 
   await user.click(await postReady());
   const failure = await screen.findByTestId("post-failure");
-  expect(failure.textContent).toContain("The wallet didn't finish.");
-  expect(failure.textContent).toContain("press Post again");
+  expect(failure.textContent).toBe(
+    "The wallet didn't finish. A deposit may have gone through: check the Wallet page. Your documents are saved; press Post to try again.",
+  );
   expect(router.push).not.toHaveBeenCalled();
   expect(wallet.sent).toEqual([]);
   // The documents are saved with Tender; the form is as it was.
@@ -754,6 +761,149 @@ test("a_wallet_that_refuses_keeps_the_uploads_and_the_form_and_a_second_try_goes
     api.heldouts[0]?.commitment,
   ]);
   expect(said()).not.toContain(SECRET);
+});
+
+test("a_result_the_wallet_cannot_be_read_for_locks_post_and_a_second_press_does_nothing", async () => {
+  const { user, wallet, api, chain } = setup({ vault: TUSDC(2) });
+  const send = wallet.signAndSendTransactions.bind(wallet);
+  wallet.signAndSendTransactions = async (params) => {
+    // The batch runs on the chain, and what comes back is not an outcome the page can read.
+    await send(params);
+    return "not an outcome" as never;
+  };
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  await user.click(await postReady());
+
+  // The task is on the chain and the page cannot say so: it is told to look, and not to post again.
+  const sent = await screen.findByTestId("post-sent");
+  expect(sent.textContent).toContain("look for it on the Tasks page");
+  expect(screen.queryByTestId("post-failure")).toBeNull();
+  expect(router.push).not.toHaveBeenCalled();
+  expect(off(postButton())).toBe(true);
+  expect(chain.tasks.size).toBe(1);
+
+  // A second press does nothing. Without the lock it would read the emptied vault, deposit the whole
+  // reward again and post the same task a second time.
+  const before = { requests: api.requests.length, batches: wallet.sent.length };
+  await user.click(postButton());
+  await settle();
+  expect(api.requests).toHaveLength(before.requests);
+  expect(wallet.sent).toHaveLength(before.batches);
+  expect(chain.tasks.size).toBe(1);
+});
+
+test("a_short_storage_balance_is_topped_up_in_the_same_batch_and_the_review_says_so", async () => {
+  const { user, chain, wallet } = setup({ vault: TUSDC(2) });
+  const byte = 10n ** 19n;
+  // 1,000 bytes are free where a post needs 1,600. The vault holds some of the token, so its slot
+  // is there already and the deposit adds none.
+  chain.storage.set(ALICE, { total: (173n + 1_000n) * byte, usedBytes: 173n });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  // The 600 bytes that are missing are 0.006 NEAR, said before the wallet is asked for it.
+  await waitFor(
+    () => expect(testId("review-storage")).toBe("Adds 0.006 NEAR from your wallet first."),
+    LONG,
+  );
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+
+  // One batch of three transactions: the storage to Tender, the deposit to the token, the post.
+  expect(wallet.sent).toHaveLength(1);
+  expect(wallet.sent[0]?.transactions.map(({ receiverId }) => receiverId)).toEqual([
+    CONTRACT,
+    TOKEN,
+    CONTRACT,
+  ]);
+  expect(chain.calls.map(({ receiverId, methodName }) => `${receiverId} ${methodName}`)).toEqual([
+    `${CONTRACT} storage_deposit`,
+    `${TOKEN} ft_transfer_call`,
+    `${CONTRACT} post_task`,
+  ]);
+  expect(chain.calls[0]?.deposit).toBe(600n * byte);
+  expect(chain.tasks.get(1n)).toMatchObject({ poster: ALICE, reward: TUSDC(5) });
+});
+
+test("a_storage_balance_that_pays_for_the_post_shows_no_storage_row_and_adds_none", async () => {
+  const { user, chain, wallet } = setup({ vault: TUSDC(5) });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  await waitFor(() => expect(testId("review-funding")).toContain("enough already"), LONG);
+  expect(screen.queryByTestId("review-storage")).toBeNull();
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
+
+  expect(chain.calls.map(({ methodName }) => methodName)).toEqual(["post_task"]);
+  expect(wallet.sent[0]?.transactions).toHaveLength(1);
+});
+
+test("a_deposit_tender_could_not_take_is_worded_as_that_and_the_next_press_tops_storage_up", async () => {
+  const { user, chain, wallet } = setup({ vault: 0n });
+  const byte = 10n ** 19n;
+  const used = 173n;
+  // No slot for the token yet, and storage for exactly a post and a slot: nothing to top up.
+  chain.vault.get(ALICE)?.delete(TOKEN);
+  chain.storage.set(ALICE, { total: (used + 1_800n) * byte, usedBytes: used });
+  const send = wallet.signAndSendTransactions.bind(wallet);
+  let spoiled = false;
+  wallet.signAndSendTransactions = async (params) => {
+    if (!spoiled) {
+      spoiled = true;
+      // Something else used the storage since the page looked, so the slot cannot be paid for: the
+      // contract hands the deposit back, and its transaction still ends well.
+      chain.storage.set(ALICE, { total: (used + 1_800n) * byte, usedBytes: used + 1_700n });
+    }
+    return send(params);
+  };
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+  await postReady();
+  expect(screen.queryByTestId("review-storage")).toBeNull();
+
+  await user.click(postButton());
+
+  // The post failed for the vault. The words say what the vault holds and where the deposit went,
+  // and not that the funds are in the vault.
+  const failure = await screen.findByTestId("post-failure");
+  expect(failure.textContent).toBe(
+    "The reward wasn't in your vault. Your vault holds 0.00 tUSDC now, and a deposit Tender couldn't take went back to your wallet. Press Post to try again.",
+  );
+  expect(chain.view(TOKEN, "ft_balance_of", { account_id: ALICE })).toBe(String(TUSDC(20)));
+  expect(chain.tasks.size).toBe(0);
+  expect(off(postButton())).toBe(false);
+
+  // The next press reads the storage again, adds the 1,700 bytes that are missing, and posts.
+  await user.click(postButton());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+  expect(wallet.sent).toHaveLength(2);
+  expect(wallet.sent[0]?.transactions.map(({ receiverId }) => receiverId)).toEqual([
+    TOKEN,
+    CONTRACT,
+  ]);
+  expect(wallet.sent[1]?.transactions.map(({ receiverId }) => receiverId)).toEqual([
+    CONTRACT,
+    TOKEN,
+    CONTRACT,
+  ]);
+  expect(chain.calls.find(({ methodName }) => methodName === "storage_deposit")?.deposit).toBe(
+    1_700n * byte,
+  );
+  expect(chain.view(TOKEN, "ft_balance_of", { account_id: ALICE })).toBe(String(TUSDC(15)));
+});
+
+test("the_funding_row_says_nothing_is_read_when_the_balances_cannot_be", async () => {
+  const { user } = setup({ vaultReadFails: true });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  // The read failed: the row has nothing to show, and does not say it is still reading.
+  await screen.findByTestId("error-state");
+  expect(testId("review-funding")).toBe("—");
+  expect(off(postButton())).toBe(true);
 });
 
 test("an_upload_that_fails_sends_nothing_to_the_wallet", async () => {
@@ -871,28 +1021,44 @@ test("the_stepper_goes_back_to_steps_that_are_done_and_not_forward", async () =>
   );
 });
 
-test("picking_a_kind_changes_the_answer_format_it_needs_and_says_so", async () => {
+test("picking_a_kind_changes_the_answer_format_it_needs_and_the_one_line_says_what_it_is", async () => {
   const { user } = setup();
   render(<PostWizard judgeAccount={JUDGE} />);
   await toChecks(user);
-  const note = () => screen.queryByTestId("format-note")?.textContent ?? null;
 
-  expect(note()).toBeNull();
+  expect(testId("answer-format")).toBe("Answers: plain text (set on Brief).");
   await user.click(screen.getByRole("radio", { name: /JSON shape/ }));
-  expect(note()).toBe("The answer format is now JSON, which JSON shape needs.");
-  expect(testId("answer-format")).toBe("Answers are JSON. You set this on the Brief step.");
-
+  expect(testId("answer-format")).toBe("Answers: JSON (set on Brief).");
   await user.click(screen.getByRole("radio", { name: /Regex cases/ }));
-  expect(note()).toBe(
-    "The answer format is now a regex, written as JSON, which Regex cases needs.",
-  );
-
+  expect(testId("answer-format")).toBe("Answers: a regex, as JSON (set on Brief).");
   await user.click(screen.getByRole("radio", { name: /Exact answer/ }));
-  expect(note()).toBe("The answer format is now plain text, which Exact answer needs.");
+  expect(testId("answer-format")).toBe("Answers: plain text (set on Brief).");
+  expect(screen.queryByTestId("format-note")).toBeNull();
 
   // The Brief step shows the format the checks asked for.
+  await user.click(screen.getByRole("radio", { name: /JSON shape/ }));
   await user.click(screen.getByRole("button", { name: "Back" }));
-  expect((screen.getByLabelText("Answer format") as HTMLSelectElement).value).toBe("text");
+  expect((screen.getByLabelText("Answer format") as HTMLSelectElement).value).toBe("json");
+});
+
+test("the_format_line_is_not_left_stale_when_the_format_is_changed_on_the_brief_step", async () => {
+  const { user } = setup();
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toChecks(user);
+  await user.click(screen.getByRole("radio", { name: /JSON shape/ }));
+  expect(testId("answer-format")).toBe("Answers: JSON (set on Brief).");
+
+  // Back to the Brief step, plain text chosen there, and on to the Checks step again.
+  await user.click(screen.getByRole("button", { name: "Back" }));
+  fireEvent.change(screen.getByLabelText("Answer format"), { target: { value: "text" } });
+  await press(user, "Next: Checks");
+  await stepHeading("Checks");
+
+  // The line says what the format is now, beside the problem it makes, and not what it was.
+  expect(testId("answer-format")).toBe("Answers: plain text (set on Brief).");
+  expect(testId("error-kind")).toBe(
+    'JSON shape needs the answer format "JSON". Change it on the Brief step.',
+  );
 });
 
 test("a_format_that_does_not_suit_the_kind_is_a_problem_on_the_checks_step", async () => {
@@ -985,7 +1151,7 @@ test.each([
   },
 );
 
-test("a_team_account_that_writes_a_rubric_is_told_the_judge_does_not_score_it_yet", async () => {
+test("a_team_account_that_writes_a_rubric_is_told_how_the_judge_scores_it", async () => {
   const { user, api } = setup({ agentIs: "team", vault: TUSDC(5) });
   render(<PostWizard judgeAccount={JUDGE} />);
   await toChecks(user);
@@ -994,14 +1160,15 @@ test("a_team_account_that_writes_a_rubric_is_told_the_judge_does_not_score_it_ye
   const left = screen.getByTestId("split-public");
   fill("What to look for", "Says what changed");
   expect(within(left).getByLabelText("Weight, 1 to 10")).toBeDefined();
-  expect(
-    within(screen.getByTestId("split-heldout")).getByText(/nothing is kept back/),
-  ).toBeDefined();
+  expect(within(screen.getByTestId("split-heldout")).getByText("Nothing.")).toBeDefined();
   await press(user, "Next: Reward");
   await screen.findByLabelText("Amount (tUSDC)");
 
-  // With the Judge as verifier, the note says what the Judge does today; with anyone else, not.
+  // With the Judge as verifier, the note says how the Judge scores a rubric; with anyone else, not.
   expect(testId("rubric-judge-note")).toBe(RUBRIC_JUDGE_NOTE);
+  expect(RUBRIC_JUDGE_NOTE).toBe(
+    "The Tender Judge scores rubric tasks with an AI model. Scores are subjective.",
+  );
   await user.click(screen.getByRole("radio", { name: /^Me/ }));
   expect(screen.queryByTestId("rubric-judge-note")).toBeNull();
 
@@ -1074,6 +1241,54 @@ test("another_account_as_the_verifier_has_to_be_an_account", async () => {
   fill("Their NEAR account", BOB);
   expect(screen.queryByTestId("error-otherVerifier")).toBeNull();
   expect(off(screen.getByRole("button", { name: "Review" }))).toBe(false);
+});
+
+test("a_public_document_over_what_the_api_keeps_is_said_on_the_checks_step_and_nothing_is_sent", async () => {
+  const { user, api, wallet } = setup();
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toChecks(user);
+  await user.click(screen.getByRole("radio", { name: /JSON shape/ }));
+  fill("Path", "$.total");
+  fill("Must equal (JSON)", "1");
+
+  // A pasted schema of 300 KB: more than the 256 KiB the API keeps.
+  fill("JSON schema", JSON.stringify({ type: "object", description: "x".repeat(300_000) }));
+
+  const alert = screen.getByRole("alert");
+  expect(alert.textContent).toBe("The public checks are too long. The limit is 256 KiB.");
+  const forward = screen.getByRole("button", { name: "Next: Reward" });
+  expect(off(forward)).toBe(true);
+  await user.click(forward);
+  expect(screen.queryByLabelText("Amount (tUSDC)")).toBeNull();
+  expect(document.activeElement).toBe(alert);
+
+  fill("JSON schema", '{"type":"object"}');
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(off(screen.getByRole("button", { name: "Next: Reward" }))).toBe(false);
+
+  // Nothing was signed in for, uploaded or sent.
+  expect(writes(api)).toEqual([]);
+  expect(wallet.signRequests).toEqual([]);
+});
+
+test("the_reward_step_names_each_group_once_and_puts_the_token_in_the_amounts_help", async () => {
+  const { user } = setup();
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReward(user);
+
+  expect(screen.getByRole("group", { name: "Time" })).toBeDefined();
+  expect(screen.getByRole("group", { name: "Who picks the winner" })).toBeDefined();
+  for (const said of ["How long does each stage last?", "Verifier", "What it pays"]) {
+    expect(screen.queryByText(said), said).toBeNull();
+  }
+  // One place says which token it is, and it is the amount's help.
+  expect(screen.getByLabelText("Amount (tUSDC)").getAttribute("aria-describedby")).toBe(
+    "post-amount-help",
+  );
+  expect(document.getElementById("post-amount-help")?.textContent).toContain(
+    "Paid in tusdc.testnet. At least 1.00 tUSDC",
+  );
+  expect(screen.getAllByText(/Paid in/)).toHaveLength(1);
 });
 
 // ---- Source rules -------------------------------------------------------------------------------

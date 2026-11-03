@@ -8,6 +8,7 @@ import {
   type StoredToken,
   signInTicket,
   subscribeToken,
+  tokenForAccount,
 } from "./apiToken";
 import { config } from "./config";
 import { type SignedMessageResult, type SignMessageInput, useWallet } from "./wallet";
@@ -149,9 +150,5 @@ export function useApiToken(): UseApiToken {
     [accountId, canSignMessage, signMessage],
   );
 
-  const token =
-    stored !== null && stored.accountId === accountId && stored.expiresAtMs > Date.now()
-      ? stored.token
-      : null;
-  return { token, signIn };
+  return { token: tokenForAccount(stored, accountId), signIn };
 }

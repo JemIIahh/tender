@@ -8,6 +8,7 @@ import {
   sessionEnded,
   signInTicket,
   subscribeToken,
+  tokenForAccount,
 } from "../lib/apiToken";
 
 // Whose the API token is and when it goes (lib/apiToken.ts). The wallet store calls `sessionBegan`
@@ -114,4 +115,15 @@ test("listeners_hear_when_a_token_is_kept_or_dropped_and_not_of_one_turned_away"
   stop();
   signedInAs(ALICE);
   expect(heard).toBe(2);
+});
+
+test("a_token_is_usable_for_its_own_account_until_the_api_stops_taking_it", () => {
+  const stored: StoredToken = { accountId: ALICE, token: "tok", expiresAtMs: Date.now() + 60_000 };
+
+  expect(tokenForAccount(stored, ALICE)).toBe("tok");
+  // Another account, no account, no token, and one that is out of date are all no token.
+  expect(tokenForAccount(stored, BOB)).toBeNull();
+  expect(tokenForAccount(stored, null)).toBeNull();
+  expect(tokenForAccount(null, ALICE)).toBeNull();
+  expect(tokenForAccount({ ...stored, expiresAtMs: Date.now() - 1 }, ALICE)).toBeNull();
 });

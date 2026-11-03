@@ -17,9 +17,8 @@ import {
 // published with the task, so agents work from it, and the right side is kept by the Judge and
 // shown to no one until the winner is paid. Every kind fills both sides in its own way.
 
-/** What the right side says, for every kind that has one. */
-const KEPT_NOTE =
-  "Agents can't read this. It is published with the scorecard after the payout, and the Judge takes it for one task only, so write new ones for each task.";
+/** What the right side says, for every kind that has one. Its heading says agents can't read it. */
+const KEPT_NOTE = "Published after payout. Use new ones for each task.";
 
 function Split({ seen, kept }: { seen: ReactNode; kept: ReactNode }) {
   return (
@@ -53,14 +52,9 @@ const Note = ({ children }: { children: ReactNode }) => (
 );
 
 export function CriteriaStep(
-  props: StepProps & {
-    canRubric: boolean;
-    /** Said when picking a kind changed the answer format, or null. */
-    formatNote: string | null;
-    onKind(kind: CheckKind): void;
-  },
+  props: StepProps & { canRubric: boolean; onKind(kind: CheckKind): void },
 ) {
-  const { form, update, errors, touch, canRubric, formatNote, onKind } = props;
+  const { form, update, errors, touch, canRubric, onKind } = props;
 
   // A row that is added or taken away moves the person's place; this puts it back somewhere sane.
   const focusAfter = useRef<string | null>(null);
@@ -85,9 +79,7 @@ export function CriteriaStep(
           <Split
             seen={
               <>
-                <Note>
-                  Entries are compared with the answers the Judge keeps, after these steps.
-                </Note>
+                <Note>Before comparing:</Note>
                 <CheckField
                   label="Ignore spaces at the start and end"
                   checked={form.trim}
@@ -109,7 +101,7 @@ export function CriteriaStep(
               <>
                 <AreaField
                   label="Accepted answers"
-                  help="One per line. An entry that equals one of them passes."
+                  help="One per line."
                   rows={5}
                   mono
                   {...bindText(props, "expected")}
@@ -123,20 +115,11 @@ export function CriteriaStep(
       case "json_schema":
         return (
           <Split
-            seen={
-              <AreaField
-                label="JSON schema"
-                help="Answers have to fit this schema."
-                rows={9}
-                mono
-                {...bindText(props, "schema")}
-              />
-            }
+            seen={<AreaField label="JSON schema" rows={9} mono {...bindText(props, "schema")} />}
             kept={
               <>
                 <div id="post-assertions" tabIndex={-1} className="grid gap-3">
                   <p className="font-medium">Values the Judge checks</p>
-                  <Note>Where a value sits in the answer, and what it must equal.</Note>
                   {form.assertions.map((row, i) => (
                     <fieldset
                       // biome-ignore lint/suspicious/noArrayIndexKey: a row has no identity but its place
@@ -209,7 +192,6 @@ export function CriteriaStep(
           <Split
             seen={
               <>
-                <Note>Examples agents can test their pattern against.</Note>
                 <AreaField
                   label="Should match"
                   help="One per line."
@@ -219,7 +201,6 @@ export function CriteriaStep(
                 />
                 <AreaField
                   label="Should not match"
-                  help="One per line."
                   rows={4}
                   mono
                   {...bindText(props, "examplesNoMatch")}
@@ -228,10 +209,7 @@ export function CriteriaStep(
             }
             kept={
               <>
-                <Note>
-                  Optional. If you add any, the Judge scores on these alone. Without them, it scores
-                  on the examples agents see.
-                </Note>
+                <Note>Optional. If set, the Judge scores on these only.</Note>
                 <AreaField
                   label="Held-out: should match"
                   help="One per line."
@@ -241,7 +219,6 @@ export function CriteriaStep(
                 />
                 <AreaField
                   label="Held-out: should not match"
-                  help="One per line."
                   rows={4}
                   mono
                   {...bindText(props, "heldoutNoMatch")}
@@ -263,7 +240,7 @@ export function CriteriaStep(
           <Split
             seen={
               <div id="post-rubric" tabIndex={-1} className="grid gap-3">
-                <Note>Points an answer is scored on. A higher weight counts for more.</Note>
+                <Note>Points an answer is scored on.</Note>
                 {form.rubric.map((row, i) => (
                   <fieldset
                     // biome-ignore lint/suspicious/noArrayIndexKey: a row has no identity but its place
@@ -324,7 +301,7 @@ export function CriteriaStep(
                 </button>
               </div>
             }
-            kept={<Note>A rubric has no held-out part: nothing is kept back.</Note>}
+            kept={<Note>Nothing.</Note>}
           />
         );
     }
@@ -345,17 +322,12 @@ export function CriteriaStep(
         error={errors.kind}
       />
       <p data-testid="answer-format" className="text-sm">
-        {`Answers are ${FORMAT_PHRASE[form.outputFormat]}. You set this on the Brief step.`}
+        {`Answers: ${FORMAT_PHRASE[form.outputFormat]} (set on Brief).`}
       </p>
-      {formatNote === null ? null : (
-        <p role="status" data-testid="format-note" className="text-sm font-medium">
-          {formatNote}
-        </p>
-      )}
 
       <TextField
         label="Pass mark"
-        help="An entry that scores below this, out of 100, is not paid."
+        help="Out of 100. Below it, no payout."
         inputMode="numeric"
         className="sm:max-w-32"
         {...bindText(props, "minScore")}
@@ -368,7 +340,6 @@ export function CriteriaStep(
           {errors.heldout}
         </p>
       )}
-      <p className="text-sm text-neutral-700">The prize goes to the winner alone.</p>
     </div>
   );
 }

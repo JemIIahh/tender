@@ -9,15 +9,18 @@ import {
   heldoutMatchesCriteria,
   MAX_RESULT_BYTES,
   MAX_URI_BYTES,
+  type PublicCriteria,
   PublicCriteriaSchema,
   postTaskCall,
   sha256Hex,
+  storageDepositCall,
+  storageShortfall,
   type TenderCall,
 } from "@tender/shared";
 import { config } from "./config";
 import { formatSpan } from "./phase";
 import { RpcError, view } from "./rpc";
-import { describeAmount, readAmount, type VaultData } from "./vault";
+import { describeAmount, readAmount, type StorageBalance, type VaultData } from "./vault";
 
 // What the post wizard (components/post) knows about a task: the form a person fills in, what is
 // wrong with it, the three documents it is turned into, and the calls that post them. The
@@ -30,6 +33,25 @@ import { describeAmount, readAmount, type VaultData } from "./vault";
 export const MAX_WINDOW_SECS = 1_209_600;
 
 const SECOND_NS = 1_000_000_000n;
+
+/**
+ * The bytes of Tender storage a post can use, with a little to spare. `post_task` charges the poster
+ * `40 + 1 + 8 + Borsh(Task)` bytes for the task record and holds `OUTCOME_RESERVE_BYTES` (800) back
+ * for its outcome (contract/tender/src/tasks.rs, `post_task` and the test that measures what it
+ * charges; types.rs). A task the wizard writes (no invite list, no parent) has a Borsh(Task) of 738
+ * bytes at the most: three account ids at their longest (204), a 256-byte brief address (260), two
+ * hashes (64), the held-out commitment (33), one funder (88) and 89 of fixed fields. So the most is
+ * 787 + 800 = 1,587 bytes. This is the figure the review of the wizard (06-T4) derived.
+ */
+export const POST_TASK_BYTES = 1_600n;
+
+/**
+ * What a first deposit of a token adds: its slot in the vault, charged to the account the deposit is
+ * for, `VAULT_SLOT_MAX_BYTES` (types.rs) at the most. `ft_on_transfer` (vault.rs) refuses a deposit
+ * whose slot the storage cannot pay for, the token hands it back, and `post_task` then fails with
+ * `E_FUNDS`. So a post that opens a slot sets this much aside as well.
+ */
+export const VAULT_SLOT_BYTES = 200n;
 
 // ---- The form -----------------------------------------------------------------------------------
 
@@ -59,7 +81,7 @@ export const FORMAT_LABEL: Record<AnswerFormat, string> = {
 export const FORMAT_PHRASE: Record<AnswerFormat, string> = {
   text: "plain text",
   json: "JSON",
-  regex_json: "a regex, written as JSON",
+  regex_json: "a regex, as JSON",
 };
 
 /** The formats each kind of check can score. The Judge reads the answer as this. */
@@ -95,7 +117,7 @@ export const KINDS: readonly KindInfo[] = [
   {
     kind: "rubric",
     label: "Rubric",
-    blurb: "The answer is scored against weighted points. For team accounts.",
+    blurb: "The answer is scored against weighted points.",
   },
 ];
 
@@ -344,6 +366,16 @@ export function checkBrief(form: PostForm): Errors {
   if (!/^[0-9]{1,7}$/.test(bytes) || Number(bytes) < 1 || Number(bytes) > MAX_RESULT_BYTES) {
     errors.maxBytes = `Use a whole number from 1 to ${MAX_RESULT_BYTES.toLocaleString("en-US")}.`;
   }
+
+  // What the schema would turn down once each field reads well: the same document the upload will
+  // be, made here, so that a problem shows on this step and not after a sign-in.
+  if (Object.keys(errors).length === 0) {
+    try {
+      checkedBrief(form);
+    } catch (error) {
+      errors.form = documentWords(error);
+    }
+  }
   return errors;
 }
 
@@ -454,17 +486,22 @@ export function checkChecks(form: PostForm, options: { canRubric: boolean }): Er
     }
   }
 
-  // What the schemas would turn down, once each field reads well: a document that does not fit, or
-  // text that cannot be stored. The held-out document is measured, never quoted.
+  // What the schemas would turn down once each field reads well: the documents the upload will be,
+  // made here, so that a problem (a document over the API's 256 KiB, text that cannot be saved)
+  // shows on this step and not after a sign-in. The public checks belong to no one field. The
+  // held-out checks are spread over several, and are measured and never quoted.
   if (Object.keys(errors).length === 0) {
-    const held = heldoutDocument(form);
-    if (held !== null) {
+    let criteria: PublicCriteria | null = null;
+    try {
+      criteria = checkedCriteria(form).data;
+    } catch (error) {
+      errors.form = documentWords(error);
+    }
+    if (criteria !== null) {
       try {
-        if (canonicalJson(held).length > MAX_RESULT_BYTES) {
-          errors.heldout = `The held-out checks are too long. The limit is ${MAX_RESULT_BYTES / 1024} KiB.`;
-        }
-      } catch {
-        errors.heldout = "Some of the held-out text has a character that can't be saved.";
+        checkedHeldout(form, criteria);
+      } catch (error) {
+        errors.heldout = documentWords(error);
       }
     }
   }
@@ -562,11 +599,11 @@ export function windowsText(windows: Windows): string {
 }
 
 /**
- * The note on the rubric and the Judge. It says what the Judge does today and is the one place to
- * change when the rubric scorer (plan 05, task 5) is built.
+ * The note on the rubric and the Judge: how the Judge scores a rubric task (plan 05, task 5), and
+ * the one thing a poster should weigh about it.
  */
 export const RUBRIC_JUDGE_NOTE =
-  "The Tender Judge doesn't score rubric tasks yet. To have this one scored, pick yourself or another account as the verifier.";
+  "The Tender Judge scores rubric tasks with an AI model. Scores are subjective.";
 
 export function checkReward(
   form: PostForm,
@@ -738,15 +775,84 @@ function fault(error: { issues: ReadonlyArray<{ path: PropertyKey[]; message: st
   return where === "" ? issue.message : `${where}: ${issue.message}`;
 }
 
-/** The canonical bytes of `document`, or a `DocumentError` for text that cannot be written. */
-function bytesOf(document: unknown, name: string): Uint8Array {
+/** The words about a document that can't be made, one pair for each of the three. */
+const DOCUMENT_WORDS = {
+  brief: {
+    cannotSave: "A character in the brief can't be saved.",
+    tooLong: "The brief is too long.",
+  },
+  criteria: {
+    cannotSave: "A character in the public checks can't be saved.",
+    tooLong: "The public checks are too long.",
+  },
+  heldout: {
+    cannotSave: "A character in the held-out checks can't be saved.",
+    tooLong: "The held-out checks are too long.",
+  },
+} as const;
+
+/**
+ * The canonical bytes of `document`. A `DocumentError` for text that cannot be written, and for a
+ * document over what the API keeps (`MAX_RESULT_BYTES`, 256 KiB), which it would turn down with a
+ * 413 after the sign-in.
+ */
+function bytesOf(document: unknown, name: keyof typeof DOCUMENT_WORDS): Uint8Array {
+  const words = DOCUMENT_WORDS[name];
+  let bytes: Uint8Array;
   try {
-    return canonicalJson(document);
+    bytes = canonicalJson(document);
   } catch {
     // The reason names a place in the document, and a place in the held-out can be the person's own
     // key: it is left out.
-    throw new DocumentError(`${name} has a character that can't be saved.`);
+    throw new DocumentError(words.cannotSave);
   }
+  if (bytes.length > MAX_RESULT_BYTES) {
+    throw new DocumentError(`${words.tooLong} The limit is ${MAX_RESULT_BYTES / 1024} KiB.`);
+  }
+  return bytes;
+}
+
+/** A document of the form, as the schema reads it and as the bytes that are uploaded. */
+interface Checked<T> {
+  data: T;
+  bytes: Uint8Array;
+}
+
+/** The brief, as it will be uploaded. Throws a `DocumentError` if it cannot be. */
+function checkedBrief(form: PostForm): Checked<Brief> {
+  const parsed = BriefSchema.safeParse(briefDocument(form));
+  if (!parsed.success) throw new DocumentError(`The brief does not fit: ${fault(parsed.error)}.`);
+  return { data: parsed.data, bytes: bytesOf(parsed.data, "brief") };
+}
+
+/** The public criteria, as they will be uploaded. Throws a `DocumentError` if they cannot be. */
+function checkedCriteria(form: PostForm): Checked<PublicCriteria> {
+  const parsed = PublicCriteriaSchema.safeParse(criteriaDocument(form));
+  if (!parsed.success) {
+    throw new DocumentError(`The public checks do not fit: ${fault(parsed.error)}.`);
+  }
+  return { data: parsed.data, bytes: bytesOf(parsed.data, "criteria") };
+}
+
+/**
+ * The held-out checks, as they will be uploaded, or null if the form has none. Checked against the
+ * `criteria` they go with. Throws a `DocumentError` that says nothing of their text.
+ */
+function checkedHeldout(form: PostForm, criteria: PublicCriteria): Uint8Array | null {
+  const raw = heldoutDocument(form);
+  if (raw === null) return null;
+  const parsed = HeldoutSchema.safeParse(raw);
+  // Said without the text of the document or of the schema's complaint.
+  if (!parsed.success || !heldoutMatchesCriteria(criteria, parsed.data)) {
+    throw new DocumentError("The held-out checks do not fit the kind of check.");
+  }
+  return bytesOf(parsed.data, "heldout");
+}
+
+/** The words of a `DocumentError`. Anything else is not a problem with the form, and goes on. */
+function documentWords(error: unknown): string {
+  if (error instanceof DocumentError) return error.message;
+  throw error;
 }
 
 /**
@@ -754,41 +860,22 @@ function bytesOf(document: unknown, name: string): Uint8Array {
  * on chain: the brief, the public criteria, and the held-out checks if there are any. Each is
  * checked against the shared schema, and the held-out against the criteria, so that what is
  * uploaded is what the API and the Judge accept. Throws a `DocumentError` if the form cannot be
- * made into them; the steps of the wizard stop that earlier, so this is the last check.
+ * made into them. The steps of the wizard make the same documents (without the hashes) to say what
+ * is wrong with their own part of the form, so this is the last check and not the first.
  */
 export function buildDocuments(form: PostForm): PostDocuments {
-  const brief = BriefSchema.safeParse(briefDocument(form));
-  if (!brief.success) throw new DocumentError(`The brief does not fit: ${fault(brief.error)}.`);
-  const criteria = PublicCriteriaSchema.safeParse(criteriaDocument(form));
-  if (!criteria.success) {
-    throw new DocumentError(`The public checks do not fit: ${fault(criteria.error)}.`);
-  }
-
-  const rawHeldout = heldoutDocument(form);
-  let heldout: Uint8Array | null = null;
-  if (rawHeldout !== null) {
-    const parsed = HeldoutSchema.safeParse(rawHeldout);
-    // Said without the text of the document or of the schema's complaint.
-    if (!parsed.success || !heldoutMatchesCriteria(criteria.data, parsed.data)) {
-      throw new DocumentError("The held-out checks do not fit the kind of check.");
-    }
-    heldout = bytesOf(parsed.data, "The held-out checks");
-    if (heldout.length > MAX_RESULT_BYTES) {
-      throw new DocumentError("The held-out checks are too long.");
-    }
-  }
+  const brief = checkedBrief(form);
+  const criteria = checkedCriteria(form);
+  const heldout = checkedHeldout(form, criteria.data);
   if (criteria.data.has_heldout !== (heldout !== null)) {
     throw new DocumentError("The public checks and the held-out checks do not agree.");
   }
-
-  const briefBytes = bytesOf(brief.data, "The brief");
-  const criteriaBytes = bytesOf(criteria.data, "The public checks");
   return {
-    brief: briefBytes,
-    criteria: criteriaBytes,
+    brief: brief.bytes,
+    criteria: criteria.bytes,
     heldout,
-    briefHash: sha256Hex(briefBytes),
-    criteriaHash: sha256Hex(criteriaBytes),
+    briefHash: sha256Hex(brief.bytes),
+    criteriaHash: sha256Hex(criteria.bytes),
     heldoutCommitment: heldout === null ? null : sha256Hex(heldout),
   };
 }
@@ -808,18 +895,45 @@ function verifierOf(form: PostForm, judgeAccount: string | null): string | undef
 }
 
 /**
+ * The NEAR, in yoctoNEAR, that a `storage_deposit` has to add so that `storage` pays for a post, and
+ * for the vault slot of the token as well if the post `opensSlot`; 0 if it already does. Only the
+ * `available` of the view is read by `storageShortfall`.
+ */
+export function storageTopUpFor(storage: StorageBalance, opensSlot: boolean): bigint {
+  return storageShortfall(
+    { total: storage.total.toString(), available: storage.available.toString(), used_bytes: "0" },
+    opensSlot ? POST_TASK_BYTES + VAULT_SLOT_BYTES : POST_TASK_BYTES,
+  );
+}
+
+/**
+ * Whether the deposit of a post opens the vault slot of its token. A vault that holds none of the
+ * token has no slot, or an emptied one, and a read cannot tell the two apart (`balances_of` lists a
+ * slot at 0): it counts as opening one, which sets aside up to 0.002 NEAR more than it may need and
+ * is never too little. A vault that holds some has its slot.
+ */
+const opensVaultSlot = (vaultBalance: bigint): boolean => vaultBalance === 0n;
+
+/**
  * The calls that post the task: `post_task`, and in front of it a deposit that tops the vault up to
- * the reward if it holds less. The wallet sends them in this order, so the vault holds the reward
- * when the task is posted. `uris.brief` is where the brief was uploaded, and `hashes` are those of
- * `buildDocuments`. The form was checked before; this checks again what a mistake would cost, and
- * throws a `RangeError` for a reward that is no amount, windows that are no durations, a verifier
- * that is no account, a hash or an address that is no good, or a negative vault balance.
+ * the reward if it holds less, and in front of that a `storage_deposit` if `storage` cannot pay for
+ * the post (and for the vault slot, if the deposit opens one). The wallet sends them in this order,
+ * so the storage and the vault hold what the task needs when it is posted. `uris.brief` is where
+ * the brief was uploaded, and `hashes` are those of `buildDocuments`. The form was checked before;
+ * this checks again what a mistake would cost, and throws a `RangeError` for a reward that is no
+ * amount, windows that are no durations, a verifier that is no account, a hash or an address that
+ * is no good, or a negative vault balance.
  */
 export function planPostCalls(o: {
   form: PostForm;
   uris: { brief: string };
   hashes: { briefHash: string; criteriaHash: string; heldoutCommitment: string | null };
   vaultBalance: bigint;
+  /**
+   * The poster's storage balance with Tender, from the read that gave `vaultBalance`. Left out, no
+   * top-up is planned: for a check that only wants to know the form can be made into calls.
+   */
+  storage?: StorageBalance;
   contractId: string;
   tokenId: string;
   /** The Judge's account, for a form that picks the Judge as verifier. */
@@ -853,9 +967,13 @@ export function planPostCalls(o: {
     pickSecs: windows.pick,
     fallbackSecs: windows.fallback,
   });
-  return vaultBalance < reward
-    ? [depositCall(tokenId, contractId, reward - vaultBalance), post]
-    : [post];
+  const topUp =
+    o.storage === undefined ? 0n : storageTopUpFor(o.storage, opensVaultSlot(vaultBalance));
+  return [
+    ...(topUp > 0n ? [storageDepositCall(contractId, topUp)] : []),
+    ...(vaultBalance < reward ? [depositCall(tokenId, contractId, reward - vaultBalance)] : []),
+    post,
+  ];
 }
 
 // ---- Paying for it ------------------------------------------------------------------------------
@@ -868,6 +986,8 @@ export interface Funding {
   toDeposit: bigint;
   /** What the wallet holds of the token; null if the token would not say. */
   inWallet: bigint | null;
+  /** The NEAR, in yoctoNEAR, to add to the storage balance first so that it pays for the post. */
+  storageTopUp: bigint;
   /** Why the task can't be posted now, in words, or null. */
   problem: string | null;
 }
@@ -876,12 +996,16 @@ export interface Funding {
  * Where the `reward` of `token` comes from, given what `data` says the account holds, and whether
  * it can be posted: the account needs a storage balance with Tender, the token has to be taking
  * deposits, and the wallet has to hold what the vault lacks (when the token says what it holds).
+ * The storage a post needs beyond that balance is topped up in the same batch (`planPostCalls`),
+ * and `storageTopUp` says how much.
  */
 export function fundingOf(data: VaultData, token: string, reward: bigint): Funding {
   const row = data.rows.find((candidate) => candidate.token === token);
   const inVault = row?.vault ?? 0n;
   const toDeposit = reward > inVault ? reward - inVault : 0n;
   const inWallet = row?.wallet ?? null;
+  const storageTopUp =
+    data.storage === null ? 0n : storageTopUpFor(data.storage, opensVaultSlot(inVault));
 
   let problem: string | null = null;
   if (data.storage === null) {
@@ -891,5 +1015,5 @@ export function fundingOf(data: VaultData, token: string, reward: bigint): Fundi
   } else if (inWallet !== null && toDeposit > inWallet) {
     problem = `You need ${describeAmount(toDeposit - inWallet, token)} more in your wallet to fund this reward.`;
   }
-  return { inVault, toDeposit, inWallet, problem };
+  return { inVault, toDeposit, inWallet, storageTopUp, problem };
 }

@@ -6,7 +6,7 @@ import {
   type TenderCall,
 } from "@tender/shared";
 import { api } from "./api";
-import { heldToken } from "./apiToken";
+import { heldToken, tokenForAccount } from "./apiToken";
 import { config } from "./config";
 import { errorMessage } from "./errors";
 import {
@@ -18,7 +18,7 @@ import {
   planPostCalls,
   rewardOf,
 } from "./post";
-import { readVault, type VaultData } from "./vault";
+import { describeAmount, readVault, type VaultData } from "./vault";
 import type { SendResult } from "./wallet";
 import {
   TransactionFailed,
@@ -30,11 +30,15 @@ import {
 
 // Posting a task, in the order that keeps the money and the held-out checks safe:
 //
-//   1. the documents are built and every number is checked, before anything leaves the page;
+//   1. the documents are built and the reward is read as an amount, before anything leaves the
+//      page (the steps of the wizard hold the rest of the form to what Tender allows, which this
+//      does not see);
 //   2. a sign-in to the API, if there is no token for the account;
 //   3. the brief, the criteria and the held-out checks are uploaded, each to its own place;
-//   4. the vault is read afresh, and the calls are planned from what it holds;
-//   5. one `signAndSend`: the deposit that tops the vault up, if it is short, and `post_task`.
+//   4. the vault and the storage balance are read afresh, and the calls are planned from what they
+//      hold;
+//   5. one `signAndSend`: the storage top-up and the deposit that tops the vault up, if either is
+//      short, and `post_task`.
 //
 // If the wallet refuses at 5, what was uploaded stays where it is and the form is as it was: the
 // next try uploads the same bytes again, which the API stores once. The token is read from its
@@ -86,13 +90,11 @@ export interface SubmitDeps {
 
 /**
  * The token held for `account`: the one in its keeping place (lib/apiToken.ts), if it is for that
- * account and not out of date. The same rule as `useApiToken`, read now and not at a render.
+ * account and not out of date. The rule is `useApiToken`'s (`tokenForAccount`), read now and not at
+ * a render.
  */
 export function liveToken(account: string): string | null {
-  const held = heldToken();
-  return held !== null && held.accountId === account && held.expiresAtMs > Date.now()
-    ? held.token
-    : null;
+  return tokenForAccount(heldToken(), account);
 }
 
 /** The real ones, but for the wallet's: the page supplies those from `useWallet`. */
@@ -118,40 +120,79 @@ export type SubmitResult =
   /** The task is on chain: `taskId` is its id, from the `task_created` event. */
   | { kind: "posted"; taskId: string }
   /**
-   * The wallet sent the transactions and no `task_created` came back for this task. It may well be
-   * posted; the page does not offer to post it again.
+   * The wallet sent the transactions and no `task_created` came back for this task, or it sent them
+   * and could not say how they went (no hashes then). It may well be posted; the page does not
+   * offer to post it again.
    */
   | { kind: "sent"; txHashes: string[] };
 
 /**
- * What the contract's panics mean to a poster. Others are shown by their code. `E_STORAGE` does not
- * send the person to the Wallet page: it sets an account up and takes unused storage back, and has
- * no way to add storage to an account that is set up. Say so here when it has one.
+ * What the contract's panics mean to a poster. Others are shown by their code. `E_STORAGE` is rare:
+ * the page tops the storage balance up in the same batch (`planPostCalls`), so it comes only if
+ * the balance ran short between the read and the send, and the next press tops it up again.
  */
 const PANIC_WORDS: Record<string, string> = {
   E_PAUSED: "Tender isn't taking new tasks right now.",
   E_TOKEN: "Tender isn't taking this token right now.",
   E_REWARD: "The reward is outside what Tender takes for this token.",
   E_WINDOW: "A window is outside what Tender allows.",
-  E_FUNDS: "Your vault doesn't hold the reward.",
-  E_STORAGE:
-    "Your storage with Tender is too full to hold this task, and this site can't add more.",
+  E_FUNDS: "The reward wasn't in your vault.",
+  E_STORAGE: "Your storage with Tender ran short as the task was posted.",
 };
 
-/** Words for a send that failed. `deposited`: the plan began with a deposit. */
-function sendWords(error: unknown, deposited: boolean): string {
+/** A wallet that threw, or a transaction that failed with no code of the contract's. */
+const WALLET_DID_NOT_FINISH =
+  "The wallet didn't finish. A deposit may have gone through: check the Wallet page. Your documents are saved; press Post to try again.";
+
+/** What a send was, for the words about it when it failed. */
+interface SentPlan {
+  calls: readonly TenderCall[];
+  account: string;
+  tokenId: string;
+  reward: bigint;
+}
+
+/**
+ * Where a deposit stands after the contract turned the post down. The deposit's own transaction
+ * ends well even when the contract could not take it, since `ft_on_transfer` never panics and the
+ * token hands the tokens back; the contract's panic comes only from the post that follows. So the
+ * deposit is not assumed to have gone in: the vault is read afresh and the words say what it holds.
+ */
+async function depositWords(plan: SentPlan, readNow: SubmitDeps["readVault"]): Promise<string> {
+  try {
+    const data = await readNow(plan.account);
+    const held = data.rows.find((row) => row.token === plan.tokenId)?.vault ?? 0n;
+    const holds = describeAmount(held, plan.tokenId);
+    return held >= plan.reward
+      ? `Your deposit went through: your vault holds ${holds}.`
+      : `Your vault holds ${holds} now, and a deposit Tender couldn't take went back to your wallet.`;
+  } catch (error) {
+    console.error(error);
+    return "The deposit may have come back to your wallet: check the Wallet page.";
+  }
+}
+
+/** Words for a send that failed. */
+async function sendWords(
+  error: unknown,
+  plan: SentPlan,
+  readNow: SubmitDeps["readVault"],
+): Promise<string> {
   if (error instanceof TransactionFailed && error.code !== null) {
-    // The contract's own panic comes from `post_task`, which runs after the deposit.
     const why = PANIC_WORDS[error.code] ?? `Tender turned the task down (${error.code}).`;
-    return deposited
-      ? `${why} Your deposit went through, so the funds are in your vault. Press Post again once this is sorted.`
-      : `${why} Nothing was posted.`;
+    // The plan began with a deposit only if it has a token transfer in it.
+    const deposited = plan.calls.some((call) => call.methodName === "ft_transfer_call");
+    const money = deposited ? await depositWords(plan, readNow) : "Nothing was posted.";
+    const again =
+      error.code === "E_STORAGE"
+        ? "Press Post to try again: the page adds what's missing."
+        : deposited
+          ? "Press Post to try again."
+          : "";
+    return [why, money, again].filter((part) => part !== "").join(" ");
   }
   if (error instanceof WalletError || error instanceof TransactionFailed) {
-    return "The wallet didn't finish. Nothing may have been posted: check your vault on the Wallet page, because a deposit may have gone through. Your documents are saved with Tender, so you can press Post again.";
-  }
-  if (error instanceof WalletResultUnreadable) {
-    return "The wallet sent the transaction but didn't say how it went. Look for your task on the Tasks page before you post it again.";
+    return WALLET_DID_NOT_FINISH;
   }
   return walletErrorMessage(error);
 }
@@ -242,6 +283,8 @@ export async function submitPost(
     throw new SubmitFailure("documents", "The reward can't be used as it is. Check the amount.");
   }
   const docs: PostDocuments = await at("documents", () => buildDocuments(form));
+  // The same plan, for an empty vault and no storage top-up, only to see that the form can be made
+  // into calls; the real one is made at 4, from what the chain says.
   await at("documents", () =>
     planPostCalls({
       form,
@@ -288,6 +331,8 @@ export async function submitPost(
     uris: { brief: brief.uri },
     hashes: docs,
     vaultBalance: funding.inVault,
+    // Not null: `fundingOf` has turned an account with no storage balance away.
+    storage: vault.storage ?? undefined,
     contractId: config.contractId,
     tokenId,
     judgeAccount,
@@ -302,13 +347,22 @@ export async function submitPost(
     );
   }
   onStage("wallet");
-  const sent = await at("wallet", async () => {
-    try {
-      return await deps.signAndSend(calls);
-    } catch (cause) {
-      throw new SubmitFailure("wallet", sendWords(cause, calls.length > 1), cause);
+  let sent: SendResult;
+  try {
+    sent = await deps.signAndSend(calls);
+  } catch (cause) {
+    // The wallet sent the transactions and could not say how they went, so the task may well be
+    // posted, and a second press would deposit and post it again. It counts as sent, with nothing
+    // to show for it: the page keeps Post off and tells the person to look.
+    if (cause instanceof WalletResultUnreadable && cause.what === "transaction") {
+      return { kind: "sent", txHashes: [] };
     }
-  });
+    throw new SubmitFailure(
+      "wallet",
+      await sendWords(cause, { calls, account, tokenId, reward }, deps.readVault),
+      cause,
+    );
+  }
 
   const created = sent.events.find(
     (event) =>

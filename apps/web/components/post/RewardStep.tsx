@@ -35,6 +35,9 @@ const UNIT_LABEL: Record<DurationUnit, string> = {
   days: "days",
 };
 
+/** A legend that is the group's one heading: the group has no other. */
+const headingLegend = (text: string) => <span className="text-lg font-semibold">{text}</span>;
+
 function tokenLabel(token: string): string {
   const { symbol } = tokenMeta(token, config.network);
   return symbol === token ? token : `${symbol} (${token})`;
@@ -123,24 +126,23 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
     },
   ];
 
-  const verifiers: Array<{ value: Verifier; label: string; detail: string }> = [
+  const verifiers: Array<{ value: Verifier; label: string; detail?: string }> = [
     ...(judgeAccount === null
       ? []
       : [
           {
             value: "judge" as const,
             label: "Tender Judge (run by the Tender team)",
-            detail: "Scores entries against your checks and picks the winner for you.",
+            detail: "Scores entries against your checks.",
           },
         ]),
-    { value: "me", label: "Me", detail: "You pick the winner yourself." },
-    { value: "other", label: "Another account", detail: "That account picks the winner." },
+    { value: "me", label: "Me" },
+    { value: "other", label: "Another account" },
   ];
 
   return (
     <div className="grid gap-6">
       <section className="grid gap-3">
-        <h3 className="text-lg font-semibold">What it pays</h3>
         {limits.tokens.length > 1 ? (
           <SelectField
             name="token"
@@ -150,24 +152,17 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
             error={errors.token}
             onChange={(token) => update({ token })}
           />
-        ) : (
-          <p id="post-token" tabIndex={-1}>
-            {chosen === undefined ? (
-              <span data-testid="error-token">
-                {errors.token ?? "Tender takes no rewards right now."}
-              </span>
-            ) : (
-              <>
-                Paid in <span className="font-medium">{tokenLabel(chosen.token)}</span>
-              </>
-            )}
+        ) : chosen === undefined ? (
+          <p id="post-token" tabIndex={-1} data-testid="error-token" className="font-medium">
+            {errors.token ?? "Tender takes no rewards right now."}
           </p>
-        )}
+        ) : null}
         {chosen === undefined ? null : (
           <TextField
             label={`Amount (${symbol})`}
             help={
               <>
+                {limits.tokens.length > 1 ? "" : `Paid in ${chosen.token}. `}
                 {`At least ${describeAmount(chosen.minReward, chosen.token)}`}
                 {chosen.maxReward < NO_REAL_LIMIT
                   ? `, at most ${describeAmount(chosen.maxReward, chosen.token)}`
@@ -183,10 +178,9 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
       </section>
 
       <section className="grid gap-3">
-        <h3 className="text-lg font-semibold">Time</h3>
         <RadioGroup
           name="preset"
-          legend="How long does each stage last?"
+          legend={headingLegend("Time")}
           value={form.preset}
           options={windowOptions}
           onChange={onPreset}
@@ -216,10 +210,9 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
       </section>
 
       <section className="grid gap-3">
-        <h3 className="text-lg font-semibold">Who picks the winner</h3>
         <RadioGroup
           name="verifier"
-          legend="Verifier"
+          legend={headingLegend("Who picks the winner")}
           value={form.verifier}
           options={verifiers}
           onChange={(verifier) => update({ verifier })}

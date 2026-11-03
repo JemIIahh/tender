@@ -100,6 +100,35 @@ test("a_deposit_is_credited_or_handed_back_whole", () => {
   expect(chain.view(TOKEN, "ft_balance_of", { account_id: ALICE })).toBe("90");
 });
 
+test("a_first_deposit_of_a_token_is_charged_a_slot_and_handed_back_if_storage_cannot_pay", () => {
+  const chain = new FakeChain(CONTRACT, [{ token: TOKEN }]);
+  chain.give(TOKEN, ALICE, 100n);
+  // An account whose storage balance has 199 bytes free: one short of the 200 a slot is charged.
+  const byte = 10n ** 19n;
+  chain.storage.set(ALICE, { total: (173n + 199n) * byte, usedBytes: 173n });
+
+  expect(eventsOf(sendAll(chain, [depositCall(TOKEN, CONTRACT, 10n)]))).toEqual([]);
+  expect(chain.view(TOKEN, "ft_balance_of", { account_id: ALICE })).toBe("100");
+  expect(chain.view(CONTRACT, "balances_of", { account_id: ALICE })).toEqual([]);
+
+  // A post that follows the refused deposit is turned down for the vault, as the contract does.
+  const [, post] = sendAll(chain, [
+    depositCall(TOKEN, CONTRACT, 10n),
+    postTaskCall(CONTRACT, { ...TERMS, reward: 10n }),
+  ]);
+  expect(JSON.stringify(post?.status)).toContain("E_FUNDS");
+
+  // One byte more pays for the slot. The deposit is credited and the slot is charged once.
+  sendAll(chain, [storageDepositCall(CONTRACT, byte)]);
+  expect(eventsOf(sendAll(chain, [depositCall(TOKEN, CONTRACT, 10n)]))).toEqual(["deposit"]);
+  expect(chain.storage.get(ALICE)?.usedBytes).toBe(173n + 200n);
+  expect(eventsOf(sendAll(chain, [depositCall(TOKEN, CONTRACT, 10n)]))).toEqual(["deposit"]);
+  expect(chain.storage.get(ALICE)?.usedBytes).toBe(173n + 200n);
+  expect(chain.view(CONTRACT, "balances_of", { account_id: ALICE })).toEqual([
+    { token: TOKEN, amount: "20" },
+  ]);
+});
+
 test("a_withdrawal_is_paid_or_put_back_and_logged_as_which", () => {
   const chain = new FakeChain(CONTRACT, [{ token: TOKEN }]);
   chain.fundVault(ALICE, TOKEN, 100n);

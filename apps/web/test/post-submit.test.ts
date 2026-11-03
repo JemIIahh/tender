@@ -6,9 +6,16 @@ import {
   type TenderEvent,
   TenderEventSchema,
 } from "@tender/shared";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
+import { clearApiToken, keepToken, signInTicket } from "../lib/apiToken";
 import { buildDocuments, type PostForm } from "../lib/post";
-import { type SubmitDeps, SubmitFailure, type SubmitInput, submitPost } from "../lib/postSubmit";
+import {
+  liveToken,
+  type SubmitDeps,
+  SubmitFailure,
+  type SubmitInput,
+  submitPost,
+} from "../lib/postSubmit";
 import type { VaultData } from "../lib/vault";
 import {
   TransactionFailed,
@@ -40,14 +47,22 @@ interface World {
   deps: SubmitDeps;
 }
 
+/** What one byte of Tender storage costs, in yoctoNEAR. */
+const BYTE = 10n ** 19n;
+
 function vaultData(o: {
   vault?: bigint;
   wallet?: bigint | null;
   storage?: boolean;
+  /** The storage that is free, in yoctoNEAR. Room for 5,000 bytes unless said. */
+  available?: bigint;
   enabled?: boolean;
 }): VaultData {
   return {
-    storage: o.storage === false ? null : { total: 50_000_000_000_000_000_000_000n, available: 1n },
+    storage:
+      o.storage === false
+        ? null
+        : { total: 50_000_000_000_000_000_000_000n, available: o.available ?? 5_000n * BYTE },
     rows: [
       {
         token: TOKEN,
@@ -99,6 +114,8 @@ function world(
     send?: (calls: TenderCall[]) => Promise<{ events: TenderEvent[]; txHashes: string[] }>;
     account?: () => string | null;
     uploadReply?: (blob: BlobUpload) => { sha256: string; uri: string };
+    /** What the vault says when it is read again, after the send failed. An error is thrown. */
+    vaultThen?: VaultData | Error;
   } = {},
 ): World {
   const w: World = {
@@ -111,6 +128,7 @@ function world(
     deps: undefined as unknown as SubmitDeps,
   };
   let uploads = 0;
+  let reads = 0;
   w.deps = {
     account: options.account ?? (() => ALICE),
     token: (account) => (account === ALICE ? w.held : null),
@@ -138,6 +156,10 @@ function world(
     },
     async readVault() {
       w.log.push("vault");
+      if (++reads > 1 && options.vaultThen !== undefined) {
+        if (options.vaultThen instanceof Error) throw options.vaultThen;
+        return options.vaultThen;
+      }
       return options.vault ?? vaultData({});
     },
     async signAndSend(calls) {
@@ -179,6 +201,34 @@ test("the_documents_are_uploaded_before_the_wallet_is_asked_for_anything", async
 test("a_task_whose_vault_holds_the_reward_sends_only_the_post", async () => {
   const form = regexForm({ amount: "5" });
   const w = world(form, { vault: vaultData({ vault: 5_000_000n }) });
+
+  await submitPost(input(form), w.deps);
+
+  expect(w.sent[0]?.map((call) => call.methodName)).toEqual(["post_task"]);
+});
+
+test("a_storage_balance_that_is_short_is_topped_up_in_the_same_send_before_the_deposit", async () => {
+  const form = regexForm({ amount: "5" });
+  // 1,000 bytes are free. A post needs 1,600, and the first deposit of the token 200 more.
+  const w = world(form, { vault: vaultData({ vault: 0n, available: 1_000n * BYTE }) });
+
+  await submitPost(input(form), w.deps);
+
+  const [calls] = w.sent;
+  expect(calls?.map((call) => [call.receiverId, call.methodName])).toEqual([
+    [CONTRACT, "storage_deposit"],
+    [TOKEN, "ft_transfer_call"],
+    [CONTRACT, "post_task"],
+  ]);
+  // The 800 bytes that are missing, in NEAR from the account that signs: no account is named.
+  expect(calls?.[0]?.args).toEqual({});
+  expect(calls?.[0]?.deposit).toBe(800n * BYTE);
+});
+
+test("a_storage_balance_that_pays_for_the_post_sends_no_top_up", async () => {
+  const form = regexForm({ amount: "5" });
+  // The vault holds the reward, so there is no deposit; the post needs 1,600 bytes, and 1,600 are free.
+  const w = world(form, { vault: vaultData({ vault: 5_000_000n, available: 1_600n * BYTE }) });
 
   await submitPost(input(form), w.deps);
 
@@ -397,6 +447,19 @@ test("a_second_refusal_is_a_failure_and_not_a_loop", async () => {
   expect(w.sent).toEqual([]);
 });
 
+test("the_token_a_request_takes_is_the_one_the_hook_would_give", () => {
+  const stored = { accountId: ALICE, token: "tok-held", expiresAtMs: Date.now() + 60_000 };
+  try {
+    expect(liveToken(ALICE)).toBeNull();
+    keepToken(stored, signInTicket());
+    expect(liveToken(ALICE)).toBe("tok-held");
+    expect(liveToken("bob.testnet")).toBeNull();
+  } finally {
+    clearApiToken();
+    sessionStorage.clear();
+  }
+});
+
 test("a_wallet_that_cannot_sign_a_message_stops_at_the_sign_in", async () => {
   const form = regexForm();
   const w = world(form, { held: null });
@@ -437,7 +500,9 @@ test("a_wallet_that_refuses_leaves_the_uploads_and_a_second_try_goes_through", a
 
   const failure = (await rejection(submitPost(input(form), w.deps))) as SubmitFailure;
   expect(failure.stage).toBe("wallet");
-  expect(failure.message).toContain("Your documents are saved with Tender");
+  expect(failure.message).toBe(
+    "The wallet didn't finish. A deposit may have gone through: check the Wallet page. Your documents are saved; press Post to try again.",
+  );
   // Everything was uploaded before the wallet was asked.
   expect(w.log).toEqual(["blob:brief", "blob:criteria", "heldout", "vault", "send"]);
 
@@ -447,50 +512,145 @@ test("a_wallet_that_refuses_leaves_the_uploads_and_a_second_try_goes_through", a
   expect(w.sent[1]).toEqual(w.sent[0]);
 });
 
-test("a_post_the_contract_turns_down_says_why_and_whether_the_deposit_went_through", async () => {
+/** What the page says of a wallet that threw, and of a transaction that failed with no code. */
+const DID_NOT_FINISH =
+  "The wallet didn't finish. A deposit may have gone through: check the Wallet page. Your documents are saved; press Post to try again.";
+
+/** Runs `work` with the console's errors held back: the page logs a failure it has handled. */
+async function quietly<T>(work: () => Promise<T>): Promise<T> {
+  const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    return await work();
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+test("a_post_the_contract_turns_down_says_why_and_what_became_of_the_deposit", async () => {
   const form = regexForm({ amount: "5" });
   const panic = (code: string | null) => async () => {
     throw new TransactionFailed("txhash", code);
   };
 
-  // With a deposit in front: the contract's panic is from `post_task`, which ran after it.
-  const withDeposit = world(form, { send: panic("E_STORAGE") });
+  // With a deposit in front, the vault is read again and the words say what it holds. The storage
+  // ran short here, which the page tops up the next time: the words say to press Post.
+  const withDeposit = world(form, {
+    send: panic("E_STORAGE"),
+    vaultThen: vaultData({ vault: 5_000_000n }),
+  });
   const first = (await rejection(submitPost(input(form), withDeposit.deps))) as SubmitFailure;
+  expect(first.stage).toBe("wallet");
   expect(first.message).toBe(
-    "Your storage with Tender is too full to hold this task, and this site can't add more. Your deposit went through, so the funds are in your vault. Press Post again once this is sorted.",
+    "Your storage with Tender ran short as the task was posted. Your deposit went through: your vault holds 5.00 tUSDC. Press Post to try again: the page adds what's missing.",
   );
 
-  // With the reward in the vault already: nothing else went through.
+  // With the reward in the vault already, nothing else went through, and the vault is not read.
   const noDeposit = world(form, {
     vault: vaultData({ vault: 5_000_000n }),
     send: panic("E_PAUSED"),
   });
   const second = (await rejection(submitPost(input(form), noDeposit.deps))) as SubmitFailure;
   expect(second.message).toBe("Tender isn't taking new tasks right now. Nothing was posted.");
+  expect(noDeposit.log.filter((line) => line === "vault")).toHaveLength(1);
+
+  // No deposit and a storage that ran short: nothing went through, and pressing Post is the way on.
+  const storageOnly = world(form, {
+    vault: vaultData({ vault: 5_000_000n }),
+    send: panic("E_STORAGE"),
+  });
+  const third = (await rejection(submitPost(input(form), storageOnly.deps))) as SubmitFailure;
+  expect(third.message).toBe(
+    "Your storage with Tender ran short as the task was posted. Nothing was posted. Press Post to try again: the page adds what's missing.",
+  );
 
   // A code the page has no words for is shown as the code.
   const unknown = world(form, { vault: vaultData({ vault: 5_000_000n }), send: panic("E_HASH") });
-  const third = (await rejection(submitPost(input(form), unknown.deps))) as SubmitFailure;
-  expect(third.message).toContain("(E_HASH)");
+  const fourth = (await rejection(submitPost(input(form), unknown.deps))) as SubmitFailure;
+  expect(fourth.message).toContain("(E_HASH)");
 
-  // A failure with no code could be either transaction: the words say to look at the vault.
+  // A failure with no code could be either transaction: the words say to look at the Wallet page.
   const noCode = world(form, { send: panic(null) });
-  const fourth = (await rejection(submitPost(input(form), noCode.deps))) as SubmitFailure;
-  expect(fourth.message).toContain("check your vault on the Wallet page");
+  const fifth = (await rejection(submitPost(input(form), noCode.deps))) as SubmitFailure;
+  expect(fifth.message).toBe(DID_NOT_FINISH);
+  expect(noCode.log.filter((line) => line === "vault")).toHaveLength(1);
 });
 
-test("an_answer_the_page_cannot_read_is_not_taken_for_a_refusal", async () => {
-  const form = regexForm();
+test.each([
+  ["E_FUNDS", "The reward wasn't in your vault."],
+  ["E_TOKEN", "Tender isn't taking this token right now."],
+])(
+  "a_%s_after_a_deposit_says_what_the_vault_holds_and_not_that_the_deposit_went_in",
+  async (code, why) => {
+    const form = regexForm({ amount: "5" });
+    const refuse = async () => {
+      throw new TransactionFailed("txhash", code);
+    };
+    const failureOf = async (w: World) =>
+      (await quietly(() => rejection(submitPost(input(form), w.deps)))) as SubmitFailure;
+
+    // The deposit was refused, as `ft_on_transfer` does when it cannot take one, and the token
+    // handed the tokens back: the transaction of the deposit ended well, the post then failed, and
+    // the vault holds what it did before. The words must not say the funds are in it.
+    const refused = world(form, {
+      vault: vaultData({ vault: 2_000_000n }),
+      send: refuse,
+      vaultThen: vaultData({ vault: 2_000_000n }),
+    });
+    const first = await failureOf(refused);
+    expect(first.stage).toBe("wallet");
+    expect(first.message).toBe(
+      `${why} Your vault holds 2.00 tUSDC now, and a deposit Tender couldn't take went back to your wallet. Press Post to try again.`,
+    );
+    expect(first.message).not.toContain("went through");
+    // The plan began with a deposit, and the vault was read again after the send.
+    expect(refused.sent[0]?.map((call) => call.methodName)).toEqual([
+      "ft_transfer_call",
+      "post_task",
+    ]);
+    expect(refused.log).toEqual([
+      "blob:brief",
+      "blob:criteria",
+      "heldout",
+      "vault",
+      "send",
+      "vault",
+    ]);
+
+    // The vault holds the reward by the second look: the deposit did go in, and the words say so.
+    const landed = world(form, {
+      vault: vaultData({ vault: 2_000_000n }),
+      send: refuse,
+      vaultThen: vaultData({ vault: 5_000_000n }),
+    });
+    expect((await failureOf(landed)).message).toBe(
+      `${why} Your deposit went through: your vault holds 5.00 tUSDC. Press Post to try again.`,
+    );
+
+    // The vault cannot be read: nothing is claimed, and the Wallet page is where to look.
+    const unknown = world(form, {
+      vault: vaultData({ vault: 2_000_000n }),
+      send: refuse,
+      vaultThen: new Error("down"),
+    });
+    expect((await failureOf(unknown)).message).toBe(
+      `${why} The deposit may have come back to your wallet: check the Wallet page. Press Post to try again.`,
+    );
+  },
+);
+
+test("a_result_the_wallet_could_not_read_is_taken_for_sent_and_not_for_a_refusal", async () => {
+  const form = regexForm({ amount: "5" });
   const w = world(form, {
     send: async () => {
       throw new WalletResultUnreadable("transaction");
     },
   });
 
-  const failure = (await rejection(submitPost(input(form), w.deps))) as SubmitFailure;
-
-  expect(failure.stage).toBe("wallet");
-  expect(failure.message).toContain("didn't say how it went");
+  // The transactions may well have posted the task, and a second press would deposit and post it
+  // again. So it is an outcome and not a failure: the page has no hashes to show, and keeps Post off.
+  await expect(submitPost(input(form), w.deps)).resolves.toEqual({ kind: "sent", txHashes: [] });
+  // Nothing is said of the deposit, since nothing is known of it, and the vault is not read again.
+  expect(w.log).toEqual(["blob:brief", "blob:criteria", "heldout", "vault", "send"]);
 });
 
 test("a_wallet_connected_as_another_account_is_sent_nothing", async () => {
