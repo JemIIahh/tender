@@ -462,7 +462,8 @@ mod tests {
 
     /// A contract whose owner has 1 NEAR of storage and has allowlisted USDC with `set_token`;
     /// alice, the poster, with 1 NEAR of storage and `FUNDS` in her vault; and bob, carol and the
-    /// judge with 0.1 NEAR of storage and no vault slot.
+    /// judge with 0.1 NEAR of storage and no vault slot. bob and carol are registered agents, with
+    /// no bond, since none is set, so they may enter open tasks.
     fn world() -> Tender {
         let mut t = fresh();
         register(&mut t, OWNER, NearToken::from_near(1));
@@ -473,6 +474,12 @@ mod tests {
         assert_eq!(fund(&mut t, USDC, "alice.test", FUNDS), 0);
         for who in ["bob.test", "carol.test", JUDGE] {
             register(&mut t, who, NearToken::from_millinear(100));
+        }
+        for who in ["bob.test", "carol.test"] {
+            try_as(&mut t, who, ONE_YOCTO, |t| {
+                t.register_agent(URI.to_string(), BRIEF_HASH.to_string(), vec![])
+            })
+            .unwrap_or_else(|message| panic!("{who} could not register: {message}"));
         }
         t
     }

@@ -311,6 +311,14 @@ impl Tender {
 }
 
 impl Tender {
+    /// Whether `account` is a registered agent that is active: registered, not unregistering and
+    /// not retired. Only such an agent may enter an open task.
+    pub(crate) fn is_active_agent(&self, account: &AccountId) -> bool {
+        self.agents
+            .get(account)
+            .is_some_and(|profile| profile.status == AgentStatus::Active)
+    }
+
     /// Runs `f` on the profile of `account`. It does nothing, and `f` does not run, if `account`
     /// has not registered.
     ///

@@ -74,6 +74,8 @@ pub async fn new_account(env: &Env, name: &'static str) -> anyhow::Result<Accoun
 ///   owner needs before `set_token`: it charges the owner for the treasury's vault slot.
 /// - The token is allowlisted at Tender for rewards of 1 to 10^12, and the poster, alice, bob and
 ///   carol hold 1_000_000_000 units of it.
+/// - alice, bob and carol are registered agents, so they may enter open tasks. No agent bond is
+///   set, so they paid none; the cooldown is the contract's default.
 pub async fn setup(min_window_secs: u32) -> anyhow::Result<Env> {
     let worker = near_workspaces::sandbox().await?;
     let root = worker.root_account()?;
@@ -161,6 +163,14 @@ pub async fn setup(min_window_secs: u32) -> anyhow::Result<Env> {
     .collect();
     tokio::try_join!(mints, all::<(), _>(at_tender))?;
 
+    // alice, bob and carol enter open tasks, which take only registered agents. No bond is set,
+    // so registering takes only the 1 yoctoNEAR and the storage.
+    all([&env.alice, &env.bob, &env.carol]
+        .into_iter()
+        .map(|who| register_agent(&env, who))
+        .collect())
+    .await?;
+
     // The owner's storage balance exists by now, and `set_token` charges it.
     let r = env
         .owner
@@ -197,6 +207,25 @@ pub fn mint(env: &Env, who: &AccountId, amount: u128) -> impl Future<Output = an
         .token
         .call("mint")
         .args_json(json!({ "account_id": who, "amount": amount.to_string() }))
+        .max_gas();
+    async move {
+        done(call.transact().await?)?;
+        Ok(())
+    }
+}
+
+/// Registers `who` as an agent with a profile named after it, attaching the 1 yoctoNEAR that
+/// `register_agent` takes. `who` needs a storage balance at Tender, and the bond in its vault if
+/// one is set.
+pub fn register_agent(env: &Env, who: &Account) -> impl Future<Output = anyhow::Result<()>> {
+    let call = who
+        .call(env.tender.id(), "register_agent")
+        .args_json(json!({
+            "profile_uri": format!("https://agents.example/{}.json", who.id()),
+            "profile_hash": hex(&sha256(who.id().as_bytes())),
+            "tags": ["test"],
+        }))
+        .deposit(ONE_YOCTO)
         .max_gas();
     async move {
         done(call.transact().await?)?;

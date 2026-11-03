@@ -269,6 +269,16 @@ impl World {
             });
             world.balances.insert(who.account(), 0);
         }
+        // The three that enter register as agents, since the tasks are open to anyone.
+        for who in [Who::A, Who::B, Who::C] {
+            world.setup(who.id(), ONE_YOCTO, |t| {
+                t.register_agent(
+                    PROFILE_URI.to_string(),
+                    BRIEF_HASH.to_string(),
+                    vec!["coder".to_string()],
+                )
+            });
+        }
         world.balances.insert(acct(TREASURY), 0);
         match world.deposit(Who::P, MAX_AMOUNT) {
             Ok(Ok(())) => {}

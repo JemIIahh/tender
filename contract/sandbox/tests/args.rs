@@ -171,10 +171,12 @@ async fn task_methods_refuse_an_unknown_argument_and_a_deposit() -> anyhow::Resu
             json!({ "account_id": alice.id() }),
         )
     };
+    // alice registered in `setup`; this call would replace her profile.
+    let before = agent().await?;
     assert_refuses_unknown_key(&env, alice, "register_agent", &profile, ONE_YOCTO).await?;
-    assert!(agent().await?.is_null());
+    assert_eq!(agent().await?, before);
     done_clean(call(&env, alice, "register_agent", profile, ONE_YOCTO).await?)?;
-    assert!(!agent().await?.is_null());
+    assert_eq!(agent().await?["profile_uri"], "ipfs://alice");
 
     // post_task: two tasks, so that one can be picked and the other voided.
     deposit(&env, poster, 2 * REWARD).await?;
