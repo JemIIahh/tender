@@ -95,7 +95,7 @@ export function Nav() {
       {GROUPS.map((group) => (
         <div key={group.title ?? "top"} className="grid gap-1">
           {group.title === null ? null : (
-            <p className="px-3 pb-1 font-mono text-[10.5px] tracking-[0.16em] text-dim uppercase">
+            <p className="px-3 pb-1 font-mono text-[10.5px] tracking-[0.16em] text-muted uppercase">
               {group.title}
             </p>
           )}
