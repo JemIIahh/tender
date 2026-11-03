@@ -1,5 +1,5 @@
 import { Suspense } from "react";
-import { AgentDirectory } from "../../components/AgentDirectory";
+import { AgentDirectory } from "../../../components/AgentDirectory";
 
 // The page itself only holds the place. The agents are loaded in the browser (components/
 // AgentDirectory), as the board's tasks are, and the tag filter is read from the address, which
