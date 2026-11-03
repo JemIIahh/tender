@@ -457,7 +457,7 @@ test("a_post_the_contract_turns_down_says_why_and_whether_the_deposit_went_throu
   const withDeposit = world(form, { send: panic("E_STORAGE") });
   const first = (await rejection(submitPost(input(form), withDeposit.deps))) as SubmitFailure;
   expect(first.message).toBe(
-    "Your storage with Tender can't hold this task. Add storage on the Wallet page. Your deposit went through, so the funds are in your vault. Fix this and press Post again.",
+    "Your storage with Tender is too full to hold this task, and this site can't add more. Your deposit went through, so the funds are in your vault. Press Post again once this is sorted.",
   );
 
   // With the reward in the vault already: nothing else went through.

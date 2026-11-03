@@ -123,14 +123,19 @@ export type SubmitResult =
    */
   | { kind: "sent"; txHashes: string[] };
 
-/** What the contract's panics mean to a poster. Others are shown by their code. */
+/**
+ * What the contract's panics mean to a poster. Others are shown by their code. `E_STORAGE` does not
+ * send the person to the Wallet page: it sets an account up and takes unused storage back, and has
+ * no way to add storage to an account that is set up. Say so here when it has one.
+ */
 const PANIC_WORDS: Record<string, string> = {
   E_PAUSED: "Tender isn't taking new tasks right now.",
   E_TOKEN: "Tender isn't taking this token right now.",
   E_REWARD: "The reward is outside what Tender takes for this token.",
   E_WINDOW: "A window is outside what Tender allows.",
   E_FUNDS: "Your vault doesn't hold the reward.",
-  E_STORAGE: "Your storage with Tender can't hold this task. Add storage on the Wallet page.",
+  E_STORAGE:
+    "Your storage with Tender is too full to hold this task, and this site can't add more.",
 };
 
 /** Words for a send that failed. `deposited`: the plan began with a deposit. */
@@ -139,7 +144,7 @@ function sendWords(error: unknown, deposited: boolean): string {
     // The contract's own panic comes from `post_task`, which runs after the deposit.
     const why = PANIC_WORDS[error.code] ?? `Tender turned the task down (${error.code}).`;
     return deposited
-      ? `${why} Your deposit went through, so the funds are in your vault. Fix this and press Post again.`
+      ? `${why} Your deposit went through, so the funds are in your vault. Press Post again once this is sorted.`
       : `${why} Nothing was posted.`;
   }
   if (error instanceof WalletError || error instanceof TransactionFailed) {
