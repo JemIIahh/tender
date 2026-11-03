@@ -10,6 +10,7 @@ import {
   type ListAgentsFilter,
   type ListTasksFilter,
   ListTasksResponseSchema,
+  MAX_RESPONSE_BYTES,
   SignInResponseSchema,
   type StartResponse,
   StartResponseSchema,
@@ -343,6 +344,86 @@ test("fetch_json_lets_a_network_error_through_unchanged", async () => {
     expect(error).toBe(failure);
     expect(error).not.toBeInstanceOf(ApiError);
   }
+});
+
+/** A `fetch` that answers every call with `body` as it is, and with `init`. */
+const streaming = (body: ReadableStream<Uint8Array>, init?: ResponseInit) =>
+  (() => Promise.resolve(new Response(body, init))) as typeof fetch;
+
+/** A body that sends a mebibyte of spaces each time it is read, for ever, and says what it did. */
+function endless() {
+  const mebibyte = new Uint8Array(1024 * 1024).fill(0x20);
+  let sent = 0;
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      sent += 1;
+      controller.enqueue(mebibyte);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  return { stream, sent: () => sent, cancelled: () => cancelled };
+}
+
+test("fetch_json_reads_no_more_than_16_mib_of_an_answer", async () => {
+  // A base URL that is hostile or wrong must not fill the memory of its caller before the
+  // caller's timeout is up, whatever the status of the answer.
+  expect(MAX_RESPONSE_BYTES).toBe(16 * 1024 * 1024);
+  for (const status of [200, 500]) {
+    const body = endless();
+    const error = await apiError(
+      fetchJson(
+        URL_OF_LIST,
+        ListTasksResponseSchema,
+        undefined,
+        streaming(body.stream, { status }),
+      ),
+    );
+    expect([error.status, error.body]).toEqual([status, null]);
+    expect(error.message).toBe(`response with status ${status} is larger than 16777216 bytes`);
+    // It stops at the mebibyte that goes past the limit, and lets the rest of the body go.
+    expect(body.sent()).toBeLessThanOrEqual(18);
+    expect(body.cancelled()).toBe(true);
+  }
+
+  // A body that declares a length past the limit is refused before it is read.
+  const declared = endless();
+  const headers = { "Content-Length": String(MAX_RESPONSE_BYTES + 1) };
+  const refused = await apiError(
+    fetchJson(
+      URL_OF_LIST,
+      ListTasksResponseSchema,
+      undefined,
+      streaming(declared.stream, { headers }),
+    ),
+  );
+  expect(refused.message).toBe("response with status 200 is larger than 16777216 bytes");
+  expect(declared.cancelled()).toBe(true);
+  expect(declared.sent()).toBeLessThanOrEqual(1);
+});
+
+test("fetch_json_decodes_a_body_as_response_text_does", async () => {
+  // A byte order mark is dropped, and a character split between two reads is put together.
+  const text = `\uFEFF${JSON.stringify(withTask({ title: "Café ✓" }))}`;
+  const bytes = new TextEncoder().encode(text);
+  const at = bytes.indexOf(0xc3) + 1;
+  const chunks = [bytes.slice(0, at), bytes.slice(at)];
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      const chunk = chunks.shift();
+      if (chunk === undefined) controller.close();
+      else controller.enqueue(chunk);
+    },
+  });
+  const page = await fetchJson(URL_OF_LIST, ListTasksResponseSchema, undefined, streaming(body));
+  expect(page.tasks[0]?.title).toBe("Café ✓");
+
+  // An answer with no body at all is an empty text, as before.
+  const empty = (() => Promise.resolve(new Response(null, { status: 503 }))) as typeof fetch;
+  const error = await apiError(fetchJson(URL_OF_LIST, ListTasksResponseSchema, undefined, empty));
+  expect([error.status, error.body]).toEqual([503, ""]);
 });
 
 /** `GET /v1/tasks` answered with one task that has `patch` applied. */
