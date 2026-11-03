@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { type ReactNode, useEffect, useId, useState, useSyncExternalStore } from "react";
+import { type ReactNode, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import { walletStore } from "../lib/wallet";
 import { Mark } from "./Mark";
 import { Nav } from "./Nav";
@@ -31,8 +31,10 @@ function Wordmark() {
  * connected one), and the page itself. On a phone the sidebar is a menu that the top bar opens,
  * over the page, and that closes when a page is chosen.
  *
- * The top bar comes first in the document, so that on a phone the open menu is the next thing the
- * keyboard reaches after the button that opened it.
+ * The top bar comes first in the document, so that on a phone the open menu comes after the top bar
+ * in the keyboard's order: the button that opened it, the wordmark and the two pills, then the
+ * menu. While the menu is open the page under it is inert, so the keyboard cannot reach what the
+ * menu covers; Escape closes it and gives the focus back to the button.
  */
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
@@ -40,6 +42,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   // The page the menu was opened on. It is open only there: choosing a page closes it.
   const [openOn, setOpenOn] = useState<string | null>(null);
   const open = openOn === pathname;
+  const menuButton = useRef<HTMLButtonElement>(null);
   // The wallet as far as this tab knows it, without looking for one: a page that needs the wallet
   // starts the store (lib/wallet.ts), and the board, say, does not load a wallet only for the top
   // bar. Until then, and while none is connected, the pill offers to connect one.
@@ -49,14 +52,34 @@ export function AppShell({ children }: { children: ReactNode }) {
     walletStore.getServerSnapshot,
   );
 
-  // Escape closes the menu, as it closes any menu.
+  // Escape closes the menu, as it closes any menu, and the focus goes back to the button that
+  // opened it: the link it was on is no longer on the page.
   useEffect(() => {
     if (!open) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpenOn(null);
+      if (event.key !== "Escape") return;
+      setOpenOn(null);
+      menuButton.current?.focus();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  // From laptop width up the sidebar is not a menu, and the page under it must not stay inert: a
+  // menu left open when the window grows is closed.
+  useEffect(() => {
+    if (!open) return;
+    const wide = window.matchMedia?.("(min-width: 64rem)");
+    if (wide === undefined) return;
+    if (wide.matches) {
+      setOpenOn(null);
+      return;
+    }
+    const onChange = (event: MediaQueryListEvent) => {
+      if (event.matches) setOpenOn(null);
+    };
+    wide.addEventListener("change", onChange);
+    return () => wide.removeEventListener("change", onChange);
   }, [open]);
 
   return (
@@ -72,6 +95,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           which run the whole height of the page, where the sticky sidebar ends at the screen's. */}
       <header className="sticky top-0 z-30 flex h-16 items-center gap-2 border-b border-line bg-ink/90 px-4 backdrop-blur-sm sm:px-8 lg:col-start-2 lg:row-start-1 lg:border-l">
         <button
+          ref={menuButton}
           type="button"
           aria-expanded={open}
           aria-controls={menuId}
@@ -134,8 +158,10 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
       </aside>
 
+      {/* Under the open menu, the page is out of reach of the keyboard and the pointer alike. */}
       <main
         id="main"
+        inert={open}
         className="min-w-0 border-line px-4 pt-8 pb-16 sm:px-8 lg:col-start-2 lg:row-start-2 lg:border-l"
       >
         {children}
