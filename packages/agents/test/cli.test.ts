@@ -1,5 +1,7 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +16,8 @@ import {
   type CliOptions,
   checkAgentKey,
   createApiClient,
+  type ExitIo,
+  exitWhenFlushed,
   main,
   parseCli,
   type RunConfig,
@@ -1295,4 +1299,78 @@ test("the_bin_acts_through_the_api_client_and_says_what_it_refuses", {
   );
   for (const piece of piecesOf(AGENT_KEY)) expect(result.stderr).not.toContain(piece);
   expect(result.stderr).not.toContain("api.tender.example");
+});
+
+test("the_bin_ends_the_process_when_told_to_stop_though_the_sign_in_request_is_still_out", {
+  timeout: 120_000,
+}, async () => {
+  // Review M3. The stop comes while the sign-in at start is out and the API does not answer: the
+  // agent stops at once (the stop wins the race), but the abandoned request keeps the event loop
+  // open for its own 30 s limit, unless the bin ends the process.
+  const requests: string[] = [];
+  const hanging = createServer((req) => {
+    requests.push(req.url ?? "");
+  });
+  await new Promise<void>((resolve) => hanging.listen(0, "127.0.0.1", resolve));
+  const home = await mkdtemp(join(tmpdir(), "tender-bin-home-"));
+  const child = spawn(
+    process.execPath,
+    ["--import", "tsx", BIN, "--agent", "analyst", "--solver", "offline", "--network", "sandbox"],
+    {
+      cwd: ROOT,
+      env: {
+        HOME: home,
+        TENDER_CONTRACT: "tender.sandbox",
+        TENDER_API_URL: `http://127.0.0.1:${(hanging.address() as AddressInfo).port}`,
+        NEAR_RPC_URL: "http://127.0.0.1:1",
+        AGENT_ANALYST_ACCOUNT: "analyst.sandbox",
+        AGENT_ANALYST_PRIVATE_KEY: AGENT_KEY.toString(),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  try {
+    const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
+    await vi.waitFor(() => expect(requests.length).toBeGreaterThan(0), {
+      timeout: 90_000,
+      interval: 50,
+    });
+
+    const stoppedAt = performance.now();
+    child.kill("SIGTERM");
+    const code = await exited;
+
+    expect(code).toBe(0);
+    // Far short of the client's 30 s: it was the bin that ended the process.
+    expect(performance.now() - stoppedAt).toBeLessThan(10_000);
+  } finally {
+    child.kill("SIGKILL");
+    hanging.closeAllConnections();
+    await new Promise((resolve) => hanging.close(resolve));
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("exit_when_flushed_exits_with_the_code_after_both_streams_have_taken_their_writes", async () => {
+  const events: string[] = [];
+  // A stream that takes its writes late, as a pipe does: the callback of a write comes later.
+  const slow = (name: string): ExitIo["stdout"] => ({
+    write: ((_chunk: unknown, callback?: () => void) => {
+      events.push(`${name} write`);
+      setTimeout(() => {
+        events.push(`${name} flushed`);
+        callback?.();
+      }, 20);
+      return true;
+    }) as ExitIo["stdout"]["write"],
+  });
+  const exit = ((code: number) => {
+    events.push(`exit ${code}`);
+  }) as ExitIo["exit"];
+
+  await exitWhenFlushed(3, { stdout: slow("stdout"), stderr: slow("stderr"), exit });
+
+  expect(events.at(-1)).toBe("exit 3");
+  expect(events.slice(0, 2).sort()).toEqual(["stderr write", "stdout write"]);
+  expect(events.slice(2, 4).sort()).toEqual(["stderr flushed", "stdout flushed"]);
 });
