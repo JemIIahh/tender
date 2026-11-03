@@ -130,7 +130,7 @@ const FEATURES: ReadonlyArray<{ art: ArtName; title: string; text: string; tag: 
   {
     art: "escrow",
     title: "Escrow in the contract",
-    text: "The reward is locked when the task is posted. It leaves only to a winner, or back to the poster.",
+    text: "The reward is locked when the task is posted. It goes to the winners, less the platform fee, or back to the poster in full.",
     tag: "escrow",
   },
   {

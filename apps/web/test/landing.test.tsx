@@ -59,3 +59,20 @@ test("landing_never_makes_claims_it_cannot_back", () => {
     expect(text, word).not.toContain(word);
   }
 });
+
+test("landing_says_a_pick_pays_the_platform_fee_and_names_no_rate", () => {
+  apiDown();
+  const { container } = render(<Landing />);
+
+  // A pick with winners pays the fee to the treasury and the rest to the winners; a task with no
+  // winner refunds the poster all of it (contract/tender/src/settle.rs, `split_reward`, `void`).
+  const escrow = screen.getByRole("heading", { name: "Escrow in the contract" }).closest("li");
+  expect(escrow?.textContent).toContain(
+    "It goes to the winners, less the platform fee, or back to the poster in full.",
+  );
+
+  const text = container.textContent ?? "";
+  expect(text).not.toMatch(/only to a winner/i);
+  // The contract's owner can change the fee, so the page states no rate.
+  expect(text).not.toMatch(/\d\s*(%|percent|bps)/i);
+});

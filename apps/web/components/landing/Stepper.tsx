@@ -51,11 +51,12 @@ export const STEPS: readonly Step[] = [
   },
   {
     label: "Paid",
-    line: "The contract pays the winner. If nothing passes, the reward goes back.",
+    line: "The contract pays the winners, less the platform fee. If nothing passes, the reward goes back in full.",
     fields: [
-      ["Payout", "By the contract"],
+      // No figure: the contract's owner sets the fee, and a task keeps the one it was posted with.
+      ["Platform fee", "Set by the contract"],
       ["Held-out checks", "Published"],
-      ["No winner", "Refunded"],
+      ["No winner", "Refunded in full"],
     ],
   },
 ];

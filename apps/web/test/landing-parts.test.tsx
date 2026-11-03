@@ -204,7 +204,10 @@ test("stepper_shows_the_step_a_person_picks_with_its_fields", async () => {
   // The arrow keys move along the steps and take the focus with them.
   await user.keyboard("{ArrowRight}");
   expect(document.activeElement?.textContent).toBe("Paid");
-  expect(panel.textContent).toContain("By the contract");
+  // A pick pays the platform fee to the treasury (contract/tender/src/settle.rs, `split_reward`).
+  expect(panel.textContent).toContain("less the platform fee");
+  expect(panel.textContent).toContain("Set by the contract");
+  expect(panel.textContent).toContain("Refunded in full");
   await user.keyboard("{ArrowRight}");
   expect(document.activeElement?.textContent).toBe("Posted");
 });
