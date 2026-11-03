@@ -9,6 +9,7 @@ import { errorMessage } from "../lib/errors";
 import { Amount } from "./Amount";
 import { ErrorState } from "./ErrorState";
 import { PhaseChip } from "./PhaseChip";
+import { EYEBROW, PANEL, PANEL_TITLE, TEXT_LINK } from "./ui";
 
 /** How many of the agent's tasks are asked for: the API's largest page, newest first. */
 const LIMIT = 50;
@@ -20,19 +21,24 @@ type Lineage =
 
 function TaskRow({ task }: { task: TaskSummary }) {
   return (
-    <li data-testid="lineage-task" className="grid gap-1 border-t border-neutral-300 py-3">
-      <Link href={`/tasks/${task.id}`} className="underline wrap-anywhere">
+    <li
+      data-testid="lineage-task"
+      className="grid gap-2 border-t border-line py-3.5 first:border-t-0 first:pt-0 last:pb-0"
+    >
+      <Link href={`/tasks/${task.id}`} className={`${TEXT_LINK} w-fit font-medium wrap-anywhere`}>
         {task.title ?? UNTITLED_TASK}
       </Link>
-      <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
-        <span>#{task.id}</span>
+      <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted">
+        <span className="font-mono text-xs">#{task.id}</span>
         <PhaseChip phase={task.phase} />
-        <Amount value={task.reward} token={task.token} />
+        <span className="text-bone">
+          <Amount value={task.reward} token={task.token} />
+        </span>
       </p>
       {task.parent === null ? null : (
-        <p className="text-sm">
+        <p className="text-sm text-muted">
           Subtask of{" "}
-          <Link data-testid="parent-link" href={`/tasks/${task.parent}`} className="underline">
+          <Link data-testid="parent-link" href={`/tasks/${task.parent}`} className={TEXT_LINK}>
             Task #{task.parent}
           </Link>
         </p>
@@ -72,17 +78,19 @@ export function AgentLineage({ account }: { account: string }) {
   }, [load]);
 
   return (
-    <section data-testid="lineage" className="grid gap-3">
-      <h2 className="text-lg font-semibold">Tasks it posted</h2>
-      <p className="text-sm text-neutral-700">
-        Newest first. A subtask names the task it came from.
-      </p>
+    <section data-testid="lineage" className={PANEL}>
+      <div className="grid gap-1">
+        <h2 className={PANEL_TITLE}>Tasks it posted</h2>
+        <p className="text-sm text-muted">Newest first. A subtask names the task it came from.</p>
+      </div>
       {lineage.status === "loading" ? (
-        <p role="status">Loading tasks…</p>
+        <p role="status" className={EYEBROW}>
+          Loading tasks…
+        </p>
       ) : lineage.status === "error" ? (
         <ErrorState message={lineage.message} retrying={lineage.retrying} onRetry={load} />
       ) : lineage.tasks.length === 0 ? (
-        <p className="text-sm">This agent has not posted any tasks.</p>
+        <p className="text-sm text-muted">This agent has not posted any tasks.</p>
       ) : (
         <>
           <ul className="grid">
@@ -91,7 +99,7 @@ export function AgentLineage({ account }: { account: string }) {
             ))}
           </ul>
           {lineage.more ? (
-            <p data-testid="lineage-more" className="text-sm">
+            <p data-testid="lineage-more" className="text-sm text-muted">
               Showing the {lineage.tasks.length} newest tasks.
             </p>
           ) : null}

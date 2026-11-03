@@ -15,9 +15,11 @@ import { errorMessage } from "../lib/errors";
 import { linkHost, safeHref } from "../lib/links";
 import { AgentFacts, UNNAMED_AGENT } from "./AgentFacts";
 import { AgentLineage } from "./AgentLineage";
+import { Avatar } from "./Avatar";
 import { ErrorState } from "./ErrorState";
 import { PhaseChip } from "./PhaseChip";
 import { TeamBadge } from "./TeamBadge";
+import { CARD, EYEBROW, H1, PANEL, PANEL_TITLE, TEXT_LINK } from "./ui";
 
 /** The name the page has before it has the agent's: the account, if the address holds one. */
 const headingFor = (account: string): string =>
@@ -36,8 +38,8 @@ type State =
 function ProfileSection({ agent }: { agent: AgentSummary }) {
   const href = safeHref(agent.profile_uri);
   return (
-    <section className="grid gap-1 text-sm">
-      <h2 className="text-lg font-semibold">Profile</h2>
+    <section className={`${CARD} grid gap-2 p-5 text-sm text-muted sm:p-6`}>
+      <h2 className={`${PANEL_TITLE} mb-2`}>Profile</h2>
       <p>Registered at block {agent.registered_height}</p>
       {href === undefined ? (
         <p className="wrap-anywhere">{`Profile address (not a web link): ${agent.profile_uri}`}</p>
@@ -48,14 +50,14 @@ function ProfileSection({ agent }: { agent: AgentSummary }) {
             target="_blank"
             rel="noopener noreferrer nofollow"
             aria-label={`Open profile document of ${agent.account}`}
-            className="underline"
+            className={TEXT_LINK}
           >
             Open profile document
           </a>{" "}
-          <span className="text-neutral-600 wrap-anywhere">({linkHost(agent.profile_uri)})</span>
+          <span className="wrap-anywhere">({linkHost(agent.profile_uri)})</span>
         </p>
       )}
-      <p className="font-mono wrap-anywhere">{`sha256 ${agent.profile_hash}`}</p>
+      <p className="font-mono text-xs wrap-anywhere">{`sha256 ${agent.profile_hash}`}</p>
     </section>
   );
 }
@@ -74,23 +76,26 @@ function wonText(entry: AgentRecentEntry): string {
 
 function RecentEntries({ entries }: { entries: AgentDetailResponse["recent_entries"] }) {
   return (
-    <section className="grid gap-3">
-      <h2 className="text-lg font-semibold">Recent entries</h2>
+    <section className={PANEL}>
+      <h2 className={PANEL_TITLE}>Recent entries</h2>
       {entries.length === 0 ? (
-        <p className="text-sm">No entries yet.</p>
+        <p className="text-sm text-muted">No entries yet.</p>
       ) : (
         <ul className="grid">
           {entries.map((entry) => (
             <li
               key={entry.task_id}
               data-testid="recent-entry"
-              className="grid gap-1 border-t border-neutral-300 py-3"
+              className="grid gap-2 border-t border-line py-3.5 first:border-t-0 first:pt-0 last:pb-0"
             >
-              <Link href={`/tasks/${entry.task_id}`} className="underline wrap-anywhere">
+              <Link
+                href={`/tasks/${entry.task_id}`}
+                className={`${TEXT_LINK} w-fit font-medium wrap-anywhere`}
+              >
                 {entry.title ?? UNTITLED_TASK}
               </Link>
-              <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
-                <span>#{entry.task_id}</span>
+              <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted">
+                <span className="font-mono text-xs">#{entry.task_id}</span>
                 <PhaseChip phase={entry.phase} />
                 <span data-testid="revealed">{`Revealed: ${entry.revealed ? "yes" : "no"}`}</span>
                 <span data-testid="won">{wonText(entry)}</span>
@@ -106,13 +111,23 @@ function RecentEntries({ entries }: { entries: AgentDetailResponse["recent_entri
 function ReadyView({ detail }: { detail: AgentDetailResponse }) {
   const { agent } = detail;
   return (
-    <article className="grid gap-8">
-      <header className="grid gap-2">
-        <h1 className="text-2xl font-semibold wrap-anywhere">{agent.name ?? UNNAMED_AGENT}</h1>
-        <p data-testid="account">
-          <TeamBadge account={agent.account} isTeam={agent.is_team} />
+    <article className="mx-auto grid w-full max-w-4xl gap-5">
+      <header className="grid gap-5 pb-3">
+        <p className={EYEBROW}>
+          Agent <span className="text-seal">&gt;</span>
         </p>
-        <AgentFacts agent={agent} />
+        <div className="flex min-w-0 items-center gap-4">
+          <Avatar account={agent.account} size={56} />
+          <div className="grid min-w-0 gap-2">
+            <h1 className={`${H1} wrap-anywhere`}>{agent.name ?? UNNAMED_AGENT}</h1>
+            <p data-testid="account">
+              <TeamBadge account={agent.account} isTeam={agent.is_team} />
+            </p>
+          </div>
+        </div>
+        <div className={PANEL}>
+          <AgentFacts agent={agent} />
+        </div>
       </header>
       <ProfileSection agent={agent} />
       <RecentEntries entries={detail.recent_entries} />
@@ -163,12 +178,16 @@ export function AgentView({ account }: { account: string }) {
   // The page has a heading in every state: the account, if the address holds one, until the agent's
   // own name is known.
   return (
-    <div className="grid gap-4">
-      <h1 className="text-2xl font-semibold wrap-anywhere">{headingFor(account)}</h1>
+    <div className="mx-auto grid w-full max-w-4xl gap-6">
+      <h1 className="text-3xl font-semibold tracking-[-0.03em] text-bone wrap-anywhere sm:text-[2.6rem]">
+        {headingFor(account)}
+      </h1>
       {state.status === "loading" ? (
-        <p role="status">Loading agent…</p>
+        <p role="status" className={EYEBROW}>
+          Loading agent…
+        </p>
       ) : state.status === "missing" ? (
-        <p>There is no agent with this account.</p>
+        <p className={`${PANEL} text-muted`}>There is no agent with this account.</p>
       ) : (
         <ErrorState message={state.message} retrying={state.retrying} onRetry={load} />
       )}
