@@ -8,8 +8,9 @@ import { loadRun, type RunInfo } from "./run";
 // What the page does goes to the real node, and each spec reads the chain back afterwards. The
 // account starts with tokens in its wallet and nothing at Tender, and the specs run in this order
 // on it: the wallet page sets it up and moves tokens in and out, and the post wizard then posts a
-// task from what is left. The post spec works from what the chain holds when it starts, so it
-// does not need the first to have run.
+// task from what is left. The wizard turns away an account that Tender does not know, so a run of
+// the post spec alone sets the account up first, on the wallet page. The wallet spec needs the
+// account as the setup made it, so each spec runs once on a chain (`retries` is 0).
 
 const tusdc = (whole: number) => BigInt(whole) * 1_000_000n;
 /** An amount as the page writes it. */
@@ -122,10 +123,26 @@ async function fillRegexChecks(page: Page): Promise<void> {
     .fill("dave..near\n_eve.near");
 }
 
+/**
+ * Sets the dev account up at Tender on the wallet page, as a person does, unless the chain says it
+ * is set up already (the wallet spec did it). The page is left signed out, as a new page is.
+ */
+async function ensureAccountIsSetUp(page: Page, run: RunInfo): Promise<void> {
+  if ((await readerOf(run).storageBalanceOf(run.dev)) !== null) return;
+  await page.goto("/wallet");
+  await page.getByRole("button", { name: "Connect wallet" }).click();
+  await expect(page.getByTestId("account-id")).toHaveText(run.dev);
+  await page.getByRole("button", { name: "Set up account" }).click();
+  await expect(page.getByTestId("storage-total")).toHaveText("0.05 NEAR");
+  await page.getByRole("button", { name: "Disconnect" }).click();
+  await expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible();
+}
+
 test("post_task_end_to_end", async ({ page }) => {
   const run = loadRun();
   const chain = readerOf(run);
   const api = new ApiClient({ baseUrl: run.apiUrl });
+  await ensureAccountIsSetUp(page, run);
 
   // What the wizard has to add to the vault for the reward, from what the chain holds now.
   const reward = tusdc(20);
