@@ -202,9 +202,9 @@ const MAX_COMPILE_RETRIES = 3;
  * - a `heldout_commitment` that an earlier task of the same poster (a lower id, of any verifier)
  *   commits to as well: `held-out checks already used by task {id}`, naming the lowest. Held-out
  *   checks are single-use, as judging a task publishes them. Another poster's task with the same
- *   commitment does not count (P05-R7): the checks are not its poster's upload, so it is never
- *   judged and never publishes them, and a stranger who posted one first must not block the
- *   poster's own;
+ *   commitment does not count (P05-R7): once a commitment is on chain anyone can post a task
+ *   with it, and only someone who holds the bytes already can have a copy judged, which
+ *   publishes them. A stranger who posted one first must not block the poster's own;
  * - held-out checks that are stored under the commitment but not as the poster's `heldout` blob,
  *   that are over 262_144 bytes, that do not fit `HeldoutSchema`, that are of another kind than
  *   the criteria, that hold a surrogate half with no partner, or whose bytes are not their

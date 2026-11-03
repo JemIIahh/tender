@@ -1273,8 +1273,8 @@ test("intake_rejects_heldout_checks_already_used", async () => {
 
 test("intake_counts_only_the_posters_own_earlier_use", async () => {
   // A commitment is public once its task is posted, so a stranger can post a task with it first
-  // and take a lower id (P05-R7). The checks under it are not the stranger's upload, so that task
-  // is never judged and never publishes them: it does not use them up.
+  // and take a lower id (P05-R7). Only someone who holds the bytes already can have a copy
+  // judged, so that task must not use the poster's checks up.
   const criteriaHash = await putCriteria(db, EXACT);
   const commitment = await putHeldout(db, EXACT_HELDOUT);
   const posted: [string, string][] = [
