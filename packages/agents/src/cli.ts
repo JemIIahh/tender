@@ -416,10 +416,49 @@ export async function checkAgentKey(
   }
 }
 
+// ---- The registration -------------------------------------------------------------------------
+
+/** What the registration check needs of the chain: one read. */
+export type RegistrationReader = Pick<TenderClient, "getAgent">;
+
+/**
+ * The line to warn with when `account` is not an active registered agent, or null when it is (or
+ * when the chain does not answer within `deadlineMs`: the agent is not held back for a read). The
+ * contract takes an entry to an open task only from an active agent that holds the bond (contract
+ * Task 16b, `E_NOT_REGISTERED`), so an agent that is not one is refused at every open task it
+ * tries. It is a warning and not a stop because a task pinned to the agent takes it without: the
+ * agent starts all the same. A function-call key cannot register (it attaches no deposit), so the
+ * line names the way: `pnpm agent:register`, with the account's full-access key.
+ */
+export async function registrationWarning(
+  chain: RegistrationReader,
+  account: string,
+  deadlineMs = KEY_CHECK_DEADLINE_MS,
+): Promise<string | null> {
+  let agent: Awaited<ReturnType<RegistrationReader["getAgent"]>>;
+  try {
+    agent = await withinDeadline(deadlineMs, chain.getAgent(account));
+  } catch {
+    return null;
+  }
+  if (agent?.status === "active") return null;
+  const standing =
+    agent === null
+      ? "is not registered as an agent"
+      : agent.status === "unregistering"
+        ? "is unregistering"
+        : "has retired";
+  return (
+    `WARN run-agent: ${account} ${standing}, so the contract refuses it at every open task ` +
+    "(E_NOT_REGISTERED); a task pinned to it is not affected. Registering takes a bond and a " +
+    "full-access key, which this agent's key is not: run pnpm agent:register for the account."
+  );
+}
+
 // ---- The run ----------------------------------------------------------------------------------
 
 /** The client the agent signs with, and the chain read that checks its key. */
-export type CliClient = AgentChain & KeyReader;
+export type CliClient = AgentChain & KeyReader & RegistrationReader;
 
 /**
  * The Tender API client of a run: `ApiClient`, acting as the agent's account with its key. The bin
@@ -630,6 +669,8 @@ export async function main(args: readonly string[], options: CliOptions): Promis
     if (config.network !== "sandbox") {
       await checkAgentKey(client, config, options.keyCheckMs);
     }
+    const notice = await registrationWarning(client, config.signer.accountId, options.keyCheckMs);
+    if (notice !== null) out(notice);
     const api = options.createApi(config);
     const solver = makeSolver(config, options.seedsDir ?? join(REPO_ROOT, "seeds"), out);
     const state = createStateStore(

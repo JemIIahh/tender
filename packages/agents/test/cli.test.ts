@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ApiClient, ApiTimeoutError, KeyPair } from "@tender/client";
-import { ApiError, SIGN_IN_MESSAGE, type TenderApi } from "@tender/shared";
+import { type AgentView, ApiError, SIGN_IN_MESSAGE, type TenderApi } from "@tender/shared";
 import { afterEach, expect, test, vi } from "vitest";
 import { AGENT_NAMES, AGENTS, agentVariables } from "../src/agents";
 import {
@@ -23,6 +23,7 @@ import {
   type RunConfig,
   readEnv,
   readRunConfig,
+  registrationWarning,
 } from "../src/cli";
 import type { RunAgentOptions } from "../src/runner";
 import { FAKE_TOKEN, type FakeApi, REFUSAL_TEXT, startFakeApi } from "./fake-api";
@@ -101,17 +102,44 @@ async function dirWith(files: Record<string, string> = {}): Promise<string> {
   return dir;
 }
 
+/** The agent as the chain shows it: active, with a bond. */
+function agentView(over: Partial<AgentView> = {}): AgentView {
+  return {
+    account: ACCOUNT,
+    asp: null,
+    profile_uri: "tender://agent/analyst",
+    profile_hash: "ab".repeat(32),
+    tags: [],
+    registered_at: "1793745950569746000",
+    entries: 0,
+    reveals: 0,
+    wins: 0,
+    earned: [],
+    picks_made: 0,
+    voids_after_reveals: 0,
+    status: "active",
+    bond_token: "usdc.testnet",
+    bond_amount: "1000000",
+    claimable_at: null,
+    ...over,
+  };
+}
+
 /**
- * A client whose one working part is the read of a key's permission. Whatever else the command
+ * A client whose working parts are the read of a key's permission and the read of the agent. Whatever else the command
  * asks of it fails the test: checking a key must never commit, reveal or read an entry.
  */
-function fakeClient(viewAccessKey: CliClient["viewAccessKey"]): CliClient {
+function fakeClient(
+  viewAccessKey: CliClient["viewAccessKey"],
+  getAgent: CliClient["getAgent"],
+): CliClient {
   const unexpected = (what: string) => () => {
     throw new Error(`the agent's client was asked to ${what}`);
   };
   return {
     accountId: ACCOUNT,
     viewAccessKey,
+    getAgent,
     commit: unexpected("commit"),
     reveal: unexpected("reveal"),
     storageBalanceOf: unexpected("read a storage balance"),
@@ -126,6 +154,8 @@ interface Setup {
   files?: Record<string, string>;
   /** What the chain says of the key. Default: a function-call key limited to Tender. */
   key?: () => Promise<Found>;
+  /** What the chain says of the agent's registration. Default: an active agent. */
+  agent?: () => Promise<AgentView | null>;
   /** What the agent's loop does. Default: nothing, and it ends. */
   loop?: (options: RunAgentOptions) => Promise<void>;
   /** The Tender API client. Default: an empty stand-in. */
@@ -157,7 +187,11 @@ async function start(args: string[], setup: Setup = {}) {
       ? ({ permission: functionCall() } as unknown as Found)
       : setup.key();
   });
-  const client = fakeClient(viewAccessKey);
+  const getAgent = vi.fn(async (_account: string): Promise<AgentView | null> => {
+    calls.push("getAgent");
+    return setup.agent === undefined ? agentView() : setup.agent();
+  });
+  const client = fakeClient(viewAccessKey, getAgent);
   const makeClient = vi.fn((_config: RunConfig) => {
     calls.push("makeClient");
     return client;
@@ -194,7 +228,20 @@ async function start(args: string[], setup: Setup = {}) {
   };
   const code = await main(args, options);
   if (assertion !== undefined) throw assertion;
-  return { code, out, err, calls, client, api, home, viewAccessKey, makeClient, createApi, loop };
+  return {
+    code,
+    out,
+    err,
+    calls,
+    client,
+    api,
+    home,
+    viewAccessKey,
+    getAgent,
+    makeClient,
+    createApi,
+    loop,
+  };
 }
 
 /** The one thing `main` printed to stderr, which holds nothing of the environment's values. */
@@ -308,6 +355,59 @@ test("check_agent_key_takes_a_function_call_key_limited_to_tender_whatever_its_m
   }
 });
 
+// ---- The registration -------------------------------------------------------------------------
+
+test("an_agent_that_is_not_active_is_warned_about_and_still_starts", async () => {
+  const states: Array<[string, () => Promise<AgentView | null>, RegExp]> = [
+    ["not registered", async () => null, /is not registered as an agent/],
+    [
+      "unregistering",
+      async () => agentView({ status: "unregistering", claimable_at: "1793745956336648000" }),
+      /is unregistering/,
+    ],
+    [
+      "retired",
+      async () => agentView({ status: "retired", bond_token: null, bond_amount: null }),
+      /has retired/,
+    ],
+  ];
+  for (const [name, agent, standing] of states) {
+    const result = await start(ARGS, { agent });
+
+    // It starts: a task pinned to the agent takes it without a registration.
+    expect(result.code, name).toBe(0);
+    expect(result.err, name).toEqual([]);
+    expect(result.calls, name).toContain("run");
+    expect(result.out, name).toHaveLength(1);
+    const [line] = result.out;
+    expect(line, name).toMatch(/^WARN run-agent: analyst\.tender\.testnet /);
+    expect(line, name).toMatch(standing);
+    expect(line, name).toContain("E_NOT_REGISTERED");
+    expect(line, name).toContain("pnpm agent:register");
+  }
+});
+
+test("an_active_agent_gets_no_registration_warning_and_a_chain_that_does_not_answer_none_either", async () => {
+  const active = await start(ARGS);
+  expect(active.out).toEqual([]);
+
+  // The read fails: the agent is not held back, and no one is told that it is unregistered.
+  const failing = await start(ARGS, {
+    agent: async () => {
+      throw new Error("rpc down");
+    },
+  });
+  expect(failing.code).toBe(0);
+  expect(failing.out).toEqual([]);
+
+  const slow = await registrationWarning(
+    { getAgent: () => new Promise(() => undefined) },
+    ACCOUNT,
+    20,
+  );
+  expect(slow).toBeNull();
+});
+
 // ---- Starting ---------------------------------------------------------------------------------
 
 test("run_agent_starts_with_a_function_call_key_limited_to_tender", async () => {
@@ -331,7 +431,14 @@ test("run_agent_starts_with_a_function_call_key_limited_to_tender", async () => 
   expect(result.out).toEqual(["a line from the agent"]);
   // In this order: the client is made, the key is checked, only then is there an API client, which
   // signs in once, and the loop starts.
-  expect(result.calls).toEqual(["makeClient", "viewAccessKey", "createApi", "signIn", "run"]);
+  expect(result.calls).toEqual([
+    "makeClient",
+    "viewAccessKey",
+    "getAgent",
+    "createApi",
+    "signIn",
+    "run",
+  ]);
 
   const options = result.loop.mock.calls[0]?.[0];
   expect(options?.client).toBe(result.client);
@@ -395,7 +502,7 @@ test("the_sandbox_is_not_asked_what_the_key_may_do", async () => {
 
   expect(result.code).toBe(0);
   expect(result.viewAccessKey).not.toHaveBeenCalled();
-  expect(result.calls).toEqual(["makeClient", "createApi", "signIn", "run"]);
+  expect(result.calls).toEqual(["makeClient", "getAgent", "createApi", "signIn", "run"]);
   expect(result.makeClient.mock.calls[0]?.[0]).toMatchObject({
     network: "sandbox",
     rpcUrl: "http://127.0.0.1:3030",
@@ -885,7 +992,7 @@ test("an_api_client_that_cannot_be_made_stops_the_agent_after_its_key_is_checked
     "run-agent: TENDER_API_URL: the API base URL must not carry a query",
   ]);
   // The key was checked first, and the loop never started.
-  expect(result.calls).toEqual(["makeClient", "viewAccessKey", "createApi"]);
+  expect(result.calls).toEqual(["makeClient", "viewAccessKey", "getAgent", "createApi"]);
 });
 
 // ---- The Tender API client --------------------------------------------------------------------
@@ -940,7 +1047,7 @@ test("what_the_api_client_refuses_in_a_base_is_said_in_its_own_words_and_quotes_
     expect(said(result), what).toContain(sentence);
     expect(said(result), what).not.toMatch(/SECRET|user:|tender\.example/);
     // It stops the agent where the API client is made: after the key check, before the loop.
-    expect(result.calls, what).toEqual(["makeClient", "viewAccessKey", "createApi"]);
+    expect(result.calls, what).toEqual(["makeClient", "viewAccessKey", "getAgent", "createApi"]);
     expect(result.out, what).toEqual([]);
   }
 });
@@ -1090,7 +1197,13 @@ test("a_sign_in_that_fails_as_the_agent_starts_is_one_warning_and_the_agent_star
       expect(result.code, what).toBe(0);
       expect(result.err, what).toEqual([]);
       expect(result.out, what).toEqual([`WARN run-agent: sign-in failed at start: ${line}`]);
-      expect(result.calls, what).toEqual(["makeClient", "viewAccessKey", "createApi", "run"]);
+      expect(result.calls, what).toEqual([
+        "makeClient",
+        "viewAccessKey",
+        "getAgent",
+        "createApi",
+        "run",
+      ]);
       if (api !== undefined) expect(seenBy(api), what).toEqual(requests);
       const shown = result.out.join("\n");
       expect(shown, what).not.toContain("127.0.0.1");
