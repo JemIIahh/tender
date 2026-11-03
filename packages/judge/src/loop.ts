@@ -6,6 +6,12 @@ import type { JudgeDeps, JudgeMemory } from "./types";
 
 /** How long `startJudge` waits after a tick before the next one starts, by default. */
 const DEFAULT_INTERVAL_MS = 10_000;
+/**
+ * How long a tick spends on intake before judging, by default (I5). A check of a `json_schema`
+ * task starts a worker (up to 10 s) and compiles in it (2 s), and the tasks to take in are any
+ * poster's, so a burst of them must not hold up the picks that are due.
+ */
+const INTAKE_BUDGET_MS = 5_000;
 const NS_PER_MS = 1_000_000n;
 
 /** The deadlines of an accepted task, as numeric text. */
@@ -19,7 +25,8 @@ interface DeadlineRow {
 
 /**
  * One pass of the Judge over the tasks that name `deps.judgeAccount` as their verifier. First
- * intake (`intakeTask`) for every task with no `judge_status` or a `pending` one, then judging
+ * intake (`intakeTask`) for every task with no `judge_status` or a `pending` one, within a budget
+ * (below), then judging
  * (`judgeTask`) for every `accepted` task the database has no outcome for and whose deadlines put
  * the clock in its judging window: the due tasks. A task accepted by the first pass can be judged
  * in the second. Intake goes in id order. Judging goes earliest stop line first (`stopLineOf`),
@@ -30,9 +37,15 @@ interface DeadlineRow {
  * `waiting: …` reason is cleared from every task that can no longer be judged
  * (`clearStaleWaits`), which a Judge that was not running when the wait ended leaves.
  *
- * It resolves with whether a task's turn ended at its slice, so that the next tick starts at once
- * (`startJudge`), intake first: a task that came due, or was posted, during a turn joins the next
- * pass. What that guarantees is that no task holds the Judge for more than a slice, and the work
+ * Intake has a budget (`ScoringLimits.intakeBudgetMs`, 5 s) so that a burst of new tasks, each
+ * needing a worker, cannot hold up the picks that are due (I5): when it has spent the budget, the
+ * task in hand is finished and the rest wait for the next tick, which starts at once and takes up
+ * with the first task that was not reached (`JudgeMemory.intakeFrom`). Every tick takes in at
+ * least one task. Judging follows intake in the same tick whether or not intake was cut short.
+ *
+ * It resolves with whether a task's turn ended at its slice, or intake was cut short, so that the
+ * next tick starts at once (`startJudge`), intake first: a task that came due, or was posted,
+ * during a turn joins the next pass. What that guarantees is that no task holds the Judge for more than a slice, and the work
  * under way at its end, while it has more than two slices left before its stop line. That work is
  * not always short: a score (5 s), a round of fetches (10 s), a worker's compile of the criteria
  * (the judging budget), or a rubric's request to the model (60 s, and the retry after a failure
@@ -61,14 +74,29 @@ export async function judgeTick(deps: JudgeDeps, signal?: AbortSignal): Promise<
       order by t.id`,
     [deps.judgeAccount],
   );
-  for (const { id } of waiting) {
+  // Intake starts where the last tick's budget ran out, and comes round to the tasks before it.
+  const from = deps.memory?.intakeFrom ?? null;
+  const first = from === null ? 0 : waiting.findIndex(({ id }) => BigInt(id) >= BigInt(from));
+  const queue = first <= 0 ? waiting : [...waiting.slice(first), ...waiting.slice(0, first)];
+  const budgetMs = deps.scoringLimits?.intakeBudgetMs ?? INTAKE_BUDGET_MS;
+  let intakeStart: number | undefined;
+  let gaveWay = false;
+  for (const [i, { id }] of queue.entries()) {
     if (signal?.aborted) return false;
+    const now = clock().getTime();
+    intakeStart ??= now;
+    if (i > 0 && now - intakeStart >= budgetMs) {
+      if (deps.memory !== undefined) deps.memory.intakeFrom = id;
+      gaveWay = true;
+      break;
+    }
     try {
       await intakeTask(deps, BigInt(id));
     } catch (error) {
       console.error(`judge: intake of task ${id} failed (${describeError(error)})`);
     }
   }
+  if (!gaveWay && deps.memory !== undefined) deps.memory.intakeFrom = null;
 
   const nowNs = BigInt(clock().getTime()) * NS_PER_MS;
   const accepted = await deps.db.query<DeadlineRow>(
@@ -85,7 +113,6 @@ export async function judgeTick(deps: JudgeDeps, signal?: AbortSignal): Promise<
     .filter((row) => phaseAt({ ...row, settled: false }, nowNs) === "judging")
     .map((row) => ({ row, stopLine: stopLineOf(row), id: BigInt(row.id) }))
     .sort((a, b) => compare(a.stopLine, b.stopLine) || compare(a.id, b.id));
-  let gaveWay = false;
   for (const { row, id } of due) {
     if (signal?.aborted) return gaveWay;
     try {
@@ -110,7 +137,7 @@ function compare(a: bigint, b: bigint): number {
 
 /** A memory with nothing in it yet. */
 export function newJudgeMemory(): JudgeMemory {
-  return { checks: new Map(), progress: new Map() };
+  return { checks: new Map(), progress: new Map(), overruns: new Map(), intakeFrom: null };
 }
 
 /**

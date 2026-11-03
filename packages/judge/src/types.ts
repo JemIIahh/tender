@@ -83,6 +83,13 @@ export interface ScoringLimits {
    * needs a `JudgeMemory`: without one, a task is judged in one go.
    */
   sliceMs?: number;
+  /**
+   * How long one tick spends on intake before it moves on to judging: 5 s by default (I5). Intake
+   * of a `json_schema` task starts a worker, so a burst of new tasks would otherwise hold up every
+   * pick that is due. The task in hand is finished, each tick does at least one, and the next tick
+   * starts at once and takes up with the task after it.
+   */
+  intakeBudgetMs?: number;
 }
 
 /**
@@ -103,6 +110,17 @@ export interface JudgeMemory {
    * window.
    */
   progress: Map<string, TaskProgress>;
+  /**
+   * How many times the criteria check of each task has run out of time at intake, by task id (M1).
+   * The task stays `pending` while it is tried again, and the count goes once it is decided.
+   */
+  overruns: Map<string, number>;
+  /**
+   * The id of the first task that the last tick's intake did not get to, when its budget ran out
+   * (I5): the next tick starts with it, so that a task that is slow every time cannot keep the
+   * ones behind it from being looked at. `null` when intake got through every task.
+   */
+  intakeFrom: string | null;
 }
 
 /** What judging one task has found out of its entries so far: never their bytes. */
