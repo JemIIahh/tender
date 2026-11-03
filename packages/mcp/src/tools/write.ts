@@ -27,6 +27,7 @@ import {
   U128StringSchema,
 } from "@tender/shared";
 import { z } from "zod";
+import { keyMayCall } from "../keys";
 import { documentText, secretCheck } from "../secrets";
 import type { McpDeps, OpenFileLookup } from "../server";
 import { type Draft, isDraftOf } from "../state";
@@ -62,6 +63,13 @@ import {
 //
 // MONEY. `deposit`, `withdraw` and `post_task` attach a deposit, which only a full-access key may.
 // With any other key they answer `NEEDS_FULL_ACCESS_KEY` before they upload or send anything.
+//
+// KEYS. The other tools that send a transaction attach no deposit, and a function-call key may make
+// that call if it lists the method (one that lists none may call any). Each checks that the key can
+// call its method (`keyMayCall`) before it saves, uploads or sends anything, and answers
+// `KEY_CANNOT_CALL` if not, naming the key it needs. The chain refuses such a call too, but only
+// after the scorecard, the profile or the work has gone up. A call with nothing to send (a commit
+// that is on chain already, a reveal that is done) needs no key.
 //
 // FILES. `commit_result` takes its work as text or as a file, and `reveal_result` later publishes
 // it, so a file path is a way to publish whatever the server can read. The server therefore reads
@@ -360,6 +368,25 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
   }
 
   /**
+   * Refuses the call of `method` that `tool` is about to make if this server's key cannot make it,
+   * before anything is saved, uploaded or sent (`keyMayCall`). The answer says which key would do,
+   * and what this one is.
+   */
+  function requireKeyFor(tool: string, method: string): void {
+    if (keyMayCall(deps.keyKind, deps.keyMethods, method)) return;
+    const own =
+      deps.keyKind === "function_call"
+        ? `a function-call key that lists ${(deps.keyMethods ?? []).join(", ")}`
+        : `not a key of ${accountId} that can call ${contractId} (balance shows key_kind "${deps.keyKind}")`;
+    throw new ToolError(
+      "KEY_CANNOT_CALL",
+      `${tool} needs a key that may call ${method} on ${contractId}: a full-access key, or a ` +
+        `function-call key to ${contractId} that lists ${method}. This server's key is ${own}. ` +
+        "Nothing was saved, uploaded or sent. Restart the server with such a key (docs/MCP.md).",
+    );
+  }
+
+  /**
    * Whether `bytes` hold any secret of the server, which a reveal would make public: as it is or in
    * a disguise (best effort; see `secretCheck`).
    */
@@ -619,6 +646,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
 
   /** A first commit for a task: the task's limit, the storage, then the draft, then the commit. */
   async function commitNew(taskId: string, bytes: Uint8Array): Promise<CallToolResult> {
+    requireKeyFor("commit_result", "commit");
     // The task comes before anything is made or spent: work that its task will not take can be
     // committed and never revealed, a task that is not there leaves a draft that blocks its id, and
     // the storage top-up below would be paid for nothing.
@@ -674,9 +702,10 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           .join(" "),
       );
     }
-    // The commit is about to be sent again, for work that the draft holds and this call has not
-    // seen. If that work holds a secret, the entry would be one that only a reveal that publishes
-    // the secret can use.
+    // The commit is about to be sent again, which needs a key that may send it.
+    requireKeyFor("commit_result", "commit");
+    // It is for work that the draft holds and this call has not seen. If that work holds a secret,
+    // the entry would be one that only a reveal that publishes the secret can use.
     if (holdsSecret(workOf(draft))) {
       throw new ToolError(
         "SECRET_IN_CONTENT",
@@ -727,7 +756,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "whether the commit landed and finishes it with the same salt, and sends nothing if it " +
         "is done. Once committed, an answer cannot be " +
         "changed through this server: a task takes one result here, and a call with other content " +
-        "is refused with ALREADY_COMMITTED. A key that cannot attach a deposit refuses with " +
+        "is refused with ALREADY_COMMITTED. Needs a key that may call commit (a full-access key, " +
+        "or a function-call key that lists it): another is refused with KEY_CANNOT_CALL before " +
+        "anything is saved. A key that cannot attach a deposit refuses with " +
         "STORAGE_LOW when your storage in the contract is low; a full-access key tops it up " +
         "first. The draft lives in this server's state directory: two servers on one account's " +
         "state directory are not supported.",
@@ -857,6 +888,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       await markCommitted(draft);
     }
 
+    // The work is about to go up and the reveal out, which needs a key that may send it.
+    requireKeyFor("reveal_result", "reveal");
+
     // What goes up must be what was committed. A draft file that was changed on disk would reveal
     // a hash with other bytes behind it, which scores nothing and gives the work away.
     const bytes = workOf(draft);
@@ -946,7 +980,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "as at commit), and then nothing is uploaded or sent. If a call fails " +
         "part way, call it again: the upload is repeatable, and a reveal that already went " +
         "through is recognised, even after the reveal deadline. Needs a draft from commit_result " +
-        "on this machine (NO_DRAFT otherwise). The draft lives in this server's state directory: " +
+        "on this machine (NO_DRAFT otherwise), and a key that may call reveal (a full-access key, " +
+        "or a function-call key that lists it): another is refused with KEY_CANNOT_CALL before " +
+        "anything is uploaded. The draft lives in this server's state directory: " +
         "two servers on one account's state directory are not supported.",
       inputSchema: { task_id: TaskId },
       annotations: IDEMPOTENT,
@@ -1194,7 +1230,10 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "points of the reward after the fee. A non-empty list must add up to exactly 10000, name " +
         "each account once, name no more accounts than the task pays (max_winners) and only " +
         "accounts that revealed an entry; INVALID_WINNERS otherwise, before anything is " +
-        "published. An empty list awards nothing. Final: a pick cannot be changed.",
+        "published. An empty list awards nothing. Needs a key that may call pick: a full-access " +
+        "key, or a function-call key that lists pick, which the usual agent key (commit and " +
+        "reveal) does not; another is refused with KEY_CANNOT_CALL before anything is " +
+        "published. Final: a pick cannot be changed.",
       inputSchema: {
         task_id: TaskId,
         winners: z
@@ -1211,6 +1250,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       annotations: SPENDS,
     },
     guarded(secrets, async ({ task_id, winners, scorecard }) => {
+      requireKeyFor("pick_winners", "pick");
       const card = ScorecardSchema.safeParse(scorecard);
       if (!card.success) throw new ToolError("INVALID_SCORECARD", issuesOf(card.error));
       if (card.data.task_id !== task_id) {
@@ -1397,7 +1437,10 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "commit_result). Tender charges the profile to your storage deposit, so a full-access " +
         "key adds the NEAR for it from your account first when you have too little (the " +
         "answer's note says how much); any other key cannot attach a deposit, and the tool stops " +
-        "with STORAGE_LOW, saying who must. Safe to repeat; the last profile stands.",
+        "with STORAGE_LOW, saying who must. Needs a key that may call register_agent: a " +
+        "full-access key, or a function-call key that lists it, which the usual agent key " +
+        "(commit and reveal) does not; another is refused with KEY_CANNOT_CALL before anything " +
+        "is uploaded. Safe to repeat; the last profile stands.",
       inputSchema: {
         name: ProfileSchema.shape.name.describe("Your agent's name, 1 to 64 characters"),
         description: ProfileSchema.shape.description.describe(
@@ -1411,6 +1454,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       annotations: IDEMPOTENT,
     },
     guarded(secrets, async ({ name, description, tags, homepage }) => {
+      requireKeyFor("register_agent", "register_agent");
       // The profile is looked at for the server's secrets before the top-up below, which pays.
       const profileBytes = bytesToPublish("profile", "register_agent", {
         name,

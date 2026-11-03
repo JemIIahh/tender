@@ -2272,12 +2272,14 @@ test("fc_key_commit_with_low_storage_refuses", async () => {
   expect(chain.storageDeposit).not.toHaveBeenCalled();
   expect(await state.getDraft("7")).toBeNull();
 
-  // The same for a key the server could not classify.
+  // A key the server could not classify may call nothing on Tender, so it is refused before the
+  // storage is even looked at.
   const unknown = await connectWrite({ keyKind: "unknown" });
   unknown.chain.storageBalanceOf.mockResolvedValue(null);
   expect((await unknown.call("commit_result", { task_id: "7", content: "a" })).text).toMatch(
-    /^STORAGE_LOW: /,
+    /^KEY_CANNOT_CALL: /,
   );
+  expect(unknown.chain.storageBalanceOf).not.toHaveBeenCalled();
   expect(unknown.chain.commit).not.toHaveBeenCalled();
 });
 
@@ -3213,6 +3215,181 @@ test("fc_key_spend_tools_explain_and_skip_tx", async () => {
   expect((await call("start_task", { task_id: "7" })).isError).toBe(false);
 });
 
+// ---- What the key may call --------------------------------------------------------------------
+
+/** The key that scripts/keeper-key.ts adds to an agent: limited to Tender, for commit and reveal. */
+const AGENT_KEY: Partial<McpDeps> = { keyKind: "function_call", keyMethods: ["commit", "reveal"] };
+const PICKED_BY_ACCOUNT = [{ account: ACCOUNT, bps: 10_000 }];
+
+test("the_agent_key_is_refused_pick_and_register_before_anything_is_uploaded", async () => {
+  // The chain refuses pick and register_agent for a key that lists commit and reveal, but only
+  // after the scorecard or the profile has gone up, and both are public. So the tools refuse
+  // first, say which key they need, and touch nothing: no upload, no look at the API or at the
+  // storage, no transaction.
+  const { call, chain, api } = await connectWrite(AGENT_KEY);
+  api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+
+  const picked = await call("pick_winners", {
+    task_id: "7",
+    winners: PICKED_BY_ACCOUNT,
+    scorecard: SCORECARD,
+  });
+  expect(picked).toEqual({
+    isError: true,
+    text:
+      "KEY_CANNOT_CALL: pick_winners needs a key that may call pick on tender.testnet: a " +
+      "full-access key, or a function-call key to tender.testnet that lists pick. This " +
+      "server's key is a function-call key that lists commit, reveal. Nothing was saved, " +
+      "uploaded or sent. Restart the server with such a key (docs/MCP.md).",
+  });
+  const registered = await call("register_agent", PROFILE);
+  expect(registered.isError).toBe(true);
+  expect(registered.text).toMatch(
+    /^KEY_CANNOT_CALL: register_agent needs a key that may call register_agent on tender\.testnet: a full-access key, or a function-call key to tender\.testnet that lists register_agent\. /,
+  );
+  for (const mock of [...Object.values(chain), ...Object.values(api)]) {
+    expect(mock).not.toHaveBeenCalled();
+  }
+
+  // What the key does list works.
+  const commit = await call("commit_result", { task_id: "7", content: "a" });
+  expect(commit.isError, commit.text).toBe(false);
+  const reveal = await call("reveal_result", { task_id: "7" });
+  expect(reveal.isError, reveal.text).toBe(false);
+  expect(chain.commit).toHaveBeenCalledTimes(1);
+  expect(chain.reveal).toHaveBeenCalledTimes(1);
+});
+
+test("a_key_must_list_the_method_that_a_tool_calls", async () => {
+  // commit_result needs commit: a key that lists reveal only is refused before a draft is made, the
+  // storage is asked about, or anything is sent.
+  const reveals = await connectWrite({ keyKind: "function_call", keyMethods: ["reveal"] });
+  const commit = await reveals.call("commit_result", { task_id: "7", content: "a" });
+  expect(commit.isError).toBe(true);
+  expect(commit.text).toMatch(/^KEY_CANNOT_CALL: commit_result needs a key that may call commit /);
+  expect(commit.text).toContain("This server's key is a function-call key that lists reveal.");
+  expect(await state.getDraft("7")).toBeNull();
+  expect(reveals.chain.storageBalanceOf).not.toHaveBeenCalled();
+  expect(reveals.chain.commit).not.toHaveBeenCalled();
+
+  // reveal_result needs reveal: a key that lists commit only commits, and is refused at the reveal
+  // before the work goes up. The draft is as the commit left it, and a better key can reveal it.
+  const commits = await connectWrite({ keyKind: "function_call", keyMethods: ["commit"] });
+  await commits.callJson("commit_result", { task_id: "8", content: "b" });
+  const reveal = await commits.call("reveal_result", { task_id: "8" });
+  expect(reveal.isError).toBe(true);
+  expect(reveal.text).toMatch(/^KEY_CANNOT_CALL: reveal_result needs a key that may call reveal /);
+  expect(commits.api.uploadBlob).not.toHaveBeenCalled();
+  expect(commits.chain.reveal).not.toHaveBeenCalled();
+  expect((await draftOf("8")).revealedUri).toBeUndefined();
+  const better = await connectWrite({ keyKind: "full_access" });
+  expect((await better.call("reveal_result", { task_id: "8" })).isError).toBe(false);
+
+  // A key that lists the method of a tool can call it.
+  const picks = await connectWrite({ keyKind: "function_call", keyMethods: ["pick"] });
+  picks.api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+  await picks.callJson("pick_winners", {
+    task_id: "7",
+    winners: PICKED_BY_ACCOUNT,
+    scorecard: SCORECARD,
+  });
+  expect(picks.chain.pick).toHaveBeenCalledTimes(1);
+  const registers = await connectWrite({
+    keyKind: "function_call",
+    keyMethods: ["register_agent"],
+  });
+  await registers.callJson("register_agent", PROFILE);
+  expect(registers.chain.registerAgent).toHaveBeenCalledTimes(1);
+
+  // A function-call key that lists none may call any, as on the chain, and a full-access key may
+  // call every one.
+  const anyKey: Array<Partial<McpDeps>> = [
+    { keyKind: "function_call", keyMethods: [] },
+    { keyKind: "function_call" },
+    { keyKind: "full_access" },
+  ];
+  for (const overrides of anyKey) {
+    const kit = await connectWrite(overrides);
+    kit.api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+    const args = { task_id: "7", winners: PICKED_BY_ACCOUNT, scorecard: SCORECARD };
+    expect((await kit.call("pick_winners", args)).isError, JSON.stringify(overrides)).toBe(false);
+    expect((await kit.call("register_agent", PROFILE)).isError, JSON.stringify(overrides)).toBe(
+      false,
+    );
+  }
+});
+
+test("a_key_the_server_could_not_classify_may_call_nothing", async () => {
+  const { call, chain, api } = await connectWrite({ keyKind: "unknown" });
+  api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+  const attempts: Array<[string, Record<string, unknown>]> = [
+    ["commit_result", { task_id: "7", content: "a" }],
+    ["reveal_result", { task_id: "8" }],
+    ["pick_winners", { task_id: "7", winners: PICKED_BY_ACCOUNT, scorecard: SCORECARD }],
+    ["register_agent", PROFILE],
+  ];
+  // A draft to reveal, for a task of its own: the commit above makes none.
+  await state.saveDraft(makeDraft("8", { committedAt: "2026-11-04T09:30:00.000Z" }));
+  for (const [name, args] of attempts) {
+    const answer = await call(name, args);
+    expect(answer.isError, name).toBe(true);
+    expect(answer.text, name).toMatch(
+      new RegExp(`^KEY_CANNOT_CALL: ${name} needs a key that may call `),
+    );
+    // It says what is wrong with the key, and where to see it.
+    expect(answer.text, name).toContain(
+      `This server's key is not a key of ${ACCOUNT} that can call tender.testnet (balance shows key_kind "unknown").`,
+    );
+  }
+  for (const mock of [...Object.values(chain), ...Object.values(api)]) {
+    expect(mock).not.toHaveBeenCalled();
+  }
+});
+
+test("a_call_with_nothing_to_send_needs_no_key", async () => {
+  // The key is looked at when something is about to be saved, uploaded or sent. A commit that the
+  // draft or the chain says is done, and a reveal that is done, send nothing, so any key may ask.
+  const committed = makeDraft("7", { committedAt: "2026-11-04T09:30:00.000Z" });
+  const landed = makeDraft("8");
+  const revealed = makeDraft("9", {
+    committedAt: "2026-11-04T09:30:00.000Z",
+    revealedUri: `${BLOBS}/done`,
+  });
+  await Promise.all([committed, landed, revealed].map((draft) => state.saveDraft(draft)));
+  const { callJson, chain, api } = await connectWrite({ keyKind: "unknown" });
+  chain.getEntry.mockResolvedValue(entryView(landed.commitment));
+
+  expect(
+    await callJson("commit_result", { task_id: "7", content: "answer for task 7" }),
+  ).toMatchObject({ tx_hash: null, note: expect.stringContaining("already committed") });
+  expect(
+    await callJson("commit_result", { task_id: "8", content: "answer for task 8" }),
+  ).toMatchObject({ tx_hash: null, note: expect.stringContaining("on chain already") });
+  expect(await callJson("reveal_result", { task_id: "9" })).toMatchObject({
+    uri: `${BLOBS}/done`,
+    tx_hash: null,
+  });
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(chain.reveal).not.toHaveBeenCalled();
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+});
+
+test("the_tools_describe_the_keys_they_need", async () => {
+  const { mcp } = await connect();
+  const { tools } = await mcp.listTools();
+  const describe = (name: string) => tools.find((tool) => tool.name === name)?.description ?? "";
+
+  // balance says what the keys are: the agent key lists commit and reveal, and no more.
+  expect(describe("balance")).toMatch(/lists commit and reveal/);
+  expect(describe("balance")).toMatch(
+    /pick_winners and register_agent refuse with KEY_CANNOT_CALL/,
+  );
+  expect(describe("balance")).not.toMatch(/pick and register/);
+  for (const name of ["commit_result", "reveal_result", "pick_winners", "register_agent"]) {
+    expect(describe(name), name).toContain("KEY_CANNOT_CALL");
+  }
+});
+
 test("pick_winners_uploads_the_scorecard_then_picks", async () => {
   const { callJson, chain, api } = await connectWrite({ keyKind: "function_call" });
   api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
@@ -3647,23 +3824,19 @@ test("register_agent_registers_storage_first", async () => {
 test("register_agent_with_a_key_that_cannot_pay_says_who_must", async () => {
   // A function-call key may register (it attaches no deposit) but cannot top its storage up, so the
   // tool says whom to ask, as a commit does, in words that fit what it was doing.
-  for (const keyKind of ["function_call", "unknown"] as const) {
-    const { call, chain, api } = await connectWrite({ keyKind });
-    chain.storageBalanceOf.mockResolvedValue(null);
+  const { call, chain, api } = await connectWrite({ keyKind: "function_call" });
+  chain.storageBalanceOf.mockResolvedValue(null);
 
-    const answer = await call("register_agent", PROFILE);
+  const answer = await call("register_agent", PROFILE);
 
-    expect(answer.isError, keyKind).toBe(true);
-    expect(answer.text, keyKind).toMatch(/^STORAGE_LOW: /);
-    expect(answer.text, keyKind).toContain(
-      `storage_deposit on the contract with account_id ${ACCOUNT}`,
-    );
-    expect(answer.text, keyKind).toMatch(/more to register a profile\./);
-    expect(answer.text, keyKind).not.toMatch(/commit and reveal/);
-    expect(chain.storageDeposit).not.toHaveBeenCalled();
-    expect(api.uploadBlob).not.toHaveBeenCalled();
-    expect(chain.registerAgent).not.toHaveBeenCalled();
-  }
+  expect(answer.isError).toBe(true);
+  expect(answer.text).toMatch(/^STORAGE_LOW: /);
+  expect(answer.text).toContain(`storage_deposit on the contract with account_id ${ACCOUNT}`);
+  expect(answer.text).toMatch(/more to register a profile\./);
+  expect(answer.text).not.toMatch(/commit and reveal/);
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+  expect(chain.registerAgent).not.toHaveBeenCalled();
 
   // With enough storage the same key registers.
   const roomy = await connectWrite({ keyKind: "function_call" });
