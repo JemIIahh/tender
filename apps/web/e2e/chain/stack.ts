@@ -486,19 +486,24 @@ function mintCall(chain: LocalChain, accountId: string, amount: bigint): TenderC
 /**
  * The account the dev wallet signs as. Every account of a local chain is set up with Tender already
  * (it has a storage balance), so a spec of the wallet's "Set up account" needs one that is not: a
- * new account under the poster's, with NEAR for its storage and gas, registered with the token and
- * given some of it, and nothing at Tender. Its key is returned to go into the web server's
- * environment, and is kept nowhere else.
+ * new account under bob's, with NEAR for its storage and gas, registered with the token and given
+ * some of it, and nothing at Tender. Its key is returned to go into the web server's environment,
+ * and is kept nowhere else.
+ *
+ * Bob is the parent because no spec signs as him and he is not the team's. The API labels an
+ * account as the team's when its provider (its parent, by the registry's `asp_of` rule) is one of
+ * `TEAM_ACCOUNTS`, so an account under the poster would carry the team's label, and the dev
+ * wallet's posts must not.
  */
 async function createDevAccount(chain: LocalChain): Promise<Signer> {
-  const { poster } = chain.accounts;
+  const { bob } = chain.accounts;
   const parent = new Account(
-    poster.accountId,
+    bob.accountId,
     new JsonRpcProvider({ url: chain.rpcUrl }),
-    poster.privateKey as KeyPairString,
+    bob.privateKey as KeyPairString,
   );
   const key = KeyPair.fromRandom("ed25519");
-  const dev: Signer = { accountId: `dev.${poster.accountId}`, privateKey: key.toString() };
+  const dev: Signer = { accountId: `dev.${bob.accountId}`, privateKey: key.toString() };
   toTxResult(
     await parent.signAndSendTransaction({
       receiverId: dev.accountId,
