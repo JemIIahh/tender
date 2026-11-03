@@ -57,12 +57,15 @@ import { seed } from "./seed";
  * - The poster posts a **parent** task: a three-part research pack for 10 tUSDC, judged by the
  *   Judge on held-out checks of the whole document.
  * - The lead takes the parent on only because it should: the poster is the one it works for, the
- *   Judge verifies it, it pays in the token of the lead's key, and its 9.50 tUSDC after the fee is
- *   more than the 6.00 tUSDC the sub-tasks cost (a parent that fails one of these is declined, with
- *   nothing committed or spent). It then enters the parent with a placeholder (a sub-task can name a
- *   parent only if its poster has an entry on it), posts three **sub-tasks** under it with the delegate key (2 tUSDC each, one
- *   for each part), and waits for them. A fourth hire is tried, to show the cap: the contract refuses
- *   it with `E_AUTH`.
+ *   Judge verifies it, it pays in the token of the lead's key, its 9.50 tUSDC after the fee is more
+ *   than the 6.00 tUSDC the sub-tasks cost, the key's remaining cap and the lead's vault cover that
+ *   6.00, and the parent's commit window leaves time for every hire and for the sub-tasks to settle
+ *   (a parent that fails one of these is declined, with nothing committed or spent). It then enters
+ *   the parent with a placeholder (a sub-task can name a parent only if its poster has an entry on
+ *   it) and returns to the runner at once. The rest is the lead's **job**, which a loop of its own
+ *   drives (`lead.run`), from a journal on disk: it posts three **sub-tasks** under the parent with
+ *   the delegate key (2 tUSDC each, one for each part), and waits for them. A fourth hire is tried,
+ *   to show the cap: the contract refuses it with `E_AUTH`.
  * - Alice and bob enter the sub-tasks. Both enter all three, one with the right answer and one with a
  *   flawed one: alice has parts 1 and 3, bob part 2. The Judge scores them on the held-out checks
  *   and picks the right one in each.
@@ -156,8 +159,12 @@ const FOURTH_WINDOW_SECS = 5;
 
 /** How often the agents look for tasks to enter and reveals that are due. */
 const AGENT_POLL_MS = 500;
-/** How long the lead may spend on the parent: its whole commit window and then some. */
-const LEAD_SOLVE_MS = 600_000;
+/**
+ * How long the lead takes to hire one part, as it plans it: a post is a transaction and two uploads,
+ * which take two or three seconds on this chain. 10 s a part leaves room for a slow machine, and
+ * keeps the third part of the parent's 190 s window inside the lead's plan (60 + 80 + 3 x 10 = 170).
+ */
+const LEAD_HIRE_SECS = 10;
 /** How long a step that starts or posts something may take. */
 const STEP_MS = 90_000;
 /** How long one request to the API may take. */
@@ -193,7 +200,6 @@ function launch(
     state: StateStore;
     tags: readonly string[];
     solver: Solver;
-    solveTimeoutMs?: number;
     stop: AbortSignal;
   },
 ): Promise<void> {
@@ -204,7 +210,6 @@ function launch(
     state: o.state,
     tags: o.tags,
     solver: o.solver,
-    solveTimeoutMs: o.solveTimeoutMs,
     pollMs: AGENT_POLL_MS,
     log: h.log,
     signal: o.stop,
@@ -423,6 +428,24 @@ async function swarm(h: Harness): Promise<void> {
   const leadState = createStateStore(join(dir, "agents", "lead"));
   const leadClient = clientOf(delegate);
   const leadApi = apiOf(delegate);
+  const leadSolver = createLeadSolver({
+    seedsDir: CHILDREN,
+    client: leadClient,
+    api: leadApi,
+    judgeAccount: judge.accountId,
+    // The lead takes on a parent only from the poster, in the token of its key, judged by the
+    // Judge, and only if it pays more after its fee than the sub-tasks cost, the key and the vault
+    // cover them, and the parent's window leaves time for all of it.
+    token,
+    delegateKey: equipped.publicKey,
+    posters: [poster.accountId],
+    journalDir: join(dir, "agents", "lead-jobs"),
+    state: leadState,
+    windows: CHILD_WINDOWS,
+    hireSecs: LEAD_HIRE_SECS,
+    pollMs: 1_000,
+    log: h.log,
+  });
   loops.push(
     launch(h, {
       name: "lead",
@@ -430,24 +453,12 @@ async function swarm(h: Harness): Promise<void> {
       api: leadApi,
       state: leadState,
       tags: [LEAD_TAG],
-      solver: createLeadSolver({
-        seedsDir: CHILDREN,
-        client: leadClient,
-        api: leadApi,
-        judgeAccount: judge.accountId,
-        // The lead takes on a parent only from the poster, in the token of its key, judged by the
-        // Judge, and only if it pays more after its fee than the sub-tasks cost.
-        token,
-        posters: [poster.accountId],
-        state: leadState,
-        windows: CHILD_WINDOWS,
-        pollMs: 1_000,
-        log: h.log,
-        signal: stopAgents.signal,
-      }),
-      solveTimeoutMs: LEAD_SOLVE_MS,
+      solver: leadSolver,
       stop: stopAgents.signal,
     }),
+    // The lead's job (its hires, its waiting, its assembling) is a loop of its own beside the
+    // runner's, so that no timeout of a solve cuts it short and no reveal waits on it.
+    leadSolver.run(stopAgents.signal).catch((error: unknown) => h.fail(error)),
   );
   for (const [name, signer] of [
     ["alice", alice],

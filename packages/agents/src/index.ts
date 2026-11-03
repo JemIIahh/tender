@@ -15,6 +15,7 @@ export {
   LEAD_TAG,
   type LeadApi,
   type LeadChain,
+  type LeadSolver,
   type LeadSolverOptions,
 } from "./agents/lead";
 export {

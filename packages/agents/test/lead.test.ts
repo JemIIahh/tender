@@ -1,19 +1,32 @@
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { TenderError, type TxResult } from "@tender/client";
 import { createStateStore, isDraftOf, type StateStore } from "@tender/mcp";
 import {
   canonicalJson,
   computeCommitment,
+  type EntryView,
   type PostTaskInput,
   type SpendOptions,
   sha256Hex,
   type TaskDetailResponse,
   type TaskOutcome,
+  type TaskView,
+  type TenderApi,
 } from "@tender/shared";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { createLeadSolver, LEAD_TAG, type LeadApi, type LeadChain } from "../src/agents/lead";
+import { createLeadSolver, LEAD_TAG, type LeadChain, type LeadSolver } from "../src/agents/lead";
+import { type AgentChain, type AgentMemory, agentTick } from "../src/runner";
 import type { TaskContext } from "../src/types";
 import {
   BRIEF,
@@ -23,12 +36,15 @@ import {
   picked,
   taskDetailResponse,
   taskSpec,
+  taskSummary,
   voided,
 } from "./helpers";
 
 // The lead agent of the swarm demo, with a stand-in chain and a stand-in API in one small world.
 // The pack is the demo's own (scripts/swarm-research-pack), so the happy path also shows that what
-// the lead assembles from the pack's solutions is the pack's parent solution.
+// the lead assembles from the pack's solutions is the pack's parent solution. The parent is entered
+// the way the runner enters it (`agentTick`, which commits what `solve` returns as the placeholder),
+// and the lead's job is driven a pass (`tick`) at a time, as its host's loop would drive it.
 
 const PACK = join(import.meta.dirname, "../../../scripts/swarm-research-pack");
 const CHILDREN = join(PACK, "children");
@@ -37,12 +53,21 @@ const SLUGS = ["01-gas-ledger", "02-key-audit", "03-event-tally"];
 const LEAD = "lead.test.near";
 const ALICE = "alice.test.near";
 const BOB = "bob.test.near";
+const STRANGER = "stranger.test.near";
+const KEY = "ed25519:Fj4yBuvGfEKKEEqx4DkXtgWUzGPrNwUUU4wP3P8r1AD9";
 /** A token the client's network knows the decimals of (6, so 2.00 is 2_000_000). */
 const TOKEN = "tusdc.test.near";
+const CONTRACT = "tender.test.near";
 const PARENT_ID = 10;
 const NS = 1_000_000_000n;
 /** The chain's clock at the start, in nanoseconds. Moves only when the world moves it. */
 const T0 = 1_700_000_000n * NS;
+/** Room for every entry the runner makes. */
+const STORAGE = {
+  total: "1000000000000000000000000",
+  available: "1000000000000000000000000",
+  used_bytes: "0",
+};
 
 const solutionOf = (slug: string): string =>
   readFileSync(join(CHILDREN, slug, "solution.txt"), "utf8");
@@ -67,10 +92,24 @@ interface WorldOptions {
   contents?: string[];
   /** Children never settle, and each poll moves the clock on by this many seconds. */
   stall?: { secs: number };
-  /** Makes the post of child number `n` (from 0) fail with this error. */
+  /** Makes the post of child number `n` (from 0) fail once with this error; it does not land. */
   failPost?: { n: number; error: Error };
-  /** Makes the commit fail. */
-  failCommit?: Error;
+  /** Child number `n` lands, and the answer to the post is lost: the client times out. */
+  lostPost?: { n: number };
+  /** Makes the Nth commit (from 1) fail once; the default is the first. With no `n`, every one. */
+  failCommit?: { error: Error; n?: number };
+  /** The Nth call of the API's `getTask` for a child throws once; "always" makes every one throw. */
+  failGetTask?: number | "always";
+  /** The Nth call of the API's `getBlob` throws once. */
+  failGetBlob?: number;
+  /** The Nth read of the chain's clock throws once. */
+  failClock?: number;
+  /** Each post takes this long in real time. */
+  postDelayMs?: number;
+  /** The delegate key's caps as `get_delegate` shows them; null for a key that is no delegate. */
+  caps?: { token?: string; per_task_cap?: string; total_cap?: string; spent?: string } | null;
+  /** The lead's vault. Default 6.00, which pays for the pack exactly. */
+  vault?: bigint;
 }
 
 /** A small world: a chain with a clock, an index of tasks, and the events in the order they happen. */
@@ -81,33 +120,101 @@ function buildWorld(o: WorldOptions = {}) {
   const uploads: Array<{ kind: string; sha256: string }> = [];
   const heldouts: string[] = [];
   const commits: Array<{ taskId: bigint; commitment: string }> = [];
+  const reveals: Array<{ taskId: bigint; contentHash: string; uri: string }> = [];
+  const entries = new Map<string, EntryView>();
   let now = T0;
+  let childPolls = 0;
+  let blobReads = 0;
+  let clockReads = 0;
+  let commitCalls = 0;
+  let postFailed = false;
+  const world = { phase: "open" as "open" | "revealing" };
 
   const parentCommitDeadline = T0 + BigInt(o.commitSecs ?? 3600) * NS;
   const nextId = () => BigInt(PARENT_ID + 1 + children.length);
 
-  const client: LeadChain = {
+  const client: LeadChain & AgentChain = {
     network: "testnet",
-    contractId: "tender.test.near",
+    contractId: CONTRACT,
     accountId: LEAD,
     async commit(taskId, commitment) {
+      commitCalls += 1;
       events.push("commit");
-      if (o.failCommit !== undefined) throw o.failCommit;
+      const failing = o.failCommit;
+      if (failing !== undefined && (failing.n === undefined || failing.n === commitCalls)) {
+        throw failing.error;
+      }
       commits.push({ taskId, commitment });
+      entries.set(String(taskId), {
+        task_id: String(taskId),
+        account: LEAD,
+        index: 0,
+        commitment,
+        committed_at_block: "1000",
+        content_hash: null,
+        uri: null,
+      });
       return { txHash: "tx-commit" } as TxResult;
+    },
+    async reveal(taskId, contentHash, _salt, uri) {
+      reveals.push({ taskId, contentHash, uri });
+      return { txHash: "tx-reveal" } as TxResult;
+    },
+    async storageBalanceOf() {
+      return STORAGE;
+    },
+    async getEntry(taskId) {
+      return entries.get(String(taskId)) ?? null;
     },
     async postTask(input, opts) {
       const n = children.length;
       events.push(`post ${n}`);
-      if (o.failPost?.n === n) throw o.failPost.error;
+      if (o.postDelayMs !== undefined) await delay(o.postDelayMs);
+      if (o.failPost?.n === n && !postFailed) {
+        postFailed = true;
+        throw o.failPost.error;
+      }
       const id = nextId();
       children.push({ id, input, opts, polls: 0 });
       // A post takes a few seconds of chain time.
       now += 3n * NS;
+      if (o.lostPost?.n === n && !postFailed) {
+        postFailed = true;
+        throw new TenderError("E_TIMEOUT", "TenderClient.send timed out; the transaction may land");
+      }
       return { txHash: `tx-post-${n}`, taskId: id } as TxResult & { taskId: bigint };
     },
     async blockTimestampNs() {
+      clockReads += 1;
+      if (o.failClock === clockReads) throw new Error("the node did not answer");
       return now;
+    },
+    async taskCount() {
+      return BigInt(PARENT_ID + children.length);
+    },
+    async getTask(id) {
+      const child = children.find((one) => one.id === id);
+      if (child === undefined) return null;
+      return {
+        id: String(id),
+        poster: LEAD,
+        parent: String(PARENT_ID),
+        brief_hash: child.input.briefHash,
+      } as TaskView;
+    },
+    async balanceOf() {
+      return o.vault ?? 6_000_000n;
+    },
+    async view<T>(_contract: string, method: string): Promise<T> {
+      if (method !== "get_delegate") throw new Error(`unexpected view ${method}`);
+      const caps = o.caps === undefined ? {} : o.caps;
+      if (caps === null) return null as T;
+      return {
+        token: caps.token ?? TOKEN,
+        per_task_cap: caps.per_task_cap ?? "2000000",
+        total_cap: caps.total_cap ?? "6000000",
+        spent: caps.spent ?? "0",
+      } as T;
     },
   };
 
@@ -154,7 +261,26 @@ function buildWorld(o: WorldOptions = {}) {
     return { ...base, task: { ...base.task, poster: LEAD, parent: String(PARENT_ID) } };
   };
 
-  const api: LeadApi = {
+  const parentSpec = () =>
+    taskSpec({
+      id: PARENT_ID,
+      tags: [LEAD_TAG],
+      phase: world.phase,
+      poster: POSTER,
+      createdAt: String(T0),
+    });
+  const parentTask = () => ({
+    ...taskDetailResponse(parentSpec()).task,
+    token: TOKEN,
+    reward: "10000000",
+    created_at: String(T0),
+    commit_deadline: String(parentCommitDeadline),
+  });
+
+  const unexpected = (method: string) => () => {
+    throw new Error(`unexpected call to api.${method}`);
+  };
+  const api: TenderApi = {
     async uploadBlob(blob) {
       events.push(`upload ${blob.kind}`);
       const sha256 = sha256Hex(blob.bytes);
@@ -167,6 +293,17 @@ function buildWorld(o: WorldOptions = {}) {
       heldouts.push(commitment);
     },
     async getTask(id) {
+      if (id === BigInt(PARENT_ID)) {
+        return {
+          ...taskDetailResponse(parentSpec()),
+          task: parentTask(),
+          brief: { ...BRIEF, tags: [LEAD_TAG] },
+        };
+      }
+      childPolls += 1;
+      if (o.failGetTask === "always" || o.failGetTask === childPolls) {
+        throw new Error("the API timed out");
+      }
       const index = children.findIndex((child) => child.id === id);
       const child = children[index];
       if (child === undefined) return null;
@@ -182,37 +319,68 @@ function buildWorld(o: WorldOptions = {}) {
       return taskDetailResponse(taskSpec({ id: Number(id), tags: ["extraction"] }));
     },
     async getBlob(sha256) {
+      blobReads += 1;
+      if (o.failGetBlob === blobReads) throw new Error("the API timed out");
       return blobs.get(sha256) ?? null;
     },
+    async listTasks(filter = {}) {
+      const open = world.phase === "open" && (filter.tag === undefined || filter.tag === LEAD_TAG);
+      return { tasks: open ? [taskSummary(parentSpec())] : [], next_cursor: null };
+    },
+    async start() {
+      return { ok: true, working_count: 1 };
+    },
+    async listEntries() {
+      return { entries: [] };
+    },
+    listAgents: unexpected("listAgents"),
+    getAgent: unexpected("getAgent"),
+    health: unexpected("health"),
+    getScorecard: unexpected("getScorecard"),
+    telegramLink: unexpected("telegramLink"),
+    signIn: unexpected("signIn"),
   };
 
-  const parent = taskDetailResponse(
-    taskSpec({ id: PARENT_ID, tags: [LEAD_TAG], phase: "open", poster: POSTER }),
-  );
+  const task = parentTask();
   const ctx: TaskContext = {
-    task: {
-      ...parent.task,
-      token: TOKEN,
-      reward: "10000000",
-      created_at: String(T0),
-      commit_deadline: String(parentCommitDeadline),
-    },
+    task,
     brief: { ...BRIEF, tags: [LEAD_TAG] },
     criteria: CRITERIA,
   };
 
-  return { client, api, ctx, events, children, uploads, heldouts, commits, blobs, now: () => now };
+  return {
+    client,
+    api,
+    ctx,
+    events,
+    children,
+    uploads,
+    heldouts,
+    commits,
+    reveals,
+    blobs,
+    state: world,
+    /** Moves the chain's clock on. */
+    advance(secs: number) {
+      now += BigInt(secs) * NS;
+    },
+    now: () => now,
+  };
 }
+
+type World = ReturnType<typeof buildWorld>;
 
 let dirs: string[] = [];
 let state: StateStore;
 let stateDir: string;
+let journalDir: string;
 /** Ends every wait a test leaves behind, so that no lead outlives its test. */
 let stop: AbortController;
 
 beforeEach(() => {
   stateDir = mkdtempSync(join(tmpdir(), "lead-state-"));
-  dirs = [stateDir];
+  journalDir = mkdtempSync(join(tmpdir(), "lead-journal-"));
+  dirs = [stateDir, journalDir];
   state = createStateStore(stateDir);
   stop = new AbortController();
 });
@@ -221,41 +389,125 @@ afterEach(() => {
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
 });
 
-function solverOf(
-  world: ReturnType<typeof buildWorld>,
-  more: Partial<Parameters<typeof createLeadSolver>[0]> = {},
-  lines: string[] = [],
-) {
-  return createLeadSolver({
+function optionsOf(world: World, more: Partial<Parameters<typeof createLeadSolver>[0]> = {}) {
+  return {
     seedsDir: CHILDREN,
     client: world.client,
     api: world.api,
     judgeAccount: JUDGE,
     token: TOKEN,
+    delegateKey: KEY,
     posters: [POSTER],
+    journalDir,
     state,
+    // A hire is taken to take 5 s here, in place of 20, so that the short windows of a test fit.
+    hireSecs: 5,
     pollMs: 1,
-    signal: stop.signal,
-    log: (line) => lines.push(line),
+    backoffMs: 1,
+    maxBackoffMs: 2,
     ...more,
+  };
+}
+
+function leadOf(
+  world: World,
+  more: Partial<Parameters<typeof createLeadSolver>[0]> = {},
+  lines: string[] = [],
+): LeadSolver {
+  return createLeadSolver({ ...optionsOf(world, more), log: (line) => lines.push(line) });
+}
+
+/** One tick of the runner, which enters the parent with what the lead's `solve` returns. */
+async function enter(
+  world: World,
+  lead: LeadSolver,
+  more: { solveTimeoutMs?: number; memory?: AgentMemory; lines?: string[] } = {},
+): Promise<void> {
+  await agentTick({
+    name: "lead",
+    client: world.client,
+    api: world.api,
+    state,
+    tags: [LEAD_TAG],
+    solver: lead,
+    solveTimeoutMs: more.solveTimeoutMs,
+    memory: more.memory,
+    log: (line) => more.lines?.push(line),
   });
 }
 
+/** Passes over the lead's jobs until none is under way. */
+async function finish(lead: LeadSolver, max = 600): Promise<void> {
+  for (let pass = 0; pass < max; pass++) {
+    await lead.tick();
+    if ((await lead.active()).length === 0) return;
+    await delay(3);
+  }
+  throw new Error("the job did not end");
+}
+
+const jobOf = (parent = PARENT_ID) =>
+  JSON.parse(readFileSync(join(journalDir, `${parent}.json`), "utf8")) as {
+    status: string;
+    reason?: string;
+    hires: Array<{ slug: string; id: string; winner?: string }>;
+    intent?: unknown;
+  };
+const journalFiles = () => readdirSync(journalDir).filter((name) => name.endsWith(".json"));
+const text = (bytes: Uint8Array | undefined) => new TextDecoder().decode(bytes ?? new Uint8Array());
+const parentSolution = () => readFileSync(join(PACK, "parent", "solution.txt"), "utf8");
+
+async function finalAnswer(): Promise<unknown> {
+  const draft = await state.getDraft(String(PARENT_ID));
+  return JSON.parse(Buffer.from(draft?.contentBase64 ?? "", "base64").toString());
+}
+
 describe("the lead's job on a swarm task", () => {
-  test("commits_a_placeholder_then_hires_three_under_a_delegate_key_then_assembles_the_pack", async () => {
+  test("takes_the_parent_with_a_placeholder_and_hires_nothing_until_a_pass_runs", async () => {
+    const world = buildWorld();
+    const lead = leadOf(world);
+    await enter(world, lead);
+
+    // The runner committed what `solve` returned, as it commits any answer.
+    expect(world.events).toEqual(["commit"]);
+    expect(world.children).toHaveLength(0);
+    const draft = await state.getDraft(String(PARENT_ID));
+    expect(draft).not.toBeNull();
+    if (draft === null) return;
+    expect(Buffer.from(draft.contentBase64, "base64").toString()).toBe("placeholder");
+    expect(draft.contentHash).toBe(sha256Hex("placeholder"));
+    expect(draft.commitment).toBe(
+      computeCommitment(BigInt(PARENT_ID), LEAD, draft.contentHash, draft.salt),
+    );
+    expect(draft.commitment).toBe(world.commits[0]?.commitment);
+    expect(isDraftOf(draft, LEAD)).toBe(true);
+    // Bound to this contract and this task, as the runner's drafts are.
+    expect(draft.contractId).toBe(CONTRACT);
+    expect(draft.taskCreatedAt).toBe(world.ctx.task.created_at);
+    expect(draft.committedAt).toBeDefined();
+    expect(draft.revealedUri).toBeUndefined();
+    // The job is written down, under way.
+    expect(jobOf().status).toBe("hiring");
+    expect(await lead.active()).toEqual([String(PARENT_ID)]);
+  });
+
+  test("a_pass_hires_three_under_a_delegate_key_then_the_assembled_pack_replaces_the_placeholder", async () => {
     const world = buildWorld();
     const lines: string[] = [];
-    const answer = await solverOf(world, {}, lines).solve(world.ctx);
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead);
 
-    // The placeholder is the first thing on chain: a child needs an entry on the parent.
+    // The placeholder is the first thing on chain: a child needs an entry on the parent. The
+    // assembled answer is the last.
     expect(world.events[0]).toBe("commit");
-    expect(world.events.filter((event) => event === "commit")).toHaveLength(1);
-    expect(world.commits[0]?.taskId).toBe(BigInt(PARENT_ID));
+    expect(world.events.at(-1)).toBe("commit");
+    expect(world.events.filter((event) => event === "commit")).toHaveLength(2);
+    expect(world.commits.map((one) => one.taskId)).toEqual([BigInt(PARENT_ID), BigInt(PARENT_ID)]);
 
     // Three children, in the order of the pack, each uploaded before it is posted.
     expect(world.children).toHaveLength(3);
-    const order = world.events.filter((event) => event !== "commit");
-    expect(order).toEqual([
+    expect(world.events.slice(1, -1)).toEqual([
       "upload brief",
       "upload criteria",
       "upload heldout",
@@ -294,67 +546,57 @@ describe("the lead's job on a swarm task", () => {
       expect(child.input.briefHash).toBe(sha256Hex(canonicalJson(briefFile)));
     }
 
-    // The pack's parent solution is the parts in order, whoever won each.
-    expect(answer).not.toBeNull();
-    const parentSolution = readFileSync(join(PACK, "parent", "solution.txt"), "utf8");
-    expect(JSON.parse(new TextDecoder().decode(answer ?? new Uint8Array()))).toEqual(
-      JSON.parse(parentSolution),
-    );
-    expect(lines.some((line) => line.includes("placeholder"))).toBe(true);
-  });
-
-  test("the_placeholder_is_a_draft_that_opens_its_commitment_and_is_marked_committed", async () => {
-    const world = buildWorld();
-    await solverOf(world).solve(world.ctx);
-
+    // The pack's parent solution is the parts in order, whoever won each, and it is the draft now.
+    expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
     const draft = await state.getDraft(String(PARENT_ID));
-    expect(draft).not.toBeNull();
-    if (draft === null) return;
-    expect(Buffer.from(draft.contentBase64, "base64").toString()).toBe("placeholder");
-    expect(draft.contentHash).toBe(sha256Hex("placeholder"));
-    expect(draft.commitment).toBe(
-      computeCommitment(BigInt(PARENT_ID), LEAD, draft.contentHash, draft.salt),
-    );
-    expect(draft.commitment).toBe(world.commits[0]?.commitment);
-    expect(isDraftOf(draft, LEAD)).toBe(true);
-    // Bound to this contract and this task, as the runner's drafts are.
-    expect(draft.contractId).toBe("tender.test.near");
-    expect(draft.taskCreatedAt).toBe(world.ctx.task.created_at);
-    expect(draft.committedAt).toBeDefined();
-    expect(draft.revealedUri).toBeUndefined();
+    expect(draft?.commitment).toBe(world.commits[1]?.commitment);
+    expect(draft?.committedAt).toBeDefined();
+    expect(isDraftOf(draft ?? ({} as never), LEAD)).toBe(true);
+    expect(jobOf().status).toBe("done");
+    expect(await lead.active()).toEqual([]);
+    expect(lines.some((line) => line.includes("placeholder"))).toBe(true);
+
+    // The runner reveals that draft once the reveal window opens.
+    world.state.phase = "revealing";
+    await enter(world, lead);
+    expect(world.reveals).toHaveLength(1);
+    expect(world.reveals[0]?.contentHash).toBe(draft?.contentHash);
   });
 
   test("the_parts_follow_the_pack_s_order_when_the_children_settle_in_another", async () => {
     const world = buildWorld({ settleOn: [4, 3, 2], winners: [BOB, ALICE, BOB] });
-    const answer = await solverOf(world).solve(world.ctx);
-    const parentSolution = readFileSync(join(PACK, "parent", "solution.txt"), "utf8");
-    expect(JSON.parse(new TextDecoder().decode(answer ?? new Uint8Array()))).toEqual(
-      JSON.parse(parentSolution),
-    );
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead);
+    expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
   });
 
   test("the_winner_s_content_is_taken_by_the_winner_and_not_by_the_order_of_commits", async () => {
     // The stand-in lists the loser first. Contents that differ per child show it went by the winner.
     const contents = SLUGS.map((_, index) => JSON.stringify({ child: index }));
     const world = buildWorld({ contents });
-    const answer = await solverOf(world).solve(world.ctx);
-    expect(JSON.parse(new TextDecoder().decode(answer ?? new Uint8Array()))).toEqual({
-      parts: [{ child: 0 }, { child: 1 }, { child: 2 }],
-    });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead);
+    expect(await finalAnswer()).toEqual({ parts: [{ child: 0 }, { child: 1 }, { child: 2 }] });
   });
 
   test("a_content_that_is_not_json_stays_a_string_in_its_part", async () => {
     const contents = [solutionOf(SLUGS[0] ?? ""), "plain words", solutionOf(SLUGS[2] ?? "")];
     const world = buildWorld({ contents });
-    const answer = await solverOf(world).solve(world.ctx);
-    const parts = JSON.parse(new TextDecoder().decode(answer ?? new Uint8Array())).parts;
-    expect(parts[1]).toBe("plain words");
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead);
+    expect(((await finalAnswer()) as { parts: unknown[] }).parts[1]).toBe("plain words");
   });
 
   test("windows_given_to_the_lead_replace_the_pack_s", async () => {
     const world = buildWorld({ commitSecs: 170 });
     const windows = { commit_secs: 20, reveal_secs: 20, pick_secs: 30, fallback_secs: 20 };
-    await solverOf(world, { windows }).solve(world.ctx);
+    const lead = leadOf(world, { windows });
+    await enter(world, lead);
+    await finish(lead);
+    expect(world.children).toHaveLength(3);
     for (const child of world.children) {
       expect(child.input).toMatchObject({
         commitSecs: 20,
@@ -370,7 +612,9 @@ describe("the lead's job on a swarm task", () => {
     // least a minute short of the parent's commit deadline, at every post.
     const world = buildWorld({ commitSecs: 170 });
     const windows = { commit_secs: 20, reveal_secs: 20, pick_secs: 30, fallback_secs: 20 };
-    await solverOf(world, { windows }).solve(world.ctx);
+    const lead = leadOf(world, { windows });
+    await enter(world, lead);
+    await finish(lead);
     const deadline = BigInt(world.ctx.task.commit_deadline);
     expect(world.children).toHaveLength(3);
     let clock = T0;
@@ -387,78 +631,123 @@ describe("what the lead will not do", () => {
   test("a_task_without_the_swarm_tag_is_left_alone", async () => {
     const world = buildWorld();
     const ctx = { ...world.ctx, brief: { ...BRIEF, tags: ["regex"] } };
-    expect(await solverOf(world).solve(ctx)).toBeNull();
+    expect(await leadOf(world).solve(ctx)).toBeNull();
     expect(world.events).toEqual([]);
+    expect(journalFiles()).toEqual([]);
   });
 
   test("a_parent_with_no_room_for_the_pack_s_windows_is_left_alone_before_anything_is_committed", async () => {
     // The pack's windows take 1500 s; a parent with 100 s to its commit deadline cannot wait.
     const world = buildWorld({ commitSecs: 100 });
     const lines: string[] = [];
-    expect(await solverOf(world, {}, lines).solve(world.ctx)).toBeNull();
+    expect(await leadOf(world, {}, lines).solve(world.ctx)).toBeNull();
     expect(world.events).toEqual([]);
+    expect(journalFiles()).toEqual([]);
     expect(lines.join("\n")).toMatch(/commit deadline/);
     expect(lines.filter((line) => line.includes("declining task 10"))).toHaveLength(1);
   });
 
   test("a_parent_that_leaves_the_windows_but_not_the_minute_in_hand_is_left_alone", async () => {
     // The windows take 70 s. A commit deadline 100 s away leaves room for them, and not for them
-    // and a minute to assemble in. With no margin the same parent is hired for.
+    // and a minute to assemble in. With no margin (and a hire taken to take 1 s) it is hired for.
     const windows = { commit_secs: 20, reveal_secs: 20, pick_secs: 30, fallback_secs: 20 };
     const tight = buildWorld({ commitSecs: 100 });
-    expect(await solverOf(tight, { windows }).solve(tight.ctx)).toBeNull();
+    expect(await leadOf(tight, { windows }).solve(tight.ctx)).toBeNull();
     expect(tight.events).toEqual([]);
 
     const relaxed = buildWorld({ commitSecs: 100 });
-    await solverOf(relaxed, { windows, marginSecs: 0 }).solve(relaxed.ctx);
+    const lead = leadOf(relaxed, { windows, marginSecs: 0, hireSecs: 1 });
+    await enter(relaxed, lead);
+    await finish(lead);
     expect(relaxed.children).toHaveLength(3);
   });
 
-  test("a_commit_that_fails_ends_the_job_before_any_hire", async () => {
-    const world = buildWorld({ failCommit: new TenderError("E_PHASE", "too late") });
+  test("a_placeholder_that_never_lands_hires_nothing_and_the_job_ends_when_there_is_no_time", async () => {
+    const world = buildWorld({
+      failCommit: { error: new TenderError("E_UNKNOWN", "node down"), n: 1 },
+    });
     const lines: string[] = [];
-    expect(await solverOf(world, {}, lines).solve(world.ctx)).toBeNull();
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    // The runner's commit failed, so the lead has no entry to name as the parent's.
+    await lead.tick();
+    await lead.tick();
     expect(world.children).toHaveLength(0);
-    expect(lines.join("\n")).toContain("E_PHASE");
+    expect((await lead.active()).length).toBe(1);
+    // Time passes until even the first part cannot be hired.
+    world.advance(3600 - 300);
+    await finish(lead);
+    expect(world.children).toHaveLength(0);
+    expect(jobOf().status).toBe("abandoned");
+    expect(lines.join("\n")).toMatch(/commit deadline/);
+    expect(lines.join("\n")).toMatch(/nothing was spent/);
   });
 
-  test("a_post_that_the_contract_refuses_ends_the_job_and_says_why", async () => {
+  test("a_post_that_the_contract_refuses_stops_the_hiring_and_nothing_more_is_spent", async () => {
     const world = buildWorld({
       failPost: { n: 1, error: new TenderError("E_AUTH", "past the total cap") },
     });
     const lines: string[] = [];
-    expect(await solverOf(world, {}, lines).solve(world.ctx)).toBeNull();
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead);
     expect(world.children).toHaveLength(1);
+    expect(jobOf().status).toBe("abandoned");
+    expect(jobOf().reason).toContain("E_AUTH");
+    expect(jobOf().intent).toBeUndefined();
     expect(lines.join("\n")).toContain("E_AUTH");
+    // More passes post nothing, and the job is not under way.
+    for (let pass = 0; pass < 5; pass++) await lead.tick();
+    expect(world.children).toHaveLength(1);
+    expect(await lead.active()).toEqual([]);
+    // The parent's entry is not stranded: its draft is still the placeholder, and not dead, so the
+    // runner reveals it in its time.
+    const draft = await state.getDraft(String(PARENT_ID));
+    expect(Buffer.from(draft?.contentBase64 ?? "", "base64").toString()).toBe("placeholder");
+    expect(draft?.dead).toBeUndefined();
+    world.state.phase = "revealing";
+    await enter(world, lead);
+    expect(world.reveals).toHaveLength(1);
   });
 
   test("a_child_that_is_voided_ends_the_job_with_no_answer", async () => {
     const world = buildWorld({ voidChild: 2 });
     const lines: string[] = [];
-    expect(await solverOf(world, {}, lines).solve(world.ctx)).toBeNull();
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead);
+    expect(jobOf().status).toBe("abandoned");
     expect(lines.join("\n")).toMatch(/voided/);
+    const draft = await state.getDraft(String(PARENT_ID));
+    expect(Buffer.from(draft?.contentBase64 ?? "", "base64").toString()).toBe("placeholder");
   });
 
   test("children_that_never_settle_end_the_job_at_the_parent_s_commit_deadline", async () => {
     const world = buildWorld({ stall: { secs: 600 } });
     const lines: string[] = [];
-    expect(await solverOf(world, {}, lines).solve(world.ctx)).toBeNull();
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead);
+    expect(jobOf().status).toBe("abandoned");
     expect(lines.join("\n")).toMatch(/commit deadline/);
   });
 
-  test("an_abort_ends_the_wait_at_once", async () => {
+  test("an_abort_ends_the_loop_at_once", async () => {
     const controller = new AbortController();
     const world = buildWorld({ stall: { secs: 0 } });
-    const solving = solverOf(world, { signal: controller.signal, pollMs: 5 }).solve(world.ctx);
+    const lead = leadOf(world);
+    await enter(world, lead);
+    const running = lead.run(controller.signal);
     setTimeout(() => controller.abort(), 50);
-    expect(await solving).toBeNull();
+    await running;
+    expect(controller.signal.aborted).toBe(true);
   });
 
   test("an_empty_pack_is_a_mistake_found_when_the_solver_is_made", () => {
     const empty = mkdtempSync(join(tmpdir(), "lead-empty-"));
     dirs.push(empty);
     const world = buildWorld();
-    expect(() => createLeadSolver({ ...solverOptions(world), seedsDir: empty })).toThrow(
+    expect(() => createLeadSolver({ ...optionsOf(world), seedsDir: empty })).toThrow(
       /no sub-tasks/,
     );
   });
@@ -469,7 +758,15 @@ describe("what the lead will not do", () => {
     mkdirSync(join(bad, "01-broken"));
     writeFileSync(join(bad, "01-broken", "task.json"), "{}");
     const world = buildWorld();
-    expect(() => createLeadSolver({ ...solverOptions(world), seedsDir: bad })).toThrow(/01-broken/);
+    expect(() => createLeadSolver({ ...optionsOf(world), seedsDir: bad })).toThrow(/01-broken/);
+  });
+
+  test("options_that_make_no_sense_are_found_when_the_solver_is_made", () => {
+    const world = buildWorld();
+    expect(() => createLeadSolver({ ...optionsOf(world), hireSecs: -1 })).toThrow(RangeError);
+    expect(() => createLeadSolver({ ...optionsOf(world), marginSecs: 1.5 })).toThrow(RangeError);
+    expect(() => createLeadSolver({ ...optionsOf(world), journalDir: "" })).toThrow(/journal/);
+    expect(() => createLeadSolver({ ...optionsOf(world), delegateKey: "" })).toThrow(/key/);
   });
 });
 
@@ -479,26 +776,26 @@ describe("what the lead will not do", () => {
 // trusts, in the token of its key, and with room for the sub-tasks. Each check below refuses on its
 // own: the parent it refuses is right in every other way.
 describe("what the lead will not take on", () => {
-  const STRANGER = "stranger.test.near";
-
   /** `ctx` with some fields of its task replaced. */
   const withTask = (ctx: TaskContext, changes: Partial<TaskContext["task"]>): TaskContext => ({
     ...ctx,
     task: { ...ctx.task, ...changes },
   });
 
-  /** Declines `change` of a parent that is otherwise fine, and checks nothing else happened. */
+  /** Declines `changes` of a parent that is otherwise fine, and checks nothing else happened. */
   async function declined(
     changes: Partial<TaskContext["task"]>,
-    more: { commitSecs?: number } = {},
+    more: WorldOptions = {},
+    lead?: Partial<Parameters<typeof createLeadSolver>[0]>,
   ): Promise<string[]> {
     const world = buildWorld(more);
     const lines: string[] = [];
-    const answer = await solverOf(world, {}, lines).solve(withTask(world.ctx, changes));
+    const answer = await leadOf(world, lead, lines).solve(withTask(world.ctx, changes));
     expect(answer).toBeNull();
-    // Nothing on chain, nothing uploaded, nothing posted, no draft kept.
+    // Nothing on chain, nothing uploaded, nothing posted, no job, no draft kept.
     expect(world.events).toEqual([]);
     expect(world.children).toHaveLength(0);
+    expect(journalFiles()).toEqual([]);
     expect(await state.getDraft(String(PARENT_ID))).toBeNull();
     const refusals = lines.filter((line) => line.includes(`declining task ${PARENT_ID}`));
     expect(refusals, lines.join("\n")).toHaveLength(1);
@@ -518,16 +815,15 @@ describe("what the lead will not take on", () => {
     await declined({ reward: "6315789" });
     // One unit more leaves 6_000_001 after the same fee, which is above the cost.
     const world = buildWorld();
-    const answer = await solverOf(world).solve(withTask(world.ctx, { reward: "6315790" }));
+    const answer = await leadOf(world).solve(withTask(world.ctx, { reward: "6315790" }));
     expect(answer).not.toBeNull();
-    expect(world.children).toHaveLength(3);
   });
 
   test("the_fee_is_the_one_the_parent_was_posted_with", async () => {
     // 6.60 tUSDC clears the cost at a fee of 5%, and not at 10%.
     await declined({ reward: "6600000", fee_bps: 1000 });
     const world = buildWorld();
-    const answer = await solverOf(world).solve(withTask(world.ctx, { reward: "6600000" }));
+    const answer = await leadOf(world).solve(withTask(world.ctx, { reward: "6600000" }));
     expect(answer).not.toBeNull();
   });
 
@@ -540,7 +836,7 @@ describe("what the lead will not take on", () => {
   test("a_token_whose_decimals_are_unknown_is_refused_not_guessed", async () => {
     const world = buildWorld();
     const lines: string[] = [];
-    const solver = solverOf(world, { token: "weird.test.near" }, lines);
+    const solver = leadOf(world, { token: "weird.test.near" }, lines);
     expect(await solver.solve(withTask(world.ctx, { token: "weird.test.near" }))).toBeNull();
     expect(world.events).toEqual([]);
     expect(lines.join("\n")).toMatch(/declining task 10: .*decimals/);
@@ -564,7 +860,8 @@ describe("what the lead will not take on", () => {
 
   test("a_parent_with_room_for_the_first_part_and_not_for_the_last_is_refused_before_anything_is_spent", async () => {
     // The first part takes 30 s and the second 1500 s. The lead looks at every part before it
-    // commits, not at the first alone, or it would hire for one and leave the parent unanswered.
+    // takes the parent on, not at the first alone, or it would hire for one and leave the parent
+    // unanswered.
     const pack = mkdtempSync(join(tmpdir(), "lead-mixed-"));
     dirs.push(pack);
     cpSync(CHILDREN, pack, { recursive: true });
@@ -582,7 +879,7 @@ describe("what the lead will not take on", () => {
     );
     const world = buildWorld({ commitSecs: 200 });
     const lines: string[] = [];
-    const solver = solverOf(world, { seedsDir: pack }, lines);
+    const solver = leadOf(world, { seedsDir: pack }, lines);
     expect(await solver.solve(world.ctx)).toBeNull();
     expect(world.events).toEqual([]);
     expect(lines.join("\n")).toMatch(/declining task 10: .*02-key-audit/);
@@ -601,19 +898,21 @@ describe("what the lead will not take on", () => {
   test("a_parent_that_passes_every_check_is_taken_on", async () => {
     const world = buildWorld();
     const lines: string[] = [];
-    expect(await solverOf(world, {}, lines).solve(world.ctx)).not.toBeNull();
+    expect(await leadOf(world, {}, lines).solve(world.ctx)).not.toBeNull();
     expect(lines.some((line) => line.includes("declining"))).toBe(false);
+    expect(jobOf().status).toBe("hiring");
   });
 
   test("the_posters_default_to_TEAM_ACCOUNTS", async () => {
     const env = { TEAM_ACCOUNTS: ` ${POSTER}, ${LEAD} ,` };
     const taken = buildWorld();
-    const solver = solverOf(taken, { posters: undefined, env });
+    const solver = leadOf(taken, { posters: undefined, env });
     expect(await solver.solve(taken.ctx)).not.toBeNull();
+    rmSync(journalDir, { recursive: true, force: true });
 
     const refused = buildWorld();
     const lines: string[] = [];
-    const other = solverOf(refused, { posters: undefined, env }, lines);
+    const other = leadOf(refused, { posters: undefined, env }, lines);
     expect(await other.solve(withTask(refused.ctx, { poster: STRANGER }))).toBeNull();
     expect(refused.events).toEqual([]);
     expect(lines.join("\n")).toContain(STRANGER);
@@ -621,7 +920,7 @@ describe("what the lead will not take on", () => {
 
   test("a_lead_with_no_posters_is_a_mistake_found_when_the_solver_is_made", () => {
     const world = buildWorld();
-    const options = { ...solverOptions(world), posters: undefined };
+    const options = { ...optionsOf(world), posters: undefined };
     expect(() => createLeadSolver({ ...options, env: {} })).toThrow(/TEAM_ACCOUNTS/);
     expect(() => createLeadSolver({ ...options, posters: [], env: {} })).toThrow(/TEAM_ACCOUNTS/);
     expect(() => createLeadSolver({ ...options, env: { TEAM_ACCOUNTS: " , " } })).toThrow(
@@ -631,31 +930,299 @@ describe("what the lead will not take on", () => {
 
   test("a_poster_that_is_not_an_account_id_is_a_mistake_found_when_the_solver_is_made", () => {
     const world = buildWorld();
-    expect(() =>
-      createLeadSolver({ ...solverOptions(world), posters: ["Not An Account"] }),
-    ).toThrow(/account id/);
+    expect(() => createLeadSolver({ ...optionsOf(world), posters: ["Not An Account"] })).toThrow(
+      /account id/,
+    );
   });
 });
 
-describe("the solver itself", () => {
-  test("is_named_the_lead_and_is_not_a_scripted_one", () => {
-    const solver = solverOf(buildWorld());
-    expect(solver.name).toBe("lead");
-    expect(solver.scripted).toBe(false);
+// Fix round 1 (the review of f29de14..02bd4d6). The gate was sound, and three paths remained where
+// the lead paid for children and then answered nothing. Each test below is the reviewer's probe.
+describe("fix round 1: I1, the plan is paid for whole or not at all", () => {
+  test("I1a_a_commit_window_the_hiring_could_outrun_is_refused_before_anything_is_paid", async () => {
+    // The probe: 133 s to the commit deadline, windows of 70 s, a 60 s margin. At one instant the
+    // three parts fit; with the time it takes to hire them (20 s a part by default) they do not.
+    const world = buildWorld({ commitSecs: 133 });
+    const windows = { commit_secs: 20, reveal_secs: 20, pick_secs: 30, fallback_secs: 20 };
+    const lines: string[] = [];
+    const lead = leadOf(world, { windows, hireSecs: undefined }, lines);
+    await enter(world, lead);
+    await lead.tick();
+    expect(world.children).toHaveLength(0);
+    expect(world.events).toEqual([]);
+    expect(journalFiles()).toEqual([]);
+    expect(lines.join("\n")).toMatch(/declining task 10: .*commit deadline/);
+  });
+
+  test("I1a_a_clock_that_outruns_the_hiring_allowance_stops_the_hiring_before_the_next_part", async () => {
+    // Hiring is taken to take 1 s a part, and each post takes the chain 3 s. The first part fits;
+    // before the second, the lead sees that it and the third no longer do, and it posts no more.
+    const world = buildWorld({ commitSecs: 133 });
+    const windows = { commit_secs: 20, reveal_secs: 20, pick_secs: 30, fallback_secs: 20 };
+    const lines: string[] = [];
+    const lead = leadOf(world, { windows, hireSecs: 1 }, lines);
+    await enter(world, lead);
+    await finish(lead);
+    expect(world.children).toHaveLength(1);
+    expect(jobOf().status).toBe("abandoned");
+    expect(jobOf().reason).toMatch(/commit deadline/);
+    for (let pass = 0; pass < 5; pass++) await lead.tick();
+    expect(world.children).toHaveLength(1);
+    expect(lines.join("\n")).toMatch(/no more is spent/);
+  });
+
+  test("I1b_a_remaining_cap_that_cannot_cover_the_sub_tasks_is_refused_before_anything_is_paid", async () => {
+    // The probe: total cap 10.00 and 5.00 spent leaves 5.00, and the three sub-tasks cost 6.00.
+    const world = buildWorld({ caps: { total_cap: "10000000", spent: "5000000" } });
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await lead.tick();
+    expect(world.children).toHaveLength(0);
+    expect(world.events).toEqual([]);
+    expect(lines.join("\n")).toMatch(/declining task 10: .*total cap/);
+  });
+
+  test("I1b_exactly_enough_cap_is_taken", async () => {
+    const world = buildWorld({ caps: { total_cap: "10000000", spent: "4000000" } });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead);
+    expect(world.children).toHaveLength(3);
+  });
+
+  test("I1b_a_sub_task_above_the_per_task_cap_is_refused", async () => {
+    const world = buildWorld({ caps: { per_task_cap: "1500000" } });
+    const lines: string[] = [];
+    expect(await leadOf(world, {}, lines).solve(world.ctx)).toBeNull();
+    expect(world.events).toEqual([]);
+    expect(lines.join("\n")).toMatch(/declining task 10: .*01-gas-ledger.*a task may cost/);
+  });
+
+  test("I1b_a_vault_that_cannot_pay_for_the_sub_tasks_is_refused", async () => {
+    const world = buildWorld({ vault: 5_000_000n });
+    const lines: string[] = [];
+    expect(await leadOf(world, {}, lines).solve(world.ctx)).toBeNull();
+    expect(world.events).toEqual([]);
+    expect(lines.join("\n")).toMatch(/declining task 10: .*vault/);
+  });
+
+  test("I1b_a_key_that_is_no_delegate_or_spends_another_token_is_refused", async () => {
+    const none = buildWorld({ caps: null });
+    const lines: string[] = [];
+    expect(await leadOf(none, {}, lines).solve(none.ctx)).toBeNull();
+    expect(lines.join("\n")).toMatch(/declining task 10: .*not a delegate key/);
+
+    const other = buildWorld({ caps: { token: "other.test.near" } });
+    const more: string[] = [];
+    expect(await leadOf(other, {}, more).solve(other.ctx)).toBeNull();
+    expect(more.join("\n")).toMatch(/declining task 10: .*other\.test\.near/);
+  });
+
+  test("the_lead_works_on_one_parent_at_a_time_and_never_on_the_same_one_twice", async () => {
+    const world = buildWorld();
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    // Another parent while the first is under way: its cost would come out of the same cap.
+    const second = { ...world.ctx, task: { ...world.ctx.task, id: "11" } };
+    expect(await lead.solve(second)).toBeNull();
+    expect(lines.join("\n")).toMatch(/declining task 11: .*one parent at a time/);
+
+    await finish(lead);
+    // The same parent again, as a draft that was set aside would offer it.
+    expect(await lead.solve(world.ctx)).toBeNull();
+    expect(lines.join("\n")).toMatch(/declining task 10: .*job for it already/);
+  });
+
+  test("a_job_of_another_life_of_the_chain_is_set_aside_and_does_not_block_the_parent", async () => {
+    const world = buildWorld();
+    const old = {
+      parent: String(PARENT_ID),
+      contractId: CONTRACT,
+      account: LEAD,
+      parentCreatedAt: "5",
+      commitDeadline: "6",
+      token: TOKEN,
+      status: "done",
+      hires: [],
+    };
+    writeFileSync(join(journalDir, `${PARENT_ID}.json`), JSON.stringify(old));
+    const lead = leadOf(world);
+    expect(await lead.solve(world.ctx)).not.toBeNull();
+    expect(jobOf().status).toBe("hiring");
+    expect(readdirSync(journalDir).some((name) => name.includes("orphaned"))).toBe(true);
+  });
+
+  test("a_journal_that_cannot_be_read_fails_closed", async () => {
+    const world = buildWorld();
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    writeFileSync(join(journalDir, "3.json"), "not json");
+    expect(await lead.solve(world.ctx)).toBeNull();
+    expect(lines.join("\n")).toMatch(/ERROR task 10 failed/);
+    await lead.tick();
+    expect(lines.join("\n")).toMatch(/ERROR the jobs cannot be read/);
+    expect(world.children).toHaveLength(0);
   });
 });
 
-function solverOptions(
-  world: ReturnType<typeof buildWorld>,
-): Parameters<typeof createLeadSolver>[0] {
-  return {
-    seedsDir: CHILDREN,
-    client: world.client,
-    api: world.api,
-    judgeAccount: JUDGE,
-    token: TOKEN,
-    posters: [POSTER],
-    state,
-    pollMs: 1,
-  };
-}
+describe("fix round 1: I2, a failed call is tried again and the job survives a restart", () => {
+  test("I2_one_failed_poll_does_not_abandon_a_parent_whose_children_are_paid_for", async () => {
+    // The probe: the API's getTask throws once, on its 4th call. All three children are posted.
+    const world = buildWorld({ failGetTask: 4 });
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead);
+    expect(world.children).toHaveLength(3);
+    expect(jobOf().status).toBe("done");
+    expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
+    expect(lines.join("\n")).toMatch(/WARN task 10 \(waiting\) failed \(Error\), trying again in/);
+  });
+
+  test("I2_a_failed_blob_fetch_and_a_failed_clock_read_are_tried_again", async () => {
+    const world = buildWorld({ failGetBlob: 1, failClock: 12 });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead);
+    expect(world.children).toHaveLength(3);
+    expect(jobOf().status).toBe("done");
+    expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
+  });
+
+  test("I2_a_failed_commit_of_the_answer_is_tried_again_with_the_same_salt", async () => {
+    const world = buildWorld({ failCommit: { error: new Error("socket hang up"), n: 2 } });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead);
+    expect(jobOf().status).toBe("done");
+    const draft = await state.getDraft(String(PARENT_ID));
+    expect(draft?.commitment).toBe(world.commits.at(-1)?.commitment);
+    expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
+    // Placeholder, the commit that failed, the commit that went through.
+    expect(world.events.filter((event) => event === "commit")).toHaveLength(3);
+  });
+
+  test("I2_a_commit_the_contract_refuses_ends_the_job", async () => {
+    const world = buildWorld({
+      failCommit: { error: new TenderError("E_PHASE", "the commit window is over"), n: 2 },
+    });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead);
+    expect(jobOf().status).toBe("abandoned");
+    expect(jobOf().reason).toContain("E_PHASE");
+  });
+
+  test("I2_a_job_that_keeps_failing_waits_longer_between_tries_and_ends_at_the_commit_deadline", async () => {
+    const world = buildWorld({ failGetTask: "always" });
+    const lines: string[] = [];
+    const lead = leadOf(world, { backoffMs: 300, maxBackoffMs: 600 }, lines);
+    await enter(world, lead);
+    // Thirty passes in a tight loop (well inside the first pause): the job is not tried again until
+    // its pause is over, so it is tried once and not thirty times.
+    for (let pass = 0; pass < 30; pass++) await lead.tick();
+    const tries = lines.filter((line) => line.includes("trying again")).length;
+    expect(tries).toBeGreaterThan(0);
+    expect(tries).toBeLessThanOrEqual(3);
+    expect(world.children).toHaveLength(3);
+    expect(jobOf().status).toBe("waiting");
+
+    // Time passes on the chain until the parent's commit deadline: the job ends there.
+    world.advance(3600);
+    await delay(100);
+    await finish(lead);
+    expect(jobOf().status).toBe("abandoned");
+    expect(jobOf().reason).toMatch(/commit deadline/);
+  });
+
+  test("I2_a_restart_resumes_the_job_and_does_not_hire_the_parts_again", async () => {
+    // The process dies when the third post fails to leave (a socket gone), after two were hired.
+    const world = buildWorld({ failPost: { n: 2, error: new Error("socket hang up") } });
+    const first = leadOf(world);
+    await enter(world, first);
+    await first.tick();
+    expect(world.children).toHaveLength(2);
+    expect(jobOf().status).toBe("hiring");
+    expect(jobOf().hires.map((one) => one.slug)).toEqual(SLUGS.slice(0, 2));
+    expect(jobOf().intent).toBeDefined();
+
+    // A new process on the same journal and drafts. The intent is too young to call lost, so it
+    // looks at the chain, finds nothing, and waits; a minute later it posts the third part.
+    const lines: string[] = [];
+    const second = leadOf(world, {}, lines);
+    await second.tick();
+    expect(world.children).toHaveLength(2);
+    world.advance(61);
+    await finish(second);
+    expect(world.children).toHaveLength(3);
+    expect(new Set(world.children.map((one) => one.input.briefHash)).size).toBe(3);
+    expect(jobOf().status).toBe("done");
+    expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
+    expect(lines.join("\n")).toMatch(/did not land/);
+  });
+
+  test("I2_a_post_whose_answer_was_lost_is_found_on_the_chain_and_not_posted_again", async () => {
+    const world = buildWorld({ lostPost: { n: 1 } });
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead);
+    // Part 2 landed, the client timed out, and the lead found it on the chain.
+    expect(world.children).toHaveLength(3);
+    expect(new Set(world.children.map((one) => one.input.briefHash)).size).toBe(3);
+    expect(jobOf().hires.map((one) => one.slug)).toEqual(SLUGS);
+    expect(jobOf().status).toBe("done");
+    expect(lines.join("\n")).toMatch(/was posted already/);
+  });
+});
+
+describe("fix round 1: I3, the lead's long work is not the runner's solve", () => {
+  test("I3_solve_returns_quickly_however_long_the_hiring_takes", async () => {
+    // Each post takes 1.5 s, so a solve that hired would take 4.5 s; this one must take a fraction
+    // of one post.
+    const world = buildWorld({ postDelayMs: 1500 });
+    const lead = leadOf(world);
+    const started = Date.now();
+    const answer = await lead.solve(world.ctx);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(text(answer ?? undefined)).toBe("placeholder");
+    // It hired nothing: that is for the passes.
+    expect(world.children).toHaveLength(0);
+  });
+
+  test("I3_a_runner_with_a_short_solve_timeout_still_ends_with_the_assembled_answer", async () => {
+    // Hiring takes over 2 s here (700 ms a post) and the runner gives a solve 400 ms. The lead's work
+    // was never inside that solve, so the placeholder is committed, the job goes on, and the answer
+    // replaces it.
+    const world = buildWorld({ postDelayMs: 700 });
+    const runner: string[] = [];
+    const lead = leadOf(world);
+    await enter(world, lead, { solveTimeoutMs: 400, lines: runner });
+    expect(runner.join("\n")).not.toMatch(/took over/);
+    await finish(lead);
+    expect(jobOf().status).toBe("done");
+    expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
+  });
+
+  test("I3_the_jobs_do_not_hold_up_the_runner", async () => {
+    // The lead's loop hires for over 1.8 s (600 ms a post), beside the runner. A tick of the runner
+    // in that time (it would reveal the drafts that are due) is not held up by it.
+    const world = buildWorld({ postDelayMs: 600 });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    const running = lead.run(stop.signal);
+    await delay(20);
+    const started = Date.now();
+    await enter(world, lead);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(jobOf().status).not.toBe("done");
+    for (let waited = 0; (await lead.active()).length > 0 && waited < 800; waited++) {
+      await delay(10);
+    }
+    stop.abort();
+    await running;
+    expect(jobOf().status).toBe("done");
+  });
+});
