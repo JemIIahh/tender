@@ -13,6 +13,8 @@ import { fileURLToPath } from "node:url";
  *   <private dir>/<slug>/solution.txt     a correct answer (every seed)
  *   <private dir>/<slug>/scenarios.json   spoiled copies of the solution, as edits of its text
  *                                         (a rubric seed only; they quote the solution)
+ *   <private dir>/<slug>/known-wrong.json the solution with one rule broken, as a few wrong
+ *                                         answers (a regex_cases or tests seed only)
  *
  * the private half. (`weak.txt` is public: it is meant to lose.) The tracked demo set in
  * `scripts/demo-seeds/` and the swarm pack are the demos' own and public in full, and need none of
@@ -55,6 +57,10 @@ export const solutionFileOf = (privateDir: string, slug: string): string =>
 export const scenariosFileOf = (privateDir: string, slug: string): string =>
   join(privateDir, slug, "scenarios.json");
 
+/** `<privateDir>/<slug>/known-wrong.json`. */
+export const knownWrongFileOf = (privateDir: string, slug: string): string =>
+  join(privateDir, slug, "known-wrong.json");
+
 /** `seedsDir/<slug>/criteria.json`, as far as the private files depend on it; null if it is not there. */
 function criteriaOf(
   seedsDir: string,
@@ -80,8 +86,9 @@ export function missingHeldouts(seedsDir: string, privateDir: string, slugs: str
 
 /**
  * The seeds of `seedsDir`, from `slugs`, that lack a private file: the `solution.txt` of any seed
- * with a `criteria.json`, its `heldout.json` when it has a held-out part, or its `scenarios.json`
- * when it is a rubric seed. Empty when the directory is complete.
+ * with a `criteria.json`, its `heldout.json` when it has a held-out part, its `scenarios.json`
+ * when it is a rubric seed, or its `known-wrong.json` when it is a regex_cases or tests seed. Empty
+ * when the directory is complete.
  */
 export function missingPrivateFiles(
   seedsDir: string,
@@ -95,7 +102,9 @@ export function missingPrivateFiles(
     return (
       noHeldout.has(slug) ||
       !existsSync(solutionFileOf(privateDir, slug)) ||
-      (criteria.kind === "rubric" && !existsSync(scenariosFileOf(privateDir, slug)))
+      (criteria.kind === "rubric" && !existsSync(scenariosFileOf(privateDir, slug))) ||
+      ((criteria.kind === "regex_cases" || criteria.kind === "tests") &&
+        !existsSync(knownWrongFileOf(privateDir, slug)))
     );
   });
 }

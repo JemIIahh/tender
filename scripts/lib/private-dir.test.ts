@@ -6,6 +6,7 @@ import { REPO_ROOT } from "./env";
 import {
   DEFAULT_PRIVATE_DIR,
   heldoutFileOf,
+  knownWrongFileOf,
   missingHeldouts,
   missingPrivateFiles,
   PRIVATE_DIR_VARIABLE,
@@ -66,12 +67,13 @@ test("the_process_environment_is_what_it_reads_when_it_is_given_none", () => {
 test("the_files_are_per_slug", () => {
   expect(heldoutFileOf("/vault", "ipv4-regex")).toBe("/vault/ipv4-regex/heldout.json");
   expect(solutionFileOf("/vault", "ipv4-regex")).toBe("/vault/ipv4-regex/solution.txt");
+  expect(knownWrongFileOf("/vault", "wrap-text")).toBe("/vault/wrap-text/known-wrong.json");
   expect(scenariosFileOf("/vault", "vendor-pick-memo")).toBe(
     "/vault/vendor-pick-memo/scenarios.json",
   );
 });
 
-test("missing_private_files_names_the_seeds_that_lack_a_solution_their_checks_or_their_scenarios", () => {
+test("missing_private_files_names_the_seeds_that_lack_a_solution_their_checks_or_their_other_files", () => {
   const seeds = tmp();
   const vault = tmp();
   const seed = (slug: string, criteria: object | undefined) => {
@@ -86,50 +88,66 @@ test("missing_private_files_names_the_seeds_that_lack_a_solution_their_checks_or
   };
   const checked = { kind: "exact", has_heldout: true };
   const rubric = { kind: "rubric", has_heldout: false };
+  const regex = { kind: "regex_cases", has_heldout: true };
+  const code = { kind: "tests", has_heldout: true };
   seed("complete", checked);
   seed("no-checks", checked);
   seed("no-solution", checked);
   seed("rubric-complete", rubric);
   seed("rubric-no-solution", rubric);
   seed("rubric-no-scenarios", rubric);
+  seed("regex-complete", regex);
+  seed("regex-no-known-wrong", regex);
+  seed("code-complete", code);
+  seed("code-no-known-wrong", code);
   seed("no-criteria", undefined);
   put("complete", "heldout.json", "solution.txt");
   put("no-checks", "solution.txt");
   put("no-solution", "heldout.json");
   put("rubric-complete", "solution.txt", "scenarios.json");
   put("rubric-no-scenarios", "solution.txt");
-  // A rubric seed's checks are not looked for, a seed that is not a rubric seed has no scenarios
-  // to look for, and a folder with no criteria is left to others.
+  put("regex-complete", "heldout.json", "solution.txt", "known-wrong.json");
+  put("regex-no-known-wrong", "heldout.json", "solution.txt");
+  put("code-complete", "heldout.json", "solution.txt", "known-wrong.json");
+  put("code-no-known-wrong", "heldout.json", "solution.txt");
+  // A rubric seed's checks are not looked for. Scenarios are looked for in a rubric seed only and
+  // known-wrong answers in a regex_cases or tests seed only. A folder with no criteria is left to
+  // others.
 
   const slugs = [
+    "code-complete",
+    "code-no-known-wrong",
     "complete",
     "no-checks",
     "no-criteria",
     "no-solution",
+    "regex-complete",
+    "regex-no-known-wrong",
     "rubric-complete",
     "rubric-no-scenarios",
     "rubric-no-solution",
   ];
   expect(missingPrivateFiles(seeds, vault, slugs)).toEqual([
+    "code-no-known-wrong",
     "no-checks",
     "no-solution",
+    "regex-no-known-wrong",
     "rubric-no-scenarios",
     "rubric-no-solution",
   ]);
   // The held-out checks alone, for what needs them and not the rest: only "no-checks".
   expect(missingHeldouts(seeds, vault, slugs)).toEqual(["no-checks"]);
   // A directory that is not there holds none.
-  expect(missingPrivateFiles(seeds, join(vault, "nope"), slugs)).toEqual([
-    "complete",
-    "no-checks",
-    "no-solution",
-    "rubric-complete",
-    "rubric-no-scenarios",
-    "rubric-no-solution",
-  ]);
+  expect(missingPrivateFiles(seeds, join(vault, "nope"), slugs)).toEqual(
+    slugs.filter((slug) => slug !== "no-criteria"),
+  );
   expect(missingHeldouts(seeds, join(vault, "nope"), slugs)).toEqual([
+    "code-complete",
+    "code-no-known-wrong",
     "complete",
     "no-checks",
     "no-solution",
+    "regex-complete",
+    "regex-no-known-wrong",
   ]);
 });

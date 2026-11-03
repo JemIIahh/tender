@@ -28,6 +28,7 @@ import { describe, expect, test } from "vitest";
 import { type LlmHandler, startFakeLlm } from "../packages/judge/test/fake-llm";
 import {
   heldoutFileOf,
+  knownWrongFileOf,
   missingPrivateFiles,
   PRIVATE_DIR_VARIABLE,
   privateDirOf,
@@ -909,178 +910,50 @@ describe.each(JSON_SCHEMA_SLUGS)("json_schema seed %s", (slug) => {
  * 50) or into some other wrong regex is not paid either, and then it tests nothing.
  */
 const NEAR_MISS_SCORE = 90;
-const KNOWN_WRONG_REGEXES: Record<
-  string,
-  { why: string; pattern: string; flags?: string; near?: number }[]
-> = {
-  "iso-date-regex": [
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-  ],
-  "semver-regex": [
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-  ],
-  "near-account-regex": [
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-  ],
-  "ipv4-regex": [
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-  ],
-  "hex-color-regex": [
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      // [redacted]
-      // [redacted]
-      why: "[redacted]",
-      pattern: "[redacted]",
-      near: 80,
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-      near: 85,
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-  ],
-  "duration-regex": [
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-      flags: "[redacted]",
-    },
-  ],
-};
+type KnownWrongRegex = { why: string; pattern: string; flags?: string; near?: number };
+type KnownWrongTest = { why: string; source: string };
 
-describe.each(Object.keys(KNOWN_WRONG_REGEXES))("regex seed %s", (slug) => {
+const knownWrongPath = (slug: string) => knownWrongFileOf(PRIVATE_DIR, slug);
+
+/**
+ * The known-wrong answers of a seed from the private directory, checked for shape; null where it
+ * has none. Each is the seed's solution with one rule broken (the tests below need it to be a near
+ * miss), so a copy of them here would be a copy of the answer one edit away: they are in
+ * `<private dir>/<slug>/known-wrong.json`, beside the solution (see README.md).
+ */
+function knownWrongOf<T extends KnownWrongRegex | KnownWrongTest>(
+  slug: string,
+  field: "pattern" | "source",
+): T[] | null {
+  if (!existsSync(knownWrongPath(slug))) return null;
+  const document: unknown = JSON.parse(readFileSync(knownWrongPath(slug), "utf8"));
+  const bad = (what: string) => new Error(`${knownWrongPath(slug)}: ${what}`);
+  if (!Array.isArray(document) || document.length === 0) throw bad("not a list of answers");
+  for (const one of document as Record<string, unknown>[]) {
+    if (typeof one?.why !== "string" || typeof one[field] !== "string") {
+      throw bad(`an answer has no \`why\` or no \`${field}\``);
+    }
+    if (field === "pattern") {
+      if (one.flags !== undefined && typeof one.flags !== "string")
+        throw bad(`"${one.why}": bad flags`);
+      if (one.near !== undefined && typeof one.near !== "number")
+        throw bad(`"${one.why}": bad near`);
+    }
+  }
+  return document as T[];
+}
+
+const REGEX_SLUGS = SLUGS.filter((slug) => load(slug).criteria.kind === "regex_cases");
+
+describe.each(REGEX_SLUGS)("regex seed %s", (slug) => {
   test("known_wrong_regexes_are_not_paid", async ({ skip }) => {
     const { criteria, heldout } = loadPrivate(slug, skip);
+    const wrong = knownWrongOf<KnownWrongRegex>(slug, "pattern");
+    if (wrong === null) return skip(PRIVATE_NOTE);
 
     const paid: string[] = [];
     const broken: string[] = [];
-    for (const { why, pattern, flags = "", near = NEAR_MISS_SCORE } of KNOWN_WRONG_REGEXES[slug] ??
-      []) {
+    for (const { why, pattern, flags = "", near = NEAR_MISS_SCORE } of wrong) {
       const answer = new TextEncoder().encode(JSON.stringify({ pattern, flags }));
       const result = await scoreAnswer(criteria, heldout, answer);
       if (result.passed) paid.push(why);
@@ -1091,134 +964,17 @@ describe.each(Object.keys(KNOWN_WRONG_REGEXES))("regex seed %s", (slug) => {
   });
 });
 
-/**
- * Functions a careless solver would write for the tests seeds, each breaking one rule of its brief.
- * A rule that no held-out case tests pays every function that breaks it, so none of these may
- * reach the pass mark. They must also run: one that throws on every case tests nothing, so each
- * has to pass at least one case.
- */
-const KNOWN_WRONG_TESTS: Record<string, { why: string; source: string }[]> = {
-  "slugify-title": [
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-  ],
-  "near-to-yocto": [
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-  ],
-  "latest-per-id": [
-    {
-      why: "[redacted]",
-      source:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      source:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      source:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      source:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      source:
-        "[redacted]",
-    },
-  ],
-  "wrap-text": [
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-  ],
-};
-
 const TESTS_SLUGS = SLUGS.filter((slug) => load(slug).criteria.kind === "tests");
 
 describe.each(TESTS_SLUGS)("tests seed %s", (slug) => {
+  // Functions a careless solver would write for the tests seeds, each breaking one rule of its
+  // brief (the private known-wrong.json). A rule that no held-out case tests pays every function
+  // that breaks it, so none of these may reach the pass mark. They must also run: one that throws
+  // on every case tests nothing, so each has to pass at least one case.
   test("known_wrong_functions_are_not_paid", async ({ skip }) => {
     const { criteria, heldout } = loadPrivate(slug, skip);
-    const wrong = KNOWN_WRONG_TESTS[slug] ?? [];
+    const wrong = knownWrongOf<KnownWrongTest>(slug, "source");
+    if (wrong === null) return skip(PRIVATE_NOTE);
     expect(wrong.length, "known-wrong functions written for this seed").toBeGreaterThanOrEqual(4);
 
     const paid: string[] = [];
