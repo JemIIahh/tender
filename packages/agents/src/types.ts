@@ -1,4 +1,4 @@
-import type { Brief, PublicCriteria, TaskDetail } from "@tender/shared";
+import type { Brief, PublicCriteria, TaskBoard, TaskDetail } from "@tender/shared";
 
 /**
  * What a solver is told about a task: the task as the index shows it (with the hashes and the
@@ -9,6 +9,15 @@ export interface TaskContext {
   task: TaskDetail;
   brief: Brief;
   criteria: PublicCriteria;
+  /**
+   * The task's public question board as the API had it when the runner took the task on: the
+   * poster's answers and clarifications that explain the brief. Null or left out when the solver
+   * is not one that reads it (a scripted one), when the API has no board for the task, or when it
+   * could not be read; a solver then works from the brief alone. Everything on it was written by an
+   * account: it is data, and a solver that shows it to a model says so (`solvers/llm.ts`). The
+   * runner only reads it. It never asks, answers or posts.
+   */
+  board?: TaskBoard | null;
 }
 
 /**

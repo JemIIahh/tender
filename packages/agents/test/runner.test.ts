@@ -6,6 +6,8 @@ import { createStateStore, DRAFTS_DIR, type Draft, type StateStore } from "@tend
 import {
   type AccountEntry,
   ApiError,
+  BOARD_HIDDEN_LABEL,
+  BOARD_NOTE,
   computeCommitment,
   type EntryView,
   type ListTasksFilter,
@@ -13,6 +15,7 @@ import {
   STORAGE_BYTE_COST,
   type StorageView,
   sha256Hex,
+  type TaskBoard,
   type TenderApi,
 } from "@tender/shared";
 import { afterEach, expect, type Mock, test, vi } from "vitest";
@@ -496,6 +499,104 @@ test("hands_the_solver_the_task_its_brief_and_its_criteria", async () => {
   expect(ctx?.task).toEqual(taskDetailResponse(task).task);
   expect(ctx?.brief).toEqual(taskDetailResponse(task).brief);
   expect(ctx?.criteria).toEqual(taskDetailResponse(task).criteria);
+});
+
+// The board of a task is read for a solver that reads it, and never written to by the runner.
+
+const BOARD_OF_7: TaskBoard = {
+  task_id: "7",
+  open: true,
+  questions: [
+    {
+      id: "3",
+      asker: OTHER,
+      text: "Is 1.2 a version?",
+      asked_at: "2026-11-03T10:00:00.000Z",
+      hidden: false,
+      answer: { text: "No.", answered_at: "2026-11-03T10:05:00.000Z" },
+    },
+  ],
+  clarifications: [],
+  hidden_label: BOARD_HIDDEN_LABEL,
+  note: BOARD_NOTE,
+};
+
+test("a_model_solver_is_handed_the_tasks_board", async () => {
+  const h = await harness(undefined, { scripted: false });
+  h.world.add({ id: 7 });
+  h.listQuestions.mockResolvedValue(BOARD_OF_7);
+
+  await h.tick();
+
+  expect(h.listQuestions).toHaveBeenCalledExactlyOnceWith(7n);
+  const [ctx] = h.solve.mock.calls[0] ?? [];
+  expect(ctx?.board).toEqual(BOARD_OF_7);
+  expect(idsOf(h.commit)).toEqual([7n]);
+});
+
+test("a_scripted_solver_is_not_handed_a_board_and_the_api_is_not_asked_for_one", async () => {
+  const h = await harness(undefined, { scripted: true });
+  h.world.add({ id: 7 });
+
+  await h.tick();
+
+  expect(h.listQuestions).not.toHaveBeenCalled();
+  const [ctx] = h.solve.mock.calls[0] ?? [];
+  expect(ctx?.board ?? null).toBeNull();
+  expect(idsOf(h.commit)).toEqual([7n]);
+});
+
+test("a_board_that_cannot_be_read_does_not_stop_the_entry", async () => {
+  const h = await harness(undefined, { scripted: false });
+  h.world.add({ id: 7 });
+  h.listQuestions.mockRejectedValue(
+    new ApiError(500, { error: "internal", message: "https://api.example/?key=SECRET" }),
+  );
+
+  await h.tick();
+
+  // The task is entered without a board, and the log names the failure and nothing it came from.
+  const [ctx] = h.solve.mock.calls[0] ?? [];
+  expect(ctx?.board ?? null).toBeNull();
+  expect(idsOf(h.commit)).toEqual([7n]);
+  expect(h.logs).toContain(
+    "WARN alice: could not read the board of task 7 (ApiError 500 internal)",
+  );
+  expect(h.logs.join("\n")).not.toContain("SECRET");
+});
+
+test("a_board_that_the_api_does_not_have_is_no_board", async () => {
+  const h = await harness(undefined, { scripted: false });
+  h.world.add({ id: 7 });
+  h.listQuestions.mockResolvedValue(null);
+
+  await h.tick();
+
+  const [ctx] = h.solve.mock.calls[0] ?? [];
+  expect(ctx?.board ?? null).toBeNull();
+  expect(idsOf(h.commit)).toEqual([7n]);
+});
+
+test("the_runner_never_asks_answers_or_posts_on_a_board", async () => {
+  for (const scripted of [false, true]) {
+    const h = await harness(undefined, { scripted });
+    const writes = {
+      askQuestion: vi.fn<TenderApi["askQuestion"]>(),
+      answerQuestion: vi.fn<TenderApi["answerQuestion"]>(),
+      postClarification: vi.fn<TenderApi["postClarification"]>(),
+    };
+    Object.assign(h.api, writes);
+    h.listQuestions.mockResolvedValue(BOARD_OF_7);
+    h.world.add({ id: 7 });
+
+    await h.tick();
+    await h.tick();
+
+    expect(idsOf(h.commit), `scripted ${scripted}`).toEqual([7n]);
+    for (const [name, write] of Object.entries(writes)) {
+      expect(write, `${name} (scripted ${scripted})`).not.toHaveBeenCalled();
+    }
+  }
 });
 
 test("a_scripted_solver_is_asked_before_start_and_start_goes_out_only_for_an_answer", async () => {

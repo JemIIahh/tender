@@ -12,6 +12,7 @@ import {
   randomSalt,
   sha256Hex,
   storageShortfall,
+  type TaskBoard,
   type TaskDetail,
   type TaskDetailResponse,
   type TaskSummary,
@@ -520,7 +521,10 @@ async function enter(run: Run, summary: TaskSummary): Promise<void> {
     return;
   }
 
-  const ctx: TaskContext = { task, brief, criteria };
+  // A solver that thinks reads what the poster has said in public on the task. A scripted one
+  // answers from a file and has no use for it, so the API is not asked.
+  const board = run.solver.scripted ? null : await boardOf(run, id);
+  const ctx: TaskContext = { task, brief, criteria, board };
   let content: Uint8Array | null;
   if (run.solver.scripted) {
     // Review M6: a scripted solver reads its answer from a file, so asking is free, and a
@@ -540,6 +544,20 @@ async function enter(run: Run, summary: TaskSummary): Promise<void> {
     if (content === null) return;
   }
   await commit(run, id, content, task.created_at);
+}
+
+/**
+ * The question board of task `id`, or null when the API has none or cannot be read. A board is a
+ * help and never a condition: a failure is logged by its type and code and nothing it came from,
+ * and the task is entered without it.
+ */
+async function boardOf(run: Run, id: string): Promise<TaskBoard | null> {
+  try {
+    return await run.api.listQuestions(BigInt(id));
+  } catch (error) {
+    run.log(`WARN ${run.name}: could not read the board of task ${id} (${describe(error)})`);
+    return null;
+  }
 }
 
 /**
