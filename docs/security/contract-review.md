@@ -1,8 +1,13 @@
-# Tender contract: freeze review (contract-freeze-1)
+# Tender contract: freeze review
 
 Plan 01 Task 16, run 2026-11-03 on branch `wt/p01-p1`, before the contract is deployed anywhere
-public. It covers `contract/tender/src` at the tag `contract-freeze-1`: the P0 contract plus
-pooled top-ups (Task 13), lineage (Task 14) and delegate keys (Task 15).
+public. It covers `contract/tender/src` at commit `6b79b40`: the P0 contract plus pooled top-ups
+(Task 13), lineage (Task 14) and delegate keys (Task 15).
+
+**Freeze tag deferred to after 16b (owner decision).** The owner approved one more contract change,
+a refundable agent registration bond with open tasks limited to registered agents (Task 16b, on
+this lane), so `contract-freeze-1` is not set here. It goes on the commit after 16b, which this
+review must then be extended to cover.
 
 ## How it was reviewed
 
@@ -35,8 +40,8 @@ low is minor gain for sustained effort; info is a confirmed observation of minim
 | 4 | **`res/` could be committed stale.** `check-res.sh` compared `SOURCES.sha256` with the sources and the wasm with `SHA256SUMS`, but nothing tied the two: a commit carrying the new sources and `SOURCES.sha256` without the rebuilt wasm and `SHA256SUMS` passed CI, so the committed, deployable wasm could be an older build (final-fix parking list). `SOURCES.sha256` now records the sources' hash bound to `SHA256SUMS`, and `check-res.sh` recomputes both. | Low | `7ce4b31` | scratch-clone check: that commit, the reverse (wasm without sources), and a wasm that does not match its sums all fail; a consistent `res/` passes |
 | 5 | `with_profile` used `get_mut`, which marks a miss as changed, so each commit, reveal and pick of an unregistered account removed a missing key on flush. Gas only (Task 5/7 minors, R33). | Info | `9045725` | behaviour unchanged; the existing suites |
 | 6 | `storage_deposit` with `registration_only` on a registered account wrote the unchanged record back. Gas only (final-fix parking list). | Info | `9045725` | `storage_deposit_follows_nep145_registration_only` (sandbox) unchanged |
-| 7 | **The property oracle had two blind spots** (Task 11 review, R33): any panic counted as a rejection, so an overflow or `unwrap` crash could pass for a rule; and a settlement that went through was never checked against the rules. Every rejection must now carry an `E_` code, and a pick, empty pick or void that succeeds must be one the model allows. The token's `min_reward` in the harness is now 10, so random top-ups meet finding 1's rule. | Info (tests) | freeze commit | `invariants_hold_after_every_call` at 512 cases, `scripted_run_reaches_every_outcome` |
-| 8 | **The storage layout was not pinned** (Task 2 minor, R33). The collections' prefixes 0 to 7, the `VoidReason` and `Outcome` tags, a fresh contract's root state and a task record are now pinned byte for byte, so a change that moves the layout fails until it comes with a `migrate`. | Info (tests) | freeze commit | `storage_layout_is_pinned` |
+| 7 | **The property oracle had two blind spots** (Task 11 review, R33): any panic counted as a rejection, so an overflow or `unwrap` crash could pass for a rule; and a settlement that went through was never checked against the rules. Every rejection must now carry an `E_` code, and a pick, empty pick or void that succeeds must be one the model allows. The token's `min_reward` in the harness is now 10, so random top-ups meet finding 1's rule. | Info (tests) | `6b79b40` | `invariants_hold_after_every_call` at 512 cases, `scripted_run_reaches_every_outcome` |
+| 8 | **The storage layout was not pinned** (Task 2 minor, R33). The collections' prefixes 0 to 7, the `VoidReason` and `Outcome` tags, a fresh contract's root state and a task record are now pinned byte for byte, so a change that moves the layout fails until it comes with a `migrate`. | Info (tests) | `6b79b40` | `storage_layout_is_pinned` |
 
 ### Checked, and accepted or left to operations
 
@@ -99,7 +104,7 @@ low is minor gain for sustained effort; info is a confirmed observation of minim
 
 ## The adversarial suite
 
-All pass on the freeze build (`tender.wasm` of the tag; sums in `contract/res/SHA256SUMS`).
+All pass on the build at `6b79b40` (`tender.wasm` sha256 `9de8a3d5…`; sums in `contract/res/SHA256SUMS`).
 
 | Test | What it tries | Result |
 |---|---|---|
