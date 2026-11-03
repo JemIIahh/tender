@@ -15,18 +15,22 @@ import {
   emptyForm,
   firstError,
   formatForKind,
+  fundingOf,
   type PostForm,
   type PostLimits,
   readPostLimits,
+  rewardOf,
   tokenOf,
 } from "../../lib/post";
 import {
   defaultDeps,
+  PostStopped,
   type Stage,
   SubmitFailure,
   type SubmitResult,
   submitPost,
 } from "../../lib/postSubmit";
+import { type Told, toldFor } from "../../lib/told";
 import { readVault } from "../../lib/vault";
 import { useWallet } from "../../lib/wallet";
 import { walletErrorMessage } from "../../lib/walletErrors";
@@ -58,6 +62,15 @@ const NEXT_LABEL: Record<StepId, string> = {
   reward: "Review",
   review: "",
 };
+
+/** The words after the person stopped waiting for the sign-in: nothing is on the chain. */
+const STOPPED_SIGNIN =
+  "You stopped waiting for your wallet. Nothing was posted. Press Post to try again.";
+
+/** One press of Post. Once `stopped`, nothing it still does or says is for the page. */
+interface Run {
+  stopped: boolean;
+}
 
 type LimitsState =
   | { status: "loading" }
@@ -95,8 +108,10 @@ export function PostWizard({
   const [vault, setVault] = useState<VaultState>({ status: "idle" });
   const [vaultNonce, setVaultNonce] = useState(0);
   const [running, setRunning] = useState<Stage | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
-  const [outcome, setOutcome] = useState<SubmitResult | null>(null);
+  // What happened is kept with the account it happened to, and shown while the wallet is that
+  // account's: after a switch it is not news, and it is back, the lock included, on a switch back.
+  const [failure, setFailure] = useState<Told<string> | null>(null);
+  const [outcome, setOutcome] = useState<Told<SubmitResult> | null>(null);
   const [connecting, setConnecting] = useState(false);
 
   const heading = useRef<HTMLHeadingElement>(null);
@@ -105,10 +120,17 @@ export function PostWizard({
   // before then must not start a second post.
   const busy = useRef(false);
   const mounted = useRef(true);
+  // The press of Post that is under way, for the person to stop waiting for it.
+  const current = useRef<Run | null>(null);
+  // The account whose last send was of unknown outcome, until a post has been through the chain
+  // look: the first press after the person unlocks Post reads the chain for the task first.
+  const lookFor = useRef<string | null>(null);
   // The account the wallet is connected as, as of the last render. A post checks it just before it
   // asks the wallet to sign, since the wallet signs as whoever is connected then.
   const latestAccount = useRef(accountId);
   latestAccount.current = accountId;
+  const failed = toldFor(failure, accountId);
+  const result = toldFor(outcome, accountId);
 
   useEffect(() => {
     mounted.current = true;
@@ -291,7 +313,7 @@ export function PostWizard({
       await connect();
     } catch (error) {
       console.error(error);
-      setFailure(walletErrorMessage(error));
+      setFailure({ account: null, value: walletErrorMessage(error) });
     } finally {
       if (mounted.current) setConnecting(false);
     }
@@ -300,36 +322,93 @@ export function PostWizard({
   const post = async () => {
     const chosen = readyLimits === null ? undefined : tokenOf(form, readyLimits);
     if (busy.current || accountId === null || chosen === undefined) return;
+    // What Review shows is what the person approves: the post stops if the chain asks for more.
+    const reward = rewardOf(form, chosen.token);
+    const shown =
+      vault.status === "ready" && reward !== null
+        ? fundingOf(vault.data, chosen.token, reward)
+        : null;
+    if (shown === null) return;
+    const account = accountId;
+    const run: Run = { stopped: false };
+    current.current = run;
     busy.current = true;
     setFailure(null);
     setRunning("upload");
     try {
-      const result = await submitPost(
-        { form, account: accountId, tokenId: chosen.token, judgeAccount },
-        { ...defaultDeps, account: () => latestAccount.current, signIn, signAndSend },
+      const done = await submitPost(
+        {
+          form,
+          account,
+          tokenId: chosen.token,
+          judgeAccount,
+          lookFirst: lookFor.current === account,
+          shown: { toDeposit: shown.toDeposit, storageTopUp: shown.storageTopUp },
+        },
+        {
+          ...defaultDeps,
+          account: () => latestAccount.current,
+          signIn,
+          signAndSend,
+          stopped: () => run.stopped,
+        },
         (stage) => {
-          if (mounted.current) setRunning(stage);
+          if (run.stopped || !mounted.current) return;
+          // Past the look at the chain, so the task was not found there: the next press needs none.
+          if (stage !== "check") lookFor.current = null;
+          setRunning(stage);
         },
       );
-      if (!mounted.current) return;
-      setOutcome(result);
-      if (result.kind === "posted") router.push(`/tasks/${result.taskId}`);
+      if (run.stopped || !mounted.current) return;
+      if (done.kind === "unknown") lookFor.current = account;
+      setOutcome({ account, value: done });
+      if (done.kind === "posted") router.push(`/tasks/${done.taskId}`);
     } catch (error) {
+      if (error instanceof PostStopped) return;
       console.error(error);
-      if (mounted.current) {
-        setFailure(error instanceof SubmitFailure ? error.message : errorMessage(error));
+      if (run.stopped || !mounted.current) return;
+      setFailure({
+        account,
+        value: error instanceof SubmitFailure ? error.message : errorMessage(error),
+      });
+      // The balances Review showed may not be the chain's any more: it reads them again.
+      if (error instanceof SubmitFailure && (error.stage === "vault" || error.stage === "wallet")) {
+        setVaultNonce((n) => n + 1);
       }
     } finally {
-      busy.current = false;
-      if (mounted.current) setRunning(null);
+      if (!run.stopped) {
+        busy.current = false;
+        if (mounted.current) setRunning(null);
+      }
     }
+  };
+
+  // The wallet has not answered for a while and the person gives up on it. The post is let go: it
+  // asks the wallet for nothing more, and what it still says is not heard. At the sign-in nothing
+  // is on the chain, so Post is open again. With the transactions at the wallet they may yet be
+  // sent, so Post is locked as after any send of unknown outcome. The press has taken away the
+  // button that had the focus, so the focus goes to the heading above Post.
+  const stopWaiting = () => {
+    const run = current.current;
+    if (run === null || run.stopped || accountId === null) return;
+    if (running !== "signin" && running !== "wallet") return;
+    run.stopped = true;
+    busy.current = false;
+    setRunning(null);
+    if (running === "signin") {
+      setFailure({ account: accountId, value: STOPPED_SIGNIN });
+    } else {
+      lookFor.current = accountId;
+      setOutcome({ account: accountId, value: { kind: "unknown" } });
+    }
+    document.getElementById("post-ready")?.focus();
   };
 
   // The last send's outcome is not known and the person has looked: the lock comes off, and the
   // balances are read again so that Review shows what they are now. The press has taken away the
   // button that had the focus, so the focus goes to the heading that the Post button is under.
   const unlockPost = () => {
-    if (outcome?.kind !== "unknown") return;
+    if (result?.kind !== "unknown") return;
     setOutcome(null);
     setVaultNonce((n) => n + 1);
     document.getElementById("post-ready")?.focus();
@@ -397,13 +476,14 @@ export function PostWizard({
             connecting={connecting}
             vault={vault}
             running={running}
-            failure={failure}
-            outcome={outcome}
+            failure={failed}
+            outcome={result}
             earlierProblem={earlierProblem}
             onConnect={connectWallet}
             onRecheck={() => setVaultNonce((n) => n + 1)}
             onBack={back}
             onPost={post}
+            onStop={stopWaiting}
             onUnlock={unlockPost}
           />
         );

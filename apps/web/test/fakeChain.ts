@@ -221,6 +221,19 @@ export class FakeChain {
           };
         case "storage_balance_of":
           return this.storageView(account);
+        case "task_count":
+          return (this.nextTaskId - 1n).toString();
+        case "get_tasks": {
+          // As the contract pages: from `from_id` (at least 1), up to `limit` (1 to 50) tasks.
+          const from = BigInt(String(args.from_id ?? "1")) || 1n;
+          const limit = BigInt(Math.min(50, Math.max(1, Number(args.limit ?? 50))));
+          const page: unknown[] = [];
+          for (let id = from; id < from + limit && id < this.nextTaskId; id++) {
+            const task = this.tasks.get(id);
+            if (task !== undefined) page.push(this.taskView(task));
+          }
+          return page;
+        }
         case "balances_of":
           return [...(this.vault.get(account) ?? [])].map(([token, amount]) => ({
             token,
@@ -243,6 +256,37 @@ export class FakeChain {
       }
     }
     throw new Error(`CodeDoesNotExist: ${contractId}`);
+  }
+
+  /** A task as `get_tasks` returns it: no entries yet, and open for commits. */
+  private taskView(task: FakeTask) {
+    return {
+      id: task.id.toString(),
+      poster: task.poster,
+      token: task.token,
+      reward: task.reward.toString(),
+      fee_bps: task.feeBps,
+      brief_uri: task.briefUri,
+      brief_hash: task.briefHash,
+      criteria_hash: task.criteriaHash,
+      heldout_commitment: task.heldoutCommitment,
+      verifier: task.verifier,
+      created_at: task.createdAt.toString(),
+      commit_deadline: task.commitDeadline.toString(),
+      reveal_deadline: task.revealDeadline.toString(),
+      pick_deadline: task.pickDeadline.toString(),
+      fallback_deadline: task.fallbackDeadline.toString(),
+      max_entries: task.maxEntries,
+      max_winners: task.maxWinners,
+      invited: task.invited,
+      parent: null,
+      commit_count: 0,
+      reveal_count: 0,
+      cleaned: 0,
+      funders: [],
+      outcome: null,
+      phase: "open",
+    };
   }
 
   private storageView(account: string) {

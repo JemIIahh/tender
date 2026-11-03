@@ -3,7 +3,10 @@ import {
   type BlobUpload,
   type BlobUploadResponse,
   MAX_URI_BYTES,
+  type TaskView,
+  TaskViewSchema,
   type TenderCall,
+  U64StringSchema,
 } from "@tender/shared";
 import { api } from "./api";
 import { heldToken, tokenForAccount } from "./apiToken";
@@ -19,6 +22,7 @@ import {
   planPostCalls,
   rewardOf,
 } from "./post";
+import { RpcError, view } from "./rpc";
 import { describeAmount, readVault, type VaultData } from "./vault";
 import type { SendResult } from "./wallet";
 import {
@@ -35,6 +39,8 @@ import {
 //   1. the documents are built and the reward is read as an amount, before anything leaves the
 //      page (the steps of the wizard hold the rest of the form to what Tender allows, which this
 //      does not see);
+//   1b. only on the first press after a send of unknown outcome: the chain's latest tasks are read
+//      for this very task, and if it is there, that is the result and nothing is sent again;
 //   2. a sign-in to the API, if there is no token for the account;
 //   3. the brief and the criteria are uploaded, each to its own place, and the held-out checks too
 //      if the Judge is to pick (the only reader of them at the API). For any other verifier they
@@ -43,7 +49,8 @@ import {
 //   4. the vault and the storage balance are read afresh, and the calls are planned from what they
 //      hold;
 //   5. one `signAndSend`: the storage top-up and the deposit that tops the vault up, if either is
-//      short, and `post_task`.
+//      short, and `post_task`. If the fresh read asks for more than the page showed the person (a
+//      deposit or a top-up that is larger now), nothing is sent: the page shows the new amounts.
 //
 // If the wallet refuses at 5, what was uploaded stays where it is and the form is as it was: the
 // next try uploads the same bytes again, which the API stores once. The token is read from its
@@ -52,10 +59,10 @@ import {
 // wallet, and never cleared from here.
 
 /** Where a post stopped, for the words about it. */
-export type FailureStage = "documents" | "signin" | "upload" | "vault" | "wallet";
+export type FailureStage = "documents" | "check" | "signin" | "upload" | "vault" | "wallet";
 
 /** What the post is doing, for a line of progress. */
-export type Stage = "signin" | "upload" | "vault" | "wallet";
+export type Stage = "check" | "signin" | "upload" | "vault" | "wallet";
 
 /**
  * A post that did not happen, in words for the person. `stage` says how far it got: before
@@ -79,6 +86,17 @@ class UploadMismatch extends Error {
   }
 }
 
+/**
+ * The person stopped waiting (`SubmitDeps.stopped`): the post gave up at the next step it came to,
+ * before it asked the wallet for anything more. Nothing is said of it: the page has said it.
+ */
+export class PostStopped extends Error {
+  constructor() {
+    super("the person stopped waiting for the wallet");
+    this.name = "PostStopped";
+  }
+}
+
 /** What a post needs from the world. The page gives the real ones; a test gives its own. */
 export interface SubmitDeps {
   /** The account the wallet is connected as now, or null. Read afresh. */
@@ -90,7 +108,14 @@ export interface SubmitDeps {
   uploadBlob(token: string, blob: BlobUpload): Promise<BlobUploadResponse>;
   uploadHeldout(token: string, commitment: string, bytes: Uint8Array): Promise<void>;
   readVault(account: string): Promise<VaultData>;
+  /** The latest tasks on chain (up to `RECENT_TASKS`), read through the browser's own node. */
+  recentTasks(): Promise<TaskView[]>;
   signAndSend(calls: readonly TenderCall[]): Promise<SendResult>;
+  /**
+   * Whether the person has stopped waiting for the wallet. Read afresh, after each wait on it: a
+   * post that was given up on goes no further, so a wallet that answers late is not asked for more.
+   */
+  stopped?(): boolean;
 }
 
 /**
@@ -102,14 +127,48 @@ export function liveToken(account: string): string | null {
   return tokenForAccount(heldToken(), account);
 }
 
+/** How many of the newest tasks a look for an earlier post reads: the most the contract returns. */
+export const RECENT_TASKS = 50;
+
+/**
+ * The newest `RECENT_TASKS` tasks, from the chain itself: the index lags it, and the point of the
+ * look is to find a task that was only just posted. Throws if the node can't be asked or answers
+ * with anything but what the contract promises.
+ */
+export async function recentTasks(): Promise<TaskView[]> {
+  const count = U64StringSchema.safeParse(await view<unknown>(config.contractId, "task_count"));
+  if (!count.success) {
+    throw new RpcError("task_count returned something other than what the contract promises");
+  }
+  const last = BigInt(count.data);
+  const from = last > BigInt(RECENT_TASKS) ? last - BigInt(RECENT_TASKS) + 1n : 1n;
+  const page = await view<unknown>(config.contractId, "get_tasks", {
+    from_id: from.toString(),
+    limit: RECENT_TASKS,
+  });
+  if (!Array.isArray(page)) {
+    throw new RpcError("get_tasks returned something other than what the contract promises");
+  }
+  return page.map((entry) => {
+    const task = TaskViewSchema.safeParse(entry);
+    if (!task.success) {
+      throw new RpcError("get_tasks returned something other than what the contract promises");
+    }
+    return task.data;
+  });
+}
+
 /** The real ones, but for the wallet's: the page supplies those from `useWallet`. */
-export const defaultDeps: Pick<SubmitDeps, "token" | "uploadBlob" | "uploadHeldout" | "readVault"> =
-  {
-    token: liveToken,
-    uploadBlob: (token, blob) => api.uploadBlob(token, blob),
-    uploadHeldout: (token, commitment, bytes) => api.uploadHeldout(token, commitment, bytes),
-    readVault,
-  };
+export const defaultDeps: Pick<
+  SubmitDeps,
+  "token" | "uploadBlob" | "uploadHeldout" | "readVault" | "recentTasks"
+> = {
+  token: liveToken,
+  uploadBlob: (token, blob) => api.uploadBlob(token, blob),
+  uploadHeldout: (token, commitment, bytes) => api.uploadHeldout(token, commitment, bytes),
+  readVault,
+  recentTasks,
+};
 
 export interface SubmitInput {
   form: PostForm;
@@ -119,6 +178,16 @@ export interface SubmitInput {
   tokenId: string;
   /** The Judge's account, for a form that picks the Judge as verifier. */
   judgeAccount: string | null;
+  /**
+   * Set on the first press after a send whose outcome was not known: the chain is read for this
+   * task before anything else, and if it is there it is the result, and nothing is sent again.
+   */
+  lookFirst?: boolean;
+  /**
+   * What the page showed the person that would be sent: the deposit and the storage top-up. If the
+   * chain asks for more than that when the post reads it afresh, nothing is sent.
+   */
+  shown?: { toDeposit: bigint; storageTopUp: bigint };
 }
 
 export type SubmitResult =
@@ -151,6 +220,12 @@ const PANIC_WORDS: Record<string, string> = {
   E_STORAGE: "Your storage with Tender ran short as the task was posted.",
 };
 
+/** The contract's refusals that pressing Post again, with nothing changed, will not get past. */
+const AGAIN_WONT_HELP = new Set(["E_TOKEN", "E_PAUSED"]);
+
+/** The post found the balances larger than the page showed. Review reads them again. */
+const BALANCES_CHANGED = "Your balances changed. Check the amounts and press Post again.";
+
 /** A wallet the person turned down, or a transaction that failed with no contract code. */
 const WALLET_DID_NOT_FINISH =
   "The wallet didn't finish. A deposit may have gone through: check the Wallet page. Your documents are saved; press Post to try again.";
@@ -160,7 +235,6 @@ interface SentPlan {
   calls: readonly TenderCall[];
   account: string;
   tokenId: string;
-  reward: bigint;
 }
 
 /**
@@ -173,10 +247,9 @@ async function depositWords(plan: SentPlan, readNow: SubmitDeps["readVault"]): P
   try {
     const data = await readNow(plan.account);
     const held = data.rows.find((row) => row.token === plan.tokenId)?.vault ?? 0n;
-    const holds = describeAmount(held, plan.tokenId);
-    return held >= plan.reward
-      ? `Your deposit went through: your vault holds ${holds}.`
-      : `Your vault holds ${holds} now, and a deposit Tender couldn't take went back to your wallet.`;
+    // What one read shows is the vault now; where the deposit is, if it is not there, is only
+    // inferred from the way a token and `ft_on_transfer` behave.
+    return `Your vault holds ${describeAmount(held, plan.tokenId)}. If the deposit isn't there, it went back to your wallet.`;
   } catch (error) {
     console.error(error);
     return "The deposit may have come back to your wallet: check the Wallet page.";
@@ -197,7 +270,7 @@ async function sendWords(
     const again =
       error.code === "E_STORAGE"
         ? "Press Post to try again: the page adds what's missing."
-        : deposited
+        : deposited && !AGAIN_WONT_HELP.has(error.code)
           ? "Press Post to try again."
           : "";
     return [why, money, again].filter((part) => part !== "").join(" ");
@@ -259,11 +332,16 @@ export async function submitPost(
 ): Promise<SubmitResult> {
   const { form, account, tokenId, judgeAccount } = input;
 
+  /** Gives up if the person stopped waiting: called after each wait on the wallet. */
+  function stillWanted(): void {
+    if (deps.stopped?.() === true) throw new PostStopped();
+  }
+
   async function at<T>(stage: FailureStage, work: () => Promise<T> | T): Promise<T> {
     try {
       return await work();
     } catch (cause) {
-      if (cause instanceof SubmitFailure) throw cause;
+      if (cause instanceof SubmitFailure || cause instanceof PostStopped) throw cause;
       throw new SubmitFailure(stage, wordsFor(stage, cause), cause);
     }
   }
@@ -274,6 +352,8 @@ export async function submitPost(
         return cause instanceof DocumentError
           ? cause.message
           : "Check the amount, the windows and the verifier: they can't be used as they are.";
+      case "check":
+        return `Couldn't look for your earlier post. ${errorMessage(cause)} Nothing was sent to your wallet.`;
       case "signin":
         return walletErrorMessage(cause);
       case "upload":
@@ -295,6 +375,7 @@ export async function submitPost(
   async function signedIn(): Promise<string> {
     onStage("signin");
     await at("signin", () => deps.signIn());
+    stillWanted();
     onStage("upload");
     const fresh = deps.token(account);
     if (fresh === null) {
@@ -337,6 +418,24 @@ export async function submitPost(
     }),
   );
 
+  // 1b. A send that may have posted the task is looked for on the chain before it is sent again:
+  // the index can lag, and the person has no list of their own tasks to look through. The look is
+  // of the newest tasks only; a task pushed out of them by `RECENT_TASKS` others in the meantime is
+  // not found, and the Tasks page the person was sent to is where it shows.
+  if (input.lookFirst === true) {
+    onStage("check");
+    const earlier = await at("check", async () =>
+      (await deps.recentTasks()).find(
+        (task) =>
+          task.poster === account &&
+          task.brief_hash === docs.briefHash &&
+          task.criteria_hash === docs.criteriaHash &&
+          task.heldout_commitment === docs.heldoutCommitment,
+      ),
+    );
+    if (earlier !== undefined) return { kind: "posted", taskId: earlier.id };
+  }
+
   // 2 and 3. Each request reads the token for itself.
   onStage("upload");
   const brief = await at("upload", async () => {
@@ -372,6 +471,15 @@ export async function submitPost(
   const vault = await at("vault", () => deps.readVault(account));
   const funding = fundingOf(vault, tokenId, reward);
   if (funding.problem !== null) throw new SubmitFailure("vault", funding.problem);
+  // The person approved the amounts on Review. A read that asks for more than they saw is not
+  // theirs to approve, so it is shown to them first: the page reads the balances again.
+  const { shown } = input;
+  if (
+    shown !== undefined &&
+    (funding.toDeposit > shown.toDeposit || funding.storageTopUp > shown.storageTopUp)
+  ) {
+    throw new SubmitFailure("vault", BALANCES_CHANGED);
+  }
   const calls = planPostCalls({
     form,
     uris: { brief: brief.uri },
@@ -389,9 +497,10 @@ export async function submitPost(
   if (deps.account() !== account) {
     throw new SubmitFailure(
       "wallet",
-      "The wallet is connected as another account now, so nothing was sent. Switch back, or start again.",
+      "The wallet was disconnected or changed, so nothing was sent.",
     );
   }
+  stillWanted();
   onStage("wallet");
   let sent: SendResult;
   try {
@@ -411,7 +520,7 @@ export async function submitPost(
     }
     throw new SubmitFailure(
       "wallet",
-      await sendWords(cause, { calls, account, tokenId, reward }, deps.readVault),
+      await sendWords(cause, { calls, account, tokenId }, deps.readVault),
       cause,
     );
   }

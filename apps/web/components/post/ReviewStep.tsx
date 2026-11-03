@@ -21,6 +21,7 @@ import {
 } from "../../lib/post";
 import type { Stage, SubmitResult } from "../../lib/postSubmit";
 import { describeAmount, describeNear, type VaultData } from "../../lib/vault";
+import { useWaitedLong } from "../../lib/waiting";
 import { WALLET_CANNOT_SIGN_MESSAGE } from "../../lib/walletErrors";
 import { ErrorState } from "../ErrorState";
 import { PRIMARY, SECONDARY } from "./ui";
@@ -33,6 +34,7 @@ export type VaultState =
   | { status: "ready"; data: VaultData };
 
 const PROGRESS: Record<Stage, string> = {
+  check: "Looking for your earlier post on the chain.",
   signin: "Signing in to Tender. Approve the message in your wallet.",
   upload: "Saving your task's documents with Tender.",
   vault: "Reading your balances.",
@@ -147,6 +149,8 @@ export function ReviewStep(props: {
   onRecheck(): void;
   onBack(): void;
   onPost(): void;
+  /** The person gives up on a wallet that has not answered: offered after a wait at the wallet. */
+  onStop(): void;
   /** The person has looked and lifts the lock that a send of unknown outcome put on Post. */
   onUnlock(): void;
 }) {
@@ -177,6 +181,11 @@ export function ReviewStep(props: {
   // Why Post is off, in the order a person can put it right. A wallet that is not connected, or
   // cannot sign, has its own words below.
   const fundingProblem = funding?.problem ?? null;
+  // A wallet that does not answer leaves Back and Post off: after a while there is a way out.
+  const waitedLong = useWaitedLong(
+    props.running === "signin" || props.running === "wallet" ? props.running : null,
+  );
+
   const blocked: string | null = !ready
     ? null
     : limits.paused
@@ -319,6 +328,13 @@ export function ReviewStep(props: {
             {PROGRESS[props.running]}
           </p>
         )}
+        {waitedLong ? (
+          <div>
+            <button type="button" onClick={props.onStop} className={SECONDARY}>
+              Stop waiting
+            </button>
+          </div>
+        ) : null}
         {props.failure === null ? null : (
           <p
             role="alert"
