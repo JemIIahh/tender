@@ -6,6 +6,7 @@ import {
   hasResultUpload,
   type NewBlob,
   putBlob,
+  recordHeldoutUpload,
   recordResultUpload,
   type StoredBlob,
   setBlobPublic,
@@ -38,6 +39,7 @@ import {
   notFound,
   readJson,
 } from "../format";
+import { rateLimit, rateLimitsOf, uploadBudget } from "../limits";
 import { getScorecard } from "../queries";
 
 /**
@@ -79,6 +81,17 @@ const NOT_SERVED_HEADERS = { "Cache-Control": "no-store" };
 
 const CONFLICT = "these bytes are already stored as another kind";
 const NOT_CANONICAL = "not canonical JSON";
+const ANOTHER_KIND =
+  "these bytes are a canonical brief, criteria, held-out, profile or scorecard document: upload it as that kind, or end your answer with a newline";
+
+/** The documents of the other kinds, each by its schema, which a result may not be. */
+const DOCUMENT_SCHEMAS: readonly z.ZodType[] = [
+  BriefSchema,
+  PublicCriteriaSchema,
+  HeldoutSchema,
+  ProfileSchema,
+  ScorecardSchema,
+];
 
 /** `POST /v1/blobs`. `task_id` is the task of a result; a scorecard names its own. */
 const UploadSchema = z.strictObject({
@@ -108,18 +121,36 @@ const HeldoutUploadSchema = z.strictObject({
  *   that of every task of the same poster that uses the same held-out document. It has to name its
  *   uploader as its verifier, and one that carries the Judge's name is taken only from the team's
  *   Judge (`deps.judgeAccount`).
- * - `POST /v1/heldout` (signed in): stores a held-out document, which nobody may read.
+ * - `POST /v1/heldout` (signed in): stores a held-out document, which nobody may read while it is
+ *   private, and records each account that sends it (`recordHeldoutUpload`). The Judge takes a
+ *   task's held-out checks when the task's poster is among those accounts, so the poster's upload
+ *   counts whoever stored the bytes first, and it is answered as any other.
  * - `GET /v1/blobs/:sha256`: the bytes of a blob that may be read.
  * - `GET /v1/scorecards/:task_id`: the scorecard the task was settled with.
  *
  * Blobs are addressed by the SHA-256 of their bytes, and the hashes on chain are SHA-256s of
  * canonical JSON, so the JSON kinds have to arrive as those bytes. The first upload of some bytes
  * fixes their kind, and nothing re-kinds them: a held-out document made public as a brief would be
- * out, and its task could not be judged. `requireAuth` is the sign-in middleware, which the
- * caller passes in.
+ * out, and its task could not be judged. The kinds of document fit disjoint schemas, so only a
+ * result, which may be any bytes, could take the bytes of another kind first; a result that is the
+ * canonical bytes of another kind of document is refused (`isDocumentOfAnotherKind`).
+ *
+ * Both upload routes are signed in, and share their limits (`rateLimits` in `deps`): `upload`
+ * requests for each account, and the bytes `uploadBudget` allows, which the content is held to
+ * once it is found good and before it is stored. The team's accounts have no limit of an account.
+ * `requireAuth` is the sign-in middleware, which the caller passes in.
  */
 export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
   const app: BlobApp = new Hono();
+  const limits = rateLimitsOf(deps.rateLimits);
+  const team = new Set(deps.teamAccounts);
+  // After sign-in, which is what says whose upload it is. One count for the two routes.
+  const perAccount = rateLimit<{ Variables: AuthVariables }>(
+    limits.upload,
+    (c) => c.var.account,
+    (c) => team.has(c.var.account),
+  );
+  const budget = uploadBudget(limits, deps.teamAccounts);
 
   // Refuses a body over `MAX_BODY_BYTES` as it arrives, before anything parses it. It comes after
   // sign-in on the routes, so a request that is not signed in is turned away without being read.
@@ -134,12 +165,13 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     },
   });
 
-  app.post("/blobs", requireAuth, tooLarge, async (c) => {
+  app.post("/blobs", requireAuth, perAccount, tooLarge, async (c) => {
     const account = c.var.account;
     const upload = parse(UploadSchema, await readJson(c), "the request body");
     const bytes = decodeContent(upload.content_base64);
     const blob = await blobOf(deps, upload, bytes, account);
 
+    budget.spend(account, bytes.length);
     const { sha256, stored } = await store(deps.db, blob);
     if (stored.kind !== blob.kind) return fail(409, "conflict", CONFLICT);
     // Its first uploader may have stored it as private, which keeps the indexer from reading it.
@@ -162,7 +194,7 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     return c.json(body);
   });
 
-  app.post("/heldout", requireAuth, tooLarge, async (c) => {
+  app.post("/heldout", requireAuth, perAccount, tooLarge, async (c) => {
     const account = c.var.account;
     const upload = parse(HeldoutUploadSchema, await readJson(c), "the request body");
     const bytes = decodeContent(upload.content_base64);
@@ -171,7 +203,8 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     }
     checkDocument("the held-out document", bytes, HeldoutSchema);
 
-    const { stored } = await store(deps.db, {
+    budget.spend(account, bytes.length);
+    const { sha256, stored } = await store(deps.db, {
       kind: "heldout",
       contentType: "application/json",
       bytes,
@@ -179,15 +212,10 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
       isPublic: false,
     });
     if (stored.kind !== "heldout") return fail(409, "conflict", CONFLICT);
-    // The Judge takes a held-out only from the poster of the task. Bytes that another account
-    // stored first would not be taken from this one, so it learns that before it posts.
-    if (stored.uploader !== account) {
-      return fail(
-        409,
-        "conflict",
-        "these bytes are already stored as a held-out by another account",
-      );
-    }
+    // The row keeps its first uploader, which anyone who has the bytes can be. The Judge takes a
+    // task's held-out checks when its poster is among the accounts that sent them, so each one is
+    // recorded, the first included, and a stranger who was first cannot keep them from the poster.
+    await recordHeldoutUpload(deps.db, { sha256, account });
 
     const body: HeldoutUploadResponse = { ok: true };
     return c.json(body);
@@ -285,6 +313,28 @@ function isCanonical(document: unknown, bytes: Uint8Array): boolean {
 }
 
 /**
+ * Whether `bytes` are a document that another kind stores, in the canonical form it is stored in:
+ * a brief, criteria, a held-out document, a profile or a scorecard. Those are the bytes whose hash
+ * a task, an agent or a pick names, and the first upload of some bytes fixes their kind for good.
+ * Stored first as somebody's private result, they could never be that document: the poster's
+ * upload would be a 409, the task would have no title, and the Judge would refuse its criteria or
+ * its held-out checks. A result is the entrant's own, so it can be other bytes, if only by a
+ * newline at its end.
+ */
+function isDocumentOfAnotherKind(bytes: Uint8Array): boolean {
+  let document: unknown;
+  try {
+    document = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    return false;
+  }
+  return (
+    DOCUMENT_SCHEMAS.some((schema) => schema.safeParse(document).success) &&
+    isCanonical(document, bytes)
+  );
+}
+
+/**
  * The blob that `upload` asks to store, once its content is what the kind needs and the account
  * may upload it, or the error that says why not. The content is looked at first, so a request that
  * is wrong in itself is a 400 whoever sends it, and the account's right to send it is a 403 or a
@@ -300,8 +350,10 @@ async function blobOf(
 ): Promise<NewBlob> {
   const { kind } = upload;
   if (kind === "result") {
-    // Any bytes of either type: the entrant's own, and nobody's to check until the Judge reads them.
+    // Any bytes of either type, but a document of another kind: the entrant's own, and nobody's to
+    // check until the Judge reads them.
     if (upload.task_id === undefined) return badRequest("task_id is required for a result");
+    if (isDocumentOfAnotherKind(bytes)) return badRequest(ANOTHER_KIND);
     await requireEntry(deps.db, upload.task_id, account);
     // The row records the task for information only: a result is served by what was revealed.
     return {
@@ -504,7 +556,7 @@ async function mayServe(db: Db, sha256: string, blob: StoredBlob, now: bigint): 
  * uploaded. Once they are served they are as public as any URL, and a reveal of them is as good
  * with no upload as with one: an entrant who sent the same bytes after that has no record, since
  * the upload route makes none then, and is not wrong to have them. A hash the store does not hold
- * is usable by no one, and nor is a held-out document, which it holds and never serves.
+ * is usable by no one, and nor is a held-out document while it is private.
  */
 export async function resultUsable(
   db: Db,

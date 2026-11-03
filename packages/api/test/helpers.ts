@@ -116,6 +116,7 @@ const TABLES = [
   "agents",
   "blobs",
   "result_uploads",
+  "heldout_uploads",
   "working",
   "auth_challenges",
   "auth_tokens",

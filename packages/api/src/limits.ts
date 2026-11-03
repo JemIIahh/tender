@@ -13,6 +13,10 @@ import type { ErrorBody } from "./format";
 // memory, which is enough because one services process runs per database (P03-R25). Past the
 // limit the answer is a 429 with `Retry-After`, the seconds until the caller's window ends.
 //
+// An upload is a row that stays for good, so the two upload routes are held to bytes as well
+// (`uploadBudget`): so many a day for each account, past which its uploads are 429s, and so many an
+// hour for the whole process, past which every upload is a 503 until the hour is over.
+//
 // A 503 that means the chain or the database cannot answer right now carries `Retry-After: 5`
 // too: what failed may well be back by then. A 503 that a setting causes, such as Telegram linking
 // that is not set up, carries none, since asking again changes nothing.
@@ -38,7 +42,10 @@ export interface RateLimit {
   windowMs: number;
 }
 
-/** The routes that have a limit. `ApiDeps.rateLimits` replaces any of them; tests use small ones. */
+/**
+ * The routes that have a limit, all in one place. `ApiDeps.rateLimits` replaces any of them; tests
+ * use small ones.
+ */
 export interface RateLimits {
   /** `POST /v1/auth/challenge`, per client address. */
   challenge: RateLimit;
@@ -46,12 +53,24 @@ export interface RateLimits {
   verify: RateLimit;
   /** `POST /v1/telegram/link`, per signed-in account. */
   telegramLink: RateLimit;
+  /** `POST /v1/blobs` and `POST /v1/heldout` together, per signed-in account. */
+  upload: RateLimit;
+  /** The bytes of content those two routes store, per signed-in account: `limit` counts bytes. */
+  uploadBytes: RateLimit;
+  /** The bytes of content they store for all accounts together: `limit` counts bytes. */
+  uploadBytesTotal: RateLimit;
 }
+
+const HOUR_MS = 60 * 60_000;
+const MIB = 1024 * 1024;
 
 export const DEFAULT_RATE_LIMITS: Readonly<RateLimits> = Object.freeze({
   challenge: { limit: 30, windowMs: 60_000 },
   verify: { limit: 30, windowMs: 60_000 },
   telegramLink: { limit: 10, windowMs: 10 * 60_000 },
+  upload: { limit: 60, windowMs: HOUR_MS },
+  uploadBytes: { limit: 32 * MIB, windowMs: 24 * HOUR_MS },
+  uploadBytesTotal: { limit: 512 * MIB, windowMs: HOUR_MS },
 });
 
 /** The limits in `over` where it has them, and the defaults for the rest. */
@@ -60,6 +79,9 @@ export function rateLimitsOf(over: Partial<RateLimits> | undefined): RateLimits 
     challenge: over?.challenge ?? DEFAULT_RATE_LIMITS.challenge,
     verify: over?.verify ?? DEFAULT_RATE_LIMITS.verify,
     telegramLink: over?.telegramLink ?? DEFAULT_RATE_LIMITS.telegramLink,
+    upload: over?.upload ?? DEFAULT_RATE_LIMITS.upload,
+    uploadBytes: over?.uploadBytes ?? DEFAULT_RATE_LIMITS.uploadBytes,
+    uploadBytesTotal: over?.uploadBytesTotal ?? DEFAULT_RATE_LIMITS.uploadBytesTotal,
   };
 }
 
@@ -67,6 +89,11 @@ const RATE_LIMITED: ErrorBody = {
   error: "rate_limited",
   message: "too many requests, try again later",
 };
+
+/** `Retry-After` for a wait of `ms`: whole seconds, at least 1. */
+function retryAfter(ms: number): { "Retry-After": string } {
+  return { "Retry-After": String(Math.max(1, Math.ceil(ms / 1000))) };
+}
 
 /**
  * The 429 of a caller over its limit. `Retry-After` is the whole seconds until the caller's window
@@ -76,26 +103,118 @@ function tooMany(c: Context, windowMs: number): Response {
   const info: unknown = c.get("rateLimit");
   const resetTime = (info as { resetTime?: unknown } | undefined)?.resetTime;
   const ms = resetTime instanceof Date ? resetTime.getTime() - Date.now() : windowMs;
-  return c.json(RATE_LIMITED, 429, { "Retry-After": String(Math.max(1, Math.ceil(ms / 1000))) });
+  return c.json(RATE_LIMITED, 429, retryAfter(ms));
 }
 
 /**
  * The middleware that holds a route to `limit`, counting the requests of each `keyOf(c)` in a
  * window of their own, kept in memory (hono-rate-limiter's `MemoryStore`). Every request counts,
- * the refused ones included. It sets no `RateLimit-*` headers: a 429 says what a caller needs,
- * which is when to come back.
+ * the refused ones included, except one that `skip` lets through, which is not counted at all. It
+ * sets no `RateLimit-*` headers: a 429 says what a caller needs, which is when to come back.
  */
 export function rateLimit<E extends Env>(
   limit: RateLimit,
   keyOf: (c: Context<E>) => string,
+  skip: (c: Context<E>) => boolean = () => false,
 ): MiddlewareHandler<E> {
   return rateLimiter<E>({
     limit: limit.limit,
     windowMs: limit.windowMs,
     keyGenerator: keyOf,
+    skip,
     standardHeaders: false,
     handler: (c) => tooMany(c, limit.windowMs),
   });
+}
+
+// ---- Bytes ------------------------------------------------------------------------------------
+
+/**
+ * The bytes each key has spent, in a window of `limit.windowMs` that begins with the first bytes it
+ * spends and holds at most `limit.limit` of them, kept in this process's memory. The windows are
+ * kept in the order they began, which is the order they end in, so the ones that are over are
+ * dropped from the front and the map holds only the keys that spent something lately.
+ */
+class ByteWindows {
+  readonly #windows = new Map<string, { spent: number; endsAt: number }>();
+
+  constructor(readonly limit: RateLimit) {}
+
+  /**
+   * How many milliseconds `key` has to wait before it may spend `bytes`: 0 when it may now. A limit
+   * that is not a number has room for nothing.
+   */
+  wait(key: string, bytes: number, now: number): number {
+    for (const [ended, window] of this.#windows) {
+      if (window.endsAt > now) break;
+      this.#windows.delete(ended);
+    }
+    const window = this.#windows.get(key);
+    if ((window?.spent ?? 0) + bytes <= this.limit.limit) return 0;
+    return window === undefined ? this.limit.windowMs : window.endsAt - now;
+  }
+
+  /** Takes `bytes` from `key`'s window, which `wait` has said has room for them. */
+  spend(key: string, bytes: number, now: number): void {
+    const window = this.#windows.get(key);
+    if (window === undefined) {
+      this.#windows.set(key, { spent: bytes, endsAt: now + this.limit.windowMs });
+    } else {
+      window.spent += bytes;
+    }
+  }
+}
+
+const UPLOADED_TOO_MUCH: ErrorBody = {
+  error: "rate_limited",
+  message: "this account has uploaded too many bytes, try again later",
+};
+
+const UPLOADS_FULL: ErrorBody = {
+  error: "unavailable",
+  message: "the API is taking no more uploads for now, try again later",
+};
+
+/** Stops the request with `status`, `body` and the `Retry-After` of `ms`. `app.onError` sends it. */
+function refuseFor(status: 429 | 503, body: ErrorBody, ms: number): never {
+  throw new HTTPException(status, {
+    res: Response.json(body, { status, headers: retryAfter(ms) }),
+    message: body.message,
+  });
+}
+
+/** The one key of the process's own window. */
+const PROCESS = "process";
+
+/**
+ * The bytes of content the upload routes of one app may still store: `limits.uploadBytes` for each
+ * signed-in account and `limits.uploadBytesTotal` for all of them together, both in this process's
+ * memory, by the wall clock. `spend(account, bytes)` takes `bytes` from both before an upload is
+ * stored, or stops the request: with a 429 (`rate_limited`) when the account has no room for them,
+ * and else with a 503 (`unavailable`) when the process has none. Either carries the `Retry-After`
+ * of the window that is full. Nothing is taken from either unless both have room, so an upload
+ * that is refused for its bytes costs none.
+ *
+ * The team's accounts (`teamAccounts`) are held to no limit of an account. Their bytes count
+ * towards the process's like any others: that limit is what keeps the database from filling, and
+ * it holds whoever sends them.
+ */
+export function uploadBudget(limits: RateLimits, teamAccounts: readonly string[]) {
+  const team = new Set(teamAccounts);
+  const perAccount = new ByteWindows(limits.uploadBytes);
+  const total = new ByteWindows(limits.uploadBytesTotal);
+  return {
+    spend(account: string, bytes: number): void {
+      const now = Date.now();
+      const exempt = team.has(account);
+      const accountWait = exempt ? 0 : perAccount.wait(account, bytes, now);
+      if (accountWait > 0) refuseFor(429, UPLOADED_TOO_MUCH, accountWait);
+      const totalWait = total.wait(PROCESS, bytes, now);
+      if (totalWait > 0) refuseFor(503, UPLOADS_FULL, totalWait);
+      if (!exempt) perAccount.spend(account, bytes, now);
+      total.spend(PROCESS, bytes, now);
+    },
+  };
 }
 
 /** The one key of the requests that have no connection to read an address from. */
