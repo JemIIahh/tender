@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -73,18 +74,21 @@ import { redact, type Services, startServices } from "./serve";
  * and the last lines of the services and the agents, and exits with 1; it never hangs.
  *
  * It keeps every file it makes in one temp dir that is new for each run: the key file, the
- * services' deployments folder and the agents' drafts. A draft is filed under the network, the
- * account and the task id, and every local chain has the same accounts and starts its tasks at 1.
- * So the agents never use the store's default folder (`~/.tender`): a draft left there by an
- * earlier run would be taken for this run's own, its agent would skip the task, and the demo
- * would fail. Run again, the demo finds nothing of the last run.
+ * services' deployments folder, the agents' drafts and the home dir of the local node. A draft is
+ * filed under the network, the account and the task id, and every local chain has the same accounts
+ * and starts its tasks at 1. So the agents never use the store's default folder (`~/.tender`): a
+ * draft left there by an earlier run would be taken for this run's own, its agent would skip the
+ * task, and the demo would fail. Run again, the demo finds nothing of the last run.
  *
  * `DEMO OK` is the last line, and it comes only after everything the demo started has stopped and
  * its files are gone, and only if the facts the scenario rests on held: alice won with 100, bob
  * scored lower, the reward was paid out whole, and the scorecard is served at the URI the chain
- * records, with the bytes it is pinned to. Whichever way the demo ends, SIGINT and SIGTERM included
- * (a second signal more than two seconds after the first exits at once), the agents, the services
- * and the chain are stopped and the temp files removed. It stops only what it started.
+ * records, with the bytes it is pinned to. Whichever way the demo ends (SIGINT and SIGTERM
+ * included) the agents, the services and the chain are stopped and the temp dir removed. A second
+ * signal more than two seconds after the first skips those orderly stops and ends the process at
+ * once, but not before the local node and any other process the demo started are killed, each by
+ * its process id, and the temp dir, with the node's home in it, is removed: a node must not outlive
+ * the demo, with its CPU and its disk. The demo kills and removes only what it started.
  */
 
 // ---- The scenario ------------------------------------------------------------------------------
@@ -138,6 +142,8 @@ const API_TIMEOUT_MS = 10_000;
 const SLACK_MS = 30_000;
 /** How long stopping a part of the demo may take before the demo goes on without it. */
 const STOP_MS = 30_000;
+/** How long listing the processes may take as the process ends: a stuck `ps` must not hold it. */
+const PS_MS = 5_000;
 /** How many of the last lines of the services and the agents a failure shows. */
 const LOG_TAIL = 40;
 
@@ -193,6 +199,12 @@ interface Harness {
   log(line: string): void;
   /** Registers what to do when the demo is over, however it ends. The last in is the first out. */
   onExit(what: string, step: () => Promise<unknown>): void;
+  /**
+   * Registers what to do as the process ends, after the orderly steps of `onExit`, or in place of
+   * them when a second signal cuts them short. It cannot wait for anything. The last in is the
+   * first out.
+   */
+  onProcessExit(step: () => void): void;
 }
 
 /**
@@ -284,13 +296,79 @@ async function nodeVersion(rpcUrl: string): Promise<string> {
   return status.version.version;
 }
 
-/** Starts the local chain, and sees to its stop. */
-async function startChain(h: Harness): Promise<LocalChain> {
-  const starting = startLocalChain();
+/**
+ * Starts the local node with the OS temp dir pointed at `tmp` for as long as that takes.
+ * near-sandbox makes the node's home dir, and the lock files of its ports, in the OS temp dir. So
+ * they are made inside the demo's own temp dir and go with it, also when the node is beyond being
+ * stopped: after a second signal, or when its start failed and left it running.
+ */
+async function startNode(tmp: string): Promise<LocalChain> {
+  const saved = process.env.TMPDIR;
+  process.env.TMPDIR = tmp;
+  try {
+    return await startLocalChain();
+  } finally {
+    if (saved === undefined) Reflect.deleteProperty(process.env, "TMPDIR");
+    else process.env.TMPDIR = saved;
+  }
+}
+
+/**
+ * Kills, each by its process id, every process still running that this process started: its
+ * children, their children, and so on. That is the local node, which near-sandbox spawns, and
+ * whatever else the demo has started. It is for the end of the process, where nothing can be waited
+ * for, and does nothing where `ps` is not there.
+ */
+function killStartedProcesses(): void {
+  const listing = spawnSync("ps", ["-A", "-o", "pid=,ppid="], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: PS_MS,
+  });
+  if (listing.error !== undefined || listing.status !== 0) return;
+  const rows = listing.stdout.split("\n").flatMap((line) => {
+    const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+    return pid === undefined || ppid === undefined || Number.isNaN(pid) || Number.isNaN(ppid)
+      ? []
+      : [{ pid, ppid }];
+  });
+  const started = new Set<number>();
+  const parents = [process.pid];
+  for (let parent = parents.pop(); parent !== undefined; parent = parents.pop()) {
+    for (const row of rows) {
+      // `ps` is a child of this process too, and has exited by now.
+      if (row.ppid !== parent || row.pid === listing.pid || started.has(row.pid)) continue;
+      started.add(row.pid);
+      parents.push(row.pid);
+    }
+  }
+  for (const pid of started) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // It has gone already.
+    }
+  }
+}
+
+/**
+ * Starts the local chain, and sees to its stop. The node is a child of this process, and the end of
+ * the process kills it unless it is known to have been stopped: a second signal skips the orderly
+ * stops, and near-sandbox leaves the node running when its start fails.
+ */
+async function startChain(h: Harness, tmp: string): Promise<LocalChain> {
+  let stopped = false;
+  h.onProcessExit(() => {
+    if (!stopped) killStartedProcesses();
+  });
+  const starting = startNode(tmp);
   // Also a chain that is still starting when the demo ends: it is stopped as soon as it is up.
   h.onExit("stop the chain", async () => {
     const chain = await starting.catch(() => undefined);
     await chain?.stop();
+    // A start that failed leaves no chain to stop, and near-sandbox can leave its node running: the
+    // end of the process looks for that one.
+    stopped = chain !== undefined;
   });
   return limited("starting the local chain", CHAIN_MS, starting, h.signal);
 }
@@ -509,13 +587,19 @@ async function demo(h: Harness): Promise<void> {
       "right answer, bob its stored weak one. No model runs, and neither is an independent entrant.",
   );
 
-  // The demo's own files (keys, deployments folder, drafts) are all in here, new for each run.
+  // The demo's own files (keys, deployments folder, drafts, the node's home) are all in here, new
+  // for each run.
   const dir = await mkdtemp(join(tmpdir(), "tender-demo-"));
   h.onExit("remove the temp files", () => rm(dir, { recursive: true, force: true }));
-  // Also when the demo is cut short before its steps have run (a second Ctrl-C).
-  process.once("exit", () => rmSync(dir, { recursive: true, force: true }));
+  // Also when the demo is cut short before its steps have run (a second Ctrl-C). A node that was
+  // killed a moment ago can still be writing, so the removal tries again.
+  h.onProcessExit(() =>
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
+  );
+  const nodeTmp = join(dir, "node");
+  await mkdir(nodeTmp);
 
-  const chain = await startChain(h);
+  const chain = await startChain(h, nodeTmp);
   const version = await limited(
     "asking the node for its version",
     API_TIMEOUT_MS,
@@ -695,6 +779,7 @@ const flush = (stream: NodeJS.WriteStream) =>
 async function main(): Promise<number> {
   const abort = new AbortController();
   const exits: Array<{ what: string; step: () => Promise<unknown> }> = [];
+  const processExits: Array<() => void> = [];
   const tail: string[] = [];
   const record = (line: string) => {
     tail.push(line);
@@ -711,7 +796,21 @@ async function main(): Promise<number> {
     onExit(what, step) {
       exits.push({ what, step });
     },
+    onProcessExit(step) {
+      processExits.push(step);
+    },
   };
+  // What runs as the process ends, however it ends, and all that runs after a second signal. The
+  // steps go last in first out, and an error in one does not keep the next from running.
+  process.once("exit", () => {
+    for (const step of [...processExits].reverse()) {
+      try {
+        step();
+      } catch {
+        // The next step still has to run.
+      }
+    }
+  });
 
   let firstSignalAt: number | undefined;
   const onSignal = (name: NodeJS.Signals) => {
@@ -720,6 +819,7 @@ async function main(): Promise<number> {
       firstSignalAt = now;
       harness.fail(new Interrupted(name));
     } else if (now - firstSignalAt > REPEAT_SIGNAL_MS) {
+      // No orderly stop is waited for. The exit steps above kill the node and remove the temp dir.
       process.stderr.write(`demo: ${name} again; exiting now\n`);
       process.exit(1);
     }
