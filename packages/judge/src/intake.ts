@@ -216,12 +216,11 @@ const MAX_COMPILE_RETRIES = 3;
  * and the reasons that come after it are not given: the cheap checks before it are. Once the wait
  * is over, the two reasons that need no worker, `held-out checks missing` and `held-out checks
  * already used by task {id}`, are given before the compile check, so that a task that would be
- * turned away for them costs no worker (I5). Anything that
- * throws while the documents are checked, a RangeError included,
- * rejects the task with a fixed reason, and so does a check that crashes its worker. A database
- * error is thrown instead, and so is a worker that cannot be started (`ScorerUnavailableError`):
- * neither says anything about the task, and the next tick tries again. Every reason is at most 200
- * code points.
+ * turned away for them costs no worker (I5). Anything that throws while the documents are
+ * checked, a RangeError included, rejects the task with a fixed reason, and so does a check that
+ * crashes its worker. A database error is thrown instead, and so is a worker that cannot be
+ * started (`ScorerUnavailableError`): neither says anything about the task, and the next tick
+ * tries again. Every reason is at most 200 code points.
  */
 export async function intakeTask(
   deps: JudgeDeps,

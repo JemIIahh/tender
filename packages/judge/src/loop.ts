@@ -26,14 +26,14 @@ interface DeadlineRow {
 /**
  * One pass of the Judge over the tasks that name `deps.judgeAccount` as their verifier. First
  * intake (`intakeTask`) for every task with no `judge_status` or a `pending` one, within a budget
- * (below), then judging
- * (`judgeTask`) for every `accepted` task the database has no outcome for and whose deadlines put
- * the clock in its judging window: the due tasks. A task accepted by the first pass can be judged
- * in the second. Intake goes in id order. Judging goes earliest stop line first (`stopLineOf`),
- * the order in which the tasks run out of time, and then by id. A busy task's turn ends at its
- * slice of the tick (20 s) whenever more than two slices are left before its stop line, whether or
- * not another task waits (P05-R18, P05-R19), and it takes up again on its next turn from what it
- * found out (`deps.memory`). What the Judge keeps of a task that is no longer due goes. Last, a
+ * (below), then judging (`judgeTask`) for every `accepted` task the database has no outcome for
+ * and whose deadlines put the clock in its judging window: the due tasks. A task accepted by the
+ * first pass can be judged in the second. Intake goes in id order, from where the last tick's
+ * budget ran out. Judging goes earliest stop line first (`stopLineOf`), the order in which the
+ * tasks run out of time, and then by id. A busy task's turn ends at its slice of the tick (20 s)
+ * whenever more than two slices are left before its stop line, whether or not another task waits
+ * (P05-R18, P05-R19), and it takes up again on its next turn from what it found out
+ * (`deps.memory`). What the Judge keeps of a task that is no longer due goes. Last, a
  * `waiting: …` reason is cleared from every task that can no longer be judged
  * (`clearStaleWaits`), which a Judge that was not running when the wait ended leaves.
  *
@@ -45,8 +45,9 @@ interface DeadlineRow {
  *
  * It resolves with whether a task's turn ended at its slice, or intake was cut short, so that the
  * next tick starts at once (`startJudge`), intake first: a task that came due, or was posted,
- * during a turn joins the next pass. What that guarantees is that no task holds the Judge for more than a slice, and the work
- * under way at its end, while it has more than two slices left before its stop line. That work is
+ * during a turn joins the next pass. What that guarantees is that no task holds the Judge for more
+ * than a slice, and the work under way at its end, while it has more than two slices left before
+ * its stop line. That work is
  * not always short: a score (5 s), a round of fetches (10 s), a worker's compile of the criteria
  * (the judging budget), or a rubric's request to the model (60 s, and the retry after a failure
  * another 60 s or more). So a turn of a rubric task can hold the Judge for two or three minutes
