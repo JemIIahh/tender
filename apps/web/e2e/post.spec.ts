@@ -2,14 +2,14 @@ import { expect, type Locator, type Page, test } from "@playwright/test";
 import { SIGN_IN_MESSAGE, sha256Hex } from "@tender/shared";
 import { FakeChain } from "../test/fakeChain";
 import { API_URL, routeApi } from "./fixtures";
+import { installInjectedWallet } from "./injectedWallet";
 import { routePostApi } from "./postApi";
-import { installPostingWallet } from "./postWallet";
 import { STUB_WALLET_NAME } from "./walletStub";
 
 // The post wizard in a browser: a person writes a task, the wizard uploads its documents to a
-// fixture API (e2e/postApi.ts), asks a wallet (e2e/postWallet.ts) to sign in and to send one batch
-// to a model of the contract and its token (test/fakeChain.ts), and the task page opens on the
-// task that was posted. The page finds the wallet through near-connect, so the picker, the
+// fixture API (e2e/postApi.ts), asks a wallet (e2e/injectedWallet.ts) to sign in and to send one
+// batch to a model of the contract and its token (test/fakeChain.ts), and the task page opens on
+// the task that was posted. The page finds the wallet through near-connect, so the picker, the
 // signature and the batch are the real ones; what the contract does with the batch is the model's.
 
 // The contract is the one the web server is built for (playwright.config.ts), and so is the Judge.
@@ -69,7 +69,7 @@ test("post_task_end_to_end", async ({ page }) => {
   chain.give(TOKEN, ALICE, TUSDC(50));
   chain.fundVault(ALICE, TOKEN, TUSDC(2));
   const fixture = await routeApi(page);
-  const wallet = await installPostingWallet(page, chain, { account: ALICE });
+  const wallet = await installInjectedWallet(page, { account: ALICE, chain });
   const api = await routePostApi(page, chain);
   const logged: string[] = [];
   page.on("console", (message) => logged.push(message.text()));
@@ -195,7 +195,7 @@ test("post_wizard_fits_a_phone_and_shows_the_keyboard_focus", async ({ page }) =
   chain.give(TOKEN, ALICE, TUSDC(50));
   chain.fundVault(ALICE, TOKEN, TUSDC(2));
   await routeApi(page);
-  await installPostingWallet(page, chain, { account: ALICE });
+  await installInjectedWallet(page, { account: ALICE, chain });
   await routePostApi(page, chain);
 
   /** No step is wider than the screen: nothing scrolls sideways. */

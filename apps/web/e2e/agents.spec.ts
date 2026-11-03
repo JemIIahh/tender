@@ -11,12 +11,12 @@ import {
   WIDE,
 } from "./agentsApi";
 import { REGEX_TITLE, routeApi, TEAM_LABEL } from "./fixtures";
-import { installSigningWallet } from "./signingWallet";
+import { installInjectedWallet } from "./injectedWallet";
 import { STUB_WALLET_NAME } from "./walletStub";
 
 // The agent directory, an agent's page, the verifier record on a task page and the Telegram page,
 // against the fixture API (e2e/fixtures.ts, e2e/agentsApi.ts) and a wallet that announces itself
-// the way an extension does (e2e/signingWallet.ts). 06-T1b runs the same pages on a local chain,
+// the way an extension does (e2e/injectedWallet.ts). 06-T1b runs the same pages on a local chain,
 // with the services started with `TELEGRAM_BOT_USERNAME=tender_test_bot`.
 
 const cards = (page: Page) => page.getByTestId("agent-card");
@@ -183,7 +183,7 @@ async function routeTme(page: Page): Promise<void> {
 
 test("telegram_link_flow_returns_tme_url", async ({ page }) => {
   const telegram = await routeTelegram(page, ALICE);
-  const wallet = await installSigningWallet(page, { account: ALICE });
+  const wallet = await installInjectedWallet(page, { account: ALICE });
   await routeTme(page);
 
   await page.goto("/telegram");
@@ -247,7 +247,7 @@ test("telegram_link_flow_returns_tme_url", async ({ page }) => {
 
 test("telegram_button_is_disabled_for_a_wallet_that_cannot_sign", async ({ page }) => {
   const telegram = await routeTelegram(page, ALICE);
-  const wallet = await installSigningWallet(page, { account: ALICE, signMessage: false });
+  const wallet = await installInjectedWallet(page, { account: ALICE, signMessage: false });
 
   await page.goto("/telegram");
   await connect(page);
@@ -318,7 +318,7 @@ test("agents_and_telegram_pages_fit_a_phone_and_show_the_keyboard_focus", async 
   await routeApi(page);
   await routeAgents(page);
   const telegram = await routeTelegram(page, ALICE);
-  await installSigningWallet(page, { account: ALICE });
+  await installInjectedWallet(page, { account: ALICE });
   await routeTme(page);
 
   // The widest agent there can be, in the directory (with and without a filter), on its own page,
