@@ -242,7 +242,7 @@ test("a_registered_account_is_not_registered_again", async () => {
   expect(wallet.sent[0]?.transactions.map((t) => t.receiverId)).toEqual([CONTRACT]);
 });
 
-test("a_deposit_the_contract_sent_back_and_a_withdrawal_the_token_could_not_pay_are_told_as_such", async () => {
+test("a_deposit_with_no_event_says_only_what_is_known_and_a_withdrawal_the_token_could_not_pay_is_told_as_such", async () => {
   const { chain, wallet, user } = setup({ connected: true });
   chain.fundVault(ALICE, USDC, 3_000_000n);
   render(<WalletView />);
@@ -254,10 +254,16 @@ test("a_deposit_the_contract_sent_back_and_a_withdrawal_the_token_could_not_pay_
   const addForm = section("Add funds");
   await user.type(within(addForm).getByLabelText("Amount"), "4");
   await user.click(within(addForm).getByRole("button", { name: "Add funds" }));
-  expect((await within(addForm).findByTestId("notice")).textContent).toContain(
-    "Tender sent the deposit back, so nothing was added.",
+  // No `deposit` event came back. That is all the page knows, so it does not say where the deposit
+  // went: the balances it reads again do.
+  expect((await within(addForm).findByTestId("notice")).textContent).toBe(
+    "The wallet finished, but Tender didn't report what happened. The balances are read from the network.",
   );
   expect(chain.ftBalances.get(USDC)?.get(ALICE)).toBe(20_000_000n);
+  await waitFor(() =>
+    expect(textOf(screen.getByTestId("token-row"), "wallet-balance")).toBe("20.00 tUSDC"),
+  );
+  expect(textOf(screen.getByTestId("token-row"), "vault-balance")).toBe("3.00 tUSDC");
 
   // The contract holds none of the token it owes (a model's way to make the token refuse): the
   // amount is back in the vault, and the person is told.

@@ -490,9 +490,12 @@ export function WalletView({
     send(
       "deposit",
       async () => [depositCall(token, config.contractId, amount)],
+      // No `deposit` event is no proof of a refund: an event the wallet did not return reads the
+      // same. So the words are the ones for any missing event, and the balances, read again, say
+      // what became of the deposit.
       (events) =>
         eventOf(events, "deposit") === undefined
-          ? "Tender sent the deposit back, so nothing was added. Check that it takes this token and that your account has storage to spare."
+          ? NO_EVENT
           : `Added ${describeAmount(amount, token)} to your vault.`,
     );
 
