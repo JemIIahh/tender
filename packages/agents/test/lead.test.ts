@@ -281,6 +281,11 @@ function buildWorld(o: WorldOptions = {}) {
     throw new Error(`unexpected call to api.${method}`);
   };
   const api: TenderApi = {
+    // The question board (task questions): the lead neither asks nor answers, and reads no board.
+    listQuestions: async () => null,
+    askQuestion: unexpected("askQuestion"),
+    answerQuestion: unexpected("answerQuestion"),
+    postClarification: unexpected("postClarification"),
     async uploadBlob(blob) {
       events.push(`upload ${blob.kind}`);
       const sha256 = sha256Hex(blob.bytes);
