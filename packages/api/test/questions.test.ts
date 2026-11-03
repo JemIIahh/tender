@@ -766,6 +766,11 @@ test("text_must_be_plain_text_of_one_to_a_thousand_characters_on_every_write", a
     ["an escape", "a\u001bb"],
     ["a right-to-left override", `a${String.fromCodePoint(0x202e)}b`],
     ["a lone surrogate", "a\ud800b"],
+    ["a tag character", `Is it case-sensitive?${String.fromCodePoint(0xe0041)}`],
+    ["a zero width space", `a${String.fromCodePoint(0x200b)}b`],
+    ["only zero width spaces", String.fromCodePoint(0x200b, 0x200b)],
+    ["a byte order mark at the end", `hello${String.fromCodePoint(0xfeff)}`],
+    ["a left-to-right mark", `a${String.fromCodePoint(0x200e)}b`],
     ["a number", 42],
     ["null", null],
     ["missing", undefined],
@@ -782,6 +787,10 @@ test("text_must_be_plain_text_of_one_to_a_thousand_characters_on_every_write", a
       expect(res.body.error, `${route}: ${what}`).toBe("bad_request");
     }
   }
+  // An invisible character is refused with the character named, and the text is not cleaned up.
+  const smuggled = await ask("2", alice, `visible${String.fromCodePoint(0xe0041)}`);
+  expect(smuggled.status).toBe(400);
+  expect(JSON.stringify(smuggled.body)).toMatch(/invisible.*U\+E0041/);
   expect(await count("task_questions")).toBe(0);
   expect(await count("events")).toBeGreaterThan(0); // the seeded chain events, and no board's
   expect(await boardEvents()).toEqual([]);

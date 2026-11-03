@@ -6331,6 +6331,11 @@ test("the_board_tools_refuse_bad_input_before_the_api_is_asked", async () => {
     ["1001 characters", "x".repeat(1_001)],
     ["a control character", "a\u0007b"],
     ["a right-to-left override", `a${String.fromCodePoint(0x202e)}b`],
+    // Invisible text for the models that read the board, which the poster could not see.
+    ["a tag character", `Is it case-sensitive?${String.fromCodePoint(0xe0041)}`],
+    ["a zero width space", `a${String.fromCodePoint(0x200b)}b`],
+    ["a byte order mark", `hello${String.fromCodePoint(0xfeff)}`],
+    ["a left-to-right mark", `a${String.fromCodePoint(0x200e)}b`],
   ];
   for (const [what, text] of texts) {
     for (const [tool, args] of [
@@ -6343,6 +6348,12 @@ test("the_board_tools_refuse_bad_input_before_the_api_is_asked", async () => {
       expect(answer.text, `${tool}: ${what}`).toMatch(/^BAD_INPUT: text: /);
     }
   }
+  // The refusal says what was found, so that the caller can write the text again without it.
+  const invisible = await call("ask_question", {
+    task_id: "7",
+    text: `hi${String.fromCodePoint(0xe0041)}`,
+  });
+  expect(invisible.text).toMatch(/^BAD_INPUT: text: .*invisible.*U\+E0041/);
   // Ids that are no u64 are refused as well, and the text of a thousand characters goes through.
   for (const args of [
     { task_id: "07", text: "ok" },

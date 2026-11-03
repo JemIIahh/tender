@@ -78,13 +78,53 @@ function hasForbiddenChar(text: string): boolean {
 }
 
 /**
+ * A format character: Unicode category Cf, which is drawn as nothing in nearly every UI, and the
+ * whole tag block U+E0000 to U+E007F, whose unassigned code points (the block has only 98 assigned
+ * of 128) are in no category Cf but could be given a meaning later.
+ */
+const FORMAT_CHAR = /[\p{Cf}\u{E0000}-\u{E007F}]/u;
+
+/**
+ * The first format character (category Cf, or in the tag block) of `text` once it is in NFC, as `U+XXXX`, or null.
+ * Cf is where everything invisible lives that could hide words from the poster and not from a
+ * model: the tag characters U+E0000 to U+E007F (an ASCII text a model can read and a person
+ * cannot see), the zero-width characters U+200B to U+200D and U+2060 to U+2064, the byte order
+ * mark U+FEFF, the left-to-right and right-to-left marks, the bidirectional controls, the soft
+ * hyphen and the rest of the category. Visible writing is not in it: letters, accents, emoji and
+ * their variation selectors (category Mn), the no-break space and the ideographic space.
+ *
+ * The cost of the whole category is the zero-width joiner and non-joiner: an emoji built from
+ * several (a family, a profession) and Persian written with its half-space are refused, and can be
+ * written without them.
+ */
+function firstFormatChar(text: string): string | null {
+  const hit = FORMAT_CHAR.exec(text.normalize("NFC"));
+  if (hit === null) return null;
+  const code = hit[0].codePointAt(0) ?? 0;
+  return `U+${code.toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
+/**
  * The text of a question, an answer or a clarification: plain text of 1 to `BOARD_TEXT_MAX_CHARS`
  * characters once the blanks at its ends are cut. It holds no control character other than a line
  * break or a tab, no bidirectional override and no lone surrogate (which cannot be written as
- * UTF-8). Markup is not refused: it is text, and nothing here reads it as anything else.
+ * UTF-8), and no invisible format character (`firstFormatChar`): a text that has one is refused
+ * with a message that names it, and is never cleaned up and accepted, since what its writer sent
+ * is not what the poster would have read. That check comes first, on the text as it was sent,
+ * because the cut of the blanks would take a byte order mark off an end without a word. Markup is
+ * not refused: it is text, and nothing here reads it as anything else.
  */
 export const BoardTextSchema = z
   .string()
+  .superRefine((text, ctx) => {
+    const found = firstFormatChar(text);
+    if (found !== null) {
+      ctx.addIssue({
+        code: "custom",
+        message: `expected plain text, without invisible formatting characters (found ${found})`,
+      });
+    }
+  })
   .trim()
   .min(1, "expected some text")
   .refine((text) => !LONE_SURROGATE.test(text), "expected well-formed text")
