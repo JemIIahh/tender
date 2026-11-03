@@ -61,12 +61,18 @@ export interface RegistrationPlan {
   storageShortfall: bigint;
 }
 
+/** What `planRegistration` reads of the chain: views only, so a server that holds less than a whole client can ask. */
+export type BondReader = Pick<
+  TenderClient,
+  "getConfig" | "getAgent" | "storageBalanceOf" | "balanceOf" | "ftStorageBalanceOf" | "ftBalanceOf"
+> & { readonly accountId?: string | undefined };
+
 /**
  * Reads the chain for what registering `account` takes: its agent record, the bond in force, its
  * vault, its wallet if the vault is short, and its storage balance. It sends nothing.
  */
 export async function planRegistration(
-  client: TenderClient,
+  client: BondReader,
   account: string | undefined = client.accountId,
 ): Promise<RegistrationPlan> {
   if (account === undefined) throw new Error("planRegistration needs an account");
@@ -100,7 +106,7 @@ export async function planRegistration(
 }
 
 /** What `account` holds of `token` outside Tender: 0 when the token has never registered it. */
-async function walletBalance(client: TenderClient, token: string, account: string) {
+async function walletBalance(client: BondReader, token: string, account: string) {
   return (await client.ftStorageBalanceOf(token, account)) === null
     ? 0n
     : await client.ftBalanceOf(token, account);
