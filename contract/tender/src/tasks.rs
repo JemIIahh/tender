@@ -214,7 +214,9 @@ impl Tender {
     /// - `invited` has at most 20 accounts, none twice, and neither the poster nor the verifier
     ///   (`E_INVITE`);
     /// - a non-zero `max_entries` comes with a non-empty `invited` (`E_LIMIT`);
-    /// - `parent` is `None`, since lineage is not enabled yet (`E_PARENT`);
+    /// - a `parent`, if any, is a task the poster can hire for (`E_PARENT`; see `check_parent`):
+    ///   it exists and is not settled, the poster has an entry on it, and this task's pick
+    ///   window ends no later than the parent's commit window;
     /// - the spend is authorised: 1 yoctoNEAR attached (`E_AUTH`);
     /// - the caller's vault holds `reward` (`E_FUNDS`).
     ///
@@ -269,8 +271,8 @@ impl Tender {
                 task.max_entries
             ));
         }
-        if task.parent.is_some() {
-            env::panic_str(&format!("{}: lineage not enabled", err::E_PARENT));
+        if let Some(parent) = task.parent {
+            self.check_parent(&poster, parent.0, pick_deadline);
         }
 
         // Everything above only reads. The mark comes before the first write, so the storage
@@ -472,6 +474,38 @@ impl Tender {
                     task.id
                 ))
             })
+    }
+
+    /// Panics `E_PARENT` unless `poster` may name task `parent` as the parent of a task whose
+    /// pick window ends at `pick_deadline` (lineage, spec 6.7). The rules, in this order:
+    /// - the parent exists, which `parent` 0 and the id of the task being posted do not;
+    /// - it is not settled;
+    /// - `poster` has an entry on it, so that "this agent hired these sub-agents for that task"
+    ///   is a fact of the chain. The parent's poster and verifier can never have one;
+    /// - `pick_deadline` is at most the parent's `commit_deadline` (I12): the sub-tasks are
+    ///   picked before the lead has to commit its final work, which is why a lead can commit a
+    ///   placeholder first and replace it. The deadline is inclusive: a pick window that ends on
+    ///   the parent's commit deadline is in time.
+    ///
+    /// No task settles before its commit deadline, so a parent that is not settled still has its
+    /// commit window open whenever the last rule passes. The second rule is kept apart for the
+    /// message: it tells a settled parent from one whose time has merely run out.
+    fn check_parent(&self, poster: &AccountId, parent: u64, pick_deadline: u64) {
+        let Some(p) = self.tasks.get(&parent) else {
+            env::panic_str(&format!("{}: parent not found", err::E_PARENT));
+        };
+        if p.outcome.is_some() {
+            env::panic_str(&format!("{}: parent is already settled", err::E_PARENT));
+        }
+        if self.entries.get(&(parent, poster.clone())).is_none() {
+            env::panic_str(&format!("{}: poster has no entry on parent", err::E_PARENT));
+        }
+        if pick_deadline > p.commit_deadline {
+            env::panic_str(&format!(
+                "{}: child must settle before parent commit deadline",
+                err::E_PARENT
+            ));
+        }
     }
 
     /// Panics `E_WINDOW` unless the window `name` of `secs` seconds is `min_window_secs` to
@@ -1223,7 +1257,7 @@ mod tests {
         };
         assert_eq!(
             as_alice(&mut t, "a parent", "E_PARENT", parent),
-            "E_PARENT: lineage not enabled"
+            "E_PARENT: parent not found"
         );
         assert_rejected(
             &mut t,
@@ -2409,5 +2443,422 @@ mod tests {
         let input = json!({ "task_id": "7", "amount": "1", "token": "usdc.test" });
         let message = parse_top_up(&input).unwrap_err();
         assert!(message.contains("unknown field `token`"), "{message}");
+    }
+
+    // Lineage: a sub-task names the task its poster has entered.
+
+    const NO_PARENT: &str = "E_PARENT: parent not found";
+    const SETTLED_PARENT: &str = "E_PARENT: parent is already settled";
+    const NO_ENTRY: &str = "E_PARENT: poster has no entry on parent";
+    const TOO_LATE: &str = "E_PARENT: child must settle before parent commit deadline";
+
+    /// A parent task: a commit window of 180 s, which a `child` posted at the same block time
+    /// ends its pick window at exactly.
+    fn parent() -> PostTaskArgs {
+        PostTaskArgs {
+            commit_secs: 180,
+            ..args()
+        }
+    }
+
+    /// A sub-task of task 1 with the shortest windows the unit-test world allows, 60 s each, so
+    /// that its pick window ends 180 s after it is posted.
+    fn child() -> PostTaskArgs {
+        PostTaskArgs {
+            commit_secs: 60,
+            reveal_secs: 60,
+            pick_secs: 60,
+            fallback_secs: 60,
+            parent: Some(U64(1)),
+            ..args()
+        }
+    }
+
+    /// `who` enters task `id` at block time `now`, which must go through. The commitment is any
+    /// 32 bytes: the contract only checks it against a reveal.
+    fn enter_at(t: &mut Tender, who: &str, now: u64, id: u64) {
+        testing_env!(ctx(who).block_timestamp(now).build());
+        if let Some(message) = panic_message(|| t.commit(U64(id), CRITERIA_HASH.to_string())) {
+            panic!("{who} could not enter task {id}: {message}");
+        }
+    }
+
+    /// Asserts that `who` posting `task` at block time `now`, with 1 yoctoNEAR, is rejected with
+    /// exactly `message`, that it logged nothing, and that it left the number of tasks and `who`'s
+    /// vault and storage as they were.
+    fn assert_child_rejected(
+        t: &mut Tender,
+        what: &str,
+        who: &str,
+        now: u64,
+        task: PostTaskArgs,
+        message: &str,
+    ) {
+        let state = |t: &Tender| {
+            (
+                t.task_count(),
+                balance(t, who),
+                t.storage_balance_of(acct(who)),
+            )
+        };
+        let before = state(t);
+        let result = try_post_at(t, who, ONE_YOCTO, now, task);
+        assert_eq!(result, Err(message.to_string()), "{what}");
+        assert!(get_logs().is_empty(), "{what}: a rejection logs nothing");
+        assert_eq!(state(t), before, "{what}: a rejection changes nothing");
+    }
+
+    #[test]
+    fn child_requires_entry_on_parent() {
+        let mut t = world();
+        for who in ["bob.test", "carol.test", "judge.test"] {
+            funder(&mut t, who, 5 * REWARD);
+        }
+        let parent_id = post(
+            &mut t,
+            PostTaskArgs {
+                verifier: Some(acct("judge.test")),
+                ..parent()
+            },
+        );
+        let other = post(&mut t, args());
+        assert_eq!((parent_id, other), (1, 2));
+
+        // Only an account that has entered task 1 can name it. A stranger cannot, and neither
+        // can the parent's poster or its verifier, who can never enter it.
+        for (what, who) in [
+            ("a stranger", "bob.test"),
+            ("the parent's poster", "alice.test"),
+            ("the parent's verifier", "judge.test"),
+        ] {
+            assert_child_rejected(&mut t, what, who, T1, child(), NO_ENTRY);
+        }
+        // An entry on another task is not an entry on the parent.
+        enter_at(&mut t, "bob.test", T1, other);
+        assert_child_rejected(
+            &mut t,
+            "an entry elsewhere",
+            "bob.test",
+            T1,
+            child(),
+            NO_ENTRY,
+        );
+
+        // carol enters it, and then she can name it. bob still cannot.
+        enter_at(&mut t, "carol.test", T1, parent_id);
+        assert_child_rejected(&mut t, "bob, later", "bob.test", T1, child(), NO_ENTRY);
+        let funds = balance(&t, "carol.test");
+        let id = try_post_at(&mut t, "carol.test", ONE_YOCTO, T1, child())
+            .expect("carol has an entry on task 1");
+        assert_eq!(id, 3);
+        let task = view(&t, id);
+        assert_eq!(task.parent, Some(U64(1)));
+        assert_eq!(task.poster, acct("carol.test"));
+        assert_eq!(task.verifier, acct("carol.test"));
+        assert_eq!(balance(&t, "carol.test"), funds - REWARD);
+        let logs = get_logs();
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        assert!(logs[0].contains(r#""parent":"1""#), "{logs:?}");
+        // The parent is as it was: a child adds nothing to it.
+        let parent_task = view(&t, parent_id);
+        assert_eq!(
+            (parent_task.reward, parent_task.commit_count),
+            (U128(REWARD), 1)
+        );
+
+        // Entering again replaces the commitment; it is still an entry.
+        enter_at(&mut t, "carol.test", T1, parent_id);
+        assert_eq!(
+            try_post_at(&mut t, "carol.test", ONE_YOCTO, T1, child()),
+            Ok(4)
+        );
+
+        // The poster is the predecessor, never the signer: bob's key signing a call that reaches
+        // Tender from carol is carol's entry, and carol's key signing bob's call is bob's.
+        testing_env!(ctx("carol.test")
+            .signer_account_id(acct("bob.test"))
+            .attached_deposit(ONE_YOCTO)
+            .block_timestamp(T1)
+            .build());
+        assert_eq!(t.post_task(child()), U64(5));
+        testing_env!(ctx("bob.test")
+            .signer_account_id(acct("carol.test"))
+            .attached_deposit(ONE_YOCTO)
+            .block_timestamp(T1)
+            .build());
+        let message = panic_message(|| {
+            t.post_task(child());
+        });
+        assert_eq!(message.as_deref(), Some(NO_ENTRY));
+        assert_eq!(t.task_count(), U64(5));
+    }
+
+    #[test]
+    fn child_must_settle_before_parent_commit_deadline() {
+        // I12. The parent's commit window is 180 s, so it ends at `deadline`.
+        let mut t = world();
+        funder(&mut t, "bob.test", 20 * REWARD);
+        funder(&mut t, "carol.test", 20 * REWARD);
+        post(&mut t, parent());
+        let deadline = T1 + 180 * SEC;
+        assert_eq!(view(&t, 1).commit_deadline, U64(deadline));
+        enter_at(&mut t, "carol.test", T1, 1);
+
+        // A pick window that ends on the deadline is in time: the deadline is the latest.
+        assert_eq!(
+            try_post_at(&mut t, "carol.test", ONE_YOCTO, T1, child()),
+            Ok(2)
+        );
+        assert_eq!(view(&t, 2).pick_deadline, U64(deadline));
+        // One nanosecond later in the block, or one second more in the pick window, is not.
+        assert_child_rejected(
+            &mut t,
+            "a nanosecond late",
+            "carol.test",
+            T1 + 1,
+            child(),
+            TOO_LATE,
+        );
+        let long_pick = PostTaskArgs {
+            pick_secs: 61,
+            ..child()
+        };
+        assert_child_rejected(
+            &mut t,
+            "a longer pick window",
+            "carol.test",
+            T1,
+            long_pick,
+            TOO_LATE,
+        );
+        // Every window counts, and the fallback window does not: it ends the child, not its pick.
+        let long_commit = PostTaskArgs {
+            commit_secs: 61,
+            ..child()
+        };
+        assert_child_rejected(
+            &mut t,
+            "a longer commit window",
+            "carol.test",
+            T1,
+            long_commit,
+            TOO_LATE,
+        );
+        let long_reveal = PostTaskArgs {
+            reveal_secs: 61,
+            ..child()
+        };
+        assert_child_rejected(
+            &mut t,
+            "a longer reveal window",
+            "carol.test",
+            T1,
+            long_reveal,
+            TOO_LATE,
+        );
+        let long_fallback = PostTaskArgs {
+            fallback_secs: MAX_WINDOW_SECS,
+            ..child()
+        };
+        assert_eq!(
+            try_post_at(&mut t, "carol.test", ONE_YOCTO, T1, long_fallback),
+            Ok(3)
+        );
+        // The windows a task gets by default are far too long.
+        let defaults = PostTaskArgs {
+            parent: Some(U64(1)),
+            ..args()
+        };
+        assert_child_rejected(
+            &mut t,
+            "the default windows",
+            "carol.test",
+            T1,
+            defaults,
+            TOO_LATE,
+        );
+        let huge = PostTaskArgs {
+            commit_secs: MAX_WINDOW_SECS,
+            reveal_secs: MAX_WINDOW_SECS,
+            pick_secs: MAX_WINDOW_SECS,
+            ..child()
+        };
+        assert_child_rejected(
+            &mut t,
+            "the longest windows",
+            "carol.test",
+            T1,
+            huge,
+            TOO_LATE,
+        );
+
+        // The rule holds at every level. Task 4 has a commit window of 3600 s. Its child, task 5,
+        // has one of 600 s, and ends its pick window 720 s in, in time. A child of task 5 must
+        // end its own pick window before task 5's commit deadline, 600 s in.
+        post(
+            &mut t,
+            PostTaskArgs {
+                commit_secs: 3_600,
+                ..args()
+            },
+        );
+        enter_at(&mut t, "carol.test", T1, 4);
+        let middle = PostTaskArgs {
+            commit_secs: 600,
+            parent: Some(U64(4)),
+            ..child()
+        };
+        assert_eq!(
+            try_post_at(&mut t, "carol.test", ONE_YOCTO, T1, middle),
+            Ok(5)
+        );
+        enter_at(&mut t, "bob.test", T1, 5);
+        let grandchild = |commit_secs| PostTaskArgs {
+            commit_secs,
+            parent: Some(U64(5)),
+            ..child()
+        };
+        // 480 + 60 + 60 = 600 s ends with task 5's commit window; 481 s does not.
+        assert_eq!(
+            try_post_at(&mut t, "bob.test", ONE_YOCTO, T1, grandchild(480)),
+            Ok(6)
+        );
+        assert_child_rejected(
+            &mut t,
+            "a grandchild too late",
+            "bob.test",
+            T1,
+            grandchild(481),
+            TOO_LATE,
+        );
+        assert_eq!(view(&t, 6).parent, Some(U64(5)));
+    }
+
+    #[test]
+    fn parent_must_exist_and_be_open() {
+        let mut t = world();
+        funder(&mut t, "bob.test", 20 * REWARD);
+        funder(&mut t, "carol.test", 20 * REWARD);
+        let named = |id| PostTaskArgs {
+            parent: Some(U64(id)),
+            ..child()
+        };
+
+        // There is no task yet, so none can be named: not 1, not 0, not the largest id.
+        for id in [1, 0, u64::MAX] {
+            assert_child_rejected(&mut t, "no tasks", "carol.test", T1, named(id), NO_PARENT);
+        }
+        post(&mut t, parent());
+        // The next id is not a task either: a task cannot be its own parent.
+        assert_child_rejected(&mut t, "the next id", "carol.test", T1, named(2), NO_PARENT);
+        assert_child_rejected(&mut t, "id 0", "carol.test", T1, named(0), NO_PARENT);
+        enter_at(&mut t, "carol.test", T1, 1);
+        assert_eq!(
+            try_post_at(&mut t, "carol.test", ONE_YOCTO, T1, named(1)),
+            Ok(2)
+        );
+
+        // The parent's commit window is over. carol entered it, and it is not settled, but a
+        // sub-task can no longer end its pick window before the deadline.
+        let deadline = T1 + 180 * SEC;
+        assert_child_rejected(
+            &mut t,
+            "at the commit deadline",
+            "carol.test",
+            deadline,
+            named(1),
+            TOO_LATE,
+        );
+        let reveal_deadline = view(&t, 1).reveal_deadline.0;
+        assert_child_rejected(
+            &mut t,
+            "when judging",
+            "carol.test",
+            reveal_deadline,
+            named(1),
+            TOO_LATE,
+        );
+
+        // Once the parent is settled it is not open, and says so. Nobody revealed, so the keeper
+        // voids it at the reveal deadline.
+        testing_env!(ctx("keeper.test").block_timestamp(reveal_deadline).build());
+        t.void_task(U64(1));
+        assert!(view(&t, 1).outcome.is_some());
+        assert_child_rejected(
+            &mut t,
+            "a voided parent",
+            "carol.test",
+            reveal_deadline,
+            named(1),
+            SETTLED_PARENT,
+        );
+        // A settled task is reported as settled whatever the time: the chain never goes back, but
+        // the rule does not depend on the clock.
+        assert_child_rejected(
+            &mut t,
+            "a voided parent, inside its window",
+            "carol.test",
+            T1,
+            named(1),
+            SETTLED_PARENT,
+        );
+        // Task 2, a child of task 1, is a task like any other, and can be named in its turn: its
+        // commit window ends 60 s in, so a sub-task of 180 s is too long for it.
+        enter_at(&mut t, "bob.test", T1, 2);
+        let grandchild = PostTaskArgs {
+            parent: Some(U64(2)),
+            ..child()
+        };
+        assert_child_rejected(
+            &mut t,
+            "a grandchild of the same windows",
+            "bob.test",
+            T1,
+            grandchild,
+            TOO_LATE,
+        );
+    }
+
+    #[test]
+    fn parent_rules_are_checked_in_the_listed_order() {
+        // Each task below breaks the rule it is named for and every rule after it. It is
+        // reported for the first rule it breaks, which is the order of the list: the parent
+        // exists, it is not settled, the poster has an entry on it, the windows end in time.
+        let mut t = world();
+        funder(&mut t, "bob.test", 20 * REWARD);
+        funder(&mut t, "carol.test", 20 * REWARD);
+        let too_long = |id| PostTaskArgs {
+            parent: Some(U64(id)),
+            ..args()
+        };
+        // Task 1 is settled: voided at its reveal deadline with nobody entered. Task 2 is open.
+        post(&mut t, parent());
+        post(&mut t, parent());
+        testing_env!(ctx("keeper.test")
+            .block_timestamp(view(&t, 1).reveal_deadline.0)
+            .build());
+        t.void_task(U64(1));
+        enter_at(&mut t, "carol.test", T1, 2);
+
+        assert_child_rejected(&mut t, "no parent", "bob.test", T1, too_long(9), NO_PARENT);
+        assert_child_rejected(
+            &mut t,
+            "settled",
+            "bob.test",
+            T1,
+            too_long(1),
+            SETTLED_PARENT,
+        );
+        assert_child_rejected(&mut t, "no entry", "bob.test", T1, too_long(2), NO_ENTRY);
+        assert_child_rejected(&mut t, "too late", "carol.test", T1, too_long(2), TOO_LATE);
+        // Mend the last one and it goes through.
+        let mended = PostTaskArgs {
+            parent: Some(U64(2)),
+            ..child()
+        };
+        assert_eq!(
+            try_post_at(&mut t, "carol.test", ONE_YOCTO, T1, mended),
+            Ok(3)
+        );
     }
 }

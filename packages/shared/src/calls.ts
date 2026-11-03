@@ -95,7 +95,11 @@ export interface PostTaskInput {
   maxWinners?: number;
   /** Who may enter. Empty (the default) is anyone. */
   invited?: string[];
-  /** The parent task. The contract refuses one (`E_PARENT`) until lineage is enabled. */
+  /**
+   * The parent task, when this is a sub-task: one that exists and is not settled, that the
+   * poster has entered, and whose commit window ends no earlier than this task's pick window
+   * (`E_PARENT` otherwise).
+   */
   parent?: bigint;
 }
 
