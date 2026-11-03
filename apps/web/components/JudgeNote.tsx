@@ -16,7 +16,7 @@ export function JudgeNote({ status, reason }: { status: string | null; reason: s
   const parts = [words, reason].filter((part): part is string => part !== null && part !== "");
   if (parts.length === 0) return null;
   return (
-    <p data-testid="judge-note" className="text-sm wrap-anywhere">
+    <p data-testid="judge-note" className="wrap-anywhere">
       {`Judge: ${parts.join(" · ")}`}
     </p>
   );

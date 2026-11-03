@@ -1,6 +1,7 @@
 "use client";
 
 import type { ListTasksFilter, Phase, TaskSummary } from "@tender/shared";
+import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   type FormEvent,
@@ -13,10 +14,15 @@ import {
   useState,
 } from "react";
 import { ErrorState } from "../../../components/ErrorState";
+import { PageHead } from "../../../components/PageHead";
 import { PHASE_LABELS } from "../../../components/PhaseChip";
+import { StillArt } from "../../../components/StillArt";
 import { TaskCard } from "../../../components/TaskCard";
+import { CARD, FIELD, PRIMARY, SECONDARY } from "../../../components/ui";
 import { api } from "../../../lib/api";
+import { featuredTaskId } from "../../../lib/card";
 import { useNowNs } from "../../../lib/clock";
+import { config } from "../../../lib/config";
 import { errorMessage } from "../../../lib/errors";
 
 // The board: the tasks the API lists, newest first, which a person narrows by the phase a task is
@@ -84,9 +90,79 @@ function NoMoreTasks() {
     if (focused === null || focused === document.body) line.current?.focus();
   }, []);
   return (
-    <p ref={line} tabIndex={-1} className="text-sm">
+    <p
+      ref={line}
+      tabIndex={-1}
+      className="justify-self-center font-mono text-[11px] tracking-[0.14em] text-muted uppercase"
+    >
       No more tasks
     </p>
+  );
+}
+
+/** The grid of cards: one column on a phone, two on a tablet, three on a wide screen. */
+const GRID = "grid gap-4 sm:grid-cols-2 xl:grid-cols-3";
+
+/** A card's place while the tasks load: its outline and nothing in it yet. */
+function CardPlaceholder() {
+  const bar = "rounded-full bg-raised";
+  return (
+    <li className={`${CARD} flex min-h-64 flex-col p-5 sm:p-6`}>
+      <div className="flex justify-between">
+        <span className={`${bar} h-5 w-20`} />
+        <span className={`${bar} h-5 w-24`} />
+      </div>
+      <span className={`${bar} mt-6 h-3 w-1/3`} />
+      <span className={`${bar} mt-3 h-5 w-4/5`} />
+      <span className={`${bar} mt-2 h-5 w-3/5`} />
+      <div className="mt-auto flex items-center gap-3 border-t border-line pt-4">
+        <span className={`${bar} size-[34px]`} />
+        <span className={`${bar} h-3 w-32`} />
+        <span className={`${bar} ml-auto size-10`} />
+      </div>
+    </li>
+  );
+}
+
+/** The board while it loads: the words for a screen reader and the eye, over empty cards. */
+function Loading() {
+  return (
+    <div role="status" className="grid gap-4">
+      <p className="font-mono text-[11px] tracking-[0.14em] text-muted uppercase">Loading tasks…</p>
+      <ul aria-hidden="true" className={GRID}>
+        <CardPlaceholder />
+        <CardPlaceholder />
+        <CardPlaceholder />
+      </ul>
+    </div>
+  );
+}
+
+/** No tasks to show: a still of the landing's sealed letter, and the words. */
+function Empty({ filtered }: { filtered: boolean }) {
+  return (
+    <div
+      className={`${CARD} relative isolate grid min-h-72 content-end gap-4 overflow-hidden p-6 sm:p-8`}
+    >
+      <StillArt
+        art="sealed"
+        focus={{ x: 0.72, y: 0.5, scale: 0.3 }}
+        className="absolute inset-0 -z-10 size-full"
+      />
+      <div aria-hidden="true" className="scanlines absolute inset-0 -z-10" />
+      <div
+        aria-hidden="true"
+        className="absolute inset-0 -z-10 bg-linear-to-r from-panel via-panel/80 to-transparent"
+      />
+      <p className="max-w-sm text-2xl font-semibold tracking-tight text-bone">
+        {filtered ? "No tasks match these filters." : "No tasks yet."}
+      </p>
+      {filtered ? null : (
+        <Link href="/post" className={PRIMARY}>
+          Post a task
+        </Link>
+      )}
+    </div>
   );
 }
 
@@ -105,18 +181,23 @@ function BoardBody({
 }) {
   switch (board.status) {
     case "loading":
-      return <p role="status">Loading tasks…</p>;
+      return <Loading />;
     case "error":
       return <ErrorState message={board.message} retrying={board.retrying} onRetry={onRetry} />;
-    case "ready":
-      if (board.tasks.length === 0) {
-        return <p>{filtered ? "No tasks match these filters." : "No tasks yet."}</p>;
-      }
+    case "ready": {
+      if (board.tasks.length === 0) return <Empty filtered={filtered} />;
+      const featured = featuredTaskId(board.tasks, nowNs, config.network);
       return (
         <>
-          <ul className="grid gap-3">
+          <ul className={GRID}>
             {board.tasks.map((task) => (
-              <TaskCard key={task.id} task={task} nowNs={nowNs} />
+              <TaskCard
+                key={task.id}
+                task={task}
+                nowNs={nowNs}
+                featured={task.id === featured}
+                judgeAccount={config.judgeAccount}
+              />
             ))}
           </ul>
           {board.next === null ? (
@@ -135,13 +216,14 @@ function BoardBody({
               type="button"
               aria-disabled={board.more.state === "loading"}
               onClick={() => onMore(board)}
-              className="min-h-11 w-fit rounded border border-neutral-900 px-4"
+              className={`${SECONDARY} justify-self-center`}
             >
               {board.more.state === "loading" ? "Loading…" : "Load more"}
             </button>
           )}
         </>
       );
+    }
   }
 }
 
@@ -259,70 +341,82 @@ function BoardView() {
   const filtered = filters.phase !== undefined || filters.tag !== undefined;
 
   return (
-    <div className="grid gap-4">
-      <h1 className="text-2xl font-semibold">Tasks</h1>
-
-      <fieldset className="flex min-w-0 flex-wrap gap-2">
-        <legend className="sr-only">Phase</legend>
-        {[undefined, ...CHIP_PHASES].map((chip) => (
-          <button
-            key={chip ?? "all"}
-            type="button"
-            aria-pressed={filters.phase === chip}
-            onClick={() => show({ ...filters, phase: chip })}
-            className="min-h-11 rounded border border-neutral-900 px-3 aria-pressed:bg-neutral-900 aria-pressed:text-white"
-          >
-            {chip === undefined ? "All" : PHASE_LABELS[chip]}
-          </button>
-        ))}
-      </fieldset>
-
-      <form onSubmit={applyTag} className="grid gap-1">
-        <div className="flex flex-wrap items-end gap-2">
-          <div className="grid gap-1">
-            <label htmlFor={tagId} className="text-sm">
-              Tag
-            </label>
-            <input
-              id={tagId}
-              value={tagText}
-              onChange={(event) => setTagText(event.currentTarget.value)}
-              aria-describedby={tagError === null ? undefined : `${tagId}-error`}
-              aria-invalid={tagError !== null}
-              autoCapitalize="none"
-              autoCorrect="off"
-              spellCheck={false}
-              className="min-h-11 w-48 rounded border border-neutral-900 px-2"
-            />
-          </div>
-          <button type="submit" className="min-h-11 rounded border border-neutral-900 px-4">
-            Filter
-          </button>
-          {filters.tag === undefined ? null : (
-            <button
-              type="button"
-              onClick={() => filterByTag(undefined)}
-              className="min-h-11 rounded border border-neutral-900 px-4"
-            >
-              Clear
-            </button>
-          )}
-        </div>
-        {/* Not an alert: the board has one alert at a time, for a request that failed. */}
-        {tagError === null ? null : (
-          <p id={`${tagId}-error`} data-testid="tag-error" className="text-sm">
-            {tagError}
-          </p>
-        )}
-      </form>
-
-      <BoardBody
-        board={board}
-        nowNs={nowNs}
-        filtered={filtered}
-        onRetry={() => load(filters)}
-        onMore={loadMore}
+    <div className="mx-auto grid w-full max-w-[1400px] gap-8">
+      <PageHead
+        eyebrow="Marketplace"
+        title="Tasks for agents."
+        muted="Pick one, get paid."
+        art={{ name: "escrow", focus: { x: 0.6, y: 0.52, scale: 0.46 } }}
       />
+
+      <div className="grid gap-4">
+        <div className="flex flex-wrap items-end gap-x-8 gap-y-4 border-b border-line">
+          {/* The phases, as tabs. Each is a toggle that the address holds, and not a tab panel. */}
+          <fieldset className="-mb-px flex max-w-full min-w-0 gap-5 overflow-x-auto sm:gap-7">
+            <legend className="sr-only">Phase</legend>
+            {[undefined, ...CHIP_PHASES].map((chip) => (
+              <button
+                key={chip ?? "all"}
+                type="button"
+                aria-pressed={filters.phase === chip}
+                onClick={() => show({ ...filters, phase: chip })}
+                className="min-h-11 shrink-0 border-b-2 border-transparent pb-1 text-[15px] whitespace-nowrap text-muted transition-colors hover:text-bone motion-reduce:transition-none aria-pressed:border-bone aria-pressed:font-medium aria-pressed:text-bone"
+              >
+                {chip === undefined ? "All" : PHASE_LABELS[chip]}
+              </button>
+            ))}
+          </fieldset>
+
+          <form onSubmit={applyTag} className="grid w-full gap-1 pb-3 sm:ml-auto sm:w-auto">
+            <div className="flex items-center gap-2">
+              <label
+                htmlFor={tagId}
+                className="font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase"
+              >
+                Tag
+              </label>
+              <input
+                id={tagId}
+                value={tagText}
+                onChange={(event) => setTagText(event.currentTarget.value)}
+                aria-describedby={tagError === null ? undefined : `${tagId}-error`}
+                aria-invalid={tagError !== null}
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                className={`${FIELD} min-h-10 min-w-0 flex-1 rounded-full font-mono text-sm sm:w-44 sm:flex-none`}
+              />
+              <button type="submit" className={`${SECONDARY} min-h-10 px-4`}>
+                Filter
+              </button>
+              {filters.tag === undefined ? null : (
+                <button
+                  type="button"
+                  onClick={() => filterByTag(undefined)}
+                  className={`${SECONDARY} min-h-10 px-4`}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            {/* Not an alert: the board has one alert at a time, for a request that failed. */}
+            {tagError === null ? null : (
+              <p id={`${tagId}-error`} data-testid="tag-error" className="text-sm text-seal">
+                {tagError}
+              </p>
+            )}
+          </form>
+        </div>
+        <div className="grid gap-6 pt-2">
+          <BoardBody
+            board={board}
+            nowNs={nowNs}
+            filtered={filtered}
+            onRetry={() => load(filters)}
+            onMore={loadMore}
+          />
+        </div>
+      </div>
     </div>
   );
 }
@@ -331,7 +425,13 @@ function BoardView() {
 // built ahead of time can only do under a Suspense boundary.
 export default function Board() {
   return (
-    <Suspense fallback={<p role="status">Loading tasks…</p>}>
+    <Suspense
+      fallback={
+        <p role="status" className="font-mono text-[11px] tracking-[0.14em] text-muted uppercase">
+          Loading tasks…
+        </p>
+      }
+    >
       <BoardView />
     </Suspense>
   );
