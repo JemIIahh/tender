@@ -129,7 +129,7 @@ export type SubmitResult =
   /**
    * The wallet failed in a way that does not say whether it sent anything: a window that closed, a
    * connection that dropped. The task may be posted. The page keeps Post off until the person has
-   * looked, and lets them post anyway.
+   * looked, and lets them unlock it.
    */
   | { kind: "unknown" };
 

@@ -286,7 +286,7 @@ async function toReview(user: User, amount = "5"): Promise<void> {
   await stepHeading("Review");
 }
 
-const postButton = () => screen.getByRole("button", { name: /^Post(ing| task)/ });
+const postButton = () => screen.getByRole("button", { name: /^Post/ });
 
 /** The Post button once the page has read the account's balances and found nothing in the way. */
 async function postReady(): Promise<HTMLElement> {
@@ -736,9 +736,9 @@ test("a_wallet_that_refuses_keeps_the_uploads_and_the_form_and_a_second_try_goes
   );
   expect(router.push).not.toHaveBeenCalled();
   expect(wallet.sent).toEqual([]);
-  // A person who turned the request down sent nothing, so there is no lock and nothing to post anyway.
+  // A person who turned the request down sent nothing, so there is no lock and nothing to unlock.
   expect(screen.queryByTestId("post-unknown")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Post anyway" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Unlock Post" })).toBeNull();
   // The documents are saved with Tender; the form is as it was.
   expect(api.blobs).toHaveLength(2);
   expect(api.heldouts).toHaveLength(1);
@@ -766,7 +766,7 @@ test("a_wallet_that_refuses_keeps_the_uploads_and_the_form_and_a_second_try_goes
   expect(said()).not.toContain(SECRET);
 });
 
-test("a_wallet_that_fails_without_saying_whether_it_sent_locks_post_until_the_person_posts_anyway", async () => {
+test("a_wallet_that_fails_without_saying_whether_it_sent_locks_post_until_the_person_unlocks_it", async () => {
   const { user, wallet, api, chain, said } = setup({ vault: TUSDC(5) });
   const send = wallet.signAndSendTransactions.bind(wallet);
   let failures = 1;
@@ -803,11 +803,11 @@ test("a_wallet_that_fails_without_saying_whether_it_sent_locks_post_until_the_pe
   expect(wallet.sent).toEqual([]);
   expect(screen.getByTestId("post-unknown")).toBeDefined();
 
-  // The person has looked and posts anyway. The lock comes off, the balances are read again, and
+  // The person has looked and unlocks Post. The lock comes off, the balances are read again, and
   // the focus is where the person reads on.
-  await user.click(screen.getByRole("button", { name: "Post anyway" }));
+  await user.click(screen.getByRole("button", { name: "Unlock Post" }));
   expect(screen.queryByTestId("post-unknown")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Post anyway" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Unlock Post" })).toBeNull();
   expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Post it" }));
   await user.click(await postReady());
   await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);

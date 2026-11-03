@@ -101,8 +101,8 @@ export function ReviewStep(props: {
   onRecheck(): void;
   onBack(): void;
   onPost(): void;
-  /** The person has looked and wants to post although the last send's outcome is not known. */
-  onPostAnyway(): void;
+  /** The person has looked and lifts the lock that a send of unknown outcome put on Post. */
+  onUnlock(): void;
 }) {
   const { form, limits, judgeAccount, tokenId, ready, accountId, canSignMessage, vault } = props;
   const reward = rewardOf(form, tokenId);
@@ -303,8 +303,8 @@ export function ReviewStep(props: {
               page before posting again.
             </p>
             <div className="flex flex-wrap gap-2">
-              <button type="button" onClick={props.onPostAnyway} className={SECONDARY}>
-                Post anyway
+              <button type="button" onClick={props.onUnlock} className={SECONDARY}>
+                Unlock Post
               </button>
             </div>
           </div>
