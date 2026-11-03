@@ -34,7 +34,7 @@ low is minor gain for sustained effort; info is a confirmed observation of minim
 
 | # | Issue | Severity | Fix commit | Test |
 |---|---|---|---|---|
-| 1 | **Funder records could be squatted with dust.** 49 one-unit top-ups took the 49 funder records after the poster's, and `E_LIMIT` then refused every later funder of that pooled task. No money at risk (Task 13 review; automated MEDIUM griefing flag). Now an account's first top-up of a task must be at least the token's current `min_reward`; a funder already in, the poster included, adds any amount. Filling the records puts at least 49 × `min_reward` into the escrow, where a pick pays it to the winners. | Low | `07721ce` | `forty_nine_dust_funders_then_a_real_funder` (failed before the fix: the first dust top-up went through); props model and scripted run |
+| 1 | **Funder records could be squatted with dust.** 49 one-unit top-ups took the 49 funder records after the poster's, and `E_LIMIT` then refused every later funder of that pooled task. No money at risk (Task 13 review; automated MEDIUM griefing flag). Now an account's first top-up of a task must be at least the token's current `min_reward`; a funder already in, the poster included, adds any amount. Filling the records now puts at least 49 × `min_reward` into the escrow, where a pick pays it to the winners. **This is a price, not a bar, and the gap is accepted (controller ruling, fix round 1):** on testnet, tUSDC's `min_reward` is 1 (scripts/deploy.ts:115), so the rule is no more than the old `amount > 0` and 49 base units of a free token still fill the records; on mainnet (`min_reward` 0.1 USDC) the same squat costs 4.9 USDC, which becomes part of the reward and goes to the winner. That is griefing, not theft: nothing is taken or trapped. The agent bond of Task 16b does not cover funders. | Low | `07721ce` (mitigated on mainnet only) | `forty_nine_dust_funders_then_a_real_funder` (failed before the fix: the first dust top-up went through); props model and scripted run |
 | 2 | **A delegate key could pick.** `pick` checked only the predecessor. A delegate key whose access key allows `pick` (or every method) could award the escrow of every task its account verifies, or posted and reached the fallback window, even tasks funded through the uncapped 1-yocto path. That defeats auth.rs's bound "a leaked key costs at most `total_cap`" (Task 15 review, minor 2). `pick` now refuses `E_AUTH` when the call is signed by one of the caller's delegate keys, found with the lookup `authorize_spend` uses (one shared helper, `direct_signing_key`). | Medium | `5309565` | `delegate_key_cannot_pick` (unit), `verifier_delegate_key_cannot_pick` (sandbox: on the old wasm the delegate key's pick paid out) |
 | 3 | **`per_task_cap` was documented per task but is enforced per call.** A post plus top-ups by one key can put up to `total_cap` into one task. The semantics stay; the docs (types.rs, events.rs, auth.rs), the `E_AUTH` text ("per-call cap (per_task_cap)") and plan 07's swarm step now say per call (Task 15 review, minor 1). | Info | `d00d38e` | `delegate_over_per_task_cap_rejected` pins the new text |
 | 4 | **`res/` could be committed stale.** `check-res.sh` compared `SOURCES.sha256` with the sources and the wasm with `SHA256SUMS`, but nothing tied the two: a commit carrying the new sources and `SOURCES.sha256` without the rebuilt wasm and `SHA256SUMS` passed CI, so the committed, deployable wasm could be an older build (final-fix parking list). `SOURCES.sha256` now records the sources' hash bound to `SHA256SUMS`, and `check-res.sh` recomputes both. | Low | `7ce4b31` | scratch-clone check: that commit, the reverse (wasm without sources), and a wasm that does not match its sums all fail; a consistent `res/` passes |
@@ -93,7 +93,7 @@ low is minor gain for sustained effort; info is a confirmed observation of minim
 | `ft_on_transfer` accepts expected tokens only, returns the unused amount | Allowlisted and enabled tokens only, by predecessor; never panics; all or nothing (`forged_token_cannot_credit`, `ft_on_transfer_never_panics_on_random_msg`). |
 | `ft_resolve_transfer` | Not applicable: Tender is not a token. |
 | No first-come secrets that can be front-run | Commit-reveal binds task and account; a copied commitment cannot be revealed (`reveal_attacks_rejected`). |
-| One account is not one person | Per-account limits are the funder cap (now dust-proof, finding 1) and `invited`. Open tasks are open by design (A8). |
+| One account is not one person | Per-account limits are the funder cap and `invited`. The cap's squat costs 49 × `min_reward` (finding 1): nothing on testnet, 4.9 USDC on mainnet. Open tasks are open by design (A8). |
 | Randomness | None on chain. Entrants choose their own salts. |
 | No profit from repeating, aborting, splitting or reordering | One pick per task (I2); the fee is on the pooled total; a re-commit replaces (I10); delegate refunds do not restore budget. |
 | Unit tests for auth, bounds, arithmetic, invariants | 253 unit and property tests. |
@@ -104,7 +104,10 @@ low is minor gain for sustained effort; info is a confirmed observation of minim
 
 ## The adversarial suite
 
-All pass on the build at `6b79b40` (`tender.wasm` sha256 `9de8a3d5…`; sums in `contract/res/SHA256SUMS`).
+All pass on the build at `6b79b40` (`tender.wasm` sha256 `9de8a3d5…`). Fix round 1 changed only doc
+comments, but cargo-near embeds the public methods' docs in the wasm's ABI (`__contract_abi`), so
+its build differs (`1ab89d07…`, 338,912 B; sums in `contract/res/SHA256SUMS`). The vault, pooled,
+delegate, args and admin suites and `pnpm skeleton` were re-run on it and pass.
 
 | Test | What it tries | Result |
 |---|---|---|

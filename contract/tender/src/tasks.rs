@@ -333,9 +333,9 @@ impl Tender {
     ///   poster among them (`E_LIMIT`);
     /// - the task's token is still enabled (`E_TOKEN`);
     /// - `amount` is more than 0; it is at least the token's `min_reward` as it is now if the
-    ///   caller does not fund the task yet, so that dust cannot take the funder records; and the
-    ///   reward it makes is at most the token's `max_reward` as it is now, and at most
-    ///   `MAX_REWARD_LIMIT` (`E_REWARD`);
+    ///   caller does not fund the task yet, which puts a price on taking the funder records (see
+    ///   `topped_up_reward`); and the reward it makes is at most the token's `max_reward` as it is
+    ///   now, and at most `MAX_REWARD_LIMIT` (`E_REWARD`);
     /// - the spend is authorised: 1 yoctoNEAR attached, or no deposit from a delegate key whose
     ///   token is the task's, with `amount` within its caps, which then count it (`E_AUTH`);
     /// - the caller's vault holds `amount` (`E_FUNDS`).
@@ -458,10 +458,13 @@ impl Tender {
     /// `min_reward` for a `new_funder`, and the sum is at most both the token's `max_reward` and
     /// `MAX_REWARD_LIMIT`, so that the task can still be picked.
     ///
-    /// The minimum for a new funder keeps the `MAX_FUNDERS` records from being taken with dust,
-    /// which would shut every later funder out of the task: filling them costs at least
-    /// `min_reward` each, all of it in the escrow. A funder already in, the poster included, may
-    /// add any amount, since it takes no new record.
+    /// The minimum for a new funder puts a price on taking the `MAX_FUNDERS` records, which shuts
+    /// every later funder out of the task: filling them costs at least `min_reward` each, all of
+    /// it in the escrow, where a pick pays it to the winners. It is a price, not a bar. Where
+    /// `min_reward` is 1, as for testnet's free tUSDC, it is no more than the old `amount > 0`; on
+    /// mainnet, at 0.1 USDC, filling the 49 records costs 4.9 USDC. That is griefing, not theft:
+    /// nobody's money is taken or trapped. A funder already in, the poster included, may add any
+    /// amount, since it takes no new record.
     fn topped_up_reward(&self, task: &Task, amount: u128, new_funder: bool) -> u128 {
         let token = &task.token;
         let Some(limits) = self.tokens.get(token).filter(|c| c.enabled) else {
@@ -2138,9 +2141,10 @@ mod tests {
         );
     }
 
-    /// The funder slots cannot be squatted with dust: an account's first top-up of a task must be
-    /// at least the token's `min_reward`, so the 49 slots after the poster's cost at least 49 times
-    /// that, all of it at stake in the task. Once in, a funder may add any amount.
+    /// Squatting the funder slots has a price: an account's first top-up of a task must be at
+    /// least the token's `min_reward`, so the 49 slots after the poster's cost at least 49 times
+    /// that, all of it at stake in the task. Once in, a funder may add any amount. With a
+    /// `min_reward` of 1 the price is 49 units, as before the rule.
     #[test]
     fn forty_nine_dust_funders_then_a_real_funder() {
         let mut t = world();
