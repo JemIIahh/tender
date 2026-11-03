@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inspect } from "node:util";
@@ -10,10 +10,12 @@ import {
   type BlobKind,
   type Db,
   getBlob,
+  hasHeldoutUpload,
   hasResultUpload,
   migrate,
   openDb,
   putBlob,
+  recordHeldoutUpload,
   recordResultUpload,
   setBlobPublic,
 } from "../src/index";
@@ -28,7 +30,7 @@ const U128_MAX = "340282366920938463463374607431768211455";
 const MINUTE = { timeout: 60_000 };
 
 // The migrations of this package, in the order they apply.
-const MIGRATIONS = ["0001_init.sql", "0002_result_uploads.sql"];
+const MIGRATIONS = ["0001_init.sql", "0002_result_uploads.sql", "0003_heldout_uploads.sql"];
 
 // Stands for a secret (a held-out answer, blob bytes) in the error tests: as text, and as hex, which
 // is how Postgres prints the bytes of a bytea.
@@ -224,6 +226,8 @@ const SCHEMA: Record<string, string[]> = {
     "account text",
     "uploaded_at timestamp with time zone = now()",
   ],
+  // Migration 0003.
+  heldout_uploads: ["sha256 text", "account text", "uploaded_at timestamp with time zone = now()"],
 };
 
 // Primary keys, uniqueness and every index, as "table: kind (columns)". An index on an expression
@@ -243,6 +247,7 @@ const KEYS = [
   "events: primary key (id)",
   "events: unique (receipt_id, log_index)",
   "funders: primary key (task_id, account)",
+  "heldout_uploads: primary key (sha256, account)",
   "result_uploads: primary key (sha256, task_id, account)",
   "schema_migrations: primary key (name)",
   "tasks: index (commit_deadline)",
@@ -1075,6 +1080,70 @@ describe.each(targets)("db on $name", (target) => {
       [sha],
     );
     expect(row?.n).toBe(0);
+  });
+
+  it("heldout_uploads_are_recorded_once_per_hash_and_account", async () => {
+    const sha = "6a".repeat(32);
+    const uploaders = async () =>
+      (
+        await db.query<{ account: string }>(
+          "select account from heldout_uploads where sha256 = $1 order by account",
+          [sha],
+        )
+      ).map((row) => row.account);
+
+    expect(await hasHeldoutUpload(db, sha, "poster.near")).toBe(false);
+    await expect(
+      recordHeldoutUpload(db, { sha256: sha, account: "mallory.near" }),
+    ).resolves.toBeUndefined();
+    // Whoever sent the bytes first, every account that sends them is recorded, once each.
+    await recordHeldoutUpload(db, { sha256: sha, account: "poster.near" });
+    await recordHeldoutUpload(db, { sha256: sha, account: "poster.near" });
+    expect(await uploaders()).toEqual(["mallory.near", "poster.near"]);
+    expect(await hasHeldoutUpload(db, sha, "poster.near")).toBe(true);
+    expect(await hasHeldoutUpload(db, sha, "mallory.near")).toBe(true);
+
+    // The record is of one hash and one account.
+    expect(await hasHeldoutUpload(db, "6b".repeat(32), "poster.near")).toBe(false);
+    expect(await hasHeldoutUpload(db, sha, "bob.near")).toBe(false);
+  });
+
+  it("the_upgrade_records_the_uploader_of_each_heldout_stored_before_it", MINUTE, async () => {
+    // A database set up before the records of held-out uploads: migrations 0001 and 0002 alone.
+    const dir = await mkdtemp(join(tmpdir(), "tender-0002-"));
+    const { db: old, dispose } = await target.fresh();
+    try {
+      for (const name of ["0001_init.sql", "0002_result_uploads.sql"]) {
+        await copyFile(new URL(`../migrations/${name}`, import.meta.url), join(dir, name));
+      }
+      expect(await migrate(old, dir)).toHaveLength(2);
+      const put = (kind: BlobKind, text: string, uploader?: string) =>
+        putBlob(old, {
+          kind,
+          contentType: "application/json",
+          bytes: Buffer.from(text),
+          uploader,
+          isPublic: kind !== "heldout",
+        });
+      const heldout = await put("heldout", '{"exact":{"expected":["42"]}}', "poster.near");
+      await old.query("update blobs set created_at = $2 where sha256 = $1", [
+        heldout,
+        "2026-10-01T09:00:00Z",
+      ]);
+      // Rows that are not a held-out document with an uploader are no one's upload of one.
+      await put("heldout", '{"exact":{"expected":["43"]}}');
+      await put("criteria", '{"kind":"exact"}', "poster.near");
+      await put("result", '{"exact":{"expected":["44"]}}', "alice.near");
+
+      expect(await migrate(old)).toEqual(["0003_heldout_uploads.sql"]);
+      expect(await old.query("select sha256, account, uploaded_at from heldout_uploads")).toEqual([
+        { sha256: heldout, account: "poster.near", uploaded_at: new Date("2026-10-01T09:00:00Z") },
+      ]);
+      expect(await hasHeldoutUpload(old, heldout, "poster.near")).toBe(true);
+    } finally {
+      await dispose();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
