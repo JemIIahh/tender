@@ -179,6 +179,10 @@ function recordingApi(served: ReadonlySet<string> = new Set()) {
       heldouts.push({ commitment, bytes });
     },
     start: unexpected("start"),
+    listQuestions: unexpected("listQuestions"),
+    askQuestion: unexpected("askQuestion"),
+    answerQuestion: unexpected("answerQuestion"),
+    postClarification: unexpected("postClarification"),
     telegramLink: unexpected("telegramLink"),
     signIn: unexpected("signIn"),
   };

@@ -49,7 +49,13 @@ const U128_MAX = "340282366920938463463374607431768211455";
 const MINUTE = { timeout: 60_000 };
 
 // The migrations of this package, in the order they apply.
-const MIGRATIONS = ["0001_init.sql", "0002_result_uploads.sql", "0003_heldout_uploads.sql"];
+const MIGRATIONS = [
+  "0001_init.sql",
+  "0002_result_uploads.sql",
+  "0003_heldout_uploads.sql",
+  "0004_task_questions.sql",
+  "0005_tg_board_digests.sql",
+];
 
 // Stands for a secret (a held-out answer, blob bytes) in the error tests: as text, and as hex, which
 // is how Postgres prints the bytes of a bytea.
@@ -247,6 +253,27 @@ const SCHEMA: Record<string, string[]> = {
   ],
   // Migration 0003.
   heldout_uploads: ["sha256 text", "account text", "uploaded_at timestamp with time zone = now()"],
+  // Migration 0004.
+  task_questions: [
+    "id bigint = serial",
+    "task_id numeric(40,0)",
+    "kind text",
+    "asker text?",
+    "body text",
+    "created_at timestamp with time zone = now()",
+    "answer text?",
+    "answered_at timestamp with time zone?",
+    "hidden boolean = false",
+  ],
+  // Migration 0005.
+  tg_board_digests: [
+    "chat_id bigint",
+    "task_id numeric(40,0)",
+    "audience text",
+    "upto_event_id bigint",
+    "sent_at timestamp with time zone",
+    "digests integer",
+  ],
 };
 
 // Primary keys, uniqueness and every index, as "table: kind (columns)". An index on an expression
@@ -269,11 +296,15 @@ const KEYS = [
   "heldout_uploads: primary key (sha256, account)",
   "result_uploads: primary key (sha256, task_id, account)",
   "schema_migrations: primary key (name)",
+  "task_questions: index (task_id, asker, created_at)",
+  "task_questions: index (task_id, id)",
+  "task_questions: primary key (id)",
   "tasks: index (commit_deadline)",
   "tasks: primary key (id)",
   "tasks: index (parent)",
   "tasks: index (poster)",
   "tasks: index (verifier)",
+  "tg_board_digests: primary key (chat_id, task_id, audience)",
   "tg_link_nonces: primary key (nonce)",
   "tg_links: primary key (chat_id)",
   "tg_sent: primary key (chat_id, dedupe_key)",
@@ -283,10 +314,14 @@ const KEYS = [
 ].sort();
 
 // Every constraint that is not a key (those are in KEYS) and not NOT NULL (that is the "?" above;
-// Postgres 18 also lists NOT NULL in pg_constraint, 17 does not): no foreign key, no other CHECK.
+// Postgres 18 also lists NOT NULL in pg_constraint, 17 does not): no foreign key, and no CHECK but
+// the kind of a blob and the three of a board row (migration 0004).
 const CONSTRAINTS = [
   "blobs: CHECK ((kind = ANY (ARRAY['brief'::text, 'criteria'::text, 'heldout'::text, " +
     "'result'::text, 'scorecard'::text, 'profile'::text])))",
+  "task_questions: CHECK (((answer IS NULL) = (answered_at IS NULL)))",
+  "task_questions: CHECK (((kind = 'question'::text) = (asker IS NOT NULL)))",
+  "task_questions: CHECK ((kind = ANY (ARRAY['question'::text, 'clarification'::text])))",
 ];
 
 async function describeSchema(db: Db) {
@@ -1175,7 +1210,12 @@ describe.each(targets)("db on $name", (target) => {
       await put("criteria", '{"kind":"exact"}', "poster.near");
       await put("result", '{"exact":{"expected":["44"]}}', "alice.near");
 
-      expect(await migrate(old)).toEqual(["0003_heldout_uploads.sql"]);
+      // 0003 is the one under test; whatever comes after it applies on top, as it would on a real upgrade.
+      expect(await migrate(old)).toEqual([
+        "0003_heldout_uploads.sql",
+        "0004_task_questions.sql",
+        "0005_tg_board_digests.sql",
+      ]);
       expect(await old.query("select sha256, account, uploaded_at from heldout_uploads")).toEqual([
         { sha256: heldout, account: "poster.near", uploaded_at: new Date("2026-10-01T09:00:00Z") },
       ]);

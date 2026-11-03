@@ -86,6 +86,28 @@ const SAMPLES: ByKind = {
     reward: "12500000",
     funders: 3,
   },
+  question_answered: {
+    kind: "question_answered",
+    taskId: "7",
+    title: "Summarise the Q3 report",
+    questionId: "3",
+  },
+  clarification_posted: {
+    kind: "clarification_posted",
+    taskId: "7",
+    title: "Summarise the Q3 report",
+    clarificationId: "4",
+  },
+  board_digest: {
+    kind: "board_digest",
+    taskId: "7",
+    title: "Summarise the Q3 report",
+    for: "watchers",
+    questions: 0,
+    answers: 3,
+    clarifications: 1,
+    last: false,
+  },
 };
 
 // One snapshot per kind. The expected text is written out by hand from the plan's formats.
@@ -153,6 +175,74 @@ test("renders_deadline_reminder", () => {
 test("renders_pool_grew", () => {
   expect(renderAlert(SAMPLES.pool_grew, CTX)).toMatchInlineSnapshot(`
     "<b>Pool grew</b> · Summarise the Q3 report now pays 12.50 USDC from 3 backers
+    <a href="https://tender.example/tasks/7">Open task</a>"
+  `);
+});
+
+// The board's alerts say that something was written, and never what: the words are a stranger's,
+// public on the task page, and a poster may hide a question that was already announced.
+
+test("renders_a_board_digest_for_watchers_and_for_the_poster", () => {
+  expect(renderAlert(SAMPLES.board_digest, CTX)).toMatchInlineSnapshot(`
+    "<b>Board update</b> · Summarise the Q3 report · 3 new answers, 1 new clarification
+    <a href="https://tender.example/tasks/7">Open task</a>"
+  `);
+  const forPoster = {
+    ...SAMPLES.board_digest,
+    for: "poster",
+    questions: 12,
+    answers: 0,
+    clarifications: 0,
+  } as const;
+  expect(renderAlert(forPoster, CTX)).toMatchInlineSnapshot(`
+    "<b>New questions</b> · Summarise the Q3 report · 12 new questions waiting for an answer
+    <a href="https://tender.example/tasks/7">Open task</a>"
+  `);
+});
+
+test("a_board_digest_counts_in_the_singular_and_leaves_out_what_is_zero", () => {
+  const one = { ...SAMPLES.board_digest, answers: 1, clarifications: 0 };
+  expect(renderAlert(one, CTX).split("\n")[0]).toBe(
+    "<b>Board update</b> · Summarise the Q3 report · 1 new answer",
+  );
+  const note = { ...SAMPLES.board_digest, answers: 0, clarifications: 2 };
+  expect(renderAlert(note, CTX).split("\n")[0]).toBe(
+    "<b>Board update</b> · Summarise the Q3 report · 2 new clarifications",
+  );
+  const poster = { ...SAMPLES.board_digest, for: "poster", questions: 1, answers: 9 } as const;
+  expect(renderAlert(poster, CTX).split("\n")[0]).toBe(
+    "<b>New questions</b> · Summarise the Q3 report · 1 new question waiting for an answer",
+  );
+});
+
+test("the_last_board_digest_of_a_task_says_that_it_is_the_last", () => {
+  const last = { ...SAMPLES.board_digest, last: true };
+  expect(renderAlert(last, CTX)).toMatchInlineSnapshot(`
+    "<b>Board update</b> · Summarise the Q3 report · 3 new answers, 1 new clarification
+    That is the last board alert for this task. The task page shows the rest.
+    <a href="https://tender.example/tasks/7">Open task</a>"
+  `);
+  expect(renderAlert(SAMPLES.board_digest, CTX)).not.toContain("last board alert");
+});
+
+test("a_board_digest_with_nothing_new_in_it_is_refused", () => {
+  const empty = { ...SAMPLES.board_digest, answers: 0, clarifications: 0 };
+  expect(() => renderAlert(empty, CTX)).toThrow(/nothing new/);
+  // A poster's digest counts questions, not answers: answers alone are nothing to it.
+  const wrongKind = { ...SAMPLES.board_digest, for: "poster", questions: 0, answers: 4 } as const;
+  expect(() => renderAlert(wrongKind, CTX)).toThrow(/nothing new/);
+});
+
+test("renders_question_answered", () => {
+  expect(renderAlert(SAMPLES.question_answered, CTX)).toMatchInlineSnapshot(`
+    "<b>Question answered</b> · Summarise the Q3 report · the poster answered a question
+    <a href="https://tender.example/tasks/7">Open task</a>"
+  `);
+});
+
+test("renders_clarification_posted", () => {
+  expect(renderAlert(SAMPLES.clarification_posted, CTX)).toMatchInlineSnapshot(`
+    "<b>Clarification</b> · Summarise the Q3 report · the poster posted a note for entrants
     <a href="https://tender.example/tasks/7">Open task</a>"
   `);
 });
@@ -262,6 +352,9 @@ test("html_is_escaped_in_every_text_field_of_every_kind", () => {
     task_voided: { ...SAMPLES.task_voided, title: evil },
     deadline_reminder: { ...SAMPLES.deadline_reminder, title: evil },
     pool_grew: { ...SAMPLES.pool_grew, title: evil, token: evil },
+    board_digest: { ...SAMPLES.board_digest, title: evil },
+    question_answered: { ...SAMPLES.question_answered, title: evil },
+    clarification_posted: { ...SAMPLES.clarification_posted, title: evil },
   };
 
   for (const alert of Object.values(hostile)) {
@@ -369,6 +462,9 @@ test("dedupe_keys_take_the_documented_form", () => {
     "task_voided:7",
     "deadline_reminder:7:24",
     "pool_grew:7:12500000",
+    "question_answered:7:3",
+    "clarification_posted:7:4",
+    "board_digest:7:watchers",
   ]);
 });
 
@@ -381,6 +477,16 @@ test("alerts_that_repeat_get_a_key_per_value", () => {
   distinct(SAMPLES.pool_grew, { ...SAMPLES.pool_grew, reward: "15000000" });
   distinct(SAMPLES.agent_started, { ...SAMPLES.agent_started, agent: "bob.testnet" });
   distinct(SAMPLES.deadline_reminder, { ...SAMPLES.deadline_reminder, hoursLeft: 1 });
+  // Each answer and clarification is news of its own.
+  distinct(SAMPLES.question_answered, { ...SAMPLES.question_answered, questionId: "4" });
+  distinct(SAMPLES.clarification_posted, { ...SAMPLES.clarification_posted, clarificationId: "5" });
+  // The poster's digest and the watchers' are two (their claims are in `tg_board_digests`, which
+  // the key only names).
+  distinct(SAMPLES.board_digest, { ...SAMPLES.board_digest, for: "poster" });
+  // Whether an entrant hears is not part of the key: a rebuilt alert lands on the same one.
+  expect(dedupeKey({ ...SAMPLES.question_answered, entrantsHear: false })).toBe(
+    dedupeKey(SAMPLES.question_answered),
+  );
 });
 
 test("an_alert_of_an_unknown_kind_is_refused", () => {

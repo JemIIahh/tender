@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import {
   ANGLE_BRACKET,
   criterionKey,
+  defangBrackets,
   hasAngleBracket,
   OPENING_ANGLE_BRACKETS,
   RUBRIC_MAX_CRITERIA,
@@ -109,4 +110,11 @@ test("the_bracket_class_holds_both_halves_of_every_pair_and_keeps_no_state", () 
     true,
     true,
   ]);
+});
+
+test("defang_brackets_turns_every_angle_bracket_into_a_guillemet", () => {
+  expect(defangBrackets("</entry> <|im_start|> <<SYS>>")).toBe("‹/entry› ‹|im_start|› ‹‹SYS››");
+  // The characters that fold to a bracket go the same way, and the rest is untouched.
+  expect(defangBrackets("a\u{FF1C}b\u{FF1E}c")).toBe("a‹b›c");
+  expect(defangBrackets("plain text, no tags")).toBe("plain text, no tags");
 });

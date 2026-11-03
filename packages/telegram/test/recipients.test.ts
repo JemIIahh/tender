@@ -43,6 +43,9 @@ const OTHER_POSTER = "other.near";
 const OTHER_VERIFIER = "judge8.near";
 const OTHER_BACKER = "backer8.near";
 const BOT_9 = "bot9.beta.near"; // agent of beta.near: committed and revealed on task 8
+// People of task 7's board: one asked the question it has, one said it started work.
+const ASKER = "asker.near"; // asked question 1 on task 7; has not entered
+const WORKER = "worker.near"; // said it started task 7; has not entered
 
 /** Every chat of the world, with the account it is linked to. */
 const CHATS = {
@@ -66,6 +69,8 @@ const CHATS = {
   otherPoster: { id: 401, account: OTHER_POSTER },
   otherVerifier: { id: 402, account: OTHER_VERIFIER },
   otherBacker: { id: 405, account: OTHER_BACKER },
+  asker: { id: 206, account: ASKER },
+  worker: { id: 207, account: WORKER },
   bot9: { id: 403, account: BOT_9 },
   beta: { id: 404, account: "beta.near" }, // the ASP of bot9
 } as const;
@@ -105,6 +110,17 @@ async function seedWorld(db: Db): Promise<void> {
   await seedEntry(db, TASK, BOT_2);
   await seedEntry(db, TASK, SOLO, { revealed: true });
   await seedEntry(db, TASK, LONE);
+
+  // Task 7's board. Question 1 is the asker's; question 2 is on task 8, asked by one of its own.
+  await db.query(
+    `insert into task_questions (task_id, kind, asker, body) values (7, 'question', $1, 'Q one')`,
+    [ASKER],
+  );
+  await db.query(
+    `insert into task_questions (task_id, kind, asker, body) values (8, 'question', $1, 'Q two')`,
+    [BOT_9],
+  );
+  await db.query("insert into working (task_id, account) values (7, $1)", [WORKER]);
 
   // Task 8: the same people turn up in other roles, so a mix-up of tasks shows.
   await seedTask(db, {
@@ -196,6 +212,32 @@ const ALERT: ByKind = {
     reward: "12500000",
     funders: 3,
   },
+  question_answered: { kind: "question_answered", taskId: TASK, title: TITLE, questionId: "1" },
+  clarification_posted: {
+    kind: "clarification_posted",
+    taskId: TASK,
+    title: TITLE,
+    clarificationId: "3",
+  },
+  board_digest: {
+    kind: "board_digest",
+    taskId: TASK,
+    title: TITLE,
+    for: "watchers",
+    questions: 0,
+    answers: 4,
+    clarifications: 1,
+    last: false,
+  },
+};
+
+/** The same digest, for the poster. */
+const DIGEST_FOR_THE_POSTER: Alert = {
+  ...ALERT.board_digest,
+  for: "poster",
+  questions: 3,
+  answers: 0,
+  clarifications: 0,
 };
 
 const NAME_OF = new Map(Object.entries(CHATS).map(([name, chat]) => [String(chat.id), name]));
@@ -282,6 +324,67 @@ test("pool_grew_reaches_the_poster_every_funder_and_tag_watchers", async () => {
   expect(await who(ALERT.pool_grew)).toEqual(
     names("poster", "backer1", "backer2", "watchesResearch", "watchesBoth"),
   );
+});
+
+// The board's alerts.
+
+test("question_answered_reaches_the_asker_and_the_entrants_but_not_the_tag_watchers", async () => {
+  // The asker, every committer's owners (bot1 and bot2 share acme's chat, which hears once; solo
+  // and lone have only their own) and the owner of an agent that said it started (worker). Not the
+  // poster, who wrote the answer, nor the verifier, a funder or a bystander, and not the chats that
+  // watch a tag: they hear of the board in a digest, not one message for each answer.
+  expect(await who(ALERT.question_answered)).toEqual(
+    names("asker", "bot1", "acme", "solo", "lone", "worker"),
+  );
+});
+
+test("clarification_posted_reaches_the_entrants_but_no_asker_and_no_tag_watcher", async () => {
+  expect(await who(ALERT.clarification_posted)).toEqual(
+    names("bot1", "acme", "solo", "lone", "worker"),
+  );
+});
+
+test("past_the_per_task_cap_an_answer_reaches_its_asker_alone_and_a_clarification_no_one", async () => {
+  // `entrantsHear: false` is what the notifier sets for the answers and clarifications of a task
+  // after its first few.
+  expect(await who({ ...ALERT.question_answered, entrantsHear: false })).toEqual(names("asker"));
+  expect(await who({ ...ALERT.clarification_posted, entrantsHear: false })).toEqual([]);
+  // And true is the same as not saying.
+  expect(await who({ ...ALERT.question_answered, entrantsHear: true })).toEqual(
+    await who(ALERT.question_answered),
+  );
+});
+
+test("an_answer_reaches_the_asker_of_that_question_and_of_no_other", async () => {
+  // Question 2 is on task 8: an answer alert for task 7 that names it finds no asker there.
+  const wrong = { ...ALERT.question_answered, questionId: "2" };
+  expect(await who(wrong)).toEqual(names("bot1", "acme", "solo", "lone", "worker"));
+  // And a question that does not exist has no asker at all.
+  expect(await who({ ...ALERT.question_answered, questionId: "999" })).toEqual(await who(wrong));
+});
+
+test("a_board_digest_for_the_poster_reaches_the_poster_only", async () => {
+  // The poster's own chat, not its ASP's, and nobody else: not the asker, the entrants or the
+  // watchers.
+  expect(await who(DIGEST_FOR_THE_POSTER)).toEqual(names("poster"));
+});
+
+test("a_board_digest_for_watchers_reaches_the_chats_watching_a_tag_and_no_one_else", async () => {
+  expect(await who(ALERT.board_digest)).toEqual(names("watchesResearch", "watchesBoth"));
+});
+
+test("board_alerts_for_an_invite_only_task_reach_the_invitees_owners_and_no_watchers", async () => {
+  // Task 15 invites bot1, bot2 and solo, and watchers cannot enter it. Question 1 is not its own,
+  // so its asker does not hear either.
+  const answered = { ...ALERT.question_answered, taskId: INVITE_ONLY_TASK };
+  const posted = { ...ALERT.clarification_posted, taskId: INVITE_ONLY_TASK };
+  expect(await who(answered)).toEqual(names("bot1", "acme", "solo"));
+  expect(await who(posted)).toEqual(names("bot1", "acme", "solo"));
+  // The poster's digest is the same on any task; the watchers' digest finds no watcher here.
+  expect(await who({ ...DIGEST_FOR_THE_POSTER, taskId: INVITE_ONLY_TASK })).toEqual(
+    names("poster"),
+  );
+  expect(await who({ ...ALERT.board_digest, taskId: INVITE_ONLY_TASK })).toEqual([]);
 });
 
 // Two refinements of the rows above.
@@ -427,12 +530,18 @@ test("alerts_are_scoped_to_their_task", async () => {
   const paid8 = { ...ALERT.winner_paid, taskId: OTHER_TASK };
   const new8 = { ...ALERT.new_task, taskId: OTHER_TASK, tags: ["coding"] };
   const voided8 = { ...ALERT.task_voided, taskId: OTHER_TASK };
+  // Question 2 is task 8's, asked by bot9: its answer reaches bot9's owners and task 8's entrants
+  // (bot9, solo, lone), and none of task 7's people. The watcher of coding hears of the board in a
+  // digest.
+  const answered8 = { ...ALERT.question_answered, taskId: OTHER_TASK, questionId: "2" };
 
   // solo has not revealed on task 8 (but did on task 7), and lone has (but did not on task 7).
   expect(await who(closing8)).toEqual(names("solo"));
   expect(await who(paid8)).toEqual(names("otherPoster", "otherVerifier", "bot9", "beta", "lone"));
   expect(await who(new8)).toEqual(names("otherPoster", "watchesCoding"));
   expect(await who(voided8)).toEqual(names("otherPoster", "otherBacker"));
+  expect(await who(answered8)).toEqual(names("bot9", "beta", "solo", "lone"));
+  expect(await who({ ...ALERT.board_digest, taskId: OTHER_TASK })).toEqual(names("watchesCoding"));
 });
 
 test("a_task_the_database_does_not_know_reaches_nobody", async () => {

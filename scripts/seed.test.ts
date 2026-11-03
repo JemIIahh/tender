@@ -350,6 +350,10 @@ function fakeApi(trace: string[], options: ApiOptions = {}) {
     uploadBlob,
     uploadHeldout,
     start: unexpected("start"),
+    listQuestions: unexpected("listQuestions"),
+    askQuestion: unexpected("askQuestion"),
+    answerQuestion: unexpected("answerQuestion"),
+    postClarification: unexpected("postClarification"),
     telegramLink: unexpected("telegramLink"),
     signIn: unexpected("signIn"),
   };

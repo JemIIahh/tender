@@ -862,7 +862,7 @@ test("every_decimal_string_and_count_of_a_response_schema_refuses_a_value_of_ano
 // ---- TenderApi --------------------------------------------------------------------------------
 
 test("a_client_with_the_listed_methods_satisfies_tender_api", async () => {
-  // A stand-in with the thirteen methods, as the test of the MCP server or of an agent would
+  // A stand-in with the seventeen methods, as the test of the MCP server or of an agent would
   // write one. `satisfies` is checked by tsc and does nothing at run time: a method that
   // `TenderApi` gains or loses, or gives other types, fails `pnpm typecheck` here.
   const standIn = {
@@ -888,6 +888,30 @@ test("a_client_with_the_listed_methods_satisfies_tender_api", async () => {
     }),
     uploadHeldout: async (_commitment: string, _bytes: Uint8Array) => {},
     start: async (_taskId: bigint) => ({ ok: true, working_count: 1 }),
+    listQuestions: async (_taskId: bigint) => null,
+    askQuestion: async (_taskId: bigint, _text: string) => ({
+      question: {
+        id: "1",
+        asker: "alice.test.near",
+        text: "q",
+        asked_at: SOON,
+        hidden: false,
+        answer: null,
+      },
+    }),
+    answerQuestion: async (_taskId: bigint, _questionId: bigint, _text: string) => ({
+      question: {
+        id: "1",
+        asker: "alice.test.near",
+        text: "q",
+        asked_at: SOON,
+        hidden: false,
+        answer: { text: "a", answered_at: SOON },
+      },
+    }),
+    postClarification: async (_taskId: bigint, _text: string) => ({
+      clarification: { id: "2", text: "c", posted_at: SOON },
+    }),
     telegramLink: async () => ({ url: "https://t.me/tender_test_bot?start=abc", expires_at: SOON }),
     signIn: async () => "a-bearer-token",
   } satisfies TenderApi;
