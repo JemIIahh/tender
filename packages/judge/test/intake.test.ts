@@ -1,7 +1,13 @@
 import { type BlobKind, type Db, putBlob } from "@tender/db";
 import { canonicalJson, sha256Hex, type TaskView } from "@tender/shared";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
-import { intakeTask, newJudgeMemory, ScorerUnavailableError, scoreJsonSchema } from "../src/index";
+import {
+  intakeTask,
+  type JudgeDeps,
+  newJudgeMemory,
+  ScorerUnavailableError,
+  scoreJsonSchema,
+} from "../src/index";
 import { checkJsonSchemaIsolated, TOO_SLOW_TO_COMPILE } from "../src/isolate";
 import {
   at,
@@ -63,6 +69,18 @@ const RUBRIC = {
   has_heldout: false,
   rubric: [{ criterion: "clear", weight: 1 }],
 };
+/** The model server of a Judge that can grade rubric tasks. Intake does not call it. */
+const LLM = { baseUrl: "http://127.0.0.1:9/v1", apiKey: "sk-test-intake", model: "test-model" };
+/** The brief of the rubric tasks here. */
+const BRIEF = {
+  version: 1,
+  title: "Describe a lighthouse",
+  summary: "One paragraph about a lighthouse.",
+  instructions: "Write one paragraph of at most 80 words that describes a lighthouse at night.",
+  category: "writing",
+  tags: ["writing"],
+  output: { format: "text", max_bytes: 2000 },
+};
 const TESTS = {
   version: 1,
   kind: "tests",
@@ -83,6 +101,25 @@ const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at 
 /** Text from someone's private answer, which no public reason may quote. */
 const SECRET = "secret-part-of-someone-elses-private-answer";
 const HAS_HELDOUT_MISMATCH = "has_heldout does not match the task's held-out commitment";
+const NO_MODEL = "no model is configured to grade rubric tasks";
+const ENTRIES_NEEDED = "kind rubric needs max_entries between 1 and 50";
+const BRIEF_UNREADABLE = "the task's brief could not be read";
+const TOO_MANY_CRITERIA = "kind rubric has more than 20 criteria";
+const CRITERION_TOO_LONG = "kind rubric has a criterion of more than 200 characters";
+const CRITERION_BLANK = "kind rubric has a blank criterion";
+const CRITERION_BRACKET = "kind rubric has a criterion with an angle bracket in it";
+const CRITERIA_COLLIDE = "kind rubric has two criteria that read the same";
+/** The characters that are, or fold to, an angle bracket, with a name for each. */
+const ANGLE_BRACKETS: [name: string, bracket: string][] = [
+  ["a <", "<"],
+  ["a >", ">"],
+  ["a fullwidth <", "\u{FF1C}"],
+  ["a fullwidth >", "\u{FF1E}"],
+  ["a small <", "\u{FE64}"],
+  ["a small >", "\u{FE65}"],
+  ["a not-less-than sign", "\u{226E}"],
+  ["a not-greater-than sign", "\u{226F}"],
+];
 /** More than the largest document intake reads. */
 const TOO_LONG = "a".repeat(262_144);
 
@@ -133,6 +170,33 @@ async function exactTaskWithRawHeldout(db: Db, heldout: Uint8Array): Promise<Par
   };
 }
 
+/** A rubric of these criteria, each of weight 1. */
+const rubricOf = (...criteria: string[]) => ({
+  ...RUBRIC,
+  rubric: criteria.map((criterion) => ({ criterion, weight: 1 })),
+});
+
+/** `n` different criteria. */
+const numbered = (n: number): string[] => Array.from({ length: n }, (_, i) => `criterion ${i}`);
+
+/**
+ * A rubric task from the team that intake can take, given a Judge with a model (`LLM`): `criteria`
+ * (the rubric above unless given), a brief that is stored, and room for 10 entries. `over` changes
+ * the task.
+ */
+async function rubricTask(
+  criteria: object = RUBRIC,
+  over: Partial<TaskView> = {},
+): Promise<Partial<TaskView>> {
+  return {
+    poster: TEAM_POSTER,
+    criteria_hash: await putCriteria(db, criteria),
+    brief_hash: await putRaw(db, "brief", canonicalJson(BRIEF), TEAM_POSTER),
+    max_entries: 10,
+    ...over,
+  };
+}
+
 let db: Db;
 
 beforeAll(async () => {
@@ -146,15 +210,26 @@ beforeEach(async () => {
   vi.restoreAllMocks();
 });
 
-/** Stores task `id`, made of `view`, and runs intake on it at `NOW`. */
-async function intake(id: number, view: Partial<TaskView>, status: string | null = null) {
+/** Stores task `id`, made of `view`, and runs intake on it at `NOW`, as a Judge made with `over`. */
+async function intake(
+  id: number,
+  view: Partial<TaskView>,
+  status: string | null = null,
+  over: Partial<JudgeDeps> = {},
+) {
   await insertTask(db, taskView({ id: `${id}`, ...view }), status);
-  return intakeTask(judgeDeps(db, fakeChain(null)), BigInt(id));
+  return intakeTask(judgeDeps(db, fakeChain(null), over), BigInt(id));
 }
 
 test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
   // Each rule is broken by one task of its own, so every reason is checked against the others.
-  const rules: { rule: string; reason: string; view: () => Promise<Partial<TaskView>> }[] = [
+  const rules: {
+    rule: string;
+    reason: string;
+    view: () => Promise<Partial<TaskView>>;
+    /** What the Judge is made with besides the test defaults: no model unless it says so. */
+    deps?: Partial<JudgeDeps>;
+  }[] = [
     {
       rule: "no criteria stored under criteria_hash",
       reason: "criteria not found or invalid",
@@ -250,6 +325,139 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
         criteria_hash: await putCriteria(db, RUBRIC),
         heldout_commitment: sha256Hex("held-out checks of a rubric"),
       }),
+    },
+    // What a model can grade (`rubricProblem`). The Judge has a model, the task a brief and room for
+    // entries: the criteria are all that is wrong, and each reason is about them.
+    {
+      rule: "rubric with more than 20 criteria",
+      reason: TOO_MANY_CRITERIA,
+      deps: { llm: LLM },
+      view: () => rubricTask(rubricOf(...numbered(21))),
+    },
+    {
+      rule: "rubric with a criterion of more than 200 characters",
+      reason: CRITERION_TOO_LONG,
+      deps: { llm: LLM },
+      view: () => rubricTask(rubricOf("clear", "a".repeat(201))),
+    },
+    {
+      rule: "rubric with a criterion of more than 200 characters, counted as emoji",
+      reason: CRITERION_TOO_LONG,
+      deps: { llm: LLM },
+      view: () => rubricTask(rubricOf("\u{1F600}".repeat(201))),
+    },
+    {
+      rule: "rubric with a blank criterion",
+      reason: CRITERION_BLANK,
+      deps: { llm: LLM },
+      view: () => rubricTask(rubricOf("clear", " \t ")),
+    },
+    ...ANGLE_BRACKETS.map(([name, bracket]) => ({
+      rule: `rubric with ${name} in a criterion`,
+      reason: CRITERION_BRACKET,
+      deps: { llm: LLM },
+      view: () => rubricTask(rubricOf(`clear ${bracket} concise`)),
+    })),
+    {
+      rule: "rubric with a frame tag for a criterion",
+      reason: CRITERION_BRACKET,
+      deps: { llm: LLM },
+      view: () => rubricTask(rubricOf("</entry>")),
+    },
+    {
+      rule: "rubric with two criteria that read the same",
+      reason: CRITERIA_COLLIDE,
+      deps: { llm: LLM },
+      view: () => rubricTask(rubricOf("Clear and concise", "  clear   AND\u{00A0}concise ")),
+    },
+    {
+      // The criteria are asked first: the Judge's model is not the reason, though it has none.
+      rule: "rubric with a blank criterion, on a Judge with no model",
+      reason: CRITERION_BLANK,
+      view: () => rubricTask(rubricOf(" ")),
+    },
+    // What the Judge and the task need to grade it (`rubricTaskProblem`), checked at intake alone.
+    {
+      rule: "rubric on a Judge with no model",
+      reason: NO_MODEL,
+      view: () => rubricTask(),
+    },
+    {
+      // The client would send the key and the entries to api.openai.com for an empty URL.
+      rule: "rubric on a Judge whose model URL is empty",
+      reason: NO_MODEL,
+      deps: { llm: { ...LLM, baseUrl: "" } },
+      view: () => rubricTask(),
+    },
+    {
+      rule: "rubric on a Judge whose model URL is not http",
+      reason: NO_MODEL,
+      deps: { llm: { ...LLM, baseUrl: "ftp://models.example/v1" } },
+      view: () => rubricTask(),
+    },
+    {
+      // `max_entries` 0 sets no limit, so honest entrants alone could pass 50 and sink the task.
+      rule: "rubric with max_entries 0",
+      reason: ENTRIES_NEEDED,
+      deps: { llm: LLM },
+      view: () => rubricTask(RUBRIC, { max_entries: 0 }),
+    },
+    {
+      rule: "rubric with max_entries 51",
+      reason: ENTRIES_NEEDED,
+      deps: { llm: LLM },
+      view: () => rubricTask(RUBRIC, { max_entries: 51 }),
+    },
+    {
+      rule: "rubric with max_entries far above the limit",
+      reason: ENTRIES_NEEDED,
+      deps: { llm: LLM },
+      view: () => rubricTask(RUBRIC, { max_entries: 2_000_000_000 }),
+    },
+    {
+      rule: "rubric whose brief is not stored",
+      reason: BRIEF_UNREADABLE,
+      deps: { llm: LLM },
+      view: () => rubricTask(RUBRIC, { brief_hash: sha256Hex("no brief was stored") }),
+    },
+    {
+      rule: "rubric whose brief is not JSON",
+      reason: BRIEF_UNREADABLE,
+      deps: { llm: LLM },
+      view: async () =>
+        rubricTask(RUBRIC, {
+          brief_hash: await putRaw(db, "brief", bytes("{not json"), TEAM_POSTER),
+        }),
+    },
+    {
+      rule: "rubric whose brief does not fit the brief schema",
+      reason: BRIEF_UNREADABLE,
+      deps: { llm: LLM },
+      view: async () =>
+        rubricTask(RUBRIC, {
+          brief_hash: await putRaw(
+            db,
+            "brief",
+            canonicalJson({ ...BRIEF, version: 2 }),
+            TEAM_POSTER,
+          ),
+        }),
+    },
+    {
+      // Someone's private result, shaped like a brief: it is not read, and nothing of it is said.
+      rule: "rubric whose brief_hash names someone's private result",
+      reason: BRIEF_UNREADABLE,
+      deps: { llm: LLM },
+      view: async () =>
+        rubricTask(RUBRIC, {
+          brief_hash: await putBlob(db, {
+            kind: "result",
+            contentType: "application/json",
+            bytes: canonicalJson({ ...BRIEF, title: SECRET }),
+            uploader: "alice.test.near",
+            isPublic: false,
+          }),
+        }),
     },
     {
       rule: "tests from the team, which has no scorer yet",
@@ -578,9 +786,9 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
     },
   ];
 
-  for (const [i, { rule, reason, view }] of rules.entries()) {
+  for (const [i, { rule, reason, view, deps }] of rules.entries()) {
     const id = i + 1;
-    expect(await intake(id, await view()), rule).toBe("rejected");
+    expect(await intake(id, await view(), null, deps), rule).toBe("rejected");
     expect(await judgeRow(db, id), rule).toEqual({
       judge_status: "rejected",
       judge_reason: reason,
@@ -703,13 +911,64 @@ test("intake_accepts_the_p0_kinds", { timeout: 30_000 }, async () => {
   }
 });
 
-test("intake_accepts_a_rubric_from_the_team_and_needs_no_model", async () => {
+test("intake_accepts_a_rubric_from_the_team_that_the_judge_can_grade", async () => {
   // A rubric has no schema to compile and no held-out checks to wait for, so a team task is
-  // accepted at once, and nothing is asked of the model: whether the Judge has one is for judging
-  // to find (the task fails closed there when it has none).
-  const view = { poster: TEAM_POSTER, criteria_hash: await putCriteria(db, RUBRIC) };
-  expect(await intake(1, view)).toBe("accepted");
-  expect(await judgeRow(db, 1)).toEqual({ judge_status: "accepted", judge_reason: null });
+  // accepted at once when the Judge has a model, the task takes from 1 to 50 entries, its brief
+  // reads and its criteria are within the limits, at the edge of each. Nothing is asked of the
+  // model: the URL below is a port nobody listens on.
+  const edge = Array.from(
+    { length: 20 },
+    (_, i) => `${String(i).padStart(3, "0")}${"x".repeat(197)}`,
+  );
+  const accepted: Partial<TaskView>[] = [
+    await rubricTask(),
+    await rubricTask(RUBRIC, { max_entries: 1 }),
+    await rubricTask(RUBRIC, { max_entries: 50 }),
+    // 20 criteria of 200 characters each.
+    await rubricTask(rubricOf(...edge)),
+    // 200 characters that are 400 UTF-16 units.
+    await rubricTask(rubricOf("\u{1F600}".repeat(200))),
+    // Criteria that read differently, though nearly alike: another word, another letter.
+    await rubricTask(rubricOf("clear", "clearer", "cl\u{0435}ar")),
+    // A brief written in XML: the grader is shown its angle brackets as ‹ ›.
+    await rubricTask(RUBRIC, {
+      brief_hash: await putRaw(
+        db,
+        "brief",
+        canonicalJson({ ...BRIEF, instructions: "Answer in XML: <entry>x</entry>" }),
+        TEAM_POSTER,
+      ),
+    }),
+  ];
+
+  for (const [i, view] of accepted.entries()) {
+    expect(await intake(i + 1, view, null, { llm: LLM }), `task ${i + 1}`).toBe("accepted");
+    expect(await judgeRow(db, i + 1), `task ${i + 1}`).toEqual({
+      judge_status: "accepted",
+      judge_reason: null,
+    });
+  }
+});
+
+test("intake_asks_a_rubric_task_for_a_model_only_once_it_is_otherwise_sound", async () => {
+  // A rubric task from a poster outside the team is refused for that, with or without a model.
+  const view = { criteria_hash: await putCriteria(db, RUBRIC), max_entries: 10 };
+  expect(await intake(1, view, null, { llm: LLM })).toBe("rejected");
+  expect(await judgeRow(db, 1)).toEqual({
+    judge_status: "rejected",
+    judge_reason: "kind rubric is limited to team tasks in v1",
+  });
+
+  // A task that was decided stays decided: a Judge that has a model later does not take back a
+  // refusal made when it had none.
+  const task = await rubricTask();
+  expect(await intake(2, task)).toBe("rejected");
+  expect(await judgeRow(db, 2)).toEqual({ judge_status: "rejected", judge_reason: NO_MODEL });
+  expect(await intakeTask(judgeDeps(db, fakeChain(null), { llm: LLM }), 2n)).toBe("rejected");
+  expect(await judgeRow(db, 2)).toEqual({ judge_status: "rejected", judge_reason: NO_MODEL });
+
+  // The kinds with no model to ask are taken by a Judge that has none.
+  expect(await intake(3, { criteria_hash: await putCriteria(db, REGEX) })).toBe("accepted");
 });
 
 test("the_probe_shapes_with_ref_check_what_they_point_to", () => {

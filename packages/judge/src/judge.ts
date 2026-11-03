@@ -410,12 +410,16 @@ interface Judged {
  * after turn until it is done, and pays a compile of the criteria for each. Contents fetched in
  * the turn and not yet scored are let go, as `progress` keeps no bytes, and are fetched again on
  * its next turn. A fetch or a score under way goes on, within its own limit and the stop line, so
- * a slice can run over by one of them: a score (5 s), a round of fetches (10 s), or a worker's
- * compile of the criteria (the judging budget). A turn finds out one result at least, whatever
- * its slice, so that a task always gets on, and it is not cut short within two slices of the stop
- * line: the last stretch before the line is one turn, which the tasks behind it wait for (see
- * `judgeTick` for what that costs them). Without a `JudgeMemory` there is nothing to take up
- * from, and a task is judged in one turn.
+ * a slice can run over by one of them: a score (5 s), a round of fetches (10 s), a worker's
+ * compile of the criteria (the judging budget), or a rubric's request to the model (60 s, and the
+ * retry after a failure another 60 s or more). So a turn of a rubric task can hold the Judge for
+ * two or three minutes, and push the tasks behind it past their stop lines. That is safe: a task
+ * is picked from what it found out in time, if a pick can still land before its pick deadline (a
+ * rubric task only when it graded every entry), and is left to its fallback window if not. A turn
+ * finds out one result at least, whatever its slice, so that a task always gets on, and it is not
+ * cut short within two slices of the stop line: the last stretch before the line is one turn,
+ * which the tasks behind it wait for (see `judgeTick` for what that costs them). Without a
+ * `JudgeMemory` there is nothing to take up from, and a task is judged in one turn.
  *
  * It throws what `resultUploaded` and the database throw, and `ScorerUnavailableError`.
  */
