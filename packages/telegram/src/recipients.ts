@@ -78,18 +78,23 @@ function audienceOf(a: Alert): Audience {
       return { chatsOf: ["poster"], ownerChatsOf: ["committers"] };
     case "pool_grew":
       return { chatsOf: ["poster", "funders"], watchers: true };
-    case "question_asked":
-      return { chatsOf: ["poster"] };
     case "question_answered":
-      // The entrants are who the board is for: the asker, those who entered, those who said they
-      // started and, on a task pinned to some accounts, the ones invited. Watchers hear it for a
-      // task open to everyone (see WATCHERS). The poster wrote the answer.
-      return {
-        ownerChatsOf: ["questionAsker", "committers", "workers", "invitees"],
-        watchers: true,
-      };
+      // The asker always hears: it is the answer to their own question. The entrants of the task
+      // (those who entered, those who said they started and, on a task pinned to some accounts,
+      // the ones invited) hear it too, until the task's board has been loud enough (the notifier
+      // says). The poster wrote the answer. The chats that watch a tag hear of the board in a
+      // digest (`board_digest`), not one message for each answer.
+      return a.entrantsHear === false
+        ? { ownerChatsOf: ["questionAsker"] }
+        : { ownerChatsOf: ["questionAsker", "committers", "workers", "invitees"] };
     case "clarification_posted":
-      return { ownerChatsOf: ["committers", "workers", "invitees"], watchers: true };
+      return a.entrantsHear === false
+        ? {}
+        : { ownerChatsOf: ["committers", "workers", "invitees"] };
+    case "board_digest":
+      // The poster hears how many questions wait for an answer. The watchers hear what was
+      // answered and clarified, for a task open to everyone (see WATCHERS).
+      return a.for === "poster" ? { chatsOf: ["poster"] } : { watchers: true };
     default: {
       const unexpected: never = a;
       throw new Error(`unknown alert: ${JSON.stringify(unexpected)}`);
@@ -160,7 +165,15 @@ function queryFor({ chatsOf = [], ownerChatsOf = [], watchers = false }: Audienc
  *   nobody, except that `agent_started` still reaches the owner chats of the agent it names.
  */
 export async function resolveRecipients(db: Db, a: Alert): Promise<string[]> {
-  const sql = queryFor(audienceOf(a));
+  const audience = audienceOf(a);
+  // An audience of nobody (a clarification past its task's cap) names no role, so no statement
+  // would use the task's id, which the database does not take as a parameter then.
+  const nobody =
+    (audience.chatsOf ?? []).length === 0 &&
+    (audience.ownerChatsOf ?? []).length === 0 &&
+    audience.watchers !== true;
+  if (nobody) return [];
+  const sql = queryFor(audience);
   const params =
     a.kind === "agent_started"
       ? [a.taskId, a.agent]

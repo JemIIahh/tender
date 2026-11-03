@@ -11,12 +11,22 @@ import { type RenderContext, renderAlert } from "./render";
  * - The event stream: `events` rows after the notifier's place in it, `worker_cursor['telegram']`,
  *   at most `BATCH_SIZE` of them, oldest first. A `task_created` makes `new_task`, a `committed`
  *   that is not a replacement `entry_committed`, a `task_topped_up` `pool_grew`, a `picked`
- *   `winner_paid` and a `voided` `task_voided`. The question board's own events make three more: a
- *   `question_asked` makes `question_asked`, a `question_answered` `question_answered` and a
- *   `clarification_posted` `clarification_posted`; a `question_hidden` makes none, and a question
- *   that the poster hid by the time the notifier looks makes none either. None of them carries the
- *   words that were written, and no message does. The cursor moves to the last event read once the
- *   batch is done, whether its alerts were sent or not.
+ *   `winner_paid` and a `voided` `task_voided`. The question board's own events make two more: a
+ *   `question_answered` makes `question_answered` and a `clarification_posted`
+ *   `clarification_posted`; a `question_asked` and a `question_hidden` make none by themselves, and
+ *   a question that the poster hid by the time the notifier looks makes none either. None of them
+ *   carries the words that were written, and no message does. The cursor moves to the last event
+ *   read once the batch is done, whether its alerts were sent or not.
+ *
+ *   The board is the one place where anyone can make news: any registered agent can ask, and a
+ *   poster can answer a question for each of them. So the notifier does not send a message for
+ *   each row. An answer reaches its asker, and the other entrants of the task (committers,
+ *   workers, invitees) for the first `BOARD_ROW_ALERTS` answers and clarifications of the task.
+ *   The poster hears of questions, and the chats that watch a tag hear of answers and
+ *   clarifications, in a digest (`board_digest`): one message that counts what is new, at most one
+ *   every `BOARD_DIGEST_WINDOW_MS` for a chat and a task, and at most `BOARD_DIGESTS_PER_TASK` for
+ *   a chat and a task in all (see `digestTask`). What a digest left out because its window was
+ *   shut is sent when the window opens (see `pendingDigests`).
  * - The `working` rows of agents that said, in the last 10 minutes, that they started a task:
  *   `agent_started`. The poster hears of the first `POSTER_STARTERS` agents to start a task and no
  *   more: any account can call start, and a message for each would be a flood. A later starter
@@ -116,6 +126,21 @@ const NS_PER_HOUR = 60n * NS_PER_MINUTE;
 const WORKING_WINDOW_MS = 10 * 60_000;
 /** How many of a task's starters its poster is told of: the first ones, in the order they began. */
 const POSTER_STARTERS = 5;
+/**
+ * How many of a task's answers and clarifications (counted over the events of the board) are sent
+ * one by one to its entrants: the first ones. Any account can ask, and a poster can answer them
+ * all, so a message for each would be a flood. Past these the task page has the rest, and an
+ * answer still reaches the account that asked it.
+ */
+export const BOARD_ROW_ALERTS = 10;
+/** A chat hears of a task's board in a digest at most once in this long, for each kind of news. */
+export const BOARD_DIGEST_WINDOW_MS = 30 * 60_000;
+/**
+ * A chat hears of a task's board in a digest at most this many times in all, for each kind of news;
+ * the last one says so. It bounds the messages one task can cost a chat over its whole life, as
+ * `POSTER_STARTERS` does for the starters.
+ */
+export const BOARD_DIGESTS_PER_TASK = 12;
 /** The reveal window counts as closing this long before it ends. */
 const REVEAL_CLOSING_NS = 10n * NS_PER_MINUTE;
 /** How long before the commit deadline each reminder goes out, in hours, the longest first. */
@@ -184,6 +209,8 @@ export async function notifierTick(opts: NotifierTickOptions): Promise<void> {
   await eventAlerts(tick);
   await workingAlerts(tick);
   await timerAlerts(tick);
+  // Last, so that the digests the board's windows held back never delay a reminder.
+  await pendingDigests(tick);
 }
 
 /** Whether the bot was told to stay away and the wait is not over. A wait that is over is forgotten. */
@@ -317,10 +344,16 @@ async function eventAlerts(tick: Tick): Promise<void> {
      limit $2`,
     [after, BATCH_SIZE],
   );
+  // The tasks whose board these events touch, in the order they were first seen.
+  const boardTasks = new Set<string>();
   for (const row of events) {
     const alert = await alertOf(tick, row);
     if (alert !== null) await deliver(tick, alert);
+    if (BOARD_ALERTING.has(row.event) && row.task_id !== null) boardTasks.add(row.task_id);
   }
+  // The digests of the board come before the cursor moves: one that the transport refuses is asked
+  // for again with the batch, and the chats that heard it already are skipped (see `digestClaim`).
+  for (const taskId of boardTasks) await digestTask(tick, taskId);
   // Ids have gaps (a rolled-back or repeated insert uses one up), so the cursor is the last id read,
   // never a count. `greatest` keeps a second notifier from moving it back.
   const last = events.at(-1);
@@ -445,10 +478,11 @@ async function alertOf(tick: Tick, row: EventRow): Promise<Alert | null> {
 }
 
 /**
- * The alert that a `question_asked`, `question_answered` or `clarification_posted` event makes, or
- * null if it makes none: for an event that is malformed or names no task or no question (logged,
- * like the chain events that do), and for a question that the poster hid, whose ask and answer are
- * no news to anyone now. The alert holds the ids and the asker, never the words: the board has
+ * The alert that a `question_answered` or `clarification_posted` event makes, or null if it makes
+ * none: for an event that is malformed or names no task or no question (logged, like the chain
+ * events that do, and so is a `question_asked` that does), for a question that the poster hid,
+ * whose ask and answer are no news to anyone now, and for a `question_asked`, which the poster
+ * hears of in a digest (`digestTask`). The alert holds the ids, never the words: the board has
  * them, and they may be hidden before a reader gets to them.
  */
 async function boardAlertOf(tick: Tick, row: EventRow): Promise<Alert | null> {
@@ -477,6 +511,7 @@ async function boardAlertOf(tick: Tick, row: EventRow): Promise<Alert | null> {
         taskId,
         title,
         clarificationId: event.data.clarification_id,
+        entrantsHear: await withinRowAlerts(tick.db, row),
       };
     case "question_asked":
     case "question_answered": {
@@ -496,13 +531,33 @@ async function boardAlertOf(tick: Tick, row: EventRow): Promise<Alert | null> {
         return null;
       }
       if (question.hidden) return null;
-      return event.event === "question_asked"
-        ? { kind: "question_asked", taskId, title, questionId, asker: event.data.asker }
-        : { kind: "question_answered", taskId, title, questionId };
+      // A question is no news of its own: the poster hears of it in a digest.
+      if (event.event === "question_asked") return null;
+      return {
+        kind: "question_answered",
+        taskId,
+        title,
+        questionId,
+        entrantsHear: await withinRowAlerts(tick.db, row),
+      };
     }
     default:
       return null;
   }
+}
+
+/**
+ * Whether the board event `row` is among the first `BOARD_ROW_ALERTS` answers and clarifications
+ * of its task, by the order of the events: the entrants of a task hear those one by one.
+ */
+async function withinRowAlerts(db: Db, row: EventRow): Promise<boolean> {
+  const [place] = await db.query<{ n: number }>(
+    `select count(*)::int as n from events
+      where task_id = $1::numeric and event in ('question_answered', 'clarification_posted')
+        and id <= $2::bigint`,
+    [row.task_id, row.id],
+  );
+  return (place?.n ?? 0) <= BOARD_ROW_ALERTS;
 }
 
 async function funderCount(db: Db, taskId: string): Promise<number> {
@@ -511,6 +566,257 @@ async function funderCount(db: Db, taskId: string): Promise<number> {
     [taskId],
   );
   return row?.n ?? 0;
+}
+
+// The board's digests.
+
+/**
+ * The board events that each kind of digest counts. The poster hears of the questions asked; the
+ * watchers of the answers and the clarifications.
+ */
+const DIGEST_EVENTS = {
+  poster: ["question_asked"],
+  watchers: ["question_answered", "clarification_posted"],
+} as const;
+const DIGEST_AUDIENCES = ["poster", "watchers"] as const;
+type DigestAudience = (typeof DIGEST_AUDIENCES)[number];
+
+/** What `tg_board_digests` holds for a chat, a task and a kind of digest. */
+interface DigestRow {
+  /** The id of the last board event the last digest covered, as text. */
+  upto: string;
+  /** When the last digest was claimed, by the notifier's clock, in milliseconds since the epoch. */
+  sentMs: string;
+  /** How many have been claimed. */
+  digests: number;
+}
+
+/**
+ * Sends the digests of the board of task `taskId` that are due: for each of the two audiences, one
+ * message to each chat that should hear, if the board has something new for it that is not hidden,
+ * its last digest was claimed `BOARD_DIGEST_WINDOW_MS` ago or more, and it has not had
+ * `BOARD_DIGESTS_PER_TASK`. What is new is what came after the last digest the chat had, counted
+ * over the board events by their rows: a question the poster hid is not counted, and a digest that
+ * would count nothing is not sent. A chat that has had none hears of everything on the board so far.
+ *
+ * Each chat's claim is its row in `tg_board_digests` (see `digestClaim`), made before the send, so
+ * that a digest is asked for at most once, and the chats that heard one are skipped when a tick is
+ * run again. A task the index does not hold is skipped without a word: the event that led here
+ * logged it already.
+ */
+async function digestTask(tick: Tick, taskId: string): Promise<void> {
+  const [task] = await tick.db.query<{ title: string | null }>(
+    "select title from tasks where id = $1::numeric",
+    [taskId],
+  );
+  if (task === undefined) return;
+  const title = titleOf(task.title, taskId);
+  for (const audience of DIGEST_AUDIENCES) await digestAudience(tick, taskId, title, audience);
+}
+
+async function digestAudience(
+  tick: Tick,
+  taskId: string,
+  title: string,
+  audience: DigestAudience,
+): Promise<void> {
+  const events = [...DIGEST_EVENTS[audience]];
+  const [head] = await tick.db.query<{ upto: string | null }>(
+    "select max(id)::text as upto from events where task_id = $1::numeric and event = any($2::text[])",
+    [taskId, events],
+  );
+  const upto = head?.upto;
+  if (upto === null || upto === undefined) return;
+
+  const blank: Alert = {
+    kind: "board_digest",
+    taskId,
+    title,
+    for: audience,
+    questions: 0,
+    answers: 0,
+    clarifications: 0,
+    last: false,
+  };
+  let chats: string[];
+  try {
+    chats = await recipientsOf(tick.db, blank);
+  } catch (error) {
+    console.error(`telegram notifier: skipped board_digest for task ${taskId}:`, error);
+    return;
+  }
+  for (const chat of chats) {
+    const before = await digestRow(tick.db, chat, taskId, audience);
+    if (before !== undefined) {
+      const shut = Number(before.sentMs) + BOARD_DIGEST_WINDOW_MS > tick.clock().getTime();
+      if (shut || before.digests >= BOARD_DIGESTS_PER_TASK || BigInt(before.upto) >= BigInt(upto)) {
+        continue;
+      }
+    }
+    const news = await newOnBoard(tick.db, taskId, before?.upto ?? "0", upto, events);
+    if (news.questions + news.answers + news.clarifications === 0) continue;
+    const alert: Alert = {
+      ...blank,
+      ...news,
+      last: (before?.digests ?? 0) + 1 >= BOARD_DIGESTS_PER_TASK,
+    };
+    let text: string;
+    try {
+      text = renderAlert(alert, renderNow(tick));
+    } catch (error) {
+      console.error(`telegram notifier: skipped ${alert.kind} for task ${taskId}:`, error);
+      continue;
+    }
+    await sendOnce(
+      tick,
+      chat,
+      alert,
+      digestClaim(tick, chat, taskId, audience, upto, before),
+      text,
+    );
+  }
+}
+
+/**
+ * Sends the digests that a window held back: those of the tasks that a chat has a row for, with
+ * board events after the row's, whose window is shut no longer and whose cap is not reached. A digest
+ * that no event asks for is sent here when its window opens. A row that outlives its chat's
+ * watching keeps its task in this list, at the cost of a few queries a tick, until the cap.
+ */
+async function pendingDigests(tick: Tick): Promise<void> {
+  const tasks = await tick.db.query<{ task_id: string }>(
+    `select distinct d.task_id::text as task_id
+       from tg_board_digests d
+      where d.digests < $1::int
+        and d.sent_at <= $2::timestamptz - ($3::float8 * interval '1 millisecond')
+        and exists (
+          select 1 from events e
+           where e.task_id = d.task_id and e.id > d.upto_event_id
+             and e.event = any(case d.audience
+                   when 'poster' then array['question_asked']::text[]
+                   else array['question_answered', 'clarification_posted']::text[] end))
+      order by 1`,
+    [BOARD_DIGESTS_PER_TASK, tick.clock().toISOString(), BOARD_DIGEST_WINDOW_MS],
+  );
+  for (const { task_id } of tasks) await digestTask(tick, task_id);
+}
+
+async function digestRow(
+  db: Db,
+  chat: string,
+  taskId: string,
+  audience: DigestAudience,
+): Promise<DigestRow | undefined> {
+  const [row] = await db.query<{ upto: string; sent_ms: string; digests: number }>(
+    `select upto_event_id::text as upto, (extract(epoch from sent_at) * 1000)::bigint::text as sent_ms,
+            digests
+       from tg_board_digests
+      where chat_id = $1 and task_id = $2::numeric and audience = $3`,
+    [chat, taskId, audience],
+  );
+  return row === undefined
+    ? undefined
+    : { upto: row.upto, sentMs: row.sent_ms, digests: row.digests };
+}
+
+/**
+ * How many questions, answers and clarifications the board events of `events` in `(after, upto]`
+ * stand for. An event counts if its row is there and, for a question, not hidden: an event that is
+ * malformed, or names a question that is not the task's, counts for nothing, and so does the ask or
+ * the answer of a question the poster hid. The question id is read as a number only when it looks
+ * like one, since the cast to a number of a row that does not would fail the whole statement.
+ */
+async function newOnBoard(
+  db: Db,
+  taskId: string,
+  after: string,
+  upto: string,
+  events: string[],
+): Promise<{ questions: number; answers: number; clarifications: number }> {
+  const [row] = await db.query<{ questions: number; answers: number; clarifications: number }>(
+    `select count(*) filter (where e.event = 'question_asked')::int as questions,
+            count(*) filter (where e.event = 'question_answered')::int as answers,
+            count(*) filter (where e.event = 'clarification_posted')::int as clarifications
+       from events e
+       left join task_questions q
+         on q.kind = 'question' and q.task_id = e.task_id
+        and q.id = case when e.data->>'question_id' ~ '^[0-9]{1,18}$'
+                        then (e.data->>'question_id')::bigint end
+      where e.task_id = $1::numeric and e.id > $2::bigint and e.id <= $3::bigint
+        and e.event = any($4::text[])
+        and (e.event = 'clarification_posted' or (q.id is not null and not q.hidden))`,
+    [taskId, after, upto, events],
+  );
+  return row ?? { questions: 0, answers: 0, clarifications: 0 };
+}
+
+/**
+ * The claim of `chat` on a digest that covers the board events up to `upto`: its row in
+ * `tg_board_digests`, written by one statement that holds the conditions of the digest, so that it
+ * is taken only if the board has something past the row's `upto_event_id`, the row's window is
+ * over and its cap is not reached (or there is no row), and by one notifier only. `before` is the
+ * row as it was when the digest was worked out; `release` puts it back, or removes the row if
+ * there was none, for a digest that Telegram cannot have taken.
+ */
+function digestClaim(
+  tick: Tick,
+  chat: string,
+  taskId: string,
+  audience: DigestAudience,
+  upto: string,
+  before: DigestRow | undefined,
+): Claim {
+  const at = tick.clock();
+  return {
+    take: async () => {
+      const claimed = await tick.db.query(
+        `insert into tg_board_digests (chat_id, task_id, audience, upto_event_id, sent_at, digests)
+         values ($1, $2::numeric, $3, $4::bigint, $5::timestamptz, 1)
+         on conflict (chat_id, task_id, audience) do update
+            set upto_event_id = excluded.upto_event_id, sent_at = excluded.sent_at,
+                digests = tg_board_digests.digests + 1
+          where tg_board_digests.upto_event_id < excluded.upto_event_id
+            and tg_board_digests.sent_at
+                  <= excluded.sent_at - ($6::float8 * interval '1 millisecond')
+            and tg_board_digests.digests < $7::int
+         returning 1`,
+        [
+          chat,
+          taskId,
+          audience,
+          upto,
+          at.toISOString(),
+          BOARD_DIGEST_WINDOW_MS,
+          BOARD_DIGESTS_PER_TASK,
+        ],
+      );
+      return claimed.length > 0;
+    },
+    release: async () => {
+      try {
+        if (before === undefined) {
+          await tick.db.query(
+            `delete from tg_board_digests
+              where chat_id = $1 and task_id = $2::numeric and audience = $3
+                and upto_event_id = $4::bigint`,
+            [chat, taskId, audience, upto],
+          );
+        } else {
+          await tick.db.query(
+            `update tg_board_digests
+                set upto_event_id = $5::bigint, sent_at = to_timestamp($6::float8 / 1000),
+                    digests = $7::int
+              where chat_id = $1 and task_id = $2::numeric and audience = $3
+                and upto_event_id = $4::bigint`,
+            [chat, taskId, audience, upto, before.upto, before.sentMs, before.digests],
+          );
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
 }
 
 // The working signals.
@@ -669,7 +975,7 @@ async function deliver(tick: Tick, alert: Alert): Promise<void> {
     return;
   }
   const key = dedupeKey(alert);
-  for (const chat of chats) await sendOnce(tick, chat, alert, key, text);
+  for (const chat of chats) await sendOnce(tick, chat, alert, sentClaim(tick, chat, key), text);
 }
 
 /**
@@ -789,18 +1095,42 @@ function logLost(alert: Alert, why: string): void {
   console.error(`telegram notifier: alert lost: ${alert.kind} for task ${alert.taskId} (${why})`);
 }
 
-/** Gives the claim of `chat` on `key` back. False if the database would not. */
-async function giveBack(tick: Tick, chat: string, key: string): Promise<boolean> {
-  try {
-    await tick.db.query("delete from tg_sent where chat_id = $1 and dedupe_key = $2", [chat, key]);
-    return true;
-  } catch {
-    return false;
-  }
+/**
+ * The right to ask Telegram to send one message to one chat, once. `take` makes the claim, and
+ * says whether it was made: false means it was made before, or its conditions do not hold, and
+ * nothing is sent. `release` gives the claim back, and says whether the database let it go.
+ */
+interface Claim {
+  take(): Promise<boolean>;
+  release(): Promise<boolean>;
+}
+
+/** The claim of `chat` on `key` in `tg_sent`, which an alert has once and a chat gets once. */
+function sentClaim(tick: Tick, chat: string, key: string): Claim {
+  return {
+    take: async () => {
+      const claimed = await tick.db.query(
+        "insert into tg_sent (chat_id, dedupe_key) values ($1, $2) on conflict do nothing returning 1",
+        [chat, key],
+      );
+      return claimed.length > 0;
+    },
+    release: async () => {
+      try {
+        await tick.db.query("delete from tg_sent where chat_id = $1 and dedupe_key = $2", [
+          chat,
+          key,
+        ]);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
 }
 
 /**
- * Sends `text` to `chat`, if `key` was not claimed for the chat before. The claim is made first, so
+ * Sends `text` to `chat`, if its claim can be taken (`claim.take`). The claim is made first, so
  * that the notifier asks for an alert to reach a chat at most once. What a failed send does to the
  * claim and to the tick depends on what the failure says about the message (`failureOf`):
  *
@@ -823,14 +1153,10 @@ async function sendOnce(
   tick: Tick,
   chat: string,
   alert: Alert,
-  key: string,
+  claim: Claim,
   text: string,
 ): Promise<void> {
-  const claimed = await tick.db.query(
-    "insert into tg_sent (chat_id, dedupe_key) values ($1, $2) on conflict do nothing returning 1",
-    [chat, key],
-  );
-  if (claimed.length === 0) return;
+  if (!(await claim.take())) return;
   try {
     await tick.bot.api.sendMessage(chat, text, SEND_OPTIONS);
   } catch (error) {
@@ -860,7 +1186,7 @@ async function sendOnce(
         pausedUntil.set(tick.bot, Math.max(until, pausedUntil.get(tick.bot) ?? 0));
       }
       const pause = wait === undefined ? "" : `, nothing is sent for ${wait} s`;
-      if (!(await giveBack(tick, chat, key))) {
+      if (!(await claim.release())) {
         logLost(alert, `${label}; its claim could not be given back`);
         throw new TransportFailed(`${took}; the tick ends here${pause}`);
       }

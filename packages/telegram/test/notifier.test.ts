@@ -25,6 +25,7 @@ import {
   vi,
 } from "vitest";
 import { createBot, type NotifierOptions, notifierTick, startNotifier } from "../src/index";
+import { BOARD_DIGEST_WINDOW_MS, BOARD_DIGESTS_PER_TASK, BOARD_ROW_ALERTS } from "../src/notifier";
 import { linkChat, openTestDb, seedAgent, seedEntry, seedTask, watchTag } from "./helpers";
 
 // The notifier runs against one migrated database, emptied before each test (a PGlite takes close to
@@ -112,6 +113,8 @@ let gate: Promise<void> | null = null;
 let onSend: (() => void) | undefined;
 let sending = 0;
 let mostSending = 0;
+/** When set, every send after this many calls (in all) is answered with a flood wait of an hour. */
+let floodAfter: number | null = null;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -128,6 +131,14 @@ const fakeTelegram: Transformer = async (_prev, method, payload) => {
     if (held !== null) await held;
   } finally {
     sending -= 1;
+  }
+  if (floodAfter !== null && calls.length > floodAfter) {
+    return {
+      ok: false,
+      error_code: 429,
+      description: "Too Many Requests: retry after 3600",
+      parameters: { retry_after: 3600 },
+    } as never;
   }
   const failure = failures.get(String(sent.chat_id));
   if (failure !== undefined) throw failure;
@@ -207,6 +218,7 @@ const TABLES = [
   "tg_link_nonces",
   "tg_watches",
   "tg_sent",
+  "tg_board_digests",
   "worker_cursor",
 ];
 
@@ -224,6 +236,7 @@ beforeEach(async () => {
   onSend = undefined;
   sending = 0;
   mostSending = 0;
+  floodAfter = null;
   height = 1000n;
   clock = T0 + 10 * MINUTE;
   errors = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1435,14 +1448,15 @@ test("the_boards_events_make_alerts_that_name_what_happened_and_never_what_was_w
     "ZZQNOTE <u>x</u> & y",
   ];
 
-  // A question reaches the poster alone, and says who asked.
+  // A question reaches the poster alone, in a digest that counts it.
   const id = await askOn7(words[0] ?? "");
   const asked = await tick();
-  expect(lines(asked)).toEqual(["11 New question #7"]);
+  expect(lines(asked)).toEqual(["11 New questions #7"]);
   expect(asked[0]?.text).toContain("Summarise the Q3 report");
-  expect(asked[0]?.text).toContain("asker.near asked the poster");
+  expect(asked[0]?.text).toContain("1 new question waiting for an answer");
 
-  // The answer reaches the asker, the one who committed, the one who started, and the tag watcher.
+  // The answer reaches the asker, the one who committed and the one who started at once, and the
+  // tag watcher in a digest that counts it.
   expect((await answerQuestion(db, { taskId: 7n, questionId: id, body: words[1] ?? "" })).ok).toBe(
     true,
   );
@@ -1451,18 +1465,20 @@ test("the_boards_events_make_alerts_that_name_what_happened_and_never_what_was_w
     "12 Question answered #7",
     "13 Question answered #7",
     "14 Question answered #7",
-    "16 Question answered #7",
+    "16 Board update #7",
   ]);
+  expect(answered[3]?.text).toContain("1 new answer");
 
-  // A clarification reaches the same, but for the asker, who has no more reason to hear than the rest.
+  // A clarification reaches the entrants at once, but for the asker, who has no more reason to hear
+  // than the rest. The watcher heard a digest a moment ago, so its next one waits for the window.
   expect((await addClarification(db, { taskId: 7n, body: words[2] ?? "" }, BOARD_LIMITS)).ok).toBe(
     true,
   );
-  expect(lines(await tick())).toEqual([
-    "13 Clarification #7",
-    "14 Clarification #7",
-    "16 Clarification #7",
-  ]);
+  expect(lines(await tick())).toEqual(["13 Clarification #7", "14 Clarification #7"]);
+  const later = await tickAt(clock + BOARD_DIGEST_WINDOW_MS + MINUTE);
+  expect(lines(later)).toEqual(["16 Board update #7"]);
+  expect(later[0]?.text).toContain("1 new clarification");
+  expect(later[0]?.text).not.toContain("answer");
 
   // A hide is no news: the poster did it.
   expect((await hideQuestion(db, { taskId: 7n, questionId: id })).ok).toBe(true);
@@ -1476,26 +1492,31 @@ test("the_boards_events_make_alerts_that_name_what_happened_and_never_what_was_w
   }
 });
 
-test("each_question_and_each_answer_is_news_of_its_own_and_none_is_sent_twice", async () => {
+test("each_answer_reaches_the_entrants_at_once_and_questions_and_watchers_get_one_digest", async () => {
   await seedBoardWorld();
   await tick();
   const first = await askOn7("First?");
   const second = await askOn7("Second?", "other.near");
-  expect(lines(await tick())).toEqual(["11 New question #7", "11 New question #7"]);
+  // Two questions are one message to the poster.
+  const asked = await tick();
+  expect(lines(asked)).toEqual(["11 New questions #7"]);
+  expect(asked[0]?.text).toContain("2 new questions waiting for an answer");
   await answerQuestion(db, { taskId: 7n, questionId: first, body: "One." });
   await answerQuestion(db, { taskId: 7n, questionId: second, body: "Two." });
-  // The asker of the second is a stranger to the chats here, so its answer reaches the entrants.
-  expect(lines(await tick())).toEqual([
+  // Each answer reaches the entrants (the asker of the second is a stranger to the chats here), and
+  // the watcher gets one message for both.
+  const answered = await tick();
+  expect(lines(answered)).toEqual([
     "12 Question answered #7",
     "13 Question answered #7",
     "14 Question answered #7",
-    "16 Question answered #7",
     "13 Question answered #7",
     "14 Question answered #7",
-    "16 Question answered #7",
+    "16 Board update #7",
   ]);
+  expect(answered[5]?.text).toContain("2 new answers");
   await addClarification(db, { taskId: 7n, body: "Note." }, BOARD_LIMITS);
-  expect(lines(await tick())).toHaveLength(3);
+  expect(lines(await tick())).toEqual(["13 Clarification #7", "14 Clarification #7"]);
 
   // A restart that reads the stream again from the start sends none of it twice.
   await db.query("update worker_cursor set event_id = 0 where name = 'telegram'");
@@ -1511,11 +1532,20 @@ test("a_question_the_poster_hid_before_the_notifier_looked_is_not_announced", as
   await answerQuestion(db, { taskId: 7n, questionId: spam, body: "no" });
   await hideQuestion(db, { taskId: 7n, questionId: spam });
 
-  // The hidden question's ask and answer are skipped without a word; the other one is announced.
-  expect(lines(await tick())).toEqual(["11 New question #7"]);
+  // The hidden question's ask and answer are skipped without a word, and left out of the counts:
+  // the poster is told of the one question.
+  const asked = await tick();
+  expect(lines(asked)).toEqual(["11 New questions #7"]);
+  expect(asked[0]?.text).toContain("1 new question waiting");
   expect(logged()).toEqual([]);
   await answerQuestion(db, { taskId: 7n, questionId: real, body: "Three parts." });
-  expect((await tick()).length).toBe(3);
+  const answered = await tick();
+  expect(lines(answered)).toEqual([
+    "13 Question answered #7",
+    "14 Question answered #7",
+    "16 Board update #7",
+  ]);
+  expect(answered[2]?.text).toContain("1 new answer");
 });
 
 test("board_events_that_cannot_make_an_alert_are_logged_and_skipped", async () => {
@@ -1547,7 +1577,7 @@ test("board_events_that_cannot_make_an_alert_are_logged_and_skipped", async () =
   );
   await askOn7("A real one"); // and news behind them
 
-  expect(lines(await tick())).toEqual(["11 New question #7"]);
+  expect(lines(await tick())).toEqual(["11 New questions #7"]);
   const logs = logged();
   expect(logs).toHaveLength(5);
   expect(logs[0]).toMatch(/event 1 \(question_answered\).*malformed/);
@@ -1556,6 +1586,307 @@ test("board_events_that_cannot_make_an_alert_are_logged_and_skipped", async () =
   expect(logs[3]).toMatch(/event 4 \(question_answered\).*question 999/);
   expect(logs[4]).toMatch(/event 5 \(question_asked\).*question 18446744073709551615/);
   expect(await tick()).toEqual([]); // and they are not met again
+  expect(logged()).toEqual([]);
+});
+
+// The board's digests. Any registered agent can ask and a poster can answer them all, so the poster
+// and the chats that watch a tag hear of the board in one message that counts what is new: at most
+// one every BOARD_DIGEST_WINDOW_MS for a chat and a task, and BOARD_DIGESTS_PER_TASK in all.
+
+/** A clarification on task 7 as the board leaves it, with no limit of the board's own in the way. */
+async function noteOn7(): Promise<void> {
+  const [row] = await db.query<{ id: string }>(
+    "insert into task_questions (task_id, kind, body) values (7, 'clarification', 'A note') returning id::text as id",
+  );
+  await db.query(
+    `insert into events (height, block_ts, receipt_id, log_index, event, data, task_id)
+     values (1, 1, $1, 0, 'clarification_posted', $2::jsonb, 7)`,
+    [
+      `board:clarification_posted:${row?.id}`,
+      JSON.stringify({ task_id: "7", clarification_id: row?.id }),
+    ],
+  );
+}
+
+/** `n` questions on task 7, each asked by an account of its own and each answered, with their events. */
+async function answeredOn7(n: number): Promise<void> {
+  await db.query(
+    `insert into task_questions (task_id, kind, asker, body, answer, answered_at)
+     select 7, 'question', 'bulk' || g || '.near', 'A question', 'An answer', now()
+       from generate_series(1, $1::int) g`,
+    [n],
+  );
+  for (const event of ["question_asked", "question_answered"]) {
+    await db.query(
+      `insert into events (height, block_ts, receipt_id, log_index, event, data, task_id)
+       select 1, 1, 'board:' || $1::text || ':' || q.id, 0, $1::text,
+              jsonb_build_object('task_id', '7', 'question_id', q.id::text)
+                || case when $1::text = 'question_asked' then jsonb_build_object('asker', q.asker)
+                        else '{}'::jsonb end,
+              7
+         from task_questions q where q.task_id = 7 and q.asker like 'bulk%'
+          and not exists (select 1 from events e where e.receipt_id = 'board:' || $1::text || ':' || q.id)`,
+      [event],
+    );
+  }
+}
+
+test("a_burst_of_board_news_is_one_digest_for_each_chat_and_the_rest_waits_for_the_window", async () => {
+  await seedBoardWorld();
+  await linkChat(db, 17, "watcher2.near");
+  await watchTag(db, 17, "research");
+  await tick();
+  const start = clock;
+
+  // Twelve accounts ask, the poster answers all twelve and posts three clarifications.
+  const ids: bigint[] = [];
+  for (let i = 1; i <= 12; i++) ids.push(await askOn7(`Question ${i}?`, `asker${i}.near`));
+  for (const id of ids)
+    await answerQuestion(db, { taskId: 7n, questionId: id, body: "An answer." });
+  for (let i = 0; i < 3; i++)
+    await addClarification(db, { taskId: 7n, body: `Note ${i}` }, BOARD_LIMITS);
+
+  const burst = await tick();
+  const heard = (chat: string) => burst.filter((message) => message.chat === chat);
+  // The poster: one message, which counts the twelve questions.
+  expect(heard("11").map((m) => m.label)).toEqual(["New questions"]);
+  expect(heard("11")[0]?.text).toContain("12 new questions waiting for an answer");
+  // Each watching chat: one message, which counts the answers and the clarifications.
+  for (const chat of ["16", "17"]) {
+    expect(
+      heard(chat).map((m) => m.label),
+      chat,
+    ).toEqual(["Board update"]);
+    expect(heard(chat)[0]?.text, chat).toContain("12 new answers, 3 new clarifications");
+  }
+  // The entrants hear the first answers and clarifications of the task one by one, and no more.
+  for (const chat of ["13", "14"]) {
+    expect(heard(chat), chat).toHaveLength(BOARD_ROW_ALERTS);
+    expect(new Set(heard(chat).map((m) => m.label))).toEqual(new Set(["Question answered"]));
+  }
+  // Nobody else heard, and fifteen rows of news cost 23 messages and not 15 times as many.
+  expect(burst).toHaveLength(1 + 2 + 2 * BOARD_ROW_ALERTS);
+
+  // More news inside the window is not announced to anyone who heard a digest, however much. A
+  // question answered to an account that has a chat still reaches that account, as it always does.
+  clock = start + 10 * MINUTE;
+  const thirteen = await askOn7("Thirteenth?", "asker13.near");
+  await answerQuestion(db, { taskId: 7n, questionId: thirteen, body: "An answer." });
+  await noteOn7();
+  const mine = await askOn7("Mine?", "asker.near");
+  await answerQuestion(db, { taskId: 7n, questionId: mine, body: "An answer." });
+  expect(lines(await tick())).toEqual(["12 Question answered #7"]);
+
+  // The window opens 30 minutes after the first digest, to the millisecond, and then the poster
+  // and each watching chat get one message that counts only what came after their last.
+  expect(await tickAt(start + BOARD_DIGEST_WINDOW_MS - 1)).toEqual([]);
+  const next = await tickAt(start + BOARD_DIGEST_WINDOW_MS);
+  expect(lines(next)).toEqual(["11 New questions #7", "16 Board update #7", "17 Board update #7"]);
+  expect(next[0]?.text).toContain("2 new questions waiting");
+  expect(next[1]?.text).toContain("2 new answers, 1 new clarification");
+
+  // And then there is nothing new: not now, not later, and not after a restart.
+  expect(await tickAt(start + 2 * BOARD_DIGEST_WINDOW_MS)).toEqual([]);
+  await db.query("update worker_cursor set event_id = 0 where name = 'telegram'");
+  expect(await tickAt(start + 3 * BOARD_DIGEST_WINDOW_MS, { bot: newBot() })).toEqual([]);
+  expect(logged()).toEqual([]);
+});
+
+test("a_chat_hears_at_most_so_many_digests_of_a_task_and_the_last_one_says_so", async () => {
+  await seedBoardWorld();
+  await tick();
+  const start = clock;
+  const heardBy16: Message[] = [];
+  for (let round = 1; round <= BOARD_DIGESTS_PER_TASK + 3; round++) {
+    await noteOn7();
+    const sent = await tickAt(start + round * (BOARD_DIGEST_WINDOW_MS + MINUTE));
+    heardBy16.push(...sent.filter((message) => message.chat === "16"));
+  }
+  // One digest each time the window had opened, up to the cap, and none after it.
+  expect(heardBy16).toHaveLength(BOARD_DIGESTS_PER_TASK);
+  expect(new Set(heardBy16.map((m) => m.label))).toEqual(new Set(["Board update"]));
+  const saidLast = heardBy16.map((m) => m.text.includes("last board alert"));
+  expect(saidLast.filter(Boolean)).toHaveLength(1);
+  expect(saidLast.at(-1)).toBe(true);
+  const [row] = await db.query<{ digests: number }>(
+    "select digests from tg_board_digests where chat_id = 16 and task_id = 7 and audience = 'watchers'",
+  );
+  expect(row?.digests).toBe(BOARD_DIGESTS_PER_TASK);
+  // The cap is for the task and the chat: another task's board is heard again.
+  await seedTask(db, { id: "8", poster: "poster.near", tags: ["research"], ...OPEN_FOR_DAYS });
+  await db.query(
+    "insert into task_questions (task_id, kind, body) values (8, 'clarification', 'Elsewhere')",
+  );
+  await db.query(
+    `insert into events (height, block_ts, receipt_id, log_index, event, data, task_id)
+     values (1, 1, 'board:clarification_posted:80', 0, 'clarification_posted',
+             '{"task_id":"8","clarification_id":"80"}'::jsonb, 8)`,
+  );
+  const other = await tickAt(
+    start + (BOARD_DIGESTS_PER_TASK + 4) * (BOARD_DIGEST_WINDOW_MS + MINUTE),
+  );
+  expect(lines(other.filter((m) => m.chat === "16"))).toEqual(["16 Board update #8"]);
+  expect(logged()).toEqual([]);
+});
+
+test("a_flood_of_board_news_does_not_hold_back_a_time_critical_alert", async () => {
+  await seedBoardWorld();
+  // Thirty more chats watch the task's tag.
+  for (let i = 0; i < 30; i++) {
+    await linkChat(db, 100 + i, `watcher${i}.near`);
+    await watchTag(db, 100 + i, "research");
+  }
+  await tick();
+  // Task 8 is in the last minutes of its reveal window, and its committer has not revealed.
+  await seedTask(db, {
+    id: "8",
+    poster: "someone.near",
+    ...schedule(T0 - HOUR, T0, clock + 5 * MINUTE),
+    commit_count: 1,
+  });
+  await seedEntry(db, "8", "late.near");
+  await linkChat(db, 200, "late.near");
+  // Sixty questions, all answered: with a message for every answer to every watching chat, that
+  // is thousands of sends. Telegram limits the bot long before, and a limited bot sends nothing.
+  await answeredOn7(60);
+  floodAfter = 120;
+
+  const sent = await tick();
+  expect(calls.length).toBeLessThan(120);
+  expect(sent.filter((m) => m.chat === "200").map((m) => m.label)).toEqual([
+    "Reveal now",
+    "Reveal closing",
+  ]);
+  expect(sent.filter((m) => m.label === "Board update")).toHaveLength(31);
+  expect(logged()).toEqual([]);
+});
+
+test("a_digest_is_sent_at_most_once_even_when_the_send_fails", async () => {
+  await seedBoardWorld();
+  await tick();
+  await askOn7("A question?");
+  // The network is down for chat 11: Telegram cannot have taken the digest, so its claim goes back.
+  failures.set("11", httpError(fetchError("connect ECONNREFUSED", "ECONNREFUSED")));
+  const error = await failedTick();
+  expect(error.name).toBe("TransportFailed");
+  expect(lines(drain())).toEqual(["11 New questions #7"]);
+  expect(await db.query("select 1 from tg_board_digests where chat_id = 11")).toEqual([]);
+
+  // It is back: the digest is sent once, and a tick after that sends nothing.
+  failures.clear();
+  expect(lines(await tick())).toEqual(["11 New questions #7"]);
+  expect(await tick()).toEqual([]);
+
+  // A message Telegram refuses (it took nothing and will not) is lost for that chat, with a line, and
+  // is not tried again; the next news is.
+  refusals.set("16", { error_code: 400, description: "Bad Request: chat not found" });
+  const id = await askOn7("Another?", "other.near");
+  await answerQuestion(db, { taskId: 7n, questionId: id, body: "Yes." });
+  await tick();
+  expect(logged()).toEqual([
+    "telegram notifier: alert lost: board_digest for task 7 (GrammyError 400: Bad Request: chat not found)",
+  ]);
+  refusals.clear();
+  // Chat 16 hears nothing of that answer now. (The poster, whose window has opened, hears of the
+  // question that was asked meanwhile.)
+  expect(lines(await tickAt(clock + 2 * BOARD_DIGEST_WINDOW_MS))).toEqual(["11 New questions #7"]);
+  const again = await askOn7("And another?", "third.near");
+  await answerQuestion(db, { taskId: 7n, questionId: again, body: "Also yes." });
+  const later = await tickAt(clock + 3 * BOARD_DIGEST_WINDOW_MS);
+  expect(lines(later.filter((m) => m.chat === "16"))).toEqual(["16 Board update #7"]);
+  expect(later.find((m) => m.chat === "16")?.text).toContain("1 new answer");
+});
+
+test("two_notifiers_working_at_once_send_a_digest_once", async () => {
+  await seedBoardWorld();
+  await tick();
+  await askOn7("A question?");
+  const options = { db, webUrl: WEB_URL, network: NETWORK, now };
+  await Promise.all([
+    notifierTick({ ...options, bot: newBot() }),
+    notifierTick({ ...options, bot: newBot() }),
+  ]);
+  expect(lines(drain())).toEqual(["11 New questions #7"]);
+  const [row] = await db.query<{ digests: number }>(
+    "select digests from tg_board_digests where chat_id = 11",
+  );
+  expect(row?.digests).toBe(1);
+});
+
+/**
+ * The poster's chat with a digest row that a second notifier may have written a moment ago, and the
+ * first notifier's view of it: it read the row before that, so it finds none and goes on to claim.
+ * Only the claim itself can turn the digest away then. Gives back the database that reads so.
+ */
+async function racedPosterRow(row: {
+  agoMs: number;
+  digests: number;
+  caughtUp?: boolean;
+}): Promise<Db> {
+  await seedBoardWorld();
+  await tick();
+  await askOn7("A question?");
+  const [head] = await db.query<{ id: string }>("select max(id)::text as id from events");
+  await db.query(
+    `insert into tg_board_digests (chat_id, task_id, audience, upto_event_id, sent_at, digests)
+     values (11, 7, 'poster', $1::bigint, to_timestamp($2::float8 / 1000), $3::int)`,
+    [row.caughtUp ? (head?.id ?? "0") : "0", clock - row.agoMs, row.digests],
+  );
+  return {
+    query: <T = Record<string, unknown>>(sql: string, params?: unknown[]) =>
+      /select upto_event_id::text as upto/.test(sql)
+        ? Promise.resolve([] as T[])
+        : db.query<T>(sql, params),
+    exec: (sql) => db.exec(sql),
+    tx: <T>(fn: (tx: Db) => Promise<T>) => db.tx(fn),
+    close: () => db.close(),
+  };
+}
+
+test("a_digest_the_claim_allows_is_sent_even_when_the_notifier_read_no_row", async () => {
+  // The control for the three tests below: only the row the notifier did not see differs.
+  const blind = await racedPosterRow({ agoMs: 2 * BOARD_DIGEST_WINDOW_MS, digests: 1 });
+  expect(lines(await tick({ database: blind }))).toEqual(["11 New questions #7"]);
+  const [row] = await db.query<{ digests: number }>("select digests from tg_board_digests");
+  expect(row?.digests).toBe(2);
+});
+
+test("the_claim_refuses_a_digest_inside_the_window_that_another_notifier_opened", async () => {
+  const blind = await racedPosterRow({ agoMs: MINUTE, digests: 1 });
+  expect(await tick({ database: blind })).toEqual([]);
+  const [row] = await db.query<{ digests: number }>("select digests from tg_board_digests");
+  expect(row?.digests).toBe(1);
+});
+
+test("the_claim_refuses_a_digest_past_the_cap_that_another_notifier_filled", async () => {
+  const blind = await racedPosterRow({
+    agoMs: 2 * BOARD_DIGEST_WINDOW_MS,
+    digests: BOARD_DIGESTS_PER_TASK,
+  });
+  expect(await tick({ database: blind })).toEqual([]);
+  const [row] = await db.query<{ digests: number }>("select digests from tg_board_digests");
+  expect(row?.digests).toBe(BOARD_DIGESTS_PER_TASK);
+});
+
+test("the_claim_refuses_a_digest_of_what_another_notifier_already_told_the_chat", async () => {
+  const blind = await racedPosterRow({
+    agoMs: 2 * BOARD_DIGEST_WINDOW_MS,
+    digests: 1,
+    caughtUp: true,
+  });
+  expect(await tick({ database: blind })).toEqual([]);
+  const [row] = await db.query<{ digests: number }>("select digests from tg_board_digests");
+  expect(row?.digests).toBe(1);
+});
+
+test("news_about_a_hidden_question_makes_no_digest_and_no_claim", async () => {
+  await seedBoardWorld();
+  await tick();
+  const spam = await askOn7("buy my tokens");
+  await answerQuestion(db, { taskId: 7n, questionId: spam, body: "no" });
+  await hideQuestion(db, { taskId: 7n, questionId: spam });
+  expect(await tick()).toEqual([]);
+  expect(await db.query("select 1 from tg_board_digests")).toEqual([]);
   expect(logged()).toEqual([]);
 });
 

@@ -212,13 +212,6 @@ const ALERT: ByKind = {
     reward: "12500000",
     funders: 3,
   },
-  question_asked: {
-    kind: "question_asked",
-    taskId: TASK,
-    title: TITLE,
-    questionId: "1",
-    asker: ASKER,
-  },
   question_answered: { kind: "question_answered", taskId: TASK, title: TITLE, questionId: "1" },
   clarification_posted: {
     kind: "clarification_posted",
@@ -226,6 +219,25 @@ const ALERT: ByKind = {
     title: TITLE,
     clarificationId: "3",
   },
+  board_digest: {
+    kind: "board_digest",
+    taskId: TASK,
+    title: TITLE,
+    for: "watchers",
+    questions: 0,
+    answers: 4,
+    clarifications: 1,
+    last: false,
+  },
+};
+
+/** The same digest, for the poster. */
+const DIGEST_FOR_THE_POSTER: Alert = {
+  ...ALERT.board_digest,
+  for: "poster",
+  questions: 3,
+  answers: 0,
+  clarifications: 0,
 };
 
 const NAME_OF = new Map(Object.entries(CHATS).map(([name, chat]) => [String(chat.id), name]));
@@ -314,38 +326,51 @@ test("pool_grew_reaches_the_poster_every_funder_and_tag_watchers", async () => {
   );
 });
 
-// The board's three rows.
+// The board's alerts.
 
-test("question_asked_reaches_the_poster_only", async () => {
-  // The poster's own chat, not its ASP's, and nobody else: not the asker, the entrants or the
-  // watchers.
-  expect(await who(ALERT.question_asked)).toEqual(names("poster"));
-});
-
-test("question_answered_reaches_the_asker_the_entrants_and_tag_watchers", async () => {
+test("question_answered_reaches_the_asker_and_the_entrants_but_not_the_tag_watchers", async () => {
   // The asker, every committer's owners (bot1 and bot2 share acme's chat, which hears once; solo
-  // and lone have only their own), the owner of an agent that said it started (worker), and each
-  // chat watching research or summary. Not the poster, who wrote the answer, nor the verifier, a
-  // funder or a bystander.
+  // and lone have only their own) and the owner of an agent that said it started (worker). Not the
+  // poster, who wrote the answer, nor the verifier, a funder or a bystander, and not the chats that
+  // watch a tag: they hear of the board in a digest, not one message for each answer.
   expect(await who(ALERT.question_answered)).toEqual(
-    names("asker", "bot1", "acme", "solo", "lone", "worker", "watchesResearch", "watchesBoth"),
+    names("asker", "bot1", "acme", "solo", "lone", "worker"),
   );
 });
 
-test("clarification_posted_reaches_the_entrants_and_tag_watchers_but_no_asker", async () => {
+test("clarification_posted_reaches_the_entrants_but_no_asker_and_no_tag_watcher", async () => {
   expect(await who(ALERT.clarification_posted)).toEqual(
-    names("bot1", "acme", "solo", "lone", "worker", "watchesResearch", "watchesBoth"),
+    names("bot1", "acme", "solo", "lone", "worker"),
+  );
+});
+
+test("past_the_per_task_cap_an_answer_reaches_its_asker_alone_and_a_clarification_no_one", async () => {
+  // `entrantsHear: false` is what the notifier sets for the answers and clarifications of a task
+  // after its first few.
+  expect(await who({ ...ALERT.question_answered, entrantsHear: false })).toEqual(names("asker"));
+  expect(await who({ ...ALERT.clarification_posted, entrantsHear: false })).toEqual([]);
+  // And true is the same as not saying.
+  expect(await who({ ...ALERT.question_answered, entrantsHear: true })).toEqual(
+    await who(ALERT.question_answered),
   );
 });
 
 test("an_answer_reaches_the_asker_of_that_question_and_of_no_other", async () => {
   // Question 2 is on task 8: an answer alert for task 7 that names it finds no asker there.
   const wrong = { ...ALERT.question_answered, questionId: "2" };
-  expect(await who(wrong)).toEqual(
-    names("bot1", "acme", "solo", "lone", "worker", "watchesResearch", "watchesBoth"),
-  );
+  expect(await who(wrong)).toEqual(names("bot1", "acme", "solo", "lone", "worker"));
   // And a question that does not exist has no asker at all.
   expect(await who({ ...ALERT.question_answered, questionId: "999" })).toEqual(await who(wrong));
+});
+
+test("a_board_digest_for_the_poster_reaches_the_poster_only", async () => {
+  // The poster's own chat, not its ASP's, and nobody else: not the asker, the entrants or the
+  // watchers.
+  expect(await who(DIGEST_FOR_THE_POSTER)).toEqual(names("poster"));
+});
+
+test("a_board_digest_for_watchers_reaches_the_chats_watching_a_tag_and_no_one_else", async () => {
+  expect(await who(ALERT.board_digest)).toEqual(names("watchesResearch", "watchesBoth"));
 });
 
 test("board_alerts_for_an_invite_only_task_reach_the_invitees_owners_and_no_watchers", async () => {
@@ -355,8 +380,11 @@ test("board_alerts_for_an_invite_only_task_reach_the_invitees_owners_and_no_watc
   const posted = { ...ALERT.clarification_posted, taskId: INVITE_ONLY_TASK };
   expect(await who(answered)).toEqual(names("bot1", "acme", "solo"));
   expect(await who(posted)).toEqual(names("bot1", "acme", "solo"));
-  // The poster's question alert is the same on any task.
-  expect(await who({ ...ALERT.question_asked, taskId: INVITE_ONLY_TASK })).toEqual(names("poster"));
+  // The poster's digest is the same on any task; the watchers' digest finds no watcher here.
+  expect(await who({ ...DIGEST_FOR_THE_POSTER, taskId: INVITE_ONLY_TASK })).toEqual(
+    names("poster"),
+  );
+  expect(await who({ ...ALERT.board_digest, taskId: INVITE_ONLY_TASK })).toEqual([]);
 });
 
 // Two refinements of the rows above.
@@ -502,8 +530,9 @@ test("alerts_are_scoped_to_their_task", async () => {
   const paid8 = { ...ALERT.winner_paid, taskId: OTHER_TASK };
   const new8 = { ...ALERT.new_task, taskId: OTHER_TASK, tags: ["coding"] };
   const voided8 = { ...ALERT.task_voided, taskId: OTHER_TASK };
-  // Question 2 is task 8's, asked by bot9: its answer reaches bot9's owners, task 8's entrants
-  // (bot9, solo, lone) and the watcher of coding, and none of task 7's people.
+  // Question 2 is task 8's, asked by bot9: its answer reaches bot9's owners and task 8's entrants
+  // (bot9, solo, lone), and none of task 7's people. The watcher of coding hears of the board in a
+  // digest.
   const answered8 = { ...ALERT.question_answered, taskId: OTHER_TASK, questionId: "2" };
 
   // solo has not revealed on task 8 (but did on task 7), and lone has (but did not on task 7).
@@ -511,7 +540,8 @@ test("alerts_are_scoped_to_their_task", async () => {
   expect(await who(paid8)).toEqual(names("otherPoster", "otherVerifier", "bot9", "beta", "lone"));
   expect(await who(new8)).toEqual(names("otherPoster", "watchesCoding"));
   expect(await who(voided8)).toEqual(names("otherPoster", "otherBacker"));
-  expect(await who(answered8)).toEqual(names("bot9", "beta", "solo", "lone", "watchesCoding"));
+  expect(await who(answered8)).toEqual(names("bot9", "beta", "solo", "lone"));
+  expect(await who({ ...ALERT.board_digest, taskId: OTHER_TASK })).toEqual(names("watchesCoding"));
 });
 
 test("a_task_the_database_does_not_know_reaches_nobody", async () => {

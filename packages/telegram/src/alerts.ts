@@ -80,18 +80,50 @@ export type Alert =
       funders: number;
     }
   /**
-   * An entrant asked the poster a question on the task's public board. The alert says that it was
-   * asked, and by whom, and never what: the words are a stranger's, and the poster may hide them.
-   * `questionId` is the board row's id, a decimal string.
-   */
-  | { kind: "question_asked"; taskId: string; title: string; questionId: string; asker: string }
-  /**
    * The poster answered a question. `questionId` names the question, whose asker the recipients are
-   * found from (`resolveRecipients`).
+   * found from (`resolveRecipients`). The asker always hears it. The task's other entrants hear it
+   * too unless `entrantsHear` is false, which the notifier sets for the answers of a task after its
+   * first few (`BOARD_ROW_ALERTS`): any account can ask, so a message for each would be a flood.
+   * The words of the answer are a stranger's, and the poster may hide a question that was already
+   * announced, so the alert never has them.
    */
-  | { kind: "question_answered"; taskId: string; title: string; questionId: string }
-  /** The poster posted a clarification on the board. `clarificationId` is the board row's id. */
-  | { kind: "clarification_posted"; taskId: string; title: string; clarificationId: string };
+  | {
+      kind: "question_answered";
+      taskId: string;
+      title: string;
+      questionId: string;
+      entrantsHear?: boolean;
+    }
+  /**
+   * The poster posted a clarification on the board. `clarificationId` is the board row's id. The
+   * task's entrants hear it, one message for each, unless `entrantsHear` is false (see above).
+   */
+  | {
+      kind: "clarification_posted";
+      taskId: string;
+      title: string;
+      clarificationId: string;
+      entrantsHear?: boolean;
+    }
+  /**
+   * What is new on a task's public board, in one message: the counts, never the words. Two
+   * audiences hear it, each of them at most once in 30 minutes for a task and at most
+   * `BOARD_DIGESTS_PER_TASK` times in all, however much is written (the notifier keeps the count in
+   * `tg_board_digests`): `for: "poster"` is the poster, told how many questions are waiting, and
+   * `for: "watchers"` the chats that watch one of the task's tags (a task open to everyone), told
+   * how many answers and clarifications there are. `last` is whether this is the last the chat will
+   * hear of the task's board, which the message says.
+   */
+  | {
+      kind: "board_digest";
+      taskId: string;
+      title: string;
+      for: "poster" | "watchers";
+      questions: number;
+      answers: number;
+      clarifications: number;
+      last: boolean;
+    };
 
 /**
  * The key that names `a` in `tg_sent(chat_id, dedupe_key)`: a chat gets the alert whose key it has
@@ -104,9 +136,10 @@ export type Alert =
  *   the alert for entry 3 still lands on the key of entry 3;
  * - `deadline_reminder:<taskId>:<hoursLeft>`, for the 24 h and the 1 h reminder;
  * - `pool_grew:<taskId>:<reward>`, so that each top-up, which raises the reward, is news;
- * - `question_asked:<taskId>:<questionId>`, `question_answered:<taskId>:<questionId>` and
- *   `clarification_posted:<taskId>:<clarificationId>`, since every row of the board is news, and a
- *   question and its answer are two alerts.
+ * - `question_answered:<taskId>:<questionId>` and `clarification_posted:<taskId>:<clarificationId>`,
+ *   since every answer and every clarification is news of its own;
+ * - `board_digest:<taskId>:<for>`, which only names it: a digest is claimed in `tg_board_digests`,
+ *   with its window and its cap, and not in `tg_sent`.
  *
  * The other kinds happen once per task.
  */
@@ -120,11 +153,12 @@ export function dedupeKey(a: Alert): string {
       return `${a.kind}:${a.taskId}:${a.hoursLeft}`;
     case "pool_grew":
       return `${a.kind}:${a.taskId}:${a.reward}`;
-    case "question_asked":
     case "question_answered":
       return `${a.kind}:${a.taskId}:${a.questionId}`;
     case "clarification_posted":
       return `${a.kind}:${a.taskId}:${a.clarificationId}`;
+    case "board_digest":
+      return `${a.kind}:${a.taskId}:${a.for}`;
     case "new_task":
     case "reveal_open":
     case "reveal_closing":

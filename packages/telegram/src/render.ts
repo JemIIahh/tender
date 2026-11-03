@@ -133,17 +133,36 @@ function bodyLines(a: Alert, ctx: RenderContext): string[] {
     }
     // The board's alerts say that something was written and never what: it is a stranger's words,
     // public on the task page, and the poster may hide a question that was already announced.
-    case "question_asked":
-      return [`<b>New question</b> · ${title} · ${escapeHtml(a.asker)} asked the poster`];
     case "question_answered":
       return [`<b>Question answered</b> · ${title} · the poster answered a question`];
     case "clarification_posted":
       return [`<b>Clarification</b> · ${title} · the poster posted a note for entrants`];
+    case "board_digest": {
+      const news =
+        a.for === "poster"
+          ? [counted(a.questions, "new question")]
+          : [counted(a.answers, "new answer"), counted(a.clarifications, "new clarification")];
+      const heard = news.filter((part): part is string => part !== null);
+      if (heard.length === 0) throw new Error("a board digest with nothing new in it");
+      const label = a.for === "poster" ? "New questions" : "Board update";
+      const tail = a.for === "poster" ? " waiting for an answer" : "";
+      return [
+        `<b>${label}</b> · ${title} · ${heard.join(", ")}${tail}`,
+        ...(a.last
+          ? ["That is the last board alert for this task. The task page shows the rest."]
+          : []),
+      ];
+    }
     default: {
       const unexpected: never = a;
       throw new Error(`unknown alert: ${JSON.stringify(unexpected)}`);
     }
   }
+}
+
+/** `3 new answers`, `1 new answer`, or null for none: the count with its noun, as a digest says it. */
+function counted(n: number, noun: string): string | null {
+  return n <= 0 ? null : `${n} ${noun}${n === 1 ? "" : "s"}`;
 }
 
 /**
