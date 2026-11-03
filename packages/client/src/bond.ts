@@ -165,8 +165,9 @@ export interface Registration {
  * 1. checks that the key is a full-access one (`E_AUTH` if not), and reads what registering takes
  *    (`planRegistration`). An agent that is unregistering is refused (`E_PHASE`: claim the bond
  *    first). Nothing has moved yet;
- * 2. if the account's storage balance or its vault lacks anything, asks `opts.approve`; when it
- *    does not say yes, throws `E_FUNDS` (or `E_STORAGE`) with what is missing and moves nothing;
+ * 2. if the vault lacks bond that the wallet cannot cover, throws `E_FUNDS` at once; else, if the
+ *    storage balance or the vault lacks anything, asks `opts.approve`, and when it does not say
+ *    yes throws `E_FUNDS` (or `E_STORAGE`) with what is missing and moves nothing;
  * 3. adds the NEAR to the storage deposit, then moves the shortfall of the bond token from the
  *    wallet into the vault, and checks that the vault holds the bond (Tender refunds a deposit it
  *    refuses and does not fail, so the check is the only sign);
@@ -193,19 +194,19 @@ export async function registerWithBond(
     );
   }
 
-  const short = plan.shortfall > 0n || plan.storageShortfall > 0n;
-  if (short && !((await opts.approve?.(plan)) ?? false)) {
-    throw new TenderError(plan.shortfall > 0n ? "E_FUNDS" : "E_STORAGE", shortfallMessage(plan));
-  }
-
-  // The wallet is checked before anything moves, so a registration that cannot be paid for leaves
-  // no storage top-up behind it.
+  // The wallet is checked before anyone is asked and before anything moves, so a registration that
+  // cannot be paid for is not offered, and leaves no storage top-up behind it.
   if (plan.terms !== null && plan.shortfall > 0n && (plan.wallet ?? 0n) < plan.shortfall) {
     throw new TenderError(
       "E_FUNDS",
       `${account} holds ${plan.wallet ?? 0n} of ${plan.terms.token} and needs ${plan.shortfall} more ` +
         `to fill the bond of ${plan.terms.amount}; nothing was moved`,
     );
+  }
+
+  const short = plan.shortfall > 0n || plan.storageShortfall > 0n;
+  if (short && !((await opts.approve?.(plan)) ?? false)) {
+    throw new TenderError(plan.shortfall > 0n ? "E_FUNDS" : "E_STORAGE", shortfallMessage(plan));
   }
 
   let storageAdded = 0n;

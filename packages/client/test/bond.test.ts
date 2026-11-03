@@ -1,5 +1,5 @@
 import { type ConfigView, canonicalJson, ProfileSchema, sha256Hex } from "@tender/shared";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import {
   type AgentView,
   bondTermsOf,
@@ -221,6 +221,14 @@ test("a_short_wallet_is_refused_before_anything_moves", async () => {
   expect((error as Error).message).toContain("holds 10");
   // Not even the storage deposit that a new account needs.
   expect(log).toEqual(["key register_agent"]);
+});
+
+test("nobody_is_asked_to_approve_a_registration_the_wallet_cannot_pay_for", async () => {
+  const { client } = fake({ wallet: 10n });
+  const approve = vi.fn(() => true);
+  const error = await registerWithBond(client, profile, { approve }).catch((e: unknown) => e);
+  expect(error).toMatchObject({ code: "E_FUNDS" });
+  expect(approve).not.toHaveBeenCalled();
 });
 
 test("a_token_the_account_never_registered_counts_as_an_empty_wallet", async () => {

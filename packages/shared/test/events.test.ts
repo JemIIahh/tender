@@ -662,7 +662,10 @@ test("extraction_keeps_receipt_and_log_order", () => {
 
 test("events_are_discriminated_by_event", () => {
   expectTypeOf<TenderEvent["event"]>().toEqualTypeOf<
+    | "agent_bond_claimed"
+    | "agent_bonded"
     | "agent_registered"
+    | "agent_unregistering"
     | "attested_pick"
     | "committed"
     | "delegate_added"
