@@ -3,6 +3,7 @@ import { ApiClient, TenderClient } from "@tender/client";
 import {
   checkApiDeployment,
   describeFailure,
+  filesDirWarning,
   readConfig,
   resolveDefaultToken,
   secretsOf,
@@ -25,6 +26,10 @@ async function main(): Promise<void> {
   const config = readConfig(process.env);
   const { accountId } = config.signer;
   secrets = secretsOf(config);
+  // A files directory that nothing can be read from is no fault of the environment, but every
+  // `file_path` would be refused without a word as to why: one line says it.
+  const warning = filesDirWarning(config);
+  if (warning !== undefined) process.stderr.write(`tender-mcp: ${warning}\n`);
 
   // The API client signs in as the agent's account, for the base that `readConfig` has checked the
   // way the client reads it (`canonicalBase`, https or this machine), so this does not throw for

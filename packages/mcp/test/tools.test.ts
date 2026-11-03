@@ -5232,6 +5232,179 @@ test("a_revealed_draft_is_believed_only_while_the_chain_does_not_deny_it", async
   expect(down.chain.reveal).not.toHaveBeenCalled();
 });
 
+/** A task the API shows as settled: it has an outcome. */
+function settledTask(): TaskDetailResponse {
+  return makeDetail([], {
+    phase: "settled",
+    outcome_kind: "picked",
+    outcome: {
+      kind: "picked",
+      task_id: "7",
+      by: "judge.testnet",
+      winners: [{ account: ACCOUNT, bps: 10_000, amount: "950000" }],
+      fee: "50000",
+      scorecard_hash: "66".repeat(32),
+      scorecard_uri: `${BLOBS}/card`,
+    },
+  });
+}
+
+test("a_settled_tasks_drafts_keep_their_answers_once_its_entries_are_cleaned_up", async () => {
+  // The contract's cleanup removes the entries of a settled task, and the keeper calls it every half
+  // minute. The chain then holds none for a result that was revealed, which is no sign that the
+  // draft is another task's: the API says the task is settled, and the draft keeps its answers.
+  const uri = `${BLOBS}/old`;
+  const revealed = makeDraft("7", { committedAt: "2026-11-04T09:30:00.000Z", revealedUri: uri });
+  const committed = makeDraft("8", { committedAt: "2026-11-04T09:30:00.000Z" });
+  await state.saveDraft(revealed);
+  await state.saveDraft(committed);
+  const { call, callJson, chain, api } = await connectWrite();
+  api.getTask.mockResolvedValue(settledTask());
+
+  expect(await callJson("reveal_result", { task_id: "7" })).toMatchObject({
+    uri,
+    tx_hash: null,
+    note: expect.stringMatching(/revealed already; nothing was sent.*settled.*cleaned up/),
+  });
+  const revealedAgain = await call("commit_result", {
+    task_id: "7",
+    content: "answer for task 7",
+  });
+  expect(revealedAgain.isError).toBe(true);
+  expect(revealedAgain.text).toMatch(/^ALREADY_REVEALED: .*revealed already.*settled.*cleaned up/);
+  expect(
+    await callJson("commit_result", { task_id: "8", content: "answer for task 8" }),
+  ).toMatchObject({
+    commitment: committed.commitment,
+    tx_hash: null,
+    note: expect.stringMatching(/already committed with this content.*settled.*cleaned up/),
+  });
+  const other = await call("commit_result", { task_id: "8", content: "another answer" });
+  expect(other.isError).toBe(true);
+  expect(other.text).toMatch(/^ALREADY_COMMITTED: .*other content.*settled.*cleaned up/);
+
+  // Nothing was sent, uploaded or moved.
+  expect(chain.commit).not.toHaveBeenCalled();
+  expect(chain.reveal).not.toHaveBeenCalled();
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+  expect(await setAsideFor("7")).toEqual([]);
+  expect(await setAsideFor("8")).toEqual([]);
+  expect(await draftOf("7")).toEqual(revealed);
+  expect(await draftOf("8")).toEqual(committed);
+
+  // The chain's silence is believed only for a task the API calls settled. Under any other phase the
+  // entries are still there to be found, and so is a API that cannot say: the answers are the
+  // chain's, as they were.
+  const phases = ["revealing", "judging", "fallback", "expired"] as const;
+  for (const phase of phases) {
+    api.getTask.mockResolvedValue(makeDetail([], { phase }));
+    expect((await call("reveal_result", { task_id: "7" })).text, phase).toMatch(/^NOT_COMMITTED: /);
+    const refused = await call("commit_result", { task_id: "7", content: "answer for task 7" });
+    expect(refused.text, phase).toMatch(/^NOT_COMMITTED: /);
+  }
+  api.getTask.mockRejectedValue(new Error("API is down"));
+  expect((await call("reveal_result", { task_id: "7" })).text).toMatch(/^NOT_COMMITTED: /);
+  expect((await call("commit_result", { task_id: "8", content: "a" })).text).toMatch(
+    /^NOT_COMMITTED: /,
+  );
+  expect(await draftOf("7")).toEqual(revealed);
+  expect(await draftOf("8")).toEqual(committed);
+});
+
+test("a_draft_whose_commitment_the_chain_holds_is_never_set_aside", async () => {
+  // The API says the task was created at another time than the draft records: an API of another
+  // deployment can, after a start-up check that was skipped because /health was out of reach. A
+  // commitment binds the task, the account, the work and a random salt, so an entry of the account
+  // with it proves that the draft is this task's, whatever the API says.
+  const wrongTime = { taskCreatedAt: ns("2026-10-01T09:00:00.000Z") };
+  const committed = makeDraft("7", {
+    committedAt: "2026-11-04T09:30:00.000Z",
+    contractId: "tender.testnet",
+    ...wrongTime,
+  });
+  const unmarked = makeDraft("8", { contractId: "tender.testnet", ...wrongTime });
+  const foreign = makeDraft("9", {
+    committedAt: "2026-11-04T09:30:00.000Z",
+    contractId: "tender-old.testnet",
+  });
+  await state.saveDraft(committed);
+  await state.saveDraft(unmarked);
+  await state.saveDraft(foreign);
+  const { callJson, chain, api } = await connectWrite();
+  holdDrafts(chain);
+
+  // A commit finds its draft done, and sends nothing.
+  expect(
+    await callJson("commit_result", { task_id: "7", content: "answer for task 7" }),
+  ).toMatchObject({ commitment: committed.commitment, tx_hash: null });
+  // A draft that was never marked committed, and that the chain holds, is marked and not resent.
+  const marked = await callJson("commit_result", { task_id: "8", content: "answer for task 8" });
+  expect(marked).toMatchObject({ commitment: unmarked.commitment, tx_hash: null });
+  expect((await draftOf("8")).committedAt).toMatch(ISO);
+  // Another contract's name on a draft that this contract holds is the same: the chain decides.
+  expect(
+    await callJson("commit_result", { task_id: "9", content: "answer for task 9" }),
+  ).toMatchObject({ commitment: foreign.commitment, tx_hash: null });
+  expect(chain.commit).not.toHaveBeenCalled();
+  for (const id of ["7", "8", "9"]) expect(await setAsideFor(id), id).toEqual([]);
+
+  // A reveal uses the draft too: its work goes up and the reveal goes out.
+  expect(await callJson("reveal_result", { task_id: "7" })).toMatchObject({ tx_hash: "TX_REVEAL" });
+  expect(api.uploadBlob).toHaveBeenCalledTimes(1);
+  expect(chain.reveal).toHaveBeenCalledWith(
+    7n,
+    committed.contentHash,
+    committed.salt,
+    expect.any(String),
+  );
+  expect(await setAsideFor("7")).toEqual([]);
+  expect((await draftOf("7")).taskCreatedAt).toBe(wrongTime.taskCreatedAt);
+});
+
+test("a_draft_the_chain_does_not_hold_is_set_aside_as_before_when_its_task_was_created_at_another_time", async () => {
+  // The veto is the chain's word for the draft, and only that. An entry with another commitment, no
+  // entry, or a chain that cannot be asked does not save a draft that the API shows to be another's.
+  const wrongTime = { taskCreatedAt: ns("2026-10-01T09:00:00.000Z") };
+  const answers: Array<[id: string, ask: McpChain["getEntry"]]> = [
+    ["7", async () => entryView("ab".repeat(32), "7")],
+    ["8", async () => null],
+    [
+      "9",
+      async () => {
+        throw new Error("RPC is down");
+      },
+    ],
+  ];
+  for (const [id, ask] of answers) {
+    await state.saveDraft(
+      makeDraft(id, {
+        committedAt: "2026-11-04T09:30:00.000Z",
+        contractId: "tender.testnet",
+        ...wrongTime,
+      }),
+    );
+    const { callJson, chain } = await connectWrite();
+    chain.getEntry.mockImplementation(async (taskId, account) => {
+      // The commit that follows the set-aside lands on this chain, as it would on the real one.
+      const sent = chain.commit.mock.calls.at(-1);
+      if (sent !== undefined && sent[0] === taskId) return entryView(sent[1], String(taskId));
+      return ask(taskId, account);
+    });
+
+    const answer = await callJson("commit_result", {
+      task_id: id,
+      content: `answer for task ${id}`,
+    });
+
+    expect(answer, id).toMatchObject({ tx_hash: "TX_COMMIT" });
+    expect(answer, id).toHaveProperty(
+      "note",
+      expect.stringMatching(/not this task's.*created at another time.*kept whole as/),
+    );
+    expect(await setAsideFor(id), id).toHaveLength(1);
+  }
+});
+
 test("file_inside_state_dir_is_unreadable", async () => {
   // TENDER_FILES_DIR may be a directory that holds the state directory (the user's home, say), and a
   // path to a draft is then a path inside it. A draft holds another task's unrevealed work and its

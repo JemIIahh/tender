@@ -1,3 +1,4 @@
+import { inspect } from "node:util";
 import type { Db } from "@tender/db";
 import { applyBlock } from "@tender/indexer";
 import {
@@ -11,7 +12,7 @@ import {
   putFixtureBlobs,
 } from "@tender/indexer/testing";
 import type { NetworkId } from "@tender/shared";
-import type { Bot, Transformer } from "grammy";
+import { type Bot, HttpError, type Transformer } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import {
   afterAll,
@@ -37,6 +38,8 @@ import { linkChat, openTestDb, seedAgent, seedEntry, seedTask, watchTag } from "
 
 const WEB_URL = "https://tender.example";
 const NETWORK: NetworkId = "testnet";
+/** The bot's token. It is in the URL of every request, so no log line may quote that URL. */
+const TOKEN = "123:test";
 
 const BOT_INFO: UserFromGetMe = {
   id: 7_000_000_001,
@@ -93,9 +96,12 @@ interface ApiCall {
 }
 const calls: ApiCall[] = [];
 /** What Telegram answers a chat instead of "sent", by chat id. */
-const refusals = new Map<string, { error_code: number; description: string }>();
-/** The chats the network drops: a call to one throws instead of getting an answer. */
-const unreachable = new Set<string>();
+const refusals = new Map<
+  string,
+  { error_code: number; description: string; parameters?: { retry_after: number } }
+>();
+/** What the network does to a call for a chat instead of getting it an answer: it throws this. */
+const failures = new Map<string, Error>();
 /** How long each send takes. */
 let sendDelayMs = 0;
 /** While set, the next send waits for it: a send that is stuck. Later sends are not held. */
@@ -121,7 +127,8 @@ const fakeTelegram: Transformer = async (_prev, method, payload) => {
   } finally {
     sending -= 1;
   }
-  if (unreachable.has(String(sent.chat_id))) throw new Error("socket hang up");
+  const failure = failures.get(String(sent.chat_id));
+  if (failure !== undefined) throw failure;
   const refusal = refusals.get(String(sent.chat_id));
   if (refusal !== undefined) return { ok: false, ...refusal } as never;
   // Telegram answers a sendMessage with the message it made.
@@ -131,7 +138,7 @@ const fakeTelegram: Transformer = async (_prev, method, payload) => {
 
 /** A bot on the fake Telegram. Another one is a restarted process. */
 function newBot(): Bot {
-  const made = createBot({ token: "123:test", db, webUrl: WEB_URL, botInfo: BOT_INFO });
+  const made = createBot({ token: TOKEN, db, webUrl: WEB_URL, botInfo: BOT_INFO });
   made.api.config.use(fakeTelegram);
   return made;
 }
@@ -206,7 +213,7 @@ beforeEach(async () => {
   calls.length = 0;
   seen = 0;
   refusals.clear();
-  unreachable.clear();
+  failures.clear();
   sendDelayMs = 0;
   gate = null;
   onSend = undefined;
@@ -741,47 +748,350 @@ test("blocked_chat_is_unlinked", async () => {
   expect(logged()).toEqual([]); // nothing more to say about the chats that are gone
 });
 
-test("other_send_errors_are_logged_and_not_retried", async () => {
+// ---------------------------------------------------------------------------------------------
+// A send that fails. What becomes of the alert depends on what the failure says about the message:
+// Telegram answered about it (lost for that chat, the tick goes on); Telegram cannot have taken it
+// (given back, the tick ends, the next tick sends it); Telegram may have taken it (lost, the tick
+// ends). A tick that ends leaves the event cursor where it was.
+
+/**
+ * An error as node-fetch makes one for a request that failed. Its message quotes the URL of the
+ * request, which holds the bot's token, and one for a failure of the system has the system's code.
+ */
+function fetchError(reason: string, code?: string): Error {
+  const error = new Error(
+    `request to https://api.telegram.org/bot${TOKEN}/sendMessage failed, reason: ${reason}`,
+  );
+  error.name = "FetchError";
+  return code === undefined ? error : Object.assign(error, { code, errno: code, type: "system" });
+}
+
+/** What grammY throws for a request that failed on the way: its message names the method only. */
+function httpError(cause: Error): HttpError {
+  return new HttpError("Network request for 'sendMessage' failed!", cause);
+}
+
+/** Runs a tick that must fail, and returns what it failed with. */
+async function failedTick(options: TickOptions = {}): Promise<Error> {
+  const outcome = await tick(options).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  expect(outcome, "the tick should have failed").toBeInstanceOf(Error);
+  return outcome as Error;
+}
+
+/** The claims on record, each as "chat alert": the chat, and the key of the alert it was to hear. */
+async function claims(): Promise<string[]> {
+  const rows = await db.query<{ chat_id: string; dedupe_key: string }>(
+    "select chat_id::text as chat_id, dedupe_key from tg_sent order by 1, 2",
+  );
+  return rows.map((row) => `${row.chat_id} ${row.dedupe_key}`);
+}
+
+test("a_refused_message_is_lost_for_that_chat_and_the_tick_goes_on", async () => {
   await linkChat(db, 41, poster);
   await linkChat(db, 42, poster);
   await linkChat(db, 43, poster);
-  await linkChat(db, 44, poster);
   refusals.set("41", { error_code: 400, description: "Bad Request: chat not found" });
-  refusals.set("42", { error_code: 429, description: "Too Many Requests: retry after 3" });
-  unreachable.add("44");
   await tick();
 
   await apply(created("7", OPEN), eventLine("committed", { task_id: "7" }));
-  // The batch goes on past the chats that fail: both alerts reach all four, once.
+  // The batch goes on past the chat that is refused: both alerts reach all three, once.
   expect(lines(await tick())).toEqual([
     "41 New task #7",
     "42 New task #7",
     "43 New task #7",
-    "44 New task #7",
     "41 Entry received #7",
     "42 Entry received #7",
     "43 Entry received #7",
-    "44 Entry received #7",
   ]);
-  const logs = logged();
-  expect(logs).toHaveLength(6);
-  for (const chat of ["41", "42", "44"]) {
-    expect(logs.filter((log) => log.includes(`chat ${chat}`))).toHaveLength(2);
-  }
-  expect(logs.some((log) => log.includes("chat 43"))).toBe(false);
-  expect(logs[0]).toContain("400");
-  expect(logs[2]).toContain("socket hang up");
+  // Each alert that chat 41 lost has a line: its kind, its task, and what Telegram said. No chat.
+  expect(logged()).toEqual([
+    "telegram notifier: alert lost: new_task for task 7 (GrammyError 400: Bad Request: chat not found)",
+    "telegram notifier: alert lost: entry_committed for task 7 (GrammyError 400: Bad Request: chat not found)",
+  ]);
 
-  // Only a 403 unlinks. The cursor moved on, and a failed send stays sent: it is not tried again.
+  // Only a 403 unlinks. The cursor moved on, and a lost alert stays sent: it is not tried again.
   const links = await db.query<{ chat_id: string }>(
     "select chat_id::text from tg_links order by 1",
   );
-  expect(links.map((row) => row.chat_id)).toEqual(["41", "42", "43", "44"]);
+  expect(links.map((row) => row.chat_id)).toEqual(["41", "42", "43"]);
   expect(await cursor()).toBe("2");
   refusals.clear();
-  unreachable.clear();
   expect(await tick()).toEqual([]);
   expect(logged()).toEqual([]);
+});
+
+test.each(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH"])(
+  "a_send_that_never_left_the_machine_is_sent_on_the_next_tick: %s",
+  async (code) => {
+    await linkChat(db, 11, poster);
+    await linkChat(db, 12, poster);
+    await tick();
+    await apply(created("7", OPEN));
+    failures.set("11", httpError(fetchError(`connect ${code}`, code)));
+
+    const error = await failedTick();
+    expect(error.name).toBe("TransportFailed");
+    expect(error.message).toContain(`HttpError ${code}`);
+    expect(error.message).toContain("tried again on the next");
+    // The tick ended at the first call: chat 12 was not asked, and the batch is not finished.
+    expect(lines(drain())).toEqual(["11 New task #7"]);
+    expect(await cursor()).toBe("0");
+    // The claim went back with the alert: nothing says it was sent, and nothing was lost.
+    expect(await claims()).toEqual([]);
+    expect(logged()).toEqual([]);
+
+    // Telegram can be reached again. The alert goes to both chats, once.
+    failures.clear();
+    expect(lines(await tick())).toEqual(["11 New task #7", "12 New task #7"]);
+    expect(await cursor()).toBe("1");
+    expect(await tick()).toEqual([]);
+    expect(logged()).toEqual([]);
+  },
+);
+
+test("a_flood_wait_longer_than_the_bot_sits_out_is_sent_on_a_later_tick", async () => {
+  // `createBot` sits out a flood wait of up to a minute, three times. A longer one, or one that is
+  // still on after the third try, reaches the notifier as a 429. Telegram took nothing.
+  await linkChat(db, 11, poster);
+  await linkChat(db, 12, poster);
+  await tick();
+  await apply(created("7", OPEN));
+  refusals.set("11", {
+    error_code: 429,
+    description: "Too Many Requests: retry after 3600",
+    parameters: { retry_after: 3600 },
+  });
+
+  const error = await failedTick();
+  expect(error.name).toBe("TransportFailed");
+  expect(error.message).toContain("GrammyError 429");
+  expect(error.message).toContain("tried again on the next");
+  expect(lines(drain())).toEqual(["11 New task #7"]); // and the tick ended there
+  expect(await cursor()).toBe("0");
+  expect(await claims()).toEqual([]);
+  expect(logged()).toEqual([]);
+
+  refusals.clear(); // the wait is over
+  expect(lines(await tick())).toEqual(["11 New task #7", "12 New task #7"]);
+  expect(await cursor()).toBe("1");
+  expect(await tick()).toEqual([]);
+});
+
+/**
+ * Failures after which Telegram may have the message: a connection that was made and broke, a
+ * request that timed out, a reply that could not be read, a 5xx. None is a failure to connect that
+ * the system reports at once (see `a_send_that_never_left_the_machine_is_sent_on_the_next_tick`),
+ * and the connect that timed out is not one either: only what is known to come before any byte of
+ * the request is given back.
+ */
+const MAY_HAVE_BEEN_TAKEN = [
+  {
+    name: "a_timeout",
+    fail: () => {
+      const timedOut = new Error("Request to 'sendMessage' timed out after 60 seconds");
+      failures.set("11", httpError(timedOut));
+    },
+    why: "HttpError",
+  },
+  {
+    name: "a_connection_that_broke_after_the_request_went_out",
+    fail: () => {
+      failures.set("11", httpError(fetchError("socket hang up", "ECONNRESET")));
+    },
+    why: "HttpError ECONNRESET",
+  },
+  {
+    name: "a_connect_that_timed_out",
+    fail: () => {
+      failures.set("11", httpError(fetchError("connect ETIMEDOUT", "ETIMEDOUT")));
+    },
+    why: "HttpError ETIMEDOUT",
+  },
+  {
+    name: "a_reply_that_is_no_json",
+    fail: () => {
+      failures.set("11", httpError(fetchError("invalid json response body")));
+    },
+    why: "HttpError",
+  },
+  {
+    name: "a_5xx",
+    fail: () => {
+      refusals.set("11", { error_code: 502, description: "Bad Gateway" });
+    },
+    why: "GrammyError 502: Bad Gateway",
+  },
+  {
+    name: "an_error_of_no_known_kind",
+    fail: () => {
+      failures.set("11", new Error("boom"));
+    },
+    why: "Error",
+  },
+];
+
+test.each(MAY_HAVE_BEEN_TAKEN)(
+  "a_send_that_may_have_gone_through_is_lost_and_never_sent_again: $name",
+  async ({ fail, why }) => {
+    await linkChat(db, 11, poster);
+    await linkChat(db, 12, poster);
+    await tick();
+    await apply(created("7", OPEN), created("8", OPEN));
+    fail();
+
+    const error = await failedTick();
+    expect(error.name).toBe("TransportFailed");
+    expect(error.message).toContain("may have gone through");
+    expect(error.message).toContain("is not sent again");
+    expect(lines(drain())).toEqual(["11 New task #7"]); // and the tick ended there
+    expect(await cursor()).toBe("0");
+    // The claim stays: if Telegram has the message, the chat is not sent it twice.
+    expect(await claims()).toEqual(["11 new_task:7"]);
+    // One line for the lost alert. It names the kind and the task, and not the chat or the token.
+    expect(logged()).toEqual([`telegram notifier: alert lost: new_task for task 7 (${why})`]);
+
+    // Telegram answers again. The next tick goes on from the cursor, and skips what was claimed.
+    failures.clear();
+    refusals.clear();
+    expect(lines(await tick())).toEqual(["12 New task #7", "11 New task #8", "12 New task #8"]);
+    expect(await cursor()).toBe("2");
+    expect(await tick()).toEqual([]);
+    expect(logged()).toEqual([]);
+  },
+);
+
+test("the_tick_stops_at_the_first_transport_failure", async () => {
+  // Three chats hear of two new tasks, and a working signal and a reminder wait behind them, for the
+  // same three chats. The network drops at chat 12, on the first alert: nothing more is asked of
+  // Telegram in the tick, not chat 13, not the second task, not the other two sources of news.
+  await linkChat(db, 11, poster);
+  await linkChat(db, 12, poster);
+  await linkChat(db, 13, poster);
+  await tick();
+  await apply(created("7", OPEN), created("8", OPEN));
+  await startWorking("7", alice, clock - 5 * MINUTE);
+  const soon = clock + 30 * MINUTE; // task 9 takes entries for another half hour, after 5 h
+  await seedTask(db, {
+    id: "9",
+    poster,
+    created_at: ns(clock - 5 * HOUR),
+    commit_deadline: ns(soon),
+    reveal_deadline: ns(soon + HOUR),
+    pick_deadline: ns(soon + 2 * HOUR),
+    fallback_deadline: ns(soon + 3 * HOUR),
+  });
+  failures.set("12", httpError(fetchError("connect ECONNREFUSED", "ECONNREFUSED")));
+
+  await failedTick();
+  expect(lines(drain())).toEqual(["11 New task #7", "12 New task #7"]);
+  expect(await cursor()).toBe("0");
+  expect(await claims()).toEqual(["11 new_task:7"]); // chat 11 got its message; chat 12's went back
+  expect(logged()).toEqual([]);
+
+  // The next tick is the whole pass again, from the old cursor, minus what chat 11 was sent.
+  failures.clear();
+  expect(lines(await tick())).toEqual([
+    "12 New task #7",
+    "13 New task #7",
+    "11 New task #8",
+    "12 New task #8",
+    "13 New task #8",
+    "11 Agent working #7",
+    "12 Agent working #7",
+    "13 Agent working #7",
+    "11 1 h left #9",
+    "12 1 h left #9",
+    "13 1 h left #9",
+  ]);
+  expect(await cursor()).toBe("2");
+  expect(await tick()).toEqual([]);
+});
+
+test("a_failure_in_the_working_signals_ends_the_tick_before_the_reminders", async () => {
+  await linkChat(db, 11, poster);
+  await tick();
+  await seedTask(db, { id: "7", poster });
+  await startWorking("7", alice, clock - 5 * MINUTE);
+  const soon = clock + 30 * MINUTE;
+  await seedTask(db, {
+    id: "9",
+    poster,
+    created_at: ns(clock - 5 * HOUR),
+    commit_deadline: ns(soon),
+    reveal_deadline: ns(soon + HOUR),
+    pick_deadline: ns(soon + 2 * HOUR),
+    fallback_deadline: ns(soon + 3 * HOUR),
+  });
+  failures.set("11", httpError(fetchError("getaddrinfo ENOTFOUND api.telegram.org", "ENOTFOUND")));
+
+  await failedTick();
+  expect(lines(drain())).toEqual(["11 Agent working #7"]); // the reminder was not tried
+  failures.clear();
+  expect(lines(await tick())).toEqual(["11 Agent working #7", "11 1 h left #9"]);
+});
+
+test("a_claim_that_cannot_be_given_back_loses_the_alert_and_says_so", async () => {
+  await linkChat(db, 11, poster);
+  await tick();
+  await apply(created("7", OPEN));
+  failures.set("11", httpError(fetchError("connect ECONNREFUSED", "ECONNREFUSED")));
+  const stuck = failingWhen(db, (sql) => sql.includes("delete from tg_sent"));
+
+  const error = await failedTick({ database: stuck });
+  expect(error.name).toBe("TransportFailed");
+  expect(error.message).not.toContain("tried again");
+  expect(logged()).toEqual([
+    "telegram notifier: alert lost: new_task for task 7 (HttpError ECONNREFUSED; its claim could not be given back)",
+  ]);
+
+  // The claim is what it was: the alert is not sent again.
+  expect(lines(drain())).toEqual(["11 New task #7"]);
+  failures.clear();
+  expect(await claims()).toEqual(["11 new_task:7"]);
+  expect(await tick()).toEqual([]);
+});
+
+test("the_error_that_ends_a_tick_holds_no_token_and_no_cause", async () => {
+  // The loop logs this error whole, and node-fetch's message quotes the URL of the request.
+  expect(fetchError("connect ECONNREFUSED", "ECONNREFUSED").message).toContain(TOKEN);
+  await linkChat(db, 11, poster);
+  await tick();
+  await apply(created("7", OPEN));
+  for (const code of ["ECONNREFUSED", "ECONNRESET"]) {
+    failures.set("11", httpError(fetchError(`connect ${code}`, code)));
+    const error = await failedTick();
+    expect(error.cause, code).toBeUndefined();
+    const shown = `${inspect(error)}\n${logged().join("\n")}`;
+    expect(shown, code).not.toContain(TOKEN);
+    expect(shown, code).not.toContain("api.telegram.org");
+  }
+});
+
+test("the_loop_rides_out_an_outage_and_sends_what_waited", async () => {
+  await linkChat(db, 11, poster);
+  await withLoop({}, async () => {
+    await firstTickDone();
+    failures.set("11", httpError(fetchError("connect ECONNREFUSED", "ECONNREFUSED")));
+    await apply(created("7", OPEN));
+    await until(() => calls.length >= 3, "the loop to try the alert again and again");
+    failures.clear();
+    await until(async () => (await cursor()) === "1", "the alert to go out once Telegram answers");
+  });
+  // Every try was for the one alert, and the last one got through.
+  const tries = lines(drain());
+  expect(tries.length).toBeGreaterThanOrEqual(4);
+  expect(new Set(tries)).toEqual(new Set(["11 New task #7"]));
+  expect(await claims()).toEqual(["11 new_task:7"]);
+  const logs = logged();
+  expect(logs.length).toBeGreaterThanOrEqual(3);
+  for (const log of logs) {
+    expect(log).toContain("telegram notifier: tick failed:");
+    expect(log).toContain("HttpError ECONNREFUSED");
+    expect(log).not.toContain(TOKEN);
+  }
 });
 
 test("a_render_error_skips_only_that_alert", async () => {

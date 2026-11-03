@@ -11,7 +11,7 @@ import {
 } from "@tender/shared";
 import { KeyPair, type KeyPairString } from "near-api-js";
 import { urlCredentials } from "./secrets";
-import { defaultStateDir } from "./state";
+import { DRAFTS_DIR, defaultStateDir, defaultStateRoot } from "./state";
 import { scrub } from "./tools/format";
 
 // What the bin reads from the environment, and what it does with it. It lives here and not in the
@@ -350,6 +350,52 @@ function pinFilesDir(dir: string, home: string): string {
   // no user ids to follow the way with).
   if (holdsHome(pinned, home)) throw new ConfigError(FILES_DIR_HOME);
   return pinned;
+}
+
+/** The real path of `place`, or the path as it is written when it is not there (yet). */
+function placeAt(place: string): string {
+  try {
+    return realpathSync.native(place);
+  } catch {
+    return resolve(place);
+  }
+}
+
+/**
+ * What to tell the operator about a `filesDir` that nothing can be read from, if it is one. The
+ * write tools read no file from this server's state directory or its drafts folder, from
+ * `~/.tender` (the root of the default state directories of every account), or from below a folder
+ * named `drafts`, in any letter case (`keptOut`). A files directory inside one of those starts all
+ * the same, and then every `file_path` is refused with an answer that does not say why, so one line
+ * says it here, once. It is a warning and not a refusal: the server is useful without files, and the
+ * user may have set it up on purpose. (The home directory and the directories that hold it never get
+ * here: `readConfig` refuses them.)
+ *
+ * `filesDir` is a real path. The places are looked up here too, as `keptOut` looks them up on each
+ * call, and one that is not there yet counts as it is written. The line names the variable and the
+ * rule, never a path.
+ */
+export function filesDirWarning(
+  config: Pick<McpConfig, "filesDir" | "stateDir">,
+  home: string = homedir(),
+): string | undefined {
+  const { filesDir, stateDir } = config;
+  if (filesDir === undefined) return undefined;
+  const inside = (place: string) => isWithin(placeAt(place), filesDir);
+  let why: string | undefined;
+  if (inside(stateDir) || inside(join(stateDir, DRAFTS_DIR))) {
+    why = "is inside this server's state directory";
+  } else if (isAbsolute(home) && inside(defaultStateRoot(home))) {
+    why = "is inside ~/.tender, where Tender keeps the state of every account";
+  } else if (filesDir.split(sep).some((name) => name.toLowerCase() === DRAFTS_DIR)) {
+    why = "has a folder named drafts on its path, which is the folder of every state directory";
+  }
+  if (why === undefined) return undefined;
+  return (
+    `TENDER_FILES_DIR ${why}, so commit_result would refuse every file_path: nothing can be read ` +
+    "from it. Use a folder of its own, outside any state directory and ~/.tender and with no " +
+    "folder named drafts on its path"
+  );
 }
 
 /**

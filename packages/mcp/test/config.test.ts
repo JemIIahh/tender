@@ -33,6 +33,7 @@ import {
   checkApiDeployment,
   describeFailure,
   expandHome,
+  filesDirWarning,
   readConfig,
   resolveDefaultToken,
   secretsOf,
@@ -597,6 +598,152 @@ test("a_files_dir_that_is_not_there_or_is_no_directory_is_refused", () => {
     expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, bad) }), bad).toBe(MISSING);
   }
   expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "nothing") })).not.toContain(home);
+});
+
+/** What the start-up warning is for the configuration that `env` adds to the basics, under the test's home. */
+function warningFor(env: Record<string, string>): string | undefined {
+  return filesDirWarning(readConfig({ ...ENV, ...env }, home), home);
+}
+
+/** The warning's two fixed parts, and the reason in between. */
+const WARNING =
+  /^TENDER_FILES_DIR (.+), so commit_result would refuse every file_path: nothing can be read from it\. Use a folder of its own, outside any state directory and ~\/\.tender and with no folder named drafts on its path$/;
+const IN_STATE = "is inside this server's state directory";
+const IN_ROOT = "is inside ~/.tender, where Tender keeps the state of every account";
+const UNDER_DRAFTS =
+  "has a folder named drafts on its path, which is the folder of every state directory";
+
+test("a_files_dir_that_nothing_can_be_read_from_is_warned_about", () => {
+  // The write tools read no file from a state directory, from ~/.tender, or from below a folder named
+  // drafts, so a TENDER_FILES_DIR in one of them starts and then refuses every file_path, without a
+  // word as to why. The warning says it once, at start-up.
+  const reason = (env: Record<string, string>) => WARNING.exec(warningFor(env) ?? "")?.[1];
+
+  // Nothing to say about no files directory, or an ordinary one.
+  const files = makeDir(home, "files");
+  expect(filesDirWarning(readConfig(ENV, home), home)).toBeUndefined();
+  expect(warningFor({ TENDER_FILES_DIR: files })).toBeUndefined();
+
+  // In ~/.tender: the default state directory (here and in anything below it), and the root itself.
+  const root = makeDir(home, ".tender");
+  const shared = makeDir(root, "shared");
+  expect(reason({ TENDER_FILES_DIR: shared })).toBe(IN_ROOT);
+  expect(reason({ TENDER_FILES_DIR: root })).toBe(IN_ROOT);
+  const mine = makeDir(makeDir(root, "testnet"), "alice.testnet");
+  expect(reason({ TENDER_FILES_DIR: mine })).toBe(IN_STATE);
+  expect(reason({ TENDER_FILES_DIR: makeDir(mine, "results") })).toBe(IN_STATE);
+
+  // In a state directory that was named, or its drafts folder, wherever it is.
+  const state = makeDir(home, "state");
+  const named = { TENDER_STATE_DIR: state };
+  expect(reason({ ...named, TENDER_FILES_DIR: state })).toBe(IN_STATE);
+  expect(reason({ ...named, TENDER_FILES_DIR: makeDir(state, "results") })).toBe(IN_STATE);
+  expect(reason({ ...named, TENDER_FILES_DIR: makeDir(state, "drafts") })).toBe(IN_STATE);
+  // A state directory that is not there yet counts as it is written, and files beside it are fine.
+  expect(warningFor({ TENDER_STATE_DIR: join(home, "not-yet"), TENDER_FILES_DIR: files })).toBe(
+    undefined,
+  );
+  // A state directory inside the files directory is the other way round: the rest can be read.
+  const wide = makeDir(home, "wide");
+  expect(warningFor({ TENDER_STATE_DIR: join(wide, "state"), TENDER_FILES_DIR: wide })).toBe(
+    undefined,
+  );
+});
+
+test("a_files_dir_below_a_folder_named_drafts_is_warned_about_in_any_letter_case", () => {
+  // The folder is the layout of every store, so it covers the state directory of any server, wherever
+  // it is. The directory itself may be that folder, or lie below it.
+  for (const [at, name] of ["drafts", "Drafts", "DRAFTS"].entries()) {
+    // (A disk may not tell the letter cases apart, so each name gets a parent of its own.)
+    const folder = makeDir(makeDir(home, `in-${at}`), name);
+    const below = makeDir(makeDir(folder, "sub"), "results");
+    for (const dir of [folder, below]) {
+      expect(warningFor({ TENDER_FILES_DIR: dir }), name).toMatch(WARNING);
+      expect(WARNING.exec(warningFor({ TENDER_FILES_DIR: dir }) ?? "")?.[1], name).toBe(
+        UNDER_DRAFTS,
+      );
+    }
+  }
+  // A name that only holds the word is no such folder.
+  for (const name of ["mydrafts", "drafts-old", "draft", "draftsman"]) {
+    const dir = makeDir(home, name);
+    expect(warningFor({ TENDER_FILES_DIR: dir }), name).toBeUndefined();
+  }
+});
+
+test("the_warning_goes_by_where_the_links_lead", () => {
+  // The files directory is kept as its real path, and the state directory is looked up as well.
+  const root = makeDir(home, ".tender");
+  const elsewhere = makeDir(root, "elsewhere");
+  symlinkSync(elsewhere, join(home, "to-state-root"), "dir");
+  expect(warningFor({ TENDER_FILES_DIR: join(home, "to-state-root") })).toMatch(WARNING);
+
+  const real = makeDir(home, "real-state");
+  const results = makeDir(real, "results");
+  symlinkSync(real, join(home, "state-link"), "dir");
+  const env = { TENDER_STATE_DIR: join(home, "state-link"), TENDER_FILES_DIR: results };
+  expect(WARNING.exec(warningFor(env) ?? "")?.[1]).toBe(IN_STATE);
+});
+
+test("the_warning_is_one_line_that_names_the_variable_and_no_path", () => {
+  const root = makeDir(home, ".tender");
+  const secret = makeDir(root, "SECRETFOLDER");
+  const line = warningFor({ TENDER_FILES_DIR: secret }) ?? "";
+
+  expect(line).toMatch(WARNING);
+  expect(line).not.toContain("\n");
+  expect(line).not.toContain(home);
+  expect(line).not.toContain("SECRETFOLDER");
+  // A home that is no path leaves out the default root, and the other rules still hold.
+  const config = readConfig({ ...ENV, TENDER_FILES_DIR: secret }, home);
+  expect(filesDirWarning(config, "")).toBeUndefined();
+  expect(filesDirWarning(config, "relative/home")).toBeUndefined();
+});
+
+test("bin_warns_about_a_files_dir_that_nothing_can_be_read_from", {
+  timeout: 120_000,
+}, async () => {
+  // One line on stderr, before anything else: an API of another contract ends the run right after,
+  // so the chain is never asked.
+  const api = createServer((request, response) => {
+    if (request.url === "/v1/health") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(healthOf("testnet", "other.testnet")));
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((done) => api.listen(0, "127.0.0.1", done));
+  try {
+    const root = makeDir(home, ".tender");
+    const env = {
+      ...ENV,
+      HOME: home,
+      TENDER_API_URL: `http://127.0.0.1:${(api.address() as AddressInfo).port}`,
+      TENDER_FILES_DIR: makeDir(root, "shared"),
+    };
+
+    const warned = await runBin(env);
+    expect(warned.code).toBe(1);
+    expect(warned.stdout).toBe("");
+    const [warning, refusal, rest] = warned.stderr.split("\n");
+    expect(`${warning}\n`).toBe(
+      `tender-mcp: ${warningFor({ TENDER_FILES_DIR: env.TENDER_FILES_DIR })}\n`,
+    );
+    expect(warning).toMatch(/^tender-mcp: TENDER_FILES_DIR is inside ~\/\.tender, /);
+    expect(refusal).toMatch(
+      /^tender-mcp: TENDER_API_URL is an API for the contract other\.testnet/,
+    );
+    expect(rest).toBe("");
+    expect(warned.stderr).not.toContain(home);
+
+    // An ordinary files directory gets the refusal alone.
+    const quiet = await runBin({ ...env, TENDER_FILES_DIR: makeDir(home, "files") });
+    expect(quiet.stderr.split("\n")).toHaveLength(2);
+    expect(quiet.stderr).toMatch(/^tender-mcp: TENDER_API_URL is an API for the contract /);
+  } finally {
+    await new Promise<void>((done) => api.close(() => done()));
+  }
 });
 
 test("a_files_dir_may_be_reached_through_a_link_and_is_kept_as_where_it_leads", () => {

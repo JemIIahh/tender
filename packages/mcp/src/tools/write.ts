@@ -16,6 +16,7 @@ import {
   MAX_RESULT_BYTES,
   NETWORKS,
   type NetworkId,
+  type Phase,
   ProfileSchema,
   PublicCriteriaSchema,
   randomSalt,
@@ -66,10 +67,15 @@ import {
 // contract, and a chain that is started again (each sandbox, a redeploy) hands them out once more.
 // A draft therefore records the contract and the task's creation time (`loadDraft`), and one that
 // records another is not this task's: it is set aside, whole and never deleted, and the task has no
-// draft, with a note to say so. A draft from before that, or from a time the API could not be asked,
-// records less, and the chain is asked instead: a draft that says it is committed (or revealed)
-// while the task is open and the chain holds no such entry is not this task's either, since an
-// entry is never removed from an open task. `reveal_result` confirms the entry before it uploads.
+// draft, with a note to say so. The chain has the last word on that: a draft whose commitment the
+// chain holds as this account's entry in the task is this task's, whatever the API says of when the
+// task was created (an API of another deployment says another), and is never set aside. A draft from
+// before that, or from a time the API could not be asked, records less, and the chain is asked
+// instead: a draft that says it is committed (or revealed) while the task is open and the chain
+// holds no such entry is not this task's either, since an entry is never removed from an open task.
+// Once the task is settled its entries are cleaned up (`cleanup`, which the keeper runs), so then
+// the chain's silence says nothing, and a draft keeps the answers it had, with a note that says why.
+// `reveal_result` confirms the entry before it uploads.
 //
 // MONEY. `deposit`, `withdraw` and `post_task` attach a deposit, which only a full-access key may.
 // With any other key they answer `NEEDS_FULL_ACCESS_KEY` before they upload or send anything. A send
@@ -145,6 +151,12 @@ const REFUSED_FOR_GOOD: ReadonlySet<string> = new Set([
 const MAX_REASON = 300;
 /** What the winners' shares of a pick add up to, in basis points. */
 const BPS_WHOLE = 10_000;
+/**
+ * Why the chain holds no entry for a draft of a settled task: the contract's `cleanup` removes the
+ * entries of a settled task, and the keeper calls it. The answers that a draft gives then say so.
+ */
+const SETTLED_CLEANUP =
+  "the task is settled, and a settled task's entries are cleaned up, so the chain no longer holds this one";
 
 const FULL_ACCESS_ONLY =
   "this tool moves money; run it with a full-access key or set up a delegate key with caps (docs/MCP.md)";
@@ -540,7 +552,8 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
    * The draft of `taskId` that this call may use, or none. A draft that another account made is
    * refused, not returned. A draft that is not this task's (`staleness`) is set aside, whole and
    * kept, and then the task has no draft: `note` says what was done with the file. When it cannot
-   * be told, because the draft records too little or the API is out of reach, the draft stands.
+   * be told, because the draft records too little or the API is out of reach, the draft stands, and
+   * so does one whose commitment the chain holds as this account's entry in the task.
    * `beforeAside` runs once a draft is found to be another task's and before the file is moved, and
    * may refuse the call: a call that is not allowed to go on moves nothing.
    */
@@ -561,6 +574,11 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     }
     const reason = await staleness(draft);
     if (reason === null) return { draft };
+    // The chain has the last word. A commitment binds the task id, this account, the work and a
+    // random salt, so an entry of this account with this draft's commitment proves that the draft
+    // belongs here, whatever the API says of the task. Only an answer that says so counts: a chain
+    // that cannot be asked proves nothing, and the draft is set aside as its record says.
+    if ((await isOnChain(draft)) === true) return { draft };
     beforeAside?.();
     return { draft: null, note: await setAsideNote(draft, reason) };
   }
@@ -623,14 +641,15 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
   }
 
   /**
-   * Whether the API says that the commit window of `taskId` is open. False when it is not, and when
-   * the API cannot say: a decision to commit again is not made on a guess.
+   * The phase the API says `taskId` is in, or null when it cannot say: it is out of reach, or does
+   * not know the task. A decision to commit again is made on "open" and no guess, so null is never
+   * taken for it.
    */
-  async function commitWindowIsOpen(taskId: string): Promise<boolean> {
+  async function taskPhase(taskId: string): Promise<Phase | null> {
     try {
-      return (await api.getTask(BigInt(taskId)))?.task.phase === "open";
+      return (await api.getTask(BigInt(taskId)))?.task.phase ?? null;
     } catch {
-      return false;
+      return null;
     }
   }
 
@@ -1041,8 +1060,10 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "was saved for another task with the same number (another contract, or a chain that was " +
         "started again), or that says it is committed while the chain holds no entry of yours in " +
         "a task that is open, is not used: it is set aside, kept whole, and the answer says so. " +
-        "The draft lives in this server's state directory: two servers on one account's state " +
-        "directory are not supported.",
+        "A draft whose commitment the chain holds as your entry is never set aside. A settled " +
+        "task's entries are cleaned up, so there a draft keeps its answers (ALREADY_REVEALED, " +
+        "already committed). The draft lives in this server's state directory: two servers on " +
+        "one account's state directory are not supported.",
       inputSchema: {
         task_id: TaskId,
         content: z
@@ -1101,23 +1122,31 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         // before drafts were bound to their task can be another task's, and then the chain has no
         // entry of ours for it. While the task is open that cannot be this draft's entry (an entry
         // is never removed from an open task), so the draft is set aside and the commit made afresh.
+        // In a settled task the entries are cleaned up, so an empty chain says nothing about the
+        // draft, and it keeps the answers below, with the reason.
+        let cleaned = "";
         if (
           (draft.committedAt !== undefined || draft.revealedUri !== undefined) &&
           (await isOnChain(draft)) === false
         ) {
-          if (!(await commitWindowIsOpen(task_id))) throw notOnChain(draft, "commit_result");
-          requireKeyFor("commit_result", "commit");
-          const aside = await setAsideNote(
-            draft,
-            "it says that it was committed, and the chain holds no entry of yours in this task " +
-              "with its commitment",
-          );
-          return noting(aside, () => commitNew(task_id, bytes, aside));
+          const phase = await taskPhase(task_id);
+          if (phase === "settled") {
+            cleaned = ` (${SETTLED_CLEANUP})`;
+          } else {
+            if (phase !== "open") throw notOnChain(draft, "commit_result");
+            requireKeyFor("commit_result", "commit");
+            const aside = await setAsideNote(
+              draft,
+              "it says that it was committed, and the chain holds no entry of yours in this task " +
+                "with its commitment",
+            );
+            return noting(aside, () => commitNew(task_id, bytes, aside));
+          }
         }
         if (draft.revealedUri !== undefined) {
           throw new ToolError(
             "ALREADY_REVEALED",
-            `the result for task ${task_id} was revealed already, so there is nothing to commit`,
+            `the result for task ${task_id} was revealed already, so there is nothing to commit${cleaned}`,
           );
         }
         const same = sha256Hex(bytes) === draft.contentHash;
@@ -1126,10 +1155,14 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           throw new ToolError(
             "ALREADY_COMMITTED",
             `task ${task_id} is committed with other content (content_hash ${draft.contentHash}). ` +
-              "This server keeps one result per task and does not replace a commit",
+              `This server keeps one result per task and does not replace a commit${cleaned}`,
           );
         }
-        return commitAnswer(draft, null, "already committed with this content; nothing was sent");
+        return commitAnswer(
+          draft,
+          null,
+          `already committed with this content; nothing was sent${cleaned}`,
+        );
       });
     }),
   );
@@ -1174,12 +1207,17 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     if (draft.dead !== undefined) throw deadError(draft);
     if (draft.revealedUri !== undefined) {
       // The draft says the work is out. A draft that is another task's says so too, and the chain
-      // is asked, when it can be; if it cannot, the draft is believed, as it was.
-      if ((await isOnChain(draft)) === false) throw notOnChain(draft, "reveal_result");
+      // is asked, when it can be; if it cannot, the draft is believed, as it was. A settled task's
+      // entries are cleaned up, so there the chain's silence is no sign of another task's draft.
+      let cleaned = "";
+      if ((await isOnChain(draft)) === false) {
+        if ((await taskPhase(taskId)) !== "settled") throw notOnChain(draft, "reveal_result");
+        cleaned = ` (${SETTLED_CLEANUP})`;
+      }
       return jsonResult({
         uri: draft.revealedUri,
         tx_hash: null,
-        note: "this result was revealed already; nothing was sent",
+        note: `this result was revealed already; nothing was sent${cleaned}`,
       });
     }
     // The work is about to go up and the reveal out, which needs a key that may send it.
@@ -1304,9 +1342,11 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "anything is uploaded. Before it uploads, it checks that the chain holds your entry with " +
         "this draft's commitment (NOT_COMMITTED otherwise, with nothing uploaded). A draft that " +
         "was saved for another task with the same number (another contract, or a chain that was " +
-        "started again) is not used: it is set aside, kept whole, and the answer says so. The " +
-        "draft lives in this server's state directory: two servers on one account's state " +
-        "directory are not supported.",
+        "started again) is not used: it is set aside, kept whole, and the answer says so, unless " +
+        "the chain holds its commitment as your entry. A settled task's entries are cleaned up, " +
+        "so a result that was revealed is still answered as revealed there. The draft lives in " +
+        "this server's state directory: two servers on one account's state directory are not " +
+        "supported.",
       inputSchema: { task_id: TaskId },
       annotations: IDEMPOTENT,
     },

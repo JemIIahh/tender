@@ -1,6 +1,6 @@
 import type { Db } from "@tender/db";
 import { type NetworkId, TenderEventSchema } from "@tender/shared";
-import { type Bot, GrammyError } from "grammy";
+import { type Bot, GrammyError, HttpError } from "grammy";
 import { type Alert, dedupeKey } from "./alerts";
 import { resolveRecipients } from "./recipients";
 import { type RenderContext, renderAlert } from "./render";
@@ -23,26 +23,38 @@ import { type RenderContext, renderAlert } from "./render";
  *   so a notifier that comes back from downtime in the last hour sends the 1 h reminder alone.
  *
  * An alert goes to each chat that `resolveRecipients` names. The notifier asks Telegram to send it
- * at most once per chat: the chat's row in `tg_sent` is claimed before the request and a failed
- * send keeps it, so a restart, or two notifiers at once, can lose a message but never make the
- * notifier send one twice. The claim, not the cursor, makes the notifier safe to restart: a tick
- * that dies halfway is run again from the old cursor, and the alerts it already sent are skipped.
+ * at most once per chat: the chat's row in `tg_sent` is claimed before the request, and kept when
+ * a send fails in a way that leaves it unknown whether Telegram took the message. So a restart, or
+ * two notifiers at once, can lose a message but never make the notifier send one twice. The claim,
+ * not the cursor, makes the notifier safe to restart: a tick that dies halfway is run again from
+ * the old cursor, and the alerts it already sent are skipped.
  *
  * The bot's transport keeps to that. `createBot` sets `autoRetry` to repeat a request only after a
  * flood wait (a 429, which says that Telegram took nothing) of up to a minute, three times at most.
  * A request that failed any other way may have been taken all the same: a connection that broke or
  * timed out, or a 5xx from something in front of Telegram. It is not repeated, so a message whose
- * answer was lost fails here with its claim kept, and is never sent again. A request that hangs
- * gives up after a minute.
+ * answer was lost fails here, and is never sent again. A request that hangs gives up after a minute.
  *
  * What goes wrong, and what the notifier does about it:
  * - A `webUrl` that task links cannot be made from is refused by `startNotifier` before any tick.
  * - An alert that cannot be rendered or addressed (see `deliver`) is logged and dropped, and the
  *   tick goes on. Its recipients are asked for up to three times first: a blip in the database
  *   fails like a row that cannot be read, and an event alert is not looked at again.
- * - A send that fails is logged and not retried; the bot's transport has waited out a flood wait
- *   already, if it was a short one, and fails a longer one at once. A 403 means the chat blocked
- *   the bot, or the bot was kicked: the chat is unlinked, with a line in the log.
+ * - Telegram answers a send with an error about that message, a 400 say. The alert is lost for that
+ *   chat: the claim is kept, and a line that starts `telegram notifier: alert lost:` names the
+ *   alert's kind and task (never a chat or a token), so that losses can be counted. The tick goes
+ *   on with the next chat. A 403 means the chat blocked the bot, or the bot was kicked: the chat is
+ *   unlinked, with a line in the log.
+ * - The transport to Telegram fails. The tick ends there, with an error that the loop logs, so that
+ *   a short outage delays the alerts and does not drop all those the tick would have reached. The
+ *   event cursor stays, and the next tick goes on from it, skipping what was sent. What becomes of
+ *   the alert that was being sent depends on what the failure says (see `sendOnce`):
+ *   - Telegram cannot have taken it: it asked for a longer wait than the bot sits out (a 429), or
+ *     the request never left the machine (connection refused, a DNS failure, an unreachable
+ *     network). The claim is given back, and the next tick sends the alert.
+ *   - Telegram may have taken it: a timeout, a connection that broke after the request went out, a
+ *     5xx. The claim stays and the alert is lost, with the same `alert lost:` line. That is the
+ *     price of at most once, and it is bounded to the one message that was in flight.
  * - A database error stops the tick, which the loop logs. The next tick starts from the old cursor.
  *
  * Times are the contract's: nanoseconds since the Unix epoch. They are bigints here and numeric in
@@ -547,7 +559,7 @@ async function deliver(tick: Tick, alert: Alert): Promise<void> {
     return;
   }
   const key = dedupeKey(alert);
-  for (const chat of chats) await sendOnce(tick, chat, key, text);
+  for (const chat of chats) await sendOnce(tick, chat, alert, key, text);
 }
 
 /**
@@ -568,14 +580,116 @@ async function recipientsOf(db: Db, alert: Alert): Promise<string[]> {
 }
 
 /**
- * Sends `text` to `chat`, if `key` was not claimed for the chat before. The claim is made first and
- * a failed send keeps it, so the notifier asks for an alert to reach a chat at most once.
- *
- * Telegram answers 403 when the user blocked the bot or the bot was kicked from a group. The chat
- * cannot be reached, so its link and its tag watches go, a line in the log says so, and the next
- * alert does not try it. Any other failure is logged, and the tick goes on with the next chat.
+ * What a failed send says about the message:
+ * - `refused`: Telegram answered with an error about this send (a 400, say). It took nothing and
+ *   will not take this, but another send may go through.
+ * - `not_taken`: the transport failed and Telegram cannot have taken the message. It asked for a
+ *   longer wait than the bot sits out (a 429), or the request never left the machine, which only a
+ *   failure to connect shows: a refused connection, a DNS failure, a network that is unreachable.
+ * - `unsure`: the transport failed, or something in front of Telegram answered a 5xx, and the
+ *   message may have been taken all the same: a timeout, a connection that broke after the request
+ *   went out. So is a failure of any other kind, which is not known to be anything else.
  */
-async function sendOnce(tick: Tick, chat: string, key: string, text: string): Promise<void> {
+type SendFailure = "refused" | "not_taken" | "unsure";
+
+/**
+ * The codes of the system errors that node-fetch passes on, and that come before any byte of the
+ * request has left: the connection was refused, the name did not resolve, or there is no route. A
+ * connection that was made and broke later reads `ECONNRESET`, `EPIPE` or a timeout, none of which
+ * is here.
+ */
+const NEVER_LEFT = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EAI_FAIL",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+]);
+
+/** An error's `code`, if it has one that is text. */
+function codeOf(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function failureOf(error: unknown): SendFailure {
+  if (error instanceof GrammyError) {
+    if (error.error_code === 429) return "not_taken";
+    return error.error_code >= 500 ? "unsure" : "refused";
+  }
+  if (error instanceof HttpError) {
+    const code = codeOf(error.error);
+    return code !== undefined && NEVER_LEFT.has(code) ? "not_taken" : "unsure";
+  }
+  return "unsure";
+}
+
+/**
+ * A failed send as a line of the log shows it: the error's name and the code that says what became
+ * of the request, and for the Bot API's own answer its description. Never the text of an error of
+ * the transport: it can quote the request's URL, which holds the bot's token.
+ */
+function labelOf(error: unknown): string {
+  if (error instanceof GrammyError) {
+    return `${error.name} ${error.error_code}: ${error.description}`;
+  }
+  if (error instanceof HttpError) {
+    const code = codeOf(error.error);
+    return code === undefined ? error.name : `${error.name} ${code}`;
+  }
+  return error instanceof Error ? error.name : "a value that is not an Error";
+}
+
+/**
+ * Ends a tick because the transport to Telegram failed. The loop logs the error whole, so it holds
+ * the failure's `labelOf` and nothing of its own text, and it has no `cause`: the failure of the
+ * transport quotes the request's URL, which holds the bot's token.
+ */
+class TransportFailed extends Error {
+  override readonly name = "TransportFailed";
+}
+
+/** The line for an alert that was not delivered and will not be tried again. */
+function logLost(alert: Alert, why: string): void {
+  console.error(`telegram notifier: alert lost: ${alert.kind} for task ${alert.taskId} (${why})`);
+}
+
+/** Gives the claim of `chat` on `key` back. False if the database would not. */
+async function giveBack(tick: Tick, chat: string, key: string): Promise<boolean> {
+  try {
+    await tick.db.query("delete from tg_sent where chat_id = $1 and dedupe_key = $2", [chat, key]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Sends `text` to `chat`, if `key` was not claimed for the chat before. The claim is made first, so
+ * that the notifier asks for an alert to reach a chat at most once. What a failed send does to the
+ * claim and to the tick depends on what the failure says about the message (`failureOf`):
+ *
+ * - Telegram answered 403: the user blocked the bot or the bot was kicked from a group. The chat
+ *   cannot be reached, so its link and its tag watches go, a line in the log says so, and the next
+ *   alert does not try it.
+ * - Any other answer about this message (`refused`): the alert is lost for the chat, with a line
+ *   (`logLost`), and the tick goes on with the next chat.
+ * - `not_taken`: the claim is given back, so that the next tick sends the alert, and the tick ends.
+ *   If the claim cannot be given back the alert is lost, and says so.
+ * - `unsure`: the claim stays and the alert is lost, with a line, and the tick ends. Nothing more
+ *   is claimed until the next tick, so a transport that is down costs the one message in flight.
+ *
+ * The tick ends by throwing `TransportFailed`, which the loop logs and tries again after its wait.
+ */
+async function sendOnce(
+  tick: Tick,
+  chat: string,
+  alert: Alert,
+  key: string,
+  text: string,
+): Promise<void> {
   const claimed = await tick.db.query(
     "insert into tg_sent (chat_id, dedupe_key) values ($1, $2) on conflict do nothing returning 1",
     [chat, key],
@@ -593,8 +707,26 @@ async function sendOnce(tick: Tick, chat: string, key: string, text: string): Pr
       console.error(`telegram notifier: unlinked chat ${chat}: ${error.message}`);
       return;
     }
-    // The message only: a GrammyError also carries the payload, which holds the text sent.
-    const reason = error instanceof Error ? error.message : String(error);
-    console.error(`telegram notifier: could not send ${key} to chat ${chat}: ${reason}`);
+    const failure = failureOf(error);
+    const label = labelOf(error);
+    if (failure === "refused") {
+      logLost(alert, label);
+      return;
+    }
+    if (failure === "not_taken") {
+      if (!(await giveBack(tick, chat, key))) {
+        logLost(alert, `${label}; its claim could not be given back`);
+        throw new TransportFailed(`Telegram did not take a send (${label}); the tick ends here`);
+      }
+      throw new TransportFailed(
+        `Telegram did not take a send (${label}); the tick ends here, and the alert is tried ` +
+          "again on the next",
+      );
+    }
+    logLost(alert, label);
+    throw new TransportFailed(
+      `A send to Telegram failed and may have gone through (${label}); the tick ends here, and ` +
+        "that alert is not sent again",
+    );
   }
 }

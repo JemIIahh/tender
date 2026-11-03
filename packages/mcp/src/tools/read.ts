@@ -128,7 +128,8 @@ async function showOwnEntry(
     } else if (stale !== null) {
       draftError =
         `DRAFT_STALE: the draft saved here for task ${taskId} is not this task's (${stale}), so it ` +
-        "is not shown and no tool will use it. commit_result and reveal_result set it aside, kept whole";
+        "is not shown. commit_result and reveal_result set it aside, kept whole, unless the chain " +
+        "holds its commitment as your entry in this task";
     } else {
       draft = found;
     }

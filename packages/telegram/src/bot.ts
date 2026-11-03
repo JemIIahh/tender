@@ -115,8 +115,10 @@ export function createBot(deps: BotDeps): Bot {
   // connection that broke, or timed out, or a 5xx from something in front of Telegram, after
   // `sendMessage` went through. The notifier claims each send before it makes it and never sends
   // again, to keep to one message per alert, and a transport that repeated such a request behind
-  // its back would undo that. So those failures reach the caller, which loses the message rather
-  // than doubles it. The waits are bounded as well, since the notifier sends one message at a time.
+  // its back would undo that. So those failures reach the caller, which counts the message lost
+  // rather than doubling it (`sendOnce` gives the claim back only when a failure shows that
+  // Telegram took nothing). The waits are bounded as well, since the notifier sends one message at a
+  // time.
   // (grammY's start-up and its long polling retry network errors themselves, apart from this.)
   bot.api.config.use(
     autoRetry({
