@@ -72,6 +72,13 @@ import { redact, type Services, startServices } from "./serve";
  * does not come, the command line says which one was missed, with the last thing the API showed
  * and the last lines of the services and the agents, and exits with 1; it never hangs.
  *
+ * It keeps every file it makes in one temp dir that is new for each run: the key file, the
+ * services' deployments folder and the agents' drafts. A draft is filed under the network, the
+ * account and the task id, and every local chain has the same accounts and starts its tasks at 1.
+ * So the agents never use the store's default folder (`~/.tender`): a draft left there by an
+ * earlier run would be taken for this run's own, its agent would skip the task, and the demo
+ * would fail. Run again, the demo finds nothing of the last run.
+ *
  * `DEMO OK` is the last line, and it comes only after everything the demo started has stopped and
  * its files are gone, and only if the facts the scenario rests on held: alice won with 100, bob
  * scored lower, the reward was paid out whole, and the scorecard is served at the URI the chain
@@ -475,6 +482,7 @@ function launchAgent(
     name: agent.name,
     client,
     api,
+    // In this run's temp dir and never the store's default folder: see the top of this file.
     state: createStateStore(join(o.stateDir, agent.name)),
     // The tags of the reference coder agent: the task is a coding task, a regex.
     tags: AGENTS.coder.tags,
@@ -501,6 +509,7 @@ async function demo(h: Harness): Promise<void> {
       "right answer, bob its stored weak one. No model runs, and neither is an independent entrant.",
   );
 
+  // The demo's own files (keys, deployments folder, drafts) are all in here, new for each run.
   const dir = await mkdtemp(join(tmpdir(), "tender-demo-"));
   h.onExit("remove the temp files", () => rm(dir, { recursive: true, force: true }));
   // Also when the demo is cut short before its steps have run (a second Ctrl-C).
