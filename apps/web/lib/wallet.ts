@@ -34,7 +34,7 @@ import { linkTabs, noTabs, type OpenTabLink, type TabLink } from "./walletTabs";
 
 /** A wallet, as far as this app uses it. near-connect's `NearWalletBase` has all of this. */
 export interface SigningWallet {
-  manifest?: { features?: { signMessage?: boolean } };
+  manifest?: { features?: { signMessage?: boolean; signAndSendTransactions?: boolean } };
   signAndSendTransactions(params: {
     transactions: TransactionRequest[];
     signerId?: string;
@@ -52,6 +52,19 @@ export interface TransactionRequest {
   receiverId: string;
   actions: ConnectorFunctionCallAction[];
 }
+
+/**
+ * The actions that make an account, in near-connect's shape (0.12.0): "Add an agent" creates the
+ * agent's account under the person's, funds it, and gives it the key the agent made, in one
+ * transaction to the new account. Nothing else in the app sends them.
+ */
+export type AccountAction =
+  | { type: "CreateAccount" }
+  | { type: "Transfer"; params: { deposit: string } }
+  | {
+      type: "AddKey";
+      params: { publicKey: string; accessKey: { permission: "FullAccess" } };
+    };
 
 /** A wallet and the account it is connected as. */
 export interface Session {
@@ -116,6 +129,21 @@ export interface WalletActions {
   signMessage(input: SignMessageInput): Promise<SignedMessageResult>;
 }
 
+/** What "Add an agent" asks of the wallet, beyond the calls every page sends (`useAccountActions`). */
+export interface AccountActions {
+  /**
+   * Whether the connected wallet says it signs and sends whole transactions, which making an
+   * account needs: a near-connect wallet's manifest says so (`signAndSendTransactions`), and the
+   * sandbox's dev wallet, which sends function calls only, does not.
+   */
+  canSend(): boolean;
+  /**
+   * Has the wallet sign and send one transaction of `actions` to `receiverId`, and gives back its
+   * hash. Throws as `signAndSend` does, and `WalletCannotSign` if the wallet does not say it can.
+   */
+  send(receiverId: string, actions: AccountAction[]): Promise<string>;
+}
+
 export type UseWallet = WalletState & WalletActions;
 
 /**
@@ -149,6 +177,11 @@ const isString = (value: unknown): value is string => typeof value === "string";
 /** Whether the wallet says in its manifest that it can sign a message. */
 function canSign(wallet: SigningWallet): boolean {
   return wallet.manifest?.features?.signMessage === true;
+}
+
+/** Whether the wallet says in its manifest that it signs and sends whole transactions. */
+function sendsTransactions(wallet: SigningWallet): boolean {
+  return wallet.manifest?.features?.signAndSendTransactions === true;
 }
 
 /** What the contract panicked with, such as `E_FUNDS`, from the `Failure` of a final status. */
@@ -431,6 +464,31 @@ export function createWalletStore(
     return readOutcomes(result, transactions.length);
   }
 
+  function canSendAccountActions(): boolean {
+    return session !== null && sendsTransactions(session.wallet);
+  }
+
+  async function sendAccountActions(receiverId: string, actions: AccountAction[]): Promise<string> {
+    if (actions.length === 0) throw new RangeError("there are no actions to send");
+    const current = session;
+    if (current === null) throw new WalletNotConnected();
+    if (!sendsTransactions(current.wallet)) throw new WalletCannotSign();
+    let result: unknown;
+    try {
+      result = await current.wallet.signAndSendTransactions({
+        // `TransactionRequest` names the function calls the rest of the app sends. A wallet takes
+        // every action of near-connect's types, and these are among them.
+        transactions: [{ receiverId, actions }] as unknown as TransactionRequest[],
+        signerId: current.accountId,
+      });
+    } catch (cause) {
+      throw new WalletError("send", cause);
+    }
+    const [hash] = readOutcomes(result, 1).txHashes;
+    if (hash === undefined) throw new WalletResultUnreadable("transaction");
+    return hash;
+  }
+
   async function signMessage(input: SignMessageInput): Promise<SignedMessageResult> {
     const current = session;
     if (current === null) throw new WalletNotConnected();
@@ -458,6 +516,8 @@ export function createWalletStore(
     disconnect,
     signAndSend,
     signMessage,
+    canSendAccountActions,
+    sendAccountActions,
   };
 }
 
@@ -605,4 +665,17 @@ export function useWalletStore(store: WalletStore): UseWallet {
 /** The connected wallet of this page, for a client component. */
 export function useWallet(): UseWallet {
   return useWalletStore(walletStore);
+}
+
+/** The account actions of `store`'s wallet. */
+export function accountActionsOf(store: WalletStore): AccountActions {
+  return { canSend: store.canSendAccountActions, send: store.sendAccountActions };
+}
+
+/**
+ * The account actions of this page's wallet. A component that uses them also calls `useWallet`,
+ * which starts the store and renders again when the account changes.
+ */
+export function useAccountActions(): AccountActions {
+  return accountActionsOf(walletStore);
 }

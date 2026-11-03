@@ -120,6 +120,13 @@ function HeldoutDownload({ file, verifier }: { file: Uint8Array; verifier: strin
   );
 }
 
+/** A group of the terms: a box with a label in mono capitals over its rows. */
+const GROUP = "grid min-w-0 content-start gap-4 rounded-xl border border-line bg-ink p-4 sm:p-5";
+const GROUP_LABEL =
+  "flex items-center gap-2 font-mono text-[10.5px] tracking-[0.16em] text-muted uppercase before:size-1.5 before:rounded-full before:bg-seal before:content-['']";
+const TERMS =
+  "grid grid-cols-1 gap-x-6 gap-y-1 sm:grid-cols-[auto_minmax(0,1fr)] sm:gap-y-3 [&>dd]:mb-2 sm:[&>dd]:mb-0";
+
 function Row({ id, label, children }: { id: string; label: string; children: ReactNode }) {
   return (
     <>
@@ -222,49 +229,68 @@ export function ReviewStep(props: {
     <div className="grid gap-6">
       <p className="text-sm text-muted">Once posted, the terms can't change.</p>
 
-      <dl className="grid grid-cols-1 gap-x-6 gap-y-1 rounded-xl border border-line bg-ink p-4 sm:grid-cols-[auto_minmax(0,1fr)] sm:gap-y-3 sm:p-5 [&>dd]:mb-2 sm:[&>dd]:mb-0">
-        <Row id="review-title" label="Title">
-          {form.title.trim()}
-        </Row>
-        <Row id="review-reward" label="Reward">
-          {reward === null ? "—" : describeAmount(reward, tokenId)}
-          {` · Tender keeps ${formatBps(limits.feeBps)} when it is paid out.`}
-        </Row>
-        <Row id="review-funding" label="Paid from">
-          {paidFrom}
-        </Row>
-        {funding === null || funding.storageTopUp === 0n ? null : (
-          <Row id="review-storage" label="Storage">
-            {`Adds ${describeNear(funding.storageTopUp)} from your wallet first.`}
-          </Row>
-        )}
-        <Row id="review-answer" label="Answers">
-          {`${FORMAT_LABEL[form.outputFormat]}, up to ${Number(form.maxBytes.trim()).toLocaleString("en-US")} bytes`}
-        </Row>
-        <Row id="review-checks" label="Checks">
-          {`${kind?.label ?? form.kind}, pass mark ${form.minScore.trim()} of 100`}
-        </Row>
-        <Row id="review-split" label="Agents see">
-          {counts.seen}
-        </Row>
-        <Row id="review-heldout" label="Kept secret">
-          {counts.kept}
-        </Row>
-        <Row id="review-prize" label="Prize">
-          Winner takes all
-        </Row>
-        <Row id="review-windows" label="Time">
-          {windows === null
-            ? "—"
-            : `${windowsText(windows)}. ${spanText(totalSecs(windows))} in all.`}
-        </Row>
-        <Row id="review-verifier" label="Picks the winner">
-          {verifierText}
-        </Row>
-        <Row id="review-account" label="Posting as">
-          {accountId ?? "Not connected"}
-        </Row>
-      </dl>
+      {/* The terms in two groups: what agents are asked and how they are judged, then the money,
+          who picks and who posts. */}
+      <div className="grid gap-4 lg:grid-cols-2 lg:items-start">
+        <div className={GROUP}>
+          <p className={GROUP_LABEL}>The task</p>
+          <dl className={TERMS}>
+            <Row id="review-title" label="Title">
+              {form.title.trim()}
+            </Row>
+            <Row id="review-answer" label="Answers">
+              {`${FORMAT_LABEL[form.outputFormat]}, up to ${Number(form.maxBytes.trim()).toLocaleString("en-US")} bytes`}
+            </Row>
+            <Row id="review-checks" label="Checks">
+              {`${kind?.label ?? form.kind}, pass mark ${form.minScore.trim()} of 100`}
+            </Row>
+            <Row id="review-split" label="Agents see">
+              {counts.seen}
+            </Row>
+            <Row id="review-heldout" label="Kept secret">
+              {counts.kept}
+            </Row>
+            <Row id="review-windows" label="Time">
+              {windows === null
+                ? "—"
+                : `${windowsText(windows)}. ${spanText(totalSecs(windows))} in all.`}
+            </Row>
+          </dl>
+        </div>
+        <div className={GROUP}>
+          <p className={GROUP_LABEL}>The reward</p>
+          {/* The amount once more, large, for the eye: the row under it says it for everyone. */}
+          <p
+            aria-hidden="true"
+            className="text-3xl leading-tight font-medium tracking-[-0.02em] text-bone tabular-nums wrap-anywhere"
+          >
+            {reward === null ? "—" : describeAmount(reward, tokenId)}
+          </p>
+          <dl className={TERMS}>
+            <Row id="review-reward" label="Reward">
+              {reward === null ? "—" : describeAmount(reward, tokenId)}
+              {` · Tender keeps ${formatBps(limits.feeBps)} when it is paid out.`}
+            </Row>
+            <Row id="review-funding" label="Paid from">
+              {paidFrom}
+            </Row>
+            {funding === null || funding.storageTopUp === 0n ? null : (
+              <Row id="review-storage" label="Storage">
+                {`Adds ${describeNear(funding.storageTopUp)} from your wallet first.`}
+              </Row>
+            )}
+            <Row id="review-prize" label="Prize">
+              Winner takes all
+            </Row>
+            <Row id="review-verifier" label="Picks the winner">
+              {verifierText}
+            </Row>
+            <Row id="review-account" label="Posting as">
+              {accountId ?? "Not connected"}
+            </Row>
+          </dl>
+        </div>
+      </div>
 
       {judgePicks || heldout === null ? null : (
         <HeldoutDownload

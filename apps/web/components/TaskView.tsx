@@ -9,6 +9,7 @@ import {
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { formatBps } from "../lib/bps";
 import { useNowNs } from "../lib/clock";
 import { config } from "../lib/config";
 import { UNTITLED_TASK } from "../lib/copy";
@@ -180,6 +181,9 @@ function ReadyView({
     <article className="mx-auto grid w-full max-w-4xl gap-5">
       <header className="grid gap-5 pb-3">
         <p className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <span className={EYEBROW}>
+            Task <span className="text-seal">&gt;</span>
+          </span>
           <PhaseChip phase={phase} />
           <span className={EYEBROW}>#{task.id}</span>
           {task.category === null ? null : <span className={EYEBROW}>{task.category}</span>}
@@ -187,14 +191,29 @@ function ReadyView({
         <h1 className="text-3xl leading-[1.08] font-semibold tracking-[-0.03em] text-bone wrap-anywhere sm:text-[2.6rem]">
           {task.title ?? UNTITLED_TASK}
         </h1>
-        <div className="grid gap-px overflow-hidden rounded-2xl border border-line bg-line sm:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)]">
-          <div className="grid content-start gap-2 bg-panel p-5">
+        {/* The task's figures side by side, as the board's cards and the landing's are. */}
+        <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-line bg-line lg:grid-cols-[minmax(0,1.3fr)_minmax(0,0.8fr)_minmax(0,0.8fr)_minmax(0,1.5fr)]">
+          <div className="col-span-2 grid content-start gap-2 bg-panel p-5 sm:col-span-1">
             <p className={FACT_LABEL}>Reward</p>
             <p className="text-2xl leading-tight font-medium tracking-[-0.02em] text-bone tabular-nums">
               <Amount value={task.reward} token={task.token} />
             </p>
           </div>
           <div className="grid content-start gap-2 bg-panel p-5">
+            <p className={FACT_LABEL}>Entries</p>
+            <p className="text-2xl leading-tight font-medium tracking-[-0.02em] text-bone tabular-nums wrap-anywhere">
+              {task.commit_count}
+            </p>
+            <p className="text-[13px] text-muted">{task.reveal_count} revealed</p>
+          </div>
+          <div className="grid content-start gap-2 bg-panel p-5">
+            <p className={FACT_LABEL}>Platform fee</p>
+            <p className="text-2xl leading-tight font-medium tracking-[-0.02em] text-bone tabular-nums">
+              {formatBps(task.fee_bps)}
+            </p>
+            <p className="text-[13px] text-muted">Of the reward, when it is paid out</p>
+          </div>
+          <div className="col-span-2 grid content-start gap-2 bg-panel p-5 sm:col-span-1">
             <p className={FACT_LABEL}>Posted by</p>
             <p data-testid="poster" className="flex min-w-0 items-center gap-3">
               <Avatar account={task.poster} size={34} />

@@ -33,6 +33,7 @@ import {
 import { useWallet } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErrors";
 import { Amount } from "./Amount";
+import { Avatar } from "./Avatar";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
 import { CARD, FACT_LABEL, FIELD, NOTICE, PANEL, PANEL_TITLE, PRIMARY, SECONDARY } from "./ui";
@@ -109,14 +110,15 @@ function BalancesSection({ rows }: { rows: TokenRow[] }) {
       {rows.length === 0 ? (
         <p className="text-sm text-muted">Tender lists no tokens yet.</p>
       ) : (
-        <ul className="grid gap-3 sm:grid-cols-2">
+        <ul className="grid gap-3">
           {rows.map((row) => (
             <li
               key={row.token}
               data-testid="token-row"
-              className="grid min-w-0 gap-3 rounded-xl border border-line bg-ink p-4"
+              className="grid min-w-0 gap-3 rounded-xl border border-line bg-ink p-4 sm:p-5"
             >
-              <span className="font-mono text-xs text-muted wrap-anywhere">
+              <span className="flex min-w-0 items-center gap-2 font-mono text-xs text-muted wrap-anywhere">
+                <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-seal" />
                 {row.token}
                 {row.enabled ? "" : " (not taking deposits)"}
               </span>
@@ -124,14 +126,14 @@ function BalancesSection({ rows }: { rows: TokenRow[] }) {
                 <dt className={`${FACT_LABEL} row-start-1`}>In your vault</dt>
                 <dd
                   data-testid="vault-balance"
-                  className="text-lg text-bone tabular-nums wrap-anywhere"
+                  className="text-xl leading-tight font-medium tracking-[-0.02em] text-bone tabular-nums wrap-anywhere sm:text-2xl"
                 >
                   <Amount value={row.vault.toString()} token={row.token} />
                 </dd>
                 <dt className={`${FACT_LABEL} row-start-1`}>In your wallet</dt>
                 <dd
                   data-testid="wallet-balance"
-                  className="text-lg text-bone tabular-nums wrap-anywhere"
+                  className="text-xl leading-tight tracking-[-0.02em] text-muted tabular-nums wrap-anywhere sm:text-2xl"
                 >
                   <Amount value={row.wallet?.toString() ?? null} token={row.token} />
                 </dd>
@@ -198,15 +200,25 @@ function StorageSection({
         </>
       ) : (
         <>
-          <dl className="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-6 gap-y-2 text-sm">
-            <dt className={FACT_LABEL}>Deposited</dt>
-            <dd data-testid="storage-total" className="text-bone">
-              {describeNear(storage.total)}
-            </dd>
-            <dt className={FACT_LABEL}>Free to take back</dt>
-            <dd data-testid="storage-available" className="text-bone">
-              {describeNear(storage.available)}
-            </dd>
+          <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line bg-line">
+            <div className="grid content-start gap-1.5 bg-ink p-4">
+              <dt className={FACT_LABEL}>Deposited</dt>
+              <dd
+                data-testid="storage-total"
+                className="text-lg text-bone tabular-nums wrap-anywhere"
+              >
+                {describeNear(storage.total)}
+              </dd>
+            </div>
+            <div className="grid content-start gap-1.5 bg-ink p-4">
+              <dt className={FACT_LABEL}>Free to take back</dt>
+              <dd
+                data-testid="storage-available"
+                className="text-lg text-bone tabular-nums wrap-anywhere"
+              >
+                {describeNear(storage.available)}
+              </dd>
+            </div>
           </dl>
           {/* `aria-disabled` does not stop a press, so the handler has the same condition. */}
           <button
@@ -552,9 +564,16 @@ export function WalletView({
     notice?.action === action ? <NoticeLine notice={notice} /> : null;
 
   return (
-    <div className="mx-auto grid w-full max-w-4xl gap-5">
+    <div className="mx-auto grid w-full max-w-6xl gap-5">
       <div className="pb-3">
-        <PageHead eyebrow="Account" title="Wallet" />
+        <PageHead
+          eyebrow="Account"
+          title="Wallet"
+          art={{ name: "escrow", focus: { x: 0.6, y: 0.52, scale: 0.46 } }}
+        >
+          Your vault with Tender: the tasks you post are paid from it, and what you win is paid into
+          it.
+        </PageHead>
       </div>
 
       <section className={`${CARD} grid gap-4 p-5 sm:p-6`}>
@@ -587,7 +606,8 @@ export function WalletView({
           </>
         ) : (
           <>
-            <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+            <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+              <Avatar account={accountId} size={34} />
               <span className="text-sm text-muted">Connected as</span>
               <span data-testid="account-id" className="font-mono text-sm text-bone wrap-anywhere">
                 {accountId}
@@ -638,56 +658,60 @@ export function WalletView({
             />
           )}
 
-          <StorageSection
-            storage={panel.data.storage}
-            running={running}
-            notices={
-              <>
-                {noticeFor("setup")}
-                {noticeFor("storage")}
-              </>
-            }
-            onSetUp={setUp}
-            onWithdraw={takeBackStorage}
-          />
+          <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)] lg:items-start">
+            <StorageSection
+              storage={panel.data.storage}
+              running={running}
+              notices={
+                <>
+                  {noticeFor("setup")}
+                  {noticeFor("storage")}
+                </>
+              }
+              onSetUp={setUp}
+              onWithdraw={takeBackStorage}
+            />
 
-          <BalancesSection rows={panel.data.rows} />
+            <BalancesSection rows={panel.data.rows} />
+          </div>
 
-          <AmountForm
-            title="Add funds"
-            intro="Move tokens from your wallet into your vault. Tasks you post are paid from the vault."
-            rows={panel.data.rows.filter((row) => row.enabled)}
-            source="wallet"
-            unavailable={
-              panel.data.storage === null
-                ? "Set up your account first."
-                : panel.data.rows.some((row) => row.enabled)
+          <div className="grid gap-5 lg:grid-cols-2 lg:items-start">
+            <AmountForm
+              title="Add funds"
+              intro="Move tokens from your wallet into your vault. Tasks you post are paid from the vault."
+              rows={panel.data.rows.filter((row) => row.enabled)}
+              source="wallet"
+              unavailable={
+                panel.data.storage === null
+                  ? "Set up your account first."
+                  : panel.data.rows.some((row) => row.enabled)
+                    ? null
+                    : "Tender takes no deposits right now."
+              }
+              submitLabel="Add funds"
+              running={running === "deposit"}
+              anyRunning={running !== null}
+              onSubmit={addFunds}
+              notice={noticeFor("deposit")}
+            />
+
+            <AmountForm
+              title="Withdraw"
+              intro="Move tokens from your vault back to your wallet. If the token hasn't registered your account, that happens first, in the same approval, for 0.00125 NEAR."
+              rows={panel.data.rows.filter((row) => row.vault > 0n)}
+              source="vault"
+              unavailable={
+                panel.data.rows.some((row) => row.vault > 0n)
                   ? null
-                  : "Tender takes no deposits right now."
-            }
-            submitLabel="Add funds"
-            running={running === "deposit"}
-            anyRunning={running !== null}
-            onSubmit={addFunds}
-            notice={noticeFor("deposit")}
-          />
-
-          <AmountForm
-            title="Withdraw"
-            intro="Move tokens from your vault back to your wallet. If the token hasn't registered your account, that happens first, in the same approval, for 0.00125 NEAR."
-            rows={panel.data.rows.filter((row) => row.vault > 0n)}
-            source="vault"
-            unavailable={
-              panel.data.rows.some((row) => row.vault > 0n)
-                ? null
-                : "There is nothing in your vault to withdraw."
-            }
-            submitLabel="Withdraw"
-            running={running === "withdraw"}
-            anyRunning={running !== null}
-            onSubmit={withdraw}
-            notice={noticeFor("withdraw")}
-          />
+                  : "There is nothing in your vault to withdraw."
+              }
+              submitLabel="Withdraw"
+              running={running === "withdraw"}
+              anyRunning={running !== null}
+              onSubmit={withdraw}
+              notice={noticeFor("withdraw")}
+            />
+          </div>
         </>
       )}
     </div>

@@ -12,6 +12,9 @@ export { PRIMARY, SECONDARY } from "../ui";
 
 const CONTROL = FIELD;
 
+/** A field's label, in the mono capitals of the app's labels, in bone: it is read before typing. */
+const LABEL = "font-mono text-[11px] tracking-[0.14em] text-bone uppercase";
+
 /** A box inside a step: a part of the form that belongs together. */
 export const BOX = "grid min-w-0 content-start gap-3 rounded-xl border border-line bg-ink p-4";
 
@@ -94,7 +97,7 @@ function Labelled({
   const id = `post-${name}`;
   return (
     <div className="grid gap-1.5">
-      <label htmlFor={id} className="text-[15px] font-medium text-bone">
+      <label htmlFor={id} className={LABEL}>
         {label}
       </label>
       {help === undefined ? null : (
@@ -225,7 +228,7 @@ export function RadioGroup<T extends string>({
       aria-describedby={error === undefined ? undefined : `${id}-error`}
       className="grid min-w-0 gap-2"
     >
-      <legend className="mb-1 text-[15px] font-medium text-bone">{legend}</legend>
+      <legend className={`mb-1.5 ${LABEL}`}>{legend}</legend>
       {options.map((option) => (
         <label
           key={option.value}

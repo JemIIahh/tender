@@ -106,3 +106,79 @@ export async function view<T>(contractId: string, method: string, args: object =
     throw new RpcError(`${method} returned text that is not JSON`);
   }
 }
+
+// ---- Accounts and their keys --------------------------------------------------------------------
+
+/**
+ * A `query` of the node at the last final block: its `result`, or the name of the error it gave in
+ * its place (`UNKNOWN_ACCOUNT`, `UNKNOWN_ACCESS_KEY`...), which is how a node says "there is none".
+ * An older node says so in words only, in `data` or in the result's `error`, and those are read too.
+ */
+async function query(
+  params: Record<string, string>,
+): Promise<{ result: Record<string, unknown> } | { missing: string }> {
+  const request = {
+    jsonrpc: "2.0",
+    id: "tender-web",
+    method: "query",
+    params: { ...params, finality: "final" },
+  };
+  const { ok, status, text } = await withTimeout(TIMEOUT_MS, async (signal) => {
+    const res = await fetch(config.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+      signal,
+    });
+    return { ok: res.ok, status: res.status, text: await res.text() };
+  });
+  let answer: unknown;
+  try {
+    answer = JSON.parse(text);
+  } catch {
+    throw new RpcError(
+      ok ? "the RPC node's answer is not JSON" : `the RPC node answered with status ${status}`,
+    );
+  }
+  const body = asRecord(answer);
+  const error = asRecord(body?.error);
+  if (error !== undefined) {
+    const cause = asRecord(error.cause);
+    const name = typeof cause?.name === "string" ? cause.name : "";
+    const words = `${String(error.data ?? "")} ${String(error.message ?? "")}`;
+    if (name.startsWith("UNKNOWN_") || /does not exist/.test(words)) return { missing: name };
+    throw new RpcError(describeNodeError(error));
+  }
+  if (!ok) throw new RpcError(`the RPC node answered with status ${status}`);
+  const result = asRecord(body?.result);
+  if (result === undefined) throw new RpcError("the RPC node's answer holds no result");
+  if (typeof result.error === "string") {
+    if (/does not exist/.test(result.error)) return { missing: "" };
+    throw new RpcError(result.error);
+  }
+  return { result };
+}
+
+/** Whether `accountId` exists on the chain now (`view_account`). */
+export async function accountExists(accountId: string): Promise<boolean> {
+  const answer = await query({ request_type: "view_account", account_id: accountId });
+  return "result" in answer;
+}
+
+/**
+ * What the chain says of `accountId` and `publicKey`: no such account, an account without that key,
+ * or an account that has it as a full-access key, which is what "Add an agent" gives it.
+ */
+export async function accountKeyState(
+  accountId: string,
+  publicKey: string,
+): Promise<"missing" | "other-keys" | "has-key"> {
+  if (!(await accountExists(accountId))) return "missing";
+  const answer = await query({
+    request_type: "view_access_key",
+    account_id: accountId,
+    public_key: publicKey,
+  });
+  if ("missing" in answer) return "other-keys";
+  return answer.result.permission === "FullAccess" ? "has-key" : "other-keys";
+}

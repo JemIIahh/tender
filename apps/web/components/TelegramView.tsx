@@ -11,8 +11,9 @@ import { type Told, toldFor } from "../lib/told";
 import { useWaitedLong } from "../lib/waiting";
 import { useWallet } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErrors";
+import { Avatar } from "./Avatar";
 import { PageHead } from "./PageHead";
-import { CARD, NOTICE, PRIMARY, SECONDARY, TEXT_LINK } from "./ui";
+import { CARD, NOTICE, PANEL_TITLE, PRIMARY, SECONDARY, TEXT_LINK } from "./ui";
 
 // The Telegram page: what the alerts are, and one button that links this account to the Tender bot.
 // The button connects the wallet, and then signs in to the API (if the page has no token yet), asks
@@ -191,24 +192,36 @@ export function TelegramView() {
         eyebrow="Account"
         title="Telegram alerts"
         art={{ name: "signal", focus: { x: 0.6, y: 0.55, scale: 0.42 } }}
-      />
+      >
+        Tender's bot, in a Telegram chat of your own.
+      </PageHead>
 
       <ul data-testid="alert-lines" className="grid gap-3 sm:grid-cols-3">
         {[
-          "Get messages about tasks you posted or your agents entered.",
-          "Send /watch research in the chat for new tasks with that tag.",
-          "Your wallet signs a message: no transaction, no fee.",
-        ].map((line) => (
-          <li key={line} className={`${CARD} flex gap-3 p-5 text-[15px] leading-relaxed text-bone`}>
-            <span aria-hidden="true" className="font-mono text-seal">
-              &gt;
-            </span>
-            {line}
+          {
+            label: "Your tasks",
+            line: "Get messages about tasks you posted or your agents entered.",
+          },
+          {
+            label: "A tag to watch",
+            line: "Send /watch research in the chat for new tasks with that tag.",
+          },
+          { label: "No fee", line: "Your wallet signs a message: no transaction, no fee." },
+        ].map(({ label, line }, index) => (
+          <li key={line} className={`${CARD} grid content-start gap-4 p-5`}>
+            <p className="flex items-center justify-between gap-3 font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase">
+              {label}
+              <span aria-hidden="true" className="text-seal">
+                0{index + 1}
+              </span>
+            </p>
+            <p className="text-[15px] leading-relaxed text-bone">{line}</p>
           </li>
         ))}
       </ul>
 
       <section className={`${CARD} grid gap-4 p-5 sm:p-6`}>
+        <h2 className={PANEL_TITLE}>Link your chat</h2>
         {!ready ? (
           <p role="status" className="text-sm text-muted">
             Checking for your wallet…
@@ -218,7 +231,8 @@ export function TelegramView() {
             {accountId === null ? (
               <p className="text-sm text-muted">Connect a wallet to link Telegram.</p>
             ) : (
-              <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+              <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+                <Avatar account={accountId} size={34} />
                 <span className="text-sm text-muted">Connected as</span>
                 <span
                   data-testid="account-id"

@@ -8,7 +8,7 @@ import type { ReactNode } from "react";
 // that adds a page does not have to touch the shell. Until it does, its link leads to Next's own
 // "not found" page.
 
-type Icon = "market" | "post" | "agents" | "wallet" | "telegram";
+type Icon = "market" | "post" | "agents" | "mine" | "earnings" | "wallet" | "telegram";
 
 interface Item {
   href: string;
@@ -28,6 +28,8 @@ const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = 
   {
     title: "Account",
     items: [
+      { href: "/my-agents", label: "My agents", icon: "mine" },
+      { href: "/earnings", label: "Earnings", icon: "earnings" },
       { href: "/wallet", label: "Wallet", icon: "wallet" },
       { href: "/telegram", label: "Telegram", icon: "telegram" },
     ],
@@ -59,6 +61,19 @@ const ICONS: Record<Icon, ReactNode> = {
     <>
       <circle cx="8" cy="5.5" r="2.6" />
       <path d="M3 13.5c.6-2.6 2.6-4 5-4s4.4 1.4 5 4" />
+    </>
+  ),
+  mine: (
+    <>
+      <circle cx="6" cy="5.5" r="2.3" />
+      <path d="M1.8 13c.5-2.3 2.2-3.6 4.2-3.6s3.7 1.3 4.2 3.6" />
+      <path d="M10.6 3.4a2.3 2.3 0 0 1 0 4.3M12 9.6c1.2.5 2 1.6 2.3 3.4" />
+    </>
+  ),
+  earnings: (
+    <>
+      <path d="M2.5 13.5h11" />
+      <path d="M4 11V8.5M7 11V6M10 11V7.5M13 11V4" />
     </>
   ),
   wallet: (
