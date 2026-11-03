@@ -593,8 +593,7 @@ function answering(
 
 /**
  * What `checkAgainstChain` makes of `chain`: whether it went through, the refusal if there is one,
- * and why it waited each time. It waits 1 to 2 ms, and a cursor ahead of the node is refused after
- * `aheadMs`, 20 ms unless given.
+ * and why it waited each time. It waits 1 to 2 ms.
  */
 async function againstChain(
   chain: ReconcileChain,
@@ -604,7 +603,6 @@ async function againstChain(
   const outcome = await checkAgainstChain(db, chain, {
     retryMs: 1,
     longestMs: 2,
-    aheadMs: 20,
     onWait: (why) => waits.push(why),
     ...over,
   }).then(
@@ -722,22 +720,26 @@ test("a_node_that_lags_the_index_does_not_refuse_it", async () => {
   expect({ ok: near.ok, waits: near.waits }).toEqual({ ok: true, waits: [] });
 });
 
-test("a_count_below_the_highest_task_refuses_once_a_node_past_the_cursor_says_so", async () => {
+test("a_count_below_the_highest_task_refuses_once_two_reads_in_a_row_past_the_cursor_say_so", async () => {
   await setCursor(TESTNET_CURSOR, 100n);
   await indexTask(7);
-  // 20 blocks past the cursor: the node has seen every block the index took, and no task of it.
-  const sure = answering([120n], [3n]);
+  // 20 blocks past the cursor: the node has seen every block the index took, and no task of it. It
+  // says so on one read, and is asked again; the refusal comes when the second read agrees.
+  const sure = answering([120n, 121n], [3n, 3n]);
   const { ok, failure, waits } = await againstChain(sure.chain);
   expect(ok).toBeUndefined();
   expect(failure).toBeInstanceOf(IndexerError);
-  expect(waits).toEqual([]);
-  expect(sure.asks).toEqual({ final: 1, count: 1 });
+  expect(waits).toHaveLength(1);
+  expect(waits[0]).toBe(
+    "the node counts 3 tasks, fewer than the 7 the database holds, though its final block, 120, is past the last block the index took, 100: reading again before the database is taken for another deploy's",
+  );
+  expect(sure.asks).toEqual({ final: 2, count: 2 });
   const words = failure?.message ?? "";
   expect(words).toContain(
     `the database holds task 7, but ${FIXTURE_CONTRACT} has made 3 on testnet`,
   );
   expect(words).toContain(
-    "as read at its final block 120, past the last block the index took (100)",
+    "as read at its final block 121, past the last block the index took (100), on 2 reads in a row",
   );
   expect(words).toContain("one database per contract deploy");
   // The causes come in order, the node first, and the advice is never to discard the database.
@@ -750,14 +752,40 @@ test("a_count_below_the_highest_task_refuses_once_a_node_past_the_cursor_says_so
   expect(words).toContain("keep the old one");
   expect(words).not.toMatch(/discard|throw .* away|wipe|reset/i);
 
-  // One block short of that, the node may be behind: it is asked again.
-  const short = answering([119n, 119n], [3n]);
+  // One odd read does not refuse it: the node that said 3 says 7 the next time, as a load-balanced
+  // RPC does when two of its nodes are some blocks apart.
+  const odd = answering([120n, 120n], [3n, 7n]);
+  const passed = await againstChain(odd.chain);
+  expect({ ok: passed.ok, failure: passed.failure }).toEqual({ ok: true, failure: undefined });
+  expect(passed.waits).toHaveLength(1);
+  expect(odd.asks).toEqual({ final: 2, count: 2 });
+
+  // The two reads are in a row: a round that does not find the count short, because the node is
+  // not yet past the cursor, or a read that fails, starts the tally again.
+  const between = answering([120n, 110n, 120n, 120n], [3n]);
+  const nearby = await againstChain(between.chain);
+  expect(nearby.failure).toBeInstanceOf(IndexerError);
+  expect(between.asks).toEqual({ final: 4, count: 4 });
+  const down = new Error("ECONNRESET");
+  const failing = answering([120n, down, 120n, 120n], [3n]);
+  const flaky = await againstChain(failing.chain);
+  expect(flaky.failure).toBeInstanceOf(IndexerError);
+  expect(failing.asks).toEqual({ final: 4, count: 3 });
+  expect(flaky.waits).toHaveLength(3);
+
+  // One block short of the skew, the node may be behind: it is asked again, and never refused.
+  const short = answering([119n], [3n]);
   const waiting = new AbortController();
+  let told = 0;
   const asked = await againstChain(short.chain, {
     signal: waiting.signal,
-    onWait: () => waiting.abort(),
+    onWait: () => {
+      told += 1;
+      if (told === 6) waiting.abort();
+    },
   });
   expect({ ok: asked.ok, failure: asked.failure }).toEqual({ ok: false, failure: undefined });
+  expect(short.asks.final).toBe(6);
 });
 
 test("on_the_sandbox_the_node_is_the_source_and_there_is_no_skew", async () => {
@@ -765,52 +793,106 @@ test("on_the_sandbox_the_node_is_the_source_and_there_is_no_skew", async () => {
   await setCursor(cursor, 100n);
   await indexTask(7);
   const sandbox = (finals: bigint[], counts: bigint[]) =>
-    answering(finals, counts, { network: "sandbox" }).chain;
-  // At the cursor itself the node has seen what the index took.
-  const mismatch = await againstChain(sandbox([100n], [3n]));
-  expect(mismatch.failure).toBeInstanceOf(IndexerError);
-  expect(mismatch.failure?.message).toContain("has made 3 on sandbox");
-  // A cursor one block above the node's final block is another chain, at once.
-  const ahead = await againstChain(sandbox([99n], [7n]), { aheadMs: undefined });
+    answering(finals, counts, { network: "sandbox" });
+  // At the cursor itself the node has seen what the index took, and two reads agree.
+  const mismatch = sandbox([100n, 100n], [3n, 3n]);
+  const refused = await againstChain(mismatch.chain);
+  expect(refused.failure).toBeInstanceOf(IndexerError);
+  expect(refused.failure?.message).toContain("has made 3 on sandbox");
+  expect(mismatch.asks).toEqual({ final: 2, count: 2 });
+  // A cursor one block above the node's final block is another chain, at once: one read, and no
+  // wait, whatever the retry times are.
+  const aheadChain = sandbox([99n], [7n]);
+  const ahead = await againstChain(aheadChain.chain, { retryMs: 60_000, longestMs: 60_000 });
   expect(ahead.failure).toBeInstanceOf(IndexerError);
   expect(ahead.waits).toEqual([]);
-  expect(ahead.failure?.message).toMatch(
-    /^the index took block 100, but the final block of sandbox/,
+  expect(aheadChain.asks).toEqual({ final: 1, count: 0 });
+  const words = ahead.failure?.message ?? "";
+  expect(words).toMatch(
+    /^the index took block 100, but the final block of sandbox at the node is 99, 1 block below it\./,
   );
+  expect(words).toContain("a sandbox that was started afresh");
+  expect(words).toContain("a new chain under this contract name needs a new database");
   // And the same database passes at the cursor, when the chain counts the task.
-  expect((await againstChain(sandbox([100n], [7n]))).ok).toBe(true);
+  expect((await againstChain(sandbox([100n], [7n]).chain)).ok).toBe(true);
 });
 
-test("a_cursor_ahead_of_the_chain_is_a_new_chain_once_the_node_stays_behind_it", async () => {
+test("off_the_sandbox_a_node_behind_the_index_is_waited_for_and_never_refused", async () => {
   await setCursor(TESTNET_CURSOR, 1_000n);
-  // A new chain under the same contract name: its final block is far below the old cursor, and it
-  // stays so while the node is asked again. Then it is refused, in the words of a new database.
-  const fresh = answering([40n], [0n]);
-  const { ok, failure, waits } = await againstChain(fresh.chain, { aheadMs: 30 });
+  // A node 960 blocks behind, and then still behind: asked again for as long as it takes, with the
+  // gap named, and never refused. The wait is told once in `behindWarnMs`, a minute unless given.
+  const slow = answering([40n], [0n]);
+  const stop = new AbortController();
+  const waits: string[] = [];
+  const checking = checkAgainstChain(db, slow.chain, {
+    retryMs: 1,
+    longestMs: 2,
+    signal: stop.signal,
+    onWait: (why) => waits.push(why),
+  });
+  await until("the node has been asked again and again", () => slow.asks.final >= 8);
+  stop.abort();
+  expect(await checking).toBe(false);
+  expect(waits).toEqual([
+    "the final block of the node, 40, is 960 blocks below the last block the index took, 1000: the node is behind, and is waited for",
+  ]);
+  expect(slow.asks.count).toBe(0);
+
+  // Told at each wait when `behindWarnMs` is 0.
+  const often = answering([40n], [0n]);
+  const enough = new AbortController();
+  let said = 0;
+  const loud = await againstChain(often.chain, {
+    behindWarnMs: 0,
+    signal: enough.signal,
+    onWait: () => {
+      said += 1;
+      if (said === 4) enough.abort();
+    },
+  });
+  expect(loud.ok).toBe(false);
+  expect(said).toBe(4);
+
+  // A node that catches up is believed, and the database passes. No task was asked about.
+  const catching = answering([900n, 950n, 990n, 1_100n], [0n]);
+  const caught = await againstChain(catching.chain, { behindWarnMs: 0 });
+  expect({ ok: caught.ok, failure: caught.failure }).toEqual({ ok: true, failure: undefined });
+  expect(caught.waits).toHaveLength(2);
+  expect(catching.asks.count).toBe(0);
+});
+
+test("off_the_sandbox_only_a_gap_no_lag_explains_is_refused_as_a_node_of_another_network", async () => {
+  // 100000 blocks behind is still a node that lags; one more is not.
+  await setCursor(TESTNET_CURSOR, 100_100n);
+  const limit = answering([100n], [0n]);
+  const stop = new AbortController();
+  const atLimit = await againstChain(limit.chain, {
+    signal: stop.signal,
+    onWait: () => stop.abort(),
+  });
+  expect({ ok: atLimit.ok, failure: atLimit.failure }).toEqual({ ok: false, failure: undefined });
+
+  await db.exec("truncate chain_cursor");
+  await setCursor(TESTNET_CURSOR, 500_000n);
+  const wrong = answering([100n], [new Error("not asked")]);
+  const { ok, failure, waits } = await againstChain(wrong.chain, {
+    retryMs: 60_000,
+    longestMs: 60_000,
+  });
   expect(ok).toBeUndefined();
   expect(failure).toBeInstanceOf(IndexerError);
-  expect(waits.length).toBeGreaterThan(0);
-  expect(waits[0]).toBe(
-    "the final block of the node, 40, is below the last block the index took, 1000",
-  );
+  expect(waits).toEqual([]);
+  expect(wrong.asks).toEqual({ final: 1, count: 0 });
   const words = failure?.message ?? "";
   expect(words).toMatch(
-    /^the index took block 1000, but the final block of testnet at the node is 40/,
+    /^the index took block 500000, but the final block of testnet at the node is 100, 499900 blocks below it\. No lag explains a gap that size: the node at NEAR_RPC_URL is most likely on another network than testnet\. Point NEAR_RPC_URL at a testnet node, and start the services again\. Or this is a new chain under the contract name /,
   );
   expect(words).toContain("a new chain under this contract name needs a new database");
   expect(words).toContain("one database per contract deploy");
-  // The node is named as the first cause, and the database is kept.
-  expect(words.indexOf("behind the chain: wait for it")).toBeLessThan(words.indexOf("new chain"));
+  // The node is named first, and the database is kept.
+  expect(words.indexOf("most likely on another network")).toBeLessThan(words.indexOf("new chain"));
   expect(words).toContain("keep the old one");
   expect(words).not.toMatch(/discard|throw .* away|wipe|reset/i);
-  // No task was asked about: the cursor alone gives it away.
-  expect(fresh.asks.count).toBe(0);
-
-  // A node that is behind and catches up within the time is believed.
-  const catching = answering([900n, 950n, 990n, 1_100n], [0n]);
-  const caught = await againstChain(catching.chain, { aheadMs: 60_000 });
-  expect({ ok: caught.ok, failure: caught.failure }).toEqual({ ok: true, failure: undefined });
-  expect(caught.waits).toHaveLength(2);
 });
 
 test("it_checks_the_environment_as_startIndexer_does_and_starts_nothing", async () => {

@@ -1,9 +1,9 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { inspect } from "node:util";
@@ -20,6 +20,7 @@ import {
   PGLITE_LOCK_BEAT_MS,
   PGLITE_LOCK_STALE_MS,
   PgliteInUseError,
+  PgliteLockLostError,
   putBlob,
   recordResultUpload,
   setBlobPublic,
@@ -1259,11 +1260,16 @@ describe("openDb", () => {
         const failure = await failureOf(url);
         expect(failure, JSON.stringify(text)).toBeInstanceOf(PgliteInUseError);
         const message = failure?.message ?? "";
-        // It names the directory, how long ago the lock was renewed, and the file to delete.
+        // It names the directory, how long ago the lock was renewed, and when the lock is taken
+        // over. The file to delete is named for a holder known to be gone alone: one that runs would
+        // lose the directory to it.
         expect(message).toContain(dir);
         expect(message).toMatch(/renewed 20(\.\d)? s ago/);
         expect(message).toContain("30 s");
-        expect(message).toContain(`delete ${lock}`);
+        expect(message).toContain(
+          `Delete ${lock} sooner only if you know that process has ended: one that still runs finds its lock gone at its next renewal, and stops`,
+        );
+        expect(message).not.toContain("to take the directory now");
         expect(message).not.toContain("\u001b");
         // The lock is left as it was.
         expect(await readFile(lock, "utf8")).toBe(text);
@@ -1337,31 +1343,118 @@ describe("openDb", () => {
       },
     );
 
+    /** The files of a PGlite directory but its lock, each as its size and a digest of its bytes. */
+    async function filesOf(dir: string): Promise<Map<string, string>> {
+      const files = new Map<string, string>();
+      for (const entry of await readdir(dir, { recursive: true, withFileTypes: true })) {
+        if (!entry.isFile() || entry.name === "tender.lock") continue;
+        const path = join(entry.parentPath, entry.name);
+        const bytes = await readFile(path);
+        const digest = createHash("sha1").update(bytes).digest("hex");
+        files.set(relative(dir, path), `${bytes.length}:${digest}`);
+      }
+      return files;
+    }
+
     it(
-      "puts_back_a_lock_that_was_deleted_and_leaves_one_that_another_process_made",
+      "a_lock_that_another_process_took_is_lost_and_the_database_stops_for_good",
       MINUTE,
       async () => {
-        const { url, lock } = await place();
-        const db = await openDb(url, FAST);
-        const text = await readFile(lock, "utf8");
+        const { url, dir, lock } = await place();
+        const lost: PgliteLockLostError[] = [];
+        const db = await openDb(url, {
+          pgliteLock: { ...FAST.pgliteLock, onLost: (error) => lost.push(error) },
+        });
+        await db.exec("create table t (a int)");
+        expect(await db.query("select 1 as one")).toEqual([{ one: 1 }]);
 
-        await rm(lock);
-        await until("the lock is put back", () => exists(lock), 10_000);
-        expect(await readFile(lock, "utf8")).toBe(text);
-
-        // A holder that was away for longer than the lock lasts finds the directory taken. The new
-        // holder's lock is not touched, nor removed when the old one closes.
+        // A holder that was away for longer than the lock lasts finds the directory taken. It is told
+        // once, however many beats come.
         const taken = holding(4242);
         await writeFile(lock, taken);
         await touchedAgo(lock, 1_000);
-        const before = await touchedMs(lock);
+        const touched = await touchedMs(lock);
+        await until("the loss is told", async () => lost.length > 0, 10_000);
         await delay(8 * FAST.pgliteLock.beatMs);
+        expect(lost).toHaveLength(1);
+        const error = lost[0];
+        expect(error).toBeInstanceOf(PgliteLockLostError);
+        expect(error?.message).toContain(dir);
+        expect(error?.message).toContain("is no longer this process's");
+        expect(error?.message).toContain("process 4242 on some-host.local has made its own lock");
+        expect(error?.message).toContain("every later call on the database fails");
+
+        // The new holder's lock is not touched. Every later call fails with the error, however it is
+        // made, and nothing more is run on the directory.
         expect(await readFile(lock, "utf8")).toBe(taken);
-        expect(await touchedMs(lock)).toBe(before);
+        expect(await touchedMs(lock)).toBe(touched);
+        const before = await filesOf(dir);
+        await expect(db.query("insert into t values (1)")).rejects.toBe(error);
+        await expect(db.exec("insert into t values (2)")).rejects.toBe(error);
+        await expect(db.tx((tx) => tx.query("select 1"))).rejects.toBe(error);
+
+        // Closing does not shut PGlite down, which writes its files, nor remove the new lock.
         await db.close();
+        expect(await filesOf(dir)).toEqual(before);
         expect(await readFile(lock, "utf8")).toBe(taken);
       },
     );
+
+    it(
+      "pglite_writes_its_directory_when_it_shuts_down_which_a_lost_one_is_spared",
+      MINUTE,
+      async () => {
+        // The control of the test above: closed with the lock held, the files change.
+        const { url, dir } = await place();
+        const db = await openDb(url);
+        await db.exec("create table t (a int)");
+        const before = await filesOf(dir);
+        await db.close();
+        expect(await filesOf(dir)).not.toEqual(before);
+      },
+    );
+
+    it("a_lock_that_was_deleted_is_lost_too_and_is_not_put_back", MINUTE, async () => {
+      const { url, lock } = await place();
+      const lost: PgliteLockLostError[] = [];
+      const db = await openDb(url, {
+        pgliteLock: { ...FAST.pgliteLock, onLost: (error) => lost.push(error) },
+      });
+      await db.exec("create table t (a int)");
+
+      await rm(lock);
+      await until("the loss is told", async () => lost.length > 0, 10_000);
+      await delay(8 * FAST.pgliteLock.beatMs);
+      expect(lost).toHaveLength(1);
+      expect(lost[0]?.message).toContain("its lock file is gone");
+      expect(await exists(lock)).toBe(false);
+      await expect(db.query("select 1")).rejects.toBeInstanceOf(PgliteLockLostError);
+      await db.close();
+      expect(await exists(lock)).toBe(false);
+
+      // Nobody else has had the directory, so it opens again, and holds what was written.
+      const again = await openDb(url);
+      expect(await again.query("select count(*)::int as n from t")).toEqual([{ n: 0 }]);
+      await again.close();
+    });
+
+    it("a_lost_lock_is_printed_as_an_error_when_nothing_is_listening", MINUTE, async () => {
+      const { url, lock } = await place();
+      const printed = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const db = await openDb(url, FAST);
+        await rm(lock);
+        await until("the loss is printed", async () => printed.mock.calls.length > 0, 10_000);
+        expect(printed).toHaveBeenCalledTimes(1);
+        expect(String(printed.mock.calls[0]?.[0])).toMatch(
+          /^ERROR database: the PGlite directory .* is no longer this process's: its lock file is gone/,
+        );
+        await expect(db.query("select 1")).rejects.toBeInstanceOf(PgliteLockLostError);
+        await db.close();
+      } finally {
+        printed.mockRestore();
+      }
+    });
 
     /**
      * A process that opens `url` with short times, says "ready", and then stays up, or ends with
@@ -1415,7 +1508,7 @@ describe("openDb", () => {
 
         const failure = await failureOf(url, timing);
         expect(failure).toBeInstanceOf(PgliteInUseError);
-        expect(failure?.message).toContain(`delete ${lock}`);
+        expect(failure?.message).toContain(`Delete ${lock} sooner only if you know that process`);
         // Past the time a lock lasts untouched, so that only its beats keep it from being taken.
         await delay(2_500);
         expect(await failureOf(url, timing)).toBeInstanceOf(PgliteInUseError);

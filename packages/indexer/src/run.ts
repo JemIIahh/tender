@@ -277,22 +277,32 @@ export interface CheckAgainstChainOptions {
    */
   skewBlocks?: bigint;
   /**
-   * How long the index may stay ahead of the node's final block, by more than `skewBlocks`, while
-   * the node is asked again, before the check refuses. Default 30000; on the sandbox 0.
+   * How many blocks the node's final block may be below the index's cursor before no lag
+   * explains it. Default 100000 off the sandbox, about a day of blocks; on the sandbox 0, where
+   * any block below the cursor is another chain.
    */
-  aheadMs?: number;
+  lagLimitBlocks?: bigint;
+  /**
+   * The least time between two `onWait` calls about a node that is behind the index, in
+   * milliseconds. Default 60000: that wait goes on for as long as the node takes, and says so once
+   * a minute.
+   */
+  behindWarnMs?: number;
 }
 
 const CHECK_FIRST_WAIT_MS = 2_000;
 const CHECK_LONGEST_WAIT_MS = 30_000;
 const SKEW_BLOCKS = 20n;
-const AHEAD_MS = 30_000;
+const LAG_LIMIT_BLOCKS = 100_000n;
+const BEHIND_WARN_MS = 60_000;
+/** How many rounds in a row must find the task count short before the database is refused. */
+const MISMATCH_ROUNDS = 2;
 
-/** What both refusals of `checkAgainstChain` say first: the node is the likelier cause. */
+/** What the refusal on a task count says first: the node is the likelier cause. */
 const NODE_BEHIND =
   "Either the node at NEAR_RPC_URL is behind the chain: wait for it, or point NEAR_RPC_URL at " +
   "another node, and start the services again.";
-/** What they say of the database that is refused: it is not to be thrown away. */
+/** What the refusals say of the database that is refused: it is not to be thrown away. */
 const KEEP_DATABASE =
   "keep the old one: it holds uploads, sign-ins and Telegram links that cannot be rebuilt from " +
   "the chain";
@@ -306,24 +316,28 @@ const KEEP_DATABASE =
  * - the highest task id in `tasks` is above the number of tasks the contract has made
  *   (`taskCount()`), as with a contract account that was deleted and made again, which counts its
  *   tasks from 1;
- * - the cursor is above the node's final height, as with a new chain under the same contract name
- *   (a sandbox that was started afresh): the indexer would resume after the old cursor, and skip
- *   the new chain's blocks below it.
+ * - the cursor is far above the node's final height, as with a new chain under the same contract
+ *   name (a sandbox that was started afresh), or with a `NEAR_RPC_URL` of another network: the
+ *   indexer would resume after the old cursor, and skip the new chain's blocks below it.
  *
  * It resolves true once the database matches the chain, or holds nothing to check (no task and no
  * cursor: the chain is not asked), and false if `signal` aborts first. It throws an `IndexerError`
- * for a mismatch it is sure of, and never for a read that fails:
+ * for a mismatch it is sure of, and for nothing else. What it waits for, with `onWait` told:
  *
  * - A read that fails, of the node or of the database, is made again after a wait that doubles
- *   from `retryMs` to `longestMs`, for as long as it takes; `onWait` is told of each wait.
- * - A count below the highest task id is a mismatch once the node's final height, read before the
- *   count, is `skewBlocks` or more past the cursor: a node that has seen every block the index
- *   took has seen its tasks. A node short of that is behind, and is asked again.
- * - A cursor ahead of the node's final height by more than `skewBlocks` is a mismatch once it has
- *   stayed so, over fresh reads, for `aheadMs`.
+ *   from `retryMs` to `longestMs`, for as long as it takes.
+ * - A node whose final height is below the cursor by more than `skewBlocks` is behind, and is
+ *   waited for, for as long as it takes: nothing writes meanwhile. The wait is told once in
+ *   `behindWarnMs`, with the gap. Only a gap that no lag explains, over `lagLimitBlocks`, is
+ *   refused, as a node of another network (on the sandbox, any gap, as a new chain).
+ * - A count below the highest task id is a mismatch when the node's final height, read before the
+ *   count, is `skewBlocks` or more past the cursor: a node that has seen every block the index took
+ *   has seen its tasks. A node short of that is behind. Even then the count is taken for the
+ *   chain's only when it has come out short on `MISMATCH_ROUNDS` rounds in a row, each of fresh
+ *   reads, since the final height and the count can come from two nodes of a load-balanced RPC.
  *
- * A refusal names the likely causes in order: the node is behind (wait, restart), and then that
- * the database is another deploy's, which needs a new one. It never advises to discard the
+ * A refusal names the likely causes in order: the node (behind, or of another network), and then
+ * that the database is another deploy's, which needs a new one. It never advises to discard the
  * database: it holds records that cannot be rebuilt from the chain.
  */
 export async function checkAgainstChain(
@@ -334,13 +348,14 @@ export async function checkAgainstChain(
   const signal = options.signal ?? new AbortController().signal;
   const sandbox = chain.network === "sandbox";
   const skew = options.skewBlocks ?? (sandbox ? 0n : SKEW_BLOCKS);
-  const aheadMs = options.aheadMs ?? (sandbox ? 0 : AHEAD_MS);
+  const lagLimit = options.lagLimitBlocks ?? (sandbox ? 0n : LAG_LIMIT_BLOCKS);
+  const behindWarnMs = options.behindWarnMs ?? BEHIND_WARN_MS;
   const longestMs = options.longestMs ?? CHECK_LONGEST_WAIT_MS;
   let waitMs = options.retryMs ?? CHECK_FIRST_WAIT_MS;
 
-  /** Tells why, waits, and says whether the check goes on: it does not once `signal` aborts. */
-  const wait = async (why: string): Promise<boolean> => {
-    options.onWait?.(why, waitMs);
+  /** Tells why unless `quiet`, waits, and says whether the check goes on: not once `signal` aborts. */
+  const wait = async (why: string, quiet = false): Promise<boolean> => {
+    if (!quiet) options.onWait?.(why, waitMs);
     await pause(waitMs, signal);
     waitMs = Math.min(waitMs * 2, longestMs);
     return !signal.aborted;
@@ -362,59 +377,94 @@ export async function checkAgainstChain(
   if (cursor === null && highest === null) return true;
   const indexed = cursor ?? 0n;
 
-  let aheadSince: number | undefined;
+  /** The rounds in a row that found the count short; any other round starts the tally again. */
+  let mismatches = 0;
+  let toldBehindAt: number | undefined;
   for (;;) {
     // The final height first: the count is then read at a block at least as late as it.
     let final: bigint;
     try {
       final = await chain.finalHeight();
     } catch (error) {
+      mismatches = 0;
       if (!(await wait(`cannot read the final block (${describe(error)})`))) return false;
       continue;
     }
 
     if (cursor !== null && cursor > final + skew) {
-      aheadSince ??= Date.now();
-      if (Date.now() - aheadSince >= aheadMs) {
-        throw new IndexerError(
-          `the index took block ${cursor}, but the final block of ${chain.network} at the node is ` +
-            `${final}, below it. ${NODE_BEHIND} Or this is a new chain under the contract name ` +
-            `${chain.contractId} (a sandbox that was started afresh, say), and the database holds ` +
-            "the index of the old one: a new chain under this contract name needs a new " +
-            `database (one database per contract deploy); ${KEEP_DATABASE}`,
-        );
-      }
-      const why = `the final block of the node, ${final}, is below the last block the index took, ${cursor}`;
-      if (!(await wait(why))) return false;
+      const gap = cursor - final;
+      if (gap > lagLimit) throw new IndexerError(farBehindWords(chain, cursor, final));
+      // The node is behind. Nothing writes while it is waited for, so it is waited for, and said so
+      // once a minute.
+      mismatches = 0;
+      const now = Date.now();
+      const tell = toldBehindAt === undefined || now - toldBehindAt >= behindWarnMs;
+      if (tell) toldBehindAt = now;
+      const why =
+        `the final block of the node, ${final}, is ${blocks(gap)} below the last block the index ` +
+        `took, ${cursor}: the node is behind, and is waited for`;
+      if (!(await wait(why, !tell))) return false;
       continue;
     }
-    aheadSince = undefined;
 
     if (highest === null) return true;
     let count: bigint;
     try {
       count = await chain.taskCount();
     } catch (error) {
+      mismatches = 0;
       if (!(await wait(`cannot read the task count (${describe(error)})`))) return false;
       continue;
     }
     if (highest <= count) return true;
     if (final >= indexed + skew) {
-      throw new IndexerError(
-        `the database holds task ${highest}, but ${chain.contractId} has made ${count} on ` +
-          `${chain.network}, as read at its final block ${final}, past the last block the index ` +
-          `took (${indexed}). ${NODE_BEHIND} Or the database is the index of another contract or ` +
-          "chain, or of an earlier deploy of this contract (an account that was deleted and made " +
-          "again counts its tasks from 1): use a new database for this deploy (one database per " +
-          `contract deploy); ${KEEP_DATABASE}`,
-      );
+      mismatches += 1;
+      if (mismatches >= MISMATCH_ROUNDS) {
+        throw new IndexerError(
+          `the database holds task ${highest}, but ${chain.contractId} has made ${count} on ` +
+            `${chain.network}, as read at its final block ${final}, past the last block the index ` +
+            `took (${indexed}), on ${MISMATCH_ROUNDS} reads in a row. ${NODE_BEHIND} Or the ` +
+            "database is the index of another contract or chain, or of an earlier deploy of this " +
+            "contract (an account that was deleted and made again counts its tasks from 1): use a " +
+            `new database for this deploy (one database per contract deploy); ${KEEP_DATABASE}`,
+        );
+      }
+      const why =
+        `the node counts ${count} tasks, fewer than the ${highest} the database holds, though ` +
+        `its final block, ${final}, is past the last block the index took, ${indexed}: reading ` +
+        "again before the database is taken for another deploy's";
+      if (!(await wait(why))) return false;
+      continue;
     }
+    mismatches = 0;
     const why =
       `the node counts ${count} tasks, fewer than the ${highest} the database holds, and its ` +
       `final block, ${final}, is too near the last block the index took, ${indexed}, to tell ` +
       "whether it is behind";
     if (!(await wait(why))) return false;
   }
+}
+
+/** "1 block", "20 blocks". */
+const blocks = (n: bigint) => `${n} block${n === 1n ? "" : "s"}`;
+
+/** What the check says of a node that is further below the cursor than any lag explains. */
+function farBehindWords(chain: DeploymentChain, cursor: bigint, final: bigint): string {
+  const sandbox = chain.network === "sandbox";
+  const where =
+    `the index took block ${cursor}, but the final block of ${chain.network} at the node is ` +
+    `${final}, ${blocks(cursor - final)} below it.`;
+  const node = sandbox
+    ? NODE_BEHIND
+    : "No lag explains a gap that size: the node at NEAR_RPC_URL is most likely on another " +
+      `network than ${chain.network}. Point NEAR_RPC_URL at a ${chain.network} node, and start ` +
+      "the services again.";
+  const fresh =
+    `Or this is a new chain under the contract name ${chain.contractId}` +
+    `${sandbox ? " (a sandbox that was started afresh, say)" : ""}, and the database holds the ` +
+    "index of the old one: a new chain under this contract name needs a new database (one " +
+    `database per contract deploy); ${KEEP_DATABASE}`;
+  return `${where} ${node} ${fresh}`;
 }
 
 /**

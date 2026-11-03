@@ -18,6 +18,7 @@ import {
   LockNotHeldError,
   migrate,
   openDb,
+  type PgliteLockOptions,
   type SessionLock,
   tryAdvisoryLock,
 } from "@tender/db";
@@ -56,7 +57,7 @@ import { loadEnv, REPO_ROOT, readEnvFile } from "./lib/env";
  *              The indexer, the keeper and the Judge start once the database has been checked
  *              against the chain (`checkAgainstChain`): a node that does not answer or is behind
  *              is waited for, with the API serving meanwhile, and a database that is another
- *              deploy's is refused with an ERROR, and none of the three starts
+ *              deploy's is refused: none of the three starts, and the process ends with 1
  *   keeper     voids and cleans up tasks, when KEEPER_PRIVATE_KEY is set, and runs with the
  *              indexer, under the same lock, so that no two processes send the same calls; off the
  *              sandbox its key must be a function-call key limited to Tender for the keeper's
@@ -982,8 +983,10 @@ export interface ServeOptions {
    */
   deployment?: { chain?: DeploymentChain } & Pick<
     CheckAgainstChainOptions,
-    "retryMs" | "longestMs" | "skewBlocks" | "aheadMs"
+    "retryMs" | "longestMs" | "skewBlocks" | "lagLimitBlocks" | "behindWarnMs"
   >;
+  /** For tests: the times of the lock on a PGlite directory (`openDb`). */
+  pgliteLock?: Pick<PgliteLockOptions, "beatMs" | "staleMs">;
   /**
    * For tests: the Bot API server the Telegram bot calls in place of Telegram's own, with no
    * trailing slash (grammY's `client.apiRoot`).
@@ -997,6 +1000,14 @@ export interface Services {
   /** The base URL clients call the API at, which sign-in is bound to (see `publicUrlOf`). */
   publicUrl: string;
   /**
+   * Resolves, once, with the error that ends the services after `startServices` has returned them,
+   * as it would have thrown it had it come sooner: the database was refused by the check against
+   * the chain, the indexer, the keeper or the Judge threw as they started, or the PGlite directory
+   * lost its lock. Nothing stops by itself: the owner stops the services, and `pnpm serve` does
+   * that and ends with 1 (`exitOnFailure`). It never rejects.
+   */
+  failed: Promise<Error>;
+  /**
    * Stops everything and resolves once all of it is down, in this order: the API stops taking
    * connections and cuts the ones left after the grace; the Telegram bot stops taking updates and
    * finishes the ones it has, and the notifier its tick, or after 5 s (`TELEGRAM_STOP_MS`) the
@@ -1007,8 +1018,8 @@ export interface Services {
   stop(): Promise<void>;
 }
 
-async function openIndex(url: string): Promise<Db> {
-  const db = await openDb(url);
+async function openIndex(url: string, pgliteLock: PgliteLockOptions): Promise<Db> {
+  const db = await openDb(url, { pgliteLock });
   try {
     await migrate(db);
   } catch (error) {
@@ -1055,8 +1066,8 @@ export function withLoops(
 /** What `startAfterCheck` returns: the work it starts, and when the check has said its first word. */
 export interface CheckedStart extends Stoppable {
   /**
-   * Resolves once the work has started, or the database has been refused, or the check waits on
-   * the node for the first time, or `stop` has ended it. Never rejects.
+   * Resolves once the work has started, or has been refused (`onRefused` has been told), or the
+   * check waits on the node for the first time, or `stop` has ended it. Never rejects.
    */
   settled: Promise<void>;
 }
@@ -1072,20 +1083,25 @@ export interface CheckedStartOptions {
   /** What `start` starts, as the lines name it: "the indexer, the keeper and the Judge". */
   guards: string;
   log: (line: string) => void;
+  /**
+   * Told, once, why the work will not run: the database was refused, or `start` threw. Nothing is
+   * tried again. The error is ours to show: an `IndexerError` as it is, any other failure of the
+   * check by its name, and the message of a `start` that threw. Not told once `stop` has been called.
+   */
+  onRefused: (error: Error) => void;
 }
 
 /**
  * Starts the work, `start`, once `check` has found the database to match the chain, and returns at
  * once: the check can wait for a node that does not answer or is behind, for as long as that takes,
- * and the API serves meanwhile. Each wait is logged as a WARN with its reason. A refusal is logged
- * as an ERROR, in the words of any failure to start (`runWhileLocked`), and nothing is tried
- * again: the work does not start, and the API goes on serving. A work that throws as it starts is
- * logged the same way.
+ * and the API serves meanwhile. Each wait is logged as a WARN with its reason. A refusal, or a work
+ * that throws as it starts, is told to `onRefused`, and the work does not start: the owner ends the
+ * services (`Services.failed`).
  *
  * `stop` ends the wait, and stops the work if it has started.
  */
 export function startAfterCheck(opts: CheckedStartOptions): CheckedStart {
-  const { check, start, guards, log } = opts;
+  const { check, start, guards, log, onRefused } = opts;
   const stopping = new AbortController();
   let running: Stoppable | undefined;
   let waited = false;
@@ -1101,20 +1117,26 @@ export function startAfterCheck(opts: CheckedStartOptions): CheckedStart {
     );
     firstWait();
   };
+  const refuse = (error: Error) => {
+    if (!stopping.signal.aborted) onRefused(error);
+  };
   const checking = (async () => {
     try {
       if (!(await check(stopping.signal, onWait)) || stopping.signal.aborted) return;
     } catch (error) {
       // A refusal is ours and is said in full; anything else by its name, as a line says of an error.
-      const why = error instanceof IndexerError ? error.message : describe(error);
-      log(`ERROR indexer: cannot start ${guards} (${why}); not trying again`);
+      refuse(
+        error instanceof IndexerError
+          ? error
+          : new Error(`cannot start ${guards} (${describe(error)})`, { cause: error }),
+      );
       return;
     }
     if (waited) log(`indexer: the database matches the chain; starting ${guards}`);
     try {
       running = start();
     } catch (error) {
-      log(`ERROR indexer: cannot start ${guards} (${messageOf(error)}); not trying again`);
+      refuse(new Error(`cannot start ${guards} (${messageOf(error)})`, { cause: error }));
     }
   })();
   return {
@@ -1279,8 +1301,9 @@ function runTelegram(
  *
  * Under the lock, the indexer and the loops beside it start once the database has been checked
  * against the chain (`startAfterCheck`), which waits for a node that cannot be asked, or is behind.
- * This resolves when that check has gone through, or has refused the database (an ERROR line), or
- * has waited for the first time (a WARN line): the API serves in each case.
+ * This resolves when that check has gone through, or has waited for the first time (a WARN line):
+ * the API serves in each case. A refusal that comes by then is thrown, like any refusal to start;
+ * one that comes later, like the loss of the PGlite lock, ends `Services.failed`.
  */
 export async function startServices(
   env: Record<string, string | undefined>,
@@ -1317,7 +1340,20 @@ export async function startServices(
       ? undefined
       : { config: config.judge, client: signingAs(config.judge) };
 
-  const db = await openIndex(config.database.url);
+  // What ends the services after they are up (`Services.failed`). Before that it is thrown.
+  const ending: { error?: Error; up: boolean } = { up: false };
+  let report: (error: Error) => void = () => undefined;
+  const failed = new Promise<Error>((resolve) => {
+    report = resolve;
+  });
+  const fail = (error: Error) => {
+    if (ending.error !== undefined) return;
+    ending.error = error;
+    if (ending.up) report(error);
+  };
+  const failure = () => ending.error;
+
+  const db = await openIndex(config.database.url, { ...options.pgliteLock, onLost: fail });
   let api: ApiServer | undefined;
   /** The Telegram bot and the notifier. */
   let telegram: TelegramRun | undefined;
@@ -1521,6 +1557,7 @@ export async function startServices(
         start: startLoops,
         guards,
         log,
+        onRefused: fail,
       });
       first.checked ??= checked;
       return checked;
@@ -1530,14 +1567,21 @@ export async function startServices(
         ? startWork()
         : await runWhileLocked({ tryLock, start: startWork, guards, log });
     // The first check has said its first word by now: the work runs, the node is waited for, or
-    // the database is refused. A process that waits for the lock has none.
+    // the database is refused, which is a refusal to start. A process that waits for the lock has none.
     await first.checked?.settled;
+    const refused = failure();
+    if (refused !== undefined) throw refused;
 
     if (bot === undefined || telegramConfig === undefined) {
       log("serve: Telegram off (TELEGRAM_BOT_TOKEN is not set)");
     } else {
       telegram = runTelegram(bot, telegramConfig, { db, network, log, webhooks });
     }
+    // Anything that ended the services while they started is a failure to start, and nothing
+    // awaits between this and the services being up.
+    const early = failure();
+    if (early !== undefined) throw early;
+    ending.up = true;
   } catch (error) {
     await stopAll().catch(() => undefined);
     throw error;
@@ -1547,6 +1591,7 @@ export async function startServices(
   return {
     url: api.url,
     publicUrl,
+    failed,
     stop() {
       stopped ??= stopAll().then(() => log("serve: stopped"));
       return stopped;
@@ -1690,10 +1735,53 @@ export function exitOnCrash(
   proc.on("unhandledRejection", crash("unhandled rejection"));
 }
 
+/** How long a failure lets the services stop before the process ends all the same, in milliseconds. */
+const FAILURE_STOP_MS = 10_000;
+
+/**
+ * Ends the process with 1 when the services cannot go on (`Services.failed`), as a refusal to start
+ * does: it says why with `print` (`console.error` unless given), stops the services, and exits
+ * through `proc`. The stop gets `stopMs` (10 s unless given); a stop that fails or takes longer is
+ * said, and the process ends all the same. Resolves once `proc.exit` has been called, which a real
+ * process does not return from.
+ */
+export async function exitOnFailure(
+  services: Pick<Services, "failed" | "stop">,
+  proc: { exit(code: number): unknown },
+  options: { print?: (line: string) => void; stopMs?: number } = {},
+): Promise<void> {
+  const print = options.print ?? ((line: string) => console.error(line));
+  const stopMs = options.stopMs ?? FAILURE_STOP_MS;
+  /** A line that cannot be printed, as with a closed stderr, does not keep the process alive. */
+  const say = (line: string) => {
+    try {
+      print(line);
+    } catch {
+      // the process ends all the same
+    }
+  };
+  const error = await services.failed;
+  say(`serve: ${messageOf(error)}`);
+  try {
+    await withinDeadline(stopMs, services.stop());
+  } catch (stopError) {
+    say(
+      stopError instanceof NoAnswerInTime
+        ? `serve: not stopped within ${stopMs / 1000} s; exiting`
+        : `serve: stopping failed: ${messageOf(stopError)}`,
+    );
+  } finally {
+    proc.exit(1);
+  }
+}
+
 async function main(): Promise<void> {
   let env: Record<string, string> = {};
   let services: Services | undefined;
   let stopping = false;
+  // Whether the services have failed since they started: the process then ends with 1, however
+  // it is stopped.
+  let failing = false;
 
   const stopAndExit = async (running: Services) => {
     try {
@@ -1702,7 +1790,7 @@ async function main(): Promise<void> {
       console.error(`serve: stopping failed: ${messageOf(error)}`);
       process.exit(1);
     }
-    process.exit(0);
+    process.exit(failing ? 1 : 0);
   };
   const onSignal = (signal: NodeJS.Signals) => {
     if (stopping) {
@@ -1728,6 +1816,10 @@ async function main(): Promise<void> {
     console.error(`serve: ${messageOf(error)}`);
     process.exit(1);
   }
+  void services.failed.then(() => {
+    failing = true;
+  });
+  void exitOnFailure(services, process);
   if (stopping) await stopAndExit(services);
 }
 

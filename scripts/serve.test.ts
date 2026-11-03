@@ -15,6 +15,7 @@ import {
   checkJudgeKey,
   checkKeeperKey,
   exitOnCrash,
+  exitOnFailure,
   publicUrlOf,
   readServeConfig,
   redact,
@@ -1369,15 +1370,18 @@ type OnWait = (why: string, retryMs: number) => void;
 test("the_work_starts_once_the_database_matches_the_chain_and_stops_with_it", async () => {
   const { events, start } = counted();
   const lines: string[] = [];
+  const refused: Error[] = [];
   const checked = startAfterCheck({
     check: async () => true,
     start,
     guards: "the indexer",
     log: (line) => lines.push(line),
+    onRefused: (error) => refused.push(error),
   });
   await checked.settled;
   expect(events).toEqual(["start"]);
   expect(lines).toEqual([]);
+  expect(refused).toEqual([]);
   await checked.stop();
   expect(events).toEqual(["start", "stop"]);
 });
@@ -1385,6 +1389,7 @@ test("the_work_starts_once_the_database_matches_the_chain_and_stops_with_it", as
 test("a_check_that_waits_says_why_each_time_and_the_work_starts_when_it_goes_through", async () => {
   const { events, start } = counted();
   const lines: string[] = [];
+  const refused: Error[] = [];
   let release: () => void = () => undefined;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
@@ -1399,6 +1404,7 @@ test("a_check_that_waits_says_why_each_time_and_the_work_starts_when_it_goes_thr
     start,
     guards: "the indexer and the keeper",
     log: (line) => lines.push(line),
+    onRefused: (error) => refused.push(error),
   });
   // The first wait is the first word: the services can come up on it, with the work still to start.
   await checked.settled;
@@ -1415,13 +1421,15 @@ test("a_check_that_waits_says_why_each_time_and_the_work_starts_when_it_goes_thr
   expect(lines.at(-1)).toBe(
     "indexer: the database matches the chain; starting the indexer and the keeper",
   );
+  expect(refused).toEqual([]);
   await checked.stop();
   expect(events).toEqual(["start", "stop"]);
 });
 
-test("a_refused_database_is_logged_as_an_error_and_nothing_starts", async () => {
+test("a_refused_database_is_told_to_the_owner_and_nothing_starts", async () => {
   const { events, start } = counted();
   const lines: string[] = [];
+  const refused: Error[] = [];
   const refusal = new IndexerError(
     "the database holds task 7, but tender.test.near has made 3 on testnet (one database per " +
       "contract deploy)",
@@ -1433,17 +1441,18 @@ test("a_refused_database_is_logged_as_an_error_and_nothing_starts", async () => 
     start,
     guards: "the indexer, the keeper and the Judge",
     log: (line) => lines.push(line),
+    onRefused: (error) => refused.push(error),
   });
   await checked.settled;
-  expect(lines).toEqual([
-    `ERROR indexer: cannot start the indexer, the keeper and the Judge (${refusal.message}); ` +
-      "not trying again",
-  ]);
+  // Told once, as it is, and nothing is tried again; the owner says it.
+  expect(refused).toEqual([refusal]);
+  expect(refused[0]).toBe(refusal);
+  expect(lines).toEqual([]);
   await checked.stop();
   expect(events).toEqual([]);
+  expect(refused).toHaveLength(1);
 
-  // Anything else that goes wrong is said by its name only: its message can quote a URL with a key.
-  const other: string[] = [];
+  // Anything else that goes wrong is told by its name only: its message can quote a URL with a key.
   const odd = startAfterCheck({
     check: async () => {
       throw Object.assign(new Error("failed: https://rpc.example/?key=s3cret"), {
@@ -1452,17 +1461,19 @@ test("a_refused_database_is_logged_as_an_error_and_nothing_starts", async () => 
     },
     start,
     guards: "the indexer",
-    log: (line) => other.push(line),
+    log: (line) => lines.push(line),
+    onRefused: (error) => refused.push(error),
   });
   await odd.settled;
-  expect(other).toEqual([
-    "ERROR indexer: cannot start the indexer (Error ECONNRESET); not trying again",
-  ]);
+  expect(refused).toHaveLength(2);
+  expect(refused[1]?.message).toBe("cannot start the indexer (Error ECONNRESET)");
   expect(events).toEqual([]);
+  expect(lines).toEqual([]);
 });
 
 test("stopping_ends_the_wait_of_a_check_and_the_work_never_starts", async () => {
   const { events, start } = counted();
+  const refused: Error[] = [];
   let signalSeen: AbortSignal | undefined;
   const checked = startAfterCheck({
     check: (signal: AbortSignal, onWait: OnWait) =>
@@ -1474,6 +1485,7 @@ test("stopping_ends_the_wait_of_a_check_and_the_work_never_starts", async () => 
     start,
     guards: "the indexer",
     log: () => undefined,
+    onRefused: (error) => refused.push(error),
   });
   await checked.settled;
   const started = Date.now();
@@ -1482,7 +1494,8 @@ test("stopping_ends_the_wait_of_a_check_and_the_work_never_starts", async () => 
   expect(signalSeen?.aborted).toBe(true);
   expect(events).toEqual([]);
 
-  // A check that goes through just as the stop comes does not start the work either.
+  // A check that goes through just as the stop comes does not start the work either, and one that
+  // refuses just then is not told: the services are stopping anyway.
   const late = startAfterCheck({
     check: async (signal: AbortSignal) => {
       await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
@@ -1491,13 +1504,27 @@ test("stopping_ends_the_wait_of_a_check_and_the_work_never_starts", async () => 
     start,
     guards: "the indexer",
     log: () => undefined,
+    onRefused: (error) => refused.push(error),
   });
   await late.stop();
+  const refusing = startAfterCheck({
+    check: async (signal: AbortSignal) => {
+      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+      throw new IndexerError("the database is another deploy's");
+    },
+    start,
+    guards: "the indexer",
+    log: () => undefined,
+    onRefused: (error) => refused.push(error),
+  });
+  await refusing.stop();
   expect(events).toEqual([]);
+  expect(refused).toEqual([]);
 });
 
-test("a_work_that_throws_as_it_starts_is_logged_like_any_failure_to_start", async () => {
+test("a_work_that_throws_as_it_starts_is_told_to_the_owner_like_a_refusal", async () => {
   const lines: string[] = [];
+  const refused: Error[] = [];
   const checked = startAfterCheck({
     check: async () => true,
     start: () => {
@@ -1505,11 +1532,96 @@ test("a_work_that_throws_as_it_starts_is_logged_like_any_failure_to_start", asyn
     },
     guards: "the indexer",
     log: (line) => lines.push(line),
+    onRefused: (error) => refused.push(error),
   });
   await checked.settled;
-  expect(lines).toEqual([
-    "ERROR indexer: cannot start the indexer (no height to start indexing testnet from); not " +
-      "trying again",
+  expect(refused.map((error) => error.message)).toEqual([
+    "cannot start the indexer (no height to start indexing testnet from)",
   ]);
+  expect(lines).toEqual([]);
   await checked.stop();
+});
+
+// ---- The process ends when the services cannot go on ------------------------------------------
+
+/** Services that fail when `fail` is called, and stop as `stop` does. */
+function failing(stop: () => Promise<void> = async () => undefined) {
+  let fail: (error: Error) => void = () => undefined;
+  const failed = new Promise<Error>((resolve) => {
+    fail = resolve;
+  });
+  const events: string[] = [];
+  const services = {
+    failed,
+    stop: async () => {
+      events.push("stop");
+      await stop();
+    },
+  };
+  return { services, fail, events };
+}
+
+test("the_process_says_why_stops_the_services_and_exits_with_1_when_they_fail", async () => {
+  const { services, fail, events } = failing();
+  const proc = { exit: vi.fn((code: number) => events.push(`exit ${code}`)) };
+  const printed: string[] = [];
+  const ending = exitOnFailure(services, proc, {
+    print: (line) => {
+      printed.push(line);
+      events.push("print");
+    },
+  });
+  // Nothing happens while the services run.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(events).toEqual([]);
+
+  fail(new IndexerError("the database holds task 7, but tender.test.near has made 3 on testnet"));
+  await ending;
+  expect(printed).toEqual([
+    "serve: the database holds task 7, but tender.test.near has made 3 on testnet",
+  ]);
+  expect(events).toEqual(["print", "stop", "exit 1"]);
+  expect(proc.exit).toHaveBeenCalledWith(1);
+});
+
+test("a_stop_that_fails_or_hangs_does_not_keep_a_failed_process_alive", async () => {
+  const printed: string[] = [];
+  const print = (line: string) => printed.push(line);
+
+  const broken = failing(async () => {
+    throw new Error("the database would not close");
+  });
+  const exitBroken = vi.fn();
+  broken.fail(new Error("the lock is gone"));
+  await exitOnFailure(broken.services, { exit: exitBroken }, { print });
+  expect(printed).toEqual([
+    "serve: the lock is gone",
+    "serve: stopping failed: the database would not close",
+  ]);
+  expect(exitBroken).toHaveBeenCalledWith(1);
+
+  printed.length = 0;
+  const hung = failing(() => new Promise<void>(() => undefined));
+  const exitHung = vi.fn();
+  hung.fail(new Error("the lock is gone"));
+  const started = Date.now();
+  await exitOnFailure(hung.services, { exit: exitHung }, { print, stopMs: 50 });
+  expect(Date.now() - started).toBeLessThan(2_000);
+  expect(printed).toEqual(["serve: the lock is gone", "serve: not stopped within 0.05 s; exiting"]);
+  expect(exitHung).toHaveBeenCalledWith(1);
+
+  // A print that throws, such as a closed stderr, does not stop it from exiting either.
+  const quiet = failing();
+  const exitQuiet = vi.fn();
+  quiet.fail(new Error("the lock is gone"));
+  await exitOnFailure(
+    quiet.services,
+    { exit: exitQuiet },
+    {
+      print: () => {
+        throw new Error("EPIPE");
+      },
+    },
+  );
+  expect(exitQuiet).toHaveBeenCalledWith(1);
 });

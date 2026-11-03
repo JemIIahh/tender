@@ -5,8 +5,9 @@ import type { ErrorBody, HealthResponse } from "../format";
 import { RETRY_SOON } from "../limits";
 
 /**
- * How long the chain has to give its final height, in milliseconds. The RPC client retries a node
- * that does not answer for minutes, which no monitor waits for.
+ * How long the chain has to give its final height, in milliseconds. The RPC client gives a read of
+ * the node 30 s (`rpcTimeoutMs`, unless it is set) before it cancels it with `E_TIMEOUT`, which is
+ * longer than a monitor waits.
  */
 const FINAL_HEIGHT_DEADLINE_MS = 5_000;
 
