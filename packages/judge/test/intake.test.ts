@@ -1267,6 +1267,115 @@ test("intake_takes_heldout_the_poster_sent_after_a_stranger", async () => {
   );
 });
 
+test("intake_takes_a_posters_upload_that_is_stored_but_not_recorded_yet", async () => {
+  // `POST /v1/heldout` stores the row and then records the upload, as two statements. A tick
+  // between them sees the poster's own row with no record, and must not turn the task away for
+  // good. The posting is old, so this is the rule about the row's uploader, not the wait.
+  const stored = await putBlob(db, {
+    kind: "heldout",
+    contentType: "application/json",
+    bytes: canonicalJson(EXACT_HELDOUT),
+    uploader: POSTER,
+    isPublic: false,
+  });
+  expect(
+    await intake(1, {
+      criteria_hash: await putCriteria(db, EXACT),
+      heldout_commitment: stored,
+    }),
+  ).toBe("accepted");
+  expect(await judgeRow(db, 1)).toEqual({ judge_status: "accepted", judge_reason: null });
+
+  // The same row with a stranger as its uploader and no record of the poster: not the poster's.
+  const strangers = await putBlob(db, {
+    kind: "heldout",
+    contentType: "application/json",
+    bytes: canonicalJson({ exact: { expected: ["43"] } }),
+    uploader: "mallory.test.near",
+    isPublic: false,
+  });
+  expect(
+    await intake(2, {
+      criteria_hash: await putCriteria(db, EXACT),
+      heldout_commitment: strangers,
+    }),
+  ).toBe("rejected");
+  expect((await judgeRow(db, 2))?.judge_reason).toBe(
+    "held-out checks were not uploaded by the poster",
+  );
+});
+
+test("a_stranger_who_uploads_first_does_not_decide_a_task_whose_poster_may_still_upload", async () => {
+  // Posted a minute before `NOW`, so the poster has until 9 minutes past `NOW` to send the checks.
+  const commitment = sha256Hex(canonicalJson(EXACT_HELDOUT));
+  await insertTask(
+    db,
+    taskView({
+      id: "1",
+      criteria_hash: await putCriteria(db, EXACT),
+      heldout_commitment: commitment,
+      created_at: (NOW_NS - MINUTE_NS).toString(),
+    }),
+  );
+  const deps = judgeDeps(db, fakeChain(null));
+  const waiting = { judge_status: "pending", judge_reason: "waiting for held-out checks" };
+
+  expect(await intakeTask(deps, 1n)).toBe("pending");
+  // A stranger who has the bytes stores them first, as the commitment is public once posted.
+  await putHeldout(db, EXACT_HELDOUT, "mallory.test.near");
+  expect((await getBlob(db, commitment))?.uploader).toBe("mallory.test.near");
+  // A tick now must not decide: the poster's upload can still come, and the reason says no more
+  // than before.
+  expect(await intakeTask(deps, 1n)).toBe("pending");
+  expect(await judgeRow(db, 1)).toEqual(waiting);
+  expect(await intakeTask({ ...deps, now: at(8.99) }, 1n)).toBe("pending");
+  expect(await judgeRow(db, 1)).toEqual(waiting);
+
+  // Then the poster uploads: the task is accepted.
+  await putHeldout(db, EXACT_HELDOUT);
+  expect(await intakeTask({ ...deps, now: at(8.99) }, 1n)).toBe("accepted");
+  expect(await judgeRow(db, 1)).toEqual({ judge_status: "accepted", judge_reason: null });
+});
+
+test("checks_only_a_stranger_sent_are_refused_once_the_posters_time_is_over", async () => {
+  // Same posting, but the poster sends nothing: when the 10 minutes from posting are over, the
+  // checks are the stranger's and the task is turned away, as before.
+  const created_at = (NOW_NS - MINUTE_NS).toString();
+  const criteria_hash = await putCriteria(db, EXACT);
+  const heldout_commitment = await putHeldout(db, EXACT_HELDOUT, "mallory.test.near");
+  await insertTask(db, taskView({ id: "1", criteria_hash, heldout_commitment, created_at }));
+  const deps = judgeDeps(db, fakeChain(null));
+
+  expect(await intakeTask({ ...deps, now: at(8.99) }, 1n)).toBe("pending");
+  expect(await intakeTask({ ...deps, now: at(9) }, 1n)).toBe("rejected");
+  expect(await judgeRow(db, 1)).toEqual({
+    judge_status: "rejected",
+    judge_reason: "held-out checks were not uploaded by the poster",
+  });
+});
+
+test("intake_does_not_wait_for_a_poster_whose_upload_cannot_take_the_bytes", async () => {
+  // The bytes are stored as another kind of blob, which a held-out upload never re-kinds (it is
+  // answered 409): the poster's upload cannot come, so waiting would only delay the refusal.
+  const created_at = (NOW_NS - MINUTE_NS).toString();
+  const heldout_commitment = await putRaw(
+    db,
+    "result",
+    canonicalJson({ exact: { expected: ["43"] } }),
+  );
+  expect(
+    await intake(1, {
+      criteria_hash: await putCriteria(db, EXACT),
+      heldout_commitment,
+      created_at,
+    }),
+  ).toBe("rejected");
+  expect(await judgeRow(db, 1)).toEqual({
+    judge_status: "rejected",
+    judge_reason: "held-out checks were not uploaded by the poster",
+  });
+});
+
 test("held_out_checks_that_are_used_or_missing_are_refused_before_a_worker_is_started", async () => {
   // I5: the two refusals that need no worker come before the compile, which starts one.
   vi.mocked(checkJsonSchemaIsolated).mockClear();
