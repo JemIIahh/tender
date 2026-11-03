@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "kind": "rubric",
+  "min_score": 70,
+  "split": "winner_take_all",
+  "has_heldout": false,
+  "rubric": [
+    {
+      "criterion": "Says the customer can cancel at any time by giving at least 30 days' written notice.",
+      "weight": 10
+    },
+    {
+      "criterion": "Says that anything already owed up to the day the cancellation takes effect must still be paid.",
+      "weight": 8
+    },
+    {
+      "criterion": "Says that money paid in advance is normally not refunded.",
+      "weight": 8
+    },
+    {
+      "criterion": "Gives the exception: if the provider seriously breaks the agreement and does not fix it, the customer gets a proportional refund for the time after cancellation.",
+      "weight": 9
+    },
+    {
+      "criterion": "Uses short, plain sentences and everyday words, with none of the legal terms of the clause (notwithstanding, provided that, save where, pro rata).",
+      "weight": 5
+    },
+    {
+      "criterion": "Adds nothing that the clause does not say: no new fees, deadlines, rights or conditions.",
+      "weight": 6
+    },
+    {
+      "criterion": "Is 100 words or fewer.",
+      "weight": 3
+    }
+  ]
+}

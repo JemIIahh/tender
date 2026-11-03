@@ -1,0 +1,10 @@
+{
+  "reward": "0.75",
+  "token": "tusdc",
+  "commit_secs": 600,
+  "reveal_secs": 300,
+  "pick_secs": 600,
+  "fallback_secs": 600,
+  "max_winners": 1,
+  "verifier": "judge"
+}

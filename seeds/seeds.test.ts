@@ -1,7 +1,16 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { type EntryScore, scoreExact, scoreJsonSchema, scoreRegexCases } from "@tender/judge";
 import {
+  type EntryScore,
+  scoreExact,
+  scoreJsonSchema,
+  scoreRegexCases,
+  scoreRubric,
+  scoreTests,
+  testsCriteriaProblem,
+} from "@tender/judge";
+import {
+  type Brief,
   BriefSchema,
   canonicalJson,
   type Heldout,
@@ -10,14 +19,21 @@ import {
   NETWORKS,
   type PublicCriteria,
   PublicCriteriaSchema,
+  RUBRIC_MIN_SCORE,
+  rubricCriteriaProblem,
+  rubricEntriesProblem,
   sha256Hex,
 } from "@tender/shared";
 import { describe, expect, test } from "vitest";
+import { startFakeLlm } from "../packages/judge/test/fake-llm";
+import { STAND_IN, standInGrader, standInScore } from "./rubric-stand-in";
 
 // Every seed task in seeds/<slug>/ is scored by the Judge's own scorers, so that a seed that pays
 // nobody (its solution misses the pass mark), pays everybody (its weak answer passes) or gives its
 // answer away (a public example is also held out) fails here, before it is posted. Nothing is
-// mocked: a regex seed runs in the same QuickJS sandbox that judges a real entry.
+// mocked: a regex seed runs in the same QuickJS sandbox that judges a real entry, and so does a
+// tests seed. The one kind with a model in it, rubric, is scored by the Judge's own rubric scorer
+// against a fake model server that grades by a few plain checks (rubric-stand-in.ts).
 
 const SEEDS_DIR = import.meta.dirname;
 const SLUGS = readdirSync(SEEDS_DIR, { withFileTypes: true })
@@ -25,14 +41,14 @@ const SLUGS = readdirSync(SEEDS_DIR, { withFileTypes: true })
   .map((entry) => entry.name)
   .sort();
 
-const SEED_FILES = [
-  "task.json",
-  "brief.json",
-  "criteria.json",
-  "heldout.json",
-  "solution.txt",
-  "weak.txt",
-];
+const SEED_FILES = ["task.json", "brief.json", "criteria.json", "solution.txt", "weak.txt"];
+
+/**
+ * The files a seed of `kind` has. A rubric seed has no held-out document: a model scores it against
+ * the public criteria, and there is no key to keep back (`has_heldout` is false).
+ */
+const filesOf = (kind: PublicCriteria["kind"]): string[] =>
+  kind === "rubric" ? SEED_FILES : [...SEED_FILES, "heldout.json"];
 
 /** The ten P0 seeds (plan 05, Task 9) and the kind of check each one has. */
 const P0_SEEDS: Record<string, PublicCriteria["kind"]> = {
@@ -48,10 +64,36 @@ const P0_SEEDS: Record<string, PublicCriteria["kind"]> = {
   "base58-decoded-length": "exact",
 };
 
+/** The twenty P1 seeds (plan 05, Task 11) and the kind of check each one has. */
+const P1_SEEDS: Record<string, PublicCriteria["kind"]> = {
+  "longest-ok-streak": "exact",
+  "mixed-currency-total": "exact",
+  "paper-screen-count": "exact",
+  "signup-overlap-count": "exact",
+  "contacts-clean": "json_schema",
+  "changelog-sections": "json_schema",
+  "survey-summary": "json_schema",
+  "bibliography-parse": "json_schema",
+  "ipv4-regex": "regex_cases",
+  "hex-color-regex": "regex_cases",
+  "duration-regex": "regex_cases",
+  "slugify-title": "tests",
+  "near-to-yocto": "tests",
+  "latest-per-id": "tests",
+  "wrap-text": "tests",
+  "release-notes-plain": "rubric",
+  "plain-terms-rewrite": "rubric",
+  "source-conflict-brief": "rubric",
+  "incident-summary-plain": "rubric",
+  "vendor-pick-memo": "rubric",
+};
+
 /** The output format a brief must name for the kinds whose scorer insists on one answer shape. */
 const FORMAT_OF_KIND: Partial<Record<PublicCriteria["kind"], string>> = {
   regex_cases: "regex_json",
   json_schema: "json",
+  tests: "code_js",
+  rubric: "text",
 };
 
 /**
@@ -86,25 +128,62 @@ const JSON_SCHEMA_SLUGS = SLUGS.filter((slug) => {
   return (readJson(slug, "criteria.json") as { kind?: unknown }).kind === "json_schema";
 });
 
-/** A seed's documents, once the schemas have read them, and the solution's bytes. */
+/**
+ * A seed's documents, once the schemas have read them, and the solution's bytes. `heldout` is
+ * `null` for a seed that has no heldout.json, which only a rubric seed may lack.
+ */
 function load(slug: string) {
   return {
     brief: BriefSchema.parse(readJson(slug, "brief.json")),
     criteria: PublicCriteriaSchema.parse(readJson(slug, "criteria.json")),
-    heldout: HeldoutSchema.parse(readJson(slug, "heldout.json")),
+    heldout: existsSync(seedPath(slug, "heldout.json"))
+      ? HeldoutSchema.parse(readJson(slug, "heldout.json"))
+      : null,
     solution: readBytes(slug, "solution.txt"),
   };
 }
 
 /**
+ * A rubric answer scored as the Judge scores it: by `scoreRubric`, against a fake model server that
+ * grades by the stand-in checks of the seed (rubric-stand-in.ts). The one entry is the only one
+ * graded, so its score is the whole of the result.
+ */
+async function scoreRubricAnswer(
+  slug: string,
+  brief: Brief,
+  criteria: Extract<PublicCriteria, { kind: "rubric" }>,
+  answer: Uint8Array,
+): Promise<EntryScore> {
+  const llm = await startFakeLlm(standInGrader(slug, criteria.rubric));
+  const account = "solver.test.near";
+  const result = await scoreRubric(criteria, brief, [{ account, text: utf8(answer) }], {
+    baseUrl: llm.baseUrl,
+    apiKey: "test-key",
+    model: "stand-in",
+  });
+  const score = result.scores.get(account);
+  if (result.failClosed || score === undefined) {
+    throw new Error(`the Judge could not score ${slug} with the stand-in grader: ${result.reason}`);
+  }
+  return score;
+}
+
+/**
  * `answer` scored as the Judge scores a revealed entry: by the scorer of the criteria's kind, on
- * the held-out document. A regex seed's held-out cases replace its public examples (P05-R4).
+ * the held-out document. A regex seed's held-out cases replace its public examples (P05-R4). A
+ * rubric seed has no held-out document and needs `seed`, its slug and brief, for the grader.
  */
 async function scoreAnswer(
   criteria: PublicCriteria,
-  heldout: Heldout,
+  heldout: Heldout | null,
   answer: Uint8Array,
+  seed?: { slug: string; brief: Brief },
 ): Promise<EntryScore> {
+  if (criteria.kind === "rubric") {
+    if (seed === undefined) throw new Error("scoring a rubric seed needs its slug and brief");
+    return scoreRubricAnswer(seed.slug, seed.brief, criteria, answer);
+  }
+  if (heldout === null) throw new Error(`a "${criteria.kind}" seed has no held-out document`);
   if (criteria.kind === "exact" && "exact" in heldout) {
     return scoreExact(criteria, heldout.exact, answer);
   }
@@ -113,6 +192,9 @@ async function scoreAnswer(
   }
   if (criteria.kind === "regex_cases" && "regex_cases" in heldout) {
     return scoreRegexCases(criteria, heldout.regex_cases, answer);
+  }
+  if (criteria.kind === "tests" && "tests" in heldout) {
+    return scoreTests(criteria, heldout.tests, answer);
   }
   throw new Error(
     `seeds.test.ts has no scorer for a "${criteria.kind}" seed with a "${Object.keys(heldout)}" held-out document`,
@@ -132,7 +214,8 @@ function scalarsIn(value: unknown): (string | number)[] {
  * a json_schema assertion, and the answers of an exact task whose criteria do not lowercase. A
  * regex case is a test vector, and the case of a letter is often what it tests.
  */
-function caseSensitiveStrings(criteria: PublicCriteria, heldout: Heldout): string[] {
+function caseSensitiveStrings(criteria: PublicCriteria, heldout: Heldout | null): string[] {
+  if (heldout === null) return [];
   if ("json_schema" in heldout) {
     return heldout.json_schema.assertions
       .flatMap(({ equals }) => scalarsIn(equals))
@@ -173,7 +256,7 @@ function v8Misses(answer: Uint8Array, cases: { match: string[]; no_match: string
  */
 async function expectItemCountFixed(slug: string, array: string, extra: unknown): Promise<void> {
   const { criteria, heldout, solution } = load(slug);
-  if (criteria.kind !== "json_schema" || !("json_schema" in heldout)) {
+  if (criteria.kind !== "json_schema" || heldout === null || !("json_schema" in heldout)) {
     throw new Error(`${slug} is not a json_schema seed`);
   }
   const answer = JSON.parse(utf8(solution)) as Record<string, unknown>;
@@ -292,17 +375,54 @@ function keyChecksValueAt(
   throw new Error(`no other value for ${at} fits the schema, so the key was not tried on it`);
 }
 
-test("the_ten_p0_seeds_are_all_there", () => {
-  const missing = Object.keys(P0_SEEDS).filter((slug) => !SLUGS.includes(slug));
+const THIRTY_SEEDS = { ...P0_SEEDS, ...P1_SEEDS };
+
+test("the_thirty_seeds_are_all_there", () => {
+  expect(Object.keys(P0_SEEDS)).toHaveLength(10);
+  expect(Object.keys(P1_SEEDS)).toHaveLength(20);
+  expect(Object.keys(THIRTY_SEEDS), "a slug is both a P0 and a P1 seed").toHaveLength(30);
+
+  const missing = Object.keys(THIRTY_SEEDS).filter((slug) => !SLUGS.includes(slug));
   expect(missing, "seeds missing from seeds/").toEqual([]);
 
-  const lacking = Object.keys(P0_SEEDS).flatMap((slug) =>
-    SEED_FILES.filter((name) => !existsSync(seedPath(slug, name))).map((name) => `${slug}/${name}`),
+  const kinds = Object.fromEntries(
+    Object.keys(THIRTY_SEEDS).map((s) => [s, load(s).criteria.kind]),
   );
-  expect(lacking, "files missing from the P0 seeds").toEqual([]);
+  expect(kinds).toEqual(THIRTY_SEEDS);
 
-  const kinds = Object.fromEntries(Object.keys(P0_SEEDS).map((s) => [s, load(s).criteria.kind]));
-  expect(kinds).toEqual(P0_SEEDS);
+  const lacking = Object.entries(THIRTY_SEEDS).flatMap(([slug, kind]) =>
+    filesOf(kind)
+      .filter((name) => !existsSync(seedPath(slug, name)))
+      .map((name) => `${slug}/${name}`),
+  );
+  expect(lacking, "files missing from the seeds").toEqual([]);
+  // A file a kind does not have would be read as one that it does: a heldout.json beside a rubric.
+  const extra = Object.entries(THIRTY_SEEDS).flatMap(([slug, kind]) =>
+    readdirSync(join(SEEDS_DIR, slug))
+      .filter((name) => !filesOf(kind).includes(name))
+      .map((name) => `${slug}/${name}`),
+  );
+  expect(extra, "files in a seed that its kind does not have").toEqual([]);
+});
+
+test("the_twenty_p1_seeds_cover_five_kinds_and_the_research_data_and_writing_categories", () => {
+  const kinds = Object.values(P1_SEEDS);
+  const countOf = (kind: PublicCriteria["kind"]) => kinds.filter((k) => k === kind).length;
+  // Plan 05, Task 11: at least 4 rubric seeds, at least 3 tests seeds (Task 6 passed), the rest
+  // spread over the P0 kinds.
+  expect(countOf("rubric"), "rubric seeds").toBeGreaterThanOrEqual(4);
+  expect(countOf("tests"), "tests seeds").toBeGreaterThanOrEqual(3);
+  for (const kind of ["exact", "json_schema", "regex_cases"] as const) {
+    expect(countOf(kind), `${kind} seeds`).toBeGreaterThanOrEqual(3);
+  }
+
+  const categories = Object.keys(P1_SEEDS).map((slug) => load(slug).brief.category);
+  for (const category of ["research", "data", "writing"] as const) {
+    expect(
+      categories.filter((c) => c === category).length,
+      `${category} seeds`,
+    ).toBeGreaterThanOrEqual(3);
+  }
 });
 
 test("every_brief_has_its_own_hash", () => {
@@ -315,11 +435,33 @@ describe.each(SLUGS)("seed %s", (slug) => {
   test("documents_follow_the_schemas", () => {
     const { criteria, heldout } = load(slug);
 
+    if (criteria.kind === "rubric") {
+      // A model scores it against the public criteria: no key, so no held-out part.
+      expect(criteria.has_heldout, "has_heldout").toBe(false);
+      expect(heldout, "a rubric seed has no heldout.json").toBeNull();
+      // The rules of @tender/shared, which the Judge turns a rubric task away at intake for
+      // breaking: at most 20 criteria of at most 200 characters, no angle brackets, none alike.
+      expect(rubricCriteriaProblem(criteria), "rubric rules").toBeNull();
+      // Seeds are posted open to anyone, so they are an open task: no cap on entries, no invites.
+      expect(rubricEntriesProblem({ max_entries: 0, invited: [] }), "entry terms").toBeNull();
+      // A pass mark a model can reach. 100 would need ten out of ten on every criterion, and
+      // under the minimum a disqualified entry (a score of 0) would pass.
+      expect(criteria.min_score, "min_score").toBeGreaterThanOrEqual(RUBRIC_MIN_SCORE);
+      expect(criteria.min_score, "min_score").toBeLessThan(100);
+      return;
+    }
+
     expect(criteria.has_heldout, "has_heldout").toBe(true);
     // Every brief says the reward goes only to a perfect answer, and the known-wrong regexes
     // below are refused on that pass mark alone: lower it and a near-miss is paid.
     expect(criteria.min_score, "min_score").toBe(100);
-    expect(heldoutMatchesCriteria(criteria, heldout), "held-out kind is the criteria's").toBe(true);
+    expect(
+      heldout !== null && heldoutMatchesCriteria(criteria, heldout),
+      "held-out kind is the criteria's",
+    ).toBe(true);
+    if (criteria.kind === "tests") {
+      expect(testsCriteriaProblem(criteria), "tests rules").toBeNull();
+    }
   });
 
   test("task_terms_are_in_range", () => {
@@ -356,13 +498,13 @@ describe.each(SLUGS)("seed %s", (slug) => {
   });
 
   test("solution_passes_its_held_out_checks", async () => {
-    const { criteria, heldout, solution } = load(slug);
+    const { brief, criteria, heldout, solution } = load(slug);
 
-    const result = await scoreAnswer(criteria, heldout, solution);
+    const result = await scoreAnswer(criteria, heldout, solution, { slug, brief });
     expect(result.score, result.reasons.join("; ")).toBeGreaterThanOrEqual(criteria.min_score);
     expect(result.passed).toBe(true);
 
-    if (criteria.kind === "regex_cases" && "regex_cases" in heldout) {
+    if (criteria.kind === "regex_cases" && heldout !== null && "regex_cases" in heldout) {
       expect(v8Misses(solution, heldout.regex_cases), "cases wrong in V8").toEqual([]);
       // The published examples are cases too, and a solution that fails them contradicts the task.
       const onExamples = await scoreRegexCases(criteria, null, solution);
@@ -374,10 +516,10 @@ describe.each(SLUGS)("seed %s", (slug) => {
 
   test("weak_answer_scores_below_the_solution", async ({ skip }) => {
     if (!existsSync(seedPath(slug, "weak.txt"))) return skip("this seed has no weak answer");
-    const { criteria, heldout, solution } = load(slug);
+    const { brief, criteria, heldout, solution } = load(slug);
 
-    const best = await scoreAnswer(criteria, heldout, solution);
-    const weak = await scoreAnswer(criteria, heldout, readBytes(slug, "weak.txt"));
+    const best = await scoreAnswer(criteria, heldout, solution, { slug, brief });
+    const weak = await scoreAnswer(criteria, heldout, readBytes(slug, "weak.txt"), { slug, brief });
     expect(weak.score).toBeLessThan(best.score);
     // A weak answer is meant to lose. If it passed, a task with only that entry would pay it.
     expect(weak.passed, "weak answer passes").toBe(false);
@@ -405,6 +547,8 @@ describe.each(SLUGS)("seed %s", (slug) => {
   test("public_examples_are_not_held_out", () => {
     const { brief, criteria, heldout } = load(slug);
 
+    if (heldout === null) return;
+
     if (criteria.kind === "regex_cases" && "regex_cases" in heldout) {
       const hidden = [...heldout.regex_cases.match, ...heldout.regex_cases.no_match];
       const shown = [...criteria.examples.match, ...criteria.examples.no_match];
@@ -417,6 +561,21 @@ describe.each(SLUGS)("seed %s", (slug) => {
       expect(
         hidden.filter((held, i) => hidden.indexOf(held) !== i),
         "held-out strings listed twice",
+      ).toEqual([]);
+    }
+
+    if (criteria.kind === "tests" && "tests" in heldout) {
+      // The published cases are a sample to try the function on. A case that is also held out
+      // counts twice in the score and tells the solver a part of the key.
+      const shown = criteria.examples.map(({ input }) => JSON.stringify(input));
+      const hidden = heldout.tests.cases.map(({ input }) => JSON.stringify(input));
+      expect(
+        shown.filter((example) => hidden.includes(example)),
+        "published cases that are also held out",
+      ).toEqual([]);
+      expect(
+        hidden.filter((held, i) => hidden.indexOf(held) !== i),
+        "held-out cases listed twice",
       ).toEqual([]);
     }
 
@@ -478,6 +637,19 @@ describe.each(SLUGS)("seed %s", (slug) => {
     ).toEqual([]);
   });
 
+  test("the_documents_claim_nothing_the_protocol_does_not_do", () => {
+    // Tender does not claim to be trustless, provably fair or private, so neither may a seed's
+    // brief or criteria, which are what an agent or a judge reads first.
+    const { brief, criteria } = load(slug);
+    const words = [
+      brief.title,
+      brief.summary,
+      brief.instructions,
+      ...(criteria.kind === "rubric" ? criteria.rubric.map(({ criterion }) => criterion) : []),
+    ].join("\n");
+    expect(words).not.toMatch(/trustless|provably fair|private/i);
+  });
+
   test("documents_round_trip_as_canonical_json", () => {
     // The poster script uploads `canonicalJson` bytes, the upload route refuses any other, and the
     // hash on chain is the SHA-256 of them. So each document must read back as itself. For the
@@ -489,7 +661,10 @@ describe.each(SLUGS)("seed %s", (slug) => {
       "heldout.json": HeldoutSchema,
     } as const;
 
-    for (const name of ["task.json", "brief.json", "criteria.json", "heldout.json"] as const) {
+    const names = (["task.json", "brief.json", "criteria.json", "heldout.json"] as const).filter(
+      (name) => existsSync(seedPath(slug, name)),
+    );
+    for (const name of names) {
       const document = readJson(slug, name);
       const canonical = utf8(canonicalJson(document));
       expect(JSON.parse(canonical), name).toEqual(document);
@@ -560,7 +735,9 @@ test("invoice_extract_brief_says_descriptions_are_copied_as_written", () => {
   // The key compares a description letter for letter, "(per day)" included, so the brief has to say
   // that it is copied as written. Otherwise a solver that shortens it loses the reward unfairly.
   const { brief, heldout } = load("invoice-extract");
-  if (!("json_schema" in heldout)) throw new Error("invoice-extract is not a json_schema seed");
+  if (heldout === null || !("json_schema" in heldout)) {
+    throw new Error("invoice-extract is not a json_schema seed");
+  }
   const [prose = "", data = ""] = brief.instructions.split("-----BEGIN DATA-----");
   expect(prose).toMatch(/\bcopy\b[^.\n]*\bdescription\b[^.\n]*\bas written\b/i);
 
@@ -585,7 +762,7 @@ describe.each(JSON_SCHEMA_SLUGS)("json_schema seed %s", (slug) => {
     // reading the scorecard sees a wrong answer rewarded. So each value of the solution, changed to
     // another that the schema accepts, has to cost the reward, unless UNCHECKED_VALUES says why not.
     const { criteria, heldout, solution } = load(slug);
-    if (criteria.kind !== "json_schema" || !("json_schema" in heldout)) {
+    if (criteria.kind !== "json_schema" || heldout === null || !("json_schema" in heldout)) {
       throw new Error(`${slug} is not a json_schema seed`);
     }
     const answer: unknown = JSON.parse(utf8(solution));
@@ -622,7 +799,10 @@ describe.each(JSON_SCHEMA_SLUGS)("json_schema seed %s", (slug) => {
  * 50) or into some other wrong regex is not paid either, and then it tests nothing.
  */
 const NEAR_MISS_SCORE = 90;
-const KNOWN_WRONG_REGEXES: Record<string, { why: string; pattern: string }[]> = {
+const KNOWN_WRONG_REGEXES: Record<
+  string,
+  { why: string; pattern: string; flags?: string; near?: number }[]
+> = {
   "iso-date-regex": [
     {
       why: "[redacted]",
@@ -706,6 +886,81 @@ const KNOWN_WRONG_REGEXES: Record<string, { why: string; pattern: string }[]> = 
       pattern: "[redacted]",
     },
   ],
+  "ipv4-regex": [
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern:
+        "[redacted]",
+    },
+  ],
+  "hex-color-regex": [
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+    },
+    {
+      // [redacted]
+      // [redacted]
+      why: "[redacted]",
+      pattern: "[redacted]",
+      near: 80,
+    },
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+      near: 85,
+    },
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+    },
+  ],
+  "duration-regex": [
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      pattern: "[redacted]",
+      flags: "[redacted]",
+    },
+  ],
 };
 
 describe.each(Object.keys(KNOWN_WRONG_REGEXES))("regex seed %s", (slug) => {
@@ -714,13 +969,210 @@ describe.each(Object.keys(KNOWN_WRONG_REGEXES))("regex seed %s", (slug) => {
 
     const paid: string[] = [];
     const broken: string[] = [];
-    for (const { why, pattern } of KNOWN_WRONG_REGEXES[slug] ?? []) {
-      const answer = new TextEncoder().encode(JSON.stringify({ pattern, flags: "" }));
+    for (const { why, pattern, flags = "", near = NEAR_MISS_SCORE } of KNOWN_WRONG_REGEXES[slug] ??
+      []) {
+      const answer = new TextEncoder().encode(JSON.stringify({ pattern, flags }));
       const result = await scoreAnswer(criteria, heldout, answer);
       if (result.passed) paid.push(why);
-      if (result.score < NEAR_MISS_SCORE) broken.push(`${why} (scores ${result.score})`);
+      if (result.score < near) broken.push(`${why} (scores ${result.score})`);
     }
     expect(paid, "wrong regexes that the held-out cases pay in full").toEqual([]);
     expect(broken, "known-wrong regexes that are no longer near-misses").toEqual([]);
+  });
+});
+
+/**
+ * Functions a careless solver would write for the tests seeds, each breaking one rule of its brief.
+ * A rule that no held-out case tests pays every function that breaks it, so none of these may
+ * reach the pass mark. They must also run: one that throws on every case tests nothing, so each
+ * has to pass at least one case.
+ */
+const KNOWN_WRONG_TESTS: Record<string, { why: string; source: string }[]> = {
+  "slugify-title": [
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+  ],
+  "near-to-yocto": [
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+  ],
+  "latest-per-id": [
+    {
+      why: "[redacted]",
+      source:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      source:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      source:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      source:
+        "[redacted]",
+    },
+    {
+      why: "[redacted]",
+      source:
+        "[redacted]",
+    },
+  ],
+  "wrap-text": [
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
+  ],
+};
+
+const TESTS_SLUGS = SLUGS.filter((slug) => load(slug).criteria.kind === "tests");
+
+describe.each(TESTS_SLUGS)("tests seed %s", (slug) => {
+  test("known_wrong_functions_are_not_paid", async () => {
+    const { criteria, heldout } = load(slug);
+    const wrong = KNOWN_WRONG_TESTS[slug] ?? [];
+    expect(wrong.length, "known-wrong functions written for this seed").toBeGreaterThanOrEqual(4);
+
+    const paid: string[] = [];
+    const broken: string[] = [];
+    for (const { why, source } of wrong) {
+      const result = await scoreAnswer(criteria, heldout, new TextEncoder().encode(source));
+      if (result.passed) paid.push(why);
+      if (result.score === 0) broken.push(`${why} (${result.reasons.join("; ")})`);
+    }
+    expect(paid, "wrong functions that the held-out cases pay in full").toEqual([]);
+    expect(broken, "known-wrong functions that fail every case, so they test nothing").toEqual([]);
+  });
+
+  test("the_solution_runs_well_inside_the_judges_limits", async () => {
+    // The Judge gives a case 1 s and 32 MiB, and an entry up to 65_536 bytes of source. A seed's
+    // own solution should not need a tenth of them, or a slow machine would fail an honest entry.
+    const { criteria, heldout, solution } = load(slug);
+    if (heldout === null || !("tests" in heldout)) throw new Error(`${slug} has no held-out cases`);
+    expect(solution.byteLength, "solution bytes").toBeLessThan(6_554);
+    expect(heldout.tests.cases.length, "held-out cases").toBeGreaterThanOrEqual(10);
+    expect(
+      criteria.kind === "tests" && criteria.examples.length,
+      "published cases",
+    ).toBeGreaterThanOrEqual(3);
+
+    await scoreAnswer(criteria, heldout, solution); // the first run starts the engine
+    const started = performance.now();
+    const result = await scoreAnswer(criteria, heldout, solution);
+    const perCase = (performance.now() - started) / heldout.tests.cases.length;
+    expect(result.score, result.reasons.join("; ")).toBe(100);
+    expect(perCase, "milliseconds for a case").toBeLessThan(100);
+  });
+});
+
+const RUBRIC_SLUGS = SLUGS.filter((slug) => load(slug).criteria.kind === "rubric");
+
+describe.each(RUBRIC_SLUGS)("rubric seed %s", (slug) => {
+  test("every_criterion_has_stand_in_checks_and_the_solution_meets_all_of_them", () => {
+    const { criteria, solution } = load(slug);
+    if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
+    expect(STAND_IN[slug]?.length, "criteria with stand-in checks").toBe(criteria.rubric.length);
+    const scores = criteria.rubric.map((_, i) => standInScore(slug, i, utf8(solution)));
+    expect(scores, "stand-in score of the solution on each criterion").toEqual(
+      criteria.rubric.map(() => 10),
+    );
+  });
+
+  test("the_weak_answer_misses_several_criteria_and_a_nonsense_answer_misses_the_pass_mark", async () => {
+    const { brief, criteria, solution } = load(slug);
+    if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
+    const weak = utf8(readBytes(slug, "weak.txt"));
+    const missed = criteria.rubric.filter(
+      (_, i) => standInScore(slug, i, weak) < standInScore(slug, i, utf8(solution)),
+    );
+    expect(missed.length, "criteria on which the weak answer does worse").toBeGreaterThanOrEqual(3);
+
+    const nonsense = await scoreAnswer(criteria, null, new TextEncoder().encode("Lorem."), {
+      slug,
+      brief,
+    });
+    expect(nonsense.passed, "a one-word answer passes").toBe(false);
+  });
+
+  test("the_brief_tells_the_solver_how_the_answer_is_graded", () => {
+    // Honest about the grader: a model scores it, and the brief says so, as the other kinds say
+    // how theirs are checked.
+    const { brief } = load(slug);
+    expect(brief.instructions).toMatch(
+      /an AI model scores your answer from 0 to 10 on each criterion/,
+    );
   });
 });

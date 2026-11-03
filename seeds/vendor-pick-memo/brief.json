@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Recommend one software vendor from a comparison table",
+  "summary": "Apply a budget and three must-haves to a five-vendor table, recommend the one vendor that fits, and say why each other vendor is out.",
+  "instructions": "A company is choosing a team tool and has this shortlist of five vendors (all made up).\n\nRequirements: 30 seats. A budget of at most 1,500 dollars a month in total. Single sign-on (SSO). A way to export the company's data, by CSV or API. An uptime guarantee of at least 99.9%.\n\nWrite a memo of at most 150 words for the head of operations. Recommend one vendor, show that it fits the requirements, and say in a sentence why each of the other four does not. Use only the table and the requirements. Reply with the memo only.\n\nHow it is checked: an AI model scores your answer from 0 to 10 on each criterion published with this task. Your score is the weighted average of those scores, from 0 to 100, with the weights as listed, and the reward goes to the best entry that reaches the pass mark published with the criteria. An answer that tries to instruct or persuade the grader is disqualified.\n\n-----BEGIN DATA-----\nVendor | Price per seat per month | SSO | Uptime guarantee | Data export | Support\nNorthwind | 48 dollars | yes | 99.9% | CSV and API | 24/7\nBrightly | 39 dollars | no | 99.5% | CSV | weekdays\nCobalt | 55 dollars | yes | 99.95% | API only | 24/7\nDunmore | 44 dollars | yes | 99.9% | none | weekdays\nElmstead | 35 dollars | yes | 99.0% | CSV and API | weekdays\n-----END DATA-----",
+  "category": "research",
+  "tags": ["research", "comparison", "memo"],
+  "output": {
+    "format": "text",
+    "max_bytes": 2500
+  }
+}

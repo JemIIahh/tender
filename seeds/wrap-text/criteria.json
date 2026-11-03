@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "kind": "tests",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "language": "js",
+  "entry": "wrapText",
+  "examples": [
+    {
+      "input": {
+        "text": "the quick brown fox",
+        "width": 10
+      },
+      "output": ["the quick", "brown fox"]
+    },
+    {
+      "input": {
+        "text": "a b c",
+        "width": 3
+      },
+      "output": ["a b", "c"]
+    },
+    {
+      "input": {
+        "text": "",
+        "width": 5
+      },
+      "output": []
+    }
+  ]
+}

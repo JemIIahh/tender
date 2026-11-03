@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "kind": "tests",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "language": "js",
+  "entry": "latestPerId",
+  "examples": [
+    {
+      "input": [
+        {
+          "id": "a",
+          "updated": "2026-01-01T00:00:00Z",
+          "value": 1
+        },
+        {
+          "id": "a",
+          "updated": "2026-01-02T00:00:00Z",
+          "value": 2
+        }
+      ],
+      "output": [
+        {
+          "id": "a",
+          "updated": "2026-01-02T00:00:00Z",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "input": [
+        {
+          "id": "b",
+          "updated": "2026-03-01T10:00:00Z",
+          "value": "x"
+        },
+        {
+          "id": "a",
+          "updated": "2026-03-01T09:00:00Z",
+          "value": "y"
+        }
+      ],
+      "output": [
+        {
+          "id": "a",
+          "updated": "2026-03-01T09:00:00Z",
+          "value": "y"
+        },
+        {
+          "id": "b",
+          "updated": "2026-03-01T10:00:00Z",
+          "value": "x"
+        }
+      ]
+    },
+    {
+      "input": [],
+      "output": []
+    }
+  ]
+}

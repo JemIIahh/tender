@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "kind": "json_schema",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "version",
+      "released",
+      "added",
+      "fixed",
+      "breaking",
+      "bullet_count",
+      "has_breaking"
+    ],
+    "properties": {
+      "version": {
+        "type": "string",
+        "minLength": 1
+      },
+      "released": {
+        "type": "string",
+        "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+      },
+      "added": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "fixed": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "breaking": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "bullet_count": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "has_breaking": {
+        "type": "boolean"
+      }
+    }
+  }
+}

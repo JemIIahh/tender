@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type LocalChain, startLocalChain, TenderClient } from "@tender/client";
 import {
@@ -55,6 +55,10 @@ const fileOf = (slug: string, name: string) =>
 
 /** The hash a task holds of a document: the SHA-256 of its canonical bytes. */
 const hashOf = (document: object) => sha256Hex(canonicalJson(document));
+
+/** The commitment a seed's task holds: the hash of its held-out checks, or none for a rubric seed. */
+const commitmentOf = (slug: string) =>
+  existsSync(join(SEEDS, slug, "heldout.json")) ? hashOf(fileOf(slug, "heldout.json")) : null;
 
 const unexpected = (method: string) => () => {
   throw new Error(`unexpected call to api.${method}`);
@@ -218,7 +222,7 @@ async function expectPosted(id: bigint, slug: string, who: Who, blobs: readonly 
   expect(task.verifier, slug).toBe(chain.accounts.judge.accountId);
   expect(task.brief_hash, slug).toBe(briefHash);
   expect(task.criteria_hash, slug).toBe(hashOf(fileOf(slug, "criteria.json")));
-  expect(task.heldout_commitment, slug).toBe(hashOf(fileOf(slug, "heldout.json")));
+  expect(task.heldout_commitment, slug).toBe(commitmentOf(slug));
   // The URI is where the API said it keeps the brief.
   expect(task.brief_uri, slug).toBe(`https://api.test/v1/blobs/${briefHash}`);
   expect(
@@ -234,7 +238,8 @@ async function expectPosted(id: bigint, slug: string, who: Who, blobs: readonly 
     },
   );
   expect(task.max_winners, slug).toBe(terms.max_winners);
-  // Open to anyone, with no cap on entries and no parent.
+  // Open to anyone, with no cap on entries and no parent. That holds for a rubric seed too: an open
+  // rubric task is allowed (the Judge grades its first 50 entries), and the script posts no cap.
   expect(task.max_entries, slug).toBe(0);
   expect(task.invited, slug).toEqual([]);
   expect(task.parent, slug).toBeNull();
@@ -375,7 +380,7 @@ test("a_vault_that_holds_part_of_the_rewards_is_topped_up_by_the_rest_and_no_mor
   await expectPosted(only.taskId, "sum-of-transfers", { poster: lead.accountId }, blobs);
 });
 
-test("all_ten_seeds_are_posted_by_an_account_that_opens_with_the_storage_for_eight", async () => {
+test("all_thirty_seeds_are_posted_by_an_account_that_opens_with_the_storage_for_eight", async () => {
   const alice = chain.accounts.alice;
   const client = clientOf("alice");
   const { api, blobs, heldouts } = recordingApi();
@@ -392,20 +397,23 @@ test("all_ten_seeds_are_posted_by_an_account_that_opens_with_the_storage_for_eig
     log: (line) => lines.push(line),
   });
 
-  // The 0.1 NEAR that the account opened with pays for about eight tasks. The script topped it up
-  // first, then the vault, and then every task was posted: none ran out of storage.
+  // The 0.1 NEAR that the account opened with pays for about eight tasks, and thirty need about
+  // four times that. The script topped it up first, then the vault, and then every task was
+  // posted: none ran out of storage.
   expect(lines[0]).toMatch(/^DEPOSITED 0\.\d+ NEAR for storage$/);
-  expect(lines[1]).toBe("DEPOSITED 7.00 tUSDC");
+  expect(lines[1]).toBe("DEPOSITED 22.50 tUSDC");
   expect(lines.slice(2)).toEqual(posted.map(({ slug, taskId }) => `SEEDED ${slug} task=${taskId}`));
-  expect(posted).toHaveLength(10);
+  expect(posted).toHaveLength(30);
   expect(posted.map(({ slug }) => slug)).toEqual([...posted.map(({ slug }) => slug)].sort());
   expect(posted.map(({ taskId }) => taskId)).toEqual(
-    Array.from({ length: 10 }, (_, i) => countBefore + 1n + BigInt(i)),
+    Array.from({ length: 30 }, (_, i) => countBefore + 1n + BigInt(i)),
   );
   for (const { slug, taskId } of posted) {
     await expectPosted(taskId, slug, { poster: alice.accountId }, blobs);
   }
-  expect(heldouts).toHaveLength(10);
+  // Twenty-five have held-out checks to store. The five rubric seeds have none, and their tasks
+  // read back with no commitment (expectPosted).
+  expect(heldouts).toHaveLength(25);
   expect(await client.balanceOf(alice.accountId, chain.tokenId)).toBe(0n);
 });
 
@@ -483,7 +491,7 @@ test("a_seed_whose_heldout_is_public_is_not_posted_and_its_reward_stays_with_the
 });
 
 test("a_poster_whose_wallet_cannot_cover_the_rewards_posts_nothing_and_moves_nothing", async () => {
-  // The keeper opens with 0.1 NEAR of storage, which does not cover ten tasks, and with no tokens
+  // The keeper opens with 0.1 NEAR of storage, which does not cover thirty tasks, and with no tokens
   // at all. A script that paid for the storage first would have paid before it found the wallet
   // empty.
   const keeper = chain.accounts.keeper;
@@ -505,8 +513,8 @@ test("a_poster_whose_wallet_cannot_cover_the_rewards_posts_nothing_and_moves_not
   );
 
   expect((failure as Error).message).toBe(
-    `the vault of ${keeper.accountId} holds 0.00 tUSDC and the seeds need 7.00 tUSDC; ` +
-      `its wallet holds 0.00 tUSDC of ${chain.tokenId}, so 7.00 tUSDC more is missing`,
+    `the vault of ${keeper.accountId} holds 0.00 tUSDC and the seeds need 22.50 tUSDC; ` +
+      `its wallet holds 0.00 tUSDC of ${chain.tokenId}, so 22.50 tUSDC more is missing`,
   );
   // The tasks, the wallet, the vault and the storage balance are what they were.
   expect(await holdings("keeper")).toEqual(before);

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Write toYocto(amount) for exact NEAR to yoctoNEAR",
+  "summary": "Write a JavaScript function that converts a NEAR amount written as a decimal string into yoctoNEAR, exactly, or null if the text is not a valid amount.",
+  "instructions": "1 NEAR is 1000000000000000000000000 yoctoNEAR (a 1 followed by 24 zeros). Write a JavaScript function toYocto(amount) that takes an amount of NEAR written as a string and returns the exact number of yoctoNEAR as a string of digits.\n\nA valid amount is: one or more digits, optionally followed by a dot and then 1 to 24 digits. Nothing else is valid: no sign, no spaces, no exponent, no thousands separators, no digit-less part (so .5 and 5. are not valid), and no more than 24 digits after the dot. For an invalid amount, or an input that is not a string, return null.\n\nFor a valid amount return the yoctoNEAR as a string of digits with no leading zeros, and \"0\" for zero. The amounts can be far larger than JavaScript numbers hold exactly, so work with the digits and not with floating point numbers.\n\nReply with JavaScript source and nothing else: no code fence and no explanation. It must define a top-level function named toYocto. It is run as a classic script, not a module, so use no import, export or require. It is called with the input of each test case as its one argument and must return its result straight away (not a promise). The result is compared as JSON with the expected output.\n\nThe code runs in a small sandbox with no network, files or timers, and each test case gets 1 second and 32 MiB of memory.\n\nHow it is checked: your function is run on a set of test cases, and a few of them are published with the task for you to try. The score is the share of cases it gets right, including cases that are kept back until the result is announced, and the reward is paid only for a score of 100.",
+  "category": "data",
+  "tags": ["data", "javascript", "near", "math"],
+  "output": {
+    "format": "code_js",
+    "max_bytes": 8192
+  }
+}

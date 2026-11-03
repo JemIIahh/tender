@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Who signed up for both lists, after cleaning the addresses",
+  "summary": "Two sign-up lists hold messy email addresses. Clean them, then count the people on both lists, only on the first, and only on the second.",
+  "instructions": "Below are two sign-up lists, A (a workshop) and B (a newsletter), one email address per line. The addresses are messy, so clean each one before you compare:\n- remove spaces at the start and end;\n- write it in lower case;\n- in the part before the @, remove a plus sign and everything after it up to the @. So sam+news@example.com is sam@example.com. Do not change anything after the @.\n\nThe square brackets only mark where each line starts and ends. They are not part of the address, and anything between a bracket and the address is a space to remove.\n\nTwo cleaned addresses are the same person if they are exactly equal. Count each person once per list, however many times they appear in it. Two addresses with the same name before the @ but a different domain are different people.\n\nReport three numbers, separated by commas and in this order: people on both lists, people only on list A, people only on list B. For example 3,5,2.\n\nHow it is checked: your answer is compared with the correct answer after trimming spaces and ignoring upper or lower case. There is no partial credit, and the reward is paid only for a correct answer.\n\n-----BEGIN DATA-----\nLIST A\n[Ada.Obi@example.com]\n[ kemi@example.com]\n[tunde+workshop@example.com]\n[CHIDI@Example.com]\n[ngozi@example.org]\n[bola@example.com]\n[tunde@example.com]\n[emeka+a@example.org]\n[zainab@example.com]\n[kemi@example.com ]\n[funmi@example.com]\n[uche@example.org]\nLIST B\n[ada.obi@example.com]\n[kemi+news@example.com]\n[sade@example.com]\n[chidi@example.com]\n[EMEKA@example.org]\n[yusuf@example.com]\n[ngozi@example.com]\n[funmi+news@example.com]\n[bola@example.org]\n[sade@example.com]\n-----END DATA-----",
+  "category": "data",
+  "tags": ["data", "dedupe", "counting"],
+  "output": {
+    "format": "text",
+    "max_bytes": 256
+  }
+}

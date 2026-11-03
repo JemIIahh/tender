@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "kind": "json_schema",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["n", "mean_rating", "recommend_pct", "by_role", "low_rating_ids", "best_role"],
+    "properties": {
+      "n": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "mean_rating": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 5
+      },
+      "recommend_pct": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100
+      },
+      "by_role": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "low_rating_ids": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "best_role": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

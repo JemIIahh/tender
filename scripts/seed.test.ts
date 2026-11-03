@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1673,7 +1673,7 @@ test("no_secret_reaches_a_log_line_or_an_error_of_a_run_that_succeeds_or_fails",
 
 // ---- The seeds of the repository ----------------------------------------------------------------
 
-test("the_ten_seeds_of_the_repository_are_posted_in_slug_order_with_the_hashes_of_their_files", async () => {
+test("the_thirty_seeds_of_the_repository_are_posted_in_slug_order_with_the_hashes_of_their_files", async () => {
   const root = join(import.meta.dirname, "..", "seeds");
   const slugs = readdirSync(root, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
@@ -1686,25 +1686,30 @@ test("the_ten_seeds_of_the_repository_are_posted_in_slug_order_with_the_hashes_o
   const { result, chain, api, lines, failure } = await run(null);
 
   expect(failure).toBeUndefined();
-  expect(slugs).toHaveLength(10);
+  expect(slugs).toHaveLength(30);
   expect(result?.map((posted) => posted.slug)).toEqual(slugs);
   expect(result?.map((posted) => posted.status)).toEqual(slugs.map(() => "posted"));
-  expect(lines.filter((line) => line.startsWith("SEEDED "))).toHaveLength(10);
+  expect(lines.filter((line) => line.startsWith("SEEDED "))).toHaveLength(30);
   expect(chain.posts.map((post) => post.briefHash)).toEqual(
     slugs.map((slug) => hashOf(fileOf(slug, "brief.json"))),
   );
   expect(chain.posts.map((post) => post.criteriaHash)).toEqual(
     slugs.map((slug) => hashOf(fileOf(slug, "criteria.json"))),
   );
+  // A rubric seed has no held-out checks, so its task carries no commitment.
+  const withChecks = slugs.filter((slug) => existsSync(join(root, slug, "heldout.json")));
+  expect(withChecks).toHaveLength(25);
   expect(chain.posts.map((post) => post.heldoutCommitment)).toEqual(
-    slugs.map((slug) => hashOf(fileOf(slug, "heldout.json"))),
+    slugs.map((slug) =>
+      withChecks.includes(slug) ? hashOf(fileOf(slug, "heldout.json")) : undefined,
+    ),
   );
-  expect(api.heldouts).toHaveLength(10);
-  // Every reward from 0.25 to 1.50, in units: 7.00 in all, which is what the vault was filled with.
+  expect(api.heldouts).toHaveLength(25);
+  // Every reward from 0.25 to 1.50, in units: 22.50 in all, which is what the vault was filled with.
   const rewards = chain.posts.map((post) => post.reward);
   expect(rewards.every((reward) => reward >= 250_000n && reward <= 1_500_000n)).toBe(true);
-  expect(rewards.reduce((sum, reward) => sum + reward, 0n)).toBe(7_000_000n);
-  expect(chain.deposit.mock.calls).toEqual([[TOKEN, 7_000_000n]]);
+  expect(rewards.reduce((sum, reward) => sum + reward, 0n)).toBe(22_500_000n);
+  expect(chain.deposit.mock.calls).toEqual([[TOKEN, 22_500_000n]]);
   expect(new Set(chain.posts.map((post) => post.verifier))).toEqual(new Set([JUDGE]));
 });
 

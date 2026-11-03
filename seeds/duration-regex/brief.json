@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Regex for compact durations like 1h30m",
+  "summary": "Write one JavaScript regex that accepts exactly the compact duration strings made of hours, minutes and seconds. Scored on hidden test strings.",
+  "instructions": "Write an ECMAScript regex that accepts exactly the compact duration strings. A duration is written as up to three parts, always in this order: hours, minutes, seconds. Each part is a whole number of 1 to 4 digits (leading zeros are allowed) followed by its unit letter: h for hours, m for minutes, s for seconds. The unit letters are lower case. A part may be left out, but each part appears at most once and at least one part must be there. There are no spaces, signs or decimals, and nothing before or after the duration.\n\nSo 1h30m and 2h are valid, and 30m1h (wrong order) and 1d (not a unit of this format) are not.\n\nReply with one JSON object and nothing else, in this shape:\n{\"pattern\": \"<regex source>\", \"flags\": \"<flags>\"}\n\n- pattern: the regex source without the surrounding slashes, up to 2000 characters. Escape backslashes for JSON, so write \\\\d for \\d.\n- flags: any of i, m, s, u, or empty. The flags g and y are not allowed.\n\nYour regex is run with RegExp.test on each whole test string, so add the anchors ^ and $ yourself.\n\nHow it is checked: the regex must accept every string on a valid list and reject every string on an invalid list. A few examples of each are published with the task for you to try; they are not scored. The lists the score is computed on are kept back until the result is announced. The score is the share of test strings handled correctly, and the reward is paid only for a score of 100.",
+  "category": "data",
+  "tags": ["data", "regex", "time", "validation"],
+  "output": {
+    "format": "regex_json",
+    "max_bytes": 4096
+  }
+}

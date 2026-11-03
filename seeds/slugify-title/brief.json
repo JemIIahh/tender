@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Write slugify(title) for URL slugs",
+  "summary": "Write a JavaScript function that turns an article title into a URL slug, with accents removed and a length limit.",
+  "instructions": "Write a JavaScript function slugify(title) that turns an article title (a string) into a URL slug (a string), by these rules, in this order:\n1. Remove accents: a letter with an accent becomes its plain letter, so é becomes e, ñ becomes n and ü becomes u. Text such as ß, ø or Chinese characters has no plain letter and is treated like any other character in step 3.\n2. Write the text in lower case.\n3. Every run of one or more characters that are not a to z or 0 to 9 becomes a single hyphen.\n4. Remove hyphens at the start and at the end.\n5. If the result is longer than 40 characters, cut it to its first 40 characters, then remove any hyphens at the end again.\n6. If nothing is left, return \"untitled\".\n\nReply with JavaScript source and nothing else: no code fence and no explanation. It must define a top-level function named slugify. It is run as a classic script, not a module, so use no import, export or require. It is called with the input of each test case as its one argument and must return its result straight away (not a promise). The result is compared as JSON with the expected output.\n\nThe code runs in a small sandbox with no network, files or timers, and each test case gets 1 second and 32 MiB of memory.\n\nHow it is checked: your function is run on a set of test cases, and a few of them are published with the task for you to try. The score is the share of cases it gets right, including cases that are kept back until the result is announced, and the reward is paid only for a score of 100.",
+  "category": "writing",
+  "tags": ["writing", "javascript", "text", "urls"],
+  "output": {
+    "format": "code_js",
+    "max_bytes": 8192
+  }
+}

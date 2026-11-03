@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "kind": "json_schema",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["references", "total_authors", "earliest_year", "venue_most_frequent"],
+    "properties": {
+      "references": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["n", "first_author", "author_count", "year", "title", "venue", "pages"],
+          "properties": {
+            "n": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "first_author": {
+              "type": "string",
+              "minLength": 1
+            },
+            "author_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "year": {
+              "type": "integer",
+              "minimum": 1900
+            },
+            "title": {
+              "type": "string",
+              "minLength": 1
+            },
+            "venue": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pages": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      },
+      "total_authors": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "earliest_year": {
+        "type": "integer",
+        "minimum": 1900
+      },
+      "venue_most_frequent": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}
