@@ -11,6 +11,11 @@ import { webPort } from "./e2e/chain/run";
 // near-sandbox uses: set NEAR_SANDBOX_BIN_PATH to it, or near-sandbox downloads one. The web server
 // is `next dev` in this directory, so it can't run beside the fixture suite's, or beside any other
 // `next dev` here. A server that is already on the port is an error, not a server to test.
+//
+// The dev wallet's key is in the code that the web server sends to the page (Next inlines the
+// `NEXT_PUBLIC_*` values), so the trace of a failed spec, in `test-results/chain/`, and the dev
+// server's output, in `.next/`, hold it. It is the key of a throwaway account on a chain that is
+// gone when the run ends, and both directories are git-ignored.
 
 export default defineConfig({
   testDir: "./e2e/chain",
@@ -28,6 +33,9 @@ export default defineConfig({
   // compiles on its first request.
   timeout: 180_000,
   expect: { timeout: 20_000 },
+  // Inside the fixture suite's `test-results`, so that the ignore rule it has covers this too. The
+  // cost: a run of the fixture suite clears that directory, and with it the traces of a failed
+  // chain run, so look at those first.
   outputDir: "./test-results/chain",
   use: {
     baseURL: `http://localhost:${webPort()}`,

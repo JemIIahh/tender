@@ -38,10 +38,11 @@ import { GiveUp, limited, messageOf, type Poll, sleep, until } from "./waits";
 //   them itself. It stops what it started in the order that asks the least of the rest: the web
 //   server, the services, the chain.
 // - What a part could not stop is found in the process table and ended by its own pid: first
-//   SIGTERM, then SIGKILL after a short grace. The web server is found as the tree below the pid
-//   that was started. The chain's node is found by the run's temp dir, which is in its command
-//   line, because the node is started with the OS temp dir pointed at the run's (see `startNode`).
-//   Only children and grandchildren of this process are ever ended.
+//   SIGTERM, then SIGKILL after a short grace. The web server is the child that was spawned, which
+//   Node can name, and the tree below it. The chain's node is found by the run's temp dir, which
+//   is in its command line, because the node is started with the OS temp dir pointed at the run's
+//   (see `startNode`). Only children and grandchildren of this process are ever ended. Where `ps`
+//   cannot be run, the stop says so: it does not take the machine for clean.
 // - If the process itself ends without a stop (an uncaught error, or `process.exit` by the runner
 //   after a second Ctrl-C), a handler on `exit` does the same ending, with no wait.
 //
@@ -91,10 +92,16 @@ const say = (line: string) => process.stdout.write(`chain suite: ${line}\n`);
 
 /** The web server this run started. */
 interface Web {
+  /**
+   * The server's own process. Node knows it is still the one that was spawned while it has not
+   * exited: the system gives its pid to no other process before the parent has seen it go.
+   */
   child: ChildProcess;
-  /** The server itself, to tell it from another process that gets its pid later. */
-  proc: Proc;
-  /** The processes below it as they were last seen, for when it has gone and left them. */
+  /**
+   * The processes below it as they were last seen, for when it has gone and left them. They are
+   * not children of this process, so each is told from another that gets its pid later by its
+   * start time.
+   */
   below: Proc[];
   /** Set when it has exited. */
   exit?: { code: number | null; signal: NodeJS.Signals | null };
@@ -281,7 +288,6 @@ async function bringUp(s: Stack, { webPort }: StackOptions): Promise<RunInfo> {
     const dev = await limited("the dev wallet's account", STEP_MS, createDevAccount(chain), signal);
 
     say(`starting the web server on port ${webPort}`);
-    const webUrl = `http://localhost:${webPort}`;
     await startWeb(s, {
       port: webPort,
       logFile: join(runDir, "next.log"),
@@ -310,7 +316,6 @@ async function bringUp(s: Stack, { webPort }: StackOptions): Promise<RunInfo> {
     });
 
     const info: RunInfo = {
-      webUrl,
       apiUrl: services.publicUrl,
       rpcUrl: chain.rpcUrl,
       contractId: chain.contractId,
@@ -362,7 +367,10 @@ async function makeRunDir(s: Stack): Promise<string> {
  * near-sandbox makes the node's home dir, and the lock files of its ports, in the OS temp dir. So
  * they are made inside the run's dir and go with it, and the node's command line holds the run's
  * dir, which is how the final sweep finds a node that nothing else could stop: one whose start
- * failed (near-sandbox leaves it running then), or whose stop was never reached.
+ * failed (near-sandbox leaves it running then), or whose stop was never reached. The cost: the
+ * lock files that keep two sandboxes starting at once from taking the same port are no longer
+ * shared with the other sandboxes on the machine, so that is left to the system, which gives out
+ * free ports at random, and a clash is unlikely.
  */
 async function startNode(runDir: string): Promise<LocalChain> {
   const saved = process.env.TMPDIR;
@@ -579,12 +587,7 @@ async function startWeb(s: Stack, options: WebOptions): Promise<Web> {
     closeSync(log);
   }
   const pid = child.pid;
-  const web: Web = {
-    child,
-    proc: { pid: pid ?? -1, ppid: process.pid, started: "", command: "next dev" },
-    below: [],
-    logFile,
-  };
+  const web: Web = { child, below: [], logFile };
   s.web = web;
   child.once("exit", (code, exitSignal) => {
     web.exit = { code, signal: exitSignal };
@@ -597,8 +600,6 @@ async function startWeb(s: Stack, options: WebOptions): Promise<Web> {
     await sleep(0);
     throw new Error(`cannot start the web server: ${spawnError?.message ?? "no pid"}`);
   }
-  const mine = listProcesses().find((row) => row.pid === pid);
-  if (mine !== undefined) web.proc = mine;
 
   const base = `http://localhost:${port}`;
   const dead = () => {
@@ -619,6 +620,8 @@ async function startWeb(s: Stack, options: WebOptions): Promise<Web> {
     signal,
     500,
   );
+  // What it has started by now: if it dies and leaves them, this is how they are found.
+  noteBelow(web);
   for (const route of options.routes) {
     const res = await limited(
       `the web server to compile ${route}`,
@@ -632,22 +635,41 @@ async function startWeb(s: Stack, options: WebOptions): Promise<Web> {
     await res.arrayBuffer();
   }
   dead();
-  web.below = descendantsOf([pid], listProcesses());
+  // Compiling the routes can have started more.
+  noteBelow(web);
   return web;
+}
+
+/**
+ * Remembers the processes now below the web server, besides those remembered already. They are not
+ * children of this process: if the server dies and leaves them to the system, only what was seen of
+ * them, each with the start time that tells it from a later process with its pid, finds them.
+ */
+function noteBelow(web: Web): void {
+  const { pid } = web.child;
+  if (pid === undefined) return;
+  const known = new Set(web.below.map((one) => `${one.pid}@${one.started}`));
+  for (const one of descendantsOf([pid], listProcesses())) {
+    if (!known.has(`${one.pid}@${one.started}`)) web.below.push(one);
+  }
 }
 
 // ---- Stopping ----------------------------------------------------------------------------------
 
 /**
  * The web server, if it is still running, and the processes below it: those now, and those it was
- * seen to have, if they are still there as they were.
+ * seen to have, if they are still there as they were. The server is told by Node, not by a start
+ * time: its pid is its own until Node has seen it exit.
  */
 function webProcesses(s: Stack, table: readonly Proc[]): Proc[] {
   const { web } = s;
   if (web === undefined) return [];
   const found = new Map<number, Proc>();
-  const server = table.find((row) => row.pid === web.proc.pid && row.started === web.proc.started);
-  if (server !== undefined) found.set(server.pid, server);
+  const { pid, exitCode, signalCode } = web.child;
+  if (pid !== undefined && exitCode === null && signalCode === null) {
+    const server = table.find((row) => row.pid === pid);
+    if (server !== undefined) found.set(server.pid, server);
+  }
   for (const one of web.below) {
     const row = table.find((r) => r.pid === one.pid && r.started === one.started);
     if (row !== undefined) found.set(row.pid, row);
@@ -659,15 +681,11 @@ function webProcesses(s: Stack, table: readonly Proc[]): Proc[] {
 /**
  * Every process of the run that is still running: the web server and what is below it, and any
  * child or grandchild of this process whose command line holds the run's dir (the chain's node),
- * with whatever those have started.
+ * with whatever those have started. Throws where `ps` cannot be run: a stop that cannot see the
+ * processes has to say so, and not take it for none.
  */
 function runProcesses(s: Stack): Proc[] {
-  let table: Proc[];
-  try {
-    table = listProcesses();
-  } catch {
-    return [];
-  }
+  const table = listProcesses();
   const found = new Map<number, Proc>();
   for (const one of webProcesses(s, table)) found.set(one.pid, one);
   for (const one of descendantsOf([process.pid], table)) {
@@ -789,7 +807,13 @@ async function stopAll(s: Stack): Promise<void> {
 function hook(s: Stack): void {
   if (s.hooked) return;
   s.hooked = true;
-  const onExit = () => killNow(runProcesses(s));
+  const onExit = () => {
+    try {
+      killNow(runProcesses(s));
+    } catch {
+      // `ps` cannot be run, and the process is ending: there is nowhere left to say so.
+    }
+  };
   process.on("exit", onExit);
   s.unhook.push(() => process.off("exit", onExit));
   for (const [name, code] of [

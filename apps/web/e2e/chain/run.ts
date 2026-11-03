@@ -30,8 +30,6 @@ export interface RunSeed {
 }
 
 export interface RunInfo {
-  /** Where the web server listens, as the browser calls it: `http://localhost:<port>`. */
-  webUrl: string;
   /** The API's base URL, in the spelling the sign-in is bound to. The web app is built for it. */
   apiUrl: string;
   /** The local chain's JSON-RPC endpoint. */

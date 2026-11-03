@@ -1,4 +1,5 @@
 import { expect, type Page, test } from "@playwright/test";
+import { cardTitled } from "./cards";
 import { loadRun } from "./run";
 
 // Every page of the app on a phone, with the data of the run's services in it: the board with the
@@ -31,7 +32,7 @@ test("phone_width_has_no_horizontal_scroll", async ({ page }) => {
       "/",
       async () => {
         for (const { title } of run.seeds) {
-          await expect(page.getByTestId("task-card").filter({ hasText: title })).toBeVisible();
+          await expect(cardTitled(page, title)).toBeVisible();
         }
       },
     ],

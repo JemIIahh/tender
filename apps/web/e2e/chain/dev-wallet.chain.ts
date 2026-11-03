@@ -1,6 +1,8 @@
 import { expect, type Page, test } from "@playwright/test";
 import { ApiClient, TenderClient } from "@tender/client";
 import { formatTokenAmount, sha256Hex } from "@tender/shared";
+import { TEAM_LABEL } from "../fixtures";
+import { cardTitled } from "./cards";
 import { loadRun, type RunInfo } from "./run";
 
 // The pages that move money, with the dev wallet: a wallet in the page that signs with the key of
@@ -279,4 +281,17 @@ test("post_task_end_to_end", async ({ page }) => {
     .toMatch(/^accepted\b/);
   await page.reload();
   await expect(page.getByTestId("judge-note")).toContainText("Judge: accepted");
+
+  // The board lists the task under the account that posted it, and without the team's label, as
+  // that account is not the team's. The board spec shows the label where it belongs; this shows the
+  // page does not put it on every poster.
+  await page.goto("/");
+  const card = cardTitled(page, TITLE);
+  await expect(card, "the card of the task the wizard posted").toBeVisible();
+  const poster = card.getByTestId("poster");
+  await expect(poster, "the poster of the task the wizard posted").toContainText(run.dev);
+  await expect(
+    poster.getByText(TEAM_LABEL, { exact: true }),
+    "the team label on a poster that is not the team's",
+  ).toHaveCount(0);
 });

@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { TEAM_LABEL } from "../fixtures";
+import { cardTitled } from "./cards";
 import { loadRun } from "./run";
 
 // The board against the services of the run: the two seeds the setup posted on the local chain,
@@ -10,7 +11,7 @@ test("board_renders_seeded_tasks", async ({ page }) => {
   await page.goto("/");
 
   for (const { slug, title } of run.seeds) {
-    const card = page.getByTestId("task-card").filter({ hasText: title });
+    const card = cardTitled(page, title);
     await expect(card, `the card of the seed ${slug} ("${title}")`).toBeVisible();
     // The label is on the poster's line, where a reader looks for who is behind the task. The
     // services count the account that posted the seeds as the team's.
