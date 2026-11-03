@@ -107,6 +107,38 @@ test("scorecard_shows_recompute_line_after_pick", async ({ page }) => {
   expect(sha256Hex(decodeURIComponent((href ?? "").slice(prefix.length)))).toBe(HELDOUT_COMMITMENT);
 });
 
+// The settled page is the widest one: a scorecard table, the payouts, and the recompute line with
+// the 64 hex characters of the commitment. "/tasks/3" (board.spec.ts) is the extreme of its data;
+// this is the page that a Judge's pick turns the open one into, looked at on a phone.
+test("settled_task_page_fits_a_phone", async ({ page }) => {
+  const phone = { width: 375, height: 812 };
+  await page.setViewportSize(phone);
+  await page.clock.install({ time: at(AT.reveal + 60n * SECOND) });
+  const api = await routeApi(page);
+  api.reveal("2", "alice.testnet", HASH_A);
+  api.reveal("2", "bob.testnet", HASH_B);
+  await page.goto(TASK);
+  await expect(chip(page)).toHaveText("Judging");
+
+  const before = api.details.get("2");
+  if (!before) throw new Error("the fixture has no task 2");
+  api.settle(pickedPage(before));
+
+  await expect(chip(page)).toHaveText("Settled");
+  for (const id of ["scorecard", "payouts", "recompute"]) {
+    await expect(page.getByTestId(id), `the ${id} of the settled page`).toBeVisible();
+  }
+  const { client, ...scroll } = await page.evaluate(() => ({
+    client: document.documentElement.clientWidth,
+    page: document.documentElement.scrollWidth,
+    body: document.body.scrollWidth,
+  }));
+  // The room is the screen, less the width of a scrollbar where one takes any (`clientWidth`).
+  const room = Math.min(phone.width, client);
+  expect(scroll.page, "the page is wider than the screen").toBeLessThanOrEqual(room);
+  expect(scroll.body, "the body is wider than the screen").toBeLessThanOrEqual(room);
+});
+
 test("api_down_shows_error_state", async ({ page }) => {
   await page.route(`${API_URL}/**`, (route) => route.abort("connectionrefused"));
 
