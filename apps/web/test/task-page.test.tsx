@@ -736,6 +736,24 @@ test("a_burst_of_events_is_one_load_of_the_task_and_its_verifier", async () => {
   expect(api.count(AGENT_PATH)).toBe(2);
 });
 
+test("a_stream_that_never_goes_quiet_still_loads_the_task", async () => {
+  const api = fakeApi(routes());
+  await open();
+  const stream = FakeEventSource.latest;
+  expect(api.count(TASK_PATH)).toBe(1);
+
+  // An event every 100 ms for longer than the page will wait: no moment of quiet ever comes, and
+  // the page has to ask all the same, before the stream stops.
+  for (let i = 0; i < 26; i++) {
+    act(() =>
+      stream.send("committed", message("committed", "7", committedData("7")), String(11 + i)),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  expect(api.count(TASK_PATH)).toBeGreaterThanOrEqual(2);
+});
+
 // ---- A task the index has not read yet ----------------------------------------------------------
 
 /** What the node answers to a view that returned `value`. */

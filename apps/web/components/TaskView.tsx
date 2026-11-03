@@ -66,6 +66,12 @@ const INDEX_POLL_WINDOW_MS = 5 * 60_000;
  * replay after a phone wakes, then costs one load and not one for each event.
  */
 const EVENTS_QUIET_MS = 300;
+/**
+ * The longest a burst keeps the page waiting. A stream that never goes quiet (a replay that
+ * repeats, a server that sends without end) would put off the load for good, and the page would
+ * show a task that has moved on without saying so.
+ */
+const EVENTS_MAX_WAIT_MS = 2_000;
 
 /**
  * What the chain itself says of task `id`, read through the browser's RPC node: the index lags the
@@ -314,10 +320,21 @@ export function TaskView({
   }, [load]);
 
   // The stream said something changed here, or it opened with nothing to resume from. A burst of
-  // them is one load, a moment after the last.
+  // them is one load, a moment after the last, and no later than `EVENTS_MAX_WAIT_MS` after the
+  // first.
+  const burstSince = useRef<number | null>(null);
   useEffect(() => {
     if (events === 0) return;
-    const timer = setTimeout(() => load(true), EVENTS_QUIET_MS);
+    // The monotonic clock: the wall clock can be set back, or stand still in a test, and a burst
+    // must still end.
+    const now = performance.now();
+    const since = burstSince.current ?? now;
+    burstSince.current = since;
+    const wait = Math.min(EVENTS_QUIET_MS, Math.max(0, since + EVENTS_MAX_WAIT_MS - now));
+    const timer = setTimeout(() => {
+      burstSince.current = null;
+      load(true);
+    }, wait);
     return () => clearTimeout(timer);
   }, [events, load]);
 
