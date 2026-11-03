@@ -440,6 +440,18 @@ test("balances_are_read_again_after_a_send_and_once_more_when_the_node_is_behind
   );
 });
 
+test("the_page_says_it_is_reading_the_balances_in_the_words_the_post_review_uses", async () => {
+  setup({ connected: true });
+  // A node that does not answer: the page is reading, and says so.
+  vi.stubGlobal("fetch", () => new Promise<Response>(() => {}));
+
+  render(<WalletView />);
+
+  await waitFor(() =>
+    expect(screen.getByRole("status").textContent).toBe("Reading your balances…"),
+  );
+});
+
 test("disconnect_takes_the_balances_away_and_leaves_the_focus_on_the_page", async () => {
   const { user } = setup({ connected: true });
   render(<WalletView />);

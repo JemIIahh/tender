@@ -330,7 +330,7 @@ test("a_regex_task_is_posted_from_the_page_with_the_deposit_first", async () => 
   expect(testId("review-heldout")).toBe("4 cases");
   expect(testId("review-prize")).toBe("Winner takes all");
   expect(testId("review-windows")).toBe(
-    "Commit 10m · Reveal 5m · Judge 10m · Fallback 10m. 35m in all.",
+    "Commit 10m · Reveal 5m · Judging 10m · Fallback 10m. 35m in all.",
   );
   expect(testId("review-verifier")).toBe("Tender Judge (run by the Tender team) · judge.testnet");
   expect(testId("review-account")).toBe(ALICE);
@@ -636,7 +636,7 @@ test("custom_windows_are_what_the_task_is_posted_with", async () => {
   await stepHeading("Review");
 
   expect(testId("review-windows")).toBe(
-    "Commit 2h · Reveal 5m · Judge 10m · Fallback 10m. 2h 25m in all.",
+    "Commit 2h · Reveal 5m · Judging 10m · Fallback 10m. 2h 25m in all.",
   );
   await user.click(await postReady());
   await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
@@ -1956,6 +1956,37 @@ test("the_reward_step_names_each_group_once_and_puts_the_token_in_the_amounts_he
     "Paid in tusdc.testnet. At least 1.00 tUSDC",
   );
   expect(screen.getAllByText(/Paid in/)).toHaveLength(1);
+});
+
+test("the_fee_is_said_on_review_and_not_on_the_reward_step", async () => {
+  const { user } = setup();
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReward(user);
+
+  // The amount's help says what the amount can be; what Tender keeps is told once, on Review.
+  expect(document.body.textContent).not.toContain("Tender keeps");
+  fill("Amount (tUSDC)", "5");
+  await press(user, "Review");
+  await stepHeading("Review");
+  expect(testId("review-reward")).toBe("5.00 tUSDC · Tender keeps 5% when it is paid out.");
+  expect(document.body.textContent?.match(/Tender keeps/g)).toHaveLength(1);
+});
+
+test("the_balances_are_being_read_in_the_same_words_on_every_line_of_review", async () => {
+  const { user } = setup({ vault: TUSDC(2) });
+  const inner = globalThis.fetch;
+  // The node does not answer for the balances: the read is under way for as long as the test looks.
+  vi.stubGlobal("fetch", (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+    String(init?.body).includes('"balances_of"')
+      ? new Promise<Response>(() => {})
+      : inner(input, init),
+  );
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  // The funding row and the line under Post say it alike, and as the Wallet page says it.
+  await waitFor(() => expect(testId("review-funding")).toBe("Reading your balances…"), LONG);
+  expect(screen.getByRole("status").textContent).toBe("Reading your balances…");
 });
 
 // ---- Source rules -------------------------------------------------------------------------------

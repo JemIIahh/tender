@@ -3,7 +3,7 @@ import { useMemo } from "react";
 import { formatBps } from "../lib/bps";
 
 /**
- * The held-out document as a download: the same bytes that were hashed into the commitment, which
+ * The held-out checks as a download: the same bytes that were hashed into the commitment, which
  * are its canonical JSON. A reader runs `shasum -a 256` on the file and compares.
  *
  * Undefined for a document that cannot be written that way. The verifier wrote it, and JSON can
@@ -15,7 +15,7 @@ function heldoutHref(heldout: unknown): string | undefined {
     const text = new TextDecoder().decode(canonicalJson(heldout));
     return `data:application/json;charset=utf-8,${encodeURIComponent(text)}`;
   } catch (error) {
-    console.error("scorecard: the held-out document cannot be written as canonical JSON", error);
+    console.error("scorecard: the held-out checks cannot be written as canonical JSON", error);
     return undefined;
   }
 }
@@ -50,7 +50,7 @@ export function ScoredBy({
 
 /**
  * The result of a pick: how each revealed entry scored and why, who won, and what a reader needs to
- * check the scores against the task's held-out document.
+ * check the scores against the task's held-out checks.
  *
  * `commitment` is the task's own `heldout_commitment` from the chain, which the verifier does not
  * choose. The scorecard carries one too, and a scorecard whose commitment differs from the task's
@@ -158,19 +158,19 @@ export function Scorecard({
 
       <div className="grid gap-1 text-sm">
         {expected === null ? (
-          <p>This task has no held-out document.</p>
+          <p>This task has no held-out checks.</p>
         ) : (
           <>
             <p data-testid="recompute" className="font-mono wrap-anywhere">
               {`Recompute: sha256(held-out) must equal ${expected}`}
             </p>
             {scorecard.heldout === null ? (
-              <p>The verifier has not published the held-out document.</p>
+              <p>The verifier has not published the held-out checks.</p>
             ) : href === undefined ? (
-              <p>The held-out document cannot be written out as a file.</p>
+              <p>The held-out checks cannot be written out as a file.</p>
             ) : (
               <a href={href} download="heldout.json" className="w-fit underline">
-                Held-out document (JSON)
+                Held-out checks (JSON)
               </a>
             )}
           </>

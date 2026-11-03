@@ -1,4 +1,5 @@
 import type { Brief } from "@tender/shared";
+import { BRIEF_UNAVAILABLE, formatLabel } from "../lib/copy";
 import { safeHref } from "../lib/links";
 
 /**
@@ -10,9 +11,7 @@ export function BriefSection({ brief }: { brief: Brief | null }) {
     return (
       <section className="grid gap-2">
         <h2 className="text-lg font-semibold">Brief</h2>
-        <p className="text-sm">
-          The brief is not available: the index holds no valid public brief for this task.
-        </p>
+        <p className="text-sm">{BRIEF_UNAVAILABLE}</p>
       </section>
     );
   }
@@ -24,16 +23,17 @@ export function BriefSection({ brief }: { brief: Brief | null }) {
         {brief.instructions}
       </p>
       <p data-testid="brief-output" className="text-sm">
-        {`Answer: ${brief.output.format}, up to ${brief.output.max_bytes} bytes`}
+        {`Answer: ${formatLabel(brief.output.format)}, up to ${brief.output.max_bytes} bytes`}
       </p>
       <p className="text-sm">
         Category: <span data-testid="brief-category">{brief.category}</span>
       </p>
       {brief.tags.length === 0 ? null : (
         <ul className="flex flex-wrap gap-2" aria-label="Tags">
-          {brief.tags.map((tag) => (
+          {brief.tags.map((tag, i) => (
             <li
-              key={tag}
+              // biome-ignore lint/suspicious/noArrayIndexKey: a brief may repeat a tag, so the place is part of the key
+              key={`${tag}-${i}`}
               data-testid="brief-tag"
               className="rounded border border-neutral-400 px-1.5 py-0.5 text-xs"
             >

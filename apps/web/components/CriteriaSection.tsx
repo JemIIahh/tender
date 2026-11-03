@@ -1,5 +1,6 @@
 import type { PublicCriteria } from "@tender/shared";
 import { formatBps } from "../lib/bps";
+import { CRITERIA_UNAVAILABLE, kindLabel } from "../lib/copy";
 
 /** How the prize is shared, in words. */
 function splitText(split: PublicCriteria["split"]): string {
@@ -99,10 +100,7 @@ export function CriteriaSection({ criteria }: { criteria: PublicCriteria | null 
     return (
       <section className="grid gap-2">
         <h2 className="text-lg font-semibold">Criteria</h2>
-        <p className="text-sm">
-          The public criteria are not available: the index holds no valid public criteria for this
-          task.
-        </p>
+        <p className="text-sm">{CRITERIA_UNAVAILABLE}</p>
       </section>
     );
   }
@@ -111,7 +109,7 @@ export function CriteriaSection({ criteria }: { criteria: PublicCriteria | null 
       <h2 className="text-lg font-semibold">Criteria</h2>
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
         <dt>Scored by</dt>
-        <dd data-testid="criteria-kind">{criteria.kind}</dd>
+        <dd data-testid="criteria-kind">{kindLabel(criteria.kind)}</dd>
         <dt>Pass mark</dt>
         <dd data-testid="criteria-pass-mark">{`${criteria.min_score} of 100`}</dd>
         <dt>Prize</dt>
@@ -119,8 +117,8 @@ export function CriteriaSection({ criteria }: { criteria: PublicCriteria | null 
       </dl>
       <p data-testid="criteria-heldout" className="text-sm">
         {criteria.has_heldout
-          ? "A held-out document stands behind these criteria. Its hash is on the task."
-          : "No held-out document."}
+          ? "Held-out checks stand behind these criteria. Their hash is on the task."
+          : "No held-out checks."}
       </p>
       <div data-testid="criteria-detail" className="grid gap-2 text-sm">
         <Detail criteria={criteria} />

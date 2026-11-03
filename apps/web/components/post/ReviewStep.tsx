@@ -2,6 +2,7 @@
 
 import { type ReactNode, useMemo } from "react";
 import { formatBps } from "../../lib/bps";
+import { READING_BALANCES } from "../../lib/copy";
 import {
   FORMAT_LABEL,
   filledAssertions,
@@ -37,7 +38,7 @@ const PROGRESS: Record<Stage, string> = {
   check: "Looking for your earlier post on the chain.",
   signin: "Signing in to Tender. Approve the message in your wallet.",
   upload: "Saving your task's documents with Tender.",
-  vault: "Reading your balances.",
+  vault: READING_BALANCES,
   wallet: "Waiting for your wallet. Approve the transactions there.",
 };
 
@@ -175,7 +176,7 @@ export function ReviewStep(props: {
         ? `Your vault: ${describeAmount(funding.inVault, tokenId)}, enough already.`
         : `Your vault: ${describeAmount(funding.inVault, tokenId)}. Added from your wallet first: ${describeAmount(funding.toDeposit, tokenId)}.`
       : reward !== null && vault.status === "loading"
-        ? "Reading your balances…"
+        ? READING_BALANCES
         : "—";
 
   // Why Post is off, in the order a person can put it right. A wallet that is not connected, or
@@ -293,7 +294,7 @@ export function ReviewStep(props: {
             {WALLET_CANNOT_SIGN_MESSAGE}
           </p>
         ) : vault.status === "loading" || vault.status === "idle" ? (
-          <p role="status">Reading your balances…</p>
+          <p role="status">{READING_BALANCES}</p>
         ) : vault.status === "error" ? (
           <ErrorState message={vault.message} retrying={vault.retrying} onRetry={props.onRecheck} />
         ) : null}

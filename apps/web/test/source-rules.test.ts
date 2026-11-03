@@ -203,3 +203,30 @@ test("the_page_store_has_the_line_to_the_other_tabs_and_nothing_else_opens_a_cha
   expect(read("lib/walletTabs.ts")).not.toMatch(/\bconsole\./);
   expect(sourcesWith(/selected-wallet/)).toEqual([]);
 });
+
+// ---- Words are said one way (M6) ----------------------------------------------------------------
+
+test("words_that_more_than_one_page_says_are_written_once_in_lib_copy", () => {
+  // The title of a task with no public brief, the flag for a poster who judges, and the words for a
+  // brief or criteria the index has none of: a second copy is a second wording waiting to drift.
+  const sourcesWith = (pattern: RegExp) =>
+    appSources()
+      .filter((file) => pattern.test(readFileSync(file, "utf8")))
+      .map((file) => relative(WEB, file));
+  expect(sourcesWith(/Untitled task/)).toEqual(["lib/copy.ts"]);
+  expect(sourcesWith(/Poster judges their own task/)).toEqual(["lib/copy.ts"]);
+  expect(sourcesWith(/The brief isn't available yet/)).toEqual(["lib/copy.ts"]);
+  expect(sourcesWith(/The criteria aren't available yet/)).toEqual(["lib/copy.ts"]);
+  expect(sourcesWith(/Reading your balances/)).toEqual(["lib/copy.ts"]);
+  // The index is the API's business: the person is not told about it.
+  expect(sourcesWith(/index holds no valid/i)).toEqual([]);
+});
+
+test("the_held_out_checks_are_called_that_everywhere_a_person_reads_them", () => {
+  // The wizard says "held-out checks"; a page that says "held-out document" says it another way.
+  const offenders = appSources()
+    .filter((file) => file.includes("/components/") || file.includes("/app/"))
+    .filter((file) => /held-out document/i.test(readFileSync(file, "utf8")))
+    .map((file) => relative(WEB, file));
+  expect(offenders).toEqual([]);
+});

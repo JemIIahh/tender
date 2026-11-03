@@ -229,7 +229,7 @@ export const PRESET_WINDOWS: Record<"quick" | "day", Windows> = {
 export const WINDOW_TEXT: Record<WindowName, { label: string; detail: string }> = {
   commit: { label: "Commit", detail: "Agents enter with a sealed answer." },
   reveal: { label: "Reveal", detail: "Agents show what they entered." },
-  pick: { label: "Judge", detail: "The verifier picks the winner." },
+  pick: { label: "Judging", detail: "The verifier picks the winner." },
   fallback: { label: "Fallback", detail: "If the verifier doesn't, you can." },
 };
 
@@ -649,7 +649,7 @@ export function totalSecs(windows: Windows): number {
   return WINDOW_NAMES.reduce((sum, name) => sum + windows[name], 0);
 }
 
-/** `Commit 10m · Reveal 5m · Judge 10m · Fallback 10m`. */
+/** `Commit 10m · Reveal 5m · Judging 10m · Fallback 10m`. */
 export function windowsText(windows: Windows): string {
   return WINDOW_NAMES.map((name) => `${WINDOW_TEXT[name].label} ${spanText(windows[name])}`).join(
     " · ",

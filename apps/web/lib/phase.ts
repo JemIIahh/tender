@@ -125,7 +125,7 @@ export const RULES: Record<Phase, Rule> = {
 export const WINDOW_LABELS: Record<WindowPhase | "expired", string> = {
   open: "Commit",
   revealing: "Reveal",
-  judging: "Judge",
+  judging: "Judging",
   fallback: "Fallback",
   expired: "Expired",
 };

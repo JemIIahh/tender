@@ -1,7 +1,6 @@
 "use client";
 
 import { tokenMeta } from "@tender/shared";
-import { formatBps } from "../../lib/bps";
 import { config } from "../../lib/config";
 import {
   DURATION_UNITS,
@@ -167,9 +166,8 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
                 {limits.tokens.length > 1 ? "" : `Paid in ${chosen.token}. `}
                 {`At least ${describeAmount(chosen.minReward, chosen.token)}`}
                 {chosen.maxReward < NO_REAL_LIMIT
-                  ? `, at most ${describeAmount(chosen.maxReward, chosen.token)}`
-                  : ""}
-                {`. Tender keeps ${formatBps(limits.feeBps)} of it when it is paid out.`}
+                  ? `, at most ${describeAmount(chosen.maxReward, chosen.token)}.`
+                  : "."}
               </>
             }
             inputMode="decimal"

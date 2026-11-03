@@ -11,6 +11,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { useNowNs } from "../lib/clock";
 import { config } from "../lib/config";
+import { UNTITLED_TASK } from "../lib/copy";
 import { errorMessage } from "../lib/errors";
 import { useEvents } from "../lib/events";
 import { awaitsJudge, isJudgeAccount, JUDGE_POLL_MS } from "../lib/judge";
@@ -168,9 +169,7 @@ function ReadyView({
   return (
     <article className="grid gap-8">
       <header className="grid gap-2">
-        <h1 className="text-2xl font-semibold wrap-anywhere">
-          {task.title ?? "Untitled task (no public brief yet)"}
-        </h1>
+        <h1 className="text-2xl font-semibold wrap-anywhere">{task.title ?? UNTITLED_TASK}</h1>
         <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-neutral-700">
           <span>#{task.id}</span>
           <PhaseChip phase={phase} />

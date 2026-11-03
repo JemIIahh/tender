@@ -109,7 +109,8 @@ test("task_page_shows_the_task_with_all_its_parts", async () => {
   expect(within(screen.getByTestId("poster")).getByText("Run by Tender team")).toBeTruthy();
   expect(screen.getByTestId("phase-timeline")).toBeTruthy();
   expect(screen.getByTestId("brief-instructions")).toBeTruthy();
-  expect(screen.getByTestId("criteria-kind").textContent).toBe("regex_cases");
+  // The kind is called what the wizard called it.
+  expect(screen.getByTestId("criteria-kind").textContent).toBe("Regex cases");
   expect(screen.getByTestId("entry-summary").textContent).toBe("2 committed · 0 revealed");
   expect(screen.getByTestId("verifier-record")).toBeTruthy();
   const funders = screen.getAllByTestId("funder-row");
@@ -334,8 +335,8 @@ test("task_page_shows_the_title_of_a_task_with_no_public_brief", async () => {
   expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
     "Untitled task (no public brief yet)",
   );
-  expect(screen.getByText(/brief is not available/i)).toBeTruthy();
-  expect(screen.getByText(/public criteria are not available/i)).toBeTruthy();
+  expect(screen.getByText("The brief isn't available yet.")).toBeTruthy();
+  expect(screen.getByText("The criteria aren't available yet.")).toBeTruthy();
 });
 
 // ---- The clock --------------------------------------------------------------------------------

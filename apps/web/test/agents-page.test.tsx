@@ -437,12 +437,21 @@ const routes =
     return notFound();
   };
 
+/**
+ * The heading of the agent's page once the agent is in. Before then the heading is the account, so
+ * that a page in any state has one.
+ */
+const loadedHeading = async () => {
+  await screen.findByTestId("account");
+  return screen.getByRole("heading", { level: 1 });
+};
+
 test("agent_page_shows_the_profile_the_recent_entries_and_the_lineage", async () => {
   const api = fakeApi(routes());
   render(<AgentView account={ALICE} />);
 
   expect(screen.getByRole("status").textContent).toBe("Loading agent…");
-  const title = await screen.findByRole("heading", { level: 1 });
+  const title = await loadedHeading();
 
   expect(title.textContent).toBe("Alice Extractor");
   expect(screen.getByTestId("account").textContent).toBe(ALICE);
@@ -484,9 +493,12 @@ test("agent_page_shows_the_profile_the_recent_entries_and_the_lineage", async ()
     "Revealed: yes",
   );
   expect(within(entries[1] as HTMLElement).getByTestId("won").textContent).toBe("Won: yes");
-  // A task with no public brief has no title to show: its number stands in. It expired with no
-  // pick, which is decided: the agent did not win it.
-  expect(within(entries[2] as HTMLElement).getByRole("link").textContent).toBe("Task #9");
+  // A task with no public brief has no title to show: the stand-in is the one every list uses, and
+  // its number is beside it. It expired with no pick, which is decided: the agent did not win it.
+  expect(within(entries[2] as HTMLElement).getByRole("link").textContent).toBe(
+    "Untitled task (no public brief yet)",
+  );
+  expect(within(entries[2] as HTMLElement).getByText("#9")).toBeTruthy();
   expect(within(entries[2] as HTMLElement).getByTestId("won").textContent).toBe("Won: no");
 
   // The tasks it posted, each with the task it is a subtask of, if it is one.
@@ -546,7 +558,7 @@ test("agent_page_marks_an_agent_the_team_runs", async () => {
   fakeApi(routes(judge));
   render(<AgentView account={judge.account} />);
 
-  await screen.findByRole("heading", { level: 1 });
+  await loadedHeading();
 
   expect(within(screen.getByTestId("account")).getByTestId("team-badge").textContent).toBe(
     "Run by Tender team",
@@ -621,8 +633,39 @@ test("agent_page_failing_says_why_and_a_retry_reads_again", async () => {
   expect(api.calls).toEqual([`/v1/agents/${ALICE}`]);
   await user.click(screen.getByRole("button", { name: "Retry" }));
 
-  expect((await screen.findByRole("heading", { level: 1 })).textContent).toBe("Alice Extractor");
+  expect((await loadedHeading()).textContent).toBe("Alice Extractor");
   expect(api.calls.filter((call) => call.startsWith("/v1/agents/"))).toHaveLength(2);
+});
+
+// A page has a heading in every state: the account until the agent's own name is known.
+test("agent_page_has_a_heading_while_it_loads_when_it_finds_no_agent_and_when_it_fails", async () => {
+  let answer: Response | "never" = "never";
+  fakeApi(() => (answer === "never" ? new Promise<Response>(() => {}) : answer));
+  const first = render(<AgentView account={ALICE} />);
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(ALICE);
+  expect(screen.getByRole("status").textContent).toBe("Loading agent…");
+  first.unmount();
+
+  answer = notFound();
+  const second = render(<AgentView account="nobody.testnet" />);
+  await screen.findByText("There is no agent with this account.");
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("nobody.testnet");
+  second.unmount();
+
+  answer = json({ error: "unavailable", message: "try later" }, 503);
+  render(<AgentView account={ALICE} />);
+  await screen.findByTestId("error-state");
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(ALICE);
+  expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+});
+
+test("agent_page_heading_for_text_that_is_no_account_is_not_that_text", async () => {
+  fakeApi(() => notFound());
+
+  render(<AgentView account="Not An Account" />);
+
+  await screen.findByText("There is no agent with this account.");
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Agent");
 });
 
 test("agent_page_says_so_when_there_are_no_entries_and_no_tasks", async () => {
@@ -649,7 +692,7 @@ test("agent_page_links_a_profile_only_if_it_is_a_web_address", async () => {
   fakeApi(routes(agent({ ...alice, profile_uri: "javascript:alert(document.cookie)" })));
   const first = render(<AgentView account={ALICE} />);
 
-  await screen.findByRole("heading", { level: 1 });
+  await loadedHeading();
 
   expect(screen.queryByRole("link", { name: /Open profile document/ })).toBeNull();
   expect(
@@ -666,7 +709,7 @@ test("agent_page_links_a_profile_only_if_it_is_a_web_address", async () => {
     ),
   );
   render(<AgentView account={ALICE} />);
-  await screen.findByRole("heading", { level: 1 });
+  await loadedHeading();
   expect(screen.queryByRole("link", { name: /Open profile document/ })).toBeNull();
 });
 
@@ -681,7 +724,7 @@ test("agent_page_shows_what_the_agent_wrote_as_text", async () => {
   );
   const { container } = render(<AgentView account={ALICE} />);
 
-  expect((await screen.findByRole("heading", { level: 1 })).textContent).toBe(markup);
+  expect((await loadedHeading()).textContent).toBe(markup);
   await waitFor(() => expect(screen.getAllByTestId("lineage-task")).toHaveLength(1));
 
   expect(container.querySelector("img")).toBeNull();

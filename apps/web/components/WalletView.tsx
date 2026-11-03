@@ -17,6 +17,7 @@ import {
   useState,
 } from "react";
 import { config } from "../lib/config";
+import { READING_BALANCES } from "../lib/copy";
 import { errorMessage } from "../lib/errors";
 import {
   describeAmount,
@@ -598,7 +599,7 @@ export function WalletView({
       </section>
 
       {accountId === null ? null : panel.status === "loading" ? (
-        <p role="status">Loading your balances…</p>
+        <p role="status">{READING_BALANCES}</p>
       ) : panel.status === "error" ? (
         <ErrorState
           message={panel.message}

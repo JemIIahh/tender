@@ -99,8 +99,8 @@ test("scorecard_shows_recompute_line_after_pick", async ({ page }) => {
     `Recompute: sha256(held-out) must equal ${HELDOUT_COMMITMENT}`,
   );
 
-  // The held-out document downloads as the bytes that were hashed: so the line can be followed.
-  const href = await page.getByRole("link", { name: /held-out document/i }).getAttribute("href");
+  // The held-out checks download as the bytes that were hashed: so the line can be followed.
+  const href = await page.getByRole("link", { name: /held-out checks/i }).getAttribute("href");
   const prefix = "data:application/json;charset=utf-8,";
   expect(href?.startsWith(prefix)).toBe(true);
   expect(sha256Hex(decodeURIComponent((href ?? "").slice(prefix.length)))).toBe(HELDOUT_COMMITMENT);
