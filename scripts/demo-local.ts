@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -31,6 +30,7 @@ import {
 import { JsonRpcProvider } from "near-api-js";
 import { addRoleKey } from "./keeper-key";
 import { REPO_ROOT } from "./lib/env";
+import { killStartedProcesses } from "./lib/process-tree";
 import { type SeedWindows, seed } from "./seed";
 import { redact, type Services, startServices } from "./serve";
 
@@ -156,8 +156,6 @@ const API_TIMEOUT_MS = 10_000;
 const SLACK_MS = 30_000;
 /** How long stopping a part of the demo may take before the demo goes on without it. */
 const STOP_MS = 30_000;
-/** How long listing the processes may take as the process ends: a stuck `ps` must not hold it. */
-const PS_MS = 5_000;
 /**
  * How many of the last lines of the services and the agents a failure shows. A clean machine that
  * fails the demo has nothing else to go by: the node's home is gone with the temp dir.
@@ -384,44 +382,6 @@ async function startNode(tmp: string): Promise<LocalChain> {
 }
 
 /**
- * Kills, each by its process id, every process still running that this process started: its
- * children, their children, and so on. That is the local node, which near-sandbox spawns, and
- * whatever else the demo has started. It is for the end of the process, where nothing can be waited
- * for, and does nothing where `ps` is not there.
- */
-function killStartedProcesses(): void {
-  const listing = spawnSync("ps", ["-A", "-o", "pid=,ppid="], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-    timeout: PS_MS,
-  });
-  if (listing.error !== undefined || listing.status !== 0) return;
-  const rows = listing.stdout.split("\n").flatMap((line) => {
-    const [pid, ppid] = line.trim().split(/\s+/).map(Number);
-    return pid === undefined || ppid === undefined || Number.isNaN(pid) || Number.isNaN(ppid)
-      ? []
-      : [{ pid, ppid }];
-  });
-  const started = new Set<number>();
-  const parents = [process.pid];
-  for (let parent = parents.pop(); parent !== undefined; parent = parents.pop()) {
-    for (const row of rows) {
-      // `ps` is a child of this process too, and has exited by now.
-      if (row.ppid !== parent || row.pid === listing.pid || started.has(row.pid)) continue;
-      started.add(row.pid);
-      parents.push(row.pid);
-    }
-  }
-  for (const pid of started) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // It has gone already.
-    }
-  }
-}
-
-/**
  * Starts the local chain, and sees to its stop. The node is a child of this process, and the end of
  * the process kills it unless it is known to have been stopped: a second signal skips the orderly
  * stops, and near-sandbox leaves the node running when its start fails.
@@ -429,6 +389,8 @@ function killStartedProcesses(): void {
 async function startChain(h: Harness, tmp: string): Promise<LocalChain> {
   let stopped = false;
   h.onProcessExit(() => {
+    // Every process below this one, by id: the node, and what else the demo started. They are listed
+    // with `ps`, or from `/proc` on a host without it, and left alone where neither can be read.
     if (!stopped) killStartedProcesses();
   });
   const starting = startNode(tmp);

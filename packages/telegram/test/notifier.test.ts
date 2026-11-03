@@ -80,6 +80,8 @@ function schedule(createdAt: number, commitDeadline: number, revealDeadline: num
 
 /** A task that opens at T0 and takes entries for an hour: with the clock at T0 + 10 min, it is new. */
 const OPEN = schedule(T0, T0 + HOUR, T0 + 2 * HOUR);
+/** The same, taking entries for four days: it is still new after a flood wait of a day. */
+const OPEN_FOR_DAYS = schedule(T0, T0 + 96 * HOUR, T0 + 97 * HOUR);
 
 const { poster, judge, alice, bob } = FIXTURE_ACCOUNTS;
 
@@ -98,7 +100,7 @@ const calls: ApiCall[] = [];
 /** What Telegram answers a chat instead of "sent", by chat id. */
 const refusals = new Map<
   string,
-  { error_code: number; description: string; parameters?: { retry_after: number } }
+  { error_code: number; description: string; parameters?: Record<string, unknown> }
 >();
 /** What the network does to a call for a chat instead of getting it an answer: it throws this. */
 const failures = new Map<string, Error>();
@@ -210,6 +212,8 @@ const TABLES = [
 beforeEach(async () => {
   await db.exec(`truncate ${TABLES.join(", ")} restart identity`);
   await putFixtureBlobs(db);
+  // A new bot for each test: a wait that Telegram asked for is kept against the bot that was told.
+  bot = newBot();
   calls.length = 0;
   seen = 0;
   refusals.clear();
@@ -852,32 +856,212 @@ test.each(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREAC
   },
 );
 
-test("a_flood_wait_longer_than_the_bot_sits_out_is_sent_on_a_later_tick", async () => {
-  // `createBot` sits out a flood wait of up to a minute, three times. A longer one, or one that is
-  // still on after the third try, reaches the notifier as a 429. Telegram took nothing.
+/** A 429 as Telegram answers one: it took nothing, and asks for `seconds` of quiet. */
+function floodWait(seconds: number) {
+  return {
+    error_code: 429,
+    description: `Too Many Requests: retry after ${seconds}`,
+    parameters: { retry_after: seconds },
+  };
+}
+
+test.each([5, 120, 3600, 86_400])(
+  "a_flood_wait_is_sat_out_before_the_bot_is_asked_again_and_then_the_alert_is_sent: %i s",
+  async (seconds) => {
+    // `createBot` sits out a flood wait of up to a minute, three times. A longer one, or one that is
+    // still on after the third try, reaches the notifier as a 429. Telegram took nothing, and it
+    // asked for quiet: the bot is not asked again, by any tick, until the wait is over.
+    await linkChat(db, 11, poster);
+    await linkChat(db, 12, poster);
+    await tick();
+    await apply(created("7", OPEN_FOR_DAYS));
+    refusals.set("11", floodWait(seconds));
+    refusals.set("12", floodWait(seconds));
+    const failedAt = clock;
+    const waitMs = seconds * 1000;
+
+    const error = await failedTick();
+    expect(error.name).toBe("TransportFailed");
+    expect(error.message).toContain("GrammyError 429");
+    expect(error.message).toContain(`nothing is sent for ${seconds} s`);
+    expect(error.message).toContain("tried again after that");
+    expect(lines(drain())).toEqual(["11 New task #7"]); // and the tick ended there
+    expect(await cursor()).toBe("0");
+    expect(await claims()).toEqual([]); // given back: the alert is still to be sent
+    expect(logged()).toEqual([]);
+
+    // Until the wait is over no tick sends a thing, or fails, or logs: it ends before it starts.
+    // Telegram would take the message now, and is not asked.
+    refusals.clear();
+    expect(await tickAt(failedAt + 1)).toEqual([]);
+    expect(await tickAt(failedAt + waitMs / 2)).toEqual([]);
+    expect(await tickAt(failedAt + waitMs - 1)).toEqual([]);
+    expect(await cursor()).toBe("0");
+    expect(await claims()).toEqual([]);
+
+    // At the end of the wait the alert goes to both chats, once, and the cursor moves.
+    expect(lines(await tickAt(failedAt + waitMs))).toEqual(["11 New task #7", "12 New task #7"]);
+    expect(await cursor()).toBe("1");
+    expect(await tick()).toEqual([]);
+    expect(logged()).toEqual([]);
+  },
+);
+
+test("what_happens_during_a_flood_wait_is_sent_when_it_is_over", async () => {
+  // The held ticks do nothing, so the cursor stays where it was and the news that came in the
+  // meantime is read afterwards: an event alert is not looked at again once the cursor has passed it.
   await linkChat(db, 11, poster);
-  await linkChat(db, 12, poster);
   await tick();
-  await apply(created("7", OPEN));
+  await apply(created("7", OPEN_FOR_DAYS));
+  refusals.set("11", floodWait(600));
+  const failedAt = clock;
+  await failedTick();
+  expect(drain()).toHaveLength(1);
+
+  await apply(created("8", OPEN_FOR_DAYS), eventLine("committed", { task_id: "7" }));
+  expect(await tickAt(failedAt + 5 * MINUTE)).toEqual([]);
+  expect(await cursor()).toBe("0");
+  expect(calls).toHaveLength(1); // the one try that was told to wait
+
+  refusals.clear();
+  expect(lines(await tickAt(failedAt + 10 * MINUTE))).toEqual([
+    "11 New task #7",
+    "11 New task #8",
+    "11 Entry received #7",
+  ]);
+  expect(await cursor()).toBe("3");
+  expect(await tick()).toEqual([]);
+});
+
+test("a_flood_wait_is_kept_by_the_bot_and_a_new_one_asks_again", async () => {
+  // The wait is kept in memory, against the bot that was told. A restart asks Telegram again: at
+  // most one request, which a 429 would answer with the wait again.
+  await linkChat(db, 11, poster);
+  await tick();
+  await apply(created("7", OPEN_FOR_DAYS));
+  refusals.set("11", floodWait(3600));
+  await failedTick();
+  expect(drain()).toHaveLength(1);
+  expect(await claims()).toEqual([]);
+
+  refusals.clear();
+  expect(await tick()).toEqual([]); // the same bot: held
+  expect(lines(await tick({ bot: newBot() }))).toEqual(["11 New task #7"]); // a restart
+  expect(await claims()).toEqual(["11 new_task:7"]);
+});
+
+test("the_loop_logs_a_flood_wait_once_and_does_not_ask_during_it", async () => {
+  await linkChat(db, 11, poster);
+  const failedAt = clock;
+  await withLoop({}, async () => {
+    await firstTickDone();
+    refusals.set("11", floodWait(3600));
+    await apply(created("7", OPEN_FOR_DAYS));
+    await until(() => calls.length === 1, "the alert to be tried");
+    await until(() => logged().length > 0, "the flood wait to be logged");
+    // The loop ticks every 5 ms: plenty of ticks come and go inside the wait.
+    clock = failedAt + 30 * MINUTE;
+    await sleep(100);
+    expect(calls).toHaveLength(1);
+    expect(logged()).toEqual([]); // the held ticks say nothing
+    refusals.clear();
+    clock = failedAt + HOUR;
+    await until(async () => (await cursor()) === "1", "the alert to go out once the wait is over");
+  });
+  expect(lines(drain())).toEqual(["11 New task #7", "11 New task #7"]);
+  expect(await claims()).toEqual(["11 new_task:7"]);
+});
+
+test.each([
+  { name: "no_retry_after", parameters: undefined },
+  { name: "a_retry_after_of_zero", parameters: { retry_after: 0 } },
+  { name: "a_negative_retry_after", parameters: { retry_after: -30 } },
+  { name: "a_retry_after_that_is_text", parameters: { retry_after: "3600" } },
+])("a_429_with_no_usable_wait_is_tried_again_on_the_next_tick: $name", async ({ parameters }) => {
+  // Nothing says how long to stay away, so the tick ends as it did before and the next goes on.
+  await linkChat(db, 11, poster);
+  await tick();
+  await apply(created("7", OPEN_FOR_DAYS));
   refusals.set("11", {
     error_code: 429,
-    description: "Too Many Requests: retry after 3600",
-    parameters: { retry_after: 3600 },
+    description: "Too Many Requests",
+    ...(parameters !== undefined && { parameters }),
   });
 
   const error = await failedTick();
-  expect(error.name).toBe("TransportFailed");
-  expect(error.message).toContain("GrammyError 429");
   expect(error.message).toContain("tried again on the next");
-  expect(lines(drain())).toEqual(["11 New task #7"]); // and the tick ended there
+  expect(error.message).not.toContain("nothing is sent for");
+  expect(lines(drain())).toEqual(["11 New task #7"]);
+  expect(await claims()).toEqual([]);
+
+  refusals.clear();
+  expect(lines(await tick())).toEqual(["11 New task #7"]);
+});
+
+/** What Telegram answers every send once the bot's token is rotated, or was never right. */
+const UNAUTHORIZED = { error_code: 401, description: "Unauthorized" };
+
+test("a_rejected_bot_token_gives_the_claim_back_and_the_alerts_go_out_after_a_restart", async () => {
+  await linkChat(db, 11, poster);
+  await linkChat(db, 12, poster);
+  await tick();
+  await apply(created("7", OPEN), created("8", OPEN));
+  refusals.set("11", UNAUTHORIZED);
+  refusals.set("12", UNAUTHORIZED);
+
+  // The first 401 ends the tick: nothing more is asked of Telegram with a token it does not take.
+  const error = await failedTick();
+  expect(error.name).toBe("TransportFailed");
+  expect(error.message).toContain("Telegram rejected the bot token (401)");
+  expect(error.message).toContain("tried again on the next");
+  expect(lines(drain())).toEqual(["11 New task #7"]);
   expect(await cursor()).toBe("0");
+  // Nothing says the alert was sent, and nothing says it was lost: the claim went back.
   expect(await claims()).toEqual([]);
   expect(logged()).toEqual([]);
 
-  refusals.clear(); // the wait is over
-  expect(lines(await tick())).toEqual(["11 New task #7", "12 New task #7"]);
-  expect(await cursor()).toBe("1");
-  expect(await tick()).toEqual([]);
+  // The same on the next tick: one try, one error, nothing lost.
+  expect((await failedTick()).message).toContain("Telegram rejected the bot token (401)");
+  expect(lines(drain())).toEqual(["11 New task #7"]);
+  expect(await claims()).toEqual([]);
+
+  // The operator fixes the token and restarts: a new bot, on the old database. Everything that
+  // waited goes out, once, from the old cursor.
+  refusals.clear();
+  expect(lines(await tick({ bot: newBot() }))).toEqual([
+    "11 New task #7",
+    "12 New task #7",
+    "11 New task #8",
+    "12 New task #8",
+  ]);
+  expect(await cursor()).toBe("2");
+  expect(await tick({ bot: newBot() })).toEqual([]);
+  expect(logged()).toEqual([]);
+});
+
+test("a_rejected_bot_token_is_logged_once_for_each_tick_and_not_for_each_alert", async () => {
+  await linkChat(db, 11, poster);
+  await linkChat(db, 12, poster);
+  await withLoop({}, async () => {
+    await firstTickDone();
+    refusals.set("11", UNAUTHORIZED);
+    refusals.set("12", UNAUTHORIZED);
+    // Three alerts for two chats are waiting: six sends, if each were tried.
+    await apply(created("7", OPEN), created("8", OPEN), created("9", OPEN));
+    await until(() => calls.length >= 4, "the loop to try the alerts again and again");
+  });
+  // Every tick made one call and logged one line, and none says an alert was lost.
+  const tries = calls.length;
+  const logs = logged();
+  expect(logs).toHaveLength(tries);
+  for (const log of logs) {
+    expect(log).toContain("telegram notifier: tick failed:");
+    expect(log).toContain("Telegram rejected the bot token (401)");
+    expect(log).not.toContain("alert lost");
+    expect(log).not.toContain(TOKEN);
+  }
+  expect(await claims()).toEqual([]);
+  expect(await cursor()).toBe("0");
 });
 
 /**
