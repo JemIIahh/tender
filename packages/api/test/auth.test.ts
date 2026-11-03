@@ -55,8 +55,8 @@ let deps: ApiDeps;
 let nowNs = TEST_NOW;
 
 beforeAll(async () => {
-  // PGlite, whatever TEST_DATABASE_URL says: the deadline tests count the timers they fake, and a
-  // Postgres pool sets one of its own for each connection it takes back.
+  // PGlite, whatever TEST_DATABASE_URL says: the deadline tests fake `setTimeout`, and a Postgres
+  // pool sets timers of its own, for each connection it takes back, that would run on that clock.
   deps = await testDeps({ now: () => nowNs, db: await testDb({ postgres: false }) });
 });
 
@@ -296,32 +296,71 @@ const UNAVAILABLE: ErrorBody = {
   message: "cannot check your key right now",
 };
 
+/** How long a question to the chain has before the API gives up on it (`withinDeadline`). */
+const KEY_DEADLINE_MS = 5_000;
+
+/**
+ * Fakes `setTimeout` and `clearTimeout`, so that the clock of the API and the database go on as
+ * they were, and keeps the deadlines of the questions to the chain apart: the timers set for
+ * `KEY_DEADLINE_MS`, and whether each has been cleared. A count of every timer in the process
+ * would take in the database's too, which it may set under load. `stop` puts back the faked
+ * functions it wrapped and makes the timers real again; a test that fails first leaves that to
+ * `afterEach`, whose `vi.useRealTimers` puts back the real ones whatever is in their place.
+ */
+function fakeTimersWithDeadlines() {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const fakeSet = globalThis.setTimeout;
+  const fakeClear = globalThis.clearTimeout;
+  const deadlines: unknown[] = [];
+  const cleared = new Set<unknown>();
+  globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+    const timer = fakeSet(...args);
+    if (args[1] === KEY_DEADLINE_MS) deadlines.push(timer);
+    return timer;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((timer: Parameters<typeof clearTimeout>[0]) => {
+    cleared.add(timer);
+    fakeClear(timer);
+  }) as typeof clearTimeout;
+  return {
+    /** How many deadlines were set, and how many of them are still running. */
+    deadlines: () => [deadlines.length, deadlines.filter((timer) => !cleared.has(timer)).length],
+    stop: () => {
+      globalThis.setTimeout = fakeSet;
+      globalThis.clearTimeout = fakeClear;
+      vi.useRealTimers();
+    },
+  };
+}
+
 /**
  * Sends `request` to an API whose chain hangs, and lets the 5 seconds it is given go by: the chain
- * is asked, with one timer running on the question; 1 ms before the bound the request is still
- * waiting, and at the bound it is answered. Only `setTimeout` and `clearTimeout` are faked, so the
- * clock of the API and the database go on as they were. The timers are real again when this
- * returns.
+ * is asked, with a deadline running on the question; 1 ms before the bound the request is still
+ * waiting, and at the bound it is answered and the deadline is cleared. The timers are real again
+ * when this returns.
  */
 async function waitOutTheDeadline<T>(chain: LiveChain, request: () => T | Promise<T>): Promise<T> {
   chain.hanging = true;
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-  const reached = chain.asked();
-  let answered = false;
-  const pending = Promise.resolve(request()).then((reply) => {
-    answered = true;
-    return reply;
-  });
-  await reached;
-  expect(vi.getTimerCount()).toBe(1);
+  const timers = fakeTimersWithDeadlines();
+  try {
+    const reached = chain.asked();
+    let answered = false;
+    const pending = Promise.resolve(request()).then((reply) => {
+      answered = true;
+      return reply;
+    });
+    await reached;
+    expect(timers.deadlines()).toEqual([1, 1]);
 
-  await vi.advanceTimersByTimeAsync(4_999);
-  expect(answered).toBe(false);
-  await vi.advanceTimersByTimeAsync(1);
-  const reply = await pending;
-  expect(vi.getTimerCount()).toBe(0);
-  vi.useRealTimers();
-  return reply;
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(answered).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const reply = await pending;
+    expect(timers.deadlines()).toEqual([1, 0]);
+    return reply;
+  } finally {
+    timers.stop();
+  }
 }
 
 /**
@@ -1361,32 +1400,35 @@ test("a_lookup_inside_the_deadline_is_used_and_leaves_no_timer_behind", async ()
   const app = appWith({ client: chain.client });
   const checked = probe({ client: chain.client });
   const body = await signChallenge(KeyPair.fromRandom("ed25519"), await challenge(app));
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const timers = fakeTimersWithDeadlines();
+  try {
+    // A chain that takes 4,999 ms is slow, not down: its answer is used, by the sign-in and by the
+    // check of the token, and the bound on each question is gone with it.
+    const slowly = async <T>(request: () => T | Promise<T>): Promise<T> => {
+      chain.hanging = true;
+      const reached = chain.asked();
+      const pending = request();
+      await reached;
+      await vi.advanceTimersByTimeAsync(4_999);
+      chain.settle();
+      return await pending;
+    };
+    const signed = await slowly(() => post<SignInResponse>(app, "/v1/auth/verify", body));
+    expect(signed.status).toBe(200);
+    expect(timers.deadlines()).toEqual([1, 0]);
+    const who = await slowly(() => whoami(checked, `Bearer ${signed.body.token}`));
+    expect(who.status).toBe(200);
+    expect(timers.deadlines()).toEqual([2, 0]);
 
-  // A chain that takes 4,999 ms is slow, not down: its answer is used, by the sign-in and by the
-  // check of the token, and the bound on the question is gone with it.
-  const slowly = async <T>(request: () => T | Promise<T>): Promise<T> => {
-    chain.hanging = true;
-    const reached = chain.asked();
-    const pending = request();
-    await reached;
-    await vi.advanceTimersByTimeAsync(4_999);
-    chain.settle();
-    return await pending;
-  };
-  const signed = await slowly(() => post<SignInResponse>(app, "/v1/auth/verify", body));
-  expect(signed.status).toBe(200);
-  expect(vi.getTimerCount()).toBe(0);
-  const who = await slowly(() => whoami(checked, `Bearer ${signed.body.token}`));
-  expect(who.status).toBe(200);
-  expect(vi.getTimerCount()).toBe(0);
-
-  // A chain that fails at once leaves no timer either.
-  chain.hanging = false;
-  chain.failing = true;
-  nowNs = TEST_NOW + MINUTE;
-  expect((await whoami(checked, `Bearer ${signed.body.token}`)).status).toBe(503);
-  expect(vi.getTimerCount()).toBe(0);
+    // A chain that fails at once leaves no deadline running either.
+    chain.hanging = false;
+    chain.failing = true;
+    nowNs = TEST_NOW + MINUTE;
+    expect((await whoami(checked, `Bearer ${signed.body.token}`)).status).toBe(503);
+    expect(timers.deadlines()).toEqual([3, 0]);
+  } finally {
+    timers.stop();
+  }
 });
 
 test("a_failed_lookup_logs_the_name_of_the_error_and_not_its_text", async () => {
