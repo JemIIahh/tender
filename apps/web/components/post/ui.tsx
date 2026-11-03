@@ -2,18 +2,18 @@
 
 import type { ReactNode } from "react";
 import type { Errors, PostForm } from "../../lib/post";
+import { FIELD } from "../ui";
 
 // The small pieces the steps of the post wizard are made of: a labelled control with its help and
 // its problem wired to it, and the choices that are radios. A field's id is `post-<name>`, which is
 // also the key of its problem in `Errors`, so that the wizard can take the person to it.
 
-export const PRIMARY =
-  "min-h-11 w-fit rounded border border-neutral-900 bg-neutral-900 px-4 text-white aria-disabled:opacity-60";
-export const SECONDARY =
-  "min-h-11 w-fit rounded border border-neutral-900 px-4 aria-disabled:opacity-60";
+export { PRIMARY, SECONDARY } from "../ui";
 
-const CONTROL =
-  "min-h-11 w-full rounded border border-neutral-900 bg-white px-2 aria-invalid:border-2";
+const CONTROL = FIELD;
+
+/** A box inside a step: a part of the form that belongs together. */
+export const BOX = "grid min-w-0 content-start gap-3 rounded-xl border border-line bg-ink p-4";
 
 /** What every step is given. */
 export interface StepProps {
@@ -52,7 +52,11 @@ function describedBy(id: string, help: boolean, error: boolean): string | undefi
 export function FieldError({ name, error }: { name: string; error: string | undefined }) {
   if (error === undefined) return null;
   return (
-    <p id={`post-${name}-error`} data-testid={`error-${name}`} className="text-sm font-medium">
+    <p
+      id={`post-${name}-error`}
+      data-testid={`error-${name}`}
+      className="text-sm font-medium text-seal"
+    >
       {error}
     </p>
   );
@@ -89,12 +93,12 @@ function Labelled({
 }) {
   const id = `post-${name}`;
   return (
-    <div className="grid gap-1">
-      <label htmlFor={id} className="font-medium">
+    <div className="grid gap-1.5">
+      <label htmlFor={id} className="text-[15px] font-medium text-bone">
         {label}
       </label>
       {help === undefined ? null : (
-        <p id={`${id}-help`} className="text-sm text-neutral-700">
+        <p id={`${id}-help`} className="text-sm text-muted">
           {help}
         </p>
       )}
@@ -221,11 +225,11 @@ export function RadioGroup<T extends string>({
       aria-describedby={error === undefined ? undefined : `${id}-error`}
       className="grid min-w-0 gap-2"
     >
-      <legend className="mb-1 font-medium">{legend}</legend>
+      <legend className="mb-1 text-[15px] font-medium text-bone">{legend}</legend>
       {options.map((option) => (
         <label
           key={option.value}
-          className="flex min-h-11 items-start gap-3 rounded border border-neutral-300 p-3 has-checked:border-neutral-900 has-checked:bg-neutral-100"
+          className="flex min-h-11 cursor-pointer items-start gap-3 rounded-xl border border-line bg-ink p-3.5 transition-colors hover:border-bone/30 has-checked:border-bone has-checked:bg-raised has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-bone motion-reduce:transition-none"
         >
           <input
             type="radio"
@@ -233,12 +237,12 @@ export function RadioGroup<T extends string>({
             value={option.value}
             checked={value === option.value}
             onChange={() => onChange(option.value)}
-            className="mt-0.5 size-5 shrink-0"
+            className="mt-0.5 size-5 shrink-0 accent-seal"
           />
           <span className="grid min-w-0 gap-0.5">
-            <span className="font-medium">{option.label}</span>
+            <span className="font-medium text-bone">{option.label}</span>
             {option.detail === undefined ? null : (
-              <span className="text-sm text-neutral-700">{option.detail}</span>
+              <span className="text-sm text-muted">{option.detail}</span>
             )}
           </span>
         </label>
@@ -259,12 +263,12 @@ export function CheckField({
   onChange(checked: boolean): void;
 }) {
   return (
-    <label className="flex min-h-11 items-center gap-3">
+    <label className="flex min-h-11 cursor-pointer items-center gap-3 text-bone">
       <input
         type="checkbox"
         checked={checked}
         onChange={(event) => onChange(event.currentTarget.checked)}
-        className="size-5 shrink-0"
+        className="size-5 shrink-0 accent-seal"
       />
       <span>{label}</span>
     </label>

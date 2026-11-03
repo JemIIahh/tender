@@ -24,6 +24,7 @@ import {
   windowsText,
 } from "../../lib/post";
 import { describeAmount } from "../../lib/vault";
+import { FIELD } from "../ui";
 import { bindText, FieldError, RadioGroup, SelectField, type StepProps, TextField } from "./ui";
 
 /** An amount this large is the contract's "no limit", which nobody means to say in a sentence. */
@@ -37,7 +38,9 @@ const UNIT_LABEL: Record<DurationUnit, string> = {
 };
 
 /** A legend that is the group's one heading: the group has no other. */
-const headingLegend = (text: string) => <span className="text-lg font-semibold">{text}</span>;
+const headingLegend = (text: string) => (
+  <span className="text-lg font-semibold tracking-tight text-bone">{text}</span>
+);
 
 function tokenLabel(token: string): string {
   const { symbol } = tokenMeta(token, config.network);
@@ -54,11 +57,11 @@ function WindowRow({ name, ...props }: StepProps & { name: WindowName }) {
   };
   const error = errors[key];
   return (
-    <div className="grid gap-1">
-      <label htmlFor={`post-${key}`} className="font-medium">
+    <div className="grid gap-1.5">
+      <label htmlFor={`post-${key}`} className="text-[15px] font-medium text-bone">
         {`${WINDOW_TEXT[name].label} window`}
       </label>
-      <p id={`post-${key}-help`} className="text-sm text-neutral-700">
+      <p id={`post-${key}-help`} className="text-sm text-muted">
         {WINDOW_TEXT[name].detail}
       </p>
       <div className="flex gap-2">
@@ -74,14 +77,14 @@ function WindowRow({ name, ...props }: StepProps & { name: WindowName }) {
           aria-describedby={
             error === undefined ? `post-${key}-help` : `post-${key}-help post-${key}-error`
           }
-          className="min-h-11 w-28 rounded border border-neutral-900 bg-white px-2 aria-invalid:border-2"
+          className={`${FIELD} w-28`}
         />
         <select
           id={`post-${key}-unit`}
           aria-label={`${WINDOW_TEXT[name].label} window unit`}
           value={duration.unit}
           onChange={(event) => set({ unit: event.currentTarget.value as DurationUnit })}
-          className="min-h-11 rounded border border-neutral-900 bg-white px-2"
+          className={`${FIELD} w-auto`}
         >
           {DURATION_UNITS.map((unit) => (
             <option key={unit} value={unit}>
@@ -154,7 +157,12 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
             onChange={(token) => update({ token })}
           />
         ) : chosen === undefined ? (
-          <p id="post-token" tabIndex={-1} data-testid="error-token" className="font-medium">
+          <p
+            id="post-token"
+            tabIndex={-1}
+            data-testid="error-token"
+            className="font-medium text-seal"
+          >
             {errors.token ?? "Tender takes no rewards right now."}
           </p>
         ) : null}
@@ -188,7 +196,7 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
         >
           {form.preset === "custom" ? (
             <div
-              className="grid gap-4 rounded border border-neutral-300 p-3"
+              className="grid gap-5 rounded-xl border border-line bg-ink p-4"
               data-testid="custom-windows"
             >
               {WINDOW_NAMES.map((name) => (
@@ -201,7 +209,7 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
                   touch={props.touch}
                 />
               ))}
-              <p className="text-sm text-neutral-700">
+              <p className="text-sm text-muted">
                 {`Each window is ${spanText(limits.minWindowSecs)} to ${spanText(limits.maxWindowSecs)}.`}
               </p>
             </div>
@@ -223,12 +231,12 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
           ) : null}
         </RadioGroup>
         {form.verifier === "judge" ? null : (
-          <p data-testid="verifier-picks-with-mcp" className="text-sm">
+          <p data-testid="verifier-picks-with-mcp" className="text-sm text-muted">
             {VERIFIER_PICKS_WITH_MCP}
           </p>
         )}
         {form.kind === "rubric" && form.verifier === "judge" ? (
-          <div className="grid gap-1 text-sm font-medium">
+          <div className="grid gap-1 rounded-xl border border-line bg-raised p-4 text-sm font-medium text-bone">
             <p data-testid="rubric-judge-note">{RUBRIC_JUDGE_NOTE}</p>
             <p data-testid="rubric-judge-limit">{RUBRIC_JUDGE_LIMIT}</p>
           </div>

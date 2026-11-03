@@ -25,6 +25,7 @@ import { describeAmount, describeNear, type VaultData } from "../../lib/vault";
 import { useWaitedLong } from "../../lib/waiting";
 import { WALLET_CANNOT_SIGN_MESSAGE } from "../../lib/walletErrors";
 import { ErrorState } from "../ErrorState";
+import { NOTICE, TEXT_LINK } from "../ui";
 import { PRIMARY, SECONDARY } from "./ui";
 
 /** What the Review step knows of the account's balances. */
@@ -101,7 +102,7 @@ function HeldoutDownload({ file, verifier }: { file: Uint8Array; verifier: strin
   return (
     <div
       data-testid="heldout-download"
-      className="grid gap-2 rounded border border-neutral-900 p-3"
+      className="grid gap-3 rounded-xl border border-seal/45 bg-seal/[0.04] p-4 text-sm text-bone"
     >
       <p>
         {verifier === null
@@ -122,8 +123,10 @@ function HeldoutDownload({ file, verifier }: { file: Uint8Array; verifier: strin
 function Row({ id, label, children }: { id: string; label: string; children: ReactNode }) {
   return (
     <>
-      <dt className="text-neutral-700">{label}</dt>
-      <dd data-testid={id} className="min-w-0 wrap-anywhere">
+      <dt className="pt-0.5 font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase">
+        {label}
+      </dt>
+      <dd data-testid={id} className="min-w-0 text-bone wrap-anywhere">
         {children}
       </dd>
     </>
@@ -217,9 +220,9 @@ export function ReviewStep(props: {
 
   return (
     <div className="grid gap-6">
-      <p>Once posted, the terms can't change.</p>
+      <p className="text-sm text-muted">Once posted, the terms can't change.</p>
 
-      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2">
+      <dl className="grid grid-cols-1 gap-x-6 gap-y-1 rounded-xl border border-line bg-ink p-4 sm:grid-cols-[auto_minmax(0,1fr)] sm:gap-y-3 sm:p-5 [&>dd]:mb-2 sm:[&>dd]:mb-0">
         <Row id="review-title" label="Title">
           {form.title.trim()}
         </Row>
@@ -271,14 +274,20 @@ export function ReviewStep(props: {
       )}
 
       <section aria-labelledby="post-ready" className="grid gap-3">
-        <h3 id="post-ready" tabIndex={-1} className="text-lg font-semibold">
+        <h3
+          id="post-ready"
+          tabIndex={-1}
+          className="text-lg font-semibold tracking-tight text-bone"
+        >
           Post it
         </h3>
         {!ready ? (
-          <p role="status">Checking for your wallet…</p>
+          <p role="status" className="text-sm text-muted">
+            Checking for your wallet…
+          </p>
         ) : accountId === null ? (
           <>
-            <p>Connect your wallet to post.</p>
+            <p className="text-sm text-muted">Connect your wallet to post.</p>
             <button
               key="connect"
               type="button"
@@ -290,30 +299,24 @@ export function ReviewStep(props: {
             </button>
           </>
         ) : !canSignMessage ? (
-          <p role="status" data-testid="cannot-sign">
+          <p role="status" data-testid="cannot-sign" className={NOTICE}>
             {WALLET_CANNOT_SIGN_MESSAGE}
           </p>
         ) : vault.status === "loading" || vault.status === "idle" ? (
-          <p role="status">{READING_BALANCES}</p>
+          <p role="status" className="text-sm text-muted">
+            {READING_BALANCES}
+          </p>
         ) : vault.status === "error" ? (
           <ErrorState message={vault.message} retrying={vault.retrying} onRetry={props.onRecheck} />
         ) : null}
 
         {blocked === null ? null : (
-          <div
-            data-testid="post-blocked"
-            className="grid gap-2 rounded border border-neutral-900 p-3"
-          >
+          <div data-testid="post-blocked" className={`${NOTICE} grid gap-3`}>
             <p>{blocked}</p>
             {fundingProblem !== null && blocked === fundingProblem ? (
               <div className="flex flex-wrap gap-2">
                 {/* A tab of its own, so that the form on this page is not lost. */}
-                <a
-                  href="/wallet"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex min-h-11 items-center rounded border border-neutral-900 px-4"
-                >
+                <a href="/wallet" target="_blank" rel="noreferrer" className={SECONDARY}>
                   Open the Wallet page
                 </a>
                 <button type="button" onClick={props.onRecheck} className={SECONDARY}>
@@ -325,7 +328,7 @@ export function ReviewStep(props: {
         )}
 
         {props.running === null ? null : (
-          <p role="status" data-testid="post-progress">
+          <p role="status" data-testid="post-progress" className="text-sm text-bone">
             {PROGRESS[props.running]}
           </p>
         )}
@@ -340,33 +343,33 @@ export function ReviewStep(props: {
           <p
             role="alert"
             data-testid="post-failure"
-            className="rounded border border-neutral-900 p-3"
+            className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
           >
             {props.failure}
           </p>
         )}
         {props.outcome?.kind === "posted" ? (
-          <p role="status" data-testid="post-done">
+          <p role="status" data-testid="post-done" className={NOTICE}>
             Posted. Opening your task.{" "}
-            <a href={`/tasks/${props.outcome.taskId}`} className="underline">
+            <a href={`/tasks/${props.outcome.taskId}`} className={TEXT_LINK}>
               Open it now
             </a>
           </p>
         ) : null}
         {props.outcome?.kind === "sent" ? (
-          <div role="status" data-testid="post-sent" className="grid gap-2">
+          <div role="status" data-testid="post-sent" className={`${NOTICE} grid gap-3`}>
             <p>
               Your wallet sent it, but Tender hasn't reported the new task. It may well be posted:
               look for it on the{" "}
               {/* A tab of its own, as for an unknown outcome, so that the form on this page is
                   not lost. */}
-              <a href="/tasks" target="_blank" rel="noreferrer" className="underline">
+              <a href="/tasks" target="_blank" rel="noreferrer" className={TEXT_LINK}>
                 Tasks
               </a>{" "}
               page before you try again.
             </p>
             {props.outcome.txHashes.length === 0 ? null : (
-              <ul aria-label="Transactions" className="grid gap-1 text-sm">
+              <ul aria-label="Transactions" className="grid gap-1 text-xs text-muted">
                 {props.outcome.txHashes.map((hash, i) => (
                   <li
                     // biome-ignore lint/suspicious/noArrayIndexKey: the wallet lists the hashes, and could list one twice
@@ -385,12 +388,12 @@ export function ReviewStep(props: {
           <div
             role="alert"
             data-testid="post-unknown"
-            className="grid gap-3 rounded border border-neutral-900 p-3"
+            className="grid gap-3 rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
           >
             <p>
               We couldn't tell whether the post went through. Check the{" "}
               {/* A tab of its own, so that the form on this page is not lost. */}
-              <a href="/tasks" target="_blank" rel="noreferrer" className="underline">
+              <a href="/tasks" target="_blank" rel="noreferrer" className={TEXT_LINK}>
                 Tasks
               </a>{" "}
               page before posting again.

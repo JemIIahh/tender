@@ -35,6 +35,8 @@ import { readVault } from "../../lib/vault";
 import { useWallet } from "../../lib/wallet";
 import { walletErrorMessage } from "../../lib/walletErrors";
 import { ErrorState } from "../ErrorState";
+import { PageHead } from "../PageHead";
+import { CARD } from "../ui";
 import { BriefStep } from "./BriefStep";
 import { CriteriaStep } from "./CriteriaStep";
 import { ReviewStep, type VaultState } from "./ReviewStep";
@@ -55,6 +57,13 @@ const STEPS = [
   { id: "review", title: "Review" },
 ] as const;
 type StepId = (typeof STEPS)[number]["id"];
+
+/** A step in the row of steps above the form: done, the one you are on, or still to come. */
+const STEP =
+  "flex min-h-11 items-center rounded-full border px-4 font-mono text-[11px] tracking-[0.12em] uppercase transition-colors motion-reduce:transition-none";
+
+/** The title of the step, at the top of its panel. */
+const STEP_TITLE = "text-2xl font-semibold tracking-[-0.02em] text-bone";
 
 const NEXT_LABEL: Record<StepId, string> = {
   brief: "Next: Checks",
@@ -427,7 +436,7 @@ export function PostWizard({
         id="post-form"
         tabIndex={-1}
         role="alert"
-        className="rounded border border-neutral-900 p-3"
+        className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
       >
         {shown.form}
       </p>
@@ -451,7 +460,9 @@ export function PostWizard({
         );
       case "reward":
         return limits.status === "loading" ? (
-          <p role="status">Loading what Tender allows…</p>
+          <p role="status" className="text-sm text-muted">
+            Loading what Tender allows…
+          </p>
         ) : limits.status === "error" ? (
           <ErrorState message={limits.message} retrying={limits.retrying} onRetry={loadLimits} />
         ) : (
@@ -463,7 +474,9 @@ export function PostWizard({
       case "review": {
         const chosen = readyLimits === null ? undefined : tokenOf(form, readyLimits);
         return readyLimits === null || chosen === undefined ? (
-          <p role="status">Loading what Tender allows…</p>
+          <p role="status" className="text-sm text-muted">
+            Loading what Tender allows…
+          </p>
         ) : (
           <ReviewStep
             form={form}
@@ -492,32 +505,32 @@ export function PostWizard({
   })();
 
   return (
-    <div className="grid gap-6">
-      <h1 className="text-2xl font-semibold">Post a task</h1>
+    <div className="mx-auto grid w-full max-w-4xl gap-6">
+      <PageHead eyebrow="New task" title="Post a task">
+        The reward is locked when the task is posted. It goes to the winners, less the platform fee,
+        or back to its funders in full.
+      </PageHead>
 
       <nav aria-label="Steps">
-        <ol className="flex flex-wrap gap-x-4 gap-y-1">
+        <ol className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           {STEPS.map(({ id, title }, at) => {
             const label = `${at + 1} ${title}`;
             return (
               <li key={id}>
                 {id === step ? (
-                  <span
-                    aria-current="step"
-                    className="inline-block py-2 font-semibold underline underline-offset-4"
-                  >
+                  <span aria-current="step" className={`${STEP} border-bone bg-bone text-ink`}>
                     {label}
                   </span>
                 ) : at < index ? (
                   <button
                     type="button"
                     onClick={() => go(id)}
-                    className="min-h-11 underline-offset-4 hover:underline"
+                    className={`${STEP} w-full border-line bg-raised text-bone hover:border-bone/40`}
                   >
                     {label}
                   </button>
                 ) : (
-                  <span className="inline-block py-2 text-neutral-500">{label}</span>
+                  <span className={`${STEP} border-dashed border-line text-muted`}>{label}</span>
                 )}
               </li>
             );
@@ -526,8 +539,8 @@ export function PostWizard({
       </nav>
 
       {step === "review" ? (
-        <div className="grid gap-6">
-          <h2 ref={heading} tabIndex={-1} className="text-xl font-semibold">
+        <div className={`${CARD} grid gap-6 p-5 sm:p-8`}>
+          <h2 ref={heading} tabIndex={-1} className={STEP_TITLE}>
             Review
           </h2>
           {body}
@@ -539,13 +552,13 @@ export function PostWizard({
             event.preventDefault();
             next();
           }}
-          className="grid gap-6"
+          className={`${CARD} grid gap-6 p-5 sm:p-8`}
         >
-          <h2 ref={heading} tabIndex={-1} className="text-xl font-semibold">
+          <h2 ref={heading} tabIndex={-1} className={STEP_TITLE}>
             {STEPS[index]?.title}
           </h2>
           {body}
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap gap-2 border-t border-line pt-6">
             {index === 0 ? null : (
               <button type="button" onClick={back} className={SECONDARY}>
                 Back
