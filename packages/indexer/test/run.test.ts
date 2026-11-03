@@ -6,6 +6,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vi
 import {
   type BlockSource,
   BlocksLostError,
+  checkDeployment,
+  IndexerError,
   type ReconcileChain,
   runIndexer,
   startIndexer,
@@ -496,4 +498,118 @@ test("it_names_the_variable_that_is_missing_or_wrong", () => {
   expect(() =>
     startIndexer(testnetEnv({ INDEXER_START_HEIGHT: "1" }), { client: emptyChain(0n) }),
   ).toThrow(/DATABASE_URL/);
+});
+
+// ---- checkDeployment --------------------------------------------------------------------------
+
+/** Stores a task of id `id` as the index would, under the cursor of `source` when it is given. */
+async function indexTask(id: number, source?: string): Promise<void> {
+  await db.query(
+    `insert into tasks (id, poster, token, reward, fee_bps, brief_uri, brief_hash, criteria_hash,
+       verifier, created_at, commit_deadline, reveal_deadline, pick_deadline, fallback_deadline,
+       max_entries, max_winners, invited, created_height)
+     values ($1, 'poster.test.near', 'token.test.near', 1, 0, 'uri', 'h', 'h', 'judge.test.near',
+       1, 1, 1, 1, 1, 1, 1, '[]', 1)`,
+    [id],
+  );
+  if (source !== undefined) {
+    await db.query("insert into chain_cursor (source, height) values ($1, 5)", [source]);
+  }
+}
+
+/** What `checkDeployment` throws for `chain`, with the asks it made of the chain's task count. */
+async function deploymentCheck(taskCounts: Array<bigint | Error>, retries = 3) {
+  const asked: number[] = [];
+  const chain = emptyChain(0n, {
+    taskCount: async () => {
+      asked.push(asked.length);
+      const next = taskCounts[Math.min(asked.length - 1, taskCounts.length - 1)];
+      if (next instanceof Error) throw next;
+      return next ?? 0n;
+    },
+  });
+  const failure = await checkDeployment(db, chain, { retries, retryMs: 1 }).then(
+    () => undefined,
+    (error: unknown) => error as Error,
+  );
+  return { failure, asks: asked.length };
+}
+
+test("a_database_with_no_task_passes_without_asking_the_chain", async () => {
+  // Empty, or with this deploy's cursor alone: nothing to compare, and the chain is not asked.
+  const down = new Error(`fetch failed for ${KEYED}`);
+  expect(await deploymentCheck([down])).toEqual({ failure: undefined, asks: 0 });
+  await db.query("insert into chain_cursor (source, height) values ($1, 5)", [TESTNET_CURSOR]);
+  expect(await deploymentCheck([down])).toEqual({ failure: undefined, asks: 0 });
+});
+
+test("a_database_whose_cursor_names_another_source_is_refused", async () => {
+  await indexTask(1, "testnet:old.testnet");
+  const { failure, asks } = await deploymentCheck([5n]);
+  expect(failure).toBeInstanceOf(IndexerError);
+  // It names the other source and this deploy, says what to do, and asks nothing of the chain.
+  expect(failure?.message).toMatch(/another deploy of Tender/);
+  expect(failure?.message).toContain('"testnet:old.testnet"');
+  expect(failure?.message).toContain(`"${TESTNET_CURSOR}"`);
+  expect(failure?.message).toContain("one database per contract deploy");
+  expect(asks).toBe(0);
+
+  // Own cursor besides makes no difference, and a long list is cut short.
+  await db.query("insert into chain_cursor (source, height) values ($1, 9)", [TESTNET_CURSOR]);
+  for (const other of ["mainnet:a.near", "mainnet:b.near", "mainnet:c.near"]) {
+    await db.query("insert into chain_cursor (source, height) values ($1, 9)", [other]);
+  }
+  const many = await deploymentCheck([5n]);
+  expect(many.failure?.message).toContain('"mainnet:a.near", "mainnet:b.near", "mainnet:c.near"');
+  expect(many.failure?.message).toMatch(/ and others, and this deploy/);
+  expect(many.failure?.message).not.toContain("old.testnet");
+
+  // A cursor that is only a prefix of this deploy's is another's.
+  await db.exec("truncate chain_cursor");
+  await db.query("insert into chain_cursor (source, height) values ($1, 9)", [
+    `${TESTNET_CURSOR}2`,
+  ]);
+  expect((await deploymentCheck([5n])).failure).toBeInstanceOf(IndexerError);
+});
+
+test("a_task_above_the_chains_count_is_refused_after_asking_again", async () => {
+  await indexTask(7, TESTNET_CURSOR);
+  const { failure, asks } = await deploymentCheck([5n]);
+  expect(failure).toBeInstanceOf(IndexerError);
+  expect(failure?.message).toContain(`holds task 7, but ${FIXTURE_CONTRACT} has 5 on testnet`);
+  expect(failure?.message).toContain("one database per contract deploy");
+  // The first ask and the three retries.
+  expect(asks).toBe(4);
+  expect((await deploymentCheck([5n], 0)).asks).toBe(1);
+  // Whatever the highest id is, not the newest row.
+  await indexTask(3);
+  expect((await deploymentCheck([6n])).failure?.message).toContain("holds task 7");
+});
+
+test("a_chain_node_that_lags_the_index_is_asked_again_before_the_database_is_refused", async () => {
+  // The index follows neardata and the RPC node can be some blocks behind: task 7 was posted just
+  // before the restart, and the node says 6, then 6, then 7.
+  await indexTask(7, TESTNET_CURSOR);
+  expect(await deploymentCheck([6n, 6n, 7n])).toEqual({ failure: undefined, asks: 3 });
+});
+
+test("a_task_at_or_below_the_chains_count_passes", async () => {
+  await indexTask(7, TESTNET_CURSOR);
+  expect(await deploymentCheck([7n])).toEqual({ failure: undefined, asks: 1 });
+  expect(await deploymentCheck([900n])).toEqual({ failure: undefined, asks: 1 });
+  // The chain's count is a bigint: past what a number holds exactly, and a u64 id.
+  await db.exec("truncate tasks");
+  await indexTask(Number.MAX_SAFE_INTEGER);
+  expect((await deploymentCheck([2n ** 64n - 1n])).failure).toBeUndefined();
+});
+
+test("a_chain_that_cannot_be_asked_refuses_a_database_that_holds_tasks_naming_the_kind_only", async () => {
+  await indexTask(1, TESTNET_CURSOR);
+  const { failure, asks } = await deploymentCheck([new Error(`fetch failed for ${KEYED}`)]);
+  expect(failure).toBeInstanceOf(IndexerError);
+  expect(failure?.message).toMatch(/^cannot ask the chain how many tasks .* has \(Error\)/);
+  // The message is what a line quotes: no key in it.
+  expect(failure?.message).not.toContain("s3cret");
+  // A failure to ask is not retried: only a count that is too low is.
+  expect(asks).toBe(1);
 });

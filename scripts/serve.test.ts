@@ -1,13 +1,18 @@
+import { spawnSync } from "node:child_process";
+import { Console } from "node:console";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import type { KeyPermission } from "@tender/client";
 import { LockNotHeldError, type SessionLock } from "@tender/db";
 import { KeyPair, type KeyPairString } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
+import { REPO_ROOT } from "./lib/env";
 import {
   checkJudgeKey,
   checkKeeperKey,
+  exitOnCrash,
   publicUrlOf,
   readServeConfig,
   redact,
@@ -45,6 +50,7 @@ const GOOD: Record<string, string> = {
   PUBLIC_WEB_URL: "https://tender.example, http://localhost:3000/",
   NEAR_RPC_URL: "https://rpc.testnet.fastnear.com",
   NEARDATA_URL: "https://testnet.neardata.xyz",
+  FASTNEAR_API_KEY: "fastnear-key-for-tests",
   INDEXER_POLL_MS: "1000",
   INDEXER_START_HEIGHT: "222000000",
   TEAM_ACCOUNTS: "judge.tender-dev.testnet, poster.tender-dev.testnet",
@@ -212,6 +218,10 @@ test("read_serve_config_names_each_bad_variable", () => {
     // A password shorter than 8 characters, as the server reads it: decoded.
     ["DATABASE_URL", "postgres://tender:short@db.internal/tender"],
     ["DATABASE_URL", "postgres://tender:%61%62%63%64%65%66%67@db.internal/tender"],
+    // Off the sandbox, the user name and the common passwords are refused as well.
+    ["DATABASE_URL", "postgres://tender-app:Tender-App@db.internal/tender"],
+    ["DATABASE_URL", "postgres://tender:postgres@db.internal/tender"],
+    ["DATABASE_URL", "postgres://tender:%70assword@db.internal/tender"],
     ["API_PORT", "65536"],
     ["API_PORT", "80a"],
     ["API_PORT", "0x50"],
@@ -504,28 +514,124 @@ test("a_database_password_or_a_webhook_secret_too_short_to_hide_is_refused", () 
   expect(short.join("\n")).not.toContain("fifteen");
 });
 
-test("the_command_line_redacts_all_it_prints_errors_and_all", () => {
-  // `main` makes the console print through `redact`. It is the text printed that is redacted, so
-  // that a secret deep in an error is caught: a grammY HttpError holds the transport's error, whose
-  // message quotes the request's URL, and the bot's token with it.
-  const printed: Record<"log" | "info" | "warn" | "error", string[]> = {
-    log: [],
-    info: [],
-    warn: [],
-    error: [],
-  };
+test("off_the_sandbox_a_database_password_that_is_the_user_name_or_a_common_word_is_refused", () => {
+  // The stock password of the Postgres image, CI's own, and the user name: the first a guesser
+  // tries, and `redact` would take the word out of every line it is in. The error names the
+  // variable, and shows nothing of the password.
+  const refused =
+    "DATABASE_URL must have a password that is not its user name, postgres, password or tender, " +
+    "off the sandbox: they are the first a guesser tries (it is not shown)";
+  const weak = [
+    "postgres://postgres:postgres@db.internal/tender",
+    "postgres://tender-app:tender-app@db.internal/tender",
+    // Case does not matter, nor how the password is spelled: the server reads it decoded.
+    "postgres://Tender-App:tender-APP@db.internal/tender",
+    "postgres://app:POSTGRES@db.internal/tender",
+    "postgres://app:Password@db.internal/tender",
+    "postgres://app:%70ostgres@db.internal/tender",
+    "postgresql://app:%70%61%73%73%77%6f%72%64@db.internal:5432/tender",
+    // The user name is decoded too.
+    "postgres://t%65nder-app:tender-app@db.internal/tender",
+  ];
+  for (const network of ["testnet", "mainnet"]) {
+    for (const url of weak) {
+      const what = `${network} ${url}`;
+      const problems = problemsOf({ ...GOOD, TENDER_NETWORK: network, DATABASE_URL: url });
+      expect(problems, what).toEqual([refused]);
+    }
+    // Other passwords are not, and neither is no password, whatever the user name.
+    for (const url of [
+      "postgres://tender-app:pass-word@db.internal/tender",
+      "postgres://postgres:postgres-9@db.internal/tender",
+      "postgres://postgres@db.internal/tender",
+      "postgres://postgres:@db.internal/tender",
+      "postgres://db.internal/tender",
+    ]) {
+      expect(problemsOf({ ...GOOD, TENDER_NETWORK: network, DATABASE_URL: url }), url).toEqual([]);
+    }
+  }
+
+  // `tender` is shorter than 8 characters, and is refused as that, once.
+  expect(
+    problemsOf({ ...GOOD, DATABASE_URL: "postgres://tender:tender@db.internal/tender" }),
+  ).toEqual([
+    "DATABASE_URL must have a password of 8 characters or more, when it has one: a shorter one " +
+      "is easy to guess, and the logs do not hide it (it is not shown)",
+  ]);
+
+  // The sandbox keeps CI's `postgres`, and a password that is its user name; the floor of 8
+  // characters holds there too.
+  const sandbox = { ...GOOD, TENDER_NETWORK: "sandbox", NEAR_RPC_URL: "http://127.0.0.1:3030" };
+  for (const url of [
+    "postgres://postgres:postgres@localhost:5432/postgres",
+    "postgres://administrator:administrator@localhost:5432/tender",
+    "postgres://app:password@localhost:5432/tender",
+  ]) {
+    expect(problemsOf({ ...sandbox, DATABASE_URL: url }), url).toEqual([]);
+  }
+  expect(
+    problemsOf({ ...sandbox, DATABASE_URL: "postgres://tender:tender@localhost/tender" }),
+  ).toHaveLength(1);
+  // And a PGlite database has no password to check.
+  expect(problemsOf({ ...GOOD, DATABASE_URL: "pglite:.data/password" })).toEqual([]);
+});
+
+test("off_the_sandbox_no_fastnear_key_is_a_warning", () => {
+  // Without a key, neardata answers 429 after a few requests, and the indexer falls behind.
+  const warning =
+    "FASTNEAR_API_KEY is not set, so the indexer calls neardata without a key, which rate limits " +
+    "it (HTTP 429) and can leave the index behind the chain";
+  for (const network of ["testnet", "mainnet"]) {
+    for (const unset of [undefined, "", "  "]) {
+      const config = readServeConfig({
+        ...GOOD,
+        TENDER_NETWORK: network,
+        FASTNEAR_API_KEY: unset,
+      });
+      expect(config.warnings, `${network} ${JSON.stringify(unset)}`).toEqual([warning]);
+    }
+    expect(readServeConfig({ ...GOOD, TENDER_NETWORK: network }).warnings).toEqual([]);
+  }
+  // The sandbox has no neardata.
+  const sandbox = readServeConfig({
+    TENDER_NETWORK: "sandbox",
+    TENDER_CONTRACT: "tender.sandbox",
+    DATABASE_URL: "pglite:memory",
+    NEAR_RPC_URL: "http://127.0.0.1:3030",
+  });
+  expect(sandbox.warnings).toEqual([]);
+  // It is a warning among the others, in the order of the variables, and never a problem.
+  expect(
+    readServeConfig({ ...GOOD, FASTNEAR_API_KEY: "", PUBLIC_WEB_URL: "", TELEGRAM_BOT_TOKEN: "" })
+      .warnings,
+  ).toEqual(["PUBLIC_WEB_URL is empty, so no web app may call the API from a browser", warning]);
+});
+
+/** The methods of the console that `redactConsole` takes. */
+const CONSOLE_METHODS = ["log", "info", "warn", "error", "debug", "dir", "dirxml"] as const;
+
+/** A console that keeps, for each method, the one text it is handed. */
+function keepingConsole() {
+  const printed = Object.fromEntries(
+    CONSOLE_METHODS.map((method) => [method, [] as string[]]),
+  ) as Record<(typeof CONSOLE_METHODS)[number], string[]>;
   /** What the console does with what it is given: here, keeps the one text it is handed. */
   const keep =
     (into: string[]) =>
     (...args: unknown[]) => {
       into.push(args.map(String).join(" "));
     };
-  const target = {
-    log: keep(printed.log),
-    info: keep(printed.info),
-    warn: keep(printed.warn),
-    error: keep(printed.error),
-  };
+  const target = Object.fromEntries(
+    CONSOLE_METHODS.map((method) => [method, keep(printed[method])]),
+  ) as Record<(typeof CONSOLE_METHODS)[number], (...args: unknown[]) => void>;
+  return { printed, target };
+}
+
+test("the_command_line_redacts_all_it_prints_errors_and_all", () => {
+  // `main` makes the console print through `redact`. It is the text printed that is redacted, so
+  // that a secret deep in an error is caught: a grammY HttpError holds the transport's error, whose
+  // message quotes the request's URL, and the bot's token with it.
+  const { printed, target } = keepingConsole();
   const env = {
     TELEGRAM_BOT_TOKEN: BOT_TOKEN,
     DATABASE_URL: "postgres://tender:pass-word-1@db.internal/tender",
@@ -543,7 +649,13 @@ test("the_command_line_redacts_all_it_prints_errors_and_all", () => {
   target.error("telegram bot: update 7 failed:", httpError);
   target.warn("%s at %s", "cannot connect", env.DATABASE_URL);
   target.log({ database: { url: env.DATABASE_URL }, network: "testnet" });
-  target.info("serve: API at http://127.0.0.1:8787 (testnet)");
+  // A line with a secret, besides the ones that name none.
+  target.info("serve: API at http://127.0.0.1:8787 (testnet), index in", env.DATABASE_URL);
+  // `debug`, `dirxml` and `dir`, which Node's console writes to the stream by itself.
+  target.debug("grammy: GET https://api.telegram.org/bot%s/getMe", BOT_TOKEN);
+  target.dirxml({ token: BOT_TOKEN });
+  target.dir({ token: BOT_TOKEN, nested: { url: env.DATABASE_URL } });
+  target.dir({ token: BOT_TOKEN, nested: { url: env.DATABASE_URL } }, { depth: 0 });
 
   expect(printed.error).toHaveLength(1);
   expect(printed.error[0]).toMatch(/^telegram bot: update 7 failed: Error: Network request for/);
@@ -551,14 +663,159 @@ test("the_command_line_redacts_all_it_prints_errors_and_all", () => {
     "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/sendMessage",
   );
   expect(printed.warn).toEqual(["cannot connect at <DATABASE_URL>"]);
-  expect(printed.log).toHaveLength(1);
+  expect(printed.info).toEqual([
+    "serve: API at http://127.0.0.1:8787 (testnet), index in <DATABASE_URL>",
+  ]);
+  expect(printed.debug).toEqual([
+    "grammy: GET https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getMe",
+  ]);
+  expect(printed.dirxml).toEqual(["{ token: '<TELEGRAM_BOT_TOKEN>' }"]);
+  // `dir` shows a value as `inspect` does, with the options it is given, through `log`. The layout
+  // is `inspect`'s, which breaks lines by the length of the text before it is redacted.
+  const oneLine = (text: string | undefined) => text?.replace(/\s+/g, " ");
+  expect(printed.log).toHaveLength(3);
   expect(printed.log[0]).toContain("url: '<DATABASE_URL>'");
-  expect(printed.info).toEqual(["serve: API at http://127.0.0.1:8787 (testnet)"]);
+  expect(oneLine(printed.log[1])).toBe(
+    "{ token: '<TELEGRAM_BOT_TOKEN>', nested: { url: '<DATABASE_URL>' } }",
+  );
+  expect(oneLine(printed.log[2])).toBe("{ token: '<TELEGRAM_BOT_TOKEN>', nested: [Object] }");
   for (const text of Object.values(printed).flat()) {
     expect(text).not.toContain(BOT_TOKEN.slice("123456789:".length));
     expect(text).not.toContain("pass-word-1");
   }
 });
+
+test("a_real_console_prints_nothing_secret_by_any_of_its_methods", async () => {
+  // Node's console writes some methods to the stream by itself (`debug`, `dir`, `dirxml`) and
+  // sends others through `log`, `warn` and `error` (`trace`, `assert`, `table`, `group`, `count`).
+  // This is the real one, on streams, so that a change of Node's routing shows up here.
+  const out = new PassThrough();
+  const err = new PassThrough();
+  let written = "";
+  for (const stream of [out, err]) stream.on("data", (chunk) => (written += chunk));
+  const real = new Console({ stdout: out, stderr: err });
+  redactConsole({ TELEGRAM_BOT_TOKEN: BOT_TOKEN }, real);
+
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/getMe`;
+  const redacted = "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getMe";
+  for (const method of ["log", "info", "warn", "error", "debug", "dirxml"] as const) {
+    real[method](method, url);
+  }
+  real.dir({ url });
+  real.trace("trace", url);
+  real.assert(false, "assert", url);
+  real.table([{ url }]);
+  real.group("group", url);
+  real.groupEnd();
+  real.count(url);
+  real.error(new Error(`fetch failed for ${url}`));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  expect(written).not.toContain(BOT_TOKEN.slice("123456789:".length));
+  const lines = written.split("\n");
+  const has = (start: string, rest = redacted) =>
+    lines.some((line) => line.startsWith(start) && line.includes(rest));
+  for (const method of ["log", "info", "warn", "error", "debug", "dirxml"]) {
+    expect(has(`${method} https:`), method).toBe(true);
+  }
+  expect(has("  url: '", `${redacted}'`), "dir").toBe(true);
+  expect(has("Trace: trace https:"), "trace").toBe(true);
+  expect(has("Assertion failed: assert https:"), "assert").toBe(true);
+  expect(
+    lines.some((line) => line.includes("│") && line.includes(redacted)),
+    "table",
+  ).toBe(true);
+  expect(has("group https:"), "group").toBe(true);
+  expect(has("https:", `${redacted}: 1`), "count").toBe(true);
+  expect(has("Error: fetch failed for https:"), "error with an Error").toBe(true);
+});
+
+test("a_crash_prints_through_the_redaction_and_ends_the_process_with_1", () => {
+  // Node prints an uncaught exception and an unhandled rejection itself, outside the redaction.
+  const { printed, target } = keepingConsole();
+  redactConsole({ TELEGRAM_BOT_TOKEN: BOT_TOKEN }, target);
+  const handlers = new Map<string, (error: unknown) => void>();
+  const exit = vi.fn();
+  const proc = {
+    on(event: string, listener: (error: unknown) => void) {
+      handlers.set(event, listener);
+    },
+    exit,
+  };
+  exitOnCrash(proc, (...args) => target.error(...args));
+  expect([...handlers.keys()].sort()).toEqual(["uncaughtException", "unhandledRejection"]);
+
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/getMe`;
+  handlers.get("uncaughtException")?.(new Error(`getaddrinfo ENOTFOUND for ${url}`));
+  expect(printed.error).toHaveLength(1);
+  expect(printed.error[0]).toMatch(
+    /^serve: uncaught exception: Error: getaddrinfo ENOTFOUND for https:\/\/api\.telegram\.org\/bot<TELEGRAM_BOT_TOKEN>\/getMe\n {4}at /,
+  );
+  expect(exit).toHaveBeenCalledTimes(1);
+  expect(exit).toHaveBeenLastCalledWith(1);
+
+  // A rejection can be of anything.
+  handlers.get("unhandledRejection")?.(`refused: ${url}`);
+  expect(printed.error[1]).toBe(
+    "serve: unhandled rejection: refused: https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getMe",
+  );
+  expect(exit).toHaveBeenCalledTimes(2);
+  expect(exit).toHaveBeenLastCalledWith(1);
+  expect(printed.error.join("\n")).not.toContain(BOT_TOKEN.slice("123456789:".length));
+
+  // A console that cannot print (a closed pipe) does not keep the process alive.
+  exit.mockClear();
+  const broken = new Map<string, (error: unknown) => void>();
+  exitOnCrash(
+    {
+      on(event: string, listener: (error: unknown) => void) {
+        broken.set(event, listener);
+      },
+      exit,
+    },
+    () => {
+      throw new Error("write EPIPE");
+    },
+  );
+  expect(() => broken.get("uncaughtException")?.(new Error("boom"))).toThrow("write EPIPE");
+  expect(exit).toHaveBeenCalledWith(1);
+});
+
+test("a_real_crash_of_the_process_is_printed_redacted_and_exits_with_1", () => {
+  // The same in a process of its own, where Node's default is to print the error itself.
+  const crashes = {
+    "an uncaught exception": [
+      "uncaught exception",
+      "setTimeout(() => { throw new Error(url); }, 10);",
+    ],
+    "an unhandled rejection": ["unhandled rejection", "Promise.reject(new Error(url));"],
+  } as const;
+  for (const [what, [label, crash]] of Object.entries(crashes)) {
+    const script = `
+      import { exitOnCrash, redactConsole } from ${JSON.stringify(join(REPO_ROOT, "scripts", "serve.ts"))};
+      redactConsole({ TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN });
+      exitOnCrash();
+      const url = "request to https://api.telegram.org/bot" + process.env.TELEGRAM_BOT_TOKEN + "/getMe failed";
+      ${crash}
+      setTimeout(() => process.exit(0), 10_000);
+    `;
+    const run = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", script],
+      {
+        cwd: REPO_ROOT,
+        env: { ...process.env, TELEGRAM_BOT_TOKEN: BOT_TOKEN },
+        encoding: "utf8",
+        timeout: 90_000,
+      },
+    );
+    expect(run.status, `${what}: ${run.stderr}`).toBe(1);
+    expect(run.stderr, what).toContain(
+      `serve: ${label}: Error: request to https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getMe failed`,
+    );
+    expect(run.stderr, what).not.toContain(BOT_TOKEN.slice("123456789:".length));
+  }
+}, 180_000);
 
 test("serve_env_lets_a_set_process_variable_win_over_the_files", async () => {
   const dir = await mkdtemp(join(tmpdir(), "tender-serve-env-"));

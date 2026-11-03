@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseEnv } from "node:util";
 import { ApiClient, type LocalChain, startLocalChain, TenderClient } from "@tender/client";
-import type { SessionLock } from "@tender/db";
+import { migrate, openDb, type SessionLock } from "@tender/db";
 import { sha256Hex } from "@tender/shared";
 import { BOT_COMMANDS } from "@tender/telegram";
 import { KeyPair } from "near-api-js";
@@ -84,6 +84,8 @@ let keeperKey: string;
 let judgeKey: string;
 const running: Services[] = [];
 const fakes: FakeBotApi[] = [];
+/** Directories of the tests' own, such as a PGlite database's. */
+const dirs: string[] = [];
 
 beforeAll(async () => {
   chain = await startLocalChain();
@@ -130,7 +132,7 @@ afterAll(async () => {
   await Promise.all(running.map((services) => services.stop()));
   await Promise.all(fakes.map((fake) => fake.close()));
   await chain?.stop();
-  for (const dir of [deploymentsDir, keyDir]) {
+  for (const dir of [deploymentsDir, keyDir, ...dirs]) {
     if (dir) await rm(dir, { recursive: true, force: true });
   }
 });
@@ -312,10 +314,12 @@ function messageFrom(chat: number, text: string): FakeUpdate {
  * `push` handed it (a long poll waits up to 200 ms for one), `sendMessage` with the message it
  * made, and anything else with `true`. It drops the updates below the offset a poll sends, as
  * Telegram does once they are confirmed. A call that `hold` picks out is not answered until
- * `release` or `close`, as by a Telegram that does not answer.
+ * `release` or `close`, as by a Telegram that does not answer. A call that `refuse` picks out is
+ * answered with 401, as by a Telegram that does not take the token, once it is no longer held.
  */
 async function startFakeBotApi(
   hold: (call: BotCall) => boolean = () => false,
+  refuse: (call: BotCall) => boolean = () => false,
 ): Promise<FakeBotApi> {
   const calls: BotCall[] = [];
   let queued: FakeUpdate[] = [];
@@ -347,6 +351,10 @@ async function startFakeBotApi(
     const call = { method, payload };
     calls.push(call);
     if (holding(call)) await new Promise<void>((resolve) => held.add(resolve));
+    if (refuse(call)) {
+      answer(401, { ok: false, error_code: 401, description: "Unauthorized" });
+      return;
+    }
     switch (method) {
       case "getMe":
         answer(200, { ok: true, result: BOT_INFO });
@@ -580,7 +588,7 @@ test("serve_runs_the_bot_by_long_polling_and_the_notifier", async () => {
   // asks for messages only, and keeps the updates that came while no process polled.
   await until("the bot polls", async () => telegram.callsOf("getUpdates").length > 0, 10_000);
   expect(telegram.callsOf("setMyCommands").map((call) => call.payload)).toEqual([
-    { commands: BOT_COMMANDS },
+    { commands: BOT_COMMANDS, scope: { type: "all_private_chats" } },
   ]);
   expect(telegram.callsOf("getMe")).toHaveLength(1);
   expect(telegram.callsOf("deleteWebhook").map((call) => call.payload)).toEqual([
@@ -627,6 +635,7 @@ test("serve_takes_the_bots_updates_at_its_webhook", async () => {
   // Telegram is slow to give the bot its own details, until `release`.
   const telegram = await startFakeBotApi((call) => call.method === "getMe");
   const lines: string[] = [];
+  const before = loops.notifiers.length;
   const services = await serve(
     envFor(telegramEnv({ TELEGRAM_MODE: "webhook", TELEGRAM_WEBHOOK_SECRET: WEBHOOK_SECRET })),
     lines,
@@ -635,6 +644,9 @@ test("serve_takes_the_bots_updates_at_its_webhook", async () => {
   expect(lines).toContain(
     `serve: Telegram bot on, taking updates at POST ${TELEGRAM_WEBHOOK_PATH}, and the notifier`,
   );
+  // The notifier runs in this mode too.
+  const notifiers = loops.notifiers.slice(before);
+  expect(notifiers).toEqual([{ stopped: false }]);
   const chat = 4_343;
   const webhook = `${services.url}${TELEGRAM_WEBHOOK_PATH}`;
   const post = (secret?: string, body: BodyInit = JSON.stringify(messageFrom(chat, "/help"))) =>
@@ -711,15 +723,82 @@ test("serve_takes_the_bots_updates_at_its_webhook", async () => {
   const methods = new Set(telegram.calls.map((call) => call.method));
   expect([...methods].filter((method) => /Updates|Webhook/.test(method))).toEqual([]);
 
-  // Once stopped, the port takes no connection, and nothing calls Telegram or writes a line.
+  // Once stopped, the notifier has stopped, the port takes no connection, and nothing calls
+  // Telegram or writes a line, to the services' log or, as the notifier does, to the console.
+  const errors = vi.spyOn(console, "error");
+  try {
+    await services.stop();
+    expect(notifiers).toEqual([{ stopped: true }]);
+    expect(lines.at(-1)).toBe("serve: stopped");
+    expect(lines.filter((line) => /^(ERROR|WARN) telegram/.test(line))).toEqual([]);
+    const after = { lines: lines.length, calls: telegram.calls.length };
+    await sleep(1_000);
+    expect(await takesConnections(services.url)).toBe(false);
+    expect(lines).toHaveLength(after.lines);
+    expect(telegram.calls).toHaveLength(after.calls);
+    expect(errors).not.toHaveBeenCalled();
+  } finally {
+    errors.mockRestore();
+  }
+});
+
+test("the_webhook_says_the_bot_is_not_available_once_it_cannot_start", async () => {
+  // Telegram is slow to give the bot its own details, and then does not take its token.
+  const telegram = await startFakeBotApi(
+    (call) => call.method === "getMe",
+    (call) => call.method === "getMe",
+  );
+  const lines: string[] = [];
+  const services = await serve(
+    envFor(telegramEnv({ TELEGRAM_MODE: "webhook", TELEGRAM_WEBHOOK_SECRET: WEBHOOK_SECRET })),
+    lines,
+    { telegramApiRoot: telegram.apiRoot },
+  );
+  const post = async () => {
+    const res = await fetch(`${services.url}${TELEGRAM_WEBHOOK_PATH}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET,
+      },
+      body: JSON.stringify(messageFrom(4_545, "/help")),
+    });
+    return { status: res.status, body: await res.json() };
+  };
+  const unavailable = (message: string) => ({
+    status: 503,
+    body: { error: "unavailable", message },
+  });
+  await until(
+    "the services ask for the bot",
+    async () => telegram.callsOf("getMe").length > 0,
+    10_000,
+  );
+
+  // While Telegram has not answered, the bot is starting.
+  expect(await post()).toEqual(unavailable("the bot is starting"));
+
+  // Then Telegram turns the token down. The ERROR is logged, and nothing tries again: from then on
+  // the bot is not available, which is no longer "starting".
+  telegram.release();
+  await until(
+    "the ERROR is logged",
+    async () => lines.some((line) => line.startsWith("ERROR")),
+    10_000,
+  );
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([
+    "ERROR telegram: the bot cannot start (GrammyError 401: Telegram does not take " +
+      "TELEGRAM_BOT_TOKEN)",
+  ]);
+  expect(await post()).toEqual(unavailable("the bot is not available"));
+  expect(await post()).toEqual(unavailable("the bot is not available"));
+  // The rest of the services go on, and the bot said nothing.
+  expect((await health(services.url)).status).toBe(200);
+  expect(telegram.callsOf("sendMessage")).toEqual([]);
+  expect(telegram.callsOf("getMe")).toHaveLength(1);
+
   await services.stop();
   expect(lines.at(-1)).toBe("serve: stopped");
-  expect(lines.filter((line) => /^(ERROR|WARN) telegram/.test(line))).toEqual([]);
-  const after = { lines: lines.length, calls: telegram.calls.length };
-  await sleep(1_000);
-  expect(await takesConnections(services.url)).toBe(false);
-  expect(lines).toHaveLength(after.lines);
-  expect(telegram.calls).toHaveLength(after.calls);
 });
 
 test("stop_goes_on_without_a_telegram_that_does_not_answer", async () => {
@@ -853,4 +932,62 @@ test("stop_leaves_the_port_closed_and_every_loop_resolved", async () => {
   } finally {
     errors.mockRestore();
   }
+});
+
+// ---- The database ------------------------------------------------------------------------------
+
+test("serve_keeps_its_index_in_a_pglite_directory_that_one_process_has_open_at_a_time", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tender-serve-pglite-"));
+  dirs.push(dir);
+  const url = `pglite:${join(dir, "index")}`;
+  const lines: string[] = [];
+  const first = await serve(envFor({ DATABASE_URL: url }), lines);
+
+  // A second services process on the directory is refused with the reason, and the first goes on.
+  const second = lines.slice();
+  await expect(serve(envFor({ DATABASE_URL: url }), second)).rejects.toThrow(
+    /^the PGlite directory .* is open already in this process/,
+  );
+  expect(second.slice(lines.length)).toEqual([]);
+
+  const taskId = await postTask();
+  await until(
+    `the index holds task ${taskId}`,
+    async () => (await fetch(`${first.url}/v1/tasks/${taskId}`)).status === 200,
+    30_000,
+  );
+  await first.stop();
+
+  // Stopped, the services let the directory go. They start on it again with the index as it was,
+  // and the check of the database against the chain, which asks for the task count now, passes.
+  const restarted = await serve(envFor({ DATABASE_URL: url }), lines);
+  expect((await fetch(`${restarted.url}/v1/tasks/${taskId}`)).status).toBe(200);
+  expect(lines.filter((line) => /^indexer: resuming after block \d+$/.test(line))).toHaveLength(1);
+  await restarted.stop();
+});
+
+test("serve_refuses_a_database_that_holds_the_index_of_another_deploy", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tender-serve-pglite-"));
+  dirs.push(dir);
+  const url = `pglite:${join(dir, "index")}`;
+  // The index of another contract, as an earlier deploy left it.
+  const left = await openDb(url);
+  await migrate(left);
+  await left.query("insert into chain_cursor (source, height) values ($1, 12345)", [
+    "sandbox:old-deploy.sandbox",
+  ]);
+  await left.close();
+
+  const lines: string[] = [];
+  const failure = await serve(envFor({ DATABASE_URL: url }), lines).then(
+    () => undefined,
+    (error: unknown) => error as Error,
+  );
+  expect(failure?.message).toMatch(
+    /^the database holds the index of another deploy of Tender: its chain cursor is for "sandbox:old-deploy\.sandbox", and this deploy is "sandbox:/,
+  );
+  expect(failure?.message).toContain("one database per contract deploy");
+  // Nothing served from it, and what had started is stopped: the directory opens again.
+  expect(lines.filter((line) => line.startsWith("serve: API at"))).toEqual([]);
+  await (await openDb(url)).close();
 });

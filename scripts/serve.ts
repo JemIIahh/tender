@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { format } from "node:util";
+import { format, type InspectOptions, inspect } from "node:util";
 import {
   type ApiServer,
   createApp,
@@ -20,7 +20,7 @@ import {
   type SessionLock,
   tryAdvisoryLock,
 } from "@tender/db";
-import { startIndexer } from "@tender/indexer";
+import { checkDeployment, startIndexer } from "@tender/indexer";
 import { startJudge } from "@tender/judge";
 import { AccountIdSchema, canonicalBase, NETWORKS, type NetworkId } from "@tender/shared";
 import {
@@ -37,7 +37,8 @@ import { loadEnv, REPO_ROOT, readEnvFile } from "./lib/env";
 /**
  * `pnpm serve`: the one process that runs the services of a deployment against one database.
  *
- *   database   opened from DATABASE_URL and migrated
+ *   database   opened from DATABASE_URL and migrated, and checked: it serves one contract deploy,
+ *              so one that holds the index of another is refused (`checkDeployment`)
  *   API        on API_PORT (default 8787), for the web app, agents and MCP clients, at the base
  *              URL PUBLIC_API_URL, which sign-in is bound to (P03-R28)
  *   indexer    follows the chain into the database; on Postgres only while this process holds
@@ -83,6 +84,11 @@ const MIN_WEBHOOK_SECRET_LENGTH = 16;
  * every line it is in, and point at it. So a `DATABASE_URL` password shorter than this is refused.
  */
 const MIN_REDACTED_LENGTH = 8;
+/**
+ * The passwords of a database off the sandbox that are refused besides the user name: the stock
+ * password of the Postgres image and the first ones a guesser tries. Compared in lower case.
+ */
+const COMMON_PASSWORDS: readonly string[] = ["postgres", "password", "tender"];
 
 /**
  * Where Telegram posts the bot's updates in webhook mode. It is not under `/v1`, and so not under
@@ -215,6 +221,12 @@ function wholeNumber(value: string, min: number, max: number): number | undefine
   return Number.isSafeInteger(n) && n >= min && n <= max ? n : undefined;
 }
 
+/** Whether `password`, if there is one, is the user name `user` or one of the common passwords. */
+function isCommonPassword(password: string, user: string): boolean {
+  const word = password.toLowerCase();
+  return word !== "" && (word === user.toLowerCase() || COMMON_PASSWORDS.includes(word));
+}
+
 function httpUrl(value: string): URL | undefined {
   try {
     const url = new URL(value);
@@ -278,7 +290,8 @@ function databaseKind(url: string): "pglite" | "postgres" | undefined {
  *
  * - `TENDER_NETWORK` (sandbox, testnet or mainnet), `TENDER_CONTRACT` (an account id) and
  *   `DATABASE_URL` (`pglite:memory`, `pglite:<dir>` or a Postgres URL, whose password, if it has
- *   one, has 8 characters or more), which must all be set;
+ *   one, has 8 characters or more, and off the sandbox is neither its user name nor `postgres`,
+ *   `password` or `tender`), which must all be set;
  * - `API_PORT`, `INDEXER_POLL_MS`, `KEEPER_INTERVAL_MS`, `JUDGE_INTERVAL_MS`,
  *   `INDEXER_START_HEIGHT` and `TRUSTED_PROXY_HOPS`, which must be whole numbers in plain decimal
  *   digits, each in its range;
@@ -300,8 +313,9 @@ function databaseKind(url: string): "pglite" | "postgres" | undefined {
  *   webhook mode that the secret is set.
  *
  * An empty value is an unset one. Off the sandbox, an empty `PUBLIC_WEB_URL` is a warning: allowed,
- * but likely a mistake. So are a bot without `TELEGRAM_BOT_USERNAME`, which no chat can be linked
- * to, and a Judge with some of the `LLM_*` variables but not all three.
+ * but likely a mistake. So are no `FASTNEAR_API_KEY`, without which neardata rate limits the
+ * indexer, a bot without `TELEGRAM_BOT_USERNAME`, which no chat can be linked to, and a Judge with
+ * some of the `LLM_*` variables but not all three.
  */
 export function readServeConfig(env: Record<string, string | undefined>): ServeConfig {
   const problems: string[] = [];
@@ -340,12 +354,20 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
     problems.push(`DATABASE_URL must be pglite:memory, pglite:<dir> or a postgres:// URL${unset}`);
   } else if (kind === "postgres" && databaseUrl !== undefined) {
     // As the server reads it: decoded. A password `redact` would leave in the logs is refused.
-    const password = decoded(URL.parse(databaseUrl)?.password ?? "");
+    const url = URL.parse(databaseUrl);
+    const password = decoded(url?.password ?? "");
     if (password !== "" && password.length < MIN_REDACTED_LENGTH) {
       problems.push(
         `DATABASE_URL must have a password of ${MIN_REDACTED_LENGTH} characters or more, when ` +
           "it has one: a shorter one is easy to guess, and the logs do not hide it (it is not " +
           "shown)",
+      );
+    } else if (offSandbox && isCommonPassword(password, decoded(url?.username ?? ""))) {
+      // The sandbox keeps CI's own, `postgres`. Elsewhere `redact` would also take the word out of
+      // every line it is in, and mark where it was.
+      problems.push(
+        "DATABASE_URL must have a password that is not its user name, postgres, password or " +
+          "tender, off the sandbox: they are the first a guesser tries (it is not shown)",
       );
     }
   }
@@ -429,6 +451,12 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
   const neardataUrl = get("NEARDATA_URL");
   if (neardataUrl !== undefined && httpUrl(neardataUrl) === undefined) {
     problems.push("NEARDATA_URL must be an http or https URL");
+  }
+  if (offSandbox && get("FASTNEAR_API_KEY") === undefined) {
+    warnings.push(
+      "FASTNEAR_API_KEY is not set, so the indexer calls neardata without a key, which rate " +
+        "limits it (HTTP 429) and can leave the index behind the chain",
+    );
   }
 
   const teamAccounts = entriesOf(get("TEAM_ACCOUNTS"));
@@ -929,7 +957,8 @@ export interface ServeOptions {
   closeGraceMs?: number;
   /**
    * For tests: how the indexer lock is tried, whatever the database. Default: the session lock of
-   * a Postgres database (`tryAdvisoryLock`), and no lock for PGlite, which one process alone opens.
+   * a Postgres database (`tryAdvisoryLock`), and no lock for PGlite, whose directory `openDb`
+   * locks against a second process (a `PgliteInUseError` at the start).
    */
   tryLock?: () => Promise<SessionLock | null>;
   /**
@@ -1025,11 +1054,17 @@ function telegramTrouble(error: unknown): string {
 interface TelegramRun extends Stoppable {
   /** What `stop` waits for still, as a line names it: nothing before `stop`, or once it is done. */
   pending(): string[];
+  /**
+   * Whether the bot's start has failed for good, as the ERROR line says: its details were refused,
+   * such as for a token that Telegram does not take, and nothing tries again.
+   */
+  startFailed(): boolean;
 }
 
 /**
  * Runs the Telegram side of the services with `bot`: the notifier, the bot's menu of commands
- * (`setMyCommands`, once), the bot's own details (`getMe`) and, in polling mode, the long polling.
+ * (`setMyCommands`, once, for private chats only, so that groups do not get the menu), the bot's
+ * own details (`getMe`) and, in polling mode, the long polling.
  * What talks to Telegram runs in the background, so that a Telegram that does not answer holds
  * nothing else up, and what fails is logged by name and code only: a failure of the menu is a
  * WARN, one of the bot an ERROR. In webhook mode the updates come to the handler that
@@ -1071,19 +1106,24 @@ function runTelegram(
     network: opts.network,
     signal,
   });
-  const commands = bot.api.setMyCommands([...BOT_COMMANDS], undefined, grammySignal).then(
-    () => undefined,
-    (error: unknown) =>
-      unlessStopping(
-        `WARN telegram: cannot set the bot's menu of commands (${telegramTrouble(error)}); the ` +
-          "commands work without it",
-      ),
-  );
+  const commands = bot.api
+    .setMyCommands([...BOT_COMMANDS], { scope: { type: "all_private_chats" } }, grammySignal)
+    .then(
+      () => undefined,
+      (error: unknown) =>
+        unlessStopping(
+          `WARN telegram: cannot set the bot's menu of commands (${telegramTrouble(error)}); the ` +
+            "commands work without it",
+        ),
+    );
+  let startFailed = false;
   const running = (async () => {
     // `bot.start` would fetch the details itself, but with no signal to end its retries.
     try {
       await bot.init(grammySignal);
     } catch (error) {
+      // A failure that comes with the stop is the stop, not the bot's.
+      startFailed = !signal.aborted;
       unlessStopping(`ERROR telegram: the bot cannot start (${telegramTrouble(error)})`);
       return;
     }
@@ -1127,6 +1167,7 @@ function runTelegram(
       ]);
     },
     pending: () => waits.filter((wait) => !wait.done).map((wait) => wait.what),
+    startFailed: () => startFailed,
   };
 }
 
@@ -1209,6 +1250,9 @@ export async function startServices(
 
   let publicUrl = "";
   try {
+    // A database serves one contract deploy: one that holds another's index is refused before
+    // anything serves from it or acts on it.
+    await checkDeployment(db, client);
     // The bot is made before the API, whose app takes its webhook. It calls Telegram only once
     // `runTelegram` runs it: the webhook takes no update before then (see below).
     const { telegram: telegramConfig } = config;
@@ -1249,8 +1293,14 @@ export async function startServices(
             // Until the bot has its own details, which `runTelegram` asks for with the stop signal,
             // grammY's handler would ask Telegram for them itself, with no signal, and before it
             // looks at the secret. So no update is taken till then: Telegram sends it again later.
+            // Once `runTelegram` has logged its ERROR, the bot will not have them: it is not
+            // starting, and the answer says so.
             if (!bot.isInited()) {
-              const body: ErrorBody = { error: "unavailable", message: "the bot is starting" };
+              const message =
+                telegram?.startFailed() === true
+                  ? "the bot is not available"
+                  : "the bot is starting";
+              const body: ErrorBody = { error: "unavailable", message };
               return Response.json(body, { status: 503 });
             }
             // Telegram says how long an update is, and an update is small: a body that does not say
@@ -1420,23 +1470,61 @@ function decoded(text: string): string {
 }
 
 /** The methods of `console` that print, which `redactConsole` wraps. */
-type Printer = Pick<Console, "log" | "info" | "warn" | "error">;
+type Printer = Pick<Console, "log" | "info" | "warn" | "error" | "debug" | "dir" | "dirxml">;
 
 /**
- * Makes what `target` prints through `log`, `info`, `warn` and `error` pass through `redact`: the
- * services' own lines, and what the packages print, whole errors among them. The text redacted is
- * the text printed, `util.format` of all the arguments, so that a secret deep inside an error is
- * caught too: a grammY `HttpError` holds the transport's error, whose message can quote the URL of
- * the request, which holds the bot's token.
+ * Makes what `target` prints pass through `redact`: the services' own lines, and what the packages
+ * print, whole errors among them. The text redacted is the text printed, `util.format` of all the
+ * arguments, so that a secret deep inside an error is caught too: a grammY `HttpError` holds the
+ * transport's error, whose message can quote the URL of the request, which holds the bot's token.
+ *
+ * `log`, `info`, `warn` and `error` are wrapped, and so are `debug`, `dirxml` and `dir`, which
+ * Node's console writes to the stream by itself, not through `log`. `trace`, `assert`, `table`,
+ * `group` and `count` print through those four, and so are covered. What bypasses the console
+ * altogether is not: the `debug` package (set by `DEBUG`) writes to stderr itself.
  */
 export function redactConsole(
   env: Record<string, string | undefined>,
   target: Printer = console,
 ): void {
-  for (const method of ["log", "info", "warn", "error"] as const) {
+  for (const method of ["log", "info", "warn", "error", "debug", "dirxml"] as const) {
     const print = target[method].bind(target);
     target[method] = (...args: unknown[]) => print(redact(format(...args), env));
   }
+  // `dir` shows one value as `inspect` does, with the same options. Its text goes out through the
+  // `log` that is wrapped by now, which prints a lone string as it is.
+  target.dir = (value: unknown, options?: InspectOptions) =>
+    target.log(inspect(value, { customInspect: false, ...options }));
+}
+
+/** What `exitOnCrash` hangs its handlers on: the process, or a stand-in in a test. */
+interface CrashTarget {
+  on(
+    event: "uncaughtException" | "unhandledRejection",
+    listener: (error: unknown) => void,
+  ): unknown;
+  exit(code: number): unknown;
+}
+
+/**
+ * Makes an uncaught exception and an unhandled rejection print through `print`, `console.error`
+ * unless given, which `redactConsole` wraps, and end the process with 1, as Node does by itself.
+ * Node prints them to stderr on its own otherwise, outside the redaction and with the whole error,
+ * whose message can quote a URL that holds a key.
+ */
+export function exitOnCrash(
+  proc: CrashTarget = process,
+  print: (...args: unknown[]) => void = (...args) => console.error(...args),
+): void {
+  const crash = (what: string) => (error: unknown) => {
+    try {
+      print(`serve: ${what}:`, error);
+    } finally {
+      proc.exit(1);
+    }
+  };
+  proc.on("uncaughtException", crash("uncaught exception"));
+  proc.on("unhandledRejection", crash("unhandled rejection"));
 }
 
 async function main(): Promise<void> {
@@ -1469,8 +1557,9 @@ async function main(): Promise<void> {
   try {
     env = serveEnv();
     // From here on, all the process prints passes through `redact`: the services' lines, the
-    // errors below, and what the packages print to the console of their own.
+    // errors below, what the packages print to the console of their own, and a crash.
     redactConsole(env);
+    exitOnCrash();
     services = await startServices(env);
   } catch (error) {
     console.error(`serve: ${messageOf(error)}`);

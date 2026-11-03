@@ -1,6 +1,7 @@
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { EventEmitter } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { EventEmitter, once } from "node:events";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inspect } from "node:util";
@@ -13,6 +14,7 @@ import {
   hasResultUpload,
   migrate,
   openDb,
+  PgliteInUseError,
   putBlob,
   recordResultUpload,
   setBlobPublic,
@@ -1117,6 +1119,136 @@ describe("openDb", () => {
       await rm(base, { recursive: true, force: true });
     }
   });
+
+  // PGlite keeps no lock on its directory, and two processes on the same files corrupt them. The
+  // lock is a pid file in the directory.
+  describe("a PGlite directory's lock", () => {
+    const bases: string[] = [];
+    afterEach(async () => {
+      await Promise.all(bases.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+    });
+    /** A directory to open, as a url, and the lock file in it. */
+    async function place() {
+      const base = await mkdtemp(join(tmpdir(), "tender-pglite-lock-"));
+      bases.push(base);
+      const dir = join(base, "data");
+      return { url: `pglite:${dir}`, dir, lock: join(dir, "tender.lock") };
+    }
+    const exists = (path: string) =>
+      stat(path).then(
+        () => true,
+        () => false,
+      );
+    const failureOf = (url: string) =>
+      openDb(url).then(
+        () => undefined,
+        (error: unknown) => error as Error,
+      );
+
+    it(
+      "belongs_to_the_one_process_that_has_the_directory_open_until_it_closes",
+      MINUTE,
+      async () => {
+        const { url, dir, lock } = await place();
+        const first = await openDb(url);
+        expect(await readFile(lock, "utf8")).toBe(`${process.pid}\n`);
+
+        // This process again: refused, whatever way the directory is spelled, and the first goes on.
+        for (const again of [url, `${url}/../data`]) {
+          const failure = await failureOf(again);
+          expect(failure).toBeInstanceOf(PgliteInUseError);
+          expect(failure?.message).toMatch(/open already in this process/);
+        }
+        expect(await first.query("select 1 as one")).toEqual([{ one: 1 }]);
+        expect(await readFile(lock, "utf8")).toBe(`${process.pid}\n`);
+
+        // Closing lets it go, once, and the directory opens again.
+        await first.close();
+        await first.close();
+        expect(await exists(lock)).toBe(false);
+        const second = await openDb(url);
+        expect(await readFile(lock, "utf8")).toBe(`${process.pid}\n`);
+        await second.close();
+
+        // Two opens at once: one has it, the other is turned away.
+        const results = await Promise.allSettled([openDb(url), openDb(url)]);
+        expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+        for (const result of results) {
+          if (result.status === "fulfilled") await result.value.close();
+        }
+        expect(await exists(lock)).toBe(false);
+        // The directory is PGlite's, with the lock file the only thing of ours in it.
+        expect(await exists(join(dir, "PG_VERSION"))).toBe(true);
+      },
+    );
+
+    it(
+      "refuses_a_directory_while_another_process_has_it_and_takes_it_over_when_it_is_gone",
+      MINUTE,
+      async () => {
+        const { url, dir, lock } = await place();
+        await mkdir(dir, { recursive: true });
+        const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+          stdio: "ignore",
+        });
+        try {
+          const text = `${other.pid}\n`;
+          await writeFile(lock, text);
+          const failure = await failureOf(url);
+          expect(failure).toBeInstanceOf(PgliteInUseError);
+          // It names the directory, the process and the file to delete, and the lock stays as it was.
+          expect(failure?.message).toContain(dir);
+          expect(failure?.message).toContain(`process ${other.pid}`);
+          expect(failure?.message).toContain(`delete ${lock}`);
+          expect(await readFile(lock, "utf8")).toBe(text);
+
+          other.kill();
+          await once(other, "exit");
+          const db = await openDb(url);
+          expect(await readFile(lock, "utf8")).toBe(`${process.pid}\n`);
+          await db.close();
+          expect(await exists(lock)).toBe(false);
+        } finally {
+          other.kill();
+        }
+      },
+    );
+
+    it("takes_over_a_lock_that_names_no_process_that_runs", MINUTE, async () => {
+      const { url, dir, lock } = await place();
+      await mkdir(dir, { recursive: true });
+      // A process that has run and ended, a leftover with this process's own pid (a container that
+      // restarts runs under the same pids), and files that name no pid.
+      const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+      const leftovers = [
+        `${gone}\n`,
+        `${process.pid}\n`,
+        "",
+        "not a pid\n",
+        "99999999999\n",
+        "0\n",
+      ];
+      for (const text of leftovers) {
+        await writeFile(lock, text);
+        const db = await openDb(url);
+        expect(await readFile(lock, "utf8"), JSON.stringify(text)).toBe(`${process.pid}\n`);
+        expect(await db.query("select 1 as one")).toEqual([{ one: 1 }]);
+        await db.close();
+        expect(await exists(lock)).toBe(false);
+      }
+    });
+
+    it("lets_go_of_the_lock_when_pglite_cannot_open_the_directory", MINUTE, async () => {
+      const { url, dir, lock } = await place();
+      await mkdir(dir, { recursive: true });
+      // Not a data directory, and not empty: initdb refuses it, or the open does.
+      await writeFile(join(dir, "PG_VERSION"), "not a version\n");
+      const failure = await failureOf(url);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(PgliteInUseError);
+      expect(await exists(lock)).toBe(false);
+    });
+  });
 });
 
 // Needs a Postgres server to be a real test of the driver; that is what TEST_DATABASE_URL is for.
@@ -1183,6 +1315,8 @@ describe("postgres adapter against a fake pool", () => {
     return { log, queries, pools, release, end, client, uncaught, socketError };
   }
   const open = () => openDb("postgres://tester:secret@localhost:1/none");
+  // Every transaction names its level, so that a server whose default is stricter does not apply it.
+  const BEGIN = "begin isolation level read committed";
   const discarded = (release: ReturnType<typeof vi.fn>) => Boolean(release.mock.calls[0]?.[0]);
 
   it("commits and returns the connection", async () => {
@@ -1195,7 +1329,7 @@ describe("postgres adapter against a fake pool", () => {
       return "ok";
     });
     expect(value).toBe("ok");
-    expect(log).toEqual(["begin", "select 1 as one", "commit"]);
+    expect(log).toEqual([BEGIN, "select 1 as one", "commit"]);
     expect(release).toHaveBeenCalledTimes(1);
     expect(discarded(release)).toBe(false);
     // Somebody listens for a lost connection while the transaction holds the client, and nobody is
@@ -1213,7 +1347,7 @@ describe("postgres adapter against a fake pool", () => {
         throw new Error("boom");
       }),
     ).rejects.toThrow("boom");
-    expect(log).toEqual(["begin", "select 1 as one", "rollback"]);
+    expect(log).toEqual([BEGIN, "select 1 as one", "rollback"]);
     expect(release).toHaveBeenCalledTimes(1);
     expect(discarded(release)).toBe(false);
     expect(client.listenerCount("error")).toBe(0);
@@ -1223,13 +1357,13 @@ describe("postgres adapter against a fake pool", () => {
     const statement = fakePool(/boom_table/);
     let db = await open();
     await expect(db.tx((tx) => tx.query("select * from boom_table"))).rejects.toThrow(/boom_table/);
-    expect(statement.log).toEqual(["begin", "select * from boom_table", "rollback"]);
+    expect(statement.log).toEqual([BEGIN, "select * from boom_table", "rollback"]);
     vi.restoreAllMocks();
 
     const commit = fakePool(/^commit$/);
     db = await open();
     await expect(db.tx((tx) => tx.query("select 1"))).rejects.toThrow(/commit/);
-    expect(commit.log).toEqual(["begin", "select 1", "commit", "rollback"]);
+    expect(commit.log).toEqual([BEGIN, "select 1", "commit", "rollback"]);
     expect(discarded(commit.release)).toBe(false);
   });
 
@@ -1412,7 +1546,7 @@ describe("postgres adapter against a fake pool", () => {
       ).rejects.toThrow("inner");
     });
     expect(log).toEqual([
-      "begin",
+      BEGIN,
       expect.stringMatching(/^savepoint \w+$/),
       "select 1",
       expect.stringMatching(/^release savepoint \w+$/),
@@ -1520,3 +1654,27 @@ it.skipIf(!POSTGRES_URL)("both_adapters_same_row_shapes", MINUTE, async () => {
     await b.dispose();
   }
 });
+
+// A server whose default isolation is stricter than the services' transactions are written for:
+// `applyBlock` and the sign-in would fail with a serialization failure (40001) when they meet.
+it.skipIf(!POSTGRES_URL)(
+  "transactions_are_read_committed_whatever_the_server_default_is",
+  MINUTE,
+  async () => {
+    if (!POSTGRES_URL) return;
+    const strict = new URL(POSTGRES_URL);
+    strict.searchParams.set("options", "-c default_transaction_isolation=serializable");
+    const db = await openDb(strict.toString());
+    try {
+      const level = "select current_setting('transaction_isolation') as level";
+      expect(await db.query(level)).toEqual([{ level: "serializable" }]);
+      expect(await db.tx((tx) => tx.query(level))).toEqual([{ level: "read committed" }]);
+      // A savepoint inside it is the same transaction.
+      expect(await db.tx((tx) => tx.tx((inner) => inner.query(level)))).toEqual([
+        { level: "read committed" },
+      ]);
+    } finally {
+      await db.close();
+    }
+  },
+);

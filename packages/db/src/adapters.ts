@@ -1,4 +1,6 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { PGlite } from "@electric-sql/pglite";
 import { Pool, TypeOverrides, types } from "pg";
 
@@ -42,6 +44,9 @@ export interface Db {
    * Inside `fn`, use only the `tx` handle. On PGlite the outer `db` waits for this transaction
    * to end while `fn` waits for the outer `db`: a deadlock. On Postgres it would run on another
    * connection, outside the transaction.
+   * On Postgres it runs at READ COMMITTED, whatever the server's `default_transaction_isolation`
+   * is: the transactions of the services are written for that level, and at a stricter one they
+   * would fail with a serialization failure (40001) when they meet.
    * The handle stops working when the transaction ends. Called on a handle, `tx` opens a
    * savepoint, so the inner work can fail and roll back on its own.
    */
@@ -86,6 +91,11 @@ const CONNECT_TIMEOUT_MS = 10_000;
  * Opens a database. `pglite:memory` is an in-memory PGlite, `pglite:<dir>` a PGlite that keeps
  * its files in that directory (created when missing), and `postgres://…` (or `postgresql://…`) a
  * Postgres server reached through a connection pool.
+ *
+ * A PGlite directory is one process's own: PGlite keeps no lock on it, and two processes that open
+ * the same files corrupt them. So `openDb` takes a pid file in the directory (`tender.lock`) and
+ * throws a `PgliteInUseError` while another process, or this one, has the directory open. `close`
+ * lets the lock go. A lock whose process is gone, such as one a crash left, is taken over.
  */
 export async function openDb(url: string): Promise<Db> {
   if (url === "pglite:memory") return openPglite();
@@ -109,7 +119,158 @@ async function openPglite(dir?: string): Promise<Db> {
   };
   if (dir === undefined) return makeDb(pgliteBackend(await PGlite.create(options)));
   await mkdir(dir, { recursive: true });
-  return makeDb(pgliteBackend(await PGlite.create(dir, options)));
+  const unlock = await lockPgliteDir(dir);
+  try {
+    return makeDb(pgliteBackend(await PGlite.create(dir, options), unlock));
+  } catch (error) {
+    await unlock();
+    throw error;
+  }
+}
+
+// ---- The lock on a PGlite directory -----------------------------------------------------------
+
+/**
+ * The file in a PGlite directory that names the process that has it open. PGlite ignores a file it
+ * does not know, including when it makes the directory.
+ */
+const PGLITE_LOCK_FILE = "tender.lock";
+/** The PGlite directories this process has open, by real path. */
+const pgliteDirsOpen = new Set<string>();
+/**
+ * How long a lock file with no pid in it is waited for: its maker has created it and not yet
+ * written to it. Past that it is a leftover, as one from a process that died in between would be.
+ */
+const PID_WAIT_MS = 250;
+const PID_POLL_MS = 25;
+/** The most the lock file is looked at before the directory is given up as taken. */
+const LOCK_ATTEMPTS = 3;
+
+/**
+ * The directory of a `pglite:<dir>` database is open in another process, or already in this one.
+ * The message names the directory and the process, and the file to delete if that process is not
+ * one of Tender's.
+ */
+export class PgliteInUseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PgliteInUseError";
+  }
+}
+
+/** The pid in the text of a lock file, or undefined when it holds none. */
+function pidOf(text: string): number | undefined {
+  const digits = text.trim();
+  if (!/^[1-9][0-9]{0,9}$/.test(digits)) return undefined;
+  const pid = Number(digits);
+  // A pid is an int32 to `process.kill`.
+  return pid <= 2 ** 31 - 1 ? pid : undefined;
+}
+
+/** Whether a process with `pid` runs: any answer but "no such process" counts, even a refusal. */
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/** What a lock file says: its text, and the pid in it, if it holds one. */
+interface LockFile {
+  text: string;
+  pid: number | undefined;
+}
+
+/** What `file` says, or undefined once it is gone. */
+async function readLock(file: string): Promise<LockFile | undefined> {
+  try {
+    const text = await readFile(file, "utf8");
+    return { text, pid: pidOf(text) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/** What `file` says once it names a pid: a file that names none yet is waited for a moment. */
+async function lockHolder(file: string): Promise<LockFile | undefined> {
+  const giveUpAt = Date.now() + PID_WAIT_MS;
+  for (;;) {
+    const lock = await readLock(file);
+    if (lock === undefined || lock.pid !== undefined || Date.now() >= giveUpAt) return lock;
+    await delay(PID_POLL_MS);
+  }
+}
+
+/**
+ * Takes the lock on the PGlite directory `dir`: a pid file made with the `wx` flag, which only one
+ * process can make. It returns the function that lets the lock go, which is safe to call twice and
+ * leaves a lock that another process has taken since.
+ *
+ * If the file is there already, it names a process: while that one runs, the directory is its own
+ * and this throws a `PgliteInUseError`. A file that names a process that is gone, or none, is a
+ * leftover of a crash and is taken over. So is one that names this process's pid, when this
+ * process has not opened the directory: a container that restarts runs under the same pids. Two
+ * processes that take over the same leftover in the same instant can both end up with the
+ * directory: the file is removed only if it still says what was read, which leaves a window of
+ * microseconds.
+ */
+async function lockPgliteDir(dir: string): Promise<() => Promise<void>> {
+  const key = await realpath(dir);
+  const file = join(dir, PGLITE_LOCK_FILE);
+  if (pgliteDirsOpen.has(key)) {
+    throw new PgliteInUseError(
+      `the PGlite directory ${dir} is open already in this process: close it before opening it again`,
+    );
+  }
+  // Before anything else is awaited, so that two opens in this process cannot both pass.
+  pgliteDirsOpen.add(key);
+  try {
+    await claimLockFile(dir, file);
+  } catch (error) {
+    pgliteDirsOpen.delete(key);
+    throw error;
+  }
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    try {
+      if ((await readLock(file))?.pid === process.pid) await rm(file, { force: true });
+    } catch {
+      // A lock that stays is taken over once this process is gone.
+    } finally {
+      pgliteDirsOpen.delete(key);
+    }
+  };
+}
+
+async function claimLockFile(dir: string, file: string): Promise<void> {
+  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
+    try {
+      await writeFile(file, `${process.pid}\n`, { flag: "wx" });
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const holder = await lockHolder(file);
+    if (holder === undefined) continue;
+    if (holder.pid !== undefined && holder.pid !== process.pid && isRunning(holder.pid)) {
+      throw new PgliteInUseError(
+        `the PGlite directory ${dir} is in use by process ${holder.pid}: only one process at a ` +
+          `time opens it. Stop that process, or use another directory; if process ${holder.pid} ` +
+          `is not one of Tender's, delete ${file}`,
+      );
+    }
+    // A leftover. Removed only if it is the one that was read: another process may have taken it
+    // over since, and its lock is not ours to remove.
+    if ((await readLock(file))?.text === holder.text) await rm(file, { force: true });
+  }
+  throw new PgliteInUseError(
+    `the PGlite directory ${dir} is being taken by another process just now: try again`,
+  );
 }
 
 async function openPostgres(url: string): Promise<Db> {
@@ -215,7 +376,8 @@ async function scrubbed<T>(work: () => Promise<T>): Promise<T> {
   }
 }
 
-function pgliteBackend(pglite: PGlite): Backend {
+/** `unlock` lets the lock on the PGlite directory go, once PGlite is closed. */
+function pgliteBackend(pglite: PGlite, unlock?: () => Promise<void>): Backend {
   const sessionOn = (target: PgliteTarget): Session => ({
     run: (sql, params) => scrubbed(async () => (await target.query<Row>(sql, params)).rows),
     script: (sql) =>
@@ -226,7 +388,13 @@ function pgliteBackend(pglite: PGlite): Backend {
   return {
     ...sessionOn(pglite),
     transaction: (fn) => scrubbed(() => pglite.transaction((tx) => fn(sessionOn(tx)))),
-    close: () => pglite.close(),
+    close: async () => {
+      try {
+        await pglite.close();
+      } finally {
+        await unlock?.();
+      }
+    },
   };
 }
 
@@ -264,7 +432,8 @@ function postgresBackend(pool: Pool): Backend {
       let broken = false;
       const session = sessionOn(client);
       try {
-        await session.script("begin");
+        // READ COMMITTED whatever the server's default is: see `Db.tx`.
+        await session.script("begin isolation level read committed");
         const result = await fn(session);
         await session.script("commit");
         return result;

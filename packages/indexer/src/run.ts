@@ -181,7 +181,7 @@ export function startIndexer(
   const stopping = new AbortController();
   const running = supervise({
     ...config,
-    cursorSource: `${config.network}:${config.contractId}`,
+    cursorSource: cursorSourceOf(config),
     start,
     source,
     client,
@@ -203,6 +203,98 @@ interface Config {
   contractId: string;
   teamAccounts: string[];
   pollMs?: number;
+}
+
+/** The key of the indexer's row in `chain_cursor`: `<network>:<contractId>`. */
+function cursorSourceOf(chain: { network: string; contractId: string }): string {
+  return `${chain.network}:${chain.contractId}`;
+}
+
+/** The reads of the chain that `checkDeployment` makes. */
+export type DeploymentChain = Pick<ReconcileChain, "network" | "contractId" | "taskCount">;
+
+export interface CheckDeploymentOptions {
+  /**
+   * How many more times the chain is asked, when the index holds a task above the number it gives
+   * (see `checkDeployment`). Default 3.
+   */
+  retries?: number;
+  /** How long to wait before each new ask, in milliseconds. Default 2000. */
+  retryMs?: number;
+}
+
+const DEPLOYMENT_RETRIES = 3;
+const DEPLOYMENT_RETRY_MS = 2_000;
+/** The most other sources `checkDeployment` names. */
+const SOURCES_NAMED = 3;
+
+/**
+ * Refuses a database that holds the index of another deploy of Tender: one database serves one
+ * contract deploy. The tables of the index are not keyed by contract, so a second contract on the
+ * same database would project its events onto the first one's rows, and the keeper and the Judge
+ * would act on them; and so would a contract account that was deleted and made again, whose task
+ * ids start from 1. It throws an `IndexerError` that says "one database per contract deploy", when
+ *
+ * - `chain_cursor` holds a row for any source but `<network>:<contractId>` of `chain`; or
+ * - the highest task id in `tasks` is above `taskCount()` of the chain.
+ *
+ * It is made at the start of the services, before anything serves from the database or acts on it.
+ * A database with no task asks nothing of the chain. The count is read again up to `retries`
+ * times, `retryMs` apart, before it refuses: the index follows neardata, and the RPC node that
+ * answers `taskCount()` can be some blocks behind it, so that a task posted just before a restart
+ * is no mismatch. A chain that cannot be asked is a refusal too, one that names the kind of the
+ * failure only: a database that holds tasks is not started on without the check.
+ */
+export async function checkDeployment(
+  db: Db,
+  chain: DeploymentChain,
+  options: CheckDeploymentOptions = {},
+): Promise<void> {
+  const own = cursorSourceOf(chain);
+  const others = await db.query<{ source: string }>(
+    "select source from chain_cursor where source <> $1 order by source limit $2",
+    [own, SOURCES_NAMED + 1],
+  );
+  if (others.length > 0) {
+    const named = others.slice(0, SOURCES_NAMED).map(({ source }) => JSON.stringify(source));
+    const more = others.length > SOURCES_NAMED ? " and others" : "";
+    throw new IndexerError(
+      `the database holds the index of another deploy of Tender: its chain cursor is for ` +
+        `${named.join(", ")}${more}, and this deploy is ${JSON.stringify(own)}. A database ` +
+        "serves one contract deploy: use a new database for this one (one database per " +
+        "contract deploy)",
+    );
+  }
+
+  const [row] = await db.query<{ id: string | null }>("select max(id)::text as id from tasks");
+  if (row?.id === null || row?.id === undefined) return;
+  const highest = BigInt(row.id);
+  const retries = options.retries ?? DEPLOYMENT_RETRIES;
+  const retryMs = options.retryMs ?? DEPLOYMENT_RETRY_MS;
+  for (let asked = 0; ; asked++) {
+    let count: bigint;
+    try {
+      count = await chain.taskCount();
+    } catch (error) {
+      throw new IndexerError(
+        `cannot ask the chain how many tasks ${chain.contractId} has (${describe(error)}), ` +
+          "and the database holds tasks that the services do not start on without checking " +
+          "them against it",
+        { cause: error },
+      );
+    }
+    if (highest <= count) return;
+    if (asked >= retries) {
+      throw new IndexerError(
+        `the database holds task ${highest}, but ${chain.contractId} has ${count} on ` +
+          `${chain.network}: it is the index of another deploy of Tender, since a contract ` +
+          "account that was deleted and made again counts its tasks from 1. A database serves " +
+          "one contract deploy: use a new database for this one (one database per contract " +
+          "deploy)",
+      );
+    }
+    await delay(retryMs);
+  }
 }
 
 /**
