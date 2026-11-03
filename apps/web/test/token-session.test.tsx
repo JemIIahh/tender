@@ -4,10 +4,16 @@ import { afterEach, expect, test, vi } from "vitest";
 import { heldToken } from "../lib/apiToken";
 import { clearApiToken, type UseApiToken, useApiToken } from "../lib/auth";
 import { createWalletStore, type Session, type WalletStore } from "../lib/wallet";
-import { WalletSessionEnded, walletErrorMessage } from "../lib/walletErrors";
+import { WalletError, WalletSessionEnded, walletErrorMessage } from "../lib/walletErrors";
 import { FakeChain } from "./fakeChain";
 import { rejection } from "./support";
-import { type ChainWallet, chainWallet, type FakeProvider, fakeProvider } from "./walletDoubles";
+import {
+  type ChainWallet,
+  chainWallet,
+  type FakeProvider,
+  fakeProvider,
+  fakeTabs,
+} from "./walletDoubles";
 
 // The API token and the wallet session (lib/apiToken.ts, lib/wallet.ts, lib/auth.ts), with the
 // real store and the real hook. The token goes where the wallet session ends, whichever page is
@@ -33,6 +39,7 @@ vi.mock("../lib/wallet", async (importOriginal) => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   clearApiToken();
@@ -327,6 +334,27 @@ test("a_sign_in_of_an_earlier_session_does_not_keep_its_token_in_a_later_one_of_
   expect(heldToken()?.token).toBe("tok-alice.testnet-1");
 });
 
+test("a_sign_in_under_way_when_another_tab_ends_the_session_stores_nothing", async () => {
+  fakeApi();
+  const alice = sessionFor(ALICE);
+  const dialog = holdFirstSignature(alice.wallet);
+  const tabs = fakeTabs();
+  holder.store = createWalletStore(async () => providerFor(alice), tabs.open);
+  await holder.store.connect();
+  const page = renderHook(() => useApiToken());
+  const signing = startSignIn(page);
+  await vi.waitFor(() => expect(dialog.opened()).toBe(1));
+
+  // The wallet is disconnected in another tab while this tab's dialog is open.
+  act(() => tabs.hear());
+  dialog.release();
+
+  expect(await rejection(signing)).toBeInstanceOf(WalletSessionEnded);
+  expect(heldToken()).toBeNull();
+  expect(tabHolds()).toBe(false);
+  expect(holder.store.getSnapshot().accountId).toBeNull();
+});
+
 // ---- A wallet found again keeps its token, or does not -----------------------------------------
 
 /** A page loaded again: a store of its own, which looks for the wallet of the visit before. */
@@ -383,4 +411,130 @@ test("no_wallet_found_after_a_reload_drops_the_token_the_tab_kept", async () => 
   });
   expect(heldToken()).toBeNull();
   expect(tabHolds()).toBe(false);
+});
+
+// ---- A wallet that is slow to come back keeps the token until it is known not to ----------------
+
+/**
+ * A page loaded again after a sign-in as Alice, whose wallet is slow to be found: the store has
+ * stopped waiting for it (the page shows its Connect button) and the restore is still on its way.
+ * Timers are the test's from here on.
+ */
+async function reloadedWhileSlow() {
+  fakeApi();
+  await connectedStore(providerFor(sessionFor(ALICE)));
+  const first = renderHook(() => useApiToken());
+  await signIn(first);
+  first.unmount();
+
+  vi.useFakeTimers();
+  const provider = fakeProvider(sessionFor(ALICE));
+  let settle = { found: (_: Session | null) => {}, failed: (_: Error) => {} };
+  provider.restore = () =>
+    new Promise((resolve, reject) => {
+      settle = { found: resolve, failed: reject };
+    });
+  holder.store = createWalletStore(async () => provider);
+  const starting = holder.store.start();
+  await vi.advanceTimersByTimeAsync(9000);
+  await starting;
+  return {
+    provider,
+    found: (found: Session | null) => settle.found(found),
+    failed: (error: Error) => settle.failed(error),
+  };
+}
+
+test("a_wallet_slow_to_be_found_leaves_the_token_the_tab_kept_and_it_is_not_served_without_an_account", async () => {
+  await reloadedWhileSlow();
+
+  expect(holder.store.getSnapshot()).toEqual({
+    ready: true,
+    accountId: null,
+    canSignMessage: false,
+  });
+  expect(heldToken()?.token).toBe("tok-alice.testnet-1");
+  expect(tabHolds()).toBe(true);
+  const page = renderHook(() => useApiToken());
+  expect(page.result.current.token).toBeNull();
+});
+
+test("a_wallet_slow_to_be_found_that_turns_up_as_the_same_account_has_its_token", async () => {
+  const slow = await reloadedWhileSlow();
+  const page = renderHook(() => useApiToken());
+
+  slow.found(sessionFor(ALICE));
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  expect(holder.store.getSnapshot().accountId).toBe(ALICE);
+  expect(page.result.current.token).toBe("tok-alice.testnet-1");
+  expect(tabHolds()).toBe(true);
+});
+
+const SLOW_ENDINGS: Array<[string, (slow: Awaited<ReturnType<typeof reloadedWhileSlow>>) => void]> =
+  [
+    ["turns_up_as_another_account", (slow) => slow.found(sessionFor(BOB))],
+    ["turns_out_not_to_be_there", (slow) => slow.found(null)],
+    ["fails_to_load", (slow) => slow.failed(new Error("the wallet list did not load"))],
+  ];
+
+for (const [ending, settle] of SLOW_ENDINGS) {
+  test(`a_wallet_slow_to_be_found_that_${ending}_drops_the_token`, async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const slow = await reloadedWhileSlow();
+    expect(heldToken()).not.toBeNull();
+
+    settle(slow);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(heldToken()).toBeNull();
+    expect(tabHolds()).toBe(false);
+  });
+}
+
+test("a_connect_while_the_wallet_is_still_being_looked_for_drops_the_token_though_it_is_the_same_account", async () => {
+  const slow = await reloadedWhileSlow();
+  expect(heldToken()).not.toBeNull();
+
+  await holder.store.connect();
+
+  expect(holder.store.getSnapshot().accountId).toBe(ALICE);
+  expect(heldToken()).toBeNull();
+  expect(tabHolds()).toBe(false);
+  // The wallet found late is the one connected already, and brings nothing back.
+  slow.found(sessionFor(ALICE));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(heldToken()).toBeNull();
+});
+
+// ---- A disconnect always drops Tender's token --------------------------------------------------
+
+test("a_wallet_that_cannot_sign_out_still_loses_the_token_of_the_tab_and_it_is_gone_before_the_wallet_is_asked", async () => {
+  const api = fakeApi();
+  const provider = providerFor(sessionFor(ALICE));
+  const trouble = new WalletError("disconnect", new Error("popup blocked"));
+  let heldWhenAsked: ReturnType<typeof heldToken> | undefined;
+  provider.disconnect = async () => {
+    heldWhenAsked = heldToken();
+    throw trouble;
+  };
+  const store = await connectedStore(provider);
+  const page = renderHook(() => useApiToken());
+  await signIn(page);
+  page.unmount();
+  expect(tabHolds()).toBe(true);
+
+  const failure = await rejection(store.disconnect());
+
+  expect(failure).toBe(trouble);
+  expect(heldWhenAsked).toBeNull();
+  expect(heldToken()).toBeNull();
+  expect(tabHolds()).toBe(false);
+  // The wallet is connected all the same, and the person signs in again.
+  expect(store.getSnapshot().accountId).toBe(ALICE);
+  const again = renderHook(() => useApiToken());
+  expect(await signIn(again)).toBe("tok-alice.testnet-2");
+  expect(api.challenges).toBe(2);
 });
