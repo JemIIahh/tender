@@ -1,16 +1,32 @@
 "use client";
 
 import type { ListTasksFilter, Phase, TaskSummary } from "@tender/shared";
-import { type FormEvent, useCallback, useEffect, useId, useRef, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import {
+  type FormEvent,
+  Suspense,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { ErrorState } from "../../components/ErrorState";
 import { PHASE_LABELS } from "../../components/PhaseChip";
 import { TaskCard } from "../../components/TaskCard";
 import { api } from "../../lib/api";
+import { useNowNs } from "../../lib/clock";
 import { errorMessage } from "../../lib/errors";
 
 // The board: the tasks the API lists, newest first, which a person narrows by the phase a task is
 // in and by a tag, and reads on from page to page. A task in its fallback window, or past it, is
 // listed under All only: the four chips are the phases of a task's life that people look for.
+//
+// The filters are in the address (`?phase=open&tag=json`), as the agent directory's tag is, so that
+// Back from a task comes to the board as it was left, and a filtered board is a link. A filter
+// change replaces the address and does not add to the history. The address can hold any text: what
+// is not a phase with a chip, or a tag, is ignored.
 
 /** The phases with a chip of their own. */
 const CHIP_PHASES: readonly Phase[] = ["open", "revealing", "judging", "settled"];
@@ -19,6 +35,22 @@ const CHIP_PHASES: readonly Phase[] = ["open", "revealing", "judging", "settled"
 const TAG = /^[a-z0-9-]{1,24}$/;
 
 type Filters = Pick<ListTasksFilter, "phase" | "tag">;
+
+/** The filters the address asks for: a phase that has a chip and a tag as the brief writes it. */
+function filtersOf(params: URLSearchParams): Filters {
+  const phase = CHIP_PHASES.find((candidate) => candidate === params.get("phase"));
+  const tag = (params.get("tag") ?? "").trim().toLowerCase();
+  return { phase, tag: TAG.test(tag) ? tag : undefined };
+}
+
+/** The query of an address for `filters`: nothing for no filters. */
+function queryOf(filters: Filters): string {
+  const query = new URLSearchParams();
+  if (filters.phase !== undefined) query.set("phase", filters.phase);
+  if (filters.tag !== undefined) query.set("tag", filters.tag);
+  const text = query.toString();
+  return text === "" ? "" : `?${text}`;
+}
 
 /** The state of "Load more": under way, or failed, and still under way after a retry. */
 type More =
@@ -60,11 +92,13 @@ function NoMoreTasks() {
 
 function BoardBody({
   board,
+  nowNs,
   filtered,
   onRetry,
   onMore,
 }: {
   board: Board;
+  nowNs: bigint;
   filtered: boolean;
   onRetry: () => void;
   onMore: (from: Ready) => void;
@@ -82,7 +116,7 @@ function BoardBody({
         <>
           <ul className="grid gap-3">
             {board.tasks.map((task) => (
-              <TaskCard key={task.id} task={task} />
+              <TaskCard key={task.id} task={task} nowNs={nowNs} />
             ))}
           </ul>
           {board.next === null ? (
@@ -111,12 +145,18 @@ function BoardBody({
   }
 }
 
-export default function Board() {
+function BoardView() {
   const tagId = useId();
+  const router = useRouter();
+  const pathname = usePathname();
+  const params = useSearchParams();
+  const nowNs = useNowNs();
   const [board, setBoard] = useState<Board>({ status: "loading" });
-  const [filters, setFilters] = useState<Filters>({});
+  const { phase, tag } = filtersOf(params);
+  // The same object until a filter changes: it is what a load depends on.
+  const filters = useMemo<Filters>(() => ({ phase, tag }), [phase, tag]);
   // What is typed in the tag field, which is not the filter until the person applies it.
-  const [tagText, setTagText] = useState("");
+  const [tagText, setTagText] = useState(tag ?? "");
   const [tagError, setTagError] = useState<string | null>(null);
   // The request that counts. An answer to an earlier one is dropped: strict mode starts two
   // requests, a retry can overlap a slow one, and a filter changed under a request makes its
@@ -156,6 +196,17 @@ export default function Board() {
     load(filters);
   }, [filters, load]);
 
+  // The field follows the address when it changes under it: Back and Forward, or a filter applied.
+  useEffect(() => {
+    setTagText(tag ?? "");
+    setTagError(null);
+  }, [tag]);
+
+  /** Shows the board for `next`, in the address. A change of filter is not a page of its own. */
+  const show = (next: Filters) => {
+    router.replace(`${pathname}${queryOf(next)}`, { scroll: false });
+  };
+
   /** The next page, after the tasks the board has. */
   const loadMore = (from: Ready) => {
     if (from.next === null || from.more.state === "loading") return;
@@ -187,22 +238,22 @@ export default function Board() {
     );
   };
 
-  const filterByTag = (tag: string | undefined) => {
-    setTagText(tag ?? "");
+  const filterByTag = (next: string | undefined) => {
+    setTagText(next ?? "");
     setTagError(null);
-    setFilters((now) => (now.tag === tag ? now : { ...now, tag }));
+    if (next !== filters.tag) show({ ...filters, tag: next });
   };
 
   const applyTag = (event: FormEvent) => {
     event.preventDefault();
     // A tag is lower case; people type it as they like, with a space on either side.
-    const tag = tagText.trim().toLowerCase();
-    if (tag === "") return filterByTag(undefined);
-    if (!TAG.test(tag)) {
+    const typed = tagText.trim().toLowerCase();
+    if (typed === "") return filterByTag(undefined);
+    if (!TAG.test(typed)) {
       setTagError("A tag is 1 to 24 characters: a to z, 0 to 9 and -.");
       return;
     }
-    filterByTag(tag);
+    filterByTag(typed);
   };
 
   const filtered = filters.phase !== undefined || filters.tag !== undefined;
@@ -213,15 +264,15 @@ export default function Board() {
 
       <fieldset className="flex min-w-0 flex-wrap gap-2">
         <legend className="sr-only">Phase</legend>
-        {[undefined, ...CHIP_PHASES].map((phase) => (
+        {[undefined, ...CHIP_PHASES].map((chip) => (
           <button
-            key={phase ?? "all"}
+            key={chip ?? "all"}
             type="button"
-            aria-pressed={filters.phase === phase}
-            onClick={() => setFilters((now) => ({ ...now, phase }))}
+            aria-pressed={filters.phase === chip}
+            onClick={() => show({ ...filters, phase: chip })}
             className="min-h-11 rounded border border-neutral-900 px-3 aria-pressed:bg-neutral-900 aria-pressed:text-white"
           >
-            {phase === undefined ? "All" : PHASE_LABELS[phase]}
+            {chip === undefined ? "All" : PHASE_LABELS[chip]}
           </button>
         ))}
       </fieldset>
@@ -267,10 +318,21 @@ export default function Board() {
 
       <BoardBody
         board={board}
+        nowNs={nowNs}
         filtered={filtered}
         onRetry={() => load(filters)}
         onMore={loadMore}
       />
     </div>
+  );
+}
+
+// The page itself only holds the place: the filters are read from the address, which a page that is
+// built ahead of time can only do under a Suspense boundary.
+export default function Board() {
+  return (
+    <Suspense fallback={<p role="status">Loading tasks…</p>}>
+      <BoardView />
+    </Suspense>
   );
 }

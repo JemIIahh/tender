@@ -1,3 +1,4 @@
+import { PosterJudges } from "./PosterJudges";
 import { TeamBadge } from "./TeamBadge";
 
 /**
@@ -65,14 +66,7 @@ export function VerifierRecord({
         </p>
       ) : null}
       <TeamBadge account={account} isTeam={isTeam} />
-      {isPoster ? (
-        <p
-          data-testid="poster-judges"
-          className="w-fit rounded border border-neutral-900 px-1.5 py-0.5 text-sm font-medium"
-        >
-          Poster judges their own task
-        </p>
-      ) : null}
+      {isPoster ? <PosterJudges /> : null}
       {unavailable ? (
         <p data-testid="verifier-unavailable" className="text-sm">
           Verifier record unavailable

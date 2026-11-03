@@ -1,12 +1,43 @@
 import { ApiError } from "@tender/shared";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { StrictMode } from "react";
-import { afterEach, expect, test, vi } from "vitest";
+import { StrictMode, useSyncExternalStore } from "react";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import Board from "../app/(app)/page";
 
 // The board over a fake API: what it shows for each state of the request, and how its filters
-// and its paging ask the API.
+// and its paging ask the API. The filters are in the address, which the tests hold in a tiny model
+// of the router: a replace changes the query and tells the page, as Next does.
+
+const nav = vi.hoisted(() => {
+  const listeners = new Set<() => void>();
+  const model = {
+    pathname: "/tasks",
+    query: new URLSearchParams(),
+    /** Every address the page replaced the history entry with, in order. */
+    replaced: [] as string[],
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    snapshot: () => model.query,
+    /** The address changes by itself, as it does on Back and Forward. */
+    go(search: string) {
+      model.query = new URLSearchParams(search);
+      for (const listener of listeners) listener();
+    },
+    replace(url: string) {
+      model.replaced.push(url);
+      model.go(url.includes("?") ? url.slice(url.indexOf("?")) : "");
+    },
+  };
+  return model;
+});
+vi.mock("next/navigation", () => ({
+  usePathname: () => nav.pathname,
+  useRouter: () => ({ replace: nav.replace }),
+  useSearchParams: () => useSyncExternalStore(nav.subscribe, nav.snapshot, nav.snapshot),
+}));
 
 const TASK = {
   id: "7",
@@ -32,6 +63,23 @@ const TASK = {
   parent: null,
   outcome_kind: null,
 };
+
+const SECOND = 1_000_000_000n;
+const CREATED = BigInt(TASK.created_at);
+
+/**
+ * Sets the time to `ns`, rounded up to a millisecond. With `ticks` the page's one-second timer is
+ * fake too, and `settle` moves it.
+ */
+function pinClock(ns: bigint, { ticks = false } = {}) {
+  vi.useRealTimers();
+  vi.useFakeTimers({ toFake: ticks ? ["Date", "setInterval", "clearInterval"] : ["Date"] });
+  const ms = ns / 1_000_000n + (ns % 1_000_000n === 0n ? 0n : 1n);
+  vi.setSystemTime(new Date(Number(ms)));
+}
+
+/** Lets the fake timers run for `ms`. */
+const settle = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms));
 
 const page = (...tasks: unknown[]) => ({ tasks, next_cursor: null });
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
@@ -59,7 +107,15 @@ const query = (api: { urls: string[] }, n: number) => new URL(api.urls[n] ?? "")
 /** `console.error` that prints nothing, for a test that reads what the board logs. */
 const quietLog = () => vi.spyOn(console, "error").mockImplementation(() => {});
 
+beforeEach(() => {
+  nav.query = new URLSearchParams();
+  nav.replaced.length = 0;
+  // The tasks of the tests are in their commit window, as the API listed them.
+  pinClock(CREATED + 30n * SECOND);
+});
+
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -430,6 +486,155 @@ test("board_drops_the_answer_to_a_filter_that_is_no_longer_the_one_asked_for", a
 
   expect(screen.queryByText("Answer for All")).toBeNull();
   expect(screen.getByText("Answer for Open")).toBeTruthy();
+});
+
+// ---- The filters are in the address ------------------------------------------------------------
+
+test("board_puts_each_filter_in_the_address_and_replaces_the_entry_it_is_on", async () => {
+  const api = fakeApi(json(page(TASK)));
+  render(<Board />);
+  await screen.findByTestId("task-card");
+
+  await userEvent.click(screen.getByRole("button", { name: "Open" }));
+  await waitFor(() => expect(api.urls).toHaveLength(2));
+  await userEvent.type(screen.getByLabelText("Tag"), "  JSON {Enter}");
+  await waitFor(() => expect(api.urls).toHaveLength(3));
+  await userEvent.click(screen.getByRole("button", { name: "All" }));
+  await waitFor(() => expect(api.urls).toHaveLength(4));
+  await userEvent.click(screen.getByRole("button", { name: "Clear" }));
+  await waitFor(() => expect(api.urls).toHaveLength(5));
+
+  // A filter changes the address of the board and adds nothing to the history, and the board is
+  // addressed where it is (`/tasks` here), whatever that is.
+  expect(nav.replaced).toEqual([
+    "/tasks?phase=open",
+    "/tasks?phase=open&tag=json",
+    "/tasks?tag=json",
+    "/tasks",
+  ]);
+});
+
+test("board_opens_on_the_filters_the_address_holds", async () => {
+  nav.go("?phase=judging&tag=json");
+  const api = fakeApi(json(page(TASK)));
+
+  render(<Board />);
+
+  await screen.findByTestId("task-card");
+  expect(query(api, 0).get("phase")).toBe("judging");
+  expect(query(api, 0).get("tag")).toBe("json");
+  expect(api.urls).toHaveLength(1);
+  expect(screen.getByRole("button", { name: "Judging" }).getAttribute("aria-pressed")).toBe("true");
+  expect((screen.getByLabelText("Tag") as HTMLInputElement).value).toBe("json");
+  expect(screen.getByRole("button", { name: "Clear" })).toBeTruthy();
+});
+
+test("board_follows_the_address_when_it_changes_under_it_as_on_back", async () => {
+  nav.go("?phase=open&tag=json");
+  const api = fakeApi(json(page(TASK)));
+  render(<Board />);
+  await screen.findByTestId("task-card");
+
+  // Back to an address with other filters, and then to one with none.
+  act(() => nav.go("?phase=settled"));
+  await waitFor(() => expect(api.urls).toHaveLength(2));
+  expect(query(api, 1).get("phase")).toBe("settled");
+  expect(query(api, 1).has("tag")).toBe(false);
+  expect((screen.getByLabelText("Tag") as HTMLInputElement).value).toBe("");
+  expect(screen.queryByRole("button", { name: "Clear" })).toBeNull();
+
+  act(() => nav.go(""));
+  await waitFor(() => expect(api.urls).toHaveLength(3));
+  expect(query(api, 2).has("phase")).toBe(false);
+  expect(screen.getByRole("button", { name: "All" }).getAttribute("aria-pressed")).toBe("true");
+});
+
+test.each([
+  ["a_phase_with_no_chip", "?phase=fallback"],
+  ["a_phase_that_is_no_phase", "?phase=bogus"],
+  ["a_tag_the_api_would_refuse", "?tag=not%20a%20tag!"],
+  ["a_tag_that_is_too_long", `?tag=${"a".repeat(25)}`],
+])("board_ignores_%s_in_the_address", async (_name, search) => {
+  nav.go(search);
+  const api = fakeApi(json(page(TASK)));
+
+  render(<Board />);
+
+  await screen.findByTestId("task-card");
+  expect(query(api, 0).has("phase")).toBe(false);
+  expect(query(api, 0).has("tag")).toBe(false);
+  expect(screen.getByRole("button", { name: "All" }).getAttribute("aria-pressed")).toBe("true");
+});
+
+test("board_reads_a_tag_of_the_address_as_a_person_would_type_it", async () => {
+  nav.go("?tag=%20JSON%20");
+  const api = fakeApi(json(page(TASK)));
+
+  render(<Board />);
+
+  await screen.findByTestId("task-card");
+  expect(query(api, 0).get("tag")).toBe("json");
+});
+
+// ---- A card and its page say the same phase -----------------------------------------------------
+
+test("board_cards_show_the_phase_by_the_clock_and_not_the_one_the_api_gave_when_it_answered", async () => {
+  // The API said Open when it answered; the time is now past the commit deadline.
+  pinClock(BigInt(TASK.commit_deadline) + 5n * SECOND);
+  fakeApi(json(page(TASK)));
+
+  render(<Board />);
+
+  const card = within(await screen.findByTestId("task-card"));
+  expect(card.getByTestId("phase-chip").textContent).toBe("Revealing");
+});
+
+test("board_cards_move_on_to_the_next_phase_at_its_deadline_without_a_reload", async () => {
+  pinClock(BigInt(TASK.commit_deadline) - 2n * SECOND, { ticks: true });
+  const api = fakeApi(json(page(TASK)));
+  render(<Board />);
+  const card = within(await screen.findByTestId("task-card"));
+  expect(card.getByTestId("phase-chip").textContent).toBe("Open");
+
+  await settle(3000);
+
+  expect(card.getByTestId("phase-chip").textContent).toBe("Revealing");
+  expect(api.calls()).toBe(1);
+});
+
+test("board_cards_show_settled_for_a_task_with_an_outcome_whatever_the_clock_says", async () => {
+  fakeApi(json(page({ ...TASK, phase: "settled", outcome_kind: "picked" })));
+
+  render(<Board />);
+
+  const card = within(await screen.findByTestId("task-card"));
+  expect(card.getByTestId("phase-chip").textContent).toBe("Settled");
+});
+
+// ---- Cards: who picks ---------------------------------------------------------------------------
+
+test("board_flags_a_task_whose_poster_is_also_its_verifier", async () => {
+  fakeApi(json(page({ ...TASK, id: "1", verifier: TASK.poster }, { ...TASK, id: "2" })));
+
+  render(<Board />);
+
+  const [poster, other] = await screen.findAllByTestId("task-card");
+  expect(within(poster as HTMLElement).getByTestId("poster-judges").textContent).toBe(
+    "Poster judges their own task",
+  );
+  expect(within(other as HTMLElement).queryByTestId("poster-judges")).toBeNull();
+});
+
+test("board_shows_a_task_with_a_repeated_tag_once_for_each_time_without_a_key_clash", async () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  fakeApi(json(page({ ...TASK, tags: ["json", "json", "extraction"] })));
+
+  render(<Board />);
+
+  const card = within(await screen.findByTestId("task-card"));
+  expect(card.getAllByText("json")).toHaveLength(2);
+  // React says it with console.error when two children have the same key.
+  expect(log.mock.calls.flat().join("\n")).not.toContain("same key");
 });
 
 // ---- More pages -------------------------------------------------------------------------------
