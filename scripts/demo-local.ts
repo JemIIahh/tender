@@ -181,7 +181,7 @@ type StopSignal = keyof typeof STOP_SIGNALS;
 // ---- What the demo says ------------------------------------------------------------------------
 
 /** One line of the demo's output. What its parts print besides goes to the log. */
-const say = (line: string) => process.stdout.write(`${line}\n`);
+export const say = (line: string) => process.stdout.write(`${line}\n`);
 
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
@@ -189,7 +189,7 @@ const messageOf = (error: unknown) => (error instanceof Error ? error.message : 
  * A step of the scenario that did not come to pass: a line that did not show in time, or a fact the
  * API shows that the scenario cannot have. Its message is for the person who ran the demo.
  */
-class DemoError extends Error {
+export class DemoError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DemoError";
@@ -210,7 +210,7 @@ class Interrupted extends Error {
 // ---- The harness -------------------------------------------------------------------------------
 
 /** What every step of the demo shares: the way out, the log, and the things to stop at the end. */
-interface Harness {
+export interface Harness {
   /** Aborts when the demo is interrupted or something it runs fails; its reason is the error. */
   readonly signal: AbortSignal;
   /** Ends the demo from outside its main flow: a loop that crashed, an error nobody caught. */
@@ -231,7 +231,12 @@ interface Harness {
  * `work`, or a `DemoError` after `ms`, or the reason of `signal` once it aborts. The work is not
  * cancelled when the race is lost: what it gives later goes nowhere.
  */
-function limited<T>(what: string, ms: number, work: Promise<T>, signal?: AbortSignal): Promise<T> {
+export function limited<T>(
+  what: string,
+  ms: number,
+  work: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new DemoError(`${what} took over ${Math.round(ms / 1000)} s`)),
@@ -248,19 +253,19 @@ function limited<T>(what: string, ms: number, work: Promise<T>, signal?: AbortSi
 }
 
 /** What a probe of `until` says: the value, once the API shows it, or what the API shows instead. */
-type Poll<T> = { value: T } | { seen: string };
+export type Poll<T> = { value: T } | { seen: string };
 
 /** The answer of a probe that has what it waits for. */
-const ready = <T>(value: T): Poll<T> => ({ value });
+export const ready = <T>(value: T): Poll<T> => ({ value });
 /** The answer of a probe that has not, and says what it sees instead. */
-const waiting = (seen: string): Poll<never> => ({ seen });
+export const waiting = (seen: string): Poll<never> => ({ seen });
 
 /**
  * Asks `probe` every `POLL_MS` until it has a value, for at most `budgetMs`. A probe that cannot
  * reach the API is asked again; one that throws a `DemoError` ends the wait with it. When the time
  * is out, the error names the milestone that was missed and the last thing the API showed.
  */
-async function until<T>(
+export async function until<T>(
   h: Harness,
   milestone: string,
   budgetMs: number,
@@ -293,17 +298,17 @@ async function until<T>(
 const msOf = (ns: string) => Number(BigInt(ns) / 1_000_000n);
 
 /** How long from now a line may take to show, when it is due by `deadlineNs`. */
-const budgetFor = (deadlineNs: string) =>
+export const budgetFor = (deadlineNs: string) =>
   Math.max(SLACK_MS, msOf(deadlineNs) - Date.now() + SLACK_MS);
 
 /** `amount` of `token` as a line writes it: `0.95 tUSDC`. */
-function amountOf(amount: string | bigint, token: string): string {
+export function amountOf(amount: string | bigint, token: string): string {
   const { symbol, decimals } = tokenMeta(token, "sandbox");
   return `${formatTokenAmount(amount, decimals)} ${symbol}`;
 }
 
 /** The role of the chain's account that `account` is (`alice`), or the account itself. */
-function nameOf(chain: LocalChain, account: string): string {
+export function nameOf(chain: LocalChain, account: string): string {
   const roles = Object.keys(chain.accounts) as LocalRole[];
   return roles.find((role) => chain.accounts[role].accountId === account) ?? account;
 }
@@ -311,7 +316,7 @@ function nameOf(chain: LocalChain, account: string): string {
 // ---- The parts ---------------------------------------------------------------------------------
 
 /** The version of nearcore the node says it runs. */
-async function nodeVersion(rpcUrl: string): Promise<string> {
+export async function nodeVersion(rpcUrl: string): Promise<string> {
   const status = await new JsonRpcProvider({ url: rpcUrl }).viewNodeStatus();
   return status.version.version;
 }
@@ -332,7 +337,7 @@ const OWN_NODE =
  * or a place to fetch one from (`SANDBOX_ARTIFACT_URL`) is taken as it is: near-sandbox asks what
  * the machine is only to build its own download URL.
  */
-function checkHost(): void {
+export function checkHost(): void {
   if (process.env.NEAR_SANDBOX_BIN_PATH || process.env.SANDBOX_ARTIFACT_URL) return;
   const host = `${process.platform}/${process.arch}`;
   if (NODE_HOSTS.includes(host)) return;
@@ -386,7 +391,7 @@ async function startNode(tmp: string): Promise<LocalChain> {
  * the process kills it unless it is known to have been stopped: a second signal skips the orderly
  * stops, and near-sandbox leaves the node running when its start fails.
  */
-async function startChain(h: Harness, tmp: string): Promise<LocalChain> {
+export async function startChain(h: Harness, tmp: string): Promise<LocalChain> {
   let stopped = false;
   h.onProcessExit(() => {
     // Every process below this one, by id: the node, and what else the demo started. They are listed
@@ -447,10 +452,11 @@ async function mintServiceKeys(
  * the index follows the chain: the indexer starts at the chain's height of that moment, so the task
  * is posted only after that.
  */
-async function startUp(
+export async function startUp(
   h: Harness,
   chain: LocalChain,
   dir: string,
+  team: readonly LocalRole[] = ["poster", "alice", "bob"],
 ): Promise<{ services: Services; reader: TenderApi }> {
   const keysDir = join(dir, "keys");
   // Empty on purpose: a record of a deploy would tell the indexer where to start, and on the
@@ -464,7 +470,7 @@ async function startUp(
     h.signal,
   );
 
-  const { keeper, judge, poster, alice, bob } = chain.accounts;
+  const { keeper, judge } = chain.accounts;
   const env: Record<string, string> = {
     TENDER_NETWORK: chain.network,
     TENDER_CONTRACT: chain.contractId,
@@ -479,7 +485,7 @@ async function startUp(
     JUDGE_PRIVATE_KEY: keys.judge,
     JUDGE_INTERVAL_MS: `${JUDGE_INTERVAL_MS}`,
     // The accounts the team runs: the API flags them, and the poster's task, as the team's.
-    TEAM_ACCOUNTS: [poster, alice, bob].map((signer) => signer.accountId).join(","),
+    TEAM_ACCOUNTS: team.map((role) => chain.accounts[role].accountId).join(","),
   };
   const starting = startServices(env, {
     log: (line) => h.log(redact(line, env)),
@@ -548,7 +554,10 @@ async function postSeed(h: Harness, chain: LocalChain, services: Services): Prom
 }
 
 /** The task as the API shows it; undefined while the API does not list it. */
-async function readTask(api: TenderApi, id: bigint): Promise<TaskDetailResponse | undefined> {
+export async function readTask(
+  api: TenderApi,
+  id: bigint,
+): Promise<TaskDetailResponse | undefined> {
   const found = await api.getTask(id);
   if (found === null) return undefined;
   // Nothing that follows can come once the Judge has turned the task down, or the task is void.
@@ -604,7 +613,7 @@ function launchAgent(
 }
 
 /** Fetches `url` and gives the bytes it serves. */
-async function fetchBytes(url: string): Promise<Uint8Array> {
+export async function fetchBytes(url: string): Promise<Uint8Array> {
   const res = await fetch(url, { signal: AbortSignal.timeout(API_TIMEOUT_MS) });
   if (!res.ok) throw new DemoError(`${url} answered ${res.status}`);
   return new Uint8Array(await res.arrayBuffer());
@@ -812,8 +821,26 @@ async function runExitSteps(
 const flush = (stream: NodeJS.WriteStream) =>
   new Promise<void>((resolve) => stream.write("", () => resolve()));
 
-/** Runs the demo and gives the exit code: 0 after `DEMO OK`, else not. */
-async function main(): Promise<number> {
+/**
+ * What `main` runs: the steps of a scenario, and the words the command line ends in. `pnpm
+ * demo:local` is `DEMO_SCRIPT`; the swarm demo (`scripts/swarm-demo.ts`) runs its own scenario
+ * through the same `main`, so both start, stop and fail the same way.
+ */
+export interface DemoScript {
+  /** The steps. A `DemoError` is a step that did not come to pass; its message is shown as it is. */
+  run(h: Harness): Promise<void>;
+  /** The last line, printed only after everything the demo started has stopped. */
+  ok: string;
+  /** The prefix of each line of a failure: `DEMO FAILED`. */
+  failed: string;
+  /** The prefix of the lines on stderr about a signal: `demo`. */
+  name: string;
+}
+
+const DEMO_SCRIPT: DemoScript = { run: demo, ok: "DEMO OK", failed: "DEMO FAILED", name: "demo" };
+
+/** Runs a scenario and gives the exit code: 0 after its `ok` line, else not. */
+export async function main(script: DemoScript = DEMO_SCRIPT): Promise<number> {
   const abort = new AbortController();
   const exits: Array<{ what: string; step: () => Promise<unknown> }> = [];
   const processExits: Array<() => void> = [];
@@ -858,11 +885,11 @@ async function main(): Promise<number> {
       // At once: the stops take some seconds, and a terminal that says nothing for that long looks
       // stuck. A SIGINT is a Ctrl-C to the person at the terminal.
       process.stderr.write(
-        `demo: ${name}; stopping (${name === "SIGINT" ? "Ctrl-C" : name} again to force)\n`,
+        `${script.name}: ${name}; stopping (${name === "SIGINT" ? "Ctrl-C" : name} again to force)\n`,
       );
     } else if (now - firstSignalAt > REPEAT_SIGNAL_MS) {
       // No orderly stop is waited for. The exit steps above kill the node and remove the temp dir.
-      process.stderr.write(`demo: ${name} again; exiting now\n`);
+      process.stderr.write(`${script.name}: ${name} again; exiting now\n`);
       process.exit(1);
     }
   };
@@ -875,7 +902,7 @@ async function main(): Promise<number> {
 
   let failure: unknown;
   try {
-    await demo(harness);
+    await script.run(harness);
   } catch (error) {
     failure = error;
   }
@@ -885,13 +912,13 @@ async function main(): Promise<number> {
   if (failure === undefined && abort.signal.aborted) failure = abort.signal.reason;
 
   if (failure instanceof Interrupted) {
-    process.stderr.write(`demo: ${failure.message}; stopped what it started\n`);
-    for (const problem of problems) process.stderr.write(`demo: ${problem}\n`);
+    process.stderr.write(`${script.name}: ${failure.message}; stopped what it started\n`);
+    for (const problem of problems) process.stderr.write(`${script.name}: ${problem}\n`);
     return STOP_SIGNALS[failure.signalName];
   }
   if (failure !== undefined || problems.length > 0) {
     const reasons = failure === undefined ? problems : [reasonOf(failure), ...problems];
-    const out = reasons.map((reason) => `DEMO FAILED: ${reason}`);
+    const out = reasons.map((reason) => `${script.failed}: ${reason}`);
     if (tail.length > 0) {
       out.push("", "The last lines of the services and the agents:");
       out.push(...tail.map((line) => `  ${line}`));
@@ -899,7 +926,7 @@ async function main(): Promise<number> {
     process.stderr.write(`${out.join("\n")}\n`);
     return 1;
   }
-  say("DEMO OK");
+  say(script.ok);
   return 0;
 }
 
