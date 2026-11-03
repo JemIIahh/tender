@@ -2776,6 +2776,7 @@ test("a_result_stored_before_the_records_is_served_after_the_upgrade", async () 
       "0002_result_uploads.sql",
       "0003_heldout_uploads.sql",
       "0004_task_questions.sql",
+      "0005_tg_board_digests.sql",
     ]);
     expect(
       await old.query(

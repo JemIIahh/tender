@@ -54,6 +54,7 @@ const MIGRATIONS = [
   "0002_result_uploads.sql",
   "0003_heldout_uploads.sql",
   "0004_task_questions.sql",
+  "0005_tg_board_digests.sql",
 ];
 
 // Stands for a secret (a held-out answer, blob bytes) in the error tests: as text, and as hex, which
@@ -264,6 +265,15 @@ const SCHEMA: Record<string, string[]> = {
     "answered_at timestamp with time zone?",
     "hidden boolean = false",
   ],
+  // Migration 0005.
+  tg_board_digests: [
+    "chat_id bigint",
+    "task_id numeric(40,0)",
+    "audience text",
+    "upto_event_id bigint",
+    "sent_at timestamp with time zone",
+    "digests integer",
+  ],
 };
 
 // Primary keys, uniqueness and every index, as "table: kind (columns)". An index on an expression
@@ -294,6 +304,7 @@ const KEYS = [
   "tasks: index (parent)",
   "tasks: index (poster)",
   "tasks: index (verifier)",
+  "tg_board_digests: primary key (chat_id, task_id, audience)",
   "tg_link_nonces: primary key (nonce)",
   "tg_links: primary key (chat_id)",
   "tg_sent: primary key (chat_id, dedupe_key)",
@@ -1200,7 +1211,11 @@ describe.each(targets)("db on $name", (target) => {
       await put("result", '{"exact":{"expected":["44"]}}', "alice.near");
 
       // 0003 is the one under test; whatever comes after it applies on top, as it would on a real upgrade.
-      expect(await migrate(old)).toEqual(["0003_heldout_uploads.sql", "0004_task_questions.sql"]);
+      expect(await migrate(old)).toEqual([
+        "0003_heldout_uploads.sql",
+        "0004_task_questions.sql",
+        "0005_tg_board_digests.sql",
+      ]);
       expect(await old.query("select sha256, account, uploaded_at from heldout_uploads")).toEqual([
         { sha256: heldout, account: "poster.near", uploaded_at: new Date("2026-10-01T09:00:00Z") },
       ]);
