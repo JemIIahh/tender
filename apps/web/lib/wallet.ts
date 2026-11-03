@@ -484,6 +484,21 @@ function sessionOf(connected: {
 }
 
 /**
+ * What the app asks of near-connect. Every send in the app is one `signAndSendTransactions` (a
+ * batch: a storage top-up, a deposit and a post are one approval), so the picker lists only wallets
+ * whose manifest says they do that (`availableWallets` in the library hides the rest), and a person
+ * cannot pick one that would fail every deposit, withdrawal and post. `signMessage` is not asked
+ * for: a wallet that can't sign a message may still send transactions, and the pages say what it
+ * can't do (`WALLET_CANNOT_SIGN_MESSAGE`).
+ */
+export function connectorOptions(network: "mainnet" | "testnet"): {
+  network: "mainnet" | "testnet";
+  features: { signAndSendTransactions: true };
+} {
+  return { network, features: { signAndSendTransactions: true } };
+}
+
+/**
  * near-connect as a provider. The library touches `window` as it loads, so it is imported when the
  * first page needs a wallet and not before.
  */
@@ -494,8 +509,7 @@ export async function connectorProvider(network: "mainnet" | "testnet"): Promise
   } catch (cause) {
     throw new WalletError("connect", cause);
   }
-  // No filter on features: a wallet that can't sign a message may still send transactions.
-  const connector = new library.NearConnector({ network });
+  const connector = new library.NearConnector(connectorOptions(network));
 
   return {
     async restore() {

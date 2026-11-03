@@ -3,6 +3,7 @@ import { render, screen, within } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { BriefSection } from "../components/BriefSection";
 import { CriteriaSection } from "../components/CriteriaSection";
+import { JudgeNote } from "../components/JudgeNote";
 import { Payouts } from "../components/Payouts";
 import { PHASE_LABELS, PhaseChip } from "../components/PhaseChip";
 import { Scorecard } from "../components/Scorecard";
@@ -238,6 +239,70 @@ test("payouts_show_no_refund_list_when_the_index_has_none", () => {
 
 // ---- The scorecard ----------------------------------------------------------------------------
 
+// ---- Who scored it --------------------------------------------------------------------------
+
+test.each([
+  ["tender-judge/1", "Scored by the Tender Judge."],
+  ["Tender_Judge-x", "Scored by the Tender Judge."],
+  ["my-judge/2", "Scored by my-judge/2."],
+  ["tender-agent", "Scored by tender-agent."],
+])("scorecard_says_who_scored_it_%s", (software, line) => {
+  render(<Scorecard scorecard={scorecard({ judge: { software, model: null } })} />);
+
+  expect(screen.getByTestId("scored-by").textContent).toBe(line);
+});
+
+test("scorecard_of_a_rubric_is_labelled_subjective_and_names_the_model", () => {
+  render(
+    <Scorecard
+      scorecard={scorecard({
+        kind: "rubric",
+        heldout: null,
+        heldout_commitment: null,
+        judge: { software: "tender-judge/1", model: "deepseek-v3.1" },
+      })}
+      commitment={null}
+    />,
+  );
+
+  expect(screen.getByTestId("scored-by").textContent).toBe(
+    "Scored by the Tender Judge with deepseek-v3.1. Subjective: a model's judgement.",
+  );
+});
+
+test("scorecard_of_another_verifiers_rubric_is_subjective_under_its_own_name", () => {
+  render(
+    <Scorecard
+      scorecard={scorecard({
+        kind: "rubric",
+        judge: { software: "acme-grader/3", model: null },
+      })}
+    />,
+  );
+
+  expect(screen.getByTestId("scored-by").textContent).toBe(
+    "Scored by acme-grader/3. Subjective: a model's judgement.",
+  );
+});
+
+test("scorecard_of_a_check_is_not_called_subjective", () => {
+  render(<Scorecard scorecard={scorecard({ kind: "exact" })} />);
+
+  expect(screen.getByTestId("scored-by").textContent).not.toMatch(/subjective/i);
+});
+
+test("scorecard_does_not_take_the_judges_name_from_another_account_when_the_build_knows_the_judge", () => {
+  // The API refuses such a card from any account but the Judge's; a build that knows the Judge holds
+  // the card to it as well, and names what the card says.
+  const card = scorecard({ judge: { software: "tender-judge/1", model: null } });
+
+  const { rerender } = render(<Scorecard scorecard={card} judgeAccount={VERIFIER} />);
+  expect(screen.getByTestId("scored-by").textContent).toBe("Scored by the Tender Judge.");
+
+  rerender(<Scorecard scorecard={card} judgeAccount="someone-else.testnet" />);
+  expect(screen.getByTestId("scored-by").textContent).toBe("Scored by tender-judge/1.");
+});
+
 test("scorecard_shows_a_row_per_entry_with_its_score_whether_it_passed_and_why", () => {
   render(<Scorecard scorecard={scorecard()} />);
 
@@ -296,13 +361,13 @@ test("scorecard_shows_the_recompute_line", () => {
   );
 });
 
-test("scorecard_links_the_held_out_document_as_the_bytes_that_were_hashed", () => {
+test("scorecard_links_the_held_out_checks_as_the_bytes_that_were_hashed", () => {
   // A commitment that really is the hash of the document, as an honest verifier publishes.
   const heldout = { regex_cases: { no_match: ["-bad"], match: ["alice.near"] } };
   const commitment = sha256Hex(canonicalJson(heldout));
   render(<Scorecard scorecard={scorecard({ heldout, heldout_commitment: commitment })} />);
 
-  const link = screen.getByRole("link", { name: /held-out document/i });
+  const link = screen.getByRole("link", { name: /held-out checks/i });
   expect(link.getAttribute("download")).toBe("heldout.json");
   const href = link.getAttribute("href") ?? "";
   const prefix = "data:application/json;charset=utf-8,";
@@ -313,7 +378,7 @@ test("scorecard_links_the_held_out_document_as_the_bytes_that_were_hashed", () =
   expect(sha256Hex(bytes)).toBe(commitment);
 });
 
-test("scorecard_shows_the_rest_and_no_link_when_the_held_out_document_cannot_be_written_out", () => {
+test("scorecard_shows_the_rest_and_no_link_when_the_held_out_checks_cannot_be_written_out", () => {
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   // JSON can escape a lone surrogate, and the canonical form refuses to write one.
   const heldout = { note: `x${String.fromCharCode(0xd800)}y` };
@@ -321,7 +386,7 @@ test("scorecard_shows_the_rest_and_no_link_when_the_held_out_document_cannot_be_
   render(<Scorecard scorecard={scorecard({ heldout })} />);
 
   expect(screen.queryByRole("link")).toBeNull();
-  expect(screen.getByText("The held-out document cannot be written out as a file.")).toBeTruthy();
+  expect(screen.getByText("The held-out checks cannot be written out as a file.")).toBeTruthy();
   // The scorecard is still there, and so is the line to recompute the commitment by.
   expect(screen.getAllByTestId("score-row")).toHaveLength(2);
   expect(screen.getByTestId("recompute")).toBeTruthy();
@@ -329,7 +394,7 @@ test("scorecard_shows_the_rest_and_no_link_when_the_held_out_document_cannot_be_
   expect(log).toHaveBeenCalledTimes(1);
 });
 
-test("scorecard_writes_the_held_out_document_once_however_often_the_page_draws", () => {
+test("scorecard_writes_the_held_out_checks_once_however_often_the_page_draws", () => {
   const decode = vi.spyOn(TextDecoder.prototype, "decode");
   const card = scorecard();
   const { rerender } = render(<Scorecard scorecard={card} commitment={HASH_A} />);
@@ -384,10 +449,10 @@ test("scorecard_for_a_task_with_no_held_out_part_has_no_recompute_line", () => {
 
   expect(screen.queryByTestId("recompute")).toBeNull();
   expect(screen.queryByRole("link", { name: /held-out/i })).toBeNull();
-  expect(screen.getByText(/no held-out document/i)).toBeTruthy();
+  expect(screen.getByText(/no held-out checks/i)).toBeTruthy();
 });
 
-test("scorecard_says_when_the_held_out_document_was_not_published", () => {
+test("scorecard_says_when_the_held_out_checks_were_not_published", () => {
   render(<Scorecard scorecard={scorecard({ heldout: null, heldout_commitment: HASH_A })} />);
 
   // The task commits to a document, and the scorecard does not carry it.
@@ -435,7 +500,7 @@ test("brief_shows_the_summary_the_instructions_and_what_an_answer_must_look_like
   // Both lines, as the poster wrote them, with the break between them kept.
   expect(instructions.textContent).toBe("Return the total as a number.\nIgnore tax lines.");
   expect(instructions.className).toContain("whitespace-pre-wrap");
-  expect(screen.getByTestId("brief-output").textContent).toBe("Answer: json, up to 4096 bytes");
+  expect(screen.getByTestId("brief-output").textContent).toBe("Answer: JSON, up to 4096 bytes");
 });
 
 test("brief_shows_the_category_and_tags", () => {
@@ -451,7 +516,8 @@ test("brief_shows_the_category_and_tags", () => {
 test("brief_says_when_the_index_has_none", () => {
   render(<BriefSection brief={null} />);
 
-  expect(screen.getByText(/brief is not available/i)).toBeTruthy();
+  expect(screen.getByText("The brief isn't available yet.")).toBeTruthy();
+  expect(document.body.textContent).not.toMatch(/index/i);
 });
 
 test("brief_renders_the_poster_s_words_as_text_never_as_html", () => {
@@ -511,11 +577,74 @@ const criteria = (overrides: Record<string, unknown> = {}): PublicCriteria =>
 test("criteria_show_how_entries_are_scored_the_pass_mark_and_the_split", () => {
   render(<CriteriaSection criteria={criteria()} />);
 
-  expect(screen.getByTestId("criteria-kind").textContent).toBe("regex_cases");
+  expect(screen.getByTestId("criteria-kind").textContent).toBe("Regex cases");
   expect(screen.getByTestId("criteria-pass-mark").textContent).toBe("80 of 100");
   expect(screen.getByTestId("criteria-split").textContent).toBe("Winner takes all");
   expect(screen.getByTestId("criteria-heldout").textContent).toBe(
-    "A held-out document stands behind these criteria. Its hash is on the task.",
+    "Held-out checks stand behind these criteria. Their hash is on the task.",
+  );
+});
+
+// The task page calls a kind and a format what the wizard called them, and shows one the wizard does
+// not offer as it came.
+test.each([
+  ["exact", "Exact answer", { normalize: [] }],
+  ["json_schema", "JSON shape", { schema: {} }],
+  ["regex_cases", "Regex cases", {}],
+  ["rubric", "Rubric", { rubric: [{ criterion: "Is it clear", weight: 1 }] }],
+  ["tests", "tests", { language: "js", entry: "total", examples: [] }],
+])("criteria_call_the_%s_kind_%s", (kind, label, more) => {
+  render(<CriteriaSection criteria={criteria({ kind, ...more })} />);
+
+  expect(screen.getByTestId("criteria-kind").textContent).toBe(label);
+});
+
+test.each([
+  ["text", "Plain text"],
+  ["json", "JSON"],
+  ["regex_json", "A regex, as JSON"],
+  ["code_js", "code_js"],
+])("brief_calls_the_%s_format_%s", (format, label) => {
+  const brief = detail().brief;
+  if (brief === null) throw new Error("the fixture has a brief");
+  render(
+    <BriefSection brief={{ ...brief, output: { ...brief.output, format: format as "text" } }} />,
+  );
+
+  expect(screen.getByTestId("brief-output").textContent).toBe(`Answer: ${label}, up to 4096 bytes`);
+});
+
+test("brief_shows_a_repeated_tag_each_time_without_a_key_clash", () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  const brief = detail().brief;
+  if (brief === null) throw new Error("the fixture has a brief");
+  render(<BriefSection brief={{ ...brief, tags: ["json", "json"] }} />);
+
+  expect(screen.getAllByTestId("brief-tag")).toHaveLength(2);
+  expect(log.mock.calls.flat().join("\n")).not.toContain("same key");
+});
+
+// ---- What the Judge made of a task ------------------------------------------------------------
+
+test.each([
+  ["pending", "Judge: not decided yet"],
+  ["accepted", "Judge: accepted"],
+  ["rejected", "Judge: turned this task down"],
+  ["failed_closed", "Judge: could not check this task"],
+  // A status this page has no words for is shown as it came, and not hidden.
+  ["something_new", "Judge: something_new"],
+])("judge_note_says_the_status_%s_in_words", (status, words) => {
+  render(<JudgeNote status={status} reason={null} />);
+
+  expect(screen.getByTestId("judge-note").textContent).toBe(words);
+  expect(screen.getByTestId("judge-note").textContent).not.toContain("failed_closed");
+});
+
+test("judge_note_gives_the_reason_after_the_words", () => {
+  render(<JudgeNote status="failed_closed" reason="the model server could not be reached" />);
+
+  expect(screen.getByTestId("judge-note").textContent).toBe(
+    "Judge: could not check this task · the model server could not be reached",
   );
 });
 
@@ -535,7 +664,7 @@ test("criteria_write_each_kind_of_split", () => {
 test("criteria_say_when_there_is_no_held_out_part", () => {
   render(<CriteriaSection criteria={criteria({ has_heldout: false })} />);
 
-  expect(screen.getByTestId("criteria-heldout").textContent).toBe("No held-out document.");
+  expect(screen.getByTestId("criteria-heldout").textContent).toBe("No held-out checks.");
 });
 
 test("criteria_list_the_examples_of_a_regex_task", () => {
@@ -571,6 +700,12 @@ test("criteria_list_the_rubric_with_its_weights", () => {
     "Covers every severity level · weight 5",
     "Fits in five bullets · weight 2",
   ]);
+  // It says nothing of who scores: the scorecard does, and a verifier other than the Judge may use
+  // a rubric too.
+  expect(screen.getByTestId("rubric-subjective").textContent).toBe(
+    "Scored against these points. Subjective.",
+  );
+  expect(document.body.textContent).not.toMatch(/LLM/);
 });
 
 test("criteria_show_the_other_kinds_as_text", () => {
@@ -635,5 +770,6 @@ test("criteria_render_the_poster_s_words_as_text_never_as_html", () => {
 test("criteria_say_when_the_index_has_none", () => {
   render(<CriteriaSection criteria={null} />);
 
-  expect(screen.getByText(/public criteria are not available/i)).toBeTruthy();
+  expect(screen.getByText("The criteria aren't available yet.")).toBeTruthy();
+  expect(document.body.textContent).not.toMatch(/index/i);
 });

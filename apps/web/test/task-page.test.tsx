@@ -1,5 +1,5 @@
-import { ApiError, type TaskOutcome } from "@tender/shared";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { ApiError, type TaskView as ChainTask, type TaskOutcome } from "@tender/shared";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { TaskView } from "../components/TaskView";
@@ -69,10 +69,16 @@ const settle = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms));
 
 const quietLog = () => vi.spyOn(console, "error").mockImplementation(() => {});
 
+/**
+ * The title of the page once the task is in. Before then the heading is the task's number, so that
+ * a page in any state has one.
+ */
+const titled = () => screen.findByRole("heading", { level: 1, name: /^(?!Task( #\d+)?$)/ });
+
 /** The page, loaded. */
-async function open(id = "7") {
-  const view = render(<TaskView id={id} />);
-  await screen.findByRole("heading", { level: 1 });
+async function open(id = "7", props: { judgeAccount?: string | null } = {}) {
+  const view = render(<TaskView id={id} {...props} />);
+  await titled();
   return view;
 }
 
@@ -95,7 +101,7 @@ test("task_page_shows_the_task_with_all_its_parts", async () => {
   render(<TaskView id="7" />);
 
   expect(screen.getByRole("status").textContent).toMatch(/loading/i);
-  const title = await screen.findByRole("heading", { level: 1 });
+  const title = await titled();
 
   expect(title.textContent).toBe("Extract invoice totals");
   expect(screen.getByTestId("phase-chip").textContent).toBe("Open");
@@ -103,7 +109,8 @@ test("task_page_shows_the_task_with_all_its_parts", async () => {
   expect(within(screen.getByTestId("poster")).getByText("Run by Tender team")).toBeTruthy();
   expect(screen.getByTestId("phase-timeline")).toBeTruthy();
   expect(screen.getByTestId("brief-instructions")).toBeTruthy();
-  expect(screen.getByTestId("criteria-kind").textContent).toBe("regex_cases");
+  // The kind is called what the wizard called it.
+  expect(screen.getByTestId("criteria-kind").textContent).toBe("Regex cases");
   expect(screen.getByTestId("entry-summary").textContent).toBe("2 committed · 0 revealed");
   expect(screen.getByTestId("verifier-record")).toBeTruthy();
   const funders = screen.getAllByTestId("funder-row");
@@ -162,7 +169,7 @@ test("task_page_shows_an_error_state_that_retries_and_logs_the_error", async () 
   failing = false;
   await userEvent.click(within(alert).getByRole("button", { name: "Retry" }));
 
-  await screen.findByRole("heading", { level: 1 });
+  await titled();
   expect(screen.queryByRole("alert")).toBeNull();
   expect(api.count(TASK_PATH)).toBe(2);
 });
@@ -328,8 +335,8 @@ test("task_page_shows_the_title_of_a_task_with_no_public_brief", async () => {
   expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
     "Untitled task (no public brief yet)",
   );
-  expect(screen.getByText(/brief is not available/i)).toBeTruthy();
-  expect(screen.getByText(/public criteria are not available/i)).toBeTruthy();
+  expect(screen.getByText("The brief isn't available yet.")).toBeTruthy();
+  expect(screen.getByText("The criteria aren't available yet.")).toBeTruthy();
 });
 
 // ---- The clock --------------------------------------------------------------------------------
@@ -415,7 +422,8 @@ test("task_page_ignores_events_about_other_tasks", async () => {
   act(() => stream.send("committed", message("committed", "8", committedData("8")), "12"));
   // An event with no task at all, such as an agent registering.
   act(() => stream.send("committed", message("committed", null, committedData("7")), "13"));
-  await new Promise((resolve) => setTimeout(resolve, 30));
+  // Longer than the page waits for a stream to go quiet before it asks.
+  await new Promise((resolve) => setTimeout(resolve, 450));
 
   expect(api.count(TASK_PATH)).toBe(2);
 });
@@ -493,7 +501,9 @@ test("task_page_shows_the_newest_answer_even_when_an_older_one_arrives_last", as
   });
   await open();
   const stream = FakeEventSource.latest;
+  // Two events far enough apart to be two loads, the first still on its way when the second goes.
   act(() => stream.send("committed", message("committed", "7", committedData("7")), "11"));
+  await waitFor(() => expect(later).toHaveLength(1));
   act(() => stream.send("committed", message("committed", "7", committedData("7")), "12"));
   await waitFor(() => expect(later).toHaveLength(2));
 
@@ -535,6 +545,363 @@ test("task_page_closes_the_stream_when_it_goes", async () => {
   expect(stream.readyState).toBe(FakeEventSource.CLOSED);
 });
 
+// ---- Every state has a heading --------------------------------------------------------------
+
+test("task_page_has_a_heading_while_it_loads_when_there_is_no_such_task_and_when_it_fails", async () => {
+  quietLog();
+  // Loading: the task's number, with the status under it.
+  fakeApi(routes());
+  const loading = render(<TaskView id="7" />);
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Task #7");
+  expect(screen.getByRole("status").textContent).toMatch(/loading/i);
+  await titled();
+  loading.unmount();
+
+  // Missing, and an address that is no number: one heading, and the page says what it knows.
+  fakeApi({ [TASK_PATH]: () => json({ error: "not_found", message: "no" }, 404) });
+  render(<TaskView id="7" />);
+  expect((await screen.findByText(/no task with this id/i)).tagName).toBe("P");
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Task #7");
+  cleanup();
+  fakeApi(routes());
+  render(<TaskView id="seven" />);
+  expect(await screen.findByText(/no task with this id/i)).toBeTruthy();
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Task");
+  cleanup();
+
+  // Failed.
+  fakeApi({ [TASK_PATH]: () => json({ error: "internal", message: "x" }, 500) });
+  render(<TaskView id="7" />);
+  await screen.findByRole("alert");
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Task #7");
+});
+
+// ---- The Tender Judge is labelled as ours -----------------------------------------------------
+
+const notFound = () => json({ error: "not_found", message: "no such agent" }, 404);
+
+test("the_judge_is_named_and_labelled_as_the_teams_though_it_is_no_registered_agent", async () => {
+  fakeApi({ [TASK_PATH]: () => json(detail()), [AGENT_PATH]: notFound });
+
+  await open("7", { judgeAccount: VERIFIER });
+
+  const record = within(screen.getByTestId("verifier-record"));
+  expect(record.getByTestId("verifier-name").textContent).toBe("Tender Judge");
+  expect(record.getByText(VERIFIER)).toBeTruthy();
+  expect(record.getByText("Run by Tender team")).toBeTruthy();
+  // It does not read as an anonymous account that nobody knows.
+  expect(record.getByTestId("verifier-no-record").textContent).toBe("No pick record on chain yet.");
+  expect(record.queryByText(/not a registered agent/)).toBeNull();
+});
+
+test("the_judge_keeps_the_figures_of_its_profile_when_it_has_one", async () => {
+  fakeApi(
+    routes(
+      () => detail(),
+      () => json(agentDetail({ is_team: false, picks_made: 31 })),
+    ),
+  );
+
+  await open("7", { judgeAccount: VERIFIER });
+
+  const record = within(screen.getByTestId("verifier-record"));
+  // Labelled as ours by this build's Judge account, whatever the profile's flag says.
+  expect(record.getByTestId("verifier-name").textContent).toBe("Tender Judge");
+  expect(record.getByText("Run by Tender team")).toBeTruthy();
+  expect(record.getByTestId("picks-made").textContent).toBe("31");
+  expect(record.queryByTestId("verifier-no-record")).toBeNull();
+});
+
+test("an_account_that_is_not_the_judge_is_not_named_or_labelled_as_it", async () => {
+  fakeApi({ [TASK_PATH]: () => json(detail()), [AGENT_PATH]: notFound });
+
+  // Without a Judge account, or with another one.
+  for (const judgeAccount of [null, "other-judge.testnet"]) {
+    const view = await open("7", { judgeAccount });
+    const record = within(screen.getByTestId("verifier-record"));
+    expect(record.queryByTestId("verifier-name"), String(judgeAccount)).toBeNull();
+    expect(record.queryByText("Run by Tender team")).toBeNull();
+    expect(record.getByText("No record: this account is not a registered agent.")).toBeTruthy();
+    view.unmount();
+  }
+});
+
+// ---- The Judge's verdict is asked for ---------------------------------------------------------
+
+test("while_the_judge_has_said_nothing_the_page_asks_every_five_seconds_until_it_does", async () => {
+  pinClock(AT.created + 30n * SECOND, { ticks: true });
+  let status: string | null = null;
+  let reason: string | null = null;
+  const api = fakeApi(routes(() => detail({ judge_status: status, judge_reason: reason })));
+  await open("7", { judgeAccount: VERIFIER });
+  expect(api.count(TASK_PATH)).toBe(1);
+  expect(screen.queryByTestId("judge-note")).toBeNull();
+
+  await settle(4_900);
+  expect(api.count(TASK_PATH)).toBe(1);
+  await settle(200);
+  expect(api.count(TASK_PATH)).toBe(2);
+
+  // "pending" is the Judge waiting for the held-out checks: still no verdict.
+  status = "pending";
+  reason = "waiting for held-out checks";
+  await settle(5_000);
+  expect(api.count(TASK_PATH)).toBe(3);
+  expect(screen.getByTestId("judge-note").textContent).toContain("waiting for held-out checks");
+  await settle(5_000);
+  expect(api.count(TASK_PATH)).toBe(4);
+
+  // A refusal, which the stream never carries, appears on its own and the asking stops.
+  status = "rejected";
+  reason = "held-out checks missing";
+  await settle(5_000);
+  expect(api.count(TASK_PATH)).toBe(5);
+  expect(screen.getByTestId("judge-note").textContent).toContain("held-out checks missing");
+  await settle(60_000);
+  expect(api.count(TASK_PATH)).toBe(5);
+});
+
+test("the_page_stops_asking_when_the_judge_accepts", async () => {
+  pinClock(AT.created + 30n * SECOND, { ticks: true });
+  let status: string | null = null;
+  const api = fakeApi(routes(() => detail({ judge_status: status })));
+  await open("7", { judgeAccount: VERIFIER });
+
+  status = "accepted";
+  await settle(5_000);
+  expect(api.count(TASK_PATH)).toBe(2);
+  await settle(60_000);
+  expect(api.count(TASK_PATH)).toBe(2);
+});
+
+test.each([
+  ["a_verifier_that_is_not_the_judge", { judgeAccount: "other-judge.testnet" }, 30n],
+  ["a_build_that_does_not_know_the_judge", { judgeAccount: null }, 30n],
+  ["a_task_older_than_fifteen_minutes", { judgeAccount: VERIFIER }, 15n * 60n + 1n],
+] as const)("the_page_does_not_ask_again_for_%s", async (_name, props, age) => {
+  pinClock(AT.created + age * SECOND, { ticks: true });
+  const api = fakeApi(routes(() => detail({ judge_status: null })));
+  await open("7", props);
+
+  await settle(60_000);
+
+  expect(api.count(TASK_PATH)).toBe(1);
+});
+
+test("the_page_does_not_ask_again_for_a_task_that_has_an_outcome", async () => {
+  pinClock(AT.created + 30n * SECOND, { ticks: true });
+  const api = fakeApi(routes(() => settledTask({ scorecard: null })));
+  await open("7", { judgeAccount: VERIFIER });
+
+  await settle(60_000);
+
+  expect(api.count(TASK_PATH)).toBe(1);
+});
+
+test("the_page_stops_asking_fifteen_minutes_after_the_task_was_created", async () => {
+  pinClock(AT.created + 14n * 60n * SECOND + 50n * SECOND, { ticks: true });
+  const api = fakeApi(routes(() => detail({ judge_status: null })));
+  await open("7", { judgeAccount: VERIFIER });
+
+  // A minute in steps of five seconds, as the page lives it: a window that ends is seen to end.
+  for (let i = 0; i < 12; i++) await settle(5_000);
+  const asked = api.count(TASK_PATH);
+  await settle(120_000);
+
+  // A few more asks until the fifteenth minute, then none.
+  expect(asked).toBeGreaterThan(1);
+  expect(asked).toBeLessThanOrEqual(3);
+  expect(api.count(TASK_PATH)).toBe(asked);
+});
+
+// ---- A burst of events is one load ------------------------------------------------------------
+
+test("a_burst_of_events_is_one_load_of_the_task_and_its_verifier", async () => {
+  const api = fakeApi(routes());
+  await open();
+  const stream = FakeEventSource.latest;
+
+  // Six events a few milliseconds apart, as a replay after a phone wakes delivers them: each is its
+  // own render, and none is a quiet moment.
+  for (let i = 0; i < 6; i++) {
+    act(() =>
+      stream.send("committed", message("committed", "7", committedData("7")), String(11 + i)),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+  await waitFor(() => expect(api.count(TASK_PATH)).toBe(2));
+  await new Promise((resolve) => setTimeout(resolve, 450));
+
+  expect(api.count(TASK_PATH)).toBe(2);
+  expect(api.count(AGENT_PATH)).toBe(2);
+});
+
+test("a_stream_that_never_goes_quiet_still_loads_the_task", async () => {
+  const api = fakeApi(routes());
+  await open();
+  const stream = FakeEventSource.latest;
+  expect(api.count(TASK_PATH)).toBe(1);
+
+  // An event every 100 ms for longer than the page will wait: no moment of quiet ever comes, and
+  // the page has to ask all the same, before the stream stops.
+  for (let i = 0; i < 26; i++) {
+    act(() =>
+      stream.send("committed", message("committed", "7", committedData("7")), String(11 + i)),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  expect(api.count(TASK_PATH)).toBeGreaterThanOrEqual(2);
+});
+
+// ---- A task the index has not read yet ----------------------------------------------------------
+
+/** What the node answers to a view that returned `value`. */
+const viewAnswer = (value: unknown) =>
+  json({
+    jsonrpc: "2.0",
+    id: "tender-web",
+    result: {
+      result: Array.from(new TextEncoder().encode(JSON.stringify(value))),
+      logs: [],
+      block_height: 1,
+      block_hash: "h",
+    },
+  });
+
+/** The task as the chain's `get_task` shows it. */
+function chainTask(id: string): ChainTask {
+  const { task } = detail();
+  return {
+    id,
+    poster: task.poster,
+    token: task.token,
+    reward: task.reward,
+    fee_bps: task.fee_bps,
+    brief_uri: task.brief_uri,
+    brief_hash: task.brief_hash,
+    criteria_hash: task.criteria_hash,
+    heldout_commitment: null,
+    verifier: task.verifier,
+    created_at: task.created_at,
+    commit_deadline: task.commit_deadline,
+    reveal_deadline: task.reveal_deadline,
+    pick_deadline: task.pick_deadline,
+    fallback_deadline: task.fallback_deadline,
+    max_entries: 0,
+    max_winners: 1,
+    invited: [],
+    parent: null,
+    commit_count: 0,
+    reveal_count: 0,
+    cleaned: 0,
+    funders: [],
+    outcome: null,
+    phase: "open",
+  };
+}
+
+const NOT_INDEXED =
+  "Task #7 is on chain. Tender's index hasn't caught up yet, so this page will fill in on its own.";
+
+test("a_task_on_chain_that_the_index_has_not_read_says_so_and_fills_in_when_it_has", async () => {
+  pinClock(AT.created + 30n * SECOND, { ticks: true });
+  let indexed = false;
+  const api = fakeApi({
+    [TASK_PATH]: () => (indexed ? json(detail()) : notFound()),
+    [AGENT_PATH]: () => json(agentDetail()),
+    "/": () => viewAnswer(chainTask("7")),
+  });
+  render(<TaskView id="7" />);
+
+  // Not "there is no task": the chain has it.
+  expect((await screen.findByTestId("not-indexed")).textContent).toBe(NOT_INDEXED);
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Task #7");
+  expect(screen.queryByText(/no task with this id/i)).toBeNull();
+
+  // The page asks the index again every few seconds.
+  await settle(4_100);
+  expect(api.count(TASK_PATH)).toBe(2);
+  indexed = true;
+  await settle(4_000);
+
+  expect((await titled()).textContent).toBe("Extract invoice totals");
+  expect(screen.queryByTestId("not-indexed")).toBeNull();
+  await settle(30_000);
+  expect(api.count(TASK_PATH)).toBe(3);
+});
+
+test("a_task_on_chain_is_asked_for_a_few_minutes_and_then_left_to_the_button", async () => {
+  pinClock(AT.created + 30n * SECOND, { ticks: true });
+  const api = fakeApi({
+    [TASK_PATH]: () => notFound(),
+    "/": () => viewAnswer(chainTask("7")),
+  });
+  render(<TaskView id="7" />);
+  await screen.findByTestId("not-indexed");
+
+  await settle(5 * 60_000 + 10_000);
+  const asked = api.count(TASK_PATH);
+  expect(asked).toBeGreaterThan(50);
+  await settle(120_000);
+  expect(api.count(TASK_PATH)).toBe(asked);
+
+  // And the button asks once more.
+  await act(async () => {
+    screen.getByRole("button", { name: "Check again" }).click();
+  });
+  await settle(10);
+  expect(api.count(TASK_PATH)).toBe(asked + 1);
+});
+
+test("a_task_the_chain_does_not_have_keeps_the_plain_sentence_and_is_not_asked_for_again", async () => {
+  pinClock(AT.created + 30n * SECOND, { ticks: true });
+  const api = fakeApi({ [TASK_PATH]: () => notFound(), "/": () => viewAnswer(null) });
+  render(<TaskView id="7" />);
+
+  expect(await screen.findByText("There is no task with this id.")).toBeTruthy();
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Task #7");
+  expect(screen.queryByTestId("not-indexed")).toBeNull();
+  await settle(60_000);
+  expect(api.count(TASK_PATH)).toBe(1);
+});
+
+test("a_task_the_chain_could_not_be_asked_about_is_not_called_missing", async () => {
+  const log = quietLog();
+  const api = fakeApi({
+    [TASK_PATH]: () => notFound(),
+    "/": () => new Response("down", { status: 503 }),
+  });
+  render(<TaskView id="7" />);
+
+  const note = await screen.findByTestId("not-indexed");
+  expect(note.textContent).toContain("the chain could not be read to check");
+  expect(note.textContent).toContain("no task with this id in Tender's index");
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Task #7");
+  expect(log).toHaveBeenCalled();
+  // The page is not live for it either way; the button asks again.
+  await userEvent.click(screen.getByRole("button", { name: "Check again" }));
+  await waitFor(() => expect(api.count(TASK_PATH)).toBe(2));
+});
+
+test("a_task_page_for_a_missing_task_fills_in_when_the_stream_reports_it", async () => {
+  let indexed = false;
+  fakeApi({
+    [TASK_PATH]: () => (indexed ? json(detail()) : notFound()),
+    [AGENT_PATH]: () => json(agentDetail()),
+    "/": () => viewAnswer(null),
+  });
+  render(<TaskView id="7" />);
+  await screen.findByText("There is no task with this id.");
+
+  indexed = true;
+  act(() =>
+    FakeEventSource.latest.send("committed", message("committed", "7", committedData("7")), "20"),
+  );
+
+  expect((await titled()).textContent).toBe("Extract invoice totals");
+});
+
 // ---- A settled task ---------------------------------------------------------------------------
 
 const picked: Extract<TaskOutcome, { kind: "picked" }> = {
@@ -564,10 +931,12 @@ test("task_page_shows_who_settled_and_the_scorecard_once_the_task_is_picked", as
   pinClock(AT.fallback + 60n * SECOND);
   fakeApi(routes(() => settledTask()));
 
-  await open();
+  await open("7", { judgeAccount: VERIFIER });
 
   expect(screen.getByTestId("phase-chip").textContent).toBe("Settled");
   expect(screen.getByTestId("settled-by").textContent).toBe(`Picked by ${VERIFIER} (verifier)`);
+  // And who scored it, from the scorecard.
+  expect(screen.getByTestId("scored-by").textContent).toBe("Scored by the Tender Judge.");
   expect(screen.getAllByTestId("winner-row")).toHaveLength(1);
   // The line asks for the commitment the task has on chain.
   expect(screen.getByTestId("recompute").textContent).toBe(

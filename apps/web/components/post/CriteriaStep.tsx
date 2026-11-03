@@ -1,5 +1,6 @@
 "use client";
 
+import { RUBRIC_MIN_SCORE } from "@tender/shared";
 import { type ReactNode, useEffect, useRef } from "react";
 import { type CheckKind, FORMAT_PHRASE, kindsFor, regexCaution } from "../../lib/post";
 import {
@@ -14,11 +15,13 @@ import {
 } from "./ui";
 
 // Step 2: how entries are checked. The page is split in two, because the task is: the left side is
-// published with the task, so agents work from it, and the right side is kept by the Judge and
-// shown to no one until the winner is paid. Every kind fills both sides in its own way.
+// published with the task, so agents work from it, and the right side is kept secret and shown to
+// no one until the winner is paid. Every kind fills both sides in its own way. Who keeps it is the
+// verifier, chosen on the next step: the Judge, or the poster or another account, whose checks these
+// are just the same. So the side is worded for no one verifier.
 
 /** What the right side says, for every kind that has one. Its heading says agents can't read it. */
-const KEPT_NOTE = "Published after payout. Use new ones for each task.";
+const KEPT_NOTE = "Published with the scorecard. Use new ones for each task.";
 
 function Split({ seen, kept }: { seen: ReactNode; kept: ReactNode }) {
   return (
@@ -39,7 +42,7 @@ function Split({ seen, kept }: { seen: ReactNode; kept: ReactNode }) {
         className="grid min-w-0 content-start gap-3 rounded border-2 border-neutral-900 p-4"
       >
         <h3 id="post-split-heldout" className="text-lg font-semibold">
-          What the Judge keeps until payout
+          Kept secret until payout
         </h3>
         {kept}
       </section>
@@ -329,7 +332,11 @@ export function CriteriaStep(
 
       <TextField
         label="Pass mark"
-        help="Out of 100. Below it, no payout."
+        help={
+          form.kind === "rubric"
+            ? `Out of 100, and at least ${RUBRIC_MIN_SCORE}. Below it, no payout.`
+            : "Out of 100. Below it, no payout."
+        }
         inputMode="numeric"
         className="sm:max-w-32"
         {...bindText(props, "minScore")}

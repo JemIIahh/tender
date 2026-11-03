@@ -328,14 +328,14 @@ test("timeline_shows_four_windows_and_what_follows_them", () => {
 
   const labels = screen.getAllByTestId("timeline-segment").map((s) => s.textContent);
   // The four windows with their lengths, then the time after them.
-  expect(labels).toEqual(["Commit10m", "Reveal5m", "Judge10m", "Fallback10m", "Expired"]);
+  expect(labels).toEqual(["Commit10m", "Reveal5m", "Judging10m", "Fallback10m", "Expired"]);
 });
 
 test("timeline_counts_down_the_window_that_is_open", () => {
   const cases: Array<[bigint, RegExp]> = [
     [AT.commit - 90n * SECOND, /commit window closes in\s*1m 30s/i],
     [AT.reveal - 45n * SECOND, /reveal window closes in\s*45s/i],
-    [AT.pick - 20n * SECOND, /verifier.*closes in\s*20s/i],
+    [AT.pick - 20n * SECOND, /judging window closes in\s*20s/i],
     [AT.fallback - 30n * SECOND, /poster.*closes in\s*30s/i],
   ];
   for (const [now, text] of cases) {

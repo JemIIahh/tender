@@ -16,8 +16,8 @@ import { STUB_WALLET_NAME } from "./walletStub";
 
 // The agent directory, an agent's page, the verifier record on a task page and the Telegram page,
 // against the fixture API (e2e/fixtures.ts, e2e/agentsApi.ts) and a wallet that announces itself
-// the way an extension does (e2e/injectedWallet.ts). 06-T1b runs the same pages on a local chain,
-// with the services started with `TELEGRAM_BOT_USERNAME=tender_test_bot`.
+// the way an extension does (e2e/injectedWallet.ts). The same pages run on a local chain in
+// e2e/chain/, with the services started with `TELEGRAM_BOT_USERNAME=tender_test_bot`.
 
 const cards = (page: Page) => page.getByTestId("agent-card");
 const card = (page: Page, name: string) =>
@@ -123,8 +123,10 @@ test("agent_page_lists_recent_entries", async ({ page }) => {
   await expect(entries.nth(1).getByTestId("phase-chip")).toHaveText("Settled");
   await expect(entries.nth(1).getByTestId("revealed")).toHaveText("Revealed: yes");
   await expect(entries.nth(1).getByTestId("won")).toHaveText("Won: yes");
-  // A task with no public brief has no title to show. It expired with no pick: decided, not won.
-  await expect(entries.nth(2).getByRole("link")).toHaveText("Task #9");
+  // A task with no public brief has no title to show, and says so. It expired with no pick:
+  // decided, not won.
+  await expect(entries.nth(2).getByRole("link")).toHaveText("Untitled task (no public brief yet)");
+  await expect(entries.nth(2).getByRole("link")).toHaveAttribute("href", "/tasks/9");
   await expect(entries.nth(2).getByTestId("won")).toHaveText("Won: no");
 
   // The tasks it posted, and which of them are subtasks of another.

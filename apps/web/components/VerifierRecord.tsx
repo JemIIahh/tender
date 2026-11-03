@@ -1,3 +1,4 @@
+import { PosterJudges } from "./PosterJudges";
 import { TeamBadge } from "./TeamBadge";
 
 /**
@@ -28,10 +29,14 @@ export function VerifierFigures({
  * the page says so instead of showing zeros the contract does not claim. A profile that could not
  * be read just now (`unavailable`) is said to be that, and is not taken for one that does not exist.
  *
+ * The Tender Judge is named and labelled as the team's whether or not it has a profile, and its
+ * figures are shown when it has one.
+ *
  * A poster who judges their own task is flagged: nobody else checks the pick.
  */
 export function VerifierRecord({
   account,
+  isJudge = false,
   isTeam,
   picks_made,
   voids_after_reveals,
@@ -39,6 +44,12 @@ export function VerifierRecord({
   unavailable = false,
 }: {
   account: string;
+  /**
+   * The account is the Tender Judge, as this build knows it. The Judge is not a registered agent,
+   * so the contract keeps no record for it, and the page names it and labels it as the team's
+   * instead of showing an anonymous account with "no record".
+   */
+  isJudge?: boolean;
   isTeam: boolean;
   picks_made: number | null;
   voids_after_reveals: number | null;
@@ -49,21 +60,23 @@ export function VerifierRecord({
   return (
     <section data-testid="verifier-record" className="grid gap-2">
       <h2 className="text-lg font-semibold">Verifier</h2>
-      <TeamBadge account={account} isTeam={isTeam} />
-      {isPoster ? (
-        <p
-          data-testid="poster-judges"
-          className="w-fit rounded border border-neutral-900 px-1.5 py-0.5 text-sm font-medium"
-        >
-          Poster judges their own task
+      {isJudge ? (
+        <p data-testid="verifier-name" className="font-medium">
+          Tender Judge
         </p>
       ) : null}
+      <TeamBadge account={account} isTeam={isTeam} />
+      {isPoster ? <PosterJudges /> : null}
       {unavailable ? (
         <p data-testid="verifier-unavailable" className="text-sm">
           Verifier record unavailable
         </p>
       ) : picks_made === null || voids_after_reveals === null ? (
-        <p className="text-sm">No record: this account is not a registered agent.</p>
+        <p data-testid="verifier-no-record" className="text-sm">
+          {isJudge
+            ? "No pick record on chain yet."
+            : "No record: this account is not a registered agent."}
+        </p>
       ) : (
         <VerifierFigures picks_made={picks_made} voids_after_reveals={voids_after_reveals} />
       )}

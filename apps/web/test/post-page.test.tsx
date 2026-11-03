@@ -1,14 +1,20 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { SIGN_IN_MESSAGE, sha256Hex } from "@tender/shared";
+import { SIGN_IN_MESSAGE, sha256Hex, storageShortfall } from "@tender/shared";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, expect, type MockInstance, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, type MockInstance, onTestFinished, test, vi } from "vitest";
 import { PostWizard } from "../components/post/PostWizard";
 import { heldToken } from "../lib/apiToken";
 import { clearApiToken } from "../lib/auth";
-import { RUBRIC_JUDGE_NOTE } from "../lib/post";
-import { createWalletStore, type WalletStore } from "../lib/wallet";
+import {
+  POST_TASK_BYTES,
+  RUBRIC_JUDGE_NOTE,
+  VAULT_SLOT_BYTES,
+  VERIFIER_PICKS_WITH_MCP,
+} from "../lib/post";
+import { describeNear } from "../lib/vault";
+import { createWalletStore, type Session, type WalletStore } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE } from "../lib/walletErrors";
 import { FakeChain, FakeNode, fakeFetch, type Outcome } from "./fakeChain";
 import { JUDGE, SECRET, TOKEN } from "./postForms";
@@ -34,6 +40,12 @@ vi.mock("../lib/wallet", async (importOriginal) => {
 });
 const router = vi.hoisted(() => ({ push: vi.fn() }));
 vi.mock("next/navigation", () => ({ useRouter: () => router }));
+// A minute is too long to wait in a test: the page waits 150 ms before it offers to stop waiting.
+// The minute itself is the default of `useWaitedLong`, and has a test of its own (waiting.test.tsx).
+vi.mock("../lib/waiting", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/waiting")>();
+  return { ...actual, useWaitedLong: (what: string | null) => actual.useWaitedLong(what, 150) };
+});
 
 // ---- The world ----------------------------------------------------------------------------------
 
@@ -318,7 +330,7 @@ test("a_regex_task_is_posted_from_the_page_with_the_deposit_first", async () => 
   expect(testId("review-heldout")).toBe("4 cases");
   expect(testId("review-prize")).toBe("Winner takes all");
   expect(testId("review-windows")).toBe(
-    "Commit 10m · Reveal 5m · Judge 10m · Fallback 10m. 35m in all.",
+    "Commit 10m · Reveal 5m · Judging 10m · Fallback 10m. 35m in all.",
   );
   expect(testId("review-verifier")).toBe("Tender Judge (run by the Tender team) · judge.testnet");
   expect(testId("review-account")).toBe(ALICE);
@@ -445,7 +457,7 @@ test.each([
   { verifier: "Me", typed: null, expected: ALICE },
   { verifier: "Another account", typed: BOB, expected: BOB },
 ])(
-  "the_verifier_$verifier_is_the_one_the_task_is_posted_with",
+  "the_verifier_is_the_one_the_task_is_posted_with_$verifier",
   async ({ verifier, typed, expected }) => {
     const { user, chain } = setup({ vault: TUSDC(5) });
     render(<PostWizard judgeAccount={JUDGE} />);
@@ -464,6 +476,151 @@ test.each([
   },
 );
 
+test("a_verifier_who_is_not_the_judge_is_told_this_site_cannot_pick", async () => {
+  const { user } = setup({ vault: TUSDC(5) });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReward(user);
+
+  // With the Judge as verifier there is nothing to add: the Judge picks.
+  expect(screen.queryByTestId("verifier-picks-with-mcp")).toBeNull();
+  for (const verifier of [/^Me/, /^Another account/]) {
+    await user.click(screen.getByRole("radio", { name: verifier }));
+    expect(testId("verifier-picks-with-mcp")).toBe(VERIFIER_PICKS_WITH_MCP);
+  }
+  expect(VERIFIER_PICKS_WITH_MCP).toContain("pick_winners");
+  await user.click(screen.getByRole("radio", { name: /^Tender Judge/ }));
+  expect(screen.queryByTestId("verifier-picks-with-mcp")).toBeNull();
+});
+
+// ---- The held-out checks of a task the Judge does not pick --------------------------------------
+
+/** What a press of "Download held-out checks" saved: its name and bytes. */
+function captureDownloads(): Array<{ name: string; bytes: Promise<Uint8Array> }> {
+  const saved: Array<{ name: string; bytes: Promise<Uint8Array> }> = [];
+  const blobs = new Map<string, Blob>();
+  let made = 0;
+  // jsdom has neither function; they are put on and taken off again for this test.
+  Object.assign(URL, {
+    createObjectURL: (blob: Blob) => {
+      const url = `blob:test/${++made}`;
+      blobs.set(url, blob);
+      return url;
+    },
+    revokeObjectURL: () => {},
+  });
+  onTestFinished(() => {
+    Reflect.deleteProperty(URL, "createObjectURL");
+    Reflect.deleteProperty(URL, "revokeObjectURL");
+  });
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    const blob = blobs.get(this.href);
+    if (blob === undefined) throw new Error(`no file was made for ${this.href}`);
+    saved.push({
+      name: this.download,
+      bytes: new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsArrayBuffer(blob);
+      }),
+    });
+  });
+  return saved;
+}
+
+test.each([
+  { name: "me", verifier: /^Me/, typed: null, who: "You pick" },
+  {
+    name: "another_account",
+    verifier: /^Another account/,
+    typed: BOB,
+    who: `${BOB} needs these held-out checks`,
+  },
+])(
+  "the_held_out_checks_are_a_file_that_hashes_to_the_commitment_when_the_verifier_is_$name",
+  async ({ verifier, typed, who }) => {
+    const saved = captureDownloads();
+    const { user, chain, api, wallet } = setup({ vault: TUSDC(5) });
+    render(<PostWizard judgeAccount={JUDGE} />);
+    await toReward(user);
+    fill("Amount (tUSDC)", "5");
+    await user.click(screen.getByRole("radio", { name: verifier }));
+    if (typed !== null) fill("Their NEAR account", typed);
+    await press(user, "Review");
+    await stepHeading("Review");
+
+    // The page says what the file is for. The checks are in no attribute of the page.
+    const box = screen.getByTestId("heldout-download");
+    expect(box.textContent).toContain(who);
+    expect(box.textContent).toContain("publish");
+    expect(document.body.innerHTML).not.toContain(SECRET);
+    expect(testId("review-heldout")).toBe("4 cases");
+
+    await user.click(within(box).getByRole("button", { name: "Download held-out checks" }));
+    expect(saved).toHaveLength(1);
+    const file = await saved[0]?.bytes;
+    expect(saved[0]?.name).toBe("heldout.json");
+    expect(new TextDecoder().decode(file)).toContain(SECRET);
+
+    // The file is the bytes the task commits to.
+    await user.click(await postReady());
+    await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
+    expect(sha256Hex(file ?? new Uint8Array())).toBe(chain.tasks.get(1n)?.heldoutCommitment);
+    // And they went nowhere else: not to the API, not to the wallet.
+    expect(api.heldouts).toEqual([]);
+    expect(api.requests.map(({ path }) => path)).not.toContain("/v1/heldout");
+    expect(JSON.stringify(wallet.sent)).not.toContain(SECRET);
+    expect(api.requests.map(({ body }) => body).join("\n")).not.toContain(SECRET);
+  },
+);
+
+test("the_judge_gets_the_held_out_checks_and_review_offers_no_file", async () => {
+  const { user, api } = setup({ vault: TUSDC(5) });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  expect(screen.queryByTestId("heldout-download")).toBeNull();
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
+  expect(api.heldouts).toHaveLength(1);
+});
+
+test("the_judges_own_account_typed_in_as_another_account_is_still_the_judge", async () => {
+  const { user, api } = setup({ vault: TUSDC(5) });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReward(user);
+  fill("Amount (tUSDC)", "5");
+  await user.click(screen.getByRole("radio", { name: /^Another account/ }));
+  fill("Their NEAR account", JUDGE);
+  await press(user, "Review");
+  await stepHeading("Review");
+
+  expect(screen.queryByTestId("heldout-download")).toBeNull();
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
+  expect(api.heldouts).toHaveLength(1);
+});
+
+test("a_task_with_no_held_out_checks_offers_no_file_whoever_picks", async () => {
+  const { user } = setup({ vault: TUSDC(5) });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toChecks(user);
+  await user.click(screen.getByRole("radio", { name: /Regex cases/ }));
+  fill("Should match", "alice.near");
+  fill("Should not match", "-bad");
+  await press(user, "Next: Reward");
+  await screen.findByLabelText("Amount (tUSDC)");
+  fill("Amount (tUSDC)", "5");
+  await user.click(screen.getByRole("radio", { name: /^Me/ }));
+  await press(user, "Review");
+  await stepHeading("Review");
+
+  expect(testId("review-heldout")).toBe("None: scored on the examples");
+  expect(screen.queryByTestId("heldout-download")).toBeNull();
+});
+
 test("custom_windows_are_what_the_task_is_posted_with", async () => {
   const { user, chain } = setup({ vault: TUSDC(5) });
   render(<PostWizard judgeAccount={JUDGE} />);
@@ -479,7 +636,7 @@ test("custom_windows_are_what_the_task_is_posted_with", async () => {
   await stepHeading("Review");
 
   expect(testId("review-windows")).toBe(
-    "Commit 2h · Reveal 5m · Judge 10m · Fallback 10m. 2h 25m in all.",
+    "Commit 2h · Reveal 5m · Judging 10m · Fallback 10m. 2h 25m in all.",
   );
   await user.click(await postReady());
   await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
@@ -594,31 +751,32 @@ test("the_reward_step_waits_for_what_tender_allows_and_asks_again_when_it_failed
 
 // ---- Review: what stands in the way -------------------------------------------------------------
 
-test("an_account_that_is_not_set_up_is_sent_to_the_wallet_page_and_nothing_is_posted", async () => {
-  const { user, wallet, api, chain } = setup({ setUp: false });
+test("an_account_that_is_not_set_up_is_set_up_by_the_post_in_one_approval", async () => {
+  const { user, wallet, chain } = setup({ setUp: false });
   render(<PostWizard judgeAccount={JUDGE} />);
   await toReview(user);
 
-  const blocked = await screen.findByTestId("post-blocked");
-  expect(blocked.textContent).toContain(
-    "Your account isn't set up with Tender yet. Set it up on the Wallet page first.",
+  // No detour to the Wallet page: Review says what the batch adds first, and Post is on.
+  const setup_ = storageShortfall(null, POST_TASK_BYTES + VAULT_SLOT_BYTES);
+  await waitFor(
+    () =>
+      expect(testId("review-storage")).toBe(`Adds ${describeNear(setup_)} from your wallet first.`),
+    LONG,
   );
-  const link = within(blocked).getByRole("link", { name: "Open the Wallet page" });
-  expect(link.getAttribute("href")).toBe("/wallet");
-  // A tab of its own, so that the form on this page is kept.
-  expect(link.getAttribute("target")).toBe("_blank");
-  expect(off(postButton())).toBe(true);
-
-  await user.click(postButton());
-  await settle();
-  expect(writes(api)).toEqual([]);
-  expect(wallet.sent).toEqual([]);
-
-  // Once it is set up, "Check again" reads the balances afresh and the way is clear.
-  chain.fundVault(ALICE, TOKEN, 0n);
-  await user.click(within(blocked).getByRole("button", { name: "Check again" }));
-  await postReady();
   expect(screen.queryByTestId("post-blocked")).toBeNull();
+  expect(screen.queryByRole("link", { name: "Open the Wallet page" })).toBeNull();
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+
+  // One send, so one approval: the registration, the deposit and the post.
+  expect(wallet.sent).toHaveLength(1);
+  expect(chain.calls.map(({ receiverId, methodName }) => `${receiverId} ${methodName}`)).toEqual([
+    `${CONTRACT} storage_deposit`,
+    `${TOKEN} ft_transfer_call`,
+    `${CONTRACT} post_task`,
+  ]);
+  expect(chain.storage.get(ALICE)?.total).toBe(setup_);
+  expect(chain.tasks.get(1n)).toMatchObject({ poster: ALICE, reward: TUSDC(5) });
 });
 
 test("a_wallet_that_holds_too_little_to_fund_the_reward_says_how_much_more", async () => {
@@ -787,7 +945,7 @@ test("a_wallet_that_fails_without_saying_whether_it_sent_locks_post_until_the_pe
   );
   // The Tasks page opens in a tab of its own, so that the form on this page is not lost.
   const link = within(unknown).getByRole("link", { name: "Tasks" });
-  expect(link.getAttribute("href")).toBe("/");
+  expect(link.getAttribute("href")).toBe("/tasks");
   expect(link.getAttribute("target")).toBe("_blank");
   expect(screen.queryByTestId("post-failure")).toBeNull();
   expect(screen.queryByTestId("post-sent")).toBeNull();
@@ -813,6 +971,336 @@ test("a_wallet_that_fails_without_saying_whether_it_sent_locks_post_until_the_pe
   await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
   expect(chain.tasks.size).toBe(1);
   expect(wallet.sent).toHaveLength(1);
+});
+
+test("a_send_that_landed_before_the_wallet_failed_is_found_on_the_chain_and_not_posted_again", async () => {
+  const { user, wallet, api, chain } = setup({ vault: TUSDC(5) });
+  const send = wallet.signAndSendTransactions.bind(wallet);
+  wallet.signAndSendTransactions = async (params) => {
+    // The batch runs, and the wallet's window closes before it can say so.
+    await send(params);
+    throw new Error("Wallet closed");
+  };
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+  await user.click(await postReady());
+  await screen.findByTestId("post-unknown");
+  expect(chain.tasks.size).toBe(1);
+  const uploads = api.blobs.length + api.heldouts.length;
+
+  // The person looks at the Tasks page, which has not caught up, sees nothing, and unlocks Post.
+  await user.click(screen.getByRole("button", { name: "Unlock Post" }));
+  await user.click(await postReady());
+
+  // Pressing Post again reads the chain first: the task is there, and it is the result. No second
+  // deposit, no second post, no upload.
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+  expect(chain.tasks.size).toBe(1);
+  expect(wallet.sent).toHaveLength(1);
+  expect(api.blobs.length + api.heldouts.length).toBe(uploads);
+});
+
+test("only_the_first_press_after_an_unknown_outcome_reads_the_chain", async () => {
+  const { user, wallet, chain } = setup({ vault: TUSDC(5) });
+  const send = wallet.signAndSendTransactions.bind(wallet);
+  const refusals = ["Wallet closed", "User rejected the request"];
+  wallet.signAndSendTransactions = async (params) => {
+    // Nothing was sent either time: the window closed, and then the person turned the request down.
+    const refusal = refusals.shift();
+    if (refusal !== undefined) throw new Error(refusal);
+    return send(params);
+  };
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+  const spy = vi.fn(globalThis.fetch);
+  vi.stubGlobal("fetch", spy);
+  // Reads of the chain for the tasks it has: a look for an earlier post.
+  const looks = () =>
+    spy.mock.calls.filter(([, init]) => String(init?.body).includes("task_count"));
+  await user.click(await postReady());
+  await screen.findByTestId("post-unknown");
+  expect(looks()).toHaveLength(0);
+
+  await user.click(screen.getByRole("button", { name: "Unlock Post" }));
+  await user.click(await postReady());
+  await screen.findByTestId("post-failure");
+  // The first press after the unlock read the chain and found nothing.
+  expect(looks()).toHaveLength(1);
+
+  // The person turned the request down, which is known to have sent nothing: the next press has
+  // nothing to look for, and goes straight on.
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+  expect(looks()).toHaveLength(1);
+  expect(chain.tasks.size).toBe(1);
+});
+
+test("a_look_for_the_earlier_post_that_fails_sends_nothing_and_looks_again_on_the_next_press", async () => {
+  const { user, wallet, chain } = setup({ vault: TUSDC(5) });
+  const send = wallet.signAndSendTransactions.bind(wallet);
+  let failures = 1;
+  wallet.signAndSendTransactions = async (params) => {
+    if (failures-- > 0) throw new Error("Wallet closed");
+    return send(params);
+  };
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+  await user.click(await postReady());
+  await screen.findByTestId("post-unknown");
+  await user.click(screen.getByRole("button", { name: "Unlock Post" }));
+  await postReady();
+
+  // The node can't be asked: the person is told, and nothing is sent.
+  const inner = globalThis.fetch;
+  let down = true;
+  vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    if (down && String(init?.body).includes("task_count")) throw new TypeError("Failed to fetch");
+    return inner(input, init);
+  });
+  await user.click(postButton());
+  const failure = await screen.findByTestId("post-failure");
+  expect(failure.textContent).toContain("Couldn't look for your earlier post.");
+  expect(failure.textContent).toContain("Nothing was sent to your wallet.");
+  expect(wallet.sent).toHaveLength(0);
+  expect(chain.tasks.size).toBe(0);
+
+  // The next press looks again, and goes on to post when it can.
+  down = false;
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+  expect(chain.tasks.size).toBe(1);
+});
+
+test("a_vault_that_changed_since_review_is_shown_again_and_not_sent", async () => {
+  const { user, wallet, chain } = setup({ vault: TUSDC(2) });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+  await waitFor(
+    () =>
+      expect(testId("review-funding")).toBe(
+        "Your vault: 2.00 tUSDC. Added from your wallet first: 3.00 tUSDC.",
+      ),
+    LONG,
+  );
+  const button = await postReady();
+
+  // The 2 tUSDC leave the vault, somewhere else, while Review is open: the send would deposit 5.
+  chain.fundVault(ALICE, TOKEN, 0n);
+  await user.click(button);
+
+  const failure = await screen.findByTestId("post-failure");
+  expect(failure.textContent).toBe(
+    "Your balances changed. Check the amounts and press Post again.",
+  );
+  expect(wallet.sent).toHaveLength(0);
+  // Review read the balances again, so what it shows is what the next press sends.
+  await waitFor(
+    () =>
+      expect(testId("review-funding")).toBe(
+        "Your vault: 0.00 tUSDC. Added from your wallet first: 5.00 tUSDC.",
+      ),
+    LONG,
+  );
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+  expect(chain.tasks.get(1n)?.reward).toBe(TUSDC(5));
+  expect(chain.view(TOKEN, "ft_balance_of", { account_id: ALICE })).toBe(String(TUSDC(15)));
+});
+
+// ---- News of a post is for the account it was about ---------------------------------------------
+
+/** A store over a provider whose next connect gives `next`, for a test that changes account. */
+function switching(world: World) {
+  const alice: Session = { wallet: world.wallet, accountId: ALICE };
+  const bob: Session = { wallet: chainWallet(world.chain, BOB), accountId: BOB };
+  const provider = fakeProvider(alice, { restored: true });
+  holder.store = createWalletStore(async () => provider);
+  return {
+    async as(session: Session) {
+      await act(async () => {
+        await holder.store.disconnect();
+      });
+      provider.connect = async () => session;
+      await world.user.click(await screen.findByRole("button", { name: "Connect wallet" }));
+      await screen.findByText(session.accountId, { selector: "[data-testid=review-account]" });
+    },
+    alice,
+    bob,
+  };
+}
+
+test("a_lock_after_an_unknown_outcome_is_not_shown_for_another_account_and_is_back_for_the_first", async () => {
+  const w = setup({ vault: TUSDC(5) });
+  const { user, wallet } = w;
+  wallet.signAndSendTransactions = async () => {
+    throw new Error("Wallet closed");
+  };
+  const accounts = switching(w);
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+  await user.click(await postReady());
+  await screen.findByTestId("post-unknown");
+
+  // Bob's Review is not locked by what happened to Alice's post.
+  await accounts.as(accounts.bob);
+  expect(screen.queryByTestId("post-unknown")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Unlock Post" })).toBeNull();
+
+  // Alice's is: she did not look yet.
+  await accounts.as(accounts.alice);
+  expect(screen.getByTestId("post-unknown")).toBeDefined();
+  expect(off(postButton())).toBe(true);
+});
+
+test("a_failure_is_not_shown_for_another_account_and_is_back_for_the_first", async () => {
+  const w = setup({ vault: TUSDC(5) });
+  const { user, wallet } = w;
+  wallet.signAndSendTransactions = async () => {
+    throw new Error("User rejected the request");
+  };
+  const accounts = switching(w);
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+  await user.click(await postReady());
+  const failure = (await screen.findByTestId("post-failure")).textContent;
+
+  await accounts.as(accounts.bob);
+  expect(screen.queryByTestId("post-failure")).toBeNull();
+
+  await accounts.as(accounts.alice);
+  expect(testId("post-failure")).toBe(failure);
+});
+
+// ---- Giving up on a wallet that does not answer ------------------------------------------------
+
+test("a_wallet_that_never_signs_in_can_be_given_up_on_and_the_post_it_belonged_to_goes_no_further", async () => {
+  const { user, wallet, api, chain } = setup({ vault: TUSDC(5) });
+  const sign = wallet.signMessage.bind(wallet);
+  let release: () => void = () => {};
+  let hung = true;
+  wallet.signMessage = (params) =>
+    hung
+      ? new Promise((resolve, reject) => {
+          release = () => sign(params).then(resolve, reject);
+        })
+      : sign(params);
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  await user.click(await postReady());
+  expect(testId("post-progress")).toContain("Signing in to Tender");
+  // Not at once: a wallet takes a while.
+  expect(screen.queryByRole("button", { name: "Stop waiting" })).toBeNull();
+  await user.click(await screen.findByRole("button", { name: "Stop waiting" }));
+
+  // Nothing is on the chain, so Post is open again, and the words say so.
+  expect(testId("post-failure")).toBe(
+    "You stopped waiting for your wallet. Nothing was posted. Press Post to try again.",
+  );
+  expect(screen.queryByTestId("post-progress")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Stop waiting" })).toBeNull();
+  expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Post it" }));
+  expect(off(postButton())).toBe(false);
+
+  // The wallet signs after all. The post that was given up on asks it for nothing more.
+  release();
+  await settle();
+  expect(api.blobs).toHaveLength(0);
+  expect(wallet.sent).toHaveLength(0);
+  expect(testId("post-failure")).toContain("You stopped waiting");
+
+  // A new press posts as it would have.
+  hung = false;
+  await user.click(postButton());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+  expect(chain.tasks.size).toBe(1);
+  expect(wallet.sent).toHaveLength(1);
+});
+
+test("a_post_given_up_on_that_ends_late_does_not_end_the_one_that_came_after_it", async () => {
+  const { user, wallet } = setup({ vault: TUSDC(5) });
+  const send = wallet.signAndSendTransactions.bind(wallet);
+  const releases: Array<() => void> = [];
+  wallet.signAndSendTransactions = (params) =>
+    new Promise((resolve, reject) => {
+      releases.push(() => send(params).then(resolve, reject));
+    });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+  await user.click(await postReady());
+  await user.click(await screen.findByRole("button", { name: "Stop waiting" }));
+  // The person looks, finds nothing, unlocks Post and presses it: a second post waits on the wallet.
+  await user.click(screen.getByRole("button", { name: "Unlock Post" }));
+  await user.click(await postReady());
+  await waitFor(() => expect(releases).toHaveLength(2), LONG);
+
+  // The first wallet answers while the second post waits on the second: the second is still under
+  // way, and a press on Post still does nothing.
+  releases[0]?.();
+  await settle();
+  expect(testId("post-progress")).toContain("Waiting for your wallet");
+  expect(off(postButton())).toBe(true);
+});
+
+test("a_wallet_that_never_answers_the_transactions_is_given_up_on_and_post_is_locked_until_looked_at", async () => {
+  const { user, wallet, api, chain } = setup({ vault: TUSDC(5) });
+  const send = wallet.signAndSendTransactions.bind(wallet);
+  let release: () => void = () => {};
+  wallet.signAndSendTransactions = (params) =>
+    new Promise((resolve, reject) => {
+      release = () => send(params).then(resolve, reject);
+    });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+  await user.click(await postReady());
+  expect(await screen.findByTestId("post-progress")).toBeDefined();
+  await waitFor(() => expect(testId("post-progress")).toContain("Waiting for your wallet"), LONG);
+
+  await user.click(await screen.findByRole("button", { name: "Stop waiting" }));
+
+  // The transactions may yet be sent, so it is the lock of any send of unknown outcome.
+  expect(screen.getByTestId("post-unknown")).toBeDefined();
+  expect(screen.queryByTestId("post-failure")).toBeNull();
+  expect(screen.queryByTestId("post-progress")).toBeNull();
+  expect(off(postButton())).toBe(true);
+  expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Post it" }));
+
+  // They are sent, late. What the post would have said is not heard: the lock stays, and the page
+  // does not move on by itself.
+  release();
+  await settle();
+  expect(chain.tasks.size).toBe(1);
+  expect(screen.getByTestId("post-unknown")).toBeDefined();
+  expect(screen.queryByTestId("post-done")).toBeNull();
+  expect(router.push).not.toHaveBeenCalled();
+
+  // The person looks and unlocks. The chain has the task, so it is the result: nothing is sent.
+  const uploads = api.blobs.length;
+  await user.click(screen.getByRole("button", { name: "Unlock Post" }));
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+  expect(wallet.sent).toHaveLength(1);
+  expect(chain.tasks.size).toBe(1);
+  expect(api.blobs).toHaveLength(uploads);
+});
+
+test("there_is_nothing_to_stop_waiting_for_while_the_documents_are_saved", async () => {
+  const { user } = setup({ vault: TUSDC(5) });
+  const inner = globalThis.fetch;
+  // The API takes the brief and never answers.
+  vi.stubGlobal("fetch", (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+    String(input).endsWith("/v1/blobs") ? new Promise<Response>(() => {}) : inner(input, init),
+  );
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+  await user.click(await postReady());
+  await waitFor(() => expect(testId("post-progress")).toContain("Saving your task's documents"));
+
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  });
+  expect(testId("post-progress")).toContain("Saving your task's documents");
+  expect(screen.queryByRole("button", { name: "Stop waiting" })).toBeNull();
 });
 
 test("a_result_the_wallet_cannot_be_read_for_locks_post_and_a_second_press_does_nothing", async () => {
@@ -918,15 +1406,17 @@ test("a_deposit_tender_could_not_take_is_worded_as_that_and_the_next_press_tops_
 
   await user.click(postButton());
 
-  // The post failed for the vault. The words say what the vault holds and where the deposit went,
-  // and not that the funds are in the vault.
+  // The post failed for the vault. The words say what the vault holds, and that the deposit, if it
+  // is not there, went back: one read can't say where it is, so they don't say it as a fact.
   const failure = await screen.findByTestId("post-failure");
   expect(failure.textContent).toBe(
-    "The reward wasn't in your vault. Your vault holds 0.00 tUSDC now, and a deposit Tender couldn't take went back to your wallet. Press Post to try again.",
+    "The reward wasn't in your vault. Your vault holds 0.00 tUSDC. If the deposit isn't there, it went back to your wallet. Press Post to try again.",
   );
   expect(chain.view(TOKEN, "ft_balance_of", { account_id: ALICE })).toBe(String(TUSDC(20)));
   expect(chain.tasks.size).toBe(0);
-  expect(off(postButton())).toBe(false);
+  // Review read the balances again after the failure, and now shows the storage the next press adds.
+  await waitFor(() => expect(testId("review-storage")).toContain("Adds"), LONG);
+  await postReady();
 
   // The next press reads the storage again, adds the 1,700 bytes that are missing, and posts.
   await user.click(postButton());
@@ -1012,9 +1502,37 @@ test("a_send_that_reports_no_new_task_does_not_redirect_and_cannot_be_pressed_ag
 
   const sent = await screen.findByTestId("post-sent");
   expect(sent.textContent).toContain("It may well be posted");
-  expect(within(sent).getByRole("link", { name: "Tasks" }).getAttribute("href")).toBe("/");
+  // The Tasks page opens in a tab of its own, as it does for an unknown outcome, so that the form
+  // on this page is not lost; and the transactions the wallet sent are shown, to look up.
+  const link = within(sent).getByRole("link", { name: "Tasks" });
+  expect(link.getAttribute("href")).toBe("/tasks");
+  expect(link.getAttribute("target")).toBe("_blank");
+  // The vault holds the reward, so the batch was one transaction: the post.
+  expect(
+    within(sent)
+      .getAllByTestId("post-sent-hash")
+      .map((hash) => hash.textContent),
+  ).toEqual(["tx1"]);
   expect(router.push).not.toHaveBeenCalled();
   expect(off(postButton())).toBe(true);
+});
+
+test("a_result_with_no_hashes_shows_none", async () => {
+  const { user, wallet } = setup({ vault: TUSDC(5) });
+  const send = wallet.signAndSendTransactions.bind(wallet);
+  wallet.signAndSendTransactions = async (params) => {
+    await send(params);
+    return "not an outcome" as never;
+  };
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  await user.click(await postReady());
+
+  // The wallet could not say how it went: there is nothing to show, and nothing is made up.
+  const sent = await screen.findByTestId("post-sent");
+  expect(within(sent).queryByTestId("post-sent-hash")).toBeNull();
+  expect(within(sent).getByRole("link", { name: "Tasks" }).getAttribute("target")).toBe("_blank");
 });
 
 // ---- The steps ----------------------------------------------------------------------------------
@@ -1153,7 +1671,7 @@ test.each([
     kept: ["Held-out: should match", "Held-out: should not match"],
   },
 ])(
-  "the_checks_step_splits_what_agents_see_from_what_the_judge_keeps_for_$name",
+  "the_checks_step_splits_what_agents_see_from_what_is_kept_secret_for_$name",
   async ({ kind, seen, kept }) => {
     const { user } = setup();
     render(<PostWizard judgeAccount={JUDGE} />);
@@ -1164,9 +1682,7 @@ test.each([
     const left = screen.getByTestId("split-public");
     const right = screen.getByTestId("split-heldout");
     expect(within(left).getByRole("heading", { name: "What agents see" })).toBeDefined();
-    expect(
-      within(right).getByRole("heading", { name: "What the Judge keeps until payout" }),
-    ).toBeDefined();
+    expect(within(right).getByRole("heading", { name: "Kept secret until payout" })).toBeDefined();
     for (const label of seen) {
       expect(within(left).getByLabelText(label), label).toBeDefined();
       expect(within(right).queryByLabelText(label), label).toBeNull();
@@ -1341,6 +1857,30 @@ test("twenty_one_points_is_one_too_many_and_is_said_when_the_twenty_first_is_add
   await screen.findByLabelText("Amount (tUSDC)");
 });
 
+test("a_rubric_pass_mark_of_zero_is_said_on_the_page_and_stops_next", async () => {
+  const { user } = setup({ agentIs: "team" });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toRubric(user);
+  fillPoint(0, "Says what changed");
+  const next = () => screen.getByRole("button", { name: "Next: Reward" });
+
+  // The Judge turns a rubric task with a pass mark of 0 away, after the reward is in.
+  fill("Pass mark", "0");
+  expect(testId("error-minScore")).toBe("A rubric needs a pass mark of 1 or more.");
+  expect(off(next())).toBe(true);
+  await user.click(next());
+  expect(document.activeElement).toBe(document.getElementById("post-minScore"));
+
+  fill("Pass mark", "1");
+  expect(screen.queryByTestId("error-minScore")).toBeNull();
+  expect(off(next())).toBe(false);
+
+  // Another kind may have 0.
+  await user.click(screen.getByRole("radio", { name: /Exact answer/ }));
+  fill("Pass mark", "0");
+  expect(screen.queryByTestId("error-minScore")).toBeNull();
+});
+
 test("a_rubric_is_dropped_when_the_account_stops_being_the_teams", async () => {
   const { user } = setup({ agentIs: "team" });
   render(<PostWizard judgeAccount={JUDGE} />);
@@ -1446,13 +1986,44 @@ test("the_reward_step_names_each_group_once_and_puts_the_token_in_the_amounts_he
   expect(screen.getAllByText(/Paid in/)).toHaveLength(1);
 });
 
+test("the_fee_is_said_on_review_and_not_on_the_reward_step", async () => {
+  const { user } = setup();
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReward(user);
+
+  // The amount's help says what the amount can be; what Tender keeps is told once, on Review.
+  expect(document.body.textContent).not.toContain("Tender keeps");
+  fill("Amount (tUSDC)", "5");
+  await press(user, "Review");
+  await stepHeading("Review");
+  expect(testId("review-reward")).toBe("5.00 tUSDC · Tender keeps 5% when it is paid out.");
+  expect(document.body.textContent?.match(/Tender keeps/g)).toHaveLength(1);
+});
+
+test("the_balances_are_being_read_in_the_same_words_on_every_line_of_review", async () => {
+  const { user } = setup({ vault: TUSDC(2) });
+  const inner = globalThis.fetch;
+  // The node does not answer for the balances: the read is under way for as long as the test looks.
+  vi.stubGlobal("fetch", (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+    String(init?.body).includes('"balances_of"')
+      ? new Promise<Response>(() => {})
+      : inner(input, init),
+  );
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  // The funding row and the line under Post say it alike, and as the Wallet page says it.
+  await waitFor(() => expect(testId("review-funding")).toBe("Reading your balances…"), LONG);
+  expect(screen.getByRole("status").textContent).toBe("Reading your balances…");
+});
+
 // ---- Source rules -------------------------------------------------------------------------------
 
 test("the_post_files_keep_no_drafts_never_clear_the_token_and_log_only_errors", () => {
   const web = join(import.meta.dirname, "..");
   const files = [
     ...readdirSync(join(web, "components/post")).map((name) => `components/post/${name}`),
-    "app/post/page.tsx",
+    "app/(app)/post/page.tsx",
     "lib/post.ts",
     "lib/postSubmit.ts",
   ];

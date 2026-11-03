@@ -1,4 +1,4 @@
-import { TaskView } from "../../../components/TaskView";
+import { TaskView } from "../../../../components/TaskView";
 
 // The page itself only reads the address. The task is loaded in the browser (components/TaskView),
 // from the API, as the board is, so that the page can ask again when the event stream says

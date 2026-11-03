@@ -1,7 +1,6 @@
 "use client";
 
 import { tokenMeta } from "@tender/shared";
-import { formatBps } from "../../lib/bps";
 import { config } from "../../lib/config";
 import {
   DURATION_UNITS,
@@ -15,6 +14,7 @@ import {
   spanText,
   tokenOf,
   totalSecs,
+  VERIFIER_PICKS_WITH_MCP,
   type Verifier,
   WINDOW_NAMES,
   WINDOW_TEXT,
@@ -166,9 +166,8 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
                 {limits.tokens.length > 1 ? "" : `Paid in ${chosen.token}. `}
                 {`At least ${describeAmount(chosen.minReward, chosen.token)}`}
                 {chosen.maxReward < NO_REAL_LIMIT
-                  ? `, at most ${describeAmount(chosen.maxReward, chosen.token)}`
-                  : ""}
-                {`. Tender keeps ${formatBps(limits.feeBps)} of it when it is paid out.`}
+                  ? `, at most ${describeAmount(chosen.maxReward, chosen.token)}.`
+                  : "."}
               </>
             }
             inputMode="decimal"
@@ -223,6 +222,11 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
             <TextField label="Their NEAR account" mono {...bindText(props, "otherVerifier")} />
           ) : null}
         </RadioGroup>
+        {form.verifier === "judge" ? null : (
+          <p data-testid="verifier-picks-with-mcp" className="text-sm">
+            {VERIFIER_PICKS_WITH_MCP}
+          </p>
+        )}
         {form.kind === "rubric" && form.verifier === "judge" ? (
           <div className="grid gap-1 text-sm font-medium">
             <p data-testid="rubric-judge-note">{RUBRIC_JUDGE_NOTE}</p>

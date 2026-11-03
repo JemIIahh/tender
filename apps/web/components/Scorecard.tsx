@@ -1,9 +1,9 @@
-import { canonicalJson, type Scorecard as ScorecardDocument } from "@tender/shared";
+import { canonicalJson, isJudgeBranded, type Scorecard as ScorecardDocument } from "@tender/shared";
 import { useMemo } from "react";
 import { formatBps } from "../lib/bps";
 
 /**
- * The held-out document as a download: the same bytes that were hashed into the commitment, which
+ * The held-out checks as a download: the same bytes that were hashed into the commitment, which
  * are its canonical JSON. A reader runs `shasum -a 256` on the file and compares.
  *
  * Undefined for a document that cannot be written that way. The verifier wrote it, and JSON can
@@ -15,14 +15,42 @@ function heldoutHref(heldout: unknown): string | undefined {
     const text = new TextDecoder().decode(canonicalJson(heldout));
     return `data:application/json;charset=utf-8,${encodeURIComponent(text)}`;
   } catch (error) {
-    console.error("scorecard: the held-out document cannot be written as canonical JSON", error);
+    console.error("scorecard: the held-out checks cannot be written as canonical JSON", error);
     return undefined;
   }
 }
 
 /**
+ * Who scored it, in a line. A scorecard whose `judge.software` carries the Judge's name is the
+ * Tender Judge's: the API takes such a card from the Judge's account only (P03-R29), and a build
+ * that knows the Judge's account holds the card to that too. Any other is named by what it says it
+ * is. A rubric is scored by a model, which is a judgement and not a check, so it is said to be
+ * subjective (spec 7.3) and the model is named.
+ */
+export function ScoredBy({
+  scorecard,
+  judgeAccount,
+}: {
+  scorecard: ScorecardDocument;
+  judgeAccount: string | null;
+}) {
+  const { software, model } = scorecard.judge;
+  const byJudge =
+    isJudgeBranded(software) && (judgeAccount === null || scorecard.verifier === judgeAccount);
+  const who = byJudge ? "the Tender Judge" : software;
+  const rubric = scorecard.kind === "rubric";
+  return (
+    <p data-testid="scored-by" className="text-sm wrap-anywhere">
+      {`Scored by ${who}`}
+      {rubric && model !== null ? ` with ${model}` : ""}
+      {rubric ? ". Subjective: a model's judgement." : "."}
+    </p>
+  );
+}
+
+/**
  * The result of a pick: how each revealed entry scored and why, who won, and what a reader needs to
- * check the scores against the task's held-out document.
+ * check the scores against the task's held-out checks.
  *
  * `commitment` is the task's own `heldout_commitment` from the chain, which the verifier does not
  * choose. The scorecard carries one too, and a scorecard whose commitment differs from the task's
@@ -33,9 +61,12 @@ function heldoutHref(heldout: unknown): string | undefined {
 export function Scorecard({
   scorecard,
   commitment,
+  judgeAccount = null,
 }: {
   scorecard: ScorecardDocument;
   commitment?: string | null;
+  /** The Tender Judge's account, if this build knows it. */
+  judgeAccount?: string | null;
 }) {
   const expected = commitment === undefined ? scorecard.heldout_commitment : commitment;
   const claimed = scorecard.heldout_commitment;
@@ -46,6 +77,7 @@ export function Scorecard({
   return (
     <section data-testid="scorecard" className="grid gap-4">
       <h2 className="text-lg font-semibold">Scorecard</h2>
+      <ScoredBy scorecard={scorecard} judgeAccount={judgeAccount} />
 
       {scorecard.entries.length === 0 ? (
         <p className="text-sm">No entry was scored.</p>
@@ -126,19 +158,19 @@ export function Scorecard({
 
       <div className="grid gap-1 text-sm">
         {expected === null ? (
-          <p>This task has no held-out document.</p>
+          <p>This task has no held-out checks.</p>
         ) : (
           <>
             <p data-testid="recompute" className="font-mono wrap-anywhere">
               {`Recompute: sha256(held-out) must equal ${expected}`}
             </p>
             {scorecard.heldout === null ? (
-              <p>The verifier has not published the held-out document.</p>
+              <p>The verifier has not published the held-out checks.</p>
             ) : href === undefined ? (
-              <p>The held-out document cannot be written out as a file.</p>
+              <p>The held-out checks cannot be written out as a file.</p>
             ) : (
               <a href={href} download="heldout.json" className="w-fit underline">
-                Held-out document (JSON)
+                Held-out checks (JSON)
               </a>
             )}
           </>

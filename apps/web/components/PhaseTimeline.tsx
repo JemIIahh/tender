@@ -46,7 +46,7 @@ function liveStatus(live: Phase, window: Segment | undefined, nowNs: bigint): Re
     case "revealing":
       return closes("Reveal window");
     case "judging":
-      return closes("Verifier's window");
+      return closes("Judging window");
     case "fallback":
       return closes("Poster's fallback window");
     case "expired":

@@ -4,6 +4,7 @@ import {
   BriefSchema,
   ConfigViewSchema,
   canonicalJson,
+  criterionKey,
   depositCall,
   HeldoutSchema,
   heldoutMatchesCriteria,
@@ -12,6 +13,12 @@ import {
   type PublicCriteria,
   PublicCriteriaSchema,
   postTaskCall,
+  RUBRIC_MAX_CRITERIA,
+  RUBRIC_MAX_CRITERION_CHARS,
+  RUBRIC_MAX_ENTRIES,
+  RUBRIC_MIN_SCORE,
+  type RubricProblem,
+  rubricCriteriaProblem,
   sha256Hex,
   storageDepositCall,
   storageShortfall,
@@ -222,7 +229,7 @@ export const PRESET_WINDOWS: Record<"quick" | "day", Windows> = {
 export const WINDOW_TEXT: Record<WindowName, { label: string; detail: string }> = {
   commit: { label: "Commit", detail: "Agents enter with a sealed answer." },
   reveal: { label: "Reveal", detail: "Agents show what they entered." },
-  pick: { label: "Judge", detail: "The verifier picks the winner." },
+  pick: { label: "Judging", detail: "The verifier picks the winner." },
   fallback: { label: "Fallback", detail: "If the verifier doesn't, you can." },
 };
 
@@ -404,29 +411,32 @@ export function regexCaution(form: PostForm): string | null {
 }
 
 // What the Judge takes of a rubric. It turns a rubric task down at intake when a model could not
-// grade its points (`rubricProblem` in packages/judge/src/kinds/rubric.ts), and that is after the
-// task is posted and its reward is in, so the Checks step holds the points to the same rules and a
-// problem shows where it can be put right. The Judge is a server package that this app does not
-// import: these are copies of its rules, and the two have to be kept in step.
-
-/** The most points a rubric may have (`RUBRIC_MAX_CRITERIA`). */
-export const RUBRIC_MAX_POINTS = 20;
-/** The most characters, counted in code points, that a point may have (`RUBRIC_MAX_CRITERION_CHARS`). */
-export const RUBRIC_MAX_POINT_CHARS = 200;
-/**
- * Every character that is an angle bracket or folds to one under Unicode normalisation: `<` and
- * `>`, the fullwidth and the small forms of each, the two with a bar through them, and the invisible
- * tag forms of the two that some models read as brackets (`ANGLE_BRACKET`). A point may hold none.
- */
-const ANGLE_BRACKET = /[<>\u{FF1C}\u{FF1E}\u{FE64}\u{FE65}\u{226E}\u{226F}\u{E003C}\u{E003E}]/u;
+// grade its points, and that is after the task is posted and its reward is in, so the Checks step
+// holds the points to the same rules and a problem shows where it can be put right. The rules are
+// the ones in `@tender/shared` (rubric.ts), which the Judge reads too: this file has no copy, only
+// the words for each problem.
 
 /**
- * What a point is known by when two are compared (`criterionKey`): the text in NFKC, spaces
- * collapsed to one and trimmed, in lower case. Two points with the same key read the same to the
- * model, which has to tell them apart. A key of "" is a blank point.
+ * The words for each rule a rubric task can break, for the problem the shared rules name. Keyed by
+ * every code, so that a rule added there is a type error here until it has words.
  */
-export function pointKey(point: string): string {
-  return point.normalize("NFKC").replace(/\s+/gu, " ").trim().toLowerCase();
+export const RUBRIC_WORDS: Record<RubricProblem, string> = {
+  too_many_criteria: `Use at most ${RUBRIC_MAX_CRITERIA} points.`,
+  criterion_blank: "Say what to look for.",
+  criterion_too_long: `Use ${RUBRIC_MAX_CRITERION_CHARS} characters or fewer.`,
+  criterion_bracket: "Leave out angle brackets, like < and >.",
+  criteria_collide: "Two points say the same thing.",
+  min_score: `A rubric needs a pass mark of ${RUBRIC_MIN_SCORE} or more.`,
+  entries: `A rubric task is open to anyone, or invite-only with 1 to ${RUBRIC_MAX_ENTRIES} entries.`,
+};
+
+/**
+ * What is wrong with one point of a rubric, by the rules of `@tender/shared`, or null: blank, too
+ * long or with a bracket, in the order the Judge names them. A point is judged by itself here; the
+ * count and a point that repeats an earlier one are the form's.
+ */
+function pointProblem(point: string): RubricProblem | null {
+  return rubricCriteriaProblem({ min_score: RUBRIC_MIN_SCORE, rubric: [{ criterion: point }] });
 }
 
 export function checkChecks(form: PostForm, options: { canRubric: boolean }): Errors {
@@ -440,9 +450,15 @@ export function checkChecks(form: PostForm, options: { canRubric: boolean }): Er
     errors.kind = `${label} needs the answer format "${wanted}". Change it on the Brief step.`;
   }
 
+  // A rubric's pass mark is at least `RUBRIC_MIN_SCORE`: the Judge scores an entry it disqualifies
+  // 0, and with a pass mark of 0 that entry would pass. The other kinds may have 0.
   const mark = form.minScore.trim();
+  const lowest = form.kind === "rubric" ? RUBRIC_MIN_SCORE : 0;
   if (!/^[0-9]{1,3}$/.test(mark) || Number(mark) > 100) {
-    errors.minScore = "Use a whole number from 0 to 100.";
+    errors.minScore = `Use a whole number from ${lowest} to 100.`;
+  } else if (form.kind === "rubric") {
+    const problem = rubricCriteriaProblem({ min_score: Number(mark), rubric: [] });
+    if (problem === "min_score") errors.minScore = RUBRIC_WORDS.min_score;
   }
 
   switch (form.kind) {
@@ -500,26 +516,22 @@ export function checkChecks(form: PostForm, options: { canRubric: boolean }): Er
     case "rubric": {
       const rows = filledRubric(form);
       if (rows.length === 0) errors.rubric = "Add at least one point to score.";
-      else if (rows.length > RUBRIC_MAX_POINTS) {
-        errors.rubric = `Use at most ${RUBRIC_MAX_POINTS} points.`;
-      }
+      else if (rows.length > RUBRIC_MAX_CRITERIA) errors.rubric = RUBRIC_WORDS.too_many_criteria;
       // Where the first point with each key is, so that a later one that repeats it says which.
       const firstWith = new Map<string, number>();
       for (const row of rows) {
         const at = form.rubric.indexOf(row);
         const point = row.criterion.trim();
-        const key = pointKey(point);
-        const length = Array.from(point).length;
+        const key = criterionKey(point);
         const first = firstWith.get(key);
         if (key !== "" && first === undefined) firstWith.set(key, at);
         // One problem to a point, the one the Judge names first.
-        if (key === "") {
-          errors[`rubric-${at}-criterion`] = "Say what to look for.";
-        } else if (length > RUBRIC_MAX_POINT_CHARS) {
+        const problem = pointProblem(point);
+        if (problem !== null) {
           errors[`rubric-${at}-criterion`] =
-            `Use ${RUBRIC_MAX_POINT_CHARS} characters or fewer. This has ${length}.`;
-        } else if (ANGLE_BRACKET.test(point)) {
-          errors[`rubric-${at}-criterion`] = "Leave out angle brackets, like < and >.";
+            problem === "criterion_too_long"
+              ? `${RUBRIC_WORDS[problem]} This has ${Array.from(point).length}.`
+              : RUBRIC_WORDS[problem];
         } else if (first !== undefined) {
           errors[`rubric-${at}-criterion`] = `This says the same as point ${first + 1}.`;
         }
@@ -637,12 +649,20 @@ export function totalSecs(windows: Windows): number {
   return WINDOW_NAMES.reduce((sum, name) => sum + windows[name], 0);
 }
 
-/** `Commit 10m · Reveal 5m · Judge 10m · Fallback 10m`. */
+/** `Commit 10m · Reveal 5m · Judging 10m · Fallback 10m`. */
 export function windowsText(windows: Windows): string {
   return WINDOW_NAMES.map((name) => `${WINDOW_TEXT[name].label} ${spanText(windows[name])}`).join(
     " · ",
   );
 }
+
+/**
+ * What a poster who picks, or names another account to pick, should know: this site has no button
+ * to pick a winner. Whoever is the verifier picks with Tender's MCP tools (`pick_winners`), and
+ * publishes the scorecard, with the held-out checks, there.
+ */
+export const VERIFIER_PICKS_WITH_MCP =
+  "Whoever picks does it with Tender's MCP tools (pick_winners). This site can't pick winners.";
 
 /**
  * The note on the rubric and the Judge: how the Judge scores a rubric task (plan 05, task 5), and
@@ -652,15 +672,12 @@ export const RUBRIC_JUDGE_NOTE =
   "The Tender Judge scores rubric tasks with an AI model. Scores are subjective.";
 
 /**
- * The most entries the Judge scores for a rubric task, the first ones in the order they were
- * committed: the rule plan 05's fix wave sets for an open task, which has no entry limit of its own
- * and is what the wizard posts. The number is `RUBRIC_MAX_ENTRIES` in
- * packages/judge/src/kinds/rubric.ts. A poster is told of it where the Judge is chosen.
+ * The line under the note: what happens to the entries after the first ones. The Judge scores the
+ * first `RUBRIC_MAX_ENTRIES` entries of a rubric task in the order they were committed (P05-R21).
+ * An open task has no entry limit of its own, and is what the wizard posts: it sends `max_entries`
+ * 0 and no invites, which `rubricEntriesProblem` accepts.
  */
-export const RUBRIC_JUDGE_MAX_ENTRIES = 50;
-
-/** The line under the note: what happens to the entries after the first ones. */
-export const RUBRIC_JUDGE_LIMIT = `The Judge scores the first ${RUBRIC_JUDGE_MAX_ENTRIES} entries.`;
+export const RUBRIC_JUDGE_LIMIT = `The Judge scores the first ${RUBRIC_MAX_ENTRIES} entries.`;
 
 export function checkReward(
   form: PostForm,
@@ -888,6 +905,12 @@ function checkedCriteria(form: PostForm): Checked<PublicCriteria> {
   if (!parsed.success) {
     throw new DocumentError(`The public checks do not fit: ${fault(parsed.error)}.`);
   }
+  // The last check, by the rules the Judge turns a rubric task down by at intake, so that a step
+  // that drifts from them cannot send what the Judge will refuse once the reward is in.
+  if (parsed.data.kind === "rubric") {
+    const problem = rubricCriteriaProblem(parsed.data);
+    if (problem !== null) throw new DocumentError(RUBRIC_WORDS[problem]);
+  }
   return { data: parsed.data, bytes: bytesOf(parsed.data, "criteria") };
 }
 
@@ -941,6 +964,47 @@ export function buildDocuments(form: PostForm): PostDocuments {
 
 const HASH = /^[0-9a-f]{64}$/;
 
+/**
+ * Whether the Judge is the one who will pick the winner of the task `form` makes, if `poster`
+ * (null: not known yet) posts it: the verifier is the Judge's account (chosen as the Judge, or
+ * typed in as another account). Only then does the Judge need the held-out checks, so only then
+ * are they sent to the API; for any other verifier they stay on the poster's page and in the file
+ * Review offers.
+ */
+export function judgeVerifies(
+  form: PostForm,
+  judgeAccount: string | null,
+  poster: string | null,
+): boolean {
+  if (judgeAccount === null) return false;
+  const verifier = form.verifier === "me" ? poster : verifierAccountOf(form, judgeAccount);
+  return verifier === judgeAccount;
+}
+
+/** The verifier's account as the form names it, or null if it names none yet. */
+function verifierAccountOf(form: PostForm, judgeAccount: string | null): string | null {
+  try {
+    return verifierOf(form, judgeAccount) ?? null;
+  } catch (error) {
+    if (error instanceof RangeError) return null;
+    throw error;
+  }
+}
+
+/**
+ * The held-out checks of the form as the file they are committed as: the same canonical JSON bytes
+ * whose SHA-256 is the commitment on chain, which the verifier publishes with the scorecard so that
+ * anyone can recompute it. Null if the form has none, or its documents cannot be made yet.
+ */
+export function heldoutFile(form: PostForm): Uint8Array | null {
+  try {
+    return buildDocuments(form).heldout;
+  } catch (error) {
+    if (error instanceof DocumentError) return null;
+    throw error;
+  }
+}
+
 /** The account that verifies, or undefined when the poster does. Throws for one that can't be. */
 function verifierOf(form: PostForm, judgeAccount: string | null): string | undefined {
   if (form.verifier === "me") return undefined;
@@ -955,11 +1019,18 @@ function verifierOf(form: PostForm, judgeAccount: string | null): string | undef
  * The NEAR, in yoctoNEAR, that a `storage_deposit` has to add so that `storage` pays for a post, and
  * for the vault slot of the token as well if the post `opensSlot`; 0 if it already does. Only the
  * `available` of the view is read by `storageShortfall`.
+ *
+ * `storage` is null for an account that has never deposited. Its first `storage_deposit` registers
+ * it, which costs bytes of its own, so the answer is the price of both (`storageShortfall` works it
+ * out, with the 0.01 NEAR a first deposit has to be at least), and the account is set up in the
+ * same approval as the post.
  */
-export function storageTopUpFor(storage: StorageBalance, opensSlot: boolean): bigint {
+export function storageTopUpFor(storage: StorageBalance | null, opensSlot: boolean): bigint {
+  const bytes = opensSlot ? POST_TASK_BYTES + VAULT_SLOT_BYTES : POST_TASK_BYTES;
+  if (storage === null) return storageShortfall(null, bytes);
   return storageShortfall(
     { total: storage.total.toString(), available: storage.available.toString(), used_bytes: "0" },
-    opensSlot ? POST_TASK_BYTES + VAULT_SLOT_BYTES : POST_TASK_BYTES,
+    bytes,
   );
 }
 
@@ -987,10 +1058,12 @@ export function planPostCalls(o: {
   hashes: { briefHash: string; criteriaHash: string; heldoutCommitment: string | null };
   vaultBalance: bigint;
   /**
-   * The poster's storage balance with Tender, from the read that gave `vaultBalance`. Left out, no
-   * top-up is planned: for a check that only wants to know the form can be made into calls.
+   * The poster's storage balance with Tender, from the read that gave `vaultBalance`: null for an
+   * account that has never deposited, whose first `storage_deposit` registers it as well (the
+   * batch sets the account up). Left out (undefined), no top-up is planned: for a check that only
+   * wants to know the form can be made into calls.
    */
-  storage?: StorageBalance;
+  storage?: StorageBalance | null;
   contractId: string;
   tokenId: string;
   /** The Judge's account, for a form that picks the Judge as verifier. */
@@ -1051,23 +1124,20 @@ export interface Funding {
 
 /**
  * Where the `reward` of `token` comes from, given what `data` says the account holds, and whether
- * it can be posted: the account needs a storage balance with Tender, the token has to be taking
- * deposits, and the wallet has to hold what the vault lacks (when the token says what it holds).
- * The storage a post needs beyond that balance is topped up in the same batch (`planPostCalls`),
- * and `storageTopUp` says how much.
+ * it can be posted: the token has to be taking deposits, and the wallet has to hold what the vault
+ * lacks (when the token says what it holds). The storage a post needs beyond the account's balance
+ * is topped up in the same batch (`planPostCalls`), and `storageTopUp` says how much; an account
+ * that has never set up its storage is set up there too, so it is not turned away.
  */
 export function fundingOf(data: VaultData, token: string, reward: bigint): Funding {
   const row = data.rows.find((candidate) => candidate.token === token);
   const inVault = row?.vault ?? 0n;
   const toDeposit = reward > inVault ? reward - inVault : 0n;
   const inWallet = row?.wallet ?? null;
-  const storageTopUp =
-    data.storage === null ? 0n : storageTopUpFor(data.storage, opensVaultSlot(inVault));
+  const storageTopUp = storageTopUpFor(data.storage, opensVaultSlot(inVault));
 
   let problem: string | null = null;
-  if (data.storage === null) {
-    problem = "Your account isn't set up with Tender yet. Set it up on the Wallet page first.";
-  } else if (toDeposit > 0n && row?.enabled !== true) {
+  if (toDeposit > 0n && row?.enabled !== true) {
     problem = "Tender isn't taking deposits of this token right now.";
   } else if (inWallet !== null && toDeposit > inWallet) {
     problem = `You need ${describeAmount(toDeposit - inWallet, token)} more in your wallet to fund this reward.`;

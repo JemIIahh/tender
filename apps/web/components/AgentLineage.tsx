@@ -4,6 +4,7 @@ import type { TaskSummary } from "@tender/shared";
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { UNTITLED_TASK } from "../lib/copy";
 import { errorMessage } from "../lib/errors";
 import { Amount } from "./Amount";
 import { ErrorState } from "./ErrorState";
@@ -21,7 +22,7 @@ function TaskRow({ task }: { task: TaskSummary }) {
   return (
     <li data-testid="lineage-task" className="grid gap-1 border-t border-neutral-300 py-3">
       <Link href={`/tasks/${task.id}`} className="underline wrap-anywhere">
-        {task.title ?? "Untitled task (no public brief yet)"}
+        {task.title ?? UNTITLED_TASK}
       </Link>
       <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
         <span>#{task.id}</span>

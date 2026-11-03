@@ -1,10 +1,22 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   BriefSchema,
   canonicalJson,
   HeldoutSchema,
   heldoutMatchesCriteria,
   PublicCriteriaSchema,
+  REGISTRATION_BYTES_MAX,
+  RUBRIC_MAX_CRITERIA,
+  RUBRIC_MAX_CRITERION_CHARS,
+  RUBRIC_MAX_ENTRIES,
+  RUBRIC_MIN_SCORE,
+  type RubricProblem,
+  rubricCriteriaProblem,
+  rubricEntriesProblem,
+  STORAGE_MIN_DEPOSIT,
   sha256Hex,
+  storageShortfall,
 } from "@tender/shared";
 import { expect, test } from "vitest";
 import {
@@ -24,11 +36,8 @@ import {
   PRESET_WINDOWS,
   parseTags,
   planPostCalls,
-  pointKey,
   RUBRIC_JUDGE_LIMIT,
-  RUBRIC_JUDGE_MAX_ENTRIES,
-  RUBRIC_MAX_POINT_CHARS,
-  RUBRIC_MAX_POINTS,
+  RUBRIC_WORDS,
   regexCaution,
   VAULT_SLOT_BYTES,
   windowsOf,
@@ -342,12 +351,34 @@ function planWithStorage(form: PostForm, vaultBalance: bigint, free: bigint) {
 
 const methods = (calls: ReturnType<typeof planFor>) => calls.map((call) => call.methodName);
 
+/** A `pub const NAME: u64 = N;` of the contract's types.rs, read from the source and not restated. */
+function contractConstant(name: string): bigint {
+  const source = readFileSync(
+    resolve(import.meta.dirname, "../../../contract/tender/src/types.rs"),
+    "utf8",
+  );
+  const found = new RegExp(`pub const ${name}: u64 = (\\d+);`).exec(source);
+  if (found?.[1] === undefined) throw new Error(`types.rs has no u64 constant ${name}`);
+  return BigInt(found[1]);
+}
+
 test("the_bytes_a_post_sets_aside_cover_what_the_contract_charges_for_the_biggest_one_it_writes", () => {
-  // The record is 40 + 1 + 8 + Borsh(Task) bytes, and 800 are held back for the outcome. A task
-  // from the wizard has a Borsh(Task) of 738 bytes at most (the review of 06-T4 derived it from
-  // contract/tender/src/tasks.rs and types.rs). The slot of a first deposit is 200 at most.
-  expect(POST_TASK_BYTES).toBeGreaterThanOrEqual(40n + 1n + 8n + 738n + 800n);
-  expect(VAULT_SLOT_BYTES).toBe(200n);
+  // The record is 40 + 1 + 8 + Borsh(Task) bytes, and the contract holds back OUTCOME_RESERVE_BYTES
+  // for the outcome. A task from the wizard has a Borsh(Task) of 738 bytes at most (the review of
+  // 06-T4 derived it from contract/tender/src/tasks.rs and types.rs). The slot of a first deposit
+  // is VAULT_SLOT_MAX_BYTES at most. Both come from the contract's source: if it grows either, this
+  // fails, and the page's figures are the thing to raise.
+  expect(POST_TASK_BYTES).toBeGreaterThanOrEqual(
+    40n + 1n + 8n + 738n + contractConstant("OUTCOME_RESERVE_BYTES"),
+  );
+  expect(VAULT_SLOT_BYTES).toBeGreaterThanOrEqual(contractConstant("VAULT_SLOT_MAX_BYTES"));
+});
+
+test("the_contract_constants_are_read_from_the_source", () => {
+  // The reader finds what is there (today's figures), and says so when a constant is not.
+  expect(contractConstant("OUTCOME_RESERVE_BYTES")).toBeGreaterThan(0n);
+  expect(contractConstant("VAULT_SLOT_MAX_BYTES")).toBeGreaterThan(0n);
+  expect(() => contractConstant("NO_SUCH_CONSTANT")).toThrow("no u64 constant");
 });
 
 test("storage_is_topped_up_first_when_it_cannot_pay_for_the_post", () => {
@@ -420,11 +451,47 @@ test("funding_says_the_storage_the_post_will_add_by_the_same_rule", () => {
     600n * BYTE,
   );
   expect(fundingOf(data(5_000_000n, 5_000n * BYTE), TOKEN, 5_000_000n).storageTopUp).toBe(0n);
-  // An account that is not set up is turned away, and no top-up is made up for it.
-  expect(fundingOf({ storage: null, rows: [] }, TOKEN, 5_000_000n)).toMatchObject({
-    storageTopUp: 0n,
-    problem: "Your account isn't set up with Tender yet. Set it up on the Wallet page first.",
+  // An account that is not set up is not turned away: the post sets it up, and the top-up is the
+  // price of its registration and of the post and the vault slot, which is all the first deposit
+  // has to cover (it is more than the 0.01 NEAR a first deposit has to be at least).
+  const newcomer = { storage: null, rows: data(0n, 0n).rows };
+  expect(fundingOf(newcomer, TOKEN, 5_000_000n)).toMatchObject({
+    storageTopUp: (POST_TASK_BYTES + VAULT_SLOT_BYTES + REGISTRATION_BYTES_MAX) * BYTE,
+    problem: null,
   });
+  expect(fundingOf(newcomer, TOKEN, 5_000_000n).storageTopUp).toBe(
+    storageShortfall(null, POST_TASK_BYTES + VAULT_SLOT_BYTES),
+  );
+  // The other things that stand in the way still do.
+  expect(fundingOf({ storage: null, rows: [] }, TOKEN, 5_000_000n).problem).toBe(
+    "Tender isn't taking deposits of this token right now.",
+  );
+});
+
+test("an_account_that_has_never_deposited_is_registered_by_the_first_call_of_the_batch", () => {
+  const form = regexForm({ amount: "5" });
+  const docs = buildDocuments(form);
+  const plan = (vaultBalance: bigint, storage: Parameters<typeof planPostCalls>[0]["storage"]) =>
+    planPostCalls({
+      form,
+      uris: { brief: `http://api.test/v1/blobs/${docs.briefHash}` },
+      hashes: docs,
+      vaultBalance,
+      storage,
+      contractId: CONTRACT,
+      tokenId: TOKEN,
+      judgeAccount: JUDGE,
+    });
+
+  // null is "never deposited" and is planned for; undefined is "plan no top-up".
+  const newcomer = plan(0n, null);
+  expect(methods(newcomer)).toEqual(["storage_deposit", "ft_transfer_call", "post_task"]);
+  // A plain storage_deposit, for the caller, of the price of the registration and the rest. With
+  // `registration_only` the contract would credit 0.01 NEAR and send the rest back.
+  expect(newcomer[0]?.args).toEqual({});
+  expect(newcomer[0]?.deposit).toBe(storageShortfall(null, POST_TASK_BYTES + VAULT_SLOT_BYTES));
+  expect(newcomer[0]?.deposit).toBeGreaterThan(STORAGE_MIN_DEPOSIT);
+  expect(methods(plan(0n, undefined))).toEqual(["ft_transfer_call", "post_task"]);
 });
 
 // ---- Checks, step by step -----------------------------------------------------------------------
@@ -481,27 +548,34 @@ const rubricOf = (...points: string[]): PostForm =>
 const numbered = (count: number): string[] => Array.from({ length: count }, (_, i) => `point ${i}`);
 const rubricChecks = (form: PostForm) => checkChecks(form, { canRubric: true });
 
-const TOO_MANY = "Use at most 20 points.";
+// The limits are the shared module's, and the cases are written from them: the step has no number
+// of its own to agree with.
+const MAX_POINTS = RUBRIC_MAX_CRITERIA;
+const MAX_CHARS = RUBRIC_MAX_CRITERION_CHARS;
+const TOO_MANY = `Use at most ${MAX_POINTS} points.`;
 const BLANK = "Say what to look for.";
 const BRACKET = "Leave out angle brackets, like < and >.";
-const tooLong = (count: number) => `Use 200 characters or fewer. This has ${count}.`;
+const tooLong = (count: number) => `Use ${MAX_CHARS} characters or fewer. This has ${count}.`;
 const sameAs = (place: number) => `This says the same as point ${place}.`;
 
-test("the_rubric_limits_are_the_judges", () => {
-  expect(RUBRIC_MAX_POINTS).toBe(20);
-  expect(RUBRIC_MAX_POINT_CHARS).toBe(200);
-});
-
 test.each([
-  ["twenty_points", rubricOf(...numbered(20)), {}],
-  ["twenty_one_points", rubricOf(...numbered(21)), { rubric: TOO_MANY }],
-  ["200_characters", rubricOf("x".repeat(200)), {}],
-  ["201_characters", rubricOf("x".repeat(201)), { "rubric-0-criterion": tooLong(201) }],
+  ["all_the_points_allowed", rubricOf(...numbered(MAX_POINTS)), {}],
+  ["one_point_too_many", rubricOf(...numbered(MAX_POINTS + 1)), { rubric: TOO_MANY }],
+  ["all_the_characters_allowed", rubricOf("x".repeat(MAX_CHARS)), {}],
+  [
+    "one_character_too_many",
+    rubricOf("x".repeat(MAX_CHARS + 1)),
+    { "rubric-0-criterion": tooLong(MAX_CHARS + 1) },
+  ],
   // Characters are counted as code points, as the Judge counts them: 200 emoji are 400 UTF-16 units.
-  ["200_emoji", rubricOf("\u{1F600}".repeat(200)), {}],
-  ["201_emoji", rubricOf("\u{1F600}".repeat(201)), { "rubric-0-criterion": tooLong(201) }],
+  ["all_the_emoji_allowed", rubricOf("\u{1F600}".repeat(MAX_CHARS)), {}],
+  [
+    "one_emoji_too_many",
+    rubricOf("\u{1F600}".repeat(MAX_CHARS + 1)),
+    { "rubric-0-criterion": tooLong(MAX_CHARS + 1) },
+  ],
   // The point is counted as it is posted, trimmed.
-  ["200_characters_and_spaces", rubricOf(`  ${"x".repeat(200)}  `), {}],
+  ["all_the_characters_and_spaces", rubricOf(`  ${"x".repeat(MAX_CHARS)}  `), {}],
   ["spaces_and_a_weight", rubricOf("clear", "  \t "), { "rubric-1-criterion": BLANK }],
   ["an_ideographic_space", rubricOf("clear", "\u{3000}"), { "rubric-1-criterion": BLANK }],
   // A prefix, letters that only look alike and a word that is only close are other points.
@@ -563,17 +637,17 @@ test("a_repeat_says_which_point_it_repeats_by_its_place_in_the_list", () => {
 
 test("a_point_with_several_problems_names_one_in_the_order_the_judge_does", () => {
   // A blank point, then a long one, then a bracket, then a repeat: the first that is broken.
-  const long = "x".repeat(201);
+  const long = "x".repeat(MAX_CHARS + 1);
   expect(rubricChecks(rubricOf(long, long))).toEqual({
-    "rubric-0-criterion": tooLong(201),
-    "rubric-1-criterion": tooLong(201),
+    "rubric-0-criterion": tooLong(MAX_CHARS + 1),
+    "rubric-1-criterion": tooLong(MAX_CHARS + 1),
   });
   expect(rubricChecks(rubricOf("a<b", "a<b"))).toEqual({
     "rubric-0-criterion": BRACKET,
     "rubric-1-criterion": BRACKET,
   });
   // The count is named as well as the points that have a problem.
-  expect(rubricChecks(rubricOf(...numbered(20), "POINT 0"))).toEqual({
+  expect(rubricChecks(rubricOf(...numbered(MAX_POINTS), "POINT 0"))).toEqual({
     rubric: TOO_MANY,
     "rubric-20-criterion": sameAs(1),
   });
@@ -585,19 +659,72 @@ test("a_point_with_several_problems_names_one_in_the_order_the_judge_does", () =
   });
 });
 
-test("point_keys_fold_case_width_and_space_as_the_judges_do", () => {
-  expect(pointKey("  Clear\tand \n CONCISE ")).toBe("clear and concise");
-  expect(pointKey("\u{FF23}lear")).toBe("clear");
-  expect(pointKey("\u{FB01}ne")).toBe("fine");
-  expect(pointKey("a\u{00A0}\u{2003}b")).toBe("a b");
-  expect(pointKey(" \t\n ")).toBe("");
-  expect(pointKey("cl\u{0435}ar")).not.toBe(pointKey("clear"));
-  expect(pointKey("accurate!")).not.toBe(pointKey("accurate"));
+test("a_rubric_needs_a_pass_mark_of_at_least_the_shared_minimum", () => {
+  const MIN = String(RUBRIC_MIN_SCORE);
+
+  // Below it, the Judge turns the task down at intake, after the reward is in (P05-R20).
+  expect(rubricChecks(rubricForm({ minScore: "0" })).minScore).toBe(RUBRIC_WORDS.min_score);
+  expect(RUBRIC_WORDS.min_score).toBe(`A rubric needs a pass mark of ${MIN} or more.`);
+  expect(rubricChecks(rubricForm({ minScore: MIN }))).toEqual({});
+  expect(rubricChecks(rubricForm({ minScore: "100" }))).toEqual({});
+  // A mark that is no mark at all says where the range begins for this kind.
+  for (const mark of ["", "101", "-1", "x"]) {
+    expect(rubricChecks(rubricForm({ minScore: mark })).minScore, mark).toBe(
+      `Use a whole number from ${MIN} to 100.`,
+    );
+  }
+  // Another kind may have 0: the Judge scores it by checks, not by a model.
+  expect(checkChecks(exactForm({ minScore: "0" }), { canRubric: true })).toEqual({});
 });
 
-test("the_judge_is_said_to_score_the_first_fifty_entries_of_a_rubric_task", () => {
-  expect(RUBRIC_JUDGE_MAX_ENTRIES).toBe(50);
-  expect(RUBRIC_JUDGE_LIMIT).toBe("The Judge scores the first 50 entries.");
+test("a_rubric_form_that_breaks_a_shared_rule_cannot_be_made_into_documents", () => {
+  // The step's own checks are the first line; the documents are checked once more by the rules of
+  // `@tender/shared` themselves, so that a step that drifts from them sends nothing the Judge turns
+  // away after the reward is in.
+  const broken: Array<[string, PostForm, RubricProblem]> = [
+    ["a pass mark of 0", rubricForm({ minScore: "0" }), "min_score"],
+    ["an angle bracket", rubricOf("a<b"), "criterion_bracket"],
+    ["two alike", rubricOf("Clear", "clear"), "criteria_collide"],
+    ["too many", rubricOf(...numbered(MAX_POINTS + 1)), "too_many_criteria"],
+    ["too long", rubricOf("x".repeat(MAX_CHARS + 1)), "criterion_too_long"],
+  ];
+  for (const [name, form, problem] of broken) {
+    expect(() => buildDocuments(form), name).toThrow(DocumentError);
+    expect(() => buildDocuments(form), name).toThrow(RUBRIC_WORDS[problem]);
+  }
+
+  // And what the step lets through, the rules let through.
+  const docs = buildDocuments(rubricForm());
+  const criteria = PublicCriteriaSchema.parse(decode(docs.criteria));
+  expect(criteria.kind === "rubric" && rubricCriteriaProblem(criteria)).toBeNull();
+});
+
+test("every_rule_a_rubric_can_break_has_words", () => {
+  for (const [problem, words] of Object.entries(RUBRIC_WORDS)) {
+    expect(words, problem).not.toBe("");
+  }
+});
+
+test("the_wizard_posts_a_rubric_task_the_way_the_shared_rules_allow", () => {
+  // An open task: no entry limit and no invites, which is all the contract allows an open task.
+  const post = planPostCalls({
+    form: rubricForm(),
+    uris: { brief: "http://api.test/v1/blobs/x" },
+    hashes: { briefHash: "a".repeat(64), criteriaHash: "b".repeat(64), heldoutCommitment: null },
+    vaultBalance: 20_000_000n,
+    contractId: CONTRACT,
+    tokenId: TOKEN,
+    judgeAccount: JUDGE,
+  }).at(-1);
+  const task = post?.args.task as { max_entries: number; invited: string[] };
+
+  expect(post?.methodName).toBe("post_task");
+  expect(rubricEntriesProblem({ max_entries: task.max_entries, invited: task.invited })).toBeNull();
+  expect(task).toMatchObject({ max_entries: 0, invited: [] });
+});
+
+test("the_judge_is_said_to_score_the_first_entries_of_a_rubric_task_as_many_as_the_shared_rule_says", () => {
+  expect(RUBRIC_JUDGE_LIMIT).toBe(`The Judge scores the first ${RUBRIC_MAX_ENTRIES} entries.`);
 });
 
 test("a_brief_is_checked_against_what_the_schema_allows", () => {

@@ -1,9 +1,16 @@
 "use client";
 
-import type { AgentDetailResponse, AgentRecentEntry, AgentSummary, Phase } from "@tender/shared";
+import {
+  AccountIdSchema,
+  type AgentDetailResponse,
+  type AgentRecentEntry,
+  type AgentSummary,
+  type Phase,
+} from "@tender/shared";
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { UNTITLED_TASK } from "../lib/copy";
 import { errorMessage } from "../lib/errors";
 import { linkHost, safeHref } from "../lib/links";
 import { AgentFacts, UNNAMED_AGENT } from "./AgentFacts";
@@ -11,6 +18,10 @@ import { AgentLineage } from "./AgentLineage";
 import { ErrorState } from "./ErrorState";
 import { PhaseChip } from "./PhaseChip";
 import { TeamBadge } from "./TeamBadge";
+
+/** The name the page has before it has the agent's: the account, if the address holds one. */
+const headingFor = (account: string): string =>
+  AccountIdSchema.safeParse(account).success ? account : "Agent";
 
 type State =
   | { status: "loading" }
@@ -76,9 +87,10 @@ function RecentEntries({ entries }: { entries: AgentDetailResponse["recent_entri
               className="grid gap-1 border-t border-neutral-300 py-3"
             >
               <Link href={`/tasks/${entry.task_id}`} className="underline wrap-anywhere">
-                {entry.title ?? `Task #${entry.task_id}`}
+                {entry.title ?? UNTITLED_TASK}
               </Link>
               <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+                <span>#{entry.task_id}</span>
                 <PhaseChip phase={entry.phase} />
                 <span data-testid="revealed">{`Revealed: ${entry.revealed ? "yes" : "no"}`}</span>
                 <span data-testid="won">{wonText(entry)}</span>
@@ -147,14 +159,19 @@ export function AgentView({ account }: { account: string }) {
     load();
   }, [load]);
 
-  switch (state.status) {
-    case "loading":
-      return <p role="status">Loading agent…</p>;
-    case "missing":
-      return <p>There is no agent with this account.</p>;
-    case "error":
-      return <ErrorState message={state.message} retrying={state.retrying} onRetry={load} />;
-    case "ready":
-      return <ReadyView detail={state.detail} />;
-  }
+  if (state.status === "ready") return <ReadyView detail={state.detail} />;
+  // The page has a heading in every state: the account, if the address holds one, until the agent's
+  // own name is known.
+  return (
+    <div className="grid gap-4">
+      <h1 className="text-2xl font-semibold wrap-anywhere">{headingFor(account)}</h1>
+      {state.status === "loading" ? (
+        <p role="status">Loading agent…</p>
+      ) : state.status === "missing" ? (
+        <p>There is no agent with this account.</p>
+      ) : (
+        <ErrorState message={state.message} retrying={state.retrying} onRetry={load} />
+      )}
+    </div>
+  );
 }

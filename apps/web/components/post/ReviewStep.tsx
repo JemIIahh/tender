@@ -1,12 +1,15 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { type ReactNode, useMemo } from "react";
 import { formatBps } from "../../lib/bps";
+import { READING_BALANCES } from "../../lib/copy";
 import {
   FORMAT_LABEL,
   filledAssertions,
   filledRubric,
   fundingOf,
+  heldoutFile,
+  judgeVerifies,
   KINDS,
   linesOf,
   type PostForm,
@@ -19,6 +22,7 @@ import {
 } from "../../lib/post";
 import type { Stage, SubmitResult } from "../../lib/postSubmit";
 import { describeAmount, describeNear, type VaultData } from "../../lib/vault";
+import { useWaitedLong } from "../../lib/waiting";
 import { WALLET_CANNOT_SIGN_MESSAGE } from "../../lib/walletErrors";
 import { ErrorState } from "../ErrorState";
 import { PRIMARY, SECONDARY } from "./ui";
@@ -31,9 +35,10 @@ export type VaultState =
   | { status: "ready"; data: VaultData };
 
 const PROGRESS: Record<Stage, string> = {
+  check: "Looking for your earlier post on the chain.",
   signin: "Signing in to Tender. Approve the message in your wallet.",
   upload: "Saving your task's documents with Tender.",
-  vault: "Reading your balances.",
+  vault: READING_BALANCES,
   wallet: "Waiting for your wallet. Approve the transactions there.",
 };
 
@@ -70,6 +75,50 @@ export function checkCounts(form: PostForm): { seen: string; kept: string } {
   }
 }
 
+/**
+ * Hands the bytes to the person as a file. The file is made when the button is pressed and given a
+ * `blob:` address that goes away a moment later, so the text of the held-out checks is in no
+ * attribute of the page and in no address.
+ */
+function saveFile(bytes: Uint8Array, name: string): void {
+  const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/**
+ * The held-out checks of a task that the Judge does not pick, as a file. They went nowhere but this
+ * page (the API's private store is read by the Judge only), so this is the one copy: the verifier
+ * needs the file to score entries and to pick, and publishes it with the scorecard, where anyone
+ * can hash it and compare with the commitment on chain.
+ */
+function HeldoutDownload({ file, verifier }: { file: Uint8Array; verifier: string | null }) {
+  return (
+    <div
+      data-testid="heldout-download"
+      className="grid gap-2 rounded border border-neutral-900 p-3"
+    >
+      <p>
+        {verifier === null
+          ? "You pick, so you need these held-out checks: save the file, and publish it with the scorecard. This page can't show it again."
+          : `${verifier} needs these held-out checks to pick: save the file and send it to them, and they publish it with the scorecard. This page can't show it again.`}
+      </p>
+      <button
+        type="button"
+        onClick={() => saveFile(file, "heldout.json")}
+        className={`${SECONDARY} min-w-0`}
+      >
+        Download held-out checks
+      </button>
+    </div>
+  );
+}
+
 function Row({ id, label, children }: { id: string; label: string; children: ReactNode }) {
   return (
     <>
@@ -101,6 +150,8 @@ export function ReviewStep(props: {
   onRecheck(): void;
   onBack(): void;
   onPost(): void;
+  /** The person gives up on a wallet that has not answered: offered after a wait at the wallet. */
+  onStop(): void;
   /** The person has looked and lifts the lock that a send of unknown outcome put on Post. */
   onUnlock(): void;
 }) {
@@ -112,6 +163,11 @@ export function ReviewStep(props: {
   const funding =
     vault.status === "ready" && reward !== null ? fundingOf(vault.data, tokenId, reward) : null;
 
+  // With the Judge as verifier, the checks are in its hands. With anyone else they are on this page
+  // only, and the person is given them as a file.
+  const judgePicks = judgeVerifies(form, judgeAccount, accountId);
+  const heldout = useMemo(() => heldoutFile(form), [form]);
+
   // "—" where there is nothing to read: no wallet connected, or a read that failed. The words about
   // reading are for a read that is under way.
   const paidFrom =
@@ -120,12 +176,17 @@ export function ReviewStep(props: {
         ? `Your vault: ${describeAmount(funding.inVault, tokenId)}, enough already.`
         : `Your vault: ${describeAmount(funding.inVault, tokenId)}. Added from your wallet first: ${describeAmount(funding.toDeposit, tokenId)}.`
       : reward !== null && vault.status === "loading"
-        ? "Reading your balances…"
+        ? READING_BALANCES
         : "—";
 
   // Why Post is off, in the order a person can put it right. A wallet that is not connected, or
   // cannot sign, has its own words below.
   const fundingProblem = funding?.problem ?? null;
+  // A wallet that does not answer leaves Back and Post off: after a while there is a way out.
+  const waitedLong = useWaitedLong(
+    props.running === "signin" || props.running === "wallet" ? props.running : null,
+  );
+
   const blocked: string | null = !ready
     ? null
     : limits.paused
@@ -183,7 +244,7 @@ export function ReviewStep(props: {
         <Row id="review-split" label="Agents see">
           {counts.seen}
         </Row>
-        <Row id="review-heldout" label="Judge keeps">
+        <Row id="review-heldout" label="Kept secret">
           {counts.kept}
         </Row>
         <Row id="review-prize" label="Prize">
@@ -201,6 +262,13 @@ export function ReviewStep(props: {
           {accountId ?? "Not connected"}
         </Row>
       </dl>
+
+      {judgePicks || heldout === null ? null : (
+        <HeldoutDownload
+          file={heldout}
+          verifier={form.verifier === "other" ? form.otherVerifier.trim() : null}
+        />
+      )}
 
       <section aria-labelledby="post-ready" className="grid gap-3">
         <h3 id="post-ready" tabIndex={-1} className="text-lg font-semibold">
@@ -226,7 +294,7 @@ export function ReviewStep(props: {
             {WALLET_CANNOT_SIGN_MESSAGE}
           </p>
         ) : vault.status === "loading" || vault.status === "idle" ? (
-          <p role="status">Reading your balances…</p>
+          <p role="status">{READING_BALANCES}</p>
         ) : vault.status === "error" ? (
           <ErrorState message={vault.message} retrying={vault.retrying} onRetry={props.onRecheck} />
         ) : null}
@@ -261,6 +329,13 @@ export function ReviewStep(props: {
             {PROGRESS[props.running]}
           </p>
         )}
+        {waitedLong ? (
+          <div>
+            <button type="button" onClick={props.onStop} className={SECONDARY}>
+              Stop waiting
+            </button>
+          </div>
+        ) : null}
         {props.failure === null ? null : (
           <p
             role="alert"
@@ -279,14 +354,32 @@ export function ReviewStep(props: {
           </p>
         ) : null}
         {props.outcome?.kind === "sent" ? (
-          <p role="status" data-testid="post-sent">
-            Your wallet sent it, but Tender hasn't reported the new task. It may well be posted:
-            look for it on the{" "}
-            <a href="/" className="underline">
-              Tasks
-            </a>{" "}
-            page before you try again.
-          </p>
+          <div role="status" data-testid="post-sent" className="grid gap-2">
+            <p>
+              Your wallet sent it, but Tender hasn't reported the new task. It may well be posted:
+              look for it on the{" "}
+              {/* A tab of its own, as for an unknown outcome, so that the form on this page is
+                  not lost. */}
+              <a href="/tasks" target="_blank" rel="noreferrer" className="underline">
+                Tasks
+              </a>{" "}
+              page before you try again.
+            </p>
+            {props.outcome.txHashes.length === 0 ? null : (
+              <ul aria-label="Transactions" className="grid gap-1 text-sm">
+                {props.outcome.txHashes.map((hash, i) => (
+                  <li
+                    // biome-ignore lint/suspicious/noArrayIndexKey: the wallet lists the hashes, and could list one twice
+                    key={`${hash}-${i}`}
+                    data-testid="post-sent-hash"
+                    className="font-mono wrap-anywhere"
+                  >
+                    {hash}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         ) : null}
         {props.outcome?.kind === "unknown" ? (
           <div
@@ -297,7 +390,7 @@ export function ReviewStep(props: {
             <p>
               We couldn't tell whether the post went through. Check the{" "}
               {/* A tab of its own, so that the form on this page is not lost. */}
-              <a href="/" target="_blank" rel="noreferrer" className="underline">
+              <a href="/tasks" target="_blank" rel="noreferrer" className="underline">
                 Tasks
               </a>{" "}
               page before posting again.

@@ -1,4 +1,4 @@
-import { AgentView } from "../../../components/AgentView";
+import { AgentView } from "../../../../components/AgentView";
 
 // The page itself only reads the address. The agent is loaded in the browser (components/
 // AgentView), from the API, as the task is.
