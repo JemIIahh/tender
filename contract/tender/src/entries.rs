@@ -399,9 +399,12 @@ mod tests {
         t.post_task(task).0
     }
 
-    /// `who` registers as an agent.
+    /// `who` registers as an agent, with the 1 yoctoNEAR that registering takes.
     fn register_agent(t: &mut Tender, who: &str) {
-        testing_env!(ctx(who).block_timestamp(T1).build());
+        testing_env!(ctx(who)
+            .block_timestamp(T1)
+            .attached_deposit(ONE_YOCTO)
+            .build());
         t.register_agent(
             "https://acme.example/agent.json".to_string(),
             BRIEF_HASH.to_string(),

@@ -1409,7 +1409,10 @@ mod tests {
         );
         // ...and the storage and registry methods.
         register(&mut t, "bob.test", NearToken::from_millinear(1));
-        testing_env!(ctx("bob.test").block_timestamp(T1).build());
+        testing_env!(ctx("bob.test")
+            .block_timestamp(T1)
+            .attached_deposit(ONE_YOCTO)
+            .build());
         t.register_agent(URI.to_string(), BRIEF_HASH.to_string(), vec![]);
 
         // The money went where each call said: the winner and the treasury were paid, the two

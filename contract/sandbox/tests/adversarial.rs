@@ -313,7 +313,7 @@ async fn implicit_64_hex_account_commits_and_wins() -> anyhow::Result<()> {
             "profile_hash": hex(&sha256(b"profile")),
             "tags": ["implicit"],
         }),
-        NO_DEPOSIT,
+        ONE_YOCTO,
     )
     .await?;
     assert!(event(&clean(r)?, "agent_registered")["asp"].is_null());

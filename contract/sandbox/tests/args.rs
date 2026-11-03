@@ -171,9 +171,9 @@ async fn task_methods_refuse_an_unknown_argument_and_a_deposit() -> anyhow::Resu
             json!({ "account_id": alice.id() }),
         )
     };
-    assert_refuses_unknown_key(&env, alice, "register_agent", &profile, NO_DEPOSIT).await?;
+    assert_refuses_unknown_key(&env, alice, "register_agent", &profile, ONE_YOCTO).await?;
     assert!(agent().await?.is_null());
-    done_clean(call(&env, alice, "register_agent", profile, NO_DEPOSIT).await?)?;
+    done_clean(call(&env, alice, "register_agent", profile, ONE_YOCTO).await?)?;
     assert!(!agent().await?.is_null());
 
     // post_task: two tasks, so that one can be picked and the other voided.

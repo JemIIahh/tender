@@ -327,8 +327,8 @@ mod tests {
 
     use crate::test_utils::{ctx, fresh, panic_message};
     use crate::types::{
-        AgentProfile, DelegateCaps, Entry, StorageAccount, StorageView, Task, TokenConfig,
-        STORAGE_MIN_DEPOSIT,
+        AgentProfile, AgentStatus, DelegateCaps, Entry, StorageAccount, StorageView, Task,
+        TokenConfig, STORAGE_MIN_DEPOSIT,
     };
     use crate::Tender;
 
@@ -393,6 +393,10 @@ mod tests {
             earned: vec![],
             picks_made: 0,
             voids_after_reveals: 0,
+            status: AgentStatus::Active,
+            bond: None,
+            unregistering_since: 0,
+            claimable_at: 0,
         };
         // Pad the URI until the record's Borsh value is exactly `value_len` bytes.
         let fixed = borsh::to_vec(&p).unwrap().len();

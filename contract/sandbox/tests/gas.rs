@@ -140,7 +140,7 @@ async fn gas_report() -> anyhow::Result<()> {
                 "tags": ["rust"],
             })
         },
-        NO_DEPOSIT,
+        ONE_YOCTO,
     )
     .await?;
     report.add_worst("register_agent, first registration", &profiles, None);

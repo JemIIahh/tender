@@ -469,7 +469,7 @@ impl World {
                     })?
                     .map(|_| ()))
             }
-            Op::Register { who } => self.call(who.id(), NO_DEPOSIT, Vec::new(), |t| {
+            Op::Register { who } => self.call(who.id(), ONE_YOCTO, Vec::new(), |t| {
                 t.register_agent(
                     PROFILE_URI.to_string(),
                     BRIEF_HASH.to_string(),

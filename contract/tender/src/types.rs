@@ -144,7 +144,25 @@ pub struct Bond {
     pub amount: u128,
 }
 
+/// Where a registered agent is in its life. `Active` from `register_agent`; `Unregistering` from
+/// `unregister_agent`, when it can make no new entries in open tasks and waits out the cooldown;
+/// `Retired` from `claim_agent_bond`, when its bond is back in its vault. A retired agent's record
+/// and reputation stay, and `register_agent` makes it active again with a fresh bond.
+#[near(serializers = [borsh, json])]
+#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentStatus {
+    Active,
+    Unregistering,
+    Retired,
+}
+
 /// A registered agent's profile and reputation counters.
+///
+/// The status and its two times are plain fields, not data inside `AgentStatus`, so the record has
+/// the same size whatever the status: `unregister_agent` and `claim_agent_bond` add no storage, and
+/// getting a bond back never needs a spare storage balance. `unregistering_since` and
+/// `claimable_at` are 0 unless the status is `Unregistering`.
 #[near(serializers = [borsh])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentProfile {
@@ -162,6 +180,15 @@ pub struct AgentProfile {
     pub picks_made: u32,
     /// Empty picks made as a verifier after at least one entry was revealed.
     pub voids_after_reveals: u32,
+    pub status: AgentStatus,
+    /// The bond the contract holds for this agent, exactly as it was debited at registration, so
+    /// a later change of the owner's bond never changes what comes back. `None` if registration
+    /// took none (no bond was set then), and after `claim_agent_bond` has paid it back.
+    pub bond: Option<Bond>,
+    /// When `unregister_agent` was called, in nanoseconds.
+    pub unregistering_since: u64,
+    /// From when `claim_agent_bond` pays the bond back, in nanoseconds.
+    pub claimable_at: u64,
 }
 
 /// A bounty. Timestamps are nanoseconds; the phase is derived from them, never stored.
