@@ -3489,12 +3489,74 @@ test("pick_winners_uploads_the_scorecard_then_picks", async () => {
     scorecard_hash: hash,
   });
 
-  // A pick that awards nothing is a scorecard with no winners, and has no entry to look up.
+  // A pick that awards nothing is a scorecard with no winners, and has no entry to look up. Its
+  // scorecard goes up all the same, so the task is read once for the hashes the card must copy.
   api.getTask.mockClear();
   const none = { ...SCORECARD, winners: [] };
   await callJson("pick_winners", { task_id: "7", winners: [], scorecard: none });
   expect(chain.pick.mock.calls[1]?.[1]).toEqual([]);
-  expect(api.getTask).not.toHaveBeenCalled();
+  expect(api.getTask).toHaveBeenCalledExactlyOnceWith(7n);
+});
+
+test("pick_winners_refuses_a_scorecard_that_does_not_rest_on_its_task_before_any_upload", async () => {
+  // The API refuses a scorecard whose criteria_hash or heldout_commitment is not its task's, and
+  // would not show one that was stored. A pick cannot be taken back, so the tool refuses such a card
+  // first, with the field and the value to copy: nothing is uploaded and nothing is sent.
+  const { call, callJson, chain, api } = await connectWrite();
+  const winners = [{ account: ACCOUNT, bps: 10_000 }];
+  const other = "44".repeat(32);
+  const taskWith = (task: Partial<TaskDetailResponse["task"]>) => revealedBy([ACCOUNT], task);
+  const refused: Array<[string, TaskDetailResponse, Record<string, unknown>, RegExp]> = [
+    [
+      "a criteria_hash that is not the task's",
+      taskWith({}),
+      { winners, scorecard: { ...SCORECARD, criteria_hash: other } },
+      new RegExp(`^SCORECARD_MISMATCH: .*criteria_hash.*${"22".repeat(32)}`),
+    ],
+    [
+      "a heldout_commitment that is not the task's",
+      taskWith({}),
+      { winners, scorecard: { ...SCORECARD, heldout_commitment: other } },
+      new RegExp(`^SCORECARD_MISMATCH: .*heldout_commitment.*${"33".repeat(32)}`),
+    ],
+    [
+      "no heldout_commitment on a task that has one",
+      taskWith({}),
+      { winners, scorecard: { ...SCORECARD, heldout_commitment: null } },
+      /^SCORECARD_MISMATCH: .*heldout_commitment/,
+    ],
+    [
+      "a heldout_commitment on a task that has none",
+      taskWith({ heldout_commitment: null }),
+      { winners, scorecard: SCORECARD },
+      /^SCORECARD_MISMATCH: .*heldout_commitment.*no held-out part/,
+    ],
+    [
+      "a pick that awards nothing, whose scorecard is published all the same",
+      taskWith({}),
+      { winners: [], scorecard: { ...SCORECARD, winners: [], criteria_hash: other } },
+      /^SCORECARD_MISMATCH: .*criteria_hash/,
+    ],
+  ];
+  for (const [what, detail, args, expected] of refused) {
+    api.getTask.mockResolvedValue(detail);
+    const answer = await call("pick_winners", { task_id: "7", ...args });
+    expect(answer.isError, what).toBe(true);
+    expect(answer.text, what).toMatch(expected);
+  }
+  expect(api.getTask).toHaveBeenCalledTimes(refused.length);
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+  expect(chain.pick).not.toHaveBeenCalled();
+
+  // A task without a held-out part is picked with a card that says null, and goes through.
+  api.getTask.mockResolvedValue(taskWith({ heldout_commitment: null }));
+  await callJson("pick_winners", {
+    task_id: "7",
+    winners,
+    scorecard: { ...SCORECARD, heldout_commitment: null },
+  });
+  expect(api.uploadBlob).toHaveBeenCalledOnce();
+  expect(chain.pick).toHaveBeenCalledOnce();
 });
 
 test("pick_winners_pays_a_split_that_the_contract_takes", async () => {
