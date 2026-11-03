@@ -15,7 +15,7 @@ use near_workspaces::types::Gas;
 use near_workspaces::{Account, AccountId};
 use serde_json::{json, Value};
 
-/// The caps of the plan's test: 5_000 per task and 10_000 in all.
+/// The caps of the plan's test: 5_000 per call and 10_000 in all.
 const PER_TASK: u128 = 5_000;
 const TOTAL: u128 = 10_000;
 /// What each of the agent's posts spends.
@@ -203,14 +203,14 @@ mod delegate {
         let id: u64 = r.json::<String>()?.parse()?;
         assert_eq!(spent(&env, lead.id(), &agent).await?, SPEND);
 
-        // The same key tops its task up: within both caps, then over the per-task cap.
+        // The same key tops its task up: within both caps, then over the per-call cap.
         let r = clean(top_up_as(&env, &agent, id, 1_000).await?)?;
         assert_eq!(num(&event(&r, "task_topped_up")["reward"]), SPEND + 1_000);
         assert_eq!(spent(&env, lead.id(), &agent).await?, SPEND + 1_000);
         let r = top_up_as(&env, &agent, id, PER_TASK + 1).await?;
         assert_fails_with(
             &r,
-            "E_AUTH: 5001 is over this delegate key's per-task cap of 5000",
+            "E_AUTH: 5001 is over this delegate key's per-call cap (per_task_cap) of 5000",
         );
         assert_eq!(spent(&env, lead.id(), &agent).await?, SPEND + 1_000);
         assert_eq!(num(&get_task(&env, id).await?["reward"]), SPEND + 1_000);

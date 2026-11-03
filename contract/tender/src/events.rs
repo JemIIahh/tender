@@ -165,8 +165,8 @@ pub(crate) struct TaskToppedUp {
 
 /// Data of `delegate_added`: `account` registered `public_key` (NEAR's text form, such as
 /// `ed25519:<base58>`) as a delegate key that may spend its vault in `token`, at most
-/// `per_task_cap` per task and `total_cap` in all (decimal strings). It replaces any caps the key
-/// had.
+/// `per_task_cap` per `post_task` or `top_up_task` call (a per-call cap, whatever the name says)
+/// and `total_cap` in all (decimal strings). It replaces any caps the key had.
 #[derive(Serialize)]
 #[serde(crate = "near_sdk::serde")]
 pub(crate) struct DelegateAdded {

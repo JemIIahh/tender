@@ -259,14 +259,17 @@ pub enum VoidReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DelegateCaps {
     pub token: AccountId,
+    /// The most one `post_task` or `top_up_task` call may spend. Despite the name it caps each
+    /// call, not each task: a post and top-ups of the same task count one by one.
     pub per_task_cap: u128,
     pub total_cap: u128,
     pub spent: u128,
 }
 
 /// A delegate key's caps, as `get_delegate` returns them: the only token it may spend, the most
-/// it may spend on one task (`per_task_cap`) and in all (`total_cap`), and what it has spent so
-/// far. The amounts are decimal strings.
+/// it may spend in one `post_task` or `top_up_task` call (`per_task_cap`, a per-call cap whatever
+/// the name says) and in all (`total_cap`), and what it has spent so far. The amounts are decimal
+/// strings.
 #[near(serializers = [json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DelegateView {

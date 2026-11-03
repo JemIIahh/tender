@@ -11,7 +11,9 @@
 //!   through when the key that signed it is one its account registered with `add_delegate`, the
 //!   call came straight from that account (signer, predecessor and the account debited are one),
 //!   the spend is in the key's token, it is at most the key's `per_task_cap`, and it keeps what the
-//!   key has spent in all within its `total_cap`. The spend is then added to `spent`.
+//!   key has spent in all within its `total_cap`. The spend is then added to `spent`. Despite its
+//!   name, `per_task_cap` caps each call: a post and then top-ups of the same task by the same
+//!   key are counted one by one, so only `total_cap` bounds what one task can get from the key.
 //!
 //! So an agent can hold a function-call key that posts and tops up tasks on its own, while a leak
 //! of that key costs at most `total_cap` of one token. `withdraw`, `storage_withdraw`, the owner's
@@ -198,7 +200,7 @@ impl Tender {
         }
         if amount > caps.per_task_cap {
             env::panic_str(&format!(
-                "{}: {amount} is over this delegate key's per-task cap of {}",
+                "{}: {amount} is over this delegate key's per-call cap (per_task_cap) of {}",
                 err::E_AUTH,
                 caps.per_task_cap
             ));
@@ -241,7 +243,7 @@ mod tests {
     const ROUTER: &str = "router.test";
     const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
     const NO_DEPOSIT: NearToken = NearToken::from_yoctonear(0);
-    /// The caps of the plan's sandbox test: 5_000 per task and 10_000 in all.
+    /// The caps of the plan's sandbox test: 5_000 per call and 10_000 in all.
     const PER_TASK: u128 = 5_000;
     const TOTAL: u128 = 10_000;
     /// What alice holds of each token at the start.
@@ -428,12 +430,12 @@ mod tests {
     fn delegate_over_per_task_cap_rejected() {
         let mut t = delegated();
         let message = rejected(
-            "one over the per-task cap",
+            "one over the per-call cap",
             try_post(&mut t, delegate_key(), task(USDC, PER_TASK + 1)),
         );
         assert_eq!(
             message,
-            "E_AUTH: 5001 is over this delegate key's per-task cap of 5000"
+            "E_AUTH: 5001 is over this delegate key's per-call cap (per_task_cap) of 5000"
         );
         assert_eq!(spent(&t), 0);
         assert_eq!(t.task_count(), U64(0));
@@ -626,7 +628,7 @@ mod tests {
         assert_eq!(spent(&t), 8_000);
         assert_eq!(t.get_task(U64(id)).unwrap().reward, U128(8_000));
         rejected(
-            "a top-up over the per-task cap",
+            "a top-up over the per-call cap",
             try_top_up(&mut t, delegate_key(), id, PER_TASK + 1),
         );
         rejected(
@@ -695,7 +697,7 @@ mod tests {
             })
         );
         rejected(
-            "over the new per-task cap",
+            "over the new per-call cap",
             try_post(&mut t, delegate_key(), task(USDC, 3_001)),
         );
         // Lowering the total cap below what is spent leaves nothing to spend.
