@@ -669,12 +669,20 @@ const connected = (signMessage: boolean, accountId = ALICE) => ({
   accounts: [{ accountId }],
 });
 
-test("near_connect_is_made_for_the_configured_network_with_every_wallet_allowed", async () => {
+test("near_connect_is_made_for_the_configured_network_and_asks_for_wallets_that_can_send_a_batch", async () => {
+  // Every send in the app is a signAndSendTransactions, and signMessage is left unfiltered: a
+  // wallet that can't sign a message may still send transactions.
   const testnet = await connectorFor("testnet");
-  expect(testnet.connector.options).toEqual({ network: "testnet" });
+  expect(testnet.connector.options).toEqual({
+    network: "testnet",
+    features: { signAndSendTransactions: true },
+  });
 
   const mainnet = await connectorFor("mainnet");
-  expect(mainnet.connector.options).toEqual({ network: "mainnet" });
+  expect(mainnet.connector.options).toEqual({
+    network: "mainnet",
+    features: { signAndSendTransactions: true },
+  });
 });
 
 test("near_connect_restores_the_wallet_it_kept_and_a_wallet_never_connected_is_quiet", async () => {

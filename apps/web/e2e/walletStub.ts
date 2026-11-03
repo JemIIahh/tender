@@ -96,7 +96,7 @@ export async function installWallet(
           type: "injected",
           platform: {},
           permissions: {},
-          features: { signMessage, testnet: true },
+          features: { signMessage, signAndSendTransactions: true, testnet: true },
         },
         signIn: async () => [{ accountId: account, publicKey }],
         signOut: async () => {},
