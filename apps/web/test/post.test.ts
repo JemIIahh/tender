@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   BriefSchema,
   canonicalJson,
@@ -349,12 +351,34 @@ function planWithStorage(form: PostForm, vaultBalance: bigint, free: bigint) {
 
 const methods = (calls: ReturnType<typeof planFor>) => calls.map((call) => call.methodName);
 
+/** A `pub const NAME: u64 = N;` of the contract's types.rs, read from the source and not restated. */
+function contractConstant(name: string): bigint {
+  const source = readFileSync(
+    resolve(import.meta.dirname, "../../../contract/tender/src/types.rs"),
+    "utf8",
+  );
+  const found = new RegExp(`pub const ${name}: u64 = (\\d+);`).exec(source);
+  if (found?.[1] === undefined) throw new Error(`types.rs has no u64 constant ${name}`);
+  return BigInt(found[1]);
+}
+
 test("the_bytes_a_post_sets_aside_cover_what_the_contract_charges_for_the_biggest_one_it_writes", () => {
-  // The record is 40 + 1 + 8 + Borsh(Task) bytes, and 800 are held back for the outcome. A task
-  // from the wizard has a Borsh(Task) of 738 bytes at most (the review of 06-T4 derived it from
-  // contract/tender/src/tasks.rs and types.rs). The slot of a first deposit is 200 at most.
-  expect(POST_TASK_BYTES).toBeGreaterThanOrEqual(40n + 1n + 8n + 738n + 800n);
-  expect(VAULT_SLOT_BYTES).toBe(200n);
+  // The record is 40 + 1 + 8 + Borsh(Task) bytes, and the contract holds back OUTCOME_RESERVE_BYTES
+  // for the outcome. A task from the wizard has a Borsh(Task) of 738 bytes at most (the review of
+  // 06-T4 derived it from contract/tender/src/tasks.rs and types.rs). The slot of a first deposit
+  // is VAULT_SLOT_MAX_BYTES at most. Both come from the contract's source: if it grows either, this
+  // fails, and the page's figures are the thing to raise.
+  expect(POST_TASK_BYTES).toBeGreaterThanOrEqual(
+    40n + 1n + 8n + 738n + contractConstant("OUTCOME_RESERVE_BYTES"),
+  );
+  expect(VAULT_SLOT_BYTES).toBeGreaterThanOrEqual(contractConstant("VAULT_SLOT_MAX_BYTES"));
+});
+
+test("the_contract_constants_are_read_from_the_source", () => {
+  // The reader finds what is there (today's figures), and says so when a constant is not.
+  expect(contractConstant("OUTCOME_RESERVE_BYTES")).toBeGreaterThan(0n);
+  expect(contractConstant("VAULT_SLOT_MAX_BYTES")).toBeGreaterThan(0n);
+  expect(() => contractConstant("NO_SUCH_CONSTANT")).toThrow("no u64 constant");
 });
 
 test("storage_is_topped_up_first_when_it_cannot_pay_for_the_post", () => {
