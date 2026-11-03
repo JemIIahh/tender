@@ -112,6 +112,18 @@ test("skeleton_runs_on_a_given_chain_and_leaves_it_running", async () => {
       winners: [{ account: accounts.alice.accountId, bps: 10_000, amount: "950000" }],
     },
   });
+  // Both entrants are active agents with the bond the contract names, which they registered with
+  // before the task was posted: an open task takes no one else.
+  for (const role of ["alice", "bob"] as const) {
+    expect(await clientOf(shared, "keeper").getAgent(accounts[role].accountId), role).toMatchObject(
+      {
+        status: "active",
+        bond_token: shared.tokenId,
+        bond_amount: "1000000",
+        claimable_at: null,
+      },
+    );
+  }
 });
 
 test("skeleton_registers_alice_with_the_token_when_nobody_has", async () => {
@@ -142,6 +154,11 @@ test("skeleton_registers_alice_with_the_token_when_nobody_has", async () => {
   expect(lines).toEqual(linesFor(taskId));
   expect(await alice.ftStorageBalanceOf(shared.tokenId, accountId)).not.toBeNull();
   expect(await alice.ftBalanceOf(shared.tokenId, accountId)).toBe(950_000n);
+  // She was an active agent from the run before, so this one took no second bond.
+  expect(await alice.getAgent(accountId)).toMatchObject({
+    status: "active",
+    bond_amount: "1000000",
+  });
 });
 
 test("skeleton_cli_prints_the_six_lines_and_exits_zero", async () => {

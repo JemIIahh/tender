@@ -3,7 +3,10 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   type LocalChain,
+  planRegistration,
+  registerWithBond,
   type Signer,
+  scriptedProfile,
   startLocalChain,
   TenderClient,
   TenderError,
@@ -32,6 +35,13 @@ import { loadEnv, REPO_ROOT } from "./lib/env";
  *
  * `pnpm skeleton` runs it on a local chain, `pnpm skeleton --network testnet` on the testnet
  * deployment. The work is a stand-in: nothing is uploaded, and the URIs are `skeleton://...`.
+ *
+ * Only a registered agent may enter an open task, and registering takes a bond (contract Task 16b).
+ * So before the deposit alice and bob each register with the bond the contract names, as the bond
+ * module of the client does it: the test token is minted to them for it, since it mints for anyone,
+ * and it is deposited into their vaults. An agent that is active already (a second run on testnet)
+ * is left as it is. This prints no line of its own: the six lines stay six, and the sandbox test
+ * that pins them is the check that nothing else reaches stdout.
  */
 
 export interface SkeletonOptions {
@@ -245,6 +255,10 @@ async function play(target: Target, log: (line: string) => void): Promise<Skelet
   if ((await alice.ftStorageBalanceOf(tokenId, aliceId)) === null) {
     await alice.send(tokenStorageDepositCall(tokenId, aliceId));
   }
+  await registerEntrants(poster, tokenId, [
+    { client: alice, name: "alice" },
+    { client: bob, name: "bob" },
+  ]);
 
   const deposit = (await poster.deposit(tokenId, DEPOSIT)).events.find(
     (e) => e.event === "deposit",
@@ -319,6 +333,43 @@ async function play(target: Target, log: (line: string) => void): Promise<Skelet
   log(`WITHDRAWN alice=${withdrawn}`);
 
   return { taskId, paid, withdrawn };
+}
+
+/**
+ * Registers each of `entrants` as an agent with the bond, unless it is active already. The token
+ * must know the account before it will move a deposit, so the account is registered with it first;
+ * and when the bond is in the test token, whatever the account lacks of it is minted to it by the
+ * poster (one key sends one transaction at a time, so the mints go one after another). Then the
+ * registrations go side by side, since each signs with its own key.
+ */
+async function registerEntrants(
+  poster: TenderClient,
+  tokenId: string,
+  entrants: ReadonlyArray<{ client: TenderClient; name: string }>,
+): Promise<void> {
+  const pending: (typeof entrants)[number][] = [];
+  for (const entrant of entrants) {
+    const { client } = entrant;
+    const account = client.accountId;
+    if (account === undefined) throw new Error("the skeleton's entrants have signers");
+    const plan = await planRegistration(client, account);
+    if (plan.agent?.status === "active") continue;
+    if (plan.terms !== null && plan.shortfall > 0n) {
+      if ((await client.ftStorageBalanceOf(plan.terms.token, account)) === null) {
+        await client.send(tokenStorageDepositCall(plan.terms.token, account));
+      }
+      const held = await client.ftBalanceOf(plan.terms.token, account);
+      if (held < plan.shortfall && plan.terms.token === tokenId) {
+        await poster.send(mintCall(tokenId, account, plan.shortfall - held));
+      }
+    }
+    pending.push(entrant);
+  }
+  await Promise.all(
+    pending.map(({ client, name }) =>
+      registerWithBond(client, scriptedProfile(name, ["skeleton"]), { approve: () => true }),
+    ),
+  );
 }
 
 /** The test token's `mint`, which anyone may call for an account the token has registered. */
