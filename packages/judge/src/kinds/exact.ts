@@ -1,5 +1,6 @@
 import type { Heldout, PublicCriteria } from "@tender/shared";
 import type { EntryScore } from "../types";
+import { decodeUtf8, scored } from "./common";
 
 type ExactCriteria = Extract<PublicCriteria, { kind: "exact" }>;
 // `Heldout` is a union, so `Heldout["exact"]` does not compile: pick the member first.
@@ -39,17 +40,4 @@ export function scoreExact(c: ExactCriteria, h: ExactHeldout, content: Uint8Arra
 
 function normalize(text: string, steps: ExactCriteria["normalize"]): string {
   return steps.reduce((current, step) => STEPS[step](current), text);
-}
-
-/** The text of `content`, or `null` when it is not valid UTF-8. */
-function decodeUtf8(content: Uint8Array): string | null {
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(content);
-  } catch {
-    return null;
-  }
-}
-
-function scored(c: ExactCriteria, score: number, reasons: string[]): EntryScore {
-  return { score, passed: score >= c.min_score, reasons };
 }

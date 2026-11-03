@@ -103,6 +103,11 @@ const TREE_SCHEMA = {
 const NOT_COMPILED = /^criteria schema cannot be compiled: /;
 const NOT_SUPPORTED = /^criteria schema is not supported: /;
 const NOT_EVALUATED = /^criteria schema cannot be evaluated: /;
+/**
+ * What the scorer says of an entry that makes the schema throw (review M6): fixed words, not the
+ * engine's, which differ between Node versions and blame the criteria for the entry.
+ */
+const ENTRY_NOT_CHECKED = "the entry could not be checked against the schema";
 
 /** The documents `checkJsonSchemaUsable` evaluates a schema on: the smallest of each JSON type. */
 const TRIALS = { null: null, boolean: true, number: 0, string: "", array: [], object: {} };
@@ -467,7 +472,10 @@ test("unusable_schema_scores_zero", async () => {
       expect(result.score, label).toBe(0);
       expect(result.passed, label).toBe(false);
       expect(result.reasons, label).toHaveLength(1);
-      expect(result.reasons[0], label).toMatch(reason);
+      // A schema that throws when it is evaluated gets the fixed reason at scoring.
+      expect(result.reasons[0], label).toMatch(
+        reason === NOT_EVALUATED ? new RegExp(`^${ENTRY_NOT_CHECKED}$`) : reason,
+      );
     }
   });
 
@@ -518,15 +526,13 @@ test("unreadable_schema_errors_score_zero", () => {
   // returns false for a number and has no `errors` of its own, and Ajv adds those to its list all
   // the same: after the type error comes `undefined`. Nothing can be told from such a list.
   const schema = { properties: { p: { type: "string", $dynamicRef: "#isPrototypeOf" } } };
-  const unreadable =
-    "criteria schema cannot be evaluated: the schema reported an error that is not an object";
 
   // An ordinary wrong answer: a number or null where the schema wants a string.
   for (const document of [{ p: 5 }, { p: null }]) {
     expect(scoreOn(schema, document), JSON.stringify(document)).toEqual({
       score: 0,
       passed: false,
-      reasons: [unreadable],
+      reasons: [ENTRY_NOT_CHECKED],
     });
   }
   // The schema is only at fault where a document reaches it: one without `p` fits.
@@ -543,27 +549,33 @@ test("schema_check_reads_errors_as_the_scorer_does", () => {
   const verdict = checkJsonSchemaUsable(schema);
   if (verdict.ok) throw new Error("the check should refuse this schema");
   expect(verdict.reason).toMatch(NOT_EVALUATED);
-  // The scorer gives the same reason for that document, and scores the others as usual.
-  expect(scoreOn(schema, null)).toEqual({ score: 0, passed: false, reasons: [verdict.reason] });
+  // The scorer scores that document 0 for the fixed reason, and scores the others as usual.
+  expect(scoreOn(schema, null)).toEqual({ score: 0, passed: false, reasons: [ENTRY_NOT_CHECKED] });
   expect(scoreOn(schema, {})).toEqual({ score: 100, passed: true, reasons: [] });
 });
 
 test("schema_check_and_scorer_agree", () => {
-  // A schema the check refuses whatever the document: the scorer scores every trial document 0,
-  // and the first of them (the one the check met first) gets the check's own reason.
+  // A schema the check refuses whatever the document: the scorer scores every trial document 0.
+  // One that does not compile gets the check's own reason (the schema is what is wrong, and the
+  // words are Ajv's, as at intake); one that throws when it is evaluated gets the fixed one.
   for (const [label, { schema, reason }] of Object.entries(UNUSABLE)) {
     const verdict = checkJsonSchemaUsable(schema);
     if (verdict.ok) throw new Error(`${label}: the check should refuse this schema`);
+    const throws = reason === NOT_EVALUATED;
     for (const [type, trial] of Object.entries(TRIALS)) {
       const result = scoreOn(schema, trial);
       expect(result.score, `${label}, ${type}`).toBe(0);
-      expect(result.reasons, `${label}, ${type}`).toEqual([expect.stringMatching(reason)]);
+      expect(result.reasons, `${label}, ${type}`).toEqual(
+        throws ? [ENTRY_NOT_CHECKED] : [expect.stringMatching(reason)],
+      );
     }
-    expect(scoreOn(schema, TRIALS.null).reasons, label).toEqual([verdict.reason]);
+    expect(scoreOn(schema, TRIALS.null).reasons, label).toEqual(
+      throws ? [ENTRY_NOT_CHECKED] : [verdict.reason],
+    );
   }
 
   // A schema that fails for one type of document only: the check refuses it, the scorer gives the
-  // document of that type the check's reason, and documents of the other types are scored as usual.
+  // document of that type the fixed reason, and documents of the other types are scored as usual.
   for (const [type, trial] of Object.entries(TRIALS)) {
     const schema = throwsOnlyOn(type);
     const verdict = checkJsonSchemaUsable(schema);
@@ -571,7 +583,7 @@ test("schema_check_and_scorer_agree", () => {
     expect(scoreOn(schema, trial), type).toEqual({
       score: 0,
       passed: false,
-      reasons: [verdict.reason],
+      reasons: [ENTRY_NOT_CHECKED],
     });
     for (const [other, document] of Object.entries(TRIALS)) {
       if (other !== type) expect(scoreOn(schema, document).score, `${type}, ${other}`).toBe(100);

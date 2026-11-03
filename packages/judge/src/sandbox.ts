@@ -85,7 +85,8 @@ function dropEngine(damaged: Promise<QuickJSWASMModule>): void {
  * already waiting for the dropped one included, uses a new one. The failed run is an
  * `exception`. A runtime that cannot be started drops the engine in the same way, and rejects.
  * The runs beside a failed one keep their results and their own budgets, and can wait for a new
- * engine to load, which takes a few milliseconds.
+ * engine to load, which takes a few milliseconds. Unless the new engine cannot be loaded either:
+ * then each of those runs rejects, as a run does whose own load fails.
  */
 export async function runInSandbox(code: string, opts: SandboxOptions): Promise<SandboxResult> {
   let loading = loadEngine();
