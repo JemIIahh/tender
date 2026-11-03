@@ -13,7 +13,10 @@ const FINAL_HEIGHT_DEADLINE_MS = 5_000;
 
 /**
  * `GET /v1/health`: whether the API can read the database and the chain, and how far the index is
- * behind. A monitor reads `lag_blocks`; the API stays `ok` while the indexer catches up.
+ * behind. A monitor reads `lag_blocks`; the API stays `ok` while the indexer catches up. It also
+ * reads `waiting_for_chain`, which is true while the services hold the indexer, the keeper and the
+ * Judge back until the node can be asked or has caught up with the index (`deps.waitingForChain`):
+ * `lag_blocks` is 0 for a node that is behind the index, so it cannot show that.
  *
  * The index is the cursor of this deployment, `<network>:<contractId>` as the indexer keeps it
  * (`startIndexer`). A database serves one contract deploy, and the services refuse one that holds
@@ -27,6 +30,7 @@ export function healthRoutes(deps: ApiDeps, options: { deadlineMs?: number } = {
   const app = new Hono();
 
   app.get("/health", async (c) => {
+    const waiting = deps.waitingForChain?.() === true;
     // None before the first block.
     const [row] = await deps.db.query<{ height: string }>(
       "select height::text as height from chain_cursor where source = $1",
@@ -50,6 +54,7 @@ export function healthRoutes(deps: ApiDeps, options: { deadlineMs?: number } = {
         network: deps.network,
         contract: deps.contractId,
         indexed_height: indexed.toString(),
+        waiting_for_chain: waiting,
       };
       return c.json(body, 503, RETRY_SOON);
     }
@@ -61,6 +66,7 @@ export function healthRoutes(deps: ApiDeps, options: { deadlineMs?: number } = {
       indexed_height: indexed.toString(),
       chain_final_height: final.toString(),
       lag_blocks: (final > indexed ? final - indexed : 0n).toString(),
+      waiting_for_chain: waiting,
     };
     return c.json(body);
   });

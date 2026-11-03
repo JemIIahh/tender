@@ -148,6 +148,7 @@ async function serveApi(): Promise<Api> {
         indexed_height: "90",
         chain_final_height: "100",
         lag_blocks: "10",
+        waiting_for_chain: false,
       });
     } else {
       res.writeHead(404, { "Content-Type": "application/json" }).end('{"error":"not_found"}');

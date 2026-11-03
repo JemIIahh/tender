@@ -8,7 +8,8 @@ import type { ErrorBody } from "./format";
 // How the API tells a caller to come back later.
 //
 // A few routes cost the API something for anyone who asks: a challenge is a row in the database, a
-// sign-in is a question to the chain, a Telegram link is a nonce. Each is held to a number of
+// sign-in is a question to the chain, a Telegram link is a nonce, an MCP request is a server and a
+// transport that may wait 30 seconds for an answer. Each is held to a number of
 // requests in a window, counted per client address or per signed-in account in this process's
 // memory, which is enough because one services process runs per database (P03-R25). Past the
 // limit the answer is a 429 with `Retry-After`, the seconds until the caller's window ends.
@@ -55,6 +56,8 @@ export interface RateLimits {
   verify: RateLimit;
   /** `POST /v1/telegram/link`, per signed-in account. */
   telegramLink: RateLimit;
+  /** `POST /mcp`, per client address: every request, whatever tool it calls. */
+  mcp: RateLimit;
   /** `POST /v1/blobs` and `POST /v1/heldout` together, per signed-in account: every request. */
   upload: RateLimit;
   /**
@@ -75,6 +78,9 @@ export const DEFAULT_RATE_LIMITS: Readonly<RateLimits> = Object.freeze({
   challenge: { limit: 30, windowMs: 60_000 },
   verify: { limit: 30, windowMs: 60_000 },
   telegramLink: { limit: 10, windowMs: 10 * 60_000 },
+  // 5 a second: an agent browsing the board makes a call or two a second at most, and a client that
+  // shares an address with others (a proxy left at 0 hops) has room beside them.
+  mcp: { limit: 300, windowMs: 60_000 },
   upload: { limit: 60, windowMs: HOUR_MS },
   uploadBytes: { limit: 8 * MIB, windowMs: 24 * HOUR_MS },
   heldoutBytesTotal: { limit: 128 * MIB, windowMs: HOUR_MS },
@@ -87,6 +93,7 @@ export function rateLimitsOf(over: Partial<RateLimits> | undefined): RateLimits 
     challenge: over?.challenge ?? DEFAULT_RATE_LIMITS.challenge,
     verify: over?.verify ?? DEFAULT_RATE_LIMITS.verify,
     telegramLink: over?.telegramLink ?? DEFAULT_RATE_LIMITS.telegramLink,
+    mcp: over?.mcp ?? DEFAULT_RATE_LIMITS.mcp,
     upload: over?.upload ?? DEFAULT_RATE_LIMITS.upload,
     uploadBytes: over?.uploadBytes ?? DEFAULT_RATE_LIMITS.uploadBytes,
     heldoutBytesTotal: over?.heldoutBytesTotal ?? DEFAULT_RATE_LIMITS.heldoutBytesTotal,
@@ -141,8 +148,10 @@ export function rateLimit<E extends Env>(
 /**
  * The bytes each key has spent, in a window of `limit.windowMs` that begins with the first bytes it
  * spends and holds at most `limit.limit` of them, kept in this process's memory. The windows are
- * kept in the order they began, which is the order they end in, so the ones that are over are
- * dropped from the front and the map holds only the keys that spent something lately.
+ * kept in the order they began, which is the order they end in while the wall clock runs forward,
+ * so the ones that are over are dropped from the front and the map holds only the keys that spent
+ * something lately. A clock that steps back breaks that order and leaves an ended window behind a
+ * live one, so a window is read only if it has not ended (`live`): one that has is no window.
  */
 class ByteWindows {
   readonly #windows = new Map<string, { spent: number; endsAt: number }>();
@@ -158,9 +167,22 @@ class ByteWindows {
       if (window.endsAt > now) break;
       this.#windows.delete(ended);
     }
-    const window = this.#windows.get(key);
+    const window = this.#live(key, now);
     if ((window?.spent ?? 0) + bytes <= this.limit.limit) return 0;
     return window === undefined ? this.limit.windowMs : window.endsAt - now;
+  }
+
+  /**
+   * `key`'s window if it has not ended by `now`. One that has (`endsAt <= now`) is no window: it is
+   * dropped, as the front of the map is, so that it neither reads as room nor takes more bytes.
+   * The clock stepping back can leave it behind a window that ends later, out of reach of the
+   * pruning at the front.
+   */
+  #live(key: string, now: number): { spent: number; endsAt: number } | undefined {
+    const window = this.#windows.get(key);
+    if (window === undefined || window.endsAt > now) return window;
+    this.#windows.delete(key);
+    return undefined;
   }
 
   /**
@@ -169,7 +191,7 @@ class ByteWindows {
    * nowhere: the next window begins empty whatever was taken from the last.
    */
   spend(key: string, bytes: number, now: number): () => void {
-    let window = this.#windows.get(key);
+    let window = this.#live(key, now);
     if (window === undefined) {
       window = { spent: 0, endsAt: now + this.limit.windowMs };
       this.#windows.set(key, window);

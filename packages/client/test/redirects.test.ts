@@ -115,6 +115,7 @@ test("a_redirect_fails_the_call_and_nothing_follows_it", async () => {
         indexed_height: "90",
         chain_final_height: "100",
         lag_blocks: "10",
+        waiting_for_chain: false,
       });
     } else if (route === "POST /v1/blobs") {
       json(res, { sha256: HASH, uri: `${self.url}/v1/blobs/${HASH}` });

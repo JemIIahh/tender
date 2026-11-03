@@ -1426,6 +1426,73 @@ test("a_check_that_waits_says_why_each_time_and_the_work_starts_when_it_goes_thr
   expect(events).toEqual(["start", "stop"]);
 });
 
+test("a_check_is_waiting_from_its_first_wait_until_it_has_gone_through_been_refused_or_ended", async () => {
+  const { start } = counted();
+  const settings = { start, guards: "the indexer", log: () => undefined };
+  const waits = (why: string) => (_signal: AbortSignal, onWait: OnWait) => onWait(why, 2_000);
+
+  // A check that has nothing to wait for never waits.
+  const quick = startAfterCheck({ ...settings, check: async () => true, onRefused: () => {} });
+  await quick.settled;
+  expect(quick.waiting()).toBe(false);
+  await quick.stop();
+
+  // From the first wait until the check goes through, whatever is said, or not said, between.
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const through = startAfterCheck({
+    ...settings,
+    check: async (signal: AbortSignal, onWait: OnWait) => {
+      waits("cannot read the final block (Error)")(signal, onWait);
+      await gate;
+      return true;
+    },
+    onRefused: () => {},
+  });
+  await through.settled;
+  expect(through.waiting()).toBe(true);
+  release();
+  await vi.waitFor(() => expect(through.waiting()).toBe(false));
+  await through.stop();
+
+  // Until the database is refused.
+  let refuse: () => void = () => undefined;
+  const refusal = new Promise<void>((resolve) => {
+    refuse = resolve;
+  });
+  const refused = startAfterCheck({
+    ...settings,
+    check: async (signal: AbortSignal, onWait: OnWait) => {
+      waits("the node is behind")(signal, onWait);
+      await refusal;
+      throw new IndexerError("the database is another deploy's");
+    },
+    onRefused: () => {},
+  });
+  await refused.settled;
+  expect(refused.waiting()).toBe(true);
+  refuse();
+  await vi.waitFor(() => expect(refused.waiting()).toBe(false));
+  await refused.stop();
+
+  // Until the wait is ended by the stop.
+  const ended = startAfterCheck({
+    ...settings,
+    check: (signal: AbortSignal, onWait: OnWait) =>
+      new Promise<boolean>((resolve) => {
+        waits("the node is behind")(signal, onWait);
+        signal.addEventListener("abort", () => resolve(false), { once: true });
+      }),
+    onRefused: () => {},
+  });
+  await ended.settled;
+  expect(ended.waiting()).toBe(true);
+  await ended.stop();
+  expect(ended.waiting()).toBe(false);
+});
+
 test("a_refused_database_is_told_to_the_owner_and_nothing_starts", async () => {
   const { events, start } = counted();
   const lines: string[] = [];

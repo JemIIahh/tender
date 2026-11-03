@@ -418,17 +418,26 @@ async function requireEntry(db: Db, taskId: string, account: string): Promise<vo
  * the poster of a task: a task of anyone else can never be judged against it, and holding the
  * scorecard back for it would hand a stranger the means to stall the verifier. The account's right
  * is looked at first, so an account that has none is told so whatever the time is. What the
- * scorecard says of its uploader is part of that right (`requireOwnScorecard`), so it is told next,
- * and the time comes last: waiting would not mend a scorecard that cannot be taken from this
- * account.
+ * scorecard says of its uploader is part of that right (`requireOwnScorecard`), so it is told next.
+ * Then what it rests on: its `criteria_hash` and `heldout_commitment` must be the task's own, a
+ * 400 otherwise, because the API shows a task's scorecard only when it does (`scorecardOf`), and a
+ * pick made with a card that is never shown cannot be taken back. The time comes last: waiting
+ * would not mend a scorecard that cannot be taken from this account, nor one that rests on other
+ * documents than the task's.
  */
 async function requireScorecardRight(
   deps: ApiDeps,
   scorecard: Scorecard,
   account: string,
 ): Promise<void> {
-  const [task] = await deps.db.query<{ poster: string; verifier: string; closed: boolean }>(
-    `select t.poster, t.verifier,
+  const [task] = await deps.db.query<{
+    poster: string;
+    verifier: string;
+    criteria_hash: string;
+    heldout_commitment: string | null;
+    closed: boolean;
+  }>(
+    `select t.poster, t.verifier, t.criteria_hash, t.heldout_commitment,
             (t.reveal_deadline <= $2::numeric
              and not exists (
                select 1
@@ -450,6 +459,14 @@ async function requireScorecardRight(
     );
   }
   requireOwnScorecard(deps, scorecard, account);
+  if (scorecard.criteria_hash !== task.criteria_hash) {
+    return badRequest(`the scorecard's criteria_hash is not the task's: copy it from the task`);
+  }
+  if (scorecard.heldout_commitment !== task.heldout_commitment) {
+    return badRequest(
+      `the scorecard's heldout_commitment is not the task's: copy it from the task`,
+    );
+  }
   if (!task.closed) return fail(409, "too_early", "the task's reveal window has not closed");
 }
 

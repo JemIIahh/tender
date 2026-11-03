@@ -36,14 +36,17 @@ const SCORECARD_TASK = "3";
 /** The winners of the captured `picked` event, as a scorecard names them: account and share. */
 const PICKED_WINNERS = fixtureData("picked").winners.map(({ account, bps }) => ({ account, bps }));
 
+/** What the captured task committed to, as the board's task 3 does: its scorecard has to rest on it. */
+const COMMITTED = fixtureData("task_created");
+
 /** The scorecard of the board's task 3, which pays what the task's pick paid. */
 const SCORECARD: Scorecard = {
   version: 1,
   task_id: SCORECARD_TASK,
   verifier: judge,
   kind: "exact",
-  criteria_hash: sha256Hex("criteria"),
-  heldout_commitment: null,
+  criteria_hash: COMMITTED.criteria_hash,
+  heldout_commitment: COMMITTED.heldout_commitment,
   heldout: null,
   tie_break: "score desc, committed_at_block asc, account asc",
   entries: [
@@ -277,6 +280,7 @@ test("client_round_trips_against_in_process_app", async () => {
     indexed_height: "100",
     chain_final_height: "100",
     lag_blocks: "0",
+    waiting_for_chain: false,
   });
 
   // One sign-in served all of it.

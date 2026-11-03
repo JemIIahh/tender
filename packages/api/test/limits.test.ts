@@ -3,12 +3,14 @@ import { randomBytes } from "node:crypto";
 import { FIXTURE_ACCOUNTS } from "@tender/indexer/testing";
 import { sha256Hex } from "@tender/shared";
 import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
 import { Account, KeyPair, KeyPairSigner, type Provider } from "near-api-js";
 import * as nearNep413 from "near-api-js/nep413";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import type { ChallengeResponse } from "../src/auth";
 import { handleError } from "../src/format";
 import { type ApiDeps, clientKey, createApp, type ErrorBody } from "../src/index";
+import { rateLimitsOf, uploadBudget } from "../src/limits";
 import { healthRoutes } from "../src/routes/health";
 import { fakeClient, resetDb, TEST_NOW, testDeps } from "./helpers";
 
@@ -127,6 +129,51 @@ test("a_limit_lets_the_caller_in_again_once_its_window_is_over", async () => {
   await expectLimited(await post(app, "/v1/auth/challenge"), 1);
   await new Promise((resolve) => setTimeout(resolve, 350));
   expect((await post(app, "/v1/auth/challenge")).status).toBe(200);
+});
+
+/** The answer that `fn` stops its request with, or a failure if it stops nothing. */
+function refusalOf(fn: () => void): Response {
+  try {
+    fn();
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+  throw new Error("expected the request to be refused");
+}
+
+test("the_byte_budget_still_limits_a_key_after_the_clock_steps_back", () => {
+  const HOUR = 3_600_000;
+  const budget = uploadBudget(rateLimitsOf({ uploadBytes: { limit: 100, windowMs: HOUR } }), []);
+  const start = Date.UTC(2026, 10, 3, 10, 0, 0);
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    // Bob's window opens at 10:00 and ends at 11:00.
+    vi.setSystemTime(start);
+    budget.reserve(bob, "blobs", 10);
+    // The clock steps back to 09:00, and Alice's window opens there and ends at 10:00. The map now
+    // holds Bob's window, which ends later, ahead of Alice's, which ends sooner.
+    vi.setSystemTime(start - HOUR);
+    budget.reserve(alice, "blobs", 60);
+
+    // At 10:30 Alice's window is over and Bob's is not. Alice has her whole allowance again, and
+    // no more than it: a window that has ended is neither room nor a place to keep spending.
+    vi.setSystemTime(start + HOUR / 2);
+    budget.reserve(alice, "blobs", 60);
+    const refused = refusalOf(() => budget.reserve(alice, "blobs", 60));
+    expect(refused.status).toBe(429);
+    // The wait is the new window's: it began at 10:30 and ends at 11:30.
+    expect(refused.headers.get("retry-after")).toBe(String(HOUR / 1000));
+    // Bob's window is the one he spent in, untouched.
+    budget.reserve(bob, "blobs", 90);
+    expect(refusalOf(() => budget.reserve(bob, "blobs", 1)).status).toBe(429);
+
+    // Alice's new window ends at 11:30, and a clock that stands at its end has no window for her.
+    vi.setSystemTime(start + 1.5 * HOUR);
+    budget.reserve(alice, "blobs", 100);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 // ---- The client address -----------------------------------------------------------------------

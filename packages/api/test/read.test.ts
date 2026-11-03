@@ -191,6 +191,7 @@ test("health_reports_lag", async () => {
     indexed_height: "90",
     chain_final_height: "100",
     lag_blocks: "10",
+    waiting_for_chain: false,
   });
 
   // Caught up, and an index that is ahead of the node the API asks: the lag is never negative.
@@ -593,7 +594,8 @@ test("task_detail_returns_the_documents_the_task_points_at", async () => {
     verifier: judge,
     kind: "exact",
     criteria_hash: criteriaHash,
-    heldout_commitment: null,
+    // The held-out of the captured task, which task 3 commits to as well.
+    heldout_commitment: fixtureData("task_created").heldout_commitment,
     heldout: null,
     tie_break: "score desc, committed_at_block asc, account asc",
     entries: [
@@ -642,8 +644,9 @@ test("task_detail_reads_only_public_blobs_of_the_matching_kind", async () => {
     task_id: taskId,
     verifier: judge,
     kind: "exact",
-    criteria_hash: sha256Hex("criteria"),
-    heldout_commitment: null,
+    // What the captured task committed to, as task 4 does: its card rests on it. Task 3's does not.
+    criteria_hash: fixtureData("task_created").criteria_hash,
+    heldout_commitment: fixtureData("task_created").heldout_commitment,
     heldout: null,
     tie_break: "score desc, committed_at_block asc, account asc",
     entries: [],

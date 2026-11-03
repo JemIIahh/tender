@@ -120,6 +120,7 @@ const HEALTH = {
   indexed_height: "100",
   chain_final_height: "102",
   lag_blocks: "2",
+  waiting_for_chain: false,
 };
 
 interface Call {

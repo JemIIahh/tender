@@ -20,6 +20,7 @@ import {
   ProfileSchema,
   PublicCriteriaSchema,
   randomSalt,
+  type Scorecard,
   ScorecardSchema,
   STORAGE_MIN_DEPOSIT,
   sha256Hex,
@@ -120,9 +121,11 @@ import {
 // holds a scorecard to the account that uploads it (P03-R29): it must name that account as its
 // verifier, and only the Judge's account may use the Judge's name. `pick_winners` makes the same
 // checks first, so that a scorecard the API would refuse is refused here with the reason, before
-// anything is sent. The contract's rules for the winners (`E_WINNERS`) are checked before the
-// upload too, since a pick that the chain then refuses would leave the scorecard public all the
-// same.
+// anything is sent. That includes the two hashes it must copy from its task (`criteria_hash` and
+// `heldout_commitment`): the API refuses a card that differs and would not show one that was
+// stored, so a pick sent with one would pay a task whose scorecard nobody could read. The
+// contract's rules for the winners (`E_WINNERS`) are checked before the upload too, since a pick
+// that the chain then refuses would leave the scorecard public all the same.
 
 /** The most bytes a result may have: a brief's `output.max_bytes` can be no more. */
 const MAX_RESULT = MAX_RESULT_BYTES;
@@ -1535,35 +1538,64 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
   // ---- pick_winners ---------------------------------------------------------------------------
 
   /**
-   * The contract's rules for a non-empty pick (`E_WINNERS`, in `check_winners`), checked before the
-   * scorecard goes up: the shares add up to exactly 10,000, no account is named twice, the task pays
-   * that many winners, and each winner has a revealed entry. The shares and names are the arguments'
-   * own; the task and its entries come from the API, the one place that lists them. A pick that the
-   * chain then refused would still leave the scorecard public.
+   * What a pick must satisfy before the scorecard goes up, checked in one place so that a pick
+   * the API or the chain would refuse is refused here, with the reason, before anything is sent.
+   *
+   * The scorecard must rest on its task: the API refuses a card whose `criteria_hash` or
+   * `heldout_commitment` is not the task's when it is uploaded, and would not show one that was
+   * stored. Those two come from the task the API lists, the same one that lists the entries. This
+   * is read for an empty pick as well, since its scorecard goes up all the same.
+   *
+   * Then the contract's rules for a non-empty pick (`E_WINNERS`, in `check_winners`): the shares
+   * add up to exactly 10,000, no account is named twice, the task pays that many winners, and
+   * each winner has a revealed entry. The shares and names are the arguments' own. A pick that
+   * the chain then refused would still leave the scorecard public.
    */
-  async function checkWinners(
+  async function checkPick(
     taskId: string,
     winners: ReadonlyArray<{ account: string; bps: number }>,
+    card: Scorecard,
   ): Promise<void> {
-    const total = winners.reduce((sum, winner) => sum + winner.bps, 0);
-    if (total !== BPS_WHOLE) {
-      throw new ToolError(
-        "INVALID_WINNERS",
-        `the shares add up to ${total}, and they must add up to exactly ${BPS_WHOLE}`,
-      );
-    }
-    const named = new Set<string>();
-    for (const { account } of winners) {
-      if (named.has(account)) {
-        throw new ToolError("INVALID_WINNERS", `${account} is named more than once`);
+    if (winners.length > 0) {
+      const total = winners.reduce((sum, winner) => sum + winner.bps, 0);
+      if (total !== BPS_WHOLE) {
+        throw new ToolError(
+          "INVALID_WINNERS",
+          `the shares add up to ${total}, and they must add up to exactly ${BPS_WHOLE}`,
+        );
       }
-      named.add(account);
+      const named = new Set<string>();
+      for (const { account } of winners) {
+        if (named.has(account)) {
+          throw new ToolError("INVALID_WINNERS", `${account} is named more than once`);
+        }
+        named.add(account);
+      }
     }
 
     const detail = await api.getTask(BigInt(taskId));
     if (detail === null) {
       throw new ToolError("NO_TASK", `the API has no task ${taskId}, so there is nothing to pick`);
     }
+    if (card.criteria_hash !== detail.task.criteria_hash) {
+      throw new ToolError(
+        "SCORECARD_MISMATCH",
+        `the scorecard's criteria_hash is not task ${taskId}'s (${detail.task.criteria_hash}): ` +
+          "copy it from the task. The API would refuse the scorecard, and would not show one " +
+          "that is picked with",
+      );
+    }
+    if (card.heldout_commitment !== detail.task.heldout_commitment) {
+      throw new ToolError(
+        "SCORECARD_MISMATCH",
+        `the scorecard's heldout_commitment is not task ${taskId}'s ` +
+          `(${detail.task.heldout_commitment ?? "null: the task has no held-out part"}): copy it ` +
+          "from the task. The API would refuse the scorecard, and would not show one that is " +
+          "picked with",
+      );
+    }
+    if (winners.length === 0) return;
+
     const most = detail.task.max_winners;
     if (winners.length > most) {
       throw new ToolError(
@@ -1595,6 +1627,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "otherwise; software named tender-judge, in any case and with or without punctuation, is " +
         "the Judge account's alone). get_scorecard shows the shape, but what it returns was made " +
         "by that task's verifier (the Judge, for a task the Judge scores), so do not reuse it. " +
+        "criteria_hash and heldout_commitment must be the task's own (get_task shows them; " +
+        "heldout_commitment is null for a task without a held-out part): a scorecard that " +
+        "differs is refused with SCORECARD_MISMATCH, since the API would not show it. " +
         "The scorecard is checked, published and its hash goes on chain with the pick; one that " +
         "holds this server's private key, or another secret it was given, is refused with " +
         "SECRET_IN_CONTENT before anything is published (best effort, as at commit_result). " +
@@ -1669,7 +1704,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       // A scorecard is public and cannot be taken back, so it is looked at for the server's secrets
       // before anything is asked of the API, let alone published.
       const scorecardBytes = bytesToPublish("scorecard", "pick_winners", card.data);
-      if (winners.length > 0) await checkWinners(task_id, winners);
+      await checkPick(task_id, winners, card.data);
 
       const doc = await uploadDocument("scorecard", scorecardBytes);
       const picked = await sending(

@@ -13,6 +13,7 @@ import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import { type ApiDeps, nowNs } from "./deps";
 import { DEFAULT_LIMIT, MAX_LIMIT } from "./format";
+import { clientKey, rateLimit, rateLimitsOf } from "./limits";
 import { getAgentDetail, getScorecard, getTaskDetail, listAgents, listTasks } from "./queries";
 
 // The remote MCP server: the read routes of the API as five tools, for the agents that browse the
@@ -46,6 +47,10 @@ import { getAgentDetail, getScorecard, getTaskDetail, listAgents, listTasks } fr
 // connection open for as long as its sender liked. Batching left the protocol in 2025-06-18 and the
 // SDK's client sends none. The wait for an answer ends at a bound too, so a request that goes
 // unanswered for any other reason cannot hold a connection either.
+//
+// Each request builds a server and a transport, so a client is held to a number of them in a
+// window, counted by its address as the other per-client limits count it (`clientKey`,
+// `limits.mcp`): past it the answer is a 429 with `Retry-After`, sent before the body is read.
 
 /**
  * Where the server answers. It is no `/v1` route, so the CORS block of `/v1` does not cover it: MCP
@@ -254,11 +259,14 @@ function rpcError(code: number, message: string) {
 /**
  * Mounts the server at `/mcp`. A POST carries one JSON-RPC message of at most `MAX_BODY_BYTES`, and
  * is answered within `REQUEST_TIMEOUT_MS`; any other method is a 405, since a stateless server has
- * no stream to open and no session to end.
+ * no stream to open and no session to end. A POST counts against its client's limit
+ * (`limits.mcp`, 300 a minute unless `deps.rateLimits` says otherwise) before anything is read;
+ * the 405s cost nothing and are not counted.
  */
 export function mountMcp(app: Hono, deps: ApiDeps): void {
   app.post(
     MCP_PATH,
+    rateLimit(rateLimitsOf(deps.rateLimits).mcp, (c) => clientKey(c, deps.trustedProxyHops ?? 0)),
     bodyLimit({
       maxSize: MAX_BODY_BYTES,
       onError: (c) => c.json(rpcError(-32600, "request body too large"), 413),

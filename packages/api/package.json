@@ -21,6 +21,7 @@
   },
   "devDependencies": {
     "@tender/indexer": "workspace:*",
+    "@tender/judge": "workspace:*",
     "near-api-js": "7.4.0"
   }
 }

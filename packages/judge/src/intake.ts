@@ -207,22 +207,28 @@ const MAX_COMPILE_RETRIES = 3;
  *   commitment does not count (P05-R7): once a commitment is on chain anyone can post a task
  *   with it, and only someone who holds the bytes already can have a copy judged, which
  *   publishes them. A stranger who posted one first must not block the poster's own;
- * - held-out checks that are stored under the commitment but not as the poster's `heldout` blob,
- *   that are over 262_144 bytes, that do not fit `HeldoutSchema`, that are of another kind than
- *   the criteria, that hold a surrogate half with no partner, or whose bytes are not their
- *   canonical form. The scorecard republishes them, and has to hash to the commitment.
+ * - held-out checks that are stored under the commitment but not as a `heldout` blob that the
+ *   poster uploaded (`posterHeldout`), that are over 262_144 bytes, that do not fit
+ *   `HeldoutSchema`, that are of another kind than the criteria, that hold a surrogate half with
+ *   no partner, or whose bytes are not their canonical form. The scorecard republishes them, and
+ *   has to hash to the commitment.
  *
  * Held-out checks that are not stored yet leave the task `pending` (`waiting for held-out
  * checks`) for 10 minutes from its `created_at`, and then it is `rejected` (`held-out checks
- * missing`). While it waits, the schema's compile check, which needs a worker, is not run yet,
- * and the reasons that come after it are not given: the cheap checks before it are. Once the wait
- * is over, the two reasons that need no worker, `held-out checks missing` and `held-out checks
- * already used by task {id}`, are given before the compile check, so that a task that would be
- * turned away for them costs no worker (I5). Anything that throws while the documents are
- * checked, a RangeError included, rejects the task with a fixed reason, and so does a check that
- * crashes its worker. A database error is thrown instead, and so is a worker that cannot be
- * started (`ScorerUnavailableError`): neither says anything about the task, and the next tick
- * tries again. Every reason is at most 200 code points.
+ * missing`). So do checks that a stranger stored first and the poster has not sent: the poster's
+ * upload can still come, and then the task is accepted; once the 10 minutes are over they are
+ * `rejected` (`held-out checks were not uploaded by the poster`). The poster's own upload counts
+ * as soon as its bytes are stored, before the upload is recorded. Checks stored as another kind
+ * of blob cannot become the poster's, and are refused at once. While it waits, the schema's
+ * compile check, which needs a worker, is not run yet, and the reasons that come after it are not
+ * given: the cheap checks before it are. Once the wait is over, the two reasons that need no
+ * worker, `held-out checks missing` and `held-out checks already used by task {id}`, are given
+ * before the compile check, so that a task that would be turned away for them costs no worker
+ * (I5). Anything that throws while the documents are checked, a RangeError included, rejects the
+ * task with a fixed reason, and so does a check that crashes its worker. A database error is
+ * thrown instead, and so is a worker that cannot be started (`ScorerUnavailableError`): neither
+ * says anything about the task, and the next tick tries again. Every reason is at most 200 code
+ * points.
  */
 export async function intakeTask(
   deps: JudgeDeps,
@@ -294,11 +300,12 @@ export async function intakeTask(
  * criteria that fail the criteria check now, under rules newer than the task's intake, are not
  * scored: such a result has `criteriaCheck` set.
  *
- * With `waitForHeldout`, held-out checks that are not stored yet make the task `pending` for 10
- * minutes from its `created_at`, and the compile part of the criteria check waits for them: a
- * pending task starts no worker. Without it they are missing at once. A database error is thrown,
- * and so is `ScorerUnavailableError` when the worker of the schema check cannot be started;
- * anything else that goes wrong is a `rejected` result with its reason.
+ * With `waitForHeldout`, held-out checks that are not stored yet, or that only a stranger has sent,
+ * make the task `pending` for 10 minutes from its `created_at` (`posterHeldout`), and the compile
+ * part of the criteria check waits for them: a pending task starts no worker. Without it they are
+ * missing, or not the poster's, at once. A database error is thrown, and so is
+ * `ScorerUnavailableError` when the worker of the schema check cannot be started; anything else
+ * that goes wrong is a `rejected` result with its reason.
  */
 export async function loadDocuments(
   db: Db,
@@ -389,11 +396,10 @@ async function checkDocuments(
     problem = CHECK_FAILED;
   }
   if (problem !== null) return criteriaRefused(problem);
-  // A task whose held-out checks have not come yet waits before anything costs a worker: its
-  // poster has 10 minutes from posting to send them.
-  const waited = policy.nowNs - BigInt(task.created_at);
-  const stillComing = policy.waitForHeldout && waited < HELDOUT_WAIT_NS;
-  if (task.heldout_commitment !== null && heldoutBlob === null && stillComing) {
+  // A task whose poster has not sent its held-out checks yet waits before anything costs a worker:
+  // the poster has 10 minutes from posting to send them (`posterHeldout`).
+  const standing = posterHeldout(task, stored, policy);
+  if (task.heldout_commitment !== null && standing === "awaited") {
     return { ok: false, status: "pending", reason: HELDOUT_WAITING };
   }
   // The refusals that cost a query and no worker come before the compile, which starts one (I5):
@@ -412,12 +418,8 @@ async function checkDocuments(
   // Their 10 minutes are over, or this is judging, which does not wait. (A task whose checks are
   // missing, or already used, was turned away before the compile: `cheapRefusal`.)
   if (heldoutBlob === null) return rejected(HELDOUT_MISSING);
-  // Blobs are content-addressed and the first upload of some bytes decides their kind, and anyone
-  // who has the bytes can be first. The checks are the poster's when the poster is among the
-  // accounts that uploaded them as a held-out document (`heldout_uploads`), whoever was first.
-  if (heldoutBlob.kind !== "heldout" || !stored.heldoutFromPoster) {
-    return rejected(HELDOUT_NOT_THE_POSTERS);
-  }
+  // Stored, but not the poster's (`posterHeldout`), and the poster's upload will not come now.
+  if (standing !== "sent") return rejected(HELDOUT_NOT_THE_POSTERS);
   if (heldoutBlob.bytes.byteLength > MAX_DOCUMENT_BYTES) return rejected(HELDOUT_TOO_LARGE);
   const heldout = parseJson(heldoutBlob.bytes);
   const valid = HeldoutSchema.safeParse(heldout);
@@ -437,6 +439,37 @@ async function checkDocuments(
   if (sha256Hex(canonical) !== task.heldout_commitment) return rejected(HELDOUT_NOT_COMMITTED);
   // `heldout` passed `HeldoutSchema`, which is strict, so it is one member of `Heldout`.
   return { ok: true, documents: { criteria, heldout: heldout as Heldout } };
+}
+
+/**
+ * Where a task's held-out checks stand with its poster, which is one rule for three cases:
+ *
+ * - `sent`: the stored bytes are a held-out document the poster uploaded. Blobs are
+ *   content-addressed, the first upload of some bytes decides their kind, and anyone who has the
+ *   bytes can be first, so the row's uploader is not enough: the poster is among the accounts
+ *   recorded as having sent them (`heldout_uploads`), whoever was first. `POST /v1/heldout` stores
+ *   the row and then records the upload, as two statements, so the poster who was first has a row
+ *   and no record in between: being the row's uploader counts too.
+ * - `awaited`: the poster's upload can still come, so the task is not decided. Nothing is stored
+ *   yet, or what is stored is a held-out document that a stranger sent first and the poster has
+ *   not (its upload would be recorded beside the stranger's), and the 10 minutes from posting are
+ *   not over. Judging does not wait (`policy.waitForHeldout`).
+ * - `never`: it will not come, or it is too late. Bytes stored as another kind of blob are never
+ *   re-kinded, and an upload of them is answered 409, so waiting for it would only hold the
+ *   refusal up. Otherwise the time is over, or this is judging.
+ */
+function posterHeldout(
+  task: TaskTerms,
+  stored: Stored,
+  policy: Policy,
+): "sent" | "awaited" | "never" {
+  const blob = stored.heldout;
+  if (blob?.kind === "heldout" && (stored.heldoutFromPoster || blob.uploader === task.poster)) {
+    return "sent";
+  }
+  const waited = policy.nowNs - BigInt(task.created_at);
+  const stillComing = policy.waitForHeldout && waited < HELDOUT_WAIT_NS;
+  return stillComing && (blob === null || blob.kind === "heldout") ? "awaited" : "never";
 }
 
 function rejected(reason: string): DocumentsCheck {

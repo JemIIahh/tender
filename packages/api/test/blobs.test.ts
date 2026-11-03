@@ -187,14 +187,17 @@ const HELDOUT = { exact: { expected: ["42"] } };
 const HELDOUT_BYTES = canonicalJson(HELDOUT);
 const HELDOUT_HASH = sha256Hex(HELDOUT_BYTES);
 
+/** What the captured task committed to: a scorecard is shown only if it rests on the same. */
+const COMMITTED = fixtureData("task_created");
+
 function scorecardOf(taskId: string, over: Partial<Scorecard> = {}): Scorecard {
   return {
     version: 1,
     task_id: taskId,
     verifier: judge,
     kind: "exact",
-    criteria_hash: sha256Hex("criteria"),
-    heldout_commitment: null,
+    criteria_hash: COMMITTED.criteria_hash,
+    heldout_commitment: COMMITTED.heldout_commitment,
     heldout: null,
     tie_break: "score desc, committed_at_block asc, account asc",
     entries: [],
@@ -776,6 +779,76 @@ test("scorecard_upload_only_by_verifier_or_poster", async () => {
   });
 });
 
+test("a_scorecard_that_does_not_rest_on_the_criteria_and_held_out_of_its_task_is_refused", async () => {
+  // The read side shows a scorecard only beside the criteria and held-out its task committed to, and
+  // a pick cannot be taken back, so the upload refuses the card that would never be shown.
+  const base = await seed();
+  await apply(taskLine(2), taskLine(3));
+  await deps.db.query("update tasks set heldout_commitment = null where id = 3");
+  nowNs = REVEAL_DEADLINE;
+  const upload = (document: Scorecard) => blobBody("scorecard", canonicalJson(document));
+  const refusal = (field: string) => ({
+    error: "bad_request",
+    message: `the scorecard's ${field} is not the task's: copy it from the task`,
+  });
+
+  const wrong: Array<[string, Scorecard, string]> = [
+    [
+      "other criteria",
+      scorecardOf("1", { criteria_hash: sha256Hex("other criteria") }),
+      "criteria_hash",
+    ],
+    [
+      "other held-out",
+      scorecardOf("1", { heldout_commitment: sha256Hex("other") }),
+      "heldout_commitment",
+    ],
+    [
+      "no held-out where the task has one",
+      scorecardOf("1", { heldout_commitment: null }),
+      "heldout_commitment",
+    ],
+    [
+      "held-out where the task has none",
+      scorecardOf("3", { heldout_commitment: HELDOUT_HASH }),
+      "heldout_commitment",
+    ],
+  ];
+  for (const [what, card, field] of wrong) {
+    const res = await post<ErrorBody>("/v1/blobs", upload(card), judge);
+    expect([res.status, res.body], what).toEqual([400, refusal(field)]);
+    // The poster's own card is held to the same.
+    const own = await post<ErrorBody>(
+      "/v1/blobs",
+      upload({ ...card, verifier: poster, judge: { software: "poster-script/1", model: null } }),
+      poster,
+    );
+    expect([own.status, own.body], `${what}, by the poster`).toEqual([400, refusal(field)]);
+  }
+  // Nothing was stored.
+  expect(await blobCount()).toBe(base);
+
+  // The card that rests on what the task committed to is taken, for a task with a held-out and for
+  // one without.
+  expect((await post("/v1/blobs", upload(scorecardOf("1")), judge)).status).toBe(200);
+  const plain = scorecardOf("3", { heldout_commitment: null });
+  expect((await post("/v1/blobs", upload(plain), judge)).status).toBe(200);
+  expect(await blobCount()).toBe(base + 2);
+
+  // Where it comes among the other refusals: after what the account may not do, which it is told
+  // first, and before the clock, since waiting would not mend the card.
+  const mismatch = scorecardOf("1", { criteria_hash: sha256Hex("other criteria") });
+  const nameless = await post<ErrorBody>(
+    "/v1/blobs",
+    upload({ ...mismatch, verifier: alice }),
+    alice,
+  );
+  expect([nameless.status, nameless.body.error]).toEqual([403, "forbidden"]);
+  nowNs = REVEAL_DEADLINE - 1n;
+  const early = await post<ErrorBody>("/v1/blobs", upload(mismatch), judge);
+  expect([early.status, early.body]).toEqual([400, refusal("criteria_hash")]);
+});
+
 test("scorecard_upload_waits_for_the_reveal_deadline", async () => {
   const base = await seed();
   const tooEarly = { error: "too_early", message: "the task's reveal window has not closed" };
@@ -784,7 +857,10 @@ test("scorecard_upload_waits_for_the_reveal_deadline", async () => {
   // the same held-out document, which would make task 1 wait for it
   // (scorecard_waits_for_every_task_sharing_its_heldout).
   const later = REVEAL_DEADLINE + 60n * SECOND;
-  await openTask(2, later, [alice], { heldout_commitment: sha256Hex("the held-out of task 2") });
+  const heldoutOf2 = sha256Hex("the held-out of task 2");
+  await openTask(2, later, [alice], { heldout_commitment: heldoutOf2 });
+  // A card rests on the criteria and the held-out of its task, so the cards of task 2 carry its own.
+  const card2 = () => scorecardOf("2", { heldout_commitment: heldoutOf2 });
 
   // A nanosecond before the deadline of its task, the verifier and the poster are both told to
   // wait, and nothing is stored.
@@ -816,13 +892,13 @@ test("scorecard_upload_waits_for_the_reveal_deadline", async () => {
   expect(await blobCount()).toBe(base + 2);
 
   // Each task has a deadline of its own: task 2 is still open, though task 1 is not.
-  const open = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("2")), judge);
+  const open = await post<ErrorBody>("/v1/blobs", upload(card2()), judge);
   expect(open.status).toBe(409);
   expect(open.body).toEqual(tooEarly);
   nowNs = later - 1n;
-  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(409);
+  expect((await post("/v1/blobs", upload(card2()), judge)).status).toBe(409);
   nowNs = later;
-  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(card2()), judge)).status).toBe(200);
   expect(await blobCount()).toBe(base + 3);
 });
 
@@ -1877,6 +1953,38 @@ test("a_scorecard_is_served_only_beside_the_payout_it_names", async () => {
   expect(await servedScorecards("4")).toEqual([null, null, null]);
 });
 
+test("a_scorecard_is_served_only_for_the_criteria_and_held_out_the_task_committed_to", async () => {
+  await seedLifecycle(deps.db);
+  // Tasks 2 to 5 commit to the captured criteria and held-out. Tasks 6 and 7 have no held-out part.
+  await apply(...[2, 3, 4, 5, 6, 7].map((id) => taskLine(id)));
+  await deps.db.query("update tasks set heldout_commitment = null where id in (6, 7)");
+  const settle = async (id: string, over: Partial<Scorecard>) => {
+    const card = scorecardOf(id, { winners: PICKED_WINNERS, ...over });
+    await apply(pickLine(id, judge, PICKED_WINNERS, await publishCard(card)));
+    return card;
+  };
+
+  // The card that goes with the task's commitments is shown. (`scorecardOf` has them by default.)
+  const matching = await settle("2", {});
+  expect(matching.criteria_hash).toBe(COMMITTED.criteria_hash);
+  expect(matching.heldout_commitment).toBe(COMMITTED.heldout_commitment);
+  expect(await servedScorecards("2")).toEqual([matching, matching, matching]);
+  // So is the card of a task with no held-out part, when it says so.
+  const plain = await settle("7", { heldout_commitment: null });
+  expect(await servedScorecards("7")).toEqual([plain, plain, plain]);
+
+  // A card that scored against other criteria is not the task's scorecard, whoever wrote it. Nor
+  // is one that rests on another held-out document, or on none where the task has one, or on one
+  // where the task has none.
+  await settle("3", { criteria_hash: sha256Hex("other criteria") });
+  await settle("4", { heldout_commitment: sha256Hex("another held-out document") });
+  await settle("5", { heldout_commitment: null });
+  await settle("6", { heldout_commitment: HELDOUT_HASH });
+  for (const id of ["3", "4", "5", "6"]) {
+    expect(await servedScorecards(id), `task ${id}`).toEqual([null, null, null]);
+  }
+});
+
 test("a_scorecard_of_an_empty_pick_names_no_winners", async () => {
   await seedLifecycle(deps.db);
   await apply(taskLine(2), taskLine(3));
@@ -1921,7 +2029,11 @@ test("scorecard_route_hides_a_private_scorecard", async () => {
     uploader: judge,
     isPublic: false,
   });
-  await apply(taskLine(3), eventLine("picked", { task_id: "3", scorecard_hash: hash }));
+  // The task committed to the held-out its scorecard publishes.
+  await apply(
+    taskLine(3, { heldout_commitment: HELDOUT_HASH }),
+    eventLine("picked", { task_id: "3", scorecard_hash: hash }),
+  );
   const app = createApp(deps);
 
   expect((await get("/v1/scorecards/3", app)).status).toBe(404);
@@ -2345,32 +2457,36 @@ test("scorecard_waits_for_every_task_sharing_its_heldout", async () => {
   const minute = REVEAL_DEADLINE + 60n * SECOND;
   const hour = REVEAL_DEADLINE + 3600n * SECOND;
   const shared = sha256Hex("a held-out document that two tasks use");
+  const own4 = sha256Hex("a held-out document of its own");
+  // A card rests on the held-out of its task, so each card here carries the one its task has.
+  const cardOf = (account: string, id: string, heldout_commitment: string | null) =>
+    scorecardBy(account, id, { heldout_commitment });
   await openTask(2, REVEAL_DEADLINE, [], { heldout_commitment: shared });
   await openTask(3, minute, [], { heldout_commitment: shared });
-  await openTask(4, hour, [], { heldout_commitment: sha256Hex("a held-out document of its own") });
+  await openTask(4, hour, [], { heldout_commitment: own4 });
 
   // Task 2 has closed its reveals but task 3, which shares its held-out, has not: publishing the
   // scorecard of task 2 would give the answers to a task that still takes reveals. The verifier and
   // the poster are told to wait, and whoever has no right to upload is told that first.
   nowNs = REVEAL_DEADLINE;
   for (const account of [judge, poster]) {
-    const early = await post<ErrorBody>("/v1/blobs", upload(scorecardBy(account, "2")), account);
+    const early = await post<ErrorBody>("/v1/blobs", upload(cardOf(account, "2", shared)), account);
     expect([early.status, early.body], account).toEqual([409, tooEarly]);
   }
-  const stranger = await post<ErrorBody>("/v1/blobs", upload(scorecardBy(alice, "2")), alice);
+  const stranger = await post<ErrorBody>("/v1/blobs", upload(cardOf(alice, "2", shared)), alice);
   expect([stranger.status, stranger.body.error]).toEqual([403, "forbidden"]);
   nowNs = minute - 1n;
-  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(409);
+  expect((await post("/v1/blobs", upload(cardOf(judge, "2", shared)), judge)).status).toBe(409);
   expect(await blobCount()).toBe(0);
 
   // When task 3 closes, both may publish. Task 4 is still open, and shares nothing with them.
   nowNs = minute;
-  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(200);
-  expect((await post("/v1/blobs", upload(scorecardBy(poster, "3")), poster)).status).toBe(200);
-  const own = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("4")), judge);
+  expect((await post("/v1/blobs", upload(cardOf(judge, "2", shared)), judge)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(cardOf(poster, "3", shared)), poster)).status).toBe(200);
+  const own = await post<ErrorBody>("/v1/blobs", upload(cardOf(judge, "4", own4)), judge);
   expect([own.status, own.body]).toEqual([409, tooEarly]);
   nowNs = hour;
-  expect((await post("/v1/blobs", upload(scorecardOf("4")), judge)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(cardOf(judge, "4", own4)), judge)).status).toBe(200);
   expect(await blobCount()).toBe(3);
 
   // Tasks that have no held-out share none: task 5 is not held back for task 6, which has none either.
@@ -2383,7 +2499,7 @@ test("scorecard_waits_for_every_task_sharing_its_heldout", async () => {
       fallback_deadline: (deadline + 120n * SECOND).toString(),
     });
   await apply(withoutHeldout(5, hour), withoutHeldout(6, hour + 3600n * SECOND));
-  expect((await post("/v1/blobs", upload(scorecardOf("5")), judge)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(cardOf(judge, "5", null)), judge)).status).toBe(200);
 });
 
 test("a_strangers_copy_of_a_heldout_does_not_hold_a_scorecard_back", async () => {
@@ -2399,29 +2515,32 @@ test("a_strangers_copy_of_a_heldout_does_not_hold_a_scorecard_back", async () =>
   const minute = REVEAL_DEADLINE + 60n * SECOND;
   const faraway = REVEAL_DEADLINE + 1_000_000n * SECOND;
   const shared = sha256Hex("a held-out document that a stranger copied");
+  // All three tasks name the same held-out, so every card here carries it.
+  const cardOf = (account: string, id: string) =>
+    scorecardBy(account, id, { heldout_commitment: shared });
   await openTask(2, REVEAL_DEADLINE, [], { heldout_commitment: shared });
   await openTask(3, minute, [], { heldout_commitment: shared });
   await openTask(4, faraway, [], { heldout_commitment: shared, poster: carol });
 
   // The poster's own task 3 holds the scorecard of task 2 back until it closes.
   nowNs = REVEAL_DEADLINE;
-  const early = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("2")), judge);
+  const early = await post<ErrorBody>("/v1/blobs", upload(cardOf(judge, "2")), judge);
   expect([early.status, early.body]).toEqual([409, tooEarly]);
   nowNs = minute - 1n;
-  expect((await post("/v1/blobs", upload(scorecardBy(poster, "2")), poster)).status).toBe(409);
+  expect((await post("/v1/blobs", upload(cardOf(poster, "2")), poster)).status).toBe(409);
   expect(await blobCount()).toBe(0);
 
   // Carol's task has days to run, and holds nothing back.
   nowNs = minute;
-  expect((await post("/v1/blobs", upload(scorecardOf("2")), judge)).status).toBe(200);
-  expect((await post("/v1/blobs", upload(scorecardBy(poster, "3")), poster)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(cardOf(judge, "2")), judge)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(cardOf(poster, "3")), poster)).status).toBe(200);
   expect(await blobCount()).toBe(2);
 
   // Her own task waits for its own reveal window, like any other.
-  const own = await post<ErrorBody>("/v1/blobs", upload(scorecardOf("4")), judge);
+  const own = await post<ErrorBody>("/v1/blobs", upload(cardOf(judge, "4")), judge);
   expect([own.status, own.body]).toEqual([409, tooEarly]);
   nowNs = faraway;
-  expect((await post("/v1/blobs", upload(scorecardOf("4")), judge)).status).toBe(200);
+  expect((await post("/v1/blobs", upload(cardOf(judge, "4")), judge)).status).toBe(200);
 });
 
 test("scorecard_route_hides_a_stored_scorecard_it_cannot_write_again", async () => {

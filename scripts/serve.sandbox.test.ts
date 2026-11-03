@@ -203,6 +203,7 @@ interface Health {
   indexed_height: string;
   chain_final_height: string;
   lag_blocks: string;
+  waiting_for_chain: boolean;
 }
 
 async function health(url: string): Promise<{ status: number; body: Health }> {
@@ -459,6 +460,8 @@ test("serve_boots_with_pglite_and_reports_health", async () => {
   expect(last?.body).toMatchObject({ ok: true, network: "sandbox", contract: chain.contractId });
   expect(BigInt(last?.body.indexed_height ?? "0")).toBeGreaterThan(0n);
   expect(BigInt(last?.body.lag_blocks ?? "20")).toBeLessThan(20n);
+  // Nothing is waited for.
+  expect(last?.body.waiting_for_chain).toBe(false);
   // Nothing was asked of a keeper, a Judge or a bot, and none runs.
   expect(lines).toContain("serve: keeper off (KEEPER_PRIVATE_KEY is not set)");
   expect(lines).toContain("serve: Judge off (JUDGE_PRIVATE_KEY is not set)");
@@ -1153,6 +1156,9 @@ test("serve_serves_while_the_chain_cannot_be_asked_and_indexes_once_it_can", asy
   const served = await health(services.url);
   expect(served.status).toBe(200);
   expect(BigInt(served.body.indexed_height)).toBe(cursor);
+  // The API is up and `ok`, and says that the services wait for the chain.
+  expect(served.body.ok).toBe(true);
+  expect(served.body.waiting_for_chain).toBe(true);
   expect((await fetch(`${services.url}/v1/tasks/${taskId}`)).status).toBe(200);
 
   // Once the node answers, the database is found to match, and they start.
@@ -1161,6 +1167,7 @@ test("serve_serves_while_the_chain_cannot_be_asked_and_indexes_once_it_can", asy
     async () => lines.some((line) => line.startsWith("serve: keeper on")),
     30_000,
   );
+  expect((await health(services.url)).body.waiting_for_chain).toBe(false);
   expect(lines).toContain(
     "indexer: the database matches the chain; starting the indexer and the keeper",
   );
@@ -1318,6 +1325,11 @@ test("serve_waits_for_a_node_behind_the_index_off_the_sandbox_and_says_so_now_an
   const served = await health(services.url);
   expect(served.status).toBe(200);
   expect(BigInt(served.body.indexed_height)).toBe(cursor);
+  // `lag_blocks` cannot show a node that is behind the index, which is why health says it, and
+  // keeps saying it between the WARN lines.
+  expect(served.body.waiting_for_chain).toBe(true);
+  await sleep(100);
+  expect((await health(services.url)).body.waiting_for_chain).toBe(true);
   expect(await stillPending(services.failed)).toBe(true);
   expect(lines.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
   expect(lines.some((line) => line.startsWith("serve: keeper on"))).toBe(false);
@@ -1329,6 +1341,7 @@ test("serve_waits_for_a_node_behind_the_index_off_the_sandbox_and_says_so_now_an
     async () => lines.some((line) => line.startsWith("serve: keeper on")),
     30_000,
   );
+  expect((await health(services.url)).body.waiting_for_chain).toBe(false);
   expect(lines).toContain(
     "indexer: the database matches the chain; starting the indexer and the keeper",
   );

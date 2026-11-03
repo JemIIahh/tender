@@ -280,6 +280,12 @@ export const HealthResponseSchema = z.object({
   chain_final_height: U64StringSchema,
   /** `chain_final_height - indexed_height`, and "0" if the index is not behind. */
   lag_blocks: U64StringSchema,
+  /**
+   * Whether the services are waiting for the chain before they index, because the node cannot be
+   * asked or is behind the index. The API stays `ok` meanwhile, and `lag_blocks` is 0 for a node
+   * behind the index, so a monitor alerts on this.
+   */
+  waiting_for_chain: z.boolean(),
 });
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 
@@ -294,6 +300,8 @@ export const HealthUnavailableSchema = z.object({
   network: z.string(),
   contract: AccountIdSchema,
   indexed_height: U64StringSchema,
+  /** As in `HealthResponseSchema`. */
+  waiting_for_chain: z.boolean(),
 });
 export type HealthUnavailable = z.infer<typeof HealthUnavailableSchema>;
 
