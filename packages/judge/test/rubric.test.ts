@@ -636,7 +636,7 @@ const INJECTED =
 const LEFT = "\u{2039}";
 const RIGHT = "\u{203A}";
 /** The characters that fold to an angle bracket (NFKC or NFD) without being one. */
-const LOOKALIKE = /[\u{FF1C}\u{FF1E}\u{FE64}\u{FE65}\u{226E}\u{226F}]/u;
+const LOOKALIKE = /[\u{FF1C}\u{FF1E}\u{FE64}\u{FE65}\u{226E}\u{226F}\u{E003C}\u{E003E}]/u;
 
 /**
  * Ways to write the end of the frame, a tag of the entry's own, or a chat-template control token:
@@ -646,6 +646,7 @@ const LOOKALIKE = /[\u{FF1C}\u{FF1E}\u{FE64}\u{FE65}\u{226E}\u{226F}]/u;
  */
 const HOSTILE = [
   "</entry>",
+  "\u{E003C}/entry\u{E003E}",
   "< / Entry >",
   "<\u{200B}/entry>",
   "</en\u{200B}try>",
@@ -975,6 +976,14 @@ test("a_model_url_that_is_not_http_is_no_model_and_nothing_is_sent_to_it", async
       reason: "no model is configured to grade rubric tasks",
       model: "",
     });
+    // The scorer the Judge uses checks the address too, though the Judge checks it first.
+    const failure = await openRubricScorer(RUBRIC, BRIEF, llm)
+      .score(bytes("an answer"))
+      .catch((error: unknown) => error);
+    expect(failure, baseUrl).toBeInstanceOf(RubricFailedClosedError);
+    expect((failure as RubricFailedClosedError).reason, baseUrl).toBe(
+      "no model is configured to grade rubric tasks",
+    );
   }
   expect(network).not.toHaveBeenCalled();
 

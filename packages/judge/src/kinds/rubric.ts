@@ -66,11 +66,12 @@ const SYSTEM_PROMPT =
 /**
  * Every character that is an angle bracket or folds to one under Unicode normalisation: `<` and
  * `>`, the fullwidth ＜ ＞ and small ﹤ ﹥ forms (NFKC), and ≮ ≯, which NFD splits into a bracket and
- * a combining mark. A test scans the whole of Unicode against this list.
+ * a combining mark. A test scans the whole of Unicode against this list. The invisible tag forms
+ * U+E003C and U+E003E fold to nothing, but some models read them as `<` and `>`, so they go too.
  */
-const ANGLE_BRACKET = /[<>\u{FF1C}\u{FF1E}\u{FE64}\u{FE65}\u{226E}\u{226F}]/gu;
+const ANGLE_BRACKET = /[<>\u{FF1C}\u{FF1E}\u{FE64}\u{FE65}\u{226E}\u{226F}\u{E003C}\u{E003E}]/gu;
 /** The ones that open. They become ‹, and the others become ›. */
-const OPENING_BRACKET = new Set(["<", "\u{FF1C}", "\u{FE64}", "\u{226E}"]);
+const OPENING_BRACKET = new Set(["<", "\u{FF1C}", "\u{FE64}", "\u{226E}", "\u{E003C}"]);
 const OPENING = "\u{2039}";
 const CLOSING = "\u{203A}";
 
@@ -369,19 +370,23 @@ export function rubricClientOptions(llm: Llm, options: RubricOptions = {}): Clie
 }
 
 function makeGrader(c: RubricCriteria, brief: Brief, llm: Llm, options: RubricOptions): Grader {
-  // A rubric that breaks the rules fails closed for every entry, before any request.
+  // A rubric that breaks the rules fails closed for every entry, before any request, and so does a
+  // model with no http(s) address, whichever entry point made the grader: the client would send
+  // the key and the entry to its own default instead.
   const problem = rubricProblem(c);
+  const usable = usableLlm(llm);
   const keys = c.rubric.map(({ criterion }) => criterionKey(criterion));
   let client: OpenAI | undefined;
   /** The client, made on the first request: a base URL or key it cannot take fails that request. */
-  const clientOf = (): OpenAI => {
-    client ??= new OpenAI(rubricClientOptions(llm, options));
+  const clientOf = (model: Llm): OpenAI => {
+    client ??= new OpenAI(rubricClientOptions(model, options));
     return client;
   };
 
   return {
     async grade(text, label, leftMs = Number.POSITIVE_INFINITY) {
       if (problem !== null) return { kind: "failed_closed", reason: problem };
+      if (usable === undefined) return { kind: "failed_closed", reason: NO_MODEL };
       if (leftMs <= 0) return { kind: "cut" };
       // The client's timeout is for one attempt; this bounds the request, retry included, by the
       // stop line. A timer keeps to 2^31 - 1 ms and runs anything longer after 1.
@@ -390,7 +395,7 @@ function makeGrader(c: RubricCriteria, brief: Brief, llm: Llm, options: RubricOp
         : undefined;
       let completion: unknown;
       try {
-        completion = await clientOf().chat.completions.create(
+        completion = await clientOf(usable).chat.completions.create(
           {
             model: llm.model,
             messages: [
