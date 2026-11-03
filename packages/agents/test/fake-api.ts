@@ -44,6 +44,7 @@ const HEALTH = {
   indexed_height: "10",
   chain_final_height: "10",
   lag_blocks: "0",
+  waiting_for_chain: false,
 };
 
 /** What the fake says, in words, when it refuses a signature: free text, which a client must not show. */

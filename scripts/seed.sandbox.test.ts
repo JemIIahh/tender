@@ -161,6 +161,7 @@ function recordingApi(served: ReadonlySet<string> = new Set()) {
       indexed_height: "1",
       chain_final_height: "1",
       lag_blocks: "0",
+      waiting_for_chain: false,
     }),
     getScorecard: unexpected("getScorecard"),
     getBlob: async (sha256) => (served.has(sha256) ? new Uint8Array([1]) : null),

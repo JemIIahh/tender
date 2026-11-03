@@ -54,6 +54,12 @@ export interface HealthResponse {
   chain_final_height: string;
   /** `chain_final_height - indexed_height`, and "0" if the index is not behind. */
   lag_blocks: string;
+  /**
+   * Whether the services are waiting for the chain before they index (see
+   * `ApiDeps.waitingForChain`). The API stays `ok` and serves the index as it is meanwhile, and
+   * `lag_blocks` cannot show a node that is behind the index, so a monitor alerts on this.
+   */
+  waiting_for_chain: boolean;
 }
 
 /** A task as the board lists it. */

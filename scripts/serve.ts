@@ -56,7 +56,8 @@ import { loadEnv, REPO_ROOT, readEnvFile } from "./lib/env";
  *              the indexer lock, so that one process at a time writes to the index (P03-R25).
  *              The indexer, the keeper and the Judge start once the database has been checked
  *              against the chain (`checkAgainstChain`): a node that does not answer or is behind
- *              is waited for, with the API serving meanwhile, and a database that is another
+ *              is waited for, with the API serving meanwhile (and `GET /v1/health` saying
+ *              `waiting_for_chain: true`, for a monitor), and a database that is another
  *              deploy's is refused: none of the three starts, and the process ends with 1
  *   keeper     voids and cleans up tasks, when KEEPER_PRIVATE_KEY is set, and runs with the
  *              indexer, under the same lock, so that no two processes send the same calls; off the
@@ -1071,6 +1072,12 @@ export interface CheckedStart extends Stoppable {
    * check waits on the node for the first time, or `stop` has ended it. Never rejects.
    */
   settled: Promise<void>;
+  /**
+   * Whether the check is waiting right now: from its first wait, told or not (a node that is
+   * behind is told once in `behindWarnMs`), until it has gone through, been refused or been ended.
+   * The API says so in `GET /v1/health` (`waiting_for_chain`).
+   */
+  waiting(): boolean;
 }
 
 export interface CheckedStartOptions {
@@ -1117,12 +1124,14 @@ export function startAfterCheck(opts: CheckedStartOptions): CheckedStart {
     opts.stopping === undefined ? stopped.signal : AbortSignal.any([stopped.signal, opts.stopping]);
   let running: Stoppable | undefined;
   let waited = false;
+  let waitingNow = false;
   let firstWait: () => void = () => undefined;
   const waitedFirst = new Promise<void>((resolve) => {
     firstWait = resolve;
   });
   const onWait = (why: string, retryMs: number) => {
     waited = true;
+    waitingNow = true;
     log(
       `WARN indexer: cannot check the database against the chain yet (${why}); ` +
         `trying again in ${retryMs / 1000} s`,
@@ -1134,7 +1143,12 @@ export function startAfterCheck(opts: CheckedStartOptions): CheckedStart {
   };
   const checking = (async () => {
     try {
-      if (!(await check(ended, onWait)) || ended.aborted) return;
+      try {
+        if (!(await check(ended, onWait)) || ended.aborted) return;
+      } finally {
+        // However the check ended, it waits no more: the work starts, or it is refused, or stopped.
+        waitingNow = false;
+      }
     } catch (error) {
       // A refusal is ours and is said in full; anything else by its name, as a line says of an error.
       refuse(
@@ -1153,6 +1167,7 @@ export function startAfterCheck(opts: CheckedStartOptions): CheckedStart {
   })();
   return {
     settled: Promise.race([checking, waitedFirst]),
+    waiting: () => waitingNow,
     async stop() {
       stopped.abort();
       await checking;
@@ -1373,6 +1388,8 @@ export async function startServices(
   let telegram: TelegramRun | undefined;
   /** The indexer, the keeper and the Judge, with the lock they run under, if any. */
   let work: Stoppable | undefined;
+  /** The latest check of the database against the chain, which `GET /v1/health` reports on. */
+  let latestCheck: CheckedStart | undefined;
 
   /** Stops what has started, in order, going on past a failure, and throws the first one. */
   const stopAll = async (): Promise<void> => {
@@ -1448,6 +1465,9 @@ export async function startServices(
           webOrigins: config.webOrigins,
           telegramBotUsername: config.telegramBotUsername,
           trustedProxyHops: config.trustedProxyHops,
+          // True while the indexer, the keeper and the Judge wait for a node that cannot be asked
+          // or is behind the index: `lag_blocks` cannot show that, so health says it.
+          waitingForChain: () => latestCheck?.waiting() === true,
         });
         if (bot !== undefined && webhook !== undefined) {
           app.post(TELEGRAM_WEBHOOK_PATH, async (c) => {
@@ -1579,6 +1599,7 @@ export async function startServices(
         stopping: stopBegun.signal,
       });
       first.checked ??= checked;
+      latestCheck = checked;
       return checked;
     };
     work =

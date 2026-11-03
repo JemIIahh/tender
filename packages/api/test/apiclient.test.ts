@@ -280,6 +280,7 @@ test("client_round_trips_against_in_process_app", async () => {
     indexed_height: "100",
     chain_final_height: "100",
     lag_blocks: "0",
+    waiting_for_chain: false,
   });
 
   // One sign-in served all of it.

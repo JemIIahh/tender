@@ -191,6 +191,7 @@ test("health_reports_lag", async () => {
     indexed_height: "90",
     chain_final_height: "100",
     lag_blocks: "10",
+    waiting_for_chain: false,
   });
 
   // Caught up, and an index that is ahead of the node the API asks: the lag is never negative.

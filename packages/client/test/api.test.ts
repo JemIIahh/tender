@@ -127,6 +127,7 @@ const HEALTH: HealthResponse = {
   indexed_height: "90",
   chain_final_height: "100",
   lag_blocks: "10",
+  waiting_for_chain: false,
 };
 const SCORECARD: Scorecard = {
   version: 1,

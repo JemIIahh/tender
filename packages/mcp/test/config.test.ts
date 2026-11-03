@@ -1228,6 +1228,7 @@ function healthOf(network: string, contract: string): HealthResponse {
     indexed_height: "10",
     chain_final_height: "10",
     lag_blocks: "0",
+    waiting_for_chain: false,
   };
 }
 

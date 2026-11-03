@@ -75,6 +75,13 @@ export interface ApiDeps {
   trustedProxyHops?: number;
   /** The rate limits, where they differ from `DEFAULT_RATE_LIMITS`. Tests use small ones. */
   rateLimits?: Partial<RateLimits>;
+  /**
+   * Whether the services are waiting for the chain right now: the indexer, the keeper and the Judge
+   * have not started because the node cannot be asked, or is behind the index, and the API serves
+   * the index as it is. `GET /v1/health` says so as `waiting_for_chain`, so that a monitor can
+   * alert on it. Called on each health request. Default: not waiting.
+   */
+  waitingForChain?: () => boolean;
 }
 
 /** The time, in nanoseconds, that `deps` says it is. */
