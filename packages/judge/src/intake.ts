@@ -16,15 +16,20 @@ import {
   TOO_SLOW_TO_COMPILE,
 } from "./isolate";
 import { type RubricCriteria, rubricProblem, rubricTaskProblem } from "./kinds/rubric";
+import { testsCriteriaProblem } from "./kinds/tests";
 import { ScorerUnavailableError } from "./score";
 import { clampReason } from "./scorecard";
 import type { JudgeDeps, JudgeMemory } from "./types";
 
 /**
- * The criteria the Judge scores in a score worker: `exact`, `json_schema` and `regex_cases`. A
- * `rubric` needs the network, so it is graded on the Judge's own thread (see `kinds/rubric.ts`).
+ * The criteria the Judge scores in a score worker: `exact`, `json_schema`, `regex_cases` and
+ * `tests`. A `rubric` needs the network, so it is graded on the Judge's own thread (see
+ * `kinds/rubric.ts`).
  */
-export type P0Criteria = Extract<PublicCriteria, { kind: "exact" | "json_schema" | "regex_cases" }>;
+export type P0Criteria = Extract<
+  PublicCriteria,
+  { kind: "exact" | "json_schema" | "regex_cases" | "tests" }
+>;
 
 /** A task's criteria and held-out checks, read and checked: what its entries are judged by. */
 export interface TaskDocuments {
@@ -125,7 +130,6 @@ const HAS_HELDOUT_MISMATCH = "has_heldout does not match the task's held-out com
 const RUBRIC_TEAM_ONLY = "kind rubric is limited to team tasks in v1";
 const RUBRIC_HAS_NO_HELDOUT = "kind rubric has no held-out checks";
 const TESTS_TEAM_ONLY = "kind tests is limited to team tasks in v1";
-const TESTS_NOT_AVAILABLE = "kind tests is not available yet";
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
 const REFERENCE_NOT_ALLOWED =
   'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry (move the schema it points to into $defs)';
@@ -174,9 +178,9 @@ const MAX_COMPILE_RETRIES = 3;
  *   over 262_144 bytes: `criteria too large`. Bytes of another kind or visibility under the hash,
  *   such as someone's private result, are not read, so nothing of them reaches a reason;
  * - `rubric` or `tests` from a poster outside `teamAccounts`: `kind {k} is limited to team tasks
- *   in v1` (C16); `tests` from the team: `kind tests is not available yet`, as there is no scorer
- *   for it. A `rubric` from the team is accepted when it passes the rules below, and judging
- *   grades it with the model it is given (`JudgeDeps.llm`);
+ *   in v1` (C16). A `rubric` from the team is accepted when it passes the rules below, and judging
+ *   grades it with the model it is given (`JudgeDeps.llm`); a `tests` task from the team is
+ *   accepted when it passes the criteria check below, and its entries run in the sandbox;
  * - `has_heldout` that does not match whether the task has a `heldout_commitment`; `rubric` with
  *   `has_heldout` set, as it has no held-out part: `kind rubric has no held-out checks`;
  * - a `rubric` that a model cannot grade, or whose pass mark a disqualified entry would reach
@@ -192,6 +196,9 @@ const MAX_COMPILE_RETRIES = 3;
  *   an open task, or 1 to 50 for an invite-only one`, or its brief cannot be read (`the task's
  *   brief could not be read`);
  * - `exact` or `json_schema` without held-out checks: `held-out checks required for kind {k}`;
+ * - `tests` criteria that `testsCriteriaProblem` refuses: an `entry` that is not a function name
+ *   (letters, digits, `_` and `$`, not a reserved word), as it becomes part of the code the
+ *   sandbox runs, or no `examples` while there are no held-out checks to stand in for them;
  * - a `json_schema` schema with an `$id` below its root, a root `$id` with a fragment, or a
  *   reference other than `#` and one to an entry of its `$defs` or `definitions` (see
  *   `referenceProblem`), or one that `checkJsonSchemaUsable` refuses, with its reason. That check
@@ -365,7 +372,7 @@ async function checkDocuments(
 
   const team = policy.teamAccounts.includes(task.poster);
   if (criteria.kind === "rubric" && !team) return rejected(RUBRIC_TEAM_ONLY);
-  if (criteria.kind === "tests") return rejected(team ? TESTS_NOT_AVAILABLE : TESTS_TEAM_ONLY);
+  if (criteria.kind === "tests" && !team) return rejected(TESTS_TEAM_ONLY);
   if (criteria.has_heldout !== (task.heldout_commitment !== null)) {
     return rejected(HAS_HELDOUT_MISMATCH);
   }
@@ -379,7 +386,7 @@ async function checkDocuments(
     if (problem !== null) return criteriaRefused(problem);
     return { ok: true, documents: { criteria, heldout: null } };
   }
-  if (criteria.kind !== "regex_cases" && !criteria.has_heldout) {
+  if (criteria.kind !== "regex_cases" && criteria.kind !== "tests" && !criteria.has_heldout) {
     return rejected(`held-out checks required for kind ${criteria.kind}`);
   }
   let problem: string | null;
@@ -475,11 +482,13 @@ function cheapRefusal(task: TaskTerms, stored: Stored): string | null {
  * The criteria check, in two parts: why the schema of `criteria` cannot be used, or `null`. This
  * part is what it may name and refer to (`referenceProblem`: `$id`, references, dynamic
  * references), checked on this thread; `compileProblem` is the other. Only `json_schema` criteria
- * have a schema. Intake runs the check, and judging runs it again through `loadDocuments` before
+ * have a schema. `tests` criteria have no other part: their rules (`testsCriteriaProblem`) are
+ * all checked here. Intake runs the check, and judging runs it again through `loadDocuments` before
  * any entry is scored (P05-R12), so that a task accepted under an older rule is not scored under a
  * check it no longer passes.
  */
 function shapeProblem(criteria: P0Criteria): string | null {
+  if (criteria.kind === "tests") return testsCriteriaProblem(criteria);
   return criteria.kind === "json_schema" ? referenceProblem(criteria.schema) : null;
 }
 

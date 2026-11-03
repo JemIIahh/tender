@@ -1,8 +1,10 @@
 import {
   newQuickJSWASMModule,
+  newVariant,
   type QuickJSContext,
   type QuickJSRuntime,
   type QuickJSWASMModule,
+  RELEASE_SYNC,
   shouldInterruptAfterDeadline,
 } from "quickjs-emscripten";
 
@@ -10,7 +12,12 @@ import {
 export interface SandboxOptions {
   /** How long the code may run. The clock starts once the engine is loaded. */
   timeoutMs: number;
-  /** How much memory the code may allocate in the engine's heap. */
+  /**
+   * The engine's memory limit for the run. This engine is built without a way to ask how big a
+   * block it holds, so it counts a block only when it is allocated or grown: the limit stops any
+   * one allocation past it (an array, a string, a buffer) and does not add the blocks up. What
+   * bounds the run's whole memory is the cap on the engine's own (`ENGINE_MEMORY_CAP_BYTES`).
+   */
   memoryBytes: number;
 }
 
@@ -32,6 +39,18 @@ export type SandboxResult =
 
 /** How much of the engine's stack the code may use. */
 const MAX_STACK_BYTES = 1_048_576;
+/**
+ * How much memory the engine may have in all, for every run on it. WebAssembly memory only
+ * grows, and QuickJS in this build cannot count what it holds (see `SandboxOptions.memoryBytes`),
+ * so without this a run that allocates many blocks of any size, none of them over its limit, takes
+ * as much of the host's memory as it can in the time it has: 1.5 GiB in three seconds, which the
+ * engine then keeps for the life of the thread. At the cap an allocation fails like one over the
+ * limit does (`memory`), and what the run freed is there for the next one.
+ */
+export const ENGINE_MEMORY_CAP_BYTES = 64 * 1024 * 1024;
+/** The engine's memory when it starts, 16 MiB: what the compiled module asks for. */
+const ENGINE_INITIAL_PAGES = 256;
+const WASM_PAGE_BYTES = 65_536;
 /** A message is for a log. Code that throws a long text does not get to carry it out. */
 const MAX_MESSAGE_LENGTH = 500;
 /** How the engine starts the message of an allocation that goes past the limit. */
@@ -46,7 +65,13 @@ let engine: Promise<QuickJSWASMModule> | undefined;
 
 function loadEngine(): Promise<QuickJSWASMModule> {
   if (engine === undefined) {
-    const loading = newQuickJSWASMModule();
+    // A memory of its own for each engine: it is dropped, and with it the memory, when a run
+    // damages it.
+    const wasmMemory = new WebAssembly.Memory({
+      initial: ENGINE_INITIAL_PAGES,
+      maximum: ENGINE_MEMORY_CAP_BYTES / WASM_PAGE_BYTES,
+    });
+    const loading = newQuickJSWASMModule(newVariant(RELEASE_SYNC, { wasmMemory }));
     engine = loading;
     // A load that failed is not kept: the next run tries again.
     loading.catch(() => dropEngine(loading));
@@ -64,12 +89,19 @@ function dropEngine(damaged: Promise<QuickJSWASMModule>): void {
  * else (no `fetch`, `require`, `process`, timers or console), and each run starts from a new
  * runtime, so nothing is carried from one run to the next.
  *
- * It costs its caller at most `timeoutMs` and `memoryBytes`: past the deadline the engine
- * interrupts the code (`timeout`; this includes a regex that backtracks without end, and code
- * that runs while the value is read), and past the limit the allocation fails (`memory`, which
- * `SandboxResult` says how far to trust). Anything else the code throws, syntax errors and the
- * engine's own stack overflow included, is an `exception`. The value is what the engine's `dump`
- * makes of the last statement's value: plain data.
+ * It is meant to cost its caller no more than `timeoutMs` and `memoryBytes`: past the deadline the
+ * engine interrupts the code (`timeout`; this includes a regex that backtracks without end, and
+ * code that runs while the value is read), and past the limit, or the engine's own cap
+ * (`ENGINE_MEMORY_CAP_BYTES`), the allocation fails (`memory`, which `SandboxResult` says how far
+ * to trust). Anything else the code throws, syntax errors and the engine's own stack overflow
+ * included, is an `exception`. The value is what the engine's `dump` makes of the last
+ * statement's value: plain data.
+ *
+ * The deadline is checked between the engine's instructions, so a long native call can run past
+ * it, by a few hundred milliseconds for a large `fill` or `repeat`, and a built-in that loops on
+ * its own is not interrupted at all: `new Array(2 ** 32 - 1).indexOf(1)` runs for minutes. Only the
+ * end of the thread it runs on ends that, which is why scorers that run an entrant's code run in
+ * score workers (`isolate.ts`).
  *
  * The engine runs on the caller's thread, so a run that uses its whole budget stops everything
  * else on that thread for as long. Run it where that is acceptable.

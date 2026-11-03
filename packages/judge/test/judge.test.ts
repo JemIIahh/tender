@@ -348,6 +348,77 @@ test("judge_picks_best_and_publishes_heldout", async () => {
   expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: null });
 });
 
+test("a_tests_task_is_judged_with_hostile_entries_among_the_answers", {
+  timeout: 60_000,
+}, async () => {
+  // The poster's tests, mallory's loop, eve's memory bomb and carol's native loop, which only the
+  // worker's stop ends: each scores 0 and the Judge picks the one answer that is right (S8).
+  const criteria = {
+    version: 1,
+    kind: "tests",
+    min_score: 100,
+    split: "winner_take_all",
+    has_heldout: true,
+    language: "js",
+    entry: "f",
+    examples: [{ input: 1, output: 2 }],
+  };
+  const cases = [
+    { input: 1, output: 2 },
+    { input: 5, output: 6 },
+    { input: 9, output: 10 },
+  ];
+  const { chain, commitment } = await postJudged(
+    [
+      ["mallory.test.near", "function f(x) { while (true) {} }", 9n],
+      [
+        "eve.test.near",
+        "function f(x) { const a = []; while (true) a.push(new Array(9).fill(0)); }",
+        10n,
+      ],
+      ["carol.test.near", "function f(x) { return new Array(2 ** 32 - 1).indexOf(1); }", 11n],
+      ["bob.test.near", "function f(x) { return x < 5 ? x + 1 : 0; }", 12n],
+      ["alice.test.near", "const f = (x) => x + 1;", 13n],
+    ],
+    { criteria, heldout: { tests: { cases } } },
+  );
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const before = workers();
+
+  const deps = judgeDeps(db, chain, {
+    teamAccounts: ["poster.test.near"],
+    scoringLimits: { entryTimeoutMs: 3_000 },
+  });
+  expect(await judgeTask(deps, 7n)).toBe("picked");
+
+  const card = await picked(chain);
+  expect(card.winners).toEqual([{ account: "alice.test.near", bps: 10_000 }]);
+  expect(card.scorecard.kind).toBe("tests");
+  const byAccount = Object.fromEntries(
+    card.scorecard.entries.map((e) => [e.account, [e.score, e.passed]]),
+  );
+  expect(byAccount).toEqual({
+    "mallory.test.near": [0, false],
+    "eve.test.near": [0, false],
+    "carol.test.near": [0, false],
+    "bob.test.near": [33, false],
+    "alice.test.near": [100, true],
+  });
+  expect(card.scorecard.entries.find((e) => e.account === "carol.test.near")?.reasons).toEqual([
+    "scoring timed out",
+  ]);
+  expect(card.scorecard.entries.find((e) => e.account === "bob.test.near")?.reasons).toEqual([
+    "case 2 (5): wrong output",
+    "case 3 (9): wrong output",
+  ]);
+  // The held-out cases are published, as for every kind, and hash to the commitment.
+  expect(card.written.heldout).toEqual({ tests: { cases } });
+  expect(sha256Hex(canonicalJson(card.written.heldout))).toBe(commitment);
+  expect(warn).not.toHaveBeenCalled();
+  // The task's workers are gone with it.
+  expect(workers()).toBe(before);
+});
+
 test("judge_no_award_when_none_pass", async () => {
   const { chain, commitment } = await postJudged([
     ["alice.test.near", "41", 10n],
