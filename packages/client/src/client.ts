@@ -19,6 +19,7 @@ import {
   registerAgentCall,
   removeDelegateCall,
   revealCall,
+  type SpendOptions,
   type StorageView,
   StorageViewSchema,
   storageDepositCall,
@@ -458,14 +459,21 @@ export class TenderClient {
   // Senders: each builds its call with the `@tender/shared` builder of the same name and `send`s
   // it, signed by the signer. They take the builder's arguments, less the contract.
 
-  /** Posts a task, with its reward from the signer's vault. `taskId` is the new task's id. */
-  async postTask(input: PostTaskInput): Promise<TxResult & { taskId: bigint }> {
-    const result = await this.send(postTaskCall(this.contractId, input));
+  /**
+   * Posts a task, with its reward from the signer's vault. `taskId` is the new task's id. With
+   * `{ delegate: true }` it attaches no deposit, for a signer whose key is a delegate key within
+   * its caps (`add_delegate`); the same goes for `topUpTask`.
+   */
+  async postTask(
+    input: PostTaskInput,
+    opts?: SpendOptions,
+  ): Promise<TxResult & { taskId: bigint }> {
+    const result = await this.send(postTaskCall(this.contractId, input, opts));
     return { ...result, taskId: BigInt(U64StringSchema.parse(result.returnValue)) };
   }
 
-  topUpTask(taskId: bigint, amount: bigint): Promise<TxResult> {
-    return this.send(topUpTaskCall(this.contractId, taskId, amount));
+  topUpTask(taskId: bigint, amount: bigint, opts?: SpendOptions): Promise<TxResult> {
+    return this.send(topUpTaskCall(this.contractId, taskId, amount, opts));
   }
 
   commit(taskId: bigint, commitment: string): Promise<TxResult> {

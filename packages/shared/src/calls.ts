@@ -69,6 +69,20 @@ const NO_DEPOSIT = 0n;
 /** The default deposit to register an account with a token (NEP-145): 0.00125 NEAR in yocto. */
 const TOKEN_STORAGE_DEPOSIT = 1_250_000_000_000_000_000_000n;
 
+/**
+ * How a spending call is authorised. A full-access key attaches 1 yoctoNEAR, which the contract's
+ * `authorize_spend` accepts from anyone. A delegate key is a function-call key, which cannot attach
+ * a deposit: with `delegate: true` the call attaches none, and the contract lets it through only
+ * within the caps its account registered for that key (`add_delegate`), else `E_AUTH`.
+ */
+export interface SpendOptions {
+  delegate?: boolean;
+}
+
+/** The deposit of a spending call: none from a delegate key, else 1 yoctoNEAR. */
+const spendDeposit = (opts: SpendOptions | undefined) =>
+  opts?.delegate === true ? NO_DEPOSIT : ONE_YOCTO;
+
 /** The terms of a task. A field that is left out takes the default noted, or is sent as `null`. */
 export interface PostTaskInput {
   /** The token the reward is paid in, as an account id. */
@@ -105,12 +119,17 @@ export interface PostTaskInput {
 
 /**
  * `post_task`: posts a task and moves its reward from the caller's vault into escrow. It attaches
- * 1 yoctoNEAR, which the contract demands of a spend.
+ * 1 yoctoNEAR, which the contract demands of a spend, or none with `{ delegate: true }`, for a
+ * delegate key (see `SpendOptions`).
  *
  * The task is built field by field, so a property that `input` has beyond `PostTaskInput` never
  * reaches the wire, where `post_task` would reject it.
  */
-export function postTaskCall(contractId: string, input: PostTaskInput): TenderCall {
+export function postTaskCall(
+  contractId: string,
+  input: PostTaskInput,
+  opts?: SpendOptions,
+): TenderCall {
   return {
     receiverId: contractId,
     methodName: "post_task",
@@ -134,18 +153,26 @@ export function postTaskCall(contractId: string, input: PostTaskInput): TenderCa
       },
     },
     gas: GAS.postTask,
-    deposit: ONE_YOCTO,
+    deposit: spendDeposit(opts),
   };
 }
 
-/** `top_up_task`: adds `amount` from the caller's vault to an open task's reward. 1 yoctoNEAR. */
-export function topUpTaskCall(contractId: string, taskId: bigint, amount: bigint): TenderCall {
+/**
+ * `top_up_task`: adds `amount` from the caller's vault to an open task's reward. 1 yoctoNEAR, or
+ * none with `{ delegate: true }`, for a delegate key (see `SpendOptions`).
+ */
+export function topUpTaskCall(
+  contractId: string,
+  taskId: bigint,
+  amount: bigint,
+  opts?: SpendOptions,
+): TenderCall {
   return {
     receiverId: contractId,
     methodName: "top_up_task",
     args: { task_id: taskId.toString(), amount: amount.toString() },
     gas: GAS.topUpTask,
-    deposit: ONE_YOCTO,
+    deposit: spendDeposit(opts),
   };
 }
 

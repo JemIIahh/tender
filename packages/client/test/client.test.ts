@@ -1,9 +1,9 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { type extractEvents, NETWORKS } from "@tender/shared";
+import { type extractEvents, NETWORKS, type PostTaskInput, type TenderCall } from "@tender/shared";
 import { KeyPair } from "near-api-js";
-import { afterEach, describe, expect, expectTypeOf, test } from "vitest";
-import { TenderClient, TenderError, toTxResult } from "../src/index";
+import { afterEach, describe, expect, expectTypeOf, test, vi } from "vitest";
+import { TenderClient, TenderError, type TxResult, toTxResult } from "../src/index";
 
 const CONTRACT = "tender.test.near";
 const BLOCK = { block_hash: "6kSpdaiEGudXLa4p43ALXFHCu96ozdEJ3c8KsCuajXyj", block_height: 34 };
@@ -159,6 +159,51 @@ describe("TenderClient construction", () => {
   test("send_without_a_signer_throws", async () => {
     const client = new TenderClient({ network: "testnet", contractId: CONTRACT });
     await expect(client.voidTask(1n)).rejects.toThrow(/no signer/);
+  });
+});
+
+describe("delegate sends", () => {
+  /** A client whose `send` records the call it is given and answers with a task id. */
+  function recording() {
+    const client = new TenderClient({ network: "testnet", contractId: CONTRACT });
+    const calls: TenderCall[] = [];
+    vi.spyOn(client, "send").mockImplementation(async (call) => {
+      calls.push(call);
+      return { returnValue: "7" } as TxResult;
+    });
+    return { client, calls };
+  }
+
+  const INPUT: PostTaskInput = {
+    token: "usdc.test.near",
+    reward: 1_000_000n,
+    briefUri: "ipfs://brief",
+    briefHash: "a".repeat(64),
+    criteriaHash: "b".repeat(64),
+    commitSecs: 60,
+    revealSecs: 60,
+    pickSecs: 60,
+    fallbackSecs: 60,
+  };
+
+  test("postTask_and_topUpTask_attach_a_yocto_unless_the_key_is_a_delegate", async () => {
+    const { client, calls } = recording();
+    await client.postTask(INPUT);
+    await client.topUpTask(7n, 500n);
+    await client.postTask(INPUT, { delegate: true });
+    await client.topUpTask(7n, 500n, { delegate: true });
+    expect(calls.map((call) => [call.methodName, call.deposit])).toStrictEqual([
+      ["post_task", 1n],
+      ["top_up_task", 1n],
+      ["post_task", 0n],
+      ["top_up_task", 0n],
+    ]);
+  });
+
+  test("a_delegate_postTask_still_gives_the_task_id", async () => {
+    const { client } = recording();
+    const posted = await client.postTask(INPUT, { delegate: true });
+    expect(posted.taskId).toBe(7n);
   });
 });
 
