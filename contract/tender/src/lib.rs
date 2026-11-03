@@ -29,8 +29,8 @@ use near_sdk::store::{IterableMap, LookupMap};
 use near_sdk::{env, near, AccountId, BorshStorageKey, PanicOnDefault, PublicKey};
 
 use crate::types::{
-    err, AgentProfile, DelegateCaps, Entry, StorageAccount, Task, TokenConfig, MAX_FEE_BPS,
-    MAX_WINDOW_SECS,
+    err, AgentProfile, Bond, DelegateCaps, Entry, StorageAccount, Task, TokenConfig,
+    DEFAULT_BOND_COOLDOWN_SECS, MAX_FEE_BPS, MAX_WINDOW_SECS,
 };
 
 /// Storage prefixes, one per collection in `Tender`, in field order.
@@ -59,6 +59,10 @@ pub struct Tender {
     fee_bps: u16,
     min_window_secs: u32,
     paused: bool,
+    /// The bond `register_agent` takes; `None` until the owner sets one.
+    agent_bond: Option<Bond>,
+    /// Seconds from `unregister_agent` to when `claim_agent_bond` pays back.
+    agent_bond_cooldown_secs: u64,
     next_task_id: u64,
     /// Token allowlist.
     tokens: IterableMap<AccountId, TokenConfig>,
@@ -104,6 +108,8 @@ impl Tender {
             fee_bps,
             min_window_secs,
             paused: false,
+            agent_bond: None,
+            agent_bond_cooldown_secs: DEFAULT_BOND_COOLDOWN_SECS,
             next_task_id: 1,
             tokens: IterableMap::new(StorageKey::Tokens),
             vault: LookupMap::new(StorageKey::Vault),
@@ -249,7 +255,7 @@ mod tests {
     }
 
     /// `storage_layout_is_pinned`'s fresh contract, hex-encoded.
-    const FRESH_STATE: &str = "01000a0000006f776e65722e74657374000d00000074726561737572792e74657374f4013c0000000001000000000000000000000002000000007602000000006d0100000001010000000201000000030100000004010000000501000000060100000007";
+    const FRESH_STATE: &str = "01000a0000006f776e65722e74657374000d00000074726561737572792e74657374f4013c0000000000007512000000000001000000000000000000000002000000007602000000006d0100000001010000000201000000030100000004010000000501000000060100000007";
     /// `storage_layout_is_pinned`'s task record: its length and the SHA-256 of its encoding.
     const TASK_RECORD: (usize, &str) = (
         444,

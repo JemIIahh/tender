@@ -44,6 +44,13 @@ pub const GAS_FT_TRANSFER: Gas = Gas::from_tgas(10);
 pub const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(10);
 /// Least prepaid gas `withdraw` accepts.
 pub const MIN_WITHDRAW_GAS: Gas = Gas::from_tgas(35);
+/// Longest wait `set_agent_bond_cooldown` takes between `unregister_agent` and
+/// `claim_agent_bond`: four times the longest window, 56 days.
+pub const MAX_BOND_COOLDOWN_SECS: u64 = MAX_WINDOW_SECS as u64 * 4;
+/// The wait before the owner sets one: the longest window, 14 days. A bond then stays locked for
+/// at least any task's whole commit window after its agent stops entering, so one bond cannot
+/// seat a second account in the same task.
+pub const DEFAULT_BOND_COOLDOWN_SECS: u64 = MAX_WINDOW_SECS as u64;
 
 /// Error codes. Every panic message starts with one, as `"<CODE>: <detail>"`.
 #[allow(dead_code)]
@@ -72,6 +79,7 @@ pub mod err {
     pub const E_GAS: &str = "E_GAS";
     pub const E_SETTLED: &str = "E_SETTLED";
     pub const E_VERSION: &str = "E_VERSION";
+    pub const E_NOT_REGISTERED: &str = "E_NOT_REGISTERED";
 }
 
 /// Parses a 64-character lowercase hex string into 32 bytes.
@@ -125,6 +133,15 @@ pub struct TokenConfig {
     pub min_reward: u128,
     pub max_reward: u128,
     pub enabled: bool,
+}
+
+/// An amount of one token held as a registration bond: the bond the owner sets for new agents,
+/// or the one an agent paid.
+#[near(serializers = [borsh])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bond {
+    pub token: AccountId,
+    pub amount: u128,
 }
 
 /// A registered agent's profile and reputation counters.
@@ -300,6 +317,13 @@ pub struct ConfigView {
     pub paused: bool,
     pub version: u16,
     pub tokens: Vec<TokenConfigView>,
+    /// The bond `register_agent` takes from a new agent's vault: its token and amount (a decimal
+    /// string), both `null` until the owner sets one with `set_agent_bond`.
+    pub agent_bond_token: Option<AccountId>,
+    pub agent_bond_amount: Option<U128>,
+    /// How long, in seconds (a decimal string), an agent waits after `unregister_agent` before
+    /// `claim_agent_bond` pays its bond back.
+    pub agent_bond_cooldown_secs: U64,
 }
 
 /// An account's storage balance, as returned by the storage methods. All amounts are yoctoNEAR.

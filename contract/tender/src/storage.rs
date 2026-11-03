@@ -216,6 +216,8 @@ impl Tender {
             fee_bps: _,
             min_window_secs: _,
             paused: _,
+            agent_bond: _,
+            agent_bond_cooldown_secs: _,
             next_task_id: _,
             tokens,
             vault,
