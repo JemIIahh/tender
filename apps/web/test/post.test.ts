@@ -4,6 +4,13 @@ import {
   HeldoutSchema,
   heldoutMatchesCriteria,
   PublicCriteriaSchema,
+  RUBRIC_MAX_CRITERIA,
+  RUBRIC_MAX_CRITERION_CHARS,
+  RUBRIC_MAX_ENTRIES,
+  RUBRIC_MIN_SCORE,
+  type RubricProblem,
+  rubricCriteriaProblem,
+  rubricEntriesProblem,
   sha256Hex,
 } from "@tender/shared";
 import { expect, test } from "vitest";
@@ -24,11 +31,8 @@ import {
   PRESET_WINDOWS,
   parseTags,
   planPostCalls,
-  pointKey,
   RUBRIC_JUDGE_LIMIT,
-  RUBRIC_JUDGE_MAX_ENTRIES,
-  RUBRIC_MAX_POINT_CHARS,
-  RUBRIC_MAX_POINTS,
+  RUBRIC_WORDS,
   regexCaution,
   VAULT_SLOT_BYTES,
   windowsOf,
@@ -481,27 +485,34 @@ const rubricOf = (...points: string[]): PostForm =>
 const numbered = (count: number): string[] => Array.from({ length: count }, (_, i) => `point ${i}`);
 const rubricChecks = (form: PostForm) => checkChecks(form, { canRubric: true });
 
-const TOO_MANY = "Use at most 20 points.";
+// The limits are the shared module's, and the cases are written from them: the step has no number
+// of its own to agree with.
+const MAX_POINTS = RUBRIC_MAX_CRITERIA;
+const MAX_CHARS = RUBRIC_MAX_CRITERION_CHARS;
+const TOO_MANY = `Use at most ${MAX_POINTS} points.`;
 const BLANK = "Say what to look for.";
 const BRACKET = "Leave out angle brackets, like < and >.";
-const tooLong = (count: number) => `Use 200 characters or fewer. This has ${count}.`;
+const tooLong = (count: number) => `Use ${MAX_CHARS} characters or fewer. This has ${count}.`;
 const sameAs = (place: number) => `This says the same as point ${place}.`;
 
-test("the_rubric_limits_are_the_judges", () => {
-  expect(RUBRIC_MAX_POINTS).toBe(20);
-  expect(RUBRIC_MAX_POINT_CHARS).toBe(200);
-});
-
 test.each([
-  ["twenty_points", rubricOf(...numbered(20)), {}],
-  ["twenty_one_points", rubricOf(...numbered(21)), { rubric: TOO_MANY }],
-  ["200_characters", rubricOf("x".repeat(200)), {}],
-  ["201_characters", rubricOf("x".repeat(201)), { "rubric-0-criterion": tooLong(201) }],
+  ["all_the_points_allowed", rubricOf(...numbered(MAX_POINTS)), {}],
+  ["one_point_too_many", rubricOf(...numbered(MAX_POINTS + 1)), { rubric: TOO_MANY }],
+  ["all_the_characters_allowed", rubricOf("x".repeat(MAX_CHARS)), {}],
+  [
+    "one_character_too_many",
+    rubricOf("x".repeat(MAX_CHARS + 1)),
+    { "rubric-0-criterion": tooLong(MAX_CHARS + 1) },
+  ],
   // Characters are counted as code points, as the Judge counts them: 200 emoji are 400 UTF-16 units.
-  ["200_emoji", rubricOf("\u{1F600}".repeat(200)), {}],
-  ["201_emoji", rubricOf("\u{1F600}".repeat(201)), { "rubric-0-criterion": tooLong(201) }],
+  ["all_the_emoji_allowed", rubricOf("\u{1F600}".repeat(MAX_CHARS)), {}],
+  [
+    "one_emoji_too_many",
+    rubricOf("\u{1F600}".repeat(MAX_CHARS + 1)),
+    { "rubric-0-criterion": tooLong(MAX_CHARS + 1) },
+  ],
   // The point is counted as it is posted, trimmed.
-  ["200_characters_and_spaces", rubricOf(`  ${"x".repeat(200)}  `), {}],
+  ["all_the_characters_and_spaces", rubricOf(`  ${"x".repeat(MAX_CHARS)}  `), {}],
   ["spaces_and_a_weight", rubricOf("clear", "  \t "), { "rubric-1-criterion": BLANK }],
   ["an_ideographic_space", rubricOf("clear", "\u{3000}"), { "rubric-1-criterion": BLANK }],
   // A prefix, letters that only look alike and a word that is only close are other points.
@@ -563,17 +574,17 @@ test("a_repeat_says_which_point_it_repeats_by_its_place_in_the_list", () => {
 
 test("a_point_with_several_problems_names_one_in_the_order_the_judge_does", () => {
   // A blank point, then a long one, then a bracket, then a repeat: the first that is broken.
-  const long = "x".repeat(201);
+  const long = "x".repeat(MAX_CHARS + 1);
   expect(rubricChecks(rubricOf(long, long))).toEqual({
-    "rubric-0-criterion": tooLong(201),
-    "rubric-1-criterion": tooLong(201),
+    "rubric-0-criterion": tooLong(MAX_CHARS + 1),
+    "rubric-1-criterion": tooLong(MAX_CHARS + 1),
   });
   expect(rubricChecks(rubricOf("a<b", "a<b"))).toEqual({
     "rubric-0-criterion": BRACKET,
     "rubric-1-criterion": BRACKET,
   });
   // The count is named as well as the points that have a problem.
-  expect(rubricChecks(rubricOf(...numbered(20), "POINT 0"))).toEqual({
+  expect(rubricChecks(rubricOf(...numbered(MAX_POINTS), "POINT 0"))).toEqual({
     rubric: TOO_MANY,
     "rubric-20-criterion": sameAs(1),
   });
@@ -585,19 +596,72 @@ test("a_point_with_several_problems_names_one_in_the_order_the_judge_does", () =
   });
 });
 
-test("point_keys_fold_case_width_and_space_as_the_judges_do", () => {
-  expect(pointKey("  Clear\tand \n CONCISE ")).toBe("clear and concise");
-  expect(pointKey("\u{FF23}lear")).toBe("clear");
-  expect(pointKey("\u{FB01}ne")).toBe("fine");
-  expect(pointKey("a\u{00A0}\u{2003}b")).toBe("a b");
-  expect(pointKey(" \t\n ")).toBe("");
-  expect(pointKey("cl\u{0435}ar")).not.toBe(pointKey("clear"));
-  expect(pointKey("accurate!")).not.toBe(pointKey("accurate"));
+test("a_rubric_needs_a_pass_mark_of_at_least_the_shared_minimum", () => {
+  const MIN = String(RUBRIC_MIN_SCORE);
+
+  // Below it, the Judge turns the task down at intake, after the reward is in (P05-R20).
+  expect(rubricChecks(rubricForm({ minScore: "0" })).minScore).toBe(RUBRIC_WORDS.min_score);
+  expect(RUBRIC_WORDS.min_score).toBe(`A rubric needs a pass mark of ${MIN} or more.`);
+  expect(rubricChecks(rubricForm({ minScore: MIN }))).toEqual({});
+  expect(rubricChecks(rubricForm({ minScore: "100" }))).toEqual({});
+  // A mark that is no mark at all says where the range begins for this kind.
+  for (const mark of ["", "101", "-1", "x"]) {
+    expect(rubricChecks(rubricForm({ minScore: mark })).minScore, mark).toBe(
+      `Use a whole number from ${MIN} to 100.`,
+    );
+  }
+  // Another kind may have 0: the Judge scores it by checks, not by a model.
+  expect(checkChecks(exactForm({ minScore: "0" }), { canRubric: true })).toEqual({});
 });
 
-test("the_judge_is_said_to_score_the_first_fifty_entries_of_a_rubric_task", () => {
-  expect(RUBRIC_JUDGE_MAX_ENTRIES).toBe(50);
-  expect(RUBRIC_JUDGE_LIMIT).toBe("The Judge scores the first 50 entries.");
+test("a_rubric_form_that_breaks_a_shared_rule_cannot_be_made_into_documents", () => {
+  // The step's own checks are the first line; the documents are checked once more by the rules of
+  // `@tender/shared` themselves, so that a step that drifts from them sends nothing the Judge turns
+  // away after the reward is in.
+  const broken: Array<[string, PostForm, RubricProblem]> = [
+    ["a pass mark of 0", rubricForm({ minScore: "0" }), "min_score"],
+    ["an angle bracket", rubricOf("a<b"), "criterion_bracket"],
+    ["two alike", rubricOf("Clear", "clear"), "criteria_collide"],
+    ["too many", rubricOf(...numbered(MAX_POINTS + 1)), "too_many_criteria"],
+    ["too long", rubricOf("x".repeat(MAX_CHARS + 1)), "criterion_too_long"],
+  ];
+  for (const [name, form, problem] of broken) {
+    expect(() => buildDocuments(form), name).toThrow(DocumentError);
+    expect(() => buildDocuments(form), name).toThrow(RUBRIC_WORDS[problem]);
+  }
+
+  // And what the step lets through, the rules let through.
+  const docs = buildDocuments(rubricForm());
+  const criteria = PublicCriteriaSchema.parse(decode(docs.criteria));
+  expect(criteria.kind === "rubric" && rubricCriteriaProblem(criteria)).toBeNull();
+});
+
+test("every_rule_a_rubric_can_break_has_words", () => {
+  for (const [problem, words] of Object.entries(RUBRIC_WORDS)) {
+    expect(words, problem).not.toBe("");
+  }
+});
+
+test("the_wizard_posts_a_rubric_task_the_way_the_shared_rules_allow", () => {
+  // An open task: no entry limit and no invites, which is all the contract allows an open task.
+  const post = planPostCalls({
+    form: rubricForm(),
+    uris: { brief: "http://api.test/v1/blobs/x" },
+    hashes: { briefHash: "a".repeat(64), criteriaHash: "b".repeat(64), heldoutCommitment: null },
+    vaultBalance: 20_000_000n,
+    contractId: CONTRACT,
+    tokenId: TOKEN,
+    judgeAccount: JUDGE,
+  }).at(-1);
+  const task = post?.args.task as { max_entries: number; invited: string[] };
+
+  expect(post?.methodName).toBe("post_task");
+  expect(rubricEntriesProblem({ max_entries: task.max_entries, invited: task.invited })).toBeNull();
+  expect(task).toMatchObject({ max_entries: 0, invited: [] });
+});
+
+test("the_judge_is_said_to_score_the_first_entries_of_a_rubric_task_as_many_as_the_shared_rule_says", () => {
+  expect(RUBRIC_JUDGE_LIMIT).toBe(`The Judge scores the first ${RUBRIC_MAX_ENTRIES} entries.`);
 });
 
 test("a_brief_is_checked_against_what_the_schema_allows", () => {

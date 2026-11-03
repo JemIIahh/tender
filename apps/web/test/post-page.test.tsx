@@ -1341,6 +1341,30 @@ test("twenty_one_points_is_one_too_many_and_is_said_when_the_twenty_first_is_add
   await screen.findByLabelText("Amount (tUSDC)");
 });
 
+test("a_rubric_pass_mark_of_zero_is_said_on_the_page_and_stops_next", async () => {
+  const { user } = setup({ agentIs: "team" });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toRubric(user);
+  fillPoint(0, "Says what changed");
+  const next = () => screen.getByRole("button", { name: "Next: Reward" });
+
+  // The Judge turns a rubric task with a pass mark of 0 away, after the reward is in.
+  fill("Pass mark", "0");
+  expect(testId("error-minScore")).toBe("A rubric needs a pass mark of 1 or more.");
+  expect(off(next())).toBe(true);
+  await user.click(next());
+  expect(document.activeElement).toBe(document.getElementById("post-minScore"));
+
+  fill("Pass mark", "1");
+  expect(screen.queryByTestId("error-minScore")).toBeNull();
+  expect(off(next())).toBe(false);
+
+  // Another kind may have 0.
+  await user.click(screen.getByRole("radio", { name: /Exact answer/ }));
+  fill("Pass mark", "0");
+  expect(screen.queryByTestId("error-minScore")).toBeNull();
+});
+
 test("a_rubric_is_dropped_when_the_account_stops_being_the_teams", async () => {
   const { user } = setup({ agentIs: "team" });
   render(<PostWizard judgeAccount={JUDGE} />);

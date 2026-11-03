@@ -4,6 +4,7 @@ import {
   BriefSchema,
   ConfigViewSchema,
   canonicalJson,
+  criterionKey,
   depositCall,
   HeldoutSchema,
   heldoutMatchesCriteria,
@@ -12,6 +13,12 @@ import {
   type PublicCriteria,
   PublicCriteriaSchema,
   postTaskCall,
+  RUBRIC_MAX_CRITERIA,
+  RUBRIC_MAX_CRITERION_CHARS,
+  RUBRIC_MAX_ENTRIES,
+  RUBRIC_MIN_SCORE,
+  type RubricProblem,
+  rubricCriteriaProblem,
   sha256Hex,
   storageDepositCall,
   storageShortfall,
@@ -404,29 +411,32 @@ export function regexCaution(form: PostForm): string | null {
 }
 
 // What the Judge takes of a rubric. It turns a rubric task down at intake when a model could not
-// grade its points (`rubricProblem` in packages/judge/src/kinds/rubric.ts), and that is after the
-// task is posted and its reward is in, so the Checks step holds the points to the same rules and a
-// problem shows where it can be put right. The Judge is a server package that this app does not
-// import: these are copies of its rules, and the two have to be kept in step.
-
-/** The most points a rubric may have (`RUBRIC_MAX_CRITERIA`). */
-export const RUBRIC_MAX_POINTS = 20;
-/** The most characters, counted in code points, that a point may have (`RUBRIC_MAX_CRITERION_CHARS`). */
-export const RUBRIC_MAX_POINT_CHARS = 200;
-/**
- * Every character that is an angle bracket or folds to one under Unicode normalisation: `<` and
- * `>`, the fullwidth and the small forms of each, the two with a bar through them, and the invisible
- * tag forms of the two that some models read as brackets (`ANGLE_BRACKET`). A point may hold none.
- */
-const ANGLE_BRACKET = /[<>\u{FF1C}\u{FF1E}\u{FE64}\u{FE65}\u{226E}\u{226F}\u{E003C}\u{E003E}]/u;
+// grade its points, and that is after the task is posted and its reward is in, so the Checks step
+// holds the points to the same rules and a problem shows where it can be put right. The rules are
+// the ones in `@tender/shared` (rubric.ts), which the Judge reads too: this file has no copy, only
+// the words for each problem.
 
 /**
- * What a point is known by when two are compared (`criterionKey`): the text in NFKC, spaces
- * collapsed to one and trimmed, in lower case. Two points with the same key read the same to the
- * model, which has to tell them apart. A key of "" is a blank point.
+ * The words for each rule a rubric task can break, for the problem the shared rules name. Keyed by
+ * every code, so that a rule added there is a type error here until it has words.
  */
-export function pointKey(point: string): string {
-  return point.normalize("NFKC").replace(/\s+/gu, " ").trim().toLowerCase();
+export const RUBRIC_WORDS: Record<RubricProblem, string> = {
+  too_many_criteria: `Use at most ${RUBRIC_MAX_CRITERIA} points.`,
+  criterion_blank: "Say what to look for.",
+  criterion_too_long: `Use ${RUBRIC_MAX_CRITERION_CHARS} characters or fewer.`,
+  criterion_bracket: "Leave out angle brackets, like < and >.",
+  criteria_collide: "Two points say the same thing.",
+  min_score: `A rubric needs a pass mark of ${RUBRIC_MIN_SCORE} or more.`,
+  entries: `A rubric task is open to anyone, or invite-only with 1 to ${RUBRIC_MAX_ENTRIES} entries.`,
+};
+
+/**
+ * What is wrong with one point of a rubric, by the rules of `@tender/shared`, or null: blank, too
+ * long or with a bracket, in the order the Judge names them. A point is judged by itself here; the
+ * count and a point that repeats an earlier one are the form's.
+ */
+function pointProblem(point: string): RubricProblem | null {
+  return rubricCriteriaProblem({ min_score: RUBRIC_MIN_SCORE, rubric: [{ criterion: point }] });
 }
 
 export function checkChecks(form: PostForm, options: { canRubric: boolean }): Errors {
@@ -440,9 +450,15 @@ export function checkChecks(form: PostForm, options: { canRubric: boolean }): Er
     errors.kind = `${label} needs the answer format "${wanted}". Change it on the Brief step.`;
   }
 
+  // A rubric's pass mark is at least `RUBRIC_MIN_SCORE`: the Judge scores an entry it disqualifies
+  // 0, and with a pass mark of 0 that entry would pass. The other kinds may have 0.
   const mark = form.minScore.trim();
+  const lowest = form.kind === "rubric" ? RUBRIC_MIN_SCORE : 0;
   if (!/^[0-9]{1,3}$/.test(mark) || Number(mark) > 100) {
-    errors.minScore = "Use a whole number from 0 to 100.";
+    errors.minScore = `Use a whole number from ${lowest} to 100.`;
+  } else if (form.kind === "rubric") {
+    const problem = rubricCriteriaProblem({ min_score: Number(mark), rubric: [] });
+    if (problem === "min_score") errors.minScore = RUBRIC_WORDS.min_score;
   }
 
   switch (form.kind) {
@@ -500,26 +516,22 @@ export function checkChecks(form: PostForm, options: { canRubric: boolean }): Er
     case "rubric": {
       const rows = filledRubric(form);
       if (rows.length === 0) errors.rubric = "Add at least one point to score.";
-      else if (rows.length > RUBRIC_MAX_POINTS) {
-        errors.rubric = `Use at most ${RUBRIC_MAX_POINTS} points.`;
-      }
+      else if (rows.length > RUBRIC_MAX_CRITERIA) errors.rubric = RUBRIC_WORDS.too_many_criteria;
       // Where the first point with each key is, so that a later one that repeats it says which.
       const firstWith = new Map<string, number>();
       for (const row of rows) {
         const at = form.rubric.indexOf(row);
         const point = row.criterion.trim();
-        const key = pointKey(point);
-        const length = Array.from(point).length;
+        const key = criterionKey(point);
         const first = firstWith.get(key);
         if (key !== "" && first === undefined) firstWith.set(key, at);
         // One problem to a point, the one the Judge names first.
-        if (key === "") {
-          errors[`rubric-${at}-criterion`] = "Say what to look for.";
-        } else if (length > RUBRIC_MAX_POINT_CHARS) {
+        const problem = pointProblem(point);
+        if (problem !== null) {
           errors[`rubric-${at}-criterion`] =
-            `Use ${RUBRIC_MAX_POINT_CHARS} characters or fewer. This has ${length}.`;
-        } else if (ANGLE_BRACKET.test(point)) {
-          errors[`rubric-${at}-criterion`] = "Leave out angle brackets, like < and >.";
+            problem === "criterion_too_long"
+              ? `${RUBRIC_WORDS[problem]} This has ${Array.from(point).length}.`
+              : RUBRIC_WORDS[problem];
         } else if (first !== undefined) {
           errors[`rubric-${at}-criterion`] = `This says the same as point ${first + 1}.`;
         }
@@ -652,15 +664,12 @@ export const RUBRIC_JUDGE_NOTE =
   "The Tender Judge scores rubric tasks with an AI model. Scores are subjective.";
 
 /**
- * The most entries the Judge scores for a rubric task, the first ones in the order they were
- * committed: the rule plan 05's fix wave sets for an open task, which has no entry limit of its own
- * and is what the wizard posts. The number is `RUBRIC_MAX_ENTRIES` in
- * packages/judge/src/kinds/rubric.ts. A poster is told of it where the Judge is chosen.
+ * The line under the note: what happens to the entries after the first ones. The Judge scores the
+ * first `RUBRIC_MAX_ENTRIES` entries of a rubric task in the order they were committed (P05-R21).
+ * An open task has no entry limit of its own, and is what the wizard posts: it sends `max_entries`
+ * 0 and no invites, which `rubricEntriesProblem` accepts.
  */
-export const RUBRIC_JUDGE_MAX_ENTRIES = 50;
-
-/** The line under the note: what happens to the entries after the first ones. */
-export const RUBRIC_JUDGE_LIMIT = `The Judge scores the first ${RUBRIC_JUDGE_MAX_ENTRIES} entries.`;
+export const RUBRIC_JUDGE_LIMIT = `The Judge scores the first ${RUBRIC_MAX_ENTRIES} entries.`;
 
 export function checkReward(
   form: PostForm,
@@ -887,6 +896,12 @@ function checkedCriteria(form: PostForm): Checked<PublicCriteria> {
   const parsed = PublicCriteriaSchema.safeParse(criteriaDocument(form));
   if (!parsed.success) {
     throw new DocumentError(`The public checks do not fit: ${fault(parsed.error)}.`);
+  }
+  // The last check, by the rules the Judge turns a rubric task down by at intake, so that a step
+  // that drifts from them cannot send what the Judge will refuse once the reward is in.
+  if (parsed.data.kind === "rubric") {
+    const problem = rubricCriteriaProblem(parsed.data);
+    if (problem !== null) throw new DocumentError(RUBRIC_WORDS[problem]);
   }
   return { data: parsed.data, bytes: bytesOf(parsed.data, "criteria") };
 }

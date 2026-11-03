@@ -1,5 +1,6 @@
 "use client";
 
+import { RUBRIC_MIN_SCORE } from "@tender/shared";
 import { type ReactNode, useEffect, useRef } from "react";
 import { type CheckKind, FORMAT_PHRASE, kindsFor, regexCaution } from "../../lib/post";
 import {
@@ -329,7 +330,11 @@ export function CriteriaStep(
 
       <TextField
         label="Pass mark"
-        help="Out of 100. Below it, no payout."
+        help={
+          form.kind === "rubric"
+            ? `Out of 100, and at least ${RUBRIC_MIN_SCORE}. Below it, no payout.`
+            : "Out of 100. Below it, no payout."
+        }
         inputMode="numeric"
         className="sm:max-w-32"
         {...bindText(props, "minScore")}
