@@ -1,5 +1,5 @@
 import type { PublicCriteria } from "@tender/shared";
-import { runInSandbox, type SandboxOptions } from "../sandbox";
+import { Sandbox, type SandboxOptions } from "../sandbox";
 import type { EntryScore } from "../types";
 import { decodeUtf8, type HeldoutOf, scored } from "./common";
 
@@ -11,7 +11,7 @@ const MAX_SOURCE_BYTES = 65_536;
 /**
  * What running one case may cost the Judge: its own runtime, of which the engine ends the code
  * after a second, and the allocation of more than 32 MiB at once. (The engine's whole memory has a
- * cap of its own: `ENGINE_MEMORY_CAP_BYTES`.)
+ * cap of its own, 128 MiB: `ENGINE_MEMORY_CAP_BYTES`.)
  */
 const SANDBOX_LIMITS: SandboxOptions = { timeoutMs: 1_000, memoryBytes: 32 * 1024 * 1024 };
 /**
@@ -98,9 +98,11 @@ export function testsCriteriaProblem(c: TestsCriteria): string | null {
  * Every case runs in a runtime of its own in the sandbox (WebAssembly QuickJS: see `sandbox.ts`),
  * 1 s and 32 MiB for the case, so nothing one case does is seen by the next, and the program is
  * the entry's source, then `JSON.stringify((entry)(input))` with the input as a JSON literal, a
- * string or array or object that is data, never code. A case that runs out of time or memory ends
- * the run: the cases after it are not run, and count as failed, so that an entry that loops costs
- * the Judge one second and not one for each case.
+ * string or array or object that is data, never code. The entry has an engine of its own, so that
+ * no other entry's run decides what it is given. A case that runs out of time ends the run: the
+ * cases after it are not run, and count as failed, so that an entry that loops costs the Judge
+ * one second and not one for each case. A case that runs out of memory fails alone, and the cases
+ * after it run on a new engine.
  *
  * The sandbox gives the code the language's own built-ins and nothing of the host: no `require`,
  * `process`, `fetch`, timers, `WebAssembly` or `import()` that loads anything. The run is bounded
@@ -132,11 +134,15 @@ export async function scoreTests(
   // Without a case, 100 × 0 / 0 would be NaN.
   if (total === 0) return scored(c, 0, ["no test cases"]);
 
+  // An engine of this entry's own, so that nothing an earlier entry did to its engine (the memory
+  // it grew, the layout it left) decides what this one is given: the same entry scores the same
+  // first, after a bomb, and after a worker was stopped.
+  const sandbox = new Sandbox();
   let passed = 0;
   let notRun = 0;
   const reasons: string[] = [];
   for (const [i, testCase] of cases.entries()) {
-    const failure = await runCase(source, c.entry, testCase);
+    const failure = await runCase(sandbox, source, c.entry, testCase);
     if (failure === null) {
       passed++;
       continue;
@@ -144,10 +150,19 @@ export async function scoreTests(
     if (reasons.length < MAX_REASONS) {
       reasons.push(`case ${i + 1} (${showInput(testCase.input)}): ${failure}`);
     }
-    if (failure === "timed out" || failure === "ran out of memory") {
+    // What a case that runs out of its limits costs the entry (controller ruling, S8 fix round 1):
+    // - It runs out of time: the run ends here. The cases after it are not run and count as
+    //   failed, and the score is over all the cases, `round(100 × passed / total)`. That bounds a
+    //   looping entry to one second and not one for each case, and an entry that is slow once
+    //   loses what is after it: tasks should keep their cases well under a second each.
+    // - It runs out of memory: that case fails, and the cases after it run, on a new engine. One
+    //   case's allocation must not zero the entry, and the label is the weaker signal (code can
+    //   fake it, and it says what the engine's allocator had left).
+    if (failure === "timed out") {
       notRun = total - i - 1;
       break;
     }
+    if (failure === "ran out of memory") sandbox.renew();
   }
   if (notRun > 0) reasons.push(`${notRun} more ${notRun === 1 ? "case" : "cases"} not run`);
 
@@ -156,11 +171,16 @@ export async function scoreTests(
 }
 
 /** Runs the entry on one case: `null` when it passes, otherwise why it does not. */
-async function runCase(source: string, entry: string, testCase: TestCase): Promise<Failure | null> {
+async function runCase(
+  sandbox: Sandbox,
+  source: string,
+  entry: string,
+  testCase: TestCase,
+): Promise<Failure | null> {
   // A newline and a semicolon after the source: it may end in a line comment or an expression.
   // `entry` is a name (checked above) and the input is JSON, which is a JavaScript literal.
   const program = `${source}\n;JSON.stringify((${entry})(${JSON.stringify(testCase.input)}))`;
-  const ran = await runInSandbox(program, SANDBOX_LIMITS);
+  const ran = await sandbox.run(program, SANDBOX_LIMITS);
   if (!ran.ok) {
     // `memory` can be faked by code that throws the engine's error, which only ends its own run.
     if (ran.error === "timeout") return "timed out";

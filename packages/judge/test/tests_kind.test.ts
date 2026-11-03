@@ -6,7 +6,7 @@ import { afterAll, expect, test } from "vitest";
 import { scoreEntry, scoreTests } from "../src/index";
 import { openTaskScorer } from "../src/isolate";
 import type { HeldoutOf } from "../src/kinds/common";
-import { runInSandbox } from "../src/sandbox";
+import { runInSandbox, Sandbox } from "../src/sandbox";
 
 // The `tests` kind runs an entrant's JavaScript, so most of this file is about what that code
 // cannot do. The hostile entries are real attempts, and each of them has to score 0 without
@@ -397,17 +397,54 @@ test("a_hostile_entry_does_not_disturb_the_entries_scored_after_it", {
   }
 });
 
-test("a_case_that_runs_out_of_time_or_memory_ends_the_run", async () => {
-  // Only the third input loops. The cases after it are not run, and count as failed.
+test("a_case_that_times_out_ends_the_run_and_the_cases_after_it_count_as_failed", async () => {
+  // Only the third input loops. The cases after it are not run, and count as failed: the score is
+  // over all the cases, 2 of 4 here.
   const source = "function f(x) { if (x === 3) { while (true) {} } return x + 1; }";
   const started = performance.now();
   const result = await score(source);
   expect(performance.now() - started).toBeLessThan(2_500);
   expect(result.score).toBe(50);
   expect(result.reasons).toEqual(["case 3 (3): timed out", "1 more case not run"]);
+  // The total is every case, not the ones that ran: 1 of 5.
+  const five: Case[] = [1, 2, 3, 4, 5].map((n) => ({ input: n, output: n + 1 }));
+  const second = await score(
+    "function f(x) { if (x === 2) { while (true) {} } return x + 1; }",
+    five,
+  );
+  expect(second).toMatchObject({
+    score: 20,
+    reasons: ["case 2 (2): timed out", "3 more cases not run"],
+  });
   // One that only throws is not a reason to stop: the cases after it run.
   const throws = await score("function f(x) { if (x === 3) throw new Error('x'); return x + 1; }");
   expect(throws).toMatchObject({ score: 75, reasons: ["case 3 (3): threw an exception"] });
+});
+
+test("a_case_that_runs_out_of_memory_does_not_zero_the_entry", { timeout: 30_000 }, async () => {
+  // Input 3 allocates until the engine gives out. The cases after it still run, on a new engine,
+  // and pass: 4 of 5. Input 5 needs 20 MB of its own, which a used-up engine could not give.
+  const source = `function f(x) {
+    if (x === 3) { const a = []; while (true) a.push(new Array(1000).fill(0)); }
+    if (x === 5) return new Array(2_500_000).fill(1).length;
+    return x + 1;
+  }`;
+  const cases: Case[] = [
+    { input: 1, output: 2 },
+    { input: 2, output: 3 },
+    { input: 3, output: 4 },
+    { input: 4, output: 5 },
+    { input: 5, output: 2_500_000 },
+  ];
+  const result = await score(source, cases);
+  expect(result).toEqual({
+    score: 80,
+    passed: false,
+    reasons: ["case 3 (3): ran out of memory"],
+  });
+  // One case lost whichever it is: with the bomb on the first input it is the first that fails.
+  const first = await score(source.replace("x === 3", "x === 1"), cases);
+  expect(first).toMatchObject({ score: 80, reasons: ["case 1 (1): ran out of memory"] });
 });
 
 test("the_sandbox_engine_cannot_be_grown_past_its_cap_by_many_small_allocations", {
@@ -496,4 +533,71 @@ test("a_loop_the_engine_cannot_interrupt_is_ended_by_the_worker_and_the_next_ent
   } finally {
     await scorer.close();
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// An entry's score does not depend on the entries scored before it.
+
+/** Honest, and needs 20 MB for a moment: under the case's 32 MiB, over what 64 MiB can give. */
+const NEEDS_20_MB = "function f(x) { return new Array(2_500_000).fill(1).length + x; }";
+const needs20MbCases: Case[] = [1, 2, 3, 4].map((n) => ({ input: n, output: 2_500_000 + n }));
+
+test("the_same_honest_entry_scores_the_same_first_after_a_bomb_and_after_a_worker_kill", {
+  timeout: 90_000,
+}, async () => {
+  const task = { criteria: criteria([], 100), heldout: { tests: heldout(needs20MbCases) } };
+  // The native loop is ended by the worker's stop, at this limit, and the next entry runs in a
+  // new worker.
+  const scorer = openTaskScorer(task, { entryTimeoutMs: 2_500 });
+  const honest = { kind: "scored", score: { score: 100, passed: true, reasons: [] } };
+  const scoreHonest = async () => scorer.score(bytes(NEEDS_20_MB));
+  try {
+    // First in a new worker.
+    expect(await scoreHonest(), "first").toEqual(honest);
+    // After a small honest entry.
+    expect(await scorer.score(bytes("function f(x) { return 2_500_000 + x; }"))).toEqual(honest);
+    expect(await scoreHonest(), "after a small entry").toEqual(honest);
+    // After memory bombs, which grow an engine that was shared.
+    for (const bomb of [HOSTILE.memory_bomb_arrays, HOSTILE.memory_bomb_objects]) {
+      expect((await scorer.score(bytes(String(bomb)))).kind).toBe("scored");
+      expect(await scoreHonest(), "after a bomb").toEqual(honest);
+    }
+    // After a native loop, whose worker is stopped: the next entry has an engine of its own.
+    const looped = await scorer.score(
+      bytes("function f(x) { return new Array(2 ** 32 - 1).indexOf(1); }"),
+    );
+    expect(looped).toEqual({ kind: "scored", score: zero("scoring timed out") });
+    expect(await scoreHonest(), "after a worker kill").toEqual(honest);
+  } finally {
+    await scorer.close();
+  }
+});
+
+test("every_entry_gets_an_engine_of_its_own", { timeout: 30_000 }, async () => {
+  // In one thread, scored one after another, as the Judge's workers do.
+  const c = criteria([], 100);
+  const h = heldout(needs20MbCases);
+  const bomb = bytes(String(HOSTILE.memory_bomb_arrays));
+  expect(await scoreTests(c, h, bytes(NEEDS_20_MB)), "first").toMatchObject({ score: 100 });
+  expect((await scoreTests(c, h, bomb)).score).toBe(0);
+  expect(await scoreTests(c, h, bytes(NEEDS_20_MB)), "after a bomb").toMatchObject({ score: 100 });
+});
+
+test("a_sandbox_has_an_engine_of_its_own_and_renew_replaces_it", async () => {
+  const limits = { timeoutMs: 1_000, memoryBytes: 32 * 1024 * 1024 };
+  const a = new Sandbox();
+  const b = new Sandbox();
+  expect(await a.run("var seen = 1; seen", limits)).toEqual({ ok: true, value: 1 });
+  // Each run has a runtime of its own, whatever the engine.
+  expect(await a.run("typeof seen", limits)).toEqual({ ok: true, value: "undefined" });
+  expect(
+    await a.run("const a = []; while (true) a.push(new Array(1000).fill(0));", limits),
+  ).toMatchObject({ ok: false, error: "memory" });
+  // `b` never saw the bomb, and `a` is as good as new once it has a new engine.
+  const big = "new Array(2_500_000).fill(1).length";
+  expect(await b.run(big, limits)).toEqual({ ok: true, value: 2_500_000 });
+  a.renew();
+  expect(await a.run(big, limits)).toEqual({ ok: true, value: 2_500_000 });
+  // The default sandbox is `runInSandbox`'s, and is another one.
+  expect(await runInSandbox("1 + 1", limits)).toEqual({ ok: true, value: 2 });
 });
