@@ -3,7 +3,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode, useSyncExternalStore } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import Board from "../app/(app)/page";
+import Board from "../app/(app)/tasks/page";
 
 // The board over a fake API: what it shows for each state of the request, and how its filters
 // and its paging ask the API. The filters are in the address, which the tests hold in a tiny model

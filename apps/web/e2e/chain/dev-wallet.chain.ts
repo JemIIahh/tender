@@ -285,7 +285,7 @@ test("post_task_end_to_end", async ({ page }) => {
   // The board lists the task under the account that posted it, and without the team's label, as
   // that account is not the team's. The board spec shows the label where it belongs; this shows the
   // page does not put it on every poster.
-  await page.goto("/");
+  await page.goto("/tasks");
   const card = cardTitled(page, TITLE);
   await expect(card, "the card of the task the wizard posted").toBeVisible();
   const poster = card.getByTestId("poster");

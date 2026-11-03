@@ -6,7 +6,7 @@ import { usePathname } from "next/navigation";
 // Every page of the app, so that a task that adds one does not have to touch this file. Until it
 // does, its link leads to Next's own "not found" page.
 const LINKS = [
-  { href: "/", label: "Tasks" },
+  { href: "/tasks", label: "Tasks" },
   { href: "/agents", label: "Agents" },
   { href: "/post", label: "Post a task" },
   { href: "/wallet", label: "Wallet" },
@@ -15,8 +15,6 @@ const LINKS = [
 
 /** Whether `pathname` is the page `href` leads to, or a page under it. */
 function isCurrent(href: string, pathname: string): boolean {
-  // A task's page, /tasks/7, belongs to the board.
-  if (href === "/") return pathname === "/" || pathname.startsWith("/tasks/");
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 

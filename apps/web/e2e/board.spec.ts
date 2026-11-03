@@ -16,7 +16,7 @@ const card = (page: Page, title: string) =>
 
 test("board_renders_seeded_tasks", async ({ page }) => {
   await routeApi(page);
-  await page.goto("/");
+  await page.goto("/tasks");
 
   for (const title of [REGEX_TITLE, INVOICE_TITLE]) {
     await expect(card(page, title)).toBeVisible();
@@ -38,7 +38,9 @@ const PHONE = { width: 375, height: 812 };
  * adds its own: "/agents", "/post" and "/telegram" are not here until they exist.
  */
 const ROUTES: Record<string, (page: Page) => Promise<void>> = {
-  "/": (page) => expect(page.getByTestId("task-card")).toHaveCount(TASKS.length),
+  // The landing, with its ticker's live figures in (they come from the fixture's open tasks).
+  "/": (page) => expect(page.getByTestId("ticker-live").first()).toBeAttached(),
+  "/tasks": (page) => expect(page.getByTestId("task-card")).toHaveCount(TASKS.length),
   // An open task with its timeline and its entries.
   "/tasks/2": (page) => expect(page.getByTestId("phase-timeline")).toBeVisible(),
   // A settled one with every part of the page, each as wide as the data can be (fixtures.ts).
@@ -73,7 +75,7 @@ test("phone_width_has_no_horizontal_scroll", async ({ page }) => {
 
 test("keyboard_focus_is_visible", async ({ page }) => {
   await routeApi(page);
-  await page.goto("/");
+  await page.goto("/tasks");
   await expect(page.getByTestId("task-card")).toHaveCount(TASKS.length);
 
   await page.keyboard.press("Tab");
@@ -100,7 +102,7 @@ test("silent_api_ends_in_an_error_state_and_retry_loads_the_board", async ({ pag
     if (!silent) await route.fallback();
   });
 
-  await page.goto("/");
+  await page.goto("/tasks");
   await expect(page.getByRole("status")).toContainText("Loading");
   await page.clock.fastForward(20_000);
 
@@ -130,7 +132,7 @@ test("silent_api_ends_in_an_error_state_and_retry_loads_the_board", async ({ pag
 
 test("board_filters_by_phase_and_tag_and_leads_to_the_task_page", async ({ page }) => {
   await routeApi(page);
-  await page.goto("/");
+  await page.goto("/tasks");
   await expect(page.getByTestId("task-card")).toHaveCount(TASKS.length);
 
   // No fixture task is settled.
