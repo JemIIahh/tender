@@ -1,7 +1,6 @@
 //! Spending authorisation: the gate in front of every method that spends from an account's vault.
 //!
-//! A spending method (`post_task` now, `top_up_task` with pooled bounties) calls `authorize_spend`
-//! before it debits. In P0 the only way through is a call with exactly 1 yoctoNEAR attached. A
+//! A spending method (`post_task` and `top_up_task`) calls `authorize_spend` before it debits. In P0 the only way through is a call with exactly 1 yoctoNEAR attached. A
 //! function-call access key cannot attach a deposit, so only a full-access key gets through, and a
 //! leaked function-call key cannot spend at all. Delegate keys with spending caps (spec 6.8) add
 //! a second way through here.

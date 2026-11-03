@@ -547,6 +547,15 @@ mod tests {
         t.post_task(task).0
     }
 
+    /// `who` tops task `id` up by `amount` at `T1`, with 1 yoctoNEAR.
+    fn top_up(t: &mut Tender, who: &str, id: u64, amount: u128) {
+        testing_env!(ctx(who)
+            .attached_deposit(ONE_YOCTO)
+            .block_timestamp(T1)
+            .build());
+        t.top_up_task(U64(id), U128(amount));
+    }
+
     /// `who` registers as an agent.
     fn register_agent(t: &mut Tender, who: &str) {
         testing_env!(ctx(who).block_timestamp(T1).build());
@@ -1194,11 +1203,9 @@ mod tests {
         fund(&mut t, "frank.test", 300);
         let before = money(&t);
         let id = post(&mut t, args());
-        // A second funder, the way Task 13's top-ups will add one: frank pays 300 into the escrow.
-        t.debit(&acct("frank.test"), &acct(USDC), 300);
-        let task = t.tasks.get_mut(&id).unwrap();
-        task.reward += 300;
-        task.funders.push((acct("frank.test"), 300));
+        // A second funder: frank tops the task up by 300.
+        top_up(&mut t, "frank.test", id, 300);
+        assert_eq!(t.get_task(U64(id)).unwrap().reward, U128(REWARD + 300));
         revealed(&mut t, id, &["bob.test", "carol.test"]);
 
         // Awarding nothing still takes a scorecard.
@@ -1218,6 +1225,81 @@ mod tests {
         let v = t.get_task(U64(id)).unwrap();
         assert_eq!(v.phase, Phase::Settled);
         assert_eq!(v.outcome, voided(VoidReason::NoAward, true));
+    }
+
+    // Pooled bounties.
+
+    #[test]
+    fn pooled_void_refunds_each_funder_exactly() {
+        let mut t = world();
+        // erin and frank fund alice's task too, and take no other part in it.
+        fund(&mut t, "erin.test", 300_000);
+        fund(&mut t, "frank.test", 200_001);
+        let id = post(&mut t, args());
+        top_up(&mut t, "erin.test", id, 300_000);
+        top_up(&mut t, "frank.test", id, 200_001);
+        top_up(&mut t, "alice.test", id, 7);
+        assert_eq!(t.get_task(U64(id)).unwrap().reward, U128(REWARD + 500_008));
+        // frank has no storage to spare when the task is voided: a refund needs none.
+        leave_spare(&mut t, "frank.test", 0);
+        let before = money(&t);
+
+        try_void(&mut t, KEEPER, id, REVEAL_DEADLINE).unwrap();
+        // Each funder gets back exactly what it paid in, and nobody else gets anything: the
+        // treasury takes no fee from a refund. In the order of `money`: alice, the treasury,
+        // bob, carol, dave, erin, frank.
+        let mut expected = before;
+        expected[0] += REWARD + 7;
+        expected[5] += 300_000;
+        expected[6] += 200_001;
+        assert_eq!(money(&t), expected);
+        assert_eq!(
+            money(&t),
+            [FUNDS, 0, 0, 0, 0, 300_000, 200_001],
+            "everyone holds what it held before it paid in"
+        );
+        // The event lists one refund per funder, in the funders' order.
+        assert_eq!(
+            get_logs(),
+            [event(
+                "voided",
+                r#"{"task_id":"1","reason":"no_reveals","by":null,"refunds":[{"account":"alice.test","amount":"1000007"},{"account":"erin.test","amount":"300000"},{"account":"frank.test","amount":"200001"}],"scorecard_hash":null,"scorecard_uri":null}"#
+            )]
+        );
+    }
+
+    #[test]
+    fn pooled_pick_takes_the_fee_on_the_whole_reward() {
+        let mut t = world();
+        fund(&mut t, "erin.test", 500_000);
+        fund(&mut t, "frank.test", 500_000);
+        let id = post(&mut t, args());
+        top_up(&mut t, "erin.test", id, 500_000);
+        top_up(&mut t, "frank.test", id, 500_000);
+        revealed(&mut t, id, &["bob.test", "carol.test"]);
+        let before = money(&t);
+
+        let winners = [("bob.test", 7_000), ("carol.test", 3_000)];
+        try_pick(&mut t, JUDGE, id, REVEAL_DEADLINE, &winners).unwrap();
+        // The reward is 2_000_000, whoever paid it. The fee is 5% of all of it, 100_000, and the
+        // 1_900_000 left is split 7:3. The funders get nothing back.
+        let mut expected = before;
+        expected[1] += 100_000;
+        expected[2] += 1_330_000;
+        expected[3] += 570_000;
+        assert_eq!(money(&t), expected);
+        assert_eq!(
+            outcome(&t, id),
+            Some(OutcomeView::Picked {
+                winners: vec![
+                    payout("bob.test", 7_000, 1_330_000),
+                    payout("carol.test", 3_000, 570_000)
+                ],
+                fee: U128(100_000),
+                scorecard_hash: SCORECARD_HASH.to_string(),
+                scorecard_uri: SCORECARD_URI.to_string(),
+            })
+        );
     }
 
     #[test]

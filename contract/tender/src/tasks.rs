@@ -1,18 +1,22 @@
-//! Posting tasks, the task views, and the phase a task is in.
+//! Posting tasks, topping them up, the task views, and the phase a task is in.
 //!
 //! A poster escrows a reward from its vault into a task with four consecutive windows: commit,
 //! reveal, pick and fallback. Each window is half-open, `[start, end)`, and the phase is derived
 //! from the block time and the outcome on every read, never stored, so no transaction is needed
 //! to move a task along. Task ids run from 1 with no gaps, so the views page through them by id.
+//!
+//! Until its commit deadline, anyone may add to a task's reward from its own vault with
+//! `top_up_task`, a pooled bounty. The task records each funder and what it paid in, so a void
+//! can give each one back exactly that.
 
 use near_sdk::json_types::{U128, U64};
 use near_sdk::{env, near, AccountId};
 
-use crate::events::{emit, TaskCreated};
+use crate::events::{emit, TaskCreated, TaskToppedUp};
 use crate::types::{
     check_uri, err, hex32, parse_hash, FunderView, Outcome, OutcomeView, Payout, PayoutView, Phase,
-    PostTaskArgs, Task, TaskView, MAX_INVITED, MAX_PAGE, MAX_WINDOW_SECS, MAX_WINNERS,
-    OUTCOME_RESERVE_BYTES,
+    PostTaskArgs, Task, TaskView, MAX_FUNDERS, MAX_INVITED, MAX_PAGE, MAX_REWARD_LIMIT,
+    MAX_WINDOW_SECS, MAX_WINNERS, OUTCOME_RESERVE_BYTES,
 };
 use crate::{Tender, TenderExt};
 
@@ -310,6 +314,89 @@ impl Tender {
         U64(id)
     }
 
+    /// Moves `amount` of task `task_id`'s token from the caller's vault into the task's escrow,
+    /// which makes the caller one of its funders: a pooled bounty. Called with exactly 1
+    /// yoctoNEAR attached, as `post_task` is.
+    ///
+    /// The rules, checked in this order, each with its error code:
+    /// - top-ups are not paused (`E_PAUSED`);
+    /// - the task exists (`E_NOT_FOUND`);
+    /// - its commit window is open: the block time is before its `commit_deadline` (`E_PHASE`);
+    /// - it is not settled (`E_SETTLED`). No task settles before its commit deadline, so the rule
+    ///   above is the one a settled task breaks; this one only keeps the money of a settled task
+    ///   from moving whatever happens;
+    /// - the caller funds the task already, or it has fewer than `MAX_FUNDERS` funders, the
+    ///   poster among them (`E_LIMIT`);
+    /// - the task's token is still enabled (`E_TOKEN`);
+    /// - `amount` is more than 0, and the reward it makes is at most the token's `max_reward` as
+    ///   it is now, and at most `MAX_REWARD_LIMIT` (`E_REWARD`);
+    /// - the spend is authorised: 1 yoctoNEAR attached (`E_AUTH`);
+    /// - the caller's vault holds `amount` (`E_FUNDS`).
+    ///
+    /// The caller is the predecessor, never the signer. If it funds the task already, the poster
+    /// included, its record grows by `amount`. Otherwise it gets a record after the others, and
+    /// pays for that record's bytes out of its storage balance (`E_STORAGE` if it cannot); that
+    /// is the only storage a top-up adds, and an existing funder needs none.
+    ///
+    /// Nothing else about the task changes: its terms are the poster's. A pick takes the fee from
+    /// the whole reward and pays the winners out of the rest, whoever paid it in; an empty pick or
+    /// a void gives each funder back exactly what it paid in, so a refund is pro rata with no
+    /// dust. Emits `task_topped_up`, with the reward the top-up made.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn top_up_task(&mut self, task_id: U64, amount: U128) {
+        let funder = env::predecessor_account_id();
+        let (id, amount) = (task_id.0, amount.0);
+        if self.paused {
+            env::panic_str(&format!("{}: topping up tasks is paused", err::E_PAUSED));
+        }
+        let task = self.tasks.get(&id).unwrap_or_else(|| no_task(id));
+        if env::block_timestamp() >= task.commit_deadline {
+            env::panic_str(&format!(
+                "{}: task {id} takes top-ups only until its commit deadline",
+                err::E_PHASE
+            ));
+        }
+        if task.outcome.is_some() {
+            env::panic_str(&format!("{}: task {id} is already settled", err::E_SETTLED));
+        }
+        let known = task
+            .funders
+            .iter()
+            .position(|(account, _)| *account == funder);
+        if known.is_none() && task.funders.len() >= MAX_FUNDERS {
+            env::panic_str(&format!(
+                "{}: task {id} has {MAX_FUNDERS} funders, the most it can have",
+                err::E_LIMIT
+            ));
+        }
+        let token = task.token.clone();
+        let reward = self.topped_up_reward(task, amount);
+
+        // Everything above only reads. The mark comes before the first write, so the storage
+        // this call adds is measured from here.
+        let before = self.storage_mark();
+        self.authorize_spend(&funder, &token, amount);
+        self.debit(&funder, &token, amount);
+        let task = self.tasks.get_mut(&id).unwrap_or_else(|| no_task(id));
+        task.reward = reward;
+        match known {
+            // A record is at most the reward, which has just been shown to fit.
+            Some(i) => task.funders[i].1 += amount,
+            None => task.funders.push((funder.clone(), amount)),
+        }
+        self.settle_storage(&funder, before);
+        emit(
+            "task_topped_up",
+            &TaskToppedUp {
+                task_id,
+                funder,
+                amount: U128(amount),
+                reward: U128(reward),
+            },
+        );
+    }
+
     /// The task with id `task_id`, in the phase it is in at the block time of the call, or `None`
     /// if there is no such task.
     pub fn get_task(&self, task_id: U64) -> Option<TaskView> {
@@ -359,6 +446,34 @@ impl Tender {
         }
     }
 
+    /// The reward that topping `task` up by `amount` makes. Panics `E_TOKEN` unless the task's
+    /// token is enabled, then `E_REWARD` unless `amount` is more than 0 and the sum is at most
+    /// both the token's `max_reward` and `MAX_REWARD_LIMIT`, so that the task can still be
+    /// picked. `min_reward` is not checked again: the task met it when it was posted.
+    fn topped_up_reward(&self, task: &Task, amount: u128) -> u128 {
+        let token = &task.token;
+        let Some(limits) = self.tokens.get(token).filter(|c| c.enabled) else {
+            env::panic_str(&format!(
+                "{}: {token} is not an enabled token",
+                err::E_TOKEN
+            ));
+        };
+        if amount == 0 {
+            env::panic_str(&format!("{}: a top-up must be more than 0", err::E_REWARD));
+        }
+        let max = limits.max_reward.min(MAX_REWARD_LIMIT);
+        task.reward
+            .checked_add(amount)
+            .filter(|reward| *reward <= max)
+            .unwrap_or_else(|| {
+                env::panic_str(&format!(
+                    "{}: a top-up of {amount} would take the reward of task {} past {max}",
+                    err::E_REWARD,
+                    task.id
+                ))
+            })
+    }
+
     /// Panics `E_WINDOW` unless the window `name` of `secs` seconds is `min_window_secs` to
     /// `MAX_WINDOW_SECS`.
     fn check_window(&self, name: &str, secs: u32) {
@@ -384,8 +499,8 @@ mod tests {
     use crate::test_utils::{ctx, fresh, panic_message};
     use crate::types::{
         parse_hash, FunderView, Outcome, OutcomeView, Payout, PayoutView, Phase, PostTaskArgs,
-        TaskView, TokenConfig, VoidReason, MAX_INVITED, MAX_URI_BYTES, MAX_WINDOW_SECS,
-        MAX_WINNERS, OUTCOME_RESERVE_BYTES,
+        StorageView, Task, TaskView, TokenConfig, VoidReason, MAX_FUNDERS, MAX_INVITED,
+        MAX_REWARD_LIMIT, MAX_URI_BYTES, MAX_WINDOW_SECS, MAX_WINNERS, OUTCOME_RESERVE_BYTES,
     };
     use crate::Tender;
 
@@ -1700,5 +1815,599 @@ mod tests {
         assert_eq!(ids(&t.get_tasks(U64(1), 500)), (1..=50).collect::<Vec<_>>());
         assert_eq!(ids(&t.get_tasks(U64(1), u32::MAX)).len(), 50);
         assert_eq!(ids(&t.get_tasks(U64(51), 500)), [51, 52, 53, 54, 55]);
+    }
+
+    // Top-ups: pooled bounties.
+
+    /// `who` tops task `id` up by `amount` at block time `now`, attaching `deposit`. `Err` holds
+    /// the message the contract panicked with.
+    fn try_top_up_at(
+        t: &mut Tender,
+        who: &str,
+        deposit: NearToken,
+        now: u64,
+        id: u64,
+        amount: u128,
+    ) -> Result<(), String> {
+        testing_env!(ctx(who)
+            .attached_deposit(deposit)
+            .block_timestamp(now)
+            .build());
+        match panic_message(|| t.top_up_task(U64(id), U128(amount))) {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
+    }
+
+    /// `who` tops task `id` up by `amount` at `T1` with 1 yoctoNEAR, which must go through.
+    fn top_up(t: &mut Tender, who: &str, id: u64, amount: u128) {
+        try_top_up_at(t, who, ONE_YOCTO, T1, id, amount)
+            .unwrap_or_else(|m| panic!("{who} topping task {id} up by {amount}: {m}"));
+    }
+
+    /// A would-be funder: `who` with 0.1 NEAR of storage and `amount` of USDC in its vault.
+    fn funder(t: &mut Tender, who: &str, amount: u128) {
+        register(t, who, NearToken::from_millinear(100));
+        fund(t, who, amount);
+    }
+
+    /// The bytes a funder record of `who` adds to a task record: its Borsh encoding.
+    fn funder_bytes(who: &str) -> u64 {
+        borsh::to_vec(&(acct(who), 0u128)).unwrap().len() as u64
+    }
+
+    fn funders(list: &[(&str, u128)]) -> Vec<FunderView> {
+        list.iter()
+            .map(|&(account, amount)| FunderView {
+                account: acct(account),
+                amount: U128(amount),
+            })
+            .collect()
+    }
+
+    /// What a top-up by `who` into task `id` could change: the task record, `who`'s vault and
+    /// `who`'s storage balance.
+    type Snapshot = (Option<Task>, u128, Option<StorageView>);
+
+    fn snapshot(t: &Tender, id: u64, who: &str) -> Snapshot {
+        (
+            t.tasks.get(&id).cloned(),
+            balance(t, who),
+            t.storage_balance_of(acct(who)),
+        )
+    }
+
+    /// Asserts that `result` is a rejection with `code`, that it logged nothing, and that the task
+    /// `id` and `who`'s vault and storage are as `before` holds them. Returns the message.
+    fn assert_top_up_rejected(
+        t: &Tender,
+        what: &str,
+        code: &str,
+        result: Result<(), String>,
+        (id, who, before): (u64, &str, &Snapshot),
+    ) -> String {
+        let message = result.expect_err(&format!("{what}: expected {code}, but it went through"));
+        assert!(
+            message.starts_with(&format!("{code}: ")),
+            "{what}: expected {code}, got {message:?}"
+        );
+        assert!(get_logs().is_empty(), "{what}: a rejection logs nothing");
+        assert_eq!(
+            &snapshot(t, id, who),
+            before,
+            "{what}: a rejection changes nothing"
+        );
+        message
+    }
+
+    #[test]
+    fn top_up_adds_reward_and_funder() {
+        let mut t = world();
+        funder(&mut t, "bob.test", 5 * REWARD);
+        let id = post(&mut t, args());
+        let posted = t.tasks.get(&id).unwrap().clone();
+        let (alice_used, bob_used) = (used(&t, "alice.test"), used(&t, "bob.test"));
+
+        top_up(&mut t, "bob.test", id, 2 * REWARD);
+
+        let v = view(&t, id);
+        assert_eq!(v.reward, U128(3 * REWARD));
+        assert_eq!(
+            v.funders,
+            funders(&[("alice.test", REWARD), ("bob.test", 2 * REWARD)])
+        );
+        assert_eq!(v.phase, Phase::Open);
+        // Nothing else about the task changed: its terms are the poster's.
+        let task = t.tasks.get(&id).unwrap().clone();
+        assert_eq!(
+            Task {
+                reward: posted.reward,
+                funders: posted.funders.clone(),
+                ..task
+            },
+            posted
+        );
+        // The money left bob's vault for the escrow, and nobody else's moved.
+        assert_eq!(balance(&t, "bob.test"), 3 * REWARD);
+        assert_eq!(balance(&t, "alice.test"), FUNDS - REWARD);
+        // bob pays for his record, which is all that grew, and alice pays nothing more.
+        assert_eq!(used(&t, "bob.test"), bob_used + funder_bytes("bob.test"));
+        assert_eq!(used(&t, "alice.test"), alice_used);
+        // One event, with the reward the top-up made.
+        assert_eq!(
+            get_logs(),
+            [
+                r#"EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"task_topped_up","data":[{"task_id":"1","funder":"bob.test","amount":"2000000","reward":"3000000"}]}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn top_up_same_funder_accumulates() {
+        let mut t = world();
+        funder(&mut t, "bob.test", 5 * REWARD);
+        let id = post(&mut t, args());
+        top_up(&mut t, "bob.test", id, REWARD);
+        let bob_used = used(&t, "bob.test");
+
+        // A second top-up adds to bob's record. There is no second record, so no storage either.
+        top_up(&mut t, "bob.test", id, 2 * REWARD);
+        assert_eq!(
+            view(&t, id).funders,
+            funders(&[("alice.test", REWARD), ("bob.test", 3 * REWARD)])
+        );
+        assert_eq!(used(&t, "bob.test"), bob_used);
+        // So it needs no spare storage at all.
+        leave_spare(&mut t, "bob.test", 0);
+        top_up(&mut t, "bob.test", id, 1);
+
+        // The poster is a funder already, so her record grows the same way.
+        let alice_used = used(&t, "alice.test");
+        top_up(&mut t, "alice.test", id, 500_000);
+        let v = view(&t, id);
+        assert_eq!(
+            v.funders,
+            funders(&[
+                ("alice.test", REWARD + 500_000),
+                ("bob.test", 3 * REWARD + 1)
+            ])
+        );
+        assert_eq!(v.reward, U128(4 * REWARD + 500_001));
+        assert_eq!(used(&t, "alice.test"), alice_used);
+        assert_eq!(balance(&t, "bob.test"), 2 * REWARD - 1);
+        assert_eq!(balance(&t, "alice.test"), FUNDS - REWARD - 500_000);
+    }
+
+    #[test]
+    fn top_up_after_commit_deadline_rejected() {
+        let mut t = world();
+        funder(&mut t, "bob.test", 5 * REWARD);
+        let id = post(&mut t, args());
+        let task = t.tasks.get(&id).unwrap().clone();
+
+        // The commit window is half-open: its last nanosecond still takes a top-up...
+        assert_eq!(
+            try_top_up_at(
+                &mut t,
+                "bob.test",
+                ONE_YOCTO,
+                task.commit_deadline - 1,
+                id,
+                1
+            ),
+            Ok(())
+        );
+        // ...and from the deadline on, in every later phase, the task takes no more money.
+        let before = snapshot(&t, id, "bob.test");
+        for (what, now) in [
+            ("at the commit deadline", task.commit_deadline),
+            (
+                "at the last nanosecond of the reveal window",
+                task.reveal_deadline - 1,
+            ),
+            ("in the verifier's window", task.reveal_deadline),
+            ("in the poster's window", task.pick_deadline),
+            ("once expired", task.fallback_deadline),
+            ("at the end of time", u64::MAX),
+        ] {
+            let result = try_top_up_at(&mut t, "bob.test", ONE_YOCTO, now, id, 1);
+            let message =
+                assert_top_up_rejected(&t, what, "E_PHASE", result, (id, "bob.test", &before));
+            assert_eq!(
+                message,
+                "E_PHASE: task 1 takes top-ups only until its commit deadline"
+            );
+        }
+
+        // A settled task, too. No task settles before its commit deadline, so that is the rule
+        // a top-up of one breaks...
+        testing_env!(ctx("keeper.test")
+            .block_timestamp(task.reveal_deadline)
+            .build());
+        t.void_task(U64(id));
+        let before = snapshot(&t, id, "bob.test");
+        let result = try_top_up_at(&mut t, "bob.test", ONE_YOCTO, task.reveal_deadline, id, 1);
+        let what = "a voided task";
+        assert_top_up_rejected(&t, what, "E_PHASE", result, (id, "bob.test", &before));
+        // ...and a block time before it, which the chain never goes back to, still finds the
+        // task settled.
+        let result = try_top_up_at(&mut t, "bob.test", ONE_YOCTO, T1, id, 1);
+        let what = "a settled task inside its commit window";
+        let message =
+            assert_top_up_rejected(&t, what, "E_SETTLED", result, (id, "bob.test", &before));
+        assert_eq!(message, "E_SETTLED: task 1 is already settled");
+    }
+
+    #[test]
+    fn top_up_cap_51st_funder() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        // alice is the first funder. 49 more make the most a task can have.
+        let names: Vec<String> = (1..MAX_FUNDERS)
+            .map(|i| format!("funder{i}.test"))
+            .collect();
+        for name in &names {
+            funder(&mut t, name, 1_000);
+            top_up(&mut t, name, id, 1_000);
+        }
+        let v = view(&t, id);
+        assert_eq!(v.funders.len(), MAX_FUNDERS);
+        assert_eq!(v.reward, U128(REWARD + 49 * 1_000));
+
+        // The 51st is refused, and nothing moves.
+        funder(&mut t, "late.test", 1_000);
+        let before = snapshot(&t, id, "late.test");
+        let result = try_top_up_at(&mut t, "late.test", ONE_YOCTO, T1, id, 1_000);
+        let what = "a 51st funder";
+        let message =
+            assert_top_up_rejected(&t, what, "E_LIMIT", result, (id, "late.test", &before));
+        assert_eq!(
+            message,
+            "E_LIMIT: task 1 has 50 funders, the most it can have"
+        );
+
+        // Those already in can still add to what they put in, the poster too.
+        fund(&mut t, "funder7.test", 500);
+        top_up(&mut t, "funder7.test", id, 500);
+        top_up(&mut t, "alice.test", id, 1);
+        let v = view(&t, id);
+        assert_eq!(v.funders.len(), MAX_FUNDERS);
+        assert_eq!(v.funders[0], funders(&[("alice.test", REWARD + 1)])[0]);
+        assert_eq!(v.funders[7], funders(&[("funder7.test", 1_500)])[0]);
+        assert_eq!(v.reward, U128(REWARD + 49 * 1_000 + 501));
+        // The records are in the order of each funder's first top-up, and add up to the reward.
+        let order: Vec<String> = v.funders[1..]
+            .iter()
+            .map(|f| f.account.to_string())
+            .collect();
+        assert_eq!(order, names);
+        assert_eq!(
+            v.funders.iter().map(|f| f.amount.0).sum::<u128>(),
+            v.reward.0
+        );
+    }
+
+    #[test]
+    fn top_up_rejects_each_rule() {
+        let mut t = world();
+        funder(&mut t, "bob.test", 5 * REWARD);
+        // carol has a storage balance and no vault slot.
+        register(&mut t, "carol.test", NearToken::from_millinear(100));
+        let id = post(&mut t, args());
+        let before = snapshot(&t, id, "bob.test");
+        let check = |t: &mut Tender, what: &str, code: &str, deposit, id, amount| {
+            let result = try_top_up_at(t, "bob.test", deposit, T1, id, amount);
+            assert_top_up_rejected(t, what, code, result, (1, "bob.test", &before))
+        };
+
+        t.paused = true;
+        let message = check(&mut t, "while paused", "E_PAUSED", ONE_YOCTO, id, 1);
+        assert_eq!(message, "E_PAUSED: topping up tasks is paused");
+        t.paused = false;
+
+        let message = check(
+            &mut t,
+            "a task that does not exist",
+            "E_NOT_FOUND",
+            ONE_YOCTO,
+            99,
+            1,
+        );
+        assert_eq!(message, "E_NOT_FOUND: no task 99");
+
+        t.put_token(acct(USDC), usdc(false));
+        let message = check(&mut t, "a disabled token", "E_TOKEN", ONE_YOCTO, id, 1);
+        assert_eq!(message, "E_TOKEN: usdc.test is not an enabled token");
+        t.put_token(acct(USDC), usdc(true));
+
+        let message = check(&mut t, "nothing", "E_REWARD", ONE_YOCTO, id, 0);
+        assert_eq!(message, "E_REWARD: a top-up must be more than 0");
+        let past_max = MAX_REWARD - REWARD + 1;
+        let message = check(
+            &mut t,
+            "past max_reward",
+            "E_REWARD",
+            ONE_YOCTO,
+            id,
+            past_max,
+        );
+        assert_eq!(
+            message,
+            format!("E_REWARD: a top-up of {past_max} would take the reward of task 1 past {MAX_REWARD}")
+        );
+        // A sum past u128::MAX is the same rejection, not an overflow.
+        check(&mut t, "u128::MAX", "E_REWARD", ONE_YOCTO, id, u128::MAX);
+
+        for (what, deposit) in [
+            ("no deposit", NO_DEPOSIT),
+            ("2 yoctoNEAR", NearToken::from_yoctonear(2)),
+            ("1 NEAR", NearToken::from_near(1)),
+        ] {
+            let message = check(&mut t, what, "E_AUTH", deposit, id, 1);
+            assert_eq!(message, AUTH_MESSAGE, "{what}");
+        }
+
+        let message = check(
+            &mut t,
+            "more than bob holds",
+            "E_FUNDS",
+            ONE_YOCTO,
+            id,
+            5 * REWARD + 1,
+        );
+        assert_eq!(message, "E_FUNDS: insufficient vault balance");
+        let carol = snapshot(&t, id, "carol.test");
+        let result = try_top_up_at(&mut t, "carol.test", ONE_YOCTO, T1, id, 1);
+        let what = "no vault slot";
+        assert_top_up_rejected(&t, what, "E_FUNDS", result, (id, "carol.test", &carol));
+
+        // Exactly up to max_reward is fine.
+        top_up(&mut t, "bob.test", id, 5 * REWARD);
+        fund(&mut t, "bob.test", MAX_REWARD);
+        top_up(&mut t, "bob.test", id, MAX_REWARD - 6 * REWARD);
+        assert_eq!(view(&t, id).reward, U128(MAX_REWARD));
+    }
+
+    #[test]
+    fn top_up_respects_limits_as_they_are_now() {
+        let mut t = world();
+        funder(&mut t, "bob.test", 5 * REWARD);
+        let id = post(&mut t, args());
+        // The owner narrows the limits below the reward. The task keeps its reward, and takes no
+        // more.
+        t.put_token(
+            acct(USDC),
+            TokenConfig {
+                min_reward: MIN_REWARD,
+                max_reward: REWARD / 2,
+                enabled: true,
+            },
+        );
+        let before = snapshot(&t, id, "bob.test");
+        let result = try_top_up_at(&mut t, "bob.test", ONE_YOCTO, T1, id, 1);
+        let what = "limits narrowed below the reward";
+        assert_top_up_rejected(&t, what, "E_REWARD", result, (id, "bob.test", &before));
+        assert_eq!(view(&t, id).reward, U128(REWARD));
+
+        // A max_reward above MAX_REWARD_LIMIT, which `set_token` refuses to set, still does not
+        // let a top-up take a reward past it: a reward past it could not be picked.
+        t.put_token(
+            acct(USDC),
+            TokenConfig {
+                min_reward: MIN_REWARD,
+                max_reward: u128::MAX,
+                enabled: true,
+            },
+        );
+        fund(&mut t, "bob.test", MAX_REWARD_LIMIT);
+        let to_the_limit = MAX_REWARD_LIMIT - REWARD;
+        let before = snapshot(&t, id, "bob.test");
+        let result = try_top_up_at(&mut t, "bob.test", ONE_YOCTO, T1, id, to_the_limit + 1);
+        let what = "past MAX_REWARD_LIMIT";
+        assert_top_up_rejected(&t, what, "E_REWARD", result, (id, "bob.test", &before));
+        top_up(&mut t, "bob.test", id, to_the_limit);
+        assert_eq!(view(&t, id).reward, U128(MAX_REWARD_LIMIT));
+    }
+
+    #[test]
+    fn top_up_rules_are_checked_in_the_listed_order() {
+        // bob tops up in a way that breaks every rule it can at once. Each step mends the rule
+        // that was reported, so the next one in the list has to be the next one reported.
+        struct Call {
+            id: u64,
+            now: u64,
+            amount: u128,
+            deposit: NearToken,
+        }
+        type Mend = fn(&mut Tender, &mut Call);
+        let mut t = world();
+        let id = post(&mut t, args());
+        assert_eq!(id, 1);
+        // The task is full: alice and 49 others.
+        for i in 1..MAX_FUNDERS {
+            let name = format!("funder{i}.test");
+            funder(&mut t, &name, 1);
+            top_up(&mut t, &name, id, 1);
+        }
+        // bob holds one unit less than he tops up.
+        funder(&mut t, "bob.test", 999);
+        let deadline = t.tasks.get(&id).unwrap().commit_deadline;
+        t.paused = true;
+        t.tasks.get_mut(&id).unwrap().outcome = Some(Outcome::Voided {
+            reason: VoidReason::NoReveals,
+            scorecard_hash: None,
+            scorecard_uri: None,
+        });
+        t.put_token(acct(USDC), usdc(false));
+        let mut call = Call {
+            id: 99,
+            now: deadline,
+            amount: MAX_REWARD,
+            deposit: NO_DEPOSIT,
+        };
+        let steps: [(&str, Mend); 9] = [
+            ("E_PAUSED", |t, _| t.paused = false),
+            ("E_NOT_FOUND", |_, c| c.id = 1),
+            ("E_PHASE", |_, c| c.now = T1),
+            ("E_SETTLED", |t, _| {
+                t.tasks.get_mut(&1).unwrap().outcome = None
+            }),
+            ("E_LIMIT", |t, _| {
+                // One funder fewer, and its money out of the reward with it.
+                let task = t.tasks.get_mut(&1).unwrap();
+                let (_, paid) = task.funders.pop().unwrap();
+                task.reward -= paid;
+            }),
+            ("E_TOKEN", |t, _| t.put_token(acct(USDC), usdc(true))),
+            ("E_REWARD", |_, c| c.amount = 1_000),
+            ("E_AUTH", |_, c| c.deposit = ONE_YOCTO),
+            ("E_FUNDS", |t, _| fund(t, "bob.test", 1)),
+        ];
+        for (code, mend) in steps {
+            let result = try_top_up_at(
+                &mut t,
+                "bob.test",
+                call.deposit,
+                call.now,
+                call.id,
+                call.amount,
+            );
+            let message = result.expect_err(&format!("{code}: expected it, but it went through"));
+            assert!(
+                message.starts_with(&format!("{code}: ")),
+                "expected {code}, got {message:?}"
+            );
+            assert!(get_logs().is_empty(), "{code}: a rejection logs nothing");
+            mend(&mut t, &mut call);
+        }
+        assert_eq!(
+            try_top_up_at(
+                &mut t,
+                "bob.test",
+                call.deposit,
+                call.now,
+                call.id,
+                call.amount
+            ),
+            Ok(())
+        );
+        assert_eq!(balance(&t, "bob.test"), 0);
+        let v = view(&t, id);
+        assert_eq!(v.funders.len(), MAX_FUNDERS);
+        assert_eq!(
+            v.funders[MAX_FUNDERS - 1],
+            funders(&[("bob.test", 1_000)])[0]
+        );
+    }
+
+    #[test]
+    fn top_up_needs_storage_only_for_a_new_funder_record() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        // With exactly the bytes of his record to spare, bob's first top-up goes through and
+        // leaves him none.
+        funder(&mut t, "bob.test", REWARD);
+        leave_spare(&mut t, "bob.test", funder_bytes("bob.test"));
+        top_up(&mut t, "bob.test", id, REWARD);
+        assert_eq!(t.storage_available(&acct("bob.test")), 0);
+
+        // One byte short, carol's is refused. The mocked VM does not revert a failed call's
+        // writes the way the chain does, so the test stops here for her (the sandbox suite and
+        // the property harness see the revert).
+        funder(&mut t, "carol.test", REWARD);
+        leave_spare(&mut t, "carol.test", funder_bytes("carol.test") - 1);
+        let result = try_top_up_at(&mut t, "carol.test", ONE_YOCTO, T1, id, REWARD);
+        assert_eq!(
+            result,
+            Err("E_STORAGE: insufficient storage balance; call storage_deposit".to_string())
+        );
+        assert!(get_logs().is_empty(), "a rejection logs nothing");
+    }
+
+    #[test]
+    fn top_up_spends_predecessor_not_signer() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        funder(&mut t, "bob.test", REWARD);
+        // mallory has a storage balance and nothing in her vault.
+        register(&mut t, "mallory.test", NearToken::from_millinear(100));
+        let mallory_used = used(&t, "mallory.test");
+
+        // mallory signs a transaction whose call reaches Tender from bob. bob is the funder: he
+        // pays the amount and the storage of his record.
+        testing_env!(ctx("bob.test")
+            .signer_account_id(acct("mallory.test"))
+            .attached_deposit(ONE_YOCTO)
+            .block_timestamp(T1)
+            .build());
+        t.top_up_task(U64(id), U128(REWARD));
+        assert_eq!(
+            view(&t, id).funders,
+            funders(&[("alice.test", REWARD), ("bob.test", REWARD)])
+        );
+        assert_eq!(balance(&t, "bob.test"), 0);
+        assert_eq!(
+            used(&t, "mallory.test"),
+            mallory_used,
+            "the signer pays nothing"
+        );
+
+        // The other way round: bob signs and the call comes from mallory, whose vault is empty.
+        fund(&mut t, "bob.test", REWARD);
+        testing_env!(ctx("mallory.test")
+            .signer_account_id(acct("bob.test"))
+            .attached_deposit(ONE_YOCTO)
+            .block_timestamp(T1)
+            .build());
+        let rejected = panic_message(|| t.top_up_task(U64(id), U128(REWARD)));
+        assert!(
+            rejected
+                .as_ref()
+                .is_some_and(|m| m.starts_with("E_FUNDS: ")),
+            "{rejected:?}"
+        );
+        assert_eq!(balance(&t, "bob.test"), REWARD);
+        assert_eq!(view(&t, id).reward, U128(2 * REWARD));
+    }
+
+    /// What `top_up_task`'s generated wasm wrapper parses `env::input()` into, mirrored as
+    /// `Input` mirrors `post_task`'s: `#[deny_unknown_arguments]` makes it `deny_unknown_fields`.
+    #[derive(Debug, PartialEq, near_sdk::serde::Deserialize)]
+    #[serde(crate = "near_sdk::serde", deny_unknown_fields)]
+    struct TopUpInput {
+        task_id: U64,
+        amount: U128,
+    }
+
+    fn parse_top_up(input: &Value) -> Result<TopUpInput, String> {
+        serde_json::from_slice(&serde_json::to_vec(input).unwrap()).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn top_up_args_wire_form() {
+        // As a client sends them: both are decimal strings.
+        assert_eq!(
+            parse_top_up(&json!({ "task_id": "7", "amount": "500000" })),
+            Ok(TopUpInput {
+                task_id: U64(7),
+                amount: U128(500_000),
+            })
+        );
+        // A JSON number is refused for either.
+        for input in [
+            json!({ "task_id": 7, "amount": "500000" }),
+            json!({ "task_id": "7", "amount": 500_000 }),
+        ] {
+            let message = parse_top_up(&input).unwrap_err();
+            assert!(message.contains("expected a string"), "{input}: {message}");
+        }
+        // Both are required.
+        let message = parse_top_up(&json!({ "task_id": "7" })).unwrap_err();
+        assert!(message.contains("missing field `amount`"), "{message}");
+        // And a key it does not take is an error, not a choice nobody made: a top-up has no
+        // token of its own, it is always in the task's.
+        let input = json!({ "task_id": "7", "amount": "1", "token": "usdc.test" });
+        let message = parse_top_up(&input).unwrap_err();
+        assert!(message.contains("unknown field `token`"), "{message}");
     }
 }

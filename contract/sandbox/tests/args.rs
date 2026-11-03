@@ -195,6 +195,16 @@ async fn task_methods_refuse_an_unknown_argument_and_a_deposit() -> anyhow::Resu
     done_clean(call(&env, alice, "withdraw", withdrawal, ONE_YOCTO).await?)?;
     assert_eq!(vault_balance(&env, alice.id()).await?, 600);
 
+    // top_up_task, by alice into the first task while it is open. Like post_task it spends from
+    // the vault, so it takes 1 yocto.
+    let top_up = json!({ "task_id": first.to_string(), "amount": "100" });
+    assert_refuses_unknown_key(&env, alice, "top_up_task", &top_up, ONE_YOCTO).await?;
+    assert_eq!(num(&get_task(&env, first).await?["reward"]), REWARD);
+    assert_eq!(vault_balance(&env, alice.id()).await?, 600);
+    done_clean(call(&env, alice, "top_up_task", top_up, ONE_YOCTO).await?)?;
+    assert_eq!(num(&get_task(&env, first).await?["reward"]), REWARD + 100);
+    assert_eq!(vault_balance(&env, alice.id()).await?, 500);
+
     // commit
     let sealed = seal(first, alice.id(), b"alice's work");
     let commitment = commitment_of(
