@@ -22,7 +22,7 @@
 use near_sdk::json_types::{U128, U64};
 use near_sdk::{assert_one_yocto, env, near, AccountId};
 
-use crate::events::{emit, AgentRegistered};
+use crate::events::{emit, AgentBondClaimed, AgentBonded, AgentRegistered, AgentUnregistering};
 use crate::types::{
     check_uri, err, hex32, parse_hash, AgentProfile, AgentStatus, AgentView, TokenBalance,
     MAX_TAGS, MAX_TAG_LEN,
@@ -98,6 +98,11 @@ impl AgentProfile {
                 .collect(),
             picks_made: self.picks_made,
             voids_after_reveals: self.voids_after_reveals,
+            status: self.status,
+            bond_token: self.bond.as_ref().map(|b| b.token.clone()),
+            bond_amount: self.bond.as_ref().map(|b| U128(b.amount)),
+            claimable_at: (self.status == AgentStatus::Unregistering)
+                .then_some(U64(self.claimable_at)),
         }
     }
 }
@@ -129,7 +134,7 @@ impl Tender {
     /// The first registration records the time and the ASP, the account's provider (`acme.near`
     /// for `bot1.acme.near`, see `asp_of`). An update, and a return from retirement, keep both,
     /// along with every counter and `earned`. Works while the contract is paused. Emits
-    /// `agent_registered`.
+    /// `agent_registered`, and after it `agent_bonded` when a bond was taken.
     #[payable]
     #[deny_unknown_arguments]
     pub fn register_agent(&mut self, profile_uri: String, profile_hash: String, tags: Vec<String>) {
@@ -168,7 +173,7 @@ impl Tender {
                 profile.tags = tags.clone();
                 if profile.status == AgentStatus::Retired {
                     profile.status = AgentStatus::Active;
-                    profile.bond = bond;
+                    profile.bond = bond.clone();
                 }
                 (profile.asp.clone(), true)
             }
@@ -189,7 +194,7 @@ impl Tender {
                         picks_made: 0,
                         voids_after_reveals: 0,
                         status: AgentStatus::Active,
-                        bond,
+                        bond: bond.clone(),
                         unregistering_since: 0,
                         claimable_at: 0,
                     },
@@ -201,7 +206,7 @@ impl Tender {
         emit(
             "agent_registered",
             &AgentRegistered {
-                account: caller,
+                account: caller.clone(),
                 asp,
                 profile_uri,
                 profile_hash: hex32(&hash),
@@ -209,6 +214,16 @@ impl Tender {
                 updated,
             },
         );
+        if let Some(bond) = bond {
+            emit(
+                "agent_bonded",
+                &AgentBonded {
+                    account: caller,
+                    token: bond.token,
+                    amount: U128(bond.amount),
+                },
+            );
+        }
     }
 
     /// Starts the caller's way out: from now on it can make no new entry in an open task, nor
@@ -222,7 +237,8 @@ impl Tender {
     ///
     /// The caller must be an active agent: one that has not registered, or has retired, is refused
     /// `E_NOT_REGISTERED`, and one already unregistering `E_PHASE`. The record keeps its size, so
-    /// the call needs no spare storage. Works while the contract is paused.
+    /// the call needs no spare storage. Works while the contract is paused. Emits
+    /// `agent_unregistering`.
     #[payable]
     #[deny_unknown_arguments]
     pub fn unregister_agent(&mut self) {
@@ -249,6 +265,13 @@ impl Tender {
         profile.unregistering_since = now;
         profile.claimable_at = claimable_at;
         self.settle_storage(&caller, before);
+        emit(
+            "agent_unregistering",
+            &AgentUnregistering {
+                account: caller,
+                claimable_at: U64(claimable_at),
+            },
+        );
     }
 
     /// Pays the caller's bond back into its vault, exactly as it was taken at registration, and
@@ -262,7 +285,8 @@ impl Tender {
     /// The record stays, with its profile, counters and `earned`, so the directory keeps its
     /// history; `register_agent` makes it active again with a fresh bond. The record shrinks by
     /// the bond, and the caller gets that storage back. The vault slot the bond came from still
-    /// exists, so the call needs no spare storage. Works while the contract is paused.
+    /// exists, so the call needs no spare storage. Works while the contract is paused. Emits
+    /// `agent_bond_claimed`.
     #[payable]
     #[deny_unknown_arguments]
     pub fn claim_agent_bond(&mut self) {
@@ -300,6 +324,15 @@ impl Tender {
             profile.claimable_at = 0;
         }
         self.settle_storage(&caller, before);
+        let (token, amount) = bond.map_or((None, 0), |b| (Some(b.token), b.amount));
+        emit(
+            "agent_bond_claimed",
+            &AgentBondClaimed {
+                account: caller,
+                token,
+                amount: U128(amount),
+            },
+        );
     }
 
     /// The profile and reputation of `account_id`, or `None` if it has not registered.
@@ -528,6 +561,10 @@ mod tests {
                 earned: vec![],
                 picks_made: 0,
                 voids_after_reveals: 0,
+                status: AgentStatus::Active,
+                bond_token: None,
+                bond_amount: None,
+                claimable_at: None,
             })
         );
     }
@@ -570,7 +607,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&t.get_agent(bot).unwrap()).unwrap(),
             format!(
-                r#"{{"account":"bot1.acme.near","asp":"acme.near","profile_uri":"{URI}","profile_hash":"{HASH}","tags":["research"],"registered_at":"1793028278935742660","entries":3,"reveals":2,"wins":1,"earned":[{{"token":"usdc.test","amount":"340282366920938463463374607431768211455"}}],"picks_made":4,"voids_after_reveals":1}}"#
+                r#"{{"account":"bot1.acme.near","asp":"acme.near","profile_uri":"{URI}","profile_hash":"{HASH}","tags":["research"],"registered_at":"1793028278935742660","entries":3,"reveals":2,"wins":1,"earned":[{{"token":"usdc.test","amount":"340282366920938463463374607431768211455"}}],"picks_made":4,"voids_after_reveals":1,"status":"active","bond_token":null,"bond_amount":null,"claimable_at":null}}"#
             )
         );
     }
@@ -1452,5 +1489,123 @@ mod tests {
             "E_STORAGE",
             "no storage",
         );
+    }
+
+    fn named_event(name: &str, data: &str) -> String {
+        format!(
+            r#"EVENT_JSON:{{"standard":"tender","version":"1.0.0","event":"{name}","data":[{data}]}}"#
+        )
+    }
+
+    #[test]
+    fn bond_events_follow_each_step() {
+        let mut t = bonded(&["alice.near"], BOND);
+        ok(try_register_at(&mut t, "alice.near", T1), "registration");
+        // `agent_registered` keeps its shape, and the bond follows it.
+        assert_eq!(
+            get_logs(),
+            [
+                event(&format!(
+                    r#"{{"account":"alice.near","asp":null,"profile_uri":"{URI}","profile_hash":"{HASH}","tags":[],"updated":false}}"#
+                )),
+                named_event(
+                    "agent_bonded",
+                    r#"{"account":"alice.near","token":"usdc.test","amount":"5000000"}"#
+                ),
+            ]
+        );
+        // An update takes no bond, so it logs no `agent_bonded`.
+        ok(try_register_at(&mut t, "alice.near", T1), "an update");
+        assert_eq!(get_logs().len(), 1);
+        assert!(get_logs()[0].contains(r#""event":"agent_registered""#));
+
+        ok(try_unregister(&mut t, "alice.near", T1), "unregistering");
+        assert_eq!(
+            get_logs(),
+            [named_event(
+                "agent_unregistering",
+                &format!(
+                    r#"{{"account":"alice.near","claimable_at":"{}"}}"#,
+                    claimable(T1)
+                )
+            )]
+        );
+        ok(try_claim(&mut t, "alice.near", claimable(T1)), "claiming");
+        assert_eq!(
+            get_logs(),
+            [named_event(
+                "agent_bond_claimed",
+                r#"{"account":"alice.near","token":"usdc.test","amount":"5000000"}"#
+            )]
+        );
+    }
+
+    #[test]
+    fn a_claim_without_a_bond_logs_a_null_token() {
+        let mut t = world(&["alice.near"]);
+        ok(try_register_at(&mut t, "alice.near", T1), "registration");
+        assert_eq!(get_logs().len(), 1, "no bond, so no agent_bonded");
+        ok(try_unregister(&mut t, "alice.near", T1), "unregistering");
+        let due = T1 + 1_209_600 * SEC;
+        ok(try_claim(&mut t, "alice.near", due), "claiming");
+        assert_eq!(
+            get_logs(),
+            [named_event(
+                "agent_bond_claimed",
+                r#"{"account":"alice.near","token":null,"amount":"0"}"#
+            )]
+        );
+    }
+
+    #[test]
+    fn agent_view_shows_status_bond_and_claimable_at() {
+        let mut t = bonded(&["alice.near"], BOND);
+        let view = |t: &Tender| serde_json::to_value(t.get_agent(acct("alice.near"))).unwrap();
+        ok(try_register_at(&mut t, "alice.near", T1), "registration");
+        let active = view(&t);
+        assert_eq!(
+            (
+                &active["status"],
+                &active["bond_token"],
+                &active["bond_amount"],
+                &active["claimable_at"]
+            ),
+            (
+                &serde_json::json!("active"),
+                &serde_json::json!("usdc.test"),
+                &serde_json::json!("5000000"),
+                &serde_json::Value::Null
+            )
+        );
+        // Every field the indexer and the API read before the bond is still there.
+        for field in [
+            "account",
+            "asp",
+            "profile_uri",
+            "profile_hash",
+            "tags",
+            "registered_at",
+            "entries",
+            "reveals",
+            "wins",
+            "earned",
+            "picks_made",
+            "voids_after_reveals",
+        ] {
+            assert!(active.get(field).is_some(), "{field} is missing");
+        }
+
+        ok(try_unregister(&mut t, "alice.near", T1), "unregistering");
+        let leaving = view(&t);
+        assert_eq!(leaving["status"], "unregistering");
+        assert_eq!(leaving["bond_amount"], "5000000");
+        assert_eq!(leaving["claimable_at"], claimable(T1).to_string());
+
+        ok(try_claim(&mut t, "alice.near", claimable(T1)), "claiming");
+        let retired = view(&t);
+        assert_eq!(retired["status"], "retired");
+        assert!(retired["bond_token"].is_null() && retired["bond_amount"].is_null());
+        assert!(retired["claimable_at"].is_null());
+        assert_eq!(retired["registered_at"], T1.to_string());
     }
 }

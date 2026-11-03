@@ -405,6 +405,15 @@ pub struct AgentView {
     pub picks_made: u32,
     /// Empty picks made as a verifier after at least one entry was revealed.
     pub voids_after_reveals: u32,
+    /// `active`, `unregistering` or `retired`. Only an active agent may enter an open task.
+    pub status: AgentStatus,
+    /// The bond the contract holds for the agent: its token, and its amount as a decimal string.
+    /// Both `null` if it paid none, and once `claim_agent_bond` has paid it back.
+    pub bond_token: Option<AccountId>,
+    pub bond_amount: Option<U128>,
+    /// While the agent is unregistering, from when its bond can be claimed (nanoseconds, a decimal
+    /// string); `null` otherwise.
+    pub claimable_at: Option<U64>,
 }
 
 /// The arguments of `post_task`, which takes them as `{"task": {...}}`. `reward` is a decimal

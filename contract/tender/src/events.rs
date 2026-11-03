@@ -69,6 +69,37 @@ pub(crate) struct AgentRegistered {
     pub updated: bool,
 }
 
+/// Data of `agent_bonded`: `account`, registering, paid `amount` of `token` (a decimal string) out
+/// of its vault as its bond, which the contract holds until `claim_agent_bond`. Logged right after
+/// that registration's `agent_registered`, and only when a bond was taken.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct AgentBonded {
+    pub account: AccountId,
+    pub token: AccountId,
+    pub amount: U128,
+}
+
+/// Data of `agent_unregistering`: `account` called `unregister_agent`, so it makes no new entries
+/// in open tasks, and its bond is claimable from `claimable_at` (nanoseconds, a decimal string).
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct AgentUnregistering {
+    pub account: AccountId,
+    pub claimable_at: U64,
+}
+
+/// Data of `agent_bond_claimed`: `account`'s bond, `amount` of `token` (a decimal string), is back
+/// in its vault, and the agent has retired. An agent that registered before the owner set any
+/// bond had none: `token` is then `null` and `amount` is `"0"`.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct AgentBondClaimed {
+    pub account: AccountId,
+    pub token: Option<AccountId>,
+    pub amount: U128,
+}
+
 /// Data of `task_created`: the new task as `get_task` shows it, in the same field order, minus
 /// `commit_count`, `reveal_count`, `cleaned`, `funders`, `outcome` and `phase`. At posting those
 /// hold nothing an indexer needs (the only funder is the poster, for the whole `reward`), and all
