@@ -22,10 +22,11 @@ import {
   U64StringSchema,
 } from "@tender/shared";
 import { type Context, Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import type { z } from "zod";
 import type { AuthVariables, RequireAuth } from "../auth";
 import { type ApiDeps, nowNs } from "../deps";
-import { badRequest, fail, issuesOf, notFound, readJson } from "../format";
+import { badRequest, type ErrorBody, fail, issuesOf, notFound, readJson } from "../format";
 import { rateLimit, rateLimitedFor, rateLimitsOf } from "../limits";
 
 // The public question board of a task (owner decision of 2026-11-03; the rules are in
@@ -41,6 +42,9 @@ import { rateLimit, rateLimitedFor, rateLimitsOf } from "../limits";
 // the request: after the commit deadline the board is read-only. A write is checked in this order,
 // and the first fault is the answer:
 //
+//   401  not signed in; 429 over the account's route limit; 413 `payload_too_large` for a body over
+//        `MAX_BODY_BYTES`, which is refused as it arrives and never parsed (a request that is not
+//        signed in is turned away without being read);
 //   404  the task is not one the index holds, or the task's or the question's id is no canonical
 //        u64 (or is past the largest row);
 //   403  the account may not do this (`not_poster`, `poster_cannot_ask`, `verifier_cannot_ask`,
@@ -69,6 +73,15 @@ interface TaskRow {
   fallback_deadline: string;
   settled: boolean;
 }
+
+/**
+ * The most bytes of a request body any write takes (413 `payload_too_large` over it). A valid body
+ * is `{"text": ...}` with at most 1000 characters, which is 4 KB of UTF-8 and at most 12 KB for the
+ * widest writer, one that spells every character outside the first plane as two `\uXXXX` escapes
+ * (12 bytes a character); 16 KiB leaves room for that and for a little spacing, and is far below
+ * what a client could make the server read and parse before the text rule was reached.
+ */
+const MAX_BODY_BYTES = 16_384;
 
 /** The largest id a `bigserial` row has. A larger id is no row's, and Postgres would refuse it. */
 const MAX_ROW_ID = 2n ** 63n - 1n;
@@ -110,6 +123,21 @@ export function questionRoutes(
     rateLimitsOf(deps.rateLimits).board,
     (c) => c.var.account,
   );
+
+  // Refuses a body over `MAX_BODY_BYTES` as it arrives, by its declared length or, with none, as it
+  // is counted. It comes after sign-in and the route limit, so a request that is not signed in is
+  // turned away without being read, and before the body is parsed. Every write has it, `hide` too,
+  // though that one reads no body: a client has no reason to send one, so one that is huge is refused.
+  const tooLarge = bodyLimit({
+    maxSize: MAX_BODY_BYTES,
+    onError: (c) => {
+      const body: ErrorBody = {
+        error: "payload_too_large",
+        message: "the request body is too large",
+      };
+      return c.json(body, 413);
+    },
+  });
 
   /** The task `raw` names, or a 404: an id that is no canonical u64 names none. */
   async function taskOf(raw: string | undefined): Promise<{ id: string; task: TaskRow }> {
@@ -208,7 +236,7 @@ export function questionRoutes(
     return c.json(body);
   });
 
-  app.post("/tasks/:id/questions", requireAuth, perAccount, async (c) => {
+  app.post("/tasks/:id/questions", requireAuth, perAccount, tooLarge, async (c) => {
     const { id, task } = await taskOf(c.req.param("id"));
     await requireMayAsk(task, c.var.account);
     requireOpen(task);
@@ -240,45 +268,57 @@ export function questionRoutes(
     return c.json(body);
   });
 
-  app.post("/tasks/:id/questions/:question_id/answer", requireAuth, perAccount, async (c) => {
-    const { id, task } = await taskOf(c.req.param("id"));
-    const questionId = questionIdOf(c.req.param("question_id"));
-    requirePoster(task, c.var.account, "answer questions");
-    requireOpen(task);
-    const { text } = await bodyOf(c, AnswerQuestionRequestSchema);
+  app.post(
+    "/tasks/:id/questions/:question_id/answer",
+    requireAuth,
+    perAccount,
+    tooLarge,
+    async (c) => {
+      const { id, task } = await taskOf(c.req.param("id"));
+      const questionId = questionIdOf(c.req.param("question_id"));
+      requirePoster(task, c.var.account, "answer questions");
+      requireOpen(task);
+      const { text } = await bodyOf(c, AnswerQuestionRequestSchema);
 
-    const result = await answerQuestion(deps.db, {
-      taskId: BigInt(id),
-      questionId,
-      body: text,
-    });
-    if (!result.ok) {
-      switch (result.reason) {
-        case "not_found":
-          return notFound("no such question");
-        case "hidden":
-          return fail(409, "hidden", "the poster hid this question, so it cannot be answered");
-        case "already_answered":
-          return fail(409, "already_answered", "this question has an answer already");
+      const result = await answerQuestion(deps.db, {
+        taskId: BigInt(id),
+        questionId,
+        body: text,
+      });
+      if (!result.ok) {
+        switch (result.reason) {
+          case "not_found":
+            return notFound("no such question");
+          case "hidden":
+            return fail(409, "hidden", "the poster hid this question, so it cannot be answered");
+          case "already_answered":
+            return fail(409, "already_answered", "this question has an answer already");
+        }
       }
-    }
-    const body: QuestionResponse = { question: questionOf(result.row) };
-    return c.json(body);
-  });
+      const body: QuestionResponse = { question: questionOf(result.row) };
+      return c.json(body);
+    },
+  );
 
-  app.post("/tasks/:id/questions/:question_id/hide", requireAuth, perAccount, async (c) => {
-    const { id, task } = await taskOf(c.req.param("id"));
-    const questionId = questionIdOf(c.req.param("question_id"));
-    requirePoster(task, c.var.account, "hide a question");
-    requireOpen(task);
+  app.post(
+    "/tasks/:id/questions/:question_id/hide",
+    requireAuth,
+    perAccount,
+    tooLarge,
+    async (c) => {
+      const { id, task } = await taskOf(c.req.param("id"));
+      const questionId = questionIdOf(c.req.param("question_id"));
+      requirePoster(task, c.var.account, "hide a question");
+      requireOpen(task);
 
-    const result = await hideQuestion(deps.db, { taskId: BigInt(id), questionId });
-    if (!result.ok) return notFound("no such question");
-    const body: QuestionResponse = { question: questionOf(result.row) };
-    return c.json(body);
-  });
+      const result = await hideQuestion(deps.db, { taskId: BigInt(id), questionId });
+      if (!result.ok) return notFound("no such question");
+      const body: QuestionResponse = { question: questionOf(result.row) };
+      return c.json(body);
+    },
+  );
 
-  app.post("/tasks/:id/clarifications", requireAuth, perAccount, async (c) => {
+  app.post("/tasks/:id/clarifications", requireAuth, perAccount, tooLarge, async (c) => {
     const { id, task } = await taskOf(c.req.param("id"));
     requirePoster(task, c.var.account, "post a clarification");
     requireOpen(task);

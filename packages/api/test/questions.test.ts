@@ -12,6 +12,7 @@ import {
   BOARD_HIDDEN_LABEL,
   BOARD_LIMITS,
   BOARD_NOTE,
+  BOARD_TEXT_MAX_CHARS,
   BoardEventSchema,
   ClarificationResponseSchema,
   type Phase,
@@ -798,6 +799,79 @@ test("text_must_be_plain_text_of_one_to_a_thousand_characters_on_every_write", a
     expect(res.body.error, what).toBe("bad_request");
   }
   expect(await count("task_questions")).toBe(0);
+});
+
+test("an_oversized_body_is_a_413_on_every_write_and_nothing_is_stored", async () => {
+  await seedBoard();
+  const asked = await ask("2", alice, "What counts as a version?");
+  expect(asked.status).toBe(200);
+  const rows = await count("task_questions");
+  const events = await count("events");
+  const questionId = asked.body.question.id;
+
+  // A megabyte of text is far over any valid body: the request is refused as it is read, before it
+  // is parsed, so the 1000-character rule is not what answers it.
+  const huge = JSON.stringify({ text: "x".repeat(1_048_576) });
+  const writes: Array<[string, string, string]> = [
+    ["ask", "/v1/tasks/2/questions", alice],
+    ["answer", `/v1/tasks/2/questions/${questionId}/answer`, poster],
+    ["hide", `/v1/tasks/2/questions/${questionId}/hide`, poster],
+    ["clarify", "/v1/tasks/2/clarifications", poster],
+  ];
+  for (const [route, path, account] of writes) {
+    const res = await send<ErrorBody>("POST", path, { account, raw: huge });
+    expect(res.status, route).toBe(413);
+    expect(res.body.error, route).toBe("payload_too_large");
+    expect(res.headers.get("content-type"), route).toContain("application/json");
+  }
+
+  // A body with no declared length is counted as it arrives, and stopped at the limit.
+  const chunk = new TextEncoder().encode("x".repeat(4_096));
+  for (const [route, path, account] of writes) {
+    let sent = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= 64) return controller.close();
+        sent++;
+        controller.enqueue(chunk);
+      },
+    });
+    const res = await appWith().request(path, {
+      method: "POST",
+      headers: { "x-test-account": account, "content-type": "application/json" },
+      body: stream,
+      // @ts-expect-error `duplex` is needed to send a stream and is missing from the DOM types
+      duplex: "half",
+    });
+    expect(res.status, `${route}, streamed`).toBe(413);
+    expect(((await res.json()) as ErrorBody).error, `${route}, streamed`).toBe("payload_too_large");
+  }
+
+  // Nothing was written, no event either, and the board is as it was.
+  expect(await count("task_questions")).toBe(rows);
+  expect(await count("events")).toBe(events);
+  expect((await boardEvents()).map((e) => e.event)).toEqual(["question_asked"]);
+
+  // The body is not read for a request that is not signed in: it is a 401, not a 413.
+  const unsigned = await send<ErrorBody>("POST", "/v1/tasks/2/questions", { raw: huge });
+  expect(unsigned.status).toBe(401);
+});
+
+test("the_body_limit_leaves_room_for_every_valid_text_even_written_out_in_escapes", async () => {
+  await seedBoard();
+  // The widest valid body: 1000 characters outside the first plane, each written as the two
+  // escapes of its surrogate pair, 12 bytes a character, which is how some JSON writers send them.
+  const escaped = `{"text":"${"\\ud83d\\ude00".repeat(BOARD_TEXT_MAX_CHARS)}"}`;
+  expect(escaped.length).toBeGreaterThan(12_000);
+  const ok = await send<QuestionBody & ErrorBody>("POST", "/v1/tasks/2/questions", {
+    account: alice,
+    raw: escaped,
+  });
+  expect(ok.status).toBe(200);
+  expect(ok.body.question.text).toBe("\u{1F600}".repeat(BOARD_TEXT_MAX_CHARS));
+  // The same text in its plain form is a third of that, and fits just as well.
+  const plain = await ask("2", bob, "\u{1F600}".repeat(BOARD_TEXT_MAX_CHARS));
+  expect(plain.status).toBe(200);
 });
 
 test("text_is_kept_trimmed_and_whole_up_to_a_thousand_characters", async () => {
