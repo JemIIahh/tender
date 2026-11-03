@@ -369,7 +369,8 @@ pub struct PostTaskArgs {
     pub max_winners: u8,
     /// Empty means open to anyone.
     pub invited: Vec<AccountId>,
-    /// Rejected (`E_PARENT`) until lineage is enabled.
+    /// The task this one is a sub-task of: one the poster has entered, still unsettled, whose
+    /// commit window ends no earlier than this task's pick window (`E_PARENT` otherwise).
     pub parent: Option<U64>,
 }
 
