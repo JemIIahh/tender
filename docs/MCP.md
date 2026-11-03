@@ -73,7 +73,7 @@ The agent key cannot attach a deposit, so it cannot move money; a leaked one can
 
 ### What each tool needs
 
-Before a tool saves, uploads or sends anything, it checks that the key can make its call. A full-access key can make any call. A function-call key to Tender can make a call that attaches no deposit if it lists the method; a key that lists no method can call any, as on the chain. A call that attaches a deposit needs a full-access key. A tool whose call the key cannot make answers `KEY_CANNOT_CALL` (the tools that move money answer `NEEDS_FULL_ACCESS_KEY`), says which key it needs and what yours is, and has saved, uploaded and sent nothing.
+Before a tool saves, uploads or sends anything, it checks that the key can make its call. A full-access key can make any call. A function-call key to Tender can make a call that attaches no deposit if it lists the method; a key that lists no method can call any, as on the chain. A call that attaches a deposit needs a full-access key. The check does not look at a function-call key's allowance: a key whose allowance has run out passes it, and the chain refuses the call after the upload. The script's agent key has no cap. A tool whose call the key cannot make answers `KEY_CANNOT_CALL` (the tools that move money answer `NEEDS_FULL_ACCESS_KEY`), says which key it needs and what yours is, and has saved, uploaded and sent nothing.
 
 | Tool | Does | Key |
 |---|---|---|
@@ -89,11 +89,11 @@ Before a tool saves, uploads or sends anything, it checks that the key can make 
 
 A commit puts only a hash on chain. The work and the random salt that opens the hash stay in a draft on your disk, and nothing else holds them. `commit_result` saves the draft, `<state dir>/drafts/<task id>.json` (mode 0600, in a directory of mode 0700), before it sends the commit.
 
-So the server can stop between the two calls, by a crash, a restart or a laptop that slept, and the reveal still works. Start a server for the same account on the same state directory, wait for the commit window to close (`reveal_opens_at` in the commit's answer, and in `get_task`), and call `reveal_result`: it reads the draft, uploads the work and sends the reveal. If a commit was cut short, call `commit_result` again with the same content; it asks the chain and finishes the commit with the same salt. `get_task` shows your entry and its draft (`own_entry`), without the work or the salt.
+So the server can stop between the two calls, by a crash, a restart or a laptop that slept, and the reveal still works. Start a server for the same account on the same state directory, wait for the commit window to close (`reveal_opens_at` in the commit's answer, `task.commit_deadline` in `get_task`), and call `reveal_result`: it reads the draft, uploads the work and sends the reveal. If a commit was cut short, call `commit_result` again with the same content; it asks the chain and finishes the commit with the same salt. `get_task` shows your entry and its draft (`own_entry`), without the work or the salt.
 
 Keep the state directory. Without its draft an entry can never be revealed, and an entry that is not revealed before the reveal deadline is not paid. The server keeps one result per task: committed content is not replaced (`ALREADY_COMMITTED`).
 
-**One server per account.** The state store has no lock. Run one `tender-mcp` per account, and do not start a second client on the same account's state directory (two Claude Code windows in one project start two). To run several agents, give each its own account; if two servers must share an account, give each its own `TENDER_STATE_DIR` and reveal from the server that committed.
+**One server per account.** The state store has no lock. Run one `tender-mcp` per account, and do not start a second client on the same account's state directory (two Claude Code windows in one project start two). To run several agents, give each its own account; if two servers must share an account, give each its own `TENDER_STATE_DIR`, reveal from the server that committed, and never let both commit to the same task: the later commit replaces the earlier one on chain, and the other server's draft can then never be revealed.
 
 A server does not outlive its client. When the client exits or is killed, the server sees its input close and exits too, even if only the `pnpm` that launched it was killed. So an old server does not stay behind to share the state directory with the next one.
 

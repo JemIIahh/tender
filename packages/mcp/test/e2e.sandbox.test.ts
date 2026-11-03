@@ -116,9 +116,10 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await Promise.allSettled(servers.map((server) => server.client.close()));
-  // A test that failed half way must not leave a server behind.
-  for (const server of servers) if (server.isAlive()) process.kill(server.pid, "SIGKILL");
-  for (const pid of leftovers) if (isRunning(pid)) process.kill(pid, "SIGKILL");
+  // A test that failed half way must not leave a server behind. A kill that fails (the process went,
+  // or its pid is somebody else's now) must not stop the rest of the cleanup.
+  for (const server of servers) if (server.isAlive()) killQuietly(server.pid);
+  for (const pid of leftovers) if (isRunning(pid)) killQuietly(pid);
   await services?.stop();
   await chain?.stop();
   if (work) await rm(work, { recursive: true, force: true });
@@ -305,8 +306,20 @@ function isRunning(pid: number): boolean {
   }
 }
 
-/** The pids of processes that a test started on its own, to end if the test did not. */
-const leftovers: number[] = [];
+function killQuietly(pid: number): void {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Gone already, or not ours to kill.
+  }
+}
+
+/**
+ * The pids of processes that a test started on its own and has not yet seen end, to end if the
+ * test did not. A pid leaves once its process is seen to end, so that a pid the system hands to
+ * another process later is never killed.
+ */
+const leftovers = new Set<number>();
 
 /**
  * A server started on its own, with no client library between: the test holds the process and its
@@ -320,10 +333,13 @@ function spawnServer(signer: Signer, stateDir: string, launch: Launch = DIRECT) 
   });
   const { pid } = child;
   if (pid === undefined) throw new Error(`could not start ${launch.command}`);
-  leftovers.push(pid);
+  leftovers.add(pid);
   const written: string[] = [];
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-    child.once("exit", (code, signal) => resolve({ code, signal }));
+    child.once("exit", (code, signal) => {
+      leftovers.delete(pid);
+      resolve({ code, signal });
+    });
   });
   const ready = new Promise<void>((resolve, reject) => {
     child.stderr.on("data", (chunk: Buffer | string) => {
@@ -610,7 +626,7 @@ test("a_killed_launcher_leaves_no_server_behind", async () => {
   await launcher.ready;
   expect(await use(launcher)).toBe("full_access");
   const behind = await descendantsOf(launcher.pid);
-  leftovers.push(...behind);
+  for (const pid of behind) leftovers.add(pid);
   expect(behind.length, "the server runs behind the launcher").toBeGreaterThan(0);
 
   process.kill(launcher.pid, "SIGKILL");
@@ -621,4 +637,5 @@ test("a_killed_launcher_leaves_no_server_behind", async () => {
     async () => behind.every((pid) => !isRunning(pid)),
     5_000,
   );
+  for (const pid of behind) leftovers.delete(pid);
 });
