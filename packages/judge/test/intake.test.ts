@@ -92,6 +92,9 @@ const TESTS = {
   examples: [{ input: 1, output: 2 }],
 };
 
+const TESTS_ENTRY_NOT_A_NAME =
+  "kind tests needs an entry that is a function name: letters, digits, _ and $, not starting with a digit, and not a reserved word";
+
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
 const REFERENCE_NOT_ALLOWED =
   'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry (move the schema it points to into $defs)';
@@ -500,9 +503,29 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
         }),
     },
     {
-      rule: "tests from the team, which has no scorer yet",
-      reason: "kind tests is not available yet",
-      view: async () => ({ poster: TEAM_POSTER, criteria_hash: await putCriteria(db, TESTS) }),
+      // The entry becomes part of the code the sandbox runs, so it can be nothing but a name.
+      rule: "tests from the team whose entry is not a function name",
+      reason: TESTS_ENTRY_NOT_A_NAME,
+      view: async () => ({
+        poster: TEAM_POSTER,
+        criteria_hash: await putCriteria(db, { ...TESTS, entry: "f; while (true) {}" }),
+      }),
+    },
+    {
+      rule: "tests from the team whose entry is a reserved word",
+      reason: TESTS_ENTRY_NOT_A_NAME,
+      view: async () => ({
+        poster: TEAM_POSTER,
+        criteria_hash: await putCriteria(db, { ...TESTS, entry: "class" }),
+      }),
+    },
+    {
+      rule: "tests from the team with no examples and no held-out checks",
+      reason: "kind tests needs at least one example when it has no held-out checks",
+      view: async () => ({
+        poster: TEAM_POSTER,
+        criteria_hash: await putCriteria(db, { ...TESTS, examples: [] }),
+      }),
     },
     {
       rule: "has_heldout without a held-out commitment",
@@ -951,6 +974,41 @@ test("intake_accepts_the_p0_kinds", { timeout: 30_000 }, async () => {
     expect(await intake(i + 1, view), `task ${i + 1}`).toBe("accepted");
     expect(await judgeRow(db, i + 1)).toEqual({ judge_status: "accepted", judge_reason: null });
   }
+});
+
+test("intake_accepts_a_tests_task_from_the_team", async () => {
+  // Like regex_cases, a tests task may go without held-out checks: the examples are the cases then.
+  // With them, the examples may be none, as the held-out cases stand in for them.
+  const heldoutTests = { tests: { cases: [{ input: 2, output: 3 }] } };
+  const accepted: Partial<TaskView>[] = [
+    { poster: TEAM_POSTER, criteria_hash: await putCriteria(db, TESTS) },
+    {
+      poster: TEAM_POSTER,
+      criteria_hash: await putCriteria(db, {
+        ...TESTS,
+        entry: "$solve_2",
+        examples: [],
+        has_heldout: true,
+      }),
+      heldout_commitment: await putHeldout(db, heldoutTests, TEAM_POSTER),
+    },
+  ];
+  for (const [i, view] of accepted.entries()) {
+    expect(await intake(i + 1, view), `task ${i + 1}`).toBe("accepted");
+    expect(await judgeRow(db, i + 1)).toEqual({ judge_status: "accepted", judge_reason: null });
+  }
+  // Another kind's held-out checks are no checks for it.
+  expect(
+    await intake(3, {
+      poster: TEAM_POSTER,
+      criteria_hash: await putCriteria(db, { ...TESTS, has_heldout: true }),
+      heldout_commitment: await putHeldout(db, REGEX_HELDOUT, TEAM_POSTER),
+    }),
+  ).toBe("rejected");
+  expect(await judgeRow(db, 3)).toEqual({
+    judge_status: "rejected",
+    judge_reason: "held-out checks are for another kind",
+  });
 });
 
 test("intake_accepts_a_rubric_from_the_team_that_the_judge_can_grade", async () => {

@@ -1,8 +1,10 @@
 import {
   newQuickJSWASMModule,
+  newVariant,
   type QuickJSContext,
   type QuickJSRuntime,
   type QuickJSWASMModule,
+  RELEASE_SYNC,
   shouldInterruptAfterDeadline,
 } from "quickjs-emscripten";
 
@@ -10,7 +12,12 @@ import {
 export interface SandboxOptions {
   /** How long the code may run. The clock starts once the engine is loaded. */
   timeoutMs: number;
-  /** How much memory the code may allocate in the engine's heap. */
+  /**
+   * The engine's memory limit for the run. This engine is built without a way to ask how big a
+   * block it holds, so it counts a block only when it is allocated or grown: the limit stops any
+   * one allocation past it (an array, a string, a buffer) and does not add the blocks up. What
+   * bounds the run's whole memory is the cap on the engine's own (`ENGINE_MEMORY_CAP_BYTES`).
+   */
   memoryBytes: number;
 }
 
@@ -32,115 +39,169 @@ export type SandboxResult =
 
 /** How much of the engine's stack the code may use. */
 const MAX_STACK_BYTES = 1_048_576;
+/**
+ * How much memory the engine may have in all, for every run on it. WebAssembly memory only
+ * grows, and QuickJS in this build cannot count what it holds (see `SandboxOptions.memoryBytes`),
+ * so without this a run that allocates many blocks of any size, none of them over its limit, takes
+ * as much of the host's memory as it can in the time it has: 1.5 GiB in three seconds, which the
+ * engine then keeps for the life of the thread. At the cap an allocation fails like one over the
+ * limit does (`memory`), and what the run freed is there for the next one.
+ *
+ * 128 MiB, so that the limit on one block (32 MiB for the `tests` kind) is what binds a run that
+ * does not allocate without end. 96 MiB admits an array of 27 MiB and a copy of it, and 128 MiB
+ * admits it with three copies (measured); a cap of 64 MiB refused an array of 19 MB. A bomb
+ * reaches 128 MiB in 0.1 to 0.3 s.
+ */
+export const ENGINE_MEMORY_CAP_BYTES = 128 * 1024 * 1024;
+/** The engine's memory when it starts, 16 MiB: what the compiled module asks for. */
+const ENGINE_INITIAL_PAGES = 256;
+const WASM_PAGE_BYTES = 65_536;
 /** A message is for a log. Code that throws a long text does not get to carry it out. */
 const MAX_MESSAGE_LENGTH = 500;
 /** How the engine starts the message of an allocation that goes past the limit. */
 const OUT_OF_MEMORY = "out of memory";
 
 /**
- * The engine: QuickJS compiled to WebAssembly, loaded on the first run and shared by the runs
- * after it. A run that damages it drops it. No run starts on a dropped engine: the runs that
- * come later load a new one, and so do the ones that were already waiting for the dropped one.
+ * A QuickJS engine (QuickJS compiled to WebAssembly, with a memory of its own) and the runs that
+ * use it. The engine is loaded on the first run and shared by the runs after it, which is the
+ * cost of loading it once (a few milliseconds), and each run still has a runtime of its own. A run
+ * that damages the engine drops it. No run starts on a dropped engine: the runs that come later
+ * load a new one, and so do the ones that were already waiting for the dropped one.
+ *
+ * `runInSandbox` runs on one `Sandbox` that every caller shares. A caller whose runs must not
+ * share anything with other callers' (the `tests` kind: one entry's allocations must not decide
+ * another's score) makes a `Sandbox` of its own, and drops its engine with `renew` when a run has
+ * left it in a state it does not want the next one to meet.
  */
-let engine: Promise<QuickJSWASMModule> | undefined;
+export class Sandbox {
+  private engine: Promise<QuickJSWASMModule> | undefined;
 
-function loadEngine(): Promise<QuickJSWASMModule> {
-  if (engine === undefined) {
-    const loading = newQuickJSWASMModule();
-    engine = loading;
-    // A load that failed is not kept: the next run tries again.
-    loading.catch(() => dropEngine(loading));
+  /** Drops the engine: the next run loads a new one, with a new memory. */
+  renew(): void {
+    this.engine = undefined;
   }
-  return engine;
+
+  private loadEngine(): Promise<QuickJSWASMModule> {
+    if (this.engine === undefined) {
+      // A memory of its own for each engine: it is dropped, and with it the memory, when a run
+      // damages it.
+      const wasmMemory = new WebAssembly.Memory({
+        initial: ENGINE_INITIAL_PAGES,
+        maximum: ENGINE_MEMORY_CAP_BYTES / WASM_PAGE_BYTES,
+      });
+      const loading = newQuickJSWASMModule(newVariant(RELEASE_SYNC, { wasmMemory }));
+      this.engine = loading;
+      // A load that failed is not kept: the next run tries again.
+      loading.catch(() => this.dropEngine(loading));
+    }
+    return this.engine;
+  }
+
+  private dropEngine(damaged: Promise<QuickJSWASMModule>): void {
+    if (this.engine === damaged) this.engine = undefined;
+  }
+
+  /**
+   * Runs `code` as a script in a fresh QuickJS runtime and returns the value of its last statement.
+   * The runtime has no host functions: the code sees the language's own built-ins and nothing
+   * else (no `fetch`, `require`, `process`, timers or console), and each run starts from a new
+   * runtime, so nothing is carried from one run to the next.
+   *
+   * It is meant to cost its caller no more than `timeoutMs` and `memoryBytes`: past the deadline the
+   * engine interrupts the code (`timeout`; this includes a regex that backtracks without end, and
+   * code that runs while the value is read), and past the limit, or the engine's own cap
+   * (`ENGINE_MEMORY_CAP_BYTES`), the allocation fails (`memory`, which `SandboxResult` says how far
+   * to trust). Anything else the code throws, syntax errors and the engine's own stack overflow
+   * included, is an `exception`. The value is what the engine's `dump` makes of the last
+   * statement's value: plain data.
+   *
+   * The deadline is checked between the engine's instructions, so a long native call can run past
+   * it, by a few hundred milliseconds for a large `fill` or `repeat`, and a built-in that loops on
+   * its own is not interrupted at all: `new Array(2 ** 32 - 1).indexOf(1)` runs for minutes. Only the
+   * end of the thread it runs on ends that, which is why scorers that run an entrant's code run in
+   * score workers (`isolate.ts`).
+   *
+   * The engine runs on the caller's thread, so a run that uses its whole budget stops everything
+   * else on that thread for as long. Run it where that is acceptable.
+   *
+   * Total in the code: whatever the code does, the result says so and this does not throw. It
+   * rejects only when the engine cannot be loaded or a runtime cannot be started, which is the
+   * host's trouble and not the code's. A load that failed is tried again by the next run.
+   *
+   * When the host itself fails inside the engine (the host's stack runs out in a deep recursion,
+   * or the engine hits one of its own assertions), the runtime is left in the middle of a call. It
+   * is neither freed, which makes the engine abort the whole module for good, nor used again: the
+   * engine is dropped, and every run that starts on an engine after that, the runs that were
+   * already waiting for the dropped one included, uses a new one. The failed run is an
+   * `exception`. A runtime that cannot be started drops the engine in the same way, and rejects.
+   * The runs beside a failed one keep their results and their own budgets, and can wait for a new
+   * engine to load, which takes a few milliseconds. Unless the new engine cannot be loaded either:
+   * then each of those runs rejects, as a run does whose own load fails.
+   */
+  async run(code: string, opts: SandboxOptions): Promise<SandboxResult> {
+    let loading = this.loadEngine();
+    let quickJS = await loading;
+    // Runs that start together wait for the same load and resume one after another, so one of them
+    // may have damaged the engine and dropped it by the time this one resumes. This one starts over
+    // on the engine that replaced it. Nothing is awaited between this check and the end of the run,
+    // so no other run can drop the engine in between.
+    while (this.engine !== loading) {
+      loading = this.loadEngine();
+      quickJS = await loading;
+    }
+
+    // The engine counts as damaged until it has made this run a runtime: if it cannot, there is
+    // nothing to free, and it is in no state to be asked again.
+    let damaged = true;
+    let runtime: QuickJSRuntime | undefined;
+    let context: QuickJSContext | undefined;
+    // Whether the deadline cut anything short. The engine reports an interrupt as an error, and
+    // swallows it where it reads the value (a `toJSON` that loops). So the run is a timeout when
+    // the handler fired, whatever the result says.
+    let interrupted = false;
+    try {
+      runtime = quickJS.newRuntime();
+      damaged = false;
+      runtime.setMemoryLimit(opts.memoryBytes);
+      runtime.setMaxStackSize(MAX_STACK_BYTES);
+      const deadline = shouldInterruptAfterDeadline(Date.now() + opts.timeoutMs);
+      runtime.setInterruptHandler((rt) => {
+        const stop = deadline(rt);
+        if (stop) interrupted = true;
+        return stop;
+      });
+      context = runtime.newContext();
+      try {
+        const outcome = evaluate(context, code);
+        if (!interrupted) return outcome;
+        return { ok: false, error: "timeout", message: `interrupted after ${opts.timeoutMs} ms` };
+      } catch (error) {
+        damaged = true;
+        return { ok: false, error: "exception", message: describeHostError(error) };
+      }
+    } finally {
+      if (!damaged) {
+        try {
+          context?.dispose();
+          runtime?.dispose();
+        } catch {
+          // Freeing it failed, so the engine is in no state to be used again.
+          damaged = true;
+        }
+      }
+      if (damaged) this.dropEngine(loading);
+    }
+  }
 }
 
-function dropEngine(damaged: Promise<QuickJSWASMModule>): void {
-  if (engine === damaged) engine = undefined;
-}
+/** The sandbox that `runInSandbox` runs on, shared by every caller. */
+const shared = new Sandbox();
 
 /**
- * Runs `code` as a script in a fresh QuickJS runtime and returns the value of its last statement.
- * The runtime has no host functions: the code sees the language's own built-ins and nothing
- * else (no `fetch`, `require`, `process`, timers or console), and each run starts from a new
- * runtime, so nothing is carried from one run to the next.
- *
- * It costs its caller at most `timeoutMs` and `memoryBytes`: past the deadline the engine
- * interrupts the code (`timeout`; this includes a regex that backtracks without end, and code
- * that runs while the value is read), and past the limit the allocation fails (`memory`, which
- * `SandboxResult` says how far to trust). Anything else the code throws, syntax errors and the
- * engine's own stack overflow included, is an `exception`. The value is what the engine's `dump`
- * makes of the last statement's value: plain data.
- *
- * The engine runs on the caller's thread, so a run that uses its whole budget stops everything
- * else on that thread for as long. Run it where that is acceptable.
- *
- * Total in the code: whatever the code does, the result says so and this does not throw. It
- * rejects only when the engine cannot be loaded or a runtime cannot be started, which is the
- * host's trouble and not the code's. A load that failed is tried again by the next run.
- *
- * When the host itself fails inside the engine (the host's stack runs out in a deep recursion,
- * or the engine hits one of its own assertions), the runtime is left in the middle of a call. It
- * is neither freed, which makes the engine abort the whole module for good, nor used again: the
- * engine is dropped, and every run that starts on an engine after that, the runs that were
- * already waiting for the dropped one included, uses a new one. The failed run is an
- * `exception`. A runtime that cannot be started drops the engine in the same way, and rejects.
- * The runs beside a failed one keep their results and their own budgets, and can wait for a new
- * engine to load, which takes a few milliseconds. Unless the new engine cannot be loaded either:
- * then each of those runs rejects, as a run does whose own load fails.
+ * Runs `code` on the shared `Sandbox`: see `Sandbox.run`.
  */
-export async function runInSandbox(code: string, opts: SandboxOptions): Promise<SandboxResult> {
-  let loading = loadEngine();
-  let quickJS = await loading;
-  // Runs that start together wait for the same load and resume one after another, so one of them
-  // may have damaged the engine and dropped it by the time this one resumes. This one starts over
-  // on the engine that replaced it. Nothing is awaited between this check and the end of the run,
-  // so no other run can drop the engine in between.
-  while (engine !== loading) {
-    loading = loadEngine();
-    quickJS = await loading;
-  }
-
-  // The engine counts as damaged until it has made this run a runtime: if it cannot, there is
-  // nothing to free, and it is in no state to be asked again.
-  let damaged = true;
-  let runtime: QuickJSRuntime | undefined;
-  let context: QuickJSContext | undefined;
-  // Whether the deadline cut anything short. The engine reports an interrupt as an error, and
-  // swallows it where it reads the value (a `toJSON` that loops). So the run is a timeout when
-  // the handler fired, whatever the result says.
-  let interrupted = false;
-  try {
-    runtime = quickJS.newRuntime();
-    damaged = false;
-    runtime.setMemoryLimit(opts.memoryBytes);
-    runtime.setMaxStackSize(MAX_STACK_BYTES);
-    const deadline = shouldInterruptAfterDeadline(Date.now() + opts.timeoutMs);
-    runtime.setInterruptHandler((rt) => {
-      const stop = deadline(rt);
-      if (stop) interrupted = true;
-      return stop;
-    });
-    context = runtime.newContext();
-    try {
-      const outcome = evaluate(context, code);
-      if (!interrupted) return outcome;
-      return { ok: false, error: "timeout", message: `interrupted after ${opts.timeoutMs} ms` };
-    } catch (error) {
-      damaged = true;
-      return { ok: false, error: "exception", message: describeHostError(error) };
-    }
-  } finally {
-    if (!damaged) {
-      try {
-        context?.dispose();
-        runtime?.dispose();
-      } catch {
-        // Freeing it failed, so the engine is in no state to be used again.
-        damaged = true;
-      }
-    }
-    if (damaged) dropEngine(loading);
-  }
+export function runInSandbox(code: string, opts: SandboxOptions): Promise<SandboxResult> {
+  return shared.run(code, opts);
 }
 
 /** Evaluates `code` in `context`, and frees what it made. Throws only if the host fails. */

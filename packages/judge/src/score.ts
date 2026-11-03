@@ -4,6 +4,7 @@ import type { HeldoutOf } from "./kinds/common";
 import { scoreExact } from "./kinds/exact";
 import { jsonSchemaScorer } from "./kinds/json_schema";
 import { scoreRegexCases } from "./kinds/regex_cases";
+import { scoreTests } from "./kinds/tests";
 import type { EntryScore } from "./types";
 
 /**
@@ -80,6 +81,19 @@ export function prepareScorer(c: P0Criteria, heldout: Heldout | null): PreparedS
           }),
       };
     }
+    case "tests": {
+      const cases = heldout === null ? null : heldoutPart(heldout, "tests");
+      return {
+        problem: null,
+        // It rejects only when the sandbox cannot be started.
+        score: (content) =>
+          scoreTests(c, cases, content).catch((error: unknown) => {
+            throw new ScorerUnavailableError("the tests sandbox could not be started", {
+              cause: error,
+            });
+          }),
+      };
+    }
   }
 }
 
@@ -87,7 +101,7 @@ export function prepareScorer(c: P0Criteria, heldout: Heldout | null): PreparedS
  * The part of `heldout` for `kind`. Intake checked that the document is of the criteria's kind,
  * and that `exact` and `json_schema` have one, so a missing part is a slip of the Judge's own.
  */
-function heldoutPart<K extends "exact" | "json_schema" | "regex_cases">(
+function heldoutPart<K extends "exact" | "json_schema" | "regex_cases" | "tests">(
   heldout: Heldout | null,
   kind: K,
 ): HeldoutOf<K> {
