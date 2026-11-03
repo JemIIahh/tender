@@ -1,4 +1,5 @@
 export * from "./api";
+export * from "./board";
 export * from "./brief";
 export * from "./calls";
 export * from "./canonical";

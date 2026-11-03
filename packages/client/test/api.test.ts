@@ -10,9 +10,11 @@ import {
   type ListAgentsResponse,
   type ListTasksResponse,
   MAX_RESULT_BYTES,
+  type QuestionResponse,
   type Scorecard,
   type StartResponse,
   sha256Hex,
+  type TaskBoard,
   type TaskDetailResponse,
   type TaskSummary,
   type TelegramLinkResponse,
@@ -158,6 +160,23 @@ const LINK: TelegramLinkResponse = {
   url: "https://t.me/tender_test_bot?start=abc",
   expires_at: "2026-10-30T12:10:00.000Z",
 };
+const QUESTION_ROW = {
+  id: "5",
+  asker: ACCOUNT,
+  text: "Is 1.2 a version?",
+  asked_at: "2026-10-30T12:00:00.000Z",
+  hidden: false,
+  answer: null,
+};
+const BOARD: TaskBoard = {
+  task_id: "7",
+  open: true,
+  questions: [QUESTION_ROW],
+  clarifications: [{ id: "6", text: "Use UTC.", posted_at: "2026-10-30T12:01:00.000Z" }],
+  hidden_label: "hidden by the poster",
+  note: "The Judge never reads this board.",
+};
+const ASKED: QuestionResponse = { question: QUESTION_ROW };
 const UPLOADED: BlobUploadResponse = { sha256: HASH, uri: `${BASE}/v1/blobs/${HASH}` };
 const BLOB = new TextEncoder().encode("the bytes of a brief");
 const BLOB_HASH = sha256Hex(BLOB);
@@ -381,6 +400,15 @@ function serveBoard(api: FakeApi): void {
   api.on(
     "POST /v1/telegram/link",
     api.signedIn(() => json(LINK)),
+  );
+  api.on(/^GET \/v1\/tasks\/\d+\/questions$/, () => json(BOARD));
+  api.on(
+    /^POST \/v1\/tasks\/\d+\/questions(\/\d+\/answer)?$/,
+    api.signedIn(() => json(ASKED)),
+  );
+  api.on(
+    /^POST \/v1\/tasks\/\d+\/clarifications$/,
+    api.signedIn(() => json({ clarification: BOARD.clarifications[0] })),
   );
 }
 
@@ -701,6 +729,56 @@ test("start_and_telegram_link_are_posts_with_a_token_and_no_body", async () => {
     expect(call.headers.get("Authorization")).toBe("Bearer token-1");
     expect(call.body).toBeUndefined();
   }
+});
+
+test("the_question_board_is_read_without_signing_in_and_a_missing_task_is_null", async () => {
+  const api = fakeApi();
+  serveBoard(api);
+  const client = clientOf(api);
+
+  expect(await client.listQuestions(7n)).toEqual(BOARD);
+  // A read needs no sign-in: the one request is the GET.
+  expect(api.calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
+    "GET /v1/tasks/7/questions",
+  ]);
+  expect(nth(api.calls, 0).headers.get("Authorization")).toBeNull();
+
+  api.on(/^GET \/v1\/tasks\/9\/questions$/, () => json(refusal("not_found"), 404));
+  expect(await client.listQuestions(9n)).toBeNull();
+});
+
+test("asking_answering_and_clarifying_are_signed_posts_with_the_text_as_json", async () => {
+  const api = fakeApi();
+  serveBoard(api);
+  const client = clientOf(api);
+
+  expect(await client.askQuestion(7n, "Is 1.2 a version?")).toEqual(ASKED);
+  expect(await client.answerQuestion(7n, 5n, "No.")).toEqual(ASKED);
+  expect((await client.postClarification(7n, "Use UTC.")).clarification.id).toBe("6");
+
+  const posts: Array<[string, string]> = [
+    ["/v1/tasks/7/questions", "Is 1.2 a version?"],
+    ["/v1/tasks/7/questions/5/answer", "No."],
+    ["/v1/tasks/7/clarifications", "Use UTC."],
+  ];
+  for (const [path, text] of posts) {
+    const call = nth(api.to(path), 0);
+    expect(call.method).toBe("POST");
+    expect(call.headers.get("Authorization")).toBe("Bearer token-1");
+    expect(call.headers.get("Content-Type")).toBe("application/json");
+    expect(JSON.parse(call.body ?? "null")).toEqual({ text });
+  }
+});
+
+test("a_refusal_of_the_board_is_an_api_error_with_its_code", async () => {
+  const api = fakeApi();
+  api.on(
+    /^POST \/v1\/tasks\/\d+\/questions$/,
+    api.signedIn(() => json(refusal("not_open"), 409)),
+  );
+  const error = await apiError(clientOf(api).askQuestion(7n, "late"));
+  expect(error.status).toBe(409);
+  expect(error.body).toMatchObject({ error: "not_open" });
 });
 
 // ---- Signing in -------------------------------------------------------------------------------

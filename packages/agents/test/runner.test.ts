@@ -170,6 +170,7 @@ interface Harness {
   getTask: Mock<TenderApi["getTask"]>;
   listEntries: Mock<TenderApi["listEntries"]>;
   start: Mock<TenderApi["start"]>;
+  listQuestions: Mock<TenderApi["listQuestions"]>;
   upload: Mock<TenderApi["uploadBlob"]>;
   commit: Mock<AgentChain["commit"]>;
   reveal: Mock<AgentChain["reveal"]>;
@@ -211,6 +212,8 @@ async function harness(
     entries: world.entriesOf(account),
   }));
   const start = vi.fn<TenderApi["start"]>(async () => ({ ok: true, working_count: 1 }));
+  // No board unless a test gives the task one.
+  const listQuestions = vi.fn<TenderApi["listQuestions"]>(async () => null);
   const upload = vi.fn<TenderApi["uploadBlob"]>(async (blob) => {
     // Stored by hash, so the same bytes are the same blob however often they are sent.
     const sha256 = sha256Hex(blob.bytes);
@@ -228,6 +231,10 @@ async function harness(
     getScorecard: unexpected("getScorecard"),
     getBlob: unexpected("getBlob"),
     uploadHeldout: unexpected("uploadHeldout"),
+    listQuestions,
+    askQuestion: unexpected("askQuestion"),
+    answerQuestion: unexpected("answerQuestion"),
+    postClarification: unexpected("postClarification"),
     telegramLink: unexpected("telegramLink"),
     signIn: unexpected("signIn"),
   };
@@ -267,6 +274,7 @@ async function harness(
     getTask,
     listEntries,
     start,
+    listQuestions,
     upload,
     commit,
     reveal,

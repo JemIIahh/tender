@@ -8,6 +8,8 @@ import {
   type BlobUploadResponse,
   BlobUploadResponseSchema,
   ChallengeResponseSchema,
+  type ClarificationResponse,
+  ClarificationResponseSchema,
   canonicalBase,
   fetchJson,
   type HealthResponse,
@@ -21,6 +23,8 @@ import {
   type ListTasksResponse,
   ListTasksResponseSchema,
   MAX_RESULT_BYTES,
+  type QuestionResponse,
+  QuestionResponseSchema,
   type Scorecard,
   ScorecardSchema,
   SIGN_IN_MESSAGE,
@@ -28,6 +32,8 @@ import {
   type StartResponse,
   StartResponseSchema,
   sha256Hex,
+  type TaskBoard,
+  TaskBoardSchema,
   type TaskDetailResponse,
   TaskDetailResponseSchema,
   type TelegramLinkResponse,
@@ -423,6 +429,19 @@ export class ApiClient implements TenderApi {
     );
   }
 
+  listQuestions(taskId: bigint): Promise<TaskBoard | null> {
+    return orNull(
+      this.timed("listQuestions", (signal) =>
+        fetchJson(
+          this.url(`/tasks/${taskId}/questions`),
+          TaskBoardSchema,
+          get(signal),
+          this.fetchImpl,
+        ),
+      ),
+    );
+  }
+
   /**
    * The bytes of the blob stored under `sha256`. The store is addressed by content, so the bytes
    * are hashed and must give `sha256`: bytes that do not are an `ApiError` with the status of the
@@ -497,6 +516,39 @@ export class ApiClient implements TenderApi {
         this.url(`/tasks/${taskId}/start`),
         StartResponseSchema,
         post(signal, token),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  askQuestion(taskId: bigint, text: string): Promise<QuestionResponse> {
+    return this.signedIn("askQuestion", (token, signal) =>
+      fetchJson(
+        this.url(`/tasks/${taskId}/questions`),
+        QuestionResponseSchema,
+        post(signal, token, { text }),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  answerQuestion(taskId: bigint, questionId: bigint, text: string): Promise<QuestionResponse> {
+    return this.signedIn("answerQuestion", (token, signal) =>
+      fetchJson(
+        this.url(`/tasks/${taskId}/questions/${questionId}/answer`),
+        QuestionResponseSchema,
+        post(signal, token, { text }),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  postClarification(taskId: bigint, text: string): Promise<ClarificationResponse> {
+    return this.signedIn("postClarification", (token, signal) =>
+      fetchJson(
+        this.url(`/tasks/${taskId}/clarifications`),
+        ClarificationResponseSchema,
+        post(signal, token, { text }),
         this.fetchImpl,
       ),
     );
