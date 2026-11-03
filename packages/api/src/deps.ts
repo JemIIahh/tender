@@ -60,6 +60,13 @@ export interface ApiDeps {
    */
   maxSseStreams?: number;
   /**
+   * The most event streams one client keeps open at once, a whole number from 0, the client being
+   * its address as the rate limits count it (`clientKey`). So one client cannot take the places of
+   * all the others. Past it the answer is a 503 with `Retry-After`, and so it is for a value that
+   * is not a number. Default: 4.
+   */
+  maxSseStreamsPerClient?: number;
+  /**
    * How many proxies in front of the API add the address they saw to `X-Forwarded-For`
    * (`TRUSTED_PROXY_HOPS`). The rate limits count requests by client address: the socket's when
    * this is 0, the default, and otherwise the header's entry that many places from its end (see

@@ -359,7 +359,8 @@ test("sse_without_a_resume_id_starts_after_the_newest_event", async () => {
 test("sse_ids_have_gaps", async () => {
   // Rolled-back transactions leave holes in a sequence, so the ids are not 1, 2, 3 ...
   await addEvents(...eventsWithIds(1, 2, 5, 9, 10));
-  const app = appWith();
+  // Five streams at once, all from the one client with no connection.
+  const app = appWith({ maxSseStreamsPerClient: 5 });
 
   const all = await open(app, "/v1/events?since=0");
   expect(ids(await all.take(5))).toEqual(["1", "2", "5", "9", "10"]);
@@ -1042,7 +1043,9 @@ test("sse_cap_answers_503_with_retry_after", async () => {
 
 test("sse_cap_defaults_to_200", async () => {
   const { db } = idleDb();
-  const app = appWith({ db }, DEFAULT_TIMING);
+  // Every request made with `app.request` is the one client with no connection, so its own cap is
+  // set at the process's here.
+  const app = appWith({ db, maxSseStreamsPerClient: 200 }, DEFAULT_TIMING);
   for (let i = 0; i < 200; i++) await open(app);
   const refused = await app.request("/v1/events");
   expect(refused.status).toBe(503);
@@ -1060,18 +1063,82 @@ test("sse_cap_of_zero_refuses_every_stream", async () => {
 test("sse_cap_that_is_not_a_number_refuses_every_stream", async () => {
   // `Number(process.env.SETTING)` is NaN when the setting is not there, and NaN is neither more
   // nor less than anything: a cap that cannot be read has to shut the streams out, and not let
-  // every one in.
+  // every one in. The same holds for the cap of one client.
   for (const cap of [Number.NaN, -1, Number.NEGATIVE_INFINITY]) {
-    const res = await appWith({ maxSseStreams: cap }).request("/v1/events");
-    expect(res.status, String(cap)).toBe(503);
-    expect(res.headers.get("retry-after"), String(cap)).toBe("5");
+    for (const over of [{ maxSseStreams: cap }, { maxSseStreamsPerClient: cap }]) {
+      const res = await appWith(over).request("/v1/events");
+      expect(res.status, JSON.stringify(over)).toBe(503);
+      expect(res.headers.get("retry-after"), JSON.stringify(over)).toBe("5");
+    }
   }
+});
+
+/** The bindings `@hono/node-server` gives a request from `address`: its socket. */
+const fromAddress = (address: string) => ({
+  incoming: { socket: { remoteAddress: address, remotePort: 4000, remoteFamily: "IPv4" } },
+});
+
+test("sse_cap_of_one_client_is_4_and_leaves_the_others_their_places", async () => {
+  // The route needs no sign-in, so one client could otherwise hold every place there is. It is
+  // counted by its address, as the rate limits count it, and has 4 places unless it is told
+  // otherwise.
+  const { db } = idleDb();
+  const app = appWith({ db }, DEFAULT_TIMING);
+  const request = (address: string) => app.request("/v1/events", {}, fromAddress(address));
+  const mine: Listener[] = [];
+  for (let i = 0; i < 4; i++) {
+    const res = await request("10.0.0.1");
+    expect(res.status).toBe(200);
+    mine.push(listen(res));
+  }
+  const refused = await request("10.0.0.1");
+  expect(refused.status).toBe(503);
+  expect(refused.headers.get("retry-after")).toBe("5");
+  expect(((await refused.json()) as ErrorBody).message).toBe(
+    "too many event streams are open from this address, try again shortly",
+  );
+
+  // Another client has places of its own, and so has a client with no connection.
+  const other = await request("10.0.0.2");
+  expect(other.status).toBe(200);
+  listen(other);
+  await open(app);
+
+  // A stream that goes gives its client's place back.
+  await mine[0]?.cancel();
+  for (let tries = 0; ; tries++) {
+    const again = await request("10.0.0.1");
+    if (again.status === 200) {
+      listen(again);
+      break;
+    }
+    expect(again.status).toBe(503);
+    if (tries > 200) throw new Error("no place for the client became free");
+    await sleep(10);
+  }
+});
+
+test("sse_cap_of_one_client_reads_the_address_behind_the_proxies", async () => {
+  // Behind a proxy every request comes from the proxy's socket; the client is the address the
+  // proxy wrote, so two clients behind it count apart, and one cannot use up the other's places.
+  const { db } = idleDb();
+  const app = appWith({ db, trustedProxyHops: 1, maxSseStreamsPerClient: 1 }, DEFAULT_TIMING);
+  const behindProxy = (client: string) =>
+    app.request("/v1/events", { headers: { "x-forwarded-for": client } }, fromAddress("10.9.9.9"));
+  const first = await behindProxy("1.2.3.4");
+  expect(first.status).toBe(200);
+  listen(first);
+  expect((await behindProxy("1.2.3.4")).status).toBe(503);
+  const second = await behindProxy("5.6.7.8");
+  expect(second.status).toBe(200);
+  listen(second);
 });
 
 test("sse_cap_holds_against_requests_that_arrive_together", async () => {
   // Twenty requests are in the route at once, and each finds out where to begin before its stream
-  // starts. The place is taken before that wait, so exactly five get one.
-  const app = appWith({ maxSseStreams: 5 });
+  // starts. The place is taken before that wait, so exactly five get one. (They are all the one
+  // client with no connection, so its cap is the process's.)
+  const app = appWith({ maxSseStreams: 5, maxSseStreamsPerClient: 5 });
   const answers = await Promise.all(Array.from({ length: 20 }, () => app.request("/v1/events")));
   const accepted = answers.filter((res) => res.status === 200);
   const refused = answers.filter((res) => res.status === 503);
