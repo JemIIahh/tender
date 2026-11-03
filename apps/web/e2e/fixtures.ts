@@ -484,7 +484,10 @@ export async function routeApi(page: Page, tasks: TaskSummary[] = TASKS): Promis
       await respond({ status: 200, headers: stream, body: `: open\nretry: ${RECONNECT_MS}\n\n` });
       return;
     }
-    const after = resume === null ? (told ?? 0) : Number(resume);
+    // Where the browser stands is where it was last told, whatever the URL says: a stream the page
+    // opened at `?since=1` is reconnected by the browser at the same address, with a header that a
+    // route cannot see, and would be sent every event after 1 again, once for each reconnect.
+    const after = Math.max(told ?? 0, resume === null ? 0 : Number(resume));
     held += 1;
     try {
       await until(() => lastId() > after);
