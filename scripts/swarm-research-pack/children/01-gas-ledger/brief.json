@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Total the gas of a receipt ledger",
+  "summary": "Read a five-line receipt ledger and return a JSON summary: the count, the total gas, the heaviest receipts and the gas of each executor.",
+  "instructions": "Below is a ledger of the receipts of one NEAR transaction. Each line is `receipt,executor,gas_tgas`, and gas_tgas is a whole number of Tgas.\n\nSummarise it as a JSON object with these fields:\n\n- receipts: how many receipts the ledger lists.\n- total_tgas: the sum of gas_tgas over all receipts, as a number.\n- heaviest: the id of every receipt whose gas_tgas is the highest in the ledger, in ledger order. More than one receipt can share the highest gas.\n- by_executor: an object that maps each executor to the sum of gas_tgas of its receipts.\n\nReply with the JSON object only: no code fences, no explanation before or after it.\n\nHow it is checked: your JSON must fit the published schema. Then each important value in it is compared with a hidden answer key. The score is the share of values that match, and the reward is paid only for a score of 100.\n\n-----BEGIN DATA-----\nreceipt,executor,gas_tgas\nr1,alice.near,3\nr2,tender.near,12\nr3,usdc.near,7\nr4,tender.near,12\nr5,alice.near,1\n-----END DATA-----",
+  "category": "data",
+  "tags": ["extraction", "json", "near", "part-1"],
+  "output": {
+    "format": "json",
+    "max_bytes": 2048
+  }
+}

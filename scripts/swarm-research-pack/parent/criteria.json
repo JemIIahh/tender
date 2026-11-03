@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "kind": "json_schema",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["parts"],
+    "properties": {
+      "parts": {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "prefixItems": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["receipts", "total_tgas", "heaviest", "by_executor"],
+            "properties": {
+              "receipts": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "total_tgas": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "heaviest": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "by_executor": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "keys",
+              "full_access",
+              "function_call",
+              "unlimited_allowance",
+              "tender_methods"
+            ],
+            "properties": {
+              "keys": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "full_access": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "function_call": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "unlimited_allowance": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "tender_methods": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["events", "counts", "first", "last", "most_common"],
+            "properties": {
+              "events": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "counts": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "first": {
+                "type": "string",
+                "minLength": 1
+              },
+              "last": {
+                "type": "string",
+                "minLength": 1
+              },
+              "most_common": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        ],
+        "items": false
+      }
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "kind": "json_schema",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["events", "counts", "first", "last", "most_common"],
+    "properties": {
+      "events": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "counts": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "first": {
+        "type": "string",
+        "minLength": 1
+      },
+      "last": {
+        "type": "string",
+        "minLength": 1
+      },
+      "most_common": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

@@ -506,6 +506,27 @@ test("spend_calls_attach_one_yocto", () => {
   }
 });
 
+test("delegate_option_attaches_no_deposit_and_changes_nothing_else", () => {
+  // A delegate key is a function-call key, which cannot attach a deposit. With `delegate: true` the
+  // spend goes through `authorize_spend`'s delegate path (the caps the account registered for the
+  // key), so no yoctoNEAR is attached; every other part of the call is the one it always was.
+  const post = postTaskCall(TENDER, FULL_INPUT);
+  const topUp = topUpTaskCall(TENDER, 42n, 500n);
+  expect(postTaskCall(TENDER, FULL_INPUT, { delegate: true })).toStrictEqual({
+    ...post,
+    deposit: 0n,
+  });
+  expect(topUpTaskCall(TENDER, 42n, 500n, { delegate: true })).toStrictEqual({
+    ...topUp,
+    deposit: 0n,
+  });
+  // Anything but `delegate: true` keeps the 1 yoctoNEAR of a spend from a full-access key.
+  for (const opts of [undefined, {}, { delegate: false }]) {
+    expect(postTaskCall(TENDER, FULL_INPUT, opts).deposit).toBe(ONE_YOCTO);
+    expect(topUpTaskCall(TENDER, 42n, 500n, opts).deposit).toBe(ONE_YOCTO);
+  }
+});
+
 test("commit_reveal_pick_attach_zero", () => {
   // These methods are not `#[payable]`, so the contract refuses any NEAR attached to them. Zero
   // is also what lets a function-call key send them.

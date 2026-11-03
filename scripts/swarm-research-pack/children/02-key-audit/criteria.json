@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "kind": "json_schema",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["keys", "full_access", "function_call", "unlimited_allowance", "tender_methods"],
+    "properties": {
+      "keys": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "full_access": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "function_call": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "unlimited_allowance": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "tender_methods": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

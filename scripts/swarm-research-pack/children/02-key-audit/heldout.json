@@ -1,0 +1,26 @@
+{
+  "json_schema": {
+    "assertions": [
+      {
+        "path": "$.keys",
+        "equals": 6
+      },
+      {
+        "path": "$.full_access",
+        "equals": ["k1", "k5"]
+      },
+      {
+        "path": "$.function_call",
+        "equals": 4
+      },
+      {
+        "path": "$.unlimited_allowance",
+        "equals": ["k3", "k6"]
+      },
+      {
+        "path": "$.tender_methods",
+        "equals": ["commit", "post_task", "reveal", "top_up_task"]
+      }
+    ]
+  }
+}
