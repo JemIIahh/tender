@@ -8,13 +8,21 @@
 //! account they can act on (see `Target`), since random ones would mostly name a task that does
 //! not exist or is in the wrong phase. After every operation it checks:
 //! - I1: the vault balances of all accounts, the treasury included, plus the rewards of the
-//!   unsettled tasks, equal the deposits taken in less the withdrawals paid out;
+//!   unsettled tasks, plus the agent bonds the contract holds, equal the deposits taken in less the
+//!   withdrawals paid out;
 //! - I2: a task's outcome is set once, by the call that settles it, and never changes after it; a
 //!   second pick or void is rejected `E_SETTLED`;
 //! - I5: a withdrawal whose transfer fails is restored exactly once, to the balance it started
 //!   from, never doubled;
 //! - I7: a picked task's payouts and fee add up to its reward;
 //! - I10: a task's `commit_count` is the number of distinct accounts that committed to it.
+//!
+//! The owner sets an agent bond of `BOND` and a cooldown of one window, and `a.test` and `b.test`
+//! register with it in the setup; `c.test` and `p.test` may register in the run. A commit, which
+//! always goes to an open task here, must go through exactly when the task is in its commit window,
+//! the account is not its poster and is an active agent; a registration, an unregistration and a
+//! claim must go through exactly when the agent's status, the clock and its balance allow, and
+//! each agent's status and recorded bond must be what the calls so far make them.
 //!
 //! Beside these, it checks that every account holds what the calls so far add up to for it, so
 //! that money paid to the wrong account shows, and money in an account the harness does not know
@@ -61,8 +69,8 @@ use crate::entries::commitment_of;
 use crate::settle::split_reward;
 use crate::test_utils::{ctx, fresh, panic_message};
 use crate::types::{
-    hex32, OutcomeView, Phase, PostTaskArgs, VoidReason, WinnerArg, MAX_FEE_BPS, MAX_FUNDERS,
-    MAX_WINNERS,
+    hex32, AgentProfile, AgentStatus, OutcomeView, Phase, PostTaskArgs, VoidReason, WinnerArg,
+    MAX_FEE_BPS, MAX_FUNDERS, MAX_WINNERS,
 };
 use crate::{StorageKey, Tender};
 
@@ -106,6 +114,10 @@ const ENTRY_URI: &str = "https://api.tender.example/v1/results/2c26b46b";
 const SCORECARD_HASH: &str = "fcde2b2edba56bf408601fb721fe9b5c338d10ee429ea04fae5511b68fbf8fb9";
 const SCORECARD_URI: &str = "https://api.tender.example/v1/blobs/fcde2b2e";
 const PROFILE_URI: &str = "https://acme.example/agent.json";
+/// The agent bond the owner sets in the setup, in `TOKEN`.
+const BOND: u128 = 7;
+/// The bond cooldown the owner sets: one window.
+const COOLDOWN_SECS: u64 = WINDOW_SECS as u64;
 
 /// One of the four accounts that deposit, post, enter and withdraw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -172,8 +184,12 @@ enum Op {
     /// The keeper cleans up at most `limit` entries of the task. Steered to a settled task that
     /// had entrants.
     Cleanup { task: Target, limit: u32 },
-    /// `who` registers as an agent, or registers again.
+    /// `who` registers as an agent, or registers again, with 1 yoctoNEAR.
     Register { who: Who },
+    /// `who` starts unregistering, with 1 yoctoNEAR.
+    Unregister { who: Who },
+    /// `who` claims its bond back, with 1 yoctoNEAR.
+    Claim { who: Who },
     /// `who` tops the task up by `amount`, with 1 yoctoNEAR. Steered to an open task.
     TopUp {
         who: Who,
@@ -216,8 +232,26 @@ struct TaskModel {
     outcome: Option<OutcomeView>,
 }
 
+/// What the harness knows of a registered agent from the calls that went through. `bond` is what
+/// the contract holds for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentModel {
+    Active { bond: u128 },
+    Unregistering { bond: u128, claimable_at: u64 },
+    Retired,
+}
+
+impl AgentModel {
+    fn bond(self) -> u128 {
+        match self {
+            AgentModel::Active { bond } | AgentModel::Unregistering { bond, .. } => bond,
+            AgentModel::Retired => 0,
+        }
+    }
+}
+
 /// The contract in the mocked blockchain, and the harness's account of everything that went
-/// through: the money in and out, the balance each account should hold, and the tasks.
+/// through: the money in and out, the balance each account should hold, the tasks and the agents.
 struct World {
     /// The block time and height of the next call.
     now: u64,
@@ -229,6 +263,8 @@ struct World {
     balances: BTreeMap<AccountId, u128>,
     /// The tasks by id, from 1.
     tasks: Vec<TaskModel>,
+    /// The registered agents.
+    agents: BTreeMap<Who, AgentModel>,
     /// The seed of the next work committed.
     next_seed: u32,
 }
@@ -239,9 +275,10 @@ impl World {
     /// NEAR of storage each, so that storage never limits what they can do. The fee (500 bps)
     /// and the shortest window (60 s) are the ones `fresh` initialises with.
     ///
-    /// Then `p.test` deposits `MAX_AMOUNT`, so that a run can post from its first operation on
-    /// instead of waiting for a deposit. The other three start with no vault slot, so the slots a
-    /// first commit makes are made in the run.
+    /// The owner sets a bond of `BOND` and a cooldown of `COOLDOWN_SECS`. Then `p.test` deposits
+    /// `MAX_AMOUNT`, so that a run can post from its first operation on instead of waiting for a
+    /// deposit, and `a.test` and `b.test` each deposit `BOND` and register with it, which leaves
+    /// their vaults empty. `c.test` starts with no vault slot.
     fn new() -> Self {
         // Every run starts from an empty trie. All the cases of a property run on one thread, and
         // `testing_env!`, which `fresh` calls, keeps the trie of the blockchain it replaces.
@@ -255,6 +292,7 @@ impl World {
             withdrawn: 0,
             balances: BTreeMap::new(),
             tasks: Vec::new(),
+            agents: BTreeMap::new(),
             next_seed: 0,
         };
         world.setup(OWNER, NearToken::from_near(1), |t| {
@@ -269,10 +307,26 @@ impl World {
             });
             world.balances.insert(who.account(), 0);
         }
+        world.setup(OWNER, ONE_YOCTO, |t| {
+            t.set_agent_bond(acct(TOKEN), U128(BOND))
+        });
+        world.setup(OWNER, ONE_YOCTO, |t| {
+            t.set_agent_bond_cooldown(U64(COOLDOWN_SECS))
+        });
         world.balances.insert(acct(TREASURY), 0);
         match world.deposit(Who::P, MAX_AMOUNT) {
             Ok(Ok(())) => {}
             other => panic!("the setup deposit failed: {other:?}"),
+        }
+        // a.test and b.test deposit the bond and register with it, so that open tasks have
+        // entrants from the first operation on. c.test and p.test have not registered.
+        for who in [Who::A, Who::B] {
+            for step in [World::deposit_bond, World::register] {
+                match step(&mut world, who) {
+                    Ok(Ok(())) => {}
+                    other => panic!("the setup registration of {who:?} failed: {other:?}"),
+                }
+            }
         }
         world
     }
@@ -469,18 +523,98 @@ impl World {
                     })?
                     .map(|_| ()))
             }
-            Op::Register { who } => self.call(who.id(), NO_DEPOSIT, Vec::new(), |t| {
-                t.register_agent(
-                    PROFILE_URI.to_string(),
-                    BRIEF_HASH.to_string(),
-                    vec!["coder".to_string()],
-                )
-            }),
+            Op::Register { who } => self.register(who),
+            Op::Unregister { who } => self.unregister(who),
+            Op::Claim { who } => self.claim(who),
             Op::TopUp { who, task, amount } => {
                 let task = self.resolve(task, |phase, _| phase == Phase::Open);
                 self.top_up(who, task, amount)
             }
         }
+    }
+
+    /// `who` deposits `BOND`.
+    fn deposit_bond(&mut self, who: Who) -> Step {
+        self.deposit(who, BOND)
+    }
+
+    /// `who` registers, or updates its profile. The rules: an agent that is unregistering is
+    /// refused; a new or retired one pays `BOND` and must hold it; an active one pays nothing.
+    /// Storage never limits the four accounts. What the rules allow must go through, and nothing
+    /// else.
+    fn register(&mut self, who: Who) -> Step {
+        let held = self.balances.get(&who.account()).copied().unwrap_or(0);
+        let state = self.agents.get(&who).copied();
+        let pays = matches!(state, None | Some(AgentModel::Retired));
+        let allowed =
+            !matches!(state, Some(AgentModel::Unregistering { .. })) && (!pays || held >= BOND);
+        let result = self.call(who.id(), ONE_YOCTO, Vec::new(), |t| {
+            t.register_agent(
+                PROFILE_URI.to_string(),
+                BRIEF_HASH.to_string(),
+                vec!["coder".to_string()],
+            )
+        })?;
+        prop_assert_eq!(
+            result.is_ok(),
+            allowed,
+            "{:?} registering as {:?} with {} held came to {:?}",
+            who,
+            state,
+            held,
+            result
+        );
+        if result.is_ok() && pays {
+            self.debit(&who.account(), BOND)?;
+            self.agents.insert(who, AgentModel::Active { bond: BOND });
+        }
+        Ok(result)
+    }
+
+    /// `who` unregisters, which only an active agent may, and must be able to.
+    fn unregister(&mut self, who: Who) -> Step {
+        let state = self.agents.get(&who).copied();
+        let result = self.call(who.id(), ONE_YOCTO, Vec::new(), Tender::unregister_agent)?;
+        let Some(AgentModel::Active { bond }) = state else {
+            prop_assert!(result.is_err(), "{:?}, as {:?}, unregistered", who, state);
+            return Ok(result);
+        };
+        prop_assert!(
+            result.is_ok(),
+            "{:?}, active, could not unregister: {:?}",
+            who,
+            result
+        );
+        let claimable_at = self.now + COOLDOWN_SECS * SEC;
+        self.agents
+            .insert(who, AgentModel::Unregistering { bond, claimable_at });
+        Ok(result)
+    }
+
+    /// `who` claims its bond, which an unregistering agent may from its `claimable_at` on, and
+    /// must be able to. The bond comes back into its vault, and it retires.
+    fn claim(&mut self, who: Who) -> Step {
+        let state = self.agents.get(&who).copied();
+        let result = self.call(who.id(), ONE_YOCTO, Vec::new(), Tender::claim_agent_bond)?;
+        let due = match state {
+            Some(AgentModel::Unregistering { bond, claimable_at }) if self.now >= claimable_at => {
+                Some(bond)
+            }
+            _ => None,
+        };
+        let Some(bond) = due else {
+            prop_assert!(result.is_err(), "{:?}, as {:?}, claimed", who, state);
+            return Ok(result);
+        };
+        prop_assert!(
+            result.is_ok(),
+            "{:?} could not claim a bond that is due: {:?}",
+            who,
+            result
+        );
+        self.credit(&who.account(), bond)?;
+        self.agents.insert(who, AgentModel::Retired);
+        Ok(result)
     }
 
     /// `who` tops `task` up by `amount`. A top-up that the rules allow must go through: an open
@@ -604,9 +738,24 @@ impl World {
         self.next_seed += 1;
         let (content_hash, salt) = work(seed);
         let commitment = hex32(&commitment_of(task, &who.account(), &content_hash, &salt));
+        // Every task here is open to anyone, so it takes an active agent that is not its poster
+        // (who verifies it), in its commit window.
+        let active = matches!(self.agents.get(&who), Some(AgentModel::Active { .. }));
+        let allowed = self
+            .task(task)
+            .is_some_and(|m| self.phase(m) == Phase::Open && m.poster != who && active);
         let result = self.call(who.id(), NO_DEPOSIT, Vec::new(), |t| {
             t.commit(U64(task), commitment)
         })?;
+        prop_assert_eq!(
+            result.is_ok(),
+            allowed,
+            "{:?} committing to task {} (active: {}) came to {:?}",
+            who,
+            task,
+            active,
+            result
+        );
         if result.is_ok() {
             self.task_mut(task)?.works.insert(who, seed);
         }
@@ -841,6 +990,7 @@ impl World {
     fn check(&self) -> Result<(), TestCaseError> {
         let trie = take_trie();
         let vault = vault_balances(&trie);
+        let bonds = bonds_held(&trie);
         install(self.context(KEEPER, NO_DEPOSIT), Vec::new(), trie);
         let t: Tender = env::state_read().expect("the contract state");
         prop_assert_eq!(t.task_count().0, self.tasks.len() as u64, "the task count");
@@ -899,6 +1049,32 @@ impl World {
                 id
             );
         }
+        let bonded: u128 = bonds.values().sum();
+        for who in Who::ALL {
+            let model = self.agents.get(&who).copied();
+            let view = t.get_agent(who.account());
+            let shown = view.as_ref().map(|v| {
+                (
+                    v.status,
+                    v.bond_amount.map(|a| a.0),
+                    v.claimable_at.map(|c| c.0),
+                )
+            });
+            let expected = model.map(|m| match m {
+                AgentModel::Active { bond } => (AgentStatus::Active, Some(bond), None),
+                AgentModel::Unregistering { bond, claimable_at } => {
+                    (AgentStatus::Unregistering, Some(bond), Some(claimable_at))
+                }
+                AgentModel::Retired => (AgentStatus::Retired, None, None),
+            });
+            prop_assert_eq!(shown, expected, "the agent record of {:?}", who);
+            prop_assert_eq!(
+                bonds.get(&who.account()).copied().unwrap_or(0),
+                model.map_or(0, AgentModel::bond),
+                "the bond stored for {:?}",
+                who
+            );
+        }
         let held: u128 = vault.values().sum();
         prop_assert!(
             self.withdrawn <= self.deposited,
@@ -907,12 +1083,13 @@ impl World {
             self.deposited
         );
         prop_assert_eq!(
-            held + escrowed,
+            held + escrowed + bonded,
             self.deposited - self.withdrawn,
-            "I1: the vaults ({}) and the escrow of the unsettled tasks ({}) do not add up to \
-             the deposits ({}) less the withdrawals ({})",
+            "I1: the vaults ({}), the escrow of the unsettled tasks ({}) and the bonds ({}) do not \
+             add up to the deposits ({}) less the withdrawals ({})",
             held,
             escrowed,
+            bonded,
             self.deposited,
             self.withdrawn
         );
@@ -1039,6 +1216,24 @@ fn vault_balances(trie: &Trie) -> BTreeMap<AccountId, u128> {
         .collect()
 }
 
+/// The bond the contract holds for each agent, read straight from the storage keys of the `agents`
+/// map: its prefix, then the Borsh encoding of the account, with the agent's record as the value.
+/// Like `vault_balances`, it needs no list of accounts. Every bond is in `TOKEN`, the only token the
+/// owner sets one in.
+fn bonds_held(trie: &Trie) -> BTreeMap<AccountId, u128> {
+    let prefix = StorageKey::Agents.into_storage_key();
+    trie.iter()
+        .filter_map(|(key, value)| {
+            let account = key.strip_prefix(prefix.as_slice())?;
+            let account: AccountId = borsh::from_slice(account).expect("an agent key");
+            let profile: AgentProfile = borsh::from_slice(value).expect("an agent record");
+            let bond = profile.bond?;
+            assert_eq!(bond.token, acct(TOKEN), "a bond in another token");
+            Some((account, bond.amount))
+        })
+        .collect()
+}
+
 /// The work that `seed` stands for: its content hash and its salt. Each commit gets a new seed, so
 /// a commit that replaces another commits other work.
 fn work(seed: u32) -> ([u8; 32], [u8; 32]) {
@@ -1149,7 +1344,9 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|(who, amount, ok)| Op::Withdraw { who, amount, ok }),
         // A limit of 0 is rejected `E_LIMIT`.
         1 => (target(), 0..=3u32).prop_map(|(task, limit)| Op::Cleanup { task, limit }),
-        1 => who().prop_map(|who| Op::Register { who }),
+        2 => who().prop_map(|who| Op::Register { who }),
+        1 => who().prop_map(|who| Op::Unregister { who }),
+        1 => who().prop_map(|who| Op::Claim { who }),
         // 0 is among the amounts, and is rejected `E_REWARD`.
         3 => (who(), target(), prop_oneof![3 => 0..=1_000u128, 1 => 1..=MAX_AMOUNT])
             .prop_map(|(who, task, amount)| Op::TopUp { who, task, amount }),
@@ -1248,6 +1445,8 @@ fn scripted_run_reaches_every_outcome() {
         limit,
     };
     let register = |who| Op::Register { who };
+    let unregister = |who| Op::Unregister { who };
+    let claim = |who| Op::Claim { who };
     let top_up = |who, task, amount| Op::TopUp {
         who,
         task: Target::Id(task),
@@ -1261,15 +1460,21 @@ fn scripted_run_reaches_every_outcome() {
         (commit(Some(B), 1), "ok"),
         (commit(Some(A), 1), "ok"),
         (commit(Some(P), 1), "E_AUTH"),
+        // c.test has not registered, so it cannot enter an open task, and it has no bond to
+        // register with until it deposits one.
+        (commit(Some(C), 1), "E_NOT_REGISTERED"),
+        (register(C), "E_FUNDS"),
+        (deposit(C, BOND), "ok"),
+        (register(C), "ok"),
         (register(C), "ok"),
         (commit(Some(C), 1), "ok"),
-        // a.test has the vault slot its commit made, and nothing in it yet.
+        // a.test's vault slot is the one its bond came out of, and nothing is in it.
         (post(Some(A), 15), "E_FUNDS"),
         (post(Some(A), 9), "E_REWARD"),
         (deposit(A, 500), "ok"),
         // Task 2, which nobody enters. Its poster puts in 3 more, which a funder may; p.test,
         // not a funder yet, cannot join with 4, under the minimum of 10, and joins with 10.
-        // b.test has the slot its commit made, and nothing in it.
+        // b.test's vault holds nothing: its bond took what it deposited.
         (post(Some(A), 17), "ok"),
         (top_up(A, 2, 3), "ok"),
         (top_up(P, 2, 4), "E_REWARD"),
@@ -1305,11 +1510,24 @@ fn scripted_run_reaches_every_outcome() {
         (reveal(None, 3), "ok"),
         (advance(60), "ok"),
         (empty_pick(3), "ok"),
-        // Task 4, revealed in and then left until it expires.
+        // Task 4, revealed in and then left until it expires. b.test unregisters after it enters:
+        // it may no longer replace its entry, nor claim before the cooldown, nor register, but it
+        // reveals, claims once the cooldown is over, which retires it, and comes back.
         (post(Some(P), 19), "ok"),
         (commit(Some(B), 4), "ok"),
+        (claim(B), "E_PHASE"),
+        (unregister(B), "ok"),
+        (unregister(B), "E_PHASE"),
+        (commit(Some(B), 4), "E_NOT_REGISTERED"),
+        (claim(B), "E_PHASE"),
+        (register(B), "E_PHASE"),
         (advance(60), "ok"),
         (reveal(Some(B), 4), "ok"),
+        (claim(B), "ok"),
+        (claim(B), "E_NOT_REGISTERED"),
+        (unregister(B), "E_NOT_REGISTERED"),
+        (register(B), "ok"),
+        (unregister(P), "E_NOT_REGISTERED"),
         (advance(200), "ok"),
         (pick(4, &[1]), "E_PHASE"),
         (void(4), "ok"),
@@ -1347,7 +1565,8 @@ fn scripted_run_reaches_every_outcome() {
         ]
     );
     // The voids and the empty pick refunded every funder what it paid in, so the top-ups cancel
-    // out. Withdrawn: 975 by a.test and 190 by c.test. b.test's failed withdrawal came back.
+    // out. Withdrawn: 975 by a.test and 190 by c.test. b.test's failed withdrawal came back, and
+    // so did its bond, which it paid again. Each of the three holds a bond of `BOND`.
     let held: Vec<u128> = [P, A, B, C]
         .into_iter()
         .map(|w| world.balance(&w.account()))
@@ -1356,6 +1575,14 @@ fn scripted_run_reaches_every_outcome() {
     assert_eq!(held, [MAX_AMOUNT - 1_000, 0, 285, 0, 50]);
     assert_eq!(
         (world.deposited, world.withdrawn),
-        (MAX_AMOUNT + 500, 1_165)
+        (MAX_AMOUNT + 3 * BOND + 500, 1_165)
     );
+    let bonds = world.view(|t| {
+        Who::ALL.map(|w| {
+            t.get_agent(w.account())
+                .and_then(|a| a.bond_amount)
+                .map(|b| b.0)
+        })
+    });
+    assert_eq!(bonds, [None, Some(BOND), Some(BOND), Some(BOND)]);
 }

@@ -29,6 +29,31 @@ pub async fn call(
         .await?)
 }
 
+/// Calls `method` on Tender as `who` with `deposit` and 30 Tgas: enough for any of Tender's
+/// single-receipt methods, and affordable for an account created with 1 NEAR, which cannot
+/// prepay the 300 Tgas that `call` attaches.
+pub async fn light_call(
+    env: &Env,
+    who: &Account,
+    method: &str,
+    args: Value,
+    deposit: NearToken,
+) -> anyhow::Result<ExecutionFinalResult> {
+    Ok(who
+        .call(env.tender.id(), method)
+        .args_json(args)
+        .deposit(deposit)
+        .gas(Gas::from_tgas(30))
+        .transact()
+        .await?)
+}
+
+/// The arguments of `commit` that enter `who` in task `task_id` with `sealed`.
+pub fn commit_args(task_id: u64, who: &AccountId, sealed: &Sealed) -> Value {
+    let commitment = commitment_of(task_id, who.as_str(), &sealed.content_hash, &sealed.salt);
+    json!({ "task_id": task_id.to_string(), "commitment": hex(&commitment) })
+}
+
 /// Calls the view `method` on `contract`.
 pub async fn view(contract: &Contract, method: &str, args: Value) -> anyhow::Result<Value> {
     Ok(contract.view(method).args_json(args).await?.json()?)
