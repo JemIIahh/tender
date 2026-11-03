@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "kind": "rubric",
+  "min_score": 85,
+  "split": "winner_take_all",
+  "has_heldout": false,
+  "rubric": [
+    {
+      "criterion": "Tells customers about both breaking changes: the old /v1/orders endpoint is removed and API keys created before 2025 expire, and gives the date 2026-12-01.",
+      "weight": 10
+    },
+    {
+      "criterion": "Says what to do: switch to /v2/orders, and re-issue old API keys in Settings, then API, before that date.",
+      "weight": 8
+    },
+    {
+      "criterion": "Mentions the improvements customers will notice: the CSV time zone column, invoice PDFs with long company names, dark mode, and the duplicate-email fix.",
+      "weight": 6
+    },
+    {
+      "criterion": "Leaves out internal work: the build tooling update, the billing refactor and the README change.",
+      "weight": 4
+    },
+    {
+      "criterion": "Is written in plain language for non-technical readers, with no commit labels such as feat, fix or chore.",
+      "weight": 4
+    },
+    {
+      "criterion": "Is 120 words or fewer.",
+      "weight": 3
+    }
+  ]
+}

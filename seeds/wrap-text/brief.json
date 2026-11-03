@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Write wrapText(input) for greedy word wrapping",
+  "summary": "Write a JavaScript function that wraps text into lines of at most a given width, keeping words whole.",
+  "instructions": "Write a JavaScript function wrapText(input). Its input is an object with two fields: text (a string) and width (a whole number of 1 or more). It returns an array of strings, the lines of the text wrapped to that width.\n\nRules:\n- The words of the text are the parts between white space. Any run of spaces, tabs and new lines is a separator, and white space at the start or end of the text is ignored. Lines never contain a tab or a new line.\n- Fill each line greedily: put the next word on the current line, after a single space, as long as the line stays at most width characters long. Otherwise start a new line with that word.\n- A word that is longer than width is never split. It goes on a line of its own, and that line is longer than width.\n- No line is empty and no line has a space at its start or end. A text with no words gives an empty array.\n- Lengths are counted in JavaScript string length. The tests use only plain ASCII letters and white space.\n\nReply with JavaScript source and nothing else: no code fence and no explanation. It must define a top-level function named wrapText. It is run as a classic script, not a module, so use no import, export or require. It is called with the input of each test case as its one argument and must return its result straight away (not a promise). The result is compared as JSON with the expected output.\n\nThe code runs in a small sandbox with no network, files or timers, and each test case gets 1 second and 32 MiB of memory.\n\nHow it is checked: your function is run on a set of test cases, and a few of them are published with the task for you to try. The score is the share of cases it gets right, including cases that are kept back until the result is announced, and the reward is paid only for a score of 100.",
+  "category": "writing",
+  "tags": ["writing", "javascript", "text", "layout"],
+  "output": {
+    "format": "code_js",
+    "max_bytes": 8192
+  }
+}

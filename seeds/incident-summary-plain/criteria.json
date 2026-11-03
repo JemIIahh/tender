@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "kind": "rubric",
+  "min_score": 85,
+  "split": "winner_take_all",
+  "has_heldout": false,
+  "rubric": [
+    {
+      "criterion": "States the impact: checkout failed for roughly 19 minutes (about 09:07 to 09:26 UTC) and about 1,840 checkouts failed.",
+      "weight": 9
+    },
+    {
+      "criterion": "Says clearly that nobody was charged twice and that no data was lost.",
+      "weight": 8
+    },
+    {
+      "criterion": "Explains the cause in plain words, such as a new update that put too much load on the database, without terms like connection pool, query, API or db-primary.",
+      "weight": 8
+    },
+    {
+      "criterion": "Says the fix was undoing the update (a rollback) and that checkout was back to normal by 09:30 UTC.",
+      "weight": 8
+    },
+    {
+      "criterion": "Names both follow-up steps: load testing before each release, and an alert when database capacity runs low.",
+      "weight": 8
+    },
+    {
+      "criterion": "Apologises once, sincerely, without excuses and without blaming any person or team.",
+      "weight": 5
+    },
+    {
+      "criterion": "Has 5 to 7 sentences and at most 140 words.",
+      "weight": 2
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Screen a reading list against four inclusion rules",
+  "summary": "From a table of papers, count those that meet four inclusion rules and add up their citations.",
+  "instructions": "Below is a reading list of papers, one per line, with these fields separated by ' | ': id, year, venue, access and citations.\n\nA paper is included only if all four rules hold:\n- it was published in the years 2021 to 2024, both years included;\n- its venue name starts with the words Journal of;\n- its access is open;\n- it has at least 20 citations.\n\nReport two numbers, separated by a comma: how many papers are included, and the total number of citations of the included papers. For example 3,150 means 3 papers with 150 citations between them.\n\nHow it is checked: your answer is compared with the correct answer after trimming spaces and ignoring upper or lower case. There is no partial credit, and the reward is paid only for a correct answer.\n\n-----BEGIN DATA-----\nP01 | 2022 | Journal of Applied Graphs | open | 34\nP02 | 2021 | Journal of Network Studies | open | 20\nP03 | 2020 | Journal of Applied Graphs | open | 88\nP04 | 2023 | Journal of Network Studies | closed | 51\nP05 | 2024 | Journal of Small Systems | open | 19\nP06 | 2024 | Journal of Small Systems | open | 41\nP07 | 2023 | The Journal of Applied Graphs | open | 60\nP08 | 2025 | Journal of Applied Graphs | open | 12\nP09 | 2022 | Proceedings of Graph Day | open | 73\nP10 | 2022 | Journals Digest | open | 45\nP11 | 2021 | Journal of Applied Graphs | open | 27\nP12 | 2023 | Journal of Network Studies | open | 102\nP13 | 2024 | Journal of Network Studies | closed | 15\nP14 | 2021 | Annals of Small Systems | open | 90\nP15 | 2023 | Journal of Small Systems | open | 25\nP16 | 2020 | Journal of Network Studies | closed | 5\n-----END DATA-----",
+  "category": "research",
+  "tags": ["research", "screening", "counting"],
+  "output": {
+    "format": "text",
+    "max_bytes": 256
+  }
+}

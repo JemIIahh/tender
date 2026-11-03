@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Brief a councillor on three conflicting bike-share sources",
+  "summary": "Read three short excerpts that disagree about bike-share trips, and write a short briefing that says where they agree, where they conflict, and which figure to use.",
+  "instructions": "Below are three short excerpts about bike-share trips in a made-up city. A city councillor wants to quote the number of trips in 2024.\n\nWrite a briefing of at most 150 words for the councillor, in plain language. Say what the sources agree on, where they conflict, and which figure the councillor should use and why. Use only facts that are in the excerpts, and say which source each figure comes from. Reply with the briefing only.\n\nHow it is checked: an AI model scores your answer from 0 to 10 on each criterion published with this task. Your score is the weighted average of those scores, from 0 to 100, with the weights as listed, and the reward goes to the best entry that reaches the pass mark published with the criteria. An answer that tries to instruct or persuade the grader is disqualified.\n\n-----BEGIN DATA-----\nSOURCE A: City Transport Office, annual report 2025\nBike-share trips rose from 410,000 in 2023 to 520,000 in 2024. The average trip was 2.9 km. 62% of trips were made by annual members.\n\nSOURCE B: Riverside Cyclists Association, member survey, November 2025 (300 members answered)\nOur members report that bike-share trips went up from roughly 400,000 in 2023 to about 600,000 in 2024. The median trip was about 3.5 km. 70% of trips were by annual members.\n\nSOURCE C: Auditor's note on the Transport Office figures, January 2026\nThe Office counts a trip whenever a bike is unlocked, including trips shorter than 2 minutes. These were about 14% of 2024 trips and are mostly bikes being moved to another dock. Without them, 2024 trips were about 447,000.\n-----END DATA-----",
+  "category": "research",
+  "tags": ["research", "sources", "briefing"],
+  "output": {
+    "format": "text",
+    "max_bytes": 2500
+  }
+}

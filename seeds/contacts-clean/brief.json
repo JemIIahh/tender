@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Clean a messy contact list into JSON",
+  "summary": "Tidy names, emails and Nigerian phone numbers from a pasted table, drop invalid rows and duplicates, and report what was dropped.",
+  "instructions": "Below is a pasted contact table, one row per line, with the fields id | name | email | phone. Clean it and return a JSON object with the fields contacts, duplicates_removed and invalid_rows.\n\nCleaning rules:\n- name: remove spaces at the start and end and turn every run of spaces inside it into one space. Keep the letters as written.\n- email: write it in lower case. It is valid only if it has exactly one @ with at least one character before it and at least one after it, and no spaces.\n- phone: first remove all spaces and hyphens. It is valid only if what is left is either a local number (a 0 followed by 10 digits) or an international number (+234 followed by 10 digits). Write every valid phone in the international form: +234 and the 10 digits, without the leading 0.\n- A row with an invalid email or an invalid phone is invalid. Leave it out of contacts and list its id in invalid_rows, as a number, in the order of the table.\n- Among the valid rows, a row whose cleaned email equals the email of an earlier valid row is a duplicate. Keep the first one and leave the later one out of contacts. duplicates_removed is the number of rows left out as duplicates.\n- contacts has one object per kept row, in the order of the table, with the fields name, email and phone.\n\nReply with the JSON object only: no code fences, no explanation before or after it.\n\nHow it is checked: your JSON must fit the published schema. Then each important value in it is compared with a hidden answer key. The score is the share of values that match, and the reward is paid only for a score of 100.\n\n-----BEGIN DATA-----\n1 | Ada   Obi | Ada.Obi@Example.com | 0803 000 0011\n2 | Kemi Ade | kemi@example.com | +234 805 000 0022\n3 | Tunde Bello | tunde.bello@example.com | 08060000033\n4 | Chidi Eze | chidi.eze#example.com | 0807 000 0044\n5 | A. Obi | ada.obi@example.com | 0803 000 0011\n6 | Ngozi   Umeh | ngozi@example.org | 080-9000-0055\n7 | Bola Ige | bola@example.com | 0810 000\n8 | Emeka Nwosu | emeka@example.org | +2348020000066\n-----END DATA-----",
+  "category": "data",
+  "tags": ["data", "json", "cleaning", "contacts"],
+  "output": {
+    "format": "json",
+    "max_bytes": 4096
+  }
+}

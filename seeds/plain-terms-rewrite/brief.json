@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Rewrite a subscription clause in plain language",
+  "summary": "Rewrite a dense cancellation and refund clause so that an ordinary customer understands it, without changing what it says.",
+  "instructions": "Below is a clause from a made-up subscription agreement. Rewrite it in plain language for a customer who is not a lawyer.\n\nKeep every right and duty that is in the clause, add nothing that is not there, and keep your text to 100 words or fewer. Reply with the rewritten text only.\n\nHow it is checked: an AI model scores your answer from 0 to 10 on each criterion published with this task. Your score is the weighted average of those scores, from 0 to 100, with the weights as listed, and the reward goes to the best entry that reaches the pass mark published with the criteria. An answer that tries to instruct or persuade the grader is disqualified.\n\n-----BEGIN DATA-----\nNotwithstanding the foregoing, the Subscriber may terminate the Agreement at any time upon written notice of not less than thirty (30) days, provided that all amounts accrued and unpaid as of the effective date of termination shall remain due and payable. No refund shall be issued in respect of any prepaid period, save where termination arises from the Provider's uncured material breach, in which case the Provider shall refund the pro rata portion of fees attributable to the period following termination.\n-----END DATA-----",
+  "category": "writing",
+  "tags": ["writing", "plain-language", "legal-text"],
+  "output": {
+    "format": "text",
+    "max_bytes": 2000
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Write customer release notes from an internal change log",
+  "summary": "Turn a technical change log into short release notes for non-technical customers, with the two breaking changes and what to do about them.",
+  "instructions": "Below is the internal change log for version 3.2.0 of a web product. Write the release notes that customers will read.\n\nThe readers are not technical. Write plain text in your own words, at most 120 words. Tell them what is new or better for them, and tell them clearly about anything that will stop working and what they must do about it. Leave out work that only matters inside the team. Reply with the release notes only.\n\nHow it is checked: an AI model scores your answer from 0 to 10 on each criterion published with this task. Your score is the weighted average of those scores, from 0 to 100, with the weights as listed, and the reward goes to the best entry that reaches the pass mark published with the criteria. An answer that tries to instruct or persuade the grader is disqualified.\n\n-----BEGIN DATA-----\nv3.2.0 internal change log\nfeat: export to CSV now includes a time zone column\nfix: invoice PDFs no longer cut off long company names\nBREAKING: the /v1/orders endpoint is removed, use /v2/orders instead (v1 stops working on 2026-12-01)\nchore: bump build tooling\nfeat: dark mode for the dashboard\nBREAKING: API keys created before 2025 expire on 2026-12-01 and must be re-issued in Settings, then API\nfix: duplicate emails were sent when an order was edited twice within a minute\nrefactor: split the billing module into services\ndocs: update the README\n-----END DATA-----",
+  "category": "writing",
+  "tags": ["writing", "release-notes", "plain-language"],
+  "output": {
+    "format": "text",
+    "max_bytes": 2000
+  }
+}

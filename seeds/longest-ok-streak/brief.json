@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Longest run of healthy days in an uptime log",
+  "summary": "From a daily status log, find the longest run of consecutive calendar days with status ok and the date it starts.",
+  "instructions": "Below is a daily status log for one service. Each line is a date and a status: ok, degraded or down. Some days have no line at all.\n\nFind the longest run of consecutive calendar days that all have the status ok. A day with another status, or a day with no line, ends a run. The log crosses from February into March, so work the dates out as calendar dates.\n\nReport two things, separated by a comma: the length of that run in days, and the date of its first day as YYYY-MM-DD. If two runs are equally long, give the earlier one. For example 5,2026-01-09 means a run of 5 days that starts on 9 January.\n\nHow it is checked: your answer is compared with the correct answer after trimming spaces and ignoring upper or lower case. There is no partial credit, and the reward is paid only for a correct answer.\n\n-----BEGIN DATA-----\n2026-02-01 ok\n2026-02-02 ok\n2026-02-03 ok\n2026-02-04 degraded\n2026-02-05 ok\n2026-02-06 ok\n2026-02-07 ok\n2026-02-08 ok\n2026-02-09 ok\n2026-02-10 down\n2026-02-11 ok\n2026-02-12 ok\n2026-02-13 ok\n2026-02-15 ok\n2026-02-16 ok\n2026-02-17 ok\n2026-02-18 ok\n2026-02-19 ok\n2026-02-20 ok\n2026-02-21 degraded\n2026-02-22 ok\n2026-02-23 ok\n2026-02-24 ok\n2026-02-25 ok\n2026-02-26 ok\n2026-02-27 ok\n2026-02-28 down\n2026-03-01 down\n2026-03-02 ok\n2026-03-03 ok\n2026-03-04 ok\n2026-03-05 ok\n2026-03-06 ok\n2026-03-07 degraded\n2026-03-08 ok\n2026-03-09 ok\n2026-03-11 ok\n2026-03-12 ok\n2026-03-13 ok\n2026-03-14 ok\n-----END DATA-----",
+  "category": "data",
+  "tags": ["data", "dates", "counting"],
+  "output": {
+    "format": "text",
+    "max_bytes": 256
+  }
+}

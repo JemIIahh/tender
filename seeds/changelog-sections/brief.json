@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Read the latest release out of a changelog",
+  "summary": "Pick the newest stable release in a changelog and return its date and bullets, sorted into added, fixed and breaking.",
+  "instructions": "Below is a changelog in Markdown. Find the newest stable release and return it as a JSON object.\n\nWhich release: a release heading looks like '## 1.2.3 - 2026-01-31'. Ignore the Unreleased block, and ignore every pre-release (a version with a hyphen suffix such as -rc.1). Among the others, the newest is the one with the highest version number, comparing the three numbers one by one as numbers, not as text. The releases are not in order in the file.\n\nFields of the object:\n- version: the version number, as written in the heading.\n- released: the date from the heading, as YYYY-MM-DD.\n- added, fixed, breaking: the bullets of that release under the headings Added, Fixed and Breaking, in the order they appear. Copy each bullet's text exactly as written, without the leading '- '. A heading the release does not have gives an empty array.\n- bullet_count: the number of bullets of the release, all three headings together.\n- has_breaking: true if the release has at least one breaking bullet, otherwise false.\n\nReply with the JSON object only: no code fences, no explanation before or after it.\n\nHow it is checked: your JSON must fit the published schema. Then each important value in it is compared with a hidden answer key. The score is the share of values that match, and the reward is paid only for a score of 100.\n\n-----BEGIN DATA-----\n## Unreleased\n- Added: experimental webhooks\n\n## 2.9.1 - 2026-08-30\n### Fixed\n- Crash when importing an empty file\n\n## 2.10.0 - 2026-10-14\n### Added\n- Export to Parquet\n- Keyboard shortcuts for the table view\n### Fixed\n- Wrong totals when a filter was cleared\n- Slow load on tables over 50,000 rows\n### Breaking\n- The `--legacy-csv` flag is removed\n\n## 2.10.0-rc.1 - 2026-10-01\n### Added\n- Export to Parquet (preview)\n-----END DATA-----",
+  "category": "writing",
+  "tags": ["writing", "json", "changelog", "markdown"],
+  "output": {
+    "format": "json",
+    "max_bytes": 4096
+  }
+}

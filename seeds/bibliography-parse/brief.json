@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Parse five citations into structured JSON",
+  "summary": "Read five reference-list entries and return their authors, year, title, venue and pages, plus a few totals.",
+  "instructions": "Below are five entries of a reference list. Return a JSON object with the fields references, total_authors, earliest_year and venue_most_frequent.\n\nreferences has one object per entry, in the order given, with these fields:\n- n: the number in square brackets.\n- first_author: the surname of the first author, as written.\n- author_count: how many authors the entry lists. The & is not an author.\n- year: the year in round brackets, as a number.\n- title: the title of the paper, as written, without the full stop that ends it.\n- venue: the name of the journal or proceedings, as written, without its volume and issue.\n- pages: the page range at the end, as written, such as 5-9.\n\ntotal_authors is the sum of author_count over all entries. earliest_year is the smallest year. venue_most_frequent is the venue that appears in the most entries. No two venues tie.\n\nReply with the JSON object only: no code fences, no explanation before or after it.\n\nHow it is checked: your JSON must fit the published schema. Then each important value in it is compared with a hidden answer key. The score is the share of values that match, and the reward is paid only for a score of 100.\n\n-----BEGIN DATA-----\n[1] Okafor, A., & Lindqvist, P. (2021). Sparse routing in small networks. Journal of Applied Graphs, 12(3), 45-67.\n[2] Mbeki, T., Haddad, R., & Sorensen, K. (2019). A census of toy graphs. Annals of Small Systems, 4(1), 1-30.\n[3] Varga, L. (2023). Why queues grow. Journal of Network Studies, 31(2), 210-229.\n[4] Aaltonen, J., Chen, W., Diallo, M., & Fenwick, S. (2024). Open data for small cities. Proceedings of Graph Day, 88-95.\n[5] Ito, Y., & Rossi, G. (2020). Counting paths, again. Journal of Applied Graphs, 11(4), 301-312.\n-----END DATA-----",
+  "category": "research",
+  "tags": ["research", "json", "citations", "parsing"],
+  "output": {
+    "format": "json",
+    "max_bytes": 8192
+  }
+}

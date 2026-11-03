@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "kind": "regex_cases",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "examples": {
+    "match": ["192.168.1.1", "0.0.0.0", "255.255.255.255"],
+    "no_match": ["256.1.1.1", "1.2.3", "01.2.3.4"]
+  }
+}

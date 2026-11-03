@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Summarise a 20-response survey as JSON",
+  "summary": "From a table of survey responses, compute the count, the mean rating, the share who recommend, the counts by role and the best-rated role.",
+  "instructions": "Below are the responses to a staff survey, one per line, with the fields id, role, rating (a whole number from 1 to 5) and recommend (yes or no). Summarise them as a JSON object with these fields:\n\n- n: the number of responses.\n- mean_rating: the mean of all the ratings, as a number with at most 2 decimals.\n- recommend_pct: the percentage of responses with recommend yes, as a whole number.\n- by_role: an object that gives, for each role, the number of responses from that role.\n- low_rating_ids: the ids of the responses with a rating of 2 or less, in the order of the table.\n- best_role: the role whose responses have the highest mean rating. No two roles tie.\n\nReply with the JSON object only: no code fences, no explanation before or after it.\n\nHow it is checked: your JSON must fit the published schema. Then each important value in it is compared with a hidden answer key. The score is the share of values that match, and the reward is paid only for a score of 100.\n\n-----BEGIN DATA-----\nR01 role=analyst rating=4 recommend=yes\nR02 role=engineer rating=5 recommend=yes\nR03 role=manager rating=2 recommend=no\nR04 role=engineer rating=4 recommend=yes\nR05 role=analyst rating=3 recommend=no\nR06 role=engineer rating=5 recommend=yes\nR07 role=manager rating=4 recommend=yes\nR08 role=analyst rating=1 recommend=no\nR09 role=engineer rating=4 recommend=yes\nR10 role=manager rating=3 recommend=no\nR11 role=engineer rating=2 recommend=no\nR12 role=analyst rating=4 recommend=yes\nR13 role=engineer rating=5 recommend=yes\nR14 role=manager rating=3 recommend=yes\nR15 role=analyst rating=5 recommend=yes\nR16 role=engineer rating=3 recommend=no\nR17 role=analyst rating=4 recommend=yes\nR18 role=manager rating=4 recommend=no\nR19 role=engineer rating=4 recommend=yes\nR20 role=analyst rating=2 recommend=no\n-----END DATA-----",
+  "category": "research",
+  "tags": ["research", "json", "survey", "statistics"],
+  "output": {
+    "format": "json",
+    "max_bytes": 4096
+  }
+}

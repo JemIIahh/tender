@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "kind": "rubric",
+  "min_score": 85,
+  "split": "winner_take_all",
+  "has_heldout": false,
+  "rubric": [
+    {
+      "criterion": "Says what the sources agree on: the two that give 2023 figures, the Transport Office and the cyclists, both show trips growing from 2023 to 2024.",
+      "weight": 8
+    },
+    {
+      "criterion": "Names the conflict over the 2024 trip count and gives each figure with its source: about 520,000 from the Transport Office and about 600,000 from the cyclists' survey.",
+      "weight": 9
+    },
+    {
+      "criterion": "Reports the auditor's finding that short trips of under 2 minutes, about 14% of 2024 trips, inflate the official count, which is about 447,000 without them.",
+      "weight": 9
+    },
+    {
+      "criterion": "Recommends the auditor's figure of about 447,000 trips for 2024, and explains why, for example that it comes from an audit of the official count and not from a survey of members.",
+      "weight": 9
+    },
+    {
+      "criterion": "Points out the weakness of the survey: it covers only 300 members and is self-reported.",
+      "weight": 4
+    },
+    {
+      "criterion": "States no number, source or claim that is not in the three excerpts.",
+      "weight": 8
+    },
+    {
+      "criterion": "Is 150 words or fewer and clear to a reader who is not a specialist.",
+      "weight": 2
+    }
+  ]
+}

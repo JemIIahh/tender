@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "kind": "rubric",
+  "min_score": 85,
+  "split": "winner_take_all",
+  "has_heldout": false,
+  "rubric": [
+    {
+      "criterion": "Recommends Northwind, the only vendor that meets every requirement.",
+      "weight": 10
+    },
+    {
+      "criterion": "Gives Northwind's monthly cost correctly (30 seats at 48 dollars is 1,440 dollars) and says it is under the 1,500 dollar budget.",
+      "weight": 8
+    },
+    {
+      "criterion": "Rules out Brightly because it has no SSO, or because its 99.5% uptime guarantee is below the required 99.9%, or for both reasons.",
+      "weight": 5
+    },
+    {
+      "criterion": "Rules out Dunmore because it offers no data export.",
+      "weight": 5
+    },
+    {
+      "criterion": "Rules out Cobalt because 30 seats would cost 1,650 dollars a month, over the budget.",
+      "weight": 5
+    },
+    {
+      "criterion": "Rules out Elmstead because its 99.0% uptime guarantee is below the required 99.9%.",
+      "weight": 5
+    },
+    {
+      "criterion": "Uses only facts and numbers from the table and the requirements, and invents no features.",
+      "weight": 8
+    },
+    {
+      "criterion": "Is 150 words or fewer.",
+      "weight": 2
+    }
+  ]
+}

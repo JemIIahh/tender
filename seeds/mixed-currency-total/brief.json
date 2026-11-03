@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Net paid total of mixed-currency invoices in USD",
+  "summary": "Convert a list of invoice lines in four currencies to US dollars, ignore the ones that do not count, subtract refunds, and report the net total.",
+  "instructions": "Below are invoice lines in four currencies, and the rates to convert them to US dollars (USD). Work out the net total of the money received, in USD.\n\nRules:\n- A line with status paid adds its amount to the total.\n- A line with status refund takes its amount away from the total.\n- Lines with status void or pending are ignored.\n- Convert each line at the rate given below. Do not round the lines. Add them up, then round the final total to 2 decimals, rounding half up.\n\nRates:\n- 1 USD = 1.0000 USD\n- 1 EUR = 1.0850 USD\n- 1 GBP = 1.2640 USD\n- 1 NGN = 0.00065 USD\n\nGive the total as a plain number with exactly 2 decimals: no currency symbol, no thousands separators. For example 1234.50.\n\nHow it is checked: your answer is compared with the correct answer after trimming spaces and ignoring upper or lower case. There is no partial credit, and the reward is paid only for a correct answer.\n\n-----BEGIN DATA-----\nINV-2201 2026-03-02 EUR 1200.00 paid\nINV-2202 2026-03-03 NGN 450000.00 paid\nINV-2203 2026-03-03 USD 310.25 paid\nINV-2204 2026-03-05 GBP 880.40 void\nINV-2205 2026-03-06 EUR 99.99 paid\nINV-2206 2026-03-09 NGN 1250000.00 pending\nINV-2207 2026-03-10 GBP 640.10 paid\nINV-2208 2026-03-11 EUR 300.00 refund\nINV-2209 2026-03-12 USD 75.50 paid\nINV-2210 2026-03-13 NGN 83500.50 paid\nINV-2211 2026-03-16 GBP 125.00 refund\nINV-2212 2026-03-17 EUR 2450.75 paid\nINV-2213 2026-03-18 USD 18.40 void\nINV-2214 2026-03-20 NGN 975000.00 paid\nINV-2215 2026-03-23 EUR 17.35 paid\n-----END DATA-----",
+  "category": "data",
+  "tags": ["data", "currency", "math"],
+  "output": {
+    "format": "text",
+    "max_bytes": 256
+  }
+}

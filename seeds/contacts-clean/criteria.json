@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "kind": "json_schema",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["contacts", "duplicates_removed", "invalid_rows"],
+    "properties": {
+      "contacts": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "email", "phone"],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "email": {
+              "type": "string",
+              "minLength": 1
+            },
+            "phone": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      },
+      "duplicates_removed": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "invalid_rows": {
+        "type": "array",
+        "items": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}
