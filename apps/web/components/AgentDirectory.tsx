@@ -17,6 +17,9 @@ import { ErrorState } from "./ErrorState";
 // are all there and a filter never narrows a list that is only half read. It stops after
 // `MAX_PAGES` pages, and says so.
 
+/** A tag as the board takes it (app/page.tsx), which is also what the API accepts. */
+const TAG = /^[a-z0-9-]{1,24}$/;
+
 /** The API's largest page. */
 const PAGE_SIZE = 50;
 /** How many pages are read before the directory stops asking: 500 agents. */
@@ -36,12 +39,17 @@ type Directory =
   | { status: "error"; message: string; retrying: boolean }
   | ({ status: "ready" } & Everyone);
 
-/** Every agent the API lists, page after page, up to `maxPages` pages. */
-async function fetchEveryone(maxPages: number): Promise<Everyone> {
+/**
+ * Every agent the API lists, page after page, up to `maxPages` pages. `wanted` says whether anyone
+ * still waits for them: once it is false (the page is gone, or a newer read has taken over) the
+ * loop asks for no more pages and the answer is null.
+ */
+async function fetchEveryone(maxPages: number, wanted: () => boolean): Promise<Everyone | null> {
   const agents: AgentSummary[] = [];
   let cursor: string | null = null;
   for (let page = 0; page < maxPages; page++) {
     const answer = await api.listAgents({ limit: PAGE_SIZE, cursor });
+    if (!wanted()) return null;
     agents.push(...answer.agents);
     if (answer.next_cursor === null) return { agents, truncated: false };
     cursor = answer.next_cursor;
@@ -88,7 +96,10 @@ function Agents({ everyone, tag }: { everyone: Everyone; tag: string }) {
     <>
       <TagFilter tags={tags} current={tag} />
       {shown.length === 0 ? (
-        <p data-testid="no-agents">No agent has the tag {tag}.</p>
+        <p data-testid="no-agents" className="wrap-anywhere">
+          {/* The address can hold any text: only what is a tag is said back. */}
+          {TAG.test(tag) ? `No agent has the tag ${tag}.` : "No agent has that tag."}
+        </p>
       ) : (
         <ul className="grid gap-3">
           {shown.map((agent) => (
@@ -108,8 +119,8 @@ function Agents({ everyone, tag }: { everyone: Everyone; tag: string }) {
 export function AgentDirectory({ maxPages = MAX_PAGES }: { maxPages?: number } = {}) {
   const tag = tagOf(useSearchParams());
   const [directory, setDirectory] = useState<Directory>({ status: "loading" });
-  // The request that counts. An answer to an earlier one is dropped: strict mode starts two
-  // requests, and a retry can overlap a slow one.
+  // The request that counts. An answer to an earlier one is dropped, and its loop stops asking for
+  // pages: strict mode starts two requests, and a retry can overlap a slow one.
   const latest = useRef(0);
 
   const load = useCallback(() => {
@@ -119,9 +130,11 @@ export function AgentDirectory({ maxPages = MAX_PAGES }: { maxPages?: number } =
     setDirectory((was) =>
       was.status === "error" ? { ...was, retrying: true } : { status: "loading" },
     );
-    fetchEveryone(maxPages).then(
+    fetchEveryone(maxPages, () => request === latest.current).then(
       (everyone) => {
-        if (request === latest.current) setDirectory({ status: "ready", ...everyone });
+        if (everyone !== null && request === latest.current) {
+          setDirectory({ status: "ready", ...everyone });
+        }
       },
       (error) => {
         if (request !== latest.current) return;
@@ -135,6 +148,10 @@ export function AgentDirectory({ maxPages = MAX_PAGES }: { maxPages?: number } =
 
   useEffect(() => {
     load();
+    // The page is going, or a read with another limit takes over: the one under way is not wanted.
+    return () => {
+      latest.current++;
+    };
   }, [load]);
 
   return (

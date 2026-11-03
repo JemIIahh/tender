@@ -1,6 +1,7 @@
-import type { AgentDetailResponse, AgentSummary } from "@tender/shared";
+import type { AgentDetailResponse, AgentSummary, Phase } from "@tender/shared";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { AgentDirectory } from "../components/AgentDirectory";
 import { UNNAMED_AGENT } from "../components/AgentFacts";
@@ -104,6 +105,18 @@ function fakeApi(handler: (url: URL, call: number) => Response | Promise<Respons
   });
   return { calls };
 }
+
+/** A gate: what waits on `opens` goes on when `open` is called. */
+function gate() {
+  let open: () => void = () => {};
+  const opens = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { opens, open: () => open() };
+}
+
+/** Lets what is under way finish, for a test that looks for something that must not happen. */
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 50));
 
 beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -259,6 +272,51 @@ test("directory_says_so_when_no_agent_has_the_tag_and_keeps_the_filter", async (
   expect(screen.getByRole("link", { name: "All" }).getAttribute("href")).toBe("/agents");
 });
 
+test("directory_says_back_only_what_is_a_tag", async () => {
+  fakeApi(() => agentsPage([alice, carol, judge]));
+  const tags: Array<[string, string]> = [
+    // A tag as the board takes it is said back, in the case it is written in.
+    ["nothing", "No agent has the tag nothing."],
+    ["Nothing", "No agent has the tag nothing."],
+    ["z".repeat(24), `No agent has the tag ${"z".repeat(24)}.`],
+    // The address can hold anything else, of any length, and none of it is said back.
+    ["z".repeat(25), "No agent has that tag."],
+    ["x".repeat(200), "No agent has that tag."],
+    ["<b>bold</b>", "No agent has that tag."],
+    ["two words", "No agent has that tag."],
+    ["under_score", "No agent has that tag."],
+  ];
+
+  for (const [tag, said] of tags) {
+    search.current = new URLSearchParams({ tag });
+    const { unmount } = render(<AgentDirectory />);
+
+    const line = await screen.findByTestId("no-agents");
+
+    expect(line.textContent, tag).toBe(said);
+    // The line breaks wherever it has to, so that nothing in it makes the page wider.
+    expect(line.className, tag).toContain("wrap-anywhere");
+    unmount();
+  }
+});
+
+test("directory_lists_a_tag_an_agent_repeats_each_time_it_is_written", async () => {
+  // The contract checks how many tags there are and what they are made of, not that they differ.
+  fakeApi(() =>
+    agentsPage([agent({ account: "dup.testnet", name: "Dup", tags: ["x", "x", "y"] })]),
+  );
+  render(<AgentDirectory />);
+
+  const [card] = await screen.findAllByTestId("agent-card");
+
+  const chips = within(within(card as HTMLElement).getByLabelText("Tags")).getAllByRole("listitem");
+  expect(chips.map((chip) => chip.textContent)).toEqual(["x", "x", "y"]);
+  // The filter lists a tag once. A repeated key is a warning React writes to the console.
+  const filter = within(screen.getByRole("navigation", { name: "Filter by tag" }));
+  expect(filter.getAllByRole("link").map((link) => link.textContent)).toEqual(["All", "x", "y"]);
+  expect(console.error).not.toHaveBeenCalled();
+});
+
 test("directory_with_no_agents_says_so", async () => {
   fakeApi(() => agentsPage([]));
   render(<AgentDirectory />);
@@ -299,6 +357,43 @@ test("directory_stops_at_its_page_limit_and_says_so", async () => {
   expect(cards).toHaveLength(2);
   expect(api.calls).toHaveLength(2);
   expect(screen.getByTestId("agents-truncated").textContent).toBe("Showing the first 2 agents.");
+});
+
+test("directory_stops_asking_for_pages_when_the_page_is_gone", async () => {
+  const wait = gate();
+  const api = fakeApi(async () => {
+    await wait.opens;
+    // Always another page: left alone, the loop would go on to its limit.
+    return agentsPage([agent({ account: "more.testnet", name: "More" })], "more.testnet");
+  });
+  const view = render(<AgentDirectory />);
+  await waitFor(() => expect(api.calls).toHaveLength(1));
+
+  view.unmount();
+  wait.open();
+  await settle();
+
+  expect(api.calls).toHaveLength(1);
+});
+
+test("directory_stops_the_read_that_a_newer_one_takes_over_from", async () => {
+  // Strict mode starts the read twice and drops the first. Only the second goes on to page two.
+  const api = fakeApi((url) =>
+    url.searchParams.get("cursor") === null ? agentsPage([alice], ALICE) : agentsPage([carol]),
+  );
+  render(
+    <StrictMode>
+      <AgentDirectory />
+    </StrictMode>,
+  );
+
+  expect(await screen.findAllByTestId("agent-card")).toHaveLength(2);
+
+  expect(api.calls).toEqual([
+    "/v1/agents?limit=50",
+    "/v1/agents?limit=50",
+    `/v1/agents?limit=50&cursor=${ALICE}`,
+  ]);
 });
 
 test("directory_failing_says_why_and_a_retry_reads_again", async () => {
@@ -363,7 +458,7 @@ test("agent_page_shows_the_profile_the_recent_entries_and_the_lineage", async ()
   // Where the profile is, and what it hashes to.
   expect(screen.getByText("Registered at block 100")).toBeTruthy();
   expect(
-    screen.getByRole("link", { name: `Open the profile document of ${ALICE}` }).getAttribute("rel"),
+    screen.getByRole("link", { name: `Open profile document of ${ALICE}` }).getAttribute("rel"),
   ).toBe("noopener noreferrer nofollow");
   expect(screen.getByText(`sha256 ${HASH_C}`)).toBeTruthy();
 
@@ -380,17 +475,23 @@ test("agent_page_shows_the_profile_the_recent_entries_and_the_lineage", async ()
   expect(within(entries[0] as HTMLElement).getByTestId("revealed").textContent).toBe(
     "Revealed: no",
   );
-  expect(within(entries[0] as HTMLElement).getByTestId("won").textContent).toBe("Won: no");
+  // The task is open: nobody has been picked, so "no" would read as a loss.
+  expect(within(entries[0] as HTMLElement).getByTestId("won").textContent).toBe(
+    "Won: not decided yet",
+  );
   expect(within(entries[1] as HTMLElement).getByTestId("phase-chip").textContent).toBe("Settled");
   expect(within(entries[1] as HTMLElement).getByTestId("revealed").textContent).toBe(
     "Revealed: yes",
   );
   expect(within(entries[1] as HTMLElement).getByTestId("won").textContent).toBe("Won: yes");
-  // A task with no public brief has no title to show: its number stands in.
+  // A task with no public brief has no title to show: its number stands in. It expired with no
+  // pick, which is decided: the agent did not win it.
   expect(within(entries[2] as HTMLElement).getByRole("link").textContent).toBe("Task #9");
+  expect(within(entries[2] as HTMLElement).getByTestId("won").textContent).toBe("Won: no");
 
   // The tasks it posted, each with the task it is a subtask of, if it is one.
   const lineage = await screen.findAllByTestId("lineage-task");
+  expect(screen.getByRole("heading", { level: 2, name: "Tasks it posted" })).toBeTruthy();
   expect(lineage).toHaveLength(2);
   expect(lineage[0]?.textContent).toContain("Check every rule of the account id");
   expect(within(lineage[0] as HTMLElement).getByTestId("phase-chip").textContent).toBe("Revealing");
@@ -404,6 +505,41 @@ test("agent_page_shows_the_profile_the_recent_entries_and_the_lineage", async ()
 
   // The agent is read first, and its tasks after it, by its account.
   expect(api.calls).toEqual([`/v1/agents/${ALICE}`, `/v1/tasks?poster=${ALICE}&limit=50`]);
+});
+
+test("agent_page_does_not_call_a_task_nobody_has_picked_a_loss", async () => {
+  const entry = (task_id: string, phase: Phase, won = false) => ({
+    task_id,
+    title: `A task that is ${phase}`,
+    phase,
+    revealed: true,
+    won,
+  });
+  fakeApi(
+    routes(alice, () => tasksPage([]), [
+      entry("1", "open"),
+      entry("2", "revealing"),
+      entry("3", "judging"),
+      entry("4", "fallback"),
+      entry("5", "expired"),
+      entry("6", "settled"),
+      entry("7", "settled", true),
+    ]),
+  );
+  render(<AgentView account={ALICE} />);
+
+  await screen.findAllByTestId("recent-entry");
+
+  // The API's `won` is false until a pick, so only a task with its outcome says "no".
+  expect(screen.getAllByTestId("won").map((won) => won.textContent)).toEqual([
+    "Won: not decided yet",
+    "Won: not decided yet",
+    "Won: not decided yet",
+    "Won: not decided yet",
+    "Won: no",
+    "Won: no",
+    "Won: yes",
+  ]);
 });
 
 test("agent_page_marks_an_agent_the_team_runs", async () => {
@@ -515,7 +651,7 @@ test("agent_page_links_a_profile_only_if_it_is_a_web_address", async () => {
 
   await screen.findByRole("heading", { level: 1 });
 
-  expect(screen.queryByRole("link", { name: /Open the profile document/ })).toBeNull();
+  expect(screen.queryByRole("link", { name: /Open profile document/ })).toBeNull();
   expect(
     screen.getByText("Profile address (not a web link): javascript:alert(document.cookie)"),
   ).toBeTruthy();
@@ -531,7 +667,7 @@ test("agent_page_links_a_profile_only_if_it_is_a_web_address", async () => {
   );
   render(<AgentView account={ALICE} />);
   await screen.findByRole("heading", { level: 1 });
-  expect(screen.queryByRole("link", { name: /Open the profile document/ })).toBeNull();
+  expect(screen.queryByRole("link", { name: /Open profile document/ })).toBeNull();
 });
 
 test("agent_page_shows_what_the_agent_wrote_as_text", async () => {

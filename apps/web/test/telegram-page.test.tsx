@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { SIGN_IN_MESSAGE } from "@tender/shared";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { TelegramView } from "../components/TelegramView";
@@ -20,7 +20,9 @@ const ALICE = "alice.testnet";
 const BOB = "bob.testnet";
 const CODE = "q3Zk_8-nP0aXw2YtLmB5Rg";
 const LINK = `https://t.me/tender_bot?start=${CODE}`;
-const EXPIRES = "2026-10-30T12:10:00.000Z";
+// A link is made for now: the page says it has expired once the clock is past this, so a fixed date
+// would be a link that has run out by the time a test reads it.
+const EXPIRES = new Date(Date.now() + 60 * 60_000).toISOString();
 const NONCE = btoa(String.fromCharCode(...Array.from({ length: 32 }, (_, i) => i + 1)));
 const CHALLENGE = {
   nonce: NONCE,
@@ -43,6 +45,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   clearApiToken();
@@ -164,9 +167,9 @@ test("telegram_page_explains_the_alerts_in_three_lines_and_asks_nothing_when_sig
   expect(screen.queryByRole("button", { name: "Link Telegram" })).toBeNull();
   const lines = within(screen.getByTestId("alert-lines")).getAllByRole("listitem");
   expect(lines).toHaveLength(3);
-  expect(lines[0]?.textContent).toMatch(/Telegram message/);
+  expect(lines[0]?.textContent).toMatch(/messages about tasks you posted or your agents entered/);
   expect(lines[1]?.textContent).toMatch(/\/watch research/);
-  expect(lines[2]?.textContent).toMatch(/sign a message/);
+  expect(lines[2]?.textContent).toMatch(/signs a message: no transaction, no fee/);
   // Nothing is signed or asked of the API, and no state of a link is claimed, until it is pressed.
   expect(api.requests).toEqual([]);
   expect(screen.queryByTestId("link-state")).toBeNull();
@@ -267,6 +270,10 @@ test("a_wallet_that_cannot_sign_gets_words_and_a_button_that_does_nothing", asyn
   const note = await screen.findByTestId("cannot-sign");
   expect(note.textContent).toBe(WALLET_CANNOT_SIGN_MESSAGE);
   expect(note.getAttribute("role")).toBe("status");
+  // The wallet page is where the wallet is disconnected, to connect another.
+  expect(
+    screen.getByRole("link", { name: "Disconnect it on the Wallet page" }).getAttribute("href"),
+  ).toBe("/wallet");
   const link = await button("Link Telegram");
   expect(link.getAttribute("aria-disabled")).toBe("true");
   await user.click(link);
@@ -283,7 +290,48 @@ test("a_wallet_that_can_sign_is_not_told_it_cannot", async () => {
   await openConnected();
 
   expect(screen.queryByTestId("cannot-sign")).toBeNull();
+  expect(screen.queryByRole("link", { name: /Wallet page/ })).toBeNull();
   expect((await button("Link Telegram")).getAttribute("aria-disabled")).toBe("false");
+});
+
+// ---- A link that runs out ---------------------------------------------------------------------
+
+test("a_link_says_it_has_expired_once_its_time_has_passed_and_is_not_offered_any_more", async () => {
+  // Only the clock is pinned: the timers the page and the Testing Library wait on stay real.
+  vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+  vi.setSystemTime(new Date("2026-10-30T12:00:00.000Z"));
+  // The first link works for ten minutes, as the API's do, and the second one is made later.
+  const api = fakeApi((call) =>
+    json({
+      url: LINK,
+      expires_at: call === 1 ? "2026-10-30T12:10:00.000Z" : "2026-10-30T12:20:30.000Z",
+    }),
+  );
+  const { user, open } = await openConnected();
+
+  await user.click(await button("Link Telegram"));
+  const state = await screen.findByTestId("link-state");
+  expect(state.textContent).toMatch(/^Your link is made\. It works once, until /);
+  expect(within(state).getByRole("link", { name: "Open Telegram" })).toBeTruthy();
+
+  // A second before it runs out it still works.
+  await act(() => vi.advanceTimersByTimeAsync(9 * 60_000 + 59_000));
+  expect(screen.getByTestId("link-state").textContent).toMatch(/It works once/);
+  expect(screen.getByRole("link", { name: "Open Telegram" })).toBeTruthy();
+
+  // Past its time the box says so, and there is no link left in it to open.
+  await act(() => vi.advanceTimersByTimeAsync(2_000));
+  const expired = screen.getByTestId("link-state");
+  expect(expired.textContent).toBe("That link has expired. Press Link Telegram for a new one.");
+  expect(within(expired).queryByRole("link")).toBeNull();
+  expect(expired.querySelector("time")).toBeNull();
+
+  // Pressing the button makes a new link, and that one is offered.
+  expect(open).toHaveBeenCalledTimes(1);
+  await user.click(await button("Link Telegram"));
+  await waitFor(() => expect(open).toHaveBeenCalledTimes(2));
+  expect(api.links()).toBe(2);
+  expect(screen.getByTestId("link-state").textContent).toMatch(/^Your link is made/);
 });
 
 // ---- A link that is not a Telegram link -----------------------------------------------------
@@ -458,6 +506,28 @@ test("a_wallet_that_is_disconnected_while_the_api_answers_gets_no_link", async (
   expect(open).not.toHaveBeenCalled();
   expect(screen.queryByTestId("link-state")).toBeNull();
   expect(screen.queryByTestId("link-error")).toBeNull();
+  expect(consoleText()).not.toContain(CODE);
+});
+
+test("a_press_that_ends_after_the_person_has_left_the_page_opens_nothing", async () => {
+  const wait = gate();
+  let answered = false;
+  const api = fakeApi(async () => {
+    await wait.opens;
+    answered = true;
+    return made();
+  });
+  const { user, open } = await openConnected();
+  await user.click(await button("Link Telegram"));
+  await waitFor(() => expect(api.links()).toBe(1));
+
+  // The person leaves while the API is still answering, and the answer comes after they have gone.
+  cleanup();
+  wait.open();
+  await waitFor(() => expect(answered).toBe(true));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  expect(open).not.toHaveBeenCalled();
   expect(consoleText()).not.toContain(CODE);
 });
 

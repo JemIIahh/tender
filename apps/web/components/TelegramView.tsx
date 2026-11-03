@@ -1,9 +1,11 @@
 "use client";
 
 import { ApiError, type TelegramLinkResponse } from "@tender/shared";
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { useApiToken } from "../lib/auth";
+import { useNowNs } from "../lib/clock";
 import { TelegramLinkRefused, telegramLinkMessage, telegramStartUrl } from "../lib/telegram";
 import { useWallet } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErrors";
@@ -40,6 +42,40 @@ function timeOf(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+/**
+ * Where a made link stands. It works once, until the time the API gave, and the box says until
+ * when. Past that time it says the link is dead and offers no way to open it. The clock ticks only
+ * while the box is on the page.
+ */
+function LinkState({ link }: { link: MadeLink }) {
+  const now = useNowNs();
+  const expired = Date.parse(link.expiresAt) <= Number(now / 1_000_000n);
+  return (
+    <div
+      role="status"
+      data-testid="link-state"
+      className="grid gap-1 rounded border border-neutral-900 p-3 text-sm"
+    >
+      {expired ? (
+        <p>That link has expired. Press Link Telegram for a new one.</p>
+      ) : (
+        <>
+          <p>
+            Your link is made. It works once, until{" "}
+            <time dateTime={link.expiresAt}>{timeOf(link.expiresAt)}</time>.
+          </p>
+          <p>
+            <a href={link.url} target="_blank" rel="noopener noreferrer" className="underline">
+              Open Telegram
+            </a>{" "}
+            if it did not open by itself, and press Start there.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 export function TelegramView() {
   const { ready, accountId, canSignMessage, connect } = useWallet();
   const { token, signIn } = useApiToken();
@@ -49,9 +85,16 @@ export function TelegramView() {
   // Set at once when the button is pressed, where `running` is only set for the next render: a
   // second press before then must not start a second sign-in.
   const busy = useRef(false);
-  // The account the page is for as of the latest render: for an answer that comes after the person
-  // has disconnected or changed wallet.
+  // Whether the page is still on screen, and which account it is for as of the latest render: for
+  // an answer that comes after the person has left, disconnected or changed wallet.
+  const mounted = useRef(false);
   const shown = useRef(accountId);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   useEffect(() => {
     shown.current = accountId;
   });
@@ -101,9 +144,10 @@ export function TelegramView() {
     const account = accountId;
     try {
       const answer = await requestLink();
-      // The wallet can be disconnected, or changed, while the API answers. The link is for the
-      // account that asked, and it is not opened for a page that is no longer that account's.
-      if (shown.current !== account) return;
+      // The person can leave the page, or disconnect the wallet, or change it, while the API
+      // answers. The link is for the account that asked, on the page that asked: it is not opened
+      // for a page that is gone or is no longer that account's.
+      if (!mounted.current || shown.current !== account) return;
       const url = telegramStartUrl(answer.url);
       if (url === null) throw new TelegramLinkRefused();
       setMade({ account, value: { url, expiresAt: answer.expires_at } });
@@ -122,17 +166,9 @@ export function TelegramView() {
       <h1 className="text-2xl font-semibold">Telegram alerts</h1>
 
       <ul data-testid="alert-lines" className="grid list-disc gap-2 pl-5">
-        <li>
-          Get a Telegram message when a task you posted, or one your agents entered, has news: new
-          entries, reveals opening, winners paid.
-        </li>
-        <li>
-          In the chat, send /watch and a tag, like /watch research, to hear about new tasks with
-          that tag.
-        </li>
-        <li>
-          Linking asks your wallet to sign a message. It costs nothing and sends no transaction.
-        </li>
+        <li>Get messages about tasks you posted or your agents entered.</li>
+        <li>Send /watch research in the chat for new tasks with that tag.</li>
+        <li>Your wallet signs a message: no transaction, no fee.</li>
       </ul>
 
       <section className="grid gap-2">
@@ -151,9 +187,17 @@ export function TelegramView() {
               </p>
             )}
             {stuck ? (
-              <p role="status" data-testid="cannot-sign" className="text-sm">
-                {WALLET_CANNOT_SIGN_MESSAGE}
-              </p>
+              <div className="grid gap-1 text-sm">
+                <p role="status" data-testid="cannot-sign">
+                  {WALLET_CANNOT_SIGN_MESSAGE}
+                </p>
+                {/* The wallet page is where Disconnect is. */}
+                <p>
+                  <Link href="/wallet" className="underline">
+                    Disconnect it on the Wallet page
+                  </Link>
+                </p>
+              </div>
             ) : null}
             {/* One button, whose words follow the step. It is the same element from one step to
                 the next, so the keyboard focus stays on it when the wallet connects. `aria-disabled`
@@ -185,24 +229,7 @@ export function TelegramView() {
           </p>
         )}
 
-        {link === null ? null : (
-          <div
-            role="status"
-            data-testid="link-state"
-            className="grid gap-1 rounded border border-neutral-900 p-3 text-sm"
-          >
-            <p>
-              Your link is made. It works once, until{" "}
-              <time dateTime={link.expiresAt}>{timeOf(link.expiresAt)}</time>.
-            </p>
-            <p>
-              <a href={link.url} target="_blank" rel="noopener noreferrer" className="underline">
-                Open Telegram
-              </a>{" "}
-              if it did not open by itself, and press Start there.
-            </p>
-          </div>
-        )}
+        {link === null ? null : <LinkState link={link} />}
       </section>
     </div>
   );

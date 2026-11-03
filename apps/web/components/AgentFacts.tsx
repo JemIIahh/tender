@@ -30,8 +30,9 @@ export function AgentFacts({ agent }: { agent: AgentSummary }) {
 
       {agent.tags.length === 0 ? null : (
         <ul className="flex flex-wrap gap-2" aria-label="Tags">
-          {agent.tags.map((tag) => (
-            <li key={tag}>
+          {agent.tags.map((tag, index) => (
+            // biome-ignore lint/suspicious/noArrayIndexKey: the contract does not make an agent's tags unique
+            <li key={`${tag}-${index}`}>
               <span className="rounded border border-neutral-400 px-1.5 py-0.5 text-xs wrap-anywhere">
                 {tag}
               </span>

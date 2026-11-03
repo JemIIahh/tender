@@ -117,13 +117,15 @@ test("agent_page_lists_recent_entries", async ({ page }) => {
   await expect(entries.nth(0)).toContainText(REGEX_TITLE);
   await expect(entries.nth(0).getByTestId("phase-chip")).toHaveText("Open");
   await expect(entries.nth(0).getByTestId("revealed")).toHaveText("Revealed: no");
-  await expect(entries.nth(0).getByTestId("won")).toHaveText("Won: no");
+  // The task is open and nobody has been picked: "no" would read as a loss.
+  await expect(entries.nth(0).getByTestId("won")).toHaveText("Won: not decided yet");
   await expect(entries.nth(1)).toContainText("Extract fields from an invoice");
   await expect(entries.nth(1).getByTestId("phase-chip")).toHaveText("Settled");
   await expect(entries.nth(1).getByTestId("revealed")).toHaveText("Revealed: yes");
   await expect(entries.nth(1).getByTestId("won")).toHaveText("Won: yes");
-  // A task with no public brief has no title to show.
+  // A task with no public brief has no title to show. It expired with no pick: decided, not won.
   await expect(entries.nth(2).getByRole("link")).toHaveText("Task #9");
+  await expect(entries.nth(2).getByTestId("won")).toHaveText("Won: no");
 
   // The tasks it posted, and which of them are subtasks of another.
   const lineage = page.getByTestId("lineage-task");
@@ -254,6 +256,10 @@ test("telegram_button_is_disabled_for_a_wallet_that_cannot_sign", async ({ page 
     "This wallet can't sign messages. Switch wallet to post tasks or link Telegram.",
   );
   const button = page.getByRole("button", { name: "Link Telegram" });
+  // The way to another wallet: the wallet page, where Disconnect is.
+  await expect(
+    page.getByRole("link", { name: "Disconnect it on the Wallet page" }),
+  ).toHaveAttribute("href", "/wallet");
   await expect(button).toHaveAttribute("aria-disabled", "true");
   // Playwright treats `aria-disabled` as disabled and would wait: `force` presses it as a person can.
   await button.click({ force: true });
@@ -326,6 +332,14 @@ test("agents_and_telegram_pages_fit_a_phone_and_show_the_keyboard_focus", async 
   await page.goto(`/agents?tag=${"a".repeat(24)}`);
   await expect(cards(page)).toHaveCount(1);
   await expectToFit(page, "/agents?tag=<the longest tag>");
+  // An address can hold any text. What is no tag is not said back, and nothing in the line makes
+  // the page wider; a tag nobody has is said back.
+  await page.goto(`/agents?tag=${"x".repeat(200)}`);
+  await expect(page.getByTestId("no-agents")).toHaveText("No agent has that tag.");
+  await expectToFit(page, "/agents?tag=<200 characters>");
+  await page.goto(`/agents?tag=${"z".repeat(24)}`);
+  await expect(page.getByTestId("no-agents")).toHaveText(`No agent has the tag ${"z".repeat(24)}.`);
+  await expectToFit(page, "/agents?tag=<24 characters nobody has>");
   await page.goto(`/agents/${WIDE}`);
   await expect(page.getByTestId("recent-entry")).toHaveCount(1);
   await expect(page.getByTestId("lineage-task")).toHaveCount(1);

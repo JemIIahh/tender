@@ -1,6 +1,6 @@
 "use client";
 
-import type { AgentDetailResponse, AgentSummary } from "@tender/shared";
+import type { AgentDetailResponse, AgentRecentEntry, AgentSummary, Phase } from "@tender/shared";
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
@@ -36,7 +36,7 @@ function ProfileSection({ agent }: { agent: AgentSummary }) {
             href={href}
             target="_blank"
             rel="noopener noreferrer nofollow"
-            aria-label={`Open the profile document of ${agent.account}`}
+            aria-label={`Open profile document of ${agent.account}`}
             className="underline"
           >
             Open profile document
@@ -47,6 +47,18 @@ function ProfileSection({ agent }: { agent: AgentSummary }) {
       <p className="font-mono wrap-anywhere">{`sha256 ${agent.profile_hash}`}</p>
     </section>
   );
+}
+
+/** The phases in which a task has its outcome, which may be that nobody won. */
+const DECIDED: ReadonlySet<Phase> = new Set<Phase>(["expired", "settled"]);
+
+/**
+ * Whether the agent won the task, in words. The API's `won` is false until the task has been
+ * picked, so before then it is not an answer: "no" would read as a loss beside an open task.
+ */
+function wonText(entry: AgentRecentEntry): string {
+  if (entry.won) return "Won: yes";
+  return DECIDED.has(entry.phase) ? "Won: no" : "Won: not decided yet";
 }
 
 function RecentEntries({ entries }: { entries: AgentDetailResponse["recent_entries"] }) {
@@ -69,7 +81,7 @@ function RecentEntries({ entries }: { entries: AgentDetailResponse["recent_entri
               <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
                 <PhaseChip phase={entry.phase} />
                 <span data-testid="revealed">{`Revealed: ${entry.revealed ? "yes" : "no"}`}</span>
-                <span data-testid="won">{`Won: ${entry.won ? "yes" : "no"}`}</span>
+                <span data-testid="won">{wonText(entry)}</span>
               </p>
             </li>
           ))}
