@@ -397,6 +397,7 @@ mod tests {
             bond: None,
             unregistering_since: 0,
             claimable_at: 0,
+            locked_until: 0,
         };
         // Pad the URI until the record's Borsh value is exactly `value_len` bytes.
         let fixed = borsh::to_vec(&p).unwrap().len();

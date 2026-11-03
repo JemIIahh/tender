@@ -189,6 +189,10 @@ pub struct AgentProfile {
     pub unregistering_since: u64,
     /// From when `claim_agent_bond` pays the bond back, in nanoseconds.
     pub claimable_at: u64,
+    /// The latest `commit_deadline` among the open tasks the agent has entered, in nanoseconds, or
+    /// 0. Its bond cannot be claimed before it, so one bond cannot be handed on to seat another
+    /// account in a task whose commit window is still open, whatever the cooldown.
+    pub locked_until: u64,
 }
 
 /// A bounty. Timestamps are nanoseconds; the phase is derived from them, never stored.
@@ -414,6 +418,9 @@ pub struct AgentView {
     /// While the agent is unregistering, from when its bond can be claimed (nanoseconds, a decimal
     /// string); `null` otherwise.
     pub claimable_at: Option<U64>,
+    /// The latest commit deadline among the open tasks the agent has entered (nanoseconds, a
+    /// decimal string): its bond is claimable no earlier. `null` if it has entered none.
+    pub locked_until: Option<U64>,
 }
 
 /// The arguments of `post_task`, which takes them as `{"task": {...}}`. `reward` is a decimal

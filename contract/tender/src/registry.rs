@@ -103,6 +103,7 @@ impl AgentProfile {
             bond_amount: self.bond.as_ref().map(|b| U128(b.amount)),
             claimable_at: (self.status == AgentStatus::Unregistering)
                 .then_some(U64(self.claimable_at)),
+            locked_until: (self.locked_until > 0).then_some(U64(self.locked_until)),
         }
     }
 }
@@ -126,7 +127,9 @@ impl Tender {
     /// The first registration, and the one that brings a retired agent back, take the bond in
     /// force (`set_agent_bond`) from the caller's vault, if the owner has set one, and record it
     /// on the agent: that is what `claim_agent_bond` pays back, whatever the bond is by then. The
-    /// agent is active from then on. An active agent's update takes no second bond.
+    /// agent is active from then on. An active agent's update takes no second bond, but an active
+    /// agent that registered before the owner set any bond holds none, and its next registration
+    /// takes it: until then it enters only pinned tasks (see `commit`).
     ///
     /// The caller pays for the profile out of its storage balance, so it must have called
     /// `storage_deposit`. An update is charged only for growth, and gives back what it shrank by.
@@ -144,19 +147,24 @@ impl Tender {
         check_tags(&tags);
 
         let caller = env::predecessor_account_id();
-        let status = self.agents.get(&caller).map(|profile| profile.status);
-        if status == Some(AgentStatus::Unregistering) {
+        let found = self
+            .agents
+            .get(&caller)
+            .map(|profile| (profile.status, profile.bond.is_some()));
+        if matches!(found, Some((AgentStatus::Unregistering, _))) {
             env::panic_str(&format!(
                 "{}: {caller} is unregistering; claim its bond with claim_agent_bond, then \
                  register again",
                 err::E_PHASE
             ));
         }
-        // A new agent, or a retired one coming back, pays the bond in force. An active one has
-        // paid already.
-        let bond = match status {
-            None | Some(AgentStatus::Retired) => self.agent_bond.clone(),
-            Some(AgentStatus::Active | AgentStatus::Unregistering) => None,
+        // A new agent, a retired one coming back, and an active one that registered before the
+        // owner set any bond pay the bond in force. An active one that holds a bond has paid.
+        let bond = match found {
+            None | Some((AgentStatus::Retired, _)) | Some((AgentStatus::Active, false)) => {
+                self.agent_bond.clone()
+            }
+            Some((AgentStatus::Active, true)) | Some((AgentStatus::Unregistering, _)) => None,
         };
 
         let before = self.storage_mark();
@@ -171,10 +179,10 @@ impl Tender {
                 profile.profile_uri = profile_uri.clone();
                 profile.profile_hash = hash;
                 profile.tags = tags.clone();
-                if profile.status == AgentStatus::Retired {
-                    profile.status = AgentStatus::Active;
+                if bond.is_some() {
                     profile.bond = bond.clone();
                 }
+                profile.status = AgentStatus::Active;
                 (profile.asp.clone(), true)
             }
             None => {
@@ -197,6 +205,7 @@ impl Tender {
                         bond: bond.clone(),
                         unregistering_since: 0,
                         claimable_at: 0,
+                        locked_until: 0,
                     },
                 );
                 (asp, false)
@@ -227,9 +236,10 @@ impl Tender {
     }
 
     /// Starts the caller's way out: from now on it can make no new entry in an open task, nor
-    /// replace one, and from `claimable_at`, the block time plus the cooldown in force
-    /// (`set_agent_bond_cooldown`), `claim_agent_bond` pays its bond back. Requires exactly 1
-    /// yoctoNEAR.
+    /// replace one, and from `claimable_at` on `claim_agent_bond` pays its bond back.
+    /// `claimable_at` is the block time plus the cooldown in force (`set_agent_bond_cooldown`),
+    /// or the agent's `locked_until`, the latest commit deadline of the open tasks it entered, if
+    /// that is later. Requires exactly 1 yoctoNEAR.
     ///
     /// Nothing else changes for it. The entries it has made stand: it can reveal them, be picked
     /// and be paid, so no valid entry is stranded. It still enters a task that invites it, since
@@ -246,8 +256,7 @@ impl Tender {
         let caller = env::predecessor_account_id();
         let now = env::block_timestamp();
         // At most 56 days of nanoseconds, so this cannot overflow.
-        let claimable_at =
-            now.saturating_add(self.agent_bond_cooldown_secs.saturating_mul(NS_PER_SEC));
+        let cooled = now.saturating_add(self.agent_bond_cooldown_secs.saturating_mul(NS_PER_SEC));
         let before = self.storage_mark();
         let Some(profile) = self.agents.get_mut(&caller) else {
             not_registered(&caller, "is not a registered agent")
@@ -261,6 +270,9 @@ impl Tender {
             )),
             AgentStatus::Retired => not_registered(&caller, "has retired; register it first"),
         }
+        // Not before the commit window of any open task it entered has closed, so its bond cannot
+        // seat another account there (it can make no new open entry from now on).
+        let claimable_at = cooled.max(profile.locked_until);
         profile.status = AgentStatus::Unregistering;
         profile.unregistering_since = now;
         profile.claimable_at = claimable_at;
@@ -345,11 +357,21 @@ impl Tender {
 
 impl Tender {
     /// Whether `account` is a registered agent that is active: registered, not unregistering and
-    /// not retired. Only such an agent may enter an open task.
+    /// not retired.
     pub(crate) fn is_active_agent(&self, account: &AccountId) -> bool {
         self.agents
             .get(account)
             .is_some_and(|profile| profile.status == AgentStatus::Active)
+    }
+
+    /// Whether `account` may enter an open task: it is an active agent and, once the owner has
+    /// set a bond, it holds one. An agent that registered before the first bond holds none, and
+    /// pays it at its next `register_agent`; until then only pinned tasks take its entries.
+    pub(crate) fn may_enter_open_tasks(&self, account: &AccountId) -> bool {
+        self.agents.get(account).is_some_and(|profile| {
+            profile.status == AgentStatus::Active
+                && (profile.bond.is_some() || self.agent_bond.is_none())
+        })
     }
 
     /// Runs `f` on the profile of `account`. It does nothing, and `f` does not run, if `account`
@@ -565,6 +587,7 @@ mod tests {
                 bond_token: None,
                 bond_amount: None,
                 claimable_at: None,
+                locked_until: None,
             })
         );
     }
@@ -607,7 +630,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&t.get_agent(bot).unwrap()).unwrap(),
             format!(
-                r#"{{"account":"bot1.acme.near","asp":"acme.near","profile_uri":"{URI}","profile_hash":"{HASH}","tags":["research"],"registered_at":"1793028278935742660","entries":3,"reveals":2,"wins":1,"earned":[{{"token":"usdc.test","amount":"340282366920938463463374607431768211455"}}],"picks_made":4,"voids_after_reveals":1,"status":"active","bond_token":null,"bond_amount":null,"claimable_at":null}}"#
+                r#"{{"account":"bot1.acme.near","asp":"acme.near","profile_uri":"{URI}","profile_hash":"{HASH}","tags":["research"],"registered_at":"1793028278935742660","entries":3,"reveals":2,"wins":1,"earned":[{{"token":"usdc.test","amount":"340282366920938463463374607431768211455"}}],"picks_made":4,"voids_after_reveals":1,"status":"active","bond_token":null,"bond_amount":null,"claimable_at":null,"locked_until":null}}"#
             )
         );
     }
@@ -1425,29 +1448,77 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_registered_before_any_bond_has_none_to_claim() {
-        // No bond is set: registering takes nothing, and the agent stays bond-free after the
-        // owner sets one.
+    fn an_agent_registered_before_any_bond_pays_it_at_its_next_registration() {
+        // Independent review M2 / Task 16b review I1. No bond is set: registering takes nothing.
         let mut t = world(&[OWNER, "alice.near"]);
         as_owner(&mut t, |t| set_token(t, USDC));
         ok(try_register_at(&mut t, "alice.near", T1), "registration");
         assert_eq!(profile(&t, "alice.near").bond, None);
+        assert!(
+            t.may_enter_open_tasks(&acct("alice.near")),
+            "no bond is set yet"
+        );
+        // Once the owner sets one, the bond-free agent may not enter open tasks until it holds
+        // it, and its next registration takes it: without the bond in its vault, it is refused.
         as_owner(&mut t, |t| t.set_agent_bond(acct(USDC), U128(BOND)));
-        ok(try_register_at(&mut t, "alice.near", T1), "an update");
+        assert!(!t.may_enter_open_tasks(&acct("alice.near")));
+        assert_rejected(
+            try_register_at(&mut t, "alice.near", T1 + SEC),
+            "E_FUNDS",
+            "an update without the bond",
+        );
         assert_eq!(profile(&t, "alice.near").bond, None);
-        // It leaves the usual way, with the cooldown in force, and the claim only retires it.
+        fund(&mut t, USDC, "alice.near", BOND + 3);
+        ok(
+            try_register_at(&mut t, "alice.near", T1 + SEC),
+            "an update with the bond",
+        );
+        assert_eq!(
+            get_logs(),
+            [
+                event(&format!(
+                    r#"{{"account":"alice.near","asp":null,"profile_uri":"{URI}","profile_hash":"{HASH}","tags":[],"updated":true}}"#
+                )),
+                named_event(
+                    "agent_bonded",
+                    r#"{"account":"alice.near","token":"usdc.test","amount":"5000000"}"#
+                ),
+            ]
+        );
+        let p = profile(&t, "alice.near");
+        assert_eq!((p.status, p.bond), (AgentStatus::Active, usdc_bond(BOND)));
+        assert_eq!(p.registered_at, T1, "still the first registration");
+        assert_eq!(vault(&t, "alice.near"), 3);
+        assert!(t.may_enter_open_tasks(&acct("alice.near")));
+        // That was its first bond, so the update after it takes none.
+        ok(
+            try_register_at(&mut t, "alice.near", T1 + 2 * SEC),
+            "a later update",
+        );
+        assert_eq!(vault(&t, "alice.near"), 3);
+        // It leaves the usual way, with the cooldown in force, and gets the bond back.
         ok(try_unregister(&mut t, "alice.near", T1), "unregistering");
         let due = T1 + 1_209_600 * SEC;
         assert_rejected(try_claim(&mut t, "alice.near", due - 1), "E_PHASE", "early");
         ok(try_claim(&mut t, "alice.near", due), "claiming");
+        assert_eq!(vault(&t, "alice.near"), BOND + 3);
+    }
+
+    #[test]
+    fn a_bond_free_agent_can_still_leave() {
+        // A bond-free agent that never pays the bond set after it registered still unregisters
+        // and retires; the claim pays nothing, since the contract holds nothing for it.
+        let mut t = world(&[OWNER, "alice.near"]);
+        as_owner(&mut t, |t| set_token(t, USDC));
+        ok(try_register_at(&mut t, "alice.near", T1), "registration");
+        as_owner(&mut t, |t| t.set_agent_bond(acct(USDC), U128(BOND)));
+        ok(try_unregister(&mut t, "alice.near", T1), "unregistering");
+        ok(
+            try_claim(&mut t, "alice.near", T1 + 1_209_600 * SEC),
+            "claiming",
+        );
         assert_eq!(profile(&t, "alice.near").status, AgentStatus::Retired);
         assert_eq!(vault(&t, "alice.near"), 0);
-        // Coming back costs the bond that is set now, which alice does not hold.
-        assert_rejected(
-            try_register_at(&mut t, "alice.near", due),
-            "E_FUNDS",
-            "coming back without the bond",
-        );
     }
 
     #[test]
