@@ -103,10 +103,17 @@ impl Tender {
         let account = account_id.unwrap_or_else(env::predecessor_account_id);
         let attached = env::attached_deposit().as_yoctonear();
         let registration_only = registration_only.unwrap_or(false);
-        // What the call credits: `None` when it only registers and the account already is.
-        let (view, credited) = match self.storage.get_mut(&account) {
-            Some(record) if registration_only => (record.view(), None),
-            Some(record) => {
+        // What the call credits: `None` when it only registers and the account already is. That
+        // case reads the record without `get_mut`, which would mark it changed and write it back
+        // unchanged.
+        let registered = self.storage.get(&account).map(StorageAccount::view);
+        let (view, credited) = match registered {
+            Some(view) if registration_only => (view, None),
+            Some(_) => {
+                let record = self
+                    .storage
+                    .get_mut(&account)
+                    .unwrap_or_else(|| not_registered());
                 record.deposited += attached;
                 (record.view(), Some(attached))
             }

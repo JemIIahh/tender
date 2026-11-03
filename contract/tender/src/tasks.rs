@@ -6,8 +6,8 @@
 //! to move a task along. Task ids run from 1 with no gaps, so the views page through them by id.
 //!
 //! Until its commit deadline, anyone may add to a task's reward from its own vault with
-//! `top_up_task`, a pooled bounty. The task records each funder and what it paid in, so a void
-//! can give each one back exactly that.
+//! `top_up_task`, a pooled bounty: at least the token's `min_reward` to join, then any amount. The
+//! task records each funder and what it paid in, so a void can give each one back exactly that.
 
 use near_sdk::json_types::{U128, U64};
 use near_sdk::{env, near, AccountId};
@@ -332,8 +332,10 @@ impl Tender {
     /// - the caller funds the task already, or it has fewer than `MAX_FUNDERS` funders, the
     ///   poster among them (`E_LIMIT`);
     /// - the task's token is still enabled (`E_TOKEN`);
-    /// - `amount` is more than 0, and the reward it makes is at most the token's `max_reward` as
-    ///   it is now, and at most `MAX_REWARD_LIMIT` (`E_REWARD`);
+    /// - `amount` is more than 0; it is at least the token's `min_reward` as it is now if the
+    ///   caller does not fund the task yet, which puts a price on taking the funder records (see
+    ///   `topped_up_reward`); and the reward it makes is at most the token's `max_reward` as it is
+    ///   now, and at most `MAX_REWARD_LIMIT` (`E_REWARD`);
     /// - the spend is authorised: 1 yoctoNEAR attached, or no deposit from a delegate key whose
     ///   token is the task's, with `amount` within its caps, which then count it (`E_AUTH`);
     /// - the caller's vault holds `amount` (`E_FUNDS`).
@@ -376,7 +378,7 @@ impl Tender {
             ));
         }
         let token = task.token.clone();
-        let reward = self.topped_up_reward(task, amount);
+        let reward = self.topped_up_reward(task, amount, known.is_none());
 
         // Everything above only reads. The mark comes before the first write, so the storage
         // this call adds is measured from here.
@@ -452,10 +454,18 @@ impl Tender {
     }
 
     /// The reward that topping `task` up by `amount` makes. Panics `E_TOKEN` unless the task's
-    /// token is enabled, then `E_REWARD` unless `amount` is more than 0 and the sum is at most
-    /// both the token's `max_reward` and `MAX_REWARD_LIMIT`, so that the task can still be
-    /// picked. `min_reward` is not checked again: the task met it when it was posted.
-    fn topped_up_reward(&self, task: &Task, amount: u128) -> u128 {
+    /// token is enabled, then `E_REWARD` unless `amount` is more than 0, at least the token's
+    /// `min_reward` for a `new_funder`, and the sum is at most both the token's `max_reward` and
+    /// `MAX_REWARD_LIMIT`, so that the task can still be picked.
+    ///
+    /// The minimum for a new funder puts a price on taking the `MAX_FUNDERS` records, which shuts
+    /// every later funder out of the task: filling them costs at least `min_reward` each, all of
+    /// it in the escrow, where a pick pays it to the winners. It is a price, not a bar. Where
+    /// `min_reward` is 1, as for testnet's free tUSDC, it is no more than the old `amount > 0`; on
+    /// mainnet, at 0.1 USDC, filling the 49 records costs 4.9 USDC. That is griefing, not theft:
+    /// nobody's money is taken or trapped. A funder already in, the poster included, may add any
+    /// amount, since it takes no new record.
+    fn topped_up_reward(&self, task: &Task, amount: u128, new_funder: bool) -> u128 {
         let token = &task.token;
         let Some(limits) = self.tokens.get(token).filter(|c| c.enabled) else {
             env::panic_str(&format!(
@@ -465,6 +475,13 @@ impl Tender {
         };
         if amount == 0 {
             env::panic_str(&format!("{}: a top-up must be more than 0", err::E_REWARD));
+        }
+        if new_funder && amount < limits.min_reward {
+            env::panic_str(&format!(
+                "{}: a first top-up must be at least the token's min_reward of {}, got {amount}",
+                err::E_REWARD,
+                limits.min_reward
+            ));
         }
         let max = limits.max_reward.min(MAX_REWARD_LIMIT);
         task.reward
@@ -2030,7 +2047,7 @@ mod tests {
                 ONE_YOCTO,
                 task.commit_deadline - 1,
                 id,
-                1
+                MIN_REWARD
             ),
             Ok(())
         );
@@ -2124,6 +2141,63 @@ mod tests {
         );
     }
 
+    /// Squatting the funder slots has a price: an account's first top-up of a task must be at
+    /// least the token's `min_reward`, so the 49 slots after the poster's cost at least 49 times
+    /// that, all of it at stake in the task. Once in, a funder may add any amount. With a
+    /// `min_reward` of 1 the price is 49 units, as before the rule.
+    #[test]
+    fn forty_nine_dust_funders_then_a_real_funder() {
+        let mut t = world();
+        let id = post(&mut t, args());
+        // 49 accounts try to take the 49 free slots with one unit each, then with one unit short
+        // of the minimum. Each is refused, and nothing moves.
+        for i in 1..MAX_FUNDERS {
+            let name = format!("dust{i}.test");
+            funder(&mut t, &name, MIN_REWARD);
+            let before = snapshot(&t, id, &name);
+            for dust in [1, MIN_REWARD - 1] {
+                let result = try_top_up_at(&mut t, &name, ONE_YOCTO, T1, id, dust);
+                let what = format!("{name}'s first top-up of {dust}");
+                let message =
+                    assert_top_up_rejected(&t, &what, "E_REWARD", result, (id, &name, &before));
+                assert_eq!(
+                    message,
+                    format!(
+                        "E_REWARD: a first top-up must be at least the token's min_reward of \
+                         {MIN_REWARD}, got {dust}"
+                    )
+                );
+            }
+        }
+        let v = view(&t, id);
+        assert_eq!(v.funders, funders(&[("alice.test", REWARD)]));
+        assert_eq!(v.reward, U128(REWARD));
+
+        // A real funder still gets in, with exactly the minimum...
+        funder(&mut t, "real.test", MIN_REWARD + 1);
+        top_up(&mut t, "real.test", id, MIN_REWARD);
+        // ...and, once a funder, may add dust, as may the poster.
+        top_up(&mut t, "real.test", id, 1);
+        top_up(&mut t, "alice.test", id, 1);
+        assert_eq!(
+            view(&t, id).funders,
+            funders(&[("alice.test", REWARD + 1), ("real.test", MIN_REWARD + 1)])
+        );
+
+        // The dust accounts can still fill the other 48 slots, but only by putting the minimum
+        // each into the task, where a pick pays it to the winners.
+        for i in 1..MAX_FUNDERS - 1 {
+            top_up(&mut t, &format!("dust{i}.test"), id, MIN_REWARD);
+        }
+        let v = view(&t, id);
+        assert_eq!(v.funders.len(), MAX_FUNDERS);
+        assert_eq!(v.reward, U128(REWARD + 1 + 49 * MIN_REWARD + 1));
+        assert_eq!(
+            v.funders.iter().map(|f| f.amount.0).sum::<u128>(),
+            v.reward.0
+        );
+    }
+
     #[test]
     fn top_up_rejects_each_rule() {
         let mut t = world();
@@ -2159,6 +2233,16 @@ mod tests {
 
         let message = check(&mut t, "nothing", "E_REWARD", ONE_YOCTO, id, 0);
         assert_eq!(message, "E_REWARD: a top-up must be more than 0");
+        // bob funds nothing yet, so his first top-up must be at least the minimum.
+        let message = check(&mut t, "dust", "E_REWARD", ONE_YOCTO, id, MIN_REWARD - 1);
+        assert_eq!(
+            message,
+            format!(
+                "E_REWARD: a first top-up must be at least the token's min_reward of {MIN_REWARD}, \
+                 got {}",
+                MIN_REWARD - 1
+            )
+        );
         let past_max = MAX_REWARD - REWARD + 1;
         let message = check(
             &mut t,
@@ -2180,7 +2264,7 @@ mod tests {
             ("2 yoctoNEAR", NearToken::from_yoctonear(2)),
             ("1 NEAR", NearToken::from_near(1)),
         ] {
-            let message = check(&mut t, what, "E_AUTH", deposit, id, 1);
+            let message = check(&mut t, what, "E_AUTH", deposit, id, MIN_REWARD);
             assert_eq!(message, AUTH_MESSAGE, "{what}");
         }
 
@@ -2194,7 +2278,7 @@ mod tests {
         );
         assert_eq!(message, "E_FUNDS: insufficient vault balance");
         let carol = snapshot(&t, id, "carol.test");
-        let result = try_top_up_at(&mut t, "carol.test", ONE_YOCTO, T1, id, 1);
+        let result = try_top_up_at(&mut t, "carol.test", ONE_YOCTO, T1, id, MIN_REWARD);
         let what = "no vault slot";
         assert_top_up_rejected(&t, what, "E_FUNDS", result, (id, "carol.test", &carol));
 
@@ -2221,7 +2305,7 @@ mod tests {
             },
         );
         let before = snapshot(&t, id, "bob.test");
-        let result = try_top_up_at(&mut t, "bob.test", ONE_YOCTO, T1, id, 1);
+        let result = try_top_up_at(&mut t, "bob.test", ONE_YOCTO, T1, id, MIN_REWARD);
         let what = "limits narrowed below the reward";
         assert_top_up_rejected(&t, what, "E_REWARD", result, (id, "bob.test", &before));
         assert_eq!(view(&t, id).reward, U128(REWARD));
@@ -2263,8 +2347,8 @@ mod tests {
         // The task is full: alice and 49 others.
         for i in 1..MAX_FUNDERS {
             let name = format!("funder{i}.test");
-            funder(&mut t, &name, 1);
-            top_up(&mut t, &name, id, 1);
+            funder(&mut t, &name, MIN_REWARD);
+            top_up(&mut t, &name, id, MIN_REWARD);
         }
         // bob holds one unit less than he tops up.
         funder(&mut t, "bob.test", 999);

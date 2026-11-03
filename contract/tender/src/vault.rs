@@ -1047,4 +1047,174 @@ mod tests {
         t.debit(&alice, &usdc, 2);
         assert_eq!(balance(&t, "alice.test"), 3);
     }
+
+    /// I8 under fuzzing: `ft_on_transfer` with random messages, amounts, senders and callers.
+    mod random_deposits {
+        use std::collections::BTreeMap;
+
+        use near_sdk::serde_json::Value;
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// The token that is allowlisted and enabled, one that is allowlisted and disabled, and
+        /// one that is not on the list.
+        const DAI: &str = "dai.test";
+        const EVIL: &str = "evil.test";
+        /// An implicit account: 64 lowercase hex characters.
+        const IMPLICIT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        /// A `msg`: anything at all, or something near the one form a deposit may name a
+        /// beneficiary in, `{"for":"<account>"}`, so that the parser is reached past its first
+        /// byte.
+        fn msg() -> impl Strategy<Value = String> {
+            let fixed = [
+                "",
+                "{}",
+                r#"{"for":"bob.test"}"#,
+                r#"  {"for" : "bob.test" }  "#,
+                r#"{"for":"carol.test"}"#,
+                r#"{"for":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+                r#"{"for":"bob.test","for":"bob.test"}"#,
+                r#"{"for":"bob.test","amount":"1"}"#,
+                r#"{"for":"bob.test"} {"for":"alice.test"}"#,
+                r#"["bob.test"]"#,
+                r#"{"for":["bob.test"]}"#,
+                r#"{"for":null}"#,
+                r#"{"for":7}"#,
+                r#"{"FOR":"bob.test"}"#,
+                r#"{"for":"BOB.TEST"}"#,
+                r#"{"for":"b"}"#,
+                r#"{"for":"bob.test\u0000"}"#,
+                r#"{"for":"bob.test"}"#,
+                "null",
+                "true",
+                "\"bob.test\"",
+                "\u{0}",
+            ];
+            prop_oneof![
+                prop::sample::select(fixed.to_vec()).prop_map(String::from),
+                any::<String>(),
+                "[{}\\[\\]\":, a-z0-9._\\\\-]{0,48}",
+                "[a-z0-9._\\-]{0,70}".prop_map(|id| format!(r#"{{"for":"{id}"}}"#)),
+                any::<String>().prop_map(|id| format!(r#"{{"for":"{id}"}}"#)),
+                (any::<String>(), any::<String>())
+                    .prop_map(|(k, v)| format!(r#"{{"for":"bob.test",{k:?}:{v:?}}}"#)),
+                (1..=20_000usize).prop_map(|n| "{".repeat(n)),
+            ]
+        }
+
+        fn amount() -> impl Strategy<Value = u128> {
+            prop_oneof![Just(0), 1..=1_000u128, any::<u128>(), Just(u128::MAX)]
+        }
+
+        /// alice and bob have a storage balance; carol and the implicit account have none.
+        fn sender() -> impl Strategy<Value = &'static str> {
+            prop::sample::select(vec!["alice.test", "bob.test", "carol.test", IMPLICIT])
+        }
+
+        fn token() -> impl Strategy<Value = &'static str> {
+            prop::sample::select(vec![USDC, USDC, DAI, EVIL])
+        }
+
+        /// 64 cases, or as many as `PROPTEST_CASES` asks for.
+        fn config() -> ProptestConfig {
+            let cases = std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|cases| cases.parse().ok())
+                .unwrap_or(64);
+            ProptestConfig::with_cases(cases)
+        }
+
+        /// The account a credited deposit must have gone to: the sender for an empty `msg`, or
+        /// the account that a `msg` of exactly the form `{"for":"<account>"}` names. `None` for
+        /// any other `msg`, which must never be credited.
+        fn beneficiary(sender: &str, msg: &str) -> Option<AccountId> {
+            if msg.is_empty() {
+                return sender.parse().ok();
+            }
+            let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(msg) else {
+                return None;
+            };
+            match (fields.len(), fields.get("for")) {
+                (1, Some(Value::String(id))) => id.parse().ok(),
+                _ => None,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(config())]
+
+            /// Whatever a token sends, `ft_on_transfer` answers and never panics (I8). It hands
+            /// back all or nothing. It credits a deposit only from the enabled, allowlisted token,
+            /// and only to the sender or the one account a `{"for":...}` names, by exactly the
+            /// amount; a refusal changes no balance and logs nothing.
+            #[test]
+            fn ft_on_transfer_never_panics_on_random_msg(
+                deposits in prop::collection::vec((token(), sender(), amount(), msg()), 1..8),
+            ) {
+                // Each case starts from an empty trie: `testing_env!` keeps the one before it.
+                near_sdk::mock::with_mocked_blockchain(|b| drop(b.take_storage()));
+                let mut t = world();
+                t.put_token(acct(DAI), token_config(false));
+                let watched: Vec<AccountId> = ["alice.test", "bob.test", "carol.test", IMPLICIT]
+                    .into_iter()
+                    .map(acct)
+                    .collect();
+                let mut expected: BTreeMap<AccountId, u128> =
+                    watched.iter().map(|a| (a.clone(), 0)).collect();
+                // Only these two have a storage balance, so only they can ever be credited.
+                let registered = [acct("alice.test"), acct("bob.test")];
+
+                for (token, sender, amount, msg) in deposits {
+                    testing_env!(ctx(token).build());
+                    let mut answer = None;
+                    let panic = panic_message(|| {
+                        answer = Some(t.ft_on_transfer(acct(sender), U128(amount), msg.clone()))
+                    });
+                    prop_assert!(
+                        panic.is_none(),
+                        "I8: ft_on_transfer panicked on {token} {sender} {amount} {msg:?}: {panic:?}"
+                    );
+                    let unused = match answer {
+                        Some(PromiseOrValue::Value(unused)) => unused.0,
+                        _ => return Err(TestCaseError::fail("ft_on_transfer must answer a value")),
+                    };
+                    let credited = amount > 0 && unused == 0;
+                    prop_assert!(
+                        unused == amount || credited,
+                        "{amount} from {sender} with {msg:?}: handed back {unused}, not all or nothing"
+                    );
+                    if credited {
+                        let to = beneficiary(sender, &msg);
+                        prop_assert!(
+                            token == USDC && to.is_some(),
+                            "{token} credited {amount} from {sender} with {msg:?}"
+                        );
+                        let to = to.unwrap();
+                        prop_assert!(
+                            registered.contains(&to),
+                            "{amount} with {msg:?} was credited to {to}, which has no storage"
+                        );
+                        *expected.get_mut(&to).unwrap() += amount;
+                    } else {
+                        prop_assert!(
+                            get_logs().is_empty(),
+                            "a refused deposit logged {:?}", get_logs()
+                        );
+                    }
+                    for account in &watched {
+                        let held = t.balance_of(account.clone(), acct(USDC)).0;
+                        prop_assert_eq!(held, expected[account], "{}'s balance", account);
+                    }
+                }
+                // Nothing reached a vault in a token other than the enabled one.
+                for account in &watched {
+                    for other in [DAI, EVIL] {
+                        prop_assert_eq!(t.balance_of(account.clone(), acct(other)).0, 0);
+                    }
+                }
+            }
+        }
+    }
 }

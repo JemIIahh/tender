@@ -160,6 +160,12 @@ impl Tender {
     /// This does not settle storage. An edit that grows the profile belongs inside a caller's
     /// `storage_mark` and `settle_storage` window, and the caller chooses who pays.
     pub(crate) fn with_profile(&mut self, account: &AccountId, f: impl FnOnce(&mut AgentProfile)) {
+        // `get` first: `get_mut` marks even a miss as changed, and the flush then removes a key
+        // that is not there, which costs gas on every commit, reveal and pick of an account that
+        // never registered, and does nothing else.
+        if self.agents.get(account).is_none() {
+            return;
+        }
         if let Some(profile) = self.agents.get_mut(account) {
             f(profile);
         }

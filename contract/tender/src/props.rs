@@ -20,7 +20,9 @@
 //! that money paid to the wrong account shows, and money in an account the harness does not know
 //! of; that `ft_on_transfer` never panics (I8); that a pick, an empty pick or a void that the
 //! rules allow always goes through, `void_task` from the fallback deadline on among them (I4), and
-//! so do a withdrawal that the balance covers and a top-up that the rules allow; that a task's
+//! so do a withdrawal that the balance covers and a top-up that the rules allow, and that no other
+//! settlement or top-up does; that every rejection panics with an `E_` code, so that a crash
+//! cannot pass for a rule; that a task's
 //! `reveal_count` is its number of reveals; that its funders are the poster and then each account
 //! that topped it up, in that order, each with what it paid in, adding up to its reward, so that
 //! an empty pick or a void refunds each of them exactly that; and that every rejected call leaves
@@ -86,7 +88,10 @@ const SEC: u64 = 1_000_000_000;
 const WINDOW_SECS: u32 = 60;
 /// The largest amount one operation deposits or withdraws.
 const MAX_AMOUNT: u128 = 1_000_000_000;
-/// The token's reward limits are 1 to this: `set_token(TOKEN, 1, 10^30, true)`.
+/// The token's reward limits: `set_token(TOKEN, 10, 10^30, true)`. A minimum above 1 makes the
+/// small amounts the runs draw meet the rule that an account's first top-up of a task is at least
+/// `min_reward`.
+const MIN_REWARD: u128 = 10;
 const MAX_REWARD: u128 = 10u128.pow(30);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 const NO_DEPOSIT: NearToken = NearToken::from_yoctonear(0);
@@ -256,7 +261,7 @@ impl World {
             t.storage_deposit(None, None);
         });
         world.setup(OWNER, ONE_YOCTO, |t| {
-            t.set_token(acct(TOKEN), U128(1), U128(MAX_REWARD), true)
+            t.set_token(acct(TOKEN), U128(MIN_REWARD), U128(MAX_REWARD), true)
         });
         for who in Who::ALL {
             world.setup(who.id(), NearToken::from_near(10), |t| {
@@ -320,6 +325,12 @@ impl World {
             changed.is_empty() && usage_after == usage,
             "a rejected call changed the state: {who} was rejected with {message:?}, but changed \
              the keys {changed:?}, and the storage usage from {usage} to {usage_after}"
+        );
+        // Every rule the contract checks panics with a code. Anything else, such as an overflow,
+        // an `unwrap` or an index out of bounds, is a crash that only looks like a rejection.
+        prop_assert!(
+            message.starts_with("E_"),
+            "{who}'s call panicked without an error code, which is a crash, not a rule: {message:?}"
         );
         Ok(Err(message))
     }
@@ -474,8 +485,9 @@ impl World {
 
     /// `who` tops `task` up by `amount`. A top-up that the rules allow must go through: an open
     /// task, a positive amount that `who`'s balance covers and that keeps the reward within the
-    /// token's limit, and room for `who` among the funders if it is not one yet. Storage never
-    /// limits the four accounts, and the pause is never on.
+    /// token's limit, and, if `who` is not a funder yet, room for it among the funders and an
+    /// amount of at least `MIN_REWARD`. Storage never limits the four accounts, and the pause is
+    /// never on.
     fn top_up(&mut self, who: Who, task: u64, amount: u128) -> Step {
         let held = self.balances.get(&who.account()).copied().unwrap_or(0);
         let allowed = self.task(task).is_some_and(|m| {
@@ -486,7 +498,7 @@ impl World {
                 && m.reward
                     .checked_add(amount)
                     .is_some_and(|reward| reward <= MAX_REWARD)
-                && (known || m.funders.len() < MAX_FUNDERS)
+                && (known || (m.funders.len() < MAX_FUNDERS && amount >= MIN_REWARD))
         });
         let result = self.call(who.id(), ONE_YOCTO, Vec::new(), |t| {
             t.top_up_task(U64(task), U128(amount))
@@ -713,6 +725,14 @@ impl World {
             return Ok(result);
         }
         prop_assert_eq!(settled, Some(false), "I2: task {} was settled again", task);
+        // Both ways: what went through is what the rules allow (I3, I6 and the windows).
+        prop_assert!(
+            allowed,
+            "task {} ({:?}) was settled by {}, which the rules forbid",
+            task,
+            phase,
+            caller
+        );
         let Some(outcome) = self.view(|t| t.get_task(U64(task)).and_then(|v| v.outcome)) else {
             return Err(TestCaseError::fail(format!(
                 "task {task} was settled but has no outcome"
@@ -1244,15 +1264,19 @@ fn scripted_run_reaches_every_outcome() {
         (register(C), "ok"),
         (commit(Some(C), 1), "ok"),
         // a.test has the vault slot its commit made, and nothing in it yet.
-        (post(Some(A), 5), "E_FUNDS"),
+        (post(Some(A), 15), "E_FUNDS"),
+        (post(Some(A), 9), "E_REWARD"),
         (deposit(A, 500), "ok"),
-        // Task 2, which nobody enters. Its poster puts in 3 more and p.test 4; b.test has the slot
-        // its commit made, and nothing in it.
-        (post(Some(A), 7), "ok"),
+        // Task 2, which nobody enters. Its poster puts in 3 more, which a funder may; p.test,
+        // not a funder yet, cannot join with 4, under the minimum of 10, and joins with 10.
+        // b.test has the slot its commit made, and nothing in it.
+        (post(Some(A), 17), "ok"),
         (top_up(A, 2, 3), "ok"),
+        (top_up(P, 2, 4), "E_REWARD"),
+        (top_up(P, 2, 10), "ok"),
         (top_up(P, 2, 4), "ok"),
         (top_up(A, 2, 0), "E_REWARD"),
-        (top_up(B, 2, 5), "E_FUNDS"),
+        (top_up(B, 2, 15), "E_FUNDS"),
         (advance(60), "ok"),
         (top_up(P, 2, 1), "E_PHASE"),
         (reveal(Some(A), 1), "ok"),
@@ -1274,7 +1298,7 @@ fn scripted_run_reaches_every_outcome() {
         (withdraw(B, Some(1_000), true), "E_FUNDS"),
         // Task 3, posted by the account that holds the most, p.test, topped up by c.test out of
         // its winnings, and picked empty, which refunds them both.
-        (post(None, 3), "ok"),
+        (post(None, 13), "ok"),
         (top_up(C, 3, 10), "ok"),
         (commit(None, 3), "ok"),
         (advance(60), "ok"),
@@ -1282,7 +1306,7 @@ fn scripted_run_reaches_every_outcome() {
         (advance(60), "ok"),
         (empty_pick(3), "ok"),
         // Task 4, revealed in and then left until it expires.
-        (post(Some(P), 9), "ok"),
+        (post(Some(P), 19), "ok"),
         (commit(Some(B), 4), "ok"),
         (advance(60), "ok"),
         (reveal(Some(B), 4), "ok"),

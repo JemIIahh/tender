@@ -15,16 +15,14 @@ use near_workspaces::types::Gas;
 use near_workspaces::{Account, AccountId};
 use serde_json::{json, Value};
 
-/// The caps of the plan's test: 5_000 per task and 10_000 in all.
+/// The caps of the plan's test: 5_000 per call and 10_000 in all.
 const PER_TASK: u128 = 5_000;
 const TOTAL: u128 = 10_000;
 /// What each of the agent's posts spends.
 const SPEND: u128 = 4_000;
 /// The methods the agent's function-call key may call.
 const AGENT_METHODS: [&str; 4] = ["post_task", "top_up_task", "commit", "reveal"];
-/// The gas the client attaches to each call.
-const POST_GAS: Gas = Gas::from_tgas(30);
-const TOP_UP_GAS: Gas = Gas::from_tgas(20);
+/// The gas the client attaches to `add_delegate` and `remove_delegate`. The others are in `common`.
 const DELEGATE_GAS: Gas = Gas::from_tgas(15);
 const AUTH_MESSAGE: &str = "E_AUTH: attach exactly 1 yoctoNEAR or use a delegate key within caps";
 const ONE_YOCTO_MESSAGE: &str = "Requires attached deposit of exactly 1 yoctoNEAR";
@@ -98,7 +96,7 @@ async fn post_as(env: &Env, key: &Account, reward: u128) -> anyhow::Result<Execu
     Ok(key
         .call(env.tender.id(), "post_task")
         .args_json(json!({ "task": task }))
-        .gas(POST_GAS)
+        .gas(POST_TASK_GAS)
         .transact()
         .await?)
 }
@@ -113,7 +111,7 @@ async fn top_up_as(
     Ok(key
         .call(env.tender.id(), "top_up_task")
         .args_json(json!({ "task_id": task_id.to_string(), "amount": amount.to_string() }))
-        .gas(TOP_UP_GAS)
+        .gas(TOP_UP_TASK_GAS)
         .transact()
         .await?)
 }
@@ -203,14 +201,14 @@ mod delegate {
         let id: u64 = r.json::<String>()?.parse()?;
         assert_eq!(spent(&env, lead.id(), &agent).await?, SPEND);
 
-        // The same key tops its task up: within both caps, then over the per-task cap.
+        // The same key tops its task up: within both caps, then over the per-call cap.
         let r = clean(top_up_as(&env, &agent, id, 1_000).await?)?;
         assert_eq!(num(&event(&r, "task_topped_up")["reward"]), SPEND + 1_000);
         assert_eq!(spent(&env, lead.id(), &agent).await?, SPEND + 1_000);
         let r = top_up_as(&env, &agent, id, PER_TASK + 1).await?;
         assert_fails_with(
             &r,
-            "E_AUTH: 5001 is over this delegate key's per-task cap of 5000",
+            "E_AUTH: 5001 is over this delegate key's per-call cap (per_task_cap) of 5000",
         );
         assert_eq!(spent(&env, lead.id(), &agent).await?, SPEND + 1_000);
         assert_eq!(num(&get_task(&env, id).await?["reward"]), SPEND + 1_000);
@@ -273,6 +271,66 @@ mod delegate {
                 "spent": "0",
             })
         );
+        Ok(())
+    }
+
+    /// A key that may spend is never a key that judges. The judge's delegate key cannot pick, even
+    /// when its access key may call `pick`, so a leaked one cannot award the tasks the judge
+    /// verifies. The judge's full-access key can, and so can a function-call key of the judge
+    /// that is no delegate, which is how the Judge service signs its picks.
+    #[tokio::test]
+    async fn verifier_delegate_key_cannot_pick() -> anyhow::Result<()> {
+        let env = setup(5).await?;
+        let judge = &env.judge;
+        deposit(&env, &env.poster, 2 * REWARD).await?;
+        let mut ids = Vec::new();
+        let mut sealed = Vec::new();
+        for content in [b"first", b"other"] {
+            let id = post(&env, &env.poster, task_json(&env, REWARD, judge.id(), 1)).await?;
+            sealed.push(commit_work(&env, &env.alice, id, content).await?);
+            ids.push(id);
+        }
+        let delegate_key = function_call_key(&env, judge, &["post_task", "pick"]).await?;
+        done_clean(add_delegate(&env, judge, &delegate_key, PER_TASK, TOTAL, ONE_YOCTO).await?)?;
+        let picking_key = function_call_key(&env, judge, &["pick"]).await?;
+
+        let task = get_task(&env, ids[0]).await?;
+        advance_to(&env, deadline(&task, "commit_deadline")).await?;
+        for (id, (hash, salt)) in ids.iter().zip(&sealed) {
+            done_clean(reveal(&env, &env.alice, *id, hash, salt, "ipfs://alice").await?)?;
+        }
+        advance_to(&env, deadline(&task, "reveal_deadline")).await?;
+        assert_eq!(get_task(&env, ids[0]).await?["phase"], "judging");
+
+        // The delegate key is refused, for a pick and for an empty pick, and nothing changes.
+        let before = stored(&env).await?;
+        for winners in [vec![winner(&env.alice, 10_000)], vec![]] {
+            let r = pick(&env, &delegate_key, ids[0], winners).await?;
+            assert_fails_with(
+                &r,
+                &format!(
+                    "E_AUTH: task {} cannot be picked with a delegate key; sign with another key \
+                     of {}",
+                    ids[0],
+                    judge.id()
+                ),
+            );
+            assert!(events(&r).is_empty());
+        }
+        assert!(
+            stored(&env).await? == before,
+            "a refused pick changed storage"
+        );
+
+        // The judge's other keys pick: a function-call key that is no delegate, and its
+        // full-access key.
+        done_clean(pick(&env, &picking_key, ids[0], vec![winner(&env.alice, 10_000)]).await?)?;
+        done_clean(pick(&env, judge, ids[1], vec![winner(&env.alice, 10_000)]).await?)?;
+        assert_eq!(
+            vault_balance(&env, env.alice.id()).await?,
+            2 * (REWARD - fee_of(REWARD))
+        );
+        assert_conserved(&env, &[]).await?;
         Ok(())
     }
 

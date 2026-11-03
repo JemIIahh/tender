@@ -11,12 +11,9 @@ mod common;
 
 use common::*;
 use near_workspaces::result::ExecutionFinalResult;
-use near_workspaces::types::Gas;
 use near_workspaces::Account;
 use serde_json::{json, Value};
 
-/// The gas the client attaches to a post. A post that burns more fails, so this is the budget.
-const POST_GAS: Gas = Gas::from_tgas(30);
 /// The parent's commit window: half an hour, in which the lead hires and then assembles.
 const PARENT_COMMIT_SECS: u32 = 1_800;
 /// Each window of a sub-task. The hiring stage, two posts and two commits, took 1.1 s of chain
@@ -51,7 +48,7 @@ fn child_json(env: &Env, reward: u128, parent: u64) -> Value {
     task
 }
 
-/// `who`'s `post_task` of `task`, sent with `POST_GAS` and 1 yocto: the raw result.
+/// `who`'s `post_task` of `task`, sent with `POST_TASK_GAS` and 1 yocto: the raw result.
 async fn post_with_gas(
     env: &Env,
     who: &Account,
@@ -61,12 +58,13 @@ async fn post_with_gas(
         .call(env.tender.id(), "post_task")
         .args_json(json!({ "task": task }))
         .deposit(ONE_YOCTO)
-        .gas(POST_GAS)
+        .gas(POST_TASK_GAS)
         .transact()
         .await?)
 }
 
-/// Posts `task` as `who` with `POST_GAS`, which must succeed. Returns its id and what it burnt.
+/// Posts `task` as `who` with `POST_TASK_GAS`, which must succeed. Returns its id and what it
+/// burnt.
 async fn post_child(env: &Env, who: &Account, task: Value) -> anyhow::Result<(u64, f64)> {
     let r = clean(post_with_gas(env, who, task).await?)?;
     let burnt = tgas(&r);
