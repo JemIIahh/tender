@@ -1522,6 +1522,70 @@ test("stopping_ends_the_wait_of_a_check_and_the_work_never_starts", async () => 
   expect(refused).toEqual([]);
 });
 
+test("once_the_services_begin_to_stop_a_pending_check_starts_nothing_and_refuses_nothing", async () => {
+  const { events, start } = counted();
+  const refused: Error[] = [];
+  const lines: string[] = [];
+  /** A check that waits once and then, when `finish` is called, goes through or refuses. */
+  const pending = (outcome: "through" | "refuses") => {
+    let finish: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const begun = new AbortController();
+    let seen: AbortSignal | undefined;
+    const checked = startAfterCheck({
+      check: async (signal: AbortSignal, onWait: OnWait) => {
+        seen = signal;
+        onWait("the node is behind", 1);
+        await gate;
+        if (outcome === "refuses") throw new IndexerError("the database is another deploy's");
+        return true;
+      },
+      start,
+      guards: "the indexer",
+      log: (line) => lines.push(line),
+      onRefused: (error) => refused.push(error),
+      stopping: begun.signal,
+    });
+    return { checked, begun, finish, seen: () => seen };
+  };
+
+  for (const outcome of ["through", "refuses"] as const) {
+    const run = pending(outcome);
+    await run.checked.settled;
+    // The owner begins to stop, with the API and the bot to stop before it calls `stop`. The check
+    // is told at once, and it ends in that time, as it would have without the word.
+    run.begun.abort();
+    expect(run.seen()?.aborted, outcome).toBe(true);
+    run.finish();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(events, outcome).toEqual([]);
+    expect(refused, outcome).toEqual([]);
+    await run.checked.stop();
+    expect(events, outcome).toEqual([]);
+    expect(refused, outcome).toEqual([]);
+    lines.length = 0;
+  }
+
+  // A check made once the owner has begun to stop starts nothing either.
+  const begun = new AbortController();
+  begun.abort();
+  const late = startAfterCheck({
+    check: async () => true,
+    start,
+    guards: "the indexer",
+    log: (line) => lines.push(line),
+    onRefused: (error) => refused.push(error),
+    stopping: begun.signal,
+  });
+  await late.settled;
+  await late.stop();
+  expect(events).toEqual([]);
+  expect(refused).toEqual([]);
+  expect(lines).toEqual([]);
+});
+
 test("a_work_that_throws_as_it_starts_is_told_to_the_owner_like_a_refusal", async () => {
   const lines: string[] = [];
   const refused: Error[] = [];

@@ -1008,12 +1008,13 @@ export interface Services {
    */
   failed: Promise<Error>;
   /**
-   * Stops everything and resolves once all of it is down, in this order: the API stops taking
-   * connections and cuts the ones left after the grace; the Telegram bot stops taking updates and
-   * finishes the ones it has, and the notifier its tick, or after 5 s (`TELEGRAM_STOP_MS`) the
-   * rest goes on without them, and a WARN says what was left; the Judge, the keeper and the
-   * indexer stop (see `withLoops`), and the indexer lock is let go; and the database is closed.
-   * Calling it again returns the same promise.
+   * Stops everything and resolves once all of it is down. A check of the database against the
+   * chain that is still waiting ends first, so that from then on it starts nothing and refuses
+   * nothing. Then, in this order: the API stops taking connections and cuts the ones left after
+   * the grace; the Telegram bot stops taking updates and finishes the ones it has, and the notifier
+   * its tick, or after 5 s (`TELEGRAM_STOP_MS`) the rest goes on without them, and a WARN says what
+   * was left; the Judge, the keeper and the indexer stop (see `withLoops`), and the indexer lock is
+   * let go; and the database is closed. Calling it again returns the same promise.
    */
   stop(): Promise<void>;
 }
@@ -1089,6 +1090,13 @@ export interface CheckedStartOptions {
    * check by its name, and the message of a `start` that threw. Not told once `stop` has been called.
    */
   onRefused: (error: Error) => void;
+  /**
+   * Aborts when the owner begins to stop everything, which takes a while before it calls `stop`:
+   * the API and the bot stop first. From then on the check ends, the work does not start, and a
+   * refusal is not told, as for `stop`: a stop is no failure, and nothing should start only to be
+   * stopped, a keeper least of all, whose first tick sends calls.
+   */
+  stopping?: AbortSignal;
 }
 
 /**
@@ -1098,11 +1106,15 @@ export interface CheckedStartOptions {
  * that throws as it starts, is told to `onRefused`, and the work does not start: the owner ends the
  * services (`Services.failed`).
  *
- * `stop` ends the wait, and stops the work if it has started.
+ * `stop` ends the wait, and stops the work if it has started. `opts.stopping` ends the wait and
+ * keeps the work from starting, and leaves a work that has started to `stop`.
  */
 export function startAfterCheck(opts: CheckedStartOptions): CheckedStart {
   const { check, start, guards, log, onRefused } = opts;
-  const stopping = new AbortController();
+  const stopped = new AbortController();
+  // Ended by `stop`, or by the owner's word that it has begun to stop.
+  const ended =
+    opts.stopping === undefined ? stopped.signal : AbortSignal.any([stopped.signal, opts.stopping]);
   let running: Stoppable | undefined;
   let waited = false;
   let firstWait: () => void = () => undefined;
@@ -1118,11 +1130,11 @@ export function startAfterCheck(opts: CheckedStartOptions): CheckedStart {
     firstWait();
   };
   const refuse = (error: Error) => {
-    if (!stopping.signal.aborted) onRefused(error);
+    if (!ended.aborted) onRefused(error);
   };
   const checking = (async () => {
     try {
-      if (!(await check(stopping.signal, onWait)) || stopping.signal.aborted) return;
+      if (!(await check(ended, onWait)) || ended.aborted) return;
     } catch (error) {
       // A refusal is ours and is said in full; anything else by its name, as a line says of an error.
       refuse(
@@ -1142,7 +1154,7 @@ export function startAfterCheck(opts: CheckedStartOptions): CheckedStart {
   return {
     settled: Promise.race([checking, waitedFirst]),
     async stop() {
-      stopping.abort();
+      stopped.abort();
       await checking;
       await running?.stop();
     },
@@ -1352,6 +1364,8 @@ export async function startServices(
     if (ending.up) report(error);
   };
   const failure = () => ending.error;
+  /** Aborts as `stopAll` begins, ahead of the slow steps in it: see `CheckedStartOptions.stopping`. */
+  const stopBegun = new AbortController();
 
   const db = await openIndex(config.database.url, { ...options.pgliteLock, onLost: fail });
   let api: ApiServer | undefined;
@@ -1362,6 +1376,10 @@ export async function startServices(
 
   /** Stops what has started, in order, going on past a failure, and throws the first one. */
   const stopAll = async (): Promise<void> => {
+    // First of all: a check of the database against the chain that is still waiting must not go on
+    // to start the indexer, the keeper and the Judge while the API and the bot stop, which takes
+    // seconds, nor refuse the database in that time, which would make this stop a failure.
+    stopBegun.abort();
     const failures: unknown[] = [];
     const step = async (work: () => Promise<void> | undefined) => {
       try {
@@ -1558,6 +1576,7 @@ export async function startServices(
         guards,
         log,
         onRefused: fail,
+        stopping: stopBegun.signal,
       });
       first.checked ??= checked;
       return checked;

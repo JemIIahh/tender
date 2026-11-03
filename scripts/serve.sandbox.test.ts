@@ -1567,13 +1567,18 @@ test("off_the_sandbox_the_process_waits_for_a_node_behind_the_index_and_ends_onl
   }
 
   // A cursor 200000 blocks past the node's: no lag explains that, so the process ends with 1, and
-  // says that the node is most likely of another network.
+  // says that the node is most likely of another network. It says so after two reads in a row, the
+  // first told with a WARN, since the final height can come from a node of a load-balanced RPC
+  // that has just restarted.
   const far = runServe(await offSandbox((await indexedCopy()).url, final + 200_000n));
   try {
     const { code } = await far.end();
     expect(code, far.stderr()).toBe(1);
+    expect(far.stdout()).toMatch(
+      /^WARN indexer: cannot check the database against the chain yet \(the final block of the node, \d+, is \d+ blocks below the last block the index took, \d+, more than any lag explains: reading again before the node is taken for one of another network\); trying again in 2 s$/m,
+    );
     expect(far.stderr()).toMatch(
-      /^serve: the index took block \d+, but the final block of testnet at the node is \d+, \d+ blocks below it\. No lag explains a gap that size: the node at NEAR_RPC_URL is most likely on another network than testnet\. Point NEAR_RPC_URL at a testnet node, and start the services again\. Or this is a new chain under the contract name /m,
+      /^serve: the index took block \d+, but the final block of testnet at the node is \d+, \d+ blocks below it, on 2 reads in a row\. No lag explains a gap that size: the node at NEAR_RPC_URL is most likely on another network than testnet\. Point NEAR_RPC_URL at a testnet node, and start the services again\. Or this is a new chain under the contract name /m,
     );
   } finally {
     far.child.kill("SIGKILL");

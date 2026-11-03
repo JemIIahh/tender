@@ -278,8 +278,10 @@ export interface CheckAgainstChainOptions {
   skewBlocks?: bigint;
   /**
    * How many blocks the node's final block may be below the index's cursor before no lag
-   * explains it. Default 100000 off the sandbox, about a day of blocks; on the sandbox 0, where
-   * any block below the cursor is another chain.
+   * explains it. Default 100000 off the sandbox, about 16 hours of blocks; on the sandbox 0, where
+   * any block below the cursor is another chain. A gap over a limit above 0 is refused only when
+   * `MISMATCH_ROUNDS` rounds in a row find it, since the final height can come from a node of a
+   * load-balanced RPC that has just restarted or is syncing; with a limit of 0 one read is enough.
    */
   lagLimitBlocks?: bigint;
   /**
@@ -329,7 +331,9 @@ const KEEP_DATABASE =
  * - A node whose final height is below the cursor by more than `skewBlocks` is behind, and is
  *   waited for, for as long as it takes: nothing writes meanwhile. The wait is told once in
  *   `behindWarnMs`, with the gap. Only a gap that no lag explains, over `lagLimitBlocks`, is
- *   refused, as a node of another network (on the sandbox, any gap, as a new chain).
+ *   refused, as a node of another network (on the sandbox, any gap, as a new chain). Off the
+ *   sandbox that takes `MISMATCH_ROUNDS` rounds in a row, as a short count does; on the sandbox,
+ *   where the node is the index's own source, one read.
  * - A count below the highest task id is a mismatch when the node's final height, read before the
  *   count, is `skewBlocks` or more past the cursor: a node that has seen every block the index took
  *   has seen its tasks. A node short of that is behind. Even then the count is taken for the
@@ -377,8 +381,18 @@ export async function checkAgainstChain(
   if (cursor === null && highest === null) return true;
   const indexed = cursor ?? 0n;
 
-  /** The rounds in a row that found the count short; any other round starts the tally again. */
-  let mismatches = 0;
+  /**
+   * What the rounds in a row have found, and how many: a gap that no lag explains, or a count that
+   * is short. A round that finds another thing, or nothing wrong, starts the tally again.
+   */
+  let tally: { found: "far" | "short"; rounds: number } | undefined;
+  const found = (what: "far" | "short"): number => {
+    tally =
+      tally?.found === what
+        ? { found: what, rounds: tally.rounds + 1 }
+        : { found: what, rounds: 1 };
+    return tally.rounds;
+  };
   let toldBehindAt: number | undefined;
   for (;;) {
     // The final height first: the count is then read at a block at least as late as it.
@@ -386,17 +400,31 @@ export async function checkAgainstChain(
     try {
       final = await chain.finalHeight();
     } catch (error) {
-      mismatches = 0;
+      tally = undefined;
       if (!(await wait(`cannot read the final block (${describe(error)})`))) return false;
       continue;
     }
 
     if (cursor !== null && cursor > final + skew) {
       const gap = cursor - final;
-      if (gap > lagLimit) throw new IndexerError(farBehindWords(chain, cursor, final));
+      if (gap > lagLimit) {
+        // No lag explains it. Where none is tolerated, as on the sandbox, the node is the index's
+        // own source and one read says so. Elsewhere the final height can come from a node of a
+        // load-balanced RPC that has just restarted or is syncing, so it is read again first.
+        const reads = lagLimit === 0n ? 1 : MISMATCH_ROUNDS;
+        if (found("far") >= reads) {
+          throw new IndexerError(farBehindWords(chain, cursor, final, reads));
+        }
+        const why =
+          `the final block of the node, ${final}, is ${blocks(gap)} below the last block the ` +
+          `index took, ${cursor}, more than any lag explains: reading again before the node is ` +
+          "taken for one of another network";
+        if (!(await wait(why))) return false;
+        continue;
+      }
       // The node is behind. Nothing writes while it is waited for, so it is waited for, and said so
       // once a minute.
-      mismatches = 0;
+      tally = undefined;
       const now = Date.now();
       const tell = toldBehindAt === undefined || now - toldBehindAt >= behindWarnMs;
       if (tell) toldBehindAt = now;
@@ -412,14 +440,13 @@ export async function checkAgainstChain(
     try {
       count = await chain.taskCount();
     } catch (error) {
-      mismatches = 0;
+      tally = undefined;
       if (!(await wait(`cannot read the task count (${describe(error)})`))) return false;
       continue;
     }
     if (highest <= count) return true;
     if (final >= indexed + skew) {
-      mismatches += 1;
-      if (mismatches >= MISMATCH_ROUNDS) {
+      if (found("short") >= MISMATCH_ROUNDS) {
         throw new IndexerError(
           `the database holds task ${highest}, but ${chain.contractId} has made ${count} on ` +
             `${chain.network}, as read at its final block ${final}, past the last block the index ` +
@@ -436,7 +463,7 @@ export async function checkAgainstChain(
       if (!(await wait(why))) return false;
       continue;
     }
-    mismatches = 0;
+    tally = undefined;
     const why =
       `the node counts ${count} tasks, fewer than the ${highest} the database holds, and its ` +
       `final block, ${final}, is too near the last block the index took, ${indexed}, to tell ` +
@@ -448,12 +475,20 @@ export async function checkAgainstChain(
 /** "1 block", "20 blocks". */
 const blocks = (n: bigint) => `${n} block${n === 1n ? "" : "s"}`;
 
-/** What the check says of a node that is further below the cursor than any lag explains. */
-function farBehindWords(chain: DeploymentChain, cursor: bigint, final: bigint): string {
+/**
+ * What the check says of a node that is further below the cursor than any lag explains, as `reads`
+ * reads in a row have found it.
+ */
+function farBehindWords(
+  chain: DeploymentChain,
+  cursor: bigint,
+  final: bigint,
+  reads: number,
+): string {
   const sandbox = chain.network === "sandbox";
   const where =
     `the index took block ${cursor}, but the final block of ${chain.network} at the node is ` +
-    `${final}, ${blocks(cursor - final)} below it.`;
+    `${final}, ${blocks(cursor - final)} below it${reads > 1 ? `, on ${reads} reads in a row` : ""}.`;
   const node = sandbox
     ? NODE_BEHIND
     : "No lag explains a gap that size: the node at NEAR_RPC_URL is most likely on another " +

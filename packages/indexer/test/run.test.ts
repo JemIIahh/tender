@@ -875,17 +875,17 @@ test("off_the_sandbox_only_a_gap_no_lag_explains_is_refused_as_a_node_of_another
   await db.exec("truncate chain_cursor");
   await setCursor(TESTNET_CURSOR, 500_000n);
   const wrong = answering([100n], [new Error("not asked")]);
-  const { ok, failure, waits } = await againstChain(wrong.chain, {
-    retryMs: 60_000,
-    longestMs: 60_000,
-  });
+  const { ok, failure, waits } = await againstChain(wrong.chain);
   expect(ok).toBeUndefined();
   expect(failure).toBeInstanceOf(IndexerError);
-  expect(waits).toEqual([]);
-  expect(wrong.asks).toEqual({ final: 1, count: 0 });
+  // The first read is told, and read again; the second says the same, and no count is asked.
+  expect(waits).toEqual([
+    "the final block of the node, 100, is 499900 blocks below the last block the index took, 500000, more than any lag explains: reading again before the node is taken for one of another network",
+  ]);
+  expect(wrong.asks).toEqual({ final: 2, count: 0 });
   const words = failure?.message ?? "";
   expect(words).toMatch(
-    /^the index took block 500000, but the final block of testnet at the node is 100, 499900 blocks below it\. No lag explains a gap that size: the node at NEAR_RPC_URL is most likely on another network than testnet\. Point NEAR_RPC_URL at a testnet node, and start the services again\. Or this is a new chain under the contract name /,
+    /^the index took block 500000, but the final block of testnet at the node is 100, 499900 blocks below it, on 2 reads in a row\. No lag explains a gap that size: the node at NEAR_RPC_URL is most likely on another network than testnet\. Point NEAR_RPC_URL at a testnet node, and start the services again\. Or this is a new chain under the contract name /,
   );
   expect(words).toContain("a new chain under this contract name needs a new database");
   expect(words).toContain("one database per contract deploy");
@@ -893,6 +893,48 @@ test("off_the_sandbox_only_a_gap_no_lag_explains_is_refused_as_a_node_of_another
   expect(words.indexOf("most likely on another network")).toBeLessThan(words.indexOf("new chain"));
   expect(words).toContain("keep the old one");
   expect(words).not.toMatch(/discard|throw .* away|wipe|reset/i);
+});
+
+test("off_the_sandbox_one_far_read_is_not_taken_for_a_node_of_another_network", async () => {
+  await setCursor(TESTNET_CURSOR, 500_000n);
+  // A node that has just restarted says 100 once, and then its own height: the second read is
+  // believed, and the database passes. No task was asked about.
+  const odd = answering([100n, 500_100n], [0n]);
+  const passed = await againstChain(odd.chain);
+  expect({ ok: passed.ok, failure: passed.failure }).toEqual({ ok: true, failure: undefined });
+  expect(passed.waits).toHaveLength(1);
+  expect(odd.asks).toEqual({ final: 2, count: 0 });
+
+  // The two reads are in a row. A read that finds the node merely behind, or fails, starts the
+  // tally again, so a far read between others is never the second, however long that goes on.
+  const down = new Error("ECONNRESET");
+  const never = async (finals: Array<bigint | Error>) => {
+    const stop = new AbortController();
+    let told = 0;
+    const chain = answering(finals, [0n]);
+    const outcome = await againstChain(chain.chain, {
+      behindWarnMs: 0,
+      signal: stop.signal,
+      onWait: () => {
+        told += 1;
+        if (told === 8) stop.abort();
+      },
+    });
+    return { ok: outcome.ok, failure: outcome.failure, asks: chain.asks.final };
+  };
+  const behind = await never(Array.from({ length: 16 }, (_, i) => (i % 2 === 0 ? 100n : 499_000n)));
+  expect({ ok: behind.ok, failure: behind.failure }).toEqual({ ok: false, failure: undefined });
+  expect(behind.asks).toBe(8);
+  const failing = await never(Array.from({ length: 16 }, (_, i) => (i % 2 === 0 ? 100n : down)));
+  expect({ ok: failing.ok, failure: failing.failure }).toEqual({ ok: false, failure: undefined });
+  expect(failing.asks).toBe(8);
+
+  // A far read and then a node that is merely behind: the tally starts again, and it takes two
+  // far reads in a row, here the third and the fourth.
+  const again = answering([100n, 499_000n, 100n, 100n], [0n]);
+  const refused = await againstChain(again.chain, { behindWarnMs: 0 });
+  expect(refused.failure).toBeInstanceOf(IndexerError);
+  expect(again.asks.final).toBe(4);
 });
 
 test("it_checks_the_environment_as_startIndexer_does_and_starts_nothing", async () => {
