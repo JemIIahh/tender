@@ -847,6 +847,25 @@ test("only_the_50_newest_tasks_and_the_unsettled_ones_are_compared", async () =>
   expect(await taskOf("2")).toMatchObject({ commit_count: 1 });
 });
 
+test("tasks_are_compared_in_the_order_of_their_ids_as_numbers", async () => {
+  await seedLifecycle(db);
+  // Tasks 2 to 10, all open, each missing the commit the chain shows. As text, 10 would come
+  // before 2: a pass takes the tasks by id as a number.
+  const tasks = [TASK_1];
+  for (let id = 2; id <= 10; id++) {
+    await apply(created(id, 100 + id));
+    tasks.push({ ...openTask(id), commit_count: 1 });
+  }
+  await apply(blockOf(110 + SKEW, []));
+  const lines: string[] = [];
+
+  const chain = lifecycleChain({ final: 110n, tasks });
+  expect(await reconcileWith(chain, lines)).toEqual({ inserted: 0, updated: 9 });
+  expect(lines).toEqual(
+    Array.from({ length: 9 }, (_, i) => `WARN reconcile task=${i + 2} field=commit_count`),
+  );
+});
+
 test("a_late_start_fills_in_the_tasks_and_agent_counters_it_never_saw", async () => {
   // The index starts at block 70: it saw the agents register, and none of task 1. Its commits,
   // reveals and pick project nothing, for the index has no task 1 to put them in.

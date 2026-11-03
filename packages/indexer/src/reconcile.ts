@@ -316,12 +316,14 @@ async function missingTaskIds(db: Db, count: bigint): Promise<bigint[]> {
  * no outcome either, though `outcome is null` is false for it.
  */
 async function taskIdsToCompare(db: Db): Promise<bigint[]> {
+  // `tasks.id` in the outer `order by`, not `id`: a bare name there is the output column, which is
+  // text, and text puts task 10 before task 9.
   const rows = await db.query<{ id: string }>(
     `select id::text as id from tasks
       where outcome is null
          or jsonb_typeof(outcome) <> 'object'
          or id in (select id from tasks order by id desc limit ${RECENT})
-      order by id`,
+      order by tasks.id`,
   );
   return rows.map((row) => BigInt(row.id));
 }

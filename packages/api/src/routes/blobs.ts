@@ -1,5 +1,4 @@
 import { Buffer } from "node:buffer";
-import type { Nep413Result } from "@tender/client";
 import {
   type Db,
   getBlob,
@@ -25,9 +24,10 @@ import {
   sha256Hex,
   U64StringSchema,
 } from "@tender/shared";
-import { type Context, Hono, type MiddlewareHandler } from "hono";
+import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
+import type { AuthVariables, RequireAuth } from "../auth";
 import { type ApiDeps, nowNs } from "../deps";
 import {
   type BlobUploadResponse,
@@ -41,18 +41,6 @@ import {
 } from "../format";
 import { rateLimit, rateLimitsOf, uploadBudget } from "../limits";
 import { getScorecard } from "../queries";
-
-/**
- * What sign-in leaves for a route to read: the account the request is signed in as, and the kind
- * of key it signed in with.
- */
-export type AuthVariables = { account: string; keyKind: Nep413Result["keyKind"] };
-
-/**
- * The middleware that signs a request in: it sets `c.var.account` and `c.var.keyKind`, or answers
- * 401 itself, or 503 when it cannot check that the key of the token is still there.
- */
-export type RequireAuth = MiddlewareHandler<{ Variables: AuthVariables }>;
 
 type BlobApp = Hono<{ Variables: AuthVariables }>;
 

@@ -32,6 +32,7 @@ import { HTTPException } from "hono/http-exception";
 import { validator } from "hono/validator";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { z } from "zod";
+import type { AuthVariables, RequireAuth } from "../src/auth";
 import { handleError, readJson } from "../src/format";
 import {
   type AgentDetailResponse,
@@ -42,7 +43,7 @@ import {
   type TaskDetailResponse,
 } from "../src/index";
 import { publicDocument } from "../src/queries";
-import { type AuthVariables, blobRoutes, type RequireAuth } from "../src/routes/blobs";
+import { blobRoutes } from "../src/routes/blobs";
 import { resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 
 // The blob store and the held-out intake. The upload routes are mounted on an app of their own

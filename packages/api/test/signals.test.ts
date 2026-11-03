@@ -10,9 +10,9 @@ import {
 import { type Phase, phaseAt, sha256Hex, type TenderEvent } from "@tender/shared";
 import { Hono } from "hono";
 import { afterAll, beforeAll, beforeEach, expect, test } from "vitest";
+import type { AuthVariables, RequireAuth } from "../src/auth";
 import { handleError } from "../src/format";
 import { type ApiDeps, createApp, type ErrorBody, type ListTasksResponse } from "../src/index";
-import type { AuthVariables, RequireAuth } from "../src/routes/blobs";
 import { startRoutes } from "../src/routes/start";
 import { telegramRoutes } from "../src/routes/telegram";
 import { resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";

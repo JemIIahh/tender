@@ -1,9 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { Hono } from "hono";
+import type { AuthVariables, RequireAuth } from "../auth";
 import type { ApiDeps } from "../deps";
 import { fail } from "../format";
 import { rateLimit, rateLimitsOf } from "../limits";
-import type { AuthVariables, RequireAuth } from "./blobs";
 
 /** `POST /v1/telegram/link`. `expires_at` is ISO 8601 in UTC to the millisecond. */
 export interface TelegramLinkResponse {

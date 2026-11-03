@@ -8,10 +8,10 @@ import { Hono } from "hono";
 import { Account, KeyPair, KeyPairSigner, type Provider } from "near-api-js";
 import * as nearNep413 from "near-api-js/nep413";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
+import type { AuthVariables } from "../src/auth";
 import { type ChallengeResponse, requireAuth, type SignInResponse } from "../src/auth";
 import { handleError } from "../src/format";
 import { type ApiDeps, type ChainReader, createApp, type ErrorBody } from "../src/index";
-import type { AuthVariables } from "../src/routes/blobs";
 import { fakeClient, resetDb, TEST_NOW, testDb, testDeps } from "./helpers";
 
 // NEP-413 sign-in. Every test signs with near-api-js itself, as a wallet or an agent would, so
