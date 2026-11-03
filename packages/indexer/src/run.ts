@@ -161,12 +161,7 @@ export function startIndexer(
 ): Indexer {
   const log = opts.log ?? console.log;
   const config = readConfig(env);
-  const start = configuredStart(env, config, opts.deploymentsDir ?? DEPLOYMENTS_DIR);
-  if (start.height === null && config.network !== "sandbox") {
-    throw new Error(
-      `no height to start indexing ${config.network} from: set INDEXER_START_HEIGHT (${start.why})`,
-    );
-  }
+  const start = startOf(env, config, opts.deploymentsDir);
   const source = opts.source ?? sourceOf(env, config, log);
   const client = opts.client ?? clientOf(env, config);
   const { db } = opts;
@@ -198,6 +193,22 @@ export function startIndexer(
   };
 }
 
+/**
+ * Throws what `startIndexer` throws for a setting or a deployment record of `env` that is missing
+ * or wrong, and starts nothing. The services call it before they open anything, so that a start
+ * that cannot work fails at once, though the indexer starts only after the database has been
+ * checked against the chain (`checkAgainstChain`).
+ */
+export function checkIndexerEnv(
+  env: Record<string, string | undefined>,
+  opts: Pick<StartIndexerOptions, "deploymentsDir"> = {},
+): void {
+  const config = readConfig(env);
+  startOf(env, config, opts.deploymentsDir);
+  sourceOf(env, config, () => undefined);
+  clientOf(env, config);
+}
+
 interface Config {
   network: NetworkId;
   contractId: string;
@@ -210,90 +221,199 @@ function cursorSourceOf(chain: { network: string; contractId: string }): string 
   return `${chain.network}:${chain.contractId}`;
 }
 
-/** The reads of the chain that `checkDeployment` makes. */
-export type DeploymentChain = Pick<ReconcileChain, "network" | "contractId" | "taskCount">;
-
-export interface CheckDeploymentOptions {
-  /**
-   * How many more times the chain is asked, when the index holds a task above the number it gives
-   * (see `checkDeployment`). Default 3.
-   */
-  retries?: number;
-  /** How long to wait before each new ask, in milliseconds. Default 2000. */
-  retryMs?: number;
-}
-
-const DEPLOYMENT_RETRIES = 3;
-const DEPLOYMENT_RETRY_MS = 2_000;
-/** The most other sources `checkDeployment` names. */
+/** The most other sources `checkCursorSource` names. */
 const SOURCES_NAMED = 3;
 
 /**
- * Refuses a database that holds the index of another deploy of Tender: one database serves one
- * contract deploy. The tables of the index are not keyed by contract, so a second contract on the
- * same database would project its events onto the first one's rows, and the keeper and the Judge
- * would act on them; and so would a contract account that was deleted and made again, whose task
- * ids start from 1. It throws an `IndexerError` that says "one database per contract deploy", when
+ * Refuses a database whose chain cursor is for another deploy of Tender than `deploy`: one
+ * database serves one contract deploy. The tables of the index are not keyed by contract, so a
+ * second contract on the same database would project its events onto the first one's rows, and the
+ * keeper and the Judge would act on them. It throws an `IndexerError` that says "one database per
+ * contract deploy" when `chain_cursor` holds a row for any source but `<network>:<contractId>`.
  *
- * - `chain_cursor` holds a row for any source but `<network>:<contractId>` of `chain`; or
- * - the highest task id in `tasks` is above `taskCount()` of the chain.
- *
- * It is made at the start of the services, before anything serves from the database or acts on it.
- * A database with no task asks nothing of the chain. The count is read again up to `retries`
- * times, `retryMs` apart, before it refuses: the index follows neardata, and the RPC node that
- * answers `taskCount()` can be some blocks behind it, so that a task posted just before a restart
- * is no mismatch. A chain that cannot be asked is a refusal too, one that names the kind of the
- * failure only: a database that holds tasks is not started on without the check.
+ * It asks nothing of the chain, so the services make it at their start, before anything serves
+ * from the database. `checkAgainstChain` is the half that needs the chain.
  */
-export async function checkDeployment(
+export async function checkCursorSource(
   db: Db,
-  chain: DeploymentChain,
-  options: CheckDeploymentOptions = {},
+  deploy: { network: string; contractId: string },
 ): Promise<void> {
-  const own = cursorSourceOf(chain);
+  const own = cursorSourceOf(deploy);
   const others = await db.query<{ source: string }>(
     "select source from chain_cursor where source <> $1 order by source limit $2",
     [own, SOURCES_NAMED + 1],
   );
-  if (others.length > 0) {
-    const named = others.slice(0, SOURCES_NAMED).map(({ source }) => JSON.stringify(source));
-    const more = others.length > SOURCES_NAMED ? " and others" : "";
-    throw new IndexerError(
-      `the database holds the index of another deploy of Tender: its chain cursor is for ` +
-        `${named.join(", ")}${more}, and this deploy is ${JSON.stringify(own)}. A database ` +
-        "serves one contract deploy: use a new database for this one (one database per " +
-        "contract deploy)",
-    );
-  }
+  if (others.length === 0) return;
+  const named = others.slice(0, SOURCES_NAMED).map(({ source }) => JSON.stringify(source));
+  const more = others.length > SOURCES_NAMED ? " and others" : "";
+  throw new IndexerError(
+    `the database holds the index of another deploy of Tender: its chain cursor is for ` +
+      `${named.join(", ")}${more}, and this deploy is ${JSON.stringify(own)}. A database ` +
+      "serves one contract deploy: use a new database for this one (one database per " +
+      "contract deploy)",
+  );
+}
 
-  const [row] = await db.query<{ id: string | null }>("select max(id)::text as id from tasks");
-  if (row?.id === null || row?.id === undefined) return;
-  const highest = BigInt(row.id);
-  const retries = options.retries ?? DEPLOYMENT_RETRIES;
-  const retryMs = options.retryMs ?? DEPLOYMENT_RETRY_MS;
-  for (let asked = 0; ; asked++) {
+/** The reads of the chain that `checkAgainstChain` makes. */
+export type DeploymentChain = Pick<
+  ReconcileChain,
+  "network" | "contractId" | "finalHeight" | "taskCount"
+>;
+
+export interface CheckAgainstChainOptions {
+  /** Ends the waiting, and the check with it: it then resolves false. */
+  signal?: AbortSignal;
+  /** Told of each wait, with why it waits and for how many milliseconds. */
+  onWait?: (why: string, retryMs: number) => void;
+  /** The first wait, in milliseconds. It doubles with each wait, up to `longestMs`. Default 2000. */
+  retryMs?: number;
+  /** The longest wait, in milliseconds. Default 30000. */
+  longestMs?: number;
+  /**
+   * How many blocks apart the node and the index may be before a difference counts as the
+   * database's. Default 20 off the sandbox, as in reconcile: the final height and a view come
+   * from a load-balanced RPC, whose nodes can be some blocks apart, and the index follows
+   * neardata. On the sandbox it is 0: the node is the index's own source.
+   */
+  skewBlocks?: bigint;
+  /**
+   * How long the index may stay ahead of the node's final block, by more than `skewBlocks`, while
+   * the node is asked again, before the check refuses. Default 30000; on the sandbox 0.
+   */
+  aheadMs?: number;
+}
+
+const CHECK_FIRST_WAIT_MS = 2_000;
+const CHECK_LONGEST_WAIT_MS = 30_000;
+const SKEW_BLOCKS = 20n;
+const AHEAD_MS = 30_000;
+
+/** What both refusals of `checkAgainstChain` say first: the node is the likelier cause. */
+const NODE_BEHIND =
+  "Either the node at NEAR_RPC_URL is behind the chain: wait for it, or point NEAR_RPC_URL at " +
+  "another node, and start the services again.";
+/** What they say of the database that is refused: it is not to be thrown away. */
+const KEEP_DATABASE =
+  "keep the old one: it holds uploads, sign-ins and Telegram links that cannot be rebuilt from " +
+  "the chain";
+
+/**
+ * Checks the database against the chain before the indexer, the keeper and the Judge start on it.
+ * One database serves one contract deploy, and a database that holds another's index would have
+ * this deploy's events projected onto it, and the keeper and the Judge act on them. Two things
+ * give it away, and both are read from the node, which can be down or behind:
+ *
+ * - the highest task id in `tasks` is above the number of tasks the contract has made
+ *   (`taskCount()`), as with a contract account that was deleted and made again, which counts its
+ *   tasks from 1;
+ * - the cursor is above the node's final height, as with a new chain under the same contract name
+ *   (a sandbox that was started afresh): the indexer would resume after the old cursor, and skip
+ *   the new chain's blocks below it.
+ *
+ * It resolves true once the database matches the chain, or holds nothing to check (no task and no
+ * cursor: the chain is not asked), and false if `signal` aborts first. It throws an `IndexerError`
+ * for a mismatch it is sure of, and never for a read that fails:
+ *
+ * - A read that fails, of the node or of the database, is made again after a wait that doubles
+ *   from `retryMs` to `longestMs`, for as long as it takes; `onWait` is told of each wait.
+ * - A count below the highest task id is a mismatch once the node's final height, read before the
+ *   count, is `skewBlocks` or more past the cursor: a node that has seen every block the index
+ *   took has seen its tasks. A node short of that is behind, and is asked again.
+ * - A cursor ahead of the node's final height by more than `skewBlocks` is a mismatch once it has
+ *   stayed so, over fresh reads, for `aheadMs`.
+ *
+ * A refusal names the likely causes in order: the node is behind (wait, restart), and then that
+ * the database is another deploy's, which needs a new one. It never advises to discard the
+ * database: it holds records that cannot be rebuilt from the chain.
+ */
+export async function checkAgainstChain(
+  db: Db,
+  chain: DeploymentChain,
+  options: CheckAgainstChainOptions = {},
+): Promise<boolean> {
+  const signal = options.signal ?? new AbortController().signal;
+  const sandbox = chain.network === "sandbox";
+  const skew = options.skewBlocks ?? (sandbox ? 0n : SKEW_BLOCKS);
+  const aheadMs = options.aheadMs ?? (sandbox ? 0 : AHEAD_MS);
+  const longestMs = options.longestMs ?? CHECK_LONGEST_WAIT_MS;
+  let waitMs = options.retryMs ?? CHECK_FIRST_WAIT_MS;
+
+  /** Tells why, waits, and says whether the check goes on: it does not once `signal` aborts. */
+  const wait = async (why: string): Promise<boolean> => {
+    options.onWait?.(why, waitMs);
+    await pause(waitMs, signal);
+    waitMs = Math.min(waitMs * 2, longestMs);
+    return !signal.aborted;
+  };
+
+  // What the database holds, which nothing changes while this waits: the indexer has not started.
+  let held: { cursor: bigint | null; highest: bigint | null } | undefined;
+  while (held === undefined) {
+    if (signal.aborted) return false;
+    try {
+      const cursor = await cursorHeight(db, cursorSourceOf(chain));
+      const [row] = await db.query<{ id: string | null }>("select max(id)::text as id from tasks");
+      held = { cursor, highest: row === undefined || row.id === null ? null : BigInt(row.id) };
+    } catch (error) {
+      if (!(await wait(`cannot read the database (${describe(error)})`))) return false;
+    }
+  }
+  const { cursor, highest } = held;
+  if (cursor === null && highest === null) return true;
+  const indexed = cursor ?? 0n;
+
+  let aheadSince: number | undefined;
+  for (;;) {
+    // The final height first: the count is then read at a block at least as late as it.
+    let final: bigint;
+    try {
+      final = await chain.finalHeight();
+    } catch (error) {
+      if (!(await wait(`cannot read the final block (${describe(error)})`))) return false;
+      continue;
+    }
+
+    if (cursor !== null && cursor > final + skew) {
+      aheadSince ??= Date.now();
+      if (Date.now() - aheadSince >= aheadMs) {
+        throw new IndexerError(
+          `the index took block ${cursor}, but the final block of ${chain.network} at the node is ` +
+            `${final}, below it. ${NODE_BEHIND} Or this is a new chain under the contract name ` +
+            `${chain.contractId} (a sandbox that was started afresh, say), and the database holds ` +
+            "the index of the old one: a new chain under this contract name needs a new " +
+            `database (one database per contract deploy); ${KEEP_DATABASE}`,
+        );
+      }
+      const why = `the final block of the node, ${final}, is below the last block the index took, ${cursor}`;
+      if (!(await wait(why))) return false;
+      continue;
+    }
+    aheadSince = undefined;
+
+    if (highest === null) return true;
     let count: bigint;
     try {
       count = await chain.taskCount();
     } catch (error) {
+      if (!(await wait(`cannot read the task count (${describe(error)})`))) return false;
+      continue;
+    }
+    if (highest <= count) return true;
+    if (final >= indexed + skew) {
       throw new IndexerError(
-        `cannot ask the chain how many tasks ${chain.contractId} has (${describe(error)}), ` +
-          "and the database holds tasks that the services do not start on without checking " +
-          "them against it",
-        { cause: error },
+        `the database holds task ${highest}, but ${chain.contractId} has made ${count} on ` +
+          `${chain.network}, as read at its final block ${final}, past the last block the index ` +
+          `took (${indexed}). ${NODE_BEHIND} Or the database is the index of another contract or ` +
+          "chain, or of an earlier deploy of this contract (an account that was deleted and made " +
+          "again counts its tasks from 1): use a new database for this deploy (one database per " +
+          `contract deploy); ${KEEP_DATABASE}`,
       );
     }
-    if (highest <= count) return;
-    if (asked >= retries) {
-      throw new IndexerError(
-        `the database holds task ${highest}, but ${chain.contractId} has ${count} on ` +
-          `${chain.network}: it is the index of another deploy of Tender, since a contract ` +
-          "account that was deleted and made again counts its tasks from 1. A database serves " +
-          "one contract deploy: use a new database for this one (one database per contract " +
-          "deploy)",
-      );
-    }
-    await delay(retryMs);
+    const why =
+      `the node counts ${count} tasks, fewer than the ${highest} the database holds, and its ` +
+      `final block, ${final}, is too near the last block the index took, ${indexed}, to tell ` +
+      "whether it is behind";
+    if (!(await wait(why))) return false;
   }
 }
 
@@ -528,6 +648,24 @@ function blockHeight(value: unknown, what: string): bigint {
     );
   }
   return BigInt(value);
+}
+
+/**
+ * Where the indexer starts, as configured. Off the sandbox it throws, naming `INDEXER_START_HEIGHT`,
+ * when neither that nor a deployment record of this contract gives a height.
+ */
+function startOf(
+  env: Record<string, string | undefined>,
+  config: Config,
+  deploymentsDir: string = DEPLOYMENTS_DIR,
+): Start {
+  const start = configuredStart(env, config, deploymentsDir);
+  if (start.height === null && config.network !== "sandbox") {
+    throw new Error(
+      `no height to start indexing ${config.network} from: set INDEXER_START_HEIGHT (${start.why})`,
+    );
+  }
+  return start;
 }
 
 /** `INDEXER_START_HEIGHT`, or the `deployHeight` of this contract's deployment record. */

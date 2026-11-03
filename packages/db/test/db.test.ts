@@ -1,9 +1,11 @@
-import { spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { EventEmitter, once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { inspect } from "node:util";
 import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -13,7 +15,10 @@ import {
   getBlob,
   hasResultUpload,
   migrate,
+  type OpenDbOptions,
   openDb,
+  PGLITE_LOCK_BEAT_MS,
+  PGLITE_LOCK_STALE_MS,
   PgliteInUseError,
   putBlob,
   recordResultUpload,
@@ -1121,10 +1126,18 @@ describe("openDb", () => {
   });
 
   // PGlite keeps no lock on its directory, and two processes on the same files corrupt them. The
-  // lock is a pid file in the directory.
+  // lock is a file in the directory that its holder touches every 10 s, and that counts as left over
+  // after 30 s without a touch.
   describe("a PGlite directory's lock", () => {
+    const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
+    const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
+    // Short times for the tests that wait on them: a beat every 40 ms, stale after 0.6 s.
+    const FAST = { pgliteLock: { beatMs: 40, staleMs: 600 } };
+
     const bases: string[] = [];
+    const children: ChildProcess[] = [];
     afterEach(async () => {
+      for (const child of children.splice(0)) child.kill("SIGKILL");
       await Promise.all(bases.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
     });
     /** A directory to open, as a url, and the lock file in it. */
@@ -1139,11 +1152,27 @@ describe("openDb", () => {
         () => true,
         () => false,
       );
-    const failureOf = (url: string) =>
-      openDb(url).then(
+    const failureOf = (url: string, options?: OpenDbOptions) =>
+      openDb(url, options).then(
         () => undefined,
         (error: unknown) => error as Error,
       );
+    /** A lock file's text as a holder writes it. */
+    const holding = (pid: number, host = "some-host.local") =>
+      `${JSON.stringify({ token: randomBytes(8).toString("hex"), pid, host })}\n`;
+    /** Sets the time `file` was last touched to `ms` ago. */
+    const touchedAgo = async (file: string, ms: number) => {
+      const then = new Date(Date.now() - ms);
+      await utimes(file, then, then);
+    };
+    const touchedMs = async (file: string) => (await stat(file)).mtimeMs;
+    async function until(what: string, check: () => Promise<boolean>, ms: number): Promise<void> {
+      const giveUpAt = Date.now() + ms;
+      while (!(await check())) {
+        if (Date.now() > giveUpAt) throw new Error(`timed out waiting until ${what}`);
+        await delay(20);
+      }
+    }
 
     it(
       "belongs_to_the_one_process_that_has_the_directory_open_until_it_closes",
@@ -1151,7 +1180,8 @@ describe("openDb", () => {
       async () => {
         const { url, dir, lock } = await place();
         const first = await openDb(url);
-        expect(await readFile(lock, "utf8")).toBe(`${process.pid}\n`);
+        const held = JSON.parse(await readFile(lock, "utf8"));
+        expect(held).toEqual({ token: expect.any(String), pid: process.pid, host: hostname() });
 
         // This process again: refused, whatever way the directory is spelled, and the first goes on.
         for (const again of [url, `${url}/../data`]) {
@@ -1160,14 +1190,16 @@ describe("openDb", () => {
           expect(failure?.message).toMatch(/open already in this process/);
         }
         expect(await first.query("select 1 as one")).toEqual([{ one: 1 }]);
-        expect(await readFile(lock, "utf8")).toBe(`${process.pid}\n`);
+        expect(JSON.parse(await readFile(lock, "utf8"))).toEqual(held);
 
-        // Closing lets it go, once, and the directory opens again.
+        // Closing lets it go, once, and the directory opens again, under a lock of its own.
         await first.close();
         await first.close();
         expect(await exists(lock)).toBe(false);
         const second = await openDb(url);
-        expect(await readFile(lock, "utf8")).toBe(`${process.pid}\n`);
+        const next = JSON.parse(await readFile(lock, "utf8"));
+        expect(next.pid).toBe(process.pid);
+        expect(next.token).not.toBe(held.token);
         await second.close();
 
         // Two opens at once: one has it, the other is turned away.
@@ -1183,58 +1215,267 @@ describe("openDb", () => {
     );
 
     it(
-      "refuses_a_directory_while_another_process_has_it_and_takes_it_over_when_it_is_gone",
+      "beats_every_10_seconds_by_default_on_a_timer_that_does_not_keep_the_process_alive",
       MINUTE,
       async () => {
-        const { url, dir, lock } = await place();
-        await mkdir(dir, { recursive: true });
-        const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-          stdio: "ignore",
-        });
+        expect([PGLITE_LOCK_BEAT_MS, PGLITE_LOCK_STALE_MS]).toEqual([10_000, 30_000]);
+        const { url } = await place();
+        const timers = vi.spyOn(globalThis, "setTimeout");
         try {
-          const text = `${other.pid}\n`;
-          await writeFile(lock, text);
-          const failure = await failureOf(url);
-          expect(failure).toBeInstanceOf(PgliteInUseError);
-          // It names the directory, the process and the file to delete, and the lock stays as it was.
-          expect(failure?.message).toContain(dir);
-          expect(failure?.message).toContain(`process ${other.pid}`);
-          expect(failure?.message).toContain(`delete ${lock}`);
-          expect(await readFile(lock, "utf8")).toBe(text);
-
-          other.kill();
-          await once(other, "exit");
           const db = await openDb(url);
-          expect(await readFile(lock, "utf8")).toBe(`${process.pid}\n`);
+          const beats = timers.mock.results
+            .filter((_, index) => timers.mock.calls[index]?.[1] === PGLITE_LOCK_BEAT_MS)
+            .map((result) => result.value as NodeJS.Timeout);
           await db.close();
-          expect(await exists(lock)).toBe(false);
+          expect(beats.length).toBeGreaterThan(0);
+          expect(beats.some((timer) => !timer.hasRef())).toBe(true);
         } finally {
-          other.kill();
+          timers.mockRestore();
         }
       },
     );
 
-    it("takes_over_a_lock_that_names_no_process_that_runs", MINUTE, async () => {
+    it("turns_away_a_lock_that_was_touched_lately_whoever_it_names", MINUTE, async () => {
       const { url, dir, lock } = await place();
       await mkdir(dir, { recursive: true });
-      // A process that has run and ended, a leftover with this process's own pid (a container that
-      // restarts runs under the same pids), and files that name no pid.
+      // A fresh lock means a holder that renews it and lives, whatever the pid in it says: the pid
+      // of a process that does not run, of one that does, and no pid at all (a file made a moment
+      // ago and not written to yet, or text that is not a lock).
       const gone = spawnSync(process.execPath, ["-e", ""]).pid;
-      const leftovers = [
-        `${gone}\n`,
-        `${process.pid}\n`,
+      const named = [
+        holding(gone),
+        holding(process.ppid),
+        holding(process.pid, hostname()),
+        holding(4242, "bad host\u001b[2J"),
         "",
-        "not a pid\n",
-        "99999999999\n",
-        "0\n",
+        "not a lock\n",
+        "4242\n",
       ];
-      for (const text of leftovers) {
+      for (const text of named) {
         await writeFile(lock, text);
-        const db = await openDb(url);
-        expect(await readFile(lock, "utf8"), JSON.stringify(text)).toBe(`${process.pid}\n`);
-        expect(await db.query("select 1 as one")).toEqual([{ one: 1 }]);
+        // Well inside the 30 s.
+        await touchedAgo(lock, PGLITE_LOCK_STALE_MS - 10_000);
+        const before = await touchedMs(lock);
+        const failure = await failureOf(url);
+        expect(failure, JSON.stringify(text)).toBeInstanceOf(PgliteInUseError);
+        const message = failure?.message ?? "";
+        // It names the directory, how long ago the lock was renewed, and the file to delete.
+        expect(message).toContain(dir);
+        expect(message).toMatch(/renewed 20(\.\d)? s ago/);
+        expect(message).toContain("30 s");
+        expect(message).toContain(`delete ${lock}`);
+        expect(message).not.toContain("\u001b");
+        // The lock is left as it was.
+        expect(await readFile(lock, "utf8")).toBe(text);
+        expect(await touchedMs(lock)).toBe(before);
+      }
+
+      // The process is named when the lock says which.
+      await writeFile(lock, holding(gone));
+      expect((await failureOf(url))?.message).toContain(
+        `in use by process ${gone} on some-host.local`,
+      );
+      await writeFile(lock, "");
+      expect((await failureOf(url))?.message).toContain("in use by another process");
+    });
+
+    it(
+      "takes_over_a_lock_that_was_not_renewed_for_30_seconds_whatever_its_pid",
+      MINUTE,
+      async () => {
+        const { url, dir, lock } = await place();
+        await mkdir(dir, { recursive: true });
+        // A pid comes back: a container that restarts runs under the same pids, so the leftover of
+        // its last run can name a process that runs now, this one included. Only the beats say
+        // whether a holder lives.
+        const gone = spawnSync(process.execPath, ["-e", ""]).pid;
+        const leftovers = [
+          holding(process.pid, hostname()),
+          holding(process.ppid, hostname()),
+          holding(1, hostname()),
+          holding(gone),
+          "",
+          "not a lock\n",
+          "4242\n",
+        ];
+        for (const text of leftovers) {
+          await writeFile(lock, text);
+          await touchedAgo(lock, PGLITE_LOCK_STALE_MS + 10_000);
+          const db = await openDb(url);
+          const now = await readFile(lock, "utf8");
+          expect(now, JSON.stringify(text)).not.toBe(text);
+          expect(JSON.parse(now).pid).toBe(process.pid);
+          expect(await db.query("select 1 as one")).toEqual([{ one: 1 }]);
+          await db.close();
+          expect(await exists(lock)).toBe(false);
+        }
+      },
+    );
+
+    it(
+      "renews_its_lock_while_it_holds_the_directory_and_stops_when_it_lets_go",
+      MINUTE,
+      async () => {
+        const { url, lock } = await place();
+        const db = await openDb(url, FAST);
+        const text = await readFile(lock, "utf8");
+
+        // Made to look old, the file is touched again within a few beats, and is not rewritten.
+        await touchedAgo(lock, 5_000);
+        await until(
+          "the lock is renewed",
+          async () => Date.now() - (await touchedMs(lock)) < 1_000,
+          10_000,
+        );
+        expect(await readFile(lock, "utf8")).toBe(text);
+
+        // Closed, no beat puts it back.
         await db.close();
         expect(await exists(lock)).toBe(false);
+        await delay(5 * FAST.pgliteLock.beatMs);
+        expect(await exists(lock)).toBe(false);
+      },
+    );
+
+    it(
+      "puts_back_a_lock_that_was_deleted_and_leaves_one_that_another_process_made",
+      MINUTE,
+      async () => {
+        const { url, lock } = await place();
+        const db = await openDb(url, FAST);
+        const text = await readFile(lock, "utf8");
+
+        await rm(lock);
+        await until("the lock is put back", () => exists(lock), 10_000);
+        expect(await readFile(lock, "utf8")).toBe(text);
+
+        // A holder that was away for longer than the lock lasts finds the directory taken. The new
+        // holder's lock is not touched, nor removed when the old one closes.
+        const taken = holding(4242);
+        await writeFile(lock, taken);
+        await touchedAgo(lock, 1_000);
+        const before = await touchedMs(lock);
+        await delay(8 * FAST.pgliteLock.beatMs);
+        expect(await readFile(lock, "utf8")).toBe(taken);
+        expect(await touchedMs(lock)).toBe(before);
+        await db.close();
+        expect(await readFile(lock, "utf8")).toBe(taken);
+      },
+    );
+
+    /**
+     * A process that opens `url` with short times, says "ready", and then stays up, or ends with
+     * `process.exit` at once when `exit` is set, without closing the database.
+     */
+    function holder(url: string, exit = false) {
+      const script = `
+        import { openDb } from ${JSON.stringify(pathToFileURL(join(PACKAGE_ROOT, "src", "index.ts")).href)};
+        await openDb(process.env.HOLD_URL, { pgliteLock: { beatMs: 100, staleMs: 1500 } });
+        process.stdout.write("ready\\n", () => {
+          if (process.env.HOLD_EXIT === "1") process.exit(0);
+        });
+        setInterval(() => {}, 1000);
+      `;
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "-e", script],
+        {
+          cwd: REPO_ROOT,
+          env: { ...process.env, HOLD_URL: url, HOLD_EXIT: exit ? "1" : "0" },
+          stdio: ["ignore", "pipe", "inherit"],
+        },
+      );
+      children.push(child);
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      const ready = new Promise<void>((resolve, reject) => {
+        let output = "";
+        child.stdout.on("data", (chunk) => {
+          output += String(chunk);
+          if (output.includes("ready\n")) resolve();
+        });
+        void exited.then(() => reject(new Error("the process that holds the directory ended")));
+        setTimeout(
+          () => reject(new Error("the process did not open the directory in time")),
+          45_000,
+        ).unref();
+      });
+      // Seen even if the test ends before it is awaited.
+      ready.catch(() => undefined);
+      return { child, ready, exited };
+    }
+
+    it(
+      "turns_a_second_process_away_while_the_first_renews_and_takes_over_after_it_is_killed",
+      MINUTE,
+      async () => {
+        const { url, lock } = await place();
+        const { child, ready, exited } = holder(url);
+        await ready;
+        const timing = { pgliteLock: { beatMs: 100, staleMs: 1500 } };
+
+        const failure = await failureOf(url, timing);
+        expect(failure).toBeInstanceOf(PgliteInUseError);
+        expect(failure?.message).toContain(`delete ${lock}`);
+        // Past the time a lock lasts untouched, so that only its beats keep it from being taken.
+        await delay(2_500);
+        expect(await failureOf(url, timing)).toBeInstanceOf(PgliteInUseError);
+
+        // Killed, the holder cannot clean up. Its pid is gone at once, and the directory is not
+        // handed over until the lock has gone without a beat for as long as a lock lasts.
+        child.kill("SIGKILL");
+        await exited;
+        const killedAt = Date.now();
+        let db: Db | undefined;
+        await until(
+          "the lock goes stale and the directory is taken over",
+          async () => {
+            try {
+              db = await openDb(url, timing);
+              return true;
+            } catch (error) {
+              if (error instanceof PgliteInUseError) return false;
+              throw error;
+            }
+          },
+          30_000,
+        );
+        // The last beat came within 100 ms before the kill; allow for a late one.
+        expect(Date.now() - killedAt).toBeGreaterThanOrEqual(1_000);
+        expect(await db?.query("select 1 as one")).toEqual([{ one: 1 }]);
+        expect(JSON.parse(await readFile(lock, "utf8")).pid).toBe(process.pid);
+        await db?.close();
+        expect(await exists(lock)).toBe(false);
+      },
+    );
+
+    it("a_process_that_ends_without_closing_the_database_leaves_no_lock", MINUTE, async () => {
+      const { url, lock } = await place();
+      const { ready, exited } = holder(url, true);
+      await ready;
+      await exited;
+      // Not stale yet by a long way, and gone all the same: the next start is not turned away.
+      expect(await exists(lock)).toBe(false);
+      const db = await openDb(url);
+      expect(await db.query("select 1 as one")).toEqual([{ one: 1 }]);
+      await db.close();
+    });
+
+    it("refuses_times_that_cannot_work_before_it_touches_the_directory", async () => {
+      const { url, dir } = await place();
+      const bad = [
+        { beatMs: 0 },
+        { beatMs: -1 },
+        { beatMs: Number.NaN },
+        { staleMs: Number.POSITIVE_INFINITY },
+        { beatMs: 100, staleMs: 100 },
+        { staleMs: PGLITE_LOCK_BEAT_MS },
+        { beatMs: PGLITE_LOCK_STALE_MS },
+      ];
+      for (const pgliteLock of bad) {
+        await expect(openDb(url, { pgliteLock }), JSON.stringify(pgliteLock)).rejects.toThrow(
+          RangeError,
+        );
+        expect(await exists(dir)).toBe(false);
       }
     });
 
@@ -1243,9 +1484,12 @@ describe("openDb", () => {
       await mkdir(dir, { recursive: true });
       // Not a data directory, and not empty: initdb refuses it, or the open does.
       await writeFile(join(dir, "PG_VERSION"), "not a version\n");
-      const failure = await failureOf(url);
+      const failure = await failureOf(url, FAST);
       expect(failure).toBeInstanceOf(Error);
       expect(failure).not.toBeInstanceOf(PgliteInUseError);
+      expect(await exists(lock)).toBe(false);
+      // And no beat makes it again.
+      await delay(5 * FAST.pgliteLock.beatMs);
       expect(await exists(lock)).toBe(false);
     });
   });

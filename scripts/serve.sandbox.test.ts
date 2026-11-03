@@ -1,11 +1,11 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseEnv } from "node:util";
 import { ApiClient, type LocalChain, startLocalChain, TenderClient } from "@tender/client";
-import { migrate, openDb, type SessionLock } from "@tender/db";
+import { type Db, migrate, openDb, type SessionLock } from "@tender/db";
 import { sha256Hex } from "@tender/shared";
 import { BOT_COMMANDS } from "@tender/telegram";
 import { KeyPair } from "near-api-js";
@@ -990,4 +990,199 @@ test("serve_refuses_a_database_that_holds_the_index_of_another_deploy", async ()
   // Nothing served from it, and what had started is stopped: the directory opens again.
   expect(lines.filter((line) => line.startsWith("serve: API at"))).toEqual([]);
   await (await openDb(url)).close();
+});
+
+// ---- The database against the chain ------------------------------------------------------------
+
+/**
+ * A PGlite directory of its own with a real index in it: a task the chain holds, and the cursor
+ * after its block. The first call makes it, by serving, posting a task and stopping; every call
+ * copies it, so that a test may change what it holds.
+ */
+let indexed: Promise<{ dir: string; taskId: bigint; cursor: bigint }> | undefined;
+async function indexedCopy(): Promise<{ url: string; taskId: bigint; cursor: bigint }> {
+  indexed ??= (async () => {
+    const base = await mkdtemp(join(tmpdir(), "tender-serve-master-"));
+    dirs.push(base);
+    const dir = join(base, "index");
+    const services = await serve(envFor({ DATABASE_URL: `pglite:${dir}` }), []);
+    const taskId = await postTask();
+    await until(
+      `the index holds task ${taskId}`,
+      async () => (await fetch(`${services.url}/v1/tasks/${taskId}`)).status === 200,
+      30_000,
+    );
+    await services.stop();
+    const db = await openDb(`pglite:${dir}`);
+    const [row] = await db.query<{ height: string }>(
+      "select height::text as height from chain_cursor",
+    );
+    await db.close();
+    return { dir, taskId, cursor: BigInt(row?.height ?? "0") };
+  })();
+  const { dir, taskId, cursor } = await indexed;
+  const base = await mkdtemp(join(tmpdir(), "tender-serve-copy-"));
+  dirs.push(base);
+  await cp(dir, join(base, "index"), { recursive: true });
+  return { url: `pglite:${join(base, "index")}`, taskId, cursor };
+}
+
+/** Changes what a copy of the index holds: `change` is given the database, which is closed after. */
+async function changing(url: string, change: (db: Db) => Promise<void>): Promise<void> {
+  const db = await openDb(url);
+  try {
+    await change(db);
+  } finally {
+    await db.close();
+  }
+}
+
+/** Stores a task of id `id` as the index would. */
+async function indexTask(db: Db, id: number): Promise<void> {
+  await db.query(
+    `insert into tasks (id, poster, token, reward, fee_bps, brief_uri, brief_hash, criteria_hash,
+       verifier, created_at, commit_deadline, reveal_deadline, pick_deadline, fallback_deadline,
+       max_entries, max_winners, invited, created_height)
+     values ($1, 'poster.test.near', 'token.test.near', 1, 0, 'uri', 'h', 'h', 'judge.test.near',
+       1, 1, 1, 1, 1, 1, 1, '[]', 1)`,
+    [id],
+  );
+}
+
+/** The reads of the chain that the check makes, over `reader`, failing as `fails` says. */
+function chainThatFails(fails: { final: number; count: number }) {
+  const asks = { final: 0, count: 0 };
+  const down = () => new Error("fetch failed for https://rpc.example.org/?apiKey=s3cret");
+  return {
+    asks,
+    chain: {
+      network: reader.network,
+      contractId: reader.contractId,
+      finalHeight: async () => {
+        asks.final += 1;
+        if (asks.final <= fails.final) throw down();
+        return reader.finalHeight();
+      },
+      taskCount: async () => {
+        asks.count += 1;
+        if (asks.count <= fails.count) throw down();
+        return reader.taskCount();
+      },
+    },
+  };
+}
+
+test("serve_serves_while_the_chain_cannot_be_asked_and_indexes_once_it_can", async () => {
+  const { url, taskId, cursor } = await indexedCopy();
+  const flaky = chainThatFails({ final: 2, count: 1 });
+  const lines: string[] = [];
+  const services = await serve(envFor({ DATABASE_URL: url, ...keeperEnv(200) }), lines, {
+    deployment: { chain: flaky.chain, retryMs: 20, longestMs: 40 },
+  });
+
+  // The services are up on the first failed read: the API serves the index as it is, and none of
+  // the indexer, the keeper and the Judge has started, since nothing says yet whose index it is.
+  const early = lines.slice();
+  expect(early).toContain(
+    "WARN indexer: cannot check the database against the chain yet (cannot read the final " +
+      "block (Error)); trying again in 0.02 s",
+  );
+  expect(early.filter((line) => /^serve: API at/.test(line))).toHaveLength(1);
+  expect(early.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
+  expect(early.some((line) => line.startsWith("serve: keeper on"))).toBe(false);
+  const served = await health(services.url);
+  expect(served.status).toBe(200);
+  expect(BigInt(served.body.indexed_height)).toBe(cursor);
+  expect((await fetch(`${services.url}/v1/tasks/${taskId}`)).status).toBe(200);
+
+  // Once the node answers, the database is found to match, and they start.
+  await until(
+    "the keeper and the indexer start",
+    async () => lines.some((line) => line.startsWith("serve: keeper on")),
+    30_000,
+  );
+  expect(lines).toContain(
+    "indexer: the database matches the chain; starting the indexer and the keeper",
+  );
+  expect(lines.some((line) => line.startsWith("indexer: resuming after block"))).toBe(true);
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([]);
+  expect(flaky.asks.final).toBeGreaterThan(2);
+  expect(flaky.asks.count).toBeGreaterThan(1);
+  // What the failed reads quoted does not show.
+  expect(lines.filter((line) => line.includes("s3cret"))).toEqual([]);
+  await services.stop();
+});
+
+test("serve_refuses_the_index_of_another_chain_and_goes_on_serving_it", async () => {
+  const { url, cursor } = await indexedCopy();
+  // A task the chain has not made: the index of a contract that was made again under this name.
+  await changing(url, (db) => indexTask(db, 999));
+  const lines: string[] = [];
+  const services = await serve(envFor({ DATABASE_URL: url, ...keeperEnv(200) }), lines);
+
+  const refused = lines.filter((line) => line.startsWith("ERROR"));
+  expect(refused).toHaveLength(1);
+  expect(refused[0]).toMatch(
+    /^ERROR indexer: cannot start the indexer and the keeper \(the database holds task 999, but .* has made \d+ on sandbox, as read at its final block \d+, past the last block the index took \(\d+\)\. Either the node at NEAR_RPC_URL is behind the chain: wait for it/,
+  );
+  expect(refused[0]).toContain(
+    "use a new database for this deploy (one database per contract deploy)",
+  );
+  expect(refused[0]).toMatch(/; not trying again$/);
+
+  // The API serves, and nothing writes: the cursor stays where it was while the chain moves on.
+  await postTask();
+  await sleep(1_500);
+  expect((await health(services.url)).status).toBe(200);
+  expect(BigInt((await health(services.url)).body.indexed_height)).toBe(cursor);
+  expect(lines.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
+  expect(lines.some((line) => line.startsWith("serve: keeper on"))).toBe(false);
+
+  // It stops all the same, and lets the database go.
+  await services.stop();
+  expect(lines.at(-1)).toBe("serve: stopped");
+  await (await openDb(url)).close();
+});
+
+test("serve_refuses_an_index_that_is_ahead_of_the_chain_as_one_of_a_new_chain", async () => {
+  const { url, cursor } = await indexedCopy();
+  // The chain was started afresh under the same contract name: its blocks are below the cursor.
+  const ahead = cursor + 1_000_000n;
+  await changing(url, async (db) => {
+    await db.query("update chain_cursor set height = $1", [ahead]);
+  });
+  const lines: string[] = [];
+  const services = await serve(envFor({ DATABASE_URL: url }), lines);
+
+  const refused = lines.filter((line) => line.startsWith("ERROR"));
+  expect(refused).toHaveLength(1);
+  expect(refused[0]).toContain(
+    `the index took block ${ahead}, but the final block of sandbox at the node is`,
+  );
+  expect(refused[0]).toContain("a new chain under this contract name needs a new database");
+  expect((await health(services.url)).status).toBe(200);
+  expect(lines.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
+  await services.stop();
+});
+
+test("stopping_ends_the_wait_for_a_chain_that_never_answers", async () => {
+  const { url } = await indexedCopy();
+  const down = chainThatFails({ final: Number.MAX_SAFE_INTEGER, count: 0 });
+  const lines: string[] = [];
+  const services = await serve(envFor({ DATABASE_URL: url }), lines, {
+    deployment: { chain: down.chain, retryMs: 20, longestMs: 40 },
+  });
+  await until("the node has been asked several times", async () => down.asks.final >= 5, 10_000);
+  expect((await health(services.url)).status).toBe(200);
+
+  const stopped = Date.now();
+  await services.stop();
+  expect(Date.now() - stopped).toBeLessThan(5_000);
+  // Nothing asks the node after the stop, and nothing was refused: the node was only waited for.
+  const asked = down.asks.final;
+  await sleep(300);
+  expect(down.asks.final).toBe(asked);
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([]);
+  expect(lines.some((line) => line.startsWith("indexer: resuming"))).toBe(false);
+  expect(lines.at(-1)).toBe("serve: stopped");
 });

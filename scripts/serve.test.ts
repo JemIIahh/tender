@@ -1,11 +1,13 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { Console } from "node:console";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { inspect } from "node:util";
 import type { KeyPermission } from "@tender/client";
 import { LockNotHeldError, type SessionLock } from "@tender/db";
+import { IndexerError } from "@tender/indexer";
 import { KeyPair, type KeyPairString } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
 import { REPO_ROOT } from "./lib/env";
@@ -21,6 +23,7 @@ import {
   ServeConfigError,
   type Stoppable,
   serveEnv,
+  startAfterCheck,
   withLoops,
 } from "./serve";
 
@@ -730,43 +733,62 @@ test("a_real_console_prints_nothing_secret_by_any_of_its_methods", async () => {
   expect(has("Error: fetch failed for https:"), "error with an Error").toBe(true);
 });
 
-test("a_crash_prints_through_the_redaction_and_ends_the_process_with_1", () => {
+test("a_crash_writes_one_redacted_line_and_then_ends_the_process_with_1", () => {
   // Node prints an uncaught exception and an unhandled rejection itself, outside the redaction.
-  const { printed, target } = keepingConsole();
-  redactConsole({ TELEGRAM_BOT_TOKEN: BOT_TOKEN }, target);
+  const order: string[] = [];
+  const written: string[] = [];
   const handlers = new Map<string, (error: unknown) => void>();
-  const exit = vi.fn();
+  const exit = vi.fn(() => {
+    order.push("exit");
+  });
   const proc = {
     on(event: string, listener: (error: unknown) => void) {
       handlers.set(event, listener);
     },
     exit,
   };
-  exitOnCrash(proc, (...args) => target.error(...args));
+  const env = { TELEGRAM_BOT_TOKEN: BOT_TOKEN };
+  exitOnCrash(env, proc, (text) => {
+    order.push("write");
+    written.push(text);
+  });
   expect([...handlers.keys()].sort()).toEqual(["uncaughtException", "unhandledRejection"]);
 
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/getMe`;
   handlers.get("uncaughtException")?.(new Error(`getaddrinfo ENOTFOUND for ${url}`));
-  expect(printed.error).toHaveLength(1);
-  expect(printed.error[0]).toMatch(
-    /^serve: uncaught exception: Error: getaddrinfo ENOTFOUND for https:\/\/api\.telegram\.org\/bot<TELEGRAM_BOT_TOKEN>\/getMe\n {4}at /,
+  expect(written).toHaveLength(1);
+  expect(written[0]).toMatch(
+    /^serve: uncaught exception: Error: getaddrinfo ENOTFOUND for https:\/\/api\.telegram\.org\/bot<TELEGRAM_BOT_TOKEN>\/getMe\n {4}at [\s\S]*\n$/,
   );
-  expect(exit).toHaveBeenCalledTimes(1);
+  // The line is written before the process ends, and the process ends with 1.
+  expect(order).toEqual(["write", "exit"]);
   expect(exit).toHaveBeenLastCalledWith(1);
 
   // A rejection can be of anything.
   handlers.get("unhandledRejection")?.(`refused: ${url}`);
-  expect(printed.error[1]).toBe(
-    "serve: unhandled rejection: refused: https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getMe",
+  expect(written[1]).toBe(
+    "serve: unhandled rejection: refused: https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getMe\n",
   );
   expect(exit).toHaveBeenCalledTimes(2);
   expect(exit).toHaveBeenLastCalledWith(1);
-  expect(printed.error.join("\n")).not.toContain(BOT_TOKEN.slice("123456789:".length));
+  expect(written.join("\n")).not.toContain(BOT_TOKEN.slice("123456789:".length));
 
-  // A console that cannot print (a closed pipe) does not keep the process alive.
+  // An error that cannot be formatted gives a fixed line: the process still says what ended it.
+  const hostile = {
+    [inspect.custom]() {
+      throw new Error(`cannot inspect ${url}`);
+    },
+  };
+  handlers.get("unhandledRejection")?.(hostile);
+  expect(written[2]).toBe("serve: unhandled rejection (it cannot be shown)\n");
+  expect(exit).toHaveBeenCalledTimes(3);
+  expect(exit).toHaveBeenLastCalledWith(1);
+
+  // A stderr that cannot be written (a closed pipe) does not keep the process alive.
   exit.mockClear();
   const broken = new Map<string, (error: unknown) => void>();
   exitOnCrash(
+    env,
     {
       on(event: string, listener: (error: unknown) => void) {
         broken.set(event, listener);
@@ -793,8 +815,9 @@ test("a_real_crash_of_the_process_is_printed_redacted_and_exits_with_1", () => {
   for (const [what, [label, crash]] of Object.entries(crashes)) {
     const script = `
       import { exitOnCrash, redactConsole } from ${JSON.stringify(join(REPO_ROOT, "scripts", "serve.ts"))};
-      redactConsole({ TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN });
-      exitOnCrash();
+      const env = { TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN };
+      redactConsole(env);
+      exitOnCrash(env);
       const url = "request to https://api.telegram.org/bot" + process.env.TELEGRAM_BOT_TOKEN + "/getMe failed";
       ${crash}
       setTimeout(() => process.exit(0), 10_000);
@@ -814,6 +837,56 @@ test("a_real_crash_of_the_process_is_printed_redacted_and_exits_with_1", () => {
       `serve: ${label}: Error: request to https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getMe failed`,
     );
     expect(run.stderr, what).not.toContain(BOT_TOKEN.slice("123456789:".length));
+  }
+}, 180_000);
+
+test("a_crash_line_arrives_whole_when_stderr_is_full_and_its_reader_is_slow", async () => {
+  // A line written through a stream, with the process ending right after it, is cut short when the
+  // pipe is full: the stream holds it behind what it has queued already. The crash waits for the
+  // pipe instead.
+  const script = `
+    import { exitOnCrash, redactConsole } from ${JSON.stringify(join(REPO_ROOT, "scripts", "serve.ts"))};
+    const env = { TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN };
+    redactConsole(env);
+    exitOnCrash(env);
+    // More than a pipe holds, queued behind each other, and then the crash.
+    for (let i = 0; i < 64; i++) console.error("filler " + "x".repeat(8192));
+    console.log("ready");
+    setTimeout(() => {
+      throw new Error("failed: https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/getMe");
+    }, 50);
+    setTimeout(() => process.exit(0), 30_000);
+  `;
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+    cwd: REPO_ROOT,
+    env: { ...process.env, TELEGRAM_BOT_TOKEN: BOT_TOKEN },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  // Noted from the start: a child that ends at once, as one does that cuts its line short, must
+  // not be waited for after it has gone.
+  const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
+  const closed = new Promise<void>((resolve) => child.stderr.once("close", () => resolve()));
+  try {
+    // Nothing reads stderr until the child is ready, and then for a little longer still.
+    await new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (chunk.toString().includes("ready")) resolve();
+      });
+      void exited.then(() => reject(new Error("the child ended before it was ready")));
+    });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const chunks: Buffer[] = [];
+    child.stderr.on("data", (chunk: Buffer) => chunks.push(chunk));
+    const [code] = await Promise.all([exited, closed]);
+    const text = Buffer.concat(chunks).toString();
+    expect(code, text.slice(-500)).toBe(1);
+    expect(text).toContain(
+      "serve: uncaught exception: Error: failed: https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getMe",
+    );
+    expect(text).not.toContain(BOT_TOKEN.slice("123456789:".length));
+  } finally {
+    child.kill("SIGKILL");
   }
 }, 180_000);
 
@@ -1287,4 +1360,156 @@ test("stopping_while_waiting_for_the_lock_ends_the_wait", async () => {
   expect(Date.now() - started).toBeLessThan(1_000);
   expect(events).toEqual([]);
   expect(tryLock).toHaveBeenCalledTimes(1);
+});
+
+// ---- The check of the database against the chain ----------------------------------------------
+
+type OnWait = (why: string, retryMs: number) => void;
+
+test("the_work_starts_once_the_database_matches_the_chain_and_stops_with_it", async () => {
+  const { events, start } = counted();
+  const lines: string[] = [];
+  const checked = startAfterCheck({
+    check: async () => true,
+    start,
+    guards: "the indexer",
+    log: (line) => lines.push(line),
+  });
+  await checked.settled;
+  expect(events).toEqual(["start"]);
+  expect(lines).toEqual([]);
+  await checked.stop();
+  expect(events).toEqual(["start", "stop"]);
+});
+
+test("a_check_that_waits_says_why_each_time_and_the_work_starts_when_it_goes_through", async () => {
+  const { events, start } = counted();
+  const lines: string[] = [];
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const checked = startAfterCheck({
+    check: async (_signal: AbortSignal, onWait: OnWait) => {
+      onWait("cannot read the final block (Error ECONNREFUSED)", 2_000);
+      onWait("cannot read the task count (Error)", 4_000);
+      await gate;
+      return true;
+    },
+    start,
+    guards: "the indexer and the keeper",
+    log: (line) => lines.push(line),
+  });
+  // The first wait is the first word: the services can come up on it, with the work still to start.
+  await checked.settled;
+  expect(events).toEqual([]);
+  expect(lines).toEqual([
+    "WARN indexer: cannot check the database against the chain yet (cannot read the final " +
+      "block (Error ECONNREFUSED)); trying again in 2 s",
+    "WARN indexer: cannot check the database against the chain yet (cannot read the task " +
+      "count (Error)); trying again in 4 s",
+  ]);
+
+  release();
+  await vi.waitFor(() => expect(events).toEqual(["start"]));
+  expect(lines.at(-1)).toBe(
+    "indexer: the database matches the chain; starting the indexer and the keeper",
+  );
+  await checked.stop();
+  expect(events).toEqual(["start", "stop"]);
+});
+
+test("a_refused_database_is_logged_as_an_error_and_nothing_starts", async () => {
+  const { events, start } = counted();
+  const lines: string[] = [];
+  const refusal = new IndexerError(
+    "the database holds task 7, but tender.test.near has made 3 on testnet (one database per " +
+      "contract deploy)",
+  );
+  const checked = startAfterCheck({
+    check: async () => {
+      throw refusal;
+    },
+    start,
+    guards: "the indexer, the keeper and the Judge",
+    log: (line) => lines.push(line),
+  });
+  await checked.settled;
+  expect(lines).toEqual([
+    `ERROR indexer: cannot start the indexer, the keeper and the Judge (${refusal.message}); ` +
+      "not trying again",
+  ]);
+  await checked.stop();
+  expect(events).toEqual([]);
+
+  // Anything else that goes wrong is said by its name only: its message can quote a URL with a key.
+  const other: string[] = [];
+  const odd = startAfterCheck({
+    check: async () => {
+      throw Object.assign(new Error("failed: https://rpc.example/?key=s3cret"), {
+        code: "ECONNRESET",
+      });
+    },
+    start,
+    guards: "the indexer",
+    log: (line) => other.push(line),
+  });
+  await odd.settled;
+  expect(other).toEqual([
+    "ERROR indexer: cannot start the indexer (Error ECONNRESET); not trying again",
+  ]);
+  expect(events).toEqual([]);
+});
+
+test("stopping_ends_the_wait_of_a_check_and_the_work_never_starts", async () => {
+  const { events, start } = counted();
+  let signalSeen: AbortSignal | undefined;
+  const checked = startAfterCheck({
+    check: (signal: AbortSignal, onWait: OnWait) =>
+      new Promise<boolean>((resolve) => {
+        signalSeen = signal;
+        onWait("the final block of the node, 5, is below the last block the index took, 99", 1);
+        signal.addEventListener("abort", () => resolve(false), { once: true });
+      }),
+    start,
+    guards: "the indexer",
+    log: () => undefined,
+  });
+  await checked.settled;
+  const started = Date.now();
+  await checked.stop();
+  expect(Date.now() - started).toBeLessThan(1_000);
+  expect(signalSeen?.aborted).toBe(true);
+  expect(events).toEqual([]);
+
+  // A check that goes through just as the stop comes does not start the work either.
+  const late = startAfterCheck({
+    check: async (signal: AbortSignal) => {
+      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+      return true;
+    },
+    start,
+    guards: "the indexer",
+    log: () => undefined,
+  });
+  await late.stop();
+  expect(events).toEqual([]);
+});
+
+test("a_work_that_throws_as_it_starts_is_logged_like_any_failure_to_start", async () => {
+  const lines: string[] = [];
+  const checked = startAfterCheck({
+    check: async () => true,
+    start: () => {
+      throw new Error("no height to start indexing testnet from");
+    },
+    guards: "the indexer",
+    log: (line) => lines.push(line),
+  });
+  await checked.settled;
+  expect(lines).toEqual([
+    "ERROR indexer: cannot start the indexer (no height to start indexing testnet from); not " +
+      "trying again",
+  ]);
+  await checked.stop();
 });

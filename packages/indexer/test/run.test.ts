@@ -6,7 +6,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vi
 import {
   type BlockSource,
   BlocksLostError,
-  checkDeployment,
+  checkAgainstChain,
+  checkCursorSource,
+  checkIndexerEnv,
   IndexerError,
   type ReconcileChain,
   runIndexer,
@@ -500,10 +502,10 @@ test("it_names_the_variable_that_is_missing_or_wrong", () => {
   ).toThrow(/DATABASE_URL/);
 });
 
-// ---- checkDeployment --------------------------------------------------------------------------
+// ---- The database against the deploy ----------------------------------------------------------
 
-/** Stores a task of id `id` as the index would, under the cursor of `source` when it is given. */
-async function indexTask(id: number, source?: string): Promise<void> {
+/** Stores a task of id `id` as the index would. */
+async function indexTask(id: number): Promise<void> {
   await db.query(
     `insert into tasks (id, poster, token, reward, fee_bps, brief_uri, brief_hash, criteria_hash,
        verifier, created_at, commit_deadline, reveal_deadline, pick_deadline, fallback_deadline,
@@ -512,104 +514,330 @@ async function indexTask(id: number, source?: string): Promise<void> {
        1, 1, 1, 1, 1, 1, 1, '[]', 1)`,
     [id],
   );
-  if (source !== undefined) {
-    await db.query("insert into chain_cursor (source, height) values ($1, 5)", [source]);
-  }
 }
 
-/** What `checkDeployment` throws for `chain`, with the asks it made of the chain's task count. */
-async function deploymentCheck(taskCounts: Array<bigint | Error>, retries = 3) {
-  const asked: number[] = [];
-  const chain = emptyChain(0n, {
-    taskCount: async () => {
-      asked.push(asked.length);
-      const next = taskCounts[Math.min(asked.length - 1, taskCounts.length - 1)];
-      if (next instanceof Error) throw next;
-      return next ?? 0n;
-    },
-  });
-  const failure = await checkDeployment(db, chain, { retries, retryMs: 1 }).then(
-    () => undefined,
-    (error: unknown) => error as Error,
-  );
-  return { failure, asks: asked.length };
+async function setCursor(source: string, height: bigint): Promise<void> {
+  await db.query("insert into chain_cursor (source, height) values ($1, $2)", [source, height]);
 }
 
-test("a_database_with_no_task_passes_without_asking_the_chain", async () => {
-  // Empty, or with this deploy's cursor alone: nothing to compare, and the chain is not asked.
-  const down = new Error(`fetch failed for ${KEYED}`);
-  expect(await deploymentCheck([down])).toEqual({ failure: undefined, asks: 0 });
-  await db.query("insert into chain_cursor (source, height) values ($1, 5)", [TESTNET_CURSOR]);
-  expect(await deploymentCheck([down])).toEqual({ failure: undefined, asks: 0 });
-});
+/** The deploy that `checkCursorSource` is asked about: the fixture contract on testnet. */
+const DEPLOY = { network: "testnet", contractId: FIXTURE_CONTRACT };
 
-test("a_database_whose_cursor_names_another_source_is_refused", async () => {
-  await indexTask(1, "testnet:old.testnet");
-  const { failure, asks } = await deploymentCheck([5n]);
+test("a_cursor_of_another_source_is_refused_at_the_start_without_asking_the_chain", async () => {
+  const failureOf = () =>
+    checkCursorSource(db, DEPLOY).then(
+      () => undefined,
+      (error: unknown) => error as Error,
+    );
+  // Nothing indexed, or this deploy's cursor alone: nothing to refuse.
+  expect(await failureOf()).toBeUndefined();
+  await setCursor(TESTNET_CURSOR, 5n);
+  expect(await failureOf()).toBeUndefined();
+
+  await setCursor("testnet:old.testnet", 5n);
+  const failure = await failureOf();
   expect(failure).toBeInstanceOf(IndexerError);
-  // It names the other source and this deploy, says what to do, and asks nothing of the chain.
+  // It names the other source and this deploy, and says what to do.
   expect(failure?.message).toMatch(/another deploy of Tender/);
   expect(failure?.message).toContain('"testnet:old.testnet"');
   expect(failure?.message).toContain(`"${TESTNET_CURSOR}"`);
   expect(failure?.message).toContain("one database per contract deploy");
-  expect(asks).toBe(0);
 
-  // Own cursor besides makes no difference, and a long list is cut short.
-  await db.query("insert into chain_cursor (source, height) values ($1, 9)", [TESTNET_CURSOR]);
+  // A long list is cut short.
   for (const other of ["mainnet:a.near", "mainnet:b.near", "mainnet:c.near"]) {
-    await db.query("insert into chain_cursor (source, height) values ($1, 9)", [other]);
+    await setCursor(other, 9n);
   }
-  const many = await deploymentCheck([5n]);
-  expect(many.failure?.message).toContain('"mainnet:a.near", "mainnet:b.near", "mainnet:c.near"');
-  expect(many.failure?.message).toMatch(/ and others, and this deploy/);
-  expect(many.failure?.message).not.toContain("old.testnet");
+  const many = await failureOf();
+  expect(many?.message).toContain('"mainnet:a.near", "mainnet:b.near", "mainnet:c.near"');
+  expect(many?.message).toMatch(/ and others, and this deploy/);
+  expect(many?.message).not.toContain("old.testnet");
 
   // A cursor that is only a prefix of this deploy's is another's.
   await db.exec("truncate chain_cursor");
-  await db.query("insert into chain_cursor (source, height) values ($1, 9)", [
-    `${TESTNET_CURSOR}2`,
-  ]);
-  expect((await deploymentCheck([5n])).failure).toBeInstanceOf(IndexerError);
+  await setCursor(`${TESTNET_CURSOR}2`, 9n);
+  expect(await failureOf()).toBeInstanceOf(IndexerError);
 });
 
-test("a_task_above_the_chains_count_is_refused_after_asking_again", async () => {
-  await indexTask(7, TESTNET_CURSOR);
-  const { failure, asks } = await deploymentCheck([5n]);
-  expect(failure).toBeInstanceOf(IndexerError);
-  expect(failure?.message).toContain(`holds task 7, but ${FIXTURE_CONTRACT} has 5 on testnet`);
-  expect(failure?.message).toContain("one database per contract deploy");
-  // The first ask and the three retries.
-  expect(asks).toBe(4);
-  expect((await deploymentCheck([5n], 0)).asks).toBe(1);
-  // Whatever the highest id is, not the newest row.
-  await indexTask(3);
-  expect((await deploymentCheck([6n])).failure?.message).toContain("holds task 7");
+/** The Nth answer to the Nth ask, the last one for every ask after it; an `Error` is thrown. */
+function answers<T>(list: Array<T | Error>): () => Promise<T> {
+  let asked = 0;
+  return async () => {
+    const next = list[Math.min(asked++, list.length - 1)] as T | Error;
+    if (next instanceof Error) throw next;
+    return next;
+  };
+}
+
+/** A chain that answers its final height and its task count from lists, counting the asks. */
+function answering(
+  finals: Array<bigint | Error>,
+  counts: Array<bigint | Error>,
+  over: Partial<ReconcileChain> = {},
+) {
+  const asks = { final: 0, count: 0 };
+  const finalHeight = answers(finals);
+  const taskCount = answers(counts);
+  const chain = emptyChain(0n, {
+    finalHeight: () => {
+      asks.final += 1;
+      return finalHeight();
+    },
+    taskCount: () => {
+      asks.count += 1;
+      return taskCount();
+    },
+    ...over,
+  });
+  return { chain, asks };
+}
+
+/**
+ * What `checkAgainstChain` makes of `chain`: whether it went through, the refusal if there is one,
+ * and why it waited each time. It waits 1 to 2 ms, and a cursor ahead of the node is refused after
+ * `aheadMs`, 20 ms unless given.
+ */
+async function againstChain(
+  chain: ReconcileChain,
+  over: Parameters<typeof checkAgainstChain>[2] = {},
+) {
+  const waits: string[] = [];
+  const outcome = await checkAgainstChain(db, chain, {
+    retryMs: 1,
+    longestMs: 2,
+    aheadMs: 20,
+    onWait: (why) => waits.push(why),
+    ...over,
+  }).then(
+    (ok) => ({ ok, failure: undefined }),
+    (error: unknown) => ({ ok: undefined, failure: error as Error }),
+  );
+  return { ...outcome, waits };
+}
+
+test("a_database_with_no_task_and_no_cursor_passes_without_asking_the_chain", async () => {
+  const { chain, asks } = answering([new Error("down")], [new Error("down")]);
+  expect(await againstChain(chain)).toEqual({ ok: true, failure: undefined, waits: [] });
+  expect(asks).toEqual({ final: 0, count: 0 });
 });
 
-test("a_chain_node_that_lags_the_index_is_asked_again_before_the_database_is_refused", async () => {
-  // The index follows neardata and the RPC node can be some blocks behind: task 7 was posted just
-  // before the restart, and the node says 6, then 6, then 7.
-  await indexTask(7, TESTNET_CURSOR);
-  expect(await deploymentCheck([6n, 6n, 7n])).toEqual({ failure: undefined, asks: 3 });
+test("a_cursor_alone_is_checked_against_the_final_height_and_asks_no_count", async () => {
+  await setCursor(TESTNET_CURSOR, 100n);
+  const { chain, asks } = answering([150n], [new Error("not asked")]);
+  expect(await againstChain(chain)).toEqual({ ok: true, failure: undefined, waits: [] });
+  expect(asks).toEqual({ final: 1, count: 0 });
 });
 
 test("a_task_at_or_below_the_chains_count_passes", async () => {
-  await indexTask(7, TESTNET_CURSOR);
-  expect(await deploymentCheck([7n])).toEqual({ failure: undefined, asks: 1 });
-  expect(await deploymentCheck([900n])).toEqual({ failure: undefined, asks: 1 });
-  // The chain's count is a bigint: past what a number holds exactly, and a u64 id.
+  await setCursor(TESTNET_CURSOR, 100n);
+  await indexTask(7);
+  for (const count of [7n, 900n]) {
+    const { chain, asks } = answering([150n], [count]);
+    expect(await againstChain(chain)).toEqual({ ok: true, failure: undefined, waits: [] });
+    expect(asks).toEqual({ final: 1, count: 1 });
+  }
+  // The count is a bigint: past what a number holds exactly, and a u64 id.
   await db.exec("truncate tasks");
   await indexTask(Number.MAX_SAFE_INTEGER);
-  expect((await deploymentCheck([2n ** 64n - 1n])).failure).toBeUndefined();
+  expect((await againstChain(answering([150n], [2n ** 64n - 1n]).chain)).ok).toBe(true);
+  // Whatever the highest id is, not the newest row.
+  await db.exec("truncate tasks");
+  await indexTask(9);
+  await indexTask(3);
+  expect((await againstChain(answering([150n], [8n]).chain)).failure?.message).toContain(
+    "the database holds task 9,",
+  );
 });
 
-test("a_chain_that_cannot_be_asked_refuses_a_database_that_holds_tasks_naming_the_kind_only", async () => {
-  await indexTask(1, TESTNET_CURSOR);
-  const { failure, asks } = await deploymentCheck([new Error(`fetch failed for ${KEYED}`)]);
+test("a_read_that_fails_is_made_again_and_never_refuses", async () => {
+  await setCursor(TESTNET_CURSOR, 100n);
+  await indexTask(7);
+  const down = new Error(`fetch failed for ${KEYED}`);
+  const { chain, asks } = answering([down, down, 150n], [down, 7n]);
+  const { ok, failure, waits } = await againstChain(chain);
+  expect({ ok, failure }).toEqual({ ok: true, failure: undefined });
+  // Each wait says what failed, by its name only: a URL can hold a key.
+  expect(waits).toEqual([
+    "cannot read the final block (Error)",
+    "cannot read the final block (Error)",
+    "cannot read the task count (Error)",
+  ]);
+  expect(leaks(waits)).toEqual([]);
+  expect(asks.count).toBe(2);
+
+  // The database may fail to answer as well. It is read again, too.
+  const query = vi.spyOn(db, "query");
+  query.mockRejectedValueOnce(
+    Object.assign(new Error("terminating connection"), { code: "57P01" }),
+  );
+  const again = await againstChain(answering([150n], [7n]).chain);
+  expect(again.ok).toBe(true);
+  expect(again.waits).toEqual(["cannot read the database (Error (code 57P01))"]);
+  query.mockRestore();
+});
+
+test("a_chain_that_never_answers_is_waited_for_until_the_check_is_stopped", async () => {
+  await setCursor(TESTNET_CURSOR, 100n);
+  await indexTask(7);
+  const stop = new AbortController();
+  const down = new Error("ECONNREFUSED");
+  const { chain } = answering([down], [down]);
+  const waits: string[] = [];
+  const checking = checkAgainstChain(db, chain, {
+    retryMs: 1,
+    longestMs: 2,
+    signal: stop.signal,
+    onWait: (why) => {
+      waits.push(why);
+      if (waits.length === 5) stop.abort();
+    },
+  });
+  // It never refuses, however long the node is down: the stop ends it, with no verdict.
+  expect(await checking).toBe(false);
+  expect(waits).toHaveLength(5);
+
+  // A stop before the start ends it at once, with nothing asked.
+  const asked = answering([150n], [7n]);
+  expect(await checkAgainstChain(db, asked.chain, { signal: stop.signal })).toBe(false);
+  expect(asked.asks).toEqual({ final: 0, count: 0 });
+});
+
+test("a_node_that_lags_the_index_does_not_refuse_it", async () => {
+  await setCursor(TESTNET_CURSOR, 100n);
+  await indexTask(7);
+  // The count is short of the task, and the node's final block is not yet past the cursor by the
+  // skew of 20: it is behind. It is asked again, and when it has caught up the database passes.
+  const lagging = answering([105n, 110n, 119n, 125n], [6n, 6n, 6n, 7n]);
+  const { ok, failure, waits } = await againstChain(lagging.chain);
+  expect({ ok, failure }).toEqual({ ok: true, failure: undefined });
+  expect(waits).toHaveLength(3);
+  expect(waits[0]).toMatch(
+    /^the node counts 6 tasks, fewer than the 7 the database holds, and its final block, 105, is too near the last block the index took, 100, to tell whether it is behind$/,
+  );
+  expect(lagging.asks).toEqual({ final: 4, count: 4 });
+
+  // The cursor a few blocks ahead of the node's final block is no mismatch either.
+  await db.exec("truncate chain_cursor");
+  await setCursor(TESTNET_CURSOR, 1_000n);
+  const near = await againstChain(answering([985n], [7n]).chain);
+  expect({ ok: near.ok, waits: near.waits }).toEqual({ ok: true, waits: [] });
+});
+
+test("a_count_below_the_highest_task_refuses_once_a_node_past_the_cursor_says_so", async () => {
+  await setCursor(TESTNET_CURSOR, 100n);
+  await indexTask(7);
+  // 20 blocks past the cursor: the node has seen every block the index took, and no task of it.
+  const sure = answering([120n], [3n]);
+  const { ok, failure, waits } = await againstChain(sure.chain);
+  expect(ok).toBeUndefined();
   expect(failure).toBeInstanceOf(IndexerError);
-  expect(failure?.message).toMatch(/^cannot ask the chain how many tasks .* has \(Error\)/);
-  // The message is what a line quotes: no key in it.
-  expect(failure?.message).not.toContain("s3cret");
-  // A failure to ask is not retried: only a count that is too low is.
-  expect(asks).toBe(1);
+  expect(waits).toEqual([]);
+  expect(sure.asks).toEqual({ final: 1, count: 1 });
+  const words = failure?.message ?? "";
+  expect(words).toContain(
+    `the database holds task 7, but ${FIXTURE_CONTRACT} has made 3 on testnet`,
+  );
+  expect(words).toContain(
+    "as read at its final block 120, past the last block the index took (100)",
+  );
+  expect(words).toContain("one database per contract deploy");
+  // The causes come in order, the node first, and the advice is never to discard the database.
+  const behind = words.indexOf("behind the chain: wait for it");
+  const another = words.indexOf("another contract or chain");
+  const fresh = words.indexOf("use a new database");
+  expect(behind).toBeGreaterThan(-1);
+  expect(another).toBeGreaterThan(behind);
+  expect(fresh).toBeGreaterThan(another);
+  expect(words).toContain("keep the old one");
+  expect(words).not.toMatch(/discard|throw .* away|wipe|reset/i);
+
+  // One block short of that, the node may be behind: it is asked again.
+  const short = answering([119n, 119n], [3n]);
+  const waiting = new AbortController();
+  const asked = await againstChain(short.chain, {
+    signal: waiting.signal,
+    onWait: () => waiting.abort(),
+  });
+  expect({ ok: asked.ok, failure: asked.failure }).toEqual({ ok: false, failure: undefined });
+});
+
+test("on_the_sandbox_the_node_is_the_source_and_there_is_no_skew", async () => {
+  const cursor = `sandbox:${FIXTURE_CONTRACT}`;
+  await setCursor(cursor, 100n);
+  await indexTask(7);
+  const sandbox = (finals: bigint[], counts: bigint[]) =>
+    answering(finals, counts, { network: "sandbox" }).chain;
+  // At the cursor itself the node has seen what the index took.
+  const mismatch = await againstChain(sandbox([100n], [3n]));
+  expect(mismatch.failure).toBeInstanceOf(IndexerError);
+  expect(mismatch.failure?.message).toContain("has made 3 on sandbox");
+  // A cursor one block above the node's final block is another chain, at once.
+  const ahead = await againstChain(sandbox([99n], [7n]), { aheadMs: undefined });
+  expect(ahead.failure).toBeInstanceOf(IndexerError);
+  expect(ahead.waits).toEqual([]);
+  expect(ahead.failure?.message).toMatch(
+    /^the index took block 100, but the final block of sandbox/,
+  );
+  // And the same database passes at the cursor, when the chain counts the task.
+  expect((await againstChain(sandbox([100n], [7n]))).ok).toBe(true);
+});
+
+test("a_cursor_ahead_of_the_chain_is_a_new_chain_once_the_node_stays_behind_it", async () => {
+  await setCursor(TESTNET_CURSOR, 1_000n);
+  // A new chain under the same contract name: its final block is far below the old cursor, and it
+  // stays so while the node is asked again. Then it is refused, in the words of a new database.
+  const fresh = answering([40n], [0n]);
+  const { ok, failure, waits } = await againstChain(fresh.chain, { aheadMs: 30 });
+  expect(ok).toBeUndefined();
+  expect(failure).toBeInstanceOf(IndexerError);
+  expect(waits.length).toBeGreaterThan(0);
+  expect(waits[0]).toBe(
+    "the final block of the node, 40, is below the last block the index took, 1000",
+  );
+  const words = failure?.message ?? "";
+  expect(words).toMatch(
+    /^the index took block 1000, but the final block of testnet at the node is 40/,
+  );
+  expect(words).toContain("a new chain under this contract name needs a new database");
+  expect(words).toContain("one database per contract deploy");
+  // The node is named as the first cause, and the database is kept.
+  expect(words.indexOf("behind the chain: wait for it")).toBeLessThan(words.indexOf("new chain"));
+  expect(words).toContain("keep the old one");
+  expect(words).not.toMatch(/discard|throw .* away|wipe|reset/i);
+  // No task was asked about: the cursor alone gives it away.
+  expect(fresh.asks.count).toBe(0);
+
+  // A node that is behind and catches up within the time is believed.
+  const catching = answering([900n, 950n, 990n, 1_100n], [0n]);
+  const caught = await againstChain(catching.chain, { aheadMs: 60_000 });
+  expect({ ok: caught.ok, failure: caught.failure }).toEqual({ ok: true, failure: undefined });
+  expect(caught.waits).toHaveLength(2);
+});
+
+test("it_checks_the_environment_as_startIndexer_does_and_starts_nothing", async () => {
+  const none = await deployments();
+  const noHeight = /no height to start indexing testnet from: set INDEXER_START_HEIGHT/;
+  expect(() => checkIndexerEnv(testnetEnv(), { deploymentsDir: none })).toThrow(noHeight);
+  expect(() =>
+    startIndexer(testnetEnv(), { db, client: emptyChain(0n), deploymentsDir: none }),
+  ).toThrow(noHeight);
+  expect(() =>
+    checkIndexerEnv(testnetEnv({ INDEXER_START_HEIGHT: "100" }), { deploymentsDir: none }),
+  ).not.toThrow();
+  // A record of this contract has a height; a record that is broken does not.
+  const record = await deployments({
+    testnet: { contract: FIXTURE_CONTRACT, deployHeight: "123" },
+  });
+  expect(() => checkIndexerEnv(testnetEnv(), { deploymentsDir: record })).not.toThrow();
+  const broken = await deployments({ testnet: { contract: FIXTURE_CONTRACT, deployHeight: "0" } });
+  expect(() => checkIndexerEnv(testnetEnv(), { deploymentsDir: broken })).toThrow(/block height/);
+  // The same settings are refused by name.
+  for (const [env, named] of [
+    [{ TENDER_CONTRACT: FIXTURE_CONTRACT }, /TENDER_NETWORK/],
+    [{ TENDER_NETWORK: "testnet" }, /TENDER_CONTRACT/],
+    [testnetEnv({ INDEXER_START_HEIGHT: "1", INDEXER_POLL_MS: "soon" }), /INDEXER_POLL_MS/],
+    [testnetEnv({ INDEXER_START_HEIGHT: "1", NEARDATA_URL: "ftp://x" }), /NEARDATA_URL/],
+    [{ TENDER_NETWORK: "sandbox", TENDER_CONTRACT: FIXTURE_CONTRACT }, /NEAR_RPC_URL/],
+  ] as const) {
+    expect(() => checkIndexerEnv(env, { deploymentsDir: none })).toThrow(named);
+  }
 });

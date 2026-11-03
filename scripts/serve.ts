@@ -1,3 +1,4 @@
+import { writeSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { format, type InspectOptions, inspect } from "node:util";
@@ -20,7 +21,15 @@ import {
   type SessionLock,
   tryAdvisoryLock,
 } from "@tender/db";
-import { checkDeployment, startIndexer } from "@tender/indexer";
+import {
+  type CheckAgainstChainOptions,
+  checkAgainstChain,
+  checkCursorSource,
+  checkIndexerEnv,
+  type DeploymentChain,
+  IndexerError,
+  startIndexer,
+} from "@tender/indexer";
 import { startJudge } from "@tender/judge";
 import { AccountIdSchema, canonicalBase, NETWORKS, type NetworkId } from "@tender/shared";
 import {
@@ -38,11 +47,16 @@ import { loadEnv, REPO_ROOT, readEnvFile } from "./lib/env";
  * `pnpm serve`: the one process that runs the services of a deployment against one database.
  *
  *   database   opened from DATABASE_URL and migrated, and checked: it serves one contract deploy,
- *              so one that holds the index of another is refused (`checkDeployment`)
+ *              so one whose chain cursor is for another is refused at the start
+ *              (`checkCursorSource`)
  *   API        on API_PORT (default 8787), for the web app, agents and MCP clients, at the base
  *              URL PUBLIC_API_URL, which sign-in is bound to (P03-R28)
  *   indexer    follows the chain into the database; on Postgres only while this process holds
- *              the indexer lock, so that one process at a time writes to the index (P03-R25)
+ *              the indexer lock, so that one process at a time writes to the index (P03-R25).
+ *              The indexer, the keeper and the Judge start once the database has been checked
+ *              against the chain (`checkAgainstChain`): a node that does not answer or is behind
+ *              is waited for, with the API serving meanwhile, and a database that is another
+ *              deploy's is refused with an ERROR, and none of the three starts
  *   keeper     voids and cleans up tasks, when KEEPER_PRIVATE_KEY is set, and runs with the
  *              indexer, under the same lock, so that no two processes send the same calls; off the
  *              sandbox its key must be a function-call key limited to Tender for the keeper's
@@ -962,6 +976,15 @@ export interface ServeOptions {
    */
   tryLock?: () => Promise<SessionLock | null>;
   /**
+   * For tests: how the database is checked against the chain before the indexer, the keeper and
+   * the Judge start (`checkAgainstChain`): the chain it asks, in place of the services' own
+   * client, and its waits.
+   */
+  deployment?: { chain?: DeploymentChain } & Pick<
+    CheckAgainstChainOptions,
+    "retryMs" | "longestMs" | "skewBlocks" | "aheadMs"
+  >;
+  /**
    * For tests: the Bot API server the Telegram bot calls in place of Telegram's own, with no
    * trailing slash (grammY's `client.apiRoot`).
    */
@@ -1025,6 +1048,81 @@ export function withLoops(
       for (const loop of loops) await loop;
       const failed = await indexing;
       if (failed !== undefined) throw failed.error;
+    },
+  };
+}
+
+/** What `startAfterCheck` returns: the work it starts, and when the check has said its first word. */
+export interface CheckedStart extends Stoppable {
+  /**
+   * Resolves once the work has started, or the database has been refused, or the check waits on
+   * the node for the first time, or `stop` has ended it. Never rejects.
+   */
+  settled: Promise<void>;
+}
+
+export interface CheckedStartOptions {
+  /**
+   * Checks the database against the chain (`checkAgainstChain`): true to go on, false if `signal`
+   * aborted first, and what it throws is a refusal. It tells `onWait` of each wait.
+   */
+  check: (signal: AbortSignal, onWait: (why: string, retryMs: number) => void) => Promise<boolean>;
+  /** Starts the work, once the database matches the chain. */
+  start: () => Stoppable;
+  /** What `start` starts, as the lines name it: "the indexer, the keeper and the Judge". */
+  guards: string;
+  log: (line: string) => void;
+}
+
+/**
+ * Starts the work, `start`, once `check` has found the database to match the chain, and returns at
+ * once: the check can wait for a node that does not answer or is behind, for as long as that takes,
+ * and the API serves meanwhile. Each wait is logged as a WARN with its reason. A refusal is logged
+ * as an ERROR, in the words of any failure to start (`runWhileLocked`), and nothing is tried
+ * again: the work does not start, and the API goes on serving. A work that throws as it starts is
+ * logged the same way.
+ *
+ * `stop` ends the wait, and stops the work if it has started.
+ */
+export function startAfterCheck(opts: CheckedStartOptions): CheckedStart {
+  const { check, start, guards, log } = opts;
+  const stopping = new AbortController();
+  let running: Stoppable | undefined;
+  let waited = false;
+  let firstWait: () => void = () => undefined;
+  const waitedFirst = new Promise<void>((resolve) => {
+    firstWait = resolve;
+  });
+  const onWait = (why: string, retryMs: number) => {
+    waited = true;
+    log(
+      `WARN indexer: cannot check the database against the chain yet (${why}); ` +
+        `trying again in ${retryMs / 1000} s`,
+    );
+    firstWait();
+  };
+  const checking = (async () => {
+    try {
+      if (!(await check(stopping.signal, onWait)) || stopping.signal.aborted) return;
+    } catch (error) {
+      // A refusal is ours and is said in full; anything else by its name, as a line says of an error.
+      const why = error instanceof IndexerError ? error.message : describe(error);
+      log(`ERROR indexer: cannot start ${guards} (${why}); not trying again`);
+      return;
+    }
+    if (waited) log(`indexer: the database matches the chain; starting ${guards}`);
+    try {
+      running = start();
+    } catch (error) {
+      log(`ERROR indexer: cannot start ${guards} (${messageOf(error)}); not trying again`);
+    }
+  })();
+  return {
+    settled: Promise.race([checking, waitedFirst]),
+    async stop() {
+      stopping.abort();
+      await checking;
+      await running?.stop();
     },
   };
 }
@@ -1175,8 +1273,14 @@ function runTelegram(
  * Starts the services of `env` (see the top of this file), and resolves once they run: the API
  * listens, the indexer, with the keeper and the Judge if they are to run, runs or waits for the
  * indexer lock, and the Telegram bot and the notifier run if they are to. The environment is
- * checked first (`readServeConfig`), and off the sandbox the keys of the keeper and the Judge too,
- * before anything starts. What fails to start is thrown, after what had started is stopped.
+ * checked first (`readServeConfig`, and what the indexer needs, `checkIndexerEnv`), and off the
+ * sandbox the keys of the keeper and the Judge too, before anything starts. What fails to start is
+ * thrown, after what had started is stopped.
+ *
+ * Under the lock, the indexer and the loops beside it start once the database has been checked
+ * against the chain (`startAfterCheck`), which waits for a node that cannot be asked, or is behind.
+ * This resolves when that check has gone through, or has refused the database (an ERROR line), or
+ * has waited for the first time (a WARN line): the API serves in each case.
  */
 export async function startServices(
   env: Record<string, string | undefined>,
@@ -1185,6 +1289,9 @@ export async function startServices(
   const log = options.log ?? console.log;
   const config = readServeConfig(env);
   for (const warning of config.warnings) log(`WARN serve: ${warning}`);
+  // The indexer starts only after the database has been checked against the chain, which can
+  // wait: what it needs of the environment is checked now, so that a start that cannot work fails.
+  checkIndexerEnv(env, { deploymentsDir: options.deploymentsDir });
   const { network, contractId, rpcUrl } = config;
   // One client reads the chain for the API and the indexer.
   const client = new TenderClient({ network, contractId, rpcUrl });
@@ -1250,9 +1357,9 @@ export async function startServices(
 
   let publicUrl = "";
   try {
-    // A database serves one contract deploy: one that holds another's index is refused before
-    // anything serves from it or acts on it.
-    await checkDeployment(db, client);
+    // A database serves one contract deploy: one whose chain cursor is for another is refused
+    // before anything serves from it. The half that needs the chain waits for the work to start.
+    await checkCursorSource(db, { network, contractId });
     // The bot is made before the API, whose app takes its webhook. It calls Telegram only once
     // `runTelegram` runs it: the webhook takes no update before then (see below).
     const { telegram: telegramConfig } = config;
@@ -1334,7 +1441,7 @@ export async function startServices(
     // Judge run only where the index is written: two keepers would send the same calls, and pay
     // for the ones that lose, and two Judges would pick twice. At the stop, as when the lock is
     // lost, each takes no further task or call once the one in hand is done (`withLoops`).
-    const startWork = (): Stoppable => {
+    const startLoops = (): Stoppable => {
       const indexer = startIndexer(env, {
         db,
         client,
@@ -1399,15 +1506,32 @@ export async function startServices(
       (config.database.kind === "postgres"
         ? () => tryAdvisoryLock(config.database.url, INDEXER_LOCK_KEY, { log: lockLog })
         : undefined);
-    const guarded = [
+    const guards = listed([
       "the indexer",
       ...(keeper === undefined ? [] : ["the keeper"]),
       ...(judge === undefined ? [] : ["the Judge"]),
-    ];
+    ]);
+    // What runs under the lock starts once the database has been checked against the chain: the
+    // node is asked, and waited for if it does not answer or is behind, while the API serves.
+    const first: { checked?: CheckedStart } = {};
+    const startWork = (): Stoppable => {
+      const { chain = client, ...timing } = options.deployment ?? {};
+      const checked = startAfterCheck({
+        check: (signal, onWait) => checkAgainstChain(db, chain, { ...timing, signal, onWait }),
+        start: startLoops,
+        guards,
+        log,
+      });
+      first.checked ??= checked;
+      return checked;
+    };
     work =
       tryLock === undefined
         ? startWork()
-        : await runWhileLocked({ tryLock, start: startWork, guards: listed(guarded), log });
+        : await runWhileLocked({ tryLock, start: startWork, guards, log });
+    // The first check has said its first word by now: the work runs, the node is waited for, or
+    // the database is refused. A process that waits for the lock has none.
+    await first.checked?.settled;
 
     if (bot === undefined || telegramConfig === undefined) {
       log("serve: Telegram off (TELEGRAM_BOT_TOKEN is not set)");
@@ -1506,19 +1630,58 @@ interface CrashTarget {
   exit(code: number): unknown;
 }
 
+/** How long a crash waits for a stderr that is full, in milliseconds. */
+const STDERR_WAIT_MS = 2_000;
+
 /**
- * Makes an uncaught exception and an unhandled rejection print through `print`, `console.error`
- * unless given, which `redactConsole` wraps, and end the process with 1, as Node does by itself.
- * Node prints them to stderr on its own otherwise, outside the redaction and with the whole error,
- * whose message can quote a URL that holds a key.
+ * Writes `text` to stderr (file descriptor 2) before it returns, whatever is queued behind it. A
+ * stream's write is asynchronous, and `process.exit` right after it can cut the line short when the
+ * pipe is full. A pipe that is full says EAGAIN to a descriptor that Node has made non-blocking,
+ * and is waited for, for up to `STDERR_WAIT_MS`. Any other failure, such as a closed pipe, is given
+ * up on: the process is ending.
+ */
+function writeStderrSync(text: string): void {
+  const bytes = Buffer.from(text);
+  const giveUpAt = Date.now() + STDERR_WAIT_MS;
+  let written = 0;
+  while (written < bytes.length) {
+    try {
+      written += writeSync(2, bytes, written);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EAGAIN" || Date.now() >= giveUpAt) return;
+      // A sleep that blocks, 5 ms: the reader of the pipe is another process.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+  }
+}
+
+/**
+ * The line a crash prints: `what` and the error as `console.error` would format them, redacted by
+ * `env`; or, when the error cannot be formatted (a hostile `inspect`, say), a fixed line.
+ */
+function crashLine(what: string, error: unknown, env: Record<string, string | undefined>): string {
+  try {
+    return redact(format(`serve: ${what}:`, error), env);
+  } catch {
+    return `serve: ${what} (it cannot be shown)`;
+  }
+}
+
+/**
+ * Makes an uncaught exception and an unhandled rejection print a line, redacted by `env`, to
+ * stderr with `write`, `writeStderrSync` unless given, and end the process with 1, as Node does by
+ * itself. Node prints them on its own otherwise, outside the redaction and with the whole error,
+ * whose message can quote a URL that holds a key. The line is written before the process exits and
+ * not through a stream, whose write the exit would cut short when the pipe is full.
  */
 export function exitOnCrash(
+  env: Record<string, string | undefined>,
   proc: CrashTarget = process,
-  print: (...args: unknown[]) => void = (...args) => console.error(...args),
+  write: (text: string) => void = writeStderrSync,
 ): void {
   const crash = (what: string) => (error: unknown) => {
     try {
-      print(`serve: ${what}:`, error);
+      write(`${crashLine(what, error, env)}\n`);
     } finally {
       proc.exit(1);
     }
@@ -1559,7 +1722,7 @@ async function main(): Promise<void> {
     // From here on, all the process prints passes through `redact`: the services' lines, the
     // errors below, what the packages print to the console of their own, and a crash.
     redactConsole(env);
-    exitOnCrash();
+    exitOnCrash(env);
     services = await startServices(env);
   } catch (error) {
     console.error(`serve: ${messageOf(error)}`);
