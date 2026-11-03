@@ -238,6 +238,70 @@ test("payouts_show_no_refund_list_when_the_index_has_none", () => {
 
 // ---- The scorecard ----------------------------------------------------------------------------
 
+// ---- Who scored it --------------------------------------------------------------------------
+
+test.each([
+  ["tender-judge/1", "Scored by the Tender Judge."],
+  ["Tender_Judge-x", "Scored by the Tender Judge."],
+  ["my-judge/2", "Scored by my-judge/2."],
+  ["tender-agent", "Scored by tender-agent."],
+])("scorecard_says_who_scored_it_%s", (software, line) => {
+  render(<Scorecard scorecard={scorecard({ judge: { software, model: null } })} />);
+
+  expect(screen.getByTestId("scored-by").textContent).toBe(line);
+});
+
+test("scorecard_of_a_rubric_is_labelled_subjective_and_names_the_model", () => {
+  render(
+    <Scorecard
+      scorecard={scorecard({
+        kind: "rubric",
+        heldout: null,
+        heldout_commitment: null,
+        judge: { software: "tender-judge/1", model: "deepseek-v3.1" },
+      })}
+      commitment={null}
+    />,
+  );
+
+  expect(screen.getByTestId("scored-by").textContent).toBe(
+    "Scored by the Tender Judge with deepseek-v3.1. Subjective: a model's judgement.",
+  );
+});
+
+test("scorecard_of_another_verifiers_rubric_is_subjective_under_its_own_name", () => {
+  render(
+    <Scorecard
+      scorecard={scorecard({
+        kind: "rubric",
+        judge: { software: "acme-grader/3", model: null },
+      })}
+    />,
+  );
+
+  expect(screen.getByTestId("scored-by").textContent).toBe(
+    "Scored by acme-grader/3. Subjective: a model's judgement.",
+  );
+});
+
+test("scorecard_of_a_check_is_not_called_subjective", () => {
+  render(<Scorecard scorecard={scorecard({ kind: "exact" })} />);
+
+  expect(screen.getByTestId("scored-by").textContent).not.toMatch(/subjective/i);
+});
+
+test("scorecard_does_not_take_the_judges_name_from_another_account_when_the_build_knows_the_judge", () => {
+  // The API refuses such a card from any account but the Judge's; a build that knows the Judge holds
+  // the card to it as well, and names what the card says.
+  const card = scorecard({ judge: { software: "tender-judge/1", model: null } });
+
+  const { rerender } = render(<Scorecard scorecard={card} judgeAccount={VERIFIER} />);
+  expect(screen.getByTestId("scored-by").textContent).toBe("Scored by the Tender Judge.");
+
+  rerender(<Scorecard scorecard={card} judgeAccount="someone-else.testnet" />);
+  expect(screen.getByTestId("scored-by").textContent).toBe("Scored by tender-judge/1.");
+});
+
 test("scorecard_shows_a_row_per_entry_with_its_score_whether_it_passed_and_why", () => {
   render(<Scorecard scorecard={scorecard()} />);
 
@@ -571,6 +635,12 @@ test("criteria_list_the_rubric_with_its_weights", () => {
     "Covers every severity level · weight 5",
     "Fits in five bullets · weight 2",
   ]);
+  // It says nothing of who scores: the scorecard does, and a verifier other than the Judge may use
+  // a rubric too.
+  expect(screen.getByTestId("rubric-subjective").textContent).toBe(
+    "Scored against these points. Subjective.",
+  );
+  expect(document.body.textContent).not.toMatch(/LLM/);
 });
 
 test("criteria_show_the_other_kinds_as_text", () => {

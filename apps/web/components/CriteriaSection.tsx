@@ -75,7 +75,7 @@ function Detail({ criteria }: { criteria: PublicCriteria }) {
     case "rubric":
       return (
         <>
-          <p>An LLM scores the answer against these points.</p>
+          <p data-testid="rubric-subjective">Scored against these points. Subjective.</p>
           <ul className="grid gap-1">
             {criteria.rubric.map((point, i) => (
               // biome-ignore lint/suspicious/noArrayIndexKey: two points can be worded alike

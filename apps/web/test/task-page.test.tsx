@@ -912,10 +912,12 @@ test("task_page_shows_who_settled_and_the_scorecard_once_the_task_is_picked", as
   pinClock(AT.fallback + 60n * SECOND);
   fakeApi(routes(() => settledTask()));
 
-  await open();
+  await open("7", { judgeAccount: VERIFIER });
 
   expect(screen.getByTestId("phase-chip").textContent).toBe("Settled");
   expect(screen.getByTestId("settled-by").textContent).toBe(`Picked by ${VERIFIER} (verifier)`);
+  // And who scored it, from the scorecard.
+  expect(screen.getByTestId("scored-by").textContent).toBe("Scored by the Tender Judge.");
   expect(screen.getAllByTestId("winner-row")).toHaveLength(1);
   // The line asks for the commitment the task has on chain.
   expect(screen.getByTestId("recompute").textContent).toBe(

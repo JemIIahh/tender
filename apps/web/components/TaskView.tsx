@@ -213,7 +213,11 @@ function ReadyView({
         unavailable={loaded.verifier === "unavailable"}
       />
       {scorecard !== null ? (
-        <Scorecard scorecard={scorecard} commitment={task.heldout_commitment} />
+        <Scorecard
+          scorecard={scorecard}
+          commitment={task.heldout_commitment}
+          judgeAccount={judgeAccount}
+        />
       ) : scorecardHash === null ? null : (
         <section className="grid gap-2">
           <h2 className="text-lg font-semibold">Scorecard</h2>
