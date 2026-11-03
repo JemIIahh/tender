@@ -87,6 +87,14 @@ const MAX_PAGE = 50;
 /** Every read is of the last final block; see `TenderClient`. */
 const FINALITY = "final";
 
+/**
+ * What the `E_TIMEOUT` of a send says after the call and the time. The client stopped waiting, and
+ * did not see the transaction fail. The message is read by people and by agents, so it says what
+ * is left open and what to do about it, in plain words.
+ */
+const SEND_MAY_STILL_LAND =
+  "The transaction may still land. Read the chain before sending it again.";
+
 const TaskOrNull = TaskViewSchema.nullable();
 const Tasks = TaskViewSchema.array();
 const EntryOrNull = EntryViewSchema.nullable();
@@ -180,8 +188,9 @@ export function toTxResult(resp: FinalTxOutcome, contractId: string): TxResult {
  * transaction, and the wait for its final outcome. near-api-js's own retries of a failing node are
  * inside the time, not on top of it. A call that runs out of time is cancelled, its request and its
  * connection with it, and throws a `TenderError` with code `E_TIMEOUT`, whose message names the
- * call and the time and says nothing of the node (no URL, no key). The time of a send starts when
- * the send does, once it has had its turn in the queue below.
+ * call and the time and says nothing of the node (no URL, no key). The message of a send goes on to
+ * say that the transaction may still land, and to read the chain before sending it again. The time
+ * of a send starts when the send does, once it has had its turn in the queue below.
  *
  * A send that timed out may still have landed. The client stopped waiting for the answer: the node
  * may have had the transaction by then, and it can run, with its events, after the `E_TIMEOUT`. So
@@ -277,8 +286,8 @@ export class TenderClient {
    * Signs `call` as the signer, sends it and waits until it is final. See `toTxResult`. It goes
    * once the earlier sends of the signer's account in this process are done (`defaultQueue`), and
    * has `sendTimeoutMs` from then on. A send the node has not finished by then throws a
-   * `TenderError` with code `E_TIMEOUT`, and may have landed all the same (see the class): the
-   * error has no `txHash`, since the client does not learn it.
+   * `TenderError` with code `E_TIMEOUT`, and may have landed all the same (see the class), which
+   * the error's message says: it has no `txHash`, since the client does not learn it.
    *
    * The time is that of each try: a transaction that loses its nonce to another (`defaultQueue`)
    * is sent once more, and that try has all of `sendTimeoutMs` again.
@@ -300,6 +309,7 @@ export class TenderClient {
             waitUntil: "FINAL",
             throwOnFailure: false,
           }),
+        SEND_MAY_STILL_LAND,
       );
       return toTxResult(resp, this.contractId);
     });

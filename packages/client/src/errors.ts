@@ -13,7 +13,8 @@
  *
  * `message` is the failure as the chain reported it, and `txHash` the transaction's hash. `cause`
  * holds the raw failure from the RPC. An `E_TIMEOUT` has neither a `txHash` nor a `cause`: its
- * message names the call and the time it had, and nothing of the node.
+ * message names the call and the time it had, and nothing of the node. That of a send adds that the
+ * transaction may still land, and to read the chain before sending it again.
  */
 export class TenderError extends Error {
   readonly code: string;

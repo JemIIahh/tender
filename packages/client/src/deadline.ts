@@ -74,6 +74,11 @@ const inScope = sharedScope();
 /**
  * `next`, with the signal of the scope it is called in added to the request. Called outside a
  * scope, it is `next`. A signal the request has already is kept: either one aborts it.
+ *
+ * The own properties of `next` are copied onto the wrapper. Something else that patches `fetch` can
+ * keep its mark on the function it left in place and patch again whenever the mark is missing
+ * (Next.js does, with `__nextPatched`). Over a wrapper that dropped its mark, that patcher and
+ * this one would take turns for ever, a layer each. With the mark kept, each patches once.
  */
 function scopedFetch(next: typeof fetch): typeof fetch {
   const scoped = (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
@@ -82,7 +87,7 @@ function scopedFetch(next: typeof fetch): typeof fetch {
     const own = init?.signal ?? (input instanceof Request ? input.signal : undefined);
     return next(input, { ...init, signal: own ? AbortSignal.any([own, deadline]) : deadline });
   };
-  return Object.assign(scoped, { [SCOPED]: true });
+  return Object.assign(scoped, next, { [SCOPED]: true });
 }
 
 /**
@@ -99,7 +104,8 @@ function ensureScopedFetch(): void {
 /**
  * Runs `call`, which asks a node for something through near-api-js, and gives its result, or fails
  * with a `TenderError` with code `E_TIMEOUT` once `timeoutMs` have passed. `operation` names the
- * call in the error's message, which says nothing else: not the node's URL, and not a key.
+ * call in the error's message, which goes on to say the time, and then `note`, a sentence of the
+ * caller's, if there is one. The message says nothing else: not the node's URL, and not a key.
  *
  * Every request `call` makes is cancelled at that time, its connection with it, and near-api-js's
  * retries are inside the time. The failure comes at that time whatever `call` is doing (see the top
@@ -113,6 +119,7 @@ export async function withDeadline<T>(
   operation: string,
   timeoutMs: number,
   call: () => Promise<T>,
+  note?: string,
 ): Promise<T> {
   ensureScopedFetch();
   const timeout = new AbortController();
@@ -121,7 +128,11 @@ export async function withDeadline<T>(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      const error = new TenderError("E_TIMEOUT", `${operation} timed out after ${timeoutMs} ms`);
+      const said = note === undefined ? "" : `. ${note}`;
+      const error = new TenderError(
+        "E_TIMEOUT",
+        `${operation} timed out after ${timeoutMs} ms${said}`,
+      );
       timeout.abort(error);
       reject(error);
     }, timeoutMs);

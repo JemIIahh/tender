@@ -25,6 +25,8 @@ const READ_MS = 300;
 const SEND_MS = 900;
 /** The most a wait for something that happens by itself may take. A test that needs it has failed. */
 const PATIENCE_MS = 10_000;
+/** What the `E_TIMEOUT` of a send says after the call and the time. That of a view says no more. */
+const MAY_LAND = "The transaction may still land. Read the chain before sending it again.";
 
 // A test here waits out a limit once, and the default of 5 s leaves a busy machine too little room.
 vi.setConfig({ testTimeout: 20_000 });
@@ -309,7 +311,7 @@ test("a_send_the_node_never_answers_fails_at_its_own_longer_limit_with_E_TIMEOUT
   const took = Date.now() - started;
 
   expect(error.code).toBe("E_TIMEOUT");
-  expect(error.message).toBe(`TenderClient.send commit timed out after ${SEND_MS} ms`);
+  expect(error.message).toBe(`TenderClient.send commit timed out after ${SEND_MS} ms. ${MAY_LAND}`);
   expect(error.txHash).toBeUndefined();
   // The send's limit and not the read's: the nonce and block reads inside it are held to it.
   expect(took).toBeGreaterThanOrEqual(SEND_MS - 20);
@@ -369,16 +371,24 @@ test("the_limit_holds_near_api_js_s_retries_and_stops_them", async () => {
   // minutes. The limit is for the whole call, and not for each try.
   const node = await startNode({ query: "unavailable" });
   const client = clientOf(node, { rpcTimeoutMs: READ_MS });
+  // Every request near-api-js makes goes through the global `fetch`, whether it reaches the node or
+  // is cancelled on the way. So this counts its tries, and not only the ones the node saw.
+  const asked = vi.spyOn(globalThis, "fetch");
 
   const started = Date.now();
   const error = await rejection(client.getTask(1n));
   expect(error.code).toBe("E_TIMEOUT");
   expect(Date.now() - started).toBeGreaterThanOrEqual(READ_MS - 20);
   expect(node.hits).toHaveLength(1);
+  const atTheLimit = asked.mock.calls.length;
+  expect(atTheLimit).toBe(1);
 
-  // The limit came while near-api-js was waiting to try again, after 500 ms. It does not: the
-  // request it would make is cancelled before it is sent, and no more come.
-  await new Promise((resolve) => setTimeout(resolve, 700));
+  // near-api-js is asleep until its second try, 500 ms after the first. That try finds the call's
+  // signal aborted and fails at once, with the call's error, which near-api-js does not try again.
+  // Were it to try again, its third try would come 750 ms after the second, and be counted here
+  // though it never reaches the node. So the count is read after that.
+  await new Promise((resolve) => setTimeout(resolve, 1_300));
+  expect(asked.mock.calls.length).toBeLessThanOrEqual(atTheLimit + 1);
   expect(node.hits).toHaveLength(1);
 });
 
