@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { format, parseEnv } from "node:util";
 import {
@@ -58,20 +58,32 @@ import { redact, type Services, startServices } from "./serve";
  *
  * The lines come from the API and the chain, and not from what the demo itself did: the counts of
  * workers, commits and reveals on the task, and then its outcome and its scorecard, polled until
- * they show. The API says how many agents are working on a task and not which, so the agents start
- * one after the other, and `STARTED alice` is printed when the count reaches 1, with only alice
- * running, and `STARTED bob` when it reaches 2.
+ * they show. Two of them are to be read with care:
+ *
+ * - `STARTED` is the agents' own word. An agent tells the API that it works on a task, and the API
+ *   counts those calls: nothing on the chain backs the count, and it names no one. So the agents
+ *   start one after the other, and `STARTED alice` is printed when the count reaches 1, with only
+ *   alice running, and `STARTED bob` when it reaches 2. The count is the API's, and giving it to
+ *   an agent is the demo's.
+ * - `PAID` is meant in the contract's sense. The pick credits the winner's share to the winner's
+ *   balance in Tender's vault, and the fee to the treasury's, in the transaction that logs it. The
+ *   tokens go to a wallet only when the account withdraws them, so no wallet has been paid when the
+ *   line is printed.
  *
  * It is plain about who the agents are. The first line says so before any of them starts, and the
  * line after it names them: alice and bob are the Tender team's own agents, they answer from files
  * (`solution.txt` and `weak.txt` of the seed) and not from a model, and the API lists them as the
- * team's (`TEAM_ACCOUNTS`).
+ * team's (`TEAM_ACCOUNTS`). That line says too that the poster and the Judge are the team's: the
+ * demo runs both.
  *
  * The task's windows are short (`WINDOWS`) and the Judge looks every second, so a run takes about a
  * minute and a half once nearcore's sandbox node is on the machine (`near-sandbox` downloads it the
- * first time, or takes the binary at `NEAR_SANDBOX_BIN_PATH`). Every wait has a deadline. When a line
- * does not come, the command line says which one was missed, with the last thing the API showed
- * and the last lines of the services and the agents, and exits with 1; it never hangs.
+ * first time, or takes the binary at `NEAR_SANDBOX_BIN_PATH`, which skips the download). It has
+ * that node for Linux (x64, arm64) and macOS (arm64) only: on another machine the demo says so
+ * before it starts anything, unless `NEAR_SANDBOX_BIN_PATH` names a node. Every wait has a
+ * deadline. When a line does not come, the command line says which one was missed, with the last
+ * thing the API showed and the last lines of the services and the agents, and exits with 1; it
+ * never hangs.
  *
  * It keeps every file it makes in one temp dir that is new for each run: the key file, the
  * services' deployments folder, the agents' drafts and the home dir of the local node. A draft is
@@ -81,10 +93,11 @@ import { redact, type Services, startServices } from "./serve";
  * task, and the demo would fail. Run again, the demo finds nothing of the last run.
  *
  * `DEMO OK` is the last line, and it comes only after everything the demo started has stopped and
- * its files are gone, and only if the facts the scenario rests on held: alice won with 100, bob
- * scored lower, the reward was paid out whole, and the scorecard is served at the URI the chain
- * records, with the bytes it is pinned to. Whichever way the demo ends (SIGINT and SIGTERM
- * included) the agents, the services and the chain are stopped and the temp dir removed. A second
+ * its files are gone, and only if the facts the scenario rests on held: the Judge made the pick,
+ * alice won with 100, bob scored lower, the reward was paid out whole, and the scorecard is served
+ * at the URI the chain records, with the bytes it is pinned to. Whichever way the demo ends (a
+ * SIGINT, SIGTERM, SIGHUP or SIGQUIT included, which stderr answers at once, as the stops take some
+ * seconds) the agents, the services and the chain are stopped and the temp dir removed. A second
  * signal more than two seconds after the first skips those orderly stops and ends the process at
  * once, but not before the local node and any other process the demo started are killed, each by
  * its process id, and the temp dir, with the node's home in it, is removed: a node must not outlive
@@ -144,8 +157,11 @@ const SLACK_MS = 30_000;
 const STOP_MS = 30_000;
 /** How long listing the processes may take as the process ends: a stuck `ps` must not hold it. */
 const PS_MS = 5_000;
-/** How many of the last lines of the services and the agents a failure shows. */
-const LOG_TAIL = 40;
+/**
+ * How many of the last lines of the services and the agents a failure shows. A clean machine that
+ * fails the demo has nothing else to go by: the node's home is gone with the temp dir.
+ */
+const LOG_TAIL = 200;
 
 /**
  * How soon after a signal another counts as the same interruption. One Ctrl-C reaches the demo more
@@ -155,8 +171,13 @@ const LOG_TAIL = 40;
  */
 const REPEAT_SIGNAL_MS = 2_000;
 
-/** The exit codes of an interrupted demo: 128 plus the signal's number. */
-const EXIT_SIGNAL: Readonly<Record<string, number>> = { SIGINT: 130, SIGTERM: 143 };
+/**
+ * The signals that stop the demo, with the exit code of each: 128 plus the signal's number. SIGHUP
+ * is a closed terminal and SIGQUIT is Ctrl-\. Left alone, either would end the process without the
+ * stops, and the local node would stay.
+ */
+const STOP_SIGNALS = { SIGHUP: 129, SIGINT: 130, SIGQUIT: 131, SIGTERM: 143 } as const;
+type StopSignal = keyof typeof STOP_SIGNALS;
 
 // ---- What the demo says ------------------------------------------------------------------------
 
@@ -176,11 +197,11 @@ class DemoError extends Error {
   }
 }
 
-/** What aborts the demo when SIGINT or SIGTERM comes. */
+/** What aborts the demo when a signal that stops it comes. */
 class Interrupted extends Error {
-  readonly signalName: string;
+  readonly signalName: StopSignal;
 
-  constructor(signalName: string) {
+  constructor(signalName: StopSignal) {
     super(`interrupted by ${signalName}`);
     this.name = "Interrupted";
     this.signalName = signalName;
@@ -297,16 +318,64 @@ async function nodeVersion(rpcUrl: string): Promise<string> {
 }
 
 /**
+ * The machines near-sandbox has nearcore's sandbox node for, as `process.platform/process.arch`.
+ * On any other it throws, once it has to build the URL of the download.
+ */
+const NODE_HOSTS: readonly string[] = ["linux/x64", "linux/arm64", "darwin/arm64"];
+
+/** What a node of one's own does for the demo, in the words of the failure that points to it. */
+const OWN_NODE =
+  "NEAR_SANDBOX_BIN_PATH names a sandbox node you already have and skips the download";
+
+/**
+ * Throws a `DemoError` in plain words if nearcore's sandbox node is neither at hand nor to be had
+ * for this machine, so that nothing is started first. A node of one's own (`NEAR_SANDBOX_BIN_PATH`)
+ * or a place to fetch one from (`SANDBOX_ARTIFACT_URL`) is taken as it is: near-sandbox asks what
+ * the machine is only to build its own download URL.
+ */
+function checkHost(): void {
+  if (process.env.NEAR_SANDBOX_BIN_PATH || process.env.SANDBOX_ARTIFACT_URL) return;
+  const host = `${process.platform}/${process.arch}`;
+  if (NODE_HOSTS.includes(host)) return;
+  throw new DemoError(
+    "the local chain runs on nearcore's sandbox node, which near-sandbox has only for Linux " +
+      `(x64, arm64) and macOS (arm64), and this Node runs on ${host}. Set NEAR_SANDBOX_BIN_PATH ` +
+      "to a sandbox node you already have to run the demo here.",
+  );
+}
+
+/** The first line of `text`, without the full stop that ends it. */
+const firstLineOf = (text: string) => (text.split("\n")[0] ?? "").replace(/\.$/, "");
+
+/**
+ * What a failed start of the local chain says, on one line: the reason near-sandbox gives, the
+ * cause under it (a download that failed says why there), and, unless a node of one's own was
+ * named, the way round the download that the first run makes.
+ */
+function startFailure(error: unknown): string {
+  const cause = error instanceof Error ? error.cause : undefined;
+  const why = cause === undefined ? "" : ` (${firstLineOf(messageOf(cause))})`;
+  const way = process.env.NEAR_SANDBOX_BIN_PATH
+    ? ""
+    : ` The first run downloads the node: ${OWN_NODE}.`;
+  return `the local chain did not start: ${firstLineOf(messageOf(error))}${why}.${way}`;
+}
+
+/**
  * Starts the local node with the OS temp dir pointed at `tmp` for as long as that takes.
  * near-sandbox makes the node's home dir, and the lock files of its ports, in the OS temp dir. So
  * they are made inside the demo's own temp dir and go with it, also when the node is beyond being
- * stopped: after a second signal, or when its start failed and left it running.
+ * stopped: after a second signal, or when its start failed and left it running. Nothing else may
+ * use the OS temp dir while this runs, and a download can make that minutes: what it made there
+ * would land in the node's dir and go with it.
  */
 async function startNode(tmp: string): Promise<LocalChain> {
   const saved = process.env.TMPDIR;
   process.env.TMPDIR = tmp;
   try {
     return await startLocalChain();
+  } catch (error) {
+    throw new DemoError(startFailure(error));
   } finally {
     if (saved === undefined) Reflect.deleteProperty(process.env, "TMPDIR");
     else process.env.TMPDIR = saved;
@@ -581,15 +650,18 @@ async function fetchBytes(url: string): Promise<Uint8Array> {
 // ---- The scenario, step by step ----------------------------------------------------------------
 
 async function demo(h: Harness): Promise<void> {
+  checkHost();
   say(BANNER);
   say(
     "alice and bob are the Tender team's own scripted agents: alice enters the seed's stored " +
-      "right answer, bob its stored weak one. No model runs, and neither is an independent entrant.",
+      "right answer, bob its stored weak one. No model runs, and neither is an independent " +
+      "entrant. The poster and the Judge are the team's too.",
   );
 
   // The demo's own files (keys, deployments folder, drafts, the node's home) are all in here, new
-  // for each run.
-  const dir = await mkdtemp(join(tmpdir(), "tender-demo-"));
+  // for each run. The path is absolute, so that the removal as the process ends does not depend on
+  // where the process is by then.
+  const dir = resolve(await mkdtemp(join(tmpdir(), "tender-demo-")));
   h.onExit("remove the temp files", () => rm(dir, { recursive: true, force: true }));
   // Also when the demo is cut short before its steps have run (a second Ctrl-C). A node that was
   // killed a moment ago can still be writing, so the removal tries again.
@@ -684,6 +756,11 @@ async function demo(h: Harness): Promise<void> {
     return ready({ outcome, scorecard: found.scorecard });
   });
   const { outcome, scorecard } = settled;
+  // `JUDGED` says the Judge picked. The contract lets the poster pick too, once the pick window is
+  // over, and the index has no picker for an outcome it took from the chain's state (`by` is null).
+  if (outcome.by !== null && outcome.by !== chain.accounts.judge.accountId) {
+    throw new DemoError(`task ${taskId} was picked by ${outcome.by} and not by the Judge`);
+  }
 
   // The ranking is the scorecard's own: score descending, then the earlier commit, then the account.
   const ranked = [...scorecard.entries].sort(
@@ -813,11 +890,16 @@ async function main(): Promise<number> {
   });
 
   let firstSignalAt: number | undefined;
-  const onSignal = (name: NodeJS.Signals) => {
+  const onSignal = (name: StopSignal) => {
     const now = Date.now();
     if (firstSignalAt === undefined) {
       firstSignalAt = now;
       harness.fail(new Interrupted(name));
+      // At once: the stops take some seconds, and a terminal that says nothing for that long looks
+      // stuck. A SIGINT is a Ctrl-C to the person at the terminal.
+      process.stderr.write(
+        `demo: ${name}; stopping (${name === "SIGINT" ? "Ctrl-C" : name} again to force)\n`,
+      );
     } else if (now - firstSignalAt > REPEAT_SIGNAL_MS) {
       // No orderly stop is waited for. The exit steps above kill the node and remove the temp dir.
       process.stderr.write(`demo: ${name} again; exiting now\n`);
@@ -825,8 +907,9 @@ async function main(): Promise<number> {
     }
   };
   const onCrash = (error: unknown) => harness.fail(error);
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
+  for (const name of Object.keys(STOP_SIGNALS) as StopSignal[]) {
+    process.on(name, () => onSignal(name));
+  }
   process.on("unhandledRejection", onCrash);
   process.on("uncaughtException", onCrash);
 
@@ -844,7 +927,7 @@ async function main(): Promise<number> {
   if (failure instanceof Interrupted) {
     process.stderr.write(`demo: ${failure.message}; stopped what it started\n`);
     for (const problem of problems) process.stderr.write(`demo: ${problem}\n`);
-    return EXIT_SIGNAL[failure.signalName] ?? 1;
+    return STOP_SIGNALS[failure.signalName];
   }
   if (failure !== undefined || problems.length > 0) {
     const reasons = failure === undefined ? problems : [reasonOf(failure), ...problems];
