@@ -303,9 +303,9 @@ export async function intakeTask(
  * With `waitForHeldout`, held-out checks that are not stored yet, or that only a stranger has sent,
  * make the task `pending` for 10 minutes from its `created_at` (`posterHeldout`), and the compile
  * part of the criteria check waits for them: a pending task starts no worker. Without it they are
- * missing, or not the poster's, at once. A database error is thrown,
- * and so is `ScorerUnavailableError` when the worker of the schema check cannot be started;
- * anything else that goes wrong is a `rejected` result with its reason.
+ * missing, or not the poster's, at once. A database error is thrown, and so is
+ * `ScorerUnavailableError` when the worker of the schema check cannot be started; anything else
+ * that goes wrong is a `rejected` result with its reason.
  */
 export async function loadDocuments(
   db: Db,
