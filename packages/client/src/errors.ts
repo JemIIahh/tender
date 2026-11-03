@@ -1,14 +1,20 @@
 /**
- * A transaction that failed on chain. `code` says why, in the contract's terms:
+ * A transaction that failed on chain, or a call to the node that ran out of time. `code` says why,
+ * in the contract's terms:
  *
  * - a code the contract panicked with, such as `E_AUTH` or `E_PHASE` (the full list is `err` in
  *   `contract/tender/src/types.rs`);
- * - or one of three codes of the client's own, which the contract never emits. `E_ARGS` and
- *   `E_INITIALIZED` name panics of the wrappers near-sdk generates around a method, and
- *   `E_UNKNOWN` is every failure the client cannot name (see `errorCodeOf`).
+ * - or one of four codes of the client's own, which the contract never emits. `E_ARGS` and
+ *   `E_INITIALIZED` name panics of the wrappers near-sdk generates around a method, `E_UNKNOWN` is
+ *   every failure the client cannot name (see `errorCodeOf`), and `E_TIMEOUT` is a call to the node
+ *   that was not answered in time (see `TenderClient`). `E_TIMEOUT` says nothing of the contract: a
+ *   send that timed out may have run all the same, so it is a failure to look into and not a
+ *   refusal to give up on.
  *
  * `message` is the failure as the chain reported it, and `txHash` the transaction's hash. `cause`
- * holds the raw failure from the RPC.
+ * holds the raw failure from the RPC. An `E_TIMEOUT` has neither a `txHash` nor a `cause`: its
+ * message names the call and the time it had, and nothing of the node. That of a send adds that the
+ * transaction may still land, and to read the chain before sending it again.
  */
 export class TenderError extends Error {
   readonly code: string;

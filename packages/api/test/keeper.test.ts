@@ -955,6 +955,29 @@ test("keeper_keeps_the_10_tick_skip_when_the_client_cannot_name_the_failure", as
   expect(await voidAttempts(70, unnamed)).toEqual(EVERY_11TH_TICK);
 });
 
+test("keeper_keeps_the_10_tick_skip_when_a_call_times_out", async () => {
+  // `E_TIMEOUT` is the client giving up on a node that did not answer in time. It is a
+  // `TenderError`, but it says nothing of what the contract thinks of the call, and the call may
+  // have gone through all the same: it is no refusal to back off from, as the node being down is
+  // none. The next try finds out, as a lost race or as a task with nothing left to do.
+  const timedOut = () => {
+    throw new TenderError("E_TIMEOUT", "TenderClient.send void_task timed out after 120000 ms");
+  };
+  expect(await voidAttempts(70, timedOut)).toEqual(EVERY_11TH_TICK);
+
+  // The same for a cleanup, and for the read of the task before it.
+  await addTask({ id: 1, commitCount: 1, settled: { kind: "picked", at: REVEAL } });
+  const views = { "1": { cleaned: 0, commit_count: 1 } };
+  const cleaning = fakeChain(views, { cleanup: timedOut });
+  expect(
+    await ticksCalling(cleaning.chain, cleaning.calls, "cleanup", REVEAL + SECOND, 70),
+  ).toEqual(EVERY_11TH_TICK);
+  const reading = fakeChain(views, { getTask: timedOut });
+  expect(await ticksCalling(reading.chain, reading.calls, "getTask", REVEAL + SECOND, 70)).toEqual(
+    EVERY_11TH_TICK,
+  );
+});
+
 test("keeper_does_not_let_an_outage_move_the_wait_that_refusals_built_up", async () => {
   // Refused on ticks 1 and 12, so the wait is 10 and then 20. The node is down on tick 33, which
   // costs 10 ticks and neither resets the wait nor doubles it; refused again on tick 44, it is 40,

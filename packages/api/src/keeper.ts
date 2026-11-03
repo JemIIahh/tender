@@ -59,10 +59,10 @@ interface Failure {
  *   again once the chore goes through. Otherwise tasks that the chain keeps refusing, such as the
  *   rows of another deployment's index, would take every slot of every tick and leave none for the
  *   rest;
- * - a task whose call or read failed in any other way, such as a node that cannot be reached or a
- *   transaction that has not finished, is left alone for the next 10 ticks, however often that
- *   happens, and the wait that refusals built up stays as it was. That says nothing of the task:
- *   after an outage every task is back within about 10 ticks.
+ * - a task whose call or read failed in any other way, such as a node that cannot be reached, a
+ *   call that timed out (`E_TIMEOUT`) or a transaction that has not finished, is left alone for
+ *   the next 10 ticks, however often that happens, and the wait that refusals built up stays as it
+ *   was. That says nothing of the task: after an outage every task is back within about 10 ticks.
  *
  * It holds something only for tasks the index still lists (`forget`), so it does not grow with
  * every task that ever failed or was found clean. `startKeeper` keeps one for the whole run. A tick
@@ -253,11 +253,14 @@ type Attempt = "sent" | "lost" | "settled" | "refused" | "failed";
  * Whether `error`, which is not a lost race, is the contract refusing the call: a `TenderError`,
  * which the client throws for a transaction that failed on chain, whose code names a refusal.
  * `E_UNKNOWN` is no such code: it is what the client calls a transaction that has no final outcome
- * yet (the RPC's doing), and a failure whose text it does not know. Nor is anything thrown before
- * the transaction ran, by near-api-js or the network: a timeout, a refused connection, a 5xx.
+ * yet (the RPC's doing), and a failure whose text it does not know. Nor is `E_TIMEOUT`, the client
+ * giving up on a node that did not answer in time: the call may have gone through all the same,
+ * and the next try finds out, as a lost race (`E_SETTLED`, `E_PHASE`) or as a task with nothing
+ * left to do. Nor is anything thrown before the transaction ran, by near-api-js or the network: a
+ * refused connection, a 5xx.
  */
 function isRefusal(error: unknown): boolean {
-  return error instanceof TenderError && error.code !== "E_UNKNOWN";
+  return error instanceof TenderError && error.code !== "E_UNKNOWN" && error.code !== "E_TIMEOUT";
 }
 
 /**

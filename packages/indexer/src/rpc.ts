@@ -1,4 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
+import { DEFAULT_RPC_TIMEOUT_MS, timeoutOption, withDeadline } from "@tender/client";
 import { receiptsFromTx } from "@tender/client/outcome";
 import type { ReceiptOutcome } from "@tender/shared";
 import { JsonRpcProvider } from "near-api-js";
@@ -11,6 +12,27 @@ const EMPTY_TX_ROOT = "11111111111111111111111111111111";
 
 /** A block as the node's `block` method gives it. */
 type NodeBlock = Awaited<ReturnType<JsonRpcProvider["viewBlock"]>>;
+
+/** The three reads that the source makes of a node. */
+type Reads = Pick<JsonRpcProvider, "viewBlock" | "viewChunk" | "viewTransactionStatusWithReceipts">;
+
+/**
+ * The reads of `provider`, each with `timeoutMs` to be answered in, as a client's view has
+ * (`withDeadline`). near-api-js's retries of a failing node are inside the time. A node that does
+ * not answer in time fails the read with a `TenderError` with code `E_TIMEOUT`.
+ */
+function withDeadlines(provider: JsonRpcProvider, timeoutMs: number): Reads {
+  const bounded = <T>(read: string, call: () => Promise<T>) =>
+    withDeadline(`RPC block source ${read}`, timeoutMs, call);
+  return {
+    viewBlock: (query) => bounded("viewBlock", () => provider.viewBlock(query)),
+    viewChunk: (chunkId) => bounded("viewChunk", () => provider.viewChunk(chunkId)),
+    viewTransactionStatusWithReceipts: (params) =>
+      bounded("viewTransactionStatusWithReceipts", () =>
+        provider.viewTransactionStatusWithReceipts(params),
+      ),
+  };
+}
 
 /**
  * The node has no block for the heights `from` to `to`, though one of them is the parent of block
@@ -63,8 +85,13 @@ export class BlocksLostError extends IndexerError {
  * Only blocks up to the last final one are read. When the source has caught up it waits `pollMs`
  * (default 500) and looks at the final height again. Once `signal` aborts it ends without an
  * error and yields nothing more. It looks at the signal before each read, so only the call under
- * way finishes first. near-api-js cannot cancel that call, and retries a failing node for about
- * two minutes.
+ * way finishes first. That call is not cancelled by the signal, but it has `rpcTimeoutMs` (default
+ * 30 s, a whole number of milliseconds from 1 to 2147483647, or `createRpcSource` throws a
+ * `RangeError`) to be answered in, near-api-js's retries of a failing node included: it used to
+ * wait for as long as the node let it. A node that has not answered by then ends the source with a
+ * `TenderError` with code `E_TIMEOUT`, which `startIndexer` logs and restarts from the cursor
+ * after, like any other failure of a source. The time is that of each read, the wait for a
+ * transaction to be final included.
  *
  * A height that has no block, as when its producer missed the slot, is skipped: the node answers
  * it with an `UnknownBlockError`. But a node answers a block that it has lost the same way, and
@@ -81,8 +108,17 @@ export class BlocksLostError extends IndexerError {
  *
  * No other error skips a block either: it ends the iteration, as that error.
  */
-export function createRpcSource(opts: { rpcUrl: string; pollMs?: number }): BlockSource {
-  const provider = new JsonRpcProvider({ url: opts.rpcUrl });
+export function createRpcSource(opts: {
+  rpcUrl: string;
+  pollMs?: number;
+  rpcTimeoutMs?: number;
+}): BlockSource {
+  const timeoutMs = timeoutOption(
+    "createRpcSource: rpcTimeoutMs",
+    opts.rpcTimeoutMs,
+    DEFAULT_RPC_TIMEOUT_MS,
+  );
+  const provider = withDeadlines(new JsonRpcProvider({ url: opts.rpcUrl }), timeoutMs);
   const pollMs = opts.pollMs ?? 500;
   return {
     async *blocks(fromHeight, signal) {
@@ -125,7 +161,7 @@ async function pause(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /** The node's block at `height`, or null if it has none. */
-async function viewBlockAt(provider: JsonRpcProvider, height: bigint): Promise<NodeBlock | null> {
+async function viewBlockAt(provider: Reads, height: bigint): Promise<NodeBlock | null> {
   try {
     return await provider.viewBlock({ blockId: Number(height) });
   } catch (error) {
@@ -150,7 +186,7 @@ function assertNeverHadBlocks(from: bigint, height: bigint, parent: number | nul
  * before they are all read.
  */
 async function indexBlock(
-  provider: JsonRpcProvider,
+  provider: Reads,
   block: NodeBlock,
   signal: AbortSignal,
 ): Promise<IndexedBlock | null> {

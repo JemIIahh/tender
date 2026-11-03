@@ -33,6 +33,12 @@ import {
 } from "@tender/shared";
 import { Account, actions, JsonRpcProvider, KeyPairSigner, type KeyPairString } from "near-api-js";
 import { AccessKeyDoesNotExistError, AccountDoesNotExistError } from "near-api-js/rpc-errors";
+import {
+  DEFAULT_RPC_TIMEOUT_MS,
+  DEFAULT_SEND_TIMEOUT_MS,
+  timeoutOption,
+  withDeadline,
+} from "./deadline";
 import { errorCodeOf, TenderError } from "./errors";
 import type { KeyPermission } from "./nep413";
 import { receiptsFromTx, type TxReceiptsOutcome } from "./outcome";
@@ -80,6 +86,14 @@ const MAX_PAGE = 50;
 
 /** Every read is of the last final block; see `TenderClient`. */
 const FINALITY = "final";
+
+/**
+ * What the `E_TIMEOUT` of a send says after the call and the time. The client stopped waiting, and
+ * did not see the transaction fail. The message is read by people and by agents, so it says what
+ * is left open and what to do about it, in plain words.
+ */
+const SEND_MAY_STILL_LAND =
+  "The transaction may still land. Read the chain before sending it again.";
 
 const TaskOrNull = TaskViewSchema.nullable();
 const Tasks = TaskViewSchema.array();
@@ -168,6 +182,22 @@ export function toTxResult(resp: FinalTxOutcome, contractId: string): TxResult {
  * before the transaction ran, from the RPC or from near-api-js, is thrown as near-api-js throws
  * it.
  *
+ * Every call to the node has a time limit, so that a node that takes a request and never answers
+ * cannot hold a caller for ever. A read (a view, a key, a block) has `rpcTimeoutMs`, 30 s unless it
+ * is set. A send has `sendTimeoutMs`, 120 s, for all it does: the nonce and the block it reads, the
+ * transaction, and the wait for its final outcome. near-api-js's own retries of a failing node are
+ * inside the time, not on top of it. A call that runs out of time is cancelled, its request and its
+ * connection with it, and throws a `TenderError` with code `E_TIMEOUT`, whose message names the
+ * call and the time and says nothing of the node (no URL, no key). The message of a send goes on to
+ * say that the transaction may still land, and to read the chain before sending it again. The time
+ * of a send starts when the send does, once it has had its turn in the queue below.
+ *
+ * A send that timed out may still have landed. The client stopped waiting for the answer: the node
+ * may have had the transaction by then, and it can run, with its events, after the `E_TIMEOUT`. So
+ * an `E_TIMEOUT` from a send is not "it failed". Read the state before sending the same thing again
+ * (`getEntry` after a `commit`, `getTask` after a `pick` or a `void_task`), and send nothing that
+ * would be wrong done twice. A view that timed out changed nothing.
+ *
  * Every send waits its turn in `defaultQueue`, keyed by the signer's account. The transactions of
  * one account, from all its clients in this process, go one at a time in the order they were sent,
  * so they never race for a nonce; those of different accounts go at the same time. A transaction
@@ -180,6 +210,10 @@ export class TenderClient {
   readonly network: NetworkId;
   readonly contractId: string;
   readonly rpcUrl: string;
+  /** How long a read of the node may take, in milliseconds. */
+  readonly rpcTimeoutMs: number;
+  /** How long a send may take, in milliseconds. */
+  readonly sendTimeoutMs: number;
   /** The signer's account, when the client has one. */
   readonly accountId?: string;
   private readonly provider: JsonRpcProvider;
@@ -188,8 +222,19 @@ export class TenderClient {
   /**
    * `rpcUrl` defaults to the network's. The sandbox has none, because a local node picks its port
    * when it starts, so a client of a local chain passes `LocalChain.rpcUrl`.
+   *
+   * `rpcTimeoutMs` (default 30000) is how long a read of the node may take, and `sendTimeoutMs`
+   * (default 120000) how long a send may take; see the class. Each is a whole number of
+   * milliseconds from 1 to 2147483647, or the constructor throws a `RangeError` that names it.
    */
-  constructor(opts: { network: NetworkId; contractId: string; rpcUrl?: string; signer?: Signer }) {
+  constructor(opts: {
+    network: NetworkId;
+    contractId: string;
+    rpcUrl?: string;
+    signer?: Signer;
+    rpcTimeoutMs?: number;
+    sendTimeoutMs?: number;
+  }) {
     const rpcUrl = opts.rpcUrl ?? NETWORKS[opts.network].rpcUrl;
     if (rpcUrl === "") {
       throw new Error(
@@ -199,6 +244,16 @@ export class TenderClient {
     this.network = opts.network;
     this.contractId = opts.contractId;
     this.rpcUrl = rpcUrl;
+    this.rpcTimeoutMs = timeoutOption(
+      "TenderClient: rpcTimeoutMs",
+      opts.rpcTimeoutMs,
+      DEFAULT_RPC_TIMEOUT_MS,
+    );
+    this.sendTimeoutMs = timeoutOption(
+      "TenderClient: sendTimeoutMs",
+      opts.sendTimeoutMs,
+      DEFAULT_SEND_TIMEOUT_MS,
+    );
     this.provider = new JsonRpcProvider({ url: rpcUrl });
     if (opts.signer !== undefined) {
       const { accountId, privateKey } = opts.signer;
@@ -208,20 +263,34 @@ export class TenderClient {
     }
   }
 
-  /** Calls the view `method` of `contractId` with `args`, unchecked. */
+  /**
+   * Calls the view `method` of `contractId` with `args`, unchecked. It has `rpcTimeoutMs`, and
+   * throws a `TenderError` with code `E_TIMEOUT` if the node has not answered by then.
+   */
   async view<T>(contractId: string, method: string, args: object = {}): Promise<T> {
-    const value: unknown = await this.provider.callFunction({
-      contractId,
-      method,
-      args: args as Record<string, unknown>,
-      blockQuery: { finality: FINALITY },
-    });
+    const value: unknown = await withDeadline(
+      `TenderClient.view ${method}`,
+      this.rpcTimeoutMs,
+      () =>
+        this.provider.callFunction({
+          contractId,
+          method,
+          args: args as Record<string, unknown>,
+          blockQuery: { finality: FINALITY },
+        }),
+    );
     return value as T;
   }
 
   /**
    * Signs `call` as the signer, sends it and waits until it is final. See `toTxResult`. It goes
-   * once the earlier sends of the signer's account in this process are done (`defaultQueue`).
+   * once the earlier sends of the signer's account in this process are done (`defaultQueue`), and
+   * has `sendTimeoutMs` from then on. A send the node has not finished by then throws a
+   * `TenderError` with code `E_TIMEOUT`, and may have landed all the same (see the class), which
+   * the error's message says: it has no `txHash`, since the client does not learn it.
+   *
+   * The time is that of each try: a transaction that loses its nonce to another (`defaultQueue`)
+   * is sent once more, and that try has all of `sendTimeoutMs` again.
    */
   async send(call: TenderCall): Promise<TxResult> {
     const account = this.account;
@@ -230,12 +299,18 @@ export class TenderClient {
     }
     const action = actions.functionCall(call.methodName, call.args, call.gas, call.deposit);
     return defaultQueue.run(account.accountId, async () => {
-      const resp = await account.signAndSendTransaction({
-        receiverId: call.receiverId,
-        actions: [action],
-        waitUntil: "FINAL",
-        throwOnFailure: false,
-      });
+      const resp = await withDeadline(
+        `TenderClient.send ${call.methodName}`,
+        this.sendTimeoutMs,
+        () =>
+          account.signAndSendTransaction({
+            receiverId: call.receiverId,
+            actions: [action],
+            waitUntil: "FINAL",
+            throwOnFailure: false,
+          }),
+        SEND_MAY_STILL_LAND,
+      );
       return toTxResult(resp, this.contractId);
     });
   }
@@ -325,7 +400,9 @@ export class TenderClient {
 
   /** The height of the last final block. */
   async finalHeight(): Promise<bigint> {
-    const { header } = await this.provider.viewBlock({ finality: FINALITY });
+    const { header } = await withDeadline("TenderClient.finalHeight", this.rpcTimeoutMs, () =>
+      this.provider.viewBlock({ finality: FINALITY }),
+    );
     return BigInt(header.height);
   }
 
@@ -334,7 +411,9 @@ export class TenderClient {
    * every transaction sent from now on.
    */
   async blockTimestampNs(): Promise<bigint> {
-    const { header } = await this.provider.viewBlock({ finality: FINALITY });
+    const { header } = await withDeadline("TenderClient.blockTimestampNs", this.rpcTimeoutMs, () =>
+      this.provider.viewBlock({ finality: FINALITY }),
+    );
     return BigInt(header.timestamp_nanosec);
   }
 
@@ -343,7 +422,8 @@ export class TenderClient {
    * when the account has no such key. The RPC's four variants all pass through unchanged, the two
    * gas-key ones too, so that the NEP-413 verifier is what decides which it accepts. Only a missing
    * key, or a missing account, which cannot have the key either, is null; any other RPC error is
-   * thrown, never read as "no key".
+   * thrown, never read as "no key". A node that does not answer in `rpcTimeoutMs` is one: it throws
+   * a `TenderError` with code `E_TIMEOUT`.
    */
   async viewAccessKey(
     accountId: string,
@@ -353,11 +433,16 @@ export class TenderClient {
       // The last final block, like every read here, so that no answer is one a fork could undo.
       // The cost: a deleted key stops working only when its deletion is final, about two blocks
       // after the deleting transaction ran.
-      const { permission } = await this.provider.viewAccessKey({
-        accountId,
-        publicKey,
-        finalityQuery: { finality: FINALITY },
-      });
+      const { permission } = await withDeadline(
+        "TenderClient.viewAccessKey",
+        this.rpcTimeoutMs,
+        () =>
+          this.provider.viewAccessKey({
+            accountId,
+            publicKey,
+            finalityQuery: { finality: FINALITY },
+          }),
+      );
       return { permission: permission as KeyPermission };
     } catch (error) {
       if (
