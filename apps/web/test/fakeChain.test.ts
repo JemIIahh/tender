@@ -1,7 +1,10 @@
 import {
   depositCall,
+  type PostTaskInput,
+  postTaskCall,
   storageDepositCall,
   storageWithdrawCall,
+  TenderEventSchema,
   tokenStorageDepositCall,
   withdrawCall,
 } from "@tender/shared";
@@ -11,7 +14,7 @@ import { chainWallet } from "./walletDoubles";
 
 // The model that the wallet tests run on (test/fakeChain.ts) is held to what the contract does, so
 // that a test that passes on it says something about the page. Each rule here is one the contract
-// source states: contract/tender/src/vault.rs, storage.rs and ft.rs.
+// source states: contract/tender/src/vault.rs, storage.rs, ft.rs and tasks.rs.
 
 const CONTRACT = "tender.testnet";
 const TOKEN = "tusdc.testnet";
@@ -171,4 +174,179 @@ test("a_wallet_double_stops_at_the_first_transaction_that_fails", async () => {
   expect(outcomes).toHaveLength(1);
   expect(wallet.sent).toHaveLength(1);
   expect(chain.calls.map((call) => call.methodName)).toEqual(["withdraw"]);
+});
+
+// ---- post_task ----------------------------------------------------------------------------------
+
+const HASH = "a".repeat(64);
+const TERMS: PostTaskInput = {
+  token: TOKEN,
+  reward: 5_000_000n,
+  briefUri: "http://api.test/v1/blobs/brief",
+  briefHash: HASH,
+  criteriaHash: "b".repeat(64),
+  heldoutCommitment: "c".repeat(64),
+  verifier: "judge.testnet",
+  commitSecs: 600,
+  revealSecs: 300,
+  pickSecs: 600,
+  fallbackSecs: 600,
+};
+
+/** A chain on which ALICE has set up and holds 10 test USDC in the vault. */
+function postingChain(): FakeChain {
+  const chain = new FakeChain(CONTRACT, [{ token: TOKEN }]);
+  chain.fundVault(ALICE, TOKEN, 10_000_000n);
+  chain.now = () => 1_793_307_169_820_229_000n;
+  return chain;
+}
+
+const codeOf = (outcomes: ReturnType<FakeChain["send"]>) =>
+  /(E_[A-Z_]+)/.exec(JSON.stringify(outcomes[0]?.status))?.[1];
+
+test("post_task_puts_the_reward_in_escrow_and_logs_task_created", () => {
+  const chain = postingChain();
+  const storageBefore = chain.storage.get(ALICE)?.usedBytes ?? 0n;
+
+  const outcomes = sendAll(chain, [postTaskCall(CONTRACT, TERMS)]);
+
+  expect(outcomes[0]?.status).toEqual({ SuccessValue: "" });
+  // The vault gave up the reward, and the poster's storage holds the task and the outcome's room.
+  expect(chain.view(CONTRACT, "balances_of", { account_id: ALICE })).toEqual([
+    { token: TOKEN, amount: "5000000" },
+  ]);
+  expect((chain.storage.get(ALICE)?.usedBytes ?? 0n) - storageBefore).toBeGreaterThan(800n);
+
+  const [log] = outcomes.flatMap((o) => o.receipts_outcome.flatMap((r) => r.outcome.logs));
+  const line = JSON.parse((log ?? "").slice("EVENT_JSON:".length));
+  const event = TenderEventSchema.parse({ event: line.event, data: line.data[0] });
+  expect(event).toMatchObject({
+    event: "task_created",
+    data: {
+      id: "1",
+      poster: ALICE,
+      token: TOKEN,
+      reward: "5000000",
+      fee_bps: 500,
+      brief_hash: HASH,
+      heldout_commitment: "c".repeat(64),
+      verifier: "judge.testnet",
+      max_entries: 0,
+      max_winners: 1,
+      invited: [],
+      parent: null,
+    },
+  });
+  // The deadlines follow one another from the block time.
+  const second = 1_000_000_000n;
+  expect(chain.tasks.get(1n)).toMatchObject({
+    createdAt: 1_793_307_169_820_229_000n,
+    commitDeadline: 1_793_307_169_820_229_000n + 600n * second,
+    revealDeadline: 1_793_307_169_820_229_000n + 900n * second,
+    pickDeadline: 1_793_307_169_820_229_000n + 1_500n * second,
+    fallbackDeadline: 1_793_307_169_820_229_000n + 2_100n * second,
+  });
+});
+
+test("post_task_is_the_poster_s_own_verifier_unless_it_names_another", () => {
+  const chain = postingChain();
+
+  sendAll(chain, [
+    postTaskCall(CONTRACT, { ...TERMS, verifier: undefined, heldoutCommitment: undefined }),
+  ]);
+
+  expect(chain.tasks.get(1n)).toMatchObject({ verifier: ALICE, heldoutCommitment: null });
+});
+
+test("post_task_breaks_a_rule_of_the_contract_and_panics_with_its_code_and_nothing_changes", () => {
+  const rules: Array<[string, (chain: FakeChain) => PostTaskInput | Record<string, unknown>]> = [
+    [
+      "E_PAUSED",
+      (chain) => {
+        chain.paused = true;
+        return TERMS;
+      },
+    ],
+    ["E_TOKEN", () => ({ ...TERMS, token: "other.testnet" })],
+    ["E_REWARD", () => ({ ...TERMS, reward: 0n })],
+    ["E_URI", () => ({ ...TERMS, briefUri: "" })],
+    ["E_URI", () => ({ ...TERMS, briefUri: "u".repeat(257) })],
+    ["E_HASH", () => ({ ...TERMS, briefHash: "A".repeat(64) })],
+    ["E_HASH", () => ({ ...TERMS, heldoutCommitment: "c".repeat(63) })],
+    ["E_WINDOW", () => ({ ...TERMS, commitSecs: 59 })],
+    ["E_WINDOW", () => ({ ...TERMS, fallbackSecs: 1_209_601 })],
+    ["E_WINNERS", () => ({ ...TERMS, maxWinners: 0 })],
+    ["E_WINNERS", () => ({ ...TERMS, maxWinners: 6 })],
+    ["E_LIMIT", () => ({ ...TERMS, maxEntries: 3 })],
+    ["E_PARENT", () => ({ ...TERMS, parent: 1n })],
+    ["E_FUNDS", () => ({ ...TERMS, reward: 10_000_001n })],
+  ];
+  for (const [code, make] of rules) {
+    const chain = postingChain();
+    const terms = make(chain) as PostTaskInput;
+
+    const outcomes = sendAll(chain, [postTaskCall(CONTRACT, terms)]);
+
+    expect(codeOf(outcomes), code).toBe(code);
+    expect(chain.tasks.size, code).toBe(0);
+    expect(chain.view(CONTRACT, "balances_of", { account_id: ALICE }), code).toEqual([
+      { token: TOKEN, amount: "10000000" },
+    ]);
+  }
+
+  // Exactly 1 yoctoNEAR, and a field the contract does not know.
+  const chain = postingChain();
+  expect(codeOf(sendAll(chain, [{ ...postTaskCall(CONTRACT, TERMS), deposit: 0n }]))).toBe(
+    "E_AUTH",
+  );
+  const extra = postTaskCall(CONTRACT, TERMS);
+  (extra.args.task as Record<string, unknown>).max_winner = 1;
+  expect(codeOf(sendAll(chain, [extra]))).toBe("E_ARGS");
+  expect(chain.tasks.size).toBe(0);
+});
+
+test("post_task_needs_a_storage_balance_that_can_hold_the_task", () => {
+  const chain = new FakeChain(CONTRACT, [{ token: TOKEN }]);
+  chain.give(TOKEN, ALICE, 5_000_000n);
+  // A vault balance with no storage cannot exist; a storage balance that is full can.
+  chain.vault.set(ALICE, new Map([[TOKEN, 10_000_000n]]));
+  expect(codeOf(sendAll(chain, [postTaskCall(CONTRACT, TERMS)]))).toBe("E_STORAGE");
+
+  chain.storage.set(ALICE, { total: NEAR(0.05), usedBytes: 4_900n });
+  expect(codeOf(sendAll(chain, [postTaskCall(CONTRACT, TERMS)]))).toBe("E_STORAGE");
+  // Nothing was taken from the vault, and no id was used up.
+  expect(chain.tasks.size).toBe(0);
+  chain.storage.set(ALICE, { total: NEAR(0.05), usedBytes: 200n });
+  sendAll(chain, [postTaskCall(CONTRACT, TERMS)]);
+  expect([...chain.tasks.keys()]).toEqual([1n]);
+});
+
+test("task_ids_count_up_from_one_and_a_failed_post_does_not_use_one", () => {
+  const chain = postingChain();
+
+  sendAll(chain, [postTaskCall(CONTRACT, TERMS)]);
+  sendAll(chain, [postTaskCall(CONTRACT, { ...TERMS, reward: 99_000_000n })]);
+  sendAll(chain, [postTaskCall(CONTRACT, { ...TERMS, reward: 1_000_000n })]);
+
+  expect([...chain.tasks.keys()]).toEqual([1n, 2n]);
+});
+
+test("get_config_tells_what_a_task_may_pay_and_how_short_a_window_may_be", () => {
+  const chain = new FakeChain(CONTRACT, [
+    { token: TOKEN, minReward: 1_000_000n, maxReward: 50_000_000n },
+    { token: "off.testnet", enabled: false },
+  ]);
+  chain.minWindowSecs = 300;
+  chain.feeBps = 250;
+
+  expect(chain.view(CONTRACT, "get_config", {})).toMatchObject({
+    fee_bps: 250,
+    min_window_secs: 300,
+    max_window_secs: 1_209_600,
+    paused: false,
+    tokens: [
+      { token: TOKEN, min_reward: "1000000", max_reward: "50000000", enabled: true },
+      { token: "off.testnet", min_reward: "1", enabled: false },
+    ],
+  });
 });

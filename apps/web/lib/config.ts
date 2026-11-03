@@ -14,6 +14,12 @@ export interface WebConfig {
   contractId: string;
   /** Whether the in-page dev wallet is on. It is on only for the sandbox. */
   devWallet: boolean;
+  /**
+   * The account of the Tender Judge, if this build knows it. The API does not say which account the
+   * Judge is, and on chain a verifier is an account id, so the post wizard needs it from here: with
+   * it, "Tender Judge" is the default verifier, and without it that choice is not offered.
+   */
+  judgeAccount: string | null;
 }
 
 /** The variables `readConfig` reads, as `process.env` holds them. */
@@ -23,6 +29,7 @@ export interface PublicEnv {
   NEXT_PUBLIC_CONTRACT?: string;
   NEXT_PUBLIC_RPC_URL?: string;
   NEXT_PUBLIC_DEV_WALLET?: string;
+  NEXT_PUBLIC_JUDGE_ACCOUNT?: string;
 }
 
 function isNetworkId(value: string): value is NetworkId {
@@ -88,12 +95,22 @@ export function readConfig(env: PublicEnv): WebConfig {
     );
   }
 
+  // Optional. An empty value in a .env file is the same as none; a value that is no account id is
+  // a mistake to stop at, not a Judge to leave out without a word.
+  const judge = env.NEXT_PUBLIC_JUDGE_ACCOUNT?.trim() ?? "";
+  if (judge !== "" && !AccountIdSchema.safeParse(judge).success) {
+    throw new Error(
+      `NEXT_PUBLIC_JUDGE_ACCOUNT must be a NEAR account id, got ${JSON.stringify(judge)}`,
+    );
+  }
+
   return {
     network,
     apiUrl,
     rpcUrl,
     contractId,
     devWallet: network === "sandbox" && env.NEXT_PUBLIC_DEV_WALLET?.trim() === "1",
+    judgeAccount: judge === "" ? null : judge,
   };
 }
 
@@ -105,4 +122,5 @@ export const config: WebConfig = readConfig({
   NEXT_PUBLIC_CONTRACT: process.env.NEXT_PUBLIC_CONTRACT,
   NEXT_PUBLIC_RPC_URL: process.env.NEXT_PUBLIC_RPC_URL,
   NEXT_PUBLIC_DEV_WALLET: process.env.NEXT_PUBLIC_DEV_WALLET,
+  NEXT_PUBLIC_JUDGE_ACCOUNT: process.env.NEXT_PUBLIC_JUDGE_ACCOUNT,
 });

@@ -1,0 +1,374 @@
+"use client";
+
+import { type ReactNode, useEffect, useRef } from "react";
+import { type CheckKind, FORMAT_PHRASE, kindsFor, regexCaution } from "../../lib/post";
+import {
+  AreaField,
+  bindText,
+  CheckField,
+  FieldError,
+  RadioGroup,
+  SECONDARY,
+  type StepProps,
+  TextField,
+} from "./ui";
+
+// Step 2: how entries are checked. The page is split in two, because the task is: the left side is
+// published with the task, so agents work from it, and the right side is kept by the Judge and
+// shown to no one until the winner is paid. Every kind fills both sides in its own way.
+
+/** What the right side says, for every kind that has one. */
+const KEPT_NOTE =
+  "Agents can't read this. It is published with the scorecard after the payout, and the Judge takes it for one task only, so write new ones for each task.";
+
+function Split({ seen, kept }: { seen: ReactNode; kept: ReactNode }) {
+  return (
+    <div className="grid gap-4 md:grid-cols-2">
+      <section
+        data-testid="split-public"
+        aria-labelledby="post-split-public"
+        className="grid min-w-0 content-start gap-3 rounded border border-neutral-300 p-4"
+      >
+        <h3 id="post-split-public" className="text-lg font-semibold">
+          What agents see
+        </h3>
+        {seen}
+      </section>
+      <section
+        data-testid="split-heldout"
+        aria-labelledby="post-split-heldout"
+        className="grid min-w-0 content-start gap-3 rounded border-2 border-neutral-900 p-4"
+      >
+        <h3 id="post-split-heldout" className="text-lg font-semibold">
+          What the Judge keeps until payout
+        </h3>
+        {kept}
+      </section>
+    </div>
+  );
+}
+
+const Note = ({ children }: { children: ReactNode }) => (
+  <p className="text-sm text-neutral-700">{children}</p>
+);
+
+export function CriteriaStep(
+  props: StepProps & {
+    canRubric: boolean;
+    /** Said when picking a kind changed the answer format, or null. */
+    formatNote: string | null;
+    onKind(kind: CheckKind): void;
+  },
+) {
+  const { form, update, errors, touch, canRubric, formatNote, onKind } = props;
+
+  // A row that is added or taken away moves the person's place; this puts it back somewhere sane.
+  const focusAfter = useRef<string | null>(null);
+  useEffect(() => {
+    if (focusAfter.current !== null) {
+      document.getElementById(focusAfter.current)?.focus();
+      focusAfter.current = null;
+    }
+  });
+
+  const setAssertion = (i: number, patch: Partial<(typeof form.assertions)[number]>) =>
+    update({
+      assertions: form.assertions.map((row, at) => (at === i ? { ...row, ...patch } : row)),
+    });
+  const setPoint = (i: number, patch: Partial<(typeof form.rubric)[number]>) =>
+    update({ rubric: form.rubric.map((row, at) => (at === i ? { ...row, ...patch } : row)) });
+
+  const sides = (() => {
+    switch (form.kind) {
+      case "exact":
+        return (
+          <Split
+            seen={
+              <>
+                <Note>
+                  Entries are compared with the answers the Judge keeps, after these steps.
+                </Note>
+                <CheckField
+                  label="Ignore spaces at the start and end"
+                  checked={form.trim}
+                  onChange={(trim) => update({ trim })}
+                />
+                <CheckField
+                  label="Ignore upper and lower case"
+                  checked={form.lowercase}
+                  onChange={(lowercase) => update({ lowercase })}
+                />
+                <CheckField
+                  label="Treat runs of spaces as one"
+                  checked={form.collapseWs}
+                  onChange={(collapseWs) => update({ collapseWs })}
+                />
+              </>
+            }
+            kept={
+              <>
+                <AreaField
+                  label="Accepted answers"
+                  help="One per line. An entry that equals one of them passes."
+                  rows={5}
+                  mono
+                  {...bindText(props, "expected")}
+                />
+                <Note>{KEPT_NOTE}</Note>
+              </>
+            }
+          />
+        );
+
+      case "json_schema":
+        return (
+          <Split
+            seen={
+              <AreaField
+                label="JSON schema"
+                help="Answers have to fit this schema."
+                rows={9}
+                mono
+                {...bindText(props, "schema")}
+              />
+            }
+            kept={
+              <>
+                <div id="post-assertions" tabIndex={-1} className="grid gap-3">
+                  <p className="font-medium">Values the Judge checks</p>
+                  <Note>Where a value sits in the answer, and what it must equal.</Note>
+                  {form.assertions.map((row, i) => (
+                    <fieldset
+                      // biome-ignore lint/suspicious/noArrayIndexKey: a row has no identity but its place
+                      key={i}
+                      className="grid min-w-0 gap-2 rounded border border-neutral-300 p-3"
+                    >
+                      <legend className="px-1 text-sm">{`Value ${i + 1}`}</legend>
+                      <TextField
+                        name={`assertion-${i}-path`}
+                        label="Path"
+                        help="Like $.total or $.items[0].name"
+                        mono
+                        value={row.path}
+                        error={errors[`assertion-${i}-path`]}
+                        onChange={(path) => {
+                          setAssertion(i, { path });
+                          touch(`assertion-${i}-path`);
+                        }}
+                        onBlur={() => touch(`assertion-${i}-path`)}
+                      />
+                      <TextField
+                        name={`assertion-${i}-equals`}
+                        label="Must equal (JSON)"
+                        help={'Like 42, true, or text in quotes: "abc"'}
+                        mono
+                        value={row.equals}
+                        error={errors[`assertion-${i}-equals`]}
+                        onChange={(equals) => {
+                          setAssertion(i, { equals });
+                          touch(`assertion-${i}-equals`);
+                        }}
+                        onBlur={() => touch(`assertion-${i}-equals`)}
+                      />
+                      <button
+                        type="button"
+                        aria-disabled={form.assertions.length === 1}
+                        onClick={() => {
+                          if (form.assertions.length === 1) return;
+                          update({ assertions: form.assertions.filter((_, at) => at !== i) });
+                          focusAfter.current = "post-add-assertion";
+                        }}
+                        className={SECONDARY}
+                      >
+                        {`Remove value ${i + 1}`}
+                      </button>
+                    </fieldset>
+                  ))}
+                  <FieldError name="assertions" error={errors.assertions} />
+                  <button
+                    id="post-add-assertion"
+                    type="button"
+                    onClick={() => {
+                      update({ assertions: [...form.assertions, { path: "", equals: "" }] });
+                      focusAfter.current = `post-assertion-${form.assertions.length}-path`;
+                    }}
+                    className={SECONDARY}
+                  >
+                    Add another value
+                  </button>
+                </div>
+                <Note>{KEPT_NOTE}</Note>
+              </>
+            }
+          />
+        );
+
+      case "regex_cases": {
+        const caution = regexCaution(form);
+        return (
+          <Split
+            seen={
+              <>
+                <Note>Examples agents can test their pattern against.</Note>
+                <AreaField
+                  label="Should match"
+                  help="One per line."
+                  rows={4}
+                  mono
+                  {...bindText(props, "examplesMatch")}
+                />
+                <AreaField
+                  label="Should not match"
+                  help="One per line."
+                  rows={4}
+                  mono
+                  {...bindText(props, "examplesNoMatch")}
+                />
+              </>
+            }
+            kept={
+              <>
+                <Note>
+                  Optional. If you add any, the Judge scores on these alone. Without them, it scores
+                  on the examples agents see.
+                </Note>
+                <AreaField
+                  label="Held-out: should match"
+                  help="One per line."
+                  rows={4}
+                  mono
+                  {...bindText(props, "heldoutMatch")}
+                />
+                <AreaField
+                  label="Held-out: should not match"
+                  help="One per line."
+                  rows={4}
+                  mono
+                  {...bindText(props, "heldoutNoMatch")}
+                />
+                {caution === null ? null : (
+                  <p data-testid="regex-caution" className="text-sm font-medium">
+                    {caution}
+                  </p>
+                )}
+                <Note>{KEPT_NOTE}</Note>
+              </>
+            }
+          />
+        );
+      }
+
+      case "rubric":
+        return (
+          <Split
+            seen={
+              <div id="post-rubric" tabIndex={-1} className="grid gap-3">
+                <Note>Points an answer is scored on. A higher weight counts for more.</Note>
+                {form.rubric.map((row, i) => (
+                  <fieldset
+                    // biome-ignore lint/suspicious/noArrayIndexKey: a row has no identity but its place
+                    key={i}
+                    className="grid min-w-0 gap-2 rounded border border-neutral-300 p-3"
+                  >
+                    <legend className="px-1 text-sm">{`Point ${i + 1}`}</legend>
+                    <TextField
+                      name={`rubric-${i}-criterion`}
+                      label="What to look for"
+                      prose
+                      value={row.criterion}
+                      error={errors[`rubric-${i}-criterion`]}
+                      onChange={(criterion) => {
+                        setPoint(i, { criterion });
+                        touch(`rubric-${i}-criterion`);
+                      }}
+                      onBlur={() => touch(`rubric-${i}-criterion`)}
+                    />
+                    <TextField
+                      name={`rubric-${i}-weight`}
+                      label="Weight, 1 to 10"
+                      inputMode="numeric"
+                      className="sm:max-w-32"
+                      value={row.weight}
+                      error={errors[`rubric-${i}-weight`]}
+                      onChange={(weight) => {
+                        setPoint(i, { weight });
+                        touch(`rubric-${i}-weight`);
+                      }}
+                      onBlur={() => touch(`rubric-${i}-weight`)}
+                    />
+                    <button
+                      type="button"
+                      aria-disabled={form.rubric.length === 1}
+                      onClick={() => {
+                        if (form.rubric.length === 1) return;
+                        update({ rubric: form.rubric.filter((_, at) => at !== i) });
+                        focusAfter.current = "post-add-point";
+                      }}
+                      className={SECONDARY}
+                    >
+                      {`Remove point ${i + 1}`}
+                    </button>
+                  </fieldset>
+                ))}
+                <FieldError name="rubric" error={errors.rubric} />
+                <button
+                  id="post-add-point"
+                  type="button"
+                  onClick={() => {
+                    update({ rubric: [...form.rubric, { criterion: "", weight: "5" }] });
+                    focusAfter.current = `post-rubric-${form.rubric.length}-criterion`;
+                  }}
+                  className={SECONDARY}
+                >
+                  Add a point
+                </button>
+              </div>
+            }
+            kept={<Note>A rubric has no held-out part: nothing is kept back.</Note>}
+          />
+        );
+    }
+  })();
+
+  return (
+    <div className="grid gap-4">
+      <RadioGroup
+        name="kind"
+        legend="How are entries checked?"
+        value={form.kind}
+        options={kindsFor(canRubric).map(({ kind, label, blurb }) => ({
+          value: kind,
+          label,
+          detail: blurb,
+        }))}
+        onChange={onKind}
+        error={errors.kind}
+      />
+      <p data-testid="answer-format" className="text-sm">
+        {`Answers are ${FORMAT_PHRASE[form.outputFormat]}. You set this on the Brief step.`}
+      </p>
+      {formatNote === null ? null : (
+        <p role="status" data-testid="format-note" className="text-sm font-medium">
+          {formatNote}
+        </p>
+      )}
+
+      <TextField
+        label="Pass mark"
+        help="An entry that scores below this, out of 100, is not paid."
+        inputMode="numeric"
+        className="sm:max-w-32"
+        {...bindText(props, "minScore")}
+      />
+
+      {sides}
+
+      {errors.heldout === undefined ? null : (
+        <p id="post-heldout" tabIndex={-1} data-testid="error-heldout" className="font-medium">
+          {errors.heldout}
+        </p>
+      )}
+      <p className="text-sm text-neutral-700">The prize goes to the winner alone.</p>
+    </div>
+  );
+}

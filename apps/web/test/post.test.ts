@@ -1,0 +1,586 @@
+import {
+  BriefSchema,
+  canonicalJson,
+  HeldoutSchema,
+  heldoutMatchesCriteria,
+  PublicCriteriaSchema,
+  sha256Hex,
+} from "@tender/shared";
+import { expect, test } from "vitest";
+import {
+  buildDocuments,
+  checkBrief,
+  checkChecks,
+  checkReward,
+  DocumentError,
+  firstError,
+  formatForKind,
+  KINDS,
+  kindsFor,
+  linesOf,
+  type PostForm,
+  PRESET_WINDOWS,
+  parseTags,
+  planPostCalls,
+  regexCaution,
+  windowsOf,
+} from "../lib/post";
+import {
+  exactForm,
+  JUDGE,
+  jsonForm,
+  LIMITS,
+  regexForm,
+  rubricForm,
+  SECRET,
+  TOKEN,
+} from "./postForms";
+
+// The rules of the post wizard, without a page: what a form is checked for, the documents it is
+// turned into and the calls that post them. vitest.config.ts gives the config the network testnet,
+// in which `tusdc.*` is the test USDC with six decimals.
+
+const CONTRACT = "tender.testnet";
+
+const decode = (bytes: Uint8Array): unknown => JSON.parse(new TextDecoder().decode(bytes));
+const text = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
+
+// ---- The documents ------------------------------------------------------------------------------
+
+test("wizard_builds_valid_documents", () => {
+  for (const form of [regexForm(), exactForm(), jsonForm(), rubricForm()]) {
+    const docs = buildDocuments(form);
+
+    // Each document is the canonical bytes of a JSON value the shared schemas accept.
+    const brief = BriefSchema.parse(decode(docs.brief));
+    const criteria = PublicCriteriaSchema.parse(decode(docs.criteria));
+    expect(docs.brief, form.kind).toEqual(canonicalJson(decode(docs.brief)));
+    expect(docs.criteria, form.kind).toEqual(canonicalJson(decode(docs.criteria)));
+    expect(criteria.kind).toBe(form.kind);
+    expect(brief.output.format).toBe(form.outputFormat);
+
+    // The hashes are those of the bytes, and the commitment is that of the held-out bytes.
+    expect(docs.briefHash).toBe(sha256Hex(docs.brief));
+    expect(docs.criteriaHash).toBe(sha256Hex(docs.criteria));
+    if (docs.heldout === null) {
+      expect(docs.heldoutCommitment).toBeNull();
+      expect(criteria.has_heldout).toBe(false);
+    } else {
+      expect(docs.heldoutCommitment).toBe(sha256Hex(docs.heldout));
+      expect(docs.heldout).toEqual(canonicalJson(decode(docs.heldout)));
+      const heldout = HeldoutSchema.parse(decode(docs.heldout));
+      expect(heldoutMatchesCriteria(criteria, heldout)).toBe(true);
+      expect(criteria.has_heldout).toBe(true);
+    }
+  }
+});
+
+test("documents_hold_what_was_typed", () => {
+  const regex = buildDocuments(regexForm());
+  expect(decode(regex.brief)).toEqual({
+    version: 1,
+    title: "Regex for NEAR account ids",
+    summary: "Write one regex that tells valid account ids from invalid ones.",
+    instructions: "Return the pattern and its flags.\nAnchor it at both ends.",
+    category: "coding",
+    tags: ["regex", "near", "validation"],
+    output: { format: "regex_json", max_bytes: 4096 },
+  });
+  expect(decode(regex.criteria)).toEqual({
+    version: 1,
+    kind: "regex_cases",
+    min_score: 100,
+    split: "winner_take_all",
+    has_heldout: true,
+    examples: { match: ["alice.near", "bob.testnet"], no_match: ["-bad", "UPPER"] },
+  });
+  expect(decode(regex.heldout as Uint8Array)).toEqual({
+    regex_cases: {
+      match: [`${SECRET}.near`, "carol.near"],
+      no_match: ["dave..near", "_eve.near"],
+    },
+  });
+
+  const exact = buildDocuments(exactForm());
+  expect(decode(exact.criteria)).toMatchObject({ kind: "exact", normalize: ["trim", "lowercase"] });
+  expect(decode(exact.heldout as Uint8Array)).toEqual({
+    exact: { expected: ["Canberra", "Canberra, ACT"] },
+  });
+
+  const json = buildDocuments(jsonForm());
+  expect(decode(json.criteria)).toMatchObject({ kind: "json_schema", schema: { type: "object" } });
+  expect(decode(json.heldout as Uint8Array)).toEqual({
+    json_schema: {
+      assertions: [
+        { path: "$.total", equals: 1250.5 },
+        { path: "$.lines[0].sku", equals: "A-1" },
+      ],
+    },
+  });
+
+  // A rubric has no held-out part.
+  const rubric = buildDocuments(rubricForm());
+  expect(rubric.heldout).toBeNull();
+  expect(decode(rubric.criteria)).toMatchObject({
+    kind: "rubric",
+    min_score: 70,
+    rubric: [
+      { criterion: "Clear about what changed", weight: 8 },
+      { criterion: "Short", weight: 3 },
+    ],
+  });
+});
+
+test("a_regex_task_without_heldout_cases_is_scored_on_its_public_examples", () => {
+  const docs = buildDocuments(regexForm({ heldoutMatch: "", heldoutNoMatch: "" }));
+
+  expect(docs.heldout).toBeNull();
+  expect(docs.heldoutCommitment).toBeNull();
+  expect(decode(docs.criteria)).toMatchObject({ has_heldout: false });
+});
+
+test("the_same_form_gives_the_same_bytes_whatever_the_order_it_was_typed_in", () => {
+  const first = buildDocuments(jsonForm({ schema: '{"type":"object","title":"t"}' }));
+  const second = buildDocuments(jsonForm({ schema: '{ "title": "t",\n "type": "object" }' }));
+
+  expect(second.criteria).toEqual(first.criteria);
+  expect(second.criteriaHash).toBe(first.criteriaHash);
+  expect(text(first.criteria)).toContain('"schema":{"title":"t","type":"object"}');
+});
+
+test("tags_are_read_from_commas_and_spaces_and_each_is_kept_once", () => {
+  expect(parseTags("Regex, near  #validation,regex")).toEqual(["regex", "near", "validation"]);
+  expect(parseTags("")).toEqual([]);
+  expect(parseTags(" , ")).toEqual([]);
+});
+
+test("cases_are_read_one_to_a_line_and_spaces_are_kept", () => {
+  expect(linesOf("a\n\n b \r\nc\n  \n")).toEqual(["a", " b ", "c"]);
+  expect(linesOf("")).toEqual([]);
+});
+
+test("a_form_that_does_not_fit_the_schemas_is_a_document_error_and_never_quotes_the_heldout", () => {
+  // The steps of the wizard stop all of these earlier; this is the last check before an upload.
+  const cases: PostForm[] = [
+    regexForm({ title: "" }),
+    regexForm({ maxBytes: "0" }),
+    exactForm({ expected: "" }),
+    jsonForm({ schema: "[1]" }),
+    // A key that would set the prototype is something the schemas refuse to carry.
+    jsonForm({ schema: '{"__proto__": {"type": "object"}}' }),
+  ];
+  for (const form of cases) {
+    expect(() => buildDocuments(form), form.title).toThrow(DocumentError);
+  }
+
+  // A lone surrogate in the held-out is text that cannot be written; the message says nothing of it.
+  let message = "";
+  try {
+    buildDocuments(exactForm({ expected: `${SECRET}\ud800` }));
+  } catch (error) {
+    expect(error).toBeInstanceOf(DocumentError);
+    message = (error as Error).message;
+  }
+  expect(message).not.toBe("");
+  expect(message).not.toContain(SECRET);
+});
+
+// ---- The calls ----------------------------------------------------------------------------------
+
+function planFor(form: PostForm, vaultBalance: bigint, judgeAccount: string | null = JUDGE) {
+  const docs = buildDocuments(form);
+  return planPostCalls({
+    form,
+    uris: { brief: `http://api.test/v1/blobs/${docs.briefHash}` },
+    hashes: docs,
+    vaultBalance,
+    contractId: CONTRACT,
+    tokenId: TOKEN,
+    judgeAccount,
+  });
+}
+
+test("deposit_prepended_when_vault_short", () => {
+  const form = regexForm({ amount: "5" });
+
+  // An empty vault: the whole reward is deposited first.
+  const empty = planFor(form, 0n);
+  expect(empty.map((call) => [call.receiverId, call.methodName])).toEqual([
+    [TOKEN, "ft_transfer_call"],
+    [CONTRACT, "post_task"],
+  ]);
+  expect(empty[0]?.args).toEqual({ receiver_id: CONTRACT, amount: "5000000", msg: "" });
+
+  // A vault that holds part of it: the difference.
+  const partial = planFor(form, 2_000_000n);
+  expect(partial).toHaveLength(2);
+  expect(partial[0]?.args).toEqual({ receiver_id: CONTRACT, amount: "3000000", msg: "" });
+  expect(partial[0]?.deposit).toBe(1n);
+
+  // The reward is in the vault already, to the last unit or beyond: only the post.
+  for (const vault of [5_000_000n, 9_000_000n]) {
+    const enough = planFor(form, vault);
+    expect(enough.map((call) => call.methodName)).toEqual(["post_task"]);
+  }
+  // One unit short is still a deposit, of one unit.
+  const oneShort = planFor(form, 4_999_999n);
+  expect(oneShort[0]?.args).toMatchObject({ amount: "1" });
+});
+
+test("post_task_carries_the_terms_of_the_form", () => {
+  const form = regexForm({ amount: "5" });
+  const docs = buildDocuments(form);
+  const [post] = planFor(form, 5_000_000n);
+
+  expect(post?.receiverId).toBe(CONTRACT);
+  expect(post?.deposit).toBe(1n);
+  expect(post?.args).toEqual({
+    task: {
+      token: TOKEN,
+      reward: "5000000",
+      brief_uri: `http://api.test/v1/blobs/${docs.briefHash}`,
+      brief_hash: docs.briefHash,
+      criteria_hash: docs.criteriaHash,
+      heldout_commitment: docs.heldoutCommitment,
+      // The Judge is this form's verifier.
+      verifier: JUDGE,
+      commit_secs: 600,
+      reveal_secs: 300,
+      pick_secs: 600,
+      fallback_secs: 600,
+      max_entries: 0,
+      max_winners: 1,
+      invited: [],
+      parent: null,
+    },
+  });
+});
+
+test("the_verifier_on_chain_is_null_when_the_poster_verifies", () => {
+  const task = (form: PostForm) =>
+    (planFor(form, 9_000_000n).at(-1)?.args.task as { verifier: unknown } | undefined)?.verifier;
+
+  expect(task(regexForm({ verifier: "me" }))).toBeNull();
+  expect(task(regexForm({ verifier: "judge" }))).toBe(JUDGE);
+  expect(task(regexForm({ verifier: "other", otherVerifier: " bob.testnet " }))).toBe(
+    "bob.testnet",
+  );
+});
+
+test("a_task_without_heldout_checks_commits_to_none", () => {
+  const form = regexForm({ heldoutMatch: "", heldoutNoMatch: "" });
+  const [post] = planFor(form, 9_000_000n);
+
+  expect(post?.args.task).toMatchObject({ heldout_commitment: null });
+});
+
+test("the_calls_are_refused_for_what_would_cost_money_to_get_wrong", () => {
+  const form = regexForm();
+  const docs = buildDocuments(form);
+  const base = {
+    form,
+    uris: { brief: "http://api.test/v1/blobs/x" },
+    hashes: docs,
+    vaultBalance: 0n,
+    contractId: CONTRACT,
+    tokenId: TOKEN,
+    judgeAccount: JUDGE,
+  };
+  expect(planPostCalls(base)).toHaveLength(2);
+
+  for (const amount of ["", "0", "-1", "1e3", "1.2345678", "abc"]) {
+    expect(() => planPostCalls({ ...base, form: { ...form, amount } }), amount).toThrow(RangeError);
+  }
+  expect(() => planPostCalls({ ...base, vaultBalance: -1n })).toThrow(RangeError);
+  expect(() =>
+    planPostCalls({ ...base, form: { ...form, preset: "custom", custom: bad() } }),
+  ).toThrow(RangeError);
+  // The Judge chosen with no Judge account to name, and a verifier that is no account.
+  expect(() => planPostCalls({ ...base, judgeAccount: null })).toThrow(RangeError);
+  expect(() =>
+    planPostCalls({ ...base, form: { ...form, verifier: "other", otherVerifier: "No Account" } }),
+  ).toThrow(RangeError);
+  // An address the chain would refuse (E_URI), and a hash that is not a SHA-256 (E_HASH).
+  expect(() => planPostCalls({ ...base, uris: { brief: "" } })).toThrow(RangeError);
+  expect(() => planPostCalls({ ...base, uris: { brief: "u".repeat(257) } })).toThrow(RangeError);
+  expect(() =>
+    planPostCalls({ ...base, hashes: { ...docs, briefHash: docs.briefHash.toUpperCase() } }),
+  ).toThrow(RangeError);
+
+  function bad() {
+    return { ...form.custom, commit: { amount: "ten", unit: "minutes" as const } };
+  }
+});
+
+// ---- Checks, step by step -----------------------------------------------------------------------
+
+test("amount_inputs_reject_invalid", () => {
+  const form = regexForm();
+  const errorFor = (amount: string) =>
+    checkReward({ ...form, amount }, { limits: LIMITS, judgeAccount: JUDGE }).amount;
+
+  // Six decimals at most; zero; negative; an exponent; text; nothing; and the ends of the range.
+  expect(errorFor("1.2345678")).toBe("This token has 6 decimal places at most.");
+  expect(errorFor("0")).toBe("Enter more than 0.");
+  expect(errorFor("-1")).toBe("An amount can't be negative.");
+  expect(errorFor("1e3")).toBe("Use digits and one point, like 12.5.");
+  expect(errorFor("")).toBe("Enter an amount.");
+  for (const typed of ["abc", "1,5", ".5", "1.", "0x10", "٣"]) {
+    expect(errorFor(typed), typed).toBe("Use digits and one point, like 12.5.");
+  }
+  // Below the least and above the cap (get_config's token limits), by one unit each.
+  expect(errorFor("0.999999")).toBe("The least for this token is 1.00 tUSDC.");
+  expect(errorFor("1000.000001")).toBe("The most for this token is 1000.00 tUSDC.");
+
+  // And the ones that are fine: the least, the cap and something between.
+  for (const typed of ["1", "1.000000", "5", "12.5", "1000", " 7 "]) {
+    expect(errorFor(typed), typed).toBeUndefined();
+  }
+});
+
+test("rubric_hidden_for_non_team", () => {
+  expect(kindsFor(false).map(({ kind }) => kind)).toEqual(["exact", "json_schema", "regex_cases"]);
+  expect(kindsFor(true).map(({ kind }) => kind)).toEqual([
+    "exact",
+    "json_schema",
+    "regex_cases",
+    "rubric",
+  ]);
+  expect(KINDS.map(({ kind }) => kind)).toContain("rubric");
+
+  // A form that holds the rubric is turned down for an account that is not the team's.
+  expect(checkChecks(rubricForm(), { canRubric: false }).kind).toBe(
+    "Rubric checks are for team accounts.",
+  );
+  expect(checkChecks(rubricForm(), { canRubric: true })).toEqual({});
+});
+
+test("a_brief_is_checked_against_what_the_schema_allows", () => {
+  expect(checkBrief(regexForm())).toEqual({});
+
+  const errors = checkBrief(
+    regexForm({
+      title: "  ",
+      summary: "s".repeat(281),
+      instructions: "",
+      tags: "ok, Bad_Tag, a",
+      maxBytes: "262145",
+    }),
+  );
+  expect(Object.keys(errors)).toEqual(["title", "summary", "instructions", "tags", "maxBytes"]);
+  expect(errors.title).toBe("Give the task a title.");
+  expect(errors.tags).toContain("bad_tag");
+  expect(errors.maxBytes).toBe("Use a whole number from 1 to 262,144.");
+
+  // Characters are counted as the schema counts them: a pair of UTF-16 units is one.
+  expect(checkBrief(regexForm({ title: "😀".repeat(120) })).title).toBeUndefined();
+  expect(checkBrief(regexForm({ title: "😀".repeat(121) })).title).toBe(
+    "Use 120 characters or fewer.",
+  );
+  expect(checkBrief(regexForm({ tags: "a b c d e f g h i" })).tags).toBe("Use 8 tags or fewer.");
+  expect(checkBrief(regexForm({ tags: "x".repeat(25) })).tags).toContain("up to 24");
+  expect(checkBrief(regexForm({ summary: "" }))).toEqual({});
+});
+
+test("checks_are_validated_for_each_kind", () => {
+  const opts = { canRubric: true };
+
+  // exact
+  expect(checkChecks(exactForm({ expected: " \n\n" }), opts).expected).toBe(
+    "Write at least one answer the Judge will accept, one to a line.",
+  );
+  // json_schema
+  expect(checkChecks(jsonForm({ schema: "" }), opts).schema).toBe(
+    "Paste the JSON schema that answers have to fit.",
+  );
+  expect(checkChecks(jsonForm({ schema: "{type:" }), opts).schema).toBe("That isn't valid JSON.");
+  expect(checkChecks(jsonForm({ schema: "[]" }), opts).schema).toBe(
+    'A schema is a JSON object, like {"type": "object"}.',
+  );
+  expect(checkChecks(jsonForm({ assertions: [{ path: "", equals: "" }] }), opts).assertions).toBe(
+    "Add at least one value for the Judge to check.",
+  );
+  const rows = checkChecks(
+    jsonForm({
+      assertions: [
+        { path: "total", equals: "1" },
+        { path: "$.a[01]", equals: "1" },
+        { path: "$.ok", equals: "abc" },
+        { path: "$.ok", equals: "" },
+        { path: "", equals: "" },
+      ],
+    }),
+    opts,
+  );
+  expect(Object.keys(rows)).toEqual([
+    "assertion-0-path",
+    "assertion-1-path",
+    "assertion-2-equals",
+    "assertion-3-equals",
+  ]);
+  // regex_cases
+  expect(
+    checkChecks(
+      regexForm({ examplesMatch: "", examplesNoMatch: "", heldoutMatch: "", heldoutNoMatch: "" }),
+      opts,
+    ).examplesMatch,
+  ).toContain("Add at least one case");
+  // rubric
+  expect(checkChecks(rubricForm({ rubric: [{ criterion: "", weight: "5" }] }), opts)).toEqual({
+    "rubric-0-criterion": "Say what to look for.",
+  });
+  expect(
+    checkChecks(rubricForm({ rubric: [{ criterion: "Short", weight: "11" }] }), opts)[
+      "rubric-0-weight"
+    ],
+  ).toBe("Use a whole number from 1 to 10.");
+  // the pass mark
+  for (const mark of ["", "101", "-1", "9.5", "x"]) {
+    expect(checkChecks(exactForm({ minScore: mark }), opts).minScore, mark).toBe(
+      "Use a whole number from 0 to 100.",
+    );
+  }
+  expect(checkChecks(exactForm({ minScore: "0" }), opts)).toEqual({});
+});
+
+test("the_answer_format_has_to_suit_the_kind_of_check", () => {
+  const opts = { canRubric: true };
+
+  expect(formatForKind("regex_cases", "text")).toBe("regex_json");
+  expect(formatForKind("json_schema", "text")).toBe("json");
+  expect(formatForKind("exact", "json")).toBe("json");
+  expect(formatForKind("exact", "regex_json")).toBe("text");
+  expect(formatForKind("rubric", "regex_json")).toBe("text");
+
+  expect(checkChecks(regexForm({ outputFormat: "text" }), opts).kind).toBe(
+    'Regex cases needs the answer format "A regex, as JSON". Change it on the Brief step.',
+  );
+  expect(checkChecks(jsonForm({ outputFormat: "text" }), opts).kind).toContain('"JSON"');
+});
+
+test("a_regex_task_scored_on_one_side_only_is_cautioned_not_refused", () => {
+  const onlyMatches = regexForm({ examplesNoMatch: "", heldoutMatch: "", heldoutNoMatch: "" });
+  expect(checkChecks(onlyMatches, { canRubric: false })).toEqual({});
+  expect(regexCaution(onlyMatches)).toContain("matches everything");
+
+  const onlyRejects = regexForm({ examplesMatch: "", heldoutMatch: "", heldoutNoMatch: "x" });
+  expect(regexCaution(onlyRejects)).toContain("matches nothing");
+
+  expect(regexCaution(regexForm())).toBeNull();
+  expect(
+    regexCaution(
+      regexForm({ examplesMatch: "", examplesNoMatch: "", heldoutMatch: "", heldoutNoMatch: "" }),
+    ),
+  ).toBeNull();
+});
+
+test("heldout_checks_that_are_too_long_are_refused_without_being_quoted", () => {
+  const big = exactForm({ expected: Array.from({ length: 30_000 }, () => SECRET).join("\n") });
+  const errors = checkChecks(big, { canRubric: false });
+
+  expect(Object.keys(errors)).toEqual(["heldout"]);
+  expect(errors.heldout).toContain("256 KiB");
+  expect(errors.heldout).not.toContain(SECRET);
+});
+
+// ---- The reward and the windows -----------------------------------------------------------------
+
+test("the_presets_are_the_windows_the_task_page_expects", () => {
+  expect(PRESET_WINDOWS.quick).toEqual({ commit: 600, reveal: 300, pick: 600, fallback: 600 });
+  expect(PRESET_WINDOWS.day).toEqual({
+    commit: 86_400,
+    reveal: 7_200,
+    pick: 14_400,
+    fallback: 86_400,
+  });
+  expect(windowsOf(regexForm({ preset: "quick" }))).toEqual(PRESET_WINDOWS.quick);
+  expect(windowsOf(regexForm({ preset: "day" }))).toEqual(PRESET_WINDOWS.day);
+});
+
+test("custom_windows_are_read_in_their_units_and_each_is_held_to_the_chain_limits", () => {
+  const custom = (commit: string, unit: "seconds" | "minutes" | "hours" | "days") =>
+    regexForm({
+      preset: "custom",
+      custom: {
+        commit: { amount: commit, unit },
+        reveal: { amount: "5", unit: "minutes" },
+        pick: { amount: "1", unit: "hours" },
+        fallback: { amount: "2", unit: "days" },
+      },
+    });
+  const check = (form: PostForm) => checkReward(form, { limits: LIMITS, judgeAccount: JUDGE });
+
+  expect(windowsOf(custom("90", "seconds"))).toEqual({
+    commit: 90,
+    reveal: 300,
+    pick: 3_600,
+    fallback: 172_800,
+  });
+  expect(check(custom("90", "seconds"))).toEqual({});
+
+  // The least the chain takes is `min_window_secs`; the most is 14 days.
+  expect(check(custom("59", "seconds"))["window-commit"]).toBe("At least 1m.");
+  expect(check(custom("60", "seconds"))["window-commit"]).toBeUndefined();
+  expect(check(custom("14", "days"))["window-commit"]).toBeUndefined();
+  expect(check(custom("15", "days"))["window-commit"]).toBe("At most 14d.");
+  expect(check(custom("1209601", "seconds"))["window-commit"]).toBe("At most 14d.");
+  // Not a whole number, nothing, zero, and more than a u32 can count.
+  for (const bad of ["", "0", "1.5", "-3", "1e2", "ten", "99999999999"]) {
+    const found = check(custom(bad, "minutes"));
+    expect(found["window-commit"], bad).toBe("Use a whole number above 0.");
+    expect(windowsOf(custom(bad, "minutes")), bad).toBeNull();
+  }
+  // A chain that wants longer windows than a preset has says so, and where to go.
+  const strict = { ...LIMITS, minWindowSecs: 3_600 };
+  expect(
+    checkReward(regexForm({ preset: "quick" }), { limits: strict, judgeAccount: JUDGE }).preset,
+  ).toContain("Use Custom");
+  expect(
+    checkReward(regexForm({ preset: "day" }), { limits: strict, judgeAccount: JUDGE }).preset,
+  ).toBeUndefined();
+});
+
+test("the_verifier_has_to_be_an_account_this_build_can_name", () => {
+  const form = regexForm();
+  const check = (patch: Partial<PostForm>, judgeAccount: string | null = JUDGE) =>
+    checkReward({ ...form, ...patch }, { limits: LIMITS, judgeAccount });
+
+  expect(check({ verifier: "judge" })).toEqual({});
+  expect(check({ verifier: "judge" }, null).verifier).toContain("isn't set up");
+  expect(check({ verifier: "me" }, null)).toEqual({});
+  expect(check({ verifier: "other", otherVerifier: "" }).otherVerifier).toBe(
+    "Enter a NEAR account, like name.near.",
+  );
+  expect(check({ verifier: "other", otherVerifier: "Bob Smith" }).otherVerifier).toBeDefined();
+  expect(check({ verifier: "other", otherVerifier: "bob.testnet" })).toEqual({});
+  // The account is not looked at when it is not the verifier.
+  expect(check({ verifier: "me", otherVerifier: "Bob Smith" })).toEqual({});
+});
+
+test("the_first_token_tender_takes_is_the_default_and_no_token_is_a_reason_to_stop", () => {
+  const form = regexForm({ token: "" });
+
+  expect(checkReward(form, { limits: LIMITS, judgeAccount: JUDGE })).toEqual({});
+  expect(checkReward(form, { limits: { ...LIMITS, tokens: [] }, judgeAccount: JUDGE }).token).toBe(
+    "Tender takes no rewards right now.",
+  );
+  // A token that is no longer taken is the first one that is, not a reward in a token that fails.
+  expect(
+    checkReward(regexForm({ token: "gone.testnet" }), { limits: LIMITS, judgeAccount: JUDGE }),
+  ).toEqual({});
+});
+
+test("a_paused_contract_stops_the_reward_step", () => {
+  const paused = { ...LIMITS, paused: true };
+
+  expect(checkReward(regexForm(), { limits: paused, judgeAccount: JUDGE })).toEqual({
+    form: "Tender isn't taking new tasks right now.",
+  });
+});
+
+test("the_field_to_go_to_is_the_first_in_the_order_of_the_page", () => {
+  const errors = checkBrief(regexForm({ title: "", instructions: "", maxBytes: "x" }));
+
+  expect(firstError(errors)).toBe("title");
+  expect(firstError({})).toBeUndefined();
+});
