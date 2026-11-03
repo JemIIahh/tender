@@ -28,9 +28,13 @@ export const H1 =
 /** A label in mono capitals, as the landing's eyebrows are. */
 export const EYEBROW = "font-mono text-[11px] tracking-[0.16em] text-muted uppercase";
 
-/** A text field, a select or a text area. */
+/**
+ * A text field, a select or a text area. Its edge is the only thing that shows where to type, so
+ * it is the dim grey, which is 3:1 or more on the ink and the panel it sits on (WCAG 1.4.11; the
+ * hairline of a card is not); test/contrast.test.ts holds it to that.
+ */
 export const FIELD =
-  "min-h-11 w-full rounded-xl border border-line bg-ink px-3 text-bone transition-colors placeholder:text-muted hover:border-bone/30 motion-reduce:transition-none aria-invalid:border-seal";
+  "min-h-11 w-full rounded-xl border border-dim bg-ink px-3 text-bone transition-colors placeholder:text-muted hover:border-bone/60 motion-reduce:transition-none aria-invalid:border-seal";
 
 /** A line a person is told, in a box: what an action came to. */
 export const NOTICE = "rounded-xl border border-line bg-raised p-4 text-sm text-bone";
