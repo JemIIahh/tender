@@ -17,6 +17,7 @@ import {
   type ServeOptions,
   type Services,
   startServices,
+  TELEGRAM_STOP_MS,
   TELEGRAM_WEBHOOK_PATH,
 } from "./serve";
 
@@ -267,6 +268,9 @@ interface FakeBotApi {
   sentTo(chat: number): string[];
   /** Hands `update` to the next long poll. */
   push(update: FakeUpdate): void;
+  /** Answers the calls held so far, and holds no more. */
+  release(): void;
+  /** Answers the calls it holds, and stops. */
   close(): Promise<void>;
 }
 
@@ -307,15 +311,26 @@ function messageFrom(chat: number, text: string): FakeUpdate {
  * made with `BOT_TOKEN`, and answers `getMe` with `BOT_INFO`, `getUpdates` with the updates that
  * `push` handed it (a long poll waits up to 200 ms for one), `sendMessage` with the message it
  * made, and anything else with `true`. It drops the updates below the offset a poll sends, as
- * Telegram does once they are confirmed.
+ * Telegram does once they are confirmed. A call that `hold` picks out is not answered until
+ * `release` or `close`, as by a Telegram that does not answer.
  */
-async function startFakeBotApi(): Promise<FakeBotApi> {
+async function startFakeBotApi(
+  hold: (call: BotCall) => boolean = () => false,
+): Promise<FakeBotApi> {
   const calls: BotCall[] = [];
   let queued: FakeUpdate[] = [];
   const waiting = new Set<() => void>();
+  const held = new Set<() => void>();
+  let holding = hold;
+  /** How many requests it is answering. */
+  let answering = 0;
   const prefix = `/bot${BOT_TOKEN}/`;
 
   const server: Server = createServer(async (req, res) => {
+    answering += 1;
+    res.once("close", () => {
+      answering -= 1;
+    });
     let body = "";
     for await (const chunk of req) body += chunk;
     const answer = (status: number, json: unknown) => {
@@ -329,7 +344,9 @@ async function startFakeBotApi(): Promise<FakeBotApi> {
     }
     const method = req.url.slice(prefix.length);
     const payload = (body === "" ? {} : JSON.parse(body)) as Record<string, unknown>;
-    calls.push({ method, payload });
+    const call = { method, payload };
+    calls.push(call);
+    if (holding(call)) await new Promise<void>((resolve) => held.add(resolve));
     switch (method) {
       case "getMe":
         answer(200, { ok: true, result: BOT_INFO });
@@ -387,9 +404,18 @@ async function startFakeBotApi(): Promise<FakeBotApi> {
       queued.push(update);
       for (const wake of [...waiting]) wake();
     },
-    close() {
+    release() {
+      holding = () => false;
+      for (const answer of [...held]) answer();
+      held.clear();
+    },
+    async close() {
+      // The calls it held are answered before the connections go: a call cut short would be
+      // retried by the bot, at a server that is gone.
+      fake.release();
+      while (answering > 0) await sleep(10);
       server.closeAllConnections();
-      return new Promise((resolve) => server.close(() => resolve()));
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
   fakes.push(fake);
@@ -496,7 +522,12 @@ test("the_key_checks_read_what_the_node_says_of_each_key", async () => {
   await expect(
     checkJudgeKey(reader, keyOf(judge.accountId, judge.privateKey), chain.contractId),
   ).rejects.toThrow(/^JUDGE_PRIVATE_KEY is a full-access key of judge\.sandbox /);
-  // The keeper's scoped key is limited to Tender, for the keeper's methods: not the Judge's.
+  // Each scoped key is limited to Tender for its own role's methods: neither passes for the other.
+  await expect(
+    checkKeeperKey(reader, keyOf(judge.accountId, judgeKey), chain.contractId),
+  ).rejects.toThrow(
+    /^KEEPER_PRIVATE_KEY is a key of judge\.sandbox \(KEEPER_ACCOUNT\) that is not a function-call key limited to tender\.sandbox for void_task and cleanup\./,
+  );
   await expect(
     checkJudgeKey(reader, keyOf(keeper.accountId, keeperKey), chain.contractId),
   ).rejects.toThrow(
@@ -593,7 +624,8 @@ test("serve_runs_the_bot_by_long_polling_and_the_notifier", async () => {
 });
 
 test("serve_takes_the_bots_updates_at_its_webhook", async () => {
-  const telegram = await startFakeBotApi();
+  // Telegram is slow to give the bot its own details, until `release`.
+  const telegram = await startFakeBotApi((call) => call.method === "getMe");
   const lines: string[] = [];
   const services = await serve(
     envFor(telegramEnv({ TELEGRAM_MODE: "webhook", TELEGRAM_WEBHOOK_SECRET: WEBHOOK_SECRET })),
@@ -604,25 +636,70 @@ test("serve_takes_the_bots_updates_at_its_webhook", async () => {
     `serve: Telegram bot on, taking updates at POST ${TELEGRAM_WEBHOOK_PATH}, and the notifier`,
   );
   const chat = 4_343;
-  const post = (secret?: string) =>
-    fetch(`${services.url}${TELEGRAM_WEBHOOK_PATH}`, {
+  const webhook = `${services.url}${TELEGRAM_WEBHOOK_PATH}`;
+  const post = (secret?: string, body: BodyInit = JSON.stringify(messageFrom(chat, "/help"))) =>
+    fetch(webhook, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         ...(secret !== undefined && { "X-Telegram-Bot-Api-Secret-Token": secret }),
       },
-      body: JSON.stringify(messageFrom(chat, "/help")),
+      body,
+      // A stream goes without a Content-Length.
+      ...(body instanceof ReadableStream && { duplex: "half" }),
     });
 
+  // Until the bot has its own details, no update is taken, with the secret or without, and none
+  // makes the bot call Telegram: the one call is the one the services made at start.
+  await until(
+    "the services ask for the bot",
+    async () => telegram.callsOf("getMe").length > 0,
+    10_000,
+  );
+  for (const secret of [WEBHOOK_SECRET, undefined, "wrong-secret"]) {
+    const res = await post(secret);
+    expect(res.status, String(secret)).toBe(503);
+    expect(await res.json(), String(secret)).toEqual({
+      error: "unavailable",
+      message: "the bot is starting",
+    });
+  }
+  expect(telegram.callsOf("getMe")).toHaveLength(1);
+  telegram.release();
+  await until(
+    "the bot has its details",
+    async () => (await post("wrong-secret")).status === 401,
+    10_000,
+  );
+
   // An update without the secret, or with another one, is turned away, and the bot says nothing.
+  const calls = telegram.calls.length;
   for (const secret of [undefined, "wrong-secret", `${WEBHOOK_SECRET}x`]) {
     const res = await post(secret);
     expect(res.status, String(secret)).toBe(401);
     expect(await res.text(), String(secret)).toBe("");
   }
+  expect(telegram.calls).toHaveLength(calls);
+
+  // A body that does not say its length, or says more than 1 MiB, is not read, secret or not.
+  const tooLarge = {
+    error: "payload_too_large",
+    message: "the request body must say its length, and be 1 MiB at most",
+  };
+  const unsized = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(JSON.stringify(messageFrom(chat, "/help"))));
+      controller.close();
+    },
+  });
+  for (const body of [unsized, "x".repeat(1_048_577)]) {
+    const res = await post(WEBHOOK_SECRET, body);
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual(tooLarge);
+  }
   expect(telegram.sentTo(chat)).toEqual([]);
 
-  // With it, the bot has answered through the Bot API by the time the webhook answers 200.
+  // With the secret, the bot has answered through the Bot API by the time the webhook answers 200.
   const res = await post(WEBHOOK_SECRET);
   expect(res.status).toBe(200);
   expect(telegram.sentTo(chat)).toHaveLength(1);
@@ -634,8 +711,50 @@ test("serve_takes_the_bots_updates_at_its_webhook", async () => {
   const methods = new Set(telegram.calls.map((call) => call.method));
   expect([...methods].filter((method) => /Updates|Webhook/.test(method))).toEqual([]);
 
+  // Once stopped, the port takes no connection, and nothing calls Telegram or writes a line.
   await services.stop();
+  expect(lines.at(-1)).toBe("serve: stopped");
   expect(lines.filter((line) => /^(ERROR|WARN) telegram/.test(line))).toEqual([]);
+  const after = { lines: lines.length, calls: telegram.calls.length };
+  await sleep(1_000);
+  expect(await takesConnections(services.url)).toBe(false);
+  expect(lines).toHaveLength(after.lines);
+  expect(telegram.calls).toHaveLength(after.calls);
+});
+
+test("stop_goes_on_without_a_telegram_that_does_not_answer", async () => {
+  // Telegram takes the long polling, then never answers the last call the bot makes, the one that
+  // tells it which updates were handled. Stopping gives up on it after 5 s, says what it left, and
+  // stops the rest, here the indexer and the database.
+  const telegram = await startFakeBotApi(
+    (call) => call.method === "getUpdates" && call.payload.limit === 1,
+  );
+  const lines: string[] = [];
+  const graceMs = 300;
+  const services = await serve(envFor(telegramEnv()), lines, {
+    closeGraceMs: graceMs,
+    telegramApiRoot: telegram.apiRoot,
+  });
+  await until("the bot polls", async () => telegram.callsOf("getUpdates").length > 0, 10_000);
+
+  const started = Date.now();
+  await services.stop();
+  const took = Date.now() - started;
+  // The deadline, and then the rest of the stop: the indexer's block in hand and the database.
+  expect(took).toBeGreaterThanOrEqual(TELEGRAM_STOP_MS - 10);
+  expect(took).toBeLessThan(TELEGRAM_STOP_MS + graceMs + 3_000);
+  expect(lines).toContain(
+    "WARN telegram: not stopped within 5 s, as Telegram does not answer; going on without the " +
+      "call that tells Telegram which updates were handled",
+  );
+  expect(lines.at(-1)).toBe("serve: stopped");
+  expect(await takesConnections(services.url)).toBe(false);
+
+  // When Telegram answers at last, the bot's stop ends, and it calls nothing more.
+  const calls = telegram.calls.length;
+  telegram.release();
+  await sleep(500);
+  expect(telegram.calls).toHaveLength(calls);
 });
 
 test("the_keeper_the_judge_and_the_indexer_wait_together_for_the_lock", async () => {

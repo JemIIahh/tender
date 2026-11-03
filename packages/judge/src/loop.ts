@@ -43,8 +43,12 @@ interface DeadlineRow {
  *
  * A task that throws, as on a chain or database error, is logged, and the pass goes on with the
  * next task. The clock is read again for the judging pass: intake can take a while.
+ *
+ * Once `signal` has aborted, the pass takes no further task: the one in hand finishes, so that a
+ * pick it sent is seen through, and the pass returns before the next intake or the next turn. On a
+ * lost indexer lock, that keeps this Judge from judging alongside the one that takes the lock over.
  */
-export async function judgeTick(deps: JudgeDeps): Promise<boolean> {
+export async function judgeTick(deps: JudgeDeps, signal?: AbortSignal): Promise<boolean> {
   const clock = deps.now ?? (() => new Date());
   // `order by t.id`: the output column `id` is text, which would sort "10" before "9".
   const waiting = await deps.db.query<{ id: string }>(
@@ -54,6 +58,7 @@ export async function judgeTick(deps: JudgeDeps): Promise<boolean> {
     [deps.judgeAccount],
   );
   for (const { id } of waiting) {
+    if (signal?.aborted) return false;
     try {
       await intakeTask(deps, BigInt(id));
     } catch (error) {
@@ -78,6 +83,7 @@ export async function judgeTick(deps: JudgeDeps): Promise<boolean> {
     .sort((a, b) => compare(a.stopLine, b.stopLine) || compare(a.id, b.id));
   let gaveWay = false;
   for (const { row, id } of due) {
+    if (signal?.aborted) return gaveWay;
     try {
       if ((await judgeTask(deps, id)) === "yielded") gaveWay = true;
     } catch (error) {
@@ -110,10 +116,10 @@ export function newJudgeMemory(): JudgeMemory {
  * that a score worker is loaded before a task needs one. The wait starts when a tick ends, so
  * ticks never overlap, however long one takes. A tick that throws is logged and the loop goes on.
  *
- * An abort during the wait ends the loop at once. An abort during a tick lets the tick finish
- * first, so that a pick it sent is seen through. A signal that is aborted already runs no tick.
- * The returned promise resolves once the loop has stopped, and the warm worker it started with
- * it, and never rejects.
+ * An abort during the wait ends the loop at once. An abort during a tick lets the task in hand
+ * finish, so that a pick it sent is seen through, and the tick takes no other (`judgeTick`). A
+ * signal that is aborted already runs no tick. The returned promise resolves once the loop has
+ * stopped, and the warm worker it started with it, and never rejects.
  */
 export function startJudge(
   deps: JudgeDeps & { intervalMs?: number; signal: AbortSignal },
@@ -139,7 +145,7 @@ export function startJudge(
       ticking = true;
       let gaveWay = false;
       try {
-        gaveWay = await judgeTick(ticked);
+        gaveWay = await judgeTick(ticked, signal);
       } catch (error) {
         console.error(`judge: tick failed (${describeError(error)})`);
       }
@@ -149,7 +155,8 @@ export function startJudge(
       else timer = setTimeout(run, gaveWay ? 0 : intervalMs);
     };
 
-    // `once` removes the listener when it fires. An abort during a tick is seen after the tick.
+    // `once` removes the listener when it fires. An abort during a tick is seen when the tick
+    // returns, after the task in hand.
     signal.addEventListener(
       "abort",
       () => {

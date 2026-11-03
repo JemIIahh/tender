@@ -1,8 +1,11 @@
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { format } from "node:util";
 import {
   type ApiServer,
   createApp,
+  type ErrorBody,
+  NoAnswerInTime,
   resultUsable,
   startApiServer,
   startKeeper,
@@ -41,8 +44,8 @@ import { loadEnv, REPO_ROOT, readEnvFile } from "./lib/env";
  *              the indexer lock, so that one process at a time writes to the index (P03-R25)
  *   keeper     voids and cleans up tasks, when KEEPER_PRIVATE_KEY is set, and runs with the
  *              indexer, under the same lock, so that no two processes send the same calls; off the
- *              sandbox its key must be a function-call key limited to Tender, which the chain is
- *              asked about first
+ *              sandbox its key must be a function-call key limited to Tender for the keeper's
+ *              methods, which the chain is asked about first
  *   Judge      judges the tasks that name JUDGE_ACCOUNT as their verifier, when JUDGE_PRIVATE_KEY
  *              is set, under the same lock as the keeper, since two Judges would pick twice; off
  *              the sandbox its key must be a function-call key limited to Tender for the judge's
@@ -69,12 +72,30 @@ const NS_PER_MS = 1_000_000n;
 const TELEGRAM_USERNAME = /^[A-Za-z0-9_]{5,32}$/;
 /** A bot token as @BotFather gives it: the bot's id, a colon, and the secret part. */
 const TELEGRAM_TOKEN = /^[0-9]+:[A-Za-z0-9_-]+$/;
+/**
+ * The shortest webhook secret the services take. Telegram takes one of 1 character; this many keep
+ * it out of reach of guessing.
+ */
+const MIN_WEBHOOK_SECRET_LENGTH = 16;
+/**
+ * The shortest secret `redact` takes out. A shorter one is likely to be a word of ordinary text as
+ * well, as a database password such as `tender` is, and taking it out wherever it is would garble
+ * every line it is in, and point at it. So a `DATABASE_URL` password shorter than this is refused.
+ */
+const MIN_REDACTED_LENGTH = 8;
 
 /**
  * Where Telegram posts the bot's updates in webhook mode. It is not under `/v1`, and so not under
  * its CORS: no browser calls it.
  */
 export const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
+/** The largest body the webhook reads, 1 MiB: an update of Telegram's is a few KiB. */
+const MAX_WEBHOOK_BODY_BYTES = 1_048_576;
+/**
+ * How long `stop` waits for the Telegram side before it goes on without it: a Telegram that does
+ * not answer would hold it for good, since the bot's calls are retried until they go through.
+ */
+export const TELEGRAM_STOP_MS = 5_000;
 
 /**
  * The key of the indexer's session advisory lock, one per database whatever the deployment: it
@@ -256,7 +277,8 @@ function databaseKind(url: string): "pglite" | "postgres" | undefined {
  * some of them are secrets. It checks:
  *
  * - `TENDER_NETWORK` (sandbox, testnet or mainnet), `TENDER_CONTRACT` (an account id) and
- *   `DATABASE_URL` (`pglite:memory`, `pglite:<dir>` or a Postgres URL), which must all be set;
+ *   `DATABASE_URL` (`pglite:memory`, `pglite:<dir>` or a Postgres URL, whose password, if it has
+ *   one, has 8 characters or more), which must all be set;
  * - `API_PORT`, `INDEXER_POLL_MS`, `KEEPER_INTERVAL_MS`, `JUDGE_INTERVAL_MS`,
  *   `INDEXER_START_HEIGHT` and `TRUSTED_PROXY_HOPS`, which must be whole numbers in plain decimal
  *   digits, each in its range;
@@ -273,9 +295,9 @@ function databaseKind(url: string): "pglite" | "postgres" | undefined {
  * - `JUDGE_ACCOUNT`, which must be an account id when it is set, and must be set with
  *   `JUDGE_PRIVATE_KEY`, which must be a private key;
  * - `TELEGRAM_MODE`, polling or webhook, and `TELEGRAM_WEBHOOK_SECRET`, which must be what
- *   Telegram takes as a secret token. With `TELEGRAM_BOT_TOKEN` set, that it looks like a bot's
- *   token, that `PUBLIC_WEB_URL` names the web app the bot links to, and in webhook mode that the
- *   secret is set.
+ *   Telegram takes as a secret token, 16 characters or more. With `TELEGRAM_BOT_TOKEN` set, that
+ *   it looks like a bot's token, that `PUBLIC_WEB_URL` names the web app the bot links to, and in
+ *   webhook mode that the secret is set.
  *
  * An empty value is an unset one. Off the sandbox, an empty `PUBLIC_WEB_URL` is a warning: allowed,
  * but likely a mistake. So are a bot without `TELEGRAM_BOT_USERNAME`, which no chat can be linked
@@ -316,6 +338,16 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
   if (kind === undefined) {
     const unset = databaseUrl === undefined ? " (it is not set)" : "";
     problems.push(`DATABASE_URL must be pglite:memory, pglite:<dir> or a postgres:// URL${unset}`);
+  } else if (kind === "postgres" && databaseUrl !== undefined) {
+    // As the server reads it: decoded. A password `redact` would leave in the logs is refused.
+    const password = decoded(URL.parse(databaseUrl)?.password ?? "");
+    if (password !== "" && password.length < MIN_REDACTED_LENGTH) {
+      problems.push(
+        `DATABASE_URL must have a password of ${MIN_REDACTED_LENGTH} characters or more, when ` +
+          "it has one: a shorter one is easy to guess, and the logs do not hide it (it is not " +
+          "shown)",
+      );
+    }
   }
 
   const apiPort =
@@ -480,10 +512,14 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
     problems.push("TELEGRAM_MODE must be polling or webhook");
   }
   const webhookSecret = get("TELEGRAM_WEBHOOK_SECRET");
-  if (webhookSecret !== undefined && !WEBHOOK_SECRET.test(webhookSecret)) {
+  if (
+    webhookSecret !== undefined &&
+    (webhookSecret.length < MIN_WEBHOOK_SECRET_LENGTH || !WEBHOOK_SECRET.test(webhookSecret))
+  ) {
     problems.push(
-      "TELEGRAM_WEBHOOK_SECRET must be 1 to 256 letters, digits, underscores and hyphens, as " +
-        "Telegram takes a secret token (its value is not shown)",
+      `TELEGRAM_WEBHOOK_SECRET must be ${MIN_WEBHOOK_SECRET_LENGTH} to 256 letters, digits, ` +
+        "underscores and hyphens: the characters Telegram takes in a secret token, and enough " +
+        "of them not to be guessed (its value is not shown)",
     );
   }
   let telegram: TelegramConfig | undefined;
@@ -765,11 +801,8 @@ interface ServiceKey {
   accountVar: string;
   /** How the key script is run to make the key. */
   script: string;
-  /**
-   * The methods the key must let its holder call, all of them and no others, as the key script
-   * adds them; undefined for a key that may be limited to any of Tender's methods.
-   */
-  methods: readonly string[] | undefined;
+  /** The methods the key must let its holder call, and no others, as the key script adds it. */
+  methods: readonly string[];
 }
 
 /** `names` as a sentence lists them: "a, b and c". */
@@ -786,10 +819,11 @@ function namesExactly(names: unknown, methods: readonly string[]): boolean {
 
 /**
  * Off the sandbox, the key a service signs with must be a function-call key limited to the Tender
- * contract, and, if `key.methods` names them, to those methods: a full-access key can do anything
- * with its account, and a key limited to another receiver cannot call Tender. The chain is asked
- * (`viewAccessKey`), with 15 seconds to answer, and anything else is a failure to start, whose
- * message names the key's variable and the key script, and shows no key.
+ * contract and to exactly `key.methods`: a full-access key can do anything with its account, a
+ * key limited to another receiver cannot call Tender, and one that lists no methods may call any
+ * of Tender's. The chain is asked (`viewAccessKey`), with 15 seconds to answer, and anything else
+ * is a failure to start, whose message names the key's variable and the key script, and shows no
+ * key.
  */
 async function checkServiceKey(
   client: Pick<TenderClient, "viewAccessKey">,
@@ -799,8 +833,7 @@ async function checkServiceKey(
   const { service, keyVar, script, methods } = key;
   const publicKey = parseKey(key.privateKey, keyVar).getPublicKey().toString();
   const of = `of ${key.accountId} (${key.accountVar})`;
-  const forMethods = methods === undefined ? "" : ` for ${listed(methods)}`;
-  const limited = `limited to ${contractId}${forMethods}`;
+  const limited = `limited to ${contractId} for ${listed(methods)}`;
   const make =
     `Remove the ${keyVar} line from the env file and run ${script}, which adds a function-call ` +
     `key ${limited} and writes it there.`;
@@ -831,13 +864,16 @@ async function checkServiceKey(
   }
   if (
     keyKindOf(found.permission, contractId) !== "function_call" ||
-    (methods !== undefined && !namesExactly(found.permission.FunctionCall.method_names, methods))
+    !namesExactly(found.permission.FunctionCall.method_names, methods)
   ) {
     throw new Error(`${keyVar} is a key ${of} that is not a function-call key ${limited}. ${make}`);
   }
 }
 
-/** The keeper's key, which must be a function-call key limited to Tender (`checkServiceKey`). */
+/**
+ * The keeper's key, which must be a function-call key limited to Tender for the keeper's methods,
+ * `void_task` and `cleanup`, as `scripts/keeper-key.ts` adds it (`checkServiceKey`).
+ */
 export function checkKeeperKey(
   client: Pick<TenderClient, "viewAccessKey">,
   keeper: Pick<KeeperConfig, "accountId" | "privateKey">,
@@ -852,7 +888,7 @@ export function checkKeeperKey(
       keyVar: "KEEPER_PRIVATE_KEY",
       accountVar: "KEEPER_ACCOUNT",
       script: "scripts/keeper-key.ts",
-      methods: undefined,
+      methods: roleMethods("keeper"),
     },
     contractId,
   );
@@ -911,9 +947,10 @@ export interface Services {
   /**
    * Stops everything and resolves once all of it is down, in this order: the API stops taking
    * connections and cuts the ones left after the grace; the Telegram bot stops taking updates and
-   * finishes the ones it has, and the notifier its tick; the Judge, the keeper and the indexer
-   * stop (see `withLoops`), and the indexer lock is let go; and the database is closed. Calling it
-   * again returns the same promise.
+   * finishes the ones it has, and the notifier its tick, or after 5 s (`TELEGRAM_STOP_MS`) the
+   * rest goes on without them, and a WARN says what was left; the Judge, the keeper and the
+   * indexer stop (see `withLoops`), and the indexer lock is let go; and the database is closed.
+   * Calling it again returns the same promise.
    */
   stop(): Promise<void>;
 }
@@ -935,7 +972,8 @@ const wallClockNs = () => BigInt(Date.now()) * NS_PER_MS;
 /**
  * The indexer and the loops that run beside it under the indexer lock, the Judge's and the
  * keeper's, as one `Stoppable`. A loop is the promise `startJudge` or `startKeeper` returns, which
- * resolves once the loop has stopped, after its tick in flight, and never rejects.
+ * resolves once the loop has stopped, after the task or the call it has in hand, and never
+ * rejects.
  *
  * `stop` aborts `stopLoops` and starts the indexer's stop at once, and then waits for each loop, in
  * the order given, and for the indexer last. When the lock is lost, another process may be
@@ -983,6 +1021,12 @@ function telegramTrouble(error: unknown): string {
   return said;
 }
 
+/** The Telegram side of the services, as `runTelegram` runs it. */
+interface TelegramRun extends Stoppable {
+  /** What `stop` waits for still, as a line names it: nothing before `stop`, or once it is done. */
+  pending(): string[];
+}
+
 /**
  * Runs the Telegram side of the services with `bot`: the notifier, the bot's menu of commands
  * (`setMyCommands`, once), the bot's own details (`getMe`) and, in polling mode, the long polling.
@@ -994,7 +1038,9 @@ function telegramTrouble(error: unknown): string {
  * `stop` ends it all, and resolves once nothing of it runs: the long polling and the updates it is
  * handling, the updates the webhook is handling, the notifier's tick, and the calls to Telegram
  * made here. In polling mode `bot.stop` also tells Telegram which updates were handled, so that it
- * does not send them again at the next start; a failure of that is a WARN.
+ * does not send them again at the next start; a failure of that is a WARN. A call that Telegram
+ * does not answer is retried until it goes through, which can hold `stop` for good: `pending` says
+ * what it still waits for.
  */
 function runTelegram(
   bot: TelegramBot,
@@ -1005,7 +1051,7 @@ function runTelegram(
     log: (line: string) => void;
     webhooks: ReadonlySet<Promise<unknown>>;
   },
-): Stoppable {
+): TelegramRun {
   const { log } = opts;
   const stopping = new AbortController();
   const { signal } = stopping;
@@ -1052,20 +1098,35 @@ function runTelegram(
     telegram.mode === "polling" ? "by long polling" : `at POST ${TELEGRAM_WEBHOOK_PATH}`;
   log(`serve: Telegram bot on, taking updates ${takes}, and the notifier`);
 
+  /** What `stop` waits for, and whether each is done. */
+  const waits: Array<{ what: string; done: boolean }> = [];
+  const waitFor = (what: string, promise: Promise<unknown>) => {
+    const wait = { what, done: false };
+    waits.push(wait);
+    const done = () => {
+      wait.done = true;
+    };
+    return promise.then(done, done);
+  };
   return {
     async stop() {
       stopping.abort();
-      await bot.stop().catch((error: unknown) => {
+      // In polling mode, this ends the long polling and tells Telegram which updates were handled.
+      const confirming = bot.stop().catch((error: unknown) => {
         log(
           `WARN telegram: cannot tell Telegram which updates were handled ` +
             `(${telegramTrouble(error)}); it may send them again at the next start`,
         );
       });
-      await running;
-      await Promise.allSettled(opts.webhooks);
-      await notifying;
-      await commands;
+      await Promise.all([
+        waitFor("the call that tells Telegram which updates were handled", confirming),
+        waitFor("the bot's start and its long polling, with the updates in hand", running),
+        waitFor("the updates posted to the webhook", Promise.allSettled(opts.webhooks)),
+        waitFor("the notifier's tick", notifying),
+        waitFor("the call that sets the bot's menu", commands),
+      ]);
     },
+    pending: () => waits.filter((wait) => !wait.done).map((wait) => wait.what),
   };
 }
 
@@ -1111,7 +1172,7 @@ export async function startServices(
   const db = await openIndex(config.database.url);
   let api: ApiServer | undefined;
   /** The Telegram bot and the notifier. */
-  let telegram: Stoppable | undefined;
+  let telegram: TelegramRun | undefined;
   /** The indexer, the keeper and the Judge, with the lock they run under, if any. */
   let work: Stoppable | undefined;
 
@@ -1126,7 +1187,20 @@ export async function startServices(
       }
     };
     await step(() => api?.close());
-    await step(() => telegram?.stop());
+    await step(async () => {
+      const run = telegram;
+      if (run === undefined) return;
+      try {
+        await withinDeadline(TELEGRAM_STOP_MS, run.stop());
+      } catch (error) {
+        if (!(error instanceof NoAnswerInTime)) throw error;
+        const left = run.pending();
+        log(
+          `WARN telegram: not stopped within ${TELEGRAM_STOP_MS / 1000} s, as Telegram does not ` +
+            `answer; going on without ${left.length > 0 ? listed(left) : "it"}`,
+        );
+      }
+    });
     // The Judge, the keeper and the indexer, then the lock.
     await step(() => work?.stop());
     await step(() => db.close());
@@ -1136,7 +1210,7 @@ export async function startServices(
   let publicUrl = "";
   try {
     // The bot is made before the API, whose app takes its webhook. It calls Telegram only once
-    // `runTelegram` runs it.
+    // `runTelegram` runs it: the webhook takes no update before then (see below).
     const { telegram: telegramConfig } = config;
     const bot =
       telegramConfig === undefined
@@ -1170,8 +1244,29 @@ export async function startServices(
           telegramBotUsername: config.telegramBotUsername,
           trustedProxyHops: config.trustedProxyHops,
         });
-        if (webhook !== undefined) {
-          app.post(TELEGRAM_WEBHOOK_PATH, (c) => {
+        if (bot !== undefined && webhook !== undefined) {
+          app.post(TELEGRAM_WEBHOOK_PATH, async (c) => {
+            // Until the bot has its own details, which `runTelegram` asks for with the stop signal,
+            // grammY's handler would ask Telegram for them itself, with no signal, and before it
+            // looks at the secret. So no update is taken till then: Telegram sends it again later.
+            if (!bot.isInited()) {
+              const body: ErrorBody = { error: "unavailable", message: "the bot is starting" };
+              return Response.json(body, { status: 503 });
+            }
+            // Telegram says how long an update is, and an update is small: a body that does not say
+            // its length, or is over 1 MiB, is not read.
+            const length = c.req.header("content-length");
+            if (
+              length === undefined ||
+              !/^[0-9]+$/.test(length) ||
+              Number(length) > MAX_WEBHOOK_BODY_BYTES
+            ) {
+              const body: ErrorBody = {
+                error: "payload_too_large",
+                message: "the request body must say its length, and be 1 MiB at most",
+              };
+              return Response.json(body, { status: 413 });
+            }
             const handling = webhook(c);
             webhooks.add(handling);
             const done = () => webhooks.delete(handling);
@@ -1187,7 +1282,8 @@ export async function startServices(
 
     // The indexer, the keeper and the Judge start and stop together, so that the keeper and the
     // Judge run only where the index is written: two keepers would send the same calls, and pay
-    // for the ones that lose, and two Judges would pick twice.
+    // for the ones that lose, and two Judges would pick twice. At the stop, as when the lock is
+    // lost, each takes no further task or call once the one in hand is done (`withLoops`).
     const startWork = (): Stoppable => {
       const indexer = startIndexer(env, {
         db,
@@ -1291,13 +1387,6 @@ const SECRET =
   /(?:KEY|SECRET|TOKEN|JWT|PASSWORD)$|^(?:TEST_)?DATABASE_URL$|^NEAR(?:DATA|_RPC(?:_FALLBACK)?)_URL$/;
 
 /**
- * The shortest secret `redact` takes out. A shorter one is likely to be a word of ordinary text as
- * well, as a database password such as `tender` is, and taking it out wherever it is would garble
- * every line it is in, and point at it.
- */
-const MIN_REDACTED_LENGTH = 8;
-
-/**
  * `text` with the value of each secret variable of `env` in it replaced by the variable's name,
  * and the password of each such URL too, as it is written and decoded; a value or a spelling of a
  * password shorter than 8 characters is left as it is. What the command line prints passes
@@ -1330,6 +1419,26 @@ function decoded(text: string): string {
   }
 }
 
+/** The methods of `console` that print, which `redactConsole` wraps. */
+type Printer = Pick<Console, "log" | "info" | "warn" | "error">;
+
+/**
+ * Makes what `target` prints through `log`, `info`, `warn` and `error` pass through `redact`: the
+ * services' own lines, and what the packages print, whole errors among them. The text redacted is
+ * the text printed, `util.format` of all the arguments, so that a secret deep inside an error is
+ * caught too: a grammY `HttpError` holds the transport's error, whose message can quote the URL of
+ * the request, which holds the bot's token.
+ */
+export function redactConsole(
+  env: Record<string, string | undefined>,
+  target: Printer = console,
+): void {
+  for (const method of ["log", "info", "warn", "error"] as const) {
+    const print = target[method].bind(target);
+    target[method] = (...args: unknown[]) => print(redact(format(...args), env));
+  }
+}
+
 async function main(): Promise<void> {
   let env: Record<string, string> = {};
   let services: Services | undefined;
@@ -1339,7 +1448,7 @@ async function main(): Promise<void> {
     try {
       await running.stop();
     } catch (error) {
-      console.error(`serve: stopping failed: ${redact(messageOf(error), env)}`);
+      console.error(`serve: stopping failed: ${messageOf(error)}`);
       process.exit(1);
     }
     process.exit(0);
@@ -1359,10 +1468,12 @@ async function main(): Promise<void> {
 
   try {
     env = serveEnv();
-    // Every line the services write passes through `redact` too, as what is printed of an error.
-    services = await startServices(env, { log: (line) => console.log(redact(line, env)) });
+    // From here on, all the process prints passes through `redact`: the services' lines, the
+    // errors below, and what the packages print to the console of their own.
+    redactConsole(env);
+    services = await startServices(env);
   } catch (error) {
-    console.error(`serve: ${redact(messageOf(error), env)}`);
+    console.error(`serve: ${messageOf(error)}`);
     process.exit(1);
   }
   if (stopping) await stopAndExit(services);

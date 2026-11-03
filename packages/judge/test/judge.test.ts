@@ -2442,6 +2442,51 @@ test("judge_tick_goes_on_after_a_task_fails", async () => {
   ]);
 });
 
+test("judge_tick_takes_no_task_after_its_signal_aborts", async () => {
+  // A tick told to stop finishes the task in hand, a pick it sent included, and takes no other:
+  // not in intake, and not in judging. On a lost lock, the tasks are left to the next Judge.
+  const criteriaHash = await putCriteria(db, EXACT);
+  const views: TaskView[] = [];
+  for (const id of ["7", "8"]) {
+    const checks = await putHeldout(db, { exact: { expected: ["42", `task ${id}`] } });
+    views.push(taskView({ id, criteria_hash: criteriaHash, heldout_commitment: checks }));
+  }
+  for (const view of views) await insertTask(db, view);
+
+  // Intake reads the clock once for each task: the first read is when the stop comes.
+  const intake = new AbortController();
+  const stopNow = () => {
+    intake.abort();
+    return NOW;
+  };
+  await judgeTick(judgeDeps(db, fakeChain(null), { now: stopNow }), intake.signal);
+  expect(await judgeRow(db, 7)).toEqual({ judge_status: "accepted", judge_reason: null });
+  expect(await judgeRow(db, 8)).toEqual({ judge_status: null, judge_reason: null });
+
+  // Both tasks due, in the order 7 then 8. The chain is first read for task 7, when the stop comes.
+  await db.query("update tasks set judge_status = 'accepted' where id = 8");
+  const sha = await putResult(db, "42", "alice.test.near");
+  await putResult(db, "42", "alice.test.near", 8n);
+  const judging = new AbortController();
+  const getTask = vi.fn(async (id: bigint) => {
+    judging.abort();
+    return views.find((view) => view.id === String(id)) ?? null;
+  });
+  const pick = vi.fn<JudgeChain["pick"]>(async () => ({}));
+  const chain: JudgeChain = {
+    getTask,
+    getAllEntries: async (taskId) => [
+      { ...entry("alice.test.near", sha, blobUri(sha)), task_id: String(taskId) },
+    ],
+    pick,
+  };
+  await judgeTick(judgeDeps(db, chain), judging.signal);
+  expect(getTask.mock.calls).toEqual([[7n]]);
+  expect(pick.mock.calls.map(([taskId, winners]) => [taskId, winners])).toEqual([
+    [7n, [{ account: "alice.test.near", bps: 10_000 }]],
+  ]);
+});
+
 /** A time `seconds` from NOW, as the chain gives a deadline. */
 const atSecond = (seconds: number) => (NOW_NS + BigInt(seconds) * SECOND_NS).toString();
 

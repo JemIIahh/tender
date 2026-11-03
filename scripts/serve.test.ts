@@ -11,6 +11,7 @@ import {
   publicUrlOf,
   readServeConfig,
   redact,
+  redactConsole,
   runWhileLocked,
   ServeConfigError,
   type Stoppable,
@@ -208,6 +209,9 @@ test("read_serve_config_names_each_bad_variable", () => {
     ["DATABASE_URL", undefined],
     ["DATABASE_URL", "mysql://db.internal/tender"],
     ["DATABASE_URL", "pglite:"],
+    // A password shorter than 8 characters, as the server reads it: decoded.
+    ["DATABASE_URL", "postgres://tender:short@db.internal/tender"],
+    ["DATABASE_URL", "postgres://tender:%61%62%63%64%65%66%67@db.internal/tender"],
     ["API_PORT", "65536"],
     ["API_PORT", "80a"],
     ["API_PORT", "0x50"],
@@ -258,6 +262,7 @@ test("read_serve_config_names_each_bad_variable", () => {
     ["TELEGRAM_MODE", "Webhook"],
     ["TELEGRAM_WEBHOOK_SECRET", undefined],
     ["TELEGRAM_WEBHOOK_SECRET", "a secret"],
+    ["TELEGRAM_WEBHOOK_SECRET", "x".repeat(15)],
     ["TELEGRAM_WEBHOOK_SECRET", "x".repeat(257)],
     // The bot's messages link to the web app.
     ["PUBLIC_WEB_URL", undefined],
@@ -472,6 +477,89 @@ test("no_secret_value_appears_in_any_error", () => {
   );
 });
 
+test("a_database_password_or_a_webhook_secret_too_short_to_hide_is_refused", () => {
+  // W-R4. A database password, if there is one, has 8 characters or more as the server reads it,
+  // decoded: `redact` hides no shorter one. A webhook secret has 16 or more.
+  for (const url of [
+    "postgres://tender:12345678@db.internal/tender",
+    "postgresql://tender:%41%42%43%44%45%46%47%48@db.internal/tender",
+    "postgres://tender@db.internal/tender",
+    "postgres://db.internal/tender",
+  ]) {
+    expect(problemsOf({ ...GOOD, DATABASE_URL: url }), url).toEqual([]);
+  }
+  expect(problemsOf({ ...GOOD, TELEGRAM_WEBHOOK_SECRET: "x".repeat(16) })).toEqual([]);
+  const short = problemsOf({
+    ...GOOD,
+    DATABASE_URL: "postgres://tender:tender@db.internal/tender",
+    TELEGRAM_WEBHOOK_SECRET: "fifteen-chars-x",
+  });
+  expect(short).toEqual([
+    "DATABASE_URL must have a password of 8 characters or more, when it has one: a shorter one " +
+      "is easy to guess, and the logs do not hide it (it is not shown)",
+    "TELEGRAM_WEBHOOK_SECRET must be 16 to 256 letters, digits, underscores and hyphens: the " +
+      "characters Telegram takes in a secret token, and enough of them not to be guessed (its " +
+      "value is not shown)",
+  ]);
+  expect(short.join("\n")).not.toContain("fifteen");
+});
+
+test("the_command_line_redacts_all_it_prints_errors_and_all", () => {
+  // `main` makes the console print through `redact`. It is the text printed that is redacted, so
+  // that a secret deep in an error is caught: a grammY HttpError holds the transport's error, whose
+  // message quotes the request's URL, and the bot's token with it.
+  const printed: Record<"log" | "info" | "warn" | "error", string[]> = {
+    log: [],
+    info: [],
+    warn: [],
+    error: [],
+  };
+  /** What the console does with what it is given: here, keeps the one text it is handed. */
+  const keep =
+    (into: string[]) =>
+    (...args: unknown[]) => {
+      into.push(args.map(String).join(" "));
+    };
+  const target = {
+    log: keep(printed.log),
+    info: keep(printed.info),
+    warn: keep(printed.warn),
+    error: keep(printed.error),
+  };
+  const env = {
+    TELEGRAM_BOT_TOKEN: BOT_TOKEN,
+    DATABASE_URL: "postgres://tender:pass-word-1@db.internal/tender",
+    TENDER_NETWORK: "testnet",
+  };
+  redactConsole(env, target);
+
+  const transport = new Error(
+    `request to https://api.telegram.org/bot${BOT_TOKEN}/sendMessage failed, reason: ` +
+      "getaddrinfo ENOTFOUND api.telegram.org",
+  );
+  const httpError = Object.assign(new Error("Network request for 'sendMessage' failed!"), {
+    error: transport,
+  });
+  target.error("telegram bot: update 7 failed:", httpError);
+  target.warn("%s at %s", "cannot connect", env.DATABASE_URL);
+  target.log({ database: { url: env.DATABASE_URL }, network: "testnet" });
+  target.info("serve: API at http://127.0.0.1:8787 (testnet)");
+
+  expect(printed.error).toHaveLength(1);
+  expect(printed.error[0]).toMatch(/^telegram bot: update 7 failed: Error: Network request for/);
+  expect(printed.error[0]).toContain(
+    "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/sendMessage",
+  );
+  expect(printed.warn).toEqual(["cannot connect at <DATABASE_URL>"]);
+  expect(printed.log).toHaveLength(1);
+  expect(printed.log[0]).toContain("url: '<DATABASE_URL>'");
+  expect(printed.info).toEqual(["serve: API at http://127.0.0.1:8787 (testnet)"]);
+  for (const text of Object.values(printed).flat()) {
+    expect(text).not.toContain(BOT_TOKEN.slice("123456789:".length));
+    expect(text).not.toContain("pass-word-1");
+  }
+});
+
 test("serve_env_lets_a_set_process_variable_win_over_the_files", async () => {
   const dir = await mkdtemp(join(tmpdir(), "tender-serve-env-"));
   dirs.push(dir);
@@ -505,7 +593,7 @@ test("serve_env_lets_a_set_process_variable_win_over_the_files", async () => {
 
 // ---- The keeper's key -------------------------------------------------------------------------
 
-test("the_keeper_key_check_takes_only_a_function_call_key_limited_to_tender", async () => {
+test("the_keeper_key_check_takes_only_a_function_call_key_for_the_keepers_methods", async () => {
   const contract = "tender.tender-dev.testnet";
   const keeper = {
     accountId: "keeper.tender-dev.testnet",
@@ -519,22 +607,39 @@ test("the_keeper_key_check_takes_only_a_function_call_key_limited_to_tender", as
     viewAccessKey: vi.fn(async () => answer),
   });
 
-  // A function-call key limited to Tender: the keeper may start. The chain is asked about the
-  // key's public half, on the keeper's account.
-  const scoped = answering({
-    permission: { FunctionCall: { receiver_id: contract, method_names: ["void_task", "cleanup"] } },
+  const calling = (receiver_id: string, method_names: string[]): KeyPermission => ({
+    FunctionCall: { receiver_id, method_names },
   });
-  await expect(checkKeeperKey(scoped, keeper, contract)).resolves.toBeUndefined();
-  expect(scoped.viewAccessKey).toHaveBeenCalledWith(keeper.accountId, publicKey);
 
-  // Anything else is a refusal that names the variable and the key script, and shows no key.
+  // The key `scripts/keeper-key.ts` adds, limited to Tender for the keeper's methods: the keeper
+  // may start. The chain is asked about the key's public half, on the keeper's account.
+  for (const methods of [
+    ["void_task", "cleanup"],
+    ["cleanup", "void_task"],
+  ]) {
+    const scoped = answering({ permission: calling(contract, methods) });
+    await expect(checkKeeperKey(scoped, keeper, contract)).resolves.toBeUndefined();
+    expect(scoped.viewAccessKey).toHaveBeenCalledWith(keeper.accountId, publicKey);
+  }
+
+  // Anything else is a refusal that names the variable and the key script, and shows no key. A
+  // key that may call any method (none listed), or other ones, is not the keeper's.
+  const notTheKeepers =
+    /^KEEPER_PRIVATE_KEY is a key of keeper\.tender-dev\.testnet \(KEEPER_ACCOUNT\) that is not a function-call key limited to tender\.tender-dev\.testnet for void_task and cleanup\./;
   const refused: Array<[string, { permission: KeyPermission } | null, RegExp]> = [
     ["no such key", null, /^KEEPER_PRIVATE_KEY is not a key of keeper\.tender-dev\.testnet/],
     ["a full-access key", { permission: "FullAccess" }, /^KEEPER_PRIVATE_KEY is a full-access key/],
     [
       "a key limited to another contract",
-      { permission: { FunctionCall: { receiver_id: "usdc.testnet", method_names: [] } } },
-      /^KEEPER_PRIVATE_KEY is a key of .* that is not a function-call key limited to tender\./,
+      { permission: calling("usdc.testnet", ["void_task", "cleanup"]) },
+      notTheKeepers,
+    ],
+    ["a key for any method", { permission: calling(contract, []) }, notTheKeepers],
+    ["a key for void_task alone", { permission: calling(contract, ["void_task"]) }, notTheKeepers],
+    [
+      "a key for the judge's methods",
+      { permission: calling(contract, ["pick", "pick_attested"]) },
+      notTheKeepers,
     ],
   ];
   for (const [what, answer, message] of refused) {
