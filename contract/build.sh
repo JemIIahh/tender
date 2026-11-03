@@ -4,8 +4,9 @@
 # Needs cargo-near 0.22.0 exactly (`cargo near --version`); any other version fails. The toolchain
 # comes from rust-toolchain.toml. The wasm is built on this machine, not in cargo-near's
 # reproducible docker build, so another machine gets different bytes. res/ holds the build that
-# was committed, and res/SOURCES.sha256 the hash of the sources it was built from, which
-# check-res.sh (run here at the end, and in CI) compares with the sources as they are.
+# was committed, and res/SOURCES.sha256 the hash of the sources it was built from bound to
+# res/SHA256SUMS, which check-res.sh (run here at the end, and in CI) recomputes from the sources
+# and the checksums as they are.
 #
 # Exits non-zero, and leaves res/ alone, if a built wasm contains $HOME or /Users/, or if
 # tender.wasm, after cargo-near's wasm-opt step, is over 450 KiB.
@@ -95,7 +96,8 @@ if command -v shasum >/dev/null 2>&1; then
 else
   (cd res && sha256sum tender.wasm test_token.wasm >SHA256SUMS)
 fi
-printf '%s\n' "$sources" >res/SOURCES.sha256
+# The record binds the sources' hash, taken before the build, to the checksums just written.
+./check-res.sh --record "$sources" >res/SOURCES.sha256
 
 echo "build.sh: wrote res/tender.wasm, res/test_token.wasm, res/SHA256SUMS and res/SOURCES.sha256"
 cat res/SHA256SUMS
