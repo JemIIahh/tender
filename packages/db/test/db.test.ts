@@ -55,6 +55,7 @@ const MIGRATIONS = [
   "0003_heldout_uploads.sql",
   "0004_task_questions.sql",
   "0005_tg_board_digests.sql",
+  "0006_agent_bond.sql",
 ];
 
 // Stands for a secret (a held-out answer, blob bytes) in the error tests: as text, and as hex, which
@@ -209,6 +210,11 @@ const SCHEMA: Record<string, string[]> = {
     "voids_after_reveals integer = 0",
     "registered_height numeric(40,0)",
     "is_team boolean = false",
+    // Migration 0006.
+    "status text = 'active'::text",
+    "bond_token text?",
+    "bond_amount numeric(40,0)?",
+    "claimable_at numeric(40,0)?",
   ],
   blobs: [
     "sha256 text",
@@ -315,8 +321,9 @@ const KEYS = [
 
 // Every constraint that is not a key (those are in KEYS) and not NOT NULL (that is the "?" above;
 // Postgres 18 also lists NOT NULL in pg_constraint, 17 does not): no foreign key, and no CHECK but
-// the kind of a blob and the three of a board row (migration 0004).
+// the kind of a blob, the three of a board row (migration 0004) and the status of an agent (0006).
 const CONSTRAINTS = [
+  "agents: CHECK ((status = ANY (ARRAY['active'::text, 'unregistering'::text, 'retired'::text])))",
   "blobs: CHECK ((kind = ANY (ARRAY['brief'::text, 'criteria'::text, 'heldout'::text, " +
     "'result'::text, 'scorecard'::text, 'profile'::text])))",
   "task_questions: CHECK (((answer IS NULL) = (answered_at IS NULL)))",
@@ -1215,6 +1222,7 @@ describe.each(targets)("db on $name", (target) => {
         "0003_heldout_uploads.sql",
         "0004_task_questions.sql",
         "0005_tg_board_digests.sql",
+        "0006_agent_bond.sql",
       ]);
       expect(await old.query("select sha256, account, uploaded_at from heldout_uploads")).toEqual([
         { sha256: heldout, account: "poster.near", uploaded_at: new Date("2026-10-01T09:00:00Z") },
@@ -1223,6 +1231,72 @@ describe.each(targets)("db on $name", (target) => {
     } finally {
       await dispose();
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.each(targets)("the agent bond columns (migration 0006) on $name", (target) => {
+  const insertAgent = (db: Db, account: string, extra: Record<string, unknown> = {}) =>
+    insertRow(db, "agents", {
+      account,
+      profile_uri: "ipfs://p",
+      profile_hash: "ab".repeat(32),
+      tags: "[]",
+      registered_height: "10",
+      ...extra,
+    });
+
+  it("an_agent_held_before_it_is_active_with_no_bond", MINUTE, async () => {
+    // A database set up before the bond: migrations 0001 to 0005, with an agent in it.
+    const dir = await mkdtemp(join(tmpdir(), "tender-0005-"));
+    const { db, dispose } = await target.fresh();
+    try {
+      const before = MIGRATIONS.slice(0, 5);
+      for (const name of before) {
+        await copyFile(new URL(`../migrations/${name}`, import.meta.url), join(dir, name));
+      }
+      expect(await migrate(db, dir)).toEqual(before);
+      await insertAgent(db, "old.near");
+
+      expect(await migrate(db)).toEqual(["0006_agent_bond.sql"]);
+      expect(
+        await db.query(
+          "select status, bond_token, bond_amount, claimable_at from agents where account = $1",
+          ["old.near"],
+        ),
+      ).toEqual([{ status: "active", bond_token: null, bond_amount: null, claimable_at: null }]);
+    } finally {
+      await dispose();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the_bond_columns_hold_a_u128_and_a_u64_and_the_status_is_one_of_three", MINUTE, async () => {
+    const { db, dispose } = await target.fresh();
+    try {
+      await migrate(db);
+      // The largest u128 for the amount, the largest u64 of nanoseconds for the time.
+      await insertAgent(db, "bonded.near", {
+        status: "unregistering",
+        bond_token: "usdc.near",
+        bond_amount: U128_MAX,
+        claimable_at: "18446744073709551615",
+      });
+      expect(
+        await db.query<{ bond_amount: string; claimable_at: string }>(
+          "select bond_amount::text, claimable_at::text from agents where account = 'bonded.near'",
+        ),
+      ).toEqual([{ bond_amount: U128_MAX, claimable_at: "18446744073709551615" }]);
+      for (const status of ["Active", "unregistered", "bonded", ""]) {
+        await expect(insertAgent(db, `bad-${status}.near`, { status }), status).rejects.toThrow();
+      }
+      // A new row that says nothing of the bond is active, as the contract's registration is.
+      await insertAgent(db, "plain.near");
+      expect(await db.query("select status from agents where account = 'plain.near'")).toEqual([
+        { status: "active" },
+      ]);
+    } finally {
+      await dispose();
     }
   });
 });

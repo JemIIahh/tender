@@ -1,7 +1,13 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type LocalChain, type LocalRole, startLocalChain, TenderClient } from "@tender/client";
+import {
+  type LocalChain,
+  type LocalRole,
+  registerLocalAgent,
+  startLocalChain,
+  TenderClient,
+} from "@tender/client";
 import { type Db, migrate, openDb } from "@tender/db";
 import { computeCommitment, randomSalt, sha256Hex } from "@tender/shared";
 import { afterAll, beforeAll, expect, test } from "vitest";
@@ -267,7 +273,7 @@ test("reconcile_repairs_missing_task", async () => {
     const aliceId = chain.accounts.alice.accountId;
     const reward = 1_000_000n;
     await poster.deposit(chain.tokenId, reward);
-    await alice.registerAgent("ipfs://alice-profile", sha256Hex("alice profile"), ["extraction"]);
+    await registerLocalAgent(chain, "alice", ["extraction"]);
     const { taskId } = await poster.postTask({
       token: chain.tokenId,
       reward,

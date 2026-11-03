@@ -66,7 +66,15 @@ const ENTRIES_1: EntryView[] = [
     uri: BOB_ENTRY.uri,
   },
 ];
-const ALICE: AgentView = sample("agent_view.json", AgentViewSchema);
+// The fixture lifecycle registers its agents before any bond is set, so the chain shows them
+// active and bond-free, which is what the index rows say. The bond fields have tests of their own.
+const ALICE: AgentView = {
+  ...sample("agent_view.json", AgentViewSchema),
+  status: "active",
+  bond_token: null,
+  bond_amount: null,
+  claimable_at: null,
+};
 const AGENTS: AgentView[] = [
   ALICE,
   { ...ALICE, account: bob, earned: [{ token: FIXTURE_TOKEN, amount: "285000" }] },
@@ -790,6 +798,92 @@ test("agent_counters_are_repaired_but_not_for_an_agent_with_a_newer_event", asyn
   });
   const [skipped] = await db.query("select picks_made from agents where account = $1", [judge]);
   expect(skipped).toEqual({ picks_made: 0 });
+});
+
+/** An agent's standing in the index. */
+async function standingOf(account: string): Promise<Row | undefined> {
+  const [row] = await db.query<Row>(
+    `select status, bond_token, bond_amount::text as bond_amount, claimable_at::text as claimable_at
+       from agents where account = $1`,
+    [account],
+  );
+  return row;
+}
+
+test("an_agents_status_and_bond_are_repaired_both_ways_from_its_view", async () => {
+  await seed();
+  // The index missed alice's bond and her unregistering (it started late), and holds a bond for the
+  // judge that the chain says is claimed and gone: a bond, unlike a counter, goes both ways.
+  await db.query(
+    "update agents set status = 'active', bond_token = $2, bond_amount = 7 where account = $1",
+    [judge, FIXTURE_TOKEN],
+  );
+  const chain = lifecycleChain({
+    agents: AGENTS.map((agent) =>
+      agent.account === alice
+        ? {
+            ...agent,
+            status: "unregistering" as const,
+            bond_token: FIXTURE_TOKEN,
+            bond_amount: "1000000",
+            claimable_at: "1793745956336648000",
+          }
+        : agent.account === judge
+          ? { ...agent, status: "retired" as const }
+          : agent,
+    ),
+  });
+  const lines: string[] = [];
+
+  expect(await reconcileWith(chain, lines)).toEqual({ inserted: 0, updated: 2 });
+  // The judge registered last, so a pass reads her view first.
+  expect(lines).toEqual([
+    `WARN reconcile agent=${judge} field=status`,
+    `WARN reconcile agent=${judge} field=bond_token`,
+    `WARN reconcile agent=${judge} field=bond_amount`,
+    `WARN reconcile agent=${alice} field=status`,
+    `WARN reconcile agent=${alice} field=bond_token`,
+    `WARN reconcile agent=${alice} field=bond_amount`,
+    `WARN reconcile agent=${alice} field=claimable_at`,
+  ]);
+  expect(await standingOf(alice)).toEqual({
+    status: "unregistering",
+    bond_token: FIXTURE_TOKEN,
+    bond_amount: "1000000",
+    claimable_at: "1793745956336648000",
+  });
+  expect(await standingOf(judge)).toEqual({
+    status: "retired",
+    bond_token: null,
+    bond_amount: null,
+    claimable_at: null,
+  });
+
+  // A second pass over the same chain finds nothing to repair.
+  const again: string[] = [];
+  expect(await reconcileWith(chain, again)).toEqual({ inserted: 0, updated: 0 });
+  expect(again).toEqual([]);
+});
+
+test("an_agent_with_a_newer_bond_event_is_left_alone_by_the_bond_repair", async () => {
+  await seed();
+  const stale = AGENTS.map((agent) =>
+    agent.account === judge ? { ...agent, status: "retired" as const } : agent,
+  );
+  // The judge's unregistering lands while reconcile reads the views, so the (older) view that says
+  // retired must not overwrite what the event says.
+  const chain = lifecycleChain({
+    final: 91n,
+    agents: stale,
+    onFirstRead: async () => {
+      await apply(blockOf(111, [eventLine("agent_unregistering", { account: judge })]));
+    },
+  });
+  const lines: string[] = [];
+
+  expect(await reconcileWith(chain, lines)).toEqual({ inserted: 0, updated: 0 });
+  expect(lines).toEqual([]);
+  expect(await standingOf(judge)).toMatchObject({ status: "unregistering" });
 });
 
 test("the_50_agent_slots_go_to_agents_that_the_pass_compares", async () => {

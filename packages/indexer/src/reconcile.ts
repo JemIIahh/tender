@@ -56,6 +56,12 @@ const COUNTS_ONLY_GROW = "the view is lower, and counts only grow";
 
 /** The fields of an `OutcomeView`, `kind` first: all that a pass compares of an outcome. */
 const OUTCOME_FIELDS = ["kind", "winners", "fee", "scorecard_hash", "scorecard_uri", "reason"];
+/**
+ * Where an agent stands (Task 16b), which a pass compares too. Unlike a counter, these go both
+ * ways on chain (an agent leaves, claims, comes back), so the view is the truth and a difference is
+ * repaired whichever way it goes.
+ */
+const BOND_FIELDS = ["status", "bond_token", "bond_amount", "claimable_at"] as const;
 /** The counters of an agent row, in the order of the view, which a pass compares. */
 const AGENT_FIELDS = [
   "entries",
@@ -75,7 +81,7 @@ const AGENT_FIELDS = [
  * - for the 50 newest tasks of the index and every one without an outcome, compares
  *   `commit_count`, `reveal_count` and the outcome with the chain;
  * - for the 50 agents of the index that its events updated last, of those it does not leave alone
- *   (see below), compares the counters with `getAgent`;
+ *   (see below), compares the counters, and the status and bond, with `getAgent`;
  * - logs `WARN reconcile task=<id> field=<f>` (or `agent=<account>`) for each field that differed,
  *   and repairs it, and `WARN reconcile task=<id> inserted from the chain` for each task inserted.
  *
@@ -336,7 +342,8 @@ async function taskIdsToCompare(db: Db): Promise<bigint[]> {
 function agentEvents(where: string): string {
   return `
     select e.id, e.data ->> 'account' as account from events e
-     where e.event in ('agent_registered', 'committed', 'revealed') ${where}
+     where e.event in ('agent_registered', 'agent_bonded', 'agent_unregistering',
+                        'agent_bond_claimed', 'committed', 'revealed') ${where}
     union all
     select e.id, e.data ->> 'by' from events e
      where e.event in ('picked', 'voided') ${where}
@@ -555,12 +562,17 @@ interface AgentRow {
   earned: unknown;
   picks_made: number;
   voids_after_reveals: number;
+  status: string;
+  bond_token: string | null;
+  bond_amount: string | null;
+  claimable_at: string | null;
 }
 
 /**
  * Brings each agent's counters up to its view, but for an agent that has an event after `since`.
  * A counter, or a slot of `earned`, is raised where the view has more and kept where it has less
- * (P03-R21). Returns the agents whose counters differed, each with the fields raised and kept.
+ * (P03-R21). The bond fields (`BOND_FIELDS`) are set to the view's, whichever way they differ.
+ * Returns the agents whose rows differed, each with the fields changed and kept.
  */
 function repairAgents(
   db: Db,
@@ -581,7 +593,9 @@ function repairAgents(
     for (const view of views) {
       if (changed.has(view.account)) continue;
       const [row] = await tx.query<AgentRow>(
-        `select account, entries, reveals, wins, earned, picks_made, voids_after_reveals
+        `select account, entries, reveals, wins, earned, picks_made, voids_after_reveals,
+                status, bond_token, bond_amount::text as bond_amount,
+                claimable_at::text as claimable_at
            from agents where account = $1`,
         [view.account],
       );
@@ -604,12 +618,19 @@ function repairAgents(
           kept.push(field);
         }
       }
+      for (const field of BOND_FIELDS) {
+        if (row[field] !== view[field]) {
+          fields.push(field);
+          next[field] = view[field] as never;
+        }
+      }
       if (fields.length === 0 && kept.length === 0) continue;
       if (fields.length > 0) {
         await tx.query(
           `update agents
               set entries = $2, reveals = $3, wins = $4, earned = $5, picks_made = $6,
-                  voids_after_reveals = $7
+                  voids_after_reveals = $7, status = $8, bond_token = $9, bond_amount = $10,
+                  claimable_at = $11
             where account = $1`,
           [
             view.account,
@@ -619,6 +640,10 @@ function repairAgents(
             JSON.stringify(next.earned),
             next.picks_made,
             next.voids_after_reveals,
+            next.status,
+            next.bond_token,
+            next.bond_amount,
+            next.claimable_at,
           ],
         );
       }

@@ -109,6 +109,16 @@ async function agentOf(account: string): Promise<Row | undefined> {
   return row;
 }
 
+/** The agent's standing and bond, as the index holds them. */
+async function standingOf(account: string): Promise<Row | undefined> {
+  const [row] = await rows(
+    `select status, bond_token, bond_amount::text as bond_amount, claimable_at::text as claimable_at
+       from agents where account = $1`,
+    [account],
+  );
+  return row;
+}
+
 async function counters(account: string): Promise<Row | undefined> {
   const [row] = await rows(
     `select entries, reveals, wins, picks_made, voids_after_reveals from agents where account = $1`,
@@ -613,6 +623,112 @@ test("agent_update_keeps_counters_and_registered_height", async () => {
     entries: 1,
     registered_height: "1000",
   });
+});
+
+// The bond events were captured on the sandbox for alice.sandbox, so each is patched to alice here.
+test("agent_bond_events_follow_an_agent_from_active_to_retired", async () => {
+  const bond = fixtureData("agent_bonded");
+  const leaving = fixtureData("agent_unregistering");
+  const claimed = fixtureData("agent_bond_claimed");
+
+  // A new agent is active, and bond-free until the contract says it took one. The captured
+  // `agent_bonded` follows the registration in the same receipt, as on the chain.
+  await apply(eventLine("agent_registered"));
+  expect(await standingOf(alice)).toEqual({
+    status: "active",
+    bond_token: null,
+    bond_amount: null,
+    claimable_at: null,
+  });
+  await apply(eventLine("agent_bonded", { account: alice }));
+  expect(await standingOf(alice)).toEqual({
+    status: "active",
+    bond_token: bond.token,
+    bond_amount: bond.amount,
+    claimable_at: null,
+  });
+
+  // Unregistering keeps the bond and says from when it is claimable.
+  await apply(eventLine("agent_unregistering", { account: alice }));
+  expect(await standingOf(alice)).toEqual({
+    status: "unregistering",
+    bond_token: bond.token,
+    bond_amount: bond.amount,
+    claimable_at: leaving.claimable_at,
+  });
+
+  // Claiming retires the agent and clears what it held: bond and date.
+  await apply(eventLine("agent_bond_claimed", { account: alice }));
+  expect(claimed.amount).toBe(bond.amount);
+  expect(await standingOf(alice)).toEqual({
+    status: "retired",
+    bond_token: null,
+    bond_amount: null,
+    claimable_at: null,
+  });
+
+  // Coming back is a registration that is active again, with a bond of its own.
+  await apply(
+    eventLine("agent_registered"),
+    eventLine("agent_bonded", { account: alice, amount: "2500000" }),
+  );
+  expect(await standingOf(alice)).toEqual({
+    status: "active",
+    bond_token: bond.token,
+    bond_amount: "2500000",
+    claimable_at: null,
+  });
+});
+
+test("agent_bond_events_keep_counters_and_name_and_are_stored_with_no_task", async () => {
+  await putFixtureBlobs(db);
+  await apply(eventLine("agent_registered", { profile_hash: FIXTURE_PROFILE_HASH }));
+  await apply(eventLine("task_created"));
+  await apply(eventLine("committed"));
+  const before = await agentOf(alice);
+
+  await apply(
+    eventLine("agent_bonded", { account: alice }),
+    eventLine("agent_unregistering", { account: alice }),
+    eventLine("agent_bond_claimed", { account: alice }),
+  );
+
+  // Status and bond moved; the profile, the counters and the registration height did not.
+  expect(await agentOf(alice)).toEqual(before);
+  expect(before).toMatchObject({
+    entries: 1,
+    name: FIXTURE_PROFILE.name,
+    registered_height: "1000",
+  });
+  expect(
+    await rows(
+      "select event, task_id::text as task_id from events where event like 'agent_bond%' or event = 'agent_unregistering' order by id",
+    ),
+  ).toEqual([
+    { event: "agent_bonded", task_id: null },
+    { event: "agent_unregistering", task_id: null },
+    { event: "agent_bond_claimed", task_id: null },
+  ]);
+});
+
+test("a_profile_update_by_an_active_agent_keeps_its_bond", async () => {
+  await apply(eventLine("agent_registered"), eventLine("agent_bonded", { account: alice }));
+  const bonded = await standingOf(alice);
+
+  // An update logs `agent_registered` with `updated: true` and no `agent_bonded`.
+  await apply(eventLine("agent_registered", { updated: true, tags: ["research"] }));
+  expect(await standingOf(alice)).toEqual(bonded);
+});
+
+test("bond_events_for_an_agent_the_index_never_saw_change_nothing", async () => {
+  // The index may start after the registration; reconcile fills the agent in from the chain.
+  await apply(
+    eventLine("agent_bonded", { account: alice }),
+    eventLine("agent_unregistering", { account: alice }),
+    eventLine("agent_bond_claimed", { account: alice }),
+  );
+  expect(await count("agents")).toBe(0);
+  expect(await count("events")).toBe(3);
 });
 
 test("agent_counters_follow_contract", async () => {
