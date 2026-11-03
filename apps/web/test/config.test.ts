@@ -22,6 +22,7 @@ test("config_reads_the_public_values", () => {
     rpcUrl: NETWORKS.testnet.rpcUrl,
     contractId: "tender.testnet",
     devWallet: false,
+    judgeAccount: null,
   });
 });
 
@@ -177,6 +178,33 @@ test("dev_wallet_needs_the_value_one", () => {
   }
 });
 
+test("config_judge_account_is_optional_and_an_account_id", () => {
+  // The post wizard offers the Judge as a verifier only when this build knows its account.
+  expect(readConfig(BASE).judgeAccount).toBeNull();
+  expect(
+    readConfig({ ...BASE, NEXT_PUBLIC_JUDGE_ACCOUNT: "judge.tender.testnet" }).judgeAccount,
+  ).toBe("judge.tender.testnet");
+  // An empty value in a .env file, or one of spaces, is the same as none.
+  for (const empty of ["", "  "]) {
+    expect(
+      readConfig({ ...BASE, NEXT_PUBLIC_JUDGE_ACCOUNT: empty }).judgeAccount,
+      empty,
+    ).toBeNull();
+  }
+  expect(
+    readConfig({ ...BASE, NEXT_PUBLIC_JUDGE_ACCOUNT: " judge.tender.testnet\n" }).judgeAccount,
+  ).toBe("judge.tender.testnet");
+});
+
+test("config_refuses_a_judge_account_that_is_not_an_account", () => {
+  // A mistake to stop at, not a Judge to leave out without a word.
+  for (const judge of ["Judge.testnet", "judge testnet", "j", "judge@testnet"]) {
+    expect(() => readConfig({ ...BASE, NEXT_PUBLIC_JUDGE_ACCOUNT: judge }), judge).toThrow(
+      `NEXT_PUBLIC_JUDGE_ACCOUNT must be a NEAR account id, got ${JSON.stringify(judge)}`,
+    );
+  }
+});
+
 test("config_of_this_module_comes_from_the_environment", () => {
   // vitest.config.ts sets these.
   expect(config).toEqual({
@@ -185,5 +213,6 @@ test("config_of_this_module_comes_from_the_environment", () => {
     rpcUrl: "http://rpc.test",
     contractId: "tender.testnet",
     devWallet: false,
+    judgeAccount: null,
   });
 });

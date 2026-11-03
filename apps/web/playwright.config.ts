@@ -29,6 +29,8 @@ export default defineConfig({
       // Never the real node: a read that no spec answers fails to connect (e2e/walletStub.ts).
       NEXT_PUBLIC_RPC_URL: RPC_URL,
       NEXT_PUBLIC_CONTRACT: "tender.tender-team.testnet",
+      // The Judge the post wizard offers as the verifier, and picks by default (e2e/fixtures.ts).
+      NEXT_PUBLIC_JUDGE_ACCOUNT: "judge.tender-team.testnet",
     },
   },
   projects: [

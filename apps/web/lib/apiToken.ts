@@ -79,6 +79,20 @@ export function heldToken(): StoredToken | null {
 /** What the server renders: no token. */
 export const noToken = (): StoredToken | null => null;
 
+/**
+ * The token in `stored` if it is for `accountId` and the API has not stopped taking it, else null.
+ * The one rule for whose token may be used, for a render (`useApiToken`) and for a request
+ * (`liveToken`, which reads `heldToken` each time).
+ */
+export function tokenForAccount(
+  stored: StoredToken | null,
+  accountId: string | null,
+): string | null {
+  return stored !== null && stored.accountId === accountId && stored.expiresAtMs > Date.now()
+    ? stored.token
+    : null;
+}
+
 export function subscribeToken(listener: () => void): () => void {
   listeners.add(listener);
   return () => {

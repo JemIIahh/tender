@@ -1,9 +1,10 @@
 import { baseEncode, decodeSignedTransaction } from "near-api-js";
 
-// An in-memory model of the Tender contract and its tokens, as far as the wallet page uses them:
-// the storage balance, the vault, a token's own balances and registrations, and the five calls
-// that change them. It answers the views the page reads and runs the calls a wallet sends, and it
-// writes what the contract writes: the same panics, the same events, the same receipts. The unit
+// An in-memory model of the Tender contract and its tokens, as far as the wallet page and the post
+// wizard use them: the storage balance, the vault, a token's own balances and registrations, tasks
+// as `post_task` makes them, and the calls that change these. It answers the views the page reads
+// and runs the calls a wallet sends, and it writes what the contract writes: the same panics, in
+// the contract's order, the same events, the same receipts. The unit
 // tests and the e2e specs share it, so a spec that fails has found a bug in the page, not in a
 // double that two files describe differently. It is not a chain: one call runs to its end before
 // the next starts, and there are no blocks.
@@ -16,6 +17,35 @@ const BYTE_COST = 10n ** 19n;
 const REGISTRATION_BYTES = 133n;
 /** What NEP-145 `registration_only` keeps at a token, in yoctoNEAR. */
 const TOKEN_REGISTRATION_COST = 1_250_000_000_000_000_000_000n;
+const U128_MAX = 2n ** 128n - 1n;
+/** `MAX_WINDOW_SECS`, `MAX_WINNERS`, `OUTCOME_RESERVE_BYTES` and `MAX_URI_BYTES` of the contract. */
+const MAX_WINDOW_SECS = 1_209_600;
+const MAX_WINNERS = 5;
+const OUTCOME_RESERVE_BYTES = 800n;
+/** `VAULT_SLOT_MAX_BYTES`: what a first deposit of a token charges the account it is for. */
+const VAULT_SLOT_BYTES = 200n;
+const MAX_URI_BYTES = 256;
+/** About what a task record takes besides its address. The model's own figure, not the contract's. */
+const TASK_RECORD_BYTES = 400n;
+const SECOND_NS = 1_000_000_000n;
+/** The keys `post_task` takes in its `task`; it refuses any other. */
+const POST_TASK_KEYS = [
+  "token",
+  "reward",
+  "brief_uri",
+  "brief_hash",
+  "criteria_hash",
+  "heldout_commitment",
+  "verifier",
+  "commit_secs",
+  "reveal_secs",
+  "pick_secs",
+  "fallback_secs",
+  "max_entries",
+  "max_winners",
+  "invited",
+  "parent",
+];
 
 export const NEAR = (whole: number): bigint =>
   BigInt(Math.round(whole * 1e6)) * (YOCTO / 10n ** 6n);
@@ -81,6 +111,32 @@ function asRecord(value: unknown): Record<string, unknown> {
 export interface TokenSetup {
   token: string;
   enabled?: boolean;
+  /** The least and the most a task may pay in this token. 1 and the largest u128 by default. */
+  minReward?: bigint;
+  maxReward?: bigint;
+}
+
+/** A task as `post_task` stores it: the fields of its `task_created` event. */
+export interface FakeTask {
+  id: bigint;
+  poster: string;
+  token: string;
+  reward: bigint;
+  feeBps: number;
+  briefUri: string;
+  briefHash: string;
+  criteriaHash: string;
+  heldoutCommitment: string | null;
+  verifier: string;
+  /** Nanoseconds since the epoch, as the contract counts them. */
+  createdAt: bigint;
+  commitDeadline: bigint;
+  revealDeadline: bigint;
+  pickDeadline: bigint;
+  fallbackDeadline: bigint;
+  maxEntries: number;
+  maxWinners: number;
+  invited: string[];
 }
 
 export class FakeChain {
@@ -98,14 +154,28 @@ export class FakeChain {
   readonly ftRegistered = new Map<string, Set<string>>();
   /** NEAR each account has paid out of its own balance, which a test can read back. */
   readonly nearSpent = new Map<string, bigint>();
+  /** The tasks that have been posted, by id. */
+  readonly tasks = new Map<bigint, FakeTask>();
+  /** The least and the most a task may pay in each token. */
+  readonly rewardLimits = new Map<string, { min: bigint; max: bigint }>();
+  /** The shortest window the contract takes. A test may set it. */
+  minWindowSecs = 60;
+  /** Whether posting is paused. A test may set it. */
+  paused = false;
+  /** The fee a new task keeps, in basis points. */
+  feeBps = 500;
+  /** The block time, in nanoseconds. The clock by default; a test may fix it. */
+  now: () => bigint = () => BigInt(Date.now()) * 1_000_000n;
   private counter = 0;
+  private nextTaskId = 1n;
 
   constructor(
     readonly contractId: string,
     tokens: TokenSetup[],
   ) {
-    for (const { token, enabled = true } of tokens) {
+    for (const { token, enabled = true, minReward = 1n, maxReward = U128_MAX } of tokens) {
       this.tokens.set(token, enabled);
+      this.rewardLimits.set(token, { min: minReward, max: maxReward });
       this.ftBalances.set(token, new Map());
       this.ftRegistered.set(token, new Set());
     }
@@ -137,15 +207,15 @@ export class FakeChain {
             owner: this.contractId,
             pending_owner: null,
             treasury: this.contractId,
-            fee_bps: 500,
-            min_window_secs: 60,
-            max_window_secs: 1_209_600,
-            paused: false,
+            fee_bps: this.feeBps,
+            min_window_secs: this.minWindowSecs,
+            max_window_secs: MAX_WINDOW_SECS,
+            paused: this.paused,
             version: 1,
             tokens: [...this.tokens].map(([token, enabled]) => ({
               token,
-              min_reward: "1",
-              max_reward: "340282366920938463463374607431768211455",
+              min_reward: (this.rewardLimits.get(token)?.min ?? 1n).toString(),
+              max_reward: (this.rewardLimits.get(token)?.max ?? U128_MAX).toString(),
               enabled,
             })),
           };
@@ -257,6 +327,8 @@ export class FakeChain {
           return this.withdraw(signer, args, deposit, gas);
         case "storage_withdraw":
           return this.storageWithdraw(signer, args, deposit);
+        case "post_task":
+          return this.postTask(signer, args, deposit);
         default:
           throw panic("E_ARGS", `no such method ${methodName}`);
       }
@@ -341,6 +413,135 @@ export class FakeChain {
     ];
   }
 
+  /**
+   * `post_task`, with the contract's checks in the contract's order: paused, token and reward,
+   * address, hashes, windows, winners, the invite list, the parent, then the spend (exactly 1
+   * yoctoNEAR, a vault that holds the reward) and the poster's storage. Only then is anything
+   * written, and the task record is charged to the poster with the bytes reserved for its outcome.
+   */
+  private postTask(signer: string, args: Record<string, unknown>, deposit: bigint) {
+    const task = asRecord(args.task);
+    for (const key of Object.keys(task)) {
+      if (!POST_TASK_KEYS.includes(key)) throw panic("E_ARGS", `unknown field ${key}`);
+    }
+    if (this.paused) throw panic("E_PAUSED", "posting new tasks is paused");
+
+    const token = String(task.token);
+    const limits = this.rewardLimits.get(token);
+    if (this.tokens.get(token) !== true || limits === undefined) {
+      throw panic("E_TOKEN", `${token} is not an enabled token`);
+    }
+    const reward = BigInt(String(task.reward));
+    if (reward < limits.min || reward > limits.max) {
+      throw panic("E_REWARD", `reward ${reward} must be ${limits.min} to ${limits.max}`);
+    }
+    const briefUri = String(task.brief_uri);
+    const uriBytes = new TextEncoder().encode(briefUri).length;
+    if (uriBytes < 1 || uriBytes > MAX_URI_BYTES) {
+      throw panic("E_URI", `brief_uri must be 1 to ${MAX_URI_BYTES} bytes`);
+    }
+    const hash = (name: string): string => {
+      const value = task[name];
+      if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+        throw panic("E_HASH", `${name} must be 64 lowercase hex characters`);
+      }
+      return value;
+    };
+    const briefHash = hash("brief_hash");
+    const criteriaHash = hash("criteria_hash");
+    const heldoutCommitment = task.heldout_commitment == null ? null : hash("heldout_commitment");
+    const secs = (name: string): bigint => {
+      const value = task[name];
+      if (
+        typeof value !== "number" ||
+        !Number.isInteger(value) ||
+        value < this.minWindowSecs ||
+        value > MAX_WINDOW_SECS
+      ) {
+        throw panic("E_WINDOW", `${name} must be ${this.minWindowSecs} to ${MAX_WINDOW_SECS}`);
+      }
+      return BigInt(value) * SECOND_NS;
+    };
+    const commit = secs("commit_secs");
+    const reveal = secs("reveal_secs");
+    const pick = secs("pick_secs");
+    const fallback = secs("fallback_secs");
+    const maxWinners = Number(task.max_winners);
+    if (!Number.isInteger(maxWinners) || maxWinners < 1 || maxWinners > MAX_WINNERS) {
+      throw panic("E_WINNERS", `max_winners must be 1 to ${MAX_WINNERS}`);
+    }
+    const verifier = typeof task.verifier === "string" ? task.verifier : signer;
+    const invited = Array.isArray(task.invited) ? task.invited.map(String) : [];
+    const maxEntries = Number(task.max_entries);
+    if (maxEntries > 0 && invited.length === 0) {
+      throw panic("E_LIMIT", `max_entries ${maxEntries} needs a non-empty invited list`);
+    }
+    if (task.parent != null) throw panic("E_PARENT", "lineage not enabled");
+
+    if (deposit !== 1n) throw panic("E_AUTH", "attach exactly 1 yoctoNEAR");
+    const balance = this.slots(signer).get(token) ?? 0n;
+    if (balance < reward) throw panic("E_FUNDS", "insufficient vault balance");
+    const record = this.storage.get(signer);
+    const bytes = TASK_RECORD_BYTES + BigInt(uriBytes) + OUTCOME_RESERVE_BYTES;
+    if (record === undefined || record.total - (record.usedBytes + bytes) * BYTE_COST < 0n) {
+      throw panic("E_STORAGE", "the storage balance cannot hold the task");
+    }
+
+    this.slots(signer).set(token, balance - reward);
+    this.storage.set(signer, { ...record, usedBytes: record.usedBytes + bytes });
+    const created = this.now();
+    const commitDeadline = created + commit;
+    const revealDeadline = commitDeadline + reveal;
+    const pickDeadline = revealDeadline + pick;
+    const fallbackDeadline = pickDeadline + fallback;
+    const id = this.nextTaskId++;
+    this.tasks.set(id, {
+      id,
+      poster: signer,
+      token,
+      reward,
+      feeBps: this.feeBps,
+      briefUri,
+      briefHash,
+      criteriaHash,
+      heldoutCommitment,
+      verifier,
+      createdAt: created,
+      commitDeadline,
+      revealDeadline,
+      pickDeadline,
+      fallbackDeadline,
+      maxEntries,
+      maxWinners,
+      invited,
+    });
+    return [
+      this.receipt(this.contractId, [
+        eventLine("task_created", {
+          id: id.toString(),
+          poster: signer,
+          token,
+          reward: reward.toString(),
+          fee_bps: this.feeBps,
+          brief_uri: briefUri,
+          brief_hash: briefHash,
+          criteria_hash: criteriaHash,
+          heldout_commitment: heldoutCommitment,
+          verifier,
+          created_at: created.toString(),
+          commit_deadline: commitDeadline.toString(),
+          reveal_deadline: revealDeadline.toString(),
+          pick_deadline: pickDeadline.toString(),
+          fallback_deadline: fallbackDeadline.toString(),
+          max_entries: maxEntries,
+          max_winners: maxWinners,
+          invited,
+          parent: null,
+        }),
+      ]),
+    ];
+  }
+
   private ftTransferCall(
     token: string,
     signer: string,
@@ -363,7 +564,19 @@ export class FakeChain {
       if (typeof named === "string") beneficiary = named;
       else accepted = false;
     }
-    if (!this.storage.has(beneficiary)) accepted = false;
+    const record = this.storage.get(beneficiary);
+    if (record === undefined) accepted = false;
+    // A token the beneficiary has no slot for yet gets one, and the slot is charged to the
+    // beneficiary's storage: a deposit whose slot it cannot pay for is handed back (vault.rs).
+    const opensSlot = !this.slots(beneficiary).has(token);
+    if (
+      accepted &&
+      opensSlot &&
+      record !== undefined &&
+      record.total - (record.usedBytes + VAULT_SLOT_BYTES) * BYTE_COST < 0n
+    ) {
+      accepted = false;
+    }
 
     const logs: string[] = [];
     if (accepted) {
@@ -372,6 +585,12 @@ export class FakeChain {
         this.contractId,
         (this.balances(token).get(this.contractId) ?? 0n) + amount,
       );
+      if (opensSlot && record !== undefined) {
+        this.storage.set(beneficiary, {
+          ...record,
+          usedBytes: record.usedBytes + VAULT_SLOT_BYTES,
+        });
+      }
       const slots = this.slots(beneficiary);
       slots.set(token, (slots.get(token) ?? 0n) + amount);
       logs.push(
@@ -416,6 +635,8 @@ export class FakeChain {
   private snapshot() {
     const copy = <K, V>(map: Map<K, V>) => new Map(map);
     return {
+      tasks: copy(this.tasks),
+      nextTaskId: this.nextTaskId,
       storage: copy(this.storage),
       vault: new Map([...this.vault].map(([account, slots]) => [account, copy(slots)])),
       ftBalances: new Map([...this.ftBalances].map(([token, held]) => [token, copy(held)])),
@@ -425,11 +646,19 @@ export class FakeChain {
   }
 
   private restore(saved: ReturnType<FakeChain["snapshot"]>): void {
-    for (const key of ["storage", "vault", "ftBalances", "ftRegistered", "nearSpent"] as const) {
+    for (const key of [
+      "tasks",
+      "storage",
+      "vault",
+      "ftBalances",
+      "ftRegistered",
+      "nearSpent",
+    ] as const) {
       const live = this[key] as Map<unknown, unknown>;
       live.clear();
       for (const [k, v] of saved[key] as Map<unknown, unknown>) live.set(k, v);
     }
+    this.nextTaskId = saved.nextTaskId;
   }
 }
 
