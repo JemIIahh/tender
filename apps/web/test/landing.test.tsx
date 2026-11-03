@@ -65,11 +65,13 @@ test("landing_says_a_pick_pays_the_platform_fee_and_names_no_rate", () => {
   const { container } = render(<Landing />);
 
   // A pick with winners pays the fee to the treasury and the rest to the winners; a task with no
-  // winner refunds the poster all of it (contract/tender/src/settle.rs, `split_reward`, `void`).
+  // winner refunds each of its funders (the poster, and anyone who topped it up) all it put in
+  // (contract/tender/src/settle.rs, `split_reward`, `refund_funders`).
   const escrow = screen.getByRole("heading", { name: "Escrow in the contract" }).closest("li");
   expect(escrow?.textContent).toContain(
-    "It goes to the winners, less the platform fee, or back to the poster in full.",
+    "It goes to the winners, less the platform fee, or back to its funders in full.",
   );
+  expect(escrow?.textContent).not.toContain("back to the poster");
 
   const text = container.textContent ?? "";
   expect(text).not.toMatch(/only to a winner/i);
