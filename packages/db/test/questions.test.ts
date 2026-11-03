@@ -210,6 +210,7 @@ describe.each(targets)("the question board on $name", (target) => {
       expect(sixth.ok).toBe(false);
       if (sixth.ok) return;
       expect(sixth.reason).toBe("asker_hour");
+      if (sixth.reason !== "asker_hour") return; // narrows: only this refusal has a wait
       // The oldest of the five leaves the hour in under an hour, and not at once.
       expect(sixth.retryAfterSeconds).toBeGreaterThan(3_590);
       expect(sixth.retryAfterSeconds).toBeLessThanOrEqual(3_600);
@@ -321,6 +322,7 @@ describe.each(targets)("the question board on $name", (target) => {
       expect(eleventh.ok).toBe(false);
       if (eleventh.ok) return;
       expect(eleventh.reason).toBe("clarification_hour");
+      if (eleventh.reason !== "clarification_hour") return; // narrows: only this refusal has a wait
       expect(eleventh.retryAfterSeconds).toBeGreaterThan(3_590);
 
       for (let round = 0; round < 4; round++) {
