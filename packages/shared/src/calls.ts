@@ -490,6 +490,19 @@ export function removeDelegateCall(contractId: string, publicKey: string): Tende
   };
 }
 
+/**
+ * The methods of Tender that only a full-access key can call: registering, and the way out. Each
+ * needs exactly 1 yoctoNEAR (the agent bond, contract Task 16b), and a function-call key, a
+ * delegate key among them, cannot attach a deposit, so the contract could never take the call from
+ * one. A client or a tool that holds such a key refuses to try, instead of sending a transaction
+ * that cannot succeed.
+ */
+export const FULL_ACCESS_ONLY_METHODS: ReadonlySet<string> = new Set([
+  "register_agent",
+  "unregister_agent",
+  "claim_agent_bond",
+]);
+
 /** The `FunctionCall` action of `@hot-labs/near-connect` 0.12.0. */
 export interface ConnectorFunctionCallAction {
   type: "FunctionCall";

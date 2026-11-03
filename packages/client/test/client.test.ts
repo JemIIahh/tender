@@ -207,6 +207,141 @@ describe("delegate sends", () => {
   });
 });
 
+describe("the agent bond calls", () => {
+  /** A client whose `send` records the calls it is given. */
+  function recording() {
+    const client = new TenderClient({ network: "testnet", contractId: CONTRACT });
+    const calls: TenderCall[] = [];
+    vi.spyOn(client, "send").mockImplementation(async (call) => {
+      calls.push(call);
+      return { returnValue: undefined } as TxResult;
+    });
+    return { client, calls };
+  }
+
+  test("each_sender_sends_its_builders_call_with_one_yocto", async () => {
+    const { client, calls } = recording();
+    await client.registerAgent("ipfs://profile", "a".repeat(64), ["rust"]);
+    await client.unregisterAgent();
+    await client.claimAgentBond();
+    await client.setAgentBond("usdc.test.near", 1_000_000n);
+    await client.setAgentBondCooldown(3_600);
+    expect(
+      calls.map((call) => [call.receiverId, call.methodName, call.args, call.deposit]),
+    ).toEqual([
+      [
+        CONTRACT,
+        "register_agent",
+        { profile_uri: "ipfs://profile", profile_hash: "a".repeat(64), tags: ["rust"] },
+        1n,
+      ],
+      [CONTRACT, "unregister_agent", {}, 1n],
+      [CONTRACT, "claim_agent_bond", {}, 1n],
+      [CONTRACT, "set_agent_bond", { token: "usdc.test.near", amount: "1000000" }, 1n],
+      [CONTRACT, "set_agent_bond_cooldown", { secs: "3600" }, 1n],
+    ]);
+  });
+
+  /** A client that signs with `key` as alice, against an RPC that says the key's permission is `permission`. */
+  async function signedAgainst(permission: unknown) {
+    const key = KeyPair.fromRandom("ed25519");
+    const publicKey = key.getPublicKey().toString();
+    const { client: reader, requests } = await fakeRpc(() =>
+      permission === null
+        ? {
+            result: {
+              ...BLOCK,
+              error: `access key ${publicKey} does not exist while viewing`,
+              logs: [],
+            },
+          }
+        : { result: { ...BLOCK, nonce: 29_000_000, permission } },
+    );
+    const client = new TenderClient({
+      network: "testnet",
+      contractId: CONTRACT,
+      rpcUrl: reader.rpcUrl,
+      signer: { accountId: "alice.test.near", privateKey: key.toString() },
+    });
+    return { client, requests, publicKey };
+  }
+
+  const FUNCTION_CALL_KEY = {
+    FunctionCall: {
+      allowance: "1000000000000000000000000",
+      receiver_id: CONTRACT,
+      method_names: ["register_agent", "unregister_agent", "claim_agent_bond", "commit"],
+    },
+  };
+
+  test("a_client_knows_the_public_half_of_its_key", async () => {
+    const { client, publicKey } = await signedAgainst("FullAccess");
+    expect(client.publicKey).toBe(publicKey);
+    expect(
+      new TenderClient({ network: "testnet", contractId: CONTRACT }).publicKey,
+    ).toBeUndefined();
+  });
+
+  test("a_function_call_key_is_refused_before_anything_is_sent", async () => {
+    // A delegate key is one of these: it lists methods, but it cannot attach the 1 yoctoNEAR.
+    const { client, requests } = await signedAgainst(FUNCTION_CALL_KEY);
+    for (const attempt of [
+      () => client.registerAgent("ipfs://profile", "a".repeat(64), []),
+      () => client.unregisterAgent(),
+      () => client.claimAgentBond(),
+      () => client.requireFullAccessKey("register_agent"),
+    ]) {
+      const error = await attempt().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(TenderError);
+      expect(error).toMatchObject({ code: "E_AUTH", txHash: undefined });
+      expect((error as Error).message).toContain("full-access key");
+      expect((error as Error).message).toContain("Nothing was sent");
+    }
+    // Only the key was looked up: not the block, not a nonce, no transaction.
+    expect(new Set(requests.map((r) => `${r.method} ${r.params.request_type}`))).toEqual(
+      new Set(["query view_access_key"]),
+    );
+  });
+
+  test("a_key_the_account_does_not_have_is_refused_too", async () => {
+    const { client, requests, publicKey } = await signedAgainst(null);
+    const error = await client.claimAgentBond().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).toMatchObject({ code: "E_AUTH" });
+    expect((error as Error).message).toContain(`${publicKey} is not a key of that account`);
+    expect(requests.map((r) => r.method)).toEqual(["query"]);
+  });
+
+  test("a_full_access_key_goes_on_to_send", async () => {
+    const { client, requests } = await signedAgainst("FullAccess");
+    // The fake node answers every request alike, so the send fails after the guard; what matters
+    // is that it got that far: the guard looked once, and the send asked the node for more.
+    const error = await client.unregisterAgent().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).not.toMatchObject({
+      code: "E_AUTH",
+      message: expect.stringContaining("Nothing was sent"),
+    });
+    expect(requests.length).toBeGreaterThan(1);
+  });
+
+  test("other_calls_are_not_checked_against_the_key", async () => {
+    // Only the three methods that take 1 yoctoNEAR of a full-access key look the key up.
+    const { client, requests } = await signedAgainst(FUNCTION_CALL_KEY);
+    await client.commit(1n, "a".repeat(64)).catch(() => undefined);
+    const lookups = requests.filter((r) => r.params.request_type === "view_access_key");
+    // near-api-js reads the key's nonce to sign; the guard adds no read of its own to a commit.
+    expect(lookups.length).toBeLessThanOrEqual(2);
+  });
+});
+
 describe("views", () => {
   test("read_the_last_final_block_and_validate", async () => {
     const config = {
@@ -219,6 +354,9 @@ describe("views", () => {
       paused: false,
       version: 1,
       tokens: [],
+      agent_bond_token: "usdc.test.near",
+      agent_bond_amount: "1000000",
+      agent_bond_cooldown_secs: "3600",
     };
     const { client, requests } = await fakeRpc(() => viewResult(config));
     expect(await client.getConfig()).toEqual(config);
@@ -228,6 +366,33 @@ describe("views", () => {
       method_name: "get_config",
       finality: "final",
     });
+  });
+
+  test("the_agent_view_carries_its_status_and_bond", async () => {
+    const agent = {
+      account: "alice.test.near",
+      asp: "test.near",
+      profile_uri: "ipfs://alice",
+      profile_hash: "a".repeat(64),
+      tags: ["rust"],
+      registered_at: "1793307169435833000",
+      entries: 0,
+      reveals: 0,
+      wins: 0,
+      earned: [],
+      picks_made: 0,
+      voids_after_reveals: 0,
+      status: "unregistering",
+      bond_token: "usdc.test.near",
+      bond_amount: "1000000",
+      claimable_at: "1793307179435833000",
+    };
+    const { client } = await fakeRpc(() => viewResult(agent));
+    expect(await client.getAgent("alice.test.near")).toEqual(agent);
+    // A contract from before the bond sends none of the four: that is not an agent in some state.
+    const { status: _s, bond_token: _t, bond_amount: _a, claimable_at: _c, ...old } = agent;
+    const { client: oldClient } = await fakeRpc(() => viewResult(old));
+    await expect(oldClient.getAgent("alice.test.near")).rejects.toThrow();
   });
 
   test("a_view_that_breaks_its_schema_is_an_error", async () => {
