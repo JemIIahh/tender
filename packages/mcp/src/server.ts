@@ -75,6 +75,14 @@ export interface McpDeps {
    * (P04-R2); a caller that builds the deps by hand answers for both itself.
    */
   filesDir?: string;
+  /**
+   * The directory the drafts are kept in (the bin passes `TENDER_STATE_DIR`'s). `commit_result`
+   * reads no file inside it, whatever `filesDir` is: a draft file holds another task's unrevealed
+   * work and its salt, and `reveal_result` publishes what a commit took in. Not set means that
+   * nothing is kept out, so a caller that builds the deps by hand and sets `filesDir` answers for
+   * it. The path need not exist yet, nor be a real path: it is looked up at each call.
+   */
+  stateDir?: string;
   /** How an open file is traced back to a path. Not set means the process's own (the real one). */
   openFiles?: OpenFileLookup;
   /**

@@ -20,7 +20,8 @@ const ACCOUNTS = {
   committers: "select account from entries where task_id = $1::numeric",
   revealers: "select account from entries where task_id = $1::numeric and content_hash is not null",
   unrevealed: "select account from entries where task_id = $1::numeric and content_hash is null",
-  agent: "select $2::text as account",
+  // `$1` is named here so that its type is known when no other role in the audience uses it.
+  agent: "select $2::text as account where $1::numeric is not null",
 } as const;
 
 type Role = keyof typeof ACCOUNTS;
@@ -49,7 +50,11 @@ function audienceOf(a: Alert): Audience {
       // WATCHERS) and goes to the owners of its invitees instead.
       return { ownerChatsOf: ["poster", "invitees"], watchers: true };
     case "agent_started":
-      return { chatsOf: ["poster"], ownerChatsOf: ["agent"] };
+      // Any account can say it started, so the poster hears of a task's first starters only (the
+      // notifier says which); a later one reaches the chats of its own owners alone.
+      return a.posterHears === false
+        ? { ownerChatsOf: ["agent"] }
+        : { chatsOf: ["poster"], ownerChatsOf: ["agent"] };
     case "entry_committed":
       return { chatsOf: ["poster"] };
     case "reveal_open":

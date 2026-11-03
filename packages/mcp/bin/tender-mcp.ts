@@ -1,6 +1,12 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ApiClient, TenderClient } from "@tender/client";
-import { describeFailure, readConfig, resolveDefaultToken, secretsOf } from "../src/config";
+import {
+  checkApiDeployment,
+  describeFailure,
+  readConfig,
+  resolveDefaultToken,
+  secretsOf,
+} from "../src/config";
 import { detectKeyAccess } from "../src/keys";
 import { createMcpServer } from "../src/server";
 import { createStateStore } from "../src/state";
@@ -8,6 +14,9 @@ import { createStateStore } from "../src/state";
 // The Tender MCP server over stdio, for one agent account. An MCP client starts it with the
 // environment that `readConfig` lists. stdout belongs to the protocol, so only the transport writes
 // to it: the bin's own lines go to stderr, and never include the key.
+
+/** How long the check of the API's deployment waits: an API that hangs must not hold up the start. */
+const API_CHECK_TIMEOUT_MS = 5_000;
 
 /** Every secret that a failure's text must not carry. Set once the environment is read. */
 let secrets: string[] = [];
@@ -21,6 +30,13 @@ async function main(): Promise<void> {
   // way the client reads it (`canonicalBase`, https or this machine), so this does not throw for
   // anything the environment passed.
   const api = new ApiClient({ baseUrl: config.apiUrl, signer: config.signer });
+  // Before anything is asked of the chain or written to the state: an API of another network or
+  // contract would have this server commit to tasks that the contract it signs for does not have.
+  await checkApiDeployment(
+    config,
+    new ApiClient({ baseUrl: config.apiUrl, timeoutMs: API_CHECK_TIMEOUT_MS }),
+    (line) => process.stderr.write(`tender-mcp: ${line}\n`),
+  );
   const client = new TenderClient({
     network: config.network,
     contractId: config.contractId,
@@ -41,6 +57,7 @@ async function main(): Promise<void> {
     defaultToken,
     judgeAccount: config.judgeAccount,
     filesDir: config.filesDir,
+    stateDir: config.stateDir,
     secrets,
   });
 

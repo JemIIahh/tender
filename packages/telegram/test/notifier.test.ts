@@ -922,6 +922,45 @@ test("agent_started_only_recent", async () => {
   expect(await tickAt(at + MINUTE)).toEqual([]);
 });
 
+test("the_poster_hears_of_a_tasks_first_starters_only", async () => {
+  // Any account can say it started, so the poster hears of the first five agents to start a task.
+  // A later one is announced to the chats of its own owners. A starter's place is counted over all
+  // who ever started the task, so it does not improve when the earlier ones fall out of the
+  // 10-minute window.
+  const at = T0 + 30 * MINUTE;
+  clock = at;
+  await seedTask(db, { id: "7", poster: "poster.near", title: "Summarise the Q3 report" });
+  await seedTask(db, { id: "8", poster: "poster.near", title: "Label the images" });
+  await linkChat(db, 101, "poster.near");
+
+  // Task 7: five agents began an hour ago, so they are not news now, and two more begin now.
+  for (const n of [1, 2, 3, 4, 5]) await startWorking("7", `old${n}.near`, at - HOUR + n * MINUTE);
+  for (const [n, agent] of ["late1.near", "late2.near"].entries()) {
+    await startWorking("7", agent, at - 3 * MINUTE + n * 1_000);
+    await linkChat(db, 201 + n, agent);
+  }
+  // Task 8: seven agents begin one after another, each with a chat of its own.
+  for (let n = 1; n <= 7; n++) {
+    await startWorking("8", `s${n}.near`, at - 8 * MINUTE + n * MINUTE);
+    await linkChat(db, 300 + n, `s${n}.near`);
+  }
+
+  const heard = lines(await tickAt(at)).sort();
+
+  expect(heard).toEqual(
+    [
+      // Task 7: its late starters' owners hear, and the poster does not: they came sixth and seventh.
+      "201 Agent working #7",
+      "202 Agent working #7",
+      // Task 8: the poster hears of the first five of seven, and every starter's own chat hears.
+      ...[1, 2, 3, 4, 5].map(() => "101 Agent working #8"),
+      ...[1, 2, 3, 4, 5, 6, 7].map((n) => `${300 + n} Agent working #8`),
+    ].sort(),
+  );
+  // The seventh and sixth never reach the poster, now or on a later tick.
+  expect(await tickAt(at + MINUTE)).toEqual([]);
+});
+
 // ---------------------------------------------------------------------------------------------
 // Timer alerts.
 
@@ -988,6 +1027,23 @@ test("timer_alerts_end_with_their_windows", async () => {
   expect(lines(await tickAt(D))).toEqual(["102 Reveal now #7", "103 Reveal now #7"]);
   // At task 8's reveal deadline nothing is open any more.
   expect(await tickAt(R + later)).toEqual([]);
+});
+
+test("the_24_h_reminder_is_not_sent_in_the_last_hour", async () => {
+  // A notifier that is back from downtime, or sees a task late, must not say "24 h left" with an hour
+  // to go: from the 1 h mark the 1 h reminder is the one that is due. Each case starts afresh, as a
+  // notifier that has sent nothing yet.
+  const cases: [when: string, at: number, heard: string[]][] = [
+    ["1 ms before the 1 h mark", D - HOUR - 1, ["101 24 h left #7", "103 24 h left #7"]],
+    ["at the 1 h mark", D - HOUR, ["101 1 h left #7", "103 1 h left #7"]],
+    ["in the last half hour", D - 30 * MINUTE, ["101 1 h left #7", "103 1 h left #7"]],
+    ["1 ms before the commit deadline", D - 1, ["101 1 h left #7", "103 1 h left #7"]],
+  ];
+  for (const [when, at, heard] of cases) {
+    await db.exec(`truncate tasks, entries, tg_links, tg_sent restart identity`);
+    await timedWorld();
+    expect(lines(await tickAt(at)), when).toEqual(heard);
+  }
 });
 
 test("reminder_skipped_for_short_windows", async () => {
@@ -1119,6 +1175,32 @@ test("timers_read_the_clock_after_a_slow_event_phase", async () => {
   const sent = await tickAt(reveal - 11 * MINUTE);
   expect(lines(sent)).toEqual(["11 New task #8", "103 Reveal now #7", "103 Reveal closing #7"]);
   expect(sent[2]?.text).toContain("5 min left to reveal");
+});
+
+test("each_new_task_is_judged_and_worded_on_the_time_it_is_when_its_turn_comes", async () => {
+  // Sends behind a backlog take minutes: here every send takes three. Three tasks close at the same
+  // moment, 5 minutes after the tick began. The first is announced with 5 min to go, the second,
+  // after one send, with 2, and the third, whose turn comes after two sends, has closed: nobody can
+  // enter it any more, so nothing is said. On the time at the start of the tick all three would
+  // say "5 min", one of them to a window that was over.
+  await linkChat(db, 11, poster);
+  expect(await tickAt(T0 + 10 * MINUTE)).toEqual([]); // the first run, on an empty stream
+  const closing = schedule(T0, T0 + 15 * MINUTE, T0 + 2 * HOUR);
+  await apply(created("7", closing), created("8", closing), created("9", closing));
+  onSend = () => {
+    clock += 3 * MINUTE;
+  };
+
+  const sent = await tickAt(T0 + 10 * MINUTE);
+
+  expect(lines(sent)).toEqual(["11 New task #7", "11 New task #8"]);
+  expect(sent[0]?.text).toContain("entries close in 5 min");
+  expect(sent[1]?.text).toContain("entries close in 2 min");
+  expect(await cursor()).toBe("3");
+  const keys = await db.query<{ dedupe_key: string }>(
+    "select dedupe_key from tg_sent order by dedupe_key",
+  );
+  expect(keys).toEqual([{ dedupe_key: "new_task:7" }, { dedupe_key: "new_task:8" }]);
 });
 
 // ---------------------------------------------------------------------------------------------

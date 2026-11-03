@@ -27,8 +27,12 @@ export type Alert =
       /** When entries stop, the task's `commit_deadline`. */
       commitDeadline: string;
     }
-  /** An agent said it started work on the task (the off-chain `working` signal). */
-  | { kind: "agent_started"; taskId: string; title: string; agent: string }
+  /**
+   * An agent said it started work on the task (the off-chain `working` signal). `posterHears` is
+   * whether the task's poster is told: not set means yes, and the notifier sets it to false for the
+   * starters of a task after its first few, who reach only the chats of their own owners.
+   */
+  | { kind: "agent_started"; taskId: string; title: string; agent: string; posterHears?: boolean }
   /** The task received a sealed entry; `count` is how many it has now. */
   | { kind: "entry_committed"; taskId: string; title: string; count: number }
   /** The commit window is over and entries can be revealed. */

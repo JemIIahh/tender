@@ -136,6 +136,11 @@ function memoryState(): StateStore {
         drafts.set(taskId, { ...draft, dead: { reason, at: new Date().toISOString() } });
       }
     },
+    async setAside(taskId) {
+      // The real store renames the file; the draft is gone from the task either way.
+      if (!drafts.delete(taskId)) return null;
+      return `${taskId}.orphaned.json`;
+    },
     async listDrafts() {
       return [...drafts.values()];
     },

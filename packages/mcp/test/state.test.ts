@@ -13,7 +13,13 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { computeCommitment, type NetworkId, sha256Hex } from "@tender/shared";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { createStateStore, type Draft, defaultStateDir, isDraftOf } from "../src/state";
+import {
+  createStateStore,
+  type Draft,
+  defaultStateDir,
+  isDraftOf,
+  staleReason,
+} from "../src/state";
 
 // Only `rename` is wrapped, so that a test can make it fail the way a crash would. Every other
 // function is the real one, and so is `rename` until a test says otherwise.
@@ -296,6 +302,134 @@ test("list_drafts", async () => {
   await writeFile(join(draftsDir, "2.json.bak"), "not a draft");
   await writeFile(join(draftsDir, "04.json"), "{}");
   expect(await store.listDrafts()).toEqual([one, two, ten]);
+});
+
+test("a_draft_records_its_contract_and_task_and_older_drafts_still_read", async () => {
+  const store = createStateStore(dir);
+
+  // The two fields are optional: a draft that an older server made has neither, and reads as it was.
+  const old = makeDraft("7");
+  await store.saveDraft(old);
+  expect(await store.getDraft("7")).toEqual(old);
+  expect(await store.getDraft("7")).not.toHaveProperty("contractId");
+
+  // A new draft records them, and they survive the marks that rewrite the file.
+  const bound = {
+    ...makeDraft("8"),
+    contractId: "tender.testnet",
+    taskCreatedAt: "1793700000000000000",
+    committedAt: "2026-11-04T10:00:00.000Z",
+  };
+  await store.saveDraft(bound);
+  await store.markRevealed("8", "https://tender.example/blobs/abc");
+  expect(await createStateStore(dir).getDraft("8")).toEqual({
+    ...bound,
+    revealedUri: "https://tender.example/blobs/abc",
+  });
+
+  // A field of the wrong type is a draft that cannot be trusted, not one that records nothing.
+  await expect(
+    store.saveDraft({ ...makeDraft("9"), contractId: 5 } as unknown as Draft),
+  ).rejects.toThrow(/invalid draft/);
+});
+
+test("set_aside_keeps_the_file_whole_and_frees_the_task", async () => {
+  const store = createStateStore(dir);
+  const draft = { ...makeDraft("7"), committedAt: "2026-11-04T10:00:00.000Z" };
+  await store.saveDraft(draft);
+  const before = await readFile(join(draftsDir, "7.json"), "utf8");
+  const clock = vi.spyOn(Date, "now").mockReturnValue(1_793_700_000_000);
+
+  const kept = await store.setAside("7");
+
+  // The file is renamed and not rewritten: the same bytes, under a name that is no task number.
+  expect(kept).toBe("7.orphaned-1793700000000.json");
+  expect(await readFile(join(draftsDir, kept ?? ""), "utf8")).toBe(before);
+  expect(await readdir(draftsDir)).toEqual([kept]);
+  // The task has no draft now, and the file is not listed as one.
+  expect(await store.getDraft("7")).toBeNull();
+  expect(await store.listDrafts()).toEqual([]);
+
+  // A new draft for the id lives beside it, and a second draft set aside in the same millisecond
+  // does not replace the first.
+  const next = makeDraft("7", { content: "the answer on the new chain" });
+  await store.saveDraft(next);
+  const again = await store.setAside("7");
+  expect(again).toBe("7.orphaned-1793700000001.json");
+  expect((await readdir(draftsDir)).sort()).toEqual([kept, again]);
+  expect(await readFile(join(draftsDir, kept ?? ""), "utf8")).toBe(before);
+  expect(JSON.parse(await readFile(join(draftsDir, again ?? ""), "utf8"))).toEqual(next);
+  clock.mockRestore();
+});
+
+test("set_aside_with_no_draft_does_nothing", async () => {
+  const store = createStateStore(dir);
+
+  // Nothing to set aside: no draft, no directory made for it.
+  expect(await store.setAside("7")).toBeNull();
+  expect(await readdir(root)).toEqual([]);
+
+  // Another task's draft is left alone, and so is a bad task id's path.
+  await store.saveDraft(makeDraft("8"));
+  expect(await store.setAside("7")).toBeNull();
+  expect(await readdir(draftsDir)).toEqual(["8.json"]);
+  await expect(store.setAside("../x")).rejects.toThrow(/invalid task id/);
+});
+
+test("a_file_that_is_not_a_draft_is_set_aside_unread", async () => {
+  // The caller that sets a draft aside has read it already, but a file that cannot be read is still
+  // a file that holds what may be recovered: it is moved and not looked into.
+  const store = createStateStore(dir);
+  await mkdir(draftsDir, { recursive: true });
+  await writeFile(join(draftsDir, "9.json"), "{ half a draft");
+
+  const kept = await store.setAside("9");
+
+  expect(kept).toMatch(/^9\.orphaned-\d+\.json$/);
+  expect(await readFile(join(draftsDir, kept ?? ""), "utf8")).toBe("{ half a draft");
+  expect(await store.getDraft("9")).toBeNull();
+});
+
+test("a_set_aside_that_fails_leaves_the_draft_where_it_was", async () => {
+  const store = createStateStore(dir);
+  const draft = makeDraft("7");
+  await store.saveDraft(draft);
+  const killed = new Error("killed before the rename");
+  vi.mocked(rename).mockRejectedValueOnce(killed);
+
+  await expect(store.setAside("7")).rejects.toBe(killed);
+
+  expect(await store.getDraft("7")).toEqual(draft);
+  expect(await readdir(draftsDir)).toEqual(["7.json"]);
+});
+
+test("stale_reason_says_when_a_draft_is_another_tasks", () => {
+  const draft = {
+    ...makeDraft("7"),
+    contractId: "tender.testnet",
+    taskCreatedAt: "1793700000000000000",
+  };
+
+  // The same contract and the same task: nothing says it is not this task's.
+  expect(staleReason(draft, "tender.testnet", "1793700000000000000")).toBeNull();
+  // The task is not known (the API could not say): the contract alone is judged.
+  expect(staleReason(draft, "tender.testnet")).toBeNull();
+
+  // Another contract: the reason names both.
+  expect(staleReason(draft, "tender2.testnet", "1793700000000000000")).toMatch(
+    /tender\.testnet.*tender2\.testnet/,
+  );
+  // The same contract and another creation time is a chain that was started again.
+  expect(staleReason(draft, "tender.testnet", "1793800000000000000")).toMatch(
+    /created at another time/,
+  );
+
+  // A draft that records less cannot be judged by what it does not record.
+  const { contractId: _contract, ...noContract } = draft;
+  expect(staleReason(noContract, "other.testnet", "1793700000000000000")).toBeNull();
+  const { taskCreatedAt: _created, ...noCreated } = draft;
+  expect(staleReason(noCreated, "tender.testnet", "1793800000000000000")).toBeNull();
+  expect(staleReason(makeDraft("7"), "tender.testnet", "1793800000000000000")).toBeNull();
 });
 
 test("rejects_task_ids_that_are_not_u64_decimals", async () => {

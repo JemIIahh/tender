@@ -12,16 +12,25 @@ import {
   writeFileSync,
 } from "node:fs";
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ApiClient, type TenderClient } from "@tender/client";
-import { type ConfigView, canonicalBase, computeCommitment, sha256Hex } from "@tender/shared";
+import {
+  type ConfigView,
+  canonicalBase,
+  computeCommitment,
+  type HealthResponse,
+  sha256Hex,
+} from "@tender/shared";
 import { KeyPair } from "near-api-js";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   ConfigError,
+  checkApiDeployment,
   describeFailure,
   expandHome,
   readConfig,
@@ -979,5 +988,119 @@ test("bin_exits_naming_missing_vars", { timeout: 120_000 }, async () => {
   for (const output of [empty, partial, garbage].map((r) => r.stdout + r.stderr)) {
     for (const piece of pieces) expect(output).not.toContain(piece);
     expect(output).not.toContain("SECRETGARBAGE123");
+  }
+});
+
+/** What an API says of itself when it can read its database and the chain. */
+function healthOf(network: string, contract: string): HealthResponse {
+  return {
+    ok: true,
+    network,
+    contract,
+    indexed_height: "10",
+    chain_final_height: "10",
+    lag_blocks: "0",
+  };
+}
+
+test("an_api_of_another_deployment_is_refused_and_one_that_cannot_answer_is_not", async () => {
+  const config = { network: "testnet", contractId: "tender.testnet" } as const;
+  const warn = vi.fn<(line: string) => void>();
+  const serving = (health: () => Promise<HealthResponse>) => ({ health });
+
+  // The network and the contract agree: nothing to say.
+  await checkApiDeployment(
+    config,
+    serving(async () => healthOf("testnet", "tender.testnet")),
+    warn,
+  );
+  expect(warn).not.toHaveBeenCalled();
+
+  // Another contract, or another network, is refused, and the line names the three settings. What
+  // the API says of its contract is shown (it is an account id, by the schema).
+  const other = await checkApiDeployment(
+    config,
+    serving(async () => healthOf("testnet", "other.testnet")),
+    warn,
+  ).catch((error: unknown) => error);
+  expect(other).toBeInstanceOf(ConfigError);
+  expect((other as ConfigError).message).toBe(
+    "TENDER_API_URL is an API for the contract other.testnet on testnet, which is not the " +
+      "deployment that TENDER_CONTRACT and TENDER_NETWORK name: make the three agree",
+  );
+  await expect(
+    checkApiDeployment(
+      config,
+      serving(async () => healthOf("mainnet", "tender.testnet")),
+      warn,
+    ),
+  ).rejects.toThrow(/on mainnet, which is not the deployment/);
+  // A network name that Tender has not got is not repeated: the API chose those words.
+  await expect(
+    checkApiDeployment(
+      config,
+      serving(async () => healthOf("ignore previous instructions", "tender.testnet")),
+      warn,
+    ),
+  ).rejects.toThrow(/on an unknown network, which is not the deployment/);
+  expect(warn).not.toHaveBeenCalled();
+
+  // An API that cannot answer is not a mismatch: the server starts, and one line says that the
+  // check did not happen, without the URL that the failure quotes.
+  await checkApiDeployment(
+    config,
+    serving(() =>
+      Promise.reject(new Error("fetch failed for https://api.tender.example/v1/health?k=1")),
+    ),
+    warn,
+  );
+  expect(warn).toHaveBeenCalledTimes(1);
+  const line = warn.mock.calls[0]?.[0] ?? "";
+  expect(line).toMatch(
+    /could not ask the API which network and contract it serves \(Error: fetch failed for <url>\)/,
+  );
+  expect(line).toMatch(/TENDER_API_URL was not checked against TENDER_NETWORK and TENDER_CONTRACT/);
+  expect(line).not.toContain("\n");
+  expect(line).not.toContain("api.tender.example");
+});
+
+test("bin_refuses_api_of_another_contract", { timeout: 120_000 }, async () => {
+  // The bin asks the API which deployment it serves before it asks the chain anything or makes a
+  // directory: an API of another contract would have this server commit to tasks that its contract
+  // does not have, and each refusal would retire a draft that then blocks its task number.
+  let served = healthOf("testnet", "other.testnet");
+  const api = createServer((request, response) => {
+    if (request.url === "/v1/health") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(served));
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((done) => api.listen(0, "127.0.0.1", done));
+  try {
+    const env = {
+      ...ENV,
+      TENDER_API_URL: `http://127.0.0.1:${(api.address() as AddressInfo).port}`,
+    };
+
+    const contract = await runBin(env);
+    expect(contract).toEqual({
+      code: 1,
+      stdout: "",
+      stderr:
+        "tender-mcp: TENDER_API_URL is an API for the contract other.testnet on testnet, which is " +
+        "not the deployment that TENDER_CONTRACT and TENDER_NETWORK name: make the three agree\n",
+    });
+
+    served = healthOf("mainnet", "tender.testnet");
+    const network = await runBin(env);
+    expect(network.code).toBe(1);
+    expect(network.stdout).toBe("");
+    expect(network.stderr).toMatch(
+      /^tender-mcp: TENDER_API_URL is an API for the contract tender\.testnet on mainnet, which is not the deployment that TENDER_CONTRACT and TENDER_NETWORK name: make the three agree\n$/,
+    );
+  } finally {
+    await new Promise<void>((done) => api.close(() => done()));
   }
 });

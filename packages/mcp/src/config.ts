@@ -2,7 +2,13 @@ import { lstatSync, readlinkSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import type { Signer, TenderClient } from "@tender/client";
-import { AccountIdSchema, canonicalBase, NETWORKS, type NetworkId } from "@tender/shared";
+import {
+  AccountIdSchema,
+  canonicalBase,
+  NETWORKS,
+  type NetworkId,
+  type TenderApi,
+} from "@tender/shared";
 import { KeyPair, type KeyPairString } from "near-api-js";
 import { urlCredentials } from "./secrets";
 import { defaultStateDir } from "./state";
@@ -415,6 +421,42 @@ export function readConfig(env: Env, home: string = homedir()): McpConfig {
     ...(judgeAccount !== undefined && { judgeAccount }),
     ...(token !== undefined && { token }),
   };
+}
+
+/**
+ * Refuses to go on with an API that serves another deployment than the environment names: the
+ * network and the contract in the API's `/health` are compared with `TENDER_NETWORK` and
+ * `TENDER_CONTRACT`. Without this, a server pointed at the wrong API commits to tasks that the
+ * contract it signs for does not have, and each refusal retires a draft that then blocks its task
+ * number once the setting is put right. The refusal names the three variables and not their values;
+ * what the API says of itself is a contract (an account id, by the schema) and a network that is
+ * shown only if it is one of Tender's.
+ *
+ * An API that cannot answer is not a mismatch, and does not keep the server from starting: the
+ * server's tools answer for the API themselves, and `warn` is told, in one line, that the check
+ * did not happen.
+ */
+export async function checkApiDeployment(
+  config: Pick<McpConfig, "network" | "contractId">,
+  api: Pick<TenderApi, "health">,
+  warn: (line: string) => void,
+): Promise<void> {
+  let served: Awaited<ReturnType<TenderApi["health"]>>;
+  try {
+    served = await api.health();
+  } catch (error) {
+    warn(
+      `could not ask the API which network and contract it serves (${describeFailure(error)}), ` +
+        "so TENDER_API_URL was not checked against TENDER_NETWORK and TENDER_CONTRACT",
+    );
+    return;
+  }
+  if (served.network === config.network && served.contract === config.contractId) return;
+  const network = Object.hasOwn(NETWORKS, served.network) ? served.network : "an unknown network";
+  throw new ConfigError(
+    `TENDER_API_URL is an API for the contract ${served.contract} on ${network}, which is not the ` +
+      "deployment that TENDER_CONTRACT and TENDER_NETWORK name: make the three agree",
+  );
 }
 
 /**

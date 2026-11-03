@@ -230,6 +230,15 @@ test("agent_started_reaches_the_poster_and_the_agents_owner_chats", async () => 
   expect(await who(ALERT.agent_started)).toEqual(names("poster", "bot1", "acme"));
 });
 
+test("a_later_starter_reaches_its_owners_and_not_the_poster", async () => {
+  // The notifier sets `posterHears` to false after a task's first few starters. Not set means that
+  // the poster hears, as above.
+  expect(await who({ ...ALERT.agent_started, posterHears: false })).toEqual(names("acme", "bot1"));
+  expect(await who({ ...ALERT.agent_started, posterHears: true })).toEqual(
+    names("poster", "bot1", "acme"),
+  );
+});
+
 test("entry_committed_reaches_the_poster_only", async () => {
   expect(await who(ALERT.entry_committed)).toEqual(names("poster"));
 });

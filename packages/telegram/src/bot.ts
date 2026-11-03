@@ -67,6 +67,17 @@ const WATCH_LOCK = 0x57415443;
 const NS_PER_MS = 1_000_000n;
 
 /**
+ * How long one request to the Bot API may take before it fails. grammY's own limit is 500 seconds,
+ * which a hung connection would hold the notifier for. It is still above the 30 seconds that a long
+ * poll waits for updates.
+ */
+const REQUEST_TIMEOUT_SECONDS = 60;
+/** How many times a request that got a flood wait is sent again. */
+const FLOOD_WAIT_RETRIES = 3;
+/** The longest flood wait the bot sits out; a request told to wait longer fails at once. */
+const FLOOD_WAIT_MAX_SECONDS = 60;
+
+/**
  * The bot behind the Telegram alerts: it links a chat to a NEAR account and lets the chat watch
  * tags, mute itself and look at its state. It sends nothing on its own; the notifier does that.
  *
@@ -90,22 +101,45 @@ export function createBot(deps: BotDeps): Bot {
 
   const bot = new Bot(deps.token, {
     botInfo: deps.botInfo,
-    ...(deps.apiRoot !== undefined && { client: { apiRoot: deps.apiRoot } }),
+    client: {
+      timeoutSeconds: REQUEST_TIMEOUT_SECONDS,
+      ...(deps.apiRoot !== undefined && { apiRoot: deps.apiRoot }),
+    },
   });
   // The throttler is installed last, so it is outermost and spaces messages out before they go
   // anywhere; autoRetry inside it waits out a flood wait without giving up the call's place.
-  bot.api.config.use(autoRetry());
+  //
+  // autoRetry sends a request again only when Telegram answered a flood wait (a 429) and asks for
+  // at most `FLOOD_WAIT_MAX_SECONDS`: that answer says Telegram took nothing, so the repeat cannot
+  // double a message. A request that failed any other way may have been taken all the same: a
+  // connection that broke, or timed out, or a 5xx from something in front of Telegram, after
+  // `sendMessage` went through. The notifier claims each send before it makes it and never sends
+  // again, to keep to one message per alert, and a transport that repeated such a request behind
+  // its back would undo that. So those failures reach the caller, which loses the message rather
+  // than doubles it. The waits are bounded as well, since the notifier sends one message at a time.
+  // (grammY's start-up and its long polling retry network errors themselves, apart from this.)
+  bot.api.config.use(
+    autoRetry({
+      maxRetryAttempts: FLOOD_WAIT_RETRIES,
+      maxDelaySeconds: FLOOD_WAIT_MAX_SECONDS,
+      rethrowHttpErrors: true,
+      rethrowInternalServerErrors: true,
+    }),
+  );
   bot.api.config.use(apiThrottler());
 
   // The error boundary: a failure anywhere below is logged and dropped. `bot.catch` would not do,
   // since it covers long polling only: `handleUpdate` always throws, and a webhook that answers
   // Telegram with an error gets the same update sent again. The log names the update, not what it
-  // said, because a message can hold a stranger's words and, for /start, a nonce.
+  // said, because a message can hold a stranger's words and, for /start, a nonce. It names the
+  // failure by `describeFailure`, never by the error itself: see there.
   bot.use(async (ctx, next) => {
     try {
       await next();
     } catch (error) {
-      console.error(`telegram bot: update ${ctx.update.update_id} failed:`, error);
+      console.error(
+        `telegram bot: update ${ctx.update.update_id} failed: ${describeFailure(error)}`,
+      );
     }
   });
 
@@ -290,6 +324,19 @@ export function createBot(deps: BotDeps): Bot {
   });
 
   return bot;
+}
+
+/**
+ * A failure as the log shows it: the error's name, the Bot API's code if it answered one, and its
+ * message. Never the error object. An `HttpError` holds the error of the request that failed, whose
+ * message can quote the request's URL, and the URL holds the bot's token; a `GrammyError` holds the
+ * payload that was sent, which is the text of a reply. Their messages are made not to quote either.
+ */
+function describeFailure(error: unknown): string {
+  if (!(error instanceof Error)) return "a value that is not an Error was thrown";
+  const code =
+    "error_code" in error && typeof error.error_code === "number" ? ` ${error.error_code}` : "";
+  return `${error.name}${code}: ${error.message}`;
 }
 
 /** Replies to the message in `ctx` with `html`, which must already be escaped. */
