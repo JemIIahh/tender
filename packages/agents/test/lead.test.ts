@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TenderError, type TxResult } from "@tender/client";
@@ -231,6 +231,8 @@ function solverOf(
     client: world.client,
     api: world.api,
     judgeAccount: JUDGE,
+    token: TOKEN,
+    posters: [POSTER],
     state,
     pollMs: 1,
     signal: stop.signal,
@@ -396,6 +398,7 @@ describe("what the lead will not do", () => {
     expect(await solverOf(world, {}, lines).solve(world.ctx)).toBeNull();
     expect(world.events).toEqual([]);
     expect(lines.join("\n")).toMatch(/commit deadline/);
+    expect(lines.filter((line) => line.includes("declining task 10"))).toHaveLength(1);
   });
 
   test("a_parent_that_leaves_the_windows_but_not_the_minute_in_hand_is_left_alone", async () => {
@@ -470,6 +473,170 @@ describe("what the lead will not do", () => {
   });
 });
 
+// A swarm task is tagged by whoever posts it, so the tag alone is no reason to spend the lead's
+// vault: a stranger could post a tiny parent and have the lead hire children for it, up to the caps
+// of its delegate key. The lead takes a parent on only if it pays, from a poster and a verifier it
+// trusts, in the token of its key, and with room for the sub-tasks. Each check below refuses on its
+// own: the parent it refuses is right in every other way.
+describe("what the lead will not take on", () => {
+  const STRANGER = "stranger.test.near";
+
+  /** `ctx` with some fields of its task replaced. */
+  const withTask = (ctx: TaskContext, changes: Partial<TaskContext["task"]>): TaskContext => ({
+    ...ctx,
+    task: { ...ctx.task, ...changes },
+  });
+
+  /** Declines `change` of a parent that is otherwise fine, and checks nothing else happened. */
+  async function declined(
+    changes: Partial<TaskContext["task"]>,
+    more: { commitSecs?: number } = {},
+  ): Promise<string[]> {
+    const world = buildWorld(more);
+    const lines: string[] = [];
+    const answer = await solverOf(world, {}, lines).solve(withTask(world.ctx, changes));
+    expect(answer).toBeNull();
+    // Nothing on chain, nothing uploaded, nothing posted, no draft kept.
+    expect(world.events).toEqual([]);
+    expect(world.children).toHaveLength(0);
+    expect(await state.getDraft(String(PARENT_ID))).toBeNull();
+    const refusals = lines.filter((line) => line.includes(`declining task ${PARENT_ID}`));
+    expect(refusals, lines.join("\n")).toHaveLength(1);
+    return refusals;
+  }
+
+  test("a_parent_that_pays_less_than_the_sub_tasks_cost_is_refused", async () => {
+    // 1.00 tUSDC less its 5% fee is 0.95, and the three sub-tasks cost 6.00.
+    const [line] = await declined({ reward: "1000000" });
+    expect(line).toMatch(/0\.95/);
+    expect(line).toMatch(/6\.00/);
+    expect(line).toMatch(/profit/);
+  });
+
+  test("a_parent_whose_payout_only_equals_the_cost_is_refused_and_one_unit_more_is_taken", async () => {
+    // 6_315_789 less a fee of floor(x * 500 / 10_000) = 315_789 is exactly 6_000_000.
+    await declined({ reward: "6315789" });
+    // One unit more leaves 6_000_001 after the same fee, which is above the cost.
+    const world = buildWorld();
+    const answer = await solverOf(world).solve(withTask(world.ctx, { reward: "6315790" }));
+    expect(answer).not.toBeNull();
+    expect(world.children).toHaveLength(3);
+  });
+
+  test("the_fee_is_the_one_the_parent_was_posted_with", async () => {
+    // 6.60 tUSDC clears the cost at a fee of 5%, and not at 10%.
+    await declined({ reward: "6600000", fee_bps: 1000 });
+    const world = buildWorld();
+    const answer = await solverOf(world).solve(withTask(world.ctx, { reward: "6600000" }));
+    expect(answer).not.toBeNull();
+  });
+
+  test("a_parent_in_another_token_than_the_delegate_key_s_is_refused", async () => {
+    const [line] = await declined({ token: "other.test.near" });
+    expect(line).toContain("other.test.near");
+    expect(line).toContain(TOKEN);
+  });
+
+  test("a_token_whose_decimals_are_unknown_is_refused_not_guessed", async () => {
+    const world = buildWorld();
+    const lines: string[] = [];
+    const solver = solverOf(world, { token: "weird.test.near" }, lines);
+    expect(await solver.solve(withTask(world.ctx, { token: "weird.test.near" }))).toBeNull();
+    expect(world.events).toEqual([]);
+    expect(lines.join("\n")).toMatch(/declining task 10: .*decimals/);
+  });
+
+  test("a_parent_verified_by_a_stranger_is_refused", async () => {
+    const [line] = await declined({ verifier: STRANGER });
+    expect(line).toContain(STRANGER);
+    expect(line).toContain(JUDGE);
+  });
+
+  test("a_parent_posted_by_a_stranger_is_refused", async () => {
+    const [line] = await declined({ poster: STRANGER });
+    expect(line).toContain(STRANGER);
+  });
+
+  test("a_parent_with_too_little_time_is_refused", async () => {
+    const [line] = await declined({}, { commitSecs: 100 });
+    expect(line).toMatch(/commit deadline/);
+  });
+
+  test("a_parent_with_room_for_the_first_part_and_not_for_the_last_is_refused_before_anything_is_spent", async () => {
+    // The first part takes 30 s and the second 1500 s. The lead looks at every part before it
+    // commits, not at the first alone, or it would hire for one and leave the parent unanswered.
+    const pack = mkdtempSync(join(tmpdir(), "lead-mixed-"));
+    dirs.push(pack);
+    cpSync(CHILDREN, pack, { recursive: true });
+    rmSync(join(pack, "03-event-tally"), { recursive: true });
+    const first = join(pack, "01-gas-ledger", "task.json");
+    writeFileSync(
+      first,
+      JSON.stringify({
+        ...JSON.parse(readFileSync(first, "utf8")),
+        commit_secs: 10,
+        reveal_secs: 10,
+        pick_secs: 10,
+        fallback_secs: 10,
+      }),
+    );
+    const world = buildWorld({ commitSecs: 200 });
+    const lines: string[] = [];
+    const solver = solverOf(world, { seedsDir: pack }, lines);
+    expect(await solver.solve(world.ctx)).toBeNull();
+    expect(world.events).toEqual([]);
+    expect(lines.join("\n")).toMatch(/declining task 10: .*02-key-audit/);
+  });
+
+  test("a_parent_that_fails_several_checks_is_refused_with_one_line", async () => {
+    const [line] = await declined({
+      poster: STRANGER,
+      verifier: STRANGER,
+      token: "other.test.near",
+      reward: "1",
+    });
+    expect(line).toContain(STRANGER);
+  });
+
+  test("a_parent_that_passes_every_check_is_taken_on", async () => {
+    const world = buildWorld();
+    const lines: string[] = [];
+    expect(await solverOf(world, {}, lines).solve(world.ctx)).not.toBeNull();
+    expect(lines.some((line) => line.includes("declining"))).toBe(false);
+  });
+
+  test("the_posters_default_to_TEAM_ACCOUNTS", async () => {
+    const env = { TEAM_ACCOUNTS: ` ${POSTER}, ${LEAD} ,` };
+    const taken = buildWorld();
+    const solver = solverOf(taken, { posters: undefined, env });
+    expect(await solver.solve(taken.ctx)).not.toBeNull();
+
+    const refused = buildWorld();
+    const lines: string[] = [];
+    const other = solverOf(refused, { posters: undefined, env }, lines);
+    expect(await other.solve(withTask(refused.ctx, { poster: STRANGER }))).toBeNull();
+    expect(refused.events).toEqual([]);
+    expect(lines.join("\n")).toContain(STRANGER);
+  });
+
+  test("a_lead_with_no_posters_is_a_mistake_found_when_the_solver_is_made", () => {
+    const world = buildWorld();
+    const options = { ...solverOptions(world), posters: undefined };
+    expect(() => createLeadSolver({ ...options, env: {} })).toThrow(/TEAM_ACCOUNTS/);
+    expect(() => createLeadSolver({ ...options, posters: [], env: {} })).toThrow(/TEAM_ACCOUNTS/);
+    expect(() => createLeadSolver({ ...options, env: { TEAM_ACCOUNTS: " , " } })).toThrow(
+      /TEAM_ACCOUNTS/,
+    );
+  });
+
+  test("a_poster_that_is_not_an_account_id_is_a_mistake_found_when_the_solver_is_made", () => {
+    const world = buildWorld();
+    expect(() =>
+      createLeadSolver({ ...solverOptions(world), posters: ["Not An Account"] }),
+    ).toThrow(/account id/);
+  });
+});
+
 describe("the solver itself", () => {
   test("is_named_the_lead_and_is_not_a_scripted_one", () => {
     const solver = solverOf(buildWorld());
@@ -486,6 +653,8 @@ function solverOptions(
     client: world.client,
     api: world.api,
     judgeAccount: JUDGE,
+    token: TOKEN,
+    posters: [POSTER],
     state,
     pollMs: 1,
   };

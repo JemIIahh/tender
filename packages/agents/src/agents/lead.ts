@@ -4,9 +4,11 @@ import { join } from "node:path";
 import type { TenderClient } from "@tender/client";
 import type { Draft, StateStore } from "@tender/mcp";
 import {
+  AccountIdSchema,
   BriefSchema,
   canonicalJson,
   computeCommitment,
+  formatTokenAmount,
   HeldoutSchema,
   heldoutMatchesCriteria,
   PublicCriteriaSchema,
@@ -39,6 +41,17 @@ import type { Solver, TaskContext } from "../types";
 //    that, which replaces the placeholder (a second commit by an entrant replaces its commitment),
 //    saves a new draft over the placeholder's, and reveals it once the parent's reveal window opens.
 //    That commit is the lead's re-commit, and it has to land before the parent's commit deadline.
+//
+// The tag is no reason to spend. Anyone can post a task with it, and the lead's vault is what pays
+// for the sub-tasks, so before it does anything the lead takes the parent through five checks and
+// declines (answers null, commits nothing, uploads nothing, logs one line) unless all of them hold:
+//
+// 1. its poster is on the lead's list of posters (`posters`, by default `TEAM_ACCOUNTS`);
+// 2. its verifier is the Judge the lead was given (`judgeAccount`);
+// 3. it pays in the token of the lead's delegate key (`token`);
+// 4. what it pays after its platform fee is more than the sub-tasks cost, so that a parent the lead
+//    wins leaves it in profit (the fee is the task's own `fee_bps`, taken as the contract takes it);
+// 5. every sub-task can be due before the parent's commit deadline, with room to spare (below).
 //
 // Time is the one hard constraint. A sub-task's pick deadline may not be later than its parent's
 // commit deadline (the contract, I12), and the lead needs time left to assemble and commit. So the
@@ -91,8 +104,23 @@ export interface LeadSolverOptions {
   client: LeadChain;
   /** Signed in as the lead: the uploads are the poster's. */
   api: LeadApi;
-  /** The account that a sub-task's `"judge"` verifier means. */
+  /**
+   * The account that a sub-task's `"judge"` verifier means, and the only verifier of a parent the
+   * lead takes on.
+   */
   judgeAccount: string;
+  /**
+   * The token of the lead's delegate key, as an account id: the only token of a parent the lead
+   * takes on, and the one its sub-tasks are paid in.
+   */
+  token: string;
+  /**
+   * The posters whose parents the lead takes on. Default: the accounts of `TEAM_ACCOUNTS` in `env`.
+   * A lead with none is a mistake, found when it is made, and not a lead that declines everything.
+   */
+  posters?: readonly string[];
+  /** Where `TEAM_ACCOUNTS` is read from when `posters` is not given. Default: `process.env`. */
+  env?: Readonly<Record<string, string | undefined>>;
   /** Where the lead's drafts live: the same store the runner uses, so the runner reveals them. */
   state: StateStore;
   /** Replaces the windows of every sub-task, for a demo that cannot wait a whole phase. */
@@ -295,6 +323,26 @@ interface Hired {
   result?: Uint8Array;
 }
 
+/** The posters a lead works for: the given ones, else `TEAM_ACCOUNTS`. Throws if there are none. */
+function postersOf(o: LeadSolverOptions): readonly string[] {
+  const listed =
+    o.posters ??
+    (o.env ?? process.env).TEAM_ACCOUNTS?.split(",")
+      .map((account) => account.trim())
+      .filter((account) => account !== "") ??
+    [];
+  if (listed.length === 0) {
+    throw new Error(
+      "the lead has no posters to work for: pass `posters`, or set TEAM_ACCOUNTS to account ids separated by commas",
+    );
+  }
+  const bad = listed.find((account) => !AccountIdSchema.safeParse(account).success);
+  if (bad !== undefined) {
+    throw new Error(`the lead's posters must be account ids; ${JSON.stringify(bad)} is not one`);
+  }
+  return listed;
+}
+
 export function createLeadSolver(o: LeadSolverOptions): Solver {
   const { client, api, state } = o;
   const log = (line: string) => (o.log ?? console.log)(`lead: ${line}`);
@@ -302,6 +350,7 @@ export function createLeadSolver(o: LeadSolverOptions): Solver {
   const pollMs = o.pollMs ?? DEFAULT_POLL_MS;
   // Read now, so a pack that is wrong fails when the lead is made and not on the first parent.
   const specs = readChildren(o.seedsDir);
+  const posters = postersOf(o);
 
   /** The windows a sub-task is posted with. */
   const windowsOf = (spec: ChildSpec): ChildWindows => o.windows ?? spec.windows;
@@ -320,6 +369,49 @@ export function createLeadSolver(o: LeadSolverOptions): Solver {
       `part ${spec.slug} needs ${needs} s from its post to its pick deadline, and the parent's commit deadline ` +
       `leaves ${left < 0n ? 0 : left} s less a ${marginSecs} s margin, so it is not posted`
     );
+  }
+
+  /**
+   * Why the lead will not take `ctx` on, or null if it will. The first check that fails speaks, so
+   * a refusal is one line. Nothing here touches the chain but a read of its clock, and that comes
+   * last.
+   */
+  async function declines(ctx: TaskContext): Promise<string | null> {
+    const { poster, verifier, token, reward, fee_bps: feeBps } = ctx.task;
+    if (!posters.includes(poster)) return `its poster ${poster} is not one the lead works for`;
+    if (verifier !== o.judgeAccount) {
+      return `its verifier ${verifier} is not the Judge, ${o.judgeAccount}`;
+    }
+    if (token !== o.token) {
+      return `it pays in ${token}, and the lead's delegate key spends ${o.token}`;
+    }
+    const meta = tokenMeta(token, client.network);
+    if (meta.symbol === token) return `the decimals of ${token} are unknown on ${client.network}`;
+
+    // The contract takes `reward * fee_bps / 10_000`, rounded down, and the winner gets the rest.
+    const gross = BigInt(reward);
+    const payout = gross - (gross * BigInt(feeBps)) / 10_000n;
+    const cost = specs.reduce(
+      (sum, spec) => sum + parseTokenAmount(spec.reward, meta.decimals),
+      0n,
+    );
+    if (payout <= cost) {
+      const show = (amount: bigint) => `${formatTokenAmount(amount, meta.decimals)} ${meta.symbol}`;
+      return (
+        `it pays ${show(payout)} after its ${feeBps / 100}% fee, and its ${specs.length} sub-tasks ` +
+        `cost ${show(cost)}, which leaves the lead no profit`
+      );
+    }
+
+    // Every part, not the first alone: the lead must not commit and hire for some of the parts and
+    // then find it has no time for the rest.
+    const now = await client.blockTimestampNs();
+    const deadline = BigInt(ctx.task.commit_deadline);
+    for (const spec of specs) {
+      const why = room(now, deadline, spec);
+      if (why !== null) return why;
+    }
+    return null;
   }
 
   /** Commits the placeholder and saves it as the parent's draft. */
@@ -416,12 +508,10 @@ export function createLeadSolver(o: LeadSolverOptions): Solver {
     if (account === undefined) throw new Error(NO_SIGNER);
     const deadline = BigInt(ctx.task.commit_deadline);
 
-    // Nothing is committed for a parent that has no time for the first part.
-    const first = specs[0];
-    const early =
-      first === undefined ? null : room(await client.blockTimestampNs(), deadline, first);
-    if (early !== null) {
-      log(`leaving task ${ctx.task.id} alone: ${early}`);
+    // Nothing is committed, uploaded or posted for a parent the lead declines.
+    const declined = await declines(ctx);
+    if (declined !== null) {
+      log(`declining task ${ctx.task.id}: ${declined}`);
       return null;
     }
 

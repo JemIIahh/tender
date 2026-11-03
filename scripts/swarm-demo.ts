@@ -56,8 +56,11 @@ import { seed } from "./seed";
  *   own caps, and cannot pick.
  * - The poster posts a **parent** task: a three-part research pack for 10 tUSDC, judged by the
  *   Judge on held-out checks of the whole document.
- * - The lead enters the parent with a placeholder (a sub-task can name a parent only if its poster
- *   has an entry on it), posts three **sub-tasks** under it with the delegate key (2 tUSDC each, one
+ * - The lead takes the parent on only because it should: the poster is the one it works for, the
+ *   Judge verifies it, it pays in the token of the lead's key, and its 9.50 tUSDC after the fee is
+ *   more than the 6.00 tUSDC the sub-tasks cost (a parent that fails one of these is declined, with
+ *   nothing committed or spent). It then enters the parent with a placeholder (a sub-task can name a
+ *   parent only if its poster has an entry on it), posts three **sub-tasks** under it with the delegate key (2 tUSDC each, one
  *   for each part), and waits for them. A fourth hire is tried, to show the cap: the contract refuses
  *   it with `E_AUTH`.
  * - Alice and bob enter the sub-tasks. Both enter all three, one with the right answer and one with a
@@ -432,6 +435,10 @@ async function swarm(h: Harness): Promise<void> {
         client: leadClient,
         api: leadApi,
         judgeAccount: judge.accountId,
+        // The lead takes on a parent only from the poster, in the token of its key, judged by the
+        // Judge, and only if it pays more after its fee than the sub-tasks cost.
+        token,
+        posters: [poster.accountId],
         state: leadState,
         windows: CHILD_WINDOWS,
         pollMs: 1_000,
