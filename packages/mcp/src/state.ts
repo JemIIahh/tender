@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
+import { access, chmod, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
@@ -18,7 +18,10 @@ import { z } from "zod";
 // - private: its directories are 0700 and its files 0600;
 // - crash safe: a draft is written whole to a temp file and renamed over the old one, so a crash
 //   or a failed write leaves the old draft or the new one, never half of either;
-// - path safe: the task id becomes part of a file name, so it must be a u64 in decimal first.
+// - path safe: the task id becomes part of a file name, so it must be a u64 in decimal first;
+// - never destroyed by the store on its own account: a draft that is not wanted any more is set
+//   aside under another name, and the file stays, because it holds the only copy of a work and its
+//   salt (`setAside`).
 //
 // The caller picks the directory, and `defaultStateDir` gives the usual one. Calls for one task are
 // expected one after another, as commit and reveal are, and the store does not lock: the MCP tools
@@ -30,6 +33,8 @@ const FILE_MODE = 0o600;
 /** The owner may do anything in a directory of the store, and nobody else may enter it. */
 const DIR_MODE = 0o700;
 const DRAFT_SUFFIX = ".json";
+/** Between the task id and the time, in the name of a draft that was set aside. */
+const ASIDE_INFIX = ".orphaned-";
 
 /**
  * What the agent keeps for one task between its commit and its reveal. Apart from the task id, the
@@ -47,6 +52,21 @@ export interface Draft {
   salt: string;
   /** What the commit puts on chain: the hash of the task id, account, content hash and salt. */
   commitment: string;
+  /**
+   * The contract the task is on, as the server that made the draft was set up. A task id counts up
+   * from 1 on each contract, and a chain that is started again (every sandbox, a redeploy) hands
+   * the same ids out once more, so a task id names a task only on one contract and one run of it.
+   * Together with `taskCreatedAt` this says whose draft it is (`staleReason`). Unset in a draft
+   * that an older server made, which cannot say.
+   */
+  contractId?: string;
+  /**
+   * When the task was created, in nanoseconds since the epoch as a decimal string, as the API had
+   * it when the draft was made. A task keeps its creation time for good, and the tasks that share
+   * an id on two runs of a chain differ in it. Unset when the API could not be asked then, and in a
+   * draft that an older server made.
+   */
+  taskCreatedAt?: string;
   /** When the commit went through, as an ISO 8601 time. Unset while the commit is in flight. */
   committedAt?: string;
   /** Where the revealed work was uploaded. Unset until the reveal has gone through. */
@@ -80,6 +100,15 @@ export interface StateStore {
    */
   markDead(taskId: string, reason: string): Promise<void>;
   /**
+   * Takes the draft for the task out of use without destroying it: the file is renamed to
+   * `{task id}.orphaned-{time}.json` in the same directory, whole, and the name is returned. After
+   * that `getDraft` finds no draft for the task and `listDrafts` does not list the file (its name is
+   * no task number), so a new draft can be saved for the id. Nothing is read, so a file that is not
+   * a readable draft is set aside as well. Returns null if there was no draft. A name that is taken
+   * is never reused.
+   */
+  setAside(taskId: string): Promise<string | null>;
+  /**
    * Every draft, revealed, dead or not, by task number. A caller that wants the ones still to
    * reveal filters on `revealedUri` and `dead`. Rejects if any file is not a readable draft.
    */
@@ -93,6 +122,8 @@ const DraftSchema: z.ZodType<Draft> = z.object({
   contentHash: z.string(),
   salt: z.string(),
   commitment: z.string(),
+  contractId: z.string().optional(),
+  taskCreatedAt: z.string().optional(),
   committedAt: z.string().optional(),
   revealedUri: z.string().optional(),
   dead: z.object({ reason: z.string(), at: z.string() }).optional(),
@@ -133,6 +164,40 @@ export function isDraftOf(draft: Draft, accountId: string): boolean {
   }
 }
 
+/**
+ * Why `draft` is not the draft of the task as it stands now, or null when nothing says that it is
+ * not. `contractId` is the contract this server is set up for, and `taskCreatedAt` the creation time
+ * of the task as the API has it now, if the caller has asked.
+ *
+ * A draft is for the task it was made for: the same id on the same contract, and the same run of it.
+ * Task ids start at 1 on every contract, and a chain that is started again (every sandbox, a
+ * redeploy) hands them out again, so an old draft can meet a new task with its id. What it records
+ * tells them apart, and a draft is stale when it records a contract other than this server's, or
+ * a creation time other than the task's. A draft that records nothing, or too little to compare, is
+ * not called stale here: that is a draft from before drafts were bound, or one made while the API
+ * was out of reach, and the caller has the chain to ask.
+ */
+export function staleReason(
+  draft: Draft,
+  contractId: string,
+  taskCreatedAt?: string,
+): string | null {
+  if (draft.contractId !== undefined && draft.contractId !== contractId) {
+    return `it was made for the contract ${show(draft.contractId)}, and this server uses ${show(contractId)}`;
+  }
+  if (
+    draft.taskCreatedAt !== undefined &&
+    taskCreatedAt !== undefined &&
+    draft.taskCreatedAt !== taskCreatedAt
+  ) {
+    return (
+      "it was made for a task with this number that was created at another time: a chain that " +
+      "was started again hands out its task numbers once more"
+    );
+  }
+  return null;
+}
+
 /** Orders task ids as numbers, so that "2" comes before "10". */
 function compareTaskIds(a: string, b: string): number {
   const x = BigInt(a);
@@ -144,6 +209,17 @@ function compareTaskIds(a: string, b: string): number {
 /** Whether `error` is a file system error with this code, such as `ENOENT`. */
 function hasCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+/** Whether anything is at `path`. */
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch (error) {
+    if (hasCode(error, "ENOENT")) return false;
+    throw error;
+  }
 }
 
 /**
@@ -193,6 +269,19 @@ async function syncDirectory(path: string): Promise<void> {
 }
 
 /**
+ * The directory that holds every default state directory, for each network and each account:
+ * `{home}/.tender`, the parent of what `defaultStateDir` gives. `home` must be an absolute path (see
+ * `defaultStateDir`).
+ */
+export function defaultStateRoot(home: string = homedir()): string {
+  // An empty or relative home would put the state wherever the process happens to run.
+  if (!isAbsolute(home)) {
+    throw new Error(`the home directory must be an absolute path, got ${show(home)}`);
+  }
+  return join(home, ".tender");
+}
+
+/**
  * Where an agent's state lives unless the operator names another directory:
  * `{home}/.tender/{network}/{account}`. Each network and each account gets its own, so two agents
  * on one machine never share drafts. It returns a path and creates nothing: the store makes the
@@ -220,12 +309,15 @@ export function defaultStateDir(
   if (!AccountIdSchema.safeParse(account).success) {
     throw new Error(`invalid account ${show(account)}: expected a NEAR account id`);
   }
-  // An empty or relative home would put the state wherever the process happens to run.
-  if (!isAbsolute(home)) {
-    throw new Error(`the home directory must be an absolute path, got ${show(home)}`);
-  }
-  return join(home, ".tender", network, account);
+  return join(defaultStateRoot(home), network, account);
 }
+
+/**
+ * The folder, inside a state directory, that holds the drafts: `{dir}/drafts/{taskId}.json`. Every
+ * store has it, whatever its directory is called, so a path with a folder of this name on the way
+ * may be one of a store's.
+ */
+export const DRAFTS_DIR = "drafts";
 
 /**
  * The store for the drafts in `{dir}/drafts/{taskId}.json`. It creates `dir` on the first write,
@@ -239,7 +331,7 @@ export function createStateStore(dir: string): StateStore {
     throw new Error("the state directory must not be empty");
   }
   // Resolved now, so that a later `chdir` cannot move the store.
-  const draftsDir = join(resolve(dir), "drafts");
+  const draftsDir = join(resolve(dir), DRAFTS_DIR);
   const fileOf = (taskId: string) => join(draftsDir, `${taskId}${DRAFT_SUFFIX}`);
 
   async function readDraft(taskId: string): Promise<Draft | null> {
@@ -316,6 +408,26 @@ export function createStateStore(dir: string): StateStore {
       // The first reason is the one that matters: a mark that is repeated must not hide it.
       if (draft.dead !== undefined) return;
       await writeDraft({ ...draft, dead: { reason, at: new Date().toISOString() } });
+    },
+
+    async setAside(taskId) {
+      assertTaskId(taskId);
+      const file = fileOf(taskId);
+      // The time in milliseconds, and the next millisecond if that name is taken: the move is a
+      // rename, which would replace a file of that name, and a draft that was set aside before must
+      // survive this one.
+      for (let at = Date.now(); ; at += 1) {
+        const aside = `${taskId}${ASIDE_INFIX}${at}${DRAFT_SUFFIX}`;
+        if (await exists(join(draftsDir, aside))) continue;
+        try {
+          await rename(file, join(draftsDir, aside));
+        } catch (error) {
+          if (hasCode(error, "ENOENT")) return null;
+          throw error;
+        }
+        await syncDirectory(draftsDir);
+        return aside;
+      }
     },
 
     async listDrafts() {

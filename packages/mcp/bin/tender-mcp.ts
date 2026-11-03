@@ -1,6 +1,13 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ApiClient, TenderClient } from "@tender/client";
-import { describeFailure, readConfig, resolveDefaultToken, secretsOf } from "../src/config";
+import {
+  checkApiDeployment,
+  describeFailure,
+  filesDirWarning,
+  readConfig,
+  resolveDefaultToken,
+  secretsOf,
+} from "../src/config";
 import { detectKeyAccess } from "../src/keys";
 import { createMcpServer } from "../src/server";
 import { createStateStore } from "../src/state";
@@ -9,6 +16,9 @@ import { createStateStore } from "../src/state";
 // environment that `readConfig` lists. stdout belongs to the protocol, so only the transport writes
 // to it: the bin's own lines go to stderr, and never include the key.
 
+/** How long the check of the API's deployment waits: an API that hangs must not hold up the start. */
+const API_CHECK_TIMEOUT_MS = 5_000;
+
 /** Every secret that a failure's text must not carry. Set once the environment is read. */
 let secrets: string[] = [];
 
@@ -16,11 +26,22 @@ async function main(): Promise<void> {
   const config = readConfig(process.env);
   const { accountId } = config.signer;
   secrets = secretsOf(config);
+  // A files directory that nothing can be read from is no fault of the environment, but every
+  // `file_path` would be refused without a word as to why: one line says it.
+  const warning = filesDirWarning(config);
+  if (warning !== undefined) process.stderr.write(`tender-mcp: ${warning}\n`);
 
   // The API client signs in as the agent's account, for the base that `readConfig` has checked the
   // way the client reads it (`canonicalBase`, https or this machine), so this does not throw for
   // anything the environment passed.
   const api = new ApiClient({ baseUrl: config.apiUrl, signer: config.signer });
+  // Before anything is asked of the chain or written to the state: an API of another network or
+  // contract would have this server commit to tasks that the contract it signs for does not have.
+  await checkApiDeployment(
+    config,
+    new ApiClient({ baseUrl: config.apiUrl, timeoutMs: API_CHECK_TIMEOUT_MS }),
+    (line) => process.stderr.write(`tender-mcp: ${line}\n`),
+  );
   const client = new TenderClient({
     network: config.network,
     contractId: config.contractId,
@@ -41,6 +62,7 @@ async function main(): Promise<void> {
     defaultToken,
     judgeAccount: config.judgeAccount,
     filesDir: config.filesDir,
+    stateDir: config.stateDir,
     secrets,
   });
 

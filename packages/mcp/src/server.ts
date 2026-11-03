@@ -69,12 +69,31 @@ export interface McpDeps {
   /**
    * The one directory that `commit_result` may read a file from (P04-R1), as a real path: it is used
    * as it is and never looked up again (P04-R3), so a path with a link in it reads nothing. A file
-   * is read only if it is a regular file whose real path, with every link followed, is inside it.
+   * is read only if it is a regular file whose real path, with every link followed, is inside it
+   * and has no name below it that starts with a dot (a hidden file or folder: `.env`, `.ssh`).
    * Not set means that no file is read at all. The bin gets it from `readConfig`, which looks the
    * directory up once, and accepts only one that nobody but the user (and root) can write to
-   * (P04-R2); a caller that builds the deps by hand answers for both itself.
+   * (P04-R2) and that is neither the home directory nor a directory that holds it; a caller that
+   * builds the deps by hand answers for all of that itself.
    */
   filesDir?: string;
+  /**
+   * The directory the drafts are kept in (the bin passes `TENDER_STATE_DIR`'s). `commit_result`
+   * reads no file inside it, whatever `filesDir` is: a draft file holds another task's unrevealed
+   * work and its salt, and `reveal_result` publishes what a commit took in. Not set means that this
+   * directory is not named; the other places that are kept out (`stateRoot`, and any folder called
+   * `drafts`) are kept out all the same, so a caller that builds the deps by hand and sets
+   * `filesDir` need only name this one. The path need not exist yet, nor be a real path: it is
+   * looked up at each call.
+   */
+  stateDir?: string;
+  /**
+   * The directory that holds the default state directories of every account on this machine,
+   * `~/.tender` (`defaultStateRoot`). `commit_result` reads no file inside it either, whatever
+   * `filesDir` is: another account's drafts are as private as this server's own. Not set means the
+   * default root, and a test says where it is. The path need not exist, nor be a real path.
+   */
+  stateRoot?: string;
   /** How an open file is traced back to a path. Not set means the process's own (the real one). */
   openFiles?: OpenFileLookup;
   /**

@@ -1,6 +1,6 @@
 import type { Db } from "@tender/db";
 import { type NetworkId, TenderEventSchema } from "@tender/shared";
-import { type Bot, GrammyError } from "grammy";
+import { type Bot, GrammyError, HttpError } from "grammy";
 import { type Alert, dedupeKey } from "./alerts";
 import { resolveRecipients } from "./recipients";
 import { type RenderContext, renderAlert } from "./render";
@@ -14,32 +14,55 @@ import { type RenderContext, renderAlert } from "./render";
  *   `winner_paid` and a `voided` `task_voided`. The cursor moves to the last event read once the
  *   batch is done, whether its alerts were sent or not.
  * - The `working` rows of agents that said, in the last 10 minutes, that they started a task:
- *   `agent_started`.
+ *   `agent_started`. The poster hears of the first `POSTER_STARTERS` agents to start a task and no
+ *   more: any account can call start, and a message for each would be a flood. A later starter
+ *   reaches only the chats of its own owners.
  * - The clock, for what no event announces: `reveal_open`, `reveal_closing` and the two
- *   `deadline_reminder`s. Every tick looks at every task and relies on the dedupe below.
+ *   `deadline_reminder`s. Every tick looks at every task and relies on the dedupe below. Each
+ *   reminder is for the stretch before the next one: with an hour to go, "24 h left" is old news,
+ *   so a notifier that comes back from downtime in the last hour sends the 1 h reminder alone.
  *
  * An alert goes to each chat that `resolveRecipients` names. The notifier asks Telegram to send it
- * at most once per chat: the chat's row in `tg_sent` is claimed before the request and a failed
- * send keeps it, so a restart, or two notifiers at once, can lose a message but never make the
- * notifier send one twice. The claim, not the cursor, makes the notifier safe to restart: a tick
- * that dies halfway is run again from the old cursor, and the alerts it already sent are skipped.
+ * at most once per chat: the chat's row in `tg_sent` is claimed before the request, and kept when
+ * a send fails in a way that leaves it unknown whether Telegram took the message. So a restart, or
+ * two notifiers at once, can lose a message but never make the notifier send one twice. The claim,
+ * not the cursor, makes the notifier safe to restart: a tick that dies halfway is run again from
+ * the old cursor, and the alerts it already sent are skipped.
  *
- * The bot's transport is another matter. `createBot` installs `autoRetry`, which repeats a request
- * after a network error or a 5xx answer, so a message that Telegram took but did not confirm can
- * reach a chat twice. The notifier cannot see that; the bot's setup has to settle it.
+ * The bot's transport keeps to that. `createBot` sets `autoRetry` to repeat a request only after a
+ * flood wait (a 429, which says that Telegram took nothing) of up to a minute, three times at most.
+ * A request that failed any other way may have been taken all the same: a connection that broke or
+ * timed out, or a 5xx from something in front of Telegram. It is not repeated, so a message whose
+ * answer was lost fails here, and is never sent again. A request that hangs gives up after a minute.
  *
  * What goes wrong, and what the notifier does about it:
  * - A `webUrl` that task links cannot be made from is refused by `startNotifier` before any tick.
  * - An alert that cannot be rendered or addressed (see `deliver`) is logged and dropped, and the
  *   tick goes on. Its recipients are asked for up to three times first: a blip in the database
  *   fails like a row that cannot be read, and an event alert is not looked at again.
- * - A send that fails is logged and not retried; the bot's `autoRetry` has already waited out a
- *   flood wait. A 403 means the chat blocked the bot, or the bot was kicked: the chat is unlinked,
- *   with a line in the log.
+ * - Telegram answers a send with an error about that message, a 400 say. The alert is lost for that
+ *   chat: the claim is kept, and a line that starts `telegram notifier: alert lost:` names the
+ *   alert's kind and task (never a chat or a token), so that losses can be counted. The tick goes
+ *   on with the next chat. A 403 means the chat blocked the bot, or the bot was kicked: the chat is
+ *   unlinked, with a line in the log.
+ * - The transport to Telegram fails. The tick ends there, with an error that the loop logs, so that
+ *   a short outage delays the alerts and does not drop all those the tick would have reached. The
+ *   event cursor stays, and the next tick goes on from it, skipping what was sent. What becomes of
+ *   the alert that was being sent depends on what the failure says (see `sendOnce`):
+ *   - Telegram cannot have taken it: it asked for a longer wait than the bot sits out (a 429), or
+ *     the request never left the machine (connection refused, a DNS failure, an unreachable
+ *     network). The claim is given back, and the next tick sends the alert.
+ *   - Telegram may have taken it: a timeout, a connection that broke after the request went out, a
+ *     5xx. The claim stays and the alert is lost, with the same `alert lost:` line. That is the
+ *     price of at most once, and it is bounded to the one message that was in flight.
  * - A database error stops the tick, which the loop logs. The next tick starts from the old cursor.
  *
  * Times are the contract's: nanoseconds since the Unix epoch. They are bigints here and numeric in
  * SQL, and are never floats, which cannot tell nanoseconds apart at this size.
+ *
+ * A tick can run for minutes, behind a batch of events and the sends they make, so the clock is read
+ * when a step needs the time and never once for the tick: an alert is judged (is the commit window
+ * over?) and worded ("entries close in 5 min") on the time it is when its turn comes.
  */
 
 /** What `notifierTick` needs. */
@@ -55,8 +78,8 @@ export interface NotifierTickOptions {
   /** The network the tasks live on. The symbol and decimals of a token depend on it. */
   network: NetworkId;
   /**
-   * The clock. Defaults to the wall clock. A tick reads it at its start and again before the
-   * timers, which can come minutes later.
+   * The clock. Defaults to the wall clock. A tick reads it each time it needs the time, since the
+   * sends before can take minutes (see the top of this file).
    */
   now?: () => Date;
 }
@@ -81,9 +104,11 @@ const NS_PER_HOUR = 60n * NS_PER_MINUTE;
 
 /** A `working` row older than this is not news. */
 const WORKING_WINDOW_MS = 10 * 60_000;
+/** How many of a task's starters its poster is told of: the first ones, in the order they began. */
+const POSTER_STARTERS = 5;
 /** The reveal window counts as closing this long before it ends. */
 const REVEAL_CLOSING_NS = 10n * NS_PER_MINUTE;
-/** How long before the commit deadline each reminder goes out, in hours. */
+/** How long before the commit deadline each reminder goes out, in hours, the longest first. */
 const REMINDER_HOURS = [24, 1] as const;
 /** How many times an alert's recipients are asked for before the alert is given up. */
 const RECIPIENT_TRIES = 3;
@@ -98,32 +123,38 @@ const ALERTING = new Set(["task_created", "committed", "task_topped_up", "picked
 interface Tick {
   db: Db;
   bot: Bot;
-  render: RenderContext;
-  /** The tick's time, `render.now`, in nanoseconds. */
-  nowNs: bigint;
+  webUrl: string;
+  network: NetworkId;
+  /** The clock. Read when a time is needed (`nowOf`, `nsOf`), never kept for the tick. */
+  clock: () => Date;
 }
 
 /**
- * One pass over the events, the working signals and the clock. The first two run on the time that
- * `opts.now` gives at the start, and the timers on the time it gives when they begin: the sends
- * behind a backlog of events can take minutes. See the top of this file for what it does.
+ * One pass over the events, the working signals and the clock. Each alert is judged and worded on
+ * the time it is when its turn comes: the sends behind a backlog of events can take minutes. See
+ * the top of this file for what it does.
  */
 export async function notifierTick(opts: NotifierTickOptions): Promise<void> {
-  const clock = opts.now ?? (() => new Date());
-  const tick = tickAt(opts, clock());
-  await eventAlerts(tick);
-  await workingAlerts(tick);
-  await timerAlerts(tickAt(opts, clock()));
-}
-
-/** What a tick works with, for the time `now`. */
-function tickAt(opts: NotifierTickOptions, now: Date): Tick {
-  return {
+  const tick: Tick = {
     db: opts.db,
     bot: opts.bot,
-    render: { webUrl: opts.webUrl, network: opts.network, now },
-    nowNs: BigInt(now.getTime()) * NS_PER_MS,
+    webUrl: opts.webUrl,
+    network: opts.network,
+    clock: opts.now ?? (() => new Date()),
   };
+  await eventAlerts(tick);
+  await workingAlerts(tick);
+  await timerAlerts(tick);
+}
+
+/** The time it is now, as an alert is worded with it. */
+function renderNow(tick: Tick): RenderContext {
+  return { webUrl: tick.webUrl, network: tick.network, now: tick.clock() };
+}
+
+/** The time it is now, in nanoseconds since the epoch, as the database compares it. */
+function nsNow(tick: Tick): bigint {
+  return BigInt(tick.clock().getTime()) * NS_PER_MS;
 }
 
 /**
@@ -282,7 +313,7 @@ interface TaskRow {
   tags: string[];
   commit_deadline: string;
   commit_count: number;
-  /** Whether entries are over: the commit deadline is not after the tick's time. */
+  /** Whether entries are over: the commit deadline is not after the time it is now. */
   closed: boolean;
 }
 
@@ -313,7 +344,7 @@ async function alertOf(tick: Tick, row: EventRow): Promise<Alert | null> {
             commit_deadline::text as commit_deadline, commit_count,
             commit_deadline <= $2::numeric as closed
      from tasks where id = $1::numeric`,
-    [taskId, tick.nowNs],
+    [taskId, nsNow(tick)],
   );
   if (task === undefined) {
     console.error(
@@ -375,19 +406,40 @@ async function funderCount(db: Db, taskId: string): Promise<number> {
 // The working signals.
 
 async function workingAlerts(tick: Tick): Promise<void> {
-  const since = new Date(tick.render.now.getTime() - WORKING_WINDOW_MS);
+  const since = new Date(tick.clock().getTime() - WORKING_WINDOW_MS);
   // A signal for a task the index does not hold yet still reaches the agent's owner, so the join
   // is a left one. `order by w.task_id` is the numeric column: `task_id` alone is the text output.
-  const started = await tick.db.query<{ task_id: string; account: string; title: string | null }>(
-    `select w.task_id::text as task_id, w.account, t.title
-     from working w left join tasks t on t.id = w.task_id
+  //
+  // `place` is the agent's place among all who started the task, in the order they began, and is
+  // counted over every row of the task, however old: a starter's place does not improve as the
+  // earlier ones age out of the window. A row is made once (the API ignores a second start), so its
+  // `started_at` and its place do not change. Only the tasks that have a recent starter are counted.
+  const started = await tick.db.query<{
+    task_id: string;
+    account: string;
+    title: string | null;
+    place: number;
+  }>(
+    `select w.task_id::text as task_id, w.account, t.title, w.place::int as place
+     from (
+       select task_id, account, started_at,
+              row_number() over (partition by task_id order by started_at, account) as place
+       from working
+       where task_id in (select task_id from working where started_at >= $1::timestamptz)
+     ) w left join tasks t on t.id = w.task_id
      where w.started_at >= $1::timestamptz
      order by w.started_at, w.task_id, w.account`,
     [since.toISOString()],
   );
   for (const row of started) {
     const title = titleOf(row.title, row.task_id);
-    await deliver(tick, { kind: "agent_started", taskId: row.task_id, title, agent: row.account });
+    await deliver(tick, {
+      kind: "agent_started",
+      taskId: row.task_id,
+      title,
+      agent: row.account,
+      posterHears: row.place <= POSTER_STARTERS,
+    });
   }
 }
 
@@ -429,10 +481,12 @@ const REVEAL_CLOSING = `
   order by t.id`;
 
 /**
- * Tasks whose commit window still has `H` hours or less to run, and that were open for longer than
- * `H + 1` hours when posted, so that the reminder does not follow the announcement within the hour.
- * `$1` is now, `$2` is now plus `H` hours and `$3` is `H + 1` hours, all in nanoseconds. A reminder
- * is for an open window: after the deadline there is nothing to be reminded of.
+ * Tasks whose commit window has more than `$1` to run, at most `$2`, and that were open for longer
+ * than `$3` when posted, so that the reminder does not follow the announcement within the hour. For
+ * the reminder of `H` hours, `$1` is now plus the next reminder's lead (now, for the last), `$2` is
+ * now plus `H` hours and `$3` is `H + 1` hours, all in nanoseconds. A reminder is for an open
+ * window: after the deadline there is nothing to be reminded of, and once the next reminder is due
+ * this one is late.
  */
 const DEADLINE_REMINDER = `
   select t.id::text as id, t.title
@@ -442,7 +496,9 @@ const DEADLINE_REMINDER = `
   order by t.id`;
 
 async function timerAlerts(tick: Tick): Promise<void> {
-  const { db, nowNs } = tick;
+  const { db } = tick;
+  // The time it is when the timers begin, which can be minutes after the tick did.
+  const nowNs = nsNow(tick);
   const opening = await db.query<RevealRow>(REVEAL_OPEN, [nowNs]);
   for (const task of opening) {
     const title = titleOf(task.title, task.id);
@@ -463,13 +519,11 @@ async function timerAlerts(tick: Tick): Promise<void> {
       revealDeadline: task.reveal_deadline,
     });
   }
-  for (const hoursLeft of REMINDER_HOURS) {
+  for (const [at, hoursLeft] of REMINDER_HOURS.entries()) {
     const lead = BigInt(hoursLeft) * NS_PER_HOUR;
-    const due = await db.query<DueRow>(DEADLINE_REMINDER, [
-      nowNs,
-      nowNs + lead,
-      lead + NS_PER_HOUR,
-    ]);
+    const next = REMINDER_HOURS[at + 1];
+    const from = nowNs + (next === undefined ? 0n : BigInt(next) * NS_PER_HOUR);
+    const due = await db.query<DueRow>(DEADLINE_REMINDER, [from, nowNs + lead, lead + NS_PER_HOUR]);
     for (const task of due) {
       const title = titleOf(task.title, task.id);
       await deliver(tick, { kind: "deadline_reminder", taskId: task.id, title, hoursLeft });
@@ -498,14 +552,14 @@ async function deliver(tick: Tick, alert: Alert): Promise<void> {
   let text: string;
   let chats: string[];
   try {
-    text = renderAlert(alert, tick.render);
+    text = renderAlert(alert, renderNow(tick));
     chats = await recipientsOf(tick.db, alert);
   } catch (error) {
     console.error(`telegram notifier: skipped ${alert.kind} for task ${alert.taskId}:`, error);
     return;
   }
   const key = dedupeKey(alert);
-  for (const chat of chats) await sendOnce(tick, chat, key, text);
+  for (const chat of chats) await sendOnce(tick, chat, alert, key, text);
 }
 
 /**
@@ -526,14 +580,116 @@ async function recipientsOf(db: Db, alert: Alert): Promise<string[]> {
 }
 
 /**
- * Sends `text` to `chat`, if `key` was not claimed for the chat before. The claim is made first and
- * a failed send keeps it, so the notifier asks for an alert to reach a chat at most once.
- *
- * Telegram answers 403 when the user blocked the bot or the bot was kicked from a group. The chat
- * cannot be reached, so its link and its tag watches go, a line in the log says so, and the next
- * alert does not try it. Any other failure is logged, and the tick goes on with the next chat.
+ * What a failed send says about the message:
+ * - `refused`: Telegram answered with an error about this send (a 400, say). It took nothing and
+ *   will not take this, but another send may go through.
+ * - `not_taken`: the transport failed and Telegram cannot have taken the message. It asked for a
+ *   longer wait than the bot sits out (a 429), or the request never left the machine, which only a
+ *   failure to connect shows: a refused connection, a DNS failure, a network that is unreachable.
+ * - `unsure`: the transport failed, or something in front of Telegram answered a 5xx, and the
+ *   message may have been taken all the same: a timeout, a connection that broke after the request
+ *   went out. So is a failure of any other kind, which is not known to be anything else.
  */
-async function sendOnce(tick: Tick, chat: string, key: string, text: string): Promise<void> {
+type SendFailure = "refused" | "not_taken" | "unsure";
+
+/**
+ * The codes of the system errors that node-fetch passes on, and that come before any byte of the
+ * request has left: the connection was refused, the name did not resolve, or there is no route. A
+ * connection that was made and broke later reads `ECONNRESET`, `EPIPE` or a timeout, none of which
+ * is here.
+ */
+const NEVER_LEFT = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EAI_FAIL",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+]);
+
+/** An error's `code`, if it has one that is text. */
+function codeOf(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function failureOf(error: unknown): SendFailure {
+  if (error instanceof GrammyError) {
+    if (error.error_code === 429) return "not_taken";
+    return error.error_code >= 500 ? "unsure" : "refused";
+  }
+  if (error instanceof HttpError) {
+    const code = codeOf(error.error);
+    return code !== undefined && NEVER_LEFT.has(code) ? "not_taken" : "unsure";
+  }
+  return "unsure";
+}
+
+/**
+ * A failed send as a line of the log shows it: the error's name and the code that says what became
+ * of the request, and for the Bot API's own answer its description. Never the text of an error of
+ * the transport: it can quote the request's URL, which holds the bot's token.
+ */
+function labelOf(error: unknown): string {
+  if (error instanceof GrammyError) {
+    return `${error.name} ${error.error_code}: ${error.description}`;
+  }
+  if (error instanceof HttpError) {
+    const code = codeOf(error.error);
+    return code === undefined ? error.name : `${error.name} ${code}`;
+  }
+  return error instanceof Error ? error.name : "a value that is not an Error";
+}
+
+/**
+ * Ends a tick because the transport to Telegram failed. The loop logs the error whole, so it holds
+ * the failure's `labelOf` and nothing of its own text, and it has no `cause`: the failure of the
+ * transport quotes the request's URL, which holds the bot's token.
+ */
+class TransportFailed extends Error {
+  override readonly name = "TransportFailed";
+}
+
+/** The line for an alert that was not delivered and will not be tried again. */
+function logLost(alert: Alert, why: string): void {
+  console.error(`telegram notifier: alert lost: ${alert.kind} for task ${alert.taskId} (${why})`);
+}
+
+/** Gives the claim of `chat` on `key` back. False if the database would not. */
+async function giveBack(tick: Tick, chat: string, key: string): Promise<boolean> {
+  try {
+    await tick.db.query("delete from tg_sent where chat_id = $1 and dedupe_key = $2", [chat, key]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Sends `text` to `chat`, if `key` was not claimed for the chat before. The claim is made first, so
+ * that the notifier asks for an alert to reach a chat at most once. What a failed send does to the
+ * claim and to the tick depends on what the failure says about the message (`failureOf`):
+ *
+ * - Telegram answered 403: the user blocked the bot or the bot was kicked from a group. The chat
+ *   cannot be reached, so its link and its tag watches go, a line in the log says so, and the next
+ *   alert does not try it.
+ * - Any other answer about this message (`refused`): the alert is lost for the chat, with a line
+ *   (`logLost`), and the tick goes on with the next chat.
+ * - `not_taken`: the claim is given back, so that the next tick sends the alert, and the tick ends.
+ *   If the claim cannot be given back the alert is lost, and says so.
+ * - `unsure`: the claim stays and the alert is lost, with a line, and the tick ends. Nothing more
+ *   is claimed until the next tick, so a transport that is down costs the one message in flight.
+ *
+ * The tick ends by throwing `TransportFailed`, which the loop logs and tries again after its wait.
+ */
+async function sendOnce(
+  tick: Tick,
+  chat: string,
+  alert: Alert,
+  key: string,
+  text: string,
+): Promise<void> {
   const claimed = await tick.db.query(
     "insert into tg_sent (chat_id, dedupe_key) values ($1, $2) on conflict do nothing returning 1",
     [chat, key],
@@ -551,8 +707,26 @@ async function sendOnce(tick: Tick, chat: string, key: string, text: string): Pr
       console.error(`telegram notifier: unlinked chat ${chat}: ${error.message}`);
       return;
     }
-    // The message only: a GrammyError also carries the payload, which holds the text sent.
-    const reason = error instanceof Error ? error.message : String(error);
-    console.error(`telegram notifier: could not send ${key} to chat ${chat}: ${reason}`);
+    const failure = failureOf(error);
+    const label = labelOf(error);
+    if (failure === "refused") {
+      logLost(alert, label);
+      return;
+    }
+    if (failure === "not_taken") {
+      if (!(await giveBack(tick, chat, key))) {
+        logLost(alert, `${label}; its claim could not be given back`);
+        throw new TransportFailed(`Telegram did not take a send (${label}); the tick ends here`);
+      }
+      throw new TransportFailed(
+        `Telegram did not take a send (${label}); the tick ends here, and the alert is tried ` +
+          "again on the next",
+      );
+    }
+    logLost(alert, label);
+    throw new TransportFailed(
+      `A send to Telegram failed and may have gone through (${label}); the tick ends here, and ` +
+        "that alert is not sent again",
+    );
   }
 }

@@ -1,7 +1,7 @@
 import type { Db } from "@tender/db";
 import type { Transformer } from "grammy";
 import type { Update, UserFromGetMe } from "grammy/types";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { createBot, WEBHOOK_SECRET, webhookHandler } from "../src/index";
 
 // The webhook's handler, called the way Hono calls it, with a context that holds only what grammY's
@@ -122,4 +122,39 @@ test("the_webhook_takes_only_a_secret_telegram_would_take", () => {
   }
   expect(WEBHOOK_SECRET.test("A-z_0-9")).toBe(true);
   expect(WEBHOOK_SECRET.test("x".repeat(256))).toBe(true);
+});
+
+test("a_slow_update_is_answered_at_the_limit_and_finished_in_the_background", async () => {
+  // grammY gives an update 10 seconds. Past that the handler used to throw, so that Telegram sent the
+  // update again, and one that was waiting on a flood wait was then handled twice and replied twice.
+  // Now it answers 200 at the limit and the bot goes on with the update.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const { bot, calls } = recordingBot();
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // The reply to Telegram is stuck, as when the API makes the bot wait out a flood wait.
+    bot.api.config.use(async (prev, method, payload) => {
+      await held;
+      return prev(method, payload);
+    });
+    const handle = webhookHandler(bot, SECRET);
+    const { c } = request(HELP_UPDATE, SECRET);
+
+    const answered = handle(c as never);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const res = await answered;
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("");
+    expect(calls).toEqual([]);
+
+    // The update was not dropped: its reply goes out once the wait is over.
+    release();
+    await vi.waitFor(() => expect(calls.map(({ method }) => method)).toEqual(["sendMessage"]));
+  } finally {
+    vi.useRealTimers();
+  }
 });

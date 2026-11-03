@@ -1,5 +1,8 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { inspect } from "node:util";
 import type { Db } from "@tender/db";
-import type { ApiCallFn, Bot, Transformer } from "grammy";
+import { type ApiCallFn, type Bot, GrammyError, HttpError, type Transformer } from "grammy";
 import type { Chat, Update, UserFromGetMe } from "grammy/types";
 import { afterAll, beforeAll, expect, test, vi } from "vitest";
 import { type Alert, BOT_COMMANDS, createBot, resolveRecipients } from "../src/index";
@@ -1292,6 +1295,202 @@ test("uses_auto_retry_and_the_throttler", async () => {
   expect(starts).toHaveLength(3);
   expect((starts[2] ?? 0) - before).toBeGreaterThanOrEqual(990);
 }, 15_000);
+
+// The transport. These talk to a Bot API on this machine through the transformers that `createBot`
+// installs (autoRetry and the throttler), real sockets included, because what matters is what the
+// bot does with a request whose answer never came back. Nothing leaves the machine.
+
+/** What the fake Bot API answers a request with. */
+type FakeReply =
+  /** Telegram took the request, and its answer is lost: the connection is cut after the request. */
+  | "lost"
+  /** Telegram did not take the request: a flood wait, `retry_after` seconds. */
+  | { floodWait: number }
+  /** Telegram did not take the request, for good: a 5xx. */
+  | "server_error"
+  | "ok";
+
+/**
+ * A Bot API on this machine. Request number n (from 1) gets `replies[n - 1]`, and every later one
+ * `then`. It records the path of each request, which holds the bot's token.
+ */
+async function fakeBotApi(replies: FakeReply[], then: FakeReply = "ok") {
+  const seen: string[] = [];
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      seen.push(req.url ?? "");
+      const reply = replies[seen.length - 1] ?? then;
+      if (reply === "lost") {
+        req.socket.destroy();
+        return;
+      }
+      res.setHeader("content-type", "application/json");
+      if (reply === "ok") {
+        const message = { message_id: seen.length, date: 0, chat: { id: 42, type: "private" } };
+        res.end(JSON.stringify({ ok: true, result: { ...message, text: "x" } }));
+      } else if (reply === "server_error") {
+        res.statusCode = 502;
+        res.end(
+          JSON.stringify({ ok: false, error_code: 502, description: "Bad Gateway: try again" }),
+        );
+      } else {
+        res.statusCode = 429;
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error_code: 429,
+            description: `Too Many Requests: retry after ${reply.floodWait}`,
+            parameters: { retry_after: reply.floodWait },
+          }),
+        );
+      }
+    });
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const { port } = server.address() as AddressInfo;
+  return {
+    apiRoot: `http://127.0.0.1:${port}`,
+    seen,
+    close: () =>
+      new Promise<void>((done) => {
+        server.close(() => done());
+        server.closeAllConnections();
+      }),
+  };
+}
+
+/** A bot, built the way the server builds it, whose Telegram is `apiRoot`. */
+function botAt(apiRoot: string): Bot {
+  return createBot({ token: TOKEN, db, webUrl: WEB_URL, botInfo: BOT_INFO, apiRoot });
+}
+
+test("a_send_whose_answer_is_lost_is_not_sent_again", async () => {
+  // Telegram may have delivered the message when its answer is lost, and the notifier has claimed
+  // the send already: a repeat would put the same alert in a chat twice. So the send fails, once.
+  const api = await fakeBotApi(["lost"]);
+  try {
+    await expect(botAt(api.apiRoot).api.sendMessage(42, "hello")).rejects.toBeInstanceOf(HttpError);
+    expect(api.seen).toHaveLength(1);
+  } finally {
+    await api.close();
+  }
+});
+
+test("a_server_error_is_not_retried_either", async () => {
+  // A 5xx from a proxy in front of Telegram does not say that Telegram did not take the message.
+  const api = await fakeBotApi(["server_error"]);
+  try {
+    await expect(botAt(api.apiRoot).api.sendMessage(42, "hello")).rejects.toMatchObject({
+      name: "GrammyError",
+      error_code: 502,
+    });
+    expect(api.seen).toHaveLength(1);
+  } finally {
+    await api.close();
+  }
+});
+
+test("a_flood_wait_is_waited_out_and_the_message_delivered_once", async () => {
+  // A 429 means that Telegram took nothing, so the bot waits what it is told and sends again.
+  const api = await fakeBotApi([{ floodWait: 1 }]);
+  try {
+    const started = Date.now();
+    const sent = await botAt(api.apiRoot).api.sendMessage(42, "hello");
+    expect(sent.message_id).toBe(2);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(900);
+    // One request that was refused and one that was taken: the message reached the chat once.
+    expect(api.seen).toHaveLength(2);
+  } finally {
+    await api.close();
+  }
+}, 15_000);
+
+test("a_flood_wait_longer_than_a_minute_fails_at_once", async () => {
+  // The notifier sends one message at a time, so a wait of an hour would hold up every chat behind.
+  const api = await fakeBotApi([{ floodWait: 3600 }]);
+  try {
+    const started = Date.now();
+    const failure = await botAt(api.apiRoot)
+      .api.sendMessage(42, "hello")
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    expect(failure).toBeInstanceOf(GrammyError);
+    expect(failure).toMatchObject({ error_code: 429, parameters: { retry_after: 3600 } });
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(api.seen).toHaveLength(1);
+  } finally {
+    await api.close();
+  }
+});
+
+test("a_flood_wait_is_retried_three_times_and_no_more", async () => {
+  const api = await fakeBotApi([], { floodWait: 0 });
+  try {
+    await expect(botAt(api.apiRoot).api.sendMessage(42, "hello")).rejects.toMatchObject({
+      error_code: 429,
+    });
+    // The request, and three more.
+    expect(api.seen).toHaveLength(4);
+  } finally {
+    await api.close();
+  }
+});
+
+test("a_request_that_hangs_gives_up_after_a_minute", () => {
+  // grammY's own limit is 500 seconds, which would hold the notifier's tick up for 8 minutes a send.
+  expect(botAt("http://127.0.0.1:1").api.options?.timeoutSeconds).toBe(60);
+});
+
+test("the_error_boundary_logs_an_http_error_without_the_request_that_failed", async () => {
+  // The error of a failed request holds the request, and its URL holds the bot's token. The
+  // boundary used to log the whole error, which autoRetry kept from it by waiting out a failure
+  // that it now passes on.
+  const api = await fakeBotApi(["lost"]);
+  const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  try {
+    const replies = await deliver(messageIn(privateChat(newChat()), "/help"), botAt(api.apiRoot));
+    expect(replies).toEqual([]);
+    expect(api.seen).toHaveLength(1);
+    expect(api.seen[0]).toContain(TOKEN);
+
+    expect(errors).toHaveBeenCalledOnce();
+    const logged = errors.mock.calls.map((args) =>
+      args.map((arg) => inspect(arg, { depth: 10 })).join(" "),
+    );
+    expect(logged[0]).toMatch(
+      /update \d+ failed: HttpError: Network request for 'sendMessage' failed!/,
+    );
+    expect(logged.join("\n")).not.toContain(TOKEN);
+    expect(logged.join("\n")).not.toContain(api.apiRoot);
+  } finally {
+    errors.mockRestore();
+    await api.close();
+  }
+}, 15_000);
+
+test("the_error_boundary_logs_the_code_of_a_telegram_error", async () => {
+  // A flood wait that is too long is passed on as it is. The log says what Telegram answered and
+  // not the payload that was sent, which holds the text of the reply.
+  const api = await fakeBotApi([{ floodWait: 3600 }]);
+  const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  try {
+    await deliver(messageIn(privateChat(newChat()), "/help"), botAt(api.apiRoot));
+
+    expect(errors).toHaveBeenCalledOnce();
+    const logged = errors.mock.calls.map((args) =>
+      args.map((arg) => inspect(arg, { depth: 10 })).join(" "),
+    );
+    expect(logged[0]).toMatch(/update \d+ failed: GrammyError 429: Call to 'sendMessage' failed!/);
+    expect(logged[0]).not.toContain("Tender alerts");
+    expect(logged.join("\n")).not.toContain(TOKEN);
+  } finally {
+    errors.mockRestore();
+    await api.close();
+  }
+});
 
 test("a_failing_update_is_logged_not_thrown", async () => {
   const down = () => Promise.reject(new Error("database is down"));

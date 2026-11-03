@@ -12,18 +12,28 @@ import {
   writeFileSync,
 } from "node:fs";
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ApiClient, type TenderClient } from "@tender/client";
-import { type ConfigView, canonicalBase, computeCommitment, sha256Hex } from "@tender/shared";
+import {
+  type ConfigView,
+  canonicalBase,
+  computeCommitment,
+  type HealthResponse,
+  sha256Hex,
+} from "@tender/shared";
 import { KeyPair } from "near-api-js";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   ConfigError,
+  checkApiDeployment,
   describeFailure,
   expandHome,
+  filesDirWarning,
   readConfig,
   resolveDefaultToken,
   secretsOf,
@@ -404,7 +414,9 @@ test("files_dir_is_an_absolute_path_or_nothing", () => {
   // TENDER_STATE_DIR: a config file holds `~/...` and no shell expands it there.
   expect(filesDir(` ${tenderFiles} \n`)).toBe(tenderFiles);
   expect(filesDir("~/results")).toBe(join(home, "results"));
-  expect(filesDir("~")).toBe(home);
+  // (And `~` alone is the home directory, which is not a folder for agents' files: see the tests of
+  // `HOME` below.)
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: "~" })).toBe(HOME);
 
   // A relative path would mean the directory the client happened to start the server in. The
   // message names the variable and does not quote what it was given.
@@ -449,6 +461,10 @@ function makeDir(parent: string, name: string, mode = 0o700): string {
 /** What `readConfig` says of a TENDER_FILES_DIR that others could write in, or that is not there. */
 const SHARED = /^TENDER_FILES_DIR must be a directory that only you can write to: /;
 const MISSING = "TENDER_FILES_DIR must be a directory that exists";
+/** What it says of one that is the home directory, or holds it (`/`, `/home`, and so on). */
+const HOME =
+  "TENDER_FILES_DIR must be a folder of its own for the files you give agents: not your home " +
+  "directory, and not a directory that holds it (/, /home, /Users and so on)";
 
 test("files_dir_must_be_a_directory_that_only_the_user_can_write_to", () => {
   // P04-R2: whoever can write in the directory can race a file read's checks, so it is the user's
@@ -501,13 +517,78 @@ test("files_dir_is_looked_at_up_to_the_home_directory_or_else_up_to_the_root", (
   const files = makeDir(mine, "files");
   const env = { ...ENV, TENDER_FILES_DIR: files };
   expect(readConfig(env, mine).filesDir).toBe(files);
-  // The home itself is the top (and the only one, for the directory that is the home).
-  expect(readConfig({ ...ENV, TENDER_FILES_DIR: mine }, mine).filesDir).toBe(mine);
 
   // Under no home of the user's, the way goes on up through `me` to the open directory.
   expect(failureOf(env, join(home, "elsewhere"))).toMatch(SHARED);
   chmodSync(open, 0o755);
   expect(readConfig(env, home).filesDir).toBe(files);
+});
+
+test("a_files_dir_that_is_the_home_directory_is_refused", () => {
+  // What the server may read it can commit, and reveal_result then publishes it, and a home directory
+  // holds the user's keys and credentials. The message names the variable and the rule, and no path.
+  mkdirSync(join(home, "sub"), { mode: 0o700 });
+  symlinkSync(home, join(home, "home-link"), "dir");
+
+  // However the home is written: `~`, a trailing slash, a `..`, or a link that leads to it.
+  for (const written of [
+    home,
+    "~",
+    "~/",
+    `${home}/`,
+    `${home}//.`,
+    `${home}/sub/..`,
+    join(home, "home-link"),
+  ]) {
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: written }), written).toBe(HOME);
+  }
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: home })).not.toContain(home);
+
+  // It does not matter who owns the home or who can write in it: that is no reason to use it.
+  chmodSync(home, 0o775);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: home })).toBe(HOME);
+  chmodSync(home, 0o700);
+
+  // A folder in the home is what the variable is for.
+  const results = makeDir(home, "results");
+  expect(readConfig({ ...ENV, TENDER_FILES_DIR: results }, home).filesDir).toBe(results);
+
+  // It is reported with the other faults, in order.
+  expect(failureOf({ ...ENV, TENDER_NETWORK: "devnet", TENDER_FILES_DIR: home })).toBe(
+    `TENDER_NETWORK must be one of sandbox, testnet, mainnet; ${HOME}`,
+  );
+});
+
+test("a_files_dir_that_holds_the_home_directory_is_refused", () => {
+  // Every directory above the home holds it, up to the root, and what is in it is in reach of
+  // commit_result as much as the home's own. The answer is this one for all of them, whoever owns
+  // the directory and whatever its mode, and not that it is not the user's.
+  const above = makeDir(home, "above");
+  const mine = makeDir(above, "me");
+  for (const holder of [above, home, dirname(home), dirname(dirname(home)), "/"]) {
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: holder }, mine), holder).toBe(HOME);
+  }
+  // A link that leads to one, and a `..` that goes up to one, are judged by where they lead.
+  symlinkSync(above, join(home, "up"), "dir");
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "up") }, mine)).toBe(HOME);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: `${mine}/..` }, mine)).toBe(HOME);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: above }, mine)).not.toContain(above);
+
+  // The home is the user's own home that is asked for, wherever the files directory is.
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: "/" }, home)).toBe(HOME);
+});
+
+test("a_files_dir_that_is_the_home_directory_in_other_letter_case_is_refused", () => {
+  // A disk may not tell letter case apart (macOS and Windows do not, by default), and then the home
+  // written in other case is the home. What counts is the real path that the kernel gives for it.
+  const swapped = home.replace(/[a-z]/gi, (letter) =>
+    letter === letter.toLowerCase() ? letter.toUpperCase() : letter.toLowerCase(),
+  );
+  // A disk that does tell them apart has no such directory, and nothing to try.
+  if (swapped === home || !existsSync(swapped)) return;
+
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: swapped })).toBe(HOME);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: dirname(swapped) }, home)).toBe(HOME);
 });
 
 test("a_files_dir_that_is_not_there_or_is_no_directory_is_refused", () => {
@@ -517,6 +598,152 @@ test("a_files_dir_that_is_not_there_or_is_no_directory_is_refused", () => {
     expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, bad) }), bad).toBe(MISSING);
   }
   expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "nothing") })).not.toContain(home);
+});
+
+/** What the start-up warning is for the configuration that `env` adds to the basics, under the test's home. */
+function warningFor(env: Record<string, string>): string | undefined {
+  return filesDirWarning(readConfig({ ...ENV, ...env }, home), home);
+}
+
+/** The warning's two fixed parts, and the reason in between. */
+const WARNING =
+  /^TENDER_FILES_DIR (.+), so commit_result would refuse every file_path: nothing can be read from it\. Use a folder of its own, outside any state directory and ~\/\.tender and with no folder named drafts on its path$/;
+const IN_STATE = "is inside this server's state directory";
+const IN_ROOT = "is inside ~/.tender, where Tender keeps the state of every account";
+const UNDER_DRAFTS =
+  "has a folder named drafts on its path, which is the folder of every state directory";
+
+test("a_files_dir_that_nothing_can_be_read_from_is_warned_about", () => {
+  // The write tools read no file from a state directory, from ~/.tender, or from below a folder named
+  // drafts, so a TENDER_FILES_DIR in one of them starts and then refuses every file_path, without a
+  // word as to why. The warning says it once, at start-up.
+  const reason = (env: Record<string, string>) => WARNING.exec(warningFor(env) ?? "")?.[1];
+
+  // Nothing to say about no files directory, or an ordinary one.
+  const files = makeDir(home, "files");
+  expect(filesDirWarning(readConfig(ENV, home), home)).toBeUndefined();
+  expect(warningFor({ TENDER_FILES_DIR: files })).toBeUndefined();
+
+  // In ~/.tender: the default state directory (here and in anything below it), and the root itself.
+  const root = makeDir(home, ".tender");
+  const shared = makeDir(root, "shared");
+  expect(reason({ TENDER_FILES_DIR: shared })).toBe(IN_ROOT);
+  expect(reason({ TENDER_FILES_DIR: root })).toBe(IN_ROOT);
+  const mine = makeDir(makeDir(root, "testnet"), "alice.testnet");
+  expect(reason({ TENDER_FILES_DIR: mine })).toBe(IN_STATE);
+  expect(reason({ TENDER_FILES_DIR: makeDir(mine, "results") })).toBe(IN_STATE);
+
+  // In a state directory that was named, or its drafts folder, wherever it is.
+  const state = makeDir(home, "state");
+  const named = { TENDER_STATE_DIR: state };
+  expect(reason({ ...named, TENDER_FILES_DIR: state })).toBe(IN_STATE);
+  expect(reason({ ...named, TENDER_FILES_DIR: makeDir(state, "results") })).toBe(IN_STATE);
+  expect(reason({ ...named, TENDER_FILES_DIR: makeDir(state, "drafts") })).toBe(IN_STATE);
+  // A state directory that is not there yet counts as it is written, and files beside it are fine.
+  expect(warningFor({ TENDER_STATE_DIR: join(home, "not-yet"), TENDER_FILES_DIR: files })).toBe(
+    undefined,
+  );
+  // A state directory inside the files directory is the other way round: the rest can be read.
+  const wide = makeDir(home, "wide");
+  expect(warningFor({ TENDER_STATE_DIR: join(wide, "state"), TENDER_FILES_DIR: wide })).toBe(
+    undefined,
+  );
+});
+
+test("a_files_dir_below_a_folder_named_drafts_is_warned_about_in_any_letter_case", () => {
+  // The folder is the layout of every store, so it covers the state directory of any server, wherever
+  // it is. The directory itself may be that folder, or lie below it.
+  for (const [at, name] of ["drafts", "Drafts", "DRAFTS"].entries()) {
+    // (A disk may not tell the letter cases apart, so each name gets a parent of its own.)
+    const folder = makeDir(makeDir(home, `in-${at}`), name);
+    const below = makeDir(makeDir(folder, "sub"), "results");
+    for (const dir of [folder, below]) {
+      expect(warningFor({ TENDER_FILES_DIR: dir }), name).toMatch(WARNING);
+      expect(WARNING.exec(warningFor({ TENDER_FILES_DIR: dir }) ?? "")?.[1], name).toBe(
+        UNDER_DRAFTS,
+      );
+    }
+  }
+  // A name that only holds the word is no such folder.
+  for (const name of ["mydrafts", "drafts-old", "draft", "draftsman"]) {
+    const dir = makeDir(home, name);
+    expect(warningFor({ TENDER_FILES_DIR: dir }), name).toBeUndefined();
+  }
+});
+
+test("the_warning_goes_by_where_the_links_lead", () => {
+  // The files directory is kept as its real path, and the state directory is looked up as well.
+  const root = makeDir(home, ".tender");
+  const elsewhere = makeDir(root, "elsewhere");
+  symlinkSync(elsewhere, join(home, "to-state-root"), "dir");
+  expect(warningFor({ TENDER_FILES_DIR: join(home, "to-state-root") })).toMatch(WARNING);
+
+  const real = makeDir(home, "real-state");
+  const results = makeDir(real, "results");
+  symlinkSync(real, join(home, "state-link"), "dir");
+  const env = { TENDER_STATE_DIR: join(home, "state-link"), TENDER_FILES_DIR: results };
+  expect(WARNING.exec(warningFor(env) ?? "")?.[1]).toBe(IN_STATE);
+});
+
+test("the_warning_is_one_line_that_names_the_variable_and_no_path", () => {
+  const root = makeDir(home, ".tender");
+  const secret = makeDir(root, "SECRETFOLDER");
+  const line = warningFor({ TENDER_FILES_DIR: secret }) ?? "";
+
+  expect(line).toMatch(WARNING);
+  expect(line).not.toContain("\n");
+  expect(line).not.toContain(home);
+  expect(line).not.toContain("SECRETFOLDER");
+  // A home that is no path leaves out the default root, and the other rules still hold.
+  const config = readConfig({ ...ENV, TENDER_FILES_DIR: secret }, home);
+  expect(filesDirWarning(config, "")).toBeUndefined();
+  expect(filesDirWarning(config, "relative/home")).toBeUndefined();
+});
+
+test("bin_warns_about_a_files_dir_that_nothing_can_be_read_from", {
+  timeout: 120_000,
+}, async () => {
+  // One line on stderr, before anything else: an API of another contract ends the run right after,
+  // so the chain is never asked.
+  const api = createServer((request, response) => {
+    if (request.url === "/v1/health") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(healthOf("testnet", "other.testnet")));
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((done) => api.listen(0, "127.0.0.1", done));
+  try {
+    const root = makeDir(home, ".tender");
+    const env = {
+      ...ENV,
+      HOME: home,
+      TENDER_API_URL: `http://127.0.0.1:${(api.address() as AddressInfo).port}`,
+      TENDER_FILES_DIR: makeDir(root, "shared"),
+    };
+
+    const warned = await runBin(env);
+    expect(warned.code).toBe(1);
+    expect(warned.stdout).toBe("");
+    const [warning, refusal, rest] = warned.stderr.split("\n");
+    expect(`${warning}\n`).toBe(
+      `tender-mcp: ${warningFor({ TENDER_FILES_DIR: env.TENDER_FILES_DIR })}\n`,
+    );
+    expect(warning).toMatch(/^tender-mcp: TENDER_FILES_DIR is inside ~\/\.tender, /);
+    expect(refusal).toMatch(
+      /^tender-mcp: TENDER_API_URL is an API for the contract other\.testnet/,
+    );
+    expect(rest).toBe("");
+    expect(warned.stderr).not.toContain(home);
+
+    // An ordinary files directory gets the refusal alone.
+    const quiet = await runBin({ ...env, TENDER_FILES_DIR: makeDir(home, "files") });
+    expect(quiet.stderr.split("\n")).toHaveLength(2);
+    expect(quiet.stderr).toMatch(/^tender-mcp: TENDER_API_URL is an API for the contract /);
+  } finally {
+    await new Promise<void>((done) => api.close(() => done()));
+  }
 });
 
 test("a_files_dir_may_be_reached_through_a_link_and_is_kept_as_where_it_leads", () => {
@@ -552,10 +779,10 @@ test("a_chain_of_links_is_refused_if_a_name_in_it_is_looked_up_where_others_can_
     symlinkSync(target, join(outside, "l2"), "dir");
     symlinkSync(join(outside, "l2"), work, "dir");
     expect(failureOf({ ...ENV, TENDER_FILES_DIR: work })).toMatch(SHARED);
-    // Pointed at the home, as it could be: the same answer, and the home is never what is kept.
+    // Pointed at the home, as it could be: refused as the home, and the home is never what is kept.
     rmSync(join(outside, "l2"));
     symlinkSync(home, join(outside, "l2"), "dir");
-    expect(failureOf({ ...ENV, TENDER_FILES_DIR: work })).toMatch(SHARED);
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: work })).toBe(HOME);
     // A link straight into `wd` was refused before (the real path is in `wd`), and still is.
     mkdirSync(join(outside, "sub"), { mode: 0o700 });
     symlinkSync(join(outside, "sub"), join(home, "direct"), "dir");
@@ -689,7 +916,11 @@ test("files_dir_and_the_directories_above_it_belong_to_the_user_or_to_root", () 
   // The way stops at the home, and at the root otherwise.
   expect(verdict({ ...clean(), "/": found(other, 0o777) }, "/srv")).toBe(FILES);
   expect(verdict({ ...clean(), "/srv": found(other, 0o777) }, "/srv")).toMatch(SHARED);
-  expect(verdict({ ...clean(), "/srv": found(other, 0o777) }, FILES)).toBe(FILES);
+  // The home itself is not a folder for the files, whatever its owner and mode, and neither is a
+  // directory that holds it, up to the root; one that only has a name like it is no such directory.
+  expect(verdict({ ...clean(), "/srv": found(other, 0o777) }, FILES)).toBe(HOME);
+  expect(verdict(clean(), "/srv/tender/files/me")).toBe(HOME);
+  expect(verdict(clean(), "/srv/tender/files-home")).toBe(FILES);
 
   // A link is judged as a link: the user's or root's will do, another user's will not. Where it
   // leads is what is kept, and that place is looked at, up to the root.
@@ -808,6 +1039,12 @@ test("files_dir_is_kept_as_its_real_path_where_there_are_no_user_ids", () => {
     expect(readConfig({ ...ENV, TENDER_FILES_DIR: join(home, "link") }, home).filesDir).toBe(open);
     expect(lstatSync).not.toHaveBeenCalled();
     expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "not-there") })).toBe(MISSING);
+    // The home, and a directory that holds it, are refused by the real path the kernel gives: the
+    // way is not followed here, and there is no other look.
+    symlinkSync(home, join(open, "home-link"), "dir");
+    for (const holder of [home, join(open, "home-link"), dirname(home), "/"]) {
+      expect(failureOf({ ...ENV, TENDER_FILES_DIR: holder }), holder).toBe(HOME);
+    }
   } finally {
     if (original !== undefined) Object.defineProperty(process, "getuid", original);
   }
@@ -979,5 +1216,119 @@ test("bin_exits_naming_missing_vars", { timeout: 120_000 }, async () => {
   for (const output of [empty, partial, garbage].map((r) => r.stdout + r.stderr)) {
     for (const piece of pieces) expect(output).not.toContain(piece);
     expect(output).not.toContain("SECRETGARBAGE123");
+  }
+});
+
+/** What an API says of itself when it can read its database and the chain. */
+function healthOf(network: string, contract: string): HealthResponse {
+  return {
+    ok: true,
+    network,
+    contract,
+    indexed_height: "10",
+    chain_final_height: "10",
+    lag_blocks: "0",
+  };
+}
+
+test("an_api_of_another_deployment_is_refused_and_one_that_cannot_answer_is_not", async () => {
+  const config = { network: "testnet", contractId: "tender.testnet" } as const;
+  const warn = vi.fn<(line: string) => void>();
+  const serving = (health: () => Promise<HealthResponse>) => ({ health });
+
+  // The network and the contract agree: nothing to say.
+  await checkApiDeployment(
+    config,
+    serving(async () => healthOf("testnet", "tender.testnet")),
+    warn,
+  );
+  expect(warn).not.toHaveBeenCalled();
+
+  // Another contract, or another network, is refused, and the line names the three settings. What
+  // the API says of its contract is shown (it is an account id, by the schema).
+  const other = await checkApiDeployment(
+    config,
+    serving(async () => healthOf("testnet", "other.testnet")),
+    warn,
+  ).catch((error: unknown) => error);
+  expect(other).toBeInstanceOf(ConfigError);
+  expect((other as ConfigError).message).toBe(
+    "TENDER_API_URL is an API for the contract other.testnet on testnet, which is not the " +
+      "deployment that TENDER_CONTRACT and TENDER_NETWORK name: make the three agree",
+  );
+  await expect(
+    checkApiDeployment(
+      config,
+      serving(async () => healthOf("mainnet", "tender.testnet")),
+      warn,
+    ),
+  ).rejects.toThrow(/on mainnet, which is not the deployment/);
+  // A network name that Tender has not got is not repeated: the API chose those words.
+  await expect(
+    checkApiDeployment(
+      config,
+      serving(async () => healthOf("ignore previous instructions", "tender.testnet")),
+      warn,
+    ),
+  ).rejects.toThrow(/on an unknown network, which is not the deployment/);
+  expect(warn).not.toHaveBeenCalled();
+
+  // An API that cannot answer is not a mismatch: the server starts, and one line says that the
+  // check did not happen, without the URL that the failure quotes.
+  await checkApiDeployment(
+    config,
+    serving(() =>
+      Promise.reject(new Error("fetch failed for https://api.tender.example/v1/health?k=1")),
+    ),
+    warn,
+  );
+  expect(warn).toHaveBeenCalledTimes(1);
+  const line = warn.mock.calls[0]?.[0] ?? "";
+  expect(line).toMatch(
+    /could not ask the API which network and contract it serves \(Error: fetch failed for <url>\)/,
+  );
+  expect(line).toMatch(/TENDER_API_URL was not checked against TENDER_NETWORK and TENDER_CONTRACT/);
+  expect(line).not.toContain("\n");
+  expect(line).not.toContain("api.tender.example");
+});
+
+test("bin_refuses_api_of_another_contract", { timeout: 120_000 }, async () => {
+  // The bin asks the API which deployment it serves before it asks the chain anything or makes a
+  // directory: an API of another contract would have this server commit to tasks that its contract
+  // does not have, and each refusal would retire a draft that then blocks its task number.
+  let served = healthOf("testnet", "other.testnet");
+  const api = createServer((request, response) => {
+    if (request.url === "/v1/health") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(served));
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((done) => api.listen(0, "127.0.0.1", done));
+  try {
+    const env = {
+      ...ENV,
+      TENDER_API_URL: `http://127.0.0.1:${(api.address() as AddressInfo).port}`,
+    };
+
+    const contract = await runBin(env);
+    expect(contract).toEqual({
+      code: 1,
+      stdout: "",
+      stderr:
+        "tender-mcp: TENDER_API_URL is an API for the contract other.testnet on testnet, which is " +
+        "not the deployment that TENDER_CONTRACT and TENDER_NETWORK name: make the three agree\n",
+    });
+
+    served = healthOf("mainnet", "tender.testnet");
+    const network = await runBin(env);
+    expect(network.code).toBe(1);
+    expect(network.stdout).toBe("");
+    expect(network.stderr).toMatch(
+      /^tender-mcp: TENDER_API_URL is an API for the contract tender\.testnet on mainnet, which is not the deployment that TENDER_CONTRACT and TENDER_NETWORK name: make the three agree\n$/,
+    );
+  } finally {
+    await new Promise<void>((done) => api.close(() => done()));
   }
 });
