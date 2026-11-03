@@ -1,6 +1,7 @@
 import type { Brief } from "@tender/shared";
 import { BRIEF_UNAVAILABLE, formatLabel } from "../lib/copy";
 import { safeHref } from "../lib/links";
+import { FACT_LABEL, PANEL, PANEL_TITLE, TAG, TEXT_LINK } from "./ui";
 
 /**
  * What the poster asks for, in the poster's words. All of it is text the poster wrote, so it is
@@ -9,33 +10,43 @@ import { safeHref } from "../lib/links";
 export function BriefSection({ brief }: { brief: Brief | null }) {
   if (brief === null) {
     return (
-      <section className="grid gap-2">
-        <h2 className="text-lg font-semibold">Brief</h2>
-        <p className="text-sm">{BRIEF_UNAVAILABLE}</p>
+      <section className={PANEL}>
+        <h2 className={PANEL_TITLE}>Brief</h2>
+        <p className="text-sm text-muted">{BRIEF_UNAVAILABLE}</p>
       </section>
     );
   }
   return (
-    <section className="grid gap-3">
-      <h2 className="text-lg font-semibold">Brief</h2>
-      {brief.summary === "" ? null : <p className="wrap-anywhere">{brief.summary}</p>}
-      <p data-testid="brief-instructions" className="text-sm whitespace-pre-wrap wrap-anywhere">
+    <section className={PANEL}>
+      <h2 className={PANEL_TITLE}>Brief</h2>
+      {brief.summary === "" ? null : (
+        <p className="text-[17px] leading-relaxed text-bone wrap-anywhere">{brief.summary}</p>
+      )}
+      <p
+        data-testid="brief-instructions"
+        className="rounded-xl border border-line bg-ink p-4 font-mono text-[13px] leading-relaxed whitespace-pre-wrap text-bone/90 wrap-anywhere"
+      >
         {brief.instructions}
       </p>
-      <p data-testid="brief-output" className="text-sm">
-        {`Answer: ${formatLabel(brief.output.format)}, up to ${brief.output.max_bytes} bytes`}
-      </p>
-      <p className="text-sm">
-        Category: <span data-testid="brief-category">{brief.category}</span>
-      </p>
+      <div className="grid gap-1 text-sm text-muted">
+        <p data-testid="brief-output">
+          {`Answer: ${formatLabel(brief.output.format)}, up to ${brief.output.max_bytes} bytes`}
+        </p>
+        <p>
+          Category:{" "}
+          <span data-testid="brief-category" className="text-bone">
+            {brief.category}
+          </span>
+        </p>
+      </div>
       {brief.tags.length === 0 ? null : (
-        <ul className="flex flex-wrap gap-2" aria-label="Tags">
+        <ul className="flex flex-wrap gap-1.5 text-bone/85" aria-label="Tags">
           {brief.tags.map((tag, i) => (
             <li
               // biome-ignore lint/suspicious/noArrayIndexKey: a brief may repeat a tag, so the place is part of the key
               key={`${tag}-${i}`}
               data-testid="brief-tag"
-              className="rounded border border-neutral-400 px-1.5 py-0.5 text-xs"
+              className={TAG}
             >
               {tag}
             </li>
@@ -43,14 +54,18 @@ export function BriefSection({ brief }: { brief: Brief | null }) {
         </ul>
       )}
       {brief.attachments === undefined || brief.attachments.length === 0 ? null : (
-        <div className="grid gap-1">
-          <h3 className="font-medium">Attachments</h3>
+        <div className="grid gap-2">
+          <h3 className={FACT_LABEL}>Attachments</h3>
           <ul className="grid gap-2">
             {brief.attachments.map((attachment, i) => {
               const href = safeHref(attachment.uri);
               return (
-                // biome-ignore lint/suspicious/noArrayIndexKey: two attachments can share a name
-                <li key={i} data-testid="attachment" className="grid gap-0.5 text-sm">
+                <li
+                  // biome-ignore lint/suspicious/noArrayIndexKey: two attachments can share a name
+                  key={i}
+                  data-testid="attachment"
+                  className="grid gap-0.5 rounded-xl border border-line bg-ink p-3 text-sm"
+                >
                   {href === undefined ? (
                     <>
                       <span className="wrap-anywhere">{attachment.name}</span>
@@ -61,12 +76,12 @@ export function BriefSection({ brief }: { brief: Brief | null }) {
                       href={href}
                       target="_blank"
                       rel="noopener noreferrer nofollow"
-                      className="w-fit underline wrap-anywhere"
+                      className={`${TEXT_LINK} w-fit wrap-anywhere`}
                     >
                       {attachment.name}
                     </a>
                   )}
-                  <span className="font-mono wrap-anywhere">{`sha256 ${attachment.sha256}`}</span>
+                  <span className="font-mono text-xs text-muted wrap-anywhere">{`sha256 ${attachment.sha256}`}</span>
                 </li>
               );
             })}
