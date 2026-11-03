@@ -77,8 +77,9 @@ async function seedBoard(): Promise<void> {
     task_id: SCORECARD_TASK,
     verifier: judge,
     kind: "exact",
-    criteria_hash: sha256Hex("criteria"),
-    heldout_commitment: null,
+    // What the captured task committed to, which the board's task 3 does: the card rests on it.
+    criteria_hash: fixtureData("task_created").criteria_hash,
+    heldout_commitment: fixtureData("task_created").heldout_commitment,
     heldout: null,
     tie_break: "score desc, committed_at_block asc, account asc",
     entries: [

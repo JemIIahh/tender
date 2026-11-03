@@ -187,14 +187,17 @@ const HELDOUT = { exact: { expected: ["42"] } };
 const HELDOUT_BYTES = canonicalJson(HELDOUT);
 const HELDOUT_HASH = sha256Hex(HELDOUT_BYTES);
 
+/** What the captured task committed to: a scorecard is shown only if it rests on the same. */
+const COMMITTED = fixtureData("task_created");
+
 function scorecardOf(taskId: string, over: Partial<Scorecard> = {}): Scorecard {
   return {
     version: 1,
     task_id: taskId,
     verifier: judge,
     kind: "exact",
-    criteria_hash: sha256Hex("criteria"),
-    heldout_commitment: null,
+    criteria_hash: COMMITTED.criteria_hash,
+    heldout_commitment: COMMITTED.heldout_commitment,
     heldout: null,
     tie_break: "score desc, committed_at_block asc, account asc",
     entries: [],
@@ -1877,6 +1880,38 @@ test("a_scorecard_is_served_only_beside_the_payout_it_names", async () => {
   expect(await servedScorecards("4")).toEqual([null, null, null]);
 });
 
+test("a_scorecard_is_served_only_for_the_criteria_and_held_out_the_task_committed_to", async () => {
+  await seedLifecycle(deps.db);
+  // Tasks 2 to 5 commit to the captured criteria and held-out. Tasks 6 and 7 have no held-out part.
+  await apply(...[2, 3, 4, 5, 6, 7].map((id) => taskLine(id)));
+  await deps.db.query("update tasks set heldout_commitment = null where id in (6, 7)");
+  const settle = async (id: string, over: Partial<Scorecard>) => {
+    const card = scorecardOf(id, { winners: PICKED_WINNERS, ...over });
+    await apply(pickLine(id, judge, PICKED_WINNERS, await publishCard(card)));
+    return card;
+  };
+
+  // The card that goes with the task's commitments is shown. (`scorecardOf` has them by default.)
+  const matching = await settle("2", {});
+  expect(matching.criteria_hash).toBe(COMMITTED.criteria_hash);
+  expect(matching.heldout_commitment).toBe(COMMITTED.heldout_commitment);
+  expect(await servedScorecards("2")).toEqual([matching, matching, matching]);
+  // So is the card of a task with no held-out part, when it says so.
+  const plain = await settle("7", { heldout_commitment: null });
+  expect(await servedScorecards("7")).toEqual([plain, plain, plain]);
+
+  // A card that scored against other criteria is not the task's scorecard, whoever wrote it. Nor
+  // is one that rests on another held-out document, or on none where the task has one, or on one
+  // where the task has none.
+  await settle("3", { criteria_hash: sha256Hex("other criteria") });
+  await settle("4", { heldout_commitment: sha256Hex("another held-out document") });
+  await settle("5", { heldout_commitment: null });
+  await settle("6", { heldout_commitment: HELDOUT_HASH });
+  for (const id of ["3", "4", "5", "6"]) {
+    expect(await servedScorecards(id), `task ${id}`).toEqual([null, null, null]);
+  }
+});
+
 test("a_scorecard_of_an_empty_pick_names_no_winners", async () => {
   await seedLifecycle(deps.db);
   await apply(taskLine(2), taskLine(3));
@@ -1921,7 +1956,11 @@ test("scorecard_route_hides_a_private_scorecard", async () => {
     uploader: judge,
     isPublic: false,
   });
-  await apply(taskLine(3), eventLine("picked", { task_id: "3", scorecard_hash: hash }));
+  // The task committed to the held-out its scorecard publishes.
+  await apply(
+    taskLine(3, { heldout_commitment: HELDOUT_HASH }),
+    eventLine("picked", { task_id: "3", scorecard_hash: hash }),
+  );
   const app = createApp(deps);
 
   expect((await get("/v1/scorecards/3", app)).status).toBe(404);

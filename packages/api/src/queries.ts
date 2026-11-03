@@ -274,14 +274,21 @@ export async function getScorecard(db: Db, taskId: string | bigint): Promise<Sco
   const id = String(taskId);
   if (!U64StringSchema.safeParse(id).success) return null;
   const [task] = await db.query<Settled>(
-    "select id::text as id, poster, verifier, outcome from tasks where id = $1::numeric",
+    `select id::text as id, poster, verifier, outcome, criteria_hash, heldout_commitment
+       from tasks where id = $1::numeric`,
     [id],
   );
   return task === undefined ? null : scorecardOf(db, task);
 }
 
-/** What a scorecard is held to: the task's id, its two accounts and its outcome. */
-type Settled = Pick<TaskDetail, "id" | "poster" | "verifier" | "outcome">;
+/**
+ * What a scorecard is held to: the task's id, its two accounts, its outcome, and the two hashes it
+ * committed to at posting.
+ */
+type Settled = Pick<
+  TaskDetail,
+  "id" | "poster" | "verifier" | "outcome" | "criteria_hash" | "heldout_commitment"
+>;
 
 /**
  * The scorecard the pick or the empty pick of `task` points at, or null: the task has no outcome or
@@ -292,9 +299,16 @@ type Settled = Pick<TaskDetail, "id" | "poster" | "verifier" | "outcome">;
  * deadline. So the hash can name any public scorecard, the card of another task, or the card the
  * Judge published before a pick of its own that failed, beside a payout the Judge did not make.
  * A card is shown only when it is the task's (`task_id`), it is the word of the task's verifier or
- * poster (`verifier`), and its winners are those the outcome paid, each account with its share in
- * the same order, or none for an empty pick. A poster that pays exactly what the Judge's card says
- * has the Judge's card shown, as it is the truth of that payout.
+ * poster (`verifier`), it rests on what the task committed to (`criteria_hash` and
+ * `heldout_commitment` are the task's own, both read from the index: no call to the chain), and its
+ * winners are those the outcome paid, each account with its share in the same order, or none for an
+ * empty pick. A poster that pays exactly what the Judge's card says has the Judge's card shown, as
+ * it is the truth of that payout.
+ *
+ * The two hashes are on chain, so a card that names others is not the scorecard of this task's
+ * criteria and held-out, whoever wrote it: it is a re-check of something else. The Judge's cards
+ * always carry the task's (`buildScorecard` refuses to make one otherwise). A verifier that writes
+ * its own card has to copy them from the task.
  */
 async function scorecardOf(db: Db, task: Settled): Promise<Scorecard | null> {
   const hash = task.outcome?.scorecard_hash ?? null;
@@ -302,6 +316,8 @@ async function scorecardOf(db: Db, task: Settled): Promise<Scorecard | null> {
   const scorecard = await publicDocument(db, hash, "scorecard", ScorecardSchema);
   if (scorecard === null || scorecard.task_id !== task.id) return null;
   if (scorecard.verifier !== task.verifier && scorecard.verifier !== task.poster) return null;
+  if (scorecard.criteria_hash !== task.criteria_hash) return null;
+  if (scorecard.heldout_commitment !== task.heldout_commitment) return null;
   return samePayout(scorecard.winners, task.outcome) ? scorecard : null;
 }
 

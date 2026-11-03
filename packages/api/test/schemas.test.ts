@@ -177,7 +177,8 @@ function scorecardOf(taskId: string, criteriaHash: string): Scorecard {
     verifier: judge,
     kind: "exact",
     criteria_hash: criteriaHash,
-    heldout_commitment: null,
+    // The held-out of the captured task, which task 3 commits to as well.
+    heldout_commitment: fixtureData("task_created").heldout_commitment,
     heldout: null,
     tie_break: "score desc, committed_at_block asc, account asc",
     entries: [
