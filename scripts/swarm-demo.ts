@@ -42,6 +42,7 @@ import {
   waiting,
 } from "./demo-local";
 import { REPO_ROOT } from "./lib/env";
+import { swarmPackHeldoutDirOf } from "./lib/heldout-dir";
 import { seed } from "./seed";
 
 /**
@@ -109,6 +110,12 @@ import { seed } from "./seed";
 
 const PACK = join(REPO_ROOT, "scripts", "swarm-research-pack");
 const CHILDREN = join(PACK, "children");
+/**
+ * The pack's held-out checks, which are secret until a task is judged and so are not in the
+ * repository: `parent/heldout.json` and `children/<slug>/heldout.json` of this folder, inside the
+ * private directory of the seeds' checks (`TENDER_SEEDS_PRIVATE_DIR`, see seeds/README.md).
+ */
+const PACK_HELDOUT = swarmPackHeldoutDirOf();
 /** The parent is the folder `parent` of the pack, which `seed` posts as it posts any seed. */
 const PARENT_SLUG = "parent";
 
@@ -399,6 +406,7 @@ async function swarm(h: Harness): Promise<void> {
       judgeAccount: judge.accountId,
       tokenId: token,
       seedsDir: PACK,
+      heldoutDir: PACK_HELDOUT,
       only: [PARENT_SLUG],
       windows: PARENT_WINDOWS,
       log: h.log,
@@ -430,6 +438,7 @@ async function swarm(h: Harness): Promise<void> {
   const leadApi = apiOf(delegate);
   const leadSolver = createLeadSolver({
     seedsDir: CHILDREN,
+    heldoutDir: join(PACK_HELDOUT, "children"),
     client: leadClient,
     api: leadApi,
     judgeAccount: judge.accountId,

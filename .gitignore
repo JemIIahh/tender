@@ -13,3 +13,5 @@ apps/web/test-results/
 apps/web/playwright-report/
 apps/web/next-env.d.ts
 *.tsbuildinfo
+# The seeds' held-out checks: secret until a task is judged, so never in the repository (seeds/README.md).
+seeds-private/

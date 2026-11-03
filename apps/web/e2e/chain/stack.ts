@@ -428,7 +428,11 @@ const clientOf = (chain: LocalChain, signer?: Signer) =>
     signer,
   });
 
-/** Posts the seeds as the poster and gives their ids and titles. */
+/**
+ * Posts the seeds as the poster and gives their ids and titles. Their held-out checks are not in
+ * the repository: `seed` reads them from the private directory (`TENDER_SEEDS_PRIVATE_DIR`, see
+ * seeds/README.md), and the run stops here, saying so, where they are not.
+ */
 async function postSeeds(
   chain: LocalChain,
   apiUrl: string,

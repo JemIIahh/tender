@@ -24,7 +24,8 @@ import {
   type TaskView,
   type TenderApi,
 } from "@tender/shared";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "vitest";
+import { writeSyntheticHeldouts } from "../../../seeds/synthetic-heldout";
 import { createLeadSolver, LEAD_TAG, type LeadChain, type LeadSolver } from "../src/agents/lead";
 import { type AgentChain, type AgentMemory, agentTick } from "../src/runner";
 import type { TaskContext } from "../src/types";
@@ -49,6 +50,14 @@ import {
 const PACK = join(import.meta.dirname, "../../../scripts/swarm-research-pack");
 const CHILDREN = join(PACK, "children");
 const SLUGS = ["01-gas-ledger", "02-key-audit", "03-event-tally"];
+
+// The pack's held-out checks are secret until a task is judged, so they are not in the pack (they
+// are in the private directory, see seeds/README.md). The lead only uploads them and commits to
+// their hash, so what these tests need of them is that they exist and are of the criteria's kind:
+// stand-ins, which are the same on every machine.
+const HELDOUT = mkdtempSync(join(tmpdir(), "lead-heldout-"));
+writeSyntheticHeldouts(CHILDREN, HELDOUT);
+afterAll(() => rmSync(HELDOUT, { recursive: true, force: true }));
 
 const LEAD = "lead.test.near";
 const ALICE = "alice.test.near";
@@ -392,6 +401,7 @@ afterEach(() => {
 function optionsOf(world: World, more: Partial<Parameters<typeof createLeadSolver>[0]> = {}) {
   return {
     seedsDir: CHILDREN,
+    heldoutDir: HELDOUT,
     client: world.client,
     api: world.api,
     judgeAccount: JUDGE,
@@ -759,6 +769,32 @@ describe("what the lead will not do", () => {
     writeFileSync(join(bad, "01-broken", "task.json"), "{}");
     const world = buildWorld();
     expect(() => createLeadSolver({ ...optionsOf(world), seedsDir: bad })).toThrow(/01-broken/);
+  });
+
+  test("a_child_whose_heldout_is_not_in_the_held_out_directory_is_found_when_the_solver_is_made", () => {
+    // The lead never posts a task without its checks, and finds out before it hires anyone.
+    const empty = mkdtempSync(join(tmpdir(), "lead-no-heldout-"));
+    dirs.push(empty);
+    const world = buildWorld();
+    expect(() => createLeadSolver({ ...optionsOf(world), heldoutDir: empty })).toThrow(
+      `held-out for 01-gas-ledger not found in ${empty}; set TENDER_SEEDS_PRIVATE_DIR`,
+    );
+  });
+
+  test("a_heldout_in_the_public_folder_of_a_child_is_not_read", () => {
+    // The pack's own folders are public, so checks that sit in one are not its checks.
+    const pack = mkdtempSync(join(tmpdir(), "lead-public-heldout-"));
+    const empty = mkdtempSync(join(tmpdir(), "lead-no-heldout-"));
+    dirs.push(pack, empty);
+    cpSync(CHILDREN, pack, { recursive: true });
+    cpSync(
+      join(HELDOUT, "01-gas-ledger", "heldout.json"),
+      join(pack, "01-gas-ledger", "heldout.json"),
+    );
+    const world = buildWorld();
+    expect(() =>
+      createLeadSolver({ ...optionsOf(world), seedsDir: pack, heldoutDir: empty }),
+    ).toThrow(/held-out for 01-gas-ledger not found/);
   });
 
   test("options_that_make_no_sense_are_found_when_the_solver_is_made", () => {

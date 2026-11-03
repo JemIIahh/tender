@@ -1,7 +1,8 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { HeldoutSchema, type PublicCriteria, PublicCriteriaSchema } from "@tender/shared";
 import { expect, test, vi } from "vitest";
+import { heldoutDirOf, heldoutFileOf } from "../../../scripts/lib/heldout-dir";
 import { ScorerUnavailableError, scoreEntry, scoreRegexCases } from "../src/index";
 import type { HeldoutOf } from "../src/kinds/common";
 import { runInSandbox } from "../src/sandbox";
@@ -55,12 +56,27 @@ function withCases(passing: number, failing: number) {
   );
 }
 
+/**
+ * Where the `near-account-regex` seed's held-out cases are: not in the seed's folder, which is
+ * public, but in the private directory (`TENDER_SEEDS_PRIVATE_DIR`, see seeds/README.md).
+ */
+const NEAR_ACCOUNT_HELDOUT = heldoutFileOf(heldoutDirOf(), "near-account-regex");
+/** Whether this machine has them. Where it has not (CI), the tests that score the seed are skipped. */
+const hasNearAccountSeed = existsSync(NEAR_ACCOUNT_HELDOUT);
+const seedTest = test.skipIf(!hasNearAccountSeed);
+if (!hasNearAccountSeed) {
+  console.warn(
+    `regex_cases: held-out for near-account-regex not found in ${heldoutDirOf()}; set TENDER_SEEDS_PRIVATE_DIR. ` +
+      "The tests that score the seed are skipped.",
+  );
+}
+
 /** The `near-account-regex` seed: its criteria, held-out cases and two answers. */
 function nearAccountSeed() {
   const dir = join(import.meta.dirname, "../../../seeds/near-account-regex");
   const read = (name: string) => readFileSync(join(dir, name));
   const c = PublicCriteriaSchema.parse(JSON.parse(read("criteria.json").toString("utf8")));
-  const h = HeldoutSchema.parse(JSON.parse(read("heldout.json").toString("utf8")));
+  const h = HeldoutSchema.parse(JSON.parse(readFileSync(NEAR_ACCOUNT_HELDOUT, "utf8")));
   if (c.kind !== "regex_cases" || !("regex_cases" in h)) throw new Error("not a regex_cases seed");
   return { c, h: h.regex_cases, solution: read("solution.txt"), weak: read("weak.txt") };
 }
@@ -73,7 +89,7 @@ const LINE_SEPARATOR = String.fromCodePoint(0x2028);
 const PARAGRAPH_SEPARATOR = String.fromCodePoint(0x2029);
 const LONE_SURROGATE = String.fromCodePoint(0xd800);
 
-test("near_account_regex_scores_100", async () => {
+seedTest("near_account_regex_scores_100", async () => {
   const { c, h, solution } = nearAccountSeed();
 
   expect(await scoreRegexCases(c, h, solution)).toEqual({ score: 100, passed: true, reasons: [] });
@@ -85,7 +101,7 @@ test("near_account_regex_scores_100", async () => {
   });
 });
 
-test("weak_regex_scores_lower", async () => {
+seedTest("weak_regex_scores_lower", async () => {
   const { c, h, weak } = nearAccountSeed();
 
   const result = await scoreRegexCases(c, h, weak);
@@ -485,7 +501,7 @@ test("sandbox_failures_become_reasons", async () => {
   });
 });
 
-test("entries_score_independently", { timeout: 10_000 }, async () => {
+seedTest("entries_score_independently", { timeout: 10_000 }, async () => {
   const { c, h, solution, weak } = nearAccountSeed();
 
   // Scored together, as the Judge will. Each entry gets a runtime and a budget of its own, so a

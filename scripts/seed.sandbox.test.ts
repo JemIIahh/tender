@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type LocalChain, startLocalChain, TenderClient } from "@tender/client";
 import {
@@ -12,12 +13,17 @@ import {
   type TenderApi,
 } from "@tender/shared";
 import { afterAll, beforeAll, expect, test } from "vitest";
+import { writeSyntheticHeldouts } from "../seeds/synthetic-heldout";
+import { heldoutDirOf, heldoutFileOf, missingHeldouts } from "./lib/heldout-dir";
 import { type SeedWindows, seed } from "./seed";
 
 // The seed script against a local chain with Tender and a test token on it, and a fake API that
 // keeps what is uploaded and says where it is served. What the chain holds of each task is read
 // back and compared with the repository's own files, whose hashes are worked out here on their
-// own: the script and the test agree only if the chain really holds what the files say.
+// own: the script and the test agree only if the chain really holds what the files say. A seed's
+// held-out checks are not among the repository's files (they are secret until the task is judged):
+// they are read from the private directory when this machine has them, and are stand-ins of the
+// right kind where it has not (CI), so the same posting is checked either way.
 
 let chain: LocalChain;
 /** Unsigned, for reading. */
@@ -49,16 +55,37 @@ const clientOf = (role: Role) =>
 
 const SEEDS = join(import.meta.dirname, "..", "seeds");
 
-/** A file of a seed of the repository, as JSON. */
+/** The private directory when it has every seed's checks, else a directory of stand-ins. */
+const STAND_IN_DIR: string | undefined = (() => {
+  const slugs = readdirSync(SEEDS, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  if (missingHeldouts(SEEDS, heldoutDirOf(), slugs).length === 0) return undefined;
+  const dir = mkdtempSync(join(tmpdir(), "tender-heldout-stand-in-"));
+  writeSyntheticHeldouts(SEEDS, dir);
+  return dir;
+})();
+const HELDOUT_DIR = STAND_IN_DIR ?? heldoutDirOf();
+
+afterAll(() => {
+  if (STAND_IN_DIR !== undefined) rmSync(STAND_IN_DIR, { recursive: true, force: true });
+});
+
+/** A file of a seed of the repository, as JSON; its held-out checks are in `HELDOUT_DIR`. */
 const fileOf = (slug: string, name: string) =>
-  JSON.parse(readFileSync(join(SEEDS, slug, name), "utf8")) as Record<string, unknown>;
+  JSON.parse(
+    readFileSync(
+      name === "heldout.json" ? heldoutFileOf(HELDOUT_DIR, slug) : join(SEEDS, slug, name),
+      "utf8",
+    ),
+  ) as Record<string, unknown>;
 
 /** The hash a task holds of a document: the SHA-256 of its canonical bytes. */
 const hashOf = (document: object) => sha256Hex(canonicalJson(document));
 
 /** The commitment a seed's task holds: the hash of its held-out checks, or none for a rubric seed. */
 const commitmentOf = (slug: string) =>
-  existsSync(join(SEEDS, slug, "heldout.json")) ? hashOf(fileOf(slug, "heldout.json")) : null;
+  existsSync(heldoutFileOf(HELDOUT_DIR, slug)) ? hashOf(fileOf(slug, "heldout.json")) : null;
 
 const unexpected = (method: string) => () => {
   throw new Error(`unexpected call to api.${method}`);
@@ -263,6 +290,7 @@ async function seedAs(role: Role, only: string[], extra: { windows?: SeedWindows
     poster: chain.accounts[role].accountId,
     judgeAccount: chain.accounts.judge.accountId,
     tokenId: chain.tokenId,
+    heldoutDir: HELDOUT_DIR,
     only,
     log: (line) => lines.push(line),
     ...extra,
@@ -307,6 +335,7 @@ test("two_seeds_are_posted_and_each_task_reads_back_as_its_files_say", async () 
     poster: poster.accountId,
     judgeAccount: chain.accounts.judge.accountId,
     tokenId: chain.tokenId,
+    heldoutDir: HELDOUT_DIR,
     only: ["near-account-regex", "invoice-extract"],
     log: (line) => lines.push(line),
   });
@@ -365,6 +394,7 @@ test("a_vault_that_holds_part_of_the_rewards_is_topped_up_by_the_rest_and_no_mor
     poster: lead.accountId,
     judgeAccount: chain.accounts.judge.accountId,
     tokenId: chain.tokenId,
+    heldoutDir: HELDOUT_DIR,
     only: ["sum-of-transfers"],
     log: (line) => lines.push(line),
   });
@@ -394,6 +424,7 @@ test("all_thirty_seeds_are_posted_by_an_account_that_opens_with_the_storage_for_
     poster: alice.accountId,
     judgeAccount: chain.accounts.judge.accountId,
     tokenId: chain.tokenId,
+    heldoutDir: HELDOUT_DIR,
     log: (line) => lines.push(line),
   });
 
@@ -436,6 +467,7 @@ test("the_windows_option_sets_the_windows_of_the_task_on_chain", async () => {
     poster: bob.accountId,
     judgeAccount: chain.accounts.judge.accountId,
     tokenId: chain.tokenId,
+    heldoutDir: HELDOUT_DIR,
     only: ["base58-decoded-length"],
     windows,
     log: () => {},
@@ -468,6 +500,7 @@ test("a_seed_whose_heldout_is_public_is_not_posted_and_its_reward_stays_with_the
     poster: poster.accountId,
     judgeAccount: chain.accounts.judge.accountId,
     tokenId: chain.tokenId,
+    heldoutDir: HELDOUT_DIR,
     only: ["semver-regex", "iso-date-regex"],
     log: (line) => lines.push(line),
   });
@@ -506,6 +539,7 @@ test("a_poster_whose_wallet_cannot_cover_the_rewards_posts_nothing_and_moves_not
     poster: keeper.accountId,
     judgeAccount: chain.accounts.judge.accountId,
     tokenId: chain.tokenId,
+    heldoutDir: HELDOUT_DIR,
     log: () => {},
   }).then(
     () => undefined,

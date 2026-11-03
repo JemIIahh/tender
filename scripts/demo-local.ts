@@ -36,7 +36,11 @@ import { redact, type Services, startServices } from "./serve";
 
 /**
  * `pnpm demo:local`: the whole loop of Tender on one machine, for a judge who has Node and pnpm and
- * nothing else. It needs no `.env`, no Rust, no Docker, no Postgres and no LLM key. It starts a
+ * nothing else. It needs no `.env`, no Rust, no Docker, no Postgres and no LLM key, but it does
+ * need the held-out checks of its seed, which are not in the repository (they are secret until a
+ * task is judged): `near-account-regex/heldout.json` in the private directory, which is
+ * `TENDER_SEEDS_PRIVATE_DIR` or `seeds-private/` (seeds/README.md). Without it the demo stops at
+ * posting, saying where it looked. It starts a
  * local chain (nearcore's sandbox node, with Tender and a test token on it) and the services of
  * `pnpm serve` (the API, the indexer, the keeper and the Judge, on an in-memory PGlite), posts the
  * seed `near-account-regex`, and lets two scripted agents enter it: alice, whose answer is right,

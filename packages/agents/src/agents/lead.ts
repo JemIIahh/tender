@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { randomBytes } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { TenderClient } from "@tender/client";
@@ -157,11 +157,19 @@ export type LeadApi = Pick<TenderApi, "getTask" | "getBlob" | "uploadBlob" | "up
 export interface LeadSolverOptions {
   /**
    * The folder of the sub-tasks: one folder for each, in the format of the seeds (`task.json`,
-   * `brief.json`, `criteria.json`, `heldout.json` when the criteria have a held-out part). They are
-   * posted in name order, and their results are the parts, in the same order. Only the files the
-   * lead posts from are read; a `solution.txt` beside them is for whoever plays the specialists.
+   * `brief.json`, `criteria.json`). They are posted in name order, and their results are the
+   * parts, in the same order. Only the files the lead posts from are read; a `solution.txt` beside
+   * them is for whoever plays the specialists.
    */
   seedsDir: string;
+  /**
+   * Where the held-out checks of the sub-tasks are: `<heldoutDir>/<name>/heldout.json` for each
+   * sub-task whose criteria have a held-out part. They are secret until a task is judged, so they
+   * are kept outside the folders of `seedsDir`, which are public, and a sub-task whose file is
+   * not there is a mistake found when the solver is made: the lead never posts a task without its
+   * checks.
+   */
+  heldoutDir: string;
   /** Signs as the lead. For a swarm it signs with a delegate key, and the posts carry no deposit. */
   client: LeadChain;
   /** Signed in as the lead: the uploads are the poster's. */
@@ -299,7 +307,7 @@ function parsed<T>(schema: Schema<T>, json: unknown, where: string): T {
 }
 
 /** Reads and checks one sub-task folder. Nothing here touches the API or the chain. */
-function readChild(dir: string, slug: string): ChildSpec {
+function readChild(dir: string, heldoutDir: string, slug: string): ChildSpec {
   const terms = readJson(dir, slug, "task.json");
   const where = `${slug}/task.json`;
   if (typeof terms !== "object" || terms === null || Array.isArray(terms)) {
@@ -331,9 +339,14 @@ function readChild(dir: string, slug: string): ChildSpec {
   );
   let heldout: Doc | undefined;
   if (criteria.has_heldout) {
+    if (!existsSync(join(heldoutDir, slug, "heldout.json"))) {
+      throw new Error(
+        `held-out for ${slug} not found in ${heldoutDir}; set TENDER_SEEDS_PRIVATE_DIR`,
+      );
+    }
     const checks = parsed(
       HeldoutSchema,
-      readJson(dir, slug, "heldout.json"),
+      readJson(join(heldoutDir, slug), slug, "heldout.json"),
       `${slug}/heldout.json`,
     );
     if (!heldoutMatchesCriteria(criteria, checks)) {
@@ -359,14 +372,14 @@ function readChild(dir: string, slug: string): ChildSpec {
 }
 
 /** Every sub-task folder of `seedsDir`, in name order. Throws for a folder that does not fit. */
-function readChildren(seedsDir: string): ChildSpec[] {
+function readChildren(seedsDir: string, heldoutDir: string): ChildSpec[] {
   const slugs = readdirSync(seedsDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
   if (slugs.length === 0)
     throw new Error(`${seedsDir} has no sub-tasks: a lead needs at least one`);
-  return slugs.map((slug) => readChild(join(seedsDir, slug), slug));
+  return slugs.map((slug) => readChild(join(seedsDir, slug), heldoutDir, slug));
 }
 
 // ---- The journal --------------------------------------------------------------------------------
@@ -573,7 +586,7 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
   if (o.journalDir === "") throw new Error("the lead's journal directory must not be empty");
   if (o.delegateKey === "") throw new Error("the lead needs the public key of its delegate key");
   // Read now, so a pack that is wrong fails when the lead is made and not on the first parent.
-  const specs = readChildren(o.seedsDir);
+  const specs = readChildren(o.seedsDir, o.heldoutDir);
   const posters = postersOf(o);
   // Resolved now, so that a later `chdir` cannot move the journal.
   const journalDir = resolve(o.journalDir);

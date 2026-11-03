@@ -21,11 +21,17 @@ import {
 } from "@tender/shared";
 import { type Deployment, parseKey, readDeployment, UsageError } from "./deploy";
 import { loadEnv, REPO_ROOT } from "./lib/env";
+import { HELDOUT_DIR_VARIABLE, heldoutDirOf } from "./lib/heldout-dir";
 
 /**
  * The seed script. It posts the seed tasks under `seeds/<slug>/`, in slug order, as the poster. A
- * seed is four files: `task.json` (the reward, token, windows, winners and verifier), `brief.json`,
- * `criteria.json` and, when the criteria have a held-out part, `heldout.json`. For each seed it
+ * seed is three public files: `task.json` (the reward, token, windows, winners and verifier),
+ * `brief.json` and `criteria.json`, and, when the criteria have a held-out part, its checks in
+ * `heldout.json`. The checks are secret until the task is judged, so they are not in the
+ * repository: they are read from `<private dir>/<slug>/heldout.json`, where the private dir is
+ * `$TENDER_SEEDS_PRIVATE_DIR`, or `seeds-private/` of the repository (git ignores it) when that is
+ * not set. A seed whose criteria have a held-out part and whose file is not there stops the run
+ * before anything is posted: a task is never posted without its checks. For each seed the script
  * uploads the brief and the criteria as canonical JSON, stores the held-out checks with the API
  * (which serves them to nobody until the task is judged), and posts the task with its hashes. It
  * prints one line as each seed is dealt with, and as the poster is topped up:
@@ -140,6 +146,12 @@ export interface SeedOptions {
   tokenId?: string;
   /** Where the seeds are. The repository's `seeds/` by default. */
   seedsDir?: string;
+  /**
+   * Where the held-out checks are: `<heldoutDir>/<slug>/heldout.json` for each seed that has a
+   * held-out part. `$TENDER_SEEDS_PRIVATE_DIR` by default, else the repository's `seeds-private/`.
+   * Never `seedsDir`: the seeds' own folders are public.
+   */
+  heldoutDir?: string;
   /** Post only these seeds, by slug. A slug that is no seed is an error. */
   only?: readonly string[];
   /** Replaces the windows of every seed, for a demo or a test that cannot wait a whole phase. */
@@ -280,7 +292,9 @@ async function readJson(
   try {
     text = await readFile(join(dir, name), "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    // ENOTDIR: a part of the path is a file, as when the private directory is named by a file.
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
     throw error;
   }
   try {
@@ -386,6 +400,7 @@ function rewardOf(reward: string, token: string, network: NetworkId, slug: strin
 async function prepare(
   o: SeedOptions,
   seedsDir: string,
+  heldoutDir: string,
   slug: string,
   deployed: () => Promise<Deployment | null>,
 ): Promise<Prepared> {
@@ -402,14 +417,19 @@ async function prepare(
     `${slug}/criteria.json`,
   );
 
-  // The criteria say whether a held-out part stands behind them, and the folder has to agree: a
-  // task whose checks are missing cannot be judged, and checks nobody posts are no secret kept.
-  const heldoutFile = await readJson(dir, "heldout.json", `${slug}/heldout.json`);
+  // The criteria say whether a held-out part stands behind them, and the private directory has to
+  // agree: a task whose checks are missing cannot be judged, and checks nobody posts are no secret
+  // kept. The checks are in the private directory and never in the seed's own (public) folder.
+  const heldoutFile = await readJson(
+    join(heldoutDir, slug),
+    "heldout.json",
+    `${slug}/heldout.json`,
+  );
   let heldout: Doc | undefined;
   if (criteria.has_heldout) {
     if (heldoutFile === null) {
       throw new Error(
-        `${slug}/criteria.json has a held-out part, and ${slug}/heldout.json does not exist`,
+        `held-out for ${slug} not found in ${heldoutDir}; set ${HELDOUT_DIR_VARIABLE}`,
       );
     }
     const checks = parsed(HeldoutSchema, heldoutFile.json, `${slug}/heldout.json`);
@@ -418,7 +438,9 @@ async function prepare(
     }
     heldout = docOf(checks, `${slug}/heldout.json`);
   } else if (heldoutFile !== null) {
-    throw new Error(`${slug}/heldout.json exists, and ${slug}/criteria.json has no held-out part`);
+    throw new Error(
+      `${slug}/heldout.json exists in ${heldoutDir}, and ${slug}/criteria.json has no held-out part`,
+    );
   }
 
   const token = await tokenOf(terms.token, slug, o, deployed);
@@ -707,12 +729,12 @@ const MAINNET_REFUSED =
  * funded.
  *
  * Throws for mainnet, whether `network` or the client says it; if `network` and the client's network
- * differ; if the client does not sign as the poster; naming the seed, if its files are wrong, or
- * two seeds share their held-out checks; if the API is not the client's deployment, or its index
- * is more than 10 blocks behind the chain; if the poster's wallet cannot cover the rewards the vault
- * lacks; if the API's list of the poster's tasks cannot be read in full; and with the API's or the
- * chain's own error if either refuses a step. The seeds posted before a failure stay posted, and
- * running the script again finishes the rest.
+ * differ; if the client does not sign as the poster; naming the seed, if its files are wrong, its
+ * held-out file is not in the private directory, or two seeds share their held-out checks; if the
+ * API is not the client's deployment, or its index is more than 10 blocks behind the chain; if the
+ * poster's wallet cannot cover the rewards the vault lacks; if the API's list of the poster's tasks
+ * cannot be read in full; and with the API's or the chain's own error if either refuses a step. The
+ * seeds posted before a failure stay posted, and running the script again finishes the rest.
  */
 export async function seed(o: SeedOptions): Promise<SeededTask[]> {
   const log = o.log ?? console.log;
@@ -729,6 +751,7 @@ export async function seed(o: SeedOptions): Promise<SeededTask[]> {
     throw new Error(`the client ${signs}, but it has to sign as the poster ${o.poster}`);
   }
   const seedsDir = o.seedsDir ?? join(REPO_ROOT, "seeds");
+  const heldoutDir = o.heldoutDir ?? heldoutDirOf();
   const slugs = await chooseSlugs(seedsDir, o.only);
 
   let deployment: Promise<Deployment | null> | undefined;
@@ -737,7 +760,7 @@ export async function seed(o: SeedOptions): Promise<SeededTask[]> {
     return deployment;
   };
   const seeds: Prepared[] = [];
-  for (const slug of slugs) seeds.push(await prepare(o, seedsDir, slug, deployed));
+  for (const slug of slugs) seeds.push(await prepare(o, seedsDir, heldoutDir, slug, deployed));
   refuseSharedHeldout(seeds);
   // Nothing is asked when there is nothing to post.
   if (seeds.length === 0) return [];
@@ -860,6 +883,19 @@ export function loadTarget(
   };
 }
 
+/**
+ * Where the command line looks for the held-out checks: `TENDER_SEEDS_PRIVATE_DIR` of the process,
+ * else that of `.env` (or `.env.deploy.testnet`), else the repository's `seeds-private/`. The
+ * process comes first so that a shell can point one run elsewhere without editing a file.
+ */
+function heldoutDirOfCli(dir: string | undefined): string {
+  const fromFiles = loadEnv("testnet", { dir })[HELDOUT_DIR_VARIABLE];
+  const fromProcess = process.env[HELDOUT_DIR_VARIABLE];
+  return heldoutDirOf({
+    [HELDOUT_DIR_VARIABLE]: (fromProcess ?? "").trim() === "" ? fromFiles : fromProcess,
+  });
+}
+
 /** What the command line prints on a failure: the code and the transaction of a `TenderError`. */
 export function describeFailure(error: unknown): string {
   if (error instanceof TenderError) {
@@ -927,6 +963,7 @@ export async function main(args: readonly string[], options: CliOptions = {}): P
       only,
       log: out,
       dir: options.dir,
+      heldoutDir: heldoutDirOfCli(options.dir),
     });
     return 0;
   } catch (error) {
