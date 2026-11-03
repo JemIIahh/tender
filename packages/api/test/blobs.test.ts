@@ -3,7 +3,9 @@ import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  type Db,
   getBlob,
+  hasHeldoutUpload,
   hasResultUpload,
   migrate,
   openDb,
@@ -22,13 +24,16 @@ import {
   FIXTURE_OPTIONS,
   FIXTURE_PROFILE,
   FIXTURE_PROFILE_HASH,
+  fixtureData,
 } from "@tender/indexer/testing";
+import { intakeTask, type JudgeDeps } from "@tender/judge";
 import { canonicalJson, type PublicCriteria, type Scorecard, sha256Hex } from "@tender/shared";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { validator } from "hono/validator";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { z } from "zod";
+import type { AuthVariables, RequireAuth } from "../src/auth";
 import { handleError, readJson } from "../src/format";
 import {
   type AgentDetailResponse,
@@ -39,7 +44,7 @@ import {
   type TaskDetailResponse,
 } from "../src/index";
 import { publicDocument } from "../src/queries";
-import { type AuthVariables, blobRoutes, type RequireAuth } from "../src/routes/blobs";
+import { blobRoutes } from "../src/routes/blobs";
 import { resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 
 // The blob store and the held-out intake. The upload routes are mounted on an app of their own
@@ -174,6 +179,9 @@ const CRITERIA: PublicCriteria = {
   has_heldout: true,
   normalize: ["trim"],
 };
+
+/** The winners of the captured `picked` event, as a scorecard names them: account and share. */
+const PICKED_WINNERS = fixtureData("picked").winners.map(({ account, bps }) => ({ account, bps }));
 
 const HELDOUT = { exact: { expected: ["42"] } };
 const HELDOUT_BYTES = canonicalJson(HELDOUT);
@@ -315,6 +323,25 @@ async function expectScorecardRefused(
 }
 
 const NOT_FOUND = { error: "not_found", message: expect.any(String) };
+
+/** What a result that is a document of another kind is refused with. */
+const ANOTHER_KIND: ErrorBody = {
+  error: "bad_request",
+  message:
+    "these bytes are a canonical brief, criteria, held-out, profile or scorecard document: upload it as that kind, or end your answer with a newline",
+};
+
+/** The canonical bytes of a brief titled `title`: one size for every title of the same length. */
+const briefOf = (title: string) => canonicalJson({ ...FIXTURE_BRIEF, title });
+
+/** The accounts recorded as having sent the held-out document under `sha256`. */
+async function heldoutUploadersOf(sha256: string): Promise<string[]> {
+  const rows = await deps.db.query<{ account: string }>(
+    "select account from heldout_uploads where sha256 = $1 order by account",
+    [sha256],
+  );
+  return rows.map((row) => row.account);
+}
 
 // ---- The brief's tests ------------------------------------------------------------------------
 
@@ -940,7 +967,8 @@ test("heldout_hash_must_match_commitment", async () => {
   const ok = await upload(HELDOUT_HASH, HELDOUT_BYTES);
   expect(ok.status).toBe(200);
   expect(ok.body).toEqual({ ok: true });
-  // It is stored private, as the poster's, under the hash the chain will hold as the commitment.
+  // It is stored private, as the poster's, under the hash the chain will hold as the commitment,
+  // and the poster is recorded as one who sent it.
   expect(await rowOf(HELDOUT_HASH)).toEqual({
     kind: "heldout",
     content_type: "application/json",
@@ -948,6 +976,7 @@ test("heldout_hash_must_match_commitment", async () => {
     uploader: poster,
     is_public: false,
   });
+  expect(await heldoutUploadersOf(HELDOUT_HASH)).toEqual([poster]);
 
   // Bytes that do not hash to the commitment are refused, however good they are.
   const other = canonicalJson({ exact: { expected: ["43"] } });
@@ -984,6 +1013,10 @@ test("heldout_hash_must_match_commitment", async () => {
   const extra = { commitment: HELDOUT_HASH, content_base64: b64(HELDOUT_BYTES), kind: "heldout" };
   expect((await post("/v1/heldout", extra, poster)).status).toBe(400);
   expect((await post("/v1/heldout", { commitment: HELDOUT_HASH }, poster)).status).toBe(400);
+  // None of the refused uploads is recorded.
+  expect(await deps.db.query("select sha256, account from heldout_uploads")).toEqual([
+    { sha256: HELDOUT_HASH, account: poster },
+  ]);
 });
 
 test("heldout_never_served_while_private", async () => {
@@ -1353,6 +1386,8 @@ test("kind_conflict_is_409", async () => {
   expect((await post("/v1/blobs", blobBody("profile", profile), carol)).status).toBe(409);
   expect(await rowOf(result)).toMatchObject({ kind: "result", is_public: false, uploader: alice });
 
+  // A public brief is not a result either. A result that is a document of another kind is refused
+  // for what it is, before its kind is looked at (`a_result_may_not_be_a_document_of_another_kind`).
   const publicBrief = canonicalJson({ ...FIXTURE_BRIEF, title: "Already public" });
   const brief = await post("/v1/blobs", blobBody("brief", publicBrief), carol);
   const asResult = await post<ErrorBody>(
@@ -1360,8 +1395,8 @@ test("kind_conflict_is_409", async () => {
     resultBody(publicBrief, "1", { content_type: "application/json" }),
     alice,
   );
-  expect(asResult.status).toBe(409);
-  expect(asResult.body).toEqual(conflict);
+  expect(asResult.status).toBe(400);
+  expect(asResult.body).toEqual(ANOTHER_KIND);
   expect(await rowOf(brief.body.sha256)).toMatchObject({
     kind: "brief",
     is_public: true,
@@ -1387,30 +1422,40 @@ test("kind_conflict_is_409", async () => {
   expect(await rowOf(answers)).toMatchObject({ kind: "result", uploader: alice, is_public: false });
 });
 
-test("heldout_from_another_uploader_is_409", async () => {
+test("heldout_is_recorded_for_every_account_that_sends_it", async () => {
   const body = { commitment: HELDOUT_HASH, content_base64: b64(HELDOUT_BYTES) };
+  // Carol has the bytes first, as anyone can once a document is out (a seed's is in the
+  // repository), and the row is hers. The poster's upload of the same bytes is answered as any
+  // other, and counts: the Judge asks whether the poster is among those who sent them.
+  expect((await post("/v1/heldout", body, carol)).status).toBe(200);
+  const mine = await post<{ ok: true }>("/v1/heldout", body, poster);
+  expect([mine.status, mine.body]).toEqual([200, { ok: true }]);
+  expect(await rowOf(HELDOUT_HASH)).toMatchObject({ uploader: carol, is_public: false });
+  expect(await heldoutUploadersOf(HELDOUT_HASH)).toEqual([carol, poster]);
+  expect(await hasHeldoutUpload(deps.db, HELDOUT_HASH, poster)).toBe(true);
+
+  // Saying it again is the same blob and the same record.
   expect((await post("/v1/heldout", body, poster)).status).toBe(200);
-
-  // Another account holding the same bytes would leave a document the Judge does not accept
-  // (it takes a held-out only from the task's poster), so the poster is told now.
-  const other = await post<ErrorBody>("/v1/heldout", body, carol);
-  expect(other.status).toBe(409);
-  expect(other.body.error).toBe("conflict");
-  expect(await rowOf(HELDOUT_HASH)).toMatchObject({ uploader: poster, is_public: false });
-
-  // The poster can say it again, and it is the same blob.
-  const again = await post("/v1/heldout", body, poster);
-  expect(again.status).toBe(200);
-  expect(again.body).toEqual({ ok: true });
   expect(await blobCount()).toBe(1);
+  expect(await heldoutUploadersOf(HELDOUT_HASH)).toEqual([carol, poster]);
 
-  // Carol, first with other bytes, is the uploader of those.
-  const mine = canonicalJson({ exact: { expected: ["44"] } });
-  expect(
-    (await post("/v1/heldout", { commitment: sha256Hex(mine), content_base64: b64(mine) }, carol))
-      .status,
-  ).toBe(200);
-  expect((await rowOf(sha256Hex(mine)))?.uploader).toBe(carol);
+  // Bytes stored as another kind are a 409, and no one is recorded for them.
+  const answers = canonicalJson({ exact: { expected: ["44"] } });
+  await putBlob(deps.db, {
+    kind: "result",
+    contentType: "text/plain",
+    bytes: answers,
+    taskId: 1n,
+    uploader: alice,
+    isPublic: false,
+  });
+  const taken = await post<ErrorBody>(
+    "/v1/heldout",
+    { commitment: sha256Hex(answers), content_base64: b64(answers) },
+    poster,
+  );
+  expect(taken.status).toBe(409);
+  expect(await heldoutUploadersOf(sha256Hex(answers))).toEqual([]);
 });
 
 test("brief_and_profile_are_stored_public", async () => {
@@ -1695,7 +1740,8 @@ test("scorecard_route_serves_the_scorecard_of_a_settled_task", async () => {
         reasons: ["matches the expected value"],
       },
     ],
-    winners: [{ account: alice, bps: 10_000 }],
+    // What the task's pick pays, below: a scorecard is served only beside its own payout.
+    winners: PICKED_WINNERS,
   });
   const bytes = canonicalJson(document);
   const stored = await post("/v1/blobs", blobBody("scorecard", bytes), judge);
@@ -1751,9 +1797,123 @@ test("scorecard_route_hides_a_scorecard_that_names_another_task", async () => {
   expect((await get("/v1/scorecards/9", app)).status).toBe(404);
 });
 
+/**
+ * The scorecard of task `id` wherever the API serves one: its route, the task's page and the MCP
+ * tool, each as the document it serves, or null for none. One function decides for all three
+ * (`getScorecard`), so they have to agree.
+ */
+async function servedScorecards(id: string): Promise<Array<Scorecard | null>> {
+  const app = createApp(deps);
+  const route = await get(`/v1/scorecards/${id}`, app);
+  const page = (await (await app.request(`/v1/tasks/${id}`)).json()) as TaskDetailResponse;
+  const call = await app.request("/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "get_scorecard", arguments: { task_id: id } },
+    }),
+  });
+  const { result } = (await call.json()) as {
+    result: { isError?: boolean; content: Array<{ text: string }> };
+  };
+  return [
+    route.status === 200 ? (JSON.parse(route.text()) as Scorecard) : null,
+    page.scorecard,
+    result.isError === true ? null : (JSON.parse(result.content[0]?.text ?? "") as Scorecard),
+  ];
+}
+
+/** Stores `document` as a public scorecard, as the Judge stores its own before it picks. */
+function publishCard(document: Scorecard): Promise<string> {
+  return putBlob(deps.db, {
+    kind: "scorecard",
+    contentType: "application/json",
+    bytes: canonicalJson(document),
+    taskId: BigInt(document.task_id),
+    uploader: document.verifier,
+    isPublic: true,
+  });
+}
+
+/** A `picked` line for task `id`, by `by`, paying `winners` (each with some amount). */
+function pickLine(
+  id: string,
+  by: string,
+  winners: Array<{ account: string; bps: number }>,
+  scorecardHash: string,
+): string {
+  return eventLine("picked", {
+    task_id: id,
+    by,
+    winners: winners.map((winner) => ({ ...winner, amount: "1000" })),
+    scorecard_hash: scorecardHash,
+  });
+}
+
+test("a_scorecard_is_served_only_beside_the_payout_it_names", async () => {
+  await seedLifecycle(deps.db);
+  await apply(taskLine(2), taskLine(3), taskLine(4));
+  const toAlice = [{ account: alice, bps: 10_000 }];
+
+  // The Judge published its card for task 2 before a pick that failed. In the fallback window the
+  // poster picks other winners with the Judge's hash: the card, which names the Judge as verifier
+  // and alice as the winner, must not be shown beside a payout to bob that the Judge never made.
+  const laundered = scorecardOf("2", { winners: toAlice });
+  await apply(pickLine("2", poster, [{ account: bob, bps: 10_000 }], await publishCard(laundered)));
+  expect(await servedScorecards("2")).toEqual([null, null, null]);
+
+  // A poster that pays exactly what the Judge's card says has the Judge's card shown: it is the
+  // truth of that payout.
+  const honoured = scorecardOf("3", { winners: toAlice });
+  await apply(pickLine("3", poster, toAlice, await publishCard(honoured)));
+  expect(await servedScorecards("3")).toEqual([honoured, honoured, honoured]);
+
+  // The same accounts and shares in another order are another pick.
+  const reordered = scorecardOf("4", { winners: PICKED_WINNERS });
+  await apply(pickLine("4", judge, PICKED_WINNERS.toReversed(), await publishCard(reordered)));
+  expect(await servedScorecards("4")).toEqual([null, null, null]);
+});
+
+test("a_scorecard_of_an_empty_pick_names_no_winners", async () => {
+  await seedLifecycle(deps.db);
+  await apply(taskLine(2), taskLine(3));
+  // A pick with no winners voids the task as `no_award`, with the scorecard it was made with.
+  const empty = scorecardOf("2");
+  await apply(eventLine("voided", { task_id: "2", scorecard_hash: await publishCard(empty) }));
+  expect(await servedScorecards("2")).toEqual([empty, empty, empty]);
+
+  // A card that names winners does not go with a payout of nothing.
+  const named = scorecardOf("3", { winners: [{ account: alice, bps: 10_000 }] });
+  await apply(eventLine("voided", { task_id: "3", scorecard_hash: await publishCard(named) }));
+  expect(await servedScorecards("3")).toEqual([null, null, null]);
+});
+
+test("a_scorecard_is_the_word_of_the_tasks_verifier_or_poster", async () => {
+  await seedLifecycle(deps.db);
+  await apply(taskLine(2), taskLine(3));
+  // A card that pays what the pick paid, for the task, in the name of an account that is neither
+  // its verifier nor its poster, is nobody's to show for it. (The upload route would not take it;
+  // the read holds to the same.)
+  const strangers = scorecardBy(carol, "2", { winners: PICKED_WINNERS });
+  await apply(pickLine("2", judge, PICKED_WINNERS, await publishCard(strangers)));
+  expect(await servedScorecards("2")).toEqual([null, null, null]);
+
+  // The poster's own card, for a pick it made in the fallback window, is shown.
+  const posters = scorecardBy(poster, "3", { winners: PICKED_WINNERS });
+  await apply(pickLine("3", poster, PICKED_WINNERS, await publishCard(posters)));
+  expect(await servedScorecards("3")).toEqual([posters, posters, posters]);
+});
+
 test("scorecard_route_hides_a_private_scorecard", async () => {
   await seedLifecycle(deps.db);
-  const document = scorecardOf("3", { heldout: HELDOUT, heldout_commitment: HELDOUT_HASH });
+  const document = scorecardOf("3", {
+    heldout: HELDOUT,
+    heldout_commitment: HELDOUT_HASH,
+    winners: PICKED_WINNERS,
+  });
   const hash = await putBlob(deps.db, {
     kind: "scorecard",
     contentType: "application/json",
@@ -1815,7 +1975,11 @@ test("scorecard_with_proto_key_is_never_served_with_the_key_missing", async () =
   const heldout: unknown = JSON.parse('{"exact":{"expected":["42"]},"__proto__":{"seen":true}}');
   expect(Object.keys(heldout as object)).toContain("__proto__");
   const bytes = canonicalJson(
-    scorecardOf("3", { heldout, heldout_commitment: sha256Hex(canonicalJson(heldout)) }),
+    scorecardOf("3", {
+      heldout,
+      heldout_commitment: sha256Hex(canonicalJson(heldout)),
+      winners: PICKED_WINNERS,
+    }),
   );
   const hash = await putBlob(deps.db, {
     kind: "scorecard",
@@ -1968,10 +2132,11 @@ test("a_refused_upload_records_nothing", async () => {
   await refused(resultBody("an answer", undefined), alice, 400);
   await refused(resultBody("an answer", "1", { content_base64: "QUJD\n" }), alice, 400);
 
-  // Bytes that are stored as another kind are a 409. The brief itself is no result, and has no record.
+  // A document of another kind is no result, whether it is stored already or not: a 400, and the
+  // brief has no record of a result.
   const brief = canonicalJson({ ...FIXTURE_BRIEF, title: "Also an answer" });
   expect((await post("/v1/blobs", blobBody("brief", brief), alice)).status).toBe(200);
-  await refused(resultBody(brief, "1", { content_type: "application/json" }), alice, 409);
+  await refused(resultBody(brief, "1", { content_type: "application/json" }), alice, 400);
 
   expect(await uploadCount()).toBe(0);
   expect(await blobCount()).toBe(base + 1);
@@ -2278,6 +2443,7 @@ test("scorecard_route_hides_a_stored_scorecard_it_cannot_write_again", async () 
           reasons: ["a\ud800b"],
         },
       ],
+      winners: PICKED_WINNERS,
     });
     expect(() => canonicalJson(document)).toThrow(/lone surrogate/);
     const bytes = utf8(JSON.stringify(document));
@@ -2487,7 +2653,7 @@ test("a_result_stored_before_the_records_is_served_after_the_upgrade", async () 
     }
 
     // The upgrade gives the result its record: carol's, for task 2, from the time she sent it.
-    expect(await migrate(old)).toEqual(["0002_result_uploads.sql"]);
+    expect(await migrate(old)).toEqual(["0002_result_uploads.sql", "0003_heldout_uploads.sql"]);
     expect(
       await old.query(
         "select sha256, task_id::text as task_id, account, uploaded_at from result_uploads",
@@ -2505,4 +2671,413 @@ test("a_result_stored_before_the_records_is_served_after_the_upgrade", async () 
     await old.close();
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// ---- Bytes that are not the uploader's to fix (I2) --------------------------------------------
+
+test("a_result_may_not_be_a_document_of_another_kind", async () => {
+  const base = await seed();
+  // The canonical bytes of each kind of document that another route stores. Stored first as
+  // somebody's private result, they could never be that document.
+  const documents: Array<[string, Uint8Array]> = [
+    ["a brief", canonicalJson({ ...FIXTURE_BRIEF, title: "Somebody else's brief" })],
+    ["criteria", canonicalJson(CRITERIA)],
+    ["a held-out document", HELDOUT_BYTES],
+    ["a profile", canonicalJson({ ...FIXTURE_PROFILE, name: "Somebody else" })],
+    ["a scorecard", canonicalJson(scorecardOf("1"))],
+  ];
+  for (const [what, bytes] of documents) {
+    for (const contentType of ["application/json", "text/plain"]) {
+      const body = resultBody(bytes, "1", { content_type: contentType });
+      const res = await post<ErrorBody>("/v1/blobs", body, alice);
+      expect([res.status, res.body], `${what} as ${contentType}`).toEqual([400, ANOTHER_KIND]);
+    }
+    expect(await rowOf(sha256Hex(bytes)), what).toBeNull();
+  }
+  expect(await blobCount()).toBe(base);
+  expect(await uploadCount()).toBe(0);
+
+  // An answer that happens to be such a document is the same answer with a newline at its end.
+  // A document that is not in its canonical form, which could not be stored as its kind, is a
+  // result, and so is JSON that fits no kind of document.
+  const answers = [
+    new Uint8Array([...HELDOUT_BYTES, 0x0a]),
+    utf8(JSON.stringify(CRITERIA, null, 2)),
+    canonicalJson({ total: 42 }),
+  ];
+  for (const bytes of answers) {
+    const body = resultBody(bytes, "1", { content_type: "application/json" });
+    expect((await post("/v1/blobs", body, alice)).status).toBe(200);
+  }
+  expect(await uploadCount()).toBe(answers.length);
+});
+
+/**
+ * The team's Judge on this file's database and clock, as far as intake needs one: whether it takes
+ * a task's documents. Intake asks the chain nothing, so its chain has nothing to say.
+ */
+function judgeOf(): JudgeDeps {
+  return {
+    db: deps.db,
+    client: {
+      getTask: async () => null,
+      getAllEntries: async () => [],
+      pick: async () => {
+        throw new Error("intake does not pick");
+      },
+    },
+    judgeAccount: judge,
+    teamAccounts: [],
+    publicUrl: "http://api.test",
+    resultUploaded: async () => false,
+    now: () => new Date(Number(nowNs / 1_000_000n)),
+  };
+}
+
+/**
+ * Task `id` of the poster, judged by the Judge, whose terms commit to `CRITERIA` and to `HELDOUT`
+ * and whose brief is `brief`, as the indexer stores it once the poster has posted it.
+ */
+async function postedTask(id: number, brief: Uint8Array): Promise<void> {
+  await apply(
+    taskLine(id, {
+      brief_hash: sha256Hex(brief),
+      criteria_hash: sha256Hex(canonicalJson(CRITERIA)),
+      heldout_commitment: HELDOUT_HASH,
+    }),
+  );
+}
+
+test("a_stranger_who_stores_the_heldout_first_does_not_keep_it_from_its_poster", async () => {
+  // The first griefing order of I2: a stranger has the poster's held-out document (a seed's is in
+  // the repository) and sends it to the held-out route first. Then the poster sends the same bytes
+  // and the criteria, and the Judge takes the task.
+  const brief = briefOf("The poster's task");
+  await postedTask(5, brief);
+  const heldout = { commitment: HELDOUT_HASH, content_base64: b64(HELDOUT_BYTES) };
+
+  expect((await post("/v1/heldout", heldout, carol)).status).toBe(200);
+  expect((await post("/v1/heldout", heldout, poster)).status).toBe(200);
+  expect(
+    (await post("/v1/blobs", blobBody("criteria", canonicalJson(CRITERIA)), poster)).status,
+  ).toBe(200);
+  expect((await post("/v1/blobs", blobBody("brief", brief), poster)).status).toBe(200);
+  expect(await rowOf(HELDOUT_HASH)).toMatchObject({ uploader: carol, is_public: false });
+
+  expect(await intakeTask(judgeOf(), 5n)).toBe("accepted");
+
+  // The other order is no trouble either: the poster first, then the stranger, whose upload is
+  // recorded and changes nothing for the poster's next task with other checks.
+  const second = canonicalJson({ exact: { expected: ["43"] } });
+  await apply(
+    taskLine(6, {
+      criteria_hash: sha256Hex(canonicalJson(CRITERIA)),
+      heldout_commitment: sha256Hex(second),
+    }),
+  );
+  const sent = { commitment: sha256Hex(second), content_base64: b64(second) };
+  expect((await post("/v1/heldout", sent, poster)).status).toBe(200);
+  expect((await post("/v1/heldout", sent, carol)).status).toBe(200);
+  expect(await intakeTask(judgeOf(), 6n)).toBe("accepted");
+});
+
+test("an_entrant_cannot_store_a_posters_documents_first_as_its_result", async () => {
+  // The second griefing order of I2: an entrant of any task (alice, on task 1) has the documents
+  // of the poster's task and sends them as a result first, which would fix their kind as a private
+  // result for good. Each is refused, and nothing is stored, so the poster's uploads that follow
+  // are the documents, and the Judge takes the task.
+  await seed();
+  const brief = briefOf("The poster's other task");
+  await postedTask(5, brief);
+  const documents = [canonicalJson(CRITERIA), HELDOUT_BYTES, brief];
+  for (const bytes of documents) {
+    const asResult = await post<ErrorBody>("/v1/blobs", resultBody(bytes, "1"), alice);
+    expect([asResult.status, asResult.body]).toEqual([400, ANOTHER_KIND]);
+    expect(await rowOf(sha256Hex(bytes))).toBeNull();
+  }
+  expect(await uploadCount()).toBe(0);
+
+  const heldout = { commitment: HELDOUT_HASH, content_base64: b64(HELDOUT_BYTES) };
+  expect((await post("/v1/heldout", heldout, poster)).status).toBe(200);
+  expect(
+    (await post("/v1/blobs", blobBody("criteria", canonicalJson(CRITERIA)), poster)).status,
+  ).toBe(200);
+  expect((await post("/v1/blobs", blobBody("brief", brief), poster)).status).toBe(200);
+
+  expect(await intakeTask(judgeOf(), 5n)).toBe("accepted");
+  // The brief is served under the hash the task names.
+  const served = await get(`/v1/blobs/${sha256Hex(brief)}`);
+  expect([served.status, served.bytes]).toEqual([200, brief]);
+});
+
+// ---- Upload limits (I1) -----------------------------------------------------------------------
+
+const HOUR_MS = 3_600_000;
+
+/** The body that uploads `bytes` as a held-out document under their own hash. */
+const heldoutBody = (bytes: Uint8Array) => ({
+  commitment: sha256Hex(bytes),
+  content_base64: b64(bytes),
+});
+
+/** Expects the refusal `status` with `body`, and a `Retry-After` within `windowMs`. */
+function expectRefused(res: Reply<ErrorBody>, status: number, body: ErrorBody, windowMs: number) {
+  expect([res.status, res.body]).toEqual([status, body]);
+  const retryAfter = Number(res.headers.get("retry-after"));
+  expect(Number.isInteger(retryAfter)).toBe(true);
+  expect(retryAfter).toBeGreaterThanOrEqual(1);
+  expect(retryAfter).toBeLessThanOrEqual(Math.ceil(windowMs / 1000));
+}
+
+const RATE_LIMITED: ErrorBody = {
+  error: "rate_limited",
+  message: "too many requests, try again later",
+};
+const UPLOADED_TOO_MUCH: ErrorBody = {
+  error: "rate_limited",
+  message: "this account has uploaded too many bytes, try again later",
+};
+const BLOBS_USED_UP: ErrorBody = {
+  error: "unavailable",
+  message: "the API is taking no more uploads for now, try again later",
+};
+const HELDOUTS_USED_UP: ErrorBody = {
+  error: "unavailable",
+  message: "the API is taking no more held-out documents for now, try again later",
+};
+
+test("uploads_are_counted_per_account_across_both_routes", async () => {
+  await seed();
+  const app = appWith({ rateLimits: { upload: { limit: 3, windowMs: HOUR_MS } } });
+  const brief = (title: string) => blobBody("brief", briefOf(title));
+
+  // A brief, a held-out document and an upload that is refused for what it is: three uploads.
+  expect((await post("/v1/blobs", brief("one"), alice, app)).status).toBe(200);
+  expect((await post("/v1/heldout", heldoutBody(HELDOUT_BYTES), alice, app)).status).toBe(200);
+  expect((await post("/v1/blobs", { kind: "nonsense" }, alice, app)).status).toBe(400);
+
+  // A fourth, to either route, is a 429 with `Retry-After`, and nothing of it is kept.
+  const blobs = await blobCount();
+  const another = canonicalJson({ exact: { expected: ["43"] } });
+  expectRefused(await post("/v1/blobs", brief("two"), alice, app), 429, RATE_LIMITED, HOUR_MS);
+  expectRefused(
+    await post("/v1/heldout", heldoutBody(another), alice, app),
+    429,
+    RATE_LIMITED,
+    HOUR_MS,
+  );
+  expect(await blobCount()).toBe(blobs);
+  expect(await heldoutUploadersOf(sha256Hex(another))).toEqual([]);
+
+  // Another account has a count of its own, though every request here has the same address.
+  expect((await post("/v1/blobs", brief("bob"), bob, app)).status).toBe(200);
+
+  // The team's accounts are not counted at all; the others still are.
+  const team = appWith({
+    teamAccounts: [carol],
+    rateLimits: { upload: { limit: 1, windowMs: HOUR_MS } },
+  });
+  for (const title of ["ca1", "ca2", "ca3"]) {
+    expect((await post("/v1/blobs", brief(title), carol, team)).status, title).toBe(200);
+  }
+  expect((await post("/v1/blobs", brief("bo1"), bob, team)).status).toBe(200);
+  expect((await post("/v1/blobs", brief("bo2"), bob, team)).status).toBe(429);
+});
+
+test("upload_bytes_are_held_to_a_budget_for_each_account", async () => {
+  await seed();
+  const size = briefOf("one").length;
+  const app = appWith({ rateLimits: { uploadBytes: { limit: 2 * size, windowMs: HOUR_MS } } });
+
+  expect((await post("/v1/blobs", blobBody("brief", briefOf("one")), alice, app)).status).toBe(200);
+  expect((await post("/v1/blobs", blobBody("brief", briefOf("two")), alice, app)).status).toBe(200);
+  // A third is more than the account may store: a 429 that says when its window ends, with
+  // nothing stored. The held-out route takes from the same budget.
+  const blobs = await blobCount();
+  expectRefused(
+    await post("/v1/blobs", blobBody("brief", briefOf("six")), alice, app),
+    429,
+    UPLOADED_TOO_MUCH,
+    HOUR_MS,
+  );
+  expectRefused(
+    await post("/v1/heldout", heldoutBody(HELDOUT_BYTES), alice, app),
+    429,
+    UPLOADED_TOO_MUCH,
+    HOUR_MS,
+  );
+  expect(await blobCount()).toBe(blobs);
+  expect(await heldoutUploadersOf(HELDOUT_HASH)).toEqual([]);
+
+  // Another account has a budget of its own, and a team account has none.
+  expect((await post("/v1/blobs", blobBody("brief", briefOf("bob")), bob, app)).status).toBe(200);
+  const team = appWith({
+    teamAccounts: [carol],
+    rateLimits: { uploadBytes: { limit: size, windowMs: HOUR_MS } },
+  });
+  for (const title of ["ca1", "ca2", "ca3"]) {
+    const res = await post("/v1/blobs", blobBody("brief", briefOf(title)), carol, team);
+    expect(res.status, title).toBe(200);
+  }
+});
+
+test("each_route_has_a_pool_of_its_own_and_the_team_is_held_to_neither", async () => {
+  await seed();
+  const size = briefOf("one").length;
+  const another = canonicalJson({ exact: { expected: ["43"] } });
+  const app = appWith({
+    teamAccounts: [carol],
+    rateLimits: {
+      blobBytesTotal: { limit: size, windowMs: HOUR_MS },
+      heldoutBytesTotal: { limit: HELDOUT_BYTES.length, windowMs: HOUR_MS },
+    },
+  });
+  const brief = (account: string, title: string) =>
+    post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf(title)), account, app);
+  const heldout = (account: string, bytes: Uint8Array) =>
+    post<ErrorBody>("/v1/heldout", heldoutBody(bytes), account, app);
+
+  // Alice's brief takes all that the route of the other kinds takes in its hour: the next new
+  // upload to it, by any account but the team's, is a 503 that says when the hour is over.
+  expect((await brief(alice, "one")).status).toBe(200);
+  const blobs = await blobCount();
+  expectRefused(await brief(bob, "two"), 503, BLOBS_USED_UP, HOUR_MS);
+  expect(await blobCount()).toBe(blobs);
+
+  // A flood of other uploads cannot stop a poster's held-out document: that route has a pool of
+  // its own. Used up in its turn, it refuses new held-out documents.
+  expect((await heldout(poster, HELDOUT_BYTES)).status).toBe(200);
+  expectRefused(await heldout(bob, another), 503, HELDOUTS_USED_UP, HOUR_MS);
+  expect(await heldoutUploadersOf(sha256Hex(another))).toEqual([]);
+
+  // The team's accounts are held to neither pool, and take from neither.
+  expect((await brief(carol, "car")).status).toBe(200);
+  expect((await heldout(carol, another)).status).toBe(200);
+  expect(await heldoutUploadersOf(sha256Hex(another))).toEqual([carol]);
+  expectRefused(await brief(bob, "two"), 503, BLOBS_USED_UP, HOUR_MS);
+});
+
+test("bytes_that_are_stored_already_cost_nothing", async () => {
+  await seed();
+  const size = briefOf("one").length;
+  const app = appWith({
+    rateLimits: {
+      uploadBytes: { limit: size, windowMs: HOUR_MS },
+      blobBytesTotal: { limit: 2 * size, windowMs: HOUR_MS },
+      heldoutBytesTotal: { limit: HELDOUT_BYTES.length, windowMs: HOUR_MS },
+    },
+  });
+  const brief = (account: string, title: string) =>
+    post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf(title)), account, app);
+
+  // Alice's brief takes all of her budget. Sending it again, as she or anyone else may, stores no
+  // new row and costs nothing, so it is taken whatever is left.
+  expect((await brief(alice, "one")).status).toBe(200);
+  expect((await brief(alice, "one")).status).toBe(200);
+  expect((await brief(bob, "one")).status).toBe(200);
+  // So bob still has his whole budget, and the route a brief's worth of room.
+  expect((await brief(bob, "two")).status).toBe(200);
+  expectRefused(await brief(alice, "six"), 429, UPLOADED_TOO_MUCH, HOUR_MS);
+
+  // The same for a held-out document: the second account to send it is recorded, for nothing.
+  const sent = heldoutBody(HELDOUT_BYTES);
+  expect((await post("/v1/heldout", sent, carol, app)).status).toBe(200);
+  expect((await post("/v1/heldout", sent, poster, app)).status).toBe(200);
+  expect(await heldoutUploadersOf(HELDOUT_HASH)).toEqual([carol, poster]);
+});
+
+test("of_two_uploads_of_the_same_new_bytes_at_once_only_the_one_that_stores_them_pays", async () => {
+  await seed();
+  const size = briefOf("one").length;
+  // Both uploads find the bytes not stored, and are charged, before either puts them: the puts are
+  // held until both have looked. The second put stores no row, and its upload is given back what
+  // it was charged.
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let lookups = 0;
+  const racing: Db = {
+    ...deps.db,
+    query: (async (sql: string, params?: unknown[]) => {
+      if (sql.includes("insert into blobs")) await held;
+      const rows = await deps.db.query(sql, params);
+      if (sql.includes("from blobs where sha256") && ++lookups === 2) release();
+      return rows;
+    }) as Db["query"],
+  };
+  const app = appWith({
+    db: racing,
+    rateLimits: { uploadBytes: { limit: 2 * size, windowMs: HOUR_MS } },
+  });
+  const send = (account: string, title: string) =>
+    post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf(title)), account, app);
+
+  const both = await Promise.all([send(alice, "duo"), send(bob, "duo")]);
+  expect(both.map((res) => res.status)).toEqual([200, 200]);
+  // Each had room for two briefs. The one that stored the bytes has room for one more and the
+  // other for two: three between them, where two would mean both had paid.
+  let more = 0;
+  for (const [account, titles] of [
+    [alice, ["al1", "al2"]],
+    [bob, ["bo1", "bo2"]],
+  ] as const) {
+    for (const title of titles) if ((await send(account, title)).status === 200) more += 1;
+  }
+  expect(more).toBe(3);
+});
+
+test("an_upload_that_is_refused_costs_nothing", async () => {
+  await seed();
+  const size = briefOf("one").length;
+  const app = appWith({
+    rateLimits: {
+      uploadBytes: { limit: size, windowMs: HOUR_MS },
+      blobBytesTotal: { limit: size, windowMs: HOUR_MS },
+    },
+  });
+  // Bytes stored as somebody's result before, which no route stores as a brief.
+  const taken = briefOf("tkn");
+  await putBlob(deps.db, {
+    kind: "result",
+    contentType: "application/json",
+    bytes: taken,
+    taskId: 1n,
+    uploader: alice,
+    isPublic: false,
+  });
+
+  // Carol is refused, over and over: a body that is no upload, a brief that is not canonical, bytes
+  // stored as another kind, a result for a task she has no entry on, content that is too large.
+  const refusals: Array<[unknown, number]> = [
+    [{ kind: "nonsense" }, 400],
+    [blobBody("brief", utf8(JSON.stringify(FIXTURE_BRIEF, null, 2))), 400],
+    [blobBody("brief", taken), 409],
+    [resultBody("an answer", "1"), 403],
+    [resultBody(new Uint8Array(LIMIT + 1), "1"), 413],
+  ];
+  for (const [body, status] of refusals) {
+    expect((await post("/v1/blobs", body, carol, app)).status).toBe(status);
+  }
+  // None of it was charged: her budget and the route's pool still have room for a brief.
+  expect((await post("/v1/blobs", blobBody("brief", briefOf("one")), carol, app)).status).toBe(200);
+  expectRefused(
+    await post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf("two")), carol, app),
+    429,
+    UPLOADED_TOO_MUCH,
+    HOUR_MS,
+  );
+});
+
+test("an_upload_budget_lets_the_account_in_again_once_its_window_is_over", async () => {
+  await seed();
+  const size = briefOf("one").length;
+  const app = appWith({ rateLimits: { uploadBytes: { limit: size, windowMs: 300 } } });
+  const upload = (title: string) =>
+    post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf(title)), alice, app);
+
+  expect((await upload("one")).status).toBe(200);
+  expectRefused(await upload("two"), 429, UPLOADED_TOO_MUCH, 300);
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  expect((await upload("two")).status).toBe(200);
 });

@@ -1,4 +1,5 @@
 export { createApp } from "./app";
+export type { AuthVariables, RequireAuth } from "./auth";
 export { NoAnswerInTime, withinDeadline } from "./deadline";
 export type { ApiDeps, ChainReader } from "./deps";
 export type {

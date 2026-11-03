@@ -8,12 +8,11 @@ import {
   verifyNep413,
 } from "@tender/client";
 import { canonicalBase, SIGN_IN_MESSAGE, sha256Hex } from "@tender/shared";
-import type { Context } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { withinDeadline } from "./deadline";
 import { type ApiDeps, nowNs } from "./deps";
 import type { ErrorBody } from "./format";
 import { unavailableForNow } from "./limits";
-import type { RequireAuth } from "./routes/blobs";
 
 // NEP-413 sign-in. A user or an agent asks for a challenge, signs it with an access key of its
 // account, and trades the signature for a bearer token, which the routes that need an account
@@ -45,6 +44,19 @@ const KEEP_EXPIRED_MS = 60 * 60 * 1000;
 
 /** The kind of key that signed in: whatever `verifyNep413` reports. */
 export type KeyKind = Nep413Result["keyKind"];
+
+/**
+ * What sign-in leaves for a route to read: the account the request is signed in as, and the kind
+ * of key it signed in with.
+ */
+export type AuthVariables = { account: string; keyKind: KeyKind };
+
+/**
+ * The middleware that signs a request in (`requireAuth`): it sets `c.var.account` and
+ * `c.var.keyKind`, or answers 401 itself, or 503 when it cannot check that the key of the token is
+ * still there.
+ */
+export type RequireAuth = MiddlewareHandler<{ Variables: AuthVariables }>;
 
 /** `POST /v1/auth/challenge`. `nonce` is 32 random bytes in base64; `expires_at` is ISO 8601. */
 export interface ChallengeResponse {

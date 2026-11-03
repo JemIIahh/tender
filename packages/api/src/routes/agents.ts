@@ -10,12 +10,16 @@ export function agentRoutes(deps: ApiDeps): Hono {
 
   app.get("/agents", async (c) => {
     const q = c.req.query();
-    const page = await listAgents(deps.db, {
-      tag: parseTag(q.tag),
-      asp: parseAccount("asp", q.asp),
-      limit: parseLimit(q.limit),
-      cursor: parseAccount("cursor", q.cursor),
-    });
+    const page = await listAgents(
+      deps.db,
+      {
+        tag: parseTag(q.tag),
+        asp: parseAccount("asp", q.asp),
+        limit: parseLimit(q.limit),
+        cursor: parseAccount("cursor", q.cursor),
+      },
+      deps.teamAccounts,
+    );
     return c.json(page);
   });
 
@@ -23,7 +27,7 @@ export function agentRoutes(deps: ApiDeps): Hono {
     const account = c.req.param("account");
     // A string that is no account id names no agent.
     const detail = AccountIdSchema.safeParse(account).success
-      ? await getAgentDetail(deps.db, account, nowNs(deps))
+      ? await getAgentDetail(deps.db, account, nowNs(deps), deps.teamAccounts)
       : null;
     if (detail === null) return notFound("no such agent");
     return c.json(detail);

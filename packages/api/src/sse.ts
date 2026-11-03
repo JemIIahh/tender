@@ -4,18 +4,20 @@ import { Hono } from "hono";
 import { type SSEStreamingApi, streamSSE } from "hono/streaming";
 import type { ApiDeps } from "./deps";
 import { type ErrorBody, parseU64 } from "./format";
+import { clientKey } from "./limits";
 
 // `GET /v1/events`: the events the indexer has stored, as a Server-Sent Events stream, for the web
 // app and for agents that want to know when something happens without asking again and again.
 //
 // The stream reads the `events` table and nothing else. Every stream polls it, so a client that
 // connects costs the database one small indexed query a second; `maxSseStreams` is what bounds
-// that. The events come out in the order of their ids, and a reconnecting client names the last
-// id it got (`Last-Event-ID`, or `?since=`) and gets everything after it, no more and no less.
-// That is safe because the indexer is the only writer and applies one block at a time, the events
-// of a block in one transaction: they become visible in the order of their ids, so a stream that
-// has read up to an id has missed nothing below it. The ids have gaps (a rolled-back transaction
-// uses up its ids), so a stream asks for `id > last`, never for `last + 1`.
+// that, and `maxSseStreamsPerClient` keeps one client, which needs no sign-in, from taking every
+// place there is. The events come out in the order of their ids, and a reconnecting client names
+// the last id it got (`Last-Event-ID`, or `?since=`) and gets everything after it, no more and no
+// less. That is safe because the indexer is the only writer and applies one block at a time, the
+// events of a block in one transaction: they become visible in the order of their ids, so a stream
+// that has read up to an id has missed nothing below it. The ids have gaps (a rolled-back
+// transaction uses up its ids), so a stream asks for `id > last`, never for `last + 1`.
 //
 // A stream does not live for ever. The place it holds is given back only when its loop ends, and a
 // client that has stopped reading (a stalled connection, a half-open one) leaves that loop waiting
@@ -60,6 +62,9 @@ const PAGE = 100;
 
 /** The open streams a process serves at once, unless `deps.maxSseStreams` says otherwise. */
 const DEFAULT_MAX_STREAMS = 200;
+
+/** The open streams one client has at once, unless `deps.maxSseStreamsPerClient` says otherwise. */
+const DEFAULT_MAX_STREAMS_PER_CLIENT = 4;
 
 /** How long a client that was turned away should wait before it tries again, in seconds. */
 const RETRY_AFTER_SECONDS = "5";
@@ -260,8 +265,10 @@ function destroyUnlessFinished(connection: ServerResponse | undefined, graceMs: 
  * sees it end and reconnects with the last id it got. If its connection is still open 10 seconds
  * after that, because the client is not reading, it is destroyed.
  *
- * At most `deps.maxSseStreams` (200) streams are open in a process. Past that, or if that is not
- * a number, the answer is a 503 with `Retry-After: 5`. `HEAD` is answered with the headers and no
+ * At most `deps.maxSseStreams` (200) streams are open in a process, and at most
+ * `deps.maxSseStreamsPerClient` (4) of them for one client, by its address as the rate limits count
+ * it (`clientKey`, behind `deps.trustedProxyHops` proxies). Past either, or if either is not a
+ * number, the answer is a 503 with `Retry-After: 5`. `HEAD` is answered with the headers and no
  * stream: Hono hands it to this route and then drops the body without reading it, so a stream
  * opened for it would never end.
  *
@@ -274,8 +281,10 @@ function destroyUnlessFinished(connection: ServerResponse | undefined, graceMs: 
 export function eventRoutes(deps: ApiDeps, timing: Partial<SseTiming> = {}): Hono {
   const clock = resolveTiming(timing);
   const app = new Hono();
-  // The streams open now. It belongs to this app: one app is one process in production.
+  // The streams open now, in all and by client. They belong to this app: one app is one process
+  // in production. A client is in the map while it has a stream open, and no longer.
   let open = 0;
+  const openBy = new Map<string, number>();
 
   app.get("/events", async (c) => {
     const lastEventId = parseU64("Last-Event-ID", c.req.header("Last-Event-ID"));
@@ -291,11 +300,16 @@ export function eventRoutes(deps: ApiDeps, timing: Partial<SseTiming> = {}): Hon
     // Asked as "is there room" and not as "is it full": a cap that is not a number (`NaN`, from a
     // setting that was not there) is never full by the second way of asking, and lets every
     // stream in.
+    const client = clientKey(c, deps.trustedProxyHops ?? 0);
     const room = open < (deps.maxSseStreams ?? DEFAULT_MAX_STREAMS);
-    if (!room) {
+    const roomForClient =
+      (openBy.get(client) ?? 0) < (deps.maxSseStreamsPerClient ?? DEFAULT_MAX_STREAMS_PER_CLIENT);
+    if (!room || !roomForClient) {
       const body: ErrorBody = {
         error: "unavailable",
-        message: "too many event streams are open, try again shortly",
+        message: room
+          ? "too many event streams are open from this address, try again shortly"
+          : "too many event streams are open, try again shortly",
       };
       return c.json(body, 503, { "Retry-After": RETRY_AFTER_SECONDS });
     }
@@ -303,11 +317,15 @@ export function eventRoutes(deps: ApiDeps, timing: Partial<SseTiming> = {}): Hon
     // The place is taken before anything is awaited and given back exactly once, whichever way
     // the request ends: by an error here, or when the stream is over.
     open += 1;
+    openBy.set(client, (openBy.get(client) ?? 0) + 1);
     let given = false;
     const giveBack = () => {
       if (given) return;
       given = true;
       open -= 1;
+      const left = (openBy.get(client) ?? 1) - 1;
+      if (left > 0) openBy.set(client, left);
+      else openBy.delete(client);
     };
     try {
       const after = await startAfter(deps.db, lastEventId ?? since);

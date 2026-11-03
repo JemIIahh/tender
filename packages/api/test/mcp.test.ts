@@ -13,6 +13,7 @@ import {
   FIXTURE_BRIEF,
   FIXTURE_BRIEF_HASH,
   FIXTURE_OPTIONS,
+  fixtureData,
 } from "@tender/indexer/testing";
 import { canonicalJson, PhaseSchema, type Scorecard, sha256Hex } from "@tender/shared";
 import type { Hono } from "hono";
@@ -36,6 +37,9 @@ const { poster, judge, alice } = FIXTURE_ACCOUNTS;
 
 /** The task of the board that has a public scorecard. */
 const SCORECARD_TASK = "3";
+
+/** The winners of the captured `picked` event, as a scorecard names them: account and share. */
+const PICKED_WINNERS = fixtureData("picked").winners.map(({ account, bps }) => ({ account, bps }));
 
 let deps: ApiDeps;
 
@@ -88,7 +92,8 @@ async function seedBoard(): Promise<void> {
         reasons: ["matches the expected value", "naïve ✓ but exact"],
       },
     ],
-    winners: [{ account: alice, bps: 10_000 }],
+    // What the pick of the task paid: a scorecard is shown only beside its own payout.
+    winners: PICKED_WINNERS,
     generated_at: "2026-10-30T10:00:00Z",
     judge: { software: "tender-judge/1", model: null },
   };
@@ -385,10 +390,7 @@ test("tools_return_the_documents_of_the_rest_routes", async () => {
   // A scorecard is the document of the task's own page: both are what `getScorecard` returns. Its
   // text is not the page's, since a scorecard is written in canonical form (the next test).
   const detail = JSON.parse(await rest(`/v1/tasks/${SCORECARD_TASK}`)) as TaskDetailResponse;
-  expect(detail.scorecard).toMatchObject({
-    task_id: SCORECARD_TASK,
-    winners: [{ account: alice }],
-  });
+  expect(detail.scorecard).toMatchObject({ task_id: SCORECARD_TASK, winners: PICKED_WINNERS });
   const scorecard = await call(client, "get_scorecard", { task_id: SCORECARD_TASK });
   expect(documentOf<Scorecard>(scorecard)).toEqual(detail.scorecard);
 });

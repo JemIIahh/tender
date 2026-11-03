@@ -153,6 +153,22 @@ function stubDb(answer: (sql: string) => Promise<unknown>): Db {
   };
 }
 
+/**
+ * A clock for `startKeeper` that counts the ticks that read it. A tick reads the clock before it
+ * looks at the signal, so one that ran after an abort would be counted too: the count says what
+ * the keeper did, where a count of every timer in the process would also take in the database's.
+ */
+function tickCounter() {
+  let ticks = 0;
+  return {
+    now: () => {
+      ticks += 1;
+      return LONG_AFTER;
+    },
+    ticks: () => ticks,
+  };
+}
+
 // ---- Types --------------------------------------------------------------------------------------
 
 test("tender_client_satisfies_keeper_chain", () => {
@@ -1327,11 +1343,13 @@ test("start_keeper_goes_on_ticking_and_stops_cleanly_when_the_log_throws", async
       if (asked === 1) throw new Error("db down");
     });
     let logged = 0;
+    const clock = tickCounter();
 
     const done = startKeeper({
       db: flaky,
       client: idleChain,
       intervalMs: 1_000,
+      now: clock.now,
       signal: controller.signal,
       log: () => {
         logged += 1;
@@ -1347,7 +1365,10 @@ test("start_keeper_goes_on_ticking_and_stops_cleanly_when_the_log_throws", async
 
     controller.abort();
     await done;
-    expect(vi.getTimerCount()).toBe(0);
+    // Nothing runs after the abort, however long the clock goes on.
+    const ticked = clock.ticks();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(clock.ticks()).toBe(ticked);
   } finally {
     // A rejection that nothing handled surfaces once the real event loop turns.
     vi.useRealTimers();
@@ -1421,20 +1442,25 @@ test("start_keeper_asks_with_the_clock_it_is_given", async () => {
 test("start_keeper_stops_and_resolves_when_the_signal_aborts_while_it_waits", async () => {
   vi.useFakeTimers();
   const controller = new AbortController();
+  const clock = tickCounter();
   const done = startKeeper({
     db: stubDb(async () => undefined),
     client: idleChain,
     intervalMs: 1_000,
+    now: clock.now,
     signal: controller.signal,
     log: () => {},
   });
   await vi.advanceTimersByTimeAsync(10);
-  expect(vi.getTimerCount()).toBe(1);
+  // The first tick is over, and the keeper waits for the next.
+  expect(clock.ticks()).toBe(1);
 
   controller.abort();
 
   await done;
-  expect(vi.getTimerCount()).toBe(0);
+  // The wait ended with the abort: no tick comes after it.
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(clock.ticks()).toBe(1);
 });
 
 test("start_keeper_finishes_the_tick_in_hand_before_it_resolves", async () => {
@@ -1450,10 +1476,12 @@ test("start_keeper_finishes_the_tick_in_hand_before_it_resolves", async () => {
     await gate;
   });
   let resolved = false;
+  const clock = tickCounter();
   const done = startKeeper({
     db: blocked,
     client: idleChain,
     intervalMs: 100,
+    now: clock.now,
     signal: controller.signal,
     log: () => {},
   });
@@ -1468,9 +1496,10 @@ test("start_keeper_finishes_the_tick_in_hand_before_it_resolves", async () => {
 
   release();
   await done;
-  // The tick ended at its next look at the signal, and no timer is left behind.
+  // The tick ended at its next look at the signal, and no tick comes after it.
+  await vi.advanceTimersByTimeAsync(5_000);
   expect(asked).toBe(1);
-  expect(vi.getTimerCount()).toBe(0);
+  expect(clock.ticks()).toBe(1);
 });
 
 test("start_keeper_does_not_tick_when_the_signal_is_aborted_already", async () => {
@@ -1481,11 +1510,20 @@ test("start_keeper_does_not_tick_when_the_signal_is_aborted_already", async () =
   const counting = stubDb(async () => {
     asked += 1;
   });
+  const clock = tickCounter();
 
-  await startKeeper({ db: counting, client: idleChain, signal: controller.signal, log: () => {} });
+  await startKeeper({
+    db: counting,
+    client: idleChain,
+    now: clock.now,
+    signal: controller.signal,
+    log: () => {},
+  });
 
+  // Nor later: no tick is waiting to run, at the default interval of 30 s or after it.
+  await vi.advanceTimersByTimeAsync(10 * 30_000);
   expect(asked).toBe(0);
-  expect(vi.getTimerCount()).toBe(0);
+  expect(clock.ticks()).toBe(0);
 });
 
 test("start_keeper_refuses_an_interval_that_setTimeout_cannot_keep", () => {

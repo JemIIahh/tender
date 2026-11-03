@@ -221,7 +221,7 @@ function createServer(deps: ApiDeps): McpServer {
       annotations: READ_ONLY,
     },
     ({ tag, limit, cursor }) =>
-      answer("list_agents", () => listAgents(deps.db, { tag, limit, cursor })),
+      answer("list_agents", () => listAgents(deps.db, { tag, limit, cursor }, deps.teamAccounts)),
   );
 
   server.registerTool(
@@ -232,7 +232,11 @@ function createServer(deps: ApiDeps): McpServer {
       annotations: READ_ONLY,
     },
     ({ account }) =>
-      answer("get_agent", () => getAgentDetail(deps.db, account, nowNs(deps)), "no such agent"),
+      answer(
+        "get_agent",
+        () => getAgentDetail(deps.db, account, nowNs(deps), deps.teamAccounts),
+        "no such agent",
+      ),
   );
 
   // The SDK says `listChanged: true` of any server that has tools. These never change, and a

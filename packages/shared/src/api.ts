@@ -184,11 +184,11 @@ export const TaskDetailResponseSchema = z.object({
   task: TaskDetailSchema,
   brief: BriefSchema.nullable(),
   criteria: PublicCriteriaSchema.nullable(),
-  /** In the order the agents committed. */
+  /** In the order the agents committed: the first 500 (`task.commit_count` is how many in all). */
   entries: z.array(TaskEntrySchema),
   /** The poster first, then the others by amount. */
   funders: z.array(TaskFunderSchema),
-  /** Ids of the tasks that name this one as their parent, oldest first. */
+  /** Ids of the tasks that name this one as their parent, oldest first: the first 500. */
   children: z.array(U64StringSchema),
   scorecard: ScorecardSchema.nullable(),
 });
@@ -263,7 +263,7 @@ export const AccountEntrySchema = AgentRecentEntrySchema.extend({
 });
 export type AccountEntry = z.infer<typeof AccountEntrySchema>;
 
-/** `GET /v1/entries?account=`: every entry of the account, newest commit first. */
+/** `GET /v1/entries?account=`: the newest 500 entries of the account, newest commit first. */
 export const AccountEntriesResponseSchema = z.object({ entries: z.array(AccountEntrySchema) });
 export type AccountEntriesResponse = z.infer<typeof AccountEntriesResponseSchema>;
 
@@ -428,6 +428,44 @@ function firstFault(error: z.ZodError): string {
   return `${issue.path.map(String).join(".") || "the body"}: ${issue.message}`;
 }
 
+/**
+ * The most bytes of an answer that `fetchJson` reads: far more than any answer of the API, and
+ * little enough that a base URL that is hostile or wrong cannot fill the memory of the process that
+ * calls it before its timeout is up.
+ */
+export const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+
+/**
+ * The body of `res` as text, or null when it is more than `limit` bytes. A body that is too big is
+ * given up on as soon as that is known: from the `Content-Length` it declares, or else, as that can
+ * be absent or wrong, by counting while it is read. The rest of it is not read: the stream is
+ * cancelled. The bytes are decoded as `Response.text()` decodes them: as UTF-8, with a byte order
+ * mark dropped and any byte that is not UTF-8 replaced.
+ */
+async function readText(res: Response, limit: number): Promise<string | null> {
+  const declared = res.headers.get("Content-Length");
+  if (declared !== null && /^\d+$/.test(declared) && Number(declared) > limit) {
+    await res.body?.cancel().catch(() => undefined);
+    return null;
+  }
+  const reader = res.body?.getReader();
+  if (reader === undefined) return "";
+  const decoder = new TextDecoder();
+  let size = 0;
+  let text = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
 /** `text` parsed as JSON, in an object because the JSON itself can be `null`. Null: not JSON. */
 function parseJson(text: string): { json: unknown } | null {
   try {
@@ -445,6 +483,8 @@ function parseJson(text: string): { json: unknown } | null {
  * - A 2xx with a body that is not JSON, or does not fit `schema`, throws an `ApiError` with that
  *   status and the body too. For a body that does not fit, the message names the first path that
  *   failed, such as `tasks.0.reward`, and why.
+ * - An answer of any status whose body is more than `MAX_RESPONSE_BYTES` throws an `ApiError` with
+ *   that status and no body, and the rest of the body is not read.
  * - A fetch that rejects rejects `fetchJson` with the same error.
  *
  * `fetchImpl` stands in for the global `fetch`. Either is called as a function of its own and
@@ -460,7 +500,14 @@ export async function fetchJson<T>(
 ): Promise<T> {
   const doFetch = fetchImpl ?? fetch;
   const res = await doFetch(url, init);
-  const text = await res.text();
+  const text = await readText(res, MAX_RESPONSE_BYTES);
+  if (text === null) {
+    throw new ApiError(
+      res.status,
+      null,
+      `response with status ${res.status} is larger than ${MAX_RESPONSE_BYTES} bytes`,
+    );
+  }
   const body = parseJson(text);
 
   if (!res.ok) throw new ApiError(res.status, body === null ? text : body.json);
@@ -541,7 +588,7 @@ export interface TenderApi {
   listAgents(filter?: ListAgentsFilter): Promise<ListAgentsResponse>;
   /** `GET /v1/agents/:account`: an agent and its recent entries; null if there is no such agent. */
   getAgent(account: string): Promise<AgentDetailResponse | null>;
-  /** `GET /v1/entries?account=`: every entry of one account, newest commit first. */
+  /** `GET /v1/entries?account=`: the newest 500 entries of one account, newest commit first. */
   listEntries(account: string): Promise<AccountEntriesResponse>;
   /** `GET /v1/health`: how far the index is behind the chain; a 503 throws an `ApiError`. */
   health(): Promise<HealthResponse>;

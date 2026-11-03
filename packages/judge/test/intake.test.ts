@@ -1,4 +1,4 @@
-import { type BlobKind, type Db, putBlob } from "@tender/db";
+import { type BlobKind, type Db, getBlob, putBlob, recordHeldoutUpload } from "@tender/db";
 import { canonicalJson, sha256Hex, type TaskView } from "@tender/shared";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import {
@@ -125,15 +125,25 @@ const TOO_LONG = "a".repeat(262_144);
 
 const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
 
-/** Stores `content` as it is, the way a client that skipped the canonical form might have. */
-function putRaw(db: Db, kind: BlobKind, content: Uint8Array, uploader = POSTER): Promise<string> {
-  return putBlob(db, {
+/**
+ * Stores `content` as it is, the way a client that skipped the canonical form might have. A
+ * held-out document is recorded as `uploader`'s upload, as `POST /v1/heldout` records one.
+ */
+async function putRaw(
+  db: Db,
+  kind: BlobKind,
+  content: Uint8Array,
+  uploader = POSTER,
+): Promise<string> {
+  const sha256 = await putBlob(db, {
     kind,
     contentType: "application/json",
     bytes: content,
     uploader,
     isPublic: kind !== "heldout",
   });
+  if (kind === "heldout") await recordHeldoutUpload(db, { sha256, account: uploader });
+  return sha256;
 }
 
 /** The re-review's probe 1 for `keyword`: `t` names the number schema in `$defs`. */
@@ -1105,8 +1115,8 @@ test("a_check_refused_for_time_is_not_kept", { timeout: 60_000 }, async () => {
 
 test("intake_rejects_heldout_from_non_poster", async () => {
   const reason = "held-out checks were not uploaded by the poster";
-  // Someone else holds the bytes and uploaded them first. Blobs are content-addressed and the
-  // first upload wins, so the poster could never upload theirs: there is nothing to wait for.
+  // Someone else holds the bytes and uploaded them, and the poster never did: they are not the
+  // poster's checks, and there is nothing to wait for, as they are stored.
   await insertTask(
     db,
     taskView({
@@ -1134,6 +1144,38 @@ test("intake_rejects_heldout_from_non_poster", async () => {
     expect(await intakeTask(deps, id)).toBe("rejected");
     expect(await judgeRow(db, id)).toEqual({ judge_status: "rejected", judge_reason: reason });
   }
+});
+
+test("intake_takes_heldout_the_poster_sent_after_a_stranger", async () => {
+  // A stranger who has the bytes, as anyone has those of a seed, stores them first, and the row
+  // is the stranger's. The poster's own upload of them is recorded as well, and that is what
+  // counts: the stranger's being first changes nothing (I2).
+  const commitment = await putHeldout(db, EXACT_HELDOUT, "mallory.test.near");
+  await putHeldout(db, EXACT_HELDOUT);
+  expect((await getBlob(db, commitment))?.uploader).toBe("mallory.test.near");
+
+  const criteria_hash = await putCriteria(db, EXACT);
+  expect(await intake(1, { criteria_hash, heldout_commitment: commitment })).toBe("accepted");
+  expect(await judgeRow(db, 1)).toEqual({ judge_status: "accepted", judge_reason: null });
+
+  // Only the poster's upload counts: the stranger's task with the same checks takes them from
+  // its own poster, who is the stranger, and the stranger sent them too (P05-R7).
+  const own = await intake(2, {
+    poster: "mallory.test.near",
+    criteria_hash,
+    heldout_commitment: commitment,
+  });
+  expect(own).toBe("accepted");
+  // A third account, which never sent them, has no claim to them.
+  const third = await intake(3, {
+    poster: "carol.test.near",
+    criteria_hash,
+    heldout_commitment: commitment,
+  });
+  expect(third).toBe("rejected");
+  expect((await judgeRow(db, 3))?.judge_reason).toBe(
+    "held-out checks were not uploaded by the poster",
+  );
 });
 
 test("intake_rejects_heldout_checks_already_used", async () => {

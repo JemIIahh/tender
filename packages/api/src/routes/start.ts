@@ -1,8 +1,8 @@
 import { phaseAt, U64StringSchema } from "@tender/shared";
 import { Hono } from "hono";
+import type { AuthVariables, RequireAuth } from "../auth";
 import { type ApiDeps, nowNs } from "../deps";
 import { fail, notFound } from "../format";
-import type { AuthVariables, RequireAuth } from "./blobs";
 
 /** `POST /v1/tasks/:id/start`. `working_count` is a JSON integer, as every count the index keeps. */
 export interface StartResponse {

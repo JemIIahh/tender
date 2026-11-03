@@ -10,6 +10,7 @@ import {
   FIXTURE_BRIEF_HASH,
   FIXTURE_CONTRACT,
   FIXTURE_OPTIONS,
+  fixtureData,
 } from "@tender/indexer/testing";
 import { ApiError, canonicalJson, type Scorecard, sha256Hex } from "@tender/shared";
 import { Hono } from "hono";
@@ -32,7 +33,10 @@ const BOT = "tender_test_bot";
 const OPEN_TASK = "2";
 const SCORECARD_TASK = "3";
 
-/** The scorecard of the board's task 3. */
+/** The winners of the captured `picked` event, as a scorecard names them: account and share. */
+const PICKED_WINNERS = fixtureData("picked").winners.map(({ account, bps }) => ({ account, bps }));
+
+/** The scorecard of the board's task 3, which pays what the task's pick paid. */
 const SCORECARD: Scorecard = {
   version: 1,
   task_id: SCORECARD_TASK,
@@ -53,7 +57,7 @@ const SCORECARD: Scorecard = {
       reasons: ["matches the expected value"],
     },
   ],
-  winners: [{ account: alice, bps: 10_000 }],
+  winners: PICKED_WINNERS,
   generated_at: "2026-10-30T10:00:00Z",
   judge: { software: "tender-judge/1", model: null },
 };

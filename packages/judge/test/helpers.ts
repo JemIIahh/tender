@@ -1,4 +1,4 @@
-import { type Db, getBlob, migrate, openDb, putBlob } from "@tender/db";
+import { type Db, getBlob, migrate, openDb, putBlob, recordHeldoutUpload } from "@tender/db";
 import { canonicalJson, type EntryView, sha256Hex, type TaskView } from "@tender/shared";
 import { vi } from "vitest";
 import type { FetchIo, JudgeChain, JudgeDeps } from "../src/index";
@@ -73,9 +73,9 @@ const uploads = new Set<string>();
 const upload = (sha256: string, taskId: bigint, account: string) =>
   `${sha256} ${taskId} ${account}`;
 
-/** Empties the two tables the Judge works with, so one database can serve a whole test file. */
+/** Empties the tables the Judge works with, so one database can serve a whole test file. */
 export async function resetDb(db: Db): Promise<void> {
-  await db.exec("truncate tasks, blobs");
+  await db.exec("truncate tasks, blobs, heldout_uploads");
   uploads.clear();
 }
 
@@ -143,15 +143,20 @@ export function putCriteria(db: Db, criteria: unknown): Promise<string> {
   });
 }
 
-/** Stores a held-out document as `POST /v1/heldout` does: private, with its uploader. */
-export function putHeldout(db: Db, heldout: unknown, uploader = POSTER): Promise<string> {
-  return putBlob(db, {
+/**
+ * Stores a held-out document as `POST /v1/heldout` does: private, with its first uploader, and
+ * `uploader` recorded among the accounts that sent it, whether or not it was the first.
+ */
+export async function putHeldout(db: Db, heldout: unknown, uploader = POSTER): Promise<string> {
+  const sha256 = await putBlob(db, {
     kind: "heldout",
     contentType: "application/json",
     bytes: canonicalJson(heldout),
     uploader,
     isPublic: false,
   });
+  await recordHeldoutUpload(db, { sha256, account: uploader });
+  return sha256;
 }
 
 /**
