@@ -69,10 +69,12 @@ export interface McpDeps {
   /**
    * The one directory that `commit_result` may read a file from (P04-R1), as a real path: it is used
    * as it is and never looked up again (P04-R3), so a path with a link in it reads nothing. A file
-   * is read only if it is a regular file whose real path, with every link followed, is inside it.
+   * is read only if it is a regular file whose real path, with every link followed, is inside it
+   * and has no name below it that starts with a dot (a hidden file or folder: `.env`, `.ssh`).
    * Not set means that no file is read at all. The bin gets it from `readConfig`, which looks the
    * directory up once, and accepts only one that nobody but the user (and root) can write to
-   * (P04-R2); a caller that builds the deps by hand answers for both itself.
+   * (P04-R2) and that is neither the home directory nor a directory that holds it; a caller that
+   * builds the deps by hand answers for all of that itself.
    */
   filesDir?: string;
   /**

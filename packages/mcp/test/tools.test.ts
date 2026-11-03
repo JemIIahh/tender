@@ -43,13 +43,7 @@ import { baseEncode, KeyPair } from "near-api-js";
 import { afterEach, beforeEach, expect, type Mock, test, vi } from "vitest";
 import { readConfig, secretsOf } from "../src/config";
 import { createMcpServer, type McpChain, type McpDeps, type OpenFileLookup } from "../src/server";
-import {
-  createStateStore,
-  type Draft,
-  defaultStateDir,
-  defaultStateRoot,
-  type StateStore,
-} from "../src/state";
+import { createStateStore, type Draft, defaultStateRoot, type StateStore } from "../src/state";
 
 // `open` and `stat` are wrapped, so that a test can change the disk between the server's look at a
 // path and its open of the file (the file tests). They do the real thing until a test says not to.
@@ -1185,8 +1179,9 @@ async function makeFilesDir(): Promise<string> {
 const UNREADABLE =
   "FILE_UNREADABLE: cannot read that file inside TENDER_FILES_DIR. A file is refused when it is " +
   "missing, outside the directory (or reached by a link that leads out), has a second hard link, " +
-  "or is in a Tender state directory (TENDER_STATE_DIR, or anything under ~/.tender) or in a " +
-  "folder named drafts; the answer does not say which";
+  "is hidden (a name on its path below the directory starts with a dot), or is in a Tender state " +
+  "directory (TENDER_STATE_DIR, or anything under ~/.tender) or in a folder named drafts; the " +
+  "answer does not say which";
 
 /** The real `node:fs/promises`, for a stub to call through to. */
 const realFs = () => vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
@@ -1558,15 +1553,16 @@ test("file_inside_the_files_dir_is_committed", async () => {
   await mkdir(join(files, "sub"));
   await writeFile(join(files, "answer.txt"), "from a file");
   await writeFile(join(files, "sub", "deep.txt"), "deeper");
-  // A name that starts with two dots is a name, and not a way up.
-  await writeFile(join(files, "..dots"), "dots");
+  // A name with dots in it is a name, and not a way up. (One that starts with a dot is hidden, and
+  // is never read: `a_hidden_file_is_unreadable`.)
+  await writeFile(join(files, "dots..txt"), "dots");
   await symlink(join(files, "answer.txt"), join(files, "sub", "link.txt"));
   const { callJson } = await connectWrite({ filesDir: files });
 
   const cases: Array<[path: string, content: string]> = [
     [join(files, "answer.txt"), "from a file"],
     [join(files, "sub", "deep.txt"), "deeper"],
-    [join(files, "..dots"), "dots"],
+    [join(files, "dots..txt"), "dots"],
     // Up and down again, and a doubled slash: where the path ends up is what counts.
     [`${files}/sub/../answer.txt`, "from a file"],
     [`${files}//answer.txt`, "from a file"],
@@ -1740,8 +1736,11 @@ test("a_files_dir_written_with_a_slash_or_as_the_root_still_holds_what_it_should
   await mkdir(lookalike);
   await writeFile(join(lookalike, "secret.txt"), "TOP SECRET");
 
+  // The root holds everything, so the names above the files, those of the temp directory, count as
+  // being under it: with a hidden folder among them (a TMPDIR in ~/.cache, say) nothing is read.
+  const hiddenAbove = files.split(sep).some((name) => name.startsWith("."));
   let taskId = 0;
-  for (const configured of [`${files}/`, `${files}//`, "/"]) {
+  for (const configured of [`${files}/`, `${files}//`, ...(hiddenAbove ? [] : ["/"])]) {
     taskId++;
     const { callJson } = await connectWrite({ filesDir: configured });
     const answer = await callJson("commit_result", {
@@ -5304,13 +5303,15 @@ async function draftIn(storeDir: string, taskId: string): Promise<string> {
 }
 
 test("a_file_in_another_accounts_default_state_dir_is_unreadable", async () => {
-  // Every account on the machine keeps its state under one root, ~/.tender, and TENDER_FILES_DIR may
-  // be a directory that holds it (the user's home). The drafts of another account are as private as
-  // this server's own, and reveal_result publishes what a commit took in: a brief that asks for one
-  // of those files, or for anything else in the root, must get nothing.
+  // Every account on the machine keeps its state under one root (~/.tender by default), and
+  // TENDER_FILES_DIR may be a directory that holds it. The drafts of another account are as private
+  // as this server's own, and reveal_result publishes what a commit took in: a brief that asks for
+  // one of those files, or for anything else in the root, must get nothing. The root has a name that
+  // is not hidden here, so that it is the rule for the root that is tried, and not the one for
+  // hidden files, which keeps out the real one (`.tender`) as well.
   const home = await realpath(root);
-  const stateRoot = defaultStateRoot(home);
-  const carol = defaultStateDir("testnet", "carol.testnet", home);
+  const stateRoot = join(home, "tender-root");
+  const carol = join(stateRoot, "testnet", "carol.testnet");
   const draft = await draftIn(carol, "8");
   await writeFile(join(carol, "notes.txt"), "a file beside the drafts");
   await writeFile(join(stateRoot, "notes.txt"), "a file of the root");
@@ -5328,7 +5329,7 @@ test("a_file_in_another_accounts_default_state_dir_is_unreadable", async () => {
     // `join` would fold the `..` away, and the point is that the name has one.
     [
       "a dot-dot way",
-      [home, "elsewhere", "..", ".tender", "testnet", "carol.testnet", "notes.txt"].join(sep),
+      [home, "elsewhere", "..", "tender-root", "testnet", "carol.testnet", "notes.txt"].join(sep),
     ],
   ] as const) {
     const answer = await kit.call("commit_result", { task_id: "7", file_path: path });
@@ -5355,25 +5356,27 @@ test("a_file_in_another_accounts_default_state_dir_is_unreadable", async () => {
 
 test("the_default_state_root_is_kept_out_without_being_told", async () => {
   // A caller that builds the deps by hand and names no state root gets the default one: the
-  // `.tender` of the home directory the process has.
+  // `.tender` of the home directory the process has. The files directory is a folder in it, so that
+  // it is this rule that refuses, and not the one for hidden files, which looks only below the
+  // files directory.
   const home = await realpath(root);
-  await mkdir(join(home, ".tender"));
-  await writeFile(join(home, ".tender", "notes.txt"), "a file of the root");
-  await writeFile(join(home, "notes.txt"), "an answer from a file");
+  const inRoot = join(defaultStateRoot(home), "files");
+  await mkdir(inRoot, { recursive: true });
+  await writeFile(join(inRoot, "notes.txt"), "a file of the root");
   vi.stubEnv("HOME", home);
   try {
-    const kit = await connectWrite({ filesDir: home });
+    const kit = await connectWrite({ filesDir: inRoot });
 
     expect(
-      await kit.call("commit_result", {
-        task_id: "7",
-        file_path: join(home, ".tender", "notes.txt"),
-      }),
+      await kit.call("commit_result", { task_id: "7", file_path: join(inRoot, "notes.txt") }),
     ).toEqual({ isError: true, text: UNREADABLE });
     expect(kit.chain.commit).not.toHaveBeenCalled();
+
+    // Told of another root, the same file is an ordinary one: it was the default that kept it out.
+    const told = await connectWrite({ filesDir: inRoot, stateRoot: join(home, "another-root") });
     expect(
-      await kit.callJson("commit_result", { task_id: "7", file_path: join(home, "notes.txt") }),
-    ).toMatchObject({ content_hash: sha256Hex("an answer from a file") });
+      await told.callJson("commit_result", { task_id: "7", file_path: join(inRoot, "notes.txt") }),
+    ).toMatchObject({ content_hash: sha256Hex("a file of the root") });
   } finally {
     vi.unstubAllEnvs();
   }
@@ -5439,8 +5442,8 @@ test("a_link_from_the_files_dir_into_a_state_dir_is_unreadable", async () => {
   // A link is judged by where it leads. These lead to places inside the files directory, which holds
   // the state here, so none of them is "outside"; and still no file there is read.
   const home = await realpath(root);
-  const stateRoot = defaultStateRoot(home);
-  const carol = defaultStateDir("testnet", "carol.testnet", home);
+  const stateRoot = join(home, "tender-root");
+  const carol = join(stateRoot, "testnet", "carol.testnet");
   const carolsDraft = await draftIn(carol, "8");
   const secondsDraft = await draftIn(join(home, "second-server"), "9");
   await state.saveDraft(makeDraft("5", { committedAt: "2026-11-04T09:30:00.000Z" }));
@@ -5484,8 +5487,8 @@ test("an_ordinary_file_is_still_read_beside_state_directories", async () => {
   // The rules keep out the state and not its neighbours: names that only resemble those of a state
   // directory belong to files like any other.
   const home = await realpath(root);
-  const stateRoot = defaultStateRoot(home);
-  await draftIn(defaultStateDir("testnet", "carol.testnet", home), "8");
+  const stateRoot = join(home, "tender-root");
+  await draftIn(join(stateRoot, "testnet", "carol.testnet"), "8");
   await state.saveDraft(makeDraft("5", { committedAt: "2026-11-04T09:30:00.000Z" }));
   const kit = await connectWrite({ filesDir: home, stateDir: join(home, "state"), stateRoot });
 
@@ -5494,7 +5497,7 @@ test("an_ordinary_file_is_still_read_beside_state_directories", async () => {
     "notes.txt",
     join("projects", "answer.json"),
     // Beside the root and beside the state directory, and not in them.
-    join(".tender-notes", "answer.txt"),
+    join("tender-root-notes", "answer.txt"),
     join("state-notes", "answer.txt"),
     // Only a folder called exactly `drafts` is a store's.
     join("projects", "drafts.txt"),
@@ -5515,6 +5518,192 @@ test("an_ordinary_file_is_still_read_beside_state_directories", async () => {
   }
 });
 
+test("a_hidden_file_is_unreadable", async () => {
+  // What a home directory keeps out of sight is its keys and credentials (`.env`, `.npmrc`,
+  // `.near-credentials`), and reveal_result publishes what a commit took in. A name that starts with
+  // a dot is never read, wherever TENDER_FILES_DIR is: the same answer as for any file that cannot
+  // be read, whether the file is there or not.
+  const files = await makeFilesDir();
+  await mkdir(join(files, "sub"));
+  const hidden = [
+    ".env",
+    ".npmrc",
+    ".near-credentials",
+    ".hidden.txt",
+    // A name that starts with dots is hidden, though it is not a way up.
+    "..dots",
+    join("sub", ".env"),
+  ];
+  for (const name of hidden) {
+    await writeFile(join(files, name), "TOP SECRET");
+  }
+  const kit = await connectWrite({ filesDir: files });
+  vi.mocked(open).mockClear();
+
+  const refused: Array<[how: string, path: string]> = [
+    ...hidden.map((name): [string, string] => [name, join(files, name)]),
+    ["a hidden file that is not there", join(files, ".gone")],
+    // `join` would fold the `..` away, and the point is that the name has one.
+    ["a dot-dot way", [files, "sub", "..", ".env"].join(sep)],
+    ["a doubled slash", `${files}//.env`],
+  ];
+  for (const [how, path] of refused) {
+    const answer = await kit.call("commit_result", { task_id: "7", file_path: path });
+
+    expect(answer, how).toEqual({ isError: true, text: UNREADABLE });
+  }
+  // Refused at the first look: nothing was opened, sent or saved.
+  expect(open).not.toHaveBeenCalled();
+  expect(kit.chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+
+  // And the description says so, so that nobody is surprised.
+  const { tools } = await kit.mcp.listTools();
+  expect(tools.find((tool) => tool.name === "commit_result")?.description).toMatch(
+    /or it is hidden, with a name on its path below that directory that starts with a dot, or it is in a Tender state directory/,
+  );
+});
+
+test("a_file_in_a_hidden_folder_is_unreadable", async () => {
+  // The folders where a home directory keeps its secrets are hidden too: `.ssh`, `.git`, `.aws`. One
+  // anywhere on the way to a file keeps it from being read, though the name of the file itself is
+  // not hidden at all.
+  const files = await makeFilesDir();
+  const hidden = [
+    join(".ssh", "id_ed25519"),
+    join(".git", "config"),
+    join(".aws", "credentials"),
+    join("work", ".cache", "out.txt"),
+    join(".a", ".b", "c.txt"),
+    join(".a", "b", "c", "d.txt"),
+  ];
+  for (const name of hidden) {
+    await mkdir(dirname(join(files, name)), { recursive: true });
+    await writeFile(join(files, name), "TOP SECRET");
+  }
+  const kit = await connectWrite({ filesDir: files });
+  vi.mocked(open).mockClear();
+
+  const refused: Array<[how: string, path: string]> = [
+    ...hidden.map((name): [string, string] => [name, join(files, name)]),
+    ["the hidden folder itself", join(files, ".ssh")],
+    ["a hidden folder that is not there", join(files, ".gone", "out.txt")],
+    // `join` would fold these away, and the point is that the names are there.
+    ["a dot-dot way", [files, "work", "..", ".ssh", "id_ed25519"].join(sep)],
+    ["a dot way", `${files}/./.ssh/id_ed25519`],
+  ];
+  for (const [how, path] of refused) {
+    const answer = await kit.call("commit_result", { task_id: "7", file_path: path });
+
+    expect(answer, how).toEqual({ isError: true, text: UNREADABLE });
+  }
+  expect(open).not.toHaveBeenCalled();
+  expect(kit.chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+});
+
+test("a_hidden_file_reached_through_a_link_is_unreadable", async () => {
+  // A link is judged by where it leads, and what it is called does not matter: a plain name that
+  // leads to a hidden file, or to a file in a hidden folder, is as unreadable as the file itself.
+  const files = await makeFilesDir();
+  await mkdir(join(files, ".ssh"));
+  await mkdir(join(files, "sub"));
+  await writeFile(join(files, ".env"), "TOP SECRET");
+  await writeFile(join(files, ".ssh", "id_ed25519"), "TOP SECRET");
+  await symlink(join(files, ".env"), join(files, "plain.txt"));
+  await symlink(".env", join(files, "relative.txt"));
+  await symlink(join(files, "plain.txt"), join(files, "chained.txt"));
+  await symlink(join(files, ".ssh", "id_ed25519"), join(files, "sub", "key.txt"));
+  await symlink(join(files, ".ssh"), join(files, "folder-link"), "dir");
+  await symlink(join("..", ".env"), join(files, "sub", "up.txt"));
+  const kit = await connectWrite({ filesDir: files });
+  vi.mocked(open).mockClear();
+
+  for (const [how, path] of [
+    ["a plain name for a hidden file", join(files, "plain.txt")],
+    ["a link with a relative target", join(files, "relative.txt")],
+    ["a link to a link to a hidden file", join(files, "chained.txt")],
+    ["a plain name for a file in a hidden folder", join(files, "sub", "key.txt")],
+    ["a link to a hidden folder", join(files, "folder-link", "id_ed25519")],
+    ["a relative link that goes up to a hidden file", join(files, "sub", "up.txt")],
+  ] as const) {
+    const answer = await kit.call("commit_result", { task_id: "7", file_path: path });
+
+    expect(answer, how).toEqual({ isError: true, text: UNREADABLE });
+  }
+  expect(open).not.toHaveBeenCalled();
+  expect(kit.chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft("7")).toBeNull();
+});
+
+test("an_ordinary_file_is_still_read_beside_hidden_ones", async () => {
+  // Only a name that starts with a dot is hidden. Dots in the middle or at the end of a name are
+  // part of it, a link is judged by where it leads, and it is what the user keeps in the files
+  // directory that is looked at: the directory's own name, and the names above it, are not.
+  const files = await makeFilesDir();
+  await writeFile(join(files, ".env"), "TOP SECRET");
+  await mkdir(join(files, ".ssh"));
+  await writeFile(join(files, ".ssh", "id_ed25519"), "TOP SECRET");
+  const kit = await connectWrite({ filesDir: files });
+
+  let taskId = 0;
+  for (const relative of [
+    "answer.txt",
+    join("projects", "answer.json"),
+    "notes.v1.2.txt",
+    "trailing.",
+    "dots..txt",
+    "env",
+    join("my.folder", "answer.txt"),
+    join("a..b", "answer.txt"),
+    join("ssh", "answer.txt"),
+  ]) {
+    taskId++;
+    await mkdir(dirname(join(files, relative)), { recursive: true });
+    await writeFile(join(files, relative), `work in ${relative}`);
+
+    const answer = await kit.callJson("commit_result", {
+      task_id: String(taskId),
+      file_path: join(files, relative),
+    });
+
+    expect(answer, relative).toMatchObject({ content_hash: sha256Hex(`work in ${relative}`) });
+  }
+
+  // A link with a hidden name that leads to an ordinary file leads to an ordinary file.
+  taskId++;
+  await symlink(join(files, "answer.txt"), join(files, ".shortcut"));
+  expect(
+    await kit.callJson("commit_result", {
+      task_id: String(taskId),
+      file_path: join(files, ".shortcut"),
+    }),
+  ).toMatchObject({ content_hash: sha256Hex("work in answer.txt") });
+
+  // The files directory may have a hidden name, or lie in a hidden folder: that is the user's own
+  // choice, and not something the agent keeps in it. What is hidden inside it is still kept out.
+  const base = join(await realpath(root), ".agent");
+  await mkdir(join(base, ".files", ".secret"), { recursive: true });
+  const dotted = await realpath(join(base, ".files"));
+  await writeFile(join(dotted, "answer.txt"), "from a hidden place");
+  await writeFile(join(dotted, ".secret", "key"), "TOP SECRET");
+  const inDotted = await connectWrite({ filesDir: dotted });
+  taskId++;
+  expect(
+    await inDotted.callJson("commit_result", {
+      task_id: String(taskId),
+      file_path: join(dotted, "answer.txt"),
+    }),
+  ).toMatchObject({ content_hash: sha256Hex("from a hidden place") });
+  expect(
+    await inDotted.call("commit_result", {
+      task_id: String(taskId + 1),
+      file_path: join(dotted, ".secret", "key"),
+    }),
+  ).toEqual({ isError: true, text: UNREADABLE });
+  expect(inDotted.chain.commit).toHaveBeenCalledTimes(1);
+});
+
 test("the_state_rules_hold_at_each_look_at_the_file", async () => {
   // A path is looked at three times: before the file is opened, at the open file's descriptor (where
   // the kernel can say), and again once it is open. Each look applies the same rules. The tests above
@@ -5529,6 +5718,8 @@ test("the_state_rules_hold_at_each_look_at_the_file", async () => {
     ["the root of the default state directories", join(home, "root", "notes.txt")],
     ["this server's own state directory", join(home, "ours", "notes.txt")],
     ["a folder named drafts", join(home, "place", "drafts", "work.txt")],
+    ["a hidden file", join(home, ".env")],
+    ["a hidden folder", join(home, "place", ".ssh", "id_ed25519")],
   ] as const) {
     taskId++;
     const swapped = lookup("linux", async () => where);
@@ -5561,6 +5752,7 @@ test("the_state_rules_hold_at_each_look_at_the_file", async () => {
     ],
     ["this server's own state directory", join(home, "ours-2"), { stateDir: join(home, "ours-2") }],
     ["a folder named drafts", join(home, "place-2", "drafts"), {}],
+    ["a hidden folder", join(home, ".hidden-2"), {}],
   ];
   for (const [why, target, over] of places) {
     taskId++;
@@ -5589,6 +5781,32 @@ test("the_state_rules_hold_at_each_look_at_the_file", async () => {
     expect(kit.chain.commit, why).not.toHaveBeenCalled();
     expect(await state.getDraft(String(taskId)), why).toBeNull();
   }
+
+  // A hidden file: the name of the file that is open is made a link to it under a hidden name.
+  taskId++;
+  const plain = join(home, "plain.txt");
+  const hidden = join(home, ".plain.txt");
+  await writeFile(plain, "inside");
+  const silent = lookup("darwin", async () => {
+    throw new Error("the descriptor is not asked on this platform");
+  });
+  const kit = await connectWrite({ filesDir: home, openFiles: silent });
+  await aroundTheOpen(home, {
+    after: async () => {
+      await rename(plain, hidden);
+      await symlink(hidden, plain);
+    },
+  });
+
+  const answer = await kit.call("commit_result", {
+    task_id: String(taskId),
+    file_path: plain,
+  });
+
+  expect(answer, "a hidden file").toEqual({ isError: true, text: UNREADABLE });
+  expect(silent.pathOf).not.toHaveBeenCalled();
+  expect(kit.chain.commit).not.toHaveBeenCalled();
+  expect(await state.getDraft(String(taskId))).toBeNull();
 });
 
 test("the_read_tools_do_not_show_a_draft_that_is_another_tasks_and_move_nothing", async () => {

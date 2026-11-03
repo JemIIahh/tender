@@ -15,7 +15,7 @@ import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ApiClient, type TenderClient } from "@tender/client";
@@ -413,7 +413,9 @@ test("files_dir_is_an_absolute_path_or_nothing", () => {
   // TENDER_STATE_DIR: a config file holds `~/...` and no shell expands it there.
   expect(filesDir(` ${tenderFiles} \n`)).toBe(tenderFiles);
   expect(filesDir("~/results")).toBe(join(home, "results"));
-  expect(filesDir("~")).toBe(home);
+  // (And `~` alone is the home directory, which is not a folder for agents' files: see the tests of
+  // `HOME` below.)
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: "~" })).toBe(HOME);
 
   // A relative path would mean the directory the client happened to start the server in. The
   // message names the variable and does not quote what it was given.
@@ -458,6 +460,10 @@ function makeDir(parent: string, name: string, mode = 0o700): string {
 /** What `readConfig` says of a TENDER_FILES_DIR that others could write in, or that is not there. */
 const SHARED = /^TENDER_FILES_DIR must be a directory that only you can write to: /;
 const MISSING = "TENDER_FILES_DIR must be a directory that exists";
+/** What it says of one that is the home directory, or holds it (`/`, `/home`, and so on). */
+const HOME =
+  "TENDER_FILES_DIR must be a folder of its own for the files you give agents: not your home " +
+  "directory, and not a directory that holds it (/, /home, /Users and so on)";
 
 test("files_dir_must_be_a_directory_that_only_the_user_can_write_to", () => {
   // P04-R2: whoever can write in the directory can race a file read's checks, so it is the user's
@@ -510,13 +516,78 @@ test("files_dir_is_looked_at_up_to_the_home_directory_or_else_up_to_the_root", (
   const files = makeDir(mine, "files");
   const env = { ...ENV, TENDER_FILES_DIR: files };
   expect(readConfig(env, mine).filesDir).toBe(files);
-  // The home itself is the top (and the only one, for the directory that is the home).
-  expect(readConfig({ ...ENV, TENDER_FILES_DIR: mine }, mine).filesDir).toBe(mine);
 
   // Under no home of the user's, the way goes on up through `me` to the open directory.
   expect(failureOf(env, join(home, "elsewhere"))).toMatch(SHARED);
   chmodSync(open, 0o755);
   expect(readConfig(env, home).filesDir).toBe(files);
+});
+
+test("a_files_dir_that_is_the_home_directory_is_refused", () => {
+  // What the server may read it can commit, and reveal_result then publishes it, and a home directory
+  // holds the user's keys and credentials. The message names the variable and the rule, and no path.
+  mkdirSync(join(home, "sub"), { mode: 0o700 });
+  symlinkSync(home, join(home, "home-link"), "dir");
+
+  // However the home is written: `~`, a trailing slash, a `..`, or a link that leads to it.
+  for (const written of [
+    home,
+    "~",
+    "~/",
+    `${home}/`,
+    `${home}//.`,
+    `${home}/sub/..`,
+    join(home, "home-link"),
+  ]) {
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: written }), written).toBe(HOME);
+  }
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: home })).not.toContain(home);
+
+  // It does not matter who owns the home or who can write in it: that is no reason to use it.
+  chmodSync(home, 0o775);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: home })).toBe(HOME);
+  chmodSync(home, 0o700);
+
+  // A folder in the home is what the variable is for.
+  const results = makeDir(home, "results");
+  expect(readConfig({ ...ENV, TENDER_FILES_DIR: results }, home).filesDir).toBe(results);
+
+  // It is reported with the other faults, in order.
+  expect(failureOf({ ...ENV, TENDER_NETWORK: "devnet", TENDER_FILES_DIR: home })).toBe(
+    `TENDER_NETWORK must be one of sandbox, testnet, mainnet; ${HOME}`,
+  );
+});
+
+test("a_files_dir_that_holds_the_home_directory_is_refused", () => {
+  // Every directory above the home holds it, up to the root, and what is in it is in reach of
+  // commit_result as much as the home's own. The answer is this one for all of them, whoever owns
+  // the directory and whatever its mode, and not that it is not the user's.
+  const above = makeDir(home, "above");
+  const mine = makeDir(above, "me");
+  for (const holder of [above, home, dirname(home), dirname(dirname(home)), "/"]) {
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: holder }, mine), holder).toBe(HOME);
+  }
+  // A link that leads to one, and a `..` that goes up to one, are judged by where they lead.
+  symlinkSync(above, join(home, "up"), "dir");
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "up") }, mine)).toBe(HOME);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: `${mine}/..` }, mine)).toBe(HOME);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: above }, mine)).not.toContain(above);
+
+  // The home is the user's own home that is asked for, wherever the files directory is.
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: "/" }, home)).toBe(HOME);
+});
+
+test("a_files_dir_that_is_the_home_directory_in_other_letter_case_is_refused", () => {
+  // A disk may not tell letter case apart (macOS and Windows do not, by default), and then the home
+  // written in other case is the home. What counts is the real path that the kernel gives for it.
+  const swapped = home.replace(/[a-z]/gi, (letter) =>
+    letter === letter.toLowerCase() ? letter.toUpperCase() : letter.toLowerCase(),
+  );
+  // A disk that does tell them apart has no such directory, and nothing to try.
+  if (swapped === home || !existsSync(swapped)) return;
+
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: swapped })).toBe(HOME);
+  expect(failureOf({ ...ENV, TENDER_FILES_DIR: dirname(swapped) }, home)).toBe(HOME);
 });
 
 test("a_files_dir_that_is_not_there_or_is_no_directory_is_refused", () => {
@@ -561,10 +632,10 @@ test("a_chain_of_links_is_refused_if_a_name_in_it_is_looked_up_where_others_can_
     symlinkSync(target, join(outside, "l2"), "dir");
     symlinkSync(join(outside, "l2"), work, "dir");
     expect(failureOf({ ...ENV, TENDER_FILES_DIR: work })).toMatch(SHARED);
-    // Pointed at the home, as it could be: the same answer, and the home is never what is kept.
+    // Pointed at the home, as it could be: refused as the home, and the home is never what is kept.
     rmSync(join(outside, "l2"));
     symlinkSync(home, join(outside, "l2"), "dir");
-    expect(failureOf({ ...ENV, TENDER_FILES_DIR: work })).toMatch(SHARED);
+    expect(failureOf({ ...ENV, TENDER_FILES_DIR: work })).toBe(HOME);
     // A link straight into `wd` was refused before (the real path is in `wd`), and still is.
     mkdirSync(join(outside, "sub"), { mode: 0o700 });
     symlinkSync(join(outside, "sub"), join(home, "direct"), "dir");
@@ -698,7 +769,11 @@ test("files_dir_and_the_directories_above_it_belong_to_the_user_or_to_root", () 
   // The way stops at the home, and at the root otherwise.
   expect(verdict({ ...clean(), "/": found(other, 0o777) }, "/srv")).toBe(FILES);
   expect(verdict({ ...clean(), "/srv": found(other, 0o777) }, "/srv")).toMatch(SHARED);
-  expect(verdict({ ...clean(), "/srv": found(other, 0o777) }, FILES)).toBe(FILES);
+  // The home itself is not a folder for the files, whatever its owner and mode, and neither is a
+  // directory that holds it, up to the root; one that only has a name like it is no such directory.
+  expect(verdict({ ...clean(), "/srv": found(other, 0o777) }, FILES)).toBe(HOME);
+  expect(verdict(clean(), "/srv/tender/files/me")).toBe(HOME);
+  expect(verdict(clean(), "/srv/tender/files-home")).toBe(FILES);
 
   // A link is judged as a link: the user's or root's will do, another user's will not. Where it
   // leads is what is kept, and that place is looked at, up to the root.
@@ -817,6 +892,12 @@ test("files_dir_is_kept_as_its_real_path_where_there_are_no_user_ids", () => {
     expect(readConfig({ ...ENV, TENDER_FILES_DIR: join(home, "link") }, home).filesDir).toBe(open);
     expect(lstatSync).not.toHaveBeenCalled();
     expect(failureOf({ ...ENV, TENDER_FILES_DIR: join(home, "not-there") })).toBe(MISSING);
+    // The home, and a directory that holds it, are refused by the real path the kernel gives: the
+    // way is not followed here, and there is no other look.
+    symlinkSync(home, join(open, "home-link"), "dir");
+    for (const holder of [home, join(open, "home-link"), dirname(home), "/"]) {
+      expect(failureOf({ ...ENV, TENDER_FILES_DIR: holder }), holder).toBe(HOME);
+    }
   } finally {
     if (original !== undefined) Object.defineProperty(process, "getuid", original);
   }

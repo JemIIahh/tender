@@ -1,6 +1,6 @@
 import { lstatSync, readlinkSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { Signer, TenderClient } from "@tender/client";
 import {
   AccountIdSchema,
@@ -155,9 +155,12 @@ function absoluteFilesDir(value: string, home: string): string {
   return path;
 }
 
-// The messages about TENDER_FILES_DIR's owner and mode name the variable and never a path: which
-// directory is at fault is for the user to find.
+// The messages about TENDER_FILES_DIR's owner, mode and place name the variable and never a path:
+// which directory is at fault is for the user to find.
 const FILES_DIR_MISSING = "TENDER_FILES_DIR must be a directory that exists";
+const FILES_DIR_HOME =
+  "TENDER_FILES_DIR must be a folder of its own for the files you give agents: not your home " +
+  "directory, and not a directory that holds it (/, /home, /Users and so on)";
 const FILES_DIR_SHARED =
   "TENDER_FILES_DIR must be a directory that only you can write to: it must be owned by you, and " +
   "it and every directory above it, up to your home directory (or up to / when it is not under " +
@@ -166,6 +169,24 @@ const FILES_DIR_SHARED =
 /** Whether `path` is `dir` or lies under it, going by how the two are written. */
 function isWithin(dir: string, path: string): boolean {
   return path === dir || path.startsWith(dir.endsWith(sep) ? dir : dir + sep);
+}
+
+/**
+ * Whether `dir`, a real path, is the user's home directory or one that holds it (`/`, `/home`,
+ * `/Users`, and so on up from the home). What the server may read can be committed and then
+ * published, and a home directory is full of what is not meant for that. The home is looked up here
+ * as well; one that is not there (a home that is gone, a test's) counts as it is written. A home
+ * that is not an absolute path is not a place, and holds nothing.
+ */
+function holdsHome(dir: string, home: string): boolean {
+  if (!isAbsolute(home)) return false;
+  let where: string;
+  try {
+    where = realpathSync.native(home);
+  } catch {
+    where = resolve(home);
+  }
+  return isWithin(dir, where);
 }
 
 /** How many links one path may lead through. The kernels give up on a loop at about this many. */
@@ -285,6 +306,12 @@ function faultIn(paths: readonly string[], me: number): "missing" | "shared" | u
  * every file) must be the one that was followed. If not, something changed while it was looked at,
  * and the directory is refused.
  *
+ * It must also be a folder for the agent's files and not the user's home directory, nor a directory
+ * that holds it (`/`, `/home`, `/Users`): what the server may read it can commit, and `reveal_result`
+ * then publishes it, and a home directory holds the user's keys and credentials. The real path is
+ * what counts, so a link to the home is refused too. This is looked at first, before the owner and
+ * the mode, so that `/` is told this and not that it is not the user's.
+ *
  * Where the platform has no user ids (Windows) there is no owner to compare, and the way is not
  * looked at; the real path is kept all the same. A directory that is not there is refused: it could
  * be made by anyone later.
@@ -295,6 +322,7 @@ function pinFilesDir(dir: string, home: string): string {
   if (me !== undefined) {
     const way = wayTo(dir);
     if (way === undefined) throw new ConfigError(FILES_DIR_MISSING);
+    if (holdsHome(way.real, home)) throw new ConfigError(FILES_DIR_HOME);
     // The top, if the directory is under the home directory: the way to the home is not looked at.
     const homeReal = isAbsolute(home) ? wayTo(home)?.real : undefined;
     const top = homeReal !== undefined && isWithin(homeReal, way.real) ? homeReal : undefined;
@@ -318,6 +346,9 @@ function pinFilesDir(dir: string, home: string): string {
     throw new ConfigError(FILES_DIR_MISSING);
   }
   if (again !== pinned) throw new ConfigError(FILES_DIR_SHARED);
+  // The place the kernel gives is what is kept: it is judged as well (the only look where there are
+  // no user ids to follow the way with).
+  if (holdsHome(pinned, home)) throw new ConfigError(FILES_DIR_HOME);
   return pinned;
 }
 
@@ -331,9 +362,9 @@ function pinFilesDir(dir: string, home: string): string {
  *   what `canonicalBase` takes (no user name, query or fragment), as the API client reads it.
  * - Optional: `TENDER_STATE_DIR` (default: `defaultStateDir`, under `home`; a leading `~` is
  *   expanded to `home`), `TENDER_FILES_DIR` (an absolute path, `~` expanded likewise, of a
- *   directory that only the user can write to: see `pinFilesDir`, which looks it up once and gives
- *   its real path; default: none, and then `commit_result` takes no file), `TENDER_JUDGE_ACCOUNT`
- *   and `TENDER_TOKEN`.
+ *   directory that only the user can write to, and that is neither the home nor a directory that
+ *   holds it: see `pinFilesDir`, which looks it up once and gives its real path; default: none, and
+ *   then `commit_result` takes no file), `TENDER_JUDGE_ACCOUNT` and `TENDER_TOKEN`.
  *
  * A variable that is set to nothing is not set. Every fault is reported at once, in one line that
  * names the variables: the ones missing, then the ones whose values are wrong.
