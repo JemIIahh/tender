@@ -282,7 +282,7 @@ export function ReviewStep(props: {
           <p role="status" data-testid="post-sent">
             Your wallet sent it, but Tender hasn't reported the new task. It may well be posted:
             look for it on the{" "}
-            <a href="/" className="underline">
+            <a href="/tasks" className="underline">
               Tasks
             </a>{" "}
             page before you try again.
@@ -297,7 +297,7 @@ export function ReviewStep(props: {
             <p>
               We couldn't tell whether the post went through. Check the{" "}
               {/* A tab of its own, so that the form on this page is not lost. */}
-              <a href="/" target="_blank" rel="noreferrer" className="underline">
+              <a href="/tasks" target="_blank" rel="noreferrer" className="underline">
                 Tasks
               </a>{" "}
               page before posting again.

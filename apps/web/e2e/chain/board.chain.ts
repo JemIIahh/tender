@@ -8,7 +8,7 @@ import { loadRun } from "./run";
 
 test("board_renders_seeded_tasks", async ({ page }) => {
   const run = loadRun();
-  await page.goto("/");
+  await page.goto("/tasks");
 
   for (const { slug, title } of run.seeds) {
     const card = cardTitled(page, title);

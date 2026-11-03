@@ -787,7 +787,7 @@ test("a_wallet_that_fails_without_saying_whether_it_sent_locks_post_until_the_pe
   );
   // The Tasks page opens in a tab of its own, so that the form on this page is not lost.
   const link = within(unknown).getByRole("link", { name: "Tasks" });
-  expect(link.getAttribute("href")).toBe("/");
+  expect(link.getAttribute("href")).toBe("/tasks");
   expect(link.getAttribute("target")).toBe("_blank");
   expect(screen.queryByTestId("post-failure")).toBeNull();
   expect(screen.queryByTestId("post-sent")).toBeNull();
@@ -1012,7 +1012,7 @@ test("a_send_that_reports_no_new_task_does_not_redirect_and_cannot_be_pressed_ag
 
   const sent = await screen.findByTestId("post-sent");
   expect(sent.textContent).toContain("It may well be posted");
-  expect(within(sent).getByRole("link", { name: "Tasks" }).getAttribute("href")).toBe("/");
+  expect(within(sent).getByRole("link", { name: "Tasks" }).getAttribute("href")).toBe("/tasks");
   expect(router.push).not.toHaveBeenCalled();
   expect(off(postButton())).toBe(true);
 });

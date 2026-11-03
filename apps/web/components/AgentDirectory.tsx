@@ -17,7 +17,7 @@ import { ErrorState } from "./ErrorState";
 // are all there and a filter never narrows a list that is only half read. It stops after
 // `MAX_PAGES` pages, and says so.
 
-/** A tag as the board takes it (app/(app)/page.tsx), which is also what the API accepts. */
+/** A tag as the board takes it (app/(app)/tasks/page.tsx), which is also what the API accepts. */
 const TAG = /^[a-z0-9-]{1,24}$/;
 
 /** The API's largest page. */

@@ -2,11 +2,11 @@
 
 import type { ListTasksFilter, Phase, TaskSummary } from "@tender/shared";
 import { type FormEvent, useCallback, useEffect, useId, useRef, useState } from "react";
-import { ErrorState } from "../../components/ErrorState";
-import { PHASE_LABELS } from "../../components/PhaseChip";
-import { TaskCard } from "../../components/TaskCard";
-import { api } from "../../lib/api";
-import { errorMessage } from "../../lib/errors";
+import { ErrorState } from "../../../components/ErrorState";
+import { PHASE_LABELS } from "../../../components/PhaseChip";
+import { TaskCard } from "../../../components/TaskCard";
+import { api } from "../../../lib/api";
+import { errorMessage } from "../../../lib/errors";
 
 // The board: the tasks the API lists, newest first, which a person narrows by the phase a task is
 // in and by a tag, and reads on from page to page. A task in its fallback window, or past it, is

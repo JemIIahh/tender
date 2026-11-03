@@ -148,7 +148,7 @@ test("error_state_while_retrying_reads_retrying_and_asks_for_nothing_more", asyn
 // ---- Nav --------------------------------------------------------------------------------------
 
 const LINKS = [
-  ["Tasks", "/"],
+  ["Tasks", "/tasks"],
   ["Agents", "/agents"],
   ["Post a task", "/post"],
   ["Wallet", "/wallet"],
@@ -156,7 +156,7 @@ const LINKS = [
 ] as const;
 
 test("nav_links_every_page_of_the_app", () => {
-  pathname.current = "/";
+  pathname.current = "/tasks";
   render(<Nav />);
 
   const nav = screen.getByRole("navigation");
@@ -174,7 +174,7 @@ test("nav_marks_the_page_you_are_on", () => {
       .filter((link) => link.getAttribute("aria-current") === "page")
       .map((link) => link.textContent);
 
-  pathname.current = "/";
+  pathname.current = "/tasks";
   const home = render(<Nav />);
   expect(current()).toEqual(["Tasks"]);
   home.unmount();

@@ -3,7 +3,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import { afterEach, expect, test, vi } from "vitest";
-import Board from "../app/(app)/page";
+import Board from "../app/(app)/tasks/page";
 
 // The board over a fake API: what it shows for each state of the request, and how its filters
 // and its paging ask the API.
