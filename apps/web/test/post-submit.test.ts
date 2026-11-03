@@ -2,13 +2,14 @@ import {
   ApiError,
   type BlobUpload,
   sha256Hex,
+  storageShortfall,
   type TenderCall,
   type TenderEvent,
   TenderEventSchema,
 } from "@tender/shared";
 import { expect, test, vi } from "vitest";
 import { clearApiToken, keepToken, signInTicket } from "../lib/apiToken";
-import { buildDocuments, type PostForm } from "../lib/post";
+import { buildDocuments, POST_TASK_BYTES, type PostForm, VAULT_SLOT_BYTES } from "../lib/post";
 import {
   liveToken,
   type SubmitDeps,
@@ -361,13 +362,25 @@ test("a_blob_the_api_stored_as_something_else_is_not_posted", async () => {
   }
 });
 
-test("an_account_with_no_storage_or_too_little_in_the_wallet_sends_nothing", async () => {
+test("an_account_that_has_never_deposited_is_set_up_by_the_same_send", async () => {
   const form = regexForm({ amount: "5" });
+  const w = world(form, { vault: vaultData({ storage: false }) });
 
-  const noStorage = world(form, { vault: vaultData({ storage: false }) });
-  const failure = (await rejection(submitPost(input(form), noStorage.deps))) as SubmitFailure;
-  expect(failure.stage).toBe("vault");
-  expect(failure.message).toContain("isn't set up with Tender");
+  const result = await submitPost(input(form), w.deps);
+
+  // One send, with the registration first: no detour to the Wallet page.
+  expect(result).toEqual({ kind: "posted", taskId: "17" });
+  expect(w.sent).toHaveLength(1);
+  expect(w.sent[0]?.map((call) => call.methodName)).toEqual([
+    "storage_deposit",
+    "ft_transfer_call",
+    "post_task",
+  ]);
+  expect(w.sent[0]?.[0]?.deposit).toBe(storageShortfall(null, POST_TASK_BYTES + VAULT_SLOT_BYTES));
+});
+
+test("an_account_with_too_little_in_the_wallet_sends_nothing", async () => {
+  const form = regexForm({ amount: "5" });
 
   // The vault holds 2 and the wallet 2.5: 3 are needed, and the wallet is half a token short.
   const short = world(form, { vault: vaultData({ vault: 2_000_000n, wallet: 2_500_000n }) });
@@ -378,7 +391,7 @@ test("an_account_with_no_storage_or_too_little_in_the_wallet_sends_nothing", asy
   const unknown = world(form, { vault: vaultData({ wallet: null }) });
   await expect(submitPost(input(form), unknown.deps)).resolves.toMatchObject({ kind: "posted" });
 
-  for (const w of [noStorage, short]) expect(w.sent).toEqual([]);
+  expect(short.sent).toEqual([]);
 });
 
 // ---- The token ----------------------------------------------------------------------------------

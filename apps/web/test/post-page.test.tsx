@@ -1,13 +1,14 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { SIGN_IN_MESSAGE, sha256Hex } from "@tender/shared";
+import { SIGN_IN_MESSAGE, sha256Hex, storageShortfall } from "@tender/shared";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, type MockInstance, test, vi } from "vitest";
 import { PostWizard } from "../components/post/PostWizard";
 import { heldToken } from "../lib/apiToken";
 import { clearApiToken } from "../lib/auth";
-import { RUBRIC_JUDGE_NOTE } from "../lib/post";
+import { POST_TASK_BYTES, RUBRIC_JUDGE_NOTE, VAULT_SLOT_BYTES } from "../lib/post";
+import { describeNear } from "../lib/vault";
 import { createWalletStore, type WalletStore } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE } from "../lib/walletErrors";
 import { FakeChain, FakeNode, fakeFetch, type Outcome } from "./fakeChain";
@@ -594,31 +595,32 @@ test("the_reward_step_waits_for_what_tender_allows_and_asks_again_when_it_failed
 
 // ---- Review: what stands in the way -------------------------------------------------------------
 
-test("an_account_that_is_not_set_up_is_sent_to_the_wallet_page_and_nothing_is_posted", async () => {
-  const { user, wallet, api, chain } = setup({ setUp: false });
+test("an_account_that_is_not_set_up_is_set_up_by_the_post_in_one_approval", async () => {
+  const { user, wallet, chain } = setup({ setUp: false });
   render(<PostWizard judgeAccount={JUDGE} />);
   await toReview(user);
 
-  const blocked = await screen.findByTestId("post-blocked");
-  expect(blocked.textContent).toContain(
-    "Your account isn't set up with Tender yet. Set it up on the Wallet page first.",
+  // No detour to the Wallet page: Review says what the batch adds first, and Post is on.
+  const setup_ = storageShortfall(null, POST_TASK_BYTES + VAULT_SLOT_BYTES);
+  await waitFor(
+    () =>
+      expect(testId("review-storage")).toBe(`Adds ${describeNear(setup_)} from your wallet first.`),
+    LONG,
   );
-  const link = within(blocked).getByRole("link", { name: "Open the Wallet page" });
-  expect(link.getAttribute("href")).toBe("/wallet");
-  // A tab of its own, so that the form on this page is kept.
-  expect(link.getAttribute("target")).toBe("_blank");
-  expect(off(postButton())).toBe(true);
-
-  await user.click(postButton());
-  await settle();
-  expect(writes(api)).toEqual([]);
-  expect(wallet.sent).toEqual([]);
-
-  // Once it is set up, "Check again" reads the balances afresh and the way is clear.
-  chain.fundVault(ALICE, TOKEN, 0n);
-  await user.click(within(blocked).getByRole("button", { name: "Check again" }));
-  await postReady();
   expect(screen.queryByTestId("post-blocked")).toBeNull();
+  expect(screen.queryByRole("link", { name: "Open the Wallet page" })).toBeNull();
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+
+  // One send, so one approval: the registration, the deposit and the post.
+  expect(wallet.sent).toHaveLength(1);
+  expect(chain.calls.map(({ receiverId, methodName }) => `${receiverId} ${methodName}`)).toEqual([
+    `${CONTRACT} storage_deposit`,
+    `${TOKEN} ft_transfer_call`,
+    `${CONTRACT} post_task`,
+  ]);
+  expect(chain.storage.get(ALICE)?.total).toBe(setup_);
+  expect(chain.tasks.get(1n)).toMatchObject({ poster: ALICE, reward: TUSDC(5) });
 });
 
 test("a_wallet_that_holds_too_little_to_fund_the_reward_says_how_much_more", async () => {

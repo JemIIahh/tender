@@ -4,6 +4,7 @@ import {
   HeldoutSchema,
   heldoutMatchesCriteria,
   PublicCriteriaSchema,
+  REGISTRATION_BYTES_MAX,
   RUBRIC_MAX_CRITERIA,
   RUBRIC_MAX_CRITERION_CHARS,
   RUBRIC_MAX_ENTRIES,
@@ -11,7 +12,9 @@ import {
   type RubricProblem,
   rubricCriteriaProblem,
   rubricEntriesProblem,
+  STORAGE_MIN_DEPOSIT,
   sha256Hex,
+  storageShortfall,
 } from "@tender/shared";
 import { expect, test } from "vitest";
 import {
@@ -424,11 +427,47 @@ test("funding_says_the_storage_the_post_will_add_by_the_same_rule", () => {
     600n * BYTE,
   );
   expect(fundingOf(data(5_000_000n, 5_000n * BYTE), TOKEN, 5_000_000n).storageTopUp).toBe(0n);
-  // An account that is not set up is turned away, and no top-up is made up for it.
-  expect(fundingOf({ storage: null, rows: [] }, TOKEN, 5_000_000n)).toMatchObject({
-    storageTopUp: 0n,
-    problem: "Your account isn't set up with Tender yet. Set it up on the Wallet page first.",
+  // An account that is not set up is not turned away: the post sets it up, and the top-up is the
+  // price of its registration and of the post and the vault slot, which is all the first deposit
+  // has to cover (it is more than the 0.01 NEAR a first deposit has to be at least).
+  const newcomer = { storage: null, rows: data(0n, 0n).rows };
+  expect(fundingOf(newcomer, TOKEN, 5_000_000n)).toMatchObject({
+    storageTopUp: (POST_TASK_BYTES + VAULT_SLOT_BYTES + REGISTRATION_BYTES_MAX) * BYTE,
+    problem: null,
   });
+  expect(fundingOf(newcomer, TOKEN, 5_000_000n).storageTopUp).toBe(
+    storageShortfall(null, POST_TASK_BYTES + VAULT_SLOT_BYTES),
+  );
+  // The other things that stand in the way still do.
+  expect(fundingOf({ storage: null, rows: [] }, TOKEN, 5_000_000n).problem).toBe(
+    "Tender isn't taking deposits of this token right now.",
+  );
+});
+
+test("an_account_that_has_never_deposited_is_registered_by_the_first_call_of_the_batch", () => {
+  const form = regexForm({ amount: "5" });
+  const docs = buildDocuments(form);
+  const plan = (vaultBalance: bigint, storage: Parameters<typeof planPostCalls>[0]["storage"]) =>
+    planPostCalls({
+      form,
+      uris: { brief: `http://api.test/v1/blobs/${docs.briefHash}` },
+      hashes: docs,
+      vaultBalance,
+      storage,
+      contractId: CONTRACT,
+      tokenId: TOKEN,
+      judgeAccount: JUDGE,
+    });
+
+  // null is "never deposited" and is planned for; undefined is "plan no top-up".
+  const newcomer = plan(0n, null);
+  expect(methods(newcomer)).toEqual(["storage_deposit", "ft_transfer_call", "post_task"]);
+  // A plain storage_deposit, for the caller, of the price of the registration and the rest. With
+  // `registration_only` the contract would credit 0.01 NEAR and send the rest back.
+  expect(newcomer[0]?.args).toEqual({});
+  expect(newcomer[0]?.deposit).toBe(storageShortfall(null, POST_TASK_BYTES + VAULT_SLOT_BYTES));
+  expect(newcomer[0]?.deposit).toBeGreaterThan(STORAGE_MIN_DEPOSIT);
+  expect(methods(plan(0n, undefined))).toEqual(["ft_transfer_call", "post_task"]);
 });
 
 // ---- Checks, step by step -----------------------------------------------------------------------

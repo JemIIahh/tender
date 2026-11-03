@@ -367,8 +367,8 @@ export async function submitPost(
     uris: { brief: brief.uri },
     hashes: docs,
     vaultBalance: funding.inVault,
-    // Not null: `fundingOf` has turned an account with no storage balance away.
-    storage: vault.storage ?? undefined,
+    // Null passes through: an account that has never deposited is set up by the same batch.
+    storage: vault.storage,
     contractId: config.contractId,
     tokenId,
     judgeAccount,

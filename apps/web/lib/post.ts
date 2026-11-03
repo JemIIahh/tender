@@ -970,11 +970,18 @@ function verifierOf(form: PostForm, judgeAccount: string | null): string | undef
  * The NEAR, in yoctoNEAR, that a `storage_deposit` has to add so that `storage` pays for a post, and
  * for the vault slot of the token as well if the post `opensSlot`; 0 if it already does. Only the
  * `available` of the view is read by `storageShortfall`.
+ *
+ * `storage` is null for an account that has never deposited. Its first `storage_deposit` registers
+ * it, which costs bytes of its own, so the answer is the price of both (`storageShortfall` works it
+ * out, with the 0.01 NEAR a first deposit has to be at least), and the account is set up in the
+ * same approval as the post.
  */
-export function storageTopUpFor(storage: StorageBalance, opensSlot: boolean): bigint {
+export function storageTopUpFor(storage: StorageBalance | null, opensSlot: boolean): bigint {
+  const bytes = opensSlot ? POST_TASK_BYTES + VAULT_SLOT_BYTES : POST_TASK_BYTES;
+  if (storage === null) return storageShortfall(null, bytes);
   return storageShortfall(
     { total: storage.total.toString(), available: storage.available.toString(), used_bytes: "0" },
-    opensSlot ? POST_TASK_BYTES + VAULT_SLOT_BYTES : POST_TASK_BYTES,
+    bytes,
   );
 }
 
@@ -1002,10 +1009,12 @@ export function planPostCalls(o: {
   hashes: { briefHash: string; criteriaHash: string; heldoutCommitment: string | null };
   vaultBalance: bigint;
   /**
-   * The poster's storage balance with Tender, from the read that gave `vaultBalance`. Left out, no
-   * top-up is planned: for a check that only wants to know the form can be made into calls.
+   * The poster's storage balance with Tender, from the read that gave `vaultBalance`: null for an
+   * account that has never deposited, whose first `storage_deposit` registers it as well (the
+   * batch sets the account up). Left out (undefined), no top-up is planned: for a check that only
+   * wants to know the form can be made into calls.
    */
-  storage?: StorageBalance;
+  storage?: StorageBalance | null;
   contractId: string;
   tokenId: string;
   /** The Judge's account, for a form that picks the Judge as verifier. */
@@ -1066,23 +1075,20 @@ export interface Funding {
 
 /**
  * Where the `reward` of `token` comes from, given what `data` says the account holds, and whether
- * it can be posted: the account needs a storage balance with Tender, the token has to be taking
- * deposits, and the wallet has to hold what the vault lacks (when the token says what it holds).
- * The storage a post needs beyond that balance is topped up in the same batch (`planPostCalls`),
- * and `storageTopUp` says how much.
+ * it can be posted: the token has to be taking deposits, and the wallet has to hold what the vault
+ * lacks (when the token says what it holds). The storage a post needs beyond the account's balance
+ * is topped up in the same batch (`planPostCalls`), and `storageTopUp` says how much; an account
+ * that has never set up its storage is set up there too, so it is not turned away.
  */
 export function fundingOf(data: VaultData, token: string, reward: bigint): Funding {
   const row = data.rows.find((candidate) => candidate.token === token);
   const inVault = row?.vault ?? 0n;
   const toDeposit = reward > inVault ? reward - inVault : 0n;
   const inWallet = row?.wallet ?? null;
-  const storageTopUp =
-    data.storage === null ? 0n : storageTopUpFor(data.storage, opensVaultSlot(inVault));
+  const storageTopUp = storageTopUpFor(data.storage, opensVaultSlot(inVault));
 
   let problem: string | null = null;
-  if (data.storage === null) {
-    problem = "Your account isn't set up with Tender yet. Set it up on the Wallet page first.";
-  } else if (toDeposit > 0n && row?.enabled !== true) {
+  if (toDeposit > 0n && row?.enabled !== true) {
     problem = "Tender isn't taking deposits of this token right now.";
   } else if (inWallet !== null && toDeposit > inWallet) {
     problem = `You need ${describeAmount(toDeposit - inWallet, token)} more in your wallet to fund this reward.`;
