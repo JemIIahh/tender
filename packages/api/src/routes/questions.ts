@@ -180,11 +180,8 @@ export function questionRoutes(
   /**
    * A 403 unless `account` may ask on the task. The poster and the verifier never may, whether or
    * not they are invited or registered. On a pinned task (`invited` is not empty) an invited account
-   * may; on an open one a registered agent may.
-   *
-   * TODO(agent bond): "registered" is a row in the indexer's `agents` table today. When the
-   * registration bond lands and agents have a status (active, unregistering, retired), tighten this
-   * to active agents, so that a retired one cannot ask.
+   * may; on an open one an active agent may: one that is unregistering or retired has given its
+   * bond up (or is on its way to), and the contract no longer lets it enter an open task either.
    */
   async function requireMayAsk(task: TaskRow, account: string): Promise<void> {
     if (account === task.poster) {
@@ -205,11 +202,15 @@ export function questionRoutes(
       return;
     }
     const [agent] = await deps.db.query<{ account: string }>(
-      "select account from agents where account = $1",
+      "select account from agents where account = $1 and status = 'active'",
       [account],
     );
     if (agent === undefined) {
-      fail(403, "not_registered", "only a registered agent can ask a question on an open task");
+      fail(
+        403,
+        "not_registered",
+        "only an active registered agent can ask a question on an open task",
+      );
     }
   }
 

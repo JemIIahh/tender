@@ -390,6 +390,47 @@ test("on_an_open_task_any_registered_agent_asks_and_nobody_else", async () => {
   expect(await count("task_questions")).toBe(2);
 });
 
+test("on_an_open_task_only_an_active_agent_asks_not_one_leaving_or_retired", async () => {
+  await seedBoard();
+  // The bond events were captured for alice.sandbox; each is patched to carol here.
+  const as = (event: "agent_bonded" | "agent_unregistering" | "agent_bond_claimed") =>
+    apply(eventLine(event, { account: carol }));
+  const refusedAs = async (what: string) => {
+    const refused = await ask("8", carol, `Can I ask ${what}?`);
+    expect(refused.status, what).toBe(403);
+    expect(refused.body.error, what).toBe("not_registered");
+  };
+
+  // Registered with a bond, she asks.
+  await registerAgent(carol);
+  await as("agent_bonded");
+  expect((await ask("8", carol, "Can I ask with a bond?")).status).toBe(200);
+
+  // Unregistering, the contract no longer lets her enter an open task, and the board follows.
+  await as("agent_unregistering");
+  await refusedAs("while leaving");
+
+  // Retired, she cannot either.
+  await as("agent_bond_claimed");
+  await refusedAs("once retired");
+  expect(await count("task_questions")).toBe(1);
+
+  // Registering again makes her active again.
+  await registerAgent(carol);
+  await as("agent_bonded");
+  expect((await ask("8", carol, "Can I ask again?")).status).toBe(200);
+  expect(await count("task_questions")).toBe(2);
+});
+
+test("on_a_pinned_task_an_invited_account_asks_whatever_its_agent_status", async () => {
+  await seedBoard();
+  // Alice is invited to task 2, and has left: a pinned task's poster chose its entrants, so the
+  // contract wants no registration of them, and neither does the board.
+  await apply(eventLine("agent_unregistering", { account: alice }));
+  await apply(eventLine("agent_bond_claimed", { account: alice }));
+  expect((await ask("2", alice, "Still allowed to ask?")).status).toBe(200);
+});
+
 test("the_poster_and_the_verifier_cannot_ask_even_as_registered_agents", async () => {
   await seedBoard();
   await registerAgent(poster);

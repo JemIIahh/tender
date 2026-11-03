@@ -39,7 +39,8 @@ const clientOf = (role: LocalRole) =>
   });
 
 beforeAll(async () => {
-  chain = await startLocalChain();
+  // Alice and bob enter an open task, so they are registered agents, with a bond, before it.
+  chain = await startLocalChain({ registerAgents: ["alice", "bob"] });
   reader = new TenderClient({
     network: chain.network,
     contractId: chain.contractId,
