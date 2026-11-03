@@ -1,5 +1,5 @@
 import type { Db } from "@tender/db";
-import { type NetworkId, TenderEventSchema } from "@tender/shared";
+import { BoardEventSchema, type NetworkId, TenderEventSchema } from "@tender/shared";
 import { type Bot, GrammyError, HttpError } from "grammy";
 import { type Alert, dedupeKey } from "./alerts";
 import { resolveRecipients } from "./recipients";
@@ -11,7 +11,11 @@ import { type RenderContext, renderAlert } from "./render";
  * - The event stream: `events` rows after the notifier's place in it, `worker_cursor['telegram']`,
  *   at most `BATCH_SIZE` of them, oldest first. A `task_created` makes `new_task`, a `committed`
  *   that is not a replacement `entry_committed`, a `task_topped_up` `pool_grew`, a `picked`
- *   `winner_paid` and a `voided` `task_voided`. The cursor moves to the last event read once the
+ *   `winner_paid` and a `voided` `task_voided`. The question board's own events make three more: a
+ *   `question_asked` makes `question_asked`, a `question_answered` `question_answered` and a
+ *   `clarification_posted` `clarification_posted`; a `question_hidden` makes none, and a question
+ *   that the poster hid by the time the notifier looks makes none either. None of them carries the
+ *   words that were written, and no message does. The cursor moves to the last event read once the
  *   batch is done, whether its alerts were sent or not.
  * - The `working` rows of agents that said, in the last 10 minutes, that they started a task:
  *   `agent_started`. The poster hears of the first `POSTER_STARTERS` agents to start a task and no
@@ -124,6 +128,15 @@ const SEND_OPTIONS = { parse_mode: "HTML", link_preview_options: { is_disabled: 
 
 /** The events that make an alert. The rest of the stream (deposits, reveals, …) is not news. */
 const ALERTING = new Set(["task_created", "committed", "task_topped_up", "picked", "voided"]);
+
+/**
+ * The events of the question board that make an alert. The board's `question_hidden` is not here:
+ * the poster did it, and there is nothing to tell anyone.
+ */
+const BOARD_ALERTING = new Set(["question_asked", "question_answered", "clarification_posted"]);
+
+/** The largest id a `bigserial` row has: a question id past it is no row's, and the database would refuse it. */
+const MAX_ROW_ID = 2n ** 63n - 1n;
 
 /**
  * Until when each bot may not be asked to send, in milliseconds since the epoch by the tick's clock.
@@ -365,6 +378,7 @@ interface TaskRow {
  * the latest count, and a rebuilt alert gets the key it had before.
  */
 async function alertOf(tick: Tick, row: EventRow): Promise<Alert | null> {
+  if (BOARD_ALERTING.has(row.event)) return boardAlertOf(tick, row);
   if (!ALERTING.has(row.event)) return null;
   const parsed = TenderEventSchema.safeParse({ event: row.event, data: row.data });
   const taskId = row.task_id;
@@ -425,6 +439,67 @@ async function alertOf(tick: Tick, row: EventRow): Promise<Alert | null> {
       };
     case "voided":
       return { kind: "task_voided", taskId, title, reason: event.data.reason };
+    default:
+      return null;
+  }
+}
+
+/**
+ * The alert that a `question_asked`, `question_answered` or `clarification_posted` event makes, or
+ * null if it makes none: for an event that is malformed or names no task or no question (logged,
+ * like the chain events that do), and for a question that the poster hid, whose ask and answer are
+ * no news to anyone now. The alert holds the ids and the asker, never the words: the board has
+ * them, and they may be hidden before a reader gets to them.
+ */
+async function boardAlertOf(tick: Tick, row: EventRow): Promise<Alert | null> {
+  const parsed = BoardEventSchema.safeParse({ event: row.event, data: row.data });
+  const taskId = row.task_id;
+  if (!parsed.success || taskId === null) {
+    console.error(`telegram notifier: skipped event ${row.id} (${row.event}): it is malformed`);
+    return null;
+  }
+  const [task] = await tick.db.query<{ title: string | null }>(
+    "select title from tasks where id = $1::numeric",
+    [taskId],
+  );
+  if (task === undefined) {
+    console.error(
+      `telegram notifier: skipped event ${row.id} (${row.event}): no task ${taskId} in the index`,
+    );
+    return null;
+  }
+  const title = titleOf(task.title, taskId);
+  const event = parsed.data;
+  switch (event.event) {
+    case "clarification_posted":
+      return {
+        kind: "clarification_posted",
+        taskId,
+        title,
+        clarificationId: event.data.clarification_id,
+      };
+    case "question_asked":
+    case "question_answered": {
+      const questionId = event.data.question_id;
+      const [question] =
+        BigInt(questionId) > MAX_ROW_ID
+          ? []
+          : await tick.db.query<{ hidden: boolean }>(
+              `select hidden from task_questions
+                where id = $1::bigint and task_id = $2::numeric and kind = 'question'`,
+              [questionId, taskId],
+            );
+      if (question === undefined) {
+        console.error(
+          `telegram notifier: skipped event ${row.id} (${row.event}): no question ${questionId} on task ${taskId}`,
+        );
+        return null;
+      }
+      if (question.hidden) return null;
+      return event.event === "question_asked"
+        ? { kind: "question_asked", taskId, title, questionId, asker: event.data.asker }
+        : { kind: "question_answered", taskId, title, questionId };
+    }
     default:
       return null;
   }

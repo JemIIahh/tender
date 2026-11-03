@@ -3,13 +3,16 @@ import type { Alert } from "./alerts";
 
 /**
  * The accounts an alert can name, each as a query that returns them in a column `account`. `$1` is
- * the task's id and `$2`, in `agent_started` only, the agent.
+ * the task's id, and `$2`, in `agent_started` only, the agent, and in `question_answered` only, the
+ * id of the question.
  *
  * An entry is revealed once it has a `content_hash`. The column stays null from the commit until
  * the `revealed` event sets it, together with `uri`.
  *
  * `invitees` are the accounts in `tasks.invited`, a jsonb array of account ids. An open task has
- * none.
+ * none. `workers` are the accounts that said they started the task (the `working` signal).
+ * `questionAsker` is the account that asked question `$2` on the task: a question that is not the
+ * task's has no asker.
  */
 const ACCOUNTS = {
   poster: "select poster as account from tasks where id = $1::numeric",
@@ -20,6 +23,9 @@ const ACCOUNTS = {
   committers: "select account from entries where task_id = $1::numeric",
   revealers: "select account from entries where task_id = $1::numeric and content_hash is not null",
   unrevealed: "select account from entries where task_id = $1::numeric and content_hash is null",
+  workers: "select account from working where task_id = $1::numeric",
+  questionAsker:
+    "select asker as account from task_questions where task_id = $1::numeric and id = $2::bigint",
   // `$1` is named here so that its type is known when no other role in the audience uses it.
   agent: "select $2::text as account where $1::numeric is not null",
 } as const;
@@ -72,6 +78,18 @@ function audienceOf(a: Alert): Audience {
       return { chatsOf: ["poster"], ownerChatsOf: ["committers"] };
     case "pool_grew":
       return { chatsOf: ["poster", "funders"], watchers: true };
+    case "question_asked":
+      return { chatsOf: ["poster"] };
+    case "question_answered":
+      // The entrants are who the board is for: the asker, those who entered, those who said they
+      // started and, on a task pinned to some accounts, the ones invited. Watchers hear it for a
+      // task open to everyone (see WATCHERS). The poster wrote the answer.
+      return {
+        ownerChatsOf: ["questionAsker", "committers", "workers", "invitees"],
+        watchers: true,
+      };
+    case "clarification_posted":
+      return { ownerChatsOf: ["committers", "workers", "invitees"], watchers: true };
     default: {
       const unexpected: never = a;
       throw new Error(`unknown alert: ${JSON.stringify(unexpected)}`);
@@ -143,7 +161,12 @@ function queryFor({ chatsOf = [], ownerChatsOf = [], watchers = false }: Audienc
  */
 export async function resolveRecipients(db: Db, a: Alert): Promise<string[]> {
   const sql = queryFor(audienceOf(a));
-  const params = a.kind === "agent_started" ? [a.taskId, a.agent] : [a.taskId];
+  const params =
+    a.kind === "agent_started"
+      ? [a.taskId, a.agent]
+      : a.kind === "question_answered"
+        ? [a.taskId, a.questionId]
+        : [a.taskId];
   const rows = await db.query<{ chat_id: string }>(sql, params);
   return rows.map((row) => row.chat_id);
 }

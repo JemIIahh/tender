@@ -86,6 +86,25 @@ const SAMPLES: ByKind = {
     reward: "12500000",
     funders: 3,
   },
+  question_asked: {
+    kind: "question_asked",
+    taskId: "7",
+    title: "Summarise the Q3 report",
+    questionId: "3",
+    asker: "alice.testnet",
+  },
+  question_answered: {
+    kind: "question_answered",
+    taskId: "7",
+    title: "Summarise the Q3 report",
+    questionId: "3",
+  },
+  clarification_posted: {
+    kind: "clarification_posted",
+    taskId: "7",
+    title: "Summarise the Q3 report",
+    clarificationId: "4",
+  },
 };
 
 // One snapshot per kind. The expected text is written out by hand from the plan's formats.
@@ -153,6 +172,30 @@ test("renders_deadline_reminder", () => {
 test("renders_pool_grew", () => {
   expect(renderAlert(SAMPLES.pool_grew, CTX)).toMatchInlineSnapshot(`
     "<b>Pool grew</b> · Summarise the Q3 report now pays 12.50 USDC from 3 backers
+    <a href="https://tender.example/tasks/7">Open task</a>"
+  `);
+});
+
+// The board's alerts say that something was written, and never what: the words are a stranger's,
+// public on the task page, and a poster may hide a question that was already announced.
+
+test("renders_question_asked", () => {
+  expect(renderAlert(SAMPLES.question_asked, CTX)).toMatchInlineSnapshot(`
+    "<b>New question</b> · Summarise the Q3 report · alice.testnet asked the poster
+    <a href="https://tender.example/tasks/7">Open task</a>"
+  `);
+});
+
+test("renders_question_answered", () => {
+  expect(renderAlert(SAMPLES.question_answered, CTX)).toMatchInlineSnapshot(`
+    "<b>Question answered</b> · Summarise the Q3 report · the poster answered a question
+    <a href="https://tender.example/tasks/7">Open task</a>"
+  `);
+});
+
+test("renders_clarification_posted", () => {
+  expect(renderAlert(SAMPLES.clarification_posted, CTX)).toMatchInlineSnapshot(`
+    "<b>Clarification</b> · Summarise the Q3 report · the poster posted a note for entrants
     <a href="https://tender.example/tasks/7">Open task</a>"
   `);
 });
@@ -262,6 +305,9 @@ test("html_is_escaped_in_every_text_field_of_every_kind", () => {
     task_voided: { ...SAMPLES.task_voided, title: evil },
     deadline_reminder: { ...SAMPLES.deadline_reminder, title: evil },
     pool_grew: { ...SAMPLES.pool_grew, title: evil, token: evil },
+    question_asked: { ...SAMPLES.question_asked, title: evil, asker: evil },
+    question_answered: { ...SAMPLES.question_answered, title: evil },
+    clarification_posted: { ...SAMPLES.clarification_posted, title: evil },
   };
 
   for (const alert of Object.values(hostile)) {
@@ -369,6 +415,9 @@ test("dedupe_keys_take_the_documented_form", () => {
     "task_voided:7",
     "deadline_reminder:7:24",
     "pool_grew:7:12500000",
+    "question_asked:7:3",
+    "question_answered:7:3",
+    "clarification_posted:7:4",
   ]);
 });
 
@@ -381,6 +430,15 @@ test("alerts_that_repeat_get_a_key_per_value", () => {
   distinct(SAMPLES.pool_grew, { ...SAMPLES.pool_grew, reward: "15000000" });
   distinct(SAMPLES.agent_started, { ...SAMPLES.agent_started, agent: "bob.testnet" });
   distinct(SAMPLES.deadline_reminder, { ...SAMPLES.deadline_reminder, hoursLeft: 1 });
+  // Each question, answer and clarification is news of its own, and an answer is not its question.
+  distinct(SAMPLES.question_asked, { ...SAMPLES.question_asked, questionId: "4" });
+  distinct(SAMPLES.question_answered, { ...SAMPLES.question_answered, questionId: "4" });
+  distinct(SAMPLES.question_asked, { ...SAMPLES.question_answered });
+  distinct(SAMPLES.clarification_posted, { ...SAMPLES.clarification_posted, clarificationId: "5" });
+  // The asker is not part of the key: a rebuilt alert for the same question lands on the same one.
+  expect(dedupeKey({ ...SAMPLES.question_asked, asker: "bob.testnet" })).toBe(
+    dedupeKey(SAMPLES.question_asked),
+  );
 });
 
 test("an_alert_of_an_unknown_kind_is_refused", () => {

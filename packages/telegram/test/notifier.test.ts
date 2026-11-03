@@ -1,5 +1,5 @@
 import { inspect } from "node:util";
-import type { Db } from "@tender/db";
+import { addClarification, addQuestion, answerQuestion, type Db, hideQuestion } from "@tender/db";
 import { applyBlock } from "@tender/indexer";
 import {
   blockOf,
@@ -11,7 +11,7 @@ import {
   lifecycleBlocks,
   putFixtureBlobs,
 } from "@tender/indexer/testing";
-import type { NetworkId } from "@tender/shared";
+import { BOARD_LIMITS, type NetworkId } from "@tender/shared";
 import { type Bot, HttpError, type Transformer } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import {
@@ -202,6 +202,7 @@ const TABLES = [
   "agents",
   "blobs",
   "working",
+  "task_questions",
   "tg_links",
   "tg_link_nonces",
   "tg_watches",
@@ -1383,6 +1384,177 @@ test("events_that_cannot_make_an_alert_are_logged_and_skipped", async () => {
   expect(logs[1]).toMatch(/event 2 \(committed\).*malformed/);
   expect(logs[2]).toMatch(/event 3 \(committed\).*task 404/);
   expect(await cursor()).toBe("4");
+  expect(await tick()).toEqual([]); // and they are not met again
+  expect(logged()).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// The question board's alerts. The rows are written by the board's own functions, as the API does,
+// so that the events are the ones production leaves: they name the task and the row, and no text.
+
+/**
+ * Task 7 open for days, and the people who hear of its board: the poster (chat 11), an account that
+ * asked (12), one that committed (13), one that said it started (14), a bystander (15) and a chat
+ * that watches the task's tag (16).
+ */
+async function seedBoardWorld(): Promise<void> {
+  await seedTask(db, {
+    id: "7",
+    poster: "poster.near",
+    title: "Summarise the Q3 report",
+    tags: ["research"],
+    ...OPEN_FOR_DAYS,
+  });
+  await seedEntry(db, "7", "committer.near");
+  // Long ago, so that it is no news of its own (the working alerts look at the last 10 minutes).
+  await startWorking("7", "worker.near", T0 - 3 * HOUR);
+  await linkChat(db, 11, "poster.near");
+  await linkChat(db, 12, "asker.near");
+  await linkChat(db, 13, "committer.near");
+  await linkChat(db, 14, "worker.near");
+  await linkChat(db, 15, "bystander.near");
+  await linkChat(db, 16, "watcher.near");
+  await watchTag(db, 16, "research");
+}
+
+/** Asks as `asker.near` on task 7, and gives back the question's id. */
+async function askOn7(body: string, asker = "asker.near"): Promise<bigint> {
+  const asked = await addQuestion(db, { taskId: 7n, asker, body }, BOARD_LIMITS);
+  if (!asked.ok) throw new Error(`the question was refused: ${asked.reason}`);
+  return BigInt(asked.row.id);
+}
+
+test("the_boards_events_make_alerts_that_name_what_happened_and_never_what_was_written", async () => {
+  await seedBoardWorld();
+  expect(await tick()).toEqual([]); // the first tick starts at the head, with nothing there
+
+  // Each holds a marker that nothing the notifier writes itself contains.
+  const words = [
+    "<b>ZZQASK</b> & see spam.example",
+    "ZZQANSWER <i>words</i> & more",
+    "ZZQNOTE <u>x</u> & y",
+  ];
+
+  // A question reaches the poster alone, and says who asked.
+  const id = await askOn7(words[0] ?? "");
+  const asked = await tick();
+  expect(lines(asked)).toEqual(["11 New question #7"]);
+  expect(asked[0]?.text).toContain("Summarise the Q3 report");
+  expect(asked[0]?.text).toContain("asker.near asked the poster");
+
+  // The answer reaches the asker, the one who committed, the one who started, and the tag watcher.
+  expect((await answerQuestion(db, { taskId: 7n, questionId: id, body: words[1] ?? "" })).ok).toBe(
+    true,
+  );
+  const answered = await tick();
+  expect(lines(answered)).toEqual([
+    "12 Question answered #7",
+    "13 Question answered #7",
+    "14 Question answered #7",
+    "16 Question answered #7",
+  ]);
+
+  // A clarification reaches the same, but for the asker, who has no more reason to hear than the rest.
+  expect((await addClarification(db, { taskId: 7n, body: words[2] ?? "" }, BOARD_LIMITS)).ok).toBe(
+    true,
+  );
+  expect(lines(await tick())).toEqual([
+    "13 Clarification #7",
+    "14 Clarification #7",
+    "16 Clarification #7",
+  ]);
+
+  // A hide is no news: the poster did it.
+  expect((await hideQuestion(db, { taskId: 7n, questionId: id })).ok).toBe(true);
+  expect(await tick()).toEqual([]);
+  expect(logged()).toEqual([]);
+
+  // Not a word of what was written went to Telegram.
+  const everything = calls.map((call) => String(call.payload.text)).join("\n");
+  for (const word of ["ZZQASK", "spam.example", "ZZQANSWER", "words", "ZZQNOTE"]) {
+    expect(everything, word).not.toContain(word);
+  }
+});
+
+test("each_question_and_each_answer_is_news_of_its_own_and_none_is_sent_twice", async () => {
+  await seedBoardWorld();
+  await tick();
+  const first = await askOn7("First?");
+  const second = await askOn7("Second?", "other.near");
+  expect(lines(await tick())).toEqual(["11 New question #7", "11 New question #7"]);
+  await answerQuestion(db, { taskId: 7n, questionId: first, body: "One." });
+  await answerQuestion(db, { taskId: 7n, questionId: second, body: "Two." });
+  // The asker of the second is a stranger to the chats here, so its answer reaches the entrants.
+  expect(lines(await tick())).toEqual([
+    "12 Question answered #7",
+    "13 Question answered #7",
+    "14 Question answered #7",
+    "16 Question answered #7",
+    "13 Question answered #7",
+    "14 Question answered #7",
+    "16 Question answered #7",
+  ]);
+  await addClarification(db, { taskId: 7n, body: "Note." }, BOARD_LIMITS);
+  expect(lines(await tick())).toHaveLength(3);
+
+  // A restart that reads the stream again from the start sends none of it twice.
+  await db.query("update worker_cursor set event_id = 0 where name = 'telegram'");
+  expect(await tick({ bot: newBot() })).toEqual([]);
+  expect(logged()).toEqual([]);
+});
+
+test("a_question_the_poster_hid_before_the_notifier_looked_is_not_announced", async () => {
+  await seedBoardWorld();
+  await tick();
+  const spam = await askOn7("buy my tokens");
+  const real = await askOn7("What is a version?", "other.near");
+  await answerQuestion(db, { taskId: 7n, questionId: spam, body: "no" });
+  await hideQuestion(db, { taskId: 7n, questionId: spam });
+
+  // The hidden question's ask and answer are skipped without a word; the other one is announced.
+  expect(lines(await tick())).toEqual(["11 New question #7"]);
+  expect(logged()).toEqual([]);
+  await answerQuestion(db, { taskId: 7n, questionId: real, body: "Three parts." });
+  expect((await tick()).length).toBe(3);
+});
+
+test("board_events_that_cannot_make_an_alert_are_logged_and_skipped", async () => {
+  await seedBoardWorld();
+  await tick();
+  // Rows that the board would not write but the table can hold. Each is logged and passed over.
+  const insert = (receipt: string, event: string, data: unknown, taskId: string | null) =>
+    db.query(
+      `insert into events (height, block_ts, receipt_id, log_index, event, data, task_id)
+       values (1, 1, $1, 0, $2, $3::jsonb, $4::numeric)`,
+      [receipt, event, JSON.stringify(data), taskId],
+    );
+  await insert("board:a", "question_answered", { nonsense: true }, "7"); // the data is no board event
+  await insert("board:b", "clarification_posted", { task_id: "7", clarification_id: "9" }, null);
+  await insert(
+    "board:c",
+    "question_asked",
+    { task_id: "404", question_id: "1", asker: "a.near" },
+    "404",
+  );
+  await insert("board:d", "question_answered", { task_id: "7", question_id: "999" }, "7");
+  // A question id past any row's must not reach the database as a bigint, which would refuse it
+  // and stop the tick at this event for good.
+  await insert(
+    "board:e",
+    "question_asked",
+    { task_id: "7", question_id: "18446744073709551615", asker: "a.near" },
+    "7",
+  );
+  await askOn7("A real one"); // and news behind them
+
+  expect(lines(await tick())).toEqual(["11 New question #7"]);
+  const logs = logged();
+  expect(logs).toHaveLength(5);
+  expect(logs[0]).toMatch(/event 1 \(question_answered\).*malformed/);
+  expect(logs[1]).toMatch(/event 2 \(clarification_posted\).*malformed/);
+  expect(logs[2]).toMatch(/event 3 \(question_asked\).*task 404/);
+  expect(logs[3]).toMatch(/event 4 \(question_answered\).*question 999/);
+  expect(logs[4]).toMatch(/event 5 \(question_asked\).*question 18446744073709551615/);
   expect(await tick()).toEqual([]); // and they are not met again
   expect(logged()).toEqual([]);
 });

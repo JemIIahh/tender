@@ -78,7 +78,20 @@ export type Alert =
       token: string;
       reward: string;
       funders: number;
-    };
+    }
+  /**
+   * An entrant asked the poster a question on the task's public board. The alert says that it was
+   * asked, and by whom, and never what: the words are a stranger's, and the poster may hide them.
+   * `questionId` is the board row's id, a decimal string.
+   */
+  | { kind: "question_asked"; taskId: string; title: string; questionId: string; asker: string }
+  /**
+   * The poster answered a question. `questionId` names the question, whose asker the recipients are
+   * found from (`resolveRecipients`).
+   */
+  | { kind: "question_answered"; taskId: string; title: string; questionId: string }
+  /** The poster posted a clarification on the board. `clarificationId` is the board row's id. */
+  | { kind: "clarification_posted"; taskId: string; title: string; clarificationId: string };
 
 /**
  * The key that names `a` in `tg_sent(chat_id, dedupe_key)`: a chat gets the alert whose key it has
@@ -90,7 +103,10 @@ export type Alert =
  * - `entry_committed:<taskId>:<count>`, since every new entry is news, and a restart that rebuilds
  *   the alert for entry 3 still lands on the key of entry 3;
  * - `deadline_reminder:<taskId>:<hoursLeft>`, for the 24 h and the 1 h reminder;
- * - `pool_grew:<taskId>:<reward>`, so that each top-up, which raises the reward, is news.
+ * - `pool_grew:<taskId>:<reward>`, so that each top-up, which raises the reward, is news;
+ * - `question_asked:<taskId>:<questionId>`, `question_answered:<taskId>:<questionId>` and
+ *   `clarification_posted:<taskId>:<clarificationId>`, since every row of the board is news, and a
+ *   question and its answer are two alerts.
  *
  * The other kinds happen once per task.
  */
@@ -104,6 +120,11 @@ export function dedupeKey(a: Alert): string {
       return `${a.kind}:${a.taskId}:${a.hoursLeft}`;
     case "pool_grew":
       return `${a.kind}:${a.taskId}:${a.reward}`;
+    case "question_asked":
+    case "question_answered":
+      return `${a.kind}:${a.taskId}:${a.questionId}`;
+    case "clarification_posted":
+      return `${a.kind}:${a.taskId}:${a.clarificationId}`;
     case "new_task":
     case "reveal_open":
     case "reveal_closing":

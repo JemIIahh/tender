@@ -131,6 +131,14 @@ function bodyLines(a: Alert, ctx: RenderContext): string[] {
       const backers = a.funders === 1 ? "backer" : "backers";
       return [`<b>Pool grew</b> · ${title} now pays ${pays} from ${a.funders} ${backers}`];
     }
+    // The board's alerts say that something was written and never what: it is a stranger's words,
+    // public on the task page, and the poster may hide a question that was already announced.
+    case "question_asked":
+      return [`<b>New question</b> · ${title} · ${escapeHtml(a.asker)} asked the poster`];
+    case "question_answered":
+      return [`<b>Question answered</b> · ${title} · the poster answered a question`];
+    case "clarification_posted":
+      return [`<b>Clarification</b> · ${title} · the poster posted a note for entrants`];
     default: {
       const unexpected: never = a;
       throw new Error(`unknown alert: ${JSON.stringify(unexpected)}`);
