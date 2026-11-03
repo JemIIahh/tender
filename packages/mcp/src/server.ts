@@ -18,6 +18,10 @@ export type McpChain = Pick<
   | "balanceOf"
   | "storageBalanceOf"
   | "getEntry"
+  // The agent bond (contract Task 16b): the agent's record, and the bond token in its wallet.
+  | "getAgent"
+  | "ftStorageBalanceOf"
+  | "ftBalanceOf"
   // Senders: what the write tools sign and send.
   | "storageDeposit"
   | "commit"

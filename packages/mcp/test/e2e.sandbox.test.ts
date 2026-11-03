@@ -17,7 +17,10 @@ import { type Services, startServices } from "../../../scripts/serve";
 // over stdio by the SDK's client, against a local chain and the services (`pnpm serve`'s, with the
 // index in an in-memory PGlite). The poster posts through its own server, with its full-access key.
 // Alice enters through hers, with the function-call key that scripts/keeper-key.ts mints for an
-// agent: it can call `commit` and `reveal` on Tender and nothing else.
+// agent: it can call `commit` and `reveal` on Tender and nothing else. Before she can enter an open
+// task she registers, and that takes her full-access key (the call attaches 1 yoctoNEAR and puts a
+// bond at stake): a server of its own with that key refuses until the bond is in her vault, then
+// registers her.
 //
 // Every server gets an environment built here from nothing: the TENDER_* names and NEAR_RPC_URL
 // that it needs, and PATH and a throw-away HOME. The parent's environment, a developer's secrets
@@ -45,7 +48,7 @@ let work: string;
 /** The HOME of every server: an empty directory, so that nothing of the developer's is read. */
 let home: string;
 /** Where each account's server keeps its drafts. */
-let stateDirs: Record<"poster" | "alice" | "bob" | "orphan", string>;
+let stateDirs: Record<"poster" | "alice" | "owner" | "bob" | "orphan", string>;
 /** Alice's function-call key, as the key script wrote it. */
 let aliceKey: Signer;
 const serviceLines: string[] = [];
@@ -58,6 +61,7 @@ beforeAll(async () => {
   stateDirs = {
     poster: join(work, "state", "poster"),
     alice: join(work, "state", "alice"),
+    owner: join(work, "state", "owner"),
     bob: join(work, "state", "bob"),
     orphan: join(work, "state", "orphan"),
   };
@@ -452,6 +456,34 @@ test("reveal_survives_restart", async () => {
     key_kind: "function_call",
   });
 
+  // Alice registers as an agent, which an open task requires (contract Task 16b), through a server
+  // that holds her full-access key. The bond is taken from her vault, which is empty: the tool says
+  // how much to deposit, moves nothing, and once the deposit is made it registers her and names the
+  // bond. Her function-call server, up since before, is then allowed to commit.
+  const owner = await startServer(chain.accounts.alice, stateDirs.owner);
+  const bond = (await reader.getConfig()).agent_bond_amount;
+  if (bond === null) throw new Error("the local chain has no agent bond set");
+  await expect(
+    call(owner, "register_agent", { name: "alice", description: "Answers 42.", tags: ["e2e"] }),
+  ).rejects.toThrow(new RegExp(`BOND_LOW: .*Deposit ${bond} more`));
+  expect(await reader.getAgent(aliceKey.accountId)).toBeNull();
+  await call(owner, "deposit", { amount: bond });
+  const registration = await call<{ tx_hash: string; bond?: { token: string; amount: string } }>(
+    owner,
+    "register_agent",
+    { name: "alice", description: "Answers 42.", tags: ["e2e"] },
+  );
+  expect(registration).toMatchObject({
+    tx_hash: expect.any(String),
+    bond: { token: chain.tokenId, amount: bond },
+  });
+  expect(await reader.getAgent(aliceKey.accountId)).toMatchObject({
+    status: "active",
+    bond_token: chain.tokenId,
+    bond_amount: bond,
+    claimable_at: null,
+  });
+
   // The poster funds its vault and posts a task, through its server. Alice's steps have to fit in
   // the commit window, and a new server has to start and reveal in the reveal window. The post
   // returns only once its block is final, a couple of seconds into the commit window, so 5 s
@@ -569,9 +601,11 @@ test("reveal_survives_restart", async () => {
   ).rejects.toThrow(
     /KEY_CANNOT_CALL: pick_winners needs a key that may call pick on .*\. This server's key is a function-call key that lists commit, reveal\./,
   );
+  // register_agent attaches 1 yoctoNEAR and puts the bond at stake, which no function-call key can
+  // do: it is refused for that, whatever the key lists, before the profile goes up.
   await expect(
     call(second, "register_agent", { name: "alice", description: "Answers 42.", tags: ["e2e"] }),
-  ).rejects.toThrow(/KEY_CANNOT_CALL: register_agent needs a key that may call register_agent /);
+  ).rejects.toThrow(/NEEDS_FULL_ACCESS_KEY: register_agent attaches exactly 1 yoctoNEAR /);
 
   // Neither of alice's servers wrote the key anywhere, and the services logged no error.
   const keyBody = aliceKey.privateKey.slice("ed25519:".length);
