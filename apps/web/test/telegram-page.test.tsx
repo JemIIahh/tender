@@ -38,6 +38,13 @@ vi.mock("../lib/wallet", async (importOriginal) => {
   return { ...actual, useWallet: () => actual.useWalletStore(holder.store) };
 });
 
+// A minute is too long to wait in a test: the page waits 150 ms before it offers to stop waiting.
+// The minute itself is the default of `useWaitedLong`, and has a test of its own (waiting.test.tsx).
+vi.mock("../lib/waiting", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/waiting")>();
+  return { ...actual, useWaitedLong: (what: string | null) => actual.useWaitedLong(what, 150) };
+});
+
 const CONSOLE = ["error", "warn", "log", "info", "debug"] as const;
 
 beforeEach(() => {
@@ -259,6 +266,59 @@ test("a_second_press_while_the_link_is_being_made_asks_for_nothing_more", async 
   expect(api.links()).toBe(1);
   expect(wallet.signRequests).toHaveLength(1);
   expect(open).toHaveBeenCalledTimes(1);
+});
+
+// ---- A wallet that does not answer -------------------------------------------------------------
+
+test("a_link_that_takes_too_long_can_be_given_up_on_and_is_not_opened_when_it_comes", async () => {
+  const wait = gate();
+  const api = fakeApi(async () => {
+    await wait.opens;
+    return made();
+  });
+  const { user, open } = await openConnected();
+
+  await user.click(await button("Link Telegram"));
+  await button("Linking…");
+  // Not at once: a wallet takes a while.
+  expect(screen.queryByRole("button", { name: "Stop waiting" })).toBeNull();
+  await user.click(await button("Stop waiting"));
+
+  // The button is open again, and the words say nothing was linked.
+  expect((await button("Link Telegram")).getAttribute("aria-disabled")).toBe("false");
+  expect(screen.getByTestId("link-error").textContent).toBe(
+    "You stopped waiting for your wallet. Nothing was linked. Press the button to try again.",
+  );
+  expect(screen.queryByRole("button", { name: "Stop waiting" })).toBeNull();
+
+  // The link comes late, to a person who gave up: it is not opened, and not shown.
+  wait.open();
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  });
+  expect(open).not.toHaveBeenCalled();
+  expect(screen.queryByTestId("link-state")).toBeNull();
+  expect(screen.getByTestId("link-error").textContent).toContain("You stopped waiting");
+  expect(api.links()).toBe(1);
+});
+
+test("a_wallet_that_never_connects_can_be_given_up_on", async () => {
+  const wait = gate();
+  const { provider, user } = setup();
+  provider.connect = async () => {
+    await wait.opens;
+    return null;
+  };
+  fakeApi();
+  render(<TelegramView />);
+
+  await user.click(await button("Connect wallet"));
+  await button("Waiting for your wallet…");
+  await user.click(await button("Stop waiting"));
+
+  expect((await button("Connect wallet")).getAttribute("aria-disabled")).toBe("false");
+  expect(screen.getByTestId("link-error").textContent).toContain("You stopped waiting");
+  wait.open();
 });
 
 // ---- A wallet that can't sign -----------------------------------------------------------------

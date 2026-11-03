@@ -7,6 +7,8 @@ import { api } from "../lib/api";
 import { useApiToken } from "../lib/auth";
 import { useNowNs } from "../lib/clock";
 import { TelegramLinkRefused, telegramLinkMessage, telegramStartUrl } from "../lib/telegram";
+import { type Told, toldFor } from "../lib/told";
+import { useWaitedLong } from "../lib/waiting";
 import { useWallet } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErrors";
 
@@ -22,12 +24,15 @@ import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErr
 
 const PRIMARY =
   "min-h-11 w-fit rounded border border-neutral-900 bg-neutral-900 px-4 text-white aria-disabled:opacity-60";
+const SECONDARY = "min-h-11 w-fit rounded border border-neutral-900 px-4";
 
-/** What the person was told, and for whom: an account's news is not shown for another account. */
-interface Told<T> {
-  /** The account connected when it happened, or null for the connect button's own failures. */
-  account: string | null;
-  value: T;
+/** What is said after the person stopped waiting: nothing was linked. */
+const STOPPED =
+  "You stopped waiting for your wallet. Nothing was linked. Press the button to try again.";
+
+/** One press of the button. Once `stopped`, nothing it still does or says is for the page. */
+interface Run {
+  stopped: boolean;
 }
 
 interface MadeLink {
@@ -85,6 +90,7 @@ export function TelegramView() {
   // Set at once when the button is pressed, where `running` is only set for the next render: a
   // second press before then must not start a second sign-in.
   const busy = useRef(false);
+  const current = useRef<Run | null>(null);
   // Whether the page is still on screen, and which account it is for as of the latest render: for
   // an answer that comes after the person has left, disconnected or changed wallet.
   const mounted = useRef(false);
@@ -99,13 +105,30 @@ export function TelegramView() {
     shown.current = accountId;
   });
 
-  const link = made !== null && made.account === accountId ? made.value : null;
-  const failed = failure !== null && failure.account === accountId ? failure.value : null;
+  const link = toldFor(made, accountId);
+  const failed = toldFor(failure, accountId);
   const stuck = accountId !== null && !canSignMessage;
   const disabled = running !== null || stuck;
+  // A wallet that never answers leaves the button off, and only the Nav to leave by.
+  const waitedLong = useWaitedLong(running);
+
+  /**
+   * The person gives up on a wallet that has not answered. Nothing is on the chain, so the button is
+   * open again at once. What the press still does is not heard, and a link it makes late is not opened.
+   */
+  const stopWaiting = () => {
+    const run = current.current;
+    if (run === null || run.stopped || running === null) return;
+    run.stopped = true;
+    busy.current = false;
+    setFailure({ account: accountId, value: STOPPED });
+    setRunning(null);
+  };
 
   const connectWallet = async () => {
     if (busy.current) return;
+    const run: Run = { stopped: false };
+    current.current = run;
     busy.current = true;
     setRunning("connect");
     setFailure(null);
@@ -113,10 +136,12 @@ export function TelegramView() {
       await connect();
     } catch (error) {
       console.error(error);
-      setFailure({ account: null, value: walletErrorMessage(error) });
+      if (!run.stopped) setFailure({ account: null, value: walletErrorMessage(error) });
     } finally {
-      busy.current = false;
-      setRunning(null);
+      if (!run.stopped) {
+        busy.current = false;
+        setRunning(null);
+      }
     }
   };
 
@@ -138,6 +163,8 @@ export function TelegramView() {
 
   const linkTelegram = async () => {
     if (busy.current || accountId === null || !canSignMessage) return;
+    const run: Run = { stopped: false };
+    current.current = run;
     busy.current = true;
     setRunning("link");
     setFailure(null);
@@ -145,19 +172,22 @@ export function TelegramView() {
     try {
       const answer = await requestLink();
       // The person can leave the page, or disconnect the wallet, or change it, while the API
-      // answers. The link is for the account that asked, on the page that asked: it is not opened
-      // for a page that is gone or is no longer that account's.
-      if (!mounted.current || shown.current !== account) return;
+      // answers, or give up waiting. The link is for the account that asked, on the page that
+      // asked, and for a person who still waits: it is not opened for a page that is gone, no
+      // longer that account's, or given up on.
+      if (run.stopped || !mounted.current || shown.current !== account) return;
       const url = telegramStartUrl(answer.url);
       if (url === null) throw new TelegramLinkRefused();
       setMade({ account, value: { url, expiresAt: answer.expires_at } });
       window.open(url, "_blank", "noopener,noreferrer");
     } catch (error) {
       console.error(error);
-      setFailure({ account, value: telegramLinkMessage(error) });
+      if (!run.stopped) setFailure({ account, value: telegramLinkMessage(error) });
     } finally {
-      busy.current = false;
-      setRunning(null);
+      if (!run.stopped) {
+        busy.current = false;
+        setRunning(null);
+      }
     }
   };
 
@@ -218,6 +248,14 @@ export function TelegramView() {
             </button>
           </>
         )}
+
+        {waitedLong ? (
+          <div>
+            <button type="button" onClick={stopWaiting} className={SECONDARY}>
+              Stop waiting
+            </button>
+          </div>
+        ) : null}
 
         {failed === null ? null : (
           <p
