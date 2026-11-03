@@ -1,9 +1,6 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { expect, test } from "vitest";
 import { REPO_ROOT } from "./lib/env";
-import { HELDOUT_DIR_VARIABLE, swarmPackHeldoutDirOf } from "./lib/heldout-dir";
 
 // `scripts/swarm-demo.ts` run the way a person runs it, on a local chain, from start to its last
 // line: a lead agent that holds a delegate key with caps of 2 tUSDC a task and 6 tUSDC in all takes a
@@ -13,23 +10,6 @@ import { HELDOUT_DIR_VARIABLE, swarmPackHeldoutDirOf } from "./lib/heldout-dir";
 // the chain, and not from what the lead said it did.
 
 const TIMEOUT_MS = 540_000;
-
-// The demo's Judge scores the parent and the sub-tasks on the pack's held-out checks, which are
-// secret until a task is judged and so are not in the repository: they are in the private
-// directory (`TENDER_SEEDS_PRIVATE_DIR`, see seeds/README.md). Without them the demo cannot run, and
-// this test is skipped.
-const PACK_HELDOUT = swarmPackHeldoutDirOf();
-const HELD = [
-  "parent",
-  join("children", "01-gas-ledger"),
-  join("children", "02-key-audit"),
-  join("children", "03-event-tally"),
-].every((dir) => existsSync(join(PACK_HELDOUT, dir, "heldout.json")));
-if (!HELD) {
-  console.warn(
-    `swarm demo: held-out for the swarm pack not found in ${PACK_HELDOUT}; set ${HELDOUT_DIR_VARIABLE}. The demo test is skipped.`,
-  );
-}
 
 interface Run {
   code: number | null;
@@ -76,7 +56,7 @@ function find(
   throw new Error(`no line matching ${pattern} after line ${after}:\n${lines.join("\n")}`);
 }
 
-test.skipIf(!HELD)(
+test(
   "swarm_demo_ok_and_lineage_visible",
   async () => {
     const { code, stdout, stderr } = await runSwarmDemo();

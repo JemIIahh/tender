@@ -1,0 +1,34 @@
+{
+  "json_schema": {
+    "assertions": [
+      {
+        "path": "$.note_number",
+        "equals": 4082
+      },
+      {
+        "path": "$.recipient",
+        "equals": "Kunle Adebayo"
+      },
+      {
+        "path": "$.city",
+        "equals": "Port Harcourt"
+      },
+      {
+        "path": "$.parcels",
+        "equals": 5
+      },
+      {
+        "path": "$.weight_kg",
+        "equals": 18.25
+      },
+      {
+        "path": "$.express",
+        "equals": true
+      },
+      {
+        "path": "$.signature_required",
+        "equals": false
+      }
+    ]
+  }
+}

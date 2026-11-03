@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { checkJsonSchemaUsable, scoreJsonSchema } from "@tender/judge";
 import {
   BriefSchema,
@@ -12,7 +12,6 @@ import {
   sha256Hex,
 } from "@tender/shared";
 import { describe, expect, test } from "vitest";
-import { HELDOUT_DIR_VARIABLE, swarmPackHeldoutDirOf } from "./lib/heldout-dir";
 
 // The pack of the swarm demo: one parent task and the three sub-tasks its lead hires for. It is in
 // the seed format (a folder of task.json, brief.json, criteria.json, heldout.json, solution.txt
@@ -20,20 +19,11 @@ import { HELDOUT_DIR_VARIABLE, swarmPackHeldoutDirOf } from "./lib/heldout-dir";
 // them with held-out checks and the 22.50 tUSDC they cost are counted by folder, and this pack is
 // the demo's own. Every task is scored here with the Judge's own scorer, so a pack that pays
 // nobody, or pays a flawed answer, fails before it is posted.
-//
-// The pack's held-out checks are secret until a task is judged, so they are not in this folder:
-// they are read from `swarm-research-pack/` of the private directory (`TENDER_SEEDS_PRIVATE_DIR`,
-// see seeds/README.md). Where it has them the tests that score the pack's answers run; where it has
-// not, which is every clean checkout and CI, those are skipped and the rest (the shape of the pack,
-// the schemas, the tags, the money, the windows) still run.
 
 const PACK = join(import.meta.dirname, "swarm-research-pack");
 const PARENT = join(PACK, "parent");
 const CHILDREN = join(PACK, "children");
 const SEEDS = join(import.meta.dirname, "..", "seeds");
-const HELDOUT = swarmPackHeldoutDirOf();
-const heldoutPathOf = (dir: string): string =>
-  join(HELDOUT, dir === PARENT ? "parent" : join("children", basename(dir)), "heldout.json");
 
 /** The three sub-tasks, in the order the lead hires for them and the parent lists their parts. */
 const CHILD_SLUGS = ["01-gas-ledger", "02-key-audit", "03-event-tally"];
@@ -47,14 +37,14 @@ const bytes = (value: string): Uint8Array => new TextEncoder().encode(value);
 type JsonSchemaCriteria = Extract<PublicCriteria, { kind: "json_schema" }>;
 type JsonSchemaHeldout = Extract<Heldout, { json_schema: unknown }>["json_schema"];
 
-/** A task of the pack, read and parsed. `heldout` is null where the private directory has none. */
+/** A task of the pack, read and parsed. */
 interface Task {
   dir: string;
   terms: Record<string, unknown>;
   brief: ReturnType<typeof BriefSchema.parse>;
   criteria: JsonSchemaCriteria;
-  heldout: JsonSchemaHeldout | null;
-  heldoutText: string | null;
+  heldout: JsonSchemaHeldout;
+  heldoutText: string;
   solution: string;
   weak: string | null;
 }
@@ -62,48 +52,27 @@ interface Task {
 function load(dir: string): Task {
   const criteria = PublicCriteriaSchema.parse(json(dir, "criteria.json"));
   if (criteria.kind !== "json_schema") throw new Error(`${dir} is not a json_schema task`);
-  const heldoutPath = heldoutPathOf(dir);
-  let heldout: JsonSchemaHeldout | null = null;
-  let heldoutText: string | null = null;
-  if (existsSync(heldoutPath)) {
-    heldoutText = readFileSync(heldoutPath, "utf8");
-    const checks = HeldoutSchema.parse(JSON.parse(heldoutText));
-    if (!heldoutMatchesCriteria(criteria, checks) || !("json_schema" in checks)) {
-      throw new Error(`${heldoutPath} is not a json_schema held-out document`);
-    }
-    heldout = checks.json_schema as JsonSchemaHeldout;
+  const heldout = HeldoutSchema.parse(json(dir, "heldout.json"));
+  if (!heldoutMatchesCriteria(criteria, heldout) || !("json_schema" in heldout)) {
+    throw new Error(`${dir}/heldout.json is not a json_schema held-out document`);
   }
   return {
     dir,
     terms: json(dir, "task.json") as Record<string, unknown>,
     brief: BriefSchema.parse(json(dir, "brief.json")),
     criteria,
-    heldout,
-    heldoutText,
+    heldout: heldout.json_schema as JsonSchemaHeldout,
+    heldoutText: text(dir, "heldout.json"),
     solution: text(dir, "solution.txt"),
     weak: existsSync(join(dir, "weak.txt")) ? text(dir, "weak.txt") : null,
   };
-}
-
-const ALL_DIRS = [PARENT, ...CHILD_SLUGS.map((slug) => join(CHILDREN, slug))];
-/** Whether this machine has the held-out checks of all four tasks. */
-const HELD = ALL_DIRS.every((dir) => existsSync(heldoutPathOf(dir)));
-const NOTE = `the pack's held-out checks are not in ${HELDOUT}; set ${HELDOUT_DIR_VARIABLE}`;
-if (!HELD) console.warn(`swarm pack: ${NOTE}. The tests that score its answers are skipped.`);
-/** A test that scores the pack's answers against its checks: skipped where they are not. */
-const heldTest = test.skipIf(!HELD);
-
-/** The checks of `task`, which the caller has made sure are there (`heldTest`). */
-function held(task: Task): JsonSchemaHeldout {
-  if (task.heldout === null) throw new Error(`${task.dir}: ${NOTE}`);
-  return task.heldout;
 }
 
 const children = (): Task[] => CHILD_SLUGS.map((slug) => load(join(CHILDREN, slug)));
 const parent = (): Task => load(PARENT);
 
 const scoreOf = (task: Task, answer: string) =>
-  scoreJsonSchema(task.criteria, held(task), bytes(answer));
+  scoreJsonSchema(task.criteria, task.heldout, bytes(answer));
 
 /** `{"parts":[...]}` over the given answers, each as the JSON it is. */
 const assemble = (answers: string[]): string =>
@@ -115,22 +84,17 @@ test("the_pack_is_a_parent_and_three_children_in_hiring_order", () => {
       .map((e) => e.name)
       .sort(),
   ).toEqual(CHILD_SLUGS);
-  for (const dir of ALL_DIRS) {
-    for (const name of ["task.json", "brief.json", "criteria.json", "solution.txt"]) {
+  for (const dir of [PARENT, ...CHILD_SLUGS.map((slug) => join(CHILDREN, slug))]) {
+    for (const name of [
+      "task.json",
+      "brief.json",
+      "criteria.json",
+      "heldout.json",
+      "solution.txt",
+    ]) {
       expect(existsSync(join(dir, name)), `${dir}/${name}`).toBe(true);
     }
-    // The checks are secret until the task is judged: never in the pack's own, tracked, folder.
-    expect(existsSync(join(dir, "heldout.json")), `${dir}/heldout.json`).toBe(false);
   }
-});
-
-test("the_private_directory_holds_the_checks_of_all_four_tasks_or_none", () => {
-  // Some but not all would skip the tests of the tasks that lack them without a word to say so.
-  const missing = ALL_DIRS.filter((dir) => !existsSync(heldoutPathOf(dir)));
-  expect(
-    missing.length === 0 || missing.length === ALL_DIRS.length,
-    `${HELDOUT} lacks the held-out checks of ${missing.map((dir) => basename(dir)).join(", ")}`,
-  ).toBe(true);
 });
 
 test("the_pack_stays_out_of_the_seed_listing", () => {
@@ -157,7 +121,7 @@ describe("each task of the pack", () => {
 });
 
 describe("the sub-tasks", () => {
-  heldTest("a_solution_scores_100_and_a_weak_answer_fits_the_schema_and_still_fails", () => {
+  test("a_solution_scores_100_and_a_weak_answer_fits_the_schema_and_still_fails", () => {
     for (const task of children()) {
       const right = scoreOf(task, task.solution);
       expect(right.score, `${task.dir}: ${right.reasons.join("; ")}`).toBe(100);
@@ -176,10 +140,10 @@ describe("the sub-tasks", () => {
     });
   });
 
-  heldTest("the_answers_are_not_in_the_public_criteria", () => {
+  test("the_answers_are_not_in_the_public_criteria", () => {
     for (const task of [parent(), ...children()]) {
       const publicText = JSON.stringify(task.criteria);
-      for (const { equals } of held(task).assertions) {
+      for (const { equals } of task.heldout.assertions) {
         for (const value of JSON.stringify(equals).match(/"[^"]{3,}"/g) ?? []) {
           expect(publicText, `${task.dir} gives away ${value}`).not.toContain(value);
         }
@@ -189,18 +153,15 @@ describe("the sub-tasks", () => {
 });
 
 describe("the parent", () => {
-  heldTest(
-    "the_children_s_solutions_assembled_score_100_and_the_stored_solution_is_that_document",
-    () => {
-      const task = parent();
-      const assembled = assemble(children().map((child) => child.solution));
-      const scored = scoreOf(task, assembled);
-      expect(scored.score, scored.reasons.join("; ")).toBe(100);
-      expect(JSON.parse(task.solution)).toEqual(JSON.parse(assembled));
-    },
-  );
+  test("the_children_s_solutions_assembled_score_100_and_the_stored_solution_is_that_document", () => {
+    const task = parent();
+    const assembled = assemble(children().map((child) => child.solution));
+    const scored = scoreOf(task, assembled);
+    expect(scored.score, scored.reasons.join("; ")).toBe(100);
+    expect(JSON.parse(task.solution)).toEqual(JSON.parse(assembled));
+  });
 
-  heldTest("one_weak_part_anywhere_keeps_the_assembled_document_from_passing", () => {
+  test("one_weak_part_anywhere_keeps_the_assembled_document_from_passing", () => {
     const task = parent();
     const all = children();
     for (const [index, child] of all.entries()) {
@@ -212,7 +173,7 @@ describe("the parent", () => {
     }
   });
 
-  heldTest("a_document_with_a_part_missing_or_extra_is_turned_down_by_the_schema", () => {
+  test("a_document_with_a_part_missing_or_extra_is_turned_down_by_the_schema", () => {
     const task = parent();
     const answers = children().map((child) => child.solution);
     expect(scoreOf(task, assemble(answers.slice(0, 2))).score).toBe(0);
@@ -245,10 +206,8 @@ describe("the money", () => {
 });
 
 describe("the held-out checks", () => {
-  heldTest("are_single_use_so_all_four_documents_differ", () => {
-    const hashes = [parent(), ...children()].map((task) =>
-      sha256Hex(bytes(task.heldoutText ?? "")),
-    );
+  test("are_single_use_so_all_four_documents_differ", () => {
+    const hashes = [parent(), ...children()].map((task) => sha256Hex(bytes(task.heldoutText)));
     expect(new Set(hashes).size).toBe(4);
   });
 });

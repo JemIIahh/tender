@@ -1,13 +1,19 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ApiClient, ApiTimeoutError, KeyPair } from "@tender/client";
-import { ApiError, SIGN_IN_MESSAGE, type TenderApi } from "@tender/shared";
+import {
+  ApiError,
+  canonicalJson,
+  SIGN_IN_MESSAGE,
+  sha256Hex,
+  type TenderApi,
+} from "@tender/shared";
 import { afterEach, expect, test, vi } from "vitest";
 import { AGENT_NAMES, AGENTS, agentVariables } from "../src/agents";
 import {
@@ -20,6 +26,7 @@ import {
   exitWhenFlushed,
   main,
   parseCli,
+  privateSeedsDirOf,
   type RunConfig,
   readEnv,
   readRunConfig,
@@ -27,7 +34,7 @@ import {
 import type { RunAgentOptions } from "../src/runner";
 import { FAKE_TOKEN, type FakeApi, REFUSAL_TEXT, startFakeApi } from "./fake-api";
 import { startFakeLlm } from "./fake-llm";
-import { contextOf, taskSpec } from "./helpers";
+import { BRIEF, contextOf, taskSpec } from "./helpers";
 
 // The command line of the reference agents, run in-process: the test hands `main` an environment,
 // env files in a directory of its own, and a client that stands in for the chain, so that nothing
@@ -134,6 +141,10 @@ interface Setup {
   keyCheckMs?: number;
   /** What stops the agent. Default: a signal that never aborts; `null` leaves it to the process's. */
   signal?: AbortSignal | null;
+  /** Where the scripted solvers find the seeds. Default: the repository's `seeds/`. */
+  seedsDir?: string;
+  /** Where they find the real seeds' solutions. Default: what the environment says. */
+  privateDir?: string;
 }
 
 /** Runs the command line with `args` against the setup, and reports what happened. */
@@ -184,7 +195,8 @@ async function start(args: string[], setup: Setup = {}) {
     dir,
     home,
     env: setup.env ?? ENV,
-    seedsDir: SEEDS,
+    seedsDir: setup.seedsDir ?? SEEDS,
+    ...(setup.privateDir !== undefined && { privateDir: setup.privateDir }),
     out: (line) => out.push(line),
     err: (text) => err.push(text),
     makeClient,
@@ -1373,4 +1385,59 @@ test("exit_when_flushed_exits_with_the_code_after_both_streams_have_taken_their_
   expect(events.at(-1)).toBe("exit 3");
   expect(events.slice(0, 2).sort()).toEqual(["stderr write", "stdout write"]);
   expect(events.slice(2, 4).sort()).toEqual(["stderr flushed", "stdout flushed"]);
+});
+
+// ---- Where the scripted solvers find the solutions ----------------------------------------------
+
+test("the_private_directory_is_the_one_the_environment_names_else_seeds_private", () => {
+  const root = "/the/repo";
+  expect(privateSeedsDirOf({}, root)).toBe(join(root, "seeds-private"));
+  // A variable set to nothing is not set.
+  expect(privateSeedsDirOf({ TENDER_SEEDS_PRIVATE_DIR: "  " }, root)).toBe(
+    join(root, "seeds-private"),
+  );
+  expect(privateSeedsDirOf({ TENDER_SEEDS_PRIVATE_DIR: "/vault/seeds" }, root)).toBe(
+    "/vault/seeds",
+  );
+  expect(privateSeedsDirOf({ TENDER_SEEDS_PRIVATE_DIR: "~/vault" }, root)).toBe(
+    join(homedir(), "vault"),
+  );
+});
+
+test("the_offline_agent_answers_from_the_private_directory_named_in_its_environment", async () => {
+  // A seeds folder with the public half of a seed, and a private directory with its solution.
+  const seeds = await dirWith();
+  const vault = await dirWith();
+  await mkdir(join(seeds, "alpha"));
+  await writeFile(join(seeds, "alpha", "brief.json"), JSON.stringify(BRIEF));
+  await mkdir(join(vault, "alpha"));
+  await writeFile(join(vault, "alpha", "solution.txt"), "THE PRIVATE SOLUTION");
+  const ctx = contextOf(taskSpec({ id: 1, briefHash: sha256Hex(canonicalJson(BRIEF)) }));
+
+  const answers: Array<string | null> = [];
+  const ask = async (options: RunAgentOptions) => {
+    const answer = await options.solver.solve(ctx);
+    answers.push(answer === null ? null : new TextDecoder().decode(answer));
+  };
+
+  // The directory comes from the environment of the run...
+  const named = await start(ARGS, {
+    seedsDir: seeds,
+    env: { ...ENV, TENDER_SEEDS_PRIVATE_DIR: vault },
+    loop: ask,
+  });
+  expect(named.code).toBe(0);
+  // ... or from the options, which win...
+  const given = await start(ARGS, {
+    seedsDir: seeds,
+    privateDir: vault,
+    env: { ...ENV, TENDER_SEEDS_PRIVATE_DIR: join(vault, "nowhere") },
+    loop: ask,
+  });
+  expect(given.code).toBe(0);
+  // ... and with neither it is the repository's seeds-private/, which a seed of this folder is not in.
+  const neither = await start(ARGS, { seedsDir: seeds, loop: ask });
+  expect(neither.code).toBe(0);
+
+  expect(answers).toEqual(["THE PRIVATE SOLUTION", "THE PRIVATE SOLUTION", null]);
 });

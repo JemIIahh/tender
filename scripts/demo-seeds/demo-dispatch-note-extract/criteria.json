@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "kind": "json_schema",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "note_number",
+      "recipient",
+      "city",
+      "parcels",
+      "weight_kg",
+      "express",
+      "signature_required"
+    ],
+    "properties": {
+      "note_number": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "recipient": {
+        "type": "string",
+        "minLength": 1
+      },
+      "city": {
+        "type": "string",
+        "minLength": 1
+      },
+      "parcels": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "weight_kg": {
+        "type": "number",
+        "minimum": 0
+      },
+      "express": {
+        "type": "boolean"
+      },
+      "signature_required": {
+        "type": "boolean"
+      }
+    }
+  }
+}

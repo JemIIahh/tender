@@ -1,0 +1,12 @@
+function rle(text) {
+  if (typeof text !== "string") return null;
+  var out = "";
+  var i = 0;
+  while (i < text.length) {
+    var j = i;
+    while (j < text.length && text[j] === text[i]) j++;
+    out += text[i] + Math.min(j - i, 9);
+    i = j;
+  }
+  return out;
+}

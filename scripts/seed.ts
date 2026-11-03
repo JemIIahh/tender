@@ -21,7 +21,7 @@ import {
 } from "@tender/shared";
 import { type Deployment, parseKey, readDeployment, UsageError } from "./deploy";
 import { loadEnv, REPO_ROOT } from "./lib/env";
-import { HELDOUT_DIR_VARIABLE, heldoutDirOf } from "./lib/heldout-dir";
+import { PRIVATE_DIR_VARIABLE, privateDirOf } from "./lib/private-dir";
 
 /**
  * The seed script. It posts the seed tasks under `seeds/<slug>/`, in slug order, as the poster. A
@@ -429,7 +429,7 @@ async function prepare(
   if (criteria.has_heldout) {
     if (heldoutFile === null) {
       throw new Error(
-        `held-out for ${slug} not found in ${heldoutDir}; set ${HELDOUT_DIR_VARIABLE}`,
+        `held-out for ${slug} not found in ${heldoutDir}; set ${PRIVATE_DIR_VARIABLE}`,
       );
     }
     const checks = parsed(HeldoutSchema, heldoutFile.json, `${slug}/heldout.json`);
@@ -751,7 +751,7 @@ export async function seed(o: SeedOptions): Promise<SeededTask[]> {
     throw new Error(`the client ${signs}, but it has to sign as the poster ${o.poster}`);
   }
   const seedsDir = o.seedsDir ?? join(REPO_ROOT, "seeds");
-  const heldoutDir = o.heldoutDir ?? heldoutDirOf();
+  const heldoutDir = o.heldoutDir ?? privateDirOf();
   const slugs = await chooseSlugs(seedsDir, o.only);
 
   let deployment: Promise<Deployment | null> | undefined;
@@ -888,11 +888,11 @@ export function loadTarget(
  * else that of `.env` (or `.env.deploy.testnet`), else the repository's `seeds-private/`. The
  * process comes first so that a shell can point one run elsewhere without editing a file.
  */
-function heldoutDirOfCli(dir: string | undefined): string {
-  const fromFiles = loadEnv("testnet", { dir })[HELDOUT_DIR_VARIABLE];
-  const fromProcess = process.env[HELDOUT_DIR_VARIABLE];
-  return heldoutDirOf({
-    [HELDOUT_DIR_VARIABLE]: (fromProcess ?? "").trim() === "" ? fromFiles : fromProcess,
+function privateDirOfCli(dir: string | undefined): string {
+  const fromFiles = loadEnv("testnet", { dir })[PRIVATE_DIR_VARIABLE];
+  const fromProcess = process.env[PRIVATE_DIR_VARIABLE];
+  return privateDirOf({
+    [PRIVATE_DIR_VARIABLE]: (fromProcess ?? "").trim() === "" ? fromFiles : fromProcess,
   });
 }
 
@@ -963,7 +963,7 @@ export async function main(args: readonly string[], options: CliOptions = {}): P
       only,
       log: out,
       dir: options.dir,
-      heldoutDir: heldoutDirOfCli(options.dir),
+      heldoutDir: privateDirOfCli(options.dir),
     });
     return 0;
   } catch (error) {

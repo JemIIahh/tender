@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "kind": "tests",
+  "min_score": 100,
+  "split": "winner_take_all",
+  "has_heldout": true,
+  "language": "js",
+  "entry": "rle",
+  "examples": [
+    {
+      "input": "aaabcc",
+      "output": "a3b1c2"
+    },
+    {
+      "input": "",
+      "output": ""
+    },
+    {
+      "input": "zzzz",
+      "output": "z4"
+    }
+  ]
+}

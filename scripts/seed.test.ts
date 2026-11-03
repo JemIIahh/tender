@@ -20,7 +20,7 @@ import {
 import { KeyPair } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
 import { writeSyntheticHeldouts } from "../seeds/synthetic-heldout";
-import { HELDOUT_DIR_VARIABLE, heldoutDirOf, missingHeldouts } from "./lib/heldout-dir";
+import { missingHeldouts, PRIVATE_DIR_VARIABLE, privateDirOf } from "./lib/private-dir";
 import { loadTarget, main, type SeedChain, type SeedOptions, seed } from "./seed";
 
 // Everything here runs without a chain, an API or the network. The API and the chain are fakes the
@@ -696,7 +696,7 @@ test("a_private_directory_that_is_a_file_gives_the_same_error", async () => {
 
 test("without_a_heldoutDir_the_private_directory_is_the_one_the_variable_names", async () => {
   const dir = await seedsDir({ alpha: {} });
-  vi.stubEnv(HELDOUT_DIR_VARIABLE, PRIVATE_OF.get(dir));
+  vi.stubEnv(PRIVATE_DIR_VARIABLE, PRIVATE_OF.get(dir));
 
   const { result, api } = await run(dir, { heldoutDir: undefined });
 
@@ -705,7 +705,7 @@ test("without_a_heldoutDir_the_private_directory_is_the_one_the_variable_names",
 });
 
 test("with_nothing_set_the_private_directory_is_seeds_private_of_the_repository", async () => {
-  vi.stubEnv(HELDOUT_DIR_VARIABLE, "");
+  vi.stubEnv(PRIVATE_DIR_VARIABLE, "");
   const dir = await seedsDir({ alpha: {} });
 
   const { failure } = await run(dir, { heldoutDir: undefined });
@@ -1782,7 +1782,7 @@ test("the_thirty_seeds_of_the_repository_are_posted_in_slug_order_with_the_hashe
   // The held-out checks are the real ones when this machine has them (the private directory), and
   // stand-ins of the right kind where it does not, so that the counts and the hashes are checked
   // everywhere. Either way a task's commitment has to be the hash of the file it was posted from.
-  const real = heldoutDirOf();
+  const real = privateDirOf();
   let held = real;
   if (missingHeldouts(root, real, slugs).length > 0) {
     held = await mkdtemp(join(tmpdir(), "tender-heldout-stand-in-"));
@@ -1917,22 +1917,22 @@ test("cli_seeds_testnet_as_the_poster_with_the_judge_and_the_api_of_the_env_file
 });
 
 test("cli_gives_seed_the_private_directory_of_the_env_file_unless_the_process_names_one", async () => {
-  const heldoutDirOfRun = async (files: Record<string, string>) => {
+  const privateDirOfRun = async (files: Record<string, string>) => {
     const { seed: fake, code } = await runCli(files, ["--network", "testnet"]);
     expect(code).toBe(0);
     return fake.mock.calls[0]?.[0].heldoutDir;
   };
 
   // Nothing set anywhere: seeds-private/ of the repository.
-  vi.stubEnv(HELDOUT_DIR_VARIABLE, "");
-  expect(await heldoutDirOfRun(deployed())).toBe(join(import.meta.dirname, "..", "seeds-private"));
+  vi.stubEnv(PRIVATE_DIR_VARIABLE, "");
+  expect(await privateDirOfRun(deployed())).toBe(join(import.meta.dirname, "..", "seeds-private"));
   // The env file names it.
-  expect(await heldoutDirOfRun(deployed(`${HELDOUT_DIR_VARIABLE}=/vault/heldout`))).toBe(
+  expect(await privateDirOfRun(deployed(`${PRIVATE_DIR_VARIABLE}=/vault/heldout`))).toBe(
     "/vault/heldout",
   );
   // The process comes first, so that a shell can point one run elsewhere.
-  vi.stubEnv(HELDOUT_DIR_VARIABLE, "/elsewhere/heldout");
-  expect(await heldoutDirOfRun(deployed(`${HELDOUT_DIR_VARIABLE}=/vault/heldout`))).toBe(
+  vi.stubEnv(PRIVATE_DIR_VARIABLE, "/elsewhere/heldout");
+  expect(await privateDirOfRun(deployed(`${PRIVATE_DIR_VARIABLE}=/vault/heldout`))).toBe(
     "/elsewhere/heldout",
   );
 });

@@ -3,7 +3,7 @@
 .env*
 **/.env*
 .tender
-# The seeds' held-out checks, which are secret until a task is judged (seeds/README.md).
+# The real seeds' held-out checks and solutions, which are secret until a task is judged (seeds/README.md).
 seeds-private
 # Installed, built or written on the machine, as in .gitignore, and made again in the image.
 node_modules

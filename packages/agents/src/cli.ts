@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, parseEnv } from "node:util";
 import {
@@ -444,7 +445,23 @@ export function createApiClient(config: Pick<RunConfig, "apiUrl" | "signer">): T
   }
 }
 
-function makeSolver(config: RunConfig, seedsDir: string, log: (line: string) => void): Solver {
+/**
+ * Where the real seeds keep their solutions (seeds/README.md): `TENDER_SEEDS_PRIVATE_DIR`, with a
+ * leading `~` taken as the home directory, else `seeds-private/` in the repository.
+ */
+export function privateSeedsDirOf(env: Env, root: string = REPO_ROOT): string {
+  const set = env.TENDER_SEEDS_PRIVATE_DIR?.trim() ?? "";
+  if (set === "") return join(root, "seeds-private");
+  if (set === "~") return homedir();
+  return resolve(set.startsWith("~/") ? join(homedir(), set.slice(2)) : set);
+}
+
+function makeSolver(
+  config: RunConfig,
+  seedsDir: string,
+  privateDir: string,
+  log: (line: string) => void,
+): Solver {
   switch (config.solver) {
     case "llm": {
       // `readRunConfig` requires the three when the solver is `llm`. The solver's warnings go where
@@ -453,7 +470,7 @@ function makeSolver(config: RunConfig, seedsDir: string, log: (line: string) => 
       return createLlmSolver({ ...config.llm, maxCallsPerHour: config.maxLlmCallsPerHour, log });
     }
     case "offline":
-      return createOfflineSolver(seedsDir);
+      return createOfflineSolver(seedsDir, privateDir);
     case "weak":
       return createWeakSolver(seedsDir);
   }
@@ -472,6 +489,11 @@ export interface CliOptions {
   env?: Env;
   /** Where the seeds are, for the scripted solvers. Default: the repository's `seeds/`. */
   seedsDir?: string;
+  /**
+   * Where the real seeds keep their solutions, which the offline solver reads first. Default:
+   * `TENDER_SEEDS_PRIVATE_DIR` of the run's environment, else the repository's `seeds-private/`.
+   */
+  privateDir?: string;
   /** Receives the agent's log lines. Default: `console.log`. */
   out?: (line: string) => void;
   /** Receives what is said about a failure. Default: `console.error`. */
@@ -631,7 +653,12 @@ export async function main(args: readonly string[], options: CliOptions): Promis
       await checkAgentKey(client, config, options.keyCheckMs);
     }
     const api = options.createApi(config);
-    const solver = makeSolver(config, options.seedsDir ?? join(REPO_ROOT, "seeds"), out);
+    const solver = makeSolver(
+      config,
+      options.seedsDir ?? join(REPO_ROOT, "seeds"),
+      options.privateDir ?? privateSeedsDirOf(env),
+      out,
+    );
     const state = createStateStore(
       defaultStateDir(config.network, config.signer.accountId, options.home),
     );

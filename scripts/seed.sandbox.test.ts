@@ -14,7 +14,7 @@ import {
 } from "@tender/shared";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { writeSyntheticHeldouts } from "../seeds/synthetic-heldout";
-import { heldoutDirOf, heldoutFileOf, missingHeldouts } from "./lib/heldout-dir";
+import { heldoutFileOf, missingHeldouts, privateDirOf } from "./lib/private-dir";
 import { type SeedWindows, seed } from "./seed";
 
 // The seed script against a local chain with Tender and a test token on it, and a fake API that
@@ -55,17 +55,17 @@ const clientOf = (role: Role) =>
 
 const SEEDS = join(import.meta.dirname, "..", "seeds");
 
-/** The private directory when it has every seed's checks, else a directory of stand-ins. */
+/** The private directory when it has every seed's held-out checks, else a directory of stand-ins. */
 const STAND_IN_DIR: string | undefined = (() => {
   const slugs = readdirSync(SEEDS, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name);
-  if (missingHeldouts(SEEDS, heldoutDirOf(), slugs).length === 0) return undefined;
+  if (missingHeldouts(SEEDS, privateDirOf(), slugs).length === 0) return undefined;
   const dir = mkdtempSync(join(tmpdir(), "tender-heldout-stand-in-"));
   writeSyntheticHeldouts(SEEDS, dir);
   return dir;
 })();
-const HELDOUT_DIR = STAND_IN_DIR ?? heldoutDirOf();
+const HELDOUT_DIR = STAND_IN_DIR ?? privateDirOf();
 
 afterAll(() => {
   if (STAND_IN_DIR !== undefined) rmSync(STAND_IN_DIR, { recursive: true, force: true });

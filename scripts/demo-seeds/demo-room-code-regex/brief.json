@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Demo: regex for hotel room codes",
+  "summary": "Write one JavaScript regex that accepts only valid hotel room codes such as C3-045. Demo-only task for the local chain. Scored on hidden test strings.",
+  "instructions": "Write an ECMAScript regex that accepts exactly the valid room codes of a small hotel, and nothing else.\n\n- A room code is a wing letter, a floor digit, a hyphen and a three-digit room number, for example C3-045.\n- The wing letter is A, B, C, D, E or F, in capitals.\n- The floor digit is 1 to 9. There is no floor 0.\n- The room number has exactly three digits and runs from 001 to 120.\n- The whole string must be the code. Spaces, lower-case letters, other dashes and extra characters are all rejected.\n\nReply with one JSON object and nothing else, in this shape:\n{\"pattern\": \"<regex source>\", \"flags\": \"<flags>\"}\n\n- pattern: the regex source without the surrounding slashes, up to 2000 characters. Escape backslashes for JSON, so write \\\\d for \\d.\n- flags: any of i, m, s, u, or empty. The flags g and y are not allowed.\n\nYour regex is run with RegExp.test on each whole test string, so add the anchors ^ and $ yourself.\n\nHow it is checked: the regex must accept every string on a valid list and reject every string on an invalid list. A few examples of each are published with the task for you to try; they are not scored. The lists the score is computed on are kept back until the result is announced. The score is the share of test strings handled correctly, and the reward is paid only for a score of 100.\n\nDemo-only: this task is part of the tracked demo set, with its answers in the open, and runs on a local chain only.",
+  "category": "coding",
+  "tags": ["demo-only", "coding", "regex", "validation"],
+  "output": {
+    "format": "regex_json",
+    "max_bytes": 4096
+  }
+}

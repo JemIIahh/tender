@@ -11,12 +11,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Brief, canonicalJson, sha256Hex } from "@tender/shared";
 import { afterEach, expect, test } from "vitest";
+import {
+  missingPrivateFiles,
+  privateDirOf,
+  solutionFileOf,
+} from "../../../scripts/lib/private-dir";
 import { createOfflineSolver, createWeakSolver } from "../src/index";
 import { BRIEF, contextOf, taskSpec } from "./helpers";
 
 // The scripted solvers answer from seed folders. Most tests build a seeds directory of their own
 // in a temp folder, so that each rule is shown on a seed that exists for it; the last one runs
-// both solvers over the repository's real seeds.
+// both solvers over the repository's real seeds, whose solutions are not in the repository but in
+// the private directory (seeds/README.md), and is skipped where that has none.
 
 const REAL_SEEDS = join(import.meta.dirname, "../../../seeds");
 
@@ -156,24 +162,80 @@ test("a_brief_that_cannot_be_hashed_fails_when_the_solver_is_made_and_names_the_
   expect(() => createOfflineSolver(dir)).toThrow(/seed broken: brief\.json cannot be hashed/);
 });
 
-test("the_real_seeds_are_answered_with_their_own_files", async () => {
-  const offline = createOfflineSolver(REAL_SEEDS);
-  const weak = createWeakSolver(REAL_SEEDS);
-  const slugs = readdirSync(REAL_SEEDS, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name);
-  // The ten P0 seeds are there, so this is not a loop over nothing.
-  expect(slugs.length).toBeGreaterThanOrEqual(10);
+test("offline_reads_a_solution_from_the_private_directory_first_and_the_seed_folder_next", async () => {
+  const dir = seedsDir();
+  const vault = mkdtempSync(join(tmpdir(), "tender-private-"));
+  dirs.push(vault);
+  // The private directory has alpha's solution, not beta's; the seed folders have both.
+  mkdirSync(join(vault, "alpha"));
+  writeFileSync(join(vault, "alpha", "solution.txt"), "ALPHA, PRIVATE");
 
-  for (const slug of slugs) {
+  const solver = createOfflineSolver(dir, vault);
+
+  expect(text(await solver.solve(taskOf(ALPHA_HASH)))).toBe("ALPHA, PRIVATE");
+  expect(text(await solver.solve(taskOf(BETA_HASH)))).toBe("BETA SOLUTION");
+});
+
+test("a_seed_with_a_solution_nowhere_is_not_answered_and_a_missing_private_directory_is_no_error", async () => {
+  const dir = seedsDir();
+  rmSync(join(dir, "beta", "solution.txt"));
+  const absent = join(tmpdir(), "tender-no-such-private-directory");
+
+  const solver = createOfflineSolver(dir, absent);
+
+  expect(text(await solver.solve(taskOf(ALPHA_HASH)))).toBe("ALPHA SOLUTION");
+  expect(await solver.solve(taskOf(BETA_HASH))).toBeNull();
+});
+
+test("a_private_directory_is_not_read_for_the_weak_answers", async () => {
+  // A weak answer is public and lives in the seed folder; the weak solver is told no other place.
+  const dir = seedsDir();
+  const vault = mkdtempSync(join(tmpdir(), "tender-private-"));
+  dirs.push(vault);
+  mkdirSync(join(vault, "alpha"));
+  writeFileSync(join(vault, "alpha", "weak.txt"), "NOT THIS ONE");
+
+  expect(text(await createWeakSolver(dir).solve(taskOf(ALPHA_HASH)))).toBe("ALPHA WEAK");
+});
+
+const REAL_PRIVATE_DIR = privateDirOf();
+const REAL_SLUGS = readdirSync(REAL_SEEDS, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory())
+  .map((entry) => entry.name);
+const realSolutionsAreHere = REAL_SLUGS.every((slug) =>
+  existsSync(solutionFileOf(REAL_PRIVATE_DIR, slug)),
+);
+
+test.skipIf(!realSolutionsAreHere)("the_real_seeds_are_answered_with_their_own_files", async () => {
+  const offline = createOfflineSolver(REAL_SEEDS, REAL_PRIVATE_DIR);
+  const weak = createWeakSolver(REAL_SEEDS);
+  // The ten P0 seeds are there, so this is not a loop over nothing.
+  expect(REAL_SLUGS.length).toBeGreaterThanOrEqual(10);
+  expect(missingPrivateFiles(REAL_SEEDS, REAL_PRIVATE_DIR, REAL_SLUGS)).toEqual([]);
+
+  for (const slug of REAL_SLUGS) {
     const brief: unknown = JSON.parse(readFileSync(join(REAL_SEEDS, slug, "brief.json"), "utf8"));
     const ctx = taskOf(sha256Hex(canonicalJson(brief)));
 
-    const solution = readFileSync(join(REAL_SEEDS, slug, "solution.txt"));
+    const solution = readFileSync(solutionFileOf(REAL_PRIVATE_DIR, slug));
     expect(await offline.solve(ctx), `${slug}: solution`).toEqual(new Uint8Array(solution));
     // Not every seed has a weak answer, and the weak solver has none for one that does not.
     const weakFile = join(REAL_SEEDS, slug, "weak.txt");
     const expected = existsSync(weakFile) ? new Uint8Array(readFileSync(weakFile)) : null;
     expect(await weak.solve(ctx), `${slug}: weak`).toEqual(expected);
+  }
+});
+
+test("the_real_seeds_have_no_solution_in_their_folders_so_the_offline_solver_needs_the_private_directory", async () => {
+  // Without the private directory a real seed is not answered at all, and nothing says it is: the
+  // solver has no answer, as for a task that is not a seed.
+  const absent = join(tmpdir(), "tender-no-such-private-directory");
+  const offline = createOfflineSolver(REAL_SEEDS, absent);
+  for (const slug of REAL_SLUGS) {
+    const brief: unknown = JSON.parse(readFileSync(join(REAL_SEEDS, slug, "brief.json"), "utf8"));
+    expect(
+      await offline.solve(taskOf(sha256Hex(canonicalJson(brief)))),
+      `${slug}: answered from the repository`,
+    ).toBeNull();
   }
 });

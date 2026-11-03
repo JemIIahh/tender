@@ -66,8 +66,12 @@ const KEEPER_INTERVAL_MS = 1_000;
 /** The bot the Telegram links name. No bot runs: there is no token, and no message is sent. */
 export const BOT_USERNAME = "tender_test_bot";
 
-/** The seeds the board shows, by slug (`seeds/<slug>/`), in the order the specs list them. */
-const SEEDS = ["near-account-regex", "invoice-extract"] as const;
+/**
+ * The tasks the board shows, by slug, in the order the specs list them. They are of the tracked
+ * demo set (`scripts/demo-seeds/<slug>/`, demo-only, local chain only), which holds a task's
+ * held-out checks beside its brief, so that the suite needs no private directory.
+ */
+const SEEDS = ["demo-room-code-regex", "demo-dispatch-note-extract"] as const;
 /** The agent whose page the specs look at. */
 const AGENT_PROFILE = {
   name: "Alice Extractor",
@@ -83,7 +87,7 @@ const DEV_NEAR = 5n * NEAR;
 const DEV_TOKENS = 50_000_000n;
 
 const WEB_DIR = fileURLToPath(new URL("../../", import.meta.url));
-const SEEDS_DIR = fileURLToPath(new URL("../../../../seeds/", import.meta.url));
+const SEEDS_DIR = fileURLToPath(new URL("../../../../scripts/demo-seeds/", import.meta.url));
 const NEXT_BIN = join(WEB_DIR, "node_modules", "next", "dist", "bin", "next");
 
 const say = (line: string) => process.stdout.write(`chain suite: ${line}\n`);
@@ -429,9 +433,9 @@ const clientOf = (chain: LocalChain, signer?: Signer) =>
   });
 
 /**
- * Posts the seeds as the poster and gives their ids and titles. Their held-out checks are not in
- * the repository: `seed` reads them from the private directory (`TENDER_SEEDS_PRIVATE_DIR`, see
- * seeds/README.md), and the run stops here, saying so, where they are not.
+ * Posts the demo tasks as the poster and gives their ids and titles. Their held-out checks are in
+ * their folders (`heldoutDir` is the demo set itself), not in the private directory the 30 real
+ * seeds use (seeds/README.md), so this needs nothing set up.
  */
 async function postSeeds(
   chain: LocalChain,
@@ -448,6 +452,7 @@ async function postSeeds(
     judgeAccount: judge.accountId,
     tokenId: chain.tokenId,
     seedsDir: SEEDS_DIR,
+    heldoutDir: SEEDS_DIR,
     only: SEEDS,
     log,
   });

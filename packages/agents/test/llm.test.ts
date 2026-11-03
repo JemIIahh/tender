@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type Brief,
@@ -8,6 +8,7 @@ import {
   PublicCriteriaSchema,
 } from "@tender/shared";
 import { afterEach, expect, test, vi } from "vitest";
+import { privateDirOf, solutionFileOf } from "../../../scripts/lib/private-dir";
 import { createLlmSolver, LlmError } from "../src/solvers/llm";
 import { checkAnswer } from "../src/solvers/shape";
 import type { Solver, TaskContext } from "../src/types";
@@ -22,6 +23,7 @@ import { BRIEF, CRITERIA, contextOf, JUDGE, POSTER, taskSpec } from "./helpers";
 const KEY = "sk-test-0123456789-SECRET";
 const MODEL = "test-org/test-model-7";
 const REAL_SEEDS = join(import.meta.dirname, "../../../seeds");
+const DEMO_SEEDS = join(import.meta.dirname, "../../../scripts/demo-seeds");
 
 const servers: FakeLlm[] = [];
 
@@ -1128,24 +1130,25 @@ test("a_reply_with_the_most_thinking_the_solver_allows_is_read_and_answered_and_
 
 // ---- The real seeds -----------------------------------------------------------------------------
 
-test("the_checks_accept_the_winning_answer_of_every_real_seed_and_the_prompt_carries_its_task", async () => {
-  const slugs = readdirSync(REAL_SEEDS, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort();
-  expect(slugs.length).toBeGreaterThanOrEqual(10);
-
-  const solutions = slugs.map((slug) =>
-    readFileSync(join(REAL_SEEDS, slug, "solution.txt"), "utf8"),
-  );
+/**
+ * The model replies with each task's winning answer in turn: the checks let each one through byte
+ * for byte, and the prompt carries the task, its instructions whole and its criteria. `solutionOf`
+ * says where the answer is, as the real seeds keep theirs apart from the repository.
+ */
+async function checksAcceptTheWinningAnswers(
+  seedsDir: string,
+  slugs: string[],
+  solutionOf: (slug: string) => string,
+): Promise<void> {
+  const solutions = slugs.map((slug) => readFileSync(solutionOf(slug), "utf8"));
   const { llm, solver } = await setUp(solutions);
 
   for (const [index, slug] of slugs.entries()) {
     const brief = BriefSchema.parse(
-      JSON.parse(readFileSync(join(REAL_SEEDS, slug, "brief.json"), "utf8")),
+      JSON.parse(readFileSync(join(seedsDir, slug, "brief.json"), "utf8")),
     );
     const criteria = PublicCriteriaSchema.parse(
-      JSON.parse(readFileSync(join(REAL_SEEDS, slug, "criteria.json"), "utf8")),
+      JSON.parse(readFileSync(join(seedsDir, slug, "criteria.json"), "utf8")),
     );
 
     const answer = await solver.solve({
@@ -1162,4 +1165,34 @@ test("the_checks_accept_the_winning_answer_of_every_real_seed_and_the_prompt_car
     expect(user, slug).toContain(`"kind": "${criteria.kind}"`);
   }
   expect(llm.requests).toHaveLength(slugs.length);
+}
+
+const slugsIn = (dir: string): string[] =>
+  readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+
+test("the_checks_accept_the_winning_answer_of_every_demo_task_and_the_prompt_carries_its_task", async () => {
+  // The tracked demo set, whose answers are in the open, in the task folders.
+  const slugs = slugsIn(DEMO_SEEDS);
+  expect(slugs.length).toBeGreaterThanOrEqual(4);
+  await checksAcceptTheWinningAnswers(DEMO_SEEDS, slugs, (slug) =>
+    join(DEMO_SEEDS, slug, "solution.txt"),
+  );
 });
+
+const REAL_PRIVATE_DIR = privateDirOf();
+const REAL_SLUGS = slugsIn(REAL_SEEDS);
+
+test.skipIf(!REAL_SLUGS.every((slug) => existsSync(solutionFileOf(REAL_PRIVATE_DIR, slug))))(
+  "the_checks_accept_the_winning_answer_of_every_real_seed_and_the_prompt_carries_its_task",
+  async () => {
+    // The real seeds' solutions are kept apart from the repository (seeds/README.md): this runs
+    // where the private directory has them, and is skipped where it has not.
+    expect(REAL_SLUGS.length).toBeGreaterThanOrEqual(10);
+    await checksAcceptTheWinningAnswers(REAL_SEEDS, REAL_SLUGS, (slug) =>
+      solutionFileOf(REAL_PRIVATE_DIR, slug),
+    );
+  },
+);
