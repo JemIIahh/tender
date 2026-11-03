@@ -362,6 +362,29 @@ test("a_blob_the_api_stored_as_something_else_is_not_posted", async () => {
   }
 });
 
+test.each([
+  { name: "the_judge", verifier: "judge", other: "", uploaded: true },
+  { name: "the_judges_account_typed_in", verifier: "other", other: JUDGE, uploaded: true },
+  { name: "the_poster", verifier: "me", other: "", uploaded: false },
+  { name: "another_account", verifier: "other", other: "bob.testnet", uploaded: false },
+] as const)(
+  "the_held_out_checks_go_to_the_api_only_when_the_judge_is_to_pick_$name",
+  async ({ verifier, other, uploaded }) => {
+    const form = regexForm({ amount: "5", verifier, otherVerifier: other });
+    const w = world(form, { vault: vaultData({ vault: 5_000_000n }) });
+
+    await expect(submitPost(input(form), w.deps)).resolves.toMatchObject({ kind: "posted" });
+
+    // The brief and the criteria are public and always go up; the held-out checks are a secret that
+    // only the Judge reads at the API.
+    expect(w.blobs.map(({ kind }) => kind)).toEqual(["brief", "criteria"]);
+    expect(w.heldouts).toHaveLength(uploaded ? 1 : 0);
+    // The commitment is on chain either way: it is in the post.
+    const task = w.sent[0]?.at(-1)?.args.task as { heldout_commitment: string } | undefined;
+    expect(task?.heldout_commitment).toBe(buildDocuments(form).heldoutCommitment);
+  },
+);
+
 test("an_account_that_has_never_deposited_is_set_up_by_the_same_send", async () => {
   const form = regexForm({ amount: "5" });
   const w = world(form, { vault: vaultData({ storage: false }) });

@@ -3,11 +3,16 @@ import { join } from "node:path";
 import { SIGN_IN_MESSAGE, sha256Hex, storageShortfall } from "@tender/shared";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, expect, type MockInstance, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, type MockInstance, onTestFinished, test, vi } from "vitest";
 import { PostWizard } from "../components/post/PostWizard";
 import { heldToken } from "../lib/apiToken";
 import { clearApiToken } from "../lib/auth";
-import { POST_TASK_BYTES, RUBRIC_JUDGE_NOTE, VAULT_SLOT_BYTES } from "../lib/post";
+import {
+  POST_TASK_BYTES,
+  RUBRIC_JUDGE_NOTE,
+  VAULT_SLOT_BYTES,
+  VERIFIER_PICKS_WITH_MCP,
+} from "../lib/post";
 import { describeNear } from "../lib/vault";
 import { createWalletStore, type WalletStore } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE } from "../lib/walletErrors";
@@ -446,7 +451,7 @@ test.each([
   { verifier: "Me", typed: null, expected: ALICE },
   { verifier: "Another account", typed: BOB, expected: BOB },
 ])(
-  "the_verifier_$verifier_is_the_one_the_task_is_posted_with",
+  "the_verifier_is_the_one_the_task_is_posted_with_$verifier",
   async ({ verifier, typed, expected }) => {
     const { user, chain } = setup({ vault: TUSDC(5) });
     render(<PostWizard judgeAccount={JUDGE} />);
@@ -464,6 +469,151 @@ test.each([
     expect(chain.tasks.get(1n)?.verifier).toBe(expected);
   },
 );
+
+test("a_verifier_who_is_not_the_judge_is_told_this_site_cannot_pick", async () => {
+  const { user } = setup({ vault: TUSDC(5) });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReward(user);
+
+  // With the Judge as verifier there is nothing to add: the Judge picks.
+  expect(screen.queryByTestId("verifier-picks-with-mcp")).toBeNull();
+  for (const verifier of [/^Me/, /^Another account/]) {
+    await user.click(screen.getByRole("radio", { name: verifier }));
+    expect(testId("verifier-picks-with-mcp")).toBe(VERIFIER_PICKS_WITH_MCP);
+  }
+  expect(VERIFIER_PICKS_WITH_MCP).toContain("pick_winners");
+  await user.click(screen.getByRole("radio", { name: /^Tender Judge/ }));
+  expect(screen.queryByTestId("verifier-picks-with-mcp")).toBeNull();
+});
+
+// ---- The held-out checks of a task the Judge does not pick --------------------------------------
+
+/** What a press of "Download held-out checks" saved: its name and bytes. */
+function captureDownloads(): Array<{ name: string; bytes: Promise<Uint8Array> }> {
+  const saved: Array<{ name: string; bytes: Promise<Uint8Array> }> = [];
+  const blobs = new Map<string, Blob>();
+  let made = 0;
+  // jsdom has neither function; they are put on and taken off again for this test.
+  Object.assign(URL, {
+    createObjectURL: (blob: Blob) => {
+      const url = `blob:test/${++made}`;
+      blobs.set(url, blob);
+      return url;
+    },
+    revokeObjectURL: () => {},
+  });
+  onTestFinished(() => {
+    Reflect.deleteProperty(URL, "createObjectURL");
+    Reflect.deleteProperty(URL, "revokeObjectURL");
+  });
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    const blob = blobs.get(this.href);
+    if (blob === undefined) throw new Error(`no file was made for ${this.href}`);
+    saved.push({
+      name: this.download,
+      bytes: new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsArrayBuffer(blob);
+      }),
+    });
+  });
+  return saved;
+}
+
+test.each([
+  { name: "me", verifier: /^Me/, typed: null, who: "You pick" },
+  {
+    name: "another_account",
+    verifier: /^Another account/,
+    typed: BOB,
+    who: `${BOB} needs these held-out checks`,
+  },
+])(
+  "the_held_out_checks_are_a_file_that_hashes_to_the_commitment_when_the_verifier_is_$name",
+  async ({ verifier, typed, who }) => {
+    const saved = captureDownloads();
+    const { user, chain, api, wallet } = setup({ vault: TUSDC(5) });
+    render(<PostWizard judgeAccount={JUDGE} />);
+    await toReward(user);
+    fill("Amount (tUSDC)", "5");
+    await user.click(screen.getByRole("radio", { name: verifier }));
+    if (typed !== null) fill("Their NEAR account", typed);
+    await press(user, "Review");
+    await stepHeading("Review");
+
+    // The page says what the file is for. The checks are in no attribute of the page.
+    const box = screen.getByTestId("heldout-download");
+    expect(box.textContent).toContain(who);
+    expect(box.textContent).toContain("publish");
+    expect(document.body.innerHTML).not.toContain(SECRET);
+    expect(testId("review-heldout")).toBe("4 cases");
+
+    await user.click(within(box).getByRole("button", { name: "Download held-out checks" }));
+    expect(saved).toHaveLength(1);
+    const file = await saved[0]?.bytes;
+    expect(saved[0]?.name).toBe("heldout.json");
+    expect(new TextDecoder().decode(file)).toContain(SECRET);
+
+    // The file is the bytes the task commits to.
+    await user.click(await postReady());
+    await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
+    expect(sha256Hex(file ?? new Uint8Array())).toBe(chain.tasks.get(1n)?.heldoutCommitment);
+    // And they went nowhere else: not to the API, not to the wallet.
+    expect(api.heldouts).toEqual([]);
+    expect(api.requests.map(({ path }) => path)).not.toContain("/v1/heldout");
+    expect(JSON.stringify(wallet.sent)).not.toContain(SECRET);
+    expect(api.requests.map(({ body }) => body).join("\n")).not.toContain(SECRET);
+  },
+);
+
+test("the_judge_gets_the_held_out_checks_and_review_offers_no_file", async () => {
+  const { user, api } = setup({ vault: TUSDC(5) });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  expect(screen.queryByTestId("heldout-download")).toBeNull();
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
+  expect(api.heldouts).toHaveLength(1);
+});
+
+test("the_judges_own_account_typed_in_as_another_account_is_still_the_judge", async () => {
+  const { user, api } = setup({ vault: TUSDC(5) });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toReward(user);
+  fill("Amount (tUSDC)", "5");
+  await user.click(screen.getByRole("radio", { name: /^Another account/ }));
+  fill("Their NEAR account", JUDGE);
+  await press(user, "Review");
+  await stepHeading("Review");
+
+  expect(screen.queryByTestId("heldout-download")).toBeNull();
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
+  expect(api.heldouts).toHaveLength(1);
+});
+
+test("a_task_with_no_held_out_checks_offers_no_file_whoever_picks", async () => {
+  const { user } = setup({ vault: TUSDC(5) });
+  render(<PostWizard judgeAccount={JUDGE} />);
+  await toChecks(user);
+  await user.click(screen.getByRole("radio", { name: /Regex cases/ }));
+  fill("Should match", "alice.near");
+  fill("Should not match", "-bad");
+  await press(user, "Next: Reward");
+  await screen.findByLabelText("Amount (tUSDC)");
+  fill("Amount (tUSDC)", "5");
+  await user.click(screen.getByRole("radio", { name: /^Me/ }));
+  await press(user, "Review");
+  await stepHeading("Review");
+
+  expect(testId("review-heldout")).toBe("None: scored on the examples");
+  expect(screen.queryByTestId("heldout-download")).toBeNull();
+});
 
 test("custom_windows_are_what_the_task_is_posted_with", async () => {
   const { user, chain } = setup({ vault: TUSDC(5) });
@@ -1155,7 +1305,7 @@ test.each([
     kept: ["Held-out: should match", "Held-out: should not match"],
   },
 ])(
-  "the_checks_step_splits_what_agents_see_from_what_the_judge_keeps_for_$name",
+  "the_checks_step_splits_what_agents_see_from_what_is_kept_secret_for_$name",
   async ({ kind, seen, kept }) => {
     const { user } = setup();
     render(<PostWizard judgeAccount={JUDGE} />);
@@ -1166,9 +1316,7 @@ test.each([
     const left = screen.getByTestId("split-public");
     const right = screen.getByTestId("split-heldout");
     expect(within(left).getByRole("heading", { name: "What agents see" })).toBeDefined();
-    expect(
-      within(right).getByRole("heading", { name: "What the Judge keeps until payout" }),
-    ).toBeDefined();
+    expect(within(right).getByRole("heading", { name: "Kept secret until payout" })).toBeDefined();
     for (const label of seen) {
       expect(within(left).getByLabelText(label), label).toBeDefined();
       expect(within(right).queryByLabelText(label), label).toBeNull();

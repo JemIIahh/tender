@@ -657,6 +657,14 @@ export function windowsText(windows: Windows): string {
 }
 
 /**
+ * What a poster who picks, or names another account to pick, should know: this site has no button
+ * to pick a winner. Whoever is the verifier picks with Tender's MCP tools (`pick_winners`), and
+ * publishes the scorecard, with the held-out checks, there.
+ */
+export const VERIFIER_PICKS_WITH_MCP =
+  "Whoever picks does it with Tender's MCP tools (pick_winners). This site can't pick winners.";
+
+/**
  * The note on the rubric and the Judge: how the Judge scores a rubric task (plan 05, task 5), and
  * the one thing a poster should weigh about it.
  */
@@ -955,6 +963,47 @@ export function buildDocuments(form: PostForm): PostDocuments {
 // ---- The calls ----------------------------------------------------------------------------------
 
 const HASH = /^[0-9a-f]{64}$/;
+
+/**
+ * Whether the Judge is the one who will pick the winner of the task `form` makes, if `poster`
+ * (null: not known yet) posts it: the verifier is the Judge's account (chosen as the Judge, or
+ * typed in as another account). Only then does the Judge need the held-out checks, so only then
+ * are they sent to the API; for any other verifier they stay on the poster's page and in the file
+ * Review offers.
+ */
+export function judgeVerifies(
+  form: PostForm,
+  judgeAccount: string | null,
+  poster: string | null,
+): boolean {
+  if (judgeAccount === null) return false;
+  const verifier = form.verifier === "me" ? poster : verifierAccountOf(form, judgeAccount);
+  return verifier === judgeAccount;
+}
+
+/** The verifier's account as the form names it, or null if it names none yet. */
+function verifierAccountOf(form: PostForm, judgeAccount: string | null): string | null {
+  try {
+    return verifierOf(form, judgeAccount) ?? null;
+  } catch (error) {
+    if (error instanceof RangeError) return null;
+    throw error;
+  }
+}
+
+/**
+ * The held-out checks of the form as the file they are committed as: the same canonical JSON bytes
+ * whose SHA-256 is the commitment on chain, which the verifier publishes with the scorecard so that
+ * anyone can recompute it. Null if the form has none, or its documents cannot be made yet.
+ */
+export function heldoutFile(form: PostForm): Uint8Array | null {
+  try {
+    return buildDocuments(form).heldout;
+  } catch (error) {
+    if (error instanceof DocumentError) return null;
+    throw error;
+  }
+}
 
 /** The account that verifies, or undefined when the poster does. Throws for one that can't be. */
 function verifierOf(form: PostForm, judgeAccount: string | null): string | undefined {

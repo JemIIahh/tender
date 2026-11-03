@@ -13,6 +13,7 @@ import {
   buildDocuments,
   DocumentError,
   fundingOf,
+  judgeVerifies,
   type PostDocuments,
   type PostForm,
   planPostCalls,
@@ -35,7 +36,10 @@ import {
 //      page (the steps of the wizard hold the rest of the form to what Tender allows, which this
 //      does not see);
 //   2. a sign-in to the API, if there is no token for the account;
-//   3. the brief, the criteria and the held-out checks are uploaded, each to its own place;
+//   3. the brief and the criteria are uploaded, each to its own place, and the held-out checks too
+//      if the Judge is to pick (the only reader of them at the API). For any other verifier they
+//      stay on the poster's page: the wizard's Review offers them as a file, which that verifier
+//      needs to pick and publishes with the scorecard;
 //   4. the vault and the storage balance are read afresh, and the calls are planned from what they
 //      hold;
 //   5. one `signAndSend`: the storage top-up and the deposit that tops the vault up, if either is
@@ -352,7 +356,13 @@ export async function submitPost(
     );
     checkUpload(stored, docs.criteriaHash, false);
   });
-  if (docs.heldout !== null && docs.heldoutCommitment !== null) {
+  // Only the Judge reads them at the API, and they are a secret until the payout: a task that
+  // another account picks has no reason to put them there.
+  if (
+    docs.heldout !== null &&
+    docs.heldoutCommitment !== null &&
+    judgeVerifies(form, judgeAccount, account)
+  ) {
     const { heldout, heldoutCommitment } = docs;
     await at("upload", () => authed((t) => deps.uploadHeldout(t, heldoutCommitment, heldout)));
   }

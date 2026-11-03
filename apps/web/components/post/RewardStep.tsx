@@ -15,6 +15,7 @@ import {
   spanText,
   tokenOf,
   totalSecs,
+  VERIFIER_PICKS_WITH_MCP,
   type Verifier,
   WINDOW_NAMES,
   WINDOW_TEXT,
@@ -223,6 +224,11 @@ export function RewardStep(props: StepProps & { limits: PostLimits; judgeAccount
             <TextField label="Their NEAR account" mono {...bindText(props, "otherVerifier")} />
           ) : null}
         </RadioGroup>
+        {form.verifier === "judge" ? null : (
+          <p data-testid="verifier-picks-with-mcp" className="text-sm">
+            {VERIFIER_PICKS_WITH_MCP}
+          </p>
+        )}
         {form.kind === "rubric" && form.verifier === "judge" ? (
           <div className="grid gap-1 text-sm font-medium">
             <p data-testid="rubric-judge-note">{RUBRIC_JUDGE_NOTE}</p>
