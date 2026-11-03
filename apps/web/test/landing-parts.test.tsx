@@ -116,6 +116,7 @@ test("ticker_reads_its_figures_from_the_api", async () => {
         indexed_height: "100",
         chain_final_height: "100",
         lag_blocks: "0",
+        waiting_for_chain: false,
       }),
   });
   render(<Ticker />);
@@ -155,15 +156,18 @@ test("ticker_figures_are_exact_or_say_they_are_a_floor", () => {
   // No open tasks: a count of 0, and no escrow line.
   expect(items({ open: { tasks: [], next_cursor: null } })).toEqual({ open: "0" });
 
-  const health = (lag: string) => ({
+  const health = (lag: string, waiting = false) => ({
     ok: true as const,
     network: "testnet",
     contract: "tender.testnet",
     indexed_height: "90",
     chain_final_height: "102",
     lag_blocks: lag,
+    waiting_for_chain: waiting,
   });
   expect(items({ health: health("12") }).index).toBe("12 blocks behind");
+  // While the services wait for the chain, a lag of 0 does not mean the index is in sync.
+  expect(items({ health: health("0", true) }).index).toBe("waiting for the chain");
   expect(items({ payout: { taskId: "3", token: TOKEN, amount: 2_000_000n } }).payout).toBe(
     "2.00 tUSDC",
   );

@@ -78,8 +78,15 @@ export function liveItems(data: TickerData, network: NetworkId): TickerItem[] {
     if (text !== null) add("payout", `Recent payout · task ${data.payout.taskId}`, text, true);
   }
   if (data.health) {
+    // While the services wait for the chain, `lag_blocks` is 0 for a node behind the index, so it
+    // would read as "in sync"; the wait is said as it is instead.
     const lag = BigInt(data.health.lag_blocks);
-    add("index", "Index", lag === 0n ? "in sync" : `${lag} blocks behind`);
+    const index = data.health.waiting_for_chain
+      ? "waiting for the chain"
+      : lag === 0n
+        ? "in sync"
+        : `${lag} blocks behind`;
+    add("index", "Index", index);
   }
   return items;
 }
