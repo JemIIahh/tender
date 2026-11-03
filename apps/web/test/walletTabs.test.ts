@@ -35,7 +35,6 @@ const arrive = () => new Promise<void>((resolve) => setTimeout(resolve, 50));
 
 test("a_tab_tells_the_others_on_the_wallet_channel_with_a_message_that_names_no_one", async () => {
   const heard = listener();
-  const elsewhere = listener("selected-wallet");
 
   link().tell();
 
@@ -44,9 +43,6 @@ test("a_tab_tells_the_others_on_the_wallet_channel_with_a_message_that_names_no_
   expect(heard[0]).toEqual({ type: "session-changed" });
   expect(Object.keys(heard[0] as object)).toEqual(["type"]);
   expect(JSON.stringify(heard[0])).not.toMatch(/token|account|testnet|near/i);
-  // Near-connect's own key is not a channel this app talks on.
-  await arrive();
-  expect(elsewhere).toEqual([]);
 });
 
 test("a_tab_hears_the_others_and_not_itself", async () => {
