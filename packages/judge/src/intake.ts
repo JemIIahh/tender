@@ -127,6 +127,10 @@ const TESTS_NOT_AVAILABLE = "kind tests is not available yet";
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
 const REFERENCE_NOT_ALLOWED =
   'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry (move the schema it points to into $defs)';
+// A reference that is already shaped like one to a `$defs` entry, where the entry is what is wrong:
+// moving the schema into `$defs` is not the fix.
+const REFERENCE_TARGET_UNUSABLE =
+  'criteria schema is not supported: a reference points to a $defs or definitions entry that is not there, is not a schema, or has a "%" in its name';
 const DYNAMIC_REFERENCE =
   "criteria schema is not supported: $dynamicRef and $recursiveRef are not supported, use $ref";
 const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at the root";
@@ -553,7 +557,9 @@ function parseJson(bytes: Uint8Array): unknown {
  *   of the root's `$defs` or `definitions`, whose value is a schema: an object or a boolean. That
  *   is what written schemas use. A name of an `Object.prototype` member, such as `constructor`, is
  *   refused even when it is defined. Anything else is refused: an anchor, a URI, a pointer
- *   anywhere else, a missing entry. The reason says to move the schema into `$defs`.
+ *   anywhere else; for those the reason says to move the schema into `$defs`. A pointer that is
+ *   already to a `$defs` or `definitions` entry, but with a `%` in the name, no such entry or an
+ *   entry that is not a schema, has a reason of its own, as moving a schema is not the fix there.
  *
  * The values of `const`, `enum`, `examples` and `default` are data, not schemas, so a `"$ref"` in
  * them is no reference and is not looked at, nor is an `$id` in them. That holds where they are
@@ -603,15 +609,14 @@ function problemOf(reference: string, root: Record<string, unknown>): string | n
   const [, keyword, segment] = DEFS_REFERENCE.exec(reference) ?? [];
   // A `%` is refused rather than decoded, so that the name looked up here is the very one Ajv
   // looks up: it percent-decodes a fragment as it resolves it.
-  if (keyword === undefined || segment === undefined || segment.includes("%")) {
-    return REFERENCE_NOT_ALLOWED;
-  }
+  if (keyword === undefined || segment === undefined) return REFERENCE_NOT_ALLOWED;
+  if (segment.includes("%")) return REFERENCE_TARGET_UNUSABLE;
   const name = segment.replace(/~1/g, "/").replace(/~0/g, "~");
   if (Object.hasOwn(Object.prototype, name)) return BUILT_IN_REFERENCE;
   const entries = Object.hasOwn(root, keyword) ? root[keyword] : undefined;
-  if (!isPlainObject(entries) || !Object.hasOwn(entries, name)) return REFERENCE_NOT_ALLOWED;
+  if (!isPlainObject(entries) || !Object.hasOwn(entries, name)) return REFERENCE_TARGET_UNUSABLE;
   const target = entries[name];
-  return typeof target === "boolean" || isPlainObject(target) ? null : REFERENCE_NOT_ALLOWED;
+  return typeof target === "boolean" || isPlainObject(target) ? null : REFERENCE_TARGET_UNUSABLE;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

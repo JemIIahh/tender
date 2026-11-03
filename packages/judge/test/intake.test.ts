@@ -95,6 +95,9 @@ const TESTS = {
 const BUILT_IN_REFERENCE = "criteria schema is not supported: a reference names a built-in member";
 const REFERENCE_NOT_ALLOWED =
   'criteria schema is not supported: a reference must be "#" or point to a $defs or definitions entry (move the schema it points to into $defs)';
+// A pointer that is already to a $defs entry, where the entry is the problem (the #14 hint).
+const REFERENCE_TARGET_UNUSABLE =
+  'criteria schema is not supported: a reference points to a $defs or definitions entry that is not there, is not a schema, or has a "%" in its name';
 const DYNAMIC_REFERENCE =
   "criteria schema is not supported: $dynamicRef and $recursiveRef are not supported, use $ref";
 const ID_BELOW_ROOT = "criteria schema is not supported: $id is only allowed at the root";
@@ -574,24 +577,24 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
     },
     {
       rule: "a $defs entry that is an array",
-      reason: REFERENCE_NOT_ALLOWED,
+      reason: REFERENCE_TARGET_UNUSABLE,
       view: () => jsonSchemaTask(db, { $defs: { x: [{ type: "string" }] }, $ref: "#/$defs/x" }),
     },
     {
       rule: "a $defs entry that is a number",
-      reason: REFERENCE_NOT_ALLOWED,
+      reason: REFERENCE_TARGET_UNUSABLE,
       view: () => jsonSchemaTask(db, { $defs: { x: 5 }, $ref: "#/$defs/x" }),
     },
     {
       rule: "a $ref to a $defs entry that is not there",
-      reason: REFERENCE_NOT_ALLOWED,
+      reason: REFERENCE_TARGET_UNUSABLE,
       view: () => jsonSchemaTask(db, { $defs: { y: { type: "string" } }, $ref: "#/$defs/x" }),
     },
     {
       // A percent-escape is refused, not decoded, so that the name read here is the one Ajv reads:
       // Ajv would look up `a`, not the `%61` that is defined.
       rule: "a $defs name that is percent-encoded",
-      reason: REFERENCE_NOT_ALLOWED,
+      reason: REFERENCE_TARGET_UNUSABLE,
       view: () => jsonSchemaTask(db, { $defs: { "%61": { type: "string" } }, $ref: "#/$defs/%61" }),
     },
     {
