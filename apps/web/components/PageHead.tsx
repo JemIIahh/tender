@@ -24,7 +24,9 @@ export function PageHead({
   children?: ReactNode;
 }) {
   return (
-    <header className="relative isolate grid content-center gap-3 md:min-h-44 md:pr-[38%]">
+    <header
+      className={`relative isolate grid content-center gap-3 ${art === undefined ? "" : "md:min-h-44 md:pr-[38%]"}`}
+    >
       {art === undefined ? null : (
         <div
           aria-hidden="true"
