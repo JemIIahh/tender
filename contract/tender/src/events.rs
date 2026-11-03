@@ -152,6 +152,17 @@ impl From<TaskView> for TaskCreated {
     }
 }
 
+/// Data of `task_topped_up`: `funder` added `amount` to the escrow of task `task_id`, which now
+/// holds `reward` in all, in the task's token. The amounts and the id are decimal strings.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub(crate) struct TaskToppedUp {
+    pub task_id: U64,
+    pub funder: AccountId,
+    pub amount: U128,
+    pub reward: U128,
+}
+
 /// Data of `committed`: `account` entered task `task_id` with `commitment` (`replaced: false`), or
 /// replaced the commitment it entered with (`replaced: true`), at block `block_height`. The
 /// commitment is 64 lowercase hex characters; the id and the height are decimal strings.

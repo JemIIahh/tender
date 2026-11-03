@@ -20,8 +20,11 @@
 //! that money paid to the wrong account shows, and money in an account the harness does not know
 //! of; that `ft_on_transfer` never panics (I8); that a pick, an empty pick or a void that the
 //! rules allow always goes through, `void_task` from the fallback deadline on among them (I4), and
-//! so does a withdrawal that the balance covers; that a task's `reveal_count` is its number of
-//! reveals; and that every rejected call leaves the state exactly as it found it.
+//! so do a withdrawal that the balance covers and a top-up that the rules allow; that a task's
+//! `reveal_count` is its number of reveals; that its funders are the poster and then each account
+//! that topped it up, in that order, each with what it paid in, adding up to its reward, so that
+//! an empty pick or a void refunds each of them exactly that; and that every rejected call leaves
+//! the state exactly as it found it.
 //!
 //! `payout_math_conserves` checks the split of a pick on its own, for rewards up to 10^30.
 //!
@@ -56,7 +59,8 @@ use crate::entries::commitment_of;
 use crate::settle::split_reward;
 use crate::test_utils::{ctx, fresh, panic_message};
 use crate::types::{
-    hex32, OutcomeView, Phase, PostTaskArgs, VoidReason, WinnerArg, MAX_FEE_BPS, MAX_WINNERS,
+    hex32, OutcomeView, Phase, PostTaskArgs, VoidReason, WinnerArg, MAX_FEE_BPS, MAX_FUNDERS,
+    MAX_WINNERS,
 };
 use crate::{StorageKey, Tender};
 
@@ -165,9 +169,12 @@ enum Op {
     Cleanup { task: Target, limit: u32 },
     /// `who` registers as an agent, or registers again.
     Register { who: Who },
-    // Task 13 adds `TopUp { who: Who, task: Target, amount: u128 }`, which drives
-    // `top_up_task` on an open task and, when it goes through, debits `who` and adds it to the
-    // task's funders in the model.
+    /// `who` tops the task up by `amount`, with 1 yoctoNEAR. Steered to an open task.
+    TopUp {
+        who: Who,
+        task: Target,
+        amount: u128,
+    },
 }
 
 /// The task an operation acts on.
@@ -192,6 +199,9 @@ enum Settlement {
 struct TaskModel {
     poster: Who,
     reward: u128,
+    /// Who paid the reward in and how much: the poster first, then each account that topped the
+    /// task up, in the order of its first top-up.
+    funders: Vec<(Who, u128)>,
     /// The block time it was posted at. Its deadlines are 1, 2, 3 and 4 windows later.
     posted_at: u64,
     /// The seed of the work each entrant committed last. Its keys are the distinct committers.
@@ -455,7 +465,58 @@ impl World {
                     vec!["coder".to_string()],
                 )
             }),
+            Op::TopUp { who, task, amount } => {
+                let task = self.resolve(task, |phase, _| phase == Phase::Open);
+                self.top_up(who, task, amount)
+            }
         }
+    }
+
+    /// `who` tops `task` up by `amount`. A top-up that the rules allow must go through: an open
+    /// task, a positive amount that `who`'s balance covers and that keeps the reward within the
+    /// token's limit, and room for `who` among the funders if it is not one yet. Storage never
+    /// limits the four accounts, and the pause is never on.
+    fn top_up(&mut self, who: Who, task: u64, amount: u128) -> Step {
+        let held = self.balances.get(&who.account()).copied().unwrap_or(0);
+        let allowed = self.task(task).is_some_and(|m| {
+            let known = m.funders.iter().any(|(w, _)| *w == who);
+            self.phase(m) == Phase::Open
+                && amount > 0
+                && amount <= held
+                && m.reward
+                    .checked_add(amount)
+                    .is_some_and(|reward| reward <= MAX_REWARD)
+                && (known || m.funders.len() < MAX_FUNDERS)
+        });
+        let result = self.call(who.id(), ONE_YOCTO, Vec::new(), |t| {
+            t.top_up_task(U64(task), U128(amount))
+        })?;
+        if let Err(message) = &result {
+            prop_assert!(
+                !allowed,
+                "{:?} topping task {} up by {} was rejected: {:?}",
+                who,
+                task,
+                amount,
+                message
+            );
+            return Ok(result);
+        }
+        prop_assert!(
+            allowed,
+            "{:?} topped task {} up by {}, which the rules forbid",
+            who,
+            task,
+            amount
+        );
+        self.debit(&who.account(), amount)?;
+        let m = self.task_mut(task)?;
+        m.reward += amount;
+        match m.funders.iter_mut().find(|(w, _)| *w == who) {
+            Some((_, paid)) => *paid += amount,
+            None => m.funders.push((who, amount)),
+        }
+        Ok(Ok(()))
     }
 
     /// The token reports a deposit. `ft_on_transfer` must answer and never panic (I8), and what
@@ -507,6 +568,7 @@ impl World {
         self.tasks.push(TaskModel {
             poster: who,
             reward,
+            funders: vec![(who, reward)],
             posted_at: self.now,
             works: BTreeMap::new(),
             revealed: BTreeSet::new(),
@@ -582,7 +644,7 @@ impl World {
     }
 
     /// `caller` settles task `task`, and the model follows: a pick pays the winners and the fee,
-    /// and an empty pick or a void refunds the poster, the only funder.
+    /// and an empty pick or a void refunds each funder what it paid in.
     fn settle(&mut self, task: u64, caller: &str, how: Settlement) -> Step {
         let model = self.task(task);
         let settled = model.map(|m| m.outcome.is_some());
@@ -673,9 +735,10 @@ impl World {
                     *reason == VoidReason::NoAward
                 };
                 prop_assert!(expected, "task {} was voided as {:?}", task, reason);
-                let m = self.task_mut(task)?;
-                let (poster, reward) = (m.poster.account(), m.reward);
-                self.credit(&poster, reward)?;
+                let funders = self.task_mut(task)?.funders.clone();
+                for (who, paid) in funders {
+                    self.credit(&who.account(), paid)?;
+                }
             }
             (outcome, _) => {
                 return Err(TestCaseError::fail(format!(
@@ -795,6 +858,24 @@ impl World {
                 task.reveal_count as usize,
                 model.revealed.len(),
                 "the reveal_count of task {} is not its number of reveals",
+                id
+            );
+            prop_assert_eq!(task.reward.0, model.reward, "the reward of task {}", id);
+            let funders: Vec<(AccountId, u128)> = task
+                .funders
+                .iter()
+                .map(|f| (f.account.clone(), f.amount.0))
+                .collect();
+            let expected: Vec<(AccountId, u128)> = model
+                .funders
+                .iter()
+                .map(|(who, paid)| (who.account(), *paid))
+                .collect();
+            prop_assert_eq!(funders, expected, "the funders of task {}", id);
+            prop_assert_eq!(
+                task.funders.iter().map(|f| f.amount.0).sum::<u128>(),
+                task.reward.0,
+                "the funders of task {} do not add up to its reward",
                 id
             );
         }
@@ -1049,7 +1130,9 @@ fn op() -> impl Strategy<Value = Op> {
         // A limit of 0 is rejected `E_LIMIT`.
         1 => (target(), 0..=3u32).prop_map(|(task, limit)| Op::Cleanup { task, limit }),
         1 => who().prop_map(|who| Op::Register { who }),
-        // Task 13: `TopUp` joins here.
+        // 0 is among the amounts, and is rejected `E_REWARD`.
+        3 => (who(), target(), prop_oneof![3 => 0..=1_000u128, 1 => 1..=MAX_AMOUNT])
+            .prop_map(|(who, task, amount)| Op::TopUp { who, task, amount }),
     ]
 }
 
@@ -1145,6 +1228,11 @@ fn scripted_run_reaches_every_outcome() {
         limit,
     };
     let register = |who| Op::Register { who };
+    let top_up = |who, task, amount| Op::TopUp {
+        who,
+        task: Target::Id(task),
+        amount,
+    };
     // Each operation, and what it should come to: "ok", or the code it is rejected with.
     let script = [
         // Task 1, 1_000 from p.test, which the setup funded. Three entrants, one of them twice.
@@ -1158,9 +1246,15 @@ fn scripted_run_reaches_every_outcome() {
         // a.test has the vault slot its commit made, and nothing in it yet.
         (post(Some(A), 5), "E_FUNDS"),
         (deposit(A, 500), "ok"),
-        // Task 2, which nobody enters.
+        // Task 2, which nobody enters. Its poster puts in 3 more and p.test 4; b.test has the slot
+        // its commit made, and nothing in it.
         (post(Some(A), 7), "ok"),
+        (top_up(A, 2, 3), "ok"),
+        (top_up(P, 2, 4), "ok"),
+        (top_up(A, 2, 0), "E_REWARD"),
+        (top_up(B, 2, 5), "E_FUNDS"),
         (advance(60), "ok"),
+        (top_up(P, 2, 1), "E_PHASE"),
         (reveal(Some(A), 1), "ok"),
         (reveal(Some(B), 1), "ok"),
         (reveal(Some(C), 1), "ok"),
@@ -1178,8 +1272,10 @@ fn scripted_run_reaches_every_outcome() {
         (withdraw(A, None, true), "ok"),
         (withdraw(B, Some(100), false), "ok"),
         (withdraw(B, Some(1_000), true), "E_FUNDS"),
-        // Task 3, picked empty, by the account that holds the most: p.test.
+        // Task 3, posted by the account that holds the most, p.test, topped up by c.test out of
+        // its winnings, and picked empty, which refunds them both.
         (post(None, 3), "ok"),
+        (top_up(C, 3, 10), "ok"),
         (commit(None, 3), "ok"),
         (advance(60), "ok"),
         (reveal(None, 3), "ok"),
@@ -1226,7 +1322,8 @@ fn scripted_run_reaches_every_outcome() {
             "voided Expired",
         ]
     );
-    // Withdrawn: 975 by a.test and 190 by c.test. b.test's failed withdrawal came back.
+    // The voids and the empty pick refunded every funder what it paid in, so the top-ups cancel
+    // out. Withdrawn: 975 by a.test and 190 by c.test. b.test's failed withdrawal came back.
     let held: Vec<u128> = [P, A, B, C]
         .into_iter()
         .map(|w| world.balance(&w.account()))

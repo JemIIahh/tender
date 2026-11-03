@@ -21,8 +21,8 @@ pub const MAX_REWARD_LIMIT: u128 = u128::MAX / 10_000;
 pub const MAX_WINNERS: u8 = 5;
 /// Most accounts a task may invite.
 pub const MAX_INVITED: usize = 20;
-/// Most funders a pooled bounty may have.
-#[allow(dead_code)]
+/// Most funders a pooled bounty may have, the poster among them. A void refunds each one in the
+/// same call, so this bounds its vault writes.
 pub const MAX_FUNDERS: usize = 50;
 /// Longest URI stored on chain.
 pub const MAX_URI_BYTES: usize = 256;
@@ -178,7 +178,9 @@ pub struct Task {
     pub reveal_count: u32,
     /// How many entries `cleanup` has removed so far.
     pub cleaned: u32,
-    /// Who paid the escrow, as `(account, amount)`, for refunds.
+    /// Who paid the escrow, as `(account, amount)`, for refunds: the poster first, then each
+    /// account that topped the task up, in the order of its first top-up, one record per account
+    /// and at most `MAX_FUNDERS`. The amounts add up to `reward`.
     pub funders: Vec<(AccountId, u128)>,
     /// `None` until the task is settled.
     pub outcome: Option<Outcome>,

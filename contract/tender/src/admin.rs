@@ -10,9 +10,9 @@
 //! predecessor, never the signer. None of them logs an event.
 //!
 //! None of them can change a balance, a task or an entry; the vault slots they add are empty. A
-//! pause or a disabled token refuses new tasks, and a disabled token refuses new deposits; neither
-//! stands in the way of `withdraw`, `pick`, `void_task` or `cleanup`, which look at neither the
-//! pause switch nor the allowlist.
+//! pause or a disabled token refuses new tasks and top-ups, and a disabled token refuses new
+//! deposits; neither stands in the way of `withdraw`, `pick`, `void_task` or `cleanup`, which look
+//! at neither the pause switch nor the allowlist.
 
 use near_sdk::json_types::U128;
 use near_sdk::{assert_one_yocto, env, near, AccountId};
@@ -53,10 +53,11 @@ impl Tender {
     /// the token's smallest unit, and `1 <= min_reward <= max_reward <= MAX_REWARD_LIMIT`
     /// (`E_REWARD`), so a task can never carry a zero reward, nor one too large to pick.
     ///
-    /// Disabling a token refuses new tasks and new deposits in it, and nothing else. Its balances
-    /// and the tasks already posted in it are untouched, and `withdraw`, `pick`, `void_task` and
-    /// `cleanup` do not look at the allowlist, so no money is ever trapped. Limits are checked at
-    /// posting only, so narrowing them leaves the tasks that exist as they are.
+    /// Disabling a token refuses new tasks, top-ups and new deposits in it, and nothing else. Its
+    /// balances and the tasks already posted in it are untouched, and `withdraw`, `pick`,
+    /// `void_task` and `cleanup` do not look at the allowlist, so no money is ever trapped. Limits
+    /// are checked when a task is posted or topped up, so narrowing them leaves the rewards of
+    /// the tasks that exist as they are, and only caps what a top-up may take them to.
     ///
     /// Also gives the treasury a vault slot for `token`, if it has none, because a pick pays the
     /// fee into it and settling must never need new storage. The owner pays for that slot and for
@@ -149,9 +150,10 @@ impl Tender {
         self.min_window_secs = min_window_secs;
     }
 
-    /// Pauses or resumes new tasks. While paused, `post_task` is refused (`E_PAUSED`). Nothing
-    /// else is paused, so a pause never traps money: deposits, withdrawals, commits, reveals,
-    /// picks, voids and cleanups all keep working. Requires 1 yoctoNEAR and the owner.
+    /// Pauses or resumes new money into tasks. While paused, `post_task` and `top_up_task` are
+    /// refused (`E_PAUSED`). Nothing else is paused, so a pause never traps money: deposits,
+    /// withdrawals, commits, reveals, picks, voids and cleanups all keep working. Requires 1
+    /// yoctoNEAR and the owner.
     #[payable]
     #[deny_unknown_arguments]
     pub fn set_paused(&mut self, paused: bool) {
@@ -454,6 +456,19 @@ mod tests {
 
     fn post(t: &mut Tender, task: PostTaskArgs) -> u64 {
         try_post(t, task).unwrap_or_else(|message| panic!("the post was rejected: {message}"))
+    }
+
+    /// `who` tops task `id` up by `amount` at `T1`, with 1 yoctoNEAR. `Err` holds the message the
+    /// contract panicked with.
+    fn try_top_up(t: &mut Tender, who: &str, id: u64, amount: u128) -> Result<(), String> {
+        testing_env!(ctx(who)
+            .attached_deposit(ONE_YOCTO)
+            .block_timestamp(T1)
+            .build());
+        match panic_message(|| t.top_up_task(U64(id), U128(amount))) {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
     }
 
     /// The work that `seed` stands for: its content hash and the salt it is committed with.
@@ -1185,6 +1200,11 @@ mod tests {
         assert_eq!(message, "E_PAUSED: posting new tasks is paused");
         assert_eq!(t.task_count(), U64(4));
         assert_eq!(balance(&t, USDC, "alice.test"), alice_before);
+        // So is a top-up of a task that is still open, and nothing moves either.
+        let message = try_top_up(&mut t, "alice.test", ids[2], 5).unwrap_err();
+        assert_eq!(message, "E_PAUSED: topping up tasks is paused");
+        assert_eq!(t.get_task(U64(ids[2])).unwrap().reward, U128(REWARD));
+        assert_eq!(balance(&t, USDC, "alice.test"), alice_before);
 
         // Everything else works. A deposit...
         assert_eq!(fund(&mut t, USDC, "alice.test", 5), 0);
@@ -1219,9 +1239,11 @@ mod tests {
         assert_eq!(t.get_task(U64(ids[2])).unwrap().outcome, None);
         assert!(t.get_config().paused);
 
-        // Unpausing lets new tasks in again.
+        // Unpausing lets new tasks and top-ups in again.
         as_owner(&mut t, |t| t.set_paused(false));
         assert_eq!(try_post(&mut t, args()), Ok(5));
+        assert_eq!(try_top_up(&mut t, "alice.test", ids[2], 5), Ok(()));
+        assert_eq!(t.get_task(U64(ids[2])).unwrap().reward, U128(REWARD + 5));
     }
 
     #[test]
@@ -1239,8 +1261,10 @@ mod tests {
         });
         assert!(!t.get_config().tokens[0].enabled);
 
-        // New tasks and new deposits in it are refused...
+        // New tasks, top-ups and new deposits in it are refused...
         let message = try_post(&mut t, args()).unwrap_err();
+        assert!(message.starts_with("E_TOKEN: "), "{message}");
+        let message = try_top_up(&mut t, "alice.test", to_void, 1).unwrap_err();
         assert!(message.starts_with("E_TOKEN: "), "{message}");
         assert_eq!(fund(&mut t, USDC, "alice.test", 7), 7);
 
