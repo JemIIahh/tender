@@ -64,7 +64,9 @@ export function TaskCard({
       {/* A token this app knows no decimals for: the amount in its smallest unit and the token's
           account, which can be long, on a line of their own and not where a figure is read. */}
       {known ? null : (
-        <p className={`mt-3 font-mono text-[11.5px] leading-snug wrap-anywhere ${soft}`}>
+        <p
+          className={`mt-3 font-mono text-[11.5px] leading-snug wrap-anywhere [&_*]:text-[11.5px] ${soft}`}
+        >
           <span className="sr-only">Reward: </span>
           <Amount value={task.reward} token={task.token} />
         </p>
