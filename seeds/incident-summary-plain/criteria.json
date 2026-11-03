@@ -1,7 +1,7 @@
 {
   "version": 1,
   "kind": "rubric",
-  "min_score": 70,
+  "min_score": 85,
   "split": "winner_take_all",
   "has_heldout": false,
   "rubric": [
@@ -19,19 +19,19 @@
     },
     {
       "criterion": "Says the fix was undoing the update (a rollback) and that checkout was back to normal by 09:30 UTC.",
-      "weight": 6
+      "weight": 8
     },
     {
       "criterion": "Names both follow-up steps: load testing before each release, and an alert when database capacity runs low.",
-      "weight": 6
+      "weight": 8
     },
     {
       "criterion": "Apologises once, sincerely, without excuses and without blaming any person or team.",
-      "weight": 4
+      "weight": 5
     },
     {
       "criterion": "Has 5 to 7 sentences and at most 140 words.",
-      "weight": 3
+      "weight": 2
     }
   ]
 }

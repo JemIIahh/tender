@@ -119,9 +119,9 @@ export const STAND_IN: Record<string, Check[][]> = {
       has(/audit/i),
     ],
     [
-      has(/\brecommend|should (?:quote|use)|\buse\b|quote|go with|trust|rely/i),
-      has(/447,?000|520,?000|600,?000/),
-      has(/audit/i),
+      // The figure it recommends is 447,000: it has to sit in the sentence that recommends.
+      has(/(?:recommend|should (?:quote|use)|go with|\bquote\b|\buse\b)[^.]*?447,?000/i),
+      has(/\baudit(?:ed)?\b/i),
       has(/because|since|comes from|rests on|\bwhy\b/i),
     ],
     [
@@ -161,12 +161,20 @@ export const STAND_IN: Record<string, Check[][]> = {
       has(
         /(?:recommend|choose|pick|select|go with)[^.]{0,40}northwind|northwind[^.]{0,40}(?:is recommended|is the (?:best|right) choice)/i,
       ),
-      has(/every requirement|all (?:the )?requirements|meets/i),
-    ],
-    [has(/1,?440/), has(/1,?500/), has(/under|below|within|less than|inside/i)],
-    [
+      // Northwind, and no other vendor, is the one said to meet the requirements.
       has(
-        /brightly[^.]*\b(?:no|lacks?|without|does not (?:have|offer|support)|doesn't (?:have|offer|support))\b[^.]*(?:sso|single sign-on)/i,
+        /northwind[^.]*?(?:every requirement|all (?:the )?requirements|meets)|(?:every requirement|all (?:the )?requirements)[^.]*northwind/i,
+      ),
+    ],
+    [
+      has(/1,?440/),
+      has(/1,?500/),
+      has(/(?:under|below|within|less than|inside)[^.]*(?:budget|1,?500)/i),
+    ],
+    [
+      // No SSO, or an uptime guarantee of 99.5% (below the 99.9% required), or both.
+      has(
+        /brightly[^.]*\b(?:no|lacks?|without|does not (?:have|offer|support)|doesn't (?:have|offer|support))\b[^.]*(?:sso|single sign-on)|brightly[^.]*?(?:99\.5|uptime)/i,
       ),
     ],
     [
@@ -213,6 +221,26 @@ export function standInGrader(slug: string, rubric: readonly { criterion: string
       const index = keys.indexOf(criterionKey(criterion));
       const score = standInScore(slug, index, entry);
       return { criterion, score, reason: `the stand-in checks gave ${score} out of 10` };
+    });
+    return { json: completion(JSON.stringify({ scores, addresses_grader: false })) };
+  };
+}
+
+/**
+ * A fake model server's handler that gives every criterion of `rubric` a 10 but one, the criterion
+ * at `dropped`, which it gives a 0, whatever the entry says. It shows what losing that one
+ * criterion, and no other, does to the score of an otherwise perfect entry, from the weights and
+ * the pass mark alone.
+ */
+export function dropOneGrader(
+  rubric: readonly { criterion: string }[],
+  dropped: number,
+): LlmHandler {
+  const droppedKey = criterionKey(rubric[dropped]?.criterion ?? "");
+  return (request) => {
+    const scores = criteriaOf(request).map(({ criterion }) => {
+      const score = criterionKey(criterion) === droppedKey ? 0 : 10;
+      return { criterion, score, reason: `${score} out of 10 by the drop-one grader` };
     });
     return { json: completion(JSON.stringify({ scores, addresses_grader: false })) };
   };

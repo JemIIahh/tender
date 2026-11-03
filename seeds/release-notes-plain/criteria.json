@@ -1,7 +1,7 @@
 {
   "version": 1,
   "kind": "rubric",
-  "min_score": 70,
+  "min_score": 85,
   "split": "winner_take_all",
   "has_heldout": false,
   "rubric": [

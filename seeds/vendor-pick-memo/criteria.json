@@ -1,7 +1,7 @@
 {
   "version": 1,
   "kind": "rubric",
-  "min_score": 70,
+  "min_score": 85,
   "split": "winner_take_all",
   "has_heldout": false,
   "rubric": [
@@ -14,24 +14,24 @@
       "weight": 8
     },
     {
-      "criterion": "Rules out Brightly because it has no SSO.",
-      "weight": 4
+      "criterion": "Rules out Brightly because it has no SSO, or because its 99.5% uptime guarantee is below the required 99.9%, or for both reasons.",
+      "weight": 5
     },
     {
       "criterion": "Rules out Dunmore because it offers no data export.",
-      "weight": 4
+      "weight": 5
     },
     {
       "criterion": "Rules out Cobalt because 30 seats would cost 1,650 dollars a month, over the budget.",
-      "weight": 4
+      "weight": 5
     },
     {
       "criterion": "Rules out Elmstead because its 99.0% uptime guarantee is below the required 99.9%.",
-      "weight": 4
+      "weight": 5
     },
     {
       "criterion": "Uses only facts and numbers from the table and the requirements, and invents no features.",
-      "weight": 4
+      "weight": 8
     },
     {
       "criterion": "Is 150 words or fewer.",

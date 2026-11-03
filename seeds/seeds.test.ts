@@ -25,8 +25,8 @@ import {
   sha256Hex,
 } from "@tender/shared";
 import { describe, expect, test } from "vitest";
-import { startFakeLlm } from "../packages/judge/test/fake-llm";
-import { STAND_IN, standInGrader, standInScore } from "./rubric-stand-in";
+import { type LlmHandler, startFakeLlm } from "../packages/judge/test/fake-llm";
+import { dropOneGrader, STAND_IN, standInGrader, standInScore } from "./rubric-stand-in";
 
 // Every seed task in seeds/<slug>/ is scored by the Judge's own scorers, so that a seed that pays
 // nobody (its solution misses the pass mark), pays everybody (its weak answer passes) or gives its
@@ -144,17 +144,18 @@ function load(slug: string) {
 }
 
 /**
- * A rubric answer scored as the Judge scores it: by `scoreRubric`, against a fake model server that
- * grades by the stand-in checks of the seed (rubric-stand-in.ts). The one entry is the only one
- * graded, so its score is the whole of the result.
+ * A rubric answer scored as the Judge scores it: by `scoreRubric`, against a fake model server
+ * that answers with `handler`. The one entry is the only one graded, so its score is the whole of
+ * the result.
  */
-async function scoreRubricAnswer(
+async function scoreRubricWith(
+  handler: LlmHandler,
   slug: string,
   brief: Brief,
   criteria: Extract<PublicCriteria, { kind: "rubric" }>,
   answer: Uint8Array,
 ): Promise<EntryScore> {
-  const llm = await startFakeLlm(standInGrader(slug, criteria.rubric));
+  const llm = await startFakeLlm(handler);
   const account = "solver.test.near";
   const result = await scoreRubric(criteria, brief, [{ account, text: utf8(answer) }], {
     baseUrl: llm.baseUrl,
@@ -163,9 +164,19 @@ async function scoreRubricAnswer(
   });
   const score = result.scores.get(account);
   if (result.failClosed || score === undefined) {
-    throw new Error(`the Judge could not score ${slug} with the stand-in grader: ${result.reason}`);
+    throw new Error(`the Judge could not score ${slug} with the fake grader: ${result.reason}`);
   }
   return score;
+}
+
+/** A rubric answer scored by the fake model server that grades by the seed's stand-in checks. */
+function scoreRubricAnswer(
+  slug: string,
+  brief: Brief,
+  criteria: Extract<PublicCriteria, { kind: "rubric" }>,
+  answer: Uint8Array,
+): Promise<EntryScore> {
+  return scoreRubricWith(standInGrader(slug, criteria.rubric), slug, brief, criteria, answer);
 }
 
 /**
@@ -1041,6 +1052,11 @@ const KNOWN_WRONG_TESTS: Record<string, { why: string; source: string }[]> = {
       source:
         '[redacted]',
     },
+    {
+      why: "[redacted]",
+      source:
+        '[redacted]',
+    },
   ],
   "latest-per-id": [
     {
@@ -1140,6 +1156,285 @@ describe.each(TESTS_SLUGS)("tests seed %s", (slug) => {
 
 const RUBRIC_SLUGS = SLUGS.filter((slug) => load(slug).criteria.kind === "rubric");
 
+/**
+ * The weight from which a criterion is one the task is about: an entry that loses it must not be
+ * paid, however well it does on the rest. With a pass mark of 85, losing a criterion of 16% of the
+ * weight or more puts the score under it.
+ */
+const HEAVY_WEIGHT = 8;
+
+/**
+ * For each rubric seed, entries that are the solution with one core element taken out or spoiled:
+ * `edits` are the changes to the text of the solution, each a piece that occurs once and what
+ * takes its place, and `drops` are the criteria (0-based, in the order of the rubric) that the
+ * entry loses, which the stand-in must score 5 or less. No such entry may reach the pass mark. A
+ * pass mark that the solution alone clears is not enough: an entry that gets the central point of
+ * the task wrong, or leaves it out, must fail it too.
+ */
+type Scenario = { why: string; drops: number[]; edits: [find: string, replace: string][] };
+const CORE_SCENARIOS: Record<string, Scenario[]> = {
+  "release-notes-plain": [
+    {
+      why: "[redacted]",
+      drops: [0],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [1],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [2],
+      edits: [
+        [
+          "[redacted]",
+          "",
+        ],
+      ],
+    },
+  ],
+  "plain-terms-rewrite": [
+    {
+      why: "[redacted]",
+      drops: [0],
+      edits: [["[redacted]", ""]],
+    },
+    {
+      why: "[redacted]",
+      drops: [1],
+      edits: [
+        [
+          "[redacted]",
+          "",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [2],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [3],
+      edits: [
+        [
+          "[redacted]",
+          "",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [4],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [5],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+  ],
+  "source-conflict-brief": [
+    {
+      why: "[redacted]",
+      drops: [0],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [1],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+        ["[redacted]", "[redacted]"],
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [2],
+      edits: [
+        [
+          "[redacted]",
+          "",
+        ],
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [3],
+      edits: [
+        [
+          "[redacted]",
+          "",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [3],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [5],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+  ],
+  "incident-summary-plain": [
+    {
+      why: "[redacted]",
+      drops: [0],
+      edits: [
+        [
+          "[redacted]",
+          "",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [1],
+      edits: [["[redacted]", ""]],
+    },
+    {
+      why: "[redacted]",
+      drops: [2],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [3],
+      edits: [
+        ["[redacted]", ""],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [4],
+      edits: [
+        [
+          "[redacted]",
+          "",
+        ],
+      ],
+    },
+  ],
+  "vendor-pick-memo": [
+    {
+      why: "[redacted]",
+      drops: [0],
+      edits: [
+        ["[redacted]", "[redacted]"],
+        ["[redacted]", "[redacted]"],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [1],
+      edits: [
+        [
+          "[redacted]",
+          "",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [6],
+      edits: [
+        [
+          "[redacted]",
+          "[redacted]",
+        ],
+      ],
+    },
+    {
+      why: "[redacted]",
+      drops: [2, 3],
+      edits: [
+        ["[redacted]", ""],
+        ["[redacted]", ""],
+      ],
+    },
+  ],
+};
+
+/** `solution` with each edit made once; a piece that is not there exactly once is a mistake. */
+function withEdits(solution: string, edits: Scenario["edits"]): string {
+  return edits.reduce((text, [find, replace]) => {
+    const pieces = text.split(find);
+    if (pieces.length !== 2) {
+      throw new Error(`"${find.slice(0, 50)}" occurs ${pieces.length - 1} times, not once`);
+    }
+    return pieces.join(replace);
+  }, solution);
+}
+
+/** The text between the BEGIN DATA and END DATA lines of a brief: the source the task works on. */
+function dataBlockOf(brief: Brief): string {
+  const match = /-----BEGIN DATA-----\n([\s\S]*)\n-----END DATA-----/.exec(brief.instructions);
+  if (match?.[1] === undefined) throw new Error("the brief has no data block");
+  return match[1];
+}
+
 describe.each(RUBRIC_SLUGS)("rubric seed %s", (slug) => {
   test("every_criterion_has_stand_in_checks_and_the_solution_meets_all_of_them", () => {
     const { criteria, solution } = load(slug);
@@ -1165,6 +1460,78 @@ describe.each(RUBRIC_SLUGS)("rubric seed %s", (slug) => {
       brief,
     });
     expect(nonsense.passed, "a one-word answer passes").toBe(false);
+  });
+
+  test("an_entry_that_loses_one_core_element_misses_the_pass_mark", async () => {
+    // The pass mark must stop an entry that leaves out, or gets wrong, the point of the task, and
+    // not only the weak answer. Each case is the solution with one such change.
+    const { brief, criteria, solution } = load(slug);
+    if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
+    const scenarios = CORE_SCENARIOS[slug] ?? [];
+    expect(scenarios.length, "core scenarios written for this seed").toBeGreaterThanOrEqual(3);
+
+    const text = utf8(solution);
+    const paid: string[] = [];
+    const notLost: string[] = [];
+    for (const { why, drops, edits } of scenarios) {
+      const entry = withEdits(text, edits);
+      const result = await scoreRubricAnswer(
+        slug,
+        brief,
+        criteria,
+        new TextEncoder().encode(entry),
+      );
+      if (result.score >= criteria.min_score) paid.push(`${why} (${result.score})`);
+      for (const index of drops) {
+        const score = standInScore(slug, index, entry);
+        if (score > 5) notLost.push(`${why}: criterion ${index + 1} still scores ${score}`);
+      }
+    }
+    expect(paid, "entries that lose a core element and still pass").toEqual([]);
+    expect(notLost, "scenarios that do not lose the criterion they name").toEqual([]);
+  });
+
+  test("losing_any_one_heavy_criterion_alone_misses_the_pass_mark", async () => {
+    // The weights and the pass mark by themselves: an entry that does perfectly on every
+    // criterion but one, which it loses altogether, is under the pass mark when that criterion is
+    // 8 or more of the weight. Every such criterion also has a scenario above.
+    const { brief, criteria } = load(slug);
+    if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
+    const heavy = criteria.rubric.flatMap(({ weight }, index) =>
+      weight >= HEAVY_WEIGHT ? [index] : [],
+    );
+    expect(heavy.length, "heavy criteria").toBeGreaterThanOrEqual(2);
+    const named = new Set((CORE_SCENARIOS[slug] ?? []).flatMap(({ drops }) => drops));
+    expect(
+      heavy.filter((index) => !named.has(index)),
+      "heavy criteria that no scenario loses",
+    ).toEqual([]);
+
+    const paid: string[] = [];
+    for (const index of heavy) {
+      const result = await scoreRubricWith(
+        dropOneGrader(criteria.rubric, index),
+        slug,
+        brief,
+        criteria,
+        new TextEncoder().encode("An entry that the fake grader scores without reading."),
+      );
+      if (result.score >= criteria.min_score) paid.push(`criterion ${index + 1} (${result.score})`);
+    }
+    expect(paid, "criteria whose loss alone still passes").toEqual([]);
+  });
+
+  test("the_source_text_pasted_back_is_not_paid", async () => {
+    // The laziest entry for a task that asks to rewrite or sum up a text is the text itself.
+    const { brief, criteria } = load(slug);
+    if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
+    const pasted = await scoreRubricAnswer(
+      slug,
+      brief,
+      criteria,
+      new TextEncoder().encode(dataBlockOf(brief)),
+    );
+    expect(pasted.passed, `the source pasted back scores ${pasted.score}`).toBe(false);
   });
 
   test("the_brief_tells_the_solver_how_the_answer_is_graded", () => {
