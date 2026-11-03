@@ -5,6 +5,7 @@ import { DitherArt } from "../components/landing/DitherArt";
 import { Stepper } from "../components/landing/Stepper";
 import { Ticker } from "../components/landing/Ticker";
 import { TypedCode } from "../components/landing/TypedCode";
+import { Mark } from "../components/Mark";
 import type { ArtName } from "../lib/scenes";
 
 // The landing: what Tender is, in a few words over moving art, and the ways in. It has its own top
@@ -17,17 +18,6 @@ export const metadata: Metadata = {
 
 const PILL =
   "inline-flex min-h-11 items-center justify-center rounded-full px-6 font-mono text-xs tracking-[0.12em] uppercase transition-colors motion-reduce:transition-none";
-
-function Mark() {
-  // A wax seal.
-  return (
-    <svg viewBox="0 0 24 24" className="size-6" aria-hidden="true">
-      <circle cx="12" cy="12" r="11" className="fill-seal" />
-      <circle cx="12" cy="12" r="6.5" fill="none" strokeWidth="1.6" className="stroke-ink" />
-      <circle cx="12" cy="12" r="2.2" className="fill-ink" />
-    </svg>
-  );
-}
 
 function TopBar() {
   return (

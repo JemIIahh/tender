@@ -22,15 +22,26 @@
   }
 }
 
-/* ---- The landing ---------------------------------------------------------------------------- */
+/* ---- The landing and the app ------------------------------------------------------------------ */
 
-/* On the dark page the ring is bone, and on its light cards it is ink again. */
-.landing :focus-visible {
+/* On the dark page the ring is bone, and on its light cards it is ink again. The app's pages
+   (app/(app)/layout.tsx) are on the same ground as the landing and take the same ring. */
+.landing :focus-visible,
+.app :focus-visible {
   outline: 2px solid var(--color-bone);
   outline-offset: 3px;
 }
-.landing .on-paper :focus-visible {
+.landing .on-paper :focus-visible,
+.app .on-paper :focus-visible {
   outline-color: var(--color-ink);
+}
+
+/* The browser draws the app's own controls (a select's list, a scrollbar, a date picker) dark. */
+.app {
+  color-scheme: dark;
+}
+.app .on-paper {
+  color-scheme: light;
 }
 
 /* Fine scanlines over the art. */

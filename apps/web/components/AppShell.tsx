@@ -1,0 +1,123 @@
+"use client";
+
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { type ReactNode, useEffect, useId, useState } from "react";
+import { Mark } from "./Mark";
+import { Nav } from "./Nav";
+import { PlatformStats } from "./PlatformStats";
+import { PRIMARY, SECONDARY } from "./ui";
+
+/** The pills of the top bar: the landing's, a little smaller so that both fit a phone. */
+const BAR_PILL = "min-h-10 px-3.5 whitespace-nowrap sm:px-4";
+
+function Wordmark() {
+  return (
+    <Link
+      href="/"
+      className="flex min-h-10 items-center gap-2.5 rounded-lg text-lg font-semibold tracking-tight text-bone"
+    >
+      <Mark />
+      {/* On a phone the top bar has room for the mark only; the name is still the link's. */}
+      <span className="max-sm:sr-only">Tender</span>
+    </Link>
+  );
+}
+
+/**
+ * The frame of every page after the landing: a sidebar with the pages and a few live figures, a
+ * top bar with "Post task" and the way to the wallet, and the page itself. On a phone the sidebar
+ * is a menu that the top bar opens, over the page, and that closes when a page is chosen.
+ *
+ * The top bar comes first in the document, so that on a phone the open menu is the next thing the
+ * keyboard reaches after the button that opened it.
+ */
+export function AppShell({ children }: { children: ReactNode }) {
+  const pathname = usePathname();
+  const menuId = useId();
+  // The page the menu was opened on. It is open only there: choosing a page closes it.
+  const [openOn, setOpenOn] = useState<string | null>(null);
+  const open = openOn === pathname;
+
+  // Escape closes the menu, as it closes any menu.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenOn(null);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  return (
+    <div className="app min-h-svh bg-ink text-bone lg:grid lg:grid-cols-[15rem_minmax(0,1fr)] lg:grid-rows-[auto_1fr]">
+      <a
+        href="#main"
+        className="sr-only z-50 rounded-full bg-bone px-4 py-2 font-mono text-[11px] tracking-[0.12em] text-ink uppercase focus:not-sr-only focus:fixed focus:top-3 focus:left-3"
+      >
+        Skip to the page
+      </a>
+
+      {/* From laptop width up, the sidebar's edge is the left border of the top bar and the page,
+          which run the whole height of the page, where the sticky sidebar ends at the screen's. */}
+      <header className="sticky top-0 z-30 flex h-16 items-center gap-2 border-b border-line bg-ink/90 px-4 backdrop-blur-sm sm:px-8 lg:col-start-2 lg:row-start-1 lg:border-l">
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-controls={menuId}
+          onClick={() => setOpenOn(open ? null : pathname)}
+          className="-ml-2 grid size-10 place-items-center rounded-lg text-bone lg:hidden"
+        >
+          <span className="sr-only">Menu</span>
+          <svg
+            viewBox="0 0 16 16"
+            aria-hidden="true"
+            className="size-5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+          >
+            {open ? (
+              <path d="M3.5 3.5l9 9M12.5 3.5l-9 9" />
+            ) : (
+              <path d="M2 4.5h12M2 8h12M2 11.5h12" />
+            )}
+          </svg>
+        </button>
+        <div className="lg:hidden">
+          <Wordmark />
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <Link href="/post" className={`${PRIMARY} ${BAR_PILL}`}>
+            Post task
+          </Link>
+          <Link href="/wallet" className={`${SECONDARY} ${BAR_PILL}`}>
+            Connect wallet
+          </Link>
+        </div>
+      </header>
+
+      <aside
+        id={menuId}
+        data-open={open}
+        className="fixed inset-x-0 top-16 bottom-0 z-20 hidden flex-col gap-8 overflow-y-auto border-t border-line bg-ink px-4 pt-6 pb-8 data-[open=true]:flex sm:px-8 lg:sticky lg:top-0 lg:col-start-1 lg:row-span-2 lg:row-start-1 lg:flex lg:h-svh lg:border-t-0 lg:px-3 lg:pt-0 lg:pb-6"
+      >
+        <div className="hidden h-16 shrink-0 items-center px-2 lg:flex">
+          <Wordmark />
+        </div>
+        <Nav />
+        <div className="mt-auto border-t border-line px-3 pt-5">
+          <PlatformStats />
+        </div>
+      </aside>
+
+      <main
+        id="main"
+        className="min-w-0 border-line px-4 pt-8 pb-16 sm:px-8 lg:col-start-2 lg:row-start-2 lg:border-l"
+      >
+        {children}
+      </main>
+    </div>
+  );
+}
