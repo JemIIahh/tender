@@ -20,7 +20,9 @@
 //! that money paid to the wrong account shows, and money in an account the harness does not know
 //! of; that `ft_on_transfer` never panics (I8); that a pick, an empty pick or a void that the
 //! rules allow always goes through, `void_task` from the fallback deadline on among them (I4), and
-//! so do a withdrawal that the balance covers and a top-up that the rules allow; that a task's
+//! so do a withdrawal that the balance covers and a top-up that the rules allow, and that no other
+//! settlement or top-up does; that every rejection panics with an `E_` code, so that a crash
+//! cannot pass for a rule; that a task's
 //! `reveal_count` is its number of reveals; that its funders are the poster and then each account
 //! that topped it up, in that order, each with what it paid in, adding up to its reward, so that
 //! an empty pick or a void refunds each of them exactly that; and that every rejected call leaves
@@ -323,6 +325,12 @@ impl World {
             changed.is_empty() && usage_after == usage,
             "a rejected call changed the state: {who} was rejected with {message:?}, but changed \
              the keys {changed:?}, and the storage usage from {usage} to {usage_after}"
+        );
+        // Every rule the contract checks panics with a code. Anything else, such as an overflow,
+        // an `unwrap` or an index out of bounds, is a crash that only looks like a rejection.
+        prop_assert!(
+            message.starts_with("E_"),
+            "{who}'s call panicked without an error code, which is a crash, not a rule: {message:?}"
         );
         Ok(Err(message))
     }
@@ -717,6 +725,14 @@ impl World {
             return Ok(result);
         }
         prop_assert_eq!(settled, Some(false), "I2: task {} was settled again", task);
+        // Both ways: what went through is what the rules allow (I3, I6 and the windows).
+        prop_assert!(
+            allowed,
+            "task {} ({:?}) was settled by {}, which the rules forbid",
+            task,
+            phase,
+            caller
+        );
         let Some(outcome) = self.view(|t| t.get_task(U64(task)).and_then(|v| v.outcome)) else {
             return Err(TestCaseError::fail(format!(
                 "task {task} was settled but has no outcome"

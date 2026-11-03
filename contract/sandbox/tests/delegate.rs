@@ -22,9 +22,7 @@ const TOTAL: u128 = 10_000;
 const SPEND: u128 = 4_000;
 /// The methods the agent's function-call key may call.
 const AGENT_METHODS: [&str; 4] = ["post_task", "top_up_task", "commit", "reveal"];
-/// The gas the client attaches to each call.
-const POST_GAS: Gas = Gas::from_tgas(30);
-const TOP_UP_GAS: Gas = Gas::from_tgas(20);
+/// The gas the client attaches to `add_delegate` and `remove_delegate`. The others are in `common`.
 const DELEGATE_GAS: Gas = Gas::from_tgas(15);
 const AUTH_MESSAGE: &str = "E_AUTH: attach exactly 1 yoctoNEAR or use a delegate key within caps";
 const ONE_YOCTO_MESSAGE: &str = "Requires attached deposit of exactly 1 yoctoNEAR";
@@ -98,7 +96,7 @@ async fn post_as(env: &Env, key: &Account, reward: u128) -> anyhow::Result<Execu
     Ok(key
         .call(env.tender.id(), "post_task")
         .args_json(json!({ "task": task }))
-        .gas(POST_GAS)
+        .gas(POST_TASK_GAS)
         .transact()
         .await?)
 }
@@ -113,7 +111,7 @@ async fn top_up_as(
     Ok(key
         .call(env.tender.id(), "top_up_task")
         .args_json(json!({ "task_id": task_id.to_string(), "amount": amount.to_string() }))
-        .gas(TOP_UP_GAS)
+        .gas(TOP_UP_TASK_GAS)
         .transact()
         .await?)
 }

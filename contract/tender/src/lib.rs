@@ -161,6 +161,101 @@ mod tests {
         );
     }
 
+    /// The storage layout as it is frozen (ruling R33): the collections' prefixes, the Borsh tags
+    /// of the stored enums, a fresh contract's root state and a task record, byte for byte. Once
+    /// deployed, any of these may change only together with a `migrate` that reads the old form.
+    /// A failure here means a change moved the layout: undo it, or write that migration and then
+    /// update the pins.
+    #[test]
+    fn storage_layout_is_pinned() {
+        use near_sdk::{borsh, env, AccountId};
+
+        use crate::types::{Outcome, Payout, Task, VoidReason};
+        use crate::StorageKey;
+
+        let acct = |id: &str| id.parse::<AccountId>().unwrap();
+        let prefixes = [
+            StorageKey::Tokens,
+            StorageKey::Vault,
+            StorageKey::Storage,
+            StorageKey::Tasks,
+            StorageKey::Entries,
+            StorageKey::EntrantAt,
+            StorageKey::Agents,
+            StorageKey::Delegates,
+        ];
+        for (tag, key) in prefixes.iter().enumerate() {
+            assert_eq!(borsh::to_vec(key).unwrap(), [tag as u8], "prefix {tag}");
+        }
+        for (tag, reason) in [
+            VoidReason::NoReveals,
+            VoidReason::NoAward,
+            VoidReason::Expired,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(borsh::to_vec(reason).unwrap(), [tag as u8], "{reason:?}");
+        }
+        let voided = Outcome::Voided {
+            reason: VoidReason::Expired,
+            scorecard_hash: None,
+            scorecard_uri: None,
+        };
+        assert_eq!(borsh::to_vec(&voided).unwrap(), [1, 2, 0, 0]);
+
+        testing_env!(ctx("owner.test").build());
+        let fresh = Tender::new(acct("owner.test"), acct("treasury.test"), 500, 60);
+        assert_eq!(hex::encode(borsh::to_vec(&fresh).unwrap()), FRESH_STATE);
+
+        let task = Task {
+            id: 7,
+            poster: acct("poster.test"),
+            token: acct("usdc.test"),
+            reward: 1_000_000,
+            fee_bps: 500,
+            brief_uri: "ipfs://brief".to_string(),
+            brief_hash: [1; 32],
+            criteria_hash: [2; 32],
+            heldout_commitment: Some([3; 32]),
+            verifier: acct("judge.test"),
+            created_at: 10,
+            commit_deadline: 20,
+            reveal_deadline: 30,
+            pick_deadline: 40,
+            fallback_deadline: 50,
+            max_entries: 2,
+            max_winners: 1,
+            invited: vec![acct("bob.test"), acct("carol.test")],
+            parent: Some(3),
+            commit_count: 2,
+            reveal_count: 1,
+            cleaned: 0,
+            funders: vec![(acct("poster.test"), 900_000), (acct("bob.test"), 100_000)],
+            outcome: Some(Outcome::Picked {
+                winners: vec![Payout {
+                    account: acct("bob.test"),
+                    bps: 10_000,
+                    amount: 950_000,
+                }],
+                fee: 50_000,
+                scorecard_hash: [4; 32],
+                scorecard_uri: "ipfs://scorecard".to_string(),
+            }),
+        };
+        let encoded = borsh::to_vec(&task).unwrap();
+        let digest = hex::encode(env::sha256(&encoded));
+        assert_eq!((encoded.len(), digest.as_str()), TASK_RECORD);
+    }
+
+    /// `storage_layout_is_pinned`'s fresh contract, hex-encoded.
+    const FRESH_STATE: &str = "01000a0000006f776e65722e74657374000d00000074726561737572792e74657374f4013c0000000001000000000000000000000002000000007602000000006d0100000001010000000201000000030100000004010000000501000000060100000007";
+    /// `storage_layout_is_pinned`'s task record: its length and the SHA-256 of its encoding.
+    const TASK_RECORD: (usize, &str) = (
+        444,
+        "88e61c51eaf368c7f13e662de31431982f7a53555e8ce8a13621e06a1f33212a",
+    );
+
     #[test]
     fn new_accepts_min_window_bounds() {
         testing_env!(ctx("owner.test").build());

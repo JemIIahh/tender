@@ -18,9 +18,6 @@ use serde_json::json;
 const SHARE: u128 = 1_000;
 /// The most funders a task may have, the poster among them.
 const MAX_FUNDERS: usize = 50;
-/// The gas the client attaches to a top-up and to a void.
-const TOP_UP_GAS: Gas = Gas::from_tgas(20);
-const VOID_GAS: Gas = Gas::from_tgas(60);
 /// What a void of fifty funders may burn, in Tgas (plan 01, Task 13).
 const VOID_BUDGET_TGAS: f64 = 100.0;
 
@@ -29,8 +26,8 @@ fn tgas(r: &ExecutionFinalResult) -> f64 {
     r.total_gas_burnt.as_gas() as f64 / 1e12
 }
 
-/// `who`'s `top_up_task` of `amount` into task `task_id`, with 1 yocto and `TOP_UP_GAS` attached:
-/// the raw result.
+/// `who`'s `top_up_task` of `amount` into task `task_id`, with 1 yocto and `TOP_UP_TASK_GAS`
+/// attached: the raw result.
 async fn top_up(
     env: &Env,
     who: &Account,
@@ -41,7 +38,7 @@ async fn top_up(
         .call(env.tender.id(), "top_up_task")
         .args_json(json!({ "task_id": task_id.to_string(), "amount": amount.to_string() }))
         .deposit(ONE_YOCTO)
-        .gas(TOP_UP_GAS)
+        .gas(TOP_UP_TASK_GAS)
         .transact()
         .await?)
 }
@@ -101,7 +98,7 @@ mod pooled {
                     .call(env.tender.id(), "top_up_task")
                     .args_json(json!({ "task_id": id.to_string(), "amount": SHARE.to_string() }))
                     .deposit(ONE_YOCTO)
-                    .gas(TOP_UP_GAS);
+                    .gas(TOP_UP_TASK_GAS);
                 async move { anyhow::Ok(tx.transact().await?) }
             })
             .collect();
@@ -168,7 +165,7 @@ mod pooled {
             .carol
             .call(env.tender.id(), "void_task")
             .args_json(json!({ "task_id": id.to_string() }))
-            .gas(VOID_GAS)
+            .gas(VOID_TASK_GAS)
             .transact()
             .await?;
         let r = clean(r)?;
@@ -216,10 +213,12 @@ mod pooled {
         );
         println!("void_task, {MAX_FUNDERS} funders (attached 60): {void_tgas:.2}");
         println!();
+        // The call attaches `VOID_TASK_GAS`, 60 Tgas, and `clean` above already fails a call that
+        // runs out of it, so 60 is the bound in effect; this states the plan's budget.
         assert!(
-        void_tgas < VOID_BUDGET_TGAS,
-        "void_task with {MAX_FUNDERS} funders burnt {void_tgas:.2} Tgas, the budget is under {VOID_BUDGET_TGAS}"
-    );
+            void_tgas < VOID_BUDGET_TGAS,
+            "void_task with {MAX_FUNDERS} funders burnt {void_tgas:.2} Tgas, over {VOID_BUDGET_TGAS}"
+        );
         Ok(())
     }
 }

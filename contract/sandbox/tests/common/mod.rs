@@ -27,7 +27,7 @@ pub use calls::*;
 pub use checks::*;
 pub use setup::*;
 
-use near_workspaces::types::NearToken;
+use near_workspaces::types::{Gas, NearToken};
 use sha2::{Digest, Sha256};
 
 pub const TENDER_WASM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/tender.wasm");
@@ -45,6 +45,13 @@ pub const MINTED: u128 = 1_000_000_000;
 pub const WINDOW_SECS: u32 = 120;
 /// The protocol fee `setup` configures, in basis points.
 pub const FEE_BPS: u16 = 500;
+
+/// The gas the TypeScript client attaches to these calls (`GAS` in packages/shared/src/calls.ts),
+/// in one place, so that the suites that send a call with it, and so show that the client's
+/// figure is enough, all follow a change to it.
+pub const POST_TASK_GAS: Gas = Gas::from_tgas(30);
+pub const TOP_UP_TASK_GAS: Gas = Gas::from_tgas(20);
+pub const VOID_TASK_GAS: Gas = Gas::from_tgas(60);
 
 /// The fee a pick takes from `reward` at `FEE_BPS`, rounded down as the contract does.
 pub fn fee_of(reward: u128) -> u128 {
