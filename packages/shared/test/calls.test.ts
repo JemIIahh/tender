@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 import {
   addDelegateCall,
+  claimAgentBondCall,
   cleanupCall,
   commitCall,
   computeCommitment,
@@ -15,6 +16,8 @@ import {
   registerAgentCall,
   removeDelegateCall,
   revealCall,
+  setAgentBondCall,
+  setAgentBondCooldownCall,
   sha256Hex,
   storageDepositCall,
   storageWithdrawCall,
@@ -22,6 +25,7 @@ import {
   toConnectorAction,
   tokenStorageDepositCall,
   topUpTaskCall,
+  unregisterAgentCall,
   voidTaskCall,
   withdrawCall,
 } from "../src/index";
@@ -355,7 +359,51 @@ function wire(): { name: string; call: TenderCall; expected: TenderCall }[] {
           tags: ["rust", "audit"],
         },
         gas: 15n * TERA,
-        deposit: 0n,
+        deposit: 1n,
+      },
+    },
+    {
+      name: "unregisterAgentCall",
+      call: unregisterAgentCall(TENDER),
+      expected: {
+        receiverId: TENDER,
+        methodName: "unregister_agent",
+        args: {},
+        gas: 15n * TERA,
+        deposit: 1n,
+      },
+    },
+    {
+      name: "claimAgentBondCall",
+      call: claimAgentBondCall(TENDER),
+      expected: {
+        receiverId: TENDER,
+        methodName: "claim_agent_bond",
+        args: {},
+        gas: 15n * TERA,
+        deposit: 1n,
+      },
+    },
+    {
+      name: "setAgentBondCall",
+      call: setAgentBondCall(TENDER, TOKEN, U128_MAX),
+      expected: {
+        receiverId: TENDER,
+        methodName: "set_agent_bond",
+        args: { token: TOKEN, amount: "340282366920938463463374607431768211455" },
+        gas: 15n * TERA,
+        deposit: 1n,
+      },
+    },
+    {
+      name: "setAgentBondCooldownCall",
+      call: setAgentBondCooldownCall(TENDER, 3_600),
+      expected: {
+        receiverId: TENDER,
+        methodName: "set_agent_bond_cooldown",
+        args: { secs: "3600" },
+        gas: 15n * TERA,
+        deposit: 1n,
       },
     },
     {
@@ -500,6 +548,14 @@ test("spend_calls_attach_one_yocto", () => {
     depositCall(TOKEN, TENDER, 10n, BOB),
     addDelegateCall(TENDER, PUBLIC_KEY, TOKEN, 1n, 2n),
     removeDelegateCall(TENDER, PUBLIC_KEY),
+    // The agent bond (contract Task 16b): registering and the way out take exactly 1 yoctoNEAR,
+    // which is why no function-call key, a delegate key among them, can send them. The owner's two
+    // setters take it too.
+    registerAgentCall(TENDER, "ipfs://profile", PROFILE_HASH, []),
+    unregisterAgentCall(TENDER),
+    claimAgentBondCall(TENDER),
+    setAgentBondCall(TENDER, TOKEN, 1n),
+    setAgentBondCooldownCall(TENDER, 5),
   ];
   for (const call of spends) {
     expect(call.deposit, `${call.receiverId}.${call.methodName}`).toBe(ONE_YOCTO);
@@ -537,20 +593,37 @@ test("commit_reveal_pick_attach_zero", () => {
     pickCall(TENDER, 1n, [], SCORECARD_HASH, "ipfs://scorecard"),
     voidTaskCall(TENDER, 1n),
     cleanupCall(TENDER, 1n),
-    registerAgentCall(TENDER, "ipfs://profile", PROFILE_HASH, []),
   ];
   for (const call of free) {
     expect(call.deposit, `${call.receiverId}.${call.methodName}`).toBe(0n);
   }
 });
 
+test("bond_calls_have_no_delegate_form", () => {
+  // A delegate key is a function-call key and attaches no deposit, but the contract takes
+  // registering, unregistering and claiming with exactly 1 yoctoNEAR and no key that cannot attach
+  // it. So these builders take no `SpendOptions`: a `delegate: true` slipped past the types (a
+  // plain JS caller, a value from elsewhere) changes nothing, and the call still attaches 1.
+  const asAny = (builder: unknown, ...args: unknown[]) =>
+    (builder as (...a: unknown[]) => TenderCall)(...args);
+  const opts = { delegate: true };
+  const calls = [
+    asAny(registerAgentCall, TENDER, "ipfs://profile", PROFILE_HASH, [], opts),
+    asAny(unregisterAgentCall, TENDER, opts),
+    asAny(claimAgentBondCall, TENDER, opts),
+  ];
+  for (const call of calls) {
+    expect(call.deposit, call.methodName).toBe(ONE_YOCTO);
+  }
+});
+
 // What the builders send.
 
 test("every_builder_sends_the_expected_call", () => {
-  // The table has all fifteen builders: Tender's thirteen and the two token calls. One of those
+  // The table has all nineteen builders: Tender's seventeen and the two token calls. One of those
   // has Tender's method name `storage_deposit`, so the receiver is part of the key.
   const covered = new Set(wire().map(({ call }) => `${call.receiverId} ${call.methodName}`));
-  expect(covered.size).toBe(15);
+  expect(covered.size).toBe(19);
   for (const { name, call, expected } of wire()) {
     expect(call, name).toStrictEqual(expected);
   }
@@ -570,6 +643,10 @@ test("gas_is_in_gas_units", () => {
     storageDeposit: 10n * TERA,
     storageWithdraw: 15n * TERA,
     registerAgent: 15n * TERA,
+    unregisterAgent: 15n * TERA,
+    claimAgentBond: 15n * TERA,
+    setAgentBond: 15n * TERA,
+    setAgentBondCooldown: 15n * TERA,
     ftTransferCall: 100n * TERA,
     tokenStorageDeposit: 10n * TERA,
     addDelegate: 15n * TERA,

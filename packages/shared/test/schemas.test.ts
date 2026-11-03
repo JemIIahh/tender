@@ -162,6 +162,68 @@ test("agent_view_accepts_agent_without_provider_derived", () => {
   expect(AgentViewSchema.parse(solo)).toEqual(solo);
 });
 
+// The agent bond (contract Task 16b). The sample is an active agent that paid a bond; what the
+// contract's views show of the other two states, and of an agent that paid none, is derived from it
+// (the shapes were seen on a sandbox: unregistering has `claimable_at`, retired has no bond left).
+test("agent_view_shows_each_status_of_the_bond_derived", () => {
+  const active = sample("agent_view");
+  expect(active).toMatchObject({ status: "active", claimable_at: null });
+  expect(active.bond_token).not.toBeNull();
+  expect(active.bond_amount).not.toBeNull();
+
+  const unregistering = { ...active, status: "unregistering", claimable_at: "1793745956336648000" };
+  expect(AgentViewSchema.parse(unregistering)).toEqual(unregistering);
+
+  const retired = { ...active, status: "retired", bond_token: null, bond_amount: null };
+  expect(AgentViewSchema.parse(retired)).toEqual(retired);
+
+  // An agent that registered before the owner set a bond has none, and is active all the same.
+  const unbonded = { ...active, bond_token: null, bond_amount: null };
+  expect(AgentViewSchema.parse(unbonded)).toEqual(unbonded);
+});
+
+test("agent_view_status_is_one_of_the_contracts_three", () => {
+  const agent = sample("agent_view");
+  for (const status of ["active", "unregistering", "retired"]) {
+    expect(accepts(AgentViewSchema, { ...agent, status }), status).toBe(true);
+  }
+  for (const status of ["Active", "unregistered", "bonded", "", null, 1]) {
+    expect(failures(AgentViewSchema, { ...agent, status }), String(status)).toEqual(["status"]);
+  }
+  // The fields are always there: a view without one is another contract's, not an agent in a state.
+  for (const field of ["status", "bond_token", "bond_amount", "claimable_at"]) {
+    expect(failures(AgentViewSchema, { ...agent, [field]: undefined }), field).toEqual([field]);
+  }
+});
+
+test("agent_view_bond_fields_follow_the_contracts_types", () => {
+  const agent = sample("agent_view");
+  // The amount is a u128 and `claimable_at` a u64, both decimal strings, never numbers.
+  expect(failures(AgentViewSchema, { ...agent, bond_amount: 1_000_000 })).toEqual(["bond_amount"]);
+  expect(failures(AgentViewSchema, { ...agent, claimable_at: 5 })).toEqual(["claimable_at"]);
+  expect(accepts(AgentViewSchema, { ...agent, bond_amount: U128_MAX })).toBe(true);
+  expect(accepts(AgentViewSchema, { ...agent, claimable_at: U64_MAX })).toBe(true);
+  expect(accepts(AgentViewSchema, { ...agent, claimable_at: "18446744073709551616" })).toBe(false);
+  expect(failures(AgentViewSchema, { ...agent, bond_token: "Token" })).toEqual(["bond_token"]);
+});
+
+test("config_view_shows_no_bond_until_the_owner_sets_one_derived", () => {
+  const config = sample("config_view");
+  expect(config.agent_bond_token).not.toBeNull();
+  const unset = { ...config, agent_bond_token: null, agent_bond_amount: null };
+  expect(ConfigViewSchema.parse(unset)).toEqual(unset);
+  // The cooldown is always there, a u64 of seconds as a decimal string.
+  expect(failures(ConfigViewSchema, { ...config, agent_bond_cooldown_secs: 5 })).toEqual([
+    "agent_bond_cooldown_secs",
+  ]);
+  expect(failures(ConfigViewSchema, { ...config, agent_bond_cooldown_secs: undefined })).toEqual([
+    "agent_bond_cooldown_secs",
+  ]);
+  expect(failures(ConfigViewSchema, { ...config, agent_bond_amount: 1_000_000 })).toEqual([
+    "agent_bond_amount",
+  ]);
+});
+
 test("config_view_accepts_pending_owner_derived", () => {
   // Derived: while an ownership transfer waits for acceptance, and with the contract paused.
   const handover = {
@@ -332,8 +394,11 @@ const WIDTHS: Array<[view: string, path: string, width: "u64" | "u128"]> = [
   ["entry_view", "committed_at_block", "u64"],
   ["agent_view", "registered_at", "u64"],
   ["agent_view", "earned.0.amount", "u128"],
+  ["agent_view", "bond_amount", "u128"],
   ["config_view", "tokens.0.min_reward", "u128"],
   ["config_view", "tokens.0.max_reward", "u128"],
+  ["config_view", "agent_bond_amount", "u128"],
+  ["config_view", "agent_bond_cooldown_secs", "u64"],
   ["storage_view", "total", "u128"],
   ["storage_view", "available", "u128"],
   ["storage_view", "used_bytes", "u64"],
@@ -511,7 +576,12 @@ const NULLABLE = new Set([
   "entry_view.content_hash",
   "entry_view.uri",
   "agent_view.asp",
+  "agent_view.bond_token",
+  "agent_view.bond_amount",
+  "agent_view.claimable_at",
   "config_view.pending_owner",
+  "config_view.agent_bond_token",
+  "config_view.agent_bond_amount",
 ]);
 
 test("only_option_fields_accept_null", () => {

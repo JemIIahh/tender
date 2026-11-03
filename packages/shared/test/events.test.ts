@@ -11,8 +11,9 @@ import { edited, type Json, keyPaths, leaves, members, type Path } from "./json-
 
 // Fixtures: test/fixtures/events/<event>.log holds one NEP-297 log line per event.
 //
-// - CAPTURED: the ten events the contract emits today were captured from the real wasm on a
-//   sandbox. They are used unmodified.
+// - CAPTURED: the ten events the contract emitted when this was first written were captured from
+//   the real wasm on a sandbox, and the three of the agent bond (Task 16b) from a later build of
+//   it, on a sandbox too. They are used unmodified.
 // - HAND_WRITTEN: the other four were written by hand from the plan 01 task text, because the
 //   contract does not emit them yet: task_topped_up (Task 13), delegate_added and delegate_removed
 //   (Task 15), and attested_pick (Task 17). When a task lands, replace its file with a captured
@@ -21,7 +22,10 @@ import { edited, type Json, keyPaths, leaves, members, type Path } from "./json-
 //   maximum value) is a copy of a real fixture with only the listed fields changed. Nothing is
 //   written from scratch.
 const CAPTURED = [
+  "agent_bond_claimed",
+  "agent_bonded",
   "agent_registered",
+  "agent_unregistering",
   "committed",
   "deposit",
   "picked",
@@ -91,7 +95,7 @@ test("parses_each_event_fixture", () => {
   }
 });
 
-test("schema_covers_exactly_the_fourteen_events", () => {
+test("schema_covers_exactly_the_seventeen_events", () => {
   const names = TenderEventSchema.options.map((option) => option.shape.event.value);
   expect(names.sort()).toEqual(EVENT_NAMES);
 });
@@ -141,6 +145,13 @@ const DERIVED: Derived[] = [
     label: "derived_agent_registered_update",
     from: "agent_registered",
     patch: { updated: true },
+  },
+  {
+    // An agent that registered before the owner set a bond has none to claim: the contract logs a
+    // null token and the amount "0" (Task 16b).
+    label: "derived_agent_bond_claimed_by_an_agent_that_never_paid_one",
+    from: "agent_bond_claimed",
+    patch: { token: null, amount: "0" },
   },
   {
     label: "derived_committed_replacing_an_earlier_commitment",
@@ -323,6 +334,7 @@ test("other_fields_reject_the_wrong_json_type", () => {
 const U64_KEYS = new Set([
   "id",
   "task_id",
+  "claimable_at",
   "created_at",
   "commit_deadline",
   "reveal_deadline",
@@ -418,8 +430,9 @@ test("account_fields_must_be_near_account_ids", () => {
 
 // The Option<T> fields of the contract's events, written `<event>.<path>`: the only places a null
 // is valid. `by` and the scorecard are null after `void_task`, and `asp` for an account that has no
-// provider.
+// provider. `agent_bond_claimed.token` is null for an agent that never paid a bond.
 const NULLABLE = new Set([
+  "agent_bond_claimed.token",
   "agent_registered.asp",
   "task_created.heldout_commitment",
   "task_created.parent",

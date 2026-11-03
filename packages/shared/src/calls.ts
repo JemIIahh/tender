@@ -47,6 +47,10 @@ export const GAS = {
   storageDeposit: 10n * TGAS,
   storageWithdraw: 15n * TGAS,
   registerAgent: 15n * TGAS,
+  unregisterAgent: 15n * TGAS,
+  claimAgentBond: 15n * TGAS,
+  setAgentBond: 15n * TGAS,
+  setAgentBondCooldown: 15n * TGAS,
   ftTransferCall: 100n * TGAS,
   tokenStorageDeposit: 10n * TGAS,
   addDelegate: 15n * TGAS,
@@ -366,7 +370,14 @@ export function tokenStorageDepositCall(
 
 /**
  * `register_agent`: creates the caller's agent profile, or replaces its URI, hash and tags. The
- * caller needs a storage balance. No deposit.
+ * caller needs a storage balance. Since the agent bond (contract Task 16b) it attaches exactly 1
+ * yoctoNEAR, so only a full-access key can send it: a function-call key, a delegate key among them,
+ * cannot, and the contract refuses it.
+ *
+ * A new agent, and a retired one coming back, also pays the bond in force out of its vault, if the
+ * owner has set one (`set_agent_bond`), so the vault must hold it first. An active agent's update
+ * pays nothing more. The bond is what `claim_agent_bond` pays back, after `unregister_agent` and
+ * the cooldown.
  */
 export function registerAgentCall(
   contractId: string,
@@ -379,7 +390,67 @@ export function registerAgentCall(
     methodName: "register_agent",
     args: { profile_uri: profileUri, profile_hash: profileHash, tags: [...tags] },
     gas: GAS.registerAgent,
-    deposit: NO_DEPOSIT,
+    deposit: ONE_YOCTO,
+  };
+}
+
+/**
+ * `unregister_agent`: starts the caller's way out. From now on it makes no new entry in an open
+ * task, and its bond is claimable once the cooldown is over (`claimable_at` in its view). 1
+ * yoctoNEAR, so a full-access key only.
+ */
+export function unregisterAgentCall(contractId: string): TenderCall {
+  return {
+    receiverId: contractId,
+    methodName: "unregister_agent",
+    args: {},
+    gas: GAS.unregisterAgent,
+    deposit: ONE_YOCTO,
+  };
+}
+
+/**
+ * `claim_agent_bond`: pays the caller's bond back into its vault, exactly as it was taken, and
+ * retires the agent. Allowed once the cooldown of `unregister_agent` is over. 1 yoctoNEAR, so a
+ * full-access key only.
+ */
+export function claimAgentBondCall(contractId: string): TenderCall {
+  return {
+    receiverId: contractId,
+    methodName: "claim_agent_bond",
+    args: {},
+    gas: GAS.claimAgentBond,
+    deposit: ONE_YOCTO,
+  };
+}
+
+/**
+ * `set_agent_bond`, owner only: the bond that `register_agent` takes from a new agent's vault,
+ * `amount` of `token` in its smallest unit. The token must be allowlisted and enabled. 1
+ * yoctoNEAR.
+ */
+export function setAgentBondCall(contractId: string, token: string, amount: bigint): TenderCall {
+  return {
+    receiverId: contractId,
+    methodName: "set_agent_bond",
+    args: { token, amount: amount.toString() },
+    gas: GAS.setAgentBond,
+    deposit: ONE_YOCTO,
+  };
+}
+
+/**
+ * `set_agent_bond_cooldown`, owner only: how many seconds an agent waits from `unregister_agent`
+ * until `claim_agent_bond`. The contract takes it from its shortest window up to 56 days. 1
+ * yoctoNEAR.
+ */
+export function setAgentBondCooldownCall(contractId: string, secs: number): TenderCall {
+  return {
+    receiverId: contractId,
+    methodName: "set_agent_bond_cooldown",
+    args: { secs: secs.toString() },
+    gas: GAS.setAgentBondCooldown,
+    deposit: ONE_YOCTO,
   };
 }
 

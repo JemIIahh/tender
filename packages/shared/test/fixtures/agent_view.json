@@ -15,5 +15,9 @@
     }
   ],
   "picks_made": 0,
-  "voids_after_reveals": 0
+  "voids_after_reveals": 0,
+  "status": "active",
+  "bond_token": "token.test.near",
+  "bond_amount": "1000000",
+  "claimable_at": null
 }

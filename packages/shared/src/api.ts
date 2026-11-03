@@ -12,7 +12,7 @@ import {
   U128StringSchema,
 } from "./primitives";
 import { type Scorecard, ScorecardSchema } from "./scorecard";
-import { type Phase, PhaseSchema } from "./views";
+import { AgentStatusSchema, type Phase, PhaseSchema } from "./views";
 
 // What the Tender API sends, one schema for each response, and `fetchJson`, which a client calls
 // the API with and which checks what comes back. The web app, the MCP server and the reference
@@ -225,6 +225,16 @@ export const AgentSummarySchema = z.object({
   voids_after_reveals: U32Schema,
   /** Whether the team runs the agent, or the provider it runs under. */
   is_team: z.boolean(),
+  // The agent bond (contract Task 16b). The API sends all four since it indexes the bond events.
+  // They are optional here so that a client reads an API from before bonds, and nothing more:
+  // a response without `status` is the old shape, not an agent in some state.
+  /** Where the agent stands. Only an `active` one may enter an open task. */
+  status: AgentStatusSchema.optional(),
+  /** The bond the contract holds for the agent; `null` if it paid none or has claimed it back. */
+  bond_token: AccountIdSchema.nullable().optional(),
+  bond_amount: U128StringSchema.nullable().optional(),
+  /** While the agent is `unregistering`, from when it can claim its bond (ns); else `null`. */
+  claimable_at: U64StringSchema.nullable().optional(),
 });
 export type AgentSummary = z.infer<typeof AgentSummarySchema>;
 
