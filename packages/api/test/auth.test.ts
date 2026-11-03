@@ -12,7 +12,7 @@ import { type ChallengeResponse, requireAuth, type SignInResponse } from "../src
 import { handleError } from "../src/format";
 import { type ApiDeps, type ChainReader, createApp, type ErrorBody } from "../src/index";
 import type { AuthVariables } from "../src/routes/blobs";
-import { fakeClient, resetDb, TEST_NOW, testDeps } from "./helpers";
+import { fakeClient, resetDb, TEST_NOW, testDb, testDeps } from "./helpers";
 
 // NEP-413 sign-in. Every test signs with near-api-js itself, as a wallet or an agent would, so
 // none of them leans on the serializer in `@tender/client` that the API verifies with. The chain
@@ -55,7 +55,9 @@ let deps: ApiDeps;
 let nowNs = TEST_NOW;
 
 beforeAll(async () => {
-  deps = await testDeps({ now: () => nowNs });
+  // PGlite, whatever TEST_DATABASE_URL says: the deadline tests count the timers they fake, and a
+  // Postgres pool sets one of its own for each connection it takes back.
+  deps = await testDeps({ now: () => nowNs, db: await testDb({ postgres: false }) });
 });
 
 afterAll(() => deps.db.close());

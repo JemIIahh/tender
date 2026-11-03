@@ -2,7 +2,7 @@ import type { Db } from "@tender/db";
 import type { ApiCallFn, Bot, Transformer } from "grammy";
 import type { Chat, Update, UserFromGetMe } from "grammy/types";
 import { afterAll, beforeAll, expect, test, vi } from "vitest";
-import { type Alert, createBot, resolveRecipients } from "../src/index";
+import { type Alert, BOT_COMMANDS, createBot, resolveRecipients } from "../src/index";
 import {
   linkChat,
   openTestDb,
@@ -1168,6 +1168,28 @@ test("status_reads_phases_at_the_wall_clock_by_default", async () => {
 
 test("help_lists_the_commands", async () => {
   expect(await say(newChat(), "/help")).toBe(HELP);
+});
+
+test("the_menu_lists_the_commands_the_bot_answers", async () => {
+  // The menu Telegram shows (`setMyCommands`) lists the commands `/help` lists, in that order, and
+  // `/help`, and each is a command the bot answers. `/start` comes with a link, and is not in it.
+  expect(BOT_COMMANDS.map(({ command }) => command)).toEqual([
+    "status",
+    "watch",
+    "unwatch",
+    "mute",
+    "unmute",
+    "stop",
+    "help",
+  ]);
+  for (const { command, description } of BOT_COMMANDS) {
+    // Telegram's rules for a command and its description.
+    expect(command).toMatch(/^[a-z0-9_]{1,32}$/);
+    expect(description.length, command).toBeGreaterThan(0);
+    expect(description.length, command).toBeLessThanOrEqual(256);
+    if (command !== "help") expect(HELP, command).toContain(`/${command}`);
+    expect(await say(newChat(), `/${command}`), command).not.toBe("");
+  }
 });
 
 test("replies_escape_what_people_wrote", async () => {
