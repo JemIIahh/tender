@@ -880,6 +880,72 @@ test("a_flood_wait_longer_than_the_bot_sits_out_is_sent_on_a_later_tick", async 
   expect(await tick()).toEqual([]);
 });
 
+/** What Telegram answers every send once the bot's token is rotated, or was never right. */
+const UNAUTHORIZED = { error_code: 401, description: "Unauthorized" };
+
+test("a_rejected_bot_token_gives_the_claim_back_and_the_alerts_go_out_after_a_restart", async () => {
+  await linkChat(db, 11, poster);
+  await linkChat(db, 12, poster);
+  await tick();
+  await apply(created("7", OPEN), created("8", OPEN));
+  refusals.set("11", UNAUTHORIZED);
+  refusals.set("12", UNAUTHORIZED);
+
+  // The first 401 ends the tick: nothing more is asked of Telegram with a token it does not take.
+  const error = await failedTick();
+  expect(error.name).toBe("TransportFailed");
+  expect(error.message).toContain("Telegram rejected the bot token (401)");
+  expect(error.message).toContain("tried again on the next");
+  expect(lines(drain())).toEqual(["11 New task #7"]);
+  expect(await cursor()).toBe("0");
+  // Nothing says the alert was sent, and nothing says it was lost: the claim went back.
+  expect(await claims()).toEqual([]);
+  expect(logged()).toEqual([]);
+
+  // The same on the next tick: one try, one error, nothing lost.
+  expect((await failedTick()).message).toContain("Telegram rejected the bot token (401)");
+  expect(lines(drain())).toEqual(["11 New task #7"]);
+  expect(await claims()).toEqual([]);
+
+  // The operator fixes the token and restarts: a new bot, on the old database. Everything that
+  // waited goes out, once, from the old cursor.
+  refusals.clear();
+  expect(lines(await tick({ bot: newBot() }))).toEqual([
+    "11 New task #7",
+    "12 New task #7",
+    "11 New task #8",
+    "12 New task #8",
+  ]);
+  expect(await cursor()).toBe("2");
+  expect(await tick({ bot: newBot() })).toEqual([]);
+  expect(logged()).toEqual([]);
+});
+
+test("a_rejected_bot_token_is_logged_once_for_each_tick_and_not_for_each_alert", async () => {
+  await linkChat(db, 11, poster);
+  await linkChat(db, 12, poster);
+  await withLoop({}, async () => {
+    await firstTickDone();
+    refusals.set("11", UNAUTHORIZED);
+    refusals.set("12", UNAUTHORIZED);
+    // Three alerts for two chats are waiting: six sends, if each were tried.
+    await apply(created("7", OPEN), created("8", OPEN), created("9", OPEN));
+    await until(() => calls.length >= 4, "the loop to try the alerts again and again");
+  });
+  // Every tick made one call and logged one line, and none says an alert was lost.
+  const tries = calls.length;
+  const logs = logged();
+  expect(logs).toHaveLength(tries);
+  for (const log of logs) {
+    expect(log).toContain("telegram notifier: tick failed:");
+    expect(log).toContain("Telegram rejected the bot token (401)");
+    expect(log).not.toContain("alert lost");
+    expect(log).not.toContain(TOKEN);
+  }
+  expect(await claims()).toEqual([]);
+  expect(await cursor()).toBe("0");
+});
+
 /**
  * Failures after which Telegram may have the message: a connection that was made and broke, a
  * request that timed out, a reply that could not be read, a 5xx. None is a failure to connect that

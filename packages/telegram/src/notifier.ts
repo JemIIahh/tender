@@ -49,9 +49,12 @@ import { type RenderContext, renderAlert } from "./render";
  *   a short outage delays the alerts and does not drop all those the tick would have reached. The
  *   event cursor stays, and the next tick goes on from it, skipping what was sent. What becomes of
  *   the alert that was being sent depends on what the failure says (see `sendOnce`):
- *   - Telegram cannot have taken it: it asked for a longer wait than the bot sits out (a 429), or
- *     the request never left the machine (connection refused, a DNS failure, an unreachable
- *     network). The claim is given back, and the next tick sends the alert.
+ *   - Telegram cannot have taken it: it asked for a longer wait than the bot sits out (a 429), it
+ *     does not take the bot's token (a 401: the token was rotated, revoked or mistyped), or the
+ *     request never left the machine (connection refused, a DNS failure, an unreachable network).
+ *     The claim is given back, and the next tick sends the alert. After a 401 that is the next
+ *     tick of a bot with a good token: every alert waits, none is lost, and the log says plainly
+ *     that the token is rejected, once for each tick, since the first 401 ends it.
  *   - Telegram may have taken it: a timeout, a connection that broke after the request went out, a
  *     5xx. The claim stays and the alert is lost, with the same `alert lost:` line. That is the
  *     price of at most once, and it is bounded to the one message that was in flight.
@@ -584,8 +587,9 @@ async function recipientsOf(db: Db, alert: Alert): Promise<string[]> {
  * - `refused`: Telegram answered with an error about this send (a 400, say). It took nothing and
  *   will not take this, but another send may go through.
  * - `not_taken`: the transport failed and Telegram cannot have taken the message. It asked for a
- *   longer wait than the bot sits out (a 429), or the request never left the machine, which only a
- *   failure to connect shows: a refused connection, a DNS failure, a network that is unreachable.
+ *   longer wait than the bot sits out (a 429), it does not take the bot's token (a 401), or the
+ *   request never left the machine, which only a failure to connect shows: a refused connection, a
+ *   DNS failure, a network that is unreachable.
  * - `unsure`: the transport failed, or something in front of Telegram answered a 5xx, and the
  *   message may have been taken all the same: a timeout, a connection that broke after the request
  *   went out. So is a failure of any other kind, which is not known to be anything else.
@@ -614,9 +618,19 @@ function codeOf(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
+/**
+ * Whether Telegram answered that it does not take the bot's token: a 401, for a token that was
+ * rotated, revoked or mistyped. Nothing is sent with it, so the message was not taken, and no
+ * alert can go out until the bot is started again with a good token.
+ */
+function isTokenRejected(error: unknown): boolean {
+  return error instanceof GrammyError && error.error_code === 401;
+}
+
 function failureOf(error: unknown): SendFailure {
   if (error instanceof GrammyError) {
-    if (error.error_code === 429) return "not_taken";
+    // A 429 and a 401 are alike: Telegram took nothing, and the alert is still to be sent.
+    if (error.error_code === 429 || isTokenRejected(error)) return "not_taken";
     return error.error_code >= 500 ? "unsure" : "refused";
   }
   if (error instanceof HttpError) {
@@ -677,7 +691,9 @@ async function giveBack(tick: Tick, chat: string, key: string): Promise<boolean>
  * - Any other answer about this message (`refused`): the alert is lost for the chat, with a line
  *   (`logLost`), and the tick goes on with the next chat.
  * - `not_taken`: the claim is given back, so that the next tick sends the alert, and the tick ends.
- *   If the claim cannot be given back the alert is lost, and says so.
+ *   If the claim cannot be given back the alert is lost, and says so. A 401 is one of these: the
+ *   error that ends the tick says that Telegram rejected the bot's token, and, since the tick ends
+ *   at the first, the loop logs that once for each tick and not once for each alert.
  * - `unsure`: the claim stays and the alert is lost, with a line, and the tick ends. Nothing more
  *   is claimed until the next tick, so a transport that is down costs the one message in flight.
  *
@@ -714,13 +730,16 @@ async function sendOnce(
       return;
     }
     if (failure === "not_taken") {
+      const took = isTokenRejected(error)
+        ? "Telegram rejected the bot token (401)"
+        : `Telegram did not take a send (${label})`;
       if (!(await giveBack(tick, chat, key))) {
         logLost(alert, `${label}; its claim could not be given back`);
-        throw new TransportFailed(`Telegram did not take a send (${label}); the tick ends here`);
+        throw new TransportFailed(`${took}; the tick ends here`);
       }
       throw new TransportFailed(
-        `Telegram did not take a send (${label}); the tick ends here, and the alert is tried ` +
-          "again on the next",
+        `${took}; the tick ends here, and the alert is tried again on the next` +
+          (isTokenRejected(error) ? ", once the bot runs with a good token" : ""),
       );
     }
     logLost(alert, label);
