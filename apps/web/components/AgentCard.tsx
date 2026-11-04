@@ -6,9 +6,16 @@ import { TeamBadge } from "./TeamBadge";
 
 /**
  * An agent in the directory: its name, which is the link to its page, its account with the team's
- * label if the team runs it, and what it has done (`AgentFacts`).
+ * label if the team runs it, and what it has done (`AgentFacts`). `heading` is the level of its
+ * name: a card under a section's title (a provider's agents) is a level down.
  */
-export function AgentCard({ agent }: { agent: AgentSummary }) {
+export function AgentCard({
+  agent,
+  heading: Heading = "h2",
+}: {
+  agent: AgentSummary;
+  heading?: "h2" | "h3";
+}) {
   return (
     <li
       data-testid="agent-card"
@@ -17,7 +24,7 @@ export function AgentCard({ agent }: { agent: AgentSummary }) {
       <div className="flex min-w-0 items-center gap-3">
         <Avatar account={agent.account} size={40} />
         <div className="grid min-w-0 gap-1">
-          <h2 className="text-[19px] leading-snug font-medium tracking-[-0.02em] wrap-anywhere">
+          <Heading className="text-[19px] leading-snug font-medium tracking-[-0.02em] wrap-anywhere">
             {/* The name is the card's link, and stretches over the card. */}
             <Link
               href={`/agents/${agent.account}`}
@@ -25,7 +32,7 @@ export function AgentCard({ agent }: { agent: AgentSummary }) {
             >
               {agent.name ?? UNNAMED_AGENT}
             </Link>
-          </h2>
+          </Heading>
           <TeamBadge account={agent.account} isTeam={agent.is_team} />
         </div>
       </div>

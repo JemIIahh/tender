@@ -416,6 +416,134 @@ export function signalScene(): Scene {
   };
 }
 
+// ---- Fleet: a provider's account and the agents it runs, each a sub-account with its bond ------
+
+/**
+ * Where the fleet's parts are, in art units: the provider's account at the top left, and its three
+ * agents down a line from it, each joined to it by a branch. The landing puts the accounts' names
+ * beside these points (app/page.tsx, `FleetArt`), so they are exported.
+ */
+export const FLEET = {
+  provider: { x: -1.55, y: -1.5, half: 0.3 },
+  agents: { x: -0.7, ys: [-0.42, 0.43, 1.28], half: 0.2 },
+} as const;
+
+/**
+ * Signals go from the provider down the line and along each branch in turn; where one lands, the
+ * agent's bond (a dot of wax) flares and sends out a ring. The tree itself stands still.
+ */
+export function fleetScene(): Scene {
+  const P = FLEET.provider;
+  const A = FLEET.agents;
+  const LINE = 0.022;
+  const trunkTop = P.y + P.half;
+  const trunkEnd = A.ys[A.ys.length - 1] ?? 0;
+  const branchEnd = A.x - A.half;
+  /** Art units a signal covers in a second, and the seconds between two signals to one agent. */
+  const SPEED = 2.4;
+  const EVERY = 3.6;
+  const px = [0, 0, 0];
+  const py = [0, 0, 0];
+  const moving = [false, false, false];
+  /** Seconds since the last signal landed on each agent. */
+  const landed = [9, 9, 9];
+  let glow = 0;
+  return {
+    frame(t) {
+      glow = 0.5 + 0.5 * Math.sin(t * 1.6);
+      A.ys.forEach((y, i) => {
+        const down = y - trunkTop;
+        const across = branchEnd - P.x;
+        const since = t - 0.3 - i * (EVERY / 3);
+        moving[i] = false;
+        landed[i] = 9;
+        if (since < 0) return;
+        const d = (since % EVERY) * SPEED;
+        if (d < down) {
+          moving[i] = true;
+          px[i] = P.x;
+          py[i] = trunkTop + d;
+        } else if (d < down + across) {
+          moving[i] = true;
+          px[i] = P.x + d - down;
+          py[i] = y;
+        } else {
+          landed[i] = (d - down - across) / SPEED;
+        }
+        // The one before this, still ringing as the next sets out.
+        if (moving[i] && since >= EVERY) landed[i] = (d + (EVERY * SPEED - down - across)) / SPEED;
+      });
+    },
+    shade(u, v, out) {
+      // Nothing but the fleet and its halo: the right of the box is for the names.
+      if (
+        u < P.x - P.half - 0.5 ||
+        u > A.x + A.half + 0.7 ||
+        v < P.y - P.half - 0.5 ||
+        v > trunkEnd + A.half + 0.7
+      ) {
+        return set(out, 0);
+      }
+      for (let i = 0; i < 3; i++) {
+        if (moving[i] && len(u - (px[i] ?? 0), v - (py[i] ?? 0)) < 0.06) return set(out, 0.97);
+      }
+
+      // The provider: an account with Tender's seal pressed in it.
+      const pu = u - P.x;
+      const pv = v - P.y;
+      const pd = box(pu, pv, P.half, P.half, 0.08);
+      if (pd < 0) {
+        const r = len(pu, pv);
+        if (r < 0.14) {
+          let l = 0.52 + 0.42 * lit(pu, pv, 0.3) + (r > 0.115 ? 0.2 : 0);
+          if (r < 0.05) l -= 0.25;
+          return set(out, clamp01(l), 1);
+        }
+        let l = 0.25 + 0.46 * lit(pu, pv, 0.9);
+        if (Math.abs(r - 0.205) < 0.017) l -= 0.26;
+        if (pd > -0.035) l += 0.3;
+        return set(out, clamp01(l));
+      }
+      let halo = pd;
+      // The seal's glow on the ground around the provider.
+      let l = pd < 0.16 ? 0.12 + 0.1 * glow * (1 - pd / 0.16) : 0;
+
+      for (let i = 0; i < 3; i++) {
+        const au = u - A.x;
+        const av = v - (A.ys[i] ?? 0);
+        const r = len(au, av);
+        const since = landed[i] ?? 9;
+        // The ring a landing sends out, in wax red.
+        if (since < 0.9) {
+          const ring = A.half * 1.25 + since * 0.42;
+          if (Math.abs(r - ring) < 0.02 * (1.4 - since))
+            return set(out, 0.92 * (1 - since / 0.9), 1);
+        }
+        const ad = box(au, av, A.half, A.half, 0.06);
+        if (ad < 0) {
+          // The agent's bond: a dot of wax, brighter for a moment when a signal lands.
+          if (r < 0.075) {
+            const flare = since < 0.6 ? 0.35 * (1 - since / 0.6) : 0;
+            return set(out, clamp01(0.5 + 0.35 * lit(au, av, 0.15) + flare), 1);
+          }
+          let shade = 0.24 + 0.44 * lit(au, av, 0.6);
+          if (Math.abs(r - 0.125) < 0.015) shade -= 0.22;
+          if (ad > -0.03) shade += 0.3;
+          return set(out, clamp01(shade));
+        }
+        halo = Math.min(halo, ad);
+      }
+
+      // The lines: down from the provider, and along to each agent.
+      let line = segment(u, v, P.x, trunkTop, P.x, trunkEnd);
+      for (const y of A.ys) line = Math.min(line, segment(u, v, P.x, y, branchEnd, y));
+      if (line < LINE) return set(out, 0.46);
+      l = Math.max(l, 0.2 * Math.exp(-Math.max(halo, 0) * 11), 0.1 * Math.exp(-line * 16));
+      set(out, l);
+    },
+  };
+}
+
 /** The art the landing and the app show, by name: the hero's show and each scene alone. */
 export const ARTS = {
   hero: () => [sealedScene(), scaleScene(), coinsScene()],
@@ -426,6 +554,8 @@ export const ARTS = {
   // The hero's other two scenes, alone, for the heads of the app's pages (components/StillArt).
   coins: () => [coinsScene()],
   scale: () => [scaleScene()],
+  // A provider and its agents: the landing's "Run a fleet", and the head of the providers' pages.
+  fleet: () => [fleetScene()],
 } satisfies Record<string, () => Scene[]>;
 
 export type ArtName = keyof typeof ARTS;

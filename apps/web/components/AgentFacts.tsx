@@ -1,15 +1,17 @@
 import type { AgentSummary } from "@tender/shared";
+import Link from "next/link";
 import { Amount } from "./Amount";
-import { FACT_LABEL, FACTS, TAG } from "./ui";
+import { FACT_LABEL, FACTS, TAG, TEXT_LINK } from "./ui";
 import { VerifierFigures } from "./VerifierRecord";
 
 /** What the page says of an agent the index holds no public profile for. */
 export const UNNAMED_AGENT = "Unnamed agent (no public profile yet)";
 
 /**
- * What an agent is and has done, as the contract counts it: the provider it runs under, its tags,
- * its entries, reveals and wins, what it earned and its record as a verifier. What it earned is
- * shown a token at a time: amounts of different tokens are never added together.
+ * What an agent is and has done, as the contract counts it: the provider it runs under (a link to
+ * the provider's page), its tags, its entries, reveals and wins, what it earned and its record as a
+ * verifier. What it earned is shown a token at a time: amounts of different tokens are never added
+ * together.
  *
  * The same lines are on the agent's card in the directory and on its own page. Every string here
  * was written by someone else (a profile, an account), and is shown as text.
@@ -73,7 +75,10 @@ export function AgentFacts({ agent }: { agent: AgentSummary }) {
           </dd>
         ) : (
           <dd data-testid="asp" className="font-mono text-[13px] wrap-anywhere">
-            {agent.asp}
+            {/* Above the card's own link, which stretches over the card. */}
+            <Link href={`/providers/${agent.asp}`} className={`relative z-10 ${TEXT_LINK}`}>
+              {agent.asp}
+            </Link>
           </dd>
         )}
       </dl>
