@@ -10,6 +10,7 @@ import {
   type TaskBoard,
   type TaskDetail,
 } from "@tender/shared";
+import Link from "next/link";
 import {
   type FormEvent,
   type ReactNode,
@@ -25,6 +26,9 @@ import { heldToken, noToken, subscribeToken } from "../lib/apiToken";
 import { useApiToken } from "../lib/auth";
 import { errorMessage } from "../lib/errors";
 import {
+  type AskerStanding,
+  askerRefusal,
+  askerStanding,
   BOARD_MAX_LABEL,
   BOARD_NOTE_SHORT,
   BOARD_READ_ONLY,
@@ -39,7 +43,7 @@ import { type Told, toldFor } from "../lib/told";
 import { useWallet } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErrors";
 import { Avatar } from "./Avatar";
-import { FACT_LABEL, FIELD, NOTICE, PANEL, PANEL_TITLE, PRIMARY, SECONDARY } from "./ui";
+import { FACT_LABEL, FIELD, NOTICE, PANEL, PANEL_TITLE, PRIMARY, SECONDARY, TEXT_LINK } from "./ui";
 
 // The task's public question board (spec 7.2.1): every question with its asker, its time and its
 // answer, the poster's clarifications, and the fixed note that none of it changes the checks. An
@@ -736,15 +740,19 @@ function BoardBody({
             Only the accounts this task invited can ask questions.
           </p>
         ) : (
-          <TextForm
-            testId="ask-form"
-            label="Ask the poster"
-            placeholder="A question about the brief. Everyone can read it."
-            submit={{ idle: "Ask", running: "Asking…" }}
-            running={running === "ask"}
-            failure={failedAt("ask")}
-            onSubmit={ask}
-          />
+          // An invited account of a pinned task asks; on an open task the account has to be an
+          // active agent, which is checked first, so that no one signs a sign-in only to be refused.
+          <AgentGate key={account} account={account} check={role === "entrant"}>
+            <TextForm
+              testId="ask-form"
+              label="Ask the poster"
+              placeholder="A question about the brief. Everyone can read it."
+              submit={{ idle: "Ask", running: "Asking…" }}
+              running={running === "ask"}
+              failure={failedAt("ask")}
+              onSubmit={ask}
+            />
+          </AgentGate>
         )}
         {told === null ? null : (
           <p role="status" data-testid="board-said" className="text-sm text-muted">
@@ -754,6 +762,86 @@ function BoardBody({
       </div>
     </>
   );
+}
+
+type AgentCheck =
+  | { state: "checking" }
+  | { state: "read"; standing: AskerStanding }
+  | { state: "unread"; message: string };
+
+/**
+ * The Ask form, for an account the API would let ask. With `check` (an open task), the account's
+ * agent record is read once first (`GET /v1/agents/:account`, keyed on the account): a registered
+ * agent that is active, or has no bond status, gets the form; any other gets one line saying why,
+ * and the way to My agents. A read that fails says so and offers Retry, and no form: the form is
+ * only for an account the page knows the API takes.
+ */
+function AgentGate({
+  account,
+  check,
+  children,
+}: {
+  account: string;
+  check: boolean;
+  children: ReactNode;
+}) {
+  const [agent, setAgent] = useState<AgentCheck>({ state: "checking" });
+  const latest = useRef(0);
+
+  const read = useCallback(() => {
+    const request = ++latest.current;
+    setAgent({ state: "checking" });
+    api.getAgentRecord(account).then(
+      (record) => {
+        if (request === latest.current) {
+          setAgent({ state: "read", standing: askerStanding(record?.agent ?? null) });
+        }
+      },
+      (error) => {
+        if (request !== latest.current) return;
+        // The person gets words; the original goes to the console, where a developer looks.
+        console.error(error);
+        setAgent({ state: "unread", message: errorMessage(error) });
+      },
+    );
+  }, [account]);
+
+  useEffect(() => {
+    if (check) read();
+  }, [check, read]);
+
+  if (!check) return children;
+  if (agent.state === "checking") {
+    return (
+      <p aria-busy="true" className="text-sm text-muted">
+        Checking this account's agent…
+      </p>
+    );
+  }
+  if (agent.state === "unread") {
+    return (
+      <div
+        data-testid="agent-check-error"
+        className={`${NOTICE} flex flex-wrap items-center justify-between gap-3`}
+      >
+        <p className="min-w-0 wrap-anywhere">{`Couldn't check whether this account is a registered agent. ${agent.message}`}</p>
+        <button type="button" onClick={read} className={SECONDARY}>
+          Retry
+        </button>
+      </div>
+    );
+  }
+  if (agent.standing.kind !== "agent") {
+    return (
+      <p data-testid="board-role" className="text-sm text-muted">
+        {askerRefusal(agent.standing)}{" "}
+        <Link href="/my-agents" className={TEXT_LINK}>
+          My agents
+        </Link>
+      </p>
+    );
+  }
+  return children;
 }
 
 /** "Keep", the safe choice of the hide prompt, which takes the focus when the prompt opens. */

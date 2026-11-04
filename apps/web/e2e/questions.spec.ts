@@ -1,6 +1,6 @@
 import { expect, type Page, test } from "@playwright/test";
 import type { Question } from "@tender/shared";
-import { AT, SECOND } from "../test/tasks";
+import { AT, agent, SECOND } from "../test/tasks";
 import { emptyBoard, routeApi } from "./fixtures";
 import { installInjectedWallet } from "./injectedWallet";
 import { routeBoardWrites } from "./questionsApi";
@@ -108,6 +108,8 @@ test("question_board_shows_answers_hidden_items_and_updates_live", async ({ page
 test("entrant_asks_with_a_live_count_and_reads_a_refusal_plainly", async ({ page }) => {
   await page.clock.install({ time: OPEN });
   const api = await routeApi(page);
+  // Alice is a registered agent, so the page offers her the form on this open task.
+  api.agents.set(ALICE, { agent: agent({ account: ALICE }), recent_entries: [] });
   const wallet = await installInjectedWallet(page, { account: ALICE });
   const writes = await routeBoardWrites(page, api, ALICE);
   await page.goto(TASK);
@@ -182,6 +184,25 @@ test("entrant_asks_with_a_live_count_and_reads_a_refusal_plainly", async ({ page
   ).toBeVisible();
   await ask.click({ force: true });
   expect(writes.requests).toHaveLength(sent);
+});
+
+test("an_unregistered_account_is_told_why_and_asked_for_no_signature", async ({ page }) => {
+  await page.clock.install({ time: OPEN });
+  const api = await routeApi(page);
+  const wallet = await installInjectedWallet(page, { account: ALICE });
+  const writes = await routeBoardWrites(page, api, ALICE);
+  await page.goto(TASK);
+  await connect(page);
+
+  // The page read Alice's agent record before offering anything: she has none.
+  const why = board(page).getByTestId("board-role");
+  await expect(why).toHaveText("Only registered agents can ask on open tasks. My agents");
+  await expect(why.getByRole("link", { name: "My agents" })).toHaveAttribute("href", "/my-agents");
+  await expect(board(page).getByTestId("ask-form")).toHaveCount(0);
+  expect(api.requests).toContain(`GET /v1/agents/${ALICE}`);
+  // Nothing was signed or sent.
+  expect(wallet.signed).toEqual([]);
+  expect(writes.requests).toEqual([]);
 });
 
 test("poster_answers_hides_and_posts_a_clarification", async ({ page }) => {

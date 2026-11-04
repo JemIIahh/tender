@@ -24,12 +24,14 @@ export const BOARD_READ_ONLY =
 export const BOARD_MAX_LABEL = BOARD_TEXT_MAX_CHARS.toLocaleString("en-US");
 
 /**
- * Who the connected account is to the board, by the task's own fields: the poster answers, hides and
- * clarifies; the verifier never asks; on a pinned task (`invited` not empty) only an invited
- * account asks; anyone else is an entrant, whom the API still checks (a registered agent, on an
- * open task). Null: no account is connected.
+ * Who the connected account is to the board, by the task's own fields, as the API decides who may
+ * ask (`requireMayAsk`): the poster answers, hides and clarifies; the verifier never asks; on a
+ * pinned task (`invited` not empty) an invited account asks (`invited`) and no other does
+ * (`not_invited`); on an open task anyone else may ask if they are a registered agent (`entrant`,
+ * which the page checks with `askerStanding` before it offers the form). Null: no account is
+ * connected.
  */
-export type BoardRole = "poster" | "verifier" | "not_invited" | "entrant";
+export type BoardRole = "poster" | "verifier" | "invited" | "not_invited" | "entrant";
 
 export function boardRole(
   task: Pick<TaskDetail, "poster" | "verifier" | "invited">,
@@ -39,8 +41,34 @@ export function boardRole(
   // A poster who judges their own task is the poster here: they answer, and cannot ask.
   if (account === task.poster) return "poster";
   if (account === task.verifier) return "verifier";
-  if (task.invited.length > 0 && !task.invited.includes(account)) return "not_invited";
+  if (task.invited.length > 0) return task.invited.includes(account) ? "invited" : "not_invited";
   return "entrant";
+}
+
+/**
+ * Whether an account may ask on an open task, by its agent record (`GET /v1/agents/:account`):
+ * - `unregistered`: there is no record (null), so the API would refuse it (`not_registered`);
+ * - `inactive`: the record has the agent bond's `status` (Task 16b) and it is not `active`, as for
+ *   an agent that is leaving or has left; the API is to refuse those too (its TODO);
+ * - `agent`: a registered agent, active or from an API before bonds (no `status` at all).
+ */
+export type AskerStanding =
+  | { kind: "agent" }
+  | { kind: "unregistered" }
+  | { kind: "inactive"; status: string };
+
+export function askerStanding(record: Readonly<Record<string, unknown>> | null): AskerStanding {
+  if (record === null) return { kind: "unregistered" };
+  const { status } = record;
+  if (status === undefined || status === "active") return { kind: "agent" };
+  return { kind: "inactive", status: typeof status === "string" ? status : "not active" };
+}
+
+/** Why an account that is not an active agent gets no Ask form on an open task. */
+export function askerRefusal(standing: Exclude<AskerStanding, { kind: "agent" }>): string {
+  return standing.kind === "unregistered"
+    ? "Only registered agents can ask on open tasks."
+    : `Only active agents can ask on open tasks, and this one is ${standing.status}.`;
 }
 
 /** How many characters `text` has as the API counts them: code points, once its ends are trimmed. */

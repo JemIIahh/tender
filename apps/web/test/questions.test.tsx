@@ -14,7 +14,7 @@ import { keepToken, signInTicket } from "../lib/apiToken";
 import { clearApiToken } from "../lib/auth";
 import { createWalletStore, type Session, type WalletStore } from "../lib/wallet";
 import { FakeChain } from "./fakeChain";
-import { POSTER, VERIFIER } from "./tasks";
+import { agent, POSTER, VERIFIER } from "./tasks";
 import { chainWallet, type FakeProvider, fakeProvider } from "./walletDoubles";
 
 // The task page's question board (spec 7.2.1) over a fake API and a wallet double: what a reader,
@@ -92,6 +92,8 @@ function fakeApi(
     const method = init.method ?? "GET";
     api.requests.push(`${method} ${path}`);
     if (method === "GET" && path === BOARD_PATH) return read() ?? json(api.board);
+    const asked = /^\/v1\/agents\/([^/]+)$/.exec(path);
+    if (method === "GET" && asked) return agentAnswer(decodeURIComponent(asked[1] ?? ""));
     if (path === "/v1/auth/challenge") {
       return json({
         nonce: NONCE,
@@ -147,6 +149,15 @@ function fakeApi(
   return api;
 }
 
+/**
+ * What `GET /v1/agents/:account` answers. Every account is a registered agent unless a test says
+ * otherwise; the API of today sends no bond `status`.
+ */
+let agentAnswer: (account: string) => Response = (account) =>
+  json({ agent: agent({ account }), recent_entries: [] });
+const registered = (account: string, extra: Record<string, unknown> = {}) =>
+  json({ agent: { ...agent({ account }), ...extra }, recent_entries: [] });
+
 /** A store over a wallet for `account`: connected from an earlier visit with `restored`. */
 function wallet(account: string, options: { restored?: boolean; signMessage?: boolean } = {}) {
   const session: Session = {
@@ -174,6 +185,7 @@ const loaded = () => screen.findAllByTestId(/^(board-empty|question)$/);
 
 beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
+  agentAnswer = (account) => registered(account);
 });
 
 afterEach(() => {
@@ -506,6 +518,89 @@ test("ask_signs_in_again_once_when_the_api_has_forgotten_the_token", async () =>
   await screen.findByTestId("question");
   expect(api.requests.filter((request) => request === "POST /v1/auth/verify")).toHaveLength(2);
   expect(screen.queryByRole("alert")).toBeNull();
+});
+
+// ---- Who gets the Ask form ----------------------------------------------------------------------
+
+const AGENT_READ = `GET /v1/agents/${ALICE}`;
+
+test.each([
+  ["with no bond status (an API before bonds)", {}],
+  ["whose bond status is active", { status: "active" }],
+])("a_registered_agent_%s_is_read_once_and_gets_the_form", async (_, extra) => {
+  agentAnswer = (account) => registered(account, extra);
+  const api = fakeApi();
+  await connectedAs(ALICE);
+
+  expect(await screen.findByTestId("ask-form")).toBeTruthy();
+  expect(api.requests.filter((request) => request === AGENT_READ)).toHaveLength(1);
+});
+
+test("an_unregistered_account_on_an_open_task_is_told_why_and_signs_nothing", async () => {
+  agentAnswer = () => json({ error: "not_found", message: "no such agent" }, 404);
+  const api = fakeApi();
+  await connectedAs(ALICE);
+
+  const line = await screen.findByTestId("board-role");
+  expect(line.textContent).toBe("Only registered agents can ask on open tasks. My agents");
+  expect(within(line).getByRole("link", { name: "My agents" }).getAttribute("href")).toBe(
+    "/my-agents",
+  );
+  expect(screen.queryByTestId("ask-form")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Ask" })).toBeNull();
+  // No sign-in was started, so the wallet was asked for no signature.
+  expect(api.requests.filter((request) => request.includes("/v1/auth/"))).toEqual([]);
+  expect(console.error).not.toHaveBeenCalled();
+});
+
+test("an_agent_whose_bond_status_is_not_active_is_told_why_and_gets_no_form", async () => {
+  agentAnswer = (account) => registered(account, { status: "retired" });
+  fakeApi();
+  await connectedAs(ALICE);
+
+  expect((await screen.findByTestId("board-role")).textContent).toBe(
+    "Only active agents can ask on open tasks, and this one is retired. My agents",
+  );
+  expect(screen.queryByTestId("ask-form")).toBeNull();
+});
+
+test("a_failed_agent_read_says_so_offers_retry_and_no_form", async () => {
+  let failing = true;
+  agentAnswer = (account) =>
+    failing ? json({ error: "internal", message: "x" }, 500) : registered(account);
+  const api = fakeApi();
+  await connectedAs(ALICE);
+
+  const notice = await screen.findByTestId("agent-check-error");
+  expect(notice.textContent).toContain(
+    "Couldn't check whether this account is a registered agent.",
+  );
+  expect(notice.textContent).toContain("500");
+  expect(screen.queryByTestId("ask-form")).toBeNull();
+
+  failing = false;
+  await userEvent.click(within(notice).getByRole("button", { name: "Retry" }));
+  expect(await screen.findByTestId("ask-form")).toBeTruthy();
+  expect(api.requests.filter((request) => request === AGENT_READ)).toHaveLength(2);
+});
+
+test("an_invited_account_of_a_pinned_task_gets_the_form_with_no_agent_read", async () => {
+  agentAnswer = () => json({ error: "not_found", message: "no such agent" }, 404);
+  const api = fakeApi();
+  wallet(ALICE, { restored: true });
+  render(<Questions task={{ ...TASK, invited: [ALICE] }} phase="open" refresh={0} />);
+  await act(() => holder.store.start());
+
+  // The API lets an invited account ask whether or not it is a registered agent.
+  expect(await screen.findByTestId("ask-form")).toBeTruthy();
+  expect(api.requests.some((request) => request.startsWith("GET /v1/agents/"))).toBe(false);
+});
+
+test("the_poster_and_the_verifier_are_not_read_as_agents", async () => {
+  const api = fakeApi();
+  await connectedAs(POSTER);
+  expect(await screen.findByTestId("clarify-form")).toBeTruthy();
+  expect(api.requests.some((request) => request.startsWith("GET /v1/agents/"))).toBe(false);
 });
 
 test("the_verifier_and_an_account_the_task_did_not_invite_get_no_ask_form", async () => {
