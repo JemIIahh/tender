@@ -10,8 +10,10 @@ import {
   BOARD_NOTE,
   computeCommitment,
   type EntryView,
+  HIRER_ACCEPTS_CRITERIA_HASH,
   type ListTasksFilter,
   type ListTasksResponse,
+  type Service,
   STORAGE_BYTE_COST,
   type StorageView,
   sha256Hex,
@@ -29,8 +31,11 @@ import {
 import type { Solver, TaskContext } from "../src/types";
 import {
   ACCOUNT,
+  CRITERIA,
   entryView,
+  JUDGE,
   OTHER,
+  POSTER,
   picked,
   type TaskSpec,
   TOKEN,
@@ -85,6 +90,9 @@ class World {
     const matching = [...this.tasks.values()]
       .filter((task) => filter.phase === undefined || task.phase === filter.phase)
       .filter((task) => filter.tag === undefined || task.tags.includes(filter.tag))
+      .filter(
+        (task) => filter.invited === undefined || (task.invited ?? []).includes(filter.invited),
+      )
       .sort((a, b) => b.id - a.id);
     const after = filter.cursor === undefined ? undefined : Number(filter.cursor);
     const rest = after === undefined ? matching : matching.filter((task) => task.id < after);
@@ -163,6 +171,9 @@ afterEach(async () => {
 interface Harness {
   /** The state directory of the agent. */
   dir: string;
+  /** The services the agent offers, as the API lists them: none unless a test gives some. */
+  services: Service[];
+  listServices: Mock<TenderApi["listServices"]>;
   world: World;
   /** The tags of the agent. */
   tags: string[];
@@ -222,6 +233,11 @@ async function harness(
     const sha256 = sha256Hex(blob.bytes);
     return { sha256, uri: `https://api.test/v1/blobs/${sha256}` };
   });
+  // The agent offers no service unless a test says so (`h.services`).
+  const listServices = vi.fn<TenderApi["listServices"]>(async () => ({
+    services: h.services,
+    next_cursor: null,
+  }));
   const api: TenderApi = {
     listTasks,
     getTask,
@@ -240,6 +256,10 @@ async function harness(
     postClarification: unexpected("postClarification"),
     telegramLink: unexpected("telegramLink"),
     signIn: unexpected("signIn"),
+    listServices,
+    getService: unexpected("getService"),
+    createService: unexpected("createService"),
+    updateService: unexpected("updateService"),
   };
 
   // A commit that goes through leaves an entry on the chain, which `getEntry` then shows. One that
@@ -268,6 +288,8 @@ async function harness(
 
   const h: Harness = {
     dir,
+    services: [],
+    listServices,
     world,
     tags: ["regex"],
     state: createStateStore(dir),
@@ -1297,6 +1319,340 @@ test("a_task_the_contract_takes_the_agent_in_is_entered", async () => {
 
   expect(idsOf(h.commit)).toEqual([1n, 2n, 3n, 4n]);
   expect(h.logs.filter((line) => line.includes("skipping"))).toEqual([]);
+});
+
+// ---- Hires: the pinned tasks that invite the agent -----------------------------------------------
+
+/**
+ * A service the agent offers: 1 tUSDC, checked by the hirer, with windows of a second each, which
+ * the test tasks' deadlines (a second apart) meet.
+ */
+function offered(over: Partial<Service> = {}): Service {
+  return {
+    id: "3",
+    provider: ACCOUNT,
+    agent: ACCOUNT,
+    title: "Summarise a filing",
+    description: "Five lines.",
+    tags: ["filings"],
+    category: "research",
+    output_format: "regex_json",
+    token: TOKEN,
+    price: "1000000",
+    commit_secs: 1,
+    reveal_secs: 1,
+    pick_secs: 1,
+    verification: { kind: "hirer" },
+    status: "active",
+    available: true,
+    is_team: false,
+    created_at: "2026-11-04T09:00:00.000Z",
+    updated_at: "2026-11-04T09:00:00.000Z",
+    agent_record: null,
+    ...over,
+  };
+}
+
+/** A hire of `offered()` as the shared builders post it, with tags the agent does not look for. */
+const hire = (id: number, over: Partial<TaskSpec> = {}): Partial<TaskSpec> & { id: number } => ({
+  id,
+  tags: ["filings"],
+  invited: [ACCOUNT],
+  maxEntries: 1,
+  poster: POSTER,
+  verifier: POSTER,
+  criteriaHash: HIRER_ACCEPTS_CRITERIA_HASH,
+  reward: "1000000",
+  token: TOKEN,
+  ...over,
+});
+
+const JUDGED_HASH = sha256Hex("the criteria of a judged service");
+const judged = (): Service =>
+  offered({
+    id: "4",
+    verification: {
+      kind: "judge",
+      criteria: CRITERIA,
+      criteria_hash: JUDGED_HASH,
+      judge: JUDGE,
+    },
+  });
+
+test("a_hire_of_a_service_the_agent_offers_is_work_whatever_its_tags", async () => {
+  const h = await harness(undefined, { scripted: false });
+  h.services = [offered()];
+  h.world.add(hire(5));
+  // Pinned to another account, and open to anyone with another tag: neither is the agent's.
+  h.world.add({ id: 6, tags: ["filings"], invited: [OTHER], maxEntries: 1 });
+  h.world.add({ id: 7, tags: ["filings"] });
+
+  await h.tick();
+
+  // The services are read once, before any task, for the agent alone.
+  expect(h.listServices.mock.calls).toEqual([[{ agent: ACCOUNT, status: "all", limit: 50 }]]);
+  expect(h.listTasks.mock.calls.map(([filter]) => filter)).toEqual([
+    { phase: "open", tag: "regex", limit: 50 },
+    { phase: "open", invited: ACCOUNT, limit: 50 },
+  ]);
+  expect(idsOf(h.commit)).toEqual([5n]);
+  // The solver had the request: the task's own brief, as for any task.
+  expect(h.solve.mock.calls[0]?.[0].task.id).toBe("5");
+  expect(h.start).toHaveBeenCalledTimes(1);
+
+  // The draft is the agent's, and the reveal is the runner's as for any entry.
+  await h.tick();
+  expect(h.commit).toHaveBeenCalledTimes(1);
+});
+
+test("a_hire_that_pays_more_than_the_price_or_names_the_judge_of_a_judged_service_is_taken", async () => {
+  const h = await harness();
+  h.services = [offered(), judged()];
+  h.world.add(hire(5, { reward: "1500000" }));
+  h.world.add(hire(6, { verifier: JUDGE, criteriaHash: JUDGED_HASH }));
+
+  await h.tick();
+
+  expect(idsOf(h.commit)).toEqual([5n, 6n]);
+  expect(h.logs.filter((line) => line.includes("skipping"))).toEqual([]);
+});
+
+test("each_hire_that_breaks_the_terms_of_the_service_is_skipped_and_the_reason_logged", async () => {
+  const refused: Array<[string, Service[], Partial<TaskSpec>, string]> = [
+    [
+      "underpaid",
+      [offered()],
+      { reward: "999999" },
+      "it pays 999999, below the 1000000 that service 3 costs",
+    ],
+    [
+      "a verifier other than the hirer",
+      [offered()],
+      { verifier: OTHER },
+      `service 3 is checked by the hirer, and the task names ${OTHER} as its verifier, not its poster`,
+    ],
+    [
+      "a verifier other than the Judge",
+      [judged()],
+      { criteriaHash: JUDGED_HASH, verifier: POSTER },
+      `service 4 is checked by the Judge, and the task names ${POSTER} as its verifier`,
+    ],
+    [
+      "criteria of no service",
+      [offered()],
+      { criteriaHash: sha256Hex("someone else's criteria") },
+      "its criteria are not those of a service the agent offers",
+    ],
+    [
+      "a paused service",
+      // The agent offers another service, so it looks for hires; this one's is paused.
+      [offered({ status: "paused" }), judged()],
+      {},
+      "service 3 is paused",
+    ],
+    [
+      "another token",
+      [offered()],
+      { token: "other.test.near" },
+      `it pays in other.test.near, and service 3 is priced in ${TOKEN}`,
+    ],
+    [
+      "an invited list of two",
+      [offered()],
+      { invited: [ACCOUNT, OTHER] },
+      "it is pinned as a hire and does not invite the agent alone, once, as a hire does",
+    ],
+    [
+      "room for two entries",
+      [offered()],
+      { maxEntries: 2 },
+      "it is pinned as a hire and does not invite the agent alone, once, as a hire does",
+    ],
+    [
+      "shorter windows",
+      [offered({ commit_secs: 2 })],
+      {},
+      "its windows are shorter than service 3's",
+    ],
+  ];
+  for (const [what, services, over, why] of refused) {
+    const h = await harness(undefined, { scripted: false });
+    h.services = services;
+    h.world.add(hire(5, over));
+
+    await h.tick();
+    await h.tick();
+
+    expect(h.logs, what).toEqual([`alice: skipping task 5, ${why}`]);
+    // Neither announced nor solved nor committed, and seen: not fetched a second time.
+    expect(h.start, what).not.toHaveBeenCalled();
+    expect(h.solve, what).not.toHaveBeenCalled();
+    expect(h.commit, what).not.toHaveBeenCalled();
+    expect(h.getTask, what).toHaveBeenCalledTimes(1);
+  }
+});
+
+test("an_agent_that_offers_no_active_service_never_looks_for_hires", async () => {
+  for (const services of [[], [offered({ status: "paused" })]]) {
+    const h = await harness();
+    h.services = services;
+    h.world.add(hire(5));
+
+    await h.tick();
+
+    expect(h.listTasks.mock.calls.map(([filter]) => filter)).toEqual([
+      { phase: "open", tag: "regex", limit: 50 },
+    ]);
+    expect(h.getTask).not.toHaveBeenCalled();
+    expect(h.commit).not.toHaveBeenCalled();
+  }
+});
+
+test("a_hire_found_by_a_tag_is_held_to_the_same_terms", async () => {
+  // A hire whose brief carries the agent's tag, underpaid; and one claiming a hire's criteria for an
+  // agent that offers no service at all.
+  const underpaid = await harness();
+  underpaid.services = [offered()];
+  underpaid.world.add(hire(5, { tags: ["regex"], reward: "1" }));
+  await underpaid.tick();
+  expect(underpaid.commit).not.toHaveBeenCalled();
+  expect(underpaid.logs).toEqual([
+    "alice: skipping task 5, it pays 1, below the 1000000 that service 3 costs",
+  ]);
+
+  const none = await harness();
+  none.world.add(hire(5, { tags: ["regex"] }));
+  await none.tick();
+  expect(none.commit).not.toHaveBeenCalled();
+  expect(none.logs).toEqual([
+    "alice: skipping task 5, its criteria are not those of a service the agent offers",
+  ]);
+});
+
+test("a_pinned_task_that_is_no_hire_is_entered_by_its_tag_as_before", async () => {
+  // Criteria of its own, pinned to the agent and others, found by the agent's tag: services or not.
+  for (const services of [[], [offered()]]) {
+    const h = await harness();
+    h.services = services;
+    h.world.add({ id: 1, tags: ["regex"], invited: [OTHER, ACCOUNT], maxEntries: 2 });
+    await h.tick();
+    expect(idsOf(h.commit)).toEqual([1n]);
+  }
+});
+
+test("a_valid_hire_found_by_its_tag_and_by_its_invite_is_entered_once", async () => {
+  const h = await harness();
+  h.services = [offered()];
+  // The hire's brief carries the agent's tag, so both listings find it.
+  h.world.add(hire(5, { tags: ["regex"] }));
+
+  await h.tick();
+
+  expect(h.listTasks.mock.calls.map(([filter]) => filter)).toEqual([
+    { phase: "open", tag: "regex", limit: 50 },
+    { phase: "open", invited: ACCOUNT, limit: 50 },
+  ]);
+  expect(idsOf(h.commit)).toEqual([5n]);
+  expect(h.getTask).toHaveBeenCalledTimes(1);
+  expect(h.logs.filter((line) => line.includes("skipping"))).toEqual([]);
+});
+
+test("with_its_services_unread_the_agent_takes_no_pinned_task_and_takes_it_once_they_are_read", async () => {
+  const h = await harness();
+  h.services = [offered(), judged()];
+  // Found by the agent's tag: a hire the hirer checks, a hire the Judge checks (whose criteria are
+  // the service's own, so unknown without the services), and a pinned task that is no hire.
+  h.world.add(hire(5, { tags: ["regex"] }));
+  h.world.add(hire(6, { tags: ["regex"], verifier: JUDGE, criteriaHash: JUDGED_HASH }));
+  h.world.add({ id: 7, tags: ["regex"], invited: [OTHER, ACCOUNT], maxEntries: 2 });
+  h.world.add({ id: 1, tags: ["regex"] });
+  h.listServices.mockRejectedValueOnce(new ApiError(503, { error: "unavailable" }));
+
+  await h.tick();
+
+  // The open task goes on; every task pinned to the agent waits, unseen, and nothing is refused.
+  expect(idsOf(h.commit)).toEqual([1n]);
+  expect(h.listTasks).toHaveBeenCalledTimes(1);
+  expect(h.logs).toEqual([
+    "ERROR alice: reading its services failed (ApiError 503)",
+    "alice: committed to task 1 tx=commit-tx",
+  ]);
+
+  // The next tick reads the services again, and takes each on its terms.
+  await h.tick();
+  expect(h.listServices).toHaveBeenCalledTimes(2);
+  expect(idsOf(h.commit)).toEqual([1n, 5n, 6n, 7n]);
+});
+
+test("services_of_another_agent_set_no_terms_and_a_failed_read_takes_no_hire", async () => {
+  // An API that ignores the agent filter sends another agent's service: it is dropped.
+  const foreign = await harness();
+  foreign.services = [offered({ agent: OTHER })];
+  foreign.world.add(hire(5));
+  await foreign.tick();
+  expect(foreign.listTasks).toHaveBeenCalledTimes(1);
+  expect(foreign.commit).not.toHaveBeenCalled();
+
+  // Services that cannot be read: no hires this tick, and the tasks of its tags all the same.
+  const failed = await harness();
+  failed.world.add({ id: 1, tags: ["regex"] });
+  failed.world.add(hire(5));
+  failed.listServices.mockRejectedValue(new ApiError(503, { error: "unavailable" }));
+  await failed.tick();
+  expect(idsOf(failed.commit)).toEqual([1n]);
+  expect(failed.logs).toEqual([
+    "ERROR alice: reading its services failed (ApiError 503)",
+    "alice: committed to task 1 tx=commit-tx",
+  ]);
+});
+
+test("an_api_that_ignores_the_invited_filter_cannot_make_the_agent_enter_open_tasks", async () => {
+  const h = await harness();
+  h.services = [offered()];
+  h.world.add({ id: 7, tags: ["filings"] });
+  h.world.add({ id: 8, tags: ["filings"], invited: [OTHER] });
+  // It answers the invited listing with every open task.
+  h.listTasks.mockImplementation(async (filter = {}) =>
+    h.world.page({ ...filter, invited: undefined }),
+  );
+
+  await h.tick();
+  await h.tick();
+
+  expect(h.commit).not.toHaveBeenCalled();
+  expect(h.start).not.toHaveBeenCalled();
+  // Seen once each: not fetched again on the next tick.
+  expect(h.getTask).toHaveBeenCalledTimes(2);
+  expect(h.logs).toEqual(["WARN alice: the API listed 2 tasks that do not invite it, skipped"]);
+});
+
+test("a_hire_the_contract_would_refuse_is_skipped_like_any_task", async () => {
+  const h = await harness();
+  h.services = [offered()];
+  h.world.add(hire(5, { commitCount: 1 }));
+
+  await h.tick();
+
+  expect(h.commit).not.toHaveBeenCalled();
+  expect(h.logs).toEqual(["alice: skipping task 5, it has all the entries it takes"]);
+});
+
+test("a_failed_listing_of_hires_is_logged_and_the_tick_goes_on", async () => {
+  const h = await harness();
+  h.services = [offered()];
+  h.world.add({ id: 1, tags: ["regex"] });
+  h.listTasks.mockImplementation(async (filter = {}) => {
+    if (filter.invited !== undefined) throw new ApiError(500, { error: "internal" });
+    return h.world.page(filter);
+  });
+
+  await h.tick();
+
+  expect(idsOf(h.commit)).toEqual([1n]);
+  expect(h.logs).toEqual([
+    "alice: committed to task 1 tx=commit-tx",
+    "ERROR alice: listing the open tasks that invite it failed (ApiError 500)",
+  ]);
 });
 
 test("a_task_rejected_since_the_listing_is_skipped_on_the_fresher_detail", async () => {

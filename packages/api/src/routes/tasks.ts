@@ -4,7 +4,7 @@ import { notFound, parseAccount, parseLimit, parsePhase, parseTag, parseU64 } fr
 import { getTaskDetail, listTasks } from "../queries";
 
 /**
- * `GET /v1/tasks?phase&tag&poster&verifier&parent&limit&cursor` and `GET /v1/tasks/:id`. The
+ * `GET /v1/tasks?phase&tag&poster&verifier&parent&invited&limit&cursor` and `GET /v1/tasks/:id`. The
  * phase of every task is worked out at the time of the request, so a task that has passed a
  * deadline since the indexer last saw an event is already in its next phase.
  */
@@ -21,6 +21,7 @@ export function taskRoutes(deps: ApiDeps): Hono {
         poster: parseAccount("poster", q.poster),
         verifier: parseAccount("verifier", q.verifier),
         parent: parseU64("parent", q.parent),
+        invited: parseAccount("invited", q.invited),
         limit: parseLimit(q.limit),
         cursor: parseU64("cursor", q.cursor),
       },

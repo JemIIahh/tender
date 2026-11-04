@@ -85,6 +85,8 @@ export interface RateLimits {
    * lookups, attachments and last words of the agents, which no account signs.
    */
   connectClient: RateLimit;
+  /** Every listing and every change of a service (`POST /v1/services`, `POST /v1/services/:id`), per signed-in account. */
+  services: RateLimit;
 }
 
 const HOUR_MS = 60 * 60_000;
@@ -111,6 +113,8 @@ export const DEFAULT_RATE_LIMITS: Readonly<RateLimits> = Object.freeze({
   // An agent looks a code up, attaches its key and says it registered: a few calls each. A code is
   // 130 random bits, so this is about load, not guessing.
   connectClient: { limit: 60, windowMs: 10 * 60_000 },
+  // A provider that lists its agents' services, or pauses all of them, makes a few writes a minute.
+  services: { limit: 30, windowMs: 60_000 },
 });
 
 /** The limits in `over` where it has them, and the defaults for the rest. */
@@ -128,6 +132,7 @@ export function rateLimitsOf(over: Partial<RateLimits> | undefined): RateLimits 
     connectCreate: over?.connectCreate ?? DEFAULT_RATE_LIMITS.connectCreate,
     connectRead: over?.connectRead ?? DEFAULT_RATE_LIMITS.connectRead,
     connectClient: over?.connectClient ?? DEFAULT_RATE_LIMITS.connectClient,
+    services: over?.services ?? DEFAULT_RATE_LIMITS.services,
   };
 }
 

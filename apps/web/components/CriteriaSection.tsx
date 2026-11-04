@@ -17,8 +17,11 @@ function splitText(split: PublicCriteria["split"]): string {
 /** A JSON value as text, on one line. */
 const inline = (value: unknown): string => JSON.stringify(value);
 
-/** What is particular to the kind of criteria: the examples, the rubric, the schema. */
-function Detail({ criteria }: { criteria: PublicCriteria }) {
+/**
+ * What is particular to the kind of criteria: the examples, the rubric, the schema. A service's page
+ * shows it too, for the criteria a hire of a Judge-checked service carries.
+ */
+export function CriteriaDetail({ criteria }: { criteria: PublicCriteria }) {
   switch (criteria.kind) {
     case "exact":
       return (
@@ -133,7 +136,7 @@ export function CriteriaSection({ criteria }: { criteria: PublicCriteria | null 
           : "No held-out checks."}
       </p>
       <div data-testid="criteria-detail" className="grid gap-2 text-sm text-bone/90">
-        <Detail criteria={criteria} />
+        <CriteriaDetail criteria={criteria} />
       </div>
     </section>
   );

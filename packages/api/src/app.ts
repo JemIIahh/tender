@@ -11,6 +11,7 @@ import { connectRoutes } from "./routes/connect";
 import { entryRoutes } from "./routes/entries";
 import { healthRoutes } from "./routes/health";
 import { questionRoutes } from "./routes/questions";
+import { serviceRoutes } from "./routes/services";
 import { startRoutes } from "./routes/start";
 import { taskRoutes } from "./routes/tasks";
 import { telegramRoutes } from "./routes/telegram";
@@ -56,6 +57,7 @@ export function createApp(deps: ApiDeps): Hono {
   app.route("/v1", blobRoutes(deps, signedIn));
   app.route("/v1", startRoutes(deps, signedIn));
   app.route("/v1", questionRoutes(deps, signedIn));
+  app.route("/v1", serviceRoutes(deps, signedIn));
   app.route("/v1", telegramRoutes(deps, signedIn));
   app.route("/v1", connectRoutes(deps, signedIn));
   app.route("/v1", eventRoutes(deps));

@@ -435,6 +435,11 @@ function buildWorld(o: WorldOptions = {}) {
     askQuestion: unexpected("askQuestion"),
     answerQuestion: unexpected("answerQuestion"),
     postClarification: unexpected("postClarification"),
+    // Services: the lead offers none, and hires by sub-tasks of its own, not through listings.
+    listServices: async () => ({ services: [], next_cursor: null }),
+    getService: unexpected("getService"),
+    createService: unexpected("createService"),
+    updateService: unexpected("updateService"),
     async uploadBlob(blob) {
       if (blob.kind === "brief") o.hooks?.beforeHire?.(children.length);
       events.push(`upload ${blob.kind}`);

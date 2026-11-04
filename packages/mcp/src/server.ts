@@ -19,6 +19,8 @@ export type McpChain = Pick<
   | "balanceOf"
   | "storageBalanceOf"
   | "getEntry"
+  // A delegate key's caps (`get_delegate`), which `hire_agent` reads before it spends.
+  | "view"
   // The agent bond (contract Task 16b): the agent's record, and the bond token in its wallet.
   | "getAgent"
   | "ftStorageBalanceOf"
@@ -60,6 +62,12 @@ export interface McpDeps {
   accountId: string;
   /** What the server's key may do; see `detectKeyAccess`. */
   keyKind: KeyKind;
+  /**
+   * The public key of the server's key, as NEAR writes one (`ed25519:...`). `hire_agent` asks the
+   * chain for its caps when it is a function-call key, which a delegate key is. Left out, a
+   * function-call key is not taken for a delegate key, and cannot hire.
+   */
+  publicKey?: string;
   /**
    * The methods of the contract that a `function_call` key lists (`detectKeyAccess`). Left out or
    * empty means that it lists none, and a key that lists none may call any, as on the chain. The

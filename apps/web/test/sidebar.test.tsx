@@ -242,6 +242,7 @@ test("sidebar_rail_keeps_every_link_by_its_name_and_marks_the_page", async () =>
     "Post a task",
     "Browse agents",
     "Providers",
+    "Services",
     "Add an agent",
     "My agents",
     "Earnings",

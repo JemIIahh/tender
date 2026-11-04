@@ -121,6 +121,34 @@ export function plainTextFault(text: string): string | null {
 }
 
 /**
+ * Plain text of 1 to `maxChars` characters once the blanks at its ends are cut, under the board's
+ * rules (`BoardTextSchema`, which is this at `BOARD_TEXT_MAX_CHARS`). A service listing's title and
+ * description and a hire's request are held to the same rules, each at its own length.
+ */
+export function plainTextSchema(maxChars: number) {
+  return z
+    .string()
+    .superRefine((text, ctx) => {
+      const found = firstFormatChar(text);
+      if (found !== null) {
+        ctx.addIssue({
+          code: "custom",
+          message: `expected plain text, without invisible formatting characters (found ${found})`,
+        });
+      }
+    })
+    .trim()
+    .min(1, "expected some text")
+    .refine((text) => !LONE_SURROGATE.test(text), "expected well-formed text")
+    .refine((text) => !hasForbiddenChar(text), "expected plain text, without control characters")
+    .refine(
+      // A text of at most that many UTF-16 units has at most that many code points.
+      (text) => text.length <= maxChars || [...text].length <= maxChars,
+      `expected at most ${maxChars} characters`,
+    );
+}
+
+/**
  * The text of a question, an answer or a clarification: plain text of 1 to `BOARD_TEXT_MAX_CHARS`
  * characters once the blanks at its ends are cut. It holds no control character other than a line
  * break or a tab, no bidirectional override and no lone surrogate (which cannot be written as
@@ -130,26 +158,7 @@ export function plainTextFault(text: string): string | null {
  * because the cut of the blanks would take a byte order mark off an end without a word. Markup is
  * not refused: it is text, and nothing here reads it as anything else.
  */
-export const BoardTextSchema = z
-  .string()
-  .superRefine((text, ctx) => {
-    const found = firstFormatChar(text);
-    if (found !== null) {
-      ctx.addIssue({
-        code: "custom",
-        message: `expected plain text, without invisible formatting characters (found ${found})`,
-      });
-    }
-  })
-  .trim()
-  .min(1, "expected some text")
-  .refine((text) => !LONE_SURROGATE.test(text), "expected well-formed text")
-  .refine((text) => !hasForbiddenChar(text), "expected plain text, without control characters")
-  .refine(
-    // A text of at most that many UTF-16 units has at most that many code points.
-    (text) => text.length <= BOARD_TEXT_MAX_CHARS || [...text].length <= BOARD_TEXT_MAX_CHARS,
-    `expected at most ${BOARD_TEXT_MAX_CHARS} characters`,
-  );
+export const BoardTextSchema = plainTextSchema(BOARD_TEXT_MAX_CHARS);
 
 // ---- Requests ---------------------------------------------------------------------------------
 

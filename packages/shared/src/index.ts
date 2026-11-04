@@ -14,6 +14,7 @@ export * from "./phase";
 export * from "./profile";
 export * from "./rubric";
 export * from "./scorecard";
+export * from "./services";
 export * from "./signin";
 export * from "./storage";
 export * from "./views";

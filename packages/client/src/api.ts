@@ -14,6 +14,7 @@ import {
   ConnectLookupSchema,
   type ConnectRegistered,
   ConnectRegisteredSchema,
+  type CreateServiceRequest,
   canonicalBase,
   fetchJson,
   type HealthResponse,
@@ -23,6 +24,9 @@ import {
   type ListAgentsFilter,
   type ListAgentsResponse,
   ListAgentsResponseSchema,
+  type ListServicesFilter,
+  type ListServicesResponse,
+  ListServicesResponseSchema,
   type ListTasksFilter,
   type ListTasksResponse,
   ListTasksResponseSchema,
@@ -31,6 +35,8 @@ import {
   QuestionResponseSchema,
   type Scorecard,
   ScorecardSchema,
+  type ServiceResponse,
+  ServiceResponseSchema,
   SIGN_IN_MESSAGE,
   SignInResponseSchema,
   type StartResponse,
@@ -43,6 +49,7 @@ import {
   type TelegramLinkResponse,
   TelegramLinkResponseSchema,
   type TenderApi,
+  type UpdateServiceRequest,
 } from "@tender/shared";
 import { KeyPair, type KeyPairString } from "near-api-js";
 import type { Signer } from "./client";
@@ -365,6 +372,7 @@ export class ApiClient implements TenderApi {
       poster: filter.poster,
       verifier: filter.verifier,
       parent: filter.parent,
+      invited: filter.invited,
       limit: filter.limit,
       cursor: filter.cursor,
     });
@@ -442,6 +450,36 @@ export class ApiClient implements TenderApi {
           get(signal),
           this.fetchImpl,
         ),
+      ),
+    );
+  }
+
+  listServices(filter: ListServicesFilter = {}): Promise<ListServicesResponse> {
+    const query = queryOf({
+      q: filter.q,
+      tag: filter.tag,
+      provider: filter.provider,
+      agent: filter.agent,
+      token: filter.token,
+      max_price: filter.maxPrice,
+      status: filter.status,
+      limit: filter.limit,
+      cursor: filter.cursor,
+    });
+    return this.timed("listServices", (signal) =>
+      fetchJson(
+        this.url(`/services${query}`),
+        ListServicesResponseSchema,
+        get(signal),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  getService(id: bigint): Promise<ServiceResponse | null> {
+    return orNull(
+      this.timed("getService", (signal) =>
+        fetchJson(this.url(`/services/${id}`), ServiceResponseSchema, get(signal), this.fetchImpl),
       ),
     );
   }
@@ -553,6 +591,28 @@ export class ApiClient implements TenderApi {
         this.url(`/tasks/${taskId}/clarifications`),
         ClarificationResponseSchema,
         post(signal, token, { text }),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  createService(service: CreateServiceRequest): Promise<ServiceResponse> {
+    return this.signedIn("createService", (token, signal) =>
+      fetchJson(
+        this.url("/services"),
+        ServiceResponseSchema,
+        post(signal, token, service),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  updateService(id: bigint, update: UpdateServiceRequest): Promise<ServiceResponse> {
+    return this.signedIn("updateService", (token, signal) =>
+      fetchJson(
+        this.url(`/services/${id}`),
+        ServiceResponseSchema,
+        post(signal, token, update),
         this.fetchImpl,
       ),
     );
