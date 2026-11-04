@@ -150,6 +150,8 @@ export interface TaskEntry {
   uri: string | null;
   revealed: boolean;
   is_team: boolean;
+  /** The block time (ns) of the entry's `revealed` event; null without one. */
+  revealed_at: string | null;
 }
 
 export interface TaskFunder {

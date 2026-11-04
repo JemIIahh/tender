@@ -47,11 +47,28 @@ function revealedEntries(entries: readonly TaskEntry[]): TaskEntry[] {
     });
 }
 
-/** When an entry was revealed, if the API says: the block time of its `revealed` event. */
-function revealedAt(entry: TaskEntry): string | null {
-  const at = (entry as TaskEntry & { revealed_at?: string | null }).revealed_at;
-  if (typeof at !== "string" || !/^\d+$/.test(at)) return null;
-  return new Date(Number(BigInt(at) / 1_000_000n)).toISOString().replace(/\.\d{3}Z$/, "Z");
+/** How a reveal time reads: `29 Oct, 20:54:59 UTC`, the same wherever the page is opened. */
+const REVEAL_TIME = new Intl.DateTimeFormat("en-GB", {
+  day: "numeric",
+  month: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+  timeZone: "UTC",
+});
+
+/** When an entry was revealed, if the API says (the block time of its reveal), as a `<time>`. */
+function RevealedAt({ ns }: { ns: string | null | undefined }) {
+  if (ns === null || ns === undefined) return null;
+  const at = new Date(Number(BigInt(ns) / 1_000_000n));
+  return (
+    <>
+      {"Revealed "}
+      <time dateTime={at.toISOString()}>{`${REVEAL_TIME.format(at)} UTC`}</time>
+      {" · "}
+    </>
+  );
 }
 
 /** What the person has chosen, as `pick` takes it, or why it can't be sent yet. */
@@ -261,7 +278,6 @@ export function PickPanel({
             const shareId = `${id}-share-${entry.entry_index}`;
             const reasonId = `${id}-reason-${entry.entry_index}`;
             const fieldError = choice.fieldErrors[entry.account];
-            const at = revealedAt(entry);
             return (
               <li
                 key={entry.account}
@@ -282,10 +298,9 @@ export function PickPanel({
                     />
                     <span className="grid min-w-0 gap-1">
                       <TeamBadge account={entry.account} isTeam={entry.is_team} />
-                      <span className="text-[12.5px] text-muted">
-                        {at === null
-                          ? `Committed at block ${entry.committed_height}`
-                          : `Revealed ${at} · committed at block ${entry.committed_height}`}
+                      <span data-testid="pick-entry-when" className="text-[12.5px] text-muted">
+                        <RevealedAt ns={entry.revealed_at} />
+                        {`${entry.revealed_at == null ? "Committed" : "committed"} at block ${entry.committed_height}`}
                       </span>
                     </span>
                   </label>

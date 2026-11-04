@@ -480,6 +480,8 @@ test("task_detail_includes_entries_brief_and_children", async () => {
       uri: "ipfs://alice-work",
       revealed: true,
       is_team: true,
+      // The block time of her reveal, 10 s after the commit deadline.
+      revealed_at: "1793307299820229000",
     },
     {
       account: bob,
@@ -489,6 +491,7 @@ test("task_detail_includes_entries_brief_and_children", async () => {
       uri: BOB_ENTRY.uri,
       revealed: true,
       is_team: false,
+      revealed_at: "1793307300820229000",
     },
   ]);
   // The poster first, as the contract lists its funders, then the top-ups.
@@ -515,6 +518,7 @@ test("task_detail_includes_entries_brief_and_children", async () => {
       uri: null,
       revealed: false,
       is_team: false,
+      revealed_at: null,
     },
   ]);
 });

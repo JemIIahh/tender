@@ -40,6 +40,7 @@ function judged(verifier: string, task: Partial<TaskDetailResponse["task"]> = {}
           content_hash: hashOf(ALICE),
           uri: `http://api.test/v1/blobs/${hashOf(ALICE)}`,
           revealed: true,
+          revealed_at: "1793307299820229000",
         }),
         entry(BOB, {
           entry_index: 1,
@@ -117,6 +118,13 @@ test("the_verifier_sees_each_revealed_entry_with_its_delivery_as_text", async ()
   expect(delivery.textContent).toBe(WORK[ALICE]);
   expect(delivery.querySelector("b")).toBeNull();
   expect(within(pick).getByLabelText(`Reason for ${ALICE} (optional)`)).toBeTruthy();
+  // When each revealed, where the API says, and the block it committed at.
+  expect(within(rows[0] as HTMLElement).getByTestId("pick-entry-when").textContent).toBe(
+    "Revealed 29 Oct, 20:54:59 UTC · committed at block 100",
+  );
+  expect(within(rows[1] as HTMLElement).getByTestId("pick-entry-when").textContent).toBe(
+    "Committed at block 101",
+  );
 });
 
 test("one_winner_gets_all_of_it_after_the_fee_with_the_exact_amount", async () => {
