@@ -15,3 +15,5 @@ apps/web/next-env.d.ts
 *.tsbuildinfo
 # The real seeds' held-out checks and solutions: secret until a task is judged, so never in the repository (seeds/README.md).
 seeds-private/
+# A submission payload (it holds personal details): never in the repository.
+.submission/
