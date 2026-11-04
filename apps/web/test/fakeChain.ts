@@ -137,7 +137,17 @@ export interface FakeTask {
   maxEntries: number;
   maxWinners: number;
   invited: string[];
+  /** Who paid into the escrow, and how much, the poster first. */
+  funders?: Array<[string, bigint]>;
+  /** How many entries were committed and revealed: the model has no entries of its own. */
+  commitCount?: number;
+  revealCount?: number;
+  /** Set once the task is voided. The model voids; it does not pick. */
+  voided?: { reason: "no_reveals" | "expired" };
 }
+
+/** `MAX_FUNDERS` of the contract: the most funders a task may have, the poster among them. */
+const MAX_FUNDERS = 50;
 
 export class FakeChain {
   /** Every call that ran, a failed one included. */
@@ -228,6 +238,10 @@ export class FakeChain {
           return this.storageView(account);
         case "task_count":
           return (this.nextTaskId - 1n).toString();
+        case "get_task": {
+          const task = this.tasks.get(BigInt(String(args.task_id ?? "0")));
+          return task === undefined ? null : this.taskView(task);
+        }
         case "get_tasks": {
           // As the contract pages: from `from_id` (at least 1), up to `limit` (1 to 50) tasks.
           const from = BigInt(String(args.from_id ?? "1")) || 1n;
@@ -285,13 +299,46 @@ export class FakeChain {
       max_winners: task.maxWinners,
       invited: task.invited,
       parent: null,
-      commit_count: 0,
-      reveal_count: 0,
+      commit_count: task.commitCount ?? 0,
+      reveal_count: task.revealCount ?? 0,
       cleaned: 0,
-      funders: [],
-      outcome: null,
-      phase: "open",
+      funders: this.fundersOf(task).map(([account, amount]) => ({
+        account,
+        amount: amount.toString(),
+      })),
+      outcome:
+        task.voided === undefined
+          ? null
+          : {
+              kind: "voided",
+              reason: task.voided.reason,
+              scorecard_hash: null,
+              scorecard_uri: null,
+            },
+      phase: this.phaseOf(task),
     };
+  }
+
+  /** The funders of `task`: the poster with the reward, unless the task says otherwise. */
+  private fundersOf(task: FakeTask): Array<[string, bigint]> {
+    return task.funders ?? [[task.poster, task.reward]];
+  }
+
+  /** The phase of `task` now, by the contract's rule. */
+  private phaseOf(task: FakeTask): string {
+    const now = this.now();
+    if (task.voided !== undefined) return "settled";
+    if (now < task.commitDeadline) return "open";
+    if (now < task.revealDeadline) return "revealing";
+    if (now < task.pickDeadline) return "judging";
+    if (now < task.fallbackDeadline) return "fallback";
+    return "expired";
+  }
+
+  /** Puts `task` on the chain as it is, as if it had been posted: for a test that needs one. */
+  addTask(task: FakeTask): void {
+    this.tasks.set(task.id, task);
+    if (task.id >= this.nextTaskId) this.nextTaskId = task.id + 1n;
   }
 
   private storageView(account: string) {
@@ -378,6 +425,10 @@ export class FakeChain {
           return this.storageWithdraw(signer, args, deposit);
         case "post_task":
           return this.postTask(signer, args, deposit);
+        case "top_up_task":
+          return this.topUpTask(signer, args, deposit);
+        case "void_task":
+          return this.voidTask(args, deposit);
         default:
           throw panic("E_ARGS", `no such method ${methodName}`);
       }
@@ -604,6 +655,112 @@ export class FakeChain {
           max_winners: maxWinners,
           invited,
           parent: null,
+        }),
+      ]),
+    ];
+  }
+
+  /**
+   * `top_up_task`, with the contract's rules in its order (contract/tender/src/tasks.rs): not
+   * paused, the task exists, its commit window is open, it is not settled, room for a new funder,
+   * the token enabled, an amount above 0 and, for a new funder, at least the token's minimum, a
+   * reward within its maximum, 1 yoctoNEAR, and the vault holding the amount. A new funder's record
+   * is charged to its storage (`E_STORAGE` if it cannot hold it).
+   */
+  private topUpTask(signer: string, args: Record<string, unknown>, deposit: bigint) {
+    if (this.paused) throw panic("E_PAUSED", "topping up tasks is paused");
+    const id = BigInt(String(args.task_id ?? "0"));
+    const task = this.tasks.get(id);
+    if (task === undefined) throw panic("E_NOT_FOUND", `no task ${id}`);
+    if (this.now() >= task.commitDeadline) {
+      throw panic("E_PHASE", `task ${id} takes top-ups only until its commit deadline`);
+    }
+    if (task.voided !== undefined) throw panic("E_SETTLED", `task ${id} is already settled`);
+    const funders = this.fundersOf(task);
+    const known = funders.findIndex(([account]) => account === signer);
+    if (known < 0 && funders.length >= MAX_FUNDERS) {
+      throw panic("E_LIMIT", `task ${id} has ${MAX_FUNDERS} funders, the most it can have`);
+    }
+    if (this.tokens.get(task.token) !== true) {
+      throw panic("E_TOKEN", `${task.token} is not an enabled token`);
+    }
+    const amount = BigInt(String(args.amount ?? "0"));
+    const limits = this.rewardLimits.get(task.token) ?? { min: 1n, max: U128_MAX };
+    if (amount === 0n) throw panic("E_REWARD", "a top-up must be more than 0");
+    if (known < 0 && amount < limits.min) {
+      throw panic(
+        "E_REWARD",
+        `a first top-up must be at least the token's min_reward of ${limits.min}`,
+      );
+    }
+    if (task.reward + amount > limits.max) {
+      throw panic("E_REWARD", `a top-up of ${amount} would take the reward past ${limits.max}`);
+    }
+    if (deposit !== 1n) throw panic("E_AUTH", "attach exactly 1 yoctoNEAR");
+    const balance = this.slots(signer).get(task.token) ?? 0n;
+    if (balance < amount) throw panic("E_FUNDS", "insufficient vault balance");
+    if (known < 0) {
+      const record = this.storage.get(signer);
+      const bytes = BigInt(4 + new TextEncoder().encode(signer).length + 16);
+      if (record === undefined || record.total - (record.usedBytes + bytes) * BYTE_COST < 0n) {
+        throw panic("E_STORAGE", "the storage balance cannot hold the funder record");
+      }
+      this.storage.set(signer, { ...record, usedBytes: record.usedBytes + bytes });
+    }
+
+    this.slots(signer).set(task.token, balance - amount);
+    const next: Array<[string, bigint]> =
+      known < 0
+        ? [...funders, [signer, amount]]
+        : funders.map(([account, paid], i) => [account, i === known ? paid + amount : paid]);
+    task.funders = next;
+    task.reward += amount;
+    return [
+      this.receipt(this.contractId, [
+        eventLine("task_topped_up", {
+          task_id: id.toString(),
+          funder: signer,
+          amount: amount.toString(),
+          reward: task.reward.toString(),
+        }),
+      ]),
+    ];
+  }
+
+  /**
+   * `void_task` (contract/tender/src/settle.rs): once the reveal window is over with nothing
+   * revealed, or the fallback window is over, anyone may void the task, and each funder gets back
+   * exactly what it paid in. Not payable.
+   */
+  private voidTask(args: Record<string, unknown>, deposit: bigint) {
+    if (deposit !== 0n) throw new Panic("Method void_task doesn't accept deposit");
+    const id = BigInt(String(args.task_id ?? "0"));
+    const task = this.tasks.get(id);
+    if (task === undefined) throw panic("E_NOT_FOUND", `no task ${id}`);
+    if (task.voided !== undefined) throw panic("E_SETTLED", `task ${id} is already settled`);
+    const now = this.now();
+    const revealed = task.revealCount ?? 0;
+    const reason =
+      revealed === 0 && now >= task.revealDeadline
+        ? ("no_reveals" as const)
+        : now >= task.fallbackDeadline
+          ? ("expired" as const)
+          : null;
+    if (reason === null) throw panic("E_PHASE", `task ${id} cannot be voided yet`);
+    const funders = this.fundersOf(task);
+    for (const [account, amount] of funders) {
+      this.slots(account).set(task.token, (this.slots(account).get(task.token) ?? 0n) + amount);
+    }
+    task.voided = { reason };
+    return [
+      this.receipt(this.contractId, [
+        eventLine("voided", {
+          task_id: id.toString(),
+          reason,
+          by: null,
+          refunds: funders.map(([account, amount]) => ({ account, amount: amount.toString() })),
+          scorecard_hash: null,
+          scorecard_uri: null,
         }),
       ]),
     ];

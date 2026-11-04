@@ -300,9 +300,10 @@ const USER_REFUSAL = /(?=.*\buser\b)(?=.*(?:reject|declin|den(?:y|ied)|cancel|re
  * Whether a send that threw is known to have ended without a post: a wallet that was not connected,
  * a transaction that failed on the network, a person who turned the request down. Any other
  * failure, a wallet window that closed or a connection that dropped included, may have come after
- * the transactions were sent, so what became of the post is not known.
+ * the transactions were sent, so what became of the post is not known. The task page's actions
+ * (lib/pick.ts, lib/refund.ts, lib/topUp.ts) go by the same rule.
  */
-function outcomeKnown(thrown: unknown): boolean {
+export function outcomeKnown(thrown: unknown): boolean {
   return (
     thrown instanceof WalletNotConnected ||
     thrown instanceof TransactionFailed ||

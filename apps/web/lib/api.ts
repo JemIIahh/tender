@@ -28,6 +28,7 @@ import {
   type ListTasksFilter,
   type ListTasksResponse,
   ListTasksResponseSchema,
+  MAX_RESULT_BYTES,
   type QuestionResponse,
   QuestionResponseSchema,
   type Scorecard,
@@ -269,6 +270,29 @@ export const api = {
     const task = taskIdText(taskId);
     if (task === undefined) return null;
     return orNull(get(`/tasks/${task}/questions`, TaskBoardSchema));
+  },
+
+  /**
+   * `GET /v1/blobs/:sha256`: the bytes the API serves by that hash, such as the work an entry
+   * revealed, once its task's reveal window is over; null if it serves none (a 404), as for a string
+   * that is no hash. The bytes are whatever a stranger uploaded: check their hash, and show them as
+   * text only. An answer longer than the largest result the API keeps is refused, unread.
+   */
+  async getBlob(sha256: string): Promise<Uint8Array | null> {
+    if (!/^[0-9a-f]{64}$/.test(sha256)) return null;
+    return withTimeout(READ_TIMEOUT_MS, async (signal) => {
+      const res = await fetch(url(`/blobs/${sha256}`), { signal });
+      if (res.status === 404) return null;
+      if (!res.ok) throw new ApiError(res.status, null);
+      const declared = Number(res.headers.get("content-length") ?? "0");
+      if (declared > MAX_RESULT_BYTES)
+        throw new ApiError(res.status, null, "the blob is too large");
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.length > MAX_RESULT_BYTES) {
+        throw new ApiError(res.status, null, "the blob is too large");
+      }
+      return bytes;
+    });
   },
 
   /** `GET /v1/health`: how far the index is behind the chain; a 503 throws an `ApiError`. */

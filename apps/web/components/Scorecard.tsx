@@ -1,4 +1,9 @@
-import { canonicalJson, isJudgeBranded, type Scorecard as ScorecardDocument } from "@tender/shared";
+import {
+  canonicalJson,
+  HAND_PICK_SOFTWARE,
+  isJudgeBranded,
+  type Scorecard as ScorecardDocument,
+} from "@tender/shared";
 import { useMemo } from "react";
 import { formatBps } from "../lib/bps";
 import { FACT_LABEL, PANEL, PANEL_TITLE, SECONDARY } from "./ui";
@@ -26,7 +31,8 @@ function heldoutHref(heldout: unknown): string | undefined {
  * Tender Judge's: the API takes such a card from the Judge's account only (P03-R29), and a build
  * that knows the Judge's account holds the card to that too. Any other is named by what it says it
  * is. A rubric is scored by a model, which is a judgement and not a check, so it is said to be
- * subjective (spec 7.3) and the model is named.
+ * subjective (spec 7.3) and the model is named. A pick made by hand (`HAND_PICK_SOFTWARE`) is
+ * said to be one, with the account that made it.
  */
 export function ScoredBy({
   scorecard,
@@ -36,6 +42,14 @@ export function ScoredBy({
   judgeAccount: string | null;
 }) {
   const { software, model } = scorecard.judge;
+  // A pick made by hand on the task page: a person chose, and the scores only write the choice down.
+  if (software === HAND_PICK_SOFTWARE) {
+    return (
+      <p data-testid="scored-by" className="text-sm text-muted wrap-anywhere">
+        {`Picked by hand by ${scorecard.verifier}. No software scored the entries: each winner is listed at 100, every other entry at 0.`}
+      </p>
+    );
+  }
   const byJudge =
     isJudgeBranded(software) && (judgeAccount === null || scorecard.verifier === judgeAccount);
   const who = byJudge ? "the Tender Judge" : software;

@@ -20,6 +20,7 @@ import { phaseOfTask } from "../lib/phase";
 import { view } from "../lib/rpc";
 import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
+import { TaskActions } from "./actions/TaskActions";
 import { BriefSection } from "./BriefSection";
 import { CriteriaSection } from "./CriteriaSection";
 import { EntryList } from "./EntryList";
@@ -265,6 +266,8 @@ function ReadyView({
       {/* The board explains the brief and the criteria, so it comes after them. */}
       <Questions task={task} phase={phase} refresh={boardEvents} />
       <EntryList entries={entries} phase={phase} />
+      {/* What can be done now: pick, refund, top up (`#pick`, `#refund`, `#top-up`). */}
+      <TaskActions data={loaded.data} nowNs={nowNs} judgeAccount={judgeAccount} />
       <VerifierRecord
         account={task.verifier}
         isJudge={isJudge}

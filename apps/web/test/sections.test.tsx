@@ -252,6 +252,21 @@ test.each([
   expect(screen.getByTestId("scored-by").textContent).toBe(line);
 });
 
+test("scorecard_of_a_pick_by_hand_says_a_person_chose_and_nothing_scored", () => {
+  render(
+    <Scorecard
+      scorecard={scorecard({
+        verifier: "poster.testnet",
+        judge: { software: "tender-web/1", model: null },
+      })}
+    />,
+  );
+
+  expect(screen.getByTestId("scored-by").textContent).toBe(
+    "Picked by hand by poster.testnet. No software scored the entries: each winner is listed at 100, every other entry at 0.",
+  );
+});
+
 test("scorecard_of_a_rubric_is_labelled_subjective_and_names_the_model", () => {
   render(
     <Scorecard
