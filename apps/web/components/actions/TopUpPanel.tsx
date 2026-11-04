@@ -59,6 +59,8 @@ export function TopUpPanel({
   // The page's clock, which a send decides by as the form does.
   const nowRef = useRef(nowNs);
   nowRef.current = nowNs;
+  // A second press before the page has drawn the first as busy sends nothing more.
+  const sending = useRef(false);
   const id = useId();
   const { symbol } = tokenMeta(task.token, config.network);
 
@@ -96,7 +98,8 @@ export function TopUpPanel({
   async function send() {
     setTouched(true);
     if (busy || accountId === null || terms === null || reading === null || !reading.ok) return;
-    if (problem !== null) return;
+    if (problem !== null || sending.current) return;
+    sending.current = true;
     setRun({ status: "busy" });
     try {
       const result = await submitTopUp(
@@ -121,6 +124,8 @@ export function TopUpPanel({
           error instanceof TopUpFailure ? error.message : "Something went wrong. Nothing was sent.",
       });
       setReads((n) => n + 1);
+    } finally {
+      sending.current = false;
     }
   }
 

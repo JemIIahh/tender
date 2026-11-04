@@ -51,10 +51,13 @@ export function RefundPanel({
   const accountRef = useRef(wallet.accountId);
   accountRef.current = wallet.accountId;
   const open = view.kind === "open";
+  // A second press before the page has drawn the first as busy sends nothing more.
+  const sending = useRef(false);
   const busy = run.status === "busy";
 
   async function send() {
-    if (!open || busy || wallet.accountId === null) return;
+    if (!open || busy || sending.current || wallet.accountId === null) return;
+    sending.current = true;
     setRun({ status: "busy" });
     try {
       const result = await submitRefund(
@@ -72,6 +75,8 @@ export function RefundPanel({
             ? error.message
             : "Something went wrong. Nothing was sent.",
       });
+    } finally {
+      sending.current = false;
     }
   }
 

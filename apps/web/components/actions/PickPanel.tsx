@@ -137,6 +137,8 @@ export function PickPanel({
   // A try again of the same pick writes the same scorecard: the time it was written is kept for as
   // long as the choice is the same.
   const written = useRef<{ key: string; at: Date } | null>(null);
+  // A second press before the page has drawn the first as busy sends nothing more.
+  const sending = useRef(false);
   const id = useId();
 
   useEffect(() => {
@@ -183,7 +185,8 @@ export function PickPanel({
       : null;
 
   async function send(winners: readonly PickWinner[]) {
-    if (busy || wallet.accountId === null) return;
+    if (busy || sending.current || wallet.accountId === null) return;
+    sending.current = true;
     const key = JSON.stringify([winners, reasons]);
     if (written.current?.key !== key) written.current = { key, at: new Date() };
     const writtenAt = written.current.at;
@@ -221,6 +224,8 @@ export function PickPanel({
             ? error.message
             : "Something went wrong before the pick was sent. Nothing was paid.",
       });
+    } finally {
+      sending.current = false;
     }
   }
 
