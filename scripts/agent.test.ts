@@ -331,13 +331,16 @@ test("init_takes_a_directory_inside_the_repository_that_git_ignores", async () =
 
 test("init_refuses_a_directory_inside_the_repository_when_git_cannot_be_asked", async () => {
   // No git on the PATH: the answer is no, even for the directory that is ignored.
+  const ignored = join(REPO, ".tender", `guard-test-${process.pid}`);
   vi.stubEnv("PATH", dir);
   try {
-    await refused(join(REPO, ".tender", `guard-test-${process.pid}`));
+    await refused(ignored);
+    expect(await exists(ignored)).toBe(false);
   } finally {
     vi.unstubAllEnvs();
+    // Should the guard ever let it through, the key it made does not stay in the repository.
+    await rm(ignored, { recursive: true, force: true });
   }
-  expect(await exists(join(REPO, ".tender", `guard-test-${process.pid}`))).toBe(false);
 });
 
 test("a_command_refuses_a_key_directory_inside_the_repository_as_init_does", async () => {
