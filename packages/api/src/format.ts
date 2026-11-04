@@ -150,8 +150,11 @@ export interface TaskEntry {
   uri: string | null;
   revealed: boolean;
   is_team: boolean;
-  /** The block time (ns) of the entry's `revealed` event; null without one. */
-  revealed_at: string | null;
+  /**
+   * The block time (ns) of the entry's `revealed` event; null without one. The API always sends it;
+   * it is optional as it is in `TaskEntrySchema`, which takes an answer from before it too.
+   */
+  revealed_at?: string | null;
 }
 
 export interface TaskFunder {
