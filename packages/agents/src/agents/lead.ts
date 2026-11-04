@@ -24,6 +24,7 @@ import {
   U64StringSchema,
 } from "@tender/shared";
 import type { Solver, TaskContext } from "../types";
+import { journalHeldElsewhere, lockJournal } from "./lead-lock";
 
 // The lead agent of a swarm: it takes a parent task that is too big to answer alone, hires
 // specialists for its parts with sub-tasks of its own, and answers the parent with what they hand in.
@@ -58,9 +59,11 @@ import type { Solver, TaskContext } from "../types";
 //
 // Every step of a job is written down before it is taken (the journal: one small file for each
 // parent, `journalDir/<parent id>.json`), so a restart picks the job up where it stopped and never
-// hires a part twice. A post is written down before it is sent as an intent, and a job that finds
-// an intent it cannot account for asks the chain whether the post landed (`reconcile`) before it
-// posts anything. A note is only a note if it outlives a power cut, so a write returns once the file
+// hires a part twice. One lead works from a journal at a time: `run` holds it with a lock file
+// (`lead-lock.ts`), a second lead's `run` on it is refused with the pid that holds it, and a lead
+// that does not hold it takes no parent and makes no pass while another live process does. A post
+// is written down before it is sent as an intent, and a job that finds an intent it cannot account
+// for asks the chain whether the post landed (`reconcile`) before it posts anything. A note is only a note if it outlives a power cut, so a write returns once the file
 // is on the disk and its name is too (`writeFileAtomic`: temp file synced, renamed, folder synced);
 // a write that cannot be made so fails, and the post that waited on it is not sent.
 //
@@ -219,7 +222,10 @@ export interface LeadSolverOptions {
    * saves is the one the runner reveals.
    */
   state: StateStore;
-  /** The file system the journal is on. Default: the real one. A test gives one that can lose power. */
+  /**
+   * The file system the journal is on. Default: the real one. A test gives one that can lose power.
+   * The lock that `run` holds on the journal (`lead-lock.ts`) is on the real one, at `journalDir`.
+   */
   fs?: JournalFs;
   /** Replaces the windows of every sub-task, for a demo that cannot wait a whole phase. */
   windows?: ChildWindows;
@@ -254,9 +260,18 @@ export interface LeadSolverOptions {
  * runner's loop, or `tick` once, for a test. Nothing is hired until one of them runs.
  */
 export interface LeadSolver extends Solver {
-  /** One pass over every job that is under way. Passes never overlap: a second call joins the first. */
+  /**
+   * One pass over every job that is under way. Passes never overlap: a second call joins the first.
+   * A pass does nothing while another live process holds the journal (`run` of another lead).
+   */
   tick(): Promise<void>;
-  /** Passes every `pollMs` until `signal` aborts. It resolves once the pass in hand is done. */
+  /**
+   * Holds the journal (`lockJournal`: a lock file in `journalDir`, with this process's pid and start
+   * time) and passes every `pollMs` until `signal` aborts. It resolves once the pass in hand is done
+   * and the journal is let go. It rejects at once, having done nothing, with a `JournalLockedError`
+   * when another lead holds the journal: one in another process (the message names its pid) or in
+   * this one.
+   */
   run(signal: AbortSignal): Promise<void>;
   /** The parents the lead has a job for that is not over. */
   active(): Promise<string[]>;
@@ -1270,7 +1285,24 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
     if (job.status === "assembling") await assembling(job);
   }
 
+  /** Whether the journal is another live process's, said once each time it becomes so. */
+  let heldBy: number | null | undefined;
+  function heldElsewhere(): { pid: number | null } | null {
+    const other = journalHeldElsewhere(journalDir);
+    if (other !== null && other.pid !== heldBy) {
+      const who = other.pid === null ? "a lock file that names no process" : `process ${other.pid}`;
+      log(
+        `WARN another lead, ${who}, holds the journal ${journalDir}: this lead does nothing with it until that one stops`,
+      );
+    }
+    heldBy = other === null ? undefined : other.pid;
+    return other;
+  }
+
   async function pass(): Promise<void> {
+    // Two leads on one journal could both hire. One that runs holds the lock, and this is how a lead
+    // driven a pass at a time (`tick`) keeps out of its way.
+    if (heldElsewhere() !== null) return;
     let jobs: Job[];
     try {
       jobs = await listJobs();
@@ -1334,9 +1366,18 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
     scripted: false,
     tick,
     async run(signal) {
-      while (!signal.aborted) {
-        await tick().catch((error: unknown) => log(`ERROR a pass failed (${describe(error)})`));
-        await sleep(pollMs, signal);
+      // Before the first pass, and before anything is awaited: a lead that cannot hold the journal
+      // does nothing at all.
+      const lock = lockJournal(journalDir, log);
+      try {
+        while (!signal.aborted) {
+          await tick().catch((error: unknown) => log(`ERROR a pass failed (${describe(error)})`));
+          await sleep(pollMs, signal);
+        }
+        // A pass that a direct `tick` started is over before the journal is let go.
+        await running?.catch(() => undefined);
+      } finally {
+        lock.release();
       }
     },
     async active() {
@@ -1347,6 +1388,16 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
       try {
         const account = client.accountId;
         if (account === undefined) throw new Error(NO_SIGNER);
+        // A job begun here would be the other lead's to run as well.
+        const other = journalHeldElsewhere(journalDir);
+        if (other !== null) {
+          const who =
+            other.pid === null ? "a lock file that names no process" : `process ${other.pid}`;
+          log(
+            `declining task ${ctx.task.id}: another lead, ${who}, holds the journal ${journalDir}`,
+          );
+          return null;
+        }
         const declined = await declines(ctx);
         if (declined !== null) {
           log(`declining task ${ctx.task.id}: ${declined}`);
