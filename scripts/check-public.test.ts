@@ -14,7 +14,17 @@ import { describe, expect, test } from "vitest";
 //   under `seeds-private/` (the real seeds' held-out checks and answers, seeds/README.md);
 // - the owner's email address, or any address at its domain;
 // - a NEAR ed25519 private key (`ed25519:` and 80 or more base58 characters), a PEM private key
-//   and a Telegram bot token.
+//   and a Telegram bot token;
+// - the shapes of common service credentials: an `sk-` API key (a form several providers use), a
+//   GitHub token, an AWS access key id, a Slack token, a Google API key and a JWT;
+// - an environment-style line (`NAME=value`, at the start of a line, with or without `export`)
+//   whose name ends in API_KEY, APIKEY, SECRET, TOKEN, PASSWORD, JWT or PRIVATE_KEY and whose value
+//   is 16 or more characters that are no placeholder (`<...>`, `$VAR`, `...`, `xxxx`, `example`).
+//
+// It does not find a secret of a shape it does not know (a short password, a key in a TypeScript
+// object literal such as `FASTNEAR_API_KEY: "..."`, or a credential with no recognisable prefix),
+// and it skips a file over 3 MB or with a NUL byte. It is a net for the likely mistakes, and the
+// pre-commit hook's gitleaks run (when installed) is a second one; neither proves a tree clean.
 //
 // A finding is told by file, line and rule, never by the text it matched: the text is the secret.
 //
@@ -85,6 +95,16 @@ function fixtureSignatures(path: string, text: string): Set<string> {
   return found;
 }
 
+/** Whether the value of an assignment is a stand-in and no secret: `<...>`, `$VAR`, `...`, `xxxx`. */
+function isPlaceholder(value: string): boolean {
+  return (
+    /^[<$[{(]/.test(value) ||
+    /\.\.\.|…/.test(value) ||
+    /^(?:x+|\*+|\.+|-+)$/i.test(value) ||
+    /example|placeholder|changeme|your[-_]/i.test(value)
+  );
+}
+
 const RULES: readonly Rule[] = [
   {
     name: "the owner's email address",
@@ -109,6 +129,40 @@ const RULES: readonly Rule[] = [
   {
     name: "a Telegram bot token",
     pattern: /(?<![0-9A-Za-z_-])[0-9]{8,10}:[A-Za-z0-9_-]{35}(?![0-9A-Za-z_-])/,
+  },
+  {
+    // `sk-` and 32 or more more characters: the form several providers use, with or without a
+    // longer prefix after the `sk-`. Shorter strings such as `sk-test-0001` are the fakes of tests.
+    name: "an sk- API key",
+    pattern: /(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{32,}/,
+  },
+  {
+    name: "a GitHub token",
+    pattern: /(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})/,
+  },
+  {
+    name: "an AWS access key id",
+    pattern: /(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])/,
+  },
+  {
+    name: "a Slack token",
+    pattern: /(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}/,
+  },
+  {
+    name: "a Google API key",
+    pattern: /(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/,
+  },
+  {
+    name: "a JWT",
+    pattern: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+  },
+  {
+    // The form of an env file, a shell line or a docs snippet: the name at the start of the line.
+    // `.env.example` has empty values and docs have placeholders, so neither matches.
+    name: "a secret assigned to an environment variable",
+    pattern:
+      /^\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:API_KEY|APIKEY|SECRET|TOKEN|PASSWORD|JWT|PRIVATE_KEY)=["']?[^\s"'#]{16,}/,
+    excused: (match) => isPlaceholder(match.text.replace(/^[^=]*=["']?/, "")),
   },
 ];
 
@@ -295,7 +349,74 @@ describe("the rules of the scan, on invented files", () => {
         ["d.md", "TELEGRAM_BOT_TOKEN=123456:short\n"],
       ]),
     );
-    expect(found).toEqual(["a.pem:1: a PEM private key", "c.md:1: a Telegram bot token"]);
+    expect(found).toEqual([
+      "a.pem:1: a PEM private key",
+      "c.md:1: a Telegram bot token",
+      // The same line is also a secret assigned to a variable named for one.
+      "c.md:1: a secret assigned to an environment variable",
+    ]);
+  });
+
+  test("the shapes of common service credentials are found, and the fakes of tests are not", () => {
+    // Written in parts, like the address: this file is scanned too.
+    const a = (n: number) => "A1b2C3d4E5".repeat(Math.ceil(n / 10)).slice(0, n);
+    const found = findProblems(
+      new Map([
+        ["a.md", `key ${["sk", "-", a(48)].join("")}\n`],
+        ["b.md", `key ${["sk", "-ant-api03-", a(40)].join("")}\n`],
+        ["c.md", `${["gh", "p_", a(36)].join("")}\n`],
+        ["d.md", `${["github", "_pat_", a(60)].join("")}\n`],
+        ["e.md", `${["AK", "IA", "ABCDEFGH12345678"].join("")}\n`],
+        ["f.md", `${["xo", "xb-", "1234567890-abcdefghij"].join("")}\n`],
+        ["g.md", `${["AI", "za", a(35)].join("")}\n`],
+        ["h.md", `${["ey", "J", a(20)].join("")}.${["ey", "J", a(20)].join("")}.${a(20)}\n`],
+        // What a test or a doc may hold.
+        ["ok1.md", "an sk-test-0001 key, a ghp_ prefix, AKIA alone, xoxb-, AIza\n"],
+        ["ok2.md", `sk-${a(31)}\n`],
+        ["ok3.md", "a token eyJhbGciOi.short\n"],
+      ]),
+    );
+    expect(found).toEqual([
+      "a.md:1: an sk- API key",
+      "b.md:1: an sk- API key",
+      "c.md:1: a GitHub token",
+      "d.md:1: a GitHub token",
+      "e.md:1: an AWS access key id",
+      "f.md:1: a Slack token",
+      "g.md:1: a Google API key",
+      "h.md:1: a JWT",
+    ]);
+  });
+
+  test("a value assigned to a variable named for a secret is found, a stand-in is not", () => {
+    const value = "q8Zt4rW1xLp9Vb2NcK7mD3";
+    const found = findProblems(
+      new Map([
+        ["a.env.md", `LLM_API_KEY=${value}\n`],
+        ["b.md", `  export FASTNEAR_API_KEY="${value}"\n`],
+        ["c.md", `TELEGRAM_WEBHOOK_SECRET=${value}  # set this\n`],
+        ["d.md", `ONECLICK_JWT=${value}\n`],
+        ["e.md", `DEPLOY_PARENT_PRIVATE_KEY=${value}\n`],
+        // Empty, short, placeholder, shell and TypeScript forms.
+        ["ok1.md", "LLM_API_KEY=\n"],
+        ["ok2.md", "LLM_API_KEY=short\n"],
+        ["ok3.md", "LLM_API_KEY=<your key from the provider>\n"],
+        ["ok4.md", "LLM_API_KEY=$LLM_API_KEY_FROM_VAULT\n"],
+        ["ok5.md", "DEPLOY_PARENT_PRIVATE_KEY=<ed25519:...>\n"],
+        ["ok6.md", "LLM_API_KEY=xxxxxxxxxxxxxxxxxxxx\n"],
+        ["ok7.md", "LLM_API_KEY=your-key-goes-here-123\n"],
+        ["ok8.ts", `const env = { LLM_API_KEY: "${value}" };\n`],
+        ["ok9.md", `TENDER_SEEDS_PRIVATE_DIR=${value}\n`],
+      ]),
+    );
+    expect(found).toEqual([
+      "a.env.md:1: a secret assigned to an environment variable",
+      "b.md:1: a secret assigned to an environment variable",
+      "c.md:1: a secret assigned to an environment variable",
+      "d.md:1: a secret assigned to an environment variable",
+      "e.md:1: a secret assigned to an environment variable",
+    ]);
+    expect(found.join("\n")).not.toContain(value);
   });
 
   test("a file with no text is only checked by its path", () => {

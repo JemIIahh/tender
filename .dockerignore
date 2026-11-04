@@ -5,6 +5,8 @@
 .tender
 # The real seeds' held-out checks and solutions, which are secret until a task is judged (seeds/README.md).
 seeds-private
+# The hackathon submission payload, which holds personal details.
+.submission
 # Installed, built or written on the machine, as in .gitignore, and made again in the image.
 node_modules
 **/node_modules

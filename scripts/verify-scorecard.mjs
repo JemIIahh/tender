@@ -10,9 +10,10 @@
 //   sha256(canonical JSON of the scorecard's `heldout`)  ==  the task's heldout_commitment
 //   sha256(the scorecard's bytes, as served)             ==  the outcome's scorecard_hash
 //
-// The first line is the point: the held-out checks a verifier scored with are published in the
-// scorecard, and anyone can see that they are the checks the poster committed to before any agent
-// worked. A task with no held-out part says so. Exit code 0 when everything that exists matches, 1
+// The first line shows that the held-out checks published in the scorecard are the checks the
+// poster committed to on chain before any agent worked. It does not show that the verifier scored
+// with them: to see that, run the checks against the revealed entries and compare the scores. A
+// task with no held-out part says so. Exit code 0 when everything that exists matches, 1
 // when something does not, 2 when it could not look.
 //
 // Canonical JSON is RFC 8785 for the data JSON holds: keys sorted by UTF-16 code unit, no
@@ -41,23 +42,30 @@ const canonical = (value) => {
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
-const { values } = parseArgs({
-  options: {
-    task: { type: "string" },
-    contract: { type: "string", default: process.env.TENDER_CONTRACT },
-    api: { type: "string", default: process.env.TENDER_API_URL },
-    network: { type: "string", default: process.env.TENDER_NETWORK || "testnet" },
-    rpc: { type: "string", default: process.env.NEAR_RPC_URL },
-  },
-});
-
-const usage = () => {
+const usage = (problem) => {
+  if (problem) console.error(problem);
   console.error(
     "usage: node scripts/verify-scorecard.mjs --task <id> --contract <account> --api <url> " +
       "[--network testnet|mainnet] [--rpc <url>]",
   );
   process.exit(2);
 };
+
+// An unknown flag, or a flag with no value, is a usage error (exit 2): exit 1 means MISMATCH.
+let values;
+try {
+  ({ values } = parseArgs({
+    options: {
+      task: { type: "string" },
+      contract: { type: "string", default: process.env.TENDER_CONTRACT },
+      api: { type: "string", default: process.env.TENDER_API_URL },
+      network: { type: "string", default: process.env.TENDER_NETWORK || "testnet" },
+      rpc: { type: "string", default: process.env.NEAR_RPC_URL },
+    },
+  }));
+} catch (error) {
+  usage(error instanceof Error ? error.message : String(error));
+}
 
 if (!/^[0-9]+$/.test(values.task ?? "") || !values.contract || !values.api) usage();
 const rpc = values.rpc || RPC[values.network];

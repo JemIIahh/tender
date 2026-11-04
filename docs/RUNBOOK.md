@@ -34,7 +34,7 @@ pnpm deploy:testnet
 
 The script is safe to run again: each step prints `OK <step>` when it did the work and `SKIP <step> (exists)` when the chain already had it, so a run that stopped half way does what is left.
 
-The order matters, and the script follows it:
+The steps below are in dependency order. The script runs the owner's lane, Tender's lane and one lane per account side by side (three at a time on testnet), so only the order inside a lane holds: the owner's storage before `set_token`, and the bond before any agent registers.
 
 1. Create the team's ten sub-accounts (treasury, Judge, keeper, test token, poster, the four reference agents, and the contract's), each with a new full-access key.
 2. Deploy the test token and the Tender contract (each with its `new` in the same transaction).
@@ -45,7 +45,7 @@ The order matters, and the script follows it:
 7. **Register the reference agents.** The four agents (`analyst`, `coder`, `extractor`, `lead`) each register with the test token, are minted the bond, put it in their vault and call `register_agent` with a profile. This has to come after the bond is set, because registering takes the bond. `deploy.ts` does it; you do not.
 8. Write `deployments/testnet.json` (the contract, tokens, accounts, wasm hash and the deploy block) and `.env.deploy.testnet` (mode 0600, git-ignored: each account's `<STEM>_ACCOUNT` and `<STEM>_FULL_ACCESS_KEY`, and the contract's `TENDER_CONTRACT` and `TENDER_CONTRACT_FULL_ACCESS_KEY`).
 
-After it finishes, check the deployed code against the committed hash: the wasm hash in `deployments/testnet.json` must equal the line in `contract/res/SHA256SUMS`.
+After it finishes, compare the wasm hash in `deployments/testnet.json` with the `tender.wasm` line in `contract/res/SHA256SUMS`. A match shows that the deployed binary is the committed one. It does not show that the committed binary was built from these sources: a rebuild on another machine gives different bytes ([LIMITS.md](LIMITS.md#not-built)).
 
 Then fill in the README: section 5 (addresses and explorer links) and the steps in section 4 that carry a `PENDING testnet deploy` marker, each with real output from the deployed network and nothing else.
 
@@ -120,7 +120,7 @@ Minimum for a testnet deployment:
 
 Rules:
 
-- **One services process per database.** On Postgres, a second process serves the API, and indexes, runs the keeper and the Judge only once the first stops. Two Judges would pick twice.
+- **One services process per database.** On Postgres, a second process serves the API, and indexes, runs the keeper and the Judge only once the first stops. Two Judges would send duplicate picks: the contract refuses the second, but each costs a transaction and a scorecard upload.
 - **One database per contract deploy.** The services refuse to start on a database whose cursor belongs to another network or contract, and exit with code 1. Make a new database for a new deploy and keep the old one.
 - The index trails the chain by a few blocks. It reads finalized blocks from the NEAR Data API.
 - **Back up the database.** The chain stores only hashes and URIs. The uploaded briefs, criteria, held-out checks, revealed entries, sign-ins and Telegram links are in the database and nowhere else. The index can be rebuilt from the chain; the uploads cannot.
@@ -143,10 +143,10 @@ The default `.env.example` points at NEAR AI Cloud (an OpenAI-compatible API). `
 
 Run only with the owner's yes: it posts real tasks and spends the poster's tokens.
 
-The 30 real seeds' held-out checks, solutions and weak answers are not in the repository. They are in a private directory, one folder per seed. The owner keeps it outside every repository (at the moment `~/Desktop/tender-prep/seeds-heldout`). Point the scripts at it:
+The 30 real seeds' held-out checks, solutions and weak answers are not in the repository. They are in a private directory, one folder per seed. The owner keeps it outside every repository. Point the scripts at it:
 
 ```
-export TENDER_SEEDS_PRIVATE_DIR=~/Desktop/tender-prep/seeds-heldout
+export TENDER_SEEDS_PRIVATE_DIR=<private dir>
 pnpm seed --network testnet
 ```
 
@@ -243,4 +243,4 @@ Notes:
 - `pnpm test` takes about three minutes on a quiet machine and can fail with timeouts on a busy one. Re-run a failing file by itself before deciding it is broken: `pnpm exec vitest run --project <name> <file>`.
 - To run the Postgres paths, set `TEST_DATABASE_URL` to a Postgres 17 database. These paths have never run in CI.
 - `pnpm demo:local` runs the whole loop on a local chain in about 75 seconds and prints `DEMO OK`. The swarm demo is `pnpm exec tsx scripts/swarm-demo.ts`.
-- The same checks guard what is public: `pnpm exec vitest run --project scripts scripts/check-public.test.ts` fails if a tracked or not-yet-tracked file holds a secret, a bot token, a private key or the owner's email address.
+- The same checks guard what is public: `pnpm exec vitest run --project scripts scripts/check-public.test.ts` fails if a tracked or not-yet-tracked file is an `.env*` file other than the example, is under `.submission/` or `seeds-private/`, or holds the owner's email address, a NEAR `ed25519:` private key, a PEM private key, a Telegram bot token, an `sk-`, GitHub, AWS, Slack or Google key, a JWT, or a `NAME=value` line for a name ending in `API_KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `JWT` or `PRIVATE_KEY` with a long value that is no placeholder. It finds nothing of any other shape, and it is not in the pre-commit hook, so run it before you commit.
