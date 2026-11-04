@@ -35,7 +35,7 @@ For a coding agent. [README.md](README.md) says what Tender is and what is built
 
 ## Commands
 
-Node 24.21 and pnpm 10.26 (`engines` and `packageManager` in `package.json`). Dependencies are pinned to exact versions (`.npmrc` has `save-exact=true`); add one with its exact version and never with `^` or `~`.
+Node 24.21 or newer and pnpm 10.26.x (`engines` and `packageManager` in `package.json`; `.npmrc` has `engine-strict=true`, so an older Node stops the install, and the commands check it too). Dependencies are pinned to exact versions (`.npmrc` has `save-exact=true`); add one with its exact version and never with `^` or `~`.
 
 ```
 pnpm install --frozen-lockfile
@@ -45,6 +45,7 @@ pnpm test                          # every project: packages/*, apps/web, script
 pnpm --filter @tender/judge test   # one package
 pnpm exec vitest run --project scripts scripts/check-public.test.ts   # one file
 pnpm demo:local                    # the whole loop on a local chain; prints DEMO OK
+pnpm demo:local --keep             # the same, then keeps the chain and the services up for the MCP server until Ctrl-C
 pnpm exec tsx scripts/swarm-demo.ts
 pnpm skeleton                      # deposit, post, commit, reveal, pick, withdraw on a local chain
 pnpm --filter @tender/web e2e      # Playwright against a fixture API (installed Google Chrome)
@@ -55,7 +56,7 @@ cd contract && ./build.sh               # rebuilds res/; needs cargo-near 0.22.0
 cd contract && ./check-res.sh           # res/ must agree with the recorded source hash and checksums (CI runs it; it does not rebuild)
 ```
 
-The sandbox tests (`*.sandbox.test.ts`, `contract/sandbox`) start a nearcore node. It downloads once, or set `NEAR_SANDBOX_BIN_PATH` to a copy. A full `pnpm test` takes about three minutes on a quiet machine and can fail with timeouts on a loaded one: re-run a failing file alone before you decide it is broken. Tests that score the real seeds run only when `TENDER_SEEDS_PRIVATE_DIR` names the private directory; elsewhere they skip with one note.
+The sandbox tests (`*.sandbox.test.ts`, `contract/sandbox`) start a nearcore node. It downloads once per install (into `node_modules`), or set `NEAR_SANDBOX_BIN_PATH` to a copy. A full `pnpm test` runs about 4,200 tests and takes about 7 minutes, and can fail with timeouts on a loaded machine: re-run a failing file alone before you decide it is broken. Tests that score the real seeds run only when `TENDER_SEEDS_PRIVATE_DIR` names the private directory; elsewhere they skip with one note, about 300 of them.
 
 ## Where the tests are
 
