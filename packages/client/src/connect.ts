@@ -217,8 +217,13 @@ function span(ms: number): string {
  * you started"), after a reload or in another browser.
  */
 export const FUND_AGENT_WHERE = (owner: string, name: string): string =>
-  `${owner} opens My agents, then Add an agent, in the web app (in this browser it may still be ` +
-  `open), types ${name} in step 1, presses Finish this agent, and presses Fund agent there.`;
+  `${owner} presses Fund agent on the Add an agent page of the web app: in step 4 if the page ` +
+  `that made the code is still open, or else after typing ${name} in step 1 and pressing Finish ` +
+  "this agent.";
+
+/** What the agent says of a contested code whose first key was its own. */
+export const CONTESTED_AFTER_YOURS =
+  "Another key tried this code after your agent's. To be safe, start over with a new code.";
 
 /** How often a wait says it is still waiting. */
 const HEARTBEAT_MS = 30_000;
@@ -244,7 +249,6 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
   const lookup = await api.connectLookup(code).catch(explain);
   const account = lookup.account_id;
   if (lookup.state === "expired") explain(new ApiError(410, { error: "code_expired" }));
-  if (lookup.state === "contested") explain(new ApiError(409, { error: "contested" }));
   // The account is the name under the owner, as the owner asked for it; an answer that says
   // otherwise is not one to act on.
   if (account !== `${lookup.name}.${lookup.owner}`) {
@@ -258,14 +262,33 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
   const chain = opts.chainFor(lookup);
 
   const name = nameFor(lookup, opts.name);
+  // A contested code is refused, and never created. Its words say whether this agent's key was the
+  // first, when the key file says so; no key is made to find out.
+  if (lookup.state === "contested") {
+    const own = await opts.key(lookup, name, false).catch(() => null);
+    if (own !== null && lookup.fingerprint === connectFingerprint(own.publicKey)) {
+      throw new ConnectError(CONTESTED_AFTER_YOURS);
+    }
+    explain(new ApiError(409, { error: "contested" }));
+  }
   // A code that has a key already, and not this one, is someone else's: the API is told (so the
-  // owner's page refuses the code), and nothing is attached, and no key is made for nothing.
+  // owner's page refuses the code), and nothing is attached, and no key is made for nothing. What
+  // the agent says depends on whether the API took the word.
   const key = await opts.key(lookup, name, lookup.fingerprint === null);
   if (
     key === null ||
     (lookup.fingerprint !== null && lookup.fingerprint !== connectFingerprint(key.publicKey))
   ) {
-    await api.connectContest(code).catch(() => undefined);
+    const recorded = await api.connectContest(code).then(
+      () => true,
+      () => false,
+    );
+    if (!recorded) {
+      throw new ConnectError(
+        "Tell the owner NOT to press Create agent: someone else's key is on this code (this " +
+          "agent could not record it on the page).",
+      );
+    }
     explain(new ApiError(409, { error: "already_attached" }));
   }
   const fingerprint = connectFingerprint(key.publicKey);
@@ -387,6 +410,14 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
       return outcome("registered", true);
     } catch (error) {
       // The chain has the registration whatever the API says, so nothing here fails the command.
+      if (apiCode(error) === "contested") {
+        log(
+          `done: ${account} is registered on the chain with this agent's key. Another key tried ` +
+            "this code after your agent's, so the owner's page shows the code as refused; the " +
+            "agent is registered all the same.",
+        );
+        return outcome("registered", false);
+      }
       if (apiCode(error) !== "not_registered" || now() >= confirmUntil) {
         log(
           `done: ${account} is registered on the chain. The API has not listed it yet; the page ` +

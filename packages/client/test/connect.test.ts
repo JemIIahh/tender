@@ -194,9 +194,10 @@ test("a_wait_that_runs_out_says_where_it_stopped_and_how_to_go_on", async () => 
   expect(bondless.calls).not.toContain("register writer");
   // It says where the owner finds Fund agent.
   expect(bondless.lines.at(-1)).toBe(
-    "stopped waiting: the bond is not in the agent's vault yet. alice.testnet opens My agents, " +
-      "then Add an agent, in the web app (in this browser it may still be open), types writer in " +
-      "step 1, presses Finish this agent, and presses Fund agent there. Then run the same command again.",
+    "stopped waiting: the bond is not in the agent's vault yet. alice.testnet presses Fund agent " +
+      "on the Add an agent page of the web app: in step 4 if the page that made the code is " +
+      "still open, or else after typing writer in step 1 and pressing Finish this agent. Then " +
+      "run the same command again.",
   );
 });
 
@@ -256,14 +257,61 @@ test("a_code_with_someone_elses_key_is_contested_before_a_key_is_made_or_anythin
   expect(mine.calls.some((call) => call.startsWith("attach"))).toBe(false);
   expect(mine.calls).toContain(`contest ${CODE}`);
 
-  // A code the API already says is contested is refused at the lookup.
+  // A code the API already says is contested is refused before anything is made or attached.
   const contested = world({
     lookup: lookupOf({ state: "contested", fingerprint: connectFingerprint(other) }),
   });
   await expect(connectAgent(contested.opts)).rejects.toThrow(
     /two different keys tried this connect code/,
   );
-  expect(contested.calls).toEqual([`lookup ${CODE}`]);
+  expect(contested.calls).toEqual([
+    `lookup ${CODE}`,
+    "chain testnet tender.testnet",
+    "key writer false",
+  ]);
+});
+
+test("a_contested_code_whose_first_key_was_this_agents_says_so_truthfully", async () => {
+  // This agent attached first; another key tried the code after: still refused, in other words.
+  const mine = world({
+    lookup: lookupOf({ state: "contested", fingerprint: connectFingerprint(PUBLIC) }),
+    existingKey: true,
+  });
+  await expect(connectAgent(mine.opts)).rejects.toThrow(
+    "Another key tried this code after your agent's. To be safe, start over with a new code.",
+  );
+  expect(mine.calls.some((call) => call.startsWith("attach") || call.startsWith("register"))).toBe(
+    false,
+  );
+
+  // Contested after this agent registered: it says so, and does not wait for a tick that never comes.
+  const late = world({
+    registered: [
+      async () => {
+        throw new ApiError(409, { error: "contested" });
+      },
+    ],
+  });
+  expect(await connectAgent(late.opts)).toMatchObject({ status: "registered", confirmed: false });
+  expect(late.lines.at(-1)).toMatch(
+    /registered on the chain with this agent's key\. Another key tried this code after your agent's/,
+  );
+  expect(late.calls.filter((call) => call.startsWith("registered"))).toHaveLength(1);
+});
+
+test("a_contest_the_api_did_not_take_is_said_truthfully", async () => {
+  const other = KeyPair.fromRandom("ed25519").getPublicKey().toString();
+  const w = world({
+    lookup: lookupOf({ state: "attached", fingerprint: connectFingerprint(other) }),
+  });
+  w.opts.api.connectContest = async () => {
+    throw new ApiError(429, { error: "rate_limited" });
+  };
+  const failure = connectAgent(w.opts);
+  await expect(failure).rejects.toThrow(
+    "Tell the owner NOT to press Create agent: someone else's key is on this code (this agent could not record it on the page).",
+  );
+  await expect(connectAgent(w.opts)).rejects.not.toThrow(/page now says/);
 });
 
 test("an_answer_whose_account_is_not_the_name_under_the_owner_is_not_acted_on", async () => {
