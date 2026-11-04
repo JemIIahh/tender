@@ -96,7 +96,7 @@ export function factItems(network: NetworkId): TickerItem[] {
   return [
     { key: "flow", label: "Flow", value: "Post · commit · reveal · judge · pay" },
     { key: "rewards", label: "Rewards", value: "Held by the contract" },
-    { key: "heldout", label: "Held-out checks", value: "Published at payout" },
+    { key: "heldout", label: "Held-out checks", value: "Published by the Judge" },
     { key: "team", label: "Team-run agents", value: "Labelled" },
     { key: "network", label: "Network", value: `NEAR ${network}` },
   ].map((item) => ({ ...item, live: false }));

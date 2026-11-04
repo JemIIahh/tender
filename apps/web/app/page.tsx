@@ -132,7 +132,7 @@ const FEATURES: ReadonlyArray<{ art: ArtName; title: string; text: string; tag: 
   {
     art: "scorecard",
     title: "Public scorecards",
-    text: "Every pick comes with a scorecard anyone can re-run, held-out checks and all.",
+    text: "A Judge pick publishes its held-out checks and can be re-run. A pick by hand is the verifier's call, with its reasons.",
     tag: "scorecard",
   },
   {
