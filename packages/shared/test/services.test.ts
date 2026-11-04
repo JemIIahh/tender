@@ -10,8 +10,11 @@ import {
   type HiredService,
   hireCriteriaHash,
   hireDocuments,
+  hireeOf,
   hireMismatch,
   hireTerms,
+  isHireCriteriaOf,
+  isHireTask,
   PublicCriteriaSchema,
   rubricCriteriaProblem,
   type Service,
@@ -121,6 +124,71 @@ test("a_judge_checked_hire_carries_the_services_criteria_and_names_the_judge", (
   // The Judge the hirer knows must be the one the service names, or the agent would not take it.
   expect(() => hireTerms(judged, "another-judge.near")).toThrow(/the Judge here is another-judge/);
   expect(hireTerms(SERVICE, null).verifier).toBeUndefined();
+});
+
+test("a_task_is_a_hire_when_it_invites_one_agent_once_with_a_hires_criteria", () => {
+  const criteria = {
+    version: 1 as const,
+    kind: "regex_cases" as const,
+    min_score: 100,
+    split: "winner_take_all" as const,
+    has_heldout: false,
+    examples: { match: ["a"], no_match: ["b"] },
+  };
+  const judged: HiredService = {
+    ...SERVICE,
+    output_format: "regex_json",
+    verification: {
+      kind: "judge",
+      criteria,
+      criteria_hash: sha256Hex(canonicalJson(criteria)),
+      judge: "judge.near",
+    },
+  };
+  // A hire as each kind of service posts it: its terms and its documents' criteria hash.
+  const posted = (service: HiredService) => {
+    const terms = hireTerms(service, "judge.near");
+    return {
+      invited: terms.invited,
+      max_entries: terms.maxEntries,
+      criteria_hash: hireDocuments(service, "a request").criteriaHash,
+    };
+  };
+  const JUDGED_HASH = sha256Hex(canonicalJson(criteria));
+  const services = [SERVICE, judged];
+  expect(isHireTask(posted(SERVICE), services)).toBe(true);
+  // The hirer-accepts criteria are the same for every service, so no listing is needed for them.
+  expect(isHireTask(posted(SERVICE), [])).toBe(true);
+  expect(isHireTask(posted(judged), services)).toBe(true);
+  // A Judge-checked hire is told by its service's criteria, so it needs the listing...
+  expect(isHireTask(posted(judged), [SERVICE])).toBe(false);
+  // ...of the invited agent: the same criteria on another agent's service make no hire of this one.
+  expect(isHireTask(posted(judged), [{ ...judged, agent: "other.near" }])).toBe(false);
+
+  // Pinned to one agent, once: anything else is not a hire, whatever its criteria.
+  const hire = posted(SERVICE);
+  expect(isHireTask({ ...hire, max_entries: 0 }, services)).toBe(false);
+  expect(isHireTask({ ...hire, max_entries: 2 }, services)).toBe(false);
+  expect(isHireTask({ ...hire, invited: [] }, services)).toBe(false);
+  expect(isHireTask({ ...hire, invited: ["writer.acme.near", "other.near"] }, services)).toBe(
+    false,
+  );
+  // Other criteria: a pinned task, and no hire.
+  expect(isHireTask({ ...hire, criteria_hash: "ab".repeat(32) }, services)).toBe(false);
+  expect(hireCriteriaHash(SERVICE)).toBe(HIRER_ACCEPTS_CRITERIA_HASH);
+
+  // The shape half of the rule: the one account a task is pinned to, as a hire is, or none.
+  expect(hireeOf(hire)).toBe("writer.acme.near");
+  expect(hireeOf({ ...hire, max_entries: 0 })).toBeNull();
+  expect(hireeOf({ ...hire, max_entries: 2 })).toBeNull();
+  expect(hireeOf({ ...hire, invited: [] })).toBeNull();
+  expect(hireeOf({ ...hire, invited: ["writer.acme.near", "other.near"] })).toBeNull();
+
+  // The criteria half of the rule, which the agent runner asks of a task that invites its agent.
+  expect(isHireCriteriaOf(HIRER_ACCEPTS_CRITERIA_HASH, "anyone.near", [])).toBe(true);
+  expect(isHireCriteriaOf(JUDGED_HASH, "writer.acme.near", [judged])).toBe(true);
+  expect(isHireCriteriaOf(JUDGED_HASH, "other.near", [judged])).toBe(false);
+  expect(isHireCriteriaOf("cd".repeat(32), "writer.acme.near", services)).toBe(false);
 });
 
 test("a_hire_matches_a_service_only_on_its_terms", () => {

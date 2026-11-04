@@ -1,10 +1,13 @@
 "use client";
 
 import { formatTokenAmount, tokenMeta } from "@tender/shared";
+import Link from "next/link";
 import { useEffect, useId, useRef, useState } from "react";
 import { config } from "../lib/config";
 import { type Live, type LiveState, liveOf, readLive } from "../lib/live";
-import { SECONDARY } from "./ui";
+import { knownFirst, knowsToken } from "../lib/tokens";
+import { RawUnits } from "./Amount";
+import { SECONDARY, TEXT_LINK } from "./ui";
 
 /** How often the figures are read again, while the tab is in view: the landing ticker's pace. */
 const REFRESH_MS = 60_000;
@@ -34,24 +37,27 @@ function Dot({ state }: { state: LiveState }) {
   );
 }
 
-/** A long id with its middle left out, `5f3a9c0e…5f3a9c0e`; a short one as it is. */
-function shortId(id: string): string {
-  return id.length <= 20 ? id : `${id.slice(0, 8)}…${id.slice(-8)}`;
-}
-
 /**
  * One token's amount in escrow, on a line of its own. A number never breaks: it is one unbroken
- * run of figures (the panel is wide enough for the largest u128 at this size, and it scrolls
- * sideways on its own line before it would wrap). A token the app knows has its symbol after the
- * number. One it does not know (`tokenMeta` never guesses decimals) shows the amount as the
- * contract holds it, with a label under it that says so, "smallest units of" and the token's
- * account, its middle left out when it is long; the whole id is the label's title, and is what a
- * screen reader reads.
+ * run of figures (the panel is wide enough for the largest u128 at this size). A token the app
+ * knows has its symbol after the number. One it does not know shows the amount as the contract
+ * holds it, labelled, and cut in the middle with a visible "…" on a line too narrow for it, as a
+ * board card shows it (`RawUnits`).
  */
 function EscrowLine({ token, amount }: { token: string; amount: bigint }) {
+  if (!knowsToken(token)) {
+    return (
+      <li data-testid="live-escrow" className="grid min-w-0 text-[12px] text-bone">
+        <RawUnits
+          value={amount.toString()}
+          token={token}
+          amountTestId="live-escrow-amount"
+          unitTestId="live-escrow-unit"
+        />
+      </li>
+    );
+  }
   const { symbol, decimals } = tokenMeta(token, config.network);
-  const known = symbol !== token;
-  const short = shortId(token);
   return (
     <li data-testid="live-escrow" className="grid min-w-0 gap-0.5">
       <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 font-mono text-[12px] text-bone tabular-nums">
@@ -59,41 +65,21 @@ function EscrowLine({ token, amount }: { token: string; amount: bigint }) {
           data-testid="live-escrow-amount"
           className="inline-block max-w-full overflow-x-auto align-bottom whitespace-nowrap"
         >
-          {known ? formatTokenAmount(amount, decimals) : amount.toString()}
-        </span>
-        {known ? (
-          <>
-            {" "}
-            <span className="whitespace-nowrap">{symbol}</span>
-          </>
-        ) : null}
+          {formatTokenAmount(amount, decimals)}
+        </span>{" "}
+        <span className="whitespace-nowrap">{symbol}</span>
       </span>
-      {known ? null : (
-        <span data-testid="live-escrow-unit" className="text-[11.5px] text-muted">
-          smallest units of{" "}
-          {short === token ? (
-            <span className="font-mono">{token}</span>
-          ) : (
-            <span title={token} className="font-mono">
-              <span aria-hidden="true">{short}</span>
-              <span className="sr-only">{token}</span>
-            </span>
-          )}
-        </span>
-      )}
     </li>
   );
 }
-
-/** Whether the app knows `token`'s decimals: those lines go first, as `Tokens` orders them. */
-const knows = (token: string) => tokenMeta(token, config.network).symbol !== token;
 
 function Figures({ live }: { live: Live }) {
   const counts: Array<[string, string]> = [];
   if (live.openTasks !== undefined) counts.push(["Open tasks", live.openTasks]);
   if (live.agents !== undefined) counts.push(["Agents", live.agents]);
   if (counts.length === 0 && live.escrow === undefined) return null;
-  const escrow = [...(live.escrow ?? [])].sort(([a], [b]) => Number(knows(b)) - Number(knows(a)));
+  // The tokens the app knows first, as `Tokens` orders them.
+  const escrow = knownFirst(live.escrow ?? [], ([token]) => token);
   return (
     <dl className="mt-3 grid gap-2.5 border-t border-line pt-3 text-[13px]">
       {counts.map(([label, value]) => (
@@ -133,9 +119,9 @@ function Figures({ live }: { live: Live }) {
  * (hollow, Offline). On a phone it is the dot alone; its name says the word either way.
  *
  * A press opens a small panel under it with the platform's figures, as the API gave them: open
- * tasks, agents, and what the open tasks hold in escrow, token by token. A figure the API did not
- * give is left out. Escape, or a press anywhere else, closes it; Escape gives the focus back to the
- * pill. Until the first read is back there is no pill.
+ * tasks, agents, and what the open tasks hold in escrow, token by token, and a link to the Metrics
+ * page. A figure the API did not give is left out. Escape, or a press anywhere else, closes it;
+ * Escape gives the focus back to the pill. Until the first read is back there is no pill.
  */
 export function LiveStatus() {
   const [live, setLive] = useState<Live | null>(null);
@@ -226,6 +212,24 @@ export function LiveStatus() {
           {look.line}
         </p>
         <Figures live={live} />
+        {/* The way on to the platform's figures in full. The keyboard leaving the panel closes it,
+            as leaving the pill does; following the link closes it too. */}
+        <p className="mt-3 border-t border-line pt-3 text-[13px]">
+          <Link
+            href="/metrics"
+            data-testid="live-metrics-link"
+            onClick={() => setOpen(false)}
+            onBlur={(event) => {
+              const next = event.relatedTarget as Node | null;
+              if (next !== null && next !== button.current && !panel.current?.contains(next)) {
+                setOpen(false);
+              }
+            }}
+            className={TEXT_LINK}
+          >
+            See metrics
+          </Link>
+        </p>
       </div>
     </div>
   );

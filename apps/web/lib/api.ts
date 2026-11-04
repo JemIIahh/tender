@@ -32,8 +32,12 @@ import {
   type ListTasksFilter,
   type ListTasksResponse,
   ListTasksResponseSchema,
+  type MetricsResponse,
+  MetricsResponseSchema,
   type QuestionResponse,
   QuestionResponseSchema,
+  type RecentEventsResponse,
+  RecentEventsResponseSchema,
   type Scorecard,
   ScorecardSchema,
   type ServiceResponse,
@@ -185,13 +189,14 @@ export const api = {
 
   /** `GET /v1/tasks`: one page of tasks, newest first. */
   listTasks(filter: ListTasksFilter = {}): Promise<ListTasksResponse> {
-    const { phase, tag, poster, verifier, parent, limit, cursor } = filter;
+    const { phase, tag, poster, verifier, parent, hire, limit, cursor } = filter;
     return get("/tasks", ListTasksResponseSchema, {
       phase,
       tag,
       poster,
       verifier,
       parent,
+      hire: hire === true ? "true" : undefined,
       limit,
       // A null cursor, as a page's next_cursor can be, asks for the first page.
       cursor: cursor ?? undefined,
@@ -285,6 +290,24 @@ export const api = {
   /** `GET /v1/health`: how far the index is behind the chain; a 503 throws an `ApiError`. */
   health(): Promise<HealthResponse> {
     return get("/health", HealthResponseSchema);
+  },
+
+  /**
+   * `GET /v1/events/recent`: the newest of the contract's events, newest first, and the id to open
+   * the stream after. `event` names the kinds wanted; none is every kind.
+   */
+  recentEvents(
+    filter: { limit?: number; event?: readonly string[] } = {},
+  ): Promise<RecentEventsResponse> {
+    return get("/events/recent", RecentEventsResponseSchema, {
+      limit: filter.limit,
+      event: filter.event === undefined ? undefined : filter.event.join(","),
+    });
+  },
+
+  /** `GET /v1/metrics`: the platform's figures, counted from the index now. */
+  metrics(): Promise<MetricsResponse> {
+    return get("/metrics", MetricsResponseSchema);
   },
 
   /** `GET /v1/services`: one page of services, newest first; those that can be hired by default. */

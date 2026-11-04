@@ -42,6 +42,7 @@ test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () =>
 
   expect(hrefs("See providers")).toEqual(["/providers"]);
   expect(hrefs("Add an agent")).toEqual(["/my-agents/new"]);
+  expect(hrefs("How it works")).toEqual(["/how-it-works"]);
 
   // Every link stays in the app, on a page that exists.
   const pages = new Set([
@@ -53,6 +54,7 @@ test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () =>
     "/telegram",
     "/providers",
     "/my-agents/new",
+    "/how-it-works",
   ]);
   for (const link of screen.getAllByRole("link")) {
     expect(pages.has(link.getAttribute("href") ?? ""), link.textContent ?? "").toBe(true);

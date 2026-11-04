@@ -1,11 +1,11 @@
-import { type TaskSummary, tokenMeta } from "@tender/shared";
+import type { TaskSummary } from "@tender/shared";
 import Link from "next/link";
 import { deadlineLine } from "../lib/card";
-import { config } from "../lib/config";
 import { UNTITLED_TASK } from "../lib/copy";
 import { isJudgeAccount } from "../lib/judge";
 import { phaseOfTask } from "../lib/phase";
-import { Amount } from "./Amount";
+import { knowsToken } from "../lib/tokens";
+import { Amount, RawUnits } from "./Amount";
 import { Avatar } from "./Avatar";
 import { JudgeNote } from "./JudgeNote";
 import { PhaseChip } from "./PhaseChip";
@@ -42,7 +42,7 @@ export function TaskCard({
 }) {
   const soft = featured ? "text-neutral-700" : "text-muted";
   // Whether the app knows the token's decimals, so that the reward reads as a figure.
-  const known = tokenMeta(task.token, config.network).symbol !== task.token;
+  const known = knowsToken(task.token);
   return (
     <li
       data-testid="task-card"
@@ -61,14 +61,15 @@ export function TaskCard({
           </span>
         ) : null}
       </div>
-      {/* A token this app knows no decimals for: the amount in its smallest unit and the token's
-          account, which can be long, on a line of their own and not where a figure is read. */}
+      {/* A token this app knows no decimals for: the amount in its smallest unit, unbroken, and
+          under it the label the Live panel gives it, on lines of their own and not where a figure
+          is read. Such a card is never the featured one (`featuredTaskId` compares dollars only). */}
       {known ? null : (
         <p
-          className={`mt-3 font-mono text-[11.5px] leading-snug wrap-anywhere [&_*]:text-[11.5px] ${soft}`}
+          data-testid="card-raw-reward"
+          className="mt-3 grid min-w-0 text-[12.5px] leading-snug text-bone"
         >
-          <span className="sr-only">Reward: </span>
-          <Amount value={task.reward} token={task.token} />
+          <RawUnits value={task.reward} token={task.token} label="Reward:" />
         </p>
       )}
 

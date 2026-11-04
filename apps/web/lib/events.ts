@@ -45,6 +45,19 @@ export interface EventInfo {
   task_id?: string;
 }
 
+/**
+ * A message of the stream in full, for a page that shows the events themselves (the Activity feed):
+ * its id (undefined if the stream sent none that is a u64), the event and its data as its schema
+ * parsed them, the block it was logged in, and the task it is about.
+ */
+export interface StreamEvent {
+  id: string | undefined;
+  event: string;
+  data: Record<string, unknown>;
+  height: string;
+  task_id: string | null;
+}
+
 export interface EventHandlers {
   /** A message of the stream was an event of the contract. */
   onEvent(info: EventInfo): void;
@@ -53,6 +66,16 @@ export interface EventHandlers {
    * replay what happened before it: a page that showed something a moment ago should ask again.
    */
   onResync(): void;
+  /** The same message as `onEvent`, whole, for a page that wants more than that it happened. */
+  onMessage?(message: StreamEvent): void;
+}
+
+export interface ConnectOptions {
+  /**
+   * The id of the last event the page already has (a backlog it read): the stream begins after it
+   * (`?since=`), with nothing to resync. A value that is not a u64 is not used.
+   */
+  since?: string;
 }
 
 export interface EventStream {
@@ -122,12 +145,18 @@ async function askHowLongToWait(controller: AbortController): Promise<number | u
  *   what `Retry-After` asks for, which is read with a request of its own that is given five
  *   seconds to answer. It starts at a second again once a connection opens.
  * - A message that is not an event the contract logs is dropped, and logged.
+ * - Given `since`, the first stream opens at `?since=` that id, as if it had got it: the server
+ *   sends what came after it, and there is nothing to resync.
  */
-export function connectEvents({ onEvent, onResync }: EventHandlers): EventStream {
+export function connectEvents(
+  { onEvent, onResync, onMessage }: EventHandlers,
+  { since }: ConnectOptions = {},
+): EventStream {
   let source: EventSource | undefined;
-  let lastId: string | undefined;
-  // A stream that has never been open has nothing to resume from.
-  let needsResync = true;
+  let lastId: string | undefined =
+    since !== undefined && U64StringSchema.safeParse(since).success ? since : undefined;
+  // A stream that has never been open has nothing to resume from, unless it was given an id.
+  let needsResync = lastId === undefined;
   let failures = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let probe: AbortController | undefined;
@@ -137,7 +166,8 @@ export function connectEvents({ onEvent, onResync }: EventHandlers): EventStream
     if (closed) return;
     // Where the stream is now, whether or not the message is of any use. An id that is not a u64
     // would be refused as `?since=`, with a 400 that closes the stream for good, so it is not kept.
-    if (U64StringSchema.safeParse(event.lastEventId).success) lastId = event.lastEventId;
+    const id = U64StringSchema.safeParse(event.lastEventId).success ? event.lastEventId : undefined;
+    if (id !== undefined) lastId = id;
 
     let json: unknown;
     try {
@@ -163,6 +193,13 @@ export function connectEvents({ onEvent, onResync }: EventHandlers): EventStream
       return;
     }
     onEvent({ event: known.data.event, task_id: message.data.task_id ?? undefined });
+    onMessage?.({
+      id,
+      event: known.data.event,
+      data: known.data.data as Record<string, unknown>,
+      height: message.data.height,
+      task_id: message.data.task_id,
+    });
   }
 
   function open(): void {

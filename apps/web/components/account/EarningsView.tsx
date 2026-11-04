@@ -20,7 +20,6 @@ import {
 } from "../../lib/account";
 import type { AgentRecord } from "../../lib/api";
 import { useNowNs } from "../../lib/clock";
-import { UNTITLED_TASK } from "../../lib/copy";
 import { phaseOfTask } from "../../lib/phase";
 import { type Loaded, useLoad } from "../../lib/useLoad";
 import { useWallet } from "../../lib/wallet";
@@ -30,8 +29,8 @@ import { Avatar } from "../Avatar";
 import { ErrorState } from "../ErrorState";
 import { PageHead } from "../PageHead";
 import { PhaseChip } from "../PhaseChip";
-import { CARD, EYEBROW, FACT_LABEL, PRIMARY, TEXT_LINK } from "../ui";
-import { Chip, ConnectGate, Stat, Stats, Tokens } from "./parts";
+import { CARD, EYEBROW, PRIMARY } from "../ui";
+import { Cell, Chip, ConnectGate, ROW, Rows, Stat, Stats, TaskCell, Tokens } from "./parts";
 
 // Earnings: what the connected account's agents won, what is still to be decided, and the tasks
 // the account posted, with where each reward went. Every figure is the chain's, through the API:
@@ -60,84 +59,6 @@ async function readAgentsEarnings(
   if (mine === null) return null;
   const earnings = await readEarnings(mine.agents, wanted);
   return earnings === null ? null : { mine, earnings };
-}
-
-// ---- Rows -----------------------------------------------------------------------------------------
-
-/**
- * A list read as a table: the column heads above it from tablet width up, and on a phone each
- * value with its head beside it. The heads are in every row for a screen reader.
- */
-function Rows({
-  heads,
-  grid,
-  testId,
-  children,
-}: {
-  heads: string[];
-  /** The columns, as a literal Tailwind class from `md` up. */
-  grid: string;
-  testId: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="grid">
-      <div
-        aria-hidden="true"
-        className={`hidden gap-6 border-b border-line px-5 pt-4 pb-3 sm:px-6 md:grid ${grid}`}
-      >
-        {heads.map((head, index) => (
-          <span
-            key={head}
-            className={`${FACT_LABEL} ${index === heads.length - 1 ? "md:text-right" : ""}`}
-          >
-            {head}
-          </span>
-        ))}
-      </div>
-      <ul data-testid={testId} className="grid">
-        {children}
-      </ul>
-    </div>
-  );
-}
-
-/** One row of `Rows`: its cells side by side from tablet width up, stacked on a phone. */
-const ROW =
-  "grid min-w-0 grid-cols-2 gap-x-4 gap-y-3 border-t border-line px-5 py-4 first:border-t-0 sm:px-6 md:items-center md:gap-6";
-
-/** A cell, with its column's head for a phone and a screen reader. */
-function Cell({
-  head,
-  children,
-  end = false,
-  lead = false,
-}: {
-  head: string;
-  children: ReactNode;
-  end?: boolean;
-  /** The row's first cell, what the row is about: the whole width of a phone, with no head shown. */
-  lead?: boolean;
-}) {
-  return (
-    <div
-      className={`grid min-w-0 content-start gap-1 md:block ${lead ? "col-span-2 md:col-span-1" : ""} ${end ? "md:text-right" : ""}`}
-    >
-      <span className={`${FACT_LABEL} ${lead ? "sr-only" : "md:sr-only"}`}>{head}: </span>
-      <div className="min-w-0 wrap-anywhere">{children}</div>
-    </div>
-  );
-}
-
-function TaskCell({ taskId, title }: { taskId: string; title: string | null }) {
-  return (
-    <span className="grid gap-0.5">
-      <Link href={`/tasks/${taskId}`} className={`${TEXT_LINK} w-fit font-medium wrap-anywhere`}>
-        {title ?? UNTITLED_TASK}
-      </Link>
-      <span className="font-mono text-xs text-muted">#{taskId}</span>
-    </span>
-  );
 }
 
 function AgentCell({ agent }: { agent: AgentRecord }) {

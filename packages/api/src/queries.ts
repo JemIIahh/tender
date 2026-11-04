@@ -1,7 +1,9 @@
 import type { BlobKind, Db } from "@tender/db";
 import {
   BriefSchema,
+  HIRER_ACCEPTS_CRITERIA_HASH,
   type ListServicesResponse,
+  type MetricsResponse,
   type Phase,
   type PublicCriteria,
   PublicCriteriaSchema,
@@ -9,6 +11,7 @@ import {
   ScorecardSchema,
   type Service,
   sha256Hex,
+  type TokenTotal,
   U64StringSchema,
 } from "@tender/shared";
 import type { z } from "zod";
@@ -162,10 +165,32 @@ export interface TaskFilter {
   parent?: string;
   /** Only the pinned tasks whose invited list names this account. */
   invited?: string;
+  /** Only the tasks that are hires of a service (`hireSql`). */
+  hire?: boolean;
   /** Page size, from 1 to 50. */
   limit: number;
   /** A task id (a canonical u64): only tasks below it, the next page of an earlier answer. */
   cursor?: string;
+}
+
+/**
+ * Whether the task row `t` is a hire of a service: `isHireTask` of `@tender/shared`, in SQL. It
+ * invites one account and takes one entry, and its criteria hash is `hirerAccepts` (a placeholder
+ * for `HIRER_ACCEPTS_CRITERIA_HASH`, the same for every service) or the SHA-256 of the criteria of
+ * a Judge-checked service of the invited account. A service keeps its criteria as the canonical JSON
+ * text every hire of it uploads and hashes, so the hash of that text's UTF-8 bytes is the
+ * `criteria_hash` its hires carry, as `hireCriteriaHash` says (the test holds the two together).
+ */
+function hireSql(hirerAccepts: string): string {
+  return `(t.max_entries = 1
+      and jsonb_typeof(t.invited) = 'array'
+      and jsonb_array_length(t.invited) = 1
+      and (t.criteria_hash = ${hirerAccepts}
+        or exists (select 1 from services s
+                    where s.agent = t.invited ->> 0
+                      and s.verifier = 'judge'
+                      and s.criteria is not null
+                      and encode(sha256(convert_to(s.criteria, 'UTF8')), 'hex') = t.criteria_hash)))`;
 }
 
 /**
@@ -192,6 +217,7 @@ export async function listTasks(
   if (f.invited !== undefined) {
     where.push(`t.invited @> ${p.add(JSON.stringify([f.invited]))}::jsonb`);
   }
+  if (f.hire === true) where.push(hireSql(p.add(HIRER_ACCEPTS_CRITERIA_HASH)));
   if (f.cursor !== undefined) where.push(`t.id < ${p.add(f.cursor)}::numeric`);
 
   const rows = await db.query<TaskSummary>(
@@ -659,6 +685,18 @@ export interface ServiceFilter {
   cursor?: string;
 }
 
+/**
+ * Whether the service row `s` can be hired now: it is active, its agent is an active agent that
+ * holds a bond (`canTakeHires`), and a Judge-checked one has the Judge, whom an API without one
+ * (`judgeAccount` null) cannot name. It is `available` of `serviceOf`, in SQL.
+ */
+function availableSql(judgeAccount: string | null): string {
+  return `(s.status = 'active'
+      and exists (select 1 from agents a
+                   where a.account = s.agent and a.status = 'active' and a.bond_amount is not null)
+      ${judgeAccount === null ? "and s.verifier = 'hirer'" : ""})`;
+}
+
 /** `text` for a `like` pattern that matches it as it is: `\`, `%` and `_` are escaped. */
 function likeEscaped(text: string): string {
   return text.replace(/[\\%_]/g, (char) => `\\${char}`);
@@ -678,14 +716,7 @@ export async function listServices(
   const p = new SqlParams();
   const teamP = p.add([...r.teamAccounts]);
   const where: string[] = [];
-  if (f.status === "available") {
-    where.push(`s.status = 'active'`);
-    where.push(
-      "exists (select 1 from agents a where a.account = s.agent and a.status = 'active' and a.bond_amount is not null)",
-    );
-    // A Judge-checked service needs the Judge, whom an API without one cannot name.
-    if (r.judgeAccount === null) where.push(`s.verifier = 'hirer'`);
-  }
+  if (f.status === "available") where.push(availableSql(r.judgeAccount));
   if (f.q !== undefined) {
     const pattern = p.add(`%${likeEscaped(f.q)}%`);
     where.push(
@@ -720,4 +751,99 @@ export async function getService(db: Db, id: bigint, r: ServiceReaders): Promise
   if (!row) return null;
   const [service] = await servicesOf(db, [row], r);
   return service ?? null;
+}
+
+// ---- Metrics ----------------------------------------------------------------------------------
+
+/** How many days `posted_by_day` covers, today (UTC) the last of them. */
+export const METRICS_DAYS = 14;
+/** How many agents `top_agents` lists. */
+export const TOP_AGENTS = 5;
+
+const DAY_NS = 86_400n * 1_000_000_000n;
+
+/**
+ * The amounts of `column` summed by task token, over the task rows `t` that `where` keeps, joined
+ * with `from`. Ordered by token in byte order. `column` is text that may not be an amount (the index
+ * keeps the outcome as the event gave it, as JSON): such a value counts as nothing rather than fail
+ * the whole read, and the indexer writes none.
+ */
+function sumsByTokenSql(column: string, from: string, where: string): string {
+  return `select t.token, sum(case when ${column} ~ '^[0-9]{1,39}$' then (${column})::numeric else 0 end)::text as amount
+       from tasks t${from}
+      where ${where}
+      group by t.token
+      order by t.token collate "C"`;
+}
+
+/**
+ * `GET /v1/metrics`, the platform's figures, counted from the index at `now` (nanoseconds): see
+ * `MetricsResponseSchema` in `@tender/shared` for what each one is. The services are counted as
+ * `listServices` counts them for `r`, and the top agents are labelled as `listAgents` labels them.
+ */
+export async function getMetrics(db: Db, now: bigint, r: ServiceReaders): Promise<MetricsResponse> {
+  const today = now / DAY_NS;
+  const firstDay = today - BigInt(METRICS_DAYS - 1);
+  const picked = "t.outcome ->> 'kind' = 'picked'";
+  // The winners of a pick, or none when the outcome holds no list of them.
+  const winners = `, jsonb_array_elements(case when jsonb_typeof(t.outcome -> 'winners') = 'array'
+                                                then t.outcome -> 'winners' else '[]'::jsonb end) w`;
+  const [tasks, paid, fees, agents, services, top, days] = await Promise.all([
+    db.query<MetricsResponse["tasks"]>(
+      `select count(*)::int as posted,
+              count(*) filter (where ${phaseSql("$1::numeric")} = 'open')::int as open,
+              count(*) filter (where t.outcome is not null)::int as settled,
+              count(*) filter (where ${picked})::int as picked,
+              count(*) filter (where t.outcome ->> 'kind' = 'voided')::int as voided
+         from tasks t`,
+      [now],
+    ),
+    db.query<TokenTotal>(sumsByTokenSql("w ->> 'amount'", winners, picked)),
+    db.query<TokenTotal>(sumsByTokenSql("t.outcome ->> 'fee'", "", picked)),
+    db.query<MetricsResponse["agents"] & { providers: number }>(
+      `select count(*)::int as registered,
+              count(*) filter (where a.status = 'active')::int as active,
+              count(distinct a.asp)::int as providers
+         from agents a`,
+    ),
+    db.query<MetricsResponse["services"]>(
+      `select count(*)::int as listed,
+              count(*) filter (where ${availableSql(r.judgeAccount)})::int as available
+         from services s`,
+    ),
+    db.query<AgentSummary>(
+      `select ${agentColumns("$1")}
+         from agents a
+        where a.wins > 0
+        order by a.wins desc, a.account collate "C"
+        limit $2::int`,
+      [[...r.teamAccounts], TOP_AGENTS],
+    ),
+    db.query<{ day: string; tasks: number }>(
+      `select div(t.created_at, $1::numeric)::text as day, count(*)::int as tasks
+         from tasks t
+        where t.created_at >= $2::numeric
+        group by 1`,
+      [DAY_NS, firstDay * DAY_NS],
+    ),
+  ]);
+  const counted = new Map(days.map((row) => [row.day, row.tasks]));
+  const msPerDay = Number(DAY_NS / 1_000_000n);
+  const { providers, ...agentCounts } = agents[0] ?? { registered: 0, active: 0, providers: 0 };
+  return {
+    tasks: tasks[0] ?? { posted: 0, open: 0, settled: 0, picked: 0, voided: 0 },
+    paid,
+    fees,
+    agents: agentCounts,
+    providers,
+    services: services[0] ?? { listed: 0, available: 0 },
+    top_agents: top,
+    posted_by_day: Array.from({ length: METRICS_DAYS }, (_, i) => {
+      const day = firstDay + BigInt(i);
+      return {
+        day: new Date(Number(day) * msPerDay).toISOString().slice(0, 10),
+        tasks: counted.get(day.toString()) ?? 0,
+      };
+    }),
+  };
 }

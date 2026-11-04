@@ -93,6 +93,46 @@ function taskCreatedData(id: string): Record<string, unknown> {
   };
 }
 
+test("events_hand_a_page_the_whole_message_when_it_asks", () => {
+  const messages: unknown[] = [];
+  connectEvents({
+    onEvent: () => {},
+    onResync: () => {},
+    onMessage: (whole) => messages.push(whole),
+  });
+  const source = FakeEventSource.latest;
+  source.send("committed", message("committed", "7", committedData("7")), "11");
+  // A message the schema refuses reaches neither handler.
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  source.send("committed", message("committed", "7", { task_id: "7" }), "12");
+  source.send("task_created", { ...message("task_created", "8", taskCreatedData("8")) });
+  expect(messages).toEqual([
+    { id: "11", event: "committed", data: committedData("7"), height: "1000", task_id: "7" },
+    // A message with no id of its own keeps the stream's last one, as a browser does.
+    {
+      id: "12",
+      event: "task_created",
+      data: taskCreatedData("8"),
+      height: "1000",
+      task_id: "8",
+    },
+  ]);
+});
+
+test("events_begin_after_the_id_a_page_already_has_and_need_no_resync", () => {
+  const resyncs = vi.fn();
+  connectEvents({ onEvent: () => {}, onResync: resyncs }, { since: "42" });
+  expect(FakeEventSource.latest.url).toBe(`${STREAM}?since=42`);
+  FakeEventSource.latest.open();
+  expect(resyncs).not.toHaveBeenCalled();
+
+  // An id that is no u64 is not sent: the stream opens as it would without one.
+  connectEvents({ onEvent: () => {}, onResync: resyncs }, { since: "4 2" });
+  expect(FakeEventSource.latest.url).toBe(STREAM);
+  FakeEventSource.latest.open();
+  expect(resyncs).toHaveBeenCalledTimes(1);
+});
+
 test("events_have_no_task_for_an_event_about_none", () => {
   const { seen, source } = connect();
 

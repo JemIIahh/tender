@@ -5,8 +5,7 @@ import { usePathname } from "next/navigation";
 import type { FocusEvent, PointerEvent, ReactNode } from "react";
 
 // Every page of the app, in the groups of the sidebar (components/AppShell.tsx), so that a task
-// that adds a page does not have to touch the shell. Until it does, its link leads to Next's own
-// "not found" page.
+// that adds a page does not have to touch the shell; and How it works, on its own at the foot.
 //
 // From laptop width up the sidebar can be a narrow rail of icons (lib/sidebar.ts). The rail's look
 // is all CSS, on the `rail:` variant: each link keeps its icon where it was, its words fade out,
@@ -14,7 +13,10 @@ import type { FocusEvent, PointerEvent, ReactNode } from "react";
 
 type Icon =
   | "market"
+  | "activity"
+  | "metrics"
   | "post"
+  | "tasks"
   | "browse"
   | "providers"
   | "services"
@@ -22,7 +24,9 @@ type Icon =
   | "mine"
   | "earnings"
   | "wallet"
-  | "telegram";
+  | "telegram"
+  | "settings"
+  | "how";
 
 interface Item {
   href: string;
@@ -31,8 +35,21 @@ interface Item {
 }
 
 const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = [
-  { title: null, items: [{ href: "/tasks", label: "Marketplace", icon: "market" }] },
-  { title: "Tasks", items: [{ href: "/post", label: "Post a task", icon: "post" }] },
+  {
+    title: null,
+    items: [
+      { href: "/tasks", label: "Marketplace", icon: "market" },
+      { href: "/activity", label: "Activity", icon: "activity" },
+      { href: "/metrics", label: "Metrics", icon: "metrics" },
+    ],
+  },
+  {
+    title: "Tasks",
+    items: [
+      { href: "/post", label: "Post a task", icon: "post" },
+      { href: "/my-tasks", label: "My tasks", icon: "tasks" },
+    ],
+  },
   {
     title: "Agents",
     items: [
@@ -49,11 +66,15 @@ const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = 
       { href: "/earnings", label: "Earnings", icon: "earnings" },
       { href: "/wallet", label: "Wallet", icon: "wallet" },
       { href: "/telegram", label: "Telegram", icon: "telegram" },
+      { href: "/settings", label: "Settings", icon: "settings" },
     ],
   },
 ];
 
-const HREFS = GROUPS.flatMap((group) => group.items.map((item) => item.href));
+/** The link at the foot of the sidebar, apart from the groups: what Tender is and how it works. */
+const FOOT: Item = { href: "/how-it-works", label: "How it works", icon: "how" };
+
+const HREFS = [...GROUPS.flatMap((group) => group.items.map((item) => item.href)), FOOT.href];
 
 /**
  * The link of the page you are on: the one whose page `pathname` is, or is under, and of those the
@@ -75,10 +96,26 @@ const ICONS: Record<Icon, ReactNode> = {
       <rect x="9" y="9" width="4.5" height="4.5" rx="1" />
     </>
   ),
+  // A pulse: what is happening now.
+  activity: <path d="M1.5 8.5h2.8l1.9-4.7 3.4 8.4 1.9-3.7h3" />,
+  // A line rising over two axes.
+  metrics: (
+    <>
+      <path d="M2.5 2.5v11h11" />
+      <path d="M5 10.2l2.6-3.1 2.2 1.8L13 4.8" />
+    </>
+  ),
   post: (
     <>
       <path d="M3 13l.6-2.7L10.4 3.5a1.4 1.4 0 0 1 2 0l.1.1a1.4 1.4 0 0 1 0 2L5.7 12.4z" />
       <path d="M9.3 4.6l2.1 2.1" />
+    </>
+  ),
+  // A list with two items ticked.
+  tasks: (
+    <>
+      <path d="M2.3 4.3l1.3 1.3 2.3-2.4M2.3 10.3l1.3 1.3 2.3-2.4" />
+      <path d="M8.4 4.4h5.3M8.4 10.4h5.3" />
     </>
   ),
   browse: (
@@ -131,6 +168,22 @@ const ICONS: Record<Icon, ReactNode> = {
     </>
   ),
   telegram: <path d="M14 2.5L1.8 7.4l4.4 1.5 1.6 4.6 2.3-3 3 2.2z" />,
+  // Two sliders.
+  settings: (
+    <>
+      <path d="M2.3 4.8h4M9.7 4.8h4M2.3 11.2h6.4M12.1 11.2h1.6" />
+      <circle cx="8" cy="4.8" r="1.7" />
+      <circle cx="10.4" cy="11.2" r="1.7" />
+    </>
+  ),
+  // A question in a circle.
+  how: (
+    <>
+      <circle cx="8" cy="8" r="6" />
+      <path d="M6.2 6.3a1.9 1.9 0 0 1 3.7.5c0 1.3-1.9 1.6-1.9 2.8" />
+      <path d="M8 11.5v.1" />
+    </>
+  ),
 };
 
 function NavIcon({ icon }: { icon: Icon }) {
@@ -161,16 +214,47 @@ export interface TipHandlers {
 /** How the words of the rail fade: with the width, and at once when motion is not wanted. */
 const FADE = "transition-opacity duration-200 motion-reduce:transition-none";
 
+/** One link of the sidebar: its icon, and its words, which fade on the rail; its name either way. */
+function NavLink({
+  item: { href, label, icon },
+  current,
+  tip,
+  small = false,
+}: {
+  item: Item;
+  current: string | undefined;
+  tip?: (label: string) => TipHandlers;
+  /** The foot's link: the same box, in smaller words. */
+  small?: boolean;
+}) {
+  return (
+    <Link
+      href={href}
+      aria-label={label}
+      aria-current={href === current ? "page" : undefined}
+      {...tip?.(label)}
+      className={`flex items-center gap-3 overflow-hidden rounded-xl px-3 text-muted transition-colors hover:bg-raised/60 hover:text-bone motion-reduce:transition-none aria-[current=page]:bg-raised aria-[current=page]:text-bone ${small ? "min-h-10 text-[13.5px]" : "min-h-10 text-[15px]"}`}
+    >
+      <NavIcon icon={icon} />
+      <span className={`whitespace-nowrap ${FADE} lg:rail:opacity-0`}>{label}</span>
+    </Link>
+  );
+}
+
 /**
- * The app's pages, grouped as the sidebar shows them, with the one you are on marked. `tip` gives
- * each link what it needs to show its name in a tooltip on the rail.
+ * The app's pages, grouped as the sidebar shows them, with the one you are on marked, and How it
+ * works at the foot. `tip` gives each link what it needs to show its name in a tooltip on the rail.
  */
 export function Nav({ tip }: { tip?: (label: string) => TipHandlers } = {}) {
   const current = currentHref(usePathname());
   return (
     // One column that may be narrower than the words in it (`grid-cols-1` is minmax(0, 1fr)): on
-    // the rail a link is as wide as the rail, and the words it holds are cut off, not the rail.
-    <nav aria-label="Main" className="grid grid-cols-1 gap-6">
+    // the rail a link is as wide as the rail, and the words it holds are cut off, not the rail. The
+    // last row takes what height is left, so that the foot's link sits at the sidebar's foot.
+    <nav
+      aria-label="Main"
+      className="grid flex-1 grid-cols-1 grid-rows-[auto_auto_auto_auto_1fr] gap-6"
+    >
       {GROUPS.map((group) => (
         <div key={group.title ?? "top"} className="grid grid-cols-1 gap-1">
           {group.title === null ? null : (
@@ -190,23 +274,17 @@ export function Nav({ tip }: { tip?: (label: string) => TipHandlers } = {}) {
             </div>
           )}
           <ul className="grid grid-cols-1 gap-1">
-            {group.items.map(({ href, label, icon }) => (
-              <li key={href}>
-                <Link
-                  href={href}
-                  aria-label={label}
-                  aria-current={href === current ? "page" : undefined}
-                  {...tip?.(label)}
-                  className="flex min-h-10 items-center gap-3 overflow-hidden rounded-xl px-3 text-[15px] text-muted transition-colors hover:bg-raised/60 hover:text-bone motion-reduce:transition-none aria-[current=page]:bg-raised aria-[current=page]:text-bone"
-                >
-                  <NavIcon icon={icon} />
-                  <span className={`whitespace-nowrap ${FADE} lg:rail:opacity-0`}>{label}</span>
-                </Link>
+            {group.items.map((item) => (
+              <li key={item.href}>
+                <NavLink item={item} current={current} tip={tip} />
               </li>
             ))}
           </ul>
         </div>
       ))}
+      <div data-testid="sidebar-foot" className="grid grid-cols-1 content-end">
+        <NavLink item={FOOT} current={current} tip={tip} small />
+      </div>
     </nav>
   );
 }

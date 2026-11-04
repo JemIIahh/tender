@@ -219,9 +219,29 @@ test("live_panel_opens_from_the_keyboard_and_escape_gives_the_focus_back", async
 
   await userEvent.keyboard(" ");
   expect(screen.getByTestId("live-panel").hidden).toBe(false);
-  // Moving on with the keyboard closes it.
+  // The panel's one control, the link to Metrics, is the next stop: the panel stays open on it.
+  await userEvent.tab();
+  expect(document.activeElement?.textContent).toBe("See metrics");
+  expect(screen.getByTestId("live-panel").hidden).toBe(false);
+  // Moving on with the keyboard, out of the panel, closes it.
   await userEvent.tab();
   expect(document.activeElement?.textContent).toBe("Elsewhere");
+  expect(screen.getByTestId("live-panel").hidden).toBe(true);
+  // And going straight on from the pill, past a closed panel, never stops in it.
+  button.focus();
+  await userEvent.tab();
+  expect(document.activeElement?.textContent).toBe("Elsewhere");
+});
+
+test("live_panel_links_to_the_metrics_page_and_closes_when_it_is_followed", async () => {
+  fakeApi({ [HEALTH_PATH]: () => json(HEALTH) });
+  render(<LiveStatus />);
+  await userEvent.click(await pill());
+  const link = within(screen.getByTestId("live-panel")).getByRole("link", { name: "See metrics" });
+  expect(link.getAttribute("href")).toBe("/metrics");
+  // A press on it is inside the panel; the page it opens is another, and the panel goes.
+  link.addEventListener("click", (event) => event.preventDefault());
+  await userEvent.click(link);
   expect(screen.getByTestId("live-panel").hidden).toBe(true);
 });
 

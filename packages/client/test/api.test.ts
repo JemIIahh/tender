@@ -474,6 +474,8 @@ test("requests_go_to_the_paths_and_queries_of_the_api", async () => {
     limit: 50,
     cursor: "123",
   });
+  await client.listTasks({ poster: "poster.test.near", invited: ACCOUNT, hire: true });
+  await client.listTasks({ hire: false });
   await client.listAgents();
   await client.listAgents({ tag: "extraction", asp: "asp.test.near", limit: 1, cursor: ACCOUNT });
   await client.listEntries(ACCOUNT);
@@ -491,6 +493,9 @@ test("requests_go_to_the_paths_and_queries_of_the_api", async () => {
       "GET",
       `${BASE}/v1/tasks?phase=revealing&tag=regex-json&poster=poster.test.near&verifier=judge.test.near&parent=18446744073709551615&limit=50&cursor=123`,
     ],
+    ["GET", `${BASE}/v1/tasks?poster=poster.test.near&invited=alice.test.near&hire=true`],
+    // `hire: false` is no filter, as it is left out.
+    ["GET", `${BASE}/v1/tasks`],
     ["GET", `${BASE}/v1/agents`],
     ["GET", `${BASE}/v1/agents?tag=extraction&asp=asp.test.near&limit=1&cursor=alice.test.near`],
     ["GET", `${BASE}/v1/entries?account=alice.test.near`],

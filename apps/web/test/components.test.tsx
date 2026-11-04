@@ -2,10 +2,13 @@ import { NETWORKS } from "@tender/shared";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, test, vi } from "vitest";
-import { Amount } from "../components/Amount";
+import { Amount, RawUnits } from "../components/Amount";
 import { ErrorState } from "../components/ErrorState";
 import { Nav } from "../components/Nav";
+import { TaskCard } from "../components/TaskCard";
 import { TeamBadge } from "../components/TeamBadge";
+import { knowsToken } from "../lib/tokens";
+import { summary } from "./tasks";
 
 // No jest-dom here (X-20): plain assertions on what the Testing Library finds.
 
@@ -145,14 +148,67 @@ test("error_state_while_retrying_reads_retrying_and_asks_for_nothing_more", asyn
   expect(onRetry).not.toHaveBeenCalled();
 });
 
+// ---- A board card in a token the app knows no decimals for --------------------------------------
+
+test("task_card_labels_an_unknown_token_as_the_live_panel_does_and_never_breaks_the_number", () => {
+  const MAX = "340282366920938463463374607431768211455";
+  const IMPLICIT = "5f3a9c0e".repeat(8);
+  render(
+    <ul>
+      <TaskCard task={summary({ token: IMPLICIT, reward: MAX })} nowNs={0n} />
+    </ul>,
+  );
+  const raw = screen.getByTestId("card-raw-reward");
+  // The amount as the contract holds it, one unbroken run of figures that never wraps.
+  const amount = raw.querySelector(".whitespace-nowrap");
+  expect(amount?.textContent).toBe(MAX);
+  expect(amount?.className).not.toContain("wrap-anywhere");
+  // Under it, the Live panel's label: the token's account with its middle left out, whole for a
+  // screen reader and in the title.
+  expect(raw.textContent).toBe(`Reward: ${MAX}smallest units of 5f3a9c0e…5f3a9c0e${IMPLICIT}`);
+  expect(raw.querySelector(`[title="${IMPLICIT}"]`)).toBeTruthy();
+  // The token's account is not run into the number any more.
+  expect(raw.textContent).not.toContain(`${MAX} ${IMPLICIT}`);
+  expect(knowsToken(IMPLICIT)).toBe(false);
+  expect(knowsToken(USDC_TESTNET)).toBe(true);
+});
+
+test("raw_units_cut_a_long_number_in_the_middle_visibly_and_keep_every_digit_in_the_page", () => {
+  const MAX = "340282366920938463463374607431768211455";
+  render(<RawUnits value={MAX} token="mystery.token.near" amountTestId="raw" />);
+  const amount = screen.getByTestId("raw");
+  // Every digit is in the page, for a screen reader, and in the tooltip.
+  expect(amount.textContent).toBe(MAX);
+  expect(amount.getAttribute("title")).toBe(MAX);
+  // The head gives way with a visible "…" (CSS), and the last six digits always show.
+  const head = screen.getByTestId("raw-head");
+  expect(head.className).toContain("text-ellipsis");
+  expect(head.className).toContain("overflow-hidden");
+  expect(head.textContent).toBe(MAX.slice(0, -6));
+  expect(head.nextElementSibling?.textContent).toBe("211455");
+  expect(head.nextElementSibling?.className).toContain("shrink-0");
+  // Never a scroller that cuts it off at the edge, and never a wrap in the middle.
+  expect(amount.className).not.toMatch(/overflow-x-auto|wrap-anywhere/);
+
+  // A short amount is shown as it is, with nothing to cut.
+  render(<RawUnits value="42" token="mystery.token.near" amountTestId="short" />);
+  expect(screen.getByTestId("short").textContent).toBe("42");
+  expect(screen.getByTestId("short").children).toHaveLength(0);
+});
+
 // ---- Nav --------------------------------------------------------------------------------------
 
 // The sidebar calls the board "Marketplace", as the app restyle brief names it, and groups the
 // agents' pages under Agents, the provider (ASP) pages and the services for hire among them (the
 // ASP and the services briefs).
+// The parity brief adds Activity and Metrics beside it, My tasks, Settings, and How it works at the
+// foot.
 const LINKS = [
   ["Marketplace", "/tasks"],
+  ["Activity", "/activity"],
+  ["Metrics", "/metrics"],
   ["Post a task", "/post"],
+  ["My tasks", "/my-tasks"],
   ["Browse agents", "/agents"],
   ["Providers", "/providers"],
   ["Services", "/services"],
@@ -161,6 +217,8 @@ const LINKS = [
   ["Earnings", "/earnings"],
   ["Wallet", "/wallet"],
   ["Telegram", "/telegram"],
+  ["Settings", "/settings"],
+  ["How it works", "/how-it-works"],
 ] as const;
 
 test("nav_links_every_page_of_the_app", () => {
@@ -188,13 +246,15 @@ test("nav_groups_the_pages_under_their_titles", () => {
     links: [...group.querySelectorAll("a")].map((link) => link.getAttribute("aria-label")),
   }));
   expect(groups).toEqual([
-    { title: null, links: ["Marketplace"] },
-    { title: "Tasks", links: ["Post a task"] },
+    { title: null, links: ["Marketplace", "Activity", "Metrics"] },
+    { title: "Tasks", links: ["Post a task", "My tasks"] },
     {
       title: "Agents",
       links: ["Browse agents", "Providers", "Services", "Add an agent", "My agents"],
     },
-    { title: "Account", links: ["Earnings", "Wallet", "Telegram"] },
+    { title: "Account", links: ["Earnings", "Wallet", "Telegram", "Settings"] },
+    // The foot, in no group.
+    { title: null, links: ["How it works"] },
   ]);
 });
 

@@ -10,7 +10,9 @@ import { blobRoutes } from "./routes/blobs";
 import { connectRoutes } from "./routes/connect";
 import { entryRoutes } from "./routes/entries";
 import { healthRoutes } from "./routes/health";
+import { metricsRoutes } from "./routes/metrics";
 import { questionRoutes } from "./routes/questions";
+import { recentEventRoutes } from "./routes/recent";
 import { serviceRoutes } from "./routes/services";
 import { startRoutes } from "./routes/start";
 import { taskRoutes } from "./routes/tasks";
@@ -50,6 +52,7 @@ export function createApp(deps: ApiDeps): Hono {
   app.route("/v1", taskRoutes(deps));
   app.route("/v1", agentRoutes(deps));
   app.route("/v1", entryRoutes(deps));
+  app.route("/v1", metricsRoutes(deps));
   app.route("/v1", authRoutes(deps));
   // One sign-in middleware for every route that needs an account, so that its record of which
   // keys it has checked lately is shared.
@@ -60,6 +63,7 @@ export function createApp(deps: ApiDeps): Hono {
   app.route("/v1", serviceRoutes(deps, signedIn));
   app.route("/v1", telegramRoutes(deps, signedIn));
   app.route("/v1", connectRoutes(deps, signedIn));
+  app.route("/v1", recentEventRoutes(deps));
   app.route("/v1", eventRoutes(deps));
 
   // Not under /v1: the MCP clients are not browsers, so the CORS block above does not apply.

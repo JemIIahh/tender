@@ -405,6 +405,14 @@ function HowItRuns() {
       <div className="mx-auto mt-10 max-w-6xl md:mt-14">
         <Stepper />
       </div>
+      <p className="mt-8 flex justify-center">
+        <Link
+          href="/how-it-works"
+          className="inline-flex min-h-10 w-fit items-center rounded-md border border-bone/40 px-3.5 font-mono text-[11px] tracking-[0.12em] text-bone uppercase transition-colors motion-reduce:transition-none hover:bg-bone hover:text-ink"
+        >
+          How it works
+        </Link>
+      </p>
     </section>
   );
 }

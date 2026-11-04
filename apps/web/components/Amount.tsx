@@ -1,5 +1,6 @@
 import { formatTokenAmount, type NetworkId, tokenMeta } from "@tender/shared";
 import { config } from "../lib/config";
+import { knowsToken, shortId } from "../lib/tokens";
 
 /** `value` in whole units, or undefined if it is no amount: missing, or not a string of digits. */
 function wholeUnits(value: string | null | undefined, decimals: number): string | undefined {
@@ -45,11 +46,78 @@ export function Amount({
       {whole ?? asWritten(value)}{" "}
       {/* A known token, with a value that is an amount, gets its symbol. Anything else gets the
           token's account id, set apart so that it is not read as more of the number. */}
-      {whole !== undefined && symbol !== token ? (
+      {whole !== undefined && knowsToken(token, network) ? (
         symbol
       ) : (
         <span className="font-mono text-sm">{token}</span>
       )}
+    </span>
+  );
+}
+
+/** How many of a raw amount's last digits always show, however narrow its line. */
+const TAIL_DIGITS = 6;
+
+/**
+ * An amount in a token this app has no decimals for (`knowsToken`), as the Live panel, a board card,
+ * Metrics and Activity show it: the amount as the contract holds it, and under it a label that says
+ * so, "smallest units of" and the token's account, its middle left out when it is long.
+ *
+ * The number is one run of figures that never wraps. On a line too narrow for all of it, it is cut
+ * in the middle, visibly: its first digits as far as they fit, a "…", and always its last six. It
+ * is never cut off silently at the line's edge, where the digits that are left would read as
+ * another number. The "…" is drawn by CSS (`text-overflow`): every digit stays in the page, so a
+ * screen reader reads the whole number, and so does the tooltip (`title`). The whole id is the
+ * label's title, and is what a screen reader reads of it.
+ */
+export function RawUnits({
+  value,
+  token,
+  amountTestId,
+  unitTestId,
+  label,
+}: {
+  value: string;
+  token: string;
+  amountTestId?: string;
+  unitTestId?: string;
+  /** Words for a screen reader before the amount, such as "Reward:". */
+  label?: string;
+}) {
+  const short = shortId(token);
+  const cut = value.length > TAIL_DIGITS * 2;
+  return (
+    <span className="grid min-w-0 gap-0.5">
+      <span className="flex min-w-0 font-mono tabular-nums">
+        {label === undefined ? null : <span className="sr-only">{label} </span>}
+        <span
+          data-testid={amountTestId}
+          title={value}
+          className="flex max-w-full min-w-0 whitespace-nowrap"
+        >
+          {cut ? (
+            <>
+              <span data-testid="raw-head" className="min-w-0 overflow-hidden text-ellipsis">
+                {value.slice(0, -TAIL_DIGITS)}
+              </span>
+              <span className="shrink-0">{value.slice(-TAIL_DIGITS)}</span>
+            </>
+          ) : (
+            value
+          )}
+        </span>
+      </span>
+      <span data-testid={unitTestId} className="text-[11.5px] text-muted">
+        smallest units of{" "}
+        {short === token ? (
+          <span className="font-mono">{token}</span>
+        ) : (
+          <span title={token} className="font-mono">
+            <span aria-hidden="true">{short}</span>
+            <span className="sr-only">{token}</span>
+          </span>
+        )}
+      </span>
     </span>
   );
 }

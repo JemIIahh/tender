@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -239,7 +239,10 @@ test("sidebar_rail_keeps_every_link_by_its_name_and_marks_the_page", async () =>
   const wide = names();
   expect(wide).toEqual([
     "Marketplace",
+    "Activity",
+    "Metrics",
     "Post a task",
+    "My tasks",
     "Browse agents",
     "Providers",
     "Services",
@@ -248,6 +251,8 @@ test("sidebar_rail_keeps_every_link_by_its_name_and_marks_the_page", async () =>
     "Earnings",
     "Wallet",
     "Telegram",
+    "Settings",
+    "How it works",
   ]);
 
   await userEvent.click(toggle());
@@ -263,6 +268,62 @@ test("sidebar_rail_keeps_every_link_by_its_name_and_marks_the_page", async () =>
   // Each group keeps its title for a screen reader, which reads the group by it.
   expect(nav.textContent).toContain("Agents");
   expect(nav.textContent).toContain("Account");
+});
+
+test("sidebar_groups_hold_the_pages_in_their_final_order_with_how_it_works_at_the_foot", async () => {
+  shell();
+  const nav = screen.getByRole("navigation", { name: "Main" });
+  // Each group's links, by the group's title (the top group has none).
+  const groups = [...nav.querySelectorAll("ul")].map((list) => {
+    const title = list.parentElement?.querySelector("p")?.textContent ?? null;
+    return [
+      title,
+      within(list)
+        .getAllByRole("link")
+        .map((link) => link.getAttribute("href")),
+    ];
+  });
+  expect(groups).toEqual([
+    [null, ["/tasks", "/activity", "/metrics"]],
+    ["Tasks", ["/post", "/my-tasks"]],
+    ["Agents", ["/agents", "/providers", "/services", "/my-agents/new", "/my-agents"]],
+    ["Account", ["/earnings", "/wallet", "/telegram", "/settings"]],
+  ]);
+  // How it works is in no group: on its own, at the foot, after the groups.
+  const foot = screen.getByTestId("sidebar-foot");
+  const how = within(foot).getByRole("link", { name: "How it works" });
+  expect(how.getAttribute("href")).toBe("/how-it-works");
+  expect(nav.lastElementChild).toBe(foot);
+
+  // Each new page is marked as the one you are on, from the sidebar.
+  for (const [path, name] of [
+    ["/activity", "Activity"],
+    ["/metrics", "Metrics"],
+    ["/my-tasks", "My tasks"],
+    ["/settings", "Settings"],
+    ["/how-it-works", "How it works"],
+  ] as const) {
+    cleanup();
+    pathname.current = path;
+    shell();
+    const marked = within(screen.getByRole("navigation", { name: "Main" })).getByRole("link", {
+      current: "page",
+    });
+    expect(marked.getAttribute("aria-label"), path).toBe(name);
+  }
+});
+
+test("sidebar_rail_names_every_new_page_in_a_tooltip", async () => {
+  shell();
+  await userEvent.click(toggle());
+  const nav = screen.getByRole("navigation", { name: "Main" });
+  for (const name of ["Activity", "Metrics", "My tasks", "Settings", "How it works"]) {
+    const link = within(nav).getByRole("link", { name });
+    await userEvent.hover(link);
+    expect(screen.getByTestId("sidebar-tip").textContent, name).toBe(name);
+    await userEvent.unhover(link);
+    await userEvent.keyboard("{Escape}");
+  }
 });
 
 test("sidebar_rail_names_each_icon_in_a_tooltip_and_escape_takes_it_away", async () => {

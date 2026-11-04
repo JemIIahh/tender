@@ -32,7 +32,7 @@ test("sidebar_becomes_a_rail_and_back_and_the_mark_moves_to_the_top_bar", async 
   await expect(sideMark).toBeHidden();
   // Every link is still there, as an icon the size of the rail, the page you are on still marked.
   const links = nav(page).getByRole("link");
-  await expect(links).toHaveCount(10);
+  await expect(links).toHaveCount(15);
   for (const link of await links.all()) {
     const box = await link.boundingBox();
     expect(box?.width).toBeCloseTo(40, 0);
