@@ -369,6 +369,7 @@ export class ApiClient implements TenderApi {
       verifier: filter.verifier,
       parent: filter.parent,
       invited: filter.invited,
+      hire: filter.hire === true ? "true" : undefined,
       limit: filter.limit,
       cursor: filter.cursor,
     });

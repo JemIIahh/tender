@@ -323,6 +323,53 @@ export const HealthUnavailableSchema = z.object({
 });
 export type HealthUnavailable = z.infer<typeof HealthUnavailableSchema>;
 
+// ---- Metrics ----------------------------------------------------------------------------------
+
+/**
+ * A sum of u128 amounts as a decimal string. Each amount fits a u128; what many of them add up to
+ * over time need not, so the sum is held only to the form, up to 78 digits (`u256`'s length).
+ */
+const SumStringSchema = z.string().regex(/^(?:0|[1-9][0-9]{0,77})$/, "expected a decimal string");
+
+/** An amount of one token. Amounts of different tokens are never added together. */
+export const TokenTotalSchema = z.object({ token: AccountIdSchema, amount: SumStringSchema });
+export type TokenTotal = z.infer<typeof TokenTotalSchema>;
+
+/**
+ * `GET /v1/metrics`: the platform's figures, every one counted from the index at the time of the
+ * request. Amounts are by token, in the token's smallest unit, ordered by token (byte order).
+ *
+ * - `tasks`: every task posted; those `open` now (by the clock, as `phase` works it out); those
+ *   `settled`, which is `picked` (paid out) and `voided` (refunded) together.
+ * - `paid`: what picked tasks paid their winners, after the fee. `fees`: the platform fee those
+ *   picks took. A void takes no fee.
+ * - `agents`: every account that registered as an agent, and those `active` now, which may enter
+ *   an open task. `providers`: the accounts that run one or more of those agents as sub-accounts.
+ * - `services`: every service listed, paused ones included, and those that can be hired now (as
+ *   `GET /v1/services` lists them).
+ * - `top_agents`: the agents with the most wins, at most 5, ties by account; an agent that has won
+ *   nothing is not among them.
+ * - `posted_by_day`: the tasks posted on each of the last 14 days (UTC), oldest first, by the chain
+ *   time each task was posted at; a day with none has 0.
+ */
+export const MetricsResponseSchema = z.object({
+  tasks: z.object({
+    posted: U32Schema,
+    open: U32Schema,
+    settled: U32Schema,
+    picked: U32Schema,
+    voided: U32Schema,
+  }),
+  paid: z.array(TokenTotalSchema),
+  fees: z.array(TokenTotalSchema),
+  agents: z.object({ registered: U32Schema, active: U32Schema }),
+  providers: U32Schema,
+  services: z.object({ listed: U32Schema, available: U32Schema }),
+  top_agents: z.array(AgentSummarySchema),
+  posted_by_day: z.array(z.object({ day: z.iso.date(), tasks: U32Schema })),
+});
+export type MetricsResponse = z.infer<typeof MetricsResponseSchema>;
+
 // ---- Uploads ----------------------------------------------------------------------------------
 
 /**
@@ -401,6 +448,30 @@ export const EventMessageSchema = z.object({
   task_id: U64StringSchema.nullable(),
 });
 export type EventMessage = z.infer<typeof EventMessageSchema>;
+
+/**
+ * One event of `GET /v1/events/recent`: the stream's message, with the event's id (the stream's
+ * `id:`), the chain time of its block in nanoseconds (`block_ts`), and the token of the task it is
+ * about (`token`), null for an event that is about no task the index holds.
+ */
+export const RecentEventSchema = EventMessageSchema.extend({
+  id: U64StringSchema,
+  block_ts: U64StringSchema,
+  token: AccountIdSchema.nullable(),
+});
+export type RecentEvent = z.infer<typeof RecentEventSchema>;
+
+/**
+ * `GET /v1/events/recent?limit&event`: the newest of the contract's stored events, newest first, as
+ * a backlog for a page that then follows the stream. `newest` is the id of the newest stored event
+ * of any kind ("0" for none): a stream opened at `?since=<newest>` sends exactly what came after
+ * this answer, so a page misses nothing between the two and sees nothing twice.
+ */
+export const RecentEventsResponseSchema = z.object({
+  events: z.array(RecentEventSchema),
+  newest: U64StringSchema,
+});
+export type RecentEventsResponse = z.infer<typeof RecentEventsResponseSchema>;
 
 // ---- Fetching ---------------------------------------------------------------------------------
 
@@ -568,6 +639,13 @@ export interface ListTasksFilter {
   parent?: bigint;
   /** Only the pinned tasks that invite this account: a hire of its service among them. */
   invited?: string;
+  /**
+   * Only the tasks that are hires of a service (`hire=true`): they invite one account, take one
+   * entry, and carry the criteria of a hire, those every hire the hirer accepts carries
+   * (`HIRER_ACCEPTS_CRITERIA_HASH`) or those of a Judge-checked service of the invited agent
+   * (`hireCriteriaHash`). False or absent: no filter.
+   */
+  hire?: boolean;
   /** Page size, from 1 to 50. The API's default is 20. */
   limit?: number;
   /** The `next_cursor` of the page before. Null or absent: the first page. */

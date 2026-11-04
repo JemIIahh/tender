@@ -333,6 +333,29 @@ export function hireCriteriaHash(service: Pick<Service, "verification">): string
     : HIRER_ACCEPTS_CRITERIA_HASH;
 }
 
+/**
+ * Whether a task's terms mark it as a hire of a service: it invites one account and takes one entry
+ * (`max_entries` 1), as `hireTerms` posts a hire, and it carries a hire's criteria: those of a hire
+ * the hirer accepts, the same for every service (`HIRER_ACCEPTS_CRITERIA_HASH`), or those of one of
+ * `services` that the invited account offers and the Judge checks (`hireCriteriaHash`). It says what
+ * the task is, not whether its terms meet the service's: `hireMismatch` is that. `GET /v1/tasks`
+ * with `hire=true` filters by the same rule, in SQL, and the API's test holds the two together.
+ */
+export function isHireTask(
+  task: { invited: readonly string[]; max_entries: number; criteria_hash: string },
+  services: readonly Pick<Service, "agent" | "verification">[],
+): boolean {
+  const [agent, ...others] = task.invited;
+  if (task.max_entries !== 1 || agent === undefined || others.length > 0) return false;
+  if (task.criteria_hash === HIRER_ACCEPTS_CRITERIA_HASH) return true;
+  return services.some(
+    (service) =>
+      service.agent === agent &&
+      service.verification.kind === "judge" &&
+      hireCriteriaHash(service) === task.criteria_hash,
+  );
+}
+
 /** What `hireMismatch` reads of a task: the fields of its detail that a hire fixes. */
 export interface HireTaskTerms {
   poster: string;

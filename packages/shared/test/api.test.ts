@@ -553,6 +553,7 @@ const ALICE = "alice.test.near";
 const JUDGE = "judge.test.near";
 const POSTER = "poster.test.near";
 const CONTRACT = "tender.test.near";
+const TOKEN = "token.test.near";
 const SOON = "2026-10-30T10:15:00.000Z";
 
 const TASK_DETAIL = {
@@ -750,6 +751,52 @@ const SAMPLES: { [name in SchemaName]: Sample[] } = {
   ],
   // `data` is any object on purpose, so the sample leaves it empty.
   EventMessageSchema: [{ body: { event: "task_created", data: {}, height: "90", task_id: "7" } }],
+  TokenTotalSchema: [{ body: { token: TOKEN, amount: "950000" } }],
+  MetricsResponseSchema: [
+    {
+      body: {
+        tasks: { posted: 4, open: 1, settled: 2, picked: 1, voided: 1 },
+        paid: [{ token: TOKEN, amount: "950000" }],
+        fees: [{ token: TOKEN, amount: "50000" }],
+        agents: { registered: 3, active: 2 },
+        providers: 1,
+        services: { listed: 2, available: 1 },
+        top_agents: [AGENT],
+        posted_by_day: [{ day: "2026-11-04", tasks: 2 }],
+      },
+    },
+  ],
+  RecentEventSchema: [
+    {
+      body: {
+        id: "12",
+        event: "task_created",
+        data: {},
+        height: "90",
+        task_id: "7",
+        block_ts: "1793307169820229000",
+        token: TOKEN,
+      },
+    },
+  ],
+  RecentEventsResponseSchema: [
+    {
+      body: {
+        events: [
+          {
+            id: "12",
+            event: "agent_registered",
+            data: {},
+            height: "90",
+            task_id: null,
+            block_ts: "1793307169820229000",
+            token: null,
+          },
+        ],
+        newest: "13",
+      },
+    },
+  ],
 };
 
 /** The path to every key of `value`, at every depth. An array is entered at its first item. */

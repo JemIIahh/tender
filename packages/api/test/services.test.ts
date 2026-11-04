@@ -5,12 +5,15 @@ import { blockOf, eventLine, FIXTURE_OPTIONS } from "@tender/indexer/testing";
 import {
   type CreateServiceRequest,
   canonicalJson,
+  HIRER_ACCEPTS_CRITERIA_HASH,
+  isHireTask,
   ListServicesResponseSchema,
   type PublicCriteria,
   SERVICE_MAX_PRICE,
   SERVICES_PER_PROVIDER,
   ServiceResponseSchema,
   sha256Hex,
+  TaskDetailResponseSchema,
 } from "@tender/shared";
 import { Hono } from "hono";
 import { afterAll, beforeAll, beforeEach, expect, test } from "vitest";
@@ -682,6 +685,92 @@ test("the_task_list_finds_the_pinned_tasks_that_invite_an_account", async () => 
   expect(await tasks(`?invited=${OTHER}`)).toEqual([]);
   expect((await app.request("/v1/tasks?invited=NOT")).status).toBe(400);
 });
+
+test("the_task_list_finds_the_hires_by_the_shared_rule", async () => {
+  // A service the hirer checks and one the Judge checks, both of writer's.
+  const hirer = await create(ACME, listing(WRITER));
+  const judged = await create(
+    ACME,
+    listing(WRITER, {
+      output_format: "regex_json",
+      verification: { kind: "judge", criteria: REGEX_CRITERIA },
+    }),
+  );
+  const services = ListServicesResponseSchema.parse((await list("?status=all")).body).services;
+  expect(services.map((service) => service.id).sort()).toEqual([hirer, judged].map(idOf).sort());
+  const judgedHash = sha256Hex(canonicalJson(REGEX_CRITERIA));
+
+  const SECOND = 1_000_000_000n;
+  const commit = TEST_NOW + 60n * SECOND;
+  const windows = {
+    created_at: String(TEST_NOW - SECOND),
+    commit_deadline: String(commit),
+    reveal_deadline: String(commit + 60n * SECOND),
+    pick_deadline: String(commit + 120n * SECOND),
+    fallback_deadline: String(commit + 180n * SECOND),
+  };
+  const pinned = (id: string, over: object) =>
+    eventLine("task_created", {
+      id,
+      poster: OTHER,
+      invited: [WRITER],
+      max_entries: 1,
+      criteria_hash: HIRER_ACCEPTS_CRITERIA_HASH,
+      ...windows,
+      ...over,
+    });
+  await applyBlock(
+    deps.db,
+    blockOf(100n, [
+      // Hires: writer alone, once, with the criteria of the hirer's acceptance or of its service.
+      pinned("2", {}),
+      pinned("3", { criteria_hash: judgedHash }),
+      // Not hires: the service's criteria for an agent that does not offer it, more than one
+      // entry, more than one invited account, none invited, and criteria of no service.
+      pinned("4", { invited: [SOLO], criteria_hash: judgedHash }),
+      pinned("5", { max_entries: 2 }),
+      pinned("6", { invited: [WRITER, SOLO] }),
+      pinned("7", { invited: [] }),
+      pinned("8", { criteria_hash: "cd".repeat(32) }),
+      // A hire by another hirer.
+      pinned("9", { poster: SOLO }),
+    ]),
+    FIXTURE_OPTIONS,
+  );
+  const app = createApp(deps);
+  const tasks = async (query: string) => {
+    const res = await app.request(`/v1/tasks${query}`);
+    expect(res.status, query).toBe(200);
+    return ((await res.json()) as { tasks: Array<{ id: string }> }).tasks.map((task) => task.id);
+  };
+  expect(await tasks("?hire=true")).toEqual(["9", "3", "2"]);
+  expect(await tasks(`?hire=true&poster=${OTHER}`)).toEqual(["3", "2"]);
+  expect(await tasks(`?hire=true&poster=${OTHER}&limit=1`)).toEqual(["3"]);
+  expect(await tasks(`?hire=true&poster=${OTHER}&cursor=3`)).toEqual(["2"]);
+  expect(await tasks(`?hire=true&invited=${SOLO}`)).toEqual([]);
+  // An empty value is no filter.
+  expect(await tasks("?hire=")).toHaveLength(8);
+
+  // The SQL is the shared rule: for every task, the list and `isHireTask` agree.
+  const hires = new Set(await tasks("?hire=true"));
+  for (const id of ["2", "3", "4", "5", "6", "7", "8", "9"]) {
+    const detail = TaskDetailResponseSchema.parse(
+      await (await app.request(`/v1/tasks/${id}`)).json(),
+    );
+    expect(isHireTask(detail.task, services), `task ${id}`).toBe(hires.has(id));
+  }
+
+  for (const value of ["false", "1", "yes", "TRUE"]) {
+    const res = await app.request(`/v1/tasks?hire=${value}`);
+    expect(res.status, value).toBe(400);
+    expect(((await res.json()) as ErrorBody).message).toBe("hire must be true");
+  }
+});
+
+/** The id of a service a create answered with. */
+function idOf(reply: Reply<ServiceBody>): string {
+  return String(reply.body.service.id);
+}
 
 // ---- Helpers ------------------------------------------------------------------------------------
 
