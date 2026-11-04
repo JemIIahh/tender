@@ -31,6 +31,7 @@ import {
   type Phase,
   PICK_BPS_WHOLE,
   PickRefusal,
+  type PickWording,
   ProfileSchema,
   PublicCriteriaSchema,
   randomSalt,
@@ -2050,6 +2051,12 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
 
   // ---- pick_winners ---------------------------------------------------------------------------
 
+  /** The MCP's words in the shared refusals: an agent calls a tool again, and reads get_scorecard. */
+  const PICK_WORDING: PickWording = {
+    retry: "call again",
+    notReused: "the Judge's from get_scorecard included",
+  };
+
   /**
    * Runs the shared checks of a pick (`checkPickScorecard`, `checkPickShares`, `checkPickOnTask` in
    * @tender/shared), which the web app's pick runs too, and answers a refusal with its code.
@@ -2076,7 +2083,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
   ): Promise<void> {
     pickRule(() => checkPickShares(winners));
     const detail = await api.getTask(BigInt(taskId));
-    pickRule(() => checkPickOnTask(detail, { taskId, winners, card }));
+    pickRule(() => checkPickOnTask(detail, { taskId, winners, card }, PICK_WORDING));
   }
 
   server.registerTool(
@@ -2130,12 +2137,11 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       // The API holds the verifier and the Judge's name to the uploader as well (P03-R29): they are
       // checked here first, with the same rules as the web app's pick.
       pickRule(() =>
-        checkPickScorecard(card.data, {
-          taskId: task_id,
-          picker: accountId,
-          judgeAccount: deps.judgeAccount,
-          winners,
-        }),
+        checkPickScorecard(
+          card.data,
+          { taskId: task_id, picker: accountId, judgeAccount: deps.judgeAccount, winners },
+          PICK_WORDING,
+        ),
       );
       // A scorecard is public and cannot be taken back, so it is looked at for the server's secrets
       // before anything is asked of the API, let alone published. The bytes are the shared ones

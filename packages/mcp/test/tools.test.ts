@@ -3694,6 +3694,25 @@ test("pick_winners_pays_a_split_that_the_contract_takes", async () => {
  */
 const HAND_PICK_HASH = "54ad6282bb3f35bdea6c7e6f77a3b2bde7576298e19ec3e785f797afb2942eb1";
 
+test("pick_winners_refusals_speak_to_an_agent", async () => {
+  // The rules are shared with the web app; the words of what to do next are the MCP's own.
+  const mismatch = await connectWrite();
+  mismatch.api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+  const winners = [{ account: ACCOUNT, bps: 10_000 }];
+  const other = await mismatch.call("pick_winners", {
+    task_id: "7",
+    winners,
+    scorecard: { ...SCORECARD, verifier: OTHER },
+  });
+  expect(other.text).toMatch(/^SCORECARD_MISMATCH: /);
+  expect(other.text).toContain("do not reuse another's, the Judge's from get_scorecard included");
+
+  const lagging = await connectWrite();
+  lagging.api.getTask.mockResolvedValue(makeDetail([makeEntry(ACCOUNT, { revealed: false })]));
+  const late = await lagging.call("pick_winners", { task_id: "7", winners, scorecard: SCORECARD });
+  expect(late.text).toMatch(/^INVALID_WINNERS: .*wait a few seconds and call again$/);
+});
+
 test("pick_winners_publishes_a_pick_by_hand_as_the_bytes_the_web_app_publishes", async () => {
   // The web app writes a person's pick with `handPickedScorecard` and uploads it with
   // `scorecardUpload`, both of @tender/shared. The same scorecard sent through this tool has to go

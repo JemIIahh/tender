@@ -9,6 +9,7 @@ import {
   type HandPickInput,
   handPickedScorecard,
   PickRefusal,
+  revealedForPick,
   type Scorecard,
   ScorecardSchema,
   scorecardUpload,
@@ -275,6 +276,39 @@ test("a_scorecard_must_go_with_its_pick", () => {
       message: "winners must be the scorecard's winners, in order",
     });
   }
+});
+
+test("a_client_words_what_to_do_next_in_its_own_terms", () => {
+  const pick = {
+    taskId: "7",
+    picker: "mallory.testnet",
+    judgeAccount: null,
+    winners: HAND_PICK.winners,
+  };
+  expect(refusal(() => checkPickScorecard(card(), pick)).message).toMatch(
+    /do not reuse another's, the Judge's included$/,
+  );
+  expect(
+    refusal(() => checkPickScorecard(card(), pick, { notReused: "not even this one" })).message,
+  ).toMatch(/do not reuse another's, not even this one$/);
+
+  const unrevealed = detail();
+  unrevealed.entries = [];
+  const on = { taskId: "7", winners: HAND_PICK.winners, card: card() };
+  expect(refusal(() => checkPickOnTask(unrevealed, on)).message).toMatch(/and try again$/);
+  expect(refusal(() => checkPickOnTask(unrevealed, on, { retry: "call again" })).message).toMatch(
+    /and call again$/,
+  );
+});
+
+test("the_entries_a_person_picks_from_are_the_revealed_ones_with_a_hash_and_an_address", () => {
+  const entries = [
+    { account: "a", revealed: true, content_hash: HASH_A, uri: "http://x/a" },
+    { account: "b", revealed: false, content_hash: null, uri: null },
+    { account: "c", revealed: true, content_hash: HASH_C, uri: null },
+    { account: "d", revealed: true, content_hash: HASH_B, uri: "http://x/d" },
+  ];
+  expect(revealedForPick(entries).map((entry) => entry.account)).toEqual(["a", "d"]);
 });
 
 test("the_shares_must_add_up_to_exactly_10000_and_name_each_account_once", () => {

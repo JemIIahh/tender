@@ -31,6 +31,18 @@ export interface PickWinner {
  */
 export type PickRefusalCode = "SCORECARD_MISMATCH" | "INVALID_WINNERS" | "NO_TASK";
 
+/**
+ * The words a client puts into the refusals that tell the picker what to do next, so that each
+ * speaks its own language: the MCP tool says "call again" and points at `get_scorecard`, the web
+ * app says "try again". The codes and the rules are the same whatever the words.
+ */
+export interface PickWording {
+  /** What to do once the index has caught up with a reveal: "try again" by default. */
+  retry?: string;
+  /** Whose scorecards not to reuse, after "do not reuse another's,": "the Judge's included". */
+  notReused?: string;
+}
+
 /** A pick that would be refused, with the reason in words. Nothing was published or sent. */
 export class PickRefusal extends Error {
   readonly code: PickRefusalCode;
@@ -58,6 +70,7 @@ export function checkPickScorecard(
     judgeAccount: string | null | undefined;
     winners: readonly PickWinner[];
   },
+  wording: PickWording = {},
 ): void {
   if (card.task_id !== pick.taskId) {
     throw new PickRefusal(
@@ -71,7 +84,7 @@ export function checkPickScorecard(
       `the scorecard names ${card.verifier} as its verifier, but the pick is sent as ` +
         `${pick.picker}, and a scorecard is published in the name of the account that picks ` +
         `with it. Make your own, naming ${pick.picker} as its verifier; do not reuse another's, ` +
-        "the Judge's included",
+        (wording.notReused ?? "the Judge's included"),
     );
   }
   // The name is only a brand, and what the API holds to the Judge's account (P03-R29). Whose the
@@ -134,6 +147,7 @@ export function checkPickShares(winners: readonly PickWinner[]): void {
 export function checkPickOnTask(
   detail: TaskDetailResponse | null,
   pick: { taskId: string; winners: readonly PickWinner[]; card: Scorecard },
+  wording: PickWording = {},
 ): void {
   const { taskId, winners, card } = pick;
   if (detail === null) {
@@ -171,7 +185,7 @@ export function checkPickOnTask(
         "INVALID_WINNERS",
         `${account} has no revealed entry in task ${taskId}, as far as the API knows. Only an ` +
           "account that revealed can win; if it revealed a moment ago, the index may not have " +
-          "caught up yet, so wait a few seconds and try again",
+          `caught up yet, so wait a few seconds and ${wording.retry ?? "try again"}`,
       );
     }
   }
@@ -212,6 +226,19 @@ export function splitReward(
 }
 
 // ---- A pick by hand ---------------------------------------------------------------------------
+
+/**
+ * The entries a pick by hand lists, and so the ones a person can choose from: those revealed, with
+ * the content hash and the address that the scorecard records for each. In the order given.
+ */
+export function revealedForPick<E extends Pick<TaskEntry, "revealed" | "content_hash" | "uri">>(
+  entries: readonly E[],
+): Array<E & { content_hash: string; uri: string }> {
+  return entries.filter(
+    (entry): entry is E & { content_hash: string; uri: string } =>
+      entry.revealed && entry.content_hash !== null && entry.uri !== null,
+  );
+}
 
 /**
  * The `judge.software` of a scorecard written for a pick made by hand: a person chose the winners
@@ -264,14 +291,13 @@ export interface HandPickInput {
  */
 export function handPickedScorecard(input: HandPickInput): Scorecard {
   const won = new Set(input.winners.map((winner) => winner.account));
-  const scored = input.entries
-    .filter((entry) => entry.revealed && entry.content_hash !== null && entry.uri !== null)
+  const scored = revealedForPick(input.entries)
     .map((entry) => {
       const score = won.has(entry.account) ? 100 : 0;
       return {
         account: entry.account,
-        content_hash: entry.content_hash ?? "",
-        uri: entry.uri ?? "",
+        content_hash: entry.content_hash,
+        uri: entry.uri,
         committed_at_block: entry.committed_height,
         score,
         passed: score >= input.minScore,
