@@ -32,7 +32,7 @@ const root = () => document.documentElement;
 const isRail = () => root().getAttribute("data-sidebar") === "rail";
 
 beforeEach(() => {
-  // The live figures read the API: here it is down, and the block stays empty.
+  // The top bar's Live pill reads the API: here it is down, and the pill says Offline.
   vi.stubGlobal("fetch", async () => {
     throw new TypeError("Failed to fetch");
   });
@@ -192,7 +192,8 @@ test("sidebar_shortcut_is_left_to_a_text_field_that_has_the_focus", () => {
     </form>,
   );
   for (const name of ["Title", "Email", "Brief"]) {
-    const field = screen.getByRole(name === "Brief" ? "textbox" : "textbox", { name });
+    // A text field, an email field and a text area all have the role textbox.
+    const field = screen.getByRole("textbox", { name });
     field.focus();
     const event = pressShortcut("metaKey", field);
     // ⌘B is the field's (bold, in some), so the page leaves it alone.
@@ -341,7 +342,9 @@ test("sidebar_holds_the_pages_and_no_figures", async () => {
   // The platform's figures are behind the top bar's Live pill (live-status.test.tsx), not here.
   shell();
   const sidebar = document.querySelector("aside");
-  expect(sidebar?.querySelector('[data-testid="sidebar-stats"]')).toBeNull();
+  // The old block's own test id, and any stat row of it.
+  expect(sidebar?.querySelector('[data-testid="platform-stats"]')).toBeNull();
+  expect(sidebar?.querySelector('[data-testid="stat"]')).toBeNull();
   expect(sidebar?.textContent).not.toMatch(/Live on Tender|Open tasks|In escrow/i);
   // The pill is in the top bar, once the API has been asked.
   const pill = await within(screen.getByRole("banner")).findByRole("button", { name: /^Status: / });

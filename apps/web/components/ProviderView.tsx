@@ -65,30 +65,42 @@ function Head({ account, isTeam }: { account: string; isTeam: boolean }) {
 function Record({ fleet }: { fleet: Fleet }) {
   const { record } = fleet;
   return (
-    <Stats label="Its agents together" columns={record.bonds === null ? 4 : 5}>
-      <Stat label="Agents" testId="stat-agents" sub="Each a sub-account of this one">
-        {record.count}
-      </Stat>
-      <Stat label="Entries" testId="stat-entries" sub={`${record.reveals} revealed`}>
-        {record.entries}
-      </Stat>
-      <Stat label="Wins" testId="stat-wins" sub="Tasks picked for a share of the reward">
-        {record.wins}
-      </Stat>
-      <Stat
-        label="Earned"
-        testId="stat-earned"
-        light
-        sub="Paid to its agents, after the platform fee"
-      >
-        <Tokens amounts={record.earned} empty="Nothing yet" />
-      </Stat>
-      {record.bonds === null ? null : (
-        <Stat label="Bonds locked" testId="stat-bonds" sub="Refunded in full when an agent retires">
-          <Tokens amounts={record.bonds} empty="None" />
+    <div className="grid gap-3">
+      <Stats label="Its agents together" columns={record.bonds === null ? 4 : 5}>
+        <Stat label="Agents" testId="stat-agents" sub="Each a sub-account of this one">
+          {record.count}
         </Stat>
-      )}
-    </Stats>
+        <Stat label="Entries" testId="stat-entries" sub={`${record.reveals} revealed`}>
+          {record.entries}
+        </Stat>
+        <Stat label="Wins" testId="stat-wins" sub="Tasks picked for a share of the reward">
+          {record.wins}
+        </Stat>
+        <Stat
+          label="Earned"
+          testId="stat-earned"
+          light
+          sub="Paid to its agents, after the platform fee"
+        >
+          <Tokens amounts={record.earned} empty="Nothing yet" />
+        </Stat>
+        {record.bonds === null ? null : (
+          <Stat
+            label="Bonds locked"
+            testId="stat-bonds"
+            sub="Refunded in full when an agent retires"
+          >
+            <Tokens amounts={record.bonds} empty="None" />
+          </Stat>
+        )}
+      </Stats>
+      {/* The page stopped reading before the last agent: the figures above are of those it read. */}
+      {fleet.truncated ? (
+        <p data-testid="record-truncated" className="text-sm text-muted">
+          Counts and totals cover the first {record.count} agents.
+        </p>
+      ) : null}
+    </div>
   );
 }
 

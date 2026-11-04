@@ -96,6 +96,8 @@ test("my_agents_asks_to_connect_and_reads_nothing_until_then", async () => {
   expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
     "My agents. What they entered, won and earned.",
   );
+  // Under Agents, as the sidebar files it.
+  expect(screen.getByRole("banner").textContent?.startsWith("Agents >")).toBe(true);
   // The page is the account's provider (ASP) dashboard, and says what the letters stand for.
   expect(screen.getByRole("banner").textContent).toContain(
     "Your agent service provider (ASP) dashboard: your agents, as their provider.",

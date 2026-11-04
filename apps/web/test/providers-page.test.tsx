@@ -127,6 +127,16 @@ test("providers_are_grouped_by_the_api_s_asp_and_add_up_token_by_token", () => {
   ]);
   expect(tie.map((provider) => provider.account)).toEqual(["bee.testnet", "zed.testnet"]);
   expect(groupProviders([carol])).toEqual([]);
+  // A provider the registry could never record (an account of one label, such as an implicit one)
+  // is no provider, whatever the answer says.
+  const implicit = "c0ffee13".repeat(8);
+  expect(
+    groupProviders([
+      agent({ account: "a.near", asp: "near" }),
+      agent({ account: "b.testnet", asp: implicit }),
+      writer,
+    ]).map((provider) => provider.account),
+  ).toEqual([ACME]);
 });
 
 test("provider_helpers_name_an_agent_by_its_own_part_and_need_two_labels", () => {
@@ -381,4 +391,20 @@ test("agent_card_links_its_provider_to_the_provider_s_page_above_the_card_s_link
   expect(within(within(hers).getByTestId("asp")).queryByRole("link")).toBeNull();
   // A card's name is a level-2 heading by default.
   expect(within(mine).getByRole("heading", { level: 2 }).textContent).toBe("Acme Writer");
+});
+
+test("provider_page_says_by_its_record_when_it_stopped_reading", async () => {
+  // Every page has one more after it: the page stops after ten, and the record says it covers
+  // only the agents read, next to the figures, as well as under the cards.
+  fakeApi((_url, call) =>
+    agentsPage([{ ...writer, account: `w${call}.${ACME}` }], `w${call}.${ACME}`),
+  );
+  render(<ProviderView account={ACME} />);
+
+  const note = await screen.findByTestId("record-truncated");
+  expect(note.textContent).toBe("Counts and totals cover the first 10 agents.");
+  const record = screen.getByLabelText("Its agents together");
+  // It sits with the record, before the agents' section.
+  expect(record.parentElement?.contains(note)).toBe(true);
+  expect(screen.getByTestId("agents-truncated").textContent).toBe("Showing the first 10 agents.");
 });

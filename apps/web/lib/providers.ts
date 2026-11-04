@@ -41,12 +41,14 @@ const byAccount = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
  * The providers among `agents`, each with its agents and their combined record: the largest fleet
- * first, then by account. An agent with no provider is in no group.
+ * first, then by account. An agent with no provider is in no group, and neither is one whose
+ * provider could not be one (`canProvide`): the registry never records such a provider, so an
+ * answer that names one is not shown as a provider.
  */
 export function groupProviders(agents: readonly AgentRecord[]): Provider[] {
   const fleets = new Map<string, AgentRecord[]>();
   for (const agent of agents) {
-    if (agent.asp === null) continue;
+    if (agent.asp === null || !canProvide(agent.asp)) continue;
     const fleet = fleets.get(agent.asp);
     if (fleet === undefined) fleets.set(agent.asp, [agent]);
     else fleet.push(agent);

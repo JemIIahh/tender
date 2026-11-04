@@ -1,11 +1,11 @@
 import { expect, type Page, test } from "@playwright/test";
-import { ALICE, OTHER_TOKEN, PROVIDER, routeAgents, WIDE } from "./agentsApi";
+import { ALICE, OTHER_TOKEN, PROVIDER, routeAgents, WIDE, WIDE_PROVIDER } from "./agentsApi";
 import { routeApi } from "./fixtures";
 
 // The provider (ASP) pages against the fixture API (e2e/agentsApi.ts): the directory groups the
 // agents the API lists by their provider, a provider's page lists the agents under it, and an
 // agent card's provider leads there. The fixtures have two providers: provider.testnet, which
-// runs Alice, and an implicit account (64 hex characters) that runs the widest agent.
+// runs Alice, and an account of two labels and 64 characters that runs the widest agent.
 
 const cards = (page: Page) => page.getByTestId("provider-card");
 
@@ -69,8 +69,8 @@ test("providers_pages_fit_a_phone_with_the_widest_data", async ({ page }) => {
   await expect(cards(page)).toHaveCount(2);
   expect(await fits()).toBe(0);
 
-  // The widest agent's provider: an account of 64 characters with no place to break.
-  await page.goto(`/providers/${OTHER_TOKEN}`);
+  // The widest agent's provider: an account of two labels and 64 characters, one place to break.
+  await page.goto(`/providers/${WIDE_PROVIDER}`);
   await expect(page.getByTestId("agent-card")).toHaveCount(1);
   await expect(page.getByTestId("agent-card")).toContainText(WIDE);
   expect(await fits()).toBe(0);
