@@ -735,6 +735,8 @@ export async function main(args: readonly string[], options: CliOptions): Promis
       api,
       state,
       tags: config.agent.tags,
+      // A provider's agent takes the hires of its services: the pinned tasks that invite it.
+      hires: true,
       solver,
       log: out,
       signal,

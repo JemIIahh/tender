@@ -201,6 +201,14 @@ export interface AgentTickOptions {
   state: StateStore;
   /** The tags of the tasks the agent looks for. A task counts if its brief carries any of them. */
   tags: readonly string[];
+  /**
+   * Whether the agent also takes the open pinned tasks that invite it, whatever their tags: a hire
+   * of one of its services is one (`hire_agent`, the web's Hire), and so is any other task that
+   * names it in `invited`. Such a task goes through the same steps as one found by its tag, and is
+   * answered by the same solver; nobody needs to say yes to it. Default: false, so that a run that
+   * looks only for its tags stays as it was; the agent CLI turns it on.
+   */
+  hires?: boolean;
   solver: Solver;
   /**
    * How long the runner waits for the solver to answer one task before it gives up on it, in
@@ -240,6 +248,7 @@ interface Run {
   api: TenderApi;
   state: StateStore;
   tags: readonly string[];
+  hires: boolean;
   solver: Solver;
   solveTimeoutMs: number;
   log: (message: string) => void;
@@ -325,15 +334,19 @@ function checkMs(name: string, ms: number): void {
   }
 }
 
-/** Every open task tagged `tag`, page after page, newest first. */
-async function listOpen(api: TenderApi, tag: string): Promise<TaskSummary[]> {
+/**
+ * Every open task tagged `tag`, page after page, newest first; or, given `{ invited }`, every open
+ * task whose invited list names that account.
+ */
+async function listOpen(api: TenderApi, by: string | { invited: string }): Promise<TaskSummary[]> {
   const tasks: TaskSummary[] = [];
+  const which = typeof by === "string" ? { tag: by } : { invited: by.invited };
   let cursor: string | undefined;
   for (let page = 0; page < MAX_PAGES; page++) {
     const filter: ListTasksFilter =
       cursor === undefined
-        ? { phase: "open", tag, limit: PAGE_SIZE }
-        : { phase: "open", tag, limit: PAGE_SIZE, cursor };
+        ? { phase: "open", ...which, limit: PAGE_SIZE }
+        : { phase: "open", ...which, limit: PAGE_SIZE, cursor };
     const found = await api.listTasks(filter);
     // A page is what was asked for. An API that gives more is not taken at its word.
     tasks.push(...found.tasks.slice(0, PAGE_SIZE));
@@ -418,6 +431,41 @@ async function enterTasks(run: Run): Promise<void> {
       );
     }
   }
+
+  if (run.hires) await enterInvitations(run, looked);
+}
+
+/**
+ * The open pinned tasks that invite the agent (`hires`), whatever their tags: a hire of its service
+ * among them. They go through `enter` like the tasks of its tags, with one step more: the detail must
+ * name the agent in its invited list, since the API was asked for those only, and an API that ignored
+ * the filter would otherwise have the agent enter every open task. A task that does not is skipped,
+ * and a count of them is logged.
+ */
+async function enterInvitations(run: Run, looked: Set<string>): Promise<void> {
+  if (run.signal?.aborted) return;
+  let open: TaskSummary[];
+  try {
+    open = await listOpen(run.api, { invited: run.account });
+  } catch (error) {
+    run.log(`ERROR ${run.name}: listing the open tasks that invite it failed (${describe(error)})`);
+    return;
+  }
+  let strays = 0;
+  for (const summary of open) {
+    if (run.signal?.aborted) return;
+    if (looked.has(summary.id) || run.memory.seen.has(summary.id)) continue;
+    looked.add(summary.id);
+    try {
+      if ((await enter(run, summary, true)) === "not_invited") strays += 1;
+    } catch (error) {
+      run.log(`ERROR ${run.name}: task ${summary.id} failed (${describe(error)})`);
+    }
+  }
+  if (strays > 0) {
+    const tasks = strays === 1 ? "task" : "tasks";
+    run.log(`WARN ${run.name}: the API listed ${strays} ${tasks} that do not invite it, skipped`);
+  }
 }
 
 /**
@@ -451,8 +499,16 @@ function refusalOf(run: Run, task: TaskDetail): string | null {
   return null;
 }
 
-/** One task of `enterTasks`. Throws for what is not the task's fault; the caller logs it. */
-async function enter(run: Run, summary: TaskSummary): Promise<void> {
+/**
+ * One task of `enterTasks`. Throws for what is not the task's fault; the caller logs it. `invited`
+ * says the task was listed as one that invites the agent: it is entered only if its detail says so,
+ * and `not_invited` is the answer for one that does not.
+ */
+async function enter(
+  run: Run,
+  summary: TaskSummary,
+  invited = false,
+): Promise<"not_invited" | undefined> {
   const { id } = summary;
   const { memory } = run;
 
@@ -505,6 +561,10 @@ async function enter(run: Run, summary: TaskSummary): Promise<void> {
   if (rejectedByTheJudge(run, task)) return;
   if (brief === null || criteria === null) return;
   if (task.phase !== "open") return;
+  if (invited && !task.invited.includes(run.account)) {
+    memory.seen.add(id);
+    return "not_invited";
+  }
 
   const refusal = refusalOf(run, task);
   if (refusal !== null) {
@@ -1196,6 +1256,7 @@ export async function agentTick(opts: AgentTickOptions): Promise<void> {
     api: opts.api,
     state: opts.state,
     tags: opts.tags,
+    hires: opts.hires ?? false,
     solver: opts.solver,
     solveTimeoutMs,
     log: opts.log ?? console.log,

@@ -13,8 +13,15 @@ import {
   BriefSchema,
   canonicalJson,
   computeCommitment,
+  DelegateViewSchema,
   HeldoutSchema,
+  HIRE_MONEY_NOTE,
+  HIRE_REQUEST_MAX_CHARS,
+  HIRE_TASK_BYTES,
+  HireRequestSchema,
   heldoutMatchesCriteria,
+  hireDocuments,
+  hireTerms,
   isJudgeBranded,
   MAX_RESULT_BYTES,
   NETWORKS,
@@ -87,7 +94,8 @@ import {
 // MONEY. `deposit`, `withdraw`, `post_task` and `register_agent` attach a deposit (the last one 1
 // yoctoNEAR, and it puts the agent's bond at stake), which only a full-access key may. With any
 // other key, a delegate key among them, they answer `NEEDS_FULL_ACCESS_KEY` before they upload or
-// send anything. A send
+// send anything. `hire_agent` spends too, and is the one that a delegate key may make: it reads the
+// key's caps (`get_delegate`) first and posts with no deposit within them. A send
 // that times out (`E_TIMEOUT`) may have landed, and a second send of money or of a task would do it
 // twice; the answer therefore names the read that tells (`sending`), before the agent sends again.
 //
@@ -1787,6 +1795,227 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         task_id: posted.taskId.toString(),
         tx_hash: posted.txHash,
         commit_deadline: created === undefined ? null : isoOfNs(created.data.commit_deadline),
+      });
+    }),
+  );
+
+  // ---- hire_agent -----------------------------------------------------------------------------
+
+  /**
+   * How this server's key pays for a hire of `price` in `token`: a full-access key attaches 1
+   * yoctoNEAR, and a delegate key attaches none and spends within the caps its account registered
+   * for it (`get_delegate`), which are read first so that a hire past them is refused here, before
+   * anything is uploaded. Any other key cannot spend.
+   */
+  async function spendModeFor(token: string, price: bigint): Promise<{ delegate: boolean }> {
+    if (deps.keyKind === "full_access") return { delegate: false };
+    requireKeyFor("hire_agent", "post_task");
+    const notDelegate = new ToolError(
+      "NEEDS_FULL_ACCESS_KEY",
+      `hire_agent pays the price out of your vault, which takes a full-access key or a delegate ` +
+        `key with caps (add_delegate; docs/MCP.md), and this server's key is neither. Nothing was ` +
+        "uploaded or sent",
+    );
+    if (deps.publicKey === undefined) throw notDelegate;
+    const raw = await client.view<unknown>(contractId, "get_delegate", {
+      account_id: accountId,
+      public_key: deps.publicKey,
+    });
+    if (raw === null || raw === undefined) throw notDelegate;
+    const caps = DelegateViewSchema.parse(raw);
+    const show = (amount: bigint | string) => formatAmount(amount, token, network);
+    if (caps.token !== token) {
+      throw new ToolError(
+        "DELEGATE_CAP",
+        `this server's delegate key spends ${caps.token}, and the service is priced in ${token}. ` +
+          "Nothing was uploaded or sent",
+      );
+    }
+    if (price > BigInt(caps.per_task_cap)) {
+      throw new ToolError(
+        "DELEGATE_CAP",
+        `the price, ${show(price)}, is above the ${show(caps.per_task_cap)} that one task may cost ` +
+          "this server's delegate key. Nothing was uploaded or sent",
+      );
+    }
+    const left = BigInt(caps.total_cap) - BigInt(caps.spent);
+    if (price > left) {
+      throw new ToolError(
+        "DELEGATE_CAP",
+        `the price, ${show(price)}, is more than the ${show(left < 0n ? 0n : left)} this server's ` +
+          "delegate key has left of its total cap. Nothing was uploaded or sent",
+      );
+    }
+    return { delegate: true };
+  }
+
+  server.registerTool(
+    "hire_agent",
+    {
+      title: "Hire an agent for a service",
+      description:
+        "Hire an agent's service (list_services shows them) for a request of yours: this posts a " +
+        "pinned task that only the offering agent may enter, once, with the service's price as its " +
+        "reward, paid from your vault in Tender (deposit first; balance shows it), and answers with " +
+        "the new task's id. The brief is your request (plain text, up to 4000 characters) and a " +
+        "reference to the service; the criteria are the service's. The agent delivers by commit and " +
+        "reveal. If the service is checked by the hirer, you are the verifier: once the reveal " +
+        "window closes, read the delivery (task_entries) and pick it with pick_winners to pay it, or " +
+        "pick nobody. If the Tender Judge checks it, the Judge picks. " +
+        `${HIRE_MONEY_NOTE} Pass max_price, the price you saw: a provider can change its price, ` +
+        "and a hire priced above max_price is refused with PRICE_ABOVE_MAX before anything is " +
+        "uploaded or paid. A service that cannot be hired now is refused with SERVICE_UNAVAILABLE. " +
+        "Works with a full-access key, and with a delegate key within its caps (DELEGATE_CAP " +
+        "otherwise), which spends without attaching a deposit; any other key is refused with " +
+        "NEEDS_FULL_ACCESS_KEY. A request that holds this server's private key, or another secret " +
+        "it was given, is refused with SECRET_IN_CONTENT (best effort, as at commit_result). If the " +
+        "send times out (E_TIMEOUT) the hire may still have been posted: call balance before you " +
+        "call again, since a second call posts and pays a second hire.",
+      inputSchema: {
+        service_id: z
+          .string()
+          .regex(/^(0|[1-9][0-9]{0,19})$/)
+          .describe(
+            'The service\'s id from list_services, a whole number written as text, such as "3"',
+          ),
+        request: z
+          .string()
+          .describe(
+            `What you want done, in plain text, up to ${HIRE_REQUEST_MAX_CHARS} characters. It is ` +
+              "public, and the agent works from it",
+          ),
+        max_price: U128StringSchema.optional().describe(
+          "The most you agree to pay, in the smallest unit of the service's token",
+        ),
+      },
+      annotations: SPENDS,
+    },
+    guarded(secrets, async ({ service_id, request, max_price }) => {
+      // The key first, before anything is read: one that cannot spend is told so at once.
+      if (deps.keyKind !== "full_access") requireKeyFor("hire_agent", "post_task");
+
+      const found = await api.getService(BigInt(service_id));
+      if (found === null) {
+        throw new ToolError("NO_SERVICE", `the API has no service ${service_id} (list_services)`);
+      }
+      const { service } = found;
+      if (!service.available) {
+        throw new ToolError(
+          "SERVICE_UNAVAILABLE",
+          service.status === "paused"
+            ? `service ${service_id} is paused by its provider, so it cannot be hired now`
+            : `the agent of service ${service_id}, ${service.agent}, is not an active agent with a ` +
+                "bond now, so the service cannot be hired",
+        );
+      }
+      if (service.agent === accountId) {
+        throw new ToolError(
+          "BAD_INPUT",
+          `service ${service_id} is offered by ${accountId}, this server's own account, and the ` +
+            "contract does not let a poster enter its own task",
+        );
+      }
+      const price = BigInt(service.price);
+      if (max_price !== undefined && price > BigInt(max_price)) {
+        throw new ToolError(
+          "PRICE_ABOVE_MAX",
+          `service ${service_id} costs ${formatAmount(price, service.token, network)} (${price}), ` +
+            `above your max_price of ${max_price}. Nothing was uploaded or paid`,
+        );
+      }
+      if (service.verification.kind === "judge" && deps.judgeAccount === undefined) {
+        throw new ToolError(
+          "NO_JUDGE_ACCOUNT",
+          `service ${service_id} is checked by the Judge, whose account this server was not told: ` +
+            "set TENDER_JUDGE_ACCOUNT",
+        );
+      }
+      const words = HireRequestSchema.safeParse(request);
+      if (!words.success) throw new ToolError("BAD_INPUT", `request: ${issuesOf(words.error)}`);
+      const documents = hireDocuments(service, words.data);
+      const terms = hireTerms(service, deps.judgeAccount ?? null);
+      const briefBytes = bytesToPublish("request", "hire_agent", documents.brief);
+      const criteriaBytes = bytesToPublish("criteria", "hire_agent", documents.criteria);
+
+      const spend = await spendModeFor(service.token, price);
+      const vault = await client.balanceOf(accountId, service.token);
+      if (vault < price) {
+        throw new ToolError(
+          "INSUFFICIENT_FUNDS",
+          `your vault holds ${formatAmount(vault, service.token, network)}, and the hire costs ` +
+            `${formatAmount(price, service.token, network)}: deposit the rest first. Nothing was ` +
+            "uploaded or paid",
+        );
+      }
+      // A hire's task record is larger than an entry's, so the storage is checked for it.
+      const storage = await client.storageBalanceOf(accountId);
+      const shortfall = storageShortfall(storage, HIRE_TASK_BYTES);
+      let added = 0n;
+      if (shortfall > 0n) {
+        if (deps.keyKind !== "full_access") {
+          throw new ToolError(
+            "STORAGE_LOW",
+            `${accountId} needs ${shortfall} yoctoNEAR (${formatNear(shortfall)}) more storage in ` +
+              `${contractId} to post a hire, and this key cannot attach a deposit, so nothing was ` +
+              `sent. Ask a full-access account to call storage_deposit with account_id ${accountId}`,
+          );
+        }
+        added = shortfall + STORAGE_TOP_UP_MARGIN;
+        await sending(
+          "Before you call hire_agent again, call balance: its storage figures show whether the " +
+            "top-up went in.",
+          () => client.storageDeposit(added),
+        );
+      }
+
+      const briefDoc = await uploadDocument("brief", briefBytes);
+      await uploadDocument("criteria", criteriaBytes);
+      const posted = await sending(
+        "Before you call hire_agent again, call balance: if your vault holds the price less than " +
+          "before, the hire was posted (list_tasks shows it once the index has it). A second " +
+          "hire_agent posts and pays another hire.",
+        () =>
+          client.postTask(
+            {
+              token: terms.token,
+              reward: terms.reward,
+              briefUri: briefDoc.uri,
+              briefHash: briefDoc.hash,
+              criteriaHash: documents.criteriaHash,
+              ...(terms.verifier !== undefined && { verifier: terms.verifier }),
+              commitSecs: terms.commitSecs,
+              revealSecs: terms.revealSecs,
+              pickSecs: terms.pickSecs,
+              fallbackSecs: terms.fallbackSecs,
+              maxEntries: terms.maxEntries,
+              maxWinners: terms.maxWinners,
+              invited: terms.invited,
+            },
+            spend.delegate ? { delegate: true } : undefined,
+          ),
+      );
+      const created = posted.events.find(
+        (event): event is Extract<TxEvent, { event: "task_created" }> =>
+          event.event === "task_created",
+      );
+      const next =
+        service.verification.kind === "judge"
+          ? "The Judge picks once the reveal window closes."
+          : "You are the verifier: once the reveal window closes, read the delivery with " +
+            "task_entries and pick it with pick_winners to pay it.";
+      return jsonResult({
+        task_id: posted.taskId.toString(),
+        tx_hash: posted.txHash,
+        service_id: service.id,
+        agent: service.agent,
+        price: service.price,
+        price_formatted: formatAmount(price, service.token, network),
+        verifier: terms.verifier ?? accountId,
+        commit_deadline: created === undefined ? null : isoOfNs(created.data.commit_deadline),
+        reveal_deadline: created === undefined ? null : isoOfNs(created.data.reveal_deadline),
+        pick_deadline: created === undefined ? null : isoOfNs(created.data.pick_deadline),
+        note: `${HIRE_MONEY_NOTE} ${next}`,
+        ...topUpNote(added, "a hire"),
       });
     }),
   );

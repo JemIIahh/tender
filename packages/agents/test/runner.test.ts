@@ -85,6 +85,9 @@ class World {
     const matching = [...this.tasks.values()]
       .filter((task) => filter.phase === undefined || task.phase === filter.phase)
       .filter((task) => filter.tag === undefined || task.tags.includes(filter.tag))
+      .filter(
+        (task) => filter.invited === undefined || (task.invited ?? []).includes(filter.invited),
+      )
       .sort((a, b) => b.id - a.id);
     const after = filter.cursor === undefined ? undefined : Number(filter.cursor);
     const rest = after === undefined ? matching : matching.filter((task) => task.id < after);
@@ -240,6 +243,10 @@ async function harness(
     postClarification: unexpected("postClarification"),
     telegramLink: unexpected("telegramLink"),
     signIn: unexpected("signIn"),
+    listServices: unexpected("listServices"),
+    getService: unexpected("getService"),
+    createService: unexpected("createService"),
+    updateService: unexpected("updateService"),
   };
 
   // A commit that goes through leaves an entry on the chain, which `getEntry` then shows. One that
@@ -1297,6 +1304,112 @@ test("a_task_the_contract_takes_the_agent_in_is_entered", async () => {
 
   expect(idsOf(h.commit)).toEqual([1n, 2n, 3n, 4n]);
   expect(h.logs.filter((line) => line.includes("skipping"))).toEqual([]);
+});
+
+// ---- Hires: the pinned tasks that invite the agent -----------------------------------------------
+
+/** One tick of `h` with `hires` on, as the agent CLI runs it. */
+const hireTick = (h: Harness) =>
+  agentTick({
+    name: "alice",
+    client: h.client,
+    api: h.api,
+    state: h.state,
+    tags: h.tags,
+    hires: true,
+    solver: h.solver,
+    log: (line) => h.logs.push(line),
+    memory: h.memory,
+  });
+
+test("a_pinned_task_that_invites_the_agent_is_work_whatever_its_tags", async () => {
+  const h = await harness(undefined, { scripted: false });
+  // A hire: pinned to the agent, with tags the agent does not look for.
+  h.world.add({ id: 5, tags: ["filings"], invited: [ACCOUNT], maxEntries: 1 });
+  // Pinned to another account, and open to anyone with another tag: neither is the agent's.
+  h.world.add({ id: 6, tags: ["filings"], invited: [OTHER], maxEntries: 1 });
+  h.world.add({ id: 7, tags: ["filings"] });
+
+  await hireTick(h);
+
+  expect(h.listTasks.mock.calls.map(([filter]) => filter)).toEqual([
+    { phase: "open", tag: "regex", limit: 50 },
+    { phase: "open", invited: ACCOUNT, limit: 50 },
+  ]);
+  expect(idsOf(h.commit)).toEqual([5n]);
+  // The solver had the request: the task's own brief, as for any task.
+  expect(h.solve.mock.calls[0]?.[0].task.id).toBe("5");
+  expect(h.start).toHaveBeenCalledTimes(1);
+
+  // The draft is the agent's, and the reveal is the runner's as for any entry.
+  await hireTick(h);
+  expect(h.commit).toHaveBeenCalledTimes(1);
+});
+
+test("a_hire_that_is_also_tagged_is_entered_once", async () => {
+  const h = await harness();
+  h.world.add({ id: 5, tags: ["regex"], invited: [ACCOUNT], maxEntries: 1 });
+
+  await hireTick(h);
+
+  expect(idsOf(h.commit)).toEqual([5n]);
+  expect(h.getTask).toHaveBeenCalledTimes(1);
+});
+
+test("without_hires_a_pinned_task_of_other_tags_is_left_alone", async () => {
+  const h = await harness();
+  h.world.add({ id: 5, tags: ["filings"], invited: [ACCOUNT], maxEntries: 1 });
+
+  await h.tick();
+
+  expect(h.listTasks).toHaveBeenCalledTimes(1);
+  expect(h.commit).not.toHaveBeenCalled();
+});
+
+test("an_api_that_ignores_the_invited_filter_cannot_make_the_agent_enter_open_tasks", async () => {
+  const h = await harness();
+  h.world.add({ id: 7, tags: ["filings"] });
+  h.world.add({ id: 8, tags: ["filings"], invited: [OTHER] });
+  // It answers the invited listing with every open task.
+  h.listTasks.mockImplementation(async (filter = {}) =>
+    h.world.page({ ...filter, invited: undefined }),
+  );
+
+  await hireTick(h);
+  await hireTick(h);
+
+  expect(h.commit).not.toHaveBeenCalled();
+  expect(h.start).not.toHaveBeenCalled();
+  // Seen once each: not fetched again on the next tick.
+  expect(h.getTask).toHaveBeenCalledTimes(2);
+  expect(h.logs).toEqual(["WARN alice: the API listed 2 tasks that do not invite it, skipped"]);
+});
+
+test("a_hire_the_contract_would_refuse_is_skipped_like_any_task", async () => {
+  const h = await harness();
+  h.world.add({ id: 5, tags: ["filings"], invited: [ACCOUNT], maxEntries: 1, commitCount: 1 });
+
+  await hireTick(h);
+
+  expect(h.commit).not.toHaveBeenCalled();
+  expect(h.logs).toEqual(["alice: skipping task 5, it has all the entries it takes"]);
+});
+
+test("a_failed_listing_of_hires_is_logged_and_the_tick_goes_on", async () => {
+  const h = await harness();
+  h.world.add({ id: 1, tags: ["regex"] });
+  h.listTasks.mockImplementation(async (filter = {}) => {
+    if (filter.invited !== undefined) throw new ApiError(500, { error: "internal" });
+    return h.world.page(filter);
+  });
+
+  await hireTick(h);
+
+  expect(idsOf(h.commit)).toEqual([1n]);
+  expect(h.logs).toEqual([
+    "alice: committed to task 1 tx=commit-tx",
+    "ERROR alice: listing the open tasks that invite it failed (ApiError 500)",
+  ]);
 });
 
 test("a_task_rejected_since_the_listing_is_skipped_on_the_fresher_detail", async () => {
