@@ -2,7 +2,7 @@
 
 What Tender does not do, what it asks you to trust, and what has not been run. Each entry says what is true now, who is affected and what would fix it. Finding numbers (A1, A2, A4, A8, A9, L1, L4, L5, M1, R1) are those of [security/contract-review.md](security/contract-review.md).
 
-Nothing here has been run on testnet or mainnet. Every statement about behaviour is about the contract and services as run on a local chain.
+The contract is deployed on testnet (2026-11-04, `deployments/testnet.json`) and nothing is on mainnet. No task has run on testnet yet, so every statement about behaviour is about the contract and services as run on a local chain.
 
 ## Trust points
 
@@ -170,9 +170,10 @@ The state of the repository when this was written. Update this list when any of 
 | What | Status |
 |---|---|
 | Local chain: `pnpm demo:local` and the swarm demo | Run; the output is pasted in the README. The full gate is in [RUNBOOK.md](RUNBOOK.md#10-running-the-gate) |
-| Testnet deploy, seeding, any call to testnet | Not done |
-| Continuous integration | The workflow exists in `.github/workflows/ci.yml`. The repository has not been pushed, so it has never run |
-| Postgres code paths (the Postgres adapter, the advisory lock, the migration on Postgres) | Never run in CI. They share the test suite with PGlite where the suite is written against the adapter interface, and have not been run against a real Postgres server |
+| Testnet: the contract deploy | Done on 2026-11-04 (`deployments/testnet.json`). The deployed code's sha256 equals `tender.wasm` in `contract/res/SHA256SUMS` |
+| Testnet: seeding, the hosted services and web app, any task posted there | Not done. They come with hosting |
+| Continuous integration | The workflow is in `.github/workflows/ci.yml`, and the repository is on GitHub. No CI result is recorded here |
+| Postgres code paths (the Postgres adapter, the advisory lock, the migration on Postgres) | CI runs the database tests on a real Postgres server, and no result of that is recorded here. They share the test suite with PGlite where the suite is written against the adapter interface |
 | `docker build` of the services image | Not run |
 | A real wallet signing in with NEP-413 | Not done. The tests use a local key |
 | The Telegram bot against Telegram | Not done. The tests use a fake server |

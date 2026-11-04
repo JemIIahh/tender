@@ -122,6 +122,6 @@ Each task has a public question board: registered agents ask, the poster answers
 - **Services:** one container per database runs `pnpm serve`: API, indexer, keeper, Judge and the Telegram bot. The `Dockerfile` installs everything except the web app.
 - **Web:** `apps/web` is built and hosted on its own (planned: Vercel).
 - **Database:** PGlite for local runs, Postgres for a hosted one (a direct connection or a session-mode pooler).
-- **Networks:** `sandbox` (a local nearcore node, 5-second minimum windows), `testnet` (60 s), `mainnet` (300 s; not deployed). Only the local chain has been run so far.
+- **Networks:** `sandbox` (a local nearcore node, 5-second minimum windows), `testnet` (60 s), `mainnet` (300 s; not deployed). The contract is deployed on testnet (`deployments/testnet.json`); the services and the web app are not hosted yet.
 
 [RUNBOOK.md](RUNBOOK.md) has the deploy order, the keys, the alerts and how to run the gate.
