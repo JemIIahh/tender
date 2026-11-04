@@ -176,7 +176,7 @@ test("web_verifier_picks_and_the_winner_is_paid_the_reward_less_the_fee", async 
   await expect(row.getByTestId("delivery")).toHaveText(new TextDecoder().decode(work));
   await expect(row.getByTestId("pick-entry-when")).toContainText("Revealed ");
   await pick.getByRole("radio", { name: `Winner: ${alice.accountId}` }).check();
-  await pick.getByLabel(`Reason for ${alice.accountId} (optional)`).fill("Matches the brief.");
+  await row.getByLabel("Reason (optional, public)").fill("Matches the brief.");
   await expect(pick.getByTestId("pick-payout")).toHaveText([
     `${alice.accountId}100%${show(reward - fee)}`,
   ]);
@@ -214,7 +214,7 @@ test("web_verifier_picks_and_the_winner_is_paid_the_reward_less_the_fee", async 
   await expect(page.getByTestId("payouts")).toBeVisible({ timeout: 60_000 });
   await expect(page.getByTestId("settled-by")).toHaveText(`Picked by ${run.dev} (verifier)`);
   await expect(page.getByTestId("scored-by")).toHaveText(
-    `Picked by hand by ${run.dev}. No software scored the entries: each winner is listed at 100, every other entry at 0.`,
+    `The scorecard says ${run.dev} picked by hand, with no software scoring the entries: each winner is listed at 100, every other entry at 0.`,
   );
   await expect(pick.getByTestId("pick-sent")).toHaveText(
     "The pick is on chain. The payouts and the scorecard are below.",
@@ -229,7 +229,8 @@ test("web_refund_pays_the_reward_back_to_the_funders", async ({ page }) => {
     title: "Room-code regex (task actions, refund)",
     verifier: run.poster,
     reward,
-    windows: { commit: 10, reveal: 25, pick: 60, fallback: 60 },
+    // A reveal window wide enough that a slow page still opens inside it.
+    windows: { commit: 10, reveal: 60, pick: 60, fallback: 60 },
   });
   const before = await reader.balanceOf(run.poster, run.tokenId);
 

@@ -605,10 +605,13 @@ async function startWeb(s: Stack, options: WebOptions): Promise<Web> {
   const log = openSync(logFile, "a");
   let child: ChildProcess;
   try {
+    // The web server inherits the environment, but not the specs' signers: it has no use for them.
+    const inherited: NodeJS.ProcessEnv = { ...process.env };
+    Reflect.deleteProperty(inherited, SIGNERS_VARIABLE);
     child = spawn(process.execPath, [NEXT_BIN, "dev", "-p", `${port}`], {
       cwd: WEB_DIR,
       env: {
-        ...process.env,
+        ...inherited,
         NODE_ENV: "development",
         NEXT_TELEMETRY_DISABLED: "1",
         ...options.env,
