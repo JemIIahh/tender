@@ -229,11 +229,13 @@ test("web_refund_pays_the_reward_back_to_the_funders", async ({ page }) => {
     title: "Room-code regex (task actions, refund)",
     verifier: run.poster,
     reward,
-    windows: { commit: 20, reveal: 10, pick: 60, fallback: 60 },
+    windows: { commit: 10, reveal: 25, pick: 60, fallback: 60 },
   });
   const before = await reader.balanceOf(run.poster, run.tokenId);
 
-  // Before the reveal deadline it says when the refund opens.
+  // In the reveal window, with nothing revealed, it says when the refund opens. (In the commit
+  // window there is no refund to speak of: the task takes entries and top-ups.)
+  await chainTimeReaches(reader, BigInt(task.commit_deadline));
   await page.goto(`/tasks/${task.id}#refund`);
   const refund = page.getByTestId("action-refund");
   await expect(refund.getByTestId("refund-opens")).toContainText(
