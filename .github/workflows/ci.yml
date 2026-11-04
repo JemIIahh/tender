@@ -74,9 +74,16 @@ jobs:
 
   # Type-checks, lints and tests the TypeScript packages. The sandbox tests start a local chain, and
   # near-sandbox downloads nearcore's sandbox node (35 MB, Linux x86_64) the first time one starts.
+  # The whole suite takes longer than one hosted runner allows, so its test files are split into
+  # four shards that run side by side. The first shard also type-checks and lints.
   node:
+    name: node (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     # A real Postgres for the @tender/db tests. They always run on PGlite, which is Postgres 18, and
     # also on this server when TEST_DATABASE_URL is set, so two majors are covered. 17.10 was the
     # newest 17 patch release more than 14 days old when it was pinned. The job's steps wait until
@@ -108,11 +115,13 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Typecheck
+        if: matrix.shard == 1
         run: pnpm typecheck
       - name: Lint
+        if: matrix.shard == 1
         run: pnpm lint
       - name: Test
-        run: pnpm test
+        run: pnpm exec vitest run --shard=${{ matrix.shard }}/4
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
 
