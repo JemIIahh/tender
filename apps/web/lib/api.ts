@@ -14,6 +14,10 @@ import {
   ChallengeResponseSchema,
   type ClarificationResponse,
   ClarificationResponseSchema,
+  type ConnectCodeCreated,
+  ConnectCodeCreatedSchema,
+  type ConnectCodeState,
+  ConnectCodeStateSchema,
   type CreateServiceRequest,
   fetchJson,
   type HealthResponse,
@@ -111,9 +115,16 @@ function notAnId(call: string, what: string, value: unknown): never {
   throw new Error(`${call}: ${JSON.stringify(String(value))} is not ${what}`);
 }
 
-function get<T>(path: string, schema: Schema<T>, query?: Query): Promise<T> {
-  return withTimeout(READ_TIMEOUT_MS, (signal) => fetchJson(url(path, query), schema, { signal }));
+function get<T>(path: string, schema: Schema<T>, query?: Query, token?: string): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (token !== undefined) headers.Authorization = `Bearer ${token}`;
+  return withTimeout(READ_TIMEOUT_MS, (signal) =>
+    fetchJson(url(path, query), schema, token === undefined ? { signal } : { signal, headers }),
+  );
 }
+
+/** A connect code's id, as the API makes one: 16 bytes in base64url, safe in a path as it is. */
+const CONNECT_ID = /^[A-Za-z0-9_-]{22}$/;
 
 function post<T>(
   path: string,
@@ -351,6 +362,24 @@ export const api = {
   async start(token: string, taskId: bigint | string): Promise<StartResponse> {
     const task = taskIdText(taskId) ?? notAnId("start", "a task id", taskId);
     return post(`/tasks/${task}/start`, StartResponseSchema, { token });
+  },
+
+  // ---- Connect your agent (packages/api/src/routes/connect.ts). The owner's two routes: the code
+  // and how it stands. The agent's side never runs in the browser.
+
+  /**
+   * `POST /v1/connect/codes`: a one-time code for the agent's account `<name>.<you>`, good for 30
+   * minutes. Needs a token from a full-access key, which a wallet signs in with. The code is shown
+   * once: the API keeps only its hash.
+   */
+  createConnectCode(token: string, name: string): Promise<ConnectCodeCreated> {
+    return post("/connect/codes", ConnectCodeCreatedSchema, { token, body: { name } });
+  },
+
+  /** `GET /v1/connect/codes/:id`: how a code of this account stands; null if it is gone. */
+  async getConnectCode(token: string, id: string): Promise<ConnectCodeState | null> {
+    if (!CONNECT_ID.test(id)) return null;
+    return orNull(get(`/connect/codes/${id}`, ConnectCodeStateSchema, undefined, token));
   },
 
   /** `POST /v1/services`: lists a service of one of the signed-in account's agents. */

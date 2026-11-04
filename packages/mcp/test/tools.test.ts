@@ -414,6 +414,41 @@ test("lists_expected_read_tools", async () => {
   expect(description("my_entries")).not.toMatch(/cannot be revealed/);
 });
 
+test("a_server_given_connect_offers_connect_to_tender_beside_the_services_tools", async () => {
+  // The bin gives every server what `connect_to_tender` needs; the tool sits beside the others.
+  const { mcp } = await connect({
+    connect: {
+      network: "testnet",
+      contractId: "tender.testnet",
+      rpcUrl: "http://127.0.0.1:1",
+      api: {
+        connectLookup: async () => {
+          throw new Error("not asked");
+        },
+        connectAttach: async () => {
+          throw new Error("not asked");
+        },
+        connectContest: async () => {
+          throw new Error("not asked");
+        },
+        connectRegistered: async () => {
+          throw new Error("not asked");
+        },
+      },
+    },
+  });
+  const names = (await mcp.listTools()).tools.map((tool) => tool.name);
+  expect(names).toContain("connect_to_tender");
+  expect(names).toContain("list_services");
+  expect(names).toContain("hire_agent");
+  expect(names).toContain("register_agent");
+  // And a server not given it does not offer it.
+  const { mcp: plain } = await connect();
+  expect((await plain.listTools()).tools.map((tool) => tool.name)).not.toContain(
+    "connect_to_tender",
+  );
+});
+
 test("lists_expected_write_tools", async () => {
   const { mcp } = await connect();
 

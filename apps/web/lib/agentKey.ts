@@ -1,49 +1,20 @@
-import { AccountIdSchema } from "@tender/shared";
+import {
+  base58Decode,
+  base58Encode,
+  MAX_ACCOUNT_LENGTH,
+  type NameReading,
+  readAgentName,
+} from "@tender/shared";
 
 // What a person types into "Add an agent" (app/(app)/my-agents/new): the agent's public key, which
 // its own tool printed where the agent runs, and the name of the account the agent gets under
 // theirs. Both are read here, in plain words for what to change, and nothing here makes, keeps or
 // sends a key: the page only ever holds the public half.
 
-const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-/** The bytes of `text` in Bitcoin's base58, as NEAR writes keys; null if it has a character base58 doesn't. */
-export function base58Decode(text: string): Uint8Array | null {
-  let value = 0n;
-  for (const char of text) {
-    const digit = BASE58.indexOf(char);
-    if (digit < 0) return null;
-    value = value * 58n + BigInt(digit);
-  }
-  const bytes: number[] = [];
-  while (value > 0n) {
-    bytes.unshift(Number(value & 0xffn));
-    value >>= 8n;
-  }
-  // Each leading "1" is a leading zero byte.
-  for (const char of text) {
-    if (char !== "1") break;
-    bytes.unshift(0);
-  }
-  return Uint8Array.from(bytes);
-}
-
-/** `bytes` in Bitcoin's base58, as NEAR writes keys. */
-export function base58Encode(bytes: Uint8Array): string {
-  let value = 0n;
-  for (const byte of bytes) value = (value << 8n) | BigInt(byte);
-  let text = "";
-  while (value > 0n) {
-    text = BASE58[Number(value % 58n)] + text;
-    value /= 58n;
-  }
-  // Each leading zero byte is a leading "1".
-  for (const byte of bytes) {
-    if (byte !== 0) break;
-    text = `1${text}`;
-  }
-  return text;
-}
+// The base58 of NEAR's keys and the rule for an agent's account name are `@tender/shared`'s, so
+// that the connect codes of the API (packages/api/src/routes/connect.ts) check a name as this page
+// does, in the same words.
+export { base58Decode, base58Encode, MAX_ACCOUNT_LENGTH, type NameReading, readAgentName };
 
 export type KeyReading =
   | { ok: true; publicKey: string }
@@ -119,57 +90,4 @@ export function readPublicKey(text: string): KeyReading {
     secret: false,
     message: "That isn't a whole public key. Copy the key again, all of it.",
   };
-}
-
-/** One part of an account id: lower-case letters and digits, joined by single `-` or `_`. */
-const PART = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
-
-/** An implicit account: 64 hex characters, which has no room for a sub-account under it. */
-const IMPLICIT = /^[0-9a-f]{64}$/;
-
-/** The longest account id NEAR takes. */
-export const MAX_ACCOUNT_LENGTH = 64;
-
-export type NameReading = { ok: true; accountId: string } | { ok: false; message: string };
-
-/**
- * The account an agent called `name` gets under `parent`: `<name>.<parent>`, a direct sub-account,
- * which `parent` alone can create. The name is one part of an account id, and the whole id is at
- * most 64 characters.
- */
-export function readAgentName(name: string, parent: string): NameReading {
-  if (IMPLICIT.test(parent) || parent.length + 2 > MAX_ACCOUNT_LENGTH) {
-    return {
-      ok: false,
-      message: `${parent} is too long to have accounts under it. Connect a named account, such as you.testnet.`,
-    };
-  }
-  const typed = name.trim();
-  if (typed === "") return { ok: false, message: "Choose a name for the agent's account." };
-  if (typed !== typed.toLowerCase()) {
-    return { ok: false, message: "Use lower case: an account id has no capitals." };
-  }
-  if (typed.includes(".")) {
-    return {
-      ok: false,
-      message: `One part only, with no dots: the account will be <name>.${parent}.`,
-    };
-  }
-  if (!PART.test(typed)) {
-    return {
-      ok: false,
-      message: "Use a to z and 0 to 9, with a single - or _ between them.",
-    };
-  }
-  const accountId = `${typed}.${parent}`;
-  if (accountId.length > MAX_ACCOUNT_LENGTH) {
-    return {
-      ok: false,
-      message: `Too long: ${accountId} is ${accountId.length} characters, and an account id is ${MAX_ACCOUNT_LENGTH} at most.`,
-    };
-  }
-  if (!AccountIdSchema.safeParse(accountId).success) {
-    return { ok: false, message: "That doesn't make a valid account id." };
-  }
-  return { ok: true, accountId };
 }

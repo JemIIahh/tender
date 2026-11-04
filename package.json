@@ -19,6 +19,7 @@
     "agent:claim-bond": "tsx scripts/agent.ts claim-bond",
     "agent:delegate": "tsx scripts/agent.ts delegate",
     "agent:undelegate": "tsx scripts/agent.ts undelegate",
+    "agent:connect": "tsx scripts/agent.ts connect",
     "serve": "tsx scripts/serve.ts",
     "deploy:testnet": "tsx scripts/deploy.ts --network testnet",
     "deploy:mainnet": "tsx scripts/deploy.ts --network mainnet"
