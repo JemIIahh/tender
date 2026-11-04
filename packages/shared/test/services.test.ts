@@ -10,6 +10,7 @@ import {
   type HiredService,
   hireCriteriaHash,
   hireDocuments,
+  hireeOf,
   hireMismatch,
   hireTerms,
   isHireCriteriaOf,
@@ -175,6 +176,13 @@ test("a_task_is_a_hire_when_it_invites_one_agent_once_with_a_hires_criteria", ()
   // Other criteria: a pinned task, and no hire.
   expect(isHireTask({ ...hire, criteria_hash: "ab".repeat(32) }, services)).toBe(false);
   expect(hireCriteriaHash(SERVICE)).toBe(HIRER_ACCEPTS_CRITERIA_HASH);
+
+  // The shape half of the rule: the one account a task is pinned to, as a hire is, or none.
+  expect(hireeOf(hire)).toBe("writer.acme.near");
+  expect(hireeOf({ ...hire, max_entries: 0 })).toBeNull();
+  expect(hireeOf({ ...hire, max_entries: 2 })).toBeNull();
+  expect(hireeOf({ ...hire, invited: [] })).toBeNull();
+  expect(hireeOf({ ...hire, invited: ["writer.acme.near", "other.near"] })).toBeNull();
 
   // The criteria half of the rule, which the agent runner asks of a task that invites its agent.
   expect(isHireCriteriaOf(HIRER_ACCEPTS_CRITERIA_HASH, "anyone.near", [])).toBe(true);

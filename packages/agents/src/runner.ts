@@ -8,6 +8,7 @@ import {
   type EntryView,
   ErrorBodySchema,
   hireCriteriaHash,
+  hireeOf,
   hireMismatch,
   isHireCriteriaOf,
   type ListTasksFilter,
@@ -482,7 +483,8 @@ function isHireCriteria(run: Run, criteriaHash: string): boolean {
  * paused one.
  */
 function hireRefusal(run: Run, task: TaskDetail): string | null {
-  if (task.max_entries !== 1 || task.invited.length !== 1 || task.invited[0] !== run.account) {
+  // Pinned as a hire is (`hireeOf` of `@tender/shared`), and to this agent.
+  if (hireeOf(task) !== run.account) {
     return "it is pinned as a hire and does not invite the agent alone, once, as a hire does";
   }
   const offered = (run.services ?? [])

@@ -353,19 +353,27 @@ export function isHireCriteriaOf(
 }
 
 /**
- * Whether a task's terms mark it as a hire of a service: it invites one account and takes one entry
- * (`max_entries` 1), as `hireTerms` posts a hire, and it carries the criteria of a hire of that
- * account (`isHireCriteriaOf`). It says what the task is, not whether its terms meet the service's:
- * `hireMismatch` is that. `GET /v1/tasks` with `hire=true` filters by the same rule, in SQL, and the
- * API's test holds the two together.
+ * The account a task is pinned to the way a hire is: it invites exactly one account and takes one
+ * entry (`max_entries` 1), as `hireTerms` posts a hire. That account, or null for a task of any
+ * other shape. The agent runner takes a hire only when this is its own agent.
+ */
+export function hireeOf(task: { invited: readonly string[]; max_entries: number }): string | null {
+  const [agent, ...others] = task.invited;
+  return task.max_entries === 1 && agent !== undefined && others.length === 0 ? agent : null;
+}
+
+/**
+ * Whether a task's terms mark it as a hire of a service: it is pinned as a hire is (`hireeOf`), and
+ * it carries the criteria of a hire of that account (`isHireCriteriaOf`). It says what the task is,
+ * not whether its terms meet the service's: `hireMismatch` is that. `GET /v1/tasks` with
+ * `hire=true` filters by the same rule, in SQL, and the API's test holds the two together.
  */
 export function isHireTask(
   task: { invited: readonly string[]; max_entries: number; criteria_hash: string },
   services: readonly Pick<Service, "agent" | "verification">[],
 ): boolean {
-  const [agent, ...others] = task.invited;
-  if (task.max_entries !== 1 || agent === undefined || others.length > 0) return false;
-  return isHireCriteriaOf(task.criteria_hash, agent, services);
+  const agent = hireeOf(task);
+  return agent !== null && isHireCriteriaOf(task.criteria_hash, agent, services);
 }
 
 /** What `hireMismatch` reads of a task: the fields of its detail that a hire fixes. */
