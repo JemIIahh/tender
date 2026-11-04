@@ -40,3 +40,7 @@ create table services (
 -- held to a limit at each listing.
 create index services_provider_idx on services (provider);
 create index services_agent_idx on services (agent);
+
+-- The hired side's runner lists the open tasks that invite its agent (`GET /v1/tasks?invited=`) on
+-- every tick, a containment test on the jsonb list, which a GIN index answers without a scan.
+create index tasks_invited_idx on tasks using gin (invited);

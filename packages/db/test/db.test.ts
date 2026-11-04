@@ -331,6 +331,8 @@ const KEYS = [
   "task_questions: index (task_id, id)",
   "task_questions: primary key (id)",
   "tasks: index (commit_deadline)",
+  // Migration 0007: a GIN index, for `invited @>`.
+  "tasks: index (invited)",
   "tasks: primary key (id)",
   "tasks: index (parent)",
   "tasks: index (poster)",

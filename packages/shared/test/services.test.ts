@@ -6,11 +6,15 @@ import {
   canonicalJson,
   HIRE_REQUEST_MAX_CHARS,
   HIRER_ACCEPTS_CRITERIA,
+  HIRER_ACCEPTS_CRITERIA_HASH,
   type HiredService,
+  hireCriteriaHash,
   hireDocuments,
+  hireMismatch,
   hireTerms,
   PublicCriteriaSchema,
   rubricCriteriaProblem,
+  type Service,
   serviceTermsProblem,
   sha256Hex,
   UpdateServiceRequestSchema,
@@ -78,7 +82,7 @@ test("a_hire_brief_is_the_request_then_the_reference_and_the_same_bytes_each_tim
   );
   expect(longest.brief.instructions.length).toBeLessThan(8000);
   expect(() => hireDocuments(SERVICE, "r".repeat(HIRE_REQUEST_MAX_CHARS + 1))).toThrow();
-  expect(() => hireDocuments(SERVICE, "hidden​words")).toThrow(/U\+200B/);
+  expect(() => hireDocuments(SERVICE, "hidden\u200bwords")).toThrow(/U\+200B/);
 });
 
 test("a_judge_checked_hire_carries_the_services_criteria_and_names_the_judge", () => {
@@ -93,7 +97,12 @@ test("a_judge_checked_hire_carries_the_services_criteria_and_names_the_judge", (
   const judged: HiredService = {
     ...SERVICE,
     output_format: "regex_json",
-    verification: { kind: "judge", criteria, criteria_hash: sha256Hex(canonicalJson(criteria)) },
+    verification: {
+      kind: "judge",
+      criteria,
+      criteria_hash: sha256Hex(canonicalJson(criteria)),
+      judge: "judge.near",
+    },
   };
   expect(hireDocuments(judged, "x").criteriaHash).toBe(sha256Hex(canonicalJson(criteria)));
   expect(hireTerms(judged, "judge.near")).toEqual({
@@ -109,7 +118,83 @@ test("a_judge_checked_hire_carries_the_services_criteria_and_names_the_judge", (
     fallbackSecs: 900,
   });
   expect(() => hireTerms(judged, null)).toThrow(RangeError);
+  // The Judge the hirer knows must be the one the service names, or the agent would not take it.
+  expect(() => hireTerms(judged, "another-judge.near")).toThrow(/the Judge here is another-judge/);
   expect(hireTerms(SERVICE, null).verifier).toBeUndefined();
+});
+
+test("a_hire_matches_a_service_only_on_its_terms", () => {
+  const listed: Service = {
+    ...SERVICE,
+    status: "active",
+    available: true,
+    is_team: false,
+    created_at: "2026-11-04T09:00:00.000Z",
+    updated_at: "2026-11-04T09:00:00.000Z",
+    agent_record: null,
+  };
+  const s = 1_000_000_000n;
+  const created = 1_793_000_000n * s;
+  const task = {
+    poster: "hirer.near",
+    verifier: "hirer.near",
+    token: "usdc.near",
+    reward: "2500000",
+    criteria_hash: HIRER_ACCEPTS_CRITERIA_HASH,
+    created_at: String(created),
+    commit_deadline: String(created + 600n * s),
+    reveal_deadline: String(created + 900n * s),
+    pick_deadline: String(created + 1_800n * s),
+  };
+  expect(HIRER_ACCEPTS_CRITERIA_HASH).toBe(sha256Hex(canonicalJson(HIRER_ACCEPTS_CRITERIA)));
+  expect(hireCriteriaHash(listed)).toBe(HIRER_ACCEPTS_CRITERIA_HASH);
+  expect(hireMismatch(task, listed)).toBeNull();
+  // More than the price is no mismatch.
+  expect(hireMismatch({ ...task, reward: "9000000" }, listed)).toBeNull();
+  const cases: Array<[Partial<typeof task>, Partial<Service>, string]> = [
+    [{}, { status: "paused" }, "service 7 is paused"],
+    [{ criteria_hash: "ab".repeat(32) }, {}, "its criteria are not service 7's"],
+    [{ token: "dai.near" }, {}, "it pays in dai.near, and service 7 is priced in usdc.near"],
+    [{ verifier: "friend.near" }, {}, "the task names friend.near as its verifier, not its poster"],
+    [{ reward: "2499999" }, {}, "it pays 2499999, below the 2500000 that service 7 costs"],
+    [
+      { commit_deadline: String(created + 599n * s) },
+      {},
+      "its windows are shorter than service 7's",
+    ],
+    [
+      { pick_deadline: String(created + 1_799n * s) },
+      {},
+      "its windows are shorter than service 7's",
+    ],
+  ];
+  for (const [taskOver, serviceOver, why] of cases) {
+    expect(hireMismatch({ ...task, ...taskOver }, { ...listed, ...serviceOver }), why).toContain(
+      why,
+    );
+  }
+  // A Judge-checked one: the Judge the API names, and its criteria.
+  const judgedHash = "cd".repeat(32);
+  const judged: Service = {
+    ...listed,
+    verification: {
+      kind: "judge",
+      criteria: HIRER_ACCEPTS_CRITERIA,
+      criteria_hash: judgedHash,
+      judge: "judge.near",
+    },
+  };
+  const judgedTask = { ...task, criteria_hash: judgedHash, verifier: "judge.near" };
+  expect(hireMismatch(judgedTask, judged)).toBeNull();
+  expect(hireMismatch({ ...judgedTask, verifier: "hirer.near" }, judged)).toContain(
+    "checked by the Judge, and the task names hirer.near",
+  );
+  expect(
+    hireMismatch(judgedTask, {
+      ...judged,
+      verification: { ...judged.verification, judge: null } as Service["verification"],
+    }),
+  ).toContain("checked by the Judge");
 });
 
 test("the_rules_that_span_fields", () => {

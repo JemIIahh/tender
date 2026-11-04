@@ -76,8 +76,25 @@ const ServiceTagsSchema = z
   .max(SERVICE_MAX_TAGS)
   .refine((tags) => new Set(tags).size === tags.length, "expected each tag once");
 
-/** A price: a u128 above 0, in the token's smallest unit. */
-const PriceSchema = U128StringSchema.refine((value) => value !== "0", "expected a price above 0");
+/**
+ * The highest price a service may ask, in the token's smallest unit: the contract's
+ * `MAX_REWARD_LIMIT` (`u128::MAX / 10_000`, types.rs), above which no token can be allowlisted, so
+ * no task could be posted at it.
+ */
+export const SERVICE_MAX_PRICE = (2n ** 128n - 1n) / 10_000n;
+
+/**
+ * A price: a u128 above 0 and at most `SERVICE_MAX_PRICE`, in the token's smallest unit. A refine
+ * runs even after the u128 check has failed, so the bound is read only of a value that is one (a
+ * throw inside it would escape `safeParse`).
+ */
+const PriceSchema = U128StringSchema.refine(
+  (value) => value !== "0",
+  "expected a price above 0",
+).refine(
+  (value) => !U128StringSchema.safeParse(value).success || BigInt(value) <= SERVICE_MAX_PRICE,
+  `expected a price of at most ${SERVICE_MAX_PRICE}, the most a task can pay`,
+);
 
 /** A window in seconds, within the contract's cap; the network's shortest is the API's to check. */
 const WindowSecsSchema = z.int().min(1).max(SERVICE_MAX_WINDOW_SECS);
@@ -202,7 +219,9 @@ export type UpdateServiceRequest = z.infer<typeof UpdateServiceRequestSchema>;
 
 /**
  * How a service is checked, as the API shows it. A Judge-checked one has its criteria and their
- * hash, which is the `criteria_hash` every hire of it carries on chain.
+ * hash, which is the `criteria_hash` every hire of it carries on chain, and the account of the Judge
+ * that the API serves (`JUDGE_ACCOUNT`), which every hire of it names as its verifier: null when the
+ * API has none, and then the service cannot be hired.
  */
 export const ServiceVerificationViewSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("hirer") }),
@@ -210,6 +229,7 @@ export const ServiceVerificationViewSchema = z.discriminatedUnion("kind", [
     kind: z.literal("judge"),
     criteria: PublicCriteriaSchema,
     criteria_hash: HashHexSchema,
+    judge: AccountIdSchema.nullable(),
   }),
 ]);
 export type ServiceVerificationView = z.infer<typeof ServiceVerificationViewSchema>;
@@ -303,6 +323,75 @@ export const HIRER_ACCEPTS_CRITERIA: PublicCriteria = Object.freeze({
   ],
 }) as PublicCriteria;
 
+/** The SHA-256 of `HIRER_ACCEPTS_CRITERIA`'s canonical bytes: the `criteria_hash` of every such hire. */
+export const HIRER_ACCEPTS_CRITERIA_HASH = sha256Hex(canonicalJson(HIRER_ACCEPTS_CRITERIA));
+
+/** The `criteria_hash` that every hire of `service` carries on chain. */
+export function hireCriteriaHash(service: Pick<Service, "verification">): string {
+  return service.verification.kind === "judge"
+    ? service.verification.criteria_hash
+    : HIRER_ACCEPTS_CRITERIA_HASH;
+}
+
+/** What `hireMismatch` reads of a task: the fields of its detail that a hire fixes. */
+export interface HireTaskTerms {
+  poster: string;
+  verifier: string;
+  token: string;
+  /** A u128 as a decimal string. */
+  reward: string;
+  criteria_hash: string;
+  /** Nanoseconds since the epoch, as decimal strings. */
+  created_at: string;
+  commit_deadline: string;
+  reveal_deadline: string;
+  pick_deadline: string;
+}
+
+const NS_PER_SEC = 1_000_000_000n;
+
+/**
+ * Why the task `task`, which carries `service`'s criteria hash, is not a hire of `service` that its
+ * agent should take, or null if it is one. A hire pays in the service's token, at least its price;
+ * names the verifier the service says (the Judge the API serves, or the poster itself); and has
+ * windows at least as long as the service's. The service must be active. The task's invited list and
+ * entry cap are the caller's to check first, as they do not depend on the service. The reasons are
+ * for a log line: they quote the task's and the service's figures, and no words of either.
+ */
+export function hireMismatch(task: HireTaskTerms, service: Service): string | null {
+  const name = `service ${service.id}`;
+  if (service.status !== "active") return `${name} is paused`;
+  if (task.criteria_hash !== hireCriteriaHash(service)) {
+    return `its criteria are not ${name}'s`;
+  }
+  if (task.token !== service.token) {
+    return `it pays in ${task.token}, and ${name} is priced in ${service.token}`;
+  }
+  const { verification } = service;
+  if (verification.kind === "judge") {
+    if (verification.judge === null || task.verifier !== verification.judge) {
+      return `${name} is checked by the Judge, and the task names ${task.verifier} as its verifier`;
+    }
+  } else if (task.verifier !== task.poster) {
+    return `${name} is checked by the hirer, and the task names ${task.verifier} as its verifier, not its poster`;
+  }
+  if (BigInt(task.reward) < BigInt(service.price)) {
+    return `it pays ${task.reward}, below the ${service.price} that ${name} costs`;
+  }
+  const created = BigInt(task.created_at);
+  const commit = BigInt(task.commit_deadline);
+  const reveal = BigInt(task.reveal_deadline);
+  const pick = BigInt(task.pick_deadline);
+  if (
+    commit - created < BigInt(service.commit_secs) * NS_PER_SEC ||
+    reveal - commit < BigInt(service.reveal_secs) * NS_PER_SEC ||
+    pick - reveal < BigInt(service.pick_secs) * NS_PER_SEC
+  ) {
+    return `its windows are shorter than ${name}'s`;
+  }
+  return null;
+}
+
 /** What a hire is made of: the service's terms, as the API showed them. */
 export type HiredService = Pick<
   Service,
@@ -387,13 +476,19 @@ export interface HireTerms {
 /**
  * The task terms of a hire: the price as the reward, the agent as the one invited entrant, the
  * service's windows, and the Judge as the verifier when the service says so (`judgeAccount`, which
- * must be set then; a `RangeError` otherwise).
+ * must be set then and be the Judge the service names; a `RangeError` otherwise).
  */
 export function hireTerms(service: HiredService, judgeAccount: string | null): HireTerms {
   let verifier: string | undefined;
   if (service.verification.kind === "judge") {
     if (judgeAccount === null)
       throw new RangeError("this service is checked by the Judge, and no Judge account is set");
+    // The agent takes a hire only if it names the Judge the API names (`hireMismatch`).
+    if (service.verification.judge !== judgeAccount) {
+      throw new RangeError(
+        `this service is checked by the Judge ${service.verification.judge ?? "(none)"}, and the Judge here is ${judgeAccount}`,
+      );
+    }
     verifier = judgeAccount;
   }
   return {

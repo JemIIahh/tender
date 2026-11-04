@@ -76,20 +76,21 @@ export async function insertService(
 }
 
 /**
- * Replaces the fields of service `id`, if `provider` listed it, and sets `updated_at` to now. False
- * when there is no such service of that provider, and nothing is written.
+ * Replaces the fields of service `id`, if `provider` listed it, and sets `updated_at` to now; the
+ * status only when `fields.status` names one (null keeps it), so that a change sent alongside a pause
+ * cannot undo the pause. False when there is no such service of that provider, and nothing is written.
  */
 export async function updateService(
   db: Db,
   id: bigint,
   provider: string,
-  fields: ServiceFields,
+  fields: Omit<ServiceFields, "status"> & { status: ServiceFields["status"] | null },
 ): Promise<boolean> {
   const rows = await db.query<{ id: string }>(
     `update services
         set title = $3, description = $4, tags = $5::jsonb, category = $6, output_format = $7,
             token = $8, price = $9::numeric, commit_secs = $10, reveal_secs = $11, pick_secs = $12,
-            verifier = $13, criteria = $14, status = $15, updated_at = now()
+            verifier = $13, criteria = $14, status = coalesce($15, status), updated_at = now()
       where id = $1 and provider = $2
       returning id::text as id`,
     [

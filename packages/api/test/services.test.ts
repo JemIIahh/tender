@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { insertService } from "@tender/db";
+import { insertService, updateService } from "@tender/db";
 import { applyBlock } from "@tender/indexer";
 import { blockOf, eventLine, FIXTURE_OPTIONS } from "@tender/indexer/testing";
 import {
@@ -7,6 +7,7 @@ import {
   canonicalJson,
   ListServicesResponseSchema,
   type PublicCriteria,
+  SERVICE_MAX_PRICE,
   SERVICES_PER_PROVIDER,
   ServiceResponseSchema,
   sha256Hex,
@@ -217,7 +218,16 @@ test("a_judge_checked_service_shows_its_criteria_and_the_hash_every_hire_carries
     kind: "judge",
     criteria: REGEX_CRITERIA,
     criteria_hash: sha256Hex(canonicalJson(REGEX_CRITERIA)),
+    // The Judge this API serves, whom every hire of it names as verifier.
+    judge: JUDGE,
   });
+  // An API without a Judge names none, and the service cannot be hired there.
+  const read = await send<ServiceBody>("GET", "/v1/services/1", {
+    app: appWith({ judgeAccount: undefined }),
+  });
+  expect(read.body.service).toMatchObject({ available: false, verification: { judge: null } });
+  const listed = await list("", appWith({ judgeAccount: undefined }));
+  expect(listed.body.services).toEqual([]);
 });
 
 test("only_the_provider_of_an_agent_can_list_for_it", async () => {
@@ -261,7 +271,7 @@ test("the_words_follow_the_plain_text_rules_and_the_limits", async () => {
     ["a title of two lines", { title: "one\ntwo" }, "expected one line, without line breaks"],
     [
       "an invisible character",
-      { title: "Summarise​" },
+      { title: "Summarise\u200b" },
       "expected plain text, without invisible formatting characters (found U+200B)",
     ],
     [
@@ -280,6 +290,11 @@ test("the_words_follow_the_plain_text_rules_and_the_limits", async () => {
     ["a tag that is no tag", { tags: ["Not A Tag"] }, "Invalid string"],
     ["a price of 0", { price: "0" }, "expected a price above 0"],
     ["a price that is no u128", { price: "1.5" }, "expected a u128 as a decimal string"],
+    [
+      "a price no task can pay",
+      { price: (SERVICE_MAX_PRICE + 1n).toString() },
+      "the most a task can pay",
+    ],
   ];
   for (const [what, over, message] of cases) {
     const refused = await create(ACME, listing(WRITER, over));
@@ -472,6 +487,59 @@ test("a_pause_is_always_taken_and_a_resume_needs_an_agent_that_can_work", async 
     status: "active",
     available: true,
   });
+});
+
+test("a_pause_alone_is_taken_even_when_the_terms_would_no_longer_pass", async () => {
+  await create(
+    ACME,
+    listing(WRITER, {
+      output_format: "regex_json",
+      verification: { kind: "judge", criteria: REGEX_CRITERIA },
+    }),
+  );
+  // The API lost its Judge since the listing: the terms would not pass now.
+  const noJudge = appWith({ judgeAccount: undefined });
+  const paused = await change("1", ACME, { status: "paused" }, noJudge);
+  expect(paused.status).toBe(200);
+  expect(paused.body.service.status).toBe("paused");
+  // A change of terms, and a resume, are checked.
+  expect((await change("1", ACME, { price: "1" }, noJudge)).status).toBe(400);
+  expect((await change("1", ACME, { status: "active" }, noJudge)).status).toBe(400);
+});
+
+test("a_change_writes_the_status_only_when_it_names_one", async () => {
+  await create(ACME, listing(WRITER));
+  const [row] = await deps.db.query<Record<string, unknown>>(
+    "select title, description, tags, category, output_format, token, price::text as price, commit_secs, reveal_secs, pick_secs from services where id = 1",
+  );
+  // A pause lands between the read of a change and its write: the write must not undo it.
+  await change("1", ACME, { status: "paused" });
+  const written = await updateService(deps.db, 1n, ACME, {
+    title: String(row?.title),
+    description: String(row?.description),
+    tags: row?.tags as string[],
+    category: String(row?.category),
+    outputFormat: String(row?.output_format),
+    token: String(row?.token),
+    price: "7",
+    commitSecs: Number(row?.commit_secs),
+    revealSecs: Number(row?.reveal_secs),
+    pickSecs: Number(row?.pick_secs),
+    verifier: "hirer",
+    criteria: null,
+    status: null,
+  });
+  expect(written).toBe(true);
+  expect((await send<ServiceBody>("GET", "/v1/services/1")).body.service).toMatchObject({
+    price: "7",
+    status: "paused",
+  });
+});
+
+test("the_index_decides_whose_agent_an_indexed_account_is", async () => {
+  // An indexed agent whose recorded provider is none: the name rule does not stand in for it.
+  await agent("orphan.acme.near", { asp: null });
+  expect((await create(ACME, listing("orphan.acme.near"))).body.error).toBe("not_your_agent");
 });
 
 // ---- Reading ------------------------------------------------------------------------------------

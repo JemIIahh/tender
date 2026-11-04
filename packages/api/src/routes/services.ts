@@ -54,7 +54,8 @@ import { canTakeHires, getService, listServices } from "../queries";
 //   403  (a listing) `not_your_agent`: the agent is neither the signed-in account nor one of its
 //        sub-accounts (the registry's `asp`);
 //   409  `agent_not_active`: the agent is not an active registered agent that holds a bond. A pause
-//        is never refused for it, and a change that leaves the service paused is not either;
+//        is never refused for it, and a change that leaves the service paused is not either. A body
+//        that only pauses is not held to the terms' rules either: a pause is never refused;
 //   409  `service_limit`: the provider keeps `SERVICES_PER_PROVIDER` services already.
 //
 // The words of a service are the provider's and are public: plain text, stored and returned as
@@ -164,6 +165,7 @@ export function serviceRoutes(
     },
   });
   const minWindowSecs = NETWORKS[deps.network].minWindowSecs;
+  const readers = { teamAccounts: deps.teamAccounts, judgeAccount: deps.judgeAccount ?? null };
 
   /** A 400 for terms that a hire could not be made of, on this network and with this Judge. */
   function checkTerms(terms: ServiceTerms, agent: string): void {
@@ -204,7 +206,9 @@ export function serviceRoutes(
       agent,
     ]);
     const parent = /^[^.]+[.](.+[.].+)$/.exec(agent)?.[1] ?? null;
-    const runsIt = agent === provider || (row?.asp ?? parent) === provider;
+    // The index's `asp` when it holds the agent, which is what the contract recorded; the name rule
+    // only for an account it does not hold.
+    const runsIt = agent === provider || (row ? row.asp : parent) === provider;
     if (!runsIt) {
       fail(
         403,
@@ -222,7 +226,7 @@ export function serviceRoutes(
   }
 
   async function answer(id: string): Promise<ServiceResponse> {
-    const service = await getService(deps.db, BigInt(id), deps.teamAccounts);
+    const service = await getService(deps.db, BigInt(id), readers);
     if (service === null) throw new Error(`service ${id} was not found after it was written`);
     return { service };
   }
@@ -258,7 +262,7 @@ export function serviceRoutes(
         limit: parseLimit(q.limit),
         cursor: parseU64("cursor", q.cursor),
       },
-      deps.teamAccounts,
+      readers,
     );
     return c.json(page);
   });
@@ -273,7 +277,7 @@ export function serviceRoutes(
   }
 
   app.get("/services/:id", async (c) => {
-    const service = await getService(deps.db, idOf(c.req.param("id")), deps.teamAccounts);
+    const service = await getService(deps.db, idOf(c.req.param("id")), readers);
     if (service === null) return notFound("no such service");
     const body: ServiceResponse = { service };
     return c.json(body);
@@ -314,10 +318,18 @@ export function serviceRoutes(
     const { status, ...changes } = await bodyOf(c, UpdateServiceRequestSchema);
     const terms: ServiceTerms = { ...termsOf(row), ...changes };
     const next = status ?? row.status;
-    checkTerms(terms, row.agent);
+    // A pause alone is never refused: a setting that changed since the terms were written (a Judge
+    // unset, a longer shortest window) must not keep a provider from taking a service off the
+    // market. Terms that change are checked, and so are those of a service that is to be active.
+    if (Object.keys(changes).length > 0 || next === "active") checkTerms(terms, row.agent);
     // A pause, or a change to a paused service, never needs the agent to be able to work.
-    await requireAgentOf(row.provider, row.agent, next === "active");
-    const written = await updateService(deps.db, id, row.provider, fieldsOf(terms, next));
+    if (next === "active") await requireAgentOf(row.provider, row.agent, true);
+    // The status is written only when the body names it, so that a change made at the same time as
+    // a pause cannot undo it.
+    const written = await updateService(deps.db, id, row.provider, {
+      ...fieldsOf(terms, next),
+      status: status ?? null,
+    });
     if (!written) return notFound("no such service");
     return c.json(await answer(id.toString()));
   });

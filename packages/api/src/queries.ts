@@ -584,16 +584,25 @@ async function agentRecords(
   return new Map(rows.map((row) => [row.account, row]));
 }
 
-/** A service as the API shows it, from its row and its agent's record. */
-function serviceOf(row: ServiceRow, agent: AgentSummary | null): Service {
+/**
+ * A service as the API shows it, from its row and its agent's record. `judgeAccount` is the Judge
+ * this API serves: a Judge-checked service names it, and cannot be hired while there is none.
+ */
+function serviceOf(
+  row: ServiceRow,
+  agent: AgentSummary | null,
+  judgeAccount: string | null,
+): Service {
   const verification: Service["verification"] =
     row.verifier === "judge" && row.criteria !== null
       ? {
           kind: "judge",
           criteria: JSON.parse(row.criteria) as PublicCriteria,
           criteria_hash: sha256Hex(row.criteria),
+          judge: judgeAccount,
         }
       : { kind: "hirer" };
+  const checkable = verification.kind === "hirer" || judgeAccount !== null;
   return {
     id: row.id,
     provider: row.provider,
@@ -610,7 +619,7 @@ function serviceOf(row: ServiceRow, agent: AgentSummary | null): Service {
     pick_secs: row.pick_secs,
     verification,
     status: row.status,
-    available: row.status === "active" && canTakeHires(agent),
+    available: row.status === "active" && canTakeHires(agent) && checkable,
     is_team: row.is_team,
     created_at: row.created_at.toISOString(),
     updated_at: row.updated_at.toISOString(),
@@ -618,17 +627,19 @@ function serviceOf(row: ServiceRow, agent: AgentSummary | null): Service {
   };
 }
 
-async function servicesOf(
-  db: Db,
-  rows: ServiceRow[],
-  teamAccounts: readonly string[],
-): Promise<Service[]> {
+/** Whom the services are read for: the team's accounts, and the Judge this API serves, if any. */
+export interface ServiceReaders {
+  teamAccounts: readonly string[];
+  judgeAccount: string | null;
+}
+
+async function servicesOf(db: Db, rows: ServiceRow[], r: ServiceReaders): Promise<Service[]> {
   const agents = await agentRecords(
     db,
     rows.map((row) => row.agent),
-    teamAccounts,
+    r.teamAccounts,
   );
-  return rows.map((row) => serviceOf(row, agents.get(row.agent) ?? null));
+  return rows.map((row) => serviceOf(row, agents.get(row.agent) ?? null, r.judgeAccount));
 }
 
 export interface ServiceFilter {
@@ -661,17 +672,19 @@ function likeEscaped(text: string): string {
 export async function listServices(
   db: Db,
   f: ServiceFilter,
-  teamAccounts: readonly string[],
+  r: ServiceReaders,
 ): Promise<ListServicesResponse> {
   const limit = clampLimit(f.limit);
   const p = new SqlParams();
-  const teamP = p.add([...teamAccounts]);
+  const teamP = p.add([...r.teamAccounts]);
   const where: string[] = [];
   if (f.status === "available") {
     where.push(`s.status = 'active'`);
     where.push(
       "exists (select 1 from agents a where a.account = s.agent and a.status = 'active' and a.bond_amount is not null)",
     );
+    // A Judge-checked service needs the Judge, whom an API without one cannot name.
+    if (r.judgeAccount === null) where.push(`s.verifier = 'hirer'`);
   }
   if (f.q !== undefined) {
     const pattern = p.add(`%${likeEscaped(f.q)}%`);
@@ -695,20 +708,16 @@ export async function listServices(
     p.values,
   );
   const { items, next_cursor } = pageOf(rows, limit, (last) => last.id);
-  return { services: await servicesOf(db, items, teamAccounts), next_cursor };
+  return { services: await servicesOf(db, items, r), next_cursor };
 }
 
 /** One service, whatever its status, with its agent's record; null if there is no such service. */
-export async function getService(
-  db: Db,
-  id: bigint,
-  teamAccounts: readonly string[],
-): Promise<Service | null> {
+export async function getService(db: Db, id: bigint, r: ServiceReaders): Promise<Service | null> {
   const [row] = await db.query<ServiceRow>(
     `select ${serviceColumns("$2")} from services s where s.id = $1::numeric`,
-    [id, [...teamAccounts]],
+    [id, [...r.teamAccounts]],
   );
   if (!row) return null;
-  const [service] = await servicesOf(db, [row], teamAccounts);
+  const [service] = await servicesOf(db, [row], r);
   return service ?? null;
 }
