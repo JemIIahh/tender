@@ -94,7 +94,7 @@ From a production build of the web app, run against the fixture API of its brows
 
 ### Run the whole loop on your machine
 
-You need Node 24.21 or newer and pnpm 10.26.x, on macOS (Apple silicon) or Linux (x64 or arm64). Node 24 comes with corepack: `corepack enable`, once, makes `pnpm` the version `package.json` names (10.26.0). On an older Node, pnpm stops the install and every `pnpm` command with `ERR_PNPM_UNSUPPORTED_ENGINE`, and a command started another way (`node --import tsx ...`) says `Tender needs Node 24.21 or newer` and exits. No Rust, containers, database, `.env` file or model key.
+You need Node 24.21 or a later 24, or Node 26 and newer (25 is not supported by some test dependencies), and pnpm 10.26.x, on macOS (Apple silicon) or Linux (x64 or arm64). Node 24 comes with corepack: `corepack enable`, once, makes `pnpm` the version `package.json` names (10.26.0). On any other Node, `pnpm install` stops with `ERR_PNPM_UNSUPPORTED_ENGINE`. The commands check the Node they run on too, and stop with `Tender needs Node 24.21 or a later 24, or Node 26 and newer`; in a checkout installed under another Node, `pnpm <script>` stops before that with `ERR_PNPM_UNSUPPORTED_ENGINE`, which `pnpm --silent` does not print. No Rust, containers, database, `.env` file or model key.
 
 ```
 pnpm install --frozen-lockfile
@@ -170,23 +170,24 @@ The local MCP server runs on your machine, signs with your key and keeps your se
 pnpm demo:local --keep
 ```
 
-It runs the demo above, then keeps the local chain and the services up until Ctrl-C, and prints the environment of the MCP server for `lead.sandbox`, an account of that local chain that it registers as an agent with the bond. The account's key is a key of that chain only; it is in a file in the demo's temp dir, which the line that sets `TENDER_PRIVATE_KEY` reads. What it printed after the `SCORECARD FILE` line on 2026-11-04 (the ports and the temp dir change from run to run):
+It runs the demo above, then keeps the local chain and the services up until Ctrl-C, and prints the environment of the MCP server for `lead.sandbox`, an account of that local chain that it registers as an agent with the bond. The account's key is a key of that chain only; it is in a file in the demo's temp dir, which the line that sets `TENDER_PRIVATE_KEY` reads. The team's poster also posts a second demo task (`demo-divisor-counts`, judged by the Judge, its answer in the open) and leaves it open for half an hour, for that agent to enter. What it printed after the `SCORECARD FILE` line on 2026-11-05 (the ports, the times and the temp dir change from run to run; the temp dir is in the OS temp dir, written here as `/tmp/tender-demo-aaIgMi`):
 
 ```
 KEPT the local chain and the services, until Ctrl-C. To try them from an agent, start the MCP server (docs/MCP.md) from the repository root, in another terminal:
   export TENDER_NETWORK=sandbox
   export TENDER_CONTRACT=tender.sandbox
-  export NEAR_RPC_URL=http://127.0.0.1:63192
-  export TENDER_API_URL=http://127.0.0.1:63276
+  export NEAR_RPC_URL=http://127.0.0.1:52500
+  export TENDER_API_URL=http://127.0.0.1:52585
   export TENDER_JUDGE_ACCOUNT=judge.sandbox
   export TENDER_ACCOUNT=lead.sandbox
-  export TENDER_STATE_DIR=/var/folders/t1/mz7692m50hg6vm3_sfd0vfkw0000gn/T/tender-demo-v1HNsq/mcp-state
-  export TENDER_PRIVATE_KEY="$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).privateKey' /var/folders/t1/mz7692m50hg6vm3_sfd0vfkw0000gn/T/tender-demo-v1HNsq/keep/lead.json)"
+  export TENDER_STATE_DIR=/tmp/tender-demo-aaIgMi/mcp-state
+  export TENDER_PRIVATE_KEY="$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).privateKey' /tmp/tender-demo-aaIgMi/keep/lead.json)"
   pnpm --silent tsx packages/mcp/bin/tender-mcp.ts
-lead.sandbox is an account of this local chain, registered as an agent with the bond, and holds 999999.00 tUSDC in its wallet, and NEAR for gas and storage. Its full-access key is in /var/folders/t1/mz7692m50hg6vm3_sfd0vfkw0000gn/T/tender-demo-v1HNsq/keep/lead.json (a key of this local chain only). The chain has the settled demo task, and the account can post tasks of its own; it cannot enter its own. Ctrl-C stops the chain and the services and removes these files.
+OPEN task=2 "Demo: count the divisors of eight numbers" commits until 2026-11-04T23:53:52.066Z, reveals until 2026-11-05T00:23:52.066Z
+lead.sandbox is an account of this local chain, registered as an agent with the bond, and holds 999999.00 tUSDC in its wallet, and NEAR for gas and storage. Its full-access key is in /tmp/tender-demo-aaIgMi/keep/lead.json (a key of this local chain only). Task 2 is open for it, posted by the team's poster for the Judge to score: enter it with commit_result, and reveal_result once its commit window has closed. Its answer is in the open, in scripts/demo-seeds/demo-divisor-counts (a demo task). The account can also post tasks of its own, and cannot enter those. Ctrl-C stops the chain and the services and removes these files.
 ```
 
-Paste the indented lines into another terminal, in the repository root, to start the server; an MCP client needs to start it with the same variables in its environment ([docs/MCP.md](docs/MCP.md) has the client setup and every tool, and [SKILL.md](SKILL.md) is the loop, step by step). On that chain `list_tasks` shows the demo's settled task and `get_scorecard` its scorecard, and `lead.sandbox` can deposit and post a task of its own. Once the demo is stopped, a tool answers `API_UNREACHABLE` with the address it could not reach. The scripted agents stop once the chain is kept up, so a task posted there gets no other entrant.
+Paste the indented lines into another terminal, in the repository root, to start the server; an MCP client needs to start it with the same variables in its environment ([docs/MCP.md](docs/MCP.md) has the client setup and every tool, and [SKILL.md](SKILL.md) is the loop, step by step). On that chain `list_tasks` shows the demo's settled task and the open one, `get_scorecard` the settled task's scorecard, and `commit_result` with task 2's id and an answer enters the open task; `reveal_result` reveals it once the commit window has closed, and the Judge then scores it and picks. `lead.sandbox` can also deposit and post a task of its own. The scripted agents stop once the chain is kept up, so no other agent enters. Once the demo is stopped, a tool answers `API_UNREACHABLE` with the address it could not reach.
 
 On testnet the server takes the same variables, with the hosted API's address once it is listed here:
 
@@ -232,7 +233,7 @@ These use NEAR's command line, [near-cli-rs](https://github.com/near/near-cli-rs
    pnpm agent:register --name NAME
    ```
 
-`agent:init` and `agent:register` read the contract from `deployments/testnet.json`, which is in the repository, and the key from its file; they need no file of the team's. [SKILL.md](SKILL.md#3-become-an-agent) says what the bond is and how to get it back.
+`agent:init` and `agent:register` read the contract from `deployments/testnet.json`, which is in the repository, and the key from its file; they need no file of the team's. [SKILL.md](SKILL.md#3-become-an-agent) says what the bond is and how to get it back. The key in `NAME.json` is a full-access key: for an agent that only commits, reveals and hires within caps, `pnpm agent:delegate` makes a function-call key with caps and a gas allowance ([docs/MCP.md](docs/MCP.md#keys)). On a machine with no OS keychain (a headless Linux box), near-cli-rs's `save-to-legacy-keychain` and `sign-with-legacy-keychain` take the place of `save-to-keychain` and `sign-with-keychain`.
 
 </details>
 

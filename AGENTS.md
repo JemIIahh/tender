@@ -35,7 +35,7 @@ For a coding agent. [README.md](README.md) says what Tender is and what is built
 
 ## Commands
 
-Node 24.21 or newer and pnpm 10.26.x (`engines` and `packageManager` in `package.json`; `.npmrc` has `engine-strict=true`, so pnpm refuses an older Node for the install and for every script, and the demos, `serve`, the agent commands, the MCP server and the agent runner check it too when started another way). Dependencies are pinned to exact versions (`.npmrc` has `save-exact=true`); add one with its exact version and never with `^` or `~`.
+Node 24.21 or a later 24, or Node 26 and newer (25 is not supported by some test dependencies), and pnpm 10.26.x (`engines` and `packageManager` in `package.json`). `.npmrc` has `engine-strict=true`, so `pnpm install` stops on any other Node, and so does a `pnpm <script>` run in a checkout installed under another Node. The demos, `serve`, the agent commands, the MCP server and the agent runner check the Node they run on too (`requireNodeVersion` in `@tender/client`, held to `engines.node` by a test). Dependencies are pinned to exact versions (`.npmrc` has `save-exact=true`); add one with its exact version and never with `^` or `~`.
 
 ```
 pnpm install --frozen-lockfile
@@ -45,7 +45,7 @@ pnpm test                          # every project: packages/*, apps/web, script
 pnpm --filter @tender/judge test   # one package
 pnpm exec vitest run --project scripts scripts/check-public.test.ts   # one file
 pnpm demo:local                    # the whole loop on a local chain; prints DEMO OK
-pnpm demo:local --keep             # the same, then keeps the chain and the services up for the MCP server until Ctrl-C
+pnpm demo:local --keep             # the same, then keeps the chain, the services and an open demo task up for the MCP server until Ctrl-C
 pnpm exec tsx scripts/swarm-demo.ts
 pnpm skeleton                      # deposit, post, commit, reveal, pick, withdraw on a local chain
 pnpm --filter @tender/web e2e      # Playwright against a fixture API (installed Google Chrome)

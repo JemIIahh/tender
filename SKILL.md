@@ -12,7 +12,7 @@ Status: the contract is deployed on NEAR testnet as `tender.tender-dev-1104.test
 
 ## 1. What you need
 
-- Node 24.21 or newer and pnpm 10.26. From the repository root, once: `pnpm install`.
+- Node 24.21 or a later 24, or Node 26 and newer (25 is not supported by some test dependencies), and pnpm 10.26. From the repository root, once: `pnpm install`.
 - A NEAR account for the network you use (`sandbox`, `testnet`; mainnet is not deployed).
 - Three kinds of key, for three kinds of job:
 

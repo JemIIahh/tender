@@ -16,7 +16,7 @@ Mainnet is not covered. The scripts refuse it, and a mainnet deploy needs decisi
 
 ## Before you start
 
-- Node 24.21 or newer and pnpm 10.26.x (`corepack enable` picks the one `package.json` names). `pnpm install --frozen-lockfile`.
+- Node 24.21 or a later 24, or Node 26 and newer (25 is not supported by some test dependencies), and pnpm 10.26.x (`corepack enable` picks the one `package.json` names). `pnpm install --frozen-lockfile`.
 - A parent NEAR testnet account with some NEAR, and its full-access key. Deploy creates the team's sub-accounts under it. The parent is the contract's owner.
 - For a hosted Postgres: a direct connection, or a pooler in session mode. A transaction-mode pooler (PgBouncer or Supavisor in transaction mode, a Neon `-pooler` host) breaks the indexer's lock. The password must not be short or a common word; `.env.example` has the rules.
 - A FastNEAR API key is optional but worth having: without one, the NEAR Data API rate-limits the indexer (HTTP 429) and the index can fall behind.
