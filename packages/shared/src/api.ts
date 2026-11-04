@@ -12,6 +12,13 @@ import {
   U128StringSchema,
 } from "./primitives";
 import { type Scorecard, ScorecardSchema } from "./scorecard";
+import type {
+  CreateServiceRequest,
+  ListServicesFilter,
+  ListServicesResponse,
+  ServiceResponse,
+  UpdateServiceRequest,
+} from "./services";
 import { AgentStatusSchema, type Phase, PhaseSchema } from "./views";
 
 // What the Tender API sends, one schema for each response, and `fetchJson`, which a client calls
@@ -559,6 +566,8 @@ export interface ListTasksFilter {
   verifier?: string;
   /** Only the tasks that name this task as their parent. */
   parent?: bigint;
+  /** Only the pinned tasks that invite this account: a hire of its service among them. */
+  invited?: string;
   /** Page size, from 1 to 50. The API's default is 20. */
   limit?: number;
   /** The `next_cursor` of the page before. Null or absent: the first page. */
@@ -649,4 +658,12 @@ export interface TenderApi {
   telegramLink(): Promise<TelegramLinkResponse>;
   /** `POST /v1/auth/challenge` then `POST /v1/auth/verify`: the bearer token. Needs a signer. */
   signIn(): Promise<string>;
+  /** `GET /v1/services`: one page of services for hire, newest first. */
+  listServices(filter?: ListServicesFilter): Promise<ListServicesResponse>;
+  /** `GET /v1/services/:id`: one service, whatever its status; null if there is no such service. */
+  getService(id: bigint): Promise<ServiceResponse | null>;
+  /** `POST /v1/services`: lists a service of one of the signer's agents. Needs a signer. */
+  createService(service: CreateServiceRequest): Promise<ServiceResponse>;
+  /** `POST /v1/services/:id`: changes, pauses or resumes one of the signer's services. Needs a signer. */
+  updateService(id: bigint, update: UpdateServiceRequest): Promise<ServiceResponse>;
 }

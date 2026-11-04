@@ -14,6 +14,7 @@ import {
   ChallengeResponseSchema,
   type ClarificationResponse,
   ClarificationResponseSchema,
+  type CreateServiceRequest,
   fetchJson,
   type HealthResponse,
   HealthResponseSchema,
@@ -21,6 +22,9 @@ import {
   type ListAgentsFilter,
   type ListAgentsResponse,
   ListAgentsResponseSchema,
+  type ListServicesFilter,
+  type ListServicesResponse,
+  ListServicesResponseSchema,
   type ListTasksFilter,
   type ListTasksResponse,
   ListTasksResponseSchema,
@@ -28,6 +32,8 @@ import {
   QuestionResponseSchema,
   type Scorecard,
   ScorecardSchema,
+  type ServiceResponse,
+  ServiceResponseSchema,
   type SignInResponse,
   SignInResponseSchema,
   type StartResponse,
@@ -39,6 +45,7 @@ import {
   type TelegramLinkResponse,
   TelegramLinkResponseSchema,
   U64StringSchema,
+  type UpdateServiceRequest,
 } from "@tender/shared";
 import { toBase64 } from "./base64";
 import { config } from "./config";
@@ -269,6 +276,32 @@ export const api = {
     return get("/health", HealthResponseSchema);
   },
 
+  /** `GET /v1/services`: one page of services, newest first; those that can be hired by default. */
+  listServices(filter: ListServicesFilter = {}): Promise<ListServicesResponse> {
+    const { q, tag, provider, agent, token, maxPrice, status, limit, cursor } = filter;
+    return get("/services", ListServicesResponseSchema, {
+      q,
+      tag,
+      provider,
+      agent,
+      token,
+      max_price: maxPrice,
+      status,
+      limit,
+      cursor: cursor ?? undefined,
+    });
+  },
+
+  /**
+   * `GET /v1/services/:id`: one service, whatever its status; null if there is none. A string that
+   * is no id is no service, so null, and nothing is sent.
+   */
+  async getService(id: bigint | string): Promise<ServiceResponse | null> {
+    const service = taskIdText(id);
+    if (service === undefined) return null;
+    return orNull(get(`/services/${service}`, ServiceResponseSchema));
+  },
+
   // ---- Writes ---------------------------------------------------------------------------------
 
   /** `POST /v1/auth/challenge`: a nonce, and the message and recipient to have a wallet sign. */
@@ -318,6 +351,24 @@ export const api = {
   async start(token: string, taskId: bigint | string): Promise<StartResponse> {
     const task = taskIdText(taskId) ?? notAnId("start", "a task id", taskId);
     return post(`/tasks/${task}/start`, StartResponseSchema, { token });
+  },
+
+  /** `POST /v1/services`: lists a service of one of the signed-in account's agents. */
+  createService(token: string, body: CreateServiceRequest): Promise<ServiceResponse> {
+    return post("/services", ServiceResponseSchema, { token, body });
+  },
+
+  /**
+   * `POST /v1/services/:id`: changes, pauses or resumes one of the signed-in account's services. It
+   * throws for an id that is no service's, without asking.
+   */
+  async updateService(
+    token: string,
+    id: string,
+    body: UpdateServiceRequest,
+  ): Promise<ServiceResponse> {
+    const service = taskIdText(id) ?? notAnId("updateService", "a service id", id);
+    return post(`/services/${service}`, ServiceResponseSchema, { token, body });
   },
 
   /** `POST /v1/telegram/link`: a one-time link from this account to the bot. Needs a token. */

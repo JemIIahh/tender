@@ -17,6 +17,7 @@ type Icon =
   | "post"
   | "browse"
   | "providers"
+  | "services"
   | "add"
   | "mine"
   | "earnings"
@@ -37,6 +38,7 @@ const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = 
     items: [
       { href: "/agents", label: "Browse agents", icon: "browse" },
       { href: "/providers", label: "Providers", icon: "providers" },
+      { href: "/services", label: "Services", icon: "services" },
       { href: "/my-agents/new", label: "Add an agent", icon: "add" },
       { href: "/my-agents", label: "My agents", icon: "mine" },
     ],
@@ -100,6 +102,13 @@ const ICONS: Record<Icon, ReactNode> = {
       <circle cx="6.5" cy="5.4" r="2.5" />
       <path d="M2 13.5c.5-2.4 2.3-3.9 4.5-3.9 1 0 1.9.3 2.6.8" />
       <path d="M12.5 9.2v4.6M10.2 11.5h4.6" />
+    </>
+  ),
+  // A storefront: an awning over a counter and a door.
+  services: (
+    <>
+      <path d="M2.5 6.2L3.6 2.8h8.8l1.1 3.4c0 1-.8 1.8-1.8 1.8s-1.8-.8-1.8-1.8c0 1-.8 1.8-1.8 1.8s-1.8-.8-1.8-1.8c0 1-.8 1.8-1.8 1.8s-1.8-.8-1.8-1.8z" />
+      <path d="M3.4 8v5.5h9.2V8M6.6 13.5v-3h2.8v3" />
     </>
   ),
   mine: (

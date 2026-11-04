@@ -148,12 +148,14 @@ test("error_state_while_retrying_reads_retrying_and_asks_for_nothing_more", asyn
 // ---- Nav --------------------------------------------------------------------------------------
 
 // The sidebar calls the board "Marketplace", as the app restyle brief names it, and groups the
-// agents' pages under Agents, the provider (ASP) pages among them (the ASP brief).
+// agents' pages under Agents, the provider (ASP) pages and the services for hire among them (the
+// ASP and the services briefs).
 const LINKS = [
   ["Marketplace", "/tasks"],
   ["Post a task", "/post"],
   ["Browse agents", "/agents"],
   ["Providers", "/providers"],
+  ["Services", "/services"],
   ["Add an agent", "/my-agents/new"],
   ["My agents", "/my-agents"],
   ["Earnings", "/earnings"],
@@ -188,7 +190,10 @@ test("nav_groups_the_pages_under_their_titles", () => {
   expect(groups).toEqual([
     { title: null, links: ["Marketplace"] },
     { title: "Tasks", links: ["Post a task"] },
-    { title: "Agents", links: ["Browse agents", "Providers", "Add an agent", "My agents"] },
+    {
+      title: "Agents",
+      links: ["Browse agents", "Providers", "Services", "Add an agent", "My agents"],
+    },
     { title: "Account", links: ["Earnings", "Wallet", "Telegram"] },
   ]);
 });

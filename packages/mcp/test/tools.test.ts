@@ -384,6 +384,7 @@ test("lists_expected_read_tools", async () => {
     "get_scorecard",
     "get_task",
     "list_questions",
+    "list_services",
     "list_tasks",
     "my_entries",
     "task_entries",
@@ -423,6 +424,7 @@ test("lists_expected_write_tools", async () => {
     "ask_question",
     "commit_result",
     "deposit",
+    "hire_agent",
     "pick_winners",
     "post_clarification",
     "post_task",
@@ -1227,6 +1229,7 @@ function writeKit() {
     ),
     withdraw: vi.fn<McpChain["withdraw"]>(async () => tx("TX_WITHDRAW", { returnValue: true })),
     registerAgent: vi.fn<McpChain["registerAgent"]>(async () => tx("TX_AGENT")),
+    view: vi.fn(async () => null) as unknown as McpChain["view"],
   };
   const api = {
     getTask: vi.fn<TenderApi["getTask"]>(async () => makeDetail([])),

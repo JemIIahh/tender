@@ -1,4 +1,4 @@
-import type { AgentSummary } from "@tender/shared";
+import type { AgentSummary, Service } from "@tender/shared";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -245,12 +245,21 @@ test("directory_says_when_there_are_no_providers_and_retries_a_failed_read", asy
 
 test("provider_page_shows_the_account_its_combined_record_and_its_agents", async () => {
   const { calls } = fakeApi((url) =>
-    url.searchParams.get("asp") === ACME ? agentsPage([analyst, coder, writer]) : serverFault(),
+    url.pathname === "/v1/services"
+      ? json({ services: [], next_cursor: null })
+      : url.searchParams.get("asp") === ACME
+        ? agentsPage([analyst, coder, writer])
+        : serverFault(),
   );
   render(<ProviderView account={ACME} />);
 
   const cards = await screen.findAllByTestId("agent-card");
-  expect(calls).toEqual([`/v1/agents?asp=${ACME}&limit=50`]);
+  await screen.findByTestId("no-provider-services");
+  expect(calls).toEqual([
+    `/v1/agents?asp=${ACME}&limit=50`,
+    // Its services for hire, after its agents are known.
+    `/v1/services?provider=${ACME}&limit=50`,
+  ]);
   expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(ACME);
   // The first mention on the page says what the letters stand for.
   expect(screen.getByRole("banner").textContent).toContain("Agent service provider (ASP)");
@@ -365,10 +374,68 @@ test("provider_page_reads_every_page_of_its_agents_and_retries", async () => {
   fail = false;
   await userEvent.click(within(error).getByRole("button", { name: "Retry" }));
   expect(await screen.findAllByTestId("agent-card")).toHaveLength(2);
-  expect(calls.slice(-2)).toEqual([
+  expect(calls.filter((call) => call.startsWith("/v1/agents")).slice(-2)).toEqual([
     `/v1/agents?asp=${ACME}&limit=50`,
     `/v1/agents?asp=${ACME}&limit=50&cursor=coder.${ACME}`,
   ]);
+});
+
+test("provider_page_lists_its_services_for_hire_as_the_services_page_does", async () => {
+  const listing: Service = {
+    id: "3",
+    provider: ACME,
+    agent: `writer.${ACME}`,
+    title: "Summarise a filing",
+    description: "Five lines.",
+    tags: ["research"],
+    category: "research",
+    output_format: "text",
+    token: TOKEN,
+    price: "2500000",
+    commit_secs: 600,
+    reveal_secs: 300,
+    pick_secs: 600,
+    verification: { kind: "hirer" },
+    status: "active",
+    available: true,
+    is_team: false,
+    created_at: "2026-11-04T09:00:00.000Z",
+    updated_at: "2026-11-04T09:00:00.000Z",
+    agent_record: writer,
+  };
+  const { calls } = fakeApi((url) =>
+    url.pathname === "/v1/services"
+      ? json({ services: [listing], next_cursor: null })
+      : agentsPage([writer]),
+  );
+  render(<ProviderView account={ACME} />);
+
+  const [card] = await screen.findAllByTestId("service-card");
+  expect(calls).toContain(`/v1/services?provider=${ACME}&limit=50`);
+  expect(screen.getByRole("heading", { level: 2, name: "Its services" })).toBeTruthy();
+  expect(within(card as HTMLElement).getByRole("heading", { level: 3 }).textContent).toBe(
+    "Summarise a filing",
+  );
+  expect(within(card as HTMLElement).getByTestId("service-price").textContent).toBe(
+    "Price: 2.50 tUSDC",
+  );
+
+  // A read that fails says so in its own place, and the agents stay.
+  vi.unstubAllGlobals();
+  let fail = true;
+  fakeApi((url) =>
+    url.pathname === "/v1/services"
+      ? fail
+        ? serverFault()
+        : json({ services: [listing], next_cursor: null })
+      : agentsPage([writer]),
+  );
+  render(<ProviderView account={ACME} />);
+  const error = await screen.findByTestId("error-state");
+  expect(screen.getAllByTestId("agent-card").length).toBeGreaterThan(0);
+  fail = false;
+  await userEvent.click(within(error).getByRole("button", { name: "Retry" }));
+  expect((await screen.findAllByTestId("service-card")).length).toBeGreaterThan(1);
 });
 
 // ---- The agent card's provider ------------------------------------------------------------------

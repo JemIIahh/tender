@@ -127,6 +127,8 @@ test("my_agents_lists_the_account_itself_first_then_the_agents_under_it_with_the
   expect(state.requests).toEqual([
     `GET /v1/agents/${ALICE}`,
     `GET /v1/agents?asp=${ALICE}&limit=50`,
+    // The provider's services, paused ones and all (components/account/ServicesSection).
+    `GET /v1/services?provider=${ALICE}&status=all&limit=50`,
   ]);
 
   const [alice, scout, long] = rows as [HTMLElement, HTMLElement, HTMLElement];

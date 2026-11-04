@@ -76,6 +76,8 @@ export interface RateLimits {
    * keeps are `BOARD_LIMITS`, in `@tender/shared`.
    */
   board: RateLimit;
+  /** Every listing and every change of a service (`POST /v1/services`, `POST /v1/services/:id`), per signed-in account. */
+  services: RateLimit;
 }
 
 const HOUR_MS = 60 * 60_000;
@@ -95,6 +97,8 @@ export const DEFAULT_RATE_LIMITS: Readonly<RateLimits> = Object.freeze({
   // A poster who answers a full board of 200 questions in one sitting makes 30 a minute for seven
   // minutes; an agent asking makes a few an hour, and the board's own limits hold it to that.
   board: { limit: 30, windowMs: 60_000 },
+  // A provider that lists its agents' services, or pauses all of them, makes a few writes a minute.
+  services: { limit: 30, windowMs: 60_000 },
 });
 
 /** The limits in `over` where it has them, and the defaults for the rest. */
@@ -109,6 +113,7 @@ export function rateLimitsOf(over: Partial<RateLimits> | undefined): RateLimits 
     heldoutBytesTotal: over?.heldoutBytesTotal ?? DEFAULT_RATE_LIMITS.heldoutBytesTotal,
     blobBytesTotal: over?.blobBytesTotal ?? DEFAULT_RATE_LIMITS.blobBytesTotal,
     board: over?.board ?? DEFAULT_RATE_LIMITS.board,
+    services: over?.services ?? DEFAULT_RATE_LIMITS.services,
   };
 }
 

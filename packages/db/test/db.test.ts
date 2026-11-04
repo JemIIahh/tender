@@ -56,6 +56,7 @@ const MIGRATIONS = [
   "0004_task_questions.sql",
   "0005_tg_board_digests.sql",
   "0006_agent_bond.sql",
+  "0007_services.sql",
 ];
 
 // Stands for a secret (a held-out answer, blob bytes) in the error tests: as text, and as hex, which
@@ -271,6 +272,27 @@ const SCHEMA: Record<string, string[]> = {
     "answered_at timestamp with time zone?",
     "hidden boolean = false",
   ],
+  // Migration 0007.
+  services: [
+    "id bigint = serial",
+    "provider text",
+    "agent text",
+    "title text",
+    "description text",
+    "tags jsonb",
+    "category text",
+    "output_format text",
+    "token text",
+    "price numeric(40,0)",
+    "commit_secs integer",
+    "reveal_secs integer",
+    "pick_secs integer",
+    "verifier text",
+    "criteria text?",
+    "status text = 'active'::text",
+    "created_at timestamp with time zone = now()",
+    "updated_at timestamp with time zone = now()",
+  ],
   // Migration 0005.
   tg_board_digests: [
     "chat_id bigint",
@@ -302,10 +324,15 @@ const KEYS = [
   "heldout_uploads: primary key (sha256, account)",
   "result_uploads: primary key (sha256, task_id, account)",
   "schema_migrations: primary key (name)",
+  "services: index (agent)",
+  "services: index (provider)",
+  "services: primary key (id)",
   "task_questions: index (task_id, asker, created_at)",
   "task_questions: index (task_id, id)",
   "task_questions: primary key (id)",
   "tasks: index (commit_deadline)",
+  // Migration 0007: a GIN index, for `invited @>`.
+  "tasks: index (invited)",
   "tasks: primary key (id)",
   "tasks: index (parent)",
   "tasks: index (poster)",
@@ -321,11 +348,15 @@ const KEYS = [
 
 // Every constraint that is not a key (those are in KEYS) and not NOT NULL (that is the "?" above;
 // Postgres 18 also lists NOT NULL in pg_constraint, 17 does not): no foreign key, and no CHECK but
-// the kind of a blob, the three of a board row (migration 0004) and the status of an agent (0006).
+// the kind of a blob, the three of a board row (migration 0004), the status of an agent (0006) and the three of a
+// service (0007).
 const CONSTRAINTS = [
   "agents: CHECK ((status = ANY (ARRAY['active'::text, 'unregistering'::text, 'retired'::text])))",
   "blobs: CHECK ((kind = ANY (ARRAY['brief'::text, 'criteria'::text, 'heldout'::text, " +
     "'result'::text, 'scorecard'::text, 'profile'::text])))",
+  "services: CHECK (((verifier = 'judge'::text) = (criteria IS NOT NULL)))",
+  "services: CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text])))",
+  "services: CHECK ((verifier = ANY (ARRAY['hirer'::text, 'judge'::text])))",
   "task_questions: CHECK (((answer IS NULL) = (answered_at IS NULL)))",
   "task_questions: CHECK (((kind = 'question'::text) = (asker IS NOT NULL)))",
   "task_questions: CHECK ((kind = ANY (ARRAY['question'::text, 'clarification'::text])))",
@@ -1218,12 +1249,7 @@ describe.each(targets)("db on $name", (target) => {
       await put("result", '{"exact":{"expected":["44"]}}', "alice.near");
 
       // 0003 is the one under test; whatever comes after it applies on top, as it would on a real upgrade.
-      expect(await migrate(old)).toEqual([
-        "0003_heldout_uploads.sql",
-        "0004_task_questions.sql",
-        "0005_tg_board_digests.sql",
-        "0006_agent_bond.sql",
-      ]);
+      expect(await migrate(old)).toEqual(MIGRATIONS.slice(2));
       expect(await old.query("select sha256, account, uploaded_at from heldout_uploads")).toEqual([
         { sha256: heldout, account: "poster.near", uploaded_at: new Date("2026-10-01T09:00:00Z") },
       ]);
@@ -1258,7 +1284,8 @@ describe.each(targets)("the agent bond columns (migration 0006) on $name", (targ
       expect(await migrate(db, dir)).toEqual(before);
       await insertAgent(db, "old.near");
 
-      expect(await migrate(db)).toEqual(["0006_agent_bond.sql"]);
+      // 0006 is the one under test; the later ones apply on top of it.
+      expect(await migrate(db)).toEqual(MIGRATIONS.slice(5));
       expect(
         await db.query(
           "select status, bond_token, bond_amount, claimable_at from agents where account = $1",

@@ -67,6 +67,12 @@ export interface TaskSpec {
   entries?: TaskEntry[];
   /** When the task was created, in nanoseconds since the epoch. Default: "1000000000". */
   createdAt?: string;
+  /** The reward, in the token's smallest unit. Default: "1000000". */
+  reward?: string;
+  /** The token. Default: `TOKEN`. */
+  token?: string;
+  /** The criteria hash the chain holds. Default: a hash of the id. */
+  criteriaHash?: string;
 }
 
 /** The task a test asks for, with the rest as a task that has just been posted and accepted. */
@@ -88,8 +94,8 @@ export function taskSummary(spec: TaskSpec): TaskSummary {
     title: `Task ${spec.id}`,
     category: "coding",
     tags: spec.tags,
-    token: TOKEN,
-    reward: "1000000",
+    token: spec.token ?? TOKEN,
+    reward: spec.reward ?? "1000000",
     phase: spec.phase,
     poster: spec.poster ?? POSTER,
     verifier: spec.verifier ?? JUDGE,
@@ -114,7 +120,7 @@ export function taskDetail(spec: TaskSpec): TaskDetail {
     ...taskSummary(spec),
     brief_uri: `https://api.test/v1/blobs/brief-${spec.id}`,
     brief_hash: spec.briefHash ?? sha256Hex(`brief of task ${spec.id}`),
-    criteria_hash: sha256Hex(`criteria of task ${spec.id}`),
+    criteria_hash: spec.criteriaHash ?? sha256Hex(`criteria of task ${spec.id}`),
     heldout_commitment: null,
     max_entries: spec.maxEntries ?? 0,
     max_winners: 1,

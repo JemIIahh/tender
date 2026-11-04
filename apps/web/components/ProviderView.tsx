@@ -10,6 +10,7 @@ import { Stat, Stats, Tokens } from "./account/parts";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
 import { FLEET_HEAD } from "./ProviderDirectory";
+import { ProviderServices } from "./ProviderServices";
 import { TeamLabel } from "./TeamBadge";
 import { CARD, EYEBROW, PANEL_TITLE } from "./ui";
 
@@ -177,6 +178,7 @@ export function ProviderView({ account }: { account: string }) {
         <>
           <Record fleet={fleet} />
           <Agents fleet={fleet} />
+          <ProviderServices account={account} />
         </>
       )}
     </div>
