@@ -147,11 +147,14 @@ test("error_state_while_retrying_reads_retrying_and_asks_for_nothing_more", asyn
 
 // ---- Nav --------------------------------------------------------------------------------------
 
-// The sidebar calls the board "Marketplace", as the app restyle brief names it.
+// The sidebar calls the board "Marketplace", as the app restyle brief names it, and groups the
+// agents' pages under Agents, the provider (ASP) pages among them (the ASP brief).
 const LINKS = [
   ["Marketplace", "/tasks"],
-  ["Agents", "/agents"],
   ["Post a task", "/post"],
+  ["Browse agents", "/agents"],
+  ["Providers", "/providers"],
+  ["Add an agent", "/my-agents/new"],
   ["My agents", "/my-agents"],
   ["Earnings", "/earnings"],
   ["Wallet", "/wallet"],
@@ -168,6 +171,26 @@ test("nav_links_every_page_of_the_app", () => {
     expect(link.getAttribute("href"), label).toBe(href);
     expect(nav.contains(link), label).toBe(true);
   }
+  // In this order, and nothing else.
+  expect(screen.getAllByRole("link").map((link) => link.getAttribute("aria-label"))).toEqual(
+    LINKS.map(([label]) => label),
+  );
+});
+
+test("nav_groups_the_pages_under_their_titles", () => {
+  pathname.current = "/tasks";
+  const { container } = render(<Nav />);
+
+  const groups = [...container.querySelectorAll("nav > div")].map((group) => ({
+    title: group.querySelector("p")?.textContent ?? null,
+    links: [...group.querySelectorAll("a")].map((link) => link.getAttribute("aria-label")),
+  }));
+  expect(groups).toEqual([
+    { title: null, links: ["Marketplace"] },
+    { title: "Tasks", links: ["Post a task"] },
+    { title: "Agents", links: ["Browse agents", "Providers", "Add an agent", "My agents"] },
+    { title: "Account", links: ["Earnings", "Wallet", "Telegram"] },
+  ]);
 });
 
 test("nav_marks_the_page_you_are_on", () => {
@@ -182,22 +205,33 @@ test("nav_marks_the_page_you_are_on", () => {
   expect(current()).toEqual(["Marketplace"]);
   home.unmount();
 
-  // A page under a link belongs to it: an agent's page to Agents, a task's page to Tasks.
+  // A page under a link belongs to it: an agent's page to Browse agents, a task's page to Tasks, a
+  // provider's page to Providers.
   pathname.current = "/agents/alice.near";
   const agent = render(<Nav />);
-  expect(current()).toEqual(["Agents"]);
+  expect(current()).toEqual(["Browse agents"]);
   agent.unmount();
+
+  pathname.current = "/providers/acme.near";
+  const provider = render(<Nav />);
+  expect(current()).toEqual(["Providers"]);
+  provider.unmount();
 
   pathname.current = "/tasks/7";
   const task = render(<Nav />);
   expect(current()).toEqual(["Marketplace"]);
   task.unmount();
 
-  // Adding an agent is part of My agents.
+  // Adding an agent has a link of its own, the longest that fits: My agents is not marked too.
   pathname.current = "/my-agents/new";
   const adding = render(<Nav />);
-  expect(current()).toEqual(["My agents"]);
+  expect(current()).toEqual(["Add an agent"]);
   adding.unmount();
+
+  pathname.current = "/my-agents";
+  const mine = render(<Nav />);
+  expect(current()).toEqual(["My agents"]);
+  mine.unmount();
 
   pathname.current = "/wallet";
   render(<Nav />);

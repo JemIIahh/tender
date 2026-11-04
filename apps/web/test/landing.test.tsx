@@ -40,8 +40,20 @@ test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () =>
   expect(screen.getByRole("link", { name: /Explore tasks/ }).getAttribute("href")).toBe("/tasks");
   expect(screen.getByRole("link", { name: /Explore agents/ }).getAttribute("href")).toBe("/agents");
 
+  expect(hrefs("See providers")).toEqual(["/providers"]);
+  expect(hrefs("Add an agent")).toEqual(["/my-agents/new"]);
+
   // Every link stays in the app, on a page that exists.
-  const pages = new Set(["/", "/tasks", "/agents", "/post", "/wallet", "/telegram"]);
+  const pages = new Set([
+    "/",
+    "/tasks",
+    "/agents",
+    "/post",
+    "/wallet",
+    "/telegram",
+    "/providers",
+    "/my-agents/new",
+  ]);
   for (const link of screen.getAllByRole("link")) {
     expect(pages.has(link.getAttribute("href") ?? ""), link.textContent ?? "").toBe(true);
   }
@@ -77,4 +89,58 @@ test("landing_says_a_pick_pays_the_platform_fee_and_names_no_rate", () => {
   expect(text).not.toMatch(/only to a winner/i);
   // The contract's owner can change the fee, so the page states no rate.
   expect(text).not.toMatch(/\d\s*(%|percent|bps)/i);
+});
+
+test("landing_has_four_ways_in_and_providers_are_one", () => {
+  apiDown();
+  render(<Landing />);
+
+  const roles = screen.getByRole("heading", { name: "Four ways in >" }).closest("section");
+  const cards = [...(roles?.querySelectorAll("ul > li:has(> h3)") ?? [])];
+  expect(cards.map((card) => card.querySelector("h3")?.textContent)).toEqual([
+    "Posters",
+    "Agents",
+    "Verifiers",
+    "Providers (ASPs)",
+  ]);
+  const providers = cards[3] as HTMLElement;
+  expect([...providers.querySelectorAll("ul > li")].map((line) => line.textContent)).toEqual([
+    ">Run a fleet of agents under your account.",
+    ">Each agent bonds and earns on its own record.",
+    ">Posters can hire your agents directly.",
+  ]);
+  expect(providers.querySelector("a")?.getAttribute("href")).toBe("/providers");
+});
+
+test("landing_shows_a_fleet_and_says_what_an_asp_is_the_first_time", () => {
+  apiDown();
+  const { container } = render(<Landing />);
+
+  const fleet = screen.getByRole("heading", { level: 2, name: "Run a fleet." }).closest("section");
+  expect(fleet).toBeTruthy();
+  // The first mention of a provider on the page spells it out, and it comes before the roles.
+  const text = container.textContent ?? "";
+  const first = text.search(/provider|ASP/);
+  expect(text.slice(first - "agent service ".length)).toMatch(/^agent service provider \(ASP\)/);
+  expect(first).toBeLessThan(text.indexOf("Four ways in"));
+  // The sub-account guarantee, in a line.
+  expect(fleet?.textContent).toContain(
+    "NEAR lets only you.near create its sub-accounts, so the link can’t be faked.",
+  );
+
+  // The art moves (a canvas, with no figures in it), and the names beside it are decoration that
+  // a sentence says again for a screen reader.
+  expect(fleet?.querySelector('[data-testid="art-fleet"]')).toBeTruthy();
+  const agents = [...(fleet?.querySelectorAll('[data-testid="fleet-agent"]') ?? [])];
+  expect(agents.map((agent) => agent.textContent)).toEqual([
+    "writer.you.nearBondRecord",
+    "coder.you.nearBondRecord",
+    "analyst.you.nearBondRecord",
+  ]);
+  expect(agents[0]?.closest('[aria-hidden="true"]')).toBeTruthy();
+  expect(fleet?.querySelector(".sr-only")?.textContent).toContain(
+    "you.near runs writer.you.near, coder.you.near and analyst.you.near",
+  );
+  // No made-up figures: the fleet shows no amounts, counts or rates.
+  expect(fleet?.textContent).not.toMatch(/\d/);
 });

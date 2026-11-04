@@ -2,13 +2,26 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import type { ReactNode } from "react";
+import type { FocusEvent, PointerEvent, ReactNode } from "react";
 
 // Every page of the app, in the groups of the sidebar (components/AppShell.tsx), so that a task
 // that adds a page does not have to touch the shell. Until it does, its link leads to Next's own
 // "not found" page.
+//
+// From laptop width up the sidebar can be a narrow rail of icons (lib/sidebar.ts). The rail's look
+// is all CSS, on the `rail:` variant: each link keeps its icon where it was, its words fade out,
+// and a group's title gives way to a line. A link's name is its label in either state.
 
-type Icon = "market" | "post" | "agents" | "mine" | "earnings" | "wallet" | "telegram";
+type Icon =
+  | "market"
+  | "post"
+  | "browse"
+  | "providers"
+  | "add"
+  | "mine"
+  | "earnings"
+  | "wallet"
+  | "telegram";
 
 interface Item {
   href: string;
@@ -17,18 +30,20 @@ interface Item {
 }
 
 const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = [
+  { title: null, items: [{ href: "/tasks", label: "Marketplace", icon: "market" }] },
+  { title: "Tasks", items: [{ href: "/post", label: "Post a task", icon: "post" }] },
   {
-    title: null,
+    title: "Agents",
     items: [
-      { href: "/tasks", label: "Marketplace", icon: "market" },
-      { href: "/agents", label: "Agents", icon: "agents" },
+      { href: "/agents", label: "Browse agents", icon: "browse" },
+      { href: "/providers", label: "Providers", icon: "providers" },
+      { href: "/my-agents/new", label: "Add an agent", icon: "add" },
+      { href: "/my-agents", label: "My agents", icon: "mine" },
     ],
   },
-  { title: "Tasks", items: [{ href: "/post", label: "Post a task", icon: "post" }] },
   {
     title: "Account",
     items: [
-      { href: "/my-agents", label: "My agents", icon: "mine" },
       { href: "/earnings", label: "Earnings", icon: "earnings" },
       { href: "/wallet", label: "Wallet", icon: "wallet" },
       { href: "/telegram", label: "Telegram", icon: "telegram" },
@@ -36,9 +51,16 @@ const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = 
   },
 ];
 
-/** Whether `pathname` is the page `href` leads to, or a page under it. */
-function isCurrent(href: string, pathname: string): boolean {
-  return pathname === href || pathname.startsWith(`${href}/`);
+const HREFS = GROUPS.flatMap((group) => group.items.map((item) => item.href));
+
+/**
+ * The link of the page you are on: the one whose page `pathname` is, or is under, and of those the
+ * longest, so that adding an agent (`/my-agents/new`) is "Add an agent" and not "My agents" too.
+ */
+export function currentHref(pathname: string): string | undefined {
+  return HREFS.filter((href) => pathname === href || pathname.startsWith(`${href}/`)).sort(
+    (a, b) => b.length - a.length,
+  )[0];
 }
 
 /** The small line drawings beside the links: decoration, the words are the links' names. */
@@ -57,10 +79,27 @@ const ICONS: Record<Icon, ReactNode> = {
       <path d="M9.3 4.6l2.1 2.1" />
     </>
   ),
-  agents: (
+  browse: (
     <>
-      <circle cx="8" cy="5.5" r="2.6" />
-      <path d="M3 13.5c.6-2.6 2.6-4 5-4s4.4 1.4 5 4" />
+      <circle cx="7" cy="7" r="4.3" />
+      <path d="M10.2 10.2l3.3 3.3" />
+    </>
+  ),
+  // A provider and the agents under it: one account above, three below, joined.
+  providers: (
+    <>
+      <rect x="5.6" y="1.8" width="4.8" height="3.6" rx="1" />
+      <path d="M8 5.4v2.4M3.4 10V7.8h9.2V10M8 7.8V10" />
+      <circle cx="3.4" cy="12.2" r="1.7" />
+      <circle cx="8" cy="12.2" r="1.7" />
+      <circle cx="12.6" cy="12.2" r="1.7" />
+    </>
+  ),
+  add: (
+    <>
+      <circle cx="6.5" cy="5.4" r="2.5" />
+      <path d="M2 13.5c.5-2.4 2.3-3.9 4.5-3.9 1 0 1.9.3 2.6.8" />
+      <path d="M12.5 9.2v4.6M10.2 11.5h4.6" />
     </>
   ),
   mine: (
@@ -102,28 +141,57 @@ function NavIcon({ icon }: { icon: Icon }) {
   );
 }
 
-/** The app's pages, grouped as the sidebar shows them, with the one you are on marked. */
-export function Nav() {
-  const pathname = usePathname();
+/** What a link does to show its name beside it, while the sidebar is the rail (AppShell). */
+export interface TipHandlers {
+  onPointerEnter: (event: PointerEvent<HTMLElement>) => void;
+  onPointerLeave: () => void;
+  onFocus: (event: FocusEvent<HTMLElement>) => void;
+  onBlur: () => void;
+}
+
+/** How the words of the rail fade: with the width, and at once when motion is not wanted. */
+const FADE = "transition-opacity duration-200 motion-reduce:transition-none";
+
+/**
+ * The app's pages, grouped as the sidebar shows them, with the one you are on marked. `tip` gives
+ * each link what it needs to show its name in a tooltip on the rail.
+ */
+export function Nav({ tip }: { tip?: (label: string) => TipHandlers } = {}) {
+  const current = currentHref(usePathname());
   return (
-    <nav aria-label="Main" className="grid gap-6">
+    // One column that may be narrower than the words in it (`grid-cols-1` is minmax(0, 1fr)): on
+    // the rail a link is as wide as the rail, and the words it holds are cut off, not the rail.
+    <nav aria-label="Main" className="grid grid-cols-1 gap-6">
       {GROUPS.map((group) => (
-        <div key={group.title ?? "top"} className="grid gap-1">
+        <div key={group.title ?? "top"} className="grid grid-cols-1 gap-1">
           {group.title === null ? null : (
-            <p className="px-3 pb-1 font-mono text-[10.5px] tracking-[0.16em] text-muted uppercase">
-              {group.title}
-            </p>
+            // On the rail the title gives way to a line, midway between the groups. The title keeps
+            // its height, so that no icon moves up or down, and its words stay for a screen
+            // reader, which reads the group by them.
+            <div className="relative overflow-hidden">
+              <p
+                className={`px-3 pb-1 font-mono text-[10.5px] tracking-[0.16em] whitespace-nowrap text-muted uppercase ${FADE} lg:rail:opacity-0`}
+              >
+                {group.title}
+              </p>
+              <span
+                aria-hidden="true"
+                className={`absolute inset-x-1.5 top-0 hidden h-px bg-line opacity-0 lg:block ${FADE} lg:rail:opacity-100`}
+              />
+            </div>
           )}
-          <ul className="grid gap-1">
+          <ul className="grid grid-cols-1 gap-1">
             {group.items.map(({ href, label, icon }) => (
               <li key={href}>
                 <Link
                   href={href}
-                  aria-current={isCurrent(href, pathname) ? "page" : undefined}
-                  className="flex min-h-10 items-center gap-3 rounded-xl px-3 text-[15px] text-muted transition-colors hover:bg-raised/60 hover:text-bone motion-reduce:transition-none aria-[current=page]:bg-raised aria-[current=page]:text-bone"
+                  aria-label={label}
+                  aria-current={href === current ? "page" : undefined}
+                  {...tip?.(label)}
+                  className="flex min-h-10 items-center gap-3 overflow-hidden rounded-xl px-3 text-[15px] text-muted transition-colors hover:bg-raised/60 hover:text-bone motion-reduce:transition-none aria-[current=page]:bg-raised aria-[current=page]:text-bone"
                 >
                   <NavIcon icon={icon} />
-                  {label}
+                  <span className={`whitespace-nowrap ${FADE} lg:rail:opacity-0`}>{label}</span>
                 </Link>
               </li>
             ))}
