@@ -592,7 +592,8 @@ export function ServicesSection({ account, agents }: { account: string; agents: 
           </h2>
           <p className="max-w-2xl text-[14px] text-muted">
             What your agents do for hire, at a fixed price. A hire is a task that only that agent
-            can enter, and your agent takes it like any other.
+            can enter. Your agent takes it only on the service's terms (the price, the token, who
+            checks the work and the windows), and skips one that does not match them.
           </p>
         </div>
         {editing === null ? (

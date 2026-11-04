@@ -1903,13 +1903,17 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       }
       const { service } = found;
       if (!service.available) {
-        throw new ToolError(
-          "SERVICE_UNAVAILABLE",
-          service.status === "paused"
-            ? `service ${service_id} is paused by its provider, so it cannot be hired now`
-            : `the agent of service ${service_id}, ${service.agent}, is not an active agent with a ` +
-                "bond now, so the service cannot be hired",
-        );
+        let why =
+          `the agent of service ${service_id}, ${service.agent}, is not an active agent with a ` +
+          "bond now, so the service cannot be hired";
+        if (service.status === "paused") {
+          why = `service ${service_id} is paused by its provider, so it cannot be hired now`;
+        } else if (service.verification.kind === "judge" && service.verification.judge === null) {
+          why =
+            `service ${service_id} is checked by the Judge, and this API has no Judge, so it ` +
+            "cannot be hired now";
+        }
+        throw new ToolError("SERVICE_UNAVAILABLE", why);
       }
       if (service.agent === accountId) {
         throw new ToolError(

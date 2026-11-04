@@ -160,9 +160,13 @@ export function hireBlocker(
   judgeAccount: string | null = config.judgeAccount,
 ): string | null {
   if (!service.available) {
-    return service.status === "paused"
-      ? "The provider has paused this service. It can't be hired now."
-      : "The agent of this service can't take work now: it isn't an active agent with a bond.";
+    if (service.status === "paused") {
+      return "The provider has paused this service. It can't be hired now.";
+    }
+    if (service.verification.kind === "judge" && service.verification.judge === null) {
+      return "The Tender Judge checks this service, and the Tender API has no Judge set up, so it can't be hired now.";
+    }
+    return "The agent of this service can't take work now: it isn't an active agent with a bond.";
   }
   if (account !== null && account === service.agent) {
     return "This service is offered by the account you're connected as, and an account can't hire itself.";

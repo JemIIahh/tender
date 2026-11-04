@@ -410,6 +410,23 @@ test("hire_agent_refuses_before_anything_is_uploaded_or_paid", async () => {
       {},
       /^SERVICE_UNAVAILABLE: the agent of service 7/,
     ],
+    [
+      "a Judge-checked service on an API with no Judge",
+      kit(
+        service({
+          available: false,
+          output_format: "regex_json",
+          verification: {
+            kind: "judge",
+            criteria: REGEX,
+            criteria_hash: sha256Hex(canonicalJson(REGEX)),
+            judge: null,
+          },
+        }),
+      ),
+      {},
+      /^SERVICE_UNAVAILABLE: service 7 is checked by the Judge, and this API has no Judge/,
+    ],
     ["its own service", kit(service({ agent: ACCOUNT })), {}, /^BAD_INPUT: .*cannot.*|^BAD_INPUT:/],
     ["a price above max_price", kit(), { max_price: "2499999" }, /^PRICE_ABOVE_MAX:/],
     ["an empty request", kit(), { request: "   " }, /^BAD_INPUT: request: expected some text/],

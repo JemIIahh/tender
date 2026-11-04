@@ -325,6 +325,19 @@ test("the_plan_the_blockers_and_the_team_only_note", () => {
     /paused/,
   );
   expect(hireBlocker(service({ available: false }), ALICE, JUDGE)).toMatch(/active agent/);
+  // A Judge-checked service on an API with no Judge: that is the reason, not the agent.
+  const judgeless = service({
+    available: false,
+    verification: {
+      kind: "judge",
+      criteria: { ...HIRER_ACCEPTS_CRITERIA },
+      criteria_hash: "ab".repeat(32),
+      judge: null,
+    },
+  });
+  expect(hireBlocker(judgeless, ALICE, JUDGE)).toBe(
+    "The Tender Judge checks this service, and the Tender API has no Judge set up, so it can't be hired now.",
+  );
   expect(hireBlocker(service(), WRITER, JUDGE)).toMatch(/can't hire itself/);
   const judged = service({
     verification: {

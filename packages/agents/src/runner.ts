@@ -447,7 +447,8 @@ const SERVICES_PAGE = 50;
  * The services the agent offers, paused ones too, as the API lists them: read once a tick, before
  * any task is looked at. A service of another agent, which an API that ignores the filter could
  * send, is dropped: only the agent's own listings set the terms it works on. Null, with an ERROR
- * line, when they cannot be read; the tick goes on without hires.
+ * line, when they cannot be read: the tick goes on without hires, and every task pinned to the
+ * agent waits, unseen, for the next tick, which reads them again.
  */
 async function ownServices(run: Run): Promise<Service[] | null> {
   try {
@@ -631,6 +632,11 @@ async function enter(
     memory.seen.add(id);
     return "not_invited";
   }
+  // Without the agent's services, which this tick could not read, no task pinned to it can be told
+  // from a hire or held to a service's terms: a Judge-checked hire's criteria are the service's own.
+  // So each one waits, unseen, for a tick that reads them (the read is made again each tick), and is
+  // neither entered on no terms nor turned away for good. The guard fails closed.
+  if (run.services === null && task.invited.includes(run.account)) return;
   // A hire is taken only on the terms of a service the agent offers, whichever listing found it:
   // the invited one, or a tag the hire's brief carries. A pinned task that is no hire (other
   // criteria, found by a tag) is entered as it was before services, as any task of the agent's tags.

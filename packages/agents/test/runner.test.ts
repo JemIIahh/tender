@@ -1540,6 +1540,50 @@ test("a_pinned_task_that_is_no_hire_is_entered_by_its_tag_as_before", async () =
   }
 });
 
+test("a_valid_hire_found_by_its_tag_and_by_its_invite_is_entered_once", async () => {
+  const h = await harness();
+  h.services = [offered()];
+  // The hire's brief carries the agent's tag, so both listings find it.
+  h.world.add(hire(5, { tags: ["regex"] }));
+
+  await h.tick();
+
+  expect(h.listTasks.mock.calls.map(([filter]) => filter)).toEqual([
+    { phase: "open", tag: "regex", limit: 50 },
+    { phase: "open", invited: ACCOUNT, limit: 50 },
+  ]);
+  expect(idsOf(h.commit)).toEqual([5n]);
+  expect(h.getTask).toHaveBeenCalledTimes(1);
+  expect(h.logs.filter((line) => line.includes("skipping"))).toEqual([]);
+});
+
+test("with_its_services_unread_the_agent_takes_no_pinned_task_and_takes_it_once_they_are_read", async () => {
+  const h = await harness();
+  h.services = [offered(), judged()];
+  // Found by the agent's tag: a hire the hirer checks, a hire the Judge checks (whose criteria are
+  // the service's own, so unknown without the services), and a pinned task that is no hire.
+  h.world.add(hire(5, { tags: ["regex"] }));
+  h.world.add(hire(6, { tags: ["regex"], verifier: JUDGE, criteriaHash: JUDGED_HASH }));
+  h.world.add({ id: 7, tags: ["regex"], invited: [OTHER, ACCOUNT], maxEntries: 2 });
+  h.world.add({ id: 1, tags: ["regex"] });
+  h.listServices.mockRejectedValueOnce(new ApiError(503, { error: "unavailable" }));
+
+  await h.tick();
+
+  // The open task goes on; every task pinned to the agent waits, unseen, and nothing is refused.
+  expect(idsOf(h.commit)).toEqual([1n]);
+  expect(h.listTasks).toHaveBeenCalledTimes(1);
+  expect(h.logs).toEqual([
+    "ERROR alice: reading its services failed (ApiError 503)",
+    "alice: committed to task 1 tx=commit-tx",
+  ]);
+
+  // The next tick reads the services again, and takes each on its terms.
+  await h.tick();
+  expect(h.listServices).toHaveBeenCalledTimes(2);
+  expect(idsOf(h.commit)).toEqual([1n, 5n, 6n, 7n]);
+});
+
 test("services_of_another_agent_set_no_terms_and_a_failed_read_takes_no_hire", async () => {
   // An API that ignores the agent filter sends another agent's service: it is dropped.
   const foreign = await harness();

@@ -163,6 +163,12 @@ test("a_hire_matches_a_service_only_on_its_terms", () => {
       "its windows are shorter than service 7's",
     ],
     [
+      // The reveal window alone a second short: the commit and pick windows are as listed.
+      { reveal_deadline: String(created + 899n * s), pick_deadline: String(created + 1_799n * s) },
+      {},
+      "its windows are shorter than service 7's",
+    ],
+    [
       { pick_deadline: String(created + 1_799n * s) },
       {},
       "its windows are shorter than service 7's",
