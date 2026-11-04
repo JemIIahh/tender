@@ -1,0 +1,24 @@
+{
+  "network": "testnet",
+  "contract": "tender.tender-dev-1104.testnet",
+  "tokens": {
+    "tusdc": "tusdc.tender-dev-1104.testnet",
+    "usdc": "3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af"
+  },
+  "accounts": {
+    "owner": "tender-dev-1104.testnet",
+    "tender": "tender.tender-dev-1104.testnet",
+    "treasury": "treasury.tender-dev-1104.testnet",
+    "judge": "judge.tender-dev-1104.testnet",
+    "keeper": "keeper.tender-dev-1104.testnet",
+    "tusdc": "tusdc.tender-dev-1104.testnet",
+    "poster": "poster.tender-dev-1104.testnet",
+    "analyst": "analyst.tender-dev-1104.testnet",
+    "coder": "coder.tender-dev-1104.testnet",
+    "extractor": "extractor.tender-dev-1104.testnet",
+    "lead": "lead.tender-dev-1104.testnet"
+  },
+  "wasmSha256": "5ec43a10812fb9b92f47ac09c3e3a7ab619104491aa00dcec05c9e6f51b62b36",
+  "deployHeight": "276165032",
+  "deployedAt": "2026-11-04T07:38:44.881Z"
+}
