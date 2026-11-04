@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative as relativePath, resolve } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import { deploymentsDirOverride, envDir, loadEnv, REPO_ROOT } from "./env";
 
@@ -107,7 +107,7 @@ test("load_env_reads_the_repository_root_by_default", () => {
   expect(existsSync(join(REPO_ROOT, "pnpm-workspace.yaml"))).toBe(true);
 });
 
-test("env_dir_is_the_repository_root_unless_tender_env_dir_names_another", () => {
+test("env_dir_is_the_repository_root_unless_tender_env_dir_names_another", async () => {
   for (const unset of [
     {},
     { TENDER_ENV_DIR: undefined },
@@ -117,13 +117,38 @@ test("env_dir_is_the_repository_root_unless_tender_env_dir_names_another", () =>
     expect(envDir(unset), JSON.stringify(unset)).toBe(REPO_ROOT);
     expect(deploymentsDirOverride(unset), JSON.stringify(unset)).toBeUndefined();
   }
-  expect(envDir({ TENDER_ENV_DIR: "/some/where" })).toBe("/some/where");
-  expect(deploymentsDirOverride({ TENDER_ENV_DIR: "/some/where" })).toBe("/some/where/deployments");
+  const dir = await dirWith({});
+  expect(envDir({ TENDER_ENV_DIR: dir })).toBe(dir);
+  expect(deploymentsDirOverride({ TENDER_ENV_DIR: dir })).toBe(join(dir, "deployments"));
   // A relative name is taken from the working directory, and the spaces around it are not part of it.
-  expect(envDir({ TENDER_ENV_DIR: " here/dir " })).toBe(resolve("here/dir"));
-  expect(deploymentsDirOverride({ TENDER_ENV_DIR: "here/dir" })).toBe(
-    join(resolve("here/dir"), "deployments"),
+  const relative = relativePath(process.cwd(), dir);
+  expect(envDir({ TENDER_ENV_DIR: ` ${relative} ` })).toBe(resolve(relative));
+  expect(deploymentsDirOverride({ TENDER_ENV_DIR: relative })).toBe(
+    join(resolve(relative), "deployments"),
   );
+});
+
+test("env_dir_throws_naming_the_variable_for_a_directory_that_does_not_exist", async () => {
+  const dir = await dirWith({ "a-file": "x" });
+  const refused: Record<string, string> = {
+    "a missing directory": join(dir, "missing"),
+    // A leading ~ is not the home directory: it is a directory of that name under the working one.
+    "a tilde": "~/tender-env-dir-that-is-not-there",
+    "a file": join(dir, "a-file"),
+    "a path under a file": join(dir, "a-file", "below"),
+  };
+  for (const [what, value] of Object.entries(refused)) {
+    const message = new RegExp(
+      `^TENDER_ENV_DIR names .+, which is not an existing directory: create it, and give an ` +
+        `absolute path \\(a leading ~ is not expanded\\)$`,
+    );
+    expect(() => envDir({ TENDER_ENV_DIR: value }), what).toThrow(message);
+    expect(() => deploymentsDirOverride({ TENDER_ENV_DIR: value }), what).toThrow(message);
+    // The default dir of `loadEnv` is the same check: it is never a silent "no files".
+    vi.stubEnv("TENDER_ENV_DIR", value);
+    expect(() => loadEnv("testnet"), what).toThrow(message);
+    vi.unstubAllEnvs();
+  }
 });
 
 test("load_env_reads_the_directory_the_process_names_in_tender_env_dir_when_given_no_dir", async () => {

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -193,13 +193,30 @@ function readEnvFile(path: string): Record<string, string> {
 
 /**
  * Where `.env` and `.env.deploy.<network>` are: the directory `TENDER_ENV_DIR` names (a relative
- * name is taken from the working directory), else the repository root. Empty counts as not set. A
- * run that must not see the files of the repository, such as a test's, points it at one of its own;
+ * name is taken from the working directory; a leading `~` is not expanded, so give an absolute
+ * path), else the repository root. Empty counts as not set. The directory must exist: a missing one
+ * throws, naming the variable, and does not read as a directory with no files. A run that must not
+ * see the files of the repository, such as a test's, points it at one of its own;
  * `scripts/lib/env.ts` reads the same variable the same way.
  */
 export function envDirOf(processEnv: Env): string {
   const set = (processEnv.TENDER_ENV_DIR ?? "").trim();
-  return set === "" ? REPO_ROOT : resolve(set);
+  if (set === "") return REPO_ROOT;
+  const path = resolve(set);
+  let isDirectory = false;
+  try {
+    isDirectory = statSync(path).isDirectory();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+  }
+  if (!isDirectory) {
+    throw new CliError(
+      "TENDER_ENV_DIR is not an existing directory: create it, and give an absolute path " +
+        "(a leading ~ is not expanded, and a relative path is taken from the working directory)",
+    );
+  }
+  return path;
 }
 
 /**

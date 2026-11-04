@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseEnv } from "node:util";
@@ -13,17 +13,37 @@ export const ENV_DIR_VARIABLE = "TENDER_ENV_DIR";
 /**
  * The directory that holds `.env`, `.env.deploy.<network>` and `deployments/`: the repository root,
  * unless `TENDER_ENV_DIR` of `processEnv` names another one (a relative name is taken from the
- * working directory). A value that is empty or only spaces counts as unset. A run that must not
- * see the files of the repository, such as a test's, points it at a directory of its own.
+ * working directory; a leading `~` is not expanded, so give an absolute path). A value that is
+ * empty or only spaces counts as unset. A run that must not see the files of the repository, such
+ * as a test's, points it at a directory of its own.
+ *
+ * The directory must exist: a missing one throws, naming the variable, instead of reading as a
+ * directory with no files (a typo would otherwise show up as a missing key, much later).
  *
  * Every script reads its files from here when it is not told a `dir` of its own, and `pnpm serve`
- * reads the indexer's `deployments/` from here too.
+ * reads the indexer's `deployments/` from here too. `pnpm deploy:testnet` and `scripts/keeper-key.ts`
+ * write into it as well, full-access keys among it.
  */
 export function envDir(
   processEnv: Readonly<Record<string, string | undefined>> = process.env,
 ): string {
   const set = (processEnv[ENV_DIR_VARIABLE] ?? "").trim();
-  return set === "" ? REPO_ROOT : resolve(set);
+  if (set === "") return REPO_ROOT;
+  const path = resolve(set);
+  let isDirectory = false;
+  try {
+    isDirectory = statSync(path).isDirectory();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+  }
+  if (!isDirectory) {
+    throw new Error(
+      `${ENV_DIR_VARIABLE} names ${path}, which is not an existing directory: create it, and ` +
+        "give an absolute path (a leading ~ is not expanded)",
+    );
+  }
+  return path;
 }
 
 /**

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative as relativePath, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ApiClient, ApiTimeoutError, KeyPair } from "@tender/client";
@@ -914,7 +914,7 @@ test("a_run_given_no_dir_reads_the_files_of_the_directory_tender_env_dir_names",
   });
 });
 
-test("env_dir_of_is_the_repository_root_unless_tender_env_dir_names_another", () => {
+test("env_dir_of_is_the_repository_root_unless_tender_env_dir_names_another", async () => {
   for (const unset of [
     {},
     { TENDER_ENV_DIR: undefined },
@@ -923,8 +923,35 @@ test("env_dir_of_is_the_repository_root_unless_tender_env_dir_names_another", ()
   ]) {
     expect(resolve(envDirOf(unset)), JSON.stringify(unset)).toBe(resolve(ROOT));
   }
-  expect(envDirOf({ TENDER_ENV_DIR: "/some/where" })).toBe("/some/where");
-  expect(envDirOf({ TENDER_ENV_DIR: " here/dir " })).toBe(resolve("here/dir"));
+  const dir = await dirWith();
+  expect(envDirOf({ TENDER_ENV_DIR: dir })).toBe(dir);
+  const relative = relativePath(process.cwd(), dir);
+  expect(envDirOf({ TENDER_ENV_DIR: ` ${relative} ` })).toBe(resolve(relative));
+});
+
+test("a_run_stops_naming_tender_env_dir_when_it_is_not_an_existing_directory", async () => {
+  const dir = await dirWith({ "a-file": "x" });
+  const sentence =
+    "TENDER_ENV_DIR is not an existing directory: create it, and give an absolute path " +
+    "(a leading ~ is not expanded, and a relative path is taken from the working directory)";
+  for (const value of [
+    join(dir, "missing"),
+    "~/tender-env-dir-that-is-not-there",
+    join(dir, "a-file"),
+  ]) {
+    expect(() => envDirOf({ TENDER_ENV_DIR: value }), value).toThrow(new CliError(sentence));
+    const err: string[] = [];
+    const code = await main(ARGS, {
+      createApi: vi.fn(),
+      env: { ...ENV, TENDER_ENV_DIR: value },
+      out: () => undefined,
+      err: (text) => err.push(text),
+      signal: new AbortController().signal,
+    });
+    // No file was read instead: the run ends at once, with the one sentence and no value of ENV.
+    expect(code, value).toBe(1);
+    expect(err, value).toEqual([`run-agent: ${sentence}`]);
+  }
 });
 
 test("read_run_config_trims_the_values_and_reads_the_model_for_the_llm_solver_only", () => {
