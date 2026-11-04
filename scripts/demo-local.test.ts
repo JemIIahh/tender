@@ -49,6 +49,13 @@ test("keep_prints_the_mcp_servers_environment_as_a_shell_takes_it", () => {
     keyFile: "/tmp/tender demo/keep/lead.json",
     stateDir: "/tmp/tender demo/mcp-state",
     holds: "999999.00 tUSDC in its wallet, and NEAR for gas and storage",
+    open: {
+      id: "2",
+      title: "Demo: count the divisors of eight numbers",
+      commitUntil: "2026-11-05T00:40:00.000Z",
+      revealUntil: "2026-11-05T01:10:00.000Z",
+      seed: "demo-divisor-counts",
+    },
   });
   expect(lines[0]).toMatch(/^KEPT the local chain and the services, until Ctrl-C\./);
   const exports = lines.filter((line) => line.startsWith("  export "));
@@ -63,6 +70,12 @@ test("keep_prints_the_mcp_servers_environment_as_a_shell_takes_it", () => {
     "export TENDER_PRIVATE_KEY",
   ]);
   expect(lines).toContain("  pnpm --silent tsx packages/mcp/bin/tender-mcp.ts");
+  expect(lines).toContain(
+    'OPEN task=2 "Demo: count the divisors of eight numbers" commits until ' +
+      "2026-11-05T00:40:00.000Z, reveals until 2026-11-05T01:10:00.000Z",
+  );
+  expect(lines.at(-1)).toContain("Task 2 is open for it");
+  expect(lines.at(-1)).toContain("scripts/demo-seeds/demo-divisor-counts");
   // The key itself is never in the lines: they name its file.
   expect(lines.join("\n")).not.toMatch(/ed25519:/);
   expect(lines.at(-1)).toContain("Its full-access key is in /tmp/tender demo/keep/lead.json");

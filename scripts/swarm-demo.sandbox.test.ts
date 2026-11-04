@@ -1,5 +1,9 @@
 import { spawn } from "node:child_process";
-import { expect, test } from "vitest";
+import { mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterAll, expect, test } from "vitest";
 import { REPO_ROOT } from "./lib/env";
 
 // `scripts/swarm-demo.ts` run the way a person runs it, on a local chain, from start to its last
@@ -135,6 +139,64 @@ test(
     expect(margin.match[1]).toBe("3.50");
     expect(Number(margin.match[1])).toBeGreaterThan(0);
     expect(lines.indexOf("SWARM OK")).toBeGreaterThan(margin.at);
+  },
+  TIMEOUT_MS,
+);
+
+// A Ctrl-C of `pnpm exec tsx scripts/swarm-demo.ts`, as a terminal sends it: a SIGINT to the process
+// group of tsx's command line, with an OS temp dir of the test's own. The demo stops what it started,
+// removes its temp dir and exits with 130, however busy it was: tsx's relay of the signal cannot kill
+// it past its stops, since it runs under a supervisor of its own (`scripts/lib/own-process.ts`).
+
+const TSX_CLI = fileURLToPath(import.meta.resolve("tsx/cli"));
+const ownTmp = realpathSync(mkdtempSync(join(tmpdir(), "tender-swarm-test-")));
+let group: number | undefined;
+
+afterAll(() => {
+  if (group !== undefined) {
+    try {
+      process.kill(-group, "SIGKILL");
+    } catch {
+      // Gone already.
+    }
+  }
+  rmSync(ownTmp, { recursive: true, force: true });
+});
+
+test(
+  "ctrl_c_stops_the_swarm_demo_and_leaves_no_temp_dir",
+  async () => {
+    const child = spawn(process.execPath, [TSX_CLI, "scripts/swarm-demo.ts"], {
+      cwd: REPO_ROOT,
+      env: { ...process.env, TMPDIR: ownTmp },
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+    group = child.pid;
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    const closed = new Promise<number | null>((resolve) => child.on("close", resolve));
+    const left = () => readdirSync(ownTmp).filter((name) => name.startsWith("tender-swarm-"));
+
+    // The chain and the services are up and the agents registered: the busiest part is next.
+    const giveUpAt = Date.now() + 300_000;
+    while (!/^REGISTERED /m.test(stdout)) {
+      if (Date.now() > giveUpAt) throw new Error(`no REGISTERED line:\n${stdout}\n${stderr}`);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    expect(left()).toHaveLength(1);
+    if (child.pid !== undefined) process.kill(-child.pid, "SIGINT");
+    const code = await closed;
+    expect(stderr).toContain("swarm: interrupted by SIGINT; stopped what it started");
+    expect(stdout).not.toContain("SWARM OK");
+    expect(code, stderr).toBe(130);
+    expect(left()).toEqual([]);
   },
   TIMEOUT_MS,
 );

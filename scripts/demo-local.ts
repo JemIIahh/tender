@@ -1,8 +1,7 @@
 import "./lib/node-check";
 import { rmSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { format, parseArgs, parseEnv } from "node:util";
@@ -33,7 +32,7 @@ import {
 import { JsonRpcProvider, KeyPair, type KeyPairString } from "near-api-js";
 import { addRoleKey } from "./keeper-key";
 import { REPO_ROOT } from "./lib/env";
-import { inOwnProcess } from "./lib/own-process";
+import { demoDir, inOwnProcess } from "./lib/own-process";
 import { killStartedProcesses } from "./lib/process-tree";
 import { type SeedWindows, seed } from "./seed";
 import { redact, type Services, startServices } from "./serve";
@@ -113,6 +112,10 @@ import { redact, type Services, startServices } from "./serve";
  * draft left there by an earlier run would be taken for this run's own, its agent would skip the
  * task, and the demo would fail. Run again, the demo finds nothing of the last run.
  *
+ * The demo runs in a child process that a supervisor starts, passes the stop signals to and cleans
+ * up after (`scripts/lib/own-process.ts`): under `pnpm demo:local`, tsx's relay of a Ctrl-C could
+ * otherwise kill it with SIGKILL, past its stops.
+ *
  * `DEMO OK` is the last line, and it comes only after everything the demo started has stopped and
  * its files are gone, and only if the facts the scenario rests on held: the Judge made the pick,
  * alice won with 100, bob scored lower, the reward was paid out whole, and the scorecard is served
@@ -128,9 +131,10 @@ import { redact, type Services, startServices } from "./serve";
  * up until Ctrl-C (or another stop signal), for the local MCP server of the README's "Use it from an
  * agent". The scripted agents stop. `lead`, an account of the local chain that the scenario does not
  * use and the API does not list as the team's, registers as an agent with the bond, and its key goes
- * to a file of mode 0600 in the temp dir. The demo prints the environment of the MCP server (the
+ * to a file of mode 0600 in the temp dir. The poster posts a second demo task, `KEPT_SEED`, open for
+ * half an hour, for that agent to enter. The demo prints the environment of the MCP server (the
  * network, the contract, the RPC URL, the API URL, the Judge, the account, a state dir in the temp
- * dir, and a line that reads the key from its file) and waits. A key of a chain that lives only on
+ * dir, and a line that reads the key from its file), the open task (`OPEN task=<id> ...`) and waits. A key of a chain that lives only on
  * this machine, and only until the demo stops, is no secret, but it is not printed all the same:
  * the line names its file. The stop is the end the demo waits for: everything stops, the temp dir
  * with the key goes, and `DEMO OK` comes last, with exit code 0. A stop before the scenario is over
@@ -146,6 +150,22 @@ import { redact, type Services, startServices } from "./serve";
  */
 const SEED = "demo-room-code-regex";
 const SEEDS_DIR = join(REPO_ROOT, "scripts", "demo-seeds");
+
+/** The start of the name of the run's temp dir, in the OS temp dir. */
+const DIR_PREFIX = "tender-demo-";
+
+/**
+ * The task `--keep` leaves open for the agent of the MCP server: another of the demo set (its answer
+ * is in the open, in `scripts/demo-seeds/`), which the Judge scores by itself, with no model. Its
+ * windows leave half an hour to connect an agent and commit, and as long to reveal.
+ */
+const KEPT_SEED = "demo-divisor-counts";
+const KEPT_WINDOWS: SeedWindows = {
+  commit_secs: 1_800,
+  reveal_secs: 1_800,
+  pick_secs: 600,
+  fallback_secs: 600,
+};
 
 /** The first line the demo prints, before any agent starts. */
 const BANNER = "Scripted demo agents run by the Tender team (offline solvers)";
@@ -576,8 +596,14 @@ export async function startUp(
   return { services, reader };
 }
 
-/** Posts the seed as the poster, and gives the id of the task. */
-async function postSeed(h: Harness, chain: LocalChain, services: Services): Promise<bigint> {
+/** Posts the demo seed `slug` (`SEED` by default) as the poster, and gives the id of the task. */
+async function postSeed(
+  h: Harness,
+  chain: LocalChain,
+  services: Services,
+  slug: string = SEED,
+  windows: SeedWindows = WINDOWS,
+): Promise<bigint> {
   const { poster, judge } = chain.accounts;
   const client = new TenderClient({
     network: chain.network,
@@ -592,7 +618,7 @@ async function postSeed(h: Harness, chain: LocalChain, services: Services): Prom
     signal: h.signal,
   });
   const seeded = await limited(
-    `posting the seed ${SEED}`,
+    `posting the seed ${slug}`,
     STEP_MS,
     seed({
       client,
@@ -604,18 +630,18 @@ async function postSeed(h: Harness, chain: LocalChain, services: Services): Prom
       seedsDir: SEEDS_DIR,
       // The demo set keeps its held-out checks beside the briefs; nothing is read from outside it.
       heldoutDir: SEEDS_DIR,
-      only: [SEED],
-      windows: WINDOWS,
+      only: [slug],
+      windows,
       log: h.log,
     }),
     h.signal,
   );
   const posted = seeded.filter((task) => task.status === "posted");
   const [task] = posted;
-  if (task === undefined || posted.length !== 1 || task.slug !== SEED) {
+  if (task === undefined || posted.length !== 1 || task.slug !== slug) {
     const got = seeded.map((one) => `${one.slug} ${one.status} as task ${one.taskId}`).join(", ");
     throw new DemoError(
-      `expected the seed ${SEED} to be posted once, but got: ${got || "nothing"}`,
+      `expected the seed ${slug} to be posted once, but got: ${got || "nothing"}`,
     );
   }
   return task.taskId;
@@ -717,6 +743,8 @@ export interface Kept {
   stateDir: string;
   /** What the account holds, in words, for the line about it. */
   holds: string;
+  /** The open task for the account to enter, with its deadlines as ISO 8601 times. */
+  open: { id: string; title: string; commitUntil: string; revealUntil: string; seed: string };
 }
 
 /**
@@ -739,17 +767,23 @@ export function keptLines(kept: Kept): string[] {
     `  export TENDER_STATE_DIR=${shellWord(kept.stateDir)}`,
     `  export TENDER_PRIVATE_KEY="$(${readKey})"`,
     "  pnpm --silent tsx packages/mcp/bin/tender-mcp.ts",
+    `OPEN task=${kept.open.id} "${kept.open.title}" commits until ${kept.open.commitUntil}, ` +
+      `reveals until ${kept.open.revealUntil}`,
     `${kept.account} is an account of this local chain, registered as an agent with the bond, and ` +
       `holds ${kept.holds}. Its full-access key is in ${kept.keyFile} (a key of this local chain ` +
-      "only). The chain has the settled demo task, and the account can post tasks of its own; it " +
-      "cannot enter its own. Ctrl-C stops the chain and the services and removes these files.",
+      `only). Task ${kept.open.id} is open for it, posted by the team's poster for the Judge to ` +
+      "score: enter it with commit_result, and reveal_result once its commit window has closed. Its " +
+      `answer is in the open, in scripts/demo-seeds/${kept.open.seed} (a demo task). The account ` +
+      "can also post tasks of its own, and cannot enter those. Ctrl-C stops the chain and the " +
+      "services and removes these files.",
   ];
 }
 
 /**
- * `--keep`: the scripted agents stop, `KEPT_AGENT` registers as an agent with the bond, its key is
- * written to a file in `dir`, the lines for the MCP server are printed, and the demo waits to be
- * stopped. A failure of the services in the meantime ends it, as a failure.
+ * `--keep`: the scripted agents stop, `KEPT_AGENT` registers as an agent with the bond, the poster
+ * posts `KEPT_SEED` with `KEPT_WINDOWS` for it to enter, its key is written to a file in `dir`, the
+ * lines for the MCP server are printed, and the demo waits to be stopped. A failure of the services
+ * in the meantime ends it, as a failure.
  */
 async function keepUp(
   h: Harness,
@@ -777,6 +811,18 @@ async function keepUp(
       ? ready(listed)
       : waiting(`the API does not list ${KEPT_AGENT} as active yet`);
   });
+
+  // A task for that agent to enter, open long enough to connect it and work; the Judge scores it.
+  const openId = await postSeed(h, chain, services, KEPT_SEED, KEPT_WINDOWS);
+  const open = await until(h, `task ${openId} open and accepted`, STEP_MS, async () => {
+    const found = await readTask(reader, openId);
+    return found?.task.judge_status === "accepted"
+      ? ready(found.task)
+      : waiting(
+          `the Judge's status of task ${openId} is ${found?.task.judge_status ?? "none yet"}`,
+        );
+  });
+  const isoOf = (ns: string) => new Date(msOf(ns)).toISOString();
 
   const keepDir = join(dir, "keep");
   await mkdir(keepDir, { mode: 0o700 });
@@ -821,6 +867,13 @@ async function keepUp(
     keyFile,
     stateDir: join(dir, "mcp-state"),
     holds: `${amountOf(wallet, chain.tokenId)} in its wallet, and NEAR for gas and storage`,
+    open: {
+      id: open.id,
+      title: open.title ?? KEPT_SEED,
+      commitUntil: isoOf(open.commit_deadline),
+      revealUntil: isoOf(open.reveal_deadline),
+      seed: KEPT_SEED,
+    },
   })) {
     say(line);
   }
@@ -862,7 +915,8 @@ async function demo(h: Harness, options: DemoOptions = {}): Promise<void> {
   // The demo's own files (keys, deployments folder, drafts, the node's home) are all in here, new
   // for each run. The path is absolute, so that the removal as the process ends does not depend on
   // where the process is by then.
-  const dir = resolve(await mkdtemp(join(tmpdir(), "tender-demo-")));
+  // The supervisor makes it, and removes it too if this process is killed past its stops (`demoDir`).
+  const dir = await demoDir(DIR_PREFIX);
   h.onExit("remove the temp files", () => rm(dir, { recursive: true, force: true }));
   // Also when the demo is cut short before its steps have run (a second Ctrl-C). A node that was
   // killed a moment ago can still be writing, so the removal tries again.
@@ -1213,9 +1267,16 @@ if (import.meta.main) {
   } catch (error) {
     process.stderr.write(`demo: ${messageOf(error)}\n`);
   }
-  // Under `pnpm demo:local`, tsx's relay of a Ctrl-C can end the demo with SIGKILL, past its stops:
-  // the demo runs in a process of its own, and this one passes the signals on (`inOwnProcess`).
-  const relayed = options === undefined ? 2 : await inOwnProcess(fileURLToPath(import.meta.url));
+  // The demo runs in a child process; this one passes the stop signals on and cleans up after it
+  // (`inOwnProcess`), so that tsx's relay of a Ctrl-C cannot kill it past its stops.
+  const relayed =
+    options === undefined
+      ? 2
+      : await inOwnProcess({
+          script: fileURLToPath(import.meta.url),
+          prefix: DIR_PREFIX,
+          name: "demo",
+        });
   const code = relayed ?? (await main(demoScript(options)));
   await flush(process.stdout);
   await flush(process.stderr);
