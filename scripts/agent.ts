@@ -1,7 +1,8 @@
-import { chmod, mkdir, open, readdir, readFile, rename, stat } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { chmod, mkdir, open, readdir, readFile, realpath, rename, stat } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { parseArgs } from "node:util";
+import { parseArgs, promisify } from "node:util";
 import {
   type AgentProfile,
   type RegistrationPlan,
@@ -71,7 +72,6 @@ const NAME = /^[a-z][a-z0-9-]{0,31}$/;
 
 /** Where the keys go: git-ignored (`.gitignore` has `.tender/`), so no key lands in a commit. */
 const KEYS_DIR = join(REPO_ROOT, ".tender", "agents");
-const IGNORED_ROOT = join(REPO_ROOT, ".tender");
 
 // ---- The key file -----------------------------------------------------------------------------
 
@@ -96,18 +96,78 @@ function nameOf(value: string | undefined): string {
   return value;
 }
 
+const run = promisify(execFile);
+
 /**
- * The directory the keys are in. A directory inside the repository must be under `.tender/`, which
- * git ignores: a key must never be somewhere that a `git add` can reach.
+ * `path` with every symlink followed and the case of every part that exists as the disk spells it
+ * (`realpath` does both, on macOS too); a part that does not exist yet stays as it was written.
  */
-function keysDirOf(dir: string | undefined): string {
-  const path = resolve(dir ?? KEYS_DIR);
-  const inRepo = relative(REPO_ROOT, path);
-  const inside = !inRepo.startsWith("..") && !inRepo.startsWith("/");
-  if (inside && relative(IGNORED_ROOT, path).startsWith("..")) {
+async function settle(path: string): Promise<string> {
+  const missing: string[] = [];
+  for (let at = path; ; at = dirname(at)) {
+    try {
+      return join(await realpath(at), ...missing.reverse());
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if ((code !== "ENOENT" && code !== "ENOTDIR") || dirname(at) === at) throw error;
+      missing.push(basename(at));
+    }
+  }
+}
+
+/** Whether the file system of `path` takes `/Users/x` and `/users/X` for one place. */
+async function ignoresCase(path: string): Promise<boolean> {
+  const swapped = path.replace(/[a-z]/gi, (c) =>
+    c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase(),
+  );
+  if (swapped === path) return false;
+  try {
+    const [a, b] = await Promise.all([stat(path), stat(swapped)]);
+    return a.ino === b.ino && a.dev === b.dev;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `inner` is `outer` or below it, by name, in the case-folded spelling if `fold` says so. */
+function isUnder(outer: string, inner: string, fold: boolean): boolean {
+  const way = fold ? relative(outer.toLowerCase(), inner.toLowerCase()) : relative(outer, inner);
+  // A name that merely starts with two dots (`..keys`) is below, and only `..` and `../...` is not.
+  return way !== ".." && !way.startsWith("../") && !isAbsolute(way);
+}
+
+/** Whether git ignores `file`, which is in the repository. Anything but a plain yes is a no. */
+async function gitIgnores(root: string, file: string): Promise<boolean> {
+  try {
+    await run("git", ["-C", root, "check-ignore", "-q", "--", relative(root, file)], {
+      timeout: 10_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The directory the keys are in, with its symlinks followed. A key must never be where a `git add`
+ * can reach, so a directory inside the repository is refused unless git says it ignores the key
+ * files in it (`.tender/` is ignored, which is where they go by default). The repository and the
+ * directory are both settled first, so that a link, a different spelling of the case on a file
+ * system that ignores it, and a name that only starts with `..` cannot walk round the check; if git
+ * cannot be asked, the answer is no. `name` is the agent whose file will be in it, when it is known.
+ */
+async function keysDirOf(dir: string | undefined, name = "agent"): Promise<string> {
+  const path = await settle(resolve(dir ?? KEYS_DIR));
+  const root = await settle(REPO_ROOT);
+  if (!isUnder(root, path, await ignoresCase(root))) return path;
+  // A name that is not an agent's (a flag not checked yet) is probed as "agent": it must not lead out.
+  const stem = NAME.test(name) ? name : "agent";
+  const files = [`${stem}.json`, `${stem}.json.tmp`].map((file) => join(path, file));
+  const ignored = await Promise.all(files.map((file) => gitIgnores(root, file)));
+  if (!ignored.every(Boolean)) {
     throw new UsageError(
-      "a key directory inside the repository must be under .tender/, which git ignores; " +
-        `${path} is not`,
+      "a key directory inside the repository must be one that git ignores (.tender/ is), so that " +
+        `no key can be committed; git does not say it ignores ${path}`,
     );
   }
   return path;
@@ -243,7 +303,7 @@ export async function initAgent(
 ): Promise<{ path: string; publicKey: string }> {
   const log = options.log ?? console.log;
   const name = nameOf(options.name);
-  const dir = keysDirOf(options.dir);
+  const dir = await keysDirOf(options.dir, name);
   if (options.account !== undefined && !AccountIdSchema.safeParse(options.account).success) {
     throw new UsageError("--account is not a valid NEAR account id");
   }
@@ -395,7 +455,7 @@ async function terminalAsk(question: string): Promise<string | undefined> {
 }
 
 async function load(options: CommandOptions, ask: boolean): Promise<Loaded> {
-  const keyDir = keysDirOf(options.dir);
+  const keyDir = await keysDirOf(options.dir, options.name);
   const name = await pickName(keyDir, options.name);
   const key = await readKeyFile(keyDir, name);
   const target = await resolveTarget(options.network, key.network, options);

@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { TenderError } from "@tender/client";
 import type { AgentView, ConfigView } from "@tender/shared";
@@ -231,13 +232,122 @@ test("init_takes_a_name_of_lowercase_letters_digits_and_dashes_only", async () =
   await expect(init("scout-2")).resolves.toBeDefined();
 });
 
+// The key directory guard. A key must never be where a `git add` can reach: a directory inside the
+// repository is refused unless git says it ignores the key files in it. Each test names a way that
+// a path can look like it is somewhere else, and checks that nothing was made on the way.
+
+const REPO = fileURLToPath(new URL("../", import.meta.url)).replace(/\/$/, "");
+const NOT_IGNORED = /git does not say it ignores/;
+
+const swapCase = (text: string) =>
+  text.replace(/[a-z]/gi, (c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()));
+
+const exists = (path: string) =>
+  stat(path).then(
+    () => true,
+    () => false,
+  );
+
+async function refused(dirPath: string) {
+  await expect(
+    initAgent({ name: "scout", network: "sandbox", dir: dirPath, log }),
+    dirPath,
+  ).rejects.toThrow(NOT_IGNORED);
+}
+
 test("init_refuses_a_directory_inside_the_repository_that_git_does_not_ignore", async () => {
+  await refused(join(REPO, "keys-here"));
+  await refused(join(REPO, "scripts"));
+  await refused(REPO);
+  // A directory that exists nowhere yet is checked as well, and none is made.
+  expect(await exists(join(REPO, "keys-here"))).toBe(false);
+  // The relative spelling lands in the same place.
+  await refused(join("scripts", "keys-here"));
+  expect(await exists(join(REPO, "scripts", "keys-here"))).toBe(false);
+});
+
+test("init_refuses_a_name_that_only_starts_with_two_dots_inside_the_repository", async () => {
+  // `relative(repo, repo/..keys)` is `..keys`, which starts with two dots and is still inside.
+  await refused(join(REPO, "..keys"));
+  await refused(join(REPO, "..keys", "agents"));
+  await refused(join(REPO, "scripts", "..keys"));
+  expect(await exists(join(REPO, "..keys"))).toBe(false);
+  expect(await exists(join(REPO, "scripts", "..keys"))).toBe(false);
+});
+
+test("init_refuses_the_repository_spelled_in_another_case_on_a_file_system_that_ignores_case", async () => {
+  const other = swapCase(REPO);
+  // Only a file system that takes the two spellings for one place has this way round the check.
+  const same = await Promise.all([stat(REPO), stat(other)]).then(
+    ([a, b]) => a.ino === b.ino && a.dev === b.dev,
+    () => false,
+  );
+  if (!same) return;
+  await refused(join(other, "keys-here"));
+  await refused(join(other, "scripts"));
+  await refused(join(other, "..keys"));
+  expect(await exists(join(REPO, "keys-here"))).toBe(false);
+});
+
+test("init_refuses_a_link_that_leads_into_the_repository", async () => {
+  const link = join(dir, "link");
+  await symlink(join(REPO, "scripts"), link);
+  await refused(join(link, "keys"));
+  await refused(link);
+  // The link, followed, is inside the repository, and nothing was made in it.
+  expect(await exists(join(REPO, "scripts", "keys"))).toBe(false);
+
+  // A link to somewhere outside the repository is no way in, and the key is written there.
+  const elsewhere = join(dir, "elsewhere");
+  await mkdir(elsewhere);
+  await symlink(elsewhere, join(dir, "out"));
+  const { path } = await initAgent({
+    name: "scout",
+    network: "sandbox",
+    dir: join(dir, "out", "keys"),
+    log,
+  });
+  expect(await exists(join(elsewhere, "keys", "scout.json"))).toBe(true);
+  expect(path).toBe(
+    join(
+      await import("node:fs/promises").then((fs) => fs.realpath(elsewhere)),
+      "keys",
+      "scout.json",
+    ),
+  );
+});
+
+test("init_takes_a_directory_inside_the_repository_that_git_ignores", async () => {
+  // `.tender/` is ignored, which is where the keys go unless `--dir` says otherwise.
+  const ignored = join(REPO, ".tender", `guard-test-${process.pid}`);
+  try {
+    const { path } = await initAgent({ name: "scout", network: "sandbox", dir: ignored, log });
+    expect(path.endsWith(join(".tender", `guard-test-${process.pid}`, "scout.json"))).toBe(true);
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+  } finally {
+    await rm(ignored, { recursive: true, force: true });
+  }
+});
+
+test("init_refuses_a_directory_inside_the_repository_when_git_cannot_be_asked", async () => {
+  // No git on the PATH: the answer is no, even for the directory that is ignored.
+  vi.stubEnv("PATH", dir);
+  try {
+    await refused(join(REPO, ".tender", `guard-test-${process.pid}`));
+  } finally {
+    vi.unstubAllEnvs();
+  }
+  expect(await exists(join(REPO, ".tender", `guard-test-${process.pid}`))).toBe(false);
+});
+
+test("a_command_refuses_a_key_directory_inside_the_repository_as_init_does", async () => {
   await expect(
-    initAgent({ name: "scout", network: "sandbox", dir: join(process.cwd(), "keys-here"), log }),
-  ).rejects.toThrow(/under \.tender\//);
-  await expect(
-    initAgent({ name: "scout", network: "sandbox", dir: join(process.cwd(), "scripts"), log }),
-  ).rejects.toThrow(/under \.tender\//);
+    registerAgentCommand(options({ dir: join(REPO, "..keys"), name: "scout", yes: true })),
+  ).rejects.toThrow(NOT_IGNORED);
+  await expect(retireAgentCommand(options({ dir: join(REPO, "scripts") }))).rejects.toThrow(
+    NOT_IGNORED,
+  );
+  await expect(claimBondCommand(options({ dir: REPO }))).rejects.toThrow(NOT_IGNORED);
 });
 
 test("init_keeps_the_account_when_it_is_given_and_checks_it", async () => {
