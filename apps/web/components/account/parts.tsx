@@ -1,16 +1,17 @@
 "use client";
 
-import { tokenMeta } from "@tender/shared";
+import Link from "next/link";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { ByToken } from "../../lib/account";
-import { config } from "../../lib/config";
+import { UNTITLED_TASK } from "../../lib/copy";
 import type { Focus } from "../../lib/dither";
 import type { ArtName } from "../../lib/scenes";
+import { knownFirst, knowsToken } from "../../lib/tokens";
 import type { UseWallet } from "../../lib/wallet";
 import { walletErrorMessage } from "../../lib/walletErrors";
-import { Amount } from "../Amount";
+import { Amount, RawUnits } from "../Amount";
 import { StillArt } from "../StillArt";
-import { CARD, EYEBROW, FACT_LABEL, PRIMARY, SECONDARY } from "../ui";
+import { CARD, EYEBROW, FACT_LABEL, PRIMARY, SECONDARY, TEXT_LINK } from "../ui";
 
 // The pieces the account pages (My agents, Add an agent, Earnings) are built from, in the app's
 // look: the state a page has before a wallet is connected, the stat blocks, the boxed empty state,
@@ -108,24 +109,37 @@ export function ConnectGate({
   );
 }
 
-/** Whether the app knows `token`'s decimals, so that its amounts read as figures. */
-const known = (token: string) => tokenMeta(token, config.network).symbol !== token;
-
 /**
  * Amounts token by token, one to a line, the tokens the app knows first (their amounts read as
  * figures; another token's is in its smallest unit, with its account); `empty` when there are none.
+ * `labelled`: another token's amount is labelled as the Live panel and a board card label it
+ * (`RawUnits`), its number never broken, instead of being followed by the token's account.
  */
-export function Tokens({ amounts, empty = "—" }: { amounts: ByToken; empty?: string }) {
+export function Tokens({
+  amounts,
+  empty = "—",
+  labelled = false,
+}: {
+  amounts: ByToken;
+  empty?: string;
+  labelled?: boolean;
+}) {
   // Faded from the colour around it, so that it reads on the cream block as on the dark ones.
   if (amounts.length === 0) return <span className="opacity-70">{empty}</span>;
-  const ordered = [...amounts].sort(([a], [b]) => Number(known(b)) - Number(known(a)));
+  const ordered = knownFirst(amounts, ([token]) => token);
   return (
     <ul className="grid gap-1">
-      {ordered.map(([token, amount]) => (
-        <li key={token} className="min-w-0 wrap-anywhere">
-          <Amount value={amount.toString()} token={token} />
-        </li>
-      ))}
+      {ordered.map(([token, amount]) =>
+        labelled && !knowsToken(token) ? (
+          <li key={token} className="min-w-0 text-[13px] leading-snug">
+            <RawUnits value={amount.toString()} token={token} />
+          </li>
+        ) : (
+          <li key={token} className="min-w-0 wrap-anywhere">
+            <Amount value={amount.toString()} token={token} />
+          </li>
+        ),
+      )}
     </ul>
   );
 }
@@ -265,6 +279,84 @@ export function Command({
         <p className="text-sm text-muted">The browser didn't allow copying: select the command.</p>
       ) : null}
     </div>
+  );
+}
+
+// ---- Rows read as a table (Earnings, My tasks) ---------------------------------------------
+
+/**
+ * A list read as a table: the column heads above it from tablet width up, and on a phone each
+ * value with its head beside it. The heads are in every row for a screen reader.
+ */
+export function Rows({
+  heads,
+  grid,
+  testId,
+  children,
+}: {
+  heads: string[];
+  /** The columns, as a literal Tailwind class from `md` up. */
+  grid: string;
+  testId: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="grid">
+      <div
+        aria-hidden="true"
+        className={`hidden gap-6 border-b border-line px-5 pt-4 pb-3 sm:px-6 md:grid ${grid}`}
+      >
+        {heads.map((head, index) => (
+          <span
+            key={head}
+            className={`${FACT_LABEL} ${index === heads.length - 1 ? "md:text-right" : ""}`}
+          >
+            {head}
+          </span>
+        ))}
+      </div>
+      <ul data-testid={testId} className="grid">
+        {children}
+      </ul>
+    </div>
+  );
+}
+
+/** One row of `Rows`: its cells side by side from tablet width up, stacked on a phone. */
+export const ROW =
+  "grid min-w-0 grid-cols-2 gap-x-4 gap-y-3 border-t border-line px-5 py-4 first:border-t-0 sm:px-6 md:items-center md:gap-6";
+
+/** A cell, with its column's head for a phone and a screen reader. */
+export function Cell({
+  head,
+  children,
+  end = false,
+  lead = false,
+}: {
+  head: string;
+  children: ReactNode;
+  end?: boolean;
+  /** The row's first cell, what the row is about: the whole width of a phone, with no head shown. */
+  lead?: boolean;
+}) {
+  return (
+    <div
+      className={`grid min-w-0 content-start gap-1 md:block ${lead ? "col-span-2 md:col-span-1" : ""} ${end ? "md:text-right" : ""}`}
+    >
+      <span className={`${FACT_LABEL} ${lead ? "sr-only" : "md:sr-only"}`}>{head}: </span>
+      <div className="min-w-0 wrap-anywhere">{children}</div>
+    </div>
+  );
+}
+
+export function TaskCell({ taskId, title }: { taskId: string; title: string | null }) {
+  return (
+    <span className="grid gap-0.5">
+      <Link href={`/tasks/${taskId}`} className={`${TEXT_LINK} w-fit font-medium wrap-anywhere`}>
+        {title ?? UNTITLED_TASK}
+      </Link>
+      <span className="font-mono text-xs text-muted">#{taskId}</span>
+    </span>
   );
 }
 

@@ -1,6 +1,7 @@
 import {
   type AccountEntry,
   AccountIdSchema,
+  type ListTasksFilter,
   type Phase,
   type TaskDetailResponse,
   type TaskSummary,
@@ -365,21 +366,32 @@ export interface Posted {
   truncated: boolean;
 }
 
-/** The tasks `account` posted (`GET /v1/tasks?poster=`), newest first, page after page. */
-export async function readPosted(
-  account: string,
+/**
+ * The tasks that fit `filter` (`GET /v1/tasks`), newest first, page after page, up to `MAX_PAGES`
+ * of them. Null once `wanted()` is false: no more pages are asked for.
+ */
+export async function readTaskPages(
+  filter: Omit<ListTasksFilter, "limit" | "cursor">,
   wanted: () => boolean = () => true,
 ): Promise<Posted | null> {
   const tasks: TaskSummary[] = [];
   let cursor: string | null = null;
   for (let page = 0; page < MAX_PAGES; page++) {
-    const answer = await api.listTasks({ poster: account, limit: PAGE_SIZE, cursor });
+    const answer = await api.listTasks({ ...filter, limit: PAGE_SIZE, cursor });
     if (!wanted()) return null;
     tasks.push(...answer.tasks);
     if (answer.next_cursor === null) return { tasks, truncated: false };
     cursor = answer.next_cursor;
   }
   return { tasks, truncated: true };
+}
+
+/** The tasks `account` posted (`GET /v1/tasks?poster=`), newest first, page after page. */
+export function readPosted(
+  account: string,
+  wanted: () => boolean = () => true,
+): Promise<Posted | null> {
+  return readTaskPages({ poster: account }, wanted);
 }
 
 /** The rewards of `tasks`, added up token by token, by where each one is at `nowNs`. */
