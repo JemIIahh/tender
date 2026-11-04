@@ -47,9 +47,8 @@ pub const MIN_WITHDRAW_GAS: Gas = Gas::from_tgas(35);
 /// Longest wait `set_agent_bond_cooldown` takes between `unregister_agent` and
 /// `claim_agent_bond`: four times the longest window, 56 days.
 pub const MAX_BOND_COOLDOWN_SECS: u64 = MAX_WINDOW_SECS as u64 * 4;
-/// The wait before the owner sets one: the longest window, 14 days. A bond then stays locked for
-/// at least any task's whole commit window after its agent stops entering, so one bond cannot
-/// seat a second account in the same task.
+/// The wait before the owner sets one: the longest window, 14 days. What stops one bond from
+/// seating a second account in a task is not this but each agent's `locked_until`.
 pub const DEFAULT_BOND_COOLDOWN_SECS: u64 = MAX_WINDOW_SECS as u64;
 
 /// Error codes. Every panic message starts with one, as `"<CODE>: <detail>"`.
@@ -189,6 +188,10 @@ pub struct AgentProfile {
     pub unregistering_since: u64,
     /// From when `claim_agent_bond` pays the bond back, in nanoseconds.
     pub claimable_at: u64,
+    /// The latest `commit_deadline` among the open tasks the agent has entered, in nanoseconds, or
+    /// 0. Its bond cannot be claimed before it, so one bond cannot be handed on to seat another
+    /// account in a task whose commit window is still open, whatever the cooldown.
+    pub locked_until: u64,
 }
 
 /// A bounty. Timestamps are nanoseconds; the phase is derived from them, never stored.
@@ -414,6 +417,9 @@ pub struct AgentView {
     /// While the agent is unregistering, from when its bond can be claimed (nanoseconds, a decimal
     /// string); `null` otherwise.
     pub claimable_at: Option<U64>,
+    /// The latest commit deadline among the open tasks the agent has entered (nanoseconds, a
+    /// decimal string): its bond is claimable no earlier. `null` if it has entered none.
+    pub locked_until: Option<U64>,
 }
 
 /// The arguments of `post_task`, which takes them as `{"task": {...}}`. `reward` is a decimal

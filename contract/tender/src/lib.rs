@@ -45,6 +45,7 @@ enum StorageKey {
     EntrantAt,
     Agents,
     Delegates,
+    DelegateCounts,
 }
 
 /// The contract state: configuration, the internal vault, and every task, entry and agent.
@@ -77,6 +78,8 @@ pub struct Tender {
     agents: LookupMap<AccountId, AgentProfile>,
     /// `(account, public key)` to spending caps.
     delegates: LookupMap<(AccountId, PublicKey), DelegateCaps>,
+    /// How many delegate keys each account has registered, for the accounts that have any.
+    delegate_counts: LookupMap<AccountId, u32>,
 }
 
 #[near]
@@ -119,6 +122,7 @@ impl Tender {
             entrant_at: LookupMap::new(StorageKey::EntrantAt),
             agents: LookupMap::new(StorageKey::Agents),
             delegates: LookupMap::new(StorageKey::Delegates),
+            delegate_counts: LookupMap::new(StorageKey::DelegateCounts),
         }
     }
 }
@@ -168,7 +172,8 @@ mod tests {
     }
 
     /// The storage layout as it is frozen (ruling R33): the collections' prefixes, the Borsh tags
-    /// of the stored enums, a fresh contract's root state and a task record, byte for byte. Once
+    /// of the stored enums, a fresh contract's root state, a task record and an agent record,
+    /// byte for byte. Once
     /// deployed, any of these may change only together with a `migrate` that reads the old form.
     /// A failure here means a change moved the layout: undo it, or write that migration and then
     /// update the pins.
@@ -176,7 +181,7 @@ mod tests {
     fn storage_layout_is_pinned() {
         use near_sdk::{borsh, env, AccountId};
 
-        use crate::types::{Outcome, Payout, Task, VoidReason};
+        use crate::types::{AgentProfile, AgentStatus, Bond, Outcome, Payout, Task, VoidReason};
         use crate::StorageKey;
 
         let acct = |id: &str| id.parse::<AccountId>().unwrap();
@@ -189,6 +194,7 @@ mod tests {
             StorageKey::EntrantAt,
             StorageKey::Agents,
             StorageKey::Delegates,
+            StorageKey::DelegateCounts,
         ];
         for (tag, key) in prefixes.iter().enumerate() {
             assert_eq!(borsh::to_vec(key).unwrap(), [tag as u8], "prefix {tag}");
@@ -252,14 +258,55 @@ mod tests {
         let encoded = borsh::to_vec(&task).unwrap();
         let digest = hex::encode(env::sha256(&encoded));
         assert_eq!((encoded.len(), digest.as_str()), TASK_RECORD);
+
+        // An agent record with every field set, and the status tags.
+        for (tag, status) in [
+            AgentStatus::Active,
+            AgentStatus::Unregistering,
+            AgentStatus::Retired,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(borsh::to_vec(status).unwrap(), [tag as u8], "{status:?}");
+        }
+        let agent = AgentProfile {
+            profile_uri: "ipfs://profile".to_string(),
+            profile_hash: [5; 32],
+            tags: vec!["rust".to_string()],
+            asp: Some(acct("acme.test")),
+            registered_at: 11,
+            entries: 3,
+            reveals: 2,
+            wins: 1,
+            earned: vec![(acct("usdc.test"), 950_000)],
+            picks_made: 4,
+            voids_after_reveals: 1,
+            status: AgentStatus::Unregistering,
+            bond: Some(Bond {
+                token: acct("usdc.test"),
+                amount: 5_000_000,
+            }),
+            unregistering_since: 12,
+            claimable_at: 13,
+            locked_until: 14,
+        };
+        let encoded = borsh::to_vec(&agent).unwrap();
+        let digest = hex::encode(env::sha256(&encoded));
+        assert_eq!((encoded.len(), digest.as_str()), AGENT_RECORD);
     }
 
     /// `storage_layout_is_pinned`'s fresh contract, hex-encoded.
-    const FRESH_STATE: &str = "01000a0000006f776e65722e74657374000d00000074726561737572792e74657374f4013c0000000000007512000000000001000000000000000000000002000000007602000000006d0100000001010000000201000000030100000004010000000501000000060100000007";
+    const FRESH_STATE: &str = "01000a0000006f776e65722e74657374000d00000074726561737572792e74657374f4013c0000000000007512000000000001000000000000000000000002000000007602000000006d01000000010100000002010000000301000000040100000005010000000601000000070100000008";
     /// `storage_layout_is_pinned`'s task record: its length and the SHA-256 of its encoding.
     const TASK_RECORD: (usize, &str) = (
         444,
         "88e61c51eaf368c7f13e662de31431982f7a53555e8ce8a13621e06a1f33212a",
+    );
+    /// `storage_layout_is_pinned`'s agent record: its length and the SHA-256 of its encoding.
+    const AGENT_RECORD: (usize, &str) = (
+        192,
+        "f404ecdae5f24b6c591857ce91a5cb558a2cf43c5c6a8b23610b89815e3296f2",
     );
 
     #[test]

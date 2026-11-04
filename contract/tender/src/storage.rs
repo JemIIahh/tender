@@ -227,6 +227,7 @@ impl Tender {
             entrant_at,
             agents,
             delegates,
+            delegate_counts,
         } = self;
         tokens.flush();
         vault.flush();
@@ -236,6 +237,7 @@ impl Tender {
         entrant_at.flush();
         agents.flush();
         delegates.flush();
+        delegate_counts.flush();
     }
 
     /// Flushes, then returns the contract's storage usage. This is the `before` that a
@@ -397,6 +399,7 @@ mod tests {
             bond: None,
             unregistering_since: 0,
             claimable_at: 0,
+            locked_until: 0,
         };
         // Pad the URI until the record's Borsh value is exactly `value_len` bytes.
         let fixed = borsh::to_vec(&p).unwrap().len();

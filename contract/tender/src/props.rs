@@ -265,6 +265,9 @@ struct World {
     tasks: Vec<TaskModel>,
     /// The registered agents.
     agents: BTreeMap<Who, AgentModel>,
+    /// For each agent, the latest commit deadline among the open tasks it entered: before it,
+    /// its bond cannot be claimed.
+    locked: BTreeMap<Who, u64>,
     /// The seed of the next work committed.
     next_seed: u32,
 }
@@ -293,6 +296,7 @@ impl World {
             balances: BTreeMap::new(),
             tasks: Vec::new(),
             agents: BTreeMap::new(),
+            locked: BTreeMap::new(),
             next_seed: 0,
         };
         world.setup(OWNER, NearToken::from_near(1), |t| {
@@ -585,7 +589,8 @@ impl World {
             who,
             result
         );
-        let claimable_at = self.now + COOLDOWN_SECS * SEC;
+        let lock = self.locked.get(&who).copied().unwrap_or(0);
+        let claimable_at = (self.now + COOLDOWN_SECS * SEC).max(lock);
         self.agents
             .insert(who, AgentModel::Unregistering { bond, claimable_at });
         Ok(result)
@@ -757,7 +762,13 @@ impl World {
             result
         );
         if result.is_ok() {
-            self.task_mut(task)?.works.insert(who, seed);
+            let m = self.task_mut(task)?;
+            let new_entry = m.works.insert(who, seed).is_none();
+            let deadline = m.posted_at + u64::from(WINDOW_SECS) * SEC;
+            if new_entry {
+                let lock = self.locked.entry(who).or_insert(0);
+                *lock = (*lock).max(deadline);
+            }
         }
         Ok(result)
     }
@@ -1058,14 +1069,19 @@ impl World {
                     v.status,
                     v.bond_amount.map(|a| a.0),
                     v.claimable_at.map(|c| c.0),
+                    v.locked_until.map(|l| l.0),
                 )
             });
+            let lock = self.locked.get(&who).copied().filter(|&l| l > 0);
             let expected = model.map(|m| match m {
-                AgentModel::Active { bond } => (AgentStatus::Active, Some(bond), None),
-                AgentModel::Unregistering { bond, claimable_at } => {
-                    (AgentStatus::Unregistering, Some(bond), Some(claimable_at))
-                }
-                AgentModel::Retired => (AgentStatus::Retired, None, None),
+                AgentModel::Active { bond } => (AgentStatus::Active, Some(bond), None, lock),
+                AgentModel::Unregistering { bond, claimable_at } => (
+                    AgentStatus::Unregistering,
+                    Some(bond),
+                    Some(claimable_at),
+                    lock,
+                ),
+                AgentModel::Retired => (AgentStatus::Retired, None, None, lock),
             });
             prop_assert_eq!(shown, expected, "the agent record of {:?}", who);
             prop_assert_eq!(

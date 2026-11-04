@@ -4,6 +4,7 @@ use std::future::Future;
 
 use anyhow::{bail, Context};
 use near_workspaces::network::Sandbox;
+use near_workspaces::result::ExecutionFinalResult;
 use near_workspaces::types::{AccessKey, KeyType, NearToken, SecretKey};
 use near_workspaces::{Account, AccountId, Contract, Worker};
 use serde_json::json;
@@ -218,6 +219,18 @@ pub fn mint(env: &Env, who: &AccountId, amount: u128) -> impl Future<Output = an
 /// `register_agent` takes. `who` needs a storage balance at Tender, and the bond in its vault if
 /// one is set.
 pub fn register_agent(env: &Env, who: &Account) -> impl Future<Output = anyhow::Result<()>> {
+    let call = register_agent_call(env, who);
+    async move {
+        done(call.await?)?;
+        Ok(())
+    }
+}
+
+/// `register_agent` as `register_agent` sends it: the raw result.
+pub fn register_agent_call(
+    env: &Env,
+    who: &Account,
+) -> impl Future<Output = anyhow::Result<ExecutionFinalResult>> {
     let call = who
         .call(env.tender.id(), "register_agent")
         .args_json(json!({
@@ -227,10 +240,7 @@ pub fn register_agent(env: &Env, who: &Account) -> impl Future<Output = anyhow::
         }))
         .deposit(ONE_YOCTO)
         .max_gas();
-    async move {
-        done(call.transact().await?)?;
-        Ok(())
-    }
+    async move { Ok(call.transact().await?) }
 }
 
 /// Gives `who` a storage balance at Tender of `amount`.

@@ -84,8 +84,8 @@ impl Tender {
     /// - the caller is neither its poster nor its verifier (`E_AUTH`);
     /// - if the task has an `invited` list, the caller is on it (`E_INVITE`);
     /// - if it has none, so is open to anyone, the caller is an active registered agent: one that
-    ///   has registered and has not called `unregister_agent` since (`E_NOT_REGISTERED`). This
-    ///   holds for a replacement too;
+    ///   has registered and has not called `unregister_agent` since, and that holds a bond if the
+    ///   owner has set one (`E_NOT_REGISTERED`). This holds for a replacement too;
     /// - `commitment` is 64 lowercase hex characters (`E_HASH`);
     /// - a caller without an entry needs a free place: `max_entries` is 0, or more than
     ///   `commit_count` (`E_FULL`);
@@ -96,7 +96,8 @@ impl Tender {
     /// the storage stay as they were, and a full task does not stop it. Otherwise the caller takes
     /// the next index and gets its payout slots for the task's token (see `ensure_payout_slots`),
     /// and the task's `commit_count` goes up by one, as does the caller's `entries` if it is a
-    /// registered agent. The caller pays for the new records out of its storage balance. Emits
+    /// registered agent. A new entry in an open task also raises the agent's `locked_until` to the
+    /// task's `commit_deadline`, before which its bond cannot be claimed. The caller pays for the new records out of its storage balance. Emits
     /// `committed`, whose `replaced` says which of the two happened.
     ///
     /// Commits work while the contract is paused, and attach no deposit, so a function-call key
@@ -129,9 +130,17 @@ impl Tender {
         // An open task: anyone could fill it with accounts that cost nothing, so it takes only
         // agents whose bond the contract holds (owner decision, 2026-11-03). A pinned task's
         // poster chose its entrants, so they need no registration.
-        if task.invited.is_empty() && !self.is_active_agent(&caller) {
+        if task.invited.is_empty() && !self.may_enter_open_tasks(&caller) {
+            let hint = if self.is_active_agent(&caller) {
+                format!(
+                    "; {caller} registered before the bond was set and holds none: call \
+                     register_agent to pay it"
+                )
+            } else {
+                String::new()
+            };
             env::panic_str(&format!(
-                "{}: open tasks take entries only from registered agents",
+                "{}: open tasks take entries only from registered agents{hint}",
                 err::E_NOT_REGISTERED
             ));
         }
@@ -146,6 +155,7 @@ impl Tender {
             ));
         }
         let token = task.token.clone();
+        let (open, commit_deadline) = (task.invited.is_empty(), task.commit_deadline);
         let block_height = env::block_height();
 
         // Every rule has been checked. Only the storage charge can still fail.
@@ -169,7 +179,13 @@ impl Tender {
                     },
                 );
                 self.entrant_at.insert((id, index), caller.clone());
-                self.with_profile(&caller, |p| p.entries = p.entries.saturating_add(1));
+                self.with_profile(&caller, |p| {
+                    p.entries = p.entries.saturating_add(1);
+                    // The bond that let it into an open task stays until this window closes.
+                    if open {
+                        p.locked_until = p.locked_until.max(commit_deadline);
+                    }
+                });
             }
         }
         self.settle_storage(&caller, before);
@@ -993,6 +1009,153 @@ mod tests {
         );
         let gina = t.get_agent(acct(STRANGER)).expect("the record stays");
         assert_eq!((gina.entries, gina.reveals, gina.wins), (1, 1, 1));
+    }
+
+    #[test]
+    fn bond_free_agent_must_hold_the_bond_once_one_is_set() {
+        // bob registered while no bond was set, so he holds none. That is enough until the owner
+        // sets one; from then on an open task needs a held bond.
+        let mut t = world();
+        let before = post(&mut t, args());
+        enter(&mut t, "bob.test", before, 1);
+        as_owner(&mut t, |t| t.set_agent_bond(acct(USDC), U128(5_000_000)));
+        let id = post(&mut t, args());
+        let result = try_commit(
+            &mut t,
+            "bob.test",
+            id,
+            T1,
+            HEIGHT,
+            &commitment(id, "bob.test", 2),
+        );
+        let message = assert_rejected(result, "E_NOT_REGISTERED", "a bond-free agent");
+        assert!(message.starts_with(NOT_REGISTERED), "{message}");
+        assert!(
+            message.contains("register_agent"),
+            "the message says what to do: {message}"
+        );
+        // Nor may he replace the entry he made before the bond was set.
+        let result = try_commit(
+            &mut t,
+            "bob.test",
+            before,
+            T1,
+            HEIGHT + 1,
+            &commitment(before, "bob.test", 3),
+        );
+        assert_rejected(result, "E_NOT_REGISTERED", "replacing a pre-bond entry");
+        // A task that invites him needs no bond.
+        let pinned = post(
+            &mut t,
+            PostTaskArgs {
+                invited: vec![acct("bob.test")],
+                ..args()
+            },
+        );
+        enter(&mut t, "bob.test", pinned, 4);
+        // He registers again, which takes the bond, and then he enters.
+        fund(&mut t, "bob.test", 5_000_000);
+        register_agent(&mut t, "bob.test");
+        assert_eq!(t.balance_of(acct("bob.test"), acct(USDC)), U128(0));
+        enter(&mut t, "bob.test", id, 5);
+        assert_eq!(counts(&t, id), (1, 0));
+    }
+
+    /// Independent review L3 / Task 16b review M1: with a cooldown far shorter than a task's commit
+    /// window, a bond used to be claimable, passed on and used again for a second account in the
+    /// same task. Each open entry now locks its agent's bond until that task's commit deadline.
+    #[test]
+    fn one_bond_cannot_seat_a_second_account_in_one_task() {
+        let mut t = world();
+        const BOND: u128 = 5_000_000;
+        as_owner(&mut t, |t| t.set_agent_bond(acct(USDC), U128(BOND)));
+        as_owner(&mut t, |t| t.set_agent_bond_cooldown(U64(60)));
+        fund(&mut t, STRANGER, BOND);
+        register_agent(&mut t, STRANGER);
+        // A one-day commit window, against a cooldown of one minute.
+        let id = post(
+            &mut t,
+            PostTaskArgs {
+                commit_secs: 86_400,
+                ..args()
+            },
+        );
+        let deadline = T1 + 86_400 * SEC;
+        try_commit(
+            &mut t,
+            STRANGER,
+            id,
+            T1 + SEC,
+            HEIGHT,
+            &commitment(id, STRANGER, 1),
+        )
+        .unwrap();
+        assert_eq!(
+            t.get_agent(acct(STRANGER)).unwrap().locked_until,
+            Some(U64(deadline))
+        );
+        agent_call(&mut t, STRANGER, T1 + 2 * SEC, Tender::unregister_agent);
+        let gina = t.get_agent(acct(STRANGER)).unwrap();
+        assert_eq!(gina.claimable_at, Some(U64(deadline)), "not T1 + 62 s");
+        // The cooldown is over, but the bond stays until the commit window closes.
+        for now in [T1 + 62 * SEC, deadline - 1] {
+            testing_env!(ctx(STRANGER)
+                .block_timestamp(now)
+                .attached_deposit(ONE_YOCTO)
+                .build());
+            let refused = panic_message(|| t.claim_agent_bond()).expect("too early");
+            assert!(refused.starts_with("E_PHASE: "), "{refused}");
+        }
+        assert_eq!(t.balance_of(acct(STRANGER), acct(USDC)), U128(0));
+        // From the deadline it comes back, when the task takes no more entries from anyone.
+        agent_call(&mut t, STRANGER, deadline, Tender::claim_agent_bond);
+        assert_eq!(t.balance_of(acct(STRANGER), acct(USDC)), U128(BOND));
+        let result = try_commit(&mut t, "carol.test", id, deadline, HEIGHT, "x");
+        assert_rejected(result, "E_PHASE", "the window has closed");
+        assert_eq!(counts(&t, id), (1, 0));
+    }
+
+    #[test]
+    fn locked_until_follows_the_latest_open_entry_only() {
+        let mut t = world();
+        as_owner(&mut t, |t| t.set_agent_bond_cooldown(U64(60)));
+        // bob, an agent with no entry, has no lock, and would leave after the cooldown alone.
+        assert_eq!(t.get_agent(acct("bob.test")).unwrap().locked_until, None);
+        let long = post(
+            &mut t,
+            PostTaskArgs {
+                commit_secs: 7_200,
+                ..args()
+            },
+        );
+        let short = post(&mut t, args());
+        let pinned = post(
+            &mut t,
+            PostTaskArgs {
+                commit_secs: 86_400,
+                invited: vec![acct("bob.test")],
+                ..args()
+            },
+        );
+        let lock = |t: &Tender| t.get_agent(acct("bob.test")).unwrap().locked_until;
+        enter(&mut t, "bob.test", long, 1);
+        assert_eq!(lock(&t), Some(U64(T1 + 7_200 * SEC)));
+        // A task that closes sooner does not lower it, and a pinned task, which needs no bond,
+        // does not raise it.
+        enter(&mut t, "bob.test", short, 2);
+        enter(&mut t, "bob.test", pinned, 3);
+        assert_eq!(lock(&t), Some(U64(T1 + 7_200 * SEC)));
+        agent_call(&mut t, "bob.test", T1, Tender::unregister_agent);
+        assert_eq!(
+            t.get_agent(acct("bob.test")).unwrap().claimable_at,
+            Some(U64(T1 + 7_200 * SEC))
+        );
+        // carol, with no open entry, may claim after the cooldown alone.
+        agent_call(&mut t, "carol.test", T1, Tender::unregister_agent);
+        assert_eq!(
+            t.get_agent(acct("carol.test")).unwrap().claimable_at,
+            Some(U64(T1 + 60 * SEC))
+        );
     }
 
     // What a commit writes.

@@ -54,7 +54,9 @@ impl Tender {
     /// - it is not settled yet (`E_SETTLED`);
     /// - the caller is its verifier or its poster (`E_AUTH`);
     /// - the call is not signed by one of the caller's delegate keys (`add_delegate`), which may
-    ///   spend within caps but never judge (`E_AUTH`);
+    ///   spend within caps but never judge; and if the caller has any delegate key, it signed the
+    ///   transaction itself, since a relayed (NEP-366) or cross-contract call hides the key that
+    ///   signed (`E_AUTH`);
     /// - the caller's window is open: the verifier's from `reveal_deadline` up to, but not
     ///   including, `pick_deadline`, and the poster's from there up to, but not including,
     ///   `fallback_deadline`. A poster who is also the verifier has both (`E_PHASE`);
@@ -87,7 +89,9 @@ impl Tender {
     /// amount.
     ///
     /// Picks work while the contract is paused, and attach no deposit, so a function-call key can
-    /// send them, as long as it is not a delegate key.
+    /// send them, as long as it is not a delegate key. A verifier with no delegate key may also
+    /// pick through a relayer, or be a contract, such as a DAO, that picks in a cross-contract
+    /// call.
     #[deny_unknown_arguments]
     pub fn pick(
         &mut self,
@@ -110,8 +114,20 @@ impl Tender {
             ));
         }
         // A key that may spend within caps must not also decide where an escrow goes, or a
-        // leaked one could award any task its account judges.
-        if self.signed_by_delegate(&caller) {
+        // leaked one could award any task its account judges. Relayed as a NEP-366
+        // meta-transaction, or sent from another contract, the call shows someone else as the
+        // signer and hides the key that signed, which could be one of the caller's delegate keys
+        // (independent review H1). So such a call is refused while the caller has any.
+        if env::signer_account_id() != caller {
+            if self.has_delegates(&caller) {
+                env::panic_str(&format!(
+                    "{}: {caller} has delegate keys, so task {id} can be picked only in a \
+                     transaction that {caller} signs itself, not through a relayer or another \
+                     contract",
+                    err::E_AUTH
+                ));
+            }
+        } else if self.signed_by_delegate(&caller) {
             env::panic_str(&format!(
                 "{}: task {id} cannot be picked with a delegate key; sign with another key of {caller}",
                 err::E_AUTH
@@ -1126,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_acts_for_the_predecessor_not_the_signer() {
+    fn pick_by_a_relayed_or_contract_call_goes_through_without_delegates() {
         let mut t = world();
         let id = post(&mut t, args());
         revealed(&mut t, id, &["bob.test"]);
@@ -1141,15 +1157,113 @@ mod tests {
             .block_timestamp(REVEAL_DEADLINE)
             .build());
         let message = pick_bob(&mut t).expect("the relayed call is rejected");
-        assert!(message.starts_with("E_AUTH: "), "{message}");
+        assert_eq!(
+            message,
+            format!("E_AUTH: only the verifier or the poster can pick task {id}")
+        );
         assert_eq!(outcome(&t, id), None);
-        // The judge's own call goes through, whoever signed it.
+        // The judge is the caller and another account signed: a NEP-366 meta-transaction that a
+        // relayer submits, or a call from a contract. The judge has no delegate key, so no key of
+        // its account is one, and the pick goes through.
         testing_env!(ctx(JUDGE)
             .signer_account_id(acct("relay.test"))
             .block_timestamp(REVEAL_DEADLINE)
             .build());
         assert_eq!(pick_bob(&mut t), None);
         assert_eq!(balance(&t, "bob.test"), 950_000);
+    }
+
+    /// A verifier that is a contract, a DAO or a multisig, picks from a cross-contract call: the
+    /// predecessor is the contract, the signer whoever sent the transaction. With no delegate
+    /// record, it may.
+    #[test]
+    fn a_contract_verifier_without_delegates_picks() {
+        let mut t = world();
+        let id = post(
+            &mut t,
+            PostTaskArgs {
+                verifier: Some(acct("dao.test")),
+                ..args()
+            },
+        );
+        revealed(&mut t, id, &["bob.test"]);
+        testing_env!(ctx("dao.test")
+            .signer_account_id(acct("member.test"))
+            .block_timestamp(REVEAL_DEADLINE)
+            .build());
+        t.pick(
+            U64(id),
+            winners(&[("bob.test", 10_000)]),
+            SCORECARD_HASH.to_string(),
+            SCORECARD_URI.to_string(),
+        );
+        assert_eq!(balance(&t, "bob.test"), 950_000);
+    }
+
+    /// Independent review H1: a delegate key's pick relayed as a NEP-366 meta-transaction. The
+    /// contract then sees the relayer as the signer, with the relayer's key, and the verifier as
+    /// the caller, so a check of the signing key alone finds no delegate. A relayed pick, empty or
+    /// not, by the verifier or by the poster in its window, is refused while the caller has any
+    /// delegate record, since the key that signed may be one of them.
+    #[test]
+    fn relayed_pick_by_a_delegate_key_is_refused() {
+        let key = |byte: u8| PublicKey::from_parts(CurveType::ED25519, vec![byte; 32]).unwrap();
+        let mut t = world();
+        let judged = post(&mut t, args());
+        let fallback = post(&mut t, args());
+        revealed(&mut t, judged, &["bob.test"]);
+        revealed(&mut t, fallback, &["bob.test"]);
+        for who in [JUDGE, "alice.test"] {
+            testing_env!(ctx(who).attached_deposit(ONE_YOCTO).build());
+            t.add_delegate(key(7), acct(USDC), U128(REWARD), U128(REWARD));
+        }
+        let bob: Shares = &[("bob.test", 10_000)];
+        for (who, id, now) in [
+            (JUDGE, judged, REVEAL_DEADLINE),
+            ("alice.test", fallback, PICK_DEADLINE),
+        ] {
+            for list in [bob, &[]] {
+                // carol relays it, so the runtime reports her as the signer, with her key.
+                testing_env!(ctx(who)
+                    .signer_account_id(acct("carol.test"))
+                    .signer_account_pk(key(3))
+                    .block_timestamp(now)
+                    .build());
+                let (list, hash, uri) = (
+                    winners(list),
+                    SCORECARD_HASH.to_string(),
+                    SCORECARD_URI.to_string(),
+                );
+                let result = match panic_message(|| t.pick(U64(id), list, hash, uri)) {
+                    Some(message) => Err(message),
+                    None => Ok(()),
+                };
+                assert_rejected(result, "E_AUTH", &format!("{who}'s relayed pick"));
+            }
+            assert_eq!(outcome(&t, id), None);
+        }
+        assert_eq!(balance(&t, "bob.test"), 0);
+        // Once each has removed its delegate key, no key of its account is one, and the same
+        // relayed pick goes through.
+        for (who, id, now) in [
+            (JUDGE, judged, REVEAL_DEADLINE),
+            ("alice.test", fallback, PICK_DEADLINE),
+        ] {
+            testing_env!(ctx(who).attached_deposit(ONE_YOCTO).build());
+            t.remove_delegate(key(7));
+            testing_env!(ctx(who)
+                .signer_account_id(acct("carol.test"))
+                .signer_account_pk(key(3))
+                .block_timestamp(now)
+                .build());
+            t.pick(
+                U64(id),
+                winners(bob),
+                SCORECARD_HASH.to_string(),
+                SCORECARD_URI.to_string(),
+            );
+        }
+        assert_eq!(balance(&t, "bob.test"), 2 * 950_000);
     }
 
     /// A key that may spend is never a key that judges. A pick, empty or not, signed by a delegate

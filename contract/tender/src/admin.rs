@@ -189,9 +189,11 @@ impl Tender {
     /// `MAX_BOND_COOLDOWN_SECS`, 56 days (`E_WINDOW`). It applies to the agents that unregister
     /// from now on; one that has unregistered keeps the time it was given.
     ///
-    /// A cooldown at least as long as the commit windows tasks use keeps a bond locked until those
-    /// windows close, so one bond cannot be passed from account to account to seat several
-    /// entrants in one task. Requires 1 yoctoNEAR and the owner.
+    /// The cooldown does not decide whether one bond can seat several accounts in one task: each
+    /// open-task entry locks its agent's bond until that task's commit deadline (`locked_until`),
+    /// whatever the cooldown. The bound is checked when the cooldown is set; a later
+    /// `set_min_window` above it leaves it as it is, which is harmless for the same reason.
+    /// Requires 1 yoctoNEAR and the owner.
     #[payable]
     #[deny_unknown_arguments]
     pub fn set_agent_bond_cooldown(&mut self, secs: U64) {
