@@ -97,6 +97,16 @@ interface WorldOptions {
   failPost?: { n: number; error: Error };
   /** Child number `n` lands, and the answer to the post is lost: the client times out. */
   lostPost?: { n: number };
+  /**
+   * Child number `n` is slow, as under congestion: the client gives up (`E_TIMEOUT`) after
+   * `giveUpSecs` of chain time, and the transaction lands `landsAfterSecs` after it was sent, or
+   * never if that is huge.
+   */
+  slowPost?: { n: number; giveUpSecs: number; landsAfterSecs: number };
+  /** This many other tasks are made on the chain just before the lead's lost or slow post lands. */
+  crowd?: number;
+  /** What the client says its sends wait for, in milliseconds. Default: it says nothing. */
+  sendTimeoutMs?: number;
   /** Makes the Nth commit (from 1) fail once; the default is the first. With no `n`, every one. */
   failCommit?: { error: Error; n?: number };
   /** The Nth call of the API's `getTask` for a child throws once; "always" makes every one throw. */
@@ -138,16 +148,50 @@ function buildWorld(o: WorldOptions = {}) {
   let blobReads = 0;
   let clockReads = 0;
   let commitCalls = 0;
+  /** The `limit` of every page of tasks the lead read. */
+  const pageReads: number[] = [];
   let postFailed = false;
+  let slowSent = false;
   const world = { phase: "open" as "open" | "revealing" };
 
   const parentCommitDeadline = T0 + BigInt(o.commitSecs ?? 3600) * NS;
-  const nextId = () => BigInt(PARENT_ID + 1 + children.length);
+  /** The number of tasks on the chain: the ids are 1 to this. */
+  let total = BigInt(PARENT_ID);
+  const nextId = () => {
+    total += 1n;
+    return total;
+  };
+  /** Posts the client gave up on that are still on their way. */
+  const pending: Array<{ input: PostTaskInput; opts: SpendOptions | undefined; landAt: bigint }> =
+    [];
+  /** Lets the posts that are due land. Every read of the chain starts with it. */
+  const land = () => {
+    for (const post of pending.filter((one) => one.landAt <= now)) {
+      pending.splice(pending.indexOf(post), 1);
+      total += BigInt(o.crowd ?? 0);
+      children.push({ id: nextId(), input: post.input, opts: post.opts, polls: 0 });
+    }
+  };
+  /** A task as the chain shows it: the lead's child, or one of somebody else's. */
+  const viewOf = (id: bigint): TaskView => {
+    const child = children.find((one) => one.id === id);
+    return (
+      child === undefined
+        ? { id: String(id), poster: STRANGER, parent: null, brief_hash: "0".repeat(64) }
+        : {
+            id: String(id),
+            poster: LEAD,
+            parent: String(PARENT_ID),
+            brief_hash: child.input.briefHash,
+          }
+    ) as TaskView;
+  };
 
   const client: LeadChain & AgentChain = {
     network: "testnet",
     contractId: CONTRACT,
     accountId: LEAD,
+    sendTimeoutMs: o.sendTimeoutMs,
     async commit(taskId, commitment) {
       commitCalls += 1;
       events.push("commit");
@@ -178,6 +222,7 @@ function buildWorld(o: WorldOptions = {}) {
       return entries.get(String(taskId)) ?? null;
     },
     async postTask(input, opts) {
+      land();
       const n = children.length;
       events.push(`post ${n}`);
       if (o.postDelayMs !== undefined) await delay(o.postDelayMs);
@@ -185,6 +230,13 @@ function buildWorld(o: WorldOptions = {}) {
         postFailed = true;
         throw o.failPost.error;
       }
+      if (o.slowPost?.n === n && !slowSent) {
+        slowSent = true;
+        pending.push({ input, opts, landAt: now + BigInt(o.slowPost.landsAfterSecs) * NS });
+        now += BigInt(o.slowPost.giveUpSecs) * NS;
+        throw new TenderError("E_TIMEOUT", "TenderClient.send timed out; the transaction may land");
+      }
+      if (o.lostPost?.n === n && !postFailed) total += BigInt(o.crowd ?? 0);
       const id = nextId();
       children.push({ id, input, opts, polls: 0 });
       // A post takes a few seconds of chain time.
@@ -197,22 +249,21 @@ function buildWorld(o: WorldOptions = {}) {
       return { txHash: `tx-post-${n}`, taskId: id } as TxResult & { taskId: bigint };
     },
     async blockTimestampNs() {
+      land();
       clockReads += 1;
       if (o.failClock === clockReads) throw new Error("the node did not answer");
       return now;
     },
     async taskCount() {
-      return BigInt(PARENT_ID + children.length);
+      land();
+      return total;
     },
-    async getTask(id) {
-      const child = children.find((one) => one.id === id);
-      if (child === undefined) return null;
-      return {
-        id: String(id),
-        poster: LEAD,
-        parent: String(PARENT_ID),
-        brief_hash: child.input.briefHash,
-      } as TaskView;
+    async getTasks(fromId, limit) {
+      land();
+      pageReads.push(limit);
+      const page: TaskView[] = [];
+      for (let id = fromId; id <= total && page.length < limit; id++) page.push(viewOf(id));
+      return page;
     },
     async balanceOf() {
       return o.vault ?? 6_000_000n;
@@ -377,6 +428,9 @@ function buildWorld(o: WorldOptions = {}) {
     commits,
     reveals,
     blobs,
+    pageReads,
+    /** Lets the posts that are due land, as the next read of the chain would. */
+    settle: land,
     state: world,
     /** Moves the chain's clock on. */
     advance(secs: number) {
@@ -1168,12 +1222,16 @@ describe("fix round 1: I2, a failed call is tried again and the job survives a r
     expect(jobOf().intent).toBeDefined();
 
     // A new process on the same journal and drafts. The intent is too young to call lost, so it
-    // looks at the chain, finds nothing, and waits; a minute later it posts the third part.
+    // looks at the chain, finds nothing, and waits. A minute is not enough either (the send may
+    // still land: N1); once the send has had its time twice and a margin it posts the third part.
     const lines: string[] = [];
     const second = leadOf(world, {}, lines);
     await second.tick();
     expect(world.children).toHaveLength(2);
     world.advance(61);
+    await second.tick();
+    expect(world.children).toHaveLength(2);
+    world.advance(240);
     await finish(second);
     expect(world.children).toHaveLength(3);
     expect(new Set(world.children.map((one) => one.input.briefHash)).size).toBe(3);
@@ -1282,5 +1340,104 @@ describe("swarm fix: N2, a note the lead wrote before a post is still there afte
       "done",
     );
     expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
+  });
+});
+
+describe("swarm fix: N1, a post is not called lost while it may still land", () => {
+  const distinct = (world: World) => new Set(world.children.map((one) => one.input.briefHash)).size;
+
+  test("N1_a_slow_post_that_lands_after_a_minute_is_not_hired_twice", async () => {
+    // Part 2 is sent; the client gives up after 120 s; the transaction, held up by congestion, lands
+    // 150 s after it was sent. A lead that called the post lost after 60 s would post it again.
+    const world = buildWorld({ slowPost: { n: 1, giveUpSecs: 120, landsAfterSecs: 150 } });
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead, 600, () => world.advance(10));
+
+    world.advance(3600);
+    world.settle();
+    expect(world.children).toHaveLength(3);
+    expect(distinct(world)).toBe(3);
+    expect(world.events.filter((event) => event === "post 1")).toHaveLength(1);
+    expect(jobOf().hires.map((one) => one.slug)).toEqual(SLUGS);
+    expect(jobOf().status).toBe("done");
+    expect(lines.join("\n")).toMatch(/part 02-key-audit was posted already, as task 12/);
+    expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
+  });
+
+  /**
+   * A post that never lands: the seconds, by the chain's clock, from when it was sent to when the
+   * lead sent it again.
+   */
+  async function secondsBeforeTheSecondPost(clientSays: number | undefined): Promise<number> {
+    let sentAgainAt = 0n;
+    const world = buildWorld({
+      sendTimeoutMs: clientSays,
+      slowPost: { n: 1, giveUpSecs: (clientSays ?? 120_000) / 1000, landsAfterSecs: 1_000_000 },
+      hooks: {
+        afterLand: (n) => {
+          if (n === 1) sentAgainAt = world.now();
+        },
+      },
+    });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    // The first send of part 2 is at 3 s of chain time (part 1's post took 3).
+    await finish(lead, 3000, () => world.advance(10));
+    expect(world.children).toHaveLength(3);
+    expect(distinct(world)).toBe(3);
+    expect(world.events.filter((event) => event === "post 1")).toHaveLength(2);
+    // The second post took 3 s of chain time itself: `sentAgainAt` is after it.
+    return Number((sentAgainAt - T0) / NS) - 3 - 3;
+  }
+
+  test("N1_a_post_that_never_lands_is_sent_again_only_after_the_send_had_its_time_twice_and_a_margin", async () => {
+    // 120 s for the send, as much again for the wait in the account's queue, and a minute.
+    const secs = await secondsBeforeTheSecondPost(undefined);
+    expect(secs).toBeGreaterThanOrEqual(300);
+    expect(secs).toBeLessThan(300 + 40);
+  });
+
+  test("N1_the_time_a_post_is_given_follows_what_the_client_says_its_sends_wait_for", async () => {
+    const secs = await secondsBeforeTheSecondPost(200_000);
+    expect(secs).toBeGreaterThanOrEqual(2 * 200 + 60);
+    expect(secs).toBeLessThan(2 * 200 + 60 + 40);
+  });
+
+  test("N1_a_post_among_hundreds_of_other_tasks_is_found_and_not_posted_again", async () => {
+    // 260 tasks of other people were made on the chain before the lead's lost post landed, which is
+    // more than a short look past the intent would read.
+    const world = buildWorld({ lostPost: { n: 1 }, crowd: 260 });
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead, 600, () => world.advance(10));
+    expect(world.children).toHaveLength(3);
+    expect(distinct(world)).toBe(3);
+    expect(lines.join("\n")).toMatch(/part 02-key-audit was posted already, as task 272/);
+    expect(jobOf().status).toBe("done");
+  });
+
+  test("N1_a_look_through_the_chain_that_is_not_finished_is_not_proof_that_the_post_is_not_there", async () => {
+    // 1200 other tasks, then the lead's. A pass reads a limited number of pages, so the post is
+    // found on the third; however old the intent, nothing is sent again before the look is over.
+    const world = buildWorld({ lostPost: { n: 1 }, crowd: 1200 });
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await lead.tick();
+    expect(world.children).toHaveLength(2);
+    // Far older than a lost post is called, and inside the parent's commit window.
+    world.advance(400);
+    await lead.tick();
+    await lead.tick();
+    expect(world.children).toHaveLength(2);
+    expect(lines.join("\n")).not.toMatch(/did not land/);
+    await finish(lead);
+    expect(world.children).toHaveLength(3);
+    expect(distinct(world)).toBe(3);
+    expect(lines.join("\n")).toMatch(/was posted already, as task 1212/);
+    expect(Math.max(...world.pageReads)).toBeLessThanOrEqual(50);
   });
 });

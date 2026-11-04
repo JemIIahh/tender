@@ -64,6 +64,12 @@ import type { Solver, TaskContext } from "../types";
 // is on the disk and its name is too (`writeFileAtomic`: temp file synced, renamed, folder synced);
 // a write that cannot be made so fails, and the post that waited on it is not sent.
 //
+// A post is sent again only when it provably is not there: the lead has looked through every task
+// made on the chain since the note and found no child of its own, and the note is older than the
+// client's send timeout twice over plus a minute (`reconcile`). A client that gave up on a send has
+// not seen it fail: under congestion the transaction can still land, and a part posted twice is
+// paid for twice.
+//
 // A call that fails and says nothing of the chain (a timeout, a 5xx, a node that blinked) is tried
 // again, after a pause that doubles up to `maxBackoffMs`, until the parent's commit deadline; one
 // failed poll never costs the parent. What the contract refuses (a code of its own: `E_AUTH` past
@@ -114,13 +120,17 @@ const DEFAULT_POLL_MS = 2_000;
 const DEFAULT_BACKOFF_MS = 1_000;
 /** The longest pause between two tries of a job that keeps failing, in milliseconds. */
 const DEFAULT_MAX_BACKOFF_MS = 30_000;
+/** What a client's send waits for, in milliseconds, when the client does not say: `TenderClient`'s. */
+const DEFAULT_SEND_TIMEOUT_MS = 120_000;
 /**
- * How long, by the chain's clock, a post the lead cannot find on the chain is given before it is
- * taken for lost, in seconds: a transaction that was sent is in a block within seconds or never.
+ * The chain seconds a post is given, on top of the time its send can take, before it is taken for
+ * lost: a transaction that the client has stopped waiting for can still be in a block a little later.
  */
-const RECONCILE_SECS = 60;
-/** The most tasks a lookup for a lost post reads. */
-const RECONCILE_SCAN = 200;
+const LOST_MARGIN_SECS = 60;
+/** The tasks of one page of a look for a lost post: the most the contract's `get_tasks` gives. */
+const SCAN_PAGE = 50;
+/** The pages one pass reads when it looks for a lost post, so that a long look does not hold up the rest. */
+const SCAN_PAGES_PER_PASS = 10;
 const NS_PER_SEC = 1_000_000_000n;
 const NO_SIGNER = "this lead's client has no signer, so it cannot commit or post";
 
@@ -134,9 +144,9 @@ export interface ChildWindows {
 
 /**
  * What the lead needs of a `TenderClient`: the network and contract its drafts are bound to, the
- * account it signs as, the commit, the post, the chain's clock, its own entry and the tasks it has
- * posted (to find a post that was lost), and the delegate key's caps and the vault (`view`,
- * `balanceOf`).
+ * account it signs as, the commit, the post, the chain's clock, its own entry and the tasks on the
+ * chain (to find a post that was lost, `taskCount` and `getTasks`), how long a send waits, and the
+ * delegate key's caps and the vault (`view`, `balanceOf`).
  */
 export type LeadChain = Pick<
   TenderClient,
@@ -148,10 +158,13 @@ export type LeadChain = Pick<
   | "blockTimestampNs"
   | "getEntry"
   | "taskCount"
-  | "getTask"
+  | "getTasks"
   | "balanceOf"
   | "view"
->;
+> & {
+  /** How long a send waits for its outcome, in milliseconds (`TenderClient` says; default 120000). */
+  readonly sendTimeoutMs?: number;
+};
 
 /** What the lead needs of the API: the sub-tasks it watches, and the uploads of a poster. */
 export type LeadApi = Pick<TenderApi, "getTask" | "getBlob" | "uploadBlob" | "uploadHeldout">;
@@ -641,6 +654,13 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
   const posters = postersOf(o);
   // Resolved now, so that a later `chdir` cannot move the journal.
   const journalDir = resolve(o.journalDir);
+  // A post is not taken for lost before its send has had its time, twice (once for the wait in the
+  // account's send queue, behind the runner's own sends, which the intent's clock includes; once for
+  // the send itself), and a margin on top. See `reconcile`.
+  const sendSecs = Math.ceil((client.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS) / 1000);
+  const lostAfterNs = BigInt(2 * sendSecs + LOST_MARGIN_SECS) * NS_PER_SEC;
+  /** Where each look for a lost post has got to, so that a pass goes on where the last stopped. */
+  const scanned = new Map<string, bigint>();
 
   /** The windows a sub-task is posted with. */
   const windowsOf = (spec: ChildSpec): ChildWindows => o.windows ?? spec.windows;
@@ -873,40 +893,61 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
   }
 
   /**
-   * Settles an intent the job holds: asks the chain whether the post landed. If a task of the lead,
-   * under the parent, with the part's brief, was made since, that is the hire. If none was and the
-   * intent is old enough that a sent transaction would be in a block by now, the post is lost and
-   * the intent goes. Otherwise it is too soon to say: null, and the job is looked at again later.
+   * Settles an intent the job holds: asks the chain whether the post landed, and re-posts only when
+   * it provably did not.
+   *
+   * A task of the lead's, under the parent, with the part's brief, made since the intent is the
+   * hire. The chain is the authority, read as final blocks (the API's index trails it, so it cannot
+   * show that a post is missing). The look goes through every task made since the intent, a few
+   * pages a pass, and goes on where it stopped; a look that is not over proves nothing.
+   *
+   * A post is lost only if the look is over and the intent is old enough. A send may take
+   * `sendTimeoutMs` after its turn in the account's queue, where it can wait behind one send of the
+   * runner's, and the client's timeout then says only that it stopped waiting: the transaction may
+   * still be in flight. The post is given both times and a margin (`lostAfterNs`) before it is taken
+   * for lost, and what happens after that is a transaction that was held back for longer than that.
+   * The clock is read before the count and the count before the tasks, so that a task that is in a
+   * block by the time the clock says is read.
+   *
+   * Null: it is too soon to say, and the job is looked at again later.
    */
   async function reconcile(job: Job): Promise<Job | null> {
     const intent = job.intent;
     const spec = specs.find((one) => one.slug === intent?.slug);
     if (intent === undefined || spec === undefined) return save({ ...job, intent: undefined });
-    const first = BigInt(intent.countBefore) + 1n;
+    const now = await client.blockTimestampNs();
     const count = await client.taskCount();
-    const stop = first + BigInt(RECONCILE_SCAN);
-    for (let id = first; id <= count && id < stop; id++) {
-      const task = await client.getTask(id);
-      if (
-        task !== null &&
-        task.poster === job.account &&
-        task.parent === job.parent &&
-        task.brief_hash === spec.brief.hash
-      ) {
-        log(`part ${spec.slug} was posted already, as task ${id}`);
+    const key = `${job.parent}/${intent.slug}/${intent.countBefore}`;
+    let next = scanned.get(key) ?? BigInt(intent.countBefore) + 1n;
+    for (let pages = 0; next <= count && pages < SCAN_PAGES_PER_PASS; pages++) {
+      const room = count - next + 1n;
+      const page = await client.getTasks(next, Number(room < BigInt(SCAN_PAGE) ? room : SCAN_PAGE));
+      const last = page.at(-1);
+      // An empty page, or one that does not move on, is a look that cannot be finished.
+      if (last === undefined || BigInt(last.id) < next) break;
+      const found = page.find(
+        (task) =>
+          task.poster === job.account &&
+          task.parent === job.parent &&
+          task.brief_hash === spec.brief.hash,
+      );
+      if (found !== undefined) {
+        scanned.delete(key);
+        log(`part ${spec.slug} was posted already, as task ${found.id}`);
         return save({
           ...job,
           intent: undefined,
-          hires: [...job.hires, { slug: spec.slug, id: id.toString() }],
+          hires: [...job.hires, { slug: spec.slug, id: found.id }],
         });
       }
+      next = BigInt(last.id) + 1n;
     }
-    const age = (await client.blockTimestampNs()) - BigInt(intent.at);
-    if (age >= BigInt(RECONCILE_SECS) * NS_PER_SEC) {
-      log(`the post for part ${spec.slug} did not land; it will be sent again`);
-      return save({ ...job, intent: undefined });
-    }
-    return null;
+    scanned.set(key, next);
+    if (next <= count) return null;
+    if (now - BigInt(intent.at) < lostAfterNs) return null;
+    scanned.delete(key);
+    log(`the post for part ${spec.slug} did not land; it will be sent again`);
+    return save({ ...job, intent: undefined });
   }
 
   async function hiring(start: Job): Promise<Job> {
