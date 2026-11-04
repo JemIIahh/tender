@@ -307,8 +307,18 @@ export async function initAgent(
   if (options.account !== undefined && !AccountIdSchema.safeParse(options.account).success) {
     throw new UsageError("--account is not a valid NEAR account id");
   }
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  await chmod(dir, 0o700);
+  // The mode of a directory is changed only when this command has just made it. One that was there
+  // already is the user's (`--dir ~` is a mistake that would have changed their home), so it is
+  // used as it is if only its owner can enter it, and refused if others can.
+  const made = await mkdir(dir, { recursive: true, mode: 0o700 });
+  if (made !== undefined) {
+    await chmod(dir, 0o700);
+  } else if (((await stat(dir)).mode & 0o077) !== 0) {
+    throw new UsageError(
+      `${dir} can be entered by other users of this machine; use a directory of your own that ` +
+        "only you can enter (mode 700), or one that does not exist yet",
+    );
+  }
   const pair = KeyPair.fromRandom("ed25519");
   const publicKey = pair.getPublicKey().toString();
   const path = fileOf(dir, name);

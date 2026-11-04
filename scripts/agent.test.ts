@@ -353,6 +353,29 @@ test("a_command_refuses_a_key_directory_inside_the_repository_as_init_does", asy
   await expect(claimBondCommand(options({ dir: REPO }))).rejects.toThrow(NOT_IGNORED);
 });
 
+test("init_leaves_the_mode_of_a_directory_that_was_there_and_refuses_one_others_can_enter", async () => {
+  // A directory of the user's own, which only they can enter: used as it is.
+  const mine = join(dir, "mine");
+  await mkdir(mine, { mode: 0o700 });
+  await initAgent({ name: "scout", network: "sandbox", dir: mine, log });
+  expect((await stat(mine)).mode & 0o777).toBe(0o700);
+
+  // One that others can enter (a home directory, say): refused, its mode kept, nothing written.
+  const shared = join(dir, "shared");
+  await mkdir(shared);
+  await chmod(shared, 0o755);
+  await expect(initAgent({ name: "scout", network: "sandbox", dir: shared, log })).rejects.toThrow(
+    /can be entered by other users/,
+  );
+  expect((await stat(shared)).mode & 0o777).toBe(0o755);
+  expect(await exists(join(shared, "scout.json"))).toBe(false);
+
+  // A directory the command makes is 0700.
+  const fresh = join(dir, "fresh", "keys");
+  await initAgent({ name: "scout", network: "sandbox", dir: fresh, log });
+  expect((await stat(fresh)).mode & 0o777).toBe(0o700);
+});
+
 test("init_keeps_the_account_when_it_is_given_and_checks_it", async () => {
   await init("scout", ACCOUNT);
   expect(JSON.parse(await readFile(join(keys, "scout.json"), "utf8")).account).toBe(ACCOUNT);
