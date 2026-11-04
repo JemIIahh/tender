@@ -395,8 +395,12 @@ export function PickPanel({
             </button>
           ) : null}
         </div>
-        {/* Only where the shares stand is announced as it changes, not every amount. */}
-        <p aria-live="polite" className="text-sm text-muted empty:hidden">
+        {/* Only where the shares stand is announced as it changes, not every amount. The region is
+            always there, so that its first words are announced too; empty, it takes no room. */}
+        <p
+          aria-live="polite"
+          className={payout === null || chosen.length > 1 ? "text-sm text-muted" : "sr-only"}
+        >
           {payout === null ? (
             <span data-testid="pick-problem">{choice.problem}</span>
           ) : chosen.length > 1 ? (
@@ -450,7 +454,9 @@ export function PickPanel({
               type="button"
               aria-disabled={busy || payout === null}
               onClick={() => {
-                if (payout === null) return;
+                // A press while a send runs changes nothing: the buttons are only aria-disabled, and
+                // the ref holds from the first press on, before the page has drawn it as busy.
+                if (busy || sending.current || payout === null) return;
                 // The winners are sent, so the question about picking nobody is closed.
                 setConfirming(false);
                 void send(choice.winners);
@@ -538,7 +544,8 @@ export function PickPanel({
           {task.heldout_commitment === null ? null : (
             <p data-testid="pick-heldout-note" className="text-[12.5px] leading-relaxed text-muted">
               This page doesn't publish the task's held-out checks: the scorecard shows them as not
-              published. A pick with Tender's MCP tools (pick_winners) can publish them.
+              published. A pick with Tender's MCP tools (pick_winners) can publish them, if you have
+              the file.
             </p>
           )}
           <p className="text-[12.5px] leading-relaxed text-muted">

@@ -226,6 +226,38 @@ test("picking_nobody_asks_first_and_says_the_agents_are_not_paid", async () => {
   expect(within(pick).queryByTestId("pick-nobody-confirm")).toBeNull();
 });
 
+test("a_send_stays_on_its_own_button_whichever_is_pressed_while_the_other_waits", async () => {
+  const data = judged(PERSON);
+  setup(PERSON, { task: data });
+  await show(data, IN_JUDGING);
+  keepToken({ accountId: PERSON, token: "tok", expiresAtMs: Date.now() + 60_000 }, signInTicket());
+  const user = userEvent.setup();
+  const pick = screen.getByTestId("action-pick");
+  await user.click(within(pick).getByRole("checkbox", { name: `Winner: ${ALICE}` }));
+
+  // The question about picking nobody is open, and Pick is pressed: the question closes, and the
+  // pick's stage is on the Pick button.
+  await user.click(within(pick).getByRole("button", { name: "Pick nobody" }));
+  expect(within(pick).getByTestId("pick-nobody-confirm")).toBeTruthy();
+  await user.click(within(pick).getByRole("button", { name: "Pick the winner" }));
+  expect(within(pick).queryByTestId("pick-nobody-confirm")).toBeNull();
+  await within(pick).findByRole("alert");
+
+  // Now the other way: "Yes, pick nobody" is sent, and a press of Pick while it runs leaves the
+  // question open and its stage on its own button.
+  await user.click(within(pick).getByRole("button", { name: "Pick nobody" }));
+  const confirm = within(pick).getByTestId("pick-nobody-confirm");
+  act(() => {
+    within(confirm).getByRole("button", { name: "Yes, pick nobody" }).click();
+    within(pick).getAllByRole("button")[0]?.click();
+  });
+  expect(within(pick).getByTestId("pick-nobody-confirm")).toBe(confirm);
+  expect(within(confirm).getAllByRole("button")[0]?.textContent).toMatch(/…$/);
+  await waitFor(() =>
+    expect(within(pick).getByRole("alert").textContent).toMatch(/^Tender refused the pick/),
+  );
+});
+
 test("the_poster_picks_in_the_fallback_window_even_when_the_judge_was_the_verifier", async () => {
   setup(POSTER);
   await show(judged(JUDGE), IN_FALLBACK);
