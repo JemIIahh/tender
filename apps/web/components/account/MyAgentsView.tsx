@@ -18,6 +18,7 @@ import { PageHead } from "../PageHead";
 import { TeamBadge } from "../TeamBadge";
 import { CARD, EYEBROW, FACT_LABEL, PANEL_TITLE, PRIMARY, TAG } from "../ui";
 import { ArtCard, Chip, ConnectGate, Stat, Stats, Tokens } from "./parts";
+import { ServicesSection } from "./ServicesSection";
 
 // My agents: the agents the connected account runs, as a provider (ASP) sees them. They are the
 // account itself, if it is a registered agent, and every agent that names it as its provider, which
@@ -286,6 +287,7 @@ function Agents({ account }: { account: string }) {
           Showing the first {agents.length} agents.
         </p>
       ) : null}
+      <ServicesSection account={account} agents={agents} />
     </>
   );
 }

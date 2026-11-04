@@ -1,4 +1,10 @@
-import type { AccountEntry, AgentSummary, TaskDetailResponse, TaskSummary } from "@tender/shared";
+import type {
+  AccountEntry,
+  AgentSummary,
+  Service,
+  TaskDetailResponse,
+  TaskSummary,
+} from "@tender/shared";
 import { vi } from "vitest";
 import { base58Encode } from "../lib/agentKey";
 import type { Session, SigningWallet } from "../lib/wallet";
@@ -82,6 +88,10 @@ export interface World {
   config: Record<string, unknown>;
   /** A path that answers 500, as `/v1/agents`. */
   failing: Set<string>;
+  /** `GET /v1/services?provider=`, the provider's services, newest first; a write changes them. */
+  services: Service[];
+  /** The `Authorization` header of each write to `/v1/services`. */
+  serviceAuth: Array<string | null>;
   /** Every request, as `GET /v1/path?query` or `RPC view_account x`. */
   requests: string[];
   /** Every request body sent, as text: what left the page. */
@@ -98,6 +108,8 @@ export function world(): World {
     accounts: new Map([[ALICE, []]]),
     config: { owner: "tender.testnet", fee_bps: 500 },
     failing: new Set(),
+    services: [],
+    serviceAuth: [],
     requests: [],
     bodies: [],
   };
@@ -158,8 +170,53 @@ export function serve(state: World): void {
         next_cursor: null,
       });
     }
+    if (url.pathname.startsWith("/v1/services")) return serveServices(state, url, init);
     return notFound();
   });
+}
+
+/**
+ * The provider's services: the list, and the two writes, which change `state.services` as the API
+ * would (a listing is the provider's, a change merges into the service).
+ */
+function serveServices(state: World, url: URL, init: RequestInit): Response {
+  const method = init.method ?? "GET";
+  if (method === "GET" && url.pathname === "/v1/services") {
+    const provider = url.searchParams.get("provider");
+    return json({
+      services: state.services.filter((one) => provider === null || one.provider === provider),
+      next_cursor: null,
+    });
+  }
+  if (method !== "POST") return notFound();
+  const headers = new Headers(init.headers);
+  state.serviceAuth.push(headers.get("authorization"));
+  const body = JSON.parse(String(init.body ?? "{}")) as Partial<Service> & { status?: string };
+  const id = /^\/v1\/services\/(\d+)$/.exec(url.pathname)?.[1];
+  if (id === undefined) {
+    const made = {
+      ...(state.services[0] ?? ({} as Service)),
+      ...body,
+      id: String(100 + state.services.length),
+      provider: ALICE,
+      status: "active",
+      available: true,
+      verification: { kind: "hirer" },
+    } as Service;
+    state.services.unshift(made);
+    return json({ service: made });
+  }
+  const at = state.services.findIndex((one) => one.id === id);
+  const was = state.services[at];
+  if (was === undefined) return notFound();
+  const changed = {
+    ...was,
+    ...body,
+    verification: was.verification,
+    available: (body.status ?? was.status) === "active",
+  } as Service;
+  state.services[at] = changed;
+  return json({ service: changed });
 }
 
 /** A transaction an account wallet was asked to send. */
