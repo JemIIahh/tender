@@ -82,6 +82,13 @@ let reader: TenderClient;
 let poster: TenderClient;
 /** No deployment record is in it, so nothing in the repository says where the indexer starts. */
 let deploymentsDir: string;
+/**
+ * A directory with no env file and no `deployments/`, which the processes of `runServe` take for
+ * the place of both (`TENDER_ENV_DIR`): what they read must not depend on the `.env`,
+ * `.env.deploy.<network>` and `deployments/<network>.json` that this checkout, or the machine that
+ * runs the tests, happens to have.
+ */
+let emptyEnvDir: string;
 let keyDir: string;
 /** The keeper's and the Judge's function-call keys, as the key script wrote them. */
 let keeperKey: string;
@@ -107,6 +114,7 @@ beforeAll(async () => {
     signer: chain.accounts.poster,
   });
   deploymentsDir = await mkdtemp(join(tmpdir(), "tender-serve-deployments-"));
+  emptyEnvDir = await mkdtemp(join(tmpdir(), "tender-serve-env-"));
 
   keyDir = await mkdtemp(join(tmpdir(), "tender-serve-keys-"));
   const { keeper, judge } = chain.accounts;
@@ -139,7 +147,7 @@ afterAll(async () => {
   await Promise.all(running.map((services) => services.stop()));
   await Promise.all(fakes.map((fake) => fake.close()));
   await chain?.stop();
-  for (const dir of [deploymentsDir, keyDir, ...dirs]) {
+  for (const dir of [deploymentsDir, emptyEnvDir, keyDir, ...dirs]) {
     if (dir) await rm(dir, { recursive: true, force: true });
   }
 });
@@ -1425,13 +1433,15 @@ test("serve_ends_on_a_pglite_directory_that_another_process_took_over", async ()
 
 /**
  * `scripts/serve.ts` as `pnpm serve` runs it, in a process of its own on `env` alone, so that
- * nothing of this process's own reaches it. What it prints is kept, and `printed` and `end` wait
- * for it, failing with everything it printed if it ends first or takes too long.
+ * nothing of this process's own reaches it, and nothing of the repository's: its env files and
+ * `deployments/` are those of `emptyEnvDir` (`TENDER_ENV_DIR`), unless `env` names another. What
+ * it prints is kept, and `printed` and `end` wait for it, failing with everything it printed if it
+ * ends first or takes too long.
  */
 function runServe(env: Record<string, string>) {
   const child = spawn(process.execPath, ["--import", "tsx", "scripts/serve.ts"], {
     cwd: REPO_ROOT,
-    env: { PATH: process.env.PATH ?? "", ...env },
+    env: { PATH: process.env.PATH ?? "", TENDER_ENV_DIR: emptyEnvDir, ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
   children.push(child);

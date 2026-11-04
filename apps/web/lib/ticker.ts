@@ -114,21 +114,6 @@ async function readPayout(): Promise<TickerData["payout"]> {
   return { taskId: picked.id, token: picked.token, amount };
 }
 
-/**
- * Reads what the app's sidebar shows: the ticker's figures less the recent payout, which takes two
- * more reads and has no room there. A read that fails is left out; this never throws.
- */
-export async function readStats(): Promise<TickerData> {
-  const [open, agents, health] = await Promise.allSettled([
-    api.listTasks({ phase: "open", limit: PAGE }),
-    api.listAgents({ limit: PAGE }),
-    api.health(),
-  ]);
-  const value = <T>(result: PromiseSettledResult<T>) =>
-    result.status === "fulfilled" ? result.value : undefined;
-  return { open: value(open), agents: value(agents), health: value(health) };
-}
-
 /** Reads what the ticker shows. A read that fails is left out; this never throws. */
 export async function readTicker(): Promise<TickerData> {
   const [open, agents, payout, health] = await Promise.allSettled([

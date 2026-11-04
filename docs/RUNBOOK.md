@@ -125,6 +125,7 @@ Rules:
 - The index trails the chain by a few blocks. It reads finalized blocks from the NEAR Data API.
 - **Back up the database.** The chain stores only hashes and URIs. The uploaded briefs, criteria, held-out checks, revealed entries, sign-ins and Telegram links are in the database and nowhere else. The index can be rebuilt from the chain; the uploads cannot.
 - Do not set the `DEBUG` variable where the services run: the `debug` package writes to stderr past the redaction that keeps secrets out of the logs.
+- `pnpm serve` reads `.env` and `.env.deploy.<network>` from the repository root, and the indexer reads `deployments/<network>.json` from there. Set `TENDER_ENV_DIR` in the process's environment to read all three from another directory instead (`<dir>/.env`, `<dir>/.env.deploy.<network>`, `<dir>/deployments/`). A variable set in `.env` does not do this. Unset, nothing changes. `pnpm seed`, `pnpm deploy:testnet`, `pnpm skeleton`, `scripts/keeper-key.ts` and the run-agent command read the same variable. Rules for the directory: give an absolute path (a leading `~` is not expanded, and a relative path is taken from the working directory); it must already exist, or the command stops and names the variable; and `pnpm deploy:testnet` and `scripts/keeper-key.ts` also **write** to it (the full-access keys into `<dir>/.env.deploy.<network>`, the record into `<dir>/deployments/`), so name a directory that only you can write to, never `/tmp` or any other shared directory. The agent key store `.tender/agents` (`pnpm agent:init`) stays under the repository, wherever the variable points: the agent commands take only their target (`.env` and the record) from it.
 
 ### Behind a proxy: TRUSTED_PROXY_HOPS
 
@@ -240,6 +241,7 @@ Notes:
 
 - Set `NEAR_SANDBOX_BIN_PATH` to a verified nearcore 2.13.4 sandbox binary to avoid a download.
 - Set `TENDER_SEEDS_PRIVATE_DIR` to the private seed directory so that every seed test runs. Without it those tests skip, with one note.
+- The tests do not read the `.env`, `.env.deploy.<network>` and `deployments/<network>.json` of the checkout, so a deployed testnet on the machine changes no result. A test that starts `pnpm serve` or the run-agent command as a process sets `TENDER_ENV_DIR` to an empty directory of its own; the others pass the directory they want to the function they call. A new test that starts one of these as a process must do the same.
 - `pnpm test` takes about three minutes on a quiet machine and can fail with timeouts on a busy one. Re-run a failing file by itself before deciding it is broken: `pnpm exec vitest run --project <name> <file>`.
 - To run the Postgres paths, set `TEST_DATABASE_URL` to a Postgres 17 database. These paths have never run in CI.
 - `pnpm demo:local` runs the whole loop on a local chain in about 75 seconds and prints `DEMO OK`. The swarm demo is `pnpm exec tsx scripts/swarm-demo.ts`.

@@ -295,11 +295,13 @@ export function MyAgentsView() {
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
       <PageHead
-        eyebrow="Account"
+        eyebrow="Agents"
         title="My agents."
         muted="What they entered, won and earned."
         art={{ name: "scale", focus: { x: 0.62, y: 0.55, scale: 0.42 } }}
-      />
+      >
+        Your agent service provider (ASP) dashboard: your agents, as their provider.
+      </PageHead>
       <ConnectGate
         wallet={wallet}
         art="scorecard"

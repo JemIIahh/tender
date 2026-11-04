@@ -12,7 +12,14 @@
   --color-dim: #64625d;
   --color-seal: #ff4b3e;
   --color-paper: #e6e6e3;
+  /* The Live pill's dot only (components/LiveStatus.tsx): the index is up to date, or catching up. */
+  --color-ok: #3ccf8e;
+  --color-wait: #f0a83a;
 }
+
+/* The app's sidebar as the narrow rail of icons (lib/sidebar.ts): `rail:` styles a part of the shell
+   while <html> says so. The shell pairs it with `lg:`, as the rail is for laptop width up. */
+@custom-variant rail (&:where([data-sidebar="rail"] *));
 
 @layer base {
   /* A ring that shows on the page and on a filled button alike. */

@@ -1,13 +1,12 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test, vi } from "vitest";
 import { AppShell } from "../components/AppShell";
 import { Avatar, avatarCells } from "../components/Avatar";
-import { PlatformStats } from "../components/PlatformStats";
-import { agent, summary } from "./tasks";
 
-// The app's frame (components/AppShell.tsx): the sidebar and its live figures, the top bar, and the
-// menu that the sidebar is on a phone. And the avatar that the board draws for a poster.
+// The app's frame (components/AppShell.tsx): the sidebar, the top bar, and the menu that the sidebar
+// is on a phone. And the avatar that the board draws for a poster. The top bar's Live pill is in
+// live-status.test.tsx, and the sidebar's rail in sidebar.test.tsx.
 
 // No jest-dom here (X-20): plain assertions on what the Testing Library finds.
 
@@ -31,8 +30,6 @@ vi.mock("../lib/wallet", () => ({
   },
 }));
 
-const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
-
 /** A `fetch` that answers by the address's path and query, and fails anything else. */
 function fakeApi(routes: Record<string, () => Response>): string[] {
   const urls: string[] = [];
@@ -51,16 +48,6 @@ afterEach(() => {
   vi.restoreAllMocks();
   wallet.state = { ...wallet.state, accountId: null };
 });
-
-const HEALTH = {
-  ok: true,
-  network: "testnet",
-  contract: "tender.testnet",
-  indexed_height: "100",
-  chain_final_height: "100",
-  lag_blocks: "0",
-  waiting_for_chain: false,
-};
 
 test("shell_has_the_page_the_post_pill_and_the_way_to_the_wallet", () => {
   fakeApi({});
@@ -124,7 +111,7 @@ test("shell_menu_opens_and_closes_the_sidebar_on_a_phone", async () => {
 
   // Escape closes it, from wherever the keyboard is in it, and the focus goes back to the button:
   // the link it was on goes off the page with the menu.
-  screen.getByRole("link", { name: "Agents" }).focus();
+  screen.getByRole("link", { name: "Browse agents" }).focus();
   await userEvent.keyboard("{Escape}");
   expect(menu.getAttribute("aria-expanded")).toBe("false");
   expect(document.activeElement).toBe(menu);
@@ -194,61 +181,6 @@ test("shell_menu_left_open_closes_when_the_window_grows_to_a_laptop", async () =
   // The sidebar is a sidebar again, and the page is not left inert.
   expect(menu.getAttribute("aria-expanded")).toBe("false");
   expect(document.getElementById("main")?.hasAttribute("inert")).toBe(false);
-});
-
-test("platform_stats_show_the_figures_the_api_gives_and_only_reads", async () => {
-  const urls = fakeApi({
-    "/v1/tasks?phase=open&limit=50": () =>
-      json({
-        tasks: [summary({ id: "7", reward: "1500000" }), summary({ id: "8", reward: "500000" })],
-        next_cursor: null,
-      }),
-    "/v1/agents?limit=50": () => json({ agents: [agent()], next_cursor: "next" }),
-    "/v1/health": () => json(HEALTH),
-  });
-  render(<PlatformStats />);
-
-  const block = await screen.findByTestId("platform-stats");
-  const stats = within(block)
-    .getAllByTestId("stat")
-    .map((row) => row.textContent);
-  expect(stats).toEqual([
-    "Open tasks2",
-    "In escrow on open tasks2.00 tUSDC",
-    // A full page with more after it: at least that many, and said so.
-    "Agents1+",
-    "Indexin sync",
-  ]);
-  expect(urls.sort()).toEqual([
-    "GET /v1/agents?limit=50",
-    "GET /v1/health",
-    "GET /v1/tasks?phase=open&limit=50",
-  ]);
-});
-
-test("platform_stats_leave_out_a_figure_the_api_did_not_give", async () => {
-  fakeApi({
-    "/v1/agents?limit=50": () => json({ agents: [agent()], next_cursor: null }),
-    "/v1/health": () => json({ ...HEALTH, lag_blocks: "0", waiting_for_chain: true }),
-  });
-  render(<PlatformStats />);
-
-  const block = await screen.findByTestId("platform-stats");
-  expect(
-    within(block)
-      .getAllByTestId("stat")
-      .map((row) => row.textContent),
-  ).toEqual(["Agents1", "Indexwaiting for the chain"]);
-});
-
-test("platform_stats_are_not_there_when_the_api_is_down", async () => {
-  const urls = fakeApi({});
-  render(<PlatformStats />);
-
-  await waitFor(() => expect(urls).toHaveLength(3));
-  // Each read failed: nothing to show, and nothing made up in its place.
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  expect(screen.queryByTestId("platform-stats")).toBeNull();
 });
 
 test("avatar_is_the_same_for_an_account_and_differs_between_accounts", () => {

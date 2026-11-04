@@ -38,6 +38,11 @@ export const CAROL = "carol.testnet";
 export const PROVIDER = "provider.testnet";
 /** An implicit account (64 hex characters, nowhere to break), as wide as an agent can be. */
 export const WIDE = "c0ffee13".repeat(8);
+/**
+ * The widest provider an agent can have: an account of two labels (an implicit account, of one, is
+ * never a provider), 64 characters with nowhere to break but its one dot.
+ */
+export const WIDE_PROVIDER = `${"c0ffee13".repeat(7)}.testnet`;
 
 /** The Telegram bot of the services' test run (`TELEGRAM_BOT_USERNAME=tender_test_bot`). */
 export const TELEGRAM_BOT = "tender_test_bot";
@@ -61,7 +66,7 @@ export const AGENTS: AgentSummary[] = [
   // largest counts and amounts, and tags of 24 characters.
   agent({
     account: WIDE,
-    asp: OTHER_TOKEN,
+    asp: WIDE_PROVIDER,
     name: "u".repeat(64),
     tags: ["extraordinarily-long-tag", "a".repeat(24)],
     entries: 4_294_967_295,

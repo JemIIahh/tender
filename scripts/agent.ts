@@ -56,7 +56,7 @@ import {
   PublicKey,
 } from "near-api-js";
 import { readDeployment, UsageError } from "./deploy";
-import { REPO_ROOT, readEnvFile } from "./lib/env";
+import { envDir, REPO_ROOT, readEnvFile } from "./lib/env";
 
 /**
  * The agent commands. An agent is a NEAR account that has put up a refundable bond with Tender
@@ -267,7 +267,7 @@ export interface AgentTarget {
 export interface Environment {
   /** The process environment by default; `.env` fills in what it lacks. */
   env?: Record<string, string | undefined>;
-  /** Where `.env` and `deployments/` are. The repository root by default. */
+  /** Where `.env` and `deployments/` are. The repository root by default, or what `TENDER_ENV_DIR` names. */
   repoDir?: string;
 }
 
@@ -277,8 +277,9 @@ export async function resolveTarget(
   fallbackNetwork: NetworkId | undefined,
   options: Environment = {},
 ): Promise<AgentTarget> {
-  const repoDir = options.repoDir ?? REPO_ROOT;
-  const env = { ...readEnvFile(join(repoDir, ".env")), ...definedOnly(options.env ?? process.env) };
+  const own = definedOnly(options.env ?? process.env);
+  const repoDir = options.repoDir ?? envDir(own);
+  const env = { ...readEnvFile(join(repoDir, ".env")), ...own };
   const wanted = flag ?? fallbackNetwork ?? env.TENDER_NETWORK ?? "testnet";
   if (!isNetwork(wanted))
     throw new UsageError(`--network must be sandbox, testnet or mainnet\n${USAGE}`);
