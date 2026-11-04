@@ -15,11 +15,11 @@ import type { PickResult } from "../../lib/pick";
 import type { RefundResult } from "../../lib/refund";
 import type { TopUpResult } from "../../lib/topUp";
 import { describeAmount } from "../../lib/vault";
-import { type UseWallet, useWallet } from "../../lib/wallet";
-import { walletErrorMessage } from "../../lib/walletErrors";
+import { useWallet } from "../../lib/wallet";
 import { Countdown } from "../Countdown";
 import { JudgeNote } from "../JudgeNote";
-import { CARD, EYEBROW, NOTICE, PANEL_TITLE, PRIMARY } from "../ui";
+import { CARD, EYEBROW, NOTICE, PANEL_TITLE } from "../ui";
+import { Connect } from "./Connect";
 import { PickPanel } from "./PickPanel";
 import { RefundPanel } from "./RefundPanel";
 import { TopUpPanel } from "./TopUpPanel";
@@ -62,34 +62,6 @@ function ActionSection({
       </h2>
       {children}
     </section>
-  );
-}
-
-/** The way in for someone with no wallet connected: a Connect button and its failure. */
-function Connect({ wallet, why }: { wallet: UseWallet; why: string }) {
-  const [failure, setFailure] = useState<string | null>(null);
-  return (
-    <div className="grid gap-3">
-      <p className="text-[14px] text-muted">{why}</p>
-      <button
-        type="button"
-        className={PRIMARY}
-        onClick={() => {
-          setFailure(null);
-          wallet.connect().catch((error: unknown) => {
-            console.error(error);
-            setFailure(walletErrorMessage(error));
-          });
-        }}
-      >
-        Connect wallet
-      </button>
-      {failure === null ? null : (
-        <p role="alert" className="text-sm text-seal">
-          {failure}
-        </p>
-      )}
-    </div>
   );
 }
 
@@ -160,7 +132,9 @@ export function TaskActions({
 
   const sections: ReactNode[] = [];
 
-  if (sent.pick !== undefined || pick !== null) {
+  // Once one settling action is sent, the other is no longer offered: the task is settled on chain,
+  // whatever the index shows yet.
+  if (sent.pick !== undefined || (pick !== null && sent.refund === undefined)) {
     let body: ReactNode;
     if (sent.pick !== undefined) {
       body = (
@@ -214,20 +188,13 @@ export function TaskActions({
     );
   }
 
-  if (sent.refund !== undefined || refund !== null) {
+  if (sent.refund !== undefined || (refund !== null && sent.pick === undefined)) {
     let body: ReactNode;
     if (sent.refund !== undefined) {
       body = (
         <p role="status" data-testid="refund-sent" className={NOTICE}>
           {refundNotice(sent.refund, settled)}
         </p>
-      );
-    } else if (refund !== null && refund.kind === "open" && account === null && !looking) {
-      body = (
-        <Connect
-          wallet={wallet}
-          why="Anyone can refund the funders now. Connect a wallet to send it."
-        />
       );
     } else if (refund !== null) {
       body = (
@@ -236,6 +203,7 @@ export function TaskActions({
           view={refund}
           nowNs={nowNs}
           wallet={wallet}
+          looking={looking}
           onSent={(result) => setSent((was) => ({ ...was, refund: result }))}
         />
       );

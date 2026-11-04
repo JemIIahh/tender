@@ -134,11 +134,9 @@ export function TopUpPanel({
       }}
     >
       <p className="text-[14px] text-muted">
-        {"Anyone can add to this reward until the commit window closes, in "}
+        {"Add to the reward until the commit window closes, in "}
         <Countdown toNs={BigInt(task.commit_deadline)} nowNs={nowNs} />
-        {
-          ". What you add is paid out with the rest to the winners, after the fee, or comes back to you in full if the task is refunded."
-        }
+        {". It's paid out with the rest, after the fee, or refunded to you in full."}
       </p>
       <div className="grid gap-2">
         <label htmlFor={`${id}-amount`} className="text-sm font-medium text-bone">

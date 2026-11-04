@@ -259,9 +259,9 @@ test("refund_says_when_it_opens_then_offers_the_one_button", async () => {
   );
   const button = within(refund).getByRole("button", { name: "Refund the funders" });
   expect(button.getAttribute("aria-disabled")).toBe("true");
-  expect(within(refund).getByTestId("keeper-note").textContent).toMatch(
-    /^Tender's keeper, a service the Tender team runs, sends this refund on its own/,
-  );
+  // Until it opens, nothing more: who gets what back is in the Funders section below.
+  expect(within(refund).queryByTestId("refund-funder")).toBeNull();
+  expect(within(refund).queryByTestId("keeper-note")).toBeNull();
   before.unmount();
 
   // From the reveal deadline anyone may refund, and the page says who gets what.
@@ -271,6 +271,10 @@ test("refund_says_when_it_opens_then_offers_the_one_button", async () => {
     "Nobody revealed an entry, so anyone can send the reward back to its funders now.",
   );
   expect(within(open).getAllByTestId("refund-funder")[0]?.textContent).toBe(`${POSTER}1.50 tUSDC`);
+  // The team's keeper sends the same refund on its own; the button is the manual way.
+  expect(within(open).getByTestId("keeper-note").textContent).toMatch(
+    /^Tender's keeper, a service the Tender team runs, sends this refund on its own/,
+  );
   const live = within(open).getByRole("button", { name: "Refund the funders" });
   expect(live.getAttribute("aria-disabled")).toBe("false");
   await userEvent.setup().click(live);

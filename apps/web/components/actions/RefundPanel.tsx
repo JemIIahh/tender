@@ -8,6 +8,7 @@ import type { UseWallet } from "../../lib/wallet";
 import { Amount } from "../Amount";
 import { Countdown } from "../Countdown";
 import { NOTICE, PRIMARY } from "../ui";
+import { Connect } from "./Connect";
 
 type Run =
   | { status: "idle" }
@@ -26,19 +27,23 @@ export const KEEPER_NOTE =
 /**
  * "Refund the funders": `void_task`, which anyone may send once the reveal window is over with
  * nothing revealed, or the fallback window is over. Before then it says when it opens, as a time
- * left, and on what it waits. It names who gets what back: each funder exactly what it paid in.
+ * left, and on what it waits. Once open, it names who gets what back (each funder exactly what it
+ * paid in), and says that the team's keeper sends the same refund on its own.
  */
 export function RefundPanel({
   data,
   view,
   nowNs,
   wallet,
+  looking,
   onSent,
 }: {
   data: TaskDetailResponse;
   view: RefundView;
   nowNs: bigint;
   wallet: UseWallet;
+  /** Whether the page is still looking for the wallet of an earlier visit. */
+  looking: boolean;
   onSent: (result: RefundResult) => void;
 }) {
   const { task, funders } = data;
@@ -88,7 +93,7 @@ export function RefundPanel({
         </p>
       )}
 
-      {funders.length === 0 ? null : (
+      {!open || funders.length === 0 ? null : (
         <ul className="grid text-[13.5px]" aria-label="What each funder gets back">
           {funders.map((funder) => (
             <li
@@ -107,10 +112,12 @@ export function RefundPanel({
         </ul>
       )}
 
-      {run.status === "done" ? null : (
+      {run.status === "done" ? null : open && wallet.accountId === null && !looking ? (
+        <Connect wallet={wallet} />
+      ) : (
         <button
           type="button"
-          aria-disabled={!open || busy}
+          aria-disabled={!open || busy || wallet.accountId === null}
           onClick={() => void send()}
           className={PRIMARY}
         >
@@ -122,9 +129,11 @@ export function RefundPanel({
           {run.message}
         </p>
       ) : null}
-      <p data-testid="keeper-note" className={`${NOTICE} text-[12.5px] text-muted`}>
-        {KEEPER_NOTE}
-      </p>
+      {open ? (
+        <p data-testid="keeper-note" className={`${NOTICE} text-[12.5px] text-muted`}>
+          {KEEPER_NOTE}
+        </p>
+      ) : null}
     </div>
   );
 }

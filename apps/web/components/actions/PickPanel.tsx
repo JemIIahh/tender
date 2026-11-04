@@ -420,7 +420,7 @@ export function PickPanel({
             )}
             {payout.dust > 0n ? (
               <p data-testid="pick-rounding" className="text-[12.5px] text-muted">
-                {`Rounding each share down leaves ${describeAmount(payout.dust, task.token)}, which goes to ${choice.winners[0]?.account}, the first winner, as the contract pays it. That is included above.`}
+                {`Rounding down leaves ${describeAmount(payout.dust, task.token)}: the contract gives it to ${choice.winners[0]?.account}, the first winner, as shown.`}
               </p>
             ) : null}
           </>
@@ -458,52 +458,54 @@ export function PickPanel({
           </div>
 
           {confirming ? (
-            <fieldset
-              ref={confirmRef}
-              tabIndex={-1}
-              data-testid="pick-nobody-confirm"
-              className="grid gap-3 rounded-xl border border-seal/50 bg-raised p-4 outline-none"
-            >
-              <legend className="font-medium text-bone">
-                Pick nobody? The agents are not paid.
-              </legend>
-              <p className="text-[13.5px] text-muted">
-                The whole reward, <Amount value={task.reward} token={task.token} />, goes back to
-                the funders, with no fee taken. The scorecard is published with every entry at 0.
-              </p>
-              {funders.length === 0 ? null : (
-                <ul className="grid gap-1 text-[13px]">
-                  {funders.map((funder) => (
-                    <li key={funder.account} className="flex flex-wrap gap-x-3">
-                      <span className="font-mono text-bone wrap-anywhere">{funder.account}</span>
-                      <span className="text-muted tabular-nums">
-                        gets back <Amount value={funder.amount} token={task.token} />
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              <div className="flex flex-wrap gap-3">
-                <button
-                  type="button"
-                  aria-disabled={busy}
-                  onClick={() => void send([])}
-                  className={PRIMARY}
-                >
-                  {busy ? STAGE_WORDS[run.stage] : "Yes, pick nobody"}
-                </button>
-                <button
-                  type="button"
-                  aria-disabled={busy}
-                  onClick={() => {
-                    if (!busy) setConfirming(false);
-                  }}
-                  className={SECONDARY}
-                >
-                  Cancel
-                </button>
-              </div>
-            </fieldset>
+            <div className="rounded-xl border border-seal/50 bg-raised p-4">
+              <fieldset
+                ref={confirmRef}
+                tabIndex={-1}
+                data-testid="pick-nobody-confirm"
+                className="grid min-w-0 gap-3 outline-none"
+              >
+                <legend className="mb-3 font-medium text-bone">
+                  Pick nobody? The agents are not paid.
+                </legend>
+                <p className="text-[13.5px] text-muted">
+                  The whole reward, <Amount value={task.reward} token={task.token} />, goes back to
+                  the funders, with no fee taken. The scorecard is published with every entry at 0.
+                </p>
+                {funders.length === 0 ? null : (
+                  <ul className="grid gap-1 text-[13px]">
+                    {funders.map((funder) => (
+                      <li key={funder.account} className="flex flex-wrap gap-x-3">
+                        <span className="font-mono text-bone wrap-anywhere">{funder.account}</span>
+                        <span className="text-muted tabular-nums">
+                          gets back <Amount value={funder.amount} token={task.token} />
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <div className="flex flex-wrap gap-3">
+                  <button
+                    type="button"
+                    aria-disabled={busy}
+                    onClick={() => void send([])}
+                    className={PRIMARY}
+                  >
+                    {busy ? STAGE_WORDS[run.stage] : "Yes, pick nobody"}
+                  </button>
+                  <button
+                    type="button"
+                    aria-disabled={busy}
+                    onClick={() => {
+                      if (!busy) setConfirming(false);
+                    }}
+                    className={SECONDARY}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </fieldset>
+            </div>
           ) : null}
 
           {run.status === "failed" ? (
@@ -512,7 +514,7 @@ export function PickPanel({
             </p>
           ) : null}
           <p className="text-[12.5px] leading-relaxed text-muted">
-            {`One approval in your wallet. Your scorecard is published, in the name of ${account}, with the pick. Sign with a key of ${account} itself: Tender refuses a pick signed with a delegate key.`}
+            {`One approval in your wallet. The scorecard is published in the name of ${account} with the pick. Sign with a key of ${account} itself: a delegate key can't pick.`}
           </p>
         </div>
       )}
