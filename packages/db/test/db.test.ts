@@ -56,6 +56,7 @@ const MIGRATIONS = [
   "0004_task_questions.sql",
   "0005_tg_board_digests.sql",
   "0006_agent_bond.sql",
+  "0007_connect_codes.sql",
 ];
 
 // Stands for a secret (a held-out answer, blob bytes) in the error tests: as text, and as hex, which
@@ -280,6 +281,19 @@ const SCHEMA: Record<string, string[]> = {
     "sent_at timestamp with time zone",
     "digests integer",
   ],
+  // Migration 0007.
+  connect_codes: [
+    "id text",
+    "code_sha256 text",
+    "owner text",
+    "name text",
+    "account_id text",
+    "created_at timestamp with time zone",
+    "expires_at timestamp with time zone",
+    "public_key text?",
+    "attached_at timestamp with time zone?",
+    "registered_at timestamp with time zone?",
+  ],
 };
 
 // Primary keys, uniqueness and every index, as "table: kind (columns)". An index on an expression
@@ -290,6 +304,10 @@ const KEYS = [
   "auth_challenges: primary key (nonce)",
   "auth_tokens: primary key (token_sha256)",
   "blobs: primary key (sha256)",
+  "connect_codes: index (expires_at)",
+  "connect_codes: index (owner, created_at)",
+  "connect_codes: primary key (id)",
+  "connect_codes: unique (code_sha256)",
   "chain_cursor: primary key (source)",
   "entries: index (account)",
   "entries: index (content_hash)",
@@ -321,11 +339,13 @@ const KEYS = [
 
 // Every constraint that is not a key (those are in KEYS) and not NOT NULL (that is the "?" above;
 // Postgres 18 also lists NOT NULL in pg_constraint, 17 does not): no foreign key, and no CHECK but
-// the kind of a blob, the three of a board row (migration 0004) and the status of an agent (0006).
+// the kind of a blob, the three of a board row (migration 0004), the status of an agent (0006) and the
+// key of a connect code with its time (0007).
 const CONSTRAINTS = [
   "agents: CHECK ((status = ANY (ARRAY['active'::text, 'unregistering'::text, 'retired'::text])))",
   "blobs: CHECK ((kind = ANY (ARRAY['brief'::text, 'criteria'::text, 'heldout'::text, " +
     "'result'::text, 'scorecard'::text, 'profile'::text])))",
+  "connect_codes: CHECK (((public_key IS NULL) = (attached_at IS NULL)))",
   "task_questions: CHECK (((answer IS NULL) = (answered_at IS NULL)))",
   "task_questions: CHECK (((kind = 'question'::text) = (asker IS NOT NULL)))",
   "task_questions: CHECK ((kind = ANY (ARRAY['question'::text, 'clarification'::text])))",
@@ -1218,12 +1238,7 @@ describe.each(targets)("db on $name", (target) => {
       await put("result", '{"exact":{"expected":["44"]}}', "alice.near");
 
       // 0003 is the one under test; whatever comes after it applies on top, as it would on a real upgrade.
-      expect(await migrate(old)).toEqual([
-        "0003_heldout_uploads.sql",
-        "0004_task_questions.sql",
-        "0005_tg_board_digests.sql",
-        "0006_agent_bond.sql",
-      ]);
+      expect(await migrate(old)).toEqual(MIGRATIONS.slice(2));
       expect(await old.query("select sha256, account, uploaded_at from heldout_uploads")).toEqual([
         { sha256: heldout, account: "poster.near", uploaded_at: new Date("2026-10-01T09:00:00Z") },
       ]);
@@ -1258,7 +1273,8 @@ describe.each(targets)("the agent bond columns (migration 0006) on $name", (targ
       expect(await migrate(db, dir)).toEqual(before);
       await insertAgent(db, "old.near");
 
-      expect(await migrate(db)).toEqual(["0006_agent_bond.sql"]);
+      // 0006 is the one under test; the ones after it apply on top.
+      expect(await migrate(db)).toEqual(MIGRATIONS.slice(5));
       expect(
         await db.query(
           "select status, bond_token, bond_amount, claimable_at from agents where account = $1",

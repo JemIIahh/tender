@@ -126,6 +126,7 @@ const TABLES = [
   "tg_watches",
   "tg_sent",
   "worker_cursor",
+  "connect_codes",
 ];
 
 /** Empties every table, so one database can serve a whole test file. */

@@ -7,6 +7,7 @@ import { mountMcp } from "./mcp";
 import { agentRoutes } from "./routes/agents";
 import { authRoutes } from "./routes/auth";
 import { blobRoutes } from "./routes/blobs";
+import { connectRoutes } from "./routes/connect";
 import { entryRoutes } from "./routes/entries";
 import { healthRoutes } from "./routes/health";
 import { questionRoutes } from "./routes/questions";
@@ -56,6 +57,7 @@ export function createApp(deps: ApiDeps): Hono {
   app.route("/v1", startRoutes(deps, signedIn));
   app.route("/v1", questionRoutes(deps, signedIn));
   app.route("/v1", telegramRoutes(deps, signedIn));
+  app.route("/v1", connectRoutes(deps, signedIn));
   app.route("/v1", eventRoutes(deps));
 
   // Not under /v1: the MCP clients are not browsers, so the CORS block above does not apply.
