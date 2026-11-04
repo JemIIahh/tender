@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseEnv } from "node:util";
-import { type Signer, TenderClient } from "@tender/client";
+import { type Signer, scriptedProfile, TenderClient } from "@tender/client";
 import {
   Account,
   type Action,
@@ -16,7 +16,7 @@ import {
   type KeyPairString,
 } from "near-api-js";
 import { afterAll, beforeAll, expect, test } from "vitest";
-import { AGENT_BOND, type Deployment, deploy } from "./deploy";
+import { AGENT_BOND, type Deployment, deploy, REFERENCE_AGENTS } from "./deploy";
 import { REPO_ROOT } from "./lib/env";
 
 // A bare local chain, with nothing deployed on it, and then the deploy script on top of it. The
@@ -274,8 +274,57 @@ test("deploy_sets_the_agent_bond_in_the_test_token_before_any_agent_registers", 
     agent_bond_cooldown_secs: "5",
   });
   expect(config.agent_bond_amount).toBe("1000000");
-  // The script registers no agent: it only sets the terms.
-  expect(await reader.getAgent("analyst.sandbox")).toBeNull();
+
+  // Every agent registers after the bond is set, and none before it.
+  const bondAt = lines.indexOf("OK set_agent_bond tusdc.sandbox 1000000");
+  for (const name of Object.keys(REFERENCE_AGENTS)) {
+    const at = lines.indexOf(`OK register_agent ${name}.sandbox`);
+    expect(at, name).toBeGreaterThan(bondAt);
+  }
+});
+
+test("deploy_registers_the_four_reference_agents_with_their_bonds", async () => {
+  const names = Object.keys(REFERENCE_AGENTS);
+  expect(names).toEqual(["analyst", "coder", "extractor", "lead"]);
+  for (const name of names) {
+    const id = `${name}.sandbox`;
+    // Each step, in order: the token, the bond into the vault, the registration.
+    const lines = first.lines;
+    const steps = [
+      `OK register ${id} at tusdc.sandbox`,
+      `OK deposit bond for ${id}`,
+      `OK register_agent ${id}`,
+    ].map((line) => lines.indexOf(line));
+    expect(
+      steps.every((at) => at >= 0),
+      `${name}: ${steps}`,
+    ).toBe(true);
+    expect(
+      [...steps].sort((a, b) => a - b),
+      name,
+    ).toEqual(steps);
+
+    // The agent is active with the bond the owner set, and its profile is the one of its name.
+    const profile = scriptedProfile(name, REFERENCE_AGENTS[name as keyof typeof REFERENCE_AGENTS]);
+    expect(await reader.getAgent(id), name).toMatchObject({
+      account: id,
+      status: "active",
+      bond_token: "tusdc.sandbox",
+      bond_amount: "1000000",
+      claimable_at: null,
+      profile_uri: profile.uri,
+      profile_hash: profile.hash,
+      tags: [...profile.tags],
+    });
+    // The bond came out of the vault, and the wallet holds nothing: exactly the bond was minted.
+    expect(await reader.balanceOf(id, "tusdc.sandbox"), name).toBe(0n);
+    expect(await reader.ftBalanceOf("tusdc.sandbox", id), name).toBe(0n);
+  }
+  // The others are no agents: the deploy registers the four that it holds the keys of for the work
+  // of an agent, and no service.
+  for (const name of ["treasury", "judge", "keeper", "poster", "tusdc", "tender"]) {
+    expect(await reader.getAgent(`${name}.sandbox`), name).toBeNull();
+  }
 });
 
 test("deploy_registers_storage_for_everyone_and_tender_with_both_tokens", async () => {
@@ -558,11 +607,21 @@ test("deploy_resumes_after_a_step_fails_and_still_knows_the_deploy_block", async
     log: (l) => resumed.push(l),
   });
 
-  expect(resumed.filter((l) => l.startsWith("OK ")).sort()).toEqual([
-    "OK record deployments/sandbox.json",
-    "OK register tender.resume.sandbox at ghost.sandbox",
-    "OK storage tender.resume.sandbox at tender.resume.sandbox",
+  // The reference agents had not begun: they register after the lanes that stopped.
+  const agents = Object.keys(REFERENCE_AGENTS).flatMap((name) => [
+    `OK register ${name}.resume.sandbox at tusdc.resume.sandbox`,
+    `OK deposit bond for ${name}.resume.sandbox`,
+    `OK register_agent ${name}.resume.sandbox`,
   ]);
+  expect(stopped.filter((l) => l.includes("register_agent"))).toEqual([]);
+  expect(resumed.filter((l) => l.startsWith("OK ")).sort()).toEqual(
+    [
+      "OK record deployments/sandbox.json",
+      "OK register tender.resume.sandbox at ghost.sandbox",
+      "OK storage tender.resume.sandbox at tender.resume.sandbox",
+      ...agents,
+    ].sort(),
+  );
   expect(resumed.filter((l) => !l.startsWith("OK "))).toHaveLength(stopped.length);
   // The first run's deploy of Tender is the one the record names, though it was not made now.
   await expectDeployBlock("tender.resume.sandbox", deployment.deployHeight, tenderWasm);
@@ -642,4 +701,55 @@ test("deploy_with_a_cooldown_below_the_shortest_window_fails_at_that_step_and_se
   // The contract's rule held, and the bond was not set after a failed cooldown.
   expect((await tender.getConfig()).agent_bond_token).toBeNull();
   expect(lines).not.toContain("OK set_agent_bond tusdc.bondlow.sandbox 1000000");
+});
+
+test("deploy_finishes_a_reference_agent_that_stopped_with_its_bond_in_the_vault", async () => {
+  // The run stops for the analyst the moment its bond is in the vault: the other three finish. The
+  // next run mints nothing, deposits nothing, and registers the analyst with the bond that is there.
+  const parent = await fundedAccount("fundstop", 100n * NEAR);
+  const dir = await newDir();
+  const tender = new TenderClient({
+    network: "sandbox",
+    contractId: "tender.fundstop.sandbox",
+    rpcUrl: node.rpcUrl,
+  });
+  const analyst = "analyst.fundstop.sandbox";
+  const token = "tusdc.fundstop.sandbox";
+  const stopped: string[] = [];
+
+  await expect(
+    deploy(targetFor(parent, "usdc.sandbox"), {
+      dir,
+      log: (line) => {
+        stopped.push(line);
+        // A line that cannot be logged fails the step that made it, after its work is done.
+        if (line === `OK deposit bond for ${analyst}`) throw new Error("stopped by the test");
+      },
+    }),
+  ).rejects.toThrow(/deposit bond for analyst\.fundstop\.sandbox: stopped by the test/);
+
+  expect(stopped).not.toContain(`OK register_agent ${analyst}`);
+  expect(await tender.getAgent(analyst)).toBeNull();
+  expect(await tender.balanceOf(analyst, token)).toBe(BigInt(AGENT_BOND));
+  for (const name of ["coder", "extractor", "lead"]) {
+    expect(await tender.getAgent(`${name}.fundstop.sandbox`), name).toMatchObject({
+      status: "active",
+    });
+  }
+
+  const resumed: string[] = [];
+  await deploy(targetFor(parent, "usdc.sandbox"), { dir, log: (line) => resumed.push(line) });
+  expect(resumed.filter((line) => line.startsWith("OK "))).toEqual([
+    `OK register_agent ${analyst}`,
+    "OK record deployments/sandbox.json",
+  ]);
+  expect(resumed).toContain(`SKIP deposit bond for ${analyst} (exists)`);
+  expect(await tender.getAgent(analyst)).toMatchObject({
+    status: "active",
+    bond_token: token,
+    bond_amount: String(AGENT_BOND),
+  });
+  // Exactly one bond was ever minted for it: the vault and the wallet are empty again.
+  expect(await tender.balanceOf(analyst, token)).toBe(0n);
+  expect(await tender.ftBalanceOf(token, analyst)).toBe(0n);
 });

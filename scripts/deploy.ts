@@ -2,13 +2,22 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { parseArgs, parseEnv } from "node:util";
-import { type Signer, TenderClient, TenderError, toTxResult } from "@tender/client";
+import {
+  bondTermsOf,
+  type Signer,
+  scriptedProfile,
+  TenderClient,
+  TenderError,
+  toTxResult,
+} from "@tender/client";
 import {
   AccountIdSchema,
+  depositCall,
   HashHexSchema,
   NETWORKS,
   type NetworkId,
   ONE_YOCTO,
+  registerAgentCall,
   setAgentBondCall,
   setAgentBondCooldownCall,
   storageDepositCall,
@@ -42,6 +51,9 @@ import { loadEnv, parseEnvText, REPO_ROOT } from "./lib/env";
  *   set_token <token>              the owner puts the test token, and USDC, on Tender's allowlist
  *   set_agent_bond_cooldown <secs> the owner sets how long an agent waits to claim its bond back
  *   set_agent_bond <token> <n>     the owner sets the bond that registering takes, in the test token
+ *   register <agent> at <token>    the four reference agents with the test token, for their bonds
+ *   deposit bond for <agent>       each is minted the bond and puts it in its vault
+ *   register_agent <agent>         each registers, which takes the bond from its vault
  *   record deployments/<n>.json    the contract, tokens, accounts, wasm hash and deploy block
  *
  * Each step prints `OK <step>` when it did the work and `SKIP <step> (exists)` when the chain
@@ -59,7 +71,7 @@ import { loadEnv, parseEnvText, REPO_ROOT } from "./lib/env";
  *
  * THE AGENT BOND (contract Task 16b). Registering as an agent takes a refundable bond, and only a
  * registered agent may enter an open task, so the bond is set here, by the last two steps of the
- * owner's lane, before any agent can register (the script registers none). It is in the test token
+ * owner's lane, before any agent registers. It is in the test token
  * the deploy made: 1 tUSDC (1_000_000 of its smallest unit, at 6 decimals) on every network, and a
  * cooldown (the wait from `unregister_agent` to `claim_agent_bond`) of 14 days on testnet, the
  * contract's own default and the longest a task's window can be, so that a bond cannot be passed
@@ -69,6 +81,14 @@ import { loadEnv, parseEnvText, REPO_ROOT } from "./lib/env";
  * must not undo that. To change them later, the owner calls `set_agent_bond` and
  * `set_agent_bond_cooldown`; a bond is never taken back to nothing, and each agent keeps the bond
  * it paid.
+ *
+ * THE REFERENCE AGENTS. The deploy holds the full-access keys of `analyst`, `coder`, `extractor` and
+ * `lead`, and registering takes a full-access key (a function-call key cannot attach the 1 yoctoNEAR),
+ * so it registers them itself, last, once the bond is set, Tender can hold the test token and their
+ * storage is open: each registers with the test token, is minted the bond (the test token lets
+ * anyone mint, which is why it is never deployed where its tokens have value), puts it in its
+ * vault, and registers with a profile of its name and the tags it works on. An agent that is
+ * registered already is left alone, and so is a vault that holds the bond already.
  *
  * `pnpm deploy:testnet` is the command line. The mainnet deploy belongs to plan 07.
  */
@@ -153,6 +173,21 @@ export function bondTermsFor(
 
 /** The default cooldown on testnet: 14 days, the contract's own default and its longest window. */
 export const TESTNET_BOND_COOLDOWN_SECS = 14 * 24 * 60 * 60;
+
+/**
+ * The reference agents the deploy registers, with the tags each works on (the same as
+ * `packages/agents/src/agents`, whose lead looks for the `swarm` tag).
+ */
+export const REFERENCE_AGENTS = {
+  analyst: ["research", "writing", "data"],
+  coder: ["coding", "regex"],
+  extractor: ["extraction", "json", "data"],
+  lead: ["swarm"],
+} as const satisfies Record<string, readonly string[]>;
+type ReferenceAgent = keyof typeof REFERENCE_AGENTS;
+const isReferenceAgent = (name: string): name is ReferenceAgent =>
+  Object.hasOwn(REFERENCE_AGENTS, name);
+const MINT_GAS = 15n * TGAS;
 /** Gas for the `new` that comes with a deploy. What a call does not use is refunded. */
 const INIT_GAS = 100n * TGAS;
 const SET_TOKEN_GAS = 30n * TGAS;
@@ -826,6 +861,90 @@ function setBondStep(ctx: Context): Step {
   };
 }
 
+/** The test token's `mint`, which anyone may call for an account the token has registered. */
+function mintCall(token: string, account: string, amount: bigint): TenderCall {
+  return {
+    receiverId: token,
+    methodName: "mint",
+    args: { account_id: account, amount: amount.toString() },
+    gas: MINT_GAS,
+    deposit: 0n,
+  };
+}
+
+/** Registers a reference agent with the token, which it must be before the token will hold its bond. */
+function agentTokenStep(ctx: Context, member: Member): Step {
+  const { token } = ctx.bond;
+  return {
+    label: `register ${member.id} at ${token}`,
+    async run() {
+      if ((await ctx.chain.reader.ftStorageBalanceOf(token, member.id)) !== null) return "SKIP";
+      const cost = await registrationCost(ctx, token);
+      await ctx.chain.call(signerOf(ctx, member), tokenStorageDepositCall(token, member.id, cost));
+      return "OK";
+    },
+  };
+}
+
+/**
+ * Mints a reference agent the bond it lacks and puts it in its vault in Tender. Nothing is done for
+ * an agent that is registered already (it paid its bond then), and a vault that holds the bond
+ * already takes no more. A run that stopped after the mint finds the tokens in the wallet and only
+ * deposits them.
+ */
+function agentFundStep(ctx: Context, member: Member): Step {
+  const tenderId = ctx.members.tender.id;
+  return {
+    label: `deposit bond for ${member.id}`,
+    async run() {
+      const { reader } = ctx.chain;
+      if ((await reader.getAgent(member.id)) !== null) return "SKIP";
+      // The bond in force, not the one this run set: the owner may have changed it since.
+      const terms = bondTermsOf(await reader.getConfig());
+      if (terms === null) return "SKIP";
+      const { token, amount } = terms;
+      const vault = await reader.balanceOf(member.id, token);
+      if (vault >= amount) return "SKIP";
+      const need = amount - vault;
+      const signer = signerOf(ctx, member);
+      const wallet = await reader.ftBalanceOf(token, member.id);
+      if (wallet < need) await ctx.chain.call(signer, mintCall(token, member.id, need - wallet));
+      await ctx.chain.call(signer, depositCall(token, tenderId, need));
+      // Tender refunds a deposit it refuses and does not fail, so the vault is the only sign.
+      const held = await reader.balanceOf(member.id, token);
+      if (held < amount) {
+        throw new Error(
+          `Tender did not take the deposit of ${need} ${token}: the vault of ${member.id} holds ${held}`,
+        );
+      }
+      return "OK";
+    },
+  };
+}
+
+/** Registers a reference agent with a profile of its name and tags, which takes its bond. */
+function agentRegisterStep(ctx: Context, member: Member): Step {
+  const tenderId = ctx.members.tender.id;
+  return {
+    label: `register_agent ${member.id}`,
+    async run() {
+      const { reader } = ctx.chain;
+      if ((await reader.getAgent(member.id)) !== null) return "SKIP";
+      if (!isReferenceAgent(member.name)) throw new Error(`${member.name} is no reference agent`);
+      const profile = scriptedProfile(member.name, REFERENCE_AGENTS[member.name]);
+      await ctx.chain.call(
+        signerOf(ctx, member),
+        registerAgentCall(tenderId, profile.uri, profile.hash, profile.tags),
+      );
+      const agent = await reader.getAgent(member.id);
+      if (agent?.status !== "active") {
+        throw new Error(`${member.id} is not an active agent after registering`);
+      }
+      return "OK";
+    },
+  };
+}
+
 /** The path of a network's record. */
 export function deploymentPath(network: NetworkId, dir: string = REPO_ROOT): string {
   return join(dir, "deployments", `${network}.json`);
@@ -1146,6 +1265,19 @@ export async function deploy(
     .filter((member) => member !== tender)
     .map((member) => [storageStep(ctx, signerOf(ctx, member))]);
   await runLanes([owner, tenderAccount, ...others], log, limit);
+
+  // The reference agents register last: the bond is set (the owner's lane), Tender can hold the
+  // token (its own lane) and their storage with Tender is open. Each signs only for itself.
+  const agents = Object.values(members).filter((member) => isReferenceAgent(member.name));
+  await runLanes(
+    agents.map((member) => [
+      agentTokenStep(ctx, member),
+      agentFundStep(ctx, member),
+      agentRegisterStep(ctx, member),
+    ]),
+    log,
+    limit,
+  );
 
   const label = `record deployments/${network}.json`;
   try {

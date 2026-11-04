@@ -6,10 +6,12 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
-import { type Signer, TenderError } from "@tender/client";
-import { NETWORKS } from "@tender/shared";
+import { type Signer, scriptedProfile, TenderError } from "@tender/client";
+import { NETWORKS, ProfileSchema } from "@tender/shared";
 import { KeyPair } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
+import { AGENT_NAMES, AGENTS } from "../packages/agents/src/agents";
+import { LEAD_TAG } from "../packages/agents/src/agents/lead";
 import {
   AGENT_BOND,
   bondTermsFor,
@@ -19,6 +21,7 @@ import {
   loadTarget,
   main,
   orAlreadyInitialised,
+  REFERENCE_AGENTS,
   readDeployment,
   runLanes,
   type Step,
@@ -556,4 +559,19 @@ test("the_agent_bond_is_one_tusdc_with_a_cooldown_of_14_days_on_testnet_and_the_
   // The testnet cooldown is inside the contract's bounds: the window at the least, 56 days at most.
   expect(14 * 24 * 60 * 60).toBeGreaterThanOrEqual(testnet.minWindowSecs);
   expect(14 * 24 * 60 * 60).toBeLessThanOrEqual(56 * 24 * 60 * 60);
+});
+
+test("the_reference_agents_register_with_the_tags_they_work_on_and_a_profile_the_registry_takes", () => {
+  // The deploy registers the four accounts it holds keys for. The tags are the ones the agents look
+  // for in a brief, so a task of theirs finds them: they must not drift from the agents package.
+  expect(Object.keys(REFERENCE_AGENTS)).toEqual([...AGENT_NAMES, "lead"]);
+  for (const name of AGENT_NAMES)
+    expect([...REFERENCE_AGENTS[name]], name).toEqual([...AGENTS[name].tags]);
+  expect([...REFERENCE_AGENTS.lead]).toEqual([LEAD_TAG]);
+  // Their profiles (a name, no document) pass the registry's schema, with at most 8 short tags.
+  for (const [name, tags] of Object.entries(REFERENCE_AGENTS)) {
+    const profile = scriptedProfile(name, tags);
+    expect(ProfileSchema.safeParse(profile.document).success, name).toBe(true);
+    expect(profile.tags.length, name).toBeLessThanOrEqual(8);
+  }
 });
