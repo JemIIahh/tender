@@ -19,6 +19,7 @@ import {
 import { config } from "../lib/config";
 import { READING_BALANCES } from "../lib/copy";
 import { errorMessage } from "../lib/errors";
+import { FAUCET_AMOUNT, faucetOffered, faucetToken, planFaucet } from "../lib/faucet";
 import {
   describeAmount,
   describeNear,
@@ -35,6 +36,7 @@ import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErr
 import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
 import { ErrorState } from "./ErrorState";
+import { FaucetSection } from "./FaucetSection";
 import { PageHead } from "./PageHead";
 import { CARD, FACT_LABEL, FIELD, NOTICE, PANEL, PANEL_TITLE, PRIMARY, SECONDARY } from "./ui";
 
@@ -60,7 +62,7 @@ type Panel =
   | { status: "error"; message: string; retrying: boolean }
   | { status: "ready"; data: VaultData; stale: Stale | null };
 
-type ActionId = "connect" | "disconnect" | "setup" | "deposit" | "withdraw" | "storage";
+type ActionId = "connect" | "disconnect" | "setup" | "deposit" | "withdraw" | "storage" | "faucet";
 
 /** What the last action came to, shown next to the control that started it. */
 interface Notice {
@@ -552,6 +554,23 @@ export function WalletView({
       },
     );
 
+  // Testnet's free test tokens: a mint to the connected account, with the token's registration in
+  // front of it if the token does not know the account. One batch, one approval. The token logs no
+  // Tender event, so the words rest on the transaction having succeeded (a failed one throws), and
+  // the balances, read again, show what the account now holds.
+  const getTestTokens = (token: string) =>
+    send(
+      "faucet",
+      async () => {
+        if (accountId === null) return [];
+        // Read now and not from the page, as for a withdrawal: it could have changed since.
+        const registered = await isRegisteredAtToken(token, accountId);
+        return planFaucet({ token, account: accountId, registered });
+      },
+      () =>
+        `Added ${describeAmount(FAUCET_AMOUNT, token)} to your wallet. They are free test tokens with no value.`,
+    );
+
   // No amount in the words: what was taken back is what the balances above show, read again.
   const takeBackStorage = () =>
     send(
@@ -659,18 +678,30 @@ export function WalletView({
           )}
 
           <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)] lg:items-start">
-            <StorageSection
-              storage={panel.data.storage}
-              running={running}
-              notices={
-                <>
-                  {noticeFor("setup")}
-                  {noticeFor("storage")}
-                </>
-              }
-              onSetUp={setUp}
-              onWithdraw={takeBackStorage}
-            />
+            <div className="grid gap-5">
+              <StorageSection
+                storage={panel.data.storage}
+                running={running}
+                notices={
+                  <>
+                    {noticeFor("setup")}
+                    {noticeFor("storage")}
+                  </>
+                }
+                onSetUp={setUp}
+                onWithdraw={takeBackStorage}
+              />
+
+              {faucetOffered(config.network) ? (
+                <FaucetSection
+                  token={faucetToken(panel.data.rows, config.network)}
+                  running={running === "faucet"}
+                  anyRunning={running !== null}
+                  onGet={getTestTokens}
+                  notice={noticeFor("faucet")}
+                />
+              ) : null}
+            </div>
 
             <BalancesSection rows={panel.data.rows} />
           </div>

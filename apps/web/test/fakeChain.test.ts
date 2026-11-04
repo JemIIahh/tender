@@ -1,5 +1,6 @@
 import {
   depositCall,
+  mintCall,
   type PostTaskInput,
   postTaskCall,
   storageDepositCall,
@@ -203,6 +204,42 @@ test("a_wallet_double_stops_at_the_first_transaction_that_fails", async () => {
   expect(outcomes).toHaveLength(1);
   expect(wallet.sent).toHaveLength(1);
   expect(chain.calls.map((call) => call.methodName)).toEqual(["withdraw"]);
+});
+
+test("the_test_tokens_mint_credits_a_registered_account_and_refuses_the_rest", () => {
+  // contract/test-token: `mint` has no access control, but panics for an account the token has not
+  // registered, and is not payable.
+  const chain = new FakeChain(CONTRACT, [{ token: TOKEN }]);
+  const balance = () => chain.view(TOKEN, "ft_balance_of", { account_id: ALICE });
+
+  const [unregistered] = sendAll(chain, [mintCall(TOKEN, ALICE, 5n)]);
+  expect(JSON.stringify(unregistered?.status)).toContain("is not registered");
+  expect(balance()).toBe("0");
+
+  // Registered, in the same transaction: the registration and the mint are one batch.
+  const [batch] = chain.send(ALICE, [
+    {
+      receiverId: TOKEN,
+      actions: [
+        actionOf(tokenStorageDepositCall(TOKEN, ALICE)),
+        actionOf(mintCall(TOKEN, ALICE, 5n)),
+      ],
+    },
+  ]);
+  expect("SuccessValue" in (batch?.status ?? {})).toBe(true);
+  expect(balance()).toBe("5");
+
+  // Minted again, for another account, by the one who is not it.
+  chain.give(TOKEN, "bob.testnet", 0n);
+  sendAll(chain, [mintCall(TOKEN, "bob.testnet", 7n)]);
+  expect(chain.view(TOKEN, "ft_balance_of", { account_id: "bob.testnet" })).toBe("7");
+
+  // Not payable: a deposit fails the call and changes nothing.
+  const payable = { ...actionOf(mintCall(TOKEN, ALICE, 1n)) };
+  payable.params = { ...payable.params, deposit: "1" };
+  const [paid] = chain.send(ALICE, [{ receiverId: TOKEN, actions: [payable] }]);
+  expect(JSON.stringify(paid?.status)).toContain("doesn't accept deposit");
+  expect(balance()).toBe("5");
 });
 
 // ---- post_task ----------------------------------------------------------------------------------

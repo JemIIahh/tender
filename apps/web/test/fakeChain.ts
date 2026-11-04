@@ -389,11 +389,29 @@ export class FakeChain {
           return [this.receipt(receiverId, [])];
         case "ft_transfer_call":
           return this.ftTransferCall(receiverId, signer, args, deposit);
+        case "mint":
+          return this.mint(receiverId, args, deposit);
         default:
           throw panic("E_ARGS", `no such method ${methodName}`);
       }
     }
     throw panic("E_ARGS", `no contract at ${receiverId}`);
+  }
+
+  /**
+   * The test token's `mint` (contract/test-token): anyone may call it for any account, but the
+   * account must be registered with the token, and the method is not payable. The token's own
+   * panics, as the standard library words them, carry no `E_` code.
+   */
+  private mint(token: string, args: Record<string, unknown>, deposit: bigint) {
+    if (deposit !== 0n) throw new Panic("Method mint doesn't accept deposit");
+    const account = String(args.account_id);
+    if (!this.registered(token).has(account)) {
+      throw new Panic(`The account ${account} is not registered`);
+    }
+    const amount = BigInt(String(args.amount));
+    this.balances(token).set(account, (this.balances(token).get(account) ?? 0n) + amount);
+    return [this.receipt(token, [])];
   }
 
   private storageDeposit(signer: string, args: Record<string, unknown>, deposit: bigint) {
