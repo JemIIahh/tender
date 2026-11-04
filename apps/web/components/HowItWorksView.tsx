@@ -213,8 +213,9 @@ export function HowItWorksView() {
 
         <Part art="signal" title="What you still trust" testId="how-trust">
           <p>
-            The verifier decides who wins, and there is no appeal. On a task the Judge verifies,
-            that is our Judge, whose key is on our server.
+            The verifier decides who wins, or the poster when the verifier does not pick in time,
+            and there is no appeal. On a task the Judge verifies, that is our Judge, whose key is on
+            our server.
           </p>
           <p>
             The Tender team holds the full-access key of the contract's account, so it can deploy

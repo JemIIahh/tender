@@ -7,6 +7,8 @@ import { routeApi } from "./fixtures";
 // where there is no rail.
 
 const sidebar = (page: Page) => page.locator("aside");
+/** The toggle, whose name stays "Sidebar"; `aria-expanded` says whether the sidebar is wide. */
+const toggle = (page: Page) => page.getByRole("button", { name: "Sidebar", exact: true });
 const nav = (page: Page) => page.getByRole("navigation", { name: "Main" });
 const width = async (page: Page) => (await sidebar(page).boundingBox())?.width ?? 0;
 
@@ -25,8 +27,10 @@ test("sidebar_becomes_a_rail_and_back_and_the_mark_moves_to_the_top_bar", async 
   await expect(sideMark).toBeVisible();
   await expect(nav(page).getByText("Browse agents")).toBeVisible();
 
-  await page.getByRole("button", { name: "Hide sidebar" }).click();
+  await expect(toggle(page)).toHaveAttribute("aria-expanded", "true");
+  await toggle(page).click();
   await settledWidth(page, 64);
+  await expect(toggle(page)).toHaveAttribute("aria-expanded", "false");
   // The mark is in the top bar now, and the sidebar's is put away.
   await expect(barMark).toBeVisible();
   await expect(sideMark).toBeHidden();
@@ -54,8 +58,9 @@ test("sidebar_becomes_a_rail_and_back_and_the_mark_moves_to_the_top_bar", async 
     0,
   );
 
-  await page.getByRole("button", { name: "Show sidebar" }).click();
+  await toggle(page).click();
   await settledWidth(page, 240);
+  await expect(toggle(page)).toHaveAttribute("aria-expanded", "true");
   await expect(barMark).toBeHidden();
   await expect(sideMark).toBeVisible();
 });
@@ -63,15 +68,12 @@ test("sidebar_becomes_a_rail_and_back_and_the_mark_moves_to_the_top_bar", async 
 test("sidebar_rail_is_kept_and_drawn_before_the_page_s_code_runs", async ({ page }) => {
   await routeApi(page);
   await page.goto("/tasks");
-  await page.getByRole("button", { name: "Hide sidebar" }).click();
+  await toggle(page).click();
   await settledWidth(page, 64);
 
   await page.reload();
   await settledWidth(page, 64);
-  await expect(page.getByRole("button", { name: "Show sidebar" })).toHaveAttribute(
-    "aria-expanded",
-    "false",
-  );
+  await expect(toggle(page)).toHaveAttribute("aria-expanded", "false");
 
   // The page as the server sends it, with none of the app's code run: only the script in the head.
   // It is already the rail, so the first frame a visitor sees is the rail, and not the wide sidebar
@@ -102,15 +104,54 @@ test("sidebar_shortcut_toggles_it_but_not_from_a_text_field", async ({ page }) =
   await expect(field).toBeFocused();
 });
 
+test("sidebar_shortcut_is_left_to_editable_text", async ({ page }) => {
+  await routeApi(page);
+  await page.goto("/tasks");
+  await settledWidth(page, 240);
+
+  // No page has editable text of its own yet: a box of it goes on the page, as a rich editor would
+  // put one, with a line in it. Whatever the page does with ⌘B, the window hears last.
+  await page.evaluate(() => {
+    const box = document.createElement("div");
+    box.contentEditable = "true";
+    box.dataset.testid = "editable";
+    box.innerHTML = "<p>A note, <span>in a line of its own</span></p>";
+    document.querySelector("main")?.append(box);
+    const taken: boolean[] = [];
+    (window as unknown as { taken: boolean[] }).taken = taken;
+    window.addEventListener("keydown", (event) => {
+      if (event.key.toLowerCase() === "b") taken.push(event.defaultPrevented);
+    });
+  });
+  const editable = page.getByTestId("editable");
+  await editable.locator("span").click();
+  await page.keyboard.press("Control+b");
+  await page.keyboard.press("Meta+b");
+  await page.waitForTimeout(400);
+  // The sidebar stays as it was, the focus stays in the text, and the page took neither press.
+  expect(await width(page)).toBeCloseTo(240, 0);
+  await expect(editable).toBeFocused();
+  expect(await page.evaluate(() => (window as unknown as { taken: boolean[] }).taken)).toEqual([
+    false,
+    false,
+  ]);
+
+  // Out of the text, the shortcut is the page's again.
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+  await page.keyboard.press("Control+b");
+  await settledWidth(page, 64);
+});
+
 test("sidebar_rail_names_each_icon_in_a_tooltip_beside_it", async ({ page }) => {
   await routeApi(page);
   await page.goto("/tasks");
-  const toggle = page.getByRole("button", { name: "Hide sidebar" });
-  await toggle.hover();
+  const button = toggle(page);
+  await button.hover();
   const tip = page.getByTestId("sidebar-tip");
+  // The tooltip's words say what a press does, and follow the sidebar; the name does not change.
   await expect(tip).toHaveText(/^Hide sidebar(⌘B|Ctrl\+B)$/);
 
-  await toggle.click();
+  await button.click();
   await settledWidth(page, 64);
   await expect(tip).toHaveText(/^Show sidebar/);
 
@@ -146,7 +187,7 @@ test("sidebar_on_a_phone_is_the_menu_and_has_no_rail", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   await routeApi(page);
   await page.goto("/tasks");
-  await expect(page.getByRole("button", { name: "Hide sidebar" })).toBeHidden();
+  await expect(toggle(page)).toBeHidden();
 
   await page.keyboard.press("Meta+b");
   await page.keyboard.press("Control+b");

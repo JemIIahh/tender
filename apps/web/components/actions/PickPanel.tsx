@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  HAND_PICK_REASON_MAX,
   type PickWinner,
   revealedForPick,
   splitReward,
@@ -11,17 +10,15 @@ import {
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { useApiToken } from "../../lib/auth";
-import { formatBps } from "../../lib/bps";
 import { PickFailure, type PickResult, type PickStage, submitPick } from "../../lib/pick";
 import { liveToken } from "../../lib/postSubmit";
 import { equalShares, equalSplitNote, readShare, shareText, shareTotal } from "../../lib/shares";
-import { describeAmount } from "../../lib/vault";
 import type { UseWallet } from "../../lib/wallet";
-import { Amount } from "../Amount";
 import { Countdown } from "../Countdown";
-import { TeamBadge } from "../TeamBadge";
-import { FACT_LABEL, FIELD, NOTICE, PRIMARY, SECONDARY } from "../ui";
-import { Delivery } from "./Delivery";
+import { FACT_LABEL, NOTICE, PRIMARY, SECONDARY } from "../ui";
+import { PickEntry } from "./PickEntry";
+import { PickNobody } from "./PickNobody";
+import { PickPayout } from "./PickPayout";
 
 const STAGE_WORDS: Record<PickStage, string> = {
   check: "Checking the task…",
@@ -47,30 +44,6 @@ function revealedEntries(entries: readonly TaskEntry[]): TaskEntry[] {
     if (x !== y) return x < y ? -1 : 1;
     return a.account < b.account ? -1 : a.account > b.account ? 1 : 0;
   });
-}
-
-/** How a reveal time reads: `29 Oct, 20:54:59 UTC`, the same wherever the page is opened. */
-const REVEAL_TIME = new Intl.DateTimeFormat("en-GB", {
-  day: "numeric",
-  month: "short",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hour12: false,
-  timeZone: "UTC",
-});
-
-/** When an entry was revealed, if the API says (the block time of its reveal), as a `<time>`. */
-function RevealedAt({ ns }: { ns: string | null | undefined }) {
-  if (ns === null || ns === undefined) return null;
-  const at = new Date(Number(BigInt(ns) / 1_000_000n));
-  return (
-    <>
-      {"Revealed "}
-      <time dateTime={at.toISOString()}>{`${REVEAL_TIME.format(at)} UTC`}</time>
-      {" · "}
-    </>
-  );
 }
 
 /** What the person has chosen, as `pick` takes it, or why it can't be sent yet. */
@@ -104,6 +77,9 @@ function winnersOf(
  * The payout is worked out as the contract makes it, with the fee the task was posted with. "Pick
  * nobody" asks first, since it pays no agent. The scorecard is written from the choice, published in
  * the picker's name, and the pick is one wallet approval (lib/pick.ts).
+ *
+ * This holds the choice and the send; an entry's row (PickEntry), the payout (PickPayout) and the
+ * question before picking nobody (PickNobody) only show it.
  */
 export function PickPanel({
   data,
@@ -264,7 +240,6 @@ export function PickPanel({
     );
   }
 
-  const funders = data.funders;
   return (
     <div className="grid gap-5">
       {windowLine}
@@ -281,171 +256,38 @@ export function PickPanel({
         <ul className="grid gap-3">
           {entries.map((entry) => {
             const on = chosen.includes(entry.account);
-            const full = !single && !on && chosen.length >= most;
-            const shareId = `${id}-share-${entry.entry_index}`;
-            const reasonId = `${id}-reason-${entry.entry_index}`;
-            // The fields are named by their visible labels, and described by whose entry it is.
-            const whoId = `${id}-who-${entry.entry_index}`;
-            const fieldError = choice.fieldErrors[entry.account];
             return (
-              <li
+              <PickEntry
                 key={entry.account}
-                data-testid="pick-entry"
-                data-chosen={on}
-                className={`grid gap-3 rounded-xl border p-4 transition-colors motion-reduce:transition-none ${on ? "border-bone/50 bg-raised" : "border-line bg-ink/40"}`}
-              >
-                <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
-                  <label className="flex min-w-0 cursor-pointer items-start gap-3">
-                    <input
-                      type={single ? "radio" : "checkbox"}
-                      name={single ? `${id}-winner` : undefined}
-                      checked={on}
-                      disabled={busy || full}
-                      onChange={(event) => toggle(entry.account, event.target.checked)}
-                      aria-label={`Winner: ${entry.account}`}
-                      className="mt-1 size-4 shrink-0 accent-[var(--color-seal)]"
-                    />
-                    <span className="grid min-w-0 gap-1">
-                      <span id={whoId}>
-                        <TeamBadge account={entry.account} isTeam={entry.is_team} />
-                      </span>
-                      <span data-testid="pick-entry-when" className="text-[12.5px] text-muted">
-                        <RevealedAt ns={entry.revealed_at} />
-                        {`${entry.revealed_at == null ? "Committed" : "committed"} at block ${entry.committed_height}`}
-                      </span>
-                    </span>
-                  </label>
-                  {on ? (
-                    <span className="rounded-full border border-seal/60 px-2.5 py-1 font-mono text-[10.5px] tracking-[0.14em] text-bone uppercase">
-                      Winner
-                    </span>
-                  ) : null}
-                </div>
-
-                <Delivery
-                  account={entry.account}
-                  contentHash={entry.content_hash ?? ""}
-                  uri={entry.uri}
-                />
-
-                <div className="grid gap-3 sm:grid-cols-[9rem_minmax(0,1fr)]">
-                  {on && chosen.length > 1 ? (
-                    <div className="grid content-start gap-1.5">
-                      <label htmlFor={shareId} className="text-[13px] text-bone">
-                        Share (%)
-                      </label>
-                      <input
-                        id={shareId}
-                        inputMode="decimal"
-                        value={shares[entry.account] ?? ""}
-                        disabled={busy}
-                        onChange={(event) =>
-                          setShares({ ...shares, [entry.account]: event.target.value })
-                        }
-                        aria-invalid={fieldError !== undefined}
-                        aria-describedby={
-                          fieldError === undefined ? whoId : `${whoId} ${shareId}-error`
-                        }
-                        className={`${FIELD} tabular-nums`}
-                      />
-                      {fieldError === undefined ? null : (
-                        <p id={`${shareId}-error`} role="alert" className="text-[12.5px] text-seal">
-                          {fieldError}
-                        </p>
-                      )}
-                    </div>
-                  ) : null}
-                  <div
-                    className={`grid content-start gap-1.5 ${on && chosen.length > 1 ? "" : "sm:col-span-2"}`}
-                  >
-                    <label htmlFor={reasonId} className="text-[13px] text-bone">
-                      Reason (optional, public)
-                    </label>
-                    <input
-                      id={reasonId}
-                      value={reasons[entry.account] ?? ""}
-                      maxLength={HAND_PICK_REASON_MAX}
-                      disabled={busy}
-                      onChange={(event) =>
-                        setReasons({ ...reasons, [entry.account]: event.target.value })
-                      }
-                      aria-describedby={whoId}
-                      className={FIELD}
-                      placeholder="One line on why, for the scorecard"
-                    />
-                  </div>
-                </div>
-              </li>
+                entry={entry}
+                idBase={id}
+                single={single}
+                on={on}
+                full={!single && !on && chosen.length >= most}
+                busy={busy}
+                several={chosen.length > 1}
+                share={shares[entry.account] ?? ""}
+                reason={reasons[entry.account] ?? ""}
+                fieldError={choice.fieldErrors[entry.account]}
+                onToggle={(next) => toggle(entry.account, next)}
+                onShare={(share) => setShares({ ...shares, [entry.account]: share })}
+                onReason={(reason) => setReasons({ ...reasons, [entry.account]: reason })}
+              />
             );
           })}
         </ul>
       </fieldset>
 
-      <div className="grid gap-3 rounded-xl border border-line bg-ink p-4">
-        <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-          <h3 className={FACT_LABEL}>What gets paid</h3>
-          {chosen.length > 1 ? (
-            <button
-              type="button"
-              onClick={() => setShares(splitEqually(chosen))}
-              disabled={busy}
-              className="font-mono text-[11px] tracking-[0.12em] text-muted uppercase underline decoration-muted/40 underline-offset-4 hover:text-bone"
-            >
-              Split equally
-            </button>
-          ) : null}
-        </div>
-        {/* Only where the shares stand is announced as it changes, not every amount. The region is
-            always there, so that its first words are announced too; empty, it takes no room. */}
-        <p
-          aria-live="polite"
-          className={payout === null || chosen.length > 1 ? "text-sm text-muted" : "sr-only"}
-        >
-          {payout === null ? (
-            <span data-testid="pick-problem">{choice.problem}</span>
-          ) : chosen.length > 1 ? (
-            "The shares add up to 100%."
-          ) : null}
-        </p>
-        {payout === null ? null : (
-          <>
-            <p className="text-[13.5px] text-muted">
-              {"Reward "}
-              <Amount value={task.reward} token={task.token} />
-              {` · platform fee ${formatBps(task.fee_bps)}, `}
-              <Amount value={payout.fee.toString()} token={task.token} />
-              {" · each winner gets their share of the rest."}
-            </p>
-            <ul className="grid">
-              {choice.winners.map((winner, i) => (
-                <li
-                  key={winner.account}
-                  data-testid="pick-payout"
-                  className="flex flex-wrap items-baseline gap-x-4 gap-y-1 border-t border-line py-2.5 first:border-t-0 first:pt-0 last:pb-0"
-                >
-                  <span className="min-w-0 font-mono text-[13px] text-bone wrap-anywhere">
-                    {winner.account}
-                  </span>
-                  <span className="text-muted tabular-nums">{formatBps(winner.bps)}</span>
-                  <span className="ml-auto text-bone tabular-nums">
-                    <Amount value={(payout.amounts[i] ?? 0n).toString()} token={task.token} />
-                  </span>
-                </li>
-              ))}
-            </ul>
-            {equalNote === null ? null : (
-              <p data-testid="pick-rounding-shares" className="text-[12.5px] text-muted">
-                {equalNote}
-              </p>
-            )}
-            {payout.dust > 0n ? (
-              <p data-testid="pick-rounding" className="text-[12.5px] text-muted">
-                {`Rounding down leaves ${describeAmount(payout.dust, task.token)}: the contract gives it to ${choice.winners[0]?.account}, the first winner, as shown.`}
-              </p>
-            ) : null}
-          </>
-        )}
-      </div>
+      <PickPayout
+        task={task}
+        chosen={chosen.length}
+        winners={choice.winners}
+        problem={choice.problem}
+        payout={payout}
+        equalNote={equalNote}
+        busy={busy}
+        onSplitEqually={() => setShares(splitEqually(chosen))}
+      />
 
       {run.status === "done" ? null : (
         <div className="grid gap-3">
@@ -483,57 +325,15 @@ export function PickPanel({
           </div>
 
           {confirming ? (
-            <div className="rounded-xl border border-seal/50 bg-raised p-4">
-              <fieldset
-                ref={confirmRef}
-                tabIndex={-1}
-                data-testid="pick-nobody-confirm"
-                className="grid min-w-0 gap-3 outline-none"
-              >
-                <legend className="mb-3 font-medium text-bone">
-                  Pick nobody? The agents are not paid.
-                </legend>
-                <p className="text-[13.5px] text-muted">
-                  The whole reward, <Amount value={task.reward} token={task.token} />, goes back to
-                  the funders, with no fee taken. The scorecard is published with every entry at 0.
-                </p>
-                {funders.length === 0 ? null : (
-                  <ul className="grid gap-1 text-[13px]">
-                    {funders.map((funder) => (
-                      <li key={funder.account} className="flex flex-wrap gap-x-3">
-                        <span className="font-mono text-bone wrap-anywhere">{funder.account}</span>
-                        <span className="text-muted tabular-nums">
-                          gets back <Amount value={funder.amount} token={task.token} />
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                <p className="text-[13px] text-muted">
-                  {`Entries were revealed, so if ${account} is a registered agent, its public record counts one more empty pick after reveals.`}
-                </p>
-                <div className="flex flex-wrap gap-3">
-                  <button
-                    type="button"
-                    aria-disabled={busy}
-                    onClick={() => void send([])}
-                    className={PRIMARY}
-                  >
-                    {busy ? STAGE_WORDS[run.stage] : "Yes, pick nobody"}
-                  </button>
-                  <button
-                    type="button"
-                    aria-disabled={busy}
-                    onClick={() => {
-                      if (!busy) setConfirming(false);
-                    }}
-                    className={SECONDARY}
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </fieldset>
-            </div>
+            <PickNobody
+              focusRef={confirmRef}
+              data={data}
+              account={account}
+              busy={busy}
+              busyWords={run.status === "busy" ? STAGE_WORDS[run.stage] : null}
+              onConfirm={() => void send([])}
+              onCancel={() => setConfirming(false)}
+            />
           ) : null}
 
           {run.status === "failed" ? (

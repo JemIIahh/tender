@@ -66,9 +66,10 @@ const TAIL_DIGITS = 6;
  * The number is one run of figures that never wraps. On a line too narrow for all of it, it is cut
  * in the middle, visibly: its first digits as far as they fit, a "…", and always its last six. It
  * is never cut off silently at the line's edge, where the digits that are left would read as
- * another number. The "…" is drawn by CSS (`text-overflow`): every digit stays in the page, so a
- * screen reader reads the whole number, and so does the tooltip (`title`). The whole id is the
- * label's title, and is what a screen reader reads of it.
+ * another number. The "…" is drawn by CSS (`text-overflow`), and every digit stays in the page and
+ * in the tooltip (`title`). The cut is for the eye only: its two parts are hidden from a screen
+ * reader, which reads the whole number once, as one text, from a copy it alone is given. The whole
+ * id is the label's title, and is what a screen reader reads of it.
  */
 export function RawUnits({
   value,
@@ -90,9 +91,12 @@ export function RawUnits({
     <span className="grid min-w-0 gap-0.5">
       <span className="flex min-w-0 font-mono tabular-nums">
         {label === undefined ? null : <span className="sr-only">{label} </span>}
+        {/* A number in two parts could be read as two numbers: the screen reader has it whole. */}
+        {cut ? <span className="sr-only">{value}</span> : null}
         <span
           data-testid={amountTestId}
           title={value}
+          aria-hidden={cut ? true : undefined}
           className="flex max-w-full min-w-0 whitespace-nowrap"
         >
           {cut ? (

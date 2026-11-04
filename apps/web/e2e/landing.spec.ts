@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 import { routeApi, TASKS } from "./fixtures";
 
 // The landing (app/page.tsx) in a browser: its way to the board, its keyboard focus, the ticker's
@@ -37,21 +37,65 @@ test("landing_ticker_counts_the_open_tasks_the_api_lists", async ({ page }) => {
   ).toHaveText(`Open tasks${open}`);
 });
 
+/**
+ * The hero art's own pixels (its canvas, as a data URL), and whether anything is drawn on it yet.
+ * Not a screenshot of its box: the box also holds the headline, the typed code and the ticker,
+ * which change on their own (the ticker's figures land whenever the API answers), so a screenshot
+ * can change while the art holds still.
+ */
+function artPixels(page: Page): Promise<{ drawn: boolean; pixels: string }> {
+  return page.getByTestId("art-hero").evaluate((element) => {
+    const canvas = element as HTMLCanvasElement;
+    const context = canvas.getContext("2d");
+    const { data } =
+      context?.getImageData(0, 0, canvas.width, canvas.height) ?? new ImageData(1, 1);
+    // The art is drawn on a clear canvas: any pixel that is not clear is the art.
+    const drawn = data.some((value, index) => index % 4 === 3 && value !== 0);
+    return { drawn, pixels: canvas.toDataURL() };
+  });
+}
+
+/** Lets the page draw `frames` frames and `ms` pass, whichever is longer, however busy it is. */
+function framesPass(page: Page, frames: number, ms: number): Promise<void> {
+  return page.evaluate(
+    ([count, least]) =>
+      new Promise<void>((done) => {
+        const start = performance.now();
+        let seen = 0;
+        const step = () => {
+          seen += 1;
+          if (seen >= count && performance.now() - start >= least) done();
+          else requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      }),
+    [frames, ms] as const,
+  );
+}
+
 test("landing_art_moves_and_holds_still_with_reduced_motion", async ({ page }) => {
   await routeApi(page);
   const art = page.getByTestId("art-hero");
 
+  // The art's code comes after the page (components/landing/DitherArt.tsx): its first frame is
+  // waited for, however long a busy machine takes, and only then is it watched.
   await page.goto("/");
   await expect(art).toBeVisible();
-  const before = await art.screenshot();
-  await page.waitForTimeout(800);
-  expect((await art.screenshot()).equals(before), "the art should move").toBe(false);
+  await expect.poll(async () => (await artPixels(page)).drawn, { timeout: 30_000 }).toBe(true);
+  const before = (await artPixels(page)).pixels;
+  await expect
+    .poll(async () => (await artPixels(page)).pixels, {
+      message: "the art should move",
+      timeout: 10_000,
+    })
+    .not.toBe(before);
 
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.reload();
   await expect(art).toBeVisible();
-  await page.waitForTimeout(300);
-  const still = await art.screenshot();
-  await page.waitForTimeout(800);
-  expect((await art.screenshot()).equals(still), "the art should hold still").toBe(true);
+  await expect.poll(async () => (await artPixels(page)).drawn, { timeout: 30_000 }).toBe(true);
+  const still = (await artPixels(page)).pixels;
+  // Room for dozens of frames of the show, which plays 24 a second: with reduced motion, none.
+  await framesPass(page, 60, 1500);
+  expect((await artPixels(page)).pixels, "the art should hold still").toBe(still);
 });

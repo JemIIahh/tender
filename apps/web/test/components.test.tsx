@@ -164,8 +164,11 @@ test("task_card_labels_an_unknown_token_as_the_live_panel_does_and_never_breaks_
   expect(amount?.textContent).toBe(MAX);
   expect(amount?.className).not.toContain("wrap-anywhere");
   // Under it, the Live panel's label: the token's account with its middle left out, whole for a
-  // screen reader and in the title.
-  expect(raw.textContent).toBe(`Reward: ${MAX}smallest units of 5f3a9c0e…5f3a9c0e${IMPLICIT}`);
+  // screen reader and in the title. The number is in the page twice: whole for a screen reader,
+  // and cut for the eye.
+  expect(raw.textContent).toBe(
+    `Reward: ${MAX}${MAX}smallest units of 5f3a9c0e…5f3a9c0e${IMPLICIT}`,
+  );
   expect(raw.querySelector(`[title="${IMPLICIT}"]`)).toBeTruthy();
   // The token's account is not run into the number any more.
   expect(raw.textContent).not.toContain(`${MAX} ${IMPLICIT}`);
@@ -189,11 +192,20 @@ test("raw_units_cut_a_long_number_in_the_middle_visibly_and_keep_every_digit_in_
   expect(head.nextElementSibling?.className).toContain("shrink-0");
   // Never a scroller that cuts it off at the edge, and never a wrap in the middle.
   expect(amount.className).not.toMatch(/overflow-x-auto|wrap-anywhere/);
+  // The cut is for the eye: a screen reader is given the whole number once, as one text, and not
+  // the two parts, which could read as two numbers.
+  expect(amount.getAttribute("aria-hidden")).toBe("true");
+  const spoken = amount.parentElement?.querySelectorAll(".sr-only") ?? [];
+  expect([...spoken].map((part) => part.textContent)).toEqual([MAX]);
+  expect(amount.previousElementSibling?.textContent).toBe(MAX);
 
   // A short amount is shown as it is, with nothing to cut.
   render(<RawUnits value="42" token="mystery.token.near" amountTestId="short" />);
   expect(screen.getByTestId("short").textContent).toBe("42");
   expect(screen.getByTestId("short").children).toHaveLength(0);
+  // Nothing is cut, so it is the one text a screen reader reads.
+  expect(screen.getByTestId("short").getAttribute("aria-hidden")).toBeNull();
+  expect(screen.getByTestId("short").parentElement?.querySelector(".sr-only")).toBeNull();
 });
 
 // ---- Nav --------------------------------------------------------------------------------------
