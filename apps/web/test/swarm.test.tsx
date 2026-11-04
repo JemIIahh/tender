@@ -78,32 +78,67 @@ test("lineage_from_a_subtask_reads_its_parent_and_its_siblings", async () => {
   expect(asked).toEqual(["20", "21", "23"]);
 });
 
-test("lineage_shows_three_levels_and_says_when_it_goes_higher_or_deeper", async () => {
-  // 1 > 2 > 3 > 4 > 5: from 4, the tree is 2, 3, 4; 1 is above it, and 5 is below its last level.
+/** A chain of tasks 1 > 2 > … > `last`, each the only subtask of the one before. */
+function chainOf(last: number): Map<string, TaskDetailResponse> {
   const chain = new Map<string, TaskDetailResponse>();
-  for (const id of ["1", "2", "3", "4", "5"]) {
-    const n = Number(id);
+  for (let n = 1; n <= last; n++) {
+    const id = String(n);
     chain.set(
       id,
       detail(
         { id, parent: n === 1 ? null : String(n - 1) },
-        { children: n === 5 ? [] : [String(n + 1)] },
+        { children: n === last ? [] : [String(n + 1)] },
       ),
     );
   }
+  return chain;
+}
+
+test("lineage_of_a_task_with_no_subtasks_goes_two_up_and_says_when_it_goes_higher", async () => {
+  // 1 > 2 > 3 > 4 > 5: from 5, which has no subtasks, the tree is 3, 4, 5, and 2 is above it.
+  const chain = chainOf(5);
+  const { asked, getTask } = reader(chain);
+
+  const lineage = await loadLineage(get(chain, "5"), getTask);
+
+  expect(lineage.root.id).toBe("3");
+  expect(lineage.above).toBe("2");
+  const level2 = lineage.root.children[0] as TreeNode;
+  const level3 = level2.children[0] as TreeNode;
+  expect([level2.id, level3.id]).toEqual(["4", "5"]);
+  expect(asked).toEqual(["4", "3"]);
+});
+
+test("lineage_of_a_task_with_a_grandparent_and_subtasks_keeps_its_subtasks_in_the_tree", async () => {
+  // 1 > 2 > 3 > 4 > 5: from 4, which has a grandparent and a subtask, the tree is 3, 4, 5. It goes
+  // up one task only, so that 4's own subtask has a level of its own, is read, and is a link.
+  const chain = chainOf(5);
   const { asked, getTask } = reader(chain);
 
   const lineage = await loadLineage(get(chain, "4"), getTask);
 
-  expect(lineage.root.id).toBe("2");
-  expect(lineage.above).toBe("1");
-  const level2 = lineage.root.children[0] as TreeNode;
-  const level3 = level2.children[0] as TreeNode;
-  expect([level2.id, level3.id]).toEqual(["3", "4"]);
-  // Task 4 is in the last level: its subtask is counted, not read.
-  expect(level3.children).toEqual([]);
-  expect(level3.deeper).toBe(1);
-  expect(asked).toEqual(["3", "2"]);
+  expect(lineage.root.id).toBe("3");
+  expect(lineage.above).toBe("2");
+  const own = lineage.root.children[0] as TreeNode;
+  expect(own.id).toBe("4");
+  expect(own.children.map((child) => [child.id, child.read.state])).toEqual([["5", "ready"]]);
+  expect(own.deeper).toBe(0);
+  expect(asked).toEqual(["3", "5"]);
+});
+
+test("lineage_says_when_a_task_on_the_last_level_has_subtasks_of_its_own", async () => {
+  // 1 > 2 > 3 > 4 > 5: from 2, the tree is 1, 2, 3, and 3's subtask (4) is below its last level.
+  const chain = chainOf(5);
+  const { getTask } = reader(chain);
+
+  const lineage = await loadLineage(get(chain, "2"), getTask);
+
+  expect(lineage.root.id).toBe("1");
+  expect(lineage.above).toBeNull();
+  const last = (lineage.root.children[0] as TreeNode).children[0] as TreeNode;
+  expect(last.id).toBe("3");
+  expect(last.children).toEqual([]);
+  expect(last.deeper).toBe(1);
 });
 
 test("lineage_reads_at_most_so_many_tasks_and_names_the_rest", async () => {
@@ -346,6 +381,35 @@ test("swarm_tree_on_a_subtask_shows_the_parent_above_it_and_marks_this_task", as
     .find((node) => node.getAttribute("data-task-id") === "22") as HTMLElement;
   expect(within(own).getByText("This task")).toBeTruthy();
   expect(screen.getByTestId("margin-value").textContent).toBe("+3.50 tUSDC");
+});
+
+test("swarm_tree_keeps_the_links_to_the_subtasks_of_a_task_with_a_grandparent", async () => {
+  // 1 > 2 > 3 > 4 > 5, on the page of 4: its subtask 5 is a link on the first render, after the
+  // lineage is read, and after the stream has it read again.
+  const chain = chainOf(5);
+  const asked = fakeApi(chain);
+  const childLinks = () =>
+    screen.queryAllByTestId("child-link").map((link) => link.getAttribute("href"));
+  const view = render(
+    <SwarmTree current={get(chain, "4")} nowNs={NOW} refresh={0} onIds={() => {}} />,
+  );
+  expect(childLinks()).toEqual(["/tasks/5"]);
+
+  await waitFor(() => expect(screen.getAllByTestId("tree-poster")).toHaveLength(3));
+  expect(childLinks()).toEqual(["/tasks/5"]);
+  // Task 5 is read and shown as a task of the tree, not only named.
+  const five = screen
+    .getAllByTestId("tree-node")
+    .find((node) => node.getAttribute("data-task-id") === "5") as HTMLElement;
+  expect(within(five).getByTestId("tree-poster")).toBeTruthy();
+  expect(screen.queryByText(/more subtasks? below/)).toBeNull();
+  expect(screen.getByText(/It goes higher/).textContent).toContain("Task #2");
+
+  const reads = asked.length;
+  view.rerender(<SwarmTree current={get(chain, "4")} nowNs={NOW} refresh={1} onIds={() => {}} />);
+  await waitFor(() => expect(asked.length).toBeGreaterThan(reads));
+  await waitFor(() => expect(screen.getAllByTestId("tree-poster")).toHaveLength(3));
+  expect(childLinks()).toEqual(["/tasks/5"]);
 });
 
 test("swarm_tree_says_the_margin_waits_while_the_swarm_is_open", async () => {

@@ -81,10 +81,13 @@ export function initialLineage(current: TaskDetailResponse): Lineage {
 }
 
 /**
- * The lineage of `current`: up to two tasks above it (so that it is in the tree's last level at
- * the deepest), then every subtask of the top one, level by level, to `TREE_DEPTH`. Each task is
- * read once, at most `MAX_READS` in all. A task the index does not have, or that could not be read,
- * stays in the tree as what it is; a read that throws is logged.
+ * The lineage of `current`, centred on it: the tasks above it, then every subtask of the top one,
+ * level by level, to `TREE_DEPTH`. It goes up as far as leaves `current`'s own subtasks a level
+ * of their own: one task up for a task that has subtasks, two for one that has none. So the page's
+ * task is never on the last level while it has subtasks, and they are always in the tree as links
+ * (the contract has no limit on depth). Each task is read once, at most `MAX_READS` in all. A task
+ * the index does not have, or that could not be read, stays in the tree as what it is; a read that
+ * throws is logged.
  */
 export async function loadLineage(current: TaskDetailResponse, getTask: GetTask): Promise<Lineage> {
   let reads = 0;
@@ -108,13 +111,15 @@ export async function loadLineage(current: TaskDetailResponse, getTask: GetTask)
     return got;
   }
 
-  // Up: the chain from the top of the tree down to `current`, top first.
+  // Up: the chain from the top of the tree down to `current`, top first, as long as it leaves a
+  // level under `current` for its subtasks.
+  const levels = current.children.length > 0 ? TREE_DEPTH - 1 : TREE_DEPTH;
   const chain: string[] = [current.task.id];
   let above: string | null = null;
   for (let at: Read = known.get(current.task.id) as Read; ; ) {
     const parent = at.state === "ready" ? at.detail.task.parent : null;
     if (parent === null) break;
-    if (chain.length === TREE_DEPTH) {
+    if (chain.length === levels) {
       above = parent;
       break;
     }
