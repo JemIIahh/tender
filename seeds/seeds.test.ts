@@ -26,6 +26,16 @@ import {
 } from "@tender/shared";
 import { describe, expect, test } from "vitest";
 import { type LlmHandler, startFakeLlm } from "../packages/judge/test/fake-llm";
+import {
+  heldoutFileOf,
+  knownWrongFileOf,
+  missingPrivateFiles,
+  PRIVATE_DIR_VARIABLE,
+  privateDirOf,
+  scenariosFileOf,
+  solutionFileOf,
+  weakFileOf,
+} from "../scripts/lib/private-dir";
 import { dropOneGrader, STAND_IN, standInGrader, standInScore } from "./rubric-stand-in";
 
 // Every seed task in seeds/<slug>/ is scored by the Judge's own scorers, so that a seed that pays
@@ -34,6 +44,14 @@ import { dropOneGrader, STAND_IN, standInGrader, standInScore } from "./rubric-s
 // mocked: a regex seed runs in the same QuickJS sandbox that judges a real entry, and so does a
 // tests seed. The one kind with a model in it, rubric, is scored by the Judge's own rubric scorer
 // against a fake model server that grades by a few plain checks (rubric-stand-in.ts).
+//
+// The private half of a seed is not in seeds/: its held-out checks are secret until a task is
+// judged, its solution.txt passes those checks by construction, so a copy of it would win the
+// task, and its weak.txt is the solution with a few values wrong. All of them are read from the
+// private directory (`TENDER_SEEDS_PRIVATE_DIR`, else `seeds-private/`, see README.md). Where that
+// has no file for a seed, which is every clean checkout and CI, a test that has to score the seed's
+// answers or its checks is skipped, with one message at the top of the run; the tests that read
+// only the public files (the schemas, the counts, the briefs, the criteria) run everywhere.
 
 const SEEDS_DIR = import.meta.dirname;
 const SLUGS = readdirSync(SEEDS_DIR, { withFileTypes: true })
@@ -41,14 +59,19 @@ const SLUGS = readdirSync(SEEDS_DIR, { withFileTypes: true })
   .map((entry) => entry.name)
   .sort();
 
-const SEED_FILES = ["task.json", "brief.json", "criteria.json", "solution.txt", "weak.txt"];
+const PRIVATE_DIR = privateDirOf();
+/** The seeds that lack their solution, or their held-out checks, in the private directory. */
+const MISSING_PRIVATE = missingPrivateFiles(SEEDS_DIR, PRIVATE_DIR, SLUGS);
+const PRIVATE_NOTE = `solutions and held-out checks not found in ${PRIVATE_DIR}; set ${PRIVATE_DIR_VARIABLE}`;
+if (MISSING_PRIVATE.length > 0) {
+  console.warn(
+    `seeds: ${PRIVATE_NOTE}. The tests that score a seed's solution or its checks are skipped ` +
+      `for ${MISSING_PRIVATE.length} seeds: ${MISSING_PRIVATE.join(", ")}.`,
+  );
+}
 
-/**
- * The files a seed of `kind` has. A rubric seed has no held-out document: a model scores it against
- * the public criteria, and there is no key to keep back (`has_heldout` is false).
- */
-const filesOf = (kind: PublicCriteria["kind"]): string[] =>
-  kind === "rubric" ? SEED_FILES : [...SEED_FILES, "heldout.json"];
+/** The public files of a seed: the question. Every answer-like file is private (`PRIVATE_DIR`). */
+const SEED_FILES = ["task.json", "brief.json", "criteria.json"];
 
 /** The ten P0 seeds (plan 05, Task 9) and the kind of check each one has. */
 const P0_SEEDS: Record<string, PublicCriteria["kind"]> = {
@@ -114,6 +137,9 @@ const seedPath = (slug: string, name: string) => join(SEEDS_DIR, slug, name);
 const readBytes = (slug: string, name: string): Buffer => readFileSync(seedPath(slug, name));
 const readJson = (slug: string, name: string): unknown =>
   JSON.parse(readBytes(slug, name).toString("utf8"));
+const heldoutPath = (slug: string) => heldoutFileOf(PRIVATE_DIR, slug);
+const solutionPath = (slug: string) => solutionFileOf(PRIVATE_DIR, slug);
+const weakPath = (slug: string) => weakFileOf(PRIVATE_DIR, slug);
 const utf8 = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
 
 /**
@@ -129,18 +155,38 @@ const JSON_SCHEMA_SLUGS = SLUGS.filter((slug) => {
 });
 
 /**
- * A seed's documents, once the schemas have read them, and the solution's bytes. `heldout` is
- * `null` for a seed that has no heldout.json, which only a rubric seed may lack.
+ * A seed's public documents, once the schemas have read them, and its private ones from the private
+ * directory. `heldout`, `solution` and `weak` are `null` when that has no file for the seed:
+ * `heldout` of a rubric seed always, which has no checks, and all of them on a machine without the
+ * private directory. A test that needs them takes the seed with `loadPrivate`.
  */
 function load(slug: string) {
   return {
     brief: BriefSchema.parse(readJson(slug, "brief.json")),
     criteria: PublicCriteriaSchema.parse(readJson(slug, "criteria.json")),
-    heldout: existsSync(seedPath(slug, "heldout.json"))
-      ? HeldoutSchema.parse(readJson(slug, "heldout.json"))
+    heldout: existsSync(heldoutPath(slug))
+      ? HeldoutSchema.parse(JSON.parse(readFileSync(heldoutPath(slug), "utf8")))
       : null,
-    solution: readBytes(slug, "solution.txt"),
+    solution: existsSync(solutionPath(slug)) ? readFileSync(solutionPath(slug)) : null,
+    weak: existsSync(weakPath(slug)) ? readFileSync(weakPath(slug)) : null,
   };
+}
+
+/**
+ * `load`, for a test that scores the seed's answers or its held-out checks. It skips the test, as
+ * `skip` does, when the private directory lacks the seed's solution or weak answer or, for a seed
+ * with a held-out part, its checks. Pass the `skip` of the test's context.
+ */
+function loadPrivate(slug: string, skip: (note?: string) => never) {
+  const seed = load(slug);
+  if (
+    seed.solution === null ||
+    seed.weak === null ||
+    (seed.criteria.has_heldout && seed.heldout === null)
+  ) {
+    skip(PRIVATE_NOTE);
+  }
+  return { ...seed, solution: seed.solution as Buffer, weak: seed.weak as Buffer };
 }
 
 /**
@@ -265,8 +311,13 @@ function v8Misses(answer: Uint8Array, cases: { match: string[]; no_match: string
  * of `array`, the solution still scores 100 once the schema's bounds on that array are taken away,
  * and falls under the pass mark with them.
  */
-async function expectItemCountFixed(slug: string, array: string, extra: unknown): Promise<void> {
-  const { criteria, heldout, solution } = load(slug);
+async function expectItemCountFixed(
+  slug: string,
+  array: string,
+  extra: unknown,
+  skip: (note?: string) => never,
+): Promise<void> {
+  const { criteria, heldout, solution } = loadPrivate(slug, skip);
   if (criteria.kind !== "json_schema" || heldout === null || !("json_schema" in heldout)) {
     throw new Error(`${slug} is not a json_schema seed`);
   }
@@ -401,19 +452,42 @@ test("the_thirty_seeds_are_all_there", () => {
   );
   expect(kinds).toEqual(THIRTY_SEEDS);
 
-  const lacking = Object.entries(THIRTY_SEEDS).flatMap(([slug, kind]) =>
-    filesOf(kind)
-      .filter((name) => !existsSync(seedPath(slug, name)))
-      .map((name) => `${slug}/${name}`),
+  const lacking = Object.keys(THIRTY_SEEDS).flatMap((slug) =>
+    SEED_FILES.filter((name) => !existsSync(seedPath(slug, name))).map((name) => `${slug}/${name}`),
   );
   expect(lacking, "files missing from the seeds").toEqual([]);
-  // A file a kind does not have would be read as one that it does: a heldout.json beside a rubric.
-  const extra = Object.entries(THIRTY_SEEDS).flatMap(([slug, kind]) =>
+  // Nothing but the public files: above all no heldout.json, whose checks are secret until the task
+  // is judged, and no solution.txt, which passes them. Both live in the private directory
+  // (README.md), never in a folder that git tracks.
+  const extra = Object.keys(THIRTY_SEEDS).flatMap((slug) =>
     readdirSync(join(SEEDS_DIR, slug))
-      .filter((name) => !filesOf(kind).includes(name))
+      .filter((name) => !SEED_FILES.includes(name))
       .map((name) => `${slug}/${name}`),
   );
-  expect(extra, "files in a seed that its kind does not have").toEqual([]);
+  expect(extra, "files in a seed that are not its public files").toEqual([]);
+});
+
+test("twenty_five_of_the_thirty_seeds_have_a_held_out_part_and_five_are_rubric_seeds", () => {
+  // The counts that do not need the checks themselves: the criteria say which seeds have them.
+  const withChecks = Object.keys(THIRTY_SEEDS).filter((slug) => load(slug).criteria.has_heldout);
+  expect(withChecks).toHaveLength(25);
+  expect(Object.values(THIRTY_SEEDS).filter((kind) => kind === "rubric")).toHaveLength(5);
+  expect(withChecks.sort()).toEqual(
+    Object.entries(THIRTY_SEEDS)
+      .filter(([, kind]) => kind !== "rubric")
+      .map(([slug]) => slug)
+      .sort(),
+  );
+});
+
+test("the_private_directory_holds_every_solution_and_held_out_file_or_none", () => {
+  // Some but not all would skip the tests of the seeds that lack one without a word to say so. A
+  // directory that is not there, or holds none, is the clean checkout, which skips them all.
+  const complete = SLUGS.filter((slug) => !MISSING_PRIVATE.includes(slug));
+  expect(
+    complete.length === 0 || MISSING_PRIVATE.length === 0,
+    `${PRIVATE_DIR} lacks the solution or the held-out checks of ${MISSING_PRIVATE.join(", ")}`,
+  ).toBe(true);
 });
 
 test("the_twenty_p1_seeds_cover_five_kinds_and_the_research_data_and_writing_categories", () => {
@@ -466,13 +540,18 @@ describe.each(SLUGS)("seed %s", (slug) => {
     // Every brief says the reward goes only to a perfect answer, and the known-wrong regexes
     // below are refused on that pass mark alone: lower it and a near-miss is paid.
     expect(criteria.min_score, "min_score").toBe(100);
+    if (criteria.kind === "tests") {
+      expect(testsCriteriaProblem(criteria), "tests rules").toBeNull();
+    }
+  });
+
+  test("held_out_document_is_of_the_criterias_kind", ({ skip }) => {
+    const { criteria, heldout } = loadPrivate(slug, skip);
+    if (!criteria.has_heldout) return;
     expect(
       heldout !== null && heldoutMatchesCriteria(criteria, heldout),
       "held-out kind is the criteria's",
     ).toBe(true);
-    if (criteria.kind === "tests") {
-      expect(testsCriteriaProblem(criteria), "tests rules").toBeNull();
-    }
   });
 
   test("task_terms_are_in_range", () => {
@@ -508,8 +587,8 @@ describe.each(SLUGS)("seed %s", (slug) => {
     expect(task.max_winners as number).toBeLessThanOrEqual(5);
   });
 
-  test("solution_passes_its_held_out_checks", async () => {
-    const { brief, criteria, heldout, solution } = load(slug);
+  test("solution_passes_its_held_out_checks", async ({ skip }) => {
+    const { brief, criteria, heldout, solution } = loadPrivate(slug, skip);
 
     const result = await scoreAnswer(criteria, heldout, solution, { slug, brief });
     expect(result.score, result.reasons.join("; ")).toBeGreaterThanOrEqual(criteria.min_score);
@@ -526,11 +605,10 @@ describe.each(SLUGS)("seed %s", (slug) => {
   });
 
   test("weak_answer_scores_below_the_solution", async ({ skip }) => {
-    if (!existsSync(seedPath(slug, "weak.txt"))) return skip("this seed has no weak answer");
-    const { brief, criteria, heldout, solution } = load(slug);
+    const { brief, criteria, heldout, solution, weak: weakAnswer } = loadPrivate(slug, skip);
 
     const best = await scoreAnswer(criteria, heldout, solution, { slug, brief });
-    const weak = await scoreAnswer(criteria, heldout, readBytes(slug, "weak.txt"), { slug, brief });
+    const weak = await scoreAnswer(criteria, heldout, weakAnswer, { slug, brief });
     expect(weak.score).toBeLessThan(best.score);
     // A weak answer is meant to lose. If it passed, a task with only that entry would pay it.
     expect(weak.passed, "weak answer passes").toBe(false);
@@ -543,20 +621,20 @@ describe.each(SLUGS)("seed %s", (slug) => {
   });
 
   test("answers_fit_the_briefs_output_rules", () => {
-    const { brief, criteria, solution } = load(slug);
+    const { brief, criteria } = load(slug);
 
     const format = FORMAT_OF_KIND[criteria.kind];
     if (format !== undefined) expect(brief.output.format).toBe(format);
-    expect(solution.byteLength, "solution.txt bytes").toBeLessThanOrEqual(brief.output.max_bytes);
-    if (existsSync(seedPath(slug, "weak.txt"))) {
-      expect(readBytes(slug, "weak.txt").byteLength, "weak.txt bytes").toBeLessThanOrEqual(
-        brief.output.max_bytes,
-      );
-    }
   });
 
-  test("public_examples_are_not_held_out", () => {
-    const { brief, criteria, heldout } = load(slug);
+  test("the_solution_and_the_weak_answer_fit_the_briefs_output_rules", ({ skip }) => {
+    const { brief, solution, weak } = loadPrivate(slug, skip);
+    expect(solution.byteLength, "solution.txt bytes").toBeLessThanOrEqual(brief.output.max_bytes);
+    expect(weak.byteLength, "weak.txt bytes").toBeLessThanOrEqual(brief.output.max_bytes);
+  });
+
+  test("public_examples_are_not_held_out", ({ skip }) => {
+    const { brief, criteria, heldout } = loadPrivate(slug, skip);
 
     if (heldout === null) return;
 
@@ -607,7 +685,7 @@ describe.each(SLUGS)("seed %s", (slug) => {
 
     if (criteria.kind === "json_schema" && "json_schema" in heldout) {
       // A json_schema task publishes a schema and no examples, but its brief explains the rules
-      // with values of its own ("8,000.50 naira is [redacted] kobo"), and one of them can be a value
+      // with values of its own ("1,234.50 naira is 123450 kobo"), and one of them can be a value
       // the key holds. Nothing the key asserts may be shown in the words above the data block: the
       // data is the question. Short values are left out, as they turn up in any text ("Ada" in
       // "adapt", 2 in "2 decimals"): a string of 4 characters or more, a number of 4 digits or more.
@@ -617,7 +695,7 @@ describe.each(SLUGS)("seed %s", (slug) => {
         brief.instructions.split("-----BEGIN DATA-----")[0] ?? "",
       ].join("\n");
       const text = prose.toLowerCase();
-      // "8,000.50" is the number 8000.5: thousands commas go, and every other number is read whole.
+      // "1,234.50" is the number 1234.5: thousands commas go, and every other number is read whole.
       const shown = new Set(
         (prose.replace(/(\d),(?=\d{3}\b)/g, "$1").match(/\d+(?:\.\d+)?/g) ?? []).map(Number),
       );
@@ -633,8 +711,8 @@ describe.each(SLUGS)("seed %s", (slug) => {
     }
   });
 
-  test("held_out_strings_keep_the_briefs_letter_case", () => {
-    const { brief, criteria, heldout } = load(slug);
+  test("held_out_strings_keep_the_briefs_letter_case", ({ skip }) => {
+    const { brief, criteria, heldout } = loadPrivate(slug, skip);
 
     // An agent echoes the brief's wording. If the brief prints "ACME LTD" and the key expects
     // "Acme Ltd", a correct copy is marked wrong, and nothing in the brief says how to avoid it.
@@ -669,13 +747,9 @@ describe.each(SLUGS)("seed %s", (slug) => {
     const schemas = {
       "brief.json": BriefSchema,
       "criteria.json": PublicCriteriaSchema,
-      "heldout.json": HeldoutSchema,
     } as const;
 
-    const names = (["task.json", "brief.json", "criteria.json", "heldout.json"] as const).filter(
-      (name) => existsSync(seedPath(slug, name)),
-    );
-    for (const name of names) {
+    for (const name of ["task.json", "brief.json", "criteria.json"] as const) {
       const document = readJson(slug, name);
       const canonical = utf8(canonicalJson(document));
       expect(JSON.parse(canonical), name).toEqual(document);
@@ -685,46 +759,74 @@ describe.each(SLUGS)("seed %s", (slug) => {
       }
     }
   });
+
+  test("the_held_out_document_round_trips_as_canonical_json", ({ skip }) => {
+    // The same for the checks, which are uploaded as canonical bytes and committed to by their
+    // hash. The file is the private directory's, and a seed without checks has none to read.
+    const { heldout } = loadPrivate(slug, skip);
+    if (heldout === null) return;
+    const document: unknown = JSON.parse(readFileSync(heldoutPath(slug), "utf8"));
+    const canonical = utf8(canonicalJson(document));
+    expect(JSON.parse(canonical), "heldout.json").toEqual(document);
+    expect(utf8(canonicalJson(HeldoutSchema.parse(JSON.parse(canonical)))), "after a parse").toBe(
+      canonical,
+    );
+  });
 });
 
-test("product_table_extract_fixes_the_product_count", async () => {
+test("product_table_extract_fixes_the_product_count", async ({ skip }) => {
   // The key asserts products[0] to products[8] and excluded_skus, and an assertion cannot see an
   // extra products[9], so a solver that keeps the discontinued item and puts it last would match
   // every one of them. The public schema fixes the count to close that.
-  await expectItemCountFixed("product-table-extract", "products", {
-    sku: "RM-1080",
-    name: 'Laptop sleeve 15"',
-    price_kobo: 1599900,
-    stock: 0,
-  });
+  await expectItemCountFixed(
+    "product-table-extract",
+    "products",
+    {
+      sku: "RM-1080",
+      name: 'Laptop sleeve 15"',
+      price_kobo: 1599900,
+      stock: 0,
+    },
+    skip,
+  );
 });
 
-test("invoice_extract_fixes_the_line_item_count", async () => {
+test("invoice_extract_fixes_the_line_item_count", async ({ skip }) => {
   // The key asserts line_items[0] to line_items[3], so a solver that lists the VAT row under the
   // table as a line of its own would match every one of them. The public schema fixes the count.
-  await expectItemCountFixed("invoice-extract", "line_items", {
-    description: "VAT (7.5%)",
-    quantity: 1,
-    unit_price: 102.17,
-    amount: 102.17,
-  });
+  await expectItemCountFixed(
+    "invoice-extract",
+    "line_items",
+    {
+      description: "VAT (7.5%)",
+      quantity: 1,
+      unit_price: 102.17,
+      amount: 102.17,
+    },
+    skip,
+  );
 });
 
-test("meeting_actions_extract_fixes_the_action_count", async () => {
+test("meeting_actions_extract_fixes_the_action_count", async ({ skip }) => {
   // The key asserts action_count 8 and actions[0] to actions[7], so a solver that lists the item the
   // notes only float (Ada, "may look at the logging costs") yet counts the eight real ones would
   // match every one of them. The public schema fixes the count of actions.
-  await expectItemCountFixed("meeting-actions-extract", "actions", {
-    owner: "Ada",
-    task: "look at the logging costs",
-    due: null,
-  });
+  await expectItemCountFixed(
+    "meeting-actions-extract",
+    "actions",
+    {
+      owner: "Ada",
+      task: "look at the logging costs",
+      due: null,
+    },
+    skip,
+  );
 });
 
-test("meeting_actions_extract_refuses_a_blank_task", async () => {
+test("meeting_actions_extract_refuses_a_blank_task", async ({ skip }) => {
   // The brief says the task is "not checked word for word", so no assertion reads it, and the
   // schema is all that stands between an action with an empty task and the reward.
-  const { criteria, heldout, solution } = load("meeting-actions-extract");
+  const { criteria, heldout, solution } = loadPrivate("meeting-actions-extract", skip);
   const answer: unknown = JSON.parse(utf8(solution));
 
   for (const blank of ["", " ", "\t\n", "\u00a0"]) {
@@ -742,10 +844,10 @@ test("meeting_actions_extract_refuses_a_blank_task", async () => {
   }
 });
 
-test("invoice_extract_brief_says_descriptions_are_copied_as_written", () => {
+test("invoice_extract_brief_says_descriptions_are_copied_as_written", ({ skip }) => {
   // The key compares a description letter for letter, "(per day)" included, so the brief has to say
   // that it is copied as written. Otherwise a solver that shortens it loses the reward unfairly.
-  const { brief, heldout } = load("invoice-extract");
+  const { brief, heldout } = loadPrivate("invoice-extract", skip);
   if (heldout === null || !("json_schema" in heldout)) {
     throw new Error("invoice-extract is not a json_schema seed");
   }
@@ -768,11 +870,11 @@ test("invoice_extract_brief_says_descriptions_are_copied_as_written", () => {
 });
 
 describe.each(JSON_SCHEMA_SLUGS)("json_schema seed %s", (slug) => {
-  test("every_value_of_the_solution_is_checked_by_the_key", () => {
+  test("every_value_of_the_solution_is_checked_by_the_key", ({ skip }) => {
     // A value that the key does not look at can be wrong and still be paid in full, and a judge
     // reading the scorecard sees a wrong answer rewarded. So each value of the solution, changed to
     // another that the schema accepts, has to cost the reward, unless UNCHECKED_VALUES says why not.
-    const { criteria, heldout, solution } = load(slug);
+    const { criteria, heldout, solution } = loadPrivate(slug, skip);
     if (criteria.kind !== "json_schema" || heldout === null || !("json_schema" in heldout)) {
       throw new Error(`${slug} is not a json_schema seed`);
     }
@@ -810,178 +912,50 @@ describe.each(JSON_SCHEMA_SLUGS)("json_schema seed %s", (slug) => {
  * 50) or into some other wrong regex is not paid either, and then it tests nothing.
  */
 const NEAR_MISS_SCORE = 90;
-const KNOWN_WRONG_REGEXES: Record<
-  string,
-  { why: string; pattern: string; flags?: string; near?: number }[]
-> = {
-  "iso-date-regex": [
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-  ],
-  "semver-regex": [
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-  ],
-  "near-account-regex": [
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-  ],
-  "ipv4-regex": [
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern:
-        "[redacted]",
-    },
-  ],
-  "hex-color-regex": [
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      // [redacted]
-      // [redacted]
-      why: "[redacted]",
-      pattern: "[redacted]",
-      near: 80,
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-      near: 85,
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-  ],
-  "duration-regex": [
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      pattern: "[redacted]",
-      flags: "[redacted]",
-    },
-  ],
-};
+type KnownWrongRegex = { why: string; pattern: string; flags?: string; near?: number };
+type KnownWrongTest = { why: string; source: string };
 
-describe.each(Object.keys(KNOWN_WRONG_REGEXES))("regex seed %s", (slug) => {
-  test("known_wrong_regexes_are_not_paid", async () => {
-    const { criteria, heldout } = load(slug);
+const knownWrongPath = (slug: string) => knownWrongFileOf(PRIVATE_DIR, slug);
+
+/**
+ * The known-wrong answers of a seed from the private directory, checked for shape; null where it
+ * has none. Each is the seed's solution with one rule broken (the tests below need it to be a near
+ * miss), so a copy of them here would be a copy of the answer one edit away: they are in
+ * `<private dir>/<slug>/known-wrong.json`, beside the solution (see README.md).
+ */
+function knownWrongOf<T extends KnownWrongRegex | KnownWrongTest>(
+  slug: string,
+  field: "pattern" | "source",
+): T[] | null {
+  if (!existsSync(knownWrongPath(slug))) return null;
+  const document: unknown = JSON.parse(readFileSync(knownWrongPath(slug), "utf8"));
+  const bad = (what: string) => new Error(`${knownWrongPath(slug)}: ${what}`);
+  if (!Array.isArray(document) || document.length === 0) throw bad("not a list of answers");
+  for (const one of document as Record<string, unknown>[]) {
+    if (typeof one?.why !== "string" || typeof one[field] !== "string") {
+      throw bad(`an answer has no \`why\` or no \`${field}\``);
+    }
+    if (field === "pattern") {
+      if (one.flags !== undefined && typeof one.flags !== "string")
+        throw bad(`"${one.why}": bad flags`);
+      if (one.near !== undefined && typeof one.near !== "number")
+        throw bad(`"${one.why}": bad near`);
+    }
+  }
+  return document as T[];
+}
+
+const REGEX_SLUGS = SLUGS.filter((slug) => load(slug).criteria.kind === "regex_cases");
+
+describe.each(REGEX_SLUGS)("regex seed %s", (slug) => {
+  test("known_wrong_regexes_are_not_paid", async ({ skip }) => {
+    const { criteria, heldout } = loadPrivate(slug, skip);
+    const wrong = knownWrongOf<KnownWrongRegex>(slug, "pattern");
+    if (wrong === null) return skip(PRIVATE_NOTE);
 
     const paid: string[] = [];
     const broken: string[] = [];
-    for (const { why, pattern, flags = "", near = NEAR_MISS_SCORE } of KNOWN_WRONG_REGEXES[slug] ??
-      []) {
+    for (const { why, pattern, flags = "", near = NEAR_MISS_SCORE } of wrong) {
       const answer = new TextEncoder().encode(JSON.stringify({ pattern, flags }));
       const result = await scoreAnswer(criteria, heldout, answer);
       if (result.passed) paid.push(why);
@@ -992,134 +966,17 @@ describe.each(Object.keys(KNOWN_WRONG_REGEXES))("regex seed %s", (slug) => {
   });
 });
 
-/**
- * Functions a careless solver would write for the tests seeds, each breaking one rule of its brief.
- * A rule that no held-out case tests pays every function that breaks it, so none of these may
- * reach the pass mark. They must also run: one that throws on every case tests nothing, so each
- * has to pass at least one case.
- */
-const KNOWN_WRONG_TESTS: Record<string, { why: string; source: string }[]> = {
-  "slugify-title": [
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-  ],
-  "near-to-yocto": [
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-  ],
-  "latest-per-id": [
-    {
-      why: "[redacted]",
-      source:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      source:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      source:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      source:
-        "[redacted]",
-    },
-    {
-      why: "[redacted]",
-      source:
-        "[redacted]",
-    },
-  ],
-  "wrap-text": [
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-    {
-      why: "[redacted]",
-      source:
-        '[redacted]',
-    },
-  ],
-};
-
 const TESTS_SLUGS = SLUGS.filter((slug) => load(slug).criteria.kind === "tests");
 
 describe.each(TESTS_SLUGS)("tests seed %s", (slug) => {
-  test("known_wrong_functions_are_not_paid", async () => {
-    const { criteria, heldout } = load(slug);
-    const wrong = KNOWN_WRONG_TESTS[slug] ?? [];
+  // Functions a careless solver would write for the tests seeds, each breaking one rule of its
+  // brief (the private known-wrong.json). A rule that no held-out case tests pays every function
+  // that breaks it, so none of these may reach the pass mark. They must also run: one that throws
+  // on every case tests nothing, so each has to pass at least one case.
+  test("known_wrong_functions_are_not_paid", async ({ skip }) => {
+    const { criteria, heldout } = loadPrivate(slug, skip);
+    const wrong = knownWrongOf<KnownWrongTest>(slug, "source");
+    if (wrong === null) return skip(PRIVATE_NOTE);
     expect(wrong.length, "known-wrong functions written for this seed").toBeGreaterThanOrEqual(4);
 
     const paid: string[] = [];
@@ -1133,10 +990,10 @@ describe.each(TESTS_SLUGS)("tests seed %s", (slug) => {
     expect(broken, "known-wrong functions that fail every case, so they test nothing").toEqual([]);
   });
 
-  test("the_solution_runs_well_inside_the_judges_limits", async () => {
+  test("the_solution_runs_well_inside_the_judges_limits", async ({ skip }) => {
     // The Judge gives a case 1 s and 32 MiB, and an entry up to 65_536 bytes of source. A seed's
     // own solution should not need a tenth of them, or a slow machine would fail an honest entry.
-    const { criteria, heldout, solution } = load(slug);
+    const { criteria, heldout, solution } = loadPrivate(slug, skip);
     if (heldout === null || !("tests" in heldout)) throw new Error(`${slug} has no held-out cases`);
     expect(solution.byteLength, "solution bytes").toBeLessThan(6_554);
     expect(heldout.tests.cases.length, "held-out cases").toBeGreaterThanOrEqual(10);
@@ -1170,252 +1027,38 @@ const HEAVY_WEIGHT = 8;
  * entry loses, which the stand-in must score 5 or less. No such entry may reach the pass mark. A
  * pass mark that the solution alone clears is not enough: an entry that gets the central point of
  * the task wrong, or leaves it out, must fail it too.
+ *
+ * The edits quote the solution, which is private, so they are private too: an array of these in
+ * `<private dir>/<slug>/scenarios.json` (see README.md). A copy of them here would be a copy of the
+ * answer, a piece at a time.
  */
 type Scenario = { why: string; drops: number[]; edits: [find: string, replace: string][] };
-const CORE_SCENARIOS: Record<string, Scenario[]> = {
-  "release-notes-plain": [
-    {
-      why: "[redacted]",
-      drops: [0],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [1],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [2],
-      edits: [
-        [
-          "[redacted]",
-          "",
-        ],
-      ],
-    },
-  ],
-  "plain-terms-rewrite": [
-    {
-      why: "[redacted]",
-      drops: [0],
-      edits: [["[redacted]", ""]],
-    },
-    {
-      why: "[redacted]",
-      drops: [1],
-      edits: [
-        [
-          "[redacted]",
-          "",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [2],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [3],
-      edits: [
-        [
-          "[redacted]",
-          "",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [4],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [5],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-  ],
-  "source-conflict-brief": [
-    {
-      why: "[redacted]",
-      drops: [0],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [1],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-        ["[redacted]", "[redacted]"],
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [2],
-      edits: [
-        [
-          "[redacted]",
-          "",
-        ],
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [3],
-      edits: [
-        [
-          "[redacted]",
-          "",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [3],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [5],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-  ],
-  "incident-summary-plain": [
-    {
-      why: "[redacted]",
-      drops: [0],
-      edits: [
-        [
-          "[redacted]",
-          "",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [1],
-      edits: [["[redacted]", ""]],
-    },
-    {
-      why: "[redacted]",
-      drops: [2],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [3],
-      edits: [
-        ["[redacted]", ""],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [4],
-      edits: [
-        [
-          "[redacted]",
-          "",
-        ],
-      ],
-    },
-  ],
-  "vendor-pick-memo": [
-    {
-      why: "[redacted]",
-      drops: [0],
-      edits: [
-        ["[redacted]", "[redacted]"],
-        ["[redacted]", "[redacted]"],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [1],
-      edits: [
-        [
-          "[redacted]",
-          "",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [6],
-      edits: [
-        [
-          "[redacted]",
-          "[redacted]",
-        ],
-      ],
-    },
-    {
-      why: "[redacted]",
-      drops: [2, 3],
-      edits: [
-        ["[redacted]", ""],
-        ["[redacted]", ""],
-      ],
-    },
-  ],
-};
+
+const scenariosPath = (slug: string) => scenariosFileOf(PRIVATE_DIR, slug);
+
+/** The scenarios of a rubric seed from the private directory, checked for shape; null where it has none. */
+function scenariosOf(slug: string): Scenario[] | null {
+  if (!existsSync(scenariosPath(slug))) return null;
+  const document: unknown = JSON.parse(readFileSync(scenariosPath(slug), "utf8"));
+  const bad = (what: string) => new Error(`${scenariosPath(slug)}: ${what}`);
+  if (!Array.isArray(document)) throw bad("not an array of scenarios");
+  for (const one of document as Partial<Scenario>[]) {
+    if (typeof one?.why !== "string") throw bad("a scenario has no `why`");
+    if (!Array.isArray(one.drops) || !one.drops.every(Number.isInteger)) {
+      throw bad(`"${one.why}": \`drops\` is not a list of criteria`);
+    }
+    const pairs = Array.isArray(one.edits) ? one.edits : [];
+    if (
+      pairs.length === 0 ||
+      !pairs.every(
+        (p) => Array.isArray(p) && p.length === 2 && p.every((q) => typeof q === "string"),
+      )
+    ) {
+      throw bad(`"${one.why}": \`edits\` is not a list of [find, replace] pairs`);
+    }
+  }
+  return document as Scenario[];
+}
 
 /** `solution` with each edit made once; a piece that is not there exactly once is a mistake. */
 function withEdits(solution: string, edits: Scenario["edits"]): string {
@@ -1436,8 +1079,8 @@ function dataBlockOf(brief: Brief): string {
 }
 
 describe.each(RUBRIC_SLUGS)("rubric seed %s", (slug) => {
-  test("every_criterion_has_stand_in_checks_and_the_solution_meets_all_of_them", () => {
-    const { criteria, solution } = load(slug);
+  test("every_criterion_has_stand_in_checks_and_the_solution_meets_all_of_them", ({ skip }) => {
+    const { criteria, solution } = loadPrivate(slug, skip);
     if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
     expect(STAND_IN[slug]?.length, "criteria with stand-in checks").toBe(criteria.rubric.length);
     const scores = criteria.rubric.map((_, i) => standInScore(slug, i, utf8(solution)));
@@ -1446,10 +1089,12 @@ describe.each(RUBRIC_SLUGS)("rubric seed %s", (slug) => {
     );
   });
 
-  test("the_weak_answer_misses_several_criteria_and_a_nonsense_answer_misses_the_pass_mark", async () => {
-    const { brief, criteria, solution } = load(slug);
+  test("the_weak_answer_misses_several_criteria_and_a_nonsense_answer_misses_the_pass_mark", async ({
+    skip,
+  }) => {
+    const { brief, criteria, solution, weak: weakAnswer } = loadPrivate(slug, skip);
     if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
-    const weak = utf8(readBytes(slug, "weak.txt"));
+    const weak = utf8(weakAnswer);
     const missed = criteria.rubric.filter(
       (_, i) => standInScore(slug, i, weak) < standInScore(slug, i, utf8(solution)),
     );
@@ -1462,12 +1107,13 @@ describe.each(RUBRIC_SLUGS)("rubric seed %s", (slug) => {
     expect(nonsense.passed, "a one-word answer passes").toBe(false);
   });
 
-  test("an_entry_that_loses_one_core_element_misses_the_pass_mark", async () => {
+  test("an_entry_that_loses_one_core_element_misses_the_pass_mark", async ({ skip }) => {
     // The pass mark must stop an entry that leaves out, or gets wrong, the point of the task, and
     // not only the weak answer. Each case is the solution with one such change.
-    const { brief, criteria, solution } = load(slug);
+    const { brief, criteria, solution } = loadPrivate(slug, skip);
     if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
-    const scenarios = CORE_SCENARIOS[slug] ?? [];
+    const scenarios = scenariosOf(slug);
+    if (scenarios === null) return skip(PRIVATE_NOTE);
     expect(scenarios.length, "core scenarios written for this seed").toBeGreaterThanOrEqual(3);
 
     const text = utf8(solution);
@@ -1491,21 +1137,33 @@ describe.each(RUBRIC_SLUGS)("rubric seed %s", (slug) => {
     expect(notLost, "scenarios that do not lose the criterion they name").toEqual([]);
   });
 
+  test("every_heavy_criterion_is_lost_by_a_scenario", ({ skip }) => {
+    // The scenarios are private (they quote the solution), so this runs where the private
+    // directory has them.
+    const { criteria } = load(slug);
+    if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
+    const heavy = criteria.rubric.flatMap(({ weight }, index) =>
+      weight >= HEAVY_WEIGHT ? [index] : [],
+    );
+    const scenarios = scenariosOf(slug);
+    if (scenarios === null) return skip(PRIVATE_NOTE);
+    const named = new Set(scenarios.flatMap(({ drops }) => drops));
+    expect(
+      heavy.filter((index) => !named.has(index)),
+      "heavy criteria that no scenario loses",
+    ).toEqual([]);
+  });
+
   test("losing_any_one_heavy_criterion_alone_misses_the_pass_mark", async () => {
     // The weights and the pass mark by themselves: an entry that does perfectly on every
     // criterion but one, which it loses altogether, is under the pass mark when that criterion is
-    // 8 or more of the weight. Every such criterion also has a scenario above.
+    // 8 or more of the weight. Every such criterion also has a scenario (next test).
     const { brief, criteria } = load(slug);
     if (criteria.kind !== "rubric") throw new Error(`${slug} is not a rubric seed`);
     const heavy = criteria.rubric.flatMap(({ weight }, index) =>
       weight >= HEAVY_WEIGHT ? [index] : [],
     );
     expect(heavy.length, "heavy criteria").toBeGreaterThanOrEqual(2);
-    const named = new Set((CORE_SCENARIOS[slug] ?? []).flatMap(({ drops }) => drops));
-    expect(
-      heavy.filter((index) => !named.has(index)),
-      "heavy criteria that no scenario loses",
-    ).toEqual([]);
 
     const paid: string[] = [];
     for (const index of heavy) {

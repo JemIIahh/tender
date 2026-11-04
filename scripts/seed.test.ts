@@ -19,18 +19,23 @@ import {
 } from "@tender/shared";
 import { KeyPair } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
+import { writeSyntheticHeldouts } from "../seeds/synthetic-heldout";
+import { missingHeldouts, PRIVATE_DIR_VARIABLE, privateDirOf } from "./lib/private-dir";
 import { loadTarget, main, type SeedChain, type SeedOptions, seed } from "./seed";
 
 // Everything here runs without a chain, an API or the network. The API and the chain are fakes the
 // test steers; the seeds are real files in a temporary directory (or, in one test, the repository's
-// own), because what the script reads is files. The command line is tested with a stand-in for
-// `seed`, as deploy's and the key script's are.
+// own), because what the script reads is files. A seed's held-out checks are kept apart from its
+// public files, as in the repository (they are secret until the task is judged): each directory of
+// seeds a test makes has a private directory of its own beside it. The command line is tested with
+// a stand-in for `seed`, as deploy's and the key script's are.
 
 const dirs: string[] = [];
 
 afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -106,28 +111,42 @@ interface SeedSpec {
   task?: FileSpec;
   brief?: FileSpec;
   criteria?: FileSpec;
-  /** Null: the folder has no `heldout.json`. */
+  /** Null: the private directory has no `heldout.json` for the seed. */
   heldout?: FileSpec;
 }
 
 const taskWith = (overrides: object) => ({ ...TASK, ...overrides });
 
-/** A directory of seeds, written pretty printed, so the file's bytes are not the canonical bytes. */
+/** The private directory of each directory of seeds `seedsDir` made: where its held-out checks are. */
+const PRIVATE_OF = new Map<string, string>();
+
+/**
+ * A directory of seeds, written pretty printed, so the file's bytes are not the canonical bytes.
+ * The held-out checks go to a private directory of their own (`PRIVATE_OF`), never into the
+ * seed's folder, which is the public half.
+ */
 async function seedsDir(spec: Record<string, SeedSpec>): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "tender-seeds-"));
-  dirs.push(dir);
+  const privateDir = await mkdtemp(join(tmpdir(), "tender-heldout-"));
+  dirs.push(dir, privateDir);
+  PRIVATE_OF.set(dir, privateDir);
   for (const [slug, files] of Object.entries(spec)) {
     await mkdir(join(dir, slug));
     const documents: Record<string, FileSpec> = {
       "task.json": files.task === undefined ? TASK : files.task,
       "brief.json": files.brief === undefined ? briefOf(slug) : files.brief,
       "criteria.json": files.criteria === undefined ? CRITERIA : files.criteria,
-      "heldout.json": files.heldout === undefined ? heldoutOf(slug) : files.heldout,
     };
     for (const [name, document] of Object.entries(documents)) {
       if (document === null) continue;
       const text = typeof document === "string" ? document : JSON.stringify(document, null, 2);
       await writeFile(join(dir, slug, name), text);
+    }
+    const checks = files.heldout === undefined ? heldoutOf(slug) : files.heldout;
+    if (checks !== null) {
+      await mkdir(join(privateDir, slug));
+      const text = typeof checks === "string" ? checks : JSON.stringify(checks, null, 2);
+      await writeFile(join(privateDir, slug, "heldout.json"), text);
     }
   }
   return dir;
@@ -517,6 +536,7 @@ async function play(world: World, dir: string | undefined, options: PlayOptions 
     judgeAccount: JUDGE,
     tokenId: TOKEN,
     seedsDir: dir,
+    heldoutDir: dir === undefined ? undefined : PRIVATE_OF.get(dir),
     log: (line) => world.lines.push(line),
     ...options,
   }).then(
@@ -620,6 +640,84 @@ test("a_seed_without_a_heldout_part_is_posted_with_no_commitment_and_nothing_sto
   expect(api.uploadHeldout).not.toHaveBeenCalled();
   // There is nothing to find out about: no commitment, so no question for the API.
   expect(api.getBlob).not.toHaveBeenCalled();
+});
+
+// ---- Where the held-out checks are --------------------------------------------------------------
+
+test("the_heldout_is_read_from_the_private_directory_and_never_from_the_seeds_own_folder", async () => {
+  // A seed's folder is the public half of the seed. A heldout.json in it is not the seed's checks,
+  // and the run does not read it: it would be committed with the rest, and the checks would be out.
+  const dir = await seedsDir({ alpha: { heldout: null } });
+  await writeFile(join(dir, "alpha", "heldout.json"), JSON.stringify(heldoutOf("alpha")));
+
+  const { failure, trace, lines } = await run(dir);
+
+  expect((failure as Error).message).toBe(
+    `held-out for alpha not found in ${PRIVATE_OF.get(dir)}; set TENDER_SEEDS_PRIVATE_DIR`,
+  );
+  expect(trace).toEqual(UNTOUCHED);
+  expect(lines).toEqual([]);
+});
+
+test("a_seed_whose_heldout_is_not_found_stops_the_run_before_any_seed_is_posted", async () => {
+  // alpha is fine and comes first: it must not be posted while beta is found out, and no task is
+  // ever posted without its checks.
+  const dir = await seedsDir({ alpha: {}, beta: { heldout: null } });
+
+  const { failure, trace, lines, chain } = await run(dir);
+
+  expect((failure as Error).message).toBe(
+    `held-out for beta not found in ${PRIVATE_OF.get(dir)}; set TENDER_SEEDS_PRIVATE_DIR`,
+  );
+  expect(trace).toEqual(UNTOUCHED);
+  expect(lines).toEqual([]);
+  expect(chain.posts).toEqual([]);
+});
+
+test("a_private_directory_that_is_not_there_gives_the_same_error", async () => {
+  const dir = await seedsDir({ alpha: {} });
+  const missing = join(tmpdir(), "tender-heldout-that-does-not-exist");
+
+  const { failure, trace } = await run(dir, { heldoutDir: missing });
+
+  expect((failure as Error).message).toBe(
+    `held-out for alpha not found in ${missing}; set TENDER_SEEDS_PRIVATE_DIR`,
+  );
+  expect(trace).toEqual(UNTOUCHED);
+});
+
+test("a_private_directory_that_is_a_file_gives_the_same_error", async () => {
+  const dir = await seedsDir({ alpha: {} });
+  const file = join(await dirWith({ "not-a-directory": "x" }), "not-a-directory");
+
+  const { failure, trace } = await run(dir, { heldoutDir: file });
+
+  expect((failure as Error).message).toBe(
+    `held-out for alpha not found in ${file}; set TENDER_SEEDS_PRIVATE_DIR`,
+  );
+  expect(trace).toEqual(UNTOUCHED);
+});
+
+test("without_a_heldoutDir_the_private_directory_is_the_one_the_variable_names", async () => {
+  const dir = await seedsDir({ alpha: {} });
+  vi.stubEnv(PRIVATE_DIR_VARIABLE, PRIVATE_OF.get(dir));
+
+  const { result, api } = await run(dir, { heldoutDir: undefined });
+
+  expect(result).toEqual([seeded("alpha", 1n)]);
+  expect(api.heldouts[0]?.bytes).toEqual(canonicalJson(heldoutOf("alpha")));
+});
+
+test("with_nothing_set_the_private_directory_is_seeds_private_of_the_repository", async () => {
+  vi.stubEnv(PRIVATE_DIR_VARIABLE, "");
+  const dir = await seedsDir({ alpha: {} });
+
+  const { failure } = await run(dir, { heldoutDir: undefined });
+
+  // The seed is made up, so the repository's own seeds-private/ has nothing for it.
+  expect((failure as Error).message).toBe(
+    `held-out for alpha not found in ${join(import.meta.dirname, "..", "seeds-private")}; set TENDER_SEEDS_PRIVATE_DIR`,
+  );
 });
 
 test("seeds_go_in_slug_order_whatever_order_the_folder_lists_them_in", async () => {
@@ -938,6 +1036,7 @@ test("an_api_that_fails_to_say_whether_the_heldout_is_public_stops_the_run", asy
       judgeAccount: JUDGE,
       tokenId: TOKEN,
       seedsDir: dir,
+      heldoutDir: PRIVATE_OF.get(dir),
       log: () => {},
     }),
   ).rejects.toBe(outage);
@@ -1590,12 +1689,12 @@ test("a_seed_that_is_wrong_stops_the_run_before_the_api_or_the_chain_is_asked_an
     [
       "checks that are missing",
       { heldout: null },
-      /^beta\/criteria\.json has a held-out part, and beta\/heldout\.json does not exist$/,
+      /^held-out for beta not found in .+; set TENDER_SEEDS_PRIVATE_DIR$/,
     ],
     [
       "checks the criteria do not have",
       { criteria: RUBRIC },
-      /^beta\/heldout\.json exists, and beta\/criteria\.json has no held-out part$/,
+      /^beta\/heldout\.json exists in .+, and beta\/criteria\.json has no held-out part$/,
     ],
     [
       "checks of another kind",
@@ -1647,6 +1746,7 @@ test("no_secret_reaches_a_log_line_or_an_error_of_a_run_that_succeeds_or_fails",
       judgeAccount: JUDGE,
       tokenId: TOKEN,
       seedsDir: dir,
+      heldoutDir: PRIVATE_OF.get(dir),
       log: (line) => lines.push(line),
     }).then(
       () => "",
@@ -1683,11 +1783,21 @@ test("the_thirty_seeds_of_the_repository_are_posted_in_slug_order_with_the_hashe
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
+  // The held-out checks are the real ones when this machine has them (the private directory), and
+  // stand-ins of the right kind where it does not, so that the counts and the hashes are checked
+  // everywhere. Either way a task's commitment has to be the hash of the file it was posted from.
+  const real = privateDirOf();
+  let held = real;
+  if (missingHeldouts(root, real, slugs).length > 0) {
+    held = await mkdtemp(join(tmpdir(), "tender-heldout-stand-in-"));
+    dirs.push(held);
+    writeSyntheticHeldouts(root, held);
+  }
   const fileOf = (slug: string, name: string): object =>
-    JSON.parse(readFileSync(join(root, slug, name), "utf8"));
+    JSON.parse(readFileSync(join(name === "heldout.json" ? held : root, slug, name), "utf8"));
 
   // No `seedsDir`: the script finds the repository's own.
-  const { result, chain, api, lines, failure } = await run(null);
+  const { result, chain, api, lines, failure } = await run(null, { heldoutDir: held });
 
   expect(failure).toBeUndefined();
   expect(slugs).toHaveLength(30);
@@ -1701,7 +1811,7 @@ test("the_thirty_seeds_of_the_repository_are_posted_in_slug_order_with_the_hashe
     slugs.map((slug) => hashOf(fileOf(slug, "criteria.json"))),
   );
   // A rubric seed has no held-out checks, so its task carries no commitment.
-  const withChecks = slugs.filter((slug) => existsSync(join(root, slug, "heldout.json")));
+  const withChecks = slugs.filter((slug) => existsSync(join(held, slug, "heldout.json")));
   expect(withChecks).toHaveLength(25);
   expect(chain.posts.map((post) => post.heldoutCommitment)).toEqual(
     slugs.map((slug) =>
@@ -1808,6 +1918,27 @@ test("cli_seeds_testnet_as_the_poster_with_the_judge_and_the_api_of_the_env_file
   });
   expect(options?.api).toBeInstanceOf(ApiClient);
   expect(fetched).toEqual([`${API_URL}/v1/blobs/${sha256}`]);
+});
+
+test("cli_gives_seed_the_private_directory_of_the_env_file_unless_the_process_names_one", async () => {
+  const privateDirOfRun = async (files: Record<string, string>) => {
+    const { seed: fake, code } = await runCli(files, ["--network", "testnet"]);
+    expect(code).toBe(0);
+    return fake.mock.calls[0]?.[0].heldoutDir;
+  };
+
+  // Nothing set anywhere: seeds-private/ of the repository.
+  vi.stubEnv(PRIVATE_DIR_VARIABLE, "");
+  expect(await privateDirOfRun(deployed())).toBe(join(import.meta.dirname, "..", "seeds-private"));
+  // The env file names it.
+  expect(await privateDirOfRun(deployed(`${PRIVATE_DIR_VARIABLE}=/vault/heldout`))).toBe(
+    "/vault/heldout",
+  );
+  // The process comes first, so that a shell can point one run elsewhere.
+  vi.stubEnv(PRIVATE_DIR_VARIABLE, "/elsewhere/heldout");
+  expect(await privateDirOfRun(deployed(`${PRIVATE_DIR_VARIABLE}=/vault/heldout`))).toBe(
+    "/elsewhere/heldout",
+  );
 });
 
 test("cli_takes_the_seeds_from_only_whether_it_is_given_once_or_often", async () => {

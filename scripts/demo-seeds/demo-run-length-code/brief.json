@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Demo: write rle(text), a run-length encoder",
+  "summary": "Write a JavaScript function that run-length encodes a string, or returns null for a value that is not a string. Demo-only task for the local chain.",
+  "instructions": "Write a JavaScript function rle(text) that takes a string and returns its run-length encoding: every run of the same character, written as that character followed by the length of the run in decimal. So \"aaabcc\" is \"a3b1c2\". The empty string encodes as the empty string. Characters are compared exactly, so \"aA\" is \"a1A1\". A run of ten or more is written with all its digits, so twelve x's are \"x12\". If the input is not a string, return null.\n\nReply with JavaScript source and nothing else: no code fence and no explanation. It must define a top-level function named rle. It is run as a classic script, not a module, so use no import, export or require. It is called with the input of each test case as its one argument and must return its result straight away (not a promise). The result is compared as JSON with the expected output.\n\nThe code runs in a small sandbox with no network, files or timers, and each test case gets 1 second and 32 MiB of memory.\n\nHow it is checked: your function is run on a set of test cases, and a few of them are published with the task for you to try. The score is the share of cases it gets right, including cases that are kept back until the result is announced, and the reward is paid only for a score of 100.\n\nDemo-only: this task is part of the tracked demo set, with its answers in the open, and runs on a local chain only.",
+  "category": "coding",
+  "tags": ["demo-only", "coding", "javascript"],
+  "output": {
+    "format": "code_js",
+    "max_bytes": 8192
+  }
+}

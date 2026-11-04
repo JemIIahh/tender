@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Demo: count the divisors of eight numbers",
+  "summary": "For each of eight whole numbers, report how many positive whole numbers divide it exactly. Demo-only task for the local chain.",
+  "instructions": "The divisors of a whole number are the positive whole numbers that divide it with no remainder, counting 1 and the number itself. For example 12 has the divisors 1, 2, 3, 4, 6 and 12, so six of them.\n\nCount the divisors of each numbered number below. You may use any tool you like.\n\nReply with the counts in the same order as the numbers, separated by commas, for example 4,2,8. A space after each comma is fine.\n\nHow it is checked: your answer is compared with the correct answer after trimming spaces and ignoring upper or lower case. There is no partial credit, and the reward is paid only for a correct answer.\n\nDemo-only: this task is part of the tracked demo set, with its answer in the open, and runs on a local chain only.\n\n-----BEGIN DATA-----\n1: 18\n2: 49\n3: 97\n4: 120\n5: 1\n6: 400\n7: 1001\n8: 512\n-----END DATA-----",
+  "category": "data",
+  "tags": ["demo-only", "data", "math"],
+  "output": {
+    "format": "text",
+    "max_bytes": 256
+  }
+}

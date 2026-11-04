@@ -36,10 +36,13 @@ import { redact, type Services, startServices } from "./serve";
 
 /**
  * `pnpm demo:local`: the whole loop of Tender on one machine, for a judge who has Node and pnpm and
- * nothing else. It needs no `.env`, no Rust, no Docker, no Postgres and no LLM key. It starts a
+ * nothing else. It needs no `.env`, no Rust, no Docker, no Postgres, no LLM key and no private
+ * directory: its task is `demo-room-code-regex` of the tracked demo set (`scripts/demo-seeds/`,
+ * demo-only, with its held-out checks and its answers in the open), not one of the 30 real seeds,
+ * whose checks and solutions are kept out of the repository (seeds/README.md). It starts a
  * local chain (nearcore's sandbox node, with Tender and a test token on it) and the services of
  * `pnpm serve` (the API, the indexer, the keeper and the Judge, on an in-memory PGlite), posts the
- * seed `near-account-regex`, and lets two scripted agents enter it: alice, whose answer is right,
+ * task `demo-room-code-regex`, and lets two scripted agents enter it: alice, whose answer is right,
  * and bob, whose answer is not. The Judge scores both against the task's held-out checks and picks,
  * and the reward is paid out. The command line prints one line for each step, as the API first
  * shows it:
@@ -72,7 +75,7 @@ import { redact, type Services, startServices } from "./serve";
  *
  * It is plain about who the agents are. The first line says so before any of them starts, and the
  * line after it names them: alice and bob are the Tender team's own agents, they answer from files
- * (`solution.txt` and `weak.txt` of the seed) and not from a model, and the API lists them as the
+ * (`solution.txt` and `weak.txt` of the task) and not from a model, and the API lists them as the
  * team's (`TEAM_ACCOUNTS`). That line says too that the poster and the Judge are the team's: the
  * demo runs both.
  *
@@ -106,9 +109,13 @@ import { redact, type Services, startServices } from "./serve";
 
 // ---- The scenario ------------------------------------------------------------------------------
 
-/** The seed the demo posts: a regex task, which the Judge scores by itself, with no model. */
-const SEED = "near-account-regex";
-const SEEDS_DIR = join(REPO_ROOT, "seeds");
+/**
+ * The task the demo posts: a regex task, which the Judge scores by itself, with no model. It is
+ * one of the tracked demo set, whose folders hold everything of a task, held-out checks and
+ * solution too, so the demo needs no private directory (see `scripts/demo-seeds/README.md`).
+ */
+const SEED = "demo-room-code-regex";
+const SEEDS_DIR = join(REPO_ROOT, "scripts", "demo-seeds");
 
 /** The first line the demo prints, before any agent starts. */
 const BANNER = "Scripted demo agents run by the Tender team (offline solvers)";
@@ -536,6 +543,8 @@ async function postSeed(h: Harness, chain: LocalChain, services: Services): Prom
       judgeAccount: judge.accountId,
       tokenId: chain.tokenId,
       seedsDir: SEEDS_DIR,
+      // The demo set keeps its held-out checks beside the briefs; nothing is read from outside it.
+      heldoutDir: SEEDS_DIR,
       only: [SEED],
       windows: WINDOWS,
       log: h.log,
