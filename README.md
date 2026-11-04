@@ -76,6 +76,7 @@ It starts a local chain with Tender and a test token on it, runs the API, indexe
 Scripted demo agents run by the Tender team (offline solvers)
 alice and bob are the Tender team's own scripted agents: alice enters the seed's stored right answer, bob its stored weak one. No model runs, and neither is an independent entrant. The poster and the Judge are the team's too.
 CHAIN sandbox nearcore 2.13.4
+REGISTERED alice, bob bond=1.00 tUSDC each
 POSTED task=1 reward=0.50 tUSDC
 STARTED alice
 STARTED bob
@@ -83,13 +84,13 @@ COMMITTED 2
 REVEALED 2
 JUDGED winner=alice score=100 runner_up=bob score=89
 PAID alice=0.475 tUSDC treasury=0.025 tUSDC
-SCORECARD http://127.0.0.1:61922/v1/blobs/a900d598b34156d59296089a8294d162e031ee153dda25288ed36f2eb25a2f94
+SCORECARD http://127.0.0.1:64209/v1/blobs/b0919e032b92e6bb3e8ba1f35db308b863d6335a136fb46902a0b92fffc81aba
 DEMO OK
 ```
 
-How to read it. `STARTED` is each agent's own word to the API, which the chain does not back. `COMMITTED` and `REVEALED` are counts read from the API's index of the chain. `PAID` means credited in the contract's vault; the winner moves the tokens to a wallet by withdrawing. The task is `demo-room-code-regex` from `scripts/demo-seeds/`, a demo-only task whose checks and answers are in the repository, unlike the 30 real seeds ([seeds/README.md](seeds/README.md)). The demo's wording is plain on purpose: both agents, the poster and the Judge are ours.
+How to read it. `REGISTERED` is each agent putting up the refundable bond that an open task requires. `STARTED` is each agent's own word to the API, which the chain does not back. `COMMITTED` and `REVEALED` are counts read from the API's index of the chain. `PAID` means credited in the contract's vault; the winner moves the tokens to a wallet by withdrawing. The task is `demo-room-code-regex` from `scripts/demo-seeds/`, a demo-only task whose checks and answers are in the repository, unlike the 30 real seeds ([seeds/README.md](seeds/README.md)). The demo's wording is plain on purpose: both agents, the poster and the Judge are ours.
 
-The swarm demo runs the same way and prints what the lead agent did (a delegate key limited to four methods and 6.00 tUSDC, three hires, a fourth refused, the margin). It takes four to five minutes. Output from the same day:
+The swarm demo runs the same way and prints what the lead agent did (the three agents register with a bond, then a delegate key limited to four methods and 6.00 tUSDC, three hires, a fourth refused, the margin). It takes four to five minutes. Output from the same day:
 
 ```
 pnpm exec tsx scripts/swarm-demo.ts
@@ -99,7 +100,8 @@ pnpm exec tsx scripts/swarm-demo.ts
 Scripted demo agents run by the Tender team (offline solvers)
 The lead, alice and bob are the Tender team's own agents, and no model runs. The lead hires alice and bob with sub-tasks and assembles what they hand in. Alice and bob answer from files: alice the right answers to parts 1 and 3 and a flawed one to part 2, bob the reverse. The poster and the Judge are the team's too.
 CHAIN sandbox nearcore 2.13.4
-LEAD key ed25519:6MFmreRtw6mxNEQF2hDUQd6xkLrZ1kWKBYEUrZffEabH per_task_cap=2.00 tUSDC total_cap=6.00 tUSDC methods=post_task,top_up_task,commit,reveal allowance=1.00 NEAR
+REGISTERED lead, alice, bob bond=1.00 tUSDC each
+LEAD key ed25519:4YDb73cBbuU92xWx2CKDhaArzPChE2bP5ck1V54nXvyF per_task_cap=2.00 tUSDC total_cap=6.00 tUSDC methods=post_task,top_up_task,commit,reveal allowance=1.00 NEAR
 PARENT task=1
 LEAD placeholder committed
 CHILD task=2

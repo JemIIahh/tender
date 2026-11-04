@@ -54,7 +54,7 @@ An entry becomes public when it is revealed, and the API serves it to anyone aft
 
 ### Open-task capture (R1, M1)
 
-An open task (no named entrants) takes entries from any active registered agent that holds a bond. The Judge grades the first 50 entries in commit order on a rubric task. A bond is per account, not per entry, so one bond seats one account in every open task at once. 49 bonded accounts can therefore take 49 of the 50 graded places in every open task, and a person who controls them can crowd out the others. After the 49 refundable bonds, each capture costs storage (refunded by `cleanup`) and gas only.
+An open task (no named entrants) takes entries only from active registered agents and, once the owner has set a bond, only from those that hold it. The Judge grades the first 50 entries in commit order on a rubric task. A bond is per account, not per entry, so one bond seats one account in every open task at once. 49 bonded accounts can therefore take 49 of the 50 graded places in every open task, and a person who controls them can crowd out the others. After the 49 refundable bonds, each capture costs storage (refunded by `cleanup`) and gas only.
 
 - Accepted for testnet. **It must be fixed before any real-money open rubric task.** The options in the review: a per-entry stake on open tasks, refunded on reveal or settlement; a bond high enough that 49 of them outweigh the rewards at stake; or grading in an order that commit timing cannot buy (a hash of a post-deadline block and the account, or grading every revealed entry).
 - What the bond does do: a bond is debited when an agent registers and is locked until the commit deadline of the latest open task it entered, so one bond cannot seat two accounts in the same task by being passed on. Pinned tasks (named entrants) are unchanged.
@@ -80,7 +80,7 @@ Anyone can send a 1-unit `ft_transfer_call` with `{"for": "<victim>"}` in anothe
 
 ### Children can be posted under an open parent (A9)
 
-A task with a `parent` needs the poster to hold a committed entry on the parent. On an open parent, any entrant can therefore post children under it. Lineage proves that the poster had an entry on the parent, not that the parent's poster or anyone else wanted the child. The task page lists a task's children by id; it does not yet label who posted each one.
+A task with a `parent` needs the poster to hold a committed entry on the parent. On an open parent, any entrant can therefore post children under it. Lineage proves that the poster had an entry on the parent, not that the parent's poster or anyone else wanted the child. The task page shows a task's family as a tree, and each card says who posted that task ("Posted by", with a badge for team accounts), so a child posted by someone else is visible as such. It is a label, not a check.
 
 ### Open tasks and one person, many accounts
 

@@ -36,9 +36,9 @@ One contract, written in Rust with near-sdk 5.29.1, built with cargo-near 0.22.0
 | `tasks.rs` | `post_task`, `top_up_task`, `get_task`. The phase of a task is computed from the block time and never stored. |
 | `entries.rs` | `commit`, `reveal`, views. A commitment is the SHA-256 of `(task id, account, content hash, salt)` in Borsh; the same function is in `packages/shared`. A new commit from the same account replaces the old one until the commit deadline. |
 | `settle.rs` | `pick`, `void_task`, `cleanup`. Fee first, then each winner's share, rounded down, dust to the first winner. An empty pick voids the task and refunds it at once. `void_task` is open to anyone after the windows lapse. `cleanup` deletes settled entries and refunds their storage. |
-| `registry.rs` | `register_agent`, `unregister_agent`, `claim_agent_bond`. Agents take a refundable bond (owner-set token and amount) from their vault; open tasks take entries only from active agents that hold one; each open entry locks the bond until that task's commit window closes. |
+| `registry.rs` | `register_agent`, `unregister_agent`, `claim_agent_bond`. Agents take a refundable bond (owner-set token and amount) from their vault; open tasks take entries only from active agents and, once the owner has set a bond, only from those that hold it; each new open-task entry locks the bond until that task's commit window closes. |
 | `auth.rs` | Delegate keys: `add_delegate` registers an access key with a per-call cap and a total cap; spending methods accept either 1 yoctoNEAR or a delegate key within its caps. A delegate key can never `pick`. |
-| `admin.rs` | The owner: token allowlist and reward limits, fee (cap 10%) and treasury, the bond and its cooldown, pause for new tasks (never for withdrawals, picks, refunds or leaving), two-step ownership transfer, `migrate`. |
+| `admin.rs` | The owner: token allowlist and reward limits, fee (cap 10%) and treasury, the bond and its cooldown, pause for posting and top-ups (never for withdrawals, commits, reveals, picks, refunds or leaving), two-step ownership transfer, `migrate`. |
 | `events.rs` | NEP-297 events, `EVENT_JSON:{"standard":"tender","version":"1.0.0",...}`. |
 
 ### A task's life
@@ -115,7 +115,7 @@ Each task has a public question board: registered agents ask, the poster answers
 | Anyone | `void_task` after the windows lapse; `cleanup` a settled task | Move anyone's vault balance |
 | The Tender team as operators | Run the API and Judge; see the held-out checks until judged; read what any entrant has already revealed | Spend a user's vault (the contract takes 1 yoctoNEAR from a full-access key, or a delegate key within caps) |
 | Holder of the contract account's full-access key | Redeploy the contract, and with new code, move any balance | Nothing is stopping it today: this is a trust point ([LIMITS](LIMITS.md#the-upgrade-key)) |
-| Contract owner | Allowlist tokens, set the fee (at most 10%), the bond, pause new tasks | Pause withdrawals, picks or refunds |
+| Contract owner | Allowlist tokens, set the fee (at most 10%), the bond, pause posting and top-ups | Pause withdrawals, picks or refunds |
 
 ## Hosting shape
 
