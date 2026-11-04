@@ -167,6 +167,8 @@ async function connect(k: ReturnType<typeof kit>, over: Partial<McpDeps> = {}) {
 }
 
 const REQUEST = "Summarise the 2026 annual filing of Example Corp in five bullet points.";
+/** The service's price, which a hire passes as its `max_price`. */
+const PRICE = "2500000";
 
 // ---- list_services ------------------------------------------------------------------------------
 
@@ -224,7 +226,12 @@ test("list_services_says_when_the_judge_takes_a_kind_only_from_the_team", async 
   const call = await connect(
     kit(
       service({
-        verification: { kind: "judge", criteria: rubric, criteria_hash: "cd".repeat(32) },
+        verification: {
+          kind: "judge",
+          criteria: rubric,
+          criteria_hash: "cd".repeat(32),
+          judge: JUDGE,
+        },
       }),
     ),
   );
@@ -296,11 +303,13 @@ test("a_judge_checked_service_is_hired_with_the_judge_as_verifier_and_its_criter
   const hash = sha256Hex(canonicalJson(REGEX));
   const judged = service({
     output_format: "regex_json",
-    verification: { kind: "judge", criteria: REGEX, criteria_hash: hash },
+    verification: { kind: "judge", criteria: REGEX, criteria_hash: hash, judge: JUDGE },
   });
   const k = kit(judged);
   const call = await connect(k);
-  expect((await call("hire_agent", { service_id: "7", request: REQUEST })).isError).toBe(false);
+  expect(
+    (await call("hire_agent", { service_id: "7", request: REQUEST, max_price: PRICE })).isError,
+  ).toBe(false);
   const [input] = k.chain.postTask.mock.calls[0] ?? [];
   expect(input?.verifier).toBe(JUDGE);
   // Every hire of the service carries the service's criteria, so the hash the listing shows.
@@ -311,6 +320,7 @@ test("a_judge_checked_service_is_hired_with_the_judge_as_verifier_and_its_criter
   const refused = await (await connect(k2, { judgeAccount: undefined }))("hire_agent", {
     service_id: "7",
     request: REQUEST,
+    max_price: PRICE,
   });
   expect(refused.text).toMatch(/^NO_JUDGE_ACCOUNT:/);
   expect(k2.chain.postTask).not.toHaveBeenCalled();
@@ -333,7 +343,7 @@ test("a_delegate_key_hires_within_its_caps_and_is_refused_past_them", async () =
   const k = kit();
   k.chain.view.mockImplementation(async () => caps());
   const call = await connect(k, delegate);
-  const answer = await call("hire_agent", { service_id: "7", request: REQUEST });
+  const answer = await call("hire_agent", { service_id: "7", request: REQUEST, max_price: PRICE });
   expect(answer.isError, answer.text).toBe(false);
   expect(k.chain.view).toHaveBeenCalledWith("tender.testnet", "get_delegate", {
     account_id: ACCOUNT,
@@ -351,6 +361,7 @@ test("a_delegate_key_hires_within_its_caps_and_is_refused_past_them", async () =
     const refused = await (await connect(refusedKit, delegate))("hire_agent", {
       service_id: "7",
       request: REQUEST,
+      max_price: PRICE,
     });
     expect(refused.text).toMatch(/^DELEGATE_CAP:/);
     expect(refused.text).toMatch(message);
@@ -363,6 +374,7 @@ test("a_delegate_key_hires_within_its_caps_and_is_refused_past_them", async () =
   const notDelegate = await (await connect(plain, delegate))("hire_agent", {
     service_id: "7",
     request: REQUEST,
+    max_price: PRICE,
   });
   expect(notDelegate.text).toMatch(/^NEEDS_FULL_ACCESS_KEY:/);
   const unknown = await (await connect(kit(), { ...delegate, publicKey: undefined }))(
@@ -370,6 +382,7 @@ test("a_delegate_key_hires_within_its_caps_and_is_refused_past_them", async () =
     {
       service_id: "7",
       request: REQUEST,
+      max_price: PRICE,
     },
   );
   expect(unknown.text).toMatch(/^NEEDS_FULL_ACCESS_KEY:/);
@@ -377,7 +390,7 @@ test("a_delegate_key_hires_within_its_caps_and_is_refused_past_them", async () =
   const commitOnly = kit();
   const cannot = await (
     await connect(commitOnly, { ...delegate, keyMethods: ["commit", "reveal"] })
-  )("hire_agent", { service_id: "7", request: REQUEST });
+  )("hire_agent", { service_id: "7", request: REQUEST, max_price: PRICE });
   expect(cannot.text).toMatch(/^KEY_CANNOT_CALL:/);
   expect(commitOnly.api.getService).not.toHaveBeenCalled();
 });
@@ -400,7 +413,7 @@ test("hire_agent_refuses_before_anything_is_uploaded_or_paid", async () => {
     ["its own service", kit(service({ agent: ACCOUNT })), {}, /^BAD_INPUT: .*cannot.*|^BAD_INPUT:/],
     ["a price above max_price", kit(), { max_price: "2499999" }, /^PRICE_ABOVE_MAX:/],
     ["an empty request", kit(), { request: "   " }, /^BAD_INPUT: request: expected some text/],
-    ["an invisible character", kit(), { request: "hi⁦" }, /^BAD_INPUT: request:/],
+    ["an invisible character", kit(), { request: "hi\u2066" }, /^BAD_INPUT: request:/],
     [
       "a request too long",
       kit(),
@@ -416,7 +429,12 @@ test("hire_agent_refuses_before_anything_is_uploaded_or_paid", async () => {
   ];
   for (const [what, k, over, message] of cases) {
     const call = await connect(k, { secrets: ["ed25519:SECRETKEYSECRETKEY"] });
-    const refused = await call("hire_agent", { service_id: "7", request: REQUEST, ...over });
+    const refused = await call("hire_agent", {
+      service_id: "7",
+      request: REQUEST,
+      max_price: PRICE,
+      ...over,
+    });
     expect(refused.isError, what).toBe(true);
     expect(refused.text, what).toMatch(message);
     expect(k.api.uploadBlob, what).not.toHaveBeenCalled();
@@ -426,7 +444,7 @@ test("hire_agent_refuses_before_anything_is_uploaded_or_paid", async () => {
   const poor = kit();
   poor.chain.balanceOf.mockResolvedValue(2_000_000n);
   const call = await connect(poor);
-  const refused = await call("hire_agent", { service_id: "7", request: REQUEST });
+  const refused = await call("hire_agent", { service_id: "7", request: REQUEST, max_price: PRICE });
   expect(refused.text).toMatch(/^INSUFFICIENT_FUNDS: your vault holds 2.00 USDC/);
   expect(poor.api.uploadBlob).not.toHaveBeenCalled();
 });
@@ -440,7 +458,7 @@ test("storage_for_the_hire_is_topped_up_by_a_full_access_key_and_asked_of_any_ot
   const k = kit();
   k.chain.storageBalanceOf.mockResolvedValue(low);
   const call = await connect(k);
-  const answer = await call("hire_agent", { service_id: "7", request: REQUEST });
+  const answer = await call("hire_agent", { service_id: "7", request: REQUEST, max_price: PRICE });
   expect(answer.isError, answer.text).toBe(false);
   // 1,700 bytes at 10^19 each, less what is free, and 0.01 NEAR more.
   expect(k.chain.storageDeposit).toHaveBeenCalledWith(
@@ -460,8 +478,35 @@ test("storage_for_the_hire_is_topped_up_by_a_full_access_key_and_asked_of_any_ot
   }));
   const refused = await (
     await connect(delegated, { keyKind: "function_call", publicKey: DELEGATE_KEY })
-  )("hire_agent", { service_id: "7", request: REQUEST });
+  )("hire_agent", { service_id: "7", request: REQUEST, max_price: PRICE });
   expect(refused.text).toMatch(/^STORAGE_LOW:/);
   expect(delegated.chain.storageDeposit).not.toHaveBeenCalled();
   expect(delegated.chain.postTask).not.toHaveBeenCalled();
+});
+
+test("hire_agent_needs_max_price_and_the_judge_the_service_names", async () => {
+  const k = kit();
+  const call = await connect(k);
+  const missing = await call("hire_agent", { service_id: "7", request: REQUEST });
+  expect(missing.isError).toBe(true);
+  expect(k.api.getService).not.toHaveBeenCalled();
+
+  const judged = service({
+    output_format: "regex_json",
+    verification: {
+      kind: "judge",
+      criteria: REGEX,
+      criteria_hash: sha256Hex(canonicalJson(REGEX)),
+      judge: "another-judge.testnet",
+    },
+  });
+  const k2 = kit(judged);
+  const refused = await (await connect(k2))("hire_agent", {
+    service_id: "7",
+    request: REQUEST,
+    max_price: PRICE,
+  });
+  expect(refused.text).toMatch(/^JUDGE_MISMATCH:/);
+  expect(k2.api.uploadBlob).not.toHaveBeenCalled();
+  expect(k2.chain.postTask).not.toHaveBeenCalled();
 });

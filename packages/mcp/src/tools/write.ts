@@ -1862,9 +1862,11 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "reveal. If the service is checked by the hirer, you are the verifier: once the reveal " +
         "window closes, read the delivery (task_entries) and pick it with pick_winners to pay it, or " +
         "pick nobody. If the Tender Judge checks it, the Judge picks. " +
-        `${HIRE_MONEY_NOTE} Pass max_price, the price you saw: a provider can change its price, ` +
-        "and a hire priced above max_price is refused with PRICE_ABOVE_MAX before anything is " +
-        "uploaded or paid. A service that cannot be hired now is refused with SERVICE_UNAVAILABLE. " +
+        `${HIRE_MONEY_NOTE} max_price is the most you agree to pay, the price you saw: a provider ` +
+        "can change its price, and a hire priced above max_price now is refused with " +
+        "PRICE_ABOVE_MAX before anything is uploaded or paid. A service that cannot be hired now is " +
+        "refused with SERVICE_UNAVAILABLE. The hired agent takes a hire only on its service's " +
+        "terms (the price, the token, the windows and who checks), which this tool posts. " +
         "Works with a full-access key, and with a delegate key within its caps (DELEGATE_CAP " +
         "otherwise), which spends without attaching a deposit; any other key is refused with " +
         "NEEDS_FULL_ACCESS_KEY. A request that holds this server's private key, or another secret " +
@@ -1884,8 +1886,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
             `What you want done, in plain text, up to ${HIRE_REQUEST_MAX_CHARS} characters. It is ` +
               "public, and the agent works from it",
           ),
-        max_price: U128StringSchema.optional().describe(
-          "The most you agree to pay, in the smallest unit of the service's token",
+        max_price: U128StringSchema.describe(
+          "The most you agree to pay, in the smallest unit of the service's token: the price " +
+            "list_services showed you",
         ),
       },
       annotations: SPENDS,
@@ -1916,7 +1919,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         );
       }
       const price = BigInt(service.price);
-      if (max_price !== undefined && price > BigInt(max_price)) {
+      if (price > BigInt(max_price)) {
         throw new ToolError(
           "PRICE_ABOVE_MAX",
           `service ${service_id} costs ${formatAmount(price, service.token, network)} (${price}), ` +
@@ -1928,6 +1931,18 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           "NO_JUDGE_ACCOUNT",
           `service ${service_id} is checked by the Judge, whose account this server was not told: ` +
             "set TENDER_JUDGE_ACCOUNT",
+        );
+      }
+      // The agent takes a hire only if it names the Judge the API names for the service.
+      if (
+        service.verification.kind === "judge" &&
+        service.verification.judge !== deps.judgeAccount
+      ) {
+        throw new ToolError(
+          "JUDGE_MISMATCH",
+          `service ${service_id} is checked by the Judge ${service.verification.judge ?? "(none)"}, ` +
+            `and this server's TENDER_JUDGE_ACCOUNT is ${deps.judgeAccount}: the agent would not ` +
+            "take a hire that names another. Nothing was uploaded or paid",
         );
       }
       const words = HireRequestSchema.safeParse(request);

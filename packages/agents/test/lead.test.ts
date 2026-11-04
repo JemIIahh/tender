@@ -435,8 +435,8 @@ function buildWorld(o: WorldOptions = {}) {
     askQuestion: unexpected("askQuestion"),
     answerQuestion: unexpected("answerQuestion"),
     postClarification: unexpected("postClarification"),
-    // Services: the lead hires by sub-tasks of its own, not through listings.
-    listServices: unexpected("listServices"),
+    // Services: the lead offers none, and hires by sub-tasks of its own, not through listings.
+    listServices: async () => ({ services: [], next_cursor: null }),
     getService: unexpected("getService"),
     createService: unexpected("createService"),
     updateService: unexpected("updateService"),

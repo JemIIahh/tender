@@ -31,7 +31,8 @@ import { createStateStore } from "../src/state";
 //    API with his key;
 // 2. alice, an agent with a delegate key that may spend 3 tUSDC a task, finds it with
 //    `list_services` and hires it with `hire_agent`, through an MCP server that holds only that key;
-// 3. bob's runner, with `hires` on, finds the pinned task that invites him, hands the request to its
+// 3. bob's runner, as he offers a service, finds the pinned task that invites him, checks it is a hire
+//    on that service's terms (the price, the token, the verifier, the criteria, the windows), hands the request to its
 //    solver, commits, and reveals once the reveal window opens, with nobody to say yes;
 // 4. alice, the verifier of a hire the hirer accepts, reads the delivery and picks it with
 //    `pick_winners` through a server that holds her full-access key (a delegate key never picks);
@@ -39,8 +40,6 @@ import { createStateStore } from "../src/state";
 //    index shows bob's win and his earnings on the service's record.
 
 const PRICE = 2_000_000n;
-/** The local chain's fee, 500 basis points (`FEE_BPS` in packages/client/src/local.ts). */
-const FEE_BPS = 500n;
 const REQUEST = "Summarise the 2026 annual filing of Example Corp in three short lines.";
 const DELIVERY = "Revenue rose 12%.\nMargins held.\nNo new debt.";
 
@@ -263,7 +262,6 @@ test("an_agent_hires_another_through_a_service_and_the_contract_pays_it_less_the
       api: bobApi,
       state,
       tags: ["nothing-tagged-this"],
-      hires: true,
       solver,
       log: (line) => runnerLines.push(line),
       memory,
@@ -346,11 +344,13 @@ test("an_agent_hires_another_through_a_service_and_the_contract_pays_it_less_the
   });
 
   // ---- 5. the money: the price less the fee to bob, the fee to the treasury ----
-  const fee = (PRICE * FEE_BPS) / 10_000n;
+  // The fee the task was posted with, as the contract holds it, not a copy of the local chain's.
+  const settled = await reader.getTask(taskId);
+  const feeBps = BigInt(settled?.fee_bps ?? -1);
+  expect(feeBps).toBeGreaterThan(0n);
+  const fee = (PRICE * feeBps) / 10_000n;
   expect(await reader.balanceOf(bob.accountId, chain.tokenId)).toBe(bobBefore + PRICE - fee);
   expect(await reader.balanceOf(treasury.accountId, chain.tokenId)).toBe(treasuryBefore + fee);
-  expect(PRICE - fee).toBe(1_900_000n);
-  const settled = await reader.getTask(taskId);
   expect(settled?.outcome).toMatchObject({
     kind: "picked",
     fee: fee.toString(),

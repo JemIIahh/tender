@@ -7,9 +7,13 @@ import {
   computeCommitment,
   type EntryView,
   ErrorBodySchema,
+  HIRER_ACCEPTS_CRITERIA_HASH,
+  hireCriteriaHash,
+  hireMismatch,
   type ListTasksFilter,
   MAX_URI_BYTES,
   randomSalt,
+  type Service,
   sha256Hex,
   storageShortfall,
   type TaskBoard,
@@ -201,14 +205,6 @@ export interface AgentTickOptions {
   state: StateStore;
   /** The tags of the tasks the agent looks for. A task counts if its brief carries any of them. */
   tags: readonly string[];
-  /**
-   * Whether the agent also takes the open pinned tasks that invite it, whatever their tags: a hire
-   * of one of its services is one (`hire_agent`, the web's Hire), and so is any other task that
-   * names it in `invited`. Such a task goes through the same steps as one found by its tag, and is
-   * answered by the same solver; nobody needs to say yes to it. Default: false, so that a run that
-   * looks only for its tags stays as it was; the agent CLI turns it on.
-   */
-  hires?: boolean;
   solver: Solver;
   /**
    * How long the runner waits for the solver to answer one task before it gives up on it, in
@@ -248,7 +244,12 @@ interface Run {
   api: TenderApi;
   state: StateStore;
   tags: readonly string[];
-  hires: boolean;
+  /**
+   * The services the agent offers, as the API listed them at the start of this tick's pass over the
+   * tasks (`ownServices`), or null when they could not be read. They decide whether the agent takes
+   * hires at all, and which (`hireRefusal`).
+   */
+  services: Service[] | null;
   solver: Solver;
   solveTimeoutMs: number;
   log: (message: string) => void;
@@ -395,6 +396,7 @@ async function listOpen(api: TenderApi, by: string | { invited: string }): Promi
 async function enterTasks(run: Run): Promise<void> {
   // A task carries several tags and is listed under each: it is looked at once per tick.
   const looked = new Set<string>();
+  run.services = await ownServices(run);
 
   for (const tag of run.tags) {
     if (run.signal?.aborted) return;
@@ -432,15 +434,79 @@ async function enterTasks(run: Run): Promise<void> {
     }
   }
 
-  if (run.hires) await enterInvitations(run, looked);
+  // Hires are taken only by an agent that offers a service now, and only on its terms.
+  if (run.services?.some((service) => service.status === "active") === true) {
+    await enterInvitations(run, looked);
+  }
+}
+
+/** The most services one agent can have: a provider keeps 50 at the most (`SERVICES_PER_PROVIDER`). */
+const SERVICES_PAGE = 50;
+
+/**
+ * The services the agent offers, paused ones too, as the API lists them: read once a tick, before
+ * any task is looked at. A service of another agent, which an API that ignores the filter could
+ * send, is dropped: only the agent's own listings set the terms it works on. Null, with an ERROR
+ * line, when they cannot be read; the tick goes on without hires.
+ */
+async function ownServices(run: Run): Promise<Service[] | null> {
+  try {
+    const page = await run.api.listServices({
+      agent: run.account,
+      status: "all",
+      limit: SERVICES_PAGE,
+    });
+    return page.services.filter((service) => service.agent === run.account);
+  } catch (error) {
+    run.log(`ERROR ${run.name}: reading its services failed (${describe(error)})`);
+    return null;
+  }
 }
 
 /**
- * The open pinned tasks that invite the agent (`hires`), whatever their tags: a hire of its service
- * among them. They go through `enter` like the tasks of its tags, with one step more: the detail must
- * name the agent in its invited list, since the API was asked for those only, and an API that ignored
- * the filter would otherwise have the agent enter every open task. A task that does not is skipped,
- * and a count of them is logged.
+ * Whether a task with `criteriaHash` claims to be a hire: it carries the criteria of a hire the
+ * hirer accepts, which are the same for every service, or those of one of the agent's own
+ * Judge-checked services.
+ */
+function isHireCriteria(run: Run, criteriaHash: string): boolean {
+  return (
+    criteriaHash === HIRER_ACCEPTS_CRITERIA_HASH ||
+    (run.services ?? []).some((service) => hireCriteriaHash(service) === criteriaHash)
+  );
+}
+
+/**
+ * Why the agent will not take `task` as a hire, or null when it will: the task invites it alone,
+ * once (`max_entries` 1, `invited` exactly the agent), and one of the agent's active services whose
+ * criteria the task carries has terms the task meets (`hireMismatch`: its token, at least its price,
+ * the verifier it names, its windows). The reason of an active service comes before that of a
+ * paused one.
+ */
+function hireRefusal(run: Run, task: TaskDetail): string | null {
+  if (task.max_entries !== 1 || task.invited.length !== 1 || task.invited[0] !== run.account) {
+    return "it is pinned as a hire and does not invite the agent alone, once, as a hire does";
+  }
+  const offered = (run.services ?? [])
+    .filter((service) => hireCriteriaHash(service) === task.criteria_hash)
+    .sort((a, b) => Number(b.status === "active") - Number(a.status === "active"));
+  if (offered.length === 0) return "its criteria are not those of a service the agent offers";
+  let reason: string | null = null;
+  for (const service of offered) {
+    const why = hireMismatch(task, service);
+    if (why === null) return null;
+    reason ??= why;
+  }
+  return reason;
+}
+
+/**
+ * The open pinned tasks that invite the agent, whatever their tags: the hires of its services. Only an
+ * agent that offers an active service looks for them. They go through `enter` like the tasks of its
+ * tags, with two steps more: the detail must name the agent in its invited list, since the API was
+ * asked for those only, and an API that ignored the filter would otherwise have the agent enter every
+ * open task (a task that does not is skipped, and a count of them is logged); and the task must be a
+ * hire of one of its services on that service's terms (`hireRefusal`), or it is skipped and the
+ * reason logged.
  */
 async function enterInvitations(run: Run, looked: Set<string>): Promise<void> {
   if (run.signal?.aborted) return;
@@ -564,6 +630,17 @@ async function enter(
   if (invited && !task.invited.includes(run.account)) {
     memory.seen.add(id);
     return "not_invited";
+  }
+  // A hire is taken only on the terms of a service the agent offers, whichever listing found it:
+  // the invited one, or a tag the hire's brief carries. A pinned task that is no hire (other
+  // criteria, found by a tag) is entered as it was before services, as any task of the agent's tags.
+  if (invited || (task.invited.includes(run.account) && isHireCriteria(run, task.criteria_hash))) {
+    const why = hireRefusal(run, task);
+    if (why !== null) {
+      memory.seen.add(id);
+      run.log(`${run.name}: skipping task ${id}, ${why}`);
+      return;
+    }
   }
 
   const refusal = refusalOf(run, task);
@@ -1256,7 +1333,7 @@ export async function agentTick(opts: AgentTickOptions): Promise<void> {
     api: opts.api,
     state: opts.state,
     tags: opts.tags,
-    hires: opts.hires ?? false,
+    services: null,
     solver: opts.solver,
     solveTimeoutMs,
     log: opts.log ?? console.log,

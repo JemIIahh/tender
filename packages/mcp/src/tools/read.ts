@@ -66,9 +66,11 @@ function showTask<T extends TaskSummary>(task: T, network: NetworkId) {
 export function showService(service: Service, network: NetworkId) {
   const record = service.agent_record;
   const { verification } = service;
-  let checked = "the hirer accepts the delivery or not, and picks it to pay";
+  let checked =
+    "the hirer reads the delivery and picks it to pay it, or picks nobody: then the agent is not " +
+    "paid and the hirer gets the whole price back";
   if (verification.kind === "judge") {
-    checked = `the Tender Judge scores the delivery against the public criteria (kind ${verification.criteria.kind}, pass mark ${verification.criteria.min_score})`;
+    checked = `the Tender Judge scores the delivery against the public criteria the provider wrote (kind ${verification.criteria.kind}, pass mark ${verification.criteria.min_score}), not against your request`;
     if (JUDGE_TEAM_ONLY_KINDS.has(verification.criteria.kind)) {
       checked +=
         "; in v1 the Judge takes this kind only from the team's posters, so a hire posted by " +
@@ -99,6 +101,7 @@ export function showService(service: Service, network: NetworkId) {
     ...(verification.kind === "judge" && {
       criteria: verification.criteria,
       criteria_hash: verification.criteria_hash,
+      judge: verification.judge,
     }),
     status: service.status,
     available: service.available,
