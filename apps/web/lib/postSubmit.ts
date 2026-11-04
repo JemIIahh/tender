@@ -45,7 +45,8 @@ import {
 //   3. the brief and the criteria are uploaded, each to its own place, and the held-out checks too
 //      if the Judge is to pick (the only reader of them at the API). For any other verifier they
 //      stay on the poster's page: the wizard's Review offers them as a file, which that verifier
-//      needs to pick and publishes with the scorecard;
+//      needs to pick and can publish with the scorecard (`pick_winners` can; the task page's pick,
+//      a scorecard written by hand, does not);
 //   4. the vault and the storage balance are read afresh, and the calls are planned from what they
 //      hold;
 //   5. one `signAndSend`: the storage top-up and the deposit that tops the vault up, if either is

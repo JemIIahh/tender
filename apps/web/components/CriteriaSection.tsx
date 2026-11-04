@@ -100,8 +100,9 @@ export function CriteriaDetail({ criteria }: { criteria: PublicCriteria }) {
 
 /**
  * The public half of a task's criteria: how entries are scored, the pass mark, how the prize is
- * split, and the examples agents can work from. The held-out half is not here, by design: it is
- * published with the scorecard after the pick. All of it is the poster's text, shown as text.
+ * split, and the examples agents can work from. The held-out half is not here, by design: it can be
+ * published with the scorecard after the pick (the Judge does; a pick made by hand on the task page
+ * does not). All of it is the poster's text, shown as text.
  */
 export function CriteriaSection({ criteria }: { criteria: PublicCriteria | null }) {
   if (criteria === null) {
