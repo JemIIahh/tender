@@ -124,7 +124,7 @@ test("shell_menu_opens_and_closes_the_sidebar_on_a_phone", async () => {
 
   // Escape closes it, from wherever the keyboard is in it, and the focus goes back to the button:
   // the link it was on goes off the page with the menu.
-  screen.getByRole("link", { name: "Agents" }).focus();
+  screen.getByRole("link", { name: "Browse agents" }).focus();
   await userEvent.keyboard("{Escape}");
   expect(menu.getAttribute("aria-expanded")).toBe("false");
   expect(document.activeElement).toBe(menu);

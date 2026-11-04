@@ -170,11 +170,32 @@ test("the_dev_wallet_key_and_account_are_read_in_one_module_and_only_under_the_s
 });
 
 test("the_app_never_writes_to_local_storage_and_the_token_module_never_logs", () => {
-  // Local storage is read by every later visit to the page, and the API token is a secret.
-  const offenders = appSources()
+  // Local storage is read by every later visit to the page, and the API token is a secret. The one
+  // thing kept there is the viewer's choice of sidebar (the ASP brief), in one module, under one
+  // key, as one of two words: no token, no account, nothing from a request.
+  const holders = appSources()
     .filter((file) => /\blocalStorage\s*[.[]/.test(readFileSync(file, "utf8")))
     .map((file) => relative(WEB, file));
-  expect(offenders).toEqual([]);
+  expect(holders).toEqual(["lib/sidebar.ts"]);
+  const sidebar = read("lib/sidebar.ts");
+  expect(sidebar).toContain('export const SIDEBAR_KEY = "tender.sidebar";');
+  const uses = sidebar.match(/localStorage\.\w+\([^)]*\)/g) ?? [];
+  expect(uses.length).toBeGreaterThan(0);
+  for (const use of uses) {
+    expect(use).toMatch(
+      /^localStorage\.(getItem\((?:SIDEBAR_KEY|\$\{JSON\.stringify\(SIDEBAR_KEY)|setItem\(SIDEBAR_KEY, rail \? RAIL : FULL)/,
+    );
+  }
+  expect(sidebar).not.toMatch(/localStorage\.(?:removeItem|clear|key)\b|localStorage\s*\[/);
+
+  // The one <script> of the app is the sidebar's, in the root layout's head, and it is a constant.
+  const scripts = appSources()
+    .filter((file) => /<script\b/.test(readFileSync(file, "utf8")))
+    .map((file) => relative(WEB, file));
+  expect(scripts).toEqual(["app/layout.tsx"]);
+  expect(read("app/layout.tsx")).toMatch(
+    /<head>\s*<script>\{SIDEBAR_SCRIPT\}<\/script>\s*<\/head>/,
+  );
 
   // The token is signed in for by lib/auth.ts and kept by lib/apiToken.ts: neither logs.
   for (const file of ["lib/auth.ts", "lib/apiToken.ts"]) {

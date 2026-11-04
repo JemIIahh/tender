@@ -14,6 +14,10 @@
   --color-paper: #e6e6e3;
 }
 
+/* The app's sidebar as the narrow rail of icons (lib/sidebar.ts): `rail:` styles a part of the shell
+   while <html> says so. The shell pairs it with `lg:`, as the rail is for laptop width up. */
+@custom-variant rail (&:where([data-sidebar="rail"] *));
+
 @layer base {
   /* A ring that shows on the page and on a filled button alike. */
   :focus-visible {
