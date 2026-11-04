@@ -1,3 +1,4 @@
+import "./lib/node-check";
 import { rmSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";

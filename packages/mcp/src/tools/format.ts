@@ -1,5 +1,5 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { TenderError } from "@tender/client";
+import { ApiUnreachableError, TenderError } from "@tender/client";
 import {
   ApiError,
   BriefSchema,
@@ -104,12 +104,14 @@ export function textResult(text: string): CallToolResult {
 }
 
 /**
- * `text` with every http(s) URL replaced by `<url>`. near-api-js puts the RPC URL it was given into
- * its error messages, and an RPC URL can carry an API key, so no error text leaves the server with
- * one in it.
+ * `text` with every http(s) URL replaced by `<url>`, but those in `keep`, which stay as they are.
+ * near-api-js puts the RPC URL it was given into its error messages, and an RPC URL can carry an API
+ * key, so no error text leaves the server with one in it. What `keep` holds is the API's base when it
+ * did not answer (`ApiUnreachableError`): `TENDER_API_URL` may hold no user name, password, query or
+ * fragment, and the agent needs to see which address it was.
  */
-export function scrubUrls(text: string): string {
-  return text.replace(/\bhttps?:\/\/\S+/gi, "<url>");
+export function scrubUrls(text: string, keep: readonly string[] = []): string {
+  return text.replace(/\bhttps?:\/\/\S+/gi, (url) => (keep.includes(url) ? url : "<url>"));
 }
 
 /** A bearer token in a header's text: the word, then the token's characters. */
@@ -118,15 +120,28 @@ const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 /**
  * `text` with nothing in it that an agent must not read: every string in `secrets` is cut out
  * (the longest first, so a key is cut whole and not left as the curve's name and a hole), a bearer
- * token is cut by its shape, and a URL is replaced (`scrubUrls`). A library's message can quote
- * any of them, and what a tool answers is read by a model that other text can steer.
+ * token is cut by its shape, and a URL is replaced (`scrubUrls`), unless it is one of `keep`. A
+ * library's message can quote any of them, and what a tool answers is read by a model that other
+ * text can steer.
  */
-export function scrub(text: string, secrets: readonly string[] = []): string {
+export function scrub(
+  text: string,
+  secrets: readonly string[] = [],
+  keep: readonly string[] = [],
+): string {
   let clean = text;
   for (const secret of [...secrets].sort((a, b) => b.length - a.length)) {
     if (secret !== "") clean = clean.replaceAll(secret, "<redacted>");
   }
-  return scrubUrls(clean.replace(BEARER, "Bearer <redacted>"));
+  return scrubUrls(clean.replace(BEARER, "Bearer <redacted>"), keep);
+}
+
+/**
+ * The URLs a failure's text may show: the API's base, when the API did not answer. Every other URL
+ * is scrubbed.
+ */
+export function urlsToShow(error: unknown): string[] {
+  return error instanceof ApiUnreachableError ? [error.base] : [];
 }
 
 /** The text of whatever was thrown, which need not be an `Error`. */
@@ -155,6 +170,8 @@ const PANIC_PREFIX = "Smart contract panicked: ";
  * - A `TenderError` has the contract's code (or the client's), and its message without the chain's
  *   `Smart contract panicked: ` and without the code once more, since the code leads the text.
  * - An `ApiError` is `API_ERROR`, and its message holds a status and a code and never a body.
+ * - An `ApiUnreachableError` is `API_UNREACHABLE`: no answer came from `TENDER_API_URL`, and the
+ *   message names it.
  * - Anything else is `ERROR`.
  */
 export function describeError(error: unknown): { code: string; message: string } {
@@ -166,18 +183,22 @@ export function describeError(error: unknown): { code: string; message: string }
     return { code: error.code, message: message === "" ? error.message : message };
   }
   if (error instanceof ApiError) return { code: "API_ERROR", message: error.message };
+  if (error instanceof ApiUnreachableError) {
+    return { code: "API_UNREACHABLE", message: `${error.message}; check TENDER_API_URL` };
+  }
   return { code: "ERROR", message: errorText(error) };
 }
 
 /**
  * A failed tool as the agent sees it: `isError` and the text `{code}: {message}`, with the
- * secrets, bearer tokens and URLs taken out of it (`scrub`).
+ * secrets, bearer tokens and URLs taken out of it (`scrub`), but the API's base when the API did
+ * not answer (`urlsToShow`).
  */
 export function errorResult(error: unknown, secrets: readonly string[] = []): CallToolResult {
   const { code, message } = describeError(error);
   return {
     isError: true,
-    content: [{ type: "text", text: scrub(`${code}: ${message}`, secrets) }],
+    content: [{ type: "text", text: scrub(`${code}: ${message}`, secrets, urlsToShow(error)) }],
   };
 }
 

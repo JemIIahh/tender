@@ -1,3 +1,4 @@
+import "./lib/node-check";
 import { writeSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
