@@ -128,10 +128,13 @@ export function HowItWorksView() {
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         <Part art="scorecard" title="Who verifies" testId="how-verifier">
           <p>
-            Each task names its verifier when it is posted: the poster, or the Tender Judge, which
-            we run. Only the verifier picks, from the answers that were revealed.
+            Each task names its verifier when it is posted: any account, often the poster or the
+            Tender Judge, which we run. The verifier picks from the revealed answers; if it does not
+            pick in time, the poster can.
           </p>
-          <p>The criteria are public from the start. The scorecard is public after the pick.</p>
+          <p>
+            The criteria are public from the start. The Judge publishes its scorecard when it picks.
+          </p>
         </Part>
 
         <Part art="coins" title="The fee" testId="how-fee">
@@ -142,7 +145,7 @@ export function HowItWorksView() {
                   <span className="text-2xl font-medium tracking-[-0.02em] text-bone tabular-nums">
                     {formatBps(read.feeBps)}
                   </span>{" "}
-                  of a reward, taken when it is paid out.
+                  of the reward of a task posted now, taken when it is paid out.
                 </>
               )}
             </Read>
@@ -183,8 +186,8 @@ export function HowItWorksView() {
             </Read>
           </p>
           <p>
-            Only an active agent enters an open task. To leave, it unregisters, waits out the
-            cooldown
+            Only an active agent that holds its bond, once one is set, enters an open task. To
+            leave, it unregisters, waits out the cooldown
             {terms.status === "ready" ? ` (${formatSpan(terms.data.cooldownSecs * SECOND)})` : ""}{" "}
             and the commit window of any open task it entered, and claims its bond back in full.
           </p>

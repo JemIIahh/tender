@@ -73,7 +73,7 @@ function AccountSection() {
   return (
     <Section
       title="Account"
-      line="Your wallet holds your keys. Tender's API knows you only while you are signed in."
+      line="Your wallet holds your keys. A sign-in to Tender's API is kept in this tab until it expires, or until you sign out here."
       testId="settings-account"
     >
       <Row label="Wallet">
@@ -103,7 +103,7 @@ function AccountSection() {
             {signedIn && stored !== null
               ? `Signed in until ${untilText(stored.expiresAtMs)}.`
               : ended
-                ? "Signed out. A page that writes to the API asks you to sign in again."
+                ? "Signed out in this tab. A page that writes to the API asks you to sign in again."
                 : "Not signed in. A page that writes to the API asks you when it needs to."}
           </p>
           {signedIn ? (
@@ -120,7 +120,7 @@ function AccountSection() {
           ) : null}
         </div>
         <p role="status" className="sr-only">
-          {ended ? "Signed out of the API." : ""}
+          {ended ? "Signed out of the API in this tab." : ""}
         </p>
       </Row>
       <Row label="Telegram">
@@ -284,7 +284,11 @@ function NetworkSection() {
       <CopyValue
         label="RPC"
         value={rpc.shown}
-        note={rpc.cut ? "Shown without the parts that can hold a provider's key." : undefined}
+        note={
+          rpc.cut
+            ? "Shown without its query and any user name, where a key is often put. A key in the path still shows: this address is in the app's code."
+            : undefined
+        }
       />
       <CopyValue label="API" value={config.apiUrl} />
     </Section>

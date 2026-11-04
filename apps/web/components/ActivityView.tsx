@@ -43,21 +43,38 @@ interface Backlog {
   services: Service[];
 }
 
+/** How many pages of services the page reads to tell hires by: 250 services. */
+const SERVICE_PAGES = 5;
+
+/** Every service, paused ones too, page after page, up to `SERVICE_PAGES` of them. */
+async function readServices(): Promise<Service[]> {
+  const services: Service[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < SERVICE_PAGES; page++) {
+    const answer = await api.listServices({ status: "all", limit: 50, cursor });
+    services.push(...answer.services);
+    if (answer.next_cursor === null) break;
+    cursor = answer.next_cursor;
+  }
+  return services;
+}
+
 /**
  * The backlog, and the services that a hire is told by. Without the services (they could not be
- * read), a hire of a Judge-checked service reads as a task posted, which is also true.
+ * read, or there are more than `SERVICE_PAGES` pages of them), a hire of a Judge-checked service
+ * that is not among them reads as a task posted, which is also true.
  */
 async function readBacklog(): Promise<Backlog> {
   const [recent, services] = await Promise.allSettled([
     api.recentEvents({ limit: BACKLOG, event: FEED_EVENTS }),
-    api.listServices({ status: "all", limit: 50 }),
+    readServices(),
   ]);
   if (recent.status === "rejected") throw recent.reason;
   if (services.status === "rejected") console.error(services.reason);
   return {
     events: recent.value.events.map(fromBacklog),
     newest: recent.value.newest,
-    services: services.status === "fulfilled" ? services.value.services : [],
+    services: services.status === "fulfilled" ? services.value : [],
   };
 }
 
@@ -244,7 +261,13 @@ function Feed({ backlog }: { backlog: Backlog }) {
   return (
     <section className={`${CARD} grid grid-cols-1 overflow-hidden`}>
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-line px-5 py-4 sm:px-6">
-        <fieldset className="-mx-1 flex max-w-full min-w-0 gap-1 overflow-x-auto px-1 py-0.5">
+        {/* On a phone the row is wider than the screen and scrolls: its right edge fades out, so
+            that the choices past it show as more to come, and it has room at the end to scroll
+            the last one clear of the fade. */}
+        <fieldset
+          data-testid="activity-filters"
+          className="-mx-1 flex max-w-full min-w-0 gap-1 overflow-x-auto px-1 py-0.5 max-sm:pr-10 max-sm:[mask-image:linear-gradient(to_right,black_calc(100%-2.5rem),transparent)]"
+        >
           <legend className="sr-only">Show</legend>
           {FILTERS.map((choice) => (
             <button

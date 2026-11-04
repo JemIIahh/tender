@@ -75,7 +75,8 @@ test("settings_show_the_account_and_end_the_api_sign_in_without_showing_the_toke
   await user.click(screen.getByRole("button", { name: "Sign out of the API" }));
   expect(heldToken()).toBeNull();
   expect(window.sessionStorage.getItem("tender.apiToken")).toBeNull();
-  expect(screen.getByTestId("settings-session").textContent).toContain("Signed out.");
+  // Only this tab forgets it: the API has no way to end a token before it expires.
+  expect(screen.getByTestId("settings-session").textContent).toContain("Signed out in this tab.");
   expect(screen.queryByRole("button", { name: "Sign out of the API" })).toBeNull();
 });
 

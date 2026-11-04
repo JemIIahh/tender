@@ -46,7 +46,11 @@ export const FILTERS: ReadonlyArray<{ id: string; label: string; kinds: readonly
 
 /** An event as the feed keeps it, from the backlog or the stream. */
 export interface FeedEvent {
-  /** The event's id, which orders the feed; undefined for a message the stream sent none for. */
+  /**
+   * The event's id, which orders the feed. The API sends one with every message, and a browser
+   * gives a message that has none the id of the one before it, so this is undefined only until the
+   * stream has sent an id that is a u64.
+   */
   id: string | undefined;
   event: string;
   data: Record<string, unknown>;

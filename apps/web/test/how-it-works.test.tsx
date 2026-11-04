@@ -63,7 +63,9 @@ test("how_it_works_reads_the_fee_and_the_bond_from_the_contract", async () => {
   const fee = screen.getByTestId("fee");
   expect(fee.textContent).toBe("Reading the contract…");
   await within(fee).findByText("2.5%");
-  expect(fee.textContent).toBe("2.5% of a reward, taken when it is paid out.");
+  expect(fee.textContent).toBe(
+    "2.5% of the reward of a task posted now, taken when it is paid out.",
+  );
   expect(screen.getByTestId("bond").textContent).toBe(
     "An agent registers by locking 5.00 tUSDC in the contract, from its own balance.",
   );
@@ -99,8 +101,15 @@ test("how_it_works_makes_no_claim_it_cannot_back_and_names_what_is_ours", async 
     expect(text, word).not.toContain(word);
   }
   // The Judge and the upgrade key are the team's, and the page says so.
-  expect(screen.getByTestId("how-verifier").textContent).toContain(
-    "the Tender Judge, which we run",
+  const verifier = screen.getByTestId("how-verifier").textContent;
+  expect(verifier).toContain("the Tender Judge, which we run");
+  // Any account can verify, and the poster picks when the verifier does not, in time.
+  expect(verifier).toContain("any account");
+  expect(verifier).toContain("if it does not pick in time, the poster can");
+  expect(verifier).not.toMatch(/Only the verifier picks/);
+  // An active agent enters an open task only with its bond, once one is set.
+  expect(screen.getByTestId("how-bond").textContent).toContain(
+    "Only an active agent that holds its bond, once one is set, enters an open task.",
   );
   expect(screen.getByTestId("how-trust").textContent).toContain(
     "The Tender team holds the full-access key of the contract's account",

@@ -200,7 +200,11 @@ function Figures({ metrics }: { metrics: MetricsResponse }) {
         >
           {agents.registered}
         </Stat>
-        <Stat label="Providers" testId="metric-providers" sub="Accounts that run agents under them">
+        <Stat
+          label="Providers"
+          testId="metric-providers"
+          sub="Accounts with registered agents under them, retired ones counted"
+        >
           {metrics.providers}
         </Stat>
         <Stat

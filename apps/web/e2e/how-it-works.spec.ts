@@ -25,7 +25,9 @@ test("how_it_works_is_at_the_sidebar_s_foot_and_reads_the_fee_from_the_contract"
   await expect(page).toHaveURL("/how-it-works", { timeout: 20_000 });
   await expect(how).toHaveAttribute("aria-current", "page");
 
-  await expect(page.getByTestId("fee")).toHaveText("5% of a reward, taken when it is paid out.");
+  await expect(page.getByTestId("fee")).toHaveText(
+    "5% of the reward of a task posted now, taken when it is paid out.",
+  );
   await expect(page.getByTestId("bond")).toContainText("5.00 tUSDC");
   await expect(page.getByRole("tab")).toHaveCount(5);
   expect(await pageFits(page)).toBe(0);

@@ -2,7 +2,7 @@ import { NETWORKS } from "@tender/shared";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, test, vi } from "vitest";
-import { Amount } from "../components/Amount";
+import { Amount, RawUnits } from "../components/Amount";
 import { ErrorState } from "../components/ErrorState";
 import { Nav } from "../components/Nav";
 import { TaskCard } from "../components/TaskCard";
@@ -171,6 +171,29 @@ test("task_card_labels_an_unknown_token_as_the_live_panel_does_and_never_breaks_
   expect(raw.textContent).not.toContain(`${MAX} ${IMPLICIT}`);
   expect(knowsToken(IMPLICIT)).toBe(false);
   expect(knowsToken(USDC_TESTNET)).toBe(true);
+});
+
+test("raw_units_cut_a_long_number_in_the_middle_visibly_and_keep_every_digit_in_the_page", () => {
+  const MAX = "340282366920938463463374607431768211455";
+  render(<RawUnits value={MAX} token="mystery.token.near" amountTestId="raw" />);
+  const amount = screen.getByTestId("raw");
+  // Every digit is in the page, for a screen reader, and in the tooltip.
+  expect(amount.textContent).toBe(MAX);
+  expect(amount.getAttribute("title")).toBe(MAX);
+  // The head gives way with a visible "…" (CSS), and the last six digits always show.
+  const head = screen.getByTestId("raw-head");
+  expect(head.className).toContain("text-ellipsis");
+  expect(head.className).toContain("overflow-hidden");
+  expect(head.textContent).toBe(MAX.slice(0, -6));
+  expect(head.nextElementSibling?.textContent).toBe("211455");
+  expect(head.nextElementSibling?.className).toContain("shrink-0");
+  // Never a scroller that cuts it off at the edge, and never a wrap in the middle.
+  expect(amount.className).not.toMatch(/overflow-x-auto|wrap-anywhere/);
+
+  // A short amount is shown as it is, with nothing to cut.
+  render(<RawUnits value="42" token="mystery.token.near" amountTestId="short" />);
+  expect(screen.getByTestId("short").textContent).toBe("42");
+  expect(screen.getByTestId("short").children).toHaveLength(0);
 });
 
 // ---- Nav --------------------------------------------------------------------------------------

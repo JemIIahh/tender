@@ -39,10 +39,10 @@ function Dot({ state }: { state: LiveState }) {
 
 /**
  * One token's amount in escrow, on a line of its own. A number never breaks: it is one unbroken
- * run of figures (the panel is wide enough for the largest u128 at this size, and it scrolls
- * sideways on its own line before it would wrap). A token the app knows has its symbol after the
- * number. One it does not know shows the amount as the contract holds it, labelled as a board card
- * labels it (`RawUnits`).
+ * run of figures (the panel is wide enough for the largest u128 at this size). A token the app
+ * knows has its symbol after the number. One it does not know shows the amount as the contract
+ * holds it, labelled, and cut in the middle with a visible "…" on a line too narrow for it, as a
+ * board card shows it (`RawUnits`).
  */
 function EscrowLine({ token, amount }: { token: string; amount: bigint }) {
   if (!knowsToken(token)) {

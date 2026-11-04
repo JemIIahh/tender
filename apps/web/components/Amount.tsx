@@ -55,12 +55,20 @@ export function Amount({
   );
 }
 
+/** How many of a raw amount's last digits always show, however narrow its line. */
+const TAIL_DIGITS = 6;
+
 /**
- * An amount in a token this app has no decimals for (`knowsToken`), as the Live panel and a board
- * card show it: the amount as the contract holds it, and under it a label that says so, "smallest
- * units of" and the token's account, its middle left out when it is long. The number is one
- * unbroken run of figures that never wraps in the middle: on a line too narrow for it, it scrolls
- * sideways on its own line. The whole id is the label's title, and is what a screen reader reads.
+ * An amount in a token this app has no decimals for (`knowsToken`), as the Live panel, a board card,
+ * Metrics and Activity show it: the amount as the contract holds it, and under it a label that says
+ * so, "smallest units of" and the token's account, its middle left out when it is long.
+ *
+ * The number is one run of figures that never wraps. On a line too narrow for all of it, it is cut
+ * in the middle, visibly: its first digits as far as they fit, a "…", and always its last six. It
+ * is never cut off silently at the line's edge, where the digits that are left would read as
+ * another number. The "…" is drawn by CSS (`text-overflow`): every digit stays in the page, so a
+ * screen reader reads the whole number, and so does the tooltip (`title`). The whole id is the
+ * label's title, and is what a screen reader reads of it.
  */
 export function RawUnits({
   value,
@@ -77,15 +85,26 @@ export function RawUnits({
   label?: string;
 }) {
   const short = shortId(token);
+  const cut = value.length > TAIL_DIGITS * 2;
   return (
     <span className="grid min-w-0 gap-0.5">
       <span className="flex min-w-0 font-mono tabular-nums">
         {label === undefined ? null : <span className="sr-only">{label} </span>}
         <span
           data-testid={amountTestId}
-          className="inline-block max-w-full overflow-x-auto align-bottom whitespace-nowrap"
+          title={value}
+          className="flex max-w-full min-w-0 whitespace-nowrap"
         >
-          {value}
+          {cut ? (
+            <>
+              <span data-testid="raw-head" className="min-w-0 overflow-hidden text-ellipsis">
+                {value.slice(0, -TAIL_DIGITS)}
+              </span>
+              <span className="shrink-0">{value.slice(-TAIL_DIGITS)}</span>
+            </>
+          ) : (
+            value
+          )}
         </span>
       </span>
       <span data-testid={unitTestId} className="text-[11.5px] text-muted">

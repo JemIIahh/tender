@@ -267,7 +267,9 @@ test("activity_feed_keeps_each_event_once_newest_first_and_at_most_its_cap", () 
 interface Api {
   backlog: RecentEvent[];
   newest: string;
+  /** The services, one page; or `pages`, page after page. */
   services: Array<Partial<Service>>;
+  pages?: Array<Array<Partial<Service>>>;
   failing: boolean;
   requests: string[];
 }
@@ -281,9 +283,11 @@ function serve(api: Api): void {
       return json({ events: api.backlog, newest: api.newest });
     }
     if (url.pathname === "/v1/services") {
+      const at = Number(url.searchParams.get("cursor") ?? "0");
+      const pages = api.pages ?? [api.services];
       return json({
-        services: api.services.map((one) => ({ ...SERVICE, ...one })),
-        next_cursor: null,
+        services: (pages[at] ?? []).map((one) => ({ ...SERVICE, ...one })),
+        next_cursor: at + 1 < pages.length ? String(at + 1) : null,
       });
     }
     if (url.pathname === "/v1/tasks/3") {
@@ -493,4 +497,29 @@ test("activity_says_when_nothing_has_happened_and_when_the_backlog_cannot_be_rea
   const empty = await screen.findByTestId("activity-empty");
   expect(empty.textContent).toContain("Nothing has happened yet");
   expect(FakeEventSource.latest.url).toBe("http://api.test/v1/events?since=0");
+});
+
+test("activity_reads_the_services_page_after_page_up_to_five", async () => {
+  // A paused service of another agent on each page, and writer's Judge-checked one on page 2: the
+  // hire of it (task 4 of the backlog) is told as a hire.
+  const other = { agent: "other.testnet", status: "paused" as const };
+  const api = apiOf({ pages: [[other], [{}], [other]] });
+  open(api);
+  await screen.findByTestId("activity");
+  expect(lines()[2]?.getAttribute("data-kind")).toBe("hired");
+  expect(api.requests.filter((request) => request.startsWith("/v1/services"))).toEqual([
+    "/v1/services?status=all&limit=50",
+    "/v1/services?status=all&limit=50&cursor=1",
+    "/v1/services?status=all&limit=50&cursor=2",
+  ]);
+});
+
+test("activity_stops_at_five_pages_of_services_and_says_only_what_it_knows", async () => {
+  // Writer's service is on the sixth page, which is not read: the hire reads as a task posted.
+  const other = { agent: "other.testnet", status: "paused" as const };
+  const api = apiOf({ pages: [[other], [other], [other], [other], [other], [{}]] });
+  open(api);
+  await screen.findByTestId("activity");
+  expect(lines()[2]?.getAttribute("data-kind")).toBe("posted");
+  expect(api.requests.filter((request) => request.startsWith("/v1/services"))).toHaveLength(5);
 });
