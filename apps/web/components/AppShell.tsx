@@ -14,9 +14,9 @@ import {
 } from "react";
 import { restoreSidebar, setRail, sidebarStore } from "../lib/sidebar";
 import { walletStore } from "../lib/wallet";
+import { LiveStatus } from "./LiveStatus";
 import { Mark } from "./Mark";
 import { Nav, type TipHandlers } from "./Nav";
-import { PlatformStats } from "./PlatformStats";
 import { PRIMARY, SECONDARY } from "./ui";
 
 /** The pills of the top bar: the landing's, a little smaller so that both fit a phone. */
@@ -118,20 +118,21 @@ function PanelIcon() {
 const FADE = "transition-[opacity,visibility] duration-200 motion-reduce:transition-none";
 
 /**
- * The frame of every page after the landing: a sidebar with the pages and a few live figures, a
- * top bar with "Post task" and the way to the wallet (the connected account, once a page has
- * connected one), and the page itself. On a phone the sidebar is a menu that the top bar opens,
- * over the page, and that closes when a page is chosen.
+ * The frame of every page after the landing: a sidebar with the pages, a top bar with the Live
+ * pill (components/LiveStatus: whether the index is up to date, and a few figures behind it),
+ * "Post task" and the way to the wallet (the connected account, once a page has connected one),
+ * and the page itself. On a phone the sidebar is a menu that the top bar opens, over the page, and
+ * that closes when a page is chosen.
  *
  * From laptop width up, the button at the head of the sidebar, or ⌘B (Ctrl+B), makes the sidebar a
  * narrow rail of icons and back (lib/sidebar.ts keeps the choice). On the rail each icon has its
- * name in a tooltip, the live figures are put away, and Tender's mark moves to the top bar. The
- * shortcut is left to a text field that has the focus, where ⌘B is the field's.
+ * name in a tooltip, and Tender's mark moves to the top bar. The shortcut is left to a text field
+ * that has the focus, where ⌘B is the field's.
  *
  * The top bar comes first in the document, so that on a phone the open menu comes after the top bar
- * in the keyboard's order: the button that opened it, the wordmark and the two pills, then the
- * menu. While the menu is open the page under it is inert, so the keyboard cannot reach what the
- * menu covers; Escape closes it and gives the focus back to the button.
+ * in the keyboard's order: the button that opened it, the wordmark and the pills, then the menu.
+ * While the menu is open the page under it is inert, so the keyboard cannot reach what the menu
+ * covers; Escape closes it and gives the focus back to the button.
  */
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
@@ -316,18 +317,21 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Wordmark />
         </div>
         <div className="ml-auto flex items-center gap-2">
+          <LiveStatus />
           <Link href="/post" className={`${PRIMARY} ${BAR_PILL}`}>
             Post task
           </Link>
+          {/* On a phone the Live dot takes some of the bar, so the pill says "Connect", and an
+              account is cut a little shorter; the names and the title are whole. */}
           {accountId === null ? (
-            <Link href="/wallet" className={`${SECONDARY} ${BAR_PILL}`}>
-              Connect wallet
+            <Link href="/wallet" aria-label="Connect wallet" className={`${SECONDARY} ${BAR_PILL}`}>
+              Connect<span className="max-sm:hidden">{"\u00a0"}wallet</span>
             </Link>
           ) : (
             <Link
               href="/wallet"
               title={accountId}
-              className={`${SECONDARY} ${BAR_PILL} max-w-[10rem] sm:max-w-60`}
+              className={`${SECONDARY} ${BAR_PILL} max-w-[7.5rem] sm:max-w-60`}
             >
               <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-seal" />
               {/* The account as it is written: an account id is lower case. */}
@@ -368,16 +372,6 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
         </div>
         <Nav tip={linkTip} />
-        {/* The figures need the sidebar's width to be read: the rail puts them away. They keep that
-            width while the sidebar narrows, cut off by their box, so their lines do not rewrap. */}
-        <div
-          data-testid="sidebar-stats"
-          className={`mt-auto min-w-0 overflow-hidden ${FADE} lg:rail:invisible lg:rail:opacity-0`}
-        >
-          <div className="lg:w-54">
-            <PlatformStats />
-          </div>
-        </div>
       </aside>
 
       {/* Under the open menu, the page is out of reach of the keyboard and the pointer alike. */}

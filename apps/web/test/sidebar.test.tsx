@@ -337,10 +337,13 @@ test("sidebar_wordmark_moves_to_the_top_bar_and_a_focus_on_it_is_not_lost", asyn
   expect(document.activeElement).toBe(toggle());
 });
 
-test("sidebar_rail_puts_the_live_figures_away", () => {
+test("sidebar_holds_the_pages_and_no_figures", async () => {
+  // The platform's figures are behind the top bar's Live pill (live-status.test.tsx), not here.
   shell();
-  // The figures are under the nav, in a block that the rail hides (CSS: invisible, faded).
-  const stats = screen.getByTestId("sidebar-stats");
-  expect(stats.className).toContain("lg:rail:invisible");
-  expect(stats.closest("aside")).toBeTruthy();
+  const sidebar = document.querySelector("aside");
+  expect(sidebar?.querySelector('[data-testid="sidebar-stats"]')).toBeNull();
+  expect(sidebar?.textContent).not.toMatch(/Live on Tender|Open tasks|In escrow/i);
+  // The pill is in the top bar, once the API has been asked.
+  const pill = await within(screen.getByRole("banner")).findByRole("button", { name: /^Status: / });
+  expect(sidebar?.contains(pill)).toBe(false);
 });

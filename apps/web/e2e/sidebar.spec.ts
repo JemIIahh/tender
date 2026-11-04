@@ -41,7 +41,7 @@ test("sidebar_becomes_a_rail_and_back_and_the_mark_moves_to_the_top_bar", async 
     "aria-current",
     "page",
   );
-  // The words are faded out, and the live figures put away.
+  // The words are faded out.
   await expect
     .poll(() =>
       nav(page)
@@ -49,7 +49,6 @@ test("sidebar_becomes_a_rail_and_back_and_the_mark_moves_to_the_top_bar", async 
         .evaluate((element) => getComputedStyle(element).opacity),
     )
     .toBe("0");
-  await expect(page.getByTestId("sidebar-stats")).toBeHidden();
   // Nothing in the sidebar is wider than the rail, so nothing can scroll it sideways.
   expect(await sidebar(page).evaluate((element) => element.scrollWidth - element.clientWidth)).toBe(
     0,
@@ -136,12 +135,11 @@ test("sidebar_change_is_instant_with_reduced_motion", async ({ page }) => {
   const animated = await page.evaluate(() =>
     [
       document.querySelector(".app"),
-      document.querySelector('[data-testid="sidebar-stats"]'),
       document.querySelector('[data-testid="side-wordmark"]'),
       document.querySelector('nav[aria-label="Main"] a span'),
     ].map((element) => getComputedStyle(element as Element).transitionProperty),
   );
-  expect(animated).toEqual(["none", "none", "none", "none"]);
+  expect(animated).toEqual(["none", "none", "none"]);
 });
 
 test("sidebar_on_a_phone_is_the_menu_and_has_no_rail", async ({ page }) => {
