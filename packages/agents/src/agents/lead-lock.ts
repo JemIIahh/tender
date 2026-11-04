@@ -5,6 +5,7 @@ import {
   linkSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -19,7 +20,9 @@ import { dirname, join, resolve } from "node:path";
 // holding its pid, the time it started, and a random token by which the holder tells its own file
 // from another's. The file is written whole under a name of its own first (made with O_EXCL, the
 // `wx` flag, and synced), and then linked to the lock's name: a link fails if the name is taken, so
-// only one lead can make it, and the lock is never seen half written.
+// only one lead can make it, and the lock is never seen half written. So the journal directory's
+// file system must support hard links (FAT and some network and FUSE mounts do not): on one that
+// does not, `run` fails at its start, and says so.
 //
 // - A second lead on the journal refuses to start, and its message names the pid that holds it.
 // - A lock whose pid is not alive is a leftover (a lead that was killed runs nothing): it is taken
@@ -30,9 +33,13 @@ import { dirname, join, resolve } from "node:path";
 //   lock in the moment between the move and the link back can leave two leads with the journal, and
 //   the one that lost its file stands back at its next pass (`journalHeldElsewhere`).
 // - A pid can come back as another process's, and then the lock looks held: the message says to
-//   delete the file in that case.
+//   delete the file in that case. Pids are judged on this host alone: leads on two hosts, or two
+//   containers, that share a journal are not told apart, so each host gets a journal of its own.
 // - A file that names no process is refused: no lead made it (a lead writes its lock whole), or it
 //   was damaged.
+// - The files a lead makes beside the lock while it takes it (the lock written whole, a leftover
+//   moved aside) carry its pid in their names. A lead killed in that moment leaves them behind, and
+//   the next lead to take the lock removes those of a pid that is not alive.
 // - The lock goes when the lead lets it go, when the process exits (`process.exit`, or the end of
 //   its work), and on SIGINT and SIGTERM. For those two: when the process has no other handler for
 //   the signal, which would then end it at once, the lock is let go and the signal is raised again,
@@ -116,6 +123,22 @@ function readLock(file: string): string | undefined {
 
 const codeOf = (error: unknown) => (error as NodeJS.ErrnoException).code;
 
+/** What a link fails with on a file system that has no hard links, or will not make one there. */
+const NO_HARD_LINKS: ReadonlySet<string> = new Set([
+  "EPERM",
+  "ENOTSUP",
+  "EOPNOTSUPP",
+  "EXDEV",
+  "ENOSYS",
+]);
+
+/**
+ * The files the lock makes beside itself while a lead takes it: the lock written whole (`.tmp`) and a
+ * leftover moved aside (`.stale`), with the pid of the lead that made them and a random token.
+ */
+const BESIDE_THE_LOCK =
+  /^\.lead\.lock\.([1-9][0-9]*)\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.(?:tmp|stale)$/;
+
 /** Writes `text` to a new file `file` (O_EXCL), and syncs it, so that what is linked to it is whole. */
 function writeWhole(file: string, text: string): void {
   const fd = openSync(file, "wx", 0o600);
@@ -130,14 +153,48 @@ function writeWhole(file: string, text: string): void {
   closeSync(fd);
 }
 
-/** Links `from` to the name `to`, if no file has that name. Returns whether it did. */
+/**
+ * Links `from` to the name `to`, if no file has that name. Returns whether it did. A file system
+ * that makes no hard links is said in plain words, and not as the system's error, which names two
+ * paths and a code.
+ */
 function linkIfFree(from: string, to: string): boolean {
   try {
     linkSync(from, to);
     return true;
   } catch (error) {
-    if (codeOf(error) === "EEXIST") return false;
+    const code = codeOf(error);
+    if (code === "EEXIST") return false;
+    if (code !== undefined && NO_HARD_LINKS.has(code)) {
+      throw new Error(
+        `the journal directory's file system must support hard links: the lead takes the lock of ` +
+          `${dirname(to)} by linking a file it wrote whole, and the link failed (${code})`,
+      );
+    }
     throw error;
+  }
+}
+
+/**
+ * Removes the files a lead that was killed while it took the lock left beside it
+ * (`BESIDE_THE_LOCK`), those of a pid that is not alive and is not this process. They are harmless
+ * (the journal reads `<id>.json` only), so this is best effort: a file that cannot be removed is left.
+ */
+function sweep(journal: string): void {
+  let names: string[];
+  try {
+    names = readdirSync(journal);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const pid = Number(BESIDE_THE_LOCK.exec(name)?.[1]);
+    if (!Number.isSafeInteger(pid) || pid === process.pid || alive(pid)) continue;
+    try {
+      rmSync(join(journal, name), { force: true });
+    } catch {
+      // Left for the next lead to try.
+    }
   }
 }
 
@@ -192,9 +249,11 @@ function makeDirectory(dir: string): void {
 }
 
 /**
- * Takes the lock of the journal `dir` for this process, making the directory if it is not there.
- * Throws a `JournalLockedError` when a live process holds it, this one included, or when its lock
- * file names no process. A leftover lock is taken over, and `log` is told. See the top of the file.
+ * Takes the lock of the journal `dir` for this process, making the directory if it is not there,
+ * and first removes what dead leads left beside the lock (`sweep`). Throws a `JournalLockedError`
+ * when a live process holds it, this one included, or when its lock file names no process, and an
+ * error that says so when the directory's file system makes no hard links. A leftover lock is taken
+ * over, and `log` is told. See the top of the file.
  */
 export function lockJournal(dir: string, log: (line: string) => void): JournalLock {
   if (dir === "") throw new Error("the lead's journal directory must not be empty");
@@ -215,9 +274,11 @@ export function lockJournal(dir: string, log: (line: string) => void): JournalLo
     token,
   })}\n`;
   // Names of this lead's own, which no other lead uses: the lock written whole, and a leftover
-  // moved aside. Neither ends in `.json`, so the journal never takes one for a job.
-  const whole = join(journal, `.${JOURNAL_LOCK_FILE}.${token}.tmp`);
-  const aside = join(journal, `.${JOURNAL_LOCK_FILE}.${token}.stale`);
+  // moved aside (`BESIDE_THE_LOCK`). Neither ends in `.json`, so the journal never takes one for a
+  // job.
+  const whole = join(journal, `.${JOURNAL_LOCK_FILE}.${process.pid}.${token}.tmp`);
+  const aside = join(journal, `.${JOURNAL_LOCK_FILE}.${process.pid}.${token}.stale`);
+  sweep(journal);
   writeWhole(whole, text);
   try {
     let leftover: JournalHolder | undefined;

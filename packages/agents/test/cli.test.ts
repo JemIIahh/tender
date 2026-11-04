@@ -79,7 +79,7 @@ const LLM_ENV: Record<string, string> = {
 const ARGS = ["--agent", "analyst", "--solver", "offline", "--network", "testnet"];
 const LLM_ARGS = ["--agent", "analyst", "--solver", "llm", "--network", "testnet"];
 const USAGE =
-  "usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent analyst|coder|extractor --solver llm|offline|weak --network sandbox|testnet|mainnet [--max-llm-calls-per-hour N] [--verifiers judge|any|<account>,...] [--min-reward <token>=<amount>]... [--daily-entries N] [--max-voids-after-reveals N]";
+  "usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent analyst|coder|extractor --solver llm|offline|weak --network sandbox|testnet|mainnet [--max-llm-calls-per-hour N] [--verifiers judge|any|<account>,...] [--min-reward <token>=<amount>]... [--daily-entries N] [--daily-judged-hires N] [--max-voids-after-reveals N]";
 const KEY_COMMAND =
   "pnpm exec tsx scripts/keeper-key.ts --network testnet --role agent --agent analyst";
 
@@ -876,7 +876,7 @@ test("policy_an_agent_with_a_model_takes_the_judges_tasks_only_20_a_day_and_none
     env: { ...ENV, ...LLM_ENV },
     config: async () => configView({ tokens: TOKENS }),
     loop: async (options) => {
-      await options.entryCounts?.write("2026-11-04", 3);
+      await options.entryCounts?.write("2026-11-04", { entries: 3, judgedHires: 1 });
     },
   });
 
@@ -887,10 +887,15 @@ test("policy_an_agent_with_a_model_takes_the_judges_tasks_only_20_a_day_and_none
     judgeAccount: JUDGE_ACCOUNT,
     minReward: { "usdc.testnet": 10_000n, "tusdc.tender.testnet": 1n },
     dailyEntries: 20,
+    dailyJudgedHires: 50,
   });
   // The count of the day is kept in the agent's state directory, beside its drafts.
   const file = join(result.home, ".tender", "testnet", ACCOUNT, ENTRY_COUNTS_FILE);
-  expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ day: "2026-11-04", entries: 3 });
+  expect(JSON.parse(await readFile(file, "utf8"))).toEqual({
+    day: "2026-11-04",
+    entries: 3,
+    judgedHires: 1,
+  });
   // The chain's least rewards are read once the key is checked, and before anything else starts.
   expect(result.calls).toEqual([
     "makeClient",
@@ -969,6 +974,8 @@ test("policy_the_flags_set_the_policy_over_the_defaults_of_the_solver", async ()
     "other.testnet=5",
     "--daily-entries",
     "5",
+    "--daily-judged-hires",
+    "7",
     "--max-voids-after-reveals",
     "0",
   ];
@@ -983,6 +990,16 @@ test("policy_the_flags_set_the_policy_over_the_defaults_of_the_solver", async ()
     minReward: { "usdc.testnet": 2_000_000n, "tusdc.tender.testnet": 1n, "other.testnet": 5n },
     maxVoidsAfterReveals: 0,
     dailyEntries: 5,
+    dailyJudgedHires: 7,
+  });
+
+  // Without the flag, an agent with a model takes 50 hires the Judge checks a day.
+  const fewer = await start([...LLM_ARGS, "--daily-entries", "5"], {
+    env: { ...ENV, ...LLM_ENV },
+  });
+  expect(fewer.loop.mock.calls[0]?.[0].policy).toMatchObject({
+    dailyEntries: 5,
+    dailyJudgedHires: 50,
   });
 
   // A scripted agent takes them as they are, and reads nothing of the chain for them.
@@ -996,6 +1013,11 @@ test("policy_the_flags_set_the_policy_over_the_defaults_of_the_solver", async ()
   });
   expect(options?.entryCounts).toBeDefined();
   expect(scripted.getConfig).not.toHaveBeenCalled();
+
+  // The cap of the hires the Judge checks alone also keeps a count.
+  const judged = await start([...ARGS, "--daily-judged-hires", "2"]);
+  expect(judged.loop.mock.calls[0]?.[0].policy).toEqual({ verifiers: "any", dailyJudgedHires: 2 });
+  expect(judged.loop.mock.calls[0]?.[0].entryCounts).toBeDefined();
 });
 
 test("policy_a_flag_of_the_policy_that_cannot_be_read_is_a_usage_error_that_quotes_nothing", () => {
@@ -1017,6 +1039,8 @@ test("policy_a_flag_of_the_policy_that_cannot_be_read_is_a_usage_error_that_quot
     ],
     [["--daily-entries", "0"], "--daily-entries must be a whole number from 1"],
     [["--daily-entries", "SECRET-8"], "--daily-entries must be a whole number from 1"],
+    [["--daily-judged-hires", "0"], "--daily-judged-hires must be a whole number from 1"],
+    [["--daily-judged-hires", "SECRET-8"], "--daily-judged-hires must be a whole number from 1"],
     // Written with `=`: node refuses a value that starts with a dash as a separate argument.
     [["--max-voids-after-reveals=-1"], "--max-voids-after-reveals must be a whole number from 0"],
     [["--max-voids-after-reveals=1.5"], "--max-voids-after-reveals must be a whole number from 0"],

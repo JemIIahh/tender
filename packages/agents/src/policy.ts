@@ -12,8 +12,12 @@ import { basename, dirname, join } from "node:path";
 // already (the price, the checker), so it is not held to the least reward or to the verifiers. It
 // counts toward the daily cap all the same, as its solve costs the same. A hire that its hirer
 // checks is the same free-work path again (the hirer is its verifier, and can pick nobody), so it is
-// held to the hirer's record (`maxVoidsAfterReveals`) and to the cap; a hire the Judge checks is not
-// held back by either.
+// held to the hirer's record (`maxVoidsAfterReveals`) and to the cap. A hire the Judge checks is
+// one too, if less plainly: a hirer can ask for a delivery that fails the service's criteria, and
+// then the Judge picks nobody, the hirer is refunded, and has read the delivery. So it has a daily
+// cap of its own (`dailyJudgedHires`), and is not held back by the other.
+//
+// Every cap fails closed: a count that cannot be read, or written, takes on nothing that it counts.
 
 /**
  * Who may check the work the agent enters: `"judge"`, the Judge that the API serves
@@ -43,21 +47,32 @@ export interface EntryPolicy {
    * and every hire counts. The count is kept on the disk (`EntryCounts`), so that a restart does
    * not reset it. Once the day is full, a task of the agent's tags waits for the next day; a hire
    * its hirer checks is refused for good (a wait would only let it be voided, and its hirer is
-   * refunded); a hire the Judge checks is taken on all the same, as it is when the count cannot be
-   * read. Default: no cap.
+   * refunded). A hire the Judge checks is not held back by it (`dailyJudgedHires` caps those).
+   * Default: no cap.
    */
   dailyEntries?: number;
+  /**
+   * The most hires the Judge checks that the agent takes on in a UTC day, kept on the disk with the
+   * other count. One over it is refused for good (the void refunds its hirer). Default: no cap.
+   */
+  dailyJudgedHires?: number;
+}
+
+/** What the agent took on in a day: every task and hire, and the hires the Judge checks among them. */
+export interface DayCount {
+  entries: number;
+  judgedHires: number;
 }
 
 /**
- * Where an agent keeps the count of the tasks it took on today, for `dailyEntries`. One process
+ * Where an agent keeps its count of the day, for `dailyEntries` and `dailyJudgedHires`. One process
  * writes it: the agent's own, as with its drafts.
  */
 export interface EntryCounts {
-  /** How many tasks the agent took on in `day` (a UTC date, `YYYY-MM-DD`): 0 if the count is of another day. */
-  read(day: string): Promise<number>;
-  /** Records `count` as the tasks of `day`, and returns once that is on the disk. */
-  write(day: string, count: number): Promise<void>;
+  /** What the agent took on in `day` (a UTC date, `YYYY-MM-DD`): nothing if the count is of another day. */
+  read(day: string): Promise<DayCount>;
+  /** Records `count` as the count of `day`, both numbers at once, and returns once it is on the disk. */
+  write(day: string, count: DayCount): Promise<void>;
 }
 
 /** The file in an agent's state directory that holds its count of the day (`createEntryCounts`). */
@@ -73,11 +88,12 @@ const isCount = (value: unknown): value is number =>
   Number.isSafeInteger(value) && Number(value) >= 0;
 
 /**
- * The count of the day in `file`, a JSON file of its own: `{"day": "2026-11-04", "entries": 3}`.
- * A missing file is a count of 0. A file that is not a count fails the read, and the runner then
- * enters no task until it can be read: a count it cannot read is a cap it cannot keep. A write is
- * made so that a crash leaves the old count or the new one, and once it returns the new one is on
- * the disk (a temp file synced, renamed over the file, and the directory synced).
+ * The count of the day in `file`, a JSON file of its own:
+ * `{"day": "2026-11-04", "entries": 3, "judgedHires": 1}`. A missing file is a count of nothing. A
+ * file that is not a count fails the read, and the runner then takes on nothing that it counts
+ * until it can be read: a count it cannot read is a cap it cannot keep. A write is made so that a
+ * crash leaves the old count or the new one, and once it returns the new one is on the disk (a temp
+ * file synced, renamed over the file, and the directory synced).
  */
 export function createEntryCounts(file: string): EntryCounts {
   if (file === "") throw new Error("the file of the entry counts must not be empty");
@@ -87,7 +103,8 @@ export function createEntryCounts(file: string): EntryCounts {
       try {
         text = await readFile(file, "utf8");
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+        if ((error as NodeJS.ErrnoException).code === "ENOENT")
+          return { entries: 0, judgedHires: 0 };
         throw error;
       }
       let json: unknown;
@@ -96,15 +113,25 @@ export function createEntryCounts(file: string): EntryCounts {
       } catch {
         throw new Error(`the entry count file ${file} is corrupt: it is not valid JSON`);
       }
-      const { day: kept, entries } = (json ?? {}) as { day?: unknown; entries?: unknown };
-      if (typeof kept !== "string" || !DAY.test(kept) || !isCount(entries)) {
+      const kept = (json ?? {}) as { day?: unknown; entries?: unknown; judgedHires?: unknown };
+      if (
+        typeof kept.day !== "string" ||
+        !DAY.test(kept.day) ||
+        !isCount(kept.entries) ||
+        !isCount(kept.judgedHires)
+      ) {
         throw new Error(`the entry count file ${file} is corrupt: it is not a day's count`);
       }
-      return kept === day ? entries : 0;
+      return kept.day === day
+        ? { entries: kept.entries, judgedHires: kept.judgedHires }
+        : { entries: 0, judgedHires: 0 };
     },
     async write(day, count) {
-      if (!DAY.test(day) || !isCount(count)) throw new RangeError("not a day's count");
-      await writeFileAtomic(file, `${JSON.stringify({ day, entries: count })}\n`);
+      if (!DAY.test(day) || !isCount(count.entries) || !isCount(count.judgedHires)) {
+        throw new RangeError("not a day's count");
+      }
+      const text = JSON.stringify({ day, entries: count.entries, judgedHires: count.judgedHires });
+      await writeFileAtomic(file, `${text}\n`);
     },
   };
 }
@@ -146,7 +173,7 @@ async function writeFileAtomic(file: string, text: string): Promise<void> {
  * limits, and `counts` for a daily cap.
  */
 export function checkPolicy(policy: EntryPolicy, counts: EntryCounts | undefined): void {
-  const { verifiers = "any", judgeAccount, minReward, maxVoidsAfterReveals, dailyEntries } = policy;
+  const { verifiers = "any", judgeAccount, minReward, maxVoidsAfterReveals } = policy;
   if (Array.isArray(verifiers)) {
     if (
       verifiers.length === 0 ||
@@ -172,12 +199,14 @@ export function checkPolicy(policy: EntryPolicy, counts: EntryCounts | undefined
   if (maxVoidsAfterReveals !== undefined && !isCount(maxVoidsAfterReveals)) {
     throw new RangeError("policy.maxVoidsAfterReveals must be a whole number, at least 0");
   }
-  if (dailyEntries !== undefined) {
-    if (!isCount(dailyEntries) || dailyEntries < 1) {
-      throw new RangeError("policy.dailyEntries must be a whole number, at least 1");
+  for (const cap of ["dailyEntries", "dailyJudgedHires"] as const) {
+    const most = policy[cap];
+    if (most === undefined) continue;
+    if (!isCount(most) || most < 1) {
+      throw new RangeError(`policy.${cap} must be a whole number, at least 1`);
     }
     if (counts === undefined) {
-      throw new TypeError("policy.dailyEntries needs entryCounts, where the day's count is kept");
+      throw new TypeError(`policy.${cap} needs entryCounts, where the day's count is kept`);
     }
   }
 }
@@ -214,7 +243,8 @@ export function policyRefusal(policy: EntryPolicy, task: PolicyTask): string | n
 
 /** The policy in one line of the log, by the names of its fields. */
 export function describePolicy(policy: EntryPolicy): string {
-  const { minReward, verifiers = "any", judgeAccount, maxVoidsAfterReveals, dailyEntries } = policy;
+  const { minReward, verifiers = "any", judgeAccount, maxVoidsAfterReveals } = policy;
+  const { dailyEntries, dailyJudgedHires } = policy;
   const who =
     verifiers === "judge"
       ? `judge (${judgeAccount})`
@@ -229,5 +259,6 @@ export function describePolicy(policy: EntryPolicy): string {
     `minReward=${floors === "" ? "none" : floors}`,
     `maxVoidsAfterReveals=${maxVoidsAfterReveals ?? "none"}`,
     `dailyEntries=${dailyEntries ?? "none"}`,
+    `dailyJudgedHires=${dailyJudgedHires ?? "none"}`,
   ].join(" ");
 }

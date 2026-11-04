@@ -271,7 +271,8 @@ export interface LeadSolver extends Solver {
    * time) and passes every `pollMs` until `signal` aborts. It resolves once the pass in hand is done
    * and the journal is let go. It rejects at once, having done nothing, with a `JournalLockedError`
    * when another lead holds the journal: one in another process (the message names its pid) or in
-   * this one.
+   * this one. The journal directory's file system must support hard links, as the lock is linked
+   * into place; on one that does not, it rejects at once and says so.
    */
   run(signal: AbortSignal): Promise<void>;
   /** The parents the lead has a job for that is not over. */

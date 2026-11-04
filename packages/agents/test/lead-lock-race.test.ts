@@ -15,6 +15,8 @@ const hooks = vi.hoisted(() => ({
   beforeRename: undefined as undefined | (() => void),
   /** Runs once, before the next link whose source is a leftover moved aside. */
   beforeLinkBack: undefined as undefined | (() => void),
+  /** The code the next link fails with, as on a file system that makes no hard links. */
+  linkFails: undefined as undefined | string,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -28,6 +30,11 @@ vi.mock("node:fs", async (importOriginal) => {
       real.renameSync(from, to);
     },
     linkSync: (from: string, to: string) => {
+      const code = hooks.linkFails;
+      hooks.linkFails = undefined;
+      if (code !== undefined) {
+        throw Object.assign(new Error(`${code}: link '${from}' -> '${to}'`), { code });
+      }
       if (String(from).endsWith(".stale")) {
         const hook = hooks.beforeLinkBack;
         hooks.beforeLinkBack = undefined;
@@ -48,6 +55,7 @@ beforeEach(() => {
 afterEach(() => {
   hooks.beforeRename = undefined;
   hooks.beforeLinkBack = undefined;
+  hooks.linkFails = undefined;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -94,5 +102,29 @@ describe("two leads take over the same leftover lock", () => {
     expect((refused as JournalLockedError).pid).toBe(1);
     expect(readFileSync(file, "utf8")).toBe(third);
     expect(readdirSync(dir)).toEqual([JOURNAL_LOCK_FILE]);
+  });
+
+  test("a_file_system_that_makes_no_hard_links_is_said_in_plain_words", () => {
+    for (const code of ["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENOSYS"]) {
+      hooks.linkFails = code;
+      let failure: unknown;
+      try {
+        lockJournal(dir, () => undefined).release();
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure, code).toBeInstanceOf(Error);
+      expect(failure, code).not.toBeInstanceOf(JournalLockedError);
+      expect((failure as Error).message, code).toBe(
+        "the journal directory's file system must support hard links: the lead takes the lock of " +
+          `${dir} by linking a file it wrote whole, and the link failed (${code})`,
+      );
+      // Nothing is left: no lock, and not the file it was written to.
+      expect(readdirSync(dir), code).toEqual([]);
+    }
+    // Any other failure of the link is the system's own, as it is.
+    hooks.linkFails = "EIO";
+    expect(() => lockJournal(dir, () => undefined)).toThrow(/^EIO: link /);
+    expect(readdirSync(dir)).toEqual([]);
   });
 });

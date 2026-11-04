@@ -56,12 +56,16 @@ import type { Solver } from "./types";
 //                                                  unit; once for each token
 //   --daily-entries N                              the most tasks it takes on in a UTC day; the
 //                                                  count is kept in its state directory
+//   --daily-judged-hires N                         the most hires the Judge checks that it takes
+//                                                  on in a UTC day
 //   --max-voids-after-reveals N                    skips a verifier whose record in the API shows
 //                                                  more empty picks after reveals than N
 //
 // A hire is held to its service's terms in place of the least reward and the verifiers, and counts
 // toward the daily cap. One its hirer checks is held to the hirer's record and refused once the day
-// is full; one the Judge checks is never held back.
+// is full; one the Judge checks is held to a cap of its own, `--daily-judged-hires N` (50 a day for
+// an agent with the llm solver, none for a scripted one), and refused over it. Every cap fails
+// closed: a count that cannot be read or written takes nothing on.
 //
 // What it reads. The variables come from `.env` and `.env.deploy.<network>` in the repository root
 // (or in the directory that `TENDER_ENV_DIR` names), the network's winning, and the process's own
@@ -104,12 +108,18 @@ const USAGE =
   `usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent ${AGENT_NAMES.join("|")} ` +
   `--solver ${SOLVERS.join("|")} --network ${Object.keys(NETWORKS).join("|")} ` +
   "[--max-llm-calls-per-hour N] [--verifiers judge|any|<account>,...] " +
-  "[--min-reward <token>=<amount>]... [--daily-entries N] [--max-voids-after-reveals N]";
+  "[--min-reward <token>=<amount>]... [--daily-entries N] [--daily-judged-hires N] " +
+  "[--max-voids-after-reveals N]";
 
 /** The most an amount of a token can be: a u128. */
 const MAX_U128 = 2n ** 128n - 1n;
 /** The tasks an agent with a model takes on in a UTC day, unless `--daily-entries` says otherwise. */
 const LLM_DAILY_ENTRIES = 20;
+/**
+ * The hires the Judge checks that an agent with a model takes on in a UTC day, unless
+ * `--daily-judged-hires` says otherwise.
+ */
+const LLM_DAILY_JUDGED_HIRES = 50;
 
 /** A failure whose message is the command line's own and safe to print: it holds no value of the environment. */
 export class CliError extends Error {
@@ -131,6 +141,7 @@ export interface CliArgs {
   verifiers?: VerifierRule;
   minReward?: Record<string, bigint>;
   dailyEntries?: number;
+  dailyJudgedHires?: number;
   maxVoidsAfterReveals?: number;
 }
 
@@ -183,6 +194,7 @@ export function parseCli(args: readonly string[]): CliArgs {
     verifiers?: string;
     "min-reward"?: string[];
     "daily-entries"?: string;
+    "daily-judged-hires"?: string;
     "max-voids-after-reveals"?: string;
   };
   try {
@@ -196,6 +208,7 @@ export function parseCli(args: readonly string[]): CliArgs {
         verifiers: { type: "string" },
         "min-reward": { type: "string", multiple: true },
         "daily-entries": { type: "string" },
+        "daily-judged-hires": { type: "string" },
         "max-voids-after-reveals": { type: "string" },
       },
     }).values;
@@ -251,6 +264,11 @@ export function parseCli(args: readonly string[]): CliArgs {
   if (dailyFlag !== undefined && dailyEntries === undefined) {
     throw new CliError(`--daily-entries must be a whole number from 1\n${USAGE}`);
   }
+  const judgedFlag = values["daily-judged-hires"];
+  const dailyJudgedHires = judgedFlag === undefined ? undefined : asCount(judgedFlag);
+  if (judgedFlag !== undefined && dailyJudgedHires === undefined) {
+    throw new CliError(`--daily-judged-hires must be a whole number from 1\n${USAGE}`);
+  }
   const voidsFlag = values["max-voids-after-reveals"];
   const maxVoidsAfterReveals = voidsFlag === undefined ? undefined : asCount(voidsFlag, 0);
   if (voidsFlag !== undefined && maxVoidsAfterReveals === undefined) {
@@ -265,6 +283,7 @@ export function parseCli(args: readonly string[]): CliArgs {
     ...(verifiers !== undefined && { verifiers }),
     ...(minReward !== undefined && { minReward }),
     ...(dailyEntries !== undefined && { dailyEntries }),
+    ...(dailyJudgedHires !== undefined && { dailyJudgedHires }),
     ...(maxVoidsAfterReveals !== undefined && { maxVoidsAfterReveals }),
   };
 }
@@ -512,9 +531,10 @@ export async function chainMinRewards(
 
 /**
  * The entry policy of a run: the flags, over the defaults of its solver. An agent with a model
- * takes the Judge's tasks only, at most 20 a UTC day, and none below its token's least reward on
- * the chain (`chainMinimums`, which the caller reads for it). A scripted agent enters any task of
- * its tags, with no cap, as the demos' agents always have. A rule that is not set is left out.
+ * takes the Judge's tasks only, at most 20 a UTC day, at most 50 hires the Judge checks a UTC day,
+ * and none below its token's least reward on the chain (`chainMinimums`, which the caller reads for
+ * it). A scripted agent enters any task of its tags, with no cap, as the demos' agents always have.
+ * A rule that is not set is left out.
  */
 export function entryPolicyOf(
   config: RunConfig,
@@ -524,6 +544,7 @@ export function entryPolicyOf(
   const verifiers = verifiersOf(config);
   const minReward = { ...(llm ? chainMinimums : {}), ...config.minReward };
   const dailyEntries = config.dailyEntries ?? (llm ? LLM_DAILY_ENTRIES : undefined);
+  const dailyJudgedHires = config.dailyJudgedHires ?? (llm ? LLM_DAILY_JUDGED_HIRES : undefined);
   return {
     verifiers,
     ...(verifiers === "judge" && { judgeAccount: config.judgeAccount }),
@@ -532,6 +553,7 @@ export function entryPolicyOf(
       maxVoidsAfterReveals: config.maxVoidsAfterReveals,
     }),
     ...(dailyEntries !== undefined && { dailyEntries }),
+    ...(dailyJudgedHires !== undefined && { dailyJudgedHires }),
   };
 }
 
@@ -937,7 +959,7 @@ export async function main(args: readonly string[], options: CliOptions): Promis
     const state = createStateStore(stateDir);
     // The count of the day lives beside the drafts, so that a restart keeps it.
     const entryCounts: EntryCounts | undefined =
-      policy.dailyEntries === undefined
+      policy.dailyEntries === undefined && policy.dailyJudgedHires === undefined
         ? undefined
         : createEntryCounts(join(stateDir, ENTRY_COUNTS_FILE));
     const signal = options.signal ?? stop.signal;

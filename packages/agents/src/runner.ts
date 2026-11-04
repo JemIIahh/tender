@@ -26,6 +26,7 @@ import {
 } from "@tender/shared";
 import {
   checkPolicy,
+  type DayCount,
   describePolicy,
   type EntryCounts,
   type EntryPolicy,
@@ -256,12 +257,12 @@ export interface AgentTickOptions {
    * token, the verifiers it lets check its work, their record of empty picks, and a cap on the
    * tasks of a UTC day. A hire is held to its service's terms instead, and counts toward the cap: a
    * hire its hirer checks is held to the hirer's record and refused once the day is full, and one
-   * the Judge checks is never held back. Without a policy the agent enters every task of its tags
-   * that it can, as the demos' scripted agents do. The command line gives one by the solver
-   * (`cli.ts`).
+   * the Judge checks is refused once the day's own cap of them is full (`dailyJudgedHires`). Every
+   * cap fails closed. Without a policy the agent enters every task of its tags that it can, as the
+   * demos' scripted agents do. The command line gives one by the solver (`cli.ts`).
    */
   policy?: EntryPolicy;
-  /** Where the count of the day is kept, for `policy.dailyEntries`, which needs it. */
+  /** Where the count of the day is kept, for `policy.dailyEntries` and `dailyJudgedHires`. */
   entryCounts?: EntryCounts;
 }
 
@@ -283,7 +284,7 @@ interface Run {
   /**
    * The services the agent offers, as the API listed them at the start of this tick's pass over the
    * tasks (`ownServices`), or null when they could not be read. They decide whether the agent takes
-   * hires at all, and which (`hireRefusal`).
+   * hires at all, and which (`hireOf`).
    */
   services: Service[] | null;
   solver: Solver;
@@ -316,7 +317,7 @@ interface Run {
    * The count of the day, as this tick read it and has added to it: the UTC day and the tasks taken
    * on in it. Null until it is needed; `unreadable` once it could not be read in this tick.
    */
-  today: { day: string; count: number } | null | "unreadable";
+  today: { day: string; count: DayCount } | null | "unreadable";
 }
 
 /** The text of `error`'s code if it has one that looks like a code, else undefined. */
@@ -432,10 +433,12 @@ async function listOpen(api: TenderApi, by: string | { invited: string }): Promi
  * 8. The agent's storage on the contract is below what a commit and a reveal need (R22), with the
  *    reveals it already owes (review M1): logged as a warning. A function-call key cannot top it
  *    up, so the agent can only wait for someone to.
- * 9. The day's count (`EntryPolicy.dailyEntries`), which every kind counts toward. A task of the
- *    agent's tags that finds the day full waits for the next UTC day, logged once; a hire its hirer
- *    checks is refused for good, logged; a hire the Judge checks is never held back (`roomToday`).
- *    The task is counted, on the disk, before the next step.
+ * 9. The day's count (`EntryPolicy.dailyEntries`, which every kind counts toward, and
+ *    `dailyJudgedHires`). A task of the agent's tags that finds the day full waits for the next UTC
+ *    day, logged once; a hire its hirer checks is refused for good, logged; a hire the Judge checks
+ *    is held to `dailyJudgedHires` alone, and refused for good over it. A count that cannot be read
+ *    or written takes nothing on (`roomToday`, `countEntry`). The task is counted, on the disk,
+ *    before the next step.
  * 10. The solver, and `start`, the signal that the agent is working on the task. A scripted solver
  *    answers from files, which costs nothing and has no side effect (review M6): it is asked
  *    first, and `start` goes out only for a task it has an answer to, so that the agent does not
@@ -445,13 +448,13 @@ async function listOpen(api: TenderApi, by: string | { invited: string }): Promi
  * 11. The answer is committed to (`commit`). If the commit does not end well, the draft it saved is
  *    settled by the next ticks (`recoverCommit`): the answer is not solved for again.
  *
- * A task is `seen` once step 2, 3, 5, 6, 7 or 8 has turned it down (or step 9, a hire its hirer
- * checks) and once the solver has been asked (for a scripted solver with an answer: once `start`
- * has gone through), whatever happens after, so a solver is asked at most once per task in a run
- * and a failing task cannot cost a model call every tick. Steps 1 and 4, a record that cannot be
- * read, a full day for a task of the agent's tags, a solver that is not available and a call that
- * fails leave the task unseen: it is looked at again next tick (a task of a full day, the next
- * day), and nothing of a task id that is not one is kept.
+ * A task is `seen` once step 2, 3, 5, 6, 7 or 8 has turned it down (or step 9, a hire) and once
+ * the solver has been asked (for a scripted solver with an answer: once `start` has gone through),
+ * whatever happens after, so a solver is asked at most once per task in a run and a failing task
+ * cannot cost a model call every tick. Steps 1 and 4, a record that cannot be read, a full day for
+ * a task of the agent's tags, a solver that is not available and a call that fails leave the task
+ * unseen: it is looked at again next tick (a task of a full day, the next day), and nothing of a
+ * task id that is not one is kept.
  */
 async function enterTasks(run: Run): Promise<void> {
   // A task carries several tags and is listed under each: it is looked at once per tick.
@@ -582,7 +585,7 @@ function hireOf(run: Run, task: TaskDetail): { kind: Kind } | { refusal: string 
  * tags, with two steps more: the detail must name the agent in its invited list, since the API was
  * asked for those only, and an API that ignored the filter would otherwise have the agent enter every
  * open task (a task that does not is skipped, and a count of them is logged); and the task must be a
- * hire of one of its services on that service's terms (`hireRefusal`), or it is skipped and the
+ * hire of one of its services on that service's terms (`hireOf`), or it is skipped and the
  * reason logged.
  */
 async function enterInvitations(run: Run, looked: Set<string>): Promise<void> {
@@ -778,11 +781,11 @@ async function enter(
       memory.seen.add(id);
       return;
     }
-    await countEntry(run, id, kind);
+    if (!(await countEntry(run, id, kind))) return;
     await run.api.start(BigInt(id));
     memory.seen.add(id);
   } else {
-    await countEntry(run, id, kind);
+    if (!(await countEntry(run, id, kind))) return;
     await run.api.start(BigInt(id));
     memory.seen.add(id);
     content = await ask(run, id, ctx);
@@ -851,13 +854,25 @@ async function voidsOf(run: Run, verifier: string): Promise<number | null | unde
 }
 
 /**
- * The count of the day (`policy.dailyEntries`), read once a tick, and again when the UTC day turns.
- * A count that cannot be read is `unreadable` for the rest of the tick, which is said once.
+ * Whether a task of `kind` is counted, and so held to a cap: a task of the agent's tags and a hire
+ * its hirer checks while there is a `dailyEntries`, and a hire the Judge checks while there is
+ * either cap (it counts toward `dailyEntries` too, though that cap does not hold it back).
+ */
+function counted(run: Run, kind: Kind): boolean {
+  const { policy } = run;
+  if (policy === undefined || run.entryCounts === undefined) return false;
+  if (policy.dailyEntries !== undefined) return true;
+  return kind === "judged hire" && policy.dailyJudgedHires !== undefined;
+}
+
+/**
+ * The count of the day, read once a tick, and again when the UTC day turns. A count that cannot be
+ * read is `unreadable` for the rest of the tick, which is said once.
  */
 async function today(
   run: Run,
   counts: EntryCounts,
-): Promise<{ day: string; count: number } | "unreadable"> {
+): Promise<{ day: string; count: DayCount } | "unreadable"> {
   const day = utcDay(Date.now());
   if (run.today === "unreadable") return run.today;
   if (run.today !== null && run.today.day === day) return run.today;
@@ -869,48 +884,65 @@ async function today(
     // learns which file to fix.
     const why = error instanceof Error ? oneLine(error.message) : typeof error;
     run.log(
-      `ERROR ${run.name}: the count of the day's entries cannot be read (${why}), so the agent takes on no task but the hires the Judge checks`,
+      `ERROR ${run.name}: the count of the day's entries cannot be read (${why}), so the agent takes on nothing that its caps count until it can`,
     );
   }
   return run.today;
 }
 
+/** Refuses hire `id` for good: it is seen, and the reason is said once. Returns false. */
+function refuseHire(run: Run, id: string, kind: Kind, why: string): false {
+  run.memory.seen.add(id);
+  const what = kind === "judged hire" ? "a hire the Judge checks" : "a hire its hirer checks";
+  run.log(`${run.name}: skipping task ${id}, ${what}, as ${why}`);
+  return false;
+}
+
 /**
- * Whether the day's count leaves room for task `id` of `kind` (`policy.dailyEntries`): always,
- * without a cap. Every kind counts toward the cap, and the cap holds each differently:
+ * Whether the day's count leaves room for task `id` of `kind`: always, for a kind no cap holds
+ * (`counted`). Every cap fails closed, and each holds its kind differently:
  *
- * - a task of the agent's tags that finds the day full waits, unseen, for the next UTC day, which
- *   is said once for it; with a count that cannot be read it waits for a tick that can read it, as
- *   a cap that is not known cannot be kept;
- * - a hire the Judge checks is never held back, neither by a full day nor by a count that cannot be
- *   read: it is taken on and counted (`countEntry`);
- * - a hire its hirer checks is refused for good, seen and said once, by a full day or a count that
- *   cannot be read. It does not wait for the next day: its hirer is its verifier, and a wait would
- *   only let its windows run out. The hirer is refunded whole when the task is voided.
+ * - `dailyEntries` holds the tasks of the agent's tags and the hires its hirer checks. A task that
+ *   finds the day full waits, unseen, for the next UTC day, which is said once for it; with a count
+ *   that cannot be read it waits for a tick that can read it, as a cap that is not known cannot be
+ *   kept. A hire its hirer checks is refused for good, seen and said once, by a full day or a count
+ *   that cannot be read: its hirer is its verifier, and a wait would only let its windows run out.
+ * - `dailyJudgedHires` holds the hires the Judge checks, which `dailyEntries` does not hold back. A
+ *   hirer can still ask for a delivery that fails the criteria, read it, and be refunded when the
+ *   Judge picks nobody, so this caps what such hires cost. One over it, or met by a count that
+ *   cannot be read, is refused for good like a hire its hirer checks.
+ *
+ * The void refunds a refused hire's hirer whole.
  */
 async function roomToday(run: Run, id: string, kind: Kind): Promise<boolean> {
-  const most = run.policy?.dailyEntries;
-  if (most === undefined || run.entryCounts === undefined) return true;
+  const { policy, entryCounts } = run;
+  if (!counted(run, kind) || policy === undefined || entryCounts === undefined) return true;
+  const now = await today(run, entryCounts);
+  const unreadable =
+    "the count of the day's entries cannot be read, so the agent cannot keep its cap";
   if (kind === "judged hire") {
-    await today(run, run.entryCounts);
-    return true;
+    if (now === "unreadable") return refuseHire(run, id, kind, unreadable);
+    const most = policy.dailyJudgedHires;
+    if (most === undefined || now.count.judgedHires < most) return true;
+    const taken = `the agent has taken on ${now.count.judgedHires} of them today, its most`;
+    return refuseHire(run, id, kind, `${taken} (dailyJudgedHires ${most})`);
   }
-  const count = await today(run, run.entryCounts);
-  if (count !== "unreadable" && count.count < most) return true;
-  if (kind === "hirer hire") {
-    run.memory.seen.add(id);
-    const why =
-      count === "unreadable"
-        ? "the count of the day's entries cannot be read, so the agent cannot keep its cap"
-        : `the agent has taken on ${count.count} tasks today, its most (dailyEntries ${most})`;
-    run.log(`${run.name}: skipping task ${id}, a hire its hirer checks, as ${why}`);
+  const most = policy.dailyEntries;
+  if (most === undefined) return true;
+  if (now !== "unreadable" && now.count.entries < most) return true;
+  if (now === "unreadable") {
+    // A task of the agent's tags waits for a tick that can read it; a hire is refused.
+    if (kind === "hirer hire") refuseHire(run, id, kind, unreadable);
     return false;
   }
-  if (count === "unreadable") return false;
-  if (run.memory.capped.get(id) !== count.day) {
-    run.memory.capped.set(id, count.day);
+  if (kind === "hirer hire") {
+    const taken = `the agent has taken on ${now.count.entries} tasks today, its most`;
+    return refuseHire(run, id, kind, `${taken} (dailyEntries ${most})`);
+  }
+  if (run.memory.capped.get(id) !== now.day) {
+    run.memory.capped.set(id, now.day);
     run.log(
-      `${run.name}: task ${id} waits for the next day (UTC): the agent has taken on ${count.count} tasks today, its most (dailyEntries ${most})`,
+      `${run.name}: task ${id} waits for the next day (UTC): the agent has taken on ${now.count.entries} tasks today, its most (dailyEntries ${most})`,
     );
   }
   return false;
@@ -918,36 +950,32 @@ async function roomToday(run: Run, id: string, kind: Kind): Promise<boolean> {
 
 /**
  * Counts the task the agent is taking on, on the disk, before it is announced and before the solver
- * is asked: a crash after the solve has it counted. A write that fails throws, and the task is left
- * for the next tick. A `start` that fails after the count leaves the task for the next tick too,
- * which counts it again: a failure can cost a place under the cap, never a solve over it.
- *
- * A hire the Judge checks is never held back by the count (`roomToday`): one that cannot be read,
- * or written, leaves it taken on and uncounted, which is said.
+ * is asked: a crash after the solve has it counted. Returns whether the task may be taken on. A
+ * write that fails takes nothing on: a task of the agent's tags is left for the next tick (the
+ * error is thrown, and logged by the caller), and a hire is refused for good, as by a count that
+ * cannot be read. A `start` that fails after the count leaves the task for the next tick, which
+ * counts it again: a failure can cost a place under a cap, never a solve over it.
  */
-async function countEntry(run: Run, id: string, kind: Kind): Promise<void> {
-  if (run.policy?.dailyEntries === undefined || run.entryCounts === undefined) return;
-  const uncounted = (why: string) =>
-    run.log(
-      `WARN ${run.name}: task ${id}, a hire the Judge checks, is taken on without being counted: ${why}`,
-    );
-  // `roomToday` read the count just before, in the same task.
+async function countEntry(run: Run, id: string, kind: Kind): Promise<boolean> {
+  if (!counted(run, kind) || run.entryCounts === undefined) return true;
+  // `roomToday` read the count just before, in the same task, and took nothing on without it.
   if (run.today === null || run.today === "unreadable") {
-    if (kind === "judged hire") {
-      uncounted("the count of the day's entries cannot be read");
-      return;
-    }
     throw new Error("the count of the day was not read before a task was taken on");
   }
-  const count = run.today.count + 1;
+  const { day, count } = run.today;
+  const next: DayCount = {
+    entries: count.entries + 1,
+    judgedHires: count.judgedHires + (kind === "judged hire" ? 1 : 0),
+  };
   try {
-    await run.entryCounts.write(run.today.day, count);
+    await run.entryCounts.write(day, next);
   } catch (error) {
-    if (kind !== "judged hire") throw error;
-    uncounted(`the count of the day's entries cannot be written (${describe(error)})`);
-    return;
+    if (kind === "task") throw error;
+    const why = `the count of the day's entries cannot be written (${describe(error)})`;
+    return refuseHire(run, id, kind, why);
   }
-  run.today = { day: run.today.day, count };
+  run.today = { day, count: next };
+  return true;
 }
 
 /**

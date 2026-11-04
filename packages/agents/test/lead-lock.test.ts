@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -196,5 +197,28 @@ describe("the lead's journal lock", () => {
     const lock = lockJournal(deeper, () => undefined);
     expect(existsSync(join(deeper, JOURNAL_LOCK_FILE))).toBe(true);
     lock.release();
+  });
+
+  test("what_a_lead_killed_while_it_took_the_lock_left_is_swept_and_nothing_else", async () => {
+    const dead = await deadPid();
+    // A lead dies between writing its lock whole and linking it, or with a leftover moved aside.
+    const swept = [
+      `.lead.lock.${dead}.${randomUUID()}.tmp`,
+      `.lead.lock.${dead}.${randomUUID()}.stale`,
+    ];
+    const kept = [
+      // A lead that runs (the process that started this test) is taking a lock this moment.
+      `.lead.lock.${process.ppid}.${randomUUID()}.tmp`,
+      // Not names the lock gives its files.
+      `.lead.lock.${dead}.not-a-token.tmp`,
+      ".lead.lock.notes",
+      "10.json",
+    ];
+    for (const name of [...swept, ...kept]) writeFileSync(join(dir, name), "x");
+
+    const lock = lockJournal(dir, () => undefined);
+    expect(readdirSync(dir).sort()).toEqual([JOURNAL_LOCK_FILE, ...kept].sort());
+    lock.release();
+    expect(readdirSync(dir).sort()).toEqual([...kept].sort());
   });
 });

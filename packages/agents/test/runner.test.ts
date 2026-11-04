@@ -1833,7 +1833,7 @@ test("policy_the_daily_cap_holds_tasks_for_the_next_utc_day_and_does_not_mark_th
     "alice: task 2 waits for the next day (UTC): the agent has taken on 2 tasks today, its most (dailyEntries 2)",
     "alice: task 1 waits for the next day (UTC): the agent has taken on 2 tasks today, its most (dailyEntries 2)",
   ]);
-  expect(await countOn(h.dir)).toEqual({ day: "2026-11-04", entries: 2 });
+  expect(await countOn(h.dir)).toEqual({ day: "2026-11-04", entries: 2, judgedHires: 0 });
 
   // Later the same day: they still wait, nothing more is said, and the API is not asked about them.
   const asked = h.getTask.mock.calls.length;
@@ -1848,7 +1848,7 @@ test("policy_the_daily_cap_holds_tasks_for_the_next_utc_day_and_does_not_mark_th
   await h.tick();
   expect(idsOf(h.commit)).toEqual([1n, 2n, 3n, 4n]);
   expect(h.solve).toHaveBeenCalledTimes(4);
-  expect(await countOn(h.dir)).toEqual({ day: "2026-11-05", entries: 2 });
+  expect(await countOn(h.dir)).toEqual({ day: "2026-11-05", entries: 2, judgedHires: 0 });
 });
 
 test("policy_the_count_of_the_day_is_on_the_disk_so_a_restart_does_not_reset_it", async () => {
@@ -1872,7 +1872,8 @@ test("policy_the_count_of_the_day_is_on_the_disk_so_a_restart_does_not_reset_it"
     "alice: task 2 waits for the next day (UTC): the agent has taken on 1 tasks today, its most (dailyEntries 1)",
   ]);
 
-  // A count that cannot be read is a cap that cannot be kept: no task is taken on until it can be.
+  // A count that cannot be read is a cap that cannot be kept: nothing it counts is taken on until
+  // it can be read.
   h.restart();
   h.entryCounts = createEntryCounts(file);
   await writeFile(file, "not a count");
@@ -1880,12 +1881,12 @@ test("policy_the_count_of_the_day_is_on_the_disk_so_a_restart_does_not_reset_it"
   await h.tick();
   expect(idsOf(h.commit)).toEqual([1n]);
   expect(h.logs.filter((line) => line.startsWith("ERROR"))).toEqual([
-    `ERROR alice: the count of the day's entries cannot be read (the entry count file ${file} is corrupt: it is not valid JSON), so the agent takes on no task but the hires the Judge checks`,
+    `ERROR alice: the count of the day's entries cannot be read (the entry count file ${file} is corrupt: it is not valid JSON), so the agent takes on nothing that its caps count until it can`,
   ]);
   await rm(file);
   await h.tick();
   expect(idsOf(h.commit)).toEqual([1n, 2n]);
-  expect(await countOn(h.dir)).toEqual({ day: "2026-11-05", entries: 1 });
+  expect(await countOn(h.dir)).toEqual({ day: "2026-11-05", entries: 1, judgedHires: 0 });
 });
 
 test("policy_an_open_policy_and_no_policy_enter_as_before", async () => {
@@ -1935,18 +1936,46 @@ test("policy_a_hire_is_held_to_its_service_not_to_the_rules_of_the_tags_and_coun
     "alice: skipping task 5, a hire its hirer checks, as the agent has taken on 3 tasks today, its most (dailyEntries 3)",
   ]);
   expect(waits(h.logs)).toEqual([]);
-  expect(await countOn(h.dir)).toEqual({ day: "2026-11-04", entries: 3 });
+  expect(await countOn(h.dir)).toEqual({ day: "2026-11-04", entries: 3, judgedHires: 0 });
   // The record of the hirer, the hires' verifier, is read, and so is the Judge's for the tasks:
   // once each in the tick.
   expect(h.getAgent.mock.calls.map(([account]) => account).sort()).toEqual([JUDGE, POSTER].sort());
 });
 
-test("policy_a_hire_the_judge_checks_is_taken_on_over_the_cap_and_counted", async () => {
+test("policy_a_hire_found_by_a_tag_of_the_agent_is_held_as_a_hire_and_counted_under_the_caps", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-11-04T12:00:00.000Z"));
+  const h = await harness();
+  h.services = [offered(), judged()];
+  // The least reward and the verifiers would turn both away from a task of the agent's tags.
+  h.policy = {
+    verifiers: "judge",
+    judgeAccount: JUDGE,
+    minReward: { [TOKEN]: 5_000_000n },
+    dailyEntries: 5,
+    dailyJudgedHires: 5,
+  };
+  h.entryCounts = createEntryCounts(join(h.dir, ENTRY_COUNTS_FILE));
+  // Hires whose briefs carry the agent's tag: the listing by the tag finds them first, and the
+  // listing of the tasks that invite the agent finds them again.
+  h.world.add(hire(5, { tags: ["regex"] }));
+  h.world.add(hire(6, { tags: ["regex"], verifier: JUDGE, criteriaHash: JUDGED_HASH }));
+
+  await h.tick();
+
+  // Taken on as hires, under both caps, once each, and counted: two entries, one the Judge checks.
+  expect(idsOf(h.commit)).toEqual([5n, 6n]);
+  expect(h.logs.filter((line) => /skipping|waits|WARN|ERROR/.test(line))).toEqual([]);
+  expect(h.getTask.mock.calls.filter(([id]) => id === 5n || id === 6n)).toHaveLength(2);
+  expect(await countOn(h.dir)).toEqual({ day: "2026-11-04", entries: 2, judgedHires: 1 });
+});
+
+test("policy_a_hire_the_judge_checks_under_its_own_cap_is_taken_on_over_daily_entries_and_counted", async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-11-04T12:00:00.000Z"));
   const h = await harness();
   h.services = [judged()];
-  h.policy = { maxVoidsAfterReveals: 0, dailyEntries: 1 };
+  h.policy = { maxVoidsAfterReveals: 0, dailyEntries: 1, dailyJudgedHires: 2 };
   h.entryCounts = createEntryCounts(join(h.dir, ENTRY_COUNTS_FILE));
   // The Judge's record shows voids: a hire the Judge checks is not held to them.
   h.getAgent.mockImplementation(async (account) => (account === JUDGE ? recordOf(JUDGE, 5) : null));
@@ -1957,15 +1986,47 @@ test("policy_a_hire_the_judge_checks_is_taken_on_over_the_cap_and_counted", asyn
 
   await h.tick();
 
-  // Task 8 fills the day, and task 7, of the agent's tags, waits for the next. Both hires are taken
-  // on all the same, and counted.
+  // Task 8 fills the day's entries, and task 7, of the agent's tags, waits for the next day. Both
+  // hires are under their own cap of 2: they are taken on all the same, and counted in both.
   expect(idsOf(h.commit)).toEqual([5n, 6n, 8n]);
   expect(waits(h.logs)).toEqual([
     "alice: task 7 waits for the next day (UTC): the agent has taken on 1 tasks today, its most (dailyEntries 1)",
   ]);
   expect(h.logs.filter((line) => /skipping|WARN|ERROR/.test(line))).toEqual([]);
-  expect(await countOn(h.dir)).toEqual({ day: "2026-11-04", entries: 3 });
+  expect(await countOn(h.dir)).toEqual({ day: "2026-11-04", entries: 3, judgedHires: 2 });
   expect(h.getAgent.mock.calls.map(([account]) => account)).toEqual([OTHER]);
+});
+
+test("policy_a_hire_the_judge_checks_over_its_own_cap_is_refused_for_good_and_not_tried_again", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-11-04T12:00:00.000Z"));
+  const h = await harness(undefined, { scripted: false });
+  h.services = [judged()];
+  // Room for many entries, and for one hire the Judge checks.
+  h.policy = { dailyEntries: 20, dailyJudgedHires: 1 };
+  h.entryCounts = createEntryCounts(join(h.dir, ENTRY_COUNTS_FILE));
+  h.world.add(hire(5, { verifier: JUDGE, criteriaHash: JUDGED_HASH }));
+  h.world.add(hire(6, { verifier: JUDGE, criteriaHash: JUDGED_HASH }));
+
+  await h.tick();
+  // Newest first: hire 6 takes the day's one place, and hire 5 is refused, neither announced nor
+  // solved. It does not wait: the void refunds its hirer.
+  expect(idsOf(h.commit)).toEqual([6n]);
+  expect(idsOf(h.start)).toEqual([6n]);
+  expect(h.solve).toHaveBeenCalledTimes(1);
+  const refusal =
+    "alice: skipping task 5, a hire the Judge checks, as the agent has taken on 1 of them today, its most (dailyJudgedHires 1)";
+  expect(h.logs.filter((line) => line.includes("task 5"))).toEqual([refusal]);
+  expect(waits(h.logs)).toEqual([]);
+  expect(await countOn(h.dir)).toEqual({ day: "2026-11-04", entries: 1, judgedHires: 1 });
+
+  // Later that day, and the next day, it is not looked at again.
+  await h.tick();
+  vi.setSystemTime(new Date("2026-11-05T12:00:00.000Z"));
+  await h.tick();
+  expect(h.getTask.mock.calls.filter(([id]) => id === 5n)).toHaveLength(1);
+  expect(idsOf(h.commit)).toEqual([6n]);
+  expect(h.logs.filter((line) => line.includes("task 5"))).toEqual([refusal]);
 });
 
 test("policy_a_hire_its_hirer_checks_over_the_cap_is_refused_for_good_and_not_tried_again", async () => {
@@ -2021,12 +2082,12 @@ test("policy_a_hire_whose_hirer_has_more_voids_after_reveals_than_the_agent_acce
   expect(h.getAgent.mock.calls.map(([account]) => account).sort()).toEqual([OTHER, POSTER].sort());
 });
 
-test("policy_a_count_that_cannot_be_read_takes_on_a_hire_the_judge_checks_and_refuses_one_its_hirer_checks", async () => {
+test("policy_a_count_that_cannot_be_read_refuses_every_hire_it_counts_and_holds_the_tasks_back", async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-11-04T12:00:00.000Z"));
   const h = await harness();
   h.services = [offered(), judged()];
-  h.policy = { dailyEntries: 5 };
+  h.policy = { dailyEntries: 5, dailyJudgedHires: 5 };
   const file = join(h.dir, ENTRY_COUNTS_FILE);
   h.entryCounts = createEntryCounts(file);
   await writeFile(file, "not a count");
@@ -2036,47 +2097,75 @@ test("policy_a_count_that_cannot_be_read_takes_on_a_hire_the_judge_checks_and_re
 
   await h.tick();
 
-  // The task of the agent's tags waits for a count it can read; the hire the Judge checks is taken
-  // on, uncounted; the hire its hirer checks is refused for good.
-  expect(idsOf(h.commit)).toEqual([5n]);
+  // Nothing is taken on. The task of the agent's tags waits for a count it can read; both hires,
+  // the one the Judge checks too, are refused for good.
+  expect(h.commit).not.toHaveBeenCalled();
+  expect(h.start).not.toHaveBeenCalled();
   expect(h.logs.filter((line) => /ERROR|WARN|skipping/.test(line))).toEqual([
-    `ERROR alice: the count of the day's entries cannot be read (the entry count file ${file} is corrupt: it is not valid JSON), so the agent takes on no task but the hires the Judge checks`,
+    `ERROR alice: the count of the day's entries cannot be read (the entry count file ${file} is corrupt: it is not valid JSON), so the agent takes on nothing that its caps count until it can`,
     "alice: skipping task 6, a hire its hirer checks, as the count of the day's entries cannot be read, so the agent cannot keep its cap",
-    "WARN alice: task 5, a hire the Judge checks, is taken on without being counted: the count of the day's entries cannot be read",
+    "alice: skipping task 5, a hire the Judge checks, as the count of the day's entries cannot be read, so the agent cannot keep its cap",
   ]);
-  // The file is left as it was: a count written over it could lift the cap.
+  // The file is left as it was: a count written over it could lift the caps.
   expect(await readFile(file, "utf8")).toBe("not a count");
 
-  // Once the count can be read, the task of the agent's tags is entered; the refused hire is not.
+  // Once the count can be read, the task of the agent's tags is entered; the hires are not.
   await rm(file);
   await h.tick();
-  expect(idsOf(h.commit)).toEqual([4n, 5n]);
-  expect(await countOn(h.dir)).toEqual({ day: "2026-11-04", entries: 1 });
+  expect(idsOf(h.commit)).toEqual([4n]);
+  expect(await countOn(h.dir)).toEqual({ day: "2026-11-04", entries: 1, judgedHires: 0 });
+
+  // With the cap of the hires the Judge checks alone, only those are counted, and only they are
+  // held to the count: the task and the hire its hirer checks are entered.
+  const judgedOnly = await harness();
+  judgedOnly.services = [offered(), judged()];
+  judgedOnly.policy = { dailyJudgedHires: 5 };
+  const its = join(judgedOnly.dir, ENTRY_COUNTS_FILE);
+  judgedOnly.entryCounts = createEntryCounts(its);
+  await writeFile(its, "not a count");
+  judgedOnly.world.add({ id: 4 });
+  judgedOnly.world.add(hire(5, { verifier: JUDGE, criteriaHash: JUDGED_HASH }));
+  judgedOnly.world.add(hire(6));
+  await judgedOnly.tick();
+  expect(idsOf(judgedOnly.commit)).toEqual([4n, 6n]);
+  expect(judgedOnly.logs.filter((line) => line.includes("skipping"))).toEqual([
+    "alice: skipping task 5, a hire the Judge checks, as the count of the day's entries cannot be read, so the agent cannot keep its cap",
+  ]);
 });
 
-test("policy_a_count_that_cannot_be_written_does_not_hold_back_a_hire_the_judge_checks", async () => {
-  const h = await harness();
-  h.services = [judged()];
-  h.policy = { dailyEntries: 5 };
+test("policy_a_count_that_cannot_be_written_refuses_a_hire_before_it_is_announced_or_solved", async () => {
+  const h = await harness(undefined, { scripted: false });
+  h.services = [offered(), judged()];
+  h.policy = { dailyEntries: 5, dailyJudgedHires: 5 };
   const full = Object.assign(new Error("no space left"), { code: "ENOSPC" });
   h.entryCounts = {
-    read: async () => 0,
+    read: async () => ({ entries: 0, judgedHires: 0 }),
     write: async () => {
       throw full;
     },
   };
   h.world.add({ id: 4 });
   h.world.add(hire(5, { verifier: JUDGE, criteriaHash: JUDGED_HASH }));
+  h.world.add(hire(6));
 
   await h.tick();
 
-  // The task of the agent's tags is left for the next tick, unannounced; the hire is taken on.
-  expect(idsOf(h.commit)).toEqual([5n]);
-  expect(idsOf(h.start)).toEqual([5n]);
-  expect(h.logs.filter((line) => /ERROR|WARN/.test(line))).toEqual([
+  // Nothing is announced and the model is not asked. The task of the agent's tags is left for the
+  // next tick; the hires are refused for good.
+  expect(h.start).not.toHaveBeenCalled();
+  expect(h.solve).not.toHaveBeenCalled();
+  expect(h.commit).not.toHaveBeenCalled();
+  expect(h.logs.filter((line) => /ERROR|WARN|skipping/.test(line))).toEqual([
     "ERROR alice: task 4 failed (Error ENOSPC)",
-    "WARN alice: task 5, a hire the Judge checks, is taken on without being counted: the count of the day's entries cannot be written (Error ENOSPC)",
+    "alice: skipping task 6, a hire its hirer checks, as the count of the day's entries cannot be written (Error ENOSPC)",
+    "alice: skipping task 5, a hire the Judge checks, as the count of the day's entries cannot be written (Error ENOSPC)",
   ]);
+
+  // The next tick tries the task again, and not the hires.
+  await h.tick();
+  expect(h.getTask.mock.calls.filter(([id]) => id === 4n)).toHaveLength(2);
+  expect(h.getTask.mock.calls.filter(([id]) => id === 5n || id === 6n)).toHaveLength(2);
+  expect(h.solve).not.toHaveBeenCalled();
 });
 
 test("policy_a_policy_that_cannot_be_applied_is_refused_before_any_tick", async () => {
@@ -2092,6 +2181,8 @@ test("policy_a_policy_that_cannot_be_applied_is_refused_before_any_tick", async 
     [{ maxVoidsAfterReveals: 1.5 }, undefined],
     [{ dailyEntries: 3 }, undefined],
     [{ dailyEntries: 0 }, counts],
+    [{ dailyJudgedHires: 2 }, undefined],
+    [{ dailyJudgedHires: 0 }, counts],
   ];
   for (const [policy, entryCounts] of wrong) {
     const options = { ...h.options(), policy, ...(entryCounts && { entryCounts }) };
@@ -2109,6 +2200,7 @@ test("policy_the_first_lines_say_the_policy_the_agent_runs_with", async () => {
     judgeAccount: JUDGE,
     minReward: { [TOKEN]: 10_000n },
     dailyEntries: 20,
+    dailyJudgedHires: 50,
   };
   h.entryCounts = createEntryCounts(join(h.dir, ENTRY_COUNTS_FILE));
   const controller = new AbortController();
@@ -2118,7 +2210,7 @@ test("policy_the_first_lines_say_the_policy_the_agent_runs_with", async () => {
 
   expect(h.logs).toEqual([
     `alice: running as ${ACCOUNT}, tags regex, test solver (scripted)`,
-    `alice: entry policy verifiers=judge (${JUDGE}) minReward=${TOKEN}:10000 maxVoidsAfterReveals=none dailyEntries=20`,
+    `alice: entry policy verifiers=judge (${JUDGE}) minReward=${TOKEN}:10000 maxVoidsAfterReveals=none dailyEntries=20 dailyJudgedHires=50`,
   ]);
 });
 
