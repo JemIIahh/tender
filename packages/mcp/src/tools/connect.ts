@@ -3,20 +3,21 @@ import { fileURLToPath } from "node:url";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   type AgentKeyFile,
-  agentKeyPath,
+  agentKeyFor,
   type ConnectApi,
   type ConnectChain,
   ConnectError,
   type ConnectOutcome,
   connectAgent,
+  FUND_AGENT_WHERE,
   hasAgentKeyFile,
   KeyDirError,
+  KeyInUseError,
   keyDirOf,
-  makeAgentKeyFile,
   planRegistration,
-  prepareKeyDir,
   readAgentKeyFile,
   registerWithBond,
+  rpcFullAccessKeys,
   rpcKeyState,
   scriptedProfile,
   TenderClient,
@@ -96,8 +97,8 @@ function nextStep(outcome: ConnectOutcome, name: string): string {
       );
     case "waiting_for_bond":
       return (
-        `${outcome.accountId} exists, and its bond has not reached its vault yet: the owner presses ` +
-        "Fund agent on their page. Then call connect_to_tender again with the same code."
+        `${outcome.accountId} exists, and its bond has not reached its vault yet. Tell the owner: ` +
+        `${FUND_AGENT_WHERE(outcome.owner, name)} Then call connect_to_tender again with the same code.`
       );
     case "registered":
       return (
@@ -168,35 +169,18 @@ export function registerConnectTool(server: McpServer, deps: ConnectToolDeps): v
           chainFor: (lookup) => chainOf(lookup, deps),
           key: async (lookup, agent, mayMake) => {
             const dir = await keysDir(deps.keysDir ?? KEYS_DIR, repoRoot, agent);
-            const path = agentKeyPath(dir, agent);
-            if (await hasAgentKeyFile(dir, agent)) {
-              const file = await readAgentKeyFile(dir, agent);
-              hold(held, file);
-              if (file.network !== lookup.network) {
-                throw new ToolError(
-                  "KEY_IN_USE",
-                  `agent ${agent} has a key for ${file.network} already, and this code is for ` +
-                    `${lookup.network}: pass another name`,
-                );
-              }
-              if (file.account !== undefined && file.account !== lookup.account_id) {
-                throw new ToolError(
-                  "KEY_IN_USE",
-                  `the key file of agent ${agent} is for ${file.account}, not ${lookup.account_id}: ` +
-                    "pass another name",
-                );
-              }
-              return { publicKey: file.publicKey, path, made: false };
-            }
-            if (!mayMake) return null;
-            await prepareKeyDir(dir).catch(keyDirFault);
-            const made = await makeAgentKeyFile({
+            if (await hasAgentKeyFile(dir, agent)) hold(held, await readAgentKeyFile(dir, agent));
+            // The rule of which key is attached is `@tender/client`'s, shared with agent:connect.
+            return agentKeyFor({
               dir,
               name: agent,
               network: lookup.network,
               account: lookup.account_id,
+              mayMake,
+            }).catch((error: unknown) => {
+              if (error instanceof KeyInUseError) throw new ToolError("KEY_IN_USE", error.message);
+              return keyDirFault(error);
             });
-            return { ...made, made: true };
           },
           register: async (lookup, agent) => {
             const dir = await keysDir(deps.keysDir ?? KEYS_DIR, repoRoot, agent);
@@ -280,5 +264,6 @@ function chainOf(lookup: ConnectLookup, deps: ConnectToolDeps): ConnectChain {
   return {
     keyState: rpcKeyState(deps.rpcUrl),
     plan: (account) => planRegistration(reader, account),
+    fullAccessKeys: rpcFullAccessKeys(deps.rpcUrl),
   };
 }

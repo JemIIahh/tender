@@ -618,11 +618,6 @@ export async function resolveDefaultToken(
   return first.token;
 }
 
-/** The credentials in an RPC URL, if it has any (`urlCredentials`): what connect mode must not print. */
-export function urlCredentialsOf(rpcUrl: string): string[] {
-  return urlCredentials(rpcUrl);
-}
-
 /**
  * What must never be printed or published: the private key, the part of it after the curve's name,
  * which a library may quote on its own, and the credentials in the RPC URL (a password, a key in

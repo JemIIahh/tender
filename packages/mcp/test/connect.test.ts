@@ -53,6 +53,10 @@ function fakeApi(lookup: () => Promise<ConnectLookup>) {
       asked.push("attach");
       throw new Error("not in these tests");
     },
+    async connectContest() {
+      asked.push("contest");
+      throw new Error("not in these tests");
+    },
     async connectRegistered() {
       asked.push("registered");
       throw new Error("not in these tests");

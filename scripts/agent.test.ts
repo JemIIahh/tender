@@ -914,6 +914,10 @@ function connectApi(over: Partial<ConnectLookup> = {}) {
       asked.push(`attach ${publicKey}`);
       return { ...lookup, state: "attached", fingerprint: connectFingerprint(publicKey) };
     },
+    async connectContest() {
+      asked.push("contest");
+      return { ...lookup, state: "contested" };
+    },
     async connectRegistered() {
       asked.push("registered");
       return {
@@ -1043,7 +1047,7 @@ test("connect_makes_inits_key_attaches_its_public_half_and_uses_it_again_on_the_
   await rm(join(keys, "writer.json"));
   await init("writer", "someone.test.near");
   await expect(run()).rejects.toThrow(
-    /is for someone\.test\.near, not writer\.alice\.testnet: pass another --name/,
+    /is for someone\.test\.near, not writer\.alice\.testnet: choose another name for the agent \(--name <name>\)/,
   );
 });
 

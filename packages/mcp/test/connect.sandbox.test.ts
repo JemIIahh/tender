@@ -275,7 +275,7 @@ test("from_an_mcp_client_connect_to_tender_goes_on_from_where_it_stopped", async
   }
 });
 
-test("a_code_someone_else_used_first_is_refused_and_nothing_is_created", async () => {
+test("a_code_someone_else_used_first_is_refused_contested_and_nothing_is_created", async () => {
   const code = await makeCode("victim");
   const accountId = `victim.${owner.accountId}`;
   // Someone who learned the code attaches a key of their own before the agent runs.
@@ -298,9 +298,12 @@ test("a_code_someone_else_used_first_is_refused_and_nothing_is_created", async (
       waitMs: 1_000,
     }),
   ).rejects.toThrow(/another key attached already.*NOT to press Create agent/);
-  // The page shows the stolen key's fingerprint, which is not the one the agent would print, and
-  // nothing was created.
-  expect((await stateOf(code.id)).fingerprint).toBe(stolen.fingerprint);
+  // The agent told the API: the owner's page now reads the code as contested, and refuses it. The
+  // fingerprint it shows is the stolen key's, and nothing was created.
+  const after = await stateOf(code.id);
+  expect(after.state).toBe("contested");
+  expect(after.contested_at).not.toBeNull();
+  expect(after.fingerprint).toBe(stolen.fingerprint);
   expect(await reader.getAgent(accountId)).toBeNull();
   expect(lines.some((line) => line.startsWith("fingerprint: "))).toBe(false);
 });

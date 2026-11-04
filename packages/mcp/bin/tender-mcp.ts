@@ -10,9 +10,9 @@ import {
   readConnectConfig,
   resolveDefaultToken,
   secretsOf,
-  urlCredentialsOf,
 } from "../src/config";
 import { detectKeyAccess } from "../src/keys";
+import { urlCredentials } from "../src/secrets";
 import { createConnectServer, createMcpServer } from "../src/server";
 import { createStateStore } from "../src/state";
 
@@ -51,7 +51,8 @@ async function serve(server: McpServer, line: string): Promise<void> {
 /** Connect mode: no account and no key, and `connect_to_tender` alone. */
 async function connectMode(): Promise<void> {
   const config = readConnectConfig(process.env);
-  secrets = urlCredentialsOf(config.rpcUrl);
+  // The RPC URL's credentials, if it has any, are all there is to keep out of what it prints.
+  secrets = urlCredentials(config.rpcUrl);
   const api = new ApiClient({ baseUrl: config.apiUrl });
   await checkApiDeployment(
     config,

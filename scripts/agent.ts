@@ -7,6 +7,7 @@ import {
   type AgentKeyFile,
   type AgentProfile,
   ApiClient,
+  agentKeyFor,
   agentKeyPath,
   type ConnectApi,
   type ConnectChain,
@@ -14,8 +15,8 @@ import {
   type ConnectOutcome,
   connectAgent,
   DELEGATE_SUFFIX,
-  hasAgentKeyFile,
   KeyDirError,
+  KeyInUseError,
   type KeyPermission,
   keyDirOf,
   makeAgentKeyFile,
@@ -24,6 +25,7 @@ import {
   type RegistrationPlan,
   readAgentKeyFile,
   registerWithBond,
+  rpcFullAccessKeys,
   rpcKeyState,
   type Signer,
   scriptedProfile,
@@ -1138,6 +1140,8 @@ export interface ConnectCommandOptions extends CommandOptions {
   apiFor?: (baseUrl: string) => ConnectApi;
   /** What the chain says of the account and the key; through the node unless a test says. */
   chainCheck?: ConnectChain["keyState"];
+  /** The account's full-access keys; through the node unless a test says. */
+  keysCheck?: ConnectChain["fullAccessKeys"];
 }
 
 /** Hosts that are this machine, where plain http cannot be read or changed on the way. */
@@ -1168,15 +1172,14 @@ async function connectTarget(
   lookup: ConnectLookup,
   options: ConnectCommandOptions,
   env: Record<string, string>,
+  repoDir: string,
 ): Promise<AgentTarget> {
   if (options.network !== undefined && options.network !== lookup.network) {
     throw new UsageError(
       `this code is for ${lookup.network}, and --network says ${options.network}: leave --network out`,
     );
   }
-  const named =
-    env.TENDER_CONTRACT ??
-    (await readDeployment(lookup.network, options.repoDir ?? REPO_ROOT))?.contract;
+  const named = env.TENDER_CONTRACT ?? (await readDeployment(lookup.network, repoDir))?.contract;
   if (named !== undefined && named !== lookup.contract) {
     throw new Error(
       `the API that made this code serves the contract ${lookup.contract} on ${lookup.network}, and ` +
@@ -1198,8 +1201,9 @@ async function connectTarget(
  */
 export async function connectAgentCommand(options: ConnectCommandOptions): Promise<ConnectOutcome> {
   const log = options.log ?? console.log;
-  const repoDir = options.repoDir ?? REPO_ROOT;
-  const env = { ...readEnvFile(join(repoDir, ".env")), ...definedOnly(options.env ?? process.env) };
+  const own = definedOnly(options.env ?? process.env);
+  const repoDir = options.repoDir ?? envDir(own);
+  const env = { ...readEnvFile(join(repoDir, ".env")), ...own };
   const wanted = options.api ?? env.TENDER_API_URL;
   if (wanted === undefined || wanted === "") {
     throw new UsageError(
@@ -1211,7 +1215,7 @@ export async function connectAgentCommand(options: ConnectCommandOptions): Promi
   let target: AgentTarget | undefined;
   let checked: Promise<AgentTarget> | undefined;
   const targetOf = (lookup: ConnectLookup) => {
-    checked ??= connectTarget(lookup, options, env).then((found) => {
+    checked ??= connectTarget(lookup, options, env, repoDir).then((found) => {
       target = found;
       return found;
     });
@@ -1224,6 +1228,8 @@ export async function connectAgentCommand(options: ConnectCommandOptions): Promi
     return {
       keyState: async (account, publicKey) =>
         (options.chainCheck ?? rpcKeyState((await ready).rpcUrl))(account, publicKey),
+      fullAccessKeys: async (account) =>
+        (options.keysCheck ?? rpcFullAccessKeys((await ready).rpcUrl))(account),
       plan: async (account) => {
         const where = await ready;
         const reader = new TenderClient({
@@ -1250,32 +1256,17 @@ export async function connectAgentCommand(options: ConnectCommandOptions): Promi
     key: async (lookup, name, mayMake) => {
       await targetOf(lookup);
       const dir = await keysDirOf(options.dir, name);
-      const path = fileOf(dir, name);
-      if (await hasAgentKeyFile(dir, name)) {
-        const file = await readKeyFile(dir, name);
-        if (file.network !== lookup.network) {
-          throw new Error(
-            `agent ${name} has a key for ${file.network} at ${path}, and this code is for ` +
-              `${lookup.network}: pass another --name`,
-          );
-        }
-        if (file.account !== undefined && file.account !== lookup.account_id) {
-          throw new Error(
-            `the key file of agent ${name} is for ${file.account}, not ${lookup.account_id}: pass ` +
-              "another --name",
-          );
-        }
-        return { publicKey: file.publicKey, path, made: false };
-      }
-      if (!mayMake) return null;
-      await prepareKeyDir(dir).catch(asUsage);
-      const made = await makeAgentKeyFile({
+      // The rule of which key is attached is `@tender/client`'s, shared with `connect_to_tender`.
+      return agentKeyFor({
         dir,
         name,
         network: lookup.network,
         account: lookup.account_id,
+        mayMake,
+      }).catch((error: unknown) => {
+        if (error instanceof KeyInUseError) throw new Error(`${error.message} (--name <name>)`);
+        return asUsage(error);
       });
-      return { ...made, made: true };
     },
     register: async (lookup, name) => {
       const where = target ?? (await targetOf(lookup));
@@ -1305,7 +1296,10 @@ export interface CliOptions extends CommandOptions {
   /** Receives what is said about a failure. Default: `console.error`. */
   err?: (text: string) => void;
   /** For tests: what `connect` asks of the API and the chain, and its clock. */
-  connect?: Pick<ConnectCommandOptions, "apiFor" | "chainCheck" | "sleep" | "now" | "pollMs">;
+  connect?: Pick<
+    ConnectCommandOptions,
+    "apiFor" | "chainCheck" | "keysCheck" | "sleep" | "now" | "pollMs"
+  >;
 }
 
 /** What is printed of a failure: the code and transaction of a `TenderError`, else the message. */

@@ -30,10 +30,12 @@ import { AGENT_NAME } from "./keyfile";
 // and running the same thing again with the same code goes on from there: the key file is used
 // again, and attaching the same key twice is answered as the first time.
 
-/** What the agent asks the API: the three routes that the code alone opens. */
+/** What the agent asks the API: the four routes that the code alone opens. */
 export interface ConnectApi {
   connectLookup(code: string): Promise<ConnectLookup>;
   connectAttach(code: string, publicKey: string): Promise<ConnectLookup>;
+  /** Says the key attached to the code is not this agent's, so that the owner's page refuses it. */
+  connectContest(code: string): Promise<ConnectLookup>;
   connectRegistered(code: string): Promise<ConnectRegistered>;
 }
 
@@ -46,6 +48,8 @@ export interface ConnectChain {
   keyState(accountId: string, publicKey: string): Promise<ConnectKeyState>;
   /** What registering `accountId` takes now (`planRegistration`). */
   plan(accountId: string): Promise<RegistrationPlan>;
+  /** The full-access keys of `accountId` (`view_access_key_list`), as `ed25519:<base58>`. */
+  fullAccessKeys(accountId: string): Promise<string[]>;
 }
 
 /** The agent's key, as the caller keeps it: its PUBLIC half and where the file is. */
@@ -127,7 +131,13 @@ function explain(error: unknown): never {
     case "already_attached":
       throw new ConnectError(
         "this connect code has another key attached already, which is not this agent's: someone " +
-          "else may have the code. Tell the owner NOT to press Create agent, and to get a new code",
+          "else has the code. Its page now says two different keys tried it and refuses to create " +
+          "the account. Tell the owner NOT to press Create agent, and to start over with a new code",
+      );
+    case "contested":
+      throw new ConnectError(
+        "two different keys tried this connect code, so someone else has it and the owner's page " +
+          "refuses it: tell the owner to start over with a new code",
       );
     case "rate_limited":
       throw new ConnectError("the API has had too many requests from here: try again in a minute");
@@ -182,10 +192,33 @@ export function rpcKeyState(rpcUrl: string): ConnectChain["keyState"] {
   };
 }
 
+/** The chain's `fullAccessKeys` through an RPC node (`view_access_key_list`), at the last final block. */
+export function rpcFullAccessKeys(rpcUrl: string): ConnectChain["fullAccessKeys"] {
+  const provider = new JsonRpcProvider({ url: rpcUrl });
+  return async (accountId) => {
+    const list = await provider.viewAccessKeyList({
+      accountId,
+      finalityQuery: { finality: "final" },
+    });
+    return list.keys
+      .filter((entry) => entry.access_key.permission === "FullAccess")
+      .map((entry) => String(entry.public_key));
+  };
+}
+
 /** A span of milliseconds in words: `29m`, `45s`. */
 function span(ms: number): string {
   return ms >= 60_000 ? `${Math.ceil(ms / 60_000)}m` : `${Math.max(1, Math.ceil(ms / 1000))}s`;
 }
+
+/**
+ * Where the owner finds Fund agent, for an agent that waits on its bond: on the owner's Add an agent
+ * page, which shows it for the code it made, and for an account typed in step 1 ("Finish an agent
+ * you started"), after a reload or in another browser.
+ */
+export const FUND_AGENT_WHERE = (owner: string, name: string): string =>
+  `${owner} opens My agents, then Add an agent, in the web app (in this browser it may still be ` +
+  `open), types ${name} in step 1, presses Finish this agent, and presses Fund agent there.`;
 
 /** How often a wait says it is still waiting. */
 const HEARTBEAT_MS = 30_000;
@@ -211,19 +244,31 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
   const lookup = await api.connectLookup(code).catch(explain);
   const account = lookup.account_id;
   if (lookup.state === "expired") explain(new ApiError(410, { error: "code_expired" }));
+  if (lookup.state === "contested") explain(new ApiError(409, { error: "contested" }));
+  // The account is the name under the owner, as the owner asked for it; an answer that says
+  // otherwise is not one to act on.
+  if (account !== `${lookup.name}.${lookup.owner}`) {
+    throw new ConnectError(
+      "the API's answer does not add up (its account is not the name under the owner): nothing " +
+        "was made or sent. Ask the owner for a new code",
+    );
+  }
   log(`connect code for ${account}, made by ${lookup.owner}, on ${lookup.network}`);
   // Before a key is made or attached: a chain that is not the code's is refused here.
   const chain = opts.chainFor(lookup);
 
   const name = nameFor(lookup, opts.name);
-  // A code that has a key already, and not this one, is someone else's: say so before attaching,
-  // and before a key is made for nothing.
+  // A code that has a key already, and not this one, is someone else's: the API is told (so the
+  // owner's page refuses the code), and nothing is attached, and no key is made for nothing.
   const key = await opts.key(lookup, name, lookup.fingerprint === null);
-  if (key === null) explain(new ApiError(409, { error: "already_attached" }));
-  const fingerprint = connectFingerprint(key.publicKey);
-  if (lookup.fingerprint !== null && lookup.fingerprint !== fingerprint) {
+  if (
+    key === null ||
+    (lookup.fingerprint !== null && lookup.fingerprint !== connectFingerprint(key.publicKey))
+  ) {
+    await api.connectContest(code).catch(() => undefined);
     explain(new ApiError(409, { error: "already_attached" }));
   }
+  const fingerprint = connectFingerprint(key.publicKey);
   log(
     key.made
       ? `key: made ${key.path} (mode 600; the private key is in it and is never printed)`
@@ -311,12 +356,22 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
       ));
     if (!funded) {
       log(
-        "stopped waiting: the bond is not in the agent's vault yet. The owner presses Fund agent " +
-          "on the page; then run the same command again.",
+        `stopped waiting: the bond is not in the agent's vault yet. ${FUND_AGENT_WHERE(lookup.owner, lookup.name)} ` +
+          "Then run the same command again.",
       );
       return outcome("waiting_for_bond");
     }
     log("funded: the bond is in the agent's vault");
+    // The account must be this agent's alone before it locks a bond in its name: its one full-access
+    // key is the agent's own.
+    const keys = await chain.fullAccessKeys(account);
+    if (keys.length !== 1 || keys[0] !== key.publicKey) {
+      throw new ConnectError(
+        `${account} has ${keys.length === 1 ? "another" : `${keys.length}`} full-access ` +
+          `${keys.length === 1 ? "key" : "keys"} besides or instead of this agent's, so it is not ` +
+          "the agent's alone: nothing was registered. Ask the owner",
+      );
+    }
     await opts.register(lookup, name, key);
     log(`registered: ${account} is an agent`);
   } else {

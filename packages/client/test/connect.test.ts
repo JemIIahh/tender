@@ -52,6 +52,8 @@ function world(
     attach?: () => Promise<ConnectLookup>;
     registered?: Array<() => Promise<unknown>>;
     existingKey?: boolean;
+    /** The account's full-access keys; the agent's own alone unless a test says. */
+    keys?: string[];
   } = {},
 ) {
   const calls: string[] = [];
@@ -71,6 +73,10 @@ function world(
         options.attach?.() ??
         lookupOf({ state: "attached", fingerprint: connectFingerprint(publicKey) })
       );
+    },
+    async connectContest(code) {
+      calls.push(`contest ${code}`);
+      return lookupOf({ state: "contested" });
     },
     async connectRegistered(code) {
       calls.push(`registered ${code}`);
@@ -100,6 +106,10 @@ function world(
           const plan = plans.length > 1 ? plans.shift() : plans[0];
           calls.push(`plan ${plan?.shortfall}`);
           return plan ?? planOf();
+        },
+        fullAccessKeys: async () => {
+          calls.push("keys");
+          return options.keys ?? [PUBLIC];
         },
       };
     },
@@ -140,6 +150,7 @@ test("the_steps_run_in_order_and_each_says_one_plain_line", async () => {
     "keyState missing",
     "keyState has-key",
     "plan 0",
+    "keys",
     "register writer",
     `registered ${CODE}`,
   ]);
@@ -181,6 +192,12 @@ test("a_wait_that_runs_out_says_where_it_stopped_and_how_to_go_on", async () => 
     "waiting for the bond: 5.00 tUSDC into the agent's vault (it holds 0.00 tUSDC)…",
   );
   expect(bondless.calls).not.toContain("register writer");
+  // It says where the owner finds Fund agent.
+  expect(bondless.lines.at(-1)).toBe(
+    "stopped waiting: the bond is not in the agent's vault yet. alice.testnet opens My agents, " +
+      "then Add an agent, in the web app (in this browser it may still be open), types writer in " +
+      "step 1, presses Finish this agent, and presses Fund agent there. Then run the same command again.",
+  );
 });
 
 test("the_bond_arriving_later_is_waited_for_and_then_the_agent_registers", async () => {
@@ -214,24 +231,57 @@ test("an_agent_that_registered_on_an_earlier_run_is_not_registered_twice", async
   expect(w.lines).toContain("key: using /keys/writer.json");
 });
 
-test("a_code_with_someone_elses_key_is_refused_before_a_key_is_made_or_anything_attached", async () => {
+test("a_code_with_someone_elses_key_is_contested_before_a_key_is_made_or_anything_attached", async () => {
   const other = KeyPair.fromRandom("ed25519").getPublicKey().toString();
   const w = world({
     lookup: lookupOf({ state: "attached", fingerprint: connectFingerprint(other) }),
   });
   await expect(connectAgent(w.opts)).rejects.toThrow(
-    /another key attached already.*Tell the owner NOT to press Create agent/,
+    /another key attached already.*page now says two different keys tried it.*NOT to press Create agent/,
   );
-  // It was told it may not make a key, and attached nothing.
-  expect(w.calls).toEqual([`lookup ${CODE}`, "chain testnet tender.testnet", "key writer false"]);
+  // It was told it may not make a key, attached nothing, and told the API (nothing secret).
+  expect(w.calls).toEqual([
+    `lookup ${CODE}`,
+    "chain testnet tender.testnet",
+    "key writer false",
+    `contest ${CODE}`,
+  ]);
 
-  // The key on this machine is not the one attached: refused as well.
+  // The key on this machine is not the one attached: contested and refused as well.
   const mine = world({
     lookup: lookupOf({ state: "attached", fingerprint: connectFingerprint(other) }),
     existingKey: true,
   });
   await expect(connectAgent(mine.opts)).rejects.toBeInstanceOf(ConnectError);
   expect(mine.calls.some((call) => call.startsWith("attach"))).toBe(false);
+  expect(mine.calls).toContain(`contest ${CODE}`);
+
+  // A code the API already says is contested is refused at the lookup.
+  const contested = world({
+    lookup: lookupOf({ state: "contested", fingerprint: connectFingerprint(other) }),
+  });
+  await expect(connectAgent(contested.opts)).rejects.toThrow(
+    /two different keys tried this connect code/,
+  );
+  expect(contested.calls).toEqual([`lookup ${CODE}`]);
+});
+
+test("an_answer_whose_account_is_not_the_name_under_the_owner_is_not_acted_on", async () => {
+  const w = world({ lookup: lookupOf({ account_id: "writer.mallory.testnet" }) });
+  await expect(connectAgent(w.opts)).rejects.toThrow(/the API's answer does not add up/);
+  expect(w.calls).toEqual([`lookup ${CODE}`]);
+});
+
+test("an_account_with_another_full_access_key_is_not_registered", async () => {
+  const other = KeyPair.fromRandom("ed25519").getPublicKey().toString();
+  const two = world({ keys: [PUBLIC, other] });
+  await expect(connectAgent(two.opts)).rejects.toThrow(
+    /has 2 full-access keys besides or instead of this agent's.*nothing was registered/,
+  );
+  expect(two.calls).not.toContain("register writer");
+  const swapped = world({ keys: [other] });
+  await expect(connectAgent(swapped.opts)).rejects.toThrow(/has another full-access key/);
+  expect(swapped.calls).not.toContain("register writer");
 });
 
 test("each_refusal_of_the_api_is_told_in_words_of_ours", async () => {

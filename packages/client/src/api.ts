@@ -571,7 +571,7 @@ export class ApiClient implements TenderApi {
 
   // ---- Connect your agent --------------------------------------------------------------------
   //
-  // The three routes of "Connect your agent" that no account signs: the connect code in the body is
+  // The four routes of "Connect your agent" that no account signs: the connect code in the body is
   // their credential (`@tender/shared`'s `connect.ts`). A client with no signer calls them.
 
   /** `POST /v1/connect/lookup`: what a connect code is for (the agent's account, where) and how it stands. */
@@ -593,6 +593,21 @@ export class ApiClient implements TenderApi {
         this.url("/connect/attach"),
         ConnectLookupSchema,
         post(signal, undefined, { code, public_key: publicKey }),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  /**
+   * `POST /v1/connect/contest`: says the key attached to the code is not this agent's. Nothing
+   * secret is sent; the owner's page then refuses the code.
+   */
+  connectContest(code: string): Promise<ConnectLookup> {
+    return this.timed("connectContest", (signal) =>
+      fetchJson(
+        this.url("/connect/contest"),
+        ConnectLookupSchema,
+        post(signal, undefined, { code }),
         this.fetchImpl,
       ),
     );

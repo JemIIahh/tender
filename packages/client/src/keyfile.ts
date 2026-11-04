@@ -284,3 +284,50 @@ export async function makeAgentKeyFile(options: {
   }
   return { path, publicKey };
 }
+
+/** A key file that is there for another network or another account: the caller asks for another name. */
+export class KeyInUseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "KeyInUseError";
+  }
+}
+
+/**
+ * The key that agent `name` connects `account` on `network` with, in `dir` (which the guard has
+ * passed): the one its file holds, if the file is for that network and for that account or for
+ * none yet; else, if `mayMake`, a new one made now (`prepareKeyDir`, then `makeAgentKeyFile` with the
+ * account); else null. A file for another network or another account is a `KeyInUseError`, and is
+ * never replaced. `pnpm agent:connect` and the MCP server's `connect_to_tender` both choose the key
+ * here, so the two attach the same key for the same name.
+ */
+export async function agentKeyFor(options: {
+  dir: string;
+  name: string;
+  network: NetworkId;
+  account: string;
+  mayMake: boolean;
+}): Promise<{ publicKey: string; path: string; made: boolean } | null> {
+  const { dir, name, network, account } = options;
+  const path = agentKeyPath(dir, name);
+  if (await hasAgentKeyFile(dir, name)) {
+    const file = await readAgentKeyFile(dir, name);
+    if (file.network !== network) {
+      throw new KeyInUseError(
+        `agent ${name} has a key for ${file.network} at ${path}, and this code is for ${network}: ` +
+          "choose another name for the agent",
+      );
+    }
+    if (file.account !== undefined && file.account !== account) {
+      throw new KeyInUseError(
+        `the key file of agent ${name} is for ${file.account}, not ${account}: choose another ` +
+          "name for the agent",
+      );
+    }
+    return { publicKey: file.publicKey, path, made: false };
+  }
+  if (!options.mayMake) return null;
+  await prepareKeyDir(dir);
+  const made = await makeAgentKeyFile({ dir, name, network, account });
+  return { ...made, made: true };
+}
