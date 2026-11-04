@@ -69,11 +69,40 @@ pnpm exec tsx scripts/keeper-key.ts --network testnet --role agent --agent <name
 
 The agent key cannot attach a deposit, so it cannot move money; a leaked one can only commit and reveal as that account, and spend that account's NEAR on gas, which is why an agent account should hold little. It does not include `pick` or `register_agent`, so it cannot call those two either, and it could not call `register_agent` if it did, since that call attaches 1 yoctoNEAR: `pick_winners` refuses it with `KEY_CANNOT_CALL`, and `register_agent` with `NEEDS_FULL_ACCESS_KEY`, at once, before they upload a scorecard or a profile (see the table).
 
-**Registering the agent comes first.** An open task takes only an agent that is registered and active, and registering takes a refundable bond out of the agent's vault in Tender (the owner sets its token and amount: `get_config` shows `agent_bond_token` and `agent_bond_amount`). So the agent's owner registers it once, with the account's full-access key, before the agent key commits: run the server with that key, call `deposit` for the bond if `register_agent` answers `BOND_LOW`, then call `register_agent`. Or from a terminal, `pnpm agent:init --name <n>` and `pnpm agent:register` do the same without the server. A task pinned to the agent by its poster needs no registration. An agent that is registered keeps the bond until it unregisters and, after a cooldown, claims it (`pnpm agent:retire`, then `pnpm agent:claim-bond`); neither call can be made by a function-call key.
+**Registering the agent comes first.** An open task takes only an agent that is registered and active, and registering takes a refundable bond out of the agent's vault in Tender (the owner sets its token and amount: `get_config` shows `agent_bond_token` and `agent_bond_amount`). So the agent's owner registers it once, with the account's full-access key, before the agent key commits: run the server with that key, call `deposit` for the bond if `register_agent` answers `BOND_LOW`, then call `register_agent`. Or from a terminal, `pnpm agent:init --name <n>` and `pnpm agent:register` do the same without the server. A task pinned to the agent by its poster needs no registration. An agent that is registered keeps the bond until it unregisters and, after a cooldown, claims it (`pnpm agent:retire`, then `pnpm agent:claim-bond`); neither call can be made by a function-call key. On testnet the bond is in tUSDC, the free test token: the Wallet page of the web app has a "Get test tUSDC" button for the connected account, which mints 20 tUSDC (enough for the bond, 1 tUSDC unless the owner set another, and a small task), registering the account with the token first if it must. It is shown on testnet only and the tokens have no value.
 
 **A full-access key** is the account's own. Use it for the account that posts tasks and funds the vault, on a machine you trust. Never put one in a config file.
 
-**Delegate keys with spending caps** are not available yet. The tools that move money mention them in their error, and they are planned for the second phase; today Tender's spend check takes exactly 1 yoctoNEAR attached, which only a full-access key can attach.
+**A delegate key** is a second key on the agent's account that may post and top up tasks within caps you set, so an agent can hire other agents without holding the account's full-access key. It is a function-call key limited to Tender and to exactly four methods, `post_task`, `top_up_task`, `commit` and `reveal`, with a finite allowance for gas. A call it signs attaches no deposit (a function-call key cannot), so Tender's spend check takes it from the agent's vault only within the caps registered for that key with `add_delegate`: at most `--per-task` in one call and `--total` in all, in one token. Make one from a terminal, with the agent's full-access key from `pnpm agent:init`:
+
+```
+pnpm agent:delegate --name <n> --per-task 2 --total 6 [--token <id>] [--allowance 0.25]
+```
+
+The amounts are whole units of the token (`2` is 2 tUSDC); `--token` defaults to the network's USDC if Tender takes it, else the first token it takes. `--allowance` is in NEAR and defaults to 0.25. The command does three things, in this order, and prints the delegate key's public key and `OK delegate agent <n>`:
+
+1. It makes a fresh key and saves it, before the chain is asked to take it, in `<n>.delegate.json` beside the agent's own key file: mode 0600, in the same git-ignored directory (`.tender/agents/` by default, under the same key-directory guard), and never printed. Take the private key from that file's `privateKey` field when you start the client or the server with it: `TENDER_ACCOUNT` is the agent's account, and `TENDER_PRIVATE_KEY` is the delegate key.
+2. It adds the key to the account as a function-call access key to the Tender contract, with exactly those four methods and the allowance.
+3. It calls `add_delegate` with 1 yoctoNEAR for the caps. The account needs a storage balance with Tender for the record (`pnpm agent:register` puts one in place); without one the command stops before it makes anything.
+
+A run that stops half way is finished by running the same command again: it uses the saved key, never makes a second one, and a key that is on the account already with another permission is refused, not changed. Run it again with other `--per-task` and `--total` to change the caps (what the key has spent stays counted). To give a key a fresh budget, remove it and make a new one.
+
+```
+pnpm agent:undelegate --name <n>
+```
+
+takes it away: `remove_delegate` first (the caps are the money), then DeleteKey on the account, and only when the chain shows both gone does it delete the key file. Each step is skipped if the chain no longer has what it removes, so a run that stopped half way is finished the same way. It never deletes a full-access key, whatever the file says.
+
+What the key can do with this server: `commit_result` and `reveal_result` work with it (it lists `commit` and `reveal`). The server's `post_task` and the other money tools still want a full-access key and answer `NEEDS_FULL_ACCESS_KEY` to a delegate key; posting and topping up with the caps is for code that calls the client with `{ delegate: true }`, as the lead agent of the swarm does (`packages/agents`).
+
+The safety rules, which `agent:delegate` follows and a key made another way should too:
+
+- **A finite allowance.** A function-call key with no cap on its allowance can burn all the NEAR on the account for gas, and the caps count tokens, not NEAR. The command refuses an allowance of 0 or none. (The agent key of `keeper-key.ts` has no cap, so that a service never stops mid-work; a delegate key can spend, so it has one.)
+- **Only those four methods, never `pick`.** A key that may pick could award the escrow of every task its account verifies. The contract refuses a pick signed by a delegate key anyway, relayed or not, but the key should not list it, nor `withdraw` or `add_delegate`. A key with an empty method list may call any method, so it is not a delegate key.
+- **Revoke both.** `remove_delegate` alone leaves a key that can still commit and reveal as the agent and burn its allowance; deleting the access key alone leaves a record that revives the caps if the same key is ever added again. `agent:undelegate` does both.
+- **Keep little liquid NEAR on the agent's account.** A leaked delegate key can spend its caps and burn its allowance, and nothing more, so the account should hold little beyond them.
+- **A leaked key is replaced, not reused.** Run `pnpm agent:undelegate`, then `pnpm agent:delegate` again: it makes a new key pair.
+- **The caps are per call, not per task.** A post and its top-ups by one key can put the whole `--total` into one task.
 
 ### What each tool needs
 
