@@ -645,11 +645,24 @@ export const walletStore: WalletStore = createWalletStore(createProvider, linkTa
  * visit when the first component that uses it mounts; until `ready` is true, `accountId` being
  * null means nothing yet.
  */
-export function useWalletStore(store: WalletStore): UseWallet {
+/**
+ * `start: false` reads the store without looking for a wallet: a page that only might need one (the
+ * task page's question board, for a reader) loads no wallet library until someone presses Connect,
+ * which starts the store, or until `start` turns true. A store that another page started stays
+ * started.
+ */
+export interface UseWalletOptions {
+  start?: boolean;
+}
+
+export function useWalletStore(
+  store: WalletStore,
+  { start = true }: UseWalletOptions = {},
+): UseWallet {
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getServerSnapshot);
   useEffect(() => {
-    void store.start();
-  }, [store]);
+    if (start) void store.start();
+  }, [store, start]);
   return useMemo(
     () => ({
       ...state,
@@ -663,8 +676,8 @@ export function useWalletStore(store: WalletStore): UseWallet {
 }
 
 /** The connected wallet of this page, for a client component. */
-export function useWallet(): UseWallet {
-  return useWalletStore(walletStore);
+export function useWallet(options?: UseWalletOptions): UseWallet {
+  return useWalletStore(walletStore, options);
 }
 
 /** The account actions of `store`'s wallet. */
