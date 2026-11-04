@@ -254,6 +254,118 @@ export function connectEvents(
   };
 }
 
+// ---- One stream for the tab -------------------------------------------------------------------
+
+/** How many of the latest messages the tab's stream keeps, for a listener that joins it late. */
+const KEPT_MESSAGES = 200;
+
+interface Listener {
+  handlers: EventHandlers;
+}
+
+/**
+ * The tab's one stream, shared by every listener (`listenToEvents`), and what it has heard: the
+ * latest messages with an id, so that a listener that joins with `since` is handed what came after
+ * it. `from` is the id the stream is known to hold every event after (undefined: it does not know,
+ * such as a stream that opened with nothing to resume from), and `dropped` the newest id that is no
+ * longer kept.
+ */
+interface TabStream {
+  stream: EventStream;
+  listeners: Set<Listener>;
+  kept: StreamEvent[];
+  from: bigint | undefined;
+  dropped: bigint | undefined;
+}
+
+/** The tab's stream, while anything listens to it. */
+let shared: TabStream | null = null;
+
+const u64 = (id: string | undefined): bigint | undefined =>
+  id !== undefined && U64StringSchema.safeParse(id).success ? BigInt(id) : undefined;
+
+/**
+ * Listens to the tab's one stream of `GET /v1/events` until `close`: the first listener opens it
+ * (`connectEvents`, at `since` if it has one) and the last one to close closes it. However many
+ * parts of a page listen, the tab holds one connection (the API holds a client to a few).
+ *
+ * Every listener hears every message (`onEvent` and `onMessage`) and every resync (`onResync`), as
+ * a stream of its own would tell it. One that joins a stream already open with `since` is first
+ * handed the kept messages after that id, in order; if the stream can't say it heard everything
+ * after it (it opened later than that, or no longer keeps them), the listener is told to resync.
+ */
+export function listenToEvents(
+  handlers: EventHandlers,
+  { since }: ConnectOptions = {},
+): EventStream {
+  const listener: Listener = { handlers };
+  if (shared === null) {
+    const start = u64(since);
+    const tab: TabStream = {
+      listeners: new Set([listener]),
+      kept: [],
+      from: start,
+      dropped: undefined,
+      stream: { close() {} },
+    };
+    shared = tab;
+    tab.stream = connectEvents(
+      {
+        onEvent: () => {},
+        onResync: () => {
+          // What came before is not sent again: the stream is no longer sure of anything kept.
+          tab.kept = [];
+          tab.from = undefined;
+          tab.dropped = undefined;
+          for (const one of [...tab.listeners]) one.handlers.onResync();
+        },
+        onMessage: (message) => {
+          if (message.id !== undefined) {
+            tab.kept.push(message);
+            if (tab.kept.length > KEPT_MESSAGES) tab.dropped = u64(tab.kept.shift()?.id);
+          }
+          const info: EventInfo = { event: message.event, task_id: message.task_id ?? undefined };
+          for (const one of [...tab.listeners]) {
+            one.handlers.onEvent(info);
+            one.handlers.onMessage?.(message);
+          }
+        },
+      },
+      { since },
+    );
+  } else {
+    const tab = shared;
+    tab.listeners.add(listener);
+    const after = u64(since);
+    if (after !== undefined) {
+      const missing =
+        tab.from === undefined ||
+        tab.from > after ||
+        (tab.dropped !== undefined && tab.dropped > after);
+      for (const message of tab.kept) {
+        const id = u64(message.id);
+        if (id === undefined || id <= after) continue;
+        handlers.onEvent({ event: message.event, task_id: message.task_id ?? undefined });
+        handlers.onMessage?.(message);
+      }
+      if (missing) handlers.onResync();
+    }
+  }
+  const tab = shared;
+  let closed = false;
+  return {
+    close() {
+      if (closed) return;
+      closed = true;
+      tab.listeners.delete(listener);
+      if (tab.listeners.size === 0 && shared === tab) {
+        shared = null;
+        tab.stream.close();
+      }
+    },
+  };
+}
+
 /**
  * A counter that goes up each time the stream tells this page something worth looking at: an event
  * `filter` lets through (every event if there is none), and also once whenever the stream opens
@@ -292,7 +404,7 @@ export function useEventsBy<K extends string>(
   });
 
   useEffect(() => {
-    const stream = connectEvents({
+    const stream = listenToEvents({
       onEvent: (info) => {
         const kind = latest.current(info);
         if (kind === null) return;

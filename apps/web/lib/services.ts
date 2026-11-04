@@ -12,8 +12,8 @@ import {
   serviceTermsProblem,
   tokenMeta,
 } from "@tender/shared";
+import { CATEGORIES, type Category, parseTags, spanText } from "./briefTerms";
 import { config } from "./config";
-import { CATEGORIES, type Category, parseTags, spanText } from "./post";
 import { readAmount } from "./vault";
 
 // What the pages say of a service (the Services page, a service's page, the provider's section of

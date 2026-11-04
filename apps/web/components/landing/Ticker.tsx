@@ -2,10 +2,8 @@
 
 import { type CSSProperties, useEffect, useState } from "react";
 import { config } from "../../lib/config";
+import { liveReads } from "../../lib/liveReads";
 import { factItems, liveItems, readTicker, type TickerItem } from "../../lib/ticker";
-
-/** How often the live figures are read again, while the tab is in view. */
-const REFRESH_MS = 60_000;
 
 /** Fewer items than this in a copy would leave a gap on a wide screen, so the copy repeats. */
 const MIN_ITEMS = 10;
@@ -34,20 +32,20 @@ function Item({ item }: { item: TickerItem }) {
 export function Ticker() {
   const [live, setLive] = useState<TickerItem[]>([]);
 
+  // The tab's shared read of the figures (the Live pill's too), read again each minute while the
+  // tab is in view; each time it comes, the ticker reads the recent payout to go with it. Only the
+  // latest counts.
   useEffect(() => {
-    let gone = false;
-    const load = () => {
-      readTicker().then((data) => {
-        if (!gone) setLive(liveItems(data, config.network));
+    let latest = 0;
+    const unsubscribe = liveReads.subscribe((reads) => {
+      const mine = ++latest;
+      readTicker(reads).then((data) => {
+        if (mine === latest) setLive(liveItems(data, config.network));
       });
-    };
-    load();
-    const every = setInterval(() => {
-      if (document.visibilityState === "visible") load();
-    }, REFRESH_MS);
+    });
     return () => {
-      gone = true;
-      clearInterval(every);
+      latest = -1;
+      unsubscribe();
     };
   }, []);
 

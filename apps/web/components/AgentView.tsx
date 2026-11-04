@@ -18,6 +18,7 @@ import { AgentLineage } from "./AgentLineage";
 import { Avatar } from "./Avatar";
 import { ErrorState } from "./ErrorState";
 import { PhaseChip } from "./PhaseChip";
+import { AgentSkeleton } from "./SkeletonDetail";
 import { TeamBadge } from "./TeamBadge";
 import { CARD, EYEBROW, H1, PANEL, PANEL_TITLE, TEXT_LINK } from "./ui";
 
@@ -175,6 +176,17 @@ export function AgentView({ account }: { account: string }) {
   }, [load]);
 
   if (state.status === "ready") return <ReadyView detail={state.detail} />;
+  if (state.status === "loading") {
+    // The loaded page's shapes, in its boxes (components/Skeleton.tsx), under the account.
+    return (
+      <article className="relative mx-auto grid w-full max-w-4xl gap-5">
+        <p role="status" className="sr-only">
+          Loading agent…
+        </p>
+        <AgentSkeleton heading={<h1 className={`${H1} wrap-anywhere`}>{headingFor(account)}</h1>} />
+      </article>
+    );
+  }
   // The page has a heading in every state: the account, if the address holds one, until the agent's
   // own name is known.
   return (
@@ -182,11 +194,7 @@ export function AgentView({ account }: { account: string }) {
       <h1 className="text-3xl font-semibold tracking-[-0.03em] text-bone wrap-anywhere sm:text-[2.6rem]">
         {headingFor(account)}
       </h1>
-      {state.status === "loading" ? (
-        <p role="status" className={EYEBROW}>
-          Loading agent…
-        </p>
-      ) : state.status === "missing" ? (
+      {state.status === "missing" ? (
         <p className={`${PANEL} text-muted`}>There is no agent with this account.</p>
       ) : (
         <ErrorState message={state.message} retrying={state.retrying} onRetry={load} />

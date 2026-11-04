@@ -1,4 +1,4 @@
-import { type AnswerFormat, FORMAT_LABEL, KINDS } from "./post";
+import { type AnswerFormat, FORMAT_LABEL, KINDS } from "./briefTerms";
 
 // Words that more than one place says. Each is said one way, here, so that a card and its page,
 // or a wizard and the page of the task it made, never word the same thing two ways.

@@ -74,6 +74,8 @@ function framesPass(page: Page, frames: number, ms: number): Promise<void> {
 }
 
 test("landing_art_moves_and_holds_still_with_reduced_motion", async ({ page }) => {
+  // It waits for real frames, as many as a busy machine takes to draw: three times the time.
+  test.slow();
   await routeApi(page);
   const art = page.getByTestId("art-hero");
 

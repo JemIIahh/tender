@@ -19,7 +19,7 @@ export const STEPS: readonly Step[] = [
     fields: [
       ["Reward", "In escrow"],
       ["Windows", "Commit · reveal · pick"],
-      ["Verifier", "Judge or poster"],
+      ["Verifier", "Any account; poster as fallback"],
     ],
   },
   {

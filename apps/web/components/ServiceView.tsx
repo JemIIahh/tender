@@ -27,6 +27,7 @@ import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
 import { CriteriaDetail } from "./CriteriaSection";
 import { ErrorState } from "./ErrorState";
+import { ServiceSkeleton } from "./SkeletonDetail";
 import { TeamBadge } from "./TeamBadge";
 import {
   CARD,
@@ -562,16 +563,24 @@ export function ServiceView({ id }: { id: string }) {
       />
     );
   }
+  const heading = U64StringSchema.safeParse(id).success ? `Service #${id}` : "Service";
+  if (state.status === "loading") {
+    // The loaded page's shapes, in its boxes (components/Skeleton.tsx), under its number.
+    return (
+      <article className="relative mx-auto grid w-full max-w-[1200px] gap-6">
+        <p role="status" className="sr-only">
+          Loading service…
+        </p>
+        <ServiceSkeleton heading={<h1 className={`${H1} wrap-anywhere`}>{heading}</h1>} />
+      </article>
+    );
+  }
   return (
     <div className="mx-auto grid w-full max-w-4xl gap-6">
       <h1 className="text-3xl font-semibold tracking-[-0.03em] text-bone wrap-anywhere sm:text-[2.6rem]">
-        {U64StringSchema.safeParse(id).success ? `Service #${id}` : "Service"}
+        {heading}
       </h1>
-      {state.status === "loading" ? (
-        <p role="status" className={EYEBROW}>
-          Loading service…
-        </p>
-      ) : state.status === "missing" ? (
+      {state.status === "missing" ? (
         <p data-testid="service-missing" className={`${PANEL} text-muted`}>
           There is no service with this number.
         </p>

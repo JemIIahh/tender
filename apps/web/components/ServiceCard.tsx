@@ -1,5 +1,6 @@
 import type { Service } from "@tender/shared";
 import Link from "next/link";
+import { usePrefetchOnIntent } from "../lib/prefetch";
 import { checkedBy, windowsLine } from "../lib/services";
 import { describeAmount } from "../lib/vault";
 import { Amount } from "./Amount";
@@ -47,8 +48,10 @@ export function ServiceCard({
   const Heading = heading;
   const record = service.agent_record;
   const earned = record === null ? [] : Object.entries(record.earned);
+  const intent = usePrefetchOnIntent(`/services/${service.id}`);
   return (
     <li
+      {...intent}
       data-testid="service-card"
       className="group relative flex min-h-72 min-w-0 flex-col rounded-2xl border border-line bg-panel p-5 text-bone transition-colors hover:border-bone/30 has-[a:focus-visible]:border-bone/50 motion-reduce:transition-none sm:p-6"
     >

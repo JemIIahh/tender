@@ -10,8 +10,9 @@ import { Avatar } from "./Avatar";
 import { Stat, Stats, Tokens } from "./account/parts";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
+import { MetricsSkeleton } from "./SkeletonLists";
 import { TeamBadge } from "./TeamBadge";
-import { CARD, EYEBROW, FACT_LABEL, PANEL_TITLE } from "./ui";
+import { CARD, FACT_LABEL, PANEL_TITLE } from "./ui";
 
 // Metrics: the platform's figures, as `GET /v1/metrics` counts them now. Every figure is the API's,
 // amounts are listed token by token and never added across tokens, and a figure the API does not
@@ -229,9 +230,12 @@ function Body({ data, onRetry }: { data: Loaded<MetricsResponse>; onRetry: () =>
     return <ErrorState message={data.message} retrying={data.retrying} onRetry={onRetry} />;
   }
   return (
-    <p role="status" className={EYEBROW}>
-      Counting…
-    </p>
+    <div className="relative grid gap-8">
+      <p role="status" className="sr-only">
+        Counting…
+      </p>
+      <MetricsSkeleton />
+    </div>
   );
 }
 

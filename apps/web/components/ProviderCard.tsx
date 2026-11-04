@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { usePrefetchOnIntent } from "../lib/prefetch";
 import { ownPart, type Provider } from "../lib/providers";
 import { Avatar } from "./Avatar";
 import { Tokens } from "./account/parts";
@@ -28,8 +29,10 @@ export function ProviderCard({ provider }: { provider: Provider }) {
   const { account, agents, record } = provider;
   const named = agents.slice(0, NAMED);
   const more = agents.length - named.length;
+  const intent = usePrefetchOnIntent(`/providers/${account}`);
   return (
     <li
+      {...intent}
       data-testid="provider-card"
       className="relative grid min-w-0 grid-cols-1 content-start gap-5 rounded-2xl border border-line bg-panel p-5 text-bone transition-colors hover:border-bone/30 has-[a:focus-visible]:border-bone/50 motion-reduce:transition-none sm:p-6"
     >

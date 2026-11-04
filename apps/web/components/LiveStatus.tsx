@@ -4,13 +4,11 @@ import { formatTokenAmount, tokenMeta } from "@tender/shared";
 import Link from "next/link";
 import { useEffect, useId, useRef, useState } from "react";
 import { config } from "../lib/config";
-import { type Live, type LiveState, liveOf, readLive } from "../lib/live";
+import { type Live, type LiveState, liveOf, liveReads } from "../lib/live";
+import { scrollCue } from "../lib/scrollCue";
 import { knownFirst, knowsToken } from "../lib/tokens";
 import { RawUnits } from "./Amount";
-import { SECONDARY, TEXT_LINK } from "./ui";
-
-/** How often the figures are read again, while the tab is in view: the landing ticker's pace. */
-const REFRESH_MS = 60_000;
+import { SCROLL_CUE, SECONDARY, TEXT_LINK } from "./ui";
 
 /** The pill's size in the top bar: the bar's other pills', and the dot alone on a phone. */
 const PILL = "min-h-10 whitespace-nowrap px-3.5 sm:px-4 max-sm:w-10 max-sm:px-0";
@@ -62,8 +60,9 @@ function EscrowLine({ token, amount }: { token: string; amount: bigint }) {
     <li data-testid="live-escrow" className="grid min-w-0 gap-0.5">
       <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 font-mono text-[12px] text-bone tabular-nums">
         <span
+          ref={scrollCue}
           data-testid="live-escrow-amount"
-          className="inline-block max-w-full overflow-x-auto align-bottom whitespace-nowrap"
+          className={`inline-block max-w-full overflow-x-auto align-bottom whitespace-nowrap ${SCROLL_CUE}`}
         >
           {formatTokenAmount(amount, decimals)}
         </span>{" "}
@@ -130,11 +129,11 @@ export function LiveStatus() {
   const panel = useRef<HTMLDivElement>(null);
   const panelId = useId();
 
-  useEffect(() => {
-    let gone = false;
-    const load = () => {
-      readLive().then((reads) => {
-        if (gone) return;
+  // The tab's one read of the figures, which the landing's ticker shares: read again each minute
+  // while the tab is in view (`liveReads`).
+  useEffect(
+    () =>
+      liveReads.subscribe((reads) => {
         // A read the page can't make sense of leaves a state that is true, not the last one: the
         // API answered, so it is not offline, but the index can't be said to be up to date.
         let next: Live;
@@ -145,17 +144,9 @@ export function LiveStatus() {
           next = { state: reads.answered ? "behind" : "offline" };
         }
         setLive(next);
-      });
-    };
-    load();
-    const every = setInterval(() => {
-      if (document.visibilityState === "visible") load();
-    }, REFRESH_MS);
-    return () => {
-      gone = true;
-      clearInterval(every);
-    };
-  }, []);
+      }),
+    [],
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -199,7 +190,10 @@ export function LiveStatus() {
         <Dot state={live.state} />
         <span className="max-sm:sr-only">{look.word}</span>
       </button>
-      {/* Always in the page, so that `aria-controls` names an element; `hidden` while closed. */}
+      {/* Always in the page, so that `aria-controls` names an element; `hidden` while closed. On
+          a phone it is fixed to the screen, under the top bar and across it with a gutter at each
+          side; nothing around it is a box that a fixed part is placed in (AppShell's top bar keeps
+          its blur on a layer of its own for that). */}
       <div
         ref={panel}
         id={panelId}

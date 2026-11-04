@@ -1,6 +1,7 @@
 "use client";
 
 import type { TaskDetailResponse } from "@tender/shared";
+import dynamic from "next/dynamic";
 import { type ReactNode, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   type ActionAnchor,
@@ -18,11 +19,36 @@ import { describeAmount } from "../../lib/vault";
 import { useWallet } from "../../lib/wallet";
 import { Countdown } from "../Countdown";
 import { JudgeNote } from "../JudgeNote";
+import { Shape } from "../Skeleton";
 import { CARD, EYEBROW, NOTICE, PANEL_TITLE } from "../ui";
 import { Connect } from "./Connect";
-import { PickPanel } from "./PickPanel";
 import { RefundPanel } from "./RefundPanel";
-import { TopUpPanel } from "./TopUpPanel";
+
+/**
+ * A panel's place while its code comes: a few shapes (components/Skeleton.tsx), in the panel's own
+ * box, that say nothing to a screen reader (the section's heading is already there).
+ */
+function PanelLoading() {
+  return (
+    <div aria-hidden="true" data-testid="action-loading" className="grid gap-3">
+      <Shape className="h-4 w-3/4 rounded-full" />
+      <Shape className="h-11 rounded-xl" />
+      <Shape className="h-11 w-40 rounded-full" />
+    </div>
+  );
+}
+
+// Picking and topping up are for some readers only (the account whose pick window is open, a
+// connected wallet while the task takes entries), so each of their panels comes in a chunk of its
+// own when it is shown, and a reader who sees neither loads none of their code. The refund panel
+// is every reader's on a task that is to be refunded, and says when it opens to the second, so it
+// comes with the page (RefundPanel, imported as usual).
+const PickPanel = dynamic(() => import("./PickPanel").then((module) => module.PickPanel), {
+  loading: PanelLoading,
+});
+const TopUpPanel = dynamic(() => import("./TopUpPanel").then((module) => module.TopUpPanel), {
+  loading: PanelLoading,
+});
 
 /** What an action came to, kept for the page until it is left. */
 interface Sent {

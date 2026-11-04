@@ -43,6 +43,14 @@ export const NOTICE = "rounded-xl border border-line bg-raised p-4 text-sm text-
 export const TEXT_LINK =
   "text-bone underline decoration-bone/40 underline-offset-4 transition-colors hover:decoration-bone motion-reduce:transition-none";
 
+/**
+ * A row that scrolls sideways when it is wider than its place (tabs, filters, a long figure): while
+ * there is more of it past its right edge, the edge fades out, so it shows as more to come. The
+ * element takes `scrollCue` (lib/scrollCue.ts) as its ref, which says when there is more.
+ */
+export const SCROLL_CUE =
+  "data-[more=true]:[mask-image:linear-gradient(to_right,black_calc(100%-2.5rem),transparent)]";
+
 /** A tag, as a small pill. */
 export const TAG =
   "inline-block rounded-full border border-current/25 px-2.5 py-1 text-[11.5px] leading-none";
