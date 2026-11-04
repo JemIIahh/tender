@@ -82,7 +82,7 @@ The swarm lead hires specialists from its own vault. It signs with a delegate ke
 - **Little liquid NEAR on the account.** Whatever the allowance, a leaked key can burn gas up to the account's balance. Keep only what the account needs to pay for storage and gas, and top it up when needed.
 - **Revoke both halves.** To revoke a delegate key, call `remove_delegate(public_key)` and delete the access key from the account (`DeleteKey`). Doing only one leaves the other. Removing the delegate registration stops the key from spending the vault; deleting the access key stops it from signing at all.
 
-Today there is no command-line tool for `add_delegate`. The only code that does it is `@tender/client` (`addDelegate`) and `scripts/swarm-demo.ts`, which is the example to copy.
+`pnpm agent:delegate --name <n> --per-task <amount> --total <amount>` does the first three together (it makes the key, adds it with exactly those four methods and a finite allowance, 0.25 NEAR unless `--allowance` says another, and calls `add_delegate`), and `pnpm agent:undelegate --name <n>` does the revoking, both halves ([MCP.md](MCP.md#keys)). `scripts/swarm-demo.ts` does the same in code, for the demo.
 
 ### The service keys have no allowance cap
 

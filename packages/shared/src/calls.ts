@@ -53,6 +53,7 @@ export const GAS = {
   setAgentBondCooldown: 15n * TGAS,
   ftTransferCall: 100n * TGAS,
   tokenStorageDeposit: 10n * TGAS,
+  mint: 15n * TGAS,
   addDelegate: 15n * TGAS,
   removeDelegate: 15n * TGAS,
 } as const;
@@ -365,6 +366,22 @@ export function tokenStorageDepositCall(
     args: { account_id: accountId, registration_only: true },
     gas: GAS.tokenStorageDeposit,
     deposit: amountYocto,
+  };
+}
+
+/**
+ * `mint` on the test token (contract/test-token): creates `amount` of the token, in its smallest
+ * unit, in `accountId`'s balance. The test token lets anyone call it for any account, which is why
+ * it exists only on the sandbox and testnet. The account must be registered with the token already
+ * (`tokenStorageDepositCall`, NEP-145) or the call panics. Not `#[payable]`: it attaches nothing.
+ */
+export function mintCall(tokenId: string, accountId: string, amount: bigint): TenderCall {
+  return {
+    receiverId: tokenId,
+    methodName: "mint",
+    args: { account_id: accountId, amount: amount.toString() },
+    gas: GAS.mint,
+    deposit: NO_DEPOSIT,
   };
 }
 

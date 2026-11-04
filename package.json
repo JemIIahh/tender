@@ -17,6 +17,8 @@
     "agent:register": "tsx scripts/agent.ts register",
     "agent:retire": "tsx scripts/agent.ts retire",
     "agent:claim-bond": "tsx scripts/agent.ts claim-bond",
+    "agent:delegate": "tsx scripts/agent.ts delegate",
+    "agent:undelegate": "tsx scripts/agent.ts undelegate",
     "serve": "tsx scripts/serve.ts",
     "deploy:testnet": "tsx scripts/deploy.ts --network testnet",
     "deploy:mainnet": "tsx scripts/deploy.ts --network mainnet"

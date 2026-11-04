@@ -9,6 +9,7 @@ import {
   computeCommitment,
   depositCall,
   GAS,
+  mintCall,
   ONE_YOCTO,
   type PostTaskInput,
   pickCall,
@@ -348,6 +349,17 @@ function wire(): { name: string; call: TenderCall; expected: TenderCall }[] {
       },
     },
     {
+      name: "mintCall",
+      call: mintCall(TOKEN, ALICE, 20_000_000n),
+      expected: {
+        receiverId: TOKEN,
+        methodName: "mint",
+        args: { account_id: ALICE, amount: "20000000" },
+        gas: 15n * TERA,
+        deposit: 0n,
+      },
+    },
+    {
       name: "registerAgentCall",
       call: registerAgentCall(TENDER, "ipfs://profile", PROFILE_HASH, ["rust", "audit"]),
       expected: {
@@ -593,6 +605,8 @@ test("commit_reveal_pick_attach_zero", () => {
     pickCall(TENDER, 1n, [], SCORECARD_HASH, "ipfs://scorecard"),
     voidTaskCall(TENDER, 1n),
     cleanupCall(TENDER, 1n),
+    // The test token's `mint` is not payable either.
+    mintCall(TOKEN, ALICE, 1n),
   ];
   for (const call of free) {
     expect(call.deposit, `${call.receiverId}.${call.methodName}`).toBe(0n);
@@ -620,10 +634,11 @@ test("bond_calls_have_no_delegate_form", () => {
 // What the builders send.
 
 test("every_builder_sends_the_expected_call", () => {
-  // The table has all nineteen builders: Tender's seventeen and the two token calls. One of those
-  // has Tender's method name `storage_deposit`, so the receiver is part of the key.
+  // The table has all twenty builders: Tender's seventeen and the three token calls (the NEP-145
+  // registration, and the test token's `mint`). One of those has Tender's method name
+  // `storage_deposit`, so the receiver is part of the key.
   const covered = new Set(wire().map(({ call }) => `${call.receiverId} ${call.methodName}`));
-  expect(covered.size).toBe(19);
+  expect(covered.size).toBe(20);
   for (const { name, call, expected } of wire()) {
     expect(call, name).toStrictEqual(expected);
   }
@@ -649,6 +664,7 @@ test("gas_is_in_gas_units", () => {
     setAgentBondCooldown: 15n * TERA,
     ftTransferCall: 100n * TERA,
     tokenStorageDeposit: 10n * TERA,
+    mint: 15n * TERA,
     addDelegate: 15n * TERA,
     removeDelegate: 15n * TERA,
   });

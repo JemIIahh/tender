@@ -146,6 +146,44 @@ test("withdraw_registers_the_account_at_the_token_first", async ({ page }) => {
   expect(vaultOf(chain)).toEqual({ [TOKEN]: TUSDC(60).toString() });
 });
 
+test("get_test_tusdc_registers_the_account_and_mints_in_one_approval", async ({ page }) => {
+  // The build is for testnet (playwright.config.ts), where the page offers free test tokens. The
+  // token has not registered ALICE, so the registration goes in front of the mint: one approval,
+  // one transaction, to the token.
+  const chain = new FakeChain(CONTRACT, [{ token: TOKEN }]);
+  const wallet = await installWallet(page, chain, { account: ALICE });
+
+  await connect(page);
+  await expect(row(page).getByTestId("wallet-balance")).toHaveText("0.00 tUSDC");
+  const faucet = page.getByTestId("faucet");
+  await expect(faucet).toContainText("Free test tokens with no value");
+  await expect(faucet).toContainText("Testnet only");
+
+  await faucet.getByRole("button", { name: "Get test tUSDC" }).click();
+
+  await expect(faucet.getByTestId("notice")).toHaveText(
+    "Added 20.00 tUSDC to your wallet. They are free test tokens with no value.",
+  );
+  await expect(row(page).getByTestId("wallet-balance")).toHaveText("20.00 tUSDC");
+  expect(wallet.sent).toHaveLength(1);
+  expect(wallet.sent[0]?.transactions.map((t) => t.receiverId)).toEqual([TOKEN]);
+  expect(wallet.sent[0]?.transactions[0]?.actions.map((a) => a.params.methodName)).toEqual([
+    "storage_deposit",
+    "mint",
+  ]);
+  expect(wallet.sent[0]?.transactions[0]?.actions[1]?.params.args).toEqual({
+    account_id: ALICE,
+    amount: TUSDC(20).toString(),
+  });
+
+  // The account is registered now, so a second press is the mint alone.
+  await faucet.getByRole("button", { name: "Get test tUSDC" }).click();
+  await expect(row(page).getByTestId("wallet-balance")).toHaveText("40.00 tUSDC");
+  expect(wallet.sent[1]?.transactions[0]?.actions.map((a) => a.params.methodName)).toEqual([
+    "mint",
+  ]);
+});
+
 test("wallet_that_cannot_sign_messages_says_so_and_still_moves_funds", async ({ page }) => {
   const chain = new FakeChain(CONTRACT, [{ token: TOKEN }]);
   chain.fundVault(ALICE, TOKEN, TUSDC(10));

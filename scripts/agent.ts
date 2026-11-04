@@ -1,36 +1,67 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, open, readdir, readFile, realpath, rename, stat } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+} from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { parseArgs, promisify } from "node:util";
 import {
   type AgentProfile,
+  type KeyPermission,
   type RegistrationPlan,
   registerWithBond,
+  type Signer,
   scriptedProfile,
   TenderClient,
   TenderError,
+  toTxResult,
 } from "@tender/client";
 import {
   AccountIdSchema,
   type AgentView,
+  type DelegateView,
+  DelegateViewSchema,
+  formatTokenAmount,
   NETWORKS,
   type NetworkId,
   ProfileSchema,
+  parseTokenAmount,
+  tokenMeta,
 } from "@tender/shared";
-import { formatNearAmount, KeyPair, type KeyPairString } from "near-api-js";
+import {
+  Account,
+  actions,
+  formatNearAmount,
+  JsonRpcProvider,
+  KeyPair,
+  type KeyPairString,
+  PublicKey,
+} from "near-api-js";
 import { readDeployment, UsageError } from "./deploy";
 import { REPO_ROOT, readEnvFile } from "./lib/env";
 
 /**
  * The agent commands. An agent is a NEAR account that has put up a refundable bond with Tender
- * (contract Task 16b); only a registered agent whose bond is held may enter an open task. These four
+ * (contract Task 16b); only a registered agent whose bond is held may enter an open task. These
  * commands take an account through its life:
  *
  *   pnpm agent:init --name <name>     makes the agent's key, on this machine, and prints its PUBLIC half
  *   pnpm agent:register               puts the bond in the vault if it is short, registers, prints the status
  *   pnpm agent:retire                 starts the way out: no new open task, the bond claimable after a cooldown
  *   pnpm agent:claim-bond             once the cooldown is over, the bond goes back to the vault
+ *
+ * and these two give the agent a key that may spend, within caps, without being the account's own:
+ *
+ *   pnpm agent:delegate --per-task <amount> --total <amount>   a delegate key: see "THE DELEGATE KEY"
+ *   pnpm agent:undelegate             takes its caps back and deletes the key from the account
  *
  * THE KEY. `init` makes an ed25519 key and writes it to the agent's own file, `<name>.json` in
  * `.tender/agents/` of the repository (git-ignored), mode 0600 in a directory of mode 0700. The
@@ -54,6 +85,22 @@ import { REPO_ROOT, readEnvFile } from "./lib/env";
  * answered yes, or was given `--yes`. Without a terminal and without `--yes` the answer is no, and
  * nothing moves.
  *
+ * THE DELEGATE KEY. `delegate` makes a second key for the same account, a function-call key that
+ * may call only `post_task`, `top_up_task`, `commit` and `reveal` on the Tender contract (never
+ * `pick`, `withdraw` or `add_delegate`), with a finite allowance for gas (0.25 NEAR unless
+ * `--allowance` says another), and registers it with `add_delegate` for the caps `--per-task` (per
+ * call) and `--total` (in all), in `--token`'s units. It signs with the agent's full-access key,
+ * from the key file. The new key's file is `<name>.delegate.json` beside it: mode 0600, git-ignored
+ * like it (the same key-directory guard), private key never printed. The key is saved before the
+ * chain is asked to take it, so a run that stops half way is finished by running the command
+ * again. `undelegate` is its undoing: `remove_delegate` (the caps, which are the money), then
+ * DeleteKey (the key), and only when the chain shows both gone is the file removed. Before its first
+ * chain step `undelegate` marks the file (`"revoking": true`), and `delegate` refuses a marked file:
+ * a run of `undelegate` that stopped after `remove_delegate` is finished by running it again, and
+ * is never mistaken for a `delegate` that stopped, which would give the key new caps with nothing
+ * spent. A function-call key that leaks costs at most its caps and its allowance; keep little
+ * liquid NEAR on the account.
+ *
  * WHERE. `--network` (else `TENDER_NETWORK` in the environment or `.env`, else testnet), the contract
  * from `TENDER_CONTRACT` or the network's record in `deployments/`, the node from `NEAR_RPC_URL` or
  * the network's own. The deploy's `.env.deploy.<network>`, which holds other accounts' keys, is not
@@ -65,10 +112,16 @@ const USAGE = `usage:
   pnpm agent:register [--name <name>] [--account <id>] [--network <n>] [--yes]
                       [--tags a,b] [--description <text>] [--uri <uri>] [--dir <path>]
   pnpm agent:retire [--name <name>] [--network <n>] [--yes] [--dir <path>]
-  pnpm agent:claim-bond [--name <name>] [--network <n>] [--dir <path>]`;
+  pnpm agent:claim-bond [--name <name>] [--network <n>] [--dir <path>]
+  pnpm agent:delegate --per-task <amount> --total <amount> [--name <name>] [--token <id>]
+                      [--allowance <NEAR>] [--network <n>] [--dir <path>]
+  pnpm agent:undelegate [--name <name>] [--network <n>] [--dir <path>]`;
 
 /** An agent's name: the key file's name, and the name in its profile. */
 const NAME = /^[a-z][a-z0-9-]{0,31}$/;
+
+/** What a delegate key's file is called after the agent's name: `<name>.delegate.json`. */
+const DELEGATE_SUFFIX = ".delegate.json";
 
 /** Where the keys go: git-ignored (`.gitignore` has `.tender/`), so no key lands in a commit. */
 const KEYS_DIR = join(REPO_ROOT, ".tender", "agents");
@@ -162,7 +215,9 @@ async function keysDirOf(dir: string | undefined, name = "agent"): Promise<strin
   if (!isUnder(root, path, await ignoresCase(root))) return path;
   // A name that is not an agent's (a flag not checked yet) is probed as "agent": it must not lead out.
   const stem = NAME.test(name) ? name : "agent";
-  const files = [`${stem}.json`, `${stem}.json.tmp`].map((file) => join(path, file));
+  const files = [`${stem}.json`, `${stem}.json.tmp`, `${stem}${DELEGATE_SUFFIX}`].map((file) =>
+    join(path, file),
+  );
   const ignored = await Promise.all(files.map((file) => gitIgnores(root, file)));
   if (!ignored.every(Boolean)) {
     throw new UsageError(
@@ -176,7 +231,11 @@ async function keysDirOf(dir: string | undefined, name = "agent"): Promise<strin
 const fileOf = (dir: string, name: string) => join(dir, `${name}.json`);
 
 /** Writes the file whole, mode 0600, synced: a crash leaves the old file or the new, not half. */
-async function writeKeyFile(path: string, key: KeyFile, replace: boolean): Promise<void> {
+async function writeKeyFile(
+  path: string,
+  key: KeyFile | DelegateFile,
+  replace: boolean,
+): Promise<void> {
   const text = `${JSON.stringify(key, null, 2)}\n`;
   if (!replace) {
     // `wx`: fails if the file exists. A key is never replaced by this path.
@@ -680,6 +739,542 @@ export async function claimBondCommand(options: CommandOptions): Promise<AgentVi
   return after;
 }
 
+// ---- The delegate key -------------------------------------------------------------------------
+
+/**
+ * The methods of a delegate key, and no others: it posts and tops up tasks (within its caps) and
+ * enters them (`commit`, `reveal`). Never `pick`, which judges and which the contract refuses a
+ * delegate key anyway, and nothing that moves money out (`withdraw`) or widens a key
+ * (`add_delegate`). The list is exact on the chain: a key with another list is not this one.
+ */
+export const DELEGATE_METHODS: readonly string[] = ["post_task", "top_up_task", "commit", "reveal"];
+
+/**
+ * The gas a delegate key may burn before it stops, in NEAR, when `--allowance` says nothing. It is
+ * always finite: a function-call key with no cap on its allowance can spend all of the account's
+ * NEAR on fees, which the caps (they count tokens) do not bound.
+ */
+export const DEFAULT_ALLOWANCE = "0.25";
+
+/** What a delegate key's file holds. The private key is in it and nowhere else. */
+interface DelegateFile {
+  version: 1;
+  kind: "delegate";
+  name: string;
+  network: NetworkId;
+  account: string;
+  /** The Tender contract the key is limited to, and whose caps it has. */
+  contract: string;
+  publicKey: string;
+  privateKey: string;
+  /**
+   * Set by `undelegate` before its first chain step and cleared only by deleting the file, once the
+   * chain shows the key and its caps gone. A file in this state is a revoke that stopped half way:
+   * `delegate` refuses it, because giving the key caps again would start it with nothing spent.
+   */
+  revoking?: true;
+}
+
+const delegateFileOf = (dir: string, name: string) => join(dir, `${name}${DELEGATE_SUFFIX}`);
+
+/**
+ * The delegate key file of `name`, or null if there is none. Throws, without the key, if it is
+ * readable by others, not a delegate key file, or if its private key is not the one its public key
+ * says.
+ */
+async function readDelegateFile(dir: string, name: string): Promise<DelegateFile | null> {
+  const path = delegateFileOf(dir, name);
+  let info: Awaited<ReturnType<typeof stat>>;
+  try {
+    info = await stat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  if ((info.mode & 0o077) !== 0) {
+    throw new Error(
+      `${path} can be read by other users of this machine: run chmod 600 on it first ` +
+        "(and treat the key as exposed if others could have read it)",
+    );
+  }
+  const bad = () => new Error(`${path} is not a delegate key file made by pnpm agent:delegate`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    throw bad();
+  }
+  if (typeof parsed !== "object" || parsed === null) throw bad();
+  const f = parsed as Record<string, unknown>;
+  if (
+    f.version !== 1 ||
+    f.kind !== "delegate" ||
+    f.name !== name ||
+    typeof f.network !== "string" ||
+    !isNetwork(f.network) ||
+    typeof f.account !== "string" ||
+    !AccountIdSchema.safeParse(f.account).success ||
+    typeof f.contract !== "string" ||
+    !AccountIdSchema.safeParse(f.contract).success ||
+    typeof f.publicKey !== "string" ||
+    typeof f.privateKey !== "string" ||
+    (f.revoking !== undefined && f.revoking !== true)
+  ) {
+    throw bad();
+  }
+  let derived: string;
+  try {
+    derived = KeyPair.fromString(f.privateKey as KeyPairString)
+      .getPublicKey()
+      .toString();
+  } catch {
+    throw bad();
+  }
+  if (derived !== f.publicKey) {
+    throw new Error(`the private key in ${path} is not the one its public key names`);
+  }
+  return {
+    version: 1,
+    kind: "delegate",
+    name,
+    network: f.network,
+    account: f.account,
+    contract: f.contract,
+    publicKey: f.publicKey,
+    privateKey: f.privateKey,
+    ...(f.revoking === true ? { revoking: true as const } : {}),
+  };
+}
+
+/** What the commands write to the chain besides Tender's own calls: access keys. A test passes a fake. */
+export interface KeyWriter {
+  /** Adds a function-call key limited to `contractId` and `methods`, with `allowance` yoctoNEAR. */
+  addFunctionCallKey(args: {
+    signer: Signer;
+    publicKey: string;
+    contractId: string;
+    methods: readonly string[];
+    allowance: bigint;
+  }): Promise<void>;
+  /** Deletes the key `publicKey` from the signer's account. */
+  deleteKey(args: { signer: Signer; publicKey: string }): Promise<void>;
+}
+
+export type KeyWriterFactory = (target: AgentTarget) => KeyWriter;
+
+/** The chain, through near-api-js: a transaction to the signer's own account, final before it returns. */
+const realKeyWriter: KeyWriterFactory = (target) => {
+  const provider = new JsonRpcProvider({ url: target.rpcUrl });
+  const send = async (signer: Signer, action: ReturnType<typeof actions.deleteKey>) => {
+    const account = new Account(signer.accountId, provider, signer.privateKey as KeyPairString);
+    const resp = await account.signAndSendTransaction({
+      receiverId: signer.accountId,
+      actions: [action],
+      waitUntil: "FINAL",
+      throwOnFailure: false,
+    });
+    toTxResult(resp, target.contractId);
+  };
+  return {
+    addFunctionCallKey: ({ signer, publicKey, contractId, methods, allowance }) =>
+      send(
+        signer,
+        actions.addFunctionCallAccessKey(
+          PublicKey.from(publicKey),
+          contractId,
+          [...methods],
+          allowance,
+        ),
+      ),
+    deleteKey: ({ signer, publicKey }) =>
+      send(signer, actions.deleteKey(PublicKey.from(publicKey))),
+  };
+};
+
+/** An access key's permission with the allowance, which `KeyPermission` leaves out. */
+interface FunctionCallKey {
+  FunctionCall: {
+    receiver_id: string;
+    method_names: readonly string[];
+    /** What is left of the allowance, in yoctoNEAR. Absent or null: no cap. */
+    allowance?: string | null;
+  };
+}
+
+const asFunctionCall = (permission: KeyPermission): FunctionCallKey["FunctionCall"] | null =>
+  typeof permission === "object" && permission !== null && "FunctionCall" in permission
+    ? (permission as FunctionCallKey).FunctionCall
+    : null;
+
+/**
+ * Throws unless `permission` is exactly a delegate key's: a function-call key to `contractId` that
+ * lists the four methods of `DELEGATE_METHODS` and no others (in any order), with an allowance that
+ * is finite. A key that lists no method may call any, and is not this one.
+ */
+function requireDelegatePermission(permission: KeyPermission, contractId: string, what: string) {
+  const call = asFunctionCall(permission);
+  if (call === null) {
+    throw new Error(
+      `${what} is a full-access key on the chain, which a delegate key never is: nothing was changed`,
+    );
+  }
+  const wanted = [...DELEGATE_METHODS].sort().join(",");
+  if (call.receiver_id !== contractId || [...call.method_names].sort().join(",") !== wanted) {
+    throw new Error(
+      `${what} is on the chain with another permission (to ${call.receiver_id}, for ` +
+        `${call.method_names.length === 0 ? "any method" : call.method_names.join(", ")}) than a ` +
+        `delegate key's (to ${contractId}, for ${DELEGATE_METHODS.join(", ")}). It will not be widened ` +
+        "or narrowed: take it off the account first, with pnpm agent:undelegate",
+    );
+  }
+  if (call.allowance === undefined || call.allowance === null) {
+    throw new Error(
+      `${what} has no cap on its allowance on the chain: it could spend all the NEAR of the ` +
+        "account on gas. Take it off with pnpm agent:undelegate and make a new one",
+    );
+  }
+}
+
+/** `get_delegate`: the caps of `publicKey` on `account`, or null. */
+async function delegateOf(
+  client: TenderClient,
+  account: string,
+  publicKey: string,
+): Promise<DelegateView | null> {
+  const view = await client.view<unknown>(client.contractId, "get_delegate", {
+    account_id: account,
+    public_key: publicKey,
+  });
+  return view === null ? null : DelegateViewSchema.parse(view);
+}
+
+export interface DelegateOptions extends CommandOptions {
+  /** The most one `post_task` or `top_up_task` may spend, in whole units of the token. */
+  perTask?: string;
+  /** The most the key may spend in all, in whole units of the token. */
+  total?: string;
+  /** The key's allowance for gas, in NEAR. `DEFAULT_ALLOWANCE` when absent. */
+  allowance?: string;
+  /** The token the caps are in. Default: the network's USDC if Tender takes it, else its first token. */
+  token?: string;
+  keysFor?: KeyWriterFactory;
+}
+
+export interface DelegateResult {
+  /** The delegate key's public half. */
+  publicKey: string;
+  /** Where its private half is. */
+  path: string;
+  /** The caps the chain holds for it. */
+  caps: DelegateView;
+}
+
+/** A positive amount in whole units, as `--flag` wrote it, or a `UsageError` that names the flag. */
+function readUnits(flag: string, text: string | undefined, decimals: number): bigint {
+  if (text === undefined) throw new UsageError(`${flag} is required\n${USAGE}`);
+  let amount: bigint;
+  try {
+    amount = parseTokenAmount(text, decimals);
+  } catch (error) {
+    throw new UsageError(
+      error instanceof RangeError && !text.startsWith("-")
+        ? `${flag} has more than ${decimals} decimal places`
+        : `${flag} must be a positive number of whole units, like 2 or 0.5`,
+    );
+  }
+  if (amount === 0n) throw new UsageError(`${flag} must be more than 0`);
+  return amount;
+}
+
+/** `error` with `note` after its message; a `TenderError` keeps its code and transaction. */
+function withNote(error: unknown, note: string): Error {
+  if (error instanceof TenderError) {
+    return new TenderError(
+      error.code,
+      error.message + note,
+      error.txHash === undefined ? {} : { txHash: error.txHash },
+    );
+  }
+  return new Error(error instanceof Error ? error.message + note : note.trim());
+}
+
+/** Wraps a failure of `step` with what state the account is left in and how to go on. */
+function afterKeyAdded(error: unknown, account: string, step: string): Error {
+  return withNote(
+    error,
+    `\nThe delegate key is on ${account} already, so ${step} did not happen: run the same ` +
+      "pnpm agent:delegate command again to finish, or pnpm agent:undelegate to take the key off.",
+  );
+}
+
+/**
+ * Wraps a failure of `step` of `undelegate`, which has marked the key file by then: says what
+ * state the account may be in and that running `pnpm agent:undelegate` again finishes it.
+ */
+function whileRevoking(error: unknown, account: string, step: string): Error {
+  return withNote(
+    error,
+    `\nThe delegate key of ${account} is being taken away and ${step} did not finish: run ` +
+      "pnpm agent:undelegate again to finish it. Until it is done, pnpm agent:delegate refuses " +
+      "this key, so that it is not given caps again.",
+  );
+}
+
+/**
+ * Gives the agent a delegate key: makes it and saves it (`<name>.delegate.json`), adds it to the
+ * account as a function-call key limited to Tender and `DELEGATE_METHODS` with a finite allowance,
+ * and registers its caps with `add_delegate`. Signs with the agent's full-access key. A run that
+ * stopped half way is finished by running it again: the saved key is used and no other is made.
+ * Prints the public key and nothing secret.
+ */
+export async function delegateAgentCommand(options: DelegateOptions): Promise<DelegateResult> {
+  const log = options.log ?? console.log;
+  // The words are checked before the chain is asked anything.
+  const allowance = readUnits("--allowance", options.allowance ?? DEFAULT_ALLOWANCE, 24);
+  const { key, account, target, client, keyDir } = await load(options, false);
+
+  // The delegate key saved already (a run that stopped, or a revoke that stopped). A file marked by
+  // `undelegate` is refused before anything else is asked of the chain: adding that key again would
+  // give it new caps with nothing spent.
+  const path = delegateFileOf(keyDir, key.name);
+  let file = await readDelegateFile(keyDir, key.name);
+  if (file?.revoking === true) {
+    throw new Error(
+      `${path} is a delegate key that pnpm agent:undelegate started to take away and did not ` +
+        `finish: run pnpm agent:undelegate --name ${key.name} to finish it. This command does ` +
+        "not use it again, because the key would get new caps with nothing counted as spent. " +
+        "Nothing was changed.",
+    );
+  }
+  await client.requireFullAccessKey("add_delegate");
+
+  const enabled = (await client.getConfig()).tokens.filter((candidate) => candidate.enabled);
+  const usdc = NETWORKS[target.network].usdc;
+  const token =
+    options.token ??
+    (usdc !== undefined && enabled.some((candidate) => candidate.token === usdc)
+      ? usdc
+      : enabled[0]?.token);
+  if (token === undefined || !enabled.some((candidate) => candidate.token === token)) {
+    throw new UsageError(
+      options.token === undefined
+        ? "Tender takes no token on this network yet: nothing to set caps in"
+        : `--token ${options.token} is not a token Tender takes now (${enabled.map((t) => t.token).join(", ") || "none"})`,
+    );
+  }
+  const { symbol, decimals } = tokenMeta(token, target.network);
+  const perTask = readUnits("--per-task", options.perTask, decimals);
+  const total = readUnits("--total", options.total, decimals);
+  if (perTask > total) {
+    throw new UsageError("--per-task is more than --total: a call could never spend that much");
+  }
+  // `add_delegate` is charged to the account's storage balance with Tender.
+  if ((await client.storageBalanceOf(account)) === null) {
+    throw new TenderError(
+      "E_STORAGE",
+      `${account} has no storage balance with Tender, which pays for the record of the caps: ` +
+        `run pnpm agent:register --name ${key.name} first (it puts the storage in place)`,
+    );
+  }
+
+  // The delegate key: the one saved already (a run that stopped), or a new one, saved before the
+  // chain is asked to take it, so that a key on the chain is never one that has been lost.
+  if (file !== null) {
+    if (
+      file.account !== account ||
+      file.network !== target.network ||
+      file.contract !== target.contractId
+    ) {
+      throw new Error(
+        `${path} is for ${file.account} at ${file.contract} on ${file.network}, and this is ` +
+          `${account} at ${target.contractId} on ${target.network}: take that key off with ` +
+          "pnpm agent:undelegate, or use another --name",
+      );
+    }
+    if (file.publicKey === key.publicKey) {
+      throw new Error(`${path} holds the agent's own full-access key, which is no delegate key`);
+    }
+    log(`using the delegate key saved in ${path}`);
+  } else {
+    const pair = KeyPair.fromRandom("ed25519");
+    file = {
+      version: 1,
+      kind: "delegate",
+      name: key.name,
+      network: target.network,
+      account,
+      contract: target.contractId,
+      publicKey: pair.getPublicKey().toString(),
+      privateKey: pair.toString(),
+    };
+    try {
+      await writeKeyFile(path, file, false);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`${path} appeared while this ran, and this command never replaces a key`);
+      }
+      throw error;
+    }
+  }
+
+  const signer: Signer = { accountId: account, privateKey: key.privateKey };
+  const keys = (options.keysFor ?? realKeyWriter)(target);
+  const held = await client.viewAccessKey(account, file.publicKey);
+  if (held === null) {
+    try {
+      await keys.addFunctionCallKey({
+        signer,
+        publicKey: file.publicKey,
+        contractId: target.contractId,
+        methods: DELEGATE_METHODS,
+        allowance,
+      });
+    } catch (error) {
+      // The transaction may still land (a node that did not answer in time); the saved key is what
+      // a second run adds, or finds on the account.
+      throw withNote(
+        error,
+        `\nThe delegate key is saved in ${path}, and the chain may or may not have taken it: ` +
+          "run the same pnpm agent:delegate command again, which adds it if it is not there.",
+      );
+    }
+  }
+  // What the chain holds, and not what was sent.
+  const added = await client.viewAccessKey(account, file.publicKey);
+  if (added === null) {
+    throw new Error(`the chain does not show the delegate key on ${account} after adding it`);
+  }
+  requireDelegatePermission(added.permission, target.contractId, "the delegate key");
+
+  let tx: Awaited<ReturnType<TenderClient["addDelegate"]>>;
+  try {
+    tx = await client.addDelegate(file.publicKey, token, perTask, total);
+  } catch (error) {
+    throw afterKeyAdded(error, account, "add_delegate");
+  }
+  const caps = await delegateOf(client, account, file.publicKey);
+  if (
+    caps === null ||
+    caps.token !== token ||
+    BigInt(caps.per_task_cap) !== perTask ||
+    BigInt(caps.total_cap) !== total
+  ) {
+    throw afterKeyAdded(
+      new Error(`the chain does not show the caps that were set: ${JSON.stringify(caps)}`),
+      account,
+      "setting the caps",
+    );
+  }
+
+  const left = asFunctionCall(added.permission)?.allowance ?? "0";
+  const show = (units: bigint) => `${formatTokenAmount(units, decimals)} ${symbol}`;
+  log(`OK delegate agent ${key.name} (${account})`);
+  log(`delegate key file: ${path} (mode 600; the private key is in it and is never printed)`);
+  log(`delegate public key: ${file.publicKey}`);
+  log(`methods: ${DELEGATE_METHODS.join(", ")} (never pick, withdraw or add_delegate)`);
+  log(`allowance: ${formatTokenAmount(left, 24)} NEAR of gas, finite`);
+  log(
+    `caps: ${show(perTask)} per call, ${show(total)} in all, in ${token}; spent ${show(BigInt(caps.spent))}`,
+  );
+  log(`tx: ${tx.txHash}`);
+  log(
+    `next: sign as ${account} with that key (TENDER_ACCOUNT=${account}, and TENDER_PRIVATE_KEY from ` +
+      "the privateKey in the file); keep little liquid NEAR on the account. " +
+      `Revoke it with pnpm agent:undelegate --name ${key.name}`,
+  );
+  return { publicKey: file.publicKey, path, caps };
+}
+
+/**
+ * Takes the delegate key away: `remove_delegate` first (its caps are the money), then DeleteKey
+ * (the key itself), each only if the chain still has it, so that a run that stopped half way is
+ * finished by running it again. Before the first chain step the key file is marked `revoking`
+ * (written whole, then renamed), which makes `delegate` refuse it: a key whose caps are gone but
+ * whose key is still on the account must not be given new caps. The file is removed only when the
+ * chain shows both gone.
+ */
+export async function undelegateAgentCommand(options: DelegateOptions): Promise<void> {
+  const log = options.log ?? console.log;
+  const { key, account, target, client, keyDir } = await load(options, false);
+  const path = delegateFileOf(keyDir, key.name);
+  const file = await readDelegateFile(keyDir, key.name);
+  if (file === null) {
+    throw new Error(`agent ${key.name} has no delegate key at ${path}: nothing to take away`);
+  }
+  if (
+    file.account !== account ||
+    file.network !== target.network ||
+    file.contract !== target.contractId
+  ) {
+    throw new Error(
+      `${path} is for ${file.account} at ${file.contract} on ${file.network}, and this is ` +
+        `${account} at ${target.contractId} on ${target.network}: nothing was changed`,
+    );
+  }
+  // A file that names the agent's own key would have this command delete the key that signs: the
+  // account would be locked for good.
+  if (file.publicKey === key.publicKey) {
+    throw new Error(`${path} holds the agent's own full-access key: nothing was changed`);
+  }
+  await client.requireFullAccessKey("remove_delegate");
+  // Only a function-call key is deleted here, whatever the file says: never a full-access key.
+  const requireFunctionCall = (held: { permission: KeyPermission } | null) => {
+    if (held !== null && asFunctionCall(held.permission) === null) {
+      throw new Error(
+        `the key in ${path} is a full-access key of ${account}, which a delegate key never is: ` +
+          "it was not deleted and nothing else was changed",
+      );
+    }
+  };
+  requireFunctionCall(await client.viewAccessKey(account, file.publicKey));
+
+  // From here on the chain changes: the mark first, so that a run that stops after
+  // `remove_delegate` is not mistaken by `delegate` for one that stopped after AddKey.
+  if (file.revoking === true) {
+    log("finishing a revoke that stopped half way");
+  } else {
+    await writeKeyFile(path, { ...file, revoking: true }, true);
+  }
+
+  let tx: Awaited<ReturnType<TenderClient["removeDelegate"]>> | undefined;
+  try {
+    if ((await delegateOf(client, account, file.publicKey)) !== null) {
+      tx = await client.removeDelegate(file.publicKey);
+    }
+  } catch (error) {
+    throw whileRevoking(error, account, "remove_delegate");
+  }
+  const held = await client.viewAccessKey(account, file.publicKey);
+  if (held !== null) {
+    requireFunctionCall(held);
+    try {
+      await (options.keysFor ?? realKeyWriter)(target).deleteKey({
+        signer: { accountId: account, privateKey: key.privateKey },
+        publicKey: file.publicKey,
+      });
+    } catch (error) {
+      throw whileRevoking(error, account, "DeleteKey");
+    }
+  }
+  // What the chain holds now: both gone, or the file stays, marked, for another run.
+  if (
+    (await client.viewAccessKey(account, file.publicKey)) !== null ||
+    (await delegateOf(client, account, file.publicKey)) !== null
+  ) {
+    throw whileRevoking(
+      new Error(`the chain still shows the delegate key or its caps on ${account}`),
+      account,
+      "taking them away",
+    );
+  }
+  await rm(path);
+  log(`OK undelegate agent ${key.name} (${account})`);
+  log(`delegate public key: ${file.publicKey}`);
+  log(tx === undefined ? "caps: none on the chain already" : `caps: removed (tx ${tx.txHash})`);
+  log(held === null ? "key: not on the account already" : "key: deleted from the account");
+  log(`delegate key file removed: ${path} (the key is dead; a new delegate makes a new one)`);
+}
+
 // ---- The command line -------------------------------------------------------------------------
 
 export interface CliOptions extends CommandOptions {
@@ -696,7 +1291,7 @@ export function describeFailure(error: unknown): string {
   return `agent failed: ${error instanceof Error ? error.message : String(error)}`;
 }
 
-const COMMANDS = ["init", "register", "retire", "claim-bond"] as const;
+const COMMANDS = ["init", "register", "retire", "claim-bond", "delegate", "undelegate"] as const;
 
 /** Runs the command line and returns the exit code: 0 when the command did its work, else 1. */
 export async function main(args: readonly string[], options: CliOptions = {}): Promise<number> {
@@ -719,6 +1314,10 @@ export async function main(args: readonly string[], options: CliOptions = {}): P
           tags: { type: "string" },
           description: { type: "string" },
           uri: { type: "string" },
+          "per-task": { type: "string" },
+          total: { type: "string" },
+          allowance: { type: "string" },
+          token: { type: "string" },
         },
       }).values;
     } catch (error) {
@@ -752,8 +1351,18 @@ export async function main(args: readonly string[], options: CliOptions = {}): P
       await registerAgentCommand(common);
     } else if (command === "retire") {
       await retireAgentCommand(common);
-    } else {
+    } else if (command === "claim-bond") {
       await claimBondCommand(common);
+    } else if (command === "delegate") {
+      await delegateAgentCommand({
+        ...common,
+        ...(text("per-task") !== undefined && { perTask: text("per-task") }),
+        ...(text("total") !== undefined && { total: text("total") }),
+        ...(text("allowance") !== undefined && { allowance: text("allowance") }),
+        ...(text("token") !== undefined && { token: text("token") }),
+      });
+    } else {
+      await undelegateAgentCommand(common);
     }
     return 0;
   } catch (error) {
