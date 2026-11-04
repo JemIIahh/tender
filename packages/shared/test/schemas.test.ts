@@ -207,6 +207,21 @@ test("agent_view_bond_fields_follow_the_contracts_types", () => {
   expect(failures(AgentViewSchema, { ...agent, bond_token: "Token" })).toEqual(["bond_token"]);
 });
 
+// `locked_until` (the bond fix round): the commit deadline of the latest open task an agent entered.
+// A contract from before the round does not send it, so the view takes it absent, and null.
+test("agent_view_takes_locked_until_when_the_contract_sends_it_and_without_it", () => {
+  const agent = sample("agent_view");
+  expect(accepts(AgentViewSchema, agent)).toBe(true);
+  expect("locked_until" in agent).toBe(false);
+  const locked = { ...agent, locked_until: "1793745956336648000" };
+  expect(AgentViewSchema.parse(locked)).toEqual(locked);
+  const free = { ...agent, locked_until: null };
+  expect(AgentViewSchema.parse(free)).toEqual(free);
+  expect(failures(AgentViewSchema, { ...agent, locked_until: 5 })).toEqual(["locked_until"]);
+  expect(accepts(AgentViewSchema, { ...agent, locked_until: U64_MAX })).toBe(true);
+  expect(accepts(AgentViewSchema, { ...agent, locked_until: "18446744073709551616" })).toBe(false);
+});
+
 test("config_view_shows_no_bond_until_the_owner_sets_one_derived", () => {
   const config = sample("config_view");
   expect(config.agent_bond_token).not.toBeNull();

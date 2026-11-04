@@ -25,6 +25,8 @@ const ACCOUNT = "agent.test.near";
 const TOKEN = "usdc.test.near";
 const BOND = 1_000_000n;
 const CLAIMABLE = "1793745956336648000";
+/** 2026-11-04T00:00:00Z in nanoseconds: a later date, as when an open task holds the bond. */
+const LOCKED = "1793750400000000000";
 
 const CONFIG: ConfigView = {
   owner: "owner.test.near",
@@ -72,6 +74,8 @@ interface World {
   claimTooSoon: boolean;
   /** Set to make the key a function-call key, which `requireFullAccessKey` refuses. */
   functionCallKey: boolean;
+  /** Set to make an open task hold the bond: `unregister_agent` then shows `locked_until`. */
+  lockedUntil?: string;
 }
 
 /** A client over the world. `calls` records every call that sends something or moves it. */
@@ -120,7 +124,14 @@ function fakeClient() {
     },
     unregisterAgent: async () => {
       calls.push("unregister");
-      world.agent = agentView({ status: "unregistering", claimable_at: CLAIMABLE });
+      world.agent =
+        world.lockedUntil === undefined
+          ? agentView({ status: "unregistering", claimable_at: CLAIMABLE })
+          : agentView({
+              status: "unregistering",
+              claimable_at: world.lockedUntil,
+              locked_until: world.lockedUntil,
+            });
       return tx;
     },
     claimAgentBond: async () => {
@@ -506,6 +517,29 @@ test("retire_asks_then_starts_the_way_out", async () => {
   expect(calls).toContain("unregister");
   expect(out).toEqual(expect.arrayContaining(["status: unregistering"]));
   expect(out.join("\n")).toMatch(/claimable at: 2026-11-03T22:45:56\.336Z \(in 0h 15m\)/);
+});
+
+test("the_status_shows_the_open_task_that_holds_the_bond_when_the_contract_says_so", async () => {
+  // `locked_until` is the commit deadline of the latest open task the agent entered, and the bond
+  // cannot be claimed before it. A contract that does not send it prints no such line.
+  await init("scout", ACCOUNT);
+  const free = fakeClient();
+  free.world.agent = agentView();
+  await retireAgentCommand(options({ clientFor: free.clientFor, yes: true }));
+  expect(out.join("\n")).not.toMatch(/held by an open task/);
+
+  out.length = 0;
+  const held = fakeClient();
+  held.world.agent = agentView();
+  held.world.lockedUntil = LOCKED;
+  const agent = await retireAgentCommand(options({ clientFor: held.clientFor, yes: true }));
+  expect(agent).toMatchObject({
+    status: "unregistering",
+    claimable_at: LOCKED,
+    locked_until: LOCKED,
+  });
+  expect(out.join("\n")).toMatch(/claimable at: 2026-11-04T00:00:00\.000Z/);
+  expect(out.join("\n")).toMatch(/held by an open task until: 2026-11-04T00:00:00\.000Z/);
 });
 
 test("retire_has_nothing_to_do_for_an_agent_that_is_not_active", async () => {
