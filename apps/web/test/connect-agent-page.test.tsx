@@ -78,6 +78,8 @@ interface World {
   refuseCode: Response | null;
   /** What `GET /v1/connect/codes/:id` answers with in place of the state, while set. */
   readStatus: number | null;
+  /** A state that lies: another fingerprint, or another account, than the code's. */
+  lie?: { fingerprint?: string; account?: string };
   /** `METHOD /path` of every request to the API, and `RPC <what> <account>` of every read. */
   requests: string[];
   /** Every request body, as text. */
@@ -204,7 +206,7 @@ function serve(state: World): void {
         id: ID,
         owner: ALICE,
         name: code.name,
-        account_id: `${code.name}.${ALICE}`,
+        account_id: state.lie?.account ?? `${code.name}.${ALICE}`,
         state: code.registeredAt
           ? "registered"
           : code.attached
@@ -215,7 +217,10 @@ function serve(state: World): void {
         created_at: "2026-11-04T10:00:00.000Z",
         expires_at: "2026-11-04T10:30:00.000Z",
         public_key: code.attached,
-        fingerprint: code.attached === null ? null : connectFingerprint(code.attached),
+        fingerprint:
+          code.attached === null
+            ? null
+            : (state.lie?.fingerprint ?? connectFingerprint(code.attached)),
         attached_at: code.attached === null ? null : "2026-11-04T10:01:00.000Z",
         registered_at: code.registeredAt,
         agent:
@@ -473,6 +478,32 @@ test("create_agent_is_one_approval_that_creates_the_account_and_pays_its_storage
   );
   expect(step(4).dataset.done).toBe("true");
   expect(batches).toHaveLength(1);
+});
+
+test("an_answer_whose_fingerprint_is_not_its_keys_or_whose_account_is_another_is_never_signed", async () => {
+  const state = world();
+  state.lie = { fingerprint: "0000-0000-0000-0000" };
+  const { user, batches } = open(state);
+  await getCode(user);
+  agentAttaches(state);
+  const mismatch = await screen.findByTestId("connect-mismatch");
+  expect(mismatch.textContent).toContain("Tender's answer doesn't match what this page asked for");
+  // The page shows the fingerprint of the key it would add, not the one the API sent.
+  expect(screen.getByTestId("connect-fingerprint").textContent).toBe(connectFingerprint(PUBLIC));
+  const create = screen.getByRole("button", { name: "Create agent" });
+  expect(create.getAttribute("aria-disabled")).toBe("true");
+  await user.click(create);
+  expect(batches).toEqual([]);
+
+  state.lie = { account: `other.${ALICE}` };
+  await waitFor(() =>
+    expect(screen.getByTestId("connect-ready").textContent).toBe(
+      `Your agent is ready: other.${ALICE}`,
+    ),
+  );
+  expect(screen.getByTestId("connect-mismatch")).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "Create agent" }));
+  expect(batches).toEqual([]);
 });
 
 test("a_wallet_short_of_the_bond_is_told_before_anything_is_signed", async () => {

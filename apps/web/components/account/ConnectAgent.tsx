@@ -7,7 +7,9 @@ import {
   type ConnectCodeCreated,
   type ConnectCodeState,
   connectCommand,
+  connectFingerprint,
   connectSentence,
+  isEd25519PublicKey,
 } from "@tender/shared";
 import Link from "next/link";
 import { type ReactNode, useEffect, useId, useRef, useState } from "react";
@@ -385,6 +387,7 @@ export function ConnectAgent({
   /** Create agent: the one approval, or only the paying part when the account is there already. */
   const create = async (fundOnly: boolean) => {
     if (busy.current || attached === null || target === null || terms.status !== "ready") return;
+    if (!answerFits) return;
     busy.current = true;
     setSend({ state: "waiting" });
     try {
@@ -451,7 +454,16 @@ export function ConnectAgent({
   const expired = state?.state === "expired";
   const short =
     bond !== null && held.state === "read" && held.amount < bond.amount ? held.amount : null;
-  const blocked = short !== null || terms.status !== "ready";
+  // The page works out the fingerprint itself, from the key it will add: what it shows is the key's,
+  // whatever the API says. An answer whose account is not the one asked for, or whose fingerprint is
+  // not its key's, is not used for anything that is signed.
+  const fingerprint =
+    attached !== null && isEd25519PublicKey(attached) ? connectFingerprint(attached) : null;
+  const answerFits =
+    state === null ||
+    (state.account_id === accountId &&
+      (attached === null || (fingerprint !== null && state.fingerprint === fingerprint)));
+  const blocked = short !== null || terms.status !== "ready" || !answerFits;
 
   return (
     <section aria-labelledby={`${id}-title`} className="grid gap-4">
@@ -662,10 +674,20 @@ export function ConnectAgent({
                   data-testid="connect-fingerprint"
                   className="font-mono text-xl tracking-[0.08em] text-bone sm:text-2xl"
                 >
-                  {state.fingerprint}
+                  {fingerprint ?? "—"}
                 </p>
                 <p className="font-mono text-[12px] text-muted wrap-anywhere">{attached}</p>
               </div>
+              {answerFits ? null : (
+                <p
+                  role="alert"
+                  data-testid="connect-mismatch"
+                  className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
+                >
+                  Tender's answer doesn't match what this page asked for, so nothing will be signed
+                  for it. Start over with a new code.
+                </p>
+              )}
               {created ? null : (
                 <p
                   data-testid="connect-warning"
