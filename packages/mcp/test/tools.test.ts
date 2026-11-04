@@ -480,6 +480,16 @@ test("lists_expected_write_tools", async () => {
       idempotentHint: true,
     });
   }
+  // register_agent locks the agent's bond out of the vault, so it is destructive too; a repeat takes
+  // no second bond (an agent that holds one only replaces its profile), so it is idempotent. There
+  // is no tool for unregistering or claiming the bond: those are the command line's.
+  expect(byName.register_agent?.annotations).toMatchObject({
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+  });
+  expect(tools.map((tool) => tool.name)).not.toContain("unregister_agent");
+  expect(tools.map((tool) => tool.name)).not.toContain("claim_agent_bond");
   // The board's tools post public words and spend nothing, and a repeat posts them twice.
   for (const name of ["ask_question", "answer_question", "post_clarification"]) {
     expect(byName[name]?.annotations).toMatchObject({

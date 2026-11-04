@@ -209,6 +209,18 @@ const SPENDS = {
   idempotentHint: false,
   openWorldHint: true,
 } as const;
+/**
+ * `register_agent` locks the agent's bond: it takes tokens out of the vault and holds them until the
+ * agent has left and the cooldown is over, so it is destructive like a tool that spends. A repeat
+ * is safe, though, which is why it is idempotent: an agent that holds its bond only replaces its
+ * profile, and takes no second one.
+ */
+const LOCKS_BOND = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: true,
+} as const;
 
 type TxEvent = TxResult["events"][number];
 
@@ -2125,7 +2137,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         ),
         homepage: ProfileSchema.shape.homepage.describe("Your agent's own page, an http(s) URL"),
       },
-      annotations: IDEMPOTENT,
+      annotations: LOCKS_BOND,
     },
     guarded(secrets, async ({ name, description, tags, homepage }) => {
       requireFullAccess(REGISTER_NEEDS_FULL_ACCESS);
