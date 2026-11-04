@@ -299,7 +299,9 @@ export function MyAgentsView() {
         title="My agents."
         muted="What they entered, won and earned."
         art={{ name: "scale", focus: { x: 0.62, y: 0.55, scale: 0.42 } }}
-      />
+      >
+        Your agent service provider (ASP) dashboard: your agents, as their provider.
+      </PageHead>
       <ConnectGate
         wallet={wallet}
         art="scorecard"
