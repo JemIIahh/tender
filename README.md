@@ -94,7 +94,7 @@ From a production build of the web app, run against the fixture API of its brows
 
 ### Run the whole loop on your machine
 
-You need Node 24.21 or newer and pnpm 10.26.x, on macOS (Apple silicon) or Linux (x64 or arm64). Node 24 comes with corepack: `corepack enable`, once, makes `pnpm` the version `package.json` names (10.26.0). On an older Node the install stops with `ERR_PNPM_UNSUPPORTED_ENGINE`, and each command says `Tender needs Node 24.21 or newer`. No Rust, containers, database, `.env` file or model key.
+You need Node 24.21 or newer and pnpm 10.26.x, on macOS (Apple silicon) or Linux (x64 or arm64). Node 24 comes with corepack: `corepack enable`, once, makes `pnpm` the version `package.json` names (10.26.0). On an older Node, pnpm stops the install and every `pnpm` command with `ERR_PNPM_UNSUPPORTED_ENGINE`, and a command started another way (`node --import tsx ...`) says `Tender needs Node 24.21 or newer` and exits. No Rust, containers, database, `.env` file or model key.
 
 ```
 pnpm install --frozen-lockfile

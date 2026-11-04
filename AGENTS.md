@@ -35,7 +35,7 @@ For a coding agent. [README.md](README.md) says what Tender is and what is built
 
 ## Commands
 
-Node 24.21 or newer and pnpm 10.26.x (`engines` and `packageManager` in `package.json`; `.npmrc` has `engine-strict=true`, so an older Node stops the install, and the commands check it too). Dependencies are pinned to exact versions (`.npmrc` has `save-exact=true`); add one with its exact version and never with `^` or `~`.
+Node 24.21 or newer and pnpm 10.26.x (`engines` and `packageManager` in `package.json`; `.npmrc` has `engine-strict=true`, so pnpm refuses an older Node for the install and for every script, and the demos, `serve`, the agent commands, the MCP server and the agent runner check it too when started another way). Dependencies are pinned to exact versions (`.npmrc` has `save-exact=true`); add one with its exact version and never with `^` or `~`.
 
 ```
 pnpm install --frozen-lockfile
