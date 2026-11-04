@@ -128,8 +128,9 @@ test("task_page_asks_for_the_task_and_then_for_its_verifier", async () => {
 
   await open();
 
-  // The verifier is the task's, from the answer: what the address held is not used for it.
-  expect(api.calls).toEqual([TASK_PATH, AGENT_PATH]);
+  // The verifier is the task's, from the answer: what the address held is not used for it. The
+  // question board is a section of the shown task, read once the task is there.
+  expect(api.calls).toEqual([TASK_PATH, AGENT_PATH, `${TASK_PATH}/questions`]);
 });
 
 test("task_page_says_when_there_is_no_such_task", async () => {
@@ -426,6 +427,106 @@ test("task_page_ignores_events_about_other_tasks", async () => {
   await new Promise((resolve) => setTimeout(resolve, 450));
 
   expect(api.count(TASK_PATH)).toBe(2);
+});
+
+test("task_page_reads_its_question_board_again_on_a_board_event_and_not_the_task", async () => {
+  const BOARD = `${TASK_PATH}/questions`;
+  let questions: unknown[] = [];
+  const api = fakeApi({
+    ...routes(),
+    [BOARD]: () =>
+      json({
+        task_id: "7",
+        open: true,
+        questions,
+        clarifications: [],
+        hidden_label: "hidden by the poster",
+        note: "note",
+      }),
+  });
+  await open();
+  const stream = FakeEventSource.latest;
+  act(() => stream.open());
+  await waitFor(() => expect(api.count(TASK_PATH)).toBe(2));
+  await waitFor(() => expect(api.count(BOARD)).toBe(2));
+  expect(await screen.findByTestId("board-empty")).toBeTruthy();
+
+  questions = [
+    {
+      id: "1",
+      asker: "bob.testnet",
+      text: "Is tax included?",
+      asked_at: "2026-11-03T10:00:00.000Z",
+      hidden: false,
+      answer: null,
+    },
+  ];
+  act(() =>
+    stream.send(
+      "question_asked",
+      message("question_asked", "7", { task_id: "7", question_id: "1", asker: "bob.testnet" }),
+      "11",
+    ),
+  );
+  // Another task's board is no news here.
+  act(() =>
+    stream.send(
+      "question_asked",
+      message("question_asked", "8", { task_id: "8", question_id: "2", asker: "bob.testnet" }),
+      "12",
+    ),
+  );
+
+  expect((await screen.findByTestId("question-text")).textContent).toBe("Is tax included?");
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  expect(api.count(BOARD)).toBe(3);
+  // The task itself did not change, and is not asked for again.
+  expect(api.count(TASK_PATH)).toBe(2);
+});
+
+test("task_page_reads_the_swarm_tree_again_when_a_subtask_settles_and_not_the_task", async () => {
+  const CHILD = "/v1/tasks/9";
+  const api = fakeApi({
+    ...routes(() => detail({}, { children: ["9"] })),
+    [CHILD]: () => json(detail({ id: "9", parent: "7", title: "Part one" }, { children: [] })),
+  });
+  await open();
+  const stream = FakeEventSource.latest;
+  act(() => stream.open());
+  await waitFor(() => expect(api.count(TASK_PATH)).toBe(2));
+  expect(await screen.findByText("Part one")).toBeTruthy();
+  const read = api.count(CHILD);
+
+  act(() =>
+    stream.send(
+      "picked",
+      message("picked", "9", {
+        task_id: "9",
+        by: VERIFIER,
+        winners: [{ account: "alice.testnet", bps: 10_000, amount: "1" }],
+        fee: "0",
+        scorecard_hash: HASH_A,
+        scorecard_uri: "x",
+      }),
+      "11",
+    ),
+  );
+  // A commit on a subtask changes nothing the tree shows.
+  act(() => stream.send("committed", message("committed", "9", committedData("9")), "12"));
+
+  await waitFor(() => expect(api.count(CHILD)).toBe(read + 1));
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  expect(api.count(CHILD)).toBe(read + 1);
+  expect(api.count(TASK_PATH)).toBe(2);
+});
+
+test("task_page_puts_the_question_board_after_the_criteria", async () => {
+  fakeApi(routes());
+  await open();
+
+  const titles = screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent);
+  expect(titles.indexOf("Questions")).toBe(titles.indexOf("Criteria") + 1);
+  expect(titles.indexOf("Entries")).toBe(titles.indexOf("Questions") + 1);
 });
 
 test("task_page_shows_a_reveal_without_a_reload", async () => {
