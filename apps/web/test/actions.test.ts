@@ -49,6 +49,28 @@ test("the_verifier_picks_in_judging_and_the_poster_in_fallback", () => {
   expect(pickView(settled, PERSON, JUDGE, IN.judging)).toBeNull();
 });
 
+test("the_pick_windows_open_and_close_at_their_exact_deadlines", () => {
+  const byPerson = task(PERSON);
+  const verifier = { kind: "pick", as: "verifier" };
+  const poster = { kind: "pick", as: "poster" };
+  // Half-open windows, as the contract's: the verifier's from the reveal deadline up to, not
+  // including, the pick deadline; the poster's from there up to, not including, the fallback deadline.
+  expect(pickView(byPerson, PERSON, JUDGE, AT.reveal - 1n)).toBeNull();
+  expect(pickView(byPerson, PERSON, JUDGE, AT.reveal)).toEqual(verifier);
+  expect(pickView(byPerson, PERSON, JUDGE, AT.pick - 1n)).toEqual(verifier);
+  expect(pickView(byPerson, PERSON, JUDGE, AT.pick)).toBeNull();
+  expect(pickView(byPerson, POSTER, JUDGE, AT.pick - 1n)).toBeNull();
+  expect(pickView(byPerson, POSTER, JUDGE, AT.pick)).toEqual(poster);
+  expect(pickView(byPerson, POSTER, JUDGE, AT.fallback - 1n)).toEqual(poster);
+  expect(pickView(byPerson, POSTER, JUDGE, AT.fallback)).toBeNull();
+  // The Judge's window has the same edges.
+  const judged = task(JUDGE);
+  expect(pickView(judged, null, JUDGE, AT.reveal - 1n)).toBeNull();
+  expect(pickView(judged, null, JUDGE, AT.reveal)).toEqual({ kind: "judge" });
+  expect(pickView(judged, null, JUDGE, AT.pick - 1n)).toEqual({ kind: "judge" });
+  expect(pickView(judged, POSTER, JUDGE, AT.pick)).toEqual(poster);
+});
+
 test("a_poster_who_is_the_verifier_picks_in_both_windows", () => {
   const own = task(POSTER);
   expect(pickView(own, POSTER, JUDGE, IN.judging)).toEqual({ kind: "pick", as: "verifier" });

@@ -3,6 +3,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { TaskActions } from "../components/actions/TaskActions";
+import { keepToken, signInTicket } from "../lib/apiToken";
 import { clearApiToken } from "../lib/auth";
 import { createWalletStore, type WalletStore } from "../lib/wallet";
 import { FakeChain, FakeNode, fakeFetch } from "./fakeChain";
@@ -54,13 +55,27 @@ function judged(verifier: string, task: Partial<TaskDetailResponse["task"]> = {}
   );
 }
 
-/** The page's world: the deliveries at the API, the chain's views at the node, and a wallet. */
-function setup(account: string | null) {
+/**
+ * The page's world: the deliveries at the API, the chain's views at the node, and a wallet. With
+ * `task`, the API also answers for task 7 and stores a scorecard, as a pick asks it to.
+ */
+function setup(account: string | null, options: { task?: TaskDetailResponse } = {}) {
   const chain = new FakeChain("tender.testnet", [{ token: TOKEN, minReward: 1_000_000n }]);
   const node = new FakeNode(chain);
   const rpc = fakeFetch("http://rpc.test", node);
   vi.stubGlobal("fetch", async (input: string, init?: RequestInit) => {
     const url = new URL(String(input));
+    if (url.host === "api.test" && options.task !== undefined) {
+      if (url.pathname === "/v1/tasks/7") return new Response(JSON.stringify(options.task));
+      if (url.pathname === "/v1/blobs" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { content_base64: string };
+        const bytes = Uint8Array.from(atob(body.content_base64), (c) => c.charCodeAt(0));
+        const hash = sha256Hex(bytes);
+        return new Response(
+          JSON.stringify({ sha256: hash, uri: `http://api.test/v1/blobs/${hash}` }),
+        );
+      }
+    }
     if (url.host === "api.test") {
       const found = Object.entries(WORK).find(([, text]) => url.pathname.endsWith(sha256Hex(text)));
       return found === undefined
@@ -117,7 +132,13 @@ test("the_verifier_sees_each_revealed_entry_with_its_delivery_as_text", async ()
   const delivery = await within(rows[0] as HTMLElement).findByTestId("delivery");
   expect(delivery.textContent).toBe(WORK[ALICE]);
   expect(delivery.querySelector("b")).toBeNull();
-  expect(within(pick).getByLabelText(`Reason for ${ALICE} (optional)`)).toBeTruthy();
+  // Each field is named by its visible label and described by whose entry it is.
+  expect(
+    within(rows[0] as HTMLElement).getByRole("textbox", {
+      name: "Reason (optional, public)",
+      description: ALICE,
+    }),
+  ).toBeTruthy();
   // When each revealed, where the API says, and the block it committed at.
   expect(within(rows[0] as HTMLElement).getByTestId("pick-entry-when").textContent).toBe(
     "Revealed 29 Oct, 20:54:59 UTC · committed at block 100",
@@ -144,7 +165,7 @@ test("one_winner_gets_all_of_it_after_the_fee_with_the_exact_amount", async () =
   expect(payouts).toHaveLength(1);
   expect(payouts[0]?.textContent).toBe(`${ALICE}100%1.425 tUSDC`);
   expect(pick.textContent).toContain("platform fee 5%, 0.075 tUSDC");
-  expect(within(pick).queryByRole("textbox", { name: /Share of/ })).toBeNull();
+  expect(within(pick).queryByRole("textbox", { name: "Share (%)" })).toBeNull();
   expect(button.getAttribute("aria-disabled")).toBe("false");
 });
 
@@ -156,8 +177,8 @@ test("several_winners_split_equally_with_labelled_shares_that_must_make_100_perc
 
   await user.click(within(pick).getByRole("checkbox", { name: `Winner: ${ALICE}` }));
   await user.click(within(pick).getByRole("checkbox", { name: `Winner: ${BOB}` }));
-  const alice = within(pick).getByRole("textbox", { name: `Share of ${ALICE}, in percent` });
-  const bob = within(pick).getByRole("textbox", { name: `Share of ${BOB}, in percent` });
+  const alice = within(pick).getByRole("textbox", { name: "Share (%)", description: ALICE });
+  const bob = within(pick).getByRole("textbox", { name: "Share (%)", description: BOB });
   expect((alice as HTMLInputElement).value).toBe("50");
   expect((bob as HTMLInputElement).value).toBe("50");
   expect(
@@ -336,6 +357,92 @@ test("top_up_shows_the_vault_and_holds_a_first_top_up_to_the_minimum", async () 
     "Added 2.00 tUSDC. The reward is now 3.50 tUSDC.",
   );
   expect(chain.vault.get(PERSON)?.get(TOKEN)).toBe(1_000_000n);
+});
+
+// ---- A second press ----------------------------------------------------------------------------
+
+/** Task 7 of the fixtures on the model of the chain, open for top-ups. */
+function addTaskSeven(chain: FakeChain): void {
+  chain.addTask({
+    id: 7n,
+    poster: POSTER,
+    token: TOKEN,
+    reward: 1_500_000n,
+    feeBps: 500,
+    briefUri: "http://api.test/v1/blobs/brief",
+    briefHash: "a".repeat(64),
+    criteriaHash: "b".repeat(64),
+    heldoutCommitment: null,
+    verifier: JUDGE,
+    createdAt: AT.created,
+    commitDeadline: AT.commit,
+    revealDeadline: AT.reveal,
+    pickDeadline: AT.pick,
+    fallbackDeadline: AT.fallback,
+    maxEntries: 0,
+    maxWinners: 1,
+    invited: [],
+  });
+}
+
+/** Presses `button` twice before the page can draw the first press. */
+function pressTwice(button: HTMLElement): void {
+  act(() => {
+    button.click();
+    button.click();
+  });
+}
+
+test("a_pick_pressed_twice_at_once_is_sent_once", async () => {
+  const data = judged(PERSON);
+  const { wallet } = setup(PERSON, { task: data });
+  await show(data, IN_JUDGING);
+  keepToken({ accountId: PERSON, token: "tok", expiresAtMs: Date.now() + 60_000 }, signInTicket());
+  const pick = screen.getByTestId("action-pick");
+  await userEvent.setup().click(within(pick).getByRole("checkbox", { name: `Winner: ${ALICE}` }));
+
+  pressTwice(within(pick).getByRole("button", { name: "Pick the winner" }));
+
+  // The model of the chain has no `pick`: the one send is refused, and there was one.
+  expect((await within(pick).findByRole("alert")).textContent).toMatch(
+    /^Tender refused the pick \(E_ARGS\)\. The scorecard is published; this pick paid nobody\.$/,
+  );
+  expect(wallet.sent).toHaveLength(1);
+});
+
+test("a_refund_pressed_twice_at_once_is_sent_once", async () => {
+  const { wallet } = setup(PERSON);
+  const empty = judged(PERSON, { reveal_count: 0 });
+  empty.entries = [entry(ALICE)];
+  await show(empty, AT.reveal);
+  const refund = screen.getByTestId("action-refund");
+
+  pressTwice(within(refund).getByRole("button", { name: "Refund the funders" }));
+
+  expect((await within(refund).findByRole("alert")).textContent).toBe("Tender has no such task.");
+  expect(wallet.sent).toHaveLength(1);
+});
+
+test("a_top_up_pressed_twice_at_once_is_sent_once", async () => {
+  const { chain, wallet } = setup(PERSON);
+  chain.storage.set(PERSON, { total: 10n ** 22n, usedBytes: 0n });
+  chain.vault.set(PERSON, new Map([[TOKEN, 5_000_000n]]));
+  addTaskSeven(chain);
+  chain.now = () => AT.created + 30n * SECOND;
+  await show(detail(), AT.created + 30n * SECOND);
+  const topUp = screen.getByTestId("action-top-up");
+  await waitFor(() =>
+    expect(within(topUp).getByTestId("top-up-vault").textContent).toMatch(/^Your vault/),
+  );
+  await userEvent.setup().type(within(topUp).getByLabelText("Amount (tUSDC)"), "2");
+
+  pressTwice(within(topUp).getByRole("button", { name: "Top up" }));
+
+  expect((await within(topUp).findByTestId("top-up-sent")).textContent).toBe(
+    "Added 2.00 tUSDC. The reward is now 3.50 tUSDC.",
+  );
+  expect(wallet.sent).toHaveLength(1);
+  expect(chain.vault.get(PERSON)?.get(TOKEN)).toBe(3_000_000n);
 });
 
 test("nothing_shows_once_the_task_is_settled", async () => {

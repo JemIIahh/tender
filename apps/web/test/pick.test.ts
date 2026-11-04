@@ -264,7 +264,9 @@ test("a_pick_refused_on_chain_says_why_and_that_the_scorecard_is_published", asy
     deps.signAndSend.mockRejectedValueOnce(new TransactionFailed("TX", code));
     const error = (await rejection(submitPick(INPUT, deps))) as PickFailure;
     expect(error.message, String(code)).toMatch(expected);
-    expect(error.message, String(code)).toMatch(/The scorecard is published; nobody was paid\.$/);
+    expect(error.message, String(code)).toMatch(
+      /The scorecard is published; this pick paid nobody\.$/,
+    );
     expect(error.published, String(code)).toBe(true);
     expect(error.stage, String(code)).toBe("wallet");
   }

@@ -12,7 +12,7 @@ import { STUB_WALLET_NAME } from "./walletStub";
 // the page through the real wallet picker, and the model of the chain (test/fakeChain.ts). Each
 // spec opens the page at the action's address, as My tasks links to it, and looks at what the
 // person sees; the refund and the top-up are sent, and the model shows what they did. A pick is
-// sent against a real chain, in e2e/chain/actions.chain.ts.
+// sent against a real chain, in e2e/chain/task-actions.chain.ts.
 //
 // With ACTION_SHOTS set to a directory, each state is also saved there as a screenshot at 375 and
 // 1440 px wide.
@@ -166,7 +166,9 @@ test("verifier_picks_one_winner_from_the_deliveries", async ({ page }) => {
   await expect(pick.getByTestId("pick-problem")).toHaveText("Choose a winner.");
 
   await pick.getByRole("radio", { name: `Winner: ${ALICE}` }).check();
-  await pick.getByLabel(`Reason for ${ALICE} (optional)`).fill("Rejects every invalid id.");
+  const reason = rows.nth(0).getByLabel("Reason (optional, public)");
+  await expect(reason).toHaveAccessibleDescription(ALICE);
+  await reason.fill("Rejects every invalid id.");
   await expect(pick.getByTestId("pick-payout")).toHaveText([`${ALICE}100%1.425 tUSDC`]);
   await expect(pick).toContainText("Reward 1.50 tUSDC · platform fee 5%, 0.075 tUSDC");
   await expect(pick.getByRole("button", { name: "Pick the winner" })).toHaveAttribute(
@@ -194,8 +196,10 @@ test("verifier_splits_between_winners_with_the_rounding_shown", async ({ page })
   for (const who of [ALICE, BOB, "carol.testnet"]) {
     await pick.getByRole("checkbox", { name: `Winner: ${who}` }).check();
   }
-  await expect(pick.getByLabel(`Share of ${ALICE}, in percent`)).toHaveValue("33.34");
-  await expect(pick.getByLabel(`Share of ${BOB}, in percent`)).toHaveValue("33.33");
+  const share = (row: number) => pick.getByTestId("pick-entry").nth(row).getByLabel("Share (%)");
+  await expect(share(0)).toHaveValue("33.34");
+  await expect(share(0)).toHaveAccessibleDescription(ALICE);
+  await expect(share(1)).toHaveValue("33.33");
   await expect(pick.getByTestId("pick-rounding-shares")).toHaveText(
     "100% doesn't split evenly 3 ways, so the first winner gets 0.01% more.",
   );
@@ -210,7 +214,7 @@ test("verifier_splits_between_winners_with_the_rounding_shown", async ({ page })
   await shoot(page, "pick-split");
 
   // Shares that do not make 100% are said, and stop the pick.
-  await pick.getByLabel(`Share of ${ALICE}, in percent`).fill("50");
+  await share(0).fill("50");
   await expect(pick.getByTestId("pick-problem")).toHaveText(
     "The shares add up to 116.66%: 16.66% too much.",
   );

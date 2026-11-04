@@ -31,8 +31,8 @@ function heldoutHref(heldout: unknown): string | undefined {
  * Tender Judge's: the API takes such a card from the Judge's account only (P03-R29), and a build
  * that knows the Judge's account holds the card to that too. Any other is named by what it says it
  * is. A rubric is scored by a model, which is a judgement and not a check, so it is said to be
- * subjective (spec 7.3) and the model is named. A pick made by hand (`HAND_PICK_SOFTWARE`) is
- * said to be one, with the account that made it.
+ * subjective (spec 7.3) and the model is named. A scorecard that names `HAND_PICK_SOFTWARE` is said
+ * to say that its verifier picked by hand: no one holds that name to an account.
  */
 export function ScoredBy({
   scorecard,
@@ -42,11 +42,12 @@ export function ScoredBy({
   judgeAccount: string | null;
 }) {
   const { software, model } = scorecard.judge;
-  // A pick made by hand on the task page: a person chose, and the scores only write the choice down.
+  // A pick made by hand, as the task page writes one: the scores only write a choice down. Nothing
+  // holds this name to anyone, as the API holds the Judge's, so it is what the scorecard says.
   if (software === HAND_PICK_SOFTWARE) {
     return (
       <p data-testid="scored-by" className="text-sm text-muted wrap-anywhere">
-        {`Picked by hand by ${scorecard.verifier}. No software scored the entries: each winner is listed at 100, every other entry at 0.`}
+        {`The scorecard says ${scorecard.verifier} picked by hand, with no software scoring the entries: each winner is listed at 100, every other entry at 0.`}
       </p>
     );
   }

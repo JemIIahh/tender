@@ -3,6 +3,7 @@
 import {
   HAND_PICK_REASON_MAX,
   type PickWinner,
+  revealedForPick,
   splitReward,
   type TaskDetailResponse,
   type TaskEntry,
@@ -35,16 +36,17 @@ type Run =
   | { status: "failed"; message: string }
   | { status: "done"; result: PickResult };
 
-/** The revealed entries, in the order the scorecard's tie-break puts equal scores: block, account. */
+/**
+ * The entries a person picks from (the shared rule, `revealedForPick`: the ones the scorecard lists),
+ * in the order the scorecard's tie-break puts equal scores: block, then account.
+ */
 function revealedEntries(entries: readonly TaskEntry[]): TaskEntry[] {
-  return entries
-    .filter((entry) => entry.revealed && entry.content_hash !== null)
-    .sort((a, b) => {
-      const x = BigInt(a.committed_height);
-      const y = BigInt(b.committed_height);
-      if (x !== y) return x < y ? -1 : 1;
-      return a.account < b.account ? -1 : a.account > b.account ? 1 : 0;
-    });
+  return revealedForPick(entries).sort((a, b) => {
+    const x = BigInt(a.committed_height);
+    const y = BigInt(b.committed_height);
+    if (x !== y) return x < y ? -1 : 1;
+    return a.account < b.account ? -1 : a.account > b.account ? 1 : 0;
+  });
 }
 
 /** How a reveal time reads: `29 Oct, 20:54:59 UTC`, the same wherever the page is opened. */
@@ -282,6 +284,8 @@ export function PickPanel({
             const full = !single && !on && chosen.length >= most;
             const shareId = `${id}-share-${entry.entry_index}`;
             const reasonId = `${id}-reason-${entry.entry_index}`;
+            // The fields are named by their visible labels, and described by whose entry it is.
+            const whoId = `${id}-who-${entry.entry_index}`;
             const fieldError = choice.fieldErrors[entry.account];
             return (
               <li
@@ -302,7 +306,9 @@ export function PickPanel({
                       className="mt-1 size-4 shrink-0 accent-[var(--color-seal)]"
                     />
                     <span className="grid min-w-0 gap-1">
-                      <TeamBadge account={entry.account} isTeam={entry.is_team} />
+                      <span id={whoId}>
+                        <TeamBadge account={entry.account} isTeam={entry.is_team} />
+                      </span>
                       <span data-testid="pick-entry-when" className="text-[12.5px] text-muted">
                         <RevealedAt ns={entry.revealed_at} />
                         {`${entry.revealed_at == null ? "Committed" : "committed"} at block ${entry.committed_height}`}
@@ -337,8 +343,9 @@ export function PickPanel({
                           setShares({ ...shares, [entry.account]: event.target.value })
                         }
                         aria-invalid={fieldError !== undefined}
-                        aria-describedby={fieldError === undefined ? undefined : `${shareId}-error`}
-                        aria-label={`Share of ${entry.account}, in percent`}
+                        aria-describedby={
+                          fieldError === undefined ? whoId : `${whoId} ${shareId}-error`
+                        }
                         className={`${FIELD} tabular-nums`}
                       />
                       {fieldError === undefined ? null : (
@@ -362,7 +369,7 @@ export function PickPanel({
                       onChange={(event) =>
                         setReasons({ ...reasons, [entry.account]: event.target.value })
                       }
-                      aria-label={`Reason for ${entry.account} (optional)`}
+                      aria-describedby={whoId}
                       className={FIELD}
                       placeholder="One line on why, for the scorecard"
                     />
@@ -374,7 +381,7 @@ export function PickPanel({
         </ul>
       </fieldset>
 
-      <div className="grid gap-3 rounded-xl border border-line bg-ink p-4" aria-live="polite">
+      <div className="grid gap-3 rounded-xl border border-line bg-ink p-4">
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
           <h3 className={FACT_LABEL}>What gets paid</h3>
           {chosen.length > 1 ? (
@@ -388,11 +395,15 @@ export function PickPanel({
             </button>
           ) : null}
         </div>
-        {payout === null ? (
-          <p data-testid="pick-problem" className="text-sm text-muted">
-            {choice.problem}
-          </p>
-        ) : (
+        {/* Only where the shares stand is announced as it changes, not every amount. */}
+        <p aria-live="polite" className="text-sm text-muted empty:hidden">
+          {payout === null ? (
+            <span data-testid="pick-problem">{choice.problem}</span>
+          ) : chosen.length > 1 ? (
+            "The shares add up to 100%."
+          ) : null}
+        </p>
+        {payout === null ? null : (
           <>
             <p className="text-[13.5px] text-muted">
               {"Reward "}
@@ -439,7 +450,10 @@ export function PickPanel({
               type="button"
               aria-disabled={busy || payout === null}
               onClick={() => {
-                if (payout !== null) void send(choice.winners);
+                if (payout === null) return;
+                // The winners are sent, so the question about picking nobody is closed.
+                setConfirming(false);
+                void send(choice.winners);
               }}
               className={PRIMARY}
             >
@@ -489,6 +503,9 @@ export function PickPanel({
                     ))}
                   </ul>
                 )}
+                <p className="text-[13px] text-muted">
+                  {`Entries were revealed, so if ${account} is a registered agent, its public record counts one more empty pick after reveals.`}
+                </p>
                 <div className="flex flex-wrap gap-3">
                   <button
                     type="button"
@@ -518,6 +535,12 @@ export function PickPanel({
               {run.message}
             </p>
           ) : null}
+          {task.heldout_commitment === null ? null : (
+            <p data-testid="pick-heldout-note" className="text-[12.5px] leading-relaxed text-muted">
+              This page doesn't publish the task's held-out checks: the scorecard shows them as not
+              published. A pick with Tender's MCP tools (pick_winners) can publish them.
+            </p>
+          )}
           <p className="text-[12.5px] leading-relaxed text-muted">
             {`One approval in your wallet. The scorecard is published in the name of ${account} with the pick. Sign with a key of ${account} itself: a delegate key can't pick.`}
           </p>

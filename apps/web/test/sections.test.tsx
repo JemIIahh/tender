@@ -263,7 +263,7 @@ test("scorecard_of_a_pick_by_hand_says_a_person_chose_and_nothing_scored", () =>
   );
 
   expect(screen.getByTestId("scored-by").textContent).toBe(
-    "Picked by hand by poster.testnet. No software scored the entries: each winner is listed at 100, every other entry at 0.",
+    "The scorecard says poster.testnet picked by hand, with no software scoring the entries: each winner is listed at 100, every other entry at 0.",
   );
 });
 

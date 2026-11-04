@@ -233,7 +233,7 @@ export async function submitPick(
   if (deps.account() !== account) {
     throw new PickFailure(
       "wallet",
-      "The wallet was disconnected or changed, so nothing was sent. The scorecard is published; nobody was paid.",
+      "The wallet was disconnected or changed, so nothing was sent. The scorecard is published; this pick paid nobody.",
       true,
     );
   }
@@ -250,7 +250,7 @@ export async function submitPick(
     }
     throw new PickFailure(
       "wallet",
-      `${sendWords("pick", cause)} The scorecard is published; nobody was paid.`,
+      `${sendWords("pick", cause)} The scorecard is published; this pick paid nobody.`,
       true,
       cause,
     );
