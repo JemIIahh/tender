@@ -24,6 +24,14 @@ import {
   type TenderApi,
   U64StringSchema,
 } from "@tender/shared";
+import {
+  checkPolicy,
+  describePolicy,
+  type EntryCounts,
+  type EntryPolicy,
+  policyRefusal,
+  utcDay,
+} from "./policy";
 import type { Solver, TaskContext } from "./types";
 
 // The agent runner: a loop that finds the open tasks of its tags, has a solver answer them, enters
@@ -97,6 +105,8 @@ const MAX_PAGES = 10;
 const MAX_REASON_CHARS = 200;
 /** The most code points of an id that a log line carries when the id is not a task id. */
 const MAX_ID_CHARS = 40;
+/** The most code points of an account id that a log line carries: the longest account id. */
+const MAX_ACCOUNT_CHARS = 64;
 /**
  * How many times a draft's commit is sent again in a run before the runner stops sending it. The
  * draft is not given up for that (review R1): it is looked for to the end of the reveal window.
@@ -194,6 +204,12 @@ export class AgentMemory {
    * one. At `MAX_RESENDS` the commit is not sent again. A restart starts the count again.
    */
   readonly resends = new Map<string, number>();
+  /**
+   * The tasks that passed every rule but the daily cap (`EntryPolicy.dailyEntries`), with the UTC
+   * day the cap was full. Such a task is not seen: the same day it is passed over without a call to
+   * the API (a day's count only grows), and the next day it is looked at afresh.
+   */
+  readonly capped = new Map<string, string>();
 }
 
 export interface AgentTickOptions {
@@ -228,6 +244,16 @@ export interface AgentTickOptions {
    * given none starts from nothing, which is right for a one-off call and for a test.
    */
   memory?: AgentMemory;
+  /**
+   * Which of the tasks of its tags the agent spends work on (`EntryPolicy`): the least reward of a
+   * token, the verifiers it lets check its work, their record of empty picks, and a cap on the
+   * tasks of a UTC day. A hire is held to its service's terms instead, and counts toward the cap.
+   * Without a policy the agent enters every task of its tags that it can, as the demos' scripted
+   * agents do. The command line gives one by the solver (`cli.ts`).
+   */
+  policy?: EntryPolicy;
+  /** Where the count of the day is kept, for `policy.dailyEntries`, which needs it. */
+  entryCounts?: EntryCounts;
 }
 
 export interface RunAgentOptions extends Omit<AgentTickOptions, "signal" | "memory"> {
@@ -269,6 +295,19 @@ interface Run {
    * They are sent once the pass over the drafts is done (`tendDrafts`), when `owed` is whole.
    */
   due: Draft[];
+  policy: EntryPolicy | undefined;
+  entryCounts: EntryCounts | undefined;
+  /**
+   * The verifiers' counts of empty picks after reveals, as this tick read them from the API
+   * (`voidsOf`): a number, null for a verifier the API has no record of, or undefined for one whose
+   * record could not be read (said once in the tick).
+   */
+  records: Map<string, number | null | undefined>;
+  /**
+   * The count of the day, as this tick read it and has added to it: the UTC day and the tasks taken
+   * on in it. Null until it is needed; `unreadable` once it could not be read in this tick.
+   */
+  today: { day: string; count: number } | null | "unreadable";
 }
 
 /** The text of `error`'s code if it has one that looks like a code, else undefined. */
@@ -376,27 +415,38 @@ async function listOpen(api: TenderApi, by: string | { invited: string }): Promi
  * 5. The detail says the Judge rejected it: as in step 2 (review M7), as the detail is fresher.
  * 6. The contract would refuse the agent (review M4): it is the task's poster or verifier, the
  *    task takes invited entrants only and the agent is not one, or the task is full. Logged.
- * 7. The agent's storage on the contract is below what a commit and a reveal need (R22), with the
+ * 7. The entry policy turns it away (`EntryPolicy`, for a task that is not a hire): it pays less
+ *    than the agent's least for its token, its verifier is not one the agent lets check its work,
+ *    or the verifier's record shows more empty picks after reveals than the agent accepts. Logged.
+ *    A record that cannot be read leaves the task for the next tick.
+ * 8. The agent's storage on the contract is below what a commit and a reveal need (R22), with the
  *    reveals it already owes (review M1): logged as a warning. A function-call key cannot top it
  *    up, so the agent can only wait for someone to.
- * 8. The solver, and `start`, the signal that the agent is working on the task. A scripted solver
+ * 9. The day's count is full (`EntryPolicy.dailyEntries`, hires included): the task waits for the
+ *    next UTC day, which is logged once. Otherwise the task is counted, on the disk, before the
+ *    next step.
+ * 10. The solver, and `start`, the signal that the agent is working on the task. A scripted solver
  *    answers from files, which costs nothing and has no side effect (review M6): it is asked
  *    first, and `start` goes out only for a task it has an answer to, so that the agent does not
  *    announce itself on strangers' tasks it will not enter. Any other solver is a model call, and
  *    `start` comes first. No answer, an error and a solver that takes too long (`solveTimeoutMs`)
  *    are logged.
- * 9. The answer is committed to (`commit`). If the commit does not end well, the draft it saved is
+ * 11. The answer is committed to (`commit`). If the commit does not end well, the draft it saved is
  *    settled by the next ticks (`recoverCommit`): the answer is not solved for again.
  *
- * A task is `seen` once step 2, 3, 5, 6 or 7 has turned it down and once the solver has been asked
- * (for a scripted solver with an answer: once `start` has gone through), whatever happens after,
- * so a solver is asked at most once per task in a run and a failing task cannot cost a model call
- * every tick. Steps 1 and 4, a solver that is not available and a call that fails leave the task
- * unseen: it is looked at again next tick, and nothing of a task id that is not one is kept.
+ * A task is `seen` once step 2, 3, 5, 6, 7 or 8 has turned it down and once the solver has been
+ * asked (for a scripted solver with an answer: once `start` has gone through), whatever happens
+ * after, so a solver is asked at most once per task in a run and a failing task cannot cost a model
+ * call every tick. Steps 1 and 4, a record that cannot be read, a full day, a solver that is not
+ * available and a call that fails leave the task unseen: it is looked at again next tick (a task
+ * of a full day, the next day), and nothing of a task id that is not one is kept.
  */
 async function enterTasks(run: Run): Promise<void> {
   // A task carries several tags and is listed under each: it is looked at once per tick.
   const looked = new Set<string>();
+  // A task that waited for another day than today is looked at afresh.
+  const today = utcDay(Date.now());
+  for (const [id, day] of run.memory.capped) if (day !== today) run.memory.capped.delete(id);
   run.services = await ownServices(run);
 
   for (const tag of run.tags) {
@@ -591,6 +641,9 @@ async function enter(
     return;
   }
 
+  // A task that met a full count today waits for tomorrow, and costs no call until then.
+  if (memory.capped.get(id) === utcDay(Date.now())) return;
+
   if (rejectedByTheJudge(run, summary)) return;
 
   // Not `memory`: a restart has none, and the draft holds the salt of a commitment that may be on
@@ -640,7 +693,9 @@ async function enter(
   // A hire is taken only on the terms of a service the agent offers, whichever listing found it:
   // the invited one, or a tag the hire's brief carries. A pinned task that is no hire (other
   // criteria, found by a tag) is entered as it was before services, as any task of the agent's tags.
-  if (invited || (task.invited.includes(run.account) && isHireCriteria(run, task.criteria_hash))) {
+  const isHire =
+    invited || (task.invited.includes(run.account) && isHireCriteria(run, task.criteria_hash));
+  if (isHire) {
     const why = hireRefusal(run, task);
     if (why !== null) {
       memory.seen.add(id);
@@ -656,6 +711,19 @@ async function enter(
     return;
   }
 
+  // The entry policy, for every task but a hire, which its service's terms hold already (the
+  // listing chose its price and its checker).
+  if (!isHire) {
+    const why = await policyRefusalOf(run, task);
+    // The verifier's record could not be read: the task waits, unseen, for the next tick.
+    if (why === undefined) return;
+    if (why !== null) {
+      memory.seen.add(id);
+      run.log(`${run.name}: skipping task ${id}, ${why}`);
+      return;
+    }
+  }
+
   // R22 (P05-P2): an entry that runs out of storage cannot reveal, and its window does not wait.
   // Checked here, ahead of `start` and the solver, rather than at the commit itself: an agent
   // that cannot commit then neither announces itself on the task nor spends a model call on it.
@@ -663,6 +731,10 @@ async function enter(
     memory.seen.add(id);
     return;
   }
+
+  // The daily cap comes last, so that a task that fails another rule is turned away for good by
+  // that rule, and only one that fails the cap alone waits for the next day. Hires count too.
+  if (!(await roomToday(run, id))) return;
 
   // A solver that thinks reads what the poster has said in public on the task. A scripted one
   // answers from a file and has no use for it, so the API is not asked.
@@ -678,15 +750,118 @@ async function enter(
       memory.seen.add(id);
       return;
     }
+    await countEntry(run);
     await run.api.start(BigInt(id));
     memory.seen.add(id);
   } else {
+    await countEntry(run);
     await run.api.start(BigInt(id));
     memory.seen.add(id);
     content = await ask(run, id, ctx);
     if (content === null) return;
   }
   await commit(run, id, content, task.created_at);
+}
+
+/**
+ * Why the entry policy turns `task` away, null if it does not, or undefined if it cannot tell now:
+ * the record of the verifier, which `maxVoidsAfterReveals` needs, could not be read. Then the task
+ * waits for the next tick, which reads the record again. The guard fails closed.
+ */
+async function policyRefusalOf(run: Run, task: TaskDetail): Promise<string | null | undefined> {
+  const { policy } = run;
+  if (policy === undefined) return null;
+  const verifier = oneLine(task.verifier, MAX_ACCOUNT_CHARS);
+  const why = policyRefusal(policy, { ...task, verifier });
+  if (why !== null) return why;
+  const most = policy.maxVoidsAfterReveals;
+  if (most === undefined) return null;
+  const voids = await voidsOf(run, task.verifier);
+  if (voids === undefined) return undefined;
+  if (voids === null || voids <= most) return null;
+  return `its verifier ${verifier} has voided ${voids} tasks after their reveals, more than the ${most} the agent accepts`;
+}
+
+/**
+ * The empty picks after reveals of `verifier` (`voids_after_reveals`), by its record in the API,
+ * read once a tick: null if the API has no record of it (it is no registered agent), undefined if
+ * the record cannot be read now, or is no count, which is said once in the tick.
+ */
+async function voidsOf(run: Run, verifier: string): Promise<number | null | undefined> {
+  if (run.records.has(verifier)) return run.records.get(verifier);
+  let voids: number | null | undefined;
+  let why: string | undefined;
+  try {
+    const found = await run.api.getAgent(verifier);
+    voids = found === null ? null : found.agent.voids_after_reveals;
+    if (voids !== null && !(Number.isSafeInteger(voids) && voids >= 0)) {
+      voids = undefined;
+      why = "it holds no count";
+    }
+  } catch (error) {
+    voids = undefined;
+    why = describe(error);
+  }
+  run.records.set(verifier, voids);
+  if (why !== undefined) {
+    const shown = oneLine(verifier, MAX_ACCOUNT_CHARS);
+    run.log(
+      `WARN ${run.name}: the record of verifier ${shown} cannot be read (${why}), so its tasks wait`,
+    );
+  }
+  return voids;
+}
+
+/**
+ * Whether the day's count leaves room for task `id` (`policy.dailyEntries`): always, without a cap.
+ * A task that finds it full waits, unseen, for the next UTC day, which is said once for it. A count
+ * that cannot be read leaves room for nothing in this tick (said once), as a cap that is not known
+ * cannot be kept.
+ */
+async function roomToday(run: Run, id: string): Promise<boolean> {
+  const most = run.policy?.dailyEntries;
+  if (most === undefined || run.entryCounts === undefined) return true;
+  const day = utcDay(Date.now());
+  if (run.today === "unreadable") return false;
+  if (run.today === null || run.today.day !== day) {
+    try {
+      run.today = { day, count: await run.entryCounts.read(day) };
+    } catch (error) {
+      run.today = "unreadable";
+      // The store's own errors name its file and quote nothing else, which is how the operator
+      // learns which file to fix.
+      const why = error instanceof Error ? oneLine(error.message) : typeof error;
+      run.log(
+        `ERROR ${run.name}: the count of the day's entries cannot be read (${why}), so no task is taken on`,
+      );
+      return false;
+    }
+  }
+  if (run.today.count < most) return true;
+  if (run.memory.capped.get(id) !== day) {
+    run.memory.capped.set(id, day);
+    run.log(
+      `${run.name}: task ${id} waits for the next day (UTC): the agent has taken on ${run.today.count} tasks today, its most (dailyEntries ${most})`,
+    );
+  }
+  return false;
+}
+
+/**
+ * Counts the task the agent is taking on, on the disk, before it is announced and before the solver
+ * is asked: a crash after the solve has it counted. A write that fails throws, and the task is left
+ * for the next tick. A `start` that fails after the count leaves the task for the next tick too,
+ * which counts it again: a failure can cost a place under the cap, never a solve over it.
+ */
+async function countEntry(run: Run): Promise<void> {
+  if (run.policy?.dailyEntries === undefined || run.entryCounts === undefined) return;
+  // `roomToday` read the count just before, in the same task. Without it nothing is taken on.
+  if (run.today === null || run.today === "unreadable") {
+    throw new Error("the count of the day was not read before a task was taken on");
+  }
+  const count = run.today.count + 1;
+  await run.entryCounts.write(run.today.day, count);
+  run.today = { day: run.today.day, count };
 }
 
 /**
@@ -839,6 +1014,7 @@ function forget(memory: AgentMemory, id: string): void {
   memory.warned.delete(id);
   memory.waiting.delete(id);
   memory.resends.delete(id);
+  memory.capped.delete(id);
 }
 
 /**
@@ -1332,6 +1508,7 @@ export async function agentTick(opts: AgentTickOptions): Promise<void> {
   if (account === undefined) throw new Error(NO_SIGNER);
   const solveTimeoutMs = opts.solveTimeoutMs ?? DEFAULT_SOLVE_TIMEOUT_MS;
   checkMs("solveTimeoutMs", solveTimeoutMs);
+  if (opts.policy !== undefined) checkPolicy(opts.policy, opts.entryCounts);
   const run: Run = {
     name: opts.name,
     account,
@@ -1347,6 +1524,10 @@ export async function agentTick(opts: AgentTickOptions): Promise<void> {
     memory: opts.memory ?? new AgentMemory(),
     owed: 0,
     due: [],
+    policy: opts.policy,
+    entryCounts: opts.entryCounts,
+    records: new Map(),
+    today: null,
   };
   await tendDrafts(run);
   await enterTasks(run);
@@ -1378,11 +1559,12 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
  * An abort during the wait ends the loop at once. An abort during a tick lets the task in hand
  * finish first, and the tick starts on no other. A signal that is aborted already runs no tick. The
  * returned promise resolves once the loop has stopped. It rejects only at once, without running a
- * tick, for a client with no signer or for a `pollMs` or `solveTimeoutMs` that `setTimeout` cannot
- * keep.
+ * tick, for a client with no signer, for a `pollMs` or `solveTimeoutMs` that `setTimeout` cannot
+ * keep, or for a `policy` that cannot be applied (`checkPolicy`).
  *
  * The first line says which account the agent signs as, and whether its solver is scripted, so
- * that a run of the team's scripted agents cannot be mistaken for something else.
+ * that a run of the team's scripted agents cannot be mistaken for something else. With a policy,
+ * the second line says it.
  */
 export async function runAgent(o: RunAgentOptions): Promise<void> {
   const { signal } = o;
@@ -1390,6 +1572,7 @@ export async function runAgent(o: RunAgentOptions): Promise<void> {
   checkMs("pollMs", pollMs);
   // Refused here and not left to the first tick, which would throw it again every time.
   checkMs("solveTimeoutMs", o.solveTimeoutMs ?? DEFAULT_SOLVE_TIMEOUT_MS);
+  if (o.policy !== undefined) checkPolicy(o.policy, o.entryCounts);
   const account = o.client.accountId;
   if (account === undefined) throw new Error(NO_SIGNER);
 
@@ -1398,6 +1581,7 @@ export async function runAgent(o: RunAgentOptions): Promise<void> {
   const tags = o.tags.length === 0 ? "none" : o.tags.join(", ");
   const kind = o.solver.scripted ? " (scripted)" : "";
   log(`${o.name}: running as ${account}, tags ${tags}, ${o.solver.name} solver${kind}`);
+  if (o.policy !== undefined) log(`${o.name}: entry policy ${describePolicy(o.policy)}`);
 
   while (!signal.aborted) {
     try {

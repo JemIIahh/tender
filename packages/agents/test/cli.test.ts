@@ -35,6 +35,7 @@ import {
   readRunConfig,
   registrationWarning,
 } from "../src/cli";
+import { ENTRY_COUNTS_FILE } from "../src/policy";
 import type { RunAgentOptions } from "../src/runner";
 import { FAKE_TOKEN, type FakeApi, REFUSAL_TEXT, startFakeApi } from "./fake-api";
 import { startFakeLlm } from "./fake-llm";
@@ -66,15 +67,19 @@ const ENV: Record<string, string> = {
 };
 /** Recognisable in any output: the model's key must never be printed. */
 const LLM_KEY = "sk-test-LLM-SECRET-0001";
+/** The Judge the API serves, which the deploy writes to `.env.deploy.<network>`. */
+const JUDGE_ACCOUNT = "judge.tender.testnet";
+/** What an agent with a model needs besides `ENV`: the model, and the Judge, its only verifier by default. */
 const LLM_ENV: Record<string, string> = {
   LLM_BASE_URL: "https://llm.example/v1",
   LLM_API_KEY: LLM_KEY,
   LLM_MODEL: "test-org/test-model-7",
+  JUDGE_ACCOUNT,
 };
 const ARGS = ["--agent", "analyst", "--solver", "offline", "--network", "testnet"];
 const LLM_ARGS = ["--agent", "analyst", "--solver", "llm", "--network", "testnet"];
 const USAGE =
-  "usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent analyst|coder|extractor --solver llm|offline|weak --network sandbox|testnet|mainnet [--max-llm-calls-per-hour N]";
+  "usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent analyst|coder|extractor --solver llm|offline|weak --network sandbox|testnet|mainnet [--max-llm-calls-per-hour N] [--verifiers judge|any|<account>,...] [--min-reward <token>=<amount>]... [--daily-entries N] [--max-voids-after-reveals N]";
 const KEY_COMMAND =
   "pnpm exec tsx scripts/keeper-key.ts --network testnet --role agent --agent analyst";
 
@@ -782,7 +787,13 @@ test("the_llm_solver_the_command_makes_asks_the_model_the_environment_names", as
   try {
     let answer: Uint8Array | null = null;
     const result = await start(["--agent", "analyst", "--solver", "llm", "--network", "testnet"], {
-      env: { ...ENV, LLM_BASE_URL: llm.baseUrl, LLM_API_KEY: LLM_KEY, LLM_MODEL: "env-model" },
+      env: {
+        ...ENV,
+        LLM_BASE_URL: llm.baseUrl,
+        LLM_API_KEY: LLM_KEY,
+        LLM_MODEL: "env-model",
+        JUDGE_ACCOUNT,
+      },
       loop: async (options) => {
         answer = await options.solver.solve(contextOf(taskSpec({ id: 1 })));
       },
@@ -803,7 +814,13 @@ test("the_hourly_limit_of_the_flag_reaches_the_llm_solver_and_its_warning_the_co
   const reply = JSON.stringify({ pattern: "^\\d+\\.\\d+\\.\\d+$", flags: "" });
   const llm = await startFakeLlm(reply);
   try {
-    const env = { ...ENV, LLM_BASE_URL: llm.baseUrl, LLM_API_KEY: LLM_KEY, LLM_MODEL: "env-model" };
+    const env = {
+      ...ENV,
+      LLM_BASE_URL: llm.baseUrl,
+      LLM_API_KEY: LLM_KEY,
+      LLM_MODEL: "env-model",
+      JUDGE_ACCOUNT,
+    };
     const answers: Array<Uint8Array | null> = [];
     const result = await start([...LLM_ARGS, "--max-llm-calls-per-hour", "2"], {
       env,
@@ -831,6 +848,198 @@ test("the_hourly_limit_of_the_flag_reaches_the_llm_solver_and_its_warning_the_co
   } finally {
     await llm.stop();
   }
+});
+
+// ---- The entry policy -------------------------------------------------------------------------
+
+/** The tokens of the contract's config, with the least reward of each. */
+const TOKENS: ConfigView["tokens"] = [
+  { token: "usdc.testnet", min_reward: "10000", max_reward: "1000000000", enabled: true },
+  { token: "tusdc.tender.testnet", min_reward: "1", max_reward: "1000000000", enabled: false },
+];
+
+test("policy_a_scripted_agent_enters_as_before_any_verifier_any_reward_no_cap", async () => {
+  for (const solver of ["offline", "weak"]) {
+    const result = await start(["--agent", "analyst", "--solver", solver, "--network", "testnet"]);
+    expect(result.code, solver).toBe(0);
+    const options = result.loop.mock.calls[0]?.[0];
+    expect(options?.policy, solver).toEqual({ verifiers: "any" });
+    expect(options?.entryCounts, solver).toBeUndefined();
+    // Nothing more is read for it: no Judge, no minimum of the chain.
+    expect(result.getConfig, solver).not.toHaveBeenCalled();
+    expect(result.out, solver).toEqual([]);
+  }
+});
+
+test("policy_an_agent_with_a_model_takes_the_judges_tasks_only_20_a_day_and_none_below_the_chains_least_reward", async () => {
+  const result = await start(LLM_ARGS, {
+    env: { ...ENV, ...LLM_ENV },
+    config: async () => configView({ tokens: TOKENS }),
+    loop: async (options) => {
+      await options.entryCounts?.write("2026-11-04", 3);
+    },
+  });
+
+  expect(result.code).toBe(0);
+  expect(result.err).toEqual([]);
+  expect(result.loop.mock.calls[0]?.[0].policy).toEqual({
+    verifiers: "judge",
+    judgeAccount: JUDGE_ACCOUNT,
+    minReward: { "usdc.testnet": 10_000n, "tusdc.tender.testnet": 1n },
+    dailyEntries: 20,
+  });
+  // The count of the day is kept in the agent's state directory, beside its drafts.
+  const file = join(result.home, ".tender", "testnet", ACCOUNT, ENTRY_COUNTS_FILE);
+  expect(JSON.parse(await readFile(file, "utf8"))).toEqual({ day: "2026-11-04", entries: 3 });
+  // The chain's least rewards are read once the key is checked, and before anything else starts.
+  expect(result.calls).toEqual([
+    "makeClient",
+    "viewAccessKey",
+    "getAgent",
+    "getConfig",
+    "createApi",
+    "signIn",
+    "run",
+  ]);
+});
+
+test("policy_an_agent_with_a_model_does_not_start_without_the_chains_least_rewards", async () => {
+  const result = await start(LLM_ARGS, {
+    env: { ...ENV, ...LLM_ENV },
+    config: async () => {
+      throw new Error("rpc down LEAK-9");
+    },
+  });
+
+  expect(result.code).toBe(1);
+  expect(said(result)).toMatch(
+    /^run-agent: cannot read the tokens' least rewards from the chain \(Error\), and an agent with a model does not start without them/,
+  );
+  expect(said(result)).not.toContain("LEAK-9");
+  expect(result.createApi).not.toHaveBeenCalled();
+  expect(result.loop).not.toHaveBeenCalled();
+});
+
+test("policy_the_judges_account_is_needed_for_the_judges_tasks_and_for_nothing_else", async () => {
+  const { JUDGE_ACCOUNT: _judge, ...noJudge } = { ...ENV, ...LLM_ENV };
+
+  const refused = await start(LLM_ARGS, { env: noJudge });
+  expect(refused.code).toBe(1);
+  expect(said(refused)).toMatch(
+    /^run-agent: missing environment variable: JUDGE_ACCOUNT \(set them in \.env or \.env\.deploy\.testnet\)/,
+  );
+  expect(said(refused)).toContain("--verifiers");
+  expect(refused.makeClient).not.toHaveBeenCalled();
+  expect(refused.loop).not.toHaveBeenCalled();
+
+  const wrong = await start(LLM_ARGS, { env: { ...noJudge, JUDGE_ACCOUNT: "Not An Id SECRET-7" } });
+  expect(wrong.code).toBe(1);
+  expect(said(wrong)).toContain("JUDGE_ACCOUNT must be a NEAR account id");
+  expect(said(wrong)).not.toContain("SECRET-7");
+
+  // Any verifier, or a list of them: there is no Judge to know, and a stray value is not read.
+  for (const verifiers of ["any", "a.testnet,b.testnet"]) {
+    const result = await start([...LLM_ARGS, "--verifiers", verifiers], {
+      env: { ...noJudge, JUDGE_ACCOUNT: "not read" },
+    });
+    expect(result.code, verifiers).toBe(0);
+    expect(result.loop.mock.calls[0]?.[0].policy, verifiers).not.toHaveProperty("judgeAccount");
+  }
+
+  // A scripted agent held to the Judge's tasks needs it as well.
+  const scripted = await start([...ARGS, "--verifiers", "judge"]);
+  expect(scripted.code).toBe(1);
+  expect(said(scripted)).toContain("missing environment variable: JUDGE_ACCOUNT");
+  const judged = await start([...ARGS, "--verifiers", "judge"], {
+    env: { ...ENV, JUDGE_ACCOUNT },
+  });
+  expect(judged.loop.mock.calls[0]?.[0].policy).toEqual({
+    verifiers: "judge",
+    judgeAccount: JUDGE_ACCOUNT,
+  });
+});
+
+test("policy_the_flags_set_the_policy_over_the_defaults_of_the_solver", async () => {
+  const flags = [
+    "--verifiers",
+    "a.testnet,b.testnet",
+    "--min-reward",
+    "usdc.testnet=2000000",
+    "--min-reward",
+    "other.testnet=5",
+    "--daily-entries",
+    "5",
+    "--max-voids-after-reveals",
+    "0",
+  ];
+  const llm = await start([...LLM_ARGS, ...flags], {
+    env: { ...ENV, ...LLM_ENV },
+    config: async () => configView({ tokens: TOKENS }),
+  });
+  expect(llm.code).toBe(0);
+  // The flagged amounts win over the chain's, and a token the chain has not is added.
+  expect(llm.loop.mock.calls[0]?.[0].policy).toEqual({
+    verifiers: ["a.testnet", "b.testnet"],
+    minReward: { "usdc.testnet": 2_000_000n, "tusdc.tender.testnet": 1n, "other.testnet": 5n },
+    maxVoidsAfterReveals: 0,
+    dailyEntries: 5,
+  });
+
+  // A scripted agent takes them as they are, and reads nothing of the chain for them.
+  const scripted = await start([...ARGS, "--daily-entries", "3", "--min-reward", "usdc.testnet=7"]);
+  expect(scripted.code).toBe(0);
+  const options = scripted.loop.mock.calls[0]?.[0];
+  expect(options?.policy).toEqual({
+    verifiers: "any",
+    minReward: { "usdc.testnet": 7n },
+    dailyEntries: 3,
+  });
+  expect(options?.entryCounts).toBeDefined();
+  expect(scripted.getConfig).not.toHaveBeenCalled();
+});
+
+test("policy_a_flag_of_the_policy_that_cannot_be_read_is_a_usage_error_that_quotes_nothing", () => {
+  const verifiers = "--verifiers must be judge, any, or NEAR account ids separated by commas";
+  const reward = "--min-reward must be <token account id>=<amount in the token's smallest unit>";
+  const cases: Array<[string[], string]> = [
+    [["--verifiers", "Not An Id SECRET-8"], verifiers],
+    [["--verifiers", ""], verifiers],
+    [["--verifiers", "a.testnet,,b.testnet"], verifiers],
+    [["--min-reward", "SECRET-8"], reward],
+    [["--min-reward", "usdc.testnet="], reward],
+    [["--min-reward", "=5"], reward],
+    [["--min-reward", "usdc.testnet=1.5"], reward],
+    [["--min-reward=usdc.testnet=-1"], reward],
+    [["--min-reward", `usdc.testnet=${2n ** 128n}`], reward],
+    [
+      ["--min-reward", "usdc.testnet=1", "--min-reward", "usdc.testnet=2"],
+      "--min-reward names a token twice",
+    ],
+    [["--daily-entries", "0"], "--daily-entries must be a whole number from 1"],
+    [["--daily-entries", "SECRET-8"], "--daily-entries must be a whole number from 1"],
+    // Written with `=`: node refuses a value that starts with a dash as a separate argument.
+    [["--max-voids-after-reveals=-1"], "--max-voids-after-reveals must be a whole number from 0"],
+    [["--max-voids-after-reveals=1.5"], "--max-voids-after-reveals must be a whole number from 0"],
+  ];
+  for (const [flags, sentence] of cases) {
+    const what = flags.join(" ");
+    expect(() => parseCli([...ARGS, ...flags]), what).toThrow(
+      new CliError(`${sentence}\n${USAGE}`),
+    );
+  }
+
+  expect(parseCli([...ARGS, "--verifiers", "judge"])).toMatchObject({ verifiers: "judge" });
+  expect(parseCli([...ARGS, "--verifiers", " a.testnet , b.testnet "])).toMatchObject({
+    verifiers: ["a.testnet", "b.testnet"],
+  });
+  expect(parseCli([...ARGS, "--min-reward", `usdc.testnet=${2n ** 128n - 1n}`])).toMatchObject({
+    minReward: { "usdc.testnet": 2n ** 128n - 1n },
+  });
+  expect(parseCli([...ARGS, "--max-voids-after-reveals", "0"])).toMatchObject({
+    maxVoidsAfterReveals: 0,
+  });
+  // None of them is there unless its flag is.
+  expect(Object.keys(parseCli(ARGS)).sort()).toEqual(["agent", "network", "solver"]);
 });
 
 test("the_environment_comes_from_the_files_and_the_process_wins", async () => {
