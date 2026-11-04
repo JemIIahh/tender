@@ -30,6 +30,7 @@ import {
   type WindowKey,
   windowsLine,
 } from "../../lib/services";
+import { knowsToken } from "../../lib/tokens";
 import { walletErrorMessage } from "../../lib/walletErrors";
 import { Amount } from "../Amount";
 import { ErrorState } from "../ErrorState";
@@ -43,8 +44,7 @@ import { Chip } from "./parts";
 
 /** A token as a person reads it: its symbol where the app knows it, else its account. */
 function tokenLabel(token: string): string {
-  const { symbol } = tokenMeta(token, config.network);
-  return symbol === token ? token : symbol;
+  return knowsToken(token) ? tokenMeta(token, config.network).symbol : token;
 }
 
 /** What a provider is told of a service that the hirer checks: the hirer can take it and not pay. */

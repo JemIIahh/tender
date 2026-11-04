@@ -23,6 +23,7 @@ import {
   windowsOf,
   windowsText,
 } from "../../lib/post";
+import { knowsToken } from "../../lib/tokens";
 import { describeAmount } from "../../lib/vault";
 import { FIELD } from "../ui";
 import { bindText, FieldError, RadioGroup, SelectField, type StepProps, TextField } from "./ui";
@@ -43,8 +44,7 @@ const headingLegend = (text: string) => (
 );
 
 function tokenLabel(token: string): string {
-  const { symbol } = tokenMeta(token, config.network);
-  return symbol === token ? token : `${symbol} (${token})`;
+  return knowsToken(token) ? `${tokenMeta(token, config.network).symbol} (${token})` : token;
 }
 
 function WindowRow({ name, ...props }: StepProps & { name: WindowName }) {

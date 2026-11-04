@@ -7,6 +7,7 @@ import {
   tokenMeta,
 } from "@tender/shared";
 import { api } from "./api";
+import { knowsToken } from "./tokens";
 
 // The landing's ticker: what the API says right now, then plain facts about the protocol. A figure
 // is shown only as the API gave it; when a read fails, its item is left out, and the facts stand on
@@ -43,8 +44,8 @@ function count(rows: number, next: string | null): string {
 
 /** `amount` of `token` in whole units with its symbol, or null for a token without known decimals. */
 function amountText(amount: bigint, token: string, network: NetworkId): string | null {
+  if (!knowsToken(token, network)) return null;
   const { symbol, decimals } = tokenMeta(token, network);
-  if (symbol === token) return null;
   return `${formatTokenAmount(amount, decimals)} ${symbol}`;
 }
 
