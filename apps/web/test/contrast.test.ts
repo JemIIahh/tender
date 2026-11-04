@@ -71,6 +71,38 @@ test("small_text_reaches_4_5_to_1_on_every_ground", () => {
   expect(ratio("ink", "paper")).toBeGreaterThanOrEqual(4.5);
 });
 
+test("task_page_board_and_swarm_tree_write_only_in_colours_that_reach_4_5_to_1", () => {
+  // The question board and the swarm tree sit on a panel, with raised boxes inside it (an answer, a
+  // clarification, the page's own node, a margin) and the failure box's faint seal wash, which
+  // reads as the panel. Every text colour they use has to reach 4.5:1 on every one of those grounds,
+  // and none is faded with an opacity, which would take it under.
+  for (const file of ["components/Questions.tsx", "components/SwarmTree.tsx"]) {
+    const source = readFileSync(join(import.meta.dirname, "..", file), "utf8");
+    const texts = new Set(
+      [...source.matchAll(/(?:^|[\s"`])text-([a-z]+)(?=[\s"`])/g)]
+        .map((m) => m[1] ?? "")
+        .filter((name) => name in COLORS),
+    );
+    const grounds = new Set(
+      [...source.matchAll(/(?:^|[\s"`])bg-([a-z]+)(?=[\s"`])/g)]
+        .map((m) => m[1] ?? "")
+        .filter((name) => name in COLORS && name !== "seal"),
+    );
+    grounds.add("panel");
+    expect(texts.size, file).toBeGreaterThan(0);
+    for (const text of texts) {
+      for (const ground of grounds) {
+        expect(ratio(text, ground), `${file}: ${text} on ${ground}`).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+    expect(source, file).not.toMatch(/(?:^|[\s"`])text-[a-z]+\/\S+/);
+    // The seal dots are a colour of their own, not text; the only seal ground is the faint wash.
+    expect(source.match(/bg-seal\/\[[^\]]+\]/g) ?? [], file).toEqual(
+      file.endsWith("Questions.tsx") ? ["bg-seal/[0.06]"] : [],
+    );
+  }
+});
+
 test("add_agent_steps_keep_their_words_at_4_5_to_1_whether_open_or_not_yet", () => {
   // A step that is not open yet is told apart by its edge and its ground, never by fading: muted
   // text at 60% on the panel was 3.14:1.

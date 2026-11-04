@@ -14,5 +14,8 @@
       "max_reward": "1000000000000",
       "enabled": true
     }
-  ]
+  ],
+  "agent_bond_token": "token.test.near",
+  "agent_bond_amount": "1000000",
+  "agent_bond_cooldown_secs": "1209600"
 }

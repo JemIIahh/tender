@@ -11,7 +11,12 @@ import {
   tokenForAccount,
 } from "./apiToken";
 import { config } from "./config";
-import { type SignedMessageResult, type SignMessageInput, useWallet } from "./wallet";
+import {
+  type SignedMessageResult,
+  type SignMessageInput,
+  type UseWalletOptions,
+  useWallet,
+} from "./wallet";
 import {
   SignInRefused,
   WalletAccountMismatch,
@@ -141,8 +146,8 @@ function signInOnce(wallet: SignInWallet): Promise<string> {
  * that signed in, and to the wallet session it signed in under: the wallet store drops it when
  * that session ends, so a wallet connected again, as the same account or another, signs in again.
  */
-export function useApiToken(): UseApiToken {
-  const { accountId, canSignMessage, signMessage } = useWallet();
+export function useApiToken(options?: UseWalletOptions): UseApiToken {
+  const { accountId, canSignMessage, signMessage } = useWallet(options);
   const stored = useSyncExternalStore(subscribeToken, heldToken, noToken);
 
   const signIn = useCallback(

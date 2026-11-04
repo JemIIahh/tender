@@ -216,6 +216,8 @@ impl Tender {
             fee_bps: _,
             min_window_secs: _,
             paused: _,
+            agent_bond: _,
+            agent_bond_cooldown_secs: _,
             next_task_id: _,
             tokens,
             vault,
@@ -225,6 +227,7 @@ impl Tender {
             entrant_at,
             agents,
             delegates,
+            delegate_counts,
         } = self;
         tokens.flush();
         vault.flush();
@@ -234,6 +237,7 @@ impl Tender {
         entrant_at.flush();
         agents.flush();
         delegates.flush();
+        delegate_counts.flush();
     }
 
     /// Flushes, then returns the contract's storage usage. This is the `before` that a
@@ -325,8 +329,8 @@ mod tests {
 
     use crate::test_utils::{ctx, fresh, panic_message};
     use crate::types::{
-        AgentProfile, DelegateCaps, Entry, StorageAccount, StorageView, Task, TokenConfig,
-        STORAGE_MIN_DEPOSIT,
+        AgentProfile, AgentStatus, DelegateCaps, Entry, StorageAccount, StorageView, Task,
+        TokenConfig, STORAGE_MIN_DEPOSIT,
     };
     use crate::Tender;
 
@@ -391,6 +395,11 @@ mod tests {
             earned: vec![],
             picks_made: 0,
             voids_after_reveals: 0,
+            status: AgentStatus::Active,
+            bond: None,
+            unregistering_since: 0,
+            claimable_at: 0,
+            locked_until: 0,
         };
         // Pad the URI until the record's Borsh value is exactly `value_len` bytes.
         let fixed = borsh::to_vec(&p).unwrap().len();

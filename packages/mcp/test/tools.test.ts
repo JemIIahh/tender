@@ -23,6 +23,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { TenderError, type TxResult } from "@tender/client";
 import {
+  type AgentView,
   ApiError,
   type BlobUpload,
   BOARD_HIDDEN_LABEL,
@@ -233,7 +234,44 @@ const CONFIG: ConfigView = {
     { token: WEIRD, min_reward: "1", max_reward: "1000000000", enabled: true },
     { token: "old.testnet", min_reward: "1", max_reward: "1000000000", enabled: false },
   ],
+  // No bond is set: registering takes nothing, so the tests that are not about the bond need no
+  // tokens in the vault. The tests of the bond ask for BONDED.
+  agent_bond_token: null,
+  agent_bond_amount: null,
+  agent_bond_cooldown_secs: "86400",
 };
+
+/** The bond of 1 USDC (1_000_000 of the smallest unit) that registering takes from the vault. */
+const BOND = 1_000_000n;
+const BONDED: ConfigView = {
+  ...CONFIG,
+  agent_bond_token: USDC,
+  agent_bond_amount: BOND.toString(),
+};
+
+/** An agent as the chain shows it, active with the bond of BONDED unless a test says otherwise. */
+function agentView(over: Partial<AgentView> = {}): AgentView {
+  return {
+    account: ACCOUNT,
+    asp: null,
+    profile_uri: `${BLOBS}/${"ab".repeat(32)}`,
+    profile_hash: "ab".repeat(32),
+    tags: ["data"],
+    registered_at: "1700000000000000000",
+    entries: 0,
+    reveals: 0,
+    wins: 0,
+    earned: [],
+    picks_made: 0,
+    voids_after_reveals: 0,
+    status: "active",
+    bond_token: USDC,
+    bond_amount: BOND.toString(),
+    claimable_at: null,
+    locked_until: null,
+    ...over,
+  };
+}
 
 /** An API of which only the named methods exist: calling any other is a failure of the test. */
 function fakeApi(methods: Partial<TenderApi>): TenderApi {
@@ -443,6 +481,16 @@ test("lists_expected_write_tools", async () => {
       idempotentHint: true,
     });
   }
+  // register_agent locks the agent's bond out of the vault, so it is destructive too; a repeat takes
+  // no second bond (an agent that holds one only replaces its profile), so it is idempotent. There
+  // is no tool for unregistering or claiming the bond: those are the command line's.
+  expect(byName.register_agent?.annotations).toMatchObject({
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+  });
+  expect(tools.map((tool) => tool.name)).not.toContain("unregister_agent");
+  expect(tools.map((tool) => tool.name)).not.toContain("claim_agent_bond");
   // The board's tools post public words and spend nothing, and a repeat posts them twice.
   for (const name of ["ask_question", "answer_question", "post_clarification"]) {
     expect(byName[name]?.annotations).toMatchObject({
@@ -1147,6 +1195,13 @@ function writeKit() {
     getConfig: vi.fn<McpChain["getConfig"]>(async () => CONFIG),
     balanceOf: vi.fn<McpChain["balanceOf"]>(async () => 0n),
     storageBalanceOf: vi.fn<McpChain["storageBalanceOf"]>(async () => ROOMY),
+    // The agent is not registered yet; the wallet holds the bond token and is registered with it.
+    getAgent: vi.fn<McpChain["getAgent"]>(async () => null),
+    ftStorageBalanceOf: vi.fn<McpChain["ftStorageBalanceOf"]>(async () => ({
+      total: "1250000000000000000000",
+      available: "0",
+    })),
+    ftBalanceOf: vi.fn<McpChain["ftBalanceOf"]>(async () => 10n * BOND),
     // The chain holds the entry of each commit that went through, as the real one does, and nothing
     // else: a commit that threw left none. A test that wants another answer sets it.
     getEntry: vi.fn<McpChain["getEntry"]>(async (taskId) => {
@@ -3338,7 +3393,8 @@ test("the_agent_key_is_refused_pick_and_register_before_anything_is_uploaded", a
   // The chain refuses pick and register_agent for a key that lists commit and reveal, but only
   // after the scorecard or the profile has gone up, and both are public. So the tools refuse
   // first, say which key they need, and touch nothing: no upload, no look at the API or at the
-  // storage, no transaction.
+  // storage, no transaction. register_agent attaches 1 yoctoNEAR, which no function-call key can,
+  // so it asks for a full-access key whatever the key lists.
   const { call, chain, api } = await connectWrite(AGENT_KEY);
   api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
 
@@ -3358,7 +3414,7 @@ test("the_agent_key_is_refused_pick_and_register_before_anything_is_uploaded", a
   const registered = await call("register_agent", PROFILE);
   expect(registered.isError).toBe(true);
   expect(registered.text).toMatch(
-    /^KEY_CANNOT_CALL: register_agent needs a key that may call register_agent on tender\.testnet: a full-access key, or a function-call key to tender\.testnet that lists register_agent\. /,
+    /^NEEDS_FULL_ACCESS_KEY: register_agent attaches exactly 1 yoctoNEAR and puts the agent's bond at stake, which only a full-access key can do: a function-call key cannot attach a deposit, a delegate key among them, whatever methods it lists\. Nothing was uploaded or sent\./,
   );
   for (const mock of [...Object.values(chain), ...Object.values(api)]) {
     expect(mock).not.toHaveBeenCalled();
@@ -3408,15 +3464,10 @@ test("a_key_must_list_the_method_that_a_tool_calls", async () => {
     scorecard: SCORECARD,
   });
   expect(picks.chain.pick).toHaveBeenCalledTimes(1);
-  const registers = await connectWrite({
-    keyKind: "function_call",
-    keyMethods: ["register_agent"],
-  });
-  await registers.callJson("register_agent", PROFILE);
-  expect(registers.chain.registerAgent).toHaveBeenCalledTimes(1);
 
   // A function-call key that lists none may call any, as on the chain, and a full-access key may
-  // call every one.
+  // call every one. register_agent is the exception: it attaches a deposit, so only a full-access
+  // key registers, and a key that lists register_agent does not change that (it cannot attach one).
   const anyKey: Array<Partial<McpDeps>> = [
     { keyKind: "function_call", keyMethods: [] },
     { keyKind: "function_call" },
@@ -3427,8 +3478,9 @@ test("a_key_must_list_the_method_that_a_tool_calls", async () => {
     kit.api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
     const args = { task_id: "7", winners: PICKED_BY_ACCOUNT, scorecard: SCORECARD };
     expect((await kit.call("pick_winners", args)).isError, JSON.stringify(overrides)).toBe(false);
-    expect((await kit.call("register_agent", PROFILE)).isError, JSON.stringify(overrides)).toBe(
-      false,
+    const registration = await kit.call("register_agent", PROFILE);
+    expect(registration.isError, JSON.stringify(overrides)).toBe(
+      overrides.keyKind !== "full_access",
     );
   }
 });
@@ -3447,6 +3499,11 @@ test("a_key_the_server_could_not_classify_may_call_nothing", async () => {
   for (const [name, args] of attempts) {
     const answer = await call(name, args);
     expect(answer.isError, name).toBe(true);
+    // register_agent wants a full-access key and says so; the others name the method they call.
+    if (name === "register_agent") {
+      expect(answer.text, name).toMatch(/^NEEDS_FULL_ACCESS_KEY: register_agent attaches /);
+      continue;
+    }
     expect(answer.text, name).toMatch(
       new RegExp(`^KEY_CANNOT_CALL: ${name} needs a key that may call `),
     );
@@ -3495,13 +3552,15 @@ test("the_tools_describe_the_keys_they_need", async () => {
 
   // balance says what the keys are: the agent key lists commit and reveal, and no more.
   expect(describe("balance")).toMatch(/lists commit and reveal/);
-  expect(describe("balance")).toMatch(
-    /pick_winners and register_agent refuse with KEY_CANNOT_CALL/,
-  );
+  expect(describe("balance")).toMatch(/pick_winners refuses with KEY_CANNOT_CALL/);
+  expect(describe("balance")).toMatch(/register_agent \(which attaches 1 yoctoNEAR\) refuse/);
   expect(describe("balance")).not.toMatch(/pick and register/);
-  for (const name of ["commit_result", "reveal_result", "pick_winners", "register_agent"]) {
+  for (const name of ["commit_result", "reveal_result", "pick_winners"]) {
     expect(describe(name), name).toContain("KEY_CANNOT_CALL");
   }
+  // register_agent attaches a deposit, so it asks for a full-access key instead.
+  expect(describe("register_agent")).toContain("NEEDS_FULL_ACCESS_KEY");
+  expect(describe("register_agent")).not.toContain("KEY_CANNOT_CALL");
 });
 
 test("pick_winners_uploads_the_scorecard_then_picks", async () => {
@@ -3902,7 +3961,7 @@ test("pick_winners_says_what_a_scorecard_must_be_and_how_shares_add_up", async (
 });
 
 test("register_agent_uploads_the_profile_then_registers", async () => {
-  const { callJson, chain, api } = await connectWrite({ keyKind: "function_call" });
+  const { callJson, chain, api } = await connectWrite({ keyKind: "full_access" });
   const profile = {
     name: "Alice Extractor",
     description: "Reads invoices and reports the totals.",
@@ -3944,9 +4003,13 @@ test("register_agent_uploads_the_profile_then_registers", async () => {
     { ...profile, homepage: "javascript:alert(1)" },
     { ...profile, tags: Array.from({ length: 9 }, () => "tag") },
   ]) {
-    expect((await connectWrite().then((kit) => kit.call("register_agent", bad))).isError).toBe(
-      true,
-    );
+    expect(
+      (
+        await connectWrite({ keyKind: "full_access" }).then((kit) =>
+          kit.call("register_agent", bad),
+        )
+      ).isError,
+    ).toBe(true);
   }
 });
 
@@ -3997,26 +4060,157 @@ test("register_agent_registers_storage_first", async () => {
   expect(stuck.chain.registerAgent).not.toHaveBeenCalled();
 });
 
-test("register_agent_with_a_key_that_cannot_pay_says_who_must", async () => {
-  // A function-call key may register (it attaches no deposit) but cannot top its storage up, so the
-  // tool says whom to ask, as a commit does, in words that fit what it was doing.
-  const { call, chain, api } = await connectWrite({ keyKind: "function_call" });
+test("register_agent_with_a_key_that_cannot_attach_a_deposit_is_refused_before_anything_happens", async () => {
+  // register_agent attaches exactly 1 yoctoNEAR, which no function-call key can, and it puts the
+  // bond at stake. So a delegate key (one that lists register_agent, with caps) is refused as the
+  // agent key is: before the profile is looked at or uploaded, before any chain view is read, and
+  // before anything is sent.
+  const keys: Array<Partial<McpDeps>> = [
+    { keyKind: "function_call" },
+    { keyKind: "function_call", keyMethods: [] },
+    { keyKind: "function_call", keyMethods: ["commit", "reveal"] },
+    { keyKind: "function_call", keyMethods: ["register_agent"] },
+    {
+      keyKind: "function_call",
+      keyMethods: ["register_agent", "unregister_agent", "claim_agent_bond"],
+    },
+    { keyKind: "unknown" },
+  ];
+  for (const overrides of keys) {
+    const { call, chain, api } = await connectWrite(overrides);
+    chain.storageBalanceOf.mockResolvedValue(null);
+    chain.getConfig.mockResolvedValue(BONDED);
+    chain.balanceOf.mockResolvedValue(BOND);
+
+    const answer = await call("register_agent", PROFILE);
+
+    expect(answer.isError, JSON.stringify(overrides)).toBe(true);
+    expect(answer.text, JSON.stringify(overrides)).toMatch(/^NEEDS_FULL_ACCESS_KEY: /);
+    expect(answer.text).toContain("1 yoctoNEAR");
+    expect(answer.text).toContain("Nothing was uploaded or sent");
+    for (const mock of [...Object.values(chain), ...Object.values(api)]) {
+      expect(mock, JSON.stringify(overrides)).not.toHaveBeenCalled();
+    }
+  }
+});
+
+test("register_agent_takes_the_bond_from_the_vault_and_says_so", async () => {
+  // The owner has set a bond of 1 USDC and the vault holds it: the profile is uploaded, the agent
+  // registers, and the answer names the bond that is now held.
+  const { callJson, chain, api } = await connectWrite({ keyKind: "full_access" });
+  chain.getConfig.mockResolvedValue(BONDED);
+  chain.balanceOf.mockResolvedValue(BOND);
+
+  const answer = await callJson("register_agent", PROFILE);
+
+  expect(chain.balanceOf).toHaveBeenCalledWith(ACCOUNT, USDC);
+  expect(chain.registerAgent).toHaveBeenCalledTimes(1);
+  expect(api.uploadBlob).toHaveBeenCalledTimes(1);
+  expect(answer).toMatchObject({
+    tx_hash: "TX_AGENT",
+    bond: { token: USDC, amount: BOND.toString() },
+  });
+  // The tool moves no tokens on its own: the vault was full already.
+  expect(chain.deposit).not.toHaveBeenCalled();
+});
+
+test("register_agent_with_too_little_in_the_vault_says_how_much_to_deposit", async () => {
+  // The vault holds part of the bond. The tool does not move the agent's tokens for it: it says what
+  // is missing and where the wallet stands, and sends and uploads nothing, not even a storage top-up.
+  const { call, chain, api } = await connectWrite({ keyKind: "full_access" });
+  chain.getConfig.mockResolvedValue(BONDED);
+  chain.balanceOf.mockResolvedValue(BOND / 4n);
   chain.storageBalanceOf.mockResolvedValue(null);
 
   const answer = await call("register_agent", PROFILE);
 
   expect(answer.isError).toBe(true);
-  expect(answer.text).toMatch(/^STORAGE_LOW: /);
-  expect(answer.text).toContain(`storage_deposit on the contract with account_id ${ACCOUNT}`);
-  expect(answer.text).toMatch(/more to register a profile\./);
-  expect(answer.text).not.toMatch(/commit and reveal/);
+  expect(answer.text).toMatch(/^BOND_LOW: /);
+  expect(answer.text).toContain(`bond of ${BOND} of ${USDC}`);
+  expect(answer.text).toContain(`which holds ${BOND / 4n}`);
+  expect(answer.text).toContain(`Deposit ${BOND - BOND / 4n} more`);
+  expect(answer.text).toContain(`your wallet holds ${10n * BOND}`);
+  expect(answer.text).toContain("deposit tool");
+  expect(answer.text).toContain("Nothing was uploaded or sent");
   expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.deposit).not.toHaveBeenCalled();
+  expect(chain.registerAgent).not.toHaveBeenCalled();
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+
+  // After the deposit the same call goes through.
+  chain.balanceOf.mockResolvedValue(BOND);
+  expect((await call("register_agent", PROFILE)).isError).toBe(false);
+  expect(chain.registerAgent).toHaveBeenCalledTimes(1);
+});
+
+test("register_agent_for_an_active_agent_updates_the_profile_and_takes_no_second_bond", async () => {
+  const { callJson, chain } = await connectWrite({ keyKind: "full_access" });
+  chain.getConfig.mockResolvedValue(BONDED);
+  chain.getAgent.mockResolvedValue(agentView());
+  chain.balanceOf.mockResolvedValue(0n);
+
+  const answer = await callJson("register_agent", PROFILE);
+
+  expect(chain.registerAgent).toHaveBeenCalledTimes(1);
+  expect(answer).toMatchObject({ tx_hash: "TX_AGENT" });
+  // No bond is taken from an agent that holds one, and the answer does not claim one was.
+  expect(answer).not.toHaveProperty("bond");
+});
+
+test("register_agent_for_an_active_agent_that_holds_no_bond_asks_for_it", async () => {
+  // It registered before the owner set a bond. The contract takes the bond at its next
+  // registration, so the tool wants it in the vault, like a new agent's.
+  const { call, callJson, chain, api } = await connectWrite({ keyKind: "full_access" });
+  chain.getConfig.mockResolvedValue(BONDED);
+  chain.getAgent.mockResolvedValue(agentView({ bond_token: null, bond_amount: null }));
+  chain.balanceOf.mockResolvedValue(0n);
+
+  const refused = await call("register_agent", PROFILE);
+  expect(refused.text).toMatch(/^BOND_LOW: /);
+  expect(refused.text).toContain(`Deposit ${BOND} more`);
   expect(api.uploadBlob).not.toHaveBeenCalled();
   expect(chain.registerAgent).not.toHaveBeenCalled();
 
-  // With enough storage the same key registers.
-  const roomy = await connectWrite({ keyKind: "function_call" });
-  expect((await roomy.call("register_agent", PROFILE)).isError).toBe(false);
+  chain.balanceOf.mockResolvedValue(BOND);
+  expect(await callJson("register_agent", PROFILE)).toMatchObject({
+    bond: { token: USDC, amount: BOND.toString() },
+  });
+});
+
+test("register_agent_for_a_retired_agent_needs_a_new_bond", async () => {
+  const { call, chain, api } = await connectWrite({ keyKind: "full_access" });
+  chain.getConfig.mockResolvedValue(BONDED);
+  chain.getAgent.mockResolvedValue(
+    agentView({ status: "retired", bond_token: null, bond_amount: null }),
+  );
+  chain.balanceOf.mockResolvedValue(0n);
+
+  const answer = await call("register_agent", PROFILE);
+
+  expect(answer.text).toMatch(/^BOND_LOW: /);
+  expect(answer.text).toContain(`Deposit ${BOND} more`);
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+  expect(chain.registerAgent).not.toHaveBeenCalled();
+});
+
+test("register_agent_for_an_unregistering_agent_says_to_claim_the_bond_first", async () => {
+  const { call, chain, api } = await connectWrite({ keyKind: "full_access" });
+  chain.getConfig.mockResolvedValue(BONDED);
+  chain.getAgent.mockResolvedValue(
+    agentView({ status: "unregistering", claimable_at: "1700086400000000000" }),
+  );
+  chain.balanceOf.mockResolvedValue(BOND);
+
+  const answer = await call("register_agent", PROFILE);
+
+  expect(answer.isError).toBe(true);
+  expect(answer.text).toMatch(/^UNREGISTERING: /);
+  expect(answer.text).toContain(`${ACCOUNT} is unregistering`);
+  expect(answer.text).toContain("pnpm agent:claim-bond");
+  expect(answer.text).toContain("Nothing was uploaded or sent");
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.registerAgent).not.toHaveBeenCalled();
+  expect(api.uploadBlob).not.toHaveBeenCalled();
 });
 
 test("register_agent_says_that_it_adds_the_storage_it_needs", async () => {
@@ -4025,7 +4219,12 @@ test("register_agent_says_that_it_adds_the_storage_it_needs", async () => {
   const description = tools.find((tool) => tool.name === "register_agent")?.description ?? "";
 
   expect(description).toMatch(/storage deposit/);
-  expect(description).toMatch(/STORAGE_LOW/);
+  expect(description).toMatch(/It can spend NEAR/);
+  // The bond and the key it needs: it takes a bond from the vault, so deposit first, and it
+  // attaches 1 yoctoNEAR, so a function-call key is turned back.
+  expect(description).toMatch(/bond/);
+  expect(description).toMatch(/BOND_LOW/);
+  expect(description).toMatch(/NEEDS_FULL_ACCESS_KEY/);
 });
 
 test("deposit_and_withdraw_take_raw_amounts_of_the_default_token", async () => {
@@ -6178,10 +6377,13 @@ test("the_descriptions_say_what_the_tools_can_spend_and_how_they_fail", async ()
   const describe = (name: string) => tools.find((tool) => tool.name === name)?.description ?? "";
 
   // The two tools that are marked as repeatable still pay a storage top-up, with a full-access key.
+  // commit_result can be sent by a function-call key, which cannot, so it also says STORAGE_LOW;
+  // register_agent takes a full-access key only, so it never meets that.
   for (const name of ["commit_result", "register_agent"]) {
     expect(describe(name), name).toMatch(/It can spend NEAR/);
-    expect(describe(name), name).toMatch(/STORAGE_LOW/);
   }
+  expect(describe("commit_result")).toMatch(/STORAGE_LOW/);
+  expect(describe("register_agent")).not.toMatch(/STORAGE_LOW/);
   expect(describe("start_task")).toMatch(/NO_TASK.*NOT_OPEN/);
   // The sends that can time out say what to read first.
   for (const [name, read] of [

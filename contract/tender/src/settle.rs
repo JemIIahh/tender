@@ -54,7 +54,9 @@ impl Tender {
     /// - it is not settled yet (`E_SETTLED`);
     /// - the caller is its verifier or its poster (`E_AUTH`);
     /// - the call is not signed by one of the caller's delegate keys (`add_delegate`), which may
-    ///   spend within caps but never judge (`E_AUTH`);
+    ///   spend within caps but never judge; and if the caller has any delegate key, it signed the
+    ///   transaction itself, since a relayed (NEP-366) or cross-contract call hides the key that
+    ///   signed (`E_AUTH`);
     /// - the caller's window is open: the verifier's from `reveal_deadline` up to, but not
     ///   including, `pick_deadline`, and the poster's from there up to, but not including,
     ///   `fallback_deadline`. A poster who is also the verifier has both (`E_PHASE`);
@@ -87,7 +89,9 @@ impl Tender {
     /// amount.
     ///
     /// Picks work while the contract is paused, and attach no deposit, so a function-call key can
-    /// send them, as long as it is not a delegate key.
+    /// send them, as long as it is not a delegate key. A verifier with no delegate key may also
+    /// pick through a relayer, or be a contract, such as a DAO, that picks in a cross-contract
+    /// call.
     #[deny_unknown_arguments]
     pub fn pick(
         &mut self,
@@ -110,8 +114,20 @@ impl Tender {
             ));
         }
         // A key that may spend within caps must not also decide where an escrow goes, or a
-        // leaked one could award any task its account judges.
-        if self.signed_by_delegate(&caller) {
+        // leaked one could award any task its account judges. Relayed as a NEP-366
+        // meta-transaction, or sent from another contract, the call shows someone else as the
+        // signer and hides the key that signed, which could be one of the caller's delegate keys
+        // (independent review H1). So such a call is refused while the caller has any.
+        if env::signer_account_id() != caller {
+            if self.has_delegates(&caller) {
+                env::panic_str(&format!(
+                    "{}: {caller} has delegate keys, so task {id} can be picked only in a \
+                     transaction that {caller} signs itself, not through a relayer or another \
+                     contract",
+                    err::E_AUTH
+                ));
+            }
+        } else if self.signed_by_delegate(&caller) {
             env::panic_str(&format!(
                 "{}: task {id} cannot be picked with a delegate key; sign with another key of {caller}",
                 err::E_AUTH
@@ -485,6 +501,9 @@ mod tests {
         "erin.test",
         "frank.test",
     ];
+    /// An account with a storage balance that has not registered as an agent, so it enters only
+    /// tasks that invite it.
+    const STRANGER: &str = "gina.test";
 
     /// Winners as the tests write them: `(account, bps)` pairs.
     type Shares<'a> = &'a [(&'a str, u16)];
@@ -533,8 +552,9 @@ mod tests {
 
     /// A contract with USDC enabled and a USDC vault slot for the treasury, both made by the
     /// owner's `set_token`, which the owner's 1 NEAR of storage pays for; alice, the poster, with
-    /// 1 NEAR of storage and `FUNDS` in her vault; and the judge and each of `AGENTS` with 0.1 NEAR
-    /// of storage and no vault slot.
+    /// 1 NEAR of storage and `FUNDS` in her vault; and the judge, `STRANGER` and each of `AGENTS`
+    /// with 0.1 NEAR of storage and no vault slot. Each of `AGENTS` is a registered agent, with no
+    /// bond, since none is set, so it may enter open tasks; the judge and `STRANGER` are not.
     fn world() -> Tender {
         let mut t = fresh();
         register(&mut t, "owner.test", NearToken::from_near(1));
@@ -542,8 +562,11 @@ mod tests {
         t.set_token(acct(USDC), U128(10), U128(50_000_000), true);
         register(&mut t, "alice.test", NearToken::from_near(1));
         fund(&mut t, "alice.test", FUNDS);
-        for who in AGENTS.into_iter().chain([JUDGE]) {
+        for who in AGENTS.into_iter().chain([JUDGE, STRANGER]) {
             register(&mut t, who, NearToken::from_millinear(100));
+        }
+        for who in AGENTS {
+            register_agent(&mut t, who);
         }
         t
     }
@@ -566,9 +589,12 @@ mod tests {
         t.top_up_task(U64(id), U128(amount));
     }
 
-    /// `who` registers as an agent.
+    /// `who` registers as an agent, with the 1 yoctoNEAR that registering takes.
     fn register_agent(t: &mut Tender, who: &str) {
-        testing_env!(ctx(who).block_timestamp(T1).build());
+        testing_env!(ctx(who)
+            .block_timestamp(T1)
+            .attached_deposit(ONE_YOCTO)
+            .build());
         t.register_agent(
             "https://acme.example/agent.json".to_string(),
             BRIEF_HASH.to_string(),
@@ -1116,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_acts_for_the_predecessor_not_the_signer() {
+    fn pick_by_a_relayed_or_contract_call_goes_through_without_delegates() {
         let mut t = world();
         let id = post(&mut t, args());
         revealed(&mut t, id, &["bob.test"]);
@@ -1131,15 +1157,113 @@ mod tests {
             .block_timestamp(REVEAL_DEADLINE)
             .build());
         let message = pick_bob(&mut t).expect("the relayed call is rejected");
-        assert!(message.starts_with("E_AUTH: "), "{message}");
+        assert_eq!(
+            message,
+            format!("E_AUTH: only the verifier or the poster can pick task {id}")
+        );
         assert_eq!(outcome(&t, id), None);
-        // The judge's own call goes through, whoever signed it.
+        // The judge is the caller and another account signed: a NEP-366 meta-transaction that a
+        // relayer submits, or a call from a contract. The judge has no delegate key, so no key of
+        // its account is one, and the pick goes through.
         testing_env!(ctx(JUDGE)
             .signer_account_id(acct("relay.test"))
             .block_timestamp(REVEAL_DEADLINE)
             .build());
         assert_eq!(pick_bob(&mut t), None);
         assert_eq!(balance(&t, "bob.test"), 950_000);
+    }
+
+    /// A verifier that is a contract, a DAO or a multisig, picks from a cross-contract call: the
+    /// predecessor is the contract, the signer whoever sent the transaction. With no delegate
+    /// record, it may.
+    #[test]
+    fn a_contract_verifier_without_delegates_picks() {
+        let mut t = world();
+        let id = post(
+            &mut t,
+            PostTaskArgs {
+                verifier: Some(acct("dao.test")),
+                ..args()
+            },
+        );
+        revealed(&mut t, id, &["bob.test"]);
+        testing_env!(ctx("dao.test")
+            .signer_account_id(acct("member.test"))
+            .block_timestamp(REVEAL_DEADLINE)
+            .build());
+        t.pick(
+            U64(id),
+            winners(&[("bob.test", 10_000)]),
+            SCORECARD_HASH.to_string(),
+            SCORECARD_URI.to_string(),
+        );
+        assert_eq!(balance(&t, "bob.test"), 950_000);
+    }
+
+    /// Independent review H1: a delegate key's pick relayed as a NEP-366 meta-transaction. The
+    /// contract then sees the relayer as the signer, with the relayer's key, and the verifier as
+    /// the caller, so a check of the signing key alone finds no delegate. A relayed pick, empty or
+    /// not, by the verifier or by the poster in its window, is refused while the caller has any
+    /// delegate record, since the key that signed may be one of them.
+    #[test]
+    fn relayed_pick_by_a_delegate_key_is_refused() {
+        let key = |byte: u8| PublicKey::from_parts(CurveType::ED25519, vec![byte; 32]).unwrap();
+        let mut t = world();
+        let judged = post(&mut t, args());
+        let fallback = post(&mut t, args());
+        revealed(&mut t, judged, &["bob.test"]);
+        revealed(&mut t, fallback, &["bob.test"]);
+        for who in [JUDGE, "alice.test"] {
+            testing_env!(ctx(who).attached_deposit(ONE_YOCTO).build());
+            t.add_delegate(key(7), acct(USDC), U128(REWARD), U128(REWARD));
+        }
+        let bob: Shares = &[("bob.test", 10_000)];
+        for (who, id, now) in [
+            (JUDGE, judged, REVEAL_DEADLINE),
+            ("alice.test", fallback, PICK_DEADLINE),
+        ] {
+            for list in [bob, &[]] {
+                // carol relays it, so the runtime reports her as the signer, with her key.
+                testing_env!(ctx(who)
+                    .signer_account_id(acct("carol.test"))
+                    .signer_account_pk(key(3))
+                    .block_timestamp(now)
+                    .build());
+                let (list, hash, uri) = (
+                    winners(list),
+                    SCORECARD_HASH.to_string(),
+                    SCORECARD_URI.to_string(),
+                );
+                let result = match panic_message(|| t.pick(U64(id), list, hash, uri)) {
+                    Some(message) => Err(message),
+                    None => Ok(()),
+                };
+                assert_rejected(result, "E_AUTH", &format!("{who}'s relayed pick"));
+            }
+            assert_eq!(outcome(&t, id), None);
+        }
+        assert_eq!(balance(&t, "bob.test"), 0);
+        // Once each has removed its delegate key, no key of its account is one, and the same
+        // relayed pick goes through.
+        for (who, id, now) in [
+            (JUDGE, judged, REVEAL_DEADLINE),
+            ("alice.test", fallback, PICK_DEADLINE),
+        ] {
+            testing_env!(ctx(who).attached_deposit(ONE_YOCTO).build());
+            t.remove_delegate(key(7));
+            testing_env!(ctx(who)
+                .signer_account_id(acct("carol.test"))
+                .signer_account_pk(key(3))
+                .block_timestamp(now)
+                .build());
+            t.pick(
+                U64(id),
+                winners(bob),
+                SCORECARD_HASH.to_string(),
+                SCORECARD_URI.to_string(),
+            );
+        }
+        assert_eq!(balance(&t, "bob.test"), 2 * 950_000);
     }
 
     /// A key that may spend is never a key that judges. A pick, empty or not, signed by a delegate
@@ -1619,6 +1743,7 @@ mod tests {
         for who in names {
             assert_eq!(who.len(), 64);
             register(&mut t, who, NearToken::from_millinear(100));
+            register_agent(&mut t, who);
         }
         let id = post(&mut t, args());
         revealed(&mut t, id, &names);
@@ -1658,14 +1783,19 @@ mod tests {
     #[test]
     fn reputation_counters_updated() {
         let mut t = world();
-        for who in ["bob.test", "carol.test", JUDGE, "alice.test"] {
+        for who in [JUDGE, "alice.test"] {
             register_agent(&mut t, who);
         }
-        let first = post(&mut t, args());
-        let second = post(&mut t, args());
-        let fallback = post(&mut t, args());
+        // Tasks that invite gina, who has not registered, beside two agents.
+        let invited = || PostTaskArgs {
+            invited: vec![acct("bob.test"), acct("carol.test"), acct(STRANGER)],
+            ..args()
+        };
+        let first = post(&mut t, invited());
+        let second = post(&mut t, invited());
+        let fallback = post(&mut t, invited());
         for id in [first, second, fallback] {
-            revealed(&mut t, id, &["bob.test", "carol.test", "dave.test"]);
+            revealed(&mut t, id, &["bob.test", "carol.test", STRANGER]);
         }
         try_pick(
             &mut t,
@@ -1675,7 +1805,7 @@ mod tests {
             &[
                 ("bob.test", 6_000),
                 ("carol.test", 3_000),
-                ("dave.test", 1_000),
+                (STRANGER, 1_000),
             ],
         )
         .unwrap();
@@ -1686,9 +1816,9 @@ mod tests {
         let carol = agent(&t, "carol.test");
         assert_eq!(carol.wins, 1);
         assert_eq!(carol.earned, usdc(285_000));
-        // dave is paid, but has no profile to update and is not given one.
-        assert_eq!(balance(&t, "dave.test"), 95_000);
-        assert_eq!(t.get_agent(acct("dave.test")), None);
+        // gina is paid, but has no profile to update and is not given one.
+        assert_eq!(balance(&t, STRANGER), 95_000);
+        assert_eq!(t.get_agent(acct(STRANGER)), None);
         let judge = agent(&t, JUDGE);
         assert_eq!(
             (judge.picks_made, judge.voids_after_reveals, judge.wins),
@@ -1774,31 +1904,37 @@ mod tests {
     #[test]
     fn winner_registered_after_commit_is_paid_without_storage_growth() {
         let mut t = world();
-        let id = post(&mut t, args());
-        // bob commits before he registers, so his commit made him a vault slot but no `earned`
-        // slot.
-        enter(&mut t, "bob.test", id, 1);
-        register_agent(&mut t, "bob.test");
-        reveal(&mut t, "bob.test", id, 1);
-        assert_eq!(agent(&t, "bob.test").earned, vec![], "the premise");
-        let bob_used = used(&t, "bob.test");
+        let id = post(
+            &mut t,
+            PostTaskArgs {
+                invited: vec![acct(STRANGER)],
+                ..args()
+            },
+        );
+        // gina enters a task that invites her before she registers, so her commit made her a
+        // vault slot but no `earned` slot.
+        enter(&mut t, STRANGER, id, 1);
+        register_agent(&mut t, STRANGER);
+        reveal(&mut t, STRANGER, id, 1);
+        assert_eq!(agent(&t, STRANGER).earned, vec![], "the premise");
+        let gina_used = used(&t, STRANGER);
 
         testing_env!(ctx(JUDGE).block_timestamp(REVEAL_DEADLINE).build());
         let usage = t.storage_mark();
         t.pick(
             U64(id),
-            winners(&[("bob.test", 10_000)]),
+            winners(&[(STRANGER, 10_000)]),
             SCORECARD_HASH.to_string(),
             SCORECARD_URI.to_string(),
         );
         // Settling adds no `earned` slot: the outcome is all that grows.
         assert_eq!(t.storage_mark() - usage, outcome_bytes(&t, id));
-        // So bob is paid and counted as a winner, but what he earned is not recorded.
-        assert_eq!(balance(&t, "bob.test"), 950_000);
-        let bob = agent(&t, "bob.test");
-        assert_eq!(bob.wins, 1);
-        assert_eq!(bob.earned, vec![]);
-        assert_eq!(used(&t, "bob.test"), bob_used);
+        // So gina is paid and counted as a winner, but what she earned is not recorded.
+        assert_eq!(balance(&t, STRANGER), 950_000);
+        let gina = agent(&t, STRANGER);
+        assert_eq!(gina.wins, 1);
+        assert_eq!(gina.earned, vec![]);
+        assert_eq!(used(&t, STRANGER), gina_used);
     }
 
     // Events and arguments.
@@ -2065,13 +2201,12 @@ mod tests {
     #[test]
     fn cleanup_in_batches_refunds_each_entrant() {
         let mut t = world();
-        // carol is a registered agent, so her first commit gave her an `earned` slot beside her
-        // vault slot. bob and dave are not, and got a vault slot only.
-        register_agent(&mut t, "carol.test");
+        // Each is a registered agent, as an open task requires, so its first commit gave it an
+        // `earned` slot beside its vault slot.
         let crowd = [
-            ("bob.test", false),
+            ("bob.test", true),
             ("carol.test", true),
-            ("dave.test", false),
+            ("dave.test", true),
         ];
         let names = crowd.map(|(who, _)| who);
         // What each is charged before it enters anything.
@@ -2112,7 +2247,7 @@ mod tests {
         // stay. dave is charged for his entry still, and it is still there.
         assert_eq!(
             used(&t, "bob.test"),
-            start[0] + slot_bytes("bob.test", false)
+            start[0] + slot_bytes("bob.test", true)
         );
         assert_eq!(
             used(&t, "carol.test"),
@@ -2130,7 +2265,7 @@ mod tests {
         assert_eq!(clean(&mut t, id, 2), 1);
         assert_eq!(
             used(&t, "dave.test"),
-            start[2] + slot_bytes("dave.test", false)
+            start[2] + slot_bytes("dave.test", true)
         );
         assert_eq!(t.get_entry(U64(id), acct("dave.test")), None);
         assert!(remaining(&t, id, 0).is_empty());
@@ -2196,6 +2331,7 @@ mod tests {
         let mut start = Vec::new();
         for (seed, w) in who.iter().enumerate() {
             register(&mut t, w, NearToken::from_millinear(100));
+            register_agent(&mut t, w);
             start.push(used(&t, w));
             enter(&mut t, w, id, seed as u8);
         }
@@ -2208,7 +2344,7 @@ mod tests {
             let gone = i < 50;
             assert_eq!(t.get_entry(U64(id), acct(w)).is_none(), gone, "{w}");
             let entry = if gone { 0 } else { entry_bytes(w, None) };
-            assert_eq!(used(&t, w), start[i] + slot_bytes(w, false) + entry, "{w}");
+            assert_eq!(used(&t, w), start[i] + slot_bytes(w, true) + entry, "{w}");
         }
         assert!(remaining(&t, id, 0).is_empty());
         let left: Vec<u32> = remaining(&t, id, 50).into_iter().map(|(i, _)| i).collect();
@@ -2219,7 +2355,7 @@ mod tests {
         assert_eq!(cleaned(&t, id), 55);
         for (i, w) in who.iter().enumerate() {
             assert_eq!(t.get_entry(U64(id), acct(w)), None, "{w}");
-            assert_eq!(used(&t, w), start[i] + slot_bytes(w, false), "{w}");
+            assert_eq!(used(&t, w), start[i] + slot_bytes(w, true), "{w}");
         }
         assert_eq!(clean(&mut t, id, 50), 0);
     }
@@ -2317,7 +2453,7 @@ mod tests {
             let revealed = (i == 0).then_some(URI);
             assert_eq!(
                 used(&t, who),
-                start[i] + slot_bytes(who, false) + entry_bytes(who, revealed),
+                start[i] + slot_bytes(who, true) + entry_bytes(who, revealed),
                 "{who}"
             );
         }
@@ -2325,7 +2461,7 @@ mod tests {
         assert_eq!(clean(&mut t, id, 50), 3);
         for (i, who) in names.into_iter().enumerate() {
             assert_eq!(t.get_entry(U64(id), acct(who)), None, "{who}");
-            assert_eq!(used(&t, who), start[i] + slot_bytes(who, false), "{who}");
+            assert_eq!(used(&t, who), start[i] + slot_bytes(who, true), "{who}");
         }
         assert_eq!(cleaned(&t, id), 3);
     }
@@ -2342,7 +2478,7 @@ mod tests {
         // so one entrant cannot stop a batch, or the cleanups after it.
         t.storage.get_mut(&acct("bob.test")).unwrap().deposited = 0;
         assert_eq!(clean(&mut t, id, 50), 2);
-        assert_eq!(used(&t, "bob.test"), start + slot_bytes("bob.test", false));
+        assert_eq!(used(&t, "bob.test"), start + slot_bytes("bob.test", true));
         assert_eq!(t.get_entry(U64(id), acct("bob.test")), None);
         assert_eq!(t.get_entry(U64(id), acct("carol.test")), None);
     }
@@ -2367,14 +2503,14 @@ mod tests {
         assert_eq!(cleaned(&t, id), 3);
         for (i, who) in [(0, "bob.test"), (2, "dave.test")] {
             assert_eq!(t.get_entry(U64(id), acct(who)), None, "{who}");
-            assert_eq!(used(&t, who), start[i] + slot_bytes(who, false), "{who}");
+            assert_eq!(used(&t, who), start[i] + slot_bytes(who, true), "{who}");
         }
         assert!(t.get_entry(U64(id), acct("erin.test")).is_some());
         assert_eq!(clean(&mut t, id, 3), 1);
         assert_eq!(cleaned(&t, id), 4);
         assert_eq!(
             used(&t, "erin.test"),
-            start[3] + slot_bytes("erin.test", false)
+            start[3] + slot_bytes("erin.test", true)
         );
         // Nobody is refunded for the gap. carol's entry cannot be found without its place, so it
         // stays, and so does what carol is charged for it.
@@ -2430,7 +2566,7 @@ mod tests {
                 let entry = if j > i { entry_bytes(who, None) } else { 0 };
                 assert_eq!(
                     used(&t, who),
-                    start[j] + slot_bytes(who, false) + entry,
+                    start[j] + slot_bytes(who, true) + entry,
                     "{who}, after {caller}'s call"
                 );
             }
@@ -2443,7 +2579,6 @@ mod tests {
     #[test]
     fn cleanup_keeps_the_task_and_every_payout() {
         let mut t = world();
-        register_agent(&mut t, "carol.test");
         let (done, other) = (post(&mut t, args()), post(&mut t, args()));
         let names = ["bob.test", "carol.test"];
         let start = names.map(|who| used(&t, who));
@@ -2490,7 +2625,7 @@ mod tests {
             assert_eq!(t.get_entry(U64(done), acct(who)), None, "{who}");
             assert_eq!(
                 used(&t, who),
-                start[i] + slot_bytes(who, i == 1) + entry_bytes(who, Some(URI)),
+                start[i] + slot_bytes(who, true) + entry_bytes(who, Some(URI)),
                 "{who}"
             );
         }

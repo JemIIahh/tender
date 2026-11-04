@@ -1,14 +1,18 @@
 import type { Page, Route } from "@playwright/test";
 import {
   type AgentDetailResponse,
+  BOARD_HIDDEN_LABEL,
+  BOARD_NOTE,
+  type BoardEvent,
   canonicalJson,
   type ListTasksResponse,
   sha256Hex,
+  type TaskBoard,
   type TaskDetailResponse,
   type TaskOutcome,
   type TaskSummary,
 } from "@tender/shared";
-import { agent, detail, entry, revealed, scorecard } from "../test/tasks";
+import { agent, detail, entry, revealed, scorecard, swarmLineage } from "../test/tasks";
 
 // A fixture API for the specs that need no chain. The web server is started with `API_URL`
 // (playwright.config.ts), and `routeApi` answers what the browser asks of it, so a spec sees the
@@ -217,10 +221,15 @@ function wideTask(): TaskDetailResponse {
   );
 }
 
-/** What `GET /v1/tasks/:id` answers to begin with: the three tasks of the board. */
+/**
+ * What `GET /v1/tasks/:id` answers to begin with: the three tasks of the board, and the swarm
+ * demo's lineage (test/tasks.ts `swarmLineage`: the parent 20 and its subtasks 21 to 23), which
+ * the board does not list, as the board's specs count its cards.
+ */
 function startingDetails(): Map<string, TaskDetailResponse> {
   const poster = (task: TaskSummary) => [{ account: task.poster, amount: task.reward }];
   return new Map([
+    ...swarmLineage(),
     ["1", detail(INVOICE_TASK, { entries: [], funders: poster(INVOICE_TASK) })],
     [
       "2",
@@ -286,10 +295,29 @@ interface StoredEvent {
   data: string;
 }
 
+/** An empty question board for task `taskId`, open for writes as the API says it. */
+export function emptyBoard(taskId: string, open = true): TaskBoard {
+  return {
+    task_id: taskId,
+    open,
+    questions: [],
+    clarifications: [],
+    hidden_label: BOARD_HIDDEN_LABEL,
+    note: BOARD_NOTE,
+  };
+}
+
 /** What a spec has to hand: the fixture API as a chain and an indexer would change it. */
 export interface FixtureApi {
   /** What `GET /v1/tasks/:id` answers, by task id. */
   details: Map<string, TaskDetailResponse>;
+  /**
+   * What `GET /v1/tasks/:id/questions` answers, by task id: an empty open board for a task that has
+   * none here. A spec that changes one calls `boardEvent` so that the page hears of it.
+   */
+  boards: Map<string, TaskBoard>;
+  /** The board of task `taskId` changed: the stream says so, as the API does (ids, no text). */
+  boardEvent(event: BoardEvent): void;
   /** What `GET /v1/agents/:account` answers, by account. An account that is not here is a 404. */
   agents: Map<string, AgentDetailResponse>;
   /** Every request answered so far, as `GET /v1/tasks/2`. */
@@ -327,6 +355,7 @@ export interface FixtureApi {
  */
 export async function routeApi(page: Page, tasks: TaskSummary[] = TASKS): Promise<FixtureApi> {
   const details = startingDetails();
+  const boards = new Map<string, TaskBoard>();
   const agents = new Map<string, AgentDetailResponse>([[JUDGE, JUDGE_AGENT]]);
   const requests: string[] = [];
 
@@ -373,8 +402,13 @@ export async function routeApi(page: Page, tasks: TaskSummary[] = TASKS): Promis
 
   const api: FixtureApi = {
     details,
+    boards,
     agents,
     requests,
+
+    boardEvent(event) {
+      emit(event.event, event.data, event.data.task_id);
+    },
 
     commit(taskId, account) {
       const found = detailOf(taskId);
@@ -512,6 +546,13 @@ export async function routeApi(page: Page, tasks: TaskSummary[] = TASKS): Promis
     if (request.method() !== "GET") return notFound();
 
     if (url.pathname === "/v1/events") return serveStream(route);
+
+    const board = /^\/v1\/tasks\/(\d+)\/questions$/.exec(url.pathname);
+    if (board) {
+      const id = board[1] ?? "";
+      if (!details.has(id)) return json(404, { error: "not_found", message: "no such task" });
+      return json(200, boards.get(id) ?? emptyBoard(id));
+    }
 
     if (url.pathname === "/v1/tasks") {
       const phase = url.searchParams.get("phase");

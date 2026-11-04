@@ -4,12 +4,14 @@ import {
   addDelegateCall,
   type ConfigView,
   ConfigViewSchema,
+  claimAgentBondCall,
   cleanupCall,
   commitCall,
   depositCall,
   type EntryView,
   EntryViewSchema,
   extractEvents,
+  FULL_ACCESS_ONLY_METHODS,
   NETWORKS,
   type NetworkId,
   type PostTaskInput,
@@ -22,6 +24,8 @@ import {
   type SpendOptions,
   type StorageView,
   StorageViewSchema,
+  setAgentBondCall,
+  setAgentBondCooldownCall,
   storageDepositCall,
   type TaskView,
   TaskViewSchema,
@@ -29,10 +33,18 @@ import {
   topUpTaskCall,
   U64StringSchema,
   U128StringSchema,
+  unregisterAgentCall,
   voidTaskCall,
   withdrawCall,
 } from "@tender/shared";
-import { Account, actions, JsonRpcProvider, KeyPairSigner, type KeyPairString } from "near-api-js";
+import {
+  Account,
+  actions,
+  JsonRpcProvider,
+  KeyPair,
+  KeyPairSigner,
+  type KeyPairString,
+} from "near-api-js";
 import { AccessKeyDoesNotExistError, AccountDoesNotExistError } from "near-api-js/rpc-errors";
 import {
   DEFAULT_RPC_TIMEOUT_MS,
@@ -217,6 +229,8 @@ export class TenderClient {
   readonly sendTimeoutMs: number;
   /** The signer's account, when the client has one. */
   readonly accountId?: string;
+  /** The public half of the signer's key, in `ed25519:<base58>` form, when the client has one. */
+  readonly publicKey?: string;
   private readonly provider: JsonRpcProvider;
   private readonly account?: Account;
 
@@ -260,6 +274,9 @@ export class TenderClient {
       const { accountId, privateKey } = opts.signer;
       this.accountId = accountId;
       const signer = KeyPairSigner.fromSecretKey(privateKey as KeyPairString);
+      this.publicKey = KeyPair.fromString(privateKey as KeyPairString)
+        .getPublicKey()
+        .toString();
       this.account = new Account(accountId, this.provider, signer);
     }
   }
@@ -298,6 +315,9 @@ export class TenderClient {
     if (account === undefined) {
       throw new Error("this TenderClient has no signer, so it cannot send transactions");
     }
+    if (call.receiverId === this.contractId && FULL_ACCESS_ONLY_METHODS.has(call.methodName)) {
+      await this.requireFullAccessKey(call.methodName);
+    }
     const action = actions.functionCall(call.methodName, call.args, call.gas, call.deposit);
     return defaultQueue.run(account.accountId, async () => {
       const resp = await withDeadline(
@@ -314,6 +334,35 @@ export class TenderClient {
       );
       return toTxResult(resp, this.contractId);
     });
+  }
+
+  /**
+   * Throws a `TenderError` with code `E_AUTH` unless the signer's key is a full-access key of its
+   * account, as the chain reports it. `register_agent`, `unregister_agent` and `claim_agent_bond`
+   * take exactly 1 yoctoNEAR, which a function-call key, a delegate key among them, cannot attach
+   * (`FULL_ACCESS_ONLY_METHODS`), so the client refuses before it sends anything: `send` does for
+   * those three, and a caller about to move money first (`registerWithBond`) asks it up front. A
+   * node that does not answer is an error of its own and not a refusal: it is thrown as
+   * `viewAccessKey` throws it. A client with no signer passes (`send` will say it has none).
+   */
+  async requireFullAccessKey(method: string): Promise<void> {
+    const { accountId, publicKey } = this;
+    if (accountId === undefined || publicKey === undefined) return;
+    const key = await this.viewAccessKey(accountId, publicKey);
+    if (key === null) {
+      throw new TenderError(
+        "E_AUTH",
+        `${method} needs a full-access key of ${accountId}, and ${publicKey} is not a key of that account. Nothing was sent.`,
+      );
+    }
+    if (key.permission !== "FullAccess") {
+      throw new TenderError(
+        "E_AUTH",
+        `${method} needs a full-access key: it takes exactly 1 yoctoNEAR, which a function-call key ` +
+          `(a delegate key too) cannot attach, and ${publicKey} is one. Nothing was sent. Use the ` +
+          `account's full-access key.`,
+      );
+    }
   }
 
   // Views of the Tender contract.
@@ -520,12 +569,45 @@ export class TenderClient {
     return this.send(storageDepositCall(this.contractId, amountYocto, accountId));
   }
 
+  /**
+   * Registers the signer as an agent, or replaces its profile. A new agent, and a retired one
+   * coming back, pays the contract's bond out of its vault, so the vault must hold it first
+   * (`registerWithBond` tops it up). Takes exactly 1 yoctoNEAR, so only a full-access key can: with
+   * another the client throws a `TenderError` with code `E_AUTH` and sends nothing.
+   */
   registerAgent(
     profileUri: string,
     profileHash: string,
     tags: readonly string[],
   ): Promise<TxResult> {
     return this.send(registerAgentCall(this.contractId, profileUri, profileHash, tags));
+  }
+
+  /**
+   * Starts the signer's way out: it makes no new entry in an open task from now on, and can claim
+   * its bond once the cooldown is over (`claimable_at` of `getAgent`). Full-access key only, as
+   * `registerAgent`.
+   */
+  unregisterAgent(): Promise<TxResult> {
+    return this.send(unregisterAgentCall(this.contractId));
+  }
+
+  /**
+   * Pays the signer's bond back into its vault and retires the agent. Only once the cooldown of
+   * `unregisterAgent` is over (`E_PHASE` before). Full-access key only, as `registerAgent`.
+   */
+  claimAgentBond(): Promise<TxResult> {
+    return this.send(claimAgentBondCall(this.contractId));
+  }
+
+  /** The owner's `set_agent_bond`: the bond that agents registering from now on pay. */
+  setAgentBond(token: string, amount: bigint): Promise<TxResult> {
+    return this.send(setAgentBondCall(this.contractId, token, amount));
+  }
+
+  /** The owner's `set_agent_bond_cooldown`: seconds from `unregister_agent` to the claim. */
+  setAgentBondCooldown(secs: number): Promise<TxResult> {
+    return this.send(setAgentBondCooldownCall(this.contractId, secs));
   }
 
   addDelegate(

@@ -3,7 +3,7 @@ import { type FileHandle, open, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { TenderError, type TxResult } from "@tender/client";
+import { planRegistration, TenderError, type TxResult } from "@tender/client";
 import {
   AccountIdSchema,
   ApiError,
@@ -84,8 +84,10 @@ import {
 // the chain's silence says nothing, and a draft keeps the answers it had, with a note that says why.
 // `reveal_result` confirms the entry before it uploads.
 //
-// MONEY. `deposit`, `withdraw` and `post_task` attach a deposit, which only a full-access key may.
-// With any other key they answer `NEEDS_FULL_ACCESS_KEY` before they upload or send anything. A send
+// MONEY. `deposit`, `withdraw`, `post_task` and `register_agent` attach a deposit (the last one 1
+// yoctoNEAR, and it puts the agent's bond at stake), which only a full-access key may. With any
+// other key, a delegate key among them, they answer `NEEDS_FULL_ACCESS_KEY` before they upload or
+// send anything. A send
 // that times out (`E_TIMEOUT`) may have landed, and a second send of money or of a task would do it
 // twice; the answer therefore names the read that tells (`sending`), before the agent sends again.
 //
@@ -171,6 +173,17 @@ const FULL_ACCESS_ONLY =
   "this tool moves money; run it with a full-access key or set up a delegate key with caps (docs/MCP.md)";
 
 /**
+ * Why `register_agent` wants a full-access key. A delegate key cannot stand in: registering takes
+ * exactly 1 yoctoNEAR and the agent's bond, and no function-call key can attach a deposit, whatever
+ * methods it lists (the contract makes the same demand of unregister_agent and claim_agent_bond).
+ */
+const REGISTER_NEEDS_FULL_ACCESS =
+  "register_agent attaches exactly 1 yoctoNEAR and puts the agent's bond at stake, which only a " +
+  "full-access key can do: a function-call key cannot attach a deposit, a delegate key among them, " +
+  "whatever methods it lists. Nothing was uploaded or sent. Restart the server with this " +
+  "account's full-access key (docs/MCP.md)";
+
+/**
  * What the tools tell a client about themselves; none is read-only. A tool that moves money or
  * cannot be taken back is destructive and not idempotent, and a client may ask before it runs one.
  */
@@ -194,6 +207,18 @@ const SPENDS = {
   readOnlyHint: false,
   destructiveHint: true,
   idempotentHint: false,
+  openWorldHint: true,
+} as const;
+/**
+ * `register_agent` locks the agent's bond: it takes tokens out of the vault and holds them until the
+ * agent has left and the cooldown is over, so it is destructive like a tool that spends. A repeat
+ * is safe, though, which is why it is idempotent: an agent that holds its bond only replaces its
+ * profile, and takes no second one.
+ */
+const LOCKS_BOND = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
   openWorldHint: true,
 } as const;
 
@@ -510,9 +535,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     }
   }
 
-  function requireFullAccess(): void {
+  function requireFullAccess(message: string = FULL_ACCESS_ONLY): void {
     if (deps.keyKind !== "full_access") {
-      throw new ToolError("NEEDS_FULL_ACCESS_KEY", FULL_ACCESS_ONLY);
+      throw new ToolError("NEEDS_FULL_ACCESS_KEY", message);
     }
   }
 
@@ -852,7 +877,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
     "403:not_registered": {
       code: "NOT_REGISTERED",
       say: () =>
-        `only a registered agent can ask a question on an open task, and ${accountId} is not one: call register_agent first`,
+        `only an active registered agent can ask a question on an open task, and ${accountId} is not one: call register_agent first (an agent that is unregistering has to claim its bond, then register again)`,
     },
     "409:not_open": {
       code: "NOT_OPEN",
@@ -2088,17 +2113,20 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       title: "Register your agent",
       description:
         "Register this account as an agent, or update its profile: a name, a description and tags " +
-        "that other agents and posters see. The profile is uploaded and its hash goes on chain; " +
+        "that other agents and posters see. Only a registered agent whose bond the contract holds " +
+        "may enter an open task (a task pinned to the agent takes it without). Registering takes " +
+        "the bond out of your vault in the contract, so deposit it first (the tool answers " +
+        "BOND_LOW with how much is missing); updating the profile of an active agent that holds its " +
+        "bond takes none. " +
+        "The profile is uploaded and its hash goes on chain; " +
         "one that holds this server's private key, or another secret it was given, is refused " +
         "with SECRET_IN_CONTENT before anything is uploaded or paid (best effort, as at " +
         "commit_result). Tender charges the profile to your storage deposit. It can spend NEAR: " +
-        "a full-access key adds the NEAR for it from your account first when you have too " +
-        "little (the answer's note says how much); any other key cannot attach a deposit, and " +
-        "the tool stops with STORAGE_LOW, saying who must. Needs a key that may call " +
-        "register_agent: a " +
-        "full-access key, or a function-call key that lists it, which the usual agent key " +
-        "(commit and reveal) does not; another is refused with KEY_CANNOT_CALL before anything " +
-        "is uploaded. Safe to repeat; the last profile stands.",
+        "it adds the NEAR for it from your account first when you have too little (the answer's " +
+        "note says how much). Needs a full-access key, because it attaches exactly 1 yoctoNEAR: a " +
+        "function-call key (a delegate key too) cannot attach a deposit and is refused with " +
+        "NEEDS_FULL_ACCESS_KEY before anything is uploaded. Safe to repeat; the last profile " +
+        "stands.",
       inputSchema: {
         name: ProfileSchema.shape.name.describe("Your agent's name, 1 to 64 characters"),
         description: ProfileSchema.shape.description.describe(
@@ -2109,10 +2137,10 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         ),
         homepage: ProfileSchema.shape.homepage.describe("Your agent's own page, an http(s) URL"),
       },
-      annotations: IDEMPOTENT,
+      annotations: LOCKS_BOND,
     },
     guarded(secrets, async ({ name, description, tags, homepage }) => {
-      requireKeyFor("register_agent", "register_agent");
+      requireFullAccess(REGISTER_NEEDS_FULL_ACCESS);
       // The profile is looked at for the server's secrets before the top-up below, which pays.
       const profileBytes = bytesToPublish("profile", "register_agent", {
         name,
@@ -2120,6 +2148,30 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         tags,
         ...(homepage !== undefined && { homepage }),
       });
+      // The bond (contract Task 16b) is taken from the vault, so the vault must hold it. The tool
+      // does not move tokens for the agent: it says how much is missing, and `deposit` is the tool
+      // that does. An active agent that holds its bond updates its profile and pays nothing; one that holds none
+      // (it registered before the owner set a bond) pays it now.
+      const plan = await planRegistration(deps.client, accountId);
+      if (plan.agent?.status === "unregistering") {
+        throw new ToolError(
+          "UNREGISTERING",
+          `${accountId} is unregistering: it cannot register or update its profile until it has ` +
+            "claimed its bond (claim_agent_bond, once the cooldown is over; pnpm agent:claim-bond). " +
+            "Nothing was uploaded or sent",
+        );
+      }
+      if (plan.terms !== null && plan.takesBond && plan.shortfall > 0n) {
+        const { token, amount } = plan.terms;
+        throw new ToolError(
+          "BOND_LOW",
+          `registering takes a bond of ${amount} of ${token} (the smallest unit of the token) from ` +
+            `your vault in ${contractId}, which holds ${plan.vault}. Deposit ${plan.shortfall} more ` +
+            `with the deposit tool (token ${token}; your wallet holds ${plan.wallet ?? 0n} of it), ` +
+            "then call register_agent again. The bond is yours to claim back after you unregister. " +
+            "Nothing was uploaded or sent",
+        );
+      }
       // The contract takes the profile's bytes out of the caller's storage balance (E_STORAGE when
       // there is none), so the balance is made good first, as it is for a deposit.
       const added = await ensureStorage("register a profile");
@@ -2129,6 +2181,10 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         tx_hash: registered.txHash,
         profile_uri: profile.uri,
         profile_hash: profile.hash,
+        ...(plan.terms !== null &&
+          plan.takesBond && {
+            bond: { token: plan.terms.token, amount: plan.terms.amount.toString() },
+          }),
         ...topUpNote(added, "a profile"),
       });
     }),

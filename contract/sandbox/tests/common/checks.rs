@@ -100,7 +100,8 @@ pub fn event(r: &ExecutionFinalResult, name: &str) -> Value {
 }
 
 /// Checks that the token Tender holds is accounted for: the vault balances of `env`'s accounts and
-/// of `extra`, plus the escrow of the tasks not settled yet.
+/// of `extra`, plus the escrow of the tasks not settled yet, plus the agent bonds it holds for
+/// any of those accounts.
 pub async fn assert_conserved(env: &Env, extra: &[&AccountId]) -> anyhow::Result<()> {
     let mut holders: Vec<&AccountId> = [
         &env.owner,
@@ -115,9 +116,13 @@ pub async fn assert_conserved(env: &Env, extra: &[&AccountId]) -> anyhow::Result
     .map(|account| account.id())
     .collect();
     holders.extend_from_slice(extra);
-    let mut vaults = 0;
+    let (mut vaults, mut bonds) = (0, 0);
     for holder in holders {
         vaults += vault_balance(env, holder).await?;
+        let agent = view(&env.tender, "get_agent", json!({ "account_id": holder })).await?;
+        if agent["bond_token"] == env.token.id().as_str() {
+            bonds += num(&agent["bond_amount"]);
+        }
     }
     let tasks = view(
         &env.tender,
@@ -134,8 +139,9 @@ pub async fn assert_conserved(env: &Env, extra: &[&AccountId]) -> anyhow::Result
         .sum();
     let held = token_balance(env, env.tender.id()).await?;
     ensure!(
-        held == vaults + escrow,
-        "Tender holds {held} of the token, but its vaults hold {vaults} and its open tasks {escrow}"
+        held == vaults + escrow + bonds,
+        "Tender holds {held} of the token, but its vaults hold {vaults}, its open tasks {escrow} \
+         and its agents' bonds {bonds}"
     );
     Ok(())
 }

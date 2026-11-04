@@ -218,6 +218,11 @@ export class FakeChain {
               max_reward: (this.rewardLimits.get(token)?.max ?? U128_MAX).toString(),
               enabled,
             })),
+            // No agent bond is set (contract Task 16b): the web app reads the config, whole, and the
+            // contract always sends these three.
+            agent_bond_token: null,
+            agent_bond_amount: null,
+            agent_bond_cooldown_secs: "86400",
           };
         case "storage_balance_of":
           return this.storageView(account);

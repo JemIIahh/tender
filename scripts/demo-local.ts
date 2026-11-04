@@ -15,6 +15,7 @@ import {
   ApiClient,
   type LocalChain,
   type LocalRole,
+  registerLocalAgent,
   type Signer,
   startLocalChain,
   TenderClient,
@@ -49,6 +50,7 @@ import { redact, type Services, startServices } from "./serve";
  *
  *   Scripted demo agents run by the Tender team (offline solvers)
  *   CHAIN sandbox nearcore <the version the node reports>
+ *   REGISTERED alice, bob bond=<amount> each
  *   POSTED task=<id> reward=<amount>
  *   STARTED alice
  *   STARTED bob
@@ -61,7 +63,13 @@ import { redact, type Services, startServices } from "./serve";
  *
  * The lines come from the API and the chain, and not from what the demo itself did: the counts of
  * workers, commits and reveals on the task, and then its outcome and its scorecard, polled until
- * they show. Two of them are to be read with care:
+ * they show. Three of them are to be read with care:
+ *
+ * - `REGISTERED` is the agents' bond (contract Task 16b). Only a registered agent whose bond the
+ *   contract holds may enter an open task, so alice and bob each put the bond in their vaults and
+ *   register, as `pnpm agent:register` does for an agent of one's own. It is done after the
+ *   services are up, so that the index sees the registrations, and the line is printed when the
+ *   API lists both as active with the bond: the status and the bond are the API's.
  *
  * - `STARTED` is the agents' own word. An agent tells the API that it works on a task, and the API
  *   counts those calls: nothing on the chain backs the count, and it names no one. So the agents
@@ -141,6 +149,7 @@ const WINDOWS: SeedWindows = {
 };
 /** The agents of the team the demo runs, and how many entries the scenario ends with. */
 const ENTRANTS = 2;
+const TEAM_AGENTS = ["alice", "bob"] as const;
 
 /** How often the Judge and the keeper look. The indexer looks at 5 blocks a second. */
 const JUDGE_INTERVAL_MS = 1_000;
@@ -662,6 +671,25 @@ async function demo(h: Harness): Promise<void> {
   say(`CHAIN ${chain.network} nearcore ${version}`);
 
   const { services, reader } = await startUp(h, chain, dir);
+
+  // The two agents register with a bond before the task is posted: an open task takes no one else.
+  await limited(
+    "registering alice and bob with a bond",
+    STEP_MS,
+    Promise.all(TEAM_AGENTS.map((role) => registerLocalAgent(chain, role, AGENTS.coder.tags))),
+    h.signal,
+  );
+  const bonded = await until(h, "REGISTERED", STEP_MS, async () => {
+    const listed = await Promise.all(
+      TEAM_AGENTS.map((role) => reader.getAgent(chain.accounts[role].accountId)),
+    );
+    const missing = TEAM_AGENTS.filter((_, i) => listed[i]?.agent.status !== "active");
+    const bond = listed[0]?.agent.bond_amount;
+    return missing.length > 0 || bond === undefined || bond === null
+      ? waiting(`the API does not list ${missing.join(" and ")} as active with a bond yet`)
+      : ready(bond);
+  });
+  say(`REGISTERED ${TEAM_AGENTS.join(", ")} bond=${amountOf(bonded, chain.tokenId)} each`);
 
   const taskId = await postSeed(h, chain, services);
   const task = await until(h, "POSTED", STEP_MS, async () => {

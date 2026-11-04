@@ -1,6 +1,6 @@
 //! Owner configuration: the token allowlist, the fee and the treasury, the shortest window, the
-//! pause switch and two-step ownership. Also the `get_config` view and the `migrate` template for
-//! upgrades.
+//! agent registration bond and its cooldown, the pause switch and two-step ownership. Also the
+//! `get_config` view and the `migrate` template for upgrades.
 //!
 //! These methods are the contract's trust surface, so there are few of them and they all work the
 //! same way. Each needs exactly 1 yoctoNEAR (`assert_one_yocto`), which a function-call key cannot
@@ -14,11 +14,12 @@
 //! deposits; neither stands in the way of `withdraw`, `pick`, `void_task` or `cleanup`, which look
 //! at neither the pause switch nor the allowlist.
 
-use near_sdk::json_types::U128;
+use near_sdk::json_types::{U128, U64};
 use near_sdk::{assert_one_yocto, env, near, AccountId};
 
 use crate::types::{
-    err, ConfigView, TokenConfig, TokenConfigView, MAX_FEE_BPS, MAX_REWARD_LIMIT, MAX_WINDOW_SECS,
+    err, Bond, ConfigView, TokenConfig, TokenConfigView, MAX_BOND_COOLDOWN_SECS, MAX_FEE_BPS,
+    MAX_REWARD_LIMIT, MAX_WINDOW_SECS,
 };
 use crate::{Tender, TenderExt};
 
@@ -45,6 +46,9 @@ impl Tender {
                     enabled: c.enabled,
                 })
                 .collect(),
+            agent_bond_token: self.agent_bond.as_ref().map(|b| b.token.clone()),
+            agent_bond_amount: self.agent_bond.as_ref().map(|b| U128(b.amount)),
+            agent_bond_cooldown_secs: U64(self.agent_bond_cooldown_secs),
         }
     }
 
@@ -150,10 +154,66 @@ impl Tender {
         self.min_window_secs = min_window_secs;
     }
 
+    /// Sets the bond that `register_agent` takes from the vault of an agent that registers from
+    /// now on: `amount` of `token`, in its smallest unit. `token` must be allowlisted and enabled
+    /// (`E_TOKEN`), since a disabled token takes no deposits to pay a bond with, and `amount` more
+    /// than 0 (`E_LIMIT`). There is no way back to no bond.
+    ///
+    /// Each agent keeps the bond it paid, so a change applies only to registrations from now on:
+    /// `claim_agent_bond` pays back exactly what was taken, and an agent that registered for
+    /// nothing before the first bond was set stays registered. Requires 1 yoctoNEAR and the owner.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn set_agent_bond(&mut self, token: AccountId, amount: U128) {
+        self.assert_owner();
+        if !self.tokens.get(&token).is_some_and(|c| c.enabled) {
+            env::panic_str(&format!(
+                "{}: {token} is not an allowlisted, enabled token",
+                err::E_TOKEN
+            ));
+        }
+        if amount.0 == 0 {
+            env::panic_str(&format!(
+                "{}: the agent bond must be more than 0",
+                err::E_LIMIT
+            ));
+        }
+        self.agent_bond = Some(Bond {
+            token,
+            amount: amount.0,
+        });
+    }
+
+    /// Sets how long, in seconds, an agent waits from `unregister_agent` until `claim_agent_bond`
+    /// pays its bond back: from the shortest window, `min_window_secs` as it is now, to
+    /// `MAX_BOND_COOLDOWN_SECS`, 56 days (`E_WINDOW`). It applies to the agents that unregister
+    /// from now on; one that has unregistered keeps the time it was given.
+    ///
+    /// The cooldown does not decide whether one bond can seat several accounts in one task: each
+    /// open-task entry locks its agent's bond until that task's commit deadline (`locked_until`),
+    /// whatever the cooldown. The bound is checked when the cooldown is set; a later
+    /// `set_min_window` above it leaves it as it is, which is harmless for the same reason.
+    /// Requires 1 yoctoNEAR and the owner.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn set_agent_bond_cooldown(&mut self, secs: U64) {
+        self.assert_owner();
+        let shortest = u64::from(self.min_window_secs);
+        if !(shortest..=MAX_BOND_COOLDOWN_SECS).contains(&secs.0) {
+            env::panic_str(&format!(
+                "{}: the cooldown must be {shortest} to {MAX_BOND_COOLDOWN_SECS} seconds, got {}",
+                err::E_WINDOW,
+                secs.0
+            ));
+        }
+        self.agent_bond_cooldown_secs = secs.0;
+    }
+
     /// Pauses or resumes new money into tasks. While paused, `post_task` and `top_up_task` are
     /// refused (`E_PAUSED`). Nothing else is paused, so a pause never traps money: deposits,
-    /// withdrawals, commits, reveals, picks, voids and cleanups all keep working. Requires 1
-    /// yoctoNEAR and the owner.
+    /// withdrawals, commits, reveals, picks, voids and cleanups all keep working, and so do
+    /// `register_agent`, `unregister_agent` and `claim_agent_bond`. Requires 1 yoctoNEAR and the
+    /// owner.
     #[payable]
     #[deny_unknown_arguments]
     pub fn set_paused(&mut self, paused: bool) {
@@ -404,7 +464,8 @@ mod tests {
 
     /// A contract whose owner has 1 NEAR of storage and has allowlisted USDC with `set_token`;
     /// alice, the poster, with 1 NEAR of storage and `FUNDS` in her vault; and bob, carol and the
-    /// judge with 0.1 NEAR of storage and no vault slot.
+    /// judge with 0.1 NEAR of storage and no vault slot. bob and carol are registered agents, with
+    /// no bond, since none is set, so they may enter open tasks.
     fn world() -> Tender {
         let mut t = fresh();
         register(&mut t, OWNER, NearToken::from_near(1));
@@ -415,6 +476,12 @@ mod tests {
         assert_eq!(fund(&mut t, USDC, "alice.test", FUNDS), 0);
         for who in ["bob.test", "carol.test", JUDGE] {
             register(&mut t, who, NearToken::from_millinear(100));
+        }
+        for who in ["bob.test", "carol.test"] {
+            try_as(&mut t, who, ONE_YOCTO, |t| {
+                t.register_agent(URI.to_string(), BRIEF_HASH.to_string(), vec![])
+            })
+            .unwrap_or_else(|message| panic!("{who} could not register: {message}"));
         }
         t
     }
@@ -558,14 +625,19 @@ mod tests {
     /// A call to the contract, with its arguments fixed.
     type Call = fn(&mut Tender);
 
-    /// Every owner-only setter, called with arguments that are valid.
-    fn setters() -> [(&'static str, Call); 6] {
+    /// Every owner-only setter, called with arguments that are valid. `set_agent_bond` comes after
+    /// `set_token`, which allowlists its token.
+    fn setters() -> [(&'static str, Call); 8] {
         [
             ("set_token", |t| {
                 t.set_token(acct(USDC), U128(10), U128(1_000), true)
             }),
             ("set_fee", |t| t.set_fee(100, acct(NEW_TREASURY))),
             ("set_min_window", |t| t.set_min_window(120)),
+            ("set_agent_bond", |t| t.set_agent_bond(acct(USDC), U128(5))),
+            ("set_agent_bond_cooldown", |t| {
+                t.set_agent_bond_cooldown(U64(3_600))
+            }),
             ("set_paused", |t| t.set_paused(true)),
             ("propose_owner", |t| t.propose_owner(acct("alice.test"))),
             ("accept_owner", |t| t.accept_owner()),
@@ -662,6 +734,14 @@ mod tests {
             (config.fee_bps, config.min_window_secs, config.paused),
             (100, 120, true)
         );
+        assert_eq!(
+            (
+                config.agent_bond_token,
+                config.agent_bond_amount,
+                config.agent_bond_cooldown_secs
+            ),
+            (Some(acct(USDC)), Some(U128(5)), U64(3_600))
+        );
     }
 
     #[test]
@@ -669,7 +749,7 @@ mod tests {
         // The owner has no storage balance, so a storage check could fail too.
         let mut t = fresh();
         // A call whose arguments break one rule, with the code of that rule.
-        let broken: [(&str, Call, &str); 3] = [
+        let broken: [(&str, Call, &str); 5] = [
             (
                 "set_token",
                 |t| t.set_token(acct(USDC), U128(0), U128(10), true),
@@ -677,6 +757,16 @@ mod tests {
             ),
             ("set_fee", |t| t.set_fee(1_001, acct(NEW_TREASURY)), "E_FEE"),
             ("set_min_window", |t| t.set_min_window(0), "E_WINDOW"),
+            (
+                "set_agent_bond",
+                |t| t.set_agent_bond(acct(USDC), U128(5)),
+                "E_TOKEN",
+            ),
+            (
+                "set_agent_bond_cooldown",
+                |t| t.set_agent_bond_cooldown(U64(0)),
+                "E_WINDOW",
+            ),
         ];
         for (name, call, code) in broken {
             // First the deposit, whoever calls...
@@ -1116,6 +1206,109 @@ mod tests {
         assert_eq!(t.get_task(U64(early)), Some(early_view));
     }
 
+    // The agent bond.
+
+    #[test]
+    fn set_agent_bond_owner_only_and_token_allowlisted() {
+        let mut t = world();
+        // DAI is on the list but switched off; WNEAR is not on it at all.
+        as_owner(&mut t, |t| {
+            t.set_token(acct(DAI), U128(1), U128(1_000), false)
+        });
+        let config = t.get_config();
+        assert_eq!(
+            (config.agent_bond_token, config.agent_bond_amount),
+            (None, None),
+            "until the owner sets one, there is no bond"
+        );
+        let before = config_json(&t);
+        let set = |token: &'static str, amount: u128| {
+            move |t: &mut Tender| t.set_agent_bond(acct(token), U128(amount))
+        };
+
+        // 1 yoctoNEAR exactly, then the owner, then the arguments.
+        for deposit in [NO_DEPOSIT, NearToken::from_yoctonear(2)] {
+            assert_eq!(
+                try_as(&mut t, OWNER, deposit, set(USDC, 5_000_000)),
+                one_yocto(),
+                "{deposit:?}"
+            );
+        }
+        for who in ["alice.test", TREASURY] {
+            assert_rejected(
+                try_as(&mut t, who, ONE_YOCTO, set(USDC, 5_000_000)),
+                "E_OWNER",
+                who,
+            );
+        }
+        // Another contract the owner's transaction went through is not the owner.
+        testing_env!(ctx("evil.test")
+            .signer_account_id(acct(OWNER))
+            .attached_deposit(ONE_YOCTO)
+            .build());
+        let through = panic_message(|| t.set_agent_bond(acct(USDC), U128(5_000_000)));
+        assert!(through.is_some_and(|m| m.starts_with("E_OWNER: ")));
+        for (what, call, code) in [
+            ("a token not on the list", set("wnear.test", 5), "E_TOKEN"),
+            ("a disabled token", set(DAI, 5), "E_TOKEN"),
+            ("a zero bond", set(USDC, 0), "E_LIMIT"),
+        ] {
+            assert_rejected(try_as(&mut t, OWNER, ONE_YOCTO, call), code, what);
+        }
+        assert_eq!(config_json(&t), before, "a refused call changes nothing");
+        assert!(get_logs().is_empty(), "a refusal logs nothing");
+
+        // The owner sets it, and changes it.
+        as_owner(&mut t, set(USDC, 5_000_000));
+        let config = t.get_config();
+        assert_eq!(
+            (config.agent_bond_token, config.agent_bond_amount),
+            (Some(acct(USDC)), Some(U128(5_000_000)))
+        );
+        as_owner(&mut t, set(USDC, 1));
+        assert_eq!(t.get_config().agent_bond_amount, Some(U128(1)));
+        assert!(get_logs().is_empty(), "an owner setter logs nothing");
+    }
+
+    #[test]
+    fn set_agent_bond_cooldown_bounds() {
+        let mut t = world();
+        assert_eq!(
+            t.get_config().agent_bond_cooldown_secs,
+            U64(1_209_600),
+            "until the owner sets one, the cooldown is the longest window"
+        );
+        let set = |secs: u64| move |t: &mut Tender| t.set_agent_bond_cooldown(U64(secs));
+        assert_eq!(try_as(&mut t, OWNER, NO_DEPOSIT, set(600)), one_yocto());
+        assert_rejected(
+            try_as(&mut t, "alice.test", ONE_YOCTO, set(600)),
+            "E_OWNER",
+            "alice",
+        );
+        // From the shortest window, 60 s here, to four times the longest, 56 days.
+        for secs in [0, 59, 4_838_401, u64::MAX] {
+            assert_rejected(
+                try_as(&mut t, OWNER, ONE_YOCTO, set(secs)),
+                "E_WINDOW",
+                &format!("{secs} s"),
+            );
+        }
+        assert_eq!(t.get_config().agent_bond_cooldown_secs, U64(1_209_600));
+        for secs in [60, 4_838_400, 600] {
+            as_owner(&mut t, set(secs));
+            assert_eq!(t.get_config().agent_bond_cooldown_secs, U64(secs));
+        }
+        // The bound follows the shortest window as it is when the call is made.
+        as_owner(&mut t, |t| t.set_min_window(900));
+        assert_rejected(
+            try_as(&mut t, OWNER, ONE_YOCTO, set(899)),
+            "E_WINDOW",
+            "below the new shortest window",
+        );
+        as_owner(&mut t, set(900));
+        assert!(get_logs().is_empty());
+    }
+
     // Ownership.
 
     #[test]
@@ -1225,7 +1418,10 @@ mod tests {
         );
         // ...and the storage and registry methods.
         register(&mut t, "bob.test", NearToken::from_millinear(1));
-        testing_env!(ctx("bob.test").block_timestamp(T1).build());
+        testing_env!(ctx("bob.test")
+            .block_timestamp(T1)
+            .attached_deposit(ONE_YOCTO)
+            .build());
         t.register_agent(URI.to_string(), BRIEF_HASH.to_string(), vec![]);
 
         // The money went where each call said: the winner and the treasury were paid, the two
@@ -1353,20 +1549,34 @@ mod tests {
         as_owner(&mut t, |t| t.set_min_window(90));
         as_owner(&mut t, |t| t.set_paused(true));
         as_owner(&mut t, |t| t.propose_owner(acct("alice.test")));
-        assert_eq!(
-            serde_json::to_value(t.get_config()).unwrap(),
-            json!({
-                "owner": "owner.test",
-                "pending_owner": "alice.test",
-                "treasury": "new-treasury.test",
-                "fee_bps": 750,
-                "min_window_secs": 90,
-                "max_window_secs": 1_209_600,
-                "paused": true,
-                "version": 1,
-                "tokens": tokens,
-            })
-        );
+        let mut expected = json!({
+            "owner": "owner.test",
+            "pending_owner": "alice.test",
+            "treasury": "new-treasury.test",
+            "fee_bps": 750,
+            "min_window_secs": 90,
+            "max_window_secs": 1_209_600,
+            "paused": true,
+            "version": 1,
+            "tokens": tokens,
+            "agent_bond_token": null,
+            "agent_bond_amount": null,
+            "agent_bond_cooldown_secs": "1209600",
+        });
+        assert_eq!(serde_json::to_value(t.get_config()).unwrap(), expected);
+        // The bond's amount and the cooldown are decimal strings.
+        as_owner(&mut t, |t| {
+            t.set_token(acct("wnear.test"), U128(1), U128(1_000), true)
+        });
+        as_owner(&mut t, |t| {
+            t.set_agent_bond(acct("wnear.test"), U128(u128::MAX))
+        });
+        as_owner(&mut t, |t| t.set_agent_bond_cooldown(U64(4_838_400)));
+        expected["tokens"][2]["max_reward"] = json!("1000");
+        expected["agent_bond_token"] = json!("wnear.test");
+        expected["agent_bond_amount"] = json!(u128::MAX.to_string());
+        expected["agent_bond_cooldown_secs"] = json!("4838400");
+        assert_eq!(serde_json::to_value(t.get_config()).unwrap(), expected);
     }
 
     // Upgrades.

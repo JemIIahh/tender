@@ -10,6 +10,7 @@ import {
   type KeyPairString,
 } from "near-api-js";
 import { DEFAULT_ACCOUNT_ID, DEFAULT_PRIVATE_KEY, Sandbox } from "near-sandbox";
+import { type Registration, registerWithBond, scriptedProfile } from "./bond";
 import { type Signer, TenderClient, toTxResult } from "./client";
 
 /** The accounts of a local chain that tests and demos sign as. */
@@ -68,6 +69,11 @@ const FEE_BPS = 500;
 /** The rewards Tender accepts in the token, in its smallest unit. */
 const MIN_REWARD = 1n;
 const MAX_REWARD = 10n ** 12n;
+/**
+ * The bond an agent pays to register on a local chain: 1 token (the token has 6 decimals). The
+ * owner sets it at start-up, so that a local chain behaves as a deployed one does.
+ */
+export const LOCAL_AGENT_BOND = 10n ** 6n;
 
 /** The committed builds (plan 01 Task 12), found from this file's place in the repo. */
 const TENDER_WASM = new URL("../../../contract/res/tender.wasm", import.meta.url);
@@ -146,6 +152,29 @@ const setTokenCall: TenderCall = {
   deposit: 1n,
 };
 
+/** What a local chain's agent bond is, and what a started chain registers on its own. */
+export interface LocalChainOptions {
+  /** The shortest window Tender accepts, in seconds. 5 by default, the sandbox's. */
+  minWindowSecs?: number;
+  /**
+   * The agent bond the owner sets: the amount of the test token (`LOCAL_AGENT_BOND` by default),
+   * and how many seconds an agent waits from `unregister_agent` to its claim: the contract's
+   * shortest window by default, which is as short as it can be. Contract rules apply: the cooldown
+   * is at least `minWindowSecs`.
+   *
+   * `null` sets no bond and leaves the cooldown at the contract's own: agents that register then
+   * hold none, as the ones did that registered before the owner first set a bond. A test of that
+   * sets the bond later with the owner's client (`setAgentBond`). There is no way back to no bond.
+   */
+  agentBond?: { amount?: bigint; cooldownSecs?: number } | null;
+  /**
+   * Roles to register as agents, each with the bond, before `startLocalChain` returns. Open tasks
+   * take entries only from registered agents, so a test or a demo whose roles enter one names them
+   * here. Roles that are left out are not agents. Registering later is `registerLocalAgent`.
+   */
+  registerAgents?: readonly LocalRole[];
+}
+
 /**
  * Starts a nearcore node with near-sandbox and sets it up for Tender:
  *
@@ -157,14 +186,23 @@ const setTokenCall: TenderCall = {
  * - every role, and `tender.sandbox`, registers with the token. Alice, bob and lead are minted
  *   10^12 each, and every role deposits 0.1 NEAR of storage with Tender;
  * - the owner, whose storage balance `set_token` charges, allowlists the token for rewards of 1 to
- *   10^12.
+ *   10^12, and then sets the agent bond (`LOCAL_AGENT_BOND` of the token) and its cooldown, before
+ *   any agent registers;
+ * - the roles of `registerAgents` register as agents, and pay the bond.
  *
  * The node binary is the one at `NEAR_SANDBOX_BIN_PATH`, or near-sandbox downloads nearcore 2.13.4
  * when that is unset. Call `stop` when done. A node that fails to set up is stopped here, once
  * every request of the setup has settled, and the setup's error is thrown.
  */
-export async function startLocalChain(opts: { minWindowSecs?: number } = {}): Promise<LocalChain> {
+export async function startLocalChain(opts: LocalChainOptions = {}): Promise<LocalChain> {
   const minWindowSecs = opts.minWindowSecs ?? NETWORKS.sandbox.minWindowSecs;
+  const bond =
+    opts.agentBond === null
+      ? null
+      : {
+          amount: opts.agentBond?.amount ?? LOCAL_AGENT_BOND,
+          cooldownSecs: opts.agentBond?.cooldownSecs ?? minWindowSecs,
+        };
   const [tenderWasm, tokenWasm] = await Promise.all([readWasm(TENDER_WASM), readWasm(TOKEN_WASM)]);
   // near-sandbox waits NEAR_RPC_TIMEOUT_SECS (default 10) for a new node to answer; a busy machine
   // needs longer, so a minute unless the caller chose otherwise.
@@ -172,7 +210,12 @@ export async function startLocalChain(opts: { minWindowSecs?: number } = {}): Pr
   const sandbox = await Sandbox.start({ version: NEARCORE_VERSION });
   let accounts: Record<LocalRole, Signer>;
   try {
-    accounts = await setUp(sandbox.rpcUrl, tenderWasm, tokenWasm, minWindowSecs);
+    accounts = await setUp(sandbox.rpcUrl, tenderWasm, tokenWasm, minWindowSecs, bond);
+    await Promise.all(
+      (opts.registerAgents ?? []).map((role) =>
+        registerLocalAgent({ rpcUrl: sandbox.rpcUrl, accounts }, role),
+      ),
+    );
   } catch (error) {
     // The setup error is the one worth reporting; a failed stop on top of it is not.
     await stopNode(sandbox).catch(() => undefined);
@@ -192,11 +235,32 @@ export async function startLocalChain(opts: { minWindowSecs?: number } = {}): Pr
   };
 }
 
+/**
+ * Registers `role` of a local chain as an agent, paying the bond from its own token balance: the
+ * shortfall is moved into its vault first (the roles alice, bob and lead hold 10^12 of the token).
+ * Open tasks take entries only from agents like this. Registering twice updates the profile and
+ * pays nothing more. `chain` is a `LocalChain`, or anything with its `rpcUrl` and `accounts`.
+ */
+export async function registerLocalAgent(
+  chain: Pick<LocalChain, "rpcUrl" | "accounts">,
+  role: LocalRole,
+  tags: readonly string[] = [],
+): Promise<Registration> {
+  const client = new TenderClient({
+    network: "sandbox",
+    contractId: CONTRACT,
+    rpcUrl: chain.rpcUrl,
+    signer: chain.accounts[role],
+  });
+  return registerWithBond(client, scriptedProfile(role, tags), { approve: () => true });
+}
+
 async function setUp(
   rpcUrl: string,
   tenderWasm: Uint8Array,
   tokenWasm: Uint8Array,
   minWindowSecs: number,
+  bond: { amount: bigint; cooldownSecs: number } | null,
 ): Promise<Record<LocalRole, Signer>> {
   type Name = LocalRole | "tender" | "usdc";
   const provider = new JsonRpcProvider({ url: rpcUrl });
@@ -247,8 +311,16 @@ async function setUp(
       await client.send(tokenStorageDepositCall(TOKEN, accountId));
       if (MINTED.includes(role)) await client.send(mintCall(accountId, TOKENS_EACH));
       await client.storageDeposit(STORAGE_DEPOSIT);
-      // `set_token` charges the owner's storage balance, which exists by now.
-      if (role === "owner") await client.send(setTokenCall);
+      // `set_token` charges the owner's storage balance, which exists by now. The bond comes
+      // straight after: it needs the token on the allowlist, and it is set before any agent
+      // registers (agents that registered earlier would hold none).
+      if (role === "owner") {
+        await client.send(setTokenCall);
+        if (bond !== null) {
+          await client.setAgentBond(TOKEN, bond.amount);
+          await client.setAgentBondCooldown(bond.cooldownSecs);
+        }
+      }
     }),
     clientOf("tender").send(tokenStorageDepositCall(TOKEN, CONTRACT)),
   ]);

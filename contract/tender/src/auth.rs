@@ -21,7 +21,20 @@
 //! (`assert_one_yocto`), which no function-call key can attach, so a delegate key can neither move
 //! money out nor raise its own caps. And `pick` refuses a call signed by a delegate key of the
 //! verifier or poster (`signed_by_delegate`), whatever methods the access key allows, so the key
-//! cannot award an escrow either; the account picks with any other key.
+//! cannot award an escrow either; the account picks with any other key. That refusal needs to see
+//! the key that signed, which the runtime shows only for a transaction the caller signs itself: in
+//! a NEP-366 meta-transaction the signer and its key are the relayer's, and in a cross-contract
+//! call they are whoever sent the transaction. So when the signer is not the caller, `pick`
+//! refuses if the caller has any delegate key at all (`has_delegates`; independent review H1):
+//! the key that signed could be one of them. An account with no delegate key picks directly,
+//! relayed or from a contract, such as a DAO verifier. Each account's number of delegate keys is
+//! kept beside the records, so that check is one lookup.
+//!
+//! The signer is read in two places only, `authorize_spend` and `pick`. Both trust the signing key
+//! only through `direct_signing_key`, which requires signer == predecessor. Every
+//! other method authorises the predecessor alone, and none of them lets a key do more than its
+//! account could: the methods that move money out or change caps need 1 yoctoNEAR, which no
+//! function-call key can attach, relayed or not.
 //!
 //! `spent` is written before the debit and the rest of the spending method. Every panic after it
 //! (`E_FUNDS`, `E_STORAGE`) fails the receipt, and NEAR rolls back all of a failed receipt's state
@@ -82,8 +95,10 @@ impl Tender {
     ///
     /// The caps are not checked against anything: they only narrow what the account's full-access
     /// key can do anyway, and the spending methods still check the token and the reward. The
-    /// caller's storage balance pays for the record (`E_STORAGE` if it cannot). Works while posting
-    /// is paused. Emits `delegate_added`.
+    /// caller's storage balance pays for the record, and for the account's count of delegate keys
+    /// when this is its first (`E_STORAGE` if it cannot). While the account has any, `pick` takes
+    /// its calls only in a transaction it signs itself. Works while posting is paused. Emits
+    /// `delegate_added`.
     #[payable]
     #[deny_unknown_arguments]
     pub fn add_delegate(
@@ -101,15 +116,23 @@ impl Tender {
             _ => 0,
         };
         let before = self.storage_mark();
-        self.delegates.insert(
-            key,
-            DelegateCaps {
-                token: token.clone(),
-                per_task_cap: per_task_cap.0,
-                total_cap: total_cap.0,
-                spent,
-            },
-        );
+        let replaced = self
+            .delegates
+            .insert(
+                key,
+                DelegateCaps {
+                    token: token.clone(),
+                    per_task_cap: per_task_cap.0,
+                    total_cap: total_cap.0,
+                    spent,
+                },
+            )
+            .is_some();
+        if !replaced {
+            let count = self.delegate_counts.get(&account).copied().unwrap_or(0);
+            self.delegate_counts
+                .insert(account.clone(), count.saturating_add(1));
+        }
         self.settle_storage(&account, before);
         emit(
             "delegate_added",
@@ -144,6 +167,14 @@ impl Tender {
                 err::E_NOT_FOUND,
                 String::from(&public_key)
             ));
+        }
+        match self.delegate_counts.get(&account).copied() {
+            Some(count) if count > 1 => {
+                self.delegate_counts.insert(account.clone(), count - 1);
+            }
+            _ => {
+                self.delegate_counts.remove(&account);
+            }
         }
         self.settle_storage(&account, before);
         emit(
@@ -218,7 +249,14 @@ impl Tender {
 
     /// Whether this call was signed by one of `account`'s delegate keys and came straight from
     /// `account`: the lookup `authorize_spend` makes. `pick` refuses such a call, because a key
-    /// that may spend within caps must not also decide where an escrow goes.
+    /// that may spend within caps must not also decide where an escrow goes. It answers `false`
+    /// for a call that did not come straight from `account`, so `pick` refuses those first.
+    /// Whether `account` has registered any delegate key. While it has, `pick` takes its calls
+    /// only in a transaction it signs itself, since only then can the key be checked.
+    pub(crate) fn has_delegates(&self, account: &AccountId) -> bool {
+        self.delegate_counts.get(account).is_some_and(|&n| n > 0)
+    }
+
     pub(crate) fn signed_by_delegate(&self, account: &AccountId) -> bool {
         direct_signing_key(account).is_some_and(|key| self.delegates.contains_key(&key))
     }
@@ -665,15 +703,23 @@ mod tests {
         add(&mut t, ALICE, key(), USDC, PER_TASK, TOTAL);
         let with = used(&t, ALICE);
         assert!(with > before, "add_delegate charged nothing");
-        // A second key costs as much again; replacing the first one's caps costs nothing.
+        // The first key also makes the account's delegate count: 40 bytes of overhead, a key of a
+        // 1-byte prefix and the account id with its 4-byte length, and a u32.
+        let count_bytes = (40 + 1 + 4 + ALICE.len() + 4) as u64;
+        assert!(t.has_delegates(&acct(ALICE)));
+        // A second key costs as much as the first one's record alone; replacing the first one's
+        // caps costs nothing.
         add(&mut t, ALICE, other_key(), USDC, PER_TASK, TOTAL);
-        assert_eq!(used(&t, ALICE) - with, with - before);
+        let second = used(&t, ALICE) - with;
+        assert_eq!(second, with - before - count_bytes);
         add(&mut t, ALICE, key(), USDC, 1, 2);
-        assert_eq!(used(&t, ALICE) - with, with - before);
-        for pk in [key(), other_key()] {
+        assert_eq!(used(&t, ALICE) - with, second);
+        for (pk, left) in [(key(), true), (other_key(), false)] {
             testing_env!(ctx(ALICE).attached_deposit(ONE_YOCTO).build());
             t.remove_delegate(pk);
+            assert_eq!(t.has_delegates(&acct(ALICE)), left);
         }
+        // The last removal also takes the count away, so every byte comes back.
         assert_eq!(used(&t, ALICE), before);
         // An account with no storage balance cannot add one.
         testing_env!(ctx("nobody.test").attached_deposit(ONE_YOCTO).build());

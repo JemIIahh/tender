@@ -32,7 +32,12 @@ export interface ApplyOptions {
  *   `earned` slot of the task's token if the agent has one (it never opens one); the account
  *   behind the pick, `by`, gets the `picks_made`;
  * - settle.rs, an empty `pick`: the account behind it gets a `voids_after_reveals` if any entry
- *   had been revealed, and no `picks_made`.
+ *   had been revealed, and no `picks_made`;
+ * - registry.rs, the agent bond (Task 16b): `agent_registered` makes the agent active (a new one,
+ *   one updating its profile, or a retired one coming back), `agent_bonded` records the bond the
+ *   contract took, `agent_unregistering` starts its way out with the time its bond is claimable
+ *   from, and `agent_bond_claimed` retires it and clears the bond. `status`, `bond_token`,
+ *   `bond_amount` and `claimable_at` equal those of `get_agent`.
  *
  * An event about a task the index does not hold, because it started after the task was created,
  * is stored in `events` and projects nothing; reconcile fills such tasks in from the chain.
@@ -100,6 +105,9 @@ function taskIdOf(event: TenderEvent): string | null {
     case "withdraw":
     case "withdraw_failed":
     case "agent_registered":
+    case "agent_bonded":
+    case "agent_unregistering":
+    case "agent_bond_claimed":
     case "delegate_added":
     case "delegate_removed":
       return null;
@@ -127,6 +135,12 @@ async function project(
       return voided(db, event.data, height);
     case "agent_registered":
       return agentRegistered(db, event.data, height, opts);
+    case "agent_bonded":
+      return agentBonded(db, event.data);
+    case "agent_unregistering":
+      return agentUnregistering(db, event.data);
+    case "agent_bond_claimed":
+      return agentBondClaimed(db, event.data);
     // Kept in `events` for the stream and the notifier, and nothing else: no table follows them.
     case "storage_deposit":
     case "deposit":
@@ -382,19 +396,50 @@ async function agentRegistered(
   const isTeam =
     opts.teamAccounts.includes(d.account) || (d.asp !== null && opts.teamAccounts.includes(d.asp));
   // A first registration writes every counter out as zero. A later one (`updated`) replaces the
-  // profile fields only: the counters and the height of the first registration stay.
+  // profile fields only: the counters and the height of the first registration stay. The agent is
+  // active after either: an unregistering agent cannot register, so this one was active already,
+  // or retired and has come back. Its bond is not touched here: `agent_bonded` follows when the
+  // registration took one, and a retired agent's was cleared by `agent_bond_claimed`.
   await db.query(
     `insert into agents (
        account, asp, profile_uri, profile_hash, tags, name, entries, reveals, wins, earned,
-       picks_made, voids_after_reveals, registered_height, is_team)
-     values ($1, $2, $3, $4, $5, $6, 0, 0, 0, '{}', 0, 0, $7, $8)
+       picks_made, voids_after_reveals, registered_height, is_team, status)
+     values ($1, $2, $3, $4, $5, $6, 0, 0, 0, '{}', 0, 0, $7, $8, 'active')
      on conflict (account) do update set
        asp = excluded.asp,
        profile_uri = excluded.profile_uri,
        profile_hash = excluded.profile_hash,
        tags = excluded.tags,
        name = excluded.name,
-       is_team = excluded.is_team`,
+       is_team = excluded.is_team,
+       status = 'active'`,
     [d.account, d.asp, d.profile_uri, d.profile_hash, JSON.stringify(d.tags), name, height, isTeam],
+  );
+}
+
+/** The bond the contract took at a registration, right after its `agent_registered`. */
+async function agentBonded(db: Db, d: Data<"agent_bonded">): Promise<void> {
+  await db.query("update agents set bond_token = $2, bond_amount = $3 where account = $1", [
+    d.account,
+    d.token,
+    d.amount,
+  ]);
+}
+
+/** The agent has started to leave: its bond is claimable from `claimable_at`. */
+async function agentUnregistering(db: Db, d: Data<"agent_unregistering">): Promise<void> {
+  await db.query(
+    "update agents set status = 'unregistering', claimable_at = $2 where account = $1",
+    [d.account, d.claimable_at],
+  );
+}
+
+/** The agent has its bond back, whatever it was (none, for one that registered before bonds). */
+async function agentBondClaimed(db: Db, d: Data<"agent_bond_claimed">): Promise<void> {
+  await db.query(
+    `update agents
+        set status = 'retired', bond_token = null, bond_amount = null, claimable_at = null
+      where account = $1`,
+    [d.account],
   );
 }

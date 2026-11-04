@@ -14,7 +14,7 @@ import { useNowNs } from "../lib/clock";
 import { config } from "../lib/config";
 import { UNTITLED_TASK } from "../lib/copy";
 import { errorMessage } from "../lib/errors";
-import { useEvents } from "../lib/events";
+import { type EventInfo, isBoardEvent, useEventsBy } from "../lib/events";
 import { awaitsJudge, isJudgeAccount, JUDGE_POLL_MS } from "../lib/judge";
 import { phaseOfTask } from "../lib/phase";
 import { view } from "../lib/rpc";
@@ -28,7 +28,9 @@ import { JudgeNote } from "./JudgeNote";
 import { Payouts } from "./Payouts";
 import { PhaseChip } from "./PhaseChip";
 import { PhaseTimeline } from "./PhaseTimeline";
+import { Questions } from "./Questions";
 import { Scorecard } from "./Scorecard";
+import { SwarmTree } from "./SwarmTree";
 import { TeamBadge } from "./TeamBadge";
 import { EYEBROW, FACT_LABEL, PANEL, PANEL_TITLE, SECONDARY, TEXT_LINK } from "./ui";
 import { VerifierRecord } from "./VerifierRecord";
@@ -75,6 +77,25 @@ const EVENTS_QUIET_MS = 300;
  * show a task that has moved on without saying so.
  */
 const EVENTS_MAX_WAIT_MS = 2_000;
+
+/** What the page asks again for, by what an event is about. */
+const EVENT_KINDS = ["task", "board", "tree"] as const;
+type EventKind = (typeof EVENT_KINDS)[number];
+
+/** The events of another task in the swarm tree that change what the tree shows of it. */
+const TREE_EVENTS: ReadonlySet<string> = new Set(["task_topped_up", "picked", "voided"]);
+
+/**
+ * What an event is about, for the page of task `id`: the task itself, its question board (whose
+ * events are the API's, not the contract's), or another task of its swarm tree (`tree`). Anything
+ * else is no news here.
+ */
+function eventKind(event: EventInfo, id: string, tree: ReadonlySet<string>): EventKind | null {
+  if (event.task_id === undefined) return null;
+  if (isBoardEvent(event.event)) return event.task_id === id ? "board" : null;
+  if (event.task_id === id) return "task";
+  return tree.has(event.task_id) && TREE_EVENTS.has(event.event) ? "tree" : null;
+}
 
 /**
  * What the chain itself says of task `id`, read through the browser's RPC node: the index lags the
@@ -137,36 +158,26 @@ function Funders({ funders, token }: Pick<TaskDetailResponse, "funders"> & { tok
   );
 }
 
-function Subtasks({ ids }: { ids: TaskDetailResponse["children"] }) {
-  if (ids.length === 0) return null;
-  return (
-    <section className={PANEL}>
-      <h2 className={PANEL_TITLE}>Subtasks</h2>
-      <ul className="flex flex-wrap gap-2">
-        {ids.map((id) => (
-          <li key={id}>
-            <Link data-testid="child-link" href={`/tasks/${id}`} className={SECONDARY}>
-              Task #{id}
-            </Link>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
 function ReadyView({
   loaded,
   nowNs,
   stale,
   judgeAccount,
   onRetry,
+  boardEvents,
+  treeEvents,
+  onTreeIds,
 }: {
   loaded: Loaded;
   nowNs: bigint;
   stale: Stale | null;
   judgeAccount: string | null;
   onRetry: () => void;
+  /** Goes up when the stream says the question board changed. */
+  boardEvents: number;
+  /** Goes up when the stream says another task of the swarm tree changed. */
+  treeEvents: number;
+  onTreeIds: (ids: ReadonlySet<string>) => void;
 }) {
   const { task, brief, criteria, entries, funders, children, scorecard } = loaded.data;
   // The phase by the clock, so that a window ends on the page when it ends in the contract.
@@ -251,6 +262,8 @@ function ReadyView({
       <PhaseTimeline task={task} nowNs={nowNs} />
       <BriefSection brief={brief} />
       <CriteriaSection criteria={criteria} />
+      {/* The board explains the brief and the criteria, so it comes after them. */}
+      <Questions task={task} phase={phase} refresh={boardEvents} />
       <EntryList entries={entries} phase={phase} />
       <VerifierRecord
         account={task.verifier}
@@ -284,7 +297,10 @@ function ReadyView({
         />
       )}
       <Funders funders={funders} token={task.token} />
-      <Subtasks ids={children} />
+      {/* Where the subtasks were listed: the lineage, as a tree, on a task that has one. */}
+      {task.parent === null && children.length === 0 ? null : (
+        <SwarmTree current={loaded.data} nowNs={nowNs} refresh={treeEvents} onIds={onTreeIds} />
+      )}
     </article>
   );
 }
@@ -315,7 +331,14 @@ export function TaskView({
 }) {
   const [state, setState] = useState<State>({ status: "loading" });
   const nowNs = useNowNs();
-  const events = useEvents((event) => event.task_id === id);
+  // The tasks of the swarm tree, as the tree last read them: their settling is news here too.
+  const treeIds = useRef<ReadonlySet<string>>(new Set());
+  const onTreeIds = useCallback((ids: ReadonlySet<string>) => {
+    treeIds.current = ids;
+  }, []);
+  // One stream for the whole page; each part asks again for what an event is about.
+  const counts = useEventsBy(EVENT_KINDS, (event) => eventKind(event, id, treeIds.current));
+  const events = counts.task;
   // The request that counts. An answer to an earlier one is dropped: strict mode starts two
   // requests, and the stream can ask again while a slow answer is on its way.
   const latest = useRef(0);
@@ -443,6 +466,9 @@ export function TaskView({
           stale={state.stale}
           judgeAccount={judgeAccount}
           onRetry={() => load(true)}
+          boardEvents={counts.board}
+          treeEvents={counts.tree}
+          onTreeIds={onTreeIds}
         />
       );
   }
