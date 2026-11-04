@@ -1,11 +1,43 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseEnv } from "node:util";
 import type { NetworkId } from "@tender/shared";
 
-/** The repository root, where the env files and `deployments/` live. */
+/** The repository root. */
 export const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
+
+/** The variable that names another directory for the env files and `deployments/`. */
+export const ENV_DIR_VARIABLE = "TENDER_ENV_DIR";
+
+/**
+ * The directory that holds `.env`, `.env.deploy.<network>` and `deployments/`: the repository root,
+ * unless `TENDER_ENV_DIR` of `processEnv` names another one (a relative name is taken from the
+ * working directory). A value that is empty or only spaces counts as unset. A run that must not
+ * see the files of the repository, such as a test's, points it at a directory of its own.
+ *
+ * Every script reads its files from here when it is not told a `dir` of its own, and `pnpm serve`
+ * reads the indexer's `deployments/` from here too.
+ */
+export function envDir(
+  processEnv: Readonly<Record<string, string | undefined>> = process.env,
+): string {
+  const set = (processEnv[ENV_DIR_VARIABLE] ?? "").trim();
+  return set === "" ? REPO_ROOT : resolve(set);
+}
+
+/**
+ * `deployments/` of the directory that `TENDER_ENV_DIR` names, or undefined when it is not set. The
+ * indexer has its own default for the repository's `deployments/`, so `pnpm serve` hands it this
+ * one only when the variable asks for another.
+ */
+export function deploymentsDirOverride(
+  processEnv: Readonly<Record<string, string | undefined>> = process.env,
+): string | undefined {
+  return (processEnv[ENV_DIR_VARIABLE] ?? "").trim() === ""
+    ? undefined
+    : join(envDir(processEnv), "deployments");
+}
 
 /**
  * The variables of dotenv text. The trailing spaces and tabs of every line are dropped first:
@@ -33,9 +65,10 @@ export function readEnvFile(path: string): Record<string, string> {
 }
 
 /**
- * The variables of `.env` and `.env.deploy.<network>` in the repository root (or `dir`), the
- * network's file winning where both set a key. A file that does not exist counts as empty, and the
- * process environment is not consulted.
+ * The variables of `.env` and `.env.deploy.<network>` in `dir` (default: `envDir()`, the
+ * repository root unless `TENDER_ENV_DIR` says another), the network's file winning where both set
+ * a key. A file that does not exist counts as empty. The process environment is not consulted for
+ * the variables, only for `TENDER_ENV_DIR` when no `dir` is given.
  *
  * Throws if a key in `required` is missing or empty, naming every such key in one error. The error
  * holds no value, so it is safe to print. The result is typed so that each key in `required` is a
@@ -45,7 +78,7 @@ export function loadEnv<const K extends string = never>(
   network: NetworkId,
   options: { required?: readonly K[]; dir?: string } = {},
 ): Record<K, string> & Record<string, string> {
-  const dir = options.dir ?? REPO_ROOT;
+  const dir = options.dir ?? envDir();
   const env = {
     ...readEnvFile(join(dir, ".env")),
     ...readEnvFile(join(dir, `.env.deploy.${network}`)),

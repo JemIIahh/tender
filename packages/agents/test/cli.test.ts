@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ApiClient, ApiTimeoutError, KeyPair } from "@tender/client";
@@ -25,6 +25,7 @@ import {
   checkAgentKey,
   createApiClient,
   type ExitIo,
+  envDirOf,
   exitWhenFlushed,
   main,
   parseCli,
@@ -183,6 +184,11 @@ interface Setup {
   env?: Record<string, string | undefined>;
   /** Files of the repository root. */
   files?: Record<string, string>;
+  /**
+   * Gives the files' directory to `main` as `TENDER_ENV_DIR` of the environment, and no `dir`, as
+   * the bin gives it.
+   */
+  dirFromEnv?: boolean;
   /** What the chain says of the key. Default: a function-call key limited to Tender. */
   key?: () => Promise<Found>;
   /** What the chain says of the agent's registration. Default: an active agent. */
@@ -256,9 +262,12 @@ async function start(args: string[], setup: Setup = {}) {
 
   const options: CliOptions = {
     createApi,
-    dir,
+    ...(setup.dirFromEnv !== true && { dir }),
     home,
-    env: setup.env ?? ENV,
+    env: {
+      ...(setup.env ?? ENV),
+      ...(setup.dirFromEnv === true && { TENDER_ENV_DIR: dir }),
+    },
     seedsDir: setup.seedsDir ?? SEEDS,
     ...(setup.privateDir !== undefined && { privateDir: setup.privateDir }),
     out: (line) => out.push(line),
@@ -888,6 +897,36 @@ test("a_run_reads_the_key_and_the_account_from_the_files_of_its_network", async 
   expect(result.viewAccessKey).toHaveBeenCalledWith(ACCOUNT, AGENT_PUBLIC);
 });
 
+test("a_run_given_no_dir_reads_the_files_of_the_directory_tender_env_dir_names", async () => {
+  const result = await start(ARGS, {
+    env: {},
+    dirFromEnv: true,
+    files: {
+      ".env": `TENDER_API_URL=https://api.tender.example\nAGENT_ANALYST_PRIVATE_KEY=${AGENT_KEY.toString()}\n`,
+      ".env.deploy.testnet": `TENDER_CONTRACT=${CONTRACT}\nAGENT_ANALYST_ACCOUNT=${ACCOUNT}\n`,
+    },
+  });
+
+  expect(result.code).toBe(0);
+  expect(result.makeClient.mock.calls[0]?.[0]).toMatchObject({
+    contractId: CONTRACT,
+    signer: { accountId: ACCOUNT, privateKey: AGENT_KEY.toString() },
+  });
+});
+
+test("env_dir_of_is_the_repository_root_unless_tender_env_dir_names_another", () => {
+  for (const unset of [
+    {},
+    { TENDER_ENV_DIR: undefined },
+    { TENDER_ENV_DIR: "" },
+    { TENDER_ENV_DIR: "  " },
+  ]) {
+    expect(resolve(envDirOf(unset)), JSON.stringify(unset)).toBe(resolve(ROOT));
+  }
+  expect(envDirOf({ TENDER_ENV_DIR: "/some/where" })).toBe("/some/where");
+  expect(envDirOf({ TENDER_ENV_DIR: " here/dir " })).toBe(resolve("here/dir"));
+});
+
 test("read_run_config_trims_the_values_and_reads_the_model_for_the_llm_solver_only", () => {
   const spaced = Object.fromEntries(
     Object.entries({ ...ENV, ...LLM_ENV }).map(([k, v]) => [k, ` ${v}\n`]),
@@ -1449,12 +1488,17 @@ test("without_a_signal_the_agent_stops_on_sigint_and_sigterm_and_leaves_the_proc
 
 // ---- The bin ----------------------------------------------------------------------------------
 
-/** What the bin did with `env` as its whole environment. */
+/**
+ * What the bin did with `env` as its whole environment, and with a directory of its own, which has
+ * no env file, in the place of the repository root (`TENDER_ENV_DIR`): nothing of the machine's
+ * `.env` or `.env.deploy.<network>` reaches it.
+ */
 async function runBin(args: string[], env: Record<string, string>) {
+  const noFiles = await dirWith();
   try {
     const { stdout, stderr } = await run(process.execPath, ["--import", "tsx", BIN, ...args], {
       cwd: ROOT,
-      env,
+      env: { TENDER_ENV_DIR: noFiles, ...env },
       timeout: 60_000,
     });
     return { code: 0, stdout, stderr };
@@ -1519,6 +1563,7 @@ test("the_bin_ends_the_process_when_told_to_stop_though_the_sign_in_request_is_s
   });
   await new Promise<void>((resolve) => hanging.listen(0, "127.0.0.1", resolve));
   const home = await mkdtemp(join(tmpdir(), "tender-bin-home-"));
+  const noFiles = await dirWith();
   const child = spawn(
     process.execPath,
     ["--import", "tsx", BIN, "--agent", "analyst", "--solver", "offline", "--network", "sandbox"],
@@ -1526,6 +1571,7 @@ test("the_bin_ends_the_process_when_told_to_stop_though_the_sign_in_request_is_s
       cwd: ROOT,
       env: {
         HOME: home,
+        TENDER_ENV_DIR: noFiles,
         TENDER_CONTRACT: "tender.sandbox",
         TENDER_API_URL: `http://127.0.0.1:${(hanging.address() as AddressInfo).port}`,
         NEAR_RPC_URL: "http://127.0.0.1:1",

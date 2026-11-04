@@ -38,9 +38,10 @@ import type { Solver } from "./types";
 // `--max-llm-calls-per-hour N` sets another limit (`maxCallsPerHour` of `createLlmSolver`); the
 // scripted solvers cost nothing and refuse it.
 //
-// What it reads. The variables come from `.env` and `.env.deploy.<network>` in the repository root,
-// the network's winning, and the process's own variables win over both, so that a host's settings
-// override the files (`pnpm serve` reads its environment the same way):
+// What it reads. The variables come from `.env` and `.env.deploy.<network>` in the repository root
+// (or in the directory that `TENDER_ENV_DIR` names), the network's winning, and the process's own
+// variables win over both, so that a host's settings override the files (`pnpm serve` reads its
+// environment the same way):
 //
 //   TENDER_CONTRACT       the Tender contract (the deploy writes it)
 //   TENDER_API_URL        where the Tender API is, named as the API's own PUBLIC_API_URL names it. The
@@ -64,7 +65,7 @@ import type { Solver } from "./types";
 // there. A message about the environment names variables and never shows a value: a value can be a
 // private key, or a URL with a key in it.
 
-/** The repository root, where the env files and the seeds are. */
+/** The repository root, where the seeds are, and the env files unless `TENDER_ENV_DIR` says another. */
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 /** How long the chain has to say what the agent's key may do. */
 const KEY_CHECK_DEADLINE_MS = 15_000;
@@ -188,6 +189,17 @@ function readEnvFile(path: string): Record<string, string> {
       (entry): entry is [string, string] => entry[1] !== undefined,
     ),
   );
+}
+
+/**
+ * Where `.env` and `.env.deploy.<network>` are: the directory `TENDER_ENV_DIR` names (a relative
+ * name is taken from the working directory), else the repository root. Empty counts as not set. A
+ * run that must not see the files of the repository, such as a test's, points it at one of its own;
+ * `scripts/lib/env.ts` reads the same variable the same way.
+ */
+export function envDirOf(processEnv: Env): string {
+  const set = (processEnv.TENDER_ENV_DIR ?? "").trim();
+  return set === "" ? REPO_ROOT : resolve(set);
 }
 
 /**
@@ -544,7 +556,10 @@ export interface CliOptions {
    * before the loop starts, and warns if that fails.
    */
   createApi: (config: RunConfig) => TenderApi;
-  /** Where `.env` and `.env.deploy.<network>` are. The repository root by default. */
+  /**
+   * Where `.env` and `.env.deploy.<network>` are. Default: `envDirOf` of `env`: the repository
+   * root, or the directory `TENDER_ENV_DIR` names.
+   */
   dir?: string;
   /** The process's variables, which win over the files. Default: `process.env`. */
   env?: Env;
@@ -703,7 +718,8 @@ export async function main(args: readonly string[], options: CliOptions): Promis
   }
   try {
     const parsed = parseCli(args);
-    const env = readEnv(options.dir ?? REPO_ROOT, parsed.network, options.env ?? process.env);
+    const processEnv = options.env ?? process.env;
+    const env = readEnv(options.dir ?? envDirOf(processEnv), parsed.network, processEnv);
     const config = readRunConfig(parsed, env);
     const { privateKey } = config.signer;
     secrets = [privateKey, privateKey.slice(privateKey.indexOf(":") + 1)];

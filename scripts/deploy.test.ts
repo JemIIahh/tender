@@ -17,6 +17,7 @@ import {
   bondTermsFor,
   type Deployment,
   deploy,
+  deploymentPath,
   laneLimit,
   loadTarget,
   main,
@@ -488,6 +489,23 @@ test("or_already_initialised_turns_e_initialized_into_null_and_keeps_every_other
       throw other;
     }),
   ).rejects.toBe(other);
+});
+
+test("read_deployment_reads_the_directory_tender_env_dir_names_when_given_no_dir", async () => {
+  const named = await dirWith({
+    "deployments/testnet.json": `${JSON.stringify(RECORD, null, 2)}\n`,
+  });
+  const empty = await dirWith({});
+  try {
+    vi.stubEnv("TENDER_ENV_DIR", named);
+    expect(deploymentPath("testnet")).toBe(join(named, "deployments", "testnet.json"));
+    expect(await readDeployment("testnet")).toEqual(RECORD);
+    // A directory with no record has none, whatever the repository root holds.
+    vi.stubEnv("TENDER_ENV_DIR", empty);
+    expect(await readDeployment("testnet")).toBeNull();
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });
 
 test("read_deployment_reads_the_record_of_a_network_and_rejects_a_damaged_one", async () => {

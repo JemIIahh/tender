@@ -485,6 +485,29 @@ test("the_target_comes_from_the_flag_then_the_environment_then_the_deploy_record
   });
 });
 
+test("with_no_repo_dir_the_target_is_read_from_the_directory_tender_env_dir_names", async () => {
+  await mkdir(join(dir, "deployments"), { recursive: true });
+  const record = {
+    network: "testnet",
+    contract: "tender.named.testnet",
+    tokens: { tusdc: "tusdc.named.testnet" },
+    accounts: { owner: "owner.testnet" },
+    wasmSha256: "ab".repeat(32),
+    deployHeight: "1",
+    deployedAt: "2026-11-01T00:00:00.000Z",
+  };
+  await writeFile(join(dir, "deployments", "testnet.json"), JSON.stringify(record));
+  await writeFile(join(dir, ".env"), "NEAR_RPC_URL=http://from-named-dir.example\n");
+
+  // The environment that the command is given names the directory: its `.env` and its record are
+  // read, and the repository's are not.
+  expect(await resolveTarget("testnet", undefined, { env: { TENDER_ENV_DIR: dir } })).toEqual({
+    network: "testnet",
+    contractId: "tender.named.testnet",
+    rpcUrl: "http://from-named-dir.example",
+  });
+});
+
 // ---- register ---------------------------------------------------------------------------------
 
 test("register_says_what_it_would_move_and_moves_nothing_on_a_no", async () => {
