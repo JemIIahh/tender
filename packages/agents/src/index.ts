@@ -18,6 +18,14 @@ export {
   type LeadSolver,
   type LeadSolverOptions,
 } from "./agents/lead";
+export { JOURNAL_LOCK_FILE, JournalLockedError } from "./agents/lead-lock";
+export {
+  createEntryCounts,
+  ENTRY_COUNTS_FILE,
+  type EntryCounts,
+  type EntryPolicy,
+  type VerifierRule,
+} from "./policy";
 export {
   type AgentChain,
   AgentMemory,

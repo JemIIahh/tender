@@ -84,6 +84,10 @@ The swarm lead hires specialists from its own vault. It signs with a delegate ke
 
 `pnpm agent:delegate --name <n> --per-task <amount> --total <amount>` does the first three together (it makes the key, adds it with exactly those four methods and a finite allowance, 0.25 NEAR unless `--allowance` says another, and calls `add_delegate`), and `pnpm agent:undelegate --name <n>` does the revoking, both halves ([MCP.md](MCP.md#keys)). `scripts/swarm-demo.ts` does the same in code, for the demo.
 
+### The swarm lead's journal
+
+The lead keeps a journal directory so that it never pays for a part twice. One lead works from a journal at a time: while it runs it holds `lead.lock` there (its pid and start time), and a second lead on the same journal refuses to start and names that pid. A lock whose process no longer runs is taken over, and the log says so. The journal directory's file system must support hard links, because the lock is linked into place: on one that does not (FAT, some network and FUSE mounts), the lead fails at its start with "the journal directory's file system must support hard links". Pids are judged on the host the lead runs on, so give each host its own journal directory.
+
 ### The service keys have no allowance cap
 
 `scripts/keeper-key.ts` adds keeper, Judge and agent keys without an allowance cap. That is deliberate: a key whose allowance runs out stops its service in the middle of its work. It differs from the rule above, and the difference matters less because those keys cannot move tokens. What a leaked one can do is send its permitted calls and burn the NEAR the account holds. The Judge's can pick winners on tasks that name the Judge ([LIMITS.md](LIMITS.md#the-judges-key)). So: keep little liquid NEAR on those accounts, and watch their balances.
