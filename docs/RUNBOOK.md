@@ -47,7 +47,7 @@ The steps below are in dependency order. The script runs the owner's calls, Tend
 
 After it finishes, compare the wasm hash in `deployments/testnet.json` with the `tender.wasm` line in `contract/res/SHA256SUMS`. A match shows that the deployed binary is the committed one. It does not show that the committed binary was built from these sources: a rebuild on another machine gives different bytes ([LIMITS.md](LIMITS.md#not-built)).
 
-Then bring the README up to date with the deployment: the contract badge and link, the key links, and the "On testnet today" steps under Try it, each with real output from the deployed network and nothing else. What comes with hosting (the site, the API address, the seed tasks) is marked so there until it is up.
+Then bring the README up to date with the deployment: the contract badge and link, the key links, the Deployed addresses table (every account, the wasm sha256, the deploy date and height, from `deployments/testnet.json`), and the "On testnet today" steps under Try it, each with real output from the deployed network and nothing else. What waits on hosting (the site, the API address, the seed tasks) says "comes with hosting" there until it is up.
 
 Back up `.env.deploy.testnet`. It holds the only copy of every full-access key the script made, including the one that can redeploy the contract ([LIMITS.md](LIMITS.md#the-upgrade-key)). Do not copy it to a host that runs a service.
 
