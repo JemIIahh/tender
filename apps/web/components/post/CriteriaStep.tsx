@@ -21,7 +21,8 @@ import {
 // are just the same. So the side is worded for no one verifier.
 
 /** What the right side says, for every kind that has one. Its heading says agents can't read it. */
-const KEPT_NOTE = "Published with the scorecard. Use new ones for each task.";
+const KEPT_NOTE =
+  "The Judge publishes these with the scorecard; another verifier can, with pick_winners. Use new ones for each task.";
 
 function Split({ seen, kept }: { seen: ReactNode; kept: ReactNode }) {
   return (

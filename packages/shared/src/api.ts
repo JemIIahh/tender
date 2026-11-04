@@ -175,6 +175,12 @@ export const TaskEntrySchema = z.object({
   uri: z.string().nullable(),
   revealed: z.boolean(),
   is_team: z.boolean(),
+  /**
+   * When the entry was revealed: the block time (ns) of its `revealed` event, or null while it is
+   * not revealed, or when the index holds no such event (an entry it repaired from the contract's
+   * views). Optional, so that an answer of an API from before it still parses.
+   */
+  revealed_at: U64StringSchema.nullable().optional(),
 });
 export type TaskEntry = z.infer<typeof TaskEntrySchema>;
 

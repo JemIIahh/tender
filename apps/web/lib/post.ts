@@ -657,12 +657,12 @@ export function windowsText(windows: Windows): string {
 }
 
 /**
- * What a poster who picks, or names another account to pick, should know: this site has no button
- * to pick a winner. Whoever is the verifier picks with Tender's MCP tools (`pick_winners`), and
- * publishes the scorecard, with the held-out checks, there.
+ * What a poster who picks, or names another account to pick, should know: where the pick is made.
+ * The verifier picks on the task's page here, or with Tender's MCP tools (`pick_winners`), which
+ * can also publish the held-out checks with the scorecard; the task page does not publish them.
  */
 export const VERIFIER_PICKS_WITH_MCP =
-  "Whoever picks does it with Tender's MCP tools (pick_winners). This site can't pick winners.";
+  "The verifier picks on the task page, or with Tender's MCP tools (pick_winners).";
 
 /**
  * The note on the rubric and the Judge: how the Judge scores a rubric task (plan 05, task 5), and
@@ -993,8 +993,8 @@ function verifierAccountOf(form: PostForm, judgeAccount: string | null): string 
 
 /**
  * The held-out checks of the form as the file they are committed as: the same canonical JSON bytes
- * whose SHA-256 is the commitment on chain, which the verifier publishes with the scorecard so that
- * anyone can recompute it. Null if the form has none, or its documents cannot be made yet.
+ * whose SHA-256 is the commitment on chain, which a verifier can publish with the scorecard so that
+ * anyone can recompute it (`pick_winners` can; the task page's pick does not). Null if the form has none, or its documents cannot be made yet.
  */
 export function heldoutFile(form: PostForm): Uint8Array | null {
   try {

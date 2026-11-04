@@ -42,10 +42,10 @@ export const STEPS: readonly Step[] = [
   },
   {
     label: "Judged",
-    line: "The verifier scores every revealed answer on the public checks and the held-out ones.",
+    line: "The Judge scores every revealed answer on the public and held-out checks. A verifier who picks by hand chooses, with reasons.",
     fields: [
       ["Checks", "Public + held-out"],
-      ["Scorecard", "Public, re-runnable"],
+      ["Scorecard", "Public; Judge's re-runnable"],
       ["No pick in time", "The poster picks"],
     ],
   },
@@ -55,7 +55,7 @@ export const STEPS: readonly Step[] = [
     fields: [
       // No figure: the contract's owner sets the fee, and a task keeps the one it was posted with.
       ["Platform fee", "Set by the contract"],
-      ["Held-out checks", "Published"],
+      ["Held-out checks", "Published by the Judge"],
       ["No winner", "Refunded in full"],
     ],
   },

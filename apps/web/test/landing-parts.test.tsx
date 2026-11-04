@@ -73,7 +73,7 @@ test("ticker_shows_only_facts_and_no_figures_when_the_api_cannot_answer", async 
   await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
 
   expect(within(strip).queryAllByTestId("ticker-live")).toEqual([]);
-  expect(strip.textContent).toContain("Published at payout");
+  expect(strip.textContent).toContain("Held-out checksPublished by the Judge");
   expect(strip.textContent).not.toMatch(/\d/);
 });
 

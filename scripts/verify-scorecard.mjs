@@ -13,8 +13,17 @@
 // The first line shows that the held-out checks published in the scorecard are the checks the
 // poster committed to on chain before any agent worked. It does not show that the verifier scored
 // with them: to see that, run the checks against the revealed entries and compare the scores. A
-// task with no held-out part says so. Exit code 0 when everything that exists matches, 1
-// when something does not, 2 when it could not look.
+// task with no held-out part says so. So does a scorecard that publishes no held-out checks for a
+// task that committed to some: its verifier chose not to publish them (a pick made by hand on the
+// web app's task page publishes none), and the pick cannot be re-run against them.
+//
+// It prints one verdict, and exits with its code:
+//   0  VERIFIED       everything that exists matches;
+//   1  MISMATCH       a hash does not: the scorecard served, or the held-out checks it publishes,
+//                     are not what the chain committed to;
+//   2                 it could not look (a usage error, a node or an API that did not answer);
+//   3  NOT PUBLISHED  the scorecard is the one the chain pinned, but it publishes no held-out
+//                     checks for a task that committed to some.
 //
 // Canonical JSON is RFC 8785 for the data JSON holds: keys sorted by UTF-16 code unit, no
 // whitespace, numbers and strings as `JSON.stringify` writes them. The function below is the
@@ -51,7 +60,8 @@ const usage = (problem) => {
   process.exit(2);
 };
 
-// An unknown flag, or a flag with no value, is a usage error (exit 2): exit 1 means MISMATCH.
+// An unknown flag, or a flag with no value, is a usage error (exit 2): exit 1 means MISMATCH, and 3
+// NOT PUBLISHED.
 let values;
 try {
   ({ values } = parseArgs({
@@ -133,20 +143,36 @@ try {
     console.log(`${label.padEnd(28)}${value}${verdict}`);
   };
 
+  // A held-out part the chain committed to, which the scorecard does not publish: no documents that
+  // differ, but nothing to compare either, as long as the scorecard itself is the one pinned.
+  let unpublished = false;
   if (task.heldout_commitment === null) {
     console.log("this task has no held-out part (heldout_commitment is null on chain)");
     if (card.heldout !== null) {
       console.log("the scorecard shows one all the same");
       ok = false;
     }
+  } else if (card.heldout === null) {
+    show("chain  heldout_commitment", task.heldout_commitment);
+    show("card   heldout", "null (not published)");
+    unpublished = true;
   } else {
     show("chain  heldout_commitment", task.heldout_commitment);
     show("card   sha256(heldout)", sha256(canonical(card.heldout)), task.heldout_commitment);
   }
   show("chain  scorecard_hash", task.outcome.scorecard_hash);
   show("api    sha256(scorecard)", sha256(bytes), task.outcome.scorecard_hash);
-  console.log(ok ? "VERIFIED" : "MISMATCH");
-  process.exit(ok ? 0 : 1);
+  if (!ok) {
+    console.log("MISMATCH");
+    process.exit(1);
+  }
+  if (unpublished) {
+    console.log("the verifier did not publish the held-out checks; this pick can't be re-run");
+    console.log("NOT PUBLISHED");
+    process.exit(3);
+  }
+  console.log("VERIFIED");
+  process.exit(0);
 } catch (error) {
   console.error(`could not check: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(2);

@@ -12,6 +12,9 @@ import {
   BoardTextSchema,
   BriefSchema,
   canonicalJson,
+  checkPickOnTask,
+  checkPickScorecard,
+  checkPickShares,
   computeCommitment,
   DelegateViewSchema,
   HeldoutSchema,
@@ -22,17 +25,20 @@ import {
   heldoutMatchesCriteria,
   hireDocuments,
   hireTerms,
-  isJudgeBranded,
   MAX_RESULT_BYTES,
   NETWORKS,
   type NetworkId,
   type Phase,
+  PICK_BPS_WHOLE,
+  PickRefusal,
+  type PickWording,
   ProfileSchema,
   PublicCriteriaSchema,
   randomSalt,
   type Scorecard,
   ScorecardSchema,
   STORAGE_MIN_DEPOSIT,
+  scorecardUpload,
   sha256Hex,
   storageShortfall,
   tokenMeta,
@@ -169,7 +175,7 @@ const REFUSED_FOR_GOOD: ReadonlySet<string> = new Set([
 /** How long the reason stored with a retired draft may be. */
 const MAX_REASON = 300;
 /** What the winners' shares of a pick add up to, in basis points. */
-const BPS_WHOLE = 10_000;
+const BPS_WHOLE = PICK_BPS_WHOLE;
 /**
  * Why the chain holds no entry for a draft of a settled task: the contract's `cleanup` removes the
  * entries of a settled task, and the keeper calls it. The answers that a draft gives then say so.
@@ -582,8 +588,12 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
    * A tool calls this before its first upload and its first payment, so a refusal means that nothing
    * was uploaded, sent or paid. The answer never says which secret, or where in the document.
    */
-  function bytesToPublish(what: string, tool: string, document: unknown): Uint8Array {
-    const bytes = canonicalJson(document);
+  function bytesToPublish(
+    what: string,
+    tool: string,
+    document: unknown,
+    bytes: Uint8Array = canonicalJson(document),
+  ): Uint8Array {
     if (holdsSecret(bytes) || holdsSecret(documentText(document))) {
       throw new ToolError(
         "SECRET_IN_CONTENT",
@@ -2041,82 +2051,39 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
 
   // ---- pick_winners ---------------------------------------------------------------------------
 
+  /** The MCP's words in the shared refusals: an agent calls a tool again, and reads get_scorecard. */
+  const PICK_WORDING: PickWording = {
+    retry: "call again",
+    notReused: "the Judge's from get_scorecard included",
+  };
+
   /**
-   * What a pick must satisfy before the scorecard goes up, checked in one place so that a pick
-   * the API or the chain would refuse is refused here, with the reason, before anything is sent.
-   *
-   * The scorecard must rest on its task: the API refuses a card whose `criteria_hash` or
-   * `heldout_commitment` is not the task's when it is uploaded, and would not show one that was
-   * stored. Those two come from the task the API lists, the same one that lists the entries. This
-   * is read for an empty pick as well, since its scorecard goes up all the same.
-   *
-   * Then the contract's rules for a non-empty pick (`E_WINNERS`, in `check_winners`): the shares
-   * add up to exactly 10,000, no account is named twice, the task pays that many winners, and
-   * each winner has a revealed entry. The shares and names are the arguments' own. A pick that
-   * the chain then refused would still leave the scorecard public.
+   * Runs the shared checks of a pick (`checkPickScorecard`, `checkPickShares`, `checkPickOnTask` in
+   * @tender/shared), which the web app's pick runs too, and answers a refusal with its code.
+   */
+  function pickRule<T>(check: () => T): T {
+    try {
+      return check();
+    } catch (error) {
+      if (error instanceof PickRefusal) throw new ToolError(error.code, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * What a pick must satisfy before the scorecard goes up, so that a pick the API or the chain
+   * would refuse is refused here, with the reason, before anything is sent: the shares and names
+   * first, then the task the API lists, the same one that lists the entries. The task is read for
+   * an empty pick as well, since its scorecard goes up all the same.
    */
   async function checkPick(
     taskId: string,
     winners: ReadonlyArray<{ account: string; bps: number }>,
     card: Scorecard,
   ): Promise<void> {
-    if (winners.length > 0) {
-      const total = winners.reduce((sum, winner) => sum + winner.bps, 0);
-      if (total !== BPS_WHOLE) {
-        throw new ToolError(
-          "INVALID_WINNERS",
-          `the shares add up to ${total}, and they must add up to exactly ${BPS_WHOLE}`,
-        );
-      }
-      const named = new Set<string>();
-      for (const { account } of winners) {
-        if (named.has(account)) {
-          throw new ToolError("INVALID_WINNERS", `${account} is named more than once`);
-        }
-        named.add(account);
-      }
-    }
-
+    pickRule(() => checkPickShares(winners));
     const detail = await api.getTask(BigInt(taskId));
-    if (detail === null) {
-      throw new ToolError("NO_TASK", `the API has no task ${taskId}, so there is nothing to pick`);
-    }
-    if (card.criteria_hash !== detail.task.criteria_hash) {
-      throw new ToolError(
-        "SCORECARD_MISMATCH",
-        `the scorecard's criteria_hash is not task ${taskId}'s (${detail.task.criteria_hash}): ` +
-          "copy it from the task. The API would refuse the scorecard, and would not show one " +
-          "that is picked with",
-      );
-    }
-    if (card.heldout_commitment !== detail.task.heldout_commitment) {
-      throw new ToolError(
-        "SCORECARD_MISMATCH",
-        `the scorecard's heldout_commitment is not task ${taskId}'s ` +
-          `(${detail.task.heldout_commitment ?? "null: the task has no held-out part"}): copy it ` +
-          "from the task. The API would refuse the scorecard, and would not show one that is " +
-          "picked with",
-      );
-    }
-    if (winners.length === 0) return;
-
-    const most = detail.task.max_winners;
-    if (winners.length > most) {
-      throw new ToolError(
-        "INVALID_WINNERS",
-        `task ${taskId} pays at most ${most} winners, and ${winners.length} were named`,
-      );
-    }
-    for (const { account } of winners) {
-      if (!detail.entries.some((entry) => entry.account === account && entry.revealed)) {
-        throw new ToolError(
-          "INVALID_WINNERS",
-          `${account} has no revealed entry in task ${taskId}, as far as the API knows. Only an ` +
-            "account that revealed can win; if it revealed a moment ago, the index may not have " +
-            "caught up yet, so wait a few seconds and call again",
-        );
-      }
-    }
+    pickRule(() => checkPickOnTask(detail, { taskId, winners, card }, PICK_WORDING));
   }
 
   server.registerTool(
@@ -2167,47 +2134,24 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       requireKeyFor("pick_winners", "pick");
       const card = ScorecardSchema.safeParse(scorecard);
       if (!card.success) throw new ToolError("INVALID_SCORECARD", issuesOf(card.error));
-      if (card.data.task_id !== task_id) {
-        throw new ToolError(
-          "SCORECARD_MISMATCH",
-          `the scorecard is for task ${card.data.task_id}, not task ${task_id}`,
-        );
-      }
-      // The API holds these two fields to the uploader as well (P03-R29): they are checked here first.
-      if (card.data.verifier !== accountId) {
-        throw new ToolError(
-          "SCORECARD_MISMATCH",
-          `the scorecard names ${card.data.verifier} as its verifier, but this server picks as ` +
-            `${accountId}, and a scorecard is published in the name of the account that picks ` +
-            "with it. Make your own, naming you as its verifier; do not reuse another's, the " +
-            "Judge's from get_scorecard included",
-        );
-      }
-      // The name is only a brand, and what the API holds to the Judge's account (P03-R29). Whose the
-      // scorecard is, is the account that it names, and never what its software is called.
-      if (isJudgeBranded(card.data.judge.software) && card.data.verifier !== deps.judgeAccount) {
-        throw new ToolError(
-          "SCORECARD_MISMATCH",
-          "the scorecard's judge.software names the Tender Judge (tender-judge, in any case and " +
-            "with or without punctuation), which only the Judge's account may use: name your own " +
-            "software",
-        );
-      }
-      const same =
-        card.data.winners.length === winners.length &&
-        card.data.winners.every(
-          (winner, index) =>
-            winner.account === winners[index]?.account && winner.bps === winners[index]?.bps,
-        );
-      if (!same) {
-        throw new ToolError(
-          "SCORECARD_MISMATCH",
-          "winners must be the scorecard's winners, in order",
-        );
-      }
+      // The API holds the verifier and the Judge's name to the uploader as well (P03-R29): they are
+      // checked here first, with the same rules as the web app's pick.
+      pickRule(() =>
+        checkPickScorecard(
+          card.data,
+          { taskId: task_id, picker: accountId, judgeAccount: deps.judgeAccount, winners },
+          PICK_WORDING,
+        ),
+      );
       // A scorecard is public and cannot be taken back, so it is looked at for the server's secrets
-      // before anything is asked of the API, let alone published.
-      const scorecardBytes = bytesToPublish("scorecard", "pick_winners", card.data);
+      // before anything is asked of the API, let alone published. The bytes are the shared ones
+      // (`scorecardUpload`), which the web app's pick uploads too.
+      const scorecardBytes = bytesToPublish(
+        "scorecard",
+        "pick_winners",
+        card.data,
+        scorecardUpload(card.data).bytes,
+      );
       await checkPick(task_id, winners, card.data);
 
       const doc = await uploadDocument("scorecard", scorecardBytes);

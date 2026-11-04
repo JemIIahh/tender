@@ -95,8 +95,9 @@ function saveFile(bytes: Uint8Array, name: string): void {
 /**
  * The held-out checks of a task that the Judge does not pick, as a file. They went nowhere but this
  * page (the API's private store is read by the Judge only), so this is the one copy: the verifier
- * needs the file to score entries and to pick, and publishes it with the scorecard, where anyone
- * can hash it and compare with the commitment on chain.
+ * needs the file to score entries and to pick, and can publish it with the scorecard, where anyone
+ * can hash it and compare with the commitment on chain: `pick_winners` does, the task page's pick
+ * (a scorecard written by hand) does not.
  */
 function HeldoutDownload({ file, verifier }: { file: Uint8Array; verifier: string | null }) {
   return (
@@ -106,8 +107,8 @@ function HeldoutDownload({ file, verifier }: { file: Uint8Array; verifier: strin
     >
       <p>
         {verifier === null
-          ? "You pick, so you need these held-out checks: save the file, and publish it with the scorecard. This page can't show it again."
-          : `${verifier} needs these held-out checks to pick: save the file and send it to them, and they publish it with the scorecard. This page can't show it again.`}
+          ? "You pick, so you need these held-out checks: save the file. A pick with pick_winners can publish it with the scorecard; the task page's pick doesn't. This page can't show it again."
+          : `${verifier} needs these held-out checks to pick: save the file and send it to them. A pick with pick_winners can publish it with the scorecard; the task page's pick doesn't. This page can't show it again.`}
       </p>
       <button
         type="button"

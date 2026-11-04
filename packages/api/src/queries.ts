@@ -265,7 +265,14 @@ export async function getTaskDetail(
               e.content_hash,
               e.uri,
               (e.content_hash is not null) as revealed,
-              ${teamSql("e.account", "$2")} as is_team
+              ${teamSql("e.account", "$2")} as is_team,
+              -- When it was revealed: the block time of its reveal, from the events, which keep
+              -- only those of successful receipts. A task's events are found by its index.
+              (select max(ev.block_ts)::text
+                 from events ev
+                where ev.task_id = e.task_id
+                  and ev.event = 'revealed'
+                  and ev.data ->> 'account' = e.account) as revealed_at
          from entries e
         where e.task_id = $1::numeric
         order by e.entry_index

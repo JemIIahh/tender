@@ -11,6 +11,7 @@ export * from "./events";
 export * from "./format";
 export * from "./hash";
 export * from "./phase";
+export * from "./pick";
 export * from "./profile";
 export * from "./rubric";
 export * from "./scorecard";

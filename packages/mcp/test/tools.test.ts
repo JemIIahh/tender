@@ -33,6 +33,7 @@ import {
   canonicalJson,
   computeCommitment,
   type EntryView,
+  handPickedScorecard,
   NETWORKS,
   type PublicCriteria,
   type Scorecard,
@@ -3719,6 +3720,98 @@ test("pick_winners_pays_a_split_that_the_contract_takes", async () => {
     winners,
     expect.stringMatching(HEX64),
     expect.any(String),
+  );
+});
+
+/**
+ * The SHA-256 of the scorecard of the pick by hand below, as packages/shared/test/pick.test.ts pins
+ * it for the same input, and as the web app's task page uploads it (apps/web/test/pick.test.ts).
+ */
+const HAND_PICK_HASH = "54ad6282bb3f35bdea6c7e6f77a3b2bde7576298e19ec3e785f797afb2942eb1";
+
+test("pick_winners_refusals_speak_to_an_agent", async () => {
+  // The rules are shared with the web app; the words of what to do next are the MCP's own.
+  const mismatch = await connectWrite();
+  mismatch.api.getTask.mockResolvedValue(revealedBy([ACCOUNT]));
+  const winners = [{ account: ACCOUNT, bps: 10_000 }];
+  const other = await mismatch.call("pick_winners", {
+    task_id: "7",
+    winners,
+    scorecard: { ...SCORECARD, verifier: OTHER },
+  });
+  expect(other.text).toMatch(/^SCORECARD_MISMATCH: /);
+  expect(other.text).toContain("do not reuse another's, the Judge's from get_scorecard included");
+
+  const lagging = await connectWrite();
+  lagging.api.getTask.mockResolvedValue(makeDetail([makeEntry(ACCOUNT, { revealed: false })]));
+  const late = await lagging.call("pick_winners", { task_id: "7", winners, scorecard: SCORECARD });
+  expect(late.text).toMatch(/^INVALID_WINNERS: .*wait a few seconds and call again$/);
+});
+
+test("pick_winners_publishes_a_pick_by_hand_as_the_bytes_the_web_app_publishes", async () => {
+  // The web app writes a person's pick with `handPickedScorecard` and uploads it with
+  // `scorecardUpload`, both of @tender/shared. The same scorecard sent through this tool has to go
+  // up as the same bytes, and be picked with the same hash: if either side wrote or uploaded it
+  // another way, the hash pinned here would differ.
+  const { callJson, chain, api } = await connectWrite({ accountId: POSTER });
+  api.getTask.mockResolvedValue(revealedBy([ACCOUNT, OTHER], { max_winners: 2 }));
+  const winners = [
+    { account: OTHER, bps: 6_000 },
+    { account: ACCOUNT, bps: 4_000 },
+  ];
+  const scorecard = handPickedScorecard({
+    taskId: "7",
+    picker: POSTER,
+    kind: "regex_cases",
+    minScore: 80,
+    criteriaHash: "22".repeat(32),
+    heldoutCommitment: "33".repeat(32),
+    entries: [
+      {
+        account: OTHER,
+        content_hash: "bb".repeat(32),
+        uri: `http://api.test/v1/blobs/${"bb".repeat(32)}`,
+        committed_height: "120",
+        revealed: true,
+      },
+      {
+        account: ACCOUNT,
+        content_hash: "aa".repeat(32),
+        uri: `http://api.test/v1/blobs/${"aa".repeat(32)}`,
+        committed_height: "120",
+        revealed: true,
+      },
+      {
+        account: "carol.testnet",
+        content_hash: null,
+        uri: null,
+        committed_height: "100",
+        revealed: false,
+      },
+      {
+        account: "dave.testnet",
+        content_hash: "cc".repeat(32),
+        uri: `http://api.test/v1/blobs/${"cc".repeat(32)}`,
+        committed_height: "90",
+        revealed: true,
+      },
+    ],
+    winners,
+    reasons: { [ACCOUNT]: "  Covers every case.  ", "dave.testnet": "" },
+    now: new Date("2026-11-04T10:00:00.000Z"),
+  });
+
+  await callJson("pick_winners", { task_id: "7", winners, scorecard });
+
+  const [[uploaded]] = api.uploadBlob.mock.calls as [[BlobUpload]];
+  expect(uploaded.kind).toBe("scorecard");
+  expect(uploaded.contentType).toBe("application/json");
+  expect(sha256Hex(uploaded.bytes)).toBe(HAND_PICK_HASH);
+  expect(chain.pick).toHaveBeenCalledExactlyOnceWith(
+    7n,
+    winners,
+    HAND_PICK_HASH,
+    `${BLOBS}/${HAND_PICK_HASH}`,
   );
 });
 

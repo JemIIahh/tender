@@ -3,10 +3,31 @@ import { readFileSync } from "node:fs";
 // What the setup of the chain suite tells its specs. The setup writes it to a file in the run's own
 // temp dir (never to the repository) and sets RUN_FILE_VARIABLE to the file's path; the workers
 // that run the specs inherit the variable, and read the file here. No key is in it: the specs act
-// through the page, and read the chain and the API, which need none.
+// through the page, and read the chain and the API, which need none. The one exception is the
+// spec of the task page's actions, which posts tasks and enters them as an agent: the keys of the
+// poster and of alice, accounts of a chain that lives as long as the run, are handed over in the
+// environment (SIGNERS_VARIABLE) and never written to a file.
 
 /** The variable that holds the path of the run's file. */
 export const RUN_FILE_VARIABLE = "TENDER_CHAIN_E2E_RUN_FILE";
+
+/** The variable that holds the poster's and alice's signers, as JSON. */
+export const SIGNERS_VARIABLE = "TENDER_CHAIN_E2E_SIGNERS";
+
+/** An account of the run's chain and its key, as `@tender/client` signs with one. */
+export interface RunSigner {
+  accountId: string;
+  privateKey: string;
+}
+
+/** The poster's and alice's signers. Throws, naming the variable, where there are none. */
+export function loadSigners(): { poster: RunSigner; alice: RunSigner } {
+  const text = process.env[SIGNERS_VARIABLE];
+  if (text === undefined || text === "") {
+    throw new Error(`${SIGNERS_VARIABLE} is not set: the specs run only after the global setup`);
+  }
+  return JSON.parse(text) as { poster: RunSigner; alice: RunSigner };
+}
 
 /**
  * The port of the web server: `WEB_PORT`, as the fixture suite reads it, and 3000 if it is not set.
