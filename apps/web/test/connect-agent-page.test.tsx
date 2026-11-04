@@ -1,0 +1,655 @@
+import { connectFingerprint, SIGN_IN_MESSAGE } from "@tender/shared";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { AddAgentView } from "../components/account/AddAgentView";
+import { clearApiToken } from "../lib/auth";
+import { createWalletStore, type SigningWallet, type WalletStore } from "../lib/wallet";
+import { fakeProvider } from "./walletDoubles";
+
+// "Connect your agent", the top of "Add an agent", as a person goes through it: the real hook, the
+// real store and the real sign-in, over a wallet that signs a message and sends batches, a fake API
+// that makes connect codes and says how they stand, and a fake node that answers the page's reads.
+// The agent itself is the test: it attaches its PUBLIC key to the code and registers by changing
+// what the API says. vitest.config.ts gives the config http://api.test, http://rpc.test, testnet and
+// the contract tender.testnet.
+
+const ALICE = "alice.testnet";
+const AGENT = `writer.${ALICE}`;
+const CONTRACT = "tender.testnet";
+const TOKEN = "tusdc.tender-team.testnet";
+const BOND = 5_000_000n;
+const CODE = "tc_abcdefghijklmnopqrstuvwxyz";
+const ID = "Q0RFRkdISUpLTE1OT1BRUg";
+const PUBLIC = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp";
+const NONCE = btoa(String.fromCharCode(...Array.from({ length: 32 }, (_, i) => i + 1)));
+
+const holder = vi.hoisted(() => ({ store: undefined as unknown as WalletStore }));
+vi.mock("../lib/wallet", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/wallet")>();
+  return {
+    ...actual,
+    useWallet: () => actual.useWalletStore(holder.store),
+    useAccountActions: () => actual.accountActionsOf(holder.store),
+  };
+});
+
+const CONSOLE = ["error", "warn", "log", "info", "debug"] as const;
+
+beforeEach(() => {
+  for (const method of CONSOLE) vi.spyOn(console, method).mockImplementation(() => {});
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+  clearApiToken();
+  sessionStorage.clear();
+  localStorage.clear();
+});
+
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+
+/** The API, the chain and the agent, as the test moves them. */
+interface World {
+  /** Accounts on the chain, with their full-access keys. */
+  accounts: Map<string, string[]>;
+  /** Accounts with a storage balance with Tender. */
+  storage: Set<string>;
+  /** Vault balances of the bond's token. */
+  vault: Map<string, bigint>;
+  /** Wallet balances of the bond's token. */
+  wallet: Map<string, bigint>;
+  /** The contract's config view. */
+  config: Record<string, unknown>;
+  /** The code, once made, as the API holds it. */
+  code: {
+    name: string;
+    attached: string | null;
+    expired: boolean;
+    agent: null | { status: string };
+    registeredAt: string | null;
+  } | null;
+  /** How many codes were made. */
+  made: number;
+  /** How many of the next deposits of the bond the token fails. */
+  failDeposits: number;
+  /** A refusal for the next code, in place of a code. */
+  refuseCode: Response | null;
+  /** What `GET /v1/connect/codes/:id` answers with in place of the state, while set. */
+  readStatus: number | null;
+  /** `METHOD /path` of every request to the API, and `RPC <what> <account>` of every read. */
+  requests: string[];
+  /** Every request body, as text. */
+  bodies: string[];
+  /** The Authorization of each request to the connect routes. */
+  authorizations: (string | null)[];
+}
+
+function world(): World {
+  return {
+    accounts: new Map([[ALICE, []]]),
+    storage: new Set(),
+    vault: new Map(),
+    wallet: new Map([[ALICE, 20_000_000n]]),
+    config: {
+      owner: CONTRACT,
+      agent_bond_token: TOKEN,
+      agent_bond_amount: BOND.toString(),
+      agent_bond_cooldown_secs: "604800",
+    },
+    code: null,
+    made: 0,
+    failDeposits: 0,
+    refuseCode: null,
+    readStatus: null,
+    requests: [],
+    bodies: [],
+    authorizations: [],
+  };
+}
+
+const rpcMissing = (name: string) =>
+  json({
+    jsonrpc: "2.0",
+    id: "x",
+    error: { name: "HANDLER_ERROR", cause: { name, info: {} }, data: "does not exist" },
+  });
+const rpcValue = (value: unknown) =>
+  json({
+    jsonrpc: "2.0",
+    id: "x",
+    result: { result: [...new TextEncoder().encode(JSON.stringify(value))], logs: [] },
+  });
+
+/** `fetch`, answered from `state`. */
+function serve(state: World): void {
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const url = new URL(String(input));
+    if (init.body !== undefined) state.bodies.push(String(init.body));
+    if (url.origin === "http://rpc.test") {
+      const { params } = JSON.parse(String(init.body)) as { params: Record<string, string> };
+      const account = params.account_id ?? "";
+      if (params.request_type === "view_account") {
+        state.requests.push(`RPC view_account ${account}`);
+        return state.accounts.has(account)
+          ? json({ jsonrpc: "2.0", id: "x", result: { amount: "1" } })
+          : rpcMissing("UNKNOWN_ACCOUNT");
+      }
+      if (params.request_type === "view_access_key") {
+        return (state.accounts.get(account) ?? []).includes(params.public_key ?? "")
+          ? json({ jsonrpc: "2.0", id: "x", result: { nonce: 0, permission: "FullAccess" } })
+          : rpcMissing("UNKNOWN_ACCESS_KEY");
+      }
+      const args = JSON.parse(atob(params.args_base64 ?? "") || "{}") as { account_id?: string };
+      const who = args.account_id ?? "";
+      state.requests.push(`RPC ${params.method_name} ${who}`);
+      switch (params.method_name) {
+        case "get_config":
+          return rpcValue(state.config);
+        case "storage_balance_of":
+          return rpcValue(
+            state.storage.has(who)
+              ? { total: "20000000000000000000000", available: "17000000000000000000000" }
+              : null,
+          );
+        case "balance_of":
+          return rpcValue((state.vault.get(who) ?? 0n).toString());
+        case "ft_balance_of":
+          return rpcValue((state.wallet.get(who) ?? 0n).toString());
+        default:
+          return rpcValue(null);
+      }
+    }
+    const method = init.method ?? "GET";
+    state.requests.push(`${method} ${url.pathname}`);
+    if (url.pathname === "/v1/auth/challenge") {
+      return json({
+        nonce: NONCE,
+        message: SIGN_IN_MESSAGE,
+        recipient: "http://api.test",
+        expires_at: "2099-01-01T00:00:00.000Z",
+      });
+    }
+    if (url.pathname === "/v1/auth/verify") {
+      return json({
+        token: "t".repeat(43),
+        expires_at: "2099-01-01T00:00:00.000Z",
+        key_kind: "full_access",
+      });
+    }
+    if (url.pathname.startsWith("/v1/connect/")) {
+      state.authorizations.push(new Headers(init.headers).get("Authorization"));
+    }
+    if (url.pathname === "/v1/connect/codes" && method === "POST") {
+      if (state.refuseCode !== null) return state.refuseCode;
+      const { name } = JSON.parse(String(init.body)) as { name: string };
+      state.made++;
+      state.code = { name, attached: null, expired: false, agent: null, registeredAt: null };
+      return json({
+        id: ID,
+        code: CODE,
+        owner: ALICE,
+        name,
+        account_id: `${name}.${ALICE}`,
+        expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+      });
+    }
+    if (url.pathname === `/v1/connect/codes/${ID}` && state.code !== null) {
+      if (state.readStatus !== null) {
+        return json({ error: "unauthorized", message: "sign in" }, state.readStatus);
+      }
+      const { code } = state;
+      return json({
+        id: ID,
+        owner: ALICE,
+        name: code.name,
+        account_id: `${code.name}.${ALICE}`,
+        state: code.registeredAt
+          ? "registered"
+          : code.attached
+            ? "attached"
+            : code.expired
+              ? "expired"
+              : "waiting",
+        created_at: "2026-11-04T10:00:00.000Z",
+        expires_at: "2026-11-04T10:30:00.000Z",
+        public_key: code.attached,
+        fingerprint: code.attached === null ? null : connectFingerprint(code.attached),
+        attached_at: code.attached === null ? null : "2026-11-04T10:01:00.000Z",
+        registered_at: code.registeredAt,
+        agent:
+          code.agent === null
+            ? null
+            : { status: code.agent.status, bond_token: TOKEN, bond_amount: BOND.toString() },
+      });
+    }
+    return json({ error: "not_found", message: "no such route" }, 404);
+  });
+}
+
+/** A transaction the wallet was asked to send, as it got it. */
+interface Sent {
+  receiverId: string;
+  actions: Array<{ type: string; params?: Record<string, unknown> }>;
+}
+
+/**
+ * Alice's wallet, which signs a message (the sign-in) and runs what it is sent on `state`: an
+ * account with the key it adds, Tender's storage for the account named, and a deposit of the bond
+ * token into the vault it names, once that account has storage (`failDeposits` of them fail).
+ * `accountActions: false` is a wallet whose manifest says it can't send whole transactions;
+ * `signMessage: false` can't sign in.
+ */
+function aliceWallet(
+  state: World,
+  options: { accountActions?: boolean; signMessage?: boolean } = {},
+) {
+  const batches: Sent[][] = [];
+  const signed: string[] = [];
+  const wallet: SigningWallet = {
+    manifest: {
+      features: {
+        signMessage: options.signMessage ?? true,
+        signAndSendTransactions: options.accountActions ?? true,
+      },
+    },
+    async signAndSendTransactions({ transactions }) {
+      const batch = transactions as unknown as Sent[];
+      batches.push(batch);
+      const outcomes: unknown[] = [];
+      for (const [index, transaction] of batch.entries()) {
+        let failed = false;
+        for (const action of transaction.actions) {
+          const params = action.params ?? {};
+          if (action.type === "AddKey") {
+            const keys = state.accounts.get(transaction.receiverId) ?? [];
+            state.accounts.set(transaction.receiverId, [...keys, String(params.publicKey)]);
+          }
+          if (action.type === "CreateAccount") state.accounts.set(transaction.receiverId, []);
+          if (action.type !== "FunctionCall") continue;
+          const args = params.args as Record<string, string>;
+          if (params.methodName === "storage_deposit") state.storage.add(String(args.account_id));
+          if (params.methodName === "ft_transfer_call") {
+            const beneficiary = (JSON.parse(args.msg ?? "{}") as { for: string }).for;
+            const amount = BigInt(args.amount ?? "0");
+            if (state.failDeposits > 0 || (state.wallet.get(ALICE) ?? 0n) < amount) {
+              state.failDeposits = Math.max(0, state.failDeposits - 1);
+              failed = true;
+            } else if (state.storage.has(beneficiary)) {
+              state.wallet.set(ALICE, (state.wallet.get(ALICE) ?? 0n) - amount);
+              state.vault.set(beneficiary, (state.vault.get(beneficiary) ?? 0n) + amount);
+            }
+          }
+        }
+        const status = failed
+          ? {
+              Failure: {
+                ActionError: { kind: { FunctionCallError: { ExecutionError: "E_TOKEN" } } },
+              },
+            }
+          : { SuccessValue: "" };
+        outcomes.push({
+          status,
+          transaction: { hash: `tx${batches.length}-${index}` },
+          receipts_outcome: [
+            { id: `r${index}`, outcome: { executor_id: transaction.receiverId, logs: [], status } },
+          ],
+        });
+        if (failed) break;
+      }
+      return outcomes;
+    },
+    async signMessage({ message }) {
+      signed.push(message);
+      return {
+        accountId: ALICE,
+        publicKey: `ed25519:${"1".repeat(44)}`,
+        signature: "c2lnbmF0dXJl",
+      };
+    },
+  };
+  return { session: { wallet, accountId: ALICE }, batches, signed };
+}
+
+function open(state: World, options: Parameters<typeof aliceWallet>[1] = {}) {
+  serve(state);
+  const alice = aliceWallet(state, options);
+  holder.store = createWalletStore(async () => fakeProvider(alice.session, { restored: true }));
+  render(<AddAgentView pollMs={20} />);
+  return { ...alice, user: userEvent.setup() };
+}
+
+const step = (n: number) => screen.getByTestId(`connect-step-${n}`);
+const nameField = async () =>
+  within(await screen.findByTestId("connect-step-1")).getByLabelText("Account name");
+
+/** Types the name, waits for the chain to say it is free, and gets a code. */
+async function getCode(user: ReturnType<typeof userEvent.setup>, name = "writer") {
+  await user.type(await nameField(), name);
+  await within(step(1)).findByText(`${name}.${ALICE} is free.`);
+  await user.click(within(step(1)).getByRole("button", { name: "Get a connect code" }));
+  await waitFor(() => expect(step(2).dataset.open).toBe("true"));
+}
+
+/** The agent attaches its key, as `pnpm agent:connect` does through the API. */
+function agentAttaches(state: World, key = PUBLIC) {
+  if (state.code === null) throw new Error("no code yet");
+  state.code.attached = key;
+}
+
+test("the_page_leads_with_one_paste_and_one_approval_and_gets_a_code_with_one_signature", async () => {
+  const state = world();
+  const { user, signed, batches } = open(state);
+  expect(screen.getByRole("banner").textContent).toMatch(
+    /One paste where your agent runs, and one approval in your wallet/,
+  );
+  await nameField();
+  // The steps by hand are folded away.
+  expect(screen.queryByLabelText("The public key it printed")).toBeNull();
+  expect(
+    screen.getByRole("button", { name: "Advanced: set up by hand" }).getAttribute("aria-expanded"),
+  ).toBe("false");
+  expect(step(1).textContent).toContain("Your wallet signs a message to sign you in to Tender");
+
+  await getCode(user);
+
+  // One message signed (the sign-in), no transaction, and the code was asked for with the token.
+  expect(signed).toEqual([SIGN_IN_MESSAGE]);
+  expect(batches).toEqual([]);
+  expect(
+    state.requests.filter((line) => !line.startsWith("RPC") && !line.startsWith("GET")),
+  ).toEqual(["POST /v1/auth/challenge", "POST /v1/auth/verify", "POST /v1/connect/codes"]);
+  expect(state.authorizations[0]).toBe(`Bearer ${"t".repeat(43)}`);
+  expect(state.bodies).toContain(JSON.stringify({ name: "writer" }));
+  expect(step(1).dataset.done).toBe("true");
+  expect(screen.getByTestId("connect-name-state").textContent).toBe(`The code is for ${AGENT}.`);
+
+  // The one thing to paste: the command, or the sentence for an agent with the MCP server.
+  expect(screen.getByTestId("connect-command").textContent).toBe(
+    `$ pnpm agent:connect ${CODE} --api http://api.test`,
+  );
+  expect(screen.getByTestId("connect-sentence").textContent).toBe(
+    `Connect to Tender with code ${CODE}`,
+  );
+  expect(screen.getByTestId("connect-waiting").textContent).toMatch(
+    /Waiting for your agent to connect\. .*The code works once, for 30 more minutes\./,
+  );
+  expect(step(3).dataset.open).toBe("false");
+});
+
+test("the_attached_key_is_shown_with_its_fingerprint_and_a_warning_before_anything_is_signed", async () => {
+  const state = world();
+  const { user, batches } = open(state);
+  await getCode(user);
+  agentAttaches(state);
+
+  await waitFor(() => expect(step(3).dataset.open).toBe("true"));
+  expect(step(2).dataset.done).toBe("true");
+  expect(screen.getByTestId("connect-ready").textContent).toBe(`Your agent is ready: ${AGENT}`);
+  expect(screen.getByTestId("connect-fingerprint").textContent).toBe(connectFingerprint(PUBLIC));
+  expect(step(3).textContent).toContain(PUBLIC);
+  expect(screen.getByTestId("connect-warning").textContent).toMatch(
+    /Press Create agent only if it is this one\. If it printed another, or an error, someone else has this code/,
+  );
+  expect((await screen.findByTestId("connect-bond")).textContent).toBe("5.00 tUSDC");
+  await screen.findByRole("button", { name: "Create agent" });
+  expect(batches).toEqual([]);
+});
+
+test("create_agent_is_one_approval_that_creates_the_account_and_pays_its_storage_and_bond", async () => {
+  const state = world();
+  const { user, batches } = open(state);
+  await getCode(user);
+  agentAttaches(state);
+  const create = await screen.findByRole("button", { name: "Create agent" });
+  await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+
+  await user.click(create);
+
+  await waitFor(() => expect(step(4).dataset.open).toBe("true"));
+  expect(batches).toEqual([
+    [
+      {
+        receiverId: AGENT,
+        actions: [
+          { type: "CreateAccount" },
+          { type: "Transfer", params: { deposit: "500000000000000000000000" } },
+          {
+            type: "AddKey",
+            params: { publicKey: PUBLIC, accessKey: { permission: "FullAccess" } },
+          },
+        ],
+      },
+      {
+        receiverId: CONTRACT,
+        actions: [
+          {
+            type: "FunctionCall",
+            params: {
+              methodName: "storage_deposit",
+              args: { account_id: AGENT },
+              gas: "10000000000000",
+              deposit: "20000000000000000000000",
+            },
+          },
+        ],
+      },
+      {
+        receiverId: TOKEN,
+        actions: [
+          {
+            type: "FunctionCall",
+            params: {
+              methodName: "ft_transfer_call",
+              args: { receiver_id: CONTRACT, amount: "5000000", msg: `{"for":"${AGENT}"}` },
+              gas: "100000000000000",
+              deposit: "1",
+            },
+          },
+        ],
+      },
+    ],
+  ]);
+  expect(state.vault.get(AGENT)).toBe(BOND);
+
+  // The ticks: Created and Funded from the chain; Registered and Active wait on the agent.
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
+  expect(screen.getByTestId("tick-created").dataset.state).toBe("done");
+  expect(screen.getByTestId("tick-registered").dataset.state).toBe("working");
+  expect(screen.getByTestId("tick-registered").textContent).toMatch(
+    /Waiting for the agent to register/,
+  );
+  expect(screen.getByTestId("tick-active").dataset.state).toBe("waiting");
+
+  // The agent registers itself; the index lists it.
+  if (state.code !== null) state.code.agent = { status: "active" };
+  await waitFor(() => expect(screen.getByTestId("tick-active").dataset.state).toBe("done"));
+  expect(screen.getByTestId("tick-registered").dataset.state).toBe("done");
+  const done = screen.getByTestId("connect-active");
+  expect(done.textContent).toContain(`Your agent is active. ${AGENT} is in the directory.`);
+  expect(within(done).getByRole("link", { name: "Open its page" }).getAttribute("href")).toBe(
+    `/agents/${AGENT}`,
+  );
+  expect(step(4).dataset.done).toBe("true");
+  expect(batches).toHaveLength(1);
+});
+
+test("a_wallet_short_of_the_bond_is_told_before_anything_is_signed", async () => {
+  const state = world();
+  state.wallet.set(ALICE, 2_000_000n);
+  const { user, batches } = open(state);
+  await getCode(user);
+  agentAttaches(state);
+
+  const short = await screen.findByTestId("connect-short");
+  expect(short.textContent).toMatch(
+    /Your wallet holds 2\.00 tUSDC, and the bond is 5\.00 tUSDC\. Add 3\.00 tUSDC to your wallet first\./,
+  );
+  expect(
+    within(short)
+      .getByRole("link", { name: "Get test tUSDC on the Wallet page" })
+      .getAttribute("href"),
+  ).toBe("/wallet");
+  const create = screen.getByRole("button", { name: "Create agent" });
+  expect(create.getAttribute("aria-disabled")).toBe("true");
+  await user.click(create);
+  expect(batches).toEqual([]);
+
+  // The person gets the tokens, and checks again.
+  state.wallet.set(ALICE, 20_000_000n);
+  await user.click(within(short).getByRole("button", { name: "Check again" }));
+  await waitFor(() => expect(screen.queryByTestId("connect-short")).toBeNull());
+  expect(screen.getByRole("button", { name: "Create agent" }).getAttribute("aria-disabled")).toBe(
+    "false",
+  );
+});
+
+test("a_bond_that_failed_leaves_the_account_created_and_fund_agent_sends_what_is_missing", async () => {
+  const state = world();
+  state.failDeposits = 1;
+  const { user, batches } = open(state);
+  await getCode(user);
+  agentAttaches(state);
+  await user.click(await screen.findByRole("button", { name: "Create agent" }));
+
+  // The account was made and the storage paid; the bond's transaction failed.
+  await waitFor(() => expect(step(4).dataset.open).toBe("true"));
+  expect(screen.getByTestId("tick-created").dataset.state).toBe("done");
+  expect(screen.getByTestId("tick-funded").dataset.state).toBe("wrong");
+  expect((await screen.findByTestId("connect-fund-error")).textContent).toBe(
+    "The account was created and its storage paid, and paying its bond failed on the network. Check that your wallet holds the bond, then press Fund agent.",
+  );
+  expect(state.storage.has(AGENT)).toBe(true);
+  expect(state.vault.get(AGENT)).toBeUndefined();
+
+  // Fund agent sends only what is missing: the bond, as the storage is in place.
+  await user.click(screen.getByRole("button", { name: "Fund agent" }));
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
+  expect(batches).toHaveLength(2);
+  expect(batches[1]?.map((tx) => tx.receiverId)).toEqual([TOKEN]);
+  expect(state.vault.get(AGENT)).toBe(BOND);
+});
+
+test("a_wallet_that_cannot_make_accounts_gets_the_near_cli_command_then_funds_with_calls", async () => {
+  const state = world();
+  const { user, batches } = open(state, { accountActions: false });
+  await getCode(user);
+  agentAttaches(state);
+
+  const cli = await screen.findByTestId("connect-cli");
+  expect(screen.queryByRole("button", { name: "Create agent" })).toBeNull();
+  expect(within(cli).getByTestId("connect-cli-command").textContent).toBe(
+    `$ near account create-account fund-myself ${AGENT} '0.50 NEAR' use-manually-provided-public-key ${PUBLIC} sign-as ${ALICE} network-config testnet sign-with-keychain send`,
+  );
+
+  // The person runs it in a terminal; the page sees the account, and pays for it with calls.
+  state.accounts.set(AGENT, [PUBLIC]);
+  await user.click(within(cli).getByRole("button", { name: "Check again" }));
+  await waitFor(() => expect(step(4).dataset.open).toBe("true"));
+  expect(screen.getByTestId("tick-funded").dataset.state).toBe("wrong");
+  await user.click(screen.getByRole("button", { name: "Fund agent" }));
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
+  expect(batches.map((batch) => batch.map((tx) => tx.receiverId))).toEqual([[CONTRACT, TOKEN]]);
+  expect(state.vault.get(AGENT)).toBe(BOND);
+});
+
+test("a_code_that_expired_unused_offers_a_new_one", async () => {
+  const state = world();
+  const { user } = open(state);
+  await getCode(user);
+  if (state.code !== null) state.code.expired = true;
+
+  const expired = await screen.findByTestId("connect-expired");
+  expect(expired.textContent).toContain("This code expired before an agent used it.");
+  await user.click(within(expired).getByRole("button", { name: "Get a new code" }));
+  await waitFor(() => expect(state.made).toBe(2));
+  await waitFor(() => expect(screen.queryByTestId("connect-expired")).toBeNull());
+});
+
+test("a_taken_name_is_refused_before_a_code_is_made_and_the_apis_refusal_is_shown_in_its_words", async () => {
+  const state = world();
+  state.accounts.set(`taken.${ALICE}`, ["ed25519:someone"]);
+  const { user } = open(state);
+  await user.type(await nameField(), "taken");
+  await within(step(1)).findByText(`taken.${ALICE} already exists. Choose another name.`);
+  const ask = within(step(1)).getByRole("button", { name: "Get a connect code" });
+  expect(ask.getAttribute("aria-disabled")).toBe("true");
+
+  await user.clear(await nameField());
+  await user.type(await nameField(), "writer");
+  await within(step(1)).findByText(`${AGENT} is free.`);
+  state.refuseCode = json(
+    {
+      error: "bad_request",
+      message: "the body does not fit its schema",
+      issues: [
+        {
+          path: ["name"],
+          message: "Use lower case: an account id has no capitals.",
+          code: "custom",
+        },
+      ],
+    },
+    400,
+  );
+  await user.click(ask);
+  expect((await screen.findByTestId("connect-ask-error")).textContent).toBe(
+    "Use lower case: an account id has no capitals.",
+  );
+  state.refuseCode = json({ error: "rate_limited", message: "too many requests" }, 429);
+  await user.click(ask);
+  await waitFor(() =>
+    expect(screen.getByTestId("connect-ask-error").textContent).toBe(
+      "You've asked for a lot of codes in a short time. Try again in a few minutes.",
+    ),
+  );
+  expect(state.made).toBe(0);
+});
+
+test("a_wallet_that_cannot_sign_in_is_sent_to_the_steps_by_hand", async () => {
+  const state = world();
+  const { user } = open(state, { signMessage: false });
+  const notice = await screen.findByTestId("connect-cannot-sign");
+  expect(notice.textContent).toContain("This wallet can't sign in to Tender");
+  expect(within(step(1)).queryByRole("button", { name: "Get a connect code" })).toBeNull();
+  await user.click(within(notice).getByRole("button", { name: "Set up by hand" }));
+  await screen.findByLabelText("The public key it printed");
+  expect(state.requests.filter((line) => line.includes("/v1/"))).toEqual([]);
+});
+
+test("a_sign_in_that_ended_is_said_and_signing_in_again_goes_on", async () => {
+  const state = world();
+  const { user, signed } = open(state);
+  await getCode(user);
+  state.readStatus = 401;
+  const notice = await screen.findByTestId("connect-signed-out");
+  expect(notice.textContent).toContain("Your sign-in to Tender has ended");
+  state.readStatus = null;
+  agentAttaches(state);
+  await user.click(within(notice).getByRole("button", { name: "Sign in again" }));
+  await waitFor(() => expect(step(3).dataset.open).toBe("true"));
+  expect(signed).toHaveLength(2);
+});
+
+test("the_page_never_holds_a_private_key_and_sends_the_api_only_the_name", async () => {
+  const state = world();
+  const { user } = open(state);
+  await getCode(user);
+  agentAttaches(state);
+  await screen.findByRole("button", { name: "Create agent" });
+  // No field takes a key, and nothing on the page or in a request is anything but public.
+  expect(document.querySelectorAll("input")).toHaveLength(1);
+  const toApi = state.bodies.filter((body) => !body.includes('"jsonrpc"'));
+  expect(toApi).toEqual([
+    expect.stringContaining('"account_id":"alice.testnet"'),
+    JSON.stringify({ name: "writer" }),
+  ]);
+  // The only key the page shows is the public one the agent attached.
+  expect(document.body.innerHTML.match(/ed25519:[1-9A-HJ-NP-Za-km-z]+/g) ?? []).toEqual([PUBLIC]);
+  for (const storage of [sessionStorage, localStorage]) {
+    for (let i = 0; i < storage.length; i++) {
+      expect(storage.getItem(storage.key(i) ?? "")).not.toContain(CODE);
+    }
+  }
+});

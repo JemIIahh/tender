@@ -66,6 +66,16 @@ export type AccountAction =
       params: { publicKey: string; accessKey: { permission: "FullAccess" } };
     };
 
+/**
+ * One transaction of a batch that mixes the two: the actions that make an account, or function
+ * calls. "Add an agent" sends the account's transaction and the calls that pay for it as one batch,
+ * one approval.
+ */
+export interface MixedTransaction {
+  receiverId: string;
+  actions: AccountAction[] | ConnectorFunctionCallAction[];
+}
+
 /** A wallet and the account it is connected as. */
 export interface Session {
   wallet: SigningWallet;
@@ -142,6 +152,12 @@ export interface AccountActions {
    * hash. Throws as `signAndSend` does, and `WalletCannotSign` if the wallet does not say it can.
    */
   send(receiverId: string, actions: AccountAction[]): Promise<string>;
+  /**
+   * Has the wallet sign and send `transactions`, in order, in one approval, and gives back their
+   * hashes. Throws as `send` does: a wallet that stops at a transaction that failed gives back no
+   * outcome for those after it, and that failure is the answer (`TransactionFailed`).
+   */
+  sendBatch(transactions: MixedTransaction[]): Promise<string[]>;
 }
 
 export type UseWallet = WalletState & WalletActions;
@@ -470,6 +486,19 @@ export function createWalletStore(
 
   async function sendAccountActions(receiverId: string, actions: AccountAction[]): Promise<string> {
     if (actions.length === 0) throw new RangeError("there are no actions to send");
+    const [hash] = await sendMixed([{ receiverId, actions }]);
+    if (hash === undefined) throw new WalletResultUnreadable("transaction");
+    return hash;
+  }
+
+  /**
+   * One approval for `transactions`, which may mix the actions that make an account with function
+   * calls. Only a wallet whose manifest says it signs and sends whole transactions is asked.
+   */
+  async function sendMixed(transactions: MixedTransaction[]): Promise<string[]> {
+    if (transactions.length === 0 || transactions.some((tx) => tx.actions.length === 0)) {
+      throw new RangeError("there are no actions to send");
+    }
     const current = session;
     if (current === null) throw new WalletNotConnected();
     if (!sendsTransactions(current.wallet)) throw new WalletCannotSign();
@@ -478,15 +507,13 @@ export function createWalletStore(
       result = await current.wallet.signAndSendTransactions({
         // `TransactionRequest` names the function calls the rest of the app sends. A wallet takes
         // every action of near-connect's types, and these are among them.
-        transactions: [{ receiverId, actions }] as unknown as TransactionRequest[],
+        transactions: transactions as unknown as TransactionRequest[],
         signerId: current.accountId,
       });
     } catch (cause) {
       throw new WalletError("send", cause);
     }
-    const [hash] = readOutcomes(result, 1).txHashes;
-    if (hash === undefined) throw new WalletResultUnreadable("transaction");
-    return hash;
+    return readOutcomes(result, transactions.length).txHashes;
   }
 
   async function signMessage(input: SignMessageInput): Promise<SignedMessageResult> {
@@ -518,6 +545,7 @@ export function createWalletStore(
     signMessage,
     canSendAccountActions,
     sendAccountActions,
+    sendMixed,
   };
 }
 
@@ -682,7 +710,11 @@ export function useWallet(options?: UseWalletOptions): UseWallet {
 
 /** The account actions of `store`'s wallet. */
 export function accountActionsOf(store: WalletStore): AccountActions {
-  return { canSend: store.canSendAccountActions, send: store.sendAccountActions };
+  return {
+    canSend: store.canSendAccountActions,
+    send: store.sendAccountActions,
+    sendBatch: store.sendMixed,
+  };
 }
 
 /**

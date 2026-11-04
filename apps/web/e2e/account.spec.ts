@@ -79,7 +79,10 @@ test("add_agent_makes_the_account_in_one_transaction_and_watches_the_agent_regis
   page,
 }) => {
   const { api, wallet } = await openConnected(page, "/my-agents/new");
-  const key = page.getByLabel("The public key it printed");
+  // The steps by hand are under the connect flow (e2e/connect.spec.ts has that).
+  await page.getByRole("button", { name: "Advanced: set up by hand" }).click();
+  const byHand = page.getByTestId("by-hand");
+  const key = byHand.getByLabel("The public key it printed");
 
   // A private key pasted by mistake is cleared at once.
   await key.fill(AGENT_SECRET_KEY);
@@ -87,7 +90,7 @@ test("add_agent_makes_the_account_in_one_transaction_and_watches_the_agent_regis
   await expect(page.getByTestId("key-error")).toContainText("private key");
 
   await key.fill(AGENT_PUBLIC_KEY);
-  await page.getByLabel("Account name").fill("scout2");
+  await byHand.getByLabel("Account name").fill("scout2");
   await expect(page.getByTestId("name-state")).toHaveText(`scout2.${OWNER} is free.`);
   expect(wallet.sent).toEqual([]);
 

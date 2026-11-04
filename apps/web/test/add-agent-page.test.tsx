@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
@@ -21,8 +21,10 @@ import {
 } from "./accountFakes";
 import { fakeProvider } from "./walletDoubles";
 
-// "Add an agent", as a person goes through it: the real hook and store over a wallet that can make
-// accounts (or can't), and a fake API and node. The agent's private key must never be kept or sent.
+// "Add an agent" set up by hand ("Advanced: set up by hand", under the connect flow, which
+// test/connect-agent-page.test.tsx has), as a person goes through it: the real hook and store over a
+// wallet that can make accounts (or can't), and a fake API and node. The agent's private key must
+// never be kept or sent.
 
 const holder = vi.hoisted(() => ({ store: undefined as unknown as WalletStore }));
 vi.mock("../lib/wallet", async (importOriginal) => {
@@ -63,8 +65,15 @@ function open(
   return { sent: session.sent, user: userEvent.setup() };
 }
 
-const keyField = () => screen.findByLabelText("The public key it printed");
-const nameField = () => screen.getByLabelText("Account name");
+/** The key field of the steps by hand, which the page shows once "Advanced: set up by hand" is pressed. */
+async function keyField(): Promise<HTMLElement> {
+  const shown = screen.queryByLabelText("The public key it printed");
+  if (shown !== null) return shown;
+  fireEvent.click(await screen.findByRole("button", { name: "Advanced: set up by hand" }));
+  return screen.findByLabelText("The public key it printed");
+}
+/** The name field of the steps by hand: the connect flow above them has one of its own. */
+const nameField = () => within(screen.getByTestId("by-hand")).getByLabelText("Account name");
 const commands = () => screen.getAllByTestId("command").map((code) => code.textContent?.slice(2));
 
 test("add_agent_asks_to_connect_first", async () => {
@@ -75,7 +84,7 @@ test("add_agent_asks_to_connect_first", async () => {
   );
   // What it costs is said before anything else.
   expect(screen.getByRole("banner").textContent).toMatch(
-    /0\.50 NEAR sent to the agent's new account.*the bond it locks when it registers, refunded in full/,
+    /0\.50 NEAR sent to the agent's new account.*0\.02 NEAR for its storage with Tender.*the bond it locks when it registers, paid from your wallet into the agent's own vault and refunded in full to that vault/,
   );
   await screen.findByRole("heading", { name: "Connect your wallet" });
   expect(screen.queryByLabelText("The public key it printed")).toBeNull();

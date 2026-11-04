@@ -3,6 +3,7 @@ import {
   type AccountAction,
   accountActionsOf,
   createWalletStore,
+  type MixedTransaction,
   type Session,
   type SigningWallet,
 } from "../lib/wallet";
@@ -113,6 +114,65 @@ test("a_wallet_that_throws_fails_and_a_failed_transaction_says_so", async () => 
 
   const garbled = walletThat({ signAndSendTransactions: true }, () => "done");
   expect(await rejection((await actionsFor(garbled.wallet)).send(AGENT, ACTIONS))).toBeInstanceOf(
+    WalletResultUnreadable,
+  );
+});
+
+// ---- Connect your agent: one approval for the account and the calls that pay for it -------------
+
+const STORAGE: MixedTransaction = {
+  receiverId: "tender.testnet",
+  actions: [
+    {
+      type: "FunctionCall",
+      params: {
+        methodName: "storage_deposit",
+        args: { account_id: AGENT },
+        gas: "10000000000000",
+        deposit: "20000000000000000000000",
+      },
+    },
+  ],
+};
+
+test("a_batch_mixes_the_account_and_the_calls_in_one_approval_and_gives_each_hash", async () => {
+  const { wallet, sent } = walletThat({ signAndSendTransactions: true }, () => [
+    outcome({ SuccessValue: "" }, "create-tx"),
+    outcome({ SuccessValue: "" }, "storage-tx"),
+  ]);
+  const actions = await actionsFor(wallet);
+  const batch: MixedTransaction[] = [{ receiverId: AGENT, actions: ACTIONS }, STORAGE];
+
+  expect(await actions.sendBatch(batch)).toEqual(["create-tx", "storage-tx"]);
+  expect(sent).toEqual([{ transactions: batch, signerId: ALICE }]);
+  await expect(actions.sendBatch([])).rejects.toBeInstanceOf(RangeError);
+  await expect(actions.sendBatch([{ receiverId: AGENT, actions: [] }])).rejects.toBeInstanceOf(
+    RangeError,
+  );
+});
+
+test("a_batch_is_asked_only_of_a_wallet_that_says_it_sends_transactions_and_its_failure_is_said", async () => {
+  const quiet = walletThat({});
+  const batch: MixedTransaction[] = [{ receiverId: AGENT, actions: ACTIONS }, STORAGE];
+  expect(await rejection((await actionsFor(quiet.wallet)).sendBatch(batch))).toBeInstanceOf(
+    WalletCannotSign,
+  );
+  expect(quiet.sent).toEqual([]);
+
+  // A wallet that stops at the failed transaction: the failure is the answer.
+  const stopped = walletThat({ signAndSendTransactions: true }, () => [
+    outcome({ SuccessValue: "" }, "create-tx"),
+    outcome({ Failure: { ActionError: { kind: { FunctionCallError: {} } } } }, "storage-tx"),
+  ]);
+  const failure = await rejection((await actionsFor(stopped.wallet)).sendBatch(batch));
+  expect(failure).toBeInstanceOf(TransactionFailed);
+  expect((failure as TransactionFailed).txHash).toBe("storage-tx");
+
+  // Fewer outcomes than transactions, and none failed: unreadable.
+  const short = walletThat({ signAndSendTransactions: true }, () => [
+    outcome({ SuccessValue: "" }),
+  ]);
+  expect(await rejection((await actionsFor(short.wallet)).sendBatch(batch))).toBeInstanceOf(
     WalletResultUnreadable,
   );
 });
