@@ -59,7 +59,9 @@ import type { Solver } from "./types";
 //   --max-voids-after-reveals N                    skips a verifier whose record in the API shows
 //                                                  more empty picks after reveals than N
 //
-// A hire is held to its service's terms in place of the policy, and counts toward the daily cap.
+// A hire is held to its service's terms in place of the least reward and the verifiers, and counts
+// toward the daily cap. One its hirer checks is held to the hirer's record and refused once the day
+// is full; one the Judge checks is never held back.
 //
 // What it reads. The variables come from `.env` and `.env.deploy.<network>` in the repository root
 // (or in the directory that `TENDER_ENV_DIR` names), the network's winning, and the process's own

@@ -2,15 +2,18 @@ import { randomBytes } from "node:crypto";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
-// An agent's entry policy: which of the open tasks of its tags it will spend work on, besides its
-// hires. The runner (`runner.ts`) applies it after the checks of its own (the Judge's verdict, the
-// contract's rules, the storage) and before it announces a task or asks its solver.
+// An agent's entry policy: which of the open tasks of its tags, and of its hires, it will spend work
+// on. The runner (`runner.ts`) applies it after the checks of its own (the Judge's verdict, the
+// contract's rules, a hire's terms) and before it announces a task or asks its solver.
 //
 // Why. The tag is no reason to spend. Anyone can post a task with an agent's tags at the token's
 // least reward, name themselves its verifier, read the revealed answers and pick nobody: they have
 // the work for free, and the agent's model calls are spent. A hire is held to its service's terms
-// already (the price, the checker), so a hire is not held to this policy, but it counts toward the
-// daily cap all the same, as its solve costs the same.
+// already (the price, the checker), so it is not held to the least reward or to the verifiers. It
+// counts toward the daily cap all the same, as its solve costs the same. A hire that its hirer
+// checks is the same free-work path again (the hirer is its verifier, and can pick nobody), so it is
+// held to the hirer's record (`maxVoidsAfterReveals`) and to the cap; a hire the Judge checks is not
+// held back by either.
 
 /**
  * Who may check the work the agent enters: `"judge"`, the Judge that the API serves
@@ -31,14 +34,17 @@ export interface EntryPolicy {
   judgeAccount?: string;
   /**
    * Skips a task whose verifier has made more empty picks after a reveal than this
-   * (`voids_after_reveals` of the verifier's record in the API). A verifier the API has no record
-   * of is not held to it. Default: no limit.
+   * (`voids_after_reveals` of the verifier's record in the API), and a hire its hirer checks whose
+   * hirer has. A verifier the API has no record of is not held to it. Default: no limit.
    */
   maxVoidsAfterReveals?: number;
   /**
-   * The most tasks the agent takes on in a UTC day, hires included: it bounds what the solver
-   * spends. The count is kept on the disk (`EntryCounts`), so that a restart does not reset it. A
-   * task that finds the day's count full waits for the next day. Default: no cap.
+   * The most tasks the agent takes on in a UTC day: it bounds what the solver spends. Every task
+   * and every hire counts. The count is kept on the disk (`EntryCounts`), so that a restart does
+   * not reset it. Once the day is full, a task of the agent's tags waits for the next day; a hire
+   * its hirer checks is refused for good (a wait would only let it be voided, and its hirer is
+   * refunded); a hire the Judge checks is taken on all the same, as it is when the count cannot be
+   * read. Default: no cap.
    */
   dailyEntries?: number;
 }
