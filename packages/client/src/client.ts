@@ -40,12 +40,19 @@ import {
 import {
   Account,
   actions,
+  baseEncode,
   JsonRpcProvider,
   KeyPair,
   KeyPairSigner,
   type KeyPairString,
+  type Transaction,
 } from "near-api-js";
-import { AccessKeyDoesNotExistError, AccountDoesNotExistError } from "near-api-js/rpc-errors";
+import {
+  AccessKeyDoesNotExistError,
+  AccountDoesNotExistError,
+  TransactionTimeoutError,
+  UnknownTransactionError,
+} from "near-api-js/rpc-errors";
 import {
   DEFAULT_RPC_TIMEOUT_MS,
   DEFAULT_SEND_TIMEOUT_MS,
@@ -86,6 +93,74 @@ export interface TxResult {
 export interface FinalTxOutcome extends TxReceiptsOutcome {
   status: unknown;
   transaction: { hash: string };
+}
+
+/**
+ * A transaction as it was signed, before it is sent: what a caller needs to ask the chain about it
+ * later (`TenderClient.txStatus`), and to know until when it can still be included.
+ */
+export interface SignedTx {
+  /** The transaction's hash, base58: the hash that `TxResult.txHash` has once it is final. */
+  txHash: string;
+  signerId: string;
+  /** The key it is signed with, `ed25519:<base58>`. */
+  publicKey: string;
+  nonce: bigint;
+  /**
+   * The block the transaction names as its reference, base58, and its height. The chain includes
+   * the transaction only while that block is less than `transaction_validity_period` blocks behind
+   * the head (86,400 on mainnet and testnet, about a day), and not at all once the key's nonce is
+   * past the transaction's.
+   */
+  blockHash: string;
+  blockHeight: bigint;
+}
+
+/** Things a caller can hook into a send. */
+export interface SendHooks {
+  /**
+   * Called, and waited for, with each transaction once it is signed and before it is sent. If it
+   * throws, nothing is sent and the send fails with what it threw, so a caller that writes the hash
+   * down here has written it down before the transaction can be anywhere. A transaction that loses
+   * its nonce (`InvalidNonceError`: the node refuses it, and it can never be included) is signed
+   * again, and the hook hears of the new one.
+   */
+  beforeSend?: (tx: SignedTx) => Promise<void>;
+}
+
+/**
+ * What the chain says of a transaction, by its hash (`TenderClient.txStatus`):
+ *
+ * - `unknown`: the node has no record of it. It was never sent, or has not reached the node yet,
+ *   or is gone from the node's memory (a node keeps a few days). It is NOT a sign that the
+ *   transaction cannot land.
+ * - `pending`: the node has it, and it is not final.
+ * - `executed`: final, and it succeeded.
+ * - `failed`: final, and it failed. Nothing it did is kept; `error` has the code the contract gave.
+ */
+export type TxStatus =
+  | { kind: "unknown" }
+  | { kind: "pending" }
+  | { kind: "executed"; result: TxResult }
+  | { kind: "failed"; error: TenderError };
+
+/** A signer that tells `report` of each transaction it signs, before the transaction is returned. */
+class ReportingSigner extends KeyPairSigner {
+  constructor(
+    key: KeyPair,
+    private readonly report: (signed: {
+      txHash: Uint8Array;
+      transaction: Transaction;
+    }) => Promise<void>,
+  ) {
+    super(key);
+  }
+
+  override async signTransaction(transaction: Transaction) {
+    const signed = await super.signTransaction(transaction);
+    await this.report({ txHash: signed.txHash, transaction: signed.signedTransaction.transaction });
+    return signed;
+  }
 }
 
 /** NEP-145's storage balance, as a token's `storage_balance_of` returns it, in yoctoNEAR. */
@@ -136,6 +211,12 @@ function failureMessage(failure: unknown): string {
   return typeof panic === "string" ? panic : (JSON.stringify(failure) ?? String(failure));
 }
 
+/** The error of a transaction that failed on chain: the contract's code, if it gave one. */
+function failedWith(txHash: string, failure: unknown): TenderError {
+  const message = failureMessage(failure);
+  return new TenderError(errorCodeOf(message), message, { txHash, cause: failure });
+}
+
 /** A `SuccessValue`: base64 of what the call returned, JSON for this contract and NEP-141. */
 function decodeReturnValue(base64: string): unknown {
   const text = Buffer.from(base64, "base64").toString("utf8");
@@ -170,10 +251,7 @@ export function toTxResult(resp: FinalTxOutcome, contractId: string): TxResult {
       receipts,
     };
   }
-  if (variant?.[0] === "Failure") {
-    const message = failureMessage(variant[1]);
-    throw new TenderError(errorCodeOf(message), message, { txHash, cause: variant[1] });
-  }
+  if (variant?.[0] === "Failure") throw failedWith(txHash, variant[1]);
   throw new TenderError(
     "E_UNKNOWN",
     `transaction ${txHash} has no final outcome; its status is ${JSON.stringify(resp.status)}`,
@@ -233,6 +311,7 @@ export class TenderClient {
   readonly publicKey?: string;
   private readonly provider: JsonRpcProvider;
   private readonly account?: Account;
+  private readonly key?: KeyPair;
 
   /**
    * `rpcUrl` defaults to the network's. The sandbox has none, because a local node picks its port
@@ -274,9 +353,8 @@ export class TenderClient {
       const { accountId, privateKey } = opts.signer;
       this.accountId = accountId;
       const signer = KeyPairSigner.fromSecretKey(privateKey as KeyPairString);
-      this.publicKey = KeyPair.fromString(privateKey as KeyPairString)
-        .getPublicKey()
-        .toString();
+      this.key = KeyPair.fromString(privateKey as KeyPairString);
+      this.publicKey = this.key.getPublicKey().toString();
       this.account = new Account(accountId, this.provider, signer);
     }
   }
@@ -305,12 +383,17 @@ export class TenderClient {
    * once the earlier sends of the signer's account in this process are done (`defaultQueue`), and
    * has `sendTimeoutMs` from then on. A send the node has not finished by then throws a
    * `TenderError` with code `E_TIMEOUT`, and may have landed all the same (see the class), which
-   * the error's message says: it has no `txHash`, since the client does not learn it.
+   * the error's message says: it has no `txHash`, since the client does not learn it. A caller
+   * that needs the hash to follow up gets it from `hooks.beforeSend`, below.
    *
    * The time is that of each try: a transaction that loses its nonce to another (`defaultQueue`)
    * is sent once more, and that try has all of `sendTimeoutMs` again.
+   *
+   * `hooks.beforeSend` hears of each transaction after it is signed and before it is sent, with
+   * its hash, so a caller can write the hash down first and, after an `E_TIMEOUT`, ask the chain
+   * what became of it (`txStatus`) instead of guessing from the time that has passed.
    */
-  async send(call: TenderCall): Promise<TxResult> {
+  async send(call: TenderCall, hooks?: SendHooks): Promise<TxResult> {
     const account = this.account;
     if (account === undefined) {
       throw new Error("this TenderClient has no signer, so it cannot send transactions");
@@ -319,7 +402,13 @@ export class TenderClient {
       await this.requireFullAccessKey(call.methodName);
     }
     const action = actions.functionCall(call.methodName, call.args, call.gas, call.deposit);
+    const beforeSend = hooks?.beforeSend;
+    const key = this.key;
     return defaultQueue.run(account.accountId, async () => {
+      const signer =
+        beforeSend === undefined || key === undefined
+          ? undefined
+          : new ReportingSigner(key, async (signed) => beforeSend(await this.describe(signed)));
       const resp = await withDeadline(
         `TenderClient.send ${call.methodName}`,
         this.sendTimeoutMs,
@@ -329,11 +418,62 @@ export class TenderClient {
             actions: [action],
             waitUntil: "FINAL",
             throwOnFailure: false,
+            signer,
           }),
         SEND_MAY_STILL_LAND,
       );
       return toTxResult(resp, this.contractId);
     });
+  }
+
+  /** A signed transaction as `SignedTx`: its reference block's height is asked of the node. */
+  private async describe(signed: {
+    txHash: Uint8Array;
+    transaction: Transaction;
+  }): Promise<SignedTx> {
+    const { transaction } = signed;
+    const blockHash = baseEncode(transaction.blockHash);
+    // Inside the send's time, and so under its deadline: this runs in the signer, in the send.
+    const block = await this.provider.viewBlock({ blockId: blockHash });
+    return {
+      txHash: baseEncode(signed.txHash),
+      signerId: transaction.signerId,
+      publicKey: transaction.publicKey.toString(),
+      nonce: transaction.nonce,
+      blockHash,
+      blockHeight: BigInt(block.header.height),
+    };
+  }
+
+  /**
+   * What the chain says of the transaction with this hash that `signerId` (default: this client's
+   * account) signed: see `TxStatus`. A node that does not answer is not an answer: the call throws
+   * (`E_TIMEOUT` after `rpcTimeoutMs`), and the caller asks again.
+   */
+  async txStatus(txHash: string, signerId: string | undefined = this.accountId): Promise<TxStatus> {
+    if (signerId === undefined) {
+      throw new Error("this TenderClient has no signer, so txStatus needs the account that signed");
+    }
+    let resp: FinalTxOutcome & { final_execution_status?: string };
+    try {
+      resp = (await withDeadline(`TenderClient.txStatus ${txHash}`, this.rpcTimeoutMs, () =>
+        this.provider.viewTransactionStatus({ txHash, accountId: signerId, waitUntil: "NONE" }),
+      )) as unknown as typeof resp;
+    } catch (error) {
+      if (error instanceof UnknownTransactionError) return { kind: "unknown" };
+      // The node's own wait for the transaction ran out: it is not final.
+      if (error instanceof TransactionTimeoutError) return { kind: "pending" };
+      throw error;
+    }
+    if (resp.final_execution_status !== "FINAL") return { kind: "pending" };
+    const variant = variantOf(resp.status);
+    if (variant?.[0] === "SuccessValue") {
+      return { kind: "executed", result: toTxResult(resp, this.contractId) };
+    }
+    if (variant?.[0] === "Failure") {
+      return { kind: "failed", error: failedWith(resp.transaction.hash, variant[1]) };
+    }
+    return { kind: "pending" };
   }
 
   /**
@@ -516,8 +656,9 @@ export class TenderClient {
   async postTask(
     input: PostTaskInput,
     opts?: SpendOptions,
+    hooks?: SendHooks,
   ): Promise<TxResult & { taskId: bigint }> {
-    const result = await this.send(postTaskCall(this.contractId, input, opts));
+    const result = await this.send(postTaskCall(this.contractId, input, opts), hooks);
     return { ...result, taskId: BigInt(U64StringSchema.parse(result.returnValue)) };
   }
 
