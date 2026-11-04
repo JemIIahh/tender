@@ -154,6 +154,117 @@ export function scorecard(overrides: Partial<Scorecard> = {}): Scorecard {
   };
 }
 
+// ---- The swarm demo's lineage -------------------------------------------------------------------
+
+/** The lead of the swarm demo: it entered the parent and posted its three subtasks. */
+export const LEAD = "lead.tender-team.testnet";
+
+/** The swarm demo's tasks, by id: the parent and its three subtasks. */
+export const SWARM = { parent: "20", children: ["21", "22", "23"] } as const;
+
+/** Whole tUSDC (6 decimals) as the smallest unit. */
+const tusdc = (whole: number) => String(Math.round(whole * 1_000_000));
+
+/** The swarm pack's titles (scripts/swarm-research-pack), parent first. */
+const SWARM_TITLES = [
+  "Research pack: the gas, keys and events of one Tender transaction",
+  "Total the gas of a receipt ledger",
+  "Audit the access keys of one account",
+  "Tally the events in a log",
+];
+
+/** Who won each subtask in the demo: alice parts 1 and 3, bob part 2. */
+const SWARM_WINNERS = ["alice.testnet", "bob.testnet", "alice.testnet"];
+
+/**
+ * The lineage of the swarm demo (scripts/swarm-demo.ts, plan 07 Task 3) as the API serves it once
+ * the demo is over: the team's poster posts the parent, 10.00 tUSDC with a 5% fee, which the Judge
+ * pays to the lead (9.50); the lead posted three subtasks of 2.00 each from its own vault (6.00),
+ * which alice and bob won. So the lead's margin is 9.50 − 6.00 = +3.50 tUSDC, the demo's `MARGIN`
+ * line. `settled: false` is the lineage while everything is still open: no payout and no winner.
+ */
+export function swarmLineage({ settled = true } = {}): Map<string, TaskDetailResponse> {
+  const fee = (reward: string) => (BigInt(reward) * 500n) / 10_000n;
+  const paid = (reward: string) => (BigInt(reward) - fee(reward)).toString();
+  const parentReward = tusdc(10);
+  const parent = detail(
+    {
+      id: SWARM.parent,
+      title: SWARM_TITLES[0],
+      category: "research",
+      tags: ["swarm", "research", "json", "near"],
+      reward: parentReward,
+      commit_count: 1,
+      reveal_count: settled ? 1 : 0,
+      judge_status: "accepted",
+      ...(settled
+        ? {
+            phase: "settled" as const,
+            outcome_kind: "picked" as const,
+            outcome: {
+              kind: "picked" as const,
+              task_id: SWARM.parent,
+              by: VERIFIER,
+              winners: [{ account: LEAD, bps: 10_000, amount: paid(parentReward) }],
+              fee: fee(parentReward).toString(),
+              scorecard_hash: HASH_C,
+              scorecard_uri: `http://api.test/v1/blobs/${HASH_C}`,
+            },
+          }
+        : {}),
+    },
+    {
+      entries: [settled ? revealed(LEAD, HASH_A) : entry(LEAD)],
+      funders: [{ account: POSTER, amount: parentReward }],
+      children: [...SWARM.children],
+    },
+  );
+  const lineage = new Map<string, TaskDetailResponse>([[SWARM.parent, parent]]);
+  SWARM.children.forEach((id, i) => {
+    const reward = tusdc(2);
+    const winner = SWARM_WINNERS[i] as string;
+    lineage.set(
+      id,
+      detail(
+        {
+          id,
+          title: SWARM_TITLES[i + 1],
+          category: "data",
+          tags: ["extraction", "json", "near", `part-${i + 1}`],
+          reward,
+          poster: LEAD,
+          is_team_poster: true,
+          parent: SWARM.parent,
+          commit_count: 2,
+          reveal_count: settled ? 2 : 0,
+          judge_status: "accepted",
+          ...(settled
+            ? {
+                phase: "settled" as const,
+                outcome_kind: "picked" as const,
+                outcome: {
+                  kind: "picked" as const,
+                  task_id: id,
+                  by: VERIFIER,
+                  winners: [{ account: winner, bps: 10_000, amount: paid(reward) }],
+                  fee: fee(reward).toString(),
+                  scorecard_hash: HASH_C,
+                  scorecard_uri: `http://api.test/v1/blobs/${HASH_C}`,
+                },
+              }
+            : {}),
+        },
+        {
+          entries: [entry("alice.testnet"), entry("bob.testnet", { entry_index: 1 })],
+          funders: [{ account: LEAD, amount: reward }],
+          children: [],
+        },
+      ),
+    );
+  });
+  return lineage;
+}
+
 /**
  * A task page's data for task 7, open, with two sealed entries and one funder. `task` overrides
  * fields of the task (its summary and its terms), `rest` the other parts of the response.

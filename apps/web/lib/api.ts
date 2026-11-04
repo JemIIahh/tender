@@ -12,6 +12,8 @@ import {
   BlobUploadResponseSchema,
   type ChallengeResponse,
   ChallengeResponseSchema,
+  type ClarificationResponse,
+  ClarificationResponseSchema,
   fetchJson,
   type HealthResponse,
   HealthResponseSchema,
@@ -22,12 +24,16 @@ import {
   type ListTasksFilter,
   type ListTasksResponse,
   ListTasksResponseSchema,
+  type QuestionResponse,
+  QuestionResponseSchema,
   type Scorecard,
   ScorecardSchema,
   type SignInResponse,
   SignInResponseSchema,
   type StartResponse,
   StartResponseSchema,
+  type TaskBoard,
+  TaskBoardSchema,
   type TaskDetailResponse,
   TaskDetailResponseSchema,
   type TelegramLinkResponse,
@@ -247,6 +253,17 @@ export const api = {
     return orNull(get(`/scorecards/${task}`, ScorecardSchema));
   },
 
+  /**
+   * `GET /v1/tasks/:id/questions`: the task's public question board, every question and every
+   * clarification oldest first; null if the API has none for it (no such task, or an API from
+   * before the board), as for an id that is no task id.
+   */
+  async getQuestions(taskId: bigint | string): Promise<TaskBoard | null> {
+    const task = taskIdText(taskId);
+    if (task === undefined) return null;
+    return orNull(get(`/tasks/${task}/questions`, TaskBoardSchema));
+  },
+
   /** `GET /v1/health`: how far the index is behind the chain; a 503 throws an `ApiError`. */
   health(): Promise<HealthResponse> {
     return get("/health", HealthResponseSchema);
@@ -306,5 +323,59 @@ export const api = {
   /** `POST /v1/telegram/link`: a one-time link from this account to the bot. Needs a token. */
   telegramLink(token: string): Promise<TelegramLinkResponse> {
     return post("/telegram/link", TelegramLinkResponseSchema, { token });
+  },
+
+  // ---- The question board (spec 7.2.1). Each needs a token, and throws for an id that is no
+  // task's or question's without asking. `text` is sent as it was typed: the API trims it and
+  // holds it to its rules, and the page shows its refusal (lib/questions.ts).
+
+  /** `POST /v1/tasks/:id/questions`: an entrant asks the poster a question, in public. */
+  async askQuestion(
+    token: string,
+    taskId: bigint | string,
+    text: string,
+  ): Promise<QuestionResponse> {
+    const task = taskIdText(taskId) ?? notAnId("askQuestion", "a task id", taskId);
+    return post(`/tasks/${task}/questions`, QuestionResponseSchema, { token, body: { text } });
+  },
+
+  /** `POST /v1/tasks/:id/questions/:question_id/answer`: the poster answers a question. */
+  async answerQuestion(
+    token: string,
+    taskId: bigint | string,
+    questionId: string,
+    text: string,
+  ): Promise<QuestionResponse> {
+    const task = taskIdText(taskId) ?? notAnId("answerQuestion", "a task id", taskId);
+    const question =
+      taskIdText(questionId) ?? notAnId("answerQuestion", "a question id", questionId);
+    return post(`/tasks/${task}/questions/${question}/answer`, QuestionResponseSchema, {
+      token,
+      body: { text },
+    });
+  },
+
+  /** `POST /v1/tasks/:id/questions/:question_id/hide`: the poster hides a question for good. */
+  async hideQuestion(
+    token: string,
+    taskId: bigint | string,
+    questionId: string,
+  ): Promise<QuestionResponse> {
+    const task = taskIdText(taskId) ?? notAnId("hideQuestion", "a task id", taskId);
+    const question = taskIdText(questionId) ?? notAnId("hideQuestion", "a question id", questionId);
+    return post(`/tasks/${task}/questions/${question}/hide`, QuestionResponseSchema, { token });
+  },
+
+  /** `POST /v1/tasks/:id/clarifications`: the poster posts a clarification of the brief. */
+  async postClarification(
+    token: string,
+    taskId: bigint | string,
+    text: string,
+  ): Promise<ClarificationResponse> {
+    const task = taskIdText(taskId) ?? notAnId("postClarification", "a task id", taskId);
+    return post(`/tasks/${task}/clarifications`, ClarificationResponseSchema, {
+      token,
+      body: { text },
+    });
   },
 };

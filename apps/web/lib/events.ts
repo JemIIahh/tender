@@ -1,10 +1,17 @@
-import { EventMessageSchema, TenderEventSchema, U64StringSchema } from "@tender/shared";
+import {
+  BOARD_EVENT_NAMES,
+  BoardEventSchema,
+  EventMessageSchema,
+  TenderEventSchema,
+  U64StringSchema,
+} from "@tender/shared";
 import { useEffect, useRef, useState } from "react";
 import { config } from "./config";
 
 // `GET /v1/events`, the API's stream of what the indexer has stored, for a page that wants to know
 // when something it shows has changed. The page asks again when told; the stream never carries
-// state, only that an event happened.
+// state, only that an event happened. Next to the contract's events it carries the question
+// board's (spec 7.2.1: `question_asked` and the rest), which name a task and a row and no text.
 
 const STREAM_URL = `${config.apiUrl}/v1/events`;
 
@@ -15,12 +22,22 @@ const MAX_BACKOFF_MS = 30_000;
 /** How long the probe for `Retry-After` is given to answer, before the stream is reopened without it. */
 const PROBE_TIMEOUT_MS = 5_000;
 
+/** The board's events, which the API writes to the same stream (they are not the contract's). */
+const BOARD_EVENTS: ReadonlySet<string> = new Set(BOARD_EVENT_NAMES);
+
+/** Whether `event` is a name of the question board's events, and not of the contract's. */
+export const isBoardEvent = (event: string): boolean => BOARD_EVENTS.has(event);
+
 /**
- * Every event the contract logs, by name. The API names each message of the stream with its event
- * (`event: committed`), so a browser hands it only to a listener for that name, and `onmessage`
- * never fires. A name the schema does not know gets no listener and never arrives.
+ * Every event the contract logs, and every event of the board, by name. The API names each message
+ * of the stream with its event (`event: committed`), so a browser hands it only to a listener for
+ * that name, and `onmessage` never fires. A name the schemas do not know gets no listener and
+ * never arrives.
  */
-const EVENT_NAMES: string[] = TenderEventSchema.options.map((option) => option.shape.event.value);
+const EVENT_NAMES: string[] = [
+  ...TenderEventSchema.options.map((option) => option.shape.event.value),
+  ...BOARD_EVENT_NAMES,
+];
 
 /** What a page's filter sees of a message: which event, and the task it is about, if any. */
 export interface EventInfo {
@@ -134,9 +151,10 @@ export function connectEvents({ onEvent, onResync }: EventHandlers): EventStream
       console.error("events: a message is not one the API sends", message.error);
       return;
     }
-    // The event as the contract logs it. The schemas drop a key they do not know, so a field added
-    // to an event later does not stop this page hearing about it.
-    const known = TenderEventSchema.safeParse({
+    // The event as the contract logs it, or as the board writes it. The schemas drop a key they do
+    // not know, so a field added to an event later does not stop this page hearing about it.
+    const schema = isBoardEvent(message.data.event) ? BoardEventSchema : TenderEventSchema;
+    const known = schema.safeParse({
       event: message.data.event,
       data: message.data.data,
     });
@@ -210,21 +228,49 @@ export function connectEvents({ onEvent, onResync }: EventHandlers): EventStream
  * It can change on every render without opening another stream.
  */
 export function useEvents(filter?: (event: EventInfo) => boolean): number {
-  const [count, setCount] = useState(0);
-  const latest = useRef(filter);
+  return useEventsBy(ONE_KIND, (event) => (filter === undefined || filter(event) ? "events" : null))
+    .events;
+}
+
+const ONE_KIND = ["events"] as const;
+
+/**
+ * `useEvents` for a page that shows several things, over one stream: a counter for each of `kinds`,
+ * which goes up each time `sort` puts an event in that kind (null: in none), and every counter
+ * goes up when the stream opens with no id to resume from. So a page asks again for only what an
+ * event is about, and opens one stream however many parts it has (the API holds a client to a few).
+ *
+ * `kinds` is read once, when the page first renders; `sort` can change on every render.
+ */
+export function useEventsBy<K extends string>(
+  kinds: readonly K[],
+  sort: (event: EventInfo) => K | null,
+): Readonly<Record<K, number>> {
+  const [counts, setCounts] = useState(
+    () => Object.fromEntries(kinds.map((kind) => [kind, 0])) as Record<K, number>,
+  );
+  const latest = useRef(sort);
   useEffect(() => {
-    latest.current = filter;
+    latest.current = sort;
   });
 
   useEffect(() => {
     const stream = connectEvents({
       onEvent: (info) => {
-        if (latest.current === undefined || latest.current(info)) setCount((n) => n + 1);
+        const kind = latest.current(info);
+        if (kind === null) return;
+        setCounts((was) => ({ ...was, [kind]: (was[kind] ?? 0) + 1 }));
       },
-      onResync: () => setCount((n) => n + 1),
+      onResync: () =>
+        setCounts(
+          (was) =>
+            Object.fromEntries(
+              Object.entries<number>(was).map(([kind, n]) => [kind, n + 1]),
+            ) as Record<K, number>,
+        ),
     });
     return () => stream.close();
   }, []);
 
-  return count;
+  return counts;
 }

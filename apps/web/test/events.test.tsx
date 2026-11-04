@@ -1,7 +1,7 @@
 import { act, render, renderHook } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { connectEvents, useEvents } from "../lib/events";
+import { connectEvents, useEvents, useEventsBy } from "../lib/events";
 import { committedData, EVENT_NAMES, FakeEventSource, message } from "./fakeEventSource";
 
 // The stream of `GET /v1/events` over a stand-in for the browser's EventSource. vitest.config.ts
@@ -123,6 +123,52 @@ test("events_drop_a_message_that_is_not_json_or_not_a_message_and_log_it", () =>
 
   expect(seen).toEqual([]);
   expect(log).toHaveBeenCalledTimes(3);
+});
+
+test("events_hear_the_question_boards_events_with_their_task_and_no_text", () => {
+  const { seen, source } = connect();
+
+  // The board's events are the API's own, on the same stream, and each has a listener.
+  for (const name of [
+    "question_asked",
+    "question_answered",
+    "question_hidden",
+    "clarification_posted",
+  ]) {
+    expect(source().listening, name).toContain(name);
+  }
+  source().send(
+    "question_asked",
+    message("question_asked", "7", { task_id: "7", question_id: "1", asker: "bob.testnet" }),
+    "1",
+  );
+  source().send(
+    "question_hidden",
+    message("question_hidden", "7", { task_id: "7", question_id: "1" }),
+    "2",
+  );
+  source().send(
+    "clarification_posted",
+    message("clarification_posted", "8", { task_id: "8", clarification_id: "4" }),
+    "3",
+  );
+
+  expect(seen).toEqual([
+    { event: "question_asked", task_id: "7" },
+    { event: "question_hidden", task_id: "7" },
+    { event: "clarification_posted", task_id: "8" },
+  ]);
+});
+
+test("events_drop_a_board_event_whose_data_does_not_fit_and_log_it", () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
+  const { seen, source } = connect();
+
+  // `question_answered` names its question.
+  source().send("question_answered", message("question_answered", "7", { task_id: "7" }), "1");
+
+  expect(seen).toEqual([]);
+  expect(log).toHaveBeenCalledTimes(1);
 });
 
 test("events_drop_a_known_event_whose_data_does_not_fit_and_log_it", () => {
@@ -553,6 +599,35 @@ test("use_events_close_the_stream_when_the_page_goes", () => {
   view.unmount();
 
   expect(stream.readyState).toBe(FakeEventSource.CLOSED);
+});
+
+test("use_events_by_counts_each_kind_over_one_stream_and_all_of_them_on_a_look_again", () => {
+  const { result } = renderHook(() =>
+    useEventsBy(["task", "board"] as const, (event) =>
+      event.task_id !== "7" ? null : event.event.startsWith("question") ? "board" : "task",
+    ),
+  );
+  expect(result.current).toEqual({ task: 0, board: 0 });
+
+  act(() =>
+    FakeEventSource.latest.send("committed", message("committed", "7", committedData("7")), "1"),
+  );
+  act(() =>
+    FakeEventSource.latest.send(
+      "question_asked",
+      message("question_asked", "7", { task_id: "7", question_id: "1", asker: "bob.testnet" }),
+      "2",
+    ),
+  );
+  act(() =>
+    FakeEventSource.latest.send("committed", message("committed", "8", committedData("8")), "3"),
+  );
+  expect(result.current).toEqual({ task: 1, board: 1 });
+
+  // The stream opened with nothing to resume from: every part looks again.
+  act(() => FakeEventSource.latest.open());
+  expect(result.current).toEqual({ task: 2, board: 2 });
+  expect(FakeEventSource.instances).toHaveLength(1);
 });
 
 /** A component that only listens to the stream. */
