@@ -42,7 +42,7 @@ import {
 } from "@tender/telegram";
 import { parseKey } from "./deploy";
 import { roleMethods } from "./keeper-key";
-import { loadEnv, REPO_ROOT, readEnvFile } from "./lib/env";
+import { deploymentsDirOverride, envDir, loadEnv, readEnvFile } from "./lib/env";
 
 /**
  * `pnpm serve`: the one process that runs the services of a deployment against one database.
@@ -636,11 +636,12 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
  * variable the process sets wins over the files, so that a host's settings override them (a
  * container has no env files at all); one it sets to an empty value counts as unset. The network
  * is the process's `TENDER_NETWORK`, or else `.env`'s. When neither names one, only `.env` is
- * read, and `readServeConfig` says what is wrong.
+ * read, and `readServeConfig` says what is wrong. The files are in `dir`: the repository root, or
+ * the directory the process's `TENDER_ENV_DIR` names, where the indexer finds `deployments/` too.
  */
 export function serveEnv(
   processEnv: Record<string, string | undefined> = process.env,
-  dir: string = REPO_ROOT,
+  dir: string = envDir(processEnv),
 ): Record<string, string> {
   const own: Record<string, string> = {};
   for (const [key, value] of Object.entries(processEnv)) {
@@ -1851,7 +1852,7 @@ async function main(): Promise<void> {
     // errors below, what the packages print to the console of their own, and a crash.
     redactConsole(env);
     exitOnCrash(env);
-    services = await startServices(env);
+    services = await startServices(env, { deploymentsDir: deploymentsDirOverride() });
   } catch (error) {
     console.error(`serve: ${messageOf(error)}`);
     process.exit(1);

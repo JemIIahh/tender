@@ -922,6 +922,87 @@ test("serve_env_lets_a_set_process_variable_win_over_the_files", async () => {
   });
 });
 
+test("serve_env_reads_the_directory_the_process_names_in_tender_env_dir_when_it_is_given_none", async () => {
+  const named = await mkdtemp(join(tmpdir(), "tender-serve-env-"));
+  const empty = await mkdtemp(join(tmpdir(), "tender-serve-env-"));
+  dirs.push(named, empty);
+  await writeFile(join(named, ".env"), "TENDER_NETWORK=testnet\nA=from-env\n");
+  await writeFile(join(named, ".env.deploy.testnet"), "B=from-testnet\n");
+
+  expect(serveEnv({ TENDER_ENV_DIR: named })).toEqual({
+    TENDER_ENV_DIR: named,
+    TENDER_NETWORK: "testnet",
+    A: "from-env",
+    B: "from-testnet",
+  });
+  // A directory with no files is no files, whatever the repository root holds; and a `dir` that is
+  // passed still wins over the variable.
+  expect(serveEnv({ TENDER_ENV_DIR: empty, TENDER_NETWORK: "testnet" })).toEqual({
+    TENDER_ENV_DIR: empty,
+    TENDER_NETWORK: "testnet",
+  });
+  expect(serveEnv({ TENDER_ENV_DIR: empty }, named)).toMatchObject({ A: "from-env" });
+});
+
+/** `scripts/serve.ts` as a process on `env` alone, for a start that fails before it reaches a network. */
+function serveFailure(
+  env: Record<string, string>,
+): Promise<{ code: number | null; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--import", "tsx", "scripts/serve.ts"], {
+      cwd: REPO_ROOT,
+      // The RPC is a port nothing listens on, so that no start can reach a real node.
+      env: { PATH: process.env.PATH ?? "", NEAR_RPC_URL: "http://127.0.0.1:1", ...env },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 90_000);
+    let stderr = "";
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stderr });
+    });
+  });
+}
+
+test("the_process_reads_its_env_files_and_its_deployment_record_from_tender_env_dir", async () => {
+  const withFile = await mkdtemp(join(tmpdir(), "tender-serve-env-"));
+  const empty = await mkdtemp(join(tmpdir(), "tender-serve-env-"));
+  dirs.push(withFile, empty);
+  await writeFile(
+    join(withFile, ".env.deploy.testnet"),
+    "TENDER_CONTRACT=tender.tender-dev.testnet\nKEEPER_ACCOUNT=keeper.tender-dev.testnet\nKEEPER_PRIVATE_KEY=not-a-key\n",
+  );
+
+  // The file of the named directory is the one read: it holds the keeper's key, which is no key.
+  const named = await serveFailure({ TENDER_NETWORK: "testnet", TENDER_ENV_DIR: withFile });
+  expect(named.code, named.stderr).toBe(1);
+  expect(named.stderr).toContain("KEEPER_PRIVATE_KEY is not a valid private key");
+  expect(named.stderr).not.toContain("TENDER_CONTRACT must be");
+
+  // A directory without it is a start with nothing: no file of the repository's is read instead.
+  const none = await serveFailure({ TENDER_NETWORK: "testnet", TENDER_ENV_DIR: empty });
+  expect(none.code, none.stderr).toBe(1);
+  expect(none.stderr).toContain("TENDER_CONTRACT must be the account id of the Tender contract");
+  expect(none.stderr).not.toContain("KEEPER_PRIVATE_KEY");
+
+  // The indexer looks for the deploy's record in `deployments/` of the same directory.
+  const noRecord = await serveFailure({
+    TENDER_NETWORK: "testnet",
+    TENDER_ENV_DIR: empty,
+    TENDER_CONTRACT: "tender.tender-dev.testnet",
+    DATABASE_URL: "pglite:memory",
+    PUBLIC_API_URL: "http://127.0.0.1:3001",
+  });
+  expect(noRecord.code, noRecord.stderr).toBe(1);
+  expect(noRecord.stderr).toContain(
+    `set INDEXER_START_HEIGHT (there is no ${join(empty, "deployments", "testnet.json")})`,
+  );
+}, 180_000);
+
 // ---- The keeper's key -------------------------------------------------------------------------
 
 test("the_keeper_key_check_takes_only_a_function_call_key_for_the_keepers_methods", async () => {

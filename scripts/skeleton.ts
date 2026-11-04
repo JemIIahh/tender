@@ -20,7 +20,7 @@ import {
   tokenStorageDepositCall,
   USDC_DECIMALS,
 } from "@tender/shared";
-import { loadEnv, REPO_ROOT } from "./lib/env";
+import { envDir, loadEnv } from "./lib/env";
 
 /**
  * The walking skeleton: one script that runs a whole task on a chain, from a deposit to a
@@ -174,7 +174,7 @@ function sandboxTarget(chain: LocalChain): Target {
  * what is missing, before it reads anything from the network; the keys come first, since they are
  * the owner's to provide.
  */
-export async function loadTestnetTarget(dir: string = REPO_ROOT): Promise<Target> {
+export async function loadTestnetTarget(dir: string = envDir()): Promise<Target> {
   const env = loadEnv("testnet", { required: TESTNET_KEYS, dir });
   const { contract, tusdc } = await readDeployment(dir);
   return {

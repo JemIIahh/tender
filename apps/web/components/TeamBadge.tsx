@@ -23,15 +23,20 @@ export function TeamBadge({
       >
         {account}
       </span>
-      {isTeam ? (
-        <span
-          data-testid="team-badge"
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-current/30 px-2 py-0.5 text-[11px] leading-4 font-medium whitespace-nowrap"
-        >
-          <span aria-hidden="true" className="size-1.5 rounded-full bg-seal" />
-          Run by Tender team
-        </span>
-      ) : null}
+      {isTeam ? <TeamLabel /> : null}
+    </span>
+  );
+}
+
+/** The label alone, for a place that names the account in its own way (a provider's card). */
+export function TeamLabel() {
+  return (
+    <span
+      data-testid="team-badge"
+      className="inline-flex w-fit shrink-0 items-center gap-1.5 rounded-full border border-current/30 px-2 py-0.5 text-[11px] leading-4 font-medium whitespace-nowrap"
+    >
+      <span aria-hidden="true" className="size-1.5 rounded-full bg-seal" />
+      Run by Tender team
     </span>
   );
 }
