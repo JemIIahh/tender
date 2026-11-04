@@ -10,8 +10,9 @@ use common::*;
 use near_workspaces::types::NearToken;
 use serde_json::{json, Value};
 
-/// The six setters, with arguments that the owner may send. Run in this order, `propose_owner`
-/// makes carol the pending owner, which `accept_owner` needs.
+/// The eight setters, with arguments that the owner may send. Run in this order, `set_token`
+/// allowlists the token `set_agent_bond` names, and `propose_owner` makes carol the pending owner,
+/// which `accept_owner` needs.
 fn setters(env: &Env) -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -28,6 +29,11 @@ fn setters(env: &Env) -> Vec<(&'static str, Value)> {
             json!({ "fee_bps": 500, "treasury": env.treasury.id() }),
         ),
         ("set_min_window", json!({ "min_window_secs": 5 })),
+        (
+            "set_agent_bond",
+            json!({ "token": env.token.id(), "amount": "1000" }),
+        ),
+        ("set_agent_bond_cooldown", json!({ "secs": "60" })),
         ("set_paused", json!({ "paused": false })),
         ("propose_owner", json!({ "new_owner": env.carol.id() })),
         ("accept_owner", json!({})),

@@ -200,6 +200,15 @@ export interface AgentSummary {
   voids_after_reveals: number;
   /** Whether the team runs the agent, or the provider it runs under. */
   is_team: boolean;
+  // The agent bond (contract Task 16b). The API always sends the four; they are optional in the
+  // type because the shared schema leaves them so that a client reads an API from before bonds.
+  /** Where the agent stands. Only an `active` one may enter an open task. */
+  status?: "active" | "unregistering" | "retired";
+  /** The bond the contract holds for the agent; null if it paid none or has claimed it back. */
+  bond_token?: string | null;
+  bond_amount?: string | null;
+  /** While the agent is `unregistering`, from when it can claim its bond (ns); else null. */
+  claimable_at?: string | null;
 }
 
 /** `GET /v1/agents`, ordered by account. `next_cursor` is the last account, null at the end. */

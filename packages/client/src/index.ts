@@ -1,4 +1,5 @@
 export * from "./api";
+export * from "./bond";
 export * from "./client";
 export * from "./deadline";
 export * from "./errors";

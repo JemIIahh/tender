@@ -1,7 +1,13 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type LocalChain, type LocalRole, startLocalChain, TenderClient } from "@tender/client";
+import {
+  type LocalChain,
+  type LocalRole,
+  registerLocalAgent,
+  startLocalChain,
+  TenderClient,
+} from "@tender/client";
 import { type Db, migrate, openDb } from "@tender/db";
 import { computeCommitment, randomSalt, sha256Hex } from "@tender/shared";
 import { afterAll, beforeAll, expect, test } from "vitest";
@@ -261,13 +267,16 @@ test("reconcile_repairs_missing_task", async () => {
   try {
     await started(db);
 
-    // A task in its commit window, entered by alice, a registered agent.
+    // A task in its commit window, entered by the lead, a registered agent. The lead is not an
+    // entrant of the skeleton run that the tests before this one make: alice and bob are, and
+    // registered with a bond then, so their records already count those entries, and a record that
+    // starts here counts only this one.
     const poster = clientOf("poster");
-    const alice = clientOf("alice");
-    const aliceId = chain.accounts.alice.accountId;
+    const lead = clientOf("lead");
+    const leadId = chain.accounts.lead.accountId;
     const reward = 1_000_000n;
     await poster.deposit(chain.tokenId, reward);
-    await alice.registerAgent("ipfs://alice-profile", sha256Hex("alice profile"), ["extraction"]);
+    await registerLocalAgent(chain, "lead", ["extraction"]);
     const { taskId } = await poster.postTask({
       token: chain.tokenId,
       reward,
@@ -280,10 +289,10 @@ test("reconcile_repairs_missing_task", async () => {
       pickSecs: 120,
       fallbackSecs: 120,
     });
-    await alice.commit(taskId, computeCommitment(taskId, aliceId, sha256Hex("work"), randomSalt()));
+    await lead.commit(taskId, computeCommitment(taskId, leadId, sha256Hex("work"), randomSalt()));
     await caughtUp(db);
     // A pass leaves alone what changed within 20 blocks of the index's height (the RPC skew it
-    // allows for): the index goes on that far past alice's registration and commit first.
+    // allows for): the index goes on that far past the lead's registration and commit first.
     const past = (await reader.finalHeight()) + 21n;
     await until(`the index reaches block ${past}`, async () => {
       const height = await indexedHeight(db);
@@ -295,13 +304,13 @@ test("reconcile_repairs_missing_task", async () => {
     const fundersBefore = await fundersOf(db, taskId);
     expect(entriesBefore).toHaveLength(1);
 
-    // The index loses the task, and alice's counters go back to zero, as in an index that started
-    // after both.
+    // The index loses the task, and the lead's counters go back to zero, as in an index that
+    // started after both.
     await db.query("delete from events where task_id = $1", [taskId]);
     await db.query("delete from entries where task_id = $1", [taskId]);
     await db.query("delete from funders where task_id = $1", [taskId]);
     await db.query("delete from tasks where id = $1", [taskId]);
-    await db.query("update agents set entries = 0, earned = '{}' where account = $1", [aliceId]);
+    await db.query("update agents set entries = 0, earned = '{}' where account = $1", [leadId]);
 
     const repairs: string[] = [];
     const result = await reconcile(db, reader, { log: (line) => repairs.push(line) });
@@ -312,13 +321,13 @@ test("reconcile_repairs_missing_task", async () => {
     expect(await entriesOf(db, taskId)).toEqual(entriesBefore);
     expect(await fundersOf(db, taskId)).toEqual(fundersBefore);
     const [agent] = await db.query("select entries, earned from agents where account = $1", [
-      aliceId,
+      leadId,
     ]);
     expect(agent).toEqual({ entries: 1, earned: { [chain.tokenId]: "0" } });
     expect(repairs).toEqual([
       `WARN reconcile task=${taskId} inserted from the chain`,
-      `WARN reconcile agent=${aliceId} field=entries`,
-      `WARN reconcile agent=${aliceId} field=earned`,
+      `WARN reconcile agent=${leadId} field=entries`,
+      `WARN reconcile agent=${leadId} field=earned`,
     ]);
 
     // A second pass finds nothing left to repair.

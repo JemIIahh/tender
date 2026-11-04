@@ -52,6 +52,7 @@ pub const FEE_BPS: u16 = 500;
 pub const POST_TASK_GAS: Gas = Gas::from_tgas(30);
 pub const TOP_UP_TASK_GAS: Gas = Gas::from_tgas(20);
 pub const VOID_TASK_GAS: Gas = Gas::from_tgas(60);
+pub const REGISTER_AGENT_GAS: Gas = Gas::from_tgas(15);
 
 /// The fee a pick takes from `reward` at `FEE_BPS`, rounded down as the contract does.
 pub fn fee_of(reward: u128) -> u128 {

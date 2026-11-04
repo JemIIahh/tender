@@ -383,7 +383,11 @@ function agentColumns(team: string): string {
     a.earned,
     a.picks_made,
     a.voids_after_reveals,
-    ${teamSql("a.account", team)} as is_team`;
+    ${teamSql("a.account", team)} as is_team,
+    a.status,
+    a.bond_token,
+    a.bond_amount::text as bond_amount,
+    a.claimable_at::text as claimable_at`;
 }
 
 export interface AgentFilter {

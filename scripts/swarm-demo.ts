@@ -15,6 +15,7 @@ import {
 import {
   ApiClient,
   type LocalChain,
+  registerLocalAgent,
   type Signer,
   TenderClient,
   TenderError,
@@ -49,6 +50,11 @@ import { seed } from "./seed";
  * chain, with nothing but Node and pnpm. It starts what `pnpm demo:local` starts (a local chain, and
  * the API, the indexer, the keeper and the Judge on an in-memory database) and then plays this:
  *
+ * - The lead, alice and bob each register as an agent with the bond the contract names (contract
+ *   Task 16b: only a registered agent whose bond the contract holds may enter an open task, and the
+ *   lead enters the parent and alice and bob the sub-tasks). They do it with their own full-access
+ *   keys, which register, unregister and claim and which a delegate key cannot, once the services are
+ *   up so that the index sees it; the lead's bond is paid before its 6 tUSDC are put in the vault.
  * - The lead holds a **delegate key**: a function-call key for Tender, limited to `post_task`,
  *   `top_up_task`, `commit` and `reveal`, with a finite allowance (1 NEAR) for gas, that its
  *   account registered with `add_delegate` for 2 tUSDC a task and 6 tUSDC in all. The key can spend
@@ -77,6 +83,7 @@ import { seed } from "./seed";
  *
  *   Scripted demo agents run by the Tender team (offline solvers)
  *   CHAIN sandbox nearcore <the version the node reports>
+ *   REGISTERED lead, alice, bob bond=<amount> each
  *   LEAD key <public key> per_task_cap=2.00 tUSDC total_cap=6.00 tUSDC methods=... allowance=1 NEAR
  *   PARENT task=<id>
  *   LEAD placeholder committed
@@ -382,6 +389,31 @@ async function swarm(h: Harness): Promise<void> {
       timeoutMs: API_TIMEOUT_MS,
       signal: h.signal,
     });
+
+  // Every entrant is a registered agent with a bond, the lead included, which enters the parent.
+  // The lead's bond is paid first, so that the 6 tUSDC it then deposits are all that its vault holds.
+  const team = [
+    ["lead", [LEAD_TAG]],
+    ["alice", ["extraction"]],
+    ["bob", ["extraction"]],
+  ] as const;
+  await limited(
+    "registering the lead, alice and bob with a bond",
+    STEP_MS,
+    Promise.all(team.map(([role, tags]) => registerLocalAgent(chain, role, tags))),
+    h.signal,
+  );
+  const bonded = await until(h, "REGISTERED", STEP_MS, async () => {
+    const listed = await Promise.all(
+      team.map(([role]) => api.getAgent(chain.accounts[role].accountId)),
+    );
+    const missing = team.filter((_, i) => listed[i]?.agent.status !== "active").map(([r]) => r);
+    const bond = listed[0]?.agent.bond_amount;
+    return missing.length > 0 || bond === undefined || bond === null
+      ? waiting(`the API does not list ${missing.join(" and ")} as active with a bond yet`)
+      : ready(bond);
+  });
+  say(`REGISTERED ${team.map(([role]) => role).join(", ")} bond=${amountOf(bonded, token)} each`);
 
   // The lead's owner sets its key and its caps. From here the agent holds the function-call key.
   const equipped = await equipLead(chain, chainReader);

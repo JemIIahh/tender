@@ -140,7 +140,7 @@ async fn gas_report() -> anyhow::Result<()> {
                 "tags": ["rust"],
             })
         },
-        NO_DEPOSIT,
+        ONE_YOCTO,
     )
     .await?;
     report.add_worst("register_agent, first registration", &profiles, None);
@@ -282,6 +282,11 @@ async fn gas_report() -> anyhow::Result<()> {
             json!({ "fee_bps": 500, "treasury": env.treasury.id() }),
         ),
         ("set_min_window", json!({ "min_window_secs": 5 })),
+        (
+            "set_agent_bond",
+            json!({ "token": env.token.id(), "amount": "1000" }),
+        ),
+        ("set_agent_bond_cooldown", json!({ "secs": "60" })),
         ("set_paused", json!({ "paused": false })),
         ("propose_owner", json!({ "new_owner": env.carol.id() })),
     ] {

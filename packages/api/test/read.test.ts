@@ -17,6 +17,8 @@ import {
   putFixtureBlobs,
 } from "@tender/indexer/testing";
 import {
+  type AgentSummary,
+  AgentSummarySchema,
   type Brief,
   canonicalJson,
   type Phase,
@@ -873,6 +875,11 @@ test("agents_list_filters_and_paginates", async () => {
     picks_made: 0,
     voids_after_reveals: 0,
     is_team: false,
+    // Registered before any bond was set: active, and none to claim.
+    status: "active",
+    bond_token: null,
+    bond_amount: null,
+    claimable_at: null,
   });
   // bob's profile is not stored, so he has no name.
   expect(second).toMatchObject({
@@ -909,6 +916,49 @@ test("agents_list_filters_and_paginates", async () => {
 
   for (const query of ["limit=0", "cursor=NOT AN ACCOUNT", "asp=NOT AN ACCOUNT", "tag=Bad_Tag"]) {
     expect((await get(`/v1/agents?${query}`)).status, query).toBe(400);
+  }
+});
+
+test("agents_show_their_status_and_bond_in_the_list_and_the_detail", async () => {
+  await seedLifecycle(deps.db);
+  // The bond events were captured for alice.sandbox, so each is patched to its agent here.
+  await apply(
+    eventLine("agent_bonded", { account: alice, token: FIXTURE_TOKEN, amount: "1000000" }),
+    eventLine("agent_bonded", { account: bob, token: FIXTURE_TOKEN, amount: "1000000" }),
+    eventLine("agent_unregistering", { account: bob, claimable_at: "1793745956336648000" }),
+    eventLine("agent_bond_claimed", { account: judge }),
+  );
+
+  const listed = (await get<ListAgentsResponse>("/v1/agents")).body.agents;
+  const standing = (a: AgentSummary) => ({
+    status: a.status,
+    bond_token: a.bond_token,
+    bond_amount: a.bond_amount,
+    claimable_at: a.claimable_at,
+  });
+  expect(listed.map((a) => [a.account, standing(a)])).toEqual([
+    [
+      alice,
+      { status: "active", bond_token: FIXTURE_TOKEN, bond_amount: "1000000", claimable_at: null },
+    ],
+    [
+      bob,
+      {
+        status: "unregistering",
+        bond_token: FIXTURE_TOKEN,
+        bond_amount: "1000000",
+        claimable_at: "1793745956336648000",
+      },
+    ],
+    [judge, { status: "retired", bond_token: null, bond_amount: null, claimable_at: null }],
+  ]);
+
+  // The detail of an agent carries the same four fields as its row in the list, as strings for
+  // the two numbers.
+  for (const agent of listed) {
+    const detail = await get<AgentDetailResponse>(`/v1/agents/${agent.account}`);
+    expect(detail.body.agent, agent.account).toEqual(agent);
+    expect(AgentSummarySchema.safeParse(detail.body.agent).success, agent.account).toBe(true);
   }
 });
 

@@ -2561,6 +2561,18 @@ mod tests {
         }
     }
 
+    /// Gives `who` a storage balance, `amount` in its vault and an agent profile, so that it can
+    /// enter the open parents below and post sub-tasks.
+    fn entrant(t: &mut Tender, who: &str, amount: u128) {
+        funder(t, who, amount);
+        testing_env!(ctx(who).attached_deposit(ONE_YOCTO).build());
+        t.register_agent(
+            "https://acme.example/agent.json".to_string(),
+            BRIEF_HASH.to_string(),
+            vec![],
+        );
+    }
+
     /// `who` enters task `id` at block time `now`, which must go through. The commitment is any
     /// 32 bytes: the contract only checks it against a reveal.
     fn enter_at(t: &mut Tender, who: &str, now: u64, id: u64) {
@@ -2599,7 +2611,7 @@ mod tests {
     fn child_requires_entry_on_parent() {
         let mut t = world();
         for who in ["bob.test", "carol.test", "judge.test"] {
-            funder(&mut t, who, 5 * REWARD);
+            entrant(&mut t, who, 5 * REWARD);
         }
         let parent_id = post(
             &mut t,
@@ -2684,8 +2696,8 @@ mod tests {
     fn child_must_settle_before_parent_commit_deadline() {
         // I12. The parent's commit window is 180 s, so it ends at `deadline`.
         let mut t = world();
-        funder(&mut t, "bob.test", 20 * REWARD);
-        funder(&mut t, "carol.test", 20 * REWARD);
+        entrant(&mut t, "bob.test", 20 * REWARD);
+        entrant(&mut t, "carol.test", 20 * REWARD);
         post(&mut t, parent());
         let deadline = T1 + 180 * SEC;
         assert_eq!(view(&t, 1).commit_deadline, U64(deadline));
@@ -2824,8 +2836,8 @@ mod tests {
     #[test]
     fn parent_must_exist_and_be_open() {
         let mut t = world();
-        funder(&mut t, "bob.test", 20 * REWARD);
-        funder(&mut t, "carol.test", 20 * REWARD);
+        entrant(&mut t, "bob.test", 20 * REWARD);
+        entrant(&mut t, "carol.test", 20 * REWARD);
         let named = |id| PostTaskArgs {
             parent: Some(U64(id)),
             ..child()
@@ -2912,8 +2924,8 @@ mod tests {
         // reported for the first rule it breaks, which is the order of the list: the parent
         // exists, it is not settled, the poster has an entry on it, the windows end in time.
         let mut t = world();
-        funder(&mut t, "bob.test", 20 * REWARD);
-        funder(&mut t, "carol.test", 20 * REWARD);
+        entrant(&mut t, "bob.test", 20 * REWARD);
+        entrant(&mut t, "carol.test", 20 * REWARD);
         let too_long = |id| PostTaskArgs {
             parent: Some(U64(id)),
             ..args()

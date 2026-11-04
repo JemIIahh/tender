@@ -276,8 +276,9 @@ mod delegate {
 
     /// A key that may spend is never a key that judges. The judge's delegate key cannot pick, even
     /// when its access key may call `pick`, so a leaked one cannot award the tasks the judge
-    /// verifies. The judge's full-access key can, and so can a function-call key of the judge
-    /// that is no delegate, which is how the Judge service signs its picks.
+    /// verifies; relayed as a meta-transaction it is refused too (metatx.rs). The judge's
+    /// full-access key can, and so can a function-call key of the judge that is no delegate,
+    /// which is how the Judge service signs its picks.
     #[tokio::test]
     async fn verifier_delegate_key_cannot_pick() -> anyhow::Result<()> {
         let env = setup(5).await?;

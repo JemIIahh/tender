@@ -64,6 +64,13 @@ export const TenderEventSchema = z.discriminatedUnion("event", [
     tags: z.array(z.string()),
     updated: z.boolean(),
   }),
+  // Task 16b, the agent bond. `agent_bonded` follows the `agent_registered` of a registration that
+  // took a bond; `agent_unregistering` and `agent_bond_claimed` are the way out. An agent that
+  // registered before the owner set a bond has none to claim: its `agent_bond_claimed` has a null
+  // `token` and the amount "0". `claimable_at` is the time (ns) from which the bond can be claimed.
+  variant("agent_bonded", { account, token: account, amount: u128 }),
+  variant("agent_unregistering", { account, claimable_at: u64 }),
+  variant("agent_bond_claimed", { account, token: account.nullable(), amount: u128 }),
   // The new task as `get_task` shows it, so the id is `id` here and `task_id` in the other events.
   // `brief_uri`: arbitrary text from the chain, see "uri" in the legend above.
   variant("task_created", {

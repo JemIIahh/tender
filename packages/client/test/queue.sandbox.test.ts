@@ -11,7 +11,8 @@ const TASKS = 5;
 let chain: LocalChain;
 
 beforeAll(async () => {
-  chain = await startLocalChain();
+  // Alice enters open tasks, which take only registered agents.
+  chain = await startLocalChain({ registerAgents: ["alice"] });
 });
 
 afterAll(async () => {

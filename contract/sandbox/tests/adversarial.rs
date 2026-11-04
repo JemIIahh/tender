@@ -3,6 +3,8 @@
 //! shows that the attack is refused, that a refusal changes nothing in Tender's storage, and, where
 //! money is involved, that the token Tender holds is still accounted for.
 //!
+//! `forty_nine_unbonded_fillers_refused` was added with the agent bond (Task 16b).
+//!
 //! `ft_on_transfer_never_panics_on_random_msg` is the unit-level part of the suite: a property test
 //! in contract/tender/src/vault.rs, since the sandbox crate has no proptest. The delegate keys'
 //! part, `verifier_delegate_key_cannot_pick`, is in delegate.rs with the other delegate tests.
@@ -313,7 +315,7 @@ async fn implicit_64_hex_account_commits_and_wins() -> anyhow::Result<()> {
             "profile_hash": hex(&sha256(b"profile")),
             "tags": ["implicit"],
         }),
-        NO_DEPOSIT,
+        ONE_YOCTO,
     )
     .await?;
     assert!(event(&clean(r)?, "agent_registered")["asp"].is_null());
@@ -680,5 +682,84 @@ async fn new_funder_without_storage_is_refused_and_nothing_changes() -> anyhow::
     )?;
     assert_eq!(num(&get_task(&env, id).await?["reward"]), 2 * REWARD);
     assert_conserved(&env, &[dave.id()]).await?;
+    Ok(())
+}
+
+/// The P05-R21 capture case (Task 16b): 49 cheap accounts take the places that the Judge grades
+/// on an open rubric task, so a real entrant is crowded out. An open task now takes entries only
+/// from active registered agents, and with a bond set, registering costs the bond, so 49 fillers
+/// need 49 bonds. These have none: every filler is refused, both its entry and its registration,
+/// nothing changes, and an agent still enters.
+#[tokio::test]
+async fn forty_nine_unbonded_fillers_refused() -> anyhow::Result<()> {
+    let env = setup(5).await?;
+    let bond = json!({ "token": env.token.id(), "amount": REWARD.to_string() });
+    done_clean(call(&env, &env.owner, "set_agent_bond", bond, ONE_YOCTO).await?)?;
+    let (id, _) = post_judged(&env, REWARD, 1).await?;
+    // Each filler has 1 NEAR, so its calls prepay 30 Tgas (`light_call`), not 300.
+    let fillers = create_entrants(&env, 49, 1).await?;
+    all(fillers
+        .iter()
+        .map(|who| {
+            let (env, who) = (env.clone(), who.clone());
+            async move { done(light_call(&env, &who, "storage_deposit", json!({}), STORAGE).await?) }
+        })
+        .collect())
+    .await?;
+
+    let before = stored(&env).await?;
+    let commits = all(fillers
+        .iter()
+        .map(|who| {
+            let (env, who) = (env.clone(), who.clone());
+            async move {
+                let args = commit_args(id, who.id(), &seal(id, who.id(), b"filler"));
+                light_call(&env, &who, "commit", args, NO_DEPOSIT).await
+            }
+        })
+        .collect())
+    .await?;
+    let registrations = all(fillers
+        .iter()
+        .map(|who| {
+            let (env, who) = (env.clone(), who.clone());
+            async move {
+                let profile = json!({
+                    "profile_uri": "ipfs://filler",
+                    "profile_hash": hex(&sha256(who.id().as_bytes())),
+                    "tags": [],
+                });
+                light_call(&env, &who, "register_agent", profile, ONE_YOCTO).await
+            }
+        })
+        .collect())
+    .await?;
+    for r in &commits {
+        assert_fails_with(
+            r,
+            "E_NOT_REGISTERED: open tasks take entries only from registered agents",
+        );
+        assert!(events(r).is_empty(), "a refusal logged {:?}", events(r));
+    }
+    for r in &registrations {
+        assert_fails_with(r, "E_FUNDS: insufficient vault balance");
+    }
+    assert!(
+        stored(&env).await? == before,
+        "49 refused fillers changed Tender's storage"
+    );
+    assert_eq!(get_task(&env, id).await?["commit_count"], 0);
+
+    // alice registered before the bond was set, so she holds none, and is refused too until she
+    // registers again, which takes the bond. Then she enters.
+    let sealed = seal(id, env.alice.id(), b"alice's work");
+    let r = commit_call(&env, &env.alice, id, &sealed).await?;
+    assert_fails_with(&r, "holds none: call register_agent to pay it");
+    deposit(&env, &env.alice, REWARD).await?;
+    let r = clean(register_agent_call(&env, &env.alice).await?)?;
+    assert_eq!(event(&r, "agent_bonded")["amount"], REWARD.to_string());
+    commit_work(&env, &env.alice, id, b"alice's work").await?;
+    assert_eq!(get_task(&env, id).await?["commit_count"], 1);
+    assert_conserved(&env, &[]).await?;
     Ok(())
 }

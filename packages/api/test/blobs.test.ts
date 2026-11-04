@@ -2714,16 +2714,16 @@ test("a_result_is_usable_by_its_uploader_while_hidden_and_by_anyone_once_served"
 });
 
 test("a_result_stored_before_the_records_is_served_after_the_upgrade", async () => {
-  // A database that was set up before the records existed: migration 0001 alone, with no table of
-  // them.
+  // A database that was set up before the records existed: migration 0001, with no table of them.
+  // Migration 0006 is in it too, because the indexer's projection of an agent writes the columns it
+  // adds; it touches nothing that the upgrade under test does.
   const dir = await mkdtemp(join(tmpdir(), "tender-0001-"));
   const old = await openDb("pglite:memory");
   try {
-    await copyFile(
-      new URL("../../db/migrations/0001_init.sql", import.meta.url),
-      join(dir, "0001_init.sql"),
-    );
-    expect(await migrate(old, dir)).toEqual(["0001_init.sql"]);
+    for (const file of ["0001_init.sql", "0006_agent_bond.sql"]) {
+      await copyFile(new URL(`../../db/migrations/${file}`, import.meta.url), join(dir, file));
+    }
+    expect(await migrate(old, dir)).toEqual(["0001_init.sql", "0006_agent_bond.sql"]);
     await seedLifecycle(old);
     const applyOld = (...lines: string[]) =>
       applyBlock(old, blockOf(nextHeight++, lines), FIXTURE_OPTIONS);

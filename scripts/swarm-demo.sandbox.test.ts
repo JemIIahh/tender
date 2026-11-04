@@ -69,7 +69,9 @@ test(
     const chain = find(lines, /^CHAIN sandbox nearcore /);
 
     // The lead's key: caps of 2.00 and 6.00 tUSDC, four methods, and a finite allowance.
-    const key = find(lines, /^LEAD key /, chain.at);
+    // The lead, alice and bob register with the bond before the lead's key is set up.
+    const registered = find(lines, /^REGISTERED lead, alice, bob bond=1\.00 tUSDC each$/, chain.at);
+    const key = find(lines, /^LEAD key /, registered.at);
     expect(lines[key.at]).toContain("per_task_cap=2.00 tUSDC");
     expect(lines[key.at]).toContain("total_cap=6.00 tUSDC");
     expect(lines[key.at]).toContain("methods=post_task,top_up_task,commit,reveal");

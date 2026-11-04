@@ -12,7 +12,10 @@ import {
 import { Account, actions, KeyPair, type KeyPairString } from "near-api-js";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import {
+  LOCAL_AGENT_BOND,
   type LocalChain,
+  registerLocalAgent,
+  registerWithBond,
   startLocalChain,
   TenderClient,
   TenderError,
@@ -26,6 +29,7 @@ import {
 type Role = keyof LocalChain["accounts"];
 
 const REWARD = 1_000_000n;
+const LOCAL_BOND = LOCAL_AGENT_BOND;
 const TGAS = 1_000_000_000_000n;
 /** An account that exists nowhere, so no token has registered it. */
 const NOBODY = "nobody.sandbox";
@@ -144,6 +148,8 @@ test("local_chain_boots_and_reads_config", async () => {
 
 test("full_flow_through_client", async () => {
   const { poster, alice, bob, judge } = clients;
+  // Open tasks take entries only from registered agents, each with the bond.
+  await Promise.all([registerLocalAgent(chain, "alice"), registerLocalAgent(chain, "bob")]);
 
   const deposited = await poster.deposit(chain.tokenId, REWARD);
   expect(names(deposited)).toEqual(["deposit"]);
@@ -286,7 +292,7 @@ test("withdraw_to_unregistered_yields_withdraw_failed_only", async () => {
 });
 
 test("views_return_string_numbers", async () => {
-  const { keeper, alice } = clients;
+  const { keeper, lead } = clients;
   const { posted, task } = await postTask();
   const above2to53 = (value: string) => BigInt(value) > 2n ** 53n;
 
@@ -321,18 +327,31 @@ test("views_return_string_numbers", async () => {
     available: "0",
   });
 
-  const registered = await alice.registerAgent("ipfs://alice-profile", sha256Hex("alice"), [
-    "analysis",
-  ]);
-  expect(names(registered)).toEqual(["agent_registered"]);
-  expectEveryLogAccountedFor(registered);
-  const agent = await keeper.getAgent(id("alice"));
-  expect(agent?.profile_uri).toBe("ipfs://alice-profile");
+  // Lead registers here, for the first time: the bond comes out of the vault that the client moves
+  // it into first, so the registration is `agent_registered` and then `agent_bonded`.
+  const registration = await registerWithBond(
+    lead,
+    { uri: "ipfs://lead-profile", hash: sha256Hex("lead"), tags: ["analysis"] },
+    { approve: () => true },
+  );
+  expect(names(registration.tx)).toEqual(["agent_registered", "agent_bonded"]);
+  expectEveryLogAccountedFor(registration.tx);
+  const agent = await keeper.getAgent(id("lead"));
+  expect(agent?.profile_uri).toBe("ipfs://lead-profile");
+  expect(agent).toMatchObject({
+    status: "active",
+    bond_token: chain.tokenId,
+    bond_amount: LOCAL_BOND.toString(),
+    claimable_at: null,
+    locked_until: null,
+  });
   expect(above2to53(agent?.registered_at ?? "0")).toBe(true);
 
-  const sealed = seal(posted.taskId, id("alice"), "work");
-  await alice.commit(posted.taskId, sealed.commitment);
-  const entry = await keeper.getEntry(posted.taskId, id("alice"));
+  const sealed = seal(posted.taskId, id("lead"), "work");
+  await lead.commit(posted.taskId, sealed.commitment);
+  // An entry in an open task holds the agent's bond until the task's commit deadline.
+  expect((await keeper.getAgent(id("lead")))?.locked_until).toBe(task.commit_deadline);
+  const entry = await keeper.getEntry(posted.taskId, id("lead"));
   expect(entry?.committed_at_block).toBeTypeOf("string");
   expect(entry?.commitment).toBe(sealed.commitment);
 
@@ -350,6 +369,7 @@ test("get_all_entries_skips_what_cleanup_removed", async () => {
   const { alice, bob, lead, keeper } = clients;
   const { posted, task } = await postTask();
   const taskId = posted.taskId;
+  // Alice and bob registered in the full flow, and lead in the views test.
   await Promise.all(
     [alice, bob, lead].map((c) =>
       c.commit(taskId, seal(taskId, c.accountId ?? "", "unrevealed").commitment),

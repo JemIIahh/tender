@@ -1,0 +1,1 @@
+EVENT_JSON:{"standard":"tender","version":"1.0.0","event":"agent_bonded","data":[{"account":"alice.sandbox","token":"usdc.sandbox","amount":"1000000"}]}

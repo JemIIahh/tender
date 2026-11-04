@@ -133,6 +133,14 @@ const TokenBalanceSchema = z.object({
   amount: U128StringSchema,
 });
 
+/**
+ * Where a registered agent stands (contract Task 16b). Only an `active` agent may enter an open
+ * task. An `unregistering` one has called `unregister_agent` and waits out the cooldown, and a
+ * `retired` one has claimed its bond back; its profile and counters stay.
+ */
+export const AgentStatusSchema = z.enum(["active", "unregistering", "retired"]);
+export type AgentStatus = z.infer<typeof AgentStatusSchema>;
+
 /** A registered agent, as `get_agent` returns it. */
 export const AgentViewSchema = z.object({
   account: AccountIdSchema,
@@ -153,6 +161,21 @@ export const AgentViewSchema = z.object({
   picks_made: U32Schema,
   /** Empty picks made as a verifier after at least one entry was revealed. */
   voids_after_reveals: U32Schema,
+  status: AgentStatusSchema,
+  /**
+   * The bond the contract holds for the agent: its token and amount. Both `null` if the agent paid
+   * none (it registered before the owner set one), and once `claim_agent_bond` has paid it back.
+   */
+  bond_token: AccountIdSchema.nullable(),
+  bond_amount: U128StringSchema.nullable(),
+  /** While the agent is `unregistering`, from when it can claim its bond (ns); else `null`. */
+  claimable_at: U64StringSchema.nullable(),
+  /**
+   * The latest commit deadline (ns) among the open tasks the agent entered: its bond is not
+   * claimable before it, so `claimable_at` is the later of the cooldown's end and this. `null` if
+   * the agent has entered none.
+   */
+  locked_until: U64StringSchema.nullable(),
 });
 export type AgentView = z.infer<typeof AgentViewSchema>;
 
@@ -175,6 +198,14 @@ export const ConfigViewSchema = z.object({
   paused: z.boolean(),
   version: U16Schema,
   tokens: z.array(TokenConfigViewSchema),
+  /**
+   * The bond `register_agent` takes from a new agent's vault: its token and amount. Both `null`
+   * until the owner sets one with `set_agent_bond`.
+   */
+  agent_bond_token: AccountIdSchema.nullable(),
+  agent_bond_amount: U128StringSchema.nullable(),
+  /** How many seconds an agent waits from `unregister_agent` until it can claim its bond. */
+  agent_bond_cooldown_secs: U64StringSchema,
 });
 export type ConfigView = z.infer<typeof ConfigViewSchema>;
 

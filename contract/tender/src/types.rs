@@ -44,6 +44,12 @@ pub const GAS_FT_TRANSFER: Gas = Gas::from_tgas(10);
 pub const GAS_ON_WITHDRAW: Gas = Gas::from_tgas(10);
 /// Least prepaid gas `withdraw` accepts.
 pub const MIN_WITHDRAW_GAS: Gas = Gas::from_tgas(35);
+/// Longest wait `set_agent_bond_cooldown` takes between `unregister_agent` and
+/// `claim_agent_bond`: four times the longest window, 56 days.
+pub const MAX_BOND_COOLDOWN_SECS: u64 = MAX_WINDOW_SECS as u64 * 4;
+/// The wait before the owner sets one: the longest window, 14 days. What stops one bond from
+/// seating a second account in a task is not this but each agent's `locked_until`.
+pub const DEFAULT_BOND_COOLDOWN_SECS: u64 = MAX_WINDOW_SECS as u64;
 
 /// Error codes. Every panic message starts with one, as `"<CODE>: <detail>"`.
 #[allow(dead_code)]
@@ -72,6 +78,7 @@ pub mod err {
     pub const E_GAS: &str = "E_GAS";
     pub const E_SETTLED: &str = "E_SETTLED";
     pub const E_VERSION: &str = "E_VERSION";
+    pub const E_NOT_REGISTERED: &str = "E_NOT_REGISTERED";
 }
 
 /// Parses a 64-character lowercase hex string into 32 bytes.
@@ -127,7 +134,34 @@ pub struct TokenConfig {
     pub enabled: bool,
 }
 
+/// An amount of one token held as a registration bond: the bond the owner sets for new agents,
+/// or the one an agent paid.
+#[near(serializers = [borsh])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bond {
+    pub token: AccountId,
+    pub amount: u128,
+}
+
+/// Where a registered agent is in its life. `Active` from `register_agent`; `Unregistering` from
+/// `unregister_agent`, when it can make no new entries in open tasks and waits out the cooldown;
+/// `Retired` from `claim_agent_bond`, when its bond is back in its vault. A retired agent's record
+/// and reputation stay, and `register_agent` makes it active again with a fresh bond.
+#[near(serializers = [borsh, json])]
+#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentStatus {
+    Active,
+    Unregistering,
+    Retired,
+}
+
 /// A registered agent's profile and reputation counters.
+///
+/// The status and its two times are plain fields, not data inside `AgentStatus`, so the record has
+/// the same size whatever the status: `unregister_agent` and `claim_agent_bond` add no storage, and
+/// getting a bond back never needs a spare storage balance. `unregistering_since` and
+/// `claimable_at` are 0 unless the status is `Unregistering`.
 #[near(serializers = [borsh])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentProfile {
@@ -145,6 +179,19 @@ pub struct AgentProfile {
     pub picks_made: u32,
     /// Empty picks made as a verifier after at least one entry was revealed.
     pub voids_after_reveals: u32,
+    pub status: AgentStatus,
+    /// The bond the contract holds for this agent, exactly as it was debited at registration, so
+    /// a later change of the owner's bond never changes what comes back. `None` if registration
+    /// took none (no bond was set then), and after `claim_agent_bond` has paid it back.
+    pub bond: Option<Bond>,
+    /// When `unregister_agent` was called, in nanoseconds.
+    pub unregistering_since: u64,
+    /// From when `claim_agent_bond` pays the bond back, in nanoseconds.
+    pub claimable_at: u64,
+    /// The latest `commit_deadline` among the open tasks the agent has entered, in nanoseconds, or
+    /// 0. Its bond cannot be claimed before it, so one bond cannot be handed on to seat another
+    /// account in a task whose commit window is still open, whatever the cooldown.
+    pub locked_until: u64,
 }
 
 /// A bounty. Timestamps are nanoseconds; the phase is derived from them, never stored.
@@ -300,6 +347,13 @@ pub struct ConfigView {
     pub paused: bool,
     pub version: u16,
     pub tokens: Vec<TokenConfigView>,
+    /// The bond `register_agent` takes from a new agent's vault: its token and amount (a decimal
+    /// string), both `null` until the owner sets one with `set_agent_bond`.
+    pub agent_bond_token: Option<AccountId>,
+    pub agent_bond_amount: Option<U128>,
+    /// How long, in seconds (a decimal string), an agent waits after `unregister_agent` before
+    /// `claim_agent_bond` pays its bond back.
+    pub agent_bond_cooldown_secs: U64,
 }
 
 /// An account's storage balance, as returned by the storage methods. All amounts are yoctoNEAR.
@@ -354,6 +408,18 @@ pub struct AgentView {
     pub picks_made: u32,
     /// Empty picks made as a verifier after at least one entry was revealed.
     pub voids_after_reveals: u32,
+    /// `active`, `unregistering` or `retired`. Only an active agent may enter an open task.
+    pub status: AgentStatus,
+    /// The bond the contract holds for the agent: its token, and its amount as a decimal string.
+    /// Both `null` if it paid none, and once `claim_agent_bond` has paid it back.
+    pub bond_token: Option<AccountId>,
+    pub bond_amount: Option<U128>,
+    /// While the agent is unregistering, from when its bond can be claimed (nanoseconds, a decimal
+    /// string); `null` otherwise.
+    pub claimable_at: Option<U64>,
+    /// The latest commit deadline among the open tasks the agent has entered (nanoseconds, a
+    /// decimal string): its bond is claimable no earlier. `null` if it has entered none.
+    pub locked_until: Option<U64>,
 }
 
 /// The arguments of `post_task`, which takes them as `{"task": {...}}`. `reward` is a decimal

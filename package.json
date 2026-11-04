@@ -13,6 +13,10 @@
     "skeleton": "tsx scripts/skeleton.ts",
     "demo:local": "tsx scripts/demo-local.ts",
     "seed": "tsx scripts/seed.ts",
+    "agent:init": "tsx scripts/agent.ts init",
+    "agent:register": "tsx scripts/agent.ts register",
+    "agent:retire": "tsx scripts/agent.ts retire",
+    "agent:claim-bond": "tsx scripts/agent.ts claim-bond",
     "serve": "tsx scripts/serve.ts",
     "deploy:testnet": "tsx scripts/deploy.ts --network testnet",
     "deploy:mainnet": "tsx scripts/deploy.ts --network mainnet"
