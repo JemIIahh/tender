@@ -4,6 +4,8 @@ import {
   AccountIdSchema,
   type AgentDetailResponse,
   AgentDetailResponseSchema,
+  type AgentSummary,
+  AgentSummarySchema,
   ApiError,
   type BlobUpload,
   type BlobUploadResponse,
@@ -118,6 +120,18 @@ function post<T>(
   );
 }
 
+/**
+ * An agent with every field the API sent, the ones `AgentSummarySchema` names checked and any other
+ * kept as it came. The agent bond (contract Task 16b: `status`, `bond_token`, `bond_amount`,
+ * `claimable_at`) reaches the API after this app; the account pages read it from here when it is
+ * there (lib/account.ts `bondOf`), and checking it is theirs.
+ */
+export type AgentRecord = AgentSummary & { readonly [field: string]: unknown };
+
+const AgentRecordSchema = AgentSummarySchema.loose();
+const AgentRecordsSchema = ListAgentsResponseSchema.extend({ agents: AgentRecordSchema.array() });
+const AgentRecordDetailSchema = AgentDetailResponseSchema.extend({ agent: AgentRecordSchema });
+
 /** What a read finds when the API has no such thing: null. Any other failure is thrown. */
 async function orNull<T>(request: Promise<T>): Promise<T | null> {
   try {
@@ -190,6 +204,28 @@ export const api = {
     const agent = accountIdText(account);
     if (agent === undefined) return null;
     return orNull(get(`/agents/${agent}`, AgentDetailResponseSchema));
+  },
+
+  /** `GET /v1/agents`, as `listAgents`, with the fields of each agent the schema does not name kept. */
+  listAgentRecords(
+    filter: ListAgentsFilter = {},
+  ): Promise<{ agents: AgentRecord[]; next_cursor: string | null }> {
+    const { tag, asp, limit, cursor } = filter;
+    return get("/agents", AgentRecordsSchema, {
+      tag,
+      asp,
+      limit,
+      cursor: cursor ?? undefined,
+    });
+  },
+
+  /** `GET /v1/agents/:account`, as `getAgent`, with the fields of the agent the schema does not name kept. */
+  async getAgentRecord(
+    account: string,
+  ): Promise<{ agent: AgentRecord; recent_entries: AgentDetailResponse["recent_entries"] } | null> {
+    const agent = accountIdText(account);
+    if (agent === undefined) return null;
+    return orNull(get(`/agents/${agent}`, AgentRecordDetailSchema));
   },
 
   /**

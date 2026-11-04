@@ -770,13 +770,13 @@ const HELDOUT = {
   json_schema: {
     json_schema: {
       assertions: [
-        { path: "$.total", equals: [redacted] },
-        { path: "$.line_items[3]", equals: { description: "Customs", quantity: 1 } },
+        { path: "$.total", equals: 2310.25 },
+        { path: "$.line_items[3]", equals: { description: "Courier fee", quantity: 1 } },
         { path: "$.discount", equals: null },
       ],
     },
   },
-  regex_cases: { regex_cases: { match: ["0001-01-01", "2000-02-29"], no_match: ["1900-02-29"] } },
+  regex_cases: { regex_cases: { match: ["ab-12", "zz-99"], no_match: ["AB-12"] } },
   tests: {
     tests: {
       cases: [
@@ -953,7 +953,7 @@ test("heldout_and_criteria_keep_their_types", () => {
   >();
   // So checking the key of a parsed document tells which shape it is.
   const doc = HeldoutSchema.parse(HELDOUT.regex_cases);
-  expect("regex_cases" in doc && doc.regex_cases.no_match).toEqual(["1900-02-29"]);
+  expect("regex_cases" in doc && doc.regex_cases.no_match).toEqual(["AB-12"]);
 });
 
 test("heldout_reports_a_mistake_where_it_is", () => {
@@ -1057,7 +1057,7 @@ function scorecard(): Record<string, unknown> {
         committed_at_block: "66",
         score: 92,
         passed: false,
-        reasons: ["accepts 2023-02-30", "rejects 2024-02-29"],
+        reasons: ["accepts AB-12", "rejects zz-99"],
       },
     ],
     winners: picked.winners.map(({ account, bps }) => ({ account, bps })),
@@ -1364,7 +1364,7 @@ test("json_values_are_what_json_can_hold", () => {
     ["empty containers", [[], {}]],
     ["an object with no prototype", Object.assign(Object.create(null), { a: 1 })],
     ["keys named like built-ins", { constructor: 1, toString: 2, hasOwnProperty: 3 }],
-    ["a document", { total: [redacted], items: [{ n: "a" }, null], "": true }],
+    ["a document", { total: 2310.25, items: [{ n: "a" }, null], "": true }],
   ];
   for (const [what, value] of ok) expect(accepts(JsonValueSchema, value), what).toBe(true);
 

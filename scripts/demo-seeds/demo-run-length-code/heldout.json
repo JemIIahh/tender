@@ -1,0 +1,54 @@
+{
+  "tests": {
+    "cases": [
+      {
+        "input": "a",
+        "output": "a1"
+      },
+      {
+        "input": "aabbaa",
+        "output": "a2b2a2"
+      },
+      {
+        "input": "aAaA",
+        "output": "a1A1a1A1"
+      },
+      {
+        "input": "xxxxxxxxxxxx",
+        "output": "x12"
+      },
+      {
+        "input": "1122",
+        "output": "1222"
+      },
+      {
+        "input": "  ",
+        "output": " 2"
+      },
+      {
+        "input": "héé",
+        "output": "h1é2"
+      },
+      {
+        "input": "abcd",
+        "output": "a1b1c1d1"
+      },
+      {
+        "input": "pppppppppp",
+        "output": "p10"
+      },
+      {
+        "input": 42,
+        "output": null
+      },
+      {
+        "input": null,
+        "output": null
+      },
+      {
+        "input": ["a"],
+        "output": null
+      }
+    ]
+  }
+}

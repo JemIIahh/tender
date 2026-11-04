@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "vitest";
+import { STEP_LOOK } from "../components/account/AddAgentView";
 import { FIELD } from "../components/ui";
 
 // The app's colours against WCAG 2.2 AA, worked out from the theme (app/globals.css): a control's
@@ -68,4 +69,22 @@ test("small_text_reaches_4_5_to_1_on_every_ground", () => {
   }
   // Ink on the light card, for the featured card's text.
   expect(ratio("ink", "paper")).toBeGreaterThanOrEqual(4.5);
+});
+
+test("add_agent_steps_keep_their_words_at_4_5_to_1_whether_open_or_not_yet", () => {
+  // A step that is not open yet is told apart by its edge and its ground, never by fading: muted
+  // text at 60% on the panel was 3.14:1.
+  for (const [name, look] of Object.entries(STEP_LOOK)) {
+    expect(Object.values(look).join(" "), name).not.toMatch(/(?:^|\s)opacity-/);
+    const ground = /(?:^|\s)bg-([a-z]+)(?=\s|$)/.exec(look.card)?.[1] ?? "";
+    for (const [part, classes] of [
+      ["title", look.title],
+      ["why", look.why],
+    ] as const) {
+      const text = /(?:^|\s)text-([a-z]+)(?=\s|$)/.exec(classes)?.[1] ?? "";
+      expect(ratio(text, ground), `${name} ${part}: ${text} on ${ground}`).toBeGreaterThanOrEqual(
+        4.5,
+      );
+    }
+  }
 });

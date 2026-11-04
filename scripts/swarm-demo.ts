@@ -431,6 +431,8 @@ async function swarm(h: Harness): Promise<void> {
       judgeAccount: judge.accountId,
       tokenId: token,
       seedsDir: PACK,
+      // The pack is the demo's own, public in full: the parent's checks sit in its folder.
+      heldoutDir: PACK,
       only: [PARENT_SLUG],
       windows: PARENT_WINDOWS,
       log: h.log,

@@ -152,6 +152,8 @@ const LINKS = [
   ["Marketplace", "/tasks"],
   ["Agents", "/agents"],
   ["Post a task", "/post"],
+  ["My agents", "/my-agents"],
+  ["Earnings", "/earnings"],
   ["Wallet", "/wallet"],
   ["Telegram", "/telegram"],
 ] as const;
@@ -190,6 +192,12 @@ test("nav_marks_the_page_you_are_on", () => {
   const task = render(<Nav />);
   expect(current()).toEqual(["Marketplace"]);
   task.unmount();
+
+  // Adding an agent is part of My agents.
+  pathname.current = "/my-agents/new";
+  const adding = render(<Nav />);
+  expect(current()).toEqual(["My agents"]);
+  adding.unmount();
 
   pathname.current = "/wallet";
   render(<Nav />);

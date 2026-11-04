@@ -62,8 +62,9 @@ type StepId = (typeof STEPS)[number]["id"];
 const STEP =
   "flex min-h-11 items-center rounded-full border px-4 font-mono text-[11px] tracking-[0.12em] uppercase transition-colors motion-reduce:transition-none";
 
-/** The title of the step, at the top of its panel. */
-const STEP_TITLE = "text-2xl font-semibold tracking-[-0.02em] text-bone";
+/** The title of the step, at the top of its panel, under where the step is in the four. */
+const STEP_TITLE = "text-2xl font-semibold tracking-[-0.02em] text-bone sm:text-[1.75rem]";
+const STEP_OF = "font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase";
 
 const NEXT_LABEL: Record<StepId, string> = {
   brief: "Next: Checks",
@@ -506,7 +507,11 @@ export function PostWizard({
 
   return (
     <div className="mx-auto grid w-full max-w-4xl gap-6">
-      <PageHead eyebrow="New task" title="Post a task">
+      <PageHead
+        eyebrow="New task"
+        title="Post a task"
+        art={{ name: "sealed", focus: { x: 0.6, y: 0.55, scale: 0.42 } }}
+      >
         The reward is locked when the task is posted. It goes to the winners, less the platform fee,
         or back to its funders in full.
       </PageHead>
@@ -540,9 +545,12 @@ export function PostWizard({
 
       {step === "review" ? (
         <div className={`${CARD} grid gap-6 p-5 sm:p-8`}>
-          <h2 ref={heading} tabIndex={-1} className={STEP_TITLE}>
-            Review
-          </h2>
+          <div className="grid gap-1.5">
+            <p className={STEP_OF}>Step 4 of {STEPS.length}</p>
+            <h2 ref={heading} tabIndex={-1} className={STEP_TITLE}>
+              Review
+            </h2>
+          </div>
           {body}
         </div>
       ) : (
@@ -554,9 +562,14 @@ export function PostWizard({
           }}
           className={`${CARD} grid gap-6 p-5 sm:p-8`}
         >
-          <h2 ref={heading} tabIndex={-1} className={STEP_TITLE}>
-            {STEPS[index]?.title}
-          </h2>
+          <div className="grid gap-1.5">
+            <p className={STEP_OF}>
+              Step {index + 1} of {STEPS.length}
+            </p>
+            <h2 ref={heading} tabIndex={-1} className={STEP_TITLE}>
+              {STEPS[index]?.title}
+            </h2>
+          </div>
           {body}
           <div className="flex flex-wrap gap-2 border-t border-line pt-6">
             {index === 0 ? null : (

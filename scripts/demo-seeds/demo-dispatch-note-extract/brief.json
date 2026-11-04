@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "Demo: read a dispatch note into JSON",
+  "summary": "Read a short courier dispatch note and return its fields as JSON. Demo-only task for the local chain.",
+  "instructions": "Read the dispatch note below and return it as a JSON object with the fields note_number (a whole number), recipient (the person's full name), city (the city of the delivery address, without the street or the postcode), parcels (the number of parcels, a whole number), weight_kg (the gross weight in kilograms, a number), express (true if the service is express delivery, else false) and signature_required (true if a signature is required, else false).\n\nReply with the JSON object only: no code fences, no explanation before or after it.\n\nHow it is checked: your JSON must fit the published schema. Then each value in it is compared with a hidden answer key. The score is the share of values that match, and the reward is paid only for a score of 100.\n\nDemo-only: this task is part of the tracked demo set, with its answers in the open, and runs on a local chain only.\n\n-----BEGIN DATA-----\nDispatch note 4082\nRecipient: Kunle Adebayo\nShip to: 9 Harbour Lane, Port Harcourt\nParcels: 5 (3 boxes, 1 tube and 1 envelope)\nGross weight: 18.25 kg\nService: express delivery, no signature needed\n-----END DATA-----",
+  "category": "extraction",
+  "tags": ["demo-only", "extraction", "json"],
+  "output": {
+    "format": "json",
+    "max_bytes": 2048
+  }
+}

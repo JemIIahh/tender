@@ -416,13 +416,16 @@ export function signalScene(): Scene {
   };
 }
 
-/** The art the landing shows, by name: the hero's show and each card's scene. */
+/** The art the landing and the app show, by name: the hero's show and each scene alone. */
 export const ARTS = {
   hero: () => [sealedScene(), scaleScene(), coinsScene()],
   escrow: () => [vaultScene()],
   sealed: () => [sealedScene({ settled: true })],
   scorecard: () => [scorecardScene()],
   signal: () => [signalScene()],
+  // The hero's other two scenes, alone, for the heads of the app's pages (components/StillArt).
+  coins: () => [coinsScene()],
+  scale: () => [scaleScene()],
 } satisfies Record<string, () => Scene[]>;
 
 export type ArtName = keyof typeof ARTS;
