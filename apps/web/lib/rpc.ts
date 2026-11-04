@@ -182,3 +182,20 @@ export async function accountKeyState(
   if ("missing" in answer) return "other-keys";
   return answer.result.permission === "FullAccess" ? "has-key" : "other-keys";
 }
+
+/**
+ * The full-access keys of `accountId` (`view_access_key_list`), as `ed25519:<base58>`, or null when
+ * there is no such account. A function-call key is left out.
+ */
+export async function fullAccessKeysOf(accountId: string): Promise<string[] | null> {
+  const answer = await query({ request_type: "view_access_key_list", account_id: accountId });
+  if ("missing" in answer) return null;
+  const keys = answer.result.keys;
+  if (!Array.isArray(keys)) throw new RpcError("view_access_key_list returned no list of keys");
+  return keys.flatMap((entry) => {
+    const item = entry as { public_key?: unknown; access_key?: { permission?: unknown } };
+    return typeof item.public_key === "string" && item.access_key?.permission === "FullAccess"
+      ? [item.public_key]
+      : [];
+  });
+}

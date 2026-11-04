@@ -3,6 +3,7 @@ import type { TenderClient } from "@tender/client";
 import type { NetworkId, TenderApi } from "@tender/shared";
 import type { KeyKind } from "./keys";
 import type { StateStore } from "./state";
+import { type ConnectToolDeps, registerConnectTool } from "./tools/connect";
 import { registerReadTools } from "./tools/read";
 import { registerWriteTools } from "./tools/write";
 
@@ -118,6 +119,11 @@ export interface McpDeps {
    * `pick_winners` and `register_agent`), before anything is uploaded or paid.
    */
   secrets?: readonly string[];
+  /**
+   * What `connect_to_tender` needs, to connect a new agent with a code from its owner's page. Not
+   * set means the tool is not offered. The bin sets it from the server's own settings.
+   */
+  connect?: ConnectToolDeps;
 }
 
 /** The server's name and version, as an MCP client sees them when it connects. */
@@ -131,5 +137,16 @@ export function createMcpServer(deps: McpDeps): McpServer {
   const server = new McpServer(SERVER_INFO);
   registerReadTools(server, deps);
   registerWriteTools(server, deps);
+  if (deps.connect !== undefined) registerConnectTool(server, deps.connect);
+  return server;
+}
+
+/**
+ * The server in connect mode (`tender-mcp --connect`), for an agent that has no account yet: it
+ * offers `connect_to_tender` alone, and holds no key until that tool has made one.
+ */
+export function createConnectServer(deps: ConnectToolDeps): McpServer {
+  const server = new McpServer(SERVER_INFO);
+  registerConnectTool(server, deps);
   return server;
 }

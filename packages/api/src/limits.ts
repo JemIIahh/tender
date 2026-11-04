@@ -76,6 +76,15 @@ export interface RateLimits {
    * keeps are `BOARD_LIMITS`, in `@tender/shared`.
    */
   board: RateLimit;
+  /** `POST /v1/connect/codes`, per signed-in account: the codes an owner makes. */
+  connectCreate: RateLimit;
+  /** `GET /v1/connect/codes/:id`, per signed-in account: an owner's page asking how a code stands. */
+  connectRead: RateLimit;
+  /**
+   * Every connect route but the owner's read, per client address: the codes made there, and the
+   * lookups, attachments and last words of the agents, which no account signs.
+   */
+  connectClient: RateLimit;
   /** Every listing and every change of a service (`POST /v1/services`, `POST /v1/services/:id`), per signed-in account. */
   services: RateLimit;
 }
@@ -97,6 +106,13 @@ export const DEFAULT_RATE_LIMITS: Readonly<RateLimits> = Object.freeze({
   // A poster who answers a full board of 200 questions in one sitting makes 30 a minute for seven
   // minutes; an agent asking makes a few an hour, and the board's own limits hold it to that.
   board: { limit: 30, windowMs: 60_000 },
+  // An owner adds an agent or two at a sitting; ten codes in ten minutes leaves room for mistakes.
+  connectCreate: { limit: 10, windowMs: 10 * 60_000 },
+  // The page asks every 2 seconds while it waits on the agent: 30 a minute, with room for two tabs.
+  connectRead: { limit: 120, windowMs: 60_000 },
+  // An agent looks a code up, attaches its key and says it registered: a few calls each. A code is
+  // 130 random bits, so this is about load, not guessing.
+  connectClient: { limit: 60, windowMs: 10 * 60_000 },
   // A provider that lists its agents' services, or pauses all of them, makes a few writes a minute.
   services: { limit: 30, windowMs: 60_000 },
 });
@@ -113,6 +129,9 @@ export function rateLimitsOf(over: Partial<RateLimits> | undefined): RateLimits 
     heldoutBytesTotal: over?.heldoutBytesTotal ?? DEFAULT_RATE_LIMITS.heldoutBytesTotal,
     blobBytesTotal: over?.blobBytesTotal ?? DEFAULT_RATE_LIMITS.blobBytesTotal,
     board: over?.board ?? DEFAULT_RATE_LIMITS.board,
+    connectCreate: over?.connectCreate ?? DEFAULT_RATE_LIMITS.connectCreate,
+    connectRead: over?.connectRead ?? DEFAULT_RATE_LIMITS.connectRead,
+    connectClient: over?.connectClient ?? DEFAULT_RATE_LIMITS.connectClient,
     services: over?.services ?? DEFAULT_RATE_LIMITS.services,
   };
 }

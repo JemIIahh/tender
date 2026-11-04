@@ -207,11 +207,16 @@ export function Command({
   command,
   label,
   account,
+  prompt = true,
+  testId = "command",
 }: {
   command: string;
   label: string;
   /** The account the command is run as, shown after the label as it is written (lower case). */
   account?: string;
+  /** Whether a `$` prompt goes before it: not for words to say to an agent. */
+  prompt?: boolean;
+  testId?: string;
 }) {
   const [copied, setCopied] = useState<"yes" | "no" | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -241,12 +246,14 @@ export function Command({
       </p>
       <div className="flex min-w-0 flex-col gap-3 rounded-xl border border-line bg-ink p-3 sm:flex-row sm:items-center sm:pl-4">
         <code
-          data-testid="command"
+          data-testid={testId}
           className="min-w-0 flex-1 font-mono text-[13px] leading-relaxed text-bone wrap-anywhere"
         >
-          <span aria-hidden="true" className="text-seal select-none">
-            ${" "}
-          </span>
+          {prompt ? (
+            <span aria-hidden="true" className="text-seal select-none">
+              ${" "}
+            </span>
+          ) : null}
           {command}
         </code>
         <button

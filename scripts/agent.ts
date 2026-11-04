@@ -1,32 +1,44 @@
-import { execFile } from "node:child_process";
-import {
-  chmod,
-  mkdir,
-  open,
-  readdir,
-  readFile,
-  realpath,
-  rename,
-  rm,
-  stat,
-} from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { readdir, readFile, rm, stat } from "node:fs/promises";
+import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { parseArgs, promisify } from "node:util";
+import { parseArgs } from "node:util";
 import {
+  AGENT_NAME,
+  type AgentKeyFile,
   type AgentProfile,
+  ApiClient,
+  agentKeyFor,
+  agentKeyPath,
+  type ConnectApi,
+  type ConnectChain,
+  ConnectError,
+  type ConnectOutcome,
+  connectAgent,
+  DELEGATE_SUFFIX,
+  KeyDirError,
+  KeyInUseError,
   type KeyPermission,
+  keyDirOf,
+  makeAgentKeyFile,
+  planRegistration,
+  prepareKeyDir,
   type RegistrationPlan,
+  readAgentKeyFile,
   registerWithBond,
+  rpcFullAccessKeys,
+  rpcKeyState,
   type Signer,
   scriptedProfile,
   TenderClient,
   TenderError,
   toTxResult,
+  writeKeyFile,
 } from "@tender/client";
 import {
   AccountIdSchema,
   type AgentView,
+  type ConnectLookup,
+  canonicalBase,
   type DelegateView,
   DelegateViewSchema,
   formatTokenAmount,
@@ -57,6 +69,12 @@ import { envDir, REPO_ROOT, readEnvFile } from "./lib/env";
  *   pnpm agent:register               puts the bond in the vault if it is short, registers, prints the status
  *   pnpm agent:retire                 starts the way out: no new open task, the bond claimable after a cooldown
  *   pnpm agent:claim-bond             once the cooldown is over, the bond goes back to the vault
+ *
+ * or all of the first two at once, with a connect code from the owner's "Add an agent" page:
+ *
+ *   pnpm agent:connect <code> --api <url>   makes the key, attaches its PUBLIC half to the code,
+ *                                           waits for the owner's wallet to create and fund the
+ *                                           account, then registers: see "CONNECT"
  *
  * and these two give the agent a key that may spend, within caps, without being the account's own:
  *
@@ -101,6 +119,18 @@ import { envDir, REPO_ROOT, readEnvFile } from "./lib/env";
  * spent. A function-call key that leaks costs at most its caps and its allowance; keep little
  * liquid NEAR on the account.
  *
+ * CONNECT. `connect` is `connectAgent` of `@tender/client`, with this file's key and register. The
+ * code says which account the agent gets (`<name>.<owner>`), on which network and contract; the key
+ * is `init`'s, in the same file and directory under the same guard, and is used again if it is there
+ * for that account, so a run that stopped (the owner was away) is finished by running the same
+ * command again. It prints the key's fingerprint, which the owner's page shows too: the owner
+ * matches the two before the wallet signs anything. Once the account exists with the key and its
+ * vault holds the bond (the owner's batch pays both), it is `register` with `--yes`: the only thing
+ * left to move is NEAR into the storage balance, from the NEAR the owner sent the account. `--api`
+ * is the address of the API that made the code (`TENDER_API_URL` when it is not given): https, or
+ * http to this machine only, as the code is a credential. `--wait` is how many minutes to wait for
+ * the owner (30 by default).
+ *
  * WHERE. `--network` (else `TENDER_NETWORK` in the environment or `.env`, else testnet), the contract
  * from `TENDER_CONTRACT` or the network's record in `deployments/`, the node from `NEAR_RPC_URL` or
  * the network's own. The deploy's `.env.deploy.<network>`, which holds other accounts' keys, is not
@@ -115,28 +145,23 @@ const USAGE = `usage:
   pnpm agent:claim-bond [--name <name>] [--network <n>] [--dir <path>]
   pnpm agent:delegate --per-task <amount> --total <amount> [--name <name>] [--token <id>]
                       [--allowance <NEAR>] [--network <n>] [--dir <path>]
-  pnpm agent:undelegate [--name <name>] [--network <n>] [--dir <path>]`;
+  pnpm agent:undelegate [--name <name>] [--network <n>] [--dir <path>]
+  pnpm agent:connect <code> [--api <url>] [--name <name>] [--network <n>] [--wait <minutes>]
+                     [--tags a,b] [--description <text>] [--dir <path>]`;
 
-/** An agent's name: the key file's name, and the name in its profile. */
-const NAME = /^[a-z][a-z0-9-]{0,31}$/;
-
-/** What a delegate key's file is called after the agent's name: `<name>.delegate.json`. */
-const DELEGATE_SUFFIX = ".delegate.json";
+/** An agent's name: the key file's name, and the name in its profile (`@tender/client`'s). */
+const NAME = AGENT_NAME;
 
 /** Where the keys go: git-ignored (`.gitignore` has `.tender/`), so no key lands in a commit. */
 const KEYS_DIR = join(REPO_ROOT, ".tender", "agents");
 
 // ---- The key file -----------------------------------------------------------------------------
 
+// The key file and the key-directory guard are `@tender/client`'s (`keyfile.ts`), so that the MCP
+// server's `connect_to_tender` makes a key exactly as `init` does, in the same directory.
+
 /** What a key file holds. `account` is absent until the agent's account is known. */
-interface KeyFile {
-  version: 1;
-  name: string;
-  network: NetworkId;
-  account?: string;
-  publicKey: string;
-  privateKey: string;
-}
+type KeyFile = AgentKeyFile;
 
 const isNetwork = (value: string): value is NetworkId => Object.hasOwn(NETWORKS, value);
 
@@ -149,179 +174,27 @@ function nameOf(value: string | undefined): string {
   return value;
 }
 
-const run = promisify(execFile);
-
-/**
- * `path` with every symlink followed and the case of every part that exists as the disk spells it
- * (`realpath` does both, on macOS too); a part that does not exist yet stays as it was written.
- */
-async function settle(path: string): Promise<string> {
-  const missing: string[] = [];
-  for (let at = path; ; at = dirname(at)) {
-    try {
-      return join(await realpath(at), ...missing.reverse());
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if ((code !== "ENOENT" && code !== "ENOTDIR") || dirname(at) === at) throw error;
-      missing.push(basename(at));
-    }
-  }
-}
-
-/** Whether the file system of `path` takes `/Users/x` and `/users/X` for one place. */
-async function ignoresCase(path: string): Promise<boolean> {
-  const swapped = path.replace(/[a-z]/gi, (c) =>
-    c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase(),
-  );
-  if (swapped === path) return false;
-  try {
-    const [a, b] = await Promise.all([stat(path), stat(swapped)]);
-    return a.ino === b.ino && a.dev === b.dev;
-  } catch {
-    return false;
-  }
-}
-
-/** Whether `inner` is `outer` or below it, by name, in the case-folded spelling if `fold` says so. */
-function isUnder(outer: string, inner: string, fold: boolean): boolean {
-  const way = fold ? relative(outer.toLowerCase(), inner.toLowerCase()) : relative(outer, inner);
-  // A name that merely starts with two dots (`..keys`) is below, and only `..` and `../...` is not.
-  return way !== ".." && !way.startsWith("../") && !isAbsolute(way);
-}
-
-/** Whether git ignores `file`, which is in the repository. Anything but a plain yes is a no. */
-async function gitIgnores(root: string, file: string): Promise<boolean> {
-  try {
-    await run("git", ["-C", root, "check-ignore", "-q", "--", relative(root, file)], {
-      timeout: 10_000,
-    });
-    return true;
-  } catch {
-    return false;
-  }
+/** A refusal of the key directory, as a fault of the flags: printed without "agent failed". */
+function asUsage(error: unknown): never {
+  throw error instanceof KeyDirError ? new UsageError(error.message) : error;
 }
 
 /**
- * The directory the keys are in, with its symlinks followed. A key must never be where a `git add`
- * can reach, so a directory inside the repository is refused unless git says it ignores the key
- * files in it (`.tender/` is ignored, which is where they go by default). The repository and the
- * directory are both settled first, so that a link, a different spelling of the case on a file
- * system that ignores it, and a name that only starts with `..` cannot walk round the check; if git
- * cannot be asked, the answer is no. `name` is the agent whose file will be in it, when it is known.
+ * The directory the keys are in, with its symlinks followed, once the key-directory guard has
+ * passed it: `--dir`, else `.tender/agents/` of the repository. `name` is the agent whose file
+ * will be in it, when it is known.
  */
 async function keysDirOf(dir: string | undefined, name = "agent"): Promise<string> {
-  const path = await settle(resolve(dir ?? KEYS_DIR));
-  const root = await settle(REPO_ROOT);
-  if (!isUnder(root, path, await ignoresCase(root))) return path;
-  // A name that is not an agent's (a flag not checked yet) is probed as "agent": it must not lead out.
-  const stem = NAME.test(name) ? name : "agent";
-  const files = [`${stem}.json`, `${stem}.json.tmp`, `${stem}${DELEGATE_SUFFIX}`].map((file) =>
-    join(path, file),
-  );
-  const ignored = await Promise.all(files.map((file) => gitIgnores(root, file)));
-  if (!ignored.every(Boolean)) {
-    throw new UsageError(
-      "a key directory inside the repository must be one that git ignores (.tender/ is), so that " +
-        `no key can be committed; git does not say it ignores ${path}`,
-    );
-  }
-  return path;
+  return keyDirOf(dir ?? KEYS_DIR, REPO_ROOT, name).catch(asUsage);
 }
 
-const fileOf = (dir: string, name: string) => join(dir, `${name}.json`);
-
-/** Writes the file whole, mode 0600, synced: a crash leaves the old file or the new, not half. */
-async function writeKeyFile(
-  path: string,
-  key: KeyFile | DelegateFile,
-  replace: boolean,
-): Promise<void> {
-  const text = `${JSON.stringify(key, null, 2)}\n`;
-  if (!replace) {
-    // `wx`: fails if the file exists. A key is never replaced by this path.
-    const file = await open(path, "wx", 0o600);
-    try {
-      await file.chmod(0o600);
-      await file.writeFile(text);
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    return;
-  }
-  const temporary = `${path}.tmp`;
-  const file = await open(temporary, "w", 0o600);
-  try {
-    await file.chmod(0o600);
-    await file.writeFile(text);
-    await file.sync();
-  } finally {
-    await file.close();
-  }
-  await rename(temporary, path);
-}
+const fileOf = agentKeyPath;
 
 /**
  * The key file of `name`. Throws, without the key, if it is missing, readable by others, not a key
  * file, or if its private key is not the one its public key says.
  */
-async function readKeyFile(dir: string, name: string): Promise<KeyFile> {
-  const path = fileOf(dir, name);
-  let info: Awaited<ReturnType<typeof stat>>;
-  try {
-    info = await stat(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new Error(`no key for agent ${name} at ${path}: run pnpm agent:init --name ${name}`);
-    }
-    throw error;
-  }
-  if ((info.mode & 0o077) !== 0) {
-    throw new Error(
-      `${path} can be read by other users of this machine: run chmod 600 on it first ` +
-        "(and treat the key as exposed if others could have read it)",
-    );
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await readFile(path, "utf8"));
-  } catch {
-    throw new Error(`${path} is not a key file made by pnpm agent:init`);
-  }
-  const bad = () => new Error(`${path} is not a key file made by pnpm agent:init`);
-  if (typeof parsed !== "object" || parsed === null) throw bad();
-  const f = parsed as Record<string, unknown>;
-  if (
-    f.version !== 1 ||
-    typeof f.name !== "string" ||
-    typeof f.network !== "string" ||
-    !isNetwork(f.network) ||
-    typeof f.publicKey !== "string" ||
-    typeof f.privateKey !== "string" ||
-    (f.account !== undefined && !AccountIdSchema.safeParse(f.account).success)
-  ) {
-    throw bad();
-  }
-  let derived: string;
-  try {
-    derived = KeyPair.fromString(f.privateKey as KeyPairString)
-      .getPublicKey()
-      .toString();
-  } catch {
-    throw bad();
-  }
-  if (derived !== f.publicKey) {
-    throw new Error(`the private key in ${path} is not the one its public key names`);
-  }
-  return {
-    version: 1,
-    name: f.name,
-    network: f.network,
-    ...(typeof f.account === "string" && { account: f.account }),
-    publicKey: f.publicKey,
-    privateKey: f.privateKey,
-  };
-}
+const readKeyFile = readAgentKeyFile;
 
 /** The agent to act for: `--name`, else the only key in the directory. */
 async function pickName(dir: string, wanted: string | undefined): Promise<string> {
@@ -366,43 +239,13 @@ export async function initAgent(
   if (options.account !== undefined && !AccountIdSchema.safeParse(options.account).success) {
     throw new UsageError("--account is not a valid NEAR account id");
   }
-  // The mode of a directory is changed only when this command has just made it. One that was there
-  // already is the user's (`--dir ~` is a mistake that would have changed their home), so it is
-  // used as it is if only its owner can enter it, and refused if others can.
-  const made = await mkdir(dir, { recursive: true, mode: 0o700 });
-  if (made !== undefined) {
-    await chmod(dir, 0o700);
-  } else if (((await stat(dir)).mode & 0o077) !== 0) {
-    throw new UsageError(
-      `${dir} can be entered by other users of this machine; use a directory of your own that ` +
-        "only you can enter (mode 700), or one that does not exist yet",
-    );
-  }
-  const pair = KeyPair.fromRandom("ed25519");
-  const publicKey = pair.getPublicKey().toString();
-  const path = fileOf(dir, name);
-  try {
-    await writeKeyFile(
-      path,
-      {
-        version: 1,
-        name,
-        network: options.network,
-        ...(options.account !== undefined && { account: options.account }),
-        publicKey,
-        privateKey: pair.toString(),
-      },
-      false,
-    );
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error(
-        `agent ${name} has a key at ${path} already, and this command never replaces a key: ` +
-          "choose another --name, or move that file away if you are sure",
-      );
-    }
-    throw error;
-  }
+  await prepareKeyDir(dir).catch(asUsage);
+  const { path, publicKey } = await makeAgentKeyFile({
+    dir,
+    name,
+    network: options.network,
+    ...(options.account !== undefined && { account: options.account }),
+  });
   log(`OK init agent ${name}`);
   log(`key file: ${path} (mode 600; the private key is in it and is never printed)`);
   log(`public key: ${publicKey}`);
@@ -1276,15 +1119,192 @@ export async function undelegateAgentCommand(options: DelegateOptions): Promise<
   log(`delegate key file removed: ${path} (the key is dead; a new delegate makes a new one)`);
 }
 
+// ---- Connect ----------------------------------------------------------------------------------
+
+/** How long `connect` waits for the owner unless `--wait` says otherwise: 30 minutes. */
+export const CONNECT_WAIT_MINUTES = 30;
+
+export interface ConnectCommandOptions extends CommandOptions {
+  /** The connect code, from the owner's Add an agent page. */
+  code: string;
+  /** The API that made the code. `TENDER_API_URL` when absent. */
+  api?: string;
+  /** How long to wait for the owner, then for the bond, in ms. 30 minutes by default. */
+  waitMs?: number;
+  /** How often to look while waiting, in ms. 3 s by default. */
+  pollMs?: number;
+  /** How long to keep asking the API to take the agent's word, once registered, in ms. */
+  confirmMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  /** The API, at the base given. A test passes its own. */
+  apiFor?: (baseUrl: string) => ConnectApi;
+  /** What the chain says of the account and the key; through the node unless a test says. */
+  chainCheck?: ConnectChain["keyState"];
+  /** The account's full-access keys; through the node unless a test says. */
+  keysCheck?: ConnectChain["fullAccessKeys"];
+}
+
+/** Hosts that are this machine, where plain http cannot be read or changed on the way. */
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/** The API's base as the API client reads it: https, or http to this machine. */
+function connectApiBase(value: string): string {
+  let base: string;
+  try {
+    base = canonicalBase(value);
+  } catch {
+    throw new UsageError(`--api is not the address of a Tender API\n${USAGE}`);
+  }
+  const { protocol, hostname } = new URL(base);
+  if (protocol === "https:" || (protocol === "http:" && LOOPBACK_HOSTS.has(hostname))) return base;
+  throw new UsageError(
+    "--api must be https, or http to localhost, 127.0.0.1 or [::1]: the connect code is a " +
+      "credential, and plain http could hand it to anyone on the way",
+  );
+}
+
+/**
+ * The chain the code is for, from what the API says, held to what this machine says: a `--network`
+ * or a `TENDER_CONTRACT` (or `deployments/<network>.json`) that names another is refused, before a
+ * key is made. The node is `NEAR_RPC_URL`, else the network's own.
+ */
+async function connectTarget(
+  lookup: ConnectLookup,
+  options: ConnectCommandOptions,
+  env: Record<string, string>,
+  repoDir: string,
+): Promise<AgentTarget> {
+  if (options.network !== undefined && options.network !== lookup.network) {
+    throw new UsageError(
+      `this code is for ${lookup.network}, and --network says ${options.network}: leave --network out`,
+    );
+  }
+  const named = env.TENDER_CONTRACT ?? (await readDeployment(lookup.network, repoDir))?.contract;
+  if (named !== undefined && named !== lookup.contract) {
+    throw new Error(
+      `the API that made this code serves the contract ${lookup.contract} on ${lookup.network}, and ` +
+        `this machine names ${named} (TENDER_CONTRACT, or deployments/${lookup.network}.json): use ` +
+        "the API of that deployment, or make them agree",
+    );
+  }
+  const rpcUrl = env.NEAR_RPC_URL ?? NETWORKS[lookup.network].rpcUrl;
+  if (rpcUrl === "") {
+    throw new Error(`NEAR_RPC_URL must be set for ${lookup.network}: the RPC URL of the node`);
+  }
+  return { network: lookup.network, contractId: lookup.contract, rpcUrl };
+}
+
+/**
+ * Connects the agent with a code from the owner's page (`connectAgent` of `@tender/client`): the key
+ * is `init`'s, used again if its file is there for this account, and the registration is
+ * `registerAgentCommand` with `--yes`. Prints plain progress lines and nothing secret.
+ */
+export async function connectAgentCommand(options: ConnectCommandOptions): Promise<ConnectOutcome> {
+  const log = options.log ?? console.log;
+  const own = definedOnly(options.env ?? process.env);
+  const repoDir = options.repoDir ?? envDir(own);
+  const env = { ...readEnvFile(join(repoDir, ".env")), ...own };
+  const wanted = options.api ?? env.TENDER_API_URL;
+  if (wanted === undefined || wanted === "") {
+    throw new UsageError(
+      `--api <url> is needed: the address of the Tender API, as the Add an agent page shows it in the command\n${USAGE}`,
+    );
+  }
+  const api = (options.apiFor ?? ((baseUrl) => new ApiClient({ baseUrl })))(connectApiBase(wanted));
+  // Settled once the code has said which chain it is for (`chainFor`, which runs before `key`).
+  let target: AgentTarget | undefined;
+  let checked: Promise<AgentTarget> | undefined;
+  const targetOf = (lookup: ConnectLookup) => {
+    checked ??= connectTarget(lookup, options, env, repoDir).then((found) => {
+      target = found;
+      return found;
+    });
+    return checked;
+  };
+  const chainFor = (lookup: ConnectLookup): ConnectChain => {
+    const ready = targetOf(lookup);
+    // Ask for it now, so that a refusal comes before the key is made (`key` waits for it).
+    ready.catch(() => undefined);
+    return {
+      keyState: async (account, publicKey) =>
+        (options.chainCheck ?? rpcKeyState((await ready).rpcUrl))(account, publicKey),
+      fullAccessKeys: async (account) =>
+        (options.keysCheck ?? rpcFullAccessKeys((await ready).rpcUrl))(account),
+      plan: async (account) => {
+        const where = await ready;
+        const reader = new TenderClient({
+          network: where.network,
+          contractId: where.contractId,
+          rpcUrl: where.rpcUrl,
+        });
+        return planRegistration(reader, account);
+      },
+    };
+  };
+
+  return connectAgent({
+    code: options.code,
+    ...(options.name !== undefined && { name: options.name }),
+    api,
+    log,
+    waitMs: options.waitMs ?? CONNECT_WAIT_MINUTES * 60_000,
+    ...(options.pollMs !== undefined && { pollMs: options.pollMs }),
+    ...(options.confirmMs !== undefined && { confirmMs: options.confirmMs }),
+    ...(options.sleep !== undefined && { sleep: options.sleep }),
+    ...(options.now !== undefined && { now: options.now }),
+    chainFor,
+    key: async (lookup, name, mayMake) => {
+      await targetOf(lookup);
+      const dir = await keysDirOf(options.dir, name);
+      // The rule of which key is attached is `@tender/client`'s, shared with `connect_to_tender`.
+      return agentKeyFor({
+        dir,
+        name,
+        network: lookup.network,
+        account: lookup.account_id,
+        mayMake,
+      }).catch((error: unknown) => {
+        if (error instanceof KeyInUseError) throw new Error(`${error.message} (--name <name>)`);
+        return asUsage(error);
+      });
+    },
+    register: async (lookup, name) => {
+      const where = target ?? (await targetOf(lookup));
+      await registerAgentCommand({
+        ...options,
+        name,
+        account: lookup.account_id,
+        network: lookup.network,
+        // The vault holds the bond by now: what is left to move is NEAR into the storage balance,
+        // out of the NEAR the owner sent the account for it.
+        yes: true,
+        log,
+        env: {
+          ...env,
+          TENDER_NETWORK: where.network,
+          TENDER_CONTRACT: where.contractId,
+          NEAR_RPC_URL: where.rpcUrl,
+        },
+      });
+    },
+  });
+}
+
 // ---- The command line -------------------------------------------------------------------------
 
 export interface CliOptions extends CommandOptions {
   /** Receives what is said about a failure. Default: `console.error`. */
   err?: (text: string) => void;
+  /** For tests: what `connect` asks of the API and the chain, and its clock. */
+  connect?: Pick<
+    ConnectCommandOptions,
+    "apiFor" | "chainCheck" | "keysCheck" | "sleep" | "now" | "pollMs"
+  >;
 }
 
 /** What is printed of a failure: the code and transaction of a `TenderError`, else the message. */
 export function describeFailure(error: unknown): string {
+  if (error instanceof ConnectError) return `agent connect stopped: ${error.message}`;
   if (error instanceof TenderError) {
     const tx = error.txHash === undefined ? "" : `\ntransaction ${error.txHash}`;
     return `agent failed with ${error.code}\n${error.message}${tx}`;
@@ -1292,21 +1312,40 @@ export function describeFailure(error: unknown): string {
   return `agent failed: ${error instanceof Error ? error.message : String(error)}`;
 }
 
-const COMMANDS = ["init", "register", "retire", "claim-bond", "delegate", "undelegate"] as const;
+const COMMANDS = [
+  "init",
+  "register",
+  "retire",
+  "claim-bond",
+  "delegate",
+  "undelegate",
+  "connect",
+] as const;
 
-/** Runs the command line and returns the exit code: 0 when the command did its work, else 1. */
+/**
+ * Runs the command line and returns the exit code: 0 when the command did its work, 1 when it
+ * failed, and 2 when `connect` stopped waiting for the owner or the bond (the same command goes on).
+ */
 export async function main(args: readonly string[], options: CliOptions = {}): Promise<number> {
   const err = options.err ?? console.error;
   try {
-    const [command, ...rest] = args;
+    const [command, ...given] = args;
     if (command === undefined || !(COMMANDS as readonly string[]).includes(command)) {
       throw new UsageError(`unknown command ${JSON.stringify(command ?? "")}\n${USAGE}`);
+    }
+    // `connect` takes its code first, as the page shows the command; no other command takes one.
+    const code = command === "connect" && !given[0]?.startsWith("-") ? given[0] : undefined;
+    const rest = code === undefined ? given : given.slice(1);
+    if (command === "connect" && code === undefined) {
+      throw new UsageError(`connect needs the code from the Add an agent page\n${USAGE}`);
     }
     let values: Record<string, string | boolean | undefined>;
     try {
       values = parseArgs({
         args: [...rest],
         options: {
+          api: { type: "string" },
+          wait: { type: "string" },
           name: { type: "string" },
           account: { type: "string" },
           network: { type: "string" },
@@ -1362,8 +1401,22 @@ export async function main(args: readonly string[], options: CliOptions = {}): P
         ...(text("allowance") !== undefined && { allowance: text("allowance") }),
         ...(text("token") !== undefined && { token: text("token") }),
       });
-    } else {
+    } else if (command === "undelegate") {
       await undelegateAgentCommand(common);
+    } else {
+      const wait = text("wait");
+      if (wait !== undefined && !/^[1-9][0-9]{0,3}$/.test(wait)) {
+        throw new UsageError(`--wait must be a whole number of minutes, 1 to 9999\n${USAGE}`);
+      }
+      const outcome = await connectAgentCommand({
+        ...common,
+        ...options.connect,
+        code: code ?? "",
+        ...(text("api") !== undefined && { api: text("api") }),
+        ...(wait !== undefined && { waitMs: Number(wait) * 60_000 }),
+      });
+      // A run that stopped to wait is not done: the same command goes on from where it stopped.
+      return outcome.status === "registered" ? 0 : 2;
     }
     return 0;
   } catch (error) {

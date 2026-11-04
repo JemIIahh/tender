@@ -1,11 +1,15 @@
-import type { Page } from "@playwright/test";
-import type {
-  AccountEntriesResponse,
-  AccountEntry,
-  AgentSummary,
-  ListTasksResponse,
-  TaskDetailResponse,
-  TaskSummary,
+import type { Page, Route } from "@playwright/test";
+import {
+  type AccountEntriesResponse,
+  type AccountEntry,
+  type AgentSummary,
+  type ConnectCodeState,
+  canonicalBase,
+  connectFingerprint,
+  type ListTasksResponse,
+  SIGN_IN_MESSAGE,
+  type TaskDetailResponse,
+  type TaskSummary,
 } from "@tender/shared";
 import { base58Encode } from "../lib/agentKey";
 import { agent, CREATED, detail, SECOND, summary } from "../test/tasks";
@@ -345,6 +349,19 @@ export interface AccountChain {
   accounts: Map<string, string[]>;
   /** The contract's config view. */
   config: Record<string, unknown>;
+  /** Accounts with a storage balance with Tender (the connect flow pays one for the agent). */
+  storage?: Set<string>;
+  /** Vault balances of the bond's token, by account. */
+  vault?: Map<string, bigint>;
+  /** What each account holds of the bond's token in its own wallet. */
+  wallet?: Map<string, bigint>;
+  /** How many of the next deposits of the bond the token fails (as an empty wallet would). */
+  failDeposits?: number;
+  /**
+   * How many of the next account creations the network fails. This wallet goes on with the next
+   * transactions of the batch after one, as some wallets do.
+   */
+  failCreates?: number;
 }
 
 /**
@@ -386,6 +403,19 @@ export async function routeAccountNode(page: Page, chain: AccountChain): Promise
           })
         : unknown("UNKNOWN_ACCOUNT", `account ${params.account_id} does not exist while viewing`);
     }
+    if (params.request_type === "view_access_key_list") {
+      return chain.accounts.has(params.account_id ?? "")
+        ? answer({
+            result: {
+              keys: (chain.accounts.get(params.account_id ?? "") ?? []).map((key) => ({
+                public_key: key,
+                access_key: { nonce: 0, permission: "FullAccess" },
+              })),
+              block_height: 100,
+            },
+          })
+        : unknown("UNKNOWN_ACCOUNT", `account ${params.account_id} does not exist while viewing`);
+    }
     if (params.request_type === "view_access_key") {
       const keys = chain.accounts.get(params.account_id ?? "") ?? [];
       return keys.includes(params.public_key ?? "")
@@ -395,9 +425,23 @@ export async function routeAccountNode(page: Page, chain: AccountChain): Promise
             `access key ${params.public_key} does not exist while viewing`,
           );
     }
-    if (params.request_type === "call_function" && params.method_name === "get_config") {
-      const bytes = [...new TextEncoder().encode(JSON.stringify(chain.config))];
-      return answer({ result: { result: bytes, logs: [], block_height: 100 } });
+    if (params.request_type === "call_function") {
+      const args = JSON.parse(Buffer.from(params.args_base64 ?? "", "base64").toString() || "{}");
+      const who = String(args.account_id ?? "");
+      const views: Record<string, () => unknown> = {
+        get_config: () => chain.config,
+        storage_balance_of: () =>
+          chain.storage?.has(who)
+            ? { total: "20000000000000000000000", available: "17000000000000000000000" }
+            : null,
+        balance_of: () => (chain.vault?.get(who) ?? 0n).toString(),
+        ft_balance_of: () => (chain.wallet?.get(who) ?? 0n).toString(),
+      };
+      const view = views[params.method_name ?? ""];
+      if (view !== undefined) {
+        const bytes = [...new TextEncoder().encode(JSON.stringify(view()))];
+        return answer({ result: { result: bytes, logs: [], block_height: 100 } });
+      }
     }
     return answer({ error: { name: "HANDLER_ERROR", cause: { name: "UNKNOWN_QUERY" } } });
   });
@@ -424,28 +468,36 @@ export async function installAccountWallet(
     "__tenderE2eAccountSend",
     (batch: { transactions: SentTransaction[] }) => {
       if (options.refuse) throw new Error("User rejected");
-      return batch.transactions.map((transaction, index) => {
+      const outcomes: unknown[] = [];
+      for (const [index, transaction] of batch.transactions.entries()) {
         wallet.sent.push(transaction);
         const created = transaction.actions.some((action) => action.type === "CreateAccount");
         const key = transaction.actions.find((action) => action.type === "AddKey")?.params
           ?.publicKey;
-        if (created)
+        const createFails = created && (options.chain.failCreates ?? 0) > 0;
+        if (createFails) options.chain.failCreates = (options.chain.failCreates ?? 1) - 1;
+        if (created && !createFails)
           options.chain.accounts.set(transaction.receiverId, typeof key === "string" ? [key] : []);
-        return {
-          status: { SuccessValue: "" },
+        const failed =
+          createFails || !transaction.actions.every((action) => runCall(options, action));
+        const status = failed
+          ? {
+              Failure: {
+                ActionError: { kind: { FunctionCallError: { ExecutionError: "E_TOKEN" } } },
+              },
+            }
+          : { SuccessValue: "" };
+        outcomes.push({
+          status,
           transaction: { hash: `acct-tx-${wallet.sent.length}-${index}` },
           receipts_outcome: [
-            {
-              id: `r${index}`,
-              outcome: {
-                executor_id: transaction.receiverId,
-                logs: [],
-                status: { SuccessValue: "" },
-              },
-            },
+            { id: `r${index}`, outcome: { executor_id: transaction.receiverId, logs: [], status } },
           ],
-        };
-      });
+        });
+        // A wallet stops at the first transaction that fails, but for a failed creation here.
+        if (failed && !createFails) break;
+      }
+      return outcomes;
     },
   );
   await page.addInitScript(
@@ -471,9 +523,12 @@ export async function installAccountWallet(
           (
             window as unknown as Record<string, (batch: unknown) => Promise<unknown>>
           ).__tenderE2eAccountSend?.(batch),
-        signMessage: async () => {
-          throw new Error("this wallet signs no messages in the specs");
-        },
+        // The connect flow signs in to the API; the fixture API checks the challenge, not a key.
+        signMessage: async () => ({
+          accountId: account,
+          publicKey: `ed25519:${"1".repeat(44)}`,
+          signature: btoa("e2e-signature"),
+        }),
       };
       const announce = () =>
         window.dispatchEvent(new CustomEvent("near-wallet-injected", { detail: wallet }));
@@ -483,6 +538,186 @@ export async function installAccountWallet(
     { account: options.account, name: STUB_WALLET_NAME },
   );
   return wallet;
+}
+
+/**
+ * What a function call of the connect flow does on `chain`: the storage Tender keeps for an account,
+ * and a deposit of the bond from the owner's wallet into the vault it names (`{"for": ...}`), once
+ * that account has storage. False for a deposit that fails. Any other action changes nothing here.
+ */
+function runCall(
+  options: { account: string; chain: AccountChain },
+  action: { type: string; params?: Record<string, unknown> },
+): boolean {
+  if (action.type !== "FunctionCall") return true;
+  const { chain } = options;
+  const args = (action.params?.args ?? {}) as Record<string, string>;
+  if (action.params?.methodName === "storage_deposit") {
+    chain.storage ??= new Set();
+    chain.storage.add(String(args.account_id));
+  }
+  if (action.params?.methodName === "ft_transfer_call") {
+    const amount = BigInt(args.amount ?? "0");
+    chain.wallet ??= new Map();
+    chain.vault ??= new Map();
+    const held = chain.wallet.get(options.account) ?? 0n;
+    if ((chain.failDeposits ?? 0) > 0 || held < amount) {
+      chain.failDeposits = Math.max(0, (chain.failDeposits ?? 0) - 1);
+      return false;
+    }
+    const beneficiary = (JSON.parse(args.msg || "{}") as { for?: string }).for ?? options.account;
+    if (chain.storage?.has(beneficiary)) {
+      chain.wallet.set(options.account, held - amount);
+      chain.vault.set(beneficiary, (chain.vault.get(beneficiary) ?? 0n) + amount);
+    }
+  }
+  return true;
+}
+
+// ---- Connect your agent ------------------------------------------------------------------------
+
+/** The code the fixture API makes, and its id. Made up: 26 letters of the code's alphabet. */
+export const CONNECT_CODE = "tc_abcdefghijklmnopqrstuvwxyz";
+export const CONNECT_ID = "Q0RFRkdISUpLTE1OT1BRUg";
+const NONCE = Buffer.alloc(32, 7).toString("base64");
+const API_TOKEN = "e2e-connect-token";
+const PREFLIGHT = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-headers": "authorization, content-type",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+};
+
+/** What the fixture API holds of a connect code, which a spec moves as the agent would. */
+export interface ConnectApi {
+  code: {
+    name: string;
+    attached: string | null;
+    expired: boolean;
+    agent: null | { status: "active" | "unregistering" | "retired" };
+    registeredAt: string | null;
+    contestedAt: string | null;
+  } | null;
+  /** How many codes were made. */
+  made: number;
+  /** `METHOD /path` of each request answered. */
+  requests: string[];
+  /** The body of each request for a code. */
+  bodies: unknown[];
+  /** The status the read of the code answers with in place of the state, while set. */
+  readStatus: number | null;
+  /** A fingerprint the read says in place of the key's, while set: an answer that doesn't fit. */
+  fingerprintLie?: string;
+}
+
+/**
+ * Answers the sign-in and the owner's two connect routes for `account`: a code is made for
+ * `<name>.<account>` and read back as the spec has moved it (`agentAttaches`, `agentRegisters`).
+ */
+export async function routeConnect(page: Page, account: string): Promise<ConnectApi> {
+  const api: ConnectApi = { code: null, made: 0, requests: [], bodies: [], readStatus: null };
+  const answer = async (route: Route) => {
+    const request = route.request();
+    if (request.method() === "OPTIONS") return route.fulfill({ status: 204, headers: PREFLIGHT });
+    const { pathname } = new URL(request.url());
+    api.requests.push(`${request.method()} ${pathname}`);
+    const json = (status: number, body: unknown) =>
+      route.fulfill({ status, json: body, headers: PREFLIGHT });
+    if (pathname === "/v1/auth/challenge") {
+      return json(200, {
+        nonce: NONCE,
+        message: SIGN_IN_MESSAGE,
+        recipient: canonicalBase(API_URL),
+        expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      });
+    }
+    if (pathname === "/v1/auth/verify") {
+      return json(200, {
+        token: API_TOKEN,
+        expires_at: "2099-01-01T00:00:00.000Z",
+        key_kind: "full_access",
+      });
+    }
+    if (request.headers().authorization !== `Bearer ${API_TOKEN}`) {
+      return json(401, { error: "unauthorized", message: "sign in first" });
+    }
+    if (pathname === "/v1/connect/codes" && request.method() === "POST") {
+      const body = request.postDataJSON() as { name: string };
+      api.bodies.push(body);
+      api.made++;
+      api.code = {
+        name: body.name,
+        attached: null,
+        expired: false,
+        agent: null,
+        registeredAt: null,
+        contestedAt: null,
+      };
+      return json(200, {
+        id: CONNECT_ID,
+        code: CONNECT_CODE,
+        owner: account,
+        name: body.name,
+        account_id: `${body.name}.${account}`,
+        expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
+      });
+    }
+    if (pathname === `/v1/connect/codes/${CONNECT_ID}` && api.code !== null) {
+      if (api.readStatus !== null)
+        return json(api.readStatus, { error: "unauthorized", message: "x" });
+      const { code } = api;
+      const state: ConnectCodeState = {
+        id: CONNECT_ID,
+        owner: account,
+        name: code.name,
+        account_id: `${code.name}.${account}`,
+        state: code.contestedAt
+          ? "contested"
+          : code.registeredAt
+            ? "registered"
+            : code.attached
+              ? "attached"
+              : code.expired
+                ? "expired"
+                : "waiting",
+        created_at: new Date(Date.now() - 60_000).toISOString(),
+        expires_at: new Date(Date.now() + 29 * 60_000).toISOString(),
+        public_key: code.attached,
+        fingerprint:
+          code.attached === null ? null : (api.fingerprintLie ?? connectFingerprint(code.attached)),
+        attached_at: code.attached === null ? null : new Date().toISOString(),
+        registered_at: code.registeredAt,
+        contested_at: code.contestedAt,
+        agent:
+          code.agent === null
+            ? null
+            : { status: code.agent.status, bond_token: TOKEN, bond_amount: "5000000" },
+      };
+      return json(200, state);
+    }
+    return json(404, { error: "not_found", message: "no such route" });
+  };
+  await page.route(`${API_URL}/v1/auth/**`, answer);
+  await page.route(`${API_URL}/v1/connect/**`, answer);
+  return api;
+}
+
+/** The agent attaches its PUBLIC key to the code, as `pnpm agent:connect` does. */
+export function agentAttaches(api: ConnectApi, publicKey: string): void {
+  if (api.code === null) throw new Error("no code yet");
+  api.code.attached = publicKey;
+}
+
+/** A second, different key tries the code (the agent's, after someone else's): contested. */
+export function agentContests(api: ConnectApi): void {
+  if (api.code === null) throw new Error("no code yet");
+  api.code.contestedAt = new Date().toISOString();
+}
+
+/** The agent registers itself, and the index lists it. */
+export function agentRegisters(api: ConnectApi, status: "active" | "unregistering" = "active") {
+  if (api.code === null) throw new Error("no code yet");
+  api.code.agent = { status };
+  api.code.registeredAt = new Date().toISOString();
 }
 
 /** A public key, as `pnpm agent:init` prints one: 32 bytes in base58. */

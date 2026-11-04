@@ -1,22 +1,31 @@
 "use client";
 
+import { AGENT_ACCOUNT_DEPOSIT, AGENT_STORAGE_DEPOSIT } from "@tender/shared";
 import Link from "next/link";
 import { type ReactNode, useEffect, useId, useRef, useState } from "react";
 import { type BondTerms, readBondTerms } from "../../lib/account";
 import { readAgentName, readPublicKey, SECRET_WARNING } from "../../lib/agentKey";
 import { api } from "../../lib/api";
 import { config } from "../../lib/config";
+import { createAccountActions, createAccountCommand } from "../../lib/connect";
 import { formatSpan } from "../../lib/phase";
 import { accountExists, accountKeyState } from "../../lib/rpc";
 import { useLoad } from "../../lib/useLoad";
 import { describeAmount, describeNear } from "../../lib/vault";
-import { type AccountAction, useAccountActions, useWallet } from "../../lib/wallet";
+import { useAccountActions, useWallet } from "../../lib/wallet";
 import { TransactionFailed, WalletError } from "../../lib/walletErrors";
 import { PageHead } from "../PageHead";
 import { FACT_LABEL, FIELD, NOTICE, PRIMARY, SECONDARY, TEXT_LINK } from "../ui";
+import { ConnectAgent } from "./ConnectAgent";
 import { Command, ConnectGate } from "./parts";
+import { STEP_LOOK, Step } from "./Step";
 
-// "Add an agent": the guided way to make an agent of the connected account, in three steps.
+export { AGENT_ACCOUNT_DEPOSIT, createAccountActions, createAccountCommand, STEP_LOOK };
+
+// "Add an agent": making an agent of the connected account. The page leads with "Connect your agent"
+// (ConnectAgent.tsx): one paste where the agent runs and one approval in the wallet. Below it,
+// "Advanced: set up by hand" keeps the three deliberate steps, for a person who wants each one in
+// their own hands:
 //
 // 1. The agent makes its own key, where it runs (`pnpm agent:init`), and the person pastes the
 //    PUBLIC key here. The page never makes, sees or keeps a private key: one pasted by mistake is
@@ -31,9 +40,6 @@ import { Command, ConnectGate } from "./parts";
 //
 // Nothing is signed until the person presses the button that says what it signs.
 
-/** What the wallet sends the new account: 0.5 NEAR, for its storage and its gas for a long while. */
-export const AGENT_ACCOUNT_DEPOSIT = 5n * 10n ** 23n;
-
 /** How long the page waits after a name or key is typed before it asks the chain about it. */
 const CHECK_DELAY_MS = 400;
 /** How often the page asks the API whether the agent has registered. */
@@ -45,36 +51,6 @@ const SETTLE_TRIES = 5;
 /** The commands, as the agent tools (packages/agents) name them. */
 export const initCommand = (name: string) => `pnpm agent:init --name ${name}`;
 export const REGISTER_COMMAND = "pnpm agent:register";
-
-/** The same transaction as the wallet's, for near-cli (near-cli-rs), signed with the person's key. */
-export function createAccountCommand(plan: {
-  accountId: string;
-  parent: string;
-  publicKey: string;
-  network: string;
-}): string {
-  return [
-    "near account create-account fund-myself",
-    plan.accountId,
-    `'${describeNear(AGENT_ACCOUNT_DEPOSIT)}'`,
-    "use-manually-provided-public-key",
-    plan.publicKey,
-    "sign-as",
-    plan.parent,
-    "network-config",
-    plan.network,
-    "sign-with-keychain send",
-  ].join(" ");
-}
-
-/** The actions of the one transaction that makes the agent's account. */
-export function createAccountActions(publicKey: string): AccountAction[] {
-  return [
-    { type: "CreateAccount" },
-    { type: "Transfer", params: { deposit: AGENT_ACCOUNT_DEPOSIT.toString() } },
-    { type: "AddKey", params: { publicKey, accessKey: { permission: "FullAccess" } } },
-  ];
-}
 
 /** What the chain says of the account the name makes, for the key that was pasted. */
 type Lookup =
@@ -102,101 +78,6 @@ type Create =
   | { state: "settling" }
   | { state: "failed"; message: string }
   | { state: "unseen" };
-
-/**
- * How a step looks once it is open, and before. A step that is not open yet has a dashed edge on
- * the ink and a muted title, and is never faded: faded, its muted words would fall below 4.5:1
- * (WCAG 1.4.3). test/contrast.test.ts holds both looks to that.
- */
-export const STEP_LOOK = {
-  open: {
-    card: "rounded-2xl border border-line bg-panel",
-    title: "text-bone",
-    why: "text-muted",
-  },
-  unopened: {
-    card: "rounded-2xl border border-dashed border-line bg-ink",
-    title: "text-muted",
-    why: "text-muted",
-  },
-} as const;
-
-/** A numbered step: its number, its title, why it is done this way, and what to do. */
-function Step({
-  n,
-  title,
-  why,
-  done,
-  open,
-  children,
-}: {
-  n: number;
-  title: string;
-  why: string;
-  done: boolean;
-  open: boolean;
-  children: ReactNode;
-}) {
-  return (
-    <li
-      data-testid={`step-${n}`}
-      data-done={done}
-      data-open={open}
-      className={`${open ? STEP_LOOK.open.card : STEP_LOOK.unopened.card} grid gap-5 p-5 sm:grid-cols-[auto_minmax(0,1fr)] sm:gap-6 sm:p-7`}
-    >
-      <span
-        aria-hidden="true"
-        className={`hidden size-10 place-items-center rounded-full font-mono text-sm sm:grid ${
-          done
-            ? "bg-bone text-ink"
-            : open
-              ? "border border-bone text-bone"
-              : "border border-dashed border-dim text-muted"
-        }`}
-      >
-        {done ? (
-          <svg
-            viewBox="0 0 16 16"
-            aria-hidden="true"
-            className="size-4"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.8"
-          >
-            <path d="M3.5 8.5l3 3 6-7" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        ) : (
-          n
-        )}
-      </span>
-      <div className="grid min-w-0 gap-4">
-        <div className="grid gap-1.5">
-          <p className={`${FACT_LABEL} flex items-center gap-2`}>
-            {/* On a phone the number's circle is a dot beside these words: red once done. */}
-            <span
-              aria-hidden="true"
-              className={`size-1.5 rounded-full sm:hidden ${done ? "bg-seal" : "bg-dim"}`}
-            />
-            Step {n}
-            {done ? " · done" : ""}
-          </p>
-          <h2
-            className={`text-xl leading-snug font-semibold tracking-tight sm:text-2xl ${open ? STEP_LOOK.open.title : STEP_LOOK.unopened.title}`}
-          >
-            {title}
-          </h2>
-          <p
-            className={`text-[15px] leading-relaxed ${open ? STEP_LOOK.open.why : STEP_LOOK.unopened.why}`}
-          >
-            <span className={open ? "text-bone" : undefined}>Why: </span>
-            {why}
-          </p>
-        </div>
-        {children}
-      </div>
-    </li>
-  );
-}
 
 /** The bond registering locks, from the contract's config, in words. */
 function BondLine({ terms }: { terms: BondTerms }) {
@@ -738,8 +619,59 @@ function Register({
   );
 }
 
-export function AddAgentView({ watchEveryMs = WATCH_EVERY_MS }: { watchEveryMs?: number } = {}) {
+/**
+ * "Advanced: set up by hand": the three steps, folded away under a button until a person asks for
+ * them, or the connect flow sends them here (a wallet that can't sign in).
+ */
+function ByHand({
+  open,
+  onToggle,
+  children,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+}) {
+  const id = useId();
+  return (
+    <section aria-labelledby={`${id}-title`} className="grid gap-4">
+      <div className="grid gap-2 border-t border-line pt-6">
+        <h2 id={`${id}-title`} className="sr-only">
+          Set up by hand
+        </h2>
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-controls={`${id}-steps`}
+          onClick={onToggle}
+          className={`${SECONDARY} justify-self-start`}
+        >
+          {open ? "Hide the steps by hand" : "Advanced: set up by hand"}
+        </button>
+        <p className="text-sm text-muted">
+          Make the key yourself, paste its public key, create the account, and register, one step at
+          a time.
+        </p>
+      </div>
+      {open ? (
+        <div id={`${id}-steps`} data-testid="by-hand">
+          {children}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+export function AddAgentView({
+  watchEveryMs = WATCH_EVERY_MS,
+  pollMs,
+}: {
+  watchEveryMs?: number;
+  /** How often the connect flow asks how its code stands; a test sets it short. */
+  pollMs?: number;
+} = {}) {
   const wallet = useWallet();
+  const [byHand, setByHand] = useState(false);
   return (
     <div className="mx-auto grid w-full max-w-4xl gap-8">
       <PageHead
@@ -748,9 +680,11 @@ export function AddAgentView({ watchEveryMs = WATCH_EVERY_MS }: { watchEveryMs?:
         muted="Its key stays where it runs."
         art={{ name: "signal", focus: { x: 0.6, y: 0.5, scale: 0.42 } }}
       >
-        Three steps. What it costs: {describeNear(AGENT_ACCOUNT_DEPOSIT)} sent to the agent's new
-        account, which stays the agent's, and the bond it locks when it registers, refunded in full
-        when it retires.{" "}
+        One paste where your agent runs, and one approval in your wallet. What it costs:{" "}
+        {describeNear(AGENT_ACCOUNT_DEPOSIT)} sent to the agent's new account, which stays the
+        agent's, {describeNear(AGENT_STORAGE_DEPOSIT)} for its storage with Tender, and the bond it
+        locks when it registers, paid from your wallet into the agent's own vault and refunded in
+        full to that vault when it retires.{" "}
         <Link href="/my-agents" className={TEXT_LINK}>
           Back to My agents
         </Link>
@@ -760,7 +694,19 @@ export function AddAgentView({ watchEveryMs = WATCH_EVERY_MS }: { watchEveryMs?:
         art="scorecard"
         why="The agent's account is made under the account your wallet is connected as, and your wallet signs it."
       >
-        {(account) => <Flow key={account} account={account} watchEveryMs={watchEveryMs} />}
+        {(account) => (
+          <div className="grid gap-8">
+            <ConnectAgent
+              key={account}
+              account={account}
+              onByHand={() => setByHand(true)}
+              {...(pollMs === undefined ? {} : { pollMs })}
+            />
+            <ByHand open={byHand} onToggle={() => setByHand((was) => !was)}>
+              <Flow key={account} account={account} watchEveryMs={watchEveryMs} />
+            </ByHand>
+          </div>
+        )}
       </ConnectGate>
     </div>
   );
