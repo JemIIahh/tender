@@ -4,6 +4,7 @@ export * from "./brief";
 export * from "./calls";
 export * from "./canonical";
 export * from "./commitment";
+export * from "./connect";
 export * from "./constants";
 export * from "./criteria";
 export * from "./events";

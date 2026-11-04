@@ -105,6 +105,22 @@ function firstFormatChar(text: string): string | null {
 }
 
 /**
+ * What is wrong with `text` as plain text, in the words `BoardTextSchema` uses, or null if nothing
+ * is: an invisible format character first (named, as `U+XXXX`), then a lone surrogate, then a
+ * control character or a bidirectional override. Other routes that take a stranger's text (the
+ * connect codes, `connect.ts`) refuse by the same rules, in the same words.
+ */
+export function plainTextFault(text: string): string | null {
+  const found = firstFormatChar(text);
+  if (found !== null) {
+    return `expected plain text, without invisible formatting characters (found ${found})`;
+  }
+  if (LONE_SURROGATE.test(text)) return "expected well-formed text";
+  if (hasForbiddenChar(text)) return "expected plain text, without control characters";
+  return null;
+}
+
+/**
  * The text of a question, an answer or a clarification: plain text of 1 to `BOARD_TEXT_MAX_CHARS`
  * characters once the blanks at its ends are cut. It holds no control character other than a line
  * break or a tab, no bidirectional override and no lone surrogate (which cannot be written as
