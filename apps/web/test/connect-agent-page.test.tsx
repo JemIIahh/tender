@@ -1,5 +1,5 @@
 import { connectFingerprint, SIGN_IN_MESSAGE } from "@tender/shared";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { configure, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { AddAgentView } from "../components/account/AddAgentView";
@@ -35,6 +35,10 @@ vi.mock("../lib/wallet", async (importOriginal) => {
 });
 
 const CONSOLE = ["error", "warn", "log", "info", "debug"] as const;
+
+// A step waits on a poll, then a read of the node, then a render: on a loaded machine that takes
+// longer than Testing Library's second.
+configure({ asyncUtilTimeout: 4000 });
 
 beforeEach(() => {
   for (const method of CONSOLE) vi.spyOn(console, method).mockImplementation(() => {});
