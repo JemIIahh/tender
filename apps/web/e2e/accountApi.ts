@@ -357,6 +357,11 @@ export interface AccountChain {
   wallet?: Map<string, bigint>;
   /** How many of the next deposits of the bond the token fails (as an empty wallet would). */
   failDeposits?: number;
+  /**
+   * How many of the next account creations the network fails. This wallet goes on with the next
+   * transactions of the batch after one, as some wallets do.
+   */
+  failCreates?: number;
 }
 
 /**
@@ -393,6 +398,19 @@ export async function routeAccountNode(page: Page, chain: AccountChain): Promise
               locked: "0",
               code_hash: "11111111111111111111111111111111",
               storage_usage: 182,
+              block_height: 100,
+            },
+          })
+        : unknown("UNKNOWN_ACCOUNT", `account ${params.account_id} does not exist while viewing`);
+    }
+    if (params.request_type === "view_access_key_list") {
+      return chain.accounts.has(params.account_id ?? "")
+        ? answer({
+            result: {
+              keys: (chain.accounts.get(params.account_id ?? "") ?? []).map((key) => ({
+                public_key: key,
+                access_key: { nonce: 0, permission: "FullAccess" },
+              })),
               block_height: 100,
             },
           })
@@ -456,9 +474,12 @@ export async function installAccountWallet(
         const created = transaction.actions.some((action) => action.type === "CreateAccount");
         const key = transaction.actions.find((action) => action.type === "AddKey")?.params
           ?.publicKey;
-        if (created)
+        const createFails = created && (options.chain.failCreates ?? 0) > 0;
+        if (createFails) options.chain.failCreates = (options.chain.failCreates ?? 1) - 1;
+        if (created && !createFails)
           options.chain.accounts.set(transaction.receiverId, typeof key === "string" ? [key] : []);
-        const failed = !transaction.actions.every((action) => runCall(options, action));
+        const failed =
+          createFails || !transaction.actions.every((action) => runCall(options, action));
         const status = failed
           ? {
               Failure: {
@@ -473,8 +494,8 @@ export async function installAccountWallet(
             { id: `r${index}`, outcome: { executor_id: transaction.receiverId, logs: [], status } },
           ],
         });
-        // A wallet stops at the first transaction that fails.
-        if (failed) break;
+        // A wallet stops at the first transaction that fails, but for a failed creation here.
+        if (failed && !createFails) break;
       }
       return outcomes;
     },
@@ -574,6 +595,7 @@ export interface ConnectApi {
     expired: boolean;
     agent: null | { status: "active" | "unregistering" | "retired" };
     registeredAt: string | null;
+    contestedAt: string | null;
   } | null;
   /** How many codes were made. */
   made: number;
@@ -583,6 +605,8 @@ export interface ConnectApi {
   bodies: unknown[];
   /** The status the read of the code answers with in place of the state, while set. */
   readStatus: number | null;
+  /** A fingerprint the read says in place of the key's, while set: an answer that doesn't fit. */
+  fingerprintLie?: string;
 }
 
 /**
@@ -626,6 +650,7 @@ export async function routeConnect(page: Page, account: string): Promise<Connect
         expired: false,
         agent: null,
         registeredAt: null,
+        contestedAt: null,
       };
       return json(200, {
         id: CONNECT_ID,
@@ -645,19 +670,23 @@ export async function routeConnect(page: Page, account: string): Promise<Connect
         owner: account,
         name: code.name,
         account_id: `${code.name}.${account}`,
-        state: code.registeredAt
-          ? "registered"
-          : code.attached
-            ? "attached"
-            : code.expired
-              ? "expired"
-              : "waiting",
+        state: code.contestedAt
+          ? "contested"
+          : code.registeredAt
+            ? "registered"
+            : code.attached
+              ? "attached"
+              : code.expired
+                ? "expired"
+                : "waiting",
         created_at: new Date(Date.now() - 60_000).toISOString(),
         expires_at: new Date(Date.now() + 29 * 60_000).toISOString(),
         public_key: code.attached,
-        fingerprint: code.attached === null ? null : connectFingerprint(code.attached),
+        fingerprint:
+          code.attached === null ? null : (api.fingerprintLie ?? connectFingerprint(code.attached)),
         attached_at: code.attached === null ? null : new Date().toISOString(),
         registered_at: code.registeredAt,
+        contested_at: code.contestedAt,
         agent:
           code.agent === null
             ? null
@@ -676,6 +705,12 @@ export async function routeConnect(page: Page, account: string): Promise<Connect
 export function agentAttaches(api: ConnectApi, publicKey: string): void {
   if (api.code === null) throw new Error("no code yet");
   api.code.attached = publicKey;
+}
+
+/** A second, different key tries the code (the agent's, after someone else's): contested. */
+export function agentContests(api: ConnectApi): void {
+  if (api.code === null) throw new Error("no code yet");
+  api.code.contestedAt = new Date().toISOString();
 }
 
 /** The agent registers itself, and the index lists it. */

@@ -4,6 +4,7 @@ import {
   type AccountChain,
   AGENT_PUBLIC_KEY,
   agentAttaches,
+  agentContests,
   agentRegisters,
   CONNECT_CODE,
   installAccountWallet,
@@ -156,4 +157,43 @@ test("a_wallet_short_of_the_bond_is_told_and_a_failed_bond_is_paid_with_fund_age
   expect(wallet.sent.map((tx) => tx.receiverId)).toEqual([AGENT, CONTRACT, TOKEN, TOKEN]);
   await page.setViewportSize(PHONE);
   await expectToFit(page, "fund agent (phone)");
+});
+
+test("a_contested_code_is_refused_and_an_agent_you_started_is_finished_with_fund_agent", async ({
+  page,
+}) => {
+  const chain = chainOf();
+  const { api, wallet } = await openConnected(page, chain);
+  await page.getByTestId("connect-step-1").getByLabel("Account name").fill("writer");
+  await expect(page.getByTestId("connect-name-state")).toHaveText(`${AGENT} is free.`);
+  await page.getByRole("button", { name: "Get a connect code" }).click();
+  await expect(page.getByTestId("connect-command")).toBeVisible();
+  agentAttaches(api, AGENT_PUBLIC_KEY);
+  await expect(page.getByRole("button", { name: "Create agent" })).toBeVisible();
+
+  // A second key tried the code: the page refuses it.
+  agentContests(api);
+  await expect(page.getByTestId("connect-contested")).toContainText(
+    "Two different keys tried this code: someone else has it. Start over.",
+  );
+  await expect(page.getByRole("button", { name: "Create agent" })).toHaveCount(0);
+  await page.getByTestId("connect-contested").getByRole("button", { name: "Start over" }).click();
+
+  // An agent started earlier: its account exists with its key and its storage, and no bond.
+  chain.accounts.set(AGENT, [AGENT_PUBLIC_KEY]);
+  chain.storage?.add(AGENT);
+  await page.getByTestId("connect-step-1").getByLabel("Account name").fill("");
+  await page.getByTestId("connect-step-1").getByLabel("Account name").fill("writer");
+  await expect(page.getByTestId("connect-name-state")).toHaveText(`${AGENT} already exists.`);
+  await page.getByRole("button", { name: "Finish this agent" }).click();
+  await expect(page.getByTestId("connect-finish-keys")).toContainText(
+    connectFingerprint(AGENT_PUBLIC_KEY),
+  );
+  await expect(page.getByTestId("tick-funded")).toHaveAttribute("data-state", "wrong");
+  await page.getByRole("button", { name: "Fund agent" }).click();
+  await expect(page.getByTestId("tick-funded")).toHaveAttribute("data-state", "done");
+  expect(wallet.sent.map((tx) => tx.receiverId)).toEqual([TOKEN]);
+  expect(api.made).toBe(1);
+  await page.setViewportSize(PHONE);
+  await expectToFit(page, "finish (phone)");
 });

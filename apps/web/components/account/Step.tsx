@@ -1,8 +1,8 @@
 import type { ReactNode } from "react";
 import { FACT_LABEL } from "../ui";
 
-// A numbered step of "Add an agent": its number, its title, why it is done this way, and what to
-// do. The connect flow (ConnectAgent.tsx) and the steps by hand (AddAgentView.tsx) are both made of
+// A numbered step of "Add an agent": its number, its title (an h3, under the h2 of its set of
+// steps), why it is done this way, and what to do. The connect flow (ConnectAgent.tsx) and the steps by hand (AddAgentView.tsx) are both made of
 // them.
 
 /**
@@ -85,11 +85,11 @@ export function Step({
             Step {n}
             {done ? " · done" : ""}
           </p>
-          <h2
+          <h3
             className={`text-xl leading-snug font-semibold tracking-tight sm:text-2xl ${open ? STEP_LOOK.open.title : STEP_LOOK.unopened.title}`}
           >
             {title}
-          </h2>
+          </h3>
           <p
             className={`text-[15px] leading-relaxed ${open ? STEP_LOOK.open.why : STEP_LOOK.unopened.why}`}
           >

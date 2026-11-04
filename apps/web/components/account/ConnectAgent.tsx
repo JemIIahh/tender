@@ -3,8 +3,8 @@
 import {
   AGENT_ACCOUNT_DEPOSIT,
   AGENT_STORAGE_DEPOSIT,
+  type AgentBondTerms,
   ApiError,
-  type ConnectCodeCreated,
   type ConnectCodeState,
   connectCommand,
   connectFingerprint,
@@ -12,8 +12,8 @@ import {
   isEd25519PublicKey,
 } from "@tender/shared";
 import Link from "next/link";
-import { type ReactNode, useEffect, useId, useRef, useState } from "react";
-import { readBondTerms } from "../../lib/account";
+import { Fragment, type ReactNode, useEffect, useId, useRef, useState } from "react";
+import { type BondTerms, readBondTerms } from "../../lib/account";
 import { readAgentName } from "../../lib/agentKey";
 import { api } from "../../lib/api";
 import { useApiToken } from "../../lib/auth";
@@ -26,12 +26,19 @@ import {
   createAgentBatch,
   fundCallsFor,
   isFunded,
+  isPaid,
+  type KeptCode,
+  keepCode,
+  readAgentFunding,
   readAgentOnChain,
+  readKeptCode,
   readWalletBalance,
+  whatLanded,
 } from "../../lib/connect";
 import { errorMessage } from "../../lib/errors";
 import { faucetOffered } from "../../lib/faucet";
-import { accountExists } from "../../lib/rpc";
+import { accountExists, fullAccessKeysOf } from "../../lib/rpc";
+import type { Loaded } from "../../lib/useLoad";
 import { useLoad } from "../../lib/useLoad";
 import { describeAmount, describeNear } from "../../lib/vault";
 import { useAccountActions, useWallet } from "../../lib/wallet";
@@ -57,9 +64,15 @@ import { Step } from "./Step";
 // 3. The page shows the account and the fingerprint of the key that came, which the agent printed
 //    too, and warns that a key that is not the agent's means someone else has the code. One button,
 //    Create agent, and ONE approval: the account with that key as a full-access key and its NEAR,
-//    then its storage with Tender, then the bond from the person's wallet into the agent's vault.
+//    then what Tender does not hold for it yet: its storage, and the bond from the person's wallet
+//    into the agent's vault.
 // 4. The agent registers itself with its own key. The page ticks Created, Funded, Registered and
 //    Active from the chain and the index, and says what to do at each step that fails.
+//
+// A code that two different keys tried is CONTESTED (the API says so): someone else has it, and the
+// page creates and funds nothing for it. A name whose account exists already is an agent the person
+// may have started: "Finish this agent" reads where it stands and pays what it lacks, with no code.
+// The code's id (no credential) is kept in this tab, so a reload comes back to the same code.
 //
 // The page never makes, sees or keeps the agent's private key, and nothing is signed until the
 // person presses the button that names what it signs.
@@ -88,6 +101,12 @@ type StateFault = "signed-out" | "unreachable" | "gone" | null;
 /** What the person holds of the bond's token in their own wallet, as the page last read it. */
 type Held = { state: "unknown" } | { state: "read"; amount: bigint } | { state: "error" };
 
+/** A code as the page holds it: what is kept across a reload, and the code itself while shown. */
+type HeldCode = KeptCode & {
+  /** The code, shown once; null after a reload, as it is never kept. */
+  code: string | null;
+};
+
 /** The words of the API's refusal of a code, from its own fixed texts, or of anything else. */
 function codeRefusal(error: unknown): string {
   if (error instanceof ApiError) {
@@ -104,7 +123,27 @@ function codeRefusal(error: unknown): string {
   return walletErrorMessage(error) || errorMessage(error);
 }
 
-/** A tick of step 4: done, under way, waiting on something, or wrong. */
+/** An account id that breaks at its dots on a narrow screen, and not in the middle of a part. */
+export function AccountName({ id, className }: { id: string; className?: string }) {
+  const parts = id.split(".");
+  return (
+    <span className={`font-mono wrap-anywhere ${className ?? ""}`}>
+      {parts.map((part, index) => (
+        // biome-ignore lint/suspicious/noArrayIndexKey: the parts of one id, in their order
+        <Fragment key={index}>
+          {part}
+          {index < parts.length - 1 ? (
+            <>
+              .<wbr />
+            </>
+          ) : null}
+        </Fragment>
+      ))}
+    </span>
+  );
+}
+
+/** A tick of the agent's setup: done, under way, waiting on something, or wanting the person. */
 function Tick({
   label,
   state,
@@ -117,12 +156,7 @@ function Tick({
   testId: string;
 }) {
   return (
-    <li
-      data-testid={testId}
-      data-state={state}
-      className="grid content-start gap-2 bg-ink p-4"
-      aria-label={`${label}: ${state === "done" ? "done" : state === "wrong" ? "needs you" : "not yet"}`}
-    >
+    <li data-testid={testId} data-state={state} className="grid content-start gap-2 bg-ink p-4">
       <p className={`${FACT_LABEL} flex items-center gap-2`}>
         {state === "done" ? (
           <svg
@@ -148,10 +182,172 @@ function Tick({
           />
         )}
         <span className={state === "done" ? "text-bone" : undefined}>{label}</span>
+        {/* What the mark says, for a screen reader: the words below stay read as they are. */}
+        <span className="sr-only">
+          {state === "done" ? ", done" : state === "wrong" ? ", needs you" : ", not yet"}
+        </span>
       </p>
       <div className="text-[13px] leading-snug text-muted">{children}</div>
     </li>
   );
+}
+
+/**
+ * The four ticks of an agent's setup, Created · Funded · Registered · Active, and Fund agent while
+ * Tender lacks its storage or its bond. Step 4 shows them for a code's account, and "Finish this
+ * agent" for an account typed in step 1.
+ */
+function AgentTicks({
+  target,
+  funded,
+  registered,
+  active,
+  status,
+  bond,
+  send,
+  canFund,
+  fundBlocked,
+  onFund,
+  keyWords = "your agent's key",
+}: {
+  /** What the Created tick says the account has: the key the code brought, or the key shown above. */
+  keyWords?: string;
+  target: string;
+  funded: boolean;
+  registered: boolean;
+  active: boolean;
+  /** The agent's status in the index, once it is there. */
+  status: string | null;
+  bond: AgentBondTerms | null;
+  send: Send;
+  /** Whether Fund agent is offered at all: not while the terms of the bond are unread. */
+  canFund: boolean;
+  /** Why Fund agent is off, if it is. */
+  fundBlocked: string | null;
+  onFund: () => void;
+}) {
+  const sending = send.state === "waiting" || send.state === "settling";
+  return (
+    <div className="grid gap-4">
+      <ol
+        aria-label="Where the agent stands"
+        className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line bg-line lg:grid-cols-4"
+      >
+        <Tick label="Created" state="done" testId="tick-created">
+          <AccountName id={target} className="text-[12px]" /> exists with {keyWords}.
+        </Tick>
+        <Tick
+          label="Funded"
+          state={funded ? "done" : sending ? "working" : "wrong"}
+          testId="tick-funded"
+        >
+          {funded ? (
+            bond === null ? (
+              "Its storage with Tender is paid."
+            ) : (
+              <>
+                Its storage and its{" "}
+                <span className="whitespace-nowrap">{describeAmount(bond.amount, bond.token)}</span>{" "}
+                bond are in place.
+              </>
+            )
+          ) : sending ? (
+            "Waiting for your wallet…"
+          ) : (
+            "Its storage or its bond hasn't arrived. Press Fund agent below."
+          )}
+        </Tick>
+        <Tick
+          label="Registered"
+          state={registered ? "done" : funded ? "working" : "waiting"}
+          testId="tick-registered"
+        >
+          {registered
+            ? "The agent registered itself with its own key."
+            : funded
+              ? "Waiting for the agent to register. Its terminal says each step."
+              : "Once it is funded."}
+        </Tick>
+        <Tick
+          label="Active"
+          state={active ? "done" : registered ? "wrong" : "waiting"}
+          testId="tick-active"
+        >
+          {active
+            ? "It can enter open tasks."
+            : registered
+              ? `It is listed as ${status ?? "registering"}. Open its page to see why.`
+              : "Once it has registered."}
+        </Tick>
+      </ol>
+
+      {funded || registered ? null : (
+        <div className="grid gap-2">
+          <button
+            type="button"
+            aria-disabled={sending || !canFund || fundBlocked !== null}
+            onClick={() => {
+              if (!sending && canFund && fundBlocked === null) onFund();
+            }}
+            className={`${PRIMARY} justify-self-start`}
+          >
+            {send.state === "waiting"
+              ? "Waiting for your wallet…"
+              : send.state === "settling"
+                ? "Looking for the bond…"
+                : "Fund agent"}
+          </button>
+          {send.state === "failed" ? (
+            <p role="alert" data-testid="connect-fund-error" className="text-sm text-seal">
+              {send.message}
+            </p>
+          ) : fundBlocked !== null ? (
+            <p className="text-sm text-muted">{fundBlocked}</p>
+          ) : (
+            <p className="text-sm text-muted">
+              Pays what Tender doesn't hold for the agent yet, its storage or its bond, in one
+              approval.
+            </p>
+          )}
+        </div>
+      )}
+
+      {active ? (
+        <div data-testid="connect-active" className={`${NOTICE} grid gap-3 border-bone/40`}>
+          <p role="status" className="flex items-start gap-2">
+            <span aria-hidden="true" className="mt-2 size-1.5 shrink-0 rounded-full bg-seal" />
+            <span>
+              Your agent is active. <AccountName id={target} className="text-[13px]" /> is in the
+              directory.
+            </span>
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Link href={`/agents/${target}`} className={PRIMARY}>
+              Open its page
+            </Link>
+            <Link href="/my-agents" className={SECONDARY}>
+              Back to My agents
+            </Link>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Reads the chain until `ready` holds, or the tries run out; gives the last thing it read. */
+async function settleOn<T>(read: () => Promise<T>, ready: (seen: T) => boolean): Promise<T | null> {
+  let seen: T | null = null;
+  for (let tries = 0; tries < SETTLE_TRIES; tries++) {
+    try {
+      seen = await read();
+      if (ready(seen)) return seen;
+    } catch (error) {
+      console.error(error);
+    }
+    await new Promise((resolve) => setTimeout(resolve, SETTLE_EVERY_MS));
+  }
+  return seen;
 }
 
 export function ConnectAgent({
@@ -171,13 +367,18 @@ export function ConnectAgent({
   const [terms, retryTerms] = useLoad("config", () => readBondTerms());
   const bond = terms.status === "ready" ? bondOfTerms(terms.data) : null;
 
-  const [nameText, setNameText] = useState("");
+  // A code kept in this tab before a reload comes back: its id and its name, not the code itself.
+  const [code, setCode] = useState<HeldCode | null>(() => {
+    const kept = readKeptCode(account);
+    return kept === null ? null : { ...kept, code: null };
+  });
+  const [nameText, setNameText] = useState(() => code?.name ?? "");
   const [nameTouched, setNameTouched] = useState(false);
   const [check, setCheck] = useState<NameCheck>({ state: "idle" });
   const [asking, setAsking] = useState(false);
   const [askError, setAskError] = useState<string | null>(null);
   const [cannotSign, setCannotSign] = useState(false);
-  const [code, setCode] = useState<ConnectCodeCreated | null>(null);
+  const [finishing, setFinishing] = useState<string | null>(null);
   const [state, setState] = useState<ConnectCodeState | null>(null);
   const [fault, setFault] = useState<StateFault>(null);
   const [chain, setChain] = useState<AgentOnChain | null>(null);
@@ -198,16 +399,18 @@ export function ConnectAgent({
   const accountId = name.ok ? name.accountId : null;
   const attached = state?.public_key ?? null;
   const target = state?.account_id ?? code?.account_id ?? null;
+  const contested = state !== null && (state.state === "contested" || state.contested_at !== null);
   const created = chain?.key === "has-key";
   const registered = state !== null && (state.agent !== null || state.registered_at !== null);
   const active = state?.agent?.status === "active";
   const funded = terms.status === "ready" && isFunded(chain, bond, registered);
   const sending = send.state === "waiting" || send.state === "settling";
   const canSend = actions.canSend();
+  const locked = code !== null || finishing !== null;
 
   // The name changed: ask the chain about the account once the typing stops.
   useEffect(() => {
-    if (accountId === null || code !== null) {
+    if (accountId === null || locked) {
       latestCheck.current++;
       setCheck({ state: "idle" });
       return;
@@ -228,13 +431,14 @@ export function ConnectAgent({
       );
     }, CHECK_DELAY_MS);
     return () => clearTimeout(timer);
-  }, [accountId, code]);
+  }, [accountId, locked]);
 
   // A code is out: ask the API how it stands every `pollMs`, and the chain once a key is attached,
-  // until the agent is active or the code ran out with no key.
+  // until the agent is active, the code ran out with no key, or two keys contested it.
+  const codeId = code?.id ?? null;
   // biome-ignore lint/correctness/useExhaustiveDependencies: `lookAgain` restarts the loop on purpose
   useEffect(() => {
-    if (code === null) return;
+    if (codeId === null) return;
     let gone = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const look = async () => {
@@ -244,10 +448,11 @@ export function ConnectAgent({
         return;
       }
       try {
-        const found = await api.getConnectCode(held, code.id);
+        const found = await api.getConnectCode(held, codeId);
         if (gone) return;
         setNowMs(Date.now());
         if (found === null) {
+          keepCode(account, null);
           setFault("gone");
           return;
         }
@@ -266,7 +471,15 @@ export function ConnectAgent({
             console.error(error);
           }
         }
-        if (found.state === "expired" || found.agent?.status === "active") return;
+        if (found.agent?.status === "active") keepCode(account, null);
+        if (
+          found.state === "expired" ||
+          found.state === "contested" ||
+          found.contested_at !== null ||
+          found.agent?.status === "active"
+        ) {
+          return;
+        }
       } catch (error) {
         if (gone) return;
         console.error(error);
@@ -283,7 +496,7 @@ export function ConnectAgent({
       gone = true;
       clearTimeout(timer);
     };
-  }, [code, pollMs, lookAgain]);
+  }, [codeId, pollMs, lookAgain, account]);
 
   // A key is attached and the account is not made yet: how much of the bond's token the person's
   // wallet holds, so that the page says before the wallet does whether the bond can be paid.
@@ -328,6 +541,7 @@ export function ConnectAgent({
         return;
       }
       const made = await withToken((held) => api.createConnectCode(held, nameText.trim()));
+      keepCode(account, made);
       setCode(made);
       setState(null);
       setChain(null);
@@ -349,7 +563,9 @@ export function ConnectAgent({
 
   const startOver = () => {
     if (sending) return;
+    keepCode(account, null);
     setCode(null);
+    setFinishing(null);
     setState(null);
     setChain(null);
     setFault(null);
@@ -368,50 +584,53 @@ export function ConnectAgent({
     }
   };
 
-  /** Reads the chain until the account is made and paid for, or the tries run out. */
-  const settle = async (accountIdNow: string, key: string): Promise<AgentOnChain | null> => {
-    let seen: AgentOnChain | null = null;
-    for (let tries = 0; tries < SETTLE_TRIES; tries++) {
-      try {
-        seen = await readAgentOnChain(accountIdNow, key, bond);
-        setChain(seen);
-        if (isFunded(seen, bond, registered)) return seen;
-      } catch (error) {
-        console.error(error);
-      }
-      await new Promise((resolve) => setTimeout(resolve, SETTLE_EVERY_MS));
-    }
-    return seen;
-  };
+  // The page works out the fingerprint itself, from the key it will add: what it shows is the key's,
+  // whatever the API says. An answer whose account is not the one asked for, or whose fingerprint is
+  // not its key's, is not used for anything that is signed, nor for a command to run.
+  const fingerprint =
+    attached !== null && isEd25519PublicKey(attached) ? connectFingerprint(attached) : null;
+  const answerFits =
+    state === null ||
+    (state.account_id === accountId &&
+      (attached === null || (fingerprint !== null && state.fingerprint === fingerprint)));
 
   /** Create agent: the one approval, or only the paying part when the account is there already. */
   const create = async (fundOnly: boolean) => {
-    if (busy.current || attached === null || target === null || terms.status !== "ready") return;
-    if (!answerFits) return;
+    if (busy.current || attached === null || accountId === null || terms.status !== "ready") return;
+    if (!answerFits || contested) return;
     busy.current = true;
     setSend({ state: "waiting" });
+    let sentAccount = false;
     try {
-      // What the chain holds now, not what the page last saw.
-      const fresh = await readAgentOnChain(target, attached, bond);
+      // What the chain holds now, not what the page last saw: an earlier try may have paid the
+      // storage or the bond, which is never paid twice.
+      const fresh = await readAgentOnChain(accountId, attached, bond);
       setChain(fresh);
       if (fresh.key === "other-keys") {
         setSend({
           state: "failed",
-          message: `${target} exists already, and not with your agent's key. Start over with another name.`,
+          message: `${accountId} exists already, and not with your agent's key. Start over with another name.`,
         });
         return;
       }
       if (fresh.key === "has-key") {
-        const calls = fundCallsFor(target, fresh, bond);
+        const calls = fundCallsFor(accountId, fresh, bond);
         if (calls.length > 0) await wallet.signAndSend(calls);
       } else if (fundOnly) {
         setSend({ state: "idle" });
         return;
       } else {
-        await actions.sendBatch(createAgentBatch({ accountId: target, publicKey: attached, bond }));
+        sentAccount = true;
+        await actions.sendBatch(
+          createAgentBatch({ accountId, publicKey: attached, chain: fresh, bond }),
+        );
       }
       setSend({ state: "settling" });
-      const after = await settle(target, attached);
+      const after = await settleOn(
+        () => readAgentOnChain(accountId, attached, bond),
+        (seen) => isFunded(seen, bond, registered),
+      );
+      if (after !== null) setChain(after);
       setSend(
         after !== null && isFunded(after, bond, registered)
           ? { state: "idle" }
@@ -426,22 +645,15 @@ export function ConnectAgent({
     } catch (error) {
       console.error(error);
       // The chain says what happened, whatever the wallet said.
-      const after = await readAgentOnChain(target, attached, bond).catch(() => null);
+      const after = await readAgentOnChain(accountId, attached, bond).catch(() => null);
       if (after !== null) setChain(after);
-      const made = after?.key === "has-key";
       setSend({
         state: "failed",
         message:
-          error instanceof TransactionFailed
-            ? made
-              ? after?.storage
-                ? "The account was created and its storage paid, and paying its bond failed on the network. Check that your wallet holds the bond, then press Fund agent."
-                : "The account was created, and paying its storage and bond failed on the network. Check that your wallet holds the bond, then press Fund agent."
-              : "The transaction failed on the network, so the account was not created. Press Create agent to try again."
-            : error instanceof WalletError
-              ? made
-                ? "The account exists, and your wallet didn't send the storage and the bond. Press Fund agent to try again."
-                : "Your wallet didn't send it. Press Create agent to try again."
+          error instanceof TransactionFailed || error instanceof WalletError
+            ? whatLanded(after, bond, error instanceof WalletError)
+            : sentAccount
+              ? whatLanded(after, bond, true)
               : "Something went wrong before anything was sent. Press Create agent to try again.",
       });
     } finally {
@@ -454,16 +666,9 @@ export function ConnectAgent({
   const expired = state?.state === "expired";
   const short =
     bond !== null && held.state === "read" && held.amount < bond.amount ? held.amount : null;
-  // The page works out the fingerprint itself, from the key it will add: what it shows is the key's,
-  // whatever the API says. An answer whose account is not the one asked for, or whose fingerprint is
-  // not its key's, is not used for anything that is signed.
-  const fingerprint =
-    attached !== null && isEd25519PublicKey(attached) ? connectFingerprint(attached) : null;
-  const answerFits =
-    state === null ||
-    (state.account_id === accountId &&
-      (attached === null || (fingerprint !== null && state.fingerprint === fingerprint)));
-  const blocked = short !== null || terms.status !== "ready" || !answerFits;
+  const blocked = short !== null || terms.status !== "ready" || !answerFits || contested;
+  const showFinishOffer =
+    !locked && name.ok && check.state === "taken" && check.accountId === accountId;
 
   return (
     <section aria-labelledby={`${id}-title`} className="grid gap-4">
@@ -479,7 +684,7 @@ export function ConnectAgent({
           testId="connect-step-1"
           title="Name your agent's account."
           why="The agent works as its own NEAR account, under yours, so the directory lists it as your agent and its record is its own."
-          done={code !== null}
+          done={locked}
           open
         >
           <div className="grid gap-1.5">
@@ -491,12 +696,12 @@ export function ConnectAgent({
                 id={`${id}-name`}
                 value={nameText}
                 onChange={(event) => {
-                  if (code !== null || asking) return;
+                  if (locked || asking) return;
                   setNameText(event.currentTarget.value);
                   setAskError(null);
                 }}
                 onBlur={() => setNameTouched(true)}
-                readOnly={code !== null || asking}
+                readOnly={locked || asking}
                 placeholder="writer"
                 autoComplete="off"
                 autoCapitalize="none"
@@ -514,10 +719,13 @@ export function ConnectAgent({
               className="text-sm"
               aria-live="polite"
             >
-              {code !== null ? (
+              {finishing !== null ? (
                 <span className="text-bone">
-                  The code is for{" "}
-                  <span className="font-mono text-[13px] wrap-anywhere">{code.account_id}</span>.
+                  Finishing <AccountName id={finishing} className="text-[13px]" />.
+                </span>
+              ) : code !== null ? (
+                <span className="text-bone">
+                  The code is for <AccountName id={code.account_id} className="text-[13px]" />.
                 </span>
               ) : !name.ok ? (
                 nameTouched || nameText !== "" ? (
@@ -531,9 +739,7 @@ export function ConnectAgent({
               ) : check.state === "free" ? (
                 <span className="text-bone">{check.accountId} is free.</span>
               ) : check.state === "taken" ? (
-                <span className="text-seal">
-                  {check.accountId} already exists. Choose another name.
-                </span>
+                <span className="text-seal">{check.accountId} already exists.</span>
               ) : (
                 <span className="text-seal">
                   Couldn't ask the network about {check.accountId}. It is checked again before the
@@ -543,7 +749,27 @@ export function ConnectAgent({
             </p>
           </div>
 
-          {code !== null ? null : cannotSign || !wallet.canSignMessage ? (
+          {showFinishOffer && accountId !== null ? (
+            <div data-testid="connect-finish-offer" className={`${NOTICE} grid gap-3`}>
+              <p>
+                If it is an agent you started here, finish it: the page reads where it stands and
+                pays what Tender doesn't hold for it yet. No new code is needed. Otherwise choose
+                another name.
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setFinishing(accountId);
+                  setSend({ state: "idle" });
+                }}
+                className={`${PRIMARY} justify-self-start`}
+              >
+                Finish this agent
+              </button>
+            </div>
+          ) : null}
+
+          {locked ? null : cannotSign || !wallet.canSignMessage ? (
             <div data-testid="connect-cannot-sign" className={`${NOTICE} grid gap-3`}>
               <p>
                 This wallet can't sign in to Tender, and a connect code needs that. Set the agent up
@@ -557,7 +783,7 @@ export function ConnectAgent({
                 Set up by hand
               </button>
             </div>
-          ) : (
+          ) : showFinishOffer ? null : (
             <div className="grid gap-2">
               <button
                 type="button"
@@ -583,384 +809,598 @@ export function ConnectAgent({
           )}
         </Step>
 
-        <Step
-          n={2}
-          testId="connect-step-2"
-          title="Paste one line where your agent runs."
-          why="The agent makes its own key there and sends Tender only the public half, with the code. Its private key never leaves its machine."
-          done={attached !== null}
-          open={code !== null}
-        >
-          {code === null ? (
-            <p className="text-sm text-muted">Once you have a code.</p>
-          ) : (
-            <div className="grid gap-4">
-              <Command
-                command={connectCommand(code.code, config.apiUrl)}
-                label="In a terminal, in the Tender repository"
-                testId="connect-command"
-              />
-              <Command
-                command={connectSentence(code.code)}
-                label="Or tell an agent that has Tender's MCP server"
-                prompt={false}
-                testId="connect-sentence"
-              />
-              {attached !== null ? null : expired ? (
-                <div data-testid="connect-expired" className={`${NOTICE} grid gap-3`}>
-                  <p role="status">
-                    This code expired before an agent used it. Codes last 30 minutes.
-                  </p>
-                  <button
-                    type="button"
-                    aria-disabled={asking}
-                    onClick={() => {
-                      if (!asking) void getCode();
-                    }}
-                    className={`${PRIMARY} justify-self-start`}
-                  >
-                    {asking ? "Waiting for your wallet…" : "Get a new code"}
-                  </button>
-                </div>
+        {finishing !== null ? (
+          <FinishAgent
+            accountId={finishing}
+            name={nameText.trim()}
+            terms={terms}
+            bond={bond}
+            retryTerms={retryTerms}
+            pollMs={pollMs}
+            onStartOver={startOver}
+          />
+        ) : (
+          <>
+            <Step
+              n={2}
+              testId="connect-step-2"
+              title="Paste one line where your agent runs."
+              why="The agent makes its own key there and sends Tender only the public half, with the code. Its private key never leaves its machine."
+              done={attached !== null && !contested}
+              open={code !== null}
+            >
+              {code === null ? (
+                <p className="text-sm text-muted">Once you have a code.</p>
               ) : (
-                <p
-                  role="status"
-                  data-testid="connect-waiting"
-                  className="flex items-start gap-2.5 rounded-xl border border-dashed border-dim p-4 text-sm text-muted"
-                >
-                  <span
-                    aria-hidden="true"
-                    className="mt-1.5 size-1.5 shrink-0 animate-pulse rounded-full bg-seal motion-reduce:animate-none"
-                  />
-                  <span>
-                    Waiting for your agent to connect. This updates by itself. The code works once,
-                    for {minutesLeft} more {minutesLeft === 1 ? "minute" : "minutes"}.
-                  </span>
-                </p>
-              )}
-              <StateFaultNotice fault={fault} onSignIn={signInAgain} onStartOver={startOver} />
-              {attached === null ? (
-                <button
-                  type="button"
-                  onClick={startOver}
-                  className={`${TEXT_LINK} justify-self-start text-sm`}
-                >
-                  Start over with another name
-                </button>
-              ) : null}
-            </div>
-          )}
-        </Step>
-
-        <Step
-          n={3}
-          testId="connect-step-3"
-          title="Check the key, then create the agent."
-          why="Your wallet makes the account with the key your agent sent, and pays for it. Matching the fingerprint is how you know that key is your agent's."
-          done={created}
-          open={attached !== null}
-        >
-          {attached === null || target === null || state === null ? (
-            <p className="text-sm text-muted">Once your agent has connected.</p>
-          ) : (
-            <div className="grid gap-4">
-              <p role="status" data-testid="connect-ready" className="text-[15px] text-bone">
-                Your agent is ready:{" "}
-                <span className="font-mono text-[14px] wrap-anywhere">{target}</span>
-              </p>
-              <div className="grid gap-1.5 rounded-xl border border-line bg-ink p-4">
-                <p className={FACT_LABEL}>Key fingerprint</p>
-                <p
-                  data-testid="connect-fingerprint"
-                  className="font-mono text-xl tracking-[0.08em] text-bone sm:text-2xl"
-                >
-                  {fingerprint ?? "—"}
-                </p>
-                <p className="font-mono text-[12px] text-muted wrap-anywhere">{attached}</p>
-              </div>
-              {answerFits ? null : (
-                <p
-                  role="alert"
-                  data-testid="connect-mismatch"
-                  className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
-                >
-                  Tender's answer doesn't match what this page asked for, so nothing will be signed
-                  for it. Start over with a new code.
-                </p>
-              )}
-              {created ? null : (
-                <p
-                  data-testid="connect-warning"
-                  className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm leading-relaxed text-bone"
-                >
-                  Your agent printed a fingerprint when it connected. Press Create agent only if it
-                  is this one. If it printed another, or an error, someone else has this code: don't
-                  press it, and start over with a new code.
-                </p>
-              )}
-
-              <dl className="grid gap-px overflow-hidden rounded-xl border border-line bg-line sm:grid-cols-2 lg:grid-cols-4">
-                <Fact
-                  label="Sent to the account"
-                  value={describeNear(AGENT_ACCOUNT_DEPOSIT)}
-                  note="For its storage and gas. It stays the agent's."
-                />
-                <Fact
-                  label="Its storage"
-                  value={describeNear(AGENT_STORAGE_DEPOSIT)}
-                  note="With Tender. The agent can take back what it doesn't use."
-                />
-                <Fact
-                  testId="connect-bond"
-                  label="Bond, into its vault"
-                  value={
-                    terms.status !== "ready"
-                      ? "…"
-                      : bond === null
-                        ? "None"
-                        : describeAmount(bond.amount, bond.token)
-                  }
-                  note={
-                    bond === null
-                      ? "No bond is set right now."
-                      : "From your wallet. Locked when it registers, back in its vault when it retires."
-                  }
-                />
-                <Fact
-                  label="You approve"
-                  value="Once"
-                  note={
-                    bond === null
-                      ? "Create the account, pay its storage."
-                      : "Create the account, pay its storage, pay its bond."
-                  }
-                />
-              </dl>
-
-              {terms.status === "error" ? (
-                <div className="grid gap-2">
-                  <p role="alert" className="text-sm text-seal">
-                    Couldn't read the bond from the contract.
-                  </p>
-                  <button
-                    type="button"
-                    aria-disabled={terms.retrying}
-                    onClick={terms.retrying ? undefined : retryTerms}
-                    className={`${SECONDARY} justify-self-start`}
-                  >
-                    {terms.retrying ? "Retrying…" : "Retry"}
-                  </button>
-                </div>
-              ) : null}
-
-              {short !== null && bond !== null && !created ? (
-                <div data-testid="connect-short" className={`${NOTICE} grid gap-2`}>
-                  <p>
-                    Your wallet holds {describeAmount(short, bond.token)}, and the bond is{" "}
-                    {describeAmount(bond.amount, bond.token)}. Add{" "}
-                    {describeAmount(bond.amount - short, bond.token)} to your wallet first.
-                  </p>
-                  <div className="flex flex-wrap items-center gap-3">
-                    {faucetOffered(config.network) ? (
-                      <Link href="/wallet" className={TEXT_LINK}>
-                        Get test tUSDC on the Wallet page
-                      </Link>
-                    ) : null}
+                <div className="grid gap-4">
+                  {contested ? null : code.code === null ? (
+                    <p data-testid="connect-code-not-kept" className={NOTICE}>
+                      The code was shown before this page was reloaded, and it is not kept.
+                      {attached === null
+                        ? " If your agent has it, it can still connect, and this page sees it. If not, get a new code."
+                        : " Your agent has connected with it."}
+                    </p>
+                  ) : (
+                    <>
+                      <Command
+                        command={connectCommand(code.code, config.apiUrl)}
+                        label="In a terminal, in the Tender repository"
+                        testId="connect-command"
+                      />
+                      <Command
+                        command={connectSentence(code.code)}
+                        label="Or tell an agent that has Tender's MCP server"
+                        prompt={false}
+                        testId="connect-sentence"
+                      />
+                    </>
+                  )}
+                  {attached !== null || contested ? null : expired || code.code === null ? (
+                    <div
+                      data-testid={expired ? "connect-expired" : "connect-new-code"}
+                      className={`${NOTICE} grid gap-3`}
+                    >
+                      {expired ? (
+                        <p role="status">
+                          This code expired before an agent used it. Codes last 30 minutes.
+                        </p>
+                      ) : null}
+                      <button
+                        type="button"
+                        aria-disabled={asking}
+                        onClick={() => {
+                          if (!asking) void getCode();
+                        }}
+                        className={`${expired ? PRIMARY : SECONDARY} justify-self-start`}
+                      >
+                        {asking ? "Waiting for your wallet…" : "Get a new code"}
+                      </button>
+                    </div>
+                  ) : null}
+                  {attached !== null || contested || expired || code.code === null ? null : (
+                    <p
+                      role="status"
+                      data-testid="connect-waiting"
+                      className="flex items-start gap-2.5 rounded-xl border border-dashed border-dim p-4 text-sm text-muted"
+                    >
+                      <span
+                        aria-hidden="true"
+                        className="mt-1.5 size-1.5 shrink-0 animate-pulse rounded-full bg-seal motion-reduce:animate-none"
+                      />
+                      <span>
+                        Waiting for your agent to connect. This updates by itself. The code works
+                        once, for {minutesLeft} more {minutesLeft === 1 ? "minute" : "minutes"}.
+                      </span>
+                    </p>
+                  )}
+                  <StateFaultNotice fault={fault} onSignIn={signInAgain} onStartOver={startOver} />
+                  {attached === null && !contested ? (
                     <button
                       type="button"
-                      onClick={() => setLookAgain((n) => n + 1)}
-                      className={SECONDARY}
+                      onClick={startOver}
+                      className={`${TEXT_LINK} justify-self-start text-sm`}
                     >
-                      Check again
+                      Start over with another name
                     </button>
-                  </div>
-                </div>
-              ) : null}
-
-              {created ? null : canSend ? (
-                <div className="grid gap-2">
-                  <button
-                    type="button"
-                    aria-disabled={blocked || sending}
-                    onClick={() => {
-                      if (!blocked && !sending) void create(false);
-                    }}
-                    className={`${PRIMARY} justify-self-start`}
-                  >
-                    {send.state === "waiting"
-                      ? "Waiting for your wallet…"
-                      : send.state === "settling"
-                        ? "Looking for the account…"
-                        : "Create agent"}
-                  </button>
-                  <p className="text-sm text-muted">
-                    One approval in your wallet. Nothing is sent until you approve it there.
-                  </p>
-                </div>
-              ) : (
-                <div data-testid="connect-cli" className="grid gap-3">
-                  <p className={NOTICE}>
-                    This wallet can't create accounts from the page. Create it from a terminal, with
-                    near-cli signed in as {account}. Then this page pays its storage and bond.
-                  </p>
-                  <Command
-                    command={createAccountCommand({
-                      accountId: target,
-                      parent: account,
-                      publicKey: attached,
-                      network: config.network,
-                    })}
-                    label="The account, with near-cli"
-                    testId="connect-cli-command"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setLookAgain((n) => n + 1)}
-                    className={`${SECONDARY} justify-self-start`}
-                  >
-                    Check again
-                  </button>
+                  ) : null}
                 </div>
               )}
+            </Step>
 
-              {send.state === "failed" && !created ? (
-                <p
-                  role="alert"
-                  data-testid="connect-send-error"
-                  className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
-                >
-                  {send.message}
-                </p>
-              ) : null}
-            </div>
-          )}
-        </Step>
-
-        <Step
-          n={4}
-          testId="connect-step-4"
-          title="It sets itself up."
-          why="Registering is signed with the agent's own key, so only the agent can do it. It does it as soon as its bond is in its vault."
-          done={active}
-          open={created}
-        >
-          {!created || target === null ? (
-            <p className="text-sm text-muted">Once its account exists.</p>
-          ) : (
-            <div className="grid gap-4">
-              <ol
-                aria-label="Where the agent stands"
-                className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line bg-line lg:grid-cols-4"
-              >
-                <Tick label="Created" state="done" testId="tick-created">
-                  <span className="font-mono text-[12px] wrap-anywhere">{target}</span> exists with
-                  your agent's key.
-                </Tick>
-                <Tick
-                  label="Funded"
-                  state={funded ? "done" : sending ? "working" : "wrong"}
-                  testId="tick-funded"
-                >
-                  {funded ? (
-                    bond === null ? (
-                      "Its storage with Tender is paid."
-                    ) : (
-                      <>
-                        Its storage and its{" "}
-                        <span className="whitespace-nowrap">
-                          {describeAmount(bond.amount, bond.token)}
-                        </span>{" "}
-                        bond are in place.
-                      </>
-                    )
-                  ) : sending ? (
-                    "Waiting for your wallet…"
-                  ) : (
-                    "Its storage or its bond hasn't arrived. Press Fund agent below."
+            <Step
+              n={3}
+              testId="connect-step-3"
+              title="Check the key, then create the agent."
+              why="Your wallet makes the account with the key your agent sent, and pays for it. Matching the fingerprint is how you know that key is your agent's."
+              done={created && !contested}
+              open={attached !== null || contested}
+            >
+              {contested ? (
+                <Contested created={created} onStartOver={startOver} />
+              ) : attached === null || target === null || state === null ? (
+                <p className="text-sm text-muted">Once your agent has connected.</p>
+              ) : (
+                <div className="grid gap-4">
+                  <p role="status" data-testid="connect-ready" className="text-[15px] text-bone">
+                    Your agent is ready: <AccountName id={target} className="text-[14px]" />
+                  </p>
+                  <div className="grid gap-1.5 rounded-xl border border-line bg-ink p-4">
+                    <p className={FACT_LABEL}>Key fingerprint</p>
+                    <p
+                      data-testid="connect-fingerprint"
+                      className="font-mono text-xl tracking-[0.08em] text-bone sm:text-2xl"
+                    >
+                      {fingerprint ?? "—"}
+                    </p>
+                    <p className="font-mono text-[12px] text-muted wrap-anywhere">{attached}</p>
+                  </div>
+                  {answerFits ? null : (
+                    <p
+                      role="alert"
+                      data-testid="connect-mismatch"
+                      className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
+                    >
+                      Tender's answer doesn't match what this page asked for, so nothing will be
+                      signed for it and no command is shown. Start over with a new code.
+                    </p>
                   )}
-                </Tick>
-                <Tick
-                  label="Registered"
-                  state={registered ? "done" : funded ? "working" : "waiting"}
-                  testId="tick-registered"
-                >
-                  {registered
-                    ? "The agent registered itself with its own key."
-                    : funded
-                      ? "Waiting for the agent to register. Its terminal says each step."
-                      : "Once it is funded."}
-                </Tick>
-                <Tick
-                  label="Active"
-                  state={active ? "done" : registered ? "wrong" : "waiting"}
-                  testId="tick-active"
-                >
-                  {active
-                    ? "It can enter open tasks."
-                    : registered
-                      ? `It is listed as ${state?.agent?.status ?? "registering"}. Open its page to see why.`
-                      : "Once it has registered."}
-                </Tick>
-              </ol>
+                  {created ? null : (
+                    <p
+                      data-testid="connect-warning"
+                      className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm leading-relaxed text-bone"
+                    >
+                      Your agent printed a fingerprint when it connected. Press Create agent only if
+                      it is this one. If it printed another, or an error, someone else has this
+                      code: don't press it, and start over with a new code.
+                    </p>
+                  )}
 
-              {funded || registered ? null : (
-                <div className="grid gap-2">
-                  <button
-                    type="button"
-                    aria-disabled={sending || terms.status !== "ready"}
-                    onClick={() => {
-                      if (!sending && terms.status === "ready") void create(true);
-                    }}
-                    className={`${PRIMARY} justify-self-start`}
-                  >
-                    {send.state === "waiting"
-                      ? "Waiting for your wallet…"
-                      : send.state === "settling"
-                        ? "Looking for the bond…"
-                        : "Fund agent"}
-                  </button>
-                  {send.state === "failed" ? (
-                    <p role="alert" data-testid="connect-fund-error" className="text-sm text-seal">
+                  <dl className="grid gap-px overflow-hidden rounded-xl border border-line bg-line sm:grid-cols-2 lg:grid-cols-4">
+                    <Fact
+                      label="Sent to the account"
+                      value={describeNear(AGENT_ACCOUNT_DEPOSIT)}
+                      note="For its storage and gas. It stays the agent's."
+                    />
+                    <Fact
+                      label="Its storage"
+                      value={describeNear(AGENT_STORAGE_DEPOSIT)}
+                      note="With Tender. The agent can take back what it doesn't use."
+                    />
+                    <Fact
+                      testId="connect-bond"
+                      label="Bond, into its vault"
+                      value={
+                        terms.status !== "ready"
+                          ? "…"
+                          : bond === null
+                            ? "None"
+                            : describeAmount(bond.amount, bond.token)
+                      }
+                      note={
+                        bond === null
+                          ? "No bond is set right now."
+                          : "From your wallet. Locked when it registers, back in its vault when it retires."
+                      }
+                    />
+                    <Fact label="You approve" value="Once" note={approveNote(chain, bond)} />
+                  </dl>
+
+                  <TermsError terms={terms} retry={retryTerms} />
+
+                  {short !== null && bond !== null && !created ? (
+                    <div data-testid="connect-short" className={`${NOTICE} grid gap-2`}>
+                      <p>
+                        Your wallet holds {describeAmount(short, bond.token)}, and the bond is{" "}
+                        {describeAmount(bond.amount, bond.token)}. Add{" "}
+                        {describeAmount(bond.amount - short, bond.token)} to your wallet first.
+                      </p>
+                      <div className="flex flex-wrap items-center gap-3">
+                        {faucetOffered(config.network) ? (
+                          <Link href="/wallet" className={TEXT_LINK}>
+                            Get test tUSDC on the Wallet page
+                          </Link>
+                        ) : null}
+                        <button
+                          type="button"
+                          onClick={() => setLookAgain((n) => n + 1)}
+                          className={SECONDARY}
+                        >
+                          Check again
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {created ? null : canSend ? (
+                    <div className="grid gap-2">
+                      <button
+                        type="button"
+                        aria-disabled={blocked || sending}
+                        onClick={() => {
+                          if (!blocked && !sending) void create(false);
+                        }}
+                        className={`${PRIMARY} justify-self-start`}
+                      >
+                        {send.state === "waiting"
+                          ? "Waiting for your wallet…"
+                          : send.state === "settling"
+                            ? "Looking for the account…"
+                            : "Create agent"}
+                      </button>
+                      <p className="text-sm text-muted">
+                        One approval in your wallet. Nothing is sent until you approve it there.
+                      </p>
+                    </div>
+                  ) : answerFits && accountId !== null && fingerprint !== null ? (
+                    // Only for an answer that fits, built from the page's own account and the key
+                    // whose fingerprint it worked out: a command is run with the person's keychain.
+                    <div data-testid="connect-cli" className="grid gap-3">
+                      <p className={NOTICE}>
+                        This wallet can't create accounts from the page. Create it from a terminal,
+                        with near-cli signed in as {account}. Then this page pays its storage and
+                        bond.
+                      </p>
+                      <Command
+                        command={createAccountCommand({
+                          accountId,
+                          parent: account,
+                          publicKey: attached,
+                          network: config.network,
+                        })}
+                        label="The account, with near-cli"
+                        testId="connect-cli-command"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setLookAgain((n) => n + 1)}
+                        className={`${SECONDARY} justify-self-start`}
+                      >
+                        Check again
+                      </button>
+                    </div>
+                  ) : null}
+
+                  {send.state === "failed" && !created ? (
+                    <p
+                      role="alert"
+                      data-testid="connect-send-error"
+                      className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
+                    >
                       {send.message}
                     </p>
-                  ) : (
-                    <p className="text-sm text-muted">
-                      Pays the agent's storage with Tender and its bond into its vault, in one
-                      approval.
-                    </p>
-                  )}
+                  ) : null}
                 </div>
               )}
+            </Step>
 
-              {active ? (
-                <div data-testid="connect-active" className={`${NOTICE} grid gap-3 border-bone/40`}>
-                  <p role="status" className="flex items-start gap-2">
-                    <span
-                      aria-hidden="true"
-                      className="mt-2 size-1.5 shrink-0 rounded-full bg-seal"
-                    />
-                    <span>
-                      Your agent is active.{" "}
-                      <span className="font-mono text-[13px] wrap-anywhere">{target}</span> is in
-                      the directory.
-                    </span>
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <Link href={`/agents/${target}`} className={PRIMARY}>
-                      Open its page
-                    </Link>
-                    <Link href="/my-agents" className={SECONDARY}>
-                      Back to My agents
-                    </Link>
-                  </div>
+            <Step
+              n={4}
+              testId="connect-step-4"
+              title="It sets itself up."
+              why="Registering is signed with the agent's own key, so only the agent can do it. It does it as soon as its bond is in its vault."
+              done={active && !contested}
+              open={created && !contested}
+            >
+              {!created || contested || target === null ? (
+                <p className="text-sm text-muted">Once its account exists.</p>
+              ) : (
+                <div className="grid gap-4">
+                  <AgentTicks
+                    target={target}
+                    funded={funded}
+                    registered={registered}
+                    active={active}
+                    status={state?.agent?.status ?? null}
+                    bond={bond}
+                    send={send}
+                    canFund={terms.status === "ready" && answerFits}
+                    fundBlocked={null}
+                    onFund={() => void create(true)}
+                  />
+                  <StateFaultNotice fault={fault} onSignIn={signInAgain} onStartOver={startOver} />
                 </div>
-              ) : null}
-              <StateFaultNotice fault={fault} onSignIn={signInAgain} onStartOver={startOver} />
-            </div>
-          )}
-        </Step>
+              )}
+            </Step>
+          </>
+        )}
       </ol>
     </section>
+  );
+}
+
+/**
+ * What the one approval of step 3 does, by what Tender holds already: an earlier try may have paid
+ * the storage or the bond, which is not paid again.
+ */
+function approveNote(chain: AgentOnChain | null, bond: AgentBondTerms | null): string {
+  const storage = chain?.storage === true;
+  const bondIn = bond === null || (chain !== null && chain.vault >= bond.amount);
+  if (bond === null) {
+    return storage
+      ? "Create the account. Its storage is in place already."
+      : "Create the account, pay its storage.";
+  }
+  if (storage && bondIn) return "Create the account. Its storage and bond are in place already.";
+  if (storage) return "Create the account, pay its bond. Its storage is in place already.";
+  if (bondIn) return "Create the account, pay its storage. Its bond is in place already.";
+  return "Create the account, pay its storage, pay its bond.";
+}
+
+/** What step 3 shows for a code that two different keys tried: nothing to create, start over. */
+function Contested({ created, onStartOver }: { created: boolean; onStartOver: () => void }) {
+  return (
+    <div
+      data-testid="connect-contested"
+      className="grid gap-3 rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm leading-relaxed text-bone"
+    >
+      <p role="alert">
+        Two different keys tried this code: someone else has it. Start over.
+        {created
+          ? " The account was created already: don't fund it until the fingerprint your agent printed matches its key."
+          : " Nothing will be created for it."}
+      </p>
+      <button type="button" onClick={onStartOver} className={`${SECONDARY} justify-self-start`}>
+        Start over
+      </button>
+    </div>
+  );
+}
+
+/** What the page says when it couldn't read the bond from the contract, with Retry. */
+function TermsError({ terms, retry }: { terms: Loaded<BondTerms>; retry: () => void }) {
+  if (terms.status !== "error") return null;
+  return (
+    <div className="grid gap-2">
+      <p role="alert" className="text-sm text-seal">
+        Couldn't read the bond from the contract.
+      </p>
+      <button
+        type="button"
+        aria-disabled={terms.retrying}
+        onClick={terms.retrying ? undefined : retry}
+        className={`${SECONDARY} justify-self-start`}
+      >
+        {terms.retrying ? "Retrying…" : "Retry"}
+      </button>
+    </div>
+  );
+}
+
+/** Where an account typed in step 1 stands, as "Finish this agent" reads it. */
+interface Finding {
+  /** Its full-access keys, null when there is no such account. */
+  keys: string[] | null;
+  storage: boolean;
+  vault: bigint;
+  /** Its status in the index; null while the index doesn't list it. */
+  status: string | null;
+}
+
+/**
+ * "Finish this agent": an account under the person's that exists already, an agent they started
+ * (after a reload, in another browser, or by hand). The page reads its full-access keys, what Tender
+ * holds for it and its status in the index, shows the ticks, and Fund agent while its storage or its
+ * bond is missing. No code is made: the key is on the account already. It funds only an account
+ * whose one full-access key is shown to be matched with the fingerprint the agent printed.
+ */
+function FinishAgent({
+  accountId,
+  name,
+  terms,
+  bond,
+  retryTerms,
+  pollMs,
+  onStartOver,
+}: {
+  accountId: string;
+  name: string;
+  terms: Loaded<BondTerms>;
+  bond: AgentBondTerms | null;
+  retryTerms: () => void;
+  pollMs: number;
+  onStartOver: () => void;
+}) {
+  const wallet = useWallet();
+  const [finding, setFinding] = useState<Finding | null>(null);
+  const [unreachable, setUnreachable] = useState(false);
+  const [send, setSend] = useState<Send>({ state: "idle" });
+  const [lookAgain, setLookAgain] = useState(0);
+  const busy = useRef(false);
+  const bondRef = useRef(bond);
+  bondRef.current = bond;
+
+  /** One look at the account: its keys, Tender's funds for it, and the index. */
+  const read = async (): Promise<Finding> => {
+    const [keys, funding, record] = await Promise.all([
+      fullAccessKeysOf(accountId),
+      readAgentFunding(accountId, bondRef.current),
+      api.getAgentRecord(accountId),
+    ]);
+    const status =
+      record === null
+        ? null
+        : typeof record.agent.status === "string"
+          ? record.agent.status
+          : // An API from before bonds lists a registered agent with no status: it is active.
+            "active";
+    return { keys, ...funding, status };
+  };
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `lookAgain` restarts the loop on purpose
+  useEffect(() => {
+    let gone = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const look = async () => {
+      try {
+        const found = await read();
+        if (gone) return;
+        setFinding(found);
+        setUnreachable(false);
+        if (found.status === "active" || found.keys === null) return;
+      } catch (error) {
+        if (gone) return;
+        console.error(error);
+        setUnreachable(true);
+      }
+      if (!gone) timer = setTimeout(look, pollMs);
+    };
+    void look();
+    return () => {
+      gone = true;
+      clearTimeout(timer);
+    };
+  }, [accountId, pollMs, lookAgain]);
+
+  const registered = finding?.status != null;
+  const active = finding?.status === "active";
+  const funded = finding !== null && (registered || isPaid(finding, bond));
+  const keys = finding?.keys ?? null;
+  const fundBlocked =
+    keys === null
+      ? "There is no such account any more."
+      : keys.length === 0
+        ? "This account has no full-access key, so no agent can register with it. Don't fund it."
+        : keys.length > 1
+          ? `This account has ${keys.length} full-access keys. An agent made with a connect code has one, its own, and registers only then. Fund agent is off.`
+          : null;
+
+  const fund = async () => {
+    if (busy.current || finding === null || terms.status !== "ready" || fundBlocked !== null) {
+      return;
+    }
+    busy.current = true;
+    setSend({ state: "waiting" });
+    try {
+      // What Tender holds now, so that nothing is paid twice.
+      const now = await readAgentFunding(accountId, bond);
+      const calls = fundCallsFor(accountId, now, bond);
+      if (calls.length > 0) await wallet.signAndSend(calls);
+      setSend({ state: "settling" });
+      const after = await settleOn(read, (seen) => isPaid(seen, bond));
+      if (after !== null) setFinding(after);
+      setSend(
+        after !== null && isPaid(after, bond)
+          ? { state: "idle" }
+          : {
+              state: "failed",
+              message:
+                "Your wallet sent it, but the storage and the bond aren't on the network yet. Check again in a moment.",
+            },
+      );
+    } catch (error) {
+      console.error(error);
+      const after = await read().catch(() => null);
+      if (after !== null) setFinding(after);
+      setSend({
+        state: "failed",
+        message:
+          error instanceof TransactionFailed
+            ? "Paying the storage or the bond failed on the network. Check that your wallet holds the bond, then press Fund agent again."
+            : error instanceof WalletError
+              ? "Your wallet didn't send it. Press Fund agent to try again."
+              : "Something went wrong before anything was sent. Press Fund agent to try again.",
+      });
+    } finally {
+      busy.current = false;
+    }
+  };
+
+  return (
+    <Step
+      n={2}
+      testId="connect-finish"
+      title="Finish this agent."
+      why="Its account exists, so its key is on it already: no code is needed. The page reads where it stands, and your wallet pays what Tender doesn't hold for it yet."
+      done={active}
+      open
+    >
+      <div className="grid gap-4">
+        {finding === null ? (
+          <p role="status" className="text-sm text-muted">
+            {unreachable
+              ? "The network can't be reached right now. Still trying…"
+              : "Reading where it stands…"}
+          </p>
+        ) : (
+          <>
+            {keys !== null && keys.length > 0 ? (
+              <div
+                data-testid="connect-finish-keys"
+                className="grid gap-3 rounded-xl border border-line bg-ink p-4"
+              >
+                <p className={FACT_LABEL}>
+                  {keys.length === 1 ? "Its full-access key" : "Its full-access keys"}
+                </p>
+                {keys.map((key) => (
+                  <div key={key} className="grid gap-1">
+                    <p className="font-mono text-xl tracking-[0.08em] text-bone sm:text-2xl">
+                      {connectFingerprint(key)}
+                    </p>
+                    <p className="font-mono text-[12px] text-muted wrap-anywhere">{key}</p>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {funded || fundBlocked !== null ? null : (
+              <p
+                data-testid="connect-finish-warning"
+                className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm leading-relaxed text-bone"
+              >
+                Fund it only if this is the fingerprint your agent printed. If it is not, the
+                account is not your agent's.
+              </p>
+            )}
+            <TermsError terms={terms} retry={retryTerms} />
+            {keys === null ? (
+              <p role="alert" className="text-sm text-seal">
+                <AccountName id={accountId} /> doesn't exist any more.
+              </p>
+            ) : (
+              <AgentTicks
+                target={accountId}
+                funded={funded}
+                registered={registered}
+                active={active}
+                status={finding.status}
+                bond={bond}
+                send={send}
+                canFund={terms.status === "ready"}
+                fundBlocked={fundBlocked}
+                onFund={() => void fund()}
+                keyWords={keys.length === 1 ? "the key above" : "the keys above"}
+              />
+            )}
+            {funded && !registered ? (
+              <p data-testid="connect-finish-register" className="text-sm text-muted">
+                Its bond is in its vault. Where the agent runs, run the same{" "}
+                <span className="font-mono text-bone">pnpm agent:connect</span> command again (or{" "}
+                <span className="font-mono text-bone">pnpm agent:register --name {name}</span>
+                ), and it registers.
+              </p>
+            ) : null}
+            {unreachable ? (
+              <p role="status" className={NOTICE}>
+                The network can't be reached right now. Still trying…
+              </p>
+            ) : null}
+          </>
+        )}
+        <div className="flex flex-wrap items-center gap-4">
+          {active ? null : (
+            <button
+              type="button"
+              onClick={() => setLookAgain((n) => n + 1)}
+              className={`${SECONDARY} justify-self-start`}
+            >
+              Check again
+            </button>
+          )}
+          <button type="button" onClick={onStartOver} className={`${TEXT_LINK} text-sm`}>
+            Start over with another name
+          </button>
+        </div>
+      </div>
+    </Step>
   );
 }
 
