@@ -176,15 +176,20 @@ test("a_task_with_no_held_out_part_is_verified_on_its_scorecard_alone", async ()
 
 test("help_prints_the_usage_and_the_exit_codes_and_exits_0", async () => {
   for (const flag of ["--help", "-h"]) {
-    const { code, out } = await new Promise<{ code: number; out: string }>((resolve) => {
-      execFile(process.execPath, [SCRIPT, flag], { timeout: 30_000 }, (error, stdout, stderr) => {
+    const { code, stdout, stderr } = await new Promise<{
+      code: number;
+      stdout: string;
+      stderr: string;
+    }>((resolve) => {
+      execFile(process.execPath, [SCRIPT, flag], { timeout: 30_000 }, (error, out, err) => {
         const exit = error === null ? 0 : typeof error.code === "number" ? error.code : -1;
-        resolve({ code: exit, out: `${stdout}${stderr}` });
+        resolve({ code: exit, stdout: out, stderr: err });
       });
     });
-    expect(out, flag).toMatch(/^usage: node scripts\/verify-scorecard\.mjs --task <id>/);
-    expect(out, flag).toContain("exit codes: 0 VERIFIED, 1 MISMATCH, 2 could not check");
-    expect(out, flag).not.toContain("Unknown option");
+    // On stdout, where a reader pipes it to `less`; nothing on stderr.
+    expect(stdout, flag).toMatch(/^usage: node scripts\/verify-scorecard\.mjs --task <id>/);
+    expect(stdout, flag).toContain("exit codes: 0 VERIFIED, 1 MISMATCH, 2 could not check");
+    expect(stderr, flag).toBe("");
     expect(code, flag).toBe(0);
   }
 });

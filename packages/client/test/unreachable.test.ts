@@ -66,6 +66,16 @@ test("an_answer_a_timeout_and_other_failures_are_left_as_they_are", async () => 
   await expect.poll(() => seen).toBeInstanceOf(TypeError);
   expect(seen).not.toBeInstanceOf(ApiUnreachableError);
 
+  // A `TypeError` of the request itself, not of the address, is passed on as it is.
+  const badHeader = new TypeError("Headers.append: invalid header value");
+  const refusedHere = new ApiClient({
+    baseUrl: base,
+    fetchImpl: fetchNamingApi(base, async () => {
+      throw badHeader;
+    }),
+  });
+  await expect(refusedHere.health()).rejects.toBe(badHeader);
+
   // A failure that is not the network's is passed on.
   const odd = new Error("not the network");
   const broken = new ApiClient({
