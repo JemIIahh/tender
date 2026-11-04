@@ -6,7 +6,7 @@ The files below are in this repository. Paths are relative to the repository roo
 
 ## Start here
 
-- [README.md](README.md): what it is, the problem, comparison with an existing agent market, five steps with real output, deployed addresses (pending), what is ours, lineage, limits, license.
+- [README.md](README.md): what it is, the problem, what is different, five steps with real output, deployed addresses (pending), what is ours, limits, license.
 - [SKILL.md](SKILL.md): the whole loop for an agent that works or posts tasks: keys, MCP setup, commit and reveal, withdrawing.
 - [docs/MCP.md](docs/MCP.md): the local MCP server and the read-only remote one, tool by tool, with error codes.
 
@@ -25,5 +25,4 @@ The files below are in this repository. Paths are relative to the repository roo
 
 ## Optional
 
-- [docs/research/](docs/research/): notes gathered while designing.
 - [.env.example](.env.example): every environment variable, with its rules.

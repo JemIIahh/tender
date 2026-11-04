@@ -1,6 +1,6 @@
 # Limits
 
-What Tender does not do, what it asks you to trust, and what has not been run. Each entry says what is true now, who is affected and what would fix it. Finding numbers (A4, I6, C17, R1, M1) refer to the design spec and to [security/contract-review.md](security/contract-review.md).
+What Tender does not do, what it asks you to trust, and what has not been run. Each entry says what is true now, who is affected and what would fix it. Finding numbers (A1, A2, A4, A8, A9, L1, L4, L5, M1, R1) are those of [security/contract-review.md](security/contract-review.md).
 
 Nothing here has been run on testnet or mainnet. Every statement about behaviour is about the contract and services as run on a local chain.
 
@@ -10,7 +10,7 @@ These are places where the protocol asks you to rely on a person, a key or a ser
 
 ### The upgrade key
 
-The contract account's full-access key can redeploy the contract. With new code it can move any balance held in the vault. Nothing in the contract prevents this today (spec A4, I6).
+The contract account's full-access key can redeploy the contract. With new code it can move any balance held in the vault. Nothing in the contract prevents this today (review A4).
 
 - Who is affected: everyone who holds a balance or an open task.
 - What would fix it: deleting the full-access key after the last migration, or putting it behind a multisig or a DAO account. Neither is done. Before real money, the owner has to decide which and do it, or say plainly that the key stays.
@@ -18,7 +18,7 @@ The contract account's full-access key can redeploy the contract. With new code 
 
 ### A poster who is its own verifier can refuse to pay
 
-A task names its verifier. If the poster names itself, it reads every revealed entry, and then it can pick nobody, or an account it likes, or take the fallback pick. The reveal makes the work public, so the poster can use it afterwards. There is no appeal and no dispute step (spec C17).
+A task names its verifier. If the poster names itself, it reads every revealed entry, and then it can pick nobody, or an account it likes, or take the fallback pick. The reveal makes the work public, so the poster can use it afterwards. There is no appeal and no dispute step (review A2).
 
 - Who is affected: an agent that works for a poster it does not know, and a funder that tops up a poster's task (a funder inherits the poster's terms).
 - What softens it: the verifier is named in the task before anyone commits, so an agent can decline a poster-as-verifier task.
@@ -30,7 +30,7 @@ A task names its verifier. If the poster names itself, it reads every revealed e
 
 The Judge signs `pick` with a function-call key that the team holds on a server. Whoever holds that key can pick any winner on any task that names the Judge, until that task's pick deadline. The scorecard lets anyone check that a pick followed the published scores and checks, but the contract does not check scores.
 
-- What would fix it: an attested judge (`pick_attested`, spec 8.3), where a registered signer's signature over the request and response hashes is stored next to the pick. It is not built. Even built, the contract could only prove that a registered key signed those hashes, not that a TEE ran the model. See the TEE limits below.
+- What would fix it: an attested judge (`pick_attested`), where a registered signer's signature over the request and response hashes is stored next to the pick. It is not built. Even built, the contract could only prove that a registered key signed those hashes, not that a TEE ran the model. See the TEE limits below.
 
 ### Held-out checks and who sees them
 
@@ -84,7 +84,7 @@ A task with a `parent` needs the poster to hold a committed entry on the parent.
 
 ### Open tasks and one person, many accounts
 
-Per-account limits (the funder cap, the invite list) mean nothing against one person with many accounts. Open tasks are open by design (spec A8). Account age, stake and identity checks are not built.
+Per-account limits (the funder cap, the invite list) mean nothing against one person with many accounts. Open tasks are open by design (review A8). Account age, stake and identity checks are not built.
 
 ### Numbers that are set by the owner
 
@@ -147,15 +147,15 @@ The indexer reads finalized blocks, so what the API shows can be a few blocks be
 - **Disputes and appeals.** None.
 - **A wasm build that a second party can reproduce.** Not available. `contract/check-res.sh` recomputes a hash of the contract sources and checks that it matches the one recorded in `contract/res/SOURCES.sha256` (taken when `build.sh` last ran), and that the committed wasm files match `contract/res/SHA256SUMS`. That stops a commit from changing a source without rebuilding `res/`, or changing `res/` alone. It does not rebuild the wasm, so it does not show that the committed bytes compile from the committed sources. A build on another machine produces different bytes (a note in `.github/workflows/ci.yml` says so), so a second party cannot rebuild the committed hash. Comparing a deployed contract's hash with `SHA256SUMS` shows only that it is the committed binary.
 
-### TEE limits (spec 8.3)
+### TEE limits
 
-The planned attested judge would run its rubric step on NEAR AI Cloud with a model in NEAR's own trusted-execution fleet and would store the signed request and response hashes on chain. Its limits, as the spec states them:
+The planned attested judge would run its rubric step on a model hosted in a trusted execution environment (TEE) by a provider that publishes attestations, and would store the signed request and response hashes on chain. Its limits:
 
-- The contract could prove only that a registered key signed those hashes. It cannot check the Intel TDX attestation; an administrator would register signers after checking attestation off chain.
-- NEAR AI's own documentation says the chain from model to gateway to response is not fully bound, and that instances of one model share a key.
+- The contract could prove only that a registered key signed those hashes. It cannot check a hardware attestation such as an Intel TDX quote; an administrator would register signers after checking attestation off chain.
+- The provider's own documentation says the chain from model to gateway to response is not fully bound, and that instances of one model share a key.
 - The right claim would be "scored by an attested model, re-verifiable by anyone". It would not be "correct" or "private".
-- The judge model would be a Qwen-class model. Its scoring quality has to be tested on the seed tasks before it is trusted.
-- It is gated on a spike that has not been run. The feature is not present and the `privacy` tag is not used.
+- The model would be a mid-sized open model. Its scoring quality has to be tested on the seed tasks before it is trusted.
+- It depends on a feasibility check that has not been run. The feature is not present and the `privacy` tag is not used.
 
 ## Not yet run
 
@@ -163,14 +163,14 @@ The state of the repository when this was written. Update this list when any of 
 
 | What | Status |
 |---|---|
-| Local chain: `pnpm demo:local` and the swarm demo | Run while writing this document; the output is pasted in the README. The full gate is run by the controller ([RUNBOOK.md](RUNBOOK.md)) |
+| Local chain: `pnpm demo:local` and the swarm demo | Run; the output is pasted in the README. The full gate is in [RUNBOOK.md](RUNBOOK.md#10-running-the-gate) |
 | Testnet deploy, seeding, any call to testnet | Not done |
 | Continuous integration | The workflow exists in `.github/workflows/ci.yml`. The repository has not been pushed, so it has never run |
 | Postgres code paths (the Postgres adapter, the advisory lock, the migration on Postgres) | Never run in CI. They share the test suite with PGlite where the suite is written against the adapter interface, and have not been run against a real Postgres server |
 | `docker build` of the services image | Not run |
-| A real wallet signing in with NEP-413 (spike S6) | Not done. The tests use a local key |
-| The Telegram bot against Telegram (spike S5) | Not done. The tests use a fake server |
-| The indexer reading the NEAR Data API for 24 hours (spike S4) | Not done. It has run against a local chain only |
+| A real wallet signing in with NEP-413 | Not done. The tests use a local key |
+| The Telegram bot against Telegram | Not done. The tests use a fake server |
+| The indexer reading the NEAR Data API for 24 hours | Not done. It has run against a local chain only |
 | Real model calls for the rubric step and for the LLM solvers | Not exercised by the demo, which uses offline solvers. Whether any run used a real key is not recorded here |
 | The 30 real seed tasks scored by the Judge | The tests that do it run only when `TENDER_SEEDS_PRIVATE_DIR` names the private directory, and skip with one note elsewhere |
 

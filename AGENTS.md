@@ -31,7 +31,7 @@ For a coding agent. [README.md](README.md) says what Tender is and what is built
 | `apps/web`            | `@tender/web`                    | The Next.js app.                                                                                                                                                                                                  |
 | `scripts`             |                                  | `demo-local.ts`, `swarm-demo.ts`, `skeleton.ts`, `deploy.ts`, `seed.ts`, `serve.ts` (the services process), `keeper-key.ts`, `verify-scorecard.mjs`, and `check-public.test.ts`.                                  |
 | `seeds`               |                                  | The 30 real seed tasks (public parts only) and their tests.                                                                                                                                                       |
-| `docs`                |                                  | `ARCHITECTURE.md`, `LIMITS.md`, `RUNBOOK.md`, `MCP.md`, `security/contract-review.md` and `research/`.                                                                                                            |
+| `docs`                |                                  | `ARCHITECTURE.md`, `LIMITS.md`, `RUNBOOK.md`, `MCP.md`, `security/contract-review.md`.                                                                                                                            |
 
 ## Commands
 
@@ -59,13 +59,13 @@ The sandbox tests (`*.sandbox.test.ts`, `contract/sandbox`) start a nearcore nod
 
 ## Where the tests are
 
-| Area                    | Tests                                                                                                                                                                       |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Contract                | Unit and property tests in `contract/tender/src/*.rs` (`props.rs` is the proptest model of the invariants in spec section 6.10); sandbox tests in `contract/sandbox/tests/` |
-| Each TypeScript package | `packages/<name>/test/*.test.ts` (and `*.sandbox.test.ts` where a chain is needed)                                                                                          |
-| Web                     | `apps/web/test` (jsdom unit tests), `apps/web/e2e` (Playwright; `e2e/chain` runs on a real local chain)                                                                     |
-| Scripts                 | `scripts/*.test.ts`; the `*.sandbox.test.ts` files run the scripts against a local chain                                                                                    |
-| Seeds                   | `seeds/seeds.test.ts`, `seeds/no-answers-in-tree.test.ts`                                                                                                                   |
+| Area                    | Tests                                                                                                                                                                                                         |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Contract                | Unit and property tests in `contract/tender/src/*.rs` (`props.rs` is the proptest model of the invariants listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)); sandbox tests in `contract/sandbox/tests/` |
+| Each TypeScript package | `packages/<name>/test/*.test.ts` (and `*.sandbox.test.ts` where a chain is needed)                                                                                                                            |
+| Web                     | `apps/web/test` (jsdom unit tests), `apps/web/e2e` (Playwright; `e2e/chain` runs on a real local chain)                                                                                                       |
+| Scripts                 | `scripts/*.test.ts`; the `*.sandbox.test.ts` files run the scripts against a local chain                                                                                                                      |
+| Seeds                   | `seeds/seeds.test.ts`, `seeds/no-answers-in-tree.test.ts`                                                                                                                                                     |
 
 ## Conventions
 
@@ -80,7 +80,7 @@ The sandbox tests (`*.sandbox.test.ts`, `contract/sandbox`) start a nearcore nod
 
 ## Starting points
 
-- Changing the contract: section 6 of the design spec, and `docs/security/contract-review.md` for what was reviewed and what was accepted.
+- Changing the contract: `docs/ARCHITECTURE.md` for how it works and which invariants hold, and `docs/security/contract-review.md` for what was reviewed and what was accepted.
 - Changing the Judge or a seed: `packages/judge/src/intake.ts` (the rules a task must pass), `seeds/README.md`.
 - Changing the API or the indexer: `packages/api/src/app.ts` lists the routes; `packages/indexer/src/apply.ts` applies events.
 - Operating a deployment: `docs/RUNBOOK.md`.

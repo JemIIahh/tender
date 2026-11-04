@@ -2,7 +2,7 @@
 
 import { type KeyboardEvent, useEffect, useId, useRef, useState } from "react";
 
-// A task's life in five steps, as the contract runs it (the design spec, section 6): each
+// A task's life in five steps, as the contract runs it (see docs/ARCHITECTURE.md, "A task's life"): each
 // step with one line and three labelled facts. It moves on by itself while it is on screen, until
 // a person picks a step, and never with reduced motion.
 

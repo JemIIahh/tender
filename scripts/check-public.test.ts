@@ -10,7 +10,7 @@ import { describe, expect, test } from "vitest";
 // them), so that a leak is found before it is committed. It looks for:
 //
 // - an environment file other than `.env.example`, anywhere in the tree;
-// - anything under `.submission/` (the hackathon submission payload holds the owner's email) or
+// - anything under `.submission/` (a submission payload holds the owner's email) or
 //   under `seeds-private/` (the real seeds' held-out checks and answers, seeds/README.md);
 // - the owner's email address, or any address at its domain;
 // - a NEAR ed25519 private key (`ed25519:` and 80 or more base58 characters), a PEM private key

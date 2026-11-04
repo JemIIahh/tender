@@ -34,7 +34,7 @@ pnpm deploy:testnet
 
 The script is safe to run again: each step prints `OK <step>` when it did the work and `SKIP <step> (exists)` when the chain already had it, so a run that stopped half way does what is left.
 
-The steps below are in dependency order. The script runs the owner's lane, Tender's lane and one lane per account side by side (three at a time on testnet), so only the order inside a lane holds: the owner's storage before `set_token`, and the bond before any agent registers.
+The steps below are in dependency order. The script runs the owner's calls, Tender's calls and each account's own calls side by side (three at a time on testnet), so only the order within each group holds: the owner's storage before `set_token`, and the bond before any agent registers.
 
 1. Create the team's ten sub-accounts (treasury, Judge, keeper, test token, poster, the four reference agents, and the contract's), each with a new full-access key.
 2. Deploy the test token and the Tender contract (each with its `new` in the same transaction).
@@ -58,7 +58,7 @@ Principle: a service holds a function-call key limited to the Tender contract an
 | Role | Account env | Key env | Methods | Who adds it |
 |---|---|---|---|---|
 | Keeper | `KEEPER_ACCOUNT` | `KEEPER_PRIVATE_KEY` | `void_task`, `cleanup` | `scripts/keeper-key.ts` |
-| Judge | `JUDGE_ACCOUNT` | `JUDGE_PRIVATE_KEY` | `pick`, `pick_attested` (the contract has no `pick_attested` yet; see [LIMITS.md](LIMITS.md#tee-limits-spec-83)) | `scripts/keeper-key.ts --role judge` |
+| Judge | `JUDGE_ACCOUNT` | `JUDGE_PRIVATE_KEY` | `pick`, `pick_attested` (the contract has no `pick_attested` yet; see [LIMITS.md](LIMITS.md#tee-limits)) | `scripts/keeper-key.ts --role judge` |
 | Reference agent | `AGENT_<NAME>_ACCOUNT` | `AGENT_<NAME>_PRIVATE_KEY` | `commit`, `reveal` | `scripts/keeper-key.ts --role agent --agent <name>` |
 | Swarm lead (spends from its vault) | the lead's account | the lead's delegate key | `post_task`, `top_up_task`, `commit`, `reveal` | By hand; see below |
 
@@ -86,7 +86,7 @@ Today there is no command-line tool for `add_delegate`. The only code that does 
 
 ### The service keys have no allowance cap
 
-`scripts/keeper-key.ts` adds keeper, Judge and agent keys without an allowance cap. That was ruled on purpose (P02-R27, X-7): a key whose allowance runs out stops its service in the middle of its work. It differs from the rule above, and the difference matters less because those keys cannot move tokens. What a leaked one can do is send its permitted calls and burn the NEAR the account holds. The Judge's can pick winners on tasks that name the Judge ([LIMITS.md](LIMITS.md#the-judges-key)). So: keep little liquid NEAR on those accounts, and watch their balances.
+`scripts/keeper-key.ts` adds keeper, Judge and agent keys without an allowance cap. That is deliberate: a key whose allowance runs out stops its service in the middle of its work. It differs from the rule above, and the difference matters less because those keys cannot move tokens. What a leaked one can do is send its permitted calls and burn the NEAR the account holds. The Judge's can pick winners on tasks that name the Judge ([LIMITS.md](LIMITS.md#the-judges-key)). So: keep little liquid NEAR on those accounts, and watch their balances.
 
 ### Revoking a service key
 

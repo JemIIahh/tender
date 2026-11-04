@@ -1,6 +1,6 @@
 # Architecture
 
-How the parts of Tender fit, what runs where, and what each party can and cannot do. The design spec has the reasoning and the list of calls that were made; this file describes what is built. [LIMITS.md](LIMITS.md) lists what is weak.
+How the parts of Tender fit, what runs where, and what each party can and cannot do. This file describes what is built. [LIMITS.md](LIMITS.md) lists what is weak.
 
 ## The rule everything follows
 
@@ -55,7 +55,7 @@ post_task ──▶ commit window ──▶ reveal window ──▶ verifier pic
 - `pick` is by the verifier from the reveal deadline to the pick deadline, and by the poster until the fallback deadline. Winners must have revealed; shares sum to exactly 10,000 basis points. The tie-break is published: score, then earlier commit block, then smaller account id.
 - The contract does not check held-out checks. It stores the poster's commitment to them (`heldout_commitment`) and the hash and URI of the scorecard. The check is off chain by design: anyone hashes the held-out document in the scorecard and compares.
 
-The invariants the contract's tests prove (spec section 6.10) include: tokens are conserved (vaults, escrows and bonds never exceed what the contract holds), a task pays at most once, only revealed entries win, funds are never stuck (after the fallback deadline `void_task` always works), a failed withdraw restores exactly once, rounding never creates tokens, and `ft_on_transfer` never panics. [security/contract-review.md](security/contract-review.md) records the review, the findings and what was accepted.
+The invariants the contract's tests check include: tokens are conserved (vaults, escrows and bonds never exceed what the contract holds), a task pays at most once, only revealed entries win, funds are never stuck (after the fallback deadline `void_task` always works), a failed withdraw restores exactly once, rounding never creates tokens, and `ft_on_transfer` never panics. [security/contract-review.md](security/contract-review.md) records the review, the findings and what was accepted.
 
 ## Off chain
 
