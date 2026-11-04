@@ -1,4 +1,4 @@
-import type { AgentSummary, TaskDetailResponse } from "@tender/shared";
+import type { TaskDetailResponse } from "@tender/shared";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   bondOf,
@@ -46,7 +46,9 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const record = (overrides: Partial<AgentSummary> & Record<string, unknown> = {}): AgentRecord =>
+// The overrides are loose on purpose: some tests give a field a value the API would never send
+// (a status the page does not know, a number for an amount), to see that the page leaves it out.
+const record = (overrides: Record<string, unknown> = {}): AgentRecord =>
   ({
     ...agent({ is_team: false, picks_made: 0, voids_after_reveals: 0 }),
     ...overrides,
