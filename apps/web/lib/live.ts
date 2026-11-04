@@ -67,12 +67,20 @@ export async function readLive(): Promise<LiveReads> {
   };
 }
 
+/** Whether `lag` is a lag of nothing. One that is no number is not taken to be nothing. */
+function noLag(lag: string): boolean {
+  try {
+    return BigInt(lag) === 0n;
+  } catch {
+    return false;
+  }
+}
+
 /** What the pill shows for `reads`. */
 export function liveOf(reads: LiveReads): Live {
   if (!reads.answered) return { state: "offline" };
   const { health, open, agents } = reads;
-  const synced =
-    health !== undefined && !health.waiting_for_chain && BigInt(health.lag_blocks) === 0n;
+  const synced = health !== undefined && !health.waiting_for_chain && noLag(health.lag_blocks);
   const live: Live = { state: synced ? "synced" : "behind" };
   if (open !== undefined) {
     live.openTasks = count(open.tasks.length, open.next_cursor);

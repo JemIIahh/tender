@@ -1,8 +1,9 @@
 "use client";
 
+import { formatTokenAmount, tokenMeta } from "@tender/shared";
 import { useEffect, useId, useRef, useState } from "react";
+import { config } from "../lib/config";
 import { type Live, type LiveState, liveOf, readLive } from "../lib/live";
-import { Tokens } from "./account/parts";
 import { SECONDARY } from "./ui";
 
 /** How often the figures are read again, while the tab is in view: the landing ticker's pace. */
@@ -33,11 +34,66 @@ function Dot({ state }: { state: LiveState }) {
   );
 }
 
+/** A long id with its middle left out, `5f3a9c0e…5f3a9c0e`; a short one as it is. */
+function shortId(id: string): string {
+  return id.length <= 20 ? id : `${id.slice(0, 8)}…${id.slice(-8)}`;
+}
+
+/**
+ * One token's amount in escrow, on a line of its own. A number never breaks: it is one unbroken
+ * run of figures (the panel is wide enough for the largest u128 at this size, and it scrolls
+ * sideways on its own line before it would wrap). A token the app knows has its symbol after the
+ * number. One it does not know (`tokenMeta` never guesses decimals) shows the amount as the
+ * contract holds it, with a label under it that says so, "smallest units of" and the token's
+ * account, its middle left out when it is long; the whole id is the label's title, and is what a
+ * screen reader reads.
+ */
+function EscrowLine({ token, amount }: { token: string; amount: bigint }) {
+  const { symbol, decimals } = tokenMeta(token, config.network);
+  const known = symbol !== token;
+  const short = shortId(token);
+  return (
+    <li data-testid="live-escrow" className="grid min-w-0 gap-0.5">
+      <span className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 font-mono text-[12px] text-bone tabular-nums">
+        <span
+          data-testid="live-escrow-amount"
+          className="inline-block max-w-full overflow-x-auto align-bottom whitespace-nowrap"
+        >
+          {known ? formatTokenAmount(amount, decimals) : amount.toString()}
+        </span>
+        {known ? (
+          <>
+            {" "}
+            <span className="whitespace-nowrap">{symbol}</span>
+          </>
+        ) : null}
+      </span>
+      {known ? null : (
+        <span data-testid="live-escrow-unit" className="text-[11.5px] text-muted">
+          smallest units of{" "}
+          {short === token ? (
+            <span className="font-mono">{token}</span>
+          ) : (
+            <span title={token} className="font-mono">
+              <span aria-hidden="true">{short}</span>
+              <span className="sr-only">{token}</span>
+            </span>
+          )}
+        </span>
+      )}
+    </li>
+  );
+}
+
+/** Whether the app knows `token`'s decimals: those lines go first, as `Tokens` orders them. */
+const knows = (token: string) => tokenMeta(token, config.network).symbol !== token;
+
 function Figures({ live }: { live: Live }) {
   const counts: Array<[string, string]> = [];
   if (live.openTasks !== undefined) counts.push(["Open tasks", live.openTasks]);
   if (live.agents !== undefined) counts.push(["Agents", live.agents]);
   if (counts.length === 0 && live.escrow === undefined) return null;
+  const escrow = [...(live.escrow ?? [])].sort(([a], [b]) => Number(knows(b)) - Number(knows(a)));
   return (
     <dl className="mt-3 grid gap-2.5 border-t border-line pt-3 text-[13px]">
       {counts.map(([label, value]) => (
@@ -54,8 +110,16 @@ function Figures({ live }: { live: Live }) {
       {live.escrow === undefined ? null : (
         <div data-testid="live-figure" className="grid gap-1.5">
           <dt className="text-muted">In escrow on open tasks</dt>
-          <dd className="font-mono text-bone tabular-nums wrap-anywhere">
-            <Tokens amounts={live.escrow} empty="None" />
+          <dd>
+            {escrow.length === 0 ? (
+              <span className="text-bone">None</span>
+            ) : (
+              <ul className="grid gap-2">
+                {escrow.map(([token, amount]) => (
+                  <EscrowLine key={token} token={token} amount={amount} />
+                ))}
+              </ul>
+            )}
           </dd>
         </div>
       )}
@@ -84,7 +148,17 @@ export function LiveStatus() {
     let gone = false;
     const load = () => {
       readLive().then((reads) => {
-        if (!gone) setLive(liveOf(reads));
+        if (gone) return;
+        // A read the page can't make sense of leaves a state that is true, not the last one: the
+        // API answered, so it is not offline, but the index can't be said to be up to date.
+        let next: Live;
+        try {
+          next = liveOf(reads);
+        } catch (error) {
+          console.error(error);
+          next = { state: reads.answered ? "behind" : "offline" };
+        }
+        setLive(next);
       });
     };
     load();
@@ -139,20 +213,20 @@ export function LiveStatus() {
         <Dot state={live.state} />
         <span className="max-sm:sr-only">{look.word}</span>
       </button>
-      {open ? (
-        <div
-          ref={panel}
-          id={panelId}
-          data-testid="live-panel"
-          className="absolute top-full right-0 z-40 mt-2 w-72 rounded-2xl border border-line bg-panel p-4 text-bone shadow-xl shadow-black/50 max-sm:fixed max-sm:inset-x-4 max-sm:top-[4.5rem] max-sm:mt-0 max-sm:w-auto"
-        >
-          <p data-testid="live-line" className="flex items-center gap-2.5 text-sm">
-            <Dot state={live.state} />
-            {look.line}
-          </p>
-          <Figures live={live} />
-        </div>
-      ) : null}
+      {/* Always in the page, so that `aria-controls` names an element; `hidden` while closed. */}
+      <div
+        ref={panel}
+        id={panelId}
+        hidden={!open}
+        data-testid="live-panel"
+        className="absolute top-full right-0 z-40 mt-2 w-[21rem] rounded-2xl border border-line bg-panel p-4 text-bone shadow-xl shadow-black/50 max-sm:fixed max-sm:inset-x-4 max-sm:top-[4.5rem] max-sm:mt-0 max-sm:w-auto"
+      >
+        <p data-testid="live-line" className="flex items-center gap-2.5 text-sm">
+          <Dot state={live.state} />
+          {look.line}
+        </p>
+        <Figures live={live} />
+      </div>
     </div>
   );
 }

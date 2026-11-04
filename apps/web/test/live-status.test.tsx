@@ -79,18 +79,21 @@ test("live_pill_says_up_to_date_and_shows_the_api_s_figures_token_by_token", asy
   // The three reads, once each, and nothing else.
   expect(urls.sort()).toEqual([`GET ${AGENTS}`, `GET ${HEALTH_PATH}`, `GET ${OPEN}`]);
 
-  await userEvent.click(button);
-  expect(button.getAttribute("aria-expanded")).toBe("true");
+  // The panel it controls is in the page while closed, hidden, so `aria-controls` names it.
   const panel = screen.getByTestId("live-panel");
   expect(button.getAttribute("aria-controls")).toBe(panel.id);
+  expect(panel.hidden).toBe(true);
+  await userEvent.click(button);
+  expect(button.getAttribute("aria-expanded")).toBe("true");
+  expect(panel.hidden).toBe(false);
   expect(screen.getByTestId("live-line").textContent).toBe("Up to date");
   expect(screen.getAllByTestId("live-figure").map((row) => row.textContent)).toEqual([
     "Open tasks3",
     // A full page with more after it: at least that many, and said so.
     "Agents1+",
     // Each token on its own line: never one sum of two tokens. A token whose decimals the app does
-    // not know is shown in its smallest unit, with its account.
-    `In escrow on open tasks2.00 tUSDC42 ${OTHER_TOKEN}`,
+    // not know is shown in its smallest unit, and a label under it says so.
+    `In escrow on open tasks2.00 tUSDC42smallest units of ${OTHER_TOKEN}`,
   ]);
   // No block heights and no counts of blocks.
   expect(panel.textContent).not.toMatch(/block|100/i);
@@ -145,7 +148,7 @@ test("live_pill_is_amber_when_the_health_check_says_the_chain_is_unavailable", a
   expect(screen.getAllByTestId("live-figure").map((row) => row.textContent)).toEqual([
     "Open tasks3",
     "Agents1",
-    `In escrow on open tasks2.00 tUSDC42 ${OTHER_TOKEN}`,
+    `In escrow on open tasks2.00 tUSDC42smallest units of ${OTHER_TOKEN}`,
   ]);
 });
 
@@ -208,18 +211,18 @@ test("live_panel_opens_from_the_keyboard_and_escape_gives_the_focus_back", async
   button.focus();
 
   await userEvent.keyboard("{Enter}");
-  expect(screen.getByTestId("live-panel")).toBeTruthy();
+  expect(screen.getByTestId("live-panel").hidden).toBe(false);
   await userEvent.keyboard("{Escape}");
-  expect(screen.queryByTestId("live-panel")).toBeNull();
+  expect(screen.getByTestId("live-panel").hidden).toBe(true);
   expect(document.activeElement).toBe(button);
   expect(button.getAttribute("aria-expanded")).toBe("false");
 
   await userEvent.keyboard(" ");
-  expect(screen.getByTestId("live-panel")).toBeTruthy();
+  expect(screen.getByTestId("live-panel").hidden).toBe(false);
   // Moving on with the keyboard closes it.
   await userEvent.tab();
   expect(document.activeElement?.textContent).toBe("Elsewhere");
-  expect(screen.queryByTestId("live-panel")).toBeNull();
+  expect(screen.getByTestId("live-panel").hidden).toBe(true);
 });
 
 test("live_panel_closes_on_a_press_elsewhere_and_not_on_one_inside_it", async () => {
@@ -232,9 +235,9 @@ test("live_panel_closes_on_a_press_elsewhere_and_not_on_one_inside_it", async ()
   );
   await userEvent.click(await pill());
   await userEvent.click(screen.getByTestId("live-line"));
-  expect(screen.getByTestId("live-panel")).toBeTruthy();
+  expect(screen.getByTestId("live-panel").hidden).toBe(false);
   await userEvent.click(screen.getByText("The page"));
-  expect(screen.queryByTestId("live-panel")).toBeNull();
+  expect(screen.getByTestId("live-panel").hidden).toBe(true);
 });
 
 test("live_pill_reads_again_each_minute_only_while_the_tab_is_in_view", async () => {
@@ -300,4 +303,71 @@ test("live_pill_dots_reach_3_to_1_on_the_pill", async () => {
       expect(ratio(text, ground), `${text} on ${ground}`).toBeGreaterThanOrEqual(4.5);
     }
   }
+});
+
+test("live_escrow_labels_a_token_it_has_no_decimals_for_and_never_breaks_a_number", async () => {
+  // The largest u128, in a token known by its symbol and in one the app has no decimals for, whose
+  // account is an implicit one of 64 characters.
+  const MAX = "340282366920938463463374607431768211455";
+  const IMPLICIT = "5f3a9c0e".repeat(8);
+  fakeApi({
+    [OPEN]: () =>
+      json({
+        tasks: [
+          summary({ id: "7", reward: MAX }),
+          summary({ id: "8", reward: MAX, token: IMPLICIT }),
+        ],
+        next_cursor: null,
+      }),
+    [HEALTH_PATH]: () => json(HEALTH),
+  });
+  render(<LiveStatus />);
+  await userEvent.click(await pill());
+
+  const lines = screen.getAllByTestId("live-escrow");
+  expect(lines).toHaveLength(2);
+  const [known, unknown] = lines as [HTMLElement, HTMLElement];
+  // The known token: its amount in whole units, then its symbol, and no label.
+  expect(known.textContent).toBe("340282366920938463463374607431768.211455 tUSDC");
+  expect(within(known).queryByTestId("live-escrow-unit")).toBeNull();
+  // The unknown one: the amount as the contract holds it, and a visible label under it that says
+  // what unit it is in, with the token's account shortened in the middle. The whole account is the
+  // label's title, and what a screen reader reads.
+  expect(within(unknown).getByTestId("live-escrow-amount").textContent).toBe(MAX);
+  const unit = within(unknown).getByTestId("live-escrow-unit");
+  expect(unit.querySelector('[aria-hidden="true"]')?.textContent).toBe("5f3a9c0e…5f3a9c0e");
+  expect(unit.querySelector(`[title="${IMPLICIT}"]`)).toBeTruthy();
+  expect(unit.querySelector(".sr-only")?.textContent).toBe(IMPLICIT);
+  expect(unit.textContent?.startsWith("smallest units of ")).toBe(true);
+  // A number is one unbroken run: it never wraps in the middle.
+  for (const amount of screen.getAllByTestId("live-escrow-amount")) {
+    expect(amount.className).toContain("whitespace-nowrap");
+    expect(amount.className).not.toContain("wrap-anywhere");
+  }
+});
+
+test("live_pill_keeps_a_true_state_when_a_read_can_t_be_made_sense_of", async () => {
+  // A lag that is no number is not taken to be no lag.
+  expect(liveOf({ health: { ...HEALTH, lag_blocks: "soon" }, answered: true }).state).toBe(
+    "behind",
+  );
+
+  // And should working out the pill's state fail at all, the pill says what is known (the API
+  // answered: Catching up), not what the last read said, nor nothing.
+  vi.resetModules();
+  vi.doMock("../lib/live", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../lib/live")>()),
+    liveOf: () => {
+      throw new RangeError("Cannot convert soon to a BigInt");
+    },
+  }));
+  const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  const { LiveStatus: Fresh } = await import("../components/LiveStatus");
+  fakeApi({ [HEALTH_PATH]: () => json(HEALTH) });
+  render(<Fresh />);
+
+  const button = await pill();
+  expect(button.getAttribute("aria-label")).toBe("Status: Catching up");
+  expect(errors).toHaveBeenCalled();
+  vi.doUnmock("../lib/live");
 });
