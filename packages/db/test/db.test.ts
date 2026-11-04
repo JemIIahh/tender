@@ -1598,13 +1598,23 @@ describe("openDb", () => {
     });
 
     /**
+     * The times of the lock a holder process keeps and the second process that tests it opens with:
+     * a beat every 100 ms, and a lock that counts as left over after 10 s. The stale time is long
+     * against the beat on purpose. A holder is one more process on a machine that may be busy, and it
+     * has to be descheduled for a whole stale time to lose its lock to the second process, which is
+     * a failure of the machine, not of the lock. 100 beats fit in the time; with 15 beats (a beat
+     * every 100 ms and 1.5 s) a loaded host did stall a holder that long.
+     */
+    const HELD = { beatMs: 100, staleMs: 10_000 };
+
+    /**
      * A process that opens `url` with short times, says "ready", and then stays up, or ends with
      * `process.exit` at once when `exit` is set, without closing the database.
      */
     function holder(url: string, exit = false) {
       const script = `
         import { openDb } from ${JSON.stringify(pathToFileURL(join(PACKAGE_ROOT, "src", "index.ts")).href)};
-        await openDb(process.env.HOLD_URL, { pgliteLock: { beatMs: 100, staleMs: 1500 } });
+        await openDb(process.env.HOLD_URL, { pgliteLock: ${JSON.stringify(HELD)} });
         process.stdout.write("ready\\n", () => {
           if (process.env.HOLD_EXIT === "1") process.exit(0);
         });
@@ -1628,9 +1638,10 @@ describe("openDb", () => {
           if (output.includes("ready\n")) resolve();
         });
         void exited.then(() => reject(new Error("the process that holds the directory ended")));
+        // Only a guard against a hang: a process starting under load takes however long it takes.
         setTimeout(
           () => reject(new Error("the process did not open the directory in time")),
-          45_000,
+          120_000,
         ).unref();
       });
       // Seen even if the test ends before it is awaited.
@@ -1638,27 +1649,38 @@ describe("openDb", () => {
       return { child, ready, exited };
     }
 
+    // The test waits out the stale time twice, and its holder starts as slowly as the machine is busy.
+    const WAITS_OUT_STALE = { timeout: 180_000 };
+
     it(
       "turns_a_second_process_away_while_the_first_renews_and_takes_over_after_it_is_killed",
-      MINUTE,
+      WAITS_OUT_STALE,
       async () => {
         const { url, lock } = await place();
         const { child, ready, exited } = holder(url);
         await ready;
-        const timing = { pgliteLock: { beatMs: 100, staleMs: 1500 } };
+        const timing = { pgliteLock: HELD };
 
         const failure = await failureOf(url, timing);
         expect(failure).toBeInstanceOf(PgliteInUseError);
         expect(failure?.message).toContain(`Delete ${lock} sooner only if you know that process`);
-        // Past the time a lock lasts untouched, so that only its beats keep it from being taken.
-        await delay(2_500);
-        expect(await failureOf(url, timing)).toBeInstanceOf(PgliteInUseError);
+        const firstBeat = await touchedMs(lock);
 
-        // Killed, the holder cannot clean up. Its pid is gone at once, and the directory is not
-        // handed over until the lock has gone without a beat for as long as a lock lasts.
+        // Past the time a lock lasts untouched, so that only its beats keep it from being taken.
+        await delay(HELD.staleMs + 1_000);
+        expect(await failureOf(url, timing)).toBeInstanceOf(PgliteInUseError);
+        // And it was the beats: the file has been touched since, which it would not be by chance.
+        expect(await touchedMs(lock)).toBeGreaterThan(firstBeat);
+
+        // Killed, the holder cannot clean up: its lock is still there, and its pid is gone at once.
         child.kill("SIGKILL");
         await exited;
-        const killedAt = Date.now();
+        expect(await exists(lock)).toBe(true);
+        // The file is not touched again, so this is the holder's last beat, whenever it came. The
+        // directory is not handed over at once for a pid that is gone: the lock has to go unrenewed
+        // for as long as a lock lasts first.
+        const lastBeat = await touchedMs(lock);
+        expect(await failureOf(url, timing)).toBeInstanceOf(PgliteInUseError);
         let db: Db | undefined;
         await until(
           "the lock goes stale and the directory is taken over",
@@ -1671,10 +1693,11 @@ describe("openDb", () => {
               throw error;
             }
           },
-          30_000,
+          HELD.staleMs + 60_000,
         );
-        // The last beat came within 100 ms before the kill; allow for a late one.
-        expect(Date.now() - killedAt).toBeGreaterThanOrEqual(1_000);
+        // Measured from the last beat, not from the kill: the beat before it may have been late, but
+        // the directory is never taken over before a full stale time has passed since the last one.
+        expect(Date.now() - lastBeat).toBeGreaterThanOrEqual(HELD.staleMs);
         expect(await db?.query("select 1 as one")).toEqual([{ one: 1 }]);
         expect(JSON.parse(await readFile(lock, "utf8")).pid).toBe(process.pid);
         await db?.close();
