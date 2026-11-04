@@ -1,9 +1,11 @@
+import "./lib/node-check";
 import { rmSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { format, parseEnv } from "node:util";
+import { fileURLToPath } from "node:url";
+import { format, parseArgs, parseEnv } from "node:util";
 import {
   AGENTS,
   createOfflineSolver,
@@ -28,9 +30,10 @@ import {
   type TenderApi,
   tokenMeta,
 } from "@tender/shared";
-import { JsonRpcProvider } from "near-api-js";
+import { JsonRpcProvider, KeyPair, type KeyPairString } from "near-api-js";
 import { addRoleKey } from "./keeper-key";
 import { REPO_ROOT } from "./lib/env";
+import { inOwnProcess } from "./lib/own-process";
 import { killStartedProcesses } from "./lib/process-tree";
 import { type SeedWindows, seed } from "./seed";
 import { redact, type Services, startServices } from "./serve";
@@ -49,6 +52,8 @@ import { redact, type Services, startServices } from "./serve";
  * shows it:
  *
  *   Scripted demo agents run by the Tender team (offline solvers)
+ *   <the line under it, which names the agents>
+ *   starting a local NEAR node (<whether it downloads>)
  *   CHAIN sandbox nearcore <the version the node reports>
  *   REGISTERED alice, bob bond=<amount> each
  *   POSTED task=<id> reward=<amount>
@@ -59,11 +64,16 @@ import { redact, type Services, startServices } from "./serve";
  *   JUDGED winner=alice score=100 runner_up=bob score=<n>
  *   PAID alice=<amount> treasury=<fee>
  *   SCORECARD <uri>
+ *   SCORECARD FILE .tender/demo/scorecard.json
  *   DEMO OK
  *
  * The lines come from the API and the chain, and not from what the demo itself did: the counts of
  * workers, commits and reveals on the task, and then its outcome and its scorecard, polled until
- * they show. Three of them are to be read with care:
+ * they show. The line before `CHAIN` comes before the node starts, so that a first run, which
+ * downloads the node for minutes on a slow link, does not sit there silent. The scorecard's URI
+ * works only while the API runs, so its bytes, checked against the hash the chain pins, are also
+ * saved to `.tender/demo/scorecard.json` of the repository (git-ignored), which every run replaces.
+ * Three of the lines are to be read with care:
  *
  * - `REGISTERED` is the agents' bond (contract Task 16b). Only a registered agent whose bond the
  *   contract holds may enter an open task, so alice and bob each put the bond in their vaults and
@@ -113,6 +123,18 @@ import { redact, type Services, startServices } from "./serve";
  * once, but not before the local node and any other process the demo started are killed, each by
  * its process id, and the temp dir, with the node's home in it, is removed: a node must not outlive
  * the demo, with its CPU and its disk. The demo kills and removes only what it started.
+ *
+ * `pnpm demo:local --keep` runs the same scenario, and then keeps the local chain and the services
+ * up until Ctrl-C (or another stop signal), for the local MCP server of the README's "Use it from an
+ * agent". The scripted agents stop. `lead`, an account of the local chain that the scenario does not
+ * use and the API does not list as the team's, registers as an agent with the bond, and its key goes
+ * to a file of mode 0600 in the temp dir. The demo prints the environment of the MCP server (the
+ * network, the contract, the RPC URL, the API URL, the Judge, the account, a state dir in the temp
+ * dir, and a line that reads the key from its file) and waits. A key of a chain that lives only on
+ * this machine, and only until the demo stops, is no secret, but it is not printed all the same:
+ * the line names its file. The stop is the end the demo waits for: everything stops, the temp dir
+ * with the key goes, and `DEMO OK` comes last, with exit code 0. A stop before the scenario is over
+ * is an interruption, as without the flag.
  */
 
 // ---- The scenario ------------------------------------------------------------------------------
@@ -150,6 +172,14 @@ const WINDOWS: SeedWindows = {
 /** The agents of the team the demo runs, and how many entries the scenario ends with. */
 const ENTRANTS = 2;
 const TEAM_AGENTS = ["alice", "bob"] as const;
+/**
+ * The account `--keep` hands to the MCP server: one of the local chain's that the scenario leaves
+ * alone and that `TEAM_ACCOUNTS` does not name, with 10 NEAR and 10^12 of the token from the start.
+ */
+const KEPT_AGENT = "lead" satisfies LocalRole;
+
+/** Where the scorecard's bytes are saved, in the repository's git-ignored `.tender/`. */
+export const SCORECARD_FILE = join(REPO_ROOT, ".tender", "demo", "scorecard.json");
 
 /** How often the Judge and the keeper look. The indexer looks at 5 blocks a second. */
 const JUDGE_INTERVAL_MS = 1_000;
@@ -241,6 +271,12 @@ export interface Harness {
    * first out.
    */
   onProcessExit(step: () => void): void;
+  /**
+   * Waits until the demo is stopped, and makes a stop by a signal from now on the end the demo
+   * waits for, and no interruption: `--keep`. It resolves however the demo is stopped; one that
+   * something it runs failed still fails.
+   */
+  untilStopped(): Promise<void>;
 }
 
 /**
@@ -403,11 +439,25 @@ async function startNode(tmp: string): Promise<LocalChain> {
 }
 
 /**
+ * The line the demo prints before the node starts. near-sandbox does not say when it downloads the
+ * node, so the line says when it does: the first time a node starts in an install, with no
+ * `NEAR_SANDBOX_BIN_PATH`. The archive is 29 to 35 MB, by machine, and the node 71.5 MB on disk;
+ * a first run on a slow link prints nothing else for minutes.
+ */
+export function nodeStartLine(env: Record<string, string | undefined> = process.env): string {
+  return env.NEAR_SANDBOX_BIN_PATH
+    ? "starting a local NEAR node (the one NEAR_SANDBOX_BIN_PATH names)"
+    : "starting a local NEAR node (the first run downloads it: about 30 MB, 70 MB on disk; " +
+        "later runs skip this)";
+}
+
+/**
  * Starts the local chain, and sees to its stop. The node is a child of this process, and the end of
  * the process kills it unless it is known to have been stopped: a second signal skips the orderly
  * stops, and near-sandbox leaves the node running when its start fails.
  */
 export async function startChain(h: Harness, tmp: string): Promise<LocalChain> {
+  say(nodeStartLine());
   let stopped = false;
   h.onProcessExit(() => {
     // Every process below this one, by id: the node, and what else the demo started. They are listed
@@ -637,9 +687,170 @@ export async function fetchBytes(url: string): Promise<Uint8Array> {
   return new Uint8Array(await res.arrayBuffer());
 }
 
+/** `path` as a line shows it: from the working directory when it is under it, else whole. */
+const shown = (path: string) => {
+  const from = relative(process.cwd(), path);
+  return from === "" || from.startsWith("..") ? path : from;
+};
+
+/** Saves the scorecard's bytes to `SCORECARD_FILE`, and gives the path as the line shows it. */
+async function saveScorecard(bytes: Uint8Array): Promise<string> {
+  await mkdir(join(SCORECARD_FILE, ".."), { recursive: true, mode: 0o700 });
+  await writeFile(SCORECARD_FILE, bytes);
+  return shown(SCORECARD_FILE);
+}
+
+/** `text` as one word of a POSIX shell: as it is when it is plain, else in single quotes. */
+export function shellWord(text: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(text) ? text : `'${text.replaceAll("'", `'\\''`)}'`;
+}
+
+/** What `--keep` hands to the MCP server. */
+export interface Kept {
+  rpcUrl: string;
+  apiUrl: string;
+  contractId: string;
+  judgeAccount: string;
+  account: string;
+  /** The key file of `account`: `privateKey` in it is the key. */
+  keyFile: string;
+  stateDir: string;
+  /** What the account holds, in words, for the line about it. */
+  holds: string;
+}
+
+/**
+ * The lines `--keep` prints: the environment of the local MCP server (docs/MCP.md), word for word as
+ * a shell takes it, the command that starts it, and what the account is.
+ */
+export function keptLines(kept: Kept): string[] {
+  const readKey =
+    `node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).privateKey' ` +
+    shellWord(kept.keyFile);
+  return [
+    "KEPT the local chain and the services, until Ctrl-C. To try them from an agent, start the MCP " +
+      "server (docs/MCP.md) from the repository root, in another terminal:",
+    "  export TENDER_NETWORK=sandbox",
+    `  export TENDER_CONTRACT=${shellWord(kept.contractId)}`,
+    `  export NEAR_RPC_URL=${shellWord(kept.rpcUrl)}`,
+    `  export TENDER_API_URL=${shellWord(kept.apiUrl)}`,
+    `  export TENDER_JUDGE_ACCOUNT=${shellWord(kept.judgeAccount)}`,
+    `  export TENDER_ACCOUNT=${shellWord(kept.account)}`,
+    `  export TENDER_STATE_DIR=${shellWord(kept.stateDir)}`,
+    `  export TENDER_PRIVATE_KEY="$(${readKey})"`,
+    "  pnpm --silent tsx packages/mcp/bin/tender-mcp.ts",
+    `${kept.account} is an account of this local chain, registered as an agent with the bond, and ` +
+      `holds ${kept.holds}. Its full-access key is in ${kept.keyFile} (a key of this local chain ` +
+      "only). The chain has the settled demo task, and the account can post tasks of its own; it " +
+      "cannot enter its own. Ctrl-C stops the chain and the services and removes these files.",
+  ];
+}
+
+/**
+ * `--keep`: the scripted agents stop, `KEPT_AGENT` registers as an agent with the bond, its key is
+ * written to a file in `dir`, the lines for the MCP server are printed, and the demo waits to be
+ * stopped. A failure of the services in the meantime ends it, as a failure.
+ */
+async function keepUp(
+  h: Harness,
+  o: {
+    chain: LocalChain;
+    services: Services;
+    reader: TenderApi;
+    dir: string;
+    agents: () => Promise<void>;
+  },
+): Promise<void> {
+  const { chain, services, reader, dir } = o;
+  await limited("stopping the scripted agents", STOP_MS, o.agents(), h.signal);
+
+  const signer = chain.accounts[KEPT_AGENT];
+  await limited(
+    `registering ${KEPT_AGENT} with a bond`,
+    STEP_MS,
+    registerLocalAgent(chain, KEPT_AGENT),
+    h.signal,
+  );
+  await until(h, `${KEPT_AGENT} registered`, STEP_MS, async () => {
+    const listed = await reader.getAgent(signer.accountId);
+    return listed?.agent.status === "active"
+      ? ready(listed)
+      : waiting(`the API does not list ${KEPT_AGENT} as active yet`);
+  });
+
+  const keepDir = join(dir, "keep");
+  await mkdir(keepDir, { mode: 0o700 });
+  const keyFile = join(keepDir, `${KEPT_AGENT}.json`);
+  const publicKey = KeyPair.fromString(signer.privateKey as KeyPairString)
+    .getPublicKey()
+    .toString();
+  await writeFile(
+    keyFile,
+    `${JSON.stringify(
+      {
+        version: 1,
+        name: KEPT_AGENT,
+        network: chain.network,
+        account: signer.accountId,
+        publicKey,
+        privateKey: signer.privateKey,
+      },
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  );
+
+  const client = new TenderClient({
+    network: chain.network,
+    contractId: chain.contractId,
+    rpcUrl: chain.rpcUrl,
+  });
+  const wallet = await limited(
+    `reading what ${KEPT_AGENT} holds`,
+    API_TIMEOUT_MS,
+    client.ftBalanceOf(chain.tokenId, signer.accountId),
+    h.signal,
+  );
+  for (const line of keptLines({
+    rpcUrl: chain.rpcUrl,
+    apiUrl: services.publicUrl,
+    contractId: chain.contractId,
+    judgeAccount: chain.accounts.judge.accountId,
+    account: signer.accountId,
+    keyFile,
+    stateDir: join(dir, "mcp-state"),
+    holds: `${amountOf(wallet, chain.tokenId)} in its wallet, and NEAR for gas and storage`,
+  })) {
+    say(line);
+  }
+  void services.failed.then((error) => h.fail(error));
+  await h.untilStopped();
+}
+
 // ---- The scenario, step by step ----------------------------------------------------------------
 
-async function demo(h: Harness): Promise<void> {
+/** What `pnpm demo:local` takes on its command line. */
+export interface DemoOptions {
+  /** Keep the chain and the services up after the scenario, until a stop signal. */
+  keep?: boolean;
+}
+
+/**
+ * The flags of `pnpm demo:local`. Throws, with the usage, on any other. A `--` before them, as in
+ * `pnpm demo:local -- --keep`, which pnpm passes on, is no argument.
+ */
+export function demoOptionsOf(args: readonly string[]): DemoOptions {
+  const given = args[0] === "--" ? args.slice(1) : [...args];
+  try {
+    const { values } = parseArgs({ args: given, options: { keep: { type: "boolean" } } });
+    return { keep: values.keep === true };
+  } catch (error) {
+    throw new DemoError(`${messageOf(error)}\nusage: pnpm demo:local [--keep]`);
+  }
+}
+
+async function demo(h: Harness, options: DemoOptions = {}): Promise<void> {
   checkHost();
   say(BANNER);
   say(
@@ -704,10 +915,11 @@ async function demo(h: Harness): Promise<void> {
   // which, so with one running, a count of 1 is that one's.
   const stopAgents = new AbortController();
   const loops: Promise<void>[] = [];
-  h.onExit("stop the agents", async () => {
+  const stopTheAgents = async () => {
     stopAgents.abort();
     await Promise.all(loops);
-  });
+  };
+  h.onExit("stop the agents", stopTheAgents);
   const agents: Agent[] = [
     { name: "alice", signer: chain.accounts.alice, solver: createOfflineSolver(SEEDS_DIR) },
     { name: "bob", signer: chain.accounts.bob, solver: createWeakSolver(SEEDS_DIR) },
@@ -813,6 +1025,12 @@ async function demo(h: Harness): Promise<void> {
   if (sha256Hex(served) !== outcome.scorecard_hash) {
     throw new DemoError("the scorecard at its URI is not the one the chain pins to its hash");
   }
+  // The URI works only while the API runs; the file stays.
+  say(`SCORECARD FILE ${await saveScorecard(served)}`);
+
+  if (options.keep === true) {
+    await keepUp(h, { chain, services, reader, dir, agents: stopTheAgents });
+  }
 }
 
 // ---- The command line --------------------------------------------------------------------------
@@ -874,7 +1092,15 @@ export interface DemoScript {
   name: string;
 }
 
-const DEMO_SCRIPT: DemoScript = { run: demo, ok: "DEMO OK", failed: "DEMO FAILED", name: "demo" };
+/** `pnpm demo:local`, with its flags. */
+export const demoScript = (options: DemoOptions = {}): DemoScript => ({
+  run: (h) => demo(h, options),
+  ok: "DEMO OK",
+  failed: "DEMO FAILED",
+  name: "demo",
+});
+
+const DEMO_SCRIPT = demoScript();
 
 /** Runs a scenario and gives the exit code: 0 after its `ok` line, else not. */
 export async function main(script: DemoScript = DEMO_SCRIPT): Promise<number> {
@@ -887,6 +1113,8 @@ export async function main(script: DemoScript = DEMO_SCRIPT): Promise<number> {
     if (tail.length > LOG_TAIL) tail.shift();
   };
   const restoreConsole = captureConsole(record);
+  // Set by `untilStopped`: from then on a stop by a signal is the end the scenario waits for.
+  let stopIsTheEnd = false;
 
   const harness: Harness = {
     signal: abort.signal,
@@ -899,6 +1127,13 @@ export async function main(script: DemoScript = DEMO_SCRIPT): Promise<number> {
     },
     onProcessExit(step) {
       processExits.push(step);
+    },
+    untilStopped() {
+      stopIsTheEnd = true;
+      return new Promise<void>((resolve) => {
+        if (abort.signal.aborted) resolve();
+        else abort.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
     },
   };
   // What runs as the process ends, however it ends, and all that runs after a second signal. The
@@ -947,6 +1182,8 @@ export async function main(script: DemoScript = DEMO_SCRIPT): Promise<number> {
   restoreConsole();
   // An error nobody caught, or a signal, that came after the last wait still ends the demo here.
   if (failure === undefined && abort.signal.aborted) failure = abort.signal.reason;
+  // A scenario that waited to be stopped (`--keep`) ends well on a stop: no interruption.
+  if (failure instanceof Interrupted && stopIsTheEnd) failure = undefined;
 
   if (failure instanceof Interrupted) {
     process.stderr.write(`${script.name}: ${failure.message}; stopped what it started\n`);
@@ -970,7 +1207,16 @@ export async function main(script: DemoScript = DEMO_SCRIPT): Promise<number> {
 // Only when run as the script, never when a test or another script imports from here. Its parts
 // leave handles open (the database's threads, kept-alive sockets), so the process ends itself.
 if (import.meta.main) {
-  const code = await main();
+  let options: DemoOptions | undefined;
+  try {
+    options = demoOptionsOf(process.argv.slice(2));
+  } catch (error) {
+    process.stderr.write(`demo: ${messageOf(error)}\n`);
+  }
+  // Under `pnpm demo:local`, tsx's relay of a Ctrl-C can end the demo with SIGKILL, past its stops:
+  // the demo runs in a process of its own, and this one passes the signals on (`inOwnProcess`).
+  const relayed = options === undefined ? 2 : await inOwnProcess(fileURLToPath(import.meta.url));
+  const code = relayed ?? (await main(demoScript(options)));
   await flush(process.stdout);
   await flush(process.stderr);
   process.exit(code);
