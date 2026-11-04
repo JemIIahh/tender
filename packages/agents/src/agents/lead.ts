@@ -195,6 +195,8 @@ export interface LeadSolverOptions {
    * saves is the one the runner reveals.
    */
   state: StateStore;
+  /** The file system the journal is on. Default: the real one. A test gives one that can lose power. */
+  fs?: JournalFs;
   /** Replaces the windows of every sub-task, for a demo that cannot wait a whole phase. */
   windows?: ChildWindows;
   /** Seconds before the parent's commit deadline by which every sub-task must be due. Default 60. */
@@ -461,12 +463,36 @@ function parseJob(text: string, file: string): Job {
   return json as Job;
 }
 
+/** An open file, as far as the journal uses one. */
+export interface JournalFile {
+  writeFile(text: string, encoding: "utf8"): Promise<void>;
+  /** Makes what was written, or for a directory what was renamed in it, survive a power cut. */
+  sync(): Promise<void>;
+  close(): Promise<void>;
+}
+
+/**
+ * What the journal needs of a file system. Node's own (`node:fs/promises`) is the default; a test
+ * replaces it with one that can lose power, to show what a power cut leaves behind.
+ */
+export interface JournalFs {
+  /** Gives the first directory it made, or undefined if the directory was there already. */
+  mkdir(path: string, options: { recursive: true; mode: number }): Promise<string | undefined>;
+  open(path: string, flags: string, mode?: number): Promise<JournalFile>;
+  rename(from: string, to: string): Promise<void>;
+  rm(path: string, options: { force: true }): Promise<void>;
+  readFile(path: string, encoding: "utf8"): Promise<string>;
+  readdir(path: string): Promise<string[]>;
+}
+
+const nodeFs: JournalFs = { mkdir, open, rename, rm, readFile, readdir };
+
 /** Writes `text` to `file` so that a reader, or a crash, finds the old file or the new one. */
-async function writeFileAtomic(file: string, text: string): Promise<void> {
+export async function writeFileAtomic(fs: JournalFs, file: string, text: string): Promise<void> {
   const dir = dirname(file);
-  await mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const temp = join(dir, `.${basename(file)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
-  const handle = await open(temp, "wx", 0o600);
+  const handle = await fs.open(temp, "wx", 0o600);
   try {
     try {
       await handle.writeFile(text, "utf8");
@@ -474,9 +500,9 @@ async function writeFileAtomic(file: string, text: string): Promise<void> {
     } finally {
       await handle.close();
     }
-    await rename(temp, file);
+    await fs.rename(temp, file);
   } catch (error) {
-    await rm(temp, { force: true }).catch(() => undefined);
+    await fs.rm(temp, { force: true }).catch(() => undefined);
     throw error;
   }
 }
@@ -559,6 +585,7 @@ function checkCount(name: string, value: number, min: number): void {
 
 export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
   const { client, api, state } = o;
+  const fs = o.fs ?? nodeFs;
   const log = (line: string) => (o.log ?? console.log)(`lead: ${line}`);
   const marginSecs = o.marginSecs ?? DEFAULT_MARGIN_SECS;
   const hireSecs = o.hireSecs ?? DEFAULT_HIRE_SECS;
@@ -590,7 +617,7 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
     const file = fileOf(parent);
     let text: string;
     try {
-      text = await readFile(file, "utf8");
+      text = await fs.readFile(file, "utf8");
     } catch (error) {
       if ((error as { code?: unknown }).code === "ENOENT") return null;
       throw error;
@@ -606,7 +633,7 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
   async function listJobs(): Promise<Job[]> {
     let names: string[];
     try {
-      names = await readdir(journalDir);
+      names = await fs.readdir(journalDir);
     } catch (error) {
       if ((error as { code?: unknown }).code === "ENOENT") return [];
       throw error;
@@ -625,7 +652,7 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
   }
 
   async function save(job: Job): Promise<Job> {
-    await writeFileAtomic(fileOf(job.parent), `${JSON.stringify(job, null, 2)}\n`);
+    await writeFileAtomic(fs, fileOf(job.parent), `${JSON.stringify(job, null, 2)}\n`);
     return job;
   }
 
@@ -1049,7 +1076,7 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
   async function begin(ctx: TaskContext, account: string): Promise<void> {
     const old = await readJob(ctx.task.id);
     if (old !== null) {
-      await rename(
+      await fs.rename(
         fileOf(ctx.task.id),
         join(journalDir, `${ctx.task.id}.orphaned-${Date.now()}.json`),
       );
