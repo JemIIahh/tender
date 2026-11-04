@@ -71,6 +71,10 @@ interface World {
   failAddDelegate: boolean;
   /** Makes `deleteKey` do nothing, as a chain that did not take it. */
   ignoreDeleteKey: boolean;
+  /** Makes `deleteKey` fail before the chain is asked, as a node that did not answer. */
+  failDeleteKey: boolean;
+  /** Makes `remove_delegate` fail before the chain is asked, as a node that did not answer. */
+  failRemoveDelegate: boolean;
   tokens: Array<{ token: string; enabled: boolean }>;
 }
 
@@ -82,6 +86,8 @@ const world = (): World => ({
   added: [],
   failAddDelegate: false,
   ignoreDeleteKey: false,
+  failDeleteKey: false,
+  failRemoveDelegate: false,
   tokens: [{ token: TOKEN, enabled: true }],
 });
 
@@ -129,6 +135,7 @@ function fakeClients(w: World): ClientFactory {
       return tx;
     },
     removeDelegate: async (publicKey: string) => {
+      if (w.failRemoveDelegate) throw new TenderError("E_TIMEOUT", "E_TIMEOUT: no answer");
       w.log.push(`remove_delegate ${publicKey}`);
       w.delegates.delete(publicKey);
       return tx;
@@ -151,6 +158,7 @@ function fakeWriter(w: World): () => KeyWriter {
       });
     },
     deleteKey: async ({ publicKey }) => {
+      if (w.failDeleteKey) throw new TenderError("E_TIMEOUT", "E_TIMEOUT: no answer");
       w.log.push(`delete_key ${publicKey}`);
       if (!w.ignoreDeleteKey) w.keys.delete(publicKey);
     },
@@ -738,6 +746,109 @@ test("undelegate_keeps_the_file_when_the_chain_still_shows_the_key", async () =>
   expect(await readdir(keys)).toEqual(["scout.json"]);
 });
 
+/** A delegate key whose `undelegate` stopped after `remove_delegate`: caps gone, key still on the account. */
+async function interruptedUndelegate(): Promise<string> {
+  const { publicKey } = await delegateAgentCommand(options());
+  w.failDeleteKey = true;
+  await expect(undelegateAgentCommand(options())).rejects.toThrow(
+    /did not finish: run pnpm agent:undelegate again/,
+  );
+  w.failDeleteKey = false;
+  expect(w.delegates.has(publicKey)).toBe(false);
+  expect(w.keys.has(publicKey)).toBe(true);
+  return publicKey;
+}
+
+test("delegate_refuses_a_key_whose_undelegate_stopped_and_gives_it_no_new_caps", async () => {
+  const publicKey = await interruptedUndelegate();
+  const before = await readFile(delegateFile(), "utf8");
+  w.log.length = 0;
+  out.length = 0;
+
+  // Both ways in: the function and the command line.
+  await expect(delegateAgentCommand(options())).rejects.toThrow(
+    /started to take away and did not finish: run pnpm agent:undelegate --name scout/,
+  );
+  expect(await cli(["delegate", "--per-task", "2", "--total", "6"])).toBe(1);
+  expect(err.join("\n")).toMatch(/pnpm agent:undelegate --name scout/);
+
+  // Nothing was sent: no key added again, no caps registered (so none start from spent 0), no new key.
+  expect(w.log).toEqual([]);
+  expect(w.added).toHaveLength(1);
+  expect(w.delegates.has(publicKey)).toBe(false);
+  expect(w.keys.has(publicKey)).toBe(true);
+  expect(await readdir(keys)).toEqual(["scout.delegate.json", "scout.json"]);
+  // The file is as undelegate left it: marked, the same key, unreadable by others.
+  expect(await readFile(delegateFile(), "utf8")).toBe(before);
+  expect(await readDelegate()).toMatchObject({ publicKey, revoking: true });
+  expect((await stat(delegateFile())).mode & 0o777).toBe(0o600);
+  await noSecret();
+});
+
+test("rerunning_undelegate_finishes_a_revoke_that_stopped_and_removes_the_file", async () => {
+  const publicKey = await interruptedUndelegate();
+  w.log.length = 0;
+  out.length = 0;
+
+  await undelegateAgentCommand(options());
+
+  // The caps were removed the first time: only the key is deleted now, and the file goes last.
+  expect(w.log).toEqual([`delete_key ${publicKey}`]);
+  expect(w.keys.has(publicKey)).toBe(false);
+  expect(w.delegates.has(publicKey)).toBe(false);
+  expect(w.keys.get(agentKey)).toBe("FullAccess");
+  expect(await readdir(keys)).toEqual(["scout.json"]);
+  expect(out).toEqual(
+    expect.arrayContaining([
+      "finishing a revoke that stopped half way",
+      `OK undelegate agent scout (${ACCOUNT})`,
+      "caps: none on the chain already",
+      "key: deleted from the account",
+    ]),
+  );
+  await expect(readDelegate()).rejects.toThrow();
+
+  // The way is open again, with a new key and never the dead one.
+  const next = await delegateAgentCommand(options());
+  expect(next.publicKey).not.toBe(publicKey);
+  expect(w.keys.has(publicKey)).toBe(false);
+});
+
+test("undelegate_marks_the_file_before_its_first_chain_step", async () => {
+  const { publicKey } = await delegateAgentCommand(options());
+  expect(await readDelegate()).not.toHaveProperty("revoking");
+
+  // `remove_delegate` fails before the chain changes: the mark is already in the file.
+  w.failRemoveDelegate = true;
+  await expect(undelegateAgentCommand(options())).rejects.toMatchObject({
+    code: "E_TIMEOUT",
+    message: expect.stringMatching(
+      /remove_delegate did not finish: run pnpm agent:undelegate again/,
+    ),
+  });
+  expect(await readDelegate()).toMatchObject({ publicKey, revoking: true });
+  expect((await stat(delegateFile())).mode & 0o777).toBe(0o600);
+  expect(w.delegates.has(publicKey)).toBe(true);
+  expect(await readdir(keys)).toEqual(["scout.delegate.json", "scout.json"]);
+
+  // A key whose caps are still on the chain is refused by `delegate` too, and finished by undelegate.
+  await expect(delegateAgentCommand(options())).rejects.toThrow(/started to take away/);
+  w.failRemoveDelegate = false;
+  w.log.length = 0;
+  await undelegateAgentCommand(options());
+  expect(w.log).toEqual([`remove_delegate ${publicKey}`, `delete_key ${publicKey}`]);
+  expect(await readdir(keys)).toEqual(["scout.json"]);
+});
+
+test("a_revoking_mark_that_is_not_true_is_not_a_delegate_key_file", async () => {
+  await delegateAgentCommand(options());
+  const file = await readDelegate();
+  await writeFile(delegateFile(), JSON.stringify({ ...file, revoking: "yes" }), { mode: 0o600 });
+
+  await expect(delegateAgentCommand(options())).rejects.toThrow(/is not a delegate key file/);
+  await expect(undelegateAgentCommand(options())).rejects.toThrow(/is not a delegate key file/);
+});
+
 test("undelegate_without_a_delegate_key_says_so", async () => {
   await expect(undelegateAgentCommand(options())).rejects.toThrow(/has no delegate key at/);
   expect(w.log).toEqual([]);
@@ -779,6 +890,9 @@ test("undelegate_never_deletes_a_full_access_key", async () => {
   expect(w.log.filter((line) => line.startsWith("delete_key"))).toEqual([]);
   expect(w.keys.get(agentKey)).toBe("FullAccess");
   expect(w.keys.get(other.getPublicKey().toString())).toBe("FullAccess");
+  // Refused before the first change, so the file was not marked either.
+  expect(await readDelegate()).not.toHaveProperty("revoking");
+  expect(w.log).toEqual([]);
 });
 
 test("undelegate_with_a_function_call_key_is_refused_before_anything_is_changed", async () => {

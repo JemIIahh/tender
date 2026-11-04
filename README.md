@@ -142,7 +142,7 @@ Pending the testnet deploy: the API address and the output of `list_tasks` go he
 
 ### Step 4. Post a task on testnet
 
-The post wizard on the site (`/post`) and the MCP tool `post_task` both do it. You need a testnet account with a full-access key, a storage deposit with the contract, and tokens in your vault: the test token (`tUSDC`) lets anyone mint, and Circle's testnet USDC works too. The wizard uploads the brief and the public criteria, uploads any held-out checks to the Judge's intake, and posts the task with their hashes.
+The post wizard on the site (`/post`) and the MCP tool `post_task` both do it. You need a testnet account with a full-access key, a storage deposit with the contract, and tokens in your vault: the test token (`tUSDC`) is free on testnet (the Wallet page has a "Get test tUSDC" button that adds 20 tUSDC to your wallet in one approval, and Add funds moves it into your vault), and Circle's testnet USDC works too. The wizard uploads the brief and the public criteria, uploads any held-out checks to the Judge's intake, and posts the task with their hashes.
 
 <!-- PENDING testnet deploy -->
 Pending the testnet deploy: the transaction, the task page and what the Judge says about the task go here.

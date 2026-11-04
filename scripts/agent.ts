@@ -94,8 +94,12 @@ import { REPO_ROOT, readEnvFile } from "./lib/env";
  * like it (the same key-directory guard), private key never printed. The key is saved before the
  * chain is asked to take it, so a run that stops half way is finished by running the command
  * again. `undelegate` is its undoing: `remove_delegate` (the caps, which are the money), then
- * DeleteKey (the key), and only when the chain shows both gone is the file removed. A function-call
- * key that leaks costs at most its caps and its allowance; keep little liquid NEAR on the account.
+ * DeleteKey (the key), and only when the chain shows both gone is the file removed. Before its first
+ * chain step `undelegate` marks the file (`"revoking": true`), and `delegate` refuses a marked file:
+ * a run of `undelegate` that stopped after `remove_delegate` is finished by running it again, and
+ * is never mistaken for a `delegate` that stopped, which would give the key new caps with nothing
+ * spent. A function-call key that leaks costs at most its caps and its allowance; keep little
+ * liquid NEAR on the account.
  *
  * WHERE. `--network` (else `TENDER_NETWORK` in the environment or `.env`, else testnet), the contract
  * from `TENDER_CONTRACT` or the network's record in `deployments/`, the node from `NEAR_RPC_URL` or
@@ -763,6 +767,12 @@ interface DelegateFile {
   contract: string;
   publicKey: string;
   privateKey: string;
+  /**
+   * Set by `undelegate` before its first chain step and cleared only by deleting the file, once the
+   * chain shows the key and its caps gone. A file in this state is a revoke that stopped half way:
+   * `delegate` refuses it, because giving the key caps again would start it with nothing spent.
+   */
+  revoking?: true;
 }
 
 const delegateFileOf = (dir: string, name: string) => join(dir, `${name}${DELEGATE_SUFFIX}`);
@@ -807,7 +817,8 @@ async function readDelegateFile(dir: string, name: string): Promise<DelegateFile
     typeof f.contract !== "string" ||
     !AccountIdSchema.safeParse(f.contract).success ||
     typeof f.publicKey !== "string" ||
-    typeof f.privateKey !== "string"
+    typeof f.privateKey !== "string" ||
+    (f.revoking !== undefined && f.revoking !== true)
   ) {
     throw bad();
   }
@@ -831,6 +842,7 @@ async function readDelegateFile(dir: string, name: string): Promise<DelegateFile
     contract: f.contract,
     publicKey: f.publicKey,
     privateKey: f.privateKey,
+    ...(f.revoking === true ? { revoking: true as const } : {}),
   };
 }
 
@@ -974,11 +986,8 @@ function readUnits(flag: string, text: string | undefined, decimals: number): bi
   return amount;
 }
 
-/** Wraps a failure of `step` with what state the account is left in and how to go on. */
-function afterKeyAdded(error: unknown, account: string, step: string): Error {
-  const note =
-    `\nThe delegate key is on ${account} already, so ${step} did not happen: run the same ` +
-    "pnpm agent:delegate command again to finish, or pnpm agent:undelegate to take the key off.";
+/** `error` with `note` after its message; a `TenderError` keeps its code and transaction. */
+function withNote(error: unknown, note: string): Error {
   if (error instanceof TenderError) {
     return new TenderError(
       error.code,
@@ -987,6 +996,28 @@ function afterKeyAdded(error: unknown, account: string, step: string): Error {
     );
   }
   return new Error(error instanceof Error ? error.message + note : note.trim());
+}
+
+/** Wraps a failure of `step` with what state the account is left in and how to go on. */
+function afterKeyAdded(error: unknown, account: string, step: string): Error {
+  return withNote(
+    error,
+    `\nThe delegate key is on ${account} already, so ${step} did not happen: run the same ` +
+      "pnpm agent:delegate command again to finish, or pnpm agent:undelegate to take the key off.",
+  );
+}
+
+/**
+ * Wraps a failure of `step` of `undelegate`, which has marked the key file by then: says what
+ * state the account may be in and that running `pnpm agent:undelegate` again finishes it.
+ */
+function whileRevoking(error: unknown, account: string, step: string): Error {
+  return withNote(
+    error,
+    `\nThe delegate key of ${account} is being taken away and ${step} did not finish: run ` +
+      "pnpm agent:undelegate again to finish it. Until it is done, pnpm agent:delegate refuses " +
+      "this key, so that it is not given caps again.",
+  );
 }
 
 /**
@@ -1001,6 +1032,20 @@ export async function delegateAgentCommand(options: DelegateOptions): Promise<De
   // The words are checked before the chain is asked anything.
   const allowance = readUnits("--allowance", options.allowance ?? DEFAULT_ALLOWANCE, 24);
   const { key, account, target, client, keyDir } = await load(options, false);
+
+  // The delegate key saved already (a run that stopped, or a revoke that stopped). A file marked by
+  // `undelegate` is refused before anything else is asked of the chain: adding that key again would
+  // give it new caps with nothing spent.
+  const path = delegateFileOf(keyDir, key.name);
+  let file = await readDelegateFile(keyDir, key.name);
+  if (file?.revoking === true) {
+    throw new Error(
+      `${path} is a delegate key that pnpm agent:undelegate started to take away and did not ` +
+        `finish: run pnpm agent:undelegate --name ${key.name} to finish it. This command does ` +
+        "not use it again, because the key would get new caps with nothing counted as spent. " +
+        "Nothing was changed.",
+    );
+  }
   await client.requireFullAccessKey("add_delegate");
 
   const enabled = (await client.getConfig()).tokens.filter((candidate) => candidate.enabled);
@@ -1034,8 +1079,6 @@ export async function delegateAgentCommand(options: DelegateOptions): Promise<De
 
   // The delegate key: the one saved already (a run that stopped), or a new one, saved before the
   // chain is asked to take it, so that a key on the chain is never one that has been lost.
-  const path = delegateFileOf(keyDir, key.name);
-  let file = await readDelegateFile(keyDir, key.name);
   if (file !== null) {
     if (
       file.account !== account ||
@@ -1089,16 +1132,11 @@ export async function delegateAgentCommand(options: DelegateOptions): Promise<De
     } catch (error) {
       // The transaction may still land (a node that did not answer in time); the saved key is what
       // a second run adds, or finds on the account.
-      const note =
+      throw withNote(
+        error,
         `\nThe delegate key is saved in ${path}, and the chain may or may not have taken it: ` +
-        "run the same pnpm agent:delegate command again, which adds it if it is not there.";
-      throw error instanceof TenderError
-        ? new TenderError(
-            error.code,
-            error.message + note,
-            error.txHash === undefined ? {} : { txHash: error.txHash },
-          )
-        : new Error(error instanceof Error ? error.message + note : note.trim());
+          "run the same pnpm agent:delegate command again, which adds it if it is not there.",
+      );
     }
   }
   // What the chain holds, and not what was sent.
@@ -1150,7 +1188,10 @@ export async function delegateAgentCommand(options: DelegateOptions): Promise<De
 /**
  * Takes the delegate key away: `remove_delegate` first (its caps are the money), then DeleteKey
  * (the key itself), each only if the chain still has it, so that a run that stopped half way is
- * finished by running it again. The key file is removed only when the chain shows both gone.
+ * finished by running it again. Before the first chain step the key file is marked `revoking`
+ * (written whole, then renamed), which makes `delegate` refuse it: a key whose caps are gone but
+ * whose key is still on the account must not be given new caps. The file is removed only when the
+ * chain shows both gone.
  */
 export async function undelegateAgentCommand(options: DelegateOptions): Promise<void> {
   const log = options.log ?? console.log;
@@ -1176,32 +1217,54 @@ export async function undelegateAgentCommand(options: DelegateOptions): Promise<
     throw new Error(`${path} holds the agent's own full-access key: nothing was changed`);
   }
   await client.requireFullAccessKey("remove_delegate");
+  // Only a function-call key is deleted here, whatever the file says: never a full-access key.
+  const requireFunctionCall = (held: { permission: KeyPermission } | null) => {
+    if (held !== null && asFunctionCall(held.permission) === null) {
+      throw new Error(
+        `the key in ${path} is a full-access key of ${account}, which a delegate key never is: ` +
+          "it was not deleted and nothing else was changed",
+      );
+    }
+  };
+  requireFunctionCall(await client.viewAccessKey(account, file.publicKey));
+
+  // From here on the chain changes: the mark first, so that a run that stops after
+  // `remove_delegate` is not mistaken by `delegate` for one that stopped after AddKey.
+  if (file.revoking === true) {
+    log("finishing a revoke that stopped half way");
+  } else {
+    await writeKeyFile(path, { ...file, revoking: true }, true);
+  }
 
   let tx: Awaited<ReturnType<TenderClient["removeDelegate"]>> | undefined;
-  if ((await delegateOf(client, account, file.publicKey)) !== null) {
-    tx = await client.removeDelegate(file.publicKey);
+  try {
+    if ((await delegateOf(client, account, file.publicKey)) !== null) {
+      tx = await client.removeDelegate(file.publicKey);
+    }
+  } catch (error) {
+    throw whileRevoking(error, account, "remove_delegate");
   }
   const held = await client.viewAccessKey(account, file.publicKey);
   if (held !== null) {
-    // Only a function-call key is deleted here, whatever the file says: never a full-access key.
-    if (asFunctionCall(held.permission) === null) {
-      throw new Error(
-        `the key in ${path} is a full-access key of ${account}, which a delegate key never is: ` +
-          "it was not deleted",
-      );
+    requireFunctionCall(held);
+    try {
+      await (options.keysFor ?? realKeyWriter)(target).deleteKey({
+        signer: { accountId: account, privateKey: key.privateKey },
+        publicKey: file.publicKey,
+      });
+    } catch (error) {
+      throw whileRevoking(error, account, "DeleteKey");
     }
-    await (options.keysFor ?? realKeyWriter)(target).deleteKey({
-      signer: { accountId: account, privateKey: key.privateKey },
-      publicKey: file.publicKey,
-    });
   }
-  // What the chain holds now: both gone, or the file stays for another run.
+  // What the chain holds now: both gone, or the file stays, marked, for another run.
   if (
     (await client.viewAccessKey(account, file.publicKey)) !== null ||
     (await delegateOf(client, account, file.publicKey)) !== null
   ) {
-    throw new Error(
-      `the chain still shows the delegate key or its caps on ${account}: run pnpm agent:undelegate again`,
+    throw whileRevoking(
+      new Error(`the chain still shows the delegate key or its caps on ${account}`),
+      account,
+      "taking them away",
     );
   }
   await rm(path);

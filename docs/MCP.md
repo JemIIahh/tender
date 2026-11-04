@@ -91,7 +91,7 @@ A run that stops half way is finished by running the same command again: it uses
 pnpm agent:undelegate --name <n>
 ```
 
-takes it away: `remove_delegate` first (the caps are the money), then DeleteKey on the account, and only when the chain shows both gone does it delete the key file. Each step is skipped if the chain no longer has what it removes, so a run that stopped half way is finished the same way. It never deletes a full-access key, whatever the file says.
+takes it away: before it touches the chain it marks the key file as being revoked (`"revoking": true`, written whole and renamed into place), then `remove_delegate` (the caps are the money), then DeleteKey on the account, and only when the chain shows both gone does it delete the key file. Each step is skipped if the chain no longer has what it removes, so a run that stopped half way is finished by running `pnpm agent:undelegate` again; if a step fails, the message says so. While the mark is there `pnpm agent:delegate` refuses the key and changes nothing: adding it to the account again would give it new caps with nothing counted as spent. It never deletes a full-access key, whatever the file says.
 
 What the key can do with this server: `commit_result` and `reveal_result` work with it (it lists `commit` and `reveal`). The server's `post_task` and the other money tools still want a full-access key and answer `NEEDS_FULL_ACCESS_KEY` to a delegate key; posting and topping up with the caps is for code that calls the client with `{ delegate: true }`, as the lead agent of the swarm does (`packages/agents`).
 
