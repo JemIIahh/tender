@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { TenderError, type TxResult } from "@tender/client";
+import { type SignedTx, TenderError, type TxResult, type TxStatus } from "@tender/client";
 import { createStateStore, isDraftOf, type StateStore } from "@tender/mcp";
 import {
   canonicalJson,
@@ -103,10 +103,22 @@ interface WorldOptions {
    * never if that is huge.
    */
   slowPost?: { n: number; giveUpSecs: number; landsAfterSecs: number };
-  /** This many other tasks are made on the chain just before the lead's lost or slow post lands. */
+  /**
+   * This many other tasks are made on the chain just before the lead's lost or slow post lands, or
+   * while a post that fails to be signed is waiting.
+   */
   crowd?: number;
-  /** What the client says its sends wait for, in milliseconds. Default: it says nothing. */
-  sendTimeoutMs?: number;
+  /** The signing of child number `n` fails once, before there is a transaction: nothing is sent. */
+  signFails?: { n: number };
+  /**
+   * Child number `n`'s transaction fails on chain `times` times, with this error: the client throws
+   * it, and the chain keeps the failure.
+   */
+  failedPost?: { n: number; times: number; error: TenderError; clientSees?: Error };
+  /** The node has forgotten every transaction: `txStatus` says unknown, always. */
+  forgetTxs?: boolean;
+  /** The Nth call of `txStatus` throws once, as a node that does not answer would. */
+  failTxStatus?: number;
   /** Makes the Nth commit (from 1) fail once; the default is the first. With no `n`, every one. */
   failCommit?: { error: Error; n?: number };
   /** The Nth call of the API's `getTask` for a child throws once; "always" makes every one throw. */
@@ -128,6 +140,10 @@ interface WorldOptions {
   hooks?: {
     /** The hire of child `n` begins: its brief is about to go up. */
     beforeHire?: (n: number) => void;
+    /** The client is about to sign the post of child `n`. */
+    beforeSign?: (n: number) => void;
+    /** The post of child `n` is signed and its hook has run; the transaction is about to be sent. */
+    beforeLand?: (n: number, tx: SignedTx) => void;
     /** The post of child `n` has landed on the chain, and the client has not answered yet. */
     afterLand?: (n: number) => void;
   };
@@ -162,14 +178,32 @@ function buildWorld(o: WorldOptions = {}) {
     return total;
   };
   /** Posts the client gave up on that are still on their way. */
-  const pending: Array<{ input: PostTaskInput; opts: SpendOptions | undefined; landAt: bigint }> =
-    [];
+  const pending: Array<{
+    input: PostTaskInput;
+    opts: SpendOptions | undefined;
+    landAt: bigint;
+    txHash: string;
+  }> = [];
+  /** What the chain says of each transaction the client signed, by hash. */
+  const txs = new Map<
+    string,
+    | { kind: "unsent" }
+    | { kind: "on its way" }
+    | { kind: "executed"; taskId: bigint }
+    | { kind: "failed"; error: TenderError }
+  >();
+  let signedCount = 0;
+  let signFailed = false;
+  let failedTimes = 0;
+  let txStatusCalls = 0;
   /** Lets the posts that are due land. Every read of the chain starts with it. */
   const land = () => {
     for (const post of pending.filter((one) => one.landAt <= now)) {
       pending.splice(pending.indexOf(post), 1);
       total += BigInt(o.crowd ?? 0);
-      children.push({ id: nextId(), input: post.input, opts: post.opts, polls: 0 });
+      const id = nextId();
+      children.push({ id, input: post.input, opts: post.opts, polls: 0 });
+      txs.set(post.txHash, { kind: "executed", taskId: id });
     }
   };
   /** A task as the chain shows it: the lead's child, or one of somebody else's. */
@@ -191,7 +225,6 @@ function buildWorld(o: WorldOptions = {}) {
     network: "testnet",
     contractId: CONTRACT,
     accountId: LEAD,
-    sendTimeoutMs: o.sendTimeoutMs,
     async commit(taskId, commitment) {
       commitCalls += 1;
       events.push("commit");
@@ -221,24 +254,57 @@ function buildWorld(o: WorldOptions = {}) {
     async getEntry(taskId) {
       return entries.get(String(taskId)) ?? null;
     },
-    async postTask(input, opts) {
+    async postTask(input, opts, sendHooks) {
       land();
       const n = children.length;
       events.push(`post ${n}`);
       if (o.postDelayMs !== undefined) await delay(o.postDelayMs);
+      o.hooks?.beforeSign?.(n);
+      if (o.signFails?.n === n && !signFailed) {
+        signFailed = true;
+        // Other people's tasks pile up on the chain meanwhile.
+        total += BigInt(o.crowd ?? 0);
+        throw new Error("the node did not answer");
+      }
+      // Signed. From here on the transaction may be sent, and its hash is known to the caller.
+      signedCount += 1;
+      const tx: SignedTx = {
+        txHash: `tx-${n}-${signedCount}`,
+        signerId: LEAD,
+        publicKey: KEY,
+        nonce: BigInt(signedCount),
+        blockHash: "7".repeat(44),
+        blockHeight: 1000n + BigInt(signedCount),
+      };
+      txs.set(tx.txHash, { kind: "unsent" });
+      await sendHooks?.beforeSend?.(tx);
+      o.hooks?.beforeLand?.(n, tx);
       if (o.failPost?.n === n && !postFailed) {
+        // It never reached the node: the chain has no record of it, and the caller cannot know.
         postFailed = true;
         throw o.failPost.error;
       }
+      if (o.failedPost?.n === n && failedTimes < o.failedPost.times) {
+        failedTimes += 1;
+        txs.set(tx.txHash, { kind: "failed", error: o.failedPost.error });
+        throw o.failedPost.clientSees ?? o.failedPost.error;
+      }
       if (o.slowPost?.n === n && !slowSent) {
         slowSent = true;
-        pending.push({ input, opts, landAt: now + BigInt(o.slowPost.landsAfterSecs) * NS });
+        pending.push({
+          input,
+          opts,
+          landAt: now + BigInt(o.slowPost.landsAfterSecs) * NS,
+          txHash: tx.txHash,
+        });
+        txs.set(tx.txHash, { kind: "on its way" });
         now += BigInt(o.slowPost.giveUpSecs) * NS;
         throw new TenderError("E_TIMEOUT", "TenderClient.send timed out; the transaction may land");
       }
       if (o.lostPost?.n === n && !postFailed) total += BigInt(o.crowd ?? 0);
       const id = nextId();
       children.push({ id, input, opts, polls: 0 });
+      txs.set(tx.txHash, { kind: "executed", taskId: id });
       // A post takes a few seconds of chain time.
       now += 3n * NS;
       o.hooks?.afterLand?.(n);
@@ -246,7 +312,27 @@ function buildWorld(o: WorldOptions = {}) {
         postFailed = true;
         throw new TenderError("E_TIMEOUT", "TenderClient.send timed out; the transaction may land");
       }
-      return { txHash: `tx-post-${n}`, taskId: id } as TxResult & { taskId: bigint };
+      return { txHash: tx.txHash, taskId: id } as TxResult & { taskId: bigint };
+    },
+    async txStatus(txHash): Promise<TxStatus> {
+      land();
+      txStatusCalls += 1;
+      if (o.failTxStatus === txStatusCalls) {
+        throw new TenderError("E_TIMEOUT", "TenderClient.txStatus timed out");
+      }
+      const state = o.forgetTxs ? undefined : txs.get(txHash);
+      if (state === undefined || state.kind === "unsent") return { kind: "unknown" };
+      if (state.kind === "on its way") return { kind: "pending" };
+      if (state.kind === "failed") return { kind: "failed", error: state.error };
+      return {
+        kind: "executed",
+        result: {
+          txHash,
+          events: [],
+          returnValue: String(state.taskId),
+          receipts: [],
+        } as TxResult,
+      };
     },
     async blockTimestampNs() {
       land();
@@ -519,12 +605,20 @@ async function finish(lead: LeadSolver, max = 600, each?: () => void): Promise<v
   throw new Error("the job did not end");
 }
 
+/** A post the journal notes: which part, and the transaction once it is signed. */
+interface JobTx {
+  slug: string;
+  tx?: { txHash: string; publicKey: string; nonce: string; blockHash: string; blockHeight: string };
+}
+
 const jobOf = (parent = PARENT_ID) =>
   JSON.parse(readFileSync(join(journalDir, `${parent}.json`), "utf8")) as {
     status: string;
     reason?: string;
     hires: Array<{ slug: string; id: string; winner?: string }>;
-    intent?: unknown;
+    intent?: JobTx;
+    unresolved?: JobTx;
+    failedPosts?: { slug: string; count: number };
   };
 const journalFiles = () => readdirSync(journalDir).filter((name) => name.endsWith(".json"));
 const text = (bytes: Uint8Array | undefined) => new TextDecoder().decode(bytes ?? new Uint8Array());
@@ -1211,33 +1305,28 @@ describe("fix round 1: I2, a failed call is tried again and the job survives a r
   });
 
   test("I2_a_restart_resumes_the_job_and_does_not_hire_the_parts_again", async () => {
-    // The process dies when the third post fails to leave (a socket gone), after two were hired.
-    const world = buildWorld({ failPost: { n: 2, error: new Error("socket hang up") } });
+    // The third post cannot be signed (the node did not answer), after two were hired.
+    const world = buildWorld({ signFails: { n: 2 } });
     const first = leadOf(world);
     await enter(world, first);
     await first.tick();
     expect(world.children).toHaveLength(2);
     expect(jobOf().status).toBe("hiring");
     expect(jobOf().hires.map((one) => one.slug)).toEqual(SLUGS.slice(0, 2));
-    expect(jobOf().intent).toBeDefined();
+    // The note is there, and it has no transaction: nothing was signed, so nothing was sent.
+    expect(jobOf().intent?.slug).toBe(SLUGS[2]);
+    expect(jobOf().intent?.tx).toBeUndefined();
 
-    // A new process on the same journal and drafts. The intent is too young to call lost, so it
-    // looks at the chain, finds nothing, and waits. A minute is not enough either (the send may
-    // still land: N1); once the send has had its time twice and a margin it posts the third part.
+    // A new process on the same journal and drafts. It has nothing to wait for: no transaction of
+    // the third part exists, so it posts it, once, and the two hired are not hired again.
     const lines: string[] = [];
     const second = leadOf(world, {}, lines);
-    await second.tick();
-    expect(world.children).toHaveLength(2);
-    world.advance(61);
-    await second.tick();
-    expect(world.children).toHaveLength(2);
-    world.advance(240);
     await finish(second);
     expect(world.children).toHaveLength(3);
     expect(new Set(world.children.map((one) => one.input.briefHash)).size).toBe(3);
     expect(jobOf().status).toBe("done");
     expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
-    expect(lines.join("\n")).toMatch(/did not land/);
+    expect(lines.join("\n")).toMatch(/never signed/);
   });
 
   test("I2_a_post_whose_answer_was_lost_is_found_on_the_chain_and_not_posted_again", async () => {
@@ -1343,8 +1432,12 @@ describe("swarm fix: N2, a note the lead wrote before a post is still there afte
   });
 });
 
-describe("swarm fix: N1, a post is not called lost while it may still land", () => {
+describe("swarm fix: N1, a post is sent again only when its transaction cannot land", () => {
   const distinct = (world: World) => new Set(world.children.map((one) => one.input.briefHash)).size;
+  const postsOf = (world: World, n: number) =>
+    world.events.filter((event) => event === `post ${n}`).length;
+  const transient = () =>
+    new TenderError("E_TIMEOUT", "TenderClient.send timed out; the transaction may land");
 
   test("N1_a_slow_post_that_lands_after_a_minute_is_not_hired_twice", async () => {
     // Part 2 is sent; the client gives up after 120 s; the transaction, held up by congestion, lands
@@ -1359,81 +1452,243 @@ describe("swarm fix: N1, a post is not called lost while it may still land", () 
     world.settle();
     expect(world.children).toHaveLength(3);
     expect(distinct(world)).toBe(3);
-    expect(world.events.filter((event) => event === "post 1")).toHaveLength(1);
+    expect(postsOf(world, 1)).toBe(1);
     expect(jobOf().hires.map((one) => one.slug)).toEqual(SLUGS);
     expect(jobOf().status).toBe("done");
     expect(lines.join("\n")).toMatch(/part 02-key-audit was posted already, as task 12/);
     expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
   });
 
-  /**
-   * A post that never lands: the seconds, by the chain's clock, from when it was sent to when the
-   * lead sent it again.
-   */
-  async function secondsBeforeTheSecondPost(clientSays: number | undefined): Promise<number> {
-    let sentAgainAt = 0n;
+  test("N1_a_transaction_that_lands_long_after_any_time_limit_is_never_sent_again", async () => {
+    // It lands twenty hours after it was sent. No time limit is a proof that it will not: a
+    // transaction is includable until its reference block is a day old.
     const world = buildWorld({
-      sendTimeoutMs: clientSays,
-      slowPost: { n: 1, giveUpSecs: (clientSays ?? 120_000) / 1000, landsAfterSecs: 1_000_000 },
+      commitSecs: 100_000,
+      slowPost: { n: 1, giveUpSecs: 120, landsAfterSecs: 72_000 },
+    });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead, 3000, () => world.advance(600));
+    expect(world.children).toHaveLength(3);
+    expect(distinct(world)).toBe(3);
+    expect(postsOf(world, 1)).toBe(1);
+    expect(jobOf().status).toBe("done");
+  });
+
+  test("N1_a_transaction_that_failed_on_chain_is_sent_once_more_with_a_new_intent", async () => {
+    const error = new TenderError("E_UNKNOWN", "Exceeded the prepaid gas");
+    const hashes: Array<string | undefined> = [];
+    const world = buildWorld({
+      failedPost: { n: 1, times: 1, error },
       hooks: {
-        afterLand: (n) => {
-          if (n === 1) sentAgainAt = world.now();
+        beforeLand: (n) => {
+          if (n === 1) hashes.push(jobOf().intent?.tx?.txHash);
         },
+      },
+    });
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead);
+    expect(postsOf(world, 1)).toBe(2);
+    expect(world.children).toHaveLength(3);
+    expect(distinct(world)).toBe(3);
+    expect(jobOf().status).toBe("done");
+    expect(jobOf().failedPosts).toBeUndefined();
+    // Two intents, two transactions.
+    expect(hashes).toHaveLength(2);
+    expect(new Set(hashes).size).toBe(2);
+    expect(lines.join("\n")).toMatch(/failed on chain/);
+  });
+
+  test("N1_a_transaction_that_fails_on_chain_twice_ends_the_job_with_no_third_post", async () => {
+    const error = new TenderError("E_UNKNOWN", "Exceeded the prepaid gas");
+    const world = buildWorld({ failedPost: { n: 1, times: 5, error } });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead);
+    expect(postsOf(world, 1)).toBe(2);
+    expect(world.children).toHaveLength(1);
+    expect(jobOf().status).toBe("abandoned");
+    expect(jobOf().reason).toMatch(/failed on chain twice/);
+    for (let pass = 0; pass < 5; pass++) await lead.tick();
+    expect(postsOf(world, 1)).toBe(2);
+  });
+
+  test("N1_a_contract_refusal_found_by_the_status_ends_the_job_and_is_not_sent_again", async () => {
+    // The client only heard a timeout; the chain says the contract refused it.
+    const world = buildWorld({
+      failedPost: {
+        n: 1,
+        times: 5,
+        error: new TenderError("E_AUTH", "past the total cap"),
+        clientSees: transient(),
       },
     });
     const lead = leadOf(world);
     await enter(world, lead);
-    // The first send of part 2 is at 3 s of chain time (part 1's post took 3).
-    await finish(lead, 3000, () => world.advance(10));
-    expect(world.children).toHaveLength(3);
-    expect(distinct(world)).toBe(3);
-    expect(world.events.filter((event) => event === "post 1")).toHaveLength(2);
-    // The second post took 3 s of chain time itself: `sentAgainAt` is after it.
-    return Number((sentAgainAt - T0) / NS) - 3 - 3;
-  }
-
-  test("N1_a_post_that_never_lands_is_sent_again_only_after_the_send_had_its_time_twice_and_a_margin", async () => {
-    // 120 s for the send, as much again for the wait in the account's queue, and a minute.
-    const secs = await secondsBeforeTheSecondPost(undefined);
-    expect(secs).toBeGreaterThanOrEqual(300);
-    expect(secs).toBeLessThan(300 + 40);
+    await finish(lead);
+    expect(postsOf(world, 1)).toBe(1);
+    expect(world.children).toHaveLength(1);
+    expect(jobOf().status).toBe("abandoned");
+    expect(jobOf().reason).toContain("E_AUTH");
   });
 
-  test("N1_the_time_a_post_is_given_follows_what_the_client_says_its_sends_wait_for", async () => {
-    const secs = await secondsBeforeTheSecondPost(200_000);
-    expect(secs).toBeGreaterThanOrEqual(2 * 200 + 60);
-    expect(secs).toBeLessThan(2 * 200 + 60 + 40);
+  test("N1_a_part_still_unresolved_when_the_deadline_nears_is_given_up_and_never_posted_again", async () => {
+    // The transaction never lands, and the node never says it failed.
+    const world = buildWorld({ slowPost: { n: 1, giveUpSecs: 120, landsAfterSecs: 1_000_000 } });
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead, 3000, () => world.advance(60));
+    expect(postsOf(world, 1)).toBe(1);
+    expect(world.children).toHaveLength(1);
+    expect(jobOf().status).toBe("abandoned");
+    expect(jobOf().reason).toMatch(/unresolved/);
+    // The journal keeps what the lead could not settle, so that a person can look it up.
+    expect(jobOf().unresolved?.slug).toBe(SLUGS[1]);
+    expect(jobOf().unresolved?.tx?.txHash).toMatch(/^tx-1-/);
+    expect(jobOf().intent).toBeUndefined();
+    expect(lines.join("\n")).toMatch(/giving up on task 10/);
+    for (let pass = 0; pass < 5; pass++) await lead.tick();
+    expect(postsOf(world, 1)).toBe(1);
+    // The parent's entry is not stranded: its draft is the placeholder, and the runner reveals it.
+    const draft = await state.getDraft(String(PARENT_ID));
+    expect(Buffer.from(draft?.contentBase64 ?? "", "base64").toString()).toBe("placeholder");
+    expect(draft?.dead).toBeUndefined();
+    world.state.phase = "revealing";
+    await enter(world, lead);
+    expect(world.reveals).toHaveLength(1);
+  });
+
+  test("N1_a_signed_post_that_may_not_have_left_is_not_sent_again_either", async () => {
+    // The socket went after the transaction was signed: the lead cannot tell whether it left.
+    const world = buildWorld({ failPost: { n: 1, error: new Error("socket hang up") } });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead, 3000, () => world.advance(60));
+    expect(postsOf(world, 1)).toBe(1);
+    expect(jobOf().status).toBe("abandoned");
+    expect(jobOf().unresolved?.tx).toBeDefined();
+  });
+
+  test("N1_a_post_that_was_never_signed_is_sent_again_at_once", async () => {
+    // No transaction exists, so nothing can land: there is no time to wait out. No clock moves here.
+    const world = buildWorld({ signFails: { n: 1 } });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead);
+    expect(postsOf(world, 1)).toBe(2);
+    expect(world.children).toHaveLength(3);
+    expect(distinct(world)).toBe(3);
+    expect(jobOf().status).toBe("done");
+  });
+
+  test("N1_an_unsigned_post_is_not_called_unsent_before_the_look_through_the_chain_is_over", async () => {
+    // 1200 other tasks were made meanwhile. Even for a post that was never signed, the lead looks
+    // through them all (a few pages a pass) before it posts the part again.
+    const world = buildWorld({ signFails: { n: 1 }, crowd: 1200 });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await lead.tick();
+    await lead.tick();
+    expect(postsOf(world, 1)).toBe(1);
+    await finish(lead);
+    expect(postsOf(world, 1)).toBe(2);
+    expect(world.children).toHaveLength(3);
+    expect(Math.max(...world.pageReads)).toBeLessThanOrEqual(50);
+  });
+
+  test("N1_the_hash_and_the_reference_block_are_in_the_journal_before_the_transaction_is_sent", async () => {
+    const seen: Array<{ n: number; noted: JobTx["tx"]; signed: SignedTx }> = [];
+    const world = buildWorld({
+      hooks: { beforeLand: (n, signed) => seen.push({ n, noted: jobOf().intent?.tx, signed }) },
+    });
+    const lead = leadOf(world);
+    await enter(world, lead);
+    await finish(lead);
+    expect(seen.map((one) => one.n)).toEqual([0, 1, 2]);
+    for (const { noted, signed } of seen) {
+      expect(noted).toEqual({
+        txHash: signed.txHash,
+        publicKey: signed.publicKey,
+        nonce: String(signed.nonce),
+        blockHash: signed.blockHash,
+        blockHeight: String(signed.blockHeight),
+      });
+    }
+  });
+
+  test("N1_a_journal_that_cannot_note_the_hash_sends_nothing", async () => {
+    // The folder cannot be synced just when the lead is to write the hash down.
+    const disk = new PowerFs();
+    let sent = false;
+    const world = buildWorld({
+      hooks: {
+        beforeSign: (n) => {
+          if (n === 1) disk.failDirSync = new Error("EIO: input/output error");
+        },
+        beforeLand: (n) => {
+          if (n === 1) sent = true;
+        },
+      },
+    });
+    const lead = leadOf(world, { fs: disk });
+    await enter(world, lead);
+    await lead.tick();
+    expect(sent).toBe(false);
+    expect(world.children).toHaveLength(1);
+  });
+
+  test("N1_a_status_the_node_cannot_give_is_asked_again_and_not_taken_for_a_loss", async () => {
+    const world = buildWorld({ lostPost: { n: 1 }, failTxStatus: 1 });
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead);
+    expect(postsOf(world, 1)).toBe(1);
+    expect(world.children).toHaveLength(3);
+    expect(distinct(world)).toBe(3);
+    expect(lines.join("\n")).toMatch(/WARN task 10 \(hiring\) failed \(TenderError E_TIMEOUT\)/);
+  });
+
+  test("N1_a_node_that_forgot_the_transaction_is_backed_up_by_a_look_through_the_chain", async () => {
+    const world = buildWorld({ lostPost: { n: 1 }, forgetTxs: true });
+    const lines: string[] = [];
+    const lead = leadOf(world, {}, lines);
+    await enter(world, lead);
+    await finish(lead);
+    expect(postsOf(world, 1)).toBe(1);
+    expect(world.children).toHaveLength(3);
+    expect(lines.join("\n")).toMatch(/part 02-key-audit was posted already, as task 12/);
   });
 
   test("N1_a_post_among_hundreds_of_other_tasks_is_found_and_not_posted_again", async () => {
     // 260 tasks of other people were made on the chain before the lead's lost post landed, which is
     // more than a short look past the intent would read.
-    const world = buildWorld({ lostPost: { n: 1 }, crowd: 260 });
+    const world = buildWorld({ lostPost: { n: 1 }, crowd: 260, forgetTxs: true });
     const lines: string[] = [];
     const lead = leadOf(world, {}, lines);
     await enter(world, lead);
-    await finish(lead, 600, () => world.advance(10));
+    await finish(lead);
     expect(world.children).toHaveLength(3);
     expect(distinct(world)).toBe(3);
     expect(lines.join("\n")).toMatch(/part 02-key-audit was posted already, as task 272/);
     expect(jobOf().status).toBe("done");
   });
 
-  test("N1_a_look_through_the_chain_that_is_not_finished_is_not_proof_that_the_post_is_not_there", async () => {
+  test("N1_a_look_through_the_chain_that_is_not_finished_finds_the_post_on_a_later_pass", async () => {
     // 1200 other tasks, then the lead's. A pass reads a limited number of pages, so the post is
-    // found on the third; however old the intent, nothing is sent again before the look is over.
-    const world = buildWorld({ lostPost: { n: 1 }, crowd: 1200 });
+    // found on the third.
+    const world = buildWorld({ lostPost: { n: 1 }, crowd: 1200, forgetTxs: true });
     const lines: string[] = [];
     const lead = leadOf(world, {}, lines);
     await enter(world, lead);
     await lead.tick();
     expect(world.children).toHaveLength(2);
-    // Far older than a lost post is called, and inside the parent's commit window.
-    world.advance(400);
-    await lead.tick();
     await lead.tick();
     expect(world.children).toHaveLength(2);
-    expect(lines.join("\n")).not.toMatch(/did not land/);
+    expect(postsOf(world, 1)).toBe(1);
     await finish(lead);
     expect(world.children).toHaveLength(3);
     expect(distinct(world)).toBe(3);

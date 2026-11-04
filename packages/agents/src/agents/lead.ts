@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import type { TenderClient } from "@tender/client";
+import type { SignedTx, TenderClient } from "@tender/client";
 import { type Draft, isDraftOf, type StateStore } from "@tender/mcp";
 import {
   AccountIdSchema,
@@ -64,11 +64,17 @@ import type { Solver, TaskContext } from "../types";
 // is on the disk and its name is too (`writeFileAtomic`: temp file synced, renamed, folder synced);
 // a write that cannot be made so fails, and the post that waited on it is not sent.
 //
-// A post is sent again only when it provably is not there: the lead has looked through every task
-// made on the chain since the note and found no child of its own, and the note is older than the
-// client's send timeout twice over plus a minute (`reconcile`). A client that gave up on a send has
-// not seen it fail: under congestion the transaction can still land, and a part posted twice is
-// paid for twice.
+// A post is sent again only when its transaction cannot land. The client tells the lead the hash of
+// each transaction it signs, before it is sent (`beforeSend`), and the lead writes the hash and the
+// transaction's reference block down first; the chain's word on that hash decides: executed (the
+// child is the hire), failed on chain (sent once more with a new note if the contract did not refuse
+// it, and the job is given up if it fails again), or not final or unknown (it may still land: a
+// transaction is includable until its reference block is a day old, so no time limit says it will
+// not). In that case nothing is sent, and if the parent's commit deadline nears with the part
+// unresolved the job is given up and the part is not posted again, with the placeholder still the
+// parent's entry. A note without a transaction is a post that was never signed, which cannot have
+// been sent: it is made again. The lead also looks through the tasks made on the chain since the
+// note for a child of its own, which settles a hash the node has forgotten.
 //
 // A call that fails and says nothing of the chain (a timeout, a 5xx, a node that blinked) is tried
 // again, after a pause that doubles up to `maxBackoffMs`, until the parent's commit deadline; one
@@ -130,13 +136,8 @@ const DEFAULT_POLL_MS = 2_000;
 const DEFAULT_BACKOFF_MS = 1_000;
 /** The longest pause between two tries of a job that keeps failing, in milliseconds. */
 const DEFAULT_MAX_BACKOFF_MS = 30_000;
-/** What a client's send waits for, in milliseconds, when the client does not say: `TenderClient`'s. */
-const DEFAULT_SEND_TIMEOUT_MS = 120_000;
-/**
- * The chain seconds a post is given, on top of the time its send can take, before it is taken for
- * lost: a transaction that the client has stopped waiting for can still be in a block a little later.
- */
-const LOST_MARGIN_SECS = 60;
+/** How many times a post whose transaction failed on chain is sent once more: one. */
+const POST_RETRIES = 1;
 /** The tasks of one page of a look for a lost post: the most the contract's `get_tasks` gives. */
 const SCAN_PAGE = 50;
 /** The pages one pass reads when it looks for a lost post, so that a long look does not hold up the rest. */
@@ -155,8 +156,8 @@ export interface ChildWindows {
 /**
  * What the lead needs of a `TenderClient`: the network and contract its drafts are bound to, the
  * account it signs as, the commit, the post, the chain's clock, its own entry and the tasks on the
- * chain (to find a post that was lost, `taskCount` and `getTasks`), how long a send waits, and the
- * delegate key's caps and the vault (`view`, `balanceOf`).
+ * chain (to find a post that was lost, `taskCount` and `getTasks`), what became of a transaction
+ * (`txStatus`), and the delegate key's caps and the vault (`view`, `balanceOf`).
  */
 export type LeadChain = Pick<
   TenderClient,
@@ -169,12 +170,10 @@ export type LeadChain = Pick<
   | "getEntry"
   | "taskCount"
   | "getTasks"
+  | "txStatus"
   | "balanceOf"
   | "view"
-> & {
-  /** How long a send waits for its outcome, in milliseconds (`TenderClient` says; default 120000). */
-  readonly sendTimeoutMs?: number;
-};
+>;
 
 /** What the lead needs of the API: the sub-tasks it watches, and the uploads of a poster. */
 export type LeadApi = Pick<TenderApi, "getTask" | "getBlob" | "uploadBlob" | "uploadHeldout">;
@@ -425,14 +424,31 @@ interface Hire {
 }
 
 /**
+ * A transaction as the client signed it, noted before it is sent: the hash to ask the chain about,
+ * and the reference block, which says until when the transaction can still be included (the chain
+ * takes it while that block is less than `transaction_validity_period` blocks old, a day or so, and
+ * not after the key's nonce has passed its own).
+ */
+interface SignedPost {
+  txHash: string;
+  publicKey: string;
+  nonce: string;
+  blockHash: string;
+  blockHeight: string;
+}
+
+/**
  * A post the lead is about to send, written down first. `countBefore` is the chain's task count
- * before it, so that a lost post is looked for among the tasks made since; `at` is the chain's clock
- * in nanoseconds.
+ * before it, so that a post whose transaction is lost to the lead is looked for among the tasks
+ * made since; `at` is the chain's clock in nanoseconds. `tx` is added once the client has signed the
+ * transaction, before it is sent: an intent without it is a post that was never signed, so never
+ * sent.
  */
 interface Intent {
   slug: string;
   countBefore: string;
   at: string;
+  tx?: SignedPost;
 }
 
 /** One parent's job, as the journal keeps it. */
@@ -451,8 +467,15 @@ interface Job {
   /** In the order of the pack: `hires[i]` is for the i-th sub-task folder. */
   hires: Hire[];
   intent?: Intent;
+  /** The part whose post failed on chain, and how many times. */
+  failedPosts?: { slug: string; count: number };
   /** Why the job was given up. */
   reason?: string;
+  /**
+   * A post whose transaction was signed and never settled: it may still land. Kept when the job is
+   * given up, so that a person can look the transaction up.
+   */
+  unresolved?: Intent;
 }
 
 const isText = (value: unknown): value is string => typeof value === "string";
@@ -468,10 +491,33 @@ function isHire(value: unknown): value is Hire {
   );
 }
 
+function isSignedPost(value: unknown): value is SignedPost {
+  if (typeof value !== "object" || value === null) return false;
+  const t = value as Record<string, unknown>;
+  return (
+    isText(t.txHash) &&
+    isText(t.publicKey) &&
+    isText(t.nonce) &&
+    isText(t.blockHash) &&
+    isText(t.blockHeight)
+  );
+}
+
 function isIntent(value: unknown): value is Intent {
   if (typeof value !== "object" || value === null) return false;
   const i = value as Record<string, unknown>;
-  return isText(i.slug) && isText(i.countBefore) && isText(i.at);
+  return (
+    isText(i.slug) &&
+    isText(i.countBefore) &&
+    isText(i.at) &&
+    (i.tx === undefined || isSignedPost(i.tx))
+  );
+}
+
+function isFailedPosts(value: unknown): value is { slug: string; count: number } {
+  if (typeof value !== "object" || value === null) return false;
+  const f = value as Record<string, unknown>;
+  return isText(f.slug) && Number.isInteger(f.count) && (f.count as number) > 0;
 }
 
 /** Reads a job from the text of its file. The error names the file and never quotes it. */
@@ -498,6 +544,8 @@ function parseJob(text: string, file: string): Job {
     Array.isArray(j.hires) &&
     j.hires.every(isHire) &&
     (j.intent === undefined || isIntent(j.intent)) &&
+    (j.failedPosts === undefined || isFailedPosts(j.failedPosts)) &&
+    (j.unresolved === undefined || isIntent(j.unresolved)) &&
     (j.reason === undefined || isText(j.reason));
   if (!ok) throw new Error(`the lead's job file ${file} is corrupt: it is not a job`);
   return json as Job;
@@ -681,11 +729,6 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
   const posters = postersOf(o);
   // Resolved now, so that a later `chdir` cannot move the journal.
   const journalDir = resolve(o.journalDir);
-  // A post is not taken for lost before its send has had its time, twice (once for the wait in the
-  // account's send queue, behind the runner's own sends, which the intent's clock includes; once for
-  // the send itself), and a margin on top. See `reconcile`.
-  const sendSecs = Math.ceil((client.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS) / 1000);
-  const lostAfterNs = BigInt(2 * sendSecs + LOST_MARGIN_SECS) * NS_PER_SEC;
   /** Where each look for a lost post has got to, so that a pass goes on where the last stopped. */
   const scanned = new Map<string, bigint>();
 
@@ -861,6 +904,15 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
 
   // ---- The job: hiring
 
+  /** What the journal keeps of a signed transaction. */
+  const noteOf = (tx: SignedTx): SignedPost => ({
+    txHash: tx.txHash,
+    publicKey: tx.publicKey,
+    nonce: tx.nonce.toString(),
+    blockHash: tx.blockHash,
+    blockHeight: tx.blockHeight.toString(),
+  });
+
   /** Uploads a sub-task's documents and posts it under the job's parent. Gives the job with the hire. */
   async function hire(start: Job, spec: ChildSpec): Promise<Job> {
     const upload = async (kind: "brief" | "criteria", doc: Doc): Promise<string> => {
@@ -883,8 +935,11 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
     if (meta.symbol === start.token) {
       throw new Error(`the decimals of ${start.token} are unknown on ${client.network}`);
     }
-    // Written down before it is sent, so that a restart that finds it can ask the chain whether the
-    // post landed, and never posts the part twice.
+    // Written down before it is signed, and again, with the transaction's hash and reference block,
+    // after it is signed and before it is sent (the client's `beforeSend`, which can stop the send
+    // by throwing). A restart that finds the note can then ask the chain what became of that very
+    // transaction, and never posts the part twice. A note without a transaction is a post that was
+    // never signed.
     const intent: Intent = {
       slug: spec.slug,
       countBefore: (await client.taskCount()).toString(),
@@ -910,39 +965,89 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
         parent: BigInt(start.parent),
       },
       { delegate: true },
+      {
+        beforeSend: async (tx) => {
+          await save({ ...start, intent: { ...intent, tx: noteOf(tx) } });
+        },
+      },
     );
     log(`hired for part ${spec.slug}: task ${posted.taskId}`);
     return save({
       ...start,
       intent: undefined,
+      failedPosts: undefined,
       hires: [...start.hires, { slug: spec.slug, id: posted.taskId.toString() }],
     });
   }
 
   /**
-   * Settles an intent the job holds: asks the chain whether the post landed, and re-posts only when
-   * it provably did not.
+   * Settles an intent the job holds: finds out what became of the post, and sends it again only if
+   * it cannot have landed and cannot land. Gives the job as it is after, or null if the post is
+   * unresolved: it may still land, and nothing is sent.
    *
-   * A task of the lead's, under the parent, with the part's brief, made since the intent is the
-   * hire. The chain is the authority, read as final blocks (the API's index trails it, so it cannot
-   * show that a post is missing). The look goes through every task made since the intent, a few
-   * pages a pass, and goes on where it stopped; a look that is not over proves nothing.
+   * Time is no evidence. A transaction stays includable until its reference block is a day old
+   * (`SignedPost`), so a client's timeout, or any wait after it, says nothing of whether it will
+   * land. What is evidence is the chain's word on the very transaction that was signed, which the
+   * intent names by its hash:
    *
-   * A post is lost only if the look is over and the intent is old enough. A send may take
-   * `sendTimeoutMs` after its turn in the account's queue, where it can wait behind one send of the
-   * runner's, and the client's timeout then says only that it stopped waiting: the transaction may
-   * still be in flight. The post is given both times and a margin (`lostAfterNs`) before it is taken
-   * for lost, and what happens after that is a transaction that was held back for longer than that.
-   * The clock is read before the count and the count before the tasks, so that a task that is in a
-   * block by the time the clock says is read.
+   * - executed: the post landed. The new task's id is in its outcome, and that is the hire.
+   * - failed on chain: nothing it did is kept. A refusal by the contract (`E_AUTH`, `E_PARENT`...)
+   *   would be met again, and ends the job; any other failure (gas, a key) is sent once more,
+   *   with a new intent, and ends the job if it fails again (`POST_RETRIES`).
+   * - unknown or pending: it may still land. Nothing is sent. The job waits, and is given up if
+   *   the parent's commit deadline comes near before the post settles (`hiring`).
    *
-   * Null: it is too soon to say, and the job is looked at again later.
+   * Besides, the lead looks through the tasks made on the chain since the note for a child of its
+   * own under the parent with the part's brief, which covers a node that no longer remembers the
+   * transaction (a node keeps a few days) or an answer that could not be read. The chain is the
+   * authority, read as final blocks (the API's index trails it); the look goes through every task,
+   * a few pages a pass, and goes on where it stopped, and a look that is not over proves nothing.
+   *
+   * An intent without a transaction was never signed, so never sent: once the look finds nothing
+   * it is cleared, and the part is posted at once.
    */
   async function reconcile(job: Job): Promise<Job | null> {
     const intent = job.intent;
     const spec = specs.find((one) => one.slug === intent?.slug);
     if (intent === undefined || spec === undefined) return save({ ...job, intent: undefined });
-    const now = await client.blockTimestampNs();
+    const hired = (id: string, how: string): Promise<Job> => {
+      scanned.delete(`${job.parent}/${intent.slug}/${intent.countBefore}`);
+      log(`part ${spec.slug} was posted already, as task ${id} (${how})`);
+      return save({
+        ...job,
+        intent: undefined,
+        failedPosts: undefined,
+        hires: [...job.hires, { slug: spec.slug, id }],
+      });
+    };
+
+    if (intent.tx !== undefined) {
+      const status = await client.txStatus(intent.tx.txHash, job.account);
+      if (status.kind === "executed") {
+        const id = U64StringSchema.parse(status.result.returnValue);
+        return hired(id, `transaction ${intent.tx.txHash}`);
+      }
+      if (status.kind === "failed") {
+        if (refused(status.error)) {
+          return abandon(
+            { ...job, intent: undefined },
+            `the contract refused part ${spec.slug} (${describe(status.error)}, transaction ${intent.tx.txHash})`,
+          );
+        }
+        const count = (job.failedPosts?.slug === spec.slug ? job.failedPosts.count : 0) + 1;
+        if (count > POST_RETRIES) {
+          return abandon(
+            { ...job, intent: undefined },
+            `the post for part ${spec.slug} failed on chain twice (${describe(status.error)}, transaction ${intent.tx.txHash})`,
+          );
+        }
+        log(
+          `the post for part ${spec.slug} failed on chain (${describe(status.error)}); it will be sent once more`,
+        );
+        return save({ ...job, intent: undefined, failedPosts: { slug: spec.slug, count } });
+      }
+    }
+
     const count = await client.taskCount();
     const key = `${job.parent}/${intent.slug}/${intent.countBefore}`;
     let next = scanned.get(key) ?? BigInt(intent.countBefore) + 1n;
@@ -958,22 +1063,14 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
           task.parent === job.parent &&
           task.brief_hash === spec.brief.hash,
       );
-      if (found !== undefined) {
-        scanned.delete(key);
-        log(`part ${spec.slug} was posted already, as task ${found.id}`);
-        return save({
-          ...job,
-          intent: undefined,
-          hires: [...job.hires, { slug: spec.slug, id: found.id }],
-        });
-      }
+      if (found !== undefined) return hired(found.id, "found on the chain");
       next = BigInt(last.id) + 1n;
     }
     scanned.set(key, next);
     if (next <= count) return null;
-    if (now - BigInt(intent.at) < lostAfterNs) return null;
+    if (intent.tx !== undefined) return null;
     scanned.delete(key);
-    log(`the post for part ${spec.slug} did not land; it will be sent again`);
+    log(`the post for part ${spec.slug} was never signed, so never sent; it will be made again`);
     return save({ ...job, intent: undefined });
   }
 
@@ -982,7 +1079,16 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
     const deadline = BigInt(job.commitDeadline);
     if (job.intent !== undefined) {
       const settled = await reconcile(job);
-      if (settled === null) return job;
+      if (settled === null) {
+        // The post may still land, so nothing is sent. If the parent's deadline comes near with the
+        // part unresolved, the job is given up, and the part is not posted again.
+        const why = fits(await client.blockTimestampNs(), deadline, specs.slice(job.hires.length));
+        if (why !== null) {
+          return abandon(job, `the post for part ${job.intent.slug} is unresolved and ${why}`);
+        }
+        return job;
+      }
+      if (settled.status !== "hiring") return settled;
       job = settled;
     }
     // A sub-task can name the parent only if the lead has an entry on it: the placeholder.
@@ -1134,11 +1240,21 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
    * already hired settle on their own and are paid to their winners.
    */
   async function abandon(job: Job, why: string): Promise<Job> {
-    const ended = await save({ ...job, intent: undefined, status: "abandoned", reason: why });
+    const ended = await save({
+      ...job,
+      intent: undefined,
+      unresolved: job.intent,
+      status: "abandoned",
+      reason: why,
+    });
     const paid = job.hires.length;
     const spent =
       paid === 0 ? "nothing was spent" : `${paid} sub-task(s) are paid for and settle on their own`;
-    log(`giving up on task ${job.parent}: ${why}; no more is spent (${spent})`);
+    const open =
+      job.intent?.tx === undefined
+        ? ""
+        : `; the post for part ${job.intent.slug} (transaction ${job.intent.tx.txHash}) may still land and is not sent again`;
+    log(`giving up on task ${job.parent}: ${why}; no more is spent (${spent})${open}`);
     return ended;
   }
 
