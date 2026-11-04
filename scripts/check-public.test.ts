@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,17 +31,46 @@ import { describe, expect, test } from "vitest";
 //
 // A finding is told by file, line and rule, never by the text it matched: the text is the secret.
 //
-// The owner's address is not written in this file, or in any other. The patterns below are built
-// from parts at run time, so that this test, which the scan reads like any other file, does not
+// The owner's address is not written in this file, or in any other: this file holds it only as
+// hashes, the SHA-256 of the whole address and of its domain. The scan hashes each e-mail-shaped
+// token it reads and compares, so that this test, which the scan reads like any other file, does not
 // hold what it looks for.
 
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 
-/** The owner's address in two parts, joined only inside the patterns. */
-const OWNER_LOCAL_PART = "[redacted]";
-const OWNER_DOMAIN = "[redacted]";
+/** The SHA-256 (lowercase hex) of the owner's whole address, in lower case. */
+const OWNER_ADDRESS_SHA256 = "95a87ca85f5a08cb3b881ba39a148e6b96249e4e9476a442ce7d9c7bb9672b18";
+/** The SHA-256 (lowercase hex) of the domain of the owner's address (what follows the `@`), in lower case. */
+const OWNER_DOMAIN_SHA256 = "376fc76693d462c543402be957235f739e54f9067f40182f1b3a9b14b597631e";
 
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** The two hashes the owner's address is told by. */
+interface OwnerHashes {
+  address: string;
+  domain: string;
+}
+
+const OWNER_HASHES: OwnerHashes = { address: OWNER_ADDRESS_SHA256, domain: OWNER_DOMAIN_SHA256 };
+
+const sha256Hex = (text: string): string => createHash("sha256").update(text).digest("hex");
+
+/**
+ * The shape of an e-mail address, `local@domain.tld`. The lookbehind keeps the scan of a long line
+ * linear: a token is tried only from the start of a run of local-part characters.
+ */
+const EMAIL_SHAPED =
+  /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g;
+
+/**
+ * The e-mail-shaped tokens of a line, in lower case, whose hash is `hash` as a whole address
+ * (`part` "address") or as a domain, the text after the `@` (`part` "domain").
+ */
+function addressesHashing(line: string, part: keyof OwnerHashes, hash: string): string[] {
+  if (!line.includes("@")) return [];
+  return Array.from(line.matchAll(EMAIL_SHAPED), (token) => token[0].toLowerCase()).filter(
+    (address) =>
+      sha256Hex(part === "address" ? address : address.slice(address.indexOf("@") + 1)) === hash,
+  );
+}
 
 /** What a rule knows about a match when it is asked whether the match is public data after all. */
 interface Match {
@@ -51,12 +81,16 @@ interface Match {
   signatures: () => ReadonlySet<string>;
 }
 
+/** How a rule finds its matches in one line: by a pattern, or by a function that returns the texts. */
+type Finder =
+  | { pattern: RegExp; match?: undefined }
+  | { match: (line: string) => readonly string[]; pattern?: undefined };
+
 /** One thing to look for in the text of a file. */
-interface Rule {
+type Rule = Finder & {
   name: string;
-  pattern: RegExp;
   excused?: (match: Match) => boolean;
-}
+};
 
 /**
  * The keys that hold a signature in a block of the chain: a transaction's or a block header's
@@ -107,15 +141,22 @@ function isPlaceholder(value: string): boolean {
   );
 }
 
+/** The two rules for the owner's address, told by hash alone (the real hashes unless a test gives its own). */
+function ownerRules(hashes: OwnerHashes = OWNER_HASHES): Rule[] {
+  return [
+    {
+      name: "the owner's email address",
+      match: (line) => addressesHashing(line, "address", hashes.address),
+    },
+    {
+      name: "an address at the owner's email domain",
+      match: (line) => addressesHashing(line, "domain", hashes.domain),
+    },
+  ];
+}
+
 const RULES: readonly Rule[] = [
-  {
-    name: "the owner's email address",
-    pattern: new RegExp(escapeRegExp(`${OWNER_LOCAL_PART}@${OWNER_DOMAIN}`), "i"),
-  },
-  {
-    name: "an address at the owner's email domain",
-    pattern: new RegExp(`@${escapeRegExp(OWNER_DOMAIN)}`, "i"),
-  },
+  ...ownerRules(),
   {
     // A NEAR secret key is 64 bytes, 87 or 88 base58 characters. So is an ed25519 signature, and a
     // block of the chain that is kept as a test fixture carries many of them, as `signature` values
@@ -181,8 +222,18 @@ function forbiddenPath(path: string): string | null {
   return null;
 }
 
+/** The texts a rule matches in one line. */
+function matchesIn(rule: Rule, line: string): readonly string[] {
+  if (rule.match !== undefined) return rule.match(line);
+  const global = new RegExp(rule.pattern.source, `${rule.pattern.flags.replace("g", "")}g`);
+  return Array.from(line.matchAll(global), (found) => found[0]);
+}
+
 /** What is wrong with the files, as lines that name a path (and a line number), never the text. */
-function findProblems(files: ReadonlyMap<string, string | null>): string[] {
+function findProblems(
+  files: ReadonlyMap<string, string | null>,
+  rules: readonly Rule[] = RULES,
+): string[] {
   const problems: string[] = [];
   for (const [path, text] of files) {
     const why = forbiddenPath(path);
@@ -194,12 +245,11 @@ function findProblems(files: ReadonlyMap<string, string | null>): string[] {
       return signatures;
     };
     const lines = text.split("\n");
-    for (const rule of RULES) {
+    for (const rule of rules) {
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i] ?? "";
-        const global = new RegExp(rule.pattern.source, `${rule.pattern.flags.replace("g", "")}g`);
-        for (const match of line.matchAll(global)) {
-          const shown: Match = { path, text: match[0], signatures: signaturesOfFile };
+        for (const text of matchesIn(rule, line)) {
+          const shown: Match = { path, text, signatures: signaturesOfFile };
           if (rule.excused?.(shown) === true) continue;
           problems.push(`${path}:${i + 1}: ${rule.name}`);
         }
@@ -284,23 +334,38 @@ describe("the rules of the scan, on invented files", () => {
     ]);
   });
 
-  test("the owner's address and its domain are found, in any case", () => {
-    const address = `${OWNER_LOCAL_PART}@${OWNER_DOMAIN}`;
+  test("an address and its domain are found by their hashes, in any case", () => {
+    // An invented owner: the mechanism is the one the real hashes go through.
+    const hashes: OwnerHashes = {
+      address: sha256Hex("someone@example.org"),
+      domain: sha256Hex("example.org"),
+    };
     const found = findProblems(
       new Map([
-        ["a.md", `write to ${address}\n`],
-        ["b.md", `${address.toUpperCase()}\n`],
-        ["c.md", `team@${OWNER_DOMAIN}\n`],
+        ["a.md", "write to someone@example.org\n"],
+        ["b.md", "SomeOne@EXAMPLE.org\n"],
+        ["c.md", "mail team@example.org.\n"],
         ["d.md", "write to someone@example.com\n"],
+        ["e.md", "example.org, someone and an @ sign\n"],
       ]),
+      ownerRules(hashes),
     );
     expect(found).toEqual([
       "a.md:1: the owner's email address",
       "a.md:1: an address at the owner's email domain",
       "b.md:1: the owner's email address",
       "b.md:1: an address at the owner's email domain",
+      // Another address at the same domain: the domain alone is enough.
       "c.md:1: an address at the owner's email domain",
     ]);
+  });
+
+  test("the owner's address is held as two SHA-256 digests, and an invented address is not found by them", () => {
+    expect(OWNER_ADDRESS_SHA256).toMatch(/^[0-9a-f]{64}$/);
+    expect(OWNER_DOMAIN_SHA256).toMatch(/^[0-9a-f]{64}$/);
+    expect(OWNER_ADDRESS_SHA256).not.toBe(OWNER_DOMAIN_SHA256);
+    // The default rules (the real hashes) leave an address that is not the owner's alone.
+    expect(findProblems(new Map([["a.md", "write to someone@example.org\n"]]))).toEqual([]);
   });
 
   test("a private key is found, a signature in a fixture is not, and a finding never shows the text", () => {
@@ -339,7 +404,7 @@ describe("the rules of the scan, on invented files", () => {
   });
 
   test("a PEM private key and a Telegram bot token are found", () => {
-    // Written in parts, like the address: this file is scanned too.
+    // Written in parts: this file is scanned too.
     const pemHeader = (kind: string) =>
       ["-----BEGIN", kind, "-----"].join(" ").replace(" -----", "-----");
     const token = `${"1234567890".slice(0, 9)}:${"AbC-dEf_".repeat(5).slice(0, 35)}`;
@@ -360,7 +425,7 @@ describe("the rules of the scan, on invented files", () => {
   });
 
   test("the shapes of common service credentials are found, and the fakes of tests are not", () => {
-    // Written in parts, like the address: this file is scanned too.
+    // Written in parts: this file is scanned too.
     const a = (n: number) => "A1b2C3d4E5".repeat(Math.ceil(n / 10)).slice(0, n);
     const found = findProblems(
       new Map([
