@@ -108,7 +108,12 @@ function fake(over: Partial<World> = {}) {
     },
     registerAgent: async () => {
       log.push("register");
-      const takes = world.agent === null || world.agent.status === "retired";
+      // As the contract does after its bond fix round: a new agent pays, a retired one coming back,
+      // and an active one that holds no bond. An active one that holds its bond pays nothing.
+      const takes =
+        world.agent === null ||
+        world.agent.status === "retired" ||
+        (world.agent.status === "active" && world.agent.bond_amount === null);
       if (takes) world.vault -= BOND;
       world.agent = agentView();
       return { txHash: "TX", events: [], returnValue: undefined, receipts: [] };
@@ -153,11 +158,14 @@ test("the_plan_of_a_new_agent_shows_the_bond_it_lacks", async () => {
   });
 });
 
-test("the_plan_takes_a_bond_from_a_new_or_retired_agent_and_not_from_an_active_one", async () => {
+test("the_plan_takes_a_bond_from_a_new_retired_or_bond_free_agent_and_not_from_a_bonded_one", async () => {
   for (const [agent, takes] of [
     [null, true],
     [agentView({ status: "retired", bond_token: null, bond_amount: null }), true],
+    // An agent that registered before the owner set a bond holds none: its next registration pays.
+    [agentView({ status: "active", bond_token: null, bond_amount: null }), true],
     [agentView({ status: "active" }), false],
+    [agentView({ status: "active", locked_until: "1793745956336648000" }), false],
     [agentView({ status: "unregistering", claimable_at: "5" }), false],
   ] as const) {
     const { client } = fake({ agent });
@@ -275,6 +283,26 @@ test("an_active_agent_updates_without_a_bond", async () => {
   const updated = await registerWithBond(client, profile);
   expect(updated.deposited).toBe(0n);
   expect(log).toEqual(["key register_agent", "register"]);
+  expect(world.vault).toBe(0n);
+});
+
+test("an_active_agent_that_holds_no_bond_pays_it_at_its_next_registration", async () => {
+  // It registered before the owner set a bond. The contract takes the bond at the next
+  // register_agent, so the vault is filled first, after a yes.
+  const agent = agentView({ status: "active", bond_token: null, bond_amount: null });
+  const { client, log, world } = fake({ agent, vault: 0n, wallet: 3n * BOND });
+  await expect(registerWithBond(client, profile)).rejects.toMatchObject({ code: "E_FUNDS" });
+  expect(log).toEqual(["key register_agent"]);
+
+  const paid = await registerWithBond(client, profile, yes);
+  expect(paid.deposited).toBe(BOND);
+  expect(paid.plan.takesBond).toBe(true);
+  expect(log).toEqual([
+    "key register_agent",
+    "key register_agent",
+    `deposit ${BOND} ${TOKEN}`,
+    "register",
+  ]);
   expect(world.vault).toBe(0n);
 });
 

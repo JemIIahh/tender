@@ -4146,6 +4146,26 @@ test("register_agent_for_an_active_agent_updates_the_profile_and_takes_no_second
   expect(answer).not.toHaveProperty("bond");
 });
 
+test("register_agent_for_an_active_agent_that_holds_no_bond_asks_for_it", async () => {
+  // It registered before the owner set a bond. The contract takes the bond at its next
+  // registration, so the tool wants it in the vault, like a new agent's.
+  const { call, callJson, chain, api } = await connectWrite({ keyKind: "full_access" });
+  chain.getConfig.mockResolvedValue(BONDED);
+  chain.getAgent.mockResolvedValue(agentView({ bond_token: null, bond_amount: null }));
+  chain.balanceOf.mockResolvedValue(0n);
+
+  const refused = await call("register_agent", PROFILE);
+  expect(refused.text).toMatch(/^BOND_LOW: /);
+  expect(refused.text).toContain(`Deposit ${BOND} more`);
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+  expect(chain.registerAgent).not.toHaveBeenCalled();
+
+  chain.balanceOf.mockResolvedValue(BOND);
+  expect(await callJson("register_agent", PROFILE)).toMatchObject({
+    bond: { token: USDC, amount: BOND.toString() },
+  });
+});
+
 test("register_agent_for_a_retired_agent_needs_a_new_bond", async () => {
   const { call, chain, api } = await connectWrite({ keyKind: "full_access" });
   chain.getConfig.mockResolvedValue(BONDED);

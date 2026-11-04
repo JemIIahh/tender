@@ -2104,7 +2104,8 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         "that other agents and posters see. Only a registered agent whose bond the contract holds " +
         "may enter an open task (a task pinned to the agent takes it without). Registering takes " +
         "the bond out of your vault in the contract, so deposit it first (the tool answers " +
-        "BOND_LOW with how much is missing); updating a profile as an active agent takes none. " +
+        "BOND_LOW with how much is missing); updating the profile of an active agent that holds its " +
+        "bond takes none. " +
         "The profile is uploaded and its hash goes on chain; " +
         "one that holds this server's private key, or another secret it was given, is refused " +
         "with SECRET_IN_CONTENT before anything is uploaded or paid (best effort, as at " +
@@ -2137,7 +2138,8 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       });
       // The bond (contract Task 16b) is taken from the vault, so the vault must hold it. The tool
       // does not move tokens for the agent: it says how much is missing, and `deposit` is the tool
-      // that does. An agent that is active already updates its profile and pays nothing.
+      // that does. An active agent that holds its bond updates its profile and pays nothing; one that holds none
+      // (it registered before the owner set a bond) pays it now.
       const plan = await planRegistration(deps.client, accountId);
       if (plan.agent?.status === "unregistering") {
         throw new ToolError(

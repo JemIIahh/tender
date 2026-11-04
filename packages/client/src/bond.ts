@@ -46,9 +46,10 @@ export interface RegistrationPlan {
   /** The bond in force, or null if the owner has set none. */
   terms: BondTerms | null;
   /**
-   * Whether this registration pays the bond: a new agent does, and a retired one coming back. An
-   * active agent updating its profile pays nothing. An unregistering one is refused (it claims its
-   * bond first), which `registerWithBond` says before it moves anything.
+   * Whether this registration pays the bond: a new agent does, a retired one coming back, and an
+   * active one that holds no bond (it registered before the owner set one). An active agent that
+   * holds its bond, updating its profile, pays nothing. An unregistering one is refused (it claims
+   * its bond first), which `registerWithBond` says before it moves anything.
    */
   takesBond: boolean;
   /** What the account's vault holds of the bond token (0 when there is no bond). */
@@ -59,6 +60,17 @@ export interface RegistrationPlan {
   wallet: bigint | null;
   /** The yoctoNEAR the account's storage balance with Tender lacks to register: 0 if none. */
   storageShortfall: bigint;
+}
+
+/**
+ * Whether registering takes the bond in force from `agent` (a bond is set): a new agent pays it, a
+ * retired one coming back, and an active one that holds none, which registered before the owner set
+ * a bond. An active agent that holds its bond updating its profile pays nothing, and an
+ * unregistering one is refused (it claims its bond first).
+ */
+function paysBond(agent: AgentView | null): boolean {
+  if (agent === null || agent.status === "retired") return true;
+  return agent.status === "active" && (agent.bond_token === null || agent.bond_amount === null);
 }
 
 /** What `planRegistration` reads of the chain: views only, so a server that holds less than a whole client can ask. */
@@ -82,7 +94,7 @@ export async function planRegistration(
     client.storageBalanceOf(account),
   ]);
   const terms = bondTermsOf(config);
-  const takesBond = terms !== null && (agent === null || agent.status === "retired");
+  const takesBond = terms !== null && paysBond(agent);
   let vault = 0n;
   let shortfall = 0n;
   let wallet: bigint | null = null;
@@ -180,7 +192,8 @@ export interface Registration {
  * 4. sends `register_agent` with 1 yoctoNEAR, which only a full-access key can (the client refuses
  *    any other, as `TenderClient.registerAgent` does), and reads the agent back.
  *
- * An active agent updating its profile pays no bond, so only the storage can be short for it.
+ * An active agent that holds its bond, updating its profile, pays no bond, so only the storage can
+ * be short for it.
  */
 export async function registerWithBond(
   client: TenderClient,
