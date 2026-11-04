@@ -19,9 +19,8 @@ import { fileURLToPath } from "node:url";
  *   <private dir>/<slug>/known-wrong.json the solution with one rule broken, as a few wrong
  *                                         answers (a regex_cases or tests seed only)
  *
- * the private half. The tracked demo set in
- * `scripts/demo-seeds/` and the swarm pack are the demos' own and public in full, and need none of
- * this.
+ * The tracked demo set in `scripts/demo-seeds/` and the swarm pack are the demos' own and public
+ * in full, and need none of this.
  *
  * The directory is `$TENDER_SEEDS_PRIVATE_DIR` when that is set, else `seeds-private/` in the
  * repository, which git ignores.

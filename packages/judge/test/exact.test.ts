@@ -57,12 +57,12 @@ test("normalize_trim_lowercase_collapse", () => {
 
 test("any_of_expected", () => {
   const c = criteria(["trim", "lowercase", "collapse_ws"]);
-  const expected = heldout("[redacted]", "[redacted]");
+  const expected = heldout("7,23", "7, 23");
 
-  expect(scoreExact(c, expected, bytes("[redacted]")).score).toBe(100);
-  expect(scoreExact(c, expected, bytes("[redacted]")).score).toBe(100);
-  expect(scoreExact(c, expected, bytes(" 10,  14\n")).score).toBe(100);
-  expect(scoreExact(c, expected, bytes("10 ,14")).score).toBe(0);
+  expect(scoreExact(c, expected, bytes("7,23")).score).toBe(100);
+  expect(scoreExact(c, expected, bytes("7, 23")).score).toBe(100);
+  expect(scoreExact(c, expected, bytes(" 7,  23\n")).score).toBe(100);
+  expect(scoreExact(c, expected, bytes("7 ,23")).score).toBe(0);
 });
 
 test("invalid_utf8_scores_zero", () => {

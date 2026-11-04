@@ -685,7 +685,7 @@ describe.each(SLUGS)("seed %s", (slug) => {
 
     if (criteria.kind === "json_schema" && "json_schema" in heldout) {
       // A json_schema task publishes a schema and no examples, but its brief explains the rules
-      // with values of its own ("8,000.50 naira is [redacted] kobo"), and one of them can be a value
+      // with values of its own ("1,234.50 naira is 123450 kobo"), and one of them can be a value
       // the key holds. Nothing the key asserts may be shown in the words above the data block: the
       // data is the question. Short values are left out, as they turn up in any text ("Ada" in
       // "adapt", 2 in "2 decimals"): a string of 4 characters or more, a number of 4 digits or more.
@@ -695,7 +695,7 @@ describe.each(SLUGS)("seed %s", (slug) => {
         brief.instructions.split("-----BEGIN DATA-----")[0] ?? "",
       ].join("\n");
       const text = prose.toLowerCase();
-      // "8,000.50" is the number 8000.5: thousands commas go, and every other number is read whole.
+      // "1,234.50" is the number 1234.5: thousands commas go, and every other number is read whole.
       const shown = new Set(
         (prose.replace(/(\d),(?=\d{3}\b)/g, "$1").match(/\d+(?:\.\d+)?/g) ?? []).map(Number),
       );

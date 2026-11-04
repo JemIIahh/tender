@@ -38,15 +38,15 @@ const INVOICE_SCHEMA = {
 };
 
 const INVOICE = {
-  invoice_number: "INV-2026-00417",
-  issue_date: "[redacted]",
-  currency: "USD",
+  invoice_number: "INV-2031-00852",
+  issue_date: "2031-07-09",
+  currency: "EUR",
   line_items: [
-    { description: "Pallet wrapping film", quantity: 12, amount: 228 },
-    { description: "Container handling", quantity: 3, amount: 735 },
-    { description: "Cold storage (per day)", quantity: 5, amount: 277.5 },
+    { description: "Crate rental", quantity: 7, amount: 140 },
+    { description: "Forklift hire", quantity: 2, amount: 410 },
+    { description: "Chilled storage (per day)", quantity: 4, amount: 187.5 },
   ],
-  total: 1240.5,
+  total: 737.5,
   note: null,
 };
 
@@ -69,9 +69,9 @@ const json = (value: unknown): Uint8Array => bytes(JSON.stringify(value));
 
 /** The three held-out checks of the invoice; the document `INVOICE` satisfies all of them. */
 const INVOICE_CHECKS = heldout(
-  check("$.invoice_number", "INV-2026-00417"),
-  check("$.line_items[1].quantity", 3),
-  check("$.total", 1240.5),
+  check("$.invoice_number", "INV-2031-00852"),
+  check("$.line_items[1].quantity", 2),
+  check("$.total", 737.5),
 );
 
 /** Scores `document` against the schema `{}` (anything fits) and one held-out check. */
@@ -188,10 +188,10 @@ afterEach(() => {
 
 test("schema_failure_scores_zero_with_errors", () => {
   // Both held-out checks hold in every document below, so only the schema can score one 0.
-  const checks = heldout(check("$.note", null), check("$.line_items[0].quantity", 12));
+  const checks = heldout(check("$.note", null), check("$.line_items[0].quantity", 7));
 
   // One violation: one error, written `instancePath message`.
-  const oneError = { ...INVOICE, total: "1240.5" };
+  const oneError = { ...INVOICE, total: "737.5" };
   expect(scoreJsonSchema(criteria(), checks, json(oneError))).toEqual({
     score: 0,
     passed: false,
@@ -205,7 +205,7 @@ test("schema_failure_scores_zero_with_errors", () => {
     extra: true,
     issue_date: "2026-02-31",
     currency: "usd",
-    total: "1240.5",
+    total: "737.5",
   };
   expect(scoreJsonSchema(criteria(), checks, json(manyErrors))).toEqual({
     score: 0,
@@ -219,7 +219,7 @@ test("schema_failure_scores_zero_with_errors", () => {
 
   // Deep inside the document, and a missing property.
   const nested = structuredClone(INVOICE);
-  nested.line_items[1] = { description: "Container handling", quantity: 3, amount: "735" as never };
+  nested.line_items[1] = { description: "Forklift hire", quantity: 2, amount: "410" as never };
   expect(scoreJsonSchema(criteria(), checks, json(nested)).reasons).toEqual([
     "/line_items/1/amount must be number",
   ]);
@@ -231,18 +231,18 @@ test("schema_failure_scores_zero_with_errors", () => {
 
 test("partial_assertions_round", () => {
   // The document fits the schema, and one of the three checked values is wrong.
-  expect(scoreJsonSchema(criteria(), INVOICE_CHECKS, json({ ...INVOICE, total: 1240 }))).toEqual({
+  expect(scoreJsonSchema(criteria(), INVOICE_CHECKS, json({ ...INVOICE, total: 737 }))).toEqual({
     score: 67,
     passed: false,
-    reasons: ["$.total expected 1240.5"],
+    reasons: ["$.total expected 737.5"],
   });
 
   // One reason per failed check, in the order of the held-out document.
-  const twoWrong = { ...INVOICE, invoice_number: "INV-1", total: 1240 };
+  const twoWrong = { ...INVOICE, invoice_number: "INV-1", total: 737 };
   expect(scoreJsonSchema(criteria(), INVOICE_CHECKS, json(twoWrong))).toEqual({
     score: 33,
     passed: false,
-    reasons: ['$.invoice_number expected "INV-2026-00417"', "$.total expected 1240.5"],
+    reasons: ['$.invoice_number expected "INV-2031-00852"', "$.total expected 737.5"],
   });
 
   // Rounding: .5 goes up.
@@ -282,22 +282,22 @@ test("array_index_paths", () => {
 
 test("deep_equal_objects", () => {
   const document = {
-    line_items: [{ description: "Customs paperwork", quantity: 1, amount: 150 }],
+    line_items: [{ description: "Courier surcharge", quantity: 1, amount: 60 }],
     tags: ["x", "y"],
     nested: { a: { b: [1, { c: true }] } },
     note: null,
   };
   const item = "$.line_items[0]";
-  const same = { description: "Customs paperwork", quantity: 1, amount: 150 };
+  const same = { description: "Courier surcharge", quantity: 1, amount: 60 };
 
   // Objects are equal by key set and values, whatever the order of the keys.
   expect(single(document, item, same).score).toBe(100);
   expect(
-    single(document, item, { amount: 150, quantity: 1, description: same.description }).score,
+    single(document, item, { amount: 60, quantity: 1, description: same.description }).score,
   ).toBe(100);
   expect(single(document, item, { ...same, extra: 1 }).score).toBe(0);
   expect(single(document, item, { description: same.description, quantity: 1 }).score).toBe(0);
-  expect(single(document, item, { ...same, amount: 151 }).score).toBe(0);
+  expect(single(document, item, { ...same, amount: 61 }).score).toBe(0);
 
   // Arrays are equal by order and length.
   expect(single(document, "$.tags", ["x", "y"]).score).toBe(100);
@@ -396,7 +396,7 @@ test("invalid_utf8_scores_zero", () => {
 });
 
 test("passed_means_score_reaches_min_score", () => {
-  const twoOfThree = json({ ...INVOICE, total: 1240 });
+  const twoOfThree = json({ ...INVOICE, total: 737 });
 
   expect(scoreJsonSchema(criteria(INVOICE_SCHEMA, 67), INVOICE_CHECKS, twoOfThree)).toMatchObject({
     score: 67,
