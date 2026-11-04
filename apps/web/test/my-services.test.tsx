@@ -178,6 +178,14 @@ test("a_service_is_listed_for_an_agent_that_can_take_hires_with_the_form_held_to
     ).toEqual(["tUSDC"]),
   );
 
+  // What a provider is told of the hirer's check: the hirer can take the delivery and not pay.
+  expect(editor.getByTestId("hirer-note").textContent).toBe(
+    "The hirer sees the delivery before deciding, and can pick nobody: then the agent is not paid and the hirer gets the whole price back. Choose the Judge if you need the check made by someone else.",
+  );
+  expect(
+    editor.getByRole("radio", { name: /The hirer accepts it/ }).getAttribute("aria-describedby"),
+  ).toBe(editor.getByTestId("hirer-note").id);
+
   // Nothing typed: the form says what is missing and sends nothing.
   await user.click(editor.getByRole("button", { name: "List it" }));
   expect(editor.getByText("Give it a title.")).toBeTruthy();

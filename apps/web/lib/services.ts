@@ -33,7 +33,7 @@ export function checkedSentence(service: Pick<Service, "verification">): string 
     return "You check the work yourself: once it is revealed, you pick it to pay the agent, or pick nobody.";
   }
   const { criteria } = verification;
-  return `The Tender Judge scores the delivery against the service's public criteria (${criteria.kind.replace("_", " ")}, pass mark ${criteria.min_score}). If it passes, the Judge picks it and the contract pays the agent.`;
+  return `The Tender Judge scores the delivery against public criteria the provider wrote (${criteria.kind.replace("_", " ")}, pass mark ${criteria.min_score}), not against your request. If it passes, the Judge picks it and the contract pays the agent.`;
 }
 
 /** The windows of a hire in a line: `Delivered within 10m · Revealed 5m · Picked 10m`. */
@@ -85,7 +85,20 @@ export interface ServiceForm {
   verifier: "hirer" | "judge";
   /** The public criteria, as JSON text, for a service the Judge checks. */
   criteria: string;
+  /**
+   * The windows of the service being changed, as listed: the minutes the form first showed for each
+   * and the seconds behind them. A window whose minutes are left as shown keeps its seconds, so a
+   * service listed with windows that are no whole number of minutes is not changed by a save.
+   */
+  listed?: Record<WindowKey, { minutes: string; secs: number }>;
 }
+
+export type WindowKey = "commit" | "reveal" | "pick";
+const WINDOW_FIELDS: Record<WindowKey, "commitMinutes" | "revealMinutes" | "pickMinutes"> = {
+  commit: "commitMinutes",
+  reveal: "revealMinutes",
+  pick: "pickMinutes",
+};
 
 /** A blank form for one of `agents`, priced in `token`. */
 export function emptyServiceForm(agents: readonly string[], token: string): ServiceForm {
@@ -124,6 +137,11 @@ export function formOfService(service: Service): ServiceForm {
     commitMinutes: String(Math.ceil(service.commit_secs / 60)),
     revealMinutes: String(Math.ceil(service.reveal_secs / 60)),
     pickMinutes: String(Math.ceil(service.pick_secs / 60)),
+    listed: {
+      commit: { minutes: String(Math.ceil(service.commit_secs / 60)), secs: service.commit_secs },
+      reveal: { minutes: String(Math.ceil(service.reveal_secs / 60)), secs: service.reveal_secs },
+      pick: { minutes: String(Math.ceil(service.pick_secs / 60)), secs: service.pick_secs },
+    },
     verifier: service.verification.kind,
     criteria:
       service.verification.kind === "judge"
@@ -146,6 +164,17 @@ function minutes(text: string): number | null {
   if (!/^[0-9]{1,6}$/.test(typed)) return null;
   const secs = Number(typed) * 60;
   return secs > 0 && secs <= SERVICE_MAX_WINDOW_SECS ? secs : null;
+}
+
+/**
+ * The window `key` of `form` in seconds: the listed seconds when its minutes are as the form first
+ * showed them, else the minutes typed, or null if they are no window.
+ */
+export function windowSecsOf(form: ServiceForm, key: WindowKey): number | null {
+  const typed = form[WINDOW_FIELDS[key]];
+  const kept = form.listed?.[key];
+  if (kept !== undefined && typed.trim() === kept.minutes) return kept.secs;
+  return minutes(typed);
 }
 
 /**
@@ -176,12 +205,12 @@ export function checkServiceForm(form: ServiceForm, minWindowSecs: number): Serv
   }
   const price = readAmount(form.price, form.token, null, "vault");
   if (!price.ok) errors.price = price.message;
-  for (const [key, label] of [
-    ["commitMinutes", "delivery"],
-    ["revealMinutes", "reveal"],
-    ["pickMinutes", "pick"],
+  for (const [window, key, label] of [
+    ["commit", "commitMinutes", "delivery"],
+    ["reveal", "revealMinutes", "reveal"],
+    ["pick", "pickMinutes", "pick"],
   ] as const) {
-    const secs = minutes(form[key]);
+    const secs = windowSecsOf(form, window);
     if (secs === null) errors[key] = "Use a whole number of minutes above 0, up to 14 days.";
     else if (secs < minWindowSecs) {
       errors[key] = `The ${label} window is at least ${spanText(minWindowSecs)} on this network.`;
@@ -232,9 +261,9 @@ export function serviceRequestOf(form: ServiceForm): CreateServiceRequest {
     output_format: form.outputFormat,
     token: form.token,
     price: price.amount.toString(),
-    commit_secs: minutes(form.commitMinutes),
-    reveal_secs: minutes(form.revealMinutes),
-    pick_secs: minutes(form.pickMinutes),
+    commit_secs: windowSecsOf(form, "commit"),
+    reveal_secs: windowSecsOf(form, "reveal"),
+    pick_secs: windowSecsOf(form, "pick"),
     verification: criteria === null ? { kind: "hirer" } : { kind: "judge", criteria },
   });
   if (!parsed.success) throw new RangeError(parsed.error.issues[0]?.message ?? "not a service");

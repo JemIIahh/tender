@@ -73,7 +73,8 @@ function vaultOf(vault: bigint, free = 10_000n): VaultData {
   };
 }
 
-function deps(over: Partial<HireDeps> = {}) {
+/** The world of a hire; `listed` is the service as the API holds it when the hire reads it again. */
+function deps(over: Partial<HireDeps> = {}, listed: Service = service()) {
   const uploads: BlobUpload[] = [];
   const sent: TenderCall[][] = [];
   let token: string | null = null;
@@ -88,6 +89,7 @@ function deps(over: Partial<HireDeps> = {}) {
       const sha256 = sha256Hex(blob.bytes);
       return { sha256, uri: `http://api.test/v1/blobs/${sha256}` };
     }),
+    getService: vi.fn(async () => ({ service: listed })),
     readVault: vi.fn(async () => vaultOf(5_000_000n)),
     signAndSend: vi.fn(async (calls): Promise<SendResult> => {
       sent.push([...calls]);
@@ -130,7 +132,8 @@ test("a_hire_signs_in_uploads_the_shared_documents_and_posts_a_pinned_task_for_t
   const result = await submitHire(input(), world.deps, (stage) => stages.push(stage));
 
   expect(result).toEqual({ kind: "posted", taskId: "41" });
-  expect(stages).toEqual(["upload", "signin", "upload", "vault", "wallet"]);
+  expect(stages).toEqual(["check", "upload", "signin", "upload", "vault", "wallet"]);
+  expect(world.deps.getService).toHaveBeenCalledWith("3");
   const docs = hireDocuments(service(), REQUEST);
   expect(world.uploads.map((blob) => [blob.kind, sha256Hex(blob.bytes)])).toEqual([
     ["brief", docs.briefHash],
@@ -164,7 +167,6 @@ test("a_hire_signs_in_uploads_the_shared_documents_and_posts_a_pinned_task_for_t
 });
 
 test("a_judge_checked_service_is_hired_with_the_judge_as_verifier", async () => {
-  const world = deps();
   const criteria = {
     version: 1 as const,
     kind: "regex_cases" as const,
@@ -175,8 +177,9 @@ test("a_judge_checked_service_is_hired_with_the_judge_as_verifier", async () => 
   };
   const judged = service({
     output_format: "regex_json",
-    verification: { kind: "judge", criteria, criteria_hash: "ab".repeat(32) },
+    verification: { kind: "judge", criteria, criteria_hash: "ab".repeat(32), judge: JUDGE },
   });
+  const world = deps({}, judged);
   await submitHire(input({ service: judged }), world.deps);
   const task = ((world.sent[0]?.[0]?.args ?? {}) as { task: Record<string, unknown> }).task;
   expect(task.verifier).toBe(JUDGE);
@@ -199,6 +202,48 @@ test("what_the_vault_lacks_is_deposited_and_the_storage_topped_up_in_the_same_ap
   expect(((calls[1]?.args ?? {}) as { amount: string }).amount).toBe("2500000");
 });
 
+test("a_service_changed_since_the_page_loaded_it_stops_the_hire_before_anything_leaves", async () => {
+  const changes: Array<[string, Partial<Service>]> = [
+    ["the price", { price: "3000000" }],
+    ["the token", { token: "other.testnet" }],
+    ["a window", { commit_secs: 7_200 }],
+    [
+      "the check",
+      {
+        verification: {
+          kind: "judge",
+          criteria: HIRER_ACCEPTS_CRITERIA,
+          criteria_hash: "ab".repeat(32),
+          judge: JUDGE,
+        },
+      },
+    ],
+    ["a pause", { status: "paused", available: false }],
+    ["an agent that left", { available: false }],
+  ];
+  for (const [what, over] of changes) {
+    const now = service(over);
+    const world = deps({}, now);
+    const failure = await submitHire(input(), world.deps).catch((error: unknown) => error);
+    expect(failure, what).toBeInstanceOf(HireFailure);
+    expect((failure as HireFailure).message, what).toBe(
+      "The provider changed this service. Check the new terms and press Hire again.",
+    );
+    expect((failure as HireFailure).stage, what).toBe("check");
+    // The page shows the terms the API holds now.
+    expect((failure as HireFailure).fresh, what).toEqual(now);
+    expect(world.deps.signIn, what).not.toHaveBeenCalled();
+    expect(world.deps.uploadBlob, what).not.toHaveBeenCalled();
+    expect(world.deps.signAndSend, what).not.toHaveBeenCalled();
+  }
+  // Words of the listing that a hire does not depend on change nothing.
+  const reworded = deps({}, service({ title: "Summarise any filing", description: "Six lines." }));
+  expect(await submitHire(input(), reworded.deps)).toEqual({ kind: "posted", taskId: "41" });
+  // A service that is gone stops it too.
+  const gone = deps({ getService: vi.fn(async () => null) });
+  await expect(submitHire(input(), gone.deps)).rejects.toThrow("The provider changed this service");
+});
+
 test("a_fresh_read_that_asks_for_more_than_was_shown_sends_nothing", async () => {
   const world = deps({ readVault: vi.fn(async () => vaultOf(0n)) });
   await expect(
@@ -211,7 +256,7 @@ test("a_hire_of_ones_own_agent_or_a_bad_request_is_refused_before_anything_leave
   for (const [what, over, words] of [
     ["its own agent", { account: WRITER }, "An account can't hire its own agent account."],
     ["no request", { request: "   " }, "The request can't be sent as it is"],
-    ["an invisible character", { request: "hi​" }, "The request can't be sent as it is"],
+    ["an invisible character", { request: "hi\u200b" }, "The request can't be sent as it is"],
     ["too long", { request: "r".repeat(4001) }, "The request can't be sent as it is"],
   ] as const) {
     const world = deps();
@@ -286,6 +331,7 @@ test("the_plan_the_blockers_and_the_team_only_note", () => {
       kind: "judge",
       criteria: { ...HIRER_ACCEPTS_CRITERIA },
       criteria_hash: "ab".repeat(32),
+      judge: JUDGE,
     },
   });
   expect(hireBlocker(judged, ALICE, null)).toMatch(/isn't set up/);
@@ -358,6 +404,23 @@ test("the_provider_form_is_held_to_the_shared_rules_in_its_own_words", () => {
   });
   expect(checkServiceForm({ ...form, verifier: "judge", criteria: exact }, 60).criteria).toMatch(
     /^The Judge needs held-out checks for kind exact/,
+  );
+});
+
+test("a_save_keeps_windows_that_are_no_whole_minutes_unless_they_are_edited", () => {
+  const form = formOfService(service({ commit_secs: 90, reveal_secs: 45, pick_secs: 600 }));
+  expect(form).toMatchObject({ commitMinutes: "2", revealMinutes: "1", pickMinutes: "10" });
+  // Left as shown: the listed seconds go back, not the rounded minutes.
+  expect(serviceRequestOf(form)).toMatchObject({
+    commit_secs: 90,
+    reveal_secs: 45,
+    pick_secs: 600,
+  });
+  // Edited: the minutes typed.
+  expect(serviceRequestOf({ ...form, commitMinutes: "3" }).commit_secs).toBe(180);
+  // The network's shortest window is held to what is kept, too.
+  expect(checkServiceForm({ ...form, title: "t", description: "d" }, 60).revealMinutes).toBe(
+    "The reveal window is at least 1m on this network.",
   );
 });
 

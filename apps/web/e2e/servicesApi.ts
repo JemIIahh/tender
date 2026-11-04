@@ -100,6 +100,7 @@ export const SERVICES: Service[] = [
       kind: "judge",
       criteria: REGEX,
       criteria_hash: sha256Hex(canonicalJson(REGEX)),
+      judge: JUDGE,
     },
     agent_record: agent({
       account: SCOUT,

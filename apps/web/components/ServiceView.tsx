@@ -25,6 +25,7 @@ import { useWallet } from "../lib/wallet";
 import { walletErrorMessage } from "../lib/walletErrors";
 import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
+import { CriteriaDetail } from "./CriteriaSection";
 import { ErrorState } from "./ErrorState";
 import { TeamBadge } from "./TeamBadge";
 import {
@@ -54,6 +55,7 @@ type State =
 
 const STAGE_WORDS: Record<HireStage, string> = {
   documents: "Writing the task…",
+  check: "Checking the service's terms…",
   signin: "Signing in with your wallet…",
   upload: "Uploading the request…",
   vault: "Reading your vault…",
@@ -163,6 +165,32 @@ function Terms({ service }: { service: Service }) {
   );
 }
 
+/**
+ * What the Judge checks a delivery against, for a Judge-checked service: the public criteria every
+ * hire of it carries, shown as text (the examples, the points, the cases). The provider wrote them,
+ * and the provider's agent is the one paid, so the page says so, and that the Judge checks them and
+ * not the hirer's request.
+ */
+function JudgeCriteria({ service }: { service: Service }) {
+  const { verification } = service;
+  if (verification.kind !== "judge") return null;
+  const { criteria } = verification;
+  return (
+    <section className={PANEL} aria-labelledby="service-criteria" data-testid="service-criteria">
+      <h2 id="service-criteria" className={PANEL_TITLE}>
+        What the Judge checks
+      </h2>
+      <p data-testid="criteria-author" className="text-[15px] leading-relaxed text-bone">
+        The provider wrote these criteria. The Judge checks the delivery against them, not against
+        your request, and pays the agent if it scores {criteria.min_score} of 100 or more.
+      </p>
+      <div className="grid gap-2 text-sm text-bone/90">
+        <CriteriaDetail criteria={criteria} />
+      </div>
+    </section>
+  );
+}
+
 /** What the vault read says will happen to the money, before the approval. */
 function PlanLines({ plan, service }: { plan: HirePlan; service: Service }) {
   return (
@@ -185,7 +213,14 @@ type Hire =
   | { status: "failed"; message: string }
   | { status: "done"; result: HireResult };
 
-function HirePanel({ service }: { service: Service }) {
+function HirePanel({
+  service,
+  onChanged,
+}: {
+  service: Service;
+  /** The service as the API holds it now, or null when it is gone. */
+  onChanged: (service: Service | null) => void;
+}) {
   const { ready, accountId, connect, signAndSend } = useWallet();
   const { signIn } = useApiToken();
   const [request, setRequest] = useState("");
@@ -241,6 +276,7 @@ function HirePanel({ service }: { service: Service }) {
           token: liveToken,
           signIn,
           uploadBlob: (token, blob) => api.uploadBlob(token, blob),
+          getService: (id) => api.getService(id),
           readVault,
           signAndSend,
         },
@@ -253,6 +289,8 @@ function HirePanel({ service }: { service: Service }) {
         status: "failed",
         message: error instanceof HireFailure ? error.message : errorMessage(error),
       });
+      // The service changed under the page: it shows the terms the API holds now.
+      if (error instanceof HireFailure && error.fresh !== undefined) onChanged(error.fresh);
     }
   };
 
@@ -409,7 +447,13 @@ function HirePanel({ service }: { service: Service }) {
   );
 }
 
-function ReadyView({ service }: { service: Service }) {
+function ReadyView({
+  service,
+  onChanged,
+}: {
+  service: Service;
+  onChanged: (service: Service | null) => void;
+}) {
   return (
     <article className="mx-auto grid w-full max-w-[1200px] gap-6">
       <header className="grid gap-4 pb-2">
@@ -466,10 +510,11 @@ function ReadyView({ service }: { service: Service }) {
           </section>
         </div>
         <div className="min-w-0 lg:sticky lg:top-24 lg:col-start-2 lg:row-span-2 lg:row-start-1">
-          <HirePanel service={service} />
+          <HirePanel service={service} onChanged={onChanged} />
         </div>
         <div className="grid min-w-0 gap-6 lg:col-start-1">
           <Terms service={service} />
+          <JudgeCriteria service={service} />
           <Facts service={service} />
         </div>
       </div>
@@ -506,7 +551,17 @@ export function ServiceView({ id }: { id: string }) {
     load();
   }, [load]);
 
-  if (state.status === "ready") return <ReadyView service={state.service} />;
+  if (state.status === "ready") {
+    return (
+      <ReadyView
+        service={state.service}
+        // A hire that found the service changed shows the new terms; the form keeps its words.
+        onChanged={(fresh) => {
+          if (fresh !== null) setState({ status: "ready", service: fresh });
+        }}
+      />
+    );
+  }
   return (
     <div className="mx-auto grid w-full max-w-4xl gap-6">
       <h1 className="text-3xl font-semibold tracking-[-0.03em] text-bone wrap-anywhere sm:text-[2.6rem]">

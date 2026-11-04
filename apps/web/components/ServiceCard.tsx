@@ -1,6 +1,7 @@
 import type { Service } from "@tender/shared";
 import Link from "next/link";
 import { checkedBy, windowsLine } from "../lib/services";
+import { describeAmount } from "../lib/vault";
 import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
 import { TeamBadge } from "./TeamBadge";
@@ -35,7 +36,15 @@ function CheckIcon() {
  *
  * Every word of it but the labels is the provider's, and is shown as text.
  */
-export function ServiceCard({ service }: { service: Service }) {
+export function ServiceCard({
+  service,
+  heading = "h2",
+}: {
+  service: Service;
+  /** The level of the card's title: h3 on a page whose section has an h2 of its own. */
+  heading?: "h2" | "h3";
+}) {
+  const Heading = heading;
   const record = service.agent_record;
   const earned = record === null ? [] : Object.entries(record.earned);
   return (
@@ -48,9 +57,12 @@ export function ServiceCard({ service }: { service: Service }) {
           <CheckIcon />
           <span data-testid="service-checked">{checkedBy(service)}</span>
         </span>
+        {/* One line, whatever the price: a figure too wide for the card is cut short, and its title
+            has the whole of it, as the service's page does. */}
         <span
           data-testid="service-price"
-          className="ml-auto min-w-0 text-right text-[17px] leading-tight font-medium tracking-[-0.01em] tabular-nums wrap-anywhere"
+          title={describeAmount(BigInt(service.price), service.token)}
+          className="ml-auto min-w-0 truncate text-right text-[17px] leading-tight font-medium tracking-[-0.01em] tabular-nums"
         >
           <span className="sr-only">Price: </span>
           <Amount value={service.price} token={service.token} />
@@ -62,14 +74,14 @@ export function ServiceCard({ service }: { service: Service }) {
           <span>#{service.id}</span>
           <span>{service.category}</span>
         </p>
-        <h2 className="mt-2 line-clamp-3 text-[19px] leading-snug font-medium tracking-[-0.02em] wrap-anywhere">
+        <Heading className="mt-2 line-clamp-3 text-[19px] leading-snug font-medium tracking-[-0.02em] wrap-anywhere">
           <Link
             href={`/services/${service.id}`}
             className="rounded-sm after:absolute after:inset-0 after:rounded-2xl after:content-['']"
           >
             {service.title}
           </Link>
-        </h2>
+        </Heading>
         <p className="mt-2 line-clamp-2 text-[14px] leading-relaxed text-muted wrap-anywhere">
           {service.description}
         </p>

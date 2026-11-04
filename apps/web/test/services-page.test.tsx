@@ -82,6 +82,7 @@ const JUDGED = service({
       examples: { match: ["2026-11-04"], no_match: ["4 Nov"] },
     },
     criteria_hash: "ab".repeat(32),
+    judge: "judge.tender-team.testnet",
   },
   agent_record: agent({ account: "scout.tender-team.testnet", wins: 31, earned: {} }),
 });
@@ -239,6 +240,7 @@ test("a_service_page_says_what_it_does_how_it_is_checked_and_what_the_agent_has_
     /^You check the work yourself/,
   );
   expect(screen.getByTestId("record-wins").textContent).toBe("9");
+  expect(screen.queryByTestId("service-criteria")).toBeNull();
   expect(screen.getByTestId("record-entries").textContent).toBe("14");
   expect(screen.getByTestId("hire-price").textContent).toBe("2.50 tUSDC");
   // The money, as it is: escrowed, paid less the fee, all of it back if nothing is delivered.
@@ -261,6 +263,20 @@ test("a_judge_checked_service_names_its_criteria_and_says_when_the_judge_takes_i
   );
   expect(document.body.textContent).toContain(`sha256 ${"ab".repeat(32)}`);
   expect(screen.queryByTestId("team-only-note")).toBeNull();
+  // What the Judge checks, as text, and who wrote it.
+  const criteria = within(screen.getByTestId("service-criteria"));
+  expect(criteria.getByTestId("criteria-author").textContent).toContain(
+    "The provider wrote these criteria. The Judge checks the delivery against them, not against your request",
+  );
+  expect(criteria.getAllByTestId("example-match").map((one) => one.textContent)).toEqual([
+    "2026-11-04",
+  ]);
+  expect(criteria.getAllByTestId("example-no-match").map((one) => one.textContent)).toEqual([
+    "4 Nov",
+  ]);
+  expect(screen.getByTestId("service-checked-sentence").textContent).toContain(
+    "public criteria the provider wrote",
+  );
 
   const rubric = service({
     verification: {
@@ -274,6 +290,7 @@ test("a_judge_checked_service_names_its_criteria_and_says_when_the_judge_takes_i
         rubric: [{ criterion: "Covers every section", weight: 1 }],
       },
       criteria_hash: "cd".repeat(32),
+      judge: "judge.tender-team.testnet",
     },
   });
   fakeApi(() => json({ service: rubric }));
@@ -281,6 +298,9 @@ test("a_judge_checked_service_names_its_criteria_and_says_when_the_judge_takes_i
   expect((await screen.findByTestId("team-only-note")).textContent).toContain(
     "the price comes back to you",
   );
+  expect(screen.getAllByTestId("rubric-row").map((row) => row.textContent)).toEqual([
+    "Covers every section · weight 1",
+  ]);
 });
 
 test("a_paused_service_and_one_whose_agent_left_cannot_be_hired", async () => {

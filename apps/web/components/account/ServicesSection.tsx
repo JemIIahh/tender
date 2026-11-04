@@ -14,7 +14,7 @@ import { type AgentRecord, api } from "../../lib/api";
 import { useApiToken } from "../../lib/auth";
 import { config } from "../../lib/config";
 import { errorMessage } from "../../lib/errors";
-import { CATEGORIES, readPostLimits } from "../../lib/post";
+import { CATEGORIES, readPostLimits, spanText } from "../../lib/post";
 import { liveToken } from "../../lib/postSubmit";
 import {
   checkServiceForm,
@@ -27,6 +27,7 @@ import {
   type ServiceErrors,
   type ServiceForm,
   serviceRequestOf,
+  type WindowKey,
   windowsLine,
 } from "../../lib/services";
 import { walletErrorMessage } from "../../lib/walletErrors";
@@ -44,6 +45,26 @@ import { Chip } from "./parts";
 function tokenLabel(token: string): string {
   const { symbol } = tokenMeta(token, config.network);
   return symbol === token ? token : symbol;
+}
+
+/** What a provider is told of a service that the hirer checks: the hirer can take it and not pay. */
+export const HIRER_ACCEPTS_NOTE =
+  "The hirer sees the delivery before deciding, and can pick nobody: then the agent is not paid and the hirer gets the whole price back. Choose the Judge if you need the check made by someone else.";
+
+/**
+ * What a window field says of a service listed with a window of no whole number of minutes: the
+ * window it keeps while the minutes are left as shown.
+ */
+function keptHint(form: ServiceForm, window: WindowKey): string | undefined {
+  const kept = form.listed?.[window];
+  if (
+    kept === undefined ||
+    kept.secs % 60 === 0 ||
+    form[`${window}Minutes`].trim() !== kept.minutes
+  ) {
+    return undefined;
+  }
+  return `Listed as ${spanText(kept.secs)}; kept unless you change it.`;
 }
 
 /** Whether an agent can take hires, as the API asks: active, with a bond. */
@@ -341,12 +362,18 @@ function Editor({
           <div className="grid gap-3 sm:grid-cols-3">
             {(
               [
-                ["commitMinutes", "To deliver"],
-                ["revealMinutes", "To reveal"],
-                ["pickMinutes", "To pick"],
+                ["commitMinutes", "commit", "To deliver"],
+                ["revealMinutes", "reveal", "To reveal"],
+                ["pickMinutes", "pick", "To pick"],
               ] as const
-            ).map(([key, label]) => (
-              <Field key={key} label={label} id={fieldId(key)} error={errors[key]}>
+            ).map(([key, window, label]) => (
+              <Field
+                key={key}
+                label={label}
+                id={fieldId(key)}
+                error={errors[key]}
+                hint={keptHint(form, window)}
+              >
                 <input
                   id={fieldId(key)}
                   inputMode="numeric"
@@ -368,17 +395,29 @@ function Editor({
               ["judge", "The Tender Judge, against public criteria"],
             ] as const
           ).map(([value, label]) => (
-            <label key={value} className="flex min-h-10 items-center gap-3 text-[15px] text-bone">
-              <input
-                type="radio"
-                name={`${id}-verifier`}
-                value={value}
-                checked={form.verifier === value}
-                onChange={() => set("verifier", value)}
-                className="size-4 accent-seal"
-              />
-              {label}
-            </label>
+            <div key={value} className="grid gap-1">
+              <label className="flex min-h-10 items-center gap-3 text-[15px] text-bone">
+                <input
+                  type="radio"
+                  name={`${id}-verifier`}
+                  value={value}
+                  checked={form.verifier === value}
+                  onChange={() => set("verifier", value)}
+                  aria-describedby={value === "hirer" ? `${id}-hirer-note` : undefined}
+                  className="size-4 accent-seal"
+                />
+                {label}
+              </label>
+              {value === "hirer" ? (
+                <p
+                  id={`${id}-hirer-note`}
+                  data-testid="hirer-note"
+                  className="pl-7 text-[12.5px] leading-relaxed text-muted"
+                >
+                  {HIRER_ACCEPTS_NOTE}
+                </p>
+              ) : null}
+            </div>
           ))}
           {errors.verifier === undefined ? null : (
             <p className="text-[12.5px] text-seal">{errors.verifier}</p>

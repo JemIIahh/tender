@@ -4,13 +4,14 @@ import {
   type BlobUploadResponse,
   depositCall,
   HIRE_TASK_BYTES,
-  type HiredService,
+  hireCriteriaHash,
   hireDocuments,
   hireTerms,
   JUDGE_TEAM_ONLY_KINDS,
   MAX_URI_BYTES,
   postTaskCall,
   type Service,
+  type ServiceResponse,
   storageDepositCall,
   storageShortfall,
   type TenderCall,
@@ -37,6 +38,9 @@ import {
 //
 // In order:
 //   1. the documents and the terms are made, before anything leaves the page;
+//   1b. the service is read again from the API: a provider can change its price, its terms or its
+//      status after the page loaded it, and a hire is posted only on the terms the API holds now,
+//      which are the ones the agent takes (its runner refuses a hire that does not match them);
 //   2. a sign-in to the API, if there is no token for the account, and the two uploads;
 //   3. the vault and the storage balance are read afresh, and the calls planned from them: a deposit
 //      of what the vault lacks, a storage top-up if the hire's task record needs one, and the post.
@@ -47,17 +51,49 @@ import {
 // does not offer to send it again.
 
 /** Where a hire stopped, for the words about it. */
-export type HireStage = "documents" | "signin" | "upload" | "vault" | "wallet";
+export type HireStage = "documents" | "check" | "signin" | "upload" | "vault" | "wallet";
 
-/** A hire that did not happen, in words for the person. Before `wallet`, nothing was sent. */
+/**
+ * A hire that did not happen, in words for the person. Before `wallet`, nothing was sent. `fresh`
+ * is the service as the API holds it now, when the hire stopped because it changed (or null, when it
+ * is gone): the page shows it in place of the one it had.
+ */
 export class HireFailure extends Error {
   readonly stage: HireStage;
+  readonly fresh: Service | null | undefined;
 
-  constructor(stage: HireStage, words: string, cause?: unknown) {
+  constructor(stage: HireStage, words: string, cause?: unknown, fresh?: Service | null) {
     super(words, { cause });
     this.name = "HireFailure";
     this.stage = stage;
+    this.fresh = fresh;
   }
+}
+
+/** What a hire says when the service changed after the page loaded it. */
+export const SERVICE_CHANGED =
+  "The provider changed this service. Check the new terms and press Hire again.";
+
+/**
+ * Whether `now` differs from `shown` in anything a hire is made of or depends on: the price, the
+ * token, the windows, how the work is checked (the kind, the criteria hash, the Judge), whether it
+ * can be hired, and its status.
+ */
+export function termsChanged(shown: Service, now: Service): boolean {
+  const judgeOf = (service: Service) =>
+    service.verification.kind === "judge" ? service.verification.judge : null;
+  return (
+    shown.price !== now.price ||
+    shown.token !== now.token ||
+    shown.commit_secs !== now.commit_secs ||
+    shown.reveal_secs !== now.reveal_secs ||
+    shown.pick_secs !== now.pick_secs ||
+    shown.verification.kind !== now.verification.kind ||
+    hireCriteriaHash(shown) !== hireCriteriaHash(now) ||
+    judgeOf(shown) !== judgeOf(now) ||
+    shown.available !== now.available ||
+    shown.status !== now.status
+  );
 }
 
 export type HireResult =
@@ -71,6 +107,8 @@ export interface HireDeps {
   token(account: string): string | null;
   signIn(): Promise<unknown>;
   uploadBlob(token: string, blob: BlobUpload): Promise<BlobUploadResponse>;
+  /** The service as the API holds it now; null if there is none. */
+  getService(id: string): Promise<ServiceResponse | null>;
   readVault(account: string): Promise<VaultData>;
   signAndSend(calls: readonly TenderCall[]): Promise<SendResult>;
 }
@@ -187,7 +225,8 @@ function checkUpload(response: BlobUploadResponse, hash: string, expectUri: bool
 }
 
 export interface HireInput {
-  service: HiredService;
+  /** The service as the page shows it. */
+  service: Service;
   request: string;
   /** The account that hires: the one connected when Hire was pressed. */
   account: string;
@@ -246,6 +285,13 @@ export async function submitHire(
       );
     }
   });
+
+  // 1b. The terms the API holds now, before anything is uploaded or signed.
+  onStage("check");
+  const now = await at("check", () => deps.getService(service.id));
+  if (now === null || termsChanged(service, now.service)) {
+    throw new HireFailure("check", SERVICE_CHANGED, undefined, now?.service ?? null);
+  }
 
   async function signedIn(): Promise<string> {
     onStage("signin");

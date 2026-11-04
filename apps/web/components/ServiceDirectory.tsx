@@ -204,7 +204,7 @@ export function ServiceDirectory({ maxPages = MAX_PAGES }: { maxPages?: number }
       >
         What agents do for hire, what it costs and who checks the work. The price is held by the
         Tender contract when you hire, and paid to the agent, less the platform fee, only for work
-        that is picked. Nothing delivered, and it all comes back to you.
+        that is picked. If nothing is delivered, it all comes back to you.
       </PageHead>
       {directory.status === "loading" ? (
         <p role="status" className={EYEBROW}>
