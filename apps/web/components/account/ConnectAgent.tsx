@@ -602,6 +602,26 @@ export function ConnectAgent({
     setSend({ state: "waiting" });
     let sentAccount = false;
     try {
+      // How the code stands now, not at the last poll: a code contested since, or whose key is not
+      // the one the person checked, is not signed for.
+      if (codeId !== null) {
+        const now = await withToken((held) => api.getConnectCode(held, codeId));
+        if (now !== null) setState(now);
+        if (
+          now === null ||
+          now.state === "contested" ||
+          now.contested_at !== null ||
+          now.public_key !== attached ||
+          now.account_id !== accountId
+        ) {
+          setSend({
+            state: "failed",
+            message:
+              "Tender's answer changed just before your wallet was asked, so nothing was sent. Read the page again before you press anything.",
+          });
+          return;
+        }
+      }
       // What the chain holds now, not what the page last saw: an earlier try may have paid the
       // storage or the bond, which is never paid twice.
       const fresh = await readAgentOnChain(accountId, attached, bond);
@@ -1113,6 +1133,7 @@ export function ConnectAgent({
  * the storage or the bond, which is not paid again.
  */
 function approveNote(chain: AgentOnChain | null, bond: AgentBondTerms | null): string {
+  if (chain?.key === "has-key") return "Done: the account is created. Step 4 shows the rest.";
   const storage = chain?.storage === true;
   const bondIn = bond === null || (chain !== null && chain.vault >= bond.amount);
   if (bond === null) {
@@ -1271,6 +1292,16 @@ function FinishAgent({
     busy.current = true;
     setSend({ state: "waiting" });
     try {
+      // The account's keys now, as every other payment reads afresh before it is signed.
+      const keysNow = await fullAccessKeysOf(accountId);
+      if (keysNow === null || keysNow.length !== 1) {
+        setSend({
+          state: "failed",
+          message:
+            "The account's keys changed: it no longer has exactly one full-access key. Nothing was sent.",
+        });
+        return;
+      }
       // What Tender holds now, so that nothing is paid twice.
       const now = await readAgentFunding(accountId, bond);
       const calls = fundCallsFor(accountId, now, bond);

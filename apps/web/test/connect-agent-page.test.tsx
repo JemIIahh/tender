@@ -81,6 +81,8 @@ interface World {
   failCreates: number;
   /** How many codes were made. */
   made: number;
+  /** A key the agent attaches at once, before the page's first read of the code. */
+  attachOnCreate?: string;
   /** How many of the next deposits of the bond the token fails. */
   failDeposits: number;
   /** A refusal for the next code, in place of a code. */
@@ -240,7 +242,13 @@ function serve(state: World): void {
       if (state.refuseCode !== null) return state.refuseCode;
       const { name } = JSON.parse(String(init.body)) as { name: string };
       state.made++;
-      state.code = { name, attached: null, expired: false, agent: null, registeredAt: null };
+      state.code = {
+        name,
+        attached: state.attachOnCreate ?? null,
+        expired: false,
+        agent: null,
+        registeredAt: null,
+      };
       return json({
         id: ID,
         code: CODE,
@@ -382,11 +390,11 @@ function aliceWallet(
   return { session: { wallet, accountId: ALICE }, batches, signed };
 }
 
-function open(state: World, options: Parameters<typeof aliceWallet>[1] = {}) {
+function open(state: World, options: Parameters<typeof aliceWallet>[1] & { pollMs?: number } = {}) {
   serve(state);
   const alice = aliceWallet(state, options);
   holder.store = createWalletStore(async () => fakeProvider(alice.session, { restored: true }));
-  render(<AddAgentView pollMs={20} />);
+  render(<AddAgentView pollMs={options.pollMs ?? 20} />);
   return { ...alice, user: userEvent.setup() };
 }
 
@@ -914,4 +922,45 @@ test("a_reload_comes_back_to_the_code_by_its_id_and_never_keeps_the_code", async
   expect(screen.queryByTestId("connect-command")).toBeNull();
   expect(state.made).toBe(1);
   expect((screen.getByLabelText("Account name") as HTMLInputElement).value).toBe("writer");
+});
+
+// ---- Fix round 2 ---------------------------------------------------------------------------------
+
+test("create_reads_the_code_again_at_the_press_and_signs_nothing_for_a_code_contested_since", async () => {
+  // The page reads the code once (the key is there at once) and not again for a minute: the
+  // contest comes between that read and the press.
+  const state = world();
+  state.attachOnCreate = PUBLIC;
+  const { user, batches } = open(state, { pollMs: 60_000 });
+  await getCode(user);
+  const create = await screen.findByRole("button", { name: "Create agent" });
+  if (state.code !== null) state.code.contestedAt = "2026-11-04T10:02:00.000Z";
+
+  await user.click(create);
+
+  expect((await screen.findByTestId("connect-contested")).textContent).toContain(
+    "Two different keys tried this code: someone else has it. Start over.",
+  );
+  expect(batches).toEqual([]);
+  expect(state.accounts.has(AGENT)).toBe(false);
+});
+
+test("create_signs_nothing_when_the_key_changed_since_the_person_checked_it", async () => {
+  const state = world();
+  state.attachOnCreate = PUBLIC;
+  const { user, batches } = open(state, { pollMs: 60_000 });
+  await getCode(user);
+  const create = await screen.findByRole("button", { name: "Create agent" });
+  expect(screen.getByTestId("connect-fingerprint").textContent).toBe(connectFingerprint(PUBLIC));
+  const other = `ed25519:${base58Encode(new Uint8Array(32).fill(5))}`;
+  if (state.code !== null) state.code.attached = other;
+
+  await user.click(create);
+
+  expect((await screen.findByTestId("connect-send-error")).textContent).toBe(
+    "Tender's answer changed just before your wallet was asked, so nothing was sent. Read the page again before you press anything.",
+  );
+  // The page now shows the key that is there, for the person to check again.
+  expect(screen.getByTestId("connect-fingerprint").textContent).toBe(connectFingerprint(other));
+  expect(batches).toEqual([]);
 });
