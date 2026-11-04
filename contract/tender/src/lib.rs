@@ -45,6 +45,7 @@ enum StorageKey {
     EntrantAt,
     Agents,
     Delegates,
+    DelegateCounts,
 }
 
 /// The contract state: configuration, the internal vault, and every task, entry and agent.
@@ -77,6 +78,8 @@ pub struct Tender {
     agents: LookupMap<AccountId, AgentProfile>,
     /// `(account, public key)` to spending caps.
     delegates: LookupMap<(AccountId, PublicKey), DelegateCaps>,
+    /// How many delegate keys each account has registered, for the accounts that have any.
+    delegate_counts: LookupMap<AccountId, u32>,
 }
 
 #[near]
@@ -119,6 +122,7 @@ impl Tender {
             entrant_at: LookupMap::new(StorageKey::EntrantAt),
             agents: LookupMap::new(StorageKey::Agents),
             delegates: LookupMap::new(StorageKey::Delegates),
+            delegate_counts: LookupMap::new(StorageKey::DelegateCounts),
         }
     }
 }
@@ -190,6 +194,7 @@ mod tests {
             StorageKey::EntrantAt,
             StorageKey::Agents,
             StorageKey::Delegates,
+            StorageKey::DelegateCounts,
         ];
         for (tag, key) in prefixes.iter().enumerate() {
             assert_eq!(borsh::to_vec(key).unwrap(), [tag as u8], "prefix {tag}");
@@ -292,7 +297,7 @@ mod tests {
     }
 
     /// `storage_layout_is_pinned`'s fresh contract, hex-encoded.
-    const FRESH_STATE: &str = "01000a0000006f776e65722e74657374000d00000074726561737572792e74657374f4013c0000000000007512000000000001000000000000000000000002000000007602000000006d0100000001010000000201000000030100000004010000000501000000060100000007";
+    const FRESH_STATE: &str = "01000a0000006f776e65722e74657374000d00000074726561737572792e74657374f4013c0000000000007512000000000001000000000000000000000002000000007602000000006d01000000010100000002010000000301000000040100000005010000000601000000070100000008";
     /// `storage_layout_is_pinned`'s task record: its length and the SHA-256 of its encoding.
     const TASK_RECORD: (usize, &str) = (
         444,

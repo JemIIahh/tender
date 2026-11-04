@@ -101,7 +101,8 @@ async fn relay(
 /// Independent review H1. The judge's delegate key, whose access key may call `post_task` and
 /// `pick` (as in delegate.rs's `verifier_delegate_key_cannot_pick`), is refused a direct pick, and
 /// now also the same pick relayed by anyone as a meta-transaction: Tender sees carol as the
-/// signer and the judge as the caller, and refuses a pick the caller did not sign itself.
+/// signer and the judge as the caller, and refuses it because the judge has a delegate key, which
+/// may be the one that signed.
 #[tokio::test]
 async fn verifier_delegate_key_cannot_pick_via_meta_transaction() -> anyhow::Result<()> {
     let env = setup(5).await?;
@@ -158,6 +159,45 @@ async fn verifier_delegate_key_cannot_pick_via_meta_transaction() -> anyhow::Res
 
     // The judge's own full-access key still picks, directly.
     done_clean(pick(&env, judge, id, vec![winner(&env.alice, 10_000)]).await?)?;
+    assert_eq!(
+        vault_balance(&env, env.alice.id()).await?,
+        REWARD - fee_of(REWARD)
+    );
+    assert_conserved(&env, &[]).await?;
+    Ok(())
+}
+
+/// A verifier with no delegate key may pick through a relayer: no key of its account is a
+/// delegate, so the key that signed the DelegateAction cannot be one. Here the judge's plain
+/// function-call key for `pick`, the kind the Judge service signs with, is relayed by carol.
+#[tokio::test]
+async fn relayed_pick_by_a_verifier_without_delegates_goes_through() -> anyhow::Result<()> {
+    let env = setup(5).await?;
+    let judge = &env.judge;
+    deposit(&env, &env.poster, REWARD).await?;
+    let id = post(&env, &env.poster, task_json(&env, REWARD, judge.id(), 1)).await?;
+    let (ah, asalt) = commit_work(&env, &env.alice, id, b"real work").await?;
+    let pick_key = function_call_key(&env, judge, &["pick"]).await?;
+    let task = get_task(&env, id).await?;
+    advance_to(&env, deadline(&task, "commit_deadline")).await?;
+    done_clean(reveal(&env, &env.alice, id, &ah, &asalt, "ipfs://alice").await?)?;
+    advance_to(&env, deadline(&task, "reveal_deadline")).await?;
+
+    let args = json!({
+        "task_id": id.to_string(),
+        "winners": [{ "account": env.alice.id(), "bps": 10_000 }],
+        "scorecard_hash": hex(&sha256(b"scorecard")),
+        "scorecard_uri": "ipfs://scorecard",
+    });
+    let outcome = relay(&env, &env.carol, &pick_key, "pick", args, 0).await?;
+    let receipts = format!("{:?}", outcome.receipts_outcome);
+    assert!(receipts.contains(r#"\"event\":\"picked\""#), "{receipts}");
+    let after = get_task(&env, id).await?;
+    assert_eq!(after["outcome"]["kind"], "picked");
+    assert_eq!(
+        after["outcome"]["winners"][0]["account"],
+        json!(env.alice.id())
+    );
     assert_eq!(
         vault_balance(&env, env.alice.id()).await?,
         REWARD - fee_of(REWARD)

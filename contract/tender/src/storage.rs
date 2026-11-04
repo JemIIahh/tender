@@ -227,6 +227,7 @@ impl Tender {
             entrant_at,
             agents,
             delegates,
+            delegate_counts,
         } = self;
         tokens.flush();
         vault.flush();
@@ -236,6 +237,7 @@ impl Tender {
         entrant_at.flush();
         agents.flush();
         delegates.flush();
+        delegate_counts.flush();
     }
 
     /// Flushes, then returns the contract's storage usage. This is the `before` that a
