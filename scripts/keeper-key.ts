@@ -10,7 +10,7 @@ import {
   PublicKey,
 } from "near-api-js";
 import { DeployEnv, type EnvWriter, type Outcome, parseKey, UsageError } from "./deploy";
-import { loadEnv, REPO_ROOT } from "./lib/env";
+import { envDir, loadEnv } from "./lib/env";
 
 /**
  * The key script. A service that signs for the keeper, the judge or an agent does not hold that
@@ -174,7 +174,7 @@ export interface KeyTarget {
 export interface AddKeyOptions {
   /** The agent's name, for the agent role (`analyst`) and for no other role. */
   agent?: string;
-  /** Where `.env` and `.env.deploy.<network>` are. The repository root by default. */
+  /** Where `.env` and `.env.deploy.<network>` are. The repository root by default, or what `TENDER_ENV_DIR` names. */
   dir?: string;
   /** Receives the `OK` or `SKIP` line, and nothing else. Default: `console.log`. */
   log?: (line: string) => void;
@@ -356,7 +356,7 @@ export async function addRoleKey(
   const { network, contractId } = target;
   if (network === "mainnet") throw new Error(MAINNET_REFUSED);
   const { stem, methods, label } = specOf(role, options.agent);
-  const dir = options.dir ?? REPO_ROOT;
+  const dir = options.dir ?? envDir();
   const log = options.log ?? console.log;
   const accountVar = `${stem}_ACCOUNT`;
   const fullKeyVar = `${stem}_FULL_ACCESS_KEY`;
@@ -495,7 +495,7 @@ export function describeFailure(error: unknown): string {
 }
 
 export interface CliOptions {
-  /** Where the env files are. The repository root by default. */
+  /** Where the env files are. The repository root by default, or what `TENDER_ENV_DIR` names. */
   dir?: string;
   /** Receives the script's lines. Defaults to `console.log`. */
   out?: (line: string) => void;

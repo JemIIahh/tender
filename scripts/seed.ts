@@ -158,7 +158,7 @@ export interface SeedOptions {
   windows?: SeedWindows;
   /** Receives each line the script prints. Defaults to `console.log`. */
   log?: (line: string) => void;
-  /** Where `deployments/` is. The repository root by default. */
+  /** Where `deployments/` is. The repository root by default, or what `TENDER_ENV_DIR` names. */
   dir?: string;
 }
 
@@ -906,7 +906,7 @@ export function describeFailure(error: unknown): string {
 }
 
 export interface CliOptions {
-  /** Where the env files and `deployments/` are. The repository root by default. */
+  /** Where the env files and `deployments/` are. The repository root by default, or what `TENDER_ENV_DIR` names. */
   dir?: string;
   /** Receives the script's lines. Defaults to `console.log`. */
   out?: (line: string) => void;

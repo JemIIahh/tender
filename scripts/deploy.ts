@@ -38,7 +38,7 @@ import {
   type KeyPairString,
 } from "near-api-js";
 import { AccountDoesNotExistError } from "near-api-js/rpc-errors";
-import { loadEnv, parseEnvText, REPO_ROOT } from "./lib/env";
+import { envDir, loadEnv, parseEnvText, REPO_ROOT } from "./lib/env";
 
 /**
  * The deploy script. Under one parent account it creates the team's ten accounts, deploys the test
@@ -115,7 +115,7 @@ export interface DeployTarget {
 }
 
 export interface DeployOptions {
-  /** Where `.env.deploy.<network>` and `deployments/` are. The repository root by default. */
+  /** Where `.env.deploy.<network>` and `deployments/` are. The repository root by default, or what `TENDER_ENV_DIR` names. */
   dir?: string;
   /** Receives each `OK <step>` and `SKIP <step> (exists)` line, and nothing else. */
   log?: (line: string) => void;
@@ -946,7 +946,7 @@ function agentRegisterStep(ctx: Context, member: Member): Step {
 }
 
 /** The path of a network's record. */
-export function deploymentPath(network: NetworkId, dir: string = REPO_ROOT): string {
+export function deploymentPath(network: NetworkId, dir: string = envDir()): string {
   return join(dir, "deployments", `${network}.json`);
 }
 
@@ -1017,7 +1017,7 @@ function parseDeployment(json: unknown, network: NetworkId, source: string): Dep
  */
 export async function readDeployment(
   network: NetworkId,
-  dir: string = REPO_ROOT,
+  dir: string = envDir(),
 ): Promise<Deployment | null> {
   const path = deploymentPath(network, dir);
   let text: string;
@@ -1165,7 +1165,7 @@ export async function deploy(
       "deploy needs the RPC URL of the chain: a local node picks its port, so pass its rpcUrl",
     );
   }
-  const dir = options.dir ?? REPO_ROOT;
+  const dir = options.dir ?? envDir();
   const log = options.log ?? console.log;
   const limit = laneLimit(network);
 
@@ -1340,7 +1340,7 @@ export function loadTarget(
     throw new UsageError(`unknown network ${JSON.stringify(network)}\n${USAGE}`);
   }
 
-  const dir = options.dir ?? REPO_ROOT;
+  const dir = options.dir ?? envDir();
   const account = loadEnv("testnet", { dir }).DEPLOY_PARENT_ACCOUNT?.trim();
   if (account === undefined || account === "") {
     throw new UsageError(parentSetup(options.now ?? new Date()));
@@ -1369,7 +1369,7 @@ export function describeFailure(error: unknown): string {
 }
 
 export interface CliOptions {
-  /** Where the env files and `deployments/` are. The repository root by default. */
+  /** Where the env files and `deployments/` are. The repository root by default, or what `TENDER_ENV_DIR` names. */
   dir?: string;
   now?: Date;
   /** Receives the lines of the deploy. Defaults to `console.log`. */
