@@ -192,7 +192,7 @@ test("my_tasks_opens_on_what_is_to_pick_with_a_count_soonest_first", async () =>
   for (const row of rows) {
     const step = stepOf(row);
     expect(step?.getAttribute("data-step")).toBe("pick");
-    expect(step?.getAttribute("href")).toMatch(/^\/tasks\/4[02]$/);
+    expect(step?.getAttribute("href")).toMatch(/^\/tasks\/4[02]#pick$/);
   }
   expect(stepOf(rows[1] as HTMLElement)?.getAttribute("aria-label")).toBe(
     "Pick the winners of task #40",
@@ -225,9 +225,11 @@ test("my_tasks_posted_shows_the_next_step_of_each_task", async () => {
     "Sort the inbox": "pick",
     "Done task": null,
   });
-  // Each step is a link to the task's page, which holds the action; the page signs nothing.
+  // Each step is a link to the step's control on the task's page; this page signs nothing.
   const lapsed = rowsOf("posted").find((row) => row.textContent?.includes("Lapsed task"));
-  expect(stepOf(lapsed as HTMLElement)?.getAttribute("href")).toBe("/tasks/43");
+  expect(stepOf(lapsed as HTMLElement)?.getAttribute("href")).toBe("/tasks/43#refund");
+  const openTask = rowsOf("posted").find((row) => row.textContent?.includes("Open task"));
+  expect(stepOf(openTask as HTMLElement)?.getAttribute("href")).toBe("/tasks/45#top-up");
   expect(screen.queryByRole("button", { name: /pick|refund|top up/i })).toBeNull();
 });
 

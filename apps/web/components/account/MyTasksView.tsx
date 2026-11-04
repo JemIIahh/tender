@@ -20,7 +20,8 @@ import { Cell, ConnectGate, ROW, Rows, TaskCell } from "./parts";
 
 // My tasks: what the connected account posted, what it has to pick, and the hires it made of a
 // service, each task with its phase, its reward, its entries, when its window closes, and the next
-// step the account can take. The step is a link to the task's page; nothing here signs anything.
+// step the account can take. The step is a link to that step's control on the task's page
+// (`/tasks/<id>#pick`, `#refund`, `#top-up`); nothing here signs anything.
 
 type Tab = "pick" | "posted" | "hires";
 
@@ -45,7 +46,9 @@ function StepLink({ task, step }: { task: TaskSummary; step: NextStep | null }) 
   const look = STEPS[step];
   return (
     <Link
-      href={`/tasks/${task.id}`}
+      // The task page's control for the step has the step's name as its id (#pick, #refund,
+      // #top-up), so the link lands on it; a page without it opens at its top.
+      href={`/tasks/${task.id}#${step}`}
       aria-label={look.name(task.id)}
       data-testid="next-step"
       data-step={step}

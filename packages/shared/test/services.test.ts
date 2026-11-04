@@ -12,6 +12,7 @@ import {
   hireDocuments,
   hireMismatch,
   hireTerms,
+  isHireCriteriaOf,
   isHireTask,
   PublicCriteriaSchema,
   rubricCriteriaProblem,
@@ -152,6 +153,7 @@ test("a_task_is_a_hire_when_it_invites_one_agent_once_with_a_hires_criteria", ()
       criteria_hash: hireDocuments(service, "a request").criteriaHash,
     };
   };
+  const JUDGED_HASH = sha256Hex(canonicalJson(criteria));
   const services = [SERVICE, judged];
   expect(isHireTask(posted(SERVICE), services)).toBe(true);
   // The hirer-accepts criteria are the same for every service, so no listing is needed for them.
@@ -173,6 +175,12 @@ test("a_task_is_a_hire_when_it_invites_one_agent_once_with_a_hires_criteria", ()
   // Other criteria: a pinned task, and no hire.
   expect(isHireTask({ ...hire, criteria_hash: "ab".repeat(32) }, services)).toBe(false);
   expect(hireCriteriaHash(SERVICE)).toBe(HIRER_ACCEPTS_CRITERIA_HASH);
+
+  // The criteria half of the rule, which the agent runner asks of a task that invites its agent.
+  expect(isHireCriteriaOf(HIRER_ACCEPTS_CRITERIA_HASH, "anyone.near", [])).toBe(true);
+  expect(isHireCriteriaOf(JUDGED_HASH, "writer.acme.near", [judged])).toBe(true);
+  expect(isHireCriteriaOf(JUDGED_HASH, "other.near", [judged])).toBe(false);
+  expect(isHireCriteriaOf("cd".repeat(32), "writer.acme.near", services)).toBe(false);
 });
 
 test("a_hire_matches_a_service_only_on_its_terms", () => {

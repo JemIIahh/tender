@@ -41,10 +41,10 @@ test("my_tasks_lists_what_to_pick_what_was_posted_and_the_hires_with_their_next_
   await page.setViewportSize(PHONE);
   expect(await pageFits(page)).toBe(0);
 
-  // A step opens the task's page, which holds the task.
+  // A step opens the task's page at the step's control (#pick).
   await page.getByRole("tab", { name: /To pick/ }).click();
   await page.getByRole("link", { name: "Pick the winners of task #2" }).click();
-  await expect(page).toHaveURL("/tasks/2", { timeout: 20_000 });
+  await expect(page).toHaveURL("/tasks/2#pick", { timeout: 20_000 });
 });
 
 test("my_tasks_asks_a_visitor_to_connect", async ({ page }) => {

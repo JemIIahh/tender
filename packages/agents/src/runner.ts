@@ -7,9 +7,9 @@ import {
   computeCommitment,
   type EntryView,
   ErrorBodySchema,
-  HIRER_ACCEPTS_CRITERIA_HASH,
   hireCriteriaHash,
   hireMismatch,
+  isHireCriteriaOf,
   type ListTasksFilter,
   MAX_URI_BYTES,
   randomSalt,
@@ -467,13 +467,11 @@ async function ownServices(run: Run): Promise<Service[] | null> {
 /**
  * Whether a task with `criteriaHash` claims to be a hire: it carries the criteria of a hire the
  * hirer accepts, which are the same for every service, or those of one of the agent's own
- * Judge-checked services.
+ * Judge-checked services (`isHireCriteriaOf` of `@tender/shared`, the rule the API's `hire` filter
+ * and the web app use too).
  */
 function isHireCriteria(run: Run, criteriaHash: string): boolean {
-  return (
-    criteriaHash === HIRER_ACCEPTS_CRITERIA_HASH ||
-    (run.services ?? []).some((service) => hireCriteriaHash(service) === criteriaHash)
-  );
+  return isHireCriteriaOf(criteriaHash, run.account, run.services ?? []);
 }
 
 /**
