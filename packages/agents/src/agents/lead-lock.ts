@@ -2,10 +2,12 @@ import { randomUUID } from "node:crypto";
 import {
   closeSync,
   fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeSync,
 } from "node:fs";
@@ -14,17 +16,23 @@ import { dirname, join, resolve } from "node:path";
 // One swarm lead per journal. The lead keeps a journal so that it never pays for a part twice, and
 // two lead processes on one journal directory could both act on it: both hire, both assemble. So a
 // lead holds the journal while it runs (`run` of `createLeadSolver`): a lock file in the directory,
-// made with O_EXCL (the `wx` flag, which only one process can make), holding its pid, the time it
-// started, and a random token by which the holder tells its own file from another's.
+// holding its pid, the time it started, and a random token by which the holder tells its own file
+// from another's. The file is written whole under a name of its own first (made with O_EXCL, the
+// `wx` flag, and synced), and then linked to the lock's name: a link fails if the name is taken, so
+// only one lead can make it, and the lock is never seen half written.
 //
 // - A second lead on the journal refuses to start, and its message names the pid that holds it.
 // - A lock whose pid is not alive is a leftover (a lead that was killed runs nothing): it is taken
-//   over, and the log says so. A pid can come back as another process's, and then the lock looks
-//   held: the message says to delete the file in that case. Two leads that take over the same
-//   leftover in the same instant could both end up with the journal: the file is removed only if it
-//   is still what was read, which leaves a window of microseconds.
-// - A file that names no process is refused: a lead may be making it this moment (the file exists
-//   before its text is written), or one stopped as it made it.
+//   over, and the log says so. It is first renamed aside, which moves the one file there is under
+//   the name, whatever it holds by then, and read where it went: if it is the leftover, it goes,
+//   and the lead links its own lock in; if another lead took the leftover over in between, its lock
+//   is linked back where it was, and this lead is refused by it. Only a third lead that makes a
+//   lock in the moment between the move and the link back can leave two leads with the journal, and
+//   the one that lost its file stands back at its next pass (`journalHeldElsewhere`).
+// - A pid can come back as another process's, and then the lock looks held: the message says to
+//   delete the file in that case.
+// - A file that names no process is refused: no lead made it (a lead writes its lock whole), or it
+//   was damaged.
 // - The lock goes when the lead lets it go, when the process exits (`process.exit`, or the end of
 //   its work), and on SIGINT and SIGTERM. For those two: when the process has no other handler for
 //   the signal, which would then end it at once, the lock is let go and the signal is raised again,
@@ -106,24 +114,56 @@ function readLock(file: string): string | undefined {
   }
 }
 
-/** Makes `file` with `text` in it, if no file of that name is there. Returns whether it did. */
-function create(file: string, text: string): boolean {
-  let fd: number;
-  try {
-    fd = openSync(file, "wx", 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-    throw error;
-  }
+const codeOf = (error: unknown) => (error as NodeJS.ErrnoException).code;
+
+/** Writes `text` to a new file `file` (O_EXCL), and syncs it, so that what is linked to it is whole. */
+function writeWhole(file: string, text: string): void {
+  const fd = openSync(file, "wx", 0o600);
   try {
     writeSync(fd, text);
+    fsyncSync(fd);
   } catch (error) {
     closeSync(fd);
     rmSync(file, { force: true });
     throw error;
   }
   closeSync(fd);
-  return true;
+}
+
+/** Links `from` to the name `to`, if no file has that name. Returns whether it did. */
+function linkIfFree(from: string, to: string): boolean {
+  try {
+    linkSync(from, to);
+    return true;
+  } catch (error) {
+    if (codeOf(error) === "EEXIST") return false;
+    throw error;
+  }
+}
+
+/**
+ * Moves the leftover lock `found` out of `file`'s way, through `aside`. The rename moves whatever is
+ * under the name now, so the file is read where it went: if it is the leftover, it is removed and
+ * this returns true. If it is not, another lead made its lock in place of the leftover since it was
+ * read, and that lock is linked back under the name it had (unless yet another lead has made one
+ * there meanwhile), and this returns false: the next look finds the live lock.
+ */
+function setAside(file: string, found: string, aside: string): boolean {
+  try {
+    renameSync(file, aside);
+  } catch (error) {
+    // Gone since the read: another lead took the leftover over, and the next look finds its lock.
+    if (codeOf(error) === "ENOENT") return false;
+    throw error;
+  }
+  let moved: string | undefined;
+  try {
+    moved = readLock(aside);
+  } finally {
+    if (moved !== found) linkIfFree(aside, file);
+    rmSync(aside, { force: true });
+  }
+  return moved === found;
 }
 
 const started = (holder: JournalHolder) =>
@@ -168,63 +208,70 @@ export function lockJournal(dir: string, log: (line: string) => void): JournalLo
     );
   }
   const file = join(journal, JOURNAL_LOCK_FILE);
+  const token = randomUUID();
   const text = `${JSON.stringify({
     pid: process.pid,
     started_at: new Date().toISOString(),
-    token: randomUUID(),
+    token,
   })}\n`;
-
-  let leftover: JournalHolder | undefined;
-  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
-    if (create(file, text)) {
-      held.set(key, { file, text });
-      hookProcess();
-      if (leftover !== undefined) {
-        log(
-          `took over the journal ${journal} from process ${leftover.pid}${started(leftover)}, which no longer runs`,
+  // Names of this lead's own, which no other lead uses: the lock written whole, and a leftover
+  // moved aside. Neither ends in `.json`, so the journal never takes one for a job.
+  const whole = join(journal, `.${JOURNAL_LOCK_FILE}.${token}.tmp`);
+  const aside = join(journal, `.${JOURNAL_LOCK_FILE}.${token}.stale`);
+  writeWhole(whole, text);
+  try {
+    let leftover: JournalHolder | undefined;
+    for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+      if (linkIfFree(whole, file)) {
+        held.set(key, { file, text });
+        hookProcess();
+        if (leftover !== undefined) {
+          log(
+            `took over the journal ${journal} from process ${leftover.pid}${started(leftover)}, which no longer runs`,
+          );
+        }
+        return {
+          file,
+          release() {
+            if (held.get(key)?.text !== text) return;
+            held.delete(key);
+            removeIfOwn(file, text);
+            if (held.size === 0) unhookProcess();
+          },
+        };
+      }
+      const found = readLock(file);
+      // Gone since the try: try again.
+      if (found === undefined) continue;
+      const holder = holderOf(found);
+      if (holder === undefined) {
+        throw new JournalLockedError(
+          `the journal ${journal} has a lock file that names no process, ${file}: a lead writes its ` +
+            "lock whole, so no lead made this one, or it was damaged. If no lead works from this " +
+            "journal, delete it",
+          null,
         );
       }
-      return {
-        file,
-        release() {
-          if (held.get(key)?.text !== text) return;
-          held.delete(key);
-          removeIfOwn(file, text);
-          if (held.size === 0) unhookProcess();
-        },
-      };
+      // A lock with this process's pid that this process does not hold is a leftover of an earlier
+      // process that had the same pid.
+      if (holder.pid !== process.pid && alive(holder.pid)) {
+        throw new JournalLockedError(
+          `the journal ${journal} is held by another lead, process ${holder.pid}${started(holder)}: ` +
+            "one lead at a time works from a journal. Stop that process, or give this lead a journal " +
+            `of its own. If process ${holder.pid} is no lead (its number was taken by another ` +
+            `process), delete ${file}`,
+          holder.pid,
+        );
+      }
+      if (setAside(file, found, aside)) leftover = holder;
     }
-    const found = readLock(file);
-    // Gone since the try: try again.
-    if (found === undefined) continue;
-    const holder = holderOf(found);
-    if (holder === undefined) {
-      throw new JournalLockedError(
-        `the journal ${journal} has a lock file that names no process, ${file}: a lead may be ` +
-          "taking it this moment, or one stopped as it took it. Try again; if it says the same, " +
-          "no lead is taking it, and the file can be deleted",
-        null,
-      );
-    }
-    // A lock with this process's pid that this process does not hold is a leftover of an earlier
-    // process that had the same pid.
-    if (holder.pid !== process.pid && alive(holder.pid)) {
-      throw new JournalLockedError(
-        `the journal ${journal} is held by another lead, process ${holder.pid}${started(holder)}: ` +
-          "one lead at a time works from a journal. Stop that process, or give this lead a journal " +
-          `of its own. If process ${holder.pid} is no lead (its number was taken by another ` +
-          `process), delete ${file}`,
-        holder.pid,
-      );
-    }
-    // A leftover. Removed only if it is still the one that was read.
-    if (readLock(file) === found) rmSync(file, { force: true });
-    leftover = holder;
+    throw new JournalLockedError(
+      `the journal ${journal} is being taken by another lead just now: try again`,
+      null,
+    );
+  } finally {
+    rmSync(whole, { force: true });
   }
-  throw new JournalLockedError(
-    `the journal ${journal} is being taken by another lead just now: try again`,
-    null,
-  );
 }
 
 /**

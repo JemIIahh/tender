@@ -63,9 +63,10 @@ import { journalHeldElsewhere, lockJournal } from "./lead-lock";
 // (`lead-lock.ts`), a second lead's `run` on it is refused with the pid that holds it, and a lead
 // that does not hold it takes no parent and makes no pass while another live process does. A post
 // is written down before it is sent as an intent, and a job that finds an intent it cannot account
-// for asks the chain whether the post landed (`reconcile`) before it posts anything. A note is only a note if it outlives a power cut, so a write returns once the file
-// is on the disk and its name is too (`writeFileAtomic`: temp file synced, renamed, folder synced);
-// a write that cannot be made so fails, and the post that waited on it is not sent.
+// for asks the chain whether the post landed (`reconcile`) before it posts anything. A note is only
+// a note if it outlives a power cut, so a write returns once the file is on the disk and its name is
+// too (`writeFileAtomic`: temp file synced, renamed, folder synced); a write that cannot be made so
+// fails, and the post that waited on it is not sent.
 //
 // A post is sent again only when its transaction cannot land. The client tells the lead the hash of
 // each transaction it signs, before it is sent (`beforeSend`), and the lead writes the hash and the

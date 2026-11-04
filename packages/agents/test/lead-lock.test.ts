@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -7,7 +7,8 @@ import { deadPid, holdJournal, killHolders } from "./journal-holder";
 
 // One swarm lead per journal. The lead keeps a journal so that it never pays for a part twice, and
 // two leads on one journal could both act on it. So a lead takes a lock file in the journal
-// directory when it starts (`lockJournal`, made with O_EXCL, holding its pid and its start time),
+// directory when it starts (`lockJournal`: written whole, then linked in, holding its pid and its
+// start time),
 // and these tests use processes of their own (`holdJournal`) for the second lead, the one that dies
 // by a signal and the one that is killed.
 
@@ -85,7 +86,8 @@ describe("the lead's journal lock", () => {
     ]);
     expect(holderIn().pid).toBe(process.pid);
     lock.release();
-    expect(existsSync(file)).toBe(false);
+    // Nothing is left behind: the lock, the copy it was written to and the leftover are all gone.
+    expect(readdirSync(dir)).toEqual([]);
 
     // A lead that was killed, which runs no handler, leaves its lock behind: the next takes it over.
     const killed = holdJournal(dir);
@@ -152,12 +154,13 @@ describe("the lead's journal lock", () => {
       expect(refused, text).toBeInstanceOf(JournalLockedError);
       expect(refused?.pid, text).toBeNull();
       expect(refused?.message, text).toBe(
-        `the journal ${dir} has a lock file that names no process, ${file}: a lead may be ` +
-          "taking it this moment, or one stopped as it took it. Try again; if it says the same, " +
-          "no lead is taking it, and the file can be deleted",
+        `the journal ${dir} has a lock file that names no process, ${file}: a lead writes its ` +
+          "lock whole, so no lead made this one, or it was damaged. If no lead works from this " +
+          "journal, delete it",
       );
-      // Left as it was.
+      // Left as it was, and nothing else is left.
       expect(readFileSync(file, "utf8"), text).toBe(text);
+      expect(readdirSync(dir), text).toEqual([JOURNAL_LOCK_FILE]);
     }
   });
 
@@ -179,6 +182,8 @@ describe("the lead's journal lock", () => {
 
   test("letting_go_leaves_a_lock_file_that_is_no_longer_this_leads", () => {
     const lock = lockJournal(dir, () => undefined);
+    // Only the lock is in the directory while it is held.
+    expect(readdirSync(dir)).toEqual([JOURNAL_LOCK_FILE]);
     // Someone deleted the file and another lead took the journal since.
     const other = `${JSON.stringify({ pid: 1, started_at: "2026-11-04T10:00:00.000Z", token: "x" })}\n`;
     writeFileSync(file, other);
