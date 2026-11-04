@@ -1,17 +1,33 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { TenderError } from "@tender/client";
-import type { AgentView, ConfigView } from "@tender/shared";
+import { type ConnectApi, TenderError } from "@tender/client";
+import {
+  type AgentView,
+  type ConfigView,
+  type ConnectLookup,
+  connectFingerprint,
+} from "@tender/shared";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   type AgentTarget,
   type ClientFactory,
   type CommandOptions,
   claimBondCommand,
+  connectAgentCommand,
   initAgent,
   main,
   registerAgentCommand,
@@ -849,3 +865,185 @@ test("the_script_run_as_a_process_prints_the_public_key_and_never_the_private_on
     `${(second as { stdout: string }).stdout}${(second as { stderr: string }).stderr}`,
   ).not.toContain(secret.slice("ed25519:".length));
 }, 60_000);
+
+// ---- connect ----------------------------------------------------------------------------------
+
+/** An API for `connect` that knows one code, for `writer.alice.testnet` on the sandbox. */
+function connectApi(over: Partial<ConnectLookup> = {}) {
+  const asked: string[] = [];
+  const lookup: ConnectLookup = {
+    owner: "alice.testnet",
+    name: "writer",
+    account_id: "writer.alice.testnet",
+    network: "sandbox",
+    contract: "tender.test.near",
+    state: "waiting",
+    expires_at: "2026-11-04T10:30:00.000Z",
+    fingerprint: null,
+    ...over,
+  };
+  const api: ConnectApi = {
+    async connectLookup() {
+      asked.push("lookup");
+      return lookup;
+    },
+    async connectAttach(_code, publicKey) {
+      asked.push(`attach ${publicKey}`);
+      return { ...lookup, state: "attached", fingerprint: connectFingerprint(publicKey) };
+    },
+    async connectRegistered() {
+      asked.push("registered");
+      return {
+        account_id: lookup.account_id,
+        state: "registered",
+        registered_at: lookup.expires_at,
+      };
+    },
+  };
+  return { api, asked };
+}
+
+const CONNECT_CODE = "tc_abcdefghijklmnopqrstuvwxyz";
+
+test("connect_takes_the_code_first_and_refuses_what_is_not_one_with_the_usage", async () => {
+  const errLines: string[] = [];
+  const run = (args: string[]) => main(args, { ...options(), log, err: (t) => errLines.push(t) });
+  for (const args of [["connect"], ["connect", "--api", "https://api.example"]]) {
+    errLines.length = 0;
+    expect(await run(args), JSON.stringify(args)).toBe(1);
+    expect(errLines.join("\n")).toMatch(/connect needs the code from the Add an agent page/);
+  }
+  errLines.length = 0;
+  expect(await run(["connect", CONNECT_CODE, "--api", "https://api.example", "--wait", "0"])).toBe(
+    1,
+  );
+  expect(errLines.join("\n")).toMatch(/--wait must be a whole number of minutes/);
+  errLines.length = 0;
+  expect(await run(["connect", "tc_short", "--api", "https://api.example"])).toBe(1);
+  expect(errLines.join("\n")).toMatch(/agent connect stopped: that is not a connect code/);
+});
+
+test("connect_sends_the_code_only_over_https_or_to_this_machine", async () => {
+  const { api } = connectApi();
+  const run = (url: string | undefined) =>
+    connectAgentCommand({
+      ...options(),
+      code: CONNECT_CODE,
+      ...(url === undefined ? {} : { api: url }),
+      apiFor: () => api,
+      waitMs: 0,
+    });
+  await expect(run("http://api.example")).rejects.toThrow(
+    /--api must be https, or http to localhost/,
+  );
+  await expect(run(undefined)).rejects.toThrow(/--api <url> is needed/);
+  await expect(run("https://api.example/v1?x=1")).rejects.toThrow(
+    /not the address of a Tender API/,
+  );
+  // TENDER_API_URL stands in for the flag.
+  const outcome = await connectAgentCommand({
+    ...options({ env: { ...options().env, TENDER_API_URL: "http://127.0.0.1:9" } }),
+    code: CONNECT_CODE,
+    apiFor: () => api,
+    waitMs: 0,
+    chainCheck: async () => "missing",
+  });
+  expect(outcome.status).toBe("waiting_for_account");
+});
+
+test("connect_refuses_a_chain_that_is_not_the_codes_before_a_key_is_made", async () => {
+  const { api, asked } = connectApi({ contract: "other.test.near" });
+  await expect(
+    connectAgentCommand({
+      ...options(),
+      code: CONNECT_CODE,
+      api: "https://api.example",
+      apiFor: () => api,
+      waitMs: 0,
+    }),
+  ).rejects.toThrow(
+    /serves the contract other\.test\.near on sandbox, and this machine names tender\.test\.near/,
+  );
+  expect(asked).toEqual(["lookup"]);
+  await expect(stat(join(keys, "writer.json"))).rejects.toMatchObject({ code: "ENOENT" });
+
+  const network = connectApi();
+  await expect(
+    connectAgentCommand({
+      ...options(),
+      network: "testnet",
+      code: CONNECT_CODE,
+      api: "https://api.example",
+      apiFor: () => network.api,
+      waitMs: 0,
+    }),
+  ).rejects.toThrow(/this code is for sandbox, and --network says testnet/);
+  expect(network.asked).toEqual(["lookup"]);
+});
+
+test("connect_makes_inits_key_attaches_its_public_half_and_uses_it_again_on_the_next_run", async () => {
+  const { api, asked } = connectApi();
+  const run = () =>
+    connectAgentCommand({
+      ...options(),
+      code: CONNECT_CODE,
+      api: "https://api.example",
+      apiFor: () => api,
+      waitMs: 0,
+      chainCheck: async () => "missing",
+    });
+  const first = await run();
+  expect(first.status).toBe("waiting_for_account");
+  const file = JSON.parse(await readFile(join(keys, "writer.json"), "utf8"));
+  expect(file).toMatchObject({
+    version: 1,
+    name: "writer",
+    network: "sandbox",
+    account: "writer.alice.testnet",
+  });
+  expect((await stat(join(keys, "writer.json"))).mode & 0o777).toBe(0o600);
+  expect(asked).toEqual(["lookup", `attach ${file.publicKey}`]);
+  expect(out).toContain(`public key: ${file.publicKey}`);
+  expect(out).toContain(`fingerprint: ${connectFingerprint(file.publicKey)}`);
+
+  // The second run uses the same key: nothing is made again.
+  out.length = 0;
+  await run();
+  expect(out).toContain(`key: using ${join(await realpath(keys), "writer.json")}`);
+  expect(asked.filter((line) => line.startsWith("attach"))).toEqual([
+    `attach ${file.publicKey}`,
+    `attach ${file.publicKey}`,
+  ]);
+  expect(everything()).not.toContain(file.privateKey.slice("ed25519:".length));
+
+  // A key file of the same name for another account is not taken.
+  await rm(join(keys, "writer.json"));
+  await init("writer", "someone.test.near");
+  await expect(run()).rejects.toThrow(
+    /is for someone\.test\.near, not writer\.alice\.testnet: pass another --name/,
+  );
+});
+
+test("the_command_line_of_connect_exits_2_when_it_stopped_to_wait", async () => {
+  const { api } = connectApi();
+  // A clock that moves only when the command sleeps: the minute of `--wait 1` passes at once.
+  let clock = 0;
+  const code = await main(
+    ["connect", CONNECT_CODE, "--api", "https://api.example", "--wait", "1"],
+    {
+      ...options(),
+      log,
+      err: (t) => err.push(t),
+      connect: {
+        apiFor: () => api,
+        chainCheck: async () => "missing",
+        now: () => clock,
+        sleep: async (ms) => {
+          clock += ms;
+        },
+      },
+    },
+  );
+  expect(code).toBe(2);
+  expect(out.at(-1)).toMatch(/stopped waiting: .*Run the same command again to go on\./);
+});

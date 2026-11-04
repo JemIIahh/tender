@@ -1,0 +1,345 @@
+import {
+  ApiError,
+  CONNECT_CODE_PATTERN,
+  type ConnectLookup,
+  type ConnectRegistered,
+  connectFingerprint,
+  formatTokenAmount,
+  tokenMeta,
+} from "@tender/shared";
+import { JsonRpcProvider } from "near-api-js";
+import { AccessKeyDoesNotExistError, AccountDoesNotExistError } from "near-api-js/rpc-errors";
+import type { RegistrationPlan } from "./bond";
+import { AGENT_NAME } from "./keyfile";
+
+// The agent's side of "Connect your agent" (`@tender/shared`'s `connect.ts` has the whole flow):
+// `pnpm agent:connect <code>` (scripts/agent.ts) and the MCP server's `connect_to_tender` both run
+// `connectAgent`, each with its own way to keep the key and to register, so that the two say the
+// same things in the same order.
+//
+//   1. look the code up: the account it is for, on which network and contract;
+//   2. the agent's key for that account: the one its key file holds, or a new one made now (the
+//      caller's `key`, which never shows the private half);
+//   3. attach the PUBLIC key to the code, and print its fingerprint, which the owner's page shows
+//      too, for the owner to match before pressing Create agent;
+//   4. wait for the account to exist with this key as a full-access key;
+//   5. wait for the bond to be in the agent's vault (the owner's batch pays it there);
+//   6. register (the caller's `register`, with the agent's own key), and tell the API.
+//
+// Every wait has an end (`waitMs`). One that ends before the step is done returns where it stopped,
+// and running the same thing again with the same code goes on from there: the key file is used
+// again, and attaching the same key twice is answered as the first time.
+
+/** What the agent asks the API: the three routes that the code alone opens. */
+export interface ConnectApi {
+  connectLookup(code: string): Promise<ConnectLookup>;
+  connectAttach(code: string, publicKey: string): Promise<ConnectLookup>;
+  connectRegistered(code: string): Promise<ConnectRegistered>;
+}
+
+/** What the chain says of an account and a key. */
+export type ConnectKeyState = "missing" | "other-keys" | "has-key";
+
+/** What the agent reads of the chain while it waits. */
+export interface ConnectChain {
+  /** Whether `accountId` exists, and has `publicKey` as a full-access key. */
+  keyState(accountId: string, publicKey: string): Promise<ConnectKeyState>;
+  /** What registering `accountId` takes now (`planRegistration`). */
+  plan(accountId: string): Promise<RegistrationPlan>;
+}
+
+/** The agent's key, as the caller keeps it: its PUBLIC half and where the file is. */
+export interface ConnectKey {
+  publicKey: string;
+  path: string;
+  /** Whether it was made now, and not read from a file made before. */
+  made: boolean;
+}
+
+export interface ConnectAgentOptions {
+  code: string;
+  /** The agent's name, for its key file and profile. Default: the name the code was made for. */
+  name?: string;
+  api: ConnectApi;
+  /**
+   * The chain the code's lookup names, made once the lookup has said which, and before any key is
+   * made: a caller whose settings name another network or contract throws here.
+   */
+  chainFor(lookup: ConnectLookup): ConnectChain;
+  /**
+   * The key of agent `name` for the code's account: read from its file, or made now if `mayMake`.
+   * Null when there is no file and it may not make one: a code that has a key attached already
+   * can only be this agent's if its key is on this machine.
+   */
+  key(lookup: ConnectLookup, name: string, mayMake: boolean): Promise<ConnectKey | null>;
+  /** Registers the agent with its own key, once its vault holds the bond. */
+  register(lookup: ConnectLookup, name: string, key: ConnectKey): Promise<void>;
+  log: (line: string) => void;
+  /** How long to wait for the owner, and then for the bond, before stopping where it is. */
+  waitMs: number;
+  /** How often to look while waiting. Default: 3 s. */
+  pollMs?: number;
+  /** How long to keep asking the API to take the agent's word, once registered. Default: 60 s. */
+  confirmMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+/** Where `connectAgent` stopped. */
+export interface ConnectOutcome {
+  status: "registered" | "waiting_for_account" | "waiting_for_bond";
+  accountId: string;
+  owner: string;
+  fingerprint: string;
+  keyPath: string;
+  /** Whether the API took the agent's word that it registered (null while it has not registered). */
+  confirmed: boolean | null;
+}
+
+/** A failure the person can act on, in words of ours: no text a server chose is in it. */
+export class ConnectError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConnectError";
+  }
+}
+
+/** The code of an `ApiError`'s body, if it has one: what the API's refusal is, to branch on. */
+function apiCode(error: unknown): string | null {
+  if (!(error instanceof ApiError)) return null;
+  const body = error.body as { error?: unknown } | null | undefined;
+  return typeof body?.error === "string" ? body.error : null;
+}
+
+/** What a refusal of the API means for the agent, in words of ours. Anything else is thrown as it is. */
+function explain(error: unknown): never {
+  switch (apiCode(error)) {
+    case "not_found":
+      throw new ConnectError(
+        "the API knows no such connect code (it was mistyped, or is more than a day old): ask the " +
+          "owner for a new code on the Add an agent page",
+      );
+    case "code_expired":
+      throw new ConnectError(
+        "this connect code took no key in its 30 minutes and has expired: ask the owner for a new " +
+          "code on the Add an agent page",
+      );
+    case "already_attached":
+      throw new ConnectError(
+        "this connect code has another key attached already, which is not this agent's: someone " +
+          "else may have the code. Tell the owner NOT to press Create agent, and to get a new code",
+      );
+    case "rate_limited":
+      throw new ConnectError("the API has had too many requests from here: try again in a minute");
+    case "bad_request":
+      throw new ConnectError("the API did not take the code or the key: copy the command again");
+    default:
+      throw error;
+  }
+}
+
+/** The agent's name: `wanted`, else the name the code was made for if it can name a key file. */
+function nameFor(lookup: ConnectLookup, wanted: string | undefined): string {
+  const name = wanted ?? lookup.name;
+  if (!AGENT_NAME.test(name)) {
+    throw new ConnectError(
+      wanted === undefined
+        ? `the account name ${lookup.name} cannot name a key file (lower-case letters, digits and ` +
+            "dashes, starting with a letter, 32 at most): pass --name <name> for the agent"
+        : "--name must be lowercase letters, digits and dashes, starting with a letter, 32 at most",
+    );
+  }
+  return name;
+}
+
+/**
+ * The chain's `keyState` through an RPC node: a view of the key, and of the account when the key is
+ * not there, at the last final block.
+ */
+export function rpcKeyState(rpcUrl: string): ConnectChain["keyState"] {
+  const provider = new JsonRpcProvider({ url: rpcUrl });
+  return async (accountId, publicKey) => {
+    try {
+      const { permission } = await provider.viewAccessKey({
+        accountId,
+        publicKey,
+        finalityQuery: { finality: "final" },
+      });
+      return permission === "FullAccess" ? "has-key" : "other-keys";
+    } catch (error) {
+      if (error instanceof AccountDoesNotExistError) return "missing";
+      if (!(error instanceof AccessKeyDoesNotExistError)) throw error;
+    }
+    // A node answers a key of an account that does not exist as a key that does not: the account
+    // is asked about on its own.
+    try {
+      await provider.viewAccount({ accountId, blockQuery: { finality: "final" } });
+      return "other-keys";
+    } catch (error) {
+      if (error instanceof AccountDoesNotExistError) return "missing";
+      throw error;
+    }
+  };
+}
+
+/** A span of milliseconds in words: `29m`, `45s`. */
+function span(ms: number): string {
+  return ms >= 60_000 ? `${Math.ceil(ms / 60_000)}m` : `${Math.max(1, Math.ceil(ms / 1000))}s`;
+}
+
+/** How often a wait says it is still waiting. */
+const HEARTBEAT_MS = 30_000;
+
+/**
+ * Connects the agent: see the top of this file. Logs one plain line for each step and nothing
+ * secret: the public key, its fingerprint and where the key file is. Throws a `ConnectError` with
+ * what to do for a refusal it understands; returns where it stopped otherwise.
+ */
+export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOutcome> {
+  const { api, log } = opts;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const now = opts.now ?? Date.now;
+  const pollMs = opts.pollMs ?? 3_000;
+  const code = opts.code.trim();
+  if (!CONNECT_CODE_PATTERN.test(code)) {
+    throw new ConnectError(
+      "that is not a connect code: it starts with tc_ and has 26 letters and digits after it. Copy " +
+        "it again from the Add an agent page",
+    );
+  }
+
+  const lookup = await api.connectLookup(code).catch(explain);
+  const account = lookup.account_id;
+  if (lookup.state === "expired") explain(new ApiError(410, { error: "code_expired" }));
+  log(`connect code for ${account}, made by ${lookup.owner}, on ${lookup.network}`);
+  // Before a key is made or attached: a chain that is not the code's is refused here.
+  const chain = opts.chainFor(lookup);
+
+  const name = nameFor(lookup, opts.name);
+  // A code that has a key already, and not this one, is someone else's: say so before attaching,
+  // and before a key is made for nothing.
+  const key = await opts.key(lookup, name, lookup.fingerprint === null);
+  if (key === null) explain(new ApiError(409, { error: "already_attached" }));
+  const fingerprint = connectFingerprint(key.publicKey);
+  if (lookup.fingerprint !== null && lookup.fingerprint !== fingerprint) {
+    explain(new ApiError(409, { error: "already_attached" }));
+  }
+  log(
+    key.made
+      ? `key: made ${key.path} (mode 600; the private key is in it and is never printed)`
+      : `key: using ${key.path}`,
+  );
+  log(`public key: ${key.publicKey}`);
+  await api.connectAttach(code, key.publicKey).catch(explain);
+  log(`fingerprint: ${fingerprint}`);
+  log(
+    `attached. On the page of ${lookup.owner}, check that the fingerprint is ${fingerprint}, then ` +
+      "press Create agent.",
+  );
+
+  const outcome = (status: ConnectOutcome["status"], confirmed: boolean | null = null) => ({
+    status,
+    accountId: account,
+    owner: lookup.owner,
+    fingerprint,
+    keyPath: key.path,
+    confirmed,
+  });
+
+  /** Looks every `pollMs` until `ready` says so, or `waitMs` is out. */
+  const waitFor = async (
+    what: string,
+    ready: () => Promise<boolean>,
+    giveUpAt: number,
+  ): Promise<boolean> => {
+    let said = now();
+    for (;;) {
+      if (await ready()) return true;
+      const left = giveUpAt - now();
+      if (left <= 0) return false;
+      if (now() - said >= HEARTBEAT_MS) {
+        log(`still waiting for ${what} (${span(left)} more, then this stops)`);
+        said = now();
+      }
+      await sleep(Math.min(pollMs, left));
+    }
+  };
+
+  const giveUpAt = now() + opts.waitMs;
+  log(`waiting for ${lookup.owner} to create ${account}…`);
+  const created = await waitFor(
+    `${account} to be created`,
+    async () => {
+      const state = await chain.keyState(account, key.publicKey);
+      if (state === "other-keys") {
+        throw new ConnectError(
+          `${account} exists, and not with this agent's key as a full-access key: it was made ` +
+            "another way. Ask the owner for a new code with another name",
+        );
+      }
+      return state === "has-key";
+    },
+    giveUpAt,
+  );
+  if (!created) {
+    log(`stopped waiting: ${account} does not exist yet. Run the same command again to go on.`);
+    return outcome("waiting_for_account");
+  }
+  log(`created: ${account} exists, with this key as its full-access key`);
+
+  // The bond: in the vault (the owner's batch puts it there), or held already by a registration.
+  let plan = await chain.plan(account);
+  // An active agent that holds its bond pays none: it registered on an earlier run.
+  if (!(plan.agent?.status === "active" && !plan.takesBond)) {
+    const bondIn = () => !plan.takesBond || plan.terms === null || plan.shortfall === 0n;
+    if (!bondIn() && plan.terms !== null) {
+      const { symbol, decimals } = tokenMeta(plan.terms.token, lookup.network);
+      log(
+        `waiting for the bond: ${formatTokenAmount(plan.terms.amount, decimals)} ${symbol} into ` +
+          `the agent's vault (it holds ${formatTokenAmount(plan.vault, decimals)} ${symbol})…`,
+      );
+    }
+    const funded =
+      bondIn() ||
+      (await waitFor(
+        "the bond",
+        async () => {
+          plan = await chain.plan(account);
+          return bondIn();
+        },
+        Math.max(giveUpAt, now() + pollMs),
+      ));
+    if (!funded) {
+      log(
+        "stopped waiting: the bond is not in the agent's vault yet. The owner presses Fund agent " +
+          "on the page; then run the same command again.",
+      );
+      return outcome("waiting_for_bond");
+    }
+    log("funded: the bond is in the agent's vault");
+    await opts.register(lookup, name, key);
+    log(`registered: ${account} is an agent`);
+  } else {
+    log(`registered: ${account} is an agent already`);
+  }
+
+  // The API takes the agent's word once its index shows it, a few blocks after the chain does.
+  const confirmUntil = now() + (opts.confirmMs ?? 60_000);
+  for (;;) {
+    try {
+      await api.connectRegistered(code);
+      log(`done: ${account} is an active agent, and the page of ${lookup.owner} says so`);
+      return outcome("registered", true);
+    } catch (error) {
+      // The chain has the registration whatever the API says, so nothing here fails the command.
+      if (apiCode(error) !== "not_registered" || now() >= confirmUntil) {
+        log(
+          `done: ${account} is registered on the chain. The API has not listed it yet; the page ` +
+            "ticks Registered once it does.",
+        );
+        return outcome("registered", false);
+      }
+      await sleep(Math.min(2_000, Math.max(1, confirmUntil - now())));
+    }
+  }
+}

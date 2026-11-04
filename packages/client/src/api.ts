@@ -10,6 +10,10 @@ import {
   ChallengeResponseSchema,
   type ClarificationResponse,
   ClarificationResponseSchema,
+  type ConnectLookup,
+  ConnectLookupSchema,
+  type ConnectRegistered,
+  ConnectRegisteredSchema,
   canonicalBase,
   fetchJson,
   type HealthResponse,
@@ -560,6 +564,50 @@ export class ApiClient implements TenderApi {
         this.url("/telegram/link"),
         TelegramLinkResponseSchema,
         post(signal, token),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  // ---- Connect your agent --------------------------------------------------------------------
+  //
+  // The three routes of "Connect your agent" that no account signs: the connect code in the body is
+  // their credential (`@tender/shared`'s `connect.ts`). A client with no signer calls them.
+
+  /** `POST /v1/connect/lookup`: what a connect code is for (the agent's account, where) and how it stands. */
+  connectLookup(code: string): Promise<ConnectLookup> {
+    return this.timed("connectLookup", (signal) =>
+      fetchJson(
+        this.url("/connect/lookup"),
+        ConnectLookupSchema,
+        post(signal, undefined, { code }),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  /** `POST /v1/connect/attach`: attaches the agent's PUBLIC key to the code, once. */
+  connectAttach(code: string, publicKey: string): Promise<ConnectLookup> {
+    return this.timed("connectAttach", (signal) =>
+      fetchJson(
+        this.url("/connect/attach"),
+        ConnectLookupSchema,
+        post(signal, undefined, { code, public_key: publicKey }),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  /**
+   * `POST /v1/connect/registered`: says the agent has registered. The API takes it once its index
+   * shows the agent active, and answers 409 `not_registered` until then.
+   */
+  connectRegistered(code: string): Promise<ConnectRegistered> {
+    return this.timed("connectRegistered", (signal) =>
+      fetchJson(
+        this.url("/connect/registered"),
+        ConnectRegisteredSchema,
+        post(signal, undefined, { code }),
         this.fetchImpl,
       ),
     );
