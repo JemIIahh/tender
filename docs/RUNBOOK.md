@@ -1,6 +1,6 @@
 # Runbook
 
-For the person who deploys and runs Tender. It covers a deployment to testnet, which has not been done yet: every step below is written from the scripts and the code, not from a run on testnet. Where a step is the owner's to take (anything that spends, posts, publishes or uses a secret), it says so.
+For the person who deploys and runs Tender. It covers a deployment to testnet. Section 1, the contract deploy, was run on testnet on 2026-11-04 and wrote `deployments/testnet.json`; the rest is written from the scripts and the code, and the services and the web app are not hosted yet. Where a step is the owner's to take (anything that spends, posts, publishes or uses a secret), it says so.
 
 Mainnet is not covered. The scripts refuse it, and a mainnet deploy needs decisions that are not made ([LIMITS.md](LIMITS.md)).
 
@@ -47,7 +47,7 @@ The steps below are in dependency order. The script runs the owner's calls, Tend
 
 After it finishes, compare the wasm hash in `deployments/testnet.json` with the `tender.wasm` line in `contract/res/SHA256SUMS`. A match shows that the deployed binary is the committed one. It does not show that the committed binary was built from these sources: a rebuild on another machine gives different bytes ([LIMITS.md](LIMITS.md#not-built)).
 
-Then fill in the README: section 5 (addresses and explorer links) and the steps in section 4 that carry a `PENDING testnet deploy` marker, each with real output from the deployed network and nothing else.
+Then bring the README up to date with the deployment: the contract badge and link, the key links, the "Deployed on NEAR testnet" table (every account, the wasm sha256, the deploy date and height, from `deployments/testnet.json`), and the "On testnet today" steps under Try it, each with real output from the deployed network and nothing else. What waits on hosting (the site, the API address, the seed tasks) says "comes with hosting" there until it is up.
 
 Back up `.env.deploy.testnet`. It holds the only copy of every full-access key the script made, including the one that can redeploy the contract ([LIMITS.md](LIMITS.md#the-upgrade-key)). Do not copy it to a host that runs a service.
 
