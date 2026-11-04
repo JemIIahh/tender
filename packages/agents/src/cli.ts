@@ -6,6 +6,7 @@ import { parseArgs, parseEnv } from "node:util";
 import {
   ApiClient,
   ApiTimeoutError,
+  bondTermsOf,
   KeyPair,
   type KeyPairString,
   keyKindOf,
@@ -419,30 +420,52 @@ export async function checkAgentKey(
 
 // ---- The registration -------------------------------------------------------------------------
 
-/** What the registration check needs of the chain: one read. */
-export type RegistrationReader = Pick<TenderClient, "getAgent">;
+/** What the registration check needs of the chain: the agent, and the config's bond if it must look. */
+export type RegistrationReader = Pick<TenderClient, "getAgent" | "getConfig">;
 
 /**
- * The line to warn with when `account` is not an active registered agent, or null when it is (or
- * when the chain does not answer within `deadlineMs`: the agent is not held back for a read). The
- * contract takes an entry to an open task only from an active agent that holds the bond (contract
- * Task 16b, `E_NOT_REGISTERED`), so an agent that is not one is refused at every open task it
- * tries. It is a warning and not a stop because a task pinned to the agent takes it without: the
- * agent starts all the same. A function-call key cannot register (it attaches no deposit), so the
- * line names the way: `pnpm agent:register`, with the account's full-access key.
+ * The line to warn with when `account` cannot enter an open task, or null when it can (or when the
+ * chain does not answer within `deadlineMs`: the agent is not held back for a read). The contract
+ * takes an entry to an open task only from an active agent that holds the bond (contract Task 16b,
+ * `E_NOT_REGISTERED`), so two kinds of agent are refused at every open task they try: one that is
+ * not registered (never, unregistering, or retired), and an active one that registered before the
+ * owner set a bond and holds none. It is a warning and not a stop because a task pinned to the
+ * agent takes it without: the agent starts all the same. A function-call key cannot register (it
+ * attaches no deposit), so the line names the way: `pnpm agent:register`, with the account's
+ * full-access key; registering again pays the bond in the second case too.
+ *
+ * The config is read only for an active agent that shows no bond, to tell whether the owner has set
+ * one: while none is set, such an agent is not held back.
  */
 export async function registrationWarning(
   chain: RegistrationReader,
   account: string,
   deadlineMs = KEY_CHECK_DEADLINE_MS,
 ): Promise<string | null> {
+  const way =
+    "Registering takes a bond and a full-access key, which this agent's key is not: " +
+    "run pnpm agent:register for the account.";
   let agent: Awaited<ReturnType<RegistrationReader["getAgent"]>>;
   try {
     agent = await withinDeadline(deadlineMs, chain.getAgent(account));
   } catch {
     return null;
   }
-  if (agent?.status === "active") return null;
+  if (agent?.status === "active") {
+    if (agent.bond_token !== null && agent.bond_amount !== null) return null;
+    let bond: ReturnType<typeof bondTermsOf>;
+    try {
+      bond = bondTermsOf(await withinDeadline(deadlineMs, chain.getConfig()));
+    } catch {
+      return null;
+    }
+    if (bond === null) return null;
+    return (
+      `WARN run-agent: ${account} registered before the bond was set and holds none, so the ` +
+      "contract refuses it at every open task (E_NOT_REGISTERED); a task pinned to it is not " +
+      `affected. ${way}`
+    );
+  }
   const standing =
     agent === null
       ? "is not registered as an agent"
@@ -451,8 +474,7 @@ export async function registrationWarning(
         : "has retired";
   return (
     `WARN run-agent: ${account} ${standing}, so the contract refuses it at every open task ` +
-    "(E_NOT_REGISTERED); a task pinned to it is not affected. Registering takes a bond and a " +
-    "full-access key, which this agent's key is not: run pnpm agent:register for the account."
+    `(E_NOT_REGISTERED); a task pinned to it is not affected. ${way}`
   );
 }
 

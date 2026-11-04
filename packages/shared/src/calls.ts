@@ -375,9 +375,11 @@ export function tokenStorageDepositCall(
  * cannot, and the contract refuses it.
  *
  * A new agent, and a retired one coming back, also pays the bond in force out of its vault, if the
- * owner has set one (`set_agent_bond`), so the vault must hold it first. An active agent's update
- * pays nothing more. The bond is what `claim_agent_bond` pays back, after `unregister_agent` and
- * the cooldown.
+ * owner has set one (`set_agent_bond`), so the vault must hold it first. So does an active agent
+ * that holds no bond (it registered before the owner set one): the contract holds it out of open
+ * tasks until it pays. An active agent that holds its bond pays nothing more for an update. The
+ * bond is what `claim_agent_bond` pays back, after `unregister_agent`, the cooldown, and any open
+ * task the agent entered (`locked_until` in its view).
  */
 export function registerAgentCall(
   contractId: string,
@@ -396,8 +398,9 @@ export function registerAgentCall(
 
 /**
  * `unregister_agent`: starts the caller's way out. From now on it makes no new entry in an open
- * task, and its bond is claimable once the cooldown is over (`claimable_at` in its view). 1
- * yoctoNEAR, so a full-access key only.
+ * task, and its bond is claimable at `claimable_at` in its view: the later of the cooldown's end
+ * and the commit deadline of the latest open task it entered (`locked_until`). 1 yoctoNEAR, so a
+ * full-access key only.
  */
 export function unregisterAgentCall(contractId: string): TenderCall {
   return {

@@ -10,6 +10,7 @@ import { ApiClient, ApiTimeoutError, KeyPair } from "@tender/client";
 import {
   type AgentView,
   ApiError,
+  type ConfigView,
   canonicalJson,
   SIGN_IN_MESSAGE,
   sha256Hex,
@@ -129,6 +130,26 @@ function agentView(over: Partial<AgentView> = {}): AgentView {
     bond_token: "usdc.testnet",
     bond_amount: "1000000",
     claimable_at: null,
+    locked_until: null,
+    ...over,
+  };
+}
+
+/** The config as the chain shows it, with the bond of 1 USDC set unless a test says otherwise. */
+function configView(over: Partial<ConfigView> = {}): ConfigView {
+  return {
+    owner: "owner.testnet",
+    pending_owner: null,
+    treasury: "treasury.testnet",
+    fee_bps: 500,
+    min_window_secs: 60,
+    max_window_secs: 604_800,
+    paused: false,
+    version: 1,
+    tokens: [],
+    agent_bond_token: "usdc.testnet",
+    agent_bond_amount: "1000000",
+    agent_bond_cooldown_secs: "86400",
     ...over,
   };
 }
@@ -140,6 +161,7 @@ function agentView(over: Partial<AgentView> = {}): AgentView {
 function fakeClient(
   viewAccessKey: CliClient["viewAccessKey"],
   getAgent: CliClient["getAgent"],
+  getConfig: CliClient["getConfig"],
 ): CliClient {
   const unexpected = (what: string) => () => {
     throw new Error(`the agent's client was asked to ${what}`);
@@ -148,6 +170,7 @@ function fakeClient(
     accountId: ACCOUNT,
     viewAccessKey,
     getAgent,
+    getConfig,
     commit: unexpected("commit"),
     reveal: unexpected("reveal"),
     storageBalanceOf: unexpected("read a storage balance"),
@@ -164,6 +187,8 @@ interface Setup {
   key?: () => Promise<Found>;
   /** What the chain says of the agent's registration. Default: an active agent. */
   agent?: () => Promise<AgentView | null>;
+  /** What the chain's config says. Default: a bond of 1 USDC is set. */
+  config?: () => Promise<ConfigView>;
   /** What the agent's loop does. Default: nothing, and it ends. */
   loop?: (options: RunAgentOptions) => Promise<void>;
   /** The Tender API client. Default: an empty stand-in. */
@@ -203,7 +228,11 @@ async function start(args: string[], setup: Setup = {}) {
     calls.push("getAgent");
     return setup.agent === undefined ? agentView() : setup.agent();
   });
-  const client = fakeClient(viewAccessKey, getAgent);
+  const getConfig = vi.fn(async (): Promise<ConfigView> => {
+    calls.push("getConfig");
+    return setup.config === undefined ? configView() : setup.config();
+  });
+  const client = fakeClient(viewAccessKey, getAgent, getConfig);
   const makeClient = vi.fn((_config: RunConfig) => {
     calls.push("makeClient");
     return client;
@@ -251,6 +280,7 @@ async function start(args: string[], setup: Setup = {}) {
     home,
     viewAccessKey,
     getAgent,
+    getConfig,
     makeClient,
     createApi,
     loop,
@@ -414,7 +444,57 @@ test("an_active_agent_gets_no_registration_warning_and_a_chain_that_does_not_ans
   expect(failing.out).toEqual([]);
 
   const slow = await registrationWarning(
-    { getAgent: () => new Promise(() => undefined) },
+    { getAgent: () => new Promise(() => undefined), getConfig: async () => configView() },
+    ACCOUNT,
+    20,
+  );
+  expect(slow).toBeNull();
+
+  // An active agent that holds its bond is not held back, and the config is not even read.
+  expect(active.calls).not.toContain("getConfig");
+});
+
+test("an_active_agent_that_holds_no_bond_is_warned_while_a_bond_is_set_and_not_when_none_is", async () => {
+  const bondFree = async () => agentView({ bond_token: null, bond_amount: null });
+
+  // The owner set a bond after the agent registered: every open task refuses it, and the line says
+  // so and names the way (registering again pays the bond), and the agent starts all the same.
+  const held = await start(ARGS, { agent: bondFree });
+  expect(held.code).toBe(0);
+  expect(held.err).toEqual([]);
+  expect(held.calls).toContain("run");
+  expect(held.calls).toContain("getConfig");
+  expect(held.out).toHaveLength(1);
+  const [line] = held.out;
+  expect(line).toMatch(
+    /^WARN run-agent: analyst\.tender\.testnet registered before the bond was set/,
+  );
+  expect(line).toContain("holds none");
+  expect(line).toContain("E_NOT_REGISTERED");
+  expect(line).toContain("pnpm agent:register");
+
+  // No bond set: such an agent is not held back, so no one is warned.
+  const free = await start(ARGS, {
+    agent: bondFree,
+    config: async () => configView({ agent_bond_token: null, agent_bond_amount: null }),
+  });
+  expect(free.code).toBe(0);
+  expect(free.out).toEqual([]);
+
+  // The config does not answer (it fails, or is too slow): the agent is not held back for a read.
+  const failing = await start(ARGS, {
+    agent: bondFree,
+    config: async () => {
+      throw new Error("rpc down");
+    },
+  });
+  expect(failing.code).toBe(0);
+  expect(failing.out).toEqual([]);
+  const slow = await registrationWarning(
+    {
+      getAgent: async () => agentView({ bond_token: null, bond_amount: null }),
+      getConfig: () => new Promise(() => undefined),
+    },
     ACCOUNT,
     20,
   );

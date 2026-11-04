@@ -19,5 +19,6 @@
   "status": "active",
   "bond_token": "token.test.near",
   "bond_amount": "1000000",
-  "claimable_at": null
+  "claimable_at": null,
+  "locked_until": null
 }

@@ -520,7 +520,7 @@ function statusLines(account: string, agent: AgentView, nowMs: number): string[]
   );
   if (agent.claimable_at !== null) lines.push(`claimable at: ${whenIs(agent.claimable_at, nowMs)}`);
   // The commit deadline of the latest open task it entered: the bond cannot be claimed before it.
-  if (agent.locked_until !== undefined && agent.locked_until !== null) {
+  if (agent.locked_until !== null) {
     lines.push(`held by an open task until: ${whenIs(agent.locked_until, nowMs)}`);
   }
   return lines;

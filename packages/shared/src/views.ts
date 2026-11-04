@@ -171,12 +171,11 @@ export const AgentViewSchema = z.object({
   /** While the agent is `unregistering`, from when it can claim its bond (ns); else `null`. */
   claimable_at: U64StringSchema.nullable(),
   /**
-   * The commit deadline (ns) of the latest open task the agent entered: its bond is not claimable
-   * before it, so `claimable_at` is the later of the cooldown's end and this. Optional, since a
-   * contract from before the bond fix round does not send it; `null` or absent means no task holds
-   * the agent.
+   * The latest commit deadline (ns) among the open tasks the agent entered: its bond is not
+   * claimable before it, so `claimable_at` is the later of the cooldown's end and this. `null` if
+   * the agent has entered none.
    */
-  locked_until: U64StringSchema.nullable().optional(),
+  locked_until: U64StringSchema.nullable(),
 });
 export type AgentView = z.infer<typeof AgentViewSchema>;
 

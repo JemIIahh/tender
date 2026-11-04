@@ -386,11 +386,19 @@ describe("views", () => {
       bond_token: "usdc.test.near",
       bond_amount: "1000000",
       claimable_at: "1793307179435833000",
+      locked_until: "1793307189435833000",
     };
     const { client } = await fakeRpc(() => viewResult(agent));
     expect(await client.getAgent("alice.test.near")).toEqual(agent);
-    // A contract from before the bond sends none of the four: that is not an agent in some state.
-    const { status: _s, bond_token: _t, bond_amount: _a, claimable_at: _c, ...old } = agent;
+    // A contract from before the bond sends none of the five: that is not an agent in some state.
+    const {
+      status: _s,
+      bond_token: _t,
+      bond_amount: _a,
+      claimable_at: _c,
+      locked_until: _l,
+      ...old
+    } = agent;
     const { client: oldClient } = await fakeRpc(() => viewResult(old));
     await expect(oldClient.getAgent("alice.test.near")).rejects.toThrow();
   });

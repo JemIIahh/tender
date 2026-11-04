@@ -343,11 +343,14 @@ test("views_return_string_numbers", async () => {
     bond_token: chain.tokenId,
     bond_amount: LOCAL_BOND.toString(),
     claimable_at: null,
+    locked_until: null,
   });
   expect(above2to53(agent?.registered_at ?? "0")).toBe(true);
 
   const sealed = seal(posted.taskId, id("lead"), "work");
   await lead.commit(posted.taskId, sealed.commitment);
+  // An entry in an open task holds the agent's bond until the task's commit deadline.
+  expect((await keeper.getAgent(id("lead")))?.locked_until).toBe(task.commit_deadline);
   const entry = await keeper.getEntry(posted.taskId, id("lead"));
   expect(entry?.committed_at_block).toBeTypeOf("string");
   expect(entry?.commitment).toBe(sealed.commitment);

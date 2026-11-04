@@ -225,8 +225,14 @@ test("a_function_call_key_cannot_register_unregister_or_claim", async () => {
   expect(await wallet("bob")).toBe(10n ** 12n);
 });
 
-test("leaving_closes_open_tasks_and_the_bond_comes_back_after_the_cooldown", async () => {
+test("leaving_closes_open_tasks_and_an_entry_holds_the_bond_until_the_commit_deadline", async () => {
   const { alice, keeper } = clients;
+  // Alice entered the open task in the first test, whose commit window is far longer than the
+  // cooldown, so what holds her bond is that task and not the cooldown.
+  const task = await keeper.getTask(taskId);
+  if (task === null) throw new Error("the task is missing");
+  expect((await keeper.getAgent(id("alice")))?.locked_until).toBe(task.commit_deadline);
+
   const unregistered = await alice.unregisterAgent();
   expect(names(unregistered)).toEqual(["agent_unregistering"]);
   expectEveryLogAccountedFor(unregistered);
@@ -234,10 +240,14 @@ test("leaving_closes_open_tasks_and_the_bond_comes_back_after_the_cooldown", asy
   expect(leaving).toMatchObject({
     status: "unregistering",
     bond_amount: LOCAL_AGENT_BOND.toString(),
+    claimable_at: task.commit_deadline,
+    locked_until: task.commit_deadline,
   });
-  const claimableAt = leaving?.claimable_at;
-  if (claimableAt === null || claimableAt === undefined) throw new Error("no claimable_at");
-  expect(unregistered.events[0]).toMatchObject({ data: { claimable_at: claimableAt } });
+  const unregisteredAt = await keeper.blockTimestampNs();
+  expect(BigInt(task.commit_deadline)).toBeGreaterThan(
+    unregisteredAt + BigInt(COOLDOWN_SECS) * 1_000_000_000n,
+  );
+  expect(unregistered.events[0]).toMatchObject({ data: { claimable_at: task.commit_deadline } });
 
   // An unregistering agent makes no new entry, and does not replace the one it made.
   const replaced = await failure(alice.commit(taskId, seal(id("alice")).commitment));
@@ -246,44 +256,76 @@ test("leaving_closes_open_tasks_and_the_bond_comes_back_after_the_cooldown", asy
   const early = await failure(registerWithBond(alice, scriptedProfile("alice")));
   expect(early.code).toBe("E_PHASE");
 
-  // The cooldown is not over: the claim is refused, and the bond stays where it is.
-  const tooSoon = await failure(alice.claimAgentBond());
-  expect(tooSoon.code).toBe("E_PHASE");
+  // The cooldown is over, the task still holds the bond: the claim is refused, and the bond stays.
+  await waitForChainTime((unregisteredAt + BigInt(COOLDOWN_SECS) * 1_000_000_000n).toString());
+  const held = await failure(alice.claimAgentBond());
+  expect(held.code).toBe("E_PHASE");
   expect(await vault("alice")).toBe(0n);
+  expect((await keeper.getAgent(id("alice")))?.status).toBe("unregistering");
+});
+
+test("an_agent_without_an_open_entry_gets_its_bond_back_once_the_cooldown_is_over", async () => {
+  const { lead, keeper } = clients;
+  await registerWithBond(lead, scriptedProfile("lead"), { approve: () => true });
+  expect((await keeper.getAgent(id("lead")))?.locked_until).toBeNull();
+
+  const unregistered = await lead.unregisterAgent();
+  expect(names(unregistered)).toEqual(["agent_unregistering"]);
+  expectEveryLogAccountedFor(unregistered);
+  const leaving = await keeper.getAgent(id("lead"));
+  expect(leaving).toMatchObject({
+    status: "unregistering",
+    bond_amount: LOCAL_AGENT_BOND.toString(),
+    locked_until: null,
+  });
+  const claimableAt = leaving?.claimable_at;
+  if (claimableAt === null || claimableAt === undefined) throw new Error("no claimable_at");
+  expect(unregistered.events[0]).toMatchObject({ data: { claimable_at: claimableAt } });
+
+  // An unregistering agent makes no new entry.
+  const replaced = await failure(lead.commit(taskId, seal(id("lead")).commitment));
+  expect(replaced.code).toBe("E_NOT_REGISTERED");
+  // It is told to claim before it registers again (and nothing is moved for it).
+  const early = await failure(registerWithBond(lead, scriptedProfile("lead")));
+  expect(early.code).toBe("E_PHASE");
+
+  // The cooldown is not over: the claim is refused, and the bond stays where it is.
+  const tooSoon = await failure(lead.claimAgentBond());
+  expect(tooSoon.code).toBe("E_PHASE");
+  expect(await vault("lead")).toBe(0n);
 
   await waitForChainTime(claimableAt);
-  const claimed = await alice.claimAgentBond();
+  const claimed = await lead.claimAgentBond();
   expect(names(claimed)).toEqual(["agent_bond_claimed"]);
   expect(claimed.events[0]).toMatchObject({
-    data: { account: id("alice"), token: chain.tokenId, amount: LOCAL_AGENT_BOND.toString() },
+    data: { account: id("lead"), token: chain.tokenId, amount: LOCAL_AGENT_BOND.toString() },
   });
   expectEveryLogAccountedFor(claimed);
-  expect(await keeper.getAgent(id("alice"))).toMatchObject({
+  expect(await keeper.getAgent(id("lead"))).toMatchObject({
     status: "retired",
     bond_token: null,
     bond_amount: null,
     claimable_at: null,
   });
   // Exactly the bond is back, in the vault, and a second claim finds nothing to pay.
-  expect(await vault("alice")).toBe(LOCAL_AGENT_BOND);
-  expect((await failure(alice.claimAgentBond())).code).toBe("E_NOT_REGISTERED");
+  expect(await vault("lead")).toBe(LOCAL_AGENT_BOND);
+  expect((await failure(lead.claimAgentBond())).code).toBe("E_NOT_REGISTERED");
 
-  // The retired agent is out of open tasks, and keeps its history.
-  expect((await failure(alice.commit(taskId, seal(id("alice")).commitment))).code).toBe(
+  // The retired agent is out of open tasks.
+  expect((await failure(lead.commit(taskId, seal(id("lead")).commitment))).code).toBe(
     "E_NOT_REGISTERED",
   );
-  expect(leaving?.entries).toBe(1);
 });
 
 test("a_retired_agent_comes_back_with_a_fresh_bond_from_its_vault", async () => {
-  const { alice } = clients;
-  const plan = await planRegistration(alice);
+  const { lead } = clients;
+  const plan = await planRegistration(lead);
   // The refund sits in the vault, so the new bond needs nothing from the wallet.
   expect(plan).toMatchObject({ takesBond: true, vault: LOCAL_AGENT_BOND, shortfall: 0n });
-  const back = await registerWithBond(alice, scriptedProfile("alice"));
+  const back = await registerWithBond(lead, scriptedProfile("lead"));
   expect(back.deposited).toBe(0n);
   expect(names(back.tx)).toEqual(["agent_registered", "agent_bonded"]);
   expect(back.agent).toMatchObject({ status: "active", bond_amount: LOCAL_AGENT_BOND.toString() });
-  expect(back.agent.entries).toBe(1);
-  expect(await vault("alice")).toBe(0n);
+  expect(back.agent.entries).toBe(0);
+  expect(await vault("lead")).toBe(0n);
 });

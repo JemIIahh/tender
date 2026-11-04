@@ -268,6 +268,7 @@ function agentView(over: Partial<AgentView> = {}): AgentView {
     bond_token: USDC,
     bond_amount: BOND.toString(),
     claimable_at: null,
+    locked_until: null,
     ...over,
   };
 }

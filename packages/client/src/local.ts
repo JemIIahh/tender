@@ -161,8 +161,12 @@ export interface LocalChainOptions {
    * and how many seconds an agent waits from `unregister_agent` to its claim: the contract's
    * shortest window by default, which is as short as it can be. Contract rules apply: the cooldown
    * is at least `minWindowSecs`.
+   *
+   * `null` sets no bond and leaves the cooldown at the contract's own: agents that register then
+   * hold none, as the ones did that registered before the owner first set a bond. A test of that
+   * sets the bond later with the owner's client (`setAgentBond`). There is no way back to no bond.
    */
-  agentBond?: { amount?: bigint; cooldownSecs?: number };
+  agentBond?: { amount?: bigint; cooldownSecs?: number } | null;
   /**
    * Roles to register as agents, each with the bond, before `startLocalChain` returns. Open tasks
    * take entries only from registered agents, so a test or a demo whose roles enter one names them
@@ -192,10 +196,13 @@ export interface LocalChainOptions {
  */
 export async function startLocalChain(opts: LocalChainOptions = {}): Promise<LocalChain> {
   const minWindowSecs = opts.minWindowSecs ?? NETWORKS.sandbox.minWindowSecs;
-  const bond = {
-    amount: opts.agentBond?.amount ?? LOCAL_AGENT_BOND,
-    cooldownSecs: opts.agentBond?.cooldownSecs ?? minWindowSecs,
-  };
+  const bond =
+    opts.agentBond === null
+      ? null
+      : {
+          amount: opts.agentBond?.amount ?? LOCAL_AGENT_BOND,
+          cooldownSecs: opts.agentBond?.cooldownSecs ?? minWindowSecs,
+        };
   const [tenderWasm, tokenWasm] = await Promise.all([readWasm(TENDER_WASM), readWasm(TOKEN_WASM)]);
   // near-sandbox waits NEAR_RPC_TIMEOUT_SECS (default 10) for a new node to answer; a busy machine
   // needs longer, so a minute unless the caller chose otherwise.
@@ -253,7 +260,7 @@ async function setUp(
   tenderWasm: Uint8Array,
   tokenWasm: Uint8Array,
   minWindowSecs: number,
-  bond: { amount: bigint; cooldownSecs: number },
+  bond: { amount: bigint; cooldownSecs: number } | null,
 ): Promise<Record<LocalRole, Signer>> {
   type Name = LocalRole | "tender" | "usdc";
   const provider = new JsonRpcProvider({ url: rpcUrl });
@@ -309,8 +316,10 @@ async function setUp(
       // registers (agents that registered earlier would hold none).
       if (role === "owner") {
         await client.send(setTokenCall);
-        await client.setAgentBond(TOKEN, bond.amount);
-        await client.setAgentBondCooldown(bond.cooldownSecs);
+        if (bond !== null) {
+          await client.setAgentBond(TOKEN, bond.amount);
+          await client.setAgentBondCooldown(bond.cooldownSecs);
+        }
       }
     }),
     clientOf("tender").send(tokenStorageDepositCall(TOKEN, CONTRACT)),

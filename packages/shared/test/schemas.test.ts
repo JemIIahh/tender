@@ -207,19 +207,28 @@ test("agent_view_bond_fields_follow_the_contracts_types", () => {
   expect(failures(AgentViewSchema, { ...agent, bond_token: "Token" })).toEqual(["bond_token"]);
 });
 
-// `locked_until` (the bond fix round): the commit deadline of the latest open task an agent entered.
-// A contract from before the round does not send it, so the view takes it absent, and null.
-test("agent_view_takes_locked_until_when_the_contract_sends_it_and_without_it", () => {
+// `locked_until` (the bond fix round): the commit deadline of the latest open task an agent entered,
+// a u64 as a decimal string, and `null` for an agent that has entered none. The contract writes the
+// key either way (the frozen contract's own serialisation test shows `"locked_until":null`).
+test("agent_view_shows_the_commit_deadline_that_holds_its_bond_derived", () => {
   const agent = sample("agent_view");
-  expect(accepts(AgentViewSchema, agent)).toBe(true);
-  expect("locked_until" in agent).toBe(false);
+  expect(agent).toMatchObject({ locked_until: null });
   const locked = { ...agent, locked_until: "1793745956336648000" };
   expect(AgentViewSchema.parse(locked)).toEqual(locked);
-  const free = { ...agent, locked_until: null };
-  expect(AgentViewSchema.parse(free)).toEqual(free);
+  // Unregistering with a task still open: `claimable_at` is the later of the cooldown and the lock.
+  const leaving = {
+    ...locked,
+    status: "unregistering",
+    claimable_at: "1793745956336648000",
+  };
+  expect(AgentViewSchema.parse(leaving)).toEqual(leaving);
   expect(failures(AgentViewSchema, { ...agent, locked_until: 5 })).toEqual(["locked_until"]);
   expect(accepts(AgentViewSchema, { ...agent, locked_until: U64_MAX })).toBe(true);
   expect(accepts(AgentViewSchema, { ...agent, locked_until: "18446744073709551616" })).toBe(false);
+  // Like every other field of the view, it is always there.
+  expect(failures(AgentViewSchema, { ...agent, locked_until: undefined })).toEqual([
+    "locked_until",
+  ]);
 });
 
 test("config_view_shows_no_bond_until_the_owner_sets_one_derived", () => {
@@ -594,6 +603,7 @@ const NULLABLE = new Set([
   "agent_view.bond_token",
   "agent_view.bond_amount",
   "agent_view.claimable_at",
+  "agent_view.locked_until",
   "config_view.pending_owner",
   "config_view.agent_bond_token",
   "config_view.agent_bond_amount",

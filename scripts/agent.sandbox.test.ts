@@ -9,6 +9,7 @@ import {
   startLocalChain,
   TenderClient,
 } from "@tender/client";
+import { computeCommitment, randomSalt, sha256Hex } from "@tender/shared";
 import {
   Account,
   actions,
@@ -246,14 +247,105 @@ test("a_function_call_key_is_refused_for_register_retire_and_claim_before_anythi
   expect(out.join("\n")).not.toContain(pair.toString().slice("ed25519:".length));
 });
 
-/** Registers `signer`'s account as an agent with the client directly, as a setup step. */
-async function registerAgentWith(signer: Signer): Promise<TenderClient> {
-  const client = new TenderClient({
+/** A client of the chain that signs as `signer`. */
+function clientOf(signer: Signer): TenderClient {
+  return new TenderClient({
     network: chain.network,
     contractId: chain.contractId,
     rpcUrl: chain.rpcUrl,
     signer,
   });
-  await registerWithBond(client, scriptedProfile("alice", []), { approve: () => true });
+}
+
+/** Registers `signer`'s account as an agent with the client directly, as a setup step. */
+async function registerAgentWith(signer: Signer, name = "alice"): Promise<TenderClient> {
+  const client = clientOf(signer);
+  await registerWithBond(client, scriptedProfile(name, []), { approve: () => true });
   return client;
 }
+
+test("an_agent_in_an_open_task_has_its_bond_held_until_the_commit_deadline_and_the_commands_say_so", async () => {
+  const lead = chain.accounts.lead;
+  const account = lead.accountId;
+  const member = await registerAgentWith(lead, "lead");
+
+  // The commands act for the account with its own full-access key, in a key file made by hand.
+  await writeFile(
+    join(keys, "holder.json"),
+    JSON.stringify({
+      version: 1,
+      name: "holder",
+      network: "sandbox",
+      account,
+      publicKey: KeyPair.fromString(lead.privateKey as KeyPairString)
+        .getPublicKey()
+        .toString(),
+      privateKey: lead.privateKey,
+    }),
+    { mode: 0o600 },
+  );
+
+  // A task whose commit window is longer than the cooldown (20 s), so what holds the bond is the
+  // task and not the cooldown. The agent enters it.
+  const poster = clientOf(chain.accounts.poster);
+  const reward = 1_000_000n;
+  await poster.deposit(chain.tokenId, reward);
+  const posted = await poster.postTask({
+    token: chain.tokenId,
+    reward,
+    briefUri: "ipfs://brief",
+    briefHash: sha256Hex("brief"),
+    criteriaHash: sha256Hex("criteria"),
+    verifier: chain.accounts.judge.accountId,
+    commitSecs: 45,
+    revealSecs: 5,
+    pickSecs: 5,
+    fallbackSecs: 5,
+  });
+  const task = await reader.getTask(posted.taskId);
+  if (task === null) throw new Error(`task ${posted.taskId} is missing right after posting`);
+  expect((await reader.getAgent(account))?.locked_until).toBeNull();
+  await member.commit(
+    posted.taskId,
+    computeCommitment(posted.taskId, account, sha256Hex("work"), randomSalt()),
+  );
+
+  // The agent's view shows the deadline that holds it.
+  expect((await reader.getAgent(account))?.locked_until).toBe(task.commit_deadline);
+
+  // Retiring: the bond becomes claimable at that deadline, which is later than the cooldown's end,
+  // and the commands print it.
+  out.length = 0;
+  const leaving = await retireAgentCommand(options({ name: "holder", yes: true }));
+  const retiredAt = await reader.blockTimestampNs();
+  expect(leaving).toMatchObject({ status: "unregistering", locked_until: task.commit_deadline });
+  expect(leaving.claimable_at).toBe(task.commit_deadline);
+  expect(BigInt(leaving.claimable_at ?? "0")).toBeGreaterThan(
+    retiredAt + BigInt(COOLDOWN_SECS) * 1_000_000_000n,
+  );
+  const deadline = new Date(Number(BigInt(task.commit_deadline) / 1_000_000n)).toISOString();
+  expect(out.filter((line) => line.startsWith("held by an open task until: "))).toEqual([
+    expect.stringContaining(deadline),
+  ]);
+  expect(out.filter((line) => line.startsWith("claimable at: "))).toEqual([
+    expect.stringContaining(deadline),
+  ]);
+
+  // Too soon: refused, with the deadline as the date, and the bond stays where it is.
+  const vaultBefore = await vault(account);
+  const early = await claimBondCommand(options({ name: "holder" })).catch((e: unknown) => e);
+  expect(early).toMatchObject({ code: "E_PHASE" });
+  expect((early as Error).message).toContain(`claimable from ${deadline}`);
+  expect(await vault(account)).toBe(vaultBefore);
+  expect((await reader.getAgent(account))?.status).toBe("unregistering");
+
+  // Once the commit deadline is over the bond is back in the vault, exactly.
+  while ((await reader.blockTimestampNs()) < BigInt(task.commit_deadline)) await sleep(300);
+  const bond = BigInt((await reader.getConfig()).agent_bond_amount ?? "0");
+  const claimed = await claimBondCommand(options({ name: "holder" }));
+  expect(claimed).toMatchObject({ status: "retired", bond_token: null, bond_amount: null });
+  expect(await vault(account)).toBe(vaultBefore + bond);
+
+  // The private key is nowhere in what the commands printed.
+  expect(out.join("\n")).not.toContain(lead.privateKey.slice("ed25519:".length));
+});
