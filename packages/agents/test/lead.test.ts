@@ -1441,3 +1441,63 @@ describe("swarm fix: N1, a post is not called lost while it may still land", () 
     expect(Math.max(...world.pageReads)).toBeLessThanOrEqual(50);
   });
 });
+
+describe("swarm fix: N4, a job that never gets its entry does not block the lead until the deadline", () => {
+  const second = (world: World): TaskContext => ({
+    ...world.ctx,
+    task: { ...world.ctx.task, id: "11" },
+  });
+
+  test("N4_a_placeholder_that_never_becomes_an_entry_is_let_go_after_a_while_and_the_next_parent_is_taken", async () => {
+    // The runner's commit of the placeholder fails, and nothing sends it again.
+    const world = buildWorld({
+      failCommit: { error: new TenderError("E_UNKNOWN", "node down"), n: 1 },
+    });
+    const lines: string[] = [];
+    const lead = leadOf(world, { entrySecs: 300 }, lines);
+    await enter(world, lead);
+
+    // Five minutes less a moment: still waiting for it, and still one parent at a time.
+    world.advance(299);
+    await lead.tick();
+    expect(jobOf().status).toBe("hiring");
+    expect(await lead.solve(second(world))).toBeNull();
+    expect(lines.join("\n")).toMatch(/declining task 11: .*one parent at a time/);
+
+    // Five minutes: nothing was ever hired, so nothing is lost by letting the job go.
+    world.advance(2);
+    await lead.tick();
+    expect(jobOf().status).toBe("abandoned");
+    expect(jobOf().reason).toMatch(/placeholder was not an entry/);
+    expect(lines.join("\n")).toMatch(/giving up on task 10: .*nothing was spent/);
+    expect(world.children).toHaveLength(0);
+    expect(await lead.active()).toEqual([]);
+    // The next parent is taken on.
+    const next = await lead.solve(second(world));
+    expect(text(next ?? undefined)).toBe("placeholder");
+  });
+
+  test("N4_an_entry_that_comes_in_time_is_hired_for_as_before", async () => {
+    // The runner's commit fails once and is sent again four minutes later, inside the grace.
+    const world = buildWorld({
+      failCommit: { error: new TenderError("E_UNKNOWN", "node down"), n: 1 },
+    });
+    const lead = leadOf(world, { entrySecs: 300 });
+    await enter(world, lead);
+    world.advance(240);
+    await lead.tick();
+    expect(world.children).toHaveLength(0);
+    expect(jobOf().status).toBe("hiring");
+    await enter(world, lead);
+    await finish(lead, 600, () => world.advance(1));
+    expect(world.children).toHaveLength(3);
+    expect(jobOf().status).toBe("done");
+    expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
+  });
+
+  test("N4_the_grace_is_a_whole_number_of_seconds_above_zero", () => {
+    const world = buildWorld();
+    expect(() => leadOf(world, { entrySecs: 0 })).toThrow(/entrySecs/);
+    expect(() => leadOf(world, { entrySecs: 1.5 })).toThrow(/entrySecs/);
+  });
+});

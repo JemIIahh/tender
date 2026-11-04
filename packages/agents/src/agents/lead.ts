@@ -76,7 +76,9 @@ import type { Solver, TaskContext } from "../types";
 // a cap, `E_PARENT`, `E_PHASE`) is not tried again: the job gives up, and nothing more is spent.
 // Giving up leaves the placeholder as the parent's entry, which the runner reveals in its time and
 // which scores nothing; the sub-tasks already hired settle on their own and are paid to their
-// winners.
+// winners. A job whose placeholder is not an entry after `entrySecs` (the runner's commit was
+// refused for good, or never tried) is let go the same way: nothing can have been hired without the
+// entry, so nothing is lost, and the lead is free to take another parent.
 //
 // The tag is no reason to spend. Anyone can post a task with it, and the lead's vault is what pays
 // for the sub-tasks, so before it does anything the lead takes the parent through the gate and
@@ -103,7 +105,10 @@ import type { Solver, TaskContext } from "../types";
 // posted at about `k * hireSecs` from now. The lead hires a part only if its three windows end
 // `marginSecs` (60 s) before the parent's commit deadline from that moment, by the chain's clock,
 // and it checks that for every part still to hire, again, before each hire, so it never starts one
-// it cannot see through. If the clock still outruns it, it gives up at once and posts no more.
+// it cannot see through. If the clock still outruns it, it gives up at once and posts no more. That
+// can be after the first hire: `hireSecs` is the lead's estimate, not a promise, and hires that run
+// longer than it leave the parts already bought paid for and the parent unanswered. Set it above
+// what a hire takes on the network in use.
 
 /** The tag of the parent tasks the lead takes on. No sub-task carries it. */
 export const LEAD_TAG = "swarm";
@@ -114,6 +119,11 @@ const PLACEHOLDER = "placeholder";
 const DEFAULT_MARGIN_SECS = 60;
 /** What one hire is taken to cost in time, in seconds: its uploads, its post, and the wait. */
 const DEFAULT_HIRE_SECS = 20;
+/**
+ * How long, by the chain's clock, a job waits for the placeholder to be an entry before it is let
+ * go, in seconds. Until it is, nothing can be hired, so nothing has been spent.
+ */
+const DEFAULT_ENTRY_SECS = 300;
 /** How long the lead waits between two passes over its jobs. */
 const DEFAULT_POLL_MS = 2_000;
 /** The first pause after a call fails, in milliseconds. It doubles for each failure in a row. */
@@ -216,8 +226,20 @@ export interface LeadSolverOptions {
   windows?: ChildWindows;
   /** Seconds before the parent's commit deadline by which every sub-task must be due. Default 60. */
   marginSecs?: number;
-  /** Seconds that one hire is taken to take, for the check that the parts fit in time. Default 20. */
+  /**
+   * Seconds that one hire is taken to take, for the check that the parts fit in time. Default 20.
+   * Set it above the longest a hire takes on the network in use: a hire that runs over it can end
+   * the job after some parts are bought (they settle and are paid to their winners, and the parent
+   * is not answered).
+   */
   hireSecs?: number;
+  /**
+   * Seconds the lead waits for the placeholder to become an entry before it lets the job go. The
+   * runner commits it at once, and a commit that is refused for good, or never tried, would
+   * otherwise keep the lead from taking another parent until this one's commit deadline. Nothing
+   * has been spent by then, so nothing is lost. Default 300.
+   */
+  entrySecs?: number;
   /** Milliseconds between two passes over the jobs, in `run`. Default 2000. */
   pollMs?: number;
   /** The first pause after a failure, in milliseconds; it doubles up to `maxBackoffMs`. Default 1000. */
@@ -422,6 +444,8 @@ interface Job {
   parentCreatedAt: string;
   /** In nanoseconds. */
   commitDeadline: string;
+  /** The chain's clock when the job began, in nanoseconds. Jobs from before it was kept have none. */
+  beganAt?: string;
   token: string;
   status: JobStatus;
   /** In the order of the pack: `hires[i]` is for the i-th sub-task folder. */
@@ -468,6 +492,7 @@ function parseJob(text: string, file: string): Job {
     isText(j.parentCreatedAt) &&
     isText(j.commitDeadline) &&
     /^\d+$/.test(j.commitDeadline) &&
+    (j.beganAt === undefined || (isText(j.beganAt) && /^\d+$/.test(j.beganAt))) &&
     isText(j.token) &&
     statuses.includes(j.status) &&
     Array.isArray(j.hires) &&
@@ -639,11 +664,13 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
   const log = (line: string) => (o.log ?? console.log)(`lead: ${line}`);
   const marginSecs = o.marginSecs ?? DEFAULT_MARGIN_SECS;
   const hireSecs = o.hireSecs ?? DEFAULT_HIRE_SECS;
+  const entrySecs = o.entrySecs ?? DEFAULT_ENTRY_SECS;
   const pollMs = o.pollMs ?? DEFAULT_POLL_MS;
   const backoffMs = o.backoffMs ?? DEFAULT_BACKOFF_MS;
   const maxBackoffMs = o.maxBackoffMs ?? DEFAULT_MAX_BACKOFF_MS;
   checkCount("marginSecs", marginSecs, 0);
   checkCount("hireSecs", hireSecs, 0);
+  checkCount("entrySecs", entrySecs, 1);
   checkCount("pollMs", pollMs, 1);
   checkCount("backoffMs", backoffMs, 1);
   checkCount("maxBackoffMs", maxBackoffMs, backoffMs);
@@ -962,12 +989,24 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
     const entry = await client.getEntry(BigInt(job.parent), job.account);
     while (job.hires.length < specs.length) {
       const todo = specs.slice(job.hires.length);
-      const why = fits(await client.blockTimestampNs(), deadline, todo);
+      const now = await client.blockTimestampNs();
+      const why = fits(now, deadline, todo);
       if (why !== null) return abandon(job, why);
       const next = todo[0];
       if (next === undefined) break;
       // Time permitting, the placeholder is on its way: the runner commits it, with its retries.
-      if (entry === null) return job;
+      // If it is not an entry after `entrySecs` nothing has been hired (a hire needs the entry), so
+      // the job is let go and does not keep the lead from the next parent until the deadline.
+      if (entry === null) {
+        const waited = job.beganAt === undefined ? 0n : now - BigInt(job.beganAt);
+        if (job.hires.length === 0 && waited >= BigInt(entrySecs) * NS_PER_SEC) {
+          return abandon(
+            job,
+            `the placeholder was not an entry ${entrySecs} s after the job began`,
+          );
+        }
+        return job;
+      }
       try {
         job = await hire(job, next);
       } catch (error) {
@@ -1166,6 +1205,7 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
       account,
       parentCreatedAt: ctx.task.created_at,
       commitDeadline: ctx.task.commit_deadline,
+      beganAt: (await client.blockTimestampNs()).toString(),
       token: ctx.task.token,
       status: "hiring",
       hires: [],
