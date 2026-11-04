@@ -234,6 +234,7 @@ test("bodies_are_capped_at_16_KiB_and_must_be_the_routes_own", async () => {
     "/v1/connect/codes",
     "/v1/connect/lookup",
     "/v1/connect/attach",
+    "/v1/connect/contest",
     "/v1/connect/registered",
   ]) {
     const reply = await send<ErrorBody>("POST", path, { account: OWNER, raw: big });
@@ -389,6 +390,65 @@ test("a_code_is_read_by_its_owner_alone", async () => {
   expect((await stateOf(id, "mallory.testnet")).status).toBe(404);
   expect((await stateOf("not-an-id")).status).toBe(404);
   expect((await stateOf(`${id.slice(0, -1)}${id.endsWith("A") ? "B" : "A"}`)).status).toBe(404);
+});
+
+// ---- Contested --------------------------------------------------------------------------------
+
+const contest = (code: string) => send("POST", "/v1/connect/contest", { body: { code } });
+
+test("a_second_different_key_marks_the_code_contested_and_every_read_says_so", async () => {
+  const { code, id, account_id } = await makeCode();
+  const first = publicKeyOf();
+  expect((await attach(code, first)).status).toBe(200);
+  expect(ConnectCodeStateSchema.parse((await stateOf(id)).body).contested_at).toBeNull();
+
+  nowNs = TEST_NOW + MINUTE_NS;
+  const second = await attach(code, publicKeyOf());
+  expect(second.status).toBe(409);
+  expect((second.body as ErrorBody).error).toBe("already_attached");
+
+  const contestedAt = new Date(Number(nowNs / 1_000_000n)).toISOString();
+  expect(ConnectCodeStateSchema.parse((await stateOf(id)).body)).toMatchObject({
+    state: "contested",
+    public_key: first,
+    contested_at: contestedAt,
+  });
+  expect(ConnectLookupSchema.parse((await lookup(code)).body).state).toBe("contested");
+  // The first key asking again still gets its answer, which says contested.
+  expect(ConnectLookupSchema.parse((await attach(code, first)).body).state).toBe("contested");
+  // The first time is the one kept.
+  nowNs += MINUTE_NS;
+  await attach(code, publicKeyOf());
+  expect(ConnectCodeStateSchema.parse((await stateOf(id)).body).contested_at).toBe(contestedAt);
+
+  // A contested code is not taken as registered, whatever the index says.
+  await indexAgent(account_id);
+  const done = await registered(code);
+  expect(done.status).toBe(409);
+  expect((done.body as ErrorBody).error).toBe("contested");
+  expect(ConnectCodeStateSchema.parse((await stateOf(id)).body).state).toBe("contested");
+});
+
+test("the_agent_contests_a_code_whose_key_is_not_its_own_and_sends_nothing_secret", async () => {
+  const { code, id } = await makeCode();
+  // Nothing attached: nothing to contest, and nothing changes.
+  const early = await contest(code);
+  expect(early.status).toBe(409);
+  expect((early.body as ErrorBody).error).toBe("not_attached");
+  expect(ConnectCodeStateSchema.parse((await stateOf(id)).body).state).toBe("waiting");
+
+  expect((await attach(code, publicKeyOf())).status).toBe(200);
+  const contested = await contest(code);
+  expect(contested.status).toBe(200);
+  expect(contested.headers.get("cache-control")).toBe("no-store");
+  expect(ConnectLookupSchema.parse(contested.body).state).toBe("contested");
+  expect(ConnectCodeStateSchema.parse((await stateOf(id)).body).state).toBe("contested");
+  // The route takes the code and nothing else.
+  expect(
+    (await send("POST", "/v1/connect/contest", { body: { code, public_key: publicKeyOf() } }))
+      .status,
+  ).toBe(400);
+  expect((await contest(`tc_${"q".repeat(26)}`)).status).toBe(404);
 });
 
 // ---- Registered -------------------------------------------------------------------------------

@@ -21,7 +21,8 @@ import { AccountIdSchema, U128StringSchema } from "./primitives";
 //
 // A code reveals nothing secret and can only attach a public key. Whoever learns it before the
 // agent can attach a key of their own, which is why the page shows the fingerprint to match with
-// what the agent printed before anything is signed. The rules on text are the question board's:
+// what the agent printed before anything is signed. And when a second, different key tries the code
+// (the agent's, after someone else's), the API marks the code contested and the page refuses it. The rules on text are the question board's:
 // a stranger's string is refused if it holds an invisible or control character (`plainTextFault`).
 
 /** How long a code takes a key, from when it was made. */
@@ -121,8 +122,11 @@ export function isEd25519PublicKey(text: string): boolean {
  * The fingerprint of a public key, which the owner's page and the agent both show so that a person
  * can see they name the same key: the first 64 bits of the SHA-256 of the key as it is written
  * (`ed25519:<base58>`), in four groups of four capital hex digits, such as `3F2A-91C0-77DE-0B14`.
- * Someone who attaches a key of their own to a code does so before the agent has made its key, so
- * there is no fingerprint to aim at; 64 bits is for the eye, and plenty.
+ * Matching two fingerprints by eye is not a strong check on its own: someone who knows the agent's
+ * fingerprint (from an earlier code, when the agent's key file is used again) could grind a key whose
+ * first and last groups match it, which is 32 bits of work. All four groups (64 bits) are out of
+ * reach. So the API also marks a code that two different keys tried (`contested`), and the page
+ * then refuses to create the account whatever the fingerprints look like.
  */
 export function connectFingerprint(publicKey: string): string {
   const hex = sha256Hex(publicKey).slice(0, 16).toUpperCase();
@@ -269,7 +273,10 @@ const PublicKeyField = field((key) =>
 export const CreateConnectCodeRequestSchema = z.strictObject({ name: AgentNameField });
 export type CreateConnectCodeRequest = z.infer<typeof CreateConnectCodeRequestSchema>;
 
-/** `POST /v1/connect/lookup` and `POST /v1/connect/registered`: the code, in the body. */
+/**
+ * `POST /v1/connect/lookup`, `POST /v1/connect/contest` and `POST /v1/connect/registered`: the code,
+ * in the body.
+ */
 export const ConnectCodeRequestSchema = z.strictObject({ code: CodeField });
 export type ConnectCodeRequest = z.infer<typeof ConnectCodeRequestSchema>;
 
@@ -287,10 +294,35 @@ export type AttachConnectKeyRequest = z.infer<typeof AttachConnectKeyRequestSche
  * - `waiting`: no key yet, and the 30 minutes are not over;
  * - `expired`: no key came in the 30 minutes, and none can now;
  * - `attached`: a key is attached, so the owner can create the account;
- * - `registered`: the agent said it registered, and the index showed it active when it did.
+ * - `registered`: the agent said it registered, and the index showed it active when it did;
+ * - `contested`: a second, different key tried the code after one was attached (`contested_at`),
+ *   so someone else has it. This wins over every other state: the page creates nothing for it.
  */
-export const ConnectStateSchema = z.enum(["waiting", "expired", "attached", "registered"]);
+export const ConnectStateSchema = z.enum([
+  "waiting",
+  "expired",
+  "attached",
+  "registered",
+  "contested",
+]);
 export type ConnectState = z.infer<typeof ConnectStateSchema>;
+
+/**
+ * The name of a code's account, as an answer carries it: one part of an account id, by the same
+ * rule a request is held to. An answer that carries anything else fails to parse, so no text a
+ * server chose reaches an agent or a page through it.
+ */
+const AgentNameAnswer = z
+  .string()
+  .refine(
+    (name) => name.length >= 1 && name.length <= MAX_ACCOUNT_LENGTH && PART.test(name),
+    "expected one part of an account id",
+  );
+
+/** A public key in an answer: `ed25519:` and 32 bytes, or the answer fails to parse. */
+const PublicKeyAnswer = z
+  .string()
+  .refine(isEd25519PublicKey, "expected a public key: ed25519: and 32 bytes in base58");
 
 /** A fingerprint as `connectFingerprint` writes one. */
 export const ConnectFingerprintSchema = z
@@ -303,7 +335,7 @@ export const ConnectCodeCreatedSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
   code: z.string().regex(CONNECT_CODE_PATTERN),
   owner: AccountIdSchema,
-  name: z.string(),
+  name: AgentNameAnswer,
   account_id: AccountIdSchema,
   /** ISO 8601 in UTC to the millisecond: when the code stops taking a key. */
   expires_at: z.iso.datetime(),
@@ -323,16 +355,18 @@ export const ConnectAgentSchema = z
 export const ConnectCodeStateSchema = z.object({
   id: z.string(),
   owner: AccountIdSchema,
-  name: z.string(),
+  name: AgentNameAnswer,
   account_id: AccountIdSchema,
   state: ConnectStateSchema,
   created_at: z.iso.datetime(),
   expires_at: z.iso.datetime(),
   /** The key the agent attached, and its fingerprint; null until one is. */
-  public_key: z.string().nullable(),
+  public_key: PublicKeyAnswer.nullable(),
   fingerprint: ConnectFingerprintSchema.nullable(),
   attached_at: z.iso.datetime().nullable(),
   registered_at: z.iso.datetime().nullable(),
+  /** When a second, different key tried the code: someone else has it. Null while none has. */
+  contested_at: z.iso.datetime().nullable(),
   /** The account as the index holds it: null until it registers. */
   agent: ConnectAgentSchema,
 });
@@ -341,13 +375,14 @@ export type ConnectCodeState = z.infer<typeof ConnectCodeStateSchema>;
 const NetworkSchema = z.enum(Object.keys(NETWORKS) as ["sandbox", "testnet", "mainnet"]);
 
 /**
- * `POST /v1/connect/lookup` and `POST /v1/connect/attach`: what the code is for, as the agent needs
+ * `POST /v1/connect/lookup`, `POST /v1/connect/attach` and `POST /v1/connect/contest`: what the
+ * code is for, as the agent needs
  * it: the account it will be, on which network and contract. `fingerprint` is that of the key
  * attached, null while none is.
  */
 export const ConnectLookupSchema = z.object({
   owner: AccountIdSchema,
-  name: z.string(),
+  name: AgentNameAnswer,
   account_id: AccountIdSchema,
   network: NetworkSchema,
   contract: AccountIdSchema,

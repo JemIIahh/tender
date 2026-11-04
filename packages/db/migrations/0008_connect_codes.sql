@@ -1,4 +1,4 @@
--- Tender schema, migration 0007. Later changes go in new numbered files, never in this one.
+-- Tender schema, migration 0008. Later changes go in new numbered files, never in this one.
 -- The conventions of 0001 hold: ids and heights are numeric(40,0), and a column is NOT NULL unless
 -- it is marked as nullable (no "not null" and no default).
 
@@ -17,6 +17,8 @@
 --   - `public_key`, `attached_at` (nullable): the key the agent attached, once, and when. Both are
 --     null or neither is.
 --   - `registered_at` (nullable): when the agent said it registered, which the index confirmed.
+--   - `contested_at` (nullable): when a second, different key tried the code after one was
+--     attached: someone else has the code, and the owner's page creates nothing for it.
 create table connect_codes (
   id text primary key,
   code_sha256 text not null unique,
@@ -27,7 +29,8 @@ create table connect_codes (
   expires_at timestamptz not null,
   public_key text,
   attached_at timestamptz check ((public_key is null) = (attached_at is null)),
-  registered_at timestamptz
+  registered_at timestamptz,
+  contested_at timestamptz
 );
 
 -- The rows of one owner are counted and listed by time, and old rows are deleted by their expiry.

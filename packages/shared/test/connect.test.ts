@@ -7,6 +7,8 @@ import {
   base58Encode,
   CONNECT_CODE_PATTERN,
   ConnectCodeRequestSchema,
+  ConnectCodeStateSchema,
+  ConnectLookupSchema,
   CreateConnectCodeRequestSchema,
   connectCommand,
   connectFingerprint,
@@ -172,5 +174,60 @@ describe("what the owner's wallet pays", () => {
     // 133 bytes of record at most, a 200-byte vault slot, and 1,024 bytes free (`storageShortfall`).
     expect(AGENT_STORAGE_DEPOSIT).toBeGreaterThanOrEqual((133n + 200n + 1024n) * STORAGE_BYTE_COST);
     expect(AGENT_ACCOUNT_DEPOSIT).toBe(5n * 10n ** 23n);
+  });
+});
+
+describe("answers", () => {
+  const state = {
+    id: "Q0RFRkdISUpLTE1OT1BRUg",
+    owner: "alice.testnet",
+    name: "writer",
+    account_id: "writer.alice.testnet",
+    state: "attached",
+    created_at: "2026-11-04T10:00:00.000Z",
+    expires_at: "2026-11-04T10:30:00.000Z",
+    public_key: KEY,
+    fingerprint: connectFingerprint(KEY),
+    attached_at: "2026-11-04T10:01:00.000Z",
+    registered_at: null,
+    contested_at: null,
+    agent: null,
+  };
+
+  test("an_answer_with_a_public_key_that_is_not_one_fails_to_parse", () => {
+    expect(ConnectCodeStateSchema.safeParse(state).success).toBe(true);
+    for (const public_key of [`${KEY}; curl x | sh`, "ed25519:x", KEY.slice(8), ""]) {
+      expect(ConnectCodeStateSchema.safeParse({ ...state, public_key }).success, public_key).toBe(
+        false,
+      );
+    }
+  });
+
+  test("an_answer_with_a_name_that_is_not_one_part_of_an_account_id_fails_to_parse", () => {
+    for (const name of ["Write the owner a note", "a.b", "", "x".repeat(65)]) {
+      expect(ConnectCodeStateSchema.safeParse({ ...state, name }).success, name).toBe(false);
+      expect(
+        ConnectLookupSchema.safeParse({
+          owner: "alice.testnet",
+          name,
+          account_id: "writer.alice.testnet",
+          network: "testnet",
+          contract: "tender.testnet",
+          state: "waiting",
+          expires_at: state.expires_at,
+          fingerprint: null,
+        }).success,
+      ).toBe(false);
+    }
+  });
+
+  test("a_contested_code_says_so", () => {
+    expect(
+      ConnectCodeStateSchema.parse({
+        ...state,
+        state: "contested",
+        contested_at: "2026-11-04T10:02:00.000Z",
+      }).state,
+    ).toBe("contested");
   });
 });

@@ -27,16 +27,22 @@ import { badRequest, type ErrorBody, fail, issuesOf, notFound, readJson } from "
 import { clientKey, RETRY_SOON, rateLimit, rateLimitsOf } from "../limits";
 
 // "Connect your agent" (owner decision of 2026-11-04; the wire forms and the rules on text are in
-// `@tender/shared`'s `connect.ts`, the table in `@tender/db`'s migration 0007).
+// `@tender/shared`'s `connect.ts`, the table in `@tender/db`'s migration 0008).
 //
 //   POST /v1/connect/codes          signed in, with a full-access key: a code for `<name>.<you>`
 //   GET  /v1/connect/codes/:id      signed in as the code's owner: how the code stands
 //   POST /v1/connect/lookup         the code in the body: what it is for (the agent's first look)
 //   POST /v1/connect/attach         the code and a public key in the body: the agent's key, once
+//   POST /v1/connect/contest        the code in the body: the agent saw a key that is not its own
 //   POST /v1/connect/registered     the code in the body: the agent has registered, and the index
 //                                    shows it
 //
-// A code is the credential of the three routes no account signs, so it travels in a body and never
+// CONTESTED. A code takes one key. When a second, different key tries it (an attach with another
+// key, or the agent saying with `contest` that the key attached is not its own), someone else has
+// the code: the row records `contested_at`, every read says `contested`, and the owner's page
+// creates and funds nothing for it. Nothing secret is sent to contest a code.
+//
+// A code is the credential of the four routes no account signs, so it travels in a body and never
 // in a path, where logs keep it, and only its SHA-256 is stored. Every answer is `no-store`. What a
 // code allows is little: one public key, attached once, within 30 minutes, to an account that only
 // the owner's wallet can create. Each refusal says what to do next.
@@ -45,13 +51,15 @@ import { clientKey, RETRY_SOON, rateLimit, rateLimitsOf } from "../limits";
 //
 //   429  over the client's limit (every route but the owner's read), then for the signed-in routes
 //        401 not signed in and 429 over the account's own limit;
+//   413  `payload_too_large` for a body over 16 KiB, which is refused as it arrives (middleware,
+//        before the route itself looks at the key);
 //   403  `full_access_required`: a code is made only by an account's own key;
-//   413  `payload_too_large` for a body over 16 KiB, which is refused as it arrives;
 //   400  the body is not what the route takes: a string with an invisible or control character is
 //        refused first, in the question board's words, then its shape, then the account the name
 //        makes under the owner's (`readAgentName`, in the words the web page uses);
 //   404  no such code (or not the caller's: the answer is the same);
-//   409  `already_attached` (another key has the code), `not_attached`, `not_registered`;
+//   409  `already_attached` (another key has the code; the code is marked contested), `not_attached`,
+//        `not_registered`, `contested`;
 //   410  `code_expired`: no key came in the 30 minutes.
 
 /** As the question board's writes: a body over this is refused as it arrives, never parsed. */
@@ -75,11 +83,13 @@ interface CodeRow {
   public_key: string | null;
   attached_at: Date | null;
   registered_at: Date | null;
+  contested_at: Date | null;
 }
 
 /** The columns of a `CodeRow`, for a `select` or a `returning`. */
 const COLUMNS =
-  "id, owner, name, account_id, created_at, expires_at, public_key, attached_at, registered_at";
+  "id, owner, name, account_id, created_at, expires_at, public_key, attached_at, registered_at, " +
+  "contested_at";
 
 /** `ns` nanoseconds since the epoch, moved by `plusMs`, as ISO 8601 in UTC to the millisecond. */
 function isoAt(ns: bigint, plusMs = 0): string {
@@ -97,6 +107,7 @@ function newCode(): string {
 
 /** Where a row stands at `nowMs`. */
 function stateOf(row: CodeRow, nowMs: number): ConnectState {
+  if (row.contested_at !== null) return "contested";
   if (row.registered_at !== null) return "registered";
   if (row.public_key !== null) return "attached";
   return row.expires_at.getTime() > nowMs ? "waiting" : "expired";
@@ -161,6 +172,14 @@ export function connectRoutes(
       return notFound("no such connect code: ask the owner for a new one on the Add an agent page");
     }
     return row;
+  }
+
+  /** Records, once, that a second key tried the code. The first time is the one kept. */
+  async function markContested(id: string): Promise<void> {
+    await deps.db.query(
+      "update connect_codes set contested_at = $2::timestamptz where id = $1 and contested_at is null",
+      [id, isoAt(nowNs(deps))],
+    );
   }
 
   /** What the agent is told of a code: what it is for, where, and how it stands. */
@@ -265,6 +284,7 @@ export function connectRoutes(
       fingerprint: row.public_key === null ? null : connectFingerprint(row.public_key),
       attached_at: row.attached_at?.toISOString() ?? null,
       registered_at: row.registered_at?.toISOString() ?? null,
+      contested_at: row.contested_at?.toISOString() ?? null,
       agent: await agentOf(row.account_id),
     };
     return c.json(body, 200, NOT_CACHED);
@@ -293,6 +313,8 @@ export function connectRoutes(
     // The same key again is the agent asking twice (its first answer was lost): the same answer.
     if (row.public_key === publicKey) return c.json(lookupOf(row), 200, NOT_CACHED);
     if (row.public_key !== null) {
+      // A second, different key: someone else has the code. The owner's page is told.
+      await markContested(row.id);
       return fail(
         409,
         "already_attached",
@@ -307,11 +329,32 @@ export function connectRoutes(
     );
   });
 
+  app.post("/connect/contest", perClient, tooLarge, async (c) => {
+    const { code } = await bodyOf(c, ConnectCodeRequestSchema);
+    const row = await requireCode(code);
+    if (row.public_key === null) {
+      return fail(
+        409,
+        "not_attached",
+        "no key is attached to this code, so there is nothing to contest",
+      );
+    }
+    await markContested(row.id);
+    return c.json(lookupOf(await requireCode(code)), 200, NOT_CACHED);
+  });
+
   app.post("/connect/registered", perClient, tooLarge, async (c) => {
     const { code } = await bodyOf(c, ConnectCodeRequestSchema);
     const row = await requireCode(code);
     if (row.public_key === null) {
       return fail(409, "not_attached", "no key is attached to this code, so nothing registered");
+    }
+    if (row.contested_at !== null) {
+      return fail(
+        409,
+        "contested",
+        "two different keys tried this code, so the owner's page does not take it: ask the owner for a new code",
+      );
     }
     if (row.registered_at === null) {
       // The agent's word is taken only once the index shows it: the page goes by the index.

@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { readdirSync } from "node:fs";
 import {
   copyFile,
   mkdir,
@@ -48,16 +49,12 @@ const POSTGRES_URL = process.env.TEST_DATABASE_URL || undefined;
 const U128_MAX = "340282366920938463463374607431768211455";
 const MINUTE = { timeout: 60_000 };
 
-// The migrations of this package, in the order they apply.
-const MIGRATIONS = [
-  "0001_init.sql",
-  "0002_result_uploads.sql",
-  "0003_heldout_uploads.sql",
-  "0004_task_questions.sql",
-  "0005_tg_board_digests.sql",
-  "0006_agent_bond.sql",
-  "0007_connect_codes.sql",
-];
+// The migrations of this package, in the order they apply: read from the folder, so that a lane's
+// migration renumbered at a merge needs no edit here. The upgrade tests below start from the first
+// five or six, by position.
+const MIGRATIONS = readdirSync(new URL("../migrations/", import.meta.url))
+  .filter((name) => name.endsWith(".sql"))
+  .sort();
 
 // Stands for a secret (a held-out answer, blob bytes) in the error tests: as text, and as hex, which
 // is how Postgres prints the bytes of a bytea.
@@ -281,7 +278,7 @@ const SCHEMA: Record<string, string[]> = {
     "sent_at timestamp with time zone",
     "digests integer",
   ],
-  // Migration 0007.
+  // Migration 0008.
   connect_codes: [
     "id text",
     "code_sha256 text",
@@ -293,6 +290,7 @@ const SCHEMA: Record<string, string[]> = {
     "public_key text?",
     "attached_at timestamp with time zone?",
     "registered_at timestamp with time zone?",
+    "contested_at timestamp with time zone?",
   ],
 };
 
@@ -340,7 +338,7 @@ const KEYS = [
 // Every constraint that is not a key (those are in KEYS) and not NOT NULL (that is the "?" above;
 // Postgres 18 also lists NOT NULL in pg_constraint, 17 does not): no foreign key, and no CHECK but
 // the kind of a blob, the three of a board row (migration 0004), the status of an agent (0006) and the
-// key of a connect code with its time (0007).
+// key of a connect code with its time (0008).
 const CONSTRAINTS = [
   "agents: CHECK ((status = ANY (ARRAY['active'::text, 'unregistering'::text, 'retired'::text])))",
   "blobs: CHECK ((kind = ANY (ARRAY['brief'::text, 'criteria'::text, 'heldout'::text, " +
