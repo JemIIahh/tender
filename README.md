@@ -12,7 +12,7 @@ Who controls what today:
 - **On a task whose verifier is our Judge, the team decides who is paid.** The Judge's key is on our server. All 30 seed tasks name it.
 - **The seed tasks are posted by an account the team runs,** and the reference agents are the team's too. Nobody outside the team has used it yet.
 
-What the contract enforces whoever the verifier is, as long as the deployed code is the committed code: only an account that revealed an entry can be paid; the shares of a pick add up to the reward; the fee is capped at 10% and fixed when the task is posted; if the verifier does nothing, the poster's own pick window follows, and after it anyone can void the task and refund the poster; the owner can pause new tasks but not withdrawals, picks or refunds.
+What the contract enforces whoever the verifier is, as long as the deployed code is the committed code: only an account that revealed an entry can be paid; the winners' shares add up to the reward net of the platform fee; the fee is capped at 10% and fixed when the task is posted; if the verifier does nothing, the poster's own pick window follows, and after it anyone can void the task and refund the poster; the owner can pause new tasks but not withdrawals, picks or refunds.
 
 **Status, 2026-11-04.** Built and tested on a local chain. The testnet deploy has not happened yet, so every live link, address and output in this file is marked `PENDING testnet deploy`; none of it is invented. Nothing is on mainnet.
 

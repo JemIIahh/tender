@@ -18,8 +18,10 @@ import { describe, expect, test } from "vitest";
 // - the shapes of common service credentials: an `sk-` API key (a form several providers use), a
 //   GitHub token, an AWS access key id, a Slack token, a Google API key and a JWT;
 // - an environment-style line (`NAME=value`, at the start of a line, with or without `export`)
-//   whose name ends in API_KEY, APIKEY, SECRET, TOKEN, PASSWORD, JWT or PRIVATE_KEY and whose value
-//   is 16 or more characters that are no placeholder (`<...>`, `$VAR`, `...`, `xxxx`, `example`).
+//   whose name is in capitals and is, or ends in, API_KEY, APIKEY, SECRET, TOKEN, PASSWORD, JWT or
+//   PRIVATE_KEY (so `TOKEN=` and `LLM_API_KEY=` both count) and whose value is 16 or more characters
+//   that are no placeholder (`<...>`, `$VAR`, `...`, `xxxx`, `example`). A name in lower case is not
+//   looked at.
 //
 // It does not find a secret of a shape it does not know (a short password, a key in a TypeScript
 // object literal such as `FASTNEAR_API_KEY: "..."`, or a credential with no recognisable prefix),
@@ -161,7 +163,7 @@ const RULES: readonly Rule[] = [
     // `.env.example` has empty values and docs have placeholders, so neither matches.
     name: "a secret assigned to an environment variable",
     pattern:
-      /^\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:API_KEY|APIKEY|SECRET|TOKEN|PASSWORD|JWT|PRIVATE_KEY)=["']?[^\s"'#]{16,}/,
+      /^\s*(?:export\s+)?(?:[A-Z][A-Z0-9_]*)?(?:API_KEY|APIKEY|SECRET|TOKEN|PASSWORD|JWT|PRIVATE_KEY)=["']?[^\s"'#]{16,}/,
     excused: (match) => isPlaceholder(match.text.replace(/^[^=]*=["']?/, "")),
   },
 ];
@@ -397,6 +399,17 @@ describe("the rules of the scan, on invented files", () => {
         ["c.md", `TELEGRAM_WEBHOOK_SECRET=${value}  # set this\n`],
         ["d.md", `ONECLICK_JWT=${value}\n`],
         ["e.md", `DEPLOY_PARENT_PRIVATE_KEY=${value}\n`],
+        // A name that is only the suffix, and the `export` forms of it.
+        ["bare1.md", `API_KEY=${value}\n`],
+        ["bare2.md", `TOKEN=${value}\n`],
+        ["bare3.md", `PASSWORD=${value}\n`],
+        ["bare4.md", `SECRET=${value}\n`],
+        ["bare5.md", `JWT=${value}\n`],
+        ["bare6.md", `PRIVATE_KEY=${value}\n`],
+        ["bare7.md", `APIKEY=${value}\n`],
+        ["bare8.md", `export TOKEN=${value}\n`],
+        ["bare9.md", `  export  API_KEY='${value}'\n`],
+        ["bare10.md", `MYTOKEN=${value}\n`],
         // Empty, short, placeholder, shell and TypeScript forms.
         ["ok1.md", "LLM_API_KEY=\n"],
         ["ok2.md", "LLM_API_KEY=short\n"],
@@ -407,6 +420,11 @@ describe("the rules of the scan, on invented files", () => {
         ["ok7.md", "LLM_API_KEY=your-key-goes-here-123\n"],
         ["ok8.ts", `const env = { LLM_API_KEY: "${value}" };\n`],
         ["ok9.md", `TENDER_SEEDS_PRIVATE_DIR=${value}\n`],
+        ["ok10.md", `TOKEN=<${value}>\n`],
+        ["ok11.md", `export TOKEN=$TOKEN_FROM_VAULT_ONLY\n`],
+        // Not in capitals, so not looked at (the header says so).
+        ["ok12.md", `token=${value}\n`],
+        ["ok13.md", `NOT_A_TOKEN_NAME=${value}\n`],
       ]),
     );
     expect(found).toEqual([
@@ -415,6 +433,16 @@ describe("the rules of the scan, on invented files", () => {
       "c.md:1: a secret assigned to an environment variable",
       "d.md:1: a secret assigned to an environment variable",
       "e.md:1: a secret assigned to an environment variable",
+      "bare1.md:1: a secret assigned to an environment variable",
+      "bare2.md:1: a secret assigned to an environment variable",
+      "bare3.md:1: a secret assigned to an environment variable",
+      "bare4.md:1: a secret assigned to an environment variable",
+      "bare5.md:1: a secret assigned to an environment variable",
+      "bare6.md:1: a secret assigned to an environment variable",
+      "bare7.md:1: a secret assigned to an environment variable",
+      "bare8.md:1: a secret assigned to an environment variable",
+      "bare9.md:1: a secret assigned to an environment variable",
+      "bare10.md:1: a secret assigned to an environment variable",
     ]);
     expect(found.join("\n")).not.toContain(value);
   });
