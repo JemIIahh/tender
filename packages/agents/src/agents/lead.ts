@@ -60,7 +60,9 @@ import type { Solver, TaskContext } from "../types";
 // parent, `journalDir/<parent id>.json`), so a restart picks the job up where it stopped and never
 // hires a part twice. A post is written down before it is sent as an intent, and a job that finds
 // an intent it cannot account for asks the chain whether the post landed (`reconcile`) before it
-// posts anything.
+// posts anything. A note is only a note if it outlives a power cut, so a write returns once the file
+// is on the disk and its name is too (`writeFileAtomic`: temp file synced, renamed, folder synced);
+// a write that cannot be made so fails, and the post that waited on it is not sent.
 //
 // A call that fails and says nothing of the chain (a timeout, a 5xx, a node that blinked) is tried
 // again, after a pause that doubles up to `maxBackoffMs`, until the parent's commit deadline; one
@@ -487,10 +489,44 @@ export interface JournalFs {
 
 const nodeFs: JournalFs = { mkdir, open, rename, rm, readFile, readdir };
 
-/** Writes `text` to `file` so that a reader, or a crash, finds the old file or the new one. */
+/**
+ * Makes the names in directory `path` (what was created, renamed or removed in it) survive a power
+ * cut: a rename is in the directory, and the directory is on the disk only once it is synced. A
+ * failure to sync is the write's failure, not something to hide: a note the disk may not have must
+ * not be taken for a note (the lead sends its post on the strength of it). Only Windows, which
+ * cannot open a directory, is let off.
+ */
+async function syncDirectory(fs: JournalFs, path: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const handle = await fs.open(path, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Makes `dir` and what is above it that is missing, and puts each new folder's name on the disk. */
+async function ensureDirectory(fs: JournalFs, dir: string): Promise<void> {
+  const first = await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  if (first === undefined) return;
+  // `first` is the topmost folder made. Its name is in its parent, and so on down to `dir`.
+  for (let made = dir; ; made = dirname(made)) {
+    await syncDirectory(fs, dirname(made));
+    if (made === first || dirname(made) === made) return;
+  }
+}
+
+/**
+ * Writes `text` to `file` so that a reader, or a crash, finds the old file or the new one, and so
+ * that once it returns the new one is on the disk and stays there through a power cut. In order:
+ * the text goes to a temp file in the same directory, which is synced; the temp file is renamed
+ * over `file`; the directory is synced, which is what makes the rename last. A cut before the last
+ * step finds the old file (or none), a cut after it the new one; the half of a file is not a state.
+ */
 export async function writeFileAtomic(fs: JournalFs, file: string, text: string): Promise<void> {
   const dir = dirname(file);
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await ensureDirectory(fs, dir);
   const temp = join(dir, `.${basename(file)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
   const handle = await fs.open(temp, "wx", 0o600);
   try {
@@ -505,6 +541,7 @@ export async function writeFileAtomic(fs: JournalFs, file: string, text: string)
     await fs.rm(temp, { force: true }).catch(() => undefined);
     throw error;
   }
+  await syncDirectory(fs, dir);
 }
 
 // ---- The lead -----------------------------------------------------------------------------------
@@ -1080,6 +1117,7 @@ export function createLeadSolver(o: LeadSolverOptions): LeadSolver {
         fileOf(ctx.task.id),
         join(journalDir, `${ctx.task.id}.orphaned-${Date.now()}.json`),
       );
+      await syncDirectory(fs, journalDir);
     }
     await save({
       parent: ctx.task.id,

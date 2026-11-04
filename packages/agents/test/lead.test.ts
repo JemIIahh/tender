@@ -39,6 +39,7 @@ import {
   taskSummary,
   voided,
 } from "./helpers";
+import { PowerCut, PowerFs } from "./power-fs";
 
 // The lead agent of the swarm demo, with a stand-in chain and a stand-in API in one small world.
 // The pack is the demo's own (scripts/swarm-research-pack), so the happy path also shows that what
@@ -110,6 +111,16 @@ interface WorldOptions {
   caps?: { token?: string; per_task_cap?: string; total_cap?: string; spent?: string } | null;
   /** The lead's vault. Default 6.00, which pays for the pack exactly. */
   vault?: bigint;
+  /**
+   * Things that happen at a given moment of a hire, to lose power or to let a disk flush at an
+   * unlucky one. `n` is the number of the child, from 0. A hook that throws ends the hire there.
+   */
+  hooks?: {
+    /** The hire of child `n` begins: its brief is about to go up. */
+    beforeHire?: (n: number) => void;
+    /** The post of child `n` has landed on the chain, and the client has not answered yet. */
+    afterLand?: (n: number) => void;
+  };
 }
 
 /** A small world: a chain with a clock, an index of tasks, and the events in the order they happen. */
@@ -178,6 +189,7 @@ function buildWorld(o: WorldOptions = {}) {
       children.push({ id, input, opts, polls: 0 });
       // A post takes a few seconds of chain time.
       now += 3n * NS;
+      o.hooks?.afterLand?.(n);
       if (o.lostPost?.n === n && !postFailed) {
         postFailed = true;
         throw new TenderError("E_TIMEOUT", "TenderClient.send timed out; the transaction may land");
@@ -287,6 +299,7 @@ function buildWorld(o: WorldOptions = {}) {
     answerQuestion: unexpected("answerQuestion"),
     postClarification: unexpected("postClarification"),
     async uploadBlob(blob) {
+      if (blob.kind === "brief") o.hooks?.beforeHire?.(children.length);
       events.push(`upload ${blob.kind}`);
       const sha256 = sha256Hex(blob.bytes);
       blobs.set(sha256, blob.bytes);
@@ -442,9 +455,10 @@ async function enter(
 }
 
 /** Passes over the lead's jobs until none is under way. */
-async function finish(lead: LeadSolver, max = 600): Promise<void> {
+async function finish(lead: LeadSolver, max = 600, each?: () => void): Promise<void> {
   for (let pass = 0; pass < max; pass++) {
     await lead.tick();
+    each?.();
     if ((await lead.active()).length === 0) return;
     await delay(3);
   }
@@ -1229,5 +1243,44 @@ describe("fix round 1: I3, the lead's long work is not the runner's solve", () =
     stop.abort();
     await running;
     expect(jobOf().status).toBe("done");
+  });
+});
+
+describe("swarm fix: N2, a note the lead wrote before a post is still there after a power cut", () => {
+  test("N2_a_post_that_landed_just_before_a_power_cut_is_found_after_the_reboot_and_not_posted_again", async () => {
+    const disk = new PowerFs();
+    const world = buildWorld({
+      hooks: {
+        // The system had flushed what the lead had written so far, a moment before part 2 began:
+        // an unlucky time, for the note about part 2 is written after it.
+        beforeHire: (n) => {
+          if (n === 1) disk.settle();
+        },
+        // Part 2 is on the chain. The power goes before the lead's client has an answer.
+        afterLand: (n) => {
+          if (n === 1) {
+            disk.powerCut();
+            throw new PowerCut("the post of part 2");
+          }
+        },
+      },
+    });
+    const first = leadOf(world, { fs: disk });
+    await enter(world, first);
+    await first.tick();
+    expect(world.children).toHaveLength(2);
+
+    // The machine is back. A new lead reads the journal as the disk holds it.
+    const lines: string[] = [];
+    const second = leadOf(world, { fs: disk }, lines);
+    await finish(second, 600, () => world.advance(10));
+    const briefs = world.children.map((one) => one.input.briefHash);
+    expect(briefs).toHaveLength(3);
+    expect(new Set(briefs).size).toBe(3);
+    expect(lines.join("\n")).toMatch(/part 02-key-audit was posted already, as task 12/);
+    expect(JSON.parse(await disk.readFile(join(journalDir, "10.json"), "utf8")).status).toBe(
+      "done",
+    );
+    expect(await finalAnswer()).toEqual(JSON.parse(parentSolution()));
   });
 });
