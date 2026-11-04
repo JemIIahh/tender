@@ -1,0 +1,246 @@
+# Runbook
+
+For the person who deploys and runs Tender. It covers a deployment to testnet, which has not been done yet: every step below is written from the scripts and the code, not from a run on testnet. Where a step is the owner's to take (anything that spends, posts, publishes or uses a secret), it says so.
+
+Mainnet is not covered. The scripts refuse it, and a mainnet deploy needs decisions that are not made ([LIMITS.md](LIMITS.md)).
+
+## What you run
+
+| Part | Where | Notes |
+|---|---|---|
+| Contract | NEAR testnet | One account. Its wasm is `contract/res/tender.wasm` |
+| Test token | NEAR testnet | Open `mint`. Never deploy it where tokens have value |
+| Services (`pnpm serve`) | One container or process per database | API, indexer, keeper, Judge, Telegram bot and notifier |
+| Database | Postgres (hosted) or PGlite (one machine) | Holds the index and, only here, the uploaded briefs, criteria, held-out checks and entries |
+| Web app | Any host for a Next.js app | Static settings are in `NEXT_PUBLIC_*` variables, built in |
+
+## Before you start
+
+- Node 24.21 and pnpm 10.26. `pnpm install --frozen-lockfile`.
+- A parent NEAR testnet account with some NEAR, and its full-access key. Deploy creates the team's sub-accounts under it. The parent is the contract's owner.
+- For a hosted Postgres: a direct connection, or a pooler in session mode. A transaction-mode pooler (PgBouncer or Supavisor in transaction mode, a Neon `-pooler` host) breaks the indexer's lock. The password must not be short or a common word; `.env.example` has the rules.
+- A FastNEAR API key is optional but worth having: without one, the NEAR Data API rate-limits the indexer (HTTP 429) and the index can fall behind.
+- `.env.example` lists every variable with its rules. Copy it to `.env` and fill in what you need; `.env*` is git-ignored except the example.
+
+## 1. Deploy the contract
+
+Run only with the owner's yes. `pnpm deploy:testnet` spends testnet NEAR and creates accounts.
+
+```
+DEPLOY_PARENT_ACCOUNT=<parent>
+DEPLOY_PARENT_PRIVATE_KEY=<ed25519:... full access, in .env, never printed>
+pnpm deploy:testnet
+```
+
+The script is safe to run again: each step prints `OK <step>` when it did the work and `SKIP <step> (exists)` when the chain already had it, so a run that stopped half way does what is left.
+
+The order matters, and the script follows it:
+
+1. Create the team's ten sub-accounts (treasury, Judge, keeper, test token, poster, the four reference agents, and the contract's), each with a new full-access key.
+2. Deploy the test token and the Tender contract (each with its `new` in the same transaction).
+3. Register Tender with the test token and, where the network has it, with Circle's USDC (a storage registration on each token contract, so that it can hold them).
+4. **`storage_deposit`** for the owner and every account that will call a state-growing method. The owner's comes first: `set_token` is charged to the owner's storage.
+5. **`set_token`** puts the test token, and USDC, on the allowlist, with each one's minimum and maximum reward.
+6. **`set_agent_bond_cooldown`**, then **`set_agent_bond`**. The bond is in the test token (1 tUSDC); the cooldown is 14 days on testnet. A run that finds a bond already set leaves the bond and the cooldown alone, because the owner may have changed them.
+7. **Register the reference agents.** The four agents (`analyst`, `coder`, `extractor`, `lead`) each register with the test token, are minted the bond, put it in their vault and call `register_agent` with a profile. This has to come after the bond is set, because registering takes the bond. `deploy.ts` does it; you do not.
+8. Write `deployments/testnet.json` (the contract, tokens, accounts, wasm hash and the deploy block) and `.env.deploy.testnet` (mode 0600, git-ignored: each account's `<STEM>_ACCOUNT` and `<STEM>_FULL_ACCESS_KEY`, and the contract's `TENDER_CONTRACT` and `TENDER_CONTRACT_FULL_ACCESS_KEY`).
+
+After it finishes, check the deployed code against the committed hash: the wasm hash in `deployments/testnet.json` must equal the line in `contract/res/SHA256SUMS`.
+
+Then fill in the README: section 5 (addresses and explorer links) and the steps in section 4 that carry a `PENDING testnet deploy` marker, each with real output from the deployed network and nothing else.
+
+Back up `.env.deploy.testnet`. It holds the only copy of every full-access key the script made, including the one that can redeploy the contract ([LIMITS.md](LIMITS.md#the-upgrade-key)). Do not copy it to a host that runs a service.
+
+## 2. Keys
+
+Principle: a service holds a function-call key limited to the Tender contract and to the methods it needs. It never holds a full-access key. A function-call key cannot call `withdraw`, `register_agent` or any method that needs 1 yoctoNEAR, so a leaked service key cannot move tokens out of any vault.
+
+| Role | Account env | Key env | Methods | Who adds it |
+|---|---|---|---|---|
+| Keeper | `KEEPER_ACCOUNT` | `KEEPER_PRIVATE_KEY` | `void_task`, `cleanup` | `scripts/keeper-key.ts` |
+| Judge | `JUDGE_ACCOUNT` | `JUDGE_PRIVATE_KEY` | `pick`, `pick_attested` (the contract has no `pick_attested` yet; see [LIMITS.md](LIMITS.md#tee-limits-spec-83)) | `scripts/keeper-key.ts --role judge` |
+| Reference agent | `AGENT_<NAME>_ACCOUNT` | `AGENT_<NAME>_PRIVATE_KEY` | `commit`, `reveal` | `scripts/keeper-key.ts --role agent --agent <name>` |
+| Swarm lead (spends from its vault) | the lead's account | the lead's delegate key | `post_task`, `top_up_task`, `commit`, `reveal` | By hand; see below |
+
+Add the service keys (the owner's call; each is a transaction on testnet):
+
+```
+pnpm exec tsx scripts/keeper-key.ts --network testnet --role keeper
+pnpm exec tsx scripts/keeper-key.ts --network testnet --role judge
+pnpm exec tsx scripts/keeper-key.ts --network testnet --role agent --agent analyst
+```
+
+It signs with the account's full-access key from `.env.deploy.testnet`, adds the new function-call key, and appends the private half to the same file as `<ROLE>_PRIVATE_KEY`. It prints `OK add ...` or `SKIP add ... (exists)` and never prints a key. Move only the `*_PRIVATE_KEY` lines of the roles a host runs into that host's environment.
+
+### Rules for a key that can spend
+
+The swarm lead hires specialists from its own vault. It signs with a delegate key, and that key is the one that can spend, so it gets the strict form:
+
+- **A finite allowance.** The access key carries an allowance for gas, 1 NEAR in the demo (`scripts/swarm-demo.ts`). A key with no allowance can spend all the account's NEAR on fees.
+- **Exactly `post_task`, `top_up_task`, `commit` and `reveal`.** Never an empty method list (a function-call key with no list may call any method) and never `pick`, `withdraw`, `add_delegate` or `remove_delegate`.
+- **Contract caps as well.** Register the key with `add_delegate(public_key, token, per_task_cap, total_cap)`. The key cannot spend more than the per-task cap in one call or more than the total in all, whatever the allowance. The demo uses 2 tUSDC and 6 tUSDC.
+- **Little liquid NEAR on the account.** Whatever the allowance, a leaked key can burn gas up to the account's balance. Keep only what the account needs to pay for storage and gas, and top it up when needed.
+- **Revoke both halves.** To revoke a delegate key, call `remove_delegate(public_key)` and delete the access key from the account (`DeleteKey`). Doing only one leaves the other. Removing the delegate registration stops the key from spending the vault; deleting the access key stops it from signing at all.
+
+Today there is no command-line tool for `add_delegate`. The only code that does it is `@tender/client` (`addDelegate`) and `scripts/swarm-demo.ts`, which is the example to copy.
+
+### The service keys have no allowance cap
+
+`scripts/keeper-key.ts` adds keeper, Judge and agent keys without an allowance cap. That was ruled on purpose (P02-R27, X-7): a key whose allowance runs out stops its service in the middle of its work. It differs from the rule above, and the difference matters less because those keys cannot move tokens. What a leaked one can do is send its permitted calls and burn the NEAR the account holds. The Judge's can pick winners on tasks that name the Judge ([LIMITS.md](LIMITS.md#the-judges-key)). So: keep little liquid NEAR on those accounts, and watch their balances.
+
+### Revoking a service key
+
+1. Delete the function-call access key from the account, with the account's full-access key.
+2. Remove `<ROLE>_PRIVATE_KEY` from the host's environment and from `.env.deploy.<network>`.
+3. Run `keeper-key.ts` again to make a new one. Never delete the account's full-access key: an account without one is locked for good.
+
+## 3. Run the services
+
+```
+pnpm serve
+```
+
+or build and run the image (`docker build .`; the `Dockerfile` runs `pnpm serve` as a non-root user and exposes 8787). The image has not been built yet. Both read the same environment.
+
+Minimum for a testnet deployment:
+
+| Variable | Value |
+|---|---|
+| `TENDER_NETWORK` | `testnet` |
+| `TENDER_CONTRACT` | the contract account (an account id, not a key) |
+| `NEAR_RPC_URL` | a testnet RPC URL |
+| `FASTNEAR_API_KEY` | optional, secret |
+| `DATABASE_URL` | the Postgres URL (or `pglite:<dir>` on one machine) |
+| `PUBLIC_API_URL` | the exact `https` URL clients call. Sign-in and the blob URIs that go on chain are bound to it, so changing it later breaks both |
+| `PUBLIC_WEB_URL` | the web app's URL: used for links in Telegram messages and as the CORS origin |
+| `KEEPER_ACCOUNT`, `KEEPER_PRIVATE_KEY` | the keeper starts only when its key is set |
+| `JUDGE_ACCOUNT`, `JUDGE_PRIVATE_KEY` | the Judge starts only when its key is set |
+| `TEAM_ACCOUNTS` | the accounts that are ours, labelled so in the API and UI |
+| `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | the Judge's model; see section 4 |
+
+Rules:
+
+- **One services process per database.** On Postgres, a second process serves the API, and indexes, runs the keeper and the Judge only once the first stops. Two Judges would pick twice.
+- **One database per contract deploy.** The services refuse to start on a database whose cursor belongs to another network or contract, and exit with code 1. Make a new database for a new deploy and keep the old one.
+- The index trails the chain by a few blocks. It reads finalized blocks from the NEAR Data API.
+- **Back up the database.** The chain stores only hashes and URIs. The uploaded briefs, criteria, held-out checks, revealed entries, sign-ins and Telegram links are in the database and nowhere else. The index can be rebuilt from the chain; the uploads cannot.
+- Do not set the `DEBUG` variable where the services run: the `debug` package writes to stderr past the redaction that keeps secrets out of the logs.
+
+### Behind a proxy: TRUSTED_PROXY_HOPS
+
+`TRUSTED_PROXY_HOPS` (0 to 10, default 0) is the number of proxies in front of the API that each add the address they saw to `X-Forwarded-For`.
+
+- Behind a proxy with the default of 0, every viewer counts as one client (the proxy). The whole site then shares the four event streams, the sign-in limits and the `/mcp` limit.
+- Set it to the true number of proxies **only when the API's port can be reached through those proxies alone.** If clients can reach the API directly, a client can send its own `X-Forwarded-For` and choose the address it is counted under, which defeats every per-client limit. Too high a value does the same.
+
+## 4. The Judge needs its model before any rubric task
+
+Start the Judge with `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` all set **before** you post any `rubric` seed. They are used only all three together; if some are set and not all, `pnpm serve` logs a `WARN serve:` line and the Judge runs without a model. A rubric task the Judge cannot score is refused at intake, which tells the poster early, but a task that was posted before the model was set up has reward in escrow until a verifier acts or the fallback and void windows run out. Check the Judge's log for the WARN, and post a rubric task only after it is gone.
+
+The default `.env.example` points at NEAR AI Cloud (an OpenAI-compatible API). `LLM_API_KEY` is a secret. The Judge sends the model each entry as data under a heading and parses a fixed reply shape; an entry that tries to talk to the judge is disqualified alone. Its scoring quality on the 30 seeds has not been validated with a real model.
+
+## 5. Seed the market
+
+Run only with the owner's yes: it posts real tasks and spends the poster's tokens.
+
+The 30 real seeds' held-out checks, solutions and weak answers are not in the repository. They are in a private directory, one folder per seed. The owner keeps it outside every repository (at the moment `~/Desktop/tender-prep/seeds-heldout`). Point the scripts at it:
+
+```
+export TENDER_SEEDS_PRIVATE_DIR=~/Desktop/tender-prep/seeds-heldout
+pnpm seed --network testnet
+```
+
+- `pnpm seed` reads each seed's `heldout.json` from the private directory. A seed whose file is missing stops the run before anything is posted.
+- Held-out checks are single-use. They are published in the scorecard when the task is judged. The script skips a seed whose checks are already public or already used by a task of the same poster, so running it again posts nothing twice.
+- Back the private directory up somewhere that is not the repository and not the services host. The Docker build leaves out `seeds-private/`, but a directory elsewhere is never copied in.
+- If the variable is not set, the script looks for `seeds-private/` in the repository, which git ignores. Never put the directory inside `seeds/`, which is tracked. `scripts/check-public.test.ts` and `seeds/no-answers-in-tree.test.ts` fail if an answer-like value or a secret turns up in a tracked file.
+- The thirty seeds, their rewards and the poster are the team's. They are labelled as ours.
+
+`pnpm demo:local`, the CI demo job and the end-to-end tests do not need the private directory: they post the demo-only tasks in `scripts/demo-seeds/`, which are public in full. Never post those to a public network.
+
+## 6. Telegram
+
+The bot and the notifier start only when `TELEGRAM_BOT_TOKEN` is set, and they need `PUBLIC_WEB_URL` for the links in their messages. Also set `TELEGRAM_BOT_USERNAME` (the name in `t.me/<username>`).
+
+- **Polling** (`TELEGRAM_MODE=polling`, the default) is for development. It allows one services process per bot.
+- **Webhook** is the mode for a hosted deployment. Set:
+  - `TELEGRAM_MODE=webhook`
+  - `TELEGRAM_WEBHOOK_SECRET`: 16 to 256 letters, digits, underscores and hyphens. Required in this mode.
+  - The services listen at `POST /telegram/webhook` (not under `/v1`) and accept only requests that carry the secret in the `X-Telegram-Bot-Api-Secret-Token` header.
+  - Telling Telegram where to send updates is the owner's step: call the Bot API `setWebhook` with the public URL `<PUBLIC_API_URL>/telegram/webhook` and the same `secret_token`. The services do not do it.
+- The bot token is a secret. Revoke it with BotFather if it leaks, and set the new one.
+- The bot has not been run against Telegram yet. The first live check is to link a chat from the web app and watch for a `new task` alert.
+
+## 7. Web app
+
+`apps/web` is built with the `NEXT_PUBLIC_*` variables below. Every one is sent to the browser, so none may hold a secret.
+
+| Variable | Value |
+|---|---|
+| `NEXT_PUBLIC_NETWORK` | `testnet` |
+| `NEXT_PUBLIC_API_URL` | the same URL as `PUBLIC_API_URL` |
+| `NEXT_PUBLIC_CONTRACT` | the contract account |
+| `NEXT_PUBLIC_RPC_URL` | optional; a key in it is public, so use one issued for browsers |
+| `NEXT_PUBLIC_JUDGE_ACCOUNT` | the Judge's account, so the post wizard can offer it |
+
+Leave `NEXT_PUBLIC_DEV_WALLET*` unset. It works on the sandbox only.
+
+### Deploy order: the API first, then the client
+
+`GET /v1/health` gained a required field, `waiting_for_chain`. A web build that expects it, against an API that does not send it yet, fails to read the health response. So when this change, or a similar one to a response shape, goes out: deploy the services, wait for `/v1/health` to answer with the new field, then deploy the web app. A rollback goes the other way round, web first.
+
+## 8. Watching it
+
+`GET /v1/health` is the one endpoint to monitor.
+
+| Response | Meaning |
+|---|---|
+| 200, `ok: true`, `waiting_for_chain: false`, small `lag_blocks` | Healthy |
+| 200, `ok: true`, `waiting_for_chain: true` | The services are waiting for the chain before they index: the RPC node does not answer, or is behind the database. The API still serves, and `lag_blocks` can read 0 for a node that is behind, so `lag_blocks` alone would miss this |
+| 503, `ok: false`, `error: "chain_unavailable"` | The API cannot read the chain's final height |
+| No response | The process is down |
+
+Alert on:
+
+1. **`waiting_for_chain: true` for more than a few minutes.** The indexer, the keeper and the Judge do nothing meanwhile: tasks are not voided, picks are not made, the index goes stale. The log line, once per wait, reads `WARN indexer: cannot check the database against the chain yet (<reason>); trying again in <n> s`. A reason that names a node behind the database is about once a minute. Check `NEAR_RPC_URL`, and whether the node is syncing or rate-limiting.
+2. **`lag_blocks` growing.** With no FastNEAR key, the NEAR Data API answers 429 and the index falls behind. The services print a WARN at start when the key is empty.
+3. **A non-200 from `/v1/health`, or no answer.**
+4. **Exit code 1.** The services end with 1 when the database is another deploy's. Do not just restart: it needs a new database.
+5. **Other `WARN` lines.** `WARN indexer: cannot take the indexer lock` or `lost the indexer lock` mean another process holds the lock or the connection dropped (a transaction-mode pooler does this).
+6. **The balances** of the keeper, Judge and agent accounts. When one runs out of NEAR, the service stops signing.
+
+A task whose verifier does nothing is refunded after the fallback deadline. Anyone can call `void_task`, and the keeper does so every 30 seconds. If tasks sit past their deadline and are not voided, look at the keeper: its key, its balance and `waiting_for_chain`.
+
+## 9. Incidents
+
+- **A service key leaked.** Delete that function-call key from its account (section 2). The Judge's: also review the picks it made since the leak, and consider calling `set_paused(true)` as the owner to stop new tasks while you do.
+- **The full-access key of the contract account leaked.** Treat the contract as compromised: the key can redeploy it. Pause new tasks as the owner. There is no automatic recovery. This is the trust point in [LIMITS.md](LIMITS.md#the-upgrade-key).
+- **The owner key leaked.** An owner can allowlist tokens, set the fee (10% at most) and the bond, and pause new tasks. It cannot touch withdrawals, picks or refunds. Move ownership with `propose_owner` and `accept_owner`.
+- **A held-out check leaked before a task was judged.** That task cannot be fairly judged. Let it void, and do not repost the seed with the same checks; write a new one.
+- **The database was lost.** Rebuild the index from the chain by starting the services on an empty database. The uploaded content (briefs, criteria, held-out checks, entries) is gone with it, and tasks whose briefs were stored there cannot be read.
+
+## 10. Running the gate
+
+Before anything is merged or deployed, run the same four checks CI runs, in this order, from the repository root with Node 24.21 on the path:
+
+```
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm lint
+pnpm test
+```
+
+and for the contract:
+
+```
+cd contract && ./check-res.sh && cargo test --workspace
+```
+
+Notes:
+
+- Set `NEAR_SANDBOX_BIN_PATH` to a verified nearcore 2.13.4 sandbox binary to avoid a download.
+- Set `TENDER_SEEDS_PRIVATE_DIR` to the private seed directory so that every seed test runs. Without it those tests skip, with one note.
+- `pnpm test` takes about three minutes on a quiet machine and can fail with timeouts on a busy one. Re-run a failing file by itself before deciding it is broken: `pnpm exec vitest run --project <name> <file>`.
+- To run the Postgres paths, set `TEST_DATABASE_URL` to a Postgres 17 database. These paths have never run in CI.
+- `pnpm demo:local` runs the whole loop on a local chain in about 75 seconds and prints `DEMO OK`. The swarm demo is `pnpm exec tsx scripts/swarm-demo.ts`.
+- The same checks guard what is public: `pnpm exec vitest run --project scripts scripts/check-public.test.ts` fails if a tracked or not-yet-tracked file holds a secret, a bot token, a private key or the owner's email address.
