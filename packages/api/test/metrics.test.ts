@@ -8,7 +8,7 @@ import {
   FIXTURE_TOKEN,
 } from "@tender/indexer/testing";
 import { type MetricsResponse, MetricsResponseSchema } from "@tender/shared";
-import { afterAll, beforeAll, beforeEach, expect, test } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { type ApiDeps, createApp } from "../src/index";
 import { resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 
@@ -198,4 +198,50 @@ test("metrics_sum_amounts_past_a_u128_and_take_no_query", async () => {
   const res = await createApp(deps).request("/v1/metrics?limit=1&poster=x");
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual(body);
+});
+
+test("metrics_are_kept_for_15_seconds_and_counted_again_after", async () => {
+  const app = createApp(deps);
+  const read = async () =>
+    MetricsResponseSchema.parse(await (await app.request("/v1/metrics")).json());
+  expect((await read()).tasks.posted).toBe(0);
+
+  // A task posted now is not in the answer kept a moment ago...
+  await apply(eventLine("task_created", { id: "1", ...openWindows() }));
+  nowNs = TEST_NOW + 14n * SECOND;
+  expect((await read()).tasks.posted).toBe(0);
+  // ...and is once 15 seconds have passed.
+  nowNs = TEST_NOW + 15n * SECOND;
+  expect((await read()).tasks.posted).toBe(1);
+  // A clock that went back counts again rather than trust what it kept.
+  await apply(eventLine("task_created", { id: "2", ...openWindows() }));
+  nowNs = TEST_NOW;
+  expect((await read()).tasks.posted).toBe(2);
+});
+
+test("metrics_count_once_for_requests_that_come_together_and_keep_no_failure", async () => {
+  let counts = 0;
+  let failing = true;
+  const counting = new Proxy(deps.db, {
+    get(target, name) {
+      const value = Reflect.get(target, name);
+      if (name !== "query") return typeof value === "function" ? value.bind(target) : value;
+      return async (sql: string, params?: unknown[]) => {
+        if (sql.includes("count(*)::int as posted")) {
+          counts += 1;
+          if (failing) throw new Error("the database is away");
+        }
+        return target.query(sql, params);
+      };
+    },
+  });
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const app = createApp({ ...deps, db: counting });
+  expect((await app.request("/v1/metrics")).status).toBe(500);
+  // The failure is not kept: the next request counts again.
+  failing = false;
+  const answers = await Promise.all([1, 2, 3].map(() => app.request("/v1/metrics")));
+  expect(answers.map((res) => res.status)).toEqual([200, 200, 200]);
+  expect(counts).toBe(2);
+  vi.restoreAllMocks();
 });

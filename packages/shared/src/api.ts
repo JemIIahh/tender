@@ -336,15 +336,18 @@ export const TokenTotalSchema = z.object({ token: AccountIdSchema, amount: SumSt
 export type TokenTotal = z.infer<typeof TokenTotalSchema>;
 
 /**
- * `GET /v1/metrics`: the platform's figures, every one counted from the index at the time of the
- * request. Amounts are by token, in the token's smallest unit, ordered by token (byte order).
+ * `GET /v1/metrics`: the platform's figures, every one counted from the index, at most 15 seconds
+ * before the request (the API keeps the answer that long). Amounts are by token, in the token's
+ * smallest unit, ordered by token (byte order).
  *
  * - `tasks`: every task posted; those `open` now (by the clock, as `phase` works it out); those
  *   `settled`, which is `picked` (paid out) and `voided` (refunded) together.
  * - `paid`: what picked tasks paid their winners, after the fee. `fees`: the platform fee those
  *   picks took. A void takes no fee.
- * - `agents`: every account that registered as an agent, and those `active` now, which may enter
- *   an open task. `providers`: the accounts that run one or more of those agents as sub-accounts.
+ * - `agents`: every account that registered as an agent, retired ones included, and those `active`
+ *   now (an active agent enters an open task once it holds the bond, if one is set). `providers`:
+ *   the accounts that one or more of those agents run under (their `asp`), whatever the agent's
+ *   status, retired included.
  * - `services`: every service listed, paused ones included, and those that can be hired now (as
  *   `GET /v1/services` lists them).
  * - `top_agents`: the agents with the most wins, at most 5, ties by account; an agent that has won
