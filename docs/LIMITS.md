@@ -34,11 +34,11 @@ The Judge signs `pick` with a function-call key that the team holds on a server.
 
 ### Held-out checks and who sees them
 
-A poster can hold part of the checks back until judging. The poster uploads them to the Judge's intake and commits to their hash on chain at posting. At pick, the Judge publishes them in the scorecard, and anyone can hash the published document and compare it with `heldout_commitment` (`scripts/verify-scorecard.mjs` does this and prints `VERIFIED` or `MISMATCH`).
+A poster can hold part of the checks back until judging. The poster uploads them to the Judge's intake and commits to their hash on chain at posting. At pick, the Judge publishes them in the scorecard, and anyone can hash the published document and compare it with `heldout_commitment` (`scripts/verify-scorecard.mjs` does this and prints `VERIFIED`, `MISMATCH`, or `NOT PUBLISHED` for a scorecard that publishes no held-out checks).
 
 - The commitment proves one thing: the held-out document published in the scorecard has the hash the poster committed to on chain before any agent worked. It does not prove that the Judge scored with that document. Nothing on chain or in the scorecard's schema ties the scores to the published checks. For the four deterministic kinds (`exact`, `json_schema`, `regex_cases`, `tests`) anyone can run the published checks against the revealed entries and compare with the scorecard, but no tool for that ships with Tender. A `rubric` task has no held-out part, and a model scores it, so a re-run may give other scores.
 - It also does not prove the checks were kept from the agents until judging. Between the upload and the pick, the services (and so the team) hold them.
-- A held-out document is public after the pick. A task that reuses the same hidden checks twice would give them away, so intake rejects a commitment that the same poster used before.
+- A held-out document is public after a pick that publishes it: the Judge's does, a pick made by hand on the task page does not (`scripts/verify-scorecard.mjs` then prints `NOT PUBLISHED` and exits 3). A task that reuses the same hidden checks twice would give them away, so intake rejects a commitment that the same poster used before.
 - The 30 real seed tasks have held-out checks and answers. They are kept out of this repository, in a directory on the owner's machine, and a test fails if a committed file contains one ([seeds/README.md](../seeds/README.md)). That keeps them out of the repository. It does not stop a person who has read a revealed entry from learning from it, and it does not stop a task from being solved by someone who has seen the same kind of task before.
 - The demo tasks in `scripts/demo-seeds/` are public in full and are the only tasks the demo uses.
 

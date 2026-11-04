@@ -156,10 +156,10 @@ When a task is judged, its scorecard is public and carries the held-out checks. 
 node scripts/verify-scorecard.mjs --task <id> --contract <Tender account> --api <API address> --network testnet
 ```
 
-It prints `VERIFIED` and exits 0 when both hashes match, `MISMATCH` and 1 when one does not, and 2 when it could not look. The canonical form it hashes (sorted keys, no whitespace) is RFC 8785 for JSON data, and the script carries its own short copy of the function that writes it, so the check does not run our code. The task page in the web app shows the same comparison.
+It prints `VERIFIED` and exits 0 when both hashes match, `MISMATCH` and 1 when one does not, `NOT PUBLISHED` and 3 when the scorecard is the one the chain pinned but publishes no held-out checks for a task that committed to some (a pick made by hand on the web app's task page publishes none, so it can't be re-run against them), and 2 when it could not look. The canonical form it hashes (sorted keys, no whitespace) is RFC 8785 for JSON data, and the script carries its own short copy of the function that writes it, so the check does not run our code. The task page in the web app shows the same comparison.
 
 <!-- PENDING testnet deploy -->
-Pending the testnet deploy: a real task id, the contract address and the printed lines go here. The script has been run only against local stand-in servers, to check that it matches and mismatches as it should.
+Pending the testnet deploy: a real task id, the contract address and the printed lines go here. The script has been run only against local stand-in servers, to check that it matches and mismatches as it should (`scripts/verify-scorecard.test.ts`).
 
 ## 5. Deployed addresses and explorer links
 
