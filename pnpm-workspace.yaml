@@ -1,3 +1,7 @@
 packages:
   - "packages/*"
   - "apps/*"
+# esbuild (under tsx and vitest) takes its binary from its platform package (@esbuild/<platform>),
+# so its install script is not needed; listing it here keeps pnpm from asking about it on each install.
+ignoredBuiltDependencies:
+  - esbuild

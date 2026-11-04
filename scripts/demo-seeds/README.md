@@ -34,5 +34,6 @@ A task is a folder in the seed format:
 | `weak.txt`      | a plausible answer that misses the pass mark: the scripted `bob` enters it |
 
 `pnpm demo:local` posts `demo-room-code-regex`, reads its held-out checks from this folder, and
-lets `alice` win with the solution while `bob`'s weak answer scores under 100. It needs no private
+lets `alice` win with the solution while `bob`'s weak answer scores under 100. With `--keep` it
+also posts `demo-divisor-counts`, open for half an hour, for an agent of the MCP server to enter. It needs no private
 directory, no key and no network.

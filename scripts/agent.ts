@@ -1,3 +1,4 @@
+import "./lib/node-check";
 import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -15,6 +16,7 @@ import {
   type ConnectOutcome,
   connectAgent,
   DELEGATE_SUFFIX,
+  fetchNamingApi,
   KeyDirError,
   KeyInUseError,
   type KeyPermission,
@@ -1210,7 +1212,11 @@ export async function connectAgentCommand(options: ConnectCommandOptions): Promi
       `--api <url> is needed: the address of the Tender API, as the Add an agent page shows it in the command\n${USAGE}`,
     );
   }
-  const api = (options.apiFor ?? ((baseUrl) => new ApiClient({ baseUrl })))(connectApiBase(wanted));
+  // A request that gets no answer names the address it went to (`fetchNamingApi`): a mistyped
+  // `--api` says which one it was, not a bare "fetch failed".
+  const api = (
+    options.apiFor ?? ((baseUrl) => new ApiClient({ baseUrl, fetchImpl: fetchNamingApi(baseUrl) }))
+  )(connectApiBase(wanted));
   // Settled once the code has said which chain it is for (`chainFor`, which runs before `key`).
   let target: AgentTarget | undefined;
   let checked: Promise<AgentTarget> | undefined;

@@ -16,7 +16,7 @@ Mainnet is not covered. The scripts refuse it, and a mainnet deploy needs decisi
 
 ## Before you start
 
-- Node 24.21 and pnpm 10.26. `pnpm install --frozen-lockfile`.
+- Node 24.21 or a later 24, or Node 26 and newer (25 is not supported by some test dependencies), and pnpm 10.26.x (`corepack enable` picks the one `package.json` names). `pnpm install --frozen-lockfile`.
 - A parent NEAR testnet account with some NEAR, and its full-access key. Deploy creates the team's sub-accounts under it. The parent is the contract's owner.
 - For a hosted Postgres: a direct connection, or a pooler in session mode. A transaction-mode pooler (PgBouncer or Supavisor in transaction mode, a Neon `-pooler` host) breaks the indexer's lock. The password must not be short or a common word; `.env.example` has the rules.
 - A FastNEAR API key is optional but worth having: without one, the NEAR Data API rate-limits the indexer (HTTP 429) and the index can fall behind.
@@ -47,7 +47,7 @@ The steps below are in dependency order. The script runs the owner's calls, Tend
 
 After it finishes, compare the wasm hash in `deployments/testnet.json` with the `tender.wasm` line in `contract/res/SHA256SUMS`. A match shows that the deployed binary is the committed one. It does not show that the committed binary was built from these sources: a rebuild on another machine gives different bytes ([LIMITS.md](LIMITS.md#not-built)).
 
-Then bring the README up to date with the deployment: the contract badge and link, the key links, the "Deployed on NEAR testnet" table (every account, the wasm sha256, the deploy date and height, from `deployments/testnet.json`), and the "On testnet today" steps under Try it, each with real output from the deployed network and nothing else. What waits on hosting (the site, the API address, the seed tasks) says "comes with hosting" there until it is up.
+Then bring the README up to date with the deployment: the contract badge and link, the key links, the "Deployed on NEAR testnet" table (every account, the wasm sha256, the deploy date and height, from `deployments/testnet.json`), and the "On testnet today" steps under Try it, each with real output from the deployed network and nothing else. What waits on hosting (the site, the API address, the seed tasks) says "Not live yet: it arrives once the services are hosted" there until it is up, and the address goes in its place when it is.
 
 Back up `.env.deploy.testnet`. It holds the only copy of every full-access key the script made, including the one that can redeploy the contract ([LIMITS.md](LIMITS.md#the-upgrade-key)). Do not copy it to a host that runs a service.
 
@@ -244,9 +244,9 @@ cd contract && ./check-res.sh && cargo test --workspace
 Notes:
 
 - Set `NEAR_SANDBOX_BIN_PATH` to a verified nearcore 2.13.4 sandbox binary to avoid a download.
-- Set `TENDER_SEEDS_PRIVATE_DIR` to the private seed directory so that every seed test runs. Without it those tests skip, with one note.
+- Set `TENDER_SEEDS_PRIVATE_DIR` to the private seed directory so that every seed test runs. Without it those tests skip (about 300), with one note.
 - The tests do not read the `.env`, `.env.deploy.<network>` and `deployments/<network>.json` of the checkout, so a deployed testnet on the machine changes no result. A test that starts `pnpm serve` or the run-agent command as a process sets `TENDER_ENV_DIR` to an empty directory of its own; the others pass the directory they want to the function they call. A new test that starts one of these as a process must do the same.
-- `pnpm test` takes about three minutes on a quiet machine and can fail with timeouts on a busy one. Re-run a failing file by itself before deciding it is broken: `pnpm exec vitest run --project <name> <file>`.
+- `pnpm test` runs about 4,200 tests in about 7 minutes and can fail with timeouts on a busy machine. Re-run a failing file by itself before deciding it is broken: `pnpm exec vitest run --project <name> <file>`.
 - To run the Postgres paths, set `TEST_DATABASE_URL` to a Postgres 17 database. These paths have never run in CI.
-- `pnpm demo:local` runs the whole loop on a local chain in about 75 seconds and prints `DEMO OK`. The swarm demo is `pnpm exec tsx scripts/swarm-demo.ts`.
+- `pnpm demo:local` runs the whole loop on a local chain in about 80 seconds once the local node is downloaded, and prints `DEMO OK`. The first run of an install also downloads the node (about 30 MB; it prints a line before it starts), which takes a few minutes on a slow link; `NEAR_SANDBOX_BIN_PATH` skips that. `pnpm demo:local --keep` then keeps the chain and the services up until Ctrl-C, for the MCP server. The swarm demo is `pnpm exec tsx scripts/swarm-demo.ts`, four to five minutes.
 - The same checks guard what is public: `pnpm exec vitest run --project scripts scripts/check-public.test.ts` fails if a tracked or not-yet-tracked file is an `.env*` file other than the example, is under `.submission/` or `seeds-private/`, or holds the owner's email address, a NEAR `ed25519:` private key, a PEM private key, a Telegram bot token, an `sk-`, GitHub, AWS, Slack or Google key, a JWT, or a `NAME=value` line (at the start of a line, with or without `export`) for a capitalised name that is, or ends in, `API_KEY`, `APIKEY`, `SECRET`, `TOKEN`, `PASSWORD`, `JWT` or `PRIVATE_KEY`, with a value of 16 or more characters that is no placeholder. It finds nothing of any other shape (a short password, a lower-case name, a key in a TypeScript object), and it is not in the pre-commit hook, so run it before you commit.

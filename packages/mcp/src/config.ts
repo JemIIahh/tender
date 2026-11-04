@@ -12,7 +12,7 @@ import {
 import { KeyPair, type KeyPairString } from "near-api-js";
 import { urlCredentials } from "./secrets";
 import { DRAFTS_DIR, defaultStateDir, defaultStateRoot } from "./state";
-import { scrub } from "./tools/format";
+import { scrub, urlsToShow } from "./tools/format";
 
 // What the bin reads from the environment, and what it does with it. It lives here and not in the
 // bin so that a test can hand it an environment without starting a process.
@@ -634,13 +634,14 @@ export function secretsOf(config: Pick<McpConfig, "signer" | "rpcUrl">): string[
 
 /**
  * A failure that stopped the server from starting, as the one line the bin prints. Every string in
- * `secrets` is cut out of it, a bearer token and a URL are replaced (`scrub`), and line breaks
- * become spaces, so that what a library puts into its message cannot print a key.
+ * `secrets` is cut out of it, a bearer token and a URL are replaced (`scrub`; the API's base stays
+ * when the API did not answer, `urlsToShow`), and line breaks become spaces, so that what a library
+ * puts into its message cannot print a key.
  */
 export function describeFailure(error: unknown, secrets: readonly string[] = []): string {
   let text: string;
   if (error instanceof ConfigError) text = error.message;
   else if (error instanceof Error) text = `${error.name}: ${error.message}`;
   else text = String(error);
-  return scrub(text, secrets).replace(/\s+/g, " ").trim();
+  return scrub(text, secrets, urlsToShow(error)).replace(/\s+/g, " ").trim();
 }

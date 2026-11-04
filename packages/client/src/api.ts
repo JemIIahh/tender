@@ -91,6 +91,61 @@ export class ApiTimeoutError extends Error {
   }
 }
 
+/**
+ * A request to the API that got no answer at all: nothing listens at the address, its name does not
+ * resolve, or the connection was refused or cut. It names the API's base, as `canonicalBase` reads
+ * it, which holds no user name, password, query or fragment, and a space follows it in the message.
+ * Of the error `fetch` gave, which is its `cause`, the message only names the code (`ECONNREFUSED`).
+ */
+export class ApiUnreachableError extends Error {
+  /** The API's base, as `canonicalBase` reads it: `http://127.0.0.1:8787`. */
+  readonly base: string;
+
+  constructor(base: string, cause: unknown) {
+    const code =
+      cause instanceof Error ? (cause.cause as { code?: unknown } | undefined)?.code : undefined;
+    const said = cause instanceof Error ? cause.message : String(cause);
+    super(
+      `could not reach the Tender API at ${base} (${said}${typeof code === "string" ? `, ${code}` : ""})`,
+      { cause },
+    );
+    this.name = "ApiUnreachableError";
+    this.base = base;
+  }
+}
+
+/**
+ * Whether `error` is `fetch` getting no answer: undici's `TypeError("fetch failed")`, or a
+ * `TypeError` whose cause has a system code (`ECONNREFUSED`, `ENOTFOUND`). Other `TypeError`s of
+ * `fetch` are mistakes of the request itself (a header value it refuses, say), and not the address.
+ */
+function noAnswer(error: unknown): boolean {
+  if (!(error instanceof TypeError)) return false;
+  const code = (error.cause as { code?: unknown } | null | undefined)?.code;
+  return error.message === "fetch failed" || typeof code === "string";
+}
+
+/**
+ * `fetchImpl` (the global `fetch`, looked up at each call, by default) for an `ApiClient` of
+ * `baseUrl`, whose requests that get no answer at all fail with an `ApiUnreachableError` that names
+ * the base, in place of `fetch`'s bare "fetch failed". For a command line or a server whose reader
+ * set the address, and needs to see which one did not answer. A request that was cancelled (by its
+ * timeout or a signal) fails as it did, and so does a failure that is not one of the network's.
+ */
+export function fetchNamingApi(baseUrl: string, fetchImpl?: typeof fetch): typeof fetch {
+  const base = canonicalBase(baseUrl);
+  return async (input, init) => {
+    // A local, so that it is called as a function of its own and not as a method of anything.
+    const doFetch = fetchImpl ?? fetch;
+    try {
+      return await doFetch(input, init);
+    } catch (error) {
+      if (init?.signal?.aborted === true || !noAnswer(error)) throw error;
+      throw new ApiUnreachableError(base, error);
+    }
+  };
+}
+
 export interface ApiClientOptions {
   /**
    * Where the API is served, as `PUBLIC_API_URL` has it: `https://api.example`. The client adds
