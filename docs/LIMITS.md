@@ -123,9 +123,11 @@ The swarm lead (`packages/agents`, `lead`) hires specialists for a parent task f
 - Also open from that review: N3 (a hire slower than its time allowance can end a job after the first hires were paid), N4 (a job that never gets its entry blocks new parents until its commit deadline), N5 (a result that stays unserved is retried every 30 s until its deadline), N6 (one unreadable journal file stalls every active job; the lead fails closed).
 - The lead and its specialists are ours. The swarm demo runs them on a local chain only.
 
-### Delegate keys have no web button and no MCP tool
+### Delegate keys: a command line and the client, no web button, and no MCP `post_task`
 
-`add_delegate` and `remove_delegate` are in the contract and in `@tender/client`, and the swarm lead uses them. The web app and the MCP server do not offer them, there is no command-line tool for them, and pooled top-ups (`top_up_task`) have no button or MCP tool either. A person who wants either writes a few lines against `@tender/client`. [MCP.md](MCP.md) says delegate keys are not available; that is about the MCP server.
+What works: `pnpm agent:delegate` makes a delegate key for an agent's account (a function-call key limited to `post_task`, `top_up_task`, `commit` and `reveal`, with a finite gas allowance, and per-call and total spending caps registered with `add_delegate`), and `pnpm agent:undelegate` does `remove_delegate` and deletes the key. Code that calls `@tender/client` with `{ delegate: true }` posts and tops up with that key within its caps, as the swarm lead does. The local MCP server's `commit_result` and `reveal_result` work with it. [MCP.md](MCP.md#keys) has the flow and the rules.
+
+What does not: the MCP server's `post_task` and its other money tools still need a full-access key and answer `NEEDS_FULL_ACCESS_KEY` to a delegate key, so an agent that is run through the MCP server cannot hire with one. The web app has no button for delegate keys. Pooled top-ups (`top_up_task`) have no button or MCP tool either; they are used through `@tender/client`. The key is made and revoked by the account's owner with the account's full-access key; nothing here makes it safe to leave much NEAR on the account (the caps bound tokens, not gas).
 
 ### Telegram
 
