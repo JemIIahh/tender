@@ -6,8 +6,10 @@ import * as api from "../src/api";
 import {
   ApiError,
   type BlobUpload,
+  type CreateServiceRequest,
   fetchJson,
   type ListAgentsFilter,
+  type ListServicesFilter,
   type ListTasksFilter,
   ListTasksResponseSchema,
   MAX_RESPONSE_BYTES,
@@ -16,6 +18,7 @@ import {
   StartResponseSchema,
   TaskOutcomeSchema,
   type TenderApi,
+  type UpdateServiceRequest,
 } from "../src/index";
 
 // `fetchJson` and the response schemas, over a fake `fetch`. The API's own test
@@ -914,6 +917,14 @@ test("a_client_with_the_listed_methods_satisfies_tender_api", async () => {
     }),
     telegramLink: async () => ({ url: "https://t.me/tender_test_bot?start=abc", expires_at: SOON }),
     signIn: async () => "a-bearer-token",
+    listServices: async (_filter?: ListServicesFilter) => ({ services: [], next_cursor: null }),
+    getService: async (_id: bigint) => null,
+    createService: async (_service: CreateServiceRequest) => {
+      throw new Error("not called");
+    },
+    updateService: async (_id: bigint, _update: UpdateServiceRequest) => {
+      throw new Error("not called");
+    },
   } satisfies TenderApi;
   const tender: TenderApi = standIn;
 
@@ -925,6 +936,7 @@ test("a_client_with_the_listed_methods_satisfies_tender_api", async () => {
     poster: "poster.test.near",
     verifier: "judge.test.near",
     parent: 7n,
+    invited: "agent.test.near",
     limit: 20,
     cursor: "7",
   });

@@ -212,6 +212,10 @@ function recordingApi(served: ReadonlySet<string> = new Set()) {
     postClarification: unexpected("postClarification"),
     telegramLink: unexpected("telegramLink"),
     signIn: unexpected("signIn"),
+    listServices: unexpected("listServices"),
+    getService: unexpected("getService"),
+    createService: unexpected("createService"),
+    updateService: unexpected("updateService"),
   };
   return { api, blobs, heldouts };
 }

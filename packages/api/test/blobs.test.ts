@@ -2771,13 +2771,16 @@ test("a_result_stored_before_the_records_is_served_after_the_upgrade", async () 
       });
     }
 
-    // The upgrade gives the result its record: carol's, for task 2, from the time she sent it.
-    expect(await migrate(old)).toEqual([
+    // The upgrade gives the result its record: carol's, for task 2, from the time she sent it. The
+    // migrations after 0006 (services, and any later) apply after these, and 0006 not again.
+    const applied = await migrate(old);
+    expect(applied.slice(0, 4)).toEqual([
       "0002_result_uploads.sql",
       "0003_heldout_uploads.sql",
       "0004_task_questions.sql",
       "0005_tg_board_digests.sql",
     ]);
+    expect(applied).not.toContain("0006_agent_bond.sql");
     expect(
       await old.query(
         "select sha256, task_id::text as task_id, account, uploaded_at from result_uploads",

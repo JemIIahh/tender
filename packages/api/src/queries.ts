@@ -1,10 +1,14 @@
 import type { BlobKind, Db } from "@tender/db";
 import {
   BriefSchema,
+  type ListServicesResponse,
   type Phase,
+  type PublicCriteria,
   PublicCriteriaSchema,
   type Scorecard,
   ScorecardSchema,
+  type Service,
+  sha256Hex,
   U64StringSchema,
 } from "@tender/shared";
 import type { z } from "zod";
@@ -156,6 +160,8 @@ export interface TaskFilter {
   verifier?: string;
   /** Only the tasks that name this task (a canonical u64) as their parent. */
   parent?: string;
+  /** Only the pinned tasks whose invited list names this account. */
+  invited?: string;
   /** Page size, from 1 to 50. */
   limit: number;
   /** A task id (a canonical u64): only tasks below it, the next page of an earlier answer. */
@@ -183,6 +189,9 @@ export async function listTasks(
   if (f.poster !== undefined) where.push(`t.poster = ${p.add(f.poster)}`);
   if (f.verifier !== undefined) where.push(`t.verifier = ${p.add(f.verifier)}`);
   if (f.parent !== undefined) where.push(`t.parent = ${p.add(f.parent)}::numeric`);
+  if (f.invited !== undefined) {
+    where.push(`t.invited @> ${p.add(JSON.stringify([f.invited]))}::jsonb`);
+  }
   if (f.cursor !== undefined) where.push(`t.id < ${p.add(f.cursor)}::numeric`);
 
   const rows = await db.query<TaskSummary>(
@@ -501,4 +510,205 @@ async function accountEntries(
       limit ${p.add(limit)}::int`,
     p.values,
   );
+}
+
+// ---- Services ---------------------------------------------------------------------------------
+
+/** A service row as the reads select it. */
+interface ServiceRow {
+  id: string;
+  provider: string;
+  agent: string;
+  title: string;
+  description: string;
+  tags: string[];
+  category: Service["category"];
+  output_format: Service["output_format"];
+  token: string;
+  price: string;
+  commit_secs: number;
+  reveal_secs: number;
+  pick_secs: number;
+  verifier: "hirer" | "judge";
+  criteria: string | null;
+  status: Service["status"];
+  created_at: Date;
+  updated_at: Date;
+  is_team: boolean;
+}
+
+/** The columns of a `ServiceRow` for the service row `s`, with `team` the team's accounts. */
+function serviceColumns(team: string): string {
+  return `s.id::text as id,
+    s.provider,
+    s.agent,
+    s.title,
+    s.description,
+    s.tags,
+    s.category,
+    s.output_format,
+    s.token,
+    s.price::text as price,
+    s.commit_secs,
+    s.reveal_secs,
+    s.pick_secs,
+    s.verifier,
+    s.criteria,
+    s.status,
+    s.created_at,
+    s.updated_at,
+    ${teamSql("s.agent", team)} as is_team`;
+}
+
+/**
+ * Whether an agent can take a hire: it is active, and holds a bond. The contract lets an invited
+ * account enter a pinned task whatever it is, and this is the API's own bar for a listing (the
+ * brief's "an ACTIVE bonded agent"): an agent that is leaving, or never put a bond at stake, is not
+ * offered for hire.
+ */
+export function canTakeHires(agent: Pick<AgentSummary, "status" | "bond_amount"> | null): boolean {
+  return agent !== null && agent.status === "active" && agent.bond_amount != null;
+}
+
+/** The agent records of `accounts`, by account, as `getAgentDetail` reads one. */
+async function agentRecords(
+  db: Db,
+  accounts: readonly string[],
+  teamAccounts: readonly string[],
+): Promise<Map<string, AgentSummary>> {
+  if (accounts.length === 0) return new Map();
+  const rows = await db.query<AgentSummary>(
+    `select ${agentColumns("$2")} from agents a where a.account = any($1::text[])`,
+    [[...new Set(accounts)], [...teamAccounts]],
+  );
+  return new Map(rows.map((row) => [row.account, row]));
+}
+
+/** A service as the API shows it, from its row and its agent's record. */
+function serviceOf(row: ServiceRow, agent: AgentSummary | null): Service {
+  const verification: Service["verification"] =
+    row.verifier === "judge" && row.criteria !== null
+      ? {
+          kind: "judge",
+          criteria: JSON.parse(row.criteria) as PublicCriteria,
+          criteria_hash: sha256Hex(row.criteria),
+        }
+      : { kind: "hirer" };
+  return {
+    id: row.id,
+    provider: row.provider,
+    agent: row.agent,
+    title: row.title,
+    description: row.description,
+    tags: row.tags,
+    category: row.category,
+    output_format: row.output_format,
+    token: row.token,
+    price: row.price,
+    commit_secs: row.commit_secs,
+    reveal_secs: row.reveal_secs,
+    pick_secs: row.pick_secs,
+    verification,
+    status: row.status,
+    available: row.status === "active" && canTakeHires(agent),
+    is_team: row.is_team,
+    created_at: row.created_at.toISOString(),
+    updated_at: row.updated_at.toISOString(),
+    agent_record: agent,
+  };
+}
+
+async function servicesOf(
+  db: Db,
+  rows: ServiceRow[],
+  teamAccounts: readonly string[],
+): Promise<Service[]> {
+  const agents = await agentRecords(
+    db,
+    rows.map((row) => row.agent),
+    teamAccounts,
+  );
+  return rows.map((row) => serviceOf(row, agents.get(row.agent) ?? null));
+}
+
+export interface ServiceFilter {
+  /** Words the title or the description contains, case aside: 1 to 80 characters. */
+  q?: string;
+  tag?: string;
+  provider?: string;
+  agent?: string;
+  token?: string;
+  /** A u128 as a decimal string: only prices at most this, in `token`. */
+  maxPrice?: string;
+  /** `available`: active services whose agent can take hires (`canTakeHires`). `all`: every one. */
+  status: "available" | "all";
+  /** Page size, from 1 to 50. */
+  limit: number;
+  /** A service id (a canonical u64): only services below it. */
+  cursor?: string;
+}
+
+/** `text` for a `like` pattern that matches it as it is: `\`, `%` and `_` are escaped. */
+function likeEscaped(text: string): string {
+  return text.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+/**
+ * The services that fit `f`, newest first, each with its agent's record from the index (the same
+ * as `GET /v1/agents/:account` gives), labelled as ours when the team runs the agent or its
+ * provider.
+ */
+export async function listServices(
+  db: Db,
+  f: ServiceFilter,
+  teamAccounts: readonly string[],
+): Promise<ListServicesResponse> {
+  const limit = clampLimit(f.limit);
+  const p = new SqlParams();
+  const teamP = p.add([...teamAccounts]);
+  const where: string[] = [];
+  if (f.status === "available") {
+    where.push(`s.status = 'active'`);
+    where.push(
+      "exists (select 1 from agents a where a.account = s.agent and a.status = 'active' and a.bond_amount is not null)",
+    );
+  }
+  if (f.q !== undefined) {
+    const pattern = p.add(`%${likeEscaped(f.q)}%`);
+    where.push(
+      `(s.title ilike ${pattern} escape '\\' or s.description ilike ${pattern} escape '\\')`,
+    );
+  }
+  if (f.tag !== undefined) where.push(`s.tags @> ${p.add(JSON.stringify([f.tag]))}::jsonb`);
+  if (f.provider !== undefined) where.push(`s.provider = ${p.add(f.provider)}`);
+  if (f.agent !== undefined) where.push(`s.agent = ${p.add(f.agent)}`);
+  if (f.token !== undefined) where.push(`s.token = ${p.add(f.token)}`);
+  if (f.maxPrice !== undefined) where.push(`s.price <= ${p.add(f.maxPrice)}::numeric`);
+  if (f.cursor !== undefined) where.push(`s.id < ${p.add(f.cursor)}::numeric`);
+
+  const rows = await db.query<ServiceRow>(
+    `select ${serviceColumns(teamP)}
+       from services s
+      ${where.length > 0 ? `where ${where.join(" and ")}` : ""}
+      order by s.id desc
+      limit ${p.add(limit + 1)}::int`,
+    p.values,
+  );
+  const { items, next_cursor } = pageOf(rows, limit, (last) => last.id);
+  return { services: await servicesOf(db, items, teamAccounts), next_cursor };
+}
+
+/** One service, whatever its status, with its agent's record; null if there is no such service. */
+export async function getService(
+  db: Db,
+  id: bigint,
+  teamAccounts: readonly string[],
+): Promise<Service | null> {
+  const [row] = await db.query<ServiceRow>(
+    `select ${serviceColumns("$2")} from services s where s.id = $1::numeric`,
+    [id, [...teamAccounts]],
+  );
+  if (!row) return null;
+  const [service] = await servicesOf(db, [row], teamAccounts);
+  return service ?? null;
 }
