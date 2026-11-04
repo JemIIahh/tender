@@ -21,7 +21,7 @@ import { addRoleKey } from "../../../../scripts/keeper-key";
 import { seed } from "../../../../scripts/seed";
 import { redact, type Services, startServices } from "../../../../scripts/serve";
 import { descendantsOf, killNow, listProcesses, type Proc, terminate } from "./processes";
-import { RUN_FILE_VARIABLE, type RunInfo } from "./run";
+import { RUN_FILE_VARIABLE, type RunInfo, SIGNERS_VARIABLE } from "./run";
 import { GiveUp, limited, messageOf, type Poll, sleep, until } from "./waits";
 
 // The stack the chain suite runs the web app against: a local NEAR chain with Tender and a test
@@ -63,7 +63,12 @@ const SWEEP_GRACE_MS = 3_000;
 const API_TIMEOUT_MS = 10_000;
 const INDEXER_POLL_MS = 200;
 const JUDGE_INTERVAL_MS = 1_000;
-const KEEPER_INTERVAL_MS = 1_000;
+/**
+ * The keeper ticks once when the services start, and not again in a run: it would void a task with
+ * nothing revealed within a second of its reveal deadline, and the spec of the task page's Refund
+ * (task-actions.chain.ts) has to be the one that voids it. No spec waits on the keeper.
+ */
+const KEEPER_INTERVAL_MS = 3_600_000;
 /** The bot the Telegram links name. No bot runs: there is no token, and no message is sent. */
 export const BOT_USERNAME = "tender_test_bot";
 
@@ -199,6 +204,9 @@ async function bringUp(s: Stack, { webPort }: StackOptions): Promise<RunInfo> {
     );
     const chain = await limited("the local chain to start", CHAIN_MS, starting, signal);
     const { poster, alice, judge, keeper } = chain.accounts;
+    // The keys of the poster and of alice, for the specs that post and enter tasks themselves. The
+    // workers inherit the environment; the keys go into no file (run.ts).
+    process.env[SIGNERS_VARIABLE] = JSON.stringify({ poster, alice });
 
     say("starting the services");
     const keys = await limited(
