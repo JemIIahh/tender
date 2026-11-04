@@ -500,6 +500,64 @@ export function readConfig(env: Env, home: string = homedir()): McpConfig {
   };
 }
 
+/** What the server reads in connect mode (`tender-mcp --connect`): no account and no key. */
+export interface McpConnectConfig {
+  network: NetworkId;
+  contractId: string;
+  /** As `McpConfig.apiUrl`. */
+  apiUrl: string;
+  /** The chain's RPC: `NEAR_RPC_URL`, else the network's own. */
+  rpcUrl: string;
+}
+
+/**
+ * The settings of connect mode (`tender-mcp --connect`), in which the server offers only
+ * `connect_to_tender`, for an agent that has no account or key yet. Required: `TENDER_NETWORK`,
+ * `TENDER_CONTRACT` and `TENDER_API_URL`, as `readConfig` reads them, and `NEAR_RPC_URL` on the
+ * sandbox. `TENDER_ACCOUNT` and `TENDER_PRIVATE_KEY` are not read: the tool makes the agent's key.
+ * Every fault is reported at once, in one line that names the variables, as `readConfig` does.
+ */
+export function readConnectConfig(env: Env): McpConnectConfig {
+  const missing: string[] = [];
+  const wrong: string[] = [];
+  function read<T>(
+    name: string,
+    parse: (value: string) => T | undefined,
+    expected: string,
+    required = true,
+  ): T | undefined {
+    const value = setting(env, name);
+    if (value === undefined) {
+      if (required) missing.push(name);
+      return undefined;
+    }
+    const parsed = parse(value);
+    if (parsed === undefined) wrong.push(`${name} must be ${expected}`);
+    return parsed;
+  }
+  const network = read("TENDER_NETWORK", asNetwork, `one of ${Object.keys(NETWORKS).join(", ")}`);
+  const contractId = read("TENDER_CONTRACT", asAccount, AN_ACCOUNT);
+  const apiUrl = read("TENDER_API_URL", asApiUrl, AN_API_URL);
+  const rpc = read("NEAR_RPC_URL", asHttpUrl, A_URL, network === "sandbox");
+  if (
+    missing.length > 0 ||
+    wrong.length > 0 ||
+    network === undefined ||
+    contractId === undefined ||
+    apiUrl === undefined
+  ) {
+    const faults = [...wrong];
+    if (missing.length > 0) {
+      const noun = missing.length === 1 ? "variable" : "variables";
+      faults.unshift(`missing environment ${noun}: ${missing.join(", ")}`);
+    }
+    throw new ConfigError(faults.join("; "));
+  }
+  const rpcUrl = rpc ?? NETWORKS[network].rpcUrl;
+  if (rpcUrl === "") throw new ConfigError("missing environment variable: NEAR_RPC_URL");
+  return { network, contractId, apiUrl, rpcUrl };
+}
+
 /**
  * Refuses to go on with an API that serves another deployment than the environment names: the
  * network and the contract in the API's `/health` are compared with `TENDER_NETWORK` and
@@ -558,6 +616,11 @@ export async function resolveDefaultToken(
     throw new ConfigError("the contract lists no enabled token: set TENDER_TOKEN");
   }
   return first.token;
+}
+
+/** The credentials in an RPC URL, if it has any (`urlCredentials`): what connect mode must not print. */
+export function urlCredentialsOf(rpcUrl: string): string[] {
+  return urlCredentials(rpcUrl);
 }
 
 /**

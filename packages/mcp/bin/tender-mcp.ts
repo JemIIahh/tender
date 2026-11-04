@@ -1,20 +1,28 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ApiClient, TenderClient } from "@tender/client";
+import { NETWORKS } from "@tender/shared";
 import {
   checkApiDeployment,
   describeFailure,
   filesDirWarning,
   readConfig,
+  readConnectConfig,
   resolveDefaultToken,
   secretsOf,
+  urlCredentialsOf,
 } from "../src/config";
 import { detectKeyAccess } from "../src/keys";
-import { createMcpServer } from "../src/server";
+import { createConnectServer, createMcpServer } from "../src/server";
 import { createStateStore } from "../src/state";
 
 // The Tender MCP server over stdio, for one agent account. An MCP client starts it with the
 // environment that `readConfig` lists. stdout belongs to the protocol, so only the transport writes
 // to it: the bin's own lines go to stderr, and never include the key.
+//
+// With `--connect` it is the server of an agent that has no account yet: it reads only the
+// network, the contract and the API (`readConnectConfig`), and offers `connect_to_tender` alone,
+// which makes the agent's key and connects it with a code from its owner's page.
 
 /** How long the check of the API's deployment waits: an API that hangs must not hold up the start. */
 const API_CHECK_TIMEOUT_MS = 5_000;
@@ -22,7 +30,46 @@ const API_CHECK_TIMEOUT_MS = 5_000;
 /** Every secret that a failure's text must not carry. Set once the environment is read. */
 let secrets: string[] = [];
 
+/** Serves `server` over stdio until the client goes, and says so on stderr. */
+async function serve(server: McpServer, line: string): Promise<void> {
+  // The session is over when the client closes our stdin, or a signal asks us to stop. Without
+  // this the process would wait on whatever connections the chain client keeps open.
+  const stop = () => {
+    server.close().then(
+      () => process.exit(0),
+      () => process.exit(1),
+    );
+  };
+  process.stdin.once("end", stop);
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+
+  await server.connect(new StdioServerTransport());
+  process.stderr.write(`tender-mcp: ${line}\n`);
+}
+
+/** Connect mode: no account and no key, and `connect_to_tender` alone. */
+async function connectMode(): Promise<void> {
+  const config = readConnectConfig(process.env);
+  secrets = urlCredentialsOf(config.rpcUrl);
+  const api = new ApiClient({ baseUrl: config.apiUrl });
+  await checkApiDeployment(
+    config,
+    new ApiClient({ baseUrl: config.apiUrl, timeoutMs: API_CHECK_TIMEOUT_MS }),
+    (line) => process.stderr.write(`tender-mcp: ${line}\n`),
+  );
+  const server = createConnectServer({
+    network: config.network,
+    contractId: config.contractId,
+    api,
+    rpcUrl: config.rpcUrl,
+    secrets,
+  });
+  await serve(server, `connect mode on ${config.network}: connect_to_tender only`);
+}
+
 async function main(): Promise<void> {
+  if (process.argv.slice(2).includes("--connect")) return connectMode();
   const config = readConfig(process.env);
   const { accountId } = config.signer;
   secrets = secretsOf(config);
@@ -64,22 +111,17 @@ async function main(): Promise<void> {
     filesDir: config.filesDir,
     stateDir: config.stateDir,
     secrets,
+    connect: {
+      network: config.network,
+      contractId: config.contractId,
+      // The connect routes need no sign-in: a client of its own, with no signer.
+      api: new ApiClient({ baseUrl: config.apiUrl }),
+      rpcUrl: config.rpcUrl ?? NETWORKS[config.network].rpcUrl,
+      secrets,
+    },
   });
 
-  // The session is over when the client closes our stdin, or a signal asks us to stop. Without
-  // this the process would wait on whatever connections the chain client keeps open.
-  const stop = () => {
-    server.close().then(
-      () => process.exit(0),
-      () => process.exit(1),
-    );
-  };
-  process.stdin.once("end", stop);
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
-
-  await server.connect(new StdioServerTransport());
-  process.stderr.write(`tender-mcp: serving ${accountId} on ${config.network} (${key.kind} key)\n`);
+  await serve(server, `serving ${accountId} on ${config.network} (${key.kind} key)`);
 }
 
 main().catch((error: unknown) => {
