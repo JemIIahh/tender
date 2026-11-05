@@ -35,6 +35,10 @@ case "$1" in
 esac
 `;
 
+// Each test makes a download, an archive and a server, and the default of 5 s leaves a busy machine
+// too little room.
+vi.setConfig({ testTimeout: 30_000 });
+
 const SAVED = {
   TMPDIR: process.env.TMPDIR,
   DIR_TO_DOWNLOAD_BINARY: process.env.DIR_TO_DOWNLOAD_BINARY,

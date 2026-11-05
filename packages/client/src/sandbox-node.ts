@@ -43,6 +43,8 @@ let downloading: Promise<void> | undefined;
  *
  * Resolves with the path of the node: the one `NEAR_SANDBOX_BIN_PATH` names, if it is set (nothing
  * is downloaded then), else the downloaded one. Several callers in one process share one download.
+ * The temp dir is the process's, so whatever else makes a temp file in it while the download runs
+ * makes it in the scratch directory, which goes when the download ends.
  */
 export async function ensureSandboxNode(): Promise<string> {
   const named = process.env.NEAR_SANDBOX_BIN_PATH;
@@ -81,6 +83,7 @@ async function download(root: string): Promise<void> {
   } finally {
     if (saved === undefined) Reflect.deleteProperty(process.env, "TMPDIR");
     else process.env.TMPDIR = saved;
-    await rm(scratch, { recursive: true, force: true });
+    // A scratch directory that will not go is no reason to hide why the download failed.
+    await rm(scratch, { recursive: true, force: true }).catch(() => undefined);
   }
 }
