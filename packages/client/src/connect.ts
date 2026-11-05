@@ -1,10 +1,12 @@
 import {
   ApiError,
   CONNECT_CODE_PATTERN,
+  type ConnectAccountKind,
   type ConnectLookup,
   type ConnectRegistered,
   connectFingerprint,
   formatTokenAmount,
+  implicitAccountOf,
   tokenMeta,
 } from "@tender/shared";
 import { JsonRpcProvider } from "near-api-js";
@@ -22,7 +24,10 @@ import { AGENT_NAME } from "./keyfile";
 //      caller's `key`, which never shows the private half);
 //   3. attach the PUBLIC key to the code, and print its fingerprint, which the owner's page shows
 //      too, for the owner to match before pressing Create agent;
-//   4. wait for the account to exist with this key as a full-access key;
+//   4. wait for the account to exist with this key as a full-access key: `<name>.<owner>`, or, if
+//      the owner chose it on the page (the API's `account_kind` is `implicit`), the agent's own
+//      implicit account, which the agent works out from its key and never takes from the API. While
+//      it waits it asks the API now and then which one the owner chose;
 //   5. wait for the bond to be in the agent's vault (the owner's batch pays it there);
 //   6. register (the caller's `register`, with the agent's own key), and tell the API.
 //
@@ -50,6 +55,8 @@ export interface ConnectChain {
   plan(accountId: string): Promise<RegistrationPlan>;
   /** The full-access keys of `accountId` (`view_access_key_list`), as `ed25519:<base58>`. */
   fullAccessKeys(accountId: string): Promise<string[]>;
+  /** Whether `accountId` exists (`view_account`). */
+  accountExists(accountId: string): Promise<boolean>;
 }
 
 /** The agent's key, as the caller keeps it: its PUBLIC half and where the file is. */
@@ -71,11 +78,25 @@ export interface ConnectAgentOptions {
    */
   chainFor(lookup: ConnectLookup): ConnectChain;
   /**
-   * The key of agent `name` for the code's account: read from its file, or made now if `mayMake`.
-   * Null when there is no file and it may not make one: a code that has a key attached already
-   * can only be this agent's if its key is on this machine.
+   * The key of agent `name` for the account the code was made for, `<lookup.name>.<lookup.owner>`
+   * (`agentKeyFor`): read from its file, or made now if `mayMake`. A file moved already to the
+   * implicit account the code's record names counts too, when the record says the owner chose it.
+   * Null when there is no file and it may not make one: a code that has a key attached already can
+   * only be this agent's if its key is on this machine.
    */
   key(lookup: ConnectLookup, name: string, mayMake: boolean): Promise<ConnectKey | null>;
+  /**
+   * Moves agent `name`'s key file from `<lookup.name>.<lookup.owner>` to the implicit account the
+   * code's record names (`lookup.account_id`), once the record says the owner chose it
+   * (`moveAgentKeyToImplicit`): only a file that names that sub-account, only to its own key's
+   * implicit account, and only when `exists` says the sub-account is not on the chain. It throws
+   * otherwise, and the file is left as it was.
+   */
+  moveKey(
+    lookup: ConnectLookup,
+    name: string,
+    exists: (accountId: string) => Promise<boolean>,
+  ): Promise<ConnectKey>;
   /** Registers the agent with its own key, once its vault holds the bond. */
   register(lookup: ConnectLookup, name: string, key: ConnectKey): Promise<void>;
   log: (line: string) => void;
@@ -83,6 +104,8 @@ export interface ConnectAgentOptions {
   waitMs: number;
   /** How often to look while waiting. Default: 3 s. */
   pollMs?: number;
+  /** How often, at most, to ask the API which account the owner chose, while waiting for it. Default: 20 s. */
+  lookupMs?: number;
   /** How long to keep asking the API to take the agent's word, once registered. Default: 60 s. */
   confirmMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -93,6 +116,10 @@ export interface ConnectAgentOptions {
 export interface ConnectOutcome {
   status: "registered" | "waiting_for_account" | "waiting_for_bond";
   accountId: string;
+  /** Whether the account is `<name>.<owner>`, or the implicit account of the agent's key. */
+  accountKind: ConnectAccountKind;
+  /** The agent's name: its key file's. */
+  name: string;
   owner: string;
   fingerprint: string;
   keyPath: string;
@@ -148,7 +175,11 @@ function explain(error: unknown): never {
   }
 }
 
-/** The agent's name: `wanted`, else the name the code was made for if it can name a key file. */
+/**
+ * The agent's name, which names its key file: `wanted` (`--name`, or the MCP tool's `name`), else
+ * the name the code was made for if it can name a key file. Nothing else names one: an existing key
+ * file is used again only under one of these two names, and never under one made from an account id.
+ */
 function nameFor(lookup: ConnectLookup, wanted: string | undefined): string {
   const name = wanted ?? lookup.name;
   if (!AGENT_NAME.test(name)) {
@@ -192,6 +223,25 @@ export function rpcKeyState(rpcUrl: string): ConnectChain["keyState"] {
   };
 }
 
+/**
+ * The chain's `accountExists` through an RPC node (`view_account`), at the newest block
+ * (`optimistic`), not the last final one: a "no" lets the key file move off `<name>.<owner>`, so it
+ * is read where an account made a block or two ago is already seen. A block that is later dropped
+ * can only make the answer "yes" wrongly, which refuses the move: the safe way to be wrong.
+ */
+export function rpcAccountExists(rpcUrl: string): ConnectChain["accountExists"] {
+  const provider = new JsonRpcProvider({ url: rpcUrl });
+  return async (accountId) => {
+    try {
+      await provider.viewAccount({ accountId, blockQuery: { finality: "optimistic" } });
+      return true;
+    } catch (error) {
+      if (error instanceof AccountDoesNotExistError) return false;
+      throw error;
+    }
+  };
+}
+
 /** The chain's `fullAccessKeys` through an RPC node (`view_access_key_list`), at the last final block. */
 export function rpcFullAccessKeys(rpcUrl: string): ConnectChain["fullAccessKeys"] {
   const provider = new JsonRpcProvider({ url: rpcUrl });
@@ -214,12 +264,31 @@ function span(ms: number): string {
 /**
  * Where the owner finds Fund agent, for an agent that waits on its bond: on the owner's Add an agent
  * page, which shows it for the code it made, and for an account typed in step 1 ("Finish an agent
- * you started"), after a reload or in another browser.
+ * you started"), after a reload or in another browser. An implicit account is not `<name>.<owner>`,
+ * so only the page that made the code (in its browser tab) finishes it.
  */
-export const FUND_AGENT_WHERE = (owner: string, name: string): string =>
-  `${owner} presses Fund agent on the Add an agent page of the web app: in step 4 if the page ` +
-  `that made the code is still open, or else after typing ${name} in step 1 and pressing Finish ` +
-  "this agent.";
+export const FUND_AGENT_WHERE = (
+  owner: string,
+  name: string,
+  kind: ConnectAccountKind = "sub_account",
+): string =>
+  kind === "implicit"
+    ? `${owner} presses Fund agent in step 4 of the Add an agent page of the web app, in the ` +
+      "browser tab that made the code."
+    : `${owner} presses Fund agent on the Add an agent page of the web app: in step 4 if the page ` +
+      `that made the code is still open, or else after typing ${name} in step 1 and pressing ` +
+      "Finish this agent.";
+
+/** What the agent says once the owner chose its implicit account. */
+export const IMPLICIT_ACCOUNT_WORDS = (owner: string, account: string): string =>
+  `${owner} chose a separate account for this agent: ${account}, the implicit account of its ` +
+  `key. It is its own account, so Tender's directory won't list it under ${owner} as its provider.`;
+
+/**
+ * How often, at most, the agent asks the API which account the owner chose while it waits for one,
+ * unless told otherwise: every 20 s, within the API's limit of 60 requests per client in 10 minutes.
+ */
+const LOOKUP_EVERY_MS = 20_000;
 
 /** What the agent says of a contested code whose first key was its own. */
 export const CONTESTED_AFTER_YOURS =
@@ -238,6 +307,7 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
   const sleep = opts.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
   const now = opts.now ?? Date.now;
   const pollMs = opts.pollMs ?? 3_000;
+  const lookupMs = opts.lookupMs ?? LOOKUP_EVERY_MS;
   const code = opts.code.trim();
   if (!CONNECT_CODE_PATTERN.test(code)) {
     throw new ConnectError(
@@ -247,17 +317,21 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
   }
 
   const lookup = await api.connectLookup(code).catch(explain);
-  const account = lookup.account_id;
   if (lookup.state === "expired") explain(new ApiError(410, { error: "code_expired" }));
-  // The account is the name under the owner, as the owner asked for it; an answer that says
-  // otherwise is not one to act on.
-  if (account !== `${lookup.name}.${lookup.owner}`) {
-    throw new ConnectError(
-      "the API's answer does not add up (its account is not the name under the owner): nothing " +
-        "was made or sent. Ask the owner for a new code",
+  // The account is the name under the owner, as the owner asked for it, or, once the code's record
+  // says the owner chose it, the implicit account of the key attached, which is checked once the key
+  // is read. An answer that says otherwise is not one to act on.
+  const subAccount = `${lookup.name}.${lookup.owner}`;
+  const doesNotAddUp = () =>
+    new ConnectError(
+      "the API's answer does not add up (its account is not the name under the owner, nor the " +
+        "implicit account of this agent's key): nothing was made or sent. Ask the owner for a new " +
+        "code",
     );
+  if (lookup.account_kind === "sub_account" && lookup.account_id !== subAccount) {
+    throw doesNotAddUp();
   }
-  log(`connect code for ${account}, made by ${lookup.owner}, on ${lookup.network}`);
+  log(`connect code for ${lookup.account_id}, made by ${lookup.owner}, on ${lookup.network}`);
   // Before a key is made or attached: a chain that is not the code's is refused here.
   const chain = opts.chainFor(lookup);
 
@@ -291,6 +365,30 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
     }
     explain(new ApiError(409, { error: "already_attached" }));
   }
+  /**
+   * Whether an answer adds up for this agent's key: its owner is the code's, and its account is the
+   * sub-account, or, only when the record says the owner chose it, the implicit account of this
+   * agent's own key. It throws otherwise.
+   */
+  const check = (answer: ConnectLookup): void => {
+    const expected =
+      answer.account_kind === "implicit" ? implicitAccountOf(key.publicKey) : subAccount;
+    if (expected === null || answer.account_id !== expected || answer.owner !== lookup.owner) {
+      throw doesNotAddUp();
+    }
+  };
+  /**
+   * The account an answer names, once it adds up. For the implicit account, the key file is moved
+   * to it first (`moveKey`), which the chain must allow: the sub-account must not exist.
+   */
+  const accountOf = async (answer: ConnectLookup): Promise<string> => {
+    check(answer);
+    if (answer.account_kind === "sub_account") return subAccount;
+    const moved = await opts.moveKey(answer, name, (id) => chain.accountExists(id));
+    if (moved.publicKey !== key.publicKey) throw doesNotAddUp();
+    return answer.account_id;
+  };
+  check(lookup);
   const fingerprint = connectFingerprint(key.publicKey);
   log(
     key.made
@@ -298,16 +396,24 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
       : `key: using ${key.path}`,
   );
   log(`public key: ${key.publicKey}`);
-  await api.connectAttach(code, key.publicKey).catch(explain);
+  // The latest answer: which account the owner chose, as of now.
+  let current = await api.connectAttach(code, key.publicKey).catch(explain);
+  let account = await accountOf(current);
   log(`fingerprint: ${fingerprint}`);
-  log(
-    `attached. On the page of ${lookup.owner}, check that the fingerprint is ${fingerprint}, then ` +
-      "press Create agent.",
-  );
+  if (current.account_kind === "implicit") {
+    log(IMPLICIT_ACCOUNT_WORDS(lookup.owner, account));
+  } else {
+    log(
+      `attached. On the page of ${lookup.owner}, check that the fingerprint is ${fingerprint}, then ` +
+        "press Create agent.",
+    );
+  }
 
   const outcome = (status: ConnectOutcome["status"], confirmed: boolean | null = null) => ({
     status,
     accountId: account,
+    accountKind: current.account_kind,
+    name,
     owner: lookup.owner,
     fingerprint,
     keyPath: key.path,
@@ -333,13 +439,47 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
     }
   };
 
+  /**
+   * Asks the API which account the owner chose, at most every `lookupMs`: a code moved to the
+   * implicit account of this agent's key moves the wait there, and the key file with it
+   * (`accountOf`). A code contested meanwhile stops the agent. An API that can't be reached now is
+   * asked again later: the chain is what the wait goes by.
+   */
+  let askedAt = now();
+  const askWhichAccount = async (): Promise<void> => {
+    if (current.account_kind === "implicit" || now() - askedAt < lookupMs) return;
+    askedAt = now();
+    const answer = await api.connectLookup(code).catch((error: unknown) => {
+      if (apiCode(error) === null || apiCode(error) === "rate_limited") return null;
+      return explain(error);
+    });
+    if (answer === null) return;
+    if (answer.state === "contested") explain(new ApiError(409, { error: "contested" }));
+    // The key attached never changes: an answer with another one is not one to act on.
+    if (answer.fingerprint !== fingerprint) throw doesNotAddUp();
+    if (answer.account_kind !== "implicit") return;
+    account = await accountOf(answer);
+    current = answer;
+    log(IMPLICIT_ACCOUNT_WORDS(lookup.owner, account));
+    log(`waiting for ${lookup.owner} to send ${account} its NEAR…`);
+  };
+
   const giveUpAt = now() + opts.waitMs;
-  log(`waiting for ${lookup.owner} to create ${account}…`);
+  log(
+    current.account_kind === "implicit"
+      ? `waiting for ${lookup.owner} to send ${account} its NEAR…`
+      : `waiting for ${lookup.owner} to create ${account}…`,
+  );
   const created = await waitFor(
-    `${account} to be created`,
+    `${lookup.owner} to create the account`,
     async () => {
+      await askWhichAccount();
       const state = await chain.keyState(account, key.publicKey);
       if (state === "other-keys") {
+        // The account exists and this key is not on it yet. The setup code adds it in a receipt of
+        // its own, a block after the account is made: an account with no full-access key yet is
+        // still being set up.
+        if ((await chain.fullAccessKeys(account)).length === 0) return false;
         throw new ConnectError(
           `${account} exists, and not with this agent's key as a full-access key: it was made ` +
             "another way. Ask the owner for a new code with another name",
@@ -379,7 +519,7 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
       ));
     if (!funded) {
       log(
-        `stopped waiting: the bond is not in the agent's vault yet. ${FUND_AGENT_WHERE(lookup.owner, lookup.name)} ` +
+        `stopped waiting: the bond is not in the agent's vault yet. ${FUND_AGENT_WHERE(lookup.owner, lookup.name, current.account_kind)} ` +
           "Then run the same command again.",
       );
       return outcome("waiting_for_bond");
@@ -395,7 +535,7 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
           "the agent's alone: nothing was registered. Ask the owner",
       );
     }
-    await opts.register(lookup, name, key);
+    await opts.register(current, name, key);
     log(`registered: ${account} is an agent`);
   } else {
     log(`registered: ${account} is an agent already`);

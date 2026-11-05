@@ -1,3 +1,4 @@
+export * from "./agentSetup";
 export * from "./api";
 export * from "./board";
 export * from "./brief";

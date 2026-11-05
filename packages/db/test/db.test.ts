@@ -312,6 +312,8 @@ const SCHEMA: Record<string, string[]> = {
     "attached_at timestamp with time zone?",
     "registered_at timestamp with time zone?",
     "contested_at timestamp with time zone?",
+    // Migration 0009.
+    "account_kind text = 'sub_account'::text",
   ],
 };
 
@@ -364,12 +366,16 @@ const KEYS = [
 // Every constraint that is not a key (those are in KEYS) and not NOT NULL (that is the "?" above;
 // Postgres 18 also lists NOT NULL in pg_constraint, 17 does not): no foreign key, and no CHECK but
 // the kind of a blob, the three of a board row (migration 0004), the status of an agent (0006), the
-// three of a service (0007) and the key of a connect code with its time (0008).
+// three of a service (0007), the key of a connect code with its time (0008) and the two of a connect
+// code's account (0009).
 const CONSTRAINTS = [
   "agents: CHECK ((status = ANY (ARRAY['active'::text, 'unregistering'::text, 'retired'::text])))",
   "blobs: CHECK ((kind = ANY (ARRAY['brief'::text, 'criteria'::text, 'heldout'::text, " +
     "'result'::text, 'scorecard'::text, 'profile'::text])))",
+  // Migration 0009: only a code with a key is implicit, and the kind of a code's account.
+  "connect_codes: CHECK (((account_kind = 'sub_account'::text) OR (public_key IS NOT NULL)))",
   "connect_codes: CHECK (((public_key IS NULL) = (attached_at IS NULL)))",
+  "connect_codes: CHECK ((account_kind = ANY (ARRAY['sub_account'::text, 'implicit'::text])))",
   "services: CHECK (((verifier = 'judge'::text) = (criteria IS NOT NULL)))",
   "services: CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text])))",
   "services: CHECK ((verifier = ANY (ARRAY['hirer'::text, 'judge'::text])))",

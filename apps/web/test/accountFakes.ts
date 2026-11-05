@@ -96,6 +96,13 @@ export interface World {
   requests: string[];
   /** Every request body sent, as text: what left the page. */
   bodies: string[];
+  /** `GET /v1/connect/implicit` (signed in): the agents set up as implicit accounts. */
+  implicit: Array<{ id: string; account_id: string; agent: object | null }>;
+  /** What `GET /v1/connect/implicit` answers with in place of the list, while set. */
+  implicitStatus: number | null;
+  /** Accounts with a storage balance with Tender, and vault balances, for the dismissal's checks. */
+  storage: Set<string>;
+  vault: Map<string, bigint>;
 }
 
 export function world(): World {
@@ -112,6 +119,10 @@ export function world(): World {
     serviceAuth: [],
     requests: [],
     bodies: [],
+    implicit: [],
+    implicitStatus: null,
+    storage: new Set(),
+    vault: new Map(),
   };
 }
 
@@ -140,7 +151,17 @@ export function serve(state: World): void {
           ? json({ jsonrpc: "2.0", id: "x", result: { nonce: 0, permission: "FullAccess" } })
           : rpcError("UNKNOWN_ACCESS_KEY", "does not exist while viewing");
       }
-      const bytes = [...new TextEncoder().encode(JSON.stringify(state.config))];
+      const args = JSON.parse(atob(params.args_base64 ?? "") || "{}") as { account_id?: string };
+      const who = args.account_id ?? "";
+      const value =
+        params.method_name === "storage_balance_of"
+          ? state.storage.has(who)
+            ? { total: "20000000000000000000000", available: "17000000000000000000000" }
+            : null
+          : params.method_name === "balance_of"
+            ? (state.vault.get(who) ?? 0n).toString()
+            : state.config;
+      const bytes = [...new TextEncoder().encode(JSON.stringify(value))];
       return json({ jsonrpc: "2.0", id: "x", result: { result: bytes, logs: [] } });
     }
     state.requests.push(`${init.method ?? "GET"} ${url.pathname}${url.search}`);
@@ -149,6 +170,22 @@ export function serve(state: World): void {
     if (agentPath !== null) {
       const found = state.agents.get(agentPath[1] ?? "");
       return found === undefined ? notFound() : json({ agent: found, recent_entries: [] });
+    }
+    if (url.pathname === "/v1/connect/implicit") {
+      const signedIn = new Headers(init.headers).get("Authorization") !== null;
+      if (!signedIn) return json({ error: "unauthorized", message: "sign in" }, 401);
+      if (state.implicitStatus !== null) {
+        return json({ error: "x", message: "a server's words" }, state.implicitStatus);
+      }
+      return json({ agents: state.implicit });
+    }
+    const dismissPath = /^\/v1\/connect\/codes\/([^/]+)\/dismiss$/.exec(url.pathname);
+    if (dismissPath !== null) {
+      const found = state.implicit.find((entry) => entry.id === dismissPath[1]);
+      if (found === undefined) return notFound();
+      if (found.agent !== null) return json({ error: "registered", message: "x" }, 409);
+      state.implicit = state.implicit.filter((entry) => entry !== found);
+      return json({ dismissed: true });
     }
     if (url.pathname === "/v1/agents") {
       return json({
@@ -227,7 +264,8 @@ export interface Sent {
 
 /**
  * Alice's wallet. `accountActions`: its manifest says it signs and sends whole transactions, and
- * one that creates an account makes it on `state`'s chain with the key it adds. `refuse`: it throws.
+ * one that creates an account makes it on `state`'s chain with the key its setup call adds.
+ * `refuse`: it throws.
  */
 export function accountWallet(
   state: World,
@@ -242,8 +280,11 @@ export function accountWallet(
       if (options.refuse) throw new Error("User rejected");
       return (transactions as unknown as Sent[]).map((transaction, index) => {
         sent.push(transaction);
-        const key = transaction.actions.find((action) => action.type === "AddKey")?.params
-          ?.publicKey;
+        // The setup code adds the key it is called with (contract/agent-setup).
+        const setup = transaction.actions.find(
+          (action) => action.type === "FunctionCall" && action.params?.methodName === "setup",
+        );
+        const key = (setup?.params?.args as { public_key?: unknown } | undefined)?.public_key;
         if (transaction.actions.some((action) => action.type === "CreateAccount")) {
           state.accounts.set(transaction.receiverId, typeof key === "string" ? [key] : []);
         }

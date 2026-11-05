@@ -1,13 +1,14 @@
 import type { KeyPermission } from "@tender/client";
 import type { Db } from "@tender/db";
-import type { NetworkId } from "@tender/shared";
+import type { ConfigView, NetworkId, StorageView } from "@tender/shared";
 import type { RateLimits } from "./limits";
 
 /**
- * The two chain reads the API makes: the height of the last final block (`/v1/health`) and the
- * permission of an access key (sign-in, and the check that the key of a token is still there).
- * `TenderClient` has both and satisfies this interface; tests pass a fake, so the API
- * type-checks and runs without a chain.
+ * The chain reads the API makes: the height of the last final block (`/v1/health`), the permission
+ * of an access key (sign-in, and the check that the key of a token is still there), and, before an
+ * implicit agent's record is dismissed, what Tender holds for its account (its storage, and its
+ * vault's balance of the bond's token). `TenderClient` has them all and satisfies this interface;
+ * tests pass a fake, so the API type-checks and runs without a chain.
  */
 export interface ChainReader {
   /** The height of the last final block. */
@@ -17,6 +18,12 @@ export interface ChainReader {
     accountId: string,
     publicKey: string,
   ): Promise<{ permission: KeyPermission } | null>;
+  /** Tender's `get_config`: the bond's token among it. */
+  getConfig(): Promise<ConfigView>;
+  /** Tender's `storage_balance_of`: null when `accountId` has none. */
+  storageBalanceOf(accountId: string): Promise<StorageView | null>;
+  /** Tender's `balance_of`: `accountId`'s vault balance of `token`. */
+  balanceOf(accountId: string, token: string): Promise<bigint>;
 }
 
 /** Everything `createApp` needs. No route reads the environment: the caller resolves it into this. */

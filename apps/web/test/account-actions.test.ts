@@ -1,3 +1,4 @@
+import { subAccountActions } from "@tender/shared";
 import { afterEach, expect, test, vi } from "vitest";
 import {
   type AccountAction,
@@ -18,18 +19,15 @@ import { rejection } from "./support";
 import { fakeProvider } from "./walletDoubles";
 
 // The wallet's account actions (lib/wallet.ts `accountActionsOf`), which "Add an agent" sends: one
-// transaction that creates the agent's account, funds it and adds its key. Only a wallet whose
+// transaction that creates the agent's account, funds it, and deploys and calls the setup code that
+// adds its key. Only a wallet whose
 // manifest says it signs and sends whole transactions is asked; the dev wallet's says it does not.
 
 const ALICE = "alice.testnet";
 const AGENT = "scout.alice.testnet";
 const KEY = `ed25519:${"1".repeat(44)}`;
 
-const ACTIONS: AccountAction[] = [
-  { type: "CreateAccount" },
-  { type: "Transfer", params: { deposit: "500000000000000000000000" } },
-  { type: "AddKey", params: { publicKey: KEY, accessKey: { permission: "FullAccess" } } },
-];
+const ACTIONS: AccountAction[] = subAccountActions(KEY);
 
 afterEach(() => {
   vi.restoreAllMocks();

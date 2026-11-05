@@ -172,7 +172,17 @@ test("the_wallet_creates_funds_and_keys_the_account_in_one_transaction_only_when
       actions: [
         { type: "CreateAccount" },
         { type: "Transfer", params: { deposit: "500000000000000000000000" } },
-        { type: "AddKey", params: { publicKey: PUBLIC, accessKey: { permission: "FullAccess" } } },
+        // The setup code, and its call that adds the key: no AddKey, which some wallets refuse.
+        { type: "DeployContract", params: { code: expect.any(Uint8Array) } },
+        {
+          type: "FunctionCall",
+          params: {
+            methodName: "setup",
+            args: { public_key: PUBLIC },
+            gas: "30000000000000",
+            deposit: "0",
+          },
+        },
       ],
     },
   ]);

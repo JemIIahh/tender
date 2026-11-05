@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { type Db, migrate, openDb } from "@tender/db";
 import { FIXTURE_CONTRACT } from "@tender/indexer/testing";
+import type { ConfigView } from "@tender/shared";
 import type { ApiDeps, ChainReader } from "../src/deps";
 
 // Shared by every test of the API. `testDeps()` is the one place that says what a test app is made
@@ -79,16 +80,40 @@ export const SALT = "5a".repeat(32);
 export const TEST_FINAL_HEIGHT = 100n;
 
 /**
- * A chain reader that answers without a chain: the final height is `TEST_FINAL_HEIGHT` and every
- * access key is a full-access one. Pass `over` to change either.
+ * A chain reader that answers without a chain: the final height is `TEST_FINAL_HEIGHT`, every
+ * access key is a full-access one, the contract's config is `TEST_CONFIG` (a bond in
+ * `TEST_BOND_TOKEN`), and Tender holds no storage and no vault balance for anyone. Pass `over` to
+ * change any of them.
  */
 export function fakeClient(over: Partial<ChainReader> = {}): ChainReader {
   return {
     finalHeight: async () => TEST_FINAL_HEIGHT,
     viewAccessKey: async () => ({ permission: "FullAccess" }),
+    getConfig: async () => TEST_CONFIG,
+    storageBalanceOf: async () => null,
+    balanceOf: async () => 0n,
     ...over,
   };
 }
+
+/** The bond's token in `TEST_CONFIG`. */
+export const TEST_BOND_TOKEN = "tusdc.testnet";
+
+/** A contract config, as `get_config` gives one, with a bond set. */
+export const TEST_CONFIG: ConfigView = {
+  owner: "owner.test.near",
+  pending_owner: null,
+  treasury: "treasury.test.near",
+  fee_bps: 500,
+  min_window_secs: 60,
+  max_window_secs: 1_209_600,
+  paused: false,
+  version: 1,
+  tokens: [],
+  agent_bond_token: TEST_BOND_TOKEN,
+  agent_bond_amount: "5000000",
+  agent_bond_cooldown_secs: "604800",
+};
 
 /**
  * The deps of a test app: a database from `testDb` (or `overrides.db`, which must be migrated), a

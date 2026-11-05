@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import {
   AGENT_ACCOUNT_DEPOSIT,
+  AGENT_SETUP_GAS,
+  AGENT_SETUP_WASM_SHA256,
   AGENT_STORAGE_DEPOSIT,
   AttachConnectKeyRequestSchema,
   base58Decode,
@@ -14,11 +16,14 @@ import {
   connectFingerprint,
   connectSentence,
   fundAgentCalls,
+  implicitAccountActions,
+  implicitAccountOf,
   isEd25519PublicKey,
   plainTextFault,
   readAgentName,
   STORAGE_BYTE_COST,
   sha256Hex,
+  subAccountActions,
 } from "../src/index";
 
 // The rules both sides of "Connect your agent" share: the fingerprint the page and the agent show,
@@ -55,6 +60,16 @@ describe("keys", () => {
     expect(isEd25519PublicKey(`${KEY}0`)).toBe(false);
     expect(isEd25519PublicKey("ed25519:")).toBe(false);
     expect(isEd25519PublicKey(`ed25519:${"z".repeat(5_000)}`)).toBe(false);
+  });
+
+  test("the_implicit_account_of_a_key_is_the_hex_of_its_32_bytes", () => {
+    expect(implicitAccountOf(KEY)).toBe(
+      Array.from({ length: 32 }, (_, i) => (i + 1).toString(16).padStart(2, "0")).join(""),
+    );
+    expect(implicitAccountOf(`ed25519:${base58Encode(new Uint8Array(32))}`)).toBe("0".repeat(64));
+    for (const text of [KEY.slice(8), `${KEY}0`, "ed25519:x", ""]) {
+      expect(implicitAccountOf(text), text).toBeNull();
+    }
   });
 
   test("base58_reads_back_what_it_writes", () => {
@@ -175,6 +190,43 @@ describe("what the owner's wallet pays", () => {
     expect(AGENT_STORAGE_DEPOSIT).toBeGreaterThanOrEqual((133n + 200n + 1024n) * STORAGE_BYTE_COST);
     expect(AGENT_ACCOUNT_DEPOSIT).toBe(5n * 10n ** 23n);
   });
+
+  test("the_sub_account_gets_the_setup_code_and_its_call_and_no_add_key", () => {
+    const actions = subAccountActions(KEY);
+    expect(actions.map((action) => action.type)).toEqual([
+      "CreateAccount",
+      "Transfer",
+      "DeployContract",
+      "FunctionCall",
+    ]);
+    expect(actions[1]).toEqual({
+      type: "Transfer",
+      params: { deposit: "500000000000000000000000" },
+    });
+    const deploy = actions[2];
+    if (deploy?.type !== "DeployContract") throw new Error("no DeployContract");
+    expect(sha256Hex(deploy.params.code)).toBe(AGENT_SETUP_WASM_SHA256);
+    expect(actions[3]).toEqual({
+      type: "FunctionCall",
+      params: {
+        methodName: "setup",
+        args: { public_key: KEY },
+        gas: "30000000000000",
+        deposit: "0",
+      },
+    });
+  });
+
+  test("the_implicit_account_gets_its_near_and_nothing_else", () => {
+    expect(implicitAccountActions()).toEqual([
+      { type: "Transfer", params: { deposit: "500000000000000000000000" } },
+    ]);
+  });
+
+  test("the_setup_call_has_room_over_the_10_5_tgas_the_sandbox_burns", () => {
+    // contract/sandbox/tests/agent_setup.rs sends `setup` with the same 30 Tgas (`SETUP_GAS`).
+    expect(AGENT_SETUP_GAS).toBe(30n * 10n ** 12n);
+  });
 });
 
 describe("answers", () => {
@@ -219,6 +271,19 @@ describe("answers", () => {
         }).success,
       ).toBe(false);
     }
+  });
+
+  test("an_answer_without_an_account_kind_is_for_the_sub_account", () => {
+    expect(ConnectCodeStateSchema.parse(state).account_kind).toBe("sub_account");
+    const implicit = ConnectCodeStateSchema.parse({
+      ...state,
+      account_kind: "implicit",
+      account_id: implicitAccountOf(KEY),
+    });
+    expect(implicit.account_kind).toBe("implicit");
+    expect(ConnectCodeStateSchema.safeParse({ ...state, account_kind: "named" }).success).toBe(
+      false,
+    );
   });
 
   test("a_contested_code_says_so", () => {

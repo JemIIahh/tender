@@ -32,8 +32,10 @@ export { AGENT_ACCOUNT_DEPOSIT, createAccountActions, createAccountCommand, STEP
 //    cleared from the field at once and kept nowhere.
 // 2. The person's wallet creates the agent's account under theirs, `<name>.<account>`, in ONE
 //    transaction to the new account: CreateAccount, a Transfer of `AGENT_ACCOUNT_DEPOSIT` for its
-//    storage and gas, and AddKey of the pasted key with full access. A wallet that can't send it
-//    gets the same as a near-cli command instead, and "Check again" reads the chain.
+//    storage and gas, the setup code (contract/agent-setup) and its call, which adds the pasted key
+//    with full access from inside the account. There is no AddKey action, which some wallets refuse.
+//    A wallet that can't send it gets a near-cli command that makes the account with the key
+//    instead, and "Check again" reads the chain.
 // 3. The agent registers itself and locks its bond (`pnpm agent:register`), which only its own key
 //    can sign. The page shows the bond from the contract's config, and watches the API until the
 //    agent is listed.
@@ -459,7 +461,9 @@ function Flow({ account, watchEveryMs }: { account: string; watchEveryMs: number
             <dd className="font-mono text-[13px] text-bone wrap-anywhere">
               {publicKey ?? "From step 1"}
             </dd>
-            <dd className="text-[13px] text-muted">Added with full access.</dd>
+            <dd className="text-[13px] text-muted">
+              Added with full access by the account's setup code.
+            </dd>
           </div>
           <div className="grid gap-1 bg-ink p-4">
             <dt className={FACT_LABEL}>You sign</dt>
@@ -536,7 +540,7 @@ function Flow({ account, watchEveryMs }: { account: string; watchEveryMs: number
                   publicKey,
                   network: config.network,
                 })}
-                label="The same transaction, with near-cli"
+                label="The account with its key, with near-cli"
               />
             ) : (
               <p className="text-sm text-muted">

@@ -1,5 +1,5 @@
 [workspace]
-members = ["tender", "test-token", "sandbox"]
+members = ["tender", "test-token", "agent-setup", "sandbox"]
 resolver = "3"
 
 [profile.release]
