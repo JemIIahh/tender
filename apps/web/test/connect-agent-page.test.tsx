@@ -104,6 +104,8 @@ interface World {
   lie?: { fingerprint?: string; account?: string; publicKey?: string };
   /** The account the API names once the code is moved to the implicit account, if not the key's. */
   lieImplicit?: string;
+  /** The status the API answers the move to the implicit account with, in place of making it. */
+  refuseImplicit?: number;
   /** `METHOD /path` of every request to the API, and `RPC <what> <account>` of every read. */
   requests: string[];
   /** Every request body, as text. */
@@ -273,6 +275,9 @@ function serve(state: World): void {
     }
     const implicitPath = `/v1/connect/codes/${ID}/implicit`;
     if (url.pathname === implicitPath && method === "POST" && state.code !== null) {
+      if (state.refuseImplicit !== undefined) {
+        return json({ error: "contested", message: "a server's words" }, state.refuseImplicit);
+      }
       state.code.kind = "implicit";
     }
     if (
@@ -871,6 +876,13 @@ test("a_retry_after_the_account_failed_pays_no_second_bond", async () => {
   );
   expect(state.accounts.has(AGENT)).toBe(false);
   expect(state.vault.get(AGENT)).toBe(BOND);
+  // The money of this way is on the chain for the sub-account: no separate account is offered, and
+  // the page says where the money is.
+  expect((await screen.findByTestId("connect-implicit-held")).textContent).toBe(
+    `Your bond and storage are waiting for ${AGENT}; they stay there until that account is created. Finish with a wallet that allows the setup step.`,
+  );
+  expect(screen.queryByTestId("connect-implicit-offer")).toBeNull();
+  expect(screen.queryByRole("button", { name: SEPARATE })).toBeNull();
 
   await user.click(screen.getByRole("button", { name: "Create agent" }));
   await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
@@ -1167,4 +1179,106 @@ test("a_wallet_that_refuses_the_transfer_too_is_told_and_create_agent_tries_the_
   expect(refused[2]?.map((tx) => tx.receiverId)).toEqual([IMPLICIT, CONTRACT, TOKEN]);
   expect(JSON.stringify(refused[2])).not.toContain("CreateAccount");
   expect(batches).toEqual([]);
+});
+
+test("the_separate_account_press_reads_the_sub_account_again_and_never_pays_twice", async () => {
+  // The page polls rarely here, so that what it shows is older than what is on the chain at the
+  // press, as it may be for up to one poll.
+  const state = world();
+  state.attachOnCreate = PUBLIC;
+  const { user, batches, refused } = open(state, { refuseNewAccounts: true, pollMs: 60_000 });
+  await getCode(user);
+  await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+  await user.click(await screen.findByRole("button", { name: "Create agent" }));
+  const offer = await screen.findByTestId("connect-implicit-offer");
+
+  // Storage and a bond reach Tender for the sub-account after the page looked (another tab, or a
+  // wallet that sent part of an earlier approval late).
+  state.storage.add(AGENT);
+  state.vault.set(AGENT, BOND);
+  await user.click(within(offer).getByRole("button", { name: SEPARATE }));
+
+  expect(
+    await screen.findByText(
+      `Your bond and storage are waiting for ${AGENT}; they stay there until that account is created. Finish with a wallet that allows the setup step.`,
+      { selector: '[data-testid="connect-send-error"]' },
+    ),
+  ).toBeTruthy();
+  // Nothing was recorded or sent: the separate account would have paid the bond a second time.
+  expect(state.requests).not.toContain(`POST /v1/connect/codes/${ID}/implicit`);
+  expect(batches).toEqual([]);
+  expect(refused).toHaveLength(1);
+  expect(state.code?.kind ?? "sub_account").toBe("sub_account");
+  await waitFor(() => expect(screen.queryByTestId("connect-implicit-offer")).toBeNull());
+  expect(screen.getByTestId("connect-implicit-held")).toBeTruthy();
+
+  // A sub-account that appears late keeps the agent the same way.
+  cleanup();
+  sessionStorage.clear();
+  const late = world();
+  late.attachOnCreate = PUBLIC;
+  const second = open(late, { refuseNewAccounts: true, pollMs: 60_000 });
+  await getCode(second.user);
+  await waitFor(() => expect(late.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+  await second.user.click(await screen.findByRole("button", { name: "Create agent" }));
+  const lateOffer = await screen.findByTestId("connect-implicit-offer");
+  late.accounts.set(AGENT, []);
+  await second.user.click(within(lateOffer).getByRole("button", { name: SEPARATE }));
+  expect((await screen.findByTestId("connect-send-error")).textContent).toBe(
+    `${AGENT} exists now, so your agent keeps it. Nothing more was sent.`,
+  );
+  expect(late.requests).not.toContain(`POST /v1/connect/codes/${ID}/implicit`);
+  expect(second.batches).toEqual([]);
+});
+
+test("a_plain_create_press_refuses_a_code_whose_account_kind_changed_since_the_page_showed_it", async () => {
+  const state = world();
+  state.attachOnCreate = PUBLIC;
+  const { user, batches } = open(state, { pollMs: 60_000 });
+  await getCode(user);
+  await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+  const create = await screen.findByRole("button", { name: "Create agent" });
+  expect(screen.getByTestId("connect-ready").textContent).toBe(`Your agent is ready: ${AGENT}`);
+
+  // The code moves to the implicit account after the person looked (another tab, or the API).
+  if (state.code !== null) state.code.kind = "implicit";
+  await user.click(create);
+
+  expect((await screen.findByTestId("connect-send-error")).textContent).toBe(
+    "Tender's answer changed just before your wallet was asked, so nothing was sent. Read the page again before you press anything.",
+  );
+  expect(batches).toEqual([]);
+  // The page now shows the account the code is for; a press from here goes by it.
+  await waitFor(() =>
+    expect(screen.getByTestId("connect-ready").textContent).toBe(
+      `Your agent is ready: ${IMPLICIT}`,
+    ),
+  );
+});
+
+test("a_switch_tender_does_not_take_says_so_and_the_way_out_stays", async () => {
+  for (const [status, words] of [
+    [
+      409,
+      "Tender didn't take the separate account: the code changed meanwhile (another key tried it, or the agent registered). Nothing was sent. Read the page again.",
+    ],
+    [
+      503,
+      "Tender couldn't record the separate account just now, so nothing was sent. Press Use a separate account instead again in a moment.",
+    ],
+  ] as const) {
+    cleanup();
+    sessionStorage.clear();
+    const state = world();
+    state.refuseImplicit = status;
+    const { user, batches } = open(state, { refuseNewAccounts: true });
+    await getCode(user);
+    agentAttaches(state);
+    await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+    await user.click(await screen.findByRole("button", { name: "Create agent" }));
+    await user.click(await screen.findByRole("button", { name: SEPARATE }));
+    await waitFor(() => expect(screen.getByTestId("connect-send-error").textContent).toBe(words));
+    expect(batches).toEqual([]);
+    expect(screen.getByRole("button", { name: SEPARATE })).toBeTruthy();
+  }
 });

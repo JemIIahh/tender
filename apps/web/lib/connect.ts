@@ -210,6 +210,32 @@ export function whatLanded(
   return `${head}${landed} Press Create agent to try again.`;
 }
 
+/**
+ * What of the first way is on the chain for `<name>.<you>` (`accountId`), in words for the person,
+ * or null when nothing is: no account, no storage with Tender and an empty vault. Then, and only
+ * then, the separate account can be chosen without paying twice. Storage or a bond that an earlier
+ * try paid stays with `<name>.<you>`, which only the person's wallet can create.
+ */
+export function heldOnSubAccount(
+  accountId: string,
+  chain: AgentOnChain,
+  bond: AgentBondTerms | null,
+): string | null {
+  if (chain.key !== "missing") {
+    return `${accountId} exists now, so your agent keeps it. Nothing more was sent.`;
+  }
+  const bondIn = bond !== null && chain.vault > 0n;
+  if (!chain.storage && !bondIn) return null;
+  const what =
+    chain.storage && bondIn
+      ? "Your bond and storage are"
+      : chain.storage
+        ? "Your storage is"
+        : "Your bond is";
+  const stay = chain.storage && bondIn ? "they stay" : "it stays";
+  return `${what} waiting for ${accountId}; ${stay} there until that account is created. Finish with a wallet that allows the setup step.`;
+}
+
 /** Whether the account is made and paid for: storage with Tender, and the bond in its vault (or held). */
 export function isFunded(
   chain: AgentOnChain | null,
@@ -303,5 +329,31 @@ export function keepCode(owner: string, code: KeptCode | null): void {
       );
   } catch {
     // As above: nothing is kept, and nothing fails.
+  }
+}
+
+// ---- Agents on separate accounts, by this tab -------------------------------------------------------
+
+const implicitKey = (owner: string) => `tender.connect.implicit.${owner}`;
+
+/**
+ * Notes, in this tab, that `owner` set up an agent on a separate account, so that My agents offers
+ * the sign-in that lists it while the tab is open. Session storage, as the kept code is: the app
+ * keeps nothing of a person's in local storage. Storage that can't be written notes nothing.
+ */
+export function rememberImplicit(owner: string): void {
+  try {
+    sessionStorage.setItem(implicitKey(owner), "1");
+  } catch {
+    // Off or full: My agents then lists them once the person is signed in, and offers no sign-in.
+  }
+}
+
+/** Whether this tab saw `owner` set up an agent on a separate account. */
+export function madeImplicit(owner: string): boolean {
+  try {
+    return sessionStorage.getItem(implicitKey(owner)) === "1";
+  } catch {
+    return false;
   }
 }

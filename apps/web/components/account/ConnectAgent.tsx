@@ -26,6 +26,7 @@ import {
   createAccountCommand,
   createAgentBatch,
   fundCallsFor,
+  heldOnSubAccount,
   implicitAgentBatch,
   isFunded,
   isPaid,
@@ -35,6 +36,7 @@ import {
   readAgentOnChain,
   readKeptCode,
   readWalletBalance,
+  rememberImplicit,
   whatLanded,
 } from "../../lib/connect";
 import { errorMessage } from "../../lib/errors";
@@ -82,6 +84,10 @@ import { Step } from "./Step";
 //
 // The page never makes, sees or keeps the agent's private key, and nothing is signed until the
 // person presses the button that names what it signs.
+
+/** What the page says when a fresh read of the code is not what the person checked. */
+const ANSWER_CHANGED =
+  "Tender's answer changed just before your wallet was asked, so nothing was sent. Read the page again before you press anything.";
 
 /** What the page says of an implicit account, wherever it offers or shows one. */
 const SEPARATE_ACCOUNT =
@@ -388,8 +394,9 @@ export function ConnectAgent({
   const [asking, setAsking] = useState(false);
   const [askError, setAskError] = useState<string | null>(null);
   const [cannotSign, setCannotSign] = useState(false);
-  // The wallet refused or failed the sub-account's transaction: the page offers the implicit account.
-  const [offerImplicit, setOfferImplicit] = useState(false);
+  // The wallet refused or failed the sub-account's transaction, and no account was made: the page
+  // offers the implicit account, if nothing of this way reached the chain (`heldOnSubAccount`).
+  const [primaryRefused, setPrimaryRefused] = useState(false);
   const [finishing, setFinishing] = useState<string | null>(null);
   const [state, setState] = useState<ConnectCodeState | null>(null);
   const [fault, setFault] = useState<StateFault>(null);
@@ -591,7 +598,7 @@ export function ConnectAgent({
     setFault(null);
     setHeld({ state: "unknown" });
     setSend({ state: "idle" });
-    setOfferImplicit(false);
+    setPrimaryRefused(false);
   };
 
   const signInAgain = async () => {
@@ -640,23 +647,37 @@ export function ConnectAgent({
     let sentAccount = false;
     let implicitRoute = kind === "implicit";
     let where = expected;
+    // While Tender is asked to record the separate account: a failure there sent nothing.
+    let switching = false;
     try {
       // How the code stands now, not at the last poll: a code contested since, or whose key or
-      // account is not the one the person checked, is not signed for.
+      // account is not the one the person checked, is not signed for; nor one whose account kind
+      // changed since the page showed it (only the separate-account button changes it, here).
       if (codeId !== null) {
         let now = await withToken((held) => api.getConnectCode(held, codeId));
         if (now !== null) setState(now);
-        if (separate && now !== null && now.account_kind === "sub_account" && fits(now)) {
-          now = await withToken((held) => api.chooseImplicitAccount(held, codeId));
-          setState(now);
-          setOfferImplicit(false);
+        if (now === null || !fits(now) || (!separate && now.account_kind !== kind)) {
+          setSend({ state: "failed", message: ANSWER_CHANGED });
+          return;
         }
-        if (now === null || !fits(now) || (separate && now.account_kind !== "implicit")) {
-          setSend({
-            state: "failed",
-            message:
-              "Tender's answer changed just before your wallet was asked, so nothing was sent. Read the page again before you press anything.",
-          });
+        if (separate && now.account_kind === "sub_account") {
+          // Nothing of the first way may be on the chain: an account made late, or storage or a
+          // bond an earlier try paid for `<name>.<you>`, would be paid again for the other.
+          const sub = await readAgentOnChain(accountId, attached, bond);
+          setChain(sub);
+          const held = heldOnSubAccount(accountId, sub, bond);
+          if (held !== null) {
+            setSend({ state: "failed", message: held });
+            return;
+          }
+          switching = true;
+          now = await withToken((held) => api.chooseImplicitAccount(held, codeId));
+          switching = false;
+          setState(now);
+          rememberImplicit(account);
+        }
+        if (!fits(now) || (separate && now.account_kind !== "implicit")) {
+          setSend({ state: "failed", message: ANSWER_CHANGED });
           return;
         }
         implicitRoute = now.account_kind === "implicit";
@@ -711,12 +732,24 @@ export function ConnectAgent({
       );
     } catch (error) {
       console.error(error);
+      if (switching) {
+        // Tender did not record the separate account: nothing was sent, and the way out stays.
+        setSend({
+          state: "failed",
+          message:
+            error instanceof ApiError && error.status === 409
+              ? "Tender didn't take the separate account: the code changed meanwhile (another key tried it, or the agent registered). Nothing was sent. Read the page again."
+              : "Tender couldn't record the separate account just now, so nothing was sent. Press Use a separate account instead again in a moment.",
+        });
+        return;
+      }
       // The chain says what happened, whatever the wallet said.
       const after =
         where === null ? null : await readAgentOnChain(where, attached, bond).catch(() => null);
       if (after !== null) setChain(after);
       // The wallet refused or blocked the sub-account's transaction, or the network failed it, and
-      // no account was made: the way out is the implicit account.
+      // no account was made: the separate account is the way out, while nothing of this way is on
+      // the chain (`heldOnSubAccount` decides what is shown).
       if (
         sentAccount &&
         !implicitRoute &&
@@ -724,7 +757,7 @@ export function ConnectAgent({
         after.key === "missing" &&
         (error instanceof WalletError || error instanceof TransactionFailed)
       ) {
-        setOfferImplicit(true);
+        setPrimaryRefused(true);
       }
       setSend({
         state: "failed",
@@ -733,7 +766,9 @@ export function ConnectAgent({
             ? whatLanded(after, bond, error instanceof WalletError)
             : sentAccount
               ? whatLanded(after, bond, true)
-              : "Something went wrong before anything was sent. Press Create agent to try again.",
+              : separate
+                ? "Something went wrong before anything was sent. Press Use a separate account instead to try again."
+                : "Something went wrong before anything was sent. Press Create agent to try again.",
       });
     } finally {
       busy.current = false;
@@ -748,6 +783,11 @@ export function ConnectAgent({
   const blocked = short !== null || terms.status !== "ready" || !answerFits || contested;
   const showFinishOffer =
     !locked && name.ok && check.state === "taken" && check.accountId === accountId;
+  // What of the first way is on the chain for `<name>.<you>`, in words, or null when nothing is.
+  const heldWords =
+    kind === "sub_account" && accountId !== null && chain !== null
+      ? heldOnSubAccount(accountId, chain, bond)
+      : null;
 
   return (
     <section aria-labelledby={`${id}-title`} className="grid gap-4">
@@ -1158,7 +1198,21 @@ export function ConnectAgent({
                     </p>
                   ) : null}
 
-                  {offerImplicit && kind === "sub_account" && !created && canSend ? (
+                  {primaryRefused &&
+                  kind === "sub_account" &&
+                  !created &&
+                  canSend &&
+                  heldWords !== null ? (
+                    <p data-testid="connect-implicit-held" className={NOTICE}>
+                      {heldWords}
+                    </p>
+                  ) : null}
+                  {primaryRefused &&
+                  kind === "sub_account" &&
+                  !created &&
+                  canSend &&
+                  chain !== null &&
+                  heldWords === null ? (
                     <div data-testid="connect-implicit-offer" className={`${NOTICE} grid gap-3`}>
                       <p>
                         Some wallets won't set up an account under yours. Your agent can use an

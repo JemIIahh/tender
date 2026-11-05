@@ -296,3 +296,28 @@ test("a_wallet_that_blocks_the_new_account_gets_one_button_for_a_separate_accoun
   await page.setViewportSize(PHONE);
   await expectToFit(page, "my agents (phone)");
 });
+
+test("money_already_on_the_sub_account_is_said_and_no_separate_account_is_offered", async ({
+  page,
+}) => {
+  // The network fails the account; this wallet goes on, and the storage and the bond reach Tender
+  // for the sub-account, which does not exist.
+  const chain = chainOf();
+  chain.failCreates = 1;
+  const { api, wallet } = await openConnected(page, chain);
+  await page.getByTestId("connect-step-1").getByLabel("Account name").fill("writer");
+  await expect(page.getByTestId("connect-name-state")).toHaveText(`${AGENT} is free.`);
+  await page.getByRole("button", { name: "Get a connect code" }).click();
+  await expect(page.getByTestId("connect-command")).toBeVisible();
+  agentAttaches(api, AGENT_PUBLIC_KEY);
+  await page.getByRole("button", { name: "Create agent" }).click();
+
+  await expect(page.getByTestId("connect-implicit-held")).toHaveText(
+    `Your bond and storage are waiting for ${AGENT}; they stay there until that account is created. Finish with a wallet that allows the setup step.`,
+  );
+  await expect(page.getByTestId("connect-implicit-offer")).toHaveCount(0);
+  expect(chain.vault?.get(AGENT)).toBe(5_000_000n);
+  expect(wallet.sent.map((tx) => tx.receiverId)).toEqual([AGENT, CONTRACT, TOKEN]);
+  await expectToFit(page, "held");
+  await shoot(page, "held-on-sub-account");
+});
