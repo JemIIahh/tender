@@ -95,6 +95,30 @@ test("shared_read_is_not_made_again_while_the_tab_is_hidden", async () => {
   shared.clear();
 });
 
+test("shared_read_that_throws_is_tried_again_and_never_stops_for_good", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  let calls = 0;
+  const read = vi.fn(async () => {
+    calls += 1;
+    if (calls === 1) throw new Error("the API is down");
+    return calls;
+  });
+  const shared = sharedRead(read, 60_000);
+  const seen: number[] = [];
+  shared.subscribe((value) => seen.push(value));
+  await act(async () => {});
+  expect(seen).toEqual([]);
+
+  // A minute later it is read again, and that one is handed on.
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(read).toHaveBeenCalledTimes(2);
+  expect(seen).toEqual([2]);
+  shared.clear();
+});
+
 // ---- The ticker and the pill ------------------------------------------------------------------
 
 const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });

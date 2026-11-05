@@ -12,8 +12,9 @@ export function BoardFiltersSkeleton() {
       className="flex flex-wrap items-end gap-x-8 gap-y-4 border-b border-line"
     >
       <div className="flex max-w-full min-w-0 gap-5 overflow-hidden sm:gap-7">
-        {["w-6", "w-10", "w-[4.5rem]", "w-14", "w-14"].map((width) => (
-          <span key={width} className="flex min-h-11 shrink-0 items-center pb-1">
+        {["w-6", "w-10", "w-[4.5rem]", "w-14", "w-14"].map((width, index) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: the tabs are only shapes, in a fixed order
+          <span key={index} className="flex min-h-11 shrink-0 items-center pb-1">
             <TextLine text="text-[15px]" width={width} />
           </span>
         ))}

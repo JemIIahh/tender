@@ -22,7 +22,6 @@ import { JudgeNote } from "../JudgeNote";
 import { Shape } from "../Skeleton";
 import { CARD, EYEBROW, NOTICE, PANEL_TITLE } from "../ui";
 import { Connect } from "./Connect";
-import { RefundPanel } from "./RefundPanel";
 
 /**
  * A panel's place while its code comes: a few shapes (components/Skeleton.tsx), in the panel's own
@@ -38,12 +37,14 @@ function PanelLoading() {
   );
 }
 
-// Picking and topping up are for some readers only (the account whose pick window is open, a
-// connected wallet while the task takes entries), so each of their panels comes in a chunk of its
-// own when it is shown, and a reader who sees neither loads none of their code. The refund panel
-// is every reader's on a task that is to be refunded, and says when it opens to the second, so it
-// comes with the page (RefundPanel, imported as usual).
+// The three panels are shown only to some readers (the account whose pick window is open, anyone
+// on a task that is to be refunded, a connected wallet while the task takes entries), so each comes
+// in a chunk of its own when it is shown, and a reader who sees none of them, as on a task that
+// takes entries, loads none of their code.
 const PickPanel = dynamic(() => import("./PickPanel").then((module) => module.PickPanel), {
+  loading: PanelLoading,
+});
+const RefundPanel = dynamic(() => import("./RefundPanel").then((module) => module.RefundPanel), {
   loading: PanelLoading,
 });
 const TopUpPanel = dynamic(() => import("./TopUpPanel").then((module) => module.TopUpPanel), {

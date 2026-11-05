@@ -116,16 +116,16 @@ async function readPayout(): Promise<TickerData["payout"]> {
   return { taskId: picked.id, token: picked.token, amount };
 }
 
-/**
- * What the ticker shows, from the tab's shared read (`reads`) and the recent payout, which is read
- * here. A read that failed is left out; this never throws.
- */
-export async function readTicker(reads: LiveReads): Promise<TickerData> {
-  let payout: TickerData["payout"];
+/** The recent payout the ticker shows, or nothing if it can't be read; this never throws. */
+export async function readRecentPayout(): Promise<TickerData["payout"]> {
   try {
-    payout = await readPayout();
+    return await readPayout();
   } catch {
-    payout = undefined;
+    return undefined;
   }
+}
+
+/** What the ticker shows: the tab's shared read (`reads`) and the recent payout. */
+export function tickerData(reads: LiveReads, payout: TickerData["payout"]): TickerData {
   return { open: reads.open, agents: reads.agents, payout, health: reads.health };
 }

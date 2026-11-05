@@ -758,3 +758,34 @@ test("events_hand_a_part_that_joins_with_an_id_what_came_after_it", () => {
   opener.close();
   expect(source.readyState).toBe(FakeEventSource.CLOSED);
 });
+
+test("events_hand_each_listener_a_message_once_and_one_that_fails_stops_no_other", () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  // A page opens the stream from id 10 and fails on every message.
+  listenToEvents(
+    {
+      onEvent: () => {
+        throw new Error("a part that fails");
+      },
+      onResync: () => {},
+    },
+    { since: "10" },
+  );
+  const source = FakeEventSource.latest;
+  // Another joins having read up to 12 already, before the stream has sent anything.
+  const seen: Array<string | undefined> = [];
+  listenToEvents(
+    { onEvent: () => {}, onResync: () => {}, onMessage: (whole) => seen.push(whole.id) },
+    { since: "12" },
+  );
+
+  // The stream then sends what came after 10: the second part is handed only 13, once.
+  act(() => {
+    source.open();
+    for (const id of ["11", "12", "13"]) {
+      source.send("committed", message("committed", "7", committedData("7")), id);
+    }
+    source.send("committed", message("committed", "7", committedData("7")), "13");
+  });
+  expect(seen).toEqual(["13"]);
+});

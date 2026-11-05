@@ -1,3 +1,9 @@
+// Two of Next's own modules, not its public API: next is pinned to an exact version (16.4.2), on
+// which both are what `next/navigation` uses. At the next upgrade of next, move to the public
+// `useRouter()` from `next/navigation`, and take the kind's type from it
+// (`NonNullable<Parameters<ReturnType<typeof useRouter>["prefetch"]>[1]>["kind"]`); the tests that
+// draw cards then need `useRouter: () => ({ prefetch })` in their `next/navigation` mock, as
+// `useRouter` throws outside the app's router.
 import type { PrefetchKind } from "next/dist/client/components/router-reducer/router-reducer-types";
 import { AppRouterContext } from "next/dist/shared/lib/app-router-context.shared-runtime";
 import { useCallback, useContext, useRef } from "react";

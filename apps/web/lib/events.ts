@@ -261,6 +261,12 @@ const KEPT_MESSAGES = 200;
 
 interface Listener {
   handlers: EventHandlers;
+  /**
+   * The newest id this listener has been handed (or joined after): a message with an id at or below
+   * it is not handed again, as when a stream that opened at an older id replays what came after
+   * that, and some of it is what this listener had already.
+   */
+  after: bigint | undefined;
 }
 
 /**
@@ -285,26 +291,53 @@ const u64 = (id: string | undefined): bigint | undefined =>
   id !== undefined && U64StringSchema.safeParse(id).success ? BigInt(id) : undefined;
 
 /**
+ * Hands `message` to one listener, unless it has it already. A listener that throws is logged and
+ * does not stop the others from hearing it: each used to have a stream of its own.
+ */
+function hand(listener: Listener, message: StreamEvent): void {
+  const id = u64(message.id);
+  if (id !== undefined) {
+    if (listener.after !== undefined && id <= listener.after) return;
+    listener.after = id;
+  }
+  try {
+    listener.handlers.onEvent({ event: message.event, task_id: message.task_id ?? undefined });
+    listener.handlers.onMessage?.(message);
+  } catch (error) {
+    console.error("events: a listener failed", error);
+  }
+}
+
+/** Tells one listener to look again, as `hand` hands it a message. */
+function resync(listener: Listener): void {
+  try {
+    listener.handlers.onResync();
+  } catch (error) {
+    console.error("events: a listener failed", error);
+  }
+}
+
+/**
  * Listens to the tab's one stream of `GET /v1/events` until `close`: the first listener opens it
  * (`connectEvents`, at `since` if it has one) and the last one to close closes it. However many
  * parts of a page listen, the tab holds one connection (the API holds a client to a few).
  *
  * Every listener hears every message (`onEvent` and `onMessage`) and every resync (`onResync`), as
- * a stream of its own would tell it. One that joins a stream already open with `since` is first
- * handed the kept messages after that id, in order; if the stream can't say it heard everything
- * after it (it opened later than that, or no longer keeps them), the listener is told to resync.
+ * a stream of its own would tell it, and a message once. One that joins a stream already open with
+ * `since` is first handed the kept messages after that id, in order; if the stream can't say it
+ * heard everything after it (it opened later than that, or no longer keeps them), the listener is
+ * told to resync.
  */
 export function listenToEvents(
   handlers: EventHandlers,
   { since }: ConnectOptions = {},
 ): EventStream {
-  const listener: Listener = { handlers };
+  const listener: Listener = { handlers, after: u64(since) };
   if (shared === null) {
-    const start = u64(since);
     const tab: TabStream = {
       listeners: new Set([listener]),
       kept: [],
-      from: start,
+      from: u64(since),
       dropped: undefined,
       stream: { close() {} },
     };
@@ -317,18 +350,14 @@ export function listenToEvents(
           tab.kept = [];
           tab.from = undefined;
           tab.dropped = undefined;
-          for (const one of [...tab.listeners]) one.handlers.onResync();
+          for (const one of [...tab.listeners]) resync(one);
         },
         onMessage: (message) => {
           if (message.id !== undefined) {
             tab.kept.push(message);
             if (tab.kept.length > KEPT_MESSAGES) tab.dropped = u64(tab.kept.shift()?.id);
           }
-          const info: EventInfo = { event: message.event, task_id: message.task_id ?? undefined };
-          for (const one of [...tab.listeners]) {
-            one.handlers.onEvent(info);
-            one.handlers.onMessage?.(message);
-          }
+          for (const one of [...tab.listeners]) hand(one, message);
         },
       },
       { since },
@@ -336,19 +365,14 @@ export function listenToEvents(
   } else {
     const tab = shared;
     tab.listeners.add(listener);
-    const after = u64(since);
+    const after = listener.after;
     if (after !== undefined) {
       const missing =
         tab.from === undefined ||
         tab.from > after ||
         (tab.dropped !== undefined && tab.dropped > after);
-      for (const message of tab.kept) {
-        const id = u64(message.id);
-        if (id === undefined || id <= after) continue;
-        handlers.onEvent({ event: message.event, task_id: message.task_id ?? undefined });
-        handlers.onMessage?.(message);
-      }
-      if (missing) handlers.onResync();
+      for (const message of tab.kept) hand(listener, message);
+      if (missing) resync(listener);
     }
   }
   const tab = shared;
@@ -364,6 +388,18 @@ export function listenToEvents(
       }
     },
   };
+}
+
+/**
+ * Closes the tab's stream and forgets its listeners, whatever is still listening: a test starts
+ * each case without one (vitest.setup.ts). The page never needs it; its last listener closes it.
+ */
+export function closeTabStream(): void {
+  const tab = shared;
+  if (tab === null) return;
+  shared = null;
+  tab.listeners.clear();
+  tab.stream.close();
 }
 
 /**

@@ -3,7 +3,14 @@
 import { type CSSProperties, useEffect, useState } from "react";
 import { config } from "../../lib/config";
 import { liveReads } from "../../lib/liveReads";
-import { factItems, liveItems, readTicker, type TickerItem } from "../../lib/ticker";
+import { scrollCue } from "../../lib/scrollCue";
+import {
+  factItems,
+  liveItems,
+  readRecentPayout,
+  type TickerItem,
+  tickerData,
+} from "../../lib/ticker";
 
 /** Fewer items than this in a copy would leave a gap on a wide screen, so the copy repeats. */
 const MIN_ITEMS = 10;
@@ -33,14 +40,17 @@ export function Ticker() {
   const [live, setLive] = useState<TickerItem[]>([]);
 
   // The tab's shared read of the figures (the Live pill's too), read again each minute while the
-  // tab is in view; each time it comes, the ticker reads the recent payout to go with it. Only the
-  // latest counts.
+  // tab is in view, and the recent payout to go with it: the first payout read starts with the
+  // shared one, not after it, and each later shared read brings a fresh one. Only the latest counts.
   useEffect(() => {
     let latest = 0;
+    let firstPayout: ReturnType<typeof readRecentPayout> | null = readRecentPayout();
     const unsubscribe = liveReads.subscribe((reads) => {
       const mine = ++latest;
-      readTicker(reads).then((data) => {
-        if (mine === latest) setLive(liveItems(data, config.network));
+      const payout = firstPayout ?? readRecentPayout();
+      firstPayout = null;
+      payout.then((paid) => {
+        if (mine === latest) setLive(liveItems(tickerData(reads, paid), config.network));
       });
     });
     return () => {
@@ -60,7 +70,7 @@ export function Ticker() {
       aria-label="Tender right now"
       className="ticker relative border-t border-line bg-ink/85 font-mono text-[11px] tracking-[0.08em] uppercase backdrop-blur-sm"
     >
-      <div className="ticker-viewport overflow-hidden">
+      <div ref={scrollCue} className="ticker-viewport overflow-hidden">
         <div
           className="ticker-rail flex w-max py-2.5"
           style={{ "--ticker-duration": `${copy.length * 5}s` } as CSSProperties}

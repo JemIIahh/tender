@@ -16,9 +16,11 @@ export interface SharedRead<T> {
 }
 
 /**
- * A shared read of `read`, which never throws (a read that can fail says so in its value). It runs
- * only while something listens: it is read again `everyMs` after the last read began, if the tab is
- * in view then, and otherwise `everyMs` later; and the last value is kept for whoever comes next.
+ * A shared read of `read`, which should not throw (a read that can fail says so in its value). It
+ * runs only while something listens: it is read again `everyMs` after the last read began, if the
+ * tab is in view then, and otherwise `everyMs` later; and the last value is kept for whoever comes
+ * next. A read that throws all the same hands nothing to anyone, and is tried again on the same
+ * schedule, so the shared read never stops for good.
  */
 export function sharedRead<T>(read: () => Promise<T>, everyMs: number): SharedRead<T> {
   const listeners = new Set<(value: T) => void>();
@@ -46,13 +48,21 @@ export function sharedRead<T>(read: () => Promise<T>, everyMs: number): SharedRe
     const mine = era;
     const promise = read();
     under = { promise, at };
-    void promise.then((value) => {
-      if (mine !== era) return;
-      under = null;
-      kept = { value, at };
-      for (const listener of [...listeners]) listener(value);
-      if (listeners.size > 0) schedule(at);
-    });
+    promise.then(
+      (value) => {
+        if (mine !== era) return;
+        under = null;
+        kept = { value, at };
+        for (const listener of [...listeners]) listener(value);
+        if (listeners.size > 0) schedule(at);
+      },
+      (error) => {
+        if (mine !== era) return;
+        console.error(error);
+        under = null;
+        if (listeners.size > 0) schedule(at);
+      },
+    );
   }
 
   return {
