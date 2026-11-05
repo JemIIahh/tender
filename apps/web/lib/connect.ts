@@ -9,7 +9,7 @@ import {
 } from "@tender/shared";
 import type { BondTerms } from "./account";
 import { config } from "./config";
-import { accountKeyState, RpcError, view } from "./rpc";
+import { accountKeyState, type Finality, RpcError, view } from "./rpc";
 import { describeNear } from "./vault";
 import { type AccountAction, groupCalls, type MixedTransaction } from "./wallet";
 
@@ -116,11 +116,13 @@ export interface AgentOnChain {
 }
 
 /** `account`'s vault balance of `token`, from `balance_of` (0 when it has no slot). */
-async function vaultOf(account: string, token: string): Promise<bigint> {
-  const value = await view<unknown>(config.contractId, "balance_of", {
-    account_id: account,
-    token,
-  });
+async function vaultOf(account: string, token: string, finality: Finality): Promise<bigint> {
+  const value = await view<unknown>(
+    config.contractId,
+    "balance_of",
+    { account_id: account, token },
+    finality,
+  );
   const parsed = U128StringSchema.safeParse(value);
   if (!parsed.success) throw new RpcError("balance_of returned something other than an amount");
   return BigInt(parsed.data);
@@ -133,10 +135,11 @@ async function vaultOf(account: string, token: string): Promise<bigint> {
 export async function readAgentFunding(
   accountId: string,
   bond: AgentBondTerms | null,
+  finality: Finality = "final",
 ): Promise<{ storage: boolean; vault: bigint }> {
   const [storage, vault] = await Promise.all([
-    view<unknown>(config.contractId, "storage_balance_of", { account_id: accountId }),
-    bond === null ? Promise.resolve(0n) : vaultOf(accountId, bond.token),
+    view<unknown>(config.contractId, "storage_balance_of", { account_id: accountId }, finality),
+    bond === null ? Promise.resolve(0n) : vaultOf(accountId, bond.token, finality),
   ]);
   // Whether there is a balance is all the page needs: its two NEP-145 fields are enough.
   const parsed = StorageViewSchema.pick({ total: true, available: true })
@@ -149,16 +152,18 @@ export async function readAgentFunding(
 /**
  * Reads `accountId` with `publicKey` on the chain: the account and the key, and what Tender holds
  * for it (its storage and its vault), always: an earlier try may have paid them for an account
- * that does not exist yet.
+ * that does not exist yet. At the last final block unless `finality` says the newest: a read of the
+ * other way's account, whose "nothing there" lets this way pay, is made at the newest.
  */
 export async function readAgentOnChain(
   accountId: string,
   publicKey: string,
   bond: AgentBondTerms | null,
+  finality: Finality = "final",
 ): Promise<AgentOnChain> {
   const [key, funding] = await Promise.all([
-    accountKeyState(accountId, publicKey),
-    readAgentFunding(accountId, bond),
+    accountKeyState(accountId, publicKey, finality),
+    readAgentFunding(accountId, bond, finality),
   ]);
   return { key, ...funding };
 }
@@ -210,30 +215,53 @@ export function whatLanded(
   return `${head}${landed} Press Create agent to try again.`;
 }
 
+/** What Tender holds for an account, as words: "Your bond and storage are", "Storage is"... */
+function heldWhat(chain: AgentOnChain, bond: AgentBondTerms | null): string | null {
+  const bondIn = bond !== null && chain.vault > 0n;
+  if (chain.storage && bondIn) return "Your bond and storage are";
+  // Tender takes storage, and a bond, for any account id from anyone: alone, it may not be yours.
+  if (chain.storage) return "Storage with Tender is";
+  if (bondIn) return "A bond is";
+  return null;
+}
+
 /**
  * What of the first way is on the chain for `<name>.<you>` (`accountId`), in words for the person,
  * or null when nothing is: no account, no storage with Tender and an empty vault. Then, and only
- * then, the separate account can be chosen without paying twice. Storage or a bond that an earlier
- * try paid stays with `<name>.<you>`, which only the person's wallet can create.
+ * then, the separate account can be paid for without paying twice. Storage or a bond that an
+ * earlier try paid stays with `<name>.<you>`, which only the person's wallet can create.
  */
 export function heldOnSubAccount(
   accountId: string,
   chain: AgentOnChain,
   bond: AgentBondTerms | null,
 ): string | null {
-  if (chain.key !== "missing") {
-    return `${accountId} exists now, so your agent keeps it. Nothing more was sent.`;
+  if (chain.key === "has-key") {
+    return `${accountId} exists now, with your agent's key, so your agent keeps it. Nothing more was sent.`;
   }
-  const bondIn = bond !== null && chain.vault > 0n;
-  if (!chain.storage && !bondIn) return null;
-  const what =
-    chain.storage && bondIn
-      ? "Your bond and storage are"
-      : chain.storage
-        ? "Your storage is"
-        : "Your bond is";
-  const stay = chain.storage && bondIn ? "they stay" : "it stays";
+  if (chain.key === "other-keys") {
+    return `${accountId} exists, and not with your agent's key, so nothing was sent for it or for a separate account. Start over with another name.`;
+  }
+  const what = heldWhat(chain, bond);
+  if (what === null) return null;
+  const stay = what.endsWith(" are") ? "they stay" : "it stays";
   return `${what} waiting for ${accountId}; ${stay} there until that account is created. Finish with a wallet that allows the setup step.`;
+}
+
+/**
+ * The mirror of `heldOnSubAccount`, for a press that pays for `<name>.<you>` (`accountId`): what
+ * Tender already holds for the agent's separate account (`implicit`), in words, or null when it
+ * holds nothing. Paying for `<name>.<you>` then would pay the storage or the bond twice.
+ */
+export function heldOnImplicit(
+  implicit: string,
+  accountId: string,
+  chain: AgentOnChain,
+  bond: AgentBondTerms | null,
+): string | null {
+  const what = heldWhat(chain, bond);
+  if (what === null) return null;
+  return `${what} already waiting for ${implicit}, your agent's separate account, so nothing more is paid for ${accountId}. Read the page again before you press anything.`;
 }
 
 /** Whether the account is made and paid for: storage with Tender, and the bond in its vault (or held). */

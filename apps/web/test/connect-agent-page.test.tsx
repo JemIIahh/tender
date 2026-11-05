@@ -1222,11 +1222,12 @@ test("the_separate_account_press_reads_the_sub_account_again_and_never_pays_twic
   await waitFor(() => expect(late.requests).toContain(`RPC ft_balance_of ${ALICE}`));
   await second.user.click(await screen.findByRole("button", { name: "Create agent" }));
   const lateOffer = await screen.findByTestId("connect-implicit-offer");
-  late.accounts.set(AGENT, []);
+  // The sub-account was made after all, with the agent's key: the agent keeps it, the page goes on
+  // to step 4, and nothing is recorded or sent for a separate account.
+  late.accounts.set(AGENT, [PUBLIC]);
   await second.user.click(within(lateOffer).getByRole("button", { name: SEPARATE }));
-  expect((await screen.findByTestId("connect-send-error")).textContent).toBe(
-    `${AGENT} exists now, so your agent keeps it. Nothing more was sent.`,
-  );
+  await waitFor(() => expect(step(4).dataset.open).toBe("true"));
+  expect(screen.getByTestId("tick-created").dataset.state).toBe("done");
   expect(late.requests).not.toContain(`POST /v1/connect/codes/${ID}/implicit`);
   expect(second.batches).toEqual([]);
 });
@@ -1281,4 +1282,90 @@ test("a_switch_tender_does_not_take_says_so_and_the_way_out_stays", async () => 
     expect(batches).toEqual([]);
     expect(screen.getByRole("button", { name: SEPARATE })).toBeTruthy();
   }
+});
+
+test("the_separate_account_after_a_failed_sub_account_try_pays_nothing_again", async () => {
+  // The network fails the account; this wallet goes on, and the storage and the bond land for the
+  // sub-account. Then Tender's record says the separate account (a lying API, or another tab).
+  const state = world();
+  state.failCreates = 1;
+  const { user, batches } = open(state);
+  await getCode(user);
+  agentAttaches(state);
+  await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+  await user.click(await screen.findByRole("button", { name: "Create agent" }));
+  await screen.findByTestId("connect-implicit-held");
+  expect(batches).toHaveLength(1);
+  if (state.code !== null) state.code.kind = "implicit";
+  await waitFor(() =>
+    expect(screen.getByTestId("connect-ready").textContent).toBe(
+      `Your agent is ready: ${IMPLICIT}`,
+    ),
+  );
+
+  // The page says where the money is, the old words about the sub-account are gone, and Create
+  // agent is off.
+  const held = `Your bond and storage are waiting for ${AGENT}; they stay there until that account is created. Finish with a wallet that allows the setup step.`;
+  expect((await screen.findByTestId("connect-other-held")).textContent).toBe(held);
+  expect(screen.queryByText(/creates the account only/)).toBeNull();
+  const create = screen.getByRole("button", { name: "Create agent" });
+  expect(create.getAttribute("aria-disabled")).toBe("true");
+
+  // A press that gets through anyway (the poll had not looked yet) reads the sub-account again at
+  // the press, and pays nothing.
+  state.storage.add(AGENT);
+  await waitFor(() => expect(state.requests).toContain(`RPC storage_balance_of ${AGENT}`));
+  await user.click(create);
+  expect(batches).toHaveLength(1);
+  expect(state.vault.get(IMPLICIT)).toBeUndefined();
+  expect(state.storage.has(IMPLICIT)).toBe(false);
+  expect(state.vault.get(AGENT)).toBe(BOND);
+});
+
+test("a_flip_back_to_the_sub_account_after_the_separate_account_was_paid_pays_nothing_again", async () => {
+  const state = world();
+  const { user, batches } = open(state, { refuseNewAccounts: true });
+  await getCode(user);
+  agentAttaches(state);
+  await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+  await user.click(await screen.findByRole("button", { name: "Create agent" }));
+  await user.click(await screen.findByRole("button", { name: SEPARATE }));
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
+  expect(batches).toHaveLength(1);
+  expect(state.vault.get(IMPLICIT)).toBe(BOND);
+
+  // Tender's record goes back to the sub-account (a lying API): the sub-account is not made, and
+  // the page says the money is with the separate account.
+  if (state.code !== null) state.code.kind = "sub_account";
+  await waitFor(() =>
+    expect(screen.getByTestId("connect-ready").textContent).toBe(`Your agent is ready: ${AGENT}`),
+  );
+  expect((await screen.findByTestId("connect-other-held")).textContent).toBe(
+    `Your bond and storage are already waiting for ${IMPLICIT}, your agent's separate account, so nothing more is paid for ${AGENT}. Read the page again before you press anything.`,
+  );
+  const create = screen.getByRole("button", { name: "Create agent" });
+  expect(create.getAttribute("aria-disabled")).toBe("true");
+  await user.click(create);
+  expect(batches).toHaveLength(1);
+  expect(state.accounts.has(AGENT)).toBe(false);
+  expect(state.vault.get(AGENT)).toBeUndefined();
+});
+
+test("finish_this_agent_pays_nothing_already_paid_for_its_keys_separate_account", async () => {
+  // writer.alice.testnet exists with the agent's key and no bond; its key's separate account holds
+  // storage and the bond from an earlier try.
+  const state = world();
+  state.accounts.set(AGENT, [PUBLIC]);
+  state.storage.add(IMPLICIT);
+  state.vault.set(IMPLICIT, BOND);
+  const { user, batches } = open(state);
+  await user.type(await nameField(), "writer");
+  await within(step(1)).findByText(`${AGENT} already exists.`);
+  await user.click(screen.getByRole("button", { name: "Finish this agent" }));
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("wrong"));
+  await user.click(screen.getByRole("button", { name: "Fund agent" }));
+  expect((await screen.findByTestId("connect-fund-error")).textContent).toBe(
+    `Your bond and storage are already waiting for ${IMPLICIT}, your agent's separate account, so nothing more is paid for ${AGENT}. Read the page again before you press anything.`,
+  );
+  expect(batches).toEqual([]);
 });

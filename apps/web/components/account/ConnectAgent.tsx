@@ -26,6 +26,7 @@ import {
   createAccountCommand,
   createAgentBatch,
   fundCallsFor,
+  heldOnImplicit,
   heldOnSubAccount,
   implicitAgentBatch,
   isFunded,
@@ -109,7 +110,11 @@ type Send =
   | { state: "idle" }
   | { state: "waiting" }
   | { state: "settling" }
-  | { state: "failed"; message: string };
+  /**
+   * `kind`: the way whose account the words are about ("pressing Create agent again creates the
+   * account only"). They are shown only while the code is on that way.
+   */
+  | { state: "failed"; message: string; kind?: "sub_account" | "implicit" };
 
 /** The fault of a read of the code's state, in a word: what the page says about it. */
 type StateFault = "signed-out" | "unreachable" | "gone" | null;
@@ -401,6 +406,10 @@ export function ConnectAgent({
   const [state, setState] = useState<ConnectCodeState | null>(null);
   const [fault, setFault] = useState<StateFault>(null);
   const [chain, setChain] = useState<AgentOnChain | null>(null);
+  // The other way's account, as the page last read it: `<name>.<you>` while the code is on the
+  // implicit account, and the implicit account while it is on `<name>.<you>`. What Tender holds
+  // there is never paid again for this way.
+  const [other, setOther] = useState<{ account: string; chain: AgentOnChain } | null>(null);
   const [held, setHeld] = useState<Held>({ state: "unknown" });
   const [send, setSend] = useState<Send>({ state: "idle" });
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -489,10 +498,27 @@ export function ConnectAgent({
             : found.account_kind === "implicit"
               ? implicitAccountOf(found.public_key)
               : found.account_id;
+        // The other way's account, which the page also works out itself.
+        const otherAt =
+          found.public_key === null
+            ? null
+            : found.account_kind === "implicit"
+              ? `${found.name}.${account}`
+              : implicitAccountOf(found.public_key);
         if (found.public_key !== null && where !== null) {
           try {
-            const onChain = await readAgentOnChain(where, found.public_key, bondRef.current);
-            if (!gone) setChain(onChain);
+            const [onChain, onOther] = await Promise.all([
+              readAgentOnChain(where, found.public_key, bondRef.current),
+              otherAt === null
+                ? Promise.resolve(null)
+                : readAgentOnChain(otherAt, found.public_key, bondRef.current, "optimistic"),
+            ]);
+            if (!gone) {
+              setChain(onChain);
+              setOther(
+                otherAt === null || onOther === null ? null : { account: otherAt, chain: onOther },
+              );
+            }
           } catch (error) {
             // The chain is asked again at the next look.
             console.error(error);
@@ -663,7 +689,7 @@ export function ConnectAgent({
         if (separate && now.account_kind === "sub_account") {
           // Nothing of the first way may be on the chain: an account made late, or storage or a
           // bond an earlier try paid for `<name>.<you>`, would be paid again for the other.
-          const sub = await readAgentOnChain(accountId, attached, bond);
+          const sub = await readAgentOnChain(accountId, attached, bond, "optimistic");
           setChain(sub);
           const held = heldOnSubAccount(accountId, sub, bond);
           if (held !== null) {
@@ -688,6 +714,21 @@ export function ConnectAgent({
         return;
       }
       const target = where;
+      // The other way's account, at the newest block: storage or a bond an earlier try paid there
+      // is never paid again for this way, whatever Tender's record says now (an API that switches
+      // the way, or a try in another tab).
+      const otherAt = implicitRoute ? accountId : implicitAccountOf(attached);
+      if (otherAt !== null) {
+        const otherNow = await readAgentOnChain(otherAt, attached, bond, "optimistic");
+        setOther({ account: otherAt, chain: otherNow });
+        const heldThere = implicitRoute
+          ? heldOnSubAccount(accountId, otherNow, bond)
+          : heldOnImplicit(otherAt, accountId, otherNow, bond);
+        if (heldThere !== null) {
+          setSend({ state: "failed", message: heldThere });
+          return;
+        }
+      }
       // What the chain holds now, not what the page last saw: an earlier try may have paid the
       // storage or the bond, which is never paid twice.
       const fresh = await readAgentOnChain(target, attached, bond);
@@ -724,6 +765,7 @@ export function ConnectAgent({
           ? { state: "idle" }
           : {
               state: "failed",
+              kind: implicitRoute ? "implicit" : "sub_account",
               message:
                 after?.key === "has-key"
                   ? "Your wallet sent it, but the storage and the bond aren't on the network yet. Check again in a moment, or press Fund agent."
@@ -761,6 +803,7 @@ export function ConnectAgent({
       }
       setSend({
         state: "failed",
+        kind: implicitRoute ? "implicit" : "sub_account",
         message:
           error instanceof TransactionFailed || error instanceof WalletError
             ? whatLanded(after, bond, error instanceof WalletError)
@@ -780,7 +823,17 @@ export function ConnectAgent({
   const expired = state?.state === "expired";
   const short =
     bond !== null && held.state === "read" && held.amount < bond.amount ? held.amount : null;
-  const blocked = short !== null || terms.status !== "ready" || !answerFits || contested;
+  // What Tender holds for the other way's account, in words, or null when it holds nothing. A
+  // reading of the account of the way the code was on before is not used.
+  const otherAccount = kind === "implicit" ? accountId : implicitAccount;
+  const otherWords =
+    other === null || accountId === null || other.account !== otherAccount
+      ? null
+      : kind === "implicit"
+        ? heldOnSubAccount(accountId, other.chain, bond)
+        : heldOnImplicit(other.account, accountId, other.chain, bond);
+  const blocked =
+    short !== null || terms.status !== "ready" || !answerFits || contested || otherWords !== null;
   const showFinishOffer =
     !locked && name.ok && check.state === "taken" && check.accountId === accountId;
   // What of the first way is on the chain for `<name>.<you>`, in words, or null when nothing is.
@@ -1188,7 +1241,9 @@ export function ConnectAgent({
                     </div>
                   ) : null}
 
-                  {send.state === "failed" && !created ? (
+                  {send.state === "failed" &&
+                  !created &&
+                  (send.kind === undefined || send.kind === kind) ? (
                     <p
                       role="alert"
                       data-testid="connect-send-error"
@@ -1198,6 +1253,11 @@ export function ConnectAgent({
                     </p>
                   ) : null}
 
+                  {otherWords !== null && !created ? (
+                    <p data-testid="connect-other-held" className={NOTICE}>
+                      {otherWords}
+                    </p>
+                  ) : null}
                   {primaryRefused &&
                   kind === "sub_account" &&
                   !created &&
@@ -1443,6 +1503,17 @@ function FinishAgent({
             "The account's keys changed: it no longer has exactly one full-access key. Nothing was sent.",
         });
         return;
+      }
+      // The account's one key may have a separate account that an earlier try paid for: what
+      // Tender holds there is not paid again here.
+      const implicit = implicitAccountOf(keysNow[0] ?? "");
+      if (implicit !== null) {
+        const there = await readAgentFunding(implicit, bond, "optimistic");
+        const held = heldOnImplicit(implicit, accountId, { key: "missing", ...there }, bond);
+        if (held !== null) {
+          setSend({ state: "failed", message: held });
+          return;
+        }
       }
       // What Tender holds now, so that nothing is paid twice.
       const now = await readAgentFunding(accountId, bond);

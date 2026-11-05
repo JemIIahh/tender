@@ -51,6 +51,13 @@ function returnedBytes(answer: unknown): number[] {
 }
 
 /**
+ * Which block a read is made at: the last final one, whose answer cannot be undone, or the newest
+ * (`optimistic`), for a read whose "nothing there" lets money move: it then sees what landed a
+ * block or two ago.
+ */
+export type Finality = "final" | "optimistic";
+
+/**
  * Calls the view `method` of `contractId` with `args` on the configured RPC node, at the last
  * final block: what it returns cannot be undone, as for `TenderClient.view`. The result is the
  * JSON the contract returned, unchecked; a caller that needs it to be right parses it with the
@@ -60,14 +67,19 @@ function returnedBytes(answer: unknown): number[] {
  * Throws an `RpcError` for an answer that is an error or is not a view's result. A request that
  * fails before there is an answer, or gets none in time (a `TimeoutError`), is thrown as it came.
  */
-export async function view<T>(contractId: string, method: string, args: object = {}): Promise<T> {
+export async function view<T>(
+  contractId: string,
+  method: string,
+  args: object = {},
+  finality: Finality = "final",
+): Promise<T> {
   const request = {
     jsonrpc: "2.0",
     id: "tender-web",
     method: "query",
     params: {
       request_type: "call_function",
-      finality: "final",
+      finality,
       account_id: contractId,
       method_name: method,
       args_base64: toBase64(new TextEncoder().encode(JSON.stringify(args, bigintAsDecimal))),
@@ -116,12 +128,13 @@ export async function view<T>(contractId: string, method: string, args: object =
  */
 async function query(
   params: Record<string, string>,
+  finality: Finality = "final",
 ): Promise<{ result: Record<string, unknown> } | { missing: string }> {
   const request = {
     jsonrpc: "2.0",
     id: "tender-web",
     method: "query",
-    params: { ...params, finality: "final" },
+    params: { ...params, finality },
   };
   const { ok, status, text } = await withTimeout(TIMEOUT_MS, async (signal) => {
     const res = await fetch(config.rpcUrl, {
@@ -160,8 +173,11 @@ async function query(
 }
 
 /** Whether `accountId` exists on the chain now (`view_account`). */
-export async function accountExists(accountId: string): Promise<boolean> {
-  const answer = await query({ request_type: "view_account", account_id: accountId });
+export async function accountExists(
+  accountId: string,
+  finality: Finality = "final",
+): Promise<boolean> {
+  const answer = await query({ request_type: "view_account", account_id: accountId }, finality);
   return "result" in answer;
 }
 
@@ -172,13 +188,13 @@ export async function accountExists(accountId: string): Promise<boolean> {
 export async function accountKeyState(
   accountId: string,
   publicKey: string,
+  finality: Finality = "final",
 ): Promise<"missing" | "other-keys" | "has-key"> {
-  if (!(await accountExists(accountId))) return "missing";
-  const answer = await query({
-    request_type: "view_access_key",
-    account_id: accountId,
-    public_key: publicKey,
-  });
+  if (!(await accountExists(accountId, finality))) return "missing";
+  const answer = await query(
+    { request_type: "view_access_key", account_id: accountId, public_key: publicKey },
+    finality,
+  );
   if ("missing" in answer) return "other-keys";
   return answer.result.permission === "FullAccess" ? "has-key" : "other-keys";
 }

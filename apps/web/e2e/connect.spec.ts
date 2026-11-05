@@ -320,4 +320,20 @@ test("money_already_on_the_sub_account_is_said_and_no_separate_account_is_offere
   expect(wallet.sent.map((tx) => tx.receiverId)).toEqual([AGENT, CONTRACT, TOKEN]);
   await expectToFit(page, "held");
   await shoot(page, "held-on-sub-account");
+
+  // Tender's record then says the separate account (a lying API, or another tab): the page says
+  // where the money is, and Create agent pays nothing.
+  if (api.code !== null) api.code.kind = "implicit";
+  await expect(page.getByTestId("connect-other-held")).toHaveText(
+    `Your bond and storage are waiting for ${AGENT}; they stay there until that account is created. Finish with a wallet that allows the setup step.`,
+  );
+  await expect(page.getByRole("button", { name: "Create agent" })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  // A press anyway (Playwright waits for an aria-disabled button, so the click is forced).
+  await page.getByRole("button", { name: "Create agent" }).click({ force: true });
+  expect(wallet.sent.map((tx) => tx.receiverId)).toEqual([AGENT, CONTRACT, TOKEN]);
+  await expectToFit(page, "other held");
+  await shoot(page, "held-after-switch");
 });
