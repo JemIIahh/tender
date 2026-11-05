@@ -1,5 +1,7 @@
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { expect, type Page, test } from "@playwright/test";
-import { connectFingerprint } from "@tender/shared";
+import { connectFingerprint, implicitAccountOf } from "@tender/shared";
 import {
   type AccountChain,
   AGENT_PUBLIC_KEY,
@@ -19,7 +21,11 @@ import { STUB_WALLET_NAME } from "./walletStub";
 // "Connect your agent" in a real browser, against the fixture API, a fixture node and an injected
 // wallet that signs in and sends batches: a name, a code, the agent attaching its key (the spec
 // does what the agent would), the fingerprint, ONE approval for the account, its storage and its
-// bond, and the ticks as the agent registers. At a laptop's width and a phone's.
+// bond, and the ticks as the agent registers. At a laptop's width and a phone's. Then a wallet that
+// blocks the new account, and the separate account that every wallet sends.
+//
+// With CONNECT_SHOTS set to a directory, the states of the separate account are also saved there as
+// screenshots at 375 and 1440 px wide.
 
 const PHONE = { width: 375, height: 812 };
 const TOKEN = "tusdc.tender-team.testnet";
@@ -39,12 +45,16 @@ const chainOf = (): AccountChain => ({
   wallet: new Map([[OWNER, 20_000_000n]]),
 });
 
-async function openConnected(page: Page, chain: AccountChain = chainOf()) {
+async function openConnected(
+  page: Page,
+  chain: AccountChain = chainOf(),
+  walletOptions: { refuseNewAccounts?: boolean } = {},
+) {
   await routeApi(page);
   await routeAccount(page);
   const api = await routeConnect(page, OWNER);
   await routeAccountNode(page, chain);
-  const wallet = await installAccountWallet(page, { account: OWNER, chain });
+  const wallet = await installAccountWallet(page, { account: OWNER, chain, ...walletOptions });
   await page.goto("/my-agents/new");
   await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
   await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
@@ -95,14 +105,19 @@ test("connect_an_agent_with_one_paste_and_one_approval_and_watch_it_tick_to_acti
   // ONE approval: the account with the agent's key, its storage, its bond into its vault.
   await expect(page.getByTestId("tick-funded")).toHaveAttribute("data-state", "done");
   expect(wallet.sent.map((tx) => tx.receiverId)).toEqual([AGENT, CONTRACT, TOKEN]);
-  expect(wallet.sent[0]?.actions).toEqual([
-    { type: "CreateAccount" },
-    { type: "Transfer", params: { deposit: "500000000000000000000000" } },
-    {
-      type: "AddKey",
-      params: { publicKey: AGENT_PUBLIC_KEY, accessKey: { permission: "FullAccess" } },
-    },
+  // The account, its NEAR, its setup code, and the call that adds the agent's key: no AddKey.
+  expect(wallet.sent[0]?.actions.map((action) => action.type)).toEqual([
+    "CreateAccount",
+    "Transfer",
+    "DeployContract",
+    "FunctionCall",
   ]);
+  expect(wallet.sent[0]?.actions[3]?.params).toEqual({
+    methodName: "setup",
+    args: { public_key: AGENT_PUBLIC_KEY },
+    gas: "30000000000000",
+    deposit: "0",
+  });
   expect(wallet.sent[2]?.actions[0]?.params).toMatchObject({
     methodName: "ft_transfer_call",
     args: { receiver_id: CONTRACT, amount: "5000000", msg: `{"for":"${AGENT}"}` },
@@ -196,4 +211,88 @@ test("a_contested_code_is_refused_and_an_agent_you_started_is_finished_with_fund
   expect(api.made).toBe(1);
   await page.setViewportSize(PHONE);
   await expectToFit(page, "finish (phone)");
+});
+
+const SHOTS = process.env.CONNECT_SHOTS;
+
+/** Saves the connect section as `name`, at a phone's width and a desktop's. */
+async function shoot(page: Page, name: string, testId = "connect-step-3"): Promise<void> {
+  if (SHOTS === undefined || SHOTS === "") return;
+  mkdirSync(SHOTS, { recursive: true });
+  // The sticky header and the dev server's badge would sit over the section in the picture.
+  await page.addStyleTag({
+    content: "header.sticky { position: static !important } nextjs-portal { display: none }",
+  });
+  const part = page.getByTestId(testId);
+  for (const width of [375, 1440]) {
+    await page.setViewportSize({ width, height: width === 375 ? 812 : 900 });
+    await part.scrollIntoViewIfNeeded();
+    await part.screenshot({ path: join(SHOTS, `${width}-${name}.png`), animations: "disabled" });
+  }
+  await page.setViewportSize({ width: 1280, height: 720 });
+}
+
+test("a_wallet_that_blocks_the_new_account_gets_one_button_for_a_separate_account", async ({
+  page,
+}) => {
+  const { api, chain, wallet } = await openConnected(page, chainOf(), { refuseNewAccounts: true });
+  const implicit = implicitAccountOf(AGENT_PUBLIC_KEY) ?? "";
+  await page.getByTestId("connect-step-1").getByLabel("Account name").fill("writer");
+  await expect(page.getByTestId("connect-name-state")).toHaveText(`${AGENT} is free.`);
+  await page.getByRole("button", { name: "Get a connect code" }).click();
+  await expect(page.getByTestId("connect-command")).toBeVisible();
+  agentAttaches(api, AGENT_PUBLIC_KEY);
+  await expect(page.getByTestId("connect-ready")).toHaveText(`Your agent is ready: ${AGENT}`);
+  await expect(page.getByTestId("connect-bond")).toHaveText("5.00 tUSDC");
+
+  // The wallet blocks the transaction that sets up the account: nothing is sent.
+  await page.getByRole("button", { name: "Create agent" }).click();
+  await expect(page.getByTestId("connect-send-error")).toHaveText(
+    "Your wallet didn't create the account. Nothing was paid. Press Create agent to try again.",
+  );
+  const offer = page.getByTestId("connect-implicit-offer");
+  await expect(offer).toContainText(
+    "This agent is its own account, so Tender's directory won't list it under you as its provider.",
+  );
+  await expect(offer.getByRole("button")).toHaveText([
+    "Use a separate account instead (works with every wallet)",
+  ]);
+  expect(wallet.sent).toEqual([]);
+  await expectToFit(page, "offer");
+  await shoot(page, "blocked-offer");
+
+  // One press: the choice is recorded, and ONE approval sends NEAR to the agent's own account, its
+  // storage and its bond.
+  await offer.getByRole("button", { name: "Use a separate account instead" }).click();
+  await expect(page.getByTestId("tick-funded")).toHaveAttribute("data-state", "done");
+  expect(api.requests).toContain("POST /v1/connect/codes/Q0RFRkdISUpLTE1OT1BRUg/implicit");
+  expect(wallet.sent.map((tx) => tx.receiverId)).toEqual([implicit, CONTRACT, TOKEN]);
+  expect(wallet.sent[0]?.actions).toEqual([
+    { type: "Transfer", params: { deposit: "500000000000000000000000" } },
+  ]);
+  expect(chain.accounts.get(implicit)).toEqual([AGENT_PUBLIC_KEY]);
+  expect(chain.vault?.get(implicit)).toBe(5_000_000n);
+  await expect(page.getByTestId("connect-ready")).toHaveText(`Your agent is ready: ${implicit}`);
+  await expect(page.getByTestId("connect-implicit")).toHaveText(
+    "This agent is its own account, so Tender's directory won't list it under you as its provider.",
+  );
+  await expectToFit(page, "separate account");
+  await shoot(page, "separate-account");
+  await shoot(page, "separate-account-ticks", "connect-step-4");
+
+  agentRegisters(api);
+  await expect(page.getByTestId("tick-active")).toHaveAttribute("data-state", "done");
+  await expect(page.getByTestId("connect-active")).toContainText(implicit);
+  await shoot(page, "separate-account-active", "connect-step-4");
+
+  // My agents lists it as set up by the person, and not linked on chain.
+  await page.getByTestId("connect-active").getByRole("link", { name: "Back to My agents" }).click();
+  const list = page.getByTestId("implicit-agents");
+  await expect(list).toContainText("Set up by you, not linked on chain");
+  await expect(list.getByTestId("implicit-agent")).toContainText(implicit);
+  await expect(list.getByTestId("implicit-agent")).toContainText("Active");
+  await expectToFit(page, "my agents");
+  await shoot(page, "my-agents-separate", "implicit-agents");
+  await page.setViewportSize(PHONE);
+  await expectToFit(page, "my agents (phone)");
 });

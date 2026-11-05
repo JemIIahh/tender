@@ -1,4 +1,11 @@
-import { base58Encode, connectFingerprint, SIGN_IN_MESSAGE } from "@tender/shared";
+import {
+  AGENT_SETUP_WASM_SHA256,
+  base58Encode,
+  connectFingerprint,
+  implicitAccountOf,
+  SIGN_IN_MESSAGE,
+  sha256Hex,
+} from "@tender/shared";
 import { cleanup, configure, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -22,6 +29,8 @@ const BOND = 5_000_000n;
 const CODE = "tc_abcdefghijklmnopqrstuvwxyz";
 const ID = "Q0RFRkdISUpLTE1OT1BRUg";
 const PUBLIC = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp";
+/** The implicit account of the agent's key: its own, which the page works out itself. */
+const IMPLICIT = implicitAccountOf(PUBLIC) ?? "";
 const NONCE = btoa(String.fromCharCode(...Array.from({ length: 32 }, (_, i) => i + 1)));
 
 const holder = vi.hoisted(() => ({ store: undefined as unknown as WalletStore }));
@@ -74,6 +83,8 @@ interface World {
     agent: null | { status: string };
     registeredAt: string | null;
     contestedAt?: string | null;
+    /** Which account the agent gets, as the API records it. */
+    kind?: "sub_account" | "implicit";
   } | null;
   /** The index's agents, by account (`GET /v1/agents/:account`), with their status. */
   agents: Map<string, string>;
@@ -91,6 +102,8 @@ interface World {
   readStatus: number | null;
   /** A state that lies: another fingerprint, or another account, than the code's. */
   lie?: { fingerprint?: string; account?: string; publicKey?: string };
+  /** The account the API names once the code is moved to the implicit account, if not the key's. */
+  lieImplicit?: string;
   /** `METHOD /path` of every request to the API, and `RPC <what> <account>` of every read. */
   requests: string[];
   /** Every request body, as text. */
@@ -258,16 +271,27 @@ function serve(state: World): void {
         expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
       });
     }
-    if (url.pathname === `/v1/connect/codes/${ID}` && state.code !== null) {
+    const implicitPath = `/v1/connect/codes/${ID}/implicit`;
+    if (url.pathname === implicitPath && method === "POST" && state.code !== null) {
+      state.code.kind = "implicit";
+    }
+    if (
+      (url.pathname === `/v1/connect/codes/${ID}` || url.pathname === implicitPath) &&
+      state.code !== null
+    ) {
       if (state.readStatus !== null) {
         return json({ error: "unauthorized", message: "sign in" }, state.readStatus);
       }
       const { code } = state;
+      const implicit = code.kind === "implicit";
       return json({
         id: ID,
         owner: ALICE,
         name: code.name,
-        account_id: state.lie?.account ?? `${code.name}.${ALICE}`,
+        account_id: implicit
+          ? (state.lieImplicit ?? implicitAccountOf(code.attached ?? "") ?? "")
+          : (state.lie?.account ?? `${code.name}.${ALICE}`),
+        account_kind: code.kind ?? "sub_account",
         state: code.contestedAt
           ? "contested"
           : code.registeredAt
@@ -305,16 +329,24 @@ interface Sent {
 
 /**
  * Alice's wallet, which signs a message (the sign-in) and runs what it is sent on `state`: an
- * account with the key it adds, Tender's storage for the account named, and a deposit of the bond
- * token into the vault it names, once that account has storage (`failDeposits` of them fail).
- * `accountActions: false` is a wallet whose manifest says it can't send whole transactions;
- * `signMessage: false` can't sign in.
+ * account with the key its setup call adds, the implicit account of a key that a transfer creates,
+ * Tender's storage for the account named, and a deposit of the bond token into the vault it names,
+ * once that account has storage (`failDeposits` of them fail). `accountActions: false` is a wallet
+ * whose manifest says it can't send whole transactions; `signMessage: false` can't sign in;
+ * `refuseNewAccounts` throws for a batch that creates an account, as a wallet that blocks setting up
+ * a key does (`refuseTransfers` for one that sends NEAR, too).
  */
 function aliceWallet(
   state: World,
-  options: { accountActions?: boolean; signMessage?: boolean } = {},
+  options: {
+    accountActions?: boolean;
+    signMessage?: boolean;
+    refuseNewAccounts?: boolean;
+    refuseTransfers?: boolean;
+  } = {},
 ) {
   const batches: Sent[][] = [];
+  const refused: Sent[][] = [];
   const signed: string[] = [];
   const wallet: SigningWallet = {
     manifest: {
@@ -325,6 +357,15 @@ function aliceWallet(
     },
     async signAndSendTransactions({ transactions }) {
       const batch = transactions as unknown as Sent[];
+      const has = (type: string) =>
+        batch.some((tx) => tx.actions.some((action) => action.type === type));
+      if (
+        (options.refuseNewAccounts && has("CreateAccount")) ||
+        (options.refuseTransfers && has("Transfer"))
+      ) {
+        refused.push(batch);
+        throw new Error("Full access key request blocked");
+      }
       batches.push(batch);
       const outcomes: unknown[] = [];
       for (const [index, transaction] of batch.entries()) {
@@ -340,13 +381,23 @@ function aliceWallet(
         }
         for (const action of failed ? [] : transaction.actions) {
           const params = action.params ?? {};
-          if (action.type === "AddKey") {
-            const keys = state.accounts.get(transaction.receiverId) ?? [];
-            state.accounts.set(transaction.receiverId, [...keys, String(params.publicKey)]);
-          }
           if (action.type === "CreateAccount") state.accounts.set(transaction.receiverId, []);
+          // A transfer that creates the implicit account of the key the agent attached.
+          const attachedKey = state.code?.attached ?? "";
+          if (
+            action.type === "Transfer" &&
+            !state.accounts.has(transaction.receiverId) &&
+            transaction.receiverId === implicitAccountOf(attachedKey)
+          ) {
+            state.accounts.set(transaction.receiverId, [attachedKey]);
+          }
           if (action.type !== "FunctionCall") continue;
           const args = params.args as Record<string, string>;
+          // The setup code adds the key it is called with, to the account it is on.
+          if (params.methodName === "setup") {
+            const keys = state.accounts.get(transaction.receiverId) ?? [];
+            state.accounts.set(transaction.receiverId, [...keys, String(args.public_key)]);
+          }
           if (params.methodName === "storage_deposit") state.storage.add(String(args.account_id));
           if (params.methodName === "ft_transfer_call") {
             const beneficiary = (JSON.parse(args.msg ?? "{}") as { for: string }).for;
@@ -387,7 +438,7 @@ function aliceWallet(
       };
     },
   };
-  return { session: { wallet, accountId: ALICE }, batches, signed };
+  return { session: { wallet, accountId: ALICE }, batches, refused, signed };
 }
 
 function open(state: World, options: Parameters<typeof aliceWallet>[1] & { pollMs?: number } = {}) {
@@ -493,9 +544,15 @@ test("create_agent_is_one_approval_that_creates_the_account_and_pays_its_storage
         actions: [
           { type: "CreateAccount" },
           { type: "Transfer", params: { deposit: "500000000000000000000000" } },
+          { type: "DeployContract", params: { code: expect.any(Uint8Array) } },
           {
-            type: "AddKey",
-            params: { publicKey: PUBLIC, accessKey: { permission: "FullAccess" } },
+            type: "FunctionCall",
+            params: {
+              methodName: "setup",
+              args: { public_key: PUBLIC },
+              gas: "30000000000000",
+              deposit: "0",
+            },
           },
         ],
       },
@@ -530,6 +587,12 @@ test("create_agent_is_one_approval_that_creates_the_account_and_pays_its_storage
     ],
   ]);
   expect(state.vault.get(AGENT)).toBe(BOND);
+  // The code deployed is the setup code of contract/res, and no AddKey is among the actions.
+  const deploy = batches[0]?.[0]?.actions[2]?.params?.code;
+  expect(deploy instanceof Uint8Array && sha256Hex(deploy)).toBe(AGENT_SETUP_WASM_SHA256);
+  expect(JSON.stringify(batches)).not.toContain("AddKey");
+  expect(state.accounts.get(AGENT)).toEqual([PUBLIC]);
+  expect(screen.queryByTestId("connect-implicit-offer")).toBeNull();
 
   // The ticks: Created and Funded from the chain; Registered and Active wait on the agent.
   await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
@@ -962,5 +1025,146 @@ test("create_signs_nothing_when_the_key_changed_since_the_person_checked_it", as
   );
   // The page now shows the key that is there, for the person to check again.
   expect(screen.getByTestId("connect-fingerprint").textContent).toBe(connectFingerprint(other));
+  expect(batches).toEqual([]);
+});
+
+// ---- A separate account -----------------------------------------------------------------------
+
+const SEPARATE = "Use a separate account instead (works with every wallet)";
+const NOT_LISTED =
+  "This agent is its own account, so Tender's directory won't list it under you as its provider.";
+
+test("a_wallet_that_blocks_the_new_account_is_offered_a_separate_account_in_one_button", async () => {
+  const state = world();
+  const { user, batches, refused } = open(state, { refuseNewAccounts: true });
+  await getCode(user);
+  agentAttaches(state);
+  await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+  await user.click(await screen.findByRole("button", { name: "Create agent" }));
+
+  // The wallet refused the sub-account's transaction: nothing was sent, and the page says so plainly
+  // and offers one way out.
+  expect((await screen.findByTestId("connect-send-error")).textContent).toBe(
+    "Your wallet didn't create the account. Nothing was paid. Press Create agent to try again.",
+  );
+  expect(refused).toHaveLength(1);
+  expect(batches).toEqual([]);
+  const offer = await screen.findByTestId("connect-implicit-offer");
+  expect(offer.textContent).toContain(NOT_LISTED);
+  expect(
+    within(offer)
+      .getAllByRole("button")
+      .map((button) => button.textContent),
+  ).toEqual([SEPARATE]);
+  expect(state.requests).not.toContain(`POST /v1/connect/codes/${ID}/implicit`);
+
+  await user.click(within(offer).getByRole("button", { name: SEPARATE }));
+
+  // The API is told first, then ONE approval: NEAR to the agent's own implicit account (which a
+  // transfer creates, with the agent's key), its storage and its bond, with no account set-up.
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
+  const told = state.requests.indexOf(`POST /v1/connect/codes/${ID}/implicit`);
+  expect(told).toBeGreaterThan(-1);
+  expect(batches).toEqual([
+    [
+      {
+        receiverId: IMPLICIT,
+        actions: [{ type: "Transfer", params: { deposit: "500000000000000000000000" } }],
+      },
+      {
+        receiverId: CONTRACT,
+        actions: [
+          {
+            type: "FunctionCall",
+            params: {
+              methodName: "storage_deposit",
+              args: { account_id: IMPLICIT },
+              gas: "10000000000000",
+              deposit: "20000000000000000000000",
+            },
+          },
+        ],
+      },
+      {
+        receiverId: TOKEN,
+        actions: [
+          {
+            type: "FunctionCall",
+            params: {
+              methodName: "ft_transfer_call",
+              args: { receiver_id: CONTRACT, amount: "5000000", msg: `{"for":"${IMPLICIT}"}` },
+              gas: "100000000000000",
+              deposit: "1",
+            },
+          },
+        ],
+      },
+    ],
+  ]);
+  expect(state.accounts.get(IMPLICIT)).toEqual([PUBLIC]);
+  expect(state.vault.get(IMPLICIT)).toBe(BOND);
+  expect(state.accounts.has(AGENT)).toBe(false);
+
+  // The page says which account it is, and that the directory won't list it under the person.
+  expect(screen.getByTestId("connect-ready").textContent).toBe(`Your agent is ready: ${IMPLICIT}`);
+  expect(screen.getByTestId("connect-implicit").textContent).toBe(NOT_LISTED);
+  expect(screen.queryByTestId("connect-implicit-offer")).toBeNull();
+  expect(screen.getByTestId("tick-created").textContent).toContain(IMPLICIT);
+
+  // The agent registers itself there; the index lists it.
+  if (state.code !== null) state.code.agent = { status: "active" };
+  await waitFor(() => expect(screen.getByTestId("tick-active").dataset.state).toBe("done"));
+  expect(screen.getByTestId("connect-active").textContent).toContain(IMPLICIT);
+  expect(batches).toHaveLength(1);
+});
+
+test("the_implicit_account_is_the_pages_own_and_an_answer_naming_another_is_never_signed", async () => {
+  const state = world();
+  state.lieImplicit =
+    implicitAccountOf(`ed25519:${base58Encode(new Uint8Array(32).fill(9))}`) ?? "";
+  const { user, batches } = open(state, { refuseNewAccounts: true });
+  await getCode(user);
+  agentAttaches(state);
+  await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+  await user.click(await screen.findByRole("button", { name: "Create agent" }));
+  await user.click(await screen.findByRole("button", { name: SEPARATE }));
+
+  // The API moved the code, and named an account that is not the key's: nothing is signed.
+  expect((await screen.findByTestId("connect-send-error")).textContent).toMatch(
+    /Tender's answer changed just before your wallet was asked, so nothing was sent/,
+  );
+  await screen.findByTestId("connect-mismatch");
+  expect(batches).toEqual([]);
+  expect(screen.getByRole("button", { name: "Create agent" }).getAttribute("aria-disabled")).toBe(
+    "true",
+  );
+});
+
+test("a_wallet_that_refuses_the_transfer_too_is_told_and_create_agent_tries_the_separate_account", async () => {
+  const state = world();
+  const { user, batches, refused } = open(state, {
+    refuseNewAccounts: true,
+    refuseTransfers: true,
+  });
+  await getCode(user);
+  agentAttaches(state);
+  await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+  await user.click(await screen.findByRole("button", { name: "Create agent" }));
+  await user.click(await screen.findByRole("button", { name: SEPARATE }));
+
+  await waitFor(() => expect(refused).toHaveLength(2));
+  expect((await screen.findByTestId("connect-send-error")).textContent).toBe(
+    "Your wallet didn't create the account. Nothing was paid. Press Create agent to try again.",
+  );
+  // The choice is kept: no offer again, and the page names the separate account.
+  await screen.findByTestId("connect-implicit");
+  expect(screen.queryByTestId("connect-implicit-offer")).toBeNull();
+  expect(refused[1]?.[0]?.receiverId).toBe(IMPLICIT);
+
+  // Create agent now goes by the separate account: the same transfer, with no account set-up.
+  await user.click(screen.getByRole("button", { name: "Create agent" }));
+  await waitFor(() => expect(refused).toHaveLength(3));
+  expect(refused[2]?.map((tx) => tx.receiverId)).toEqual([IMPLICIT, CONTRACT, TOKEN]);
+  expect(JSON.stringify(refused[2])).not.toContain("CreateAccount");
   expect(batches).toEqual([]);
 });

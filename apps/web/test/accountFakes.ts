@@ -96,6 +96,8 @@ export interface World {
   requests: string[];
   /** Every request body sent, as text: what left the page. */
   bodies: string[];
+  /** `GET /v1/connect/implicit` (signed in): the agents set up as implicit accounts. */
+  implicit: object[];
 }
 
 export function world(): World {
@@ -112,6 +114,7 @@ export function world(): World {
     serviceAuth: [],
     requests: [],
     bodies: [],
+    implicit: [],
   };
 }
 
@@ -149,6 +152,12 @@ export function serve(state: World): void {
     if (agentPath !== null) {
       const found = state.agents.get(agentPath[1] ?? "");
       return found === undefined ? notFound() : json({ agent: found, recent_entries: [] });
+    }
+    if (url.pathname === "/v1/connect/implicit") {
+      const signedIn = new Headers(init.headers).get("Authorization") !== null;
+      return signedIn
+        ? json({ agents: state.implicit })
+        : json({ error: "unauthorized", message: "sign in" }, 401);
     }
     if (url.pathname === "/v1/agents") {
       return json({
@@ -227,7 +236,8 @@ export interface Sent {
 
 /**
  * Alice's wallet. `accountActions`: its manifest says it signs and sends whole transactions, and
- * one that creates an account makes it on `state`'s chain with the key it adds. `refuse`: it throws.
+ * one that creates an account makes it on `state`'s chain with the key its setup call adds.
+ * `refuse`: it throws.
  */
 export function accountWallet(
   state: World,
@@ -242,8 +252,11 @@ export function accountWallet(
       if (options.refuse) throw new Error("User rejected");
       return (transactions as unknown as Sent[]).map((transaction, index) => {
         sent.push(transaction);
-        const key = transaction.actions.find((action) => action.type === "AddKey")?.params
-          ?.publicKey;
+        // The setup code adds the key it is called with (contract/agent-setup).
+        const setup = transaction.actions.find(
+          (action) => action.type === "FunctionCall" && action.params?.methodName === "setup",
+        );
+        const key = (setup?.params?.args as { public_key?: unknown } | undefined)?.public_key;
         if (transaction.actions.some((action) => action.type === "CreateAccount")) {
           state.accounts.set(transaction.receiverId, typeof key === "string" ? [key] : []);
         }

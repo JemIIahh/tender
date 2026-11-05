@@ -18,6 +18,7 @@ import { PageHead } from "../PageHead";
 import { ListSkeleton } from "../SkeletonLists";
 import { TeamBadge } from "../TeamBadge";
 import { CARD, EYEBROW, FACT_LABEL, PANEL_TITLE, PRIMARY, TAG } from "../ui";
+import { ImplicitAgents } from "./ImplicitAgents";
 import { ArtCard, Chip, ConnectGate, Stat, Stats, Tokens } from "./parts";
 import { ServicesSection } from "./ServicesSection";
 
@@ -247,7 +248,14 @@ function Agents({ account }: { account: string }) {
     return <ErrorState message={state.message} retrying={state.retrying} onRetry={retry} />;
   }
   const { agents, selfRegistered, truncated } = state.data;
-  if (agents.length === 0) return <NoAgents />;
+  if (agents.length === 0) {
+    return (
+      <>
+        <NoAgents />
+        <ImplicitAgents account={account} />
+      </>
+    );
+  }
   return (
     <>
       <Summary record={combinedRecord(agents)} selfRegistered={selfRegistered} />
@@ -274,6 +282,7 @@ function Agents({ account }: { account: string }) {
           Showing the first {agents.length} agents.
         </p>
       ) : null}
+      <ImplicitAgents account={account} />
       <ServicesSection account={account} agents={agents} />
     </>
   );

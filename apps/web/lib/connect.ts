@@ -2,7 +2,9 @@ import {
   AGENT_ACCOUNT_DEPOSIT,
   type AgentBondTerms,
   fundAgentCalls,
+  implicitAccountActions,
   StorageViewSchema,
+  subAccountActions,
   U128StringSchema,
 } from "@tender/shared";
 import type { BondTerms } from "./account";
@@ -13,14 +15,19 @@ import { type AccountAction, groupCalls, type MixedTransaction } from "./wallet"
 
 // What "Add an agent" reads and sends for "Connect your agent" (`@tender/shared`'s `connect.ts` has
 // the flow). The page never makes, sees or keeps the agent's private key: the agent attaches its
-// PUBLIC key to the code, the page reads it back from the API, and the wallet adds it to the
-// account it creates. What the page shows as done it reads from the chain and from the index, and
-// never takes from the wallet's word.
+// PUBLIC key to the code, the page reads it back from the API, and the wallet makes the account
+// with it: `<name>.<you>`, whose setup code adds the key (no AddKey action, which some wallets
+// refuse), or, when the person chooses it, the implicit account of the key, which a plain transfer
+// creates. What the page shows as done it reads from the chain and from the index, and never takes
+// from the wallet's word.
 
 /** How often the page asks how the code stands, and what the chain holds, while it waits. */
 export const CONNECT_POLL_MS = 2000;
 
-/** The same transaction as the wallet's, for near-cli (near-cli-rs), signed with the person's key. */
+/**
+ * The account with the agent's key, for near-cli (near-cli-rs), signed with the person's key from
+ * their own keychain: near-cli adds the key itself (an AddKey action), which no wallet sees.
+ */
 export function createAccountCommand(plan: {
   accountId: string;
   parent: string;
@@ -41,13 +48,12 @@ export function createAccountCommand(plan: {
   ].join(" ");
 }
 
-/** The actions of the one transaction that makes the agent's account. */
+/**
+ * The actions of the one transaction that makes the agent's sub-account: CreateAccount, its NEAR,
+ * the setup code and the call that adds `publicKey` from inside it (`subAccountActions`).
+ */
 export function createAccountActions(publicKey: string): AccountAction[] {
-  return [
-    { type: "CreateAccount" },
-    { type: "Transfer", params: { deposit: AGENT_ACCOUNT_DEPOSIT.toString() } },
-    { type: "AddKey", params: { publicKey, accessKey: { permission: "FullAccess" } } },
-  ];
+  return subAccountActions(publicKey);
 }
 
 /** The bond in the contract's terms, or null when registering takes none. */
@@ -61,6 +67,7 @@ export function bondOfTerms(terms: BondTerms): AgentBondTerms | null {
  * its storage with Tender, its bond into its vault), grouped into transactions as every send of the
  * app is. What is in place already is not paid again: Tender takes a storage deposit and a bond for
  * an account that does not exist yet, so an earlier try whose account failed may have paid both.
+ * For an account that exists already (`has-key`), only the calls.
  */
 export function createAgentBatch(plan: {
   accountId: string;
@@ -69,7 +76,28 @@ export function createAgentBatch(plan: {
   bond: AgentBondTerms | null;
 }): MixedTransaction[] {
   return [
-    { receiverId: plan.accountId, actions: createAccountActions(plan.publicKey) },
+    ...(plan.chain.key === "has-key"
+      ? []
+      : [{ receiverId: plan.accountId, actions: createAccountActions(plan.publicKey) }]),
+    ...groupCalls(fundCallsFor(plan.accountId, plan.chain, plan.bond)),
+  ];
+}
+
+/**
+ * The one approval of "Use a separate account instead": NEAR to the agent's implicit account
+ * (`accountId`, which the page worked out from the key), which the chain creates with the agent's
+ * key, then the same calls as `createAgentBatch`. A transfer is what every wallet sends. For an
+ * account that exists already, only the calls.
+ */
+export function implicitAgentBatch(plan: {
+  accountId: string;
+  chain: AgentOnChain;
+  bond: AgentBondTerms | null;
+}): MixedTransaction[] {
+  return [
+    ...(plan.chain.key === "has-key"
+      ? []
+      : [{ receiverId: plan.accountId, actions: implicitAccountActions() }]),
     ...groupCalls(fundCallsFor(plan.accountId, plan.chain, plan.bond)),
   ];
 }

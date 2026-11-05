@@ -1,7 +1,8 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup as cleanupAll, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { MyAgentsView } from "../components/account/MyAgentsView";
+import { clearApiToken, keepToken, signInTicket } from "../lib/apiToken";
 import { createWalletStore, type WalletStore } from "../lib/wallet";
 import { ALICE, accountWallet, row, SCOUT, serve, TOKEN, type World, world } from "./accountFakes";
 import { fakeProvider } from "./walletDoubles";
@@ -25,6 +26,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  clearApiToken();
   sessionStorage.clear();
 });
 
@@ -206,4 +208,61 @@ test("a_read_that_fails_says_so_and_retry_reads_again", async () => {
   state.failing.clear();
   await user.click(within(alert).getByRole("button", { name: "Retry" }));
   await waitFor(() => expect(screen.getAllByTestId("my-agent")).toHaveLength(3));
+});
+
+// ---- Agents set up as separate accounts ---------------------------------------------------------
+
+test("agents_set_up_as_separate_accounts_are_listed_once_signed_in_and_said_to_be_unlinked", async () => {
+  const state = aliceAndHerAgents();
+  state.implicit = [
+    {
+      account_id: OTHER,
+      name: "solo",
+      created_at: "2026-11-05T10:00:00.000Z",
+      agent: { status: "active", bond_token: TOKEN, bond_amount: "5000000" },
+    },
+    {
+      account_id: "ab".repeat(32),
+      name: "lone",
+      created_at: "2026-11-05T09:00:00.000Z",
+      agent: null,
+    },
+  ];
+  // Signed in already, as the Add an agent page leaves the tab.
+  keepToken(
+    { accountId: ALICE, token: "tok-alice", expiresAtMs: Date.now() + 3_600_000 },
+    signInTicket(),
+  );
+  open(state);
+  const list = await screen.findByTestId("implicit-agents");
+  expect(within(list).getByText("Set up by you, not linked on chain")).toBeTruthy();
+  const rows = within(list).getAllByTestId("implicit-agent");
+  expect(rows.map((one) => within(one).getByRole("link").getAttribute("href"))).toEqual([
+    `/agents/${OTHER}`,
+    `/agents/${"ab".repeat(32)}`,
+  ]);
+  expect(rows[0]?.textContent).toContain("Active");
+  expect(rows[1]?.textContent).toContain("Not registered yet");
+  // The list of agents under her is still the provider's own, from the index.
+  expect(screen.getAllByTestId("my-agent")).toHaveLength(3);
+});
+
+test("signed_out_the_page_offers_the_sign_in_that_lists_them_and_reads_nothing_first", async () => {
+  const state = world();
+  open(state);
+  const offer = await screen.findByTestId("implicit-agents-signin");
+  expect(offer.textContent).toContain("Sign in to Tender to list it");
+  expect(state.requests.filter((request) => request.includes("/v1/connect/"))).toEqual([]);
+  // An account with nothing set up that way, signed in: nothing more is shown.
+  cleanupAll();
+  keepToken(
+    { accountId: ALICE, token: "tok-alice", expiresAtMs: Date.now() + 3_600_000 },
+    signInTicket(),
+  );
+  const empty = world();
+  open(empty);
+  await screen.findByTestId("no-agents");
+  await waitFor(() => expect(empty.requests).toContain("GET /v1/connect/implicit"));
+  expect(screen.queryByTestId("implicit-agents")).toBeNull();
+  expect(screen.queryByTestId("implicit-agents-signin")).toBeNull();
 });
