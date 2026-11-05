@@ -3268,7 +3268,12 @@ test("post_task_uploads_and_passes_commitment", async () => {
   // The brief and the criteria go up as canonical JSON, and the chain gets the hash of those bytes.
   const brief = canonicalJson(BRIEF);
   const criteria = canonicalJson(CRITERIA);
-  const heldout = canonicalJson(HELDOUT);
+  // The held-out checks were given without a salt: the tool adds one of 32 fresh random bytes, so
+  // the commitment on chain cannot be found by hashing likely answers.
+  const [, heldout = new Uint8Array()] = api.uploadHeldout.mock.calls[0] ?? [];
+  const committed = JSON.parse(new TextDecoder().decode(heldout));
+  expect(committed).toEqual({ ...HELDOUT, salt: expect.stringMatching(/^[0-9a-f]{64}$/) });
+  expect(heldout).toEqual(canonicalJson(committed));
   expect(api.uploadBlob).toHaveBeenCalledTimes(2);
   expect(api.uploadBlob).toHaveBeenNthCalledWith(1, {
     kind: "brief",
@@ -3302,11 +3307,49 @@ test("post_task_uploads_and_passes_commitment", async () => {
     ...api.uploadHeldout.mock.invocationCallOrder,
   );
   expect(lastUpload).toBeLessThan(chain.postTask.mock.invocationCallOrder[0] ?? 0);
+  // The answer gives the document as committed, salt included: a scorecard that publishes it has
+  // to carry exactly this.
   expect(answer).toEqual({
     task_id: "12",
     tx_hash: "TX_POST",
     commit_deadline: "2026-11-04T10:00:00.000Z",
+    heldout: committed,
   });
+});
+
+test("post_task_salts_each_post_afresh_and_keeps_a_salt_it_is_given", async () => {
+  const { callJson, call, chain, api } = await connectWrite({
+    keyKind: "full_access",
+    judgeAccount: "judge.testnet",
+  });
+
+  type Posted = { heldout: { salt: string } };
+  // The same checks posted twice commit to two hashes.
+  const first = (await callJson("post_task", POST_ARGS)) as Posted;
+  const second = (await callJson("post_task", POST_ARGS)) as Posted;
+  expect(first.heldout.salt).not.toBe(second.heldout.salt);
+  const commitments = chain.postTask.mock.calls.map(([input]) => input.heldoutCommitment);
+  expect(new Set(commitments).size).toBe(2);
+
+  // A salt that is given is kept, and it is what the commitment is the hash of.
+  const salt = "ab".repeat(32);
+  const kept = (await callJson("post_task", {
+    ...POST_ARGS,
+    heldout: { ...HELDOUT, salt },
+  })) as Posted;
+  expect(kept.heldout).toEqual({ ...HELDOUT, salt });
+  const bytes = canonicalJson({ ...HELDOUT, salt });
+  expect(api.uploadHeldout).toHaveBeenLastCalledWith(sha256Hex(bytes), bytes);
+  expect(chain.postTask.mock.lastCall?.[0].heldoutCommitment).toBe(sha256Hex(bytes));
+
+  // One that is no salt is refused before anything is uploaded or sent.
+  const uploads = api.uploadBlob.mock.calls.length;
+  const posts = chain.postTask.mock.calls.length;
+  const bad = await call("post_task", { ...POST_ARGS, heldout: { ...HELDOUT, salt: "42" } });
+  expect(bad.isError).toBe(true);
+  expect(bad.text).toMatch(/^INVALID_HELDOUT: .*salt/);
+  expect(api.uploadBlob.mock.calls.length).toBe(uploads);
+  expect(chain.postTask.mock.calls.length).toBe(posts);
 });
 
 test("post_task_without_a_heldout_part_or_a_verifier_or_a_token", async () => {

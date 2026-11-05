@@ -155,7 +155,7 @@ export TENDER_SEEDS_PRIVATE_DIR=<private dir>
 pnpm seed --network testnet
 ```
 
-- `pnpm seed` reads each seed's `heldout.json` from the private directory. A seed whose file is missing stops the run before anything is posted.
+- `pnpm seed` reads each seed's `heldout.json` from the private directory. A seed whose file is missing, or has no `salt`, stops the run before anything is posted. `pnpm exec tsx scripts/salt-heldout.ts <private dir>` adds a salt of 32 random bytes to each file that has none (back the directory up first).
 - Held-out checks are single-use. They are published in the scorecard when the task is judged. The script skips a seed whose checks are already public or already used by a task of the same poster, so running it again posts nothing twice.
 - Back the private directory up somewhere that is not the repository and not the services host. The Docker build leaves out `seeds-private/`, but a directory elsewhere is never copied in.
 - If the variable is not set, the script looks for `seeds-private/` in the repository, which git ignores. Never put the directory inside `seeds/`, which is tracked. `scripts/check-public.test.ts` and `seeds/no-answers-in-tree.test.ts` fail if an answer-like value or a secret turns up in a tracked file.

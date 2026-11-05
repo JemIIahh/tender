@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import type { Heldout } from "@tender/shared";
+import type { HeldoutChecks } from "@tender/shared";
 import { expect, onTestFinished, test, vi } from "vitest";
 import type { P0Criteria } from "../src/intake";
 import {
@@ -46,7 +46,7 @@ const EXACT: P0Criteria = {
   has_heldout: true,
   normalize: ["trim"],
 };
-const EXACT_HELDOUT: Heldout = { exact: { expected: ["42"] } };
+const EXACT_HELDOUT: HeldoutChecks = { exact: { expected: ["42"] } };
 const EXACT_TASK = { criteria: EXACT, heldout: EXACT_HELDOUT };
 
 /** json_schema criteria over `schema`, with a pass mark of 100. */
@@ -58,13 +58,13 @@ const jsonSchema = (schema: Record<string, unknown>): P0Criteria => ({
   has_heldout: true,
   schema,
 });
-const X_IS_1: Heldout = { json_schema: { assertions: [{ path: "$.x", equals: 1 }] } };
+const X_IS_1: HeldoutChecks = { json_schema: { assertions: [{ path: "$.x", equals: 1 }] } };
 /** A tree: an array of arrays of arrays, as deep as the document goes. */
 const TREE_SCHEMA = {
   $defs: { node: { type: "array", items: { $ref: "#/$defs/node" } } },
   $ref: "#/$defs/node",
 };
-const ROOT_IS_EMPTY: Heldout = { json_schema: { assertions: [{ path: "$", equals: [] }] } };
+const ROOT_IS_EMPTY: HeldoutChecks = { json_schema: { assertions: [{ path: "$", equals: [] }] } };
 
 const REGEX: P0Criteria = {
   version: 1,
@@ -98,7 +98,7 @@ const workers = (): number =>
 
 test("a_worker_scores_as_the_scorers_do_on_this_thread", { timeout: 120_000 }, async () => {
   const deep = bytes("[".repeat(100_000) + "]".repeat(100_000));
-  const tasks: [P0Criteria, Heldout | null, Uint8Array[]][] = [
+  const tasks: [P0Criteria, HeldoutChecks | null, Uint8Array[]][] = [
     [EXACT, EXACT_HELDOUT, [bytes("42"), bytes(" 42\n"), bytes("41"), Uint8Array.of(0xff)]],
     // One worker scores them all, with the schema compiled once: on this thread each is compiled
     // for itself. Overflowing the stack in the validator leaves it as good as new.

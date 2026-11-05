@@ -72,6 +72,9 @@ async function postgresSchema(url: string): Promise<Db> {
  */
 export const TEST_NOW = 1_793_307_200_000_000_000n;
 
+/** A held-out document's salt: any 64 lowercase hex characters will do in a test. */
+export const SALT = "5a".repeat(32);
+
 /** The final block height of the fake chain. */
 export const TEST_FINAL_HEIGHT = 100n;
 

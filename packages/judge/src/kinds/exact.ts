@@ -1,10 +1,10 @@
-import type { Heldout, PublicCriteria } from "@tender/shared";
+import type { HeldoutChecks, PublicCriteria } from "@tender/shared";
 import type { EntryScore } from "../types";
 import { decodeUtf8, scored } from "./common";
 
 type ExactCriteria = Extract<PublicCriteria, { kind: "exact" }>;
-// `Heldout` is a union, so `Heldout["exact"]` does not compile: pick the member first.
-type ExactHeldout = Extract<Heldout, { exact: unknown }>["exact"];
+// `HeldoutChecks` is a union, so `HeldoutChecks["exact"]` does not compile: pick the member first.
+type ExactHeldout = Extract<HeldoutChecks, { exact: unknown }>["exact"];
 
 /**
  * What each `normalize` step does. A `Record` over the step names, so a step added to the

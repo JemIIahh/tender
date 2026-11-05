@@ -50,6 +50,7 @@ import {
   putHeldout,
   putResult,
   resetDb,
+  salted,
   taskView,
   testDb,
 } from "./helpers";
@@ -227,7 +228,7 @@ const EXACT = {
   has_heldout: true,
   normalize: ["trim", "lowercase"],
 };
-const HELDOUT = { exact: { expected: ["42", "forty-two"] } };
+const HELDOUT = salted({ exact: { expected: ["42", "forty-two"] } });
 const REGEX = {
   version: 1,
   kind: "regex_cases",
@@ -277,7 +278,7 @@ async function postJudged(
   const heldout = o.heldout === undefined ? HELDOUT : o.heldout;
   const view = taskView({
     criteria_hash: await putCriteria(db, o.criteria ?? EXACT),
-    heldout_commitment: heldout === null ? null : await putHeldout(db, heldout),
+    heldout_commitment: heldout === null ? null : await putHeldout(db, salted(heldout)),
     ...o.view,
   });
   await insertTask(db, view, "accepted");
@@ -406,9 +407,10 @@ test("judge_picks_best_and_publishes_heldout", async () => {
   ]);
   expect(card.scorecard.entries[3]?.reasons).toEqual(["expected one of 2 accepted answers"]);
 
-  // It publishes the held-out checks: the scorecard carries them, they hash to the commitment on
-  // chain, and their own blob is public now.
+  // It publishes the held-out checks: the scorecard carries them with their salt, they hash to the
+  // commitment on chain, and their own blob is public now.
   expect(card.written.heldout).toEqual(HELDOUT);
+  expect(card.written.heldout).toHaveProperty("salt", HELDOUT.salt);
   expect(sha256Hex(canonicalJson(card.written.heldout))).toBe(commitment);
   expect(await isPublic(db, commitment)).toBe(true);
   // The task stays accepted; the chain says it is settled.
@@ -478,8 +480,9 @@ test("a_tests_task_is_judged_with_hostile_entries_among_the_answers", {
     "case 2 (5): wrong output",
     "case 3 (9): wrong output",
   ]);
-  // The held-out cases are published, as for every kind, and hash to the commitment.
-  expect(card.written.heldout).toEqual({ tests: { cases } });
+  // The held-out cases are published with their salt, as for every kind, and hash to the
+  // commitment.
+  expect(card.written.heldout).toEqual(salted({ tests: { cases } }));
   expect(sha256Hex(canonicalJson(card.written.heldout))).toBe(commitment);
   expect(warn).not.toHaveBeenCalled();
   // The task's workers are gone with it.
@@ -512,7 +515,10 @@ test("mismatched_or_missing_content_scores_zero", async () => {
   const served = await putResult(db, "42", "mismatch.test.near");
   const revealed = await putResult(db, "forty-two", "mismatch.test.near");
   // Another task's held-out checks, private, under a hash that its task shows on chain.
-  const othersHeldout = await putHeldout(db, { exact: { expected: ["another task's answer"] } });
+  const othersHeldout = await putHeldout(
+    db,
+    salted({ exact: { expected: ["another task's answer"] } }),
+  );
   const extra = [
     // Reveals the hash of other bytes than its URI serves.
     entry("mismatch.test.near", revealed, blobUri(served), 1n),
@@ -720,7 +726,7 @@ const jsonSchemaCriteria = (schema: object) => ({
   has_heldout: true,
   schema,
 });
-const X_IS_1 = { json_schema: { assertions: [{ path: "$.x", equals: 1 }] } };
+const X_IS_1 = salted({ json_schema: { assertions: [{ path: "$.x", equals: 1 }] } });
 
 test("judge_rejects_criteria_that_fail_the_criteria_check_now", async () => {
   // P05-R12: the task was accepted under an older rule, which let $dynamicRef through; Ajv would
@@ -796,9 +802,12 @@ test("a_schema_that_compiles_past_the_budget_is_rejected_at_intake_and_at_judgin
     taskView({
       id: "6",
       criteria_hash: criteriaHash,
-      heldout_commitment: await putHeldout(db, {
-        json_schema: { assertions: [{ path: "$.p0", equals: "a" }] },
-      }),
+      heldout_commitment: await putHeldout(
+        db,
+        salted({
+          json_schema: { assertions: [{ path: "$.p0", equals: "a" }] },
+        }),
+      ),
     }),
   );
   const short = { scoringLimits: { compileBudgetMs: 25 } };
@@ -850,9 +859,12 @@ test("judging_gives_the_compile_check_four_times_intakes_budget", {
     taskView({
       id: "6",
       criteria_hash: await putCriteria(db, criteria),
-      heldout_commitment: await putHeldout(db, {
-        json_schema: { assertions: [{ path: "$.x", equals: 6 }] },
-      }),
+      heldout_commitment: await putHeldout(
+        db,
+        salted({
+          json_schema: { assertions: [{ path: "$.x", equals: 6 }] },
+        }),
+      ),
     }),
   );
   expect(await intakeTask(judgeDeps(db, fakeChain(null), budget), 6n)).toBe("rejected");
@@ -2524,7 +2536,7 @@ test("fetch_reads_our_own_blobs_from_the_database", async () => {
 
   // A blob of another kind is no entry's content, whether it is private, as the held-out checks
   // of an open task are, or public.
-  const heldout = await putHeldout(db, { exact: { expected: ["secret"] } });
+  const heldout = await putHeldout(db, salted({ exact: { expected: ["secret"] } }));
   const criteria = await putCriteria(db, EXACT);
   for (const other of [heldout, criteria]) {
     expect(await fetchEntryContent(deps, blobUri(other), NO_NETWORK)).toEqual({
@@ -2618,7 +2630,8 @@ test("judge_tick_clears_a_waiting_reason_that_outlives_the_wait", async () => {
 test("judge_tick_goes_on_after_a_task_fails", async () => {
   const criteriaHash = await putCriteria(db, EXACT);
   // Held-out checks of its own for each task: they are single-use.
-  const checksOf = (id: string) => putHeldout(db, { exact: { expected: ["42", `task ${id}`] } });
+  const checksOf = (id: string) =>
+    putHeldout(db, salted({ exact: { expected: ["42", `task ${id}`] } }));
   const sha = await putResult(db, "42", "alice.test.near", 8n);
   const views: TaskView[] = [];
   for (const id of ["7", "8"]) {
@@ -2664,7 +2677,7 @@ test("judge_tick_takes_no_task_after_its_signal_aborts", async () => {
   const criteriaHash = await putCriteria(db, EXACT);
   const views: TaskView[] = [];
   for (const id of ["7", "8"]) {
-    const checks = await putHeldout(db, { exact: { expected: ["42", `task ${id}`] } });
+    const checks = await putHeldout(db, salted({ exact: { expected: ["42", `task ${id}`] } }));
     views.push(taskView({ id, criteria_hash: criteriaHash, heldout_commitment: checks }));
   }
   for (const view of views) await insertTask(db, view);
@@ -2709,7 +2722,7 @@ test("intake_stops_at_its_budget_and_the_next_tick_takes_up_with_the_task_after_
   // in two tasks, then goes on to judging, and the next tick starts at once with the third.
   const criteriaHash = await putCriteria(db, EXACT);
   for (const id of ["1", "2", "3", "4", "5"]) {
-    const checks = await putHeldout(db, { exact: { expected: ["42", `task ${id}`] } });
+    const checks = await putHeldout(db, salted({ exact: { expected: ["42", `task ${id}`] } }));
     await insertTask(db, taskView({ id, criteria_hash: criteriaHash, heldout_commitment: checks }));
   }
   let reads = 0;
@@ -2746,7 +2759,7 @@ test("an_intake_that_is_slow_every_time_does_not_keep_the_tasks_behind_it_from_b
   // is tried again only after the tasks behind it have had their turn.
   const criteriaHash = await putCriteria(db, EXACT);
   for (const id of ["1", "2", "3"]) {
-    const checks = await putHeldout(db, { exact: { expected: ["42", `task ${id}`] } });
+    const checks = await putHeldout(db, salted({ exact: { expected: ["42", `task ${id}`] } }));
     await insertTask(db, taskView({ id, criteria_hash: criteriaHash, heldout_commitment: checks }));
   }
   // The database fails for task 1 alone, as it does for a task whose intake cannot go on.
@@ -2804,9 +2817,12 @@ async function postTasks(
     const view = taskView({
       id,
       criteria_hash: criteriaHash,
-      heldout_commitment: await putHeldout(db, {
-        exact: { expected: ["42", "forty-two", `task ${id}`] },
-      }),
+      heldout_commitment: await putHeldout(
+        db,
+        salted({
+          exact: { expected: ["42", "forty-two", `task ${id}`] },
+        }),
+      ),
       ...deadlines,
     });
     await insertTask(db, view, "accepted");

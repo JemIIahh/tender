@@ -386,11 +386,14 @@ function readChild(dir: string, slug: string): ChildSpec {
   );
   let heldout: Doc | undefined;
   if (criteria.has_heldout) {
-    const checks = parsed(
-      HeldoutSchema,
-      readJson(dir, slug, "heldout.json"),
-      `${slug}/heldout.json`,
-    );
+    const json = readJson(dir, slug, "heldout.json");
+    if (typeof json === "object" && json !== null && !Object.hasOwn(json, "salt")) {
+      throw new Error(
+        `${slug}/heldout.json has no salt, so its commitment could be guessed: add one with ` +
+          "pnpm exec tsx scripts/salt-heldout.ts <the folder of the sub-tasks>",
+      );
+    }
+    const checks = parsed(HeldoutSchema, json, `${slug}/heldout.json`);
     if (!heldoutMatchesCriteria(criteria, checks)) {
       throw new Error(`${slug}/heldout.json is not a held-out document of kind ${criteria.kind}`);
     }

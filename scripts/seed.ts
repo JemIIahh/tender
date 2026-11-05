@@ -282,6 +282,11 @@ function parsed<T>(schema: Schema<T>, json: unknown, where: string): T {
   throw new Error(`${where} does not fit its schema, first at ${fault}`);
 }
 
+/** Whether `json` is an object with a `salt` key, as a held-out document needs (`HeldoutSchema`). */
+function hasSalt(json: unknown): boolean {
+  return typeof json === "object" && json !== null && Object.hasOwn(json, "salt");
+}
+
 /** The JSON in `dir/name`, in an object because the JSON itself can be `null`. Null: no such file. */
 async function readJson(
   dir: string,
@@ -430,6 +435,12 @@ async function prepare(
     if (heldoutFile === null) {
       throw new Error(
         `held-out for ${slug} not found in ${heldoutDir}; set ${PRIVATE_DIR_VARIABLE}`,
+      );
+    }
+    if (!hasSalt(heldoutFile.json)) {
+      throw new Error(
+        `${slug}/heldout.json has no salt, so its commitment could be guessed: add one with ` +
+          `pnpm exec tsx scripts/salt-heldout.ts ${heldoutDir}`,
       );
     }
     const checks = parsed(HeldoutSchema, heldoutFile.json, `${slug}/heldout.json`);

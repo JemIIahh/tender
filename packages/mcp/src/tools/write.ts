@@ -17,6 +17,7 @@ import {
   checkPickShares,
   computeCommitment,
   DelegateViewSchema,
+  type Heldout,
   HeldoutSchema,
   HIRE_MONEY_NOTE,
   HIRE_REQUEST_MAX_CHARS,
@@ -38,6 +39,7 @@ import {
   type Scorecard,
   ScorecardSchema,
   STORAGE_MIN_DEPOSIT,
+  saltHeldout,
   scorecardUpload,
   sha256Hex,
   storageShortfall,
@@ -1679,8 +1681,12 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           .record(z.string(), z.unknown())
           .optional()
           .describe(
-            "The held-out document, with one key, the criteria kind. Give it exactly when " +
-              "criteria.has_heldout is true. It stays private until the task is scored",
+            "The held-out document: one key, the criteria kind, with that kind's checks. Give it " +
+              "exactly when criteria.has_heldout is true. This tool adds a salt of 32 fresh random " +
+              "bytes when it has none, so that the commitment on chain cannot be guessed from a " +
+              "short answer; the result gives the document as committed, salt included, which a " +
+              "scorecard of yours must publish to match the commitment. The API serves it to " +
+              "nobody until the task is judged; the scorecard then makes it public",
           ),
         reward: z.string().describe("The reward, a whole number of the token's smallest unit"),
         token: z
@@ -1754,8 +1760,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         );
       }
       let heldoutBytes: Uint8Array | undefined;
+      let committedHeldout: Heldout | undefined;
       if (input.heldout !== undefined) {
-        const heldout = HeldoutSchema.safeParse(input.heldout);
+        const heldout = HeldoutSchema.safeParse(saltHeldout(input.heldout));
         if (!heldout.success) throw new ToolError("INVALID_HELDOUT", issuesOf(heldout.error));
         if (!heldoutMatchesCriteria(criteria.data, heldout.data)) {
           throw new ToolError(
@@ -1764,6 +1771,7 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
           );
         }
         heldoutBytes = bytesToPublish("held-out document", "post_task", heldout.data);
+        committedHeldout = heldout.data;
       }
       const briefBytes = bytesToPublish("brief", "post_task", brief.data);
       const criteriaBytes = bytesToPublish("public criteria", "post_task", criteria.data);
@@ -1805,6 +1813,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
         task_id: posted.taskId.toString(),
         tx_hash: posted.txHash,
         commit_deadline: created === undefined ? null : isoOfNs(created.data.commit_deadline),
+        // The document the commitment is the hash of, its salt included: a scorecard that
+        // publishes the checks has to carry exactly this.
+        ...(committedHeldout !== undefined && { heldout: committedHeldout }),
       });
     }),
   );

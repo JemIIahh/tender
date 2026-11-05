@@ -102,7 +102,8 @@ const briefOf = (slug: string) => ({
   output: { format: "text", max_bytes: 100 },
 });
 
-const heldoutOf = (slug: string) => ({ exact: { expected: [slug] } });
+/** A seed's held-out document: its checks, and a salt that is the seed's own. */
+const heldoutOf = (slug: string) => ({ exact: { expected: [slug] }, salt: sha256Hex(slug) });
 
 /** The text of a file the seed's folder holds. A string is written as it is, anything else as JSON. */
 type FileSpec = string | object | null;
@@ -672,6 +673,22 @@ test("a_seed_whose_heldout_is_not_found_stops_the_run_before_any_seed_is_posted"
 
   expect((failure as Error).message).toBe(
     `held-out for beta not found in ${PRIVATE_OF.get(dir)}; set TENDER_SEEDS_PRIVATE_DIR`,
+  );
+  expect(trace).toEqual(UNTOUCHED);
+  expect(lines).toEqual([]);
+  expect(chain.posts).toEqual([]);
+});
+
+test("a_heldout_file_without_a_salt_stops_the_run_before_any_seed_is_posted", async () => {
+  // Without a salt the commitment of a short answer is found by hashing the likely answers, and
+  // the API and the Judge refuse such checks: the run names the script that adds one.
+  const dir = await seedsDir({ alpha: {}, beta: { heldout: { exact: { expected: ["beta"] } } } });
+
+  const { failure, trace, lines, chain } = await run(dir);
+
+  expect((failure as Error).message).toBe(
+    "beta/heldout.json has no salt, so its commitment could be guessed: add one with " +
+      `pnpm exec tsx scripts/salt-heldout.ts ${PRIVATE_OF.get(dir)}`,
   );
   expect(trace).toEqual(UNTOUCHED);
   expect(lines).toEqual([]);
@@ -1437,7 +1454,7 @@ test("seeds_that_share_their_heldout_checks_are_refused_before_anything_is_asked
   // beta's file holds the document that alpha's does, written another way: one set of checks.
   const { failure, trace, lines } = await run({
     alpha: {},
-    beta: { heldout: '{"exact":\n{"expected": ["alpha"]}}' },
+    beta: { heldout: `{"salt": "${sha256Hex("alpha")}",\n"exact":\n{"expected": ["alpha"]}}` },
     gamma: { heldout: heldoutOf("alpha") },
   });
 
@@ -1702,12 +1719,12 @@ test("a_seed_that_is_wrong_stops_the_run_before_the_api_or_the_chain_is_asked_an
     ],
     [
       "checks of another kind",
-      { heldout: { regex_cases: { match: ["a"], no_match: ["b"] } } },
+      { heldout: { regex_cases: { match: ["a"], no_match: ["b"] }, salt: sha256Hex("beta") } },
       /^beta\/heldout\.json is not a held-out document of kind exact$/,
     ],
     [
       "checks with nothing in them",
-      { heldout: { exact: { expected: [] } } },
+      { heldout: { exact: { expected: [] }, salt: sha256Hex("beta") } },
       /^beta\/heldout\.json does not fit its schema, first at exact\.expected: /,
     ],
   ];

@@ -1,11 +1,11 @@
-import type { Heldout, PublicCriteria } from "@tender/shared";
+import type { HeldoutChecks, PublicCriteria } from "@tender/shared";
 import type { EntryScore } from "../types";
 
 /**
- * The held-out part of the criteria of kind `K`. `Heldout` is a union, so `Heldout[K]` does not
- * compile: pick the member first.
+ * The held-out part of the criteria of kind `K`. `HeldoutChecks` is a union, so
+ * `HeldoutChecks[K]` does not compile: pick the member first.
  */
-export type HeldoutOf<K extends string> = Extract<Heldout, Record<K, unknown>>[K];
+export type HeldoutOf<K extends string> = Extract<HeldoutChecks, Record<K, unknown>>[K];
 
 /**
  * The text of `content`, or `null` when it is not valid UTF-8. Bad bytes are not repaired into

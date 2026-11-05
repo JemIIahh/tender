@@ -12,6 +12,15 @@ export const POSTER = "poster.test.near";
 export const TEAM_POSTER = "team.test.near";
 export const PUBLIC_URL = "http://api.test";
 
+/** A held-out document's salt: any 64 lowercase hex characters will do in a test. */
+export const SALT = "5a".repeat(32);
+
+/** `checks` as a held-out document: with `SALT`, which `HeldoutSchema` asks for. */
+export const salted = <T extends object>(checks: T): T & { salt: string } => ({
+  ...checks,
+  salt: SALT,
+});
+
 /** The time every test runs at unless it sets its own. */
 export const NOW = new Date("2026-11-08T12:00:00.000Z");
 
