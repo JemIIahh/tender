@@ -70,8 +70,8 @@ export const AGENT_ACCOUNT_DEPOSIT = 5n * 10n ** 23n;
 
 /**
  * The gas the owner's wallet attaches to the call of `setup` on the new account: 30 Tgas. The
- * transaction that creates the account burns about 9 Tgas in all (contract/sandbox's agent_setup
- * test prints it), and what is not burnt is refunded.
+ * transaction that creates the account burns about 10.5 Tgas in all, its receipts included
+ * (contract/sandbox's agent_setup test prints it: 10.54), and what is not burnt is refunded.
  */
 export const AGENT_SETUP_GAS = 30n * 10n ** 12n;
 
@@ -504,6 +504,8 @@ export type ConnectRegistered = z.infer<typeof ConnectRegisteredSchema>;
 export const ConnectImplicitAgentsSchema = z.object({
   agents: z.array(
     z.object({
+      /** The code's id, by which its owner dismisses an agent that never registered. */
+      id: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
       account_id: AccountIdSchema,
       name: AgentNameAnswer,
       created_at: z.iso.datetime(),
@@ -512,3 +514,7 @@ export const ConnectImplicitAgentsSchema = z.object({
   ),
 });
 export type ConnectImplicitAgents = z.infer<typeof ConnectImplicitAgentsSchema>;
+
+/** `POST /v1/connect/codes/:id/dismiss`: the implicit agent's record is gone. */
+export const ConnectDismissedSchema = z.object({ dismissed: z.literal(true) });
+export type ConnectDismissed = z.infer<typeof ConnectDismissedSchema>;

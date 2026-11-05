@@ -212,57 +212,125 @@ test("a_read_that_fails_says_so_and_retry_reads_again", async () => {
 
 // ---- Agents set up as separate accounts ---------------------------------------------------------
 
-test("agents_set_up_as_separate_accounts_are_listed_once_signed_in_and_said_to_be_unlinked", async () => {
-  const state = aliceAndHerAgents();
+const SOLO = "ab".repeat(32);
+const LONE = "cd".repeat(32);
+
+/** Alice's two agents on separate accounts: one registered, one never funded. */
+function withImplicit(state: World): World {
   state.implicit = [
     {
-      account_id: OTHER,
+      id: "SOLOSOLOSOLOSOLOSOLO01",
+      account_id: SOLO,
       name: "solo",
       created_at: "2026-11-05T10:00:00.000Z",
       agent: { status: "active", bond_token: TOKEN, bond_amount: "5000000" },
-    },
+    } as World["implicit"][number],
     {
-      account_id: "ab".repeat(32),
+      id: "LONELONELONELONELONE01",
+      account_id: LONE,
       name: "lone",
       created_at: "2026-11-05T09:00:00.000Z",
       agent: null,
-    },
+    } as World["implicit"][number],
   ];
-  // Signed in already, as the Add an agent page leaves the tab.
+  return state;
+}
+
+const signedIn = () =>
   keepToken(
     { accountId: ALICE, token: "tok-alice", expiresAtMs: Date.now() + 3_600_000 },
     signInTicket(),
   );
+
+test("agents_set_up_as_separate_accounts_are_listed_once_signed_in_and_said_to_be_unlinked", async () => {
+  const state = withImplicit(aliceAndHerAgents());
+  signedIn();
   open(state);
   const list = await screen.findByTestId("implicit-agents");
   expect(within(list).getByText("Set up by you, not linked on chain")).toBeTruthy();
   const rows = within(list).getAllByTestId("implicit-agent");
   expect(rows.map((one) => within(one).getByRole("link").getAttribute("href"))).toEqual([
-    `/agents/${OTHER}`,
-    `/agents/${"ab".repeat(32)}`,
+    `/agents/${SOLO}`,
+    `/agents/${LONE}`,
   ]);
   expect(rows[0]?.textContent).toContain("Active");
+  // A registered agent cannot be dismissed; one that never registered can.
+  expect(within(rows[0] as HTMLElement).queryByRole("button", { name: "Dismiss" })).toBeNull();
   expect(rows[1]?.textContent).toContain("Not registered yet");
   // The list of agents under her is still the provider's own, from the index.
   expect(screen.getAllByTestId("my-agent")).toHaveLength(3);
 });
 
-test("signed_out_the_page_offers_the_sign_in_that_lists_them_and_reads_nothing_first", async () => {
+test("an_agent_nothing_reached_is_dismissed_and_one_that_got_anything_is_kept", async () => {
+  const state = withImplicit(aliceAndHerAgents());
+  // Its storage reached Tender: the record is the only link to it, so it stays.
+  state.storage.add(LONE);
+  signedIn();
+  const { user } = open(state);
+  const lone = (await screen.findAllByTestId("implicit-agent"))[1] as HTMLElement;
+  await user.click(within(lone).getByRole("button", { name: "Dismiss" }));
+  expect((await within(lone).findByTestId("implicit-agent-note")).textContent).toBe(
+    "Something already reached this account, so its record is kept.",
+  );
+  expect(state.requests.some((request) => request.endsWith("/dismiss"))).toBe(false);
+
+  // Nothing reached it: it goes, and the list is read again.
+  state.storage.delete(LONE);
+  await user.click(within(lone).getByRole("button", { name: "Dismiss" }));
+  await waitFor(() => expect(screen.getAllByTestId("implicit-agent")).toHaveLength(1));
+  expect(state.requests).toContain("POST /v1/connect/codes/LONELONELONELONELONE01/dismiss");
+  expect(state.implicit.map((entry) => entry.account_id)).toEqual([SOLO]);
+});
+
+test("the_sign_in_line_shows_only_where_it_can_find_something", async () => {
+  // Signed out, and this tab never saw a separate account set up: nothing is offered, and nothing
+  // is read.
   const state = world();
   open(state);
-  const offer = await screen.findByTestId("implicit-agents-signin");
-  expect(offer.textContent).toContain("Sign in to Tender to list it");
+  await screen.findByTestId("no-agents");
+  expect(screen.queryByTestId("implicit-agents-signin")).toBeNull();
   expect(state.requests.filter((request) => request.includes("/v1/connect/"))).toEqual([]);
-  // An account with nothing set up that way, signed in: nothing more is shown.
+
+  // This tab saw one set up: the sign-in line is offered.
   cleanupAll();
-  keepToken(
-    { accountId: ALICE, token: "tok-alice", expiresAtMs: Date.now() + 3_600_000 },
-    signInTicket(),
+  sessionStorage.setItem(`tender.connect.implicit.${ALICE}`, "1");
+  open(world());
+  expect((await screen.findByTestId("implicit-agents-signin")).textContent).toContain(
+    "Sign in to Tender to list them",
   );
+
+  // Signed in with nothing set up that way: nothing more is shown.
+  cleanupAll();
+  sessionStorage.clear();
+  signedIn();
   const empty = world();
   open(empty);
   await screen.findByTestId("no-agents");
   await waitFor(() => expect(empty.requests).toContain("GET /v1/connect/implicit"));
   expect(screen.queryByTestId("implicit-agents")).toBeNull();
   expect(screen.queryByTestId("implicit-agents-signin")).toBeNull();
+});
+
+test("a_sign_in_that_ended_offers_a_new_one_and_a_failed_read_says_so_with_retry", async () => {
+  // The API no longer takes the tab's token: the sign-in line, not silence.
+  const state = withImplicit(world());
+  state.implicitStatus = 401;
+  signedIn();
+  open(state);
+  expect((await screen.findByTestId("implicit-agents-signin")).textContent).toContain(
+    "Your sign-in to Tender has ended",
+  );
+
+  // The API is away: one line, with Retry, which reads again.
+  cleanupAll();
+  const away = withImplicit(world());
+  away.implicitStatus = 500;
+  signedIn();
+  const { user } = open(away);
+  const error = await screen.findByTestId("implicit-agents-error");
+  expect(error.textContent).toContain("Couldn't list the agents you set up as separate accounts.");
+  expect(error.textContent).not.toContain("a server's words");
+  away.implicitStatus = null;
+  await user.click(within(error).getByRole("button", { name: "Retry" }));
+  expect(await screen.findByTestId("implicit-agents")).toBeTruthy();
 });

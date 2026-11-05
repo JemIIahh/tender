@@ -18,6 +18,8 @@ import {
   ConnectCodeCreatedSchema,
   type ConnectCodeState,
   ConnectCodeStateSchema,
+  type ConnectDismissed,
+  ConnectDismissedSchema,
   type ConnectImplicitAgents,
   ConnectImplicitAgentsSchema,
   type CreateServiceRequest,
@@ -446,6 +448,16 @@ export const api = {
   /** `GET /v1/connect/implicit`: the agents this account set up as implicit accounts, newest first. */
   implicitAgents(token: string): Promise<ConnectImplicitAgents> {
     return get("/connect/implicit", ConnectImplicitAgentsSchema, undefined, token);
+  },
+
+  /**
+   * `POST /v1/connect/codes/:id/dismiss`: forgets an implicit agent of this account that the index
+   * does not list. Needs a token from a full-access key. It throws for an id that is no code id,
+   * without asking.
+   */
+  dismissImplicitAgent(token: string, id: string): Promise<ConnectDismissed> {
+    if (!CONNECT_ID.test(id)) return notAnId("dismissImplicitAgent", "a connect code id", id);
+    return post(`/connect/codes/${id}/dismiss`, ConnectDismissedSchema, { token });
   },
 
   /** `POST /v1/services`: lists a service of one of the signed-in account's agents. */

@@ -223,12 +223,17 @@ export function rpcKeyState(rpcUrl: string): ConnectChain["keyState"] {
   };
 }
 
-/** The chain's `accountExists` through an RPC node (`view_account`), at the last final block. */
+/**
+ * The chain's `accountExists` through an RPC node (`view_account`), at the newest block
+ * (`optimistic`), not the last final one: a "no" lets the key file move off `<name>.<owner>`, so it
+ * is read where an account made a block or two ago is already seen. A block that is later dropped
+ * can only make the answer "yes" wrongly, which refuses the move: the safe way to be wrong.
+ */
 export function rpcAccountExists(rpcUrl: string): ConnectChain["accountExists"] {
   const provider = new JsonRpcProvider({ url: rpcUrl });
   return async (accountId) => {
     try {
-      await provider.viewAccount({ accountId, blockQuery: { finality: "final" } });
+      await provider.viewAccount({ accountId, blockQuery: { finality: "optimistic" } });
       return true;
     } catch (error) {
       if (error instanceof AccountDoesNotExistError) return false;

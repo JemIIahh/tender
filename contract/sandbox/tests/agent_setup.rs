@@ -50,6 +50,28 @@ async fn full_access_keys(env: &Env, who: &AccountId) -> anyhow::Result<(Vec<Str
     Ok((full, keys.len()))
 }
 
+/// What is left on `who` after it sends all but `keep` of its balance to `to`: the transfer's own
+/// gas comes out of `keep`. The error, if the chain refused the transfer, as text. The gas refunds
+/// of `who`'s earlier calls land first, a few blocks on, so that the balance read is the whole of it.
+async fn send_all_but(
+    env: &Env,
+    who: &Account,
+    to: &AccountId,
+    keep: NearToken,
+) -> anyhow::Result<Result<u128, String>> {
+    env.worker.fast_forward(5).await?;
+    let balance = who.view_account().await?.balance.as_yoctonear();
+    let amount = NearToken::from_yoctonear(balance - keep.as_yoctonear());
+    match who.transfer_near(to, amount).await {
+        Err(error) => Ok(Err(format!("{error:?}"))),
+        Ok(r) if r.is_failure() => Ok(Err(failure_text(&r))),
+        Ok(_) => {
+            env.worker.fast_forward(5).await?;
+            Ok(Ok(who.view_account().await?.balance.as_yoctonear()))
+        }
+    }
+}
+
 /// The contract's owner sets a bond of `BOND` in the test token.
 async fn set_bond(env: &Env) -> anyhow::Result<()> {
     let bond = json!({ "token": env.token.id(), "amount": BOND.to_string() });
@@ -156,6 +178,11 @@ async fn the_owners_transaction_gives_the_sub_account_the_agents_key_alone() -> 
             .transfer_near(owner.id(), NearToken::from_millinear(100))
             .await?,
     )?;
+    // Its 2,187 bytes lock 0.02187 NEAR (over the 770 bytes an account may hold for nothing): the
+    // chain refuses to let it keep only 0.5 milliNEAR.
+    let drained = send_all_but(&env, &agent, owner.id(), NearToken::from_micronear(500)).await?;
+    let refused = drained.expect_err("a sub-account with its setup code cannot drop to 0.5 mNEAR");
+    assert!(refused.contains("LackBalanceForState"), "{refused}");
 
     // The parent, a second time, with a key of its own: refused, and the keys are as they were.
     let other = SecretKey::from_random(KeyType::ED25519)
@@ -301,10 +328,11 @@ async fn an_implicit_account_needs_only_a_transfer_and_has_no_provider() -> anyh
 
     done(owner.transfer_near(&implicit, ACCOUNT_DEPOSIT).await?)?;
     let details = env.worker.view_account(&implicit).await?;
+    // At most 770 bytes: a zero-balance account, which locks nothing (checked below).
+    assert!(details.storage_usage <= 770, "{}", details.storage_usage);
     println!(
-        "storage: the implicit account stores {} bytes, locking {} yoctoNEAR",
-        details.storage_usage,
-        u128::from(details.storage_usage) * 10u128.pow(19),
+        "storage: the implicit account stores {} bytes",
+        details.storage_usage
     );
     assert_eq!(
         full_access_keys(&env, &implicit).await?,
@@ -314,5 +342,17 @@ async fn an_implicit_account_needs_only_a_transfer_and_has_no_provider() -> anyh
     fund(&env, &owner, &implicit).await?;
     let agent = Account::from_secret_key(implicit, key, &env.worker);
     registers_itself(&env, &agent, None).await?;
+    // Its 182 bytes lock nothing: an account of at most 770 bytes needs no balance for its storage
+    // (zero-balance accounts), so it can keep under 0.5 milliNEAR, far below 182 bytes' 1.82.
+    let left = send_all_but(&env, &agent, owner.id(), NearToken::from_micronear(500))
+        .await?
+        .map_err(|refused| {
+            anyhow::anyhow!("an implicit account was held to a balance: {refused}")
+        })?;
+    assert!(
+        left < NearToken::from_micronear(500).as_yoctonear(),
+        "{left}"
+    );
+    println!("storage: the implicit account keeps {left} yoctoNEAR after sending the rest away");
     Ok(())
 }

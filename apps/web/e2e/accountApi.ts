@@ -693,6 +693,7 @@ export async function routeConnect(page: Page, account: string): Promise<Connect
             ? []
             : [
                 {
+                  id: CONNECT_ID,
                   account_id: implicit,
                   name: code.name,
                   created_at: new Date(Date.now() - 60_000).toISOString(),

@@ -601,12 +601,14 @@ test("the_owners_implicit_agents_are_listed_and_kept_past_their_day", async () =
   expect(list.headers.get("cache-control")).toBe("no-store");
   expect(ConnectImplicitAgentsSchema.parse(list.body).agents).toEqual([
     {
+      id: b.id,
       account_id: implicitAccountOf(keyB),
       name: "beta",
       created_at: new Date(Number((TEST_NOW + MINUTE_NS) / 1_000_000n)).toISOString(),
       agent: null,
     },
     {
+      id: a.id,
       account_id: implicitAccountOf(keyA),
       name: "alpha",
       created_at: new Date(Number(TEST_NOW / 1_000_000n)).toISOString(),
@@ -625,6 +627,50 @@ test("the_owners_implicit_agents_are_listed_and_kept_past_their_day", async () =
   expect((await stateOf(c.id)).status).toBe(404);
   expect((await stateOf(a.id)).status).toBe(200);
   expect(ConnectImplicitAgentsSchema.parse((await implicitAgents()).body).agents).toHaveLength(2);
+});
+
+const dismiss = (id: string, o: { account?: string; key?: KeyKind } = {}) =>
+  send("POST", `/v1/connect/codes/${id}/dismiss`, { account: o.account ?? OWNER, ...o });
+
+test("the_owner_dismisses_an_implicit_agent_the_index_does_not_list_and_nothing_else", async () => {
+  const key = publicKeyOf();
+  const solo = await makeCode("solo");
+  await attach(solo.code, key);
+  await toImplicit(solo.id);
+
+  // Only the owner's own key, and only the owner's own code.
+  const fnKey = await dismiss(solo.id, { key: "function_call" });
+  expect(fnKey.status).toBe(403);
+  expect((fnKey.body as ErrorBody).error).toBe("full_access_required");
+  expect((await dismiss(solo.id, { account: "mallory.testnet" })).status).toBe(404);
+  expect((await send("POST", `/v1/connect/codes/${solo.id}/dismiss`, {})).status).toBe(401);
+  // A code on the sub-account is not dismissed: it goes by itself after its day.
+  const sub = await makeCode("sub");
+  expect((await dismiss(sub.id)).status).toBe(404);
+  expect((await stateOf(sub.id)).status).toBe(200);
+
+  // An agent the index lists stays.
+  const listed = await makeCode("listed");
+  const listedKey = publicKeyOf();
+  await attach(listed.code, listedKey);
+  await toImplicit(listed.id);
+  await indexAgent(implicitAccountOf(listedKey) ?? "");
+  const refused = await dismiss(listed.id);
+  expect(refused.status).toBe(409);
+  expect((refused.body as ErrorBody).error).toBe("registered");
+  expect((await stateOf(listed.id)).status).toBe(200);
+
+  // The unfunded one goes: its row, its code and its place in the list.
+  const done = await dismiss(solo.id);
+  expect(done.status).toBe(200);
+  expect(done.headers.get("cache-control")).toBe("no-store");
+  expect(done.body).toEqual({ dismissed: true });
+  expect((await stateOf(solo.id)).status).toBe(404);
+  expect((await lookup(solo.code)).status).toBe(404);
+  expect(
+    ConnectImplicitAgentsSchema.parse((await implicitAgents()).body).agents.map((a) => a.name),
+  ).toEqual(["listed"]);
+  expect((await dismiss(solo.id)).status).toBe(404);
 });
 
 // ---- Limits -----------------------------------------------------------------------------------

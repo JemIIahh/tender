@@ -223,7 +223,7 @@ describe("what the owner's wallet pays", () => {
     ]);
   });
 
-  test("the_setup_call_has_room_over_the_9_tgas_the_sandbox_burns", () => {
+  test("the_setup_call_has_room_over_the_10_5_tgas_the_sandbox_burns", () => {
     // contract/sandbox/tests/agent_setup.rs sends `setup` with the same 30 Tgas (`SETUP_GAS`).
     expect(AGENT_SETUP_GAS).toBe(30n * 10n ** 12n);
   });

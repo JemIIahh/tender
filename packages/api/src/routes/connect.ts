@@ -9,6 +9,7 @@ import {
   type ConnectCodeCreated,
   ConnectCodeRequestSchema,
   type ConnectCodeState,
+  type ConnectDismissed,
   type ConnectImplicitAgents,
   type ConnectLookup,
   type ConnectRegistered,
@@ -38,6 +39,9 @@ import { clientKey, RETRY_SOON, rateLimit, rateLimitsOf } from "../limits";
 //                                    agent gets the implicit account of its key instead of
 //                                    `<name>.<you>` (the owner's wallet refused the sub-account)
 //   GET  /v1/connect/implicit       signed in: the owner's agents set up as implicit accounts
+//   POST /v1/connect/codes/:id/dismiss
+//                                   signed in as the code's owner, with a full-access key: forgets
+//                                    an implicit agent the index does not list (one never funded)
 //   POST /v1/connect/lookup         the code in the body: what it is for (the agent's first look)
 //   POST /v1/connect/attach         the code and a public key in the body: the agent's key, once
 //   POST /v1/connect/contest        the code in the body: the agent saw a key that is not its own
@@ -49,6 +53,7 @@ import { clientKey, RETRY_SOON, rateLimit, rateLimitsOf } from "../limits";
 // (`implicit`). The API works out that account from the key it holds; nothing in the request names
 // it. The choice is made once and kept. A row with `implicit` and no contest is never deleted: it
 // is the owner's only record of the agent, since the chain gives an implicit account no provider.
+// Its owner may dismiss it while the index does not list the agent: the row, and its code, go.
 //
 // CONTESTED. A code takes one key. When a second, different key tries it (an attach with another
 // key, or the agent saying with `contest` that the key attached is not its own), someone else has
@@ -73,7 +78,8 @@ import { clientKey, RETRY_SOON, rateLimit, rateLimitsOf } from "../limits";
 //   404  no such code (or not the caller's: the answer is the same);
 //   409  `already_attached` (another key has the code; the code is marked contested), `not_attached`,
 //        `not_registered`, `contested`, `already_registered` (an agent registered with the code's
-//        sub-account, so it is too late to choose another);
+//        sub-account, so it is too late to choose another), `registered` (a dismissal of an
+//        implicit agent the index lists);
 //   410  `code_expired`: no key came in the 30 minutes.
 
 /** As the question board's writes: a body over this is refused as it arrives, never parsed. */
@@ -377,8 +383,39 @@ export function connectRoutes(
     );
   });
 
+  app.post("/connect/codes/:id/dismiss", requireAuth, perReader, tooLarge, async (c) => {
+    if (c.var.keyKind !== "full_access") {
+      return fail(
+        403,
+        "full_access_required",
+        "sign in with your wallet (a full-access key) to dismiss an agent",
+      );
+    }
+    const row = await ownRow(c.req.param("id"), c.var.account);
+    // Only an implicit agent's row is kept past its day, so only one is dismissed.
+    if (row === null || row.account_kind !== "implicit") return notFound("no such implicit agent");
+    // One guarded statement: an agent the index lists, by the time of the delete, stays.
+    const [gone] = await deps.db.query<{ id: string }>(
+      `delete from connect_codes c
+        where c.id = $1 and c.owner = $2 and c.account_kind = 'implicit'
+          and not exists (select 1 from agents a where a.account = c.account_id)
+        returning c.id`,
+      [row.id, c.var.account],
+    );
+    if (gone === undefined) {
+      return fail(
+        409,
+        "registered",
+        `${row.account_id} is a registered agent, so its record stays: retire it to stop it`,
+      );
+    }
+    const body: ConnectDismissed = { dismissed: true };
+    return c.json(body, 200, NOT_CACHED);
+  });
+
   app.get("/connect/implicit", requireAuth, perReader, async (c) => {
     const rows = await deps.db.query<{
+      id: string;
       account_id: string;
       name: string;
       created_at: Date;
@@ -386,7 +423,7 @@ export function connectRoutes(
       bond_token: string | null;
       bond_amount: string | null;
     }>(
-      `select c.account_id, c.name, c.created_at, a.status, a.bond_token,
+      `select c.id, c.account_id, c.name, c.created_at, a.status, a.bond_token,
               a.bond_amount::text as bond_amount
          from connect_codes c left join agents a on a.account = c.account_id
         where c.owner = $1 and c.account_kind = 'implicit' and c.contested_at is null
@@ -396,6 +433,7 @@ export function connectRoutes(
     );
     const body: ConnectImplicitAgents = {
       agents: rows.map((row) => ({
+        id: row.id,
         account_id: row.account_id,
         name: row.name,
         created_at: row.created_at.toISOString(),
