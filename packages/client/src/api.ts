@@ -118,8 +118,9 @@ export class ApiUnreachableError extends Error {
  * Whether `error` is `fetch` getting no answer: undici's `TypeError("fetch failed")`, or a
  * `TypeError` whose cause has a system code (`ECONNREFUSED`, `ENOTFOUND`). Other `TypeError`s of
  * `fetch` are mistakes of the request itself (a header value it refuses, say), and not the address.
+ * The chain client's calls fail the same way when the RPC node does not answer.
  */
-function noAnswer(error: unknown): boolean {
+export function isNoAnswer(error: unknown): boolean {
   if (!(error instanceof TypeError)) return false;
   const code = (error.cause as { code?: unknown } | null | undefined)?.code;
   return error.message === "fetch failed" || typeof code === "string";
@@ -140,7 +141,7 @@ export function fetchNamingApi(baseUrl: string, fetchImpl?: typeof fetch): typeo
     try {
       return await doFetch(input, init);
     } catch (error) {
-      if (init?.signal?.aborted === true || !noAnswer(error)) throw error;
+      if (init?.signal?.aborted === true || !isNoAnswer(error)) throw error;
       throw new ApiUnreachableError(base, error);
     }
   };

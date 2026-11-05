@@ -1,7 +1,7 @@
 import { lstatSync, readlinkSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
-import type { Signer, TenderClient } from "@tender/client";
+import { isNoAnswer, type Signer, type TenderClient } from "@tender/client";
 import {
   AccountIdSchema,
   canonicalBase,
@@ -595,6 +595,57 @@ export async function checkApiDeployment(
 }
 
 /**
+ * The node did not answer when the server asked it something at start (`askNode`). `origin` is the
+ * node's address as `scheme://host:port`, which `describeFailure` shows: of `NEAR_RPC_URL` it is the
+ * one part that holds no user name, password, key or token.
+ */
+export class NodeUnreachableError extends ConfigError {
+  readonly origin: string | undefined;
+
+  constructor(config: Pick<McpConfig, "network" | "rpcUrl">, cause: unknown) {
+    const url = config.rpcUrl ?? NETWORKS[config.network].rpcUrl;
+    let origin: string | undefined;
+    try {
+      origin = new URL(url).origin;
+    } catch {
+      // No address to show; the line still says the node is silent.
+    }
+    const code = (cause as { cause?: { code?: unknown } } | null)?.cause?.code;
+    const said = cause instanceof Error ? cause.message : String(cause);
+    const hint =
+      config.rpcUrl === undefined
+        ? `NEAR_RPC_URL is not set, so this is the default node of ${config.network}: try again, ` +
+          "or set NEAR_RPC_URL to another node"
+        : "NEAR_RPC_URL must name a node that is running; if it is a busy public node, try again";
+    super(
+      `could not reach the NEAR node${origin === undefined ? "" : ` at ${origin}`} ` +
+        `(${said}${typeof code === "string" ? `, ${code}` : ""}). ${hint}`,
+    );
+    this.name = "NodeUnreachableError";
+    this.origin = origin;
+    this.cause = cause;
+  }
+}
+
+/**
+ * Runs `ask`, a call that the server makes to the node at start, and turns a node that gives no
+ * answer at all (a wrong `NEAR_RPC_URL`, a busy public node, a local chain that has stopped) from
+ * `fetch failed`, which names nothing, into a `NodeUnreachableError` that names the address and
+ * `NEAR_RPC_URL`. A failure that is not the node's silence passes as it is.
+ */
+export async function askNode<T>(
+  config: Pick<McpConfig, "network" | "rpcUrl">,
+  ask: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await ask();
+  } catch (error) {
+    if (isNoAnswer(error)) throw new NodeUnreachableError(config, error);
+    throw error;
+  }
+}
+
+/**
  * The token the tools use when a call names none (ruling P04-P12):
  *
  * 1. `TENDER_TOKEN`, if it is set. The contract is not asked.
@@ -635,13 +686,16 @@ export function secretsOf(config: Pick<McpConfig, "signer" | "rpcUrl">): string[
 /**
  * A failure that stopped the server from starting, as the one line the bin prints. Every string in
  * `secrets` is cut out of it, a bearer token and a URL are replaced (`scrub`; the API's base stays
- * when the API did not answer, `urlsToShow`), and line breaks become spaces, so that what a library
- * puts into its message cannot print a key.
+ * when the API did not answer, `urlsToShow`, and so does the address of a node that did not), and
+ * line breaks become spaces, so that what a library puts into its message cannot print a key.
  */
 export function describeFailure(error: unknown, secrets: readonly string[] = []): string {
   let text: string;
   if (error instanceof ConfigError) text = error.message;
   else if (error instanceof Error) text = `${error.name}: ${error.message}`;
   else text = String(error);
-  return scrub(text, secrets, urlsToShow(error)).replace(/\s+/g, " ").trim();
+  const node = error instanceof NodeUnreachableError ? [error.origin ?? ""] : [];
+  return scrub(text, secrets, [...urlsToShow(error), ...node])
+    .replace(/\s+/g, " ")
+    .trim();
 }

@@ -29,6 +29,7 @@ import {
 import { KeyPair } from "near-api-js";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
+  askNode,
   ConfigError,
   checkApiDeployment,
   describeFailure,
@@ -1304,6 +1305,100 @@ test("an_api_of_another_deployment_is_refused_and_one_that_cannot_answer_is_not"
   expect(warn.mock.calls[0]?.[0]).toMatch(
     /could not ask the API which network and contract it serves \(ApiUnreachableError: could not reach the Tender API at https:\/\/api\.tender\.example \(fetch failed, ECONNREFUSED\)\)/,
   );
+});
+
+test("a_node_that_gives_no_answer_is_named_with_its_address_and_the_variable", async () => {
+  const down = new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } });
+  const refuse = () => Promise.reject(down);
+
+  // NEAR_RPC_URL names the node: the line shows its address, scheme and host and port, and nothing
+  // the URL may hold besides (a user name, a password, a path, a query), and says what to check.
+  const password = "word-word-word";
+  const queryValue = "query-query-1234";
+  const pathToken = "ab12ab12ab12ab12ab12";
+  const rpcUrl = `https://bob:${password}@rpc.example:3030/v2/${pathToken}?apiKey=${queryValue}`;
+  const named = await askNode({ network: "testnet", rpcUrl }, refuse).catch((e: unknown) => e);
+  expect(named).toBeInstanceOf(ConfigError);
+  const line = (named as ConfigError).message;
+  expect(line).toBe(
+    "could not reach the NEAR node at https://rpc.example:3030 (fetch failed, ECONNREFUSED). " +
+      "NEAR_RPC_URL must name a node that is running; if it is a busy public node, try again",
+  );
+  for (const piece of ["bob", password, pathToken, queryValue, "apiKey", "/v2"]) {
+    expect(line).not.toContain(piece);
+  }
+  // The raw failure is kept under it, and the bin's line keeps the address that the message shows.
+  expect((named as Error).cause).toBe(down);
+  expect(
+    describeFailure(
+      named,
+      secretsOf({ signer: { accountId: "a.test", privateKey: KEY.toString() }, rpcUrl }),
+    ),
+  ).toBe(line);
+
+  // NEAR_RPC_URL not set: the node is the network's own, and the line says so.
+  const unset = await askNode({ network: "testnet", rpcUrl: undefined }, refuse).catch(
+    (e: unknown) => e,
+  );
+  expect((unset as ConfigError).message).toBe(
+    "could not reach the NEAR node at https://rpc.testnet.fastnear.com (fetch failed, ECONNREFUSED). " +
+      "NEAR_RPC_URL is not set, so this is the default node of testnet: try again, or set " +
+      "NEAR_RPC_URL to another node",
+  );
+
+  // Anything else is not the node's silence and passes as it is, and an answer passes as it is.
+  const refused = new Error("E_AUTH: not yours");
+  await expect(askNode({ network: "testnet", rpcUrl }, () => Promise.reject(refused))).rejects.toBe(
+    refused,
+  );
+  const badHeader = new TypeError("Headers.append: invalid header value");
+  await expect(
+    askNode({ network: "testnet", rpcUrl }, () => Promise.reject(badHeader)),
+  ).rejects.toBe(badHeader);
+  expect(await askNode({ network: "testnet", rpcUrl }, async () => 42)).toBe(42);
+});
+
+/** A port on this machine that nothing listens on: one the system gave out a moment ago. */
+async function closedPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const { port } = server.address() as AddressInfo;
+  await new Promise<void>((done) => server.close(() => done()));
+  return port;
+}
+
+test("bin_names_the_node_that_does_not_answer", { timeout: 120_000 }, async () => {
+  // An API that serves the deployment the environment names, so that nothing else is said; and a
+  // node at an address where nothing listens, which is what a wrong NEAR_RPC_URL looks like.
+  const api = createServer((request, response) => {
+    if (request.url === "/v1/health") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(healthOf("sandbox", "tender.sandbox")));
+      return;
+    }
+    response.writeHead(404).end();
+  });
+  await new Promise<void>((done) => api.listen(0, "127.0.0.1", done));
+  try {
+    const rpc = `http://127.0.0.1:${await closedPort()}`;
+    const result = await runBin({
+      TENDER_NETWORK: "sandbox",
+      TENDER_CONTRACT: "tender.sandbox",
+      TENDER_API_URL: `http://127.0.0.1:${(api.address() as AddressInfo).port}`,
+      TENDER_ACCOUNT: "alice.sandbox",
+      TENDER_PRIVATE_KEY: KEY.toString(),
+      NEAR_RPC_URL: `${rpc}/secretpath`,
+    });
+    expect(result).toEqual({
+      code: 1,
+      stdout: "",
+      stderr:
+        `tender-mcp: could not reach the NEAR node at ${rpc} (fetch failed, ECONNREFUSED). ` +
+        "NEAR_RPC_URL must name a node that is running; if it is a busy public node, try again\n",
+    });
+  } finally {
+    await new Promise<void>((done) => api.close(() => done()));
+  }
 });
 
 test("bin_refuses_api_of_another_contract", { timeout: 120_000 }, async () => {
