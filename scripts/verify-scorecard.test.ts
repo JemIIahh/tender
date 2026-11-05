@@ -103,13 +103,28 @@ afterAll(async () => {
   await new Promise((resolve) => api.close(resolve));
 });
 
-/** Runs the script for task `id`, and gives its exit code and what it printed. */
-function verify(id: string): Promise<{ code: number; out: string }> {
+/**
+ * Runs the script for task `id` (with the flags in `more`, after the usual ones), and gives its exit
+ * code and what it printed. The environment names no network and no node: the flags decide.
+ */
+function verify(id: string, more: string[] = []): Promise<{ code: number; out: string }> {
+  const { TENDER_NETWORK: _network, NEAR_RPC_URL: _rpc, ...env } = process.env;
   return new Promise((resolve) => {
     execFile(
       process.execPath,
-      [SCRIPT, "--task", id, "--contract", "tender.test", "--api", apiUrl, "--rpc", nodeUrl],
-      { timeout: 30_000 },
+      [
+        SCRIPT,
+        "--task",
+        id,
+        "--contract",
+        "tender.test",
+        "--api",
+        apiUrl,
+        "--rpc",
+        nodeUrl,
+        ...more,
+      ],
+      { timeout: 30_000, env },
       (error, stdout, stderr) => {
         const code = error === null ? 0 : typeof error.code === "number" ? error.code : -1;
         resolve({ code, out: `${stdout}${stderr}` });
@@ -198,4 +213,21 @@ test("a_task_the_chain_does_not_have_could_not_be_checked", async () => {
   const { code, out } = await verify("99");
   expect(out).toContain("could not check: tender.test has no task 99");
   expect(code).toBe(2);
+});
+
+test("a_check_on_a_node_of_its_own_names_the_node_and_not_a_network", async () => {
+  // --rpc without --network: the node is no testnet's, and the first line must not say it is.
+  pinned("7", COMMITMENT, card(HELDOUT, COMMITMENT));
+  const { code, out } = await verify("7");
+  const host = new URL(nodeUrl).host;
+  expect(out.split("\n")[0]).toBe(`task 7 on tender.test (node ${host})`);
+  expect(out).not.toContain("testnet");
+  expect(code).toBe(0);
+});
+
+test("a_network_named_beside_a_node_is_named_with_it", async () => {
+  pinned("8", COMMITMENT, card(HELDOUT, COMMITMENT));
+  const { code, out } = await verify("8", ["--network", "sandbox"]);
+  expect(out.split("\n")[0]).toBe(`task 8 on tender.test (sandbox, node ${new URL(nodeUrl).host})`);
+  expect(code).toBe(0);
 });
