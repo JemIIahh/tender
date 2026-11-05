@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { SECONDARY } from "./ui";
 
-/** A pill of a top bar: the app's and the landing's. */
+/** A pill of the app's top bar. */
 export const BAR_PILL = "min-h-10 px-3.5 whitespace-nowrap sm:px-4";
 
 /**

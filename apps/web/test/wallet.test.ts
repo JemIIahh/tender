@@ -11,6 +11,7 @@ import {
   createWalletStore,
   groupCalls,
   type Session,
+  START_PATIENCE_MS,
   type WalletProvider,
 } from "../lib/wallet";
 import {
@@ -515,15 +516,42 @@ test("a_wallet_that_is_slow_to_come_back_does_not_hold_the_page_and_is_taken_whe
   const store = createWalletStore(async () => provider);
 
   const starting = store.start();
-  await vi.advanceTimersByTimeAsync(7000);
+  await vi.advanceTimersByTimeAsync(START_PATIENCE_MS - 500);
   expect(store.getSnapshot().ready).toBe(false);
-  await vi.advanceTimersByTimeAsync(1500);
+  await vi.advanceTimersByTimeAsync(1000);
   await starting;
 
   // The page shows its Connect button...
   expect(store.getSnapshot()).toEqual({ ready: true, accountId: null, canSignMessage: false });
   // ...and the wallet, when it turns up, is connected all the same.
   found({ wallet, accountId: ALICE });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(store.getSnapshot().accountId).toBe(ALICE);
+});
+
+test("a_wallet_library_that_is_slow_to_load_does_not_hold_the_page_past_the_same_limit", async () => {
+  vi.useFakeTimers();
+  const wallet = chainWallet(new FakeChain(CONTRACT, []), ALICE);
+  let loaded: (provider: WalletProvider) => void = () => {};
+  // The library's download, which comes before any restore, never answers in time.
+  const store = createWalletStore(
+    () =>
+      new Promise<WalletProvider>((resolve) => {
+        loaded = resolve;
+      }),
+  );
+
+  const starting = store.start();
+  await vi.advanceTimersByTimeAsync(START_PATIENCE_MS - 500);
+  expect(store.getSnapshot().ready).toBe(false);
+  await vi.advanceTimersByTimeAsync(1000);
+  await starting;
+  // About 4 s in all, the download included: the page offers Connect.
+  expect(store.getSnapshot()).toEqual({ ready: true, accountId: null, canSignMessage: false });
+  expect(START_PATIENCE_MS).toBe(4000);
+
+  // The library comes, and the wallet of the earlier visit with it: it is taken up all the same.
+  loaded(fakeProvider({ wallet, accountId: ALICE }, { restored: true }));
   await vi.advanceTimersByTimeAsync(0);
   expect(store.getSnapshot().accountId).toBe(ALICE);
 });
@@ -543,7 +571,7 @@ test("a_wallet_connected_while_the_old_one_is_looked_for_is_not_replaced_by_it",
   const store = createWalletStore(async () => provider);
 
   const starting = store.start();
-  await vi.advanceTimersByTimeAsync(9000);
+  await vi.advanceTimersByTimeAsync(START_PATIENCE_MS + 1000);
   await starting;
   await store.connect();
   found({ wallet, accountId: ALICE });

@@ -122,8 +122,12 @@ test("task_page_shows_the_task_with_all_its_parts", async () => {
   expect(screen.queryByTestId("payouts")).toBeNull();
   // Nothing is loading any more. What still says it is waiting is the wallet, which the app shell
   // starts and this page alone does not: until then no section offers Connect.
-  expect(screen.queryAllByRole("status").map((status) => status.textContent)).toEqual(
-    screen.queryAllByRole("status").map(() => "Checking for your wallet…"),
+  // The task takes top-ups, and that section waits for the wallet; nothing else is waiting.
+  expect(screen.queryAllByRole("status").map((status) => status.textContent)).toEqual([
+    "Checking for your wallet…",
+  ]);
+  expect(within(screen.getByTestId("action-top-up")).getByRole("status").textContent).toBe(
+    "Checking for your wallet…",
   );
 });
 

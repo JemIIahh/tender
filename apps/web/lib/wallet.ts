@@ -164,11 +164,12 @@ export type UseWallet = WalletState & WalletActions;
 
 /**
  * How long a page waits for the wallet from an earlier visit before it shows the person a Connect
- * button. near-connect loads its wallet list from the network first and has no limit of its own.
- * A wallet that turns up later is still taken, and keeps the token the tab held if it is the same
- * account.
+ * button: the whole look, the wallet library's download included, since the app shell starts it on
+ * every page and shows a placeholder until then. near-connect loads its wallet list from the
+ * network first and has no limit of its own. A wallet that turns up later is still taken, and
+ * keeps the token the tab held if it is the same account.
  */
-const RESTORE_PATIENCE_MS = 8000;
+export const START_PATIENCE_MS = 4000;
 
 /** Groups `calls` into the transactions that carry them: consecutive calls to one receiver join. */
 export function groupCalls(calls: readonly TenderCall[]): TransactionRequest[] {
@@ -399,41 +400,39 @@ export function createWalletStore(
     starting ??= (async () => {
       // Hearing the other tabs begins before the wallet is looked for.
       link();
-      try {
+      const look = (async () => {
         const wallets = await getProvider();
         // A token kept from the earlier visit is dropped only when the wallet is known not to
         // come back: it looked and found none, or could not look. A restore that is still on its
         // way when the page stops waiting leaves the token. It is not served without an account, a
         // Connect drops it, and a wallet that does turn up keeps it for the same account only.
-        const restoring = wallets
-          .restore()
-          .then(
-            (restored) => {
-              // A wallet connected in the meantime stays.
-              if (session !== null) return;
-              if (restored !== null) beginSession(restored, true);
-              // No wallet: this tab has no session to go on with. The other tabs are not told.
-              // near-connect also says "no wallet" when its wallet list did not download, and a
-              // guess is no reason to sign them out. A session ends for them when it is
-              // disconnected, when the wallet signs itself out, or when a Connect replaces it.
-              else endSession(false);
-            },
-            (error: unknown) => {
-              console.error(error);
-              // Not looked at: the same for this tab, and the other tabs are left alone.
-              if (session === null) endSession(false);
-            },
-          )
-          .catch((error: unknown) => console.error(error));
-        await settleWithin(restoring, RESTORE_PATIENCE_MS);
-      } catch (error) {
+        await wallets.restore().then(
+          (restored) => {
+            // A wallet connected in the meantime stays.
+            if (session !== null) return;
+            if (restored !== null) beginSession(restored, true);
+            // No wallet: this tab has no session to go on with. The other tabs are not told.
+            // near-connect also says "no wallet" when its wallet list did not download, and a
+            // guess is no reason to sign them out. A session ends for them when it is
+            // disconnected, when the wallet signs itself out, or when a Connect replaces it.
+            else endSession(false);
+          },
+          (error: unknown) => {
+            console.error(error);
+            // Not looked at: the same for this tab, and the other tabs are left alone.
+            if (session === null) endSession(false);
+          },
+        );
+      })().catch((error: unknown) => {
         // A build with no wallet to offer, or a wallet library that did not load: the page shows
         // the Connect button, and pressing it says why.
         console.error(error);
         if (session === null) endSession(false);
-      } finally {
-        publish({ ready: true });
-      }
+      });
+      // The library's download and the restore together, at most `START_PATIENCE_MS`: past that
+      // the page shows Connect, and what the look finds later is still taken.
+      await settleWithin(look, START_PATIENCE_MS);
+      publish({ ready: true });
     })();
     return starting;
   }

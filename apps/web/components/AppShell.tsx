@@ -341,7 +341,9 @@ export function AppShell({ children }: { children: ReactNode }) {
               aria-label="Checking your wallet"
               data-testid="wallet-pill-placeholder"
               className={`${SECONDARY} ${BAR_PILL} w-24 animate-pulse motion-reduce:animate-none sm:w-36`}
-            />
+            >
+              <span className="sr-only">Checking your wallet</span>
+            </span>
           ) : accountId === null ? (
             <Link href="/wallet" aria-label="Connect wallet" className={`${SECONDARY} ${BAR_PILL}`}>
               Connect<span className="max-sm:hidden">{"\u00a0"}wallet</span>
