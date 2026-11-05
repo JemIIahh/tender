@@ -65,8 +65,8 @@ function HeldoutDownload({ file, verifier }: { file: Uint8Array; verifier: strin
     >
       <p>
         {verifier === null
-          ? "You pick, so you need the secret checks: save the file. A pick with pick_winners can publish it with the scorecard; the task page's pick doesn't. This page can't show it again."
-          : `${verifier} needs the secret checks to pick: save the file and send it to them. A pick with pick_winners can publish it with the scorecard; the task page's pick doesn't. This page can't show it again.`}
+          ? "You pick, so you need the hidden checks: save the file. A pick with pick_winners can publish it with the scorecard; the task page's pick doesn't. This page can't show it again."
+          : `${verifier} needs the hidden checks to pick: save the file and send it to them. A pick with pick_winners can publish it with the scorecard; the task page's pick doesn't. This page can't show it again.`}
       </p>
       <button
         type="button"

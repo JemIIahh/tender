@@ -183,7 +183,7 @@ export interface PostForm {
   heldoutNoMatch: string;
   /**
    * The salt of the held-out checks: 32 random bytes as 64 lowercase hex characters, drawn once for
-   * the form (`emptyForm`), so that every document the steps make of it, the one Review offers as a
+   * the form (`emptyForm`), so that every document the page makes of it, the one it offers as a
    * file and the one that is posted, has the same commitment. Without it a short answer could be
    * found by hashing likely answers until one gives the commitment on chain. Not shown or typed.
    */

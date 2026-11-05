@@ -22,6 +22,7 @@ import {
   windowsOf,
 } from "../../lib/post";
 import { FIELD } from "../ui";
+import { HIDDEN_HELP } from "./RuleFields";
 import {
   AreaField,
   bindText,
@@ -231,14 +232,14 @@ export function MoreOptions(
               <div className="grid gap-4 sm:grid-cols-2">
                 <AreaField
                   label="Hidden: should match"
-                  help="Optional. One per line. If set, the Judge scores on these only. Kept secret until the winner is paid."
+                  help={`Optional. One per line. If set, the Judge scores on these only. ${HIDDEN_HELP}`}
                   rows={3}
                   mono
                   {...bindText(props, "heldoutMatch")}
                 />
                 <AreaField
                   label="Hidden: should not match"
-                  help="Optional. One per line. Kept secret until the winner is paid."
+                  help={`Optional. One per line. ${HIDDEN_HELP}`}
                   rows={3}
                   mono
                   {...bindText(props, "heldoutNoMatch")}

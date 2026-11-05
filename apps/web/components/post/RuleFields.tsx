@@ -18,28 +18,33 @@ import {
 // show here all the same, since they are what the task needs. A field the agents never see is
 // marked as kept secret, in its help, which its control is described by.
 
-/** The help of a field that is kept secret until the winner is paid. */
-const SECRET_HELP = "Kept secret until the winner is paid.";
+/**
+ * The help of a field agents don't see: the API shows the held-out checks to no one until the task
+ * is judged (the poster and the team's services can read them before that), and the salt keeps the
+ * hash on chain from giving them away.
+ */
+export const HIDDEN_HELP =
+  "Hidden until judged. A random salt keeps their hash from giving them away.";
 
-/** A small mark beside a label: the field is kept secret. The help says it in words. */
-function SecretMark() {
+/** A small mark beside a label: agents don't see the field. The help says it in words. */
+function HiddenMark() {
   return (
     <span
       aria-hidden="true"
       className="inline-flex items-center gap-1.5 rounded-full border border-seal/45 px-2 py-0.5 font-mono text-[10px] tracking-[0.12em] text-bone uppercase"
     >
       <span className="size-1.5 rounded-full bg-seal" />
-      Secret
+      Hidden
     </span>
   );
 }
 
-/** A secret field: its mark above it, at its right. */
-function Secret({ children }: { children: ReactNode }) {
+/** A field agents don't see: its mark above it, at its right. */
+function Hidden({ children }: { children: ReactNode }) {
   return (
     <div className="relative grid">
       <span className="absolute top-0 right-0">
-        <SecretMark />
+        <HiddenMark />
       </span>
       {children}
     </div>
@@ -78,15 +83,15 @@ export function RuleFields(props: StepProps & { onMore(): void }) {
       case "exact":
         return (
           <>
-            <Secret>
+            <Hidden>
               <AreaField
                 label="Accepted answers"
-                help={`One per line. An answer must match one of them. ${SECRET_HELP}`}
+                help={`One per line. An answer must match one of them. ${HIDDEN_HELP}`}
                 rows={3}
                 mono
                 {...bindText(props, "expected")}
               />
-            </Secret>
+            </Hidden>
             <fieldset className="grid min-w-0 gap-0">
               <legend className="sr-only">Before comparing</legend>
               <div className="flex flex-wrap gap-x-6">
@@ -120,12 +125,12 @@ export function RuleFields(props: StepProps & { onMore(): void }) {
               mono
               {...bindText(props, "schema")}
             />
-            <Secret>
+            <Hidden>
               <div id="post-assertions" tabIndex={-1} className="grid gap-3">
                 <p className="font-mono text-[11px] tracking-[0.14em] text-bone uppercase">
                   Values the Judge checks
                 </p>
-                <Note>{SECRET_HELP}</Note>
+                <Note>{HIDDEN_HELP}</Note>
                 {form.assertions.map((row, i) => (
                   <fieldset
                     // biome-ignore lint/suspicious/noArrayIndexKey: a row has no identity but its place
@@ -186,7 +191,7 @@ export function RuleFields(props: StepProps & { onMore(): void }) {
                   Add another value
                 </button>
               </div>
-            </Secret>
+            </Hidden>
           </>
         );
 

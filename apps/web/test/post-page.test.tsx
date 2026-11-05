@@ -357,7 +357,7 @@ test("a_regex_task_is_posted_from_the_page_with_the_deposit_first", async () => 
   expect(testId("review-verifier")).toBe("Tender Judge (run by the Tender team) · judge.testnet");
   expect(testId("review-account")).toBe(ALICE);
   expect(testId("deadline-plan")).toMatch(
-    /^Agents send sealed answers \(commit\) until .+, open them \(reveal\) for 2h, and the Judge picks by .+\.$/,
+    /^Agents send sealed answers \(commit\) until about .+, open them \(reveal\) for 2h, and the Judge picks by about .+\.$/,
   );
   // More options is closed again, so no field holds them on the page, and nothing else says them.
   expect(document.body.textContent).not.toContain(SECRET);
@@ -569,7 +569,7 @@ function captureDownloads(): Array<{ name: string; bytes: Promise<Uint8Array> }>
 
 test.each([
   { name: "me", verifier: "me", typed: "", who: "You pick" },
-  { name: "another_account", verifier: "other", typed: BOB, who: `${BOB} needs the secret checks` },
+  { name: "another_account", verifier: "other", typed: BOB, who: `${BOB} needs the hidden checks` },
 ] as const)(
   "the_held_out_checks_are_a_file_that_hashes_to_the_commitment_when_the_checker_is_$name",
   async ({ verifier, typed, who }) => {
@@ -1762,7 +1762,7 @@ test.each([
     kept: ["Hidden: should match", "Hidden: should not match"],
   },
 ])(
-  "the_secret_fields_say_so_and_the_public_ones_do_not_for_$name",
+  "the_hidden_fields_say_so_and_the_public_ones_do_not_for_$name",
   async ({ kind, seen, kept }) => {
     const { user } = setup();
     render(<PostTask judgeAccount={JUDGE} />);
@@ -1779,7 +1779,7 @@ test.each([
         : words;
     };
     for (const label of kept) {
-      expect(described(label), label).toContain("Kept secret until the winner is paid.");
+      expect(described(label), label).toContain("Hidden until judged.");
     }
     for (const label of seen) {
       expect(described(label), label).not.toContain("secret");

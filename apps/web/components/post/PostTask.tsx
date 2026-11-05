@@ -796,7 +796,7 @@ export function PostTask({
             >
               {windows === null || answersUntil === null
                 ? "Pick when agents stop answering. The rest is worked out from it."
-                : `Agents send sealed answers (commit) until ${WHEN.format(answersUntil)}, open them (reveal) for ${spanText(windows.reveal)}, and ${who} by ${WHEN.format(answersUntil + (windows.reveal + windows.pick) * 1000)}.`}
+                : `Agents send sealed answers (commit) until about ${WHEN.format(answersUntil)}, open them (reveal) for ${spanText(windows.reveal)}, and ${who} by about ${WHEN.format(answersUntil + (windows.reveal + windows.pick) * 1000)}.`}
             </p>
           </section>
 
