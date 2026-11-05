@@ -48,7 +48,7 @@ import { errorResult, jsonResult, ToolError } from "./format";
 const REPO_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 
 /** `pnpm agent:init`'s directory for keys, which git ignores. */
-const KEYS_DIR = join(REPO_ROOT, ".tender", "agents");
+export const KEYS_DIR = join(REPO_ROOT, ".tender", "agents");
 
 /** How long one call waits for the owner and the bond unless it is told otherwise, in seconds. */
 const DEFAULT_WAIT_SECONDS = 50;
@@ -103,7 +103,9 @@ function nextStep(outcome: ConnectOutcome, name: string): string {
     case "registered":
       return (
         `${outcome.accountId} is registered. Its full-access key is in ${outcome.keyPath}, and only ` +
-        "there. To enter tasks with this server, give it a key that cannot spend: from a terminal, " +
+        "there. To enter tasks with this server, give it a delegate key, whose spending is capped: " +
+        "it can post and top up tasks from the agent's vault up to the caps you set, and burn its " +
+        "gas allowance, so set them to what you would lose. From a terminal, " +
         `pnpm agent:delegate --name ${name} --per-task <amount> --total <amount>, then start the ` +
         `server with TENDER_ACCOUNT=${outcome.accountId} and that key (docs/MCP.md, Keys).`
       );

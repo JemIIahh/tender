@@ -28,6 +28,7 @@ import {
   firstError,
   formatForKind,
   fundingOf,
+  heldoutFile,
   KINDS,
   kindsFor,
   linesOf,
@@ -92,6 +93,24 @@ test("wizard_builds_valid_documents", () => {
   }
 });
 
+test("the_heldout_checks_are_salted_once_for_each_form", () => {
+  // A short answer's commitment could be found by hashing likely answers: the form draws 32 random
+  // bytes once, so every document made of it, the file Review offers and the one posted, has one
+  // commitment, and another form with the same checks has another.
+  const form = exactForm();
+  expect(form.heldoutSalt).toMatch(/^[0-9a-f]{64}$/);
+  const first = buildDocuments(form);
+  expect(buildDocuments({ ...form, title: "Another title" }).heldoutCommitment).toBe(
+    first.heldoutCommitment,
+  );
+  expect(heldoutFile(form)).toEqual(first.heldout);
+  expect(decode(first.heldout as Uint8Array)).toMatchObject({ salt: form.heldoutSalt });
+
+  const other = exactForm();
+  expect(other.heldoutSalt).not.toBe(form.heldoutSalt);
+  expect(buildDocuments(other).heldoutCommitment).not.toBe(first.heldoutCommitment);
+});
+
 test("documents_hold_what_was_typed", () => {
   const regex = buildDocuments(regexForm());
   expect(decode(regex.brief)).toEqual({
@@ -111,17 +130,21 @@ test("documents_hold_what_was_typed", () => {
     has_heldout: true,
     examples: { match: ["alice.near", "bob.testnet"], no_match: ["-bad", "UPPER"] },
   });
+  // Each held-out document carries the form's salt.
+  const salt = expect.stringMatching(/^[0-9a-f]{64}$/);
   expect(decode(regex.heldout as Uint8Array)).toEqual({
     regex_cases: {
       match: [`${SECRET}.near`, "carol.near"],
       no_match: ["dave..near", "_eve.near"],
     },
+    salt,
   });
 
   const exact = buildDocuments(exactForm());
   expect(decode(exact.criteria)).toMatchObject({ kind: "exact", normalize: ["trim", "lowercase"] });
   expect(decode(exact.heldout as Uint8Array)).toEqual({
     exact: { expected: ["Canberra", "Canberra, ACT"] },
+    salt,
   });
 
   const json = buildDocuments(jsonForm());
@@ -133,6 +156,7 @@ test("documents_hold_what_was_typed", () => {
         { path: "$.lines[0].sku", equals: "A-1" },
       ],
     },
+    salt,
   });
 
   // A rubric has no held-out part.

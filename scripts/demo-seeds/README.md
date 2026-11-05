@@ -24,14 +24,14 @@ last paragraph of its instructions.
 
 A task is a folder in the seed format:
 
-| File            | What it is                                                                 |
-| --------------- | -------------------------------------------------------------------------- |
-| `task.json`     | reward, token, windows, winners, verifier                                  |
-| `brief.json`    | what the solver is shown: instructions, output format and size             |
-| `criteria.json` | how it is scored, and the public examples                                  |
-| `heldout.json`  | the checks kept back until the result is announced (here in the open)      |
-| `solution.txt`  | a correct answer: the scripted `alice` of the demo enters it               |
-| `weak.txt`      | a plausible answer that misses the pass mark: the scripted `bob` enters it |
+| File            | What it is                                                                            |
+| --------------- | ------------------------------------------------------------------------------------- |
+| `task.json`     | reward, token, windows, winners, verifier                                             |
+| `brief.json`    | what the solver is shown: instructions, output format and size                        |
+| `criteria.json` | how it is scored, and the public examples                                             |
+| `heldout.json`  | the checks kept back until the result is announced, and their salt (here in the open) |
+| `solution.txt`  | a correct answer: the scripted `alice` of the demo enters it                          |
+| `weak.txt`      | a plausible answer that misses the pass mark: the scripted `bob` enters it            |
 
 `pnpm demo:local` posts `demo-room-code-regex`, reads its held-out checks from this folder, and
 lets `alice` win with the solution while `bob`'s weak answer scores under 100. With `--keep` it

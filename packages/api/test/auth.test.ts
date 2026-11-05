@@ -12,7 +12,7 @@ import type { AuthVariables } from "../src/auth";
 import { type ChallengeResponse, requireAuth, type SignInResponse } from "../src/auth";
 import { handleError } from "../src/format";
 import { type ApiDeps, type ChainReader, createApp, type ErrorBody } from "../src/index";
-import { fakeClient, resetDb, TEST_NOW, testDb, testDeps } from "./helpers";
+import { fakeClient, resetDb, SALT, TEST_NOW, testDb, testDeps } from "./helpers";
 
 // NEP-413 sign-in. Every test signs with near-api-js itself, as a wallet or an agent would, so
 // none of them leans on the serializer in `@tender/client` that the API verifies with. The chain
@@ -194,7 +194,7 @@ function whoami(app: Hono<{ Variables: AuthVariables }>, authorization?: string)
 
 /** Both uploads that need a signed-in account, with bodies that are valid. */
 const BRIEF_BYTES = canonicalJson(FIXTURE_BRIEF);
-const HELDOUT_BYTES = canonicalJson({ exact: { expected: ["42"] } });
+const HELDOUT_BYTES = canonicalJson({ exact: { expected: ["42"] }, salt: SALT });
 const UPLOADS: Array<[string, unknown]> = [
   [
     "/v1/blobs",

@@ -17,7 +17,7 @@ import { Hono } from "hono";
 import { KeyPair } from "near-api-js";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "vitest";
 import { type ApiDeps, createApp } from "../src/index";
-import { fakeClient, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
+import { fakeClient, SALT, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 
 // `ApiClient` against the real app, served on an ephemeral port of the loopback interface, so that
 // the requests it builds are the ones the routes read: the paths, the queries, the JSON of the
@@ -271,6 +271,14 @@ test("client_round_trips_against_in_process_app", async () => {
   expect(await client.getAgent("nobody.test.near")).toBeNull();
   const entries = await client.listEntries(alice);
   expect(entries.entries.map((entry) => entry.task_id)).toEqual(["1"]);
+  // The poster's record: its tasks, and none of them voided after a reveal.
+  const { poster } = FIXTURE_ACCOUNTS;
+  expect(await client.getPoster(poster)).toEqual({
+    account: poster,
+    tasks_posted: (await client.listTasks({ poster })).tasks.length,
+    voided_after_reveals: 0,
+    is_team: false,
+  });
 
   // How far the index is behind the chain.
   expect(await client.health()).toEqual({
@@ -302,7 +310,7 @@ test("client_reaches_the_rest_of_the_routes", async () => {
 
   // A held-out document goes up and cannot be read back; one that does not hash to its commitment
   // is refused.
-  const heldout = canonicalJson({ exact: { expected: ["42"] } });
+  const heldout = canonicalJson({ exact: { expected: ["42"] }, salt: SALT });
   expect(await client.uploadHeldout(sha256Hex(heldout), heldout)).toBeUndefined();
   expect(await client.getBlob(sha256Hex(heldout))).toBeNull();
   const mismatch = await apiError(client.uploadHeldout(sha256Hex("something else"), heldout));

@@ -10,7 +10,10 @@ import { afterAll, beforeAll, expect, test } from "vitest";
 // exit code are what is checked.
 
 const SCRIPT = fileURLToPath(new URL("./verify-scorecard.mjs", import.meta.url));
-const HELDOUT = { regex_cases: { match: ["C3-045"], no_match: ["G1-010"] } };
+const HELDOUT = {
+  regex_cases: { match: ["C3-045"], no_match: ["G1-010"] },
+  salt: "5a".repeat(32),
+};
 const COMMITMENT = sha256Hex(canonicalJson(HELDOUT));
 
 /** A scorecard as the API serves it: its canonical bytes. */
@@ -142,6 +145,20 @@ test("a_scorecard_that_publishes_the_committed_held_out_checks_is_verified", asy
   pinned("1", COMMITMENT, card(HELDOUT, COMMITMENT));
   const { code, out } = await verify("1");
   expect(out).toMatch(/card {3}sha256\(heldout\) +[0-9a-f]{64} {2}MATCH/);
+  // The hash is of the whole document, salt included, and the salt is said to be there.
+  expect(out).toContain("card   heldout salt         present");
+  expect(out.trimEnd().split("\n").at(-1)).toBe("VERIFIED");
+  expect(code).toBe(0);
+});
+
+test("held_out_checks_published_without_a_salt_are_verified_with_a_note", async () => {
+  const { salt: _salt, ...unsalted } = HELDOUT;
+  const commitment = sha256Hex(canonicalJson(unsalted));
+  pinned("7", commitment, card(unsalted, commitment));
+  const { code, out } = await verify("7");
+  expect(out).toContain(
+    "card   heldout salt         none: while the task was open, a short answer could be found from the commitment",
+  );
   expect(out.trimEnd().split("\n").at(-1)).toBe("VERIFIED");
   expect(code).toBe(0);
 });

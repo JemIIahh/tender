@@ -42,10 +42,10 @@ const withdrawal = { account, token: account, amount: u128, to: account };
 /**
  * Every event Tender logs, as a union discriminated on `event`.
  *
- * Fields and their order follow the structs in `contract/tender/src/events.rs`. Four events are not
- * emitted yet (`task_topped_up`, `delegate_added`, `delegate_removed`, `attested_pick`): their
- * shapes come from the text of plan 01 Tasks 13, 15 and 17, and are to be checked against the
- * contract when those tasks land.
+ * Fields and their order follow the structs in `contract/tender/src/events.rs`. The deployed
+ * contract emits `task_topped_up`, `delegate_added` and `delegate_removed` in these shapes. One event
+ * is not emitted yet, `attested_pick`: its shape comes from the text of plan 01 Task 17, and is to
+ * be checked against the contract if that task lands.
  *
  * Keys the schema does not name are dropped from the parsed data rather than rejected, so a field
  * added to the contract later cannot make a consumer lose the event.

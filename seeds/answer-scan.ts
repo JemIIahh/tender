@@ -1,4 +1,4 @@
-import type { Heldout } from "@tender/shared";
+import type { HeldoutChecks } from "@tender/shared";
 import { sha256Hex } from "@tender/shared";
 
 // The rules of the "no answers in the tracked tree" guard (no-answers-in-tree.test.ts), kept apart
@@ -178,10 +178,13 @@ export function scalarsIn(value: unknown): (string | number)[] {
 
 const unique = <T>(values: T[]): T[] => [...new Set(values)];
 
+/** A seed's held-out document: its checks, and its salt where it has one. */
+export type SeedHeldout = HeldoutChecks & { salt?: string };
+
 /** What a seed's answer-like files hold, as the private directory has them. */
 export interface SeedAnswers {
   /** `heldout.json`; null for a rubric seed. */
-  heldout: Heldout | null;
+  heldout: SeedHeldout | null;
   /** `solution.txt` and `weak.txt`, as text. */
   solution: string;
   weak: string;
@@ -201,6 +204,8 @@ export interface SeedAnswers {
  *   tests         the same, of each input and output
  *   all           the whole text of the solution, the weak answer and each known-wrong answer, and
  *                 each line of 40 or more characters of them
+ *   salt          the held-out document's salt, as text: with it, the commitment of a short answer
+ *                 can be found by hashing the likely answers
  *
  * Values of one or two characters and the common words are left out (`worthLookingFor`). The
  * second half of the guard, a table of cases in one file, is `caseStrings`.
@@ -236,6 +241,7 @@ export function answerCandidates(seed: SeedAnswers): Candidate[] {
     if (value.length < LONG_CASE_LENGTH || inQuestion(value)) continue;
     add("case string", value);
   }
+  if (heldout?.salt !== undefined) add("held-out salt", heldout.salt, "text");
 
   const wholeAndLines = (what: string, text: string): void => {
     const trimmed = text.trim();
@@ -263,7 +269,7 @@ export function answerCandidates(seed: SeedAnswers): Candidate[] {
  * for the table rule: a file that holds `CASE_SET_SHARE` of them (and `CASE_SET_MIN`) has copied
  * the table, however generic each case is. Empty for the other kinds.
  */
-export function caseStrings(heldout: Heldout | null): string[] {
+export function caseStrings(heldout: SeedHeldout | null): string[] {
   if (heldout === null) return [];
   const all: string[] = [];
   if ("regex_cases" in heldout)

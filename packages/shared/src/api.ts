@@ -276,6 +276,28 @@ export const AgentDetailResponseSchema = z.object({
 });
 export type AgentDetailResponse = z.infer<typeof AgentDetailResponseSchema>;
 
+// ---- Posters ----------------------------------------------------------------------------------
+
+/**
+ * `GET /v1/posters/:account`: an account's record as a poster, counted from the index. Any account
+ * id has one, all zeros for an account that has posted nothing.
+ */
+export const PosterRecordResponseSchema = z.object({
+  account: AccountIdSchema,
+  /** The tasks the account has posted. */
+  tasks_posted: U32Schema,
+  /**
+   * Its tasks that were voided after at least one entry was revealed: the verifier picked no one,
+   * or no one picked before the task could be voided. Either way the funders were refunded and the
+   * revealed work was public. An honest task that no entry passed counts too: the figure says what
+   * happened, not why.
+   */
+  voided_after_reveals: U32Schema,
+  /** Whether the team runs the account. */
+  is_team: z.boolean(),
+});
+export type PosterRecordResponse = z.infer<typeof PosterRecordResponseSchema>;
+
 // ---- Entries ----------------------------------------------------------------------------------
 
 /** One entry of an account, with the task it is in. */
@@ -705,6 +727,11 @@ export interface TenderApi {
   getAgent(account: string): Promise<AgentDetailResponse | null>;
   /** `GET /v1/entries?account=`: the newest 500 entries of one account, newest commit first. */
   listEntries(account: string): Promise<AccountEntriesResponse>;
+  /**
+   * `GET /v1/posters/:account`: the tasks an account has posted, and how many of them were voided
+   * after a reveal; all zeros for an account that has posted none.
+   */
+  getPoster(account: string): Promise<PosterRecordResponse>;
   /** `GET /v1/health`: how far the index is behind the chain; a 503 throws an `ApiError`. */
   health(): Promise<HealthResponse>;
   /** `GET /v1/scorecards/:task_id`: the scorecard a task was settled with; null if it has none. */

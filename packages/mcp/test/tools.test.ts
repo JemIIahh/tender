@@ -1357,8 +1357,8 @@ const UNREADABLE =
   "FILE_UNREADABLE: cannot read that file inside TENDER_FILES_DIR. A file is refused when it is " +
   "missing, outside the directory (or reached by a link that leads out), has a second hard link, " +
   "is hidden (a name on its path below the directory starts with a dot), or is in a Tender state " +
-  "directory (TENDER_STATE_DIR, or anything under ~/.tender) or in a folder named drafts; the " +
-  "answer does not say which";
+  "directory (TENDER_STATE_DIR, or anything under ~/.tender), in a folder named drafts, or in the " +
+  "repository's folder of agent keys (.tender/agents); the answer does not say which";
 
 /** The real `node:fs/promises`, for a stub to call through to. */
 const realFs = () => vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
@@ -3268,7 +3268,12 @@ test("post_task_uploads_and_passes_commitment", async () => {
   // The brief and the criteria go up as canonical JSON, and the chain gets the hash of those bytes.
   const brief = canonicalJson(BRIEF);
   const criteria = canonicalJson(CRITERIA);
-  const heldout = canonicalJson(HELDOUT);
+  // The held-out checks were given without a salt: the tool adds one of 32 fresh random bytes, so
+  // the commitment on chain cannot be found by hashing likely answers.
+  const [, heldout = new Uint8Array()] = api.uploadHeldout.mock.calls[0] ?? [];
+  const committed = JSON.parse(new TextDecoder().decode(heldout));
+  expect(committed).toEqual({ ...HELDOUT, salt: expect.stringMatching(/^[0-9a-f]{64}$/) });
+  expect(heldout).toEqual(canonicalJson(committed));
   expect(api.uploadBlob).toHaveBeenCalledTimes(2);
   expect(api.uploadBlob).toHaveBeenNthCalledWith(1, {
     kind: "brief",
@@ -3302,11 +3307,49 @@ test("post_task_uploads_and_passes_commitment", async () => {
     ...api.uploadHeldout.mock.invocationCallOrder,
   );
   expect(lastUpload).toBeLessThan(chain.postTask.mock.invocationCallOrder[0] ?? 0);
+  // The answer gives the document as committed, salt included: a scorecard that publishes it has
+  // to carry exactly this.
   expect(answer).toEqual({
     task_id: "12",
     tx_hash: "TX_POST",
     commit_deadline: "2026-11-04T10:00:00.000Z",
+    heldout: committed,
   });
+});
+
+test("post_task_salts_each_post_afresh_and_keeps_a_salt_it_is_given", async () => {
+  const { callJson, call, chain, api } = await connectWrite({
+    keyKind: "full_access",
+    judgeAccount: "judge.testnet",
+  });
+
+  type Posted = { heldout: { salt: string } };
+  // The same checks posted twice commit to two hashes.
+  const first = (await callJson("post_task", POST_ARGS)) as Posted;
+  const second = (await callJson("post_task", POST_ARGS)) as Posted;
+  expect(first.heldout.salt).not.toBe(second.heldout.salt);
+  const commitments = chain.postTask.mock.calls.map(([input]) => input.heldoutCommitment);
+  expect(new Set(commitments).size).toBe(2);
+
+  // A salt that is given is kept, and it is what the commitment is the hash of.
+  const salt = "ab".repeat(32);
+  const kept = (await callJson("post_task", {
+    ...POST_ARGS,
+    heldout: { ...HELDOUT, salt },
+  })) as Posted;
+  expect(kept.heldout).toEqual({ ...HELDOUT, salt });
+  const bytes = canonicalJson({ ...HELDOUT, salt });
+  expect(api.uploadHeldout).toHaveBeenLastCalledWith(sha256Hex(bytes), bytes);
+  expect(chain.postTask.mock.lastCall?.[0].heldoutCommitment).toBe(sha256Hex(bytes));
+
+  // One that is no salt is refused before anything is uploaded or sent.
+  const uploads = api.uploadBlob.mock.calls.length;
+  const posts = chain.postTask.mock.calls.length;
+  const bad = await call("post_task", { ...POST_ARGS, heldout: { ...HELDOUT, salt: "42" } });
+  expect(bad.isError).toBe(true);
+  expect(bad.text).toMatch(/^INVALID_HELDOUT: .*salt/);
+  expect(api.uploadBlob.mock.calls.length).toBe(uploads);
+  expect(chain.postTask.mock.calls.length).toBe(posts);
 });
 
 test("post_task_without_a_heldout_part_or_a_verifier_or_a_token", async () => {
@@ -6015,6 +6058,33 @@ test("a_file_in_another_accounts_default_state_dir_is_unreadable", async () => {
   expect(
     await linked.call("commit_result", { task_id: "9", file_path: join(stateRoot, "notes.txt") }),
   ).toEqual({ isError: true, text: UNREADABLE });
+});
+
+test("a_file_in_the_folder_of_agent_keys_is_unreadable_even_as_the_files_directory", async () => {
+  // `connect_to_tender` and `pnpm agent:init` write full-access keys to the repository's
+  // .tender/agents. With TENDER_FILES_DIR set to that folder, a commit_result that a brief steered
+  // to another agent's key file would publish the key at the reveal, and the secret check knows
+  // this server's key only (review M5). The folder is kept out like a state directory.
+  const keys = join(await realpath(root), "agents");
+  await mkdir(keys);
+  await writeFile(join(keys, "other.json"), '{"account_id":"other.testnet","private_key":"x"}');
+  const kit = await connectWrite({ filesDir: keys, keysDir: keys });
+  vi.mocked(open).mockClear();
+
+  for (const path of [join(keys, "other.json"), keys]) {
+    expect(await kit.call("commit_result", { task_id: "7", file_path: path }), path).toEqual({
+      isError: true,
+      text: UNREADABLE,
+    });
+  }
+  expect(open).not.toHaveBeenCalled();
+  expect(kit.chain.commit).not.toHaveBeenCalled();
+
+  // The description says so; without `keysDir` the folder kept out is the repository's own.
+  const { tools } = await kit.mcp.listTools();
+  expect(tools.find((tool) => tool.name === "commit_result")?.description).toMatch(
+    /repository's folder of agent keys, \.tender\/agents/,
+  );
 });
 
 test("the_default_state_root_is_kept_out_without_being_told", async () => {

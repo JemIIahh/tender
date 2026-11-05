@@ -22,6 +22,8 @@ import {
   putCriteria,
   putHeldout,
   resetDb,
+  SALT,
+  salted,
   TEAM_POSTER,
   taskView,
   testDb,
@@ -42,7 +44,7 @@ const EXACT = {
   has_heldout: true,
   normalize: ["trim"],
 };
-const EXACT_HELDOUT = { exact: { expected: ["42"] } };
+const EXACT_HELDOUT = salted({ exact: { expected: ["42"] } });
 const JSON_SCHEMA = {
   version: 1,
   kind: "json_schema",
@@ -51,7 +53,9 @@ const JSON_SCHEMA = {
   has_heldout: true,
   schema: { type: "object", required: ["total"] },
 };
-const JSON_SCHEMA_HELDOUT = { json_schema: { assertions: [{ path: "$.total", equals: 42 }] } };
+const JSON_SCHEMA_HELDOUT = salted({
+  json_schema: { assertions: [{ path: "$.total", equals: 42 }] },
+});
 const REGEX = {
   version: 1,
   kind: "regex_cases",
@@ -60,7 +64,7 @@ const REGEX = {
   has_heldout: false,
   examples: { match: ["a"], no_match: ["b"] },
 };
-const REGEX_HELDOUT = { regex_cases: { match: ["aa"], no_match: ["bb"] } };
+const REGEX_HELDOUT = salted({ regex_cases: { match: ["aa"], no_match: ["bb"] } });
 const RUBRIC = {
   version: 1,
   kind: "rubric",
@@ -178,7 +182,7 @@ async function jsonSchemaTask(
 ): Promise<Partial<TaskView>> {
   return {
     criteria_hash: await putCriteria(db, { ...JSON_SCHEMA, schema }),
-    heldout_commitment: await putHeldout(db, heldout),
+    heldout_commitment: await putHeldout(db, salted(heldout)),
   };
 }
 
@@ -804,7 +808,10 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
       reason: "held-out checks are for another kind",
       view: async () => ({
         criteria_hash: await putCriteria(db, EXACT),
-        heldout_commitment: await putHeldout(db, { regex_cases: { match: ["x"], no_match: [] } }),
+        heldout_commitment: await putHeldout(
+          db,
+          salted({ regex_cases: { match: ["x"], no_match: [] } }),
+        ),
       }),
     },
     {
@@ -812,7 +819,7 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
       reason: "held-out checks invalid",
       view: async () => ({
         criteria_hash: await putCriteria(db, EXACT),
-        heldout_commitment: await putHeldout(db, { exact: { expected: [] } }),
+        heldout_commitment: await putHeldout(db, salted({ exact: { expected: [] } })),
       }),
     },
     {
@@ -823,7 +830,17 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
     {
       rule: "held-out checks with a lone surrogate, which have no canonical form",
       reason: "held-out checks invalid",
-      view: () => exactTaskWithRawHeldout(db, bytes('{"exact":{"expected":["\\ud800"]}}')),
+      view: () =>
+        exactTaskWithRawHeldout(db, bytes(`{"exact":{"expected":["\\ud800"]},"salt":"${SALT}"}`)),
+    },
+    {
+      // Stored before the API asked for a salt: refused, as its commitment can be guessed.
+      rule: "held-out checks with no salt",
+      reason: "held-out checks have no salt, so their commitment can be guessed",
+      view: async () => ({
+        criteria_hash: await putCriteria(db, EXACT),
+        heldout_commitment: await putHeldout(db, { exact: { expected: ["42"] } }),
+      }),
     },
     {
       rule: "held-out checks whose bytes are not their canonical form",
@@ -835,7 +852,7 @@ test("intake_rejects_each_rule", { timeout: 60_000 }, async () => {
       reason: "held-out checks too large",
       view: async () => ({
         criteria_hash: await putCriteria(db, EXACT),
-        heldout_commitment: await putHeldout(db, { exact: { expected: [TOO_LONG] } }),
+        heldout_commitment: await putHeldout(db, salted({ exact: { expected: [TOO_LONG] } })),
       }),
     },
     {
@@ -979,7 +996,7 @@ test("intake_accepts_the_p0_kinds", { timeout: 30_000 }, async () => {
 test("intake_accepts_a_tests_task_from_the_team", async () => {
   // Like regex_cases, a tests task may go without held-out checks: the examples are the cases then.
   // With them, the examples may be none, as the held-out cases stand in for them.
-  const heldoutTests = { tests: { cases: [{ input: 2, output: 3 }] } };
+  const heldoutTests = salted({ tests: { cases: [{ input: 2, output: 3 }] } });
   const accepted: Partial<TaskView>[] = [
     { poster: TEAM_POSTER, criteria_hash: await putCriteria(db, TESTS) },
     {
@@ -1140,8 +1157,8 @@ test("a_pending_task_starts_no_worker_and_a_check_is_kept", { timeout: 60_000 },
   const deps = judgeDeps(db, fakeChain(null), { memory });
   const criteriaHash = await putCriteria(db, JSON_SCHEMA);
   const checks = [
-    { json_schema: { assertions: [{ path: "$.total", equals: 1 }] } },
-    { json_schema: { assertions: [{ path: "$.total", equals: 2 }] } },
+    salted({ json_schema: { assertions: [{ path: "$.total", equals: 1 }] } }),
+    salted({ json_schema: { assertions: [{ path: "$.total", equals: 2 }] } }),
   ];
   for (const [i, heldout] of checks.entries()) {
     await insertTask(
@@ -1239,7 +1256,7 @@ test("intake_rejects_heldout_from_non_poster", async () => {
       heldout_commitment: await putRaw(
         db,
         "result",
-        canonicalJson({ exact: { expected: ["43"] } }),
+        canonicalJson(salted({ exact: { expected: ["43"] } })),
       ),
     }),
   );
@@ -1348,7 +1365,7 @@ test("intake_takes_a_posters_upload_that_is_stored_but_not_recorded_yet", async 
   const strangers = await putBlob(db, {
     kind: "heldout",
     contentType: "application/json",
-    bytes: canonicalJson({ exact: { expected: ["43"] } }),
+    bytes: canonicalJson(salted({ exact: { expected: ["43"] } })),
     uploader: "mallory.test.near",
     isPublic: false,
   });
@@ -1419,7 +1436,7 @@ test("intake_does_not_wait_for_a_poster_whose_upload_cannot_take_the_bytes", asy
   const heldout_commitment = await putRaw(
     db,
     "result",
-    canonicalJson({ exact: { expected: ["43"] } }),
+    canonicalJson(salted({ exact: { expected: ["43"] } })),
   );
   expect(
     await intake(1, {
@@ -1498,7 +1515,7 @@ test("intake_rejects_heldout_checks_already_used", async () => {
   expect(await judgeRow(db, 3)).toEqual(usedBy(1));
 
   // Ids compare as numbers, 9 before 10, and an earlier task counts whoever its verifier is.
-  const other = await putHeldout(db, { exact: { expected: ["another answer"] } });
+  const other = await putHeldout(db, salted({ exact: { expected: ["another answer"] } }));
   const verifiers: [string, string][] = [
     ["9", "other-judge.test.near"],
     ["10", JUDGE],

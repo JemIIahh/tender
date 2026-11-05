@@ -31,6 +31,8 @@ import {
   type ListTasksResponse,
   ListTasksResponseSchema,
   MAX_RESULT_BYTES,
+  type PosterRecordResponse,
+  PosterRecordResponseSchema,
   type QuestionResponse,
   QuestionResponseSchema,
   type Scorecard,
@@ -478,6 +480,17 @@ export class ApiClient implements TenderApi {
       fetchJson(
         this.url(`/entries${queryOf({ account })}`),
         AccountEntriesResponseSchema,
+        get(signal),
+        this.fetchImpl,
+      ),
+    );
+  }
+
+  getPoster(account: string): Promise<PosterRecordResponse> {
+    return this.timed("getPoster", (signal) =>
+      fetchJson(
+        this.url(`/posters/${encodeURIComponent(account)}`),
+        PosterRecordResponseSchema,
         get(signal),
         this.fetchImpl,
       ),

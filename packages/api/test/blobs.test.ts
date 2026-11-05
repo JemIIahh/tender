@@ -45,7 +45,7 @@ import {
 } from "../src/index";
 import { publicDocument } from "../src/queries";
 import { blobRoutes } from "../src/routes/blobs";
-import { resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
+import { resetDb, SALT, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 
 // The blob store and the held-out intake. The upload routes are mounted on an app of their own
 // with `stubAuth`, which reads the signed-in account from a header, so these tests do not sign in;
@@ -183,7 +183,7 @@ const CRITERIA: PublicCriteria = {
 /** The winners of the captured `picked` event, as a scorecard names them: account and share. */
 const PICKED_WINNERS = fixtureData("picked").winners.map(({ account, bps }) => ({ account, bps }));
 
-const HELDOUT = { exact: { expected: ["42"] } };
+const HELDOUT = { exact: { expected: ["42"] }, salt: SALT };
 const HELDOUT_BYTES = canonicalJson(HELDOUT);
 const HELDOUT_HASH = sha256Hex(HELDOUT_BYTES);
 
@@ -1055,7 +1055,7 @@ test("heldout_hash_must_match_commitment", async () => {
   expect(await heldoutUploadersOf(HELDOUT_HASH)).toEqual([poster]);
 
   // Bytes that do not hash to the commitment are refused, however good they are.
-  const other = canonicalJson({ exact: { expected: ["43"] } });
+  const other = canonicalJson({ exact: { expected: ["43"] }, salt: SALT });
   const wrongHash = await upload(HELDOUT_HASH, other);
   expect(wrongHash.status).toBe(400);
   expect(wrongHash.body.error).toBe("bad_request");
@@ -1074,9 +1074,12 @@ test("heldout_hash_must_match_commitment", async () => {
   // The hash matches but the bytes are not a held-out document: the poster committed to rubbish.
   for (const document of [
     {},
-    { exact: { expected: [] } },
-    { exact: { expected: ["1"] }, tests: { cases: [] } },
+    { exact: { expected: [] }, salt: SALT },
+    { exact: { expected: ["1"] }, tests: { cases: [] }, salt: SALT },
     [1],
+    // Checks with no salt: their commitment could be found by hashing the likely answers.
+    { exact: { expected: ["42"] } },
+    { exact: { expected: ["42"] }, salt: "too short" },
   ]) {
     const bytes = canonicalJson(document);
     const rubbish = await upload(sha256Hex(bytes), bytes);
@@ -1413,7 +1416,9 @@ test("json_kinds_must_be_canonical", async () => {
   expect(heldout.status).toBe(400);
   expect(heldout.body.message).toBe("not canonical JSON");
   // A lone surrogate is refused there as well. The commitment is the hash of the bytes sent.
-  const lone = utf8(textOf({ exact: { expected: ["X"] } }).replace("X", String.raw`\ud800`));
+  const lone = utf8(
+    textOf({ exact: { expected: ["X"] }, salt: SALT }).replace("X", String.raw`\ud800`),
+  );
   const loneHeldout = await post<ErrorBody>(
     "/v1/heldout",
     { commitment: sha256Hex(lone), content_base64: b64(lone) },
@@ -1516,7 +1521,7 @@ test("heldout_is_recorded_for_every_account_that_sends_it", async () => {
   expect(await heldoutUploadersOf(HELDOUT_HASH)).toEqual([carol, poster]);
 
   // Bytes stored as another kind are a 409, and no one is recorded for them.
-  const answers = canonicalJson({ exact: { expected: ["44"] } });
+  const answers = canonicalJson({ exact: { expected: ["44"] }, salt: SALT });
   await putBlob(deps.db, {
     kind: "result",
     contentType: "text/plain",
@@ -2084,7 +2089,9 @@ test("public_document_is_returned_as_parsed_from_its_bytes", async () => {
 test("scorecard_with_proto_key_is_never_served_with_the_key_missing", async () => {
   await seedLifecycle(deps.db);
   // `JSON.parse` makes `__proto__` an own key, which an object literal or an assignment would not.
-  const heldout: unknown = JSON.parse('{"exact":{"expected":["42"]},"__proto__":{"seen":true}}');
+  const heldout: unknown = JSON.parse(
+    `{"exact":{"expected":["42"]},"salt":"${SALT}","__proto__":{"seen":true}}`,
+  );
   expect(Object.keys(heldout as object)).toContain("__proto__");
   const bytes = canonicalJson(
     scorecardOf("3", {
@@ -2895,7 +2902,7 @@ test("a_stranger_who_stores_the_heldout_first_does_not_keep_it_from_its_poster",
 
   // The other order is no trouble either: the poster first, then the stranger, whose upload is
   // recorded and changes nothing for the poster's next task with other checks.
-  const second = canonicalJson({ exact: { expected: ["43"] } });
+  const second = canonicalJson({ exact: { expected: ["43"] }, salt: SALT });
   await apply(
     taskLine(6, {
       criteria_hash: sha256Hex(canonicalJson(CRITERIA)),
@@ -2985,7 +2992,7 @@ test("uploads_are_counted_per_account_across_both_routes", async () => {
 
   // A fourth, to either route, is a 429 with `Retry-After`, and nothing of it is kept.
   const blobs = await blobCount();
-  const another = canonicalJson({ exact: { expected: ["43"] } });
+  const another = canonicalJson({ exact: { expected: ["43"] }, salt: SALT });
   expectRefused(await post("/v1/blobs", brief("two"), alice, app), 429, RATE_LIMITED, HOUR_MS);
   expectRefused(
     await post("/v1/heldout", heldoutBody(another), alice, app),
@@ -3051,7 +3058,7 @@ test("upload_bytes_are_held_to_a_budget_for_each_account", async () => {
 test("each_route_has_a_pool_of_its_own_and_the_team_is_held_to_neither", async () => {
   await seed();
   const size = briefOf("one").length;
-  const another = canonicalJson({ exact: { expected: ["43"] } });
+  const another = canonicalJson({ exact: { expected: ["43"] }, salt: SALT });
   const app = appWith({
     teamAccounts: [carol],
     rateLimits: {
@@ -3082,6 +3089,44 @@ test("each_route_has_a_pool_of_its_own_and_the_team_is_held_to_neither", async (
   expect((await heldout(carol, another)).status).toBe(200);
   expect(await heldoutUploadersOf(sha256Hex(another))).toEqual([carol]);
   expectRefused(await brief(bob, "two"), 503, BLOBS_USED_UP, HOUR_MS);
+});
+
+test("an_entrants_result_has_a_budget_of_its_own_that_a_flood_of_other_uploads_cannot_spend", async () => {
+  // Throwaway accounts that fill the shared pool would block every other entrant's upload, and so
+  // its reveal, while the attacker's own result is stored already. An account with a commitment on
+  // a task that has not revealed and whose reveals are still open uploads its result from a budget
+  // of its own: the most bytes the task's brief lets a result have (the captured brief: 4096).
+  await seed();
+  await openTask(2, REVEAL_DEADLINE, [carol, alice], { brief_hash: FIXTURE_BRIEF_HASH });
+  const size = briefOf("one").length;
+  const app = appWith({ rateLimits: { blobBytesTotal: { limit: size, windowMs: HOUR_MS } } });
+  const brief = (account: string, title: string) =>
+    post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf(title)), account, app);
+  const result = (account: string, content: string | Uint8Array, taskId = "2") =>
+    post<ErrorBody>("/v1/blobs", resultBody(content, taskId), account, app);
+
+  // Bob's brief takes the whole pool: the next new upload to the route by anyone is a 503.
+  expect((await brief(bob, "one")).status).toBe(200);
+  expectRefused(await brief(poster, "two"), 503, BLOBS_USED_UP, HOUR_MS);
+
+  // Carol's result goes up all the same, and so does alice's, each from its own budget.
+  expect((await result(carol, "the answer is 42")).status).toBe(200);
+  expect((await result(alice, "the answer is 41")).status).toBe(200);
+  expect(await uploadsOf(sha256Hex("the answer is 42"))).toEqual([
+    { task_id: "2", account: carol },
+  ]);
+
+  // The budget is the brief's limit for each entrant and task: past it, the pool again.
+  expect((await result(carol, new Uint8Array(4096 - 16).fill(97))).status).toBe(200);
+  expectRefused(await result(carol, "one byte too many"), 503, BLOBS_USED_UP, HOUR_MS);
+
+  // Once alice has revealed, her uploads for the task are the pool's like anyone's.
+  await reveal(2, alice, "the answer is 41");
+  expectRefused(await result(alice, "a second thought"), 503, BLOBS_USED_UP, HOUR_MS);
+
+  // An entry whose reveals are over has no budget of its own either.
+  await openTask(3, TEST_NOW, [carol]);
+  expectRefused(await result(carol, "too late", "3"), 503, BLOBS_USED_UP, HOUR_MS);
 });
 
 test("bytes_that_are_stored_already_cost_nothing", async () => {

@@ -17,6 +17,11 @@
 // task that committed to some: its verifier chose not to publish them (a pick made by hand on the
 // web app's task page publishes none), and the pick cannot be re-run against them.
 //
+// A held-out document carries a `salt` of random bytes beside its checks, and the hash is of the
+// whole document, salt included. Without one, the commitment of a short answer could have been
+// found by hashing likely answers while the task was open; the script says when the published
+// document has none. That is a note, not a mismatch: the hashes are what they are.
+//
 // It prints one verdict, and exits with its code:
 //   0  VERIFIED       everything that exists matches;
 //   1  MISMATCH       a hash does not: the scorecard served, or the held-out checks it publishes,
@@ -191,6 +196,16 @@ try {
   } else {
     show("chain  heldout_commitment", task.heldout_commitment);
     show("card   sha256(heldout)", sha256(canonical(card.heldout)), task.heldout_commitment);
+    const salted =
+      typeof card.heldout === "object" &&
+      !Array.isArray(card.heldout) &&
+      Object.hasOwn(card.heldout, "salt");
+    show(
+      "card   heldout salt",
+      salted
+        ? "present"
+        : "none: while the task was open, a short answer could be found from the commitment",
+    );
   }
   show("chain  scorecard_hash", task.outcome.scorecard_hash);
   show("api    sha256(scorecard)", sha256(bytes), task.outcome.scorecard_hash);

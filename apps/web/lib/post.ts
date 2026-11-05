@@ -18,6 +18,7 @@ import {
   RUBRIC_MAX_ENTRIES,
   RUBRIC_MIN_SCORE,
   type RubricProblem,
+  randomSalt,
   rubricCriteriaProblem,
   sha256Hex,
   storageDepositCall,
@@ -169,6 +170,13 @@ export interface PostForm {
   /** `regex_cases`, held out: more of the same. The Judge scores on these if there are any. */
   heldoutMatch: string;
   heldoutNoMatch: string;
+  /**
+   * The salt of the held-out checks: 32 random bytes as 64 lowercase hex characters, drawn once for
+   * the form (`emptyForm`), so that every document the steps make of it, the one Review offers as a
+   * file and the one that is posted, has the same commitment. Without it a short answer could be
+   * found by hashing likely answers until one gives the commitment on chain. Not shown or typed.
+   */
+  heldoutSalt: string;
   /** `rubric`, public. */
   rubric: RubricRow[];
 
@@ -250,6 +258,7 @@ export function emptyForm(options: { judgeAccount: string | null }): PostForm {
     examplesNoMatch: "",
     heldoutMatch: "",
     heldoutNoMatch: "",
+    heldoutSalt: randomSalt(),
     rubric: [{ criterion: "", weight: "5" }],
     token: "",
     amount: "",
@@ -770,8 +779,14 @@ function criteriaDocument(form: PostForm): unknown {
   }
 }
 
-/** The held-out document of the form, or null if the form has none. */
+/** The held-out document of the form, its salt included, or null if the form has none. */
 function heldoutDocument(form: PostForm): unknown {
+  const checks = heldoutChecks(form);
+  return checks === null ? null : { ...checks, salt: form.heldoutSalt };
+}
+
+/** The held-out checks of the form, or null if the form has none. */
+function heldoutChecks(form: PostForm): object | null {
   switch (form.kind) {
     case "exact":
       return { exact: { expected: linesOf(form.expected) } };

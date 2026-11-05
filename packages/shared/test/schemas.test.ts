@@ -13,6 +13,7 @@ import {
   formatTokenAmount,
   HashHexSchema,
   type Heldout,
+  type HeldoutChecks,
   HeldoutSchema,
   heldoutMatchesCriteria,
   JsonValueSchema,
@@ -21,8 +22,10 @@ import {
   type PublicCriteria,
   PublicCriteriaSchema,
   parseTokenAmount,
+  randomSalt,
   ScorecardSchema,
   StorageViewSchema,
+  saltHeldout,
   sha256Hex,
   TaskViewSchema,
   tokenMeta,
@@ -775,8 +778,10 @@ const CRITERIA = {
     rubric: [{ criterion: "Answers the question that was asked", weight: 5 }],
   },
 };
+/** A held-out document's salt: any 64 lowercase hex characters will do in a test. */
+const SALT = "5a".repeat(32);
 const HELDOUT = {
-  exact: { exact: { expected: ["42", "42.0"] } },
+  exact: { exact: { expected: ["42", "42.0"] }, salt: SALT },
   json_schema: {
     json_schema: {
       assertions: [
@@ -785,8 +790,9 @@ const HELDOUT = {
         { path: "$.discount", equals: null },
       ],
     },
+    salt: SALT,
   },
-  regex_cases: { regex_cases: { match: ["ab-12", "zz-99"], no_match: ["AB-12"] } },
+  regex_cases: { regex_cases: { match: ["ab-12", "zz-99"], no_match: ["AB-12"] }, salt: SALT },
   tests: {
     tests: {
       cases: [
@@ -794,6 +800,7 @@ const HELDOUT = {
         { input: [], output: null },
       ],
     },
+    salt: SALT,
   },
 };
 
@@ -920,44 +927,101 @@ test("heldout_accepts_one_document_per_kind", () => {
     expect(HeldoutSchema.parse(doc), kind).toEqual(doc);
   }
   // The shape the drafted seeds use.
-  const seedStyle = { regex_cases: { match: ["a"], no_match: ["b"] } };
+  const seedStyle = { regex_cases: { match: ["a"], no_match: ["b"] }, salt: SALT };
   expect(HeldoutSchema.parse(seedStyle)).toEqual(seedStyle);
   // `match` and `no_match` may each be empty; the other kinds need at least one entry.
-  expect(accepts(HeldoutSchema, { regex_cases: { match: [], no_match: [] } })).toBe(true);
+  expect(accepts(HeldoutSchema, { regex_cases: { match: [], no_match: [] }, salt: SALT })).toBe(
+    true,
+  );
+  // A salt is 32 to 64 random bytes in lowercase hex.
+  for (const salt of ["0".repeat(64), "ab".repeat(48), "f".repeat(128), randomSalt()]) {
+    expect(accepts(HeldoutSchema, { ...HELDOUT.exact, salt }), salt).toBe(true);
+  }
 });
 
 test("heldout_rejects_malformed_documents", () => {
   const bad: [string, unknown][] = [
     ["no key", {}],
+    ["a salt and no kind", { salt: SALT }],
     ["two keys", { ...HELDOUT.exact, ...HELDOUT.regex_cases }],
-    ["a key that is no kind", { fuzzy: { expected: ["x"] } }],
-    ["rubric, which has no held-out part", { rubric: [{ criterion: "c", weight: 1 }] }],
+    ["a key that is no kind", { fuzzy: { expected: ["x"] }, salt: SALT }],
+    ["rubric, which has no held-out part", { rubric: [{ criterion: "c", weight: 1 }], salt: SALT }],
     ["not an object", ["exact"]],
     ["null", null],
-    ["a bare shape", { expected: ["x"] }],
-    ["exact without answers", { exact: { expected: [] } }],
-    ["exact with a number", { exact: { expected: [42] } }],
-    ["json_schema without assertions", { json_schema: { assertions: [] } }],
-    ["an assertion with no value", { json_schema: { assertions: [{ path: "$.a" }] } }],
-    ["an assertion with no path", { json_schema: { assertions: [{ equals: 1 }] } }],
-    ["an assertion with an empty path", { json_schema: { assertions: [{ path: "", equals: 1 }] } }],
-    ["tests without cases", { tests: { cases: [] } }],
-    ["a case with no output", { tests: { cases: [{ input: 1 }] } }],
-    ["regex_cases without no_match", { regex_cases: { match: ["a"] } }],
-    ["a shape of another kind", { exact: { match: [], no_match: [] } }],
-    ["a stray key in the shape", { exact: { expected: ["x"], note: "hint" } }],
+    ["a bare shape", { expected: ["x"], salt: SALT }],
+    ["exact without answers", { exact: { expected: [] }, salt: SALT }],
+    ["exact with a number", { exact: { expected: [42] }, salt: SALT }],
+    ["json_schema without assertions", { json_schema: { assertions: [] }, salt: SALT }],
+    ["an assertion with no value", { json_schema: { assertions: [{ path: "$.a" }] }, salt: SALT }],
+    ["an assertion with no path", { json_schema: { assertions: [{ equals: 1 }] }, salt: SALT }],
+    [
+      "an assertion with an empty path",
+      { json_schema: { assertions: [{ path: "", equals: 1 }] }, salt: SALT },
+    ],
+    ["tests without cases", { tests: { cases: [] }, salt: SALT }],
+    ["a case with no output", { tests: { cases: [{ input: 1 }] }, salt: SALT }],
+    ["regex_cases without no_match", { regex_cases: { match: ["a"] }, salt: SALT }],
+    ["a shape of another kind", { exact: { match: [], no_match: [] }, salt: SALT }],
+    ["a stray key in the shape", { exact: { expected: ["x"], note: "hint" }, salt: SALT }],
   ];
   for (const [what, doc] of bad) expect(accepts(HeldoutSchema, doc), what).toBe(false);
 });
 
+test("heldout_needs_a_salt_of_random_bytes", () => {
+  // Without one, the commitment of a short answer is found by hashing the likely answers.
+  const { salt: _salt, ...unsalted } = HELDOUT.exact;
+  const bad: [string, unknown][] = [
+    ["no salt", unsalted],
+    ["an empty salt", { ...unsalted, salt: "" }],
+    ["31 bytes", { ...unsalted, salt: "ab".repeat(31) }],
+    ["65 bytes", { ...unsalted, salt: "ab".repeat(65) }],
+    ["an odd number of hex digits", { ...unsalted, salt: `${"ab".repeat(32)}c` }],
+    ["upper case", { ...unsalted, salt: "AB".repeat(32) }],
+    ["not hex", { ...unsalted, salt: "zz".repeat(32) }],
+    ["a number", { ...unsalted, salt: 42 }],
+    ["null", { ...unsalted, salt: null }],
+  ];
+  for (const [what, doc] of bad) {
+    const result = HeldoutSchema.safeParse(doc);
+    expect(result.success, what).toBe(false);
+    // Reported at the salt, with a message that says what a salt is.
+    expect(
+      result.error?.issues.map((issue) => [issue.path.join("."), issue.message]),
+      what,
+    ).toEqual([["salt", expect.stringMatching(/needs "salt": 64 to 128 lowercase hex/)]]);
+  }
+});
+
+test("salt_heldout_adds_a_fresh_salt_to_checks_without_one", () => {
+  const { salt: _salt, ...checks } = HELDOUT.regex_cases;
+  const first = saltHeldout(checks) as Record<string, unknown>;
+  const second = saltHeldout(checks) as Record<string, unknown>;
+  expect(HeldoutSchema.parse(first)).toEqual(first);
+  expect(first.regex_cases).toBe(checks.regex_cases);
+  expect(first.salt).toMatch(/^[0-9a-f]{64}$/);
+  // Fresh each time, so two tasks with the same checks commit to different hashes.
+  expect(second.salt).not.toBe(first.salt);
+  // The input is not changed.
+  expect(Object.hasOwn(checks, "salt")).toBe(false);
+  // A salt that is there stays, whatever it is: the schema judges it.
+  expect(saltHeldout(HELDOUT.exact)).toBe(HELDOUT.exact);
+  const bad = { ...checks, salt: "short" };
+  expect(saltHeldout(bad)).toBe(bad);
+  // Anything that is no plain object is left alone.
+  for (const other of [null, ["exact"], "exact", 1, undefined]) {
+    expect(saltHeldout(other)).toBe(other);
+  }
+});
+
 test("heldout_and_criteria_keep_their_types", () => {
   // Types, checked by `tsc`: the schemas hand out these shapes, whatever they do inside.
-  expectTypeOf<Heldout>().toEqualTypeOf<
+  expectTypeOf<HeldoutChecks>().toEqualTypeOf<
     | { exact: { expected: string[] } }
     | { json_schema: { assertions: Array<{ path: string; equals: unknown }> } }
     | { regex_cases: { match: string[]; no_match: string[] } }
     | { tests: { cases: Array<{ input: unknown; output: unknown }> } }
   >();
+  expectTypeOf<Heldout>().toEqualTypeOf<HeldoutChecks & { salt: string }>();
   expectTypeOf<Extract<PublicCriteria, { kind: "json_schema" }>["schema"]>().toEqualTypeOf<
     Record<string, unknown>
   >();
@@ -973,38 +1037,48 @@ test("heldout_reports_a_mistake_where_it_is", () => {
     const result = HeldoutSchema.safeParse(doc);
     return result.success ? [] : result.error.issues.map((i) => [i.code, i.path.join(".")]);
   };
-  expect(issues({ regex_cases: { match: ["a"] } })).toEqual([
+  const salted = (doc: Record<string, unknown>) => ({ ...doc, salt: SALT });
+  expect(issues(salted({ regex_cases: { match: ["a"] } }))).toEqual([
     ["invalid_type", "regex_cases.no_match"],
   ]);
-  expect(issues({ regex_cases: { match: ["a"], no_match: [1] } })).toEqual([
+  expect(issues(salted({ regex_cases: { match: ["a"], no_match: [1] } }))).toEqual([
     ["invalid_type", "regex_cases.no_match.0"],
   ]);
-  expect(issues({ exact: { expected: [] } })).toEqual([["too_small", "exact.expected"]]);
-  expect(issues({ exact: { expected: ["x"], note: "hint" } })).toEqual([
+  expect(issues(salted({ exact: { expected: [] } }))).toEqual([["too_small", "exact.expected"]]);
+  expect(issues(salted({ exact: { expected: ["x"], note: "hint" } }))).toEqual([
     ["unrecognized_keys", "exact"],
   ]);
-  expect(issues({ json_schema: { assertions: [{ path: "", equals: 1 }] } })).toEqual([
+  expect(issues(salted({ json_schema: { assertions: [{ path: "", equals: 1 }] } }))).toEqual([
     ["too_small", "json_schema.assertions.0.path"],
   ]);
-  expect(issues({ tests: { cases: [{ input: 1 }] } })).toEqual([
+  expect(issues(salted({ tests: { cases: [{ input: 1 }] } }))).toEqual([
     ["custom", "tests.cases.0.output"],
   ]);
   // A kind with no value (undefined) is not a document that is missing fields.
-  expect(issues({ exact: undefined })).toEqual([["invalid_type", "exact"]]);
+  expect(issues(salted({ exact: undefined }))).toEqual([["invalid_type", "exact"]]);
+  // A missing salt is reported where it is, beside any other mistake.
+  expect(issues({ exact: { expected: [] } })).toEqual([
+    ["invalid_type", "salt"],
+    ["too_small", "exact.expected"],
+  ]);
 
   // A document that is not keyed by one kind.
   const oneKey = [["custom", ""]];
-  expect(issues({})).toEqual(oneKey);
+  expect(issues(salted({}))).toEqual(oneKey);
   expect(issues({ ...HELDOUT.exact, ...HELDOUT.regex_cases })).toEqual(oneKey);
-  expect(issues({ fuzzy: { expected: ["x"] } })).toEqual([["unrecognized_keys", ""]]);
+  expect(issues(salted({ fuzzy: { expected: ["x"] } }))).toEqual([["unrecognized_keys", ""]]);
   expect(issues({ ...HELDOUT.exact, fuzzy: 1 })).toEqual([["unrecognized_keys", ""]]);
-  expect(issues({ rubric: [{ criterion: "c", weight: 1 }] })).toEqual([["unrecognized_keys", ""]]);
+  expect(issues(salted({ rubric: [{ criterion: "c", weight: 1 }] }))).toEqual([
+    ["unrecognized_keys", ""],
+  ]);
   for (const notAnObject of [null, ["exact"], "exact", 1]) {
     expect(issues(notAnObject), JSON.stringify(notAnObject)).toEqual([["invalid_type", ""]]);
   }
   // The message says what a held-out document is.
-  const message = HeldoutSchema.safeParse({}).error?.issues[0]?.message;
-  expect(message).toMatch(/exactly one key.*exact, json_schema, regex_cases or tests/);
+  const message = HeldoutSchema.safeParse(salted({})).error?.issues[0]?.message;
+  expect(message).toMatch(
+    /"salt" and exactly one more key: exact, json_schema, regex_cases or tests/,
+  );
 });
 
 test("heldout_kind_must_match", () => {
@@ -1308,7 +1382,9 @@ test("json_values_nested_beyond_the_call_stack_fail_instead_of_throwing", () => 
     "heldout",
   ]);
   const cases = [{ input: nested(9_999), output: 1 }];
-  expect(failures(HeldoutSchema, { tests: { cases } })).toEqual(["tests.cases.0.input"]);
+  expect(failures(HeldoutSchema, { tests: { cases }, salt: SALT })).toEqual([
+    "tests.cases.0.input",
+  ]);
 });
 
 test("json_values_with_an_own_proto_key_fail_instead_of_losing_it", () => {
@@ -1332,11 +1408,13 @@ test("json_values_with_an_own_proto_key_fail_instead_of_losing_it", () => {
     "examples.0.input",
   ]);
   const assertions = [{ path: "$.a", equals: evil }];
-  expect(failures(HeldoutSchema, { json_schema: { assertions } })).toEqual([
+  expect(failures(HeldoutSchema, { json_schema: { assertions }, salt: SALT })).toEqual([
     "json_schema.assertions.0.equals",
   ]);
   const cases = [{ input: 1, output: evil }];
-  expect(failures(HeldoutSchema, { tests: { cases } })).toEqual(["tests.cases.0.output"]);
+  expect(failures(HeldoutSchema, { tests: { cases }, salt: SALT })).toEqual([
+    "tests.cases.0.output",
+  ]);
   expect(failures(ScorecardSchema, { ...scorecard(), heldout: evil })).toEqual(["heldout"]);
 
   // Only an own key of that name counts: it as a value, close names, and every object's inherited

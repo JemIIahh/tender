@@ -27,6 +27,20 @@ function heldoutHref(heldout: unknown): string | undefined {
 }
 
 /**
+ * Whether published held-out checks have no salt. The held-out checks carry 32 random bytes or
+ * more (`HeldoutSchema`), so that their commitment cannot be found by hashing likely answers while
+ * the task is open; checks without them could have been, if they were short.
+ */
+function unsalted(heldout: unknown): boolean {
+  return (
+    typeof heldout === "object" &&
+    heldout !== null &&
+    !Array.isArray(heldout) &&
+    !Object.hasOwn(heldout, "salt")
+  );
+}
+
+/**
  * Who scored it, in a line. A scorecard whose `judge.software` carries the Judge's name is the
  * Tender Judge's: the API takes such a card from the Judge's account only (P03-R29), and a build
  * that knows the Judge's account holds the card to that too. Any other is named by what it says it
@@ -185,9 +199,22 @@ export function Scorecard({
             ) : href === undefined ? (
               <p>The held-out checks cannot be written out as a file.</p>
             ) : (
-              <a href={href} download="heldout.json" className={SECONDARY}>
-                Held-out checks (JSON)
-              </a>
+              <>
+                <a href={href} download="heldout.json" className={SECONDARY}>
+                  Held-out checks (JSON)
+                </a>
+                {unsalted(scorecard.heldout) ? (
+                  <p data-testid="heldout-unsalted" className="text-seal">
+                    These held-out checks have no salt, so while the task was open a short answer
+                    could have been found from the hash on the task.
+                  </p>
+                ) : (
+                  <p data-testid="heldout-salt">
+                    The file includes its salt, the random value that kept the hash from giving the
+                    answer away before the reveal.
+                  </p>
+                )}
+              </>
             )}
           </>
         )}

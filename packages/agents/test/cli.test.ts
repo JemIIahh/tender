@@ -79,7 +79,7 @@ const LLM_ENV: Record<string, string> = {
 const ARGS = ["--agent", "analyst", "--solver", "offline", "--network", "testnet"];
 const LLM_ARGS = ["--agent", "analyst", "--solver", "llm", "--network", "testnet"];
 const USAGE =
-  "usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent analyst|coder|extractor --solver llm|offline|weak --network sandbox|testnet|mainnet [--max-llm-calls-per-hour N] [--verifiers judge|any|<account>,...] [--min-reward <token>=<amount>]... [--daily-entries N] [--daily-judged-hires N] [--max-voids-after-reveals N]";
+  "usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent analyst|coder|extractor --solver llm|offline|weak --network sandbox|testnet|mainnet [--max-llm-calls-per-hour N] [--verifiers judge|any|<account>,...] [--min-reward <token>=<amount>]... [--daily-entries N] [--daily-judged-hires N] [--max-voids-after-reveals N] [--max-poster-voids N]";
 const KEY_COMMAND =
   "pnpm exec tsx scripts/keeper-key.ts --network testnet --role agent --agent analyst";
 
@@ -886,6 +886,7 @@ test("policy_an_agent_with_a_model_takes_the_judges_tasks_only_20_a_day_and_none
     verifiers: "judge",
     judgeAccount: JUDGE_ACCOUNT,
     minReward: { "usdc.testnet": 10_000n, "tusdc.tender.testnet": 1n },
+    maxPosterVoids: 2,
     dailyEntries: 20,
     dailyJudgedHires: 50,
   });
@@ -978,6 +979,8 @@ test("policy_the_flags_set_the_policy_over_the_defaults_of_the_solver", async ()
     "7",
     "--max-voids-after-reveals",
     "0",
+    "--max-poster-voids",
+    "5",
   ];
   const llm = await start([...LLM_ARGS, ...flags], {
     env: { ...ENV, ...LLM_ENV },
@@ -989,6 +992,7 @@ test("policy_the_flags_set_the_policy_over_the_defaults_of_the_solver", async ()
     verifiers: ["a.testnet", "b.testnet"],
     minReward: { "usdc.testnet": 2_000_000n, "tusdc.tender.testnet": 1n, "other.testnet": 5n },
     maxVoidsAfterReveals: 0,
+    maxPosterVoids: 5,
     dailyEntries: 5,
     dailyJudgedHires: 7,
   });
@@ -1044,6 +1048,8 @@ test("policy_a_flag_of_the_policy_that_cannot_be_read_is_a_usage_error_that_quot
     // Written with `=`: node refuses a value that starts with a dash as a separate argument.
     [["--max-voids-after-reveals=-1"], "--max-voids-after-reveals must be a whole number from 0"],
     [["--max-voids-after-reveals=1.5"], "--max-voids-after-reveals must be a whole number from 0"],
+    [["--max-poster-voids=-1"], "--max-poster-voids must be a whole number from 0"],
+    [["--max-poster-voids", "SECRET-8"], "--max-poster-voids must be a whole number from 0"],
   ];
   for (const [flags, sentence] of cases) {
     const what = flags.join(" ");
@@ -1062,6 +1068,7 @@ test("policy_a_flag_of_the_policy_that_cannot_be_read_is_a_usage_error_that_quot
   expect(parseCli([...ARGS, "--max-voids-after-reveals", "0"])).toMatchObject({
     maxVoidsAfterReveals: 0,
   });
+  expect(parseCli([...ARGS, "--max-poster-voids", "0"])).toMatchObject({ maxPosterVoids: 0 });
   // None of them is there unless its flag is.
   expect(Object.keys(parseCli(ARGS)).sort()).toEqual(["agent", "network", "solver"]);
 });

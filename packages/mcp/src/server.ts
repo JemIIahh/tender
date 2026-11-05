@@ -107,6 +107,14 @@ export interface McpDeps {
    * default root, and a test says where it is. The path need not exist, nor be a real path.
    */
   stateRoot?: string;
+  /**
+   * The repository's folder of agent keys (`.tender/agents`), where `pnpm agent:init`, `pnpm
+   * agent:connect` and `connect_to_tender` write full-access keys. `commit_result` reads no file
+   * inside it either, whatever `filesDir` is: a reveal would publish another agent's key, and the
+   * secret check knows only this server's own. Not set means the repository's own; a test says
+   * where it is. The path need not exist, nor be a real path.
+   */
+  keysDir?: string;
   /** How an open file is traced back to a path. Not set means the process's own (the real one). */
   openFiles?: OpenFileLookup;
   /**

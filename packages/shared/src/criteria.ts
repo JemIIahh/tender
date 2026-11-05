@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { randomSalt } from "./hash";
 
 /** Basis points in a whole. */
 const BPS_WHOLE = 10_000;
@@ -167,43 +168,69 @@ const TestsHeldoutSchema = z.strictObject({
   cases: z.array(z.strictObject({ input: JsonValueSchema, output: JsonValueSchema })).min(1),
 });
 
-/** A held-out document: one key, the criteria kind, whose value has that kind's shape. */
-export type Heldout =
+/**
+ * The checks of a held-out document: one key, the criteria kind, whose value has that kind's shape.
+ * What the Judge scores with; a document also carries its `salt` (`Heldout`).
+ */
+export type HeldoutChecks =
   | { exact: z.infer<typeof ExactHeldoutSchema> }
   | { json_schema: z.infer<typeof JsonSchemaHeldoutSchema> }
   | { regex_cases: z.infer<typeof RegexCasesHeldoutSchema> }
   | { tests: z.infer<typeof TestsHeldoutSchema> };
 
+/** A held-out document: its checks, under the criteria kind, and its `salt`. */
+export type Heldout = HeldoutChecks & { salt: string };
+
 const HELDOUT_RULE =
-  "a held-out document has exactly one key: exact, json_schema, regex_cases or tests";
+  'a held-out document has "salt" and exactly one more key: exact, json_schema, regex_cases or tests';
+
+/** 32 to 64 random bytes, as 64 to 128 lowercase hex characters. */
+const HELDOUT_SALT = /^(?:[0-9a-f]{2}){32,64}$/;
+const SALT_RULE =
+  'a held-out document needs "salt": 64 to 128 lowercase hex characters of fresh random bytes ' +
+  "(randomSalt makes 64), so that its commitment cannot be guessed from a short answer";
 
 /**
  * The held-out half of a task's criteria: the hidden answers and cases the Judge scores with. It
  * is stored as `canonicalJson` bytes, the task's `heldout_commitment` on chain is the SHA-256 of
  * them, and the scorecard publishes the document so anyone can check that.
  *
- * An object with exactly one key, the criteria kind, whose value has that kind's shape:
- * `{"regex_cases": {"match": [...], "no_match": [...]}}`. A `rubric` has no held-out document.
- * The schema checks the shape; `heldoutMatchesCriteria` checks that the kind is the task's.
+ * An object with a `salt` and exactly one more key, the criteria kind, whose value has that kind's
+ * shape: `{"regex_cases": {"match": [...], "no_match": [...]}, "salt": "<64 hex>"}`. A `rubric` has
+ * no held-out document. The schema checks the shape; `heldoutMatchesCriteria` checks that the kind
+ * is the task's.
+ *
+ * The salt is at least 32 random bytes that whoever writes the document draws afresh
+ * (`randomSalt`, `saltHeldout`). The commitment is public from the moment the task is posted, and
+ * the checks of many tasks are short (a count, a total): without the salt, anyone could hash the
+ * likely answers until one gives the commitment, and enter it without doing the work. The scorers
+ * ignore it, and the scorecard publishes it with the checks, so the commitment can still be
+ * recomputed. A document without one is refused, by the API's upload and by the Judge's intake.
  *
  * The key picks the shape, so a mistake inside it is reported where it is, such as a missing
  * `regex_cases.no_match`, and not as a failure to match any of the four.
  */
 export const HeldoutSchema = z
   .strictObject({
+    salt: z.string({ error: SALT_RULE }).regex(HELDOUT_SALT, { error: SALT_RULE }),
     exact: z.exactOptional(ExactHeldoutSchema),
     json_schema: z.exactOptional(JsonSchemaHeldoutSchema),
     regex_cases: z.exactOptional(RegexCasesHeldoutSchema),
     tests: z.exactOptional(TestsHeldoutSchema),
   })
   // Checked last, once the keys that are there are known and well formed, so it is the only
-  // thing reported for `{}` and for two kinds at once.
-  .refine((document) => Object.keys(document).length === 1, {
+  // thing reported for a document with no kind and for two kinds at once.
+  .refine((document) => kindsOf(document).length === 1, {
     error: HELDOUT_RULE,
     when: (payload) => payload.issues.length === 0,
   })
-  // Exactly one of the four keys is set, so the document is one member of `Heldout`.
+  // The salt and exactly one of the four kinds are set, so the document is one member of `Heldout`.
   .transform((document) => document as Heldout);
+
+/** The keys of `document` that hold checks: every key but the salt. */
+function kindsOf(document: object): string[] {
+  return Object.keys(document).filter((key) => key !== "salt");
+}
 
 /**
  * Whether `heldout` is of the kind `criteria` asks for. A held-out document that is valid on its
@@ -211,6 +238,19 @@ export const HeldoutSchema = z
  * document matches it.
  */
 export function heldoutMatchesCriteria(criteria: PublicCriteria, heldout: Heldout): boolean {
-  const keys = Object.keys(heldout);
+  const keys = kindsOf(heldout);
   return keys.length === 1 && keys[0] === criteria.kind;
+}
+
+/**
+ * `document` with a fresh salt (`randomSalt`) when it is a plain object without one: what a post
+ * flow commits to when its author gave only the checks. Anything else is given back as it is, for
+ * `HeldoutSchema` to judge, a salt the author chose included. Never changes `document`.
+ */
+export function saltHeldout(document: unknown): unknown {
+  if (typeof document !== "object" || document === null || Array.isArray(document)) {
+    return document;
+  }
+  if (Object.hasOwn(document, "salt")) return document;
+  return { ...document, salt: randomSalt() };
 }

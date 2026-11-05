@@ -155,8 +155,8 @@ export TENDER_SEEDS_PRIVATE_DIR=<private dir>
 pnpm seed --network testnet
 ```
 
-- `pnpm seed` reads each seed's `heldout.json` from the private directory. A seed whose file is missing stops the run before anything is posted.
-- Held-out checks are single-use. They are published in the scorecard when the task is judged. The script skips a seed whose checks are already public or already used by a task of the same poster, so running it again posts nothing twice.
+- `pnpm seed` reads each seed's `heldout.json` from the private directory. A seed whose file is missing, or has no `salt`, stops the run before anything is posted. Back the directory up, then run `pnpm exec tsx scripts/salt-heldout.ts <private dir>`: it gives a new salt to each file that has none, and to each whose checks changed since its salt was drawn (a salt it draws ends in a fingerprint of its checks, so it can tell; a salt it did not draw is replaced too). It leaves a file alone whose salt was drawn for the checks it holds.
+- Held-out checks and their salt are single-use. Both are published in the scorecard when the task is judged. The script skips a seed whose checks are already public or already used by a task of the same poster, so running it again posts nothing twice. A seed rewritten after it was judged needs new checks and a new salt: run `salt-heldout.ts` after changing the checks. `pnpm seed` stops, before anything is paid, on a seed whose salt a scorecard of the poster has published, and says so.
 - Back the private directory up somewhere that is not the repository and not the services host. The Docker build leaves out `seeds-private/`, but a directory elsewhere is never copied in.
 - If the variable is not set, the script looks for `seeds-private/` in the repository, which git ignores. Never put the directory inside `seeds/`, which is tracked. `scripts/check-public.test.ts` and `seeds/no-answers-in-tree.test.ts` fail if an answer-like value or a secret turns up in a tracked file.
 - The thirty seeds, their rewards and the poster are the team's. They are labelled as ours.
@@ -204,6 +204,7 @@ Leave `NEXT_PUBLIC_DEV_WALLET*` unset. It works on the sandbox only.
 | 200, `ok: true`, `waiting_for_chain: true` | The services are waiting for the chain before they index: the RPC node does not answer, or is behind the database. The API still serves, and `lag_blocks` can read 0 for a node that is behind, so `lag_blocks` alone would miss this |
 | 503, `ok: false`, `error: "chain_unavailable"` | The API cannot read the chain's final height |
 | No response | The process is down |
+| 429, `error: "rate_limited"` | The monitor asks more than 300 times a minute from one address (`rateLimits.health`). The chain's height in a 200 is at most 2 seconds old: one read of the node serves every request in that time |
 
 Alert on:
 

@@ -15,6 +15,7 @@ import {
   putHeldout,
   putResult,
   resetDb,
+  salted,
   taskView,
   testDb,
 } from "./helpers";
@@ -128,7 +129,7 @@ const EXACT = {
   has_heldout: true,
   normalize: ["trim", "lowercase"],
 };
-const HELDOUT = { exact: { expected: ["42"] } };
+const HELDOUT = salted({ exact: { expected: ["42"] } });
 
 /** What a hostile board says: the Judge is told to change the scoring, and the answers to give. */
 const HOSTILE = [

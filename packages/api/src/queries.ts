@@ -5,6 +5,7 @@ import {
   type ListServicesResponse,
   type MetricsResponse,
   type Phase,
+  type PosterRecordResponse,
   type PublicCriteria,
   PublicCriteriaSchema,
   type Scorecard,
@@ -497,6 +498,36 @@ export async function getAgentDetail(
       revealed,
       won,
     })),
+  };
+}
+
+// ---- Posters ----------------------------------------------------------------------------------
+
+/**
+ * `account`'s record as a poster: the tasks it has posted, and those of them that were voided with
+ * at least one entry revealed (an empty pick, or a void once the fallback deadline passed). An
+ * account that has posted nothing has a record of zeros. It is labelled as a task's poster is
+ * (`is_team_poster`), by `teamAccounts`.
+ */
+export async function getPosterRecord(
+  db: Db,
+  account: string,
+  teamAccounts: readonly string[],
+): Promise<PosterRecordResponse> {
+  const [row] = await db.query<Omit<PosterRecordResponse, "account">>(
+    `select count(*)::int as tasks_posted,
+            (count(*) filter (where t.outcome ->> 'kind' = 'voided' and t.reveal_count > 0))::int
+              as voided_after_reveals,
+            ${teamSql("$1::text", "$2")} as is_team
+       from tasks t
+      where t.poster = $1`,
+    [account, [...teamAccounts]],
+  );
+  return {
+    account,
+    tasks_posted: row?.tasks_posted ?? 0,
+    voided_after_reveals: row?.voided_after_reveals ?? 0,
+    is_team: row?.is_team === true,
   };
 }
 

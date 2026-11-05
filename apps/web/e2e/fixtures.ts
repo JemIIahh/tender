@@ -127,6 +127,7 @@ const CORS = { "access-control-allow-origin": "*" };
 /** A held-out document, and the hash a task commits to for it, as an honest verifier publishes. */
 export const HELDOUT = {
   regex_cases: { match: ["alice.near", "bob.testnet"], no_match: ["-bad", "UPPER"] },
+  salt: "5a".repeat(32),
 };
 export const HELDOUT_COMMITMENT = sha256Hex(canonicalJson(HELDOUT));
 

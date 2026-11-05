@@ -45,6 +45,7 @@ import {
   POSTER,
   picked,
   type TaskSpec,
+  TEAM_POSTER,
   TOKEN,
   taskDetailResponse,
   taskEntry,
@@ -202,6 +203,8 @@ interface Harness {
   solve: Mock<Solver["solve"]>;
   /** What `api.getAgent` gives: the verifiers' records, for a policy that reads them. */
   getAgent: Mock<TenderApi["getAgent"]>;
+  /** What `api.getPoster` gives: the posters' records, for a policy that reads them. */
+  getPoster: Mock<TenderApi["getPoster"]>;
   client: AgentChain;
   api: TenderApi;
   solver: Solver;
@@ -250,8 +253,9 @@ async function harness(
     services: h.services,
     next_cursor: null,
   }));
-  // No verifier's record is read unless a test's policy asks for one.
+  // No verifier's or poster's record is read unless a test's policy asks for one.
   const getAgent = vi.fn<TenderApi["getAgent"]>(unexpected("getAgent"));
+  const getPoster = vi.fn<TenderApi["getPoster"]>(unexpected("getPoster"));
   const api: TenderApi = {
     listTasks,
     getTask,
@@ -259,6 +263,7 @@ async function harness(
     uploadBlob: upload,
     listAgents: unexpected("listAgents"),
     getAgent,
+    getPoster,
     listEntries,
     health: unexpected("health"),
     getScorecard: unexpected("getScorecard"),
@@ -322,6 +327,7 @@ async function harness(
     entries,
     solve,
     getAgent,
+    getPoster,
     client,
     api,
     solver,
@@ -1764,6 +1770,116 @@ test("policy_a_task_whose_verifier_the_agent_does_not_let_check_its_work_is_skip
   );
 });
 
+test("policy_judge_only_enters_a_task_only_once_the_judge_has_accepted_it", async () => {
+  // A task the Judge has not accepted yet (null: not looked at; pending: waiting for its held-out
+  // checks) may never be judged: a poster who never sends the checks gets the revealed work and a
+  // full refund. With the Judge-only policy, such a task waits, unseen and unannounced, and is
+  // looked at again each tick; a rejected one is skipped for good.
+  const h = await harness(undefined, { scripted: false });
+  h.policy = { verifiers: "judge", judgeAccount: JUDGE };
+  const fresh = h.world.add({ id: 1, judgeStatus: null });
+  const waiting = h.world.add({ id: 2, judgeStatus: "pending" });
+  h.world.add({ id: 3, judgeStatus: "accepted" });
+  h.world.add({ id: 4, judgeStatus: "rejected", judgeReason: "held-out checks missing" });
+
+  await h.tick();
+  await h.tick();
+
+  expect(idsOf(h.commit)).toEqual([3n]);
+  expect(idsOf(h.start)).toEqual([3n]);
+  expect(h.solve).toHaveBeenCalledTimes(1);
+  // Unseen: fetched again on each tick, and not logged as a skip.
+  expect(h.getTask.mock.calls.filter(([id]) => id === 1n || id === 2n)).toHaveLength(4);
+  expect(h.logs.filter((line) => line.includes("skipping"))).toEqual([
+    "alice: skipping task 4, the Judge rejected it: held-out checks missing",
+  ]);
+  // Said once for each task that waits, however many ticks it waits.
+  expect(h.logs.filter((line) => line.includes("waits until the Judge"))).toEqual([
+    "alice: task 2 waits until the Judge has accepted it (it is pending)",
+    "alice: task 1 waits until the Judge has accepted it (it has not looked at it yet)",
+  ]);
+
+  // Once the Judge accepts them, they are entered.
+  fresh.judgeStatus = "accepted";
+  waiting.judgeStatus = "accepted";
+  await h.tick();
+  expect(idsOf(h.commit)).toEqual([1n, 2n, 3n]);
+});
+
+test("policy_without_judge_only_enters_a_task_the_judge_has_not_accepted_yet", async () => {
+  // The gate is the Judge-only policy's: an agent that lets any verifier check its work, as the
+  // demos' scripted agents do, enters as before.
+  const h = await harness();
+  h.policy = { verifiers: "any" };
+  h.world.add({ id: 1, judgeStatus: null });
+  h.world.add({ id: 2, judgeStatus: "pending" });
+
+  await h.tick();
+
+  expect(idsOf(h.commit)).toEqual([1n, 2n]);
+});
+
+/** A poster's record in the API, as `GET /v1/posters/:account` gives it. */
+const posterRecordOf = (account: string, voided: number, isTeam = false) => ({
+  account,
+  tasks_posted: voided + 3,
+  voided_after_reveals: voided,
+  is_team: isTeam,
+});
+
+test("policy_a_poster_with_more_tasks_voided_after_reveals_than_the_agent_accepts_is_turned_away", async () => {
+  // The Judge's pick is only as good as the held-out checks the poster wrote: a poster who writes
+  // checks that nothing passes reads the revealed work and is refunded. Its record shows it.
+  const h = await harness(undefined, { scripted: false });
+  h.policy = { verifiers: "judge", judgeAccount: JUDGE, maxPosterVoids: 2 };
+  const voided = new Map([
+    [OTHER, 3],
+    [POSTER, 2],
+  ]);
+  h.getPoster.mockImplementation(async (account) =>
+    posterRecordOf(account, voided.get(account) ?? 0, account === TEAM_POSTER),
+  );
+  h.world.add({ id: 1, poster: OTHER });
+  h.world.add({ id: 2, poster: POSTER });
+  h.world.add({ id: 4, poster: OTHER });
+  // The team's poster is not held to it, whatever its record says.
+  voided.set(TEAM_POSTER, 9);
+  h.world.add({ id: 5, poster: TEAM_POSTER });
+
+  await h.tick();
+  await h.tick();
+
+  expect(idsOf(h.commit)).toEqual([2n, 5n]);
+  expect(h.solve).toHaveBeenCalledTimes(2);
+  for (const id of [1, 4]) {
+    expect(h.logs).toContain(
+      `alice: skipping task ${id}, its poster ${OTHER} has had 3 tasks voided after their reveals, more than the 2 the agent accepts`,
+    );
+  }
+  // Seen: each is looked at once. A record is read once a tick, however many tasks name the poster,
+  // and the team poster's is not read at all.
+  expect(h.getTask.mock.calls.filter(([id]) => id === 1n || id === 4n)).toHaveLength(2);
+  expect(h.getPoster.mock.calls.map(([account]) => account).sort()).toEqual([OTHER, POSTER].sort());
+});
+
+test("policy_a_poster_record_that_cannot_be_read_leaves_its_tasks_for_the_next_tick", async () => {
+  const h = await harness();
+  h.policy = { maxPosterVoids: 0 };
+  h.getPoster.mockRejectedValueOnce(new ApiError(503, { error: "unavailable", message: "x" }));
+  h.getPoster.mockResolvedValue(posterRecordOf(POSTER, 0));
+  h.world.add({ id: 1 });
+
+  await h.tick();
+  // The guard fails closed: nothing entered, nothing seen, one line for the poster.
+  expect(h.commit).not.toHaveBeenCalled();
+  expect(h.logs.filter((line) => line.includes("record"))).toEqual([
+    `WARN alice: the record of poster ${POSTER} cannot be read (ApiError 503 unavailable), so its tasks wait`,
+  ]);
+
+  await h.tick();
+  expect(idsOf(h.commit)).toEqual([1n]);
+});
+
 test("policy_a_verifier_with_more_voids_after_reveals_than_the_agent_accepts_is_turned_away", async () => {
   const h = await harness();
   h.policy = { maxVoidsAfterReveals: 1 };
@@ -2179,6 +2295,8 @@ test("policy_a_policy_that_cannot_be_applied_is_refused_before_any_tick", async 
     [{ verifiers: "none" as never }, undefined],
     [{ minReward: { [TOKEN]: -1n } }, undefined],
     [{ maxVoidsAfterReveals: 1.5 }, undefined],
+    [{ maxPosterVoids: 1.5 }, undefined],
+    [{ maxPosterVoids: -1 }, undefined],
     [{ dailyEntries: 3 }, undefined],
     [{ dailyEntries: 0 }, counts],
     [{ dailyJudgedHires: 2 }, undefined],
@@ -2210,7 +2328,7 @@ test("policy_the_first_lines_say_the_policy_the_agent_runs_with", async () => {
 
   expect(h.logs).toEqual([
     `alice: running as ${ACCOUNT}, tags regex, test solver (scripted)`,
-    `alice: entry policy verifiers=judge (${JUDGE}) minReward=${TOKEN}:10000 maxVoidsAfterReveals=none dailyEntries=20 dailyJudgedHires=50`,
+    `alice: entry policy verifiers=judge (${JUDGE}) minReward=${TOKEN}:10000 maxVoidsAfterReveals=none maxPosterVoids=none dailyEntries=20 dailyJudgedHires=50`,
   ]);
 });
 

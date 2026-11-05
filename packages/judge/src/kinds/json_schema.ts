@@ -1,12 +1,13 @@
-import type { Heldout, PublicCriteria } from "@tender/shared";
+import type { HeldoutChecks, PublicCriteria } from "@tender/shared";
 import Ajv2020, { type ValidateFunction } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import type { EntryScore } from "../types";
 import { decodeUtf8, scored } from "./common";
 
 type JsonSchemaCriteria = Extract<PublicCriteria, { kind: "json_schema" }>;
-// `Heldout` is a union, so `Heldout["json_schema"]` does not compile: pick the member first.
-type JsonSchemaHeldout = Extract<Heldout, { json_schema: unknown }>["json_schema"];
+// `HeldoutChecks` is a union, so `HeldoutChecks["json_schema"]` does not compile: pick the member
+// first.
+type JsonSchemaHeldout = Extract<HeldoutChecks, { json_schema: unknown }>["json_schema"];
 
 /** How many schema errors the reasons of a document that does not fit list. */
 const MAX_SCHEMA_ERRORS = 3;

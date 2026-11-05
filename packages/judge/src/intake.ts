@@ -146,6 +146,11 @@ const HELDOUT_MISSING = "held-out checks missing";
 const HELDOUT_NOT_THE_POSTERS = "held-out checks were not uploaded by the poster";
 const HELDOUT_TOO_LARGE = "held-out checks too large";
 const HELDOUT_INVALID = "held-out checks invalid";
+/**
+ * Checks with no salt (`HeldoutSchema`): their commitment can be found by hashing the likely
+ * answers, so they are refused, whenever they were stored. The API refuses them at upload.
+ */
+const HELDOUT_UNSALTED = "held-out checks have no salt, so their commitment can be guessed";
 const HELDOUT_OTHER_KIND = "held-out checks are for another kind";
 const HELDOUT_NOT_COMMITTED = "held-out checks do not match the commitment";
 const CHECK_FAILED = "criteria could not be checked";
@@ -215,7 +220,8 @@ const MAX_COMPILE_RETRIES = 3;
  *   with it, and only someone who holds the bytes already can have a copy judged, which
  *   publishes them. A stranger who posted one first must not block the poster's own;
  * - held-out checks that are stored under the commitment but not as a `heldout` blob that the
- *   poster uploaded (`posterHeldout`), that are over 262_144 bytes, that do not fit
+ *   poster uploaded (`posterHeldout`), that are over 262_144 bytes, that have no salt
+ *   (`held-out checks have no salt, ...`: stored before the API asked for one), that do not fit
  *   `HeldoutSchema`, that are of another kind than the criteria, that hold a surrogate half with
  *   no partner, or whose bytes are not their canonical form. The scorecard republishes them, and
  *   has to hash to the commitment.
@@ -429,6 +435,7 @@ async function checkDocuments(
   if (standing !== "sent") return rejected(HELDOUT_NOT_THE_POSTERS);
   if (heldoutBlob.bytes.byteLength > MAX_DOCUMENT_BYTES) return rejected(HELDOUT_TOO_LARGE);
   const heldout = parseJson(heldoutBlob.bytes);
+  if (isUnsalted(heldout)) return rejected(HELDOUT_UNSALTED);
   const valid = HeldoutSchema.safeParse(heldout);
   if (!valid.success) return rejected(HELDOUT_INVALID);
   if (!heldoutMatchesCriteria(criteria, valid.data)) return rejected(HELDOUT_OTHER_KIND);
@@ -571,6 +578,16 @@ function hasLoneSurrogate(document: unknown): boolean {
     }
   }
   return false;
+}
+
+/** Whether `document` is a JSON object with no `salt` key: held-out checks from before the salt. */
+function isUnsalted(document: unknown): boolean {
+  return (
+    typeof document === "object" &&
+    document !== null &&
+    !Array.isArray(document) &&
+    !Object.hasOwn(document, "salt")
+  );
 }
 
 /** The JSON document in `bytes`, or `undefined` when they are not UTF-8 JSON. */
