@@ -15,7 +15,7 @@ const PILL = "min-h-10 whitespace-nowrap px-3.5 sm:px-4 max-sm:w-10 max-sm:px-0"
 
 const LOOKS: Record<LiveState, { word: string; line: string; dot: string }> = {
   synced: { word: "Live", line: "Up to date", dot: "bg-ok" },
-  behind: { word: "Catching up", line: "Catching up with the chain", dot: "bg-wait" },
+  behind: { word: "Updating", line: "Some numbers may be a few minutes old.", dot: "bg-wait" },
   // Hollow, so that it differs from the other two by its shape as well as its colour.
   offline: {
     word: "Offline",
@@ -114,7 +114,7 @@ function Figures({ live }: { live: Live }) {
 
 /**
  * The top bar's Live pill: a dot and a word for whether the index is up to date with the chain
- * (green, Live), still catching up or waiting for the chain (amber, Catching up), or out of reach
+ * (green, Live), still catching up or waiting for the chain (amber, Updating), or out of reach
  * (hollow, Offline). On a phone it is the dot alone; its name says the word either way.
  *
  * A press opens a small panel under it with the platform's figures, as the API gave them: open

@@ -71,10 +71,10 @@ test("live_pill_says_catching_up_without_numbers_of_blocks", async ({ page }) =>
   await routeHealth(page, { ...HEALTH, chain_final_height: "5444", lag_blocks: "444" });
   await page.goto("/tasks");
 
-  await expect(pill(page)).toHaveText("Catching up");
+  await expect(pill(page)).toHaveText("Updating");
   await expect(pill(page).getByTestId("live-dot")).toHaveAttribute("data-state", "behind");
   await pill(page).click();
-  await expect(page.getByTestId("live-line")).toHaveText("Catching up with the chain");
+  await expect(page.getByTestId("live-line")).toHaveText("Some numbers may be a few minutes old.");
   await expect(panel(page)).not.toContainText("444");
 });
 

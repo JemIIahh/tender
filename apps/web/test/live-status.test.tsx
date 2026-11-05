@@ -108,12 +108,14 @@ test("live_pill_says_catching_up_and_never_how_many_blocks", async () => {
   render(<LiveStatus />);
 
   const button = await pill();
-  expect(button.getAttribute("aria-label")).toBe("Status: Catching up");
-  expect(button.textContent).toBe("Catching up");
+  expect(button.getAttribute("aria-label")).toBe("Status: Updating");
+  expect(button.textContent).toBe("Updating");
   expect(dot(button)).toBe("behind");
   await userEvent.click(button);
   const panel = screen.getByTestId("live-panel");
-  expect(screen.getByTestId("live-line").textContent).toBe("Catching up with the chain");
+  expect(screen.getByTestId("live-line").textContent).toBe(
+    "Some numbers may be a few minutes old.",
+  );
   expect(panel.textContent).not.toMatch(/1237|1337|block/i);
 });
 
@@ -142,8 +144,8 @@ test("live_pill_is_amber_when_the_health_check_says_the_chain_is_unavailable", a
   });
   render(<LiveStatus />);
   const button = await pill();
-  expect(button.getAttribute("aria-label")).toBe("Status: Catching up");
-  expect(button.textContent).toBe("Catching up");
+  expect(button.getAttribute("aria-label")).toBe("Status: Updating");
+  expect(button.textContent).toBe("Updating");
   await userEvent.click(button);
   expect(screen.getAllByTestId("live-figure").map((row) => row.textContent)).toEqual([
     "Open tasks3",
@@ -373,7 +375,7 @@ test("live_pill_keeps_a_true_state_when_a_read_can_t_be_made_sense_of", async ()
   );
 
   // And should working out the pill's state fail at all, the pill says what is known (the API
-  // answered: Catching up), not what the last read said, nor nothing.
+  // answered: Updating), not what the last read said, nor nothing.
   vi.resetModules();
   vi.doMock("../lib/live", async (importOriginal) => ({
     ...(await importOriginal<typeof import("../lib/live")>()),
@@ -387,7 +389,7 @@ test("live_pill_keeps_a_true_state_when_a_read_can_t_be_made_sense_of", async ()
   render(<Fresh />);
 
   const button = await pill();
-  expect(button.getAttribute("aria-label")).toBe("Status: Catching up");
+  expect(button.getAttribute("aria-label")).toBe("Status: Updating");
   expect(errors).toHaveBeenCalled();
   vi.doUnmock("../lib/live");
 });
