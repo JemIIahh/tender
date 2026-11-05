@@ -119,17 +119,17 @@ test("landing_top_bar_launches_the_market_and_names_a_connected_account", async 
   await expect(bar.getByRole("link", { name: /Connect/ })).toHaveCount(0);
   await expect(bar.getByRole("link", { name: OWNER })).toHaveCount(0);
 
-  // Connected in the app, then back to the landing in the same tab: the account is beside Launch
-  // market, as the app's top bar shows it.
+  // Connected in the app, then the landing loaded afresh: it takes up the wallet of that visit, and
+  // the account is beside Launch market, as the app's top bar shows it.
   await page.getByRole("link", { name: "Launch market" }).click();
   await expect(page).toHaveURL(/\/tasks$/, { timeout: 20_000 });
   await page.goto("/my-tasks");
   await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
   await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
   await expect(page.getByRole("banner").getByRole("link", { name: OWNER })).toBeVisible();
-  await page.getByRole("link", { name: "Tender" }).first().click();
-  await expect(page).toHaveURL(/\/$/, { timeout: 20_000 });
+  await page.goto("/");
   const account = page.getByRole("banner").first().getByRole("link", { name: OWNER });
+  await expect(account).toBeVisible({ timeout: 20_000 });
   await expect(account).toHaveAttribute("href", "/wallet");
   await expect(account).toHaveAttribute("title", OWNER);
   await expect(

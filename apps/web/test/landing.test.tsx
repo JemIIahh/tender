@@ -13,6 +13,7 @@ import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
 const wallet = vi.hoisted(() => ({
   state: { ready: false, accountId: null as string | null, canSignMessage: true },
   listeners: new Set<() => void>(),
+  starts: 0,
 }));
 vi.mock("../lib/wallet", () => ({
   walletStore: {
@@ -23,6 +24,9 @@ vi.mock("../lib/wallet", () => ({
     getSnapshot: () => wallet.state,
     // The server knows no wallet.
     getServerSnapshot: () => ({ ready: false, accountId: null, canSignMessage: false }),
+    start: async () => {
+      wallet.starts++;
+    },
   },
 }));
 
@@ -49,6 +53,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   wallet.state = { ready: false, accountId: null, canSignMessage: true };
+  wallet.starts = 0;
 });
 
 test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () => {
@@ -144,6 +149,8 @@ test("landing_top_bar_shows_the_connected_account_and_nothing_until_the_tab_know
   const links = () =>
     banner.getAllByRole("link").map((link) => link.getAttribute("aria-label") ?? link.textContent);
 
+  // The landing looks for the wallet of an earlier visit as soon as it is in the browser.
+  expect(wallet.starts).toBe(1);
   // Before the tab knows of a wallet: Launch market alone, and no Connect wallet ever.
   expect(links()).toEqual([
     "Tender",
