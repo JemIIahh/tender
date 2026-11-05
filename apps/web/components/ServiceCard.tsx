@@ -76,7 +76,6 @@ export function ServiceCard({
       <div className="mt-5 min-w-0">
         <p className="flex flex-wrap gap-x-3 font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase">
           <span>#{service.id}</span>
-          <span>{service.category}</span>
         </p>
         <Heading className="mt-2 line-clamp-3 text-[19px] leading-snug font-medium tracking-[-0.02em] wrap-anywhere">
           <Link

@@ -319,3 +319,19 @@ test("nav_marks_the_page_you_are_on", () => {
   render(<Nav />);
   expect(current()).toEqual(["Wallet"]);
 });
+
+test("task_card_shows_no_category_and_keeps_the_tags", () => {
+  render(
+    <ul>
+      <TaskCard
+        task={summary({ category: "research", tags: ["filings", "summaries"] })}
+        nowNs={0n}
+      />
+    </ul>,
+  );
+  // Tender asks for no category when a task is posted: a card shows none, "other" included.
+  const card = screen.getByTestId("task-card");
+  expect(card.textContent?.toLowerCase()).not.toContain("research");
+  expect(card.textContent).toContain("filings");
+  expect(card.textContent).toContain("summaries");
+});

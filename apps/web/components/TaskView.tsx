@@ -199,7 +199,6 @@ function ReadyView({
           </span>
           <PhaseChip phase={phase} />
           <span className={EYEBROW}>#{task.id}</span>
-          {task.category === null ? null : <span className={EYEBROW}>{task.category}</span>}
         </p>
         <h1 className="text-3xl leading-[1.08] font-semibold tracking-[-0.03em] text-bone wrap-anywhere sm:text-[2.6rem]">
           {task.title ?? UNTITLED_TASK}

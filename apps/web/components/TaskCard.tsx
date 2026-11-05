@@ -89,7 +89,6 @@ export function TaskCard({
             </span>
           ) : null}
           <span>#{task.id}</span>
-          {task.category === null ? null : <span>{task.category}</span>}
           <span>
             {task.commit_count} {task.commit_count === 1 ? "entry" : "entries"}
           </span>
