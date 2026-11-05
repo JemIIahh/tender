@@ -76,10 +76,12 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  # Type-checks, lints and tests the TypeScript packages. The sandbox tests start a local chain, and
-  # near-sandbox downloads nearcore's sandbox node (35 MB, Linux x86_64) the first time one starts.
-  # The whole suite takes longer than one hosted runner allows, so its test files are split into
-  # four shards that run side by side. The first shard also type-checks and lints.
+  # Type-checks, lints and tests the TypeScript packages. The sandbox tests start a local chain on
+  # nearcore's sandbox node (35 MB, Linux x86_64), which the shards would each download at their
+  # first test: one step per shard gets it instead, from a cache, and NEAR_SANDBOX_BIN_PATH then
+  # points every test at it. The whole suite takes longer than one hosted runner allows, so its test
+  # files are split into four shards that run side by side. The first shard also type-checks and
+  # lints.
   node:
     name: node (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
@@ -118,6 +120,22 @@ jobs:
           cache: pnpm
       - name: Install
         run: pnpm install --frozen-lockfile
+      # The key hashes the two files that name the versions it holds: the near-sandbox package
+      # (packages/client/package.json) and the nearcore release it downloads (sandbox-node.ts). A
+      # new version of either makes a new key, and the step after this one downloads the node.
+      - name: Cache the sandbox node
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/tender-sandbox-node
+          key: sandbox-node-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packages/client/package.json', 'packages/client/src/sandbox-node.ts') }}
+      # Downloads the node into the cached directory unless the cache held it, and prints its path.
+      # Running it with --version is the check that the cached file is a node that starts.
+      - name: Get the sandbox node
+        run: |
+          set -euo pipefail
+          sandbox_node="$(DIR_TO_DOWNLOAD_BINARY="$HOME/.cache/tender-sandbox-node" pnpm exec tsx scripts/fetch-sandbox-node.ts | tail -n 1)"
+          "$sandbox_node" --version
+          echo "NEAR_SANDBOX_BIN_PATH=$sandbox_node" >> "$GITHUB_ENV"
       - name: Typecheck
         if: matrix.shard == 1
         run: pnpm typecheck
@@ -131,9 +149,11 @@ jobs:
 
   # The demo a judge runs on a clean machine (`pnpm demo:local`): a local chain, the services and
   # two scripted agents, from a posted task to the Judge's pick. It needs no secret, env file,
-  # Postgres or model, so the job has none, and near-sandbox downloads nearcore's sandbox node the
-  # first time it starts, as in the node job. The demo prints DEMO OK as its last line, after
-  # everything it started has stopped, and the job passes only if that line is in its output.
+  # Postgres or model, so the job has none, and it downloads nearcore's sandbox node at its first
+  # start, as a clean machine does (no cache, no NEAR_SANDBOX_BIN_PATH). Its OS temp dir is a tmpfs,
+  # as /tmp is on Fedora, Arch and Debian 13, so the download crosses filesystems on every run.
+  # The demo prints DEMO OK as its last line, after everything it started has stopped, and the job
+  # passes only if that line is in its output.
   demo:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -149,7 +169,15 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: Run the demo
+        env:
+          TMPDIR: /dev/shm
         run: |
           set -euo pipefail
+          # The run proves the download only if the temp dir and node_modules are on different
+          # filesystems; if the runner ever mounts /dev/shm on the checkout's, stop and say so.
+          if [ "$(stat -c %d "$TMPDIR")" = "$(stat -c %d node_modules)" ]; then
+            echo "::error::$TMPDIR is on the filesystem of node_modules, so this run cannot show that the node downloads across filesystems"
+            exit 1
+          fi
           pnpm demo:local | tee "$RUNNER_TEMP/demo.log"
           grep -Fx 'DEMO OK' "$RUNNER_TEMP/demo.log"
