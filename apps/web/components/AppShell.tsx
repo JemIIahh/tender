@@ -15,13 +15,13 @@ import {
 import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
 import { restoreSidebar, setRail, sidebarStore } from "../lib/sidebar";
 import { walletStore } from "../lib/wallet";
+import { AccountPill, BAR_PILL } from "./AccountPill";
 import { LiveStatus } from "./LiveStatus";
 import { Mark } from "./Mark";
 import { Nav, type TipHandlers } from "./Nav";
 import { PRIMARY, SECONDARY } from "./ui";
 
 /** The pills of the top bar: the landing's, a little smaller so that both fit a phone. */
-const BAR_PILL = "min-h-10 px-3.5 whitespace-nowrap sm:px-4";
 
 /** Laptop width, from which the sidebar is a sidebar (and can be the rail) and not a menu. */
 const WIDE = "(min-width: 64rem)";
@@ -337,15 +337,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               Connect<span className="max-sm:hidden">{"\u00a0"}wallet</span>
             </Link>
           ) : (
-            <Link
-              href="/wallet"
-              title={accountId}
-              className={`${SECONDARY} ${BAR_PILL} max-w-[7.5rem] sm:max-w-60`}
-            >
-              <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-seal" />
-              {/* The account as it is written: an account id is lower case. */}
-              <span className="truncate text-xs tracking-normal normal-case">{accountId}</span>
-            </Link>
+            <AccountPill accountId={accountId} />
           )}
         </div>
       </header>

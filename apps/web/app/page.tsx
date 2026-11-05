@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import type { CSSProperties, ReactNode } from "react";
 import { DitherArt } from "../components/landing/DitherArt";
+import { LandingAccount } from "../components/landing/LandingAccount";
 import { Stepper } from "../components/landing/Stepper";
 import { Ticker } from "../components/landing/Ticker";
 import { TypedCode } from "../components/landing/TypedCode";
@@ -21,24 +22,27 @@ export const metadata: Metadata = {
 const PILL =
   "inline-flex min-h-11 items-center justify-center rounded-full px-6 font-mono text-xs tracking-[0.12em] uppercase transition-colors motion-reduce:transition-none";
 
+/** The landing's links: the app's main areas. */
+const BAR_LINKS = [
+  ["/tasks", "Tasks"],
+  ["/agents", "Agents"],
+  ["/services", "Services"],
+  ["/how-it-works", "How it works"],
+] as const;
+
 function TopBar() {
   return (
-    <header className="flex h-16 items-center gap-8 px-4 sm:px-8">
+    <header className="flex h-16 items-center gap-4 px-4 sm:gap-8 sm:px-8">
       <Link href="/" className="flex items-center gap-2.5 text-lg font-semibold tracking-tight">
         <Mark />
         Tender
       </Link>
-      <nav aria-label="Main" className="hidden sm:block">
+      <nav aria-label="Main" className="hidden md:block">
         <ul className="flex gap-6 text-sm text-muted">
-          {[
-            ["/tasks", "Tasks"],
-            ["/agents", "Agents"],
-            ["/how-it-works", "How it works"],
-            ["/telegram", "Telegram"],
-          ].map(([href, label]) => (
+          {BAR_LINKS.map(([href, label]) => (
             <li key={href}>
               <Link
-                href={href ?? "/"}
+                href={href}
                 className="py-2 transition-colors motion-reduce:transition-none hover:text-bone"
               >
                 {label}
@@ -47,12 +51,19 @@ function TopBar() {
           ))}
         </ul>
       </nav>
-      <Link
-        href="/wallet"
-        className="ml-auto inline-flex min-h-10 items-center rounded-full bg-bone px-4 font-mono text-[11px] tracking-[0.12em] text-ink uppercase hover:bg-white"
-      >
-        Connect wallet
-      </Link>
+      {/* The way into the app, whatever the wallet: connecting is done there. Once this tab has a
+          wallet connected, its account is beside it, as in the app's top bar. On a phone the
+          button says "Launch"; its name is whole. */}
+      <div className="ml-auto flex items-center gap-2">
+        <Link
+          href="/tasks"
+          aria-label="Launch market"
+          className="inline-flex min-h-10 items-center rounded-full bg-bone px-4 font-mono text-[11px] tracking-[0.12em] whitespace-nowrap text-ink uppercase hover:bg-white"
+        >
+          Launch<span className="max-sm:hidden">{"\u00a0"}market</span>
+        </Link>
+        <LandingAccount />
+      </div>
     </header>
   );
 }
