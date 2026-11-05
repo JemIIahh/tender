@@ -2,7 +2,6 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import type { CSSProperties, ReactNode } from "react";
 import { DitherArt } from "../components/landing/DitherArt";
-import { LandingAccount } from "../components/landing/LandingAccount";
 import { Stepper } from "../components/landing/Stepper";
 import { Ticker } from "../components/landing/Ticker";
 import { TypedCode } from "../components/landing/TypedCode";
@@ -51,9 +50,9 @@ function TopBar() {
           ))}
         </ul>
       </nav>
-      {/* The way into the app, whatever the wallet: connecting is done there. Once this tab has a
-          wallet connected, its account is beside it, as in the app's top bar. On a phone the
-          button says "Launch"; its name is whole. */}
+      {/* The way into the app, and the only thing at the bar's right: the landing shows no account
+          and offers no Connect wallet, which are the app's. On a phone the button says "Launch";
+          its name is whole. */}
       <div className="ml-auto flex items-center gap-2">
         <Link
           href="/tasks"
@@ -62,7 +61,6 @@ function TopBar() {
         >
           Launch<span className="max-sm:hidden">{"\u00a0"}market</span>
         </Link>
-        <LandingAccount />
       </div>
     </header>
   );

@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import Landing from "../app/page";
 import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
@@ -7,36 +7,6 @@ import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
 // Its parts are in landing-parts.test.tsx.
 
 // No jest-dom here (X-20): plain assertions on what the Testing Library finds.
-
-// The tab's wallet as the landing's top bar reads it: a store nothing here starts, in the state a
-// test sets. The real one (lib/wallet.ts) would look for near-connect.
-const wallet = vi.hoisted(() => ({
-  state: { ready: false, accountId: null as string | null, canSignMessage: true },
-  listeners: new Set<() => void>(),
-  starts: 0,
-}));
-vi.mock("../lib/wallet", () => ({
-  walletStore: {
-    subscribe: (listener: () => void) => {
-      wallet.listeners.add(listener);
-      return () => wallet.listeners.delete(listener);
-    },
-    getSnapshot: () => wallet.state,
-    // The server knows no wallet.
-    getServerSnapshot: () => ({ ready: false, accountId: null, canSignMessage: false }),
-    start: async () => {
-      wallet.starts++;
-    },
-  },
-}));
-
-/** The tab's wallet changes to `state`, as a page of the app that connects it would make it. */
-function walletIs(state: { ready: boolean; accountId: string | null }): void {
-  act(() => {
-    wallet.state = { ...wallet.state, ...state };
-    for (const listener of wallet.listeners) listener();
-  });
-}
 
 /** The API down: every request fails before it is answered. */
 const apiDown = () =>
@@ -52,8 +22,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  wallet.state = { ready: false, accountId: null, canSignMessage: true };
-  wallet.starts = 0;
 });
 
 test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () => {
@@ -142,48 +110,18 @@ test("landing_top_bar_links_the_app_s_main_areas_and_launches_the_market", () =>
   expect(launch.textContent).toBe("Launch\u00a0market");
 });
 
-test("landing_top_bar_shows_the_connected_account_and_nothing_until_the_tab_knows", () => {
+test("landing_top_bar_shows_launch_market_and_no_account_or_connect_wallet", () => {
   apiDown();
   render(<Landing />);
   const banner = within(screen.getAllByRole("banner")[0] as HTMLElement);
-  const links = () =>
-    banner.getAllByRole("link").map((link) => link.getAttribute("aria-label") ?? link.textContent);
 
-  // The landing looks for the wallet of an earlier visit as soon as it is in the browser.
-  expect(wallet.starts).toBe(1);
-  // Before the tab knows of a wallet: Launch market alone, and no Connect wallet ever.
-  expect(links()).toEqual([
-    "Tender",
-    "Tasks",
-    "Agents",
-    "Services",
-    "How it works",
-    "Launch market",
-  ]);
-  // It knows: none is connected. Still nothing but Launch market.
-  walletIs({ ready: true, accountId: null });
-  expect(links()).toEqual([
-    "Tender",
-    "Tasks",
-    "Agents",
-    "Services",
-    "How it works",
-    "Launch market",
-  ]);
+  // The bar is the mark, the app's main areas and Launch market: no account, and no Connect wallet,
+  // which are the app's. The landing does not read the wallet at all.
+  expect(
+    banner.getAllByRole("link").map((link) => link.getAttribute("aria-label") ?? link.textContent),
+  ).toEqual(["Tender", "Tasks", "Agents", "Services", "How it works", "Launch market"]);
   expect(banner.queryByRole("link", { name: /Connect/ })).toBeNull();
-
-  // A page of the app connected a wallet in this tab: its account is beside Launch market, as the
-  // app's top bar shows it, and leads to the Wallet page.
-  walletIs({ ready: true, accountId: "alice.testnet" });
-  const account = banner.getByRole("link", { name: "alice.testnet" });
-  expect(account.getAttribute("href")).toBe("/wallet");
-  expect(account.getAttribute("title")).toBe("alice.testnet");
-  expect(account.querySelector(".truncate")?.textContent).toBe("alice.testnet");
-  expect(banner.getByRole("link", { name: "Launch market" }).getAttribute("href")).toBe("/tasks");
-
-  // And it goes when the wallet does.
-  walletIs({ ready: true, accountId: null });
-  expect(banner.queryByRole("link", { name: "alice.testnet" })).toBeNull();
+  expect(banner.queryByRole("button")).toBeNull();
 });
 
 test("landing_never_makes_claims_it_cannot_back", () => {
