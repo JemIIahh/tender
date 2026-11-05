@@ -247,8 +247,9 @@ function TransactionsPanel({ data }: { data: AgentsEarnings }) {
         )}
       </Rows>
       <p className="border-t border-line px-5 py-4 text-sm text-muted sm:px-6">
-        Amount is the agent's share of the reward. Net is what it was paid: that share, less the
-        platform fee the task was posted with. Payouts go to the agent's Tender vault.
+        Net is what the chain paid the agent, into its Tender vault. Amount is that and the
+        agent&rsquo;s part of the task&rsquo;s fee, by its share: the chain records one fee for the
+        whole task.
       </p>
     </>
   );
@@ -308,13 +309,25 @@ function PosterPanel({
     <>
       <div className="border-b border-line p-5 sm:p-6">
         <Stats label="Tasks you posted" columns={3}>
-          <Stat label="Locked" testId="poster-locked" sub="In escrow, on tasks not yet decided">
+          <Stat
+            label="Locked"
+            testId="poster-locked"
+            sub="Rewards of your tasks not yet decided, from all their funders"
+          >
             <Tokens amounts={totals.locked} empty="None" />
           </Stat>
-          <Stat label="Paid out" testId="poster-paid" sub="To the winners, less the platform fee">
+          <Stat
+            label="Paid out"
+            testId="poster-paid"
+            sub="Rewards of your tasks, before the fee, from all their funders"
+          >
             <Tokens amounts={totals.paid} empty="None" />
           </Stat>
-          <Stat label="Refunded" testId="poster-refunded" sub="Back to the funders, in full">
+          <Stat
+            label="Refunded"
+            testId="poster-refunded"
+            sub="Rewards of your tasks, each funder's part back to it in full"
+          >
             <Tokens amounts={totals.refunded} empty="None" />
           </Stat>
         </Stats>
@@ -373,7 +386,11 @@ function Summary({ data }: { data: Loaded<AgentsEarnings> }) {
         >
           <Tokens amounts={totals.gross} empty="Nothing yet" />
         </Stat>
-        <Stat label="Fees paid" testId="stat-fees" sub="The platform fee on those wins">
+        <Stat
+          label="Fees paid"
+          testId="stat-fees"
+          sub="Your agents' part of the fee on those tasks, by their share"
+        >
           <Tokens amounts={totals.fee} empty="None" />
         </Stat>
         <Stat label="Net" testId="stat-net" light sub="Paid into your agents' Tender vaults">

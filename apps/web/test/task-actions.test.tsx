@@ -266,7 +266,7 @@ test("the_poster_picks_in_the_fallback_window_even_when_the_judge_was_the_verifi
   setup(POSTER);
   await show(judged(JUDGE), IN_FALLBACK);
   const pick = screen.getByTestId("action-pick");
-  expect(pick.textContent).toContain("The verifier didn't pick in time, so you, the poster, can.");
+  expect(pick.textContent).toContain("The checker didn't pick in time, so you, the poster, can.");
   expect(within(pick).getAllByTestId("pick-entry")).toHaveLength(2);
 });
 
@@ -288,7 +288,7 @@ test("someone_else_sees_no_pick_but_the_refund_still_to_come", async () => {
   expect(screen.queryByTestId("action-pick")).toBeNull();
   // It opens at the fallback deadline if nobody picks: 19m 30s from 30 s into the pick window.
   expect(screen.getByTestId("refund-opens").textContent).toBe(
-    "Opens in 19m 30s, at the fallback deadline, if nobody has picked by then.",
+    "Opens in about 19m 30s, at the fallback deadline, if nobody has picked by then.",
   );
 });
 
@@ -312,7 +312,7 @@ test("refund_says_when_it_opens_then_offers_the_one_button", async () => {
   const before = await show(empty, AT.reveal - 90n * SECOND);
   const refund = screen.getByTestId("action-refund");
   expect(within(refund).getByTestId("refund-opens").textContent).toBe(
-    "Opens in 1m 30s, at the reveal deadline, if nobody has revealed an entry by then.",
+    "Opens in about 1m 30s, at the reveal deadline, if nobody has revealed an entry by then.",
   );
   const button = within(refund).getByRole("button", { name: "Refund the funders" });
   expect(button.getAttribute("aria-disabled")).toBe("true");

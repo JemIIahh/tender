@@ -169,7 +169,7 @@ test("web_verifier_picks_and_the_winner_is_paid_the_reward_less_the_fee", async 
   const pick = page.getByTestId("action-pick");
   await expect(pick).toContainText(`Picking is open for ${run.dev}.`);
   await connect(pick);
-  await expect(pick).toContainText("You're the verifier.");
+  await expect(pick).toContainText("You're the checker (the verifier).");
   const row = pick.getByTestId("pick-entry");
   await expect(row).toHaveCount(1);
   // Her delivery, read through the API and hashed again, as text.

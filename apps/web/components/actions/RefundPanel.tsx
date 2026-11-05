@@ -90,7 +90,7 @@ export function RefundPanel({
         </p>
       ) : (
         <p data-testid="refund-opens" className="text-[14px] text-muted">
-          {"Opens in "}
+          {"Opens in about "}
           <Countdown toNs={view.atNs} nowNs={nowNs} />
           {view.ifNothingRevealed
             ? ", at the reveal deadline, if nobody has revealed an entry by then."

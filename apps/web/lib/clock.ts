@@ -2,7 +2,11 @@ import { useEffect, useState } from "react";
 
 const NS_PER_MS = 1_000_000n;
 
-/** The wall clock now, in nanoseconds since the Unix epoch, which is how the chain counts time. */
+/**
+ * The wall clock now, in nanoseconds since the Unix epoch, which is how the chain counts time. It
+ * is the viewer's clock, not the chain's: a page that says when a window closes by it says "about"
+ * (the chain decides by the time of the block a call lands in).
+ */
 export function nowNs(): bigint {
   return BigInt(Date.now()) * NS_PER_MS;
 }

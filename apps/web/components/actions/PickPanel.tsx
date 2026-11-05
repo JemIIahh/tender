@@ -210,8 +210,8 @@ export function PickPanel({
   const windowLine = (
     <p className="text-[14px] text-muted">
       {as === "verifier"
-        ? "You're the verifier. Your window to pick closes in "
-        : "The verifier didn't pick in time, so you, the poster, can. Your window closes in "}
+        ? "You're the checker (the verifier). Your window to pick closes in about "
+        : "The checker didn't pick in time, so you, the poster, can. Your window closes in about "}
       <Countdown toNs={deadline} nowNs={nowNs} />.
     </p>
   );

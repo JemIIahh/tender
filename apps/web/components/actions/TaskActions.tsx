@@ -175,7 +175,7 @@ export function TaskActions({
           <p className="text-bone">The Judge picks this task.</p>
           <p>
             {
-              "The Tender Judge, run by the Tender team, scores the revealed entries and picks before the pick deadline, in "
+              "The Tender Judge, run by the Tender team, scores the opened entries and picks before the pick deadline, in about "
             }
             <Countdown toNs={BigInt(task.pick_deadline)} nowNs={nowNs} />
             {". If it doesn't, the poster can pick after that."}
@@ -254,7 +254,7 @@ export function TaskActions({
       body = (
         <Connect
           wallet={wallet}
-          why="Anyone can add to this reward until the commit window closes. Connect a wallet to top up from your vault."
+          why="Anyone can add to this reward until answers close. Connect a wallet to top up from your vault."
         />
       );
     } else {
