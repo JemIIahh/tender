@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Builds both contracts into res/ and writes res/SHA256SUMS and res/SOURCES.sha256.
+# Builds the three contracts into res/ (tender.wasm, test_token.wasm and agent_setup.wasm, the code
+# "Connect your agent" deploys on a new agent account) and writes res/SHA256SUMS and
+# res/SOURCES.sha256.
 #
 # Needs cargo-near 0.22.0 exactly (`cargo near --version`); any other version fails. The toolchain
 # comes from rust-toolchain.toml. The wasm is built on this machine, not in cargo-near's
@@ -8,12 +10,14 @@
 # res/SHA256SUMS, which check-res.sh (run here at the end, and in CI) recomputes from the sources
 # and the checksums as they are.
 #
-# Exits non-zero, and leaves res/ alone, if a built wasm contains $HOME or /Users/, or if
-# tender.wasm, after cargo-near's wasm-opt step, is over 450 KiB.
+# Exits non-zero, and leaves res/ alone, if a built wasm contains $HOME or /Users/, or if, after
+# cargo-near's wasm-opt step, tender.wasm is over 450 KiB or agent_setup.wasm over 3 KiB.
 set -euo pipefail
 
 # 450 KiB. Deploying code costs about 1 NEAR per 100 KB, so the size is a budget.
 MAX_TENDER_BYTES=$((450 * 1024))
+# 3 KiB. Every agent account made with it pays for these bytes in storage (0.01 NEAR per KB).
+MAX_SETUP_BYTES=$((3 * 1024))
 CARGO_NEAR_VERSION="cargo-near-near 0.22.0"
 
 fail() {
@@ -57,7 +61,8 @@ wasm_rustflags="RUSTFLAGS=-C link-arg=-s --remap-path-prefix=$HOME=/build"
 # there by an earlier build must never be copied into res/ in place of this one.
 built_tender=$target_dir/near/tender/tender.wasm
 built_token=$target_dir/near/test_token/test_token.wasm
-rm -f "$built_tender" "$built_token"
+built_setup=$target_dir/near/agent_setup/agent_setup.wasm
+rm -f "$built_tender" "$built_token" "$built_setup"
 
 # The hash of the sources is taken before the build. If a source changes while it runs, the
 # check at the end fails.
@@ -66,8 +71,10 @@ sources=$(./check-res.sh --print)
 # cargo-near builds the crate in the current directory.
 (cd tender && cargo near build non-reproducible-wasm --env "$wasm_rustflags")
 (cd test-token && cargo near build non-reproducible-wasm --env "$wasm_rustflags")
+# agent-setup has no near-sdk in its code, so it has no ABI to make.
+(cd agent-setup && cargo near build non-reproducible-wasm --no-abi --env "$wasm_rustflags")
 
-for wasm in "$built_tender" "$built_token"; do
+for wasm in "$built_tender" "$built_token" "$built_setup"; do
   [ -f "$wasm" ] || fail "cargo-near did not write $wasm"
   # A path from the build machine in the wasm means the remap did not take.
   for path in "$HOME" /Users/; do
@@ -83,22 +90,28 @@ echo "build.sh: tender.wasm is $tender_bytes bytes (limit $MAX_TENDER_BYTES)"
 if [ "$tender_bytes" -gt "$MAX_TENDER_BYTES" ]; then
   fail "tender.wasm is $tender_bytes bytes, over the $MAX_TENDER_BYTES byte ($((MAX_TENDER_BYTES / 1024)) KiB) limit"
 fi
+setup_bytes=$(($(wc -c <"$built_setup")))
+echo "build.sh: agent_setup.wasm is $setup_bytes bytes (limit $MAX_SETUP_BYTES)"
+if [ "$setup_bytes" -gt "$MAX_SETUP_BYTES" ]; then
+  fail "agent_setup.wasm is $setup_bytes bytes, over the $MAX_SETUP_BYTES byte ($((MAX_SETUP_BYTES / 1024)) KiB) limit"
+fi
 
 mkdir -p res
 cp "$built_tender" res/tender.wasm
 cp "$built_token" res/test_token.wasm
+cp "$built_setup" res/agent_setup.wasm
 # cargo-near writes its output readable by the owner only.
-chmod 644 res/tender.wasm res/test_token.wasm
+chmod 644 res/tender.wasm res/test_token.wasm res/agent_setup.wasm
 
 # shasum ships with macOS and with Perl on Linux; sha256sum is the coreutils fallback.
 if command -v shasum >/dev/null 2>&1; then
-  (cd res && shasum -a 256 tender.wasm test_token.wasm >SHA256SUMS)
+  (cd res && shasum -a 256 tender.wasm test_token.wasm agent_setup.wasm >SHA256SUMS)
 else
-  (cd res && sha256sum tender.wasm test_token.wasm >SHA256SUMS)
+  (cd res && sha256sum tender.wasm test_token.wasm agent_setup.wasm >SHA256SUMS)
 fi
 # The record binds the sources' hash, taken before the build, to the checksums just written.
 ./check-res.sh --record "$sources" >res/SOURCES.sha256
 
-echo "build.sh: wrote res/tender.wasm, res/test_token.wasm, res/SHA256SUMS and res/SOURCES.sha256"
+echo "build.sh: wrote res/tender.wasm, res/test_token.wasm, res/agent_setup.wasm, res/SHA256SUMS and res/SOURCES.sha256"
 cat res/SHA256SUMS
 ./check-res.sh
