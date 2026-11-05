@@ -9,7 +9,7 @@ import { loadRun, type RunInfo } from "./run";
 // a new account of the run's chain (e2e/chain/stack.ts), so there is no picker and no extension.
 // What the page does goes to the real node, and each spec reads the chain back afterwards. The
 // account starts with tokens in its wallet and nothing at Tender, and the specs run in this order
-// on it: the wallet page sets it up and moves tokens in and out, and the post wizard then posts a
+// on it: the wallet page sets it up and moves tokens in and out, and the post form then posts a
 // task from what is left. The wizard turns away an account that Tender does not know, so a run of
 // the post spec alone sets the account up first, on the wallet page. The wallet spec needs the
 // account as the setup made it, so each spec runs once on a chain (`retries` is 0).
@@ -103,26 +103,44 @@ test("register_deposit_withdraw_round_trip", async ({ page }) => {
 const SECRET = "held-out-secret-7f3a";
 const TITLE = "Regex for NEAR account ids (chain suite)";
 
+const more = (page: Page) => page.getByRole("button", { name: /^More options/ });
+
+async function openMore(page: Page): Promise<void> {
+  if ((await more(page).getAttribute("aria-expanded")) === "false") await more(page).click();
+}
+
 async function fillBrief(page: Page): Promise<void> {
   await page.getByLabel("Title", { exact: true }).fill(TITLE);
-  await page.getByLabel("Summary (optional)").fill("One regex that tells valid ids from invalid.");
   await page
     .getByLabel("Instructions", { exact: true })
     .fill("Return the pattern and its flags.\nAnchor it at both ends.");
-  await page.getByLabel("Category", { exact: true }).selectOption("coding");
+  await openMore(page);
+  await page.getByLabel("Summary (optional)").fill("One regex that tells valid ids from invalid.");
   await page.getByLabel("Tags (optional)").fill("regex, near");
 }
 
 async function fillRegexChecks(page: Page): Promise<void> {
+  await openMore(page);
   await page.getByRole("radio", { name: /Regex cases/ }).check();
   await page.getByLabel("Should match", { exact: true }).fill("alice.near\nbob.testnet");
   await page.getByLabel("Should not match", { exact: true }).fill("-bad\nUPPER");
-  await page
-    .getByLabel("Held-out: should match", { exact: true })
-    .fill(`${SECRET}.near\ncarol.near`);
-  await page
-    .getByLabel("Held-out: should not match", { exact: true })
-    .fill("dave..near\n_eve.near");
+  await page.getByLabel("Hidden: should match", { exact: true }).fill(`${SECRET}.near\ncarol.near`);
+  await page.getByLabel("Hidden: should not match", { exact: true }).fill("dave..near\n_eve.near");
+}
+
+/** The windows set by hand under More options: 10, 5, 10 and 10 minutes. */
+async function setWindows(page: Page): Promise<void> {
+  await openMore(page);
+  await page.getByRole("checkbox", { name: "Set each window yourself" }).check();
+  for (const [name, amount] of [
+    ["Answer", "10"],
+    ["Open", "5"],
+    ["Pick", "10"],
+    ["Fallback", "10"],
+  ] as const) {
+    await page.getByLabel(`${name} window`, { exact: true }).fill(amount);
+    await page.getByLabel(`${name} window unit`).selectOption("minutes");
+  }
 }
 
 /**
@@ -170,25 +188,20 @@ test("post_task_end_to_end", async ({ page }) => {
   await page.goto("/post");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Post a task");
   await fillBrief(page);
-  await page.getByRole("button", { name: "Next: Checks" }).click();
-  await expect(page.getByRole("heading", { level: 2, name: "Checks" })).toBeVisible();
   await fillRegexChecks(page);
-  await page.getByRole("button", { name: "Next: Reward" }).click();
+  await setWindows(page);
   await page.getByLabel("Amount (tUSDC)").fill("20");
-  await page.getByRole("button", { name: "Review" }).click();
-  await expect(page.getByRole("heading", { level: 2, name: "Review" })).toBeVisible();
+  await more(page).click();
 
-  // The review says what is about to happen, and counts the checks the Judge keeps.
-  await expect(page.getByTestId("review-title")).toHaveText(TITLE);
+  // The page says what is about to happen. Without a wallet its one button connects one.
   await expect(page.getByTestId("review-reward")).toContainText(show(reward));
-  await expect(page.getByTestId("review-heldout")).toHaveText("4 cases");
   await expect(page.getByTestId("review-verifier")).toContainText("Tender Judge");
   await expect(page.getByTestId("review-account")).toHaveText("Not connected");
   const post = page.getByRole("button", { name: "Post task" });
-  await expect(post).toHaveAttribute("aria-disabled", "true");
+  await expect(post).toHaveCount(0);
 
   // The dev wallet connects at once, and the page reads the vault from the chain.
-  await page.getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
   await expect(page.getByTestId("review-account")).toHaveText(run.dev);
   await expect(page.getByTestId("review-funding")).toHaveText(
     toAdd === 0n

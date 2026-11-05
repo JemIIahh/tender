@@ -340,8 +340,8 @@ export function PostSummary(props: {
         </button>
       )}
       <p className="text-[13px] text-muted">
-        Your wallet signs you in to Tender, then approves the deposit and the post together. Once
-        posted, the terms can&rsquo;t change.
+        Your wallet may ask you to sign in to Tender first. The deposit and the post are then one
+        approval. Once posted, the terms can&rsquo;t change.
       </p>
     </section>
   );
