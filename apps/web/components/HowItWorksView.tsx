@@ -96,10 +96,10 @@ function StepStrip() {
           data-testid="how-step"
           className={`${CARD} grid content-start overflow-hidden`}
         >
-          <div aria-hidden="true" className="relative h-24 overflow-hidden border-b border-line">
+          <div aria-hidden="true" className="relative h-28 overflow-hidden border-b border-line">
             <StillArt
               art={step.art}
-              focus={{ x: 0.5, y: 0.5, scale: 0.62 }}
+              focus={{ x: 0.5, y: 0.52, scale: 0.46 }}
               className="size-full"
             />
             <div className="scanlines absolute inset-0" />

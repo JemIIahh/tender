@@ -172,7 +172,11 @@ function AccountName({ account, agent }: { account: string; agent: boolean }) {
   const tail = dot === -1 ? "" : account.slice(dot);
   const name = (
     <>
-      <span className="truncate font-medium text-bone">{head}</span>
+      {/* The first label is kept whole; the rest gives way. An account of one label (an
+          implicit one, 64 characters) is cut short itself. */}
+      <span className={`font-medium text-bone ${tail === "" ? "min-w-0 truncate" : "shrink-0"}`}>
+        {head}
+      </span>
       {tail === "" ? null : <span className="min-w-0 truncate text-muted">{tail}</span>}
     </>
   );
