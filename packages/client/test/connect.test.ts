@@ -170,6 +170,7 @@ function world(
       calls.push(`move ${name} ${lookup.account_id}`);
       if (options.moveFails !== undefined) throw options.moveFails;
       // As `moveAgentKeyToImplicit` does: the sub-account must not be on the chain.
+      if (lookup.account_kind !== "implicit") throw new Error("the record says sub_account");
       if (await exists(`${lookup.name}.${lookup.owner}`)) throw new Error("sub-account exists");
       return { publicKey: PUBLIC, path: `/keys/${name}.json`, made: false };
     },

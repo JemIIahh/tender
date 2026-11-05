@@ -213,6 +213,7 @@ export function registerConnectTool(server: McpServer, deps: ConnectToolDeps): v
               dir,
               name: agent,
               network: lookup.network,
+              accountKind: lookup.account_kind,
               from: `${lookup.name}.${lookup.owner}`,
               to: lookup.account_id,
               exists,

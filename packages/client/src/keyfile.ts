@@ -345,6 +345,7 @@ export async function agentKeyFor(options: {
  * Moves agent `name`'s key file, in `dir`, from the code's sub-account `from` (`<name>.<owner>`) to
  * `to`, once the code's record says the owner chose the agent's implicit account: the file then
  * names the account the agent registers with, for the commands that follow. Only:
+ * - when the record says so (`accountKind` is `implicit`);
  * - a file for `network` that names `from` exactly (a file for any other account, or for none, is
  *   never moved: it may be another agent's, registered already);
  * - when `to` is the implicit account of the file's own key;
@@ -357,6 +358,8 @@ export async function moveAgentKeyToImplicit(options: {
   dir: string;
   name: string;
   network: NetworkId;
+  /** What the code's record says the owner chose: only `implicit` moves anything. */
+  accountKind: "sub_account" | "implicit";
   from: string;
   to: string;
   /** Whether an account exists on the chain. */
@@ -364,6 +367,11 @@ export async function moveAgentKeyToImplicit(options: {
 }): Promise<{ publicKey: string; path: string; made: false }> {
   const { dir, name, network, from, to } = options;
   const path = agentKeyPath(dir, name);
+  if (options.accountKind !== "implicit") {
+    throw new KeyInUseError(
+      `the code's record does not say its owner chose a separate account: the key file of agent ${name} is not moved`,
+    );
+  }
   if (!(await hasAgentKeyFile(dir, name))) {
     throw new KeyInUseError(
       `agent ${name} has no key file at ${path} to move to ${to}: run the command where its key is`,

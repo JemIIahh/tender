@@ -61,8 +61,21 @@ function chain(existing: string[] = []) {
   };
 }
 
-const move = (to: string, exists: (id: string) => Promise<boolean>, from = SUB) =>
-  moveAgentKeyToImplicit({ dir, name: "writer", network: "testnet", from, to, exists });
+const move = (
+  to: string,
+  exists: (id: string) => Promise<boolean>,
+  from = SUB,
+  accountKind: "sub_account" | "implicit" = "implicit",
+) =>
+  moveAgentKeyToImplicit({
+    dir,
+    name: "writer",
+    network: "testnet",
+    accountKind,
+    from,
+    to,
+    exists,
+  });
 
 test("a_file_of_the_codes_sub_account_moves_to_its_own_implicit_account_while_the_sub_account_is_not_on_chain", async () => {
   const file = await fileFor(SUB);
@@ -149,4 +162,26 @@ test("agent_key_for_never_rewrites_a_file_and_takes_a_moved_one_only_for_the_imp
   await expect(keyFor(null)).rejects.toBeInstanceOf(KeyInUseError);
   await expect(keyFor("ab".repeat(32))).rejects.toBeInstanceOf(KeyInUseError);
   expect(await text(file.path)).toBe(moved);
+});
+
+test("nothing_moves_unless_the_codes_record_says_the_owner_chose_the_separate_account", async () => {
+  const file = await fileFor(SUB);
+  const c = chain();
+  await expect(move(file.implicit, c.exists, SUB, "sub_account")).rejects.toThrow(
+    new KeyInUseError(
+      "the code's record does not say its owner chose a separate account: the key file of agent writer is not moved",
+    ),
+  );
+  expect(c.asked).toEqual([]);
+  expect(await text(file.path)).toBe(file.text);
+});
+
+test("a_registered_agents_file_for_its_existing_sub_account_is_never_moved", async () => {
+  // The agent registered with its sub-account: the account is on the chain. A record that says
+  // implicit (a lying API, or a code for another agent of the same name) moves nothing.
+  const file = await fileFor(SUB);
+  const c = chain([SUB]);
+  await expect(move(file.implicit, c.exists)).rejects.toThrow(/exists on the chain/);
+  expect(c.asked).toEqual([SUB]);
+  expect(await text(file.path)).toBe(file.text);
 });

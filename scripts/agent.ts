@@ -1298,6 +1298,7 @@ export async function connectAgentCommand(options: ConnectCommandOptions): Promi
         dir,
         name,
         network: lookup.network,
+        accountKind: lookup.account_kind,
         from: `${lookup.name}.${lookup.owner}`,
         to: lookup.account_id,
         exists,
