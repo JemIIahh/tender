@@ -12,10 +12,11 @@ import { Hono } from "hono";
 import { KeyPair } from "near-api-js";
 import { afterAll, beforeAll, beforeEach, expect, test } from "vitest";
 import type { AuthVariables, KeyKind, RequireAuth } from "../src/auth";
+import type { ChainReader } from "../src/deps";
 import { handleError } from "../src/format";
 import { type ApiDeps, createApp, type ErrorBody } from "../src/index";
 import { connectRoutes } from "../src/routes/connect";
-import { resetDb, TEST_NOW, testDeps } from "./helpers";
+import { fakeClient, resetDb, TEST_BOND_TOKEN, TEST_NOW, testDeps } from "./helpers";
 
 // The connect codes of "Connect your agent". The routes are mounted on an app of their own with
 // `stubAuth`, which reads the signed-in account and the kind of its key from headers, so most tests
@@ -673,6 +674,70 @@ test("the_owner_dismisses_an_implicit_agent_the_index_does_not_list_and_nothing_
   expect((await dismiss(solo.id)).status).toBe(404);
 });
 
+test("a_dismissal_reads_the_chain_and_keeps_the_record_while_tender_holds_anything_for_it", async () => {
+  const key = publicKeyOf();
+  const implicit = implicitAccountOf(key) ?? "";
+  const { code, id } = await makeCode("solo");
+  await attach(code, key);
+  await toImplicit(id);
+  const asked: string[] = [];
+  const withChain = (over: Partial<ChainReader>) =>
+    appWith({
+      client: fakeClient({
+        storageBalanceOf: async (account) => {
+          asked.push(`storage ${account}`);
+          return null;
+        },
+        balanceOf: async (account, token) => {
+          asked.push(`vault ${account} ${token}`);
+          return 0n;
+        },
+        ...over,
+      }),
+    });
+  const dismissOn = (app: Requester) =>
+    send<ErrorBody>("POST", `/v1/connect/codes/${id}/dismiss`, { account: OWNER, app });
+
+  // Storage with Tender for the account: the record stays.
+  const storage = await dismissOn(
+    withChain({
+      storageBalanceOf: async () => ({
+        total: "20000000000000000000000",
+        available: "0",
+        used_bytes: "0",
+      }),
+    }),
+  );
+  expect(storage.status).toBe(409);
+  expect(storage.body.error).toBe("funded");
+  // A bond in its vault, in the bond's token: the record stays.
+  const bond = await dismissOn(
+    withChain({
+      balanceOf: async (account, token) =>
+        account === implicit && token === TEST_BOND_TOKEN ? 5_000_000n : 0n,
+    }),
+  );
+  expect(bond.status).toBe(409);
+  expect(bond.body.error).toBe("funded");
+  // A chain that can't be read: the record stays, and the answer says to try again.
+  const down = await dismissOn(
+    withChain({
+      getConfig: async () => {
+        throw new Error("rpc down at https://rpc.example/?key=secret");
+      },
+    }),
+  );
+  expect(down.status).toBe(503);
+  expect(JSON.stringify(down.body)).not.toContain("secret");
+  expect((await stateOf(id)).status).toBe(200);
+
+  // Nothing held: the record goes, after the chain was asked about the account itself.
+  expect((await dismissOn(withChain({}))).status).toBe(200);
+  expect(asked).toContain(`storage ${implicit}`);
+  expect(asked).toContain(`vault ${implicit} ${TEST_BOND_TOKEN}`);
+  expect((await stateOf(id)).status).toBe(404);
+});
+
 // ---- Limits -----------------------------------------------------------------------------------
 
 test("an_owner_makes_a_limited_number_of_codes", async () => {
@@ -716,4 +781,31 @@ test("an_owners_page_is_held_to_a_limit_on_reads", async () => {
   expect((await read()).status).toBe(200);
   expect((await read()).status).toBe(200);
   expect((await read()).status).toBe(429);
+});
+
+test("the_owners_switch_list_and_dismissal_share_that_limit", async () => {
+  // Each of the owner's other routes counts against the same per-account budget as the reads, and
+  // is refused once it is spent.
+  const routes: Array<[string, (app: Requester, id: string) => Promise<Reply<unknown>>]> = [
+    [
+      "implicit",
+      (app, id) => send("POST", `/v1/connect/codes/${id}/implicit`, { account: OWNER, app }),
+    ],
+    ["list", (app) => send("GET", "/v1/connect/implicit", { account: OWNER, app })],
+    [
+      "dismiss",
+      (app, id) => send("POST", `/v1/connect/codes/${id}/dismiss`, { account: OWNER, app }),
+    ],
+  ];
+  for (const [what, call] of routes) {
+    await resetDb(deps.db);
+    const { code, id } = await makeCode();
+    await attach(code, publicKeyOf());
+    const app = appWith({ rateLimits: { connectRead: { limit: 1, windowMs: 60_000 } } });
+    expect(
+      (await send("GET", `/v1/connect/codes/${id}`, { account: OWNER, app })).status,
+      what,
+    ).toBe(200);
+    expect((await call(app, id)).status, what).toBe(429);
+  }
 });

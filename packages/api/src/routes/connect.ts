@@ -41,7 +41,8 @@ import { clientKey, RETRY_SOON, rateLimit, rateLimitsOf } from "../limits";
 //   GET  /v1/connect/implicit       signed in: the owner's agents set up as implicit accounts
 //   POST /v1/connect/codes/:id/dismiss
 //                                   signed in as the code's owner, with a full-access key: forgets
-//                                    an implicit agent the index does not list (one never funded)
+//                                    an implicit agent the index does not list and for whose
+//                                    account Tender holds no storage and no bond
 //   POST /v1/connect/lookup         the code in the body: what it is for (the agent's first look)
 //   POST /v1/connect/attach         the code and a public key in the body: the agent's key, once
 //   POST /v1/connect/contest        the code in the body: the agent saw a key that is not its own
@@ -78,8 +79,10 @@ import { clientKey, RETRY_SOON, rateLimit, rateLimitsOf } from "../limits";
 //   404  no such code (or not the caller's: the answer is the same);
 //   409  `already_attached` (another key has the code; the code is marked contested), `not_attached`,
 //        `not_registered`, `contested`, `already_registered` (an agent registered with the code's
-//        sub-account, so it is too late to choose another), `registered` (a dismissal of an
-//        implicit agent the index lists);
+//        sub-account, so it is too late to choose another), `registered` and `funded` (a
+//        dismissal of an implicit agent the index lists, or for whose account Tender holds storage
+//        or a bond);
+//   503  `unavailable`: a dismissal while the chain cannot be read.
 //   410  `code_expired`: no key came in the 30 minutes.
 
 /** As the question board's writes: a body over this is refused as it arrives, never parsed. */
@@ -394,6 +397,32 @@ export function connectRoutes(
     const row = await ownRow(c.req.param("id"), c.var.account);
     // Only an implicit agent's row is kept past its day, so only one is dismissed.
     if (row === null || row.account_kind !== "implicit") return notFound("no such implicit agent");
+    // The record is the owner's only link to whatever Tender holds for the account: while it holds
+    // storage or a bond for it, the record stays, whatever the page that asked has seen.
+    let held: boolean;
+    try {
+      const config = await deps.client.getConfig();
+      const [storage, vault] = await Promise.all([
+        deps.client.storageBalanceOf(row.account_id),
+        config.agent_bond_token === null
+          ? Promise.resolve(0n)
+          : deps.client.balanceOf(row.account_id, config.agent_bond_token),
+      ]);
+      held = storage !== null || vault > 0n;
+    } catch {
+      return fail(
+        503,
+        "unavailable",
+        "cannot read the chain right now, so the record stays: try again in a minute",
+      );
+    }
+    if (held) {
+      return fail(
+        409,
+        "funded",
+        `Tender holds storage or a bond for ${row.account_id}, so its record stays`,
+      );
+    }
     // One guarded statement: an agent the index lists, by the time of the delete, stays.
     const [gone] = await deps.db.query<{ id: string }>(
       `delete from connect_codes c

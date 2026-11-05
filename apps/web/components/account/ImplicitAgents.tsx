@@ -35,11 +35,27 @@ type Agents = ConnectImplicitAgents["agents"];
 /** What the list read found: the agents, or a token the API no longer takes. */
 type Found = Agents | "signed-out";
 
+/** The words of a refused dismissal, from the API's own codes, never its text. */
+function refusalOf(error: unknown): string {
+  if (error instanceof ApiError) {
+    const code = (error.body as { error?: unknown } | null)?.error;
+    if (code === "registered") return "This agent has registered, so its record is kept.";
+    if (code === "funded") return "Something already reached this account, so its record is kept.";
+    if (error.status === 503)
+      return "Tender can't read the chain right now. Try again in a minute.";
+  }
+  return `Couldn't dismiss it: ${errorMessage(error)}`;
+}
+
 /** Whether anything reached `account` on the chain: the account itself, or storage or a bond with Tender. */
 async function anythingLanded(account: string): Promise<boolean> {
-  const [exists, terms] = await Promise.all([accountExists(account), readBondTerms()]);
+  // At the newest block: a "no" lets the record go.
+  const [exists, terms] = await Promise.all([
+    accountExists(account, "optimistic"),
+    readBondTerms(),
+  ]);
   if (exists) return true;
-  const funding = await readAgentFunding(account, bondOfTerms(terms));
+  const funding = await readAgentFunding(account, bondOfTerms(terms), "optimistic");
   return funding.storage || funding.vault > 0n;
 }
 
@@ -75,10 +91,7 @@ function List({
       console.error(error);
       setSaid((now) => ({
         ...now,
-        [id]:
-          error instanceof ApiError && error.status === 409
-            ? "This agent has registered, so its record is kept."
-            : `Couldn't dismiss it: ${errorMessage(error)}`,
+        [id]: refusalOf(error),
       }));
     } finally {
       setBusy(null);
