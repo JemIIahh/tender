@@ -15,10 +15,11 @@ import { createServer, type Server } from "node:http";
 import { syncBuiltinESMExports } from "node:module";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, relative, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Sandbox } from "near-sandbox";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { ensureSandboxNode, NEARCORE_VERSION } from "../src/index";
+import { ensureSandboxNode, NEARCORE_VERSION, sandboxDownloadRoot } from "../src/index";
 
 // `ensureSandboxNode`: the download of nearcore's sandbox node that the first local chain of an
 // install makes. near-sandbox unpacks it into the OS temp dir and then renames it into its own
@@ -214,4 +215,77 @@ test("a_failed_download_gives_the_temp_dir_back_and_leaves_no_scratch_dir", asyn
   initNode.mockRestore();
   expect(await ensureSandboxNode()).toBe(nodePath());
   expect(world.hits).toHaveLength(1);
+});
+
+test("a_download_removes_its_own_scratch_dir_and_no_other", async () => {
+  // Another process's download, still going on in the same install: its scratch dir is a sibling.
+  const other = join(world.install, ".tmp-other");
+  mkdirSync(other);
+  writeFileSync(join(other, "home"), "x");
+
+  await ensureSandboxNode();
+
+  expect(readdirSync(world.install).filter((name) => name.startsWith(".tmp-"))).toEqual([
+    ".tmp-other",
+  ]);
+  expect(existsSync(join(other, "home"))).toBe(true);
+});
+
+test("each_download_has_a_scratch_dir_of_its_own", async () => {
+  // Two processes cannot be made here; two downloads one after the other can: each one's temp dir
+  // is a new directory beside the node's place, not the name the last one used.
+  const seen: string[] = [];
+  const real = (Sandbox as unknown as { initConfigsWithVersion: (v: string) => Promise<unknown> })
+    .initConfigsWithVersion;
+  vi.spyOn(
+    Sandbox as unknown as { initConfigsWithVersion: (v: string) => Promise<unknown> },
+    "initConfigsWithVersion",
+  ).mockImplementation(async (version) => {
+    seen.push(tmpdir());
+    return real.call(Sandbox, version);
+  });
+
+  await ensureSandboxNode();
+  // The node is on disk now, and near-sandbox has pointed NEAR_SANDBOX_BIN_PATH at it: take both
+  // away, so that the next call downloads again.
+  rmSync(join(world.install, `near-sandbox-${NEARCORE_VERSION}`), { recursive: true });
+  setEnv("NEAR_SANDBOX_BIN_PATH", undefined);
+  await ensureSandboxNode();
+
+  expect(seen).toHaveLength(2);
+  expect(new Set(seen).size).toBe(2);
+  for (const dir of seen) expect(dirname(dir)).toBe(world.install);
+  expect(readdirSync(world.install).filter((name) => name.startsWith(".tmp-"))).toEqual([]);
+});
+
+/** The directory of the near-sandbox package this test resolves, found from the manifest. */
+function nearSandboxPackageDir(): string {
+  let dir = dirname(fileURLToPath(import.meta.resolve("near-sandbox")));
+  for (;;) {
+    const manifest = join(dir, "package.json");
+    if (
+      existsSync(manifest) &&
+      JSON.parse(readFileSync(manifest, "utf8")).name === "near-sandbox"
+    ) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) throw new Error("the package of near-sandbox was not found");
+    dir = parent;
+  }
+}
+
+test("the_download_root_is_near_sandboxs_own_and_follows_DIR_TO_DOWNLOAD_BINARY", () => {
+  // Unset, it is `bin` in near-sandbox's package, which is where near-sandbox 0.3.4 puts a node
+  // (`join(__dirname, "..", "..", "bin")` from `dist/esm`). A new version of the package has to be
+  // checked against this: the scratch dir must sit beside the node's place to be on its filesystem.
+  setEnv("DIR_TO_DOWNLOAD_BINARY", undefined);
+  expect(sandboxDownloadRoot()).toBe(join(nearSandboxPackageDir(), "bin"));
+
+  // Set, it is that directory, made absolute as near-sandbox's own `join` leaves it relative to the
+  // working directory.
+  setEnv("DIR_TO_DOWNLOAD_BINARY", "nodes/here");
+  expect(sandboxDownloadRoot()).toBe(resolve("nodes/here"));
+  setEnv("DIR_TO_DOWNLOAD_BINARY", world.install);
+  expect(sandboxDownloadRoot()).toBe(world.install);
 });

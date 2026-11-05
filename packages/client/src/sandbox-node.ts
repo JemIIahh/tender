@@ -1,4 +1,4 @@
-import { mkdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Sandbox } from "near-sandbox";
@@ -11,7 +11,7 @@ export const NEARCORE_VERSION = "2.13.4";
  * package, which is a directory of `node_modules`. A node is `near-sandbox-<version>/near-sandbox`
  * under it.
  */
-function downloadRoot(): string {
+export function sandboxDownloadRoot(): string {
   const own = process.env.DIR_TO_DOWNLOAD_BINARY;
   if (own) return resolve(own);
   // The package's entry is `<package>/dist/esm/index.mjs`.
@@ -39,7 +39,9 @@ let downloading: Promise<void> | undefined;
  * /tmp, or a checkout on a bind mount (a dev container, Codespaces). It also keeps the lock of the
  * download when the download fails, so a process that waits for that lock waits for minutes. A
  * directory beside the destination is on the destination's filesystem, and the temp dir goes back
- * to what it was, so the node's home dir and its port locks land where the caller put them.
+ * to what it was, so the node's home dir and its port locks land where the caller put them. Each
+ * download has a scratch directory of its own there (`.tmp-` and a random suffix), and removes
+ * only that one.
  *
  * Resolves with the path of the node: the one `NEAR_SANDBOX_BIN_PATH` names, if it is set (nothing
  * is downloaded then), else the downloaded one. Several callers in one process share one download.
@@ -49,7 +51,7 @@ let downloading: Promise<void> | undefined;
 export async function ensureSandboxNode(): Promise<string> {
   const named = process.env.NEAR_SANDBOX_BIN_PATH;
   if (named) return named;
-  const root = downloadRoot();
+  const root = sandboxDownloadRoot();
   const node = join(root, `near-sandbox-${NEARCORE_VERSION}`, "near-sandbox");
   if (await isFile(node)) return node;
   downloading ??= download(root).finally(() => {
@@ -73,8 +75,10 @@ async function download(root: string): Promise<void> {
       "near-sandbox no longer has the call that downloads the node: see sandbox-node.ts",
     );
   }
-  const scratch = join(root, ".tmp");
-  await mkdir(scratch, { recursive: true });
+  // A directory of this call's own, so that processes that download at the same time (the test
+  // files of a fresh clone) never remove each other's.
+  await mkdir(root, { recursive: true });
+  const scratch = await mkdtemp(join(root, ".tmp-"));
   const saved = process.env.TMPDIR;
   process.env.TMPDIR = scratch;
   try {
