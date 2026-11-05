@@ -2,9 +2,13 @@ import { AccountIdSchema } from "@tender/shared";
 import { Hono } from "hono";
 import { type ApiDeps, nowNs } from "../deps";
 import { notFound, parseAccount, parseLimit, parseTag } from "../format";
-import { getAgentDetail, listAgents } from "../queries";
+import { getAgentDetail, getPosterRecord, listAgents } from "../queries";
 
-/** `GET /v1/agents?tag&asp&limit&cursor` and `GET /v1/agents/:account`. */
+/**
+ * `GET /v1/agents?tag&asp&limit&cursor`, `GET /v1/agents/:account`, and an account's record as a
+ * poster, `GET /v1/posters/:account`, which an agent reads before it works on that account's task
+ * (`EntryPolicy.maxPosterVoids`). Any account id has a poster record, zeros if it posted nothing.
+ */
 export function agentRoutes(deps: ApiDeps): Hono {
   const app = new Hono();
 
@@ -31,6 +35,12 @@ export function agentRoutes(deps: ApiDeps): Hono {
       : null;
     if (detail === null) return notFound("no such agent");
     return c.json(detail);
+  });
+
+  app.get("/posters/:account", async (c) => {
+    const account = c.req.param("account");
+    if (!AccountIdSchema.safeParse(account).success) return notFound("no such account");
+    return c.json(await getPosterRecord(deps.db, account, deps.teamAccounts));
   });
 
   return app;

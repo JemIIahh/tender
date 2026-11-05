@@ -271,6 +271,14 @@ test("client_round_trips_against_in_process_app", async () => {
   expect(await client.getAgent("nobody.test.near")).toBeNull();
   const entries = await client.listEntries(alice);
   expect(entries.entries.map((entry) => entry.task_id)).toEqual(["1"]);
+  // The poster's record: its tasks, and none of them voided after a reveal.
+  const { poster } = FIXTURE_ACCOUNTS;
+  expect(await client.getPoster(poster)).toEqual({
+    account: poster,
+    tasks_posted: (await client.listTasks({ poster })).tasks.length,
+    voided_after_reveals: 0,
+    is_team: false,
+  });
 
   // How far the index is behind the chain.
   expect(await client.health()).toEqual({

@@ -498,6 +498,7 @@ function buildWorld(o: WorldOptions = {}) {
     },
     listAgents: unexpected("listAgents"),
     getAgent: unexpected("getAgent"),
+    getPoster: unexpected("getPoster"),
     health: unexpected("health"),
     getScorecard: unexpected("getScorecard"),
     telegramLink: unexpected("telegramLink"),

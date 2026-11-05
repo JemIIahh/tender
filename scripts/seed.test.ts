@@ -364,6 +364,7 @@ function fakeApi(trace: string[], options: ApiOptions = {}) {
     listAgents: unexpected("listAgents"),
     getAgent: unexpected("getAgent"),
     listEntries: unexpected("listEntries"),
+    getPoster: unexpected("getPoster"),
     health,
     getScorecard: unexpected("getScorecard"),
     getBlob,
