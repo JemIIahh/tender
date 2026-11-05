@@ -103,12 +103,12 @@ test("silent_api_ends_in_an_error_state_and_retry_loads_the_board", async ({ pag
   });
 
   await page.goto("/tasks");
-  await expect(page.getByRole("status")).toContainText("Loading");
+  await expect(page.locator("main").getByRole("status")).toContainText("Loading");
   await page.clock.fastForward(20_000);
 
   const error = page.getByTestId("error-state");
   await expect(error).toContainText("too long");
-  await expect(page.getByRole("status")).toHaveCount(0);
+  await expect(page.locator("main").getByRole("status")).toHaveCount(0);
 
   // Retry from the keyboard while the API is still silent. The error and its button stay on the
   // page, and the button keeps the focus: a browser drops it from a button that goes away.
@@ -117,7 +117,7 @@ test("silent_api_ends_in_an_error_state_and_retry_loads_the_board", async ({ pag
   await page.keyboard.press("Enter");
   await expect(retry).toHaveText("Retrying…");
   await expect(retry).toBeFocused();
-  await expect(page.getByRole("status")).toHaveCount(0);
+  await expect(page.locator("main").getByRole("status")).toHaveCount(0);
 
   await page.clock.fastForward(20_000);
   await expect(retry).toHaveText("Retry");
@@ -170,7 +170,7 @@ test("board_holds_the_cards_place_while_it_loads_and_its_shapes_keep_still_with_
   });
 
   await page.goto("/tasks");
-  await expect(page.getByRole("status")).toContainText("Loading tasks");
+  await expect(page.locator("main").getByRole("status")).toContainText("Loading tasks");
   // Three cards' shapes where the cards will be, hidden from a screen reader; they shimmer.
   const shapes = page.locator('main ul[aria-hidden="true"] > li');
   await expect(shapes).toHaveCount(3);
@@ -183,7 +183,7 @@ test("board_holds_the_cards_place_while_it_loads_and_its_shapes_keep_still_with_
   release();
   const firstCard = page.getByTestId("task-card").first();
   await expect(firstCard).toBeVisible();
-  await expect(page.getByRole("status")).toHaveCount(0);
+  await expect(page.locator("main").getByRole("status")).toHaveCount(0);
   // The first card is where its shape was: nothing moved when the tasks landed.
   const loaded = await firstCard.boundingBox();
   expect(loaded?.x).toBeCloseTo(shape?.x ?? -1, 0);

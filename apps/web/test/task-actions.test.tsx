@@ -292,16 +292,23 @@ test("someone_else_sees_no_pick_but_the_refund_still_to_come", async () => {
   );
 });
 
-test("a_reader_is_offered_to_connect_and_no_wallet_is_looked_for", async () => {
+test("a_reader_is_offered_to_connect_once_the_tab_knows_and_the_actions_look_for_no_wallet", async () => {
   const { provider } = setup(null);
   const restore = vi.spyOn(provider, "restore");
   render(<TaskActions data={judged(PERSON)} nowNs={IN_JUDGING} judgeAccount={JUDGE} />);
   const pick = screen.getByTestId("action-pick");
+  // The actions look for no wallet themselves (this tab never signed in). Until the tab's store
+  // knows, they offer no Connect, which would flash for someone about to be taken up again.
+  await act(async () => {});
+  expect(restore).not.toHaveBeenCalled();
+  expect(within(pick).queryByRole("button", { name: "Connect wallet" })).toBeNull();
+  expect(within(pick).getByRole("status").textContent).toBe("Checking for your wallet…");
+
+  // The app shell starts the store; it finds no wallet: the way in, and no status.
+  await act(() => holder.store.start());
   expect(pick.textContent).toContain(`Picking is open for ${PERSON}.`);
   expect(within(pick).getByRole("button", { name: "Connect wallet" })).toBeTruthy();
   expect(screen.queryByRole("status")).toBeNull();
-  await act(async () => {});
-  expect(restore).not.toHaveBeenCalled();
 });
 
 test("refund_says_when_it_opens_then_offers_the_one_button", async () => {

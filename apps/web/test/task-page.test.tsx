@@ -120,7 +120,11 @@ test("task_page_shows_the_task_with_all_its_parts", async () => {
   // Nothing has been picked.
   expect(screen.queryByTestId("scorecard")).toBeNull();
   expect(screen.queryByTestId("payouts")).toBeNull();
-  expect(screen.queryByRole("status")).toBeNull();
+  // Nothing is loading any more. What still says it is waiting is the wallet, which the app shell
+  // starts and this page alone does not: until then no section offers Connect.
+  expect(screen.queryAllByRole("status").map((status) => status.textContent)).toEqual(
+    screen.queryAllByRole("status").map(() => "Checking for your wallet…"),
+  );
 });
 
 test("task_page_asks_for_the_task_and_then_for_its_verifier", async () => {

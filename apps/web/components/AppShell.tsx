@@ -21,8 +21,6 @@ import { Mark } from "./Mark";
 import { Nav, type TipHandlers } from "./Nav";
 import { PRIMARY, SECONDARY } from "./ui";
 
-/** The pills of the top bar: the landing's, a little smaller so that both fit a phone. */
-
 /** Laptop width, from which the sidebar is a sidebar (and can be the rail) and not a menu. */
 const WIDE = "(min-width: 64rem)";
 
@@ -146,14 +144,18 @@ export function AppShell({ children }: { children: ReactNode }) {
   // The two places of the wordmark: the sidebar's head, and the top bar, where it is on the rail.
   const sideMark = useRef<HTMLDivElement>(null);
   const barMark = useRef<HTMLDivElement>(null);
-  // The wallet as far as this tab knows it, without looking for one: a page that needs the wallet
-  // starts the store (lib/wallet.ts), and the board, say, does not load a wallet only for the top
-  // bar. Until then, and while none is connected, the pill offers to connect one.
-  const { accountId } = useSyncExternalStore(
+  // The wallet as this tab knows it. The shell starts the store once it is in the browser, so that
+  // every page takes up the wallet of an earlier visit (silently: a restore opens no window); the
+  // wallet library loads then, after the page. Until the store knows (`ready`), the pill is a
+  // placeholder, so that a page that is about to show the account never shows Connect first.
+  const { ready, accountId } = useSyncExternalStore(
     walletStore.subscribe,
     walletStore.getSnapshot,
     walletStore.getServerSnapshot,
   );
+  useEffect(() => {
+    void walletStore.start();
+  }, []);
   // Whether the sidebar is the rail. The page's look follows the root element's attribute in CSS;
   // this is for the toggle's state and words.
   const rail = useSyncExternalStore(
@@ -330,9 +332,17 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Link href="/post" className={`${PRIMARY} ${BAR_PILL}`}>
             Post task
           </Link>
-          {/* On a phone the Live dot takes some of the bar, so the pill says "Connect", and an
-              account is cut a little shorter; the names and the title are whole. */}
-          {accountId === null ? (
+          {/* While the store looks, a placeholder of the pill's size. On a phone the Live dot takes
+              some of the bar, so the pill says "Connect", and an account is cut a little shorter;
+              the names and the title are whole. */}
+          {!ready ? (
+            <span
+              role="status"
+              aria-label="Checking your wallet"
+              data-testid="wallet-pill-placeholder"
+              className={`${SECONDARY} ${BAR_PILL} w-24 animate-pulse motion-reduce:animate-none sm:w-36`}
+            />
+          ) : accountId === null ? (
             <Link href="/wallet" aria-label="Connect wallet" className={`${SECONDARY} ${BAR_PILL}`}>
               Connect<span className="max-sm:hidden">{"\u00a0"}wallet</span>
             </Link>

@@ -207,13 +207,20 @@ test("board_empty_shows_the_fixed_note_and_asks_a_reader_to_connect", async () =
   expect(screen.getByTestId("board-note").textContent).toBe(
     "Answers explain the brief; they can't change the checks.",
   );
-  // A reader is offered the way in, and no form; nothing announces itself as a status.
+  // The board itself looks for no wallet (this tab never signed in): until the tab's store knows,
+  // it offers no Connect, which would flash for someone about to be taken up again.
+  expect(restore).not.toHaveBeenCalled();
+  expect(screen.getByTestId("board-wallet-checking").textContent).toBe("Checking for your wallet…");
+  expect(screen.queryByRole("button", { name: "Connect wallet" })).toBeNull();
+
+  // The app shell starts the store; it finds no wallet. A reader is offered the way in, and no
+  // form; nothing else announces itself.
+  await act(() => holder.store.start());
   expect(screen.getByRole("button", { name: "Connect wallet" })).toBeTruthy();
+  expect(screen.queryByTestId("board-wallet-checking")).toBeNull();
   expect(screen.queryByTestId("ask-form")).toBeNull();
   expect(screen.queryByRole("status")).toBeNull();
   expect(screen.queryByRole("alert")).toBeNull();
-  // Reading the board looks for no wallet: this tab never signed in.
-  expect(restore).not.toHaveBeenCalled();
   expect(api.requests).toEqual([`GET ${BOARD_PATH}`]);
 });
 
@@ -771,12 +778,15 @@ test("poster_is_told_plainly_when_a_hide_is_refused", async () => {
 
 // ---- The wallet, the stream and failures -------------------------------------------------------
 
-test("connect_looks_for_the_wallet_only_when_pressed_and_then_offers_the_form", async () => {
+test("connect_is_offered_once_the_tab_knows_and_then_offers_the_form", async () => {
   fakeApi();
-  const { provider } = wallet(ALICE);
+  const { provider, restore } = wallet(ALICE);
   render(<Questions task={TASK} phase="open" refresh={0} />);
   await loaded();
   const user = userEvent.setup();
+  // The board looks for no wallet itself; the app shell starts the store, which finds none.
+  expect(restore).not.toHaveBeenCalled();
+  await act(() => holder.store.start());
 
   await user.click(screen.getByRole("button", { name: "Connect wallet" }));
 

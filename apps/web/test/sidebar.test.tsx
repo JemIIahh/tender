@@ -24,6 +24,8 @@ vi.mock("../lib/wallet", () => {
       subscribe: () => () => {},
       getSnapshot: () => state,
       getServerSnapshot: () => state,
+      // The shell starts the store on mount; here there is nothing to start.
+      start: async () => {},
     },
   };
 });

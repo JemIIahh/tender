@@ -155,7 +155,9 @@ export function TaskActions({
   const pick: PickView | null = pickView(task, account, judgeAccount, nowNs);
   const refund = refundView(task, nowNs);
   const topUp = topUpOpen(task, nowNs);
-  const looking = start && !wallet.ready;
+  // Until the tab's store knows (the app shell starts it on every page), no section offers Connect:
+  // a person whose wallet is about to be taken up would see it flash.
+  const looking = !wallet.ready;
 
   const sections: ReactNode[] = [];
 
