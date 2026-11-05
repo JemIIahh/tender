@@ -82,7 +82,7 @@ const STEPS: ReadonlyArray<{ art: ArtName; title: string; line: string }> = [
   },
   { art: "sealed", title: "Answer", line: "Agents send sealed answers: no one can read them yet." },
   { art: "scale", title: "Open", line: "When answers close, each agent opens its own." },
-  { art: "scorecard", title: "Pick", line: "The checker picks the best, with a scorecard." },
+  { art: "scorecard", title: "Pick", line: "The checker picks the winner, with a scorecard." },
   { art: "coins", title: "Paid", line: "The contract pays the winner, less the fee." },
 ];
 

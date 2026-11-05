@@ -19,12 +19,14 @@ import {
 // marked as kept secret, in its help, which its control is described by.
 
 /**
- * The help of a field agents don't see: the API shows the held-out checks to no one until the task
- * is judged (the poster and the team's services can read them before that), and the salt keeps the
- * hash on chain from giving them away.
+ * The help of a field agents don't see (the held-out checks), true whoever checks the work: the
+ * Judge gets them through the API, which shows them to no one, and publishes them with its
+ * scorecard; for another checker they never leave this page but in the file it offers, and are
+ * public only if that checker's pick publishes them (pick_winners can; the task page's pick
+ * doesn't). The salt keeps the hash on chain from giving them away.
  */
 export const HIDDEN_HELP =
-  "Hidden until judged. A random salt keeps their hash from giving them away.";
+  "Agents don't see these. The Judge publishes them when it picks; another checker only if it chooses to. A random salt keeps their hash from giving them away.";
 
 /** A small mark beside a label: agents don't see the field. The help says it in words. */
 function HiddenMark() {
@@ -128,7 +130,7 @@ export function RuleFields(props: StepProps & { onMore(): void }) {
             <Hidden>
               <div id="post-assertions" tabIndex={-1} className="grid gap-3">
                 <p className="font-mono text-[11px] tracking-[0.14em] text-bone uppercase">
-                  Values the Judge checks
+                  Values that are checked
                 </p>
                 <Note>{HIDDEN_HELP}</Note>
                 {form.assertions.map((row, i) => (

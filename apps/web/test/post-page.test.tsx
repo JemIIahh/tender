@@ -569,7 +569,12 @@ function captureDownloads(): Array<{ name: string; bytes: Promise<Uint8Array> }>
 
 test.each([
   { name: "me", verifier: "me", typed: "", who: "You pick" },
-  { name: "another_account", verifier: "other", typed: BOB, who: `${BOB} needs the hidden checks` },
+  {
+    name: "another_account",
+    verifier: "other",
+    typed: BOB,
+    who: `${BOB} needs these held-out checks`,
+  },
 ] as const)(
   "the_held_out_checks_are_a_file_that_hashes_to_the_commitment_when_the_checker_is_$name",
   async ({ verifier, typed, who }) => {
@@ -699,6 +704,28 @@ test("a_quick_pick_sets_the_deadline_and_the_windows_follow_it", async () => {
   expect(task && task.revealDeadline - task.commitDeadline).toBe(300n * SECOND);
   expect(task && task.pickDeadline - task.revealDeadline).toBe(600n * SECOND);
   expect(task && task.fallbackDeadline - task.pickDeadline).toBe(3_600n * SECOND);
+});
+
+test("the_windows_note_says_the_figures_the_post_sends_at_the_one_week_quick_pick", async () => {
+  setup({ vault: TUSDC(5) });
+  const user = userEvent.setup();
+  render(<PostTask judgeAccount={JUDGE} />);
+  await screen.findByLabelText("Amount (tUSDC)");
+  await openMore(user);
+  // A day by default: 2 hours to open, 4 to pick, and the poster's fallback a day.
+  await waitFor(() =>
+    expect(testId("derived-windows")).toBe(
+      "Worked out from the deadline: answers are opened for 2h, the checker picks within 4h, and if it doesn't, you can for 1d.",
+    ),
+  );
+
+  // A week: the bounds hold (12 hours to open, at most 3 days of fallback), and the note says so,
+  // as the line under the field does.
+  await user.click(screen.getByRole("button", { name: "1 week from now" }));
+  expect(testId("derived-windows")).toBe(
+    "Worked out from the deadline: answers are opened for 12h, the checker picks within 1d 4h, and if it doesn't, you can for 3d.",
+  );
+  expect(testId("deadline-plan")).toContain("open them (reveal) for 12h");
 });
 
 test("a_deadline_too_near_or_too_far_is_said_and_stops_the_post", async () => {
@@ -1779,7 +1806,9 @@ test.each([
         : words;
     };
     for (const label of kept) {
-      expect(described(label), label).toContain("Hidden until judged.");
+      expect(described(label), label).toContain(
+        "Agents don't see these. The Judge publishes them when it picks; another checker only if it chooses to.",
+      );
     }
     for (const label of seen) {
       expect(described(label), label).not.toContain("secret");

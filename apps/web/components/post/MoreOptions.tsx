@@ -122,6 +122,9 @@ export function MoreOptions(
   const { form, update, errors, touch, open, onToggle, canRubric, onKind, limits } = props;
   const panel = useId();
   const invited = invitedOf(form).length;
+  // The windows the deadline gives, as the post will send them (`windowsForDeadline`'s bounds
+  // applied), for the note under the windows.
+  const derived = form.timing === "deadline" ? windowsOf(form) : null;
 
   const setCustom = (custom: boolean) => {
     if (!custom) {
@@ -145,7 +148,7 @@ export function MoreOptions(
           type="button"
           id="post-more"
           aria-expanded={open}
-          aria-controls={panel}
+          aria-controls={open ? panel : undefined}
           onClick={onToggle}
           className="flex min-h-14 w-full items-center justify-between gap-4 rounded-2xl px-5 text-left text-[15px] font-medium text-bone transition-colors hover:bg-raised motion-reduce:transition-none sm:px-7"
         >
@@ -310,10 +313,10 @@ export function MoreOptions(
                 )}
               </div>
             ) : (
-              <p className="text-sm text-muted">
-                Worked out from the deadline: opening the answers takes a twelfth of the time to
-                answer, the pick a sixth, and if the checker doesn&rsquo;t pick, you can for six
-                times as long.
+              <p data-testid="derived-windows" className="text-sm text-muted">
+                {derived === null
+                  ? "Worked out from the deadline, once it is a time after now."
+                  : `Worked out from the deadline: answers are opened for ${spanText(derived.reveal)}, the checker picks within ${spanText(derived.pick)}, and if it doesn't, you can for ${spanText(derived.fallback)}.`}
               </p>
             )}
           </Group>
