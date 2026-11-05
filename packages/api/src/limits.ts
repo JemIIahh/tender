@@ -9,16 +9,19 @@ import type { ErrorBody } from "./format";
 //
 // A few routes cost the API something for anyone who asks: a challenge is a row in the database, a
 // sign-in is a question to the chain, a Telegram link is a nonce, an MCP request is a server and a
-// transport that may wait 30 seconds for an answer. Each is held to a number of
-// requests in a window, counted per client address or per signed-in account in this process's
-// memory, which is enough because one services process runs per database (P03-R25). Past the
-// limit the answer is a 429 with `Retry-After`, the seconds until the caller's window ends.
+// transport that may wait 30 seconds for an answer, a health check reads the chain, a start is a
+// row and an alert. Each is held to a number of requests in a window, counted per client address
+// or per signed-in account in this process's memory, which is enough because one services process
+// runs per database (P03-R25). Past the limit the answer is a 429 with `Retry-After`, the seconds
+// until the caller's window ends.
 //
 // An upload is a row that stays for good, so the two upload routes are held to the bytes of the new
 // rows they store as well (`uploadBudget`): so many a day for each account, past which its uploads
 // are 429s, and so many an hour for all accounts together, one pool for held-out documents and one
-// for the rest, past which that route's uploads are 503s until the hour is over. The team's
-// accounts are held to none of these.
+// for the rest, past which that route's uploads are 503s until the hour is over. An entrant's
+// result for a task it can still reveal in comes from a budget of its own instead of the pool, so
+// that throwaway accounts that fill the pool cannot keep the task's other entrants from revealing.
+// The team's accounts are held to none of these.
 //
 // A 503 that means the chain or the database cannot answer right now carries `Retry-After: 5`
 // too: what failed may well be back by then. A 503 that a setting causes, such as Telegram linking
@@ -58,6 +61,13 @@ export interface RateLimits {
   telegramLink: RateLimit;
   /** `POST /mcp`, per client address: every request, whatever tool it calls. */
   mcp: RateLimit;
+  /** `GET /v1/health`, per client address. Its read of the chain is shared too (`health.ts`). */
+  health: RateLimit;
+  /**
+   * `POST /v1/tasks/:id/start`, per signed-in account: each new start is a row and a Telegram
+   * alert to the task's watchers.
+   */
+  start: RateLimit;
   /** `POST /v1/blobs` and `POST /v1/heldout` together, per signed-in account: every request. */
   upload: RateLimit;
   /**
@@ -99,6 +109,11 @@ export const DEFAULT_RATE_LIMITS: Readonly<RateLimits> = Object.freeze({
   // 5 a second: an agent browsing the board makes a call or two a second at most, and a client that
   // shares an address with others (a proxy left at 0 hops) has room beside them.
   mcp: { limit: 300, windowMs: 60_000 },
+  // A monitor asks every few seconds, and each tab of the web app asks with its other reads; 5 a
+  // second leaves room for many of them behind one address.
+  health: { limit: 300, windowMs: 60_000 },
+  // An agent starts a task when it takes one on: a few an hour. 30 a minute is room for a burst.
+  start: { limit: 30, windowMs: 60_000 },
   upload: { limit: 60, windowMs: HOUR_MS },
   uploadBytes: { limit: 8 * MIB, windowMs: 24 * HOUR_MS },
   heldoutBytesTotal: { limit: 128 * MIB, windowMs: HOUR_MS },
@@ -124,6 +139,8 @@ export function rateLimitsOf(over: Partial<RateLimits> | undefined): RateLimits 
     verify: over?.verify ?? DEFAULT_RATE_LIMITS.verify,
     telegramLink: over?.telegramLink ?? DEFAULT_RATE_LIMITS.telegramLink,
     mcp: over?.mcp ?? DEFAULT_RATE_LIMITS.mcp,
+    health: over?.health ?? DEFAULT_RATE_LIMITS.health,
+    start: over?.start ?? DEFAULT_RATE_LIMITS.start,
     upload: over?.upload ?? DEFAULT_RATE_LIMITS.upload,
     uploadBytes: over?.uploadBytes ?? DEFAULT_RATE_LIMITS.uploadBytes,
     heldoutBytesTotal: over?.heldoutBytesTotal ?? DEFAULT_RATE_LIMITS.heldoutBytesTotal,
@@ -283,12 +300,35 @@ export function rateLimitedFor(message: string, seconds: number): never {
 const POOL = "pool";
 
 /**
+ * The budget of its own that an entrant's result is charged to (`uploadBudget`): the entrant's,
+ * for one task, while it can still reveal there.
+ */
+export interface EntrantAllowance {
+  /** The task and the account, as one key. */
+  key: string;
+  /** The most bytes of new rows the entrant may store for the task: what a result may have. */
+  bytes: number;
+  /** The task's reveal deadline, after which the allowance is gone, in nanoseconds. */
+  untilNs: bigint;
+  /** The time of the request, by the API's clock, in nanoseconds. */
+  nowNs: bigint;
+}
+
+/**
  * The bytes of new rows that the upload routes of one app may still store, in this process's
  * memory and by the wall clock: `limits.uploadBytes` for each signed-in account, and for all
  * accounts together `limits.heldoutBytesTotal` of held-out documents and `limits.blobBytesTotal` of
  * the rest. The two pools are apart, so a flood of results or briefs cannot stop a held-out
  * document, which a poster has to send within minutes of posting. The team's accounts
  * (`teamAccounts`) are held to none of them.
+ *
+ * A result whose uploader has a commitment on its task that is not revealed yet, while the task
+ * takes reveals, is charged to that entrant's allowance for the task (`own`, `EntrantAllowance`)
+ * instead of the pool: the bytes the task's brief lets a result have, kept until the reveal
+ * deadline. So no flood of other uploads, from however many accounts, can keep an entrant from
+ * uploading the result it reveals. Each allowance is bounded by the chain: one for each entry,
+ * which costs its entrant storage and, on an open task, a bond. Past it, the result is the pool's
+ * like any other upload. The account's own budget holds either way.
  *
  * Only a new row costs anything: bytes that are stored already, and an upload that is refused,
  * store none. `reserve(account, route, bytes)` is called once an upload is found good and its bytes
@@ -306,13 +346,37 @@ export function uploadBudget(limits: RateLimits, teamAccounts: readonly string[]
     heldout: new ByteWindows(limits.heldoutBytesTotal),
     blobs: new ByteWindows(limits.blobBytesTotal),
   };
+  /** What each entrant has spent of its allowance for a task, by `EntrantAllowance.key`. */
+  const entrants = new Map<string, { spent: number; untilNs: bigint }>();
   return {
-    reserve(account: string, route: UploadRoute, bytes: number): () => void {
+    reserve(
+      account: string,
+      route: UploadRoute,
+      bytes: number,
+      own?: EntrantAllowance,
+    ): () => void {
       if (team.has(account)) return () => {};
       const now = Date.now();
       const pool = pools[route];
       const accountWait = perAccount.wait(account, bytes, now);
       if (accountWait > 0) refuseFor(429, UPLOADED_TOO_MUCH, accountWait);
+      if (own !== undefined) {
+        // The allowances whose reveals are over are gone.
+        for (const [key, held] of entrants) if (held.untilNs <= own.nowNs) entrants.delete(key);
+        const held = entrants.get(own.key) ?? { spent: 0, untilNs: own.untilNs };
+        if (own.nowNs < own.untilNs && held.spent + bytes <= own.bytes) {
+          held.spent += bytes;
+          entrants.set(own.key, held);
+          const returnToAccount = perAccount.spend(account, bytes, now);
+          let returned = false;
+          return () => {
+            if (returned) return;
+            returned = true;
+            returnToAccount();
+            held.spent -= bytes;
+          };
+        }
+      }
       const poolWait = pool.wait(POOL, bytes, now);
       if (poolWait > 0) refuseFor(503, POOL_USED_UP[route], poolWait);
       const returnToAccount = perAccount.spend(account, bytes, now);

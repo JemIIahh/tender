@@ -241,6 +241,7 @@ test("post_task_end_to_end", async ({ page }) => {
       match: [`${SECRET}.near`, "carol.near"],
       no_match: ["dave..near", "_eve.near"],
     },
+    salt: expect.stringMatching(/^[0-9a-f]{64}$/),
   });
   // The API has the same commitment, once its index has the task.
   await expect

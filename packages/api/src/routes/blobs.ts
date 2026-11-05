@@ -39,7 +39,13 @@ import {
   notFound,
   readJson,
 } from "../format";
-import { rateLimit, rateLimitsOf, type UploadRoute, uploadBudget } from "../limits";
+import {
+  type EntrantAllowance,
+  rateLimit,
+  rateLimitsOf,
+  type UploadRoute,
+  uploadBudget,
+} from "../limits";
 import { getScorecard } from "../queries";
 
 type BlobApp = Hono<{ Variables: AuthVariables }>;
@@ -140,9 +146,13 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     (c) => team.has(c.var.account),
   );
   const budget = uploadBudget(limits, deps.teamAccounts);
-  /** What a new row of `bytes` that `account` sends by `route` is charged with. */
-  const charge = (account: string, route: UploadRoute, bytes: Uint8Array) => () =>
-    budget.reserve(account, route, bytes.length);
+  /**
+   * What a new row of `bytes` that `account` sends by `route` is charged with: the entrant's own
+   * allowance for its result (`own`), else the route's pool.
+   */
+  const charge =
+    (account: string, route: UploadRoute, bytes: Uint8Array, own?: EntrantAllowance) => () =>
+      budget.reserve(account, route, bytes.length, own);
 
   // Refuses a body over `MAX_BODY_BYTES` as it arrives, before anything parses it. It comes after
   // sign-in on the routes, so a request that is not signed in is turned away without being read.
@@ -161,9 +171,9 @@ export function blobRoutes(deps: ApiDeps, requireAuth: RequireAuth): BlobApp {
     const account = c.var.account;
     const upload = parse(UploadSchema, await readJson(c), "the request body");
     const bytes = decodeContent(upload.content_base64);
-    const blob = await blobOf(deps, upload, bytes, account);
+    const { blob, own } = await blobOf(deps, upload, bytes, account);
 
-    const { sha256, stored } = await store(deps.db, blob, charge(account, "blobs", bytes));
+    const { sha256, stored } = await store(deps.db, blob, charge(account, "blobs", bytes, own));
     if (stored.kind !== blob.kind) return fail(409, "conflict", CONFLICT);
     // Its first uploader may have stored it as private, which keeps the indexer from reading it.
     // The one uploading it now holds the bytes, so making it public gives nothing away.
@@ -334,23 +344,25 @@ function isDocumentOfAnotherKind(bytes: Uint8Array): boolean {
  * is wrong in itself is a 400 whoever sends it, and the account's right to send it is a 403 or a
  * 404 after that. Whether it is the time for it comes last (a scorecard's 409). Visibility is the
  * kind's: all but a result are public, which is what lets the indexer read a brief or a profile,
- * and the API a scorecard.
+ * and the API a scorecard. `own` is the allowance a result is charged to instead of the pool, for
+ * an entrant that can still reveal it (`entrantAllowance`).
  */
 async function blobOf(
   deps: ApiDeps,
   upload: Upload,
   bytes: Uint8Array,
   account: string,
-): Promise<NewBlob> {
+): Promise<{ blob: NewBlob; own?: EntrantAllowance }> {
   const { kind } = upload;
   if (kind === "result") {
     // Any bytes of either type, but a document of another kind: the entrant's own, and nobody's to
     // check until the Judge reads them.
     if (upload.task_id === undefined) return badRequest("task_id is required for a result");
     if (isDocumentOfAnotherKind(bytes)) return badRequest(ANOTHER_KIND);
-    await requireEntry(deps.db, upload.task_id, account);
+    const entry = await requireEntry(deps.db, upload.task_id, account);
+    const own = await entrantAllowance(deps, upload.task_id, account, entry);
     // The row records the task for information only: a result is served by what was revealed.
-    return {
+    const blob: NewBlob = {
       kind,
       contentType: upload.content_type,
       bytes,
@@ -358,6 +370,7 @@ async function blobOf(
       uploader: account,
       isPublic: false,
     };
+    return own === undefined ? { blob } : { blob, own };
   }
 
   if (upload.content_type !== "application/json") {
@@ -371,28 +384,52 @@ async function blobOf(
     }
     await requireScorecardRight(deps, scorecard, account);
     return {
-      kind,
-      contentType: upload.content_type,
-      bytes,
-      taskId: BigInt(scorecard.task_id),
-      uploader: account,
-      isPublic: true,
+      blob: {
+        kind,
+        contentType: upload.content_type,
+        bytes,
+        taskId: BigInt(scorecard.task_id),
+        uploader: account,
+        isPublic: true,
+      },
     };
   }
 
   if (kind === "brief") checkDocument("the brief", bytes, BriefSchema);
   else if (kind === "criteria") checkDocument("the criteria", bytes, PublicCriteriaSchema);
   else checkDocument("the profile", bytes, ProfileSchema);
-  return { kind, contentType: upload.content_type, bytes, uploader: account, isPublic: true };
+  return {
+    blob: { kind, contentType: upload.content_type, bytes, uploader: account, isPublic: true },
+  };
+}
+
+/** What `requireEntry` finds of an account's entry on a task, and of the task. */
+interface EntryStanding {
+  /** Whether the entry has not been revealed yet. */
+  unrevealed: boolean;
+  /** The task's reveal deadline, in nanoseconds, as a decimal string. */
+  revealDeadline: string;
+  /** The hash of the task's brief. */
+  briefHash: string;
 }
 
 /**
  * A result is an entrant's, so the account must have an entry on the task. The index can be a few
  * blocks behind the chain, so a 403 can also mean that the commit is too fresh to be in it yet.
  */
-async function requireEntry(db: Db, taskId: string, account: string): Promise<void> {
-  const [task] = await db.query<{ entered: boolean }>(
-    `select exists (select 1 from entries e where e.task_id = t.id and e.account = $2) as entered
+async function requireEntry(db: Db, taskId: string, account: string): Promise<EntryStanding> {
+  const [task] = await db.query<{
+    entered: boolean;
+    unrevealed: boolean;
+    reveal_deadline: string;
+    brief_hash: string;
+  }>(
+    `select exists (select 1 from entries e where e.task_id = t.id and e.account = $2) as entered,
+            exists (select 1 from entries e
+                     where e.task_id = t.id and e.account = $2 and e.content_hash is null)
+              as unrevealed,
+            t.reveal_deadline::text as reveal_deadline,
+            t.brief_hash
        from tasks t
       where t.id = $1::numeric`,
     [taskId, account],
@@ -404,6 +441,49 @@ async function requireEntry(db: Db, taskId: string, account: string): Promise<vo
       "forbidden",
       "this account has no entry on that task in the index; if it committed a moment ago, the indexer may not have seen the commit yet, so try again shortly",
     );
+  }
+  return {
+    unrevealed: task.unrevealed,
+    revealDeadline: task.reveal_deadline,
+    briefHash: task.brief_hash,
+  };
+}
+
+/**
+ * The allowance of its own that `account`'s result for `taskId` is charged to instead of the pool
+ * (`uploadBudget`), while its entry is not revealed and the task's reveals are open: the most bytes
+ * the task's brief lets a result have (`output.max_bytes`), or `MAX_CONTENT_BYTES` when the brief
+ * is not stored as one. Undefined once the entry is revealed or the reveals are over: the result is
+ * the pool's then, like any other upload.
+ */
+async function entrantAllowance(
+  deps: ApiDeps,
+  taskId: string,
+  account: string,
+  entry: EntryStanding,
+): Promise<EntrantAllowance | undefined> {
+  const now = nowNs(deps);
+  const untilNs = BigInt(entry.revealDeadline);
+  if (!entry.unrevealed || now >= untilNs) return undefined;
+  return {
+    key: `${taskId}:${account}`,
+    bytes: await resultLimitOf(deps.db, entry.briefHash),
+    untilNs,
+    nowNs: now,
+  };
+}
+
+/** The most bytes the brief stored under `briefHash` lets a result have, or `MAX_CONTENT_BYTES`. */
+async function resultLimitOf(db: Db, briefHash: string): Promise<number> {
+  const stored = await getBlob(db, briefHash);
+  if (stored === null || stored.kind !== "brief") return MAX_CONTENT_BYTES;
+  try {
+    const brief = BriefSchema.safeParse(
+      JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(stored.bytes)),
+    );
+    return brief.success ? brief.data.output.max_bytes : MAX_CONTENT_BYTES;
+  } catch {
+    return MAX_CONTENT_BYTES;
   }
 }
 

@@ -46,9 +46,11 @@ import type { Solver } from "./types";
 // scripted solvers cost nothing and refuse it.
 //
 // The entry policy (`EntryPolicy` of `policy.ts`) says which tasks of its tags the agent spends work
-// on. An agent with the llm solver enters only the tasks that the Judge checks (`JUDGE_ACCOUNT`), at
-// most 20 a UTC day, and none that pays less than its token's least reward on the chain (read from
-// `get_config` when it starts). One with a scripted solver enters any task, as the demos' agents do.
+// on. An agent with the llm solver enters only the tasks that the Judge checks (`JUDGE_ACCOUNT`) and
+// has accepted, at most 20 a UTC day, none that pays less than its token's least reward on the chain
+// (read from `get_config` when it starts), and none whose poster has had more than 2 tasks voided
+// after their reveals (the team's poster aside). One with a scripted solver enters any task, as the
+// demos' agents do.
 // The flags set the rules over those defaults:
 //
 //   --verifiers judge|any|<account>,<account>...   who may check its work
@@ -60,6 +62,8 @@ import type { Solver } from "./types";
 //                                                  on in a UTC day
 //   --max-voids-after-reveals N                    skips a verifier whose record in the API shows
 //                                                  more empty picks after reveals than N
+//   --max-poster-voids N                           skips a poster whose record in the API shows
+//                                                  more tasks voided after reveals than N
 //
 // A hire is held to its service's terms in place of the least reward and the verifiers, and counts
 // toward the daily cap. One its hirer checks is held to the hirer's record and refused once the day
@@ -109,12 +113,18 @@ const USAGE =
   `--solver ${SOLVERS.join("|")} --network ${Object.keys(NETWORKS).join("|")} ` +
   "[--max-llm-calls-per-hour N] [--verifiers judge|any|<account>,...] " +
   "[--min-reward <token>=<amount>]... [--daily-entries N] [--daily-judged-hires N] " +
-  "[--max-voids-after-reveals N]";
+  "[--max-voids-after-reveals N] [--max-poster-voids N]";
 
 /** The most an amount of a token can be: a u128. */
 const MAX_U128 = 2n ** 128n - 1n;
 /** The tasks an agent with a model takes on in a UTC day, unless `--daily-entries` says otherwise. */
 const LLM_DAILY_ENTRIES = 20;
+/**
+ * The tasks voided after their reveals that an agent with a model lets a poster have had, unless
+ * `--max-poster-voids` says otherwise: a poster can write held-out checks that nothing passes, read
+ * the revealed work and be refunded, and an honest poster's hard task can void too, so a few.
+ */
+const LLM_MAX_POSTER_VOIDS = 2;
 /**
  * The hires the Judge checks that an agent with a model takes on in a UTC day, unless
  * `--daily-judged-hires` says otherwise.
@@ -143,6 +153,7 @@ export interface CliArgs {
   dailyEntries?: number;
   dailyJudgedHires?: number;
   maxVoidsAfterReveals?: number;
+  maxPosterVoids?: number;
 }
 
 /**
@@ -196,6 +207,7 @@ export function parseCli(args: readonly string[]): CliArgs {
     "daily-entries"?: string;
     "daily-judged-hires"?: string;
     "max-voids-after-reveals"?: string;
+    "max-poster-voids"?: string;
   };
   try {
     values = parseArgs({
@@ -210,6 +222,7 @@ export function parseCli(args: readonly string[]): CliArgs {
         "daily-entries": { type: "string" },
         "daily-judged-hires": { type: "string" },
         "max-voids-after-reveals": { type: "string" },
+        "max-poster-voids": { type: "string" },
       },
     }).values;
   } catch (error) {
@@ -274,6 +287,11 @@ export function parseCli(args: readonly string[]): CliArgs {
   if (voidsFlag !== undefined && maxVoidsAfterReveals === undefined) {
     throw new CliError(`--max-voids-after-reveals must be a whole number from 0\n${USAGE}`);
   }
+  const posterFlag = values["max-poster-voids"];
+  const maxPosterVoids = posterFlag === undefined ? undefined : asCount(posterFlag, 0);
+  if (posterFlag !== undefined && maxPosterVoids === undefined) {
+    throw new CliError(`--max-poster-voids must be a whole number from 0\n${USAGE}`);
+  }
 
   return {
     agent: AGENTS[agent],
@@ -285,6 +303,7 @@ export function parseCli(args: readonly string[]): CliArgs {
     ...(dailyEntries !== undefined && { dailyEntries }),
     ...(dailyJudgedHires !== undefined && { dailyJudgedHires }),
     ...(maxVoidsAfterReveals !== undefined && { maxVoidsAfterReveals }),
+    ...(maxPosterVoids !== undefined && { maxPosterVoids }),
   };
 }
 
@@ -532,9 +551,10 @@ export async function chainMinRewards(
 /**
  * The entry policy of a run: the flags, over the defaults of its solver. An agent with a model
  * takes the Judge's tasks only, at most 20 a UTC day, at most 50 hires the Judge checks a UTC day,
- * and none below its token's least reward on the chain (`chainMinimums`, which the caller reads for
- * it). A scripted agent enters any task of its tags, with no cap, as the demos' agents always have.
- * A rule that is not set is left out.
+ * none below its token's least reward on the chain (`chainMinimums`, which the caller reads for
+ * it), and none of a poster with more than 2 tasks voided after their reveals. A scripted agent
+ * enters any task of its tags, with no cap, as the demos' agents always have. A rule that is not
+ * set is left out.
  */
 export function entryPolicyOf(
   config: RunConfig,
@@ -545,6 +565,7 @@ export function entryPolicyOf(
   const minReward = { ...(llm ? chainMinimums : {}), ...config.minReward };
   const dailyEntries = config.dailyEntries ?? (llm ? LLM_DAILY_ENTRIES : undefined);
   const dailyJudgedHires = config.dailyJudgedHires ?? (llm ? LLM_DAILY_JUDGED_HIRES : undefined);
+  const maxPosterVoids = config.maxPosterVoids ?? (llm ? LLM_MAX_POSTER_VOIDS : undefined);
   return {
     verifiers,
     ...(verifiers === "judge" && { judgeAccount: config.judgeAccount }),
@@ -552,6 +573,7 @@ export function entryPolicyOf(
     ...(config.maxVoidsAfterReveals !== undefined && {
       maxVoidsAfterReveals: config.maxVoidsAfterReveals,
     }),
+    ...(maxPosterVoids !== undefined && { maxPosterVoids }),
     ...(dailyEntries !== undefined && { dailyEntries }),
     ...(dailyJudgedHires !== undefined && { dailyJudgedHires }),
   };

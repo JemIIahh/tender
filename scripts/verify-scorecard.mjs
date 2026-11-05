@@ -17,6 +17,11 @@
 // task that committed to some: its verifier chose not to publish them (a pick made by hand on the
 // web app's task page publishes none), and the pick cannot be re-run against them.
 //
+// A held-out document carries a `salt` of random bytes beside its checks, and the hash is of the
+// whole document, salt included. Without one, the commitment of a short answer could have been
+// found by hashing likely answers while the task was open; the script says when the published
+// document has none. That is a note, not a mismatch: the hashes are what they are.
+//
 // It prints one verdict, and exits with its code:
 //   0  VERIFIED       everything that exists matches;
 //   1  MISMATCH       a hash does not: the scorecard served, or the held-out checks it publishes,
@@ -30,7 +35,8 @@
 // whole of it, so the check does not depend on this repository's own code.
 //
 // Defaults come from the environment: TENDER_CONTRACT, TENDER_API_URL, TENDER_NETWORK and
-// NEAR_RPC_URL. No key is needed or read. `--help` prints the usage and the exit codes.
+// NEAR_RPC_URL. No key is needed or read. `--help` prints the usage and the exit codes. The first
+// line it prints names the network, or, for a node given with --rpc, that node's host.
 
 import { createHash } from "node:crypto";
 import { parseArgs } from "node:util";
@@ -67,7 +73,7 @@ const HELP = `${USAGE}
 Checks a settled task's scorecard against the chain: the held-out checks it publishes against the
 task's heldout_commitment, and the scorecard's bytes against the outcome's scorecard_hash.
 --contract, --api, --network and --rpc default to TENDER_CONTRACT, TENDER_API_URL, TENDER_NETWORK
-(else testnet) and NEAR_RPC_URL. No key is needed or read.
+(else testnet, unless --rpc names a node) and NEAR_RPC_URL. No key is needed or read.
 
 exit codes: 0 VERIFIED, 1 MISMATCH, 2 could not check (a usage error, a node or an API that did
 not answer), 3 NOT PUBLISHED (the scorecard is the pinned one, but publishes no held-out checks).`;
@@ -82,7 +88,7 @@ try {
       task: { type: "string" },
       contract: { type: "string", default: process.env.TENDER_CONTRACT },
       api: { type: "string", default: process.env.TENDER_API_URL },
-      network: { type: "string", default: process.env.TENDER_NETWORK || "testnet" },
+      network: { type: "string", default: process.env.TENDER_NETWORK || undefined },
       rpc: { type: "string", default: process.env.NEAR_RPC_URL },
     },
   }));
@@ -95,11 +101,25 @@ if (values.help) {
   process.exit(0);
 }
 if (!/^[0-9]+$/.test(values.task ?? "") || !values.contract || !values.api) usage();
-const rpc = values.rpc || RPC[values.network];
+const rpc = values.rpc || RPC[values.network ?? "testnet"];
 if (!rpc) {
   console.error(`no RPC url for network "${values.network}": pass --rpc`);
   process.exit(2);
 }
+
+// What the first line says the check ran against. The network flag only picks a public node, so a
+// node of one's own (--rpc, or NEAR_RPC_URL) is named by its host, which holds no credentials, and
+// is not called testnet when no network was named: a check on a local chain would say so.
+const hostOf = (url) => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "an RPC url that does not parse";
+  }
+};
+const ranOn = values.rpc
+  ? [values.network, `node ${hostOf(values.rpc)}`].filter(Boolean).join(", ")
+  : (values.network ?? "testnet");
 
 const timeout = () => AbortSignal.timeout(20_000);
 
@@ -139,7 +159,7 @@ async function servedScorecard() {
 
 try {
   const task = await chainTask();
-  console.log(`task ${values.task} on ${values.contract} (${values.network})`);
+  console.log(`task ${values.task} on ${values.contract} (${ranOn})`);
   if (task.outcome === null) {
     console.log("not settled yet: no scorecard to check");
     process.exit(0);
@@ -176,6 +196,16 @@ try {
   } else {
     show("chain  heldout_commitment", task.heldout_commitment);
     show("card   sha256(heldout)", sha256(canonical(card.heldout)), task.heldout_commitment);
+    const salted =
+      typeof card.heldout === "object" &&
+      !Array.isArray(card.heldout) &&
+      Object.hasOwn(card.heldout, "salt");
+    show(
+      "card   heldout salt",
+      salted
+        ? "present"
+        : "none: while the task was open, a short answer could be found from the commitment",
+    );
   }
   show("chain  scorecard_hash", task.outcome.scorecard_hash);
   show("api    sha256(scorecard)", sha256(bytes), task.outcome.scorecard_hash);

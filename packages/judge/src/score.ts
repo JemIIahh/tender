@@ -1,4 +1,4 @@
-import type { Heldout } from "@tender/shared";
+import type { HeldoutChecks } from "@tender/shared";
 import type { P0Criteria } from "./intake";
 import type { HeldoutOf } from "./kinds/common";
 import { scoreExact } from "./kinds/exact";
@@ -19,8 +19,11 @@ export class ScorerUnavailableError extends Error {
 /** What `scoreEntry` scores: an entry's content, against the task's checked documents. */
 export interface ScoreInput {
   criteria: P0Criteria;
-  /** The held-out document as parsed from its bytes, or `null` when the task has none. */
-  heldout: Heldout | null;
+  /**
+   * The held-out document as parsed from its bytes, or `null` when the task has none. Only its
+   * checks are scored with: its salt is there to make its commitment unguessable.
+   */
+  heldout: HeldoutChecks | null;
   /** The bytes the entry revealed, already checked against its `content_hash`. */
   content: Uint8Array;
 }
@@ -58,7 +61,7 @@ export interface PreparedScorer {
  * It throws `ScorerUnavailableError` when the held-out document has no part for the kind that
  * needs one, a slip of the Judge's own.
  */
-export function prepareScorer(c: P0Criteria, heldout: Heldout | null): PreparedScorer {
+export function prepareScorer(c: P0Criteria, heldout: HeldoutChecks | null): PreparedScorer {
   switch (c.kind) {
     case "exact": {
       const h = heldoutPart(heldout, "exact");
@@ -102,7 +105,7 @@ export function prepareScorer(c: P0Criteria, heldout: Heldout | null): PreparedS
  * and that `exact` and `json_schema` have one, so a missing part is a slip of the Judge's own.
  */
 function heldoutPart<K extends "exact" | "json_schema" | "regex_cases" | "tests">(
-  heldout: Heldout | null,
+  heldout: HeldoutChecks | null,
   kind: K,
 ): HeldoutOf<K> {
   if (heldout === null || !Object.hasOwn(heldout, kind)) {

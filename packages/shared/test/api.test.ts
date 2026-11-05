@@ -671,6 +671,9 @@ const SAMPLES: { [name in SchemaName]: Sample[] } = {
   ListAgentsResponseSchema: [{ body: { agents: [AGENT], next_cursor: ALICE } }],
   AgentRecentEntrySchema: [{ body: RECENT_ENTRY }],
   AgentDetailResponseSchema: [{ body: { agent: AGENT, recent_entries: [RECENT_ENTRY] } }],
+  PosterRecordResponseSchema: [
+    { body: { account: POSTER, tasks_posted: 4, voided_after_reveals: 1, is_team: false } },
+  ],
   AccountEntrySchema: [
     {
       body: {
@@ -912,7 +915,7 @@ test("every_decimal_string_and_count_of_a_response_schema_refuses_a_value_of_ano
 // ---- TenderApi --------------------------------------------------------------------------------
 
 test("a_client_with_the_listed_methods_satisfies_tender_api", async () => {
-  // A stand-in with the seventeen methods, as the test of the MCP server or of an agent would
+  // A stand-in with every method of TenderApi, as the test of the MCP server or of an agent would
   // write one. `satisfies` is checked by tsc and does nothing at run time: a method that
   // `TenderApi` gains or loses, or gives other types, fails `pnpm typecheck` here.
   const standIn = {
@@ -921,6 +924,12 @@ test("a_client_with_the_listed_methods_satisfies_tender_api", async () => {
     listAgents: async (_filter?: ListAgentsFilter) => ({ agents: [], next_cursor: null }),
     getAgent: async (_account: string) => null,
     listEntries: async (_account: string) => ({ entries: [] }),
+    getPoster: async (account: string) => ({
+      account,
+      tasks_posted: 0,
+      voided_after_reveals: 0,
+      is_team: false,
+    }),
     health: async () => ({
       ok: true,
       network: "testnet",

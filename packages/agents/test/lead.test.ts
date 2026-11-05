@@ -498,6 +498,7 @@ function buildWorld(o: WorldOptions = {}) {
     },
     listAgents: unexpected("listAgents"),
     getAgent: unexpected("getAgent"),
+    getPoster: unexpected("getPoster"),
     health: unexpected("health"),
     getScorecard: unexpected("getScorecard"),
     telegramLink: unexpected("telegramLink"),
@@ -934,6 +935,22 @@ describe("what the lead will not do", () => {
     writeFileSync(join(bad, "01-broken", "task.json"), "{}");
     const world = buildWorld();
     expect(() => createLeadSolver({ ...optionsOf(world), seedsDir: bad })).toThrow(/01-broken/);
+  });
+
+  test("a_child_whose_heldout_checks_have_no_salt_is_found_when_the_solver_is_made", () => {
+    // Without a salt, the commitment of a short answer is found by hashing the likely answers: the
+    // lead refuses to post such checks, and names the script that adds one.
+    const pack = mkdtempSync(join(tmpdir(), "lead-unsalted-"));
+    dirs.push(pack);
+    cpSync(join(CHILDREN, "01-gas-ledger"), join(pack, "01-gas-ledger"), { recursive: true });
+    const file = join(pack, "01-gas-ledger", "heldout.json");
+    const { salt: _salt, ...checks } = JSON.parse(readFileSync(file, "utf8"));
+    writeFileSync(file, JSON.stringify(checks));
+    const world = buildWorld();
+    expect(() => createLeadSolver({ ...optionsOf(world), seedsDir: pack })).toThrow(
+      "01-gas-ledger/heldout.json has no salt, so its commitment could be guessed: add one with " +
+        "pnpm exec tsx scripts/salt-heldout.ts <the folder of the sub-tasks>",
+    );
   });
 
   test("options_that_make_no_sense_are_found_when_the_solver_is_made", () => {

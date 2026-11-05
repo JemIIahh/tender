@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { randomSalt } from "@tender/shared";
 
 // Stand-ins for the seeds' held-out checks, for the tests that run where the real ones are not.
 // The real checks are secret until a task is judged and are kept outside the repository
@@ -8,8 +9,15 @@ import { join } from "node:path";
 // document of its seed's kind, different for every seed. They score nothing in earnest, and no test
 // that scores a seed's answers may use them.
 
-/** A held-out document of `kind` for `slug`: valid for its schema, and unlike any other seed's. */
+/**
+ * A held-out document of `kind` for `slug`: valid for its schema, and unlike any other seed's. Its
+ * salt is fresh each time, as a real one is.
+ */
 export function syntheticHeldout(kind: string, slug: string): object {
+  return { ...syntheticChecks(kind, slug), salt: randomSalt() };
+}
+
+function syntheticChecks(kind: string, slug: string): object {
   switch (kind) {
     case "exact":
       return { exact: { expected: [`stand-in answer for ${slug}`] } };

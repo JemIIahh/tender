@@ -393,6 +393,34 @@ test("scorecard_links_the_held_out_checks_as_the_bytes_that_were_hashed", () => 
   expect(sha256Hex(bytes)).toBe(commitment);
 });
 
+test("scorecard_says_the_held_out_file_carries_its_salt_and_flags_checks_without_one", () => {
+  const checks = { exact: { expected: ["42"] } };
+  const salted = { ...checks, salt: "5a".repeat(32) };
+  const { unmount } = render(
+    <Scorecard
+      scorecard={scorecard({
+        heldout: salted,
+        heldout_commitment: sha256Hex(canonicalJson(salted)),
+      })}
+    />,
+  );
+  expect(screen.getByTestId("heldout-salt").textContent).toMatch(/includes its salt/);
+  expect(screen.queryByTestId("heldout-unsalted")).toBeNull();
+  unmount();
+
+  // Checks published without a salt: their commitment could be guessed from a short answer.
+  render(
+    <Scorecard
+      scorecard={scorecard({
+        heldout: checks,
+        heldout_commitment: sha256Hex(canonicalJson(checks)),
+      })}
+    />,
+  );
+  expect(screen.getByTestId("heldout-unsalted").textContent).toMatch(/no salt/);
+  expect(screen.queryByTestId("heldout-salt")).toBeNull();
+});
+
 test("scorecard_shows_the_rest_and_no_link_when_the_held_out_checks_cannot_be_written_out", () => {
   const log = vi.spyOn(console, "error").mockImplementation(() => {});
   // JSON can escape a lone surrogate, and the canonical form refuses to write one.

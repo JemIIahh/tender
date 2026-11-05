@@ -177,6 +177,25 @@ test("start_only_while_open", async () => {
   expect(await workingRows()).toEqual([{ task_id: "2", account: alice }]);
 });
 
+test("start_is_limited_per_account_with_a_429_and_retry_after", async () => {
+  // Each new start is a row and an alert to the task's watchers (review M2).
+  await seedBoard();
+  const app = appWith({
+    rateLimits: { start: { limit: 2, windowMs: 60_000 } },
+    teamAccounts: [carol],
+  });
+  expect((await post("/v1/tasks/2/start", alice, app)).status).toBe(200);
+  expect((await post("/v1/tasks/2/start", alice, app)).status).toBe(200);
+  const limited = await post<ErrorBody>("/v1/tasks/2/start", alice, app);
+  expect(limited.status).toBe(429);
+  expect(limited.body.error).toBe("rate_limited");
+  expect(limited.headers.get("retry-after")).toBe("60");
+  // Another account counts on its own, and the team's accounts are not held to it.
+  expect((await post("/v1/tasks/2/start", bob, app)).status).toBe(200);
+  for (let i = 0; i < 3; i++)
+    expect((await post("/v1/tasks/2/start", carol, app)).status).toBe(200);
+});
+
 test("start_follows_the_phase_clock", async () => {
   await seedBoard();
   const app = appWith();

@@ -19,6 +19,8 @@ import type { TaskContext } from "../src/types";
 export const ACCOUNT = "alice.test.near";
 export const OTHER = "bob.test.near";
 export const POSTER = "poster.test.near";
+/** A poster the API labels as the team's (`is_team_poster`). */
+export const TEAM_POSTER = "team.test.near";
 export const JUDGE = "judge.test.near";
 export const TOKEN = "tusdc.test.near";
 
@@ -109,7 +111,7 @@ export function taskSummary(spec: TaskSpec): TaskSummary {
     working_count: 0,
     judge_status: spec.judgeStatus,
     judge_reason: spec.judgeReason,
-    is_team_poster: true,
+    is_team_poster: (spec.poster ?? POSTER) === TEAM_POSTER,
     parent: null,
     outcome_kind: spec.outcome?.kind ?? null,
   };

@@ -102,7 +102,8 @@ const briefOf = (slug: string) => ({
   output: { format: "text", max_bytes: 100 },
 });
 
-const heldoutOf = (slug: string) => ({ exact: { expected: [slug] } });
+/** A seed's held-out document: its checks, and a salt that is the seed's own. */
+const heldoutOf = (slug: string) => ({ exact: { expected: [slug] }, salt: sha256Hex(slug) });
 
 /** The text of a file the seed's folder holds. A string is written as it is, anything else as JSON. */
 type FileSpec = string | object | null;
@@ -202,6 +203,8 @@ interface Listed {
   /** Null: the task has no held-out checks. */
   heldoutCommitment: string | null;
   phase: Phase;
+  /** The held-out document its scorecard published, if it has one. */
+  published?: object;
 }
 
 interface ListedOptions {
@@ -271,7 +274,23 @@ function detailOf(task: Listed): TaskDetailResponse {
     entries: [],
     funders: [],
     children: [],
-    scorecard: null,
+    scorecard:
+      task.published === undefined
+        ? null
+        : {
+            version: 1,
+            task_id: `${task.id}`,
+            verifier: JUDGE,
+            kind: "exact",
+            criteria_hash: "c".repeat(64),
+            heldout_commitment: task.heldoutCommitment,
+            heldout: task.published,
+            tie_break: "score desc, committed_at_block asc, account asc",
+            entries: [],
+            winners: [],
+            generated_at: "2026-11-05T10:00:00.000Z",
+            judge: { software: "tender-judge/1", model: null },
+          },
   };
 }
 
@@ -363,6 +382,7 @@ function fakeApi(trace: string[], options: ApiOptions = {}) {
     listAgents: unexpected("listAgents"),
     getAgent: unexpected("getAgent"),
     listEntries: unexpected("listEntries"),
+    getPoster: unexpected("getPoster"),
     health,
     getScorecard: unexpected("getScorecard"),
     getBlob,
@@ -672,6 +692,22 @@ test("a_seed_whose_heldout_is_not_found_stops_the_run_before_any_seed_is_posted"
 
   expect((failure as Error).message).toBe(
     `held-out for beta not found in ${PRIVATE_OF.get(dir)}; set TENDER_SEEDS_PRIVATE_DIR`,
+  );
+  expect(trace).toEqual(UNTOUCHED);
+  expect(lines).toEqual([]);
+  expect(chain.posts).toEqual([]);
+});
+
+test("a_heldout_file_without_a_salt_stops_the_run_before_any_seed_is_posted", async () => {
+  // Without a salt the commitment of a short answer is found by hashing the likely answers, and
+  // the API and the Judge refuse such checks: the run names the script that adds one.
+  const dir = await seedsDir({ alpha: {}, beta: { heldout: { exact: { expected: ["beta"] } } } });
+
+  const { failure, trace, lines, chain } = await run(dir);
+
+  expect((failure as Error).message).toBe(
+    "beta/heldout.json has no salt, so its commitment could be guessed: add one with " +
+      `pnpm exec tsx scripts/salt-heldout.ts ${PRIVATE_OF.get(dir)}`,
   );
   expect(trace).toEqual(UNTOUCHED);
   expect(lines).toEqual([]);
@@ -1293,6 +1329,60 @@ test("a_task_with_other_documents_but_the_same_heldout_stops_the_seed_all_the_sa
   expect(lines).toEqual(["SKIP alpha (held-out already used by task 100)"]);
 });
 
+test("new_checks_under_a_salt_a_scorecard_published_stop_the_run_before_anything_is_paid", async () => {
+  // Task 40 was alpha's, judged: its scorecard published its checks and salt. alpha was then
+  // rewritten with new checks under the same salt, which makes them guessable from their
+  // commitment again: the run stops, names the task and the fix, and pays and posts nothing.
+  const old = { exact: { expected: ["an older answer"] }, salt: sha256Hex("alpha") };
+  const judged = { ...listedOf(40n, "alpha", "settled"), heldoutCommitment: hashOf(old) };
+  const dir = await seedsDir({ alpha: {}, beta: {} });
+
+  const { failure, lines, chain, api } = await run(dir, {
+    api: { tasks: [{ ...judged, published: old }] },
+  });
+
+  expect((failure as Error).message).toBe(
+    "alpha/heldout.json has the salt that the scorecard of task 40 published, so its checks " +
+      'could be guessed from their commitment: give it a new salt (delete "salt" from the file ' +
+      `and run pnpm exec tsx scripts/salt-heldout.ts ${PRIVATE_OF.get(dir)})`,
+  );
+  expect(lines).toEqual([]);
+  expect(chain.deposit).not.toHaveBeenCalled();
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.postTask).not.toHaveBeenCalled();
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+
+  // With a salt of its own, alpha goes up, and a scorecard with another salt stands in no one's way.
+  await writeFile(
+    join(PRIVATE_OF.get(dir) ?? "", "alpha", "heldout.json"),
+    JSON.stringify({ exact: { expected: ["alpha"] }, salt: sha256Hex("a new salt") }),
+  );
+  const again = await run(dir, { api: { tasks: [{ ...judged, published: old }] } });
+  expect(again.failure).toBeUndefined();
+  expect(again.lines.filter((line) => line.startsWith("SEEDED"))).toEqual([
+    "SEEDED alpha task=1",
+    "SEEDED beta task=2",
+  ]);
+});
+
+test("a_judged_seed_whose_published_document_is_its_own_is_skipped_not_refused", async () => {
+  // The same checks and salt as the scorecard published: the seed is public, and is skipped for it.
+  const published = heldoutOf("alpha");
+  const { result, lines, failure } = await run(
+    { alpha: {} },
+    {
+      api: {
+        tasks: [{ ...listedOf(40n, "alpha", "settled"), published }],
+        served: new Set([hashOf(published)]),
+      },
+    },
+  );
+
+  expect(failure).toBeUndefined();
+  expect(lines).toEqual(["SKIP alpha (held-out already public)"]);
+  expect(result).toEqual([existing("alpha", 40n)]);
+});
+
 test("a_task_with_the_brief_of_the_seed_and_other_heldout_does_not_stop_it", async () => {
   // A seed whose checks were rewritten is a task of its own, whatever its brief.
   const tasks = [listedOf(100n, "alpha", "open", { heldout: "other" })];
@@ -1437,7 +1527,7 @@ test("seeds_that_share_their_heldout_checks_are_refused_before_anything_is_asked
   // beta's file holds the document that alpha's does, written another way: one set of checks.
   const { failure, trace, lines } = await run({
     alpha: {},
-    beta: { heldout: '{"exact":\n{"expected": ["alpha"]}}' },
+    beta: { heldout: `{"salt": "${sha256Hex("alpha")}",\n"exact":\n{"expected": ["alpha"]}}` },
     gamma: { heldout: heldoutOf("alpha") },
   });
 
@@ -1702,12 +1792,12 @@ test("a_seed_that_is_wrong_stops_the_run_before_the_api_or_the_chain_is_asked_an
     ],
     [
       "checks of another kind",
-      { heldout: { regex_cases: { match: ["a"], no_match: ["b"] } } },
+      { heldout: { regex_cases: { match: ["a"], no_match: ["b"] }, salt: sha256Hex("beta") } },
       /^beta\/heldout\.json is not a held-out document of kind exact$/,
     ],
     [
       "checks with nothing in them",
-      { heldout: { exact: { expected: [] } } },
+      { heldout: { exact: { expected: [] }, salt: sha256Hex("beta") } },
       /^beta\/heldout\.json does not fit its schema, first at exact\.expected: /,
     ],
   ];

@@ -185,6 +185,7 @@ function recordingApi(served: ReadonlySet<string> = new Set()) {
     listAgents: unexpected("listAgents"),
     getAgent: unexpected("getAgent"),
     listEntries: unexpected("listEntries"),
+    getPoster: unexpected("getPoster"),
     health: async () => ({
       ok: true,
       network: chain.network,

@@ -155,8 +155,8 @@ export TENDER_SEEDS_PRIVATE_DIR=<private dir>
 pnpm seed --network testnet
 ```
 
-- `pnpm seed` reads each seed's `heldout.json` from the private directory. A seed whose file is missing stops the run before anything is posted.
-- Held-out checks are single-use. They are published in the scorecard when the task is judged. The script skips a seed whose checks are already public or already used by a task of the same poster, so running it again posts nothing twice.
+- `pnpm seed` reads each seed's `heldout.json` from the private directory. A seed whose file is missing, or has no `salt`, stops the run before anything is posted. Back the directory up, then run `pnpm exec tsx scripts/salt-heldout.ts <private dir>`: it gives a new salt to each file that has none, and to each whose checks changed since its salt was drawn (a salt it draws ends in a fingerprint of its checks, so it can tell; a salt it did not draw is replaced too). It leaves a file alone whose salt was drawn for the checks it holds.
+- Held-out checks and their salt are single-use. Both are published in the scorecard when the task is judged. The script skips a seed whose checks are already public or already used by a task of the same poster, so running it again posts nothing twice. A seed rewritten after it was judged needs new checks and a new salt: run `salt-heldout.ts` after changing the checks. `pnpm seed` stops, before anything is paid, on a seed whose salt a scorecard of the poster has published, and says so.
 - Back the private directory up somewhere that is not the repository and not the services host. The Docker build leaves out `seeds-private/`, but a directory elsewhere is never copied in.
 - If the variable is not set, the script looks for `seeds-private/` in the repository, which git ignores. Never put the directory inside `seeds/`, which is tracked. `scripts/check-public.test.ts` and `seeds/no-answers-in-tree.test.ts` fail if an answer-like value or a secret turns up in a tracked file.
 - The thirty seeds, their rewards and the poster are the team's. They are labelled as ours.
@@ -204,6 +204,7 @@ Leave `NEXT_PUBLIC_DEV_WALLET*` unset. It works on the sandbox only.
 | 200, `ok: true`, `waiting_for_chain: true` | The services are waiting for the chain before they index: the RPC node does not answer, or is behind the database. The API still serves, and `lag_blocks` can read 0 for a node that is behind, so `lag_blocks` alone would miss this |
 | 503, `ok: false`, `error: "chain_unavailable"` | The API cannot read the chain's final height |
 | No response | The process is down |
+| 429, `error: "rate_limited"` | The monitor asks more than 300 times a minute from one address (`rateLimits.health`). The chain's height in a 200 is at most 2 seconds old: one read of the node serves every request in that time |
 
 Alert on:
 
@@ -247,6 +248,6 @@ Notes:
 - Set `TENDER_SEEDS_PRIVATE_DIR` to the private seed directory so that every seed test runs. Without it those tests skip (about 300), with one note.
 - The tests do not read the `.env`, `.env.deploy.<network>` and `deployments/<network>.json` of the checkout, so a deployed testnet on the machine changes no result. A test that starts `pnpm serve` or the run-agent command as a process sets `TENDER_ENV_DIR` to an empty directory of its own; the others pass the directory they want to the function they call. A new test that starts one of these as a process must do the same.
 - `pnpm test` runs about 4,200 tests in about 7 minutes and can fail with timeouts on a busy machine. Re-run a failing file by itself before deciding it is broken: `pnpm exec vitest run --project <name> <file>`.
-- To run the Postgres paths, set `TEST_DATABASE_URL` to a Postgres 17 database. These paths have never run in CI.
+- The `@tender/db` tests always run on PGlite, and also on a Postgres server when `TEST_DATABASE_URL` is set. CI sets it on every push, to a Postgres 17 service, so the Postgres paths run there. To run them on your machine, set it to a Postgres 17 database.
 - `pnpm demo:local` runs the whole loop on a local chain in about 80 seconds once the local node is downloaded, and prints `DEMO OK`. The first run of an install also downloads the node (about 30 MB; it prints a line before it starts), which takes a few minutes on a slow link; `NEAR_SANDBOX_BIN_PATH` skips that. `pnpm demo:local --keep` then keeps the chain and the services up until Ctrl-C, for the MCP server. The swarm demo is `pnpm exec tsx scripts/swarm-demo.ts`, four to five minutes.
 - The same checks guard what is public: `pnpm exec vitest run --project scripts scripts/check-public.test.ts` fails if a tracked or not-yet-tracked file is an `.env*` file other than the example, is under `.submission/` or `seeds-private/`, or holds the owner's email address, a NEAR `ed25519:` private key, a PEM private key, a Telegram bot token, an `sk-`, GitHub, AWS, Slack or Google key, a JWT, or a `NAME=value` line (at the start of a line, with or without `export`) for a capitalised name that is, or ends in, `API_KEY`, `APIKEY`, `SECRET`, `TOKEN`, `PASSWORD`, `JWT` or `PRIVATE_KEY`, with a value of 16 or more characters that is no placeholder. It finds nothing of any other shape (a short password, a lower-case name, a key in a TypeScript object), and it is not in the pre-commit hook, so run it before you commit.

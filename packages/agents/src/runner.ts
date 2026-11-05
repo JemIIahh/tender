@@ -218,6 +218,11 @@ export class AgentMemory {
    * A hire is never here: the cap refuses one its hirer checks for good, and holds back no other.
    */
   readonly capped = new Map<string, string>();
+  /**
+   * Tasks the Judge checks that wait, under the Judge-only rule, for the Judge to accept them, which
+   * has been said once (`awaitsTheJudge`). They are not seen: each tick looks at them again.
+   */
+  readonly awaitingJudge = new Set<string>();
 }
 
 export interface AgentTickOptions {
@@ -313,6 +318,12 @@ interface Run {
    * record could not be read (said once in the tick).
    */
   records: Map<string, number | null | undefined>;
+  /**
+   * The posters' counts of tasks voided after a reveal, as this tick read them from the API
+   * (`posterVoidsOf`): a number, or undefined for a record that could not be read (said once in the
+   * tick). Null for a poster the API labels as the team's, which `maxPosterVoids` does not hold.
+   */
+  posters: Map<string, number | null | undefined>;
   /**
    * The count of the day, as this tick read it and has added to it: the UTC day and the tasks taken
    * on in it. Null until it is needed; `unreadable` once it could not be read in this tick.
@@ -430,6 +441,10 @@ async function listOpen(api: TenderApi, by: string | { invited: string }): Promi
  *    more empty picks after reveals than the agent accepts. Logged. A record that cannot be read
  *    leaves the task for the next tick. A hire is held to its service's terms in place of the first
  *    two; a hire its hirer checks is held to the hirer's record, and one the Judge checks to none.
+ *    Every kind is held to its poster's record of tasks voided after their reveals
+ *    (`maxPosterVoids`), unless the API labels the poster as the team's.
+ *    Under the Judge-only rule, a task of the agent's tags or a hire the Judge checks then waits
+ *    until the Judge has accepted it (`awaitsTheJudge`): said once, and left unseen.
  * 8. The agent's storage on the contract is below what a commit and a reveal need (R22), with the
  *    reveals it already owes (review M1): logged as a warning. A function-call key cannot top it
  *    up, so the agent can only wait for someone to.
@@ -451,8 +466,9 @@ async function listOpen(api: TenderApi, by: string | { invited: string }): Promi
  * A task is `seen` once step 2, 3, 5, 6, 7 or 8 has turned it down (or step 9, a hire) and once
  * the solver has been asked (for a scripted solver with an answer: once `start` has gone through),
  * whatever happens after, so a solver is asked at most once per task in a run and a failing task
- * cannot cost a model call every tick. Steps 1 and 4, a record that cannot be read, a full day for
- * a task of the agent's tags, a solver that is not available and a call that fails leave the task
+ * cannot cost a model call every tick. Steps 1 and 4, a record that cannot be read, a task that
+ * waits for the Judge to accept it, a full day for a task of the agent's tags, a solver that is not
+ * available and a call that fails leave the task
  * unseen: it is looked at again next tick (a task of a full day, the next day), and nothing of a
  * task id that is not one is kept.
  */
@@ -755,6 +771,19 @@ async function enter(
     }
   }
 
+  // The record of the poster (`maxPosterVoids`), for every kind: a hirer is a poster too.
+  const posterWhy = await posterRefusalOf(run, task);
+  // The poster's record could not be read: the task waits, unseen, for the next tick.
+  if (posterWhy === undefined) return;
+  if (posterWhy !== null) {
+    memory.seen.add(id);
+    run.log(`${run.name}: skipping task ${id}, ${posterWhy}`);
+    return;
+  }
+
+  // Under the Judge-only rule, a task the Judge checks waits until the Judge has accepted it.
+  if (awaitsTheJudge(run, task, kind)) return;
+
   // R22 (P05-P2): an entry that runs out of storage cannot reveal, and its window does not wait.
   // Checked here, ahead of `start` and the solver, rather than at the commit itself: an agent
   // that cannot commit then neither announces itself on the task nor spends a model call on it.
@@ -821,6 +850,76 @@ async function policyRefusalOf(
   const who =
     kind === "hirer hire" ? `its verifier, the hirer ${verifier},` : `its verifier ${verifier}`;
   return `${who} has voided ${voids} tasks after their reveals, more than the ${most} the agent accepts`;
+}
+
+/**
+ * Whether `task`, a task of the agent's tags or a hire the Judge checks, waits for the Judge under
+ * the Judge-only rule (`verifiers: "judge"`): until its `judge_status` is `accepted`. A task the
+ * Judge has not looked at yet (null), or holds `pending` (its held-out checks are not in), may never
+ * be accepted: a poster who never sends the checks has the revealed work and a full refund once it
+ * is voided. So it is left unseen, for a later tick to look at again, and that it waits is said once.
+ * A rejected task never gets here (`rejectedByTheJudge`). A hire its hirer checks has no Judge.
+ */
+function awaitsTheJudge(run: Run, task: TaskDetail, kind: Kind): boolean {
+  if (run.policy?.verifiers !== "judge" || kind === "hirer hire") return false;
+  if (task.judge_status === "accepted") {
+    run.memory.awaitingJudge.delete(task.id);
+    return false;
+  }
+  if (!run.memory.awaitingJudge.has(task.id)) {
+    run.memory.awaitingJudge.add(task.id);
+    const where =
+      task.judge_status === null
+        ? "it has not looked at it yet"
+        : `it is ${oneLine(task.judge_status, MAX_ACCOUNT_CHARS)}`;
+    run.log(`${run.name}: task ${task.id} waits until the Judge has accepted it (${where})`);
+  }
+  return true;
+}
+
+/**
+ * Why `maxPosterVoids` turns `task` away, null if it does not, or undefined if it cannot tell now:
+ * the poster's record could not be read, and the task waits for the next tick. A poster the API
+ * labels as the team's (`is_team_poster`) is not held to it.
+ */
+async function posterRefusalOf(run: Run, task: TaskDetail): Promise<string | null | undefined> {
+  const most = run.policy?.maxPosterVoids;
+  if (most === undefined || task.is_team_poster) return null;
+  const voided = await posterVoidsOf(run, task.poster);
+  if (voided === undefined) return undefined;
+  if (voided === null || voided <= most) return null;
+  const poster = oneLine(task.poster, MAX_ACCOUNT_CHARS);
+  return `its poster ${poster} has had ${voided} tasks voided after their reveals, more than the ${most} the agent accepts`;
+}
+
+/**
+ * The tasks of `poster` voided after a reveal (`voided_after_reveals`), by its record in the API,
+ * read once a tick: null for a poster the API labels as the team's, undefined if the record cannot
+ * be read now, or is no count, which is said once in the tick.
+ */
+async function posterVoidsOf(run: Run, poster: string): Promise<number | null | undefined> {
+  if (run.posters.has(poster)) return run.posters.get(poster);
+  let voided: number | null | undefined;
+  let why: string | undefined;
+  try {
+    const record = await run.api.getPoster(poster);
+    voided = record.is_team ? null : record.voided_after_reveals;
+    if (voided !== null && !(Number.isSafeInteger(voided) && voided >= 0)) {
+      voided = undefined;
+      why = "it holds no count";
+    }
+  } catch (error) {
+    voided = undefined;
+    why = describe(error);
+  }
+  run.posters.set(poster, voided);
+  if (why !== undefined) {
+    const shown = oneLine(poster, MAX_ACCOUNT_CHARS);
+    run.log(
+      `WARN ${run.name}: the record of poster ${shown} cannot be read (${why}), so its tasks wait`,
+    );
+  }
+  return voided;
 }
 
 /**
@@ -1641,6 +1740,7 @@ export async function agentTick(opts: AgentTickOptions): Promise<void> {
     policy: opts.policy,
     entryCounts: opts.entryCounts,
     records: new Map(),
+    posters: new Map(),
     today: null,
   };
   await tendDrafts(run);

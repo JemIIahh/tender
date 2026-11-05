@@ -427,6 +427,7 @@ test("a_regex_task_is_posted_from_the_page_with_the_deposit_first", async () => 
       match: [`${SECRET}.near`, "carol.near"],
       no_match: ["dave..near", "_eve.near"],
     },
+    salt: expect.stringMatching(/^[0-9a-f]{64}$/),
   });
   expect(JSON.parse(criteria?.text ?? "{}")).toMatchObject({
     kind: "regex_cases",

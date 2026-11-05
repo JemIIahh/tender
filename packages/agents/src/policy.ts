@@ -17,6 +17,12 @@ import { basename, dirname, join } from "node:path";
 // then the Judge picks nobody, the hirer is refunded, and has read the delivery. So it has a daily
 // cap of its own (`dailyJudgedHires`), and is not held back by the other.
 //
+// The Judge does not make that path go away. The poster writes the held-out checks, and the Judge's
+// pick is only as good as them: checks that no answer meets get the revealed work and a refund just
+// the same. So an agent can also skip a poster whose tasks were voided after their reveals more
+// often than it accepts (`maxPosterVoids`); with the Judge-only rule, the runner enters a task only
+// once the Judge has accepted it, as one it never accepts is voided after the work is public.
+//
 // Every cap fails closed: a count that cannot be read, or written, takes on nothing that it counts.
 
 /**
@@ -42,6 +48,14 @@ export interface EntryPolicy {
    * hirer has. A verifier the API has no record of is not held to it. Default: no limit.
    */
   maxVoidsAfterReveals?: number;
+  /**
+   * Skips a task or hire whose poster has had more tasks voided after a reveal than this
+   * (`voided_after_reveals` of the poster's record in the API, `GET /v1/posters/:account`): an
+   * empty pick, or no pick at all, after the work was public, which refunds the poster. It counts an
+   * honest task that no entry passed as well. A poster the API labels as the team's is not held to
+   * it: the agent that trusts the team's Judge trusts its seed poster. Default: no limit.
+   */
+  maxPosterVoids?: number;
   /**
    * The most tasks the agent takes on in a UTC day: it bounds what the solver spends. Every task
    * and every hire counts. The count is kept on the disk (`EntryCounts`), so that a restart does
@@ -173,7 +187,13 @@ async function writeFileAtomic(file: string, text: string): Promise<void> {
  * limits, and `counts` for a daily cap.
  */
 export function checkPolicy(policy: EntryPolicy, counts: EntryCounts | undefined): void {
-  const { verifiers = "any", judgeAccount, minReward, maxVoidsAfterReveals } = policy;
+  const {
+    verifiers = "any",
+    judgeAccount,
+    minReward,
+    maxVoidsAfterReveals,
+    maxPosterVoids,
+  } = policy;
   if (Array.isArray(verifiers)) {
     if (
       verifiers.length === 0 ||
@@ -198,6 +218,9 @@ export function checkPolicy(policy: EntryPolicy, counts: EntryCounts | undefined
   }
   if (maxVoidsAfterReveals !== undefined && !isCount(maxVoidsAfterReveals)) {
     throw new RangeError("policy.maxVoidsAfterReveals must be a whole number, at least 0");
+  }
+  if (maxPosterVoids !== undefined && !isCount(maxPosterVoids)) {
+    throw new RangeError("policy.maxPosterVoids must be a whole number, at least 0");
   }
   for (const cap of ["dailyEntries", "dailyJudgedHires"] as const) {
     const most = policy[cap];
@@ -244,7 +267,7 @@ export function policyRefusal(policy: EntryPolicy, task: PolicyTask): string | n
 /** The policy in one line of the log, by the names of its fields. */
 export function describePolicy(policy: EntryPolicy): string {
   const { minReward, verifiers = "any", judgeAccount, maxVoidsAfterReveals } = policy;
-  const { dailyEntries, dailyJudgedHires } = policy;
+  const { maxPosterVoids, dailyEntries, dailyJudgedHires } = policy;
   const who =
     verifiers === "judge"
       ? `judge (${judgeAccount})`
@@ -258,6 +281,7 @@ export function describePolicy(policy: EntryPolicy): string {
     `verifiers=${who}`,
     `minReward=${floors === "" ? "none" : floors}`,
     `maxVoidsAfterReveals=${maxVoidsAfterReveals ?? "none"}`,
+    `maxPosterVoids=${maxPosterVoids ?? "none"}`,
     `dailyEntries=${dailyEntries ?? "none"}`,
     `dailyJudgedHires=${dailyJudgedHires ?? "none"}`,
   ].join(" ");

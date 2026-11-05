@@ -22,6 +22,8 @@ import {
   type Brief,
   canonicalJson,
   type Phase,
+  type PosterRecordResponse,
+  PosterRecordResponseSchema,
   type PublicCriteria,
   phaseAt,
   type Scorecard,
@@ -733,6 +735,58 @@ test("task_detail_keeps_who_voided_a_task", async () => {
     reason: "no_award",
     by: judge,
   });
+});
+
+test("poster_record_counts_its_tasks_and_those_voided_after_a_reveal", async () => {
+  // What an agent reads before it works on a task (`maxPosterVoids`): a poster can write held-out
+  // checks that nothing passes, read the revealed work and be refunded, and each such task counts.
+  await apply(
+    taskLine(2, { poster: carol, ...windowsFor("judging") }),
+    taskLine(3, { poster: carol, ...windowsFor("judging") }),
+    taskLine(4, { poster: carol, ...windowsFor("expired") }),
+    taskLine(5, { poster: carol, ...windowsFor("judging") }),
+    taskLine(6, { poster: carol, ...windowsFor("open") }),
+    taskLine(7, { poster: bob, ...windowsFor("judging") }),
+  );
+  // The reveals, as the indexer counts them from `revealed` events.
+  await deps.db.query("update tasks set reveal_count = 1 where id in (2, 4, 5, 7)");
+  await apply(
+    // An empty pick after a reveal, and a void once the windows ran out after one: both count.
+    eventLine("voided", { task_id: "2" }),
+    eventLine("voided", {
+      task_id: "4",
+      reason: "expired",
+      by: null,
+      scorecard_hash: null,
+      scorecard_uri: null,
+    }),
+    // An empty pick that nobody revealed to, and a pick, do not; nor does another poster's void.
+    eventLine("voided", { task_id: "3" }),
+    eventLine("picked", { task_id: "5" }),
+    eventLine("voided", { task_id: "7" }),
+  );
+
+  const record = await get<PosterRecordResponse>(`/v1/posters/${carol}`);
+  expect(record.status).toBe(200);
+  expect(PosterRecordResponseSchema.parse(record.body)).toEqual({
+    account: carol,
+    tasks_posted: 5,
+    voided_after_reveals: 2,
+    is_team: false,
+  });
+  // An account that has posted nothing has a record of zeros, labelled as the team's if it is.
+  const team = await get<PosterRecordResponse>(
+    "/v1/posters/nobody.test.near",
+    appWith({ teamAccounts: ["nobody.test.near"] }),
+  );
+  expect(team.body).toEqual({
+    account: "nobody.test.near",
+    tasks_posted: 0,
+    voided_after_reveals: 0,
+    is_team: true,
+  });
+  // A string that is no account id names no poster.
+  expect((await get("/v1/posters/NOT_AN_ACCOUNT")).status).toBe(404);
 });
 
 test("unknown_task_404", async () => {

@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type Heldout, HeldoutSchema, sha256Hex } from "@tender/shared";
+import { HeldoutSchema, sha256Hex } from "@tender/shared";
 import { describe, expect, test } from "vitest";
 import {
   heldoutFileOf,
@@ -24,6 +24,7 @@ import {
   holdsCaseTable,
   mask,
   occursIn,
+  type SeedHeldout,
   worthLookingFor,
 } from "./answer-scan";
 
@@ -115,14 +116,14 @@ describe("the rules of the scan", () => {
   });
 
   test("a_seeds_answers_are_collected_by_kind", () => {
-    const seed = (heldout: Heldout | null, publicText = "") => ({
+    const seed = (heldout: SeedHeldout | null, publicText = "") => ({
       heldout,
       solution: "short solution",
       weak: "short weak one",
       knownWrong: [],
       publicText,
     });
-    const values = (heldout: Heldout | null, publicText?: string) =>
+    const values = (heldout: SeedHeldout | null, publicText?: string) =>
       answerCandidates(seed(heldout, publicText)).map((c) => c.value);
 
     // exact: each answer, and the same without spaces; looked for as a literal when it is composite.
@@ -133,7 +134,7 @@ describe("the rules of the scan", () => {
     ]);
 
     // json_schema: a value the question shows is not an answer; one it does not show is.
-    const json: Heldout = {
+    const json: SeedHeldout = {
       json_schema: {
         assertions: [
           { path: "$.a", equals: "Quartz Ltd" },
@@ -152,18 +153,25 @@ describe("the rules of the scan", () => {
     // a generic constant on the hash list is not.
     const generic = "340282366920938463463374607431768211456";
     expect(GENERIC_HASHES.has(sha256Hex(generic))).toBe(true);
-    const cases: Heldout = {
+    const cases: SeedHeldout = {
       regex_cases: { match: ["a.b", "kestrel-feather-0042"], no_match: [generic] },
     };
     const caseValues = answerCandidates(seed(cases))
       .filter((c) => c.what === "case string")
       .map((c) => c.value);
     expect(caseValues).toEqual(["kestrel-feather-0042"]);
+
+    // The salt: with it, the commitment of a short answer is found by hashing the likely answers.
+    const salt = "c0ffee".repeat(10).slice(0, 64);
+    const salted = answerCandidates(seed({ exact: { expected: ["4, 19"] }, salt }));
+    expect(salted.filter((c) => c.what === "held-out salt").map((c) => [c.value, c.how])).toEqual([
+      [salt, "text"],
+    ]);
   });
 
   test("a_copied_table_of_cases_is_found_however_generic_each_case_is", () => {
     const cases = ["aa.bb", "cc.dd", "ee.ff", "gg.hh", "ii.jj", "kk.ll", "mm.nn", "oo.pp"];
-    const heldout: Heldout = {
+    const heldout: SeedHeldout = {
       regex_cases: { match: cases.slice(0, 4), no_match: cases.slice(4) },
     };
     expect(caseStrings(heldout)).toEqual(cases);

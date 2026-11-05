@@ -22,5 +22,6 @@
         "equals": ["commit", "post_task", "reveal", "top_up_task"]
       }
     ]
-  }
+  },
+  "salt": "cca5ac6a23caec7734f3029e269da068a2d54690920dae9695d6941d42899648"
 }

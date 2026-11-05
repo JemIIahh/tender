@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { type MessagePort, type TransferListItem, Worker } from "node:worker_threads";
-import type { Heldout } from "@tender/shared";
+import type { HeldoutChecks } from "@tender/shared";
 import type { P0Criteria } from "./intake";
 import { checkJsonSchemaUsable } from "./kinds/json_schema";
 import { type PreparedScorer, prepareScorer, ScorerUnavailableError } from "./score";
@@ -62,7 +62,7 @@ const UNAVAILABLE = "unavailable";
  */
 export interface ScoreJob {
   criteria: P0Criteria;
-  heldout: Heldout | null;
+  heldout: HeldoutChecks | null;
 }
 
 /**

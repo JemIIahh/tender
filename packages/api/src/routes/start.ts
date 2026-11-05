@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import type { AuthVariables, RequireAuth } from "../auth";
 import { type ApiDeps, nowNs } from "../deps";
 import { fail, notFound } from "../format";
+import { rateLimit, rateLimitsOf } from "../limits";
 
 /** `POST /v1/tasks/:id/start`. `working_count` is a JSON integer, as every count the index keeps. */
 export interface StartResponse {
@@ -32,14 +33,24 @@ interface TaskWindows {
  *
  * It is idempotent. The first start of an account is the one that is kept, along with its
  * `started_at`, so asking again changes nothing and the notifier's announcement is not repeated.
+ * Each account is held to `limits.start` requests a minute (30 unless `deps.rateLimits` says
+ * otherwise), refused ones included, past which the answer is a 429 with `Retry-After`; the team's
+ * accounts are not held to it.
  */
 export function startRoutes(
   deps: ApiDeps,
   requireAuth: RequireAuth,
 ): Hono<{ Variables: AuthVariables }> {
   const app = new Hono<{ Variables: AuthVariables }>();
+  const team = new Set(deps.teamAccounts);
+  // After sign-in, which is what says whose request it is.
+  const perAccount = rateLimit<{ Variables: AuthVariables }>(
+    rateLimitsOf(deps.rateLimits).start,
+    (c) => c.var.account,
+    (c) => team.has(c.var.account),
+  );
 
-  app.post("/tasks/:id/start", requireAuth, async (c) => {
+  app.post("/tasks/:id/start", requireAuth, perAccount, async (c) => {
     const id = c.req.param("id");
     if (!U64StringSchema.safeParse(id).success) return notFound("no such task");
 

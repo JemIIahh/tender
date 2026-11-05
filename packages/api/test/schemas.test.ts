@@ -46,7 +46,7 @@ import { type ApiDeps, createApp } from "../src/index";
 import type { StartResponse } from "../src/routes/start";
 import type { TelegramLinkResponse } from "../src/routes/telegram";
 import type { EventMessage } from "../src/sse";
-import { fakeClient, resetDb, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
+import { fakeClient, resetDb, SALT, seedLifecycle, TEST_NOW, testDeps } from "./helpers";
 
 // The drift test of `@tender/shared`'s API schemas (src/api.ts). The web app, the MCP server and
 // the agents read every response through those schemas, so each one has to be what its route
@@ -510,7 +510,7 @@ test("sign_in_uploads_start_and_telegram_link_match_their_schemas", async () => 
   expect(read.status).toBe(200);
   expect(new Uint8Array(await read.arrayBuffer())).toEqual(brief);
 
-  const heldout = canonicalJson({ exact: { expected: ["42"] } });
+  const heldout = canonicalJson({ exact: { expected: ["42"] }, salt: SALT });
   const held = await post(
     app,
     "/v1/heldout",

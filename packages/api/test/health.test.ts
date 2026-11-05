@@ -128,3 +128,81 @@ test("health_says_whether_the_services_are_waiting_for_the_chain", async () => {
     errors.mockRestore();
   }
 });
+
+test("health_reads_the_chain_once_in_each_window_whatever_the_rate", async () => {
+  // A public route with no sign-in: each request made its own RPC call, on the endpoint the Judge
+  // and the keeper also use, so a flood of them could get the services rate-limited at the node.
+  await setCursor(`${deps.network}:${deps.contractId}`, 90n);
+  let height = 1_000n;
+  const finalHeight = vi.fn(async () => height);
+  let now = 5_000_000_000_000n;
+  const app = createApp({ ...deps, client: fakeClient({ finalHeight }), now: () => now });
+  const read = async () => {
+    const res = await app.request("/v1/health");
+    expect(res.status).toBe(200);
+    return ((await res.json()) as HealthResponse).chain_final_height;
+  };
+
+  // At once and one after another: one read of the chain for all of them.
+  expect(await Promise.all(Array.from({ length: 50 }, read))).toEqual(Array(50).fill("1000"));
+  for (let i = 0; i < 50; i++) expect(await read()).toBe("1000");
+  expect(finalHeight).toHaveBeenCalledTimes(1);
+
+  // Two seconds on, the next request reads it again, and the answer is fresh.
+  height = 1_002n;
+  now += 1_999_999_999n;
+  expect(await read()).toBe("1000");
+  now += 1n;
+  expect(await read()).toBe("1002");
+  expect(finalHeight).toHaveBeenCalledTimes(2);
+
+  // A clock that went back is not trusted to say the answer is fresh.
+  now -= 10_000_000_000n;
+  height = 1_003n;
+  expect(await read()).toBe("1003");
+  expect(finalHeight).toHaveBeenCalledTimes(3);
+});
+
+test("health_keeps_a_failed_chain_read_for_its_window_too", async () => {
+  // A node that fails would otherwise be asked again by every request: the failure is the answer
+  // for the rest of its window, and the window after it asks once more.
+  const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let fail = true;
+  const finalHeight = vi.fn(async () => {
+    if (fail) throw new Error("down");
+    return 1_000n;
+  });
+  let now = 5_000_000_000_000n;
+  const app = createApp({ ...deps, client: fakeClient({ finalHeight }), now: () => now });
+  try {
+    for (let i = 0; i < 20; i++) {
+      const res = await app.request("/v1/health");
+      expect(res.status).toBe(503);
+      expect(res.headers.get("retry-after")).toBe("5");
+    }
+    expect(finalHeight).toHaveBeenCalledTimes(1);
+
+    fail = false;
+    now += 2_000_000_000n;
+    expect((await app.request("/v1/health")).status).toBe(200);
+    expect(finalHeight).toHaveBeenCalledTimes(2);
+  } finally {
+    errors.mockRestore();
+  }
+});
+
+test("health_is_limited_per_client_with_a_429_and_retry_after", async () => {
+  const app = createApp({
+    ...deps,
+    client: fakeClient({ finalHeight: async () => 1_000n }),
+    rateLimits: { health: { limit: 3, windowMs: 60_000 } },
+  });
+  for (let i = 0; i < 3; i++) expect((await app.request("/v1/health")).status).toBe(200);
+  const limited = await app.request("/v1/health");
+  expect(limited.status).toBe(429);
+  expect(limited.headers.get("retry-after")).toBe("60");
+  expect(await limited.json()).toEqual({
+    error: "rate_limited",
+    message: "too many requests, try again later",
+  });
+});

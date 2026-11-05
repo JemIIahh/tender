@@ -264,6 +264,9 @@ test("from_an_mcp_client_connect_to_tender_goes_on_from_where_it_stopped", async
     expect((second.progress as string[]).some((line) => line === `key: using ${keyFile}`)).toBe(
       true,
     );
+    // A delegate key spends, within its caps: the answer says so, and never that it cannot.
+    expect(String(second.next)).toMatch(/delegate key, whose spending is capped: it can post/);
+    expect(String(second.next)).not.toMatch(/cannot spend/);
     expect((await reader.getAgent(accountId))?.status).toBe("active");
     const secrets = await secretsIn(join(keys, "reader.json"));
     for (const answer of [first, second]) {
