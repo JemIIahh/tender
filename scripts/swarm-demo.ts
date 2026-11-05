@@ -1,7 +1,8 @@
+import "./lib/node-check";
 import { rmSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { mkdir, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import {
   type ChildWindows,
@@ -43,6 +44,7 @@ import {
   waiting,
 } from "./demo-local";
 import { REPO_ROOT } from "./lib/env";
+import { demoDir, inOwnProcess } from "./lib/own-process";
 import { seed } from "./seed";
 
 /**
@@ -115,6 +117,8 @@ import { seed } from "./seed";
 // ---- The scenario ------------------------------------------------------------------------------
 
 const PACK = join(REPO_ROOT, "scripts", "swarm-research-pack");
+/** The start of the name of the run's temp dir, in the OS temp dir. */
+const DIR_PREFIX = "tender-swarm-";
 const CHILDREN = join(PACK, "children");
 /** The parent is the folder `parent` of the pack, which `seed` posts as it posts any seed. */
 const PARENT_SLUG = "parent";
@@ -351,7 +355,8 @@ async function swarm(h: Harness): Promise<void> {
       "The poster and the Judge are the team's too.",
   );
 
-  const dir = resolve(await mkdtemp(join(tmpdir(), "tender-swarm-")));
+  // The supervisor makes it, and removes it too if this process is killed past its stops (`demoDir`).
+  const dir = await demoDir(DIR_PREFIX);
   h.onExit("remove the temp files", () => rm(dir, { recursive: true, force: true }));
   h.onProcessExit(() =>
     rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
@@ -737,9 +742,17 @@ export const SWARM_SCRIPT: DemoScript = {
   name: "swarm",
 };
 
-// Only when run as the script, never when a test or another script imports from here.
+// Only when run as the script, never when a test or another script imports from here. The demo runs
+// in a child process; this one passes the stop signals on and cleans up after it (`inOwnProcess`),
+// so that tsx's relay of a Ctrl-C (`pnpm exec tsx scripts/swarm-demo.ts`) cannot kill it past its
+// stops.
 if (import.meta.main) {
-  const code = await main(SWARM_SCRIPT);
+  const relayed = await inOwnProcess({
+    script: fileURLToPath(import.meta.url),
+    prefix: DIR_PREFIX,
+    name: "swarm",
+  });
+  const code = relayed ?? (await main(SWARM_SCRIPT));
   await new Promise<void>((done) => process.stdout.write("", () => done()));
   await new Promise<void>((done) => process.stderr.write("", () => done()));
   process.exit(code);

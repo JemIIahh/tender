@@ -1,6 +1,12 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApiClient, TenderClient } from "@tender/client";
+import {
+  ApiClient,
+  type ApiClientOptions,
+  fetchNamingApi,
+  requireNodeVersion,
+  TenderClient,
+} from "@tender/client";
 import { NETWORKS } from "@tender/shared";
 import {
   checkApiDeployment,
@@ -24,8 +30,18 @@ import { createStateStore } from "../src/state";
 // network, the contract and the API (`readConnectConfig`), and offers `connect_to_tender` alone,
 // which makes the agent's key and connects it with a code from its owner's page.
 
+// On a Node older than Tender needs, one line says so before anything is read or started.
+requireNodeVersion();
+
 /** How long the check of the API's deployment waits: an API that hangs must not hold up the start. */
 const API_CHECK_TIMEOUT_MS = 5_000;
+
+/**
+ * A client of the API at `TENDER_API_URL` whose requests that get no answer say which address did
+ * not answer (`API_UNREACHABLE` in a tool's answer, and the start-up line), not a bare "fetch failed".
+ */
+const apiClient = (options: ApiClientOptions) =>
+  new ApiClient({ ...options, fetchImpl: fetchNamingApi(options.baseUrl) });
 
 /** Every secret that a failure's text must not carry. Set once the environment is read. */
 let secrets: string[] = [];
@@ -53,10 +69,10 @@ async function connectMode(): Promise<void> {
   const config = readConnectConfig(process.env);
   // The RPC URL's credentials, if it has any, are all there is to keep out of what it prints.
   secrets = urlCredentials(config.rpcUrl);
-  const api = new ApiClient({ baseUrl: config.apiUrl });
+  const api = apiClient({ baseUrl: config.apiUrl });
   await checkApiDeployment(
     config,
-    new ApiClient({ baseUrl: config.apiUrl, timeoutMs: API_CHECK_TIMEOUT_MS }),
+    apiClient({ baseUrl: config.apiUrl, timeoutMs: API_CHECK_TIMEOUT_MS }),
     (line) => process.stderr.write(`tender-mcp: ${line}\n`),
   );
   const server = createConnectServer({
@@ -82,12 +98,12 @@ async function main(): Promise<void> {
   // The API client signs in as the agent's account, for the base that `readConfig` has checked the
   // way the client reads it (`canonicalBase`, https or this machine), so this does not throw for
   // anything the environment passed.
-  const api = new ApiClient({ baseUrl: config.apiUrl, signer: config.signer });
+  const api = apiClient({ baseUrl: config.apiUrl, signer: config.signer });
   // Before anything is asked of the chain or written to the state: an API of another network or
   // contract would have this server commit to tasks that the contract it signs for does not have.
   await checkApiDeployment(
     config,
-    new ApiClient({ baseUrl: config.apiUrl, timeoutMs: API_CHECK_TIMEOUT_MS }),
+    apiClient({ baseUrl: config.apiUrl, timeoutMs: API_CHECK_TIMEOUT_MS }),
     (line) => process.stderr.write(`tender-mcp: ${line}\n`),
   );
   const client = new TenderClient({
@@ -117,7 +133,7 @@ async function main(): Promise<void> {
       network: config.network,
       contractId: config.contractId,
       // The connect routes need no sign-in: a client of its own, with no signer.
-      api: new ApiClient({ baseUrl: config.apiUrl }),
+      api: apiClient({ baseUrl: config.apiUrl }),
       rpcUrl: config.rpcUrl ?? NETWORKS[config.network].rpcUrl,
       secrets,
     },

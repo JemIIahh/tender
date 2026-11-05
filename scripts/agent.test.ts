@@ -10,6 +10,8 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import type { AddressInfo } from "node:net";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -976,6 +978,25 @@ test("connect_sends_the_code_only_over_https_or_to_this_machine", async () => {
     chainCheck: async () => "missing",
   });
   expect(outcome.status).toBe("waiting_for_account");
+});
+
+test("connect_to_an_api_that_does_not_answer_names_its_address_and_makes_no_key", async () => {
+  // A port that nothing listens on: the one the system gave out a moment ago.
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise((resolve) => server.close(resolve));
+
+  const code = await main(["connect", CONNECT_CODE, "--api", `http://127.0.0.1:${port}/`], {
+    ...options(),
+    log,
+    err: (t) => err.push(t),
+  });
+  expect(code).toBe(1);
+  expect(err).toEqual([
+    `agent failed: could not reach the Tender API at http://127.0.0.1:${port} (fetch failed, ECONNREFUSED)`,
+  ]);
+  await expect(stat(keys)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 test("connect_refuses_a_chain_that_is_not_the_codes_before_a_key_is_made", async () => {

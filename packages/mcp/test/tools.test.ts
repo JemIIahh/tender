@@ -21,7 +21,13 @@ import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { TenderError, type TxResult } from "@tender/client";
+import {
+  ApiClient,
+  ApiUnreachableError,
+  fetchNamingApi,
+  TenderError,
+  type TxResult,
+} from "@tender/client";
 import {
   type AgentView,
   ApiError,
@@ -49,6 +55,7 @@ import { afterEach, beforeEach, expect, type Mock, test, vi } from "vitest";
 import { readConfig, secretsOf } from "../src/config";
 import { createMcpServer, type McpChain, type McpDeps, type OpenFileLookup } from "../src/server";
 import { createStateStore, type Draft, defaultStateRoot, type StateStore } from "../src/state";
+import { errorResult } from "../src/tools/format";
 
 // `open` and `stat` are wrapped, so that a test can change the disk between the server's look at a
 // path and its open of the file (the file tests). They do the real thing until a test says not to.
@@ -1122,6 +1129,38 @@ test("a_failing_tool_answers_with_a_code_and_no_url", async () => {
   // A server that hit a failure still answers the next call.
   getTask.mockResolvedValue(null);
   expect(await call("get_task", { task_id: "7" })).toEqual({ isError: false, text: "no task 7" });
+});
+
+test("an_api_that_does_not_answer_is_named_by_its_address_and_nothing_else_is", async () => {
+  // The bin's API client (`fetchNamingApi`), over a `fetch` that gets no answer, as undici fails.
+  const down = new TypeError("fetch failed", {
+    cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9"), { code: "ECONNREFUSED" }),
+  });
+  const base = "http://127.0.0.1:9";
+  const { call } = await connect({
+    api: new ApiClient({
+      baseUrl: `${base}/`,
+      fetchImpl: fetchNamingApi(`${base}/`, async () => {
+        throw down;
+      }),
+    }),
+  });
+  expect(await call("list_tasks")).toEqual({
+    isError: true,
+    text:
+      "API_UNREACHABLE: could not reach the Tender API at http://127.0.0.1:9 " +
+      "(fetch failed, ECONNREFUSED); check TENDER_API_URL",
+  });
+
+  // Only that address is kept: any other URL in a failure is still scrubbed.
+  const unreachable = new ApiUnreachableError(base, down);
+  const withMore = Object.assign(unreachable, {
+    message: `${unreachable.message} via https://rpc.example.com/?apiKey=SECRETKEY`,
+  });
+  const { text } = errorResult(withMore).content[0] as { text: string };
+  expect(text).toContain("at http://127.0.0.1:9 (fetch failed");
+  expect(text).toContain("via <url>");
+  expect(text).not.toContain("SECRETKEY");
 });
 
 // ---- The write tools --------------------------------------------------------------------------

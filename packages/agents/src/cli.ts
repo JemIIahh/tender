@@ -22,6 +22,13 @@ import {
   type TenderApi,
 } from "@tender/shared";
 import { AGENT_NAMES, AGENTS, type AgentConfig, agentVariables, isAgentName } from "./agents";
+import {
+  createEntryCounts,
+  ENTRY_COUNTS_FILE,
+  type EntryCounts,
+  type EntryPolicy,
+  type VerifierRule,
+} from "./policy";
 import { type AgentChain, runAgent } from "./runner";
 import { createLlmSolver } from "./solvers/llm";
 import { createOfflineSolver } from "./solvers/offline";
@@ -37,6 +44,28 @@ import type { Solver } from "./types";
 // The model costs credits, so the llm solver asks it at most 30 times an hour. The flag
 // `--max-llm-calls-per-hour N` sets another limit (`maxCallsPerHour` of `createLlmSolver`); the
 // scripted solvers cost nothing and refuse it.
+//
+// The entry policy (`EntryPolicy` of `policy.ts`) says which tasks of its tags the agent spends work
+// on. An agent with the llm solver enters only the tasks that the Judge checks (`JUDGE_ACCOUNT`), at
+// most 20 a UTC day, and none that pays less than its token's least reward on the chain (read from
+// `get_config` when it starts). One with a scripted solver enters any task, as the demos' agents do.
+// The flags set the rules over those defaults:
+//
+//   --verifiers judge|any|<account>,<account>...   who may check its work
+//   --min-reward <token>=<amount>                  the least reward of a token, in its smallest
+//                                                  unit; once for each token
+//   --daily-entries N                              the most tasks it takes on in a UTC day; the
+//                                                  count is kept in its state directory
+//   --daily-judged-hires N                         the most hires the Judge checks that it takes
+//                                                  on in a UTC day
+//   --max-voids-after-reveals N                    skips a verifier whose record in the API shows
+//                                                  more empty picks after reveals than N
+//
+// A hire is held to its service's terms in place of the least reward and the verifiers, and counts
+// toward the daily cap. One its hirer checks is held to the hirer's record and refused once the day
+// is full; one the Judge checks is held to a cap of its own, `--daily-judged-hires N` (50 a day for
+// an agent with the llm solver, none for a scripted one), and refused over it. Every cap fails
+// closed: a count that cannot be read or written takes nothing on.
 //
 // What it reads. The variables come from `.env` and `.env.deploy.<network>` in the repository root
 // (or in the directory that `TENDER_ENV_DIR` names), the network's winning, and the process's own
@@ -59,6 +88,8 @@ import type { Solver } from "./types";
 //                         the agent never uses that one
 //   LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 //                         the model, for `--solver llm` and for no other
+//   JUDGE_ACCOUNT         the Judge the API serves (the deploy writes it), for an agent whose
+//                         verifiers are `judge`, and for no other
 //
 // What it checks. Off the sandbox, before anything starts, the chain is asked what the key may do
 // (`checkAgentKey`), and a full-access key, or one that is not limited to Tender, stops the agent
@@ -76,7 +107,19 @@ type SolverName = (typeof SOLVERS)[number];
 const USAGE =
   `usage: pnpm exec tsx packages/agents/bin/run-agent.ts --agent ${AGENT_NAMES.join("|")} ` +
   `--solver ${SOLVERS.join("|")} --network ${Object.keys(NETWORKS).join("|")} ` +
-  "[--max-llm-calls-per-hour N]";
+  "[--max-llm-calls-per-hour N] [--verifiers judge|any|<account>,...] " +
+  "[--min-reward <token>=<amount>]... [--daily-entries N] [--daily-judged-hires N] " +
+  "[--max-voids-after-reveals N]";
+
+/** The most an amount of a token can be: a u128. */
+const MAX_U128 = 2n ** 128n - 1n;
+/** The tasks an agent with a model takes on in a UTC day, unless `--daily-entries` says otherwise. */
+const LLM_DAILY_ENTRIES = 20;
+/**
+ * The hires the Judge checks that an agent with a model takes on in a UTC day, unless
+ * `--daily-judged-hires` says otherwise.
+ */
+const LLM_DAILY_JUDGED_HIRES = 50;
 
 /** A failure whose message is the command line's own and safe to print: it holds no value of the environment. */
 export class CliError extends Error {
@@ -94,16 +137,47 @@ export interface CliArgs {
   network: NetworkId;
   /** The llm solver's limit on requests to the model, when the flag sets one. */
   maxLlmCallsPerHour?: number;
+  /** The rules of the entry policy that the flags set; each is there only when its flag is. */
+  verifiers?: VerifierRule;
+  minReward?: Record<string, bigint>;
+  dailyEntries?: number;
+  dailyJudgedHires?: number;
+  maxVoidsAfterReveals?: number;
 }
 
 /**
- * The call limit of a flag: digits, a whole number from 1. Why a value is refused is not said, as
+ * The number of a flag: digits, a whole number from `min`. Why a value is refused is not said, as
  * it can be anything that was pasted.
  */
-function asCallLimit(value: string): number | undefined {
+function asCount(value: string, min = 1): number | undefined {
   if (!/^[0-9]+$/.test(value)) return undefined;
-  const limit = Number(value);
-  return Number.isSafeInteger(limit) && limit >= 1 ? limit : undefined;
+  const count = Number(value);
+  return Number.isSafeInteger(count) && count >= min ? count : undefined;
+}
+
+const isAccountId = (value: string) => AccountIdSchema.safeParse(value).success;
+
+/** `--verifiers`: `judge`, `any`, or account ids separated by commas. */
+function asVerifiers(value: string): VerifierRule | undefined {
+  const text = value.trim();
+  if (text === "judge" || text === "any") return text;
+  const accounts = text.split(",").map((one) => one.trim());
+  return accounts.every(isAccountId) ? accounts : undefined;
+}
+
+/** The `--min-reward` flags, `<token>=<amount>` each, as a table; undefined if one cannot be read. */
+function asMinRewards(values: readonly string[]): Record<string, bigint> | undefined | "twice" {
+  const table: Record<string, bigint> = {};
+  for (const value of values) {
+    const at = value.indexOf("=");
+    const token = value.slice(0, at).trim();
+    const amount = value.slice(at + 1).trim();
+    if (at < 0 || !isAccountId(token) || !/^[0-9]+$/.test(amount)) return undefined;
+    if (BigInt(amount) > MAX_U128) return undefined;
+    if (Object.hasOwn(table, token)) return "twice";
+    table[token] = BigInt(amount);
+  }
+  return table;
 }
 
 /**
@@ -117,6 +191,11 @@ export function parseCli(args: readonly string[]): CliArgs {
     solver?: string;
     network?: string;
     "max-llm-calls-per-hour"?: string;
+    verifiers?: string;
+    "min-reward"?: string[];
+    "daily-entries"?: string;
+    "daily-judged-hires"?: string;
+    "max-voids-after-reveals"?: string;
   };
   try {
     values = parseArgs({
@@ -126,6 +205,11 @@ export function parseCli(args: readonly string[]): CliArgs {
         solver: { type: "string" },
         network: { type: "string" },
         "max-llm-calls-per-hour": { type: "string" },
+        verifiers: { type: "string" },
+        "min-reward": { type: "string", multiple: true },
+        "daily-entries": { type: "string" },
+        "daily-judged-hires": { type: "string" },
+        "max-voids-after-reveals": { type: "string" },
       },
     }).values;
   } catch (error) {
@@ -152,19 +236,61 @@ export function parseCli(args: readonly string[]): CliArgs {
   }
 
   const flagged = values["max-llm-calls-per-hour"];
-  const maxLlmCallsPerHour = flagged === undefined ? undefined : asCallLimit(flagged);
+  const maxLlmCallsPerHour = flagged === undefined ? undefined : asCount(flagged);
   if (flagged !== undefined && maxLlmCallsPerHour === undefined) {
     throw new CliError(`--max-llm-calls-per-hour must be a whole number from 1\n${USAGE}`);
   }
   if (flagged !== undefined && solver !== "llm") {
     throw new CliError(`--max-llm-calls-per-hour is for --solver llm only\n${USAGE}`);
   }
+
+  const verifiersFlag = values.verifiers;
+  const verifiers = verifiersFlag === undefined ? undefined : asVerifiers(verifiersFlag);
+  if (verifiersFlag !== undefined && verifiers === undefined) {
+    throw new CliError(
+      `--verifiers must be judge, any, or NEAR account ids separated by commas\n${USAGE}`,
+    );
+  }
+  const rewardFlags = values["min-reward"];
+  const minReward = rewardFlags === undefined ? undefined : asMinRewards(rewardFlags);
+  if (rewardFlags !== undefined && minReward === undefined) {
+    throw new CliError(
+      `--min-reward must be <token account id>=<amount in the token's smallest unit>\n${USAGE}`,
+    );
+  }
+  if (minReward === "twice") throw new CliError(`--min-reward names a token twice\n${USAGE}`);
+  const dailyFlag = values["daily-entries"];
+  const dailyEntries = dailyFlag === undefined ? undefined : asCount(dailyFlag);
+  if (dailyFlag !== undefined && dailyEntries === undefined) {
+    throw new CliError(`--daily-entries must be a whole number from 1\n${USAGE}`);
+  }
+  const judgedFlag = values["daily-judged-hires"];
+  const dailyJudgedHires = judgedFlag === undefined ? undefined : asCount(judgedFlag);
+  if (judgedFlag !== undefined && dailyJudgedHires === undefined) {
+    throw new CliError(`--daily-judged-hires must be a whole number from 1\n${USAGE}`);
+  }
+  const voidsFlag = values["max-voids-after-reveals"];
+  const maxVoidsAfterReveals = voidsFlag === undefined ? undefined : asCount(voidsFlag, 0);
+  if (voidsFlag !== undefined && maxVoidsAfterReveals === undefined) {
+    throw new CliError(`--max-voids-after-reveals must be a whole number from 0\n${USAGE}`);
+  }
+
   return {
     agent: AGENTS[agent],
     solver: solver as SolverName,
     network: network as NetworkId,
     ...(maxLlmCallsPerHour !== undefined && { maxLlmCallsPerHour }),
+    ...(verifiers !== undefined && { verifiers }),
+    ...(minReward !== undefined && { minReward }),
+    ...(dailyEntries !== undefined && { dailyEntries }),
+    ...(dailyJudgedHires !== undefined && { dailyJudgedHires }),
+    ...(maxVoidsAfterReveals !== undefined && { maxVoidsAfterReveals }),
   };
+}
+
+/** The verifiers of a run: the flag's, else `judge` for an agent with a model and `any` for the rest. */
+function verifiersOf(args: CliArgs): VerifierRule {
+  return args.verifiers ?? (args.solver === "llm" ? "judge" : "any");
 }
 
 // ---- The environment --------------------------------------------------------------------------
@@ -248,6 +374,8 @@ export interface RunConfig extends CliArgs {
   publicKey: string;
   /** The model's settings, for `--solver llm`. */
   llm?: { baseUrl: string; apiKey: string; model: string };
+  /** The Judge the API serves (`JUDGE_ACCOUNT`), for an agent whose verifiers are `judge`. */
+  judgeAccount?: string;
 }
 
 const AN_ACCOUNT = "a NEAR account id";
@@ -322,6 +450,10 @@ export function readRunConfig(args: CliArgs, env: Env): RunConfig {
   const baseUrl = llm ? read("LLM_BASE_URL", asHttpUrl, A_URL) : undefined;
   const apiKey = llm ? read("LLM_API_KEY", asText, "a key") : undefined;
   const model = llm ? read("LLM_MODEL", asText, "a model name") : undefined;
+  // The Judge only for an agent that takes the Judge's tasks alone, as the model's settings are
+  // the llm solver's: a value that no rule needs is not read.
+  const judged = verifiersOf(args) === "judge";
+  const judgeAccount = judged ? read("JUDGE_ACCOUNT", asAccount, AN_ACCOUNT) : undefined;
 
   if (
     missing.length > 0 ||
@@ -346,6 +478,14 @@ export function readRunConfig(args: CliArgs, env: Env): RunConfig {
           keyCommand(network, agent.name),
       );
     }
+    if (missing.includes("JUDGE_ACCOUNT")) {
+      faults.push(
+        "JUDGE_ACCOUNT is the Judge the API serves, which the deploy writes to " +
+          `.env.deploy.${network}: an agent whose verifiers are judge (an agent with a model, ` +
+          "unless --verifiers says otherwise) enters only the tasks it checks. Set it, or pass " +
+          "--verifiers any or --verifiers <account>,<account>",
+      );
+    }
     throw new CliError(faults.join("; "));
   }
 
@@ -359,6 +499,61 @@ export function readRunConfig(args: CliArgs, env: Env): RunConfig {
     ...(baseUrl !== undefined &&
       apiKey !== undefined &&
       model !== undefined && { llm: { baseUrl, apiKey, model } }),
+    ...(judgeAccount !== undefined && { judgeAccount }),
+  };
+}
+
+// ---- The entry policy -------------------------------------------------------------------------
+
+/** What the policy needs of the chain: the contract's config, for the tokens' least rewards. */
+export type ConfigReader = Pick<TenderClient, "getConfig">;
+
+/**
+ * The least reward of each token on the chain (`get_config`), which an agent with a model takes as
+ * its own unless `--min-reward` gives another. The chain has `deadlineMs` to answer, and an agent
+ * with a model does not start without them.
+ */
+export async function chainMinRewards(
+  chain: ConfigReader,
+  deadlineMs = KEY_CHECK_DEADLINE_MS,
+): Promise<Record<string, bigint>> {
+  try {
+    const config = await withinDeadline(deadlineMs, chain.getConfig());
+    return Object.fromEntries(config.tokens.map((one) => [one.token, BigInt(one.min_reward)]));
+  } catch (error) {
+    throw new CliError(
+      `cannot read the tokens' least rewards from the chain (${describe(error)}), and an agent ` +
+        "with a model does not start without them: they are its least rewards unless " +
+        "--min-reward says otherwise. Try again once the chain answers",
+    );
+  }
+}
+
+/**
+ * The entry policy of a run: the flags, over the defaults of its solver. An agent with a model
+ * takes the Judge's tasks only, at most 20 a UTC day, at most 50 hires the Judge checks a UTC day,
+ * and none below its token's least reward on the chain (`chainMinimums`, which the caller reads for
+ * it). A scripted agent enters any task of its tags, with no cap, as the demos' agents always have.
+ * A rule that is not set is left out.
+ */
+export function entryPolicyOf(
+  config: RunConfig,
+  chainMinimums: Readonly<Record<string, bigint>> = {},
+): EntryPolicy {
+  const llm = config.solver === "llm";
+  const verifiers = verifiersOf(config);
+  const minReward = { ...(llm ? chainMinimums : {}), ...config.minReward };
+  const dailyEntries = config.dailyEntries ?? (llm ? LLM_DAILY_ENTRIES : undefined);
+  const dailyJudgedHires = config.dailyJudgedHires ?? (llm ? LLM_DAILY_JUDGED_HIRES : undefined);
+  return {
+    verifiers,
+    ...(verifiers === "judge" && { judgeAccount: config.judgeAccount }),
+    ...(Object.keys(minReward).length > 0 && { minReward }),
+    ...(config.maxVoidsAfterReveals !== undefined && {
+      maxVoidsAfterReveals: config.maxVoidsAfterReveals,
+    }),
+    ...(dailyEntries !== undefined && { dailyEntries }),
+    ...(dailyJudgedHires !== undefined && { dailyJudgedHires }),
   };
 }
 
@@ -720,8 +915,9 @@ export async function exitWhenFlushed(
 /**
  * Runs the command line and returns the exit code: 0 after the agent was stopped, 1 for anything
  * that kept it from starting or ended it. The order is the flags, the environment, the agent's
- * key (off the sandbox), the Tender API client, the solver, one sign-in to the API, and then the
- * loop.
+ * key (off the sandbox), its registration, the tokens' least rewards (for an agent with a model),
+ * the Tender API client, the solver, one sign-in to the API, and then the loop, with the entry
+ * policy (`entryPolicyOf`).
  */
 export async function main(args: readonly string[], options: CliOptions): Promise<number> {
   const out = options.out ?? console.log;
@@ -749,6 +945,9 @@ export async function main(args: readonly string[], options: CliOptions): Promis
     }
     const notice = await registrationWarning(client, config.signer.accountId, options.keyCheckMs);
     if (notice !== null) out(notice);
+    const minimums =
+      config.solver === "llm" ? await chainMinRewards(client, options.keyCheckMs) : {};
+    const policy = entryPolicyOf(config, minimums);
     const api = options.createApi(config);
     const solver = makeSolver(
       config,
@@ -756,9 +955,13 @@ export async function main(args: readonly string[], options: CliOptions): Promis
       options.privateDir ?? privateSeedsDirOf(env),
       out,
     );
-    const state = createStateStore(
-      defaultStateDir(config.network, config.signer.accountId, options.home),
-    );
+    const stateDir = defaultStateDir(config.network, config.signer.accountId, options.home);
+    const state = createStateStore(stateDir);
+    // The count of the day lives beside the drafts, so that a restart keeps it.
+    const entryCounts: EntryCounts | undefined =
+      policy.dailyEntries === undefined && policy.dailyJudgedHires === undefined
+        ? undefined
+        : createEntryCounts(join(stateDir, ENTRY_COUNTS_FILE));
     const signal = options.signal ?? stop.signal;
     await signInAtStart(api, signal, out, secrets);
 
@@ -771,6 +974,8 @@ export async function main(args: readonly string[], options: CliOptions): Promis
       solver,
       log: out,
       signal,
+      policy,
+      ...(entryCounts !== undefined && { entryCounts }),
     });
     return 0;
   } catch (error) {

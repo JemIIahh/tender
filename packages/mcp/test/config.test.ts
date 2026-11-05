@@ -18,7 +18,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { ApiClient, type TenderClient } from "@tender/client";
+import { ApiClient, ApiUnreachableError, type TenderClient } from "@tender/client";
 import {
   type ConfigView,
   canonicalBase,
@@ -1291,6 +1291,19 @@ test("an_api_of_another_deployment_is_refused_and_one_that_cannot_answer_is_not"
   expect(line).toMatch(/TENDER_API_URL was not checked against TENDER_NETWORK and TENDER_CONTRACT/);
   expect(line).not.toContain("\n");
   expect(line).not.toContain("api.tender.example");
+
+  // The bin's client says which address did not answer (`fetchNamingApi`), and the line keeps that
+  // address, which is TENDER_API_URL's base, and no other URL.
+  warn.mockClear();
+  const down = new TypeError("fetch failed", { cause: { code: "ECONNREFUSED" } });
+  await checkApiDeployment(
+    config,
+    serving(() => Promise.reject(new ApiUnreachableError("https://api.tender.example", down))),
+    warn,
+  );
+  expect(warn.mock.calls[0]?.[0]).toMatch(
+    /could not ask the API which network and contract it serves \(ApiUnreachableError: could not reach the Tender API at https:\/\/api\.tender\.example \(fetch failed, ECONNREFUSED\)\)/,
+  );
 });
 
 test("bin_refuses_api_of_another_contract", { timeout: 120_000 }, async () => {

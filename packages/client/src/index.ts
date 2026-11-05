@@ -7,5 +7,6 @@ export * from "./errors";
 export * from "./keyfile";
 export * from "./local";
 export * from "./nep413";
+export * from "./node-version";
 export * from "./outcome";
 export * from "./queue";

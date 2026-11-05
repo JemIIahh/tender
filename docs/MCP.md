@@ -6,7 +6,7 @@ It runs on your machine. It signs with your key, and it keeps your unrevealed an
 
 ## Start it
 
-You need Node 24.21 or later and pnpm. From the repo root, once: `pnpm install`.
+You need Node 24.21 or a later 24, or Node 26 and newer (25 is not supported by some test dependencies), and pnpm. From the repo root, once: `pnpm install`.
 
 The server is a script, not a command on your `PATH`. A client starts it with
 
@@ -65,7 +65,7 @@ The key in `TENDER_PRIVATE_KEY` decides what the server may do. The server asks 
 pnpm exec tsx scripts/keeper-key.ts --network testnet --role agent --agent <name>
 ```
 
-`<name>` is the agent's name from the deploy (`analyst`, `coder`, `extractor` or `lead`). The script reads `AGENT_<NAME>_ACCOUNT` and `AGENT_<NAME>_FULL_ACCESS_KEY` from `.env.deploy.testnet`, adds a key limited to the Tender contract and to the methods `commit` and `reveal`, with no cap on its allowance, and writes the private half to the same file as `AGENT_<NAME>_PRIVATE_KEY` (mode 0600). It prints `OK add agent <name> key <public key> to <account>`, or `SKIP ... (exists)` when you run it again, and never prints a private key. Set `TENDER_ACCOUNT` to the account and `TENDER_PRIVATE_KEY` to that private key. The command line works on testnet only; mainnet keys are left to the launch plan.
+`<name>` is the agent's name from the deploy (`analyst`, `coder`, `extractor` or `lead`): this script is for the team's own agents, as only the deployer has `.env.deploy.testnet`. For an account of your own, make its key with `pnpm agent:init` (the README's "Use it from an agent" has the steps on testnet), or try the tools on a local chain with `pnpm demo:local --keep`, which prints the environment for a ready local account and leaves a demo task open for it to enter. The script reads `AGENT_<NAME>_ACCOUNT` and `AGENT_<NAME>_FULL_ACCESS_KEY` from `.env.deploy.testnet`, adds a key limited to the Tender contract and to the methods `commit` and `reveal`, with no cap on its allowance, and writes the private half to the same file as `AGENT_<NAME>_PRIVATE_KEY` (mode 0600). It prints `OK add agent <name> key <public key> to <account>`, or `SKIP ... (exists)` when you run it again, and never prints a private key. Set `TENDER_ACCOUNT` to the account and `TENDER_PRIVATE_KEY` to that private key. The command line works on testnet only; mainnet keys are left to the launch plan.
 
 The agent key cannot attach a deposit, so it cannot move money; a leaked one can only commit and reveal as that account, and spend that account's NEAR on gas, which is why an agent account should hold little. It does not include `pick` or `register_agent`, so it cannot call those two either, and it could not call `register_agent` if it did, since that call attaches 1 yoctoNEAR: `pick_winners` refuses it with `KEY_CANNOT_CALL`, and `register_agent` with `NEEDS_FULL_ACCESS_KEY`, at once, before they upload a scorecard or a profile (see the table).
 
@@ -234,6 +234,7 @@ A failed tool answers `isError` with `CODE: message`.
 | `FILE_UNREADABLE` | `file_path` cannot be read from `TENDER_FILES_DIR`: the file is missing, outside it, reached by a link that leads out, has a second hard link, is hidden (a name on its path below `TENDER_FILES_DIR` starts with a dot), or is in a Tender state directory (this server's own, anything under `~/.tender`, or any folder named `drafts`). The answer names all of these rules and never says which one applied |
 | `E_PHASE` | The window is not open: a reveal before the commit window closes, or after the reveal deadline |
 | `API_ERROR` on a reveal | The API has not indexed your commit yet. Wait a few seconds and call again |
+| `API_UNREACHABLE` | No answer came from `TENDER_API_URL`: nothing listens there, its name does not resolve, or the connection was cut. The message names the address (only that URL is shown; any other is scrubbed) and the code, such as `ECONNREFUSED`. Check the variable, and that the API is up: on a local chain, that `pnpm demo:local --keep` still runs |
 | `SECRET_IN_CONTENT` | What you gave holds the server's key (or another secret it was given). It is refused before anything is uploaded or sent |
 | `NO_SERVICE`, `SERVICE_UNAVAILABLE`, `PRICE_ABOVE_MAX`, `JUDGE_MISMATCH`, `DELEGATE_CAP`, `INSUFFICIENT_FUNDS` | `hire_agent` refused the hire, before anything was uploaded or paid: see [Services](#services-hiring-an-agent) |
 

@@ -1,5 +1,6 @@
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -26,6 +27,7 @@ import {
 } from "@tender/shared";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { createLeadSolver, LEAD_TAG, type LeadChain, type LeadSolver } from "../src/agents/lead";
+import { JOURNAL_LOCK_FILE, JournalLockedError } from "../src/agents/lead-lock";
 import { type AgentChain, type AgentMemory, agentTick } from "../src/runner";
 import type { TaskContext } from "../src/types";
 import {
@@ -39,6 +41,7 @@ import {
   taskSummary,
   voided,
 } from "./helpers";
+import { holdJournal, killHolders } from "./journal-holder";
 import { PowerCut, PowerFs } from "./power-fs";
 
 // The lead agent of the swarm demo, with a stand-in chain and a stand-in API in one small world.
@@ -1760,4 +1763,71 @@ describe("swarm fix: N4, a job that never gets its entry does not block the lead
     expect(() => leadOf(world, { entrySecs: 0 })).toThrow(/entrySecs/);
     expect(() => leadOf(world, { entrySecs: 1.5 })).toThrow(/entrySecs/);
   });
+});
+
+describe("one lead per journal: the lead holds its journal while it runs", () => {
+  const PROCESSES = { timeout: 180_000 };
+  const lockFile = () => join(journalDir, JOURNAL_LOCK_FILE);
+
+  afterEach(() => killHolders());
+
+  test("the_lead_holds_its_journal_while_it_runs_and_lets_it_go_when_it_stops", async () => {
+    const world = buildWorld({ stall: { secs: 0 } });
+    const lead = leadOf(world);
+    const running = lead.run(stop.signal);
+    // Taken as `run` starts, before its first pass: the pid and the start time of this process.
+    expect(JSON.parse(readFileSync(lockFile(), "utf8"))).toMatchObject({ pid: process.pid });
+    // A second lead on the same journal does not run, in this process either.
+    await expect(leadOf(world).run(new AbortController().signal)).rejects.toThrow(
+      JournalLockedError,
+    );
+    stop.abort();
+    await running;
+    expect(existsSync(lockFile())).toBe(false);
+    // Let go, it is free for the next lead.
+    const again = new AbortController();
+    const next = leadOf(world).run(again.signal);
+    again.abort();
+    await next;
+    expect(existsSync(lockFile())).toBe(false);
+  });
+
+  test(
+    "a_lead_whose_journal_another_process_holds_refuses_to_run_and_acts_on_nothing",
+    PROCESSES,
+    async () => {
+      const world = buildWorld();
+      const lines: string[] = [];
+      const lead = leadOf(world, {}, lines);
+      // A job under way, from before the other process came.
+      await enter(world, lead);
+      expect(jobOf().status).toBe("hiring");
+
+      const other = holdJournal(journalDir);
+      await other.ready;
+
+      // `run` is refused at once, with the pid that holds the journal, and makes no pass.
+      await expect(lead.run(stop.signal)).rejects.toThrow(
+        `is held by another lead, process ${other.pid}`,
+      );
+      // Its solver takes no parent, and a pass hires nothing: the journal is the other lead's.
+      const next = { ...world.ctx, task: { ...world.ctx.task, id: "11" } };
+      expect(await lead.solve(next)).toBeNull();
+      expect(journalFiles()).toEqual([`${PARENT_ID}.json`]);
+      await lead.tick();
+      await lead.tick();
+      expect(world.children).toHaveLength(0);
+      expect(lines.filter((line) => line.includes(`process ${other.pid}`))).toEqual([
+        `lead: declining task 11: another lead, process ${other.pid}, holds the journal ${journalDir}`,
+        `lead: WARN another lead, process ${other.pid}, holds the journal ${journalDir}: this lead does nothing with it until that one stops`,
+      ]);
+
+      // Once the other lead stops, the journal is free, and the job goes on from where it was.
+      other.child.kill("SIGTERM");
+      await other.exited;
+      await finish(lead);
+      expect(world.children).toHaveLength(3);
+      expect(jobOf().status).toBe("done");
+    },
+  );
 });
