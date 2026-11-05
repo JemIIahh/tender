@@ -3,15 +3,17 @@ import { expect, test } from "vitest";
 import { REPO_ROOT } from "./lib/env";
 
 // Each command a person runs checks the Node it is on before the rest of it runs or starts anything:
-// `pnpm demo:local`, the swarm demo, `pnpm serve`, the agent commands, the MCP server and the agent
-// runner. The test runs each as its own process on a Node that says it is 22, or 25 (the one place
-// the check reads, `process.version`, is set before the command is loaded) and reads what it printed.
+// `pnpm demo:local`, the swarm demo, `pnpm serve`, the agent commands, the sandbox-node fetch that
+// CI runs, the MCP server and the agent runner. The test runs each as its own process on a Node
+// that says it is 22, or 25 (the one place the check reads, `process.version`, is set before the
+// command is loaded) and reads what it printed.
 
 const ENTRY_POINTS = [
   "scripts/demo-local.ts",
   "scripts/swarm-demo.ts",
   "scripts/serve.ts",
   "scripts/agent.ts",
+  "scripts/fetch-sandbox-node.ts",
   "packages/mcp/bin/tender-mcp.ts",
   "packages/agents/bin/run-agent.ts",
 ];
