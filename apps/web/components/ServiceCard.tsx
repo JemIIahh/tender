@@ -5,6 +5,7 @@ import { checkedBy, windowsLine } from "../lib/services";
 import { describeAmount } from "../lib/vault";
 import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
+import { Count, EarnedNothing, FigureLine } from "./Figures";
 import { TeamBadge } from "./TeamBadge";
 import { FACT_LABEL, PRIMARY, TAG } from "./ui";
 
@@ -100,28 +101,40 @@ export function ServiceCard({
         </ul>
       )}
 
-      <dl className="mt-5 grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line bg-line">
-        <div className="grid gap-1 bg-ink px-3 py-2.5">
-          <dt className={FACT_LABEL}>Wins</dt>
-          <dd data-testid="service-wins" className="text-lg font-medium tabular-nums">
-            {record?.wins ?? 0}
-          </dd>
+      {(record?.wins ?? 0) === 0 && earned.length === 0 ? (
+        // No wins and nothing earned yet: one line, not two empty boxes.
+        <div className="mt-5">
+          <FigureLine testId="service-figures">
+            {[
+              <Count key="wins" value={0} one="win" many="wins" testId="service-wins" />,
+              <EarnedNothing key="earned" testId="service-earned" />,
+            ]}
+          </FigureLine>
         </div>
-        <div className="grid min-w-0 gap-1 bg-ink px-3 py-2.5">
-          <dt className={FACT_LABEL}>Earned</dt>
-          <dd data-testid="service-earned" className="text-[14px] leading-snug wrap-anywhere">
-            {earned.length === 0 ? (
-              <span className="text-muted">Nothing yet</span>
-            ) : (
-              earned.map(([token, amount]) => (
-                <span key={token} className="block">
-                  <Amount value={amount} token={token} />
-                </span>
-              ))
-            )}
-          </dd>
-        </div>
-      </dl>
+      ) : (
+        <dl className="mt-5 grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line bg-line">
+          <div className="grid gap-1 bg-ink px-3 py-2.5">
+            <dt className={FACT_LABEL}>Wins</dt>
+            <dd data-testid="service-wins" className="text-lg font-medium tabular-nums">
+              {record?.wins ?? 0}
+            </dd>
+          </div>
+          <div className="grid min-w-0 gap-1 bg-ink px-3 py-2.5">
+            <dt className={FACT_LABEL}>Earned</dt>
+            <dd data-testid="service-earned" className="text-[14px] leading-snug wrap-anywhere">
+              {earned.length === 0 ? (
+                <span className="text-muted">Nothing yet</span>
+              ) : (
+                earned.map(([token, amount]) => (
+                  <span key={token} className="block">
+                    <Amount value={amount} token={token} />
+                  </span>
+                ))
+              )}
+            </dd>
+          </div>
+        </dl>
+      )}
 
       <div className="mt-auto grid gap-4 pt-5">
         <p className="text-[12.5px] text-muted">{windowsLine(service)}</p>

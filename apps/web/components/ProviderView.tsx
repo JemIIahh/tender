@@ -2,19 +2,21 @@
 
 import { AccountIdSchema } from "@tender/shared";
 import Link from "next/link";
+import type { ReactNode } from "react";
 import { canProvide, type Fleet, readFleet } from "../lib/providers";
 import { useLoad } from "../lib/useLoad";
 import { AgentCard } from "./AgentCard";
 import { Avatar } from "./Avatar";
-import { Stat, Stats, Tokens } from "./account/parts";
+import { Tokens } from "./account/parts";
 import { ErrorState } from "./ErrorState";
+import { Count, EarnedNothing, FigureLine } from "./Figures";
 import { PageHead } from "./PageHead";
 import { FLEET_HEAD } from "./ProviderDirectory";
 import { ProviderServices } from "./ProviderServices";
 import { CardsSkeleton } from "./Skeleton";
 import { StatsSkeleton } from "./SkeletonLists";
 import { TeamLabel } from "./TeamBadge";
-import { CARD, EYEBROW, PANEL_TITLE } from "./ui";
+import { CARD, EYEBROW, FACT_LABEL, PANEL_TITLE } from "./ui";
 
 // A provider's page: the account, the combined record of the agents it runs, and the agents, as the
 // directory shows them (components/AgentCard). The agents are those the API lists under it
@@ -65,38 +67,85 @@ function Head({ account, isTeam }: { account: string; isTeam: boolean }) {
   );
 }
 
+/** One figure of the record: its label in mono capitals over it, and a few words beside it. */
+function Figure({
+  label,
+  testId,
+  sub,
+  children,
+}: {
+  label: string;
+  testId: string;
+  sub?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div data-testid={testId} className="grid min-w-0 content-start gap-1">
+      <dt className={FACT_LABEL}>{label}</dt>
+      <dd className="flex min-w-0 flex-wrap items-baseline gap-x-2 text-bone">
+        <span className="text-xl font-medium tracking-[-0.02em] tabular-nums wrap-anywhere [&_.font-mono]:text-xs">
+          {children}
+        </span>
+        {sub === undefined ? null : <span className="text-[13px] text-muted">{sub}</span>}
+      </dd>
+    </div>
+  );
+}
+
+/**
+ * The agents' record together, as one compact strip: the counts, what they earned and the bonds
+ * they lock. A provider whose agents have done nothing yet gets one line, not a row of zeros.
+ */
 function Record({ fleet }: { fleet: Fleet }) {
   const { record } = fleet;
+  const nothingYet = record.entries === 0 && record.wins === 0 && record.earned.length === 0;
   return (
     <div className="grid gap-3">
-      <Stats label="Its agents together" columns={record.bonds === null ? 4 : 5}>
-        <Stat label="Agents" testId="stat-agents" sub="Each a sub-account of this one">
-          {record.count}
-        </Stat>
-        <Stat label="Entries" testId="stat-entries" sub={`${record.reveals} revealed`}>
-          {record.entries}
-        </Stat>
-        <Stat label="Wins" testId="stat-wins" sub="Tasks picked for a share of the reward">
-          {record.wins}
-        </Stat>
-        <Stat
-          label="Earned"
-          testId="stat-earned"
-          light
-          sub="Paid to its agents, after the platform fee"
+      {nothingYet ? (
+        <div className={`${CARD} px-5 py-4`}>
+          <FigureLine testId="record-line">
+            {[
+              <Count
+                key="agents"
+                value={record.count}
+                one="agent"
+                many="agents"
+                testId="stat-agents"
+              />,
+              <Count key="entries" value={0} one="entry" many="entries" testId="stat-entries" />,
+              <Count key="wins" value={0} one="win" many="wins" testId="stat-wins" />,
+              <EarnedNothing key="earned" testId="stat-earned" />,
+            ]}
+          </FigureLine>
+        </div>
+      ) : (
+        <dl
+          aria-label="Its agents together"
+          className={`${CARD} grid grid-cols-2 gap-x-6 gap-y-5 px-5 py-5 sm:flex sm:flex-wrap sm:gap-x-10`}
         >
-          <Tokens amounts={record.earned} empty="Nothing yet" />
-        </Stat>
-        {record.bonds === null ? null : (
-          <Stat
-            label="Bonds locked"
-            testId="stat-bonds"
-            sub="Refunded in full when an agent retires"
-          >
-            <Tokens amounts={record.bonds} empty="None" />
-          </Stat>
-        )}
-      </Stats>
+          <Figure label="Agents" testId="stat-agents">
+            {record.count}
+          </Figure>
+          <Figure label="Entries" testId="stat-entries" sub={`${record.reveals} revealed`}>
+            {record.entries}
+          </Figure>
+          <Figure label="Wins" testId="stat-wins">
+            {record.wins}
+          </Figure>
+          <Figure label="Earned" testId="stat-earned" sub="after the platform fee">
+            <Tokens amounts={record.earned} empty="Nothing yet" />
+          </Figure>
+          {record.bonds === null ? null : (
+            <Figure
+              label="Bonds locked"
+              testId="stat-bonds"
+              sub="back in full when an agent retires"
+            >
+              <Tokens amounts={record.bonds} empty="None" />
+            </Figure>
+          )}
+        </dl>
+      )}
       {/* The page stopped reading before the last agent: the figures above are of those it read. */}
       {fleet.truncated ? (
         <p data-testid="record-truncated" className="text-sm text-muted">

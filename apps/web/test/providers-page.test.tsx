@@ -188,7 +188,15 @@ test("directory_lists_each_provider_with_its_agents_and_combined_record", async 
 
   // The team's provider carries the label, as its agents do.
   expect(within(team).getByTestId("team-badge").textContent).toBe("Run by Tender team");
-  expect(within(team).getByTestId("earned").textContent).toBe("Nothing yet");
+  // An agent's record of nothing is one line, not a row of empty boxes.
+  expect(within(team).getByTestId("provider-figures").textContent).toBe(
+    "1 agent·0 entries·0 wins·earned nothing yet",
+  );
+  expect(within(team).getByTestId("earned").textContent).toBe("nothing yet");
+  // With figures, the counts are one line too, and what was earned is under it.
+  expect(within(acme).getByTestId("provider-figures").textContent).toBe(
+    "3 agents·8 entries·3 wins",
+  );
 });
 
 test("directory_names_four_agents_and_counts_the_rest", async () => {
@@ -269,14 +277,10 @@ test("provider_page_shows_the_account_its_combined_record_and_its_agents", async
 
   // The combined record: only what the API counted, added up.
   const record = screen.getByLabelText("Its agents together");
-  expect(within(record).getByTestId("stat-agents").textContent).toBe(
-    "Agents3Each a sub-account of this one",
-  );
-  // The label, the figure, and the line under it.
+  expect(within(record).getByTestId("stat-agents").textContent).toBe("Agents3");
+  // The label, the figure, and a few words beside it.
   expect(within(record).getByTestId("stat-entries").textContent).toBe("Entries87 revealed");
-  expect(within(record).getByTestId("stat-wins").textContent).toBe(
-    "Wins3Tasks picked for a share of the reward",
-  );
+  expect(within(record).getByTestId("stat-wins").textContent).toBe("Wins3");
   expect(
     within(within(record).getByTestId("stat-earned"))
       .getAllByTestId("amount")
@@ -335,6 +339,20 @@ test("provider_page_of_the_team_carries_the_label", async () => {
   await screen.findAllByTestId("agent-card");
   const head = screen.getByRole("banner");
   expect(within(head).getByTestId("team-badge").textContent).toBe("Run by Tender team");
+});
+
+test("provider_page_of_agents_that_have_done_nothing_yet_says_it_in_one_line", async () => {
+  fakeApi(() => agentsPage([analyst]));
+  render(<ProviderView account={ACME} />);
+
+  expect((await screen.findByTestId("record-line")).textContent).toBe(
+    "1 agent·0 entries·0 wins·earned nothing yet",
+  );
+  expect(screen.queryByLabelText("Its agents together")).toBeNull();
+  // The agent's card says the same in its own line.
+  expect(within(screen.getByTestId("agent-card")).getByTestId("agent-figures").textContent).toBe(
+    "0 entries·0 reveals·0 wins·earned nothing yet",
+  );
 });
 
 test("provider_page_with_no_agents_says_so_and_why_an_account_can_t_be_one", async () => {

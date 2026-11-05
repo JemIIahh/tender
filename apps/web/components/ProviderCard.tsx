@@ -3,27 +3,18 @@ import { usePrefetchOnIntent } from "../lib/prefetch";
 import { ownPart, type Provider } from "../lib/providers";
 import { Avatar } from "./Avatar";
 import { Tokens } from "./account/parts";
+import { Count, EarnedNothing, FigureLine } from "./Figures";
 import { TeamLabel } from "./TeamBadge";
 import { FACT_LABEL, FACTS } from "./ui";
 
 /** How many of a provider's agents its card names; the rest are counted. */
 const NAMED = 4;
 
-function Count({ label, value, testId }: { label: string; value: number; testId: string }) {
-  return (
-    <div className="grid min-w-0 gap-1 bg-ink px-2 py-3">
-      <dt className={FACT_LABEL}>{label}</dt>
-      <dd data-testid={testId} className="text-xl font-medium tabular-nums wrap-anywhere">
-        {value}
-      </dd>
-    </div>
-  );
-}
-
 /**
  * A provider in the directory: its account, which is the link to its page, the team's label if the
  * API flags its agents as the team's, its agents by the part of their accounts that is their own,
- * and their combined record: how many, their entries and wins, and what they earned, token by token.
+ * and their combined record in one line: how many, their entries and wins, and what they earned,
+ * token by token, under it once there is something.
  */
 export function ProviderCard({ provider }: { provider: Provider }) {
   const { account, agents, record } = provider;
@@ -34,12 +25,12 @@ export function ProviderCard({ provider }: { provider: Provider }) {
     <li
       {...intent}
       data-testid="provider-card"
-      className="relative grid min-w-0 grid-cols-1 content-start gap-5 rounded-2xl border border-line bg-panel p-5 text-bone transition-colors hover:border-bone/30 has-[a:focus-visible]:border-bone/50 motion-reduce:transition-none sm:p-6"
+      className="relative grid min-w-0 grid-cols-1 content-start gap-4 rounded-2xl border border-line bg-panel p-5 text-bone transition-colors hover:border-bone/30 has-[a:focus-visible]:border-bone/50 motion-reduce:transition-none"
     >
       <div className="flex min-w-0 items-center gap-3">
-        <Avatar account={account} size={40} />
-        <div className="grid min-w-0 gap-1.5">
-          <h2 className="font-mono text-[16px] leading-snug font-medium wrap-anywhere">
+        <Avatar account={account} size={36} />
+        <div className="grid min-w-0 gap-1">
+          <h2 className="font-mono text-[15px] leading-snug font-medium wrap-anywhere">
             {/* The account is the card's link, and stretches over the card. */}
             <Link
               href={`/providers/${account}`}
@@ -75,18 +66,36 @@ export function ProviderCard({ provider }: { provider: Provider }) {
         ) : null}
       </ul>
 
-      <dl className="grid grid-cols-3 gap-px overflow-hidden rounded-xl border border-line bg-line text-center">
-        <Count label="Agents" value={record.count} testId="provider-agents" />
-        <Count label="Entries" value={record.entries} testId="entries" />
-        <Count label="Wins" value={record.wins} testId="wins" />
-      </dl>
-
-      <dl className={FACTS}>
-        <dt className={FACT_LABEL}>Earned</dt>
-        <dd data-testid="earned" className="text-bone">
-          <Tokens amounts={record.earned} empty="Nothing yet" />
-        </dd>
-      </dl>
+      <div className="grid gap-2 border-t border-line pt-4">
+        <FigureLine testId="provider-figures">
+          {[
+            <Count
+              key="agents"
+              value={record.count}
+              one="agent"
+              many="agents"
+              testId="provider-agents"
+            />,
+            <Count
+              key="entries"
+              value={record.entries}
+              one="entry"
+              many="entries"
+              testId="entries"
+            />,
+            <Count key="wins" value={record.wins} one="win" many="wins" testId="wins" />,
+            record.earned.length === 0 ? <EarnedNothing key="earned" testId="earned" /> : null,
+          ]}
+        </FigureLine>
+        {record.earned.length === 0 ? null : (
+          <dl className={FACTS}>
+            <dt className={FACT_LABEL}>Earned</dt>
+            <dd data-testid="earned" className="text-bone">
+              <Tokens amounts={record.earned} />
+            </dd>
+          </dl>
+        )}
+      </div>
     </li>
   );
 }

@@ -29,7 +29,10 @@ test("providers_directory_groups_the_agents_and_leads_to_a_provider_s_page", asy
 
   // The whole card is the link: a click in its middle, on its figures, follows it.
   await provider.click();
-  await expect(page).toHaveURL(new RegExp(`/providers/${PROVIDER.replace(".", "\\.")}$`));
+  // `next dev` compiles a page the first time it is opened, which can take a while.
+  await expect(page).toHaveURL(new RegExp(`/providers/${PROVIDER.replace(".", "\\.")}$`), {
+    timeout: 20_000,
+  });
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(PROVIDER);
   await expect(page.getByTestId("agent-card")).toHaveCount(1);
   await expect(page.getByTestId("stat-agents")).toContainText("1");
@@ -39,7 +42,7 @@ test("providers_directory_groups_the_agents_and_leads_to_a_provider_s_page", asy
   ]);
 
   await page.getByRole("link", { name: "All providers" }).click();
-  await expect(page).toHaveURL(/\/providers$/);
+  await expect(page).toHaveURL(/\/providers$/, { timeout: 20_000 });
 });
 
 test("agent_card_s_provider_is_a_link_that_a_click_reaches", async ({ page }) => {
@@ -52,7 +55,10 @@ test("agent_card_s_provider_is_a_link_that_a_click_reaches", async ({ page }) =>
     .getByTestId("agent-card")
     .filter({ has: page.getByRole("heading", { name: "Alice Extractor" }) });
   await alice.getByTestId("asp").getByRole("link", { name: PROVIDER }).click();
-  await expect(page).toHaveURL(new RegExp(`/providers/${PROVIDER.replace(".", "\\.")}$`));
+  // `next dev` compiles a page the first time it is opened, which can take a while.
+  await expect(page).toHaveURL(new RegExp(`/providers/${PROVIDER.replace(".", "\\.")}$`), {
+    timeout: 20_000,
+  });
   await expect(page.getByTestId("agent-card")).toHaveCount(1);
 });
 

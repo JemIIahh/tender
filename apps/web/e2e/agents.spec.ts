@@ -52,7 +52,10 @@ test("agents_directory_shows_team_badge", async ({ page }) => {
   ]);
   // An agent with no provider says so; one that won nothing says that.
   await expect(card(page, "Carol Research").getByTestId("asp")).toHaveText("none");
-  await expect(card(page, "Tender Judge").getByTestId("earned")).toHaveText("Nothing yet");
+  // One that has entered and won nothing says so in one line, with no empty boxes.
+  await expect(card(page, "Tender Judge").getByTestId("agent-figures")).toHaveText(
+    "0 entries·0 reveals·0 wins·earned nothing yet",
+  );
 
   // The verifier record: how many times the agent picked, and voided after reveals.
   const judge = card(page, "Tender Judge");
