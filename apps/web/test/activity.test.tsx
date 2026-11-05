@@ -14,6 +14,8 @@ import {
   FEED_MAX,
   type FeedEvent,
   fromBacklog,
+  GROUP_MS,
+  groupLines,
   lineOf,
   mergeFeed,
   type Part,
@@ -240,6 +242,75 @@ test("activity_lines_say_what_each_event_says_with_amounts_in_the_task_s_token",
   // The feed shows only its events, and only data that fits the contract's.
   expect(lineOf(feedEvent("deposit", {}), ctx())).toBeNull();
   expect(lineOf(feedEvent("committed", { task_id: "7" }), ctx())).toBeNull();
+});
+
+test("a_run_of_one_account_s_lines_is_said_as_one_with_its_amounts_added", () => {
+  const line = (event: string, data: Record<string, unknown>, at: number, id: string) => {
+    const made = lineOf(feedEvent(event, data, { id, atMs: at }), ctx({ 7: TOKEN, 8: TOKEN }));
+    if (made === null) throw new Error(`no line for ${event}`);
+    return made;
+  };
+  const registered = (account: string, at: number, id: string) =>
+    line(
+      "agent_registered",
+      {
+        account,
+        asp: null,
+        profile_uri: "x",
+        profile_hash: "e".repeat(64),
+        tags: [],
+        updated: false,
+      },
+      at,
+      id,
+    );
+  const bonded = (account: string, at: number, id: string) =>
+    line("agent_bonded", { account, token: TOKEN, amount: "1000000" }, at, id);
+
+  // Newest first, as the feed has them: the bond, then the registration a minute before it.
+  const [one, ...rest] = groupLines([
+    bonded(ALICE, NOW_MS, "2"),
+    registered(ALICE, NOW_MS - 60_000, "1"),
+  ]);
+  expect(rest).toEqual([]);
+  expect(textOf(one?.parts ?? [])).toBe(`${ALICE} registered as an agent and locked its bond`);
+  expect(one?.amountLabel).toBe("bond");
+  expect(one?.amounts).toEqual([[TOKEN, 1_000_000n]]);
+  expect(one?.atMs).toBe(NOW_MS);
+  expect(one?.key).toBe("2+1");
+
+  // A verb said again at once is said once; three make a list.
+  const entries = groupLines([
+    line("committed", committed("9", ALICE), NOW_MS, "6"),
+    line("committed", committed("8", ALICE), NOW_MS - 1_000, "5"),
+    line("committed", committed("7", ALICE), NOW_MS - 2_000, "4"),
+  ]);
+  expect(entries.map((entry) => textOf(entry.parts))).toEqual([`${ALICE} entered #7 , #8 and #9`]);
+  // Two posts by one account: their rewards together, in their one token.
+  const posts = groupLines([
+    line("task_created", taskCreated("8"), NOW_MS, "8"),
+    line("task_created", taskCreated("7"), NOW_MS - 1_000, "7"),
+  ]);
+  expect(posts.map((post) => textOf(post.parts))).toEqual([`${BOB} posted #7 and #8`]);
+  expect(posts[0]?.amounts).toEqual([[TOKEN, 3_000_000n]]);
+
+  // Not together: another account between them, lines far apart, or amounts of two kinds.
+  expect(
+    groupLines([
+      bonded(ALICE, NOW_MS, "3"),
+      registered(BOB, NOW_MS, "2"),
+      registered(ALICE, NOW_MS, "1"),
+    ]),
+  ).toHaveLength(3);
+  expect(
+    groupLines([bonded(ALICE, NOW_MS, "2"), registered(ALICE, NOW_MS - GROUP_MS - 1, "1")]),
+  ).toHaveLength(2);
+  expect(
+    groupLines([
+      bonded(ALICE, NOW_MS, "2"),
+      line("task_created", taskCreated("9", { poster: ALICE }), NOW_MS, "1"),
+    ]),
+  ).toHaveLength(2);
 });
 
 test("activity_feed_keeps_each_event_once_newest_first_and_at_most_its_cap", () => {
