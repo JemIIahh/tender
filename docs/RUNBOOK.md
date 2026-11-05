@@ -204,6 +204,7 @@ Leave `NEXT_PUBLIC_DEV_WALLET*` unset. It works on the sandbox only.
 | 200, `ok: true`, `waiting_for_chain: true` | The services are waiting for the chain before they index: the RPC node does not answer, or is behind the database. The API still serves, and `lag_blocks` can read 0 for a node that is behind, so `lag_blocks` alone would miss this |
 | 503, `ok: false`, `error: "chain_unavailable"` | The API cannot read the chain's final height |
 | No response | The process is down |
+| 429, `error: "rate_limited"` | The monitor asks more than 300 times a minute from one address (`rateLimits.health`). The chain's height in a 200 is at most 2 seconds old: one read of the node serves every request in that time |
 
 Alert on:
 

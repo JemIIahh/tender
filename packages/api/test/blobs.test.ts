@@ -3091,6 +3091,44 @@ test("each_route_has_a_pool_of_its_own_and_the_team_is_held_to_neither", async (
   expectRefused(await brief(bob, "two"), 503, BLOBS_USED_UP, HOUR_MS);
 });
 
+test("an_entrants_result_has_a_budget_of_its_own_that_a_flood_of_other_uploads_cannot_spend", async () => {
+  // Throwaway accounts that fill the shared pool would block every other entrant's upload, and so
+  // its reveal, while the attacker's own result is stored already. An account with a commitment on
+  // a task that has not revealed and whose reveals are still open uploads its result from a budget
+  // of its own: the most bytes the task's brief lets a result have (the captured brief: 4096).
+  await seed();
+  await openTask(2, REVEAL_DEADLINE, [carol, alice], { brief_hash: FIXTURE_BRIEF_HASH });
+  const size = briefOf("one").length;
+  const app = appWith({ rateLimits: { blobBytesTotal: { limit: size, windowMs: HOUR_MS } } });
+  const brief = (account: string, title: string) =>
+    post<ErrorBody>("/v1/blobs", blobBody("brief", briefOf(title)), account, app);
+  const result = (account: string, content: string | Uint8Array, taskId = "2") =>
+    post<ErrorBody>("/v1/blobs", resultBody(content, taskId), account, app);
+
+  // Bob's brief takes the whole pool: the next new upload to the route by anyone is a 503.
+  expect((await brief(bob, "one")).status).toBe(200);
+  expectRefused(await brief(poster, "two"), 503, BLOBS_USED_UP, HOUR_MS);
+
+  // Carol's result goes up all the same, and so does alice's, each from its own budget.
+  expect((await result(carol, "the answer is 42")).status).toBe(200);
+  expect((await result(alice, "the answer is 41")).status).toBe(200);
+  expect(await uploadsOf(sha256Hex("the answer is 42"))).toEqual([
+    { task_id: "2", account: carol },
+  ]);
+
+  // The budget is the brief's limit for each entrant and task: past it, the pool again.
+  expect((await result(carol, new Uint8Array(4096 - 16).fill(97))).status).toBe(200);
+  expectRefused(await result(carol, "one byte too many"), 503, BLOBS_USED_UP, HOUR_MS);
+
+  // Once alice has revealed, her uploads for the task are the pool's like anyone's.
+  await reveal(2, alice, "the answer is 41");
+  expectRefused(await result(alice, "a second thought"), 503, BLOBS_USED_UP, HOUR_MS);
+
+  // An entry whose reveals are over has no budget of its own either.
+  await openTask(3, TEST_NOW, [carol]);
+  expectRefused(await result(carol, "too late", "3"), 503, BLOBS_USED_UP, HOUR_MS);
+});
+
 test("bytes_that_are_stored_already_cost_nothing", async () => {
   await seed();
   const size = briefOf("one").length;
