@@ -196,7 +196,8 @@ test("stepper_shows_the_step_a_person_picks_with_its_fields", async () => {
   const panel = screen.getByTestId("step-panel");
   expect(panel.textContent).toContain("In escrow");
   expect(panel.textContent).toContain("Commit · reveal · pick");
-  expect(panel.textContent).toContain("Judge or poster");
+  // The verifier is any account the poster names, and the poster picks when it does not in time.
+  expect(panel.textContent).toContain("Any account; poster as fallback");
 
   await user.click(screen.getByRole("tab", { name: "Judged" }));
   expect(screen.getByRole("tab", { name: "Judged" }).getAttribute("aria-selected")).toBe("true");
@@ -288,7 +289,7 @@ function fakeContext() {
   return context;
 }
 
-test("art_draws_one_still_frame_and_never_runs_with_reduced_motion", () => {
+test("art_draws_one_still_frame_and_never_runs_with_reduced_motion", async () => {
   reducedMotion(true);
   const context = fakeContext();
   const frame = vi.fn(() => 1);
@@ -297,11 +298,13 @@ test("art_draws_one_still_frame_and_never_runs_with_reduced_motion", () => {
 
   render(<DitherArt art="hero" wide={{ x: 0.5, y: 0.5, scale: 0.4 }} />);
 
-  expect(context.puts).toBeGreaterThan(0);
+  // The canvas is there at once; what plays it comes in a chunk of its own, after the page.
+  expect(screen.getByTestId("art-hero").tagName).toBe("CANVAS");
+  await waitFor(() => expect(context.puts).toBeGreaterThan(0));
   expect(frame).not.toHaveBeenCalled();
 });
 
-test("art_runs_while_seen_and_stops_when_the_tab_is_hidden", () => {
+test("art_runs_while_seen_and_stops_when_the_tab_is_hidden", async () => {
   reducedMotion(false);
   fakeContext();
   const frame = vi.fn(() => 7);
@@ -312,7 +315,7 @@ test("art_runs_while_seen_and_stops_when_the_tab_is_hidden", () => {
   vi.spyOn(Document.prototype, "visibilityState", "get").mockImplementation(() => visibility);
 
   const { unmount } = render(<DitherArt art="escrow" wide={{ x: 0.5, y: 0.5, scale: 0.4 }} />);
-  expect(frame).toHaveBeenCalledTimes(1);
+  await waitFor(() => expect(frame).toHaveBeenCalledTimes(1));
 
   visibility = "hidden";
   fireEvent(document, new Event("visibilitychange"));

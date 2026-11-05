@@ -1,18 +1,27 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import { Dither, type Focus, showAt } from "../../lib/dither";
-import { ARTS, type ArtName } from "../../lib/scenes";
+import dynamic from "next/dynamic";
+import { useRef } from "react";
+import type { Focus } from "../../lib/dither";
+import type { ArtName } from "../../lib/scenes";
 
-/** Frames a second at most: the art is coarse, and more would only cost battery. */
-const FPS = 24;
+/**
+ * What plays the art (the scenes, the dither and the frames), in a chunk of its own: the art is
+ * decoration, and its code is not needed to draw the page. Until it is in, the canvas is clear and
+ * the ground shows through it; its box is there from the first paint, so nothing moves when it
+ * comes.
+ */
+const DitherPlayer = dynamic(() => import("./DitherPlayer").then((module) => module.DitherPlayer), {
+  ssr: false,
+});
 
 /**
  * A canvas that plays one of the landing's arts (lib/scenes.ts), dithered. The canvas holds one
  * pixel per `cell` CSS pixels and the browser scales it up with hard edges, so a frame is small.
  *
  * It runs only while it is on screen and the tab is in view. With reduced motion asked for, it
- * draws one frame, `still` seconds into the show, and stops there.
+ * draws one frame, `still` seconds into the show, and stops there (components/landing/
+ * DitherPlayer.tsx, which comes after the page).
  */
 export function DitherArt({
   art,
@@ -39,111 +48,6 @@ export function DitherArt({
   className?: string;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
-  // Numbers, so that a new object with the same values does not start the show again.
-  const { x: wx, y: wy, scale: ws } = wide;
-  const { x: nx, y: ny, scale: ns } = narrow;
-
-  useEffect(() => {
-    const canvas = ref.current;
-    const context = canvas?.getContext("2d");
-    if (!canvas || !context) return;
-    const scenes = ARTS[art]();
-    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)");
-    const wideFocus = { x: wx, y: wy, scale: ws };
-    const narrowFocus = { x: nx, y: ny, scale: ns };
-
-    let buffer: { dither: Dither; image: ImageData; focus: Focus } | null = null;
-    // A show of several scenes starts with the first one coming in.
-    let clock = scenes.length > 1 ? -change : 0;
-    let frame = 0;
-    let last = 0;
-    let onScreen = true;
-    // A small tear now and then, while no change of scene is under way.
-    let nextTear = 3;
-
-    const draw = () => {
-      if (!buffer) return;
-      const at = reduce?.matches ? still : clock;
-      const show = showAt(at, scenes.length, hold, change);
-      const scene = scenes[show.index];
-      if (!scene) return;
-      scene.frame(show.time);
-      const from = show.from === undefined ? undefined : scenes[show.from.index];
-      from?.frame(show.from?.time ?? 0);
-      let tear = from ? 0.12 * Math.sin(Math.PI * show.mix) : 0;
-      if (!from && at > nextTear) {
-        tear = 0.03;
-        if (at > nextTear + 0.12) nextTear = at + 2.5 + Math.random() * 3;
-      }
-      if (reduce?.matches) tear = 0;
-      buffer.dither.draw(scene, buffer.focus, { from, mix: show.mix, tear });
-      context.putImageData(buffer.image, 0, 0);
-    };
-
-    const size = () => {
-      const { width, height } = canvas.getBoundingClientRect();
-      const pixel = width < 640 ? Math.max(2, cell - 1) : cell;
-      const w = Math.max(16, Math.round(width / pixel));
-      const h = Math.max(16, Math.round(height / pixel));
-      const focus = width > height * 1.25 ? wideFocus : narrowFocus;
-      if (buffer?.dither.width === w && buffer.dither.height === h && buffer.focus === focus)
-        return;
-      canvas.width = w;
-      canvas.height = h;
-      const image = context.createImageData(w, h);
-      buffer = { dither: new Dither(w, h, new Uint32Array(image.data.buffer)), image, focus };
-      draw();
-    };
-
-    const tick = (now: number) => {
-      frame = requestAnimationFrame(tick);
-      const elapsed = now - last;
-      if (elapsed < 1000 / FPS - 2) return;
-      last = now;
-      // A long gap (a frame the browser held back) moves the show on by one frame, not by the gap.
-      clock += Math.min(elapsed, 100) / 1000;
-      draw();
-    };
-    const stop = () => {
-      cancelAnimationFrame(frame);
-      frame = 0;
-    };
-    const run = () => {
-      if (reduce?.matches || !onScreen || document.visibilityState !== "visible") {
-        stop();
-        draw();
-        return;
-      }
-      if (frame === 0) {
-        last = performance.now();
-        frame = requestAnimationFrame(tick);
-      }
-    };
-
-    size();
-    const resized = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(size);
-    resized?.observe(canvas);
-    const seen =
-      typeof IntersectionObserver === "undefined"
-        ? null
-        : new IntersectionObserver(([entry]) => {
-            onScreen = entry?.isIntersecting ?? true;
-            run();
-          });
-    seen?.observe(canvas);
-    document.addEventListener("visibilitychange", run);
-    reduce?.addEventListener?.("change", run);
-    run();
-
-    return () => {
-      stop();
-      resized?.disconnect();
-      seen?.disconnect();
-      document.removeEventListener("visibilitychange", run);
-      reduce?.removeEventListener?.("change", run);
-    };
-  }, [art, cell, wx, wy, ws, nx, ny, ns, hold, change, still]);
-
   return (
     <div aria-hidden="true" className={className}>
       <canvas
@@ -151,6 +55,16 @@ export function DitherArt({
         data-testid={`art-${art}`}
         className="block size-full"
         style={{ imageRendering: "pixelated" }}
+      />
+      <DitherPlayer
+        canvas={ref}
+        art={art}
+        cell={cell}
+        wide={wide}
+        narrow={narrow}
+        hold={hold}
+        change={change}
+        still={still}
       />
     </div>
   );

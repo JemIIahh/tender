@@ -5,7 +5,8 @@ import { useLoad } from "../lib/useLoad";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
 import { ProviderCard } from "./ProviderCard";
-import { CARD, EYEBROW } from "./ui";
+import { CardsSkeleton } from "./Skeleton";
+import { CARD } from "./ui";
 
 // The provider directory: the accounts that run agents as sub-accounts of their own, each with its
 // agents and their combined record. It is the agent directory's list (components/AgentDirectory),
@@ -27,9 +28,12 @@ export function ProviderDirectory() {
         faked.
       </PageHead>
       {state.status === "idle" || state.status === "loading" ? (
-        <p role="status" className={EYEBROW}>
-          Loading providers…
-        </p>
+        <>
+          <p role="status" className="sr-only">
+            Loading providers…
+          </p>
+          <CardsSkeleton count={6} />
+        </>
       ) : state.status === "error" ? (
         <ErrorState message={state.message} retrying={state.retrying} onRetry={retry} />
       ) : state.data.providers.length === 0 ? (

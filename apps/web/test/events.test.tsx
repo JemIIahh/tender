@@ -1,7 +1,7 @@
 import { act, render, renderHook } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { connectEvents, useEvents, useEventsBy } from "../lib/events";
+import { connectEvents, listenToEvents, useEvents, useEventsBy } from "../lib/events";
 import { committedData, EVENT_NAMES, FakeEventSource, message } from "./fakeEventSource";
 
 // The stream of `GET /v1/events` over a stand-in for the browser's EventSource. vitest.config.ts
@@ -686,4 +686,160 @@ test("use_events_keep_one_open_stream_under_strict_mode", () => {
   // Strict mode mounts, unmounts and mounts again: the first stream is closed, one is left open.
   const open = FakeEventSource.instances.filter((s) => s.readyState !== FakeEventSource.CLOSED);
   expect(open).toHaveLength(1);
+});
+
+// ---- One stream for the tab -------------------------------------------------------------------
+
+/** A component that counts the events about task `id`. */
+function Counter({ id, testId }: { id: string; testId: string }) {
+  const count = useEvents((event) => event.task_id === id);
+  return <span data-testid={testId}>{count}</span>;
+}
+
+test("events_are_one_stream_for_the_tab_however_many_parts_listen", () => {
+  const first = render(<Counter id="7" testId="seven" />);
+  const second = render(<Counter id="8" testId="eight" />);
+  const third = renderHook(() => useEventsBy(["any"] as const, () => "any"));
+  expect(FakeEventSource.instances).toHaveLength(1);
+
+  const source = FakeEventSource.latest;
+  act(() => source.send("committed", message("committed", "7", committedData("7")), "1"));
+  act(() => source.send("committed", message("committed", "8", committedData("8")), "2"));
+  expect(first.getByTestId("seven").textContent).toBe("1");
+  expect(second.getByTestId("eight").textContent).toBe("1");
+  expect(third.result.current.any).toBe(2);
+
+  // A part that goes leaves the stream to the others; the last one to go closes it.
+  first.unmount();
+  third.unmount();
+  expect(source.readyState).not.toBe(FakeEventSource.CLOSED);
+  act(() => source.send("committed", message("committed", "8", committedData("8")), "3"));
+  expect(second.getByTestId("eight").textContent).toBe("2");
+  second.unmount();
+  expect(source.readyState).toBe(FakeEventSource.CLOSED);
+  expect(FakeEventSource.instances).toHaveLength(1);
+});
+
+test("events_hand_a_part_that_joins_with_an_id_what_came_after_it", () => {
+  // The stream is opened from id 10 (a page that read a backlog up to it), and hears 11 and 12.
+  const opener = listenToEvents({ onEvent: () => {}, onResync: () => {} }, { since: "10" });
+  const source = FakeEventSource.latest;
+  act(() => {
+    source.open();
+    source.send("committed", message("committed", "7", committedData("7")), "11");
+    source.send("committed", message("committed", "8", committedData("8")), "12");
+  });
+
+  // A part that read up to 11 joins: it is handed 12, and nothing is opened.
+  const seen: Array<string | undefined> = [];
+  const resyncs = vi.fn();
+  const joiner = listenToEvents(
+    { onEvent: () => {}, onResync: resyncs, onMessage: (whole) => seen.push(whole.id) },
+    { since: "11" },
+  );
+  expect(seen).toEqual(["12"]);
+  expect(resyncs).not.toHaveBeenCalled();
+  expect(FakeEventSource.instances).toHaveLength(1);
+  act(() => source.send("committed", message("committed", "7", committedData("7")), "13"));
+  expect(seen).toEqual(["12", "13"]);
+
+  // One that read up to 9 can't be handed 10: the stream began after it, so it is told to look
+  // again, after it is handed what the stream has.
+  const behind = vi.fn();
+  const older: Array<string | undefined> = [];
+  listenToEvents(
+    { onEvent: () => {}, onResync: behind, onMessage: (whole) => older.push(whole.id) },
+    { since: "9" },
+  ).close();
+  expect(older).toEqual(["11", "12", "13"]);
+  expect(behind).toHaveBeenCalledTimes(1);
+
+  joiner.close();
+  opener.close();
+  expect(source.readyState).toBe(FakeEventSource.CLOSED);
+});
+
+test("events_hand_each_listener_a_message_once_and_one_that_fails_stops_no_other", () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  // A page opens the stream from id 10 and fails on every message.
+  listenToEvents(
+    {
+      onEvent: () => {
+        throw new Error("a part that fails");
+      },
+      onResync: () => {},
+    },
+    { since: "10" },
+  );
+  const source = FakeEventSource.latest;
+  // Another joins having read up to 12 already, before the stream has sent anything.
+  const seen: Array<string | undefined> = [];
+  listenToEvents(
+    { onEvent: () => {}, onResync: () => {}, onMessage: (whole) => seen.push(whole.id) },
+    { since: "12" },
+  );
+
+  // The stream then sends what came after 10: the second part is handed only 13, once.
+  act(() => {
+    source.open();
+    for (const id of ["11", "12", "13"]) {
+      source.send("committed", message("committed", "7", committedData("7")), id);
+    }
+    source.send("committed", message("committed", "7", committedData("7")), "13");
+  });
+  expect(seen).toEqual(["13"]);
+});
+
+test("events_follow_the_stream_when_its_ids_go_back_after_the_api_s_database_started_over", () => {
+  // A page has heard up to 500. The API's database starts over, and the API begins the stream at
+  // its new newest id, so the next ids are lower: the page hears them, and is told to look again.
+  const seen: Array<string | undefined> = [];
+  const resyncs = vi.fn();
+  listenToEvents({
+    onEvent: () => {},
+    onResync: resyncs,
+    onMessage: (whole) => seen.push(whole.id),
+  });
+  const source = FakeEventSource.latest;
+  act(() => {
+    source.open();
+    source.send("committed", message("committed", "7", committedData("7")), "500");
+  });
+  expect(resyncs).toHaveBeenCalledTimes(1);
+
+  act(() => source.send("committed", message("committed", "8", committedData("8")), "31"));
+  expect(seen).toEqual(["500", "31"]);
+  expect(resyncs).toHaveBeenCalledTimes(2);
+  // From there on the new ids are followed, each once.
+  act(() => {
+    source.send("committed", message("committed", "8", committedData("8")), "32");
+    source.send("committed", message("committed", "8", committedData("8")), "32");
+  });
+  expect(seen).toEqual(["500", "31", "32"]);
+
+  // A part that joins now, having read up to 31 of the new database, is handed 32: what was kept
+  // from the old one is gone.
+  const joined: Array<string | undefined> = [];
+  listenToEvents(
+    { onEvent: () => {}, onResync: () => {}, onMessage: (whole) => joined.push(whole.id) },
+    { since: "31" },
+  );
+  expect(joined).toEqual(["32"]);
+});
+
+test("events_opened_after_an_id_follow_lower_ids_when_the_database_started_over", () => {
+  // Opened after 12 (a backlog the page read), and the database started over below it.
+  const seen: Array<string | undefined> = [];
+  const resyncs = vi.fn();
+  listenToEvents(
+    { onEvent: () => {}, onResync: resyncs, onMessage: (whole) => seen.push(whole.id) },
+    { since: "12" },
+  );
+  const source = FakeEventSource.latest;
+  act(() => {
+    source.open();
+    source.send("committed", message("committed", "7", committedData("7")), "4");
+  });
+  expect(seen).toEqual(["4"]);
+  expect(resyncs).toHaveBeenCalledTimes(1);
 });

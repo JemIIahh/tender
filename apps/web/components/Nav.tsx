@@ -230,6 +230,9 @@ function NavLink({
   return (
     <Link
       href={href}
+      // Every page of the sidebar is fetched ahead as its link comes into view (a production build
+      // only): each is a static page, so it comes whole, and a press on it shows it at once.
+      prefetch
       aria-label={label}
       aria-current={href === current ? "page" : undefined}
       {...tip?.(label)}

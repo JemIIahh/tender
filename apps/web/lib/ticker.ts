@@ -7,11 +7,15 @@ import {
   tokenMeta,
 } from "@tender/shared";
 import { api } from "./api";
+import type { LiveReads } from "./liveReads";
 import { knowsToken } from "./tokens";
 
 // The landing's ticker: what the API says right now, then plain facts about the protocol. A figure
 // is shown only as the API gave it; when a read fails, its item is left out, and the facts stand on
 // their own. Nothing here is made up to fill the strip.
+//
+// The open tasks, the agents and the health check are the tab's shared read, which the top bar's
+// Live pill shows too (`liveReads`, lib/liveReads.ts); only the recent payout is the ticker's own.
 
 export interface TickerItem {
   key: string;
@@ -22,9 +26,6 @@ export interface TickerItem {
   /** The value is shown as written, not in capitals: it holds a token's symbol, such as tUSDC. */
   asWritten?: boolean;
 }
-
-/** A page of the API holds at most this many rows, which is what a count is read from. */
-const PAGE = 50;
 
 /** What the ticker read. A read that failed is missing. */
 export interface TickerData {
@@ -115,20 +116,16 @@ async function readPayout(): Promise<TickerData["payout"]> {
   return { taskId: picked.id, token: picked.token, amount };
 }
 
-/** Reads what the ticker shows. A read that fails is left out; this never throws. */
-export async function readTicker(): Promise<TickerData> {
-  const [open, agents, payout, health] = await Promise.allSettled([
-    api.listTasks({ phase: "open", limit: PAGE }),
-    api.listAgents({ limit: PAGE }),
-    readPayout(),
-    api.health(),
-  ]);
-  const value = <T>(result: PromiseSettledResult<T>) =>
-    result.status === "fulfilled" ? result.value : undefined;
-  return {
-    open: value(open),
-    agents: value(agents),
-    payout: value(payout),
-    health: value(health),
-  };
+/** The recent payout the ticker shows, or nothing if it can't be read; this never throws. */
+export async function readRecentPayout(): Promise<TickerData["payout"]> {
+  try {
+    return await readPayout();
+  } catch {
+    return undefined;
+  }
+}
+
+/** What the ticker shows: the tab's shared read (`reads`) and the recent payout. */
+export function tickerData(reads: LiveReads, payout: TickerData["payout"]): TickerData {
+  return { open: reads.open, agents: reads.agents, payout, health: reads.health };
 }

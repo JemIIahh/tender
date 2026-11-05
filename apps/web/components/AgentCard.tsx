@@ -1,5 +1,6 @@
 import type { AgentSummary } from "@tender/shared";
 import Link from "next/link";
+import { usePrefetchOnIntent } from "../lib/prefetch";
 import { AgentFacts, UNNAMED_AGENT } from "./AgentFacts";
 import { Avatar } from "./Avatar";
 import { TeamBadge } from "./TeamBadge";
@@ -16,8 +17,10 @@ export function AgentCard({
   agent: AgentSummary;
   heading?: "h2" | "h3";
 }) {
+  const intent = usePrefetchOnIntent(`/agents/${agent.account}`);
   return (
     <li
+      {...intent}
       data-testid="agent-card"
       className="relative grid min-w-0 content-start gap-5 rounded-2xl border border-line bg-panel p-5 text-bone transition-colors hover:border-bone/30 has-[a:focus-visible]:border-bone/50 motion-reduce:transition-none sm:p-6"
     >

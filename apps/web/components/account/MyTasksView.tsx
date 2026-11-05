@@ -9,13 +9,15 @@ import { deadlineLine } from "../../lib/card";
 import { nowNs as clockNs, useNowNs } from "../../lib/clock";
 import { type NextStep, nextStep, readHires, readToPick } from "../../lib/myTasks";
 import { phaseOfTask } from "../../lib/phase";
+import { scrollCue } from "../../lib/scrollCue";
 import { type Loaded, useLoad } from "../../lib/useLoad";
 import { useWallet } from "../../lib/wallet";
 import { Amount } from "../Amount";
 import { ErrorState } from "../ErrorState";
 import { PageHead } from "../PageHead";
 import { PhaseChip } from "../PhaseChip";
-import { CARD, EYEBROW, PRIMARY, SECONDARY } from "../ui";
+import { RowsSkeleton } from "../SkeletonLists";
+import { CARD, PRIMARY, SCROLL_CUE, SECONDARY } from "../ui";
 import { Cell, ConnectGate, ROW, Rows, TaskCell } from "./parts";
 
 // My tasks: what the connected account posted, what it has to pick, and the hires it made of a
@@ -147,10 +149,15 @@ function Panel({
       </div>
     );
   }
+  // The rows' shapes where the rows will be (components/Skeleton.tsx), and the words for a screen
+  // reader.
   return (
-    <p role="status" className={`${EYEBROW} p-6`}>
-      {loading}
-    </p>
+    <div className="relative grid">
+      <p role="status" className="sr-only">
+        {loading}
+      </p>
+      <RowsSkeleton rows={2} />
+    </div>
   );
 }
 
@@ -220,7 +227,8 @@ function Account({ account }: { account: string }) {
           role="tablist"
           aria-label="Your tasks"
           onKeyDown={onKeyDown}
-          className="-mb-px flex max-w-full gap-5 overflow-x-auto sm:gap-7"
+          ref={scrollCue}
+          className={`-mb-px flex max-w-full gap-5 overflow-x-auto sm:gap-7 ${SCROLL_CUE}`}
         >
           {TABS.map((candidate) => (
             <button

@@ -9,7 +9,8 @@ import { errorMessage } from "../lib/errors";
 import { AgentCard } from "./AgentCard";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
-import { CARD, EYEBROW } from "./ui";
+import { CardsSkeleton, ChipsSkeleton } from "./Skeleton";
+import { CARD } from "./ui";
 
 // The agent directory: who competes on Tender, what they have done and what they earned, and which
 // of them the Tender team runs. The filter is a tag, and it is in the address (`/agents?tag=...`),
@@ -168,9 +169,13 @@ export function AgentDirectory({ maxPages = MAX_PAGES }: { maxPages?: number } =
         Who competes on Tender, what they have won, and which of them the Tender team runs.
       </PageHead>
       {directory.status === "loading" ? (
-        <p role="status" className={EYEBROW}>
-          Loading agents…
-        </p>
+        <>
+          <p role="status" className="sr-only">
+            Loading agents…
+          </p>
+          <ChipsSkeleton />
+          <CardsSkeleton count={6} />
+        </>
       ) : directory.status === "error" ? (
         <ErrorState message={directory.message} retrying={directory.retrying} onRetry={load} />
       ) : (

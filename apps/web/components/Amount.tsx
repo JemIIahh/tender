@@ -66,9 +66,12 @@ const TAIL_DIGITS = 6;
  * The number is one run of figures that never wraps. On a line too narrow for all of it, it is cut
  * in the middle, visibly: its first digits as far as they fit, a "…", and always its last six. It
  * is never cut off silently at the line's edge, where the digits that are left would read as
- * another number. The "…" is drawn by CSS (`text-overflow`): every digit stays in the page, so a
- * screen reader reads the whole number, and so does the tooltip (`title`). The whole id is the
- * label's title, and is what a screen reader reads of it.
+ * another number. The "…" is drawn by CSS (`text-overflow`), and every digit stays in the page and
+ * in the tooltip (`title`). The cut is for the eye only: its two parts are hidden from a screen
+ * reader, which reads the whole number once, as one text, from a copy it alone is given. That copy
+ * can't be selected, and the two parts sit in one line (inline blocks, not flex items, which a copy
+ * would part with a line break), so what a person copies is the number once, whole. The whole id
+ * is the label's title, and is what a screen reader reads of it.
  */
 export function RawUnits({
   value,
@@ -89,18 +92,27 @@ export function RawUnits({
   return (
     <span className="grid min-w-0 gap-0.5">
       <span className="flex min-w-0 font-mono tabular-nums">
-        {label === undefined ? null : <span className="sr-only">{label} </span>}
+        {/* Words and a whole number for a screen reader only, which a copy leaves out. */}
+        {label === undefined ? null : <span className="sr-only select-none">{label} </span>}
+        {/* A number in two parts could be read as two numbers: the screen reader has it whole. */}
+        {cut ? <span className="sr-only select-none">{value}</span> : null}
         <span
           data-testid={amountTestId}
           title={value}
-          className="flex max-w-full min-w-0 whitespace-nowrap"
+          aria-hidden={cut ? true : undefined}
+          className="block max-w-full min-w-0 whitespace-nowrap"
         >
           {cut ? (
             <>
-              <span data-testid="raw-head" className="min-w-0 overflow-hidden text-ellipsis">
+              {/* The head takes what the line has left after the tail's six figures (a figure is
+                  1ch in mono), and gives way with a "…". */}
+              <span
+                data-testid="raw-head"
+                className="inline-block max-w-[calc(100%-6ch)] overflow-hidden align-bottom text-ellipsis"
+              >
                 {value.slice(0, -TAIL_DIGITS)}
               </span>
-              <span className="shrink-0">{value.slice(-TAIL_DIGITS)}</span>
+              <span className="inline-block align-bottom">{value.slice(-TAIL_DIGITS)}</span>
             </>
           ) : (
             value

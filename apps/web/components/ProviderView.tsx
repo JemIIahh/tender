@@ -11,6 +11,8 @@ import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
 import { FLEET_HEAD } from "./ProviderDirectory";
 import { ProviderServices } from "./ProviderServices";
+import { CardsSkeleton } from "./Skeleton";
+import { StatsSkeleton } from "./SkeletonLists";
 import { TeamLabel } from "./TeamBadge";
 import { CARD, EYEBROW, PANEL_TITLE } from "./ui";
 
@@ -167,9 +169,13 @@ export function ProviderView({ account }: { account: string }) {
         <Head account={account} isTeam={fleet?.isTeam ?? false} />
       </div>
       {state.status === "idle" || state.status === "loading" ? (
-        <p role="status" className={EYEBROW}>
-          Loading its agents…
-        </p>
+        <>
+          <p role="status" className="sr-only">
+            Loading its agents…
+          </p>
+          <StatsSkeleton count={3} columns={3} />
+          <CardsSkeleton />
+        </>
       ) : state.status === "error" ? (
         <ErrorState message={state.message} retrying={state.retrying} onRetry={retry} />
       ) : fleet === null || fleet.agents.length === 0 ? (

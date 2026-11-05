@@ -101,6 +101,28 @@ test("live_pill_is_the_dot_alone_on_a_phone_and_its_panel_fits", async ({ page }
   expect(box?.width).toBeCloseTo(375 - 32, 0);
   expect(box?.y ?? 0).toBeGreaterThanOrEqual(64);
   expect(await fits()).toBe(0);
+  // It is placed against the screen, 4.5rem from its top, and not against the top bar: no box
+  // around it is one that a fixed part is placed in (a transform, a filter or a backdrop filter
+  // makes one), so it stays where it is whatever the bar's look.
+  expect(box?.y).toBeCloseTo(72, 0);
+  const holders = await panel(page).evaluate((element) => {
+    const found: string[] = [];
+    for (let at = element.parentElement; at !== null; at = at.parentElement) {
+      const style = getComputedStyle(at);
+      if (
+        style.transform !== "none" ||
+        style.filter !== "none" ||
+        style.backdropFilter !== "none" ||
+        style.perspective !== "none" ||
+        /paint|layout|strict|content/.test(style.contain) ||
+        /transform|filter|perspective/.test(style.willChange)
+      ) {
+        found.push(`${at.tagName.toLowerCase()}.${at.className}`);
+      }
+    }
+    return found;
+  });
+  expect(holders).toEqual([]);
   await page.keyboard.press("Escape");
   await expect(panel(page)).toBeHidden();
   await expect(pill(page)).toBeFocused();

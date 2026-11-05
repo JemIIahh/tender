@@ -1,4 +1,5 @@
 import type { Scene, Shade } from "./dither";
+import { FLEET } from "./fleet";
 
 // The landing's scenes, from Tender's own world: an envelope handed in and sealed, a scale that
 // weighs the entries, coins paid onto a stack, a vault, a scorecard being ticked, and a signal
@@ -417,16 +418,6 @@ export function signalScene(): Scene {
 }
 
 // ---- Fleet: a provider's account and the agents it runs, each a sub-account with its bond ------
-
-/**
- * Where the fleet's parts are, in art units: the provider's account at the top left, and its three
- * agents down a line from it, each joined to it by a branch. The landing puts the accounts' names
- * beside these points (app/page.tsx, `FleetArt`), so they are exported.
- */
-export const FLEET = {
-  provider: { x: -1.55, y: -1.5, half: 0.3 },
-  agents: { x: -0.7, ys: [-0.42, 0.43, 1.28], half: 0.2 },
-} as const;
 
 /**
  * Signals go from the provider down the line and along each branch in turn; where one lands, the

@@ -16,14 +16,17 @@ import {
 import { ErrorState } from "../../../components/ErrorState";
 import { PageHead } from "../../../components/PageHead";
 import { PHASE_LABELS } from "../../../components/PhaseChip";
+import { CARD_GRID, CardsSkeleton } from "../../../components/Skeleton";
 import { StillArt } from "../../../components/StillArt";
 import { TaskCard } from "../../../components/TaskCard";
-import { CARD, FIELD, PRIMARY, SECONDARY } from "../../../components/ui";
+import { CARD, FIELD, PRIMARY, SCROLL_CUE, SECONDARY } from "../../../components/ui";
 import { api } from "../../../lib/api";
 import { featuredTaskId } from "../../../lib/card";
 import { useNowNs } from "../../../lib/clock";
 import { config } from "../../../lib/config";
 import { errorMessage } from "../../../lib/errors";
+import { scrollCue } from "../../../lib/scrollCue";
+import RouteLoading from "./loading";
 
 // The board: the tasks the API lists, newest first, which a person narrows by the phase a task is
 // in and by a tag, and reads on from page to page. A task in its fallback window, or past it, is
@@ -101,39 +104,17 @@ function NoMoreTasks() {
 }
 
 /** The grid of cards: one column on a phone, two on a tablet, three on a wide screen. */
-const GRID = "grid gap-4 sm:grid-cols-2 xl:grid-cols-3";
+const GRID = CARD_GRID;
 
-/** A card's place while the tasks load: its outline and nothing in it yet. */
-function CardPlaceholder() {
-  const bar = "rounded-full bg-raised";
-  return (
-    <li className={`${CARD} flex min-h-64 flex-col p-5 sm:p-6`}>
-      <div className="flex justify-between">
-        <span className={`${bar} h-5 w-20`} />
-        <span className={`${bar} h-5 w-24`} />
-      </div>
-      <span className={`${bar} mt-6 h-3 w-1/3`} />
-      <span className={`${bar} mt-3 h-5 w-4/5`} />
-      <span className={`${bar} mt-2 h-5 w-3/5`} />
-      <div className="mt-auto flex items-center gap-3 border-t border-line pt-4">
-        <span className={`${bar} size-[34px]`} />
-        <span className={`${bar} h-3 w-32`} />
-        <span className={`${bar} ml-auto size-10`} />
-      </div>
-    </li>
-  );
-}
-
-/** The board while it loads: the words for a screen reader and the eye, over empty cards. */
+/**
+ * The board while it loads: the cards' shapes where the cards will be (components/Skeleton.tsx, as
+ * the route's loading.tsx draws them), and the words for a screen reader.
+ */
 function Loading() {
   return (
-    <div role="status" className="grid gap-4">
-      <p className="font-mono text-[11px] tracking-[0.14em] text-muted uppercase">Loading tasks…</p>
-      <ul aria-hidden="true" className={GRID}>
-        <CardPlaceholder />
-        <CardPlaceholder />
-        <CardPlaceholder />
-      </ul>
+    <div role="status" className="relative grid">
+      <p className="sr-only">Loading tasks…</p>
+      <CardsSkeleton />
     </div>
   );
 }
@@ -351,8 +332,12 @@ function BoardView() {
 
       <div className="grid gap-4">
         <div className="flex flex-wrap items-end gap-x-8 gap-y-4 border-b border-line">
-          {/* The phases, as tabs. Each is a toggle that the address holds, and not a tab panel. */}
-          <fieldset className="-mb-px flex max-w-full min-w-0 gap-5 overflow-x-auto sm:gap-7">
+          {/* The phases, as tabs. Each is a toggle that the address holds, and not a tab panel. On
+              a narrow phone they scroll, with the edge faded while there are more (`SCROLL_CUE`). */}
+          <fieldset
+            ref={scrollCue}
+            className={`-mb-px flex max-w-full min-w-0 gap-5 overflow-x-auto sm:gap-7 ${SCROLL_CUE}`}
+          >
             <legend className="sr-only">Phase</legend>
             {[undefined, ...CHIP_PHASES].map((chip) => (
               <button
@@ -425,13 +410,7 @@ function BoardView() {
 // built ahead of time can only do under a Suspense boundary.
 export default function Board() {
   return (
-    <Suspense
-      fallback={
-        <p role="status" className="font-mono text-[11px] tracking-[0.14em] text-muted uppercase">
-          Loading tasks…
-        </p>
-      }
-    >
+    <Suspense fallback={<RouteLoading />}>
       <BoardView />
     </Suspense>
   );

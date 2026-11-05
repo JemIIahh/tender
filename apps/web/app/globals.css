@@ -91,6 +91,33 @@ html:has(.app) {
   animation: caret 1s steps(1) infinite;
 }
 
+/* A shape that holds the place of what is still loading (components/Skeleton.tsx): the raised grey
+   of a panel's parts, with a faint light that passes over it, slowly, when motion is welcome. */
+.skeleton {
+  background-color: var(--color-raised);
+}
+@keyframes skeleton {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0 0;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .skeleton {
+    background-image: linear-gradient(
+      90deg,
+      transparent 33%,
+      color-mix(in srgb, var(--color-bone) 5%, transparent) 50%,
+      transparent 67%
+    );
+    background-size: 300% 100%;
+    background-repeat: no-repeat;
+    animation: skeleton 1.8s ease-in-out infinite;
+  }
+}
+
 /* Reduced motion: nothing moves. The ticker can be scrolled by hand instead. */
 @media (prefers-reduced-motion: reduce) {
   .ticker-rail,
@@ -99,5 +126,10 @@ html:has(.app) {
   }
   .ticker-viewport {
     overflow-x: auto;
+  }
+  /* Scrolled by hand, the strip fades at its right edge while there is more past it, as the app's
+     other sideways rows do (lib/scrollCue.ts says when). */
+  .ticker-viewport[data-more="true"] {
+    mask-image: linear-gradient(to right, black calc(100% - 2.5rem), transparent);
   }
 }

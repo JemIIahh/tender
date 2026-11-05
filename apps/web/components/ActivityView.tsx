@@ -18,14 +18,16 @@ import {
   tokensPosted,
 } from "../lib/activity";
 import { api } from "../lib/api";
-import { connectEvents } from "../lib/events";
+import { listenToEvents } from "../lib/events";
+import { scrollCue } from "../lib/scrollCue";
 import { knowsToken } from "../lib/tokens";
 import { useLoad } from "../lib/useLoad";
 import { useWallet } from "../lib/wallet";
 import { Amount, RawUnits } from "./Amount";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
-import { CARD, EYEBROW, TEXT_LINK } from "./ui";
+import { FeedSkeleton } from "./SkeletonLists";
+import { CARD, SCROLL_CUE, TEXT_LINK } from "./ui";
 
 // Activity: what happens on Tender, one plain line an event, newest first. The page reads the API's
 // backlog of recent events once, then follows the event stream from the newest of them (the same
@@ -213,20 +215,26 @@ function useFetchedTokens(feed: readonly FeedEvent[], posted: ReadonlyMap<string
   return fetched;
 }
 
-function Feed({ backlog }: { backlog: Backlog }) {
+function Feed({ backlog, onResync }: { backlog: Backlog; onResync: () => void }) {
   const id = useId();
   const nowMs = useNowMs();
   const wallet = useWallet();
+  // The latest of the page's way to read the backlog again, for the stream's handler.
+  const resyncRef = useRef(onResync);
+  resyncRef.current = onResync;
   const [feed, setFeed] = useState<FeedEvent[]>(backlog.events);
   const [filter, setFilter] = useState(FILTERS[0]?.id ?? "all");
   const [mine, setMine] = useState(false);
 
-  // The stream, from the newest event of the backlog: what happened after it, as it happens.
+  // The stream, from the newest event of the backlog: what happened after it, as it happens. It is
+  // the tab's one stream (`listenToEvents`), shared with any other part that listens.
   useEffect(() => {
-    const stream = connectEvents(
+    const stream = listenToEvents(
       {
         onEvent: () => {},
-        onResync: () => {},
+        // The stream can't vouch for what came before: the feed is read again, backlog and all
+        // (the API's database started over, say, and the ids the feed holds are of the old one).
+        onResync: () => resyncRef.current(),
         onMessage: (message) => {
           if (!SHOWN.has(message.event)) return;
           setFeed((was) => mergeFeed(was, [fromStream(message, Date.now())]));
@@ -261,12 +269,13 @@ function Feed({ backlog }: { backlog: Backlog }) {
   return (
     <section className={`${CARD} grid grid-cols-1 overflow-hidden`}>
       <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-line px-5 py-4 sm:px-6">
-        {/* On a phone the row is wider than the screen and scrolls: its right edge fades out, so
-            that the choices past it show as more to come, and it has room at the end to scroll
-            the last one clear of the fade. */}
+        {/* On a phone the row is wider than the screen and scrolls: while there is more of it
+            past its right edge, the edge fades out, so that the choices past it show as more to
+            come (`SCROLL_CUE`). */}
         <fieldset
+          ref={scrollCue}
           data-testid="activity-filters"
-          className="-mx-1 flex max-w-full min-w-0 gap-1 overflow-x-auto px-1 py-0.5 max-sm:pr-10 max-sm:[mask-image:linear-gradient(to_right,black_calc(100%-2.5rem),transparent)]"
+          className={`-mx-1 flex max-w-full min-w-0 gap-1 overflow-x-auto px-1 py-0.5 ${SCROLL_CUE}`}
         >
           <legend className="sr-only">Show</legend>
           {FILTERS.map((choice) => (
@@ -339,13 +348,16 @@ export function ActivityView() {
         art={{ name: "signal", focus: { x: 0.55, y: 0.5, scale: 0.6 } }}
       />
       {backlog.status === "ready" ? (
-        <Feed backlog={backlog.data} />
+        <Feed backlog={backlog.data} onResync={retry} />
       ) : backlog.status === "error" ? (
         <ErrorState message={backlog.message} retrying={backlog.retrying} onRetry={retry} />
       ) : (
-        <p role="status" className={EYEBROW}>
-          Loading activity…
-        </p>
+        <>
+          <p role="status" className="sr-only">
+            Loading activity…
+          </p>
+          <FeedSkeleton />
+        </>
       )}
     </div>
   );

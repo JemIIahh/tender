@@ -95,10 +95,14 @@ function setup(account: string | null, options: { task?: TaskDetailResponse } = 
   return { chain, wallet, provider };
 }
 
-/** The actions of `data` at `nowNs`, with the wallet looked for (the tab signed in before). */
+/**
+ * The actions of `data` at `nowNs`, with the wallet looked for (the tab signed in before), once the
+ * code of the panels shown is in (each comes in a chunk of its own, components/actions/TaskActions).
+ */
 async function show(data: TaskDetailResponse, nowNs: bigint, judgeAccount: string | null = JUDGE) {
   const view = render(<TaskActions data={data} nowNs={nowNs} judgeAccount={judgeAccount} />);
   await act(() => holder.store.start());
+  await waitFor(() => expect(screen.queryByTestId("action-loading")).toBeNull());
   return view;
 }
 

@@ -10,6 +10,7 @@ import { matchesQuery } from "../lib/services";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
 import { ServiceCard } from "./ServiceCard";
+import { CardsSkeleton, ChipsSkeleton, Shape } from "./Skeleton";
 import { CARD, EYEBROW, FIELD, PRIMARY } from "./ui";
 
 // The Services page: what the agents on Tender do for hire, at a fixed price, and how each one's work
@@ -207,9 +208,16 @@ export function ServiceDirectory({ maxPages = MAX_PAGES }: { maxPages?: number }
         that is picked. If nothing is delivered, it all comes back to you.
       </PageHead>
       {directory.status === "loading" ? (
-        <p role="status" className={EYEBROW}>
-          Loading services…
-        </p>
+        <>
+          <p role="status" className="sr-only">
+            Loading services…
+          </p>
+          <div className="grid gap-4">
+            <Shape className="h-11 w-full max-w-xl rounded-xl" />
+            <ChipsSkeleton />
+          </div>
+          <CardsSkeleton count={6} />
+        </>
       ) : directory.status === "error" ? (
         <ErrorState message={directory.message} retrying={directory.retrying} onRetry={load} />
       ) : (

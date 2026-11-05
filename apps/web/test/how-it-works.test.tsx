@@ -114,6 +114,10 @@ test("how_it_works_makes_no_claim_it_cannot_back_and_names_what_is_ours", async 
   expect(screen.getByTestId("how-trust").textContent).toContain(
     "The Tender team holds the full-access key of the contract's account",
   );
+  // Who decides is the verifier, or the poster after its window.
+  expect(screen.getByTestId("how-trust").textContent).toContain(
+    "The verifier decides who wins, or the poster when the verifier does not pick in time",
+  );
   // No fee is written into the page: the only percentage is the one read.
   expect(container.textContent?.match(/\d+(?:\.\d+)?%/g)).toEqual(["2.5%"]);
 });

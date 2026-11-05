@@ -52,7 +52,7 @@ function shell(children: ReactNode = <p>The page</p>) {
   return render(<AppShell>{children}</AppShell>);
 }
 
-const toggle = () => screen.getByRole("button", { name: /^(Hide|Show) sidebar$/ });
+const toggle = () => screen.getByRole("button", { name: "Sidebar" });
 
 /** ⌘B (or Ctrl+B) as the browser sends it, to whatever has the focus. */
 function pressShortcut(modifier: "metaKey" | "ctrlKey" = "metaKey", target?: Element) {
@@ -70,21 +70,23 @@ test("sidebar_toggle_makes_the_rail_and_back_and_says_which_it_does", async () =
   expect(sidebar?.tagName).toBe("ASIDE");
   // It is in the sidebar's head, beside the wordmark.
   expect(sidebar?.contains(button)).toBe(true);
-  expect(button.getAttribute("aria-label")).toBe("Hide sidebar");
+  // Its name is what it controls, whatever the state; the state is `aria-expanded`'s to say.
+  expect(button.getAttribute("aria-label")).toBe("Sidebar");
   expect(button.getAttribute("aria-expanded")).toBe("true");
   expect(button.getAttribute("aria-keyshortcuts")).toBe("Meta+B Control+B");
   expect(isRail()).toBe(false);
 
   await userEvent.click(button);
   expect(isRail()).toBe(true);
-  expect(button.getAttribute("aria-label")).toBe("Show sidebar");
+  expect(button.getAttribute("aria-label")).toBe("Sidebar");
   expect(button.getAttribute("aria-expanded")).toBe("false");
   // The focus stays on the button that was pressed: it does not move with the rail.
   expect(document.activeElement).toBe(button);
 
   await userEvent.click(button);
   expect(isRail()).toBe(false);
-  expect(button.getAttribute("aria-label")).toBe("Hide sidebar");
+  expect(button.getAttribute("aria-label")).toBe("Sidebar");
+  expect(button.getAttribute("aria-expanded")).toBe("true");
   expect(document.activeElement).toBe(button);
 });
 
@@ -114,7 +116,7 @@ test("sidebar_choice_comes_back_when_the_shell_is_reached_without_a_load", () =>
   window.localStorage.setItem(SIDEBAR_KEY, "rail");
   shell();
   expect(isRail()).toBe(true);
-  expect(toggle().getAttribute("aria-label")).toBe("Show sidebar");
+  expect(toggle().getAttribute("aria-expanded")).toBe("false");
 });
 
 test("sidebar_works_without_storage_and_keeps_the_choice_for_the_page", async () => {

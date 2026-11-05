@@ -15,6 +15,7 @@ import { UNNAMED_AGENT } from "../AgentFacts";
 import { Avatar } from "../Avatar";
 import { ErrorState } from "../ErrorState";
 import { PageHead } from "../PageHead";
+import { ListSkeleton } from "../SkeletonLists";
 import { TeamBadge } from "../TeamBadge";
 import { CARD, EYEBROW, FACT_LABEL, PANEL_TITLE, PRIMARY, TAG } from "../ui";
 import { ArtCard, Chip, ConnectGate, Stat, Stats, Tokens } from "./parts";
@@ -229,26 +230,12 @@ function NoAgents() {
   );
 }
 
+/** The list while it loads: the rows' shapes where the rows will be, and the words for a screen reader. */
 function Loading() {
-  const bar = "rounded-full bg-raised";
   return (
-    <div role="status" className="grid gap-4">
-      <p className={EYEBROW}>Loading your agents…</p>
-      <ul aria-hidden="true" className={`${CARD} grid`}>
-        {[0, 1].map((row) => (
-          <li
-            key={row}
-            className="flex items-center gap-4 border-t border-line p-6 first:border-t-0"
-          >
-            <span className={`${bar} size-11`} />
-            <span className="grid flex-1 gap-2">
-              <span className={`${bar} h-4 w-48`} />
-              <span className={`${bar} h-3 w-32`} />
-            </span>
-            <span className={`${bar} hidden h-12 w-56 sm:block`} />
-          </li>
-        ))}
-      </ul>
+    <div role="status" className="relative grid">
+      <p className="sr-only">Loading your agents…</p>
+      <ListSkeleton />
     </div>
   );
 }

@@ -31,6 +31,7 @@ import { PhaseChip } from "./PhaseChip";
 import { PhaseTimeline } from "./PhaseTimeline";
 import { Questions } from "./Questions";
 import { Scorecard } from "./Scorecard";
+import { TASK_TITLE, TaskSkeleton } from "./SkeletonDetail";
 import { SwarmTree } from "./SwarmTree";
 import { TeamBadge } from "./TeamBadge";
 import { EYEBROW, FACT_LABEL, PANEL, PANEL_TITLE, SECONDARY, TEXT_LINK } from "./ui";
@@ -435,13 +436,14 @@ export function TaskView({
   const title = "text-3xl font-semibold tracking-[-0.03em] text-bone sm:text-[2.6rem]";
   switch (state.status) {
     case "loading":
+      // The loaded page's shapes, in its boxes (components/Skeleton.tsx), under the task's number.
       return (
-        <div className={plain}>
-          <h1 className={title}>{heading}</h1>
-          <p role="status" className={EYEBROW}>
+        <article className="relative mx-auto grid w-full max-w-4xl gap-5">
+          <p role="status" className="sr-only">
             Loading task…
           </p>
-        </div>
+          <TaskSkeleton heading={<h1 className={TASK_TITLE}>{heading}</h1>} />
+        </article>
       );
     case "missing":
       return (

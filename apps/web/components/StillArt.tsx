@@ -1,17 +1,26 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import { Dither, type Focus } from "../lib/dither";
-import { ARTS, type ArtName } from "../lib/scenes";
+import dynamic from "next/dynamic";
+import { useRef } from "react";
+import type { Focus } from "../lib/dither";
+import type { ArtName } from "../lib/scenes";
+
+/**
+ * What draws the frame (the scene and the dither), in a chunk of its own: the art is decoration, and
+ * its code is not needed to draw the page. Until it is in, the canvas is clear; its box is there
+ * from the first paint, so nothing moves when the frame comes.
+ */
+const StillPainter = dynamic(() => import("./StillPainter").then((module) => module.StillPainter), {
+  ssr: false,
+});
 
 /**
  * One frame of one of the landing's arts (lib/scenes.ts), dithered as the landing draws it, and
  * never moving: the app is calm, and the art there is only a picture at the head of a page or in an
  * empty state. The landing's own art moves (components/landing/DitherArt.tsx).
  *
- * The frame is drawn when the art first comes on screen, and again when its box changes size. A
- * browser that cannot say when that is (no IntersectionObserver) is left without the picture,
- * which is decoration and says nothing the page does not.
+ * The frame is drawn when the art first comes on screen, and again when its box changes size
+ * (components/StillPainter.tsx, which comes after the page).
  */
 export function StillArt({
   art,
@@ -30,49 +39,6 @@ export function StillArt({
   className?: string;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
-  const { x, y, scale } = focus;
-
-  useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas || typeof IntersectionObserver === "undefined") return;
-    let drawn = "";
-    const draw = () => {
-      const { width, height } = canvas.getBoundingClientRect();
-      const w = Math.max(16, Math.round(width / cell));
-      const h = Math.max(16, Math.round(height / cell));
-      if (drawn === `${w}x${h}`) return;
-      const context = canvas.getContext("2d");
-      const scene = ARTS[art]()[0];
-      if (!context || !scene) return;
-      drawn = `${w}x${h}`;
-      canvas.width = w;
-      canvas.height = h;
-      const image = context.createImageData(w, h);
-      scene.frame(at);
-      new Dither(w, h, new Uint32Array(image.data.buffer)).draw(scene, { x, y, scale });
-      context.putImageData(image, 0, 0);
-    };
-    let seen = false;
-    const sized =
-      typeof ResizeObserver === "undefined"
-        ? null
-        : new ResizeObserver(() => {
-            if (seen) draw();
-          });
-    const shown = new IntersectionObserver(([entry]) => {
-      if (entry?.isIntersecting && !seen) {
-        seen = true;
-        draw();
-        sized?.observe(canvas);
-      }
-    });
-    shown.observe(canvas);
-    return () => {
-      shown.disconnect();
-      sized?.disconnect();
-    };
-  }, [art, at, cell, x, y, scale]);
-
   return (
     <div aria-hidden="true" className={className}>
       <canvas
@@ -81,6 +47,7 @@ export function StillArt({
         className="block size-full"
         style={{ imageRendering: "pixelated" }}
       />
+      <StillPainter canvas={ref} art={art} focus={focus} at={at} cell={cell} />
     </div>
   );
 }

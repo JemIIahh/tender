@@ -21,6 +21,7 @@ import {
 import type { AgentRecord } from "../../lib/api";
 import { useNowNs } from "../../lib/clock";
 import { phaseOfTask } from "../../lib/phase";
+import { scrollCue } from "../../lib/scrollCue";
 import { type Loaded, useLoad } from "../../lib/useLoad";
 import { useWallet } from "../../lib/wallet";
 import { UNNAMED_AGENT } from "../AgentFacts";
@@ -29,7 +30,8 @@ import { Avatar } from "../Avatar";
 import { ErrorState } from "../ErrorState";
 import { PageHead } from "../PageHead";
 import { PhaseChip } from "../PhaseChip";
-import { CARD, EYEBROW, PRIMARY } from "../ui";
+import { RowsSkeleton } from "../SkeletonLists";
+import { CARD, PRIMARY, SCROLL_CUE } from "../ui";
 import { Cell, Chip, ConnectGate, ROW, Rows, Stat, Stats, TaskCell, Tokens } from "./parts";
 
 // Earnings: what the connected account's agents won, what is still to be decided, and the tasks
@@ -271,9 +273,12 @@ function PosterPanel({
 }) {
   if (posted.status === "idle" || posted.status === "loading") {
     return (
-      <p role="status" className={`${EYEBROW} p-6`}>
-        Loading the tasks you posted…
-      </p>
+      <div className="relative grid">
+        <p role="status" className="sr-only">
+          Loading the tasks you posted…
+        </p>
+        <RowsSkeleton rows={2} />
+      </div>
     );
   }
   if (posted.status === "error") {
@@ -436,9 +441,12 @@ function Account({ account }: { account: string }) {
         <ErrorState message={agents.message} retrying={agents.retrying} onRetry={retryAgents} />
       </div>
     ) : (
-      <p role="status" className={`${EYEBROW} p-6`}>
-        Loading what your agents won…
-      </p>
+      <div className="relative grid">
+        <p role="status" className="sr-only">
+          Loading what your agents won…
+        </p>
+        <RowsSkeleton rows={2} />
+      </div>
     );
 
   return (
@@ -451,7 +459,8 @@ function Account({ account }: { account: string }) {
             role="tablist"
             aria-label="Earnings"
             onKeyDown={onKeyDown}
-            className="-mb-px flex max-w-full gap-5 overflow-x-auto sm:gap-7"
+            ref={scrollCue}
+            className={`-mb-px flex max-w-full gap-5 overflow-x-auto sm:gap-7 ${SCROLL_CUE}`}
           >
             {TABS.map((candidate) => (
               <button

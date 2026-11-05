@@ -24,8 +24,17 @@ import {
   storageShortfall,
   type TenderCall,
 } from "@tender/shared";
+import {
+  type AnswerFormat,
+  type Category,
+  type CheckKind,
+  FORMAT_LABEL,
+  KINDS,
+  type KindInfo,
+  parseTags,
+  spanText,
+} from "./briefTerms";
 import { config } from "./config";
-import { formatSpan } from "./phase";
 import { RpcError, view } from "./rpc";
 import { describeAmount, readAmount, type StorageBalance, type VaultData } from "./vault";
 
@@ -38,8 +47,6 @@ import { describeAmount, readAmount, type StorageBalance, type VaultData } from 
 
 /** The most seconds a window may last, as the contract has it (`MAX_WINDOW_SECS`): 14 days. */
 export const MAX_WINDOW_SECS = 1_209_600;
-
-const SECOND_NS = 1_000_000_000n;
 
 /**
  * The bytes of Tender storage a post can use, with a little to spare. `post_task` charges the poster
@@ -62,27 +69,19 @@ export const VAULT_SLOT_BYTES = 200n;
 
 // ---- The form -----------------------------------------------------------------------------------
 
-export type Category = Brief["category"];
-export const CATEGORIES: readonly Category[] = [
-  "extraction",
-  "coding",
-  "research",
-  "data",
-  "writing",
-  "other",
-];
-
-/** The ways a task can be checked that the wizard writes. `tests` has no form here. */
-export type CheckKind = "exact" | "json_schema" | "regex_cases" | "rubric";
-
-/** What an entry looks like; `code_js` goes with the `tests` kind, which the wizard does not offer. */
-export type AnswerFormat = "text" | "json" | "regex_json";
-
-export const FORMAT_LABEL: Record<AnswerFormat, string> = {
-  text: "Plain text",
-  json: "JSON",
-  regex_json: "A regex, as JSON",
-};
+// The categories, the kinds of check and the formats by name, tags and a window's length in words
+// are in lib/briefTerms.ts, for the pages that only say them; the wizard's rules about them are here.
+export {
+  type AnswerFormat,
+  CATEGORIES,
+  type Category,
+  type CheckKind,
+  FORMAT_LABEL,
+  KINDS,
+  type KindInfo,
+  parseTags,
+  spanText,
+} from "./briefTerms";
 
 /** The same formats in the middle of a sentence, where `FORMAT_LABEL` would have a capital. */
 export const FORMAT_PHRASE: Record<AnswerFormat, string> = {
@@ -98,35 +97,6 @@ const FORMATS_FOR_KIND: Record<CheckKind, readonly AnswerFormat[]> = {
   regex_cases: ["regex_json"],
   rubric: ["text", "json"],
 };
-
-export interface KindInfo {
-  kind: CheckKind;
-  label: string;
-  blurb: string;
-}
-
-export const KINDS: readonly KindInfo[] = [
-  {
-    kind: "exact",
-    label: "Exact answer",
-    blurb: "The answer has to equal one of the answers you write.",
-  },
-  {
-    kind: "json_schema",
-    label: "JSON shape",
-    blurb: "The answer is JSON that fits a schema. The Judge also checks values inside it.",
-  },
-  {
-    kind: "regex_cases",
-    label: "Regex cases",
-    blurb: "The answer is a regular expression that has to match some strings and not others.",
-  },
-  {
-    kind: "rubric",
-    label: "Rubric",
-    blurb: "The answer is scored against weighted points.",
-  },
-];
 
 /** The kinds to offer: the rubric is for team accounts only. */
 export function kindsFor(canRubric: boolean): readonly KindInfo[] {
@@ -305,15 +275,6 @@ export function linesOf(text: string): string[] {
     .split("\n")
     .map((line) => line.replace(/\r$/, ""))
     .filter((line) => line.trim() !== "");
-}
-
-/** The tags in `text`: lower case, without a leading `#`, each once, in the order written. */
-export function parseTags(text: string): string[] {
-  const tags = text
-    .split(/[\s,]+/)
-    .map((tag) => tag.replace(/^#+/, "").toLowerCase())
-    .filter((tag) => tag !== "");
-  return [...new Set(tags)];
 }
 
 const TAG = /^[a-z0-9-]{1,24}$/;
@@ -640,9 +601,6 @@ export function windowsOf(form: PostForm): Windows | null {
   if (commit === null || reveal === null || pick === null || fallback === null) return null;
   return { commit, reveal, pick, fallback };
 }
-
-/** A length of time in a few words: `10m`, `1d`. */
-export const spanText = (secs: number): string => formatSpan(BigInt(secs) * SECOND_NS);
 
 /** The four windows added up, in seconds. */
 export function totalSecs(windows: Windows): number {

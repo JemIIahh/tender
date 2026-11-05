@@ -12,8 +12,12 @@ export const METRICS_CACHE_NS = 15n * 1_000_000_000n;
  *
  * The count runs a few aggregates over whole tables, and the route is public and asks for no
  * sign-in, so an answer is kept for `METRICS_CACHE_NS` and every request in that time gets it, the
- * requests that come while it is being counted included: at most one count runs at a time, and at
- * most one every 15 seconds. The figures are at most that old. A count that fails is not kept.
+ * requests that come while it is being counted included. So at most one count starts in any 15
+ * seconds, counted from when the last one started, unless that count failed (a count that fails
+ * is not kept, and the next request counts again at once) or the clock went back. A count that
+ * takes longer than 15 seconds is still running when a request after them starts the next one, and
+ * the two run side by side. The figures are at most 15 seconds old, plus the time their count
+ * took.
  */
 export function metricsRoutes(deps: ApiDeps): Hono {
   const app = new Hono();

@@ -6,7 +6,8 @@ import { Stepper } from "../components/landing/Stepper";
 import { Ticker } from "../components/landing/Ticker";
 import { TypedCode } from "../components/landing/TypedCode";
 import { Mark } from "../components/Mark";
-import { type ArtName, FLEET } from "../lib/scenes";
+import { FLEET } from "../lib/fleet";
+import type { ArtName } from "../lib/scenes";
 
 // The landing: what Tender is, in a few words over moving art, and the ways in. It has its own top
 // bar and no app Nav (app/(app)/layout.tsx is for the app's pages). The art, the typed code, the

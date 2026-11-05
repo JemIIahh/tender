@@ -286,7 +286,15 @@ export function AppShell({ children }: { children: ReactNode }) {
 
       {/* From laptop width up, the sidebar's edge is the left border of the top bar and the page,
           which run the whole height of the page, where the sticky sidebar ends at the screen's. */}
-      <header className="sticky top-0 z-30 flex h-16 items-center gap-2 border-b border-line bg-ink/90 px-4 backdrop-blur-sm sm:px-8 lg:col-start-2 lg:row-start-1 lg:border-l">
+      <header className="sticky top-0 z-30 flex h-16 items-center gap-2 border-b border-line px-4 sm:px-8 lg:col-start-2 lg:row-start-1 lg:border-l">
+        {/* The bar's frosted ground is a layer of its own, behind its contents. On the bar itself,
+            the blur (a backdrop filter) would make the bar the box that a fixed part inside it is
+            placed in, and the Live panel, fixed under the bar on a phone, would follow the bar
+            instead of the screen. */}
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 -z-10 bg-ink/90 backdrop-blur-sm"
+        />
         <button
           ref={menuButton}
           type="button"
@@ -347,11 +355,12 @@ export function AppShell({ children }: { children: ReactNode }) {
         className="fixed inset-x-0 top-16 bottom-0 z-20 hidden flex-col gap-8 overflow-x-hidden overflow-y-auto border-t border-line bg-ink px-4 pt-6 pb-8 data-[open=true]:flex sm:px-8 lg:sticky lg:top-0 lg:col-start-1 lg:row-span-2 lg:row-start-1 lg:flex lg:h-svh lg:border-t-0 lg:px-3 lg:pt-0 lg:pb-6"
       >
         <div className="hidden h-16 shrink-0 items-center gap-1.5 lg:flex">
-          {/* Its name says what a press does; `aria-expanded` says how the sidebar is now. */}
+          {/* Its name is what it controls, and stays the same as it is pressed; `aria-expanded` says
+              whether the sidebar is wide now, and the tooltip says what a press does. */}
           <button
             ref={toggleButton}
             type="button"
-            aria-label={rail ? "Show sidebar" : "Hide sidebar"}
+            aria-label="Sidebar"
             aria-expanded={!rail}
             aria-controls={menuId}
             aria-keyshortcuts="Meta+B Control+B"
@@ -383,7 +392,9 @@ export function AppShell({ children }: { children: ReactNode }) {
         {children}
       </main>
 
-      {/* The tooltip says again what the element's name says, so a screen reader is not told twice. */}
+      {/* The tooltip says again what a screen reader is told already, so it is hidden from one: a
+          link's name, or for the toggle what a press does, which its name, its state
+          (`aria-expanded`) and its shortcut (`aria-keyshortcuts`) say. */}
       {shownTip === null ? null : (
         <div
           aria-hidden="true"

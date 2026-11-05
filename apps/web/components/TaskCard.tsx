@@ -4,6 +4,7 @@ import { deadlineLine } from "../lib/card";
 import { UNTITLED_TASK } from "../lib/copy";
 import { isJudgeAccount } from "../lib/judge";
 import { phaseOfTask } from "../lib/phase";
+import { usePrefetchOnIntent } from "../lib/prefetch";
 import { knowsToken } from "../lib/tokens";
 import { Amount, RawUnits } from "./Amount";
 import { Avatar } from "./Avatar";
@@ -43,8 +44,10 @@ export function TaskCard({
   const soft = featured ? "text-neutral-700" : "text-muted";
   // Whether the app knows the token's decimals, so that the reward reads as a figure.
   const known = knowsToken(task.token);
+  const intent = usePrefetchOnIntent(`/tasks/${task.id}`);
   return (
     <li
+      {...intent}
       data-testid="task-card"
       data-featured={featured}
       className={`group relative flex min-h-64 min-w-0 flex-col rounded-2xl border p-5 transition-colors motion-reduce:transition-none sm:p-6 ${

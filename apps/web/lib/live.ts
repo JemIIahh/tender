@@ -1,30 +1,15 @@
-import {
-  ApiError,
-  type HealthResponse,
-  type ListAgentsResponse,
-  type ListTasksResponse,
-} from "@tender/shared";
 import { type ByToken, sumByToken } from "./account";
-import { api } from "./api";
+import type { LiveReads } from "./liveReads";
 
 // What the top bar's Live pill says (components/LiveStatus.tsx): whether the index is up to date
 // with the chain, and a few figures of the platform. Three reads, the ones the sidebar's figures
-// used to make, and nothing else. Every figure is the API's; one it did not give is left out, and
-// a person is never shown a block height or a count of blocks.
+// used to make, and nothing else (lib/liveReads.ts, which the landing's ticker shares). Every figure
+// is the API's; one it did not give is left out, and a person is never shown a block height or a
+// count of blocks.
 
-/** A page of the API holds at most this many rows, which is what a count is read from. */
-const PAGE = 50;
+export { LIVE_REFRESH_MS, type LiveReads, liveReads, readLive } from "./liveReads";
 
 export type LiveState = "synced" | "behind" | "offline";
-
-/** What the three reads brought back. A read that failed is missing. */
-export interface LiveReads {
-  open?: ListTasksResponse;
-  agents?: ListAgentsResponse;
-  health?: HealthResponse;
-  /** The API answered at least one of them, whatever the answer was. */
-  answered: boolean;
-}
 
 export interface Live {
   /**
@@ -43,28 +28,6 @@ export interface Live {
 /** A count from a page: exact if it is the last page, else at least what the page holds ("50+"). */
 function count(rows: number, next: string | null): string {
   return next === null ? String(rows) : `${rows}+`;
-}
-
-/** The three reads: open tasks, agents and health. A read that fails is left out; this never throws. */
-export async function readLive(): Promise<LiveReads> {
-  const results = await Promise.allSettled([
-    api.listTasks({ phase: "open", limit: PAGE }),
-    api.listAgents({ limit: PAGE }),
-    api.health(),
-  ]);
-  const [open, agents, health] = results;
-  const value = <T>(result: PromiseSettledResult<T>) =>
-    result.status === "fulfilled" ? result.value : undefined;
-  return {
-    open: value(open),
-    agents: value(agents),
-    health: value(health),
-    // An error with a status is an answer (the health check's 503 among them); a failed fetch or
-    // a timeout is not.
-    answered: results.some(
-      (result) => result.status === "fulfilled" || result.reason instanceof ApiError,
-    ),
-  };
 }
 
 /** Whether `lag` is a lag of nothing. One that is no number is not taken to be nothing. */

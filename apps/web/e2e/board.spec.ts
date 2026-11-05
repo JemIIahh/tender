@@ -154,3 +154,73 @@ test("board_filters_by_phase_and_tag_and_leads_to_the_task_page", async ({ page 
   await expect(page).toHaveURL(/\/tasks\/2$/);
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(REGEX_TITLE);
 });
+
+test("board_holds_the_cards_place_while_it_loads_and_its_shapes_keep_still_with_reduced_motion", async ({
+  page,
+}) => {
+  await routeApi(page);
+  // The board's read waits until it is let go (registered after the fixture, so asked first).
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(`${API_URL}/v1/tasks*`, async (route) => {
+    await held;
+    await route.fallback();
+  });
+
+  await page.goto("/tasks");
+  await expect(page.getByRole("status")).toContainText("Loading tasks");
+  // Three cards' shapes where the cards will be, hidden from a screen reader; they shimmer.
+  const shapes = page.locator('main ul[aria-hidden="true"] > li');
+  await expect(shapes).toHaveCount(3);
+  const shimmer = shapes.first().locator(".skeleton").first();
+  expect(await shimmer.evaluate((element) => getComputedStyle(element).animationName)).toBe(
+    "skeleton",
+  );
+  const shape = await shapes.first().boundingBox();
+
+  release();
+  const firstCard = page.getByTestId("task-card").first();
+  await expect(firstCard).toBeVisible();
+  await expect(page.getByRole("status")).toHaveCount(0);
+  // The first card is where its shape was: nothing moved when the tasks landed.
+  const loaded = await firstCard.boundingBox();
+  expect(loaded?.x).toBeCloseTo(shape?.x ?? -1, 0);
+  expect(loaded?.y).toBeCloseTo(shape?.y ?? -1, 0);
+  expect(loaded?.width).toBeCloseTo(shape?.width ?? -1, 0);
+
+  // With reduced motion the shapes are there, and still.
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.unroute(`${API_URL}/v1/tasks*`);
+  await page.route(`${API_URL}/v1/tasks*`, () => new Promise(() => {}));
+  await page.reload();
+  await expect(shapes).toHaveCount(3);
+  expect(await shimmer.evaluate((element) => getComputedStyle(element).animationName)).toBe("none");
+});
+
+test("a_cut_raw_amount_copies_as_the_one_whole_number", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  // A phone, where the community task's 39-figure reward is cut in the middle on its card.
+  await page.setViewportSize(PHONE);
+  await routeApi(page);
+  await page.goto("/tasks");
+  const reward = page.getByTestId("card-raw-reward");
+  await expect(reward.getByTestId("raw-head")).toBeVisible();
+  const MAX = "340282366920938463463374607431768211455";
+
+  // The person selects the whole line of the number, and copies it.
+  await reward.getByTestId("raw-head").evaluate((head) => {
+    const line = head.parentElement?.parentElement as HTMLElement;
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    const selection = getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  });
+  expect(await page.evaluate(() => getSelection()?.toString())).toBe(MAX);
+  await page.keyboard.press("ControlOrMeta+C");
+  // What lands on the clipboard is the number once, whole: not the screen reader's copy as well,
+  // and not cut in two by a line break.
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(MAX);
+});
