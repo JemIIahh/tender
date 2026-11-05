@@ -1090,6 +1090,7 @@ test("connect_makes_inits_key_attaches_its_public_half_and_uses_it_again_on_the_
 
 test("connect_moves_the_key_file_to_the_implicit_account_the_owner_chose", async () => {
   const { api, moveToImplicit } = connectApi();
+  const asked: string[] = [];
   const run = () =>
     connectAgentCommand({
       ...options(),
@@ -1098,8 +1099,14 @@ test("connect_moves_the_key_file_to_the_implicit_account_the_owner_chose", async
       apiFor: () => api,
       waitMs: 0,
       chainCheck: async () => "missing",
+      accountCheck: async (account) => {
+        asked.push(account);
+        return false;
+      },
     });
   expect((await run()).accountKind).toBe("sub_account");
+  // On the sub-account route nothing looks at the implicit account.
+  expect(asked).toEqual([]);
   const path = join(keys, "writer.json");
   const made = JSON.parse(await readFile(path, "utf8"));
   expect(made.account).toBe("writer.alice.testnet");
@@ -1114,6 +1121,8 @@ test("connect_moves_the_key_file_to_the_implicit_account_the_owner_chose", async
     accountId: implicit,
     accountKind: "implicit",
   });
+  // The chain was asked whether the code's sub-account exists before the file was moved.
+  expect(asked).toEqual(["writer.alice.testnet"]);
   // The same key, the file now naming the account it is for, for the commands that follow.
   const moved = JSON.parse(await readFile(path, "utf8"));
   expect(moved).toEqual({ ...made, account: implicit });
@@ -1121,7 +1130,7 @@ test("connect_moves_the_key_file_to_the_implicit_account_the_owner_chose", async
   expect(out).toContain(`waiting for alice.testnet to send ${implicit} its NEAR…`);
   expect(everything()).not.toContain(made.privateKey.slice("ed25519:".length));
 
-  // The implicit account of another key is never this file's.
+  // A record naming the implicit account of another key is never this file's, and is not acted on.
   const stranger = connectApi({
     state: "attached",
     fingerprint: connectFingerprint(made.publicKey),
@@ -1136,9 +1145,91 @@ test("connect_moves_the_key_file_to_the_implicit_account_the_owner_chose", async
       apiFor: () => stranger.api,
       waitMs: 0,
       chainCheck: async () => "missing",
+      accountCheck: async () => false,
     }),
-  ).rejects.toThrow(/the key file of agent writer is for [0-9a-f]{64}, not (ab){32}/);
-  expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ ...made, account: implicit });
+  ).rejects.toThrow(/the key file of agent writer is for [0-9a-f]{64}, not writer\.alice\.testnet/);
+  expect(JSON.parse(await readFile(path, "utf8"))).toEqual(moved);
+});
+
+test("connect_never_moves_the_key_file_of_an_agent_whose_sub_account_exists", async () => {
+  const { api, moveToImplicit } = connectApi();
+  const run = (exists: boolean) =>
+    connectAgentCommand({
+      ...options(),
+      code: CONNECT_CODE,
+      api: "https://api.example",
+      apiFor: () => api,
+      waitMs: 0,
+      chainCheck: async () => "missing",
+      accountCheck: async () => exists,
+    });
+  await run(false);
+  const path = join(keys, "writer.json");
+  const before = await readFile(path, "utf8");
+  // The API says the owner chose the separate account, but the sub-account is on the chain (made
+  // by the owner's wallet after all, or by a lying API's tale): the agent keeps it, and stops.
+  moveToImplicit();
+  await expect(run(true)).rejects.toThrow(
+    /writer\.alice\.testnet exists on the chain, so agent writer keeps it: its key file is not moved/,
+  );
+  expect(await readFile(path, "utf8")).toBe(before);
+});
+
+test("connect_never_takes_over_the_key_file_of_another_owners_agent", async () => {
+  // writer's file is for an account of another owner, registered there. A code for "writer" under
+  // alice, whatever its record says, never takes or moves it.
+  await init("writer", "writer.bob.testnet");
+  const path = join(keys, "writer.json");
+  const before = await readFile(path, "utf8");
+  const file = JSON.parse(before);
+  for (const over of [
+    {},
+    {
+      state: "attached" as const,
+      fingerprint: connectFingerprint(file.publicKey),
+      account_kind: "implicit" as const,
+      account_id: implicitAccountOf(file.publicKey) ?? "",
+    },
+  ]) {
+    const { api } = connectApi(over);
+    await expect(
+      connectAgentCommand({
+        ...options(),
+        code: CONNECT_CODE,
+        api: "https://api.example",
+        apiFor: () => api,
+        waitMs: 0,
+        chainCheck: async () => "missing",
+        accountCheck: async () => false,
+      }),
+    ).rejects.toThrow(/is for writer\.bob\.testnet, not writer\.alice\.testnet/);
+    expect(await readFile(path, "utf8")).toBe(before);
+  }
+});
+
+test("connect_uses_an_existing_key_file_only_under_name_or_the_codes_own_name", async () => {
+  // writer's file exists; a code made for "reader" carries writer's fingerprint (a lying API).
+  const { publicKey } = await init("writer", "writer.alice.testnet");
+  const before = await readFile(join(keys, "writer.json"), "utf8");
+  const { api, asked } = connectApi({
+    name: "reader",
+    account_id: "reader.alice.testnet",
+    state: "attached",
+    fingerprint: connectFingerprint(publicKey),
+  });
+  await expect(
+    connectAgentCommand({
+      ...options(),
+      code: CONNECT_CODE,
+      api: "https://api.example",
+      apiFor: () => api,
+      waitMs: 0,
+      chainCheck: async () => "missing",
+    }),
+  ).rejects.toThrow(/NOT to press Create agent/);
+  // reader has no key file, so nothing was attached, and writer's file was not read for it.
+  expect(asked).toEqual(["lookup", "contest"]);
+  expect(await readFile(join(keys, "writer.json"), "utf8")).toBe(before);
 });
 
 test("the_command_line_of_connect_exits_2_when_it_stopped_to_wait", async () => {

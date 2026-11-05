@@ -14,9 +14,11 @@ import {
   KeyDirError,
   KeyInUseError,
   keyDirOf,
+  moveAgentKeyToImplicit,
   planRegistration,
   readAgentKeyFile,
   registerWithBond,
+  rpcAccountExists,
   rpcFullAccessKeys,
   rpcKeyState,
   scriptedProfile,
@@ -195,8 +197,25 @@ export function registerConnectTool(server: McpServer, deps: ConnectToolDeps): v
               dir,
               name: agent,
               network: lookup.network,
-              account: lookup.account_id,
+              // The account the code was made for; a file moved to the implicit account counts
+              // only once the code's record says the owner chose it.
+              account: `${lookup.name}.${lookup.owner}`,
+              implicit: lookup.account_kind === "implicit" ? lookup.account_id : null,
               mayMake,
+            }).catch((error: unknown) => {
+              if (error instanceof KeyInUseError) throw new ToolError("KEY_IN_USE", error.message);
+              return keyDirFault(error);
+            });
+          },
+          moveKey: async (lookup, agent, exists) => {
+            const dir = await keysDir(deps.keysDir ?? KEYS_DIR, repoRoot, agent);
+            return moveAgentKeyToImplicit({
+              dir,
+              name: agent,
+              network: lookup.network,
+              from: `${lookup.name}.${lookup.owner}`,
+              to: lookup.account_id,
+              exists,
             }).catch((error: unknown) => {
               if (error instanceof KeyInUseError) throw new ToolError("KEY_IN_USE", error.message);
               return keyDirFault(error);
@@ -285,5 +304,6 @@ function chainOf(lookup: ConnectLookup, deps: ConnectToolDeps): ConnectChain {
     keyState: rpcKeyState(deps.rpcUrl),
     plan: (account) => planRegistration(reader, account),
     fullAccessKeys: rpcFullAccessKeys(deps.rpcUrl),
+    accountExists: rpcAccountExists(deps.rpcUrl),
   };
 }

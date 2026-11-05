@@ -22,11 +22,13 @@ import {
   type KeyPermission,
   keyDirOf,
   makeAgentKeyFile,
+  moveAgentKeyToImplicit,
   planRegistration,
   prepareKeyDir,
   type RegistrationPlan,
   readAgentKeyFile,
   registerWithBond,
+  rpcAccountExists,
   rpcFullAccessKeys,
   rpcKeyState,
   type Signer,
@@ -124,10 +126,14 @@ import { envDir, REPO_ROOT, readEnvFile } from "./lib/env";
  * CONNECT. `connect` is `connectAgent` of `@tender/client`, with this file's key and register. The
  * code says which account the agent gets (`<name>.<owner>`, or the implicit account of the agent's
  * key once the owner chose that on the page), on which network and contract; the key is `init`'s, in
- * the same file and directory under the same guard, and is used again if it is there for that
- * account, so a run that stopped (the owner was away) is finished by running the same command again.
- * When the owner chooses the implicit account, the key file is rewritten to name it. It prints the key's fingerprint, which the owner's page shows too: the owner
- * matches the two before the wallet signs anything. Once the account exists with the key and its
+ * the same file and directory under the same guard, named by `--name` or else by the code's own
+ * name, and is used again if it is there for that account, so a run that stopped (the owner was
+ * away) is finished by running the same command again. When the code's record says the owner chose
+ * the implicit account, the key file is moved to it (`moveAgentKeyToImplicit`): only a file made for
+ * this code's `<name>.<owner>`, only to its own key's implicit account, and only while the chain has
+ * no `<name>.<owner>`; otherwise the command stops and the file is left as it was. It prints the
+ * key's fingerprint, which the owner's page shows too: the owner matches the two before the wallet
+ * signs anything. Once the account exists with the key and its
  * vault holds the bond (the owner's batch pays both), it is `register` with `--yes`: the only thing
  * left to move is NEAR into the storage balance, from the NEAR the owner sent the account. `--api`
  * is the address of the API that made the code (`TENDER_API_URL` when it is not given): https, or
@@ -1147,6 +1153,8 @@ export interface ConnectCommandOptions extends CommandOptions {
   chainCheck?: ConnectChain["keyState"];
   /** The account's full-access keys; through the node unless a test says. */
   keysCheck?: ConnectChain["fullAccessKeys"];
+  /** Whether an account exists; through the node unless a test says. */
+  accountCheck?: ConnectChain["accountExists"];
 }
 
 /** Hosts that are this machine, where plain http cannot be read or changed on the way. */
@@ -1239,6 +1247,8 @@ export async function connectAgentCommand(options: ConnectCommandOptions): Promi
         (options.chainCheck ?? rpcKeyState((await ready).rpcUrl))(account, publicKey),
       fullAccessKeys: async (account) =>
         (options.keysCheck ?? rpcFullAccessKeys((await ready).rpcUrl))(account),
+      accountExists: async (account) =>
+        (options.accountCheck ?? rpcAccountExists((await ready).rpcUrl))(account),
       plan: async (account) => {
         const where = await ready;
         const reader = new TenderClient({
@@ -1271,10 +1281,28 @@ export async function connectAgentCommand(options: ConnectCommandOptions): Promi
         dir,
         name,
         network: lookup.network,
-        account: lookup.account_id,
+        // The account the code was made for; a file moved to the implicit account counts only once
+        // the code's record says the owner chose it.
+        account: `${lookup.name}.${lookup.owner}`,
+        implicit: lookup.account_kind === "implicit" ? lookup.account_id : null,
         mayMake,
       }).catch((error: unknown) => {
         if (error instanceof KeyInUseError) throw new Error(`${error.message} (--name <name>)`);
+        return asUsage(error);
+      });
+    },
+    moveKey: async (lookup, name, exists) => {
+      await targetOf(lookup);
+      const dir = await keysDirOf(options.dir, name);
+      return moveAgentKeyToImplicit({
+        dir,
+        name,
+        network: lookup.network,
+        from: `${lookup.name}.${lookup.owner}`,
+        to: lookup.account_id,
+        exists,
+      }).catch((error: unknown) => {
+        if (error instanceof KeyInUseError) throw new Error(error.message);
         return asUsage(error);
       });
     },
@@ -1308,7 +1336,7 @@ export interface CliOptions extends CommandOptions {
   /** For tests: what `connect` asks of the API and the chain, and its clock. */
   connect?: Pick<
     ConnectCommandOptions,
-    "apiFor" | "chainCheck" | "keysCheck" | "sleep" | "now" | "pollMs"
+    "apiFor" | "chainCheck" | "keysCheck" | "accountCheck" | "sleep" | "now" | "pollMs"
   >;
 }
 

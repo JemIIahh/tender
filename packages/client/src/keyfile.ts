@@ -294,19 +294,23 @@ export class KeyInUseError extends Error {
 }
 
 /**
- * The key that agent `name` connects `account` on `network` with, in `dir` (which the guard has
- * passed): the one its file holds, if the file is for that network and for that account or for
- * none yet, or if `account` is the implicit account of the file's own key (the file is then
- * rewritten to name it); else, if `mayMake`, a new one made now (`prepareKeyDir`, then `makeAgentKeyFile` with the
- * account); else null. A file for another network or another account is a `KeyInUseError`, and is
- * never replaced. `pnpm agent:connect` and the MCP server's `connect_to_tender` both choose the key
- * here, so the two attach the same key for the same name.
+ * The key that agent `name` connects on `network` with, for a code made for `account` (always the
+ * code's sub-account, `<name>.<owner>`), in `dir` (which the guard has passed): the one its file
+ * holds, if the file is for that network and for `account` or for no account yet, or, when the
+ * code's record says the owner chose the agent's implicit account (`implicit`), for that account
+ * once `moveAgentKeyToImplicit` has moved it there and it is the implicit account of the file's own
+ * key; else, if `mayMake`, a new one made now (`prepareKeyDir`, then `makeAgentKeyFile` with
+ * `account`); else null. A file for another network or another account is a `KeyInUseError`, and
+ * is never replaced or rewritten here. `pnpm agent:connect` and the MCP server's
+ * `connect_to_tender` both choose the key here, so the two attach the same key for the same name.
  */
 export async function agentKeyFor(options: {
   dir: string;
   name: string;
   network: NetworkId;
   account: string;
+  /** The implicit account the code's record names, if the owner chose it; else null. */
+  implicit?: string | null;
   mayMake: boolean;
 }): Promise<{ publicKey: string; path: string; made: boolean } | null> {
   const { dir, name, network, account } = options;
@@ -319,13 +323,11 @@ export async function agentKeyFor(options: {
           "choose another name for the agent",
       );
     }
-    if (file.account !== undefined && file.account !== account) {
-      // The implicit account of the file's own key is always that key's: the owner chose it for
-      // the agent ("a separate account"), so the file now says so, for the commands that follow.
-      if (account === implicitAccountOf(file.publicKey)) {
-        await writeKeyFile(path, { ...file, account }, true);
-        return { publicKey: file.publicKey, path, made: false };
-      }
+    const moved =
+      options.implicit != null &&
+      file.account === options.implicit &&
+      options.implicit === implicitAccountOf(file.publicKey);
+    if (file.account !== undefined && file.account !== account && !moved) {
       throw new KeyInUseError(
         `the key file of agent ${name} is for ${file.account}, not ${account}: choose another ` +
           "name for the agent",
@@ -337,4 +339,61 @@ export async function agentKeyFor(options: {
   await prepareKeyDir(dir);
   const made = await makeAgentKeyFile({ dir, name, network, account });
   return { ...made, made: true };
+}
+
+/**
+ * Moves agent `name`'s key file, in `dir`, from the code's sub-account `from` (`<name>.<owner>`) to
+ * `to`, once the code's record says the owner chose the agent's implicit account: the file then
+ * names the account the agent registers with, for the commands that follow. Only:
+ * - a file for `network` that names `from` exactly (a file for any other account, or for none, is
+ *   never moved: it may be another agent's, registered already);
+ * - when `to` is the implicit account of the file's own key;
+ * - when the chain says `from` does not exist (`exists`, a `view_account`): an agent whose
+ *   sub-account was made keeps it.
+ * A file that names `to` already was moved before, and is taken as it is. Anything else is a
+ * `KeyInUseError`, and the file is left as it was.
+ */
+export async function moveAgentKeyToImplicit(options: {
+  dir: string;
+  name: string;
+  network: NetworkId;
+  from: string;
+  to: string;
+  /** Whether an account exists on the chain. */
+  exists: (accountId: string) => Promise<boolean>;
+}): Promise<{ publicKey: string; path: string; made: false }> {
+  const { dir, name, network, from, to } = options;
+  const path = agentKeyPath(dir, name);
+  if (!(await hasAgentKeyFile(dir, name))) {
+    throw new KeyInUseError(
+      `agent ${name} has no key file at ${path} to move to ${to}: run the command where its key is`,
+    );
+  }
+  const file = await readAgentKeyFile(dir, name);
+  const found = { publicKey: file.publicKey, path, made: false as const };
+  if (file.network !== network) {
+    throw new KeyInUseError(
+      `agent ${name} has a key for ${file.network} at ${path}, and this code is for ${network}: ` +
+        "its file is not moved",
+    );
+  }
+  if (to !== implicitAccountOf(file.publicKey)) {
+    throw new KeyInUseError(
+      `${to} is not the implicit account of the key of agent ${name} at ${path}: its file is not moved`,
+    );
+  }
+  if (file.account === to) return found;
+  if (file.account !== from) {
+    throw new KeyInUseError(
+      `the key file of agent ${name} is for ${file.account ?? "no account yet"}, not ${from}, the ` +
+        `account this code was made for: its file is not moved to ${to}`,
+    );
+  }
+  if (await options.exists(from)) {
+    throw new KeyInUseError(
+      `${from} exists on the chain, so agent ${name} keeps it: its key file is not moved to ${to}`,
+    );
+  }
+  await writeKeyFile(path, { ...file, account: to }, true);
+  return found;
 }

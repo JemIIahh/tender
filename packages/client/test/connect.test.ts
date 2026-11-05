@@ -66,6 +66,10 @@ function world(
     keys?: string[];
     /** The full-access keys, read after read (the last one again and again), over `keys`. */
     keyLists?: string[][];
+    /** The accounts that exist on the chain, as `view_account` says. */
+    existing?: string[];
+    /** What moving the key file does instead of moving it: a refusal. */
+    moveFails?: Error;
   } = {},
 ) {
   const calls: string[] = [];
@@ -143,6 +147,10 @@ function world(
           calls.push(`plan ${plan?.shortfall}`);
           return plan ?? planOf();
         },
+        accountExists: async (account) => {
+          calls.push(`exists ${account}`);
+          return (options.existing ?? []).includes(account);
+        },
         fullAccessKeys: async () => {
           calls.push("keys");
           if (keyLists.length > 0)
@@ -157,6 +165,13 @@ function world(
       const made = !held;
       held = true;
       return { publicKey: PUBLIC, path: `/keys/${name}.json`, made };
+    },
+    moveKey: async (lookup, name, exists) => {
+      calls.push(`move ${name} ${lookup.account_id}`);
+      if (options.moveFails !== undefined) throw options.moveFails;
+      // As `moveAgentKeyToImplicit` does: the sub-account must not be on the chain.
+      if (await exists(`${lookup.name}.${lookup.owner}`)) throw new Error("sub-account exists");
+      return { publicKey: PUBLIC, path: `/keys/${name}.json`, made: false };
     },
     register: async (lookup, name) => {
       calls.push(`register ${name}`);
@@ -469,10 +484,12 @@ test("the_owner_choosing_the_implicit_account_moves_the_wait_and_the_key_file_th
   expect(w.asked.slice(0, 7).every((account) => account === ACCOUNT)).toBe(true);
   expect(w.asked.at(-1)).toBe(IMPLICIT);
   expect(new Set(w.asked)).toEqual(new Set([ACCOUNT, IMPLICIT]));
-  // The key file is asked for again, for the implicit account, and nothing is made.
-  expect(w.calls.filter((call) => call.startsWith("key "))).toEqual([
+  // The key file is moved once, to the implicit account, after the chain said the sub-account is
+  // not there; nothing is made.
+  expect(w.calls.filter((call) => /^(key|move|exists) /.test(call))).toEqual([
     "key writer true",
-    "key writer false",
+    `move writer ${IMPLICIT}`,
+    `exists ${ACCOUNT}`,
   ]);
   expect(w.registeredAs).toEqual([IMPLICIT]);
   expect(w.lines).toContain(
@@ -543,4 +560,58 @@ test("an_account_whose_setup_key_is_on_its_way_is_waited_for", async () => {
   });
   expect((await connectAgent(w.opts)).status).toBe("registered");
   expect(w.calls).toContain("register writer");
+});
+
+test("the_key_file_moves_only_once_the_record_says_the_owner_chose_the_implicit_account", async () => {
+  // A code on the sub-account all along: no move, no look at the chain for it.
+  const sub = world({ keyStates: ["missing", "has-key"] });
+  expect((await connectAgent(sub.opts)).accountKind).toBe("sub_account");
+  expect(sub.calls.filter((call) => /^(move|exists) /.test(call))).toEqual([]);
+
+  // A sub-account that is on the chain already keeps the agent: the move is refused, and the agent
+  // stops before it waits for or registers anything.
+  const kept = world({ later: [movedOf()], keyStates: ["missing"], existing: [ACCOUNT] });
+  await expect(connectAgent(kept.opts)).rejects.toThrow(/sub-account exists/);
+  expect(kept.calls).not.toContain("register writer");
+  expect(kept.asked.every((account) => account === ACCOUNT)).toBe(true);
+
+  // A move the key store refuses (a file for another account) stops the agent the same way.
+  const refused = world({
+    lookup: movedOf(),
+    existingKey: true,
+    moveFails: new Error("the key file of agent writer is for writer.bob.testnet"),
+  });
+  await expect(connectAgent(refused.opts)).rejects.toThrow(/is for writer\.bob\.testnet/);
+  expect(refused.asked).toEqual([]);
+  expect(refused.calls).not.toContain("register writer");
+});
+
+test("an_implicit_account_of_another_key_is_refused_before_the_key_file_is_touched", async () => {
+  const other = implicitAccountOf(KeyPair.fromRandom("ed25519").getPublicKey().toString()) ?? "";
+  for (const w of [
+    world({ lookup: movedOf({ account_id: other }), existingKey: true }),
+    world({ later: [movedOf({ account_id: other })], keyStates: ["missing"] }),
+  ]) {
+    await expect(connectAgent(w.opts)).rejects.toThrow(/does not add up/);
+    expect(w.calls.some((call) => call.startsWith("move "))).toBe(false);
+  }
+});
+
+test("a_key_file_is_chosen_only_by_the_name_given_or_the_codes_own_name", async () => {
+  // A code made for "reader" never reaches writer's file, even with writer's fingerprint on it.
+  const w = world({
+    lookup: lookupOf({
+      name: "reader",
+      account_id: `reader.${OWNER}`,
+      state: "attached",
+      fingerprint: connectFingerprint(PUBLIC),
+    }),
+  });
+  await expect(connectAgent(w.opts)).rejects.toThrow(/NOT to press Create agent|another key/);
+  expect(w.calls.filter((call) => call.startsWith("key "))).toEqual(["key reader false"]);
+  // With --name, that name, and only it.
+  const named = world({ lookup: lookupOf({ name: "reader", account_id: `reader.${OWNER}` }) });
+  named.opts.name = "writer";
+  expect((await connectAgent(named.opts)).name).toBe("writer");
+  expect(named.calls.filter((call) => call.startsWith("key "))).toEqual(["key writer true"]);
 });

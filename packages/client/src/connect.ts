@@ -55,6 +55,8 @@ export interface ConnectChain {
   plan(accountId: string): Promise<RegistrationPlan>;
   /** The full-access keys of `accountId` (`view_access_key_list`), as `ed25519:<base58>`. */
   fullAccessKeys(accountId: string): Promise<string[]>;
+  /** Whether `accountId` exists (`view_account`). */
+  accountExists(accountId: string): Promise<boolean>;
 }
 
 /** The agent's key, as the caller keeps it: its PUBLIC half and where the file is. */
@@ -76,13 +78,25 @@ export interface ConnectAgentOptions {
    */
   chainFor(lookup: ConnectLookup): ConnectChain;
   /**
-   * The key of agent `name` for the code's account (`lookup.account_id`): read from its file, or
-   * made now if `mayMake`. Null when there is no file and it may not make one: a code that has a
-   * key attached already can only be this agent's if its key is on this machine. Called again, with
-   * `mayMake` false, when the owner moves the code to the implicit account of the key, so that the
-   * key file says which account it is for (`agentKeyFor`).
+   * The key of agent `name` for the account the code was made for, `<lookup.name>.<lookup.owner>`
+   * (`agentKeyFor`): read from its file, or made now if `mayMake`. A file moved already to the
+   * implicit account the code's record names counts too, when the record says the owner chose it.
+   * Null when there is no file and it may not make one: a code that has a key attached already can
+   * only be this agent's if its key is on this machine.
    */
   key(lookup: ConnectLookup, name: string, mayMake: boolean): Promise<ConnectKey | null>;
+  /**
+   * Moves agent `name`'s key file from `<lookup.name>.<lookup.owner>` to the implicit account the
+   * code's record names (`lookup.account_id`), once the record says the owner chose it
+   * (`moveAgentKeyToImplicit`): only a file that names that sub-account, only to its own key's
+   * implicit account, and only when `exists` says the sub-account is not on the chain. It throws
+   * otherwise, and the file is left as it was.
+   */
+  moveKey(
+    lookup: ConnectLookup,
+    name: string,
+    exists: (accountId: string) => Promise<boolean>,
+  ): Promise<ConnectKey>;
   /** Registers the agent with its own key, once its vault holds the bond. */
   register(lookup: ConnectLookup, name: string, key: ConnectKey): Promise<void>;
   log: (line: string) => void;
@@ -161,7 +175,11 @@ function explain(error: unknown): never {
   }
 }
 
-/** The agent's name: `wanted`, else the name the code was made for if it can name a key file. */
+/**
+ * The agent's name, which names its key file: `wanted` (`--name`, or the MCP tool's `name`), else
+ * the name the code was made for if it can name a key file. Nothing else names one: an existing key
+ * file is used again only under one of these two names, and never under one made from an account id.
+ */
 function nameFor(lookup: ConnectLookup, wanted: string | undefined): string {
   const name = wanted ?? lookup.name;
   if (!AGENT_NAME.test(name)) {
@@ -200,6 +218,20 @@ export function rpcKeyState(rpcUrl: string): ConnectChain["keyState"] {
       return "other-keys";
     } catch (error) {
       if (error instanceof AccountDoesNotExistError) return "missing";
+      throw error;
+    }
+  };
+}
+
+/** The chain's `accountExists` through an RPC node (`view_account`), at the last final block. */
+export function rpcAccountExists(rpcUrl: string): ConnectChain["accountExists"] {
+  const provider = new JsonRpcProvider({ url: rpcUrl });
+  return async (accountId) => {
+    try {
+      await provider.viewAccount({ accountId, blockQuery: { finality: "final" } });
+      return true;
+    } catch (error) {
+      if (error instanceof AccountDoesNotExistError) return false;
       throw error;
     }
   };
@@ -281,9 +313,9 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
 
   const lookup = await api.connectLookup(code).catch(explain);
   if (lookup.state === "expired") explain(new ApiError(410, { error: "code_expired" }));
-  // The account is the name under the owner, as the owner asked for it, or (once the owner chose
-  // it) the implicit account of the key attached, which is checked once the key is read. An answer
-  // that says otherwise is not one to act on.
+  // The account is the name under the owner, as the owner asked for it, or, once the code's record
+  // says the owner chose it, the implicit account of the key attached, which is checked once the key
+  // is read. An answer that says otherwise is not one to act on.
   const subAccount = `${lookup.name}.${lookup.owner}`;
   const doesNotAddUp = () =>
     new ConnectError(
@@ -328,16 +360,30 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
     }
     explain(new ApiError(409, { error: "already_attached" }));
   }
-  const implicit = implicitAccountOf(key.publicKey);
-  /** The account an answer names, if it adds up for this agent's key; it throws otherwise. */
-  const accountOf = (answer: ConnectLookup): string => {
-    const expected = answer.account_kind === "implicit" ? implicit : subAccount;
+  /**
+   * Whether an answer adds up for this agent's key: its owner is the code's, and its account is the
+   * sub-account, or, only when the record says the owner chose it, the implicit account of this
+   * agent's own key. It throws otherwise.
+   */
+  const check = (answer: ConnectLookup): void => {
+    const expected =
+      answer.account_kind === "implicit" ? implicitAccountOf(key.publicKey) : subAccount;
     if (expected === null || answer.account_id !== expected || answer.owner !== lookup.owner) {
       throw doesNotAddUp();
     }
-    return expected;
   };
-  accountOf(lookup);
+  /**
+   * The account an answer names, once it adds up. For the implicit account, the key file is moved
+   * to it first (`moveKey`), which the chain must allow: the sub-account must not exist.
+   */
+  const accountOf = async (answer: ConnectLookup): Promise<string> => {
+    check(answer);
+    if (answer.account_kind === "sub_account") return subAccount;
+    const moved = await opts.moveKey(answer, name, (id) => chain.accountExists(id));
+    if (moved.publicKey !== key.publicKey) throw doesNotAddUp();
+    return answer.account_id;
+  };
+  check(lookup);
   const fingerprint = connectFingerprint(key.publicKey);
   log(
     key.made
@@ -347,7 +393,7 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
   log(`public key: ${key.publicKey}`);
   // The latest answer: which account the owner chose, as of now.
   let current = await api.connectAttach(code, key.publicKey).catch(explain);
-  let account = accountOf(current);
+  let account = await accountOf(current);
   log(`fingerprint: ${fingerprint}`);
   if (current.account_kind === "implicit") {
     log(IMPLICIT_ACCOUNT_WORDS(lookup.owner, account));
@@ -389,10 +435,10 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
   };
 
   /**
-   * Asks the API which account the owner chose, at most every `lookupMs`: a code moved to
-   * the implicit account of this agent's key moves the wait there, and the key file with it. A code
-   * contested meanwhile stops the agent. An API that can't be reached now is asked again later: the
-   * chain is what the wait goes by.
+   * Asks the API which account the owner chose, at most every `lookupMs`: a code moved to the
+   * implicit account of this agent's key moves the wait there, and the key file with it
+   * (`accountOf`). A code contested meanwhile stops the agent. An API that can't be reached now is
+   * asked again later: the chain is what the wait goes by.
    */
   let askedAt = now();
   const askWhichAccount = async (): Promise<void> => {
@@ -407,11 +453,8 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
     // The key attached never changes: an answer with another one is not one to act on.
     if (answer.fingerprint !== fingerprint) throw doesNotAddUp();
     if (answer.account_kind !== "implicit") return;
-    const moved = accountOf(answer);
-    const again = await opts.key(answer, name, false);
-    if (again === null || again.publicKey !== key.publicKey) throw doesNotAddUp();
+    account = await accountOf(answer);
     current = answer;
-    account = moved;
     log(IMPLICIT_ACCOUNT_WORDS(lookup.owner, account));
     log(`waiting for ${lookup.owner} to send ${account} its NEAR…`);
   };
