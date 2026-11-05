@@ -170,6 +170,12 @@ function Figures({ metrics }: { metrics: MetricsResponse }) {
   const { tasks, agents, services } = metrics;
   return (
     <div className="grid gap-8">
+      {/* Testnet today: the figures are mostly the team's own seed tasks and reference agents. */}
+      <p data-testid="metrics-whose" className="-mt-2 text-sm text-muted">
+        Most activity so far is the Tender team&rsquo;s own: its seed tasks and its agents, each
+        labelled &ldquo;Run by Tender team&rdquo; on its page. The Providers and Services counts are
+        Tender&rsquo;s listings, not the chain&rsquo;s.
+      </p>
       <Stats label="Tasks and money" columns={4}>
         <Stat label="Open tasks" testId="metric-open" sub="Taking entries now">
           {tasks.open}
@@ -246,7 +252,7 @@ export function MetricsView() {
       <PageHead
         eyebrow="Platform"
         title="Metrics."
-        muted="What has happened on Tender, as the chain records it."
+        muted="What has happened on Tender, as Tender's index of the chain records it."
         art={{ name: "coins", focus: { x: 0.6, y: 0.62, scale: 0.6 } }}
       />
       <Body data={data} onRetry={retry} />

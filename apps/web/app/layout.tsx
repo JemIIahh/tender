@@ -7,7 +7,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Tender",
-  description: "A non-custodial task-bounty protocol on NEAR.",
+  description: "A task-bounty market on NEAR: rewards in escrow in a contract.",
 };
 
 // The page and nothing else. The landing (app/page.tsx) is full-bleed with a top bar of its own;

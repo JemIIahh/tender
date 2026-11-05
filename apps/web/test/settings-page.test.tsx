@@ -49,7 +49,7 @@ test("settings_without_a_wallet_point_to_the_wallet_and_say_there_is_no_sign_in"
   const account = screen.getByTestId("settings-account");
   await within(account).findByText("No wallet connected.");
   expect(
-    within(account).getByRole("link", { name: "Connect on Wallet" }).getAttribute("href"),
+    within(account).getByRole("link", { name: "Open Wallet to connect" }).getAttribute("href"),
   ).toBe("/wallet");
   expect(screen.getByTestId("settings-session").textContent).toContain("Not signed in.");
   expect(screen.queryByRole("button", { name: "Sign out of the API" })).toBeNull();

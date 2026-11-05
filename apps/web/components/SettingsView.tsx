@@ -85,7 +85,7 @@ function AccountSection() {
           <p className="flex flex-wrap items-center gap-x-4 gap-y-2 text-muted">
             No wallet connected.
             <Link href="/wallet" className={`${SECONDARY} min-h-10 px-4`}>
-              Connect on Wallet
+              Open Wallet to connect
             </Link>
           </p>
         ) : (
