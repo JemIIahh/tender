@@ -103,7 +103,7 @@ export function AgentFacts({ agent }: { agent: AgentSummary }) {
       </dl>
 
       <div data-testid="agent-verifier-record" className="grid gap-2 border-t border-line pt-4">
-        <p className={FACT_LABEL}>Verifier record</p>
+        <p className={FACT_LABEL}>Record as a checker</p>
         <VerifierFigures
           picks_made={agent.picks_made}
           voids_after_reveals={agent.voids_after_reveals}

@@ -193,7 +193,7 @@ test("task_page_shows_the_task_and_says_so_when_the_verifier_record_cannot_be_re
   // One section says what is missing, and still names the verifier. It does not claim that the
   // account is no agent, which it does not know.
   const record = within(screen.getByTestId("verifier-record"));
-  expect(record.getByText("Verifier record unavailable")).toBeTruthy();
+  expect(record.getByText("Checker record unavailable")).toBeTruthy();
   expect(record.getByText(VERIFIER)).toBeTruthy();
   expect(record.queryByTestId("picks-made")).toBeNull();
   expect(record.queryByText(/no record/i)).toBeNull();
@@ -233,7 +233,7 @@ test("task_page_takes_the_new_task_when_only_the_verifier_record_fails_on_asking
   await waitFor(() =>
     expect(screen.getByTestId("entry-summary").textContent).toBe("3 committed · 0 revealed"),
   );
-  expect(screen.getByText("Verifier record unavailable")).toBeTruthy();
+  expect(screen.getByText("Checker record unavailable")).toBeTruthy();
   // The task itself is current, so there is no notice that it may be out of date.
   expect(screen.queryByRole("alert")).toBeNull();
 });
@@ -347,15 +347,17 @@ test("task_page_follows_the_clock_into_the_next_phase", async () => {
   fakeApi(routes());
   await open();
   expect(screen.getByTestId("phase-chip").textContent).toBe("Open");
-  expect(screen.getByTestId("live-status").textContent).toBe("Commit window closes in 3s");
+  expect(screen.getByTestId("live-status").textContent).toBe("Answer window (commit) closes in 3s");
 
   await settle(1000);
-  expect(screen.getByTestId("live-status").textContent).toBe("Commit window closes in 2s");
+  expect(screen.getByTestId("live-status").textContent).toBe("Answer window (commit) closes in 2s");
 
   // The windows are half-open: at the deadline the next one has begun. Nothing was fetched.
   await settle(2000);
   expect(screen.getByTestId("phase-chip").textContent).toBe("Revealing");
-  expect(screen.getByTestId("live-status").textContent).toBe("Reveal window closes in 5m 0s");
+  expect(screen.getByTestId("live-status").textContent).toBe(
+    "Opening window (reveal) closes in 5m 0s",
+  );
 });
 
 test("task_page_shows_a_hash_in_the_reveal_window_and_the_link_when_it_ends", async () => {

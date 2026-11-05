@@ -181,7 +181,7 @@ export function Scorecard({
               {`Recompute: sha256(held-out) must equal ${expected}`}
             </p>
             {scorecard.heldout === null ? (
-              <p>The verifier has not published the held-out checks.</p>
+              <p>The checker has not published the held-out checks.</p>
             ) : href === undefined ? (
               <p>The held-out checks cannot be written out as a file.</p>
             ) : (

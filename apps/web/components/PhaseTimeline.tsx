@@ -43,11 +43,11 @@ function liveStatus(live: Phase, window: Segment | undefined, nowNs: bigint): Re
   );
   switch (live) {
     case "open":
-      return closes("Commit window");
+      return closes("Answer window (commit)");
     case "revealing":
-      return closes("Reveal window");
+      return closes("Opening window (reveal)");
     case "judging":
-      return closes("Judging window");
+      return closes("Pick window");
     case "fallback":
       return closes("Poster's fallback window");
     case "expired":

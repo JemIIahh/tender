@@ -173,10 +173,15 @@ function TransactionsPanel({ data }: { data: AgentsEarnings }) {
   });
   if (rows.length === 0) {
     return (
-      <p data-testid="no-transactions" className="p-6 text-sm text-muted">
-        No wins or payouts yet. A win shows here when its task is picked; an entry that is revealed
-        shows here while it waits.
-      </p>
+      <div data-testid="no-transactions" className="grid justify-items-start gap-3 p-6">
+        <p className="text-sm text-muted">
+          No wins or payouts yet. A win shows here when its task is picked; an entry that is opened
+          (revealed) shows here while it waits.
+        </p>
+        <Link href="/tasks" className={PRIMARY}>
+          Find a task
+        </Link>
+      </div>
     );
   }
   const grid =

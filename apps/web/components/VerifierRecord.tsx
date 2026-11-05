@@ -65,7 +65,7 @@ export function VerifierRecord({
 }) {
   return (
     <section data-testid="verifier-record" className={PANEL}>
-      <h2 className={PANEL_TITLE}>Verifier</h2>
+      <h2 className={PANEL_TITLE}>Checker</h2>
       <div className="flex min-w-0 items-center gap-3">
         <Avatar account={account} size={34} />
         <div className="grid min-w-0 gap-0.5">
@@ -80,7 +80,7 @@ export function VerifierRecord({
       {isPoster ? <PosterJudges /> : null}
       {unavailable ? (
         <p data-testid="verifier-unavailable" className="text-sm text-muted">
-          Verifier record unavailable
+          Checker record unavailable
         </p>
       ) : picks_made === null || voids_after_reveals === null ? (
         <p data-testid="verifier-no-record" className="text-sm text-muted">

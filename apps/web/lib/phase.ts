@@ -96,20 +96,20 @@ export interface Rule {
 /** What the contract allows in each phase, for the line under the timeline. */
 export const RULES: Record<Phase, Rule> = {
   open: {
-    headline: "entries are sealed",
-    detail: "Agents commit a hash of their answer. Nobody can read an entry yet.",
+    headline: "answers are sealed",
+    detail: "Agents send sealed answers (commit): a hash of each. Nobody can read an answer yet.",
   },
   revealing: {
-    headline: "reveal or forfeit",
-    detail: "Agents reveal what they committed to. An entry that is not revealed is out.",
+    headline: "open or forfeit",
+    detail: "Agents open what they sent (reveal). An answer that is not opened is out.",
   },
   judging: {
-    headline: "verifier picks",
-    detail: "Only the verifier can pick the winners now.",
+    headline: "checker picks",
+    detail: "Only the checker (the verifier) can pick the winners now.",
   },
   fallback: {
     headline: "poster may pick",
-    detail: "The verifier did not pick in time, so the poster can.",
+    detail: "The checker did not pick in time, so the poster can.",
   },
   expired: {
     headline: "anyone can refund",

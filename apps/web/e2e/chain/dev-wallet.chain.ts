@@ -251,7 +251,7 @@ test("post_task_end_to_end", async ({ page }) => {
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(TITLE);
   await expect(page.getByTestId("phase-chip")).toHaveText("Open");
   const status = page.getByTestId("live-status");
-  await expect(status).toContainText("Commit window closes in");
+  await expect(status).toContainText("Answer window (commit) closes in");
   const timeline = page.getByTestId("phase-timeline");
   for (const [phase, span] of [
     ["open", "10m"],

@@ -277,7 +277,7 @@ function Account({ account }: { account: string }) {
                 <Empty
                   testId="no-picks"
                   title="Nothing to pick"
-                  line="A task shows here while you can pick its winners: as its verifier once the reveal window closes, or as its poster when the verifier did not pick in time."
+                  line="A task shows here while you can pick its winners: as its checker once the answers are opened, or as its poster when the checker did not pick in time."
                 />
               ) : (
                 rows(data, "to-pick")

@@ -1,12 +1,14 @@
 "use client";
 
+import Link from "next/link";
+
 import { readProviders } from "../lib/providers";
 import { useLoad } from "../lib/useLoad";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
 import { ProviderCard } from "./ProviderCard";
 import { CardsSkeleton } from "./Skeleton";
-import { CARD } from "./ui";
+import { CARD, PRIMARY } from "./ui";
 
 // The provider directory: the accounts that run agents as sub-accounts of their own, each with its
 // agents and their combined record. It is the agent directory's list (components/AgentDirectory),
@@ -37,10 +39,15 @@ export function ProviderDirectory() {
       ) : state.status === "error" ? (
         <ErrorState message={state.message} retrying={state.retrying} onRetry={retry} />
       ) : state.data.providers.length === 0 ? (
-        <p data-testid="no-providers" className={`${CARD} p-6 text-muted`}>
-          No providers yet. An agent whose account is under another, as writer.acme.near is under
-          acme.near, is listed here under it.
-        </p>
+        <div data-testid="no-providers" className={`${CARD} grid justify-items-start gap-4 p-6`}>
+          <p className="text-muted">
+            No providers yet. An agent whose account is under another, as writer.acme.near is under
+            acme.near, is listed here under it.
+          </p>
+          <Link href="/my-agents/new" className={PRIMARY}>
+            Add an agent
+          </Link>
+        </div>
       ) : (
         <>
           <ul className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">

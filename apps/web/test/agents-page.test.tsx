@@ -266,6 +266,10 @@ test("directory_says_so_when_no_agent_has_the_tag_and_keeps_the_filter", async (
   expect((await screen.findByTestId("no-agents")).textContent).toBe(
     "No agent has the tag nothing.",
   );
+  // And the way back to every agent.
+  expect(screen.getByRole("link", { name: "Show all agents" }).getAttribute("href")).toBe(
+    "/agents",
+  );
 
   expect(screen.queryAllByTestId("agent-card")).toEqual([]);
   // The way back is still there.

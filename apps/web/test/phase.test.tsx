@@ -231,13 +231,13 @@ test("scrubber_shows_rule_per_phase", () => {
   render(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.created + 10n * SECOND} />);
 
   // Live, the rule is the one of the phase it is now: the commit window.
-  expect(rule()).toBe("entries are sealed");
+  expect(rule()).toBe("answers are sealed");
 
   // One position in each zone, and the rule of the phase the position falls in.
   const expected: Array<[number, string]> = [
-    [10, "entries are sealed"],
-    [30, "reveal or forfeit"],
-    [50, "verifier picks"],
+    [10, "answers are sealed"],
+    [30, "open or forfeit"],
+    [50, "checker picks"],
     [70, "poster may pick"],
     [90, "anyone can refund"],
   ];
@@ -248,9 +248,9 @@ test("scrubber_shows_rule_per_phase", () => {
 });
 
 test("scrubber_rules_are_the_ones_the_plan_names", () => {
-  expect(RULES.open.headline).toBe("entries are sealed");
-  expect(RULES.revealing.headline).toBe("reveal or forfeit");
-  expect(RULES.judging.headline).toBe("verifier picks");
+  expect(RULES.open.headline).toBe("answers are sealed");
+  expect(RULES.revealing.headline).toBe("open or forfeit");
+  expect(RULES.judging.headline).toBe("checker picks");
   expect(RULES.fallback.headline).toBe("poster may pick");
   expect(RULES.expired.headline).toBe("anyone can refund");
 });
@@ -262,7 +262,7 @@ test("scrubber_previews_without_changing_what_is_live", () => {
   const live = () => screen.getByTestId("live-status").textContent;
 
   // Live: the reveal window, counting down the 200 s that are left. Nothing is being previewed.
-  expect(rule()).toBe("reveal or forfeit");
+  expect(rule()).toBe("open or forfeit");
   expect(live()).toContain("3m 20s");
   expect(screen.queryByTestId("preview-status")).toBeNull();
   expect(screen.queryByRole("button", { name: /back to now/i })).toBeNull();
@@ -286,7 +286,7 @@ test("scrubber_goes_back_to_now", async () => {
   expect(rule()).toBe("anyone can refund");
   await userEvent.click(screen.getByRole("button", { name: /back to now/i }));
 
-  expect(rule()).toBe("entries are sealed");
+  expect(rule()).toBe("answers are sealed");
   expect(onScrub).toHaveBeenLastCalledWith(null);
   expect(screen.queryByRole("button", { name: /back to now/i })).toBeNull();
 });
@@ -297,13 +297,13 @@ test("scrubber_follows_the_clock_until_it_is_touched", () => {
 
   rerender(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.commit + 150n * SECOND} />);
   expect((scrubber() as HTMLInputElement).value).toBe("30");
-  expect(rule()).toBe("reveal or forfeit");
+  expect(rule()).toBe("open or forfeit");
 
   // Once it is dragged the position is the person's, and the clock moving on does not take it back.
   dragTo(5);
   rerender(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.reveal + 10n * SECOND} />);
   expect((scrubber() as HTMLInputElement).value).toBe("5");
-  expect(rule()).toBe("entries are sealed");
+  expect(rule()).toBe("answers are sealed");
 });
 
 test("scrubber_marks_the_live_window_and_the_previewed_one", () => {
@@ -333,9 +333,9 @@ test("timeline_shows_four_windows_and_what_follows_them", () => {
 
 test("timeline_counts_down_the_window_that_is_open", () => {
   const cases: Array<[bigint, RegExp]> = [
-    [AT.commit - 90n * SECOND, /commit window closes in\s*1m 30s/i],
-    [AT.reveal - 45n * SECOND, /reveal window closes in\s*45s/i],
-    [AT.pick - 20n * SECOND, /judging window closes in\s*20s/i],
+    [AT.commit - 90n * SECOND, /answer window \(commit\) closes in\s*1m 30s/i],
+    [AT.reveal - 45n * SECOND, /opening window \(reveal\) closes in\s*45s/i],
+    [AT.pick - 20n * SECOND, /pick window closes in\s*20s/i],
     [AT.fallback - 30n * SECOND, /poster.*closes in\s*30s/i],
   ];
   for (const [now, text] of cases) {
@@ -366,7 +366,7 @@ test("timeline_of_a_settled_task_says_settled_and_still_previews_the_clock", () 
 
   // The scrubber still answers what the rule was at another moment, and says it is a what-if.
   dragTo(30);
-  expect(rule()).toBe("reveal or forfeit");
+  expect(rule()).toBe("open or forfeit");
   expect(screen.getByTestId("preview-status").textContent).toMatch(/already settled/i);
 });
 
@@ -389,7 +389,7 @@ test("scrubber_is_a_slider_a_keyboard_can_use", () => {
   dragTo(30);
   const text = slider.getAttribute("aria-valuetext") ?? "";
   expect(text).toMatch(/reveal/i);
-  expect(text).toContain("reveal or forfeit");
+  expect(text).toContain("open or forfeit");
 });
 
 test("scrubber_text_does_not_change_while_it_follows_the_clock", () => {
@@ -405,7 +405,7 @@ test("scrubber_text_does_not_change_while_it_follows_the_clock", () => {
   rerender(<PhaseTimeline task={TIMELINE_TASK} nowNs={AT.commit + 42n * SECOND} />);
 
   expect(text()).toBe(before);
-  expect(before).toBe("Now, reveal window: reveal or forfeit");
+  expect(before).toBe("Now, reveal window: open or forfeit");
   expect(before).not.toMatch(/after posting/);
 });
 

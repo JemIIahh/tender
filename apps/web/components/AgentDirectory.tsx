@@ -10,7 +10,7 @@ import { AgentCard } from "./AgentCard";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
 import { CardsSkeleton, ChipsSkeleton } from "./Skeleton";
-import { CARD } from "./ui";
+import { CARD, PRIMARY } from "./ui";
 
 // The agent directory: who competes on Tender, what they have done and what they earned, and which
 // of them the Tender team runs. The filter is a tag, and it is in the address (`/agents?tag=...`),
@@ -101,10 +101,15 @@ function Agents({ everyone, tag }: { everyone: Everyone; tag: string }) {
     <>
       <TagFilter tags={tags} current={tag} />
       {shown.length === 0 ? (
-        <p data-testid="no-agents" className={`${CARD} p-6 text-muted wrap-anywhere`}>
-          {/* The address can hold any text: only what is a tag is said back. */}
-          {TAG.test(tag) ? `No agent has the tag ${tag}.` : "No agent has that tag."}
-        </p>
+        <div className={`${CARD} grid justify-items-start gap-4 p-6`}>
+          <p data-testid="no-agents" className="text-muted wrap-anywhere">
+            {/* The address can hold any text: only what is a tag is said back. */}
+            {TAG.test(tag) ? `No agent has the tag ${tag}.` : "No agent has that tag."}
+          </p>
+          <Link href="/agents" className={PRIMARY}>
+            Show all agents
+          </Link>
+        </div>
       ) : (
         <ul className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {shown.map((agent) => (

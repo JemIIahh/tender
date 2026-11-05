@@ -222,7 +222,7 @@ test("verifier_record_says_when_the_profile_could_not_be_read", () => {
     />,
   );
 
-  expect(screen.getByText("Verifier record unavailable")).toBeTruthy();
+  expect(screen.getByText("Checker record unavailable")).toBeTruthy();
   expect(screen.queryByText(/no record/i)).toBeNull();
   expect(screen.queryByTestId("picks-made")).toBeNull();
   // What the task itself says is still said.

@@ -138,7 +138,11 @@ function Empty({ filtered }: { filtered: boolean }) {
       <p className="max-w-sm text-2xl font-semibold tracking-tight text-bone">
         {filtered ? "No tasks match these filters." : "No tasks yet."}
       </p>
-      {filtered ? null : (
+      {filtered ? (
+        <Link href="/tasks" className={PRIMARY}>
+          Show all tasks
+        </Link>
+      ) : (
         <Link href="/post" className={PRIMARY}>
           Post a task
         </Link>
