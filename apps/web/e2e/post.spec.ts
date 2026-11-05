@@ -206,6 +206,71 @@ test("post_task_end_to_end", async ({ page }) => {
   await expect(timer).not.toHaveText(before ?? "");
 });
 
+test("post_task_end_to_end_with_the_default_deadline_and_rule", async ({ page }) => {
+  // The page as most posters leave it: the exact-answer rule, the Judge, and the deadline a day off.
+  const chain = new FakeChain(CONTRACT, [{ token: TOKEN, minReward: TUSDC(1) }]);
+  chain.give(TOKEN, ALICE, TUSDC(50));
+  chain.fundVault(ALICE, TOKEN, TUSDC(10));
+  await routeApi(page);
+  await installInjectedWallet(page, { account: ALICE, chain });
+  const api = await routePostApi(page, chain);
+
+  await page.goto("/post");
+  await page.getByLabel("Title", { exact: true }).fill("Capital of Australia");
+  await page.getByLabel("Instructions", { exact: true }).fill("Answer with the city's name.");
+  await page.getByLabel("Accepted answers").fill(`Canberra\n${SECRET}`);
+  await page.getByLabel("Amount (tUSDC)").fill("10");
+  await expect(page.getByTestId("reward-net")).toHaveText(
+    "Winner receives 9.50 tUSDC after the 5% fee.",
+  );
+  await expect(page.getByTestId("deadline-plan")).toContainText(
+    "open them (reveal) for 2h, and the Judge picks by about",
+  );
+  // The field holds a time a day off, to the minute.
+  const typed = await page.getByLabel("Agents answer until").inputValue();
+  const ahead = new Date(typed).getTime() - Date.now();
+  expect(ahead).toBeGreaterThan(86_400_000 - 120_000);
+  expect(ahead).toBeLessThanOrEqual(86_400_000 + 60_000);
+
+  await connect(page);
+  await expect(page.getByTestId("review-funding")).toHaveText(
+    "Your vault: 10.00 tUSDC, enough already.",
+  );
+  const post = page.getByRole("button", { name: "Post task" });
+  await expect(post).toHaveAttribute("aria-disabled", "false");
+  await post.click();
+  await page.waitForURL("**/tasks/1");
+
+  // The task on the chain has the windows a day gives: about a day to answer, then 2 hours to
+  // open, 4 to pick and a day of the poster's fallback.
+  const task = chain.tasks.get(1n);
+  const SECOND = 1_000_000_000n;
+  expect(task).toMatchObject({ poster: ALICE, reward: TUSDC(10), verifier: JUDGE });
+  const commit = task === undefined ? 0n : (task.commitDeadline - task.createdAt) / SECOND;
+  expect(commit).toBeGreaterThan(86_400n - 180n);
+  expect(commit).toBeLessThanOrEqual(86_400n + 60n);
+  expect(task && task.revealDeadline - task.commitDeadline).toBe(7_200n * SECOND);
+  expect(task && task.pickDeadline - task.revealDeadline).toBe(14_400n * SECOND);
+  expect(task && task.fallbackDeadline - task.pickDeadline).toBe(86_400n * SECOND);
+  // The Judge got the accepted answers, salted; nothing else did.
+  const [heldout] = api.heldouts;
+  expect(sha256Hex(heldout?.bytes ?? new Uint8Array())).toBe(task?.heldoutCommitment);
+  const document = JSON.parse(heldout?.text ?? "{}") as { exact?: unknown; salt?: string };
+  expect(document.exact).toEqual({ expected: ["Canberra", SECRET] });
+  expect(document.salt).toMatch(/^[0-9a-f]{64,128}$/);
+  expect(api.blobs.map(({ text }) => text).join("\n")).not.toContain(SECRET);
+
+  // The task page shows the windows it was posted with.
+  const timeline = page.getByTestId("phase-timeline");
+  for (const [phase, span] of [
+    ["revealing", "2h"],
+    ["judging", "4h"],
+    ["fallback", "1d"],
+  ] as const) {
+    await expect(timeline.locator(`[data-phase="${phase}"]`)).toContainText(span);
+  }
+});
+
 test("post_form_fits_a_phone_and_shows_the_keyboard_focus", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   const chain = new FakeChain(CONTRACT, [{ token: TOKEN, minReward: TUSDC(1) }]);
