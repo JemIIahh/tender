@@ -189,7 +189,11 @@ test("raw_units_cut_a_long_number_in_the_middle_visibly_and_keep_every_digit_in_
   expect(head.className).toContain("overflow-hidden");
   expect(head.textContent).toBe(MAX.slice(0, -6));
   expect(head.nextElementSibling?.textContent).toBe("211455");
-  expect(head.nextElementSibling?.className).toContain("shrink-0");
+  // The head gives up only what the tail's six figures need, and the two sit in one line: inline
+  // blocks, which a copy does not part with a line break (flex items it would).
+  expect(head.className).toContain("max-w-[calc(100%-6ch)]");
+  expect(head.className).toContain("inline-block");
+  expect(head.nextElementSibling?.className).toContain("inline-block");
   // Never a scroller that cuts it off at the edge, and never a wrap in the middle.
   expect(amount.className).not.toMatch(/overflow-x-auto|wrap-anywhere/);
   // The cut is for the eye: a screen reader is given the whole number once, as one text, and not
@@ -198,6 +202,9 @@ test("raw_units_cut_a_long_number_in_the_middle_visibly_and_keep_every_digit_in_
   const spoken = amount.parentElement?.querySelectorAll(".sr-only") ?? [];
   expect([...spoken].map((part) => part.textContent)).toEqual([MAX]);
   expect(amount.previousElementSibling?.textContent).toBe(MAX);
+  // The spoken copy can't be selected, so a copy of the line has the number once (e2e/board.spec.ts
+  // copies it in a browser).
+  expect(amount.previousElementSibling?.className).toContain("select-none");
 
   // A short amount is shown as it is, with nothing to cut.
   render(<RawUnits value="42" token="mystery.token.near" amountTestId="short" />);

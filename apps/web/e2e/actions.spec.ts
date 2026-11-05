@@ -256,16 +256,22 @@ test("refund_counts_down_then_refunds_the_funders", async ({ page }) => {
   const chain = new FakeChain(CONTRACT, [{ token: TOKEN }]);
   chain.addTask(chainTask(data));
 
-  // In the reveal window with nothing revealed: it opens at the reveal deadline.
+  // In the reveal window with nothing revealed: it opens at the reveal deadline. The page's clock
+  // starts 30 s before the moment looked at, which is room for a busy machine to load the page in,
+  // and once the page is there it is moved on to 2m 30s before the deadline and held, so the
+  // countdown reads to the second.
   const early = await open(page, data, {
-    now: AT.reveal - 150n * SECOND,
+    now: AT.reveal - 180n * SECOND,
     anchor: "refund",
     account: PERSON,
     chain,
   });
+  // The deadline is not on a whole millisecond (the fixtures count in nanoseconds), and the clock
+  // counts in them: it stops on the first millisecond of the last 150 seconds, not just before it.
+  await page.clock.pauseAt(new Date(Number((AT.reveal - 150n * SECOND + 999_999n) / 1_000_000n)));
   const refund = page.getByTestId("action-refund");
   await expect(refund.getByTestId("refund-opens")).toHaveText(
-    /^Opens in 2m (?:29|30)s, at the reveal deadline, if nobody has revealed an entry by then\.$/,
+    "Opens in 2m 30s, at the reveal deadline, if nobody has revealed an entry by then.",
   );
   await expect(refund.getByRole("button", { name: "Refund the funders" })).toHaveAttribute(
     "aria-disabled",
@@ -279,6 +285,8 @@ test("refund_counts_down_then_refunds_the_funders", async ({ page }) => {
   await expect(refund.getByTestId("refund-open")).toHaveText(
     "Nobody revealed an entry, so anyone can send the reward back to its funders now.",
   );
+  // The clock runs again, for the wallet picker's own timers.
+  await page.clock.resume();
   await connect(page, refund);
   await expect(refund.getByTestId("refund-funder")).toHaveText([`${POSTER}1.50 tUSDC`]);
   await shoot(page, "refund-open");

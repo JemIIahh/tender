@@ -198,3 +198,29 @@ test("board_holds_the_cards_place_while_it_loads_and_its_shapes_keep_still_with_
   await expect(shapes).toHaveCount(3);
   expect(await shimmer.evaluate((element) => getComputedStyle(element).animationName)).toBe("none");
 });
+
+test("a_cut_raw_amount_copies_as_the_one_whole_number", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  // A phone, where the community task's 39-figure reward is cut in the middle on its card.
+  await page.setViewportSize(PHONE);
+  await routeApi(page);
+  await page.goto("/tasks");
+  const reward = page.getByTestId("card-raw-reward");
+  await expect(reward.getByTestId("raw-head")).toBeVisible();
+  const MAX = "340282366920938463463374607431768211455";
+
+  // The person selects the whole line of the number, and copies it.
+  await reward.getByTestId("raw-head").evaluate((head) => {
+    const line = head.parentElement?.parentElement as HTMLElement;
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    const selection = getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  });
+  expect(await page.evaluate(() => getSelection()?.toString())).toBe(MAX);
+  await page.keyboard.press("ControlOrMeta+C");
+  // What lands on the clipboard is the number once, whole: not the screen reader's copy as well,
+  // and not cut in two by a line break.
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(MAX);
+});
