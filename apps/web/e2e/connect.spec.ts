@@ -337,3 +337,25 @@ test("money_already_on_the_sub_account_is_said_and_no_separate_account_is_offere
   await expectToFit(page, "other held");
   await shoot(page, "held-after-switch");
 });
+
+test("a_strangers_storage_on_the_sub_account_is_noted_and_the_separate_account_still_offered", async ({
+  page,
+}) => {
+  const chain = chainOf();
+  chain.storage?.add(AGENT);
+  const { api, wallet } = await openConnected(page, chain, { refuseNewAccounts: true });
+  await page.getByTestId("connect-step-1").getByLabel("Account name").fill("writer");
+  await expect(page.getByTestId("connect-name-state")).toHaveText(`${AGENT} is free.`);
+  await page.getByRole("button", { name: "Get a connect code" }).click();
+  await expect(page.getByTestId("connect-command")).toBeVisible();
+  agentAttaches(api, AGENT_PUBLIC_KEY);
+  await page.getByRole("button", { name: "Create agent" }).click();
+  await expect(page.getByTestId("connect-storage-note")).toHaveText(
+    `Some storage is already paid for ${AGENT}; it stays with that account.`,
+  );
+  await expect(page.getByTestId("connect-implicit-offer")).toBeVisible();
+  await expect(page.getByTestId("connect-implicit-held")).toHaveCount(0);
+  expect(wallet.sent).toEqual([]);
+  await expectToFit(page, "storage note");
+  await shoot(page, "storage-note");
+});

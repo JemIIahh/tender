@@ -1369,3 +1369,73 @@ test("finish_this_agent_pays_nothing_already_paid_for_its_keys_separate_account"
   );
   expect(batches).toEqual([]);
 });
+
+test("fund_agent_on_the_separate_account_pays_nothing_while_the_sub_account_holds_a_bond", async () => {
+  // Fund agent has no disabled state: only the press-time read of the other account stops it. The
+  // code is on the separate account, which exists and lacks its bond; an earlier try left a bond
+  // with writer.alice.testnet.
+  const state = world();
+  const { user, batches } = open(state);
+  await getCode(user);
+  state.accounts.set(IMPLICIT, [PUBLIC]);
+  state.storage.add(IMPLICIT);
+  state.vault.set(AGENT, BOND);
+  if (state.code !== null) {
+    state.code.attached = PUBLIC;
+    state.code.kind = "implicit";
+  }
+  await waitFor(() => expect(step(4).dataset.open).toBe("true"));
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("wrong"));
+  const fund = screen.getByRole("button", { name: "Fund agent" });
+  expect(fund.getAttribute("aria-disabled")).toBe("false");
+
+  await user.click(fund);
+  expect((await screen.findByTestId("connect-fund-error")).textContent).toBe(
+    `A bond is waiting for ${AGENT}; it stays there until that account is created. Finish with a wallet that allows the setup step.`,
+  );
+  expect(batches).toEqual([]);
+  expect(state.vault.get(IMPLICIT)).toBeUndefined();
+});
+
+test("a_strangers_storage_on_the_other_account_is_noted_and_blocks_nothing", async () => {
+  // Someone paid 0.01 NEAR of Tender storage for writer.alice.testnet: the wallet still refuses the
+  // sub-account, and the separate account is offered and paid for all the same.
+  const state = world();
+  state.storage.add(AGENT);
+  const { user, batches } = open(state, { refuseNewAccounts: true });
+  await getCode(user);
+  agentAttaches(state);
+  await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+  await user.click(await screen.findByRole("button", { name: "Create agent" }));
+  const offer = await screen.findByTestId("connect-implicit-offer");
+  expect(screen.queryByTestId("connect-implicit-held")).toBeNull();
+  expect((await screen.findByTestId("connect-storage-note")).textContent).toBe(
+    `Some storage is already paid for ${AGENT}; it stays with that account.`,
+  );
+  await user.click(within(offer).getByRole("button", { name: SEPARATE }));
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
+  expect(batches.map((batch) => batch.map((tx) => tx.receiverId))).toEqual([
+    [IMPLICIT, CONTRACT, TOKEN],
+  ]);
+
+  // The mirror: storage someone paid for the agent's separate account does not stop the
+  // sub-account either.
+  cleanup();
+  sessionStorage.clear();
+  const mirror = world();
+  mirror.storage.add(IMPLICIT);
+  const second = open(mirror);
+  await getCode(second.user);
+  agentAttaches(mirror);
+  await waitFor(() => expect(mirror.requests).toContain(`RPC ft_balance_of ${ALICE}`));
+  expect((await screen.findByTestId("connect-storage-note")).textContent).toBe(
+    `Some storage is already paid for ${IMPLICIT}; it stays with that account.`,
+  );
+  const create = screen.getByRole("button", { name: "Create agent" });
+  expect(create.getAttribute("aria-disabled")).toBe("false");
+  await second.user.click(create);
+  await waitFor(() => expect(screen.getByTestId("tick-funded").dataset.state).toBe("done"));
+  expect(second.batches.map((batch) => batch.map((tx) => tx.receiverId))).toEqual([
+    [AGENT, CONTRACT, TOKEN],
+  ]);
+});

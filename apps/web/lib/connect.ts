@@ -215,21 +215,38 @@ export function whatLanded(
   return `${head}${landed} Press Create agent to try again.`;
 }
 
-/** What Tender holds for an account, as words: "Your bond and storage are", "Storage is"... */
+/**
+ * What Tender holds for an account that stops the other way being paid for, as words: a bond, with
+ * its storage or alone. Storage alone never stops it: Tender takes a storage deposit for any account
+ * id from anyone, so a stranger's 0.01 NEAR could otherwise block the person (`storageNote` says
+ * it is there instead).
+ */
 function heldWhat(chain: AgentOnChain, bond: AgentBondTerms | null): string | null {
-  const bondIn = bond !== null && chain.vault > 0n;
-  if (chain.storage && bondIn) return "Your bond and storage are";
-  // Tender takes storage, and a bond, for any account id from anyone: alone, it may not be yours.
-  if (chain.storage) return "Storage with Tender is";
-  if (bondIn) return "A bond is";
-  return null;
+  if (bond === null || chain.vault === 0n) return null;
+  return chain.storage ? "Your bond and storage are" : "A bond is";
 }
 
 /**
- * What of the first way is on the chain for `<name>.<you>` (`accountId`), in words for the person,
- * or null when nothing is: no account, no storage with Tender and an empty vault. Then, and only
- * then, the separate account can be paid for without paying twice. Storage or a bond that an
- * earlier try paid stays with `<name>.<you>`, which only the person's wallet can create.
+ * A short note for storage alone with Tender for `account` (no bond), which stops nothing: it stays
+ * with that account. Null otherwise.
+ */
+export function storageNote(
+  account: string,
+  chain: AgentOnChain,
+  bond: AgentBondTerms | null,
+): string | null {
+  const bondIn = bond !== null && chain.vault > 0n;
+  return chain.storage && !bondIn
+    ? `Some storage is already paid for ${account}; it stays with that account.`
+    : null;
+}
+
+/**
+ * What of the first way is on the chain for `<name>.<you>` (`accountId`) that stops the separate
+ * account being paid for, in words for the person, or null when nothing does: the account itself,
+ * or a bond in its vault. A bond that an earlier try paid stays with `<name>.<you>`, which only the
+ * person's wallet can create, so the separate account would pay it twice. Storage alone does not
+ * stop it (`storageNote`).
  */
 export function heldOnSubAccount(
   accountId: string,
@@ -249,9 +266,10 @@ export function heldOnSubAccount(
 }
 
 /**
- * The mirror of `heldOnSubAccount`, for a press that pays for `<name>.<you>` (`accountId`): what
+ * The mirror of `heldOnSubAccount`, for a press that pays for `<name>.<you>` (`accountId`): a bond
  * Tender already holds for the agent's separate account (`implicit`), in words, or null when it
- * holds nothing. Paying for `<name>.<you>` then would pay the storage or the bond twice.
+ * holds none. Paying for `<name>.<you>` then would pay the bond twice. Storage alone does not stop
+ * it (`storageNote`).
  */
 export function heldOnImplicit(
   implicit: string,

@@ -38,6 +38,7 @@ import {
   readKeptCode,
   readWalletBalance,
   rememberImplicit,
+  storageNote,
   whatLanded,
 } from "../../lib/connect";
 import { errorMessage } from "../../lib/errors";
@@ -841,6 +842,21 @@ export function ConnectAgent({
     kind === "sub_account" && accountId !== null && chain !== null
       ? heldOnSubAccount(accountId, chain, bond)
       : null;
+  // Storage alone with Tender, which stops nothing: on the other way's account, or on
+  // `<name>.<you>` when the separate account is offered.
+  const otherNote =
+    other !== null && other.account === otherAccount && otherWords === null
+      ? storageNote(other.account, other.chain, bond)
+      : null;
+  const ownNote =
+    primaryRefused &&
+    kind === "sub_account" &&
+    accountId !== null &&
+    chain !== null &&
+    heldWords === null
+      ? storageNote(accountId, chain, bond)
+      : null;
+  const noteWords = otherNote ?? ownNote;
 
   return (
     <section aria-labelledby={`${id}-title`} className="grid gap-4">
@@ -1256,6 +1272,11 @@ export function ConnectAgent({
                   {otherWords !== null && !created ? (
                     <p data-testid="connect-other-held" className={NOTICE}>
                       {otherWords}
+                    </p>
+                  ) : null}
+                  {noteWords !== null && !created ? (
+                    <p data-testid="connect-storage-note" className="text-sm text-muted">
+                      {noteWords}
                     </p>
                   ) : null}
                   {primaryRefused &&
