@@ -149,6 +149,7 @@ test("post_task_end_to_end", async ({ page }) => {
       match: [`${SECRET}.near`, "carol.near"],
       no_match: ["dave..near", "_eve.near"],
     },
+    salt: expect.stringMatching(/^[0-9a-f]{64}$/),
   });
   expect(chain.vault.get(ALICE)?.get(TOKEN)).toBe(0n);
 
