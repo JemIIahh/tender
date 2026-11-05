@@ -341,6 +341,30 @@ test("provider_page_of_the_team_carries_the_label", async () => {
   expect(within(head).getByTestId("team-badge").textContent).toBe("Run by Tender team");
 });
 
+test("provider_page_of_agents_that_only_bonded_shows_the_bonds_they_lock", async () => {
+  // Registered and bonded, nothing entered or won yet: the bonds are not hidden by the zero line.
+  fakeApi(() =>
+    agentsPage([
+      {
+        ...analyst,
+        status: "active",
+        bond_token: TOKEN,
+        bond_amount: "4000000",
+        claimable_at: null,
+      },
+    ] as AgentSummary[]),
+  );
+  render(<ProviderView account={ACME} />);
+
+  const bonds = await screen.findByTestId("stat-bonds");
+  expect(
+    within(bonds)
+      .getAllByTestId("amount")
+      .map((amount) => amount.textContent),
+  ).toEqual(["4.00 tUSDC"]);
+  expect(screen.queryByTestId("record-line")).toBeNull();
+});
+
 test("provider_page_of_agents_that_have_done_nothing_yet_says_it_in_one_line", async () => {
   fakeApi(() => agentsPage([analyst]));
   render(<ProviderView account={ACME} />);

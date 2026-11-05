@@ -446,4 +446,8 @@ test("a_service_comes_back_into_the_form_as_it_was_written", () => {
     verifier: "hirer",
   });
   expect(serviceRequestOf(form).price).toBe("2500000");
+  // The form asks no category: an edited listing keeps its own, and a new one is "other".
+  const research = formOfService(service({ category: "research" }));
+  expect(serviceRequestOf(research).category).toBe("research");
+  expect(emptyServiceForm(["alice.testnet"], "tusdc.testnet").category).toBe("other");
 });

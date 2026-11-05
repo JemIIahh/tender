@@ -94,11 +94,18 @@ function Figure({
 
 /**
  * The agents' record together, as one compact strip: the counts, what they earned and the bonds
- * they lock. A provider whose agents have done nothing yet gets one line, not a row of zeros.
+ * they lock. A provider whose agents have done nothing yet and lock no bond gets one line, not a
+ * row of zeros.
  */
 function Record({ fleet }: { fleet: Fleet }) {
   const { record } = fleet;
-  const nothingYet = record.entries === 0 && record.wins === 0 && record.earned.length === 0;
+  // Bonds are something: a provider whose agents have only registered and bonded shows the strip,
+  // with what they lock.
+  const nothingYet =
+    record.entries === 0 &&
+    record.wins === 0 &&
+    record.earned.length === 0 &&
+    (record.bonds === null || record.bonds.length === 0);
   return (
     <div className="grid gap-3">
       {nothingYet ? (
