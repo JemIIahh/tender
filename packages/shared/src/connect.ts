@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { agentSetupWasm } from "./agentSetup";
 import { plainTextFault } from "./board";
 import { depositCall, storageDepositCall, type TenderCall } from "./calls";
 import { NETWORKS } from "./constants";
@@ -14,16 +15,31 @@ import { AccountIdSchema, U128StringSchema } from "./primitives";
 //   2. The agent, where it runs, makes its own key and posts the PUBLIC half with the code
 //      (`POST /v1/connect/attach`). The code is the post's only credential.
 //   3. The owner's page shows the account and the key's fingerprint (`connectFingerprint`), which the
-//      agent prints too, and one button: the owner's wallet creates the account with that key as a
-//      full-access key, sends it NEAR, and pays its storage and its bond into its vault
-//      (`fundAgentCalls`).
+//      agent prints too, and one button. The owner's wallet makes the agent's account, sends it NEAR,
+//      and pays its storage and its bond into its vault (`fundAgentCalls`), in one approval.
 //   4. The agent registers itself with its own key, and says so (`POST /v1/connect/registered`).
+//
+// THE AGENT'S ACCOUNT (owner decision of 2026-11-05, after a wallet refused to add a full-access
+// key). There are two ways, and the code's record says which one the owner took (`account_kind`):
+//
+//   - `sub_account` (the first try): `<name>.<owner>`, which the owner's transaction creates with
+//     CreateAccount, Transfer, DeployContract (the setup code, `agentSetupWasm`) and a call of
+//     `setup({"public_key": …})`, which adds the agent's key from inside the account
+//     (contract/agent-setup). The wallet sees no AddKey action. Tender's directory lists the agent
+//     under the owner as its provider (ASP), because only a parent can create a sub-account.
+//   - `implicit` (when the wallet refuses that, or the owner chooses it): the agent's own implicit
+//     account, the 64 hex characters of its public key (`implicitAccountOf`). The owner's
+//     transaction is a plain Transfer to it, which every wallet sends; the chain creates the account
+//     with that key. The contract gives such an account no provider, so the directory does not list
+//     it under the owner. The API records the choice (`POST /v1/connect/codes/:id/implicit`) and the
+//     agent waits for that account instead.
 //
 // A code reveals nothing secret and can only attach a public key. Whoever learns it before the
 // agent can attach a key of their own, which is why the page shows the fingerprint to match with
 // what the agent printed before anything is signed. And when a second, different key tries the code
-// (the agent's, after someone else's), the API marks the code contested and the page refuses it. The rules on text are the question board's:
-// a stranger's string is refused if it holds an invisible or control character (`plainTextFault`).
+// (the agent's, after someone else's), the API marks the code contested and the page refuses it. The
+// rules on text are the question board's: a stranger's string is refused if it holds an invisible or
+// control character (`plainTextFault`).
 
 /** How long a code takes a key, from when it was made. */
 export const CONNECT_CODE_TTL_MS = 30 * 60 * 1000;
@@ -51,6 +67,13 @@ export const CONNECT_CODE_PATTERN = /^tc_[a-z2-7]{26}$/;
  * and its gas for a long while. It is the agent's from then on.
  */
 export const AGENT_ACCOUNT_DEPOSIT = 5n * 10n ** 23n;
+
+/**
+ * The gas the owner's wallet attaches to the call of `setup` on the new account: 30 Tgas. The
+ * transaction that creates the account burns about 9 Tgas in all (contract/sandbox's agent_setup
+ * test prints it), and what is not burnt is refunded.
+ */
+export const AGENT_SETUP_GAS = 30n * 10n ** 12n;
 
 /**
  * NEAR the owner's wallet puts into the agent's storage balance with Tender: 0.02 NEAR, 2,000 bytes.
@@ -131,6 +154,18 @@ export function isEd25519PublicKey(text: string): boolean {
 export function connectFingerprint(publicKey: string): string {
   const hex = sha256Hex(publicKey).slice(0, 16).toUpperCase();
   return `${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}`;
+}
+
+/**
+ * The implicit account of an ed25519 public key: the 64 lower-case hex characters of its 32 bytes.
+ * The key controls it, and the chain creates it, with that key as its one full-access key, on the
+ * first transfer to it. Null for anything that is not an ed25519 public key.
+ */
+export function implicitAccountOf(publicKey: string): string | null {
+  if (!isEd25519PublicKey(publicKey)) return null;
+  const bytes = base58Decode(publicKey.slice(KEY_PREFIX.length));
+  if (bytes === null) return null;
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /** One part of an account id: lower-case letters and digits, joined by single `-` or `_`. */
@@ -239,6 +274,51 @@ export function fundAgentCalls(plan: {
   return calls;
 }
 
+/**
+ * An action of the transaction that makes the agent's account, in a wallet connector's shape
+ * (@hot-labs/near-connect 0.12.0). There is no AddKey among them: the sub-account gets the agent's
+ * key from its setup code, and the implicit account from the chain.
+ */
+export type AgentAccountAction =
+  | { type: "CreateAccount" }
+  | { type: "Transfer"; params: { deposit: string } }
+  | { type: "DeployContract"; params: { code: Uint8Array } }
+  | {
+      type: "FunctionCall";
+      params: { methodName: string; args: { public_key: string }; gas: string; deposit: string };
+    };
+
+/**
+ * The one transaction to `<name>.<owner>` that makes the agent's sub-account: CreateAccount, its
+ * NEAR (`AGENT_ACCOUNT_DEPOSIT`), the setup code (`agentSetupWasm`, about 2 KB, which the account
+ * keeps and pays storage for out of that NEAR) and the call of `setup` that adds `publicKey` as its
+ * full-access key. Every action is undone if one fails.
+ */
+export function subAccountActions(publicKey: string): AgentAccountAction[] {
+  return [
+    { type: "CreateAccount" },
+    { type: "Transfer", params: { deposit: AGENT_ACCOUNT_DEPOSIT.toString() } },
+    { type: "DeployContract", params: { code: agentSetupWasm() } },
+    {
+      type: "FunctionCall",
+      params: {
+        methodName: "setup",
+        args: { public_key: publicKey },
+        gas: AGENT_SETUP_GAS.toString(),
+        deposit: "0",
+      },
+    },
+  ];
+}
+
+/**
+ * The one transaction to the agent's implicit account (`implicitAccountOf`): its NEAR, which
+ * creates it with the agent's key as its one full-access key. Every wallet sends a transfer.
+ */
+export function implicitAccountActions(): AgentAccountAction[] {
+  return [{ type: "Transfer", params: { deposit: AGENT_ACCOUNT_DEPOSIT.toString() } }];
+}
+
 // ---- Requests ---------------------------------------------------------------------------------
 
 /**
@@ -319,6 +399,16 @@ const AgentNameAnswer = z
     "expected one part of an account id",
   );
 
+/**
+ * Which account the agent gets (see the top of this file): `<name>.<owner>`, or the implicit
+ * account of its key. An answer from an API older than the choice has no field, which means the
+ * sub-account, the only way there was.
+ */
+export const ConnectAccountKindSchema = z.enum(["sub_account", "implicit"]);
+export type ConnectAccountKind = z.infer<typeof ConnectAccountKindSchema>;
+
+const AccountKindAnswer = ConnectAccountKindSchema.default("sub_account");
+
 /** A public key in an answer: `ed25519:` and 32 bytes, or the answer fails to parse. */
 const PublicKeyAnswer = z
   .string()
@@ -351,12 +441,17 @@ export const ConnectAgentSchema = z
   })
   .nullable();
 
-/** `GET /v1/connect/codes/:id` (signed in as the code's owner). */
+/**
+ * `GET /v1/connect/codes/:id` (signed in as the code's owner), and `POST
+ * /v1/connect/codes/:id/implicit`. `account_id` is the account the agent gets: `<name>.<owner>`, or,
+ * once `account_kind` is `implicit`, the implicit account of `public_key`.
+ */
 export const ConnectCodeStateSchema = z.object({
   id: z.string(),
   owner: AccountIdSchema,
   name: AgentNameAnswer,
   account_id: AccountIdSchema,
+  account_kind: AccountKindAnswer,
   state: ConnectStateSchema,
   created_at: z.iso.datetime(),
   expires_at: z.iso.datetime(),
@@ -376,14 +471,15 @@ const NetworkSchema = z.enum(Object.keys(NETWORKS) as ["sandbox", "testnet", "ma
 
 /**
  * `POST /v1/connect/lookup`, `POST /v1/connect/attach` and `POST /v1/connect/contest`: what the
- * code is for, as the agent needs
- * it: the account it will be, on which network and contract. `fingerprint` is that of the key
- * attached, null while none is.
+ * code is for, as the agent needs it: the account it will be (`<name>.<owner>`, or the implicit
+ * account of the key attached once the owner chose it), on which network and contract.
+ * `fingerprint` is that of the key attached, null while none is.
  */
 export const ConnectLookupSchema = z.object({
   owner: AccountIdSchema,
   name: AgentNameAnswer,
   account_id: AccountIdSchema,
+  account_kind: AccountKindAnswer,
   network: NetworkSchema,
   contract: AccountIdSchema,
   state: ConnectStateSchema,
@@ -399,3 +495,20 @@ export const ConnectRegisteredSchema = z.object({
   registered_at: z.iso.datetime(),
 });
 export type ConnectRegistered = z.infer<typeof ConnectRegisteredSchema>;
+
+/**
+ * `GET /v1/connect/implicit` (signed in): the agents the owner set up as implicit accounts, which
+ * the directory does not list under them, newest first. The record is the owner's own word, kept by
+ * the API: nothing on the chain links the two. `agent` is the account as the index holds it.
+ */
+export const ConnectImplicitAgentsSchema = z.object({
+  agents: z.array(
+    z.object({
+      account_id: AccountIdSchema,
+      name: AgentNameAnswer,
+      created_at: z.iso.datetime(),
+      agent: ConnectAgentSchema,
+    }),
+  ),
+});
+export type ConnectImplicitAgents = z.infer<typeof ConnectImplicitAgentsSchema>;

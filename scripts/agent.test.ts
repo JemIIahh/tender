@@ -22,6 +22,7 @@ import {
   type ConfigView,
   type ConnectLookup,
   connectFingerprint,
+  implicitAccountOf,
 } from "@tender/shared";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
@@ -893,13 +894,17 @@ test("the_script_run_as_a_process_prints_the_public_key_and_never_the_private_on
 
 // ---- connect ----------------------------------------------------------------------------------
 
-/** An API for `connect` that knows one code, for `writer.alice.testnet` on the sandbox. */
+/**
+ * An API for `connect` that knows one code, for `writer.alice.testnet` on the sandbox. Once a key is
+ * attached, a lookup says so; `moveToImplicit` is the owner choosing the key's implicit account.
+ */
 function connectApi(over: Partial<ConnectLookup> = {}) {
   const asked: string[] = [];
-  const lookup: ConnectLookup = {
+  let lookup: ConnectLookup = {
     owner: "alice.testnet",
     name: "writer",
     account_id: "writer.alice.testnet",
+    account_kind: "sub_account",
     network: "sandbox",
     contract: "tender.test.near",
     state: "waiting",
@@ -914,7 +919,9 @@ function connectApi(over: Partial<ConnectLookup> = {}) {
     },
     async connectAttach(_code, publicKey) {
       asked.push(`attach ${publicKey}`);
-      return { ...lookup, state: "attached", fingerprint: connectFingerprint(publicKey) };
+      lookup = { ...lookup, state: "attached", fingerprint: connectFingerprint(publicKey) };
+      attached = publicKey;
+      return lookup;
     },
     async connectContest() {
       asked.push("contest");
@@ -929,7 +936,16 @@ function connectApi(over: Partial<ConnectLookup> = {}) {
       };
     },
   };
-  return { api, asked };
+  let attached: string | null = null;
+  const moveToImplicit = () => {
+    if (attached === null) throw new Error("no key is attached to move");
+    lookup = {
+      ...lookup,
+      account_kind: "implicit",
+      account_id: implicitAccountOf(attached) ?? "",
+    };
+  };
+  return { api, asked, moveToImplicit };
 }
 
 const CONNECT_CODE = "tc_abcdefghijklmnopqrstuvwxyz";
@@ -1070,6 +1086,59 @@ test("connect_makes_inits_key_attaches_its_public_half_and_uses_it_again_on_the_
   await expect(run()).rejects.toThrow(
     /is for someone\.test\.near, not writer\.alice\.testnet: choose another name for the agent \(--name <name>\)/,
   );
+});
+
+test("connect_moves_the_key_file_to_the_implicit_account_the_owner_chose", async () => {
+  const { api, moveToImplicit } = connectApi();
+  const run = () =>
+    connectAgentCommand({
+      ...options(),
+      code: CONNECT_CODE,
+      api: "https://api.example",
+      apiFor: () => api,
+      waitMs: 0,
+      chainCheck: async () => "missing",
+    });
+  expect((await run()).accountKind).toBe("sub_account");
+  const path = join(keys, "writer.json");
+  const made = JSON.parse(await readFile(path, "utf8"));
+  expect(made.account).toBe("writer.alice.testnet");
+
+  // The owner's wallet refused the sub-account, and the owner chose the separate account.
+  moveToImplicit();
+  const implicit = implicitAccountOf(made.publicKey);
+  out.length = 0;
+  const outcome = await run();
+  expect(outcome).toMatchObject({
+    status: "waiting_for_account",
+    accountId: implicit,
+    accountKind: "implicit",
+  });
+  // The same key, the file now naming the account it is for, for the commands that follow.
+  const moved = JSON.parse(await readFile(path, "utf8"));
+  expect(moved).toEqual({ ...made, account: implicit });
+  expect((await stat(path)).mode & 0o777).toBe(0o600);
+  expect(out).toContain(`waiting for alice.testnet to send ${implicit} its NEAR…`);
+  expect(everything()).not.toContain(made.privateKey.slice("ed25519:".length));
+
+  // The implicit account of another key is never this file's.
+  const stranger = connectApi({
+    state: "attached",
+    fingerprint: connectFingerprint(made.publicKey),
+    account_kind: "implicit",
+    account_id: "ab".repeat(32),
+  });
+  await expect(
+    connectAgentCommand({
+      ...options(),
+      code: CONNECT_CODE,
+      api: "https://api.example",
+      apiFor: () => stranger.api,
+      waitMs: 0,
+      chainCheck: async () => "missing",
+    }),
+  ).rejects.toThrow(/the key file of agent writer is for [0-9a-f]{64}, not (ab){32}/);
+  expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ ...made, account: implicit });
 });
 
 test("the_command_line_of_connect_exits_2_when_it_stopped_to_wait", async () => {

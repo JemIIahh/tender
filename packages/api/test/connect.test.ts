@@ -2,9 +2,11 @@ import {
   CONNECT_CODE_PATTERN,
   ConnectCodeCreatedSchema,
   ConnectCodeStateSchema,
+  ConnectImplicitAgentsSchema,
   ConnectLookupSchema,
   ConnectRegisteredSchema,
   connectFingerprint,
+  implicitAccountOf,
 } from "@tender/shared";
 import { Hono } from "hono";
 import { KeyPair } from "near-api-js";
@@ -259,6 +261,7 @@ test("a_lookup_says_what_the_code_is_for_and_where", async () => {
     owner: OWNER,
     name: "writer",
     account_id: `writer.${OWNER}`,
+    account_kind: "sub_account",
     network: "testnet",
     contract: deps.contractId,
     state: "waiting",
@@ -487,6 +490,141 @@ test("the_agents_word_that_it_registered_is_taken_once_the_index_shows_it", asyn
     state: "registered",
     agent: { status: "active", bond_token: "tusdc.testnet", bond_amount: "1000000" },
   });
+});
+
+// ---- The implicit account ---------------------------------------------------------------------
+
+const toImplicit = (id: string, o: { account?: string; key?: KeyKind } = {}) =>
+  send("POST", `/v1/connect/codes/${id}/implicit`, { account: o.account ?? OWNER, ...o });
+const implicitAgents = (account = OWNER) => send("GET", "/v1/connect/implicit", { account });
+
+test("the_owner_moves_an_attached_code_to_the_implicit_account_of_its_key", async () => {
+  const { code, id, account_id } = await makeCode();
+  expect(account_id).toBe(`writer.${OWNER}`);
+  // No key yet: there is no implicit account to choose.
+  const early = await toImplicit(id);
+  expect(early.status).toBe(409);
+  expect((early.body as ErrorBody).error).toBe("not_attached");
+
+  const key = publicKeyOf();
+  expect(ConnectLookupSchema.parse((await attach(code, key)).body).account_kind).toBe(
+    "sub_account",
+  );
+  const moved = await toImplicit(id);
+  expect(moved.status).toBe(200);
+  expect(moved.headers.get("cache-control")).toBe("no-store");
+  const implicit = implicitAccountOf(key);
+  expect(ConnectCodeStateSchema.parse(moved.body)).toMatchObject({
+    account_kind: "implicit",
+    account_id: implicit,
+    name: "writer",
+    public_key: key,
+    state: "attached",
+  });
+  // Every read says so, the agent's too, and asking again changes nothing.
+  expect(ConnectCodeStateSchema.parse((await stateOf(id)).body).account_id).toBe(implicit);
+  expect(ConnectLookupSchema.parse((await lookup(code)).body)).toMatchObject({
+    account_kind: "implicit",
+    account_id: implicit,
+  });
+  expect((await toImplicit(id)).body).toEqual(moved.body);
+
+  // The agent's word that it registered is held to the implicit account in the index.
+  expect((await registered(code)).status).toBe(409);
+  await indexAgent(implicit ?? "");
+  expect((await registered(code)).status).toBe(200);
+});
+
+test("only_the_owners_own_key_moves_a_code_and_nothing_names_the_account", async () => {
+  const { code, id } = await makeCode();
+  const key = publicKeyOf();
+  await attach(code, key);
+  const fnKey = await toImplicit(id, { key: "function_call" });
+  expect(fnKey.status).toBe(403);
+  expect((fnKey.body as ErrorBody).error).toBe("full_access_required");
+  expect((await toImplicit(id, { account: "mallory.testnet" })).status).toBe(404);
+  expect((await toImplicit("not-an-id")).status).toBe(404);
+  expect((await send("POST", `/v1/connect/codes/${id}/implicit`, {})).status, "signed out").toBe(
+    401,
+  );
+  // A body naming another account is not read: the account is the key's own.
+  const named = await send("POST", `/v1/connect/codes/${id}/implicit`, {
+    account: OWNER,
+    body: { account_id: "mallory.testnet" },
+  });
+  expect(ConnectCodeStateSchema.parse(named.body).account_id).toBe(implicitAccountOf(key));
+});
+
+test("a_contested_or_registered_code_keeps_its_account", async () => {
+  const contested = await makeCode("first");
+  await attach(contested.code, publicKeyOf());
+  await attach(contested.code, publicKeyOf());
+  const refused = await toImplicit(contested.id);
+  expect(refused.status).toBe(409);
+  expect((refused.body as ErrorBody).error).toBe("contested");
+
+  const done = await makeCode("second");
+  await attach(done.code, publicKeyOf());
+  await indexAgent(done.account_id);
+  expect((await registered(done.code)).status).toBe(200);
+  const late = await toImplicit(done.id);
+  expect(late.status).toBe(409);
+  expect((late.body as ErrorBody).error).toBe("already_registered");
+  expect(ConnectCodeStateSchema.parse((await stateOf(done.id)).body)).toMatchObject({
+    account_kind: "sub_account",
+    account_id: done.account_id,
+  });
+});
+
+test("the_owners_implicit_agents_are_listed_and_kept_past_their_day", async () => {
+  // One sub-account code, one implicit agent registered, one implicit agent not yet, and one
+  // implicit code contested afterwards, which is not listed.
+  const sub = await makeCode("sub");
+  await attach(sub.code, publicKeyOf());
+  const keyA = publicKeyOf();
+  const a = await makeCode("alpha");
+  await attach(a.code, keyA);
+  await toImplicit(a.id);
+  await indexAgent(implicitAccountOf(keyA) ?? "");
+  nowNs += MINUTE_NS;
+  const keyB = publicKeyOf();
+  const b = await makeCode("beta");
+  await attach(b.code, keyB);
+  await toImplicit(b.id);
+  const c = await makeCode("gamma");
+  await attach(c.code, publicKeyOf());
+  await toImplicit(c.id);
+  await send("POST", "/v1/connect/contest", { body: { code: c.code } });
+
+  const list = await implicitAgents();
+  expect(list.status).toBe(200);
+  expect(list.headers.get("cache-control")).toBe("no-store");
+  expect(ConnectImplicitAgentsSchema.parse(list.body).agents).toEqual([
+    {
+      account_id: implicitAccountOf(keyB),
+      name: "beta",
+      created_at: new Date(Number((TEST_NOW + MINUTE_NS) / 1_000_000n)).toISOString(),
+      agent: null,
+    },
+    {
+      account_id: implicitAccountOf(keyA),
+      name: "alpha",
+      created_at: new Date(Number(TEST_NOW / 1_000_000n)).toISOString(),
+      agent: { status: "active", bond_token: "tusdc.testnet", bond_amount: "1000000" },
+    },
+  ]);
+  expect(ConnectImplicitAgentsSchema.parse((await implicitAgents("bob.testnet")).body)).toEqual({
+    agents: [],
+  });
+  expect((await send("GET", "/v1/connect/implicit", {})).status).toBe(401);
+
+  // Days later, a new code clears the old rows: the implicit agents' stay, the others go.
+  nowNs = TEST_NOW + 3n * 24n * 60n * MINUTE_NS;
+  await makeCode("later");
+  expect((await stateOf(sub.id)).status).toBe(404);
+  expect((await stateOf(c.id)).status).toBe(404);
+  expect((await stateOf(a.id)).status).toBe(200);
+  expect(ConnectImplicitAgentsSchema.parse((await implicitAgents()).body).agents).toHaveLength(2);
 });
 
 // ---- Limits -----------------------------------------------------------------------------------

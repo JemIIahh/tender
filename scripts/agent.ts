@@ -122,10 +122,11 @@ import { envDir, REPO_ROOT, readEnvFile } from "./lib/env";
  * liquid NEAR on the account.
  *
  * CONNECT. `connect` is `connectAgent` of `@tender/client`, with this file's key and register. The
- * code says which account the agent gets (`<name>.<owner>`), on which network and contract; the key
- * is `init`'s, in the same file and directory under the same guard, and is used again if it is there
- * for that account, so a run that stopped (the owner was away) is finished by running the same
- * command again. It prints the key's fingerprint, which the owner's page shows too: the owner
+ * code says which account the agent gets (`<name>.<owner>`, or the implicit account of the agent's
+ * key once the owner chose that on the page), on which network and contract; the key is `init`'s, in
+ * the same file and directory under the same guard, and is used again if it is there for that
+ * account, so a run that stopped (the owner was away) is finished by running the same command again.
+ * When the owner chooses the implicit account, the key file is rewritten to name it. It prints the key's fingerprint, which the owner's page shows too: the owner
  * matches the two before the wallet signs anything. Once the account exists with the key and its
  * vault holds the bond (the owner's batch pays both), it is `register` with `--yes`: the only thing
  * left to move is NEAR into the storage balance, from the NEAR the owner sent the account. `--api`
@@ -1135,6 +1136,8 @@ export interface ConnectCommandOptions extends CommandOptions {
   waitMs?: number;
   /** How often to look while waiting, in ms. 3 s by default. */
   pollMs?: number;
+  /** How often, at most, to ask the API which account the owner chose, in ms. 20 s by default. */
+  lookupMs?: number;
   /** How long to keep asking the API to take the agent's word, once registered, in ms. */
   confirmMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -1255,6 +1258,7 @@ export async function connectAgentCommand(options: ConnectCommandOptions): Promi
     log,
     waitMs: options.waitMs ?? CONNECT_WAIT_MINUTES * 60_000,
     ...(options.pollMs !== undefined && { pollMs: options.pollMs }),
+    ...(options.lookupMs !== undefined && { lookupMs: options.lookupMs }),
     ...(options.confirmMs !== undefined && { confirmMs: options.confirmMs }),
     ...(options.sleep !== undefined && { sleep: options.sleep }),
     ...(options.now !== undefined && { now: options.now }),

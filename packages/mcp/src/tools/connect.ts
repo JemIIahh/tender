@@ -36,6 +36,9 @@ import { errorResult, jsonResult, ToolError } from "./format";
 //     is in that file and nowhere else: no answer of this tool holds it;
 //   - only the PUBLIC key goes to the API, with the code;
 //   - the code must be for the network and the contract this server is set for;
+//   - the account is `<name>.<owner>`, or the agent's own implicit account (64 hex characters) when
+//     the owner's wallet refused the sub-account and the owner chose that on the page; the tool waits
+//     for whichever the code's record names;
 //   - registering is `registerWithBond` with the agent's own key, once the owner's batch has put the
 //     bond in its vault. The only thing it moves is NEAR into the storage balance, out of the NEAR
 //     the owner sent the account for it.
@@ -68,6 +71,8 @@ export interface ConnectToolDeps {
   repoRoot?: string;
   /** How often to look while waiting, in ms. 3 s by default. */
   pollMs?: number;
+  /** How often, at most, to ask the API which account the owner chose, in ms. 20 s by default. */
+  lookupMs?: number;
   /** How long to keep asking the API to take the agent's word, once registered, in ms. */
   confirmMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -86,23 +91,33 @@ const CONNECTS = {
   openWorldHint: true,
 } as const;
 
+/** What the owner should know of an implicit account: it is not listed under them. */
+const NOT_LISTED = (owner: string) =>
+  `It is the agent's own account, so Tender's directory won't list it under ${owner} as its provider.`;
+
 /** What to do after the call, for each place it can stop. */
-function nextStep(outcome: ConnectOutcome, name: string): string {
+function nextStep(outcome: ConnectOutcome): string {
+  const { name } = outcome;
+  const implicit = outcome.accountKind === "implicit";
   switch (outcome.status) {
     case "waiting_for_account":
-      return (
-        `Tell the owner (${outcome.owner}) that the fingerprint is ${outcome.fingerprint}: their page ` +
-        "shows the same one. Once it matches, they press Create agent. Then call connect_to_tender " +
-        "again with the same code."
-      );
+      return implicit
+        ? `${outcome.owner} chose a separate account for the agent, ${outcome.accountId}, and its ` +
+            `NEAR has not arrived yet. ${NOT_LISTED(outcome.owner)} Call connect_to_tender again ` +
+            "with the same code."
+        : `Tell the owner (${outcome.owner}) that the fingerprint is ${outcome.fingerprint}: their ` +
+            "page shows the same one. Once it matches, they press Create agent. Then call " +
+            "connect_to_tender again with the same code.";
     case "waiting_for_bond":
       return (
         `${outcome.accountId} exists, and its bond has not reached its vault yet. Tell the owner: ` +
-        `${FUND_AGENT_WHERE(outcome.owner, name)} Then call connect_to_tender again with the same code.`
+        `${FUND_AGENT_WHERE(outcome.owner, name, outcome.accountKind)} Then call connect_to_tender ` +
+        "again with the same code."
       );
     case "registered":
       return (
-        `${outcome.accountId} is registered. Its full-access key is in ${outcome.keyPath}, and only ` +
+        `${outcome.accountId} is registered.${implicit ? ` ${NOT_LISTED(outcome.owner)}` : ""} ` +
+        `Its full-access key is in ${outcome.keyPath}, and only ` +
         "there. To enter tasks with this server, give it a delegate key, whose spending is capped: " +
         "it can post and top up tasks from the agent's vault up to the caps you set, and burn its " +
         "gas allowance, so set them to what you would lose. From a terminal, " +
@@ -128,7 +143,9 @@ export function registerConnectTool(server: McpServer, deps: ConnectToolDeps): v
         "leaves the file and is never shown), sends only the PUBLIC key to Tender with the code, " +
         "and gives the key's fingerprint for the owner to match on their page before they create " +
         "the account. Then it waits for the owner's wallet to create <name>.<owner> with that key " +
-        "and pay its bond, and registers the agent with its own key. One call waits wait_seconds " +
+        "(or, if the owner chose a separate account, to send NEAR to the key's own implicit " +
+        "account) and pay its bond, and registers the agent with its own key. One call waits " +
+        "wait_seconds " +
         "(50 by default) and says where it stopped (status waiting_for_account or " +
         "waiting_for_bond): call it again with the same code to go on. It moves no token of yours: " +
         "the bond comes from the owner. Safe to repeat.",
@@ -165,6 +182,7 @@ export function registerConnectTool(server: McpServer, deps: ConnectToolDeps): v
           log: (line) => progress.push(line),
           waitMs: (wait_seconds ?? DEFAULT_WAIT_SECONDS) * 1000,
           ...(deps.pollMs !== undefined && { pollMs: deps.pollMs }),
+          ...(deps.lookupMs !== undefined && { lookupMs: deps.lookupMs }),
           ...(deps.confirmMs !== undefined && { confirmMs: deps.confirmMs }),
           ...(deps.sleep !== undefined && { sleep: deps.sleep }),
           ...(deps.now !== undefined && { now: deps.now }),
@@ -205,16 +223,16 @@ export function registerConnectTool(server: McpServer, deps: ConnectToolDeps): v
             });
           },
         });
-        const agentName = name ?? outcome.accountId.split(".")[0] ?? "";
         return jsonResult({
           status: outcome.status,
           account: outcome.accountId,
+          account_kind: outcome.accountKind,
           owner: outcome.owner,
           fingerprint: outcome.fingerprint,
           key_file: outcome.keyPath,
           ...(outcome.confirmed !== null && { confirmed_by_api: outcome.confirmed }),
           progress,
-          next: nextStep(outcome, agentName),
+          next: nextStep(outcome),
         });
       } catch (error) {
         const failure =

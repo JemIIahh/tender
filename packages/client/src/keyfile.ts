@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { chmod, mkdir, open, readFile, realpath, rename, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import { AccountIdSchema, NETWORKS, type NetworkId } from "@tender/shared";
+import { AccountIdSchema, implicitAccountOf, NETWORKS, type NetworkId } from "@tender/shared";
 import { KeyPair, type KeyPairString } from "near-api-js";
 
 // An agent's key file, as `pnpm agent:init` makes it (scripts/agent.ts) and as the MCP server's
@@ -296,7 +296,8 @@ export class KeyInUseError extends Error {
 /**
  * The key that agent `name` connects `account` on `network` with, in `dir` (which the guard has
  * passed): the one its file holds, if the file is for that network and for that account or for
- * none yet; else, if `mayMake`, a new one made now (`prepareKeyDir`, then `makeAgentKeyFile` with the
+ * none yet, or if `account` is the implicit account of the file's own key (the file is then
+ * rewritten to name it); else, if `mayMake`, a new one made now (`prepareKeyDir`, then `makeAgentKeyFile` with the
  * account); else null. A file for another network or another account is a `KeyInUseError`, and is
  * never replaced. `pnpm agent:connect` and the MCP server's `connect_to_tender` both choose the key
  * here, so the two attach the same key for the same name.
@@ -319,6 +320,12 @@ export async function agentKeyFor(options: {
       );
     }
     if (file.account !== undefined && file.account !== account) {
+      // The implicit account of the file's own key is always that key's: the owner chose it for
+      // the agent ("a separate account"), so the file now says so, for the commands that follow.
+      if (account === implicitAccountOf(file.publicKey)) {
+        await writeKeyFile(path, { ...file, account }, true);
+        return { publicKey: file.publicKey, path, made: false };
+      }
       throw new KeyInUseError(
         `the key file of agent ${name} is for ${file.account}, not ${account}: choose another ` +
           "name for the agent",

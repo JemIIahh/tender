@@ -34,6 +34,7 @@ const lookupOf = (over: Partial<ConnectLookup> = {}): ConnectLookup => ({
   owner: "alice.testnet",
   name: "writer",
   account_id: "writer.alice.testnet",
+  account_kind: "sub_account",
   network: "testnet",
   contract: "tender.testnet",
   state: "waiting",

@@ -9,11 +9,13 @@ import {
   type ConnectCodeCreated,
   ConnectCodeRequestSchema,
   type ConnectCodeState,
+  type ConnectImplicitAgents,
   type ConnectLookup,
   type ConnectRegistered,
   type ConnectState,
   CreateConnectCodeRequestSchema,
   connectFingerprint,
+  implicitAccountOf,
   readAgentName,
   sha256Hex,
 } from "@tender/shared";
@@ -31,11 +33,22 @@ import { clientKey, RETRY_SOON, rateLimit, rateLimitsOf } from "../limits";
 //
 //   POST /v1/connect/codes          signed in, with a full-access key: a code for `<name>.<you>`
 //   GET  /v1/connect/codes/:id      signed in as the code's owner: how the code stands
+//   POST /v1/connect/codes/:id/implicit
+//                                   signed in as the code's owner, with a full-access key: the
+//                                    agent gets the implicit account of its key instead of
+//                                    `<name>.<you>` (the owner's wallet refused the sub-account)
+//   GET  /v1/connect/implicit       signed in: the owner's agents set up as implicit accounts
 //   POST /v1/connect/lookup         the code in the body: what it is for (the agent's first look)
 //   POST /v1/connect/attach         the code and a public key in the body: the agent's key, once
 //   POST /v1/connect/contest        the code in the body: the agent saw a key that is not its own
 //   POST /v1/connect/registered     the code in the body: the agent has registered, and the index
 //                                    shows it
+//
+// THE ACCOUNT. A code is for `<name>.<owner>` (`account_kind` `sub_account`) until its owner, with a
+// key attached and no contest and no registration yet, chooses the implicit account of that key
+// (`implicit`). The API works out that account from the key it holds; nothing in the request names
+// it. The choice is made once and kept. A row with `implicit` and no contest is never deleted: it
+// is the owner's only record of the agent, since the chain gives an implicit account no provider.
 //
 // CONTESTED. A code takes one key. When a second, different key tries it (an attach with another
 // key, or the agent saying with `contest` that the key attached is not its own), someone else has
@@ -59,7 +72,8 @@ import { clientKey, RETRY_SOON, rateLimit, rateLimitsOf } from "../limits";
 //        makes under the owner's (`readAgentName`, in the words the web page uses);
 //   404  no such code (or not the caller's: the answer is the same);
 //   409  `already_attached` (another key has the code; the code is marked contested), `not_attached`,
-//        `not_registered`, `contested`;
+//        `not_registered`, `contested`, `already_registered` (an agent registered with the code's
+//        sub-account, so it is too late to choose another);
 //   410  `code_expired`: no key came in the 30 minutes.
 
 /** As the question board's writes: a body over this is refused as it arrives, never parsed. */
@@ -84,12 +98,16 @@ interface CodeRow {
   attached_at: Date | null;
   registered_at: Date | null;
   contested_at: Date | null;
+  account_kind: "sub_account" | "implicit";
 }
 
 /** The columns of a `CodeRow`, for a `select` or a `returning`. */
 const COLUMNS =
   "id, owner, name, account_id, created_at, expires_at, public_key, attached_at, registered_at, " +
-  "contested_at";
+  "contested_at, account_kind";
+
+/** How many implicit agents `GET /v1/connect/implicit` lists, newest first. */
+const MAX_IMPLICIT_AGENTS = 100;
 
 /** `ns` nanoseconds since the epoch, moved by `plusMs`, as ISO 8601 in UTC to the millisecond. */
 function isoAt(ns: bigint, plusMs = 0): string {
@@ -188,6 +206,7 @@ export function connectRoutes(
       owner: row.owner,
       name: row.name,
       account_id: row.account_id,
+      account_kind: row.account_kind,
       network: deps.network,
       contract: deps.contractId,
       state: stateOf(row, nowMs()),
@@ -241,10 +260,13 @@ export function connectRoutes(
       expires_at: isoAt(now, CONNECT_CODE_TTL_MS),
     };
     await deps.db.tx(async (tx) => {
-      // Rows that have been kept their day after expiry go, so the table does not grow with use.
-      await tx.query("delete from connect_codes where expires_at < $1::timestamptz", [
-        isoAt(now, -CONNECT_KEEP_MS),
-      ]);
+      // Rows that have been kept their day after expiry go, so the table does not grow with use;
+      // an implicit agent's row stays, as it is the owner's only record of it.
+      await tx.query(
+        `delete from connect_codes where expires_at < $1::timestamptz
+          and (account_kind = 'sub_account' or contested_at is not null)`,
+        [isoAt(now, -CONNECT_KEEP_MS)],
+      );
       await tx.query(
         `insert into connect_codes (id, code_sha256, owner, name, account_id, created_at, expires_at)
          values ($1, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz)`,
@@ -262,21 +284,14 @@ export function connectRoutes(
     return c.json(created, 200, NOT_CACHED);
   });
 
-  app.get("/connect/codes/:id", requireAuth, perReader, async (c) => {
-    const id = c.req.param("id");
-    const [row] = ID_SHAPE.test(id)
-      ? await deps.db.query<CodeRow>(
-          `select ${COLUMNS} from connect_codes where id = $1 and owner = $2`,
-          [id, c.var.account],
-        )
-      : [];
-    // Another owner's code is answered as no code at all.
-    if (row === undefined) return notFound("no such connect code");
-    const body: ConnectCodeState = {
+  /** How a row stands, for its owner's page. */
+  async function codeStateOf(row: CodeRow): Promise<ConnectCodeState> {
+    return {
       id: row.id,
       owner: row.owner,
       name: row.name,
       account_id: row.account_id,
+      account_kind: row.account_kind,
       state: stateOf(row, nowMs()),
       created_at: row.created_at.toISOString(),
       expires_at: row.expires_at.toISOString(),
@@ -286,6 +301,109 @@ export function connectRoutes(
       registered_at: row.registered_at?.toISOString() ?? null,
       contested_at: row.contested_at?.toISOString() ?? null,
       agent: await agentOf(row.account_id),
+    };
+  }
+
+  /** The caller's own code `id`, or null: another owner's code is answered as no code at all. */
+  async function ownRow(id: string, owner: string): Promise<CodeRow | null> {
+    if (!ID_SHAPE.test(id)) return null;
+    const [row] = await deps.db.query<CodeRow>(
+      `select ${COLUMNS} from connect_codes where id = $1 and owner = $2`,
+      [id, owner],
+    );
+    return row ?? null;
+  }
+
+  app.get("/connect/codes/:id", requireAuth, perReader, async (c) => {
+    const row = await ownRow(c.req.param("id"), c.var.account);
+    if (row === null) return notFound("no such connect code");
+    return c.json(await codeStateOf(row), 200, NOT_CACHED);
+  });
+
+  app.post("/connect/codes/:id/implicit", requireAuth, perReader, tooLarge, async (c) => {
+    // As for a code: only the account's own key, which a wallet signs in with, chooses where the
+    // agent's account is.
+    if (c.var.keyKind !== "full_access") {
+      return fail(
+        403,
+        "full_access_required",
+        "sign in with your wallet (a full-access key) to choose the agent's account",
+      );
+    }
+    const id = c.req.param("id");
+    const owner = c.var.account;
+    const row = await ownRow(id, owner);
+    if (row === null) return notFound("no such connect code");
+    if (row.public_key === null) {
+      return fail(409, "not_attached", "no key is attached to this code yet, so it has no account");
+    }
+    if (row.contested_at !== null) {
+      return fail(
+        409,
+        "contested",
+        "two different keys tried this code, so it is refused: start over with a new code",
+      );
+    }
+    if (row.account_kind === "implicit") return c.json(await codeStateOf(row), 200, NOT_CACHED);
+    if (row.registered_at !== null) {
+      return fail(
+        409,
+        "already_registered",
+        `${row.account_id} registered already, so the agent keeps that account`,
+      );
+    }
+    // The account is the key's own, worked out here from the key the row holds.
+    const implicit = implicitAccountOf(row.public_key);
+    if (implicit === null) throw new Error("a connect code holds a key that is not an ed25519 key");
+    // One guarded statement: a contest or a registration that came in between is not overwritten.
+    const [moved] = await deps.db.query<CodeRow>(
+      `update connect_codes set account_kind = 'implicit', account_id = $3
+        where id = $1 and owner = $2 and account_kind = 'sub_account' and public_key is not null
+          and contested_at is null and registered_at is null
+        returning ${COLUMNS}`,
+      [id, owner, implicit],
+    );
+    if (moved !== undefined) return c.json(await codeStateOf(moved), 200, NOT_CACHED);
+    // Something changed in between: answer by what the row says now.
+    const now = await ownRow(id, owner);
+    if (now === null) return notFound("no such connect code");
+    if (now.account_kind === "implicit") return c.json(await codeStateOf(now), 200, NOT_CACHED);
+    return fail(
+      409,
+      now.contested_at !== null ? "contested" : "already_registered",
+      now.contested_at !== null
+        ? "two different keys tried this code, so it is refused: start over with a new code"
+        : `${now.account_id} registered already, so the agent keeps that account`,
+    );
+  });
+
+  app.get("/connect/implicit", requireAuth, perReader, async (c) => {
+    const rows = await deps.db.query<{
+      account_id: string;
+      name: string;
+      created_at: Date;
+      status: "active" | "unregistering" | "retired" | null;
+      bond_token: string | null;
+      bond_amount: string | null;
+    }>(
+      `select c.account_id, c.name, c.created_at, a.status, a.bond_token,
+              a.bond_amount::text as bond_amount
+         from connect_codes c left join agents a on a.account = c.account_id
+        where c.owner = $1 and c.account_kind = 'implicit' and c.contested_at is null
+        order by c.created_at desc, c.id
+        limit ${MAX_IMPLICIT_AGENTS}`,
+      [c.var.account],
+    );
+    const body: ConnectImplicitAgents = {
+      agents: rows.map((row) => ({
+        account_id: row.account_id,
+        name: row.name,
+        created_at: row.created_at.toISOString(),
+        agent:
+          row.status === null
+            ? null
+            : { status: row.status, bond_token: row.bond_token, bond_amount: row.bond_amount },
+      })),
     };
     return c.json(body, 200, NOT_CACHED);
   });

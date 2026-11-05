@@ -12,14 +12,18 @@ import {
   TenderClient,
 } from "@tender/client";
 import {
-  AGENT_ACCOUNT_DEPOSIT,
+  type AgentAccountAction,
   ConnectCodeCreatedSchema,
   type ConnectCodeState,
   ConnectCodeStateSchema,
+  ConnectImplicitAgentsSchema,
   connectFingerprint,
   fundAgentCalls,
+  implicitAccountActions,
+  implicitAccountOf,
+  subAccountActions,
 } from "@tender/shared";
-import { Account, actions, JsonRpcProvider, type KeyPairString, PublicKey } from "near-api-js";
+import { Account, actions, JsonRpcProvider, type KeyPairString } from "near-api-js";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { connectAgentCommand } from "../../../scripts/agent";
 import { type Services, startServices } from "../../../scripts/serve";
@@ -27,12 +31,15 @@ import { createConnectServer } from "../src/server";
 
 // "Connect your agent" end to end, on a local chain with the bond set and the services
 // (`pnpm serve`'s, with the index in an in-memory PGlite): the owner signs in and makes a code, the
-// agent attaches its public key, the owner's wallet batch is sent as the page builds it (here signed
-// with the owner's key, as a wallet would: the account with the agent's key and its NEAR, its
-// storage with Tender, its bond into its vault), the agent registers itself, and the index shows it
-// active. Once from a terminal (`pnpm agent:connect`'s command), once from an MCP client
-// (`connect_to_tender`), and once with a code that someone else used first. Every line either
-// agent prints is searched for its private key, which must not be in it.
+// agent attaches its public key, the owner's wallet batch is sent with the actions the page sends
+// (`subAccountActions` or `implicitAccountActions` of `@tender/shared`, signed here with the owner's
+// key, as a wallet would: the account and its NEAR, then its storage with Tender and its bond into
+// its vault), the agent registers itself with its own key, and the index shows it active. By the
+// sub-account (its setup code adds the agent's key; no AddKey is sent) from a terminal
+// (`pnpm agent:connect`'s command) and from an MCP client (`connect_to_tender`); by the implicit
+// account, which the owner chooses on the API while the agent waits, and on a later run; and with a
+// code that someone else used first. Every line either agent prints is searched for its private key,
+// which must not be in it.
 
 let chain: LocalChain;
 let services: Services;
@@ -106,22 +113,42 @@ async function stateOf(id: string): Promise<ConnectCodeState> {
   return ConnectCodeStateSchema.parse(await res.json());
 }
 
+/** A wallet connector's action, as near-api-js signs it. */
+function signable(action: AgentAccountAction) {
+  switch (action.type) {
+    case "CreateAccount":
+      return actions.createAccount();
+    case "Transfer":
+      return actions.transfer(BigInt(action.params.deposit));
+    case "DeployContract":
+      return actions.deployContract(action.params.code);
+    case "FunctionCall":
+      return actions.functionCall(
+        action.params.methodName,
+        action.params.args,
+        BigInt(action.params.gas),
+        BigInt(action.params.deposit),
+      );
+  }
+}
+
 /**
- * The owner's one approval, as the page builds it (`createAgentBatch` in apps/web/lib/connect.ts):
- * the account with the agent's key as a full-access key and its NEAR, then `fundAgentCalls`. Signed
- * here with the owner's own key, as the wallet would, one transaction after the other.
+ * The owner's one approval, as the page builds it (`createAgentBatch` and `implicitAgentBatch` in
+ * apps/web/lib/connect.ts): the transaction to the agent's account with the actions of
+ * `@tender/shared`, then `fundAgentCalls`. Signed here with the owner's own key, as the wallet would,
+ * one transaction after the other.
  */
-async function ownerBatch(accountId: string, publicKey: string): Promise<void> {
+async function ownerBatch(accountId: string, accountActions: AgentAccountAction[]): Promise<void> {
   const account = new Account(owner.accountId, provider, owner.privateKey as KeyPairString);
-  await account.signAndSendTransaction({
+  const sent = await account.signAndSendTransaction({
     receiverId: accountId,
-    actions: [
-      actions.createAccount(),
-      actions.transfer(AGENT_ACCOUNT_DEPOSIT),
-      actions.addFullAccessKey(PublicKey.from(publicKey)),
-    ],
+    actions: accountActions.map(signable),
     waitUntil: "FINAL",
   });
+  // No action of it, nor any receipt it made, failed.
+  for (const outcome of [sent.transaction_outcome, ...sent.receipts_outcome]) {
+    expect(JSON.stringify(outcome.outcome.status)).not.toMatch(/Failure/);
+  }
   const terms = bondTermsOf(await reader.getConfig());
   for (const call of fundAgentCalls({
     contractId: chain.contractId,
@@ -135,6 +162,27 @@ async function ownerBatch(accountId: string, publicKey: string): Promise<void> {
       waitUntil: "FINAL",
     });
   }
+}
+
+/** The full-access keys of `accountId`. */
+async function fullAccessKeys(accountId: string): Promise<string[]> {
+  const list = await provider.viewAccessKeyList({
+    accountId,
+    finalityQuery: { finality: "final" },
+  });
+  return list.keys
+    .filter((entry) => entry.access_key.permission === "FullAccess")
+    .map((entry) => String(entry.public_key));
+}
+
+/** What the owner's page sends on "Use a separate account instead": `POST /v1/connect/codes/:id/implicit`. */
+async function chooseImplicit(id: string): Promise<ConnectCodeState> {
+  const res = await fetch(`${services.publicUrl}/v1/connect/codes/${id}/implicit`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(200);
+  return ConnectCodeStateSchema.parse(await res.json());
 }
 
 /** The private key in an agent's key file, and its body alone. */
@@ -181,13 +229,22 @@ test("from_a_terminal_a_code_becomes_an_active_agent_with_one_batch_of_the_owner
   // Nothing on the chain yet: the agent waits for the owner.
   expect(await reader.getAgent(accountId)).toBeNull();
 
-  await ownerBatch(accountId, attached.public_key);
+  await ownerBatch(accountId, subAccountActions(attached.public_key));
 
   const outcome = await connecting;
-  expect(outcome).toMatchObject({ status: "registered", accountId, confirmed: true });
+  expect(outcome).toMatchObject({
+    status: "registered",
+    accountId,
+    accountKind: "sub_account",
+    confirmed: true,
+  });
   const agent = await reader.getAgent(accountId);
   expect(agent?.status).toBe("active");
   expect(agent?.bond_amount).not.toBeNull();
+  // Its provider is the owner, and its one full-access key is the agent's, which the setup code
+  // added: the setup cannot run again.
+  expect(agent?.asp).toBe(owner.accountId);
+  expect(await fullAccessKeys(accountId)).toEqual([attached.public_key]);
   await until(
     "the index shows the agent",
     async () => (await stateOf(code.id)).agent !== null,
@@ -252,7 +309,7 @@ test("from_an_mcp_client_connect_to_tender_goes_on_from_where_it_stopped", async
     expect(String(first.next)).toMatch(/press Create agent\. Then call connect_to_tender again/);
     if (attached.public_key === null) throw new Error("no key attached");
 
-    await ownerBatch(accountId, attached.public_key);
+    await ownerBatch(accountId, subAccountActions(attached.public_key));
 
     // The next call uses the same key, finds the account and the bond, and registers.
     const second = await call({ code: code.code, wait_seconds: 60 });
@@ -269,6 +326,131 @@ test("from_an_mcp_client_connect_to_tender_goes_on_from_where_it_stopped", async
     expect(String(second.next)).not.toMatch(/cannot spend/);
     expect((await reader.getAgent(accountId))?.status).toBe("active");
     const secrets = await secretsIn(join(keys, "reader.json"));
+    for (const answer of [first, second]) {
+      for (const secret of secrets) expect(JSON.stringify(answer)).not.toContain(secret);
+    }
+  } finally {
+    await mcp.close();
+    await server.close();
+  }
+});
+
+test("when_the_wallet_refuses_the_sub_account_the_agent_goes_by_its_implicit_account", async () => {
+  const keys = join(work, "keys-solo");
+  const code = await makeCode("solo");
+  const lines: string[] = [];
+  const connecting = connectAgentCommand({
+    code: code.code,
+    api: services.publicUrl,
+    dir: keys,
+    repoDir: join(work, "repo-solo"),
+    env: { NEAR_RPC_URL: chain.rpcUrl },
+    log: (line) => lines.push(line),
+    pollMs: 300,
+    lookupMs: 600,
+    waitMs: 120_000,
+  });
+  await until(
+    "the agent attaches its key",
+    async () => (await stateOf(code.id)).state === "attached",
+    60_000,
+  );
+  const attached = await stateOf(code.id);
+  if (attached.public_key === null) throw new Error("no key attached");
+  const implicit = implicitAccountOf(attached.public_key);
+  if (implicit === null) throw new Error("no implicit account");
+
+  // The owner's wallet refused the sub-account's transaction (nothing was sent), and the owner
+  // chose the separate account: the API works it out from the key, and the agent moves its wait.
+  const moved = await chooseImplicit(code.id);
+  expect(moved).toMatchObject({ account_kind: "implicit", account_id: implicit });
+  await until(
+    "the agent waits for the implicit account",
+    async () =>
+      lines.some((l) => l.includes(`chose a separate account for this agent: ${implicit}`)),
+    30_000,
+  );
+  await ownerBatch(implicit, implicitAccountActions());
+
+  const outcome = await connecting;
+  expect(outcome).toMatchObject({
+    status: "registered",
+    accountId: implicit,
+    accountKind: "implicit",
+    confirmed: true,
+  });
+  // The chain made it with the agent's key alone, and the contract gives it no provider.
+  expect(await fullAccessKeys(implicit)).toEqual([attached.public_key]);
+  const agent = await reader.getAgent(implicit);
+  expect(agent).toMatchObject({ status: "active", asp: null });
+  expect(await reader.getAgent(`solo.${owner.accountId}`)).toBeNull();
+  // The key file names the account it is for now.
+  expect(JSON.parse(await readFile(join(keys, "solo.json"), "utf8"))).toMatchObject({
+    account: implicit,
+    publicKey: attached.public_key,
+  });
+  // The owner's record lists it: "set up by you, not linked on chain".
+  await until(
+    "the index shows the agent",
+    async () => (await stateOf(code.id)).agent !== null,
+    30_000,
+  );
+  const res = await fetch(`${services.publicUrl}/v1/connect/implicit`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  expect(ConnectImplicitAgentsSchema.parse(await res.json()).agents).toContainEqual(
+    expect.objectContaining({
+      account_id: implicit,
+      name: "solo",
+      agent: expect.objectContaining({ status: "active" }),
+    }),
+  );
+  const secrets = await secretsIn(join(keys, "solo.json"));
+  for (const line of lines) for (const secret of secrets) expect(line).not.toContain(secret);
+});
+
+test("connect_to_tender_goes_on_at_the_implicit_account_the_owner_chose_between_calls", async () => {
+  const keys = join(work, "keys-mcp-solo");
+  const server = createConnectServer({
+    network: chain.network,
+    contractId: chain.contractId,
+    api: new ApiClient({ baseUrl: services.publicUrl }),
+    rpcUrl: chain.rpcUrl,
+    keysDir: keys,
+    pollMs: 300,
+  });
+  const mcp = new Client({ name: "test", version: "0.0.0" });
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(serverSide), mcp.connect(clientSide)]);
+  const call = async (args: Record<string, unknown>) => {
+    const result = await mcp.callTool({ name: "connect_to_tender", arguments: args });
+    const [first] = result.content as Array<{ type: string; text: string }>;
+    if (result.isError) throw new Error(first?.text);
+    return JSON.parse(first?.text ?? "{}") as Record<string, unknown>;
+  };
+  try {
+    const code = await makeCode("lone");
+    const first = await call({ code: code.code, wait_seconds: 0 });
+    expect(first).toMatchObject({ status: "waiting_for_account", account_kind: "sub_account" });
+    const attached = await stateOf(code.id);
+    if (attached.public_key === null) throw new Error("no key attached");
+    const implicit = implicitAccountOf(attached.public_key);
+    if (implicit === null) throw new Error("no implicit account");
+
+    await chooseImplicit(code.id);
+    await ownerBatch(implicit, implicitAccountActions());
+
+    const second = await call({ code: code.code, wait_seconds: 60 });
+    expect(second).toMatchObject({
+      status: "registered",
+      account: implicit,
+      account_kind: "implicit",
+      confirmed_by_api: true,
+    });
+    expect(String(second.next)).toMatch(/won't list it under .* as its provider/);
+    expect(String(second.next)).toMatch(/pnpm agent:delegate --name lone/);
+    expect(await reader.getAgent(implicit)).toMatchObject({ status: "active", asp: null });
+    const secrets = await secretsIn(join(keys, "lone.json"));
     for (const answer of [first, second]) {
       for (const secret of secrets) expect(JSON.stringify(answer)).not.toContain(secret);
     }
