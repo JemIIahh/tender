@@ -119,6 +119,28 @@ test("shared_read_that_throws_is_tried_again_and_never_stops_for_good", async ()
   shared.clear();
 });
 
+test("shared_read_goes_on_for_everyone_when_one_listener_throws", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const { read, answer } = slowRead();
+  const shared = sharedRead(read, 60_000);
+  shared.subscribe(() => {
+    throw new Error("a part that fails");
+  });
+  const seen: number[] = [];
+  shared.subscribe((value) => seen.push(value));
+  await act(async () => answer(1));
+  // The other listener is handed the value, and the read keeps its schedule.
+  expect(seen).toEqual([1]);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(60_000);
+  });
+  expect(read).toHaveBeenCalledTimes(2);
+  await act(async () => answer(2));
+  expect(seen).toEqual([1, 2]);
+  shared.clear();
+});
+
 // ---- The ticker and the pill ------------------------------------------------------------------
 
 const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });

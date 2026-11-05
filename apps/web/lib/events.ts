@@ -282,6 +282,8 @@ interface TabStream {
   kept: StreamEvent[];
   from: bigint | undefined;
   dropped: bigint | undefined;
+  /** The newest id the stream has come to (or was opened after); its ids only go up. */
+  newest: bigint | undefined;
 }
 
 /** The tab's stream, while anything listens to it. */
@@ -339,6 +341,7 @@ export function listenToEvents(
       kept: [],
       from: u64(since),
       dropped: undefined,
+      newest: u64(since),
       stream: { close() {} },
     };
     shared = tab;
@@ -353,6 +356,21 @@ export function listenToEvents(
           for (const one of [...tab.listeners]) resync(one);
         },
         onMessage: (message) => {
+          const id = u64(message.id);
+          if (id !== undefined && tab.newest !== undefined && id < tab.newest) {
+            // The ids went back: the API's database started over, and the API began this stream
+            // at its new newest id (packages/api/src/sse.ts, `startAfter`). What was kept, and
+            // each listener's mark, belong to the old one: they go, and every listener looks
+            // again, as after a stream that came back with nothing to resume from.
+            tab.kept = [];
+            tab.from = undefined;
+            tab.dropped = undefined;
+            for (const one of [...tab.listeners]) {
+              one.after = undefined;
+              resync(one);
+            }
+          }
+          if (id !== undefined) tab.newest = id;
           if (message.id !== undefined) {
             tab.kept.push(message);
             if (tab.kept.length > KEPT_MESSAGES) tab.dropped = u64(tab.kept.shift()?.id);

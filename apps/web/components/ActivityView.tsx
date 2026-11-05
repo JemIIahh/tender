@@ -215,10 +215,13 @@ function useFetchedTokens(feed: readonly FeedEvent[], posted: ReadonlyMap<string
   return fetched;
 }
 
-function Feed({ backlog }: { backlog: Backlog }) {
+function Feed({ backlog, onResync }: { backlog: Backlog; onResync: () => void }) {
   const id = useId();
   const nowMs = useNowMs();
   const wallet = useWallet();
+  // The latest of the page's way to read the backlog again, for the stream's handler.
+  const resyncRef = useRef(onResync);
+  resyncRef.current = onResync;
   const [feed, setFeed] = useState<FeedEvent[]>(backlog.events);
   const [filter, setFilter] = useState(FILTERS[0]?.id ?? "all");
   const [mine, setMine] = useState(false);
@@ -229,7 +232,9 @@ function Feed({ backlog }: { backlog: Backlog }) {
     const stream = listenToEvents(
       {
         onEvent: () => {},
-        onResync: () => {},
+        // The stream can't vouch for what came before: the feed is read again, backlog and all
+        // (the API's database started over, say, and the ids the feed holds are of the old one).
+        onResync: () => resyncRef.current(),
         onMessage: (message) => {
           if (!SHOWN.has(message.event)) return;
           setFeed((was) => mergeFeed(was, [fromStream(message, Date.now())]));
@@ -343,7 +348,7 @@ export function ActivityView() {
         art={{ name: "signal", focus: { x: 0.55, y: 0.5, scale: 0.6 } }}
       />
       {backlog.status === "ready" ? (
-        <Feed backlog={backlog.data} />
+        <Feed backlog={backlog.data} onResync={retry} />
       ) : backlog.status === "error" ? (
         <ErrorState message={backlog.message} retrying={backlog.retrying} onRetry={retry} />
       ) : (

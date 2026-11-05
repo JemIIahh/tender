@@ -461,6 +461,34 @@ test("activity_adds_what_the_stream_says_on_top_and_reads_a_task_s_token_once", 
   expect(lines()).toHaveLength(6);
 });
 
+test("activity_reads_its_backlog_again_when_the_api_s_database_started_over", async () => {
+  const api = apiOf();
+  open(api);
+  await screen.findByTestId("activity");
+  const backlogReads = () =>
+    api.requests.filter((request) => request.startsWith("/v1/events/recent")).length;
+  expect(backlogReads()).toBe(1);
+  expect(FakeEventSource.latest.url).toBe("http://api.test/v1/events?since=12");
+
+  // The stream, opened after 12, sends 3: the ids went back, so the feed it holds is of a database
+  // that is gone. The page reads its backlog again, once, and follows the stream from the new one.
+  const old = FakeEventSource.latest;
+  api.backlog = [BACKLOG[1] as RecentEvent];
+  api.newest = "3";
+  act(() => {
+    old.open();
+    old.send(
+      "committed",
+      { event: "committed", data: committed("2", BOB), height: "101", task_id: "2" },
+      "3",
+    );
+  });
+  await waitFor(() => expect(backlogReads()).toBe(2));
+  await waitFor(() => expect(lines()).toHaveLength(1));
+  expect(old.readyState).toBe(FakeEventSource.CLOSED);
+  expect(FakeEventSource.latest.url).toBe("http://api.test/v1/events?since=3");
+});
+
 test("activity_filters_by_kind_and_by_the_connected_account", async () => {
   const user = open(apiOf(), true);
   await screen.findByTestId("activity");

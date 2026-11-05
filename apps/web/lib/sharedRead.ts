@@ -20,7 +20,8 @@ export interface SharedRead<T> {
  * runs only while something listens: it is read again `everyMs` after the last read began, if the
  * tab is in view then, and otherwise `everyMs` later; and the last value is kept for whoever comes
  * next. A read that throws all the same hands nothing to anyone, and is tried again on the same
- * schedule, so the shared read never stops for good.
+ * schedule; a listener that throws is logged and keeps neither the others nor the schedule from
+ * going on. So the shared read never stops for good while anything listens.
  */
 export function sharedRead<T>(read: () => Promise<T>, everyMs: number): SharedRead<T> {
   const listeners = new Set<(value: T) => void>();
@@ -29,6 +30,15 @@ export function sharedRead<T>(read: () => Promise<T>, everyMs: number): SharedRe
   let timer: ReturnType<typeof setTimeout> | undefined;
   // A read from before `clear` is not handed to anyone after it.
   let era = 0;
+
+  /** Hands `value` to `listener`; one that throws is logged, and the rest go on. */
+  function hand(listener: (value: T) => void, value: T): void {
+    try {
+      listener(value);
+    } catch (error) {
+      console.error(error);
+    }
+  }
 
   function schedule(from: number): void {
     clearTimeout(timer);
@@ -46,14 +56,19 @@ export function sharedRead<T>(read: () => Promise<T>, everyMs: number): SharedRe
     if (under !== null) return;
     const at = Date.now();
     const mine = era;
-    const promise = read();
+    let promise: Promise<T>;
+    try {
+      promise = read();
+    } catch (error) {
+      promise = Promise.reject(error);
+    }
     under = { promise, at };
     promise.then(
       (value) => {
         if (mine !== era) return;
         under = null;
         kept = { value, at };
-        for (const listener of [...listeners]) listener(value);
+        for (const listener of [...listeners]) hand(listener, value);
         if (listeners.size > 0) schedule(at);
       },
       (error) => {
@@ -70,7 +85,7 @@ export function sharedRead<T>(read: () => Promise<T>, everyMs: number): SharedRe
       listeners.add(listener);
       const fresh = kept !== null && Date.now() - kept.at < everyMs;
       if (kept !== null && fresh) {
-        listener(kept.value);
+        hand(listener, kept.value);
         if (timer === undefined && under === null) schedule(kept.at);
       } else {
         refresh();

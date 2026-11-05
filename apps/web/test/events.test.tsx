@@ -789,3 +789,57 @@ test("events_hand_each_listener_a_message_once_and_one_that_fails_stops_no_other
   });
   expect(seen).toEqual(["13"]);
 });
+
+test("events_follow_the_stream_when_its_ids_go_back_after_the_api_s_database_started_over", () => {
+  // A page has heard up to 500. The API's database starts over, and the API begins the stream at
+  // its new newest id, so the next ids are lower: the page hears them, and is told to look again.
+  const seen: Array<string | undefined> = [];
+  const resyncs = vi.fn();
+  listenToEvents({
+    onEvent: () => {},
+    onResync: resyncs,
+    onMessage: (whole) => seen.push(whole.id),
+  });
+  const source = FakeEventSource.latest;
+  act(() => {
+    source.open();
+    source.send("committed", message("committed", "7", committedData("7")), "500");
+  });
+  expect(resyncs).toHaveBeenCalledTimes(1);
+
+  act(() => source.send("committed", message("committed", "8", committedData("8")), "31"));
+  expect(seen).toEqual(["500", "31"]);
+  expect(resyncs).toHaveBeenCalledTimes(2);
+  // From there on the new ids are followed, each once.
+  act(() => {
+    source.send("committed", message("committed", "8", committedData("8")), "32");
+    source.send("committed", message("committed", "8", committedData("8")), "32");
+  });
+  expect(seen).toEqual(["500", "31", "32"]);
+
+  // A part that joins now, having read up to 31 of the new database, is handed 32: what was kept
+  // from the old one is gone.
+  const joined: Array<string | undefined> = [];
+  listenToEvents(
+    { onEvent: () => {}, onResync: () => {}, onMessage: (whole) => joined.push(whole.id) },
+    { since: "31" },
+  );
+  expect(joined).toEqual(["32"]);
+});
+
+test("events_opened_after_an_id_follow_lower_ids_when_the_database_started_over", () => {
+  // Opened after 12 (a backlog the page read), and the database started over below it.
+  const seen: Array<string | undefined> = [];
+  const resyncs = vi.fn();
+  listenToEvents(
+    { onEvent: () => {}, onResync: resyncs, onMessage: (whole) => seen.push(whole.id) },
+    { since: "12" },
+  );
+  const source = FakeEventSource.latest;
+  act(() => {
+    source.open();
+    source.send("committed", message("committed", "7", committedData("7")), "4");
+  });
+  expect(seen).toEqual(["4"]);
+  expect(resyncs).toHaveBeenCalledTimes(1);
+});
