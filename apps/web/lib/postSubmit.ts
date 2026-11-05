@@ -16,11 +16,13 @@ import {
   buildDocuments,
   DocumentError,
   fundingOf,
+  inviteBytes,
   judgeVerifies,
   type PostDocuments,
   type PostForm,
   planPostCalls,
   rewardOf,
+  windowsOf,
 } from "./post";
 import { RpcError, view } from "./rpc";
 import { describeAmount, readVault, type VaultData } from "./vault";
@@ -37,14 +39,14 @@ import {
 // Posting a task, in the order that keeps the money and the held-out checks safe:
 //
 //   1. the documents are built and the reward is read as an amount, before anything leaves the
-//      page (the steps of the wizard hold the rest of the form to what Tender allows, which this
-//      does not see);
+//      page (the form's checks hold the rest of it to what Tender allows, which this does not
+//      see);
 //   1b. only on the first press after a send of unknown outcome: the chain's latest tasks are read
 //      for this very task, and if it is there, that is the result and nothing is sent again;
 //   2. a sign-in to the API, if there is no token for the account;
 //   3. the brief and the criteria are uploaded, each to its own place, and the held-out checks too
 //      if the Judge is to pick (the only reader of them at the API). For any other verifier they
-//      stay on the poster's page: the wizard's Review offers them as a file, which that verifier
+//      stay on the poster's page: the form offers them as a file before Post, which that verifier
 //      needs to pick and can publish with the scorecard (`pick_winners` can; the task page's pick,
 //      a scorecard written by hand, does not);
 //   4. the vault and the storage balance are read afresh, and the calls are planned from what they
@@ -224,7 +226,7 @@ const PANIC_WORDS: Record<string, string> = {
 /** The contract's refusals that pressing Post again, with nothing changed, will not get past. */
 const AGAIN_WONT_HELP = new Set(["E_TOKEN", "E_PAUSED"]);
 
-/** The post found the balances larger than the page showed. Review reads them again. */
+/** The post found the balances larger than the page showed. The page reads them again. */
 const BALANCES_CHANGED = "Your balances changed. Check the amounts and press Post again.";
 
 /** A wallet the person turned down, or a transaction that failed with no contract code. */
@@ -353,7 +355,7 @@ export async function submitPost(
       case "documents":
         return cause instanceof DocumentError
           ? cause.message
-          : "Check the amount, the windows and the verifier: they can't be used as they are.";
+          : "Check the amount, the deadline and who checks the work: they can't be used as they are.";
       case "check":
         return `Couldn't look for your earlier post. ${errorMessage(cause)} Nothing was sent to your wallet.`;
       case "signin":
@@ -404,6 +406,10 @@ export async function submitPost(
   const reward = rewardOf(form, tokenId);
   if (reward === null) {
     throw new SubmitFailure("documents", "The reward can't be used as it is. Check the amount.");
+  }
+  // A deadline is a time, and the time it names may have come while the page was open.
+  if (windowsOf(form) === null) {
+    throw new SubmitFailure("documents", "The deadline has passed. Pick a later one.");
   }
   const docs: PostDocuments = await at("documents", () => buildDocuments(form));
   // The same plan, for an empty vault and no storage top-up, only to see that the form can be made
@@ -471,9 +477,9 @@ export async function submitPost(
   // 4. What the vault holds now decides whether there is a deposit.
   onStage("vault");
   const vault = await at("vault", () => deps.readVault(account));
-  const funding = fundingOf(vault, tokenId, reward);
+  const funding = fundingOf(vault, tokenId, reward, inviteBytes(form));
   if (funding.problem !== null) throw new SubmitFailure("vault", funding.problem);
-  // The person approved the amounts on Review. A read that asks for more than they saw is not
+  // The person approved the amounts the page showed. A read that asks for more than they saw is not
   // theirs to approve, so it is shown to them first: the page reads the balances again.
   const { shown } = input;
   if (

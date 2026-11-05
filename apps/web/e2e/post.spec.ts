@@ -1,4 +1,4 @@
-import { expect, type Locator, type Page, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 import { SIGN_IN_MESSAGE, sha256Hex } from "@tender/shared";
 import { FakeChain } from "../test/fakeChain";
 import { API_URL, routeApi } from "./fixtures";
@@ -6,8 +6,8 @@ import { installInjectedWallet } from "./injectedWallet";
 import { routePostApi } from "./postApi";
 import { STUB_WALLET_NAME } from "./walletStub";
 
-// The post wizard in a browser: a person writes a task, the wizard uploads its documents to a
-// fixture API (e2e/postApi.ts), asks a wallet (e2e/injectedWallet.ts) to sign in and to send one
+// The post form in a browser: a person writes a task on one page, the page uploads its documents to
+// a fixture API (e2e/postApi.ts), asks a wallet (e2e/injectedWallet.ts) to sign in and to send one
 // batch to a model of the contract and its token (test/fakeChain.ts), and the task page opens on
 // the task that was posted. The page finds the wallet through near-connect, so the picker, the
 // signature and the batch are the real ones; what the contract does with the batch is the model's.
@@ -21,44 +21,63 @@ const TUSDC = (whole: number) => BigInt(whole) * 1_000_000n;
 /** A line of the held-out checks. It must reach the held-out upload and nothing else. */
 const SECRET = "held-out-secret-7f3a";
 
+const more = (page: Page) => page.getByRole("button", { name: /^More options/ });
+
+async function openMore(page: Page): Promise<void> {
+  if ((await more(page).getAttribute("aria-expanded")) === "false") await more(page).click();
+}
+
 async function fillBrief(page: Page): Promise<void> {
   await page.getByLabel("Title", { exact: true }).fill("Regex for NEAR account ids");
-  await page.getByLabel("Summary (optional)").fill("One regex that tells valid ids from invalid.");
   await page
     .getByLabel("Instructions", { exact: true })
     .fill("Return the pattern and its flags.\nAnchor it at both ends.");
-  await page.getByLabel("Category", { exact: true }).selectOption("coding");
+  await openMore(page);
+  await page.getByLabel("Summary (optional)").fill("One regex that tells valid ids from invalid.");
   await page.getByLabel("Tags (optional)").fill("regex, near");
 }
 
 async function fillRegexChecks(page: Page): Promise<void> {
+  await openMore(page);
   await page.getByRole("radio", { name: /Regex cases/ }).check();
   await page.getByLabel("Should match", { exact: true }).fill("alice.near\nbob.testnet");
   await page.getByLabel("Should not match", { exact: true }).fill("-bad\nUPPER");
-  await page
-    .getByLabel("Held-out: should match", { exact: true })
-    .fill(`${SECRET}.near\ncarol.near`);
-  await page
-    .getByLabel("Held-out: should not match", { exact: true })
-    .fill("dave..near\n_eve.near");
+  await page.getByLabel("Hidden: should match", { exact: true }).fill(`${SECRET}.near\ncarol.near`);
+  await page.getByLabel("Hidden: should not match", { exact: true }).fill("dave..near\n_eve.near");
 }
 
-/** Writes the whole task, step by step, and stops on the Review step. */
+/** The windows set by hand under More options: 10, 5, 10 and 10 minutes. */
+async function setWindows(page: Page): Promise<void> {
+  await openMore(page);
+  await page.getByRole("checkbox", { name: "Set each window yourself" }).check();
+  for (const [name, amount] of [
+    ["Answer", "10"],
+    ["Open", "5"],
+    ["Pick", "10"],
+    ["Fallback", "10"],
+  ] as const) {
+    await page.getByLabel(`${name} window`, { exact: true }).fill(amount);
+    await page.getByLabel(`${name} window unit`).selectOption("minutes");
+  }
+}
+
+/** Writes the whole task on the one page, More options and all. */
 async function writeTask(page: Page, amount = "5"): Promise<void> {
   await page.goto("/post");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Post a task");
   await fillBrief(page);
-  await page.getByRole("button", { name: "Next: Checks" }).click();
-  await expect(page.getByRole("heading", { level: 2, name: "Checks" })).toBeFocused();
   await fillRegexChecks(page);
-  await page.getByRole("button", { name: "Next: Reward" }).click();
+  await setWindows(page);
   await page.getByLabel("Amount (tUSDC)").fill(amount);
-  await page.getByRole("button", { name: "Review" }).click();
-  await expect(page.getByRole("heading", { level: 2, name: "Review" })).toBeFocused();
+  await expect(page.getByTestId("reward-net")).toHaveText(
+    `Winner receives ${(Number(amount) * 0.95).toFixed(2)} tUSDC after the 5% fee.`,
+  );
+  // Closed again: the fields that hold the hidden cases are not on the page.
+  await more(page).click();
 }
 
 async function connect(page: Page): Promise<void> {
-  await page.getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
   await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
   await expect(page.getByTestId("review-account")).toHaveText(ALICE);
 }
@@ -76,16 +95,13 @@ test("post_task_end_to_end", async ({ page }) => {
 
   await writeTask(page);
 
-  // The review says what is about to happen, and counts the checks the Judge keeps.
-  await expect(page.getByTestId("review-title")).toHaveText("Regex for NEAR account ids");
-  await expect(page.getByTestId("review-reward")).toContainText("5.00 tUSDC");
-  await expect(page.getByTestId("review-heldout")).toHaveText("4 cases");
+  // The page says what is about to happen. Without a wallet its one button connects one.
+  await expect(page.getByTestId("review-reward")).toHaveText("5.00 tUSDC");
   await expect(page.getByTestId("review-verifier")).toContainText("Tender Judge");
   await expect(page.getByTestId("review-account")).toHaveText("Not connected");
-  await expect(page.getByRole("button", { name: "Post task" })).toHaveAttribute(
-    "aria-disabled",
-    "true",
-  );
+  await expect(page.getByTestId("deadline-plan")).toContainText("open them (reveal) for 5m");
+  await expect(page.getByRole("button", { name: "Post task" })).toHaveCount(0);
+  expect(await page.locator("body").textContent()).not.toContain(SECRET);
   await connect(page);
   await expect(page.getByTestId("review-funding")).toHaveText(
     "Your vault: 2.00 tUSDC. Added from your wallet first: 3.00 tUSDC.",
@@ -189,7 +205,7 @@ test("post_task_end_to_end", async ({ page }) => {
   await expect(timer).not.toHaveText(before ?? "");
 });
 
-test("post_wizard_fits_a_phone_and_shows_the_keyboard_focus", async ({ page }) => {
+test("post_form_fits_a_phone_and_shows_the_keyboard_focus", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   const chain = new FakeChain(CONTRACT, [{ token: TOKEN, minReward: TUSDC(1) }]);
   chain.give(TOKEN, ALICE, TUSDC(50));
@@ -198,7 +214,7 @@ test("post_wizard_fits_a_phone_and_shows_the_keyboard_focus", async ({ page }) =
   await installInjectedWallet(page, { account: ALICE, chain });
   await routePostApi(page, chain);
 
-  /** No step is wider than the screen: nothing scrolls sideways. */
+  /** Nothing is wider than the screen: nothing scrolls sideways. */
   const fits = async (where: string) => {
     const widths = await page.evaluate(() => ({
       client: document.documentElement.clientWidth,
@@ -211,13 +227,12 @@ test("post_wizard_fits_a_phone_and_shows_the_keyboard_focus", async ({ page }) =
   };
 
   /**
-   * Every control the keyboard reaches shows where it is. Gives the ids it reached. The walk begins
-   * at the top of the page, or on `from` (which is not one of the controls it reached).
+   * Every control the keyboard reaches shows where it is. Gives the ids it reached (or the words of
+   * a control that has none). The walk begins at the top of the page.
    */
-  const focusRing = async (from?: Locator): Promise<string[]> => {
+  const focusRing = async (): Promise<string[]> => {
     const reached: string[] = [];
-    await from?.focus();
-    for (let presses = 0; presses < 60; presses++) {
+    for (let presses = 0; presses < 120; presses++) {
       await page.keyboard.press("Tab");
       const focus = await page.evaluate(() => {
         const element = document.activeElement;
@@ -233,7 +248,8 @@ test("post_wizard_fits_a_phone_and_shows_the_keyboard_focus", async ({ page }) =
         };
       });
       if (focus === null) break;
-      reached.push(focus.name);
+      // A date and time field is one control with a stop for each of its parts.
+      if (reached.at(-1) !== focus.name) reached.push(focus.name);
       expect(focus.style, `${focus.name} shows no focus ring`).not.toBe("none");
       expect(focus.width, `${focus.name}: the focus ring is thin`).toBeGreaterThanOrEqual(2);
     }
@@ -241,48 +257,59 @@ test("post_wizard_fits_a_phone_and_shows_the_keyboard_focus", async ({ page }) =
   };
 
   await page.goto("/post");
-  await expect(page.getByRole("heading", { level: 2, name: "Brief" })).toBeVisible();
-  await fits("brief");
-  expect(await focusRing()).toEqual(
+  await expect(page.getByLabel("Amount (tUSDC)")).toBeVisible();
+  await fits("the form");
+  // From the top of the page to its last control, and then from More options, opened, on.
+  const top = await focusRing();
+  await openMore(page);
+  await fits("more options");
+  expect([...top, ...(await focusRing())]).toEqual(
     expect.arrayContaining([
       "post-title",
-      "post-summary",
       "post-instructions",
-      "post-category",
+      "post-expected",
+      "post-amount",
+      "post-deadline",
+      "post-more",
+      "post-summary",
       "post-tags",
+      "post-minScore",
       "post-outputFormat",
       "post-maxBytes",
-      "Next: Checks",
+      "post-invited",
+      "Connect wallet",
     ]),
   );
 
   await fillBrief(page);
-  await page.getByRole("button", { name: "Next: Checks" }).click();
   for (const kind of [/Exact answer/, /JSON shape/, /Regex cases/]) {
     await page.getByRole("radio", { name: kind }).check();
     await fits(`checks: ${kind}`);
   }
   await fillRegexChecks(page);
-  await page.getByRole("button", { name: "Next: Reward" }).click();
   await page.getByLabel("Amount (tUSDC)").fill("5");
-  await fits("reward");
-  await page.getByRole("radio", { name: /^Custom/ }).check();
-  await fits("reward, custom windows");
-  await page.getByRole("radio", { name: /^Another account/ }).check();
-  await fits("reward, another verifier");
+  await setWindows(page);
+  await fits("windows set by hand");
+  await page.getByRole("checkbox", { name: "Another account checks the work" }).check();
+  await page.getByLabel("Their NEAR account").fill("bob.testnet");
+  await fits("another checker");
   await page.getByRole("radio", { name: /^Tender Judge/ }).check();
-  await page.getByRole("radio", { name: /^Quick/ }).check();
+  await page.getByRole("checkbox", { name: "Set each window yourself" }).uncheck();
+  await page.getByRole("button", { name: "1 week from now" }).click();
+  await fits("a deadline");
 
-  await page.getByRole("button", { name: "Review" }).click();
-  await expect(page.getByRole("heading", { level: 2, name: "Review" })).toBeVisible();
-  await fits("review, not connected");
+  await fits("not connected");
   await connect(page);
   await expect(page.getByRole("button", { name: "Post task" })).toHaveAttribute(
     "aria-disabled",
     "false",
   );
-  await fits("review, connected");
-  expect(await focusRing(page.getByRole("button", { name: "1 Brief" }))).toEqual(
-    expect.arrayContaining(["Back", "Post task"]),
+  await fits("connected");
+  await page.keyboard.press("Shift+Tab");
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("button", { name: "Post task" })).toBeFocused();
+  const ring = await page.evaluate(
+    () => getComputedStyle(document.activeElement as Element).outlineStyle,
   );
+  expect(ring).not.toBe("none");
 });

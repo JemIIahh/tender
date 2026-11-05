@@ -4,10 +4,11 @@ import { SIGN_IN_MESSAGE, sha256Hex, storageShortfall } from "@tender/shared";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, type MockInstance, onTestFinished, test, vi } from "vitest";
-import { PostWizard } from "../components/post/PostWizard";
+import { PostTask } from "../components/post/PostTask";
 import { heldToken } from "../lib/apiToken";
 import { clearApiToken } from "../lib/auth";
 import {
+  deadlineInput,
   POST_TASK_BYTES,
   RUBRIC_JUDGE_NOTE,
   VAULT_SLOT_BYTES,
@@ -21,7 +22,7 @@ import { JUDGE, SECRET, TOKEN } from "./postForms";
 import { agent } from "./tasks";
 import { type ChainWallet, chainWallet, fakeProvider } from "./walletDoubles";
 
-// The post wizard as a person uses it: the real page over a wallet that runs on a model of the
+// The post form as a person uses it: the real page over a wallet that runs on a model of the
 // contract and its token (read through a fake RPC node) and an API that keeps what it is sent.
 // vitest.config.ts gives the config the network testnet, the contract tender.testnet, the API
 // http://api.test and the node http://rpc.test.
@@ -257,8 +258,6 @@ type User = World["user"];
 const press = (user: User, name: string | RegExp) =>
   user.click(screen.getByRole("button", { name }));
 
-const stepHeading = (name: string) => screen.findByRole("heading", { level: 2, name });
-
 const off = (button: HTMLElement) => button.getAttribute("aria-disabled") === "true";
 
 const testId = (id: string) => screen.getByTestId(id).textContent;
@@ -270,32 +269,62 @@ function fillBrief(): void {
   fill("Instructions", "Return a pattern and its flags.");
 }
 
+const moreButton = () => screen.getByRole("button", { name: /^More options/ });
+
+/** Opens More options, if it is closed. */
+async function openMore(user: User): Promise<void> {
+  if (moreButton().getAttribute("aria-expanded") === "false") await user.click(moreButton());
+}
+
+/** Closes More options, if it is open. */
+async function closeMore(user: User): Promise<void> {
+  if (moreButton().getAttribute("aria-expanded") === "true") await user.click(moreButton());
+}
+
+/** Picks the kind of check under More options, and leaves it open. */
+async function pickKind(user: User, kind: RegExp): Promise<void> {
+  await openMore(user);
+  await user.click(await screen.findByRole("radio", { name: kind }));
+}
+
 async function fillRegexChecks(user: User): Promise<void> {
-  await user.click(screen.getByRole("radio", { name: /Regex cases/ }));
+  await pickKind(user, /Regex cases/);
   fill("Should match", "alice.near\nbob.testnet");
   fill("Should not match", "-bad\nUPPER");
-  fill("Held-out: should match", `${SECRET}.near\ncarol.near`);
-  fill("Held-out: should not match", "dave..near\n_eve.near");
+  fill("Hidden: should match", `${SECRET}.near\ncarol.near`);
+  fill("Hidden: should not match", "dave..near\n_eve.near");
+  await closeMore(user);
 }
 
-async function toChecks(user: User): Promise<void> {
-  fillBrief();
-  await press(user, "Next: Checks");
-  await stepHeading("Checks");
+/** Who checks the work: one of the two choices, or another account under More options. */
+async function chooseChecker(
+  user: User,
+  who: "judge" | "me" | "other",
+  account = "",
+): Promise<void> {
+  if (who !== "other") {
+    await user.click(
+      screen.getByRole("radio", { name: who === "me" ? /^I check it myself/ : /^Tender Judge/ }),
+    );
+    return;
+  }
+  await openMore(user);
+  const box = screen.getByRole("checkbox", { name: "Another account checks the work" });
+  if (!(box as HTMLInputElement).checked) await user.click(box);
+  fill("Their NEAR account", account);
 }
 
+/** The brief and the regex checks are written; the reward's field is on the page. */
 async function toReward(user: User): Promise<void> {
-  await toChecks(user);
+  fillBrief();
   await fillRegexChecks(user);
-  await press(user, "Next: Reward");
   await screen.findByLabelText("Amount (tUSDC)");
 }
 
+/** The whole task is written, with `amount` as its reward. */
 async function toReview(user: User, amount = "5"): Promise<void> {
   await toReward(user);
   fill("Amount (tUSDC)", amount);
-  await press(user, "Review");
-  await stepHeading("Review");
 }
 
 const postButton = () => screen.getByRole("button", { name: /^Post/ });
@@ -317,23 +346,20 @@ async function settle(): Promise<void> {
 
 test("a_regex_task_is_posted_from_the_page_with_the_deposit_first", async () => {
   const { user, chain, wallet, api, said } = setup({ vault: TUSDC(2) });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
 
   await toReview(user);
 
-  // The review says what will happen, in words and counts. The held-out checks are only counted.
-  expect(testId("review-title")).toBe("Regex for NEAR account ids");
-  expect(testId("review-reward")).toContain("5.00 tUSDC");
-  expect(testId("review-answer")).toBe("A regex, as JSON, up to 4,096 bytes");
-  expect(testId("review-checks")).toBe("Regex cases, pass mark 100 of 100");
-  expect(testId("review-split")).toBe("4 examples");
-  expect(testId("review-heldout")).toBe("4 cases");
-  expect(testId("review-prize")).toBe("Winner takes all");
-  expect(testId("review-windows")).toBe(
-    "Commit 10m · Reveal 5m · Judging 10m · Fallback 10m. 35m in all.",
-  );
+  // The page says what will happen, in words: what the winner receives once the fee is taken, and
+  // what posting adds to the vault first. The held-out checks are shown nowhere but in their fields.
+  expect(testId("reward-net")).toBe("Winner receives 4.75 tUSDC after the 5% fee.");
+  expect(testId("review-reward")).toBe("5.00 tUSDC");
   expect(testId("review-verifier")).toBe("Tender Judge (run by the Tender team) · judge.testnet");
   expect(testId("review-account")).toBe(ALICE);
+  expect(testId("deadline-plan")).toMatch(
+    /^Agents send sealed answers \(commit\) until .+, open them \(reveal\) for 2h, and the Judge picks by .+\.$/,
+  );
+  // More options is closed again, so no field holds them on the page, and nothing else says them.
   expect(document.body.textContent).not.toContain(SECRET);
   await waitFor(
     () =>
@@ -388,10 +414,14 @@ test("a_regex_task_is_posted_from_the_page_with_the_deposit_first", async () => 
     maxWinners: 1,
   });
   expect(sha256Hex(heldout?.bytes ?? new Uint8Array())).toBe(task?.heldoutCommitment);
-  expect(task && task.commitDeadline - task.createdAt).toBe(600n * SECOND);
-  expect(task && task.revealDeadline - task.commitDeadline).toBe(300n * SECOND);
-  expect(task && task.pickDeadline - task.revealDeadline).toBe(600n * SECOND);
-  expect(task && task.fallbackDeadline - task.pickDeadline).toBe(600n * SECOND);
+  // The deadline a new form has is a day off, rounded up to the minute; the post's commit window
+  // runs from the press to it, and the other windows follow from a day: 2 hours, 4 and 24.
+  const commit = task === undefined ? 0n : (task.commitDeadline - task.createdAt) / SECOND;
+  expect(commit).toBeGreaterThanOrEqual(86_400n - 30n);
+  expect(commit).toBeLessThanOrEqual(86_400n + 60n);
+  expect(task && task.revealDeadline - task.commitDeadline).toBe(7_200n * SECOND);
+  expect(task && task.pickDeadline - task.revealDeadline).toBe(14_400n * SECOND);
+  expect(task && task.fallbackDeadline - task.pickDeadline).toBe(86_400n * SECOND);
   expect(JSON.parse(heldout?.text ?? "{}")).toEqual({
     regex_cases: {
       match: [`${SECRET}.near`, "carol.near"],
@@ -425,7 +455,7 @@ test("a_regex_task_is_posted_from_the_page_with_the_deposit_first", async () => 
 
 test("a_vault_that_holds_the_reward_posts_without_a_deposit", async () => {
   const { user, wallet } = setup({ vault: TUSDC(8) });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await waitFor(
@@ -440,7 +470,7 @@ test("a_vault_that_holds_the_reward_posts_without_a_deposit", async () => {
 
 test("a_second_press_while_the_first_is_under_way_posts_once", async () => {
   const { user, wallet, api } = setup({ vault: TUSDC(5) });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await user.dblClick(await postReady());
@@ -454,21 +484,17 @@ test("a_second_press_while_the_first_is_under_way_posts_once", async () => {
 });
 
 test.each([
-  { verifier: "Me", typed: null, expected: ALICE },
-  { verifier: "Another account", typed: BOB, expected: BOB },
-])(
-  "the_verifier_is_the_one_the_task_is_posted_with_$verifier",
+  { verifier: "me", typed: "", expected: ALICE },
+  { verifier: "other", typed: BOB, expected: BOB },
+] as const)(
+  "the_checker_is_the_one_the_task_is_posted_with_$verifier",
   async ({ verifier, typed, expected }) => {
     const { user, chain } = setup({ vault: TUSDC(5) });
-    render(<PostWizard judgeAccount={JUDGE} />);
-    await toReward(user);
-    fill("Amount (tUSDC)", "5");
-    await user.click(screen.getByRole("radio", { name: new RegExp(`^${verifier}`) }));
-    if (typed !== null) fill("Their NEAR account", typed);
-    await press(user, "Review");
-    await stepHeading("Review");
+    render(<PostTask judgeAccount={JUDGE} />);
+    await toReview(user);
+    await chooseChecker(user, verifier, typed);
 
-    expect(testId("review-verifier")).toBe(typed ?? "You");
+    expect(testId("review-verifier")).toBe(typed === "" ? "You" : typed);
     await user.click(await postReady());
     await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
 
@@ -476,20 +502,30 @@ test.each([
   },
 );
 
-test("a_verifier_who_is_not_the_judge_is_told_this_site_cannot_pick", async () => {
+test("a_checker_who_is_not_the_judge_is_told_where_to_pick", async () => {
   const { user } = setup({ vault: TUSDC(5) });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReward(user);
 
-  // With the Judge as verifier there is nothing to add: the Judge picks.
+  // With the Judge as checker there is nothing to add: the Judge picks.
   expect(screen.queryByTestId("verifier-picks-with-mcp")).toBeNull();
-  for (const verifier of [/^Me/, /^Another account/]) {
-    await user.click(screen.getByRole("radio", { name: verifier }));
-    expect(testId("verifier-picks-with-mcp")).toBe(VERIFIER_PICKS_WITH_MCP);
-  }
+  await chooseChecker(user, "me");
+  expect(testId("verifier-picks-with-mcp")).toBe(VERIFIER_PICKS_WITH_MCP);
+  await chooseChecker(user, "other", BOB);
+  expect(testId("verifier-picks-with-mcp")).toBe(VERIFIER_PICKS_WITH_MCP);
+  // Another account is neither of the two choices.
+  expect(
+    screen
+      .getAllByRole("radio", { name: /^(?:Tender Judge|I check it myself)/ })
+      .map((radio) => (radio as HTMLInputElement).checked),
+  ).toEqual([false, false]);
   expect(VERIFIER_PICKS_WITH_MCP).toContain("pick_winners");
-  await user.click(screen.getByRole("radio", { name: /^Tender Judge/ }));
+  await chooseChecker(user, "judge");
   expect(screen.queryByTestId("verifier-picks-with-mcp")).toBeNull();
+  expect(
+    (screen.getByRole("checkbox", { name: "Another account checks the work" }) as HTMLInputElement)
+      .checked,
+  ).toBe(false);
 });
 
 // ---- The held-out checks of a task the Judge does not pick --------------------------------------
@@ -531,32 +567,24 @@ function captureDownloads(): Array<{ name: string; bytes: Promise<Uint8Array> }>
 }
 
 test.each([
-  { name: "me", verifier: /^Me/, typed: null, who: "You pick" },
-  {
-    name: "another_account",
-    verifier: /^Another account/,
-    typed: BOB,
-    who: `${BOB} needs these held-out checks`,
-  },
-])(
-  "the_held_out_checks_are_a_file_that_hashes_to_the_commitment_when_the_verifier_is_$name",
+  { name: "me", verifier: "me", typed: "", who: "You pick" },
+  { name: "another_account", verifier: "other", typed: BOB, who: `${BOB} needs the secret checks` },
+] as const)(
+  "the_held_out_checks_are_a_file_that_hashes_to_the_commitment_when_the_checker_is_$name",
   async ({ verifier, typed, who }) => {
     const saved = captureDownloads();
     const { user, chain, api, wallet } = setup({ vault: TUSDC(5) });
-    render(<PostWizard judgeAccount={JUDGE} />);
-    await toReward(user);
-    fill("Amount (tUSDC)", "5");
-    await user.click(screen.getByRole("radio", { name: verifier }));
-    if (typed !== null) fill("Their NEAR account", typed);
-    await press(user, "Review");
-    await stepHeading("Review");
+    render(<PostTask judgeAccount={JUDGE} />);
+    await toReview(user);
+    await chooseChecker(user, verifier, typed);
+    await closeMore(user);
 
-    // The page says what the file is for. The checks are in no attribute of the page.
+    // The page says what the file is for. The checks are in no attribute of the page, More options
+    // being closed, where the fields that hold them are.
     const box = screen.getByTestId("heldout-download");
     expect(box.textContent).toContain(who);
     expect(box.textContent).toContain("publish");
     expect(document.body.innerHTML).not.toContain(SECRET);
-    expect(testId("review-heldout")).toBe("4 cases");
 
     await user.click(within(box).getByRole("button", { name: "Download held-out checks" }));
     expect(saved).toHaveLength(1);
@@ -576,9 +604,9 @@ test.each([
   },
 );
 
-test("the_judge_gets_the_held_out_checks_and_review_offers_no_file", async () => {
+test("the_judge_gets_the_held_out_checks_and_the_page_offers_no_file", async () => {
   const { user, api } = setup({ vault: TUSDC(5) });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   expect(screen.queryByTestId("heldout-download")).toBeNull();
@@ -589,13 +617,9 @@ test("the_judge_gets_the_held_out_checks_and_review_offers_no_file", async () =>
 
 test("the_judges_own_account_typed_in_as_another_account_is_still_the_judge", async () => {
   const { user, api } = setup({ vault: TUSDC(5) });
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toReward(user);
-  fill("Amount (tUSDC)", "5");
-  await user.click(screen.getByRole("radio", { name: /^Another account/ }));
-  fill("Their NEAR account", JUDGE);
-  await press(user, "Review");
-  await stepHeading("Review");
+  render(<PostTask judgeAccount={JUDGE} />);
+  await toReview(user);
+  await chooseChecker(user, "other", JUDGE);
 
   expect(screen.queryByTestId("heldout-download")).toBeNull();
   await user.click(await postReady());
@@ -605,58 +629,120 @@ test("the_judges_own_account_typed_in_as_another_account_is_still_the_judge", as
 
 test("a_task_with_no_held_out_checks_offers_no_file_whoever_picks", async () => {
   const { user } = setup({ vault: TUSDC(5) });
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toChecks(user);
-  await user.click(screen.getByRole("radio", { name: /Regex cases/ }));
+  render(<PostTask judgeAccount={JUDGE} />);
+  fillBrief();
+  await pickKind(user, /Regex cases/);
   fill("Should match", "alice.near");
   fill("Should not match", "-bad");
-  await press(user, "Next: Reward");
-  await screen.findByLabelText("Amount (tUSDC)");
   fill("Amount (tUSDC)", "5");
-  await user.click(screen.getByRole("radio", { name: /^Me/ }));
-  await press(user, "Review");
-  await stepHeading("Review");
+  await chooseChecker(user, "me");
 
-  expect(testId("review-heldout")).toBe("None: scored on the examples");
+  await postReady();
   expect(screen.queryByTestId("heldout-download")).toBeNull();
 });
 
-test("custom_windows_are_what_the_task_is_posted_with", async () => {
+test("windows_set_by_hand_are_what_the_task_is_posted_with", async () => {
   const { user, chain } = setup({ vault: TUSDC(5) });
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toReward(user);
-  fill("Amount (tUSDC)", "5");
+  render(<PostTask judgeAccount={JUDGE} />);
+  await toReview(user);
+  await openMore(user);
 
-  await user.click(screen.getByRole("radio", { name: /^Custom/ }));
-  // Custom starts from the choice it replaces: Quick, in the largest unit that fits.
-  expect((screen.getByLabelText("Commit window") as HTMLInputElement).value).toBe("10");
-  fill("Commit window", "2");
-  fireEvent.change(screen.getByLabelText("Commit window unit"), { target: { value: "hours" } });
-  await press(user, "Review");
-  await stepHeading("Review");
+  await user.click(screen.getByRole("checkbox", { name: "Set each window yourself" }));
+  // They start from the windows the deadline gives, a day's, in the largest unit that fits.
+  expect((screen.getByLabelText("Answer window") as HTMLInputElement).value).toBe("1");
+  expect((screen.getByLabelText("Answer window unit") as HTMLSelectElement).value).toBe("days");
+  expect((screen.getByLabelText("Open window") as HTMLInputElement).value).toBe("2");
+  fill("Answer window", "10");
+  fireEvent.change(screen.getByLabelText("Answer window unit"), { target: { value: "minutes" } });
+  fill("Open window", "5");
+  fireEvent.change(screen.getByLabelText("Open window unit"), { target: { value: "minutes" } });
+  fill("Pick window", "10");
+  fireEvent.change(screen.getByLabelText("Pick window unit"), { target: { value: "minutes" } });
+  fill("Fallback window", "10");
+  fireEvent.change(screen.getByLabelText("Fallback window unit"), {
+    target: { value: "minutes" },
+  });
+  // The deadline's field gives way to them.
+  expect(screen.queryByLabelText("Agents answer until")).toBeNull();
+  expect(testId("deadline-plan")).toMatch(/open them \(reveal\) for 5m, and the Judge picks by/);
 
-  expect(testId("review-windows")).toBe(
-    "Commit 2h · Reveal 5m · Judging 10m · Fallback 10m. 2h 25m in all.",
-  );
   await user.click(await postReady());
   await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
   const task = chain.tasks.get(1n);
-  expect(task && task.commitDeadline - task.createdAt).toBe(7200n * SECOND);
+  expect(task && task.commitDeadline - task.createdAt).toBe(600n * SECOND);
+  expect(task && task.revealDeadline - task.commitDeadline).toBe(300n * SECOND);
+  expect(task && task.pickDeadline - task.revealDeadline).toBe(600n * SECOND);
+  expect(task && task.fallbackDeadline - task.pickDeadline).toBe(600n * SECOND);
+});
+
+test("a_quick_pick_sets_the_deadline_and_the_windows_follow_it", async () => {
+  const { user, chain } = setup({ vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  const before = Date.now();
+  await user.click(screen.getByRole("button", { name: "1 h from now" }));
+  const typed = (screen.getByLabelText("Agents answer until") as HTMLInputElement).value;
+  // A minute's precision, rounded up: an hour from the press, or up to a minute more.
+  const at = new Date(typed).getTime();
+  expect(at - before).toBeGreaterThanOrEqual(3_600_000 - 1_000);
+  expect(at - before).toBeLessThanOrEqual(3_600_000 + 61_000);
+  expect(testId("deadline-plan")).toMatch(/open them \(reveal\) for 5m, and the Judge picks by/);
+
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
+  const task = chain.tasks.get(1n);
+  const commit = task === undefined ? 0n : (task.commitDeadline - task.createdAt) / SECOND;
+  expect(commit).toBeGreaterThanOrEqual(3_600n - 30n);
+  expect(commit).toBeLessThanOrEqual(3_600n + 60n);
+  expect(task && task.revealDeadline - task.commitDeadline).toBe(300n * SECOND);
+  expect(task && task.pickDeadline - task.revealDeadline).toBe(600n * SECOND);
+  expect(task && task.fallbackDeadline - task.pickDeadline).toBe(3_600n * SECOND);
+});
+
+test("a_deadline_too_near_or_too_far_is_said_and_stops_the_post", async () => {
+  const { user, wallet, api } = setup({ vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await toReview(user);
+  await postReady();
+  const set = (ms: number) =>
+    fireEvent.change(screen.getByLabelText("Agents answer until"), {
+      target: { value: deadlineInput(ms) },
+    });
+
+  set(Date.now() - 60_000);
+  expect(testId("error-deadline")).toBe("Pick a time at least 1m from now.");
+  expect(off(postButton())).toBe(true);
+  set(Date.now() + 15 * 86_400_000);
+  expect(testId("error-deadline")).toBe("Pick a time within 14d from now.");
+  expect(off(postButton())).toBe(true);
+  fireEvent.change(screen.getByLabelText("Agents answer until"), { target: { value: "" } });
+  expect(testId("error-deadline")).toBe("Pick a date and a time.");
+
+  // Post takes the person to the field, and nothing is sent.
+  await user.click(postButton());
+  expect(document.activeElement).toBe(screen.getByLabelText("Agents answer until"));
+  expect(writes(api)).toEqual([]);
+  expect(wallet.sent).toEqual([]);
+
+  set(Date.now() + 3 * 86_400_000);
+  expect(screen.queryByTestId("error-deadline")).toBeNull();
+  await postReady();
 });
 
 // ---- Money --------------------------------------------------------------------------------------
 
 test("amount_inputs_reject_invalid_on_the_page", async () => {
   const { user, wallet, api } = setup({ vault: TUSDC(5) });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReward(user);
   const amount = screen.getByLabelText("Amount (tUSDC)");
-  const forward = () => screen.getByRole("button", { name: "Review" });
 
   // Nothing is said before the person has typed, and nothing of a good amount.
   expect(screen.queryByTestId("error-amount")).toBeNull();
   fill("Amount (tUSDC)", "5");
   expect(screen.queryByTestId("error-amount")).toBeNull();
+  await postReady();
 
   const cases: Array<[string, string | RegExp]> = [
     ["", "Enter an amount."],
@@ -673,20 +759,20 @@ test("amount_inputs_reject_invalid_on_the_page", async () => {
     if (typeof message === "string") expect(shown, typed).toBe(message);
     else expect(shown, typed).toMatch(message);
     expect(amount.getAttribute("aria-invalid"), typed).toBe("true");
-    expect(off(forward()), typed).toBe(true);
+    expect(off(postButton()), typed).toBe(true);
   }
 
-  // Pressing it anyway stays on the step, with the cursor in the field.
-  await user.click(forward());
-  expect(screen.queryByRole("heading", { level: 2, name: "Review" })).toBeNull();
+  // Pressing Post anyway posts nothing, and puts the cursor in the field.
+  await user.click(postButton());
   expect(document.activeElement).toBe(amount);
 
   // The edges are fine: the least and the most there are.
   for (const typed of ["1", "1000", "12.345678"]) {
     fill("Amount (tUSDC)", typed);
     expect(screen.queryByTestId("error-amount"), typed).toBeNull();
-    expect(off(forward()), typed).toBe(false);
   }
+  fill("Amount (tUSDC)", "5");
+  await postReady();
 
   // Nothing was signed in for, uploaded or sent.
   expect(writes(api)).toEqual([]);
@@ -694,66 +780,81 @@ test("amount_inputs_reject_invalid_on_the_page", async () => {
   expect(wallet.sent).toEqual([]);
 });
 
-test("a_paused_contract_stops_the_reward_step", async () => {
-  const { user } = setup({ paused: true });
-  render(<PostWizard judgeAccount={JUDGE} />);
+test("the_winner_s_share_is_said_as_the_amount_is_typed_with_the_contract_s_fee", async () => {
+  const { user } = setup({ vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReward(user);
-  fill("Amount (tUSDC)", "5");
 
-  expect(screen.getByRole("alert").textContent).toBe("Tender isn't taking new tasks right now.");
-  expect(off(screen.getByRole("button", { name: "Review" }))).toBe(true);
+  // Before an amount, the line says what the fee is; with one, what the winner gets, rounded down
+  // as the contract rounds (500 basis points of 12.345678 is 0.6172839, so 11.728395 is left).
+  expect(testId("reward-net")).toBe("The winner receives the reward less Tender's 5% fee.");
+  fill("Amount (tUSDC)", "10");
+  expect(testId("reward-net")).toBe("Winner receives 9.50 tUSDC after the 5% fee.");
+  fill("Amount (tUSDC)", "12.345678");
+  expect(testId("reward-net")).toBe("Winner receives 11.728395 tUSDC after the 5% fee.");
+  // The fee is said once on the page.
+  expect(document.body.textContent?.match(/5% fee/g)).toHaveLength(1);
+});
+
+test("a_paused_contract_stops_the_post", async () => {
+  const { user } = setup({ paused: true });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await toReview(user);
+
+  await waitFor(() =>
+    expect(screen.getAllByRole("alert").map((alert) => alert.textContent)).toContain(
+      "Tender isn't taking new tasks right now.",
+    ),
+  );
+  expect(off(postButton())).toBe(true);
 });
 
 test("windows_are_held_to_what_the_contract_allows", async () => {
-  const { user } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toReward(user);
-  fill("Amount (tUSDC)", "5");
-  await user.click(screen.getByRole("radio", { name: /^Custom/ }));
+  const { user } = setup({ vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await toReview(user);
+  await openMore(user);
+  await user.click(screen.getByRole("checkbox", { name: "Set each window yourself" }));
   const unit = (name: string, value: string) =>
     fireEvent.change(screen.getByLabelText(`${name} window unit`), { target: { value } });
-  const forward = () => screen.getByRole("button", { name: "Review" });
 
-  fill("Commit window", "0");
+  fill("Answer window", "0");
   expect(testId("error-window-commit")).toBe("Use a whole number above 0.");
-  unit("Commit", "seconds");
-  fill("Commit window", "30");
+  unit("Answer", "seconds");
+  fill("Answer window", "30");
   expect(testId("error-window-commit")).toBe("At least 1m.");
-  fill("Commit window", "1.5");
+  fill("Answer window", "1.5");
   expect(testId("error-window-commit")).toBe("Use a whole number above 0.");
-  unit("Commit", "days");
-  fill("Commit window", "15");
+  unit("Answer", "days");
+  fill("Answer window", "15");
   expect(testId("error-window-commit")).toBe("At most 14d.");
-  expect(off(forward())).toBe(true);
+  expect(off(postButton())).toBe(true);
 
-  fill("Commit window", "14");
+  fill("Answer window", "14");
   expect(screen.queryByTestId("error-window-commit")).toBeNull();
-  expect(off(forward())).toBe(false);
+  await postReady();
 });
 
-test("the_reward_step_waits_for_what_tender_allows_and_asks_again_when_it_failed", async () => {
-  const { user } = setup({ limitsFailOnce: true });
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toChecks(user);
+test("the_reward_waits_for_what_tender_allows_and_asks_again_when_it_failed", async () => {
+  const { user } = setup({ limitsFailOnce: true, vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  fillBrief();
   await fillRegexChecks(user);
-  await press(user, "Next: Reward");
 
-  // The read failed once: the step says so, and cannot be left.
+  // The read failed once: the part says so, and nothing can be posted.
   const alert = await screen.findByTestId("error-state");
   expect(alert.textContent).toContain("Can't reach the server.");
   expect(screen.queryByLabelText("Amount (tUSDC)")).toBeNull();
-  expect(off(screen.getByRole("button", { name: "Review" }))).toBe(true);
+  expect(off(postButton())).toBe(true);
 
   await user.click(within(alert).getByRole("button", { name: "Retry" }));
   await screen.findByLabelText("Amount (tUSDC)");
   expect(screen.queryByTestId("error-state")).toBeNull();
 });
 
-// ---- Review: what stands in the way -------------------------------------------------------------
-
 test("an_account_that_is_not_set_up_is_set_up_by_the_post_in_one_approval", async () => {
   const { user, wallet, chain } = setup({ setUp: false });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   // No detour to the Wallet page: Review says what the batch adds first, and Post is on.
@@ -781,7 +882,7 @@ test("an_account_that_is_not_set_up_is_set_up_by_the_post_in_one_approval", asyn
 
 test("a_wallet_that_holds_too_little_to_fund_the_reward_says_how_much_more", async () => {
   const { user, chain, wallet } = setup({ vault: TUSDC(1), holds: TUSDC(2) });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   // 5 are asked, 1 is in the vault and 2 in the wallet: 2 short.
@@ -796,48 +897,46 @@ test("a_wallet_that_holds_too_little_to_fund_the_reward_says_how_much_more", asy
   expect(screen.queryByTestId("post-blocked")).toBeNull();
 });
 
-test("an_earlier_step_that_goes_wrong_while_review_is_open_stops_the_post", async () => {
-  // A team account writes a rubric and reaches Review. Its wallet is then disconnected: the page
-  // can no longer say the account is the team's, so the rubric is dropped, and the Checks step has
-  // nothing the Judge could accept.
+test("a_rubric_that_is_dropped_while_the_page_is_open_stops_the_post", async () => {
+  // A team account writes a rubric. Its wallet is then disconnected: the page can no longer say the
+  // account is the team's, so the rubric is dropped, and the rule has nothing the Judge could take.
   const { user, wallet } = setup({ agentIs: "team", vault: TUSDC(5) });
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toChecks(user);
-  await user.click(await screen.findByRole("radio", { name: /^Rubric/ }));
+  render(<PostTask judgeAccount={JUDGE} />);
+  fillBrief();
+  await pickKind(user, /^Rubric/);
   fill("What to look for", "Says what changed");
-  await press(user, "Next: Reward");
-  await screen.findByLabelText("Amount (tUSDC)");
   fill("Amount (tUSDC)", "5");
-  await press(user, "Review");
-  await stepHeading("Review");
   await postReady();
 
   await act(async () => {
     await holder.store.disconnect();
   });
 
-  const blocked = await screen.findByTestId("post-blocked");
-  expect(blocked.textContent).toBe(
-    "Something on an earlier step needs fixing. Go back and check each one.",
+  // The kind is Exact answer now, as the person left everything else, and it asks for an answer.
+  await waitFor(() =>
+    expect((screen.getByRole("radio", { name: /Exact answer/ }) as HTMLInputElement).checked).toBe(
+      true,
+    ),
   );
+  expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe(
+    "Regex for NEAR account ids",
+  );
+  await user.click(screen.getByRole("button", { name: "Connect wallet" }));
+  await waitFor(() => expect(testId("review-account")).toBe(ALICE), LONG);
   expect(off(postButton())).toBe(true);
-  expect(wallet.sent).toEqual([]);
-
-  // Back at the Checks step, the form is as the person left it but for the kind, which is Exact
-  // answer now, and which asks for an answer to accept.
-  await user.click(screen.getByRole("button", { name: "2 Checks" }));
-  await stepHeading("Checks");
-  expect((screen.getByRole("radio", { name: /Exact answer/ }) as HTMLInputElement).checked).toBe(
-    true,
+  await user.click(postButton());
+  expect(testId("error-expected")).toBe(
+    "Write at least one answer the Judge will accept, one to a line.",
   );
-  expect(off(screen.getByRole("button", { name: "Next: Reward" }))).toBe(true);
+  expect(document.activeElement).toBe(screen.getByLabelText("Accepted answers"));
+  expect(wallet.sent).toEqual([]);
 });
 
 // ---- Review: the wallet -------------------------------------------------------------------------
 
-test("a_wallet_that_cannot_sign_a_message_cannot_post_but_steps_one_to_three_work", async () => {
+test("a_wallet_that_cannot_sign_a_message_cannot_post_but_the_form_works", async () => {
   const { user, wallet, api } = setup({ signMessage: false });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
 
   await toReview(user);
 
@@ -850,18 +949,17 @@ test("a_wallet_that_cannot_sign_a_message_cannot_post_but_steps_one_to_three_wor
   expect(wallet.sent).toEqual([]);
 });
 
-test("without_a_wallet_the_form_works_and_review_offers_connect", async () => {
+test("without_a_wallet_the_form_works_and_the_button_connects_one", async () => {
   const { user } = setup({ connected: false });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
 
   await toReview(user);
 
   expect(testId("review-account")).toBe("Not connected");
   // Nothing is being read without a wallet, so the row does not say it is reading.
   expect(testId("review-funding")).toBe("—");
-  expect(screen.getByRole("button", { name: "Post task" }).getAttribute("aria-disabled")).toBe(
-    "true",
-  );
+  // The one button connects a wallet; Post is not there until one is.
+  expect(screen.queryByRole("button", { name: "Post task" })).toBeNull();
   await user.click(screen.getByRole("button", { name: "Connect wallet" }));
   await waitFor(() => expect(testId("review-account")).toBe(ALICE), LONG);
   expect(screen.queryByRole("button", { name: "Connect wallet" })).toBeNull();
@@ -870,7 +968,6 @@ test("without_a_wallet_the_form_works_and_review_offers_connect", async () => {
   await postReady();
 
   // What was typed before the wallet was there is still there.
-  await user.click(screen.getByRole("button", { name: "1 Brief" }));
   expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe(
     "Regex for NEAR account ids",
   );
@@ -884,7 +981,7 @@ test("a_wallet_that_refuses_keeps_the_uploads_and_the_form_and_a_second_try_goes
     if (refusals-- > 0) throw new Error("User rejected");
     return send(params);
   };
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await user.click(await postReady());
@@ -901,11 +998,8 @@ test("a_wallet_that_refuses_keeps_the_uploads_and_the_form_and_a_second_try_goes
   expect(api.blobs).toHaveLength(2);
   expect(api.heldouts).toHaveLength(1);
   expect(off(postButton())).toBe(false);
-  await user.click(screen.getByRole("button", { name: "Back" }));
   expect((screen.getByLabelText("Amount (tUSDC)") as HTMLInputElement).value).toBe("5");
 
-  await press(user, "Review");
-  await stepHeading("Review");
   await user.click(await postReady());
   await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
 
@@ -933,7 +1027,7 @@ test("a_wallet_that_fails_without_saying_whether_it_sent_locks_post_until_the_pe
     if (failures-- > 0) throw new Error("Wallet closed");
     return send(params);
   };
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await user.click(await postReady());
@@ -981,7 +1075,7 @@ test("a_send_that_landed_before_the_wallet_failed_is_found_on_the_chain_and_not_
     await send(params);
     throw new Error("Wallet closed");
   };
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
   await user.click(await postReady());
   await screen.findByTestId("post-unknown");
@@ -1010,7 +1104,7 @@ test("only_the_first_press_after_an_unknown_outcome_reads_the_chain", async () =
     if (refusal !== undefined) throw new Error(refusal);
     return send(params);
   };
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
   const spy = vi.fn(globalThis.fetch);
   vi.stubGlobal("fetch", spy);
@@ -1043,7 +1137,7 @@ test("a_look_for_the_earlier_post_that_fails_sends_nothing_and_looks_again_on_th
     if (failures-- > 0) throw new Error("Wallet closed");
     return send(params);
   };
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
   await user.click(await postReady());
   await screen.findByTestId("post-unknown");
@@ -1073,7 +1167,7 @@ test("a_look_for_the_earlier_post_that_fails_sends_nothing_and_looks_again_on_th
 
 test("a_vault_that_changed_since_review_is_shown_again_and_not_sent", async () => {
   const { user, wallet, chain } = setup({ vault: TUSDC(2) });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
   await waitFor(
     () =>
@@ -1136,7 +1230,7 @@ test("a_lock_after_an_unknown_outcome_is_not_shown_for_another_account_and_is_ba
     throw new Error("Wallet closed");
   };
   const accounts = switching(w);
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
   await user.click(await postReady());
   await screen.findByTestId("post-unknown");
@@ -1159,7 +1253,7 @@ test("a_failure_is_not_shown_for_another_account_and_is_back_for_the_first", asy
     throw new Error("User rejected the request");
   };
   const accounts = switching(w);
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
   await user.click(await postReady());
   const failure = (await screen.findByTestId("post-failure")).textContent;
@@ -1184,7 +1278,7 @@ test("a_wallet_that_never_signs_in_can_be_given_up_on_and_the_post_it_belonged_t
           release = () => sign(params).then(resolve, reject);
         })
       : sign(params);
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await user.click(await postReady());
@@ -1225,7 +1319,7 @@ test("a_post_given_up_on_that_ends_late_does_not_end_the_one_that_came_after_it"
     new Promise((resolve, reject) => {
       releases.push(() => send(params).then(resolve, reject));
     });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
   await user.click(await postReady());
   await user.click(await screen.findByRole("button", { name: "Stop waiting" }));
@@ -1250,7 +1344,7 @@ test("a_wallet_that_never_answers_the_transactions_is_given_up_on_and_post_is_lo
     new Promise((resolve, reject) => {
       release = () => send(params).then(resolve, reject);
     });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
   await user.click(await postReady());
   expect(await screen.findByTestId("post-progress")).toBeDefined();
@@ -1291,7 +1385,7 @@ test("there_is_nothing_to_stop_waiting_for_while_the_documents_are_saved", async
   vi.stubGlobal("fetch", (input: Parameters<typeof fetch>[0], init?: RequestInit) =>
     String(input).endsWith("/v1/blobs") ? new Promise<Response>(() => {}) : inner(input, init),
   );
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
   await user.click(await postReady());
   await waitFor(() => expect(testId("post-progress")).toContain("Saving your task's documents"));
@@ -1311,7 +1405,7 @@ test("a_result_the_wallet_cannot_be_read_for_locks_post_and_a_second_press_does_
     await send(params);
     return "not an outcome" as never;
   };
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await user.click(await postReady());
@@ -1340,7 +1434,7 @@ test("a_short_storage_balance_is_topped_up_in_the_same_batch_and_the_review_says
   // 1,000 bytes are free where a post needs 1,600. The vault holds some of the token, so its slot
   // is there already and the deposit adds none.
   chain.storage.set(ALICE, { total: (173n + 1_000n) * byte, usedBytes: 173n });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   // The 600 bytes that are missing are 0.006 NEAR, said before the wallet is asked for it.
@@ -1369,7 +1463,7 @@ test("a_short_storage_balance_is_topped_up_in_the_same_batch_and_the_review_says
 
 test("a_storage_balance_that_pays_for_the_post_shows_no_storage_row_and_adds_none", async () => {
   const { user, chain, wallet } = setup({ vault: TUSDC(5) });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await waitFor(() => expect(testId("review-funding")).toContain("enough already"), LONG);
@@ -1399,7 +1493,7 @@ test("a_deposit_tender_could_not_take_is_worded_as_that_and_the_next_press_tops_
     }
     return send(params);
   };
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
   await postReady();
   expect(screen.queryByTestId("review-storage")).toBeNull();
@@ -1439,7 +1533,7 @@ test("a_deposit_tender_could_not_take_is_worded_as_that_and_the_next_press_tops_
 
 test("the_funding_row_says_nothing_is_read_when_the_balances_cannot_be", async () => {
   const { user } = setup({ vaultReadFails: true });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   // The read failed: the row has nothing to show, and does not say it is still reading.
@@ -1450,7 +1544,7 @@ test("the_funding_row_says_nothing_is_read_when_the_balances_cannot_be", async (
 
 test("an_upload_that_fails_sends_nothing_to_the_wallet", async () => {
   const { user, wallet, api } = setup({ vault: TUSDC(5), uploadsFail: true });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await user.click(await postReady());
@@ -1468,7 +1562,7 @@ test("an_upload_that_fails_sends_nothing_to_the_wallet", async () => {
 
 test("a_token_the_api_turns_away_is_signed_in_for_again_and_never_cleared_by_the_page", async () => {
   const { user, wallet, api } = setup({ vault: TUSDC(5), turnFirstTokenAway: true });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await user.click(await postReady());
@@ -1495,7 +1589,7 @@ test("a_send_that_reports_no_new_task_does_not_redirect_and_cannot_be_pressed_ag
       })),
     }));
   };
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await user.click(await postReady());
@@ -1524,7 +1618,7 @@ test("a_result_with_no_hashes_shows_none", async () => {
     await send(params);
     return "not an outcome" as never;
   };
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
   await user.click(await postReady());
@@ -1535,121 +1629,117 @@ test("a_result_with_no_hashes_shows_none", async () => {
   expect(within(sent).getByRole("link", { name: "Tasks" }).getAttribute("target")).toBe("_blank");
 });
 
-// ---- The steps ----------------------------------------------------------------------------------
+// ---- The form's problems ------------------------------------------------------------------------
 
-test("pressing_next_on_a_step_with_problems_shows_every_one_and_goes_to_the_first", async () => {
-  const { user } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await stepHeading("Brief");
+test("pressing_post_with_problems_shows_every_one_and_goes_to_the_first", async () => {
+  const { user, api, wallet } = setup({ vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await screen.findByLabelText("Amount (tUSDC)");
 
   // A new form is not full of complaints.
   expect(screen.queryByTestId("error-title")).toBeNull();
-  expect(off(screen.getByRole("button", { name: "Next: Checks" }))).toBe(true);
+  expect(off(postButton())).toBe(true);
 
-  await press(user, "Next: Checks");
+  await user.click(postButton());
 
   expect(testId("error-title")).toBe("Give the task a title.");
   expect(testId("error-instructions")).toBe("Tell agents what to do.");
+  expect(testId("error-expected")).toBe(
+    "Write at least one answer the Judge will accept, one to a line.",
+  );
+  expect(testId("error-amount")).toBe("Enter an amount.");
   expect(document.activeElement).toBe(screen.getByLabelText("Title"));
-  expect(screen.queryByRole("heading", { level: 2, name: "Checks" })).toBeNull();
 
   fill("Title", "A title");
   expect(screen.queryByTestId("error-title")).toBeNull();
-  await press(user, "Next: Checks");
+  await user.click(postButton());
   expect(document.activeElement).toBe(screen.getByLabelText("Instructions"));
 
   fill("Instructions", "Do the thing.");
-  expect(off(screen.getByRole("button", { name: "Next: Checks" }))).toBe(false);
-  await press(user, "Next: Checks");
-  await stepHeading("Checks");
-  // The heading of a step takes the focus, so that a reader begins at the top of it.
-  expect(document.activeElement).toBe(screen.getByRole("heading", { level: 2, name: "Checks" }));
+  await user.click(postButton());
+  expect(document.activeElement).toBe(screen.getByLabelText("Accepted answers"));
+  fill("Accepted answers", "42");
+  await user.click(postButton());
+  expect(document.activeElement).toBe(screen.getByLabelText("Amount (tUSDC)"));
+  fill("Amount (tUSDC)", "5");
+  await postReady();
+
+  // Nothing was signed in for, uploaded or sent on the way.
+  expect(writes(api)).toEqual([]);
+  expect(wallet.sent).toEqual([]);
 });
 
-test("the_stepper_goes_back_to_steps_that_are_done_and_not_forward", async () => {
+test("a_problem_under_more_options_opens_it_and_goes_to_the_field", async () => {
+  const { user } = setup({ vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await toReview(user);
+  await openMore(user);
+  fill("Tags (optional)", "Not A Tag!");
+  await closeMore(user);
+  expect(screen.queryByLabelText("Tags (optional)")).toBeNull();
+
+  await user.click(postButton());
+  expect(moreButton().getAttribute("aria-expanded")).toBe("true");
+  await waitFor(() =>
+    expect(document.activeElement).toBe(screen.getByLabelText("Tags (optional)")),
+  );
+  expect(testId("error-tags")).toContain('Change "tag!".');
+});
+
+test("what_was_typed_under_more_options_stays_when_it_is_closed_and_opened", async () => {
   const { user } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  const steps = within(screen.getByRole("navigation", { name: "Steps" }));
-
-  expect(steps.queryAllByRole("button")).toEqual([]);
-  expect(steps.getByText("1 Brief").getAttribute("aria-current")).toBe("step");
-
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReward(user);
-
-  expect(steps.getAllByRole("button").map((button) => button.textContent)).toEqual([
-    "1 Brief",
-    "2 Checks",
-  ]);
-  expect(steps.getByText("3 Reward").getAttribute("aria-current")).toBe("step");
-  expect(steps.queryByRole("button", { name: "4 Review" })).toBeNull();
-
-  await user.click(steps.getByRole("button", { name: "2 Checks" }));
-  await stepHeading("Checks");
-  // What was typed is where it was left.
-  expect((screen.getByLabelText("Held-out: should match") as HTMLTextAreaElement).value).toBe(
+  await openMore(user);
+  expect((screen.getByLabelText("Hidden: should match") as HTMLTextAreaElement).value).toBe(
     `${SECRET}.near\ncarol.near`,
+  );
+  expect((screen.getByLabelText("Should match") as HTMLTextAreaElement).value).toBe(
+    "alice.near\nbob.testnet",
   );
 });
 
 test("picking_a_kind_changes_the_answer_format_it_needs_and_the_one_line_says_what_it_is", async () => {
   const { user } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toChecks(user);
+  render(<PostTask judgeAccount={JUDGE} />);
 
-  expect(testId("answer-format")).toBe("Answers: plain text (set on Brief).");
-  await user.click(screen.getByRole("radio", { name: /JSON shape/ }));
-  expect(testId("answer-format")).toBe("Answers: JSON (set on Brief).");
-  await user.click(screen.getByRole("radio", { name: /Regex cases/ }));
-  expect(testId("answer-format")).toBe("Answers: a regex, as JSON (set on Brief).");
-  await user.click(screen.getByRole("radio", { name: /Exact answer/ }));
-  expect(testId("answer-format")).toBe("Answers: plain text (set on Brief).");
+  expect(testId("answer-format")).toBe("Answers: plain text. Change it under More options.");
+  await pickKind(user, /JSON shape/);
+  expect(testId("answer-format")).toBe("Answers: JSON. Change it under More options.");
+  await pickKind(user, /Regex cases/);
+  expect(testId("answer-format")).toBe("Answers: a regex, as JSON. Change it under More options.");
+  await pickKind(user, /Exact answer/);
+  expect(testId("answer-format")).toBe("Answers: plain text. Change it under More options.");
   expect(screen.queryByTestId("format-note")).toBeNull();
 
-  // The Brief step shows the format the checks asked for.
-  await user.click(screen.getByRole("radio", { name: /JSON shape/ }));
-  await user.click(screen.getByRole("button", { name: "Back" }));
+  // The format field shows the format the kind asked for.
+  await pickKind(user, /JSON shape/);
   expect((screen.getByLabelText("Answer format") as HTMLSelectElement).value).toBe("json");
 });
 
-test("the_format_line_is_not_left_stale_when_the_format_is_changed_on_the_brief_step", async () => {
+test("a_format_that_does_not_suit_the_kind_is_a_problem_and_the_line_is_not_left_stale", async () => {
   const { user } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toChecks(user);
-  await user.click(screen.getByRole("radio", { name: /JSON shape/ }));
-  expect(testId("answer-format")).toBe("Answers: JSON (set on Brief).");
+  render(<PostTask judgeAccount={JUDGE} />);
+  await pickKind(user, /JSON shape/);
+  expect(testId("answer-format")).toBe("Answers: JSON. Change it under More options.");
 
-  // Back to the Brief step, plain text chosen there, and on to the Checks step again.
-  await user.click(screen.getByRole("button", { name: "Back" }));
   fireEvent.change(screen.getByLabelText("Answer format"), { target: { value: "text" } });
-  await press(user, "Next: Checks");
-  await stepHeading("Checks");
 
-  // The line says what the format is now, beside the problem it makes, and not what it was.
-  expect(testId("answer-format")).toBe("Answers: plain text (set on Brief).");
+  // The line says what the format is now, and the problem it makes is said at the kind.
+  expect(testId("answer-format")).toBe("Answers: plain text. Change it under More options.");
   expect(testId("error-kind")).toBe(
-    'JSON shape needs the answer format "JSON". Change it on the Brief step.',
+    'JSON shape needs the answer format "JSON". Change it under More options.',
+  );
+  expect(off(postButton())).toBe(true);
+
+  await pickKind(user, /Regex cases/);
+  fireEvent.change(screen.getByLabelText("Answer format"), { target: { value: "text" } });
+  expect(testId("error-kind")).toBe(
+    'Regex cases needs the answer format "A regex, as JSON". Change it under More options.',
   );
 });
 
-test("a_format_that_does_not_suit_the_kind_is_a_problem_on_the_checks_step", async () => {
-  const { user } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toChecks(user);
-  await fillRegexChecks(user);
-  await user.click(screen.getByRole("button", { name: "Back" }));
-
-  // Changed on the Brief step, behind the checks' back.
-  fireEvent.change(screen.getByLabelText("Answer format"), { target: { value: "text" } });
-  await press(user, "Next: Checks");
-  await stepHeading("Checks");
-
-  expect(testId("error-kind")).toBe(
-    'Regex cases needs the answer format "A regex, as JSON". Change it on the Brief step.',
-  );
-  expect(off(screen.getByRole("button", { name: "Next: Reward" }))).toBe(true);
-});
-
-// ---- The split ----------------------------------------------------------------------------------
+// ---- What agents see and what is kept secret ----------------------------------------------------
 
 test.each([
   {
@@ -1668,28 +1758,30 @@ test.each([
     name: "regex_cases",
     kind: /Regex cases/,
     seen: ["Should match", "Should not match"],
-    kept: ["Held-out: should match", "Held-out: should not match"],
+    kept: ["Hidden: should match", "Hidden: should not match"],
   },
 ])(
-  "the_checks_step_splits_what_agents_see_from_what_is_kept_secret_for_$name",
+  "the_secret_fields_say_so_and_the_public_ones_do_not_for_$name",
   async ({ kind, seen, kept }) => {
     const { user } = setup();
-    render(<PostWizard judgeAccount={JUDGE} />);
-    await toChecks(user);
+    render(<PostTask judgeAccount={JUDGE} />);
+    await pickKind(user, kind);
 
-    await user.click(screen.getByRole("radio", { name: kind }));
-
-    const left = screen.getByTestId("split-public");
-    const right = screen.getByTestId("split-heldout");
-    expect(within(left).getByRole("heading", { name: "What agents see" })).toBeDefined();
-    expect(within(right).getByRole("heading", { name: "Kept secret until payout" })).toBeDefined();
-    for (const label of seen) {
-      expect(within(left).getByLabelText(label), label).toBeDefined();
-      expect(within(right).queryByLabelText(label), label).toBeNull();
-    }
+    /** What the field is described by: its help, and its problem if it has one. */
+    const described = (label: string) => {
+      const field = screen.getByLabelText(label);
+      const ids = field.getAttribute("aria-describedby")?.split(" ") ?? [];
+      const words = ids.map((id) => document.getElementById(id)?.textContent ?? "").join(" ");
+      // A value of a JSON check is described by its own help; the list says it is kept secret.
+      return field.closest("#post-assertions") !== null
+        ? `${words} ${document.getElementById("post-assertions")?.textContent ?? ""}`
+        : words;
+    };
     for (const label of kept) {
-      expect(within(right).getByLabelText(label), label).toBeDefined();
-      expect(within(left).queryByLabelText(label), label).toBeNull();
+      expect(described(label), label).toContain("Kept secret until the winner is paid.");
+    }
+    for (const label of seen) {
+      expect(described(label), label).not.toContain("secret");
     }
   },
 );
@@ -1703,8 +1795,8 @@ test.each([
   "the_rubric_is_offered_on_the_page_for_a_$agentIs_account_$offered",
   async ({ agentIs, offered }) => {
     const { user, api } = setup({ agentIs });
-    render(<PostWizard judgeAccount={JUDGE} />);
-    await toChecks(user);
+    render(<PostTask judgeAccount={JUDGE} />);
+    await openMore(user);
     await waitFor(
       () => expect(api.requests.map(({ path }) => path)).toContain(`/v1/agents/${ALICE}`),
       LONG,
@@ -1721,33 +1813,29 @@ test.each([
 
 test("a_team_account_that_writes_a_rubric_is_told_how_the_judge_scores_it", async () => {
   const { user, api } = setup({ agentIs: "team", vault: TUSDC(5) });
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toChecks(user);
-
-  await user.click(await screen.findByRole("radio", { name: /^Rubric/ }));
-  const left = screen.getByTestId("split-public");
+  render(<PostTask judgeAccount={JUDGE} />);
+  fillBrief();
+  await pickKind(user, /^Rubric/);
   fill("What to look for", "Says what changed");
-  expect(within(left).getByLabelText("Weight, 1 to 10")).toBeDefined();
-  expect(within(screen.getByTestId("split-heldout")).getByText("Nothing.")).toBeDefined();
-  await press(user, "Next: Reward");
-  await screen.findByLabelText("Amount (tUSDC)");
+  expect(screen.getByLabelText("Weight, 1 to 10")).toBeDefined();
 
-  // With the Judge as verifier, the note says how the Judge scores a rubric; with anyone else, not.
+  // With the Judge as checker, the note says how the Judge scores a rubric; with anyone else, not.
   expect(testId("rubric-judge-note")).toBe(RUBRIC_JUDGE_NOTE);
   expect(RUBRIC_JUDGE_NOTE).toBe(
     "The Tender Judge scores rubric tasks with an AI model. Scores are subjective.",
   );
-  // And that it scores the first entries only, since the wizard posts no entry limit of its own.
+  // And that it scores the first entries only, since an open task has no entry limit of its own.
   expect(testId("rubric-judge-limit")).toBe("The Judge scores the first 50 entries.");
-  await user.click(screen.getByRole("radio", { name: /^Me/ }));
+  await chooseChecker(user, "me");
   expect(screen.queryByTestId("rubric-judge-note")).toBeNull();
   expect(screen.queryByTestId("rubric-judge-limit")).toBeNull();
+  // Nothing is kept secret, so there is no file to save.
+  fill("Amount (tUSDC)", "5");
+  await postReady();
+  expect(screen.queryByTestId("heldout-download")).toBeNull();
 
   // And the held-out part is not sent: there is none.
-  fill("Amount (tUSDC)", "5");
-  await press(user, "Review");
-  await stepHeading("Review");
-  await user.click(await postReady());
+  await user.click(postButton());
   await waitFor(() => expect(router.push).toHaveBeenCalled(), LONG);
   expect(api.heldouts).toEqual([]);
   expect(JSON.parse(api.blobs[1]?.text ?? "{}")).toMatchObject({
@@ -1762,19 +1850,21 @@ const pointInputs = () => screen.getAllByLabelText("What to look for");
 const fillPoint = (i: number, value: string) =>
   fireEvent.change(pointInputs()[i] as HTMLElement, { target: { value } });
 
+/** A team account with the rest of the task written and a rubric chosen. */
 async function toRubric(user: User): Promise<void> {
-  await toChecks(user);
-  await user.click(await screen.findByRole("radio", { name: /^Rubric/ }));
+  fillBrief();
+  fill("Amount (tUSDC)", "5");
+  await pickKind(user, /^Rubric/);
 }
 
-test("a_point_the_judge_would_refuse_is_said_where_it_is_written_and_stops_next", async () => {
-  const { user } = setup({ agentIs: "team" });
-  render(<PostWizard judgeAccount={JUDGE} />);
+test("a_point_the_judge_would_refuse_is_said_where_it_is_written_and_stops_the_post", async () => {
+  const { user } = setup({ agentIs: "team", vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await screen.findByLabelText("Amount (tUSDC)");
   await toRubric(user);
   fillPoint(0, "Says what changed");
   await press(user, "Add a point");
   await press(user, "Add a point");
-  const next = () => screen.getByRole("button", { name: "Next: Reward" });
 
   // An angle bracket.
   fillPoint(1, "Names the <file> that changed");
@@ -1787,27 +1877,25 @@ test("a_point_the_judge_would_refuse_is_said_where_it_is_written_and_stops_next"
   expect(screen.queryByTestId("error-rubric-1-criterion")).toBeNull();
   // The same as another point, as the Judge reads it: case, width and spaces do not tell them apart.
   fillPoint(1, "Names the file");
-  fillPoint(2, "  \uFF33\uFF21\uFF39\uFF33 what\u3000changed ");
+  fillPoint(2, "  ＳＡＹＳ what　changed ");
   expect(testId("error-rubric-2-criterion")).toBe("This says the same as point 1.");
   expect(screen.queryByTestId("error-rubric-0-criterion")).toBeNull();
   expect(screen.queryByTestId("error-rubric-1-criterion")).toBeNull();
 
-  // The step does not go on, and Next takes the person to the point to put right.
-  expect(off(next())).toBe(true);
-  await user.click(next());
+  // Post is off, and takes the person to the point to put right.
+  expect(off(postButton())).toBe(true);
+  await user.click(postButton());
   expect(document.activeElement).toBe(pointInputs()[2]);
-  expect(screen.queryByRole("heading", { level: 2, name: "Reward" })).toBeNull();
 
   fillPoint(2, "Gives a reason");
   expect(screen.queryByTestId("error-rubric-2-criterion")).toBeNull();
-  expect(off(next())).toBe(false);
-  await user.click(next());
-  await screen.findByLabelText("Amount (tUSDC)");
+  await postReady();
 });
 
 test("a_point_the_judge_would_refuse_that_is_not_the_last_one_is_found_by_its_place", async () => {
-  const { user } = setup({ agentIs: "team" });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  const { user } = setup({ agentIs: "team", vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await screen.findByLabelText("Amount (tUSDC)");
   await toRubric(user);
   fillPoint(0, "Says what changed");
   await press(user, "Add a point");
@@ -1823,12 +1911,13 @@ test("a_point_the_judge_would_refuse_that_is_not_the_last_one_is_found_by_its_pl
   await press(user, "Remove point 1");
   expect(screen.queryByTestId("error-rubric-0-criterion")).toBeNull();
   expect(screen.queryByTestId("error-rubric-1-criterion")).toBeNull();
-  expect(off(screen.getByRole("button", { name: "Next: Reward" }))).toBe(false);
+  await postReady();
 });
 
 test("twenty_one_points_is_one_too_many_and_is_said_when_the_twenty_first_is_added", async () => {
-  const { user } = setup({ agentIs: "team" });
-  render(<PostWizard judgeAccount={JUDGE} />);
+  const { user } = setup({ agentIs: "team", vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await screen.findByLabelText("Amount (tUSDC)");
   await toRubric(user);
   for (let i = 1; i < 20; i++) {
     fireEvent.click(screen.getByRole("button", { name: "Add a point" }));
@@ -1837,43 +1926,41 @@ test("twenty_one_points_is_one_too_many_and_is_said_when_the_twenty_first_is_add
   for (let i = 0; i < 20; i++) fillPoint(i, `Point number ${i + 1}`);
   // Twenty is allowed.
   expect(screen.queryByTestId("error-rubric")).toBeNull();
-  expect(off(screen.getByRole("button", { name: "Next: Reward" }))).toBe(false);
+  await postReady();
 
   await press(user, "Add a point");
   expect(pointInputs()).toHaveLength(21);
   expect(testId("error-rubric")).toBe("Use at most 20 points.");
   fillPoint(20, "Point number 21");
-  expect(off(screen.getByRole("button", { name: "Next: Reward" }))).toBe(true);
+  expect(off(postButton())).toBe(true);
 
-  // Next goes to the list as a whole, since no one point is the wrong one.
-  await press(user, "Next: Reward");
+  // Post goes to the list as a whole, since no one point is the wrong one.
+  await user.click(postButton());
   expect(testId("error-rubric")).toBe("Use at most 20 points.");
   expect(document.activeElement).toBe(document.getElementById("post-rubric"));
-  expect(screen.queryByRole("heading", { level: 2, name: "Reward" })).toBeNull();
 
   await press(user, "Remove point 21");
   expect(screen.queryByTestId("error-rubric")).toBeNull();
-  await press(user, "Next: Reward");
-  await screen.findByLabelText("Amount (tUSDC)");
+  await postReady();
 });
 
-test("a_rubric_pass_mark_of_zero_is_said_on_the_page_and_stops_next", async () => {
-  const { user } = setup({ agentIs: "team" });
-  render(<PostWizard judgeAccount={JUDGE} />);
+test("a_rubric_pass_mark_of_zero_is_said_on_the_page_and_stops_the_post", async () => {
+  const { user } = setup({ agentIs: "team", vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await screen.findByLabelText("Amount (tUSDC)");
   await toRubric(user);
   fillPoint(0, "Says what changed");
-  const next = () => screen.getByRole("button", { name: "Next: Reward" });
 
   // The Judge turns a rubric task with a pass mark of 0 away, after the reward is in.
   fill("Pass mark", "0");
   expect(testId("error-minScore")).toBe("A rubric needs a pass mark of 1 or more.");
-  expect(off(next())).toBe(true);
-  await user.click(next());
+  expect(off(postButton())).toBe(true);
+  await user.click(postButton());
   expect(document.activeElement).toBe(document.getElementById("post-minScore"));
 
   fill("Pass mark", "1");
   expect(screen.queryByTestId("error-minScore")).toBeNull();
-  expect(off(next())).toBe(false);
+  await postReady();
 
   // Another kind may have 0.
   await user.click(screen.getByRole("radio", { name: /Exact answer/ }));
@@ -1883,9 +1970,8 @@ test("a_rubric_pass_mark_of_zero_is_said_on_the_page_and_stops_next", async () =
 
 test("a_rubric_is_dropped_when_the_account_stops_being_the_teams", async () => {
   const { user } = setup({ agentIs: "team" });
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toChecks(user);
-  await user.click(await screen.findByRole("radio", { name: /^Rubric/ }));
+  render(<PostTask judgeAccount={JUDGE} />);
+  await pickKind(user, /^Rubric/);
   expect((screen.getByRole("radio", { name: /^Rubric/ }) as HTMLInputElement).checked).toBe(true);
 
   await act(async () => {
@@ -1898,51 +1984,108 @@ test("a_rubric_is_dropped_when_the_account_stops_being_the_teams", async () => {
   );
 });
 
-// ---- The Judge ----------------------------------------------------------------------------------
+// ---- Who can enter ------------------------------------------------------------------------------
 
-test("the_judge_is_the_default_verifier_when_the_build_knows_its_account", async () => {
-  const { user } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toReward(user);
+test("invited_agents_are_posted_with_the_task_and_their_bytes_are_paid_for", async () => {
+  const { user, chain, wallet } = setup({ vault: TUSDC(5) });
+  const byte = 10n ** 19n;
+  // Just enough storage for a task with no invites: the invite list is what has to be added.
+  chain.storage.set(ALICE, { total: (173n + POST_TASK_BYTES) * byte, usedBytes: 173n });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await toReview(user);
+  await openMore(user);
+  fill("Invited agents (optional)", `carol.testnet\n${BOB}`);
+  fill("Most entries (optional)", "1");
 
-  const judge = screen.getByRole("radio", { name: /^Tender Judge \(run by the Tender team\)/ });
-  expect((judge as HTMLInputElement).checked).toBe(true);
+  // 4 bytes and the account's length for each: 4 + 13 and 4 + 11.
+  await waitFor(
+    () => expect(testId("review-storage")).toBe("Adds 0.00032 NEAR from your wallet first."),
+    LONG,
+  );
+  await user.click(await postReady());
+  await waitFor(() => expect(router.push).toHaveBeenCalledWith("/tasks/1"), LONG);
+
+  expect(wallet.sent).toHaveLength(1);
+  expect(chain.tasks.get(1n)).toMatchObject({ invited: ["carol.testnet", BOB], maxEntries: 1 });
+  expect(chain.calls[0]).toMatchObject({ methodName: "storage_deposit", deposit: 32n * byte });
 });
 
-test("without_a_judge_account_the_judge_is_not_offered_and_the_poster_verifies", async () => {
+test("an_invite_list_the_contract_would_refuse_is_said_on_the_page", async () => {
+  const { user } = setup({ vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await toReview(user);
+  await openMore(user);
+  const invite = (text: string) => fill("Invited agents (optional)", text);
+
+  invite("Not An Account");
+  expect(testId("error-invited")).toBe(
+    '"Not" is not a NEAR account. Write one account to a line, like name.near.',
+  );
+  invite(`${BOB}\n${BOB}`);
+  expect(testId("error-invited")).toBe(`${BOB} is listed twice.`);
+  invite(ALICE);
+  expect(testId("error-invited")).toBe(
+    "You can't invite yourself: a poster can't enter their own task.",
+  );
+  invite(JUDGE);
+  expect(testId("error-invited")).toBe(`${JUDGE} checks the work, so it can't be invited.`);
+  invite(Array.from({ length: 21 }, (_, i) => `agent${i}.testnet`).join("\n"));
+  expect(testId("error-invited")).toBe("Invite 20 agents at most.");
+  expect(off(postButton())).toBe(true);
+
+  invite(BOB);
+  expect(screen.queryByTestId("error-invited")).toBeNull();
+  fill("Most entries (optional)", "0");
+  expect(testId("error-maxEntries")).toBe("Use a whole number above 0, or leave it empty.");
+  fill("Most entries (optional)", "");
+  expect(screen.queryByTestId("error-maxEntries")).toBeNull();
+  await postReady();
+});
+
+// ---- The Judge ----------------------------------------------------------------------------------
+
+test("the_judge_is_the_default_checker_when_the_build_knows_its_account", async () => {
+  setup();
+  render(<PostTask judgeAccount={JUDGE} />);
+
+  const judge = screen.getByRole("radio", { name: /^Tender Judge/ });
+  expect((judge as HTMLInputElement).checked).toBe(true);
+  // It is labelled as the team's.
+  expect(judge.closest("label")?.textContent).toContain("Run by the Tender team.");
+});
+
+test("without_a_judge_account_the_judge_is_not_offered_and_the_poster_checks", async () => {
   const { user } = setup();
-  render(<PostWizard judgeAccount={null} />);
-  await toReward(user);
+  render(<PostTask judgeAccount={null} />);
+  await toReview(user);
 
   expect(screen.queryByRole("radio", { name: /Tender Judge/ })).toBeNull();
-  expect((screen.getByRole("radio", { name: /^Me/ }) as HTMLInputElement).checked).toBe(true);
-  fill("Amount (tUSDC)", "5");
-  await press(user, "Review");
-  await stepHeading("Review");
+  expect(
+    (screen.getByRole("radio", { name: /^I check it myself/ }) as HTMLInputElement).checked,
+  ).toBe(true);
   expect(testId("review-verifier")).toBe("You");
 });
 
-test("another_account_as_the_verifier_has_to_be_an_account", async () => {
-  const { user } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toReward(user);
-  fill("Amount (tUSDC)", "5");
-  await user.click(screen.getByRole("radio", { name: /^Another account/ }));
+test("another_account_as_the_checker_has_to_be_an_account", async () => {
+  const { user } = setup({ vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await toReview(user);
 
-  fill("Their NEAR account", "Not An Account");
+  await chooseChecker(user, "other", "Not An Account");
   expect(testId("error-otherVerifier")).toBe("Enter a NEAR account, like name.near.");
-  expect(off(screen.getByRole("button", { name: "Review" }))).toBe(true);
+  expect(off(postButton())).toBe(true);
 
   fill("Their NEAR account", BOB);
   expect(screen.queryByTestId("error-otherVerifier")).toBeNull();
-  expect(off(screen.getByRole("button", { name: "Review" }))).toBe(false);
+  await postReady();
 });
 
-test("a_public_document_over_what_the_api_keeps_is_said_on_the_checks_step_and_nothing_is_sent", async () => {
-  const { user, api, wallet } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toChecks(user);
-  await user.click(screen.getByRole("radio", { name: /JSON shape/ }));
+test("a_public_document_over_what_the_api_keeps_is_said_at_the_rule_and_nothing_is_sent", async () => {
+  const { user, api, wallet } = setup({ vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  fillBrief();
+  fill(await screen.findByLabelText("Amount (tUSDC)").then(() => "Amount (tUSDC)"), "5");
+  await pickKind(user, /JSON shape/);
   fill("Path", "$.total");
   fill("Must equal (JSON)", "1");
 
@@ -1951,56 +2094,54 @@ test("a_public_document_over_what_the_api_keeps_is_said_on_the_checks_step_and_n
 
   const alert = screen.getByRole("alert");
   expect(alert.textContent).toBe("The public checks are too long. The limit is 256 KiB.");
-  const forward = screen.getByRole("button", { name: "Next: Reward" });
-  expect(off(forward)).toBe(true);
-  await user.click(forward);
-  expect(screen.queryByLabelText("Amount (tUSDC)")).toBeNull();
+  expect(off(postButton())).toBe(true);
+  await user.click(postButton());
   expect(document.activeElement).toBe(alert);
 
   fill("JSON schema", '{"type":"object"}');
   expect(screen.queryByRole("alert")).toBeNull();
-  expect(off(screen.getByRole("button", { name: "Next: Reward" }))).toBe(false);
+  await postReady();
 
   // Nothing was signed in for, uploaded or sent.
   expect(writes(api)).toEqual([]);
   expect(wallet.signRequests).toEqual([]);
 });
 
-test("the_reward_step_names_each_group_once_and_puts_the_token_in_the_amounts_help", async () => {
-  const { user } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toReward(user);
+test("the_page_asks_four_questions_and_puts_the_rest_under_more_options", async () => {
+  setup();
+  render(<PostTask judgeAccount={JUDGE} />);
+  await screen.findByLabelText("Amount (tUSDC)");
 
-  expect(screen.getByRole("group", { name: "Time" })).toBeDefined();
-  expect(screen.getByRole("group", { name: "Who picks the winner" })).toBeDefined();
-  for (const said of ["How long does each stage last?", "Verifier", "What it pays"]) {
-    expect(screen.queryByText(said), said).toBeNull();
+  expect(
+    screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent),
+  ).toEqual([
+    "What do you need done?",
+    "Who checks the work?",
+    "Reward",
+    "Deadline",
+    expect.stringMatching(/^More options/),
+    "Post it",
+  ]);
+  // No category anywhere, and the answer's format, size and tags are under More options.
+  for (const label of [
+    "Category",
+    "Answer format",
+    "Largest answer, in bytes",
+    "Tags (optional)",
+  ]) {
+    expect(screen.queryByLabelText(label), label).toBeNull();
   }
-  // One place says which token it is, and it is the amount's help.
-  expect(screen.getByLabelText("Amount (tUSDC)").getAttribute("aria-describedby")).toBe(
-    "post-amount-help",
+  expect(moreButton().getAttribute("aria-expanded")).toBe("false");
+  // The token is said once, beside the amount; the amount's help says what it can be.
+  expect(document.getElementById("post-amount-help")?.textContent).toMatch(
+    /^At least 1\.00 tUSDC, at most 1,?000\.00 tUSDC\.$/,
   );
-  expect(document.getElementById("post-amount-help")?.textContent).toContain(
-    "Paid in tusdc.testnet. At least 1.00 tUSDC",
-  );
-  expect(screen.getAllByText(/Paid in/)).toHaveLength(1);
+  expect(screen.getAllByText(/tusdc\.testnet/)).toHaveLength(1);
+  // The deadline is a day off to begin with, and the line under it says what follows from it.
+  await waitFor(() => expect(testId("deadline-plan")).toContain("open them (reveal) for 2h"));
 });
 
-test("the_fee_is_said_on_review_and_not_on_the_reward_step", async () => {
-  const { user } = setup();
-  render(<PostWizard judgeAccount={JUDGE} />);
-  await toReward(user);
-
-  // The amount's help says what the amount can be; what Tender keeps is told once, on Review.
-  expect(document.body.textContent).not.toContain("Tender keeps");
-  fill("Amount (tUSDC)", "5");
-  await press(user, "Review");
-  await stepHeading("Review");
-  expect(testId("review-reward")).toBe("5.00 tUSDC · Tender keeps 5% when it is paid out.");
-  expect(document.body.textContent?.match(/Tender keeps/g)).toHaveLength(1);
-});
-
-test("the_balances_are_being_read_in_the_same_words_on_every_line_of_review", async () => {
+test("the_balances_are_being_read_in_the_same_words_on_every_line", async () => {
   const { user } = setup({ vault: TUSDC(2) });
   const inner = globalThis.fetch;
   // The node does not answer for the balances: the read is under way for as long as the test looks.
@@ -2009,10 +2150,10 @@ test("the_balances_are_being_read_in_the_same_words_on_every_line_of_review", as
       ? new Promise<Response>(() => {})
       : inner(input, init),
   );
-  render(<PostWizard judgeAccount={JUDGE} />);
+  render(<PostTask judgeAccount={JUDGE} />);
   await toReview(user);
 
-  // The funding row and the line under Post say it alike, and as the Wallet page says it.
+  // The funding row and the line above Post say it alike, and as the Wallet page says it.
   await waitFor(() => expect(testId("review-funding")).toBe("Reading your balances…"), LONG);
   expect(screen.getByRole("status").textContent).toBe("Reading your balances…");
 });
@@ -2027,7 +2168,7 @@ test("the_post_files_keep_no_drafts_never_clear_the_token_and_log_only_errors", 
     "lib/post.ts",
     "lib/postSubmit.ts",
   ];
-  expect(files.length).toBeGreaterThanOrEqual(9);
+  expect(files.length).toBeGreaterThanOrEqual(8);
 
   for (const file of files) {
     const source = readFileSync(join(web, file), "utf8");
