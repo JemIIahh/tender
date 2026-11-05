@@ -203,6 +203,8 @@ interface Listed {
   /** Null: the task has no held-out checks. */
   heldoutCommitment: string | null;
   phase: Phase;
+  /** The held-out document its scorecard published, if it has one. */
+  published?: object;
 }
 
 interface ListedOptions {
@@ -272,7 +274,23 @@ function detailOf(task: Listed): TaskDetailResponse {
     entries: [],
     funders: [],
     children: [],
-    scorecard: null,
+    scorecard:
+      task.published === undefined
+        ? null
+        : {
+            version: 1,
+            task_id: `${task.id}`,
+            verifier: JUDGE,
+            kind: "exact",
+            criteria_hash: "c".repeat(64),
+            heldout_commitment: task.heldoutCommitment,
+            heldout: task.published,
+            tie_break: "score desc, committed_at_block asc, account asc",
+            entries: [],
+            winners: [],
+            generated_at: "2026-11-05T10:00:00.000Z",
+            judge: { software: "tender-judge/1", model: null },
+          },
   };
 }
 
@@ -1309,6 +1327,60 @@ test("a_task_with_other_documents_but_the_same_heldout_stops_the_seed_all_the_sa
 
   expect(result).toEqual([existing("alpha", 100n)]);
   expect(lines).toEqual(["SKIP alpha (held-out already used by task 100)"]);
+});
+
+test("new_checks_under_a_salt_a_scorecard_published_stop_the_run_before_anything_is_paid", async () => {
+  // Task 40 was alpha's, judged: its scorecard published its checks and salt. alpha was then
+  // rewritten with new checks under the same salt, which makes them guessable from their
+  // commitment again: the run stops, names the task and the fix, and pays and posts nothing.
+  const old = { exact: { expected: ["an older answer"] }, salt: sha256Hex("alpha") };
+  const judged = { ...listedOf(40n, "alpha", "settled"), heldoutCommitment: hashOf(old) };
+  const dir = await seedsDir({ alpha: {}, beta: {} });
+
+  const { failure, lines, chain, api } = await run(dir, {
+    api: { tasks: [{ ...judged, published: old }] },
+  });
+
+  expect((failure as Error).message).toBe(
+    "alpha/heldout.json has the salt that the scorecard of task 40 published, so its checks " +
+      'could be guessed from their commitment: give it a new salt (delete "salt" from the file ' +
+      `and run pnpm exec tsx scripts/salt-heldout.ts ${PRIVATE_OF.get(dir)})`,
+  );
+  expect(lines).toEqual([]);
+  expect(chain.deposit).not.toHaveBeenCalled();
+  expect(chain.storageDeposit).not.toHaveBeenCalled();
+  expect(chain.postTask).not.toHaveBeenCalled();
+  expect(api.uploadBlob).not.toHaveBeenCalled();
+
+  // With a salt of its own, alpha goes up, and a scorecard with another salt stands in no one's way.
+  await writeFile(
+    join(PRIVATE_OF.get(dir) ?? "", "alpha", "heldout.json"),
+    JSON.stringify({ exact: { expected: ["alpha"] }, salt: sha256Hex("a new salt") }),
+  );
+  const again = await run(dir, { api: { tasks: [{ ...judged, published: old }] } });
+  expect(again.failure).toBeUndefined();
+  expect(again.lines.filter((line) => line.startsWith("SEEDED"))).toEqual([
+    "SEEDED alpha task=1",
+    "SEEDED beta task=2",
+  ]);
+});
+
+test("a_judged_seed_whose_published_document_is_its_own_is_skipped_not_refused", async () => {
+  // The same checks and salt as the scorecard published: the seed is public, and is skipped for it.
+  const published = heldoutOf("alpha");
+  const { result, lines, failure } = await run(
+    { alpha: {} },
+    {
+      api: {
+        tasks: [{ ...listedOf(40n, "alpha", "settled"), published }],
+        served: new Set([hashOf(published)]),
+      },
+    },
+  );
+
+  expect(failure).toBeUndefined();
+  expect(lines).toEqual(["SKIP alpha (held-out already public)"]);
+  expect(result).toEqual([existing("alpha", 40n)]);
 });
 
 test("a_task_with_the_brief_of_the_seed_and_other_heldout_does_not_stop_it", async () => {

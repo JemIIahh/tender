@@ -53,6 +53,12 @@ import { PRIVATE_DIR_VARIABLE, privateDirOf } from "./lib/private-dir";
  * seeds of one run with the same checks are refused before anything happens, since the second
  * could not be judged.
  *
+ * A salt is single-use too. A scorecard publishes the checks with their salt, and new checks under
+ * a salt that is public are as guessable from their commitment as checks with no salt. So a seed
+ * about to be posted whose salt a scorecard of one of the poster's tasks has published already
+ * stops the run before anything is paid, and the message says how to draw a new salt
+ * (`scripts/salt-heldout.ts`, which draws one for checks it did not salt).
+ *
  * Running the script again posts nothing twice. Before it pays or uploads anything, it asks the API
  * for the poster's tasks, page after page, and reads every one of them, since the list leaves out
  * the commitment and the brief hash, and the task has both. A settled task counts like any other,
@@ -323,6 +329,8 @@ interface Prepared {
   criteria: Doc;
   /** Absent when the criteria have no held-out part. */
   heldout?: Doc;
+  /** The salt of `heldout`, when there is one. */
+  heldoutSalt?: string;
   token: string;
   /** In the token's smallest unit. */
   reward: bigint;
@@ -431,6 +439,7 @@ async function prepare(
     `${slug}/heldout.json`,
   );
   let heldout: Doc | undefined;
+  let heldoutSalt: string | undefined;
   if (criteria.has_heldout) {
     if (heldoutFile === null) {
       throw new Error(
@@ -448,6 +457,7 @@ async function prepare(
       throw new Error(`${slug}/heldout.json is not a held-out document of kind ${criteria.kind}`);
     }
     heldout = docOf(checks, `${slug}/heldout.json`);
+    heldoutSalt = checks.salt;
   } else if (heldoutFile !== null) {
     throw new Error(
       `${slug}/heldout.json exists in ${heldoutDir}, and ${slug}/criteria.json has no held-out part`,
@@ -460,6 +470,7 @@ async function prepare(
     brief: docOf(brief, `${slug}/brief.json`),
     criteria: docOf(criteria, `${slug}/criteria.json`),
     heldout,
+    ...(heldoutSalt !== undefined && { heldoutSalt }),
     token,
     reward: rewardOf(terms.reward, token, o.network, slug),
     verifier: terms.verifier === "judge" ? o.judgeAccount : o.poster,
@@ -607,6 +618,8 @@ interface Earlier {
   byCommitment: Map<string, bigint>;
   /** By brief hash: the oldest task of the poster that has not settled. */
   unsettledByBrief: Map<string, bigint>;
+  /** By salt: the oldest task of the poster whose scorecard published held-out checks with it. */
+  publishedSalts: Map<string, bigint>;
 }
 
 /**
@@ -638,7 +651,11 @@ async function tasksOf(api: TenderApi, poster: string): Promise<Earlier> {
     }
   } while (cursor !== null);
 
-  const earlier: Earlier = { byCommitment: new Map(), unsettledByBrief: new Map() };
+  const earlier: Earlier = {
+    byCommitment: new Map(),
+    unsettledByBrief: new Map(),
+    publishedSalts: new Map(),
+  };
   // The oldest first, so that it is the one that a commitment or brief posted more than once is
   // named by: the Judge names the lowest id as well.
   for (const id of [...ids].sort((a, b) => Number(a - b))) {
@@ -653,8 +670,41 @@ async function tasksOf(api: TenderApi, poster: string): Promise<Earlier> {
     if (phase !== "settled" && !earlier.unsettledByBrief.has(brief)) {
       earlier.unsettledByBrief.set(brief, id);
     }
+    const salt = publishedSaltOf(found.scorecard?.heldout);
+    if (salt !== undefined && !earlier.publishedSalts.has(salt)) {
+      earlier.publishedSalts.set(salt, id);
+    }
   }
   return earlier;
+}
+
+/** The salt of held-out checks a scorecard published, if they have one. */
+function publishedSaltOf(heldout: unknown): string | undefined {
+  if (typeof heldout !== "object" || heldout === null) return undefined;
+  const salt = (heldout as { salt?: unknown }).salt;
+  return typeof salt === "string" ? salt : undefined;
+}
+
+/**
+ * Throws when a seed about to be posted carries a salt that a scorecard of the poster's has
+ * published already: its checks would be guessable from their commitment, as if they had no salt.
+ * A seed whose whole document was published is skipped before this (its checks are public), so
+ * what is here has new checks under an old salt, as a seed rewritten after it was judged would.
+ */
+function refusePublishedSalts(
+  seeds: readonly Prepared[],
+  earlier: Earlier,
+  heldoutDir: string,
+): void {
+  for (const { slug, heldoutSalt } of seeds) {
+    const taskId = heldoutSalt === undefined ? undefined : earlier.publishedSalts.get(heldoutSalt);
+    if (taskId === undefined) continue;
+    throw new Error(
+      `${slug}/heldout.json has the salt that the scorecard of task ${taskId} published, so its ` +
+        `checks could be guessed from their commitment: give it a new salt (delete "salt" from ` +
+        `the file and run pnpm exec tsx scripts/salt-heldout.ts ${heldoutDir})`,
+    );
+  }
 }
 
 /**
@@ -741,7 +791,8 @@ const MAINNET_REFUSED =
  *
  * Throws for mainnet, whether `network` or the client says it; if `network` and the client's network
  * differ; if the client does not sign as the poster; naming the seed, if its files are wrong, its
- * held-out file is not in the private directory, or two seeds share their held-out checks; if the
+ * held-out file is not in the private directory, two seeds share their held-out checks, or a seed
+ * to post carries a salt that a scorecard of the poster has published; if the
  * API is not the client's deployment, or its index is more than 10 blocks behind the chain; if the
  * poster's wallet cannot cover the rewards the vault lacks; if the API's list of the poster's tasks
  * cannot be read in full; and with the API's or the chain's own error if either refuses a step. The
@@ -794,6 +845,7 @@ export async function seed(o: SeedOptions): Promise<SeededTask[]> {
 
   // The poster pays for what it posts, and what it lacks is found out before any of it is paid.
   const toPost = seeds.filter(({ slug }) => !skips.has(slug));
+  refusePublishedSalts(toPost, earlier, heldoutDir);
   if (toPost.length > 0) {
     const plan = await planFunding(o, toPost);
     await fund(o, plan, log);

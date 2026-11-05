@@ -1,9 +1,9 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HeldoutSchema } from "@tender/shared";
+import { canonicalJson, HeldoutSchema, sha256Hex } from "@tender/shared";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { heldoutFilesOf, saltHeldoutFile } from "./salt-heldout";
+import { drawnFor, heldoutFilesOf, saltFor, saltHeldoutFile } from "./salt-heldout";
 
 let dir: string;
 beforeEach(() => {
@@ -31,7 +31,10 @@ test("a_file_without_a_salt_gets_a_fresh_one_and_keeps_its_checks", () => {
 
   const salted = read(one);
   expect(HeldoutSchema.parse(salted)).toEqual(salted);
-  expect(salted).toEqual({ ...checks, salt: expect.stringMatching(/^[0-9a-f]{64}$/) });
+  // 32 random bytes, then the first 16 bytes of the SHA-256 of the checks it was drawn for.
+  const fingerprint = sha256Hex(canonicalJson(checks)).slice(0, 32);
+  expect(salted).toEqual({ ...checks, salt: expect.stringMatching(/^[0-9a-f]{96}$/) });
+  expect(String(salted.salt).endsWith(fingerprint)).toBe(true);
   // Each file draws its own, so the same checks commit to different hashes.
   expect(read(two).salt).not.toBe(salted.salt);
   // Written with two spaces and a newline at the end, and no temporary file is left.
@@ -39,11 +42,46 @@ test("a_file_without_a_salt_gets_a_fresh_one_and_keeps_its_checks", () => {
   expect(readdirSync(join(dir, "one"))).toEqual(["heldout.json"]);
 });
 
-test("a_file_with_a_salt_is_left_as_it_is", () => {
-  const file = seed("kept", { exact: { expected: ["x"] }, salt: "ab".repeat(32) });
+test("a_file_whose_salt_was_drawn_for_its_checks_is_left_as_it_is", () => {
+  const checks = { exact: { expected: ["x"] } };
+  const file = seed("kept", { ...checks, salt: saltFor(checks) });
   const before = readFileSync(file, "utf8");
   expect(saltHeldoutFile(file)).toBe("kept");
   expect(readFileSync(file, "utf8")).toBe(before);
+  // And running it twice changes nothing the second time.
+  const fresh = seed("fresh", checks);
+  expect(saltHeldoutFile(fresh)).toBe("salted");
+  const once = readFileSync(fresh, "utf8");
+  expect(saltHeldoutFile(fresh)).toBe("kept");
+  expect(readFileSync(fresh, "utf8")).toBe(once);
+});
+
+test("new_checks_under_an_old_salt_get_a_new_salt", () => {
+  // Once a task is judged, its scorecard publishes the checks and the salt. Checks changed under
+  // that salt (a rotated seed) would be as guessable as unsalted ones, so the salt is drawn again.
+  const file = seed("rotated", { exact: { expected: ["old answer"] } });
+  expect(saltHeldoutFile(file)).toBe("salted");
+  const published = read(file).salt;
+  writeFileSync(file, JSON.stringify({ exact: { expected: ["new answer"] }, salt: published }));
+
+  expect(saltHeldoutFile(file)).toBe("resalted");
+  const rotated = read(file);
+  expect(rotated.salt).not.toBe(published);
+  expect(rotated).toEqual({ exact: { expected: ["new answer"] }, salt: expect.any(String) });
+  expect(drawnFor(rotated.salt, rotated)).toBe(true);
+  expect(drawnFor(published, rotated)).toBe(false);
+
+  // A salt the script did not draw cannot be told apart from an old one: it is drawn again too,
+  // whatever it is, a valid one or not.
+  for (const [slug, salt] of [
+    ["by-hand", "ab".repeat(32)],
+    ["too-short", "42"],
+  ] as const) {
+    const other = seed(slug, { exact: { expected: ["x"] }, salt });
+    expect(saltHeldoutFile(other), slug).toBe("resalted");
+    expect(read(other).salt, slug).not.toBe(salt);
+    expect(HeldoutSchema.safeParse(read(other)).success, slug).toBe(true);
+  }
 });
 
 test("a_file_that_is_no_held_out_document_is_refused_without_quoting_it", () => {
@@ -51,7 +89,7 @@ test("a_file_that_is_no_held_out_document_is_refused_without_quoting_it", () => 
     ["text", "the answer is 42", /is not JSON/],
     ["array", '["the answer is 42"]', /it is not an object/],
     ["wrong shape", '{"exact": {"expected": []}}', /at exact\.expected/],
-    ["bad salt", '{"exact": {"expected": ["the answer is 42"]}, "salt": "42"}', /at salt/],
+    ["no kind", '{"answer": "the answer is 42", "salt": "42"}', /is not a held-out document/],
   ];
   for (const [slug, text, message] of cases) {
     mkdirSync(join(dir, slug));
