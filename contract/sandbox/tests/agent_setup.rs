@@ -300,6 +300,12 @@ async fn an_implicit_account_needs_only_a_transfer_and_has_no_provider() -> anyh
     let implicit: AccountId = hex(key.public_key().key_data()).parse()?;
 
     done(owner.transfer_near(&implicit, ACCOUNT_DEPOSIT).await?)?;
+    let details = env.worker.view_account(&implicit).await?;
+    println!(
+        "storage: the implicit account stores {} bytes, locking {} yoctoNEAR",
+        details.storage_usage,
+        u128::from(details.storage_usage) * 10u128.pow(19),
+    );
     assert_eq!(
         full_access_keys(&env, &implicit).await?,
         (vec![public_key], 1),
