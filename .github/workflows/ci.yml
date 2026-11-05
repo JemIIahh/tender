@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+# Every action is pinned to the commit of a release, with the release in a comment: a tag can be
+# moved, and a moved tag would run new code with the job's token. To update one, take the commit of
+# the new release (`gh api repos/<owner>/<repo>/tags`), not the tag.
+
 # The jobs only read the repository. A job that needs more asks for it in its own permissions.
 permissions:
   contents: read
@@ -19,11 +23,11 @@ jobs:
       pull-requests: read
     steps:
       # Full history, so gitleaks scans every commit in the push or pull request.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
       # v3, not v2: v2 runs on Node 20, which GitHub-hosted runners dropped on 2026-09-16.
-      - uses: gitleaks/gitleaks-action@v3
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -37,7 +41,7 @@ jobs:
       run:
         working-directory: contract
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       # rust-toolchain.toml pins Rust 1.96.0 with the wasm32 target, rustfmt and clippy. Rustup 1.28
       # and later install the pinned toolchain only when asked to, so ask.
       - name: Install the pinned Rust toolchain
@@ -101,14 +105,14 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       # pnpm goes before setup-node, whose pnpm cache asks pnpm for the store path. The version
       # matches the packageManager field in package.json, as the action requires. The latest majors
       # of both actions (pnpm/action-setup v6, setup-node v7) run on Node 24.
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 10.26.0
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.21.0
           cache: pnpm
@@ -134,11 +138,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 10.26.0
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.21.0
           cache: pnpm
