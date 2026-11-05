@@ -12,6 +12,7 @@ import {
 import { DEFAULT_ACCOUNT_ID, DEFAULT_PRIVATE_KEY, Sandbox } from "near-sandbox";
 import { type Registration, registerWithBond, scriptedProfile } from "./bond";
 import { type Signer, TenderClient, toTxResult } from "./client";
+import { ensureSandboxNode, NEARCORE_VERSION } from "./sandbox-node";
 
 /** The accounts of a local chain that tests and demos sign as. */
 export type LocalRole =
@@ -50,8 +51,6 @@ const ROLES = [
 ] as const satisfies readonly LocalRole[];
 const CONTRACT = "tender.sandbox";
 const TOKEN = "usdc.sandbox";
-/** The nearcore that plan 01 tested the contract on, and near-sandbox 0.3.4's default. */
-const NEARCORE_VERSION = "2.13.4";
 /** How long `stop` waits for near-sandbox to see the node exit. A live node exits in about 25 ms. */
 const STOP_TIMEOUT_MS = 10_000;
 
@@ -190,9 +189,10 @@ export interface LocalChainOptions {
  *   any agent registers;
  * - the roles of `registerAgents` register as agents, and pay the bond.
  *
- * The node binary is the one at `NEAR_SANDBOX_BIN_PATH`, or near-sandbox downloads nearcore 2.13.4
- * when that is unset. Call `stop` when done. A node that fails to set up is stopped here, once
- * every request of the setup has settled, and the setup's error is thrown.
+ * The node binary is the one at `NEAR_SANDBOX_BIN_PATH`, or nearcore 2.13.4, downloaded when that is
+ * unset and the install has no copy yet (`ensureSandboxNode`). Call `stop` when done. A node that
+ * fails to set up is stopped here, once every request of the setup has settled, and the setup's
+ * error is thrown.
  */
 export async function startLocalChain(opts: LocalChainOptions = {}): Promise<LocalChain> {
   const minWindowSecs = opts.minWindowSecs ?? NETWORKS.sandbox.minWindowSecs;
@@ -207,6 +207,7 @@ export async function startLocalChain(opts: LocalChainOptions = {}): Promise<Loc
   // near-sandbox waits NEAR_RPC_TIMEOUT_SECS (default 10) for a new node to answer; a busy machine
   // needs longer, so a minute unless the caller chose otherwise.
   process.env.NEAR_RPC_TIMEOUT_SECS ??= "60";
+  await ensureSandboxNode();
   const sandbox = await Sandbox.start({ version: NEARCORE_VERSION });
   let accounts: Record<LocalRole, Signer>;
   try {

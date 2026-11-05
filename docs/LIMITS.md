@@ -172,8 +172,8 @@ The state of the repository when this was written. Update this list when any of 
 | Local chain: `pnpm demo:local` and the swarm demo | Run; the output is pasted in the README. The full gate is in [RUNBOOK.md](RUNBOOK.md#10-running-the-gate) |
 | Testnet: the contract deploy | Done on 2026-11-04 (`deployments/testnet.json`). The deployed code's sha256 equals `tender.wasm` in `contract/res/SHA256SUMS` |
 | Testnet: seeding, the hosted services and web app, any task posted there | Not done. They come with hosting |
-| Continuous integration | The workflow is in `.github/workflows/ci.yml`, and the repository is on GitHub. No CI result is recorded here |
-| Postgres code paths (the Postgres adapter, the advisory lock, the migration on Postgres) | CI runs the database tests on a real Postgres server, and no result of that is recorded here. They share the test suite with PGlite where the suite is written against the adapter interface |
+| Continuous integration | `.github/workflows/ci.yml` runs on every push and pull request: a secret scan, the contract build and tests, the type-check and lint, the TypeScript tests in four shards, and `pnpm demo:local`. The run for `428708a` on `main` (run 41984122331) passed all seven of its jobs. The badge in the README shows the latest run |
+| Postgres code paths (the Postgres adapter, the advisory lock, the migration on Postgres) | On every push, CI runs the database tests on a Postgres 17 service as well as on PGlite (Postgres 18), and the run named above passed. They share the test suite with PGlite where the suite is written against the adapter interface |
 | `docker build` of the services image | Not run |
 | A real wallet signing in with NEP-413 | Not done. The tests use a local key |
 | The Telegram bot against Telegram | Not done. The tests use a fake server |

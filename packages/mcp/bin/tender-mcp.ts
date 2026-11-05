@@ -9,6 +9,7 @@ import {
 } from "@tender/client";
 import { NETWORKS } from "@tender/shared";
 import {
+  askNode,
   checkApiDeployment,
   describeFailure,
   filesDirWarning,
@@ -112,8 +113,10 @@ async function main(): Promise<void> {
     rpcUrl: config.rpcUrl,
     signer: config.signer,
   });
-  const key = await detectKeyAccess(client, accountId, config.publicKey);
-  const defaultToken = await resolveDefaultToken(config, client);
+  // The first questions to the node: one that gives no answer is named, with `NEAR_RPC_URL`, in
+  // place of a bare `fetch failed`.
+  const key = await askNode(config, () => detectKeyAccess(client, accountId, config.publicKey));
+  const defaultToken = await askNode(config, () => resolveDefaultToken(config, client));
   const server = createMcpServer({
     client,
     api,
