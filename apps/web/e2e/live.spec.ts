@@ -11,7 +11,8 @@ const HEALTH = {
   contract: "tender.tender-team.testnet",
   indexed_height: "5000",
   chain_final_height: "5000",
-  lag_blocks: "0",
+  // A steady few blocks behind the final block, as on testnet: up to date.
+  lag_blocks: "3",
   waiting_for_chain: false,
 };
 

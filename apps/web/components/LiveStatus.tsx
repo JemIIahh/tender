@@ -114,7 +114,8 @@ function Figures({ live }: { live: Live }) {
 
 /**
  * The top bar's Live pill: a dot and a word for whether the index is up to date with the chain
- * (green, Live), still catching up or waiting for the chain (amber, Updating), or out of reach
+ * (green, Live: 30 blocks behind its final block or fewer, about 30 seconds), still catching up or
+ * waiting for the chain (amber, Updating), or out of reach
  * (hollow, Offline). On a phone it is the dot alone; its name says the word either way.
  *
  * A press opens a small panel under it with the platform's figures, as the API gave them: open

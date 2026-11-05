@@ -121,9 +121,19 @@ test("live_pill_says_catching_up_and_never_how_many_blocks", async () => {
 
 test("live_state_follows_the_health_check", () => {
   const health = (over: Partial<typeof HEALTH>) => ({ ...HEALTH, ...over });
-  // Up to date only with no lag and no wait for the chain.
-  expect(liveOf({ health: health({}), answered: true }).state).toBe("synced");
-  expect(liveOf({ health: health({ lag_blocks: "3" }), answered: true }).state).toBe("behind");
+  // Up to date with a lag of 30 blocks or fewer (about 30 s) and no wait for the chain: the index
+  // reads finalized blocks, and on testnet it runs a steady one to three behind.
+  const at = (lag_blocks: string) =>
+    liveOf({ health: health({ lag_blocks }), answered: true }).state;
+  expect(at("0")).toBe("synced");
+  expect(at("3")).toBe("synced");
+  expect(at("30")).toBe("synced");
+  expect(at("31")).toBe("behind");
+  expect(at("1237")).toBe("behind");
+  // A lag that is no number, or less than none, is not taken to be small.
+  expect(at("soon")).toBe("behind");
+  expect(at("")).toBe("behind");
+  expect(at("-1")).toBe("behind");
   // While the services wait for the chain, a lag of 0 does not mean up to date.
   expect(liveOf({ health: health({ waiting_for_chain: true }), answered: true }).state).toBe(
     "behind",
