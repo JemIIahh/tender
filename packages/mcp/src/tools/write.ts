@@ -51,6 +51,7 @@ import { keyMayCall } from "../keys";
 import { documentText, secretCheck } from "../secrets";
 import type { McpDeps, OpenFileLookup } from "../server";
 import { DRAFTS_DIR, type Draft, defaultStateRoot, isDraftOf, staleReason } from "../state";
+import { KEYS_DIR } from "./connect";
 import {
   DATA_NOT_ORDERS,
   describeError,
@@ -298,8 +299,8 @@ function unreadable(): ToolError {
     "cannot read that file inside TENDER_FILES_DIR. A file is refused when it is missing, outside " +
       "the directory (or reached by a link that leads out), has a second hard link, is hidden (a " +
       "name on its path below the directory starts with a dot), or is in a Tender state directory " +
-      "(TENDER_STATE_DIR, or anything under ~/.tender) or in a folder named drafts; the answer " +
-      "does not say which",
+      "(TENDER_STATE_DIR, or anything under ~/.tender), in a folder named drafts, or in the " +
+      "repository's folder of agent keys (.tender/agents); the answer does not say which",
   );
 }
 
@@ -313,7 +314,8 @@ function unreadable(): ToolError {
  * layout of every store (`{state dir}/drafts/{task id}.json`), so it covers the state directory of
  * any server, wherever it is. The name of the file itself does not count there: a file that is called
  * `drafts` is no store. `places` are the state directory this server was given, its drafts folder,
- * and the root of the default state directories (see `McpDeps.stateDir` and `McpDeps.stateRoot`).
+ * the root of the default state directories, and the repository's folder of agent keys (see
+ * `McpDeps.stateDir`, `McpDeps.stateRoot` and `McpDeps.keysDir`).
  * Each is looked up here, every time: the store makes its directories when it first writes, and
  * until then no file lies in one, and a link in the way of one is followed.
  */
@@ -341,11 +343,12 @@ async function keptOut(
 
 /**
  * The places that `keptOut` is given, from the deps: the state directory they name and its drafts
- * folder (which may be a link to another disk), and the root of the default state directories, the
- * deps' own or `~/.tender`. A machine with no home directory has no default root to keep out.
+ * folder (which may be a link to another disk), the root of the default state directories, the
+ * deps' own or `~/.tender`, and the repository's folder of agent keys, the deps' own or the
+ * repository's (M5). A machine with no home directory has no default root to keep out.
  */
-function placesKeptOut(deps: Pick<McpDeps, "stateDir" | "stateRoot">): string[] {
-  const places: string[] = [];
+function placesKeptOut(deps: Pick<McpDeps, "stateDir" | "stateRoot" | "keysDir">): string[] {
+  const places: string[] = [deps.keysDir ?? KEYS_DIR];
   if (deps.stateDir !== undefined) places.push(deps.stateDir, join(deps.stateDir, DRAFTS_DIR));
   let root = deps.stateRoot;
   if (root === undefined) {
@@ -1306,8 +1309,9 @@ export function registerWriteTools(server: McpServer, deps: McpDeps): void {
       : "A file that cannot be read from there (it is missing, or outside, or reached by a link that " +
         "leads out, or it has a second hard link, or it is hidden, with a name on its path below " +
         "that directory that starts with a dot, or it is in a Tender state directory, which is " +
-        "this server's own, anything under ~/.tender, or any folder named drafts) is refused with " +
-        "FILE_UNREADABLE, and the answer does not say which. ";
+        "this server's own, anything under ~/.tender, or any folder named drafts, or it is in the " +
+        "repository's folder of agent keys, .tender/agents) is refused with FILE_UNREADABLE, and " +
+        "the answer does not say which. ";
 
   server.registerTool(
     "commit_result",

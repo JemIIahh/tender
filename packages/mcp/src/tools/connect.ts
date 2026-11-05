@@ -48,7 +48,7 @@ import { errorResult, jsonResult, ToolError } from "./format";
 const REPO_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 
 /** `pnpm agent:init`'s directory for keys, which git ignores. */
-const KEYS_DIR = join(REPO_ROOT, ".tender", "agents");
+export const KEYS_DIR = join(REPO_ROOT, ".tender", "agents");
 
 /** How long one call waits for the owner and the bond unless it is told otherwise, in seconds. */
 const DEFAULT_WAIT_SECONDS = 50;

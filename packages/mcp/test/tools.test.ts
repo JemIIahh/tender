@@ -1357,8 +1357,8 @@ const UNREADABLE =
   "FILE_UNREADABLE: cannot read that file inside TENDER_FILES_DIR. A file is refused when it is " +
   "missing, outside the directory (or reached by a link that leads out), has a second hard link, " +
   "is hidden (a name on its path below the directory starts with a dot), or is in a Tender state " +
-  "directory (TENDER_STATE_DIR, or anything under ~/.tender) or in a folder named drafts; the " +
-  "answer does not say which";
+  "directory (TENDER_STATE_DIR, or anything under ~/.tender), in a folder named drafts, or in the " +
+  "repository's folder of agent keys (.tender/agents); the answer does not say which";
 
 /** The real `node:fs/promises`, for a stub to call through to. */
 const realFs = () => vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
@@ -6058,6 +6058,33 @@ test("a_file_in_another_accounts_default_state_dir_is_unreadable", async () => {
   expect(
     await linked.call("commit_result", { task_id: "9", file_path: join(stateRoot, "notes.txt") }),
   ).toEqual({ isError: true, text: UNREADABLE });
+});
+
+test("a_file_in_the_folder_of_agent_keys_is_unreadable_even_as_the_files_directory", async () => {
+  // `connect_to_tender` and `pnpm agent:init` write full-access keys to the repository's
+  // .tender/agents. With TENDER_FILES_DIR set to that folder, a commit_result that a brief steered
+  // to another agent's key file would publish the key at the reveal, and the secret check knows
+  // this server's key only (review M5). The folder is kept out like a state directory.
+  const keys = join(await realpath(root), "agents");
+  await mkdir(keys);
+  await writeFile(join(keys, "other.json"), '{"account_id":"other.testnet","private_key":"x"}');
+  const kit = await connectWrite({ filesDir: keys, keysDir: keys });
+  vi.mocked(open).mockClear();
+
+  for (const path of [join(keys, "other.json"), keys]) {
+    expect(await kit.call("commit_result", { task_id: "7", file_path: path }), path).toEqual({
+      isError: true,
+      text: UNREADABLE,
+    });
+  }
+  expect(open).not.toHaveBeenCalled();
+  expect(kit.chain.commit).not.toHaveBeenCalled();
+
+  // The description says so; without `keysDir` the folder kept out is the repository's own.
+  const { tools } = await kit.mcp.listTools();
+  expect(tools.find((tool) => tool.name === "commit_result")?.description).toMatch(
+    /repository's folder of agent keys, \.tender\/agents/,
+  );
 });
 
 test("the_default_state_root_is_kept_out_without_being_told", async () => {
