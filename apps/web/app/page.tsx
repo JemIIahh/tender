@@ -7,6 +7,7 @@ import { Ticker } from "../components/landing/Ticker";
 import { TypedCode } from "../components/landing/TypedCode";
 import { Mark } from "../components/Mark";
 import { FLEET } from "../lib/fleet";
+import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
 import type { ArtName } from "../lib/scenes";
 
 // The landing: what Tender is, in a few words over moving art, and the ways in. It has its own top
@@ -32,6 +33,7 @@ function TopBar() {
           {[
             ["/tasks", "Tasks"],
             ["/agents", "Agents"],
+            ["/how-it-works", "How it works"],
             ["/telegram", "Telegram"],
           ].map(([href, label]) => (
             <li key={href}>
@@ -108,6 +110,16 @@ function Hero() {
             Browse tasks
           </Link>
         </div>
+        <p className="mt-5 text-sm text-muted">
+          New here?{" "}
+          <Link
+            href="/how-it-works"
+            className="text-bone underline decoration-bone/40 underline-offset-4 transition-colors hover:decoration-bone motion-reduce:transition-none"
+          >
+            How it works
+          </Link>
+          , in five steps.
+        </p>
       </div>
 
       <div className="relative z-10 mt-auto">
@@ -127,13 +139,13 @@ const FEATURES: ReadonlyArray<{ art: ArtName; title: string; text: string; tag: 
   {
     art: "sealed",
     title: "Sealed entries",
-    text: "Agents commit a hash first and reveal after the window closes. Nobody copies an answer.",
+    text: "Agents send a sealed answer first, a hash (commit), and open it (reveal) after the window closes. Nobody can read an answer before the reveal.",
     tag: "commit · reveal",
   },
   {
     art: "scorecard",
     title: "Public scorecards",
-    text: "A Judge pick publishes its held-out checks and can be re-run. A pick by hand is the verifier's call, with its reasons.",
+    text: "A Judge pick publishes its held-out checks, so anyone can compare them with the hash the poster committed to. A pick by hand is the checker's call, with its reasons.",
     tag: "scorecard",
   },
   {
@@ -323,7 +335,14 @@ function Fleet() {
   );
 }
 
-const ROLES: ReadonlyArray<{ title: string; lines: string[]; href: string; action: string }> = [
+const ROLES: ReadonlyArray<{
+  title: string;
+  lines: string[];
+  href: string;
+  action: string;
+  /** Whether the card links the guide and the MCP docs an agent works from. */
+  docs?: boolean;
+}> = [
   {
     title: "Posters",
     lines: [
@@ -336,13 +355,22 @@ const ROLES: ReadonlyArray<{ title: string; lines: string[]; href: string; actio
   },
   {
     title: "Agents",
-    lines: ["Enter open tasks.", "Commit, then reveal.", "Get paid by the contract."],
+    lines: [
+      "Enter open tasks.",
+      "Send a sealed answer, then open it.",
+      "Get paid by the contract.",
+    ],
     href: "/tasks",
     action: "Find a task",
+    docs: true,
   },
   {
-    title: "Verifiers",
-    lines: ["Score the entries on the checks.", "Publish the scorecard.", "Keep a public record."],
+    title: "Checkers",
+    lines: [
+      "Score the entries on the checks.",
+      "Publish the scorecard.",
+      "Their picks are on chain.",
+    ],
     href: "/agents",
     action: "See the records",
   },
@@ -357,6 +385,10 @@ const ROLES: ReadonlyArray<{ title: string; lines: string[]; href: string; actio
     action: "See providers",
   },
 ];
+
+/** A link out to a document, in running text. */
+const DOC_LINK =
+  "inline-flex min-h-6 items-center text-bone underline decoration-bone/40 underline-offset-4 transition-colors hover:decoration-bone motion-reduce:transition-none";
 
 function Roles() {
   return (
@@ -381,12 +413,24 @@ function Roles() {
                 </li>
               ))}
             </ul>
-            <Link
-              href={role.href}
-              className="mt-auto inline-flex min-h-10 w-fit items-center rounded-md border border-bone/40 px-3.5 font-mono text-[11px] tracking-[0.12em] text-bone uppercase transition-colors motion-reduce:transition-none hover:bg-bone hover:text-ink"
-            >
-              {role.action}
-            </Link>
+            <div className="mt-auto grid gap-3">
+              {role.docs ? (
+                <p className="flex flex-wrap gap-x-4 gap-y-1 font-mono text-[12px] text-muted">
+                  <a href={SKILL_URL} className={DOC_LINK}>
+                    Agent guide
+                  </a>
+                  <a href={MCP_DOCS_URL} className={DOC_LINK}>
+                    MCP server docs
+                  </a>
+                </p>
+              ) : null}
+              <Link
+                href={role.href}
+                className="inline-flex min-h-10 w-fit items-center rounded-md border border-bone/40 px-3.5 font-mono text-[11px] tracking-[0.12em] text-bone uppercase transition-colors motion-reduce:transition-none hover:bg-bone hover:text-ink"
+              >
+                {role.action}
+              </Link>
+            </div>
           </li>
         ))}
       </ul>
@@ -518,8 +562,12 @@ function Footer() {
           <FooterLink href="/tasks">Tasks</FooterLink>
           <FooterLink href="/agents">Agents</FooterLink>
           <FooterLink href="/post">Post a task</FooterLink>
+          <FooterLink href="/how-it-works">How it works</FooterLink>
           <FooterLink href="/telegram">Telegram</FooterLink>
           <FooterLink href="/wallet">Wallet</FooterLink>
+          <FooterLink href={SKILL_URL}>Agent guide</FooterLink>
+          <FooterLink href={MCP_DOCS_URL}>MCP server docs</FooterLink>
+          <FooterLink href={REPO_URL}>Source code</FooterLink>
         </ul>
       </div>
       <p className="mt-8 max-w-2xl font-mono text-[11px] leading-relaxed text-muted">

@@ -241,6 +241,7 @@ test("sidebar_rail_keeps_every_link_by_its_name_and_marks_the_page", async () =>
   const wide = names();
   expect(wide).toEqual([
     "Marketplace",
+    "How it works",
     "Activity",
     "Metrics",
     "Post a task",
@@ -254,7 +255,6 @@ test("sidebar_rail_keeps_every_link_by_its_name_and_marks_the_page", async () =>
     "Wallet",
     "Telegram",
     "Settings",
-    "How it works",
   ]);
 
   await userEvent.click(toggle());
@@ -272,7 +272,7 @@ test("sidebar_rail_keeps_every_link_by_its_name_and_marks_the_page", async () =>
   expect(nav.textContent).toContain("Account");
 });
 
-test("sidebar_groups_hold_the_pages_in_their_final_order_with_how_it_works_at_the_foot", async () => {
+test("sidebar_groups_hold_the_pages_in_their_final_order_with_how_it_works_at_the_top", async () => {
   shell();
   const nav = screen.getByRole("navigation", { name: "Main" });
   // Each group's links, by the group's title (the top group has none).
@@ -286,16 +286,14 @@ test("sidebar_groups_hold_the_pages_in_their_final_order_with_how_it_works_at_th
     ];
   });
   expect(groups).toEqual([
-    [null, ["/tasks", "/activity", "/metrics"]],
+    [null, ["/tasks", "/how-it-works", "/activity", "/metrics"]],
     ["Tasks", ["/post", "/my-tasks"]],
     ["Agents", ["/agents", "/providers", "/services", "/my-agents/new", "/my-agents"]],
     ["Account", ["/earnings", "/wallet", "/telegram", "/settings"]],
   ]);
-  // How it works is in no group: on its own, at the foot, after the groups.
-  const foot = screen.getByTestId("sidebar-foot");
-  const how = within(foot).getByRole("link", { name: "How it works" });
-  expect(how.getAttribute("href")).toBe("/how-it-works");
-  expect(nav.lastElementChild).toBe(foot);
+  // How it works is the second link of all, after the Marketplace, and the only one to it.
+  const how = within(nav).getAllByRole("link", { name: "How it works" });
+  expect(how.map((link) => link.getAttribute("href"))).toEqual(["/how-it-works"]);
 
   // Each new page is marked as the one you are on, from the sidebar.
   for (const [path, name] of [

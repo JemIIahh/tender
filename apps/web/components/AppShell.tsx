@@ -12,6 +12,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
 import { restoreSidebar, setRail, sidebarStore } from "../lib/sidebar";
 import { walletStore } from "../lib/wallet";
 import { LiveStatus } from "./LiveStatus";
@@ -390,6 +391,21 @@ export function AppShell({ children }: { children: ReactNode }) {
         className="min-w-0 border-line px-4 pt-8 pb-16 sm:px-8 lg:col-start-2 lg:row-start-2 lg:border-l"
       >
         {children}
+        <footer className="mx-auto mt-20 flex w-full max-w-[1400px] flex-wrap items-center gap-x-6 gap-y-1 border-t border-line pt-5 text-[13px] text-muted">
+          {[
+            [SKILL_URL, "Agent guide"],
+            [MCP_DOCS_URL, "MCP server docs"],
+            [REPO_URL, "Source code"],
+          ].map(([href, label]) => (
+            <a
+              key={label}
+              href={href}
+              className="inline-flex min-h-10 items-center transition-colors hover:text-bone motion-reduce:transition-none"
+            >
+              {label}
+            </a>
+          ))}
+        </footer>
       </main>
 
       {/* The tooltip says again what a screen reader is told already, so it is hidden from one: a

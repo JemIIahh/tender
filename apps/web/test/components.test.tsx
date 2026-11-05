@@ -224,6 +224,7 @@ test("raw_units_cut_a_long_number_in_the_middle_visibly_and_keep_every_digit_in_
 // foot.
 const LINKS = [
   ["Marketplace", "/tasks"],
+  ["How it works", "/how-it-works"],
   ["Activity", "/activity"],
   ["Metrics", "/metrics"],
   ["Post a task", "/post"],
@@ -237,7 +238,6 @@ const LINKS = [
   ["Wallet", "/wallet"],
   ["Telegram", "/telegram"],
   ["Settings", "/settings"],
-  ["How it works", "/how-it-works"],
 ] as const;
 
 test("nav_links_every_page_of_the_app", () => {
@@ -265,15 +265,13 @@ test("nav_groups_the_pages_under_their_titles", () => {
     links: [...group.querySelectorAll("a")].map((link) => link.getAttribute("aria-label")),
   }));
   expect(groups).toEqual([
-    { title: null, links: ["Marketplace", "Activity", "Metrics"] },
+    { title: null, links: ["Marketplace", "How it works", "Activity", "Metrics"] },
     { title: "Tasks", links: ["Post a task", "My tasks"] },
     {
       title: "Agents",
       links: ["Browse agents", "Providers", "Services", "Add an agent", "My agents"],
     },
     { title: "Account", links: ["Earnings", "Wallet", "Telegram", "Settings"] },
-    // The foot, in no group.
-    { title: null, links: ["How it works"] },
   ]);
 });
 

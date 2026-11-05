@@ -1,6 +1,7 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import Landing from "../app/page";
+import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
 
 // The landing (app/page.tsx): what it says Tender is, where its links go, and what it never says.
 // Its parts are in landing-parts.test.tsx.
@@ -42,9 +43,27 @@ test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () =>
 
   expect(hrefs("See providers")).toEqual(["/providers"]);
   expect(hrefs("Add an agent")).toEqual(["/my-agents/new"]);
-  expect(hrefs("How it works")).toEqual(["/how-it-works"]);
+  // How it works from the hero, the top bar, the steps and the footer.
+  expect(new Set(hrefs("How it works"))).toEqual(new Set(["/how-it-works"]));
+  const hero = screen.getByRole("region", { name: /Post a task\./ });
+  expect(within(hero).getByRole("link", { name: "How it works" }).getAttribute("href")).toBe(
+    "/how-it-works",
+  );
+  // The agents' card and the footer link the guide and the MCP docs, and the footer the source.
+  const roles = screen.getByRole("heading", { name: "Four ways in >" }).closest("section");
+  const agents = within(roles as HTMLElement)
+    .getByRole("heading", { level: 3, name: "Agents" })
+    .closest("li");
+  expect(
+    within(agents as HTMLElement)
+      .getAllByRole("link")
+      .map((link) => link.getAttribute("href")),
+  ).toEqual([SKILL_URL, MCP_DOCS_URL, "/tasks"]);
+  const footer = within(screen.getByRole("contentinfo"));
+  expect(footer.getByRole("link", { name: "Source code" }).getAttribute("href")).toBe(REPO_URL);
+  expect(footer.getByRole("link", { name: "Agent guide" }).getAttribute("href")).toBe(SKILL_URL);
 
-  // Every link stays in the app, on a page that exists.
+  // Every link stays in the app, on a page that exists, but those to the source and its docs.
   const pages = new Set([
     "/",
     "/tasks",
@@ -55,6 +74,9 @@ test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () =>
     "/providers",
     "/my-agents/new",
     "/how-it-works",
+    REPO_URL,
+    SKILL_URL,
+    MCP_DOCS_URL,
   ]);
   for (const link of screen.getAllByRole("link")) {
     expect(pages.has(link.getAttribute("href") ?? ""), link.textContent ?? "").toBe(true);
@@ -102,7 +124,7 @@ test("landing_has_four_ways_in_and_providers_are_one", () => {
   expect(cards.map((card) => card.querySelector("h3")?.textContent)).toEqual([
     "Posters",
     "Agents",
-    "Verifiers",
+    "Checkers",
     "Providers (ASPs)",
   ]);
   const providers = cards[3] as HTMLElement;

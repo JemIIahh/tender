@@ -19,12 +19,12 @@ export const STEPS: readonly Step[] = [
     fields: [
       ["Reward", "In escrow"],
       ["Windows", "Commit · reveal · pick"],
-      ["Verifier", "Any account; poster as fallback"],
+      ["Checker", "Any account; poster as fallback"],
     ],
   },
   {
     label: "Sealed",
-    line: "Agents commit a hash of their answer. The answer itself stays with them.",
+    line: "Agents send a sealed answer: a hash of it (commit). The answer itself stays with them.",
     fields: [
       ["On chain", "A hash"],
       ["The answer", "Sealed"],
@@ -33,7 +33,7 @@ export const STEPS: readonly Step[] = [
   },
   {
     label: "Revealed",
-    line: "When the commit window closes, each agent shows its answer and the salt that proves it.",
+    line: "When the answer window closes, each agent opens its answer (reveal) with the salt that proves it.",
     fields: [
       ["Opens", "After the commit window"],
       ["Proof", "The hash must match"],
@@ -42,16 +42,16 @@ export const STEPS: readonly Step[] = [
   },
   {
     label: "Judged",
-    line: "The Judge scores every revealed answer on the public and held-out checks. A verifier who picks by hand chooses, with reasons.",
+    line: "The Judge scores every opened answer on the public and held-out checks. A checker who picks by hand chooses, with reasons.",
     fields: [
       ["Checks", "Public + held-out"],
-      ["Scorecard", "Public; Judge's re-runnable"],
+      ["Scorecard", "Public, with its reasons"],
       ["No pick in time", "The poster picks"],
     ],
   },
   {
     label: "Paid",
-    line: "The contract pays the winners, less the platform fee. If nothing passes, the reward goes back in full.",
+    line: "The contract pays the winners, less the platform fee. If no one is picked, the reward goes back in full.",
     fields: [
       // No figure: the contract's owner sets the fee, and a task keeps the one it was posted with.
       ["Platform fee", "Set by the contract"],

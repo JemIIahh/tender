@@ -5,7 +5,8 @@ import { usePathname } from "next/navigation";
 import type { FocusEvent, PointerEvent, ReactNode } from "react";
 
 // Every page of the app, in the groups of the sidebar (components/AppShell.tsx), so that a task
-// that adds a page does not have to touch the shell; and How it works, on its own at the foot.
+// that adds a page does not have to touch the shell. How it works is in the top group, beside the
+// Marketplace, for anyone new to find first.
 //
 // From laptop width up the sidebar can be a narrow rail of icons (lib/sidebar.ts). The rail's look
 // is all CSS, on the `rail:` variant: each link keeps its icon where it was, its words fade out,
@@ -39,6 +40,7 @@ const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = 
     title: null,
     items: [
       { href: "/tasks", label: "Marketplace", icon: "market" },
+      { href: "/how-it-works", label: "How it works", icon: "how" },
       { href: "/activity", label: "Activity", icon: "activity" },
       { href: "/metrics", label: "Metrics", icon: "metrics" },
     ],
@@ -71,10 +73,7 @@ const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = 
   },
 ];
 
-/** The link at the foot of the sidebar, apart from the groups: what Tender is and how it works. */
-const FOOT: Item = { href: "/how-it-works", label: "How it works", icon: "how" };
-
-const HREFS = [...GROUPS.flatMap((group) => group.items.map((item) => item.href)), FOOT.href];
+const HREFS = GROUPS.flatMap((group) => group.items.map((item) => item.href));
 
 /**
  * The link of the page you are on: the one whose page `pathname` is, or is under, and of those the
@@ -219,13 +218,10 @@ function NavLink({
   item: { href, label, icon },
   current,
   tip,
-  small = false,
 }: {
   item: Item;
   current: string | undefined;
   tip?: (label: string) => TipHandlers;
-  /** The foot's link: the same box, in smaller words. */
-  small?: boolean;
 }) {
   return (
     <Link
@@ -236,7 +232,7 @@ function NavLink({
       aria-label={label}
       aria-current={href === current ? "page" : undefined}
       {...tip?.(label)}
-      className={`flex items-center gap-3 overflow-hidden rounded-xl px-3 text-muted transition-colors hover:bg-raised/60 hover:text-bone motion-reduce:transition-none aria-[current=page]:bg-raised aria-[current=page]:text-bone ${small ? "min-h-10 text-[13.5px]" : "min-h-10 text-[15px]"}`}
+      className={`flex min-h-10 items-center gap-3 overflow-hidden rounded-xl px-3 text-[15px] text-muted transition-colors hover:bg-raised/60 hover:text-bone motion-reduce:transition-none aria-[current=page]:bg-raised aria-[current=page]:text-bone`}
     >
       <NavIcon icon={icon} />
       <span className={`whitespace-nowrap ${FADE} lg:rail:opacity-0`}>{label}</span>
@@ -245,19 +241,15 @@ function NavLink({
 }
 
 /**
- * The app's pages, grouped as the sidebar shows them, with the one you are on marked, and How it
- * works at the foot. `tip` gives each link what it needs to show its name in a tooltip on the rail.
+ * The app's pages, grouped as the sidebar shows them, with the one you are on marked. `tip` gives
+ * each link what it needs to show its name in a tooltip on the rail.
  */
 export function Nav({ tip }: { tip?: (label: string) => TipHandlers } = {}) {
   const current = currentHref(usePathname());
   return (
     // One column that may be narrower than the words in it (`grid-cols-1` is minmax(0, 1fr)): on
-    // the rail a link is as wide as the rail, and the words it holds are cut off, not the rail. The
-    // last row takes what height is left, so that the foot's link sits at the sidebar's foot.
-    <nav
-      aria-label="Main"
-      className="grid flex-1 grid-cols-1 grid-rows-[auto_auto_auto_auto_1fr] gap-6"
-    >
+    // the rail a link is as wide as the rail, and the words it holds are cut off, not the rail.
+    <nav aria-label="Main" className="grid grid-cols-1 content-start gap-6">
       {GROUPS.map((group) => (
         <div key={group.title ?? "top"} className="grid grid-cols-1 gap-1">
           {group.title === null ? null : (
@@ -285,9 +277,6 @@ export function Nav({ tip }: { tip?: (label: string) => TipHandlers } = {}) {
           </ul>
         </div>
       ))}
-      <div data-testid="sidebar-foot" className="grid grid-cols-1 content-end">
-        <NavLink item={FOOT} current={current} tip={tip} small />
-      </div>
     </nav>
   );
 }
