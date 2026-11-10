@@ -18,6 +18,10 @@ import {
   ConnectCodeCreatedSchema,
   type ConnectCodeState,
   ConnectCodeStateSchema,
+  type ConnectDismissed,
+  ConnectDismissedSchema,
+  type ConnectImplicitAgents,
+  ConnectImplicitAgentsSchema,
   type CreateServiceRequest,
   fetchJson,
   type HealthResponse,
@@ -411,8 +415,9 @@ export const api = {
     return post(`/tasks/${task}/start`, StartResponseSchema, { token });
   },
 
-  // ---- Connect your agent (packages/api/src/routes/connect.ts). The owner's two routes: the code
-  // and how it stands. The agent's side never runs in the browser.
+  // ---- Connect your agent (packages/api/src/routes/connect.ts). The owner's routes: the code, how
+  // it stands, the choice of the implicit account, and the agents set up that way. The agent's side
+  // never runs in the browser.
 
   /**
    * `POST /v1/connect/codes`: a one-time code for the agent's account `<name>.<you>`, good for 30
@@ -427,6 +432,32 @@ export const api = {
   async getConnectCode(token: string, id: string): Promise<ConnectCodeState | null> {
     if (!CONNECT_ID.test(id)) return null;
     return orNull(get(`/connect/codes/${id}`, ConnectCodeStateSchema, undefined, token));
+  },
+
+  /**
+   * `POST /v1/connect/codes/:id/implicit`: the agent of this code gets the implicit account of the
+   * key attached, in place of `<name>.<you>`. The API works the account out from the key; the page
+   * checks it against its own. Needs a token from a full-access key. It throws for an id that is
+   * no code id, without asking.
+   */
+  chooseImplicitAccount(token: string, id: string): Promise<ConnectCodeState> {
+    if (!CONNECT_ID.test(id)) return notAnId("chooseImplicitAccount", "a connect code id", id);
+    return post(`/connect/codes/${id}/implicit`, ConnectCodeStateSchema, { token });
+  },
+
+  /** `GET /v1/connect/implicit`: the agents this account set up as implicit accounts, newest first. */
+  implicitAgents(token: string): Promise<ConnectImplicitAgents> {
+    return get("/connect/implicit", ConnectImplicitAgentsSchema, undefined, token);
+  },
+
+  /**
+   * `POST /v1/connect/codes/:id/dismiss`: forgets an implicit agent of this account that the index
+   * does not list. Needs a token from a full-access key. It throws for an id that is no code id,
+   * without asking.
+   */
+  dismissImplicitAgent(token: string, id: string): Promise<ConnectDismissed> {
+    if (!CONNECT_ID.test(id)) return notAnId("dismissImplicitAgent", "a connect code id", id);
+    return post(`/connect/codes/${id}/dismiss`, ConnectDismissedSchema, { token });
   },
 
   /** `POST /v1/services`: lists a service of one of the signed-in account's agents. */

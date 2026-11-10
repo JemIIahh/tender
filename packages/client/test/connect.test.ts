@@ -1,4 +1,9 @@
-import { ApiError, type ConnectLookup, connectFingerprint } from "@tender/shared";
+import {
+  ApiError,
+  type ConnectLookup,
+  connectFingerprint,
+  implicitAccountOf,
+} from "@tender/shared";
 import { KeyPair } from "near-api-js";
 import { expect, test } from "vitest";
 import {
@@ -18,11 +23,14 @@ const CODE = "tc_abcdefghijklmnopqrstuvwxyz";
 const OWNER = "alice.testnet";
 const ACCOUNT = `writer.${OWNER}`;
 const PUBLIC = KeyPair.fromRandom("ed25519").getPublicKey().toString();
+/** The implicit account of the agent's key: where the agent goes when the owner chooses it. */
+const IMPLICIT = implicitAccountOf(PUBLIC) ?? "";
 
 const lookupOf = (over: Partial<ConnectLookup> = {}): ConnectLookup => ({
   owner: OWNER,
   name: "writer",
   account_id: ACCOUNT,
+  account_kind: "sub_account",
   network: "testnet",
   contract: "tender.testnet",
   state: "waiting",
@@ -47,6 +55,8 @@ const planOf = (over: Partial<RegistrationPlan> = {}): RegistrationPlan => ({
 function world(
   options: {
     lookup?: ConnectLookup;
+    /** What the lookups after the first answer, in order (the last one again and again). */
+    later?: Array<ConnectLookup | Error>;
     keyStates?: ConnectKeyState[];
     plans?: RegistrationPlan[];
     attach?: () => Promise<ConnectLookup>;
@@ -54,9 +64,25 @@ function world(
     existingKey?: boolean;
     /** The account's full-access keys; the agent's own alone unless a test says. */
     keys?: string[];
+    /** The full-access keys, read after read (the last one again and again), over `keys`. */
+    keyLists?: string[][];
+    /** The accounts that exist on the chain, as `view_account` says. */
+    existing?: string[];
+    /** What moving the key file does instead of moving it: a refusal. */
+    moveFails?: Error;
   } = {},
 ) {
   const calls: string[] = [];
+  /** The accounts the chain was asked about, and the accounts registered. */
+  const asked: string[] = [];
+  const registeredAs: string[] = [];
+  const later = [...(options.later ?? [])];
+  const keyLists = [...(options.keyLists ?? [])];
+  let looked = false;
+  /** The key attached, once it is: later lookups carry its fingerprint, as the API's do. */
+  let attachedKey: string | null = null;
+  /** Whether the fake key store holds the agent's key: made by the engine, or there before. */
+  let held = options.existingKey ?? false;
   const lines: string[] = [];
   let clock = 1_000_000;
   const keyStates = [...(options.keyStates ?? ["has-key"])];
@@ -65,13 +91,26 @@ function world(
   const api: ConnectApi = {
     async connectLookup(code) {
       calls.push(`lookup ${code}`);
-      return options.lookup ?? lookupOf();
+      if (looked && later.length > 0) {
+        const next = later.length > 1 ? later.shift() : later[0];
+        if (next instanceof Error) throw next;
+        if (next !== undefined) return next;
+      }
+      looked = true;
+      const first = options.lookup ?? lookupOf();
+      return attachedKey === null
+        ? first
+        : { ...first, state: "attached", fingerprint: connectFingerprint(attachedKey) };
     },
     async connectAttach(code, publicKey) {
       calls.push(`attach ${code} ${publicKey}`);
+      attachedKey = publicKey;
       return (
-        options.attach?.() ??
-        lookupOf({ state: "attached", fingerprint: connectFingerprint(publicKey) })
+        options.attach?.() ?? {
+          ...(options.lookup ?? lookupOf()),
+          state: "attached",
+          fingerprint: connectFingerprint(publicKey),
+        }
       );
     },
     async connectContest(code) {
@@ -97,7 +136,8 @@ function world(
     chainFor: (lookup) => {
       calls.push(`chain ${lookup.network} ${lookup.contract}`);
       return {
-        keyState: async () => {
+        keyState: async (account) => {
+          asked.push(account);
           const state = keyStates.length > 1 ? keyStates.shift() : keyStates[0];
           calls.push(`keyState ${state}`);
           return state ?? "missing";
@@ -107,26 +147,39 @@ function world(
           calls.push(`plan ${plan?.shortfall}`);
           return plan ?? planOf();
         },
+        accountExists: async (account) => {
+          calls.push(`exists ${account}`);
+          return (options.existing ?? []).includes(account);
+        },
         fullAccessKeys: async () => {
           calls.push("keys");
+          if (keyLists.length > 0)
+            return (keyLists.length > 1 ? keyLists.shift() : keyLists[0]) ?? [];
           return options.keys ?? [PUBLIC];
         },
       };
     },
     key: async (_lookup, name, mayMake) => {
       calls.push(`key ${name} ${mayMake}`);
-      if (!(options.existingKey ?? false) && !mayMake) return null;
-      return {
-        publicKey: PUBLIC,
-        path: `/keys/${name}.json`,
-        made: !(options.existingKey ?? false),
-      };
+      if (!held && !mayMake) return null;
+      const made = !held;
+      held = true;
+      return { publicKey: PUBLIC, path: `/keys/${name}.json`, made };
     },
-    register: async (_lookup, name) => {
+    moveKey: async (lookup, name, exists) => {
+      calls.push(`move ${name} ${lookup.account_id}`);
+      if (options.moveFails !== undefined) throw options.moveFails;
+      // As `moveAgentKeyToImplicit` does: the sub-account must not be on the chain.
+      if (lookup.account_kind !== "implicit") throw new Error("the record says sub_account");
+      if (await exists(`${lookup.name}.${lookup.owner}`)) throw new Error("sub-account exists");
+      return { publicKey: PUBLIC, path: `/keys/${name}.json`, made: false };
+    },
+    register: async (lookup, name) => {
       calls.push(`register ${name}`);
+      registeredAs.push(lookup.account_id);
     },
   };
-  return { calls, lines, opts, elapsed: () => clock - 1_000_000 };
+  return { calls, lines, opts, asked, registeredAs, elapsed: () => clock - 1_000_000 };
 }
 
 test("the_steps_run_in_order_and_each_says_one_plain_line", async () => {
@@ -135,6 +188,8 @@ test("the_steps_run_in_order_and_each_says_one_plain_line", async () => {
   expect(outcome).toEqual({
     status: "registered",
     accountId: ACCOUNT,
+    accountKind: "sub_account",
+    name: "writer",
     owner: OWNER,
     fingerprint: connectFingerprint(PUBLIC),
     keyPath: "/keys/writer.json",
@@ -177,7 +232,7 @@ test("a_wait_that_runs_out_says_where_it_stopped_and_how_to_go_on", async () => 
   expect(outcome.status).toBe("waiting_for_account");
   expect(w.elapsed()).toBe(100_000);
   expect(w.lines).toContain(
-    "still waiting for writer.alice.testnet to be created (2m more, then this stops)",
+    "still waiting for alice.testnet to create the account (2m more, then this stops)",
   );
   expect(w.lines.at(-1)).toBe(
     `stopped waiting: ${ACCOUNT} does not exist yet. Run the same command again to go on.`,
@@ -395,4 +450,169 @@ test("the_api_is_asked_again_until_its_index_shows_the_agent_and_a_late_index_fa
     ],
   });
   expect(await connectAgent(away.opts)).toMatchObject({ status: "registered", confirmed: false });
+});
+
+// ---- The implicit account ---------------------------------------------------------------------
+
+/** The API's answer once the owner chose the implicit account of the agent's key. */
+const movedOf = (over: Partial<ConnectLookup> = {}) =>
+  lookupOf({
+    state: "attached",
+    fingerprint: connectFingerprint(PUBLIC),
+    account_kind: "implicit",
+    account_id: IMPLICIT,
+    ...over,
+  });
+
+test("the_owner_choosing_the_implicit_account_moves_the_wait_and_the_key_file_there", async () => {
+  // The owner's wallet refuses the sub-account; 40 s in, the owner chooses the separate account,
+  // and its NEAR arrives a little later.
+  const attached = lookupOf({ state: "attached", fingerprint: connectFingerprint(PUBLIC) });
+  const w = world({
+    later: [attached, movedOf()],
+    keyStates: [...Array<ConnectKeyState>(14).fill("missing"), "missing", "has-key"],
+  });
+  const outcome = await connectAgent(w.opts);
+  expect(outcome).toMatchObject({
+    status: "registered",
+    accountId: IMPLICIT,
+    accountKind: "implicit",
+    confirmed: true,
+  });
+  // The API is asked at most every 20 s, never between; the chain is asked about the sub-account
+  // until the move, and about the implicit account after it.
+  expect(w.calls.filter((call) => call.startsWith("lookup"))).toHaveLength(3);
+  expect(w.asked.slice(0, 7).every((account) => account === ACCOUNT)).toBe(true);
+  expect(w.asked.at(-1)).toBe(IMPLICIT);
+  expect(new Set(w.asked)).toEqual(new Set([ACCOUNT, IMPLICIT]));
+  // The key file is moved once, to the implicit account, after the chain said the sub-account is
+  // not there; nothing is made.
+  expect(w.calls.filter((call) => /^(key|move|exists) /.test(call))).toEqual([
+    "key writer true",
+    `move writer ${IMPLICIT}`,
+    `exists ${ACCOUNT}`,
+  ]);
+  expect(w.registeredAs).toEqual([IMPLICIT]);
+  expect(w.lines).toContain(
+    `${OWNER} chose a separate account for this agent: ${IMPLICIT}, the implicit account of its ` +
+      `key. It is its own account, so Tender's directory won't list it under ${OWNER} as its provider.`,
+  );
+  expect(w.lines).toContain(`registered: ${IMPLICIT} is an agent`);
+});
+
+test("a_run_after_the_move_goes_on_at_the_implicit_account_and_stops_with_the_right_words", async () => {
+  const w = world({ lookup: movedOf(), later: [movedOf()], existingKey: true, plans: [planOf()] });
+  w.opts.waitMs = 10_000;
+  const outcome = await connectAgent(w.opts);
+  expect(outcome).toMatchObject({ status: "waiting_for_bond", accountId: IMPLICIT });
+  expect(w.asked).toEqual([IMPLICIT]);
+  expect(w.lines[0]).toBe(`connect code for ${IMPLICIT}, made by ${OWNER}, on testnet`);
+  expect(w.lines).toContain(`waiting for ${OWNER} to send ${IMPLICIT} its NEAR…`);
+  // Finish this agent works by name, which an implicit account has not.
+  expect(w.lines.at(-1)).toBe(
+    "stopped waiting: the bond is not in the agent's vault yet. alice.testnet presses Fund agent " +
+      "in step 4 of the Add an agent page of the web app, in the browser tab that made the code. " +
+      "Then run the same command again.",
+  );
+});
+
+test("an_implicit_account_that_is_not_this_keys_is_not_acted_on", async () => {
+  const other = implicitAccountOf(KeyPair.fromRandom("ed25519").getPublicKey().toString()) ?? "";
+  // From the first look (a run after the move)...
+  const first = world({ lookup: movedOf({ account_id: other }), existingKey: true });
+  await expect(connectAgent(first.opts)).rejects.toThrow(/the API's answer does not add up/);
+  expect(first.calls).not.toContain(`attach ${CODE} ${PUBLIC}`);
+  // ... and while it waits: it stops, and registers nothing.
+  const later = world({ later: [movedOf({ account_id: other })], keyStates: ["missing"] });
+  await expect(connectAgent(later.opts)).rejects.toThrow(/the API's answer does not add up/);
+  expect(later.calls).not.toContain("register writer");
+  // An answer whose key changed is not acted on either.
+  const swapped = world({
+    later: [lookupOf({ state: "attached", fingerprint: "0000-0000-0000-0000" })],
+    keyStates: ["missing"],
+  });
+  await expect(connectAgent(swapped.opts)).rejects.toThrow(/does not add up/);
+});
+
+test("a_code_contested_while_the_agent_waits_stops_it", async () => {
+  const w = world({ later: [movedOf({ state: "contested" })], keyStates: ["missing"] });
+  await expect(connectAgent(w.opts)).rejects.toThrow(/two different keys tried this connect code/);
+  expect(w.calls).not.toContain("register writer");
+});
+
+test("an_api_that_cant_be_reached_while_the_agent_waits_does_not_stop_it", async () => {
+  const w = world({
+    later: [new TypeError("fetch failed"), new ApiError(429, { error: "rate_limited" })],
+    keyStates: [...Array<ConnectKeyState>(20).fill("missing"), "has-key"],
+  });
+  expect(await connectAgent(w.opts)).toMatchObject({
+    status: "registered",
+    accountId: ACCOUNT,
+    accountKind: "sub_account",
+  });
+  expect(w.calls.filter((call) => call.startsWith("lookup")).length).toBeGreaterThan(2);
+});
+
+test("an_account_whose_setup_key_is_on_its_way_is_waited_for", async () => {
+  // The setup code adds the key in a receipt of its own: for a block the account has no key.
+  const w = world({
+    keyStates: ["other-keys", "has-key"],
+    keyLists: [[], [PUBLIC]],
+  });
+  expect((await connectAgent(w.opts)).status).toBe("registered");
+  expect(w.calls).toContain("register writer");
+});
+
+test("the_key_file_moves_only_once_the_record_says_the_owner_chose_the_implicit_account", async () => {
+  // A code on the sub-account all along: no move, no look at the chain for it.
+  const sub = world({ keyStates: ["missing", "has-key"] });
+  expect((await connectAgent(sub.opts)).accountKind).toBe("sub_account");
+  expect(sub.calls.filter((call) => /^(move|exists) /.test(call))).toEqual([]);
+
+  // A sub-account that is on the chain already keeps the agent: the move is refused, and the agent
+  // stops before it waits for or registers anything.
+  const kept = world({ later: [movedOf()], keyStates: ["missing"], existing: [ACCOUNT] });
+  await expect(connectAgent(kept.opts)).rejects.toThrow(/sub-account exists/);
+  expect(kept.calls).not.toContain("register writer");
+  expect(kept.asked.every((account) => account === ACCOUNT)).toBe(true);
+
+  // A move the key store refuses (a file for another account) stops the agent the same way.
+  const refused = world({
+    lookup: movedOf(),
+    existingKey: true,
+    moveFails: new Error("the key file of agent writer is for writer.bob.testnet"),
+  });
+  await expect(connectAgent(refused.opts)).rejects.toThrow(/is for writer\.bob\.testnet/);
+  expect(refused.asked).toEqual([]);
+  expect(refused.calls).not.toContain("register writer");
+});
+
+test("an_implicit_account_of_another_key_is_refused_before_the_key_file_is_touched", async () => {
+  const other = implicitAccountOf(KeyPair.fromRandom("ed25519").getPublicKey().toString()) ?? "";
+  for (const w of [
+    world({ lookup: movedOf({ account_id: other }), existingKey: true }),
+    world({ later: [movedOf({ account_id: other })], keyStates: ["missing"] }),
+  ]) {
+    await expect(connectAgent(w.opts)).rejects.toThrow(/does not add up/);
+    expect(w.calls.some((call) => call.startsWith("move "))).toBe(false);
+  }
+});
+
+test("a_key_file_is_chosen_only_by_the_name_given_or_the_codes_own_name", async () => {
+  // A code made for "reader" never reaches writer's file, even with writer's fingerprint on it.
+  const w = world({
+    lookup: lookupOf({
+      name: "reader",
+      account_id: `reader.${OWNER}`,
+      state: "attached",
+      fingerprint: connectFingerprint(PUBLIC),
+    }),
+  });
+  await expect(connectAgent(w.opts)).rejects.toThrow(/NOT to press Create agent|another key/);
+  expect(w.calls.filter((call) => call.startsWith("key "))).toEqual(["key reader false"]);
+  // With --name, that name, and only it.
+  const named = world({ lookup: lookupOf({ name: "reader", account_id: `reader.${OWNER}` }) });
+  named.opts.name = "writer";
+  expect((await connectAgent(named.opts)).name).toBe("writer");
+  expect(named.calls.filter((call) => call.startsWith("key "))).toEqual(["key writer true"]);
 });

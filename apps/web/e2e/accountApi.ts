@@ -6,6 +6,7 @@ import {
   type ConnectCodeState,
   canonicalBase,
   connectFingerprint,
+  implicitAccountOf,
   type ListTasksResponse,
   SIGN_IN_MESSAGE,
   type TaskDetailResponse,
@@ -455,12 +456,15 @@ export interface SentTransaction {
 
 /**
  * A wallet for `account`, announced the way an extension is, that sends what it is given on
- * `chain`: a transaction that creates an account makes it, with the key it adds. `refuse`: a
- * wallet that throws, as one does when the person rejects it.
+ * `chain`: a transaction that creates an account makes it, with the key its setup call adds, and a
+ * transfer to the implicit account of `AGENT_PUBLIC_KEY` makes that account with that key.
+ * `refuse`: a wallet that throws, as one does when the person rejects it. `refuseNewAccounts`: a
+ * wallet that blocks a transaction that sets up an account under the person's (as a wallet that
+ * refuses to add full-access keys may), and sends everything else.
  */
 export async function installAccountWallet(
   page: Page,
-  options: { account: string; chain: AccountChain; refuse?: boolean },
+  options: { account: string; chain: AccountChain; refuse?: boolean; refuseNewAccounts?: boolean },
 ): Promise<{ sent: SentTransaction[] }> {
   const wallet = { sent: [] as SentTransaction[] };
   await routeWalletManifest(page);
@@ -468,16 +472,32 @@ export async function installAccountWallet(
     "__tenderE2eAccountSend",
     (batch: { transactions: SentTransaction[] }) => {
       if (options.refuse) throw new Error("User rejected");
+      const creates = (transaction: SentTransaction) =>
+        transaction.actions.some((action) => action.type === "CreateAccount");
+      if (options.refuseNewAccounts && batch.transactions.some(creates)) {
+        throw new Error("Full access key request blocked");
+      }
       const outcomes: unknown[] = [];
       for (const [index, transaction] of batch.transactions.entries()) {
         wallet.sent.push(transaction);
-        const created = transaction.actions.some((action) => action.type === "CreateAccount");
-        const key = transaction.actions.find((action) => action.type === "AddKey")?.params
-          ?.publicKey;
+        const created = creates(transaction);
+        const setup = transaction.actions.find(
+          (action) => action.type === "FunctionCall" && action.params?.methodName === "setup",
+        );
+        const key = (setup?.params?.args as { public_key?: unknown } | undefined)?.public_key;
         const createFails = created && (options.chain.failCreates ?? 0) > 0;
         if (createFails) options.chain.failCreates = (options.chain.failCreates ?? 1) - 1;
         if (created && !createFails)
           options.chain.accounts.set(transaction.receiverId, typeof key === "string" ? [key] : []);
+        // A transfer to an implicit account that does not exist yet creates it with its key.
+        const implicit = implicitAccountOf(AGENT_PUBLIC_KEY);
+        if (
+          transaction.receiverId === implicit &&
+          !options.chain.accounts.has(implicit) &&
+          transaction.actions.some((action) => action.type === "Transfer")
+        ) {
+          options.chain.accounts.set(implicit, [AGENT_PUBLIC_KEY]);
+        }
         const failed =
           createFails || !transaction.actions.every((action) => runCall(options, action));
         const status = failed
@@ -596,6 +616,8 @@ export interface ConnectApi {
     agent: null | { status: "active" | "unregistering" | "retired" };
     registeredAt: string | null;
     contestedAt: string | null;
+    /** Which account the agent gets: `<name>.<owner>`, or the implicit account of its key. */
+    kind: "sub_account" | "implicit";
   } | null;
   /** How many codes were made. */
   made: number;
@@ -651,6 +673,7 @@ export async function routeConnect(page: Page, account: string): Promise<Connect
         agent: null,
         registeredAt: null,
         contestedAt: null,
+        kind: "sub_account",
       };
       return json(200, {
         id: CONNECT_ID,
@@ -661,7 +684,36 @@ export async function routeConnect(page: Page, account: string): Promise<Connect
         expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
       });
     }
-    if (pathname === `/v1/connect/codes/${CONNECT_ID}` && api.code !== null) {
+    if (pathname === "/v1/connect/implicit" && request.method() === "GET") {
+      const { code } = api;
+      const implicit = code?.attached == null ? null : implicitAccountOf(code.attached);
+      return json(200, {
+        agents:
+          code === null || code.kind !== "implicit" || implicit === null
+            ? []
+            : [
+                {
+                  id: CONNECT_ID,
+                  account_id: implicit,
+                  name: code.name,
+                  created_at: new Date(Date.now() - 60_000).toISOString(),
+                  agent:
+                    code.agent === null
+                      ? null
+                      : { status: code.agent.status, bond_token: TOKEN, bond_amount: "5000000" },
+                },
+              ],
+      });
+    }
+    const implicitPath = `/v1/connect/codes/${CONNECT_ID}/implicit`;
+    if (pathname === implicitPath && request.method() === "POST" && api.code !== null) {
+      if (api.code.attached === null) return json(409, { error: "not_attached", message: "x" });
+      api.code.kind = "implicit";
+    }
+    if (
+      (pathname === `/v1/connect/codes/${CONNECT_ID}` || pathname === implicitPath) &&
+      api.code !== null
+    ) {
       if (api.readStatus !== null)
         return json(api.readStatus, { error: "unauthorized", message: "x" });
       const { code } = api;
@@ -669,7 +721,11 @@ export async function routeConnect(page: Page, account: string): Promise<Connect
         id: CONNECT_ID,
         owner: account,
         name: code.name,
-        account_id: `${code.name}.${account}`,
+        account_id:
+          code.kind === "implicit" && code.attached !== null
+            ? (implicitAccountOf(code.attached) ?? "")
+            : `${code.name}.${account}`,
+        account_kind: code.kind,
         state: code.contestedAt
           ? "contested"
           : code.registeredAt

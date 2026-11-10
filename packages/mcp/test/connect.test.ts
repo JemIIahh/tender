@@ -1,12 +1,17 @@
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { ConnectApi } from "@tender/client";
-import { ApiError, type ConnectLookup } from "@tender/shared";
+import { type ConnectApi, makeAgentKeyFile, prepareKeyDir } from "@tender/client";
+import {
+  ApiError,
+  type ConnectLookup,
+  connectFingerprint,
+  implicitAccountOf,
+} from "@tender/shared";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { ConfigError, readConnectConfig } from "../src/config";
 import { createConnectServer } from "../src/server";
@@ -34,6 +39,7 @@ const lookupOf = (over: Partial<ConnectLookup> = {}): ConnectLookup => ({
   owner: "alice.testnet",
   name: "writer",
   account_id: "writer.alice.testnet",
+  account_kind: "sub_account",
   network: "testnet",
   contract: "tender.testnet",
   state: "waiting",
@@ -182,6 +188,39 @@ test("a_key_directory_inside_the_repository_that_git_does_not_ignore_is_refused"
   await expect(stat(join(ROOT, "packages/mcp/not-ignored-keys"))).rejects.toMatchObject({
     code: "ENOENT",
   });
+  await mcp.close();
+});
+
+test("another_owners_agent_key_file_is_never_taken_or_moved_whatever_the_record_says", async () => {
+  // writer's key file is for an account of another owner. A code for "writer" under alice whose
+  // record says the owner chose the implicit account of that very key is refused before anything is
+  // attached, and the file is left as it was.
+  const keys = join(work, "keys");
+  await prepareKeyDir(keys);
+  const made = await makeAgentKeyFile({
+    dir: keys,
+    name: "writer",
+    network: "testnet",
+    account: "writer.bob.testnet",
+  });
+  const path = join(keys, "writer.json");
+  const before = await readFile(path, "utf8");
+  const { api, asked } = fakeApi(async () =>
+    lookupOf({
+      state: "attached",
+      fingerprint: connectFingerprint(made.publicKey),
+      account_kind: "implicit",
+      account_id: implicitAccountOf(made.publicKey) ?? "",
+    }),
+  );
+  const { call, mcp } = await serverWith({ api, keysDir: keys });
+  const answer = await call({ code: CODE });
+  expect(answer.isError).toBe(true);
+  expect(answer.text).toMatch(
+    /^KEY_IN_USE: the key file of agent writer is for writer\.bob\.testnet, not writer\.alice\.testnet/,
+  );
+  expect(asked).toEqual(["lookup"]);
+  expect(await readFile(path, "utf8")).toBe(before);
   await mcp.close();
 });
 

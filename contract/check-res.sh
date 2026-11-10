@@ -2,12 +2,12 @@
 # Checks that contract/res/ was built from the contract sources as they are now.
 #
 # The sources' hash is one SHA-256 over every tracked file that goes into the wasm:
-# contract/tender, contract/test-token, contract/Cargo.toml, contract/Cargo.lock,
+# contract/tender, contract/test-token, contract/agent-setup, contract/Cargo.toml, contract/Cargo.lock,
 # contract/build.sh (its flags shape the bytes) and rust-toolchain.toml. build.sh takes it before
 # it builds, and records in res/SOURCES.sha256 that hash bound to res/SHA256SUMS, the checksums of
 # the wasm it built: the SHA-256 of the sources' hash, a newline, and SHA256SUMS. This script
 # recomputes the record from the files in the working tree and fails if it differs, and then
-# checks res/tender.wasm and res/test_token.wasm against res/SHA256SUMS. So a commit fails CI if
+# checks res/tender.wasm, res/test_token.wasm and res/agent_setup.wasm against res/SHA256SUMS. So a commit fails CI if
 # it changes a source without a rebuild of res/, and also if it carries the new sources and their
 # record but not the wasm and the checksums built from them, or the wasm without the sources.
 #
@@ -39,8 +39,8 @@ sha256() {
 sources_sha256() {
   (
     cd "$repo_root"
-    git ls-files -z -- contract/tender contract/test-token contract/Cargo.toml contract/Cargo.lock \
-      contract/build.sh rust-toolchain.toml |
+    git ls-files -z -- contract/tender contract/test-token contract/agent-setup contract/Cargo.toml \
+      contract/Cargo.lock contract/build.sh rust-toolchain.toml |
       LC_ALL=C sort -z |
       while IFS= read -r -d '' path; do
         # Deleted from the working tree but not yet from the index: no longer an input.
@@ -85,15 +85,15 @@ if [ "$expected" != "$recorded" ]; then
 fi
 
 # The wasm in res/ is the build that SHA256SUMS describes, in the format build.sh writes.
-for wasm in tender.wasm test_token.wasm; do
+for wasm in tender.wasm test_token.wasm agent_setup.wasm; do
   [ -f "$contract_dir/res/$wasm" ] || stale "res/ is incomplete" "res/$wasm is missing"
 done
-sums=$(cd "$contract_dir/res" && for wasm in tender.wasm test_token.wasm; do
+sums=$(cd "$contract_dir/res" && for wasm in tender.wasm test_token.wasm agent_setup.wasm; do
   printf '%s  %s\n' "$(sha256 <"$wasm")" "$wasm"
 done)
 if [ "$sums" != "$(cat "$contract_dir/res/SHA256SUMS" 2>/dev/null || true)" ]; then
   stale "res/ is not the build that res/SHA256SUMS describes" \
-    "res/tender.wasm or res/test_token.wasm does not match res/SHA256SUMS"
+    "res/tender.wasm, res/test_token.wasm or res/agent_setup.wasm does not match res/SHA256SUMS"
 fi
 
 echo "check-res.sh: res/ was built from these sources ($current)"

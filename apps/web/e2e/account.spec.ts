@@ -97,19 +97,21 @@ test("add_agent_makes_the_account_in_one_transaction_and_watches_the_agent_regis
   await page.getByRole("button", { name: `Create scout2.${OWNER}` }).click();
 
   await expect(page.getByTestId("step-2")).toHaveAttribute("data-done", "true");
-  expect(wallet.sent).toEqual([
-    {
-      receiverId: `scout2.${OWNER}`,
-      actions: [
-        { type: "CreateAccount" },
-        { type: "Transfer", params: { deposit: "500000000000000000000000" } },
-        {
-          type: "AddKey",
-          params: { publicKey: AGENT_PUBLIC_KEY, accessKey: { permission: "FullAccess" } },
-        },
-      ],
-    },
+  // One transaction: the account, its NEAR, its setup code and the call that adds the key.
+  expect(wallet.sent.map((tx) => tx.receiverId)).toEqual([`scout2.${OWNER}`]);
+  expect(wallet.sent[0]?.actions.map((action) => action.type)).toEqual([
+    "CreateAccount",
+    "Transfer",
+    "DeployContract",
+    "FunctionCall",
   ]);
+  expect(wallet.sent[0]?.actions[1]?.params).toEqual({ deposit: "500000000000000000000000" });
+  expect(wallet.sent[0]?.actions[3]?.params).toEqual({
+    methodName: "setup",
+    args: { public_key: AGENT_PUBLIC_KEY },
+    gas: "30000000000000",
+    deposit: "0",
+  });
   await expect(page.getByTestId("bond-terms")).toContainText("Registering locks 5.00 tUSDC");
   await expect(page.getByTestId("watching")).toBeVisible();
 

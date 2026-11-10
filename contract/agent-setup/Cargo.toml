@@ -1,0 +1,20 @@
+[package]
+name = "agent-setup"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The code the owner's wallet deploys on a new agent account so that the account gets the agent's
+# key without an AddKey action in the wallet's transaction (see src/lib.rs). Every agent account
+# made this way pays for these bytes in storage, so the code is raw no_std wasm: no near-sdk, no
+# allocator, no serde.
+[lib]
+crate-type = ["cdylib"]
+
+# Named and never used: no line of the code refers to it, so it is not linked into the wasm.
+# cargo-near 0.22 reads the nearcore protocol a contract targets from its near-sdk dependency's
+# `package.metadata.near.min_protocol_version` (84 for 5.29.1, the version tender uses), and refuses
+# to build with rustc 1.96 for an older one. Only the wasm build names it, so the host's unit tests
+# never compile it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+near-sdk = { version = "=5.29.1", default-features = false }

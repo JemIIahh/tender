@@ -2,25 +2,32 @@ import {
   AGENT_ACCOUNT_DEPOSIT,
   type AgentBondTerms,
   fundAgentCalls,
+  implicitAccountActions,
   StorageViewSchema,
+  subAccountActions,
   U128StringSchema,
 } from "@tender/shared";
 import type { BondTerms } from "./account";
 import { config } from "./config";
-import { accountKeyState, RpcError, view } from "./rpc";
+import { accountKeyState, type Finality, RpcError, view } from "./rpc";
 import { describeNear } from "./vault";
 import { type AccountAction, groupCalls, type MixedTransaction } from "./wallet";
 
 // What "Add an agent" reads and sends for "Connect your agent" (`@tender/shared`'s `connect.ts` has
 // the flow). The page never makes, sees or keeps the agent's private key: the agent attaches its
-// PUBLIC key to the code, the page reads it back from the API, and the wallet adds it to the
-// account it creates. What the page shows as done it reads from the chain and from the index, and
-// never takes from the wallet's word.
+// PUBLIC key to the code, the page reads it back from the API, and the wallet makes the account
+// with it: `<name>.<you>`, whose setup code adds the key (no AddKey action, which some wallets
+// refuse), or, when the person chooses it, the implicit account of the key, which a plain transfer
+// creates. What the page shows as done it reads from the chain and from the index, and never takes
+// from the wallet's word.
 
 /** How often the page asks how the code stands, and what the chain holds, while it waits. */
 export const CONNECT_POLL_MS = 2000;
 
-/** The same transaction as the wallet's, for near-cli (near-cli-rs), signed with the person's key. */
+/**
+ * The account with the agent's key, for near-cli (near-cli-rs), signed with the person's key from
+ * their own keychain: near-cli adds the key itself (an AddKey action), which no wallet sees.
+ */
 export function createAccountCommand(plan: {
   accountId: string;
   parent: string;
@@ -41,13 +48,12 @@ export function createAccountCommand(plan: {
   ].join(" ");
 }
 
-/** The actions of the one transaction that makes the agent's account. */
+/**
+ * The actions of the one transaction that makes the agent's sub-account: CreateAccount, its NEAR,
+ * the setup code and the call that adds `publicKey` from inside it (`subAccountActions`).
+ */
 export function createAccountActions(publicKey: string): AccountAction[] {
-  return [
-    { type: "CreateAccount" },
-    { type: "Transfer", params: { deposit: AGENT_ACCOUNT_DEPOSIT.toString() } },
-    { type: "AddKey", params: { publicKey, accessKey: { permission: "FullAccess" } } },
-  ];
+  return subAccountActions(publicKey);
 }
 
 /** The bond in the contract's terms, or null when registering takes none. */
@@ -61,6 +67,7 @@ export function bondOfTerms(terms: BondTerms): AgentBondTerms | null {
  * its storage with Tender, its bond into its vault), grouped into transactions as every send of the
  * app is. What is in place already is not paid again: Tender takes a storage deposit and a bond for
  * an account that does not exist yet, so an earlier try whose account failed may have paid both.
+ * For an account that exists already (`has-key`), only the calls.
  */
 export function createAgentBatch(plan: {
   accountId: string;
@@ -69,7 +76,28 @@ export function createAgentBatch(plan: {
   bond: AgentBondTerms | null;
 }): MixedTransaction[] {
   return [
-    { receiverId: plan.accountId, actions: createAccountActions(plan.publicKey) },
+    ...(plan.chain.key === "has-key"
+      ? []
+      : [{ receiverId: plan.accountId, actions: createAccountActions(plan.publicKey) }]),
+    ...groupCalls(fundCallsFor(plan.accountId, plan.chain, plan.bond)),
+  ];
+}
+
+/**
+ * The one approval of "Use a separate account instead": NEAR to the agent's implicit account
+ * (`accountId`, which the page worked out from the key), which the chain creates with the agent's
+ * key, then the same calls as `createAgentBatch`. A transfer is what every wallet sends. For an
+ * account that exists already, only the calls.
+ */
+export function implicitAgentBatch(plan: {
+  accountId: string;
+  chain: AgentOnChain;
+  bond: AgentBondTerms | null;
+}): MixedTransaction[] {
+  return [
+    ...(plan.chain.key === "has-key"
+      ? []
+      : [{ receiverId: plan.accountId, actions: implicitAccountActions() }]),
     ...groupCalls(fundCallsFor(plan.accountId, plan.chain, plan.bond)),
   ];
 }
@@ -88,11 +116,13 @@ export interface AgentOnChain {
 }
 
 /** `account`'s vault balance of `token`, from `balance_of` (0 when it has no slot). */
-async function vaultOf(account: string, token: string): Promise<bigint> {
-  const value = await view<unknown>(config.contractId, "balance_of", {
-    account_id: account,
-    token,
-  });
+async function vaultOf(account: string, token: string, finality: Finality): Promise<bigint> {
+  const value = await view<unknown>(
+    config.contractId,
+    "balance_of",
+    { account_id: account, token },
+    finality,
+  );
   const parsed = U128StringSchema.safeParse(value);
   if (!parsed.success) throw new RpcError("balance_of returned something other than an amount");
   return BigInt(parsed.data);
@@ -105,10 +135,11 @@ async function vaultOf(account: string, token: string): Promise<bigint> {
 export async function readAgentFunding(
   accountId: string,
   bond: AgentBondTerms | null,
+  finality: Finality = "final",
 ): Promise<{ storage: boolean; vault: bigint }> {
   const [storage, vault] = await Promise.all([
-    view<unknown>(config.contractId, "storage_balance_of", { account_id: accountId }),
-    bond === null ? Promise.resolve(0n) : vaultOf(accountId, bond.token),
+    view<unknown>(config.contractId, "storage_balance_of", { account_id: accountId }, finality),
+    bond === null ? Promise.resolve(0n) : vaultOf(accountId, bond.token, finality),
   ]);
   // Whether there is a balance is all the page needs: its two NEP-145 fields are enough.
   const parsed = StorageViewSchema.pick({ total: true, available: true })
@@ -121,16 +152,18 @@ export async function readAgentFunding(
 /**
  * Reads `accountId` with `publicKey` on the chain: the account and the key, and what Tender holds
  * for it (its storage and its vault), always: an earlier try may have paid them for an account
- * that does not exist yet.
+ * that does not exist yet. At the last final block unless `finality` says the newest: a read of the
+ * other way's account, whose "nothing there" lets this way pay, is made at the newest.
  */
 export async function readAgentOnChain(
   accountId: string,
   publicKey: string,
   bond: AgentBondTerms | null,
+  finality: Finality = "final",
 ): Promise<AgentOnChain> {
   const [key, funding] = await Promise.all([
-    accountKeyState(accountId, publicKey),
-    readAgentFunding(accountId, bond),
+    accountKeyState(accountId, publicKey, finality),
+    readAgentFunding(accountId, bond, finality),
   ]);
   return { key, ...funding };
 }
@@ -180,6 +213,73 @@ export function whatLanded(
           ? " Its bond did reach Tender; pressing Create agent again sends the account and the storage only."
           : " Nothing was paid.";
   return `${head}${landed} Press Create agent to try again.`;
+}
+
+/**
+ * What Tender holds for an account that stops the other way being paid for, as words: a bond, with
+ * its storage or alone. Storage alone never stops it: Tender takes a storage deposit for any account
+ * id from anyone, so a stranger's 0.01 NEAR could otherwise block the person (`storageNote` says
+ * it is there instead).
+ */
+function heldWhat(chain: AgentOnChain, bond: AgentBondTerms | null): string | null {
+  if (bond === null || chain.vault === 0n) return null;
+  return chain.storage ? "Your bond and storage are" : "A bond is";
+}
+
+/**
+ * A short note for storage alone with Tender for `account` (no bond), which stops nothing: it stays
+ * with that account. Null otherwise.
+ */
+export function storageNote(
+  account: string,
+  chain: AgentOnChain,
+  bond: AgentBondTerms | null,
+): string | null {
+  const bondIn = bond !== null && chain.vault > 0n;
+  return chain.storage && !bondIn
+    ? `Some storage is already paid for ${account}; it stays with that account.`
+    : null;
+}
+
+/**
+ * What of the first way is on the chain for `<name>.<you>` (`accountId`) that stops the separate
+ * account being paid for, in words for the person, or null when nothing does: the account itself,
+ * or a bond in its vault. A bond that an earlier try paid stays with `<name>.<you>`, which only the
+ * person's wallet can create, so the separate account would pay it twice. Storage alone does not
+ * stop it (`storageNote`).
+ */
+export function heldOnSubAccount(
+  accountId: string,
+  chain: AgentOnChain,
+  bond: AgentBondTerms | null,
+): string | null {
+  if (chain.key === "has-key") {
+    return `${accountId} exists now, with your agent's key, so your agent keeps it. Nothing more was sent.`;
+  }
+  if (chain.key === "other-keys") {
+    return `${accountId} exists, and not with your agent's key, so nothing was sent for it or for a separate account. Start over with another name.`;
+  }
+  const what = heldWhat(chain, bond);
+  if (what === null) return null;
+  const stay = what.endsWith(" are") ? "they stay" : "it stays";
+  return `${what} waiting for ${accountId}; ${stay} there until that account is created. Finish with a wallet that allows the setup step.`;
+}
+
+/**
+ * The mirror of `heldOnSubAccount`, for a press that pays for `<name>.<you>` (`accountId`): a bond
+ * Tender already holds for the agent's separate account (`implicit`), in words, or null when it
+ * holds none. Paying for `<name>.<you>` then would pay the bond twice. Storage alone does not stop
+ * it (`storageNote`).
+ */
+export function heldOnImplicit(
+  implicit: string,
+  accountId: string,
+  chain: AgentOnChain,
+  bond: AgentBondTerms | null,
+): string | null {
+  const what = heldWhat(chain, bond);
+  if (what === null) return null;
+  return `${what} already waiting for ${implicit}, your agent's separate account, so nothing more is paid for ${accountId}. Read the page again before you press anything.`;
 }
 
 /** Whether the account is made and paid for: storage with Tender, and the bond in its vault (or held). */
@@ -275,5 +375,31 @@ export function keepCode(owner: string, code: KeptCode | null): void {
       );
   } catch {
     // As above: nothing is kept, and nothing fails.
+  }
+}
+
+// ---- Agents on separate accounts, by this tab -------------------------------------------------------
+
+const implicitKey = (owner: string) => `tender.connect.implicit.${owner}`;
+
+/**
+ * Notes, in this tab, that `owner` set up an agent on a separate account, so that My agents offers
+ * the sign-in that lists it while the tab is open. Session storage, as the kept code is: the app
+ * keeps nothing of a person's in local storage. Storage that can't be written notes nothing.
+ */
+export function rememberImplicit(owner: string): void {
+  try {
+    sessionStorage.setItem(implicitKey(owner), "1");
+  } catch {
+    // Off or full: My agents then lists them once the person is signed in, and offers no sign-in.
+  }
+}
+
+/** Whether this tab saw `owner` set up an agent on a separate account. */
+export function madeImplicit(owner: string): boolean {
+  try {
+    return sessionStorage.getItem(implicitKey(owner)) === "1";
+  } catch {
+    return false;
   }
 }

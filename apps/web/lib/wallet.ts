@@ -2,6 +2,7 @@ import type { TxReceiptsOutcome } from "@tender/client/outcome";
 import { receiptsFromTx } from "@tender/client/outcome";
 import {
   AccountIdSchema,
+  type AgentAccountAction,
   type ConnectorFunctionCallAction,
   extractEvents,
   type TenderCall,
@@ -55,16 +56,12 @@ export interface TransactionRequest {
 
 /**
  * The actions that make an account, in near-connect's shape (0.12.0): "Add an agent" creates the
- * agent's account under the person's, funds it, and gives it the key the agent made, in one
- * transaction to the new account. Nothing else in the app sends them.
+ * agent's account under the person's, funds it, deploys its setup code and calls it to add the key
+ * the agent made, in one transaction to the new account; or sends NEAR to the implicit account of
+ * that key (`@tender/shared`'s `subAccountActions` and `implicitAccountActions`). No AddKey is sent,
+ * which some wallets refuse. Nothing else in the app sends them.
  */
-export type AccountAction =
-  | { type: "CreateAccount" }
-  | { type: "Transfer"; params: { deposit: string } }
-  | {
-      type: "AddKey";
-      params: { publicKey: string; accessKey: { permission: "FullAccess" } };
-    };
+export type AccountAction = AgentAccountAction;
 
 /**
  * One transaction of a batch that mixes the two: the actions that make an account, or function
