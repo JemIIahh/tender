@@ -474,6 +474,26 @@ test("board_summary_says_it_counts_only_what_it_loaded_when_there_is_more", asyn
   );
 });
 
+test("board_offers_only_the_retry_when_the_next_page_fails_under_an_empty_segment", async () => {
+  quietLog();
+  fakeApi(
+    json({ tasks: [TASK], next_cursor: "6" }),
+    json({ error: "internal", message: "internal error" }, 500),
+  );
+  render(<Board />);
+  await screen.findByTestId("task-card");
+  await userEvent.click(screen.getByRole("button", { name: /^Settled/ }));
+  await userEvent.click(
+    within(screen.getByTestId("none-loaded")).getByRole("button", { name: "Load more" }),
+  );
+
+  const alert = await screen.findByRole("alert");
+  expect(within(alert).getByRole("button", { name: "Retry" })).toBeTruthy();
+  // The panel still says what is true, and leaves the way on to the retry.
+  expect(screen.getByTestId("none-loaded").textContent).toContain("The one task loaded");
+  expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+});
+
 test("board_with_more_to_read_counts_at_least_and_says_a_segment_is_empty_only_among_those_loaded", async () => {
   const api = fakeApi(
     json({ tasks: [TASK], next_cursor: "6" }),

@@ -220,7 +220,12 @@ function NoneLoaded({
           ? `The one task loaded is not ${SEGMENT_WORDS[segment]}.`
           : `None of the ${tasksText(count)} loaded is ${SEGMENT_WORDS[segment]}.`
       }
-      action={<LoadMore ready={ready} onMore={onMore} primary />}
+      // A next page that failed has its own retry under the panel: one way on, not two.
+      action={
+        ready.more.state === "error" ? undefined : (
+          <LoadMore ready={ready} onMore={onMore} primary />
+        )
+      }
     >
       Older tasks may be. Load more to look further back.
     </EmptyState>

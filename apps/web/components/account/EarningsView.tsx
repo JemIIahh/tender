@@ -68,8 +68,8 @@ function AgentCell({ agent }: { agent: AgentRecord }) {
     <span className="flex min-w-0 items-center gap-2.5">
       <Avatar account={agent.account} size={28} />
       <span className="grid min-w-0">
-        <span className="text-sm text-bone wrap-anywhere">{agent.name ?? agent.account}</span>
-        {agent.name === null ? null : (
+        <span className="text-sm text-bone wrap-anywhere">{agentName(agent)}</span>
+        {agentName(agent) === agent.account ? null : (
           <span className="font-mono text-xs text-muted wrap-anywhere">{agent.account}</span>
         )}
       </span>
