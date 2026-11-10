@@ -478,8 +478,11 @@ export async function connectAgent(opts: ConnectAgentOptions): Promise<ConnectOu
       if (state === "other-keys") {
         // The account exists and this key is not on it yet. The setup code adds it in a receipt of
         // its own, a block after the account is made: an account with no full-access key yet is
-        // still being set up.
-        if ((await chain.fullAccessKeys(account)).length === 0) return false;
+        // still being set up. The list is read after the key was, so the key may have landed in
+        // between: the newer read decides.
+        const keys = await chain.fullAccessKeys(account);
+        if (keys.includes(key.publicKey)) return true;
+        if (keys.length === 0) return false;
         throw new ConnectError(
           `${account} exists, and not with this agent's key as a full-access key: it was made ` +
             "another way. Ask the owner for a new code with another name",

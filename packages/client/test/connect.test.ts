@@ -424,9 +424,18 @@ test("a_name_that_cannot_name_a_key_file_asks_for_one", async () => {
 });
 
 test("an_account_made_another_way_is_refused", async () => {
-  const w = world({ keyStates: ["other-keys"] });
+  const other = KeyPair.fromRandom("ed25519").getPublicKey().toString();
+  const w = world({ keyStates: ["other-keys"], keys: [other] });
   await expect(connectAgent(w.opts)).rejects.toThrow(/exists, and not with this agent's key/);
   expect(w.calls).not.toContain("register writer");
+});
+
+test("a_setup_key_that_lands_between_the_two_reads_is_the_agents_and_not_a_refusal", async () => {
+  // The key's own read saw no key; the setup receipt landed before the list was read.
+  const w = world({ keyStates: ["other-keys"], keyLists: [[PUBLIC]] });
+  expect((await connectAgent(w.opts)).status).toBe("registered");
+  expect(w.calls).toContain("register writer");
+  expect(w.lines.join("\n")).toContain(`created: ${ACCOUNT} exists, with this key`);
 });
 
 test("the_api_is_asked_again_until_its_index_shows_the_agent_and_a_late_index_fails_nothing", async () => {
