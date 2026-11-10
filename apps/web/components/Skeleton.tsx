@@ -132,22 +132,6 @@ export function CardsSkeleton({ count = 3 }: { count?: number }) {
   );
 }
 
-/** A row of filter chips (the directories' tags), which wraps as the chips do. */
-export function ChipsSkeleton({ count = 5 }: { count?: number }) {
-  const widths = ["w-12", "w-20", "w-16", "w-24", "w-14", "w-[4.5rem]"];
-  return (
-    <div aria-hidden="true" className="flex flex-wrap gap-2">
-      {Array.from({ length: count }, (_, index) => (
-        <Shape
-          // biome-ignore lint/suspicious/noArrayIndexKey: the chips are only shapes, in a fixed order
-          key={index}
-          className={`h-10 rounded-full ${widths[index % widths.length]}`}
-        />
-      ))}
-    </div>
-  );
-}
-
 /** A panel (`PANEL`) with a title and `lines` of text, or `children` under the title. */
 export function PanelSkeleton({
   title = "w-32",

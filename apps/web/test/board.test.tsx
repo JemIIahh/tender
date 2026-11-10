@@ -322,7 +322,7 @@ test("board_links_each_card_to_its_task_page", async () => {
   expect(untitled.getAttribute("href")).toBe("/tasks/8");
 });
 
-test("board_shows_the_judges_reason_whenever_there_is_one", async () => {
+test("board_flags_what_a_reader_must_know_of_the_judge_and_nothing_when_it_accepted", async () => {
   fakeApi(
     json(
       page(
@@ -332,25 +332,40 @@ test("board_shows_the_judges_reason_whenever_there_is_one", async () => {
           judge_status: "accepted",
           judge_reason: "not judged: needs a held-out part",
         },
-        { ...TASK, id: "2", judge_status: null, judge_reason: "waiting for the Judge" },
+        { ...TASK, id: "2", judge_status: "pending", judge_reason: "waiting for held-out checks" },
         { ...TASK, id: "3", judge_status: "accepted", judge_reason: null },
         { ...TASK, id: "4", judge_status: null, judge_reason: null },
+        { ...TASK, id: "5", judge_status: "rejected", judge_reason: "the rule does not compile" },
+        { ...TASK, id: "6", judge_status: "failed_closed", judge_reason: null },
+        { ...TASK, id: "7", judge_status: null, judge_reason: "waiting for the Judge" },
       ),
     ),
   );
 
   render(<Board />);
 
-  const notes = (await screen.findAllByTestId("task-card")).map(
-    (card) => within(card).queryByTestId("judge-note")?.textContent ?? null,
-  );
-  // The reason is shown for an accepted task too: the Judge says why before agents spend effort.
-  expect(notes).toEqual([
-    "Judge: accepted · not judged: needs a held-out part",
-    "Judge: waiting for the Judge",
-    "Judge: accepted",
+  const chips = (await screen.findAllByTestId("task-card")).map((card) => {
+    const chip = within(card).queryByTestId("judge-chip");
+    return chip === null ? null : [chip.querySelector(".truncate")?.textContent, chip.title];
+  });
+  // Plain words on the card; the Judge's own, reason included, in the chip's tooltip. An accepted
+  // task with nothing more to say, and one the Judge has not looked at, have no chip.
+  expect(chips).toEqual([
+    ["Judge couldn't score this task", "Judge: accepted · not judged: needs a held-out part"],
+    ["Judge hasn't checked this yet", "Judge: not decided yet · waiting for held-out checks"],
     null,
+    null,
+    ["Judge refused this task", "Judge: turned this task down · the rule does not compile"],
+    ["Judge couldn't check this task", "Judge: could not check this task"],
+    ["Judge left a note", "Judge: waiting for the Judge"],
   ]);
+  // No "Judge: accepted" line on a card.
+  expect(screen.queryByTestId("judge-note")).toBeNull();
+  // A screen reader hears the Judge's words after the chip's.
+  const first = screen.getAllByTestId("judge-chip")[0] as HTMLElement;
+  expect(first.querySelector(".sr-only")?.textContent).toBe(
+    " (Judge: accepted · not judged: needs a held-out part)",
+  );
 });
 
 test("board_shows_the_judges_words_as_text_never_as_html", async () => {
@@ -360,7 +375,9 @@ test("board_shows_the_judges_words_as_text_never_as_html", async () => {
 
   await screen.findByTestId("task-card");
   expect(document.querySelector("img")).toBeNull();
-  expect(screen.getByTestId("judge-note").textContent).toContain('<img src=x onerror="alert(1)">');
+  const chip = screen.getByTestId("judge-chip");
+  expect(chip.title).toContain('<img src=x onerror="alert(1)">');
+  expect(chip.textContent).toContain('<img src=x onerror="alert(1)">');
 });
 
 // ---- Filters ----------------------------------------------------------------------------------

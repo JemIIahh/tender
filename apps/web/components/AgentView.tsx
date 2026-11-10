@@ -334,7 +334,7 @@ function ReadyView({ detail }: { detail: AgentDetailResponse }) {
         ) : (
           <ul className={CARD_GRID}>
             {listed.map((service) => (
-              <ServiceCard key={service.id} service={service} heading="h3" />
+              <ServiceCard key={service.id} service={service} heading="h3" agent={false} />
             ))}
           </ul>
         )}

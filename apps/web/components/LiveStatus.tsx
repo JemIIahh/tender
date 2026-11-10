@@ -203,8 +203,9 @@ export function LiveStatus() {
       <button
         ref={button}
         type="button"
-        // The name holds the word the pill shows (WCAG 2.5.3), and says what it is about.
-        aria-label={`Status: ${look.word}`}
+        // The name starts with the word the segment shows, the network's (WCAG 2.5.3), and then
+        // says the state, which the dot and the tooltip show.
+        aria-label={`${networkName()}, ${look.word}`}
         title={`${look.word}: ${look.line}`}
         aria-expanded={open}
         aria-controls={panelId}

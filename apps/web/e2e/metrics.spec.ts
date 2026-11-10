@@ -29,7 +29,7 @@ test("metrics_show_the_figures_and_are_reached_from_the_live_pill", async ({ pag
   await openParity(page, "/tasks");
   await page
     .getByRole("banner")
-    .getByRole("button", { name: /^Status: / })
+    .getByRole("button", { name: /^Testnet, / })
     .click();
   await page.getByTestId("live-panel").getByRole("link", { name: "See metrics" }).click();
   await expect(page).toHaveURL("/metrics", { timeout: 20_000 });

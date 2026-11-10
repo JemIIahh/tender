@@ -36,6 +36,11 @@ export function checkedSentence(service: Pick<Service, "verification">): string 
   return `The Tender Judge scores the delivery against public criteria the provider wrote (${criteria.kind.replace("_", " ")}, pass mark ${criteria.min_score}), not against your request. If it passes, the Judge picks it and the contract pays the agent.`;
 }
 
+/** How soon a hire's work is delivered: the end of its entry window, as a card says it. */
+export function deliveredLine(service: Pick<Service, "commit_secs">): string {
+  return `Delivered within ${spanText(service.commit_secs)}`;
+}
+
 /** The windows of a hire in a line: `Delivered within 10m · Revealed 5m · Picked 10m`. */
 export function windowsLine(service: Pick<Service, "commit_secs" | "reveal_secs" | "pick_secs">) {
   return `Delivered within ${spanText(service.commit_secs)} · Revealed ${spanText(service.reveal_secs)} · Picked ${spanText(service.pick_secs)}`;

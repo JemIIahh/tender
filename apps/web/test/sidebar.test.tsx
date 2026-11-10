@@ -438,7 +438,9 @@ test("sidebar_live_block_shows_the_top_bar_s_figures_from_the_same_reads", async
       .map((row) => row.textContent),
   ).toEqual(["Open tasks2", "Agents1", "Locked2.00 tUSDC"]);
   // The top bar's status is there too, and the two made the three reads once between them.
-  const pill = await within(screen.getByRole("banner")).findByRole("button", { name: /^Status: / });
+  const pill = await within(screen.getByRole("banner")).findByRole("button", {
+    name: /^Testnet, /,
+  });
   expect(sidebar?.contains(pill)).toBe(false);
   expect(urls.sort()).toEqual([
     "/v1/agents?limit=50",

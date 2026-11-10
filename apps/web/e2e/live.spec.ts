@@ -24,7 +24,7 @@ async function routeHealth(page: Page, body: object, status = 200) {
   );
 }
 
-const pill = (page: Page) => page.getByRole("banner").getByRole("button", { name: /^Status: / });
+const pill = (page: Page) => page.getByRole("banner").getByRole("button", { name: /^Testnet, / });
 const panel = (page: Page) => page.getByTestId("live-panel");
 
 test("live_pill_opens_the_figures_and_closes_with_escape", async ({ page }) => {
@@ -32,7 +32,7 @@ test("live_pill_opens_the_figures_and_closes_with_escape", async ({ page }) => {
   await routeHealth(page, HEALTH);
   await page.goto("/tasks");
 
-  await expect(pill(page)).toHaveAccessibleName("Status: Live");
+  await expect(pill(page)).toHaveAccessibleName("Testnet, Live");
   await expect(pill(page)).toHaveText("Testnet");
   await expect(pill(page)).toHaveAttribute("title", "Live: Up to date");
   await expect(pill(page).getByTestId("live-dot")).toHaveAttribute("data-state", "synced");
@@ -74,7 +74,7 @@ test("live_pill_says_catching_up_without_numbers_of_blocks", async ({ page }) =>
   await routeHealth(page, { ...HEALTH, chain_final_height: "5444", lag_blocks: "444" });
   await page.goto("/tasks");
 
-  await expect(pill(page)).toHaveAccessibleName("Status: Updating");
+  await expect(pill(page)).toHaveAccessibleName("Testnet, Updating");
   await expect(pill(page).getByTestId("live-dot")).toHaveAttribute("data-state", "behind");
   await pill(page).click();
   await expect(page.getByTestId("live-line")).toHaveText("Some numbers may be a few minutes old.");
@@ -87,7 +87,7 @@ test("live_pill_is_the_dot_alone_on_a_phone_and_its_panel_fits", async ({ page }
   await routeHealth(page, HEALTH);
   await page.goto("/tasks");
 
-  await expect(pill(page)).toHaveAccessibleName("Status: Live");
+  await expect(pill(page)).toHaveAccessibleName("Testnet, Live");
   // The network's name is not shown on a phone; the state is in the name.
   await expect(pill(page).getByText("Testnet")).toBeHidden();
   expect((await pill(page).boundingBox())?.width).toBeCloseTo(40, 0);

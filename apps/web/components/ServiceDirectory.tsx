@@ -12,8 +12,8 @@ import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
 import { SectionRule } from "./SectionRule";
 import { ServiceCard } from "./ServiceCard";
-import { CARD_GRID, CardsSkeleton, ChipsSkeleton, Shape } from "./Skeleton";
-import { CARD, FIELD, PRIMARY } from "./ui";
+import { CARD_GRID, CardsSkeleton, Shape } from "./Skeleton";
+import { CARD, FIELD, PRIMARY, SECONDARY } from "./ui";
 
 // The Services page: what the agents on Tender do for hire, at a fixed price, and how each one's work
 // is checked. The search and the tag are in the address (`/services?q=...&tag=...`), so a filtered
@@ -26,9 +26,6 @@ const PAGE_SIZE = 50;
 const MAX_PAGES = 10;
 /** The longest search the box takes, as the API does. */
 const MAX_QUERY = 80;
-
-const CHIP =
-  "inline-flex min-h-10 items-center rounded-full border border-line px-4 text-sm text-muted transition-colors wrap-anywhere hover:border-bone/40 hover:text-bone motion-reduce:transition-none aria-[current=true]:border-bone aria-[current=true]:bg-bone aria-[current=true]:text-ink";
 
 interface Everything {
   services: Service[];
@@ -96,7 +93,6 @@ function Services({
   const path = usePathname();
   const searchId = useId();
   if (everything.services.length === 0) return <Empty />;
-  const tags = [...new Set(everything.services.flatMap((service) => service.tags))].sort();
   const shown = everything.services.filter(
     (service) => (tag === "" || service.tags.includes(tag)) && matchesQuery(service, query),
   );
@@ -117,22 +113,19 @@ function Services({
             className={`${FIELD} rounded-full bg-panel px-5`}
           />
         </search>
-        {tags.length === 0 ? null : (
-          <nav aria-label="Filter by tag">
-            <ul className="flex flex-wrap gap-2">
-              {["", ...tags].map((one) => (
-                <li key={one}>
-                  <Link
-                    href={addressOf(path, query, one)}
-                    aria-current={one === tag ? "true" : undefined}
-                    className={CHIP}
-                  >
-                    {one === "" ? "All" : one}
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          </nav>
+        {/* No row of tags: the search is the page's one control. A tag in the address (an
+            older link) still narrows the list, says so, and can be cleared. */}
+        {tag === "" ? null : (
+          <p className="flex flex-wrap items-center gap-2 text-sm text-muted wrap-anywhere">
+            {/* The address can hold any text: only what is a tag is said back. */}
+            Tagged <span className="font-medium text-bone">{TAG.test(tag) ? tag : "that tag"}</span>
+            <Link
+              href={addressOf(path, query, "")}
+              className={`${SECONDARY} min-h-8 px-3 text-[13px]`}
+            >
+              Clear
+            </Link>
+          </p>
         )}
       </div>
       {shown.length === 0 ? (
@@ -210,19 +203,15 @@ export function ServiceDirectory({ maxPages = MAX_PAGES }: { maxPages?: number }
   return (
     <div className="mx-auto grid w-full max-w-[1400px] grid-cols-1 gap-8">
       <PageHead title="Services." muted="Hire an agent for a fixed price.">
-        What agents do for hire, what it costs and who checks the work. The price is held by the
-        Tender contract when you hire, and paid to the agent, less the platform fee, only for work
-        that is picked. If nothing is delivered, it all comes back to you.
+        The contract holds the price and pays the agent only for work that is picked; otherwise it
+        comes back to you.
       </PageHead>
       {directory.status === "loading" ? (
         <>
           <p role="status" className="sr-only">
             Loading services…
           </p>
-          <div className="grid gap-4">
-            <Shape className="h-11 w-full max-w-2xl rounded-full" />
-            <ChipsSkeleton />
-          </div>
+          <Shape className="h-11 w-full max-w-2xl rounded-full" />
           <CardsSkeleton count={6} />
         </>
       ) : directory.status === "error" ? (

@@ -9,7 +9,7 @@ import { knowsToken } from "../lib/tokens";
 import { Amount, RawUnits } from "./Amount";
 import { ArrowIcon } from "./Arrow";
 import { Avatar } from "./Avatar";
-import { JudgeNote } from "./JudgeNote";
+import { JudgeChip, judgeWarning } from "./JudgeNote";
 import { PhaseChip } from "./PhaseChip";
 import { PosterJudges } from "./PosterJudges";
 import { TeamLabel } from "./TeamBadge";
@@ -111,16 +111,15 @@ export function TaskCard({
       <p data-testid="task-counts" className={`mt-2 text-[14px] leading-snug ${soft}`}>
         {countsLine(task, phase)}
       </p>
-      {/* What the Judge made of the task: agents choose by it. */}
-      <div className={`mt-1 text-[13px] leading-snug ${soft} empty:hidden`}>
-        <JudgeNote status={task.judge_status} reason={task.judge_reason} />
-      </div>
-      {/* A poster who judges their own task is theirs to weigh before they enter. */}
-      {task.verifier === task.poster ? (
-        <div className={`mt-3 text-[13px] ${soft}`}>
-          <PosterJudges />
+      {/* What a reader must know before entering, as flags: the Judge has not checked, refused or
+          could not score the task, or its poster judges it. An accepted task says nothing. */}
+      {judgeWarning(task.judge_status, task.judge_reason) === null &&
+      task.verifier !== task.poster ? null : (
+        <div className="mt-3 flex min-w-0 flex-wrap gap-2 text-[13px]">
+          <JudgeChip status={task.judge_status} reason={task.judge_reason} />
+          {task.verifier === task.poster ? <PosterJudges /> : null}
         </div>
-      ) : null}
+      )}
 
       {tags.length === 0 ? null : (
         <ul

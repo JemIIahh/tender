@@ -60,7 +60,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const pill = () => screen.findByRole("button", { name: /^Status: / });
+const pill = () => screen.findByRole("button", { name: /^Testnet, / });
 const dot = (element: HTMLElement) =>
   within(element).getByTestId("live-dot").getAttribute("data-state");
 
@@ -73,10 +73,12 @@ test("live_pill_says_up_to_date_and_shows_the_api_s_figures_token_by_token", asy
   render(<LiveStatus />);
 
   const button = await pill();
-  // Its name says the state, as does its tooltip; it shows the dot and the network's name.
-  expect(button.getAttribute("aria-label")).toBe("Status: Live");
+  // It shows the dot and the network's name; its name starts with that word (WCAG 2.5.3) and then
+  // says the state, as its tooltip does.
+  expect(button.getAttribute("aria-label")).toBe("Testnet, Live");
   expect(button.getAttribute("title")).toBe("Live: Up to date");
   expect(button.textContent).toBe("Testnet");
+  expect(button.getAttribute("aria-label")?.startsWith(button.textContent ?? "-")).toBe(true);
   expect(dot(button)).toBe("synced");
   expect(button.getAttribute("aria-expanded")).toBe("false");
   // The three reads, once each, and nothing else.
@@ -111,7 +113,7 @@ test("live_pill_says_catching_up_and_never_how_many_blocks", async () => {
   render(<LiveStatus />);
 
   const button = await pill();
-  expect(button.getAttribute("aria-label")).toBe("Status: Updating");
+  expect(button.getAttribute("aria-label")).toBe("Testnet, Updating");
   expect(button.getAttribute("title")).toBe("Updating: Some numbers may be a few minutes old.");
   expect(button.textContent).toBe("Testnet");
   expect(dot(button)).toBe("behind");
@@ -158,7 +160,7 @@ test("live_pill_is_amber_when_the_health_check_says_the_chain_is_unavailable", a
   });
   render(<LiveStatus />);
   const button = await pill();
-  expect(button.getAttribute("aria-label")).toBe("Status: Updating");
+  expect(button.getAttribute("aria-label")).toBe("Testnet, Updating");
   expect(dot(button)).toBe("behind");
   await userEvent.click(button);
   expect(screen.getAllByTestId("live-figure").map((row) => row.textContent)).toEqual([
@@ -174,7 +176,7 @@ test("live_pill_says_offline_and_shows_no_figure_when_the_api_can_t_be_reached",
 
   const button = await pill();
   expect(urls).toHaveLength(3);
-  expect(button.getAttribute("aria-label")).toBe("Status: Offline");
+  expect(button.getAttribute("aria-label")).toBe("Testnet, Offline");
   expect(button.getAttribute("title")).toBe("Offline: Can't reach Tender right now");
   expect(dot(button)).toBe("offline");
   await userEvent.click(button);
@@ -306,7 +308,7 @@ test("live_pill_is_the_dot_alone_on_a_phone_and_keeps_its_name", async () => {
   // The network's name is hidden on a phone by CSS; the state stays in the button's name.
   const word = within(button).getByText("Testnet");
   expect(word.className).toContain("max-sm:hidden");
-  expect(button.getAttribute("aria-label")).toBe("Status: Live");
+  expect(button.getAttribute("aria-label")).toBe("Testnet, Live");
   expect(button.className).toContain("max-sm:w-10");
   // On a phone the panel spans the screen under the top bar.
   await userEvent.click(button);
@@ -407,7 +409,7 @@ test("live_pill_keeps_a_true_state_when_a_read_can_t_be_made_sense_of", async ()
   render(<Fresh />);
 
   const button = await pill();
-  expect(button.getAttribute("aria-label")).toBe("Status: Updating");
+  expect(button.getAttribute("aria-label")).toBe("Testnet, Updating");
   expect(errors).toHaveBeenCalled();
   vi.doUnmock("../lib/live");
 });

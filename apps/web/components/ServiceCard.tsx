@@ -1,11 +1,12 @@
 import type { Service } from "@tender/shared";
 import Link from "next/link";
+import { agentName } from "../lib/agents";
 import { usePrefetchOnIntent } from "../lib/prefetch";
-import { checkedBy, windowsLine } from "../lib/services";
+import { checkedBy, deliveredLine } from "../lib/services";
 import { describeAmount } from "../lib/vault";
 import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
-import { TeamBadge } from "./TeamBadge";
+import { TeamLabel } from "./TeamBadge";
 import { LINK_CARD, PRIMARY } from "./ui";
 
 /** The small shield of a check, beside who checks the work. */
@@ -31,23 +32,27 @@ function CheckIcon() {
 /**
  * A service in the directory, as one of the app's rounded cards: who checks the work, its title,
  * which is the link to its page (the whole card answers a click on it), two lines of what it does,
- * the agent that does it (with the team's label when the team runs it) and its record as the
- * contract counts it (wins, and what it earned, token by token), and under a hairline its price
- * and Hire, a link of its own, above the card's, to the form on the service's page.
+ * the agent that does it (the name it goes by, the team's label when the team runs it, and its
+ * wins), and under a hairline its price, how soon the work is delivered, and Hire, a link of its
+ * own, above the card's, to the form on the service's page. What the agent earned and its provider
+ * are on the agent's page. On that page (`agent` false) the card leaves the agent out.
  *
  * Every word of it but the labels is the provider's, and is shown as text.
  */
 export function ServiceCard({
   service,
   heading = "h2",
+  agent = true,
 }: {
   service: Service;
   /** The level of the card's title: h3 on a page whose section has an h2 of its own. */
   heading?: "h2" | "h3";
+  /** Whether it names its agent: not on the agent's own page, which is about it already. */
+  agent?: boolean;
 }) {
   const Heading = heading;
   const record = service.agent_record;
-  const earned = record === null ? [] : Object.entries(record.earned);
+  const wins = record?.wins ?? 0;
   const intent = usePrefetchOnIntent(`/services/${service.id}`);
   return (
     <li
@@ -76,36 +81,27 @@ export function ServiceCard({
         {service.description}
       </p>
 
-      <div className="mt-5 flex min-w-0 items-center gap-3">
-        <Avatar account={service.agent} size={32} square />
-        <div className="grid min-w-0 flex-1 grid-cols-1 gap-0.5 text-[12.5px]">
-          <p data-testid="service-agent" className="flex min-w-0 items-center">
+      {agent ? (
+        <div className="mt-5 flex min-w-0 items-center gap-3 text-[13px]">
+          <Avatar account={service.agent} size={32} square />
+          <p
+            data-testid="service-agent"
+            className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1"
+          >
             <span className="sr-only">Agent: </span>
-            <TeamBadge account={service.agent} isTeam={service.is_team} truncate />
-          </p>
-          <p className="min-w-0 truncate text-muted">
-            <span data-testid="service-wins" className="text-bone tabular-nums">
-              {record?.wins ?? 0}
-            </span>{" "}
-            {(record?.wins ?? 0) === 1 ? "win" : "wins"} · Earned{" "}
-            <span data-testid="service-earned" className="text-bone">
-              {earned.length === 0
-                ? "Nothing yet"
-                : earned.map(([token, amount], at) => (
-                    <span key={token}>
-                      {at === 0 ? null : ", "}
-                      <Amount value={amount} token={token} />
-                    </span>
-                  ))}
+            <span title={service.agent} className="min-w-0 truncate font-medium text-bone">
+              {agentName({ account: service.agent, name: record?.name ?? null })}
+            </span>
+            {service.is_team ? <TeamLabel /> : null}
+            <span className="whitespace-nowrap text-muted">
+              <span data-testid="service-wins" className="text-bone tabular-nums">
+                {wins}
+              </span>{" "}
+              {wins === 1 ? "win" : "wins"}
             </span>
           </p>
-          {service.provider === service.agent ? null : (
-            <p className="truncate text-muted" title={service.provider}>
-              Provider <span className="font-mono">{service.provider}</span>
-            </p>
-          )}
         </div>
-      </div>
+      ) : null}
 
       <div className="mt-auto pt-6">
         <div className="flex items-center gap-3 border-t border-line pt-5">
@@ -123,7 +119,7 @@ export function ServiceCard({
               </span>
               <span className="shrink-0 text-[13px] text-muted">/ task</span>
             </p>
-            <p className="truncate text-[12.5px] text-muted">{windowsLine(service)}</p>
+            <p className="truncate text-[12.5px] text-muted">{deliveredLine(service)}</p>
           </div>
           {/* Above the card's stretched link, so that it is a link of its own. */}
           <Link

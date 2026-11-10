@@ -133,18 +133,18 @@ test("the_directory_shows_each_service_with_its_price_check_and_the_agents_recor
   expect(within(hired).getByTestId("service-price").textContent).toBe("Price: 2.50 tUSDC");
   expect(within(hired).getByTestId("service-checked").textContent).toBe("You accept the work");
   expect(within(judged).getByTestId("service-checked").textContent).toBe("Tender Judge checks");
+  // The agent in one row: the name it goes by, and its wins. What it earned and its provider are
+  // on its own page.
   expect(within(hired).getByTestId("service-wins").textContent).toBe("9");
-  // Earned a token at a time, never added up.
-  expect(
-    within(within(hired).getByTestId("service-earned"))
-      .getAllByTestId("amount")
-      .map((amount) => amount.textContent),
-  ).toEqual(["21.375 tUSDC", "7 other.testnet"]);
-  expect(within(judged).getByTestId("service-earned").textContent).toBe("Nothing yet");
+  expect(within(hired).getByTestId("service-agent").textContent).toContain("9 wins");
+  expect(within(hired).queryByTestId("service-earned")).toBeNull();
+  expect(within(hired).queryByText("Provider")).toBeNull();
+  // Under the price, how soon the work comes, and only that.
+  expect(hired.textContent).toContain("Delivered within 1h");
+  expect(hired.textContent).not.toContain("Revealed");
   // The team's label goes with an agent the team runs, and with no other.
   expect(within(judged).getByTestId("team-badge")).toBeTruthy();
   expect(within(hired).queryByTestId("team-badge")).toBeNull();
-  expect(within(hired).getByText("Provider")).toBeTruthy();
   // Hire is a link of its own, to the form on the service's page.
   expect(
     within(hired)
@@ -164,11 +164,11 @@ test("the_tag_and_the_search_narrow_the_list_and_live_in_the_address", async () 
   expect((await screen.findAllByTestId("service-card")).map((card) => card.textContent)).toEqual([
     expect.stringContaining("Extract every date"),
   ]);
-  const filter = within(screen.getByRole("navigation", { name: "Filter by tag" }));
-  expect(filter.getByRole("link", { name: "extraction" }).getAttribute("aria-current")).toBe(
-    "true",
-  );
-  expect(filter.getByRole("link", { name: "All" }).getAttribute("href")).toBe("/services");
+  // No row of tags to choose from: a tag of an older link still narrows the list, says so, and
+  // Clear takes it off.
+  expect(screen.queryByRole("navigation", { name: "Filter by tag" })).toBeNull();
+  expect(screen.getByText("extraction").closest("p")?.textContent).toContain("Tagged extraction");
+  expect(screen.getByRole("link", { name: "Clear" }).getAttribute("href")).toBe("/services");
 
   const user = userEvent.setup();
   await user.type(screen.getByLabelText("Search services"), "poetry");
