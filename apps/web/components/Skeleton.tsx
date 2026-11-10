@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { CARD, EYEBROW, H1, PANEL, PANEL_TITLE } from "./ui";
+import { CARD, H1, PANEL, PANEL_TITLE } from "./ui";
 
 // The shapes a page shows while it loads: the route's `loading.tsx` (while its code and its page
 // come) and the page itself (while its data comes) draw the same ones, in the boxes the loaded page
@@ -53,28 +53,25 @@ export function RouteSkeleton({ frame, children }: { frame: string; children: Re
   );
 }
 
-/** A page's head (components/PageHead) while it loads: its label, its headline, a line under it. */
+/** A page's head (components/PageHead) while it loads: its headline, and a line under it. */
 export function HeadSkeleton({
-  art = true,
   title = ["w-3/5"],
   phone = [],
   body = [],
+  crumbs = false,
 }: {
-  /** The head has a picture at its right, which gives it its height from tablet width up. */
-  art?: boolean;
   /** The width of each line of the headline. */
   title?: string[];
   /** The width of each line more that the headline takes on a phone, where it wraps sooner. */
   phone?: string[];
   /** The width of each line of the text under it. */
   body?: string[];
+  /** The page has breadcrumbs above its headline. */
+  crumbs?: boolean;
 }) {
   return (
-    <div
-      aria-hidden="true"
-      className={`relative isolate grid content-center gap-3 ${art ? "md:min-h-44 md:pr-[38%]" : ""}`}
-    >
-      <TextLine text={EYEBROW} width="w-28" />
+    <div aria-hidden="true" className="grid gap-3">
+      {crumbs ? <TextLine text="text-[14px]" width="w-48" /> : null}
       <div className="grid">
         {title.map((width, index) => (
           // biome-ignore lint/suspicious/noArrayIndexKey: the lines are only shapes, in a fixed order
@@ -98,23 +95,26 @@ export function HeadSkeleton({
 }
 
 /** The grid of cards of the board and the directories: one column, two on a tablet, three wide. */
-export const CARD_GRID = "grid gap-4 sm:grid-cols-2 xl:grid-cols-3";
+export const CARD_GRID = "grid grid-cols-1 gap-6 md:grid-cols-2 xl:grid-cols-3";
 
 /** A card of the board, or of a directory, while it loads: its outline and its parts' places. */
 export function CardSkeleton() {
   return (
-    <li aria-hidden="true" className={`${CARD} flex min-h-64 flex-col p-5 sm:p-6`}>
-      <div className="flex justify-between">
+    <li aria-hidden="true" className={`${CARD} flex min-h-72 flex-col p-6 sm:p-7`}>
+      <div className="flex items-center justify-between">
         <Shape className="h-5 w-20 rounded-full" />
-        <Shape className="h-5 w-24 rounded-full" />
+        <Shape className="h-6 w-28 rounded-full" />
       </div>
-      <Shape className="mt-6 h-3 w-1/3 rounded-full" />
-      <Shape className="mt-3 h-5 w-4/5 rounded-full" />
+      <Shape className="mt-7 h-5 w-4/5 rounded-full" />
       <Shape className="mt-2 h-5 w-3/5 rounded-full" />
-      <div className="mt-auto flex items-center gap-3 border-t border-line pt-4">
-        <Shape className="size-[34px] rounded-full" />
-        <Shape className="h-3 w-32 rounded-full" />
-        <Shape className="ml-auto size-10 rounded-full" />
+      <Shape className="mt-4 h-3 w-1/3 rounded-full" />
+      <div className="mt-auto flex items-center gap-3 pt-7">
+        <Shape className="size-10 rounded-full" />
+        <span className="grid flex-1 gap-2">
+          <Shape className="h-3 w-40 rounded-full" />
+          <Shape className="h-3 w-28 rounded-full" />
+        </span>
+        <Shape className="size-11 rounded-full" />
       </div>
     </li>
   );
@@ -129,22 +129,6 @@ export function CardsSkeleton({ count = 3 }: { count?: number }) {
         <CardSkeleton key={index} />
       ))}
     </ul>
-  );
-}
-
-/** A row of filter chips (the directories' tags), which wraps as the chips do. */
-export function ChipsSkeleton({ count = 5 }: { count?: number }) {
-  const widths = ["w-12", "w-20", "w-16", "w-24", "w-14", "w-[4.5rem]"];
-  return (
-    <div aria-hidden="true" className="flex flex-wrap gap-2">
-      {Array.from({ length: count }, (_, index) => (
-        <Shape
-          // biome-ignore lint/suspicious/noArrayIndexKey: the chips are only shapes, in a fixed order
-          key={index}
-          className={`h-10 rounded-full ${widths[index % widths.length]}`}
-        />
-      ))}
-    </div>
   );
 }
 

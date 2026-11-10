@@ -3,8 +3,8 @@
  * labelled as ours wherever they appear; `isTeam` comes from the API (`is_team_poster`, `is_team`).
  *
  * It takes the colour of the text around it, so that it reads on the dark ground and on a light
- * card alike. `truncate` keeps a long account to one line, cut short, where the room is a card's;
- * everywhere else an account wraps wherever it has to.
+ * card alike. `truncate` keeps a long account to one line, cut short, where the room is a card's,
+ * with the label kept whole beside it; everywhere else an account wraps wherever it has to.
  */
 export function TeamBadge({
   account,
@@ -16,7 +16,9 @@ export function TeamBadge({
   truncate?: boolean;
 }) {
   return (
-    <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+    <span
+      className={`flex min-w-0 items-center gap-x-2 gap-y-1 ${truncate ? "flex-nowrap" : "flex-wrap"}`}
+    >
       <span
         title={truncate ? account : undefined}
         className={`min-w-0 font-mono text-[13px] ${truncate ? "max-w-full truncate" : "wrap-anywhere"}`}

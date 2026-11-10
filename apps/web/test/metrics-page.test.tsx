@@ -97,8 +97,11 @@ test("metrics_rank_the_top_agents_with_links_to_their_pages", async () => {
       .getByRole("link", { name: /Alice Extractor/ })
       .getAttribute("href"),
   ).toBe("/agents/alice.testnet");
-  // An agent with no public profile has no name to show, and says so.
-  expect(rows[1]?.textContent).toContain("Unnamed agent");
+  // An agent with no public profile goes by the first part of its account, as it does everywhere.
+  expect(within(rows[1] as HTMLElement).getByRole("link", { name: /^bob/ }).textContent).toContain(
+    "bob",
+  );
+  expect(rows[1]?.textContent).not.toContain("Unnamed agent");
   expect(rows[1]?.textContent).toContain("Nothing yet");
 });
 

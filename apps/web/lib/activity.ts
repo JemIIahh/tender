@@ -274,7 +274,7 @@ export function lineOf(event: FeedEvent, ctx: LineContext): ActivityLine | null 
       return {
         ...base,
         kind: "agent",
-        parts: [account(bond.account, true), text("locked its agent bond")],
+        parts: [account(bond.account, true), text("locked its bond")],
         amountLabel: "bond",
         amounts: sumByToken([[bond.token, bond.amount]]),
         accounts: [bond.account],
@@ -283,6 +283,80 @@ export function lineOf(event: FeedEvent, ctx: LineContext): ActivityLine | null 
     default:
       return null;
   }
+}
+
+/** How close in time two lines of one account have to be to be said as one: ten minutes. */
+export const GROUP_MS = 10 * 60_000;
+
+/** The account a line is about, when it begins with one: who posted, entered, picked, registered. */
+function actorOf(line: ActivityLine): string | null {
+  const [first] = line.parts;
+  return first?.kind === "account" ? first.account : null;
+}
+
+/** Whether two lines' amounts can be said as one figure: of one kind, or one of them has none. */
+function sameLabel(a: ActivityLine, b: ActivityLine): boolean {
+  return a.amountLabel === null || b.amountLabel === null || a.amountLabel === b.amountLabel;
+}
+
+/**
+ * `lines` (newest first) with each run of lines of one account, ten minutes or less apart, said as
+ * one: "analyst registered as an agent and locked its bond", "lead entered #3 and #4". What the
+ * account did is said in the order it happened, a verb said once when it is said again at once.
+ * The amounts of the run are added up token by token, and only lines whose amounts are of one kind
+ * (or that have none) go together; a line with a note (a void) stays on its own. The kind is the
+ * newest line's, and so is the time.
+ */
+export function groupLines(lines: readonly ActivityLine[]): ActivityLine[] {
+  const runs: ActivityLine[][] = [];
+  for (const line of lines) {
+    const run = runs.at(-1);
+    const last = run?.at(-1);
+    const actor = actorOf(line);
+    if (
+      run !== undefined &&
+      last !== undefined &&
+      actor !== null &&
+      actorOf(last) === actor &&
+      line.note === null &&
+      last.note === null &&
+      run.every((member) => sameLabel(member, line)) &&
+      Math.abs(last.atMs - line.atMs) <= GROUP_MS
+    ) {
+      run.push(line);
+    } else {
+      runs.push([line]);
+    }
+  }
+  return runs.map((run) => {
+    const [newest] = run;
+    if (newest === undefined || run.length === 1) return newest as ActivityLine;
+    const [actor] = newest.parts;
+    // Oldest first: what was done, in the order it was done.
+    const done = [...run].reverse().map((line) => line.parts.slice(1));
+    const said: Part[] = [];
+    done.forEach((rest, at) => {
+      const before = done[at - 1];
+      // A verb said at once again is left out: "entered #3 and #4".
+      const again =
+        before !== undefined &&
+        rest[0]?.kind === "text" &&
+        before[0]?.kind === "text" &&
+        rest[0].text === before[0].text;
+      if (at > 0) said.push(text(at === done.length - 1 ? "and" : ","));
+      said.push(...(again ? rest.slice(1) : rest));
+    });
+    const accounts = [...new Set(run.flatMap((line) => line.accounts))];
+    return {
+      ...newest,
+      key: run.map((line) => line.key).join("+"),
+      parts: actor === undefined ? said : [actor, ...said],
+      amountLabel: run.find((line) => line.amountLabel !== null)?.amountLabel ?? null,
+      amounts: sumByToken(run.flatMap((line) => line.amounts)),
+      amountPending: run.some((line) => line.amountPending),
+      accounts,
+    };
+  });
 }
 
 /** The tokens of the tasks `events` post, by task id: a `task_created` names its own. */

@@ -115,7 +115,7 @@ export function Scorecard({
         <table className="w-full table-fixed text-sm">
           <caption className="sr-only">How each revealed entry scored</caption>
           <thead>
-            <tr className="text-left font-mono text-[10px] tracking-[0.12em] text-muted uppercase sm:text-[10.5px]">
+            <tr className="text-left text-[12px] text-muted sm:text-[13px]">
               <th scope="col" className="w-[30%] px-1 pb-2 font-normal">
                 Entry
               </th>
@@ -195,7 +195,7 @@ export function Scorecard({
               {`Recompute: sha256(held-out) must equal ${expected}`}
             </p>
             {scorecard.heldout === null ? (
-              <p>The verifier has not published the held-out checks.</p>
+              <p>The checker has not published the held-out checks.</p>
             ) : href === undefined ? (
               <p>The held-out checks cannot be written out as a file.</p>
             ) : (

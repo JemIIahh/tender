@@ -58,7 +58,19 @@ test("how_it_works_reads_the_fee_and_the_bond_from_the_contract", async () => {
   render(<HowItWorksView />);
   expect(screen.getByRole("heading", { level: 1 }).textContent).toContain("How it works.");
   // The lifecycle stepper, five steps.
-  expect(within(screen.getByRole("tablist")).getAllByRole("tab")).toHaveLength(5);
+  // The five steps, each numbered, with a picture and a few words.
+  const steps = screen.getAllByTestId("how-step");
+  expect(steps.map((step) => step.querySelector("p")?.textContent)).toEqual([
+    "1Post",
+    "2Answer",
+    "3Open",
+    "4Pick",
+    "5Paid",
+  ]);
+  for (const step of steps) {
+    expect(step.querySelector("canvas")).not.toBeNull();
+    expect((step.textContent ?? "").split(" ").length).toBeLessThanOrEqual(14);
+  }
 
   const fee = screen.getByTestId("fee");
   expect(fee.textContent).toBe("Reading the contract…");
@@ -103,7 +115,7 @@ test("how_it_works_makes_no_claim_it_cannot_back_and_names_what_is_ours", async 
   // The Judge and the upgrade key are the team's, and the page says so.
   const verifier = screen.getByTestId("how-verifier").textContent;
   expect(verifier).toContain("the Tender Judge, which we run");
-  // Any account can verify, and the poster picks when the verifier does not, in time.
+  // Any account can check, and the poster picks when the checker does not, in time.
   expect(verifier).toContain("any account");
   expect(verifier).toContain("if it does not pick in time, the poster can");
   expect(verifier).not.toMatch(/Only the verifier picks/);
@@ -116,7 +128,7 @@ test("how_it_works_makes_no_claim_it_cannot_back_and_names_what_is_ours", async 
   );
   // Who decides is the verifier, or the poster after its window.
   expect(screen.getByTestId("how-trust").textContent).toContain(
-    "The verifier decides who wins, or the poster when the verifier does not pick in time",
+    "The checker (the verifier) decides who wins, or the poster when the checker does not pick in time",
   );
   // No fee is written into the page: the only percentage is the one read.
   expect(container.textContent?.match(/\d+(?:\.\d+)?%/g)).toEqual(["2.5%"]);

@@ -273,6 +273,18 @@ test("a_win_is_the_payout_its_task_records_with_its_part_of_the_fee", () => {
     fee: 60_000n,
     gross: 1_200_000n,
   });
+  // Three winners of a fee of 100 units: 33 each by share, and the unit left over is the first's,
+  // so that the parts add up to the task's fee.
+  const three = picked("22", 2_000n, [
+    [ALICE, 3_334],
+    ["carol.testnet", 3_333],
+    ["dave.testnet", 3_333],
+  ]);
+  const fees = [ALICE, "carol.testnet", "dave.testnet"].map(
+    (account) => winOf(record({ account }), three)?.fee,
+  );
+  expect(fees).toEqual([34n, 33n, 33n]);
+  expect(fees.reduce((sum, fee) => (sum ?? 0n) + (fee ?? 0n), 0n)).toBe(100n);
   // Not among the winners, voided, or not decided: no win.
   expect(winOf(record({ account: "bob.testnet" }), task)).toBeNull();
   expect(winOf(alice, detail({ outcome: null }))).toBeNull();

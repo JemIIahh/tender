@@ -156,7 +156,9 @@ test("verifier_picks_one_winner_from_the_deliveries", async ({ page }) => {
   await expect(pick).toContainText("Picking is open for person.testnet.");
   await connect(page, pick);
 
-  await expect(pick).toContainText("You're the verifier. Your window to pick closes in");
+  await expect(pick).toContainText(
+    "You're the checker (the verifier). Your window to pick closes in about",
+  );
   const rows = pick.getByTestId("pick-entry");
   await expect(rows).toHaveCount(2);
   await expect(rows.nth(0).getByTestId("delivery")).toHaveText(WORK[ALICE]?.trimEnd() ?? "");
@@ -271,7 +273,7 @@ test("refund_counts_down_then_refunds_the_funders", async ({ page }) => {
   await page.clock.pauseAt(new Date(Number((AT.reveal - 150n * SECOND + 999_999n) / 1_000_000n)));
   const refund = page.getByTestId("action-refund");
   await expect(refund.getByTestId("refund-opens")).toHaveText(
-    "Opens in 2m 30s, at the reveal deadline, if nobody has revealed an entry by then.",
+    "Opens in about 2m 30s, at the reveal deadline, if nobody has revealed an entry by then.",
   );
   await expect(refund.getByRole("button", { name: "Refund the funders" })).toHaveAttribute(
     "aria-disabled",

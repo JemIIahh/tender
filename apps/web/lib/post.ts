@@ -21,9 +21,11 @@ import {
   randomSalt,
   rubricCriteriaProblem,
   sha256Hex,
+  splitReward,
   storageDepositCall,
   storageShortfall,
   type TenderCall,
+  tokenMeta,
 } from "@tender/shared";
 import {
   type AnswerFormat,
@@ -39,7 +41,7 @@ import { config } from "./config";
 import { RpcError, view } from "./rpc";
 import { describeAmount, readAmount, type StorageBalance, type VaultData } from "./vault";
 
-// What the post wizard (components/post) knows about a task: the form a person fills in, what is
+// What the post form (components/post) knows about a task: the form a person fills in, what is
 // wrong with it, the three documents it is turned into, and the calls that post them. The
 // components hold the state and show the words; every rule is here, so that a test can state it.
 //
@@ -49,14 +51,18 @@ import { describeAmount, readAmount, type StorageBalance, type VaultData } from 
 /** The most seconds a window may last, as the contract has it (`MAX_WINDOW_SECS`): 14 days. */
 export const MAX_WINDOW_SECS = 1_209_600;
 
+/** The most agents a task can invite, as the contract has it (`MAX_INVITED`, types.rs). */
+export const MAX_INVITED = 20;
+
 /**
  * The bytes of Tender storage a post can use, with a little to spare. `post_task` charges the poster
  * `40 + 1 + 8 + Borsh(Task)` bytes for the task record and holds `OUTCOME_RESERVE_BYTES` (800) back
  * for its outcome (contract/tender/src/tasks.rs, `post_task` and the test that measures what it
- * charges; types.rs). A task the wizard writes (no invite list, no parent) has a Borsh(Task) of 738
+ * charges; types.rs). A task the form writes (no invite list, no parent) has a Borsh(Task) of 738
  * bytes at the most: three account ids at their longest (204), a 256-byte brief address (260), two
  * hashes (64), the held-out commitment (33), one funder (88) and 89 of fixed fields. So the most is
- * 787 + 800 = 1,587 bytes. This is the figure the review of the wizard (06-T4) derived.
+ * 787 + 800 = 1,587 bytes. This is the figure the review of the wizard (06-T4) derived. An invite
+ * list adds its accounts to the record (`inviteBytes`), and a post adds those bytes to this figure.
  */
 export const POST_TASK_BYTES = 1_600n;
 
@@ -71,7 +77,7 @@ export const VAULT_SLOT_BYTES = 200n;
 // ---- The form -----------------------------------------------------------------------------------
 
 // The categories, the kinds of check and the formats by name, tags and a window's length in words
-// are in lib/briefTerms.ts, for the pages that only say them; the wizard's rules about them are here.
+// are in lib/briefTerms.ts, for the pages that only say them; the form's rules about them are here.
 export {
   type AnswerFormat,
   CATEGORIES,
@@ -111,7 +117,11 @@ export function formatForKind(kind: CheckKind, current: AnswerFormat): AnswerFor
 }
 
 export type Verifier = "judge" | "me" | "other";
-export type Preset = "quick" | "day" | "custom";
+/**
+ * How the windows are set: from one deadline (`deadline`), which the page works the other windows
+ * out from, or each by hand under More options (`custom`).
+ */
+export type Timing = "deadline" | "custom";
 export type WindowName = "commit" | "reveal" | "pick" | "fallback";
 export const WINDOW_NAMES: readonly WindowName[] = ["commit", "reveal", "pick", "fallback"];
 export type DurationUnit = "seconds" | "minutes" | "hours" | "days";
@@ -136,7 +146,7 @@ export interface RubricRow {
 }
 
 /**
- * What the wizard collects, as it is typed: text stays text until a check reads it, so that a
+ * What the post form collects, as it is typed: text stays text until a check reads it, so that a
  * half-written number or a half-written schema is something the form can hold.
  */
 export interface PostForm {
@@ -144,6 +154,7 @@ export interface PostForm {
   title: string;
   summary: string;
   instructions: string;
+  /** Not asked for: every task the page posts is `other`. The brief's schema needs one. */
   category: Category;
   /** Separated by commas or spaces. */
   tags: string;
@@ -172,7 +183,7 @@ export interface PostForm {
   heldoutNoMatch: string;
   /**
    * The salt of the held-out checks: 32 random bytes as 64 lowercase hex characters, drawn once for
-   * the form (`emptyForm`), so that every document the steps make of it, the one Review offers as a
+   * the form (`emptyForm`), so that every document the page makes of it, the one it offers as a
    * file and the one that is posted, has the same commitment. Without it a short answer could be
    * found by hashing likely answers until one gives the commitment on chain. Not shown or typed.
    */
@@ -181,14 +192,25 @@ export interface PostForm {
   rubric: RubricRow[];
 
   // Reward
-  /** The token's account id; empty until chosen, which is the first token Tender takes. */
+  /** The token's account id; empty until chosen, which is `defaultToken`. */
   token: string;
   amount: string;
-  preset: Preset;
-  /** The windows of `Custom`. */
+  timing: Timing;
+  /**
+   * When agents stop answering, as a `datetime-local` field holds it: `YYYY-MM-DDTHH:mm`, in the
+   * viewer's time zone. The commit window runs from the post to it.
+   */
+  deadline: string;
+  /** The windows of `custom`. */
   custom: Record<WindowName, Duration>;
   verifier: Verifier;
   otherVerifier: string;
+
+  // Who can enter
+  /** The agents invited, one account to a line or separated by commas; empty: anyone can enter. */
+  invited: string;
+  /** The most entries an invite-only task takes; empty: as many as are invited. */
+  maxEntries: string;
 }
 
 export interface Windows {
@@ -198,18 +220,66 @@ export interface Windows {
   fallback: number;
 }
 
-/** The windows of the two presets, in seconds: Quick 10/5/10/10 minutes, Day 24/2/4/24 hours. */
-export const PRESET_WINDOWS: Record<"quick" | "day", Windows> = {
-  quick: { commit: 600, reveal: 300, pick: 600, fallback: 600 },
-  day: { commit: 86_400, reveal: 7_200, pick: 14_400, fallback: 86_400 },
-};
+/** The quick picks beside the deadline, from the time they are pressed. */
+export const QUICK_DEADLINES: ReadonlyArray<{ label: string; secs: number }> = [
+  { label: "1 h", secs: 3_600 },
+  { label: "24 h", secs: 86_400 },
+  { label: "3 days", secs: 259_200 },
+  { label: "1 week", secs: 604_800 },
+];
+
+/** The deadline a new form has: a day from now. */
+export const DEFAULT_DEADLINE_SECS = 86_400;
 
 export const WINDOW_TEXT: Record<WindowName, { label: string; detail: string }> = {
-  commit: { label: "Commit", detail: "Agents enter with a sealed answer." },
-  reveal: { label: "Reveal", detail: "Agents show what they entered." },
-  pick: { label: "Judging", detail: "The verifier picks the winner." },
-  fallback: { label: "Fallback", detail: "If the verifier doesn't, you can." },
+  commit: { label: "Answer", detail: "Agents send sealed answers (commit)." },
+  reveal: { label: "Open", detail: "Agents open what they sent (reveal)." },
+  pick: { label: "Pick", detail: "The checker picks the winner." },
+  fallback: { label: "Fallback", detail: "If the checker doesn't, you can." },
 };
+
+const MINUTE_MS = 60_000;
+
+/** `ms` as a `datetime-local` value in the viewer's time zone, to the minute. */
+export function deadlineInput(ms: number): string {
+  const at = new Date(ms);
+  const two = (n: number) => String(n).padStart(2, "0");
+  return `${at.getFullYear()}-${two(at.getMonth() + 1)}-${two(at.getDate())}T${two(at.getHours())}:${two(at.getMinutes())}`;
+}
+
+/** The deadline `secs` from `nowMs`, rounded up to the next whole minute, as the field holds it. */
+export function deadlineIn(secs: number, nowMs: number): string {
+  return deadlineInput(Math.ceil((nowMs + secs * 1000) / MINUTE_MS) * MINUTE_MS);
+}
+
+/** The time a `datetime-local` value names, in ms, or null if it names none. */
+export function deadlineMs(value: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/.test(value.trim())) return null;
+  // A date and time with no offset is read in the viewer's time zone.
+  const ms = new Date(value.trim()).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** To five minutes, so that a press a few minutes after the deadline was set gives the same. */
+const roundToFiveMinutes = (secs: number) => Math.round(secs / 300) * 300;
+const clamp = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value));
+
+/**
+ * The windows of a task whose agents answer for `commitSecs`: opening their answers takes a twelfth
+ * of that (5 minutes to 12 hours), the pick a sixth (10 minutes to 2 days), and the poster's
+ * fallback six times the pick (10 minutes to 3 days), each to five minutes. A day to answer gives
+ * 2 hours, 4 hours and a day. Every window it gives but the first is 5 minutes to 3 days, which
+ * every network's limits take; the first is the deadline's, and is checked against them.
+ */
+export function windowsForDeadline(commitSecs: number): Windows {
+  const pick = clamp(roundToFiveMinutes(commitSecs / 6), 600, 172_800);
+  return {
+    commit: commitSecs,
+    reveal: clamp(roundToFiveMinutes(commitSecs / 12), 300, 43_200),
+    pick,
+    fallback: clamp(pick * 6, 600, 259_200),
+  };
+}
 
 const UNIT_SECS: Record<DurationUnit, number> = {
   seconds: 1,
@@ -236,8 +306,12 @@ export function durationsOf(windows: Windows): Record<WindowName, Duration> {
   return durations;
 }
 
-/** A new form. `judgeAccount`: the Judge is the default verifier if this build knows its account. */
-export function emptyForm(options: { judgeAccount: string | null }): PostForm {
+/**
+ * A new form. `judgeAccount`: the Judge is the default verifier if this build knows its account.
+ * The deadline is a day after `nowMs` (now unless said).
+ */
+export function emptyForm(options: { judgeAccount: string | null; nowMs?: number }): PostForm {
+  const nowMs = options.nowMs ?? Date.now();
   return {
     title: "",
     summary: "",
@@ -262,11 +336,50 @@ export function emptyForm(options: { judgeAccount: string | null }): PostForm {
     rubric: [{ criterion: "", weight: "5" }],
     token: "",
     amount: "",
-    preset: "quick",
-    custom: durationsOf(PRESET_WINDOWS.quick),
+    timing: "deadline",
+    deadline: deadlineIn(DEFAULT_DEADLINE_SECS, nowMs),
+    custom: durationsOf(windowsForDeadline(DEFAULT_DEADLINE_SECS)),
     verifier: options.judgeAccount === null ? "me" : "judge",
     otherVerifier: "",
+    invited: "",
+    maxEntries: "",
   };
+}
+
+/** The accounts in `text`, as typed: separated by commas, spaces or lines, each trimmed. */
+export function accountsOf(text: string): string[] {
+  return text.split(/[\s,]+/).filter((account) => account !== "");
+}
+
+/** The agents a form invites, in the order typed. */
+export function invitedOf(form: PostForm): string[] {
+  return accountsOf(form.invited);
+}
+
+/**
+ * The bytes the invite list adds to the task record the contract charges for: Borsh writes each
+ * account as its length (4 bytes) and its bytes. `POST_TASK_BYTES` holds an empty list.
+ */
+export function inviteBytes(form: PostForm): bigint {
+  const encoder = new TextEncoder();
+  return invitedOf(form).reduce(
+    (sum, account) => sum + 4n + BigInt(encoder.encode(account).length),
+    0n,
+  );
+}
+
+/**
+ * The `max_entries` a form posts: 0, no limit, for a task open to anyone (the contract takes a
+ * limit only with an invite list); for an invite-only one, the number typed, or as many as are
+ * invited (each agent has one entry, so that is no limit either, and it is what a rubric task
+ * needs: 1 to `RUBRIC_MAX_ENTRIES`). NaN for a number that is not one, which the checks refuse.
+ */
+export function maxEntriesOf(form: PostForm): number {
+  const invited = invitedOf(form).length;
+  if (invited === 0) return 0;
+  const typed = form.maxEntries.trim();
+  if (typed === "") return invited;
+  return /^[0-9]{1,9}$/.test(typed) ? Number(typed) : Number.NaN;
 }
 
 // ---- Reading what was typed ---------------------------------------------------------------------
@@ -345,7 +458,7 @@ export function checkBrief(form: PostForm): Errors {
   }
 
   // What the schema would turn down once each field reads well: the same document the upload will
-  // be, made here, so that a problem shows on this step and not after a sign-in.
+  // be, made here, so that a problem shows on the page and not after a sign-in.
   if (Object.keys(errors).length === 0) {
     try {
       checkedBrief(form);
@@ -381,7 +494,7 @@ export function regexCaution(form: PostForm): string | null {
 }
 
 // What the Judge takes of a rubric. It turns a rubric task down at intake when a model could not
-// grade its points, and that is after the task is posted and its reward is in, so the Checks step
+// grade its points, and that is after the task is posted and its reward is in, so the form
 // holds the points to the same rules and a problem shows where it can be put right. The rules are
 // the ones in `@tender/shared` (rubric.ts), which the Judge reads too: this file has no copy, only
 // the words for each problem.
@@ -409,6 +522,12 @@ function pointProblem(point: string): RubricProblem | null {
   return rubricCriteriaProblem({ min_score: RUBRIC_MIN_SCORE, rubric: [{ criterion: point }] });
 }
 
+/** Who accepts an answer, as the form's checker is: the Judge, you, or the account it names. */
+function accepter(form: Pick<PostForm, "verifier">): string {
+  if (form.verifier === "judge") return "the Judge";
+  return form.verifier === "me" ? "you" : "the checker";
+}
+
 export function checkChecks(form: PostForm, options: { canRubric: boolean }): Errors {
   const errors: Errors = {};
 
@@ -417,7 +536,7 @@ export function checkChecks(form: PostForm, options: { canRubric: boolean }): Er
     errors.kind = "Rubric checks are for team accounts.";
   } else if (!FORMATS_FOR_KIND[form.kind].includes(form.outputFormat)) {
     const wanted = FORMATS_FOR_KIND[form.kind].map((format) => FORMAT_LABEL[format]).join(" or ");
-    errors.kind = `${label} needs the answer format "${wanted}". Change it on the Brief step.`;
+    errors.kind = `${label} needs the answer format "${wanted}". Change it under More options.`;
   }
 
   // A rubric's pass mark is at least `RUBRIC_MIN_SCORE`: the Judge scores an entry it disqualifies
@@ -434,7 +553,7 @@ export function checkChecks(form: PostForm, options: { canRubric: boolean }): Er
   switch (form.kind) {
     case "exact":
       if (linesOf(form.expected).length === 0) {
-        errors.expected = "Write at least one answer the Judge will accept, one to a line.";
+        errors.expected = `Write at least one answer ${accepter(form)} will accept, one to a line.`;
       }
       break;
 
@@ -516,7 +635,7 @@ export function checkChecks(form: PostForm, options: { canRubric: boolean }): Er
 
   // What the schemas would turn down once each field reads well: the documents the upload will be,
   // made here, so that a problem (a document over the API's 256 KiB, text that cannot be saved)
-  // shows on this step and not after a sign-in. The public checks belong to no one field. The
+  // shows on the page and not after a sign-in. The public checks belong to no one field. The
   // held-out checks are spread over several, and are measured and never quoted.
   if (Object.keys(errors).length === 0) {
     let criteria: PublicCriteria | null = null;
@@ -581,9 +700,24 @@ export async function readPostLimits(): Promise<PostLimits> {
   };
 }
 
-/** The token a form is for: the one chosen if Tender takes it, else the first it takes. */
+/**
+ * The token a form is for: the one chosen if Tender takes it, else the default: the test USDC
+ * where Tender takes it (it is free to get, on testnet), else the first token Tender takes.
+ */
 export function tokenOf(form: PostForm, limits: PostLimits): TokenLimit | undefined {
-  return limits.tokens.find(({ token }) => token === form.token) ?? limits.tokens[0];
+  return (
+    limits.tokens.find(({ token }) => token === form.token) ??
+    limits.tokens.find(({ token }) => tokenMeta(token, config.network).symbol === "tUSDC") ??
+    limits.tokens[0]
+  );
+}
+
+/**
+ * What the winner of a task with this reward receives, as the contract splits it: the reward less
+ * the fee, `reward * feeBps / 10_000` rounded down (`splitReward`, one winner).
+ */
+export function winnerReceives(reward: bigint, feeBps: number): bigint {
+  return splitReward(reward, feeBps, [10_000]).amounts[0] ?? 0n;
 }
 
 /** The reward a form asks for in the token's smallest unit, or null if what is typed is no amount. */
@@ -600,9 +734,19 @@ export function durationSecs(duration: Duration): number | null {
   return Number.isSafeInteger(secs) && secs > 0 && secs <= 0xffff_ffff ? secs : null;
 }
 
-/** The four windows of a form in seconds, or null if one of the custom ones is not a duration. */
-export function windowsOf(form: PostForm): Windows | null {
-  if (form.preset !== "custom") return PRESET_WINDOWS[form.preset];
+/**
+ * The four windows of a form in seconds, or null if they are not durations: a custom one that is
+ * none, or a deadline that is no time or is not after `nowMs` (now unless said). From a deadline,
+ * the commit window runs from `nowMs` to it, in whole seconds, and the rest follow from it
+ * (`windowsForDeadline`).
+ */
+export function windowsOf(form: PostForm, nowMs: number = Date.now()): Windows | null {
+  if (form.timing === "deadline") {
+    const at = deadlineMs(form.deadline);
+    if (at === null) return null;
+    const secs = Math.floor((at - nowMs) / 1000);
+    return secs > 0 && secs <= 0xffff_ffff ? windowsForDeadline(secs) : null;
+  }
   const commit = durationSecs(form.custom.commit);
   const reveal = durationSecs(form.custom.reveal);
   const pick = durationSecs(form.custom.pick);
@@ -616,7 +760,7 @@ export function totalSecs(windows: Windows): number {
   return WINDOW_NAMES.reduce((sum, name) => sum + windows[name], 0);
 }
 
-/** `Commit 10m · Reveal 5m · Judging 10m · Fallback 10m`. */
+/** `Answer 10m · Open 5m · Pick 10m · Fallback 10m`. */
 export function windowsText(windows: Windows): string {
   return WINDOW_NAMES.map((name) => `${WINDOW_TEXT[name].label} ${spanText(windows[name])}`).join(
     " · ",
@@ -629,7 +773,7 @@ export function windowsText(windows: Windows): string {
  * can also publish the held-out checks with the scorecard; the task page does not publish them.
  */
 export const VERIFIER_PICKS_WITH_MCP =
-  "The verifier picks on the task page, or with Tender's MCP tools (pick_winners).";
+  "The checker picks on the task page, or with Tender's MCP tools (pick_winners).";
 
 /**
  * The note on the rubric and the Judge: how the Judge scores a rubric task (plan 05, task 5), and
@@ -641,16 +785,24 @@ export const RUBRIC_JUDGE_NOTE =
 /**
  * The line under the note: what happens to the entries after the first ones. The Judge scores the
  * first `RUBRIC_MAX_ENTRIES` entries of a rubric task in the order they were committed (P05-R21).
- * An open task has no entry limit of its own, and is what the wizard posts: it sends `max_entries`
- * 0 and no invites, which `rubricEntriesProblem` accepts.
+ * An open task has no entry limit of its own (`max_entries` 0 and no invites); an invite-only one
+ * takes at most as many as are invited, 20 at the most. `rubricEntriesProblem` accepts both.
  */
 export const RUBRIC_JUDGE_LIMIT = `The Judge scores the first ${RUBRIC_MAX_ENTRIES} entries.`;
 
 export function checkReward(
   form: PostForm,
-  options: { limits: PostLimits; judgeAccount: string | null },
+  options: {
+    limits: PostLimits;
+    judgeAccount: string | null;
+    /** The account that will post, when a wallet is connected: it can't invite itself. */
+    poster?: string | null;
+    /** Now, in ms, for the deadline; now unless said. */
+    nowMs?: number;
+  },
 ): Errors {
   const { limits, judgeAccount } = options;
+  const nowMs = options.nowMs ?? Date.now();
   const errors: Errors = {};
 
   if (limits.paused) errors.form = "Tender isn't taking new tasks right now.";
@@ -669,7 +821,62 @@ export function checkReward(
     }
   }
 
-  if (form.preset === "custom") {
+  if (form.timing === "deadline") {
+    const at = deadlineMs(form.deadline);
+    const secs = at === null ? null : Math.floor((at - nowMs) / 1000);
+    const windows = secs === null || secs <= 0 ? null : windowsForDeadline(secs);
+    if (at === null) {
+      errors.deadline = "Pick a date and a time.";
+    } else if (secs === null || secs < limits.minWindowSecs) {
+      errors.deadline = `Pick a time at least ${spanText(limits.minWindowSecs)} from now.`;
+    } else if (secs > limits.maxWindowSecs) {
+      errors.deadline = `Pick a time within ${spanText(limits.maxWindowSecs)} from now.`;
+    } else if (
+      windows !== null &&
+      WINDOW_NAMES.some(
+        (name) => windows[name] < limits.minWindowSecs || windows[name] > limits.maxWindowSecs,
+      )
+    ) {
+      errors.deadline = `The windows after this deadline are outside what the network takes, from ${spanText(limits.minWindowSecs)} to ${spanText(limits.maxWindowSecs)}. Set each one under More options.`;
+    }
+  }
+
+  if (form.verifier === "judge" && judgeAccount === null) {
+    errors.verifier = "The Tender Judge isn't set up for this site. Pick another checker.";
+  }
+  if (form.verifier === "other" && !AccountIdSchema.safeParse(form.otherVerifier.trim()).success) {
+    errors.otherVerifier = "Enter a NEAR account, like name.near.";
+  }
+
+  // Who can enter, by the contract's rules (`check_invited`, `E_LIMIT`): at most `MAX_INVITED`
+  // accounts, each once, and never the poster or the checker, who cannot enter their own task.
+  const invited = invitedOf(form);
+  const checker =
+    form.verifier === "judge"
+      ? judgeAccount
+      : form.verifier === "other"
+        ? form.otherVerifier.trim()
+        : (options.poster ?? null);
+  const bad = invited.find((account) => !AccountIdSchema.safeParse(account).success);
+  const twice = invited.find((account, at) => invited.indexOf(account) !== at);
+  if (bad !== undefined) {
+    errors.invited = `"${bad}" is not a NEAR account. Write one account to a line, like name.near.`;
+  } else if (invited.length > MAX_INVITED) {
+    errors.invited = `Invite ${MAX_INVITED} agents at most.`;
+  } else if (twice !== undefined) {
+    errors.invited = `${twice} is listed twice.`;
+  } else if (options.poster != null && invited.includes(options.poster)) {
+    errors.invited = "You can't invite yourself: a poster can't enter their own task.";
+  } else if (checker !== null && invited.includes(checker)) {
+    errors.invited = `${checker} checks the work, so it can't be invited.`;
+  }
+  const most = maxEntriesOf(form);
+  if (invited.length > 0 && (!Number.isSafeInteger(most) || most < 1 || most > 0xffff_ffff)) {
+    errors.maxEntries = "Use a whole number above 0, or leave it empty.";
+  } else if (form.kind === "rubric" && most > RUBRIC_MAX_ENTRIES) {
+    errors.maxEntries = RUBRIC_WORDS.entries;
+  }
+  if (form.timing === "custom") {
     for (const name of WINDOW_NAMES) {
       const secs = durationSecs(form.custom[name]);
       const key = `window-${name}`;
@@ -679,21 +886,6 @@ export function checkReward(
       else if (secs > limits.maxWindowSecs)
         errors[key] = `At most ${spanText(limits.maxWindowSecs)}.`;
     }
-  } else {
-    const windows = PRESET_WINDOWS[form.preset];
-    const out = WINDOW_NAMES.some(
-      (name) => windows[name] < limits.minWindowSecs || windows[name] > limits.maxWindowSecs,
-    );
-    if (out) {
-      errors.preset = `A window of this choice is outside what the network takes, from ${spanText(limits.minWindowSecs)} to ${spanText(limits.maxWindowSecs)}. Use Custom to set your own.`;
-    }
-  }
-
-  if (form.verifier === "judge" && judgeAccount === null) {
-    errors.verifier = "The Tender Judge isn't set up for this site. Pick another verifier.";
-  }
-  if (form.verifier === "other" && !AccountIdSchema.safeParse(form.otherVerifier.trim()).success) {
-    errors.otherVerifier = "Enter a NEAR account, like name.near.";
   }
   return errors;
 }
@@ -878,7 +1070,7 @@ function checkedCriteria(form: PostForm): Checked<PublicCriteria> {
   if (!parsed.success) {
     throw new DocumentError(`The public checks do not fit: ${fault(parsed.error)}.`);
   }
-  // The last check, by the rules the Judge turns a rubric task down by at intake, so that a step
+  // The last check, by the rules the Judge turns a rubric task down by at intake, so that a form
   // that drifts from them cannot send what the Judge will refuse once the reward is in.
   if (parsed.data.kind === "rubric") {
     const problem = rubricCriteriaProblem(parsed.data);
@@ -913,7 +1105,7 @@ function documentWords(error: unknown): string {
  * on chain: the brief, the public criteria, and the held-out checks if there are any. Each is
  * checked against the shared schema, and the held-out against the criteria, so that what is
  * uploaded is what the API and the Judge accept. Throws a `DocumentError` if the form cannot be
- * made into them. The steps of the wizard make the same documents (without the hashes) to say what
+ * made into them. The form's checks make the same documents (without the hashes) to say what
  * is wrong with their own part of the form, so this is the last check and not the first.
  */
 export function buildDocuments(form: PostForm): PostDocuments {
@@ -990,16 +1182,21 @@ function verifierOf(form: PostForm, judgeAccount: string | null): string | undef
 
 /**
  * The NEAR, in yoctoNEAR, that a `storage_deposit` has to add so that `storage` pays for a post, and
- * for the vault slot of the token as well if the post `opensSlot`; 0 if it already does. Only the
- * `available` of the view is read by `storageShortfall`.
+ * for the vault slot of the token as well if the post `opensSlot`, and for its invite list; 0 if it
+ * already does. Only the `available` of the view is read by `storageShortfall`.
  *
  * `storage` is null for an account that has never deposited. Its first `storage_deposit` registers
  * it, which costs bytes of its own, so the answer is the price of both (`storageShortfall` works it
  * out, with the 0.01 NEAR a first deposit has to be at least), and the account is set up in the
  * same approval as the post.
  */
-export function storageTopUpFor(storage: StorageBalance | null, opensSlot: boolean): bigint {
-  const bytes = opensSlot ? POST_TASK_BYTES + VAULT_SLOT_BYTES : POST_TASK_BYTES;
+export function storageTopUpFor(
+  storage: StorageBalance | null,
+  opensSlot: boolean,
+  /** The bytes of an invite list, beyond the task the figure is for (`inviteBytes`). */
+  extraBytes = 0n,
+): bigint {
+  const bytes = (opensSlot ? POST_TASK_BYTES + VAULT_SLOT_BYTES : POST_TASK_BYTES) + extraBytes;
   if (storage === null) return storageShortfall(null, bytes);
   return storageShortfall(
     { total: storage.total.toString(), available: storage.available.toString(), used_bytes: "0" },
@@ -1022,8 +1219,9 @@ const opensVaultSlot = (vaultBalance: bigint): boolean => vaultBalance === 0n;
  * so the storage and the vault hold what the task needs when it is posted. `uris.brief` is where
  * the brief was uploaded, and `hashes` are those of `buildDocuments`. The form was checked before;
  * this checks again what a mistake would cost, and throws a `RangeError` for a reward that is no
- * amount, windows that are no durations, a verifier that is no account, a hash or an address that
- * is no good, or a negative vault balance.
+ * amount, windows that are no durations (a deadline that has passed), a verifier that is no
+ * account, an invite list the contract would refuse by its length or its accounts, a hash or an
+ * address that is no good, or a negative vault balance.
  */
 export function planPostCalls(o: {
   form: PostForm;
@@ -1041,12 +1239,15 @@ export function planPostCalls(o: {
   tokenId: string;
   /** The Judge's account, for a form that picks the Judge as verifier. */
   judgeAccount?: string | null;
+  /** Now, in ms, which a deadline's commit window runs from; now unless said. */
+  nowMs?: number;
 }): TenderCall[] {
   const { form, uris, hashes, vaultBalance, contractId, tokenId } = o;
   const reward = rewardOf(form, tokenId);
   if (reward === null) throw new RangeError("the reward is not an amount");
   if (vaultBalance < 0n) throw new RangeError("the vault balance is negative");
-  const windows = windowsOf(form);
+  // From a deadline, the commit window runs from now: the time the calls are made.
+  const windows = windowsOf(form, o.nowMs);
   if (windows === null) throw new RangeError("the windows are not durations");
   const verifier = verifierOf(form, o.judgeAccount ?? null);
   const uriBytes = new TextEncoder().encode(uris.brief).length;
@@ -1055,6 +1256,18 @@ export function planPostCalls(o: {
   }
   for (const hash of [hashes.briefHash, hashes.criteriaHash, hashes.heldoutCommitment]) {
     if (hash !== null && !HASH.test(hash)) throw new RangeError("a hash is not a SHA-256");
+  }
+
+  const invited = invitedOf(form);
+  const maxEntries = maxEntriesOf(form);
+  if (
+    invited.length > MAX_INVITED ||
+    invited.some((account) => !AccountIdSchema.safeParse(account).success) ||
+    !Number.isSafeInteger(maxEntries) ||
+    maxEntries < 0 ||
+    maxEntries > 0xffff_ffff
+  ) {
+    throw new RangeError("the invite list or the entry limit is not one the contract takes");
   }
 
   const post = postTaskCall(contractId, {
@@ -1069,9 +1282,13 @@ export function planPostCalls(o: {
     revealSecs: windows.reveal,
     pickSecs: windows.pick,
     fallbackSecs: windows.fallback,
+    maxEntries,
+    invited,
   });
   const topUp =
-    o.storage === undefined ? 0n : storageTopUpFor(o.storage, opensVaultSlot(vaultBalance));
+    o.storage === undefined
+      ? 0n
+      : storageTopUpFor(o.storage, opensVaultSlot(vaultBalance), inviteBytes(form));
   return [
     ...(topUp > 0n ? [storageDepositCall(contractId, topUp)] : []),
     ...(vaultBalance < reward ? [depositCall(tokenId, contractId, reward - vaultBalance)] : []),
@@ -1102,12 +1319,18 @@ export interface Funding {
  * is topped up in the same batch (`planPostCalls`), and `storageTopUp` says how much; an account
  * that has never set up its storage is set up there too, so it is not turned away.
  */
-export function fundingOf(data: VaultData, token: string, reward: bigint): Funding {
+export function fundingOf(
+  data: VaultData,
+  token: string,
+  reward: bigint,
+  /** The bytes of the task's invite list (`inviteBytes`); none unless said. */
+  extraBytes = 0n,
+): Funding {
   const row = data.rows.find((candidate) => candidate.token === token);
   const inVault = row?.vault ?? 0n;
   const toDeposit = reward > inVault ? reward - inVault : 0n;
   const inWallet = row?.wallet ?? null;
-  const storageTopUp = storageTopUpFor(data.storage, opensVaultSlot(inVault));
+  const storageTopUp = storageTopUpFor(data.storage, opensVaultSlot(inVault), extraBytes);
 
   let problem: string | null = null;
   if (toDeposit > 0n && row?.enabled !== true) {

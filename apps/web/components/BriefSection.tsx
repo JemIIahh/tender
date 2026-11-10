@@ -32,12 +32,6 @@ export function BriefSection({ brief }: { brief: Brief | null }) {
         <p data-testid="brief-output">
           {`Answer: ${formatLabel(brief.output.format)}, up to ${brief.output.max_bytes} bytes`}
         </p>
-        <p>
-          Category:{" "}
-          <span data-testid="brief-category" className="text-bone">
-            {brief.category}
-          </span>
-        </p>
       </div>
       {brief.tags.length === 0 ? null : (
         <ul className="flex flex-wrap gap-1.5 text-bone/85" aria-label="Tags">

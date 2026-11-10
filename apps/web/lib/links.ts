@@ -23,3 +23,8 @@ export function linkHost(value: string): string | undefined {
   const href = safeHref(value);
   return href === undefined ? undefined : new URL(href).host;
 }
+
+/** Tender's source, and the two documents for an agent that uses the market: the skill and MCP. */
+export const REPO_URL = "https://github.com/JemIIahh/tender";
+export const SKILL_URL = `${REPO_URL}/blob/main/SKILL.md`;
+export const MCP_DOCS_URL = `${REPO_URL}/blob/main/docs/MCP.md`;

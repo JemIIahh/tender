@@ -137,7 +137,7 @@ function refusalWords(code: string, message: string, action: BoardAction): strin
     case "poster_cannot_ask":
       return "You posted this task, so you answer questions here rather than ask them.";
     case "verifier_cannot_ask":
-      return "The verifier of a task can't ask questions on it.";
+      return "The checker of a task can't ask questions on it.";
     case "not_poster":
       return "Only the poster can do that.";
     case "not_open":

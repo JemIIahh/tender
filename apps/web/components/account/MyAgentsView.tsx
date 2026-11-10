@@ -8,18 +8,19 @@ import {
   combinedRecord,
   readMyAgents,
 } from "../../lib/account";
+import { agentName } from "../../lib/agents";
 import type { AgentRecord } from "../../lib/api";
 import { useLoad } from "../../lib/useLoad";
 import { useWallet } from "../../lib/wallet";
-import { UNNAMED_AGENT } from "../AgentFacts";
 import { Avatar } from "../Avatar";
+import { EmptyState } from "../EmptyState";
 import { ErrorState } from "../ErrorState";
 import { PageHead } from "../PageHead";
 import { ListSkeleton } from "../SkeletonLists";
 import { TeamBadge } from "../TeamBadge";
 import { CARD, EYEBROW, FACT_LABEL, PANEL_TITLE, PRIMARY, TAG } from "../ui";
 import { ImplicitAgents } from "./ImplicitAgents";
-import { ArtCard, Chip, ConnectGate, Stat, Stats, Tokens } from "./parts";
+import { Chip, ConnectGate, Stat, Stats, Tokens } from "./parts";
 import { ServicesSection } from "./ServicesSection";
 
 // My agents: the agents the connected account runs, as a provider (ASP) sees them. They are the
@@ -104,7 +105,7 @@ function AgentRow({ agent, self }: { agent: AgentRecord; self: boolean }) {
               href={`/agents/${agent.account}`}
               className="min-w-0 rounded-sm wrap-anywhere after:absolute after:inset-0 after:content-['']"
             >
-              {agent.name ?? UNNAMED_AGENT}
+              {agentName(agent)}
             </Link>
           </h3>
           <p className="text-muted" data-testid="my-agent-account">
@@ -218,16 +219,18 @@ const ADD = "/my-agents/new";
 
 function NoAgents() {
   return (
-    <ArtCard art="scorecard" focus={{ x: 0.72, y: 0.32, scale: 0.4 }} testId="no-agents">
-      <p className="max-w-sm text-2xl font-semibold tracking-tight text-bone">No agents yet</p>
-      <p className="max-w-md text-[15px] leading-relaxed text-muted">
-        An agent gets an account under yours, made with a key that stays where the agent runs. Then
-        it registers itself and starts entering tasks.
-      </p>
-      <Link href={ADD} className={PRIMARY}>
-        Add an agent
-      </Link>
-    </ArtCard>
+    <EmptyState
+      testId="no-agents"
+      title="No agents yet"
+      action={
+        <Link href={ADD} className={PRIMARY}>
+          Add an agent
+        </Link>
+      }
+    >
+      An agent gets an account under yours, made with a key that stays where the agent runs. Then it
+      registers itself and starts entering tasks.
+    </EmptyState>
   );
 }
 
@@ -292,17 +295,11 @@ export function MyAgentsView() {
   const wallet = useWallet();
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
-      <PageHead
-        eyebrow="Agents"
-        title="My agents."
-        muted="What they entered, won and earned."
-        art={{ name: "scale", focus: { x: 0.62, y: 0.55, scale: 0.42 } }}
-      >
+      <PageHead title="My agents." muted="What they entered, won and earned.">
         Your agent service provider (ASP) dashboard: your agents, as their provider.
       </PageHead>
       <ConnectGate
         wallet={wallet}
-        art="scorecard"
         why="Connect a wallet to see the agents it runs: the account itself, if it is registered, and the agents under it."
       >
         {(account) => <Agents account={account} />}

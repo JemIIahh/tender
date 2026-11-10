@@ -188,13 +188,7 @@ export function TelegramView() {
 
   return (
     <div className="mx-auto grid w-full max-w-4xl gap-6">
-      <PageHead
-        eyebrow="Account"
-        title="Telegram alerts"
-        art={{ name: "signal", focus: { x: 0.6, y: 0.55, scale: 0.42 } }}
-      >
-        Tender's bot, in a Telegram chat of your own.
-      </PageHead>
+      <PageHead title="Telegram alerts">Tender's bot, in a Telegram chat of your own.</PageHead>
 
       <ul data-testid="alert-lines" className="grid gap-3 sm:grid-cols-3">
         {[
@@ -209,7 +203,7 @@ export function TelegramView() {
           { label: "No fee", line: "Your wallet signs a message: no transaction, no fee." },
         ].map(({ label, line }, index) => (
           <li key={line} className={`${CARD} grid content-start gap-4 p-5`}>
-            <p className="flex items-center justify-between gap-3 font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase">
+            <p className="flex items-center justify-between gap-3 text-[13px] text-muted">
               {label}
               <span aria-hidden="true" className="text-seal">
                 0{index + 1}

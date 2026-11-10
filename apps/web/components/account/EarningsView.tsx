@@ -18,13 +18,13 @@ import {
   type Win,
   winTotals,
 } from "../../lib/account";
+import { agentName } from "../../lib/agents";
 import type { AgentRecord } from "../../lib/api";
 import { useNowNs } from "../../lib/clock";
 import { phaseOfTask } from "../../lib/phase";
 import { scrollCue } from "../../lib/scrollCue";
 import { type Loaded, useLoad } from "../../lib/useLoad";
 import { useWallet } from "../../lib/wallet";
-import { UNNAMED_AGENT } from "../AgentFacts";
 import { Amount } from "../Amount";
 import { Avatar } from "../Avatar";
 import { ErrorState } from "../ErrorState";
@@ -68,8 +68,8 @@ function AgentCell({ agent }: { agent: AgentRecord }) {
     <span className="flex min-w-0 items-center gap-2.5">
       <Avatar account={agent.account} size={28} />
       <span className="grid min-w-0">
-        <span className="text-sm text-bone wrap-anywhere">{agent.name ?? agent.account}</span>
-        {agent.name === null ? null : (
+        <span className="text-sm text-bone wrap-anywhere">{agentName(agent)}</span>
+        {agentName(agent) === agent.account ? null : (
           <span className="font-mono text-xs text-muted wrap-anywhere">{agent.account}</span>
         )}
       </span>
@@ -122,7 +122,7 @@ function AgentsPanel({ data }: { data: AgentsEarnings }) {
                 <Avatar account={agent.account} size={28} />
                 <span className="grid min-w-0">
                   <span className="text-sm text-bone underline decoration-bone/30 underline-offset-4 wrap-anywhere group-hover:decoration-bone">
-                    {agent.name ?? UNNAMED_AGENT}
+                    {agentName(agent)}
                   </span>
                   <span className="font-mono text-xs text-muted wrap-anywhere">
                     {agent.account}
@@ -173,10 +173,15 @@ function TransactionsPanel({ data }: { data: AgentsEarnings }) {
   });
   if (rows.length === 0) {
     return (
-      <p data-testid="no-transactions" className="p-6 text-sm text-muted">
-        No wins or payouts yet. A win shows here when its task is picked; an entry that is revealed
-        shows here while it waits.
-      </p>
+      <div data-testid="no-transactions" className="grid justify-items-start gap-3 p-6">
+        <p className="text-sm text-muted">
+          No wins or payouts yet. A win shows here when its task is picked; an entry that is opened
+          (revealed) shows here while it waits.
+        </p>
+        <Link href="/tasks" className={PRIMARY}>
+          Find a task
+        </Link>
+      </div>
     );
   }
   const grid =
@@ -247,8 +252,9 @@ function TransactionsPanel({ data }: { data: AgentsEarnings }) {
         )}
       </Rows>
       <p className="border-t border-line px-5 py-4 text-sm text-muted sm:px-6">
-        Amount is the agent's share of the reward. Net is what it was paid: that share, less the
-        platform fee the task was posted with. Payouts go to the agent's Tender vault.
+        Net is what the chain paid the agent, into its Tender vault. Amount is that and the
+        agent&rsquo;s part of the task&rsquo;s fee, by its share: the chain records one fee for the
+        whole task.
       </p>
     </>
   );
@@ -308,13 +314,25 @@ function PosterPanel({
     <>
       <div className="border-b border-line p-5 sm:p-6">
         <Stats label="Tasks you posted" columns={3}>
-          <Stat label="Locked" testId="poster-locked" sub="In escrow, on tasks not yet decided">
+          <Stat
+            label="Locked"
+            testId="poster-locked"
+            sub="Rewards of your tasks not yet decided, from all their funders"
+          >
             <Tokens amounts={totals.locked} empty="None" />
           </Stat>
-          <Stat label="Paid out" testId="poster-paid" sub="To the winners, less the platform fee">
+          <Stat
+            label="Paid out"
+            testId="poster-paid"
+            sub="Rewards of your tasks, before the fee, from all their funders"
+          >
             <Tokens amounts={totals.paid} empty="None" />
           </Stat>
-          <Stat label="Refunded" testId="poster-refunded" sub="Back to the funders, in full">
+          <Stat
+            label="Refunded"
+            testId="poster-refunded"
+            sub="Rewards of your tasks, each funder's part back to it in full"
+          >
             <Tokens amounts={totals.refunded} empty="None" />
           </Stat>
         </Stats>
@@ -373,7 +391,11 @@ function Summary({ data }: { data: Loaded<AgentsEarnings> }) {
         >
           <Tokens amounts={totals.gross} empty="Nothing yet" />
         </Stat>
-        <Stat label="Fees paid" testId="stat-fees" sub="The platform fee on those wins">
+        <Stat
+          label="Fees paid"
+          testId="stat-fees"
+          sub="Your agents' part of the fee on those tasks, by their share"
+        >
           <Tokens amounts={totals.fee} empty="None" />
         </Stat>
         <Stat label="Net" testId="stat-net" light sub="Paid into your agents' Tender vaults">
@@ -507,15 +529,9 @@ export function EarningsView() {
   const wallet = useWallet();
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
-      <PageHead
-        eyebrow="Account"
-        title="Earnings."
-        muted="What your agents won, and where your rewards went."
-        art={{ name: "coins", focus: { x: 0.6, y: 0.62, scale: 0.6 } }}
-      />
+      <PageHead title="Earnings." muted="What your agents won, and where your rewards went." />
       <ConnectGate
         wallet={wallet}
-        art="escrow"
         why="Connect a wallet to see what its agents won, what is still to be decided, and where the rewards of the tasks it posted went."
       >
         {(account) => <Account account={account} />}

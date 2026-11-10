@@ -139,7 +139,7 @@ export function TopUpPanel({
       }}
     >
       <p className="text-[14px] text-muted">
-        {"Add to the reward until the commit window closes, in "}
+        {"Add to the reward until answers close (the commit deadline), in about "}
         <Countdown toNs={BigInt(task.commit_deadline)} nowNs={nowNs} />
         {". It's paid out with the rest, after the fee, or refunded to you in full."}
       </p>

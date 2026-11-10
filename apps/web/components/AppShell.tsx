@@ -12,15 +12,14 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
 import { restoreSidebar, setRail, sidebarStore } from "../lib/sidebar";
 import { walletStore } from "../lib/wallet";
-import { LiveStatus } from "./LiveStatus";
+import { AccountGroup, BAR_PILL } from "./AccountPill";
 import { Mark } from "./Mark";
 import { Nav, type TipHandlers } from "./Nav";
-import { PRIMARY, SECONDARY } from "./ui";
-
-/** The pills of the top bar: the landing's, a little smaller so that both fit a phone. */
-const BAR_PILL = "min-h-10 px-3.5 whitespace-nowrap sm:px-4";
+import { SidebarLive } from "./SidebarLive";
+import { PRIMARY } from "./ui";
 
 /** Laptop width, from which the sidebar is a sidebar (and can be the rail) and not a menu. */
 const WIDE = "(min-width: 64rem)";
@@ -118,11 +117,12 @@ function PanelIcon() {
 const FADE = "transition-[opacity,visibility] duration-200 motion-reduce:transition-none";
 
 /**
- * The frame of every page after the landing: a sidebar with the pages, a top bar with the Live
- * pill (components/LiveStatus: whether the index is up to date, and a few figures behind it),
- * "Post task" and the way to the wallet (the connected account, once a page has connected one),
- * and the page itself. On a phone the sidebar is a menu that the top bar opens, over the page, and
- * that closes when a page is chosen.
+ * The frame of every page after the landing: a sidebar with the pages and, pinned under them, the
+ * Live block (components/SidebarLive: a few of the platform's figures and the way to Metrics); a
+ * top bar with "Post task" and the account group (components/AccountPill: whether the index is up
+ * to date, the network, and the way to the wallet, which is the connected account once a page has
+ * connected one); and the page itself. On a phone the sidebar is a menu that the top bar opens,
+ * over the page, and that closes when a page is chosen.
  *
  * From laptop width up, the button at the head of the sidebar, or ⌘B (Ctrl+B), makes the sidebar a
  * narrow rail of icons and back (lib/sidebar.ts keeps the choice). On the rail each icon has its
@@ -145,14 +145,18 @@ export function AppShell({ children }: { children: ReactNode }) {
   // The two places of the wordmark: the sidebar's head, and the top bar, where it is on the rail.
   const sideMark = useRef<HTMLDivElement>(null);
   const barMark = useRef<HTMLDivElement>(null);
-  // The wallet as far as this tab knows it, without looking for one: a page that needs the wallet
-  // starts the store (lib/wallet.ts), and the board, say, does not load a wallet only for the top
-  // bar. Until then, and while none is connected, the pill offers to connect one.
-  const { accountId } = useSyncExternalStore(
+  // The wallet as this tab knows it. The shell starts the store once it is in the browser, so that
+  // every page takes up the wallet of an earlier visit (silently: a restore opens no window); the
+  // wallet library loads then, after the page. Until the store knows (`ready`), the pill is a
+  // placeholder, so that a page that is about to show the account never shows Connect first.
+  const { ready, accountId } = useSyncExternalStore(
     walletStore.subscribe,
     walletStore.getSnapshot,
     walletStore.getServerSnapshot,
   );
+  useEffect(() => {
+    void walletStore.start();
+  }, []);
   // Whether the sidebar is the rail. The page's look follows the root element's attribute in CSS;
   // this is for the toggle's state and words.
   const rail = useSyncExternalStore(
@@ -279,7 +283,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     <div className="app min-h-svh bg-ink text-bone lg:grid lg:grid-cols-[15rem_minmax(0,1fr)] lg:grid-rows-[auto_1fr] lg:transition-[grid-template-columns] lg:duration-200 lg:ease-[cubic-bezier(0.32,0.72,0,1)] lg:motion-reduce:transition-none lg:rail:grid-cols-[4rem_minmax(0,1fr)]">
       <a
         href="#main"
-        className="sr-only z-50 rounded-full bg-bone px-4 py-2 font-mono text-[11px] tracking-[0.12em] text-ink uppercase focus:not-sr-only focus:fixed focus:top-3 focus:left-3"
+        className="sr-only z-50 rounded-full bg-bone px-4 py-2 text-[13px] font-medium text-ink focus:not-sr-only focus:fixed focus:top-3 focus:left-3"
       >
         Skip to the page
       </a>
@@ -324,35 +328,18 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div ref={barMark} data-testid="bar-wordmark" className="lg:hidden lg:rail:block">
           <Wordmark />
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          <LiveStatus />
+        <div className="ml-auto flex min-w-0 items-center gap-2">
           <Link href="/post" className={`${PRIMARY} ${BAR_PILL}`}>
             Post task
           </Link>
-          {/* On a phone the Live dot takes some of the bar, so the pill says "Connect", and an
-              account is cut a little shorter; the names and the title are whole. */}
-          {accountId === null ? (
-            <Link href="/wallet" aria-label="Connect wallet" className={`${SECONDARY} ${BAR_PILL}`}>
-              Connect<span className="max-sm:hidden">{"\u00a0"}wallet</span>
-            </Link>
-          ) : (
-            <Link
-              href="/wallet"
-              title={accountId}
-              className={`${SECONDARY} ${BAR_PILL} max-w-[7.5rem] sm:max-w-60`}
-            >
-              <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-seal" />
-              {/* The account as it is written: an account id is lower case. */}
-              <span className="truncate text-xs tracking-normal normal-case">{accountId}</span>
-            </Link>
-          )}
+          <AccountGroup ready={ready} accountId={accountId} />
         </div>
       </header>
 
       <aside
         id={menuId}
         data-open={open}
-        className="fixed inset-x-0 top-16 bottom-0 z-20 hidden flex-col gap-8 overflow-x-hidden overflow-y-auto border-t border-line bg-ink px-4 pt-6 pb-8 data-[open=true]:flex sm:px-8 lg:sticky lg:top-0 lg:col-start-1 lg:row-span-2 lg:row-start-1 lg:flex lg:h-svh lg:border-t-0 lg:px-3 lg:pt-0 lg:pb-6"
+        className="fixed inset-x-0 top-16 bottom-0 z-20 hidden flex-col gap-4 overflow-hidden border-t border-line bg-ink px-4 pt-4 pb-5 data-[open=true]:flex sm:px-8 lg:sticky lg:top-0 lg:col-start-1 lg:row-span-2 lg:row-start-1 lg:flex lg:h-svh lg:border-t-0 lg:px-3 lg:pt-0 lg:pb-4"
       >
         <div className="hidden h-16 shrink-0 items-center gap-1.5 lg:flex">
           {/* Its name is what it controls, and stays the same as it is pressed; `aria-expanded` says
@@ -380,7 +367,12 @@ export function AppShell({ children }: { children: ReactNode }) {
             <Wordmark />
           </div>
         </div>
-        <Nav tip={linkTip} />
+        {/* The links scroll on their own when the window is short; the Live block stays in view. The
+            gutter leaves room for a link's focus ring, which the scrolling box would cut off. */}
+        <div className="-mx-1.5 min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-1.5 py-1">
+          <Nav tip={linkTip} />
+        </div>
+        <SidebarLive tip={linkTip} />
       </aside>
 
       {/* Under the open menu, the page is out of reach of the keyboard and the pointer alike. */}
@@ -390,6 +382,21 @@ export function AppShell({ children }: { children: ReactNode }) {
         className="min-w-0 border-line px-4 pt-8 pb-16 sm:px-8 lg:col-start-2 lg:row-start-2 lg:border-l"
       >
         {children}
+        <footer className="mx-auto mt-20 flex w-full max-w-[1400px] flex-wrap items-center gap-x-6 gap-y-1 border-t border-line pt-5 text-[13px] text-muted">
+          {[
+            [SKILL_URL, "Agent guide"],
+            [MCP_DOCS_URL, "MCP server docs"],
+            [REPO_URL, "Source code"],
+          ].map(([href, label]) => (
+            <a
+              key={label}
+              href={href}
+              className="inline-flex min-h-10 items-center transition-colors hover:text-bone motion-reduce:transition-none"
+            >
+              {label}
+            </a>
+          ))}
+        </footer>
       </main>
 
       {/* The tooltip says again what a screen reader is told already, so it is hidden from one: a

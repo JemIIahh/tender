@@ -13,11 +13,12 @@ import { Avatar, avatarCells } from "../components/Avatar";
 const pathname = vi.hoisted(() => ({ current: "/tasks" }));
 vi.mock("next/navigation", () => ({ usePathname: () => pathname.current }));
 
-// The wallet as the top bar reads it: a store that nothing here starts, with the account a test
-// sets. The real one (lib/wallet.ts) would look for near-connect.
+// The wallet as the top bar reads it: a store whose start is counted and does nothing, with the
+// state a test sets. The real one (lib/wallet.ts) would look for near-connect.
 const wallet = vi.hoisted(() => ({
   state: { ready: true, accountId: null as string | null, canSignMessage: true },
   listeners: new Set<() => void>(),
+  starts: 0,
 }));
 vi.mock("../lib/wallet", () => ({
   walletStore: {
@@ -27,6 +28,9 @@ vi.mock("../lib/wallet", () => ({
     },
     getSnapshot: () => wallet.state,
     getServerSnapshot: () => wallet.state,
+    start: async () => {
+      wallet.starts++;
+    },
   },
 }));
 
@@ -46,7 +50,8 @@ function fakeApi(routes: Record<string, () => Response>): string[] {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  wallet.state = { ...wallet.state, accountId: null };
+  wallet.state = { ...wallet.state, ready: true, accountId: null };
+  wallet.starts = 0;
 });
 
 test("shell_has_the_page_the_post_pill_and_the_way_to_the_wallet", () => {
@@ -89,6 +94,62 @@ test("shell_top_bar_names_the_connected_account_once_the_tab_has_one", () => {
   });
   expect(banner.queryByRole("link", { name: "Connect wallet" })).toBeNull();
   expect(banner.getByRole("link", { name: "alice.testnet" }).getAttribute("href")).toBe("/wallet");
+  // Beside it, a button that copies the account.
+  expect(banner.getByRole("button", { name: "Copy account" })).toBeTruthy();
+});
+
+test("shell_starts_the_wallet_and_shows_no_connect_until_it_knows", () => {
+  fakeApi({});
+  wallet.state = { ...wallet.state, ready: false, accountId: null };
+  render(
+    <AppShell>
+      <p>The page</p>
+    </AppShell>,
+  );
+  const banner = within(screen.getByRole("banner"));
+  // The shell looks for the wallet of an earlier visit on every page.
+  expect(wallet.starts).toBe(1);
+
+  // Not ready: a placeholder of the pill, which says what it is, and no Connect.
+  const checking = banner.getByRole("status", { name: "Checking your wallet" });
+  expect(checking.className).toContain("animate-pulse");
+  expect(checking.className).toContain("motion-reduce:animate-none");
+  expect(banner.queryByRole("link", { name: "Connect wallet" })).toBeNull();
+
+  // Ready with no account: Connect wallet, and the placeholder is gone.
+  act(() => {
+    wallet.state = { ...wallet.state, ready: true, accountId: null };
+    for (const listener of wallet.listeners) listener();
+  });
+  expect(banner.queryByRole("status", { name: "Checking your wallet" })).toBeNull();
+  expect(banner.getByRole("link", { name: "Connect wallet" }).getAttribute("href")).toBe("/wallet");
+
+  // Ready with an account: the account's pill, and no Connect.
+  act(() => {
+    wallet.state = { ...wallet.state, ready: true, accountId: "alice.testnet" };
+    for (const listener of wallet.listeners) listener();
+  });
+  expect(banner.queryByRole("link", { name: "Connect wallet" })).toBeNull();
+  expect(banner.getByRole("link", { name: "alice.testnet" }).getAttribute("href")).toBe("/wallet");
+});
+
+test("shell_goes_straight_from_checking_to_the_account_with_no_connect_between", () => {
+  fakeApi({});
+  wallet.state = { ...wallet.state, ready: false, accountId: null };
+  render(
+    <AppShell>
+      <p>The page</p>
+    </AppShell>,
+  );
+  const banner = within(screen.getByRole("banner"));
+  expect(banner.getByRole("status", { name: "Checking your wallet" })).toBeTruthy();
+  // The store takes up the wallet of an earlier visit: the account, never Connect, comes next.
+  act(() => {
+    wallet.state = { ...wallet.state, ready: true, accountId: "alice.testnet" };
+    for (const listener of wallet.listeners) listener();
+  });
+  expect(banner.getByRole("link", { name: "alice.testnet" })).toBeTruthy();
+  expect(banner.queryByRole("link", { name: "Connect wallet" })).toBeNull();
 });
 
 test("shell_menu_opens_and_closes_the_sidebar_on_a_phone", async () => {

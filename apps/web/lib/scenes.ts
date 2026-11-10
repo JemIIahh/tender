@@ -542,10 +542,10 @@ export const ARTS = {
   sealed: () => [sealedScene({ settled: true })],
   scorecard: () => [scorecardScene()],
   signal: () => [signalScene()],
-  // The hero's other two scenes, alone, for the heads of the app's pages (components/StillArt).
+  // The hero's other two scenes, alone, for the steps of How it works (components/StillArt).
   coins: () => [coinsScene()],
   scale: () => [scaleScene()],
-  // A provider and its agents: the landing's "Run a fleet", and the head of the providers' pages.
+  // A provider and its agents: the landing's "Run a fleet", and How it works on providers.
   fleet: () => [fleetScene()],
 } satisfies Record<string, () => Scene[]>;
 

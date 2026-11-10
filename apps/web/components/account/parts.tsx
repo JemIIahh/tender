@@ -4,48 +4,16 @@ import Link from "next/link";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { ByToken } from "../../lib/account";
 import { UNTITLED_TASK } from "../../lib/copy";
-import type { Focus } from "../../lib/dither";
-import type { ArtName } from "../../lib/scenes";
 import { knownFirst, knowsToken } from "../../lib/tokens";
 import type { UseWallet } from "../../lib/wallet";
 import { walletErrorMessage } from "../../lib/walletErrors";
 import { Amount, RawUnits } from "../Amount";
-import { StillArt } from "../StillArt";
-import { CARD, EYEBROW, FACT_LABEL, PRIMARY, SECONDARY, TEXT_LINK } from "../ui";
+import { EmptyState } from "../EmptyState";
+import { EYEBROW, FACT_LABEL, PRIMARY, SECONDARY, TEXT_LINK } from "../ui";
 
 // The pieces the account pages (My agents, Add an agent, Earnings) are built from, in the app's
 // look: the state a page has before a wallet is connected, the stat blocks, the boxed empty state,
 // a command to copy, and amounts listed token by token.
-
-/** A card with one of the landing's arts behind its words, fading into the panel from the left. */
-export function ArtCard({
-  art,
-  focus,
-  children,
-  testId,
-}: {
-  art: ArtName;
-  focus: Focus;
-  children: ReactNode;
-  testId?: string;
-}) {
-  return (
-    <div
-      data-testid={testId}
-      className={`${CARD} relative isolate grid min-h-[24rem] content-end justify-items-start gap-4 overflow-hidden p-6 sm:min-h-72 sm:p-8`}
-    >
-      <StillArt art={art} focus={focus} className="absolute inset-0 -z-10 size-full" />
-      <div aria-hidden="true" className="scanlines absolute inset-0 -z-10" />
-      {/* On a phone the words are under the art, on a wider screen beside it: the ground under
-          them is solid either way. */}
-      <div
-        aria-hidden="true"
-        className="absolute inset-0 -z-10 bg-linear-to-t from-panel from-50% via-panel/80 via-65% to-panel/10 sm:bg-linear-to-r sm:from-panel sm:from-0% sm:via-panel/85 sm:via-50% sm:to-panel/10"
-      />
-      {children}
-    </div>
-  );
-}
 
 /**
  * The page before it knows the account: "Checking for your wallet…" while the wallet from an
@@ -56,13 +24,11 @@ export function ArtCard({
 export function ConnectGate({
   wallet,
   why,
-  art,
   children,
 }: {
   wallet: Pick<UseWallet, "ready" | "accountId" | "connect">;
   /** What connecting shows, in a sentence. */
   why: string;
-  art: ArtName;
   children: (accountId: string) => ReactNode;
 }) {
   const [waiting, setWaiting] = useState(false);
@@ -89,23 +55,23 @@ export function ConnectGate({
     }
   };
   return (
-    <ArtCard art={art} focus={{ x: 0.72, y: 0.3, scale: 0.36 }} testId="connect-gate">
-      <p className={EYEBROW}>
-        Not connected <span className="text-seal">&gt;</span>
-      </p>
-      <h2 className="max-w-md text-2xl font-semibold tracking-tight text-bone sm:text-3xl">
-        Connect your wallet
-      </h2>
-      <p className="max-w-md text-[15px] leading-relaxed text-muted">{why}</p>
-      <button type="button" aria-disabled={waiting} onClick={connect} className={PRIMARY}>
-        {waiting ? "Waiting for your wallet…" : "Connect wallet"}
-      </button>
+    <EmptyState
+      testId="connect-gate"
+      heading="h2"
+      title="Connect your wallet"
+      action={
+        <button type="button" aria-disabled={waiting} onClick={connect} className={PRIMARY}>
+          {waiting ? "Waiting for your wallet…" : "Connect wallet"}
+        </button>
+      }
+    >
+      <p>{why}</p>
       {failed === null ? null : (
-        <p role="alert" className="max-w-md text-sm text-seal">
+        <p role="alert" className="mt-2 text-sm text-seal">
           {failed}
         </p>
       )}
-    </ArtCard>
+    </EmptyState>
   );
 }
 
@@ -145,40 +111,39 @@ export function Tokens({
 }
 
 /**
- * A stat block: a label in mono capitals, the figure, and a line that says what it is. `light` is
- * the page's one cream block, for the figure the page is about.
+ * A stat block: a label, the figure, and a line that says what it is. `light` is the page's one
+ * cream block, for the figure the page is about. `wide` takes a whole row of a two-column grid,
+ * below the widest screens, for a figure that needs the room (an amount, an account).
  */
 export function Stat({
   label,
   children,
   sub,
   light = false,
+  wide = false,
   testId,
 }: {
   label: string;
   children: ReactNode;
   sub?: ReactNode;
   light?: boolean;
+  wide?: boolean;
   testId?: string;
 }) {
   return (
     <div
       data-testid={testId}
-      className={`grid min-w-0 content-start gap-3 rounded-2xl border p-5 ${
-        light ? "on-paper border-transparent bg-paper text-ink" : "border-line bg-panel text-bone"
-      }`}
+      className={`grid min-w-0 grid-cols-1 content-start gap-3 rounded-2xl border p-5 ${
+        wide ? "max-xl:col-span-2" : ""
+      } ${light ? "on-paper border-transparent bg-paper text-ink" : "border-line bg-panel text-bone"}`}
     >
-      <dt
-        className={`font-mono text-[10.5px] tracking-[0.14em] uppercase ${light ? "text-neutral-700" : "text-muted"}`}
-      >
-        {label}
-      </dt>
-      <dd className="grid gap-2">
+      <dt className={`text-[13px] ${light ? "text-ink/70" : "text-muted"}`}>{label}</dt>
+      <dd className="grid min-w-0 grid-cols-1 gap-2">
         <div className="text-xl leading-tight font-medium tracking-[-0.02em] tabular-nums wrap-anywhere sm:text-2xl [&_.font-mono]:text-xs">
           {children}
         </div>
         {sub === undefined ? null : (
-          <p className={`text-[13px] leading-snug ${light ? "text-neutral-700" : "text-muted"}`}>
+          <p className={`text-[13px] leading-snug ${light ? "text-ink/70" : "text-muted"}`}>
             {sub}
           </p>
         )}
@@ -367,7 +332,7 @@ export function TaskCell({ taskId, title }: { taskId: string; title: string | nu
   );
 }
 
-/** A chip with a dot, in mono capitals, as the phase chip is. */
+/** A small chip with a dot, in the phase chip's small capitals: a status badge. */
 export function Chip({ children, dot = "bg-current" }: { children: ReactNode; dot?: string }) {
   return (
     <span className="inline-flex w-fit shrink-0 items-center gap-1.5 rounded-full border border-current/25 px-2.5 py-1 font-mono text-[10.5px] leading-none tracking-[0.12em] whitespace-nowrap uppercase">

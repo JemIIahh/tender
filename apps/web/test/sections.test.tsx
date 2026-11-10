@@ -546,10 +546,12 @@ test("brief_shows_the_summary_the_instructions_and_what_an_answer_must_look_like
   expect(screen.getByTestId("brief-output").textContent).toBe("Answer: JSON, up to 4096 bytes");
 });
 
-test("brief_shows_the_category_and_tags", () => {
+test("brief_shows_the_tags_and_no_category", () => {
   render(<BriefSection brief={detail().brief} />);
 
-  expect(screen.getByTestId("brief-category").textContent).toBe("extraction");
+  // Tender asks for no category when a task is posted, so none is shown.
+  expect(screen.queryByTestId("brief-category")).toBeNull();
+  expect(document.body.textContent).not.toMatch(/Category/);
   expect(screen.getAllByTestId("brief-tag").map((tag) => tag.textContent)).toEqual([
     "extraction",
     "json",

@@ -51,7 +51,14 @@ function TaskRow({ task }: { task: TaskSummary }) {
  * The tasks an agent posted, newest first, each with the task it is a subtask of, if it is one. It
  * is a section of the agent's page and fails on its own: the profile above it stays.
  */
-export function AgentLineage({ account }: { account: string }) {
+export function AgentLineage({
+  account,
+  heading: Heading = "h2",
+}: {
+  account: string;
+  /** The level of its title: h3 inside a section of the agent's page. */
+  heading?: "h2" | "h3";
+}) {
   const [lineage, setLineage] = useState<Lineage>({ status: "loading" });
   const latest = useRef(0);
 
@@ -80,7 +87,7 @@ export function AgentLineage({ account }: { account: string }) {
   return (
     <section data-testid="lineage" className={PANEL}>
       <div className="grid gap-1">
-        <h2 className={PANEL_TITLE}>Tasks it posted</h2>
+        <Heading className={PANEL_TITLE}>Tasks it posted</Heading>
         <p className="text-sm text-muted">Newest first. A subtask names the task it came from.</p>
       </div>
       {lineage.status === "loading" ? (

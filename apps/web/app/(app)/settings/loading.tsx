@@ -6,7 +6,7 @@ import { FormsSkeleton } from "../../../components/SkeletonDetail";
 export default function Loading() {
   return (
     <RouteSkeleton frame="mx-auto grid w-full max-w-4xl gap-6">
-      <HeadSkeleton art={false} title={["w-4/5"]} />
+      <HeadSkeleton title={["w-4/5"]} />
       <FormsSkeleton panels={3} />
     </RouteSkeleton>
   );

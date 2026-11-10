@@ -2,7 +2,7 @@
 
 import type { Service } from "@tender/shared";
 import Link from "next/link";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   type ActivityKind,
   type ActivityLine,
@@ -12,6 +12,7 @@ import {
   FILTERS,
   fromBacklog,
   fromStream,
+  groupLines,
   lineOf,
   mergeFeed,
   type Part,
@@ -27,7 +28,7 @@ import { Amount, RawUnits } from "./Amount";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
 import { FeedSkeleton } from "./SkeletonLists";
-import { CARD, SCROLL_CUE, TEXT_LINK } from "./ui";
+import { CARD, PRIMARY, SCROLL_CUE, TEXT_LINK } from "./ui";
 
 // Activity: what happens on Tender, one plain line an event, newest first. The page reads the API's
 // backlog of recent events once, then follows the event stream from the newest of them (the same
@@ -90,16 +91,111 @@ function useNowMs(): number {
   return now;
 }
 
-/** The mark at the start of a line: what kind of event it is, as a shape; the words say it too. */
-const MARKS: Record<ActivityKind, string> = {
-  posted: "bg-bone",
-  hired: "bg-bone",
-  entered: "border-[1.5px] border-muted",
-  revealed: "bg-muted",
-  paid: "bg-seal",
-  refunded: "border-[1.5px] border-seal",
-  agent: "rounded-[2px] bg-muted",
+/** The icon at the start of a line: what kind of event it is, as a picture; the words say it too. */
+const ICONS: Record<ActivityKind, ReactNode> = {
+  posted: (
+    <>
+      <path d="M4 1.8h5l3 3v9.4H4z" />
+      <path d="M9 1.8v3h3M8 7.6v4.2M5.9 9.7h4.2" />
+    </>
+  ),
+  hired: (
+    <>
+      <path d="M2.2 5.2h11.6v8H2.2z" />
+      <path d="M5.8 5.2V3.4h4.4v1.8M2.2 8.8h11.6" />
+    </>
+  ),
+  entered: (
+    <>
+      <path d="M1.8 3.8h12.4v8.4H1.8z" />
+      <path d="M1.8 3.8L8 8.6l6.2-4.8" />
+    </>
+  ),
+  revealed: (
+    <>
+      <path d="M1.8 7L8 2.8 14.2 7v6.2H1.8z" />
+      <path d="M1.8 7L8 11l6.2-4" />
+    </>
+  ),
+  paid: (
+    <>
+      <circle cx="8" cy="8" r="6" />
+      <path d="M5.4 8.2l1.8 1.8 3.4-3.6" />
+    </>
+  ),
+  refunded: (
+    <>
+      <path d="M5.8 3.6L2.6 6.8l3.2 3.2" />
+      <path d="M2.6 6.8h7.2a3.6 3.6 0 010 7.2H8.4" />
+    </>
+  ),
+  agent: (
+    <>
+      <circle cx="8" cy="5.4" r="2.6" />
+      <path d="M2.8 14c.6-2.9 2.6-4.3 5.2-4.3s4.6 1.4 5.2 4.3" />
+    </>
+  ),
 };
+
+function KindIcon({ kind }: { kind: ActivityKind }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={`grid size-7 shrink-0 place-items-center rounded-full border ${
+        kind === "paid" ? "border-seal/50 text-seal" : "border-line text-bone/80"
+      }`}
+    >
+      <svg
+        viewBox="0 0 16 16"
+        aria-hidden="true"
+        className="size-3.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        {ICONS[kind]}
+      </svg>
+    </span>
+  );
+}
+
+/**
+ * An account in a line, short: its first label in full, and the rest of it muted, cut short with
+ * "…" when the line has no room for it (`lead` `.tender-dev-1104.testnet`). The whole of it is its
+ * title, and the words a screen reader says.
+ */
+function AccountName({ account, agent }: { account: string; agent: boolean }) {
+  const dot = account.indexOf(".");
+  const head = dot === -1 ? account : account.slice(0, dot);
+  const tail = dot === -1 ? "" : account.slice(dot);
+  const name = (
+    <>
+      {/* The first label is kept whole; the rest gives way. An account of one label (an
+          implicit one, 64 characters) is cut short itself. */}
+      <span className={`font-medium text-bone ${tail === "" ? "min-w-0 truncate" : "shrink-0"}`}>
+        {head}
+      </span>
+      {tail === "" ? null : <span className="min-w-0 truncate text-muted">{tail}</span>}
+    </>
+  );
+  const shape =
+    "inline-flex max-w-[min(100%,15rem)] min-w-0 align-bottom font-mono text-[13px] whitespace-nowrap";
+  return agent ? (
+    <Link
+      href={`/agents/${account}`}
+      title={account}
+      className={`${shape} underline decoration-bone/30 underline-offset-4 transition-colors hover:decoration-bone motion-reduce:transition-none`}
+    >
+      {name}
+    </Link>
+  ) : (
+    <span title={account} className={shape}>
+      {name}
+    </span>
+  );
+}
 
 function PartView({ part }: { part: Part }) {
   if (part.kind === "text") return <span>{part.text}</span>;
@@ -110,22 +206,13 @@ function PartView({ part }: { part: Part }) {
       </Link>
     );
   }
-  return part.agent ? (
-    <Link
-      href={`/agents/${part.account}`}
-      className={`${TEXT_LINK} font-mono text-[13.5px] wrap-anywhere`}
-    >
-      {part.account}
-    </Link>
-  ) : (
-    <span className="font-mono text-[13.5px] text-bone wrap-anywhere">{part.account}</span>
-  );
+  return <AccountName account={part.account} agent={part.agent} />;
 }
 
 function LineAmounts({ line }: { line: ActivityLine }) {
   if (line.amounts.length === 0 && !line.amountPending) return null;
   return (
-    <span className="grid gap-0.5 text-sm text-bone">
+    <span className="grid gap-0.5 text-[13px] text-bone">
       {line.amounts.map(([token, amount]) => (
         <span
           key={token}
@@ -137,7 +224,7 @@ function LineAmounts({ line }: { line: ActivityLine }) {
               <Amount value={amount.toString()} token={token} />
             </span>
           ) : (
-            <span className="text-[12.5px]">
+            <span className="text-[12px]">
               <RawUnits value={amount.toString()} token={token} />
             </span>
           )}
@@ -158,28 +245,27 @@ function Line({ line, nowMs }: { line: ActivityLine; nowMs: number }) {
     <li
       data-testid="activity-line"
       data-kind={line.kind}
-      className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3.5 gap-y-1.5 border-t border-line px-5 py-4 first:border-t-0 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center sm:px-6"
+      className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 gap-y-0.5 border-t border-line px-4 py-2 first:border-t-0 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:px-5"
     >
-      <span
-        aria-hidden="true"
-        className={`mt-2 size-2 shrink-0 self-start rounded-full sm:mt-0 sm:self-center ${MARKS[line.kind]}`}
-      />
-      <p className="min-w-0 text-[15px] leading-snug text-muted">
+      <KindIcon kind={line.kind} />
+      <p className="min-w-0 text-[14px] leading-snug text-muted">
         {line.parts.map((part, index) => (
           // biome-ignore lint/suspicious/noArrayIndexKey: a line's parts are fixed in their order
           <span key={index}>
-            {index === 0 ? null : " "}
+            {/* A comma goes on the word before it. */}
+            {index === 0 || (part.kind === "text" && part.text === ",") ? null : " "}
             <PartView part={part} />
           </span>
         ))}
         {line.note === null ? null : <span>: {line.note}</span>}
       </p>
-      <div className="col-start-2 grid gap-1 sm:col-start-auto sm:justify-items-end sm:text-right">
+      {/* The amount and the time, together at the right of the line. */}
+      <div className="col-start-2 flex flex-wrap items-baseline gap-x-3 gap-y-0.5 sm:col-start-auto sm:justify-end sm:text-right">
         <LineAmounts line={line} />
         <time
           dateTime={at.toISOString()}
           title={at.toLocaleString()}
-          className="font-mono text-[11.5px] text-muted"
+          className="font-mono text-[11.5px] whitespace-nowrap text-muted sm:min-w-[4.5rem]"
         >
           {ago(line.atMs, nowMs)}
         </time>
@@ -261,14 +347,17 @@ function Feed({ backlog, onResync }: { backlog: Backlog; onResync: () => void })
 
   const kinds = new Set(FILTERS.find((choice) => choice.id === filter)?.kinds ?? []);
   const account = wallet.accountId;
-  const shown = lines.filter(
-    (line) =>
-      kinds.has(line.kind) && (!mine || account === null || line.accounts.includes(account)),
+  // Filtered first, so that a run of one account's lines is said as one only within what is shown.
+  const shown = groupLines(
+    lines.filter(
+      (line) =>
+        kinds.has(line.kind) && (!mine || account === null || line.accounts.includes(account)),
+    ),
   );
 
   return (
     <section className={`${CARD} grid grid-cols-1 overflow-hidden`}>
-      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-line px-5 py-4 sm:px-6">
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-b border-line px-4 py-3 sm:px-5">
         {/* On a phone the row is wider than the screen and scrolls: while there is more of it
             past its right edge, the edge fades out, so that the choices past it show as more to
             come (`SCROLL_CUE`). */}
@@ -315,6 +404,9 @@ function Feed({ backlog, onResync }: { backlog: Backlog; onResync: () => void })
           <p className="max-w-md text-sm text-muted">
             Tasks posted, entries, payouts and new agents show here as they happen.
           </p>
+          <Link href="/post" className={`${PRIMARY} mt-2`}>
+            Post a task
+          </Link>
         </div>
       ) : shown.length === 0 ? (
         <p data-testid="activity-none-shown" className="p-6 text-sm text-muted">
@@ -329,9 +421,8 @@ function Feed({ backlog, onResync }: { backlog: Backlog; onResync: () => void })
           ))}
         </ol>
       )}
-      <p className="border-t border-line px-5 py-4 text-sm text-muted sm:px-6">
-        The latest {BACKLOG} events, then each new one as it happens. Amounts are in each task's
-        token.
+      <p className="border-t border-line px-4 py-3 text-[13px] text-muted sm:px-5">
+        Newest first, as it happens. Amounts are in each task&rsquo;s token.
       </p>
     </section>
   );
@@ -341,12 +432,7 @@ export function ActivityView() {
   const [backlog, retry] = useLoad("activity", readBacklog);
   return (
     <div className="mx-auto grid w-full max-w-5xl gap-8">
-      <PageHead
-        eyebrow="Live"
-        title="Activity."
-        muted="What happens on Tender, as it happens."
-        art={{ name: "signal", focus: { x: 0.55, y: 0.5, scale: 0.6 } }}
-      />
+      <PageHead title="Activity." muted="What happens on Tender, as it happens." />
       {backlog.status === "ready" ? (
         <Feed backlog={backlog.data} onResync={retry} />
       ) : backlog.status === "error" ? (

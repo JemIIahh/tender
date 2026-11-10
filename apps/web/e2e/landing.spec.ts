@@ -1,5 +1,8 @@
 import { expect, type Page, test } from "@playwright/test";
+import { OWNER } from "./accountApi";
 import { routeApi, TASKS } from "./fixtures";
+import { openParity, pageFits } from "./parityApi";
+import { STUB_WALLET_NAME } from "./walletStub";
 
 // The landing (app/page.tsx) in a browser: its way to the board, its keyboard focus, the ticker's
 // figures from the API, and art that moves, except when reduced motion is asked for.
@@ -100,4 +103,48 @@ test("landing_art_moves_and_holds_still_with_reduced_motion", async ({ page }) =
   // Room for dozens of frames of the show, which plays 24 a second: with reduced motion, none.
   await framesPass(page, 60, 1500);
   expect((await artPixels(page)).pixels, "the art should hold still").toBe(still);
+});
+
+test("landing_top_bar_launches_the_market_and_shows_no_account_even_when_connected", async ({
+  page,
+}) => {
+  // Not connected: Launch market and the app's main areas, and no Connect wallet.
+  await openParity(page, "/");
+  const bar = page.getByRole("banner").first();
+  await expect(bar.getByRole("link", { name: "Launch market" })).toHaveAttribute("href", "/tasks");
+  await expect(page.getByRole("navigation", { name: "Main" }).getByRole("link")).toHaveText([
+    "Tasks",
+    "Agents",
+    "Services",
+    "How it works",
+  ]);
+  await expect(bar.getByRole("link", { name: /Connect/ })).toHaveCount(0);
+  await expect(bar.getByRole("link", { name: OWNER })).toHaveCount(0);
+
+  // Connected in the app, then the landing, loaded afresh and reached from the app: still Launch
+  // market alone. The account is the app's to show.
+  await page.getByRole("link", { name: "Launch market" }).click();
+  await expect(page).toHaveURL(/\/tasks$/, { timeout: 20_000 });
+  await page.goto("/my-tasks");
+  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await expect(page.getByRole("banner").getByRole("link", { name: OWNER })).toBeVisible();
+  for (const reach of ["load", "wordmark"] as const) {
+    if (reach === "load") await page.goto("/");
+    else {
+      await page.goto("/my-tasks");
+      await page.getByRole("link", { name: "Tender" }).first().click();
+      await expect(page).toHaveURL(/\/$/, { timeout: 20_000 });
+    }
+    const top = page.getByRole("banner").first();
+    await expect(top.getByRole("link", { name: "Launch market" })).toBeVisible();
+    await expect(top.getByRole("link", { name: OWNER })).toHaveCount(0);
+    await expect(top.getByRole("link", { name: /Connect/ })).toHaveCount(0);
+  }
+  expect(await pageFits(page)).toBe(0);
+  await page.setViewportSize({ width: 375, height: 812 });
+  await expect(
+    page.getByRole("banner").first().getByRole("link", { name: "Launch market" }),
+  ).toBeVisible();
+  expect(await pageFits(page)).toBe(0);
 });

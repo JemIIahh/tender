@@ -266,7 +266,7 @@ test("the_poster_picks_in_the_fallback_window_even_when_the_judge_was_the_verifi
   setup(POSTER);
   await show(judged(JUDGE), IN_FALLBACK);
   const pick = screen.getByTestId("action-pick");
-  expect(pick.textContent).toContain("The verifier didn't pick in time, so you, the poster, can.");
+  expect(pick.textContent).toContain("The checker didn't pick in time, so you, the poster, can.");
   expect(within(pick).getAllByTestId("pick-entry")).toHaveLength(2);
 });
 
@@ -288,20 +288,27 @@ test("someone_else_sees_no_pick_but_the_refund_still_to_come", async () => {
   expect(screen.queryByTestId("action-pick")).toBeNull();
   // It opens at the fallback deadline if nobody picks: 19m 30s from 30 s into the pick window.
   expect(screen.getByTestId("refund-opens").textContent).toBe(
-    "Opens in 19m 30s, at the fallback deadline, if nobody has picked by then.",
+    "Opens in about 19m 30s, at the fallback deadline, if nobody has picked by then.",
   );
 });
 
-test("a_reader_is_offered_to_connect_and_no_wallet_is_looked_for", async () => {
+test("a_reader_is_offered_to_connect_once_the_tab_knows_and_the_actions_look_for_no_wallet", async () => {
   const { provider } = setup(null);
   const restore = vi.spyOn(provider, "restore");
   render(<TaskActions data={judged(PERSON)} nowNs={IN_JUDGING} judgeAccount={JUDGE} />);
   const pick = screen.getByTestId("action-pick");
+  // The actions look for no wallet themselves (this tab never signed in). Until the tab's store
+  // knows, they offer no Connect, which would flash for someone about to be taken up again.
+  await act(async () => {});
+  expect(restore).not.toHaveBeenCalled();
+  expect(within(pick).queryByRole("button", { name: "Connect wallet" })).toBeNull();
+  expect(within(pick).getByRole("status").textContent).toBe("Checking for your wallet…");
+
+  // The app shell starts the store; it finds no wallet: the way in, and no status.
+  await act(() => holder.store.start());
   expect(pick.textContent).toContain(`Picking is open for ${PERSON}.`);
   expect(within(pick).getByRole("button", { name: "Connect wallet" })).toBeTruthy();
   expect(screen.queryByRole("status")).toBeNull();
-  await act(async () => {});
-  expect(restore).not.toHaveBeenCalled();
 });
 
 test("refund_says_when_it_opens_then_offers_the_one_button", async () => {
@@ -312,7 +319,7 @@ test("refund_says_when_it_opens_then_offers_the_one_button", async () => {
   const before = await show(empty, AT.reveal - 90n * SECOND);
   const refund = screen.getByTestId("action-refund");
   expect(within(refund).getByTestId("refund-opens").textContent).toBe(
-    "Opens in 1m 30s, at the reveal deadline, if nobody has revealed an entry by then.",
+    "Opens in about 1m 30s, at the reveal deadline, if nobody has revealed an entry by then.",
   );
   const button = within(refund).getByRole("button", { name: "Refund the funders" });
   expect(button.getAttribute("aria-disabled")).toBe("true");

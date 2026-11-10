@@ -19,7 +19,7 @@ const CONTRACT_WORDS: Record<Action, Record<string, string>> = {
   pick: {
     E_SETTLED: "This task is settled already: someone picked or refunded it first.",
     E_PHASE:
-      "The pick window isn't open for this account now. The verifier picks until the pick deadline, and the poster after it until the fallback deadline.",
+      "The pick window isn't open for this account now. The checker picks until the pick deadline, and the poster after it until the fallback deadline.",
     E_AUTH:
       "Tender refused the pick from this key. A delegate key can spend within its caps but can never pick: sign with another key of this account, such as its full-access key.",
     E_WINNERS:

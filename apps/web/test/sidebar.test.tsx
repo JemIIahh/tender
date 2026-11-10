@@ -1,10 +1,11 @@
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import RootLayout from "../app/layout";
 import { AppShell } from "../components/AppShell";
 import { restoreSidebar, SIDEBAR_KEY, SIDEBAR_SCRIPT, setRail } from "../lib/sidebar";
+import { agent, summary } from "./tasks";
 
 // The sidebar's rail (components/AppShell.tsx, lib/sidebar.ts): the toggle and its shortcut, the
 // choice kept in this browser and put back before the page is drawn, and the rail's names and
@@ -24,6 +25,8 @@ vi.mock("../lib/wallet", () => {
       subscribe: () => () => {},
       getSnapshot: () => state,
       getServerSnapshot: () => state,
+      // The shell starts the store on mount; here there is nothing to start.
+      start: async () => {},
     },
   };
 });
@@ -241,18 +244,15 @@ test("sidebar_rail_keeps_every_link_by_its_name_and_marks_the_page", async () =>
   const wide = names();
   expect(wide).toEqual([
     "Marketplace",
-    "Activity",
-    "Metrics",
     "Post a task",
     "My tasks",
     "Browse agents",
-    "Providers",
     "Services",
     "Add an agent",
     "My agents",
+    "Activity",
     "Earnings",
     "Wallet",
-    "Telegram",
     "Settings",
     "How it works",
   ]);
@@ -264,15 +264,16 @@ test("sidebar_rail_keeps_every_link_by_its_name_and_marks_the_page", async () =>
   for (const label of wide) {
     expect(within(nav).getByRole("link", { name: label ?? "" })).toBeTruthy();
   }
+  // A provider's page is under Browse agents, whose tab Providers is.
   expect(within(nav).getByRole("link", { current: "page" }).getAttribute("aria-label")).toBe(
-    "Providers",
+    "Browse agents",
   );
   // Each group keeps its title for a screen reader, which reads the group by it.
   expect(nav.textContent).toContain("Agents");
   expect(nav.textContent).toContain("Account");
 });
 
-test("sidebar_groups_hold_the_pages_in_their_final_order_with_how_it_works_at_the_foot", async () => {
+test("sidebar_groups_hold_the_pages_in_their_final_order_with_how_it_works_under_docs", async () => {
   shell();
   const nav = screen.getByRole("navigation", { name: "Main" });
   // Each group's links, by the group's title (the top group has none).
@@ -286,23 +287,27 @@ test("sidebar_groups_hold_the_pages_in_their_final_order_with_how_it_works_at_th
     ];
   });
   expect(groups).toEqual([
-    [null, ["/tasks", "/activity", "/metrics"]],
+    [null, ["/tasks"]],
     ["Tasks", ["/post", "/my-tasks"]],
-    ["Agents", ["/agents", "/providers", "/services", "/my-agents/new", "/my-agents"]],
-    ["Account", ["/earnings", "/wallet", "/telegram", "/settings"]],
+    ["Agents", ["/agents", "/services", "/my-agents/new", "/my-agents"]],
+    ["Account", ["/activity", "/earnings", "/wallet", "/settings"]],
+    ["Docs", ["/how-it-works"]],
   ]);
-  // How it works is in no group: on its own, at the foot, after the groups.
-  const foot = screen.getByTestId("sidebar-foot");
-  const how = within(foot).getByRole("link", { name: "How it works" });
-  expect(how.getAttribute("href")).toBe("/how-it-works");
-  expect(nav.lastElementChild).toBe(foot);
+  // How it works is the last link of all, under Docs, and the only one to it.
+  const how = within(nav).getAllByRole("link", { name: "How it works" });
+  expect(how.map((link) => link.getAttribute("href"))).toEqual(["/how-it-works"]);
+  // Metrics is behind the Live block, under the links.
+  const live = screen.getByTestId("sidebar-live");
+  expect(within(live).getByRole("link", { name: "All metrics" }).getAttribute("href")).toBe(
+    "/metrics",
+  );
 
-  // Each new page is marked as the one you are on, from the sidebar.
+  // Each new page is marked as the one you are on, from the sidebar; Telegram is under Settings.
   for (const [path, name] of [
     ["/activity", "Activity"],
-    ["/metrics", "Metrics"],
     ["/my-tasks", "My tasks"],
     ["/settings", "Settings"],
+    ["/telegram", "Settings"],
     ["/how-it-works", "How it works"],
   ] as const) {
     cleanup();
@@ -318,9 +323,8 @@ test("sidebar_groups_hold_the_pages_in_their_final_order_with_how_it_works_at_th
 test("sidebar_rail_names_every_new_page_in_a_tooltip", async () => {
   shell();
   await userEvent.click(toggle());
-  const nav = screen.getByRole("navigation", { name: "Main" });
-  for (const name of ["Activity", "Metrics", "My tasks", "Settings", "How it works"]) {
-    const link = within(nav).getByRole("link", { name });
+  for (const name of ["Activity", "My tasks", "Settings", "How it works", "All metrics"]) {
+    const link = screen.getByRole("link", { name });
     await userEvent.hover(link);
     expect(screen.getByTestId("sidebar-tip").textContent, name).toBe(name);
     await userEvent.unhover(link);
@@ -331,17 +335,17 @@ test("sidebar_rail_names_every_new_page_in_a_tooltip", async () => {
 test("sidebar_rail_names_each_icon_in_a_tooltip_and_escape_takes_it_away", async () => {
   shell();
   const nav = screen.getByRole("navigation", { name: "Main" });
-  const providers = within(nav).getByRole("link", { name: "Providers" });
+  const services = within(nav).getByRole("link", { name: "Services" });
 
   // On the wide sidebar the words are there: no tooltip.
-  await userEvent.hover(providers);
+  await userEvent.hover(services);
   expect(screen.queryByTestId("sidebar-tip")).toBeNull();
-  await userEvent.unhover(providers);
+  await userEvent.unhover(services);
 
   await userEvent.click(toggle());
-  await userEvent.hover(providers);
+  await userEvent.hover(services);
   const tip = screen.getByTestId("sidebar-tip");
-  expect(tip.textContent).toBe("Providers");
+  expect(tip.textContent).toBe("Services");
   // It repeats the link's name, which a screen reader already has.
   expect(tip.getAttribute("aria-hidden")).toBe("true");
 
@@ -402,15 +406,73 @@ test("sidebar_wordmark_moves_to_the_top_bar_and_a_focus_on_it_is_not_lost", asyn
   expect(document.activeElement).toBe(toggle());
 });
 
-test("sidebar_holds_the_pages_and_no_figures", async () => {
-  // The platform's figures are behind the top bar's Live pill (live-status.test.tsx), not here.
+test("sidebar_live_block_shows_the_top_bar_s_figures_from_the_same_reads", async () => {
+  // The three reads of the top bar's status, answered: the Live block, pinned under the links,
+  // shows their figures and asks the API for nothing more.
+  const urls: string[] = [];
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    const path = `${url.pathname}${url.search}`;
+    urls.push(path);
+    if (path === "/v1/tasks?phase=open&limit=50") {
+      return json({
+        tasks: [summary({ id: "7", reward: "1500000" }), summary({ id: "8", reward: "500000" })],
+        next_cursor: null,
+      });
+    }
+    if (path === "/v1/agents?limit=50") return json({ agents: [agent()], next_cursor: null });
+    throw new TypeError("Failed to fetch");
+  });
   shell();
   const sidebar = document.querySelector("aside");
-  // The old block's own test id, and any stat row of it.
-  expect(sidebar?.querySelector('[data-testid="platform-stats"]')).toBeNull();
-  expect(sidebar?.querySelector('[data-testid="stat"]')).toBeNull();
-  expect(sidebar?.textContent).not.toMatch(/Live on Tender|Open tasks|In escrow/i);
-  // The pill is in the top bar, once the API has been asked.
-  const pill = await within(screen.getByRole("banner")).findByRole("button", { name: /^Status: / });
+  const live = screen.getByTestId("sidebar-live");
+  expect(sidebar?.contains(live)).toBe(true);
+  // It is not among the links, which scroll on their own above it.
+  expect(screen.getByRole("navigation", { name: "Main" }).contains(live)).toBe(false);
+
+  await waitFor(() => expect(within(live).getAllByTestId("sidebar-figure")).toHaveLength(3));
+  expect(
+    within(live)
+      .getAllByTestId("sidebar-figure")
+      .map((row) => row.textContent),
+  ).toEqual(["Open tasks2", "Agents1", "On open tasks2.00 tUSDC"]);
+  // The top bar's status is there too, and the two made the three reads once between them.
+  const pill = await within(screen.getByRole("banner")).findByRole("button", {
+    name: /^Status: /,
+  });
   expect(sidebar?.contains(pill)).toBe(false);
+  expect(urls.sort()).toEqual([
+    "/v1/agents?limit=50",
+    "/v1/health",
+    "/v1/tasks?phase=open&limit=50",
+  ]);
+  // On the rail its figures go: the dot and the link to Metrics stay.
+  expect(live.querySelector("dl")?.className).toContain("lg:rail:hidden");
+  expect(within(live).getByRole("link", { name: "All metrics" }).getAttribute("href")).toBe(
+    "/metrics",
+  );
+});
+
+test("sidebar_marks_all_metrics_on_the_metrics_page", () => {
+  pathname.current = "/metrics";
+  shell();
+  const live = screen.getByTestId("sidebar-live");
+  expect(within(live).getByRole("link", { name: "All metrics" }).getAttribute("aria-current")).toBe(
+    "page",
+  );
+  // No link of the list is marked: Metrics has none of its own.
+  expect(
+    within(screen.getByRole("navigation", { name: "Main" })).queryByRole("link", {
+      current: "page",
+    }),
+  ).toBeNull();
+  cleanup();
+  pathname.current = "/tasks";
+  shell();
+  expect(
+    within(screen.getByTestId("sidebar-live"))
+      .getByRole("link", { name: "All metrics" })
+      .getAttribute("aria-current"),
+  ).toBeNull();
 });

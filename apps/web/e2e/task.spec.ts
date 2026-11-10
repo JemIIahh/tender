@@ -39,7 +39,7 @@ test("task_page_updates_live_through_reveal", async ({ page }) => {
 
   // The commit window: all anyone can see is that entries were committed, and at which block.
   await expect(chip(page)).toHaveText("Open");
-  await expect(page.getByTestId("live-status")).toContainText("Commit window closes in");
+  await expect(page.getByTestId("live-status")).toContainText("Answer window (commit) closes in");
   await expect(summary(page)).toHaveText("2 committed · 0 revealed");
   await expect(row(page, "alice.testnet")).toContainText(
     "Sealed entry · committed at block 123456",
@@ -53,7 +53,7 @@ test("task_page_updates_live_through_reveal", async ({ page }) => {
   // The commit deadline passes. The page moves on with the clock, and asks for nothing.
   await page.clock.fastForward(30_000);
   await expect(chip(page)).toHaveText("Revealing");
-  await expect(page.getByTestId("live-status")).toContainText("Reveal window closes in");
+  await expect(page.getByTestId("live-status")).toContainText("Opening window (reveal) closes in");
 
   // An agent reveals: its hash is there, and there is nothing to open yet.
   api.reveal("2", "alice.testnet", HASH_A);
@@ -70,7 +70,7 @@ test("task_page_updates_live_through_reveal", async ({ page }) => {
     `${API_URL}/v1/blobs/${HASH_A}`,
   );
   await expect(row(page, "bob.testnet")).toContainText("Not revealed · committed at block");
-  await expect(page.getByTestId("rule")).toHaveText("verifier picks");
+  await expect(page.getByTestId("rule")).toHaveText("checker picks");
 
   expect(await page.evaluate(() => (window as unknown as { kept?: boolean }).kept)).toBe(true);
   // Every update came from the stream: it asked for the task again each time.
@@ -166,7 +166,7 @@ test("scrubber_previews_each_rule_from_the_keyboard", async ({ page }) => {
   await page.goto(TASK);
   const slider = page.getByRole("slider", { name: "Preview another moment" });
   const rule = page.getByTestId("rule");
-  await expect(rule).toHaveText("entries are sealed");
+  await expect(rule).toHaveText("answers are sealed");
   // Wait for the page to finish loading (the stream makes it ask once more when it opens), so
   // that what is counted below is what the preview does.
   const reads = () => api.requests.filter((request) => !request.includes("/v1/events")).length;
@@ -185,16 +185,16 @@ test("scrubber_previews_each_rule_from_the_keyboard", async ({ page }) => {
   await page.keyboard.press("Home");
   await expect(page.getByTestId("preview-status")).toBeVisible();
   for (let i = 0; i < 19; i++) await page.keyboard.press("ArrowRight");
-  await expect(rule).toHaveText("entries are sealed");
+  await expect(rule).toHaveText("answers are sealed");
   await page.keyboard.press("ArrowRight");
-  await expect(rule).toHaveText("reveal or forfeit");
+  await expect(rule).toHaveText("open or forfeit");
 
   // Home again, then Page Up (a tenth of the scale each): one zone per two presses.
   await page.keyboard.press("Home");
-  await expect(rule).toHaveText("entries are sealed");
+  await expect(rule).toHaveText("answers are sealed");
   const stops: Array<[presses: number, headline: string]> = [
-    [3, "reveal or forfeit"],
-    [2, "verifier picks"],
+    [3, "open or forfeit"],
+    [2, "checker picks"],
     [2, "poster may pick"],
     [2, "anyone can refund"],
   ];
@@ -207,7 +207,7 @@ test("scrubber_previews_each_rule_from_the_keyboard", async ({ page }) => {
   // Back to now. The preview never touched the page: no request was made for it, the phase is
   // still the live one, and the rule is the live one.
   await page.getByRole("button", { name: "Back to now" }).click();
-  await expect(rule).toHaveText("entries are sealed");
+  await expect(rule).toHaveText("answers are sealed");
   await expect(page.getByTestId("preview-status")).toHaveCount(0);
   await expect(chip(page)).toHaveText("Open");
   expect(reads()).toBe(asked);

@@ -1,6 +1,7 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import Landing from "../app/page";
+import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
 
 // The landing (app/page.tsx): what it says Tender is, where its links go, and what it never says.
 // Its parts are in landing-parts.test.tsx.
@@ -36,15 +37,35 @@ test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () =>
   expect(hrefs("Browse tasks")).toEqual(["/tasks"]);
   expect(hrefs("Find a task")).toEqual(["/tasks"]);
   expect(hrefs("See the records")).toEqual(["/agents"]);
-  expect(hrefs("Connect wallet")).toEqual(["/wallet"]);
+  // The top bar's way in is the market, whatever the wallet; it offers no Connect wallet.
+  expect(hrefs("Launch market")).toEqual(["/tasks"]);
+  expect(screen.queryByRole("link", { name: "Connect wallet" })).toBeNull();
   expect(screen.getByRole("link", { name: /Explore tasks/ }).getAttribute("href")).toBe("/tasks");
   expect(screen.getByRole("link", { name: /Explore agents/ }).getAttribute("href")).toBe("/agents");
 
   expect(hrefs("See providers")).toEqual(["/providers"]);
   expect(hrefs("Add an agent")).toEqual(["/my-agents/new"]);
-  expect(hrefs("How it works")).toEqual(["/how-it-works"]);
+  // How it works from the hero, the top bar, the steps and the footer.
+  expect(new Set(hrefs("How it works"))).toEqual(new Set(["/how-it-works"]));
+  const hero = screen.getByRole("region", { name: /Post a task\./ });
+  expect(within(hero).getByRole("link", { name: "How it works" }).getAttribute("href")).toBe(
+    "/how-it-works",
+  );
+  // The agents' card and the footer link the guide and the MCP docs, and the footer the source.
+  const roles = screen.getByRole("heading", { name: "Four ways in >" }).closest("section");
+  const agents = within(roles as HTMLElement)
+    .getByRole("heading", { level: 3, name: "Agents" })
+    .closest("li");
+  expect(
+    within(agents as HTMLElement)
+      .getAllByRole("link")
+      .map((link) => link.getAttribute("href")),
+  ).toEqual([SKILL_URL, MCP_DOCS_URL, "/tasks"]);
+  const footer = within(screen.getByRole("contentinfo"));
+  expect(footer.getByRole("link", { name: "Source code" }).getAttribute("href")).toBe(REPO_URL);
+  expect(footer.getByRole("link", { name: "Agent guide" }).getAttribute("href")).toBe(SKILL_URL);
 
-  // Every link stays in the app, on a page that exists.
+  // Every link stays in the app, on a page that exists, but those to the source and its docs.
   const pages = new Set([
     "/",
     "/tasks",
@@ -55,6 +76,10 @@ test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () =>
     "/providers",
     "/my-agents/new",
     "/how-it-works",
+    "/services",
+    REPO_URL,
+    SKILL_URL,
+    MCP_DOCS_URL,
   ]);
   for (const link of screen.getAllByRole("link")) {
     expect(pages.has(link.getAttribute("href") ?? ""), link.textContent ?? "").toBe(true);
@@ -63,6 +88,40 @@ test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () =>
   // The honesty line about what the team runs.
   expect(screen.getByRole("contentinfo").textContent).toContain("Run by Tender team");
   await waitFor(() => expect(screen.getAllByTestId("ticker-fact").length).toBeGreaterThan(0));
+});
+
+test("landing_top_bar_links_the_app_s_main_areas_and_launches_the_market", () => {
+  apiDown();
+  render(<Landing />);
+
+  const bar = within(screen.getByRole("navigation", { name: "Main" }));
+  expect(
+    bar.getAllByRole("link").map((link) => [link.textContent, link.getAttribute("href")]),
+  ).toEqual([
+    ["Tasks", "/tasks"],
+    ["Agents", "/agents"],
+    ["Services", "/services"],
+    ["How it works", "/how-it-works"],
+  ]);
+  const banner = within(screen.getAllByRole("banner")[0] as HTMLElement);
+  const launch = banner.getByRole("link", { name: "Launch market" });
+  expect(launch.getAttribute("href")).toBe("/tasks");
+  // Its name is whole on a phone too, where the words are cut to "Launch".
+  expect(launch.textContent).toBe("Launch\u00a0market");
+});
+
+test("landing_top_bar_shows_launch_market_and_no_account_or_connect_wallet", () => {
+  apiDown();
+  render(<Landing />);
+  const banner = within(screen.getAllByRole("banner")[0] as HTMLElement);
+
+  // The bar is the mark, the app's main areas and Launch market: no account, and no Connect wallet,
+  // which are the app's. The landing does not read the wallet at all.
+  expect(
+    banner.getAllByRole("link").map((link) => link.getAttribute("aria-label") ?? link.textContent),
+  ).toEqual(["Tender", "Tasks", "Agents", "Services", "How it works", "Launch market"]);
+  expect(banner.queryByRole("link", { name: /Connect/ })).toBeNull();
+  expect(banner.queryByRole("button")).toBeNull();
 });
 
 test("landing_never_makes_claims_it_cannot_back", () => {
@@ -102,7 +161,7 @@ test("landing_has_four_ways_in_and_providers_are_one", () => {
   expect(cards.map((card) => card.querySelector("h3")?.textContent)).toEqual([
     "Posters",
     "Agents",
-    "Verifiers",
+    "Checkers",
     "Providers (ASPs)",
   ]);
   const providers = cards[3] as HTMLElement;

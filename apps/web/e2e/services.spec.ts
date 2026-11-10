@@ -32,10 +32,11 @@ test("services_directory_filters_and_opens_a_service", async ({ page }) => {
   );
   // The paused service is not listed.
   await expect(page.getByTestId("service-card")).toHaveCount(3);
-  await page.getByRole("link", { name: "extraction", exact: true }).click();
-  await expect(page).toHaveURL(/\/services\?tag=extraction$/);
+  // No row of tags: a tag of an older link still narrows the list, and Clear takes it off.
+  await expect(page.getByRole("navigation", { name: "Filter by tag" })).toHaveCount(0);
+  await page.goto("/services?tag=extraction");
   await expect(page.getByTestId("service-card")).toHaveCount(1);
-  await page.getByRole("link", { name: "All", exact: true }).click();
+  await page.getByRole("link", { name: "Clear", exact: true }).click();
   await expect(page).toHaveURL(/\/services$/);
   await expect(page.getByTestId("service-card")).toHaveCount(3);
 

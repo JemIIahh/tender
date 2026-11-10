@@ -585,11 +585,7 @@ export function WalletView({
   return (
     <div className="mx-auto grid w-full max-w-6xl gap-5">
       <div className="pb-3">
-        <PageHead
-          eyebrow="Account"
-          title="Wallet"
-          art={{ name: "escrow", focus: { x: 0.6, y: 0.52, scale: 0.46 } }}
-        >
+        <PageHead title="Wallet">
           Your vault with Tender: the tasks you post are paid from it, and what you win is paid into
           it.
         </PageHead>

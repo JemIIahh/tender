@@ -44,7 +44,7 @@ function Section({
   );
 }
 
-/** A label in mono capitals, and what it says, side by side from tablet width up. */
+/** A label, and what it says, side by side from tablet width up. */
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="grid min-w-0 gap-2 border-t border-line pt-4 first:border-t-0 first:pt-0 sm:grid-cols-[11rem_minmax(0,1fr)] sm:items-center sm:gap-6">
@@ -85,7 +85,7 @@ function AccountSection() {
           <p className="flex flex-wrap items-center gap-x-4 gap-y-2 text-muted">
             No wallet connected.
             <Link href="/wallet" className={`${SECONDARY} min-h-10 px-4`}>
-              Connect on Wallet
+              Open Wallet to connect
             </Link>
           </p>
         ) : (
@@ -298,7 +298,7 @@ function NetworkSection() {
 export function SettingsView() {
   return (
     <div className="mx-auto grid w-full max-w-4xl gap-6">
-      <PageHead eyebrow="Account" title="Settings." muted="Yours, in this browser." />
+      <PageHead title="Settings." muted="Yours, in this browser." />
       <AccountSection />
       <DisplaySection />
       <NetworkSection />

@@ -180,8 +180,8 @@ function detailOf(account: string): AgentDetailResponse | undefined {
 
 /**
  * Answers `GET /v1/agents` (narrowed by `tag` and `asp`), the agents' own pages for the agents
- * above, and `GET /v1/tasks?poster=` for the tasks they posted. Anything else, the Judge's own
- * page included, is left to `routeApi`.
+ * above, `GET /v1/tasks?poster=` for the tasks they posted, and `GET /v1/services` with none.
+ * Anything else, the Judge's own page included, is left to `routeApi`.
  */
 export async function routeAgents(page: Page): Promise<void> {
   await page.route(`${API_URL}/**`, async (route) => {
@@ -204,6 +204,10 @@ export async function routeAgents(page: Page): Promise<void> {
     const one = /^\/v1\/agents\/([^/]+)$/.exec(url.pathname);
     const found = one === null ? undefined : detailOf(decodeURIComponent(one[1] ?? ""));
     if (found !== undefined) return json(found);
+
+    // No agent here lists a service (servicesApi.ts has those): the directory's prices and an
+    // agent's page read an empty list.
+    if (url.pathname === "/v1/services") return json({ services: [], next_cursor: null });
 
     const poster = url.searchParams.get("poster");
     if (url.pathname === "/v1/tasks" && poster !== null) {

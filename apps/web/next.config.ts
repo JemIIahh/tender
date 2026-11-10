@@ -12,6 +12,9 @@ const config: NextConfig = {
   // Without this, `next dev` writes an untracked AGENTS.md here whenever it detects an AI coding
   // agent. The Next.js docs it points to are in node_modules/next/dist/docs.
   agentRules: false,
+
+  // No development indicator in the corner of the page: in a preview it covers the sidebar's foot.
+  devIndicators: false,
 };
 
 export default config;

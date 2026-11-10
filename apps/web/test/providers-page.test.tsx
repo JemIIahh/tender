@@ -159,17 +159,26 @@ test("directory_lists_each_provider_with_its_agents_and_combined_record", async 
   render(<ProviderDirectory />);
 
   const cards = await screen.findAllByTestId("provider-card");
-  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Providers");
+  // Providers is a tab of Browse agents: the same head, the tab marked, and a section of its own.
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
+    "Browse agents. Hire one that fits.",
+  );
+  const tabs = within(screen.getByRole("navigation", { name: "Browse" }));
+  expect(tabs.getByRole("link", { name: "Providers" }).getAttribute("aria-current")).toBe("page");
+  expect(tabs.getByRole("link", { name: "Agents" }).getAttribute("href")).toBe("/agents");
+  expect(screen.getByRole("heading", { level: 2, name: "Providers" })).toBeTruthy();
   // The first mention on the page says what the letters stand for.
-  const head = screen.getByRole("banner");
-  expect(head.textContent).toContain("An agent service provider (ASP) runs agents");
+  expect(screen.getByText(/^An agent service provider \(ASP\) runs agents/)).toBeTruthy();
   // One read of the agent list, the API's largest page; nothing is asked of the chain.
   expect(calls).toEqual(["/v1/agents?limit=50"]);
 
   expect(cards).toHaveLength(2);
   const [acme, team] = cards as [HTMLElement, HTMLElement];
-  const link = within(acme).getByRole("link", { name: ACME });
+  // Its account is its name, and the round arrow is its link, which stretches over the card.
+  expect(within(acme).getByRole("heading", { level: 2 }).textContent).toBe(ACME);
+  const link = within(acme).getByRole("link", { name: `Open provider: ${ACME}` });
   expect(link.getAttribute("href")).toBe(`/providers/${ACME}`);
+  expect(link.className).toContain("after:inset-0");
   expect(within(acme).getByTestId("provider-agents").textContent).toBe("3");
   expect(within(acme).getByTestId("entries").textContent).toBe("8");
   expect(within(acme).getByTestId("wins").textContent).toBe("3");
@@ -188,7 +197,15 @@ test("directory_lists_each_provider_with_its_agents_and_combined_record", async 
 
   // The team's provider carries the label, as its agents do.
   expect(within(team).getByTestId("team-badge").textContent).toBe("Run by Tender team");
-  expect(within(team).getByTestId("earned").textContent).toBe("Nothing yet");
+  // An agent's record of nothing is one line, not a row of empty boxes.
+  expect(within(team).getByTestId("provider-figures").textContent).toBe(
+    "1 agent·0 entries·0 wins·earned nothing yet",
+  );
+  expect(within(team).getByTestId("earned").textContent).toBe("nothing yet");
+  // With figures, the counts are one line too, and what was earned is under it.
+  expect(within(acme).getByTestId("provider-figures").textContent).toBe(
+    "3 agents·8 entries·3 wins",
+  );
 });
 
 test("directory_names_four_agents_and_counts_the_rest", async () => {
@@ -263,20 +280,20 @@ test("provider_page_shows_the_account_its_combined_record_and_its_agents", async
   expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(ACME);
   // The first mention on the page says what the letters stand for.
   expect(screen.getByRole("banner").textContent).toContain("Agent service provider (ASP)");
-  expect(screen.getByRole("link", { name: "All providers" }).getAttribute("href")).toBe(
+  // Its breadcrumbs lead back to the providers, a tab of Browse agents.
+  const trail = within(screen.getByRole("navigation", { name: "Breadcrumbs" }));
+  expect(trail.getAllByRole("link").map((one) => one.getAttribute("href"))).toEqual([
+    "/tasks",
+    "/agents",
     "/providers",
-  );
+  ]);
 
   // The combined record: only what the API counted, added up.
   const record = screen.getByLabelText("Its agents together");
-  expect(within(record).getByTestId("stat-agents").textContent).toBe(
-    "Agents3Each a sub-account of this one",
-  );
-  // The label, the figure, and the line under it.
+  expect(within(record).getByTestId("stat-agents").textContent).toBe("Agents3");
+  // The label, the figure, and a few words beside it.
   expect(within(record).getByTestId("stat-entries").textContent).toBe("Entries87 revealed");
-  expect(within(record).getByTestId("stat-wins").textContent).toBe(
-    "Wins3Tasks picked for a share of the reward",
-  );
+  expect(within(record).getByTestId("stat-wins").textContent).toBe("Wins3");
   expect(
     within(within(record).getByTestId("stat-earned"))
       .getAllByTestId("amount")
@@ -288,17 +305,16 @@ test("provider_page_shows_the_account_its_combined_record_and_its_agents", async
   // The agents, as the directory shows them, a level under the section's title.
   expect(cards).toHaveLength(3);
   expect(screen.getByRole("heading", { level: 2, name: "Its agents" })).toBeTruthy();
+  // An agent with no public profile goes by the first part of its account.
   expect(screen.getAllByRole("heading", { level: 3 }).map((name) => name.textContent)).toEqual([
-    "Unnamed agent (no public profile yet)",
+    "analyst",
     "Acme Coder",
     "Acme Writer",
   ]);
-  // Each card's provider field leads back here.
-  for (const card of cards) {
-    expect(within(within(card).getByTestId("asp")).getByRole("link").getAttribute("href")).toBe(
-      `/providers/${ACME}`,
-    );
-  }
+  // Each card leads to its agent's page, where its provider leads back here.
+  expect(
+    cards.map((card) => within(card).getByRole("link").getAttribute("href")?.split(".")[0]),
+  ).toEqual(["/agents/analyst", "/agents/coder", "/agents/writer"]);
   expect(screen.queryByTestId("team-badge")).toBeNull();
 });
 
@@ -337,10 +353,48 @@ test("provider_page_of_the_team_carries_the_label", async () => {
   expect(within(head).getByTestId("team-badge").textContent).toBe("Run by Tender team");
 });
 
+test("provider_page_of_agents_that_only_bonded_shows_the_bonds_they_lock", async () => {
+  // Registered and bonded, nothing entered or won yet: the bonds are not hidden by the zero line.
+  fakeApi(() =>
+    agentsPage([
+      {
+        ...analyst,
+        status: "active",
+        bond_token: TOKEN,
+        bond_amount: "4000000",
+        claimable_at: null,
+      },
+    ] as AgentSummary[]),
+  );
+  render(<ProviderView account={ACME} />);
+
+  const bonds = await screen.findByTestId("stat-bonds");
+  expect(
+    within(bonds)
+      .getAllByTestId("amount")
+      .map((amount) => amount.textContent),
+  ).toEqual(["4.00 tUSDC"]);
+  expect(screen.queryByTestId("record-line")).toBeNull();
+});
+
+test("provider_page_of_agents_that_have_done_nothing_yet_says_it_in_one_line", async () => {
+  fakeApi(() => agentsPage([analyst]));
+  render(<ProviderView account={ACME} />);
+
+  expect((await screen.findByTestId("record-line")).textContent).toBe(
+    "1 agent·0 entries·0 wins·earned nothing yet",
+  );
+  expect(screen.queryByLabelText("Its agents together")).toBeNull();
+  // The agent's card says the same in its own line.
+  expect(within(screen.getByTestId("agent-card")).getByTestId("agent-stats").textContent).toBe(
+    "No entries yet",
+  );
+});
+
 test("provider_page_with_no_agents_says_so_and_why_an_account_can_t_be_one", async () => {
   fakeApi(() => agentsPage([]));
   const first = render(<ProviderView account={ACME} />);
-  expect((await screen.findByTestId("no-fleet")).textContent).toBe(
+  expect((await screen.findByTestId("no-fleet")).textContent).toContain(
     "No agents run under this account yet.",
   );
   expect(screen.queryByLabelText("Its agents together")).toBeNull();
@@ -440,24 +494,24 @@ test("provider_page_lists_its_services_for_hire_as_the_services_page_does", asyn
 
 // ---- The agent card's provider ------------------------------------------------------------------
 
-test("agent_card_links_its_provider_to_the_provider_s_page_above_the_card_s_link", () => {
+test("agent_card_leaves_the_provider_to_the_agent_s_page_and_takes_a_heading_level", () => {
   render(
     <ul>
       <AgentCard agent={writer} />
-      <AgentCard agent={carol} />
+      <AgentCard agent={carol} heading="h3" />
     </ul>,
   );
   const [mine, hers] = screen.getAllByTestId("agent-card") as [HTMLElement, HTMLElement];
-  const asp = within(mine).getByTestId("asp");
-  expect(asp.textContent).toBe(ACME);
-  const link = within(asp).getByRole("link", { name: ACME });
-  expect(link.getAttribute("href")).toBe(`/providers/${ACME}`);
-  // It sits above the card's own link, which stretches over the card, so a click reaches it.
-  expect(link.className).toContain("relative z-10");
-  // No provider: no link.
-  expect(within(within(hers).getByTestId("asp")).queryByRole("link")).toBeNull();
-  // A card's name is a level-2 heading by default.
+  // The provider is on the agent's page (agents-page.test.tsx): the card has one link, its own.
+  expect(within(mine).queryByTestId("asp")).toBeNull();
+  expect(
+    within(mine)
+      .getAllByRole("link")
+      .map((link) => link.getAttribute("href")),
+  ).toEqual([`/agents/${writer.account}`]);
+  // A card's name is a level-2 heading by default, and a level down under a section's title.
   expect(within(mine).getByRole("heading", { level: 2 }).textContent).toBe("Acme Writer");
+  expect(within(hers).getByRole("heading", { level: 3 })).toBeTruthy();
 });
 
 test("provider_page_says_by_its_record_when_it_stopped_reading", async () => {

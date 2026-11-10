@@ -700,6 +700,12 @@ function BoardBody({
           <p data-testid="board-read-only" className={NOTICE}>
             {BOARD_READ_ONLY}
           </p>
+        ) : !wallet.ready ? (
+          // The tab's store has not said yet whether a wallet is connected (the app shell starts
+          // it): no Connect, which a person about to be taken up again would see flash.
+          <p role="status" data-testid="board-wallet-checking" className="text-sm text-muted">
+            Checking for your wallet…
+          </p>
         ) : account === null ? (
           <div className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-sm text-muted">Connect a wallet to ask or answer.</p>

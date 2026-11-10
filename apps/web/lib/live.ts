@@ -13,7 +13,8 @@ export type LiveState = "synced" | "behind" | "offline";
 
 export interface Live {
   /**
-   * `synced`: the index has every final block and the services are not waiting for the chain.
+   * `synced`: the index is `SYNCED_LAG_BLOCKS` or fewer behind the final block and the services
+   * are not waiting for the chain.
    * `behind`: the API answers, but it can't say the index is up to date (it is catching up, the
    * services wait for the chain, or the chain could not be read). `offline`: no answer at all.
    */
@@ -30,20 +31,26 @@ function count(rows: number, next: string | null): string {
   return next === null ? String(rows) : `${rows}+`;
 }
 
-/** Whether `lag` is a lag of nothing. One that is no number is not taken to be nothing. */
-function noLag(lag: string): boolean {
-  try {
-    return BigInt(lag) === 0n;
-  } catch {
-    return false;
-  }
+/**
+ * The most blocks the index may be behind the chain's final block and still be called up to date:
+ * about 30 seconds of NEAR's blocks. The index reads finalized blocks, so on testnet it runs a steady
+ * one to three behind, which is as up to date as it gets.
+ */
+export const SYNCED_LAG_BLOCKS = 30n;
+
+/**
+ * Whether `lag` is small enough to call up to date. Only a count of blocks in decimal digits is
+ * read: one that is no number (`BigInt` would take "" and " " as 0) is not taken to be small.
+ */
+function smallLag(lag: string): boolean {
+  return /^[0-9]{1,20}$/.test(lag) && BigInt(lag) <= SYNCED_LAG_BLOCKS;
 }
 
 /** What the pill shows for `reads`. */
 export function liveOf(reads: LiveReads): Live {
   if (!reads.answered) return { state: "offline" };
   const { health, open, agents } = reads;
-  const synced = health !== undefined && !health.waiting_for_chain && noLag(health.lag_blocks);
+  const synced = health !== undefined && !health.waiting_for_chain && smallLag(health.lag_blocks);
   const live: Live = { state: synced ? "synced" : "behind" };
   if (open !== undefined) {
     live.openTasks = count(open.tasks.length, open.next_cursor);

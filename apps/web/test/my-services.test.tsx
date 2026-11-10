@@ -186,6 +186,9 @@ test("a_service_is_listed_for_an_agent_that_can_take_hires_with_the_form_held_to
     editor.getByRole("radio", { name: /The hirer accepts it/ }).getAttribute("aria-describedby"),
   ).toBe(editor.getByTestId("hirer-note").id);
 
+  // No category is asked: a new listing is sent as "other" (below).
+  expect(editor.queryByLabelText("Category")).toBeNull();
+
   // Nothing typed: the form says what is missing and sends nothing.
   await user.click(editor.getByRole("button", { name: "List it" }));
   expect(editor.getByText("Give it a title.")).toBeTruthy();

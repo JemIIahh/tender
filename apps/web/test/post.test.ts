@@ -25,23 +25,32 @@ import {
   checkChecks,
   checkReward,
   DocumentError,
+  deadlineIn,
+  deadlineInput,
+  deadlineMs,
+  emptyForm,
   firstError,
   formatForKind,
   fundingOf,
   heldoutFile,
+  inviteBytes,
   KINDS,
   kindsFor,
   linesOf,
+  MAX_INVITED,
+  maxEntriesOf,
   POST_TASK_BYTES,
   type PostForm,
-  PRESET_WINDOWS,
   parseTags,
   planPostCalls,
   RUBRIC_JUDGE_LIMIT,
   RUBRIC_WORDS,
   regexCaution,
+  tokenOf,
   VAULT_SLOT_BYTES,
+  windowsForDeadline,
   windowsOf,
+  winnerReceives,
 } from "../lib/post";
 import {
   exactForm,
@@ -269,7 +278,17 @@ test("deposit_prepended_when_vault_short", () => {
 });
 
 test("post_task_carries_the_terms_of_the_form", () => {
-  const form = regexForm({ amount: "5" });
+  // Windows set by hand, of 10, 5, 10 and 10 minutes.
+  const form = regexForm({
+    amount: "5",
+    timing: "custom",
+    custom: {
+      commit: { amount: "10", unit: "minutes" },
+      reveal: { amount: "5", unit: "minutes" },
+      pick: { amount: "10", unit: "minutes" },
+      fallback: { amount: "600", unit: "seconds" },
+    },
+  });
   const docs = buildDocuments(form);
   const [post] = planFor(form, 5_000_000n);
 
@@ -294,6 +313,37 @@ test("post_task_carries_the_terms_of_the_form", () => {
       invited: [],
       parent: null,
     },
+  });
+});
+
+test("post_task_runs_the_commit_window_to_the_deadline_from_when_the_calls_are_made", () => {
+  const now = new Date(2026, 10, 5, 9, 30).getTime();
+  const form = regexForm({ deadline: deadlineInput(now + 86_400_000) });
+  const docs = buildDocuments(form);
+  const plan = (nowMs: number) =>
+    planPostCalls({
+      form,
+      uris: { brief: "http://api.test/v1/blobs/x" },
+      hashes: docs,
+      vaultBalance: 5_000_000n,
+      contractId: CONTRACT,
+      tokenId: TOKEN,
+      judgeAccount: JUDGE,
+      nowMs,
+    }).at(-1)?.args.task;
+  expect(plan(now)).toMatchObject({
+    commit_secs: 86_400,
+    reveal_secs: 7_200,
+    pick_secs: 14_400,
+    fallback_secs: 86_400,
+  });
+  // Ten minutes later the deadline is the same time, ten minutes nearer.
+  // The other windows are to five minutes, so a press a little later gives the same ones.
+  expect(plan(now + 600_000)).toMatchObject({
+    commit_secs: 85_800,
+    reveal_secs: 7_200,
+    pick_secs: 14_400,
+    fallback_secs: 86_400,
   });
 });
 
@@ -334,10 +384,17 @@ test("the_calls_are_refused_for_what_would_cost_money_to_get_wrong", () => {
   }
   expect(() => planPostCalls({ ...base, vaultBalance: -1n })).toThrow(RangeError);
   expect(() =>
-    planPostCalls({ ...base, form: { ...form, preset: "custom", custom: bad() } }),
+    planPostCalls({ ...base, form: { ...form, timing: "custom", custom: bad() } }),
   ).toThrow(RangeError);
   // The Judge chosen with no Judge account to name, and a verifier that is no account.
   expect(() => planPostCalls({ ...base, judgeAccount: null })).toThrow(RangeError);
+  // A deadline that has passed by the time the calls are made, and an invite list the contract
+  // would refuse by its length.
+  expect(() =>
+    planPostCalls({ ...base, form: { ...form, deadline: deadlineInput(Date.now() - 60_000) } }),
+  ).toThrow(RangeError);
+  const many = Array.from({ length: MAX_INVITED + 1 }, (_, i) => `a${i}.testnet`).join("\n");
+  expect(() => planPostCalls({ ...base, form: { ...form, invited: many } })).toThrow(RangeError);
   expect(() =>
     planPostCalls({ ...base, form: { ...form, verifier: "other", otherVerifier: "No Account" } }),
   ).toThrow(RangeError);
@@ -781,9 +838,15 @@ test("a_brief_is_checked_against_what_the_schema_allows", () => {
 test("checks_are_validated_for_each_kind", () => {
   const opts = { canRubric: true };
 
-  // exact
+  // exact: worded for the checker chosen, the Judge, the poster or another account.
   expect(checkChecks(exactForm({ expected: " \n\n" }), opts).expected).toBe(
     "Write at least one answer the Judge will accept, one to a line.",
+  );
+  expect(checkChecks(exactForm({ expected: "", verifier: "me" }), opts).expected).toBe(
+    "Write at least one answer you will accept, one to a line.",
+  );
+  expect(checkChecks(exactForm({ expected: "", verifier: "other" }), opts).expected).toBe(
+    "Write at least one answer the checker will accept, one to a line.",
   );
   // json_schema
   expect(checkChecks(jsonForm({ schema: "" }), opts).schema).toBe(
@@ -849,7 +912,7 @@ test("the_answer_format_has_to_suit_the_kind_of_check", () => {
   expect(formatForKind("rubric", "regex_json")).toBe("text");
 
   expect(checkChecks(regexForm({ outputFormat: "text" }), opts).kind).toBe(
-    'Regex cases needs the answer format "A regex, as JSON". Change it on the Brief step.',
+    'Regex cases needs the answer format "A regex, as JSON". Change it under More options.',
   );
   expect(checkChecks(jsonForm({ outputFormat: "text" }), opts).kind).toContain('"JSON"');
 });
@@ -922,22 +985,86 @@ test("text_that_cannot_be_saved_is_a_problem_on_the_step_that_holds_it", () => {
 
 // ---- The reward and the windows -----------------------------------------------------------------
 
-test("the_presets_are_the_windows_the_task_page_expects", () => {
-  expect(PRESET_WINDOWS.quick).toEqual({ commit: 600, reveal: 300, pick: 600, fallback: 600 });
-  expect(PRESET_WINDOWS.day).toEqual({
+test("the_windows_follow_from_the_deadline_within_every_network_s_limits", () => {
+  // A day to answer gives the windows a task of a day had: 2 hours to open, 4 to pick, a day after.
+  expect(windowsForDeadline(86_400)).toEqual({
     commit: 86_400,
     reveal: 7_200,
     pick: 14_400,
     fallback: 86_400,
   });
-  expect(windowsOf(regexForm({ preset: "quick" }))).toEqual(PRESET_WINDOWS.quick);
-  expect(windowsOf(regexForm({ preset: "day" }))).toEqual(PRESET_WINDOWS.day);
+  // An hour, three days and a week, the quick picks.
+  expect(windowsForDeadline(3_600)).toEqual({
+    commit: 3_600,
+    reveal: 300,
+    pick: 600,
+    fallback: 3_600,
+  });
+  expect(windowsForDeadline(259_200)).toEqual({
+    commit: 259_200,
+    reveal: 21_600,
+    pick: 43_200,
+    fallback: 259_200,
+  });
+  expect(windowsForDeadline(604_800)).toEqual({
+    commit: 604_800,
+    reveal: 43_200,
+    pick: 100_800,
+    fallback: 259_200,
+  });
+  // Whatever the deadline, every window after the first is 5 minutes to 3 days, to 5 minutes:
+  // mainnet's least window is 5 minutes and every network's most is 14 days.
+  for (let secs = 1; secs <= 1_209_600; secs = Math.ceil(secs * 1.37) + 7) {
+    const { reveal, pick, fallback } = windowsForDeadline(secs);
+    for (const window of [reveal, pick, fallback]) {
+      expect(window % 300, String(secs)).toBe(0);
+      expect(window, String(secs)).toBeGreaterThanOrEqual(300);
+      expect(window, String(secs)).toBeLessThanOrEqual(259_200);
+    }
+  }
+});
+
+test("a_deadline_is_a_time_in_the_viewer_s_zone_and_the_commit_window_runs_to_it", () => {
+  const now = new Date(2026, 10, 5, 9, 30, 20).getTime();
+  // Rounded up to the minute: never less than asked for.
+  expect(deadlineIn(86_400, now)).toBe("2026-11-06T09:31");
+  expect(deadlineMs("2026-11-06T09:31")).toBe(new Date(2026, 10, 6, 9, 31).getTime());
+  for (const bad of ["", "tomorrow", "2026-11-06", "06/11/2026 09:31"]) {
+    expect(deadlineMs(bad), bad).toBeNull();
+  }
+  // A new form's deadline is a day from now.
+  const form = regexForm({ deadline: emptyForm({ judgeAccount: JUDGE, nowMs: now }).deadline });
+  expect(windowsOf(form, now)).toEqual(windowsForDeadline(86_400 + 40));
+  // The commit window is what is left until the deadline when the calls are made.
+  expect(windowsOf(form, now + 3_600_000)?.commit).toBe(86_400 + 40 - 3_600);
+  // A deadline that has come is no window.
+  expect(windowsOf(form, new Date(2026, 10, 6, 9, 31).getTime())).toBeNull();
+  expect(windowsOf(regexForm({ deadline: "" }), now)).toBeNull();
+});
+
+test("a_deadline_is_held_to_what_the_contract_allows", () => {
+  const now = Date.now();
+  const at = (ms: number) => regexForm({ deadline: deadlineInput(ms) });
+  const check = (form: PostForm, limits = LIMITS) =>
+    checkReward(form, { limits, judgeAccount: JUDGE, nowMs: now }).deadline;
+
+  expect(check(at(now + 86_400_000))).toBeUndefined();
+  expect(check(at(now - 60_000))).toBe("Pick a time at least 1m from now.");
+  expect(check(at(now + 30_000))).toBe("Pick a time at least 1m from now.");
+  expect(check(at(now + 15 * 86_400_000))).toBe("Pick a time within 14d from now.");
+  expect(check(regexForm({ deadline: "" }))).toBe("Pick a date and a time.");
+  // A chain that wants longer windows than those the deadline gives says so, and where to go.
+  const strict = { ...LIMITS, minWindowSecs: 3_600 };
+  expect(check(at(now + 2 * 3_600_000), strict)).toContain("Set each one under More options.");
+  expect(check(at(now + 7 * 86_400_000), strict)).toBeUndefined();
+  // Windows set by hand are checked instead, each by itself.
+  expect(check(regexForm({ timing: "custom", deadline: "" }))).toBeUndefined();
 });
 
 test("custom_windows_are_read_in_their_units_and_each_is_held_to_the_chain_limits", () => {
   const custom = (commit: string, unit: "seconds" | "minutes" | "hours" | "days") =>
     regexForm({
-      preset: "custom",
+      timing: "custom",
       custom: {
         commit: { amount: commit, unit },
         reveal: { amount: "5", unit: "minutes" },
@@ -967,14 +1094,75 @@ test("custom_windows_are_read_in_their_units_and_each_is_held_to_the_chain_limit
     expect(found["window-commit"], bad).toBe("Use a whole number above 0.");
     expect(windowsOf(custom(bad, "minutes")), bad).toBeNull();
   }
-  // A chain that wants longer windows than a preset has says so, and where to go.
-  const strict = { ...LIMITS, minWindowSecs: 3_600 };
+});
+
+test("the_winner_receives_the_reward_less_the_fee_as_the_contract_splits_it", () => {
+  expect(winnerReceives(10_000_000n, 500)).toBe(9_500_000n);
+  // The fee is rounded down, so the winner's share is rounded up: 12.345678 less 0.617283.
+  expect(winnerReceives(12_345_678n, 500)).toBe(11_728_395n);
+  expect(winnerReceives(1n, 500)).toBe(1n);
+  expect(winnerReceives(10_000_000n, 0)).toBe(10_000_000n);
+});
+
+test("invited_agents_are_read_and_held_to_the_contract_s_rules", () => {
+  const BOB = "bob.testnet";
+  const check = (patch: Partial<PostForm>, poster: string | null = "alice.testnet") =>
+    checkReward(regexForm(patch), { limits: LIMITS, judgeAccount: JUDGE, poster });
+
+  expect(check({ invited: "" })).toEqual({});
+  expect(check({ invited: `${BOB}, carol.testnet\n dave.testnet ` })).toEqual({});
+  expect(check({ invited: "Bob" }).invited).toBe(
+    '"Bob" is not a NEAR account. Write one account to a line, like name.near.',
+  );
+  expect(check({ invited: `${BOB} ${BOB}` }).invited).toBe(`${BOB} is listed twice.`);
+  expect(check({ invited: "alice.testnet" }).invited).toContain("You can't invite yourself");
+  // Before a wallet is connected the poster is not known, and not held against the list.
+  expect(check({ invited: "alice.testnet" }, null).invited).toBeUndefined();
+  expect(check({ invited: JUDGE }).invited).toBe(
+    `${JUDGE} checks the work, so it can't be invited.`,
+  );
   expect(
-    checkReward(regexForm({ preset: "quick" }), { limits: strict, judgeAccount: JUDGE }).preset,
-  ).toContain("Use Custom");
-  expect(
-    checkReward(regexForm({ preset: "day" }), { limits: strict, judgeAccount: JUDGE }).preset,
-  ).toBeUndefined();
+    check({ invited: "alice.testnet", verifier: "me" }, "alice.testnet").invited,
+  ).toBeDefined();
+  expect(check({ invited: BOB, verifier: "other", otherVerifier: BOB }).invited).toBe(
+    `${BOB} checks the work, so it can't be invited.`,
+  );
+  const twenty = Array.from({ length: MAX_INVITED }, (_, i) => `a${i}.testnet`).join("\n");
+  expect(check({ invited: twenty }).invited).toBeUndefined();
+  expect(check({ invited: `${twenty}\nb.testnet` }).invited).toBe("Invite 20 agents at most.");
+
+  // The entry limit: none for an open task, as many as are invited unless a number is typed.
+  expect(maxEntriesOf(regexForm({ maxEntries: "3" }))).toBe(0);
+  expect(maxEntriesOf(regexForm({ invited: `${BOB}\ncarol.testnet` }))).toBe(2);
+  expect(maxEntriesOf(regexForm({ invited: BOB, maxEntries: "1" }))).toBe(1);
+  expect(check({ invited: BOB, maxEntries: "0" }).maxEntries).toBe(
+    "Use a whole number above 0, or leave it empty.",
+  );
+  expect(check({ invited: BOB, maxEntries: "two" }).maxEntries).toBeDefined();
+  expect(check({ maxEntries: "two" }).maxEntries).toBeUndefined();
+  // Each account is 4 bytes of length and its own bytes in the task record.
+  expect(inviteBytes(regexForm({ invited: `${BOB}\ncarol.testnet` }))).toBe(4n + 11n + 4n + 13n);
+});
+
+test("an_invite_list_goes_on_chain_and_its_bytes_are_topped_up", () => {
+  const form = regexForm({ invited: "bob.testnet", maxEntries: "1" });
+  const docs = buildDocuments(form);
+  const calls = planPostCalls({
+    form,
+    uris: { brief: "http://api.test/v1/blobs/x" },
+    hashes: docs,
+    vaultBalance: 10_000_000n,
+    storage: {
+      total: (173n + POST_TASK_BYTES) * 10n ** 19n,
+      available: POST_TASK_BYTES * 10n ** 19n,
+    },
+    contractId: CONTRACT,
+    tokenId: TOKEN,
+    judgeAccount: JUDGE,
+  });
+  expect(calls.map(({ methodName }) => methodName)).toEqual(["storage_deposit", "post_task"]);
+  expect(calls[0]?.deposit).toBe((4n + 11n) * 10n ** 19n);
+  expect(calls[1]?.args.task).toMatchObject({ invited: ["bob.testnet"], max_entries: 1 });
 });
 
 test("the_verifier_has_to_be_an_account_this_build_can_name", () => {
@@ -1005,6 +1193,12 @@ test("the_first_token_tender_takes_is_the_default_and_no_token_is_a_reason_to_st
   expect(
     checkReward(regexForm({ token: "gone.testnet" }), { limits: LIMITS, judgeAccount: JUDGE }),
   ).toEqual({});
+  // On testnet the test USDC is the default wherever Tender lists it: it is free to get.
+  const other = { token: "other.testnet", minReward: 1n, maxReward: 10n };
+  const both = { ...LIMITS, tokens: [other, ...LIMITS.tokens] };
+  expect(tokenOf(form, both)?.token).toBe(TOKEN);
+  expect(tokenOf(regexForm({ token: "other.testnet" }), both)?.token).toBe("other.testnet");
+  expect(tokenOf(form, { ...LIMITS, tokens: [other] })?.token).toBe("other.testnet");
 });
 
 test("a_paused_contract_stops_the_reward_step", () => {

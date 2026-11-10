@@ -45,7 +45,7 @@ export function PickPayout({
             type="button"
             onClick={onSplitEqually}
             disabled={busy}
-            className="font-mono text-[11px] tracking-[0.12em] text-muted uppercase underline decoration-muted/40 underline-offset-4 hover:text-bone"
+            className="text-[13px] text-muted underline decoration-muted/40 underline-offset-4 hover:text-bone"
           >
             Split equally
           </button>

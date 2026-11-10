@@ -1,12 +1,13 @@
 import type { Service } from "@tender/shared";
 import Link from "next/link";
+import { agentName } from "../lib/agents";
 import { usePrefetchOnIntent } from "../lib/prefetch";
-import { checkedBy, windowsLine } from "../lib/services";
+import { checkedBy, deliveredLine } from "../lib/services";
 import { describeAmount } from "../lib/vault";
 import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
-import { TeamBadge } from "./TeamBadge";
-import { FACT_LABEL, PRIMARY, TAG } from "./ui";
+import { TeamLabel } from "./TeamBadge";
+import { LINK_CARD, PRIMARY } from "./ui";
 
 /** The small shield of a check, beside who checks the work. */
 function CheckIcon() {
@@ -29,119 +30,101 @@ function CheckIcon() {
 }
 
 /**
- * A service in the directory, as one of the Marketplace's rounded cards: its price at the top, its
- * title, which is the link to its page (the whole card answers a click on it), how the work is
- * checked, the agent's record as the contract counts it (wins, and what it earned, token by token),
- * and the agent and its provider, with the team's label when the team runs them. Hire is a link of
- * its own, above the card's, to the form on the service's page.
+ * A service in the directory, as one of the app's rounded cards: who checks the work, its title,
+ * which is the link to its page (the whole card answers a click on it), two lines of what it does,
+ * the agent that does it (the name it goes by, the team's label when the team runs it, and its
+ * wins), and under a hairline its price, how soon the work is delivered, and Hire, a link of its
+ * own, above the card's, to the form on the service's page. What the agent earned and its provider
+ * are on the agent's page. On that page (`agent` false) the card leaves the agent out.
  *
  * Every word of it but the labels is the provider's, and is shown as text.
  */
 export function ServiceCard({
   service,
   heading = "h2",
+  agent = true,
 }: {
   service: Service;
   /** The level of the card's title: h3 on a page whose section has an h2 of its own. */
   heading?: "h2" | "h3";
+  /** Whether it names its agent: not on the agent's own page, which is about it already. */
+  agent?: boolean;
 }) {
   const Heading = heading;
   const record = service.agent_record;
-  const earned = record === null ? [] : Object.entries(record.earned);
+  const wins = record?.wins ?? 0;
   const intent = usePrefetchOnIntent(`/services/${service.id}`);
   return (
     <li
       {...intent}
       data-testid="service-card"
-      className="group relative flex min-h-72 min-w-0 flex-col rounded-2xl border border-line bg-panel p-5 text-bone transition-colors hover:border-bone/30 has-[a:focus-visible]:border-bone/50 motion-reduce:transition-none sm:p-6"
+      className={`${LINK_CARD} flex min-w-0 flex-col p-6 text-bone sm:p-7`}
     >
-      <div className="flex items-start gap-3">
-        <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-line px-2.5 py-1 text-[11.5px] leading-none whitespace-nowrap text-muted">
+      <div className="flex items-center gap-3">
+        <span className="inline-flex min-w-0 items-center gap-1.5 rounded-full border border-line px-2.5 py-1 text-[12px] leading-none whitespace-nowrap text-muted">
           <CheckIcon />
-          <span data-testid="service-checked">{checkedBy(service)}</span>
+          <span data-testid="service-checked" className="truncate">
+            {checkedBy(service)}
+          </span>
         </span>
-        {/* One line, whatever the price: a figure too wide for the card is cut short, and its title
-            has the whole of it, as the service's page does. */}
-        <span
-          data-testid="service-price"
-          title={describeAmount(BigInt(service.price), service.token)}
-          className="ml-auto min-w-0 truncate text-right text-[17px] leading-tight font-medium tracking-[-0.01em] tabular-nums"
+      </div>
+
+      <Heading className="mt-5 line-clamp-2 text-xl leading-snug font-medium tracking-[-0.02em] wrap-anywhere">
+        <Link
+          href={`/services/${service.id}`}
+          className="rounded-sm after:absolute after:inset-0 after:rounded-2xl after:content-['']"
         >
-          <span className="sr-only">Price: </span>
-          <Amount value={service.price} token={service.token} />
-        </span>
-      </div>
+          {service.title}
+        </Link>
+      </Heading>
+      <p className="mt-2 line-clamp-2 text-[14px] leading-relaxed text-muted wrap-anywhere">
+        {service.description}
+      </p>
 
-      <div className="mt-5 min-w-0">
-        <p className="flex flex-wrap gap-x-3 font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase">
-          <span>#{service.id}</span>
-          <span>{service.category}</span>
-        </p>
-        <Heading className="mt-2 line-clamp-3 text-[19px] leading-snug font-medium tracking-[-0.02em] wrap-anywhere">
-          <Link
-            href={`/services/${service.id}`}
-            className="rounded-sm after:absolute after:inset-0 after:rounded-2xl after:content-['']"
+      {agent ? (
+        <div className="mt-5 flex min-w-0 items-center gap-3 text-[13px]">
+          <Avatar account={service.agent} size={32} square />
+          <p
+            data-testid="service-agent"
+            className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1"
           >
-            {service.title}
-          </Link>
-        </Heading>
-        <p className="mt-2 line-clamp-2 text-[14px] leading-relaxed text-muted wrap-anywhere">
-          {service.description}
-        </p>
-      </div>
-
-      {service.tags.length === 0 ? null : (
-        <ul className="mt-4 flex flex-wrap gap-1.5 text-bone/85" aria-label="Tags">
-          {service.tags.map((tag) => (
-            <li key={tag}>
-              <span className={TAG}>{tag}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-
-      <dl className="mt-5 grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line bg-line">
-        <div className="grid gap-1 bg-ink px-3 py-2.5">
-          <dt className={FACT_LABEL}>Wins</dt>
-          <dd data-testid="service-wins" className="text-lg font-medium tabular-nums">
-            {record?.wins ?? 0}
-          </dd>
+            <span className="sr-only">Agent: </span>
+            <span title={service.agent} className="min-w-0 truncate font-medium text-bone">
+              {agentName({ account: service.agent, name: record?.name ?? null })}
+            </span>
+            {service.is_team ? <TeamLabel /> : null}
+            <span className="whitespace-nowrap text-muted">
+              <span data-testid="service-wins" className="text-bone tabular-nums">
+                {wins}
+              </span>{" "}
+              {wins === 1 ? "win" : "wins"}
+            </span>
+          </p>
         </div>
-        <div className="grid min-w-0 gap-1 bg-ink px-3 py-2.5">
-          <dt className={FACT_LABEL}>Earned</dt>
-          <dd data-testid="service-earned" className="text-[14px] leading-snug wrap-anywhere">
-            {earned.length === 0 ? (
-              <span className="text-muted">Nothing yet</span>
-            ) : (
-              earned.map(([token, amount]) => (
-                <span key={token} className="block">
-                  <Amount value={amount} token={token} />
-                </span>
-              ))
-            )}
-          </dd>
-        </div>
-      </dl>
+      ) : null}
 
-      <div className="mt-auto grid gap-4 pt-5">
-        <p className="text-[12.5px] text-muted">{windowsLine(service)}</p>
-        <div className="flex items-center gap-3 border-t border-line pt-4">
-          <Avatar account={service.agent} size={34} />
-          <div className="grid min-w-0 flex-1 gap-0.5 text-[12.5px]">
-            <p data-testid="service-agent" className="flex min-w-0 items-center">
-              <span className="sr-only">Agent: </span>
-              <TeamBadge account={service.agent} isTeam={service.is_team} truncate />
+      <div className="mt-auto pt-6">
+        <div className="flex items-center gap-3 border-t border-line pt-5">
+          <div className="grid min-w-0 flex-1 grid-cols-1 gap-0.5">
+            {/* One line, whatever the price: a figure too wide for the card is cut short, and its
+                title has the whole of it, as the service's page does. */}
+            <p className="flex min-w-0 items-baseline gap-1.5 font-mono text-[15px]">
+              <span
+                data-testid="service-price"
+                title={describeAmount(BigInt(service.price), service.token)}
+                className="min-w-0 truncate text-bone tabular-nums"
+              >
+                <span className="sr-only">Price: </span>
+                <Amount value={service.price} token={service.token} />
+              </span>
+              <span className="shrink-0 text-[13px] text-muted">/ task</span>
             </p>
-            {service.provider === service.agent ? null : (
-              <p className="truncate text-muted" title={service.provider}>
-                Provider <span className="font-mono">{service.provider}</span>
-              </p>
-            )}
+            <p className="truncate text-[12.5px] text-muted">{deliveredLine(service)}</p>
           </div>
           {/* Above the card's stretched link, so that it is a link of its own. */}
           <Link
             href={`/services/${service.id}#hire`}
-            className={`${PRIMARY} relative z-10 min-h-10 shrink-0 px-4`}
+            className={`${PRIMARY} relative z-10 min-h-10 shrink-0 px-5`}
             aria-label={`Hire: ${service.title}`}
           >
             Hire

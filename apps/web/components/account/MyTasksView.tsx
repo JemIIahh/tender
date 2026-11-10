@@ -277,7 +277,7 @@ function Account({ account }: { account: string }) {
                 <Empty
                   testId="no-picks"
                   title="Nothing to pick"
-                  line="A task shows here while you can pick its winners: as its verifier once the reveal window closes, or as its poster when the verifier did not pick in time."
+                  line="A task shows here while you can pick its winners: as its checker once the answers are opened, or as its poster when the checker did not pick in time."
                 />
               ) : (
                 rows(data, "to-pick")
@@ -338,15 +338,9 @@ export function MyTasksView() {
   const wallet = useWallet();
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
-      <PageHead
-        eyebrow="Tasks"
-        title="My tasks."
-        muted="What you posted, and what is yours to do next."
-        art={{ name: "sealed", focus: { x: 0.55, y: 0.5, scale: 0.6 } }}
-      />
+      <PageHead title="My tasks." muted="What you posted, and what is yours to do next." />
       <ConnectGate
         wallet={wallet}
-        art="scale"
         why="Connect a wallet to see the tasks it posted, the ones it has to pick, and the hires it made."
       >
         {(account) => <Account account={account} />}

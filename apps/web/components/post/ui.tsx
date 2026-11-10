@@ -4,21 +4,21 @@ import type { ReactNode } from "react";
 import type { Errors, PostForm } from "../../lib/post";
 import { FIELD } from "../ui";
 
-// The small pieces the steps of the post wizard are made of: a labelled control with its help and
+// The small pieces the parts of the post form are made of: a labelled control with its help and
 // its problem wired to it, and the choices that are radios. A field's id is `post-<name>`, which is
-// also the key of its problem in `Errors`, so that the wizard can take the person to it.
+// also the key of its problem in `Errors`, so that the form can take the person to it.
 
 export { PRIMARY, SECONDARY } from "../ui";
 
 const CONTROL = FIELD;
 
-/** A field's label, in the mono capitals of the app's labels, in bone: it is read before typing. */
-const LABEL = "font-mono text-[11px] tracking-[0.14em] text-bone uppercase";
+/** A field's label, in bone: it is read before typing. */
+const LABEL = "text-[14px] font-medium text-bone";
 
 /** A box inside a step: a part of the form that belongs together. */
 export const BOX = "grid min-w-0 content-start gap-3 rounded-xl border border-line bg-ink p-4";
 
-/** What every step is given. */
+/** What every part of the form is given. */
 export interface StepProps {
   form: PostForm;
   update(patch: Partial<PostForm>): void;

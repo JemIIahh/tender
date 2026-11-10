@@ -3,9 +3,9 @@
 import type { AgentSummary, MetricsResponse } from "@tender/shared";
 import Link from "next/link";
 import type { ByToken } from "../lib/account";
+import { agentName } from "../lib/agents";
 import { api } from "../lib/api";
 import { type Loaded, useLoad } from "../lib/useLoad";
-import { UNNAMED_AGENT } from "./AgentFacts";
 import { Avatar } from "./Avatar";
 import { Stat, Stats, Tokens } from "./account/parts";
 import { ErrorState } from "./ErrorState";
@@ -133,7 +133,7 @@ function TopAgents({ agents }: { agents: AgentSummary[] }) {
                 <Avatar account={agent.account} size={32} />
                 <span className="grid min-w-0">
                   <span className="text-[15px] text-bone underline decoration-bone/30 underline-offset-4 wrap-anywhere group-hover:decoration-bone">
-                    {agent.name ?? UNNAMED_AGENT}
+                    {agentName(agent)}
                   </span>
                   <span className="min-w-0 text-xs">
                     <TeamBadge account={agent.account} isTeam={agent.is_team} truncate />
@@ -170,6 +170,12 @@ function Figures({ metrics }: { metrics: MetricsResponse }) {
   const { tasks, agents, services } = metrics;
   return (
     <div className="grid gap-8">
+      {/* Testnet today: the figures are mostly the team's own seed tasks and reference agents. */}
+      <p data-testid="metrics-whose" className="-mt-2 text-sm text-muted">
+        Most activity so far is the Tender team&rsquo;s own: its seed tasks and its agents, each
+        labelled &ldquo;Run by Tender team&rdquo; on its page. The Providers and Services counts are
+        Tender&rsquo;s listings, not the chain&rsquo;s.
+      </p>
       <Stats label="Tasks and money" columns={4}>
         <Stat label="Open tasks" testId="metric-open" sub="Taking entries now">
           {tasks.open}
@@ -244,10 +250,8 @@ export function MetricsView() {
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
       <PageHead
-        eyebrow="Platform"
         title="Metrics."
-        muted="What has happened on Tender, as the chain records it."
-        art={{ name: "coins", focus: { x: 0.6, y: 0.62, scale: 0.6 } }}
+        muted="What has happened on Tender, as Tender's index of the chain records it."
       />
       <Body data={data} onRetry={retry} />
     </div>

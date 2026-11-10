@@ -26,6 +26,14 @@ test("sidebar_becomes_a_rail_and_back_and_the_mark_moves_to_the_top_bar", async 
   await expect(barMark).toBeHidden();
   await expect(sideMark).toBeVisible();
   await expect(nav(page).getByText("Browse agents")).toBeVisible();
+  // At 1440 by 900 every link is in view, the last one too, above the Live block pinned under them.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const how = nav(page).getByRole("link", { name: "How it works" });
+  await expect(how).toBeInViewport({ ratio: 1 });
+  const live = page.getByTestId("sidebar-live");
+  await expect(live).toBeInViewport({ ratio: 1 });
+  const [howBox, liveBox] = await Promise.all([how.boundingBox(), live.boundingBox()]);
+  expect((howBox?.y ?? 0) + (howBox?.height ?? 0)).toBeLessThanOrEqual(liveBox?.y ?? 0);
 
   await expect(toggle(page)).toHaveAttribute("aria-expanded", "true");
   await toggle(page).click();
@@ -36,7 +44,7 @@ test("sidebar_becomes_a_rail_and_back_and_the_mark_moves_to_the_top_bar", async 
   await expect(sideMark).toBeHidden();
   // Every link is still there, as an icon the size of the rail, the page you are on still marked.
   const links = nav(page).getByRole("link");
-  await expect(links).toHaveCount(15);
+  await expect(links).toHaveCount(12);
   for (const link of await links.all()) {
     const box = await link.boundingBox();
     expect(box?.width).toBeCloseTo(40, 0);
@@ -94,8 +102,13 @@ test("sidebar_shortcut_toggles_it_but_not_from_a_text_field", async ({ page }) =
   await page.keyboard.press("Meta+b");
   await settledWidth(page, 240);
 
-  // In the board's tag field, ⌘B is the field's.
-  const field = page.getByRole("textbox").first();
+  // In a text field, ⌘B is the field's. The board has none of its own: one goes on the page.
+  await page.evaluate(() => {
+    const input = document.createElement("input");
+    input.setAttribute("aria-label", "A field");
+    document.querySelector("main")?.prepend(input);
+  });
+  const field = page.getByRole("textbox", { name: "A field" });
   await field.focus();
   await page.keyboard.press("Control+b");
   await page.keyboard.press("Meta+b");
@@ -155,11 +168,11 @@ test("sidebar_rail_names_each_icon_in_a_tooltip_beside_it", async ({ page }) => 
   await settledWidth(page, 64);
   await expect(tip).toHaveText(/^Show sidebar/);
 
-  const providers = nav(page).getByRole("link", { name: "Providers" });
-  await providers.hover();
-  await expect(tip).toHaveText("Providers");
+  const services = nav(page).getByRole("link", { name: "Services" });
+  await services.hover();
+  await expect(tip).toHaveText("Services");
   // Beside the icon, outside the rail, and not cut off by it.
-  const [link, box] = await Promise.all([providers.boundingBox(), tip.boundingBox()]);
+  const [link, box] = await Promise.all([services.boundingBox(), tip.boundingBox()]);
   expect(box?.x ?? 0).toBeGreaterThan(64);
   const middle = (link?.y ?? 0) + (link?.height ?? 0) / 2;
   expect(Math.abs((box?.y ?? 0) + (box?.height ?? 0) / 2 - middle)).toBeLessThan(2);
@@ -195,6 +208,7 @@ test("sidebar_on_a_phone_is_the_menu_and_has_no_rail", async ({ page }) => {
 
   // The menu, with every page by its words.
   await page.getByRole("button", { name: "Menu" }).click();
-  await expect(nav(page).getByText("Providers")).toBeVisible();
+  await expect(nav(page).getByText("Services")).toBeVisible();
   await expect(nav(page).getByText("Add an agent")).toBeVisible();
+  await expect(page.getByTestId("sidebar-live")).toBeVisible();
 });

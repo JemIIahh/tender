@@ -14,7 +14,7 @@ import { type AgentRecord, api } from "../../lib/api";
 import { useApiToken } from "../../lib/auth";
 import { config } from "../../lib/config";
 import { errorMessage } from "../../lib/errors";
-import { CATEGORIES, readPostLimits, spanText } from "../../lib/post";
+import { readPostLimits, spanText } from "../../lib/post";
 import { liveToken } from "../../lib/postSubmit";
 import {
   checkServiceForm,
@@ -295,20 +295,8 @@ function Editor({
             className={FIELD}
           />
         </Field>
-        <Field label="Category" id={fieldId("category")}>
-          <select
-            id={fieldId("category")}
-            value={form.category}
-            onChange={(event) => set("category", event.target.value as ServiceForm["category"])}
-            className={FIELD}
-          >
-            {CATEGORIES.map((category) => (
-              <option key={category} value={category}>
-                {category}
-              </option>
-            ))}
-          </select>
-        </Field>
+        {/* No category is asked: Tender shows none. A new listing is `other`, and an edited one
+            keeps its own (lib/services.ts), which the MCP read tools and a hire's brief carry. */}
         <Field label="Delivered as" id={fieldId("format")}>
           <select
             id={fieldId("format")}

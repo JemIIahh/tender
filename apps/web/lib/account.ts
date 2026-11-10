@@ -262,15 +262,25 @@ async function mapLimit<T, R>(
   return results;
 }
 
-/** The win of `agent` in `detail`, if its outcome is a pick with the agent among the winners. */
+/**
+ * The win of `agent` in `detail`, if its outcome is a pick with the agent among the winners. `net`
+ * is what the chain paid it. The chain records one fee for the task, so `fee` is the winner's part
+ * of it, by its share: each part rounded down, and what that leaves over given to the first winner,
+ * as the contract gives the first winner the dust of the payouts, so that the parts add up to the
+ * task's fee and each `gross` (`net + fee`) to the reward.
+ */
 export function winOf(agent: AgentRecord, detail: TaskDetailResponse): Win | null {
   const { task } = detail;
   const outcome = task.outcome;
   if (outcome === null || outcome.kind !== "picked") return null;
-  const winner = outcome.winners.find((candidate) => candidate.account === agent.account);
+  const at = outcome.winners.findIndex((candidate) => candidate.account === agent.account);
+  const winner = outcome.winners[at];
   if (winner === undefined) return null;
   const net = BigInt(winner.amount);
-  const fee = (BigInt(outcome.fee) * BigInt(winner.bps)) / 10_000n;
+  const total = BigInt(outcome.fee);
+  const parts = outcome.winners.map((one) => (total * BigInt(one.bps)) / 10_000n);
+  const left = total - parts.reduce((sum, part) => sum + part, 0n);
+  const fee = (parts[at] ?? 0n) + (at === 0 ? left : 0n);
   return {
     agent,
     taskId: task.id,

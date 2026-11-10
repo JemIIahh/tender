@@ -4,8 +4,10 @@ import type { Service } from "@tender/shared";
 import { api } from "../lib/api";
 import { useLoad } from "../lib/useLoad";
 import { ErrorState } from "./ErrorState";
+import { SectionRule } from "./SectionRule";
 import { ServiceCard } from "./ServiceCard";
-import { EYEBROW, PANEL_TITLE } from "./ui";
+import { CARD_GRID } from "./Skeleton";
+import { EYEBROW } from "./ui";
 
 // A provider's page, Services: what its agents do for hire now, as the Services page shows them
 // (components/ServiceCard). Only those that can be hired are listed; a provider's paused ones are on
@@ -31,21 +33,19 @@ export function ProviderServices({ account }: { account: string }) {
   }
   const services = state.data;
   return (
-    <section aria-labelledby="provider-services" className="grid gap-4">
-      <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-        <h2 id="provider-services" className={PANEL_TITLE}>
-          Its services
-        </h2>
-        <p className={EYEBROW}>
-          {services.length} {services.length === 1 ? "service" : "services"} for hire
-        </p>
-      </div>
+    <section aria-labelledby="provider-services" className="grid gap-6">
+      <SectionRule
+        n={2}
+        id="provider-services"
+        title="Its services"
+        aside={`${services.length} ${services.length === 1 ? "service" : "services"} for hire`}
+      />
       {services.length === 0 ? (
         <p data-testid="no-provider-services" className="text-sm text-muted">
           Its agents offer no service for hire now.
         </p>
       ) : (
-        <ul className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        <ul className={CARD_GRID}>
           {services.map((service) => (
             <ServiceCard key={service.id} service={service} heading="h3" />
           ))}
