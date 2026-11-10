@@ -838,9 +838,15 @@ test("a_brief_is_checked_against_what_the_schema_allows", () => {
 test("checks_are_validated_for_each_kind", () => {
   const opts = { canRubric: true };
 
-  // exact
+  // exact: worded for the checker chosen, the Judge, the poster or another account.
   expect(checkChecks(exactForm({ expected: " \n\n" }), opts).expected).toBe(
     "Write at least one answer the Judge will accept, one to a line.",
+  );
+  expect(checkChecks(exactForm({ expected: "", verifier: "me" }), opts).expected).toBe(
+    "Write at least one answer you will accept, one to a line.",
+  );
+  expect(checkChecks(exactForm({ expected: "", verifier: "other" }), opts).expected).toBe(
+    "Write at least one answer the checker will accept, one to a line.",
   );
   // json_schema
   expect(checkChecks(jsonForm({ schema: "" }), opts).schema).toBe(

@@ -108,6 +108,16 @@ function WindowRow({ name, ...props }: StepProps & { name: WindowName }) {
   );
 }
 
+/**
+ * What the hidden cases of a regex rule do, for the checker chosen: the Judge scores on them alone;
+ * any other checker picks as it chooses, and the rule says what it should score on.
+ */
+function heldoutScoring(verifier: Verifier): string {
+  if (verifier === "judge") return "If set, the Judge scores on these only.";
+  const who = verifier === "me" ? "You pick" : "The checker picks";
+  return `If set, the rule says to score on these only. ${who}, so applying it is up to ${verifier === "me" ? "you" : "them"}.`;
+}
+
 export function MoreOptions(
   props: StepProps & {
     open: boolean;
@@ -235,7 +245,7 @@ export function MoreOptions(
               <div className="grid gap-4 sm:grid-cols-2">
                 <AreaField
                   label="Hidden: should match"
-                  help={`Optional. One per line. If set, the Judge scores on these only. ${HIDDEN_HELP}`}
+                  help={`Optional. One per line. ${heldoutScoring(form.verifier)} ${HIDDEN_HELP}`}
                   rows={3}
                   mono
                   {...bindText(props, "heldoutMatch")}

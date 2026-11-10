@@ -503,6 +503,22 @@ test.each([
   },
 );
 
+test("the_hidden_cases_say_what_they_do_for_the_checker_chosen", async () => {
+  const { user } = setup({ vault: TUSDC(5) });
+  render(<PostTask judgeAccount={JUDGE} />);
+  await pickKind(user, /Regex cases/);
+  const help = () => screen.getByText(/One per line\. If set, /).textContent ?? "";
+
+  // The Judge scores on them alone; any other checker picks as it chooses.
+  expect(help()).toContain("If set, the Judge scores on these only.");
+  await chooseChecker(user, "me");
+  expect(help()).toContain("If set, the rule says to score on these only. You pick");
+  expect(help()).not.toContain("the Judge scores");
+  await chooseChecker(user, "other", BOB);
+  expect(help()).toContain("The checker picks");
+  expect(help()).not.toContain("the Judge scores");
+});
+
 test("a_checker_who_is_not_the_judge_is_told_where_to_pick", async () => {
   const { user } = setup({ vault: TUSDC(5) });
   render(<PostTask judgeAccount={JUDGE} />);

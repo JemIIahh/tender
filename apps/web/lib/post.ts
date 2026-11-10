@@ -522,6 +522,12 @@ function pointProblem(point: string): RubricProblem | null {
   return rubricCriteriaProblem({ min_score: RUBRIC_MIN_SCORE, rubric: [{ criterion: point }] });
 }
 
+/** Who accepts an answer, as the form's checker is: the Judge, you, or the account it names. */
+function accepter(form: Pick<PostForm, "verifier">): string {
+  if (form.verifier === "judge") return "the Judge";
+  return form.verifier === "me" ? "you" : "the checker";
+}
+
 export function checkChecks(form: PostForm, options: { canRubric: boolean }): Errors {
   const errors: Errors = {};
 
@@ -547,7 +553,7 @@ export function checkChecks(form: PostForm, options: { canRubric: boolean }): Er
   switch (form.kind) {
     case "exact":
       if (linesOf(form.expected).length === 0) {
-        errors.expected = "Write at least one answer the Judge will accept, one to a line.";
+        errors.expected = `Write at least one answer ${accepter(form)} will accept, one to a line.`;
       }
       break;
 
