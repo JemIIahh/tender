@@ -113,14 +113,17 @@ test("my_agents_asks_to_connect_and_reads_nothing_until_then", async () => {
   await user.click(screen.getByRole("button", { name: "Connect wallet" }));
 
   expect(provider.connects).toBe(1);
-  expect(await screen.findAllByTestId("my-agent")).toHaveLength(3);
+  // The account's own row and the rows under it come from two reads: wait for all three.
+  await waitFor(() => expect(screen.getAllByTestId("my-agent")).toHaveLength(3));
 });
 
 test("my_agents_lists_the_account_itself_first_then_the_agents_under_it_with_their_record", async () => {
   const state = aliceAndHerAgents();
   open(state);
 
-  const rows = await screen.findAllByTestId("my-agent");
+  // The account's own row and the rows under it come from two reads: wait for all three.
+  await waitFor(() => expect(screen.getAllByTestId("my-agent")).toHaveLength(3));
+  const rows = screen.getAllByTestId("my-agent");
   expect(rows.map((one) => within(one).getByTestId("my-agent-account").textContent)).toEqual([
     ALICE,
     SCOUT,
@@ -170,7 +173,8 @@ test("my_agents_lists_the_account_itself_first_then_the_agents_under_it_with_the
 test("the_bond_fields_show_each_agents_status_and_bond_when_the_api_sends_them", async () => {
   open(aliceAndHerAgents(true));
 
-  const [alice, scout, long] = (await screen.findAllByTestId("my-agent")) as [
+  await waitFor(() => expect(screen.getAllByTestId("my-agent")).toHaveLength(3));
+  const [alice, scout, long] = screen.getAllByTestId("my-agent") as [
     HTMLElement,
     HTMLElement,
     HTMLElement,
