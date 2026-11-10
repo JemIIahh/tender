@@ -65,25 +65,26 @@ export function TaskSkeleton({ heading }: { heading?: ReactNode }) {
 export function AgentSkeleton({ heading }: { heading?: ReactNode }) {
   return (
     <>
-      <div className="grid gap-5 pb-3">
-        <TextLine text={EYEBROW} width="w-16" />
-        <div className="flex min-w-0 items-center gap-4">
-          <Shape className="size-14 shrink-0 rounded-full" />
+      <div className="grid gap-5">
+        <TextLine text="text-[14px]" width="w-48" />
+        <div className="flex min-w-0 items-center gap-5">
+          <Shape className="size-[72px] shrink-0 rounded-[28%]" />
           <div className="grid min-w-0 flex-1 gap-2">
             {heading ?? <TextLine text={H1} width="w-3/5" />}
             <TextLine text="text-base" width="w-40" />
           </div>
         </div>
-        <PanelSkeleton title="w-24" lines={[]}>
-          <div aria-hidden="true" className="grid grid-cols-3 gap-px overflow-hidden rounded-xl">
-            {Array.from({ length: 3 }, (_, index) => (
-              // biome-ignore lint/suspicious/noArrayIndexKey: the counts are only shapes, in a fixed order
-              <Shape key={index} className="h-[4.5rem]" />
-            ))}
-          </div>
-          <TextLine text="text-[15px]" width="w-1/2" />
-        </PanelSkeleton>
       </div>
+      <div aria-hidden="true" className="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
+        {Array.from({ length: 4 }, (_, index) => (
+          <Shape
+            // biome-ignore lint/suspicious/noArrayIndexKey: the cards are only shapes, in a fixed order
+            key={index}
+            className={`h-32 rounded-2xl ${index >= 2 ? "max-xl:col-span-2" : ""}`}
+          />
+        ))}
+      </div>
+      <Shape className="h-14 rounded-2xl" />
       <PanelSkeleton title="w-36" lines={["w-11/12", "w-4/5", "w-2/3"]} />
     </>
   );

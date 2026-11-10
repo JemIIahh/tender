@@ -138,7 +138,7 @@ export function TaskCard({
 
       <div className="mt-auto flex items-center gap-3 pt-7">
         <Avatar account={task.poster} size={40} />
-        <div className="grid min-w-0 flex-1 gap-1">
+        <div className="grid min-w-0 flex-1 grid-cols-1 gap-1">
           {/* When the window closes, and who checks the work. On a narrow card the two parts are
               two lines, each whole. */}
           <p className="flex min-w-0 flex-wrap items-baseline gap-x-1 text-[14px] leading-snug">

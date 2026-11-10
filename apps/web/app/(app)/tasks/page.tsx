@@ -388,7 +388,7 @@ function BoardView() {
   }, [ready, nowNs]);
 
   return (
-    <div className="mx-auto grid w-full max-w-[1400px] gap-8">
+    <div className="mx-auto grid w-full max-w-[1400px] grid-cols-1 gap-8">
       <PageHead title="Tasks for agents." muted="Pick one, get paid." />
 
       <div className="grid gap-6">

@@ -8,42 +8,35 @@ import { useLoad } from "../lib/useLoad";
 import { AgentCard } from "./AgentCard";
 import { Avatar } from "./Avatar";
 import { Tokens } from "./account/parts";
+import { EmptyState } from "./EmptyState";
 import { ErrorState } from "./ErrorState";
 import { Count, EarnedNothing, FigureLine } from "./Figures";
-import { PageHead } from "./PageHead";
+import { Breadcrumbs, type Crumb, PageHead } from "./PageHead";
 import { ProviderServices } from "./ProviderServices";
-import { CardsSkeleton } from "./Skeleton";
+import { SectionRule } from "./SectionRule";
+import { CARD_GRID, CardsSkeleton } from "./Skeleton";
 import { StatsSkeleton } from "./SkeletonLists";
 import { TeamLabel } from "./TeamBadge";
-import { CARD, EYEBROW, FACT_LABEL, PANEL_TITLE } from "./ui";
+import { CARD, FACT_LABEL, PRIMARY } from "./ui";
 
 // A provider's page: the account, the combined record of the agents it runs, and the agents, as the
 // directory shows them (components/AgentCard). The agents are those the API lists under it
 // (`GET /v1/agents?asp=`); the page adds up only what the API counted.
 
-function Back() {
-  return (
-    <Link
-      href="/providers"
-      className={`${EYEBROW} inline-flex min-h-10 w-fit items-center gap-2 rounded-md transition-colors hover:text-bone motion-reduce:transition-none`}
-    >
-      <svg
-        viewBox="0 0 16 16"
-        aria-hidden="true"
-        className="size-3.5"
-        fill="none"
-        stroke="currentColor"
-      >
-        <path d="M13 8H3M7 4L3 8l4 4" strokeWidth="1.6" />
-      </svg>
-      All providers
-    </Link>
-  );
+/** The trail to a provider's page: Providers is a tab of Browse agents. */
+function crumbs(last: string): Crumb[] {
+  return [
+    { label: "Marketplace", href: "/tasks" },
+    { label: "Agents", href: "/agents" },
+    { label: "Providers", href: "/providers" },
+    { label: last },
+  ];
 }
 
 function Head({ account, isTeam }: { account: string; isTeam: boolean }) {
   return (
     <PageHead
+      crumbs={crumbs(account)}
       title={
         <span className="flex min-w-0 items-center gap-4">
           <Avatar account={account} size={56} />
@@ -64,7 +57,7 @@ function Head({ account, isTeam }: { account: string; isTeam: boolean }) {
   );
 }
 
-/** One figure of the record: its label in mono capitals over it, and a few words beside it. */
+/** One figure of the record: its label over it, and a few words beside it. */
 function Figure({
   label,
   testId,
@@ -162,16 +155,14 @@ function Record({ fleet }: { fleet: Fleet }) {
 
 function Agents({ fleet }: { fleet: Fleet }) {
   return (
-    <section aria-labelledby="fleet-agents" className="grid gap-4">
-      <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-        <h2 id="fleet-agents" className={PANEL_TITLE}>
-          Its agents
-        </h2>
-        <p className={EYEBROW}>
-          {fleet.agents.length} {fleet.agents.length === 1 ? "agent" : "agents"}
-        </p>
-      </div>
-      <ul className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+    <section aria-labelledby="fleet-agents" className="grid gap-6">
+      <SectionRule
+        n={1}
+        id="fleet-agents"
+        title="Its agents"
+        aside={`${fleet.agents.length} ${fleet.agents.length === 1 ? "agent" : "agents"}`}
+      />
+      <ul className={CARD_GRID}>
         {fleet.agents.map((agent) => (
           <AgentCard key={agent.account} agent={agent} heading="h3" />
         ))}
@@ -187,11 +178,11 @@ function Agents({ fleet }: { fleet: Fleet }) {
 
 function NoAgents({ account }: { account: string }) {
   return (
-    <p data-testid="no-fleet" className={`${CARD} p-6 text-muted wrap-anywhere`}>
+    <EmptyState testId="no-fleet" title="No agents yet.">
       {canProvide(account)
         ? "No agents run under this account yet."
         : "No agents run under this account: a provider's account has two labels or more, as acme.near has."}
-    </p>
+    </EmptyState>
   );
 }
 
@@ -205,22 +196,26 @@ export function ProviderView({ account }: { account: string }) {
 
   if (!valid) {
     return (
-      <div className="mx-auto grid w-full max-w-[1400px] gap-6">
-        <Back />
+      <div className="mx-auto grid w-full max-w-[1400px] grid-cols-1 gap-6">
+        <Breadcrumbs crumbs={crumbs("Provider")} />
         <h1 className="text-3xl font-semibold tracking-[-0.03em] text-bone sm:text-[2.6rem]">
           Provider
         </h1>
-        <p className={`${CARD} p-6 text-muted`}>There is no provider with this account.</p>
+        <EmptyState
+          title="There is no provider with this account."
+          action={
+            <Link href="/providers" className={PRIMARY}>
+              All providers
+            </Link>
+          }
+        />
       </div>
     );
   }
   const fleet = state.status === "ready" ? state.data : null;
   return (
-    <div className="mx-auto grid w-full max-w-[1400px] gap-8">
-      <div className="grid gap-3">
-        <Back />
-        <Head account={account} isTeam={fleet?.isTeam ?? false} />
-      </div>
+    <div className="mx-auto grid w-full max-w-[1400px] grid-cols-1 gap-8">
+      <Head account={account} isTeam={fleet?.isTeam ?? false} />
       {state.status === "idle" || state.status === "loading" ? (
         <>
           <p role="status" className="sr-only">

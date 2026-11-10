@@ -95,7 +95,7 @@ export function HeadSkeleton({
 }
 
 /** The grid of cards of the board and the directories: one column, two on a tablet, three wide. */
-export const CARD_GRID = "grid gap-6 md:grid-cols-2 xl:grid-cols-3";
+export const CARD_GRID = "grid grid-cols-1 gap-6 md:grid-cols-2 xl:grid-cols-3";
 
 /** A card of the board, or of a directory, while it loads: its outline and its parts' places. */
 export function CardSkeleton() {

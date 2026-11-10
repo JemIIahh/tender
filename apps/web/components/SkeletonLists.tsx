@@ -16,6 +16,19 @@ export function BoardFiltersSkeleton() {
   );
 }
 
+/** The tabs under Browse agents (components/DirectoryTabs), over their hairline. */
+export function TabsSkeleton() {
+  return (
+    <div aria-hidden="true" className="flex gap-7 border-b border-line">
+      {["w-14", "w-[4.5rem]"].map((width) => (
+        <span key={width} className="flex min-h-11 items-center pb-1">
+          <TextLine text="text-[15px]" width={width} />
+        </span>
+      ))}
+    </div>
+  );
+}
+
 /** A stat block (components/account/parts.tsx, `Stat`): its label, its figure and its line. */
 function StatSkeleton() {
   return (

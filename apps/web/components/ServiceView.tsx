@@ -27,6 +27,7 @@ import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
 import { CriteriaDetail } from "./CriteriaSection";
 import { ErrorState } from "./ErrorState";
+import { Breadcrumbs } from "./PageHead";
 import { ServiceSkeleton } from "./SkeletonDetail";
 import { TeamBadge } from "./TeamBadge";
 import {
@@ -458,15 +459,13 @@ function ReadyView({
   return (
     <article className="mx-auto grid w-full max-w-[1200px] gap-6">
       <header className="grid gap-4 pb-2">
-        <p className={EYEBROW}>
-          Service #{service.id} <span className="text-seal">&gt;</span>{" "}
-          <Link
-            href="/services"
-            className="normal-case tracking-normal underline decoration-bone/30 underline-offset-4 hover:text-bone"
-          >
-            All services
-          </Link>
-        </p>
+        <Breadcrumbs
+          crumbs={[
+            { label: "Marketplace", href: "/tasks" },
+            { label: "Services", href: "/services" },
+            { label: `Service #${service.id}` },
+          ]}
+        />
         <h1 className={`${H1} wrap-anywhere`}>{service.title}</h1>
         <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
           <Avatar account={service.agent} size={40} />

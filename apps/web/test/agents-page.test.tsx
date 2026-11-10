@@ -1,10 +1,9 @@
-import type { AgentDetailResponse, AgentSummary, Phase } from "@tender/shared";
+import type { AgentDetailResponse, AgentSummary, Phase, Service } from "@tender/shared";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { AgentDirectory } from "../components/AgentDirectory";
-import { UNNAMED_AGENT } from "../components/AgentFacts";
 import { AgentView } from "../components/AgentView";
 import { agent, HASH_C, summary, TOKEN } from "./tasks";
 
@@ -95,15 +94,57 @@ const detailOf = (who: AgentSummary, recent = RECENT) =>
 const tasksPage = (tasks: unknown[], next: string | null = null) =>
   json({ tasks, next_cursor: next });
 
-/** A `fetch` that hands each request, as a URL, to `handler`, and writes down path and query. */
+/** The services the API lists, for the directory's prices and an agent's page: none by default. */
+const listed = vi.hoisted(() => ({ current: [] as unknown[] }));
+
+/**
+ * A `fetch` that hands each request, as a URL, to `handler`, and writes down path and query. The
+ * services, which the directory and an agent's page read beside the agents, are answered from
+ * `listed` and written down apart (`serviceCalls`), so that `calls` are the agents' reads.
+ */
 function fakeApi(handler: (url: URL, call: number) => Response | Promise<Response>) {
   const calls: string[] = [];
+  const serviceCalls: string[] = [];
   vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
     const url = new URL(String(input));
+    if (url.pathname === "/v1/services") {
+      serviceCalls.push(`${url.pathname}${url.search}`);
+      const agent = url.searchParams.get("agent");
+      const services = listed.current.filter(
+        (one) => agent === null || (one as Service).agent === agent,
+      );
+      return json({ services, next_cursor: null });
+    }
     calls.push(`${url.pathname}${url.search}`);
     return handler(url, calls.length);
   });
-  return { calls };
+  return { calls, serviceCalls };
+}
+
+/** A service of `agent`'s at `price` (tUSDC's smallest unit), as the API lists one. */
+function serviceOf(agentAccount: string, id: string, price: string): Service {
+  return {
+    id,
+    provider: agentAccount,
+    agent: agentAccount,
+    title: `Service ${id}`,
+    description: "Does one thing well.",
+    tags: [],
+    category: "research",
+    output_format: "text",
+    token: TOKEN,
+    price,
+    commit_secs: 3_600,
+    reveal_secs: 1_800,
+    pick_secs: 3_600,
+    verification: { kind: "hirer" },
+    status: "active",
+    available: true,
+    is_team: false,
+    created_at: "2026-11-01T00:00:00.000Z",
+    updated_at: "2026-11-01T00:00:00.000Z",
+    agent_record: null,
+  };
 }
 
 /** A gate: what waits on `opens` goes on when `open` is called. */
@@ -126,60 +167,82 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   search.current = new URLSearchParams();
+  listed.current = [];
 });
 
+/** The card whose name (its heading) is `name`. */
 const cardOf = (cards: HTMLElement[], name: string): HTMLElement => {
-  const found = cards.find((card) => within(card).queryByRole("link", { name }) !== null);
+  const found = cards.find((card) => within(card).queryByRole("heading", { name }) !== null);
   if (found === undefined) throw new Error(`no card for ${name}`);
   return found;
 };
 
 // ---- The directory ----------------------------------------------------------------------------
 
-test("directory_shows_each_agent_with_what_it_has_done_and_earned", async () => {
+test("directory_shows_each_agent_with_one_line_of_what_it_has_done", async () => {
   fakeApi(() => agentsPage([alice, carol, judge]));
   render(<AgentDirectory />);
 
   const cards = await screen.findAllByTestId("agent-card");
 
   expect(cards).toHaveLength(3);
-  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Agents");
-  const mine = cardOf(cards, "Alice Extractor");
-  expect(within(mine).getByRole("link", { name: "Alice Extractor" }).getAttribute("href")).toBe(
-    `/agents/${ALICE}`,
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
+    "Browse agents. Hire one that fits.",
   );
-  expect(mine.textContent).toContain(ALICE);
-  expect(within(mine).getByTestId("asp").textContent).toBe("provider.testnet");
-  expect(within(mine).getByTestId("entries").textContent).toBe("5");
-  expect(within(mine).getByTestId("reveals").textContent).toBe("4");
-  expect(within(mine).getByTestId("wins").textContent).toBe("2");
-  expect(
-    within(within(mine).getByLabelText("Tags"))
-      .getAllByRole("listitem")
-      .map((tag) => tag.textContent),
-  ).toEqual(["extraction", "json"]);
-  expect(within(mine).getByTestId("picks-made").textContent).toBe("0");
-  expect(within(mine).getByTestId("voids-after-reveals").textContent).toBe("0");
+  const mine = cardOf(cards, "Alice Extractor");
+  // The card's link is its round arrow, named for the agent, and it stretches over the card.
+  const link = within(mine).getByRole("link", { name: "Open agent: Alice Extractor" });
+  expect(link.getAttribute("href")).toBe(`/agents/${ALICE}`);
+  expect(link.className).toContain("after:inset-0");
+  expect(within(mine).getByTestId("agent-account").textContent).toBe(ALICE);
+  // One line: wins, entries, and what it earned in the tokens the app knows (its page has all).
+  expect(within(mine).getByTestId("agent-stats").textContent).toBe(
+    "2 wins · 5 entries · 2.50 tUSDC earned",
+  );
+  // The rest is on its page, not on its card.
+  for (const id of ["asp", "picks-made", "voids-after-reveals", "agent-verifier-record"]) {
+    expect(within(mine).queryByTestId(id), id).toBeNull();
+  }
+  expect(within(cardOf(cards, "Carol Research")).getByTestId("agent-stats").textContent).toBe(
+    "0 wins · 1 entry",
+  );
+  expect(within(cardOf(cards, "Tender Judge")).getByTestId("agent-stats").textContent).toBe(
+    "No entries yet",
+  );
+});
 
-  // Earned, a token at a time: each is its own line, in its own token, and nothing adds them up.
-  const earned = within(within(mine).getByTestId("earned"));
-  expect(earned.getAllByTestId("amount").map((amount) => amount.textContent)).toEqual([
-    "2.50 tUSDC",
-    `7 ${OTHER_TOKEN}`,
-  ]);
-  expect(earned.getAllByRole("listitem")).toHaveLength(2);
+test("directory_shows_the_cheapest_service_of_an_agent_that_lists_one", async () => {
+  listed.current = [
+    serviceOf(ALICE, "1", "3000000"),
+    serviceOf(ALICE, "2", "2000000"),
+    // A token the app has no decimals for is not compared with the others.
+    { ...serviceOf(ALICE, "3", "5"), token: OTHER_TOKEN },
+  ];
+  const api = fakeApi(() => agentsPage([alice, carol]));
+  render(<AgentDirectory />);
 
-  // An agent that has earned nothing, and one that runs under no provider, say so.
-  const hers = cardOf(cards, "Carol Research");
-  expect(within(hers).getByTestId("earned").textContent).toBe("Nothing yet");
-  expect(within(hers).getByTestId("asp").textContent).toBe("none");
-  expect(within(hers).getByTestId("picks-made").textContent).toBe("3");
+  const cards = await screen.findAllByTestId("agent-card");
+  const mine = cardOf(cards, "Alice Extractor");
+  await waitFor(() =>
+    expect(within(mine).getByTestId("agent-from").textContent).toBe("From 2.00 tUSDC / task"),
+  );
+  // An agent that lists none shows no price.
+  expect(within(cardOf(cards, "Carol Research")).queryByTestId("agent-from")).toBeNull();
+  // The services are read once, beside the agents.
+  expect(api.serviceCalls).toEqual(["/v1/services?limit=50"]);
+});
 
-  // The verifier record is on the card of an agent that has judged.
-  const theirs = cardOf(cards, "Tender Judge");
-  const record = within(within(theirs).getByTestId("agent-verifier-record"));
-  expect(record.getByTestId("picks-made").textContent).toBe("12");
-  expect(record.getByTestId("voids-after-reveals").textContent).toBe("1");
+test("directory_shows_its_agents_without_prices_when_the_services_can_t_be_read", async () => {
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/v1/services") return serverFault();
+    return agentsPage([alice]);
+  });
+  render(<AgentDirectory />);
+  const [card] = await screen.findAllByTestId("agent-card");
+  await settle();
+  expect(within(card as HTMLElement).queryByTestId("agent-from")).toBeNull();
+  expect(screen.queryByTestId("error-state")).toBeNull();
 });
 
 test("directory_marks_the_agents_the_team_runs_and_only_those", async () => {
@@ -192,88 +255,103 @@ test("directory_marks_the_agents_the_team_runs_and_only_those", async () => {
   expect(badges).toHaveLength(1);
   expect(badges[0]?.textContent).toBe("Run by Tender team");
   expect(cardOf(cards, "Tender Judge").contains(badges[0] as HTMLElement)).toBe(true);
-  // The provider line names an account and nothing more: the API can't say whose it is.
   expect(within(cardOf(cards, "Alice Extractor")).queryByTestId("team-badge")).toBeNull();
 });
 
-test("directory_names_an_agent_with_no_public_profile_as_such", async () => {
-  fakeApi(() => agentsPage([agent({ account: "ghost.testnet", name: null, tags: [] })]));
+test("directory_calls_an_agent_with_no_public_profile_by_the_first_part_of_its_account", async () => {
+  fakeApi(() =>
+    agentsPage([agent({ account: "analyst.acme.testnet", name: null, tags: [], is_team: false })]),
+  );
   render(<AgentDirectory />);
 
   const [card] = await screen.findAllByTestId("agent-card");
 
+  expect(within(card as HTMLElement).getByRole("heading").textContent).toBe("analyst");
   expect(
     within(card as HTMLElement)
-      .getByRole("link", { name: UNNAMED_AGENT })
+      .getByRole("link", { name: "Open agent: analyst" })
       .getAttribute("href"),
-  ).toBe("/agents/ghost.testnet");
-  // No tags, no list of them.
-  expect(within(card as HTMLElement).queryByLabelText("Tags")).toBeNull();
+  ).toBe("/agents/analyst.acme.testnet");
+  expect(card?.textContent).not.toContain("Unnamed agent");
 });
 
-test("directory_filters_by_the_tag_in_the_address_and_offers_the_tags_the_agents_have", async () => {
-  search.current = new URLSearchParams("tag=research");
-  fakeApi(() => agentsPage([alice, carol, judge]));
+test("directory_searches_by_name_or_account_over_what_it_has", async () => {
+  const api = fakeApi(() => agentsPage([alice, carol, judge]));
+  const user = userEvent.setup();
   render(<AgentDirectory />);
+  await screen.findAllByTestId("agent-card");
+  const field = screen.getByRole("searchbox", { name: "Search by name or account" });
 
-  const cards = await screen.findAllByTestId("agent-card");
-
-  expect(cards).toHaveLength(1);
-  expect(
-    within(cards[0] as HTMLElement).getByRole("link", { name: "Carol Research" }),
-  ).toBeTruthy();
-  // Every tag of every agent, once, in order; each a link to the filtered view.
-  const chips = within(screen.getByRole("navigation", { name: "Filter by tag" })).getAllByRole(
-    "link",
-  );
-  expect(chips.map((chip) => [chip.textContent, chip.getAttribute("href")])).toEqual([
-    ["All", "/agents"],
-    ["extraction", "/agents?tag=extraction"],
-    ["json", "/agents?tag=json"],
-    ["judge", "/agents?tag=judge"],
-    ["research", "/agents?tag=research"],
-    ["summaries", "/agents?tag=summaries"],
+  await user.type(field, "carol");
+  expect(screen.getAllByTestId("agent-card").map((card) => card.textContent)).toEqual([
+    expect.stringContaining("Carol Research"),
   ]);
-  expect(chips.filter((chip) => chip.getAttribute("aria-current") === "true")).toHaveLength(1);
-  expect(screen.getByRole("link", { name: "research" }).getAttribute("aria-current")).toBe("true");
+  expect(screen.getByText("1 shown")).toBeTruthy();
+
+  // An account's words count too, in any case.
+  await user.clear(field);
+  await user.type(field, "TENDER-TEAM");
+  expect(screen.getAllByTestId("agent-card")).toHaveLength(1);
+  expect(within(screen.getByTestId("agent-card")).getByRole("heading").textContent).toBe(
+    "Tender Judge",
+  );
+
+  // Nothing matches: one line, and the way back to every agent.
+  await user.clear(field);
+  await user.type(field, "nobody at all");
+  expect(screen.queryAllByTestId("agent-card")).toEqual([]);
+  expect(screen.getByTestId("no-matching-agents").textContent).toContain("No agent matches.");
+  // The search is over what was read: no request is made for it.
+  expect(api.calls).toEqual(["/v1/agents?limit=50"]);
 });
 
-test("directory_with_no_tag_marks_all_and_lists_every_agent", async () => {
-  fakeApi(() => agentsPage([alice, carol, judge]));
+test("directory_sorts_the_newest_first_or_the_most_wins_first", async () => {
+  const older = agent({ ...carol, registered_height: "50", wins: 9 });
+  const newer = agent({ ...alice, registered_height: "300", wins: 2 });
+  fakeApi(() => agentsPage([older, judge, newer]));
+  const user = userEvent.setup();
   render(<AgentDirectory />);
+  await screen.findAllByTestId("agent-card");
+  const names = () =>
+    screen
+      .getAllByTestId("agent-card")
+      .map((card) => within(card).getByRole("heading").textContent);
+  const order = within(screen.getByRole("group", { name: "Order" }));
 
-  const cards = await screen.findAllByTestId("agent-card");
+  expect(order.getByRole("button", { name: "Newest" }).getAttribute("aria-pressed")).toBe("true");
+  expect(names()).toEqual(["Alice Extractor", "Tender Judge", "Carol Research"]);
 
-  expect(cards).toHaveLength(3);
-  expect(screen.getByRole("link", { name: "All" }).getAttribute("aria-current")).toBe("true");
+  await user.click(order.getByRole("button", { name: "Most wins" }));
+
+  expect(names()).toEqual(["Carol Research", "Alice Extractor", "Tender Judge"]);
 });
 
-test("directory_reads_the_tag_as_a_tag_is_written", async () => {
+test("directory_narrows_by_the_tag_in_the_address_and_clear_takes_it_off", async () => {
   search.current = new URLSearchParams("tag=%20Research%20");
   fakeApi(() => agentsPage([alice, carol, judge]));
   render(<AgentDirectory />);
 
   const cards = await screen.findAllByTestId("agent-card");
 
+  // A tag of an older link is read as a tag is written, and still narrows the list.
   expect(cards).toHaveLength(1);
+  expect(within(cards[0] as HTMLElement).getByRole("heading").textContent).toBe("Carol Research");
+  expect(screen.getByRole("link", { name: "Clear" }).getAttribute("href")).toBe("/agents");
+  // No row of tags to choose from.
+  expect(screen.queryByRole("navigation", { name: "Filter by tag" })).toBeNull();
 });
 
-test("directory_says_so_when_no_agent_has_the_tag_and_keeps_the_filter", async () => {
+test("directory_says_so_when_no_agent_has_the_tag", async () => {
   search.current = new URLSearchParams("tag=nothing");
   fakeApi(() => agentsPage([alice, carol, judge]));
   render(<AgentDirectory />);
 
-  expect((await screen.findByTestId("no-agents")).textContent).toBe(
-    "No agent has the tag nothing.",
-  );
-  // And the way back to every agent.
+  const empty = await screen.findByTestId("no-matching-agents");
+  expect(empty.textContent).toContain("No agent has the tag nothing.");
   expect(screen.getByRole("link", { name: "Show all agents" }).getAttribute("href")).toBe(
     "/agents",
   );
-
   expect(screen.queryAllByTestId("agent-card")).toEqual([]);
-  // The way back is still there.
-  expect(screen.getByRole("link", { name: "All" }).getAttribute("href")).toBe("/agents");
 });
 
 test("directory_says_back_only_what_is_a_tag", async () => {
@@ -284,41 +362,24 @@ test("directory_says_back_only_what_is_a_tag", async () => {
     ["Nothing", "No agent has the tag nothing."],
     ["z".repeat(24), `No agent has the tag ${"z".repeat(24)}.`],
     // The address can hold anything else, of any length, and none of it is said back.
-    ["z".repeat(25), "No agent has that tag."],
-    ["x".repeat(200), "No agent has that tag."],
-    ["<b>bold</b>", "No agent has that tag."],
-    ["two words", "No agent has that tag."],
-    ["under_score", "No agent has that tag."],
+    ["z".repeat(25), "No agent matches."],
+    ["x".repeat(200), "No agent matches."],
+    ["<b>bold</b>", "No agent matches."],
+    ["two words", "No agent matches."],
+    ["under_score", "No agent matches."],
   ];
 
   for (const [tag, said] of tags) {
     search.current = new URLSearchParams({ tag });
     const { unmount } = render(<AgentDirectory />);
 
-    const line = await screen.findByTestId("no-agents");
+    const empty = await screen.findByTestId("no-matching-agents");
 
-    expect(line.textContent, tag).toBe(said);
-    // The line breaks wherever it has to, so that nothing in it makes the page wider.
-    expect(line.className, tag).toContain("wrap-anywhere");
+    expect(within(empty).getByText(said), tag).toBeTruthy();
+    expect(empty.textContent, tag).not.toContain("<b>");
+    expect(empty.textContent, tag).not.toContain("x".repeat(200));
     unmount();
   }
-});
-
-test("directory_lists_a_tag_an_agent_repeats_each_time_it_is_written", async () => {
-  // The contract checks how many tags there are and what they are made of, not that they differ.
-  fakeApi(() =>
-    agentsPage([agent({ account: "dup.testnet", name: "Dup", tags: ["x", "x", "y"] })]),
-  );
-  render(<AgentDirectory />);
-
-  const [card] = await screen.findAllByTestId("agent-card");
-
-  const chips = within(within(card as HTMLElement).getByLabelText("Tags")).getAllByRole("listitem");
-  expect(chips.map((chip) => chip.textContent)).toEqual(["x", "x", "y"]);
-  // The filter lists a tag once. A repeated key is a warning React writes to the console.
-  const filter = within(screen.getByRole("navigation", { name: "Filter by tag" }));
-  expect(filter.getAllByRole("link").map((link) => link.textContent)).toEqual(["All", "x", "y"]);
-  expect(console.error).not.toHaveBeenCalled();
 });
 
 test("directory_with_no_agents_says_so", async () => {
@@ -326,11 +387,13 @@ test("directory_with_no_agents_says_so", async () => {
   render(<AgentDirectory />);
 
   expect((await screen.findByText("No agents yet.")).tagName).toBe("P");
-
-  expect(screen.queryByRole("navigation", { name: "Filter by tag" })).toBeNull();
+  expect(screen.getByRole("link", { name: "Add an agent" }).getAttribute("href")).toBe(
+    "/my-agents/new",
+  );
+  expect(screen.queryByRole("searchbox")).toBeNull();
 });
 
-test("directory_reads_every_page_before_it_shows_the_tags", async () => {
+test("directory_reads_every_page_before_it_shows_any", async () => {
   const api = fakeApi((url) =>
     url.searchParams.get("cursor") === null ? agentsPage([alice], ALICE) : agentsPage([carol]),
   );
@@ -340,8 +403,7 @@ test("directory_reads_every_page_before_it_shows_the_tags", async () => {
 
   expect(cards).toHaveLength(2);
   expect(api.calls).toEqual(["/v1/agents?limit=50", `/v1/agents?limit=50&cursor=${ALICE}`]);
-  // A tag of the second page is there to choose.
-  expect(screen.getByRole("link", { name: "research" })).toBeTruthy();
+  expect(screen.getByText("2 shown")).toBeTruthy();
   expect(screen.queryByTestId("agents-truncated")).toBeNull();
 });
 
@@ -458,11 +520,32 @@ test("agent_page_shows_the_profile_the_recent_entries_and_the_lineage", async ()
   const title = await loadedHeading();
 
   expect(title.textContent).toBe("Alice Extractor");
+  // Breadcrumbs from the Marketplace, the last step the page itself.
+  const trail = within(screen.getByRole("navigation", { name: "Breadcrumbs" }));
+  expect(trail.getAllByRole("link").map((link) => link.getAttribute("href"))).toEqual([
+    "/tasks",
+    "/agents",
+  ]);
+  expect(trail.getByText("Alice Extractor").getAttribute("aria-current")).toBe("page");
   expect(screen.getByTestId("account").textContent).toBe(ALICE);
   expect(screen.queryByTestId("team-badge")).toBeNull();
-  expect(screen.getByTestId("asp").textContent).toBe("provider.testnet");
+  // The four stat cards, and the strip of its provider, its record as a checker and when it joined.
   expect(screen.getByTestId("wins").textContent).toBe("2");
-  expect(screen.getByTestId("agent-verifier-record")).toBeTruthy();
+  expect(screen.getByTestId("entries").textContent).toBe("5");
+  expect(screen.getByTestId("reveals").textContent).toBe("4");
+  expect(screen.getByRole("button", { name: "Copy account" })).toBeTruthy();
+  expect(screen.getByTestId("asp").textContent).toBe("provider.testnet");
+  expect(within(screen.getByTestId("asp")).getByRole("link").getAttribute("href")).toBe(
+    "/providers/provider.testnet",
+  );
+  const record = within(screen.getByTestId("agent-verifier-record"));
+  expect(record.getByTestId("picks-made").textContent).toBe("0");
+  expect(record.getByTestId("voids-after-reveals").textContent).toBe("0");
+  // The numbered sections.
+  for (const name of ["Services", "Recent tasks", "Record"]) {
+    expect(screen.getByRole("heading", { level: 2, name }), name).toBeTruthy();
+  }
+  expect(await screen.findByTestId("no-agent-services")).toBeTruthy();
   expect(
     within(screen.getByTestId("earned"))
       .getAllByTestId("amount")
@@ -507,7 +590,7 @@ test("agent_page_shows_the_profile_the_recent_entries_and_the_lineage", async ()
 
   // The tasks it posted, each with the task it is a subtask of, if it is one.
   const lineage = await screen.findAllByTestId("lineage-task");
-  expect(screen.getByRole("heading", { level: 2, name: "Tasks it posted" })).toBeTruthy();
+  expect(screen.getByRole("heading", { level: 3, name: "Tasks it posted" })).toBeTruthy();
   expect(lineage).toHaveLength(2);
   expect(lineage[0]?.textContent).toContain("Check every rule of the account id");
   expect(within(lineage[0] as HTMLElement).getByTestId("phase-chip").textContent).toBe("Revealing");
@@ -519,8 +602,34 @@ test("agent_page_shows_the_profile_the_recent_entries_and_the_lineage", async ()
   expect(within(lineage[1] as HTMLElement).queryByTestId("parent-link")).toBeNull();
   expect(screen.queryByTestId("lineage-more")).toBeNull();
 
-  // The agent is read first, and its tasks after it, by its account.
+  // The agent is read first, and its tasks and its services after it, by its account.
   expect(api.calls).toEqual([`/v1/agents/${ALICE}`, `/v1/tasks?poster=${ALICE}&limit=50`]);
+  expect(api.serviceCalls).toEqual([`/v1/services?agent=${ALICE}&limit=50`]);
+});
+
+test("agent_page_lists_its_services_and_says_what_the_cheapest_costs", async () => {
+  listed.current = [serviceOf(ALICE, "1", "3000000"), serviceOf(ALICE, "2", "2000000")];
+  fakeApi(routes());
+  render(<AgentView account={ALICE} />);
+  await loadedHeading();
+
+  const cards = await screen.findAllByTestId("service-card");
+  expect(cards).toHaveLength(2);
+  // Under the section's h2, each service's title is an h3.
+  expect(within(cards[0] as HTMLElement).getByRole("heading", { level: 3 }).textContent).toBe(
+    "Service 1",
+  );
+  // The way down to them, with the cheapest price.
+  const pill = screen.getByRole("link", { name: /See services/ });
+  expect(pill.getAttribute("href")).toBe("#agent-services");
+  expect(within(pill).getByTestId("agent-from").textContent).toBe("From 2.00 tUSDC / task");
+});
+
+test("agent_page_calls_an_agent_with_no_profile_by_its_account_s_first_part", async () => {
+  fakeApi(routes(agent({ ...alice, name: null })));
+  render(<AgentView account={ALICE} />);
+  expect((await loadedHeading()).textContent).toBe("alice");
+  expect(screen.getByText(/No public profile yet/)).toBeTruthy();
 });
 
 test("agent_page_does_not_call_a_task_nobody_has_picked_a_loss", async () => {

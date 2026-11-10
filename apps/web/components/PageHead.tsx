@@ -14,7 +14,7 @@ export interface Crumb {
  */
 export function Breadcrumbs({ crumbs }: { crumbs: readonly Crumb[] }) {
   return (
-    <nav aria-label="Breadcrumbs">
+    <nav aria-label="Breadcrumbs" className="min-w-0">
       <ol className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[14px] text-muted">
         {crumbs.map((crumb, index) => (
           // biome-ignore lint/suspicious/noArrayIndexKey: the trail is fixed for the page, in its order
@@ -59,7 +59,7 @@ export function PageHead({
   children?: ReactNode;
 }) {
   return (
-    <header className="grid gap-3">
+    <header className="grid grid-cols-1 gap-3">
       {crumbs === undefined ? null : <Breadcrumbs crumbs={crumbs} />}
       <h1 className={`${H1} wrap-anywhere`}>
         {title}

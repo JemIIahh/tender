@@ -17,7 +17,7 @@ export default function Loading() {
         phone={["w-1/2"]}
       />
       <div className="grid gap-4">
-        <Shape className="h-11 w-full max-w-xl rounded-xl" />
+        <Shape className="h-11 w-full max-w-2xl rounded-full" />
         <ChipsSkeleton />
       </div>
       <CardsSkeleton count={6} />

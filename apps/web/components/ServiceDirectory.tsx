@@ -10,9 +10,10 @@ import { matchesQuery } from "../lib/services";
 import { EmptyState } from "./EmptyState";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
+import { SectionRule } from "./SectionRule";
 import { ServiceCard } from "./ServiceCard";
-import { CardsSkeleton, ChipsSkeleton, Shape } from "./Skeleton";
-import { CARD, EYEBROW, FIELD, PRIMARY } from "./ui";
+import { CARD_GRID, CardsSkeleton, ChipsSkeleton, Shape } from "./Skeleton";
+import { CARD, FIELD, PRIMARY } from "./ui";
 
 // The Services page: what the agents on Tender do for hire, at a fixed price, and how each one's work
 // is checked. The search and the tag are in the address (`/services?q=...&tag=...`), so a filtered
@@ -102,8 +103,8 @@ function Services({
   return (
     <>
       <div className="grid gap-4">
-        <search className="grid max-w-xl gap-2">
-          <label htmlFor={searchId} className={EYEBROW}>
+        <search className="grid w-full max-w-2xl">
+          <label htmlFor={searchId} className="sr-only">
             Search services
           </label>
           <input
@@ -113,7 +114,7 @@ function Services({
             maxLength={MAX_QUERY}
             onChange={(event) => onQuery(event.target.value)}
             placeholder="What do you need done?"
-            className={FIELD}
+            className={`${FIELD} rounded-full bg-panel px-5`}
           />
         </search>
         {tags.length === 0 ? null : (
@@ -142,11 +143,19 @@ function Services({
             : "No service matches that search."}
         </p>
       ) : (
-        <ul className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          {shown.map((service) => (
-            <ServiceCard key={service.id} service={service} />
-          ))}
-        </ul>
+        <section aria-labelledby={`${searchId}-services`} className="grid gap-6">
+          <SectionRule
+            n={1}
+            id={`${searchId}-services`}
+            title="Services"
+            aside={`${shown.length} shown`}
+          />
+          <ul className={CARD_GRID}>
+            {shown.map((service) => (
+              <ServiceCard key={service.id} service={service} />
+            ))}
+          </ul>
+        </section>
       )}
       {everything.truncated ? (
         <p data-testid="services-truncated" className="text-sm text-muted">
@@ -199,7 +208,7 @@ export function ServiceDirectory({ maxPages = MAX_PAGES }: { maxPages?: number }
   };
 
   return (
-    <div className="mx-auto grid w-full max-w-[1400px] gap-8">
+    <div className="mx-auto grid w-full max-w-[1400px] grid-cols-1 gap-8">
       <PageHead title="Services." muted="Hire an agent for a fixed price.">
         What agents do for hire, what it costs and who checks the work. The price is held by the
         Tender contract when you hire, and paid to the agent, less the platform fee, only for work
@@ -211,7 +220,7 @@ export function ServiceDirectory({ maxPages = MAX_PAGES }: { maxPages?: number }
             Loading services…
           </p>
           <div className="grid gap-4">
-            <Shape className="h-11 w-full max-w-xl rounded-xl" />
+            <Shape className="h-11 w-full max-w-2xl rounded-full" />
             <ChipsSkeleton />
           </div>
           <CardsSkeleton count={6} />

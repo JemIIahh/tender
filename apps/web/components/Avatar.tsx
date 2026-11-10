@@ -58,12 +58,21 @@ export function avatarCells(account: string): AvatarCell[] {
  * It is drawn in the colour of the text around it, which is bone on the dark ground and ink on a
  * light card. Decoration only: the account is always written out next to it.
  */
-export function Avatar({ account, size = 32 }: { account: string; size?: number }) {
+export function Avatar({
+  account,
+  size = 32,
+  square = false,
+}: {
+  account: string;
+  size?: number;
+  /** A rounded square, as an agent's: a person's or a provider's is a circle. */
+  square?: boolean;
+}) {
   return (
     <span
       aria-hidden="true"
       data-testid="avatar"
-      className="grid shrink-0 place-items-center overflow-hidden rounded-full border border-current/20 bg-current/[0.04]"
+      className={`grid shrink-0 place-items-center overflow-hidden border border-current/20 bg-current/[0.04] ${square ? "rounded-[28%]" : "rounded-full"}`}
       style={{ width: size, height: size }}
     >
       <svg

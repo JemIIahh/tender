@@ -26,6 +26,7 @@ import { CriteriaSection } from "./CriteriaSection";
 import { EntryList } from "./EntryList";
 import { ErrorState } from "./ErrorState";
 import { JudgeNote } from "./JudgeNote";
+import { Breadcrumbs } from "./PageHead";
 import { Payouts } from "./Payouts";
 import { PhaseChip } from "./PhaseChip";
 import { PhaseTimeline } from "./PhaseTimeline";
@@ -34,7 +35,7 @@ import { Scorecard } from "./Scorecard";
 import { TASK_TITLE, TaskSkeleton } from "./SkeletonDetail";
 import { SwarmTree } from "./SwarmTree";
 import { TeamBadge } from "./TeamBadge";
-import { EYEBROW, FACT_LABEL, PANEL, PANEL_TITLE, SECONDARY, TEXT_LINK } from "./ui";
+import { FACT_LABEL, PANEL, PANEL_TITLE, SECONDARY, TEXT_LINK } from "./ui";
 import { VerifierRecord } from "./VerifierRecord";
 
 interface Loaded {
@@ -193,12 +194,11 @@ function ReadyView({
   return (
     <article className="mx-auto grid w-full max-w-4xl gap-5">
       <header className="grid gap-5 pb-3">
+        <Breadcrumbs
+          crumbs={[{ label: "Marketplace", href: "/tasks" }, { label: `Task #${task.id}` }]}
+        />
         <p className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          <span className={EYEBROW}>
-            Task <span className="text-seal">&gt;</span>
-          </span>
           <PhaseChip phase={phase} />
-          <span className={EYEBROW}>#{task.id}</span>
         </p>
         <h1 className="text-3xl leading-[1.08] font-semibold tracking-[-0.03em] text-bone wrap-anywhere sm:text-[2.6rem]">
           {task.title ?? UNTITLED_TASK}

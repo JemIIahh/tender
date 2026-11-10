@@ -22,7 +22,6 @@ import { STUB_WALLET_NAME } from "./walletStub";
 const cards = (page: Page) => page.getByTestId("agent-card");
 const card = (page: Page, name: string) =>
   cards(page).filter({ has: page.getByRole("heading", { name }) });
-const tagFilter = (page: Page) => page.getByRole("navigation", { name: "Filter by tag" });
 
 test("agents_directory_shows_team_badge", async ({ page }) => {
   await routeApi(page);
@@ -39,63 +38,64 @@ test("agents_directory_shows_team_badge", async ({ page }) => {
     await expect(card(page, name).getByTestId("team-badge")).toHaveCount(0);
   }
 
-  // A card: the account, the provider, the counts, and what was earned, a token at a time.
+  // A card: the account under the name, and one line of wins, entries and what it earned in the
+  // tokens the app knows; one that has entered nothing says so.
   const alice = card(page, "Alice Extractor");
-  await expect(alice).toContainText(ALICE);
-  await expect(alice.getByTestId("asp")).toHaveText("provider.testnet");
-  await expect(alice.getByTestId("entries")).toHaveText("5");
-  await expect(alice.getByTestId("reveals")).toHaveText("4");
-  await expect(alice.getByTestId("wins")).toHaveText("2");
-  await expect(alice.getByTestId("earned").getByTestId("amount")).toHaveText([
+  await expect(alice.getByTestId("agent-account")).toHaveText(ALICE);
+  await expect(alice.getByTestId("agent-stats")).toHaveText(
+    "2 wins · 5 entries · 2.50 tUSDC earned",
+  );
+  await expect(card(page, "Tender Judge").getByTestId("agent-stats")).toHaveText("No entries yet");
+  // The provider, the record as a checker and every token earned are on the agent's page.
+  await expect(alice.getByTestId("asp")).toHaveCount(0);
+  await card(page, "Tender Judge").click();
+  await expect(page).toHaveURL(new RegExp(`/agents/${JUDGE}$`), { timeout: 20_000 });
+  const record = page.getByTestId("agent-verifier-record");
+  await expect(record.getByTestId("picks-made")).toHaveText("12");
+  await expect(record.getByTestId("voids-after-reveals")).toHaveText("1");
+  await page.goto(`/agents/${ALICE}`);
+  await expect(page.getByTestId("earned").getByTestId("amount")).toHaveText([
     "2.50 tUSDC",
     `7 ${OTHER_TOKEN}`,
   ]);
-  // An agent with no provider says so; one that won nothing says that.
-  await expect(card(page, "Carol Research").getByTestId("asp")).toHaveText("none");
-  // One that has entered and won nothing says so in one line, with no empty boxes.
-  await expect(card(page, "Tender Judge").getByTestId("agent-figures")).toHaveText(
-    "0 entries·0 reveals·0 wins·earned nothing yet",
-  );
-
-  // The verifier record: how many times the agent picked, and voided after reveals.
-  const judge = card(page, "Tender Judge");
-  await expect(judge.getByTestId("picks-made")).toHaveText("12");
-  await expect(judge.getByTestId("voids-after-reveals")).toHaveText("1");
 });
 
-test("agents_directory_filters_by_tag_and_a_filtered_view_can_be_linked", async ({ page }) => {
+test("agents_directory_searches_sorts_and_a_tagged_view_can_still_be_linked", async ({ page }) => {
   await routeApi(page);
   await routeAgents(page);
   await page.goto("/agents");
   await expect(cards(page)).toHaveCount(AGENTS.length);
+  await expect(page.getByText(`${AGENTS.length} shown`)).toBeVisible();
+  // No row of tags: a search and an order.
+  await expect(page.getByRole("navigation", { name: "Filter by tag" })).toHaveCount(0);
 
-  // The tags are the ones the agents list.
-  await expect(tagFilter(page).getByRole("link", { name: "All" })).toHaveAttribute(
-    "aria-current",
+  const search = page.getByRole("searchbox", { name: "Search by name or account" });
+  await search.fill("carol");
+  await expect(cards(page)).toHaveCount(1);
+  await expect(card(page, "Carol Research")).toBeVisible();
+  await search.fill("");
+  await expect(cards(page)).toHaveCount(AGENTS.length);
+
+  // Most wins first: the widest agent has the most.
+  await page.getByRole("button", { name: "Most wins" }).click();
+  await expect(page.getByRole("button", { name: "Most wins" })).toHaveAttribute(
+    "aria-pressed",
     "true",
   );
-  for (const tag of ["coding", "extraction", "judge", "research", "summaries"]) {
-    await expect(tagFilter(page).getByRole("link", { name: tag, exact: true })).toBeVisible();
-  }
+  await expect(cards(page).first()).toContainText(WIDE);
 
-  await tagFilter(page).getByRole("link", { name: "research", exact: true }).click();
-  await expect(page).toHaveURL(/\/agents\?tag=research$/);
+  // A tag in the address still narrows the list: an older link loads as it was.
+  await page.goto("/agents?tag=research");
   await expect(cards(page)).toHaveCount(2);
   await expect(card(page, "Carol Research")).toBeVisible();
   await expect(card(page, "Tender Scout")).toBeVisible();
-  await expect(
-    tagFilter(page).getByRole("link", { name: "research", exact: true }),
-  ).toHaveAttribute("aria-current", "true");
 
-  // The address is the view: it loads as it was.
-  await page.goto("/agents?tag=extraction");
-  await expect(cards(page)).toHaveCount(1);
-  await expect(card(page, "Alice Extractor")).toBeVisible();
-
-  // A tag nobody has is said so, and All shows everyone again.
+  // A tag nobody has is said so, and Show all agents shows everyone again.
   await page.goto("/agents?tag=unheard-of");
-  await expect(page.getByTestId("no-agents")).toHaveText("No agent has the tag unheard-of.");
-  await tagFilter(page).getByRole("link", { name: "All" }).click();
+  await expect(page.getByTestId("no-matching-agents")).toContainText(
+    "No agent has the tag unheard-of.",
+  );
+  await page.getByRole("link", { name: "Show all agents" }).click();
   await expect(page).toHaveURL(/\/agents$/);
   await expect(cards(page)).toHaveCount(AGENTS.length);
 });
@@ -332,7 +332,7 @@ test("agents_and_telegram_pages_fit_a_phone_and_show_the_keyboard_focus", async 
   await expect(cards(page)).toHaveCount(AGENTS.length);
   await expectToFit(page, "/agents");
   expect(await tabThrough(page, "/agents")).toEqual(
-    expect.arrayContaining(["All", "Alice Extractor", "Carol Research"]),
+    expect.arrayContaining(["Open agent: Alice Extractor", "Open agent: Carol Research"]),
   );
   await page.goto(`/agents?tag=${"a".repeat(24)}`);
   await expect(cards(page)).toHaveCount(1);
@@ -340,10 +340,12 @@ test("agents_and_telegram_pages_fit_a_phone_and_show_the_keyboard_focus", async 
   // An address can hold any text. What is no tag is not said back, and nothing in the line makes
   // the page wider; a tag nobody has is said back.
   await page.goto(`/agents?tag=${"x".repeat(200)}`);
-  await expect(page.getByTestId("no-agents")).toHaveText("No agent has that tag.");
+  await expect(page.getByTestId("no-matching-agents")).toContainText("No agent matches.");
   await expectToFit(page, "/agents?tag=<200 characters>");
   await page.goto(`/agents?tag=${"z".repeat(24)}`);
-  await expect(page.getByTestId("no-agents")).toHaveText(`No agent has the tag ${"z".repeat(24)}.`);
+  await expect(page.getByTestId("no-matching-agents")).toContainText(
+    `No agent has the tag ${"z".repeat(24)}.`,
+  );
   await expectToFit(page, "/agents?tag=<24 characters nobody has>");
   await page.goto(`/agents/${WIDE}`);
   await expect(page.getByTestId("recent-entry")).toHaveCount(1);

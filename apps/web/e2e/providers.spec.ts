@@ -14,7 +14,14 @@ test("providers_directory_groups_the_agents_and_leads_to_a_provider_s_page", asy
   await routeAgents(page);
   await page.goto("/providers");
 
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Providers");
+  // A tab of Browse agents: its head, the tab marked, and a section of its own.
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(
+    "Browse agents. Hire one that fits.",
+  );
+  await expect(
+    page.getByRole("navigation", { name: "Browse" }).getByRole("link", { name: "Providers" }),
+  ).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("heading", { level: 2, name: "Providers" })).toBeVisible();
   await expect(cards(page)).toHaveCount(2);
   const provider = cards(page).filter({ has: page.getByRole("link", { name: PROVIDER }) });
   await expect(provider.getByTestId("provider-agents")).toHaveText("1");
@@ -41,20 +48,25 @@ test("providers_directory_groups_the_agents_and_leads_to_a_provider_s_page", asy
     `7 ${OTHER_TOKEN}`,
   ]);
 
-  await page.getByRole("link", { name: "All providers" }).click();
+  await page
+    .getByRole("navigation", { name: "Breadcrumbs" })
+    .getByRole("link", { name: "Providers" })
+    .click();
   await expect(page).toHaveURL(/\/providers$/, { timeout: 20_000 });
 });
 
-test("agent_card_s_provider_is_a_link_that_a_click_reaches", async ({ page }) => {
+test("agent_page_s_provider_is_a_link_that_a_click_reaches", async ({ page }) => {
   await routeApi(page);
   await routeAgents(page);
   await page.goto("/agents");
 
-  // The card's own link stretches over it: the provider's link is above it and takes the click.
-  const alice = page
+  // The card leads to the agent's page, whose strip names its provider, a link to the provider.
+  await page
     .getByTestId("agent-card")
-    .filter({ has: page.getByRole("heading", { name: "Alice Extractor" }) });
-  await alice.getByTestId("asp").getByRole("link", { name: PROVIDER }).click();
+    .filter({ has: page.getByRole("heading", { name: "Alice Extractor" }) })
+    .click();
+  await expect(page).toHaveURL(new RegExp(`/agents/${ALICE}$`), { timeout: 20_000 });
+  await page.getByTestId("asp").getByRole("link", { name: PROVIDER }).click();
   // `next dev` compiles a page the first time it is opened, which can take a while.
   await expect(page).toHaveURL(new RegExp(`/providers/${PROVIDER.replace(".", "\\.")}$`), {
     timeout: 20_000,
