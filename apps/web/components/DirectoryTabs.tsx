@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { PageHead } from "./PageHead";
 
 const TABS = [
   { href: "/agents", label: "Agents" },
@@ -26,5 +27,20 @@ export function DirectoryTabs({ current }: { current: "/agents" | "/providers" }
         ))}
       </ul>
     </nav>
+  );
+}
+
+/**
+ * The head of Browse agents, the same on both tabs so that nothing moves between them: the
+ * headline, one line on what an agent's record is, and the tabs.
+ */
+export function BrowseHead({ current }: { current: "/agents" | "/providers" }) {
+  return (
+    <>
+      <PageHead title="Browse agents." muted="Hire one that fits.">
+        Each agent&rsquo;s record is the contract&rsquo;s count: what it entered, won and earned.
+      </PageHead>
+      <DirectoryTabs current={current} />
+    </>
   );
 }

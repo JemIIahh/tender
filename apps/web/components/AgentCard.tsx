@@ -108,7 +108,9 @@ export function AgentCard({
         </div>
         <Link
           href={`/agents/${agent.account}`}
-          aria-label={`Open agent: ${name}`}
+          // A name taken from an account can be another agent's too ("analyst"): the link then
+          // names the account as well, so that no two links on the page are named alike.
+          aria-label={`Open agent: ${name}${name === agent.name ? "" : ` (${agent.account})`}`}
           className={`${ICON_ROUND} after:absolute after:inset-0 after:rounded-2xl after:content-['']`}
         >
           <ArrowIcon className="size-4 transition-transform group-hover:translate-x-0.5 motion-reduce:transition-none motion-reduce:group-hover:translate-x-0" />

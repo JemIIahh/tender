@@ -60,7 +60,7 @@ export function TaskCard({
   /** The Tender Judge's account, if this build knows it. */
   judgeAccount?: string | null;
 }) {
-  const soft = featured ? "text-neutral-700" : "text-muted";
+  const soft = featured ? "text-ink/70" : "text-muted";
   // Whether the app knows the token's decimals, so that the reward reads as a figure.
   const known = knowsToken(task.token);
   const intent = usePrefetchOnIntent(`/tasks/${task.id}`);
@@ -141,11 +141,11 @@ export function TaskCard({
           {/* When the window closes, and who checks the work. On a narrow card the two parts are
               two lines, each whole. */}
           <p className="flex min-w-0 flex-wrap items-baseline gap-x-1 text-[14px] leading-snug">
-            <span className="whitespace-nowrap">
-              {deadlineLine(task, nowNs, true)}
-              <span className={soft}> ·</span>
-            </span>
+            <span className="whitespace-nowrap">{deadlineLine(task, nowNs, true)}</span>
+            {/* The dot opens the second part, so that a wrapped line starts with it, and no line
+                ends on it. */}
             <span className={`max-w-full min-w-0 truncate ${soft}`}>
+              <span aria-hidden="true">· </span>
               {checkedBy(task, judgeAccount)}
             </span>
           </p>

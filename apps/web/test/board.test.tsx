@@ -461,7 +461,8 @@ test("board_summary_says_how_many_are_open_and_what_they_lock", async () => {
   );
   render(<Board />);
   await screen.findAllByTestId("task-card");
-  expect(screen.getByTestId("board-summary").textContent).toBe("3 open · 4.00 tUSDC locked");
+  // The sum is labelled as what it is: the rewards of the open tasks, not all that is locked.
+  expect(screen.getByTestId("board-summary").textContent).toBe("3 open · 4.00 tUSDC on open tasks");
 });
 
 test("board_summary_says_it_counts_only_what_it_loaded_when_there_is_more", async () => {
@@ -469,8 +470,41 @@ test("board_summary_says_it_counts_only_what_it_loaded_when_there_is_more", asyn
   render(<Board />);
   await screen.findByTestId("task-card");
   expect(screen.getByTestId("board-summary").textContent).toBe(
-    "1 open · 1.50 tUSDC locked · of the 1 tasks loaded",
+    "1 open · 1.50 tUSDC on open tasks · of the 1 task loaded",
   );
+});
+
+test("board_with_more_to_read_counts_at_least_and_says_a_segment_is_empty_only_among_those_loaded", async () => {
+  const api = fakeApi(
+    json({ tasks: [TASK], next_cursor: "6" }),
+    json({ tasks: [SETTLED], next_cursor: null }),
+  );
+  render(<Board />);
+  await screen.findByTestId("task-card");
+  // With more pages to read, a count is of the tasks loaded: at least that many.
+  expect(pressed()).toEqual([
+    "All 1+:true",
+    "Open 1+:false",
+    "Judging 0+:false",
+    "Settled 0+:false",
+  ]);
+
+  await userEvent.click(screen.getByRole("button", { name: /^Settled/ }));
+
+  // Not "no tasks match": none of those loaded is settled, and the way on is to read more.
+  const none = screen.getByTestId("none-loaded");
+  expect(none.textContent).toContain("The one task loaded is not settled.");
+  expect(screen.queryByText(/no tasks match/i)).toBeNull();
+  expect(screen.queryByRole("link", { name: "Show all tasks" })).toBeNull();
+  // One Load more, in the panel.
+  expect(screen.getAllByRole("button", { name: "Load more" })).toHaveLength(1);
+
+  await userEvent.click(within(none).getByRole("button", { name: "Load more" }));
+
+  await screen.findByText("A settled task");
+  expect(query(api, 1).get("cursor")).toBe("6");
+  expect(pressed()).toEqual(["All 2:false", "Open 1:false", "Judging 0:false", "Settled 1:true"]);
+  expect(screen.queryByTestId("none-loaded")).toBeNull();
 });
 
 test("board_asks_the_api_for_the_tag_the_address_holds_and_clear_takes_it_off", async () => {

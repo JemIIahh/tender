@@ -2,6 +2,7 @@
 
 import { formatTokenAmount, tokenMeta } from "@tender/shared";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useId } from "react";
 import { config } from "../lib/config";
 import { knownFirst, knowsToken } from "../lib/tokens";
@@ -13,13 +14,15 @@ const FADE = "transition-opacity duration-200 motion-reduce:transition-none";
 
 /**
  * The sidebar's Live block, pinned under its links: whether the index is up to date, and three of
- * the platform's figures (open tasks, agents, and what the open tasks lock in the contract), from
+ * the platform's figures (open tasks, agents, and the rewards the open tasks hold), from
  * the same shared read as the top bar's status (`useLive`), so it asks the API for nothing more.
  * A figure the API did not give is left out, and so is an amount in a token the app has no
  * decimals for. "All metrics" leads to the Metrics page. On the rail it is the dot and the link.
  */
 export function SidebarLive({ tip }: { tip?: (label: string) => TipHandlers }) {
   const live = useLive();
+  // The Metrics page has no link of its own in the sidebar: this one is marked on it.
+  const onMetrics = usePathname() === "/metrics";
   const titleId = useId();
   const figures: Array<[string, string]> = [];
   if (live?.openTasks !== undefined) figures.push(["Open tasks", live.openTasks]);
@@ -27,7 +30,7 @@ export function SidebarLive({ tip }: { tip?: (label: string) => TipHandlers }) {
   for (const [token, amount] of knownFirst(live?.escrow ?? [], ([one]) => one)) {
     if (!knowsToken(token)) continue;
     const { symbol, decimals } = tokenMeta(token, config.network);
-    figures.push(["Locked", `${formatTokenAmount(amount, decimals)} ${symbol}`]);
+    figures.push(["On open tasks", `${formatTokenAmount(amount, decimals)} ${symbol}`]);
   }
   return (
     <section
@@ -65,8 +68,9 @@ export function SidebarLive({ tip }: { tip?: (label: string) => TipHandlers }) {
       <Link
         href="/metrics"
         aria-label="All metrics"
+        aria-current={onMetrics ? "page" : undefined}
         {...tip?.("All metrics")}
-        className="flex min-h-9 items-center gap-3 overflow-hidden rounded-xl px-3 text-[13px] whitespace-nowrap text-muted transition-colors hover:bg-raised/60 hover:text-bone motion-reduce:transition-none"
+        className="flex min-h-9 items-center gap-3 overflow-hidden rounded-xl px-3 text-[13px] whitespace-nowrap text-muted transition-colors hover:bg-raised/60 hover:text-bone motion-reduce:transition-none aria-[current=page]:bg-raised aria-[current=page]:text-bone"
       >
         {/* A line rising over two axes: the link's mark on the rail, where its words fade out. */}
         <svg

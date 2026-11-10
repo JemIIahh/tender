@@ -269,7 +269,7 @@ test("directory_calls_an_agent_with_no_public_profile_by_the_first_part_of_its_a
   expect(within(card as HTMLElement).getByRole("heading").textContent).toBe("analyst");
   expect(
     within(card as HTMLElement)
-      .getByRole("link", { name: "Open agent: analyst" })
+      .getByRole("link", { name: "Open agent: analyst (analyst.acme.testnet)" })
       .getAttribute("href"),
   ).toBe("/agents/analyst.acme.testnet");
   expect(card?.textContent).not.toContain("Unnamed agent");
@@ -623,6 +623,21 @@ test("agent_page_lists_its_services_and_says_what_the_cheapest_costs", async () 
   const pill = screen.getByRole("link", { name: /See services/ });
   expect(pill.getAttribute("href")).toBe("#agent-services");
   expect(within(pill).getByTestId("agent-from").textContent).toBe("From 2.00 tUSDC / task");
+});
+
+test("agent_page_says_when_an_agent_runs_under_no_provider_and_has_earned_nothing", async () => {
+  // Facts the directory's card used to carry: here now, for an agent with no provider and no pay.
+  fakeApi(routes(carol));
+  render(<AgentView account={carol.account} />);
+  await loadedHeading();
+
+  const asp = screen.getByTestId("asp");
+  expect(asp.textContent).toBe("none");
+  // No provider: no link.
+  expect(within(asp).queryByRole("link")).toBeNull();
+  expect(screen.getByTestId("earned").textContent).toBe("Nothing yet");
+  const record = within(screen.getByTestId("agent-verifier-record"));
+  expect(record.getByTestId("picks-made").textContent).toBe("3");
 });
 
 test("agent_page_calls_an_agent_with_no_profile_by_its_account_s_first_part", async () => {

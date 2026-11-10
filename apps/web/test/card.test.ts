@@ -1,5 +1,12 @@
 import { expect, test } from "vitest";
-import { briefly, deadlineLine, featuredTaskId, roughly } from "../lib/card";
+import {
+  boardSummary,
+  briefly,
+  deadlineLine,
+  featuredTaskId,
+  roughly,
+  segmentOf,
+} from "../lib/card";
 import { AT, SECOND, summary } from "./tasks";
 
 // What a card on the board says beside its phase, and which card is the featured one (lib/card.ts).
@@ -73,4 +80,42 @@ test("featured_task_is_the_largest_dollar_reward_among_the_open_tasks", () => {
   // One open task is no top of anything: two are needed for a featured card.
   expect(featuredTaskId([tasks[1] ?? summary()], now, "testnet")).toBeNull();
   expect(featuredTaskId([tasks[1] ?? summary(), tasks[3] ?? summary()], now, "testnet")).toBeNull();
+});
+
+test("segment_of_a_task_is_by_the_clock_and_none_for_the_fallback_and_past_it", () => {
+  const task = summary();
+  expect(segmentOf(task, AT.created + MINUTE)).toBe("open");
+  // Revealing and judging are one segment.
+  expect(segmentOf(task, AT.commit + MINUTE)).toBe("judging");
+  expect(segmentOf(task, AT.reveal + MINUTE)).toBe("judging");
+  // The poster's fallback window, and past it with no outcome: under All only.
+  expect(segmentOf(task, AT.pick + MINUTE)).toBeNull();
+  expect(segmentOf(task, AT.fallback + MINUTE)).toBeNull();
+  // An outcome is settled whatever the clock says.
+  expect(segmentOf(summary({ outcome_kind: "voided" }), AT.created + MINUTE)).toBe("settled");
+});
+
+test("board_summary_counts_the_open_tasks_and_adds_their_rewards_a_token_at_a_time", () => {
+  const now = AT.created + MINUTE;
+  const other = "odd.testnet";
+  const summary1 = boardSummary(
+    [
+      summary({ id: "1", reward: "1500000" }),
+      summary({ id: "2", reward: "500000" }),
+      // Another token: its own sum, never added to the first.
+      summary({ id: "3", reward: "7", token: other }),
+      // A reward of nothing adds no line.
+      summary({ id: "4", reward: "0", token: "zero.testnet" }),
+      // Not open: neither counted nor added.
+      summary({ id: "5", reward: "9000000", outcome_kind: "picked" }),
+    ],
+    now,
+  );
+  expect(summary1.open).toBe(4);
+  expect(summary1.locked).toEqual([
+    [summary().token, 2000000n],
+    [other, 7n],
+  ]);
+  // Past the commit window nothing is open.
+  expect(boardSummary([summary()], AT.commit + SECOND)).toEqual({ open: 0, locked: [] });
 });

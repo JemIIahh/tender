@@ -183,7 +183,7 @@ test("the_live_pill_shows_at_once_what_the_landing_s_ticker_read_and_reads_nothi
   // Into the app: the pill has the figures at once, and the three are not read again.
   landing.unmount();
   render(<LiveStatus />);
-  expect(screen.getByRole("button", { name: "Testnet, Live" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Status: Live (Testnet)" })).toBeTruthy();
   await act(async () => {});
   for (const path of shared) expect(urls.filter((url) => url === path)).toHaveLength(1);
 });

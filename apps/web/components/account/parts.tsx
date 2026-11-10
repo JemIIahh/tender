@@ -111,36 +111,39 @@ export function Tokens({
 }
 
 /**
- * A stat block: a label in mono capitals, the figure, and a line that says what it is. `light` is
- * the page's one cream block, for the figure the page is about.
+ * A stat block: a label, the figure, and a line that says what it is. `light` is the page's one
+ * cream block, for the figure the page is about. `wide` takes a whole row of a two-column grid,
+ * below the widest screens, for a figure that needs the room (an amount, an account).
  */
 export function Stat({
   label,
   children,
   sub,
   light = false,
+  wide = false,
   testId,
 }: {
   label: string;
   children: ReactNode;
   sub?: ReactNode;
   light?: boolean;
+  wide?: boolean;
   testId?: string;
 }) {
   return (
     <div
       data-testid={testId}
-      className={`grid min-w-0 content-start gap-3 rounded-2xl border p-5 ${
-        light ? "on-paper border-transparent bg-paper text-ink" : "border-line bg-panel text-bone"
-      }`}
+      className={`grid min-w-0 grid-cols-1 content-start gap-3 rounded-2xl border p-5 ${
+        wide ? "max-xl:col-span-2" : ""
+      } ${light ? "on-paper border-transparent bg-paper text-ink" : "border-line bg-panel text-bone"}`}
     >
-      <dt className={`text-[13px] ${light ? "text-neutral-700" : "text-muted"}`}>{label}</dt>
-      <dd className="grid gap-2">
+      <dt className={`text-[13px] ${light ? "text-ink/70" : "text-muted"}`}>{label}</dt>
+      <dd className="grid min-w-0 grid-cols-1 gap-2">
         <div className="text-xl leading-tight font-medium tracking-[-0.02em] tabular-nums wrap-anywhere sm:text-2xl [&_.font-mono]:text-xs">
           {children}
         </div>
         {sub === undefined ? null : (
-          <p className={`text-[13px] leading-snug ${light ? "text-neutral-700" : "text-muted"}`}>
+          <p className={`text-[13px] leading-snug ${light ? "text-ink/70" : "text-muted"}`}>
             {sub}
           </p>
         )}
@@ -329,7 +332,7 @@ export function TaskCell({ taskId, title }: { taskId: string; title: string | nu
   );
 }
 
-/** A chip with a dot, in mono capitals, as the phase chip is. */
+/** A small chip with a dot, in the phase chip's small capitals: a status badge. */
 export function Chip({ children, dot = "bg-current" }: { children: ReactNode; dot?: string }) {
   return (
     <span className="inline-flex w-fit shrink-0 items-center gap-1.5 rounded-full border border-current/25 px-2.5 py-1 font-mono text-[10.5px] leading-none tracking-[0.12em] whitespace-nowrap uppercase">

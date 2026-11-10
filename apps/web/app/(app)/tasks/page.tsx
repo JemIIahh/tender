@@ -163,6 +163,70 @@ function Empty({ filtered }: { filtered: boolean }) {
   );
 }
 
+/** How a segment's tasks are said in a sentence: "None of the 50 tasks loaded is settled." */
+const SEGMENT_WORDS: Record<Segment, string> = {
+  open: "open",
+  judging: "being revealed or judged",
+  settled: "settled",
+};
+
+/** "50 tasks", "1 task". */
+const tasksText = (count: number) => `${count} ${count === 1 ? "task" : "tasks"}`;
+
+/**
+ * The button that reads the next page. `aria-disabled` and not `disabled`, as the retry button:
+ * the focus stays on it while the page comes.
+ */
+function LoadMore({
+  ready,
+  onMore,
+  primary = false,
+}: {
+  ready: Ready;
+  onMore: (from: Ready) => void;
+  primary?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      aria-disabled={ready.more.state === "loading"}
+      onClick={() => onMore(ready)}
+      className={primary ? PRIMARY : `${SECONDARY} justify-self-center`}
+    >
+      {ready.more.state === "loading" ? "Loading…" : "Load more"}
+    </button>
+  );
+}
+
+/**
+ * A segment with no task among those loaded, while there are more to read: it says what is true,
+ * that none of those loaded is in it, and offers to read on.
+ */
+function NoneLoaded({
+  ready,
+  segment,
+  onMore,
+}: {
+  ready: Ready;
+  segment: Segment;
+  onMore: (from: Ready) => void;
+}) {
+  const count = ready.tasks.length;
+  return (
+    <EmptyState
+      testId="none-loaded"
+      title={
+        count === 1
+          ? `The one task loaded is not ${SEGMENT_WORDS[segment]}.`
+          : `None of the ${tasksText(count)} loaded is ${SEGMENT_WORDS[segment]}.`
+      }
+      action={<LoadMore ready={ready} onMore={onMore} primary />}
+    >
+      Older tasks may be. Load more to look further back.
+    </EmptyState>
+  );
+}
+
 /** An amount of a token the app knows, as a figure and its symbol. */
 function tokenText(token: string, amount: bigint): string {
   const { symbol, decimals } = tokenMeta(token, config.network);
@@ -189,7 +253,7 @@ function Summary({
   return (
     <p
       data-testid="board-summary"
-      title="The open tasks among those loaded, and what their rewards lock in the contract"
+      title="The open tasks among those loaded, and the rewards they hold in the contract"
       className="flex min-w-0 items-center gap-2.5 text-[15px] text-muted"
     >
       <span
@@ -202,10 +266,10 @@ function Summary({
           <span key={token}>
             {" · "}
             <span className="font-medium text-bone tabular-nums">{tokenText(token, amount)}</span>{" "}
-            locked
+            on open tasks
           </span>
         ))}
-        {more ? ` · of the ${loaded} tasks loaded` : null}
+        {more ? ` · of the ${tasksText(loaded)} loaded` : null}
       </span>
     </p>
   );
@@ -246,9 +310,13 @@ function BoardBody({
           ? board.tasks
           : board.tasks.filter((task) => segmentOf(task, nowNs) === segment);
       const featured = featuredTaskId(board.tasks, nowNs, config.network);
+      // A segment empty among the tasks loaded, with more to read, is not an empty board.
+      const noneLoaded = shown.length === 0 && board.next !== null && segment !== undefined;
       return (
         <>
-          {shown.length === 0 ? (
+          {noneLoaded ? (
+            <NoneLoaded ready={board} segment={segment} onMore={onMore} />
+          ) : shown.length === 0 ? (
             <Empty filtered={filtered} />
           ) : (
             <ul className={GRID}>
@@ -273,16 +341,8 @@ function BoardBody({
               retrying={board.more.retrying}
               onRetry={() => onMore(board)}
             />
-          ) : (
-            // `aria-disabled` and not `disabled`, as the retry button: the focus stays on it.
-            <button
-              type="button"
-              aria-disabled={board.more.state === "loading"}
-              onClick={() => onMore(board)}
-              className={`${SECONDARY} justify-self-center`}
-            >
-              {board.more.state === "loading" ? "Loading…" : "Load more"}
-            </button>
+          ) : noneLoaded ? null : (
+            <LoadMore ready={board} onMore={onMore} />
           )}
         </>
       );
@@ -430,8 +490,10 @@ function BoardView() {
               >
                 {chip.label}{" "}
                 {ready === null ? null : (
+                  // With more pages to read, a count is of the tasks loaded: at least that many.
                   <span className="text-[13px] tabular-nums opacity-70">
                     {counts[chip.segment ?? "all"]}
+                    {ready.next === null ? "" : "+"}
                   </span>
                 )}
               </button>

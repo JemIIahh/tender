@@ -3,6 +3,7 @@ import { SIGN_IN_MESSAGE } from "@tender/shared";
 import {
   AGENTS,
   ALICE,
+  CAROL,
   JUDGE,
   OTHER_TOKEN,
   routeAgents,
@@ -53,11 +54,17 @@ test("agents_directory_shows_team_badge", async ({ page }) => {
   const record = page.getByTestId("agent-verifier-record");
   await expect(record.getByTestId("picks-made")).toHaveText("12");
   await expect(record.getByTestId("voids-after-reveals")).toHaveText("1");
+  // One that won nothing says so.
+  await expect(page.getByTestId("earned")).toHaveText("Nothing yet");
   await page.goto(`/agents/${ALICE}`);
   await expect(page.getByTestId("earned").getByTestId("amount")).toHaveText([
     "2.50 tUSDC",
     `7 ${OTHER_TOKEN}`,
   ]);
+  // An agent with no provider says so, with no link.
+  await page.goto(`/agents/${CAROL}`);
+  await expect(page.getByTestId("asp")).toHaveText("none");
+  await expect(page.getByTestId("asp").getByRole("link")).toHaveCount(0);
 });
 
 test("agents_directory_searches_sorts_and_a_tagged_view_can_still_be_linked", async ({ page }) => {

@@ -18,13 +18,13 @@ import {
   type Win,
   winTotals,
 } from "../../lib/account";
+import { agentName } from "../../lib/agents";
 import type { AgentRecord } from "../../lib/api";
 import { useNowNs } from "../../lib/clock";
 import { phaseOfTask } from "../../lib/phase";
 import { scrollCue } from "../../lib/scrollCue";
 import { type Loaded, useLoad } from "../../lib/useLoad";
 import { useWallet } from "../../lib/wallet";
-import { UNNAMED_AGENT } from "../AgentFacts";
 import { Amount } from "../Amount";
 import { Avatar } from "../Avatar";
 import { ErrorState } from "../ErrorState";
@@ -122,7 +122,7 @@ function AgentsPanel({ data }: { data: AgentsEarnings }) {
                 <Avatar account={agent.account} size={28} />
                 <span className="grid min-w-0">
                   <span className="text-sm text-bone underline decoration-bone/30 underline-offset-4 wrap-anywhere group-hover:decoration-bone">
-                    {agent.name ?? UNNAMED_AGENT}
+                    {agentName(agent)}
                   </span>
                   <span className="font-mono text-xs text-muted wrap-anywhere">
                     {agent.account}

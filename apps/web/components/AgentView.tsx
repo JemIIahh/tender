@@ -9,7 +9,7 @@ import {
   type Service,
 } from "@tender/shared";
 import Link from "next/link";
-import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { agentName, cheapestByAgent } from "../lib/agents";
 import { api } from "../lib/api";
 import { UNTITLED_TASK } from "../lib/copy";
@@ -20,6 +20,7 @@ import { FromLine } from "./AgentCard";
 import { AgentLineage } from "./AgentLineage";
 import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
+import { Stat } from "./account/parts";
 import { CopyButton } from "./CopyButton";
 import { EmptyState } from "./EmptyState";
 import { ErrorState } from "./ErrorState";
@@ -142,42 +143,6 @@ async function readServices(account: string): Promise<Service[]> {
   return (await api.listServices({ agent: account, limit: 50 })).services;
 }
 
-/** One of the four stat cards under the head: a label, the figure, and a line under it. */
-function StatCard({
-  label,
-  children,
-  sub,
-  light = false,
-  wide = false,
-}: {
-  label: string;
-  children: ReactNode;
-  sub?: ReactNode;
-  light?: boolean;
-  /** The whole row on a phone and a tablet, where two to a row leaves it too little room. */
-  wide?: boolean;
-}) {
-  return (
-    <div
-      className={`grid min-w-0 grid-cols-1 content-start gap-2 rounded-2xl border p-5 sm:p-6 ${wide ? "max-xl:col-span-2" : ""} ${
-        light ? "on-paper border-transparent bg-paper text-ink" : "border-line bg-panel text-bone"
-      }`}
-    >
-      <dt className={`text-[13px] ${light ? "text-neutral-700" : "text-muted"}`}>{label}</dt>
-      <dd className="grid min-w-0 grid-cols-1 gap-1.5">
-        <div className="text-2xl leading-tight font-medium tracking-[-0.02em] tabular-nums wrap-anywhere sm:text-[1.75rem] [&_.font-mono]:text-xs">
-          {children}
-        </div>
-        {sub === undefined ? null : (
-          <div className={`text-[13px] leading-snug ${light ? "text-neutral-700" : "text-muted"}`}>
-            {sub}
-          </div>
-        )}
-      </dd>
-    </div>
-  );
-}
-
 function ReadyView({ detail }: { detail: AgentDetailResponse }) {
   const { agent } = detail;
   const name = agentName(agent);
@@ -233,10 +198,10 @@ function ReadyView({ detail }: { detail: AgentDetailResponse }) {
       {/* Two to a row on a phone, Wins beside Entries; what it earned and its account take a
           row each there, as they are the widest. Four in a row on a wide screen. */}
       <dl aria-label="Its record" className="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
-        <StatCard label="Wins" sub="Tasks it was picked for">
+        <Stat label="Wins" sub="Tasks it was picked for">
           <span data-testid="wins">{agent.wins}</span>
-        </StatCard>
-        <StatCard
+        </Stat>
+        <Stat
           label="Entries"
           sub={
             <>
@@ -248,8 +213,8 @@ function ReadyView({ detail }: { detail: AgentDetailResponse }) {
           }
         >
           <span data-testid="entries">{agent.entries}</span>
-        </StatCard>
-        <StatCard label="Earned" sub="Paid to it, a token at a time" light wide>
+        </Stat>
+        <Stat label="Earned" sub="Paid to it, a token at a time" light wide>
           <span data-testid="earned" className="block">
             {earned.length === 0 ? (
               "Nothing yet"
@@ -263,15 +228,15 @@ function ReadyView({ detail }: { detail: AgentDetailResponse }) {
               </ul>
             )}
           </span>
-        </StatCard>
-        <StatCard label="On chain" sub="Its NEAR account" wide>
+        </Stat>
+        <Stat label="On chain" sub="Its NEAR account" wide>
           <span className="flex min-w-0 items-center gap-1">
-            <span title={agent.account} className="min-w-0 truncate font-mono text-[15px]">
+            <span title={agent.account} className="min-w-0 truncate font-mono">
               {agent.account}
             </span>
             <CopyButton value={agent.account} label="Copy account" />
           </span>
-        </StatCard>
+        </Stat>
       </dl>
 
       <dl
@@ -328,9 +293,9 @@ function ReadyView({ detail }: { detail: AgentDetailResponse }) {
             Loading its services…
           </p>
         ) : listed.length === 0 ? (
-          <p data-testid="no-agent-services" className={`${CARD} p-6 text-muted`}>
-            It lists no service for hire now.
-          </p>
+          <EmptyState testId="no-agent-services" title="It lists no service for hire now.">
+            A provider lists its agents&rsquo; services from My agents.
+          </EmptyState>
         ) : (
           <ul className={CARD_GRID}>
             {listed.map((service) => (
@@ -362,9 +327,10 @@ function ReadyView({ detail }: { detail: AgentDetailResponse }) {
  * what its cheapest service costs, four stat cards (wins, entries, earned, its account on chain), a
  * strip of its provider, its record as a checker and when it joined, and three numbered sections:
  * its services for hire, its recent tasks (the entries it made, and the tasks it posted, its
- * lineage), and its record (the profile document). An account that is no agent is "not found", which is no error; a string that is no
- * account is not asked about at all (`api.getAgent`). The posted tasks are asked for only once the
- * agent is known, so that an address that holds anything else never reaches them.
+ * lineage), and its record (the profile document). An account that is no agent is "not found",
+ * which is no error; a string that is no account is not asked about at all (`api.getAgent`). Its
+ * posted tasks and its services are asked for only once the agent is known, so that an address
+ * that holds anything else never reaches them.
  */
 export function AgentView({ account }: { account: string }) {
   const [state, setState] = useState<State>({ status: "loading" });

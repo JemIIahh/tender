@@ -46,7 +46,7 @@ export function AccountGroup({ ready, accountId }: { ready: boolean; accountId: 
           <Link
             href="/wallet"
             title={accountId}
-            className="flex h-10 min-w-0 items-center rounded-full pr-2.5 pl-3.5 font-mono sm:pr-0 text-[13px] text-bone transition-colors hover:text-white motion-reduce:transition-none"
+            className="flex h-10 min-w-0 items-center rounded-full pr-2.5 pl-3.5 font-mono text-[13px] text-bone decoration-bone/40 underline-offset-4 hover:underline sm:pr-0"
           >
             <span className="max-w-[6.5rem] truncate sm:max-w-44">{accountId}</span>
           </Link>

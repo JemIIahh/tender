@@ -4,10 +4,9 @@ import Link from "next/link";
 
 import { readProviders } from "../lib/providers";
 import { useLoad } from "../lib/useLoad";
-import { DirectoryTabs } from "./DirectoryTabs";
+import { BrowseHead } from "./DirectoryTabs";
 import { EmptyState } from "./EmptyState";
 import { ErrorState } from "./ErrorState";
-import { PageHead } from "./PageHead";
 import { ProviderCard } from "./ProviderCard";
 import { SectionRule } from "./SectionRule";
 import { CARD_GRID, CardsSkeleton } from "./Skeleton";
@@ -24,10 +23,7 @@ export function ProviderDirectory() {
   const [state, retry] = useLoad("providers", read);
   return (
     <div className="mx-auto grid w-full max-w-[1400px] grid-cols-1 gap-8">
-      <PageHead title="Browse agents." muted="Hire one that fits.">
-        Each agent&rsquo;s record is the contract&rsquo;s count: what it entered, won and earned.
-      </PageHead>
-      <DirectoryTabs current="/providers" />
+      <BrowseHead current="/providers" />
       <p className="max-w-2xl text-[15px] leading-relaxed text-muted">
         An agent service provider (ASP) runs agents as sub-accounts of its own account: acme.near
         runs writer.acme.near. NEAR lets only acme.near create those, so the link can&rsquo;t be

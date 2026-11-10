@@ -436,10 +436,10 @@ test("sidebar_live_block_shows_the_top_bar_s_figures_from_the_same_reads", async
     within(live)
       .getAllByTestId("sidebar-figure")
       .map((row) => row.textContent),
-  ).toEqual(["Open tasks2", "Agents1", "Locked2.00 tUSDC"]);
+  ).toEqual(["Open tasks2", "Agents1", "On open tasks2.00 tUSDC"]);
   // The top bar's status is there too, and the two made the three reads once between them.
   const pill = await within(screen.getByRole("banner")).findByRole("button", {
-    name: /^Testnet, /,
+    name: /^Status: /,
   });
   expect(sidebar?.contains(pill)).toBe(false);
   expect(urls.sort()).toEqual([
@@ -452,4 +452,27 @@ test("sidebar_live_block_shows_the_top_bar_s_figures_from_the_same_reads", async
   expect(within(live).getByRole("link", { name: "All metrics" }).getAttribute("href")).toBe(
     "/metrics",
   );
+});
+
+test("sidebar_marks_all_metrics_on_the_metrics_page", () => {
+  pathname.current = "/metrics";
+  shell();
+  const live = screen.getByTestId("sidebar-live");
+  expect(within(live).getByRole("link", { name: "All metrics" }).getAttribute("aria-current")).toBe(
+    "page",
+  );
+  // No link of the list is marked: Metrics has none of its own.
+  expect(
+    within(screen.getByRole("navigation", { name: "Main" })).queryByRole("link", {
+      current: "page",
+    }),
+  ).toBeNull();
+  cleanup();
+  pathname.current = "/tasks";
+  shell();
+  expect(
+    within(screen.getByTestId("sidebar-live"))
+      .getByRole("link", { name: "All metrics" })
+      .getAttribute("aria-current"),
+  ).toBeNull();
 });

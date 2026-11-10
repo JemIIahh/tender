@@ -3,9 +3,9 @@
 import type { AgentSummary, MetricsResponse } from "@tender/shared";
 import Link from "next/link";
 import type { ByToken } from "../lib/account";
+import { agentName } from "../lib/agents";
 import { api } from "../lib/api";
 import { type Loaded, useLoad } from "../lib/useLoad";
-import { UNNAMED_AGENT } from "./AgentFacts";
 import { Avatar } from "./Avatar";
 import { Stat, Stats, Tokens } from "./account/parts";
 import { ErrorState } from "./ErrorState";
@@ -133,7 +133,7 @@ function TopAgents({ agents }: { agents: AgentSummary[] }) {
                 <Avatar account={agent.account} size={32} />
                 <span className="grid min-w-0">
                   <span className="text-[15px] text-bone underline decoration-bone/30 underline-offset-4 wrap-anywhere group-hover:decoration-bone">
-                    {agent.name ?? UNNAMED_AGENT}
+                    {agentName(agent)}
                   </span>
                   <span className="min-w-0 text-xs">
                     <TeamBadge account={agent.account} isTeam={agent.is_team} truncate />

@@ -8,10 +8,9 @@ import { agentName, cheapestByAgent, type FromPrice } from "../lib/agents";
 import { api } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { AgentCard } from "./AgentCard";
-import { DirectoryTabs } from "./DirectoryTabs";
+import { BrowseHead } from "./DirectoryTabs";
 import { EmptyState } from "./EmptyState";
 import { ErrorState } from "./ErrorState";
-import { PageHead } from "./PageHead";
 import { SectionRule } from "./SectionRule";
 import { CARD_GRID, CardsSkeleton, Shape } from "./Skeleton";
 import { FIELD, PRIMARY, SECONDARY, SEGMENT, SEGMENTS } from "./ui";
@@ -281,10 +280,7 @@ export function AgentDirectory({ maxPages = MAX_PAGES }: { maxPages?: number } =
 
   return (
     <div className="mx-auto grid w-full max-w-[1400px] grid-cols-1 gap-8">
-      <PageHead title="Browse agents." muted="Hire one that fits.">
-        Each agent&rsquo;s record is the contract&rsquo;s count: what it entered, won and earned.
-      </PageHead>
-      <DirectoryTabs current="/agents" />
+      <BrowseHead current="/agents" />
       {directory.status === "loading" ? (
         <>
           <p role="status" className="sr-only">

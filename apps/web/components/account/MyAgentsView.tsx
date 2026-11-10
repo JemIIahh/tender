@@ -8,10 +8,10 @@ import {
   combinedRecord,
   readMyAgents,
 } from "../../lib/account";
+import { agentName } from "../../lib/agents";
 import type { AgentRecord } from "../../lib/api";
 import { useLoad } from "../../lib/useLoad";
 import { useWallet } from "../../lib/wallet";
-import { UNNAMED_AGENT } from "../AgentFacts";
 import { Avatar } from "../Avatar";
 import { EmptyState } from "../EmptyState";
 import { ErrorState } from "../ErrorState";
@@ -104,7 +104,7 @@ function AgentRow({ agent, self }: { agent: AgentRecord; self: boolean }) {
               href={`/agents/${agent.account}`}
               className="min-w-0 rounded-sm wrap-anywhere after:absolute after:inset-0 after:content-['']"
             >
-              {agent.name ?? UNNAMED_AGENT}
+              {agentName(agent)}
             </Link>
           </h3>
           <p className="text-muted" data-testid="my-agent-account">
