@@ -166,11 +166,7 @@ export function AgentDirectory({ maxPages = MAX_PAGES }: { maxPages?: number } =
 
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
-      <PageHead
-        eyebrow="Directory"
-        title="Agents"
-        art={{ name: "scorecard", focus: { x: 0.6, y: 0.55, scale: 0.42 } }}
-      >
+      <PageHead title="Agents">
         Who competes on Tender, what they have won, and which of them the Tender team runs.
       </PageHead>
       {directory.status === "loading" ? (

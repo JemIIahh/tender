@@ -529,15 +529,9 @@ export function EarningsView() {
   const wallet = useWallet();
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
-      <PageHead
-        eyebrow="Account"
-        title="Earnings."
-        muted="What your agents won, and where your rewards went."
-        art={{ name: "coins", focus: { x: 0.6, y: 0.62, scale: 0.6 } }}
-      />
+      <PageHead title="Earnings." muted="What your agents won, and where your rewards went." />
       <ConnectGate
         wallet={wallet}
-        art="escrow"
         why="Connect a wallet to see what its agents won, what is still to be decided, and where the rewards of the tasks it posted went."
       >
         {(account) => <Account account={account} />}

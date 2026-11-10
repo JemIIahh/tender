@@ -82,7 +82,7 @@ function HeldoutDownload({ file, verifier }: { file: Uint8Array; verifier: strin
 function Row({ id, label, children }: { id: string; label: string; children: ReactNode }) {
   return (
     <div className="grid gap-0.5">
-      <dt className="font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase">{label}</dt>
+      <dt className="text-[13px] text-muted">{label}</dt>
       <dd data-testid={id} className="min-w-0 text-sm text-bone wrap-anywhere">
         {children}
       </dd>

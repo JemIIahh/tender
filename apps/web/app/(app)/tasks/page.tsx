@@ -1,61 +1,82 @@
 "use client";
 
-import type { ListTasksFilter, Phase, TaskSummary } from "@tender/shared";
+import {
+  formatTokenAmount,
+  type ListTasksFilter,
+  type TaskSummary,
+  tokenMeta,
+} from "@tender/shared";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import {
-  type FormEvent,
-  Suspense,
-  useCallback,
-  useEffect,
-  useId,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { EmptyState } from "../../../components/EmptyState";
 import { ErrorState } from "../../../components/ErrorState";
 import { PageHead } from "../../../components/PageHead";
-import { PHASE_LABELS } from "../../../components/PhaseChip";
 import { CARD_GRID, CardsSkeleton } from "../../../components/Skeleton";
-import { StillArt } from "../../../components/StillArt";
 import { TaskCard } from "../../../components/TaskCard";
-import { CARD, FIELD, PRIMARY, SCROLL_CUE, SECONDARY } from "../../../components/ui";
+import { PRIMARY, SECONDARY, SEGMENT, SEGMENTS } from "../../../components/ui";
 import { api } from "../../../lib/api";
-import { featuredTaskId } from "../../../lib/card";
+import {
+  type BoardSummary,
+  boardSummary,
+  featuredTaskId,
+  type Segment,
+  segmentOf,
+} from "../../../lib/card";
 import { useNowNs } from "../../../lib/clock";
 import { config } from "../../../lib/config";
 import { errorMessage } from "../../../lib/errors";
-import { scrollCue } from "../../../lib/scrollCue";
+import { knownFirst, knowsToken } from "../../../lib/tokens";
 import RouteLoading from "./loading";
 
-// The board: the tasks the API lists, newest first, which a person narrows by the phase a task is
-// in and by a tag, and reads on from page to page. A task in its fallback window, or past it, is
-// listed under All only: the four chips are the phases of a task's life that people look for.
+// The board: the tasks the API lists, newest first, a page of 50 at a time. Under the headline, a
+// line says how many of them are open and what they hold in the contract, and a segmented control
+// narrows them by where they are in their life (by the clock, as each card says it): open, being
+// revealed and judged, or settled. A task in its fallback window, or past it, is listed under All
+// only. The counts and the line are of the tasks the board has read, and say so when there are more.
 //
-// The filters are in the address (`?phase=open&tag=json`), as the agent directory's tag is, so that
-// Back from a task comes to the board as it was left, and a filtered board is a link. A filter
+// The filters are in the address (`?phase=open`, and `?tag=json`, which the API narrows by), so
+// that Back from a task comes to the board as it was left, and a filtered board is a link. A filter
 // change replaces the address and does not add to the history. The address can hold any text: what
-// is not a phase with a chip, or a tag, is ignored.
+// is not a segment, or a tag, is ignored.
 
-/** The phases with a chip of their own. */
-const CHIP_PHASES: readonly Phase[] = ["open", "revealing", "judging", "settled"];
+/** The segments, in the order the control shows them, after All. */
+const SEGMENTS_SHOWN: ReadonlyArray<{ segment: Segment; label: string }> = [
+  { segment: "open", label: "Open" },
+  { segment: "judging", label: "Judging" },
+  { segment: "settled", label: "Settled" },
+];
+
+/** What an address's `phase` names: a segment, or a phase inside one (an older link's). */
+const ADDRESS_SEGMENT: Record<string, Segment> = {
+  open: "open",
+  judging: "judging",
+  revealing: "judging",
+  settled: "settled",
+};
 
 /** A tag as the brief writes it, which is also what the API accepts. */
 const TAG = /^[a-z0-9-]{1,24}$/;
 
-type Filters = Pick<ListTasksFilter, "phase" | "tag">;
+/** The API's largest page: the board reads this many tasks at a time. */
+const PAGE_SIZE = 50;
 
-/** The filters the address asks for: a phase that has a chip and a tag as the brief writes it. */
+interface Filters {
+  segment: Segment | undefined;
+  tag: ListTasksFilter["tag"];
+}
+
+/** The filters the address asks for: a segment of the control, and a tag as the brief writes it. */
 function filtersOf(params: URLSearchParams): Filters {
-  const phase = CHIP_PHASES.find((candidate) => candidate === params.get("phase"));
+  const segment = ADDRESS_SEGMENT[params.get("phase") ?? ""];
   const tag = (params.get("tag") ?? "").trim().toLowerCase();
-  return { phase, tag: TAG.test(tag) ? tag : undefined };
+  return { segment, tag: TAG.test(tag) ? tag : undefined };
 }
 
 /** The query of an address for `filters`: nothing for no filters. */
 function queryOf(filters: Filters): string {
   const query = new URLSearchParams();
-  if (filters.phase !== undefined) query.set("phase", filters.phase);
+  if (filters.segment !== undefined) query.set("phase", filters.segment);
   if (filters.tag !== undefined) query.set("tag", filters.tag);
   const text = query.toString();
   return text === "" ? "" : `?${text}`;
@@ -93,11 +114,7 @@ function NoMoreTasks() {
     if (focused === null || focused === document.body) line.current?.focus();
   }, []);
   return (
-    <p
-      ref={line}
-      tabIndex={-1}
-      className="justify-self-center font-mono text-[11px] tracking-[0.14em] text-muted uppercase"
-    >
+    <p ref={line} tabIndex={-1} className="justify-self-center text-sm text-muted">
       No more tasks
     </p>
   );
@@ -119,47 +136,101 @@ function Loading() {
   );
 }
 
-/** No tasks to show: a still of the landing's sealed letter, and the words. */
+/** No tasks to show: a line, a sentence, and the one thing to do. */
 function Empty({ filtered }: { filtered: boolean }) {
-  return (
-    <div
-      className={`${CARD} relative isolate grid min-h-72 content-end gap-4 overflow-hidden p-6 sm:p-8`}
-    >
-      <StillArt
-        art="sealed"
-        focus={{ x: 0.72, y: 0.5, scale: 0.3 }}
-        className="absolute inset-0 -z-10 size-full"
-      />
-      <div aria-hidden="true" className="scanlines absolute inset-0 -z-10" />
-      <div
-        aria-hidden="true"
-        className="absolute inset-0 -z-10 bg-linear-to-r from-panel via-panel/80 to-transparent"
-      />
-      <p className="max-w-sm text-2xl font-semibold tracking-tight text-bone">
-        {filtered ? "No tasks match these filters." : "No tasks yet."}
-      </p>
-      {filtered ? (
+  return filtered ? (
+    <EmptyState
+      title="No tasks match these filters."
+      action={
         <Link href="/tasks" className={PRIMARY}>
           Show all tasks
         </Link>
-      ) : (
+      }
+    >
+      Try another phase, or see every task on the board.
+    </EmptyState>
+  ) : (
+    <EmptyState
+      title="No tasks yet."
+      action={
         <Link href="/post" className={PRIMARY}>
           Post a task
         </Link>
-      )}
-    </div>
+      }
+    >
+      Say what you need and lock the reward: agents compete to do it.
+    </EmptyState>
+  );
+}
+
+/** An amount of a token the app knows, as a figure and its symbol. */
+function tokenText(token: string, amount: bigint): string {
+  const { symbol, decimals } = tokenMeta(token, config.network);
+  return `${formatTokenAmount(amount, decimals)} ${symbol}`;
+}
+
+/**
+ * The line under the headline: how many of the tasks the board has are open, and what their rewards
+ * lock in the contract, token by token (a token the app has no decimals for is left out of the
+ * line; its cards say its amount). With more tasks to read, it says it counts the loaded ones.
+ */
+function Summary({
+  summary,
+  loaded,
+  more,
+}: {
+  summary: BoardSummary;
+  loaded: number;
+  more: boolean;
+}) {
+  const locked = knownFirst(summary.locked, ([token]) => token).filter(([token]) =>
+    knowsToken(token),
+  );
+  return (
+    <p
+      data-testid="board-summary"
+      title="The open tasks among those loaded, and what their rewards lock in the contract"
+      className="flex min-w-0 items-center gap-2.5 text-[15px] text-muted"
+    >
+      <span
+        aria-hidden="true"
+        className={`size-2 shrink-0 rounded-full ${summary.open > 0 ? "bg-ok" : "border-[1.5px] border-muted"}`}
+      />
+      <span className="min-w-0">
+        <span className="font-medium text-bone tabular-nums">{summary.open}</span> open
+        {locked.map(([token, amount]) => (
+          <span key={token}>
+            {" · "}
+            <span className="font-medium text-bone tabular-nums">{tokenText(token, amount)}</span>{" "}
+            locked
+          </span>
+        ))}
+        {more ? ` · of the ${loaded} tasks loaded` : null}
+      </span>
+    </p>
+  );
+}
+
+/** The summary line's place while the board loads, as tall as the line. */
+function SummaryShape() {
+  return (
+    <span aria-hidden="true" className="flex h-[1lh] items-center text-[15px]">
+      <span className="skeleton h-[0.62em] w-44 rounded-full" />
+    </span>
   );
 }
 
 function BoardBody({
   board,
   nowNs,
+  segment,
   filtered,
   onRetry,
   onMore,
 }: {
   board: Board;
   nowNs: bigint;
+  segment: Segment | undefined;
   filtered: boolean;
   onRetry: () => void;
   onMore: (from: Ready) => void;
@@ -170,21 +241,28 @@ function BoardBody({
     case "error":
       return <ErrorState message={board.message} retrying={board.retrying} onRetry={onRetry} />;
     case "ready": {
-      if (board.tasks.length === 0) return <Empty filtered={filtered} />;
+      const shown =
+        segment === undefined
+          ? board.tasks
+          : board.tasks.filter((task) => segmentOf(task, nowNs) === segment);
       const featured = featuredTaskId(board.tasks, nowNs, config.network);
       return (
         <>
-          <ul className={GRID}>
-            {board.tasks.map((task) => (
-              <TaskCard
-                key={task.id}
-                task={task}
-                nowNs={nowNs}
-                featured={task.id === featured}
-                judgeAccount={config.judgeAccount}
-              />
-            ))}
-          </ul>
+          {shown.length === 0 ? (
+            <Empty filtered={filtered} />
+          ) : (
+            <ul className={GRID}>
+              {shown.map((task) => (
+                <TaskCard
+                  key={task.id}
+                  task={task}
+                  nowNs={nowNs}
+                  featured={task.id === featured}
+                  judgeAccount={config.judgeAccount}
+                />
+              ))}
+            </ul>
+          )}
           {board.next === null ? (
             board.paged ? (
               <NoMoreTasks />
@@ -213,31 +291,28 @@ function BoardBody({
 }
 
 function BoardView() {
-  const tagId = useId();
   const router = useRouter();
   const pathname = usePathname();
   const params = useSearchParams();
   const nowNs = useNowNs();
   const [board, setBoard] = useState<Board>({ status: "loading" });
-  const { phase, tag } = filtersOf(params);
-  // The same object until a filter changes: it is what a load depends on.
-  const filters = useMemo<Filters>(() => ({ phase, tag }), [phase, tag]);
-  // What is typed in the tag field, which is not the filter until the person applies it.
-  const [tagText, setTagText] = useState(tag ?? "");
-  const [tagError, setTagError] = useState<string | null>(null);
+  const { segment, tag } = filtersOf(params);
+  // The same value until the tag changes: it is what a load depends on. The segment is not: it
+  // narrows the tasks the board has, by the clock, and asks the API for nothing.
+  const filters = useMemo<Filters>(() => ({ segment, tag }), [segment, tag]);
   // The request that counts. An answer to an earlier one is dropped: strict mode starts two
-  // requests, a retry can overlap a slow one, and a filter changed under a request makes its
-  // answer one for a board that is no longer there.
+  // requests, a retry can overlap a slow one, and a tag changed under a request makes its answer
+  // one for a board that is no longer there.
   const latest = useRef(0);
 
-  const load = useCallback((now: Filters) => {
+  const load = useCallback((now: string | undefined) => {
     const request = ++latest.current;
     // A retry leaves the error and its button where they are, so that the person who pressed it
     // keeps their focus: a button that is taken off the page drops it to the top of the document.
     setBoard((was) =>
       was.status === "error" ? { ...was, retrying: true } : { status: "loading" },
     );
-    api.listTasks(now).then(
+    api.listTasks({ tag: now, limit: PAGE_SIZE }).then(
       (page) => {
         if (request === latest.current) {
           setBoard({
@@ -260,14 +335,8 @@ function BoardView() {
   }, []);
 
   useEffect(() => {
-    load(filters);
-  }, [filters, load]);
-
-  // The field follows the address when it changes under it: Back and Forward, or a filter applied.
-  useEffect(() => {
-    setTagText(tag ?? "");
-    setTagError(null);
-  }, [tag]);
+    load(tag);
+  }, [tag, load]);
 
   /** Shows the board for `next`, in the address. A change of filter is not a page of its own. */
   const show = (next: Filters) => {
@@ -283,7 +352,7 @@ function BoardView() {
       ...from,
       more: from.more.state === "error" ? { ...from.more, retrying: true } : { state: "loading" },
     });
-    api.listTasks({ ...filters, cursor: from.next }).then(
+    api.listTasks({ tag: filters.tag, limit: PAGE_SIZE, cursor: from.next }).then(
       (page) => {
         if (request !== latest.current) return;
         setBoard({
@@ -305,103 +374,77 @@ function BoardView() {
     );
   };
 
-  const filterByTag = (next: string | undefined) => {
-    setTagText(next ?? "");
-    setTagError(null);
-    if (next !== filters.tag) show({ ...filters, tag: next });
-  };
-
-  const applyTag = (event: FormEvent) => {
-    event.preventDefault();
-    // A tag is lower case; people type it as they like, with a space on either side.
-    const typed = tagText.trim().toLowerCase();
-    if (typed === "") return filterByTag(undefined);
-    if (!TAG.test(typed)) {
-      setTagError("A tag is 1 to 24 characters: a to z, 0 to 9 and -.");
-      return;
+  const filtered = filters.segment !== undefined || filters.tag !== undefined;
+  const ready = board.status === "ready" ? board : null;
+  // How many of the tasks the board has are in each segment, by the clock.
+  const counts = useMemo(() => {
+    const by: Record<Segment | "all", number> = { all: 0, open: 0, judging: 0, settled: 0 };
+    for (const task of ready?.tasks ?? []) {
+      by.all += 1;
+      const at = segmentOf(task, nowNs);
+      if (at !== null) by[at] += 1;
     }
-    filterByTag(typed);
-  };
-
-  const filtered = filters.phase !== undefined || filters.tag !== undefined;
+    return by;
+  }, [ready, nowNs]);
 
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
-      <PageHead
-        eyebrow="Marketplace"
-        title="Tasks for agents."
-        muted="Pick one, get paid."
-        art={{ name: "escrow", focus: { x: 0.6, y: 0.52, scale: 0.46 } }}
-      />
+      <PageHead title="Tasks for agents." muted="Pick one, get paid." />
 
-      <div className="grid gap-4">
-        <div className="flex flex-wrap items-end gap-x-8 gap-y-4 border-b border-line">
-          {/* The phases, as tabs. Each is a toggle that the address holds, and not a tab panel. On
-              a narrow phone they scroll, with the edge faded while there are more (`SCROLL_CUE`). */}
-          <fieldset
-            ref={scrollCue}
-            className={`-mb-px flex max-w-full min-w-0 gap-5 overflow-x-auto sm:gap-7 ${SCROLL_CUE}`}
-          >
-            <legend className="sr-only">Phase</legend>
-            {[undefined, ...CHIP_PHASES].map((chip) => (
-              <button
-                key={chip ?? "all"}
-                type="button"
-                aria-pressed={filters.phase === chip}
-                onClick={() => show({ ...filters, phase: chip })}
-                className="min-h-11 shrink-0 border-b-2 border-transparent pb-1 text-[15px] whitespace-nowrap text-muted transition-colors hover:text-bone motion-reduce:transition-none aria-pressed:border-bone aria-pressed:font-medium aria-pressed:text-bone"
-              >
-                {chip === undefined ? "All" : PHASE_LABELS[chip]}
-              </button>
-            ))}
-          </fieldset>
-
-          <form onSubmit={applyTag} className="grid w-full gap-1 pb-3 sm:ml-auto sm:w-auto">
-            <div className="flex items-center gap-2">
-              <label
-                htmlFor={tagId}
-                className="font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase"
-              >
-                Tag
-              </label>
-              <input
-                id={tagId}
-                value={tagText}
-                onChange={(event) => setTagText(event.currentTarget.value)}
-                aria-describedby={tagError === null ? undefined : `${tagId}-error`}
-                aria-invalid={tagError !== null}
-                autoCapitalize="none"
-                autoCorrect="off"
-                spellCheck={false}
-                className={`${FIELD} min-h-10 min-w-0 flex-1 rounded-full font-mono text-sm sm:w-44 sm:flex-none`}
+      <div className="grid gap-6">
+        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-4">
+          <div className="grid min-w-0 gap-2">
+            {ready === null ? (
+              <SummaryShape />
+            ) : (
+              <Summary
+                summary={boardSummary(ready.tasks, nowNs)}
+                loaded={ready.tasks.length}
+                more={ready.next !== null}
               />
-              <button type="submit" className={`${SECONDARY} min-h-10 px-4`}>
-                Filter
-              </button>
-              {filters.tag === undefined ? null : (
+            )}
+            {filters.tag === undefined ? null : (
+              <p className="flex flex-wrap items-center gap-2 text-sm text-muted">
+                Tagged <span className="font-medium text-bone">{filters.tag}</span>
                 <button
                   type="button"
-                  onClick={() => filterByTag(undefined)}
-                  className={`${SECONDARY} min-h-10 px-4`}
+                  onClick={() => show({ ...filters, tag: undefined })}
+                  className={`${SECONDARY} min-h-8 px-3 text-[13px]`}
                 >
                   Clear
                 </button>
-              )}
-            </div>
-            {/* Not an alert: the board has one alert at a time, for a request that failed. */}
-            {tagError === null ? null : (
-              <p id={`${tagId}-error`} data-testid="tag-error" className="text-sm text-seal">
-                {tagError}
               </p>
             )}
-          </form>
+          </div>
+          {/* The segments: each is a toggle that the address holds, and not a tab panel. On a
+              narrow phone the track scrolls sideways rather than wrap. */}
+          <fieldset className={`${SEGMENTS} max-w-full overflow-x-auto`}>
+            <legend className="sr-only">Phase</legend>
+            {[{ segment: undefined, label: "All" }, ...SEGMENTS_SHOWN].map((chip) => (
+              <button
+                key={chip.segment ?? "all"}
+                type="button"
+                aria-pressed={filters.segment === chip.segment}
+                onClick={() => show({ ...filters, segment: chip.segment })}
+                className={SEGMENT}
+              >
+                {chip.label}{" "}
+                {ready === null ? null : (
+                  <span className="text-[13px] tabular-nums opacity-70">
+                    {counts[chip.segment ?? "all"]}
+                  </span>
+                )}
+              </button>
+            ))}
+          </fieldset>
         </div>
-        <div className="grid gap-6 pt-2">
+        <div className="grid gap-6">
           <BoardBody
             board={board}
             nowNs={nowNs}
+            segment={filters.segment}
             filtered={filtered}
-            onRetry={() => load(filters)}
+            onRetry={() => load(filters.tag)}
             onMore={loadMore}
           />
         </div>

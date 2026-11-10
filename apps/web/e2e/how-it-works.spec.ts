@@ -2,30 +2,23 @@ import { expect, test } from "@playwright/test";
 import { routeApi } from "./fixtures";
 import { openParity, pageFits } from "./parityApi";
 
-// How it works in a browser: reached from the top of the sidebar and from the landing's hero, with
+// How it works in a browser: reached from the sidebar's Docs group and from the landing's hero, with
 // the fee and the bond read from the fixture node's config view.
 
-test("how_it_works_is_at_the_top_of_the_sidebar_and_reads_the_fee_from_the_contract", async ({
+test("how_it_works_is_under_docs_in_the_sidebar_and_reads_the_fee_from_the_contract", async ({
   page,
 }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
   await openParity(page, "/tasks");
-  const how = page
-    .getByRole("navigation", { name: "Main" })
-    .getByRole("link", { name: "How it works" });
-  // At the top of the sidebar, under the Marketplace and above every group.
-  const [howBox, marketBox, postBox] = await Promise.all([
+  const nav = page.getByRole("navigation", { name: "Main" });
+  const how = nav.getByRole("link", { name: "How it works" });
+  // Under Docs, the last group of the sidebar, below every other link, and in view.
+  await expect(how).toBeInViewport({ ratio: 1 });
+  const [howBox, settingsBox] = await Promise.all([
     how.boundingBox(),
-    page
-      .getByRole("navigation", { name: "Main" })
-      .getByRole("link", { name: "Marketplace" })
-      .boundingBox(),
-    page
-      .getByRole("navigation", { name: "Main" })
-      .getByRole("link", { name: "Post a task" })
-      .boundingBox(),
+    nav.getByRole("link", { name: "Settings" }).boundingBox(),
   ]);
-  expect(howBox?.y ?? 0).toBeGreaterThan(marketBox?.y ?? 0);
-  expect(howBox?.y ?? 0).toBeLessThan(postBox?.y ?? 0);
+  expect(howBox?.y ?? 0).toBeGreaterThan(settingsBox?.y ?? 0);
   await how.click();
   await expect(page).toHaveURL("/how-it-works", { timeout: 20_000 });
   await expect(how).toHaveAttribute("aria-current", "page");

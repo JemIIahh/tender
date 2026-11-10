@@ -13,12 +13,7 @@ export default function NotFound() {
   return (
     <AppShell>
       <div className="mx-auto grid w-full max-w-[1400px] gap-8">
-        <PageHead
-          eyebrow="404"
-          title="Page not found."
-          muted="Nothing is at this address."
-          art={{ name: "signal", focus: { x: 0.55, y: 0.5, scale: 0.6 } }}
-        >
+        <PageHead title="Page not found." muted="Nothing is at this address.">
           <p>The link may be old, or the address mistyped.</p>
           <div className="mt-5 flex flex-wrap gap-2">
             <Link href="/tasks" className={PRIMARY}>

@@ -102,8 +102,15 @@ test("silent_api_ends_in_an_error_state_and_retry_loads_the_board", async ({ pag
     if (!silent) await route.fallback();
   });
 
+  // The board's own read, and not the Live block's read of the open tasks.
+  const boardRead = page.waitForRequest(
+    (request) =>
+      request.url().startsWith(`${API_URL}/v1/tasks?`) && !request.url().includes("phase="),
+  );
   await page.goto("/tasks");
   await expect(page.locator("main").getByRole("status")).toContainText("Loading");
+  // The page shows "Loading" before its code has run: the clock jumps once the read is under way.
+  await boardRead;
   await page.clock.fastForward(20_000);
 
   const error = page.getByTestId("error-state");
@@ -134,16 +141,25 @@ test("board_filters_by_phase_and_tag_and_leads_to_the_task_page", async ({ page 
   await routeApi(page);
   await page.goto("/tasks");
   await expect(page.getByTestId("task-card")).toHaveCount(TASKS.length);
+  // No tag field and no Filter button: the segments are the board's one control.
+  await expect(page.locator("main").getByRole("textbox")).toHaveCount(0);
+  const phases = page.getByRole("group", { name: "Phase" });
+  await expect(phases.getByRole("button")).toHaveText([
+    `All ${TASKS.length}`,
+    "Open 0",
+    "Judging 0",
+    "Settled 0",
+  ]);
 
   // No fixture task is settled.
-  await page.getByRole("button", { name: "Settled" }).click();
+  await phases.getByRole("button", { name: /^Settled/ }).click();
+  await expect(page).toHaveURL(/\/tasks\?phase=settled$/);
   await expect(page.getByText("No tasks match these filters.")).toBeVisible();
-  await page.getByRole("button", { name: "All" }).click();
+  await phases.getByRole("button", { name: /^All/ }).click();
   await expect(page.getByTestId("task-card")).toHaveCount(TASKS.length);
 
-  // A tag, typed and sent with the Enter key.
-  await page.getByRole("textbox", { name: "Tag" }).fill("Regex");
-  await page.keyboard.press("Enter");
+  // A tag in the address, which the API narrows by, and Clear to take it off.
+  await page.goto("/tasks?tag=regex");
   await expect(page.getByTestId("task-card")).toHaveCount(1);
   await expect(card(page, REGEX_TITLE)).toBeVisible();
   await page.getByRole("button", { name: "Clear" }).click();

@@ -1,8 +1,9 @@
 import { expect, type Page, test } from "@playwright/test";
 import { API_URL, routeApi, TASKS } from "./fixtures";
 
-// The top bar's Live pill (components/LiveStatus.tsx) in a browser: its word and dot, the panel of
-// figures it opens from the pointer and the keyboard, and the phone, where it is the dot alone. The
+// The top bar's status (components/LiveStatus.tsx) in a browser, the first part of its account
+// group: its dot, the network's name and its accessible name, the panel of figures it opens from
+// the pointer and the keyboard, and the phone, where it is the dot alone. The
 // fixture API has no health check of its own; each spec answers it as the state it needs.
 
 const HEALTH = {
@@ -32,14 +33,15 @@ test("live_pill_opens_the_figures_and_closes_with_escape", async ({ page }) => {
   await page.goto("/tasks");
 
   await expect(pill(page)).toHaveAccessibleName("Status: Live");
-  await expect(pill(page)).toHaveText("Live");
+  await expect(pill(page)).toHaveText("Testnet");
+  await expect(pill(page)).toHaveAttribute("title", "Live: Up to date");
   await expect(pill(page).getByTestId("live-dot")).toHaveAttribute("data-state", "synced");
-  // It sits left of Post task, in the top bar.
+  // It opens the account group, right of Post task, in the top bar.
   const [pillBox, postBox] = await Promise.all([
     pill(page).boundingBox(),
     page.getByRole("banner").getByRole("link", { name: "Post task" }).boundingBox(),
   ]);
-  expect((pillBox?.x ?? 0) + (pillBox?.width ?? 0)).toBeLessThanOrEqual(postBox?.x ?? 0);
+  expect(pillBox?.x ?? 0).toBeGreaterThanOrEqual((postBox?.x ?? 0) + (postBox?.width ?? 0));
 
   await pill(page).click();
   await expect(pill(page)).toHaveAttribute("aria-expanded", "true");
@@ -72,7 +74,7 @@ test("live_pill_says_catching_up_without_numbers_of_blocks", async ({ page }) =>
   await routeHealth(page, { ...HEALTH, chain_final_height: "5444", lag_blocks: "444" });
   await page.goto("/tasks");
 
-  await expect(pill(page)).toHaveText("Updating");
+  await expect(pill(page)).toHaveAccessibleName("Status: Updating");
   await expect(pill(page).getByTestId("live-dot")).toHaveAttribute("data-state", "behind");
   await pill(page).click();
   await expect(page.getByTestId("live-line")).toHaveText("Some numbers may be a few minutes old.");
@@ -86,8 +88,8 @@ test("live_pill_is_the_dot_alone_on_a_phone_and_its_panel_fits", async ({ page }
   await page.goto("/tasks");
 
   await expect(pill(page)).toHaveAccessibleName("Status: Live");
-  // The word is there for a screen reader only: a box of a pixel at most.
-  expect((await pill(page).getByText("Live").boundingBox())?.width ?? 0).toBeLessThanOrEqual(1);
+  // The network's name is not shown on a phone; the state is in the name.
+  await expect(pill(page).getByText("Testnet")).toBeHidden();
   expect((await pill(page).boundingBox())?.width).toBeCloseTo(40, 0);
   const fits = () =>
     page.evaluate(

@@ -132,7 +132,7 @@ export function PhaseTimeline({
               aria-current={live === zone ? "step" : undefined}
               className="min-w-0 rounded-xl border border-line bg-ink px-0.5 py-2.5 text-muted sm:px-1 data-[state~=live]:border-bone data-[state~=live]:bg-bone data-[state~=live]:text-ink data-[state~=preview]:outline-2 data-[state~=preview]:-outline-offset-4 data-[state~=preview]:outline-bone/70 data-[state~=preview]:outline-dashed"
             >
-              <span className="block font-mono text-[9px] tracking-normal uppercase wrap-anywhere sm:text-[10.5px] sm:tracking-[0.14em]">
+              <span className="block text-[11px] leading-tight font-medium wrap-anywhere sm:text-[12px]">
                 {WINDOW_LABELS[zone]}
               </span>
               {window ? (

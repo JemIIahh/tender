@@ -160,10 +160,8 @@ export function HowItWorksView() {
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-10">
       <PageHead
-        eyebrow="Tender"
         title="How it works."
         muted="A contract holds the reward. A checker picks the winner."
-        art={{ name: "scale", focus: { x: 0.55, y: 0.5, scale: 0.6 } }}
       >
         <div className="mt-2 flex flex-wrap gap-2">
           <Link href="/post" className={PRIMARY}>

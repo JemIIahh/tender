@@ -4,26 +4,14 @@ import { CARD, FACT_LABEL } from "./ui";
 // The shapes of lists and figures while they load (components/Skeleton.tsx says what shapes are
 // for): the board's filters, rows of figures, tables, lists and the activity feed.
 
-/** The board's phase tabs and tag field, over its hairline. */
+/** The board's summary line and its segmented control of phases, side by side. */
 export function BoardFiltersSkeleton() {
   return (
-    <div
-      aria-hidden="true"
-      className="flex flex-wrap items-end gap-x-8 gap-y-4 border-b border-line"
-    >
-      <div className="flex max-w-full min-w-0 gap-5 overflow-hidden sm:gap-7">
-        {["w-6", "w-10", "w-[4.5rem]", "w-14", "w-14"].map((width, index) => (
-          // biome-ignore lint/suspicious/noArrayIndexKey: the tabs are only shapes, in a fixed order
-          <span key={index} className="flex min-h-11 shrink-0 items-center pb-1">
-            <TextLine text="text-[15px]" width={width} />
-          </span>
-        ))}
-      </div>
-      <div className="flex w-full items-center gap-2 pb-3 sm:ml-auto sm:w-auto">
-        <Shape className="h-3 w-7 rounded-full" />
-        <Shape className="h-10 min-w-0 flex-1 rounded-full sm:w-44 sm:flex-none" />
-        <Shape className="h-10 w-[4.5rem] rounded-full" />
-      </div>
+    <div aria-hidden="true" className="flex flex-wrap items-center justify-between gap-x-6 gap-y-4">
+      <TextLine text="text-[15px]" width="w-44" />
+      <span className="flex h-11 w-72 max-w-full items-center gap-1 rounded-full border border-line bg-panel p-1">
+        <Shape className="h-9 w-14 rounded-full" />
+      </span>
     </div>
   );
 }

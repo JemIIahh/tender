@@ -94,6 +94,8 @@ test("shell_top_bar_names_the_connected_account_once_the_tab_has_one", () => {
   });
   expect(banner.queryByRole("link", { name: "Connect wallet" })).toBeNull();
   expect(banner.getByRole("link", { name: "alice.testnet" }).getAttribute("href")).toBe("/wallet");
+  // Beside it, a button that copies the account.
+  expect(banner.getByRole("button", { name: "Copy account" })).toBeTruthy();
 });
 
 test("shell_starts_the_wallet_and_shows_no_connect_until_it_knows", () => {

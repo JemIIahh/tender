@@ -432,12 +432,7 @@ export function ActivityView() {
   const [backlog, retry] = useLoad("activity", readBacklog);
   return (
     <div className="mx-auto grid w-full max-w-5xl gap-8">
-      <PageHead
-        eyebrow="Live"
-        title="Activity."
-        muted="What happens on Tender, as it happens."
-        art={{ name: "signal", focus: { x: 0.55, y: 0.5, scale: 0.6 } }}
-      />
+      <PageHead title="Activity." muted="What happens on Tender, as it happens." />
       {backlog.status === "ready" ? (
         <Feed backlog={backlog.data} onResync={retry} />
       ) : backlog.status === "error" ? (

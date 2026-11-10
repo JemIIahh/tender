@@ -5,9 +5,10 @@ import { StrictMode, useSyncExternalStore } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import Board from "../app/(app)/tasks/page";
 
-// The board over a fake API: what it shows for each state of the request, and how its filters
-// and its paging ask the API. The filters are in the address, which the tests hold in a tiny model
-// of the router: a replace changes the query and tells the page, as Next does.
+// The board over a fake API: what it shows for each state of the request, how its segments narrow
+// what it has, and how its tag and its paging ask the API. The filters are in the address, which
+// the tests hold in a tiny model of the router: a replace changes the query and tells the page, as
+// Next does.
 
 const nav = vi.hoisted(() => {
   const listeners = new Set<() => void>();
@@ -305,13 +306,18 @@ test("board_links_each_card_to_its_task_page", async () => {
   render(<Board />);
 
   const cards = await screen.findAllByTestId("task-card");
+  // The card's one link is its round arrow, named for the task, and it stretches over the card.
   const titled = within(cards[0] as HTMLElement).getByRole("link", {
-    name: "Extract invoice totals",
+    name: "Open task: Extract invoice totals",
   });
   expect(titled.getAttribute("href")).toBe("/tasks/7");
+  expect(titled.className).toContain("after:inset-0");
+  expect(within(cards[0] as HTMLElement).getByRole("heading", { level: 2 }).textContent).toBe(
+    "Extract invoice totals",
+  );
   // A task with no public brief has a page too: its title is the stand-in.
   const untitled = within(cards[1] as HTMLElement).getByRole("link", {
-    name: /no public brief yet/i,
+    name: /^Open task: .*no public brief yet/i,
   });
   expect(untitled.getAttribute("href")).toBe("/tasks/8");
 });
@@ -359,116 +365,161 @@ test("board_shows_the_judges_words_as_text_never_as_html", async () => {
 
 // ---- Filters ----------------------------------------------------------------------------------
 
-test("board_phase_chips_ask_the_api_for_that_phase", async () => {
-  const api = fakeApi(json(page(TASK)));
+/** A settled task beside the open one: the segments have something to tell apart. */
+const SETTLED = {
+  ...TASK,
+  id: "9",
+  title: "A settled task",
+  phase: "settled",
+  outcome_kind: "picked",
+};
+
+/** Each segment of the control, by its words (the label and the count) and whether it is pressed. */
+const pressed = () =>
+  within(screen.getByRole("group", { name: "Phase" }))
+    .getAllByRole("button")
+    .map((chip) => `${chip.textContent}:${chip.getAttribute("aria-pressed")}`);
+
+test("board_segments_narrow_the_tasks_it_has_by_the_clock_and_count_them", async () => {
+  const api = fakeApi(json(page(TASK, SETTLED)));
   render(<Board />);
-  await screen.findByTestId("task-card");
-  const group = screen.getByRole("group", { name: "Phase" });
-  const pressed = () =>
-    within(group)
-      .getAllByRole("button")
-      .map((chip) => `${chip.textContent}:${chip.getAttribute("aria-pressed")}`);
-  // All the tasks to begin with, as the API lists them when no phase is asked for.
-  expect(pressed()).toEqual([
-    "All:true",
-    "Open:false",
-    "Revealing:false",
-    "Judging:false",
-    "Settled:false",
-  ]);
+  await screen.findAllByTestId("task-card");
+  // All the tasks to begin with, read a page of 50 at a time with no phase asked for: the segments
+  // narrow what the board has, by the phase each card shows, and ask the API for nothing.
   expect(query(api, 0).has("phase")).toBe(false);
+  expect(query(api, 0).get("limit")).toBe("50");
+  expect(pressed()).toEqual(["All 2:true", "Open 1:false", "Judging 0:false", "Settled 1:false"]);
 
-  await userEvent.click(within(group).getByRole("button", { name: "Revealing" }));
+  await userEvent.click(screen.getByRole("button", { name: /^Settled/ }));
 
-  await waitFor(() => expect(api.urls).toHaveLength(2));
-  expect(query(api, 1).get("phase")).toBe("revealing");
-  expect(pressed()).toEqual([
-    "All:false",
-    "Open:false",
-    "Revealing:true",
-    "Judging:false",
-    "Settled:false",
+  expect(pressed()).toEqual(["All 2:false", "Open 1:false", "Judging 0:false", "Settled 1:true"]);
+  expect(screen.getAllByTestId("task-card").map((card) => card.textContent)).toEqual([
+    expect.stringContaining("A settled task"),
   ]);
+  expect(api.urls).toHaveLength(1);
 
-  await userEvent.click(within(group).getByRole("button", { name: "All" }));
+  await userEvent.click(screen.getByRole("button", { name: /^All/ }));
 
-  await waitFor(() => expect(api.urls).toHaveLength(3));
-  expect(query(api, 2).has("phase")).toBe(false);
+  expect(screen.getAllByTestId("task-card")).toHaveLength(2);
+  expect(api.urls).toHaveLength(1);
 });
 
-test("board_filters_by_tag", async () => {
+test("board_judging_segment_holds_the_tasks_being_revealed_and_judged", async () => {
+  // Past the commit deadline TASK is in its reveal window; one more task is past its reveal one.
+  pinClock(BigInt(TASK.commit_deadline) + 5n * SECOND);
+  const judging = {
+    ...TASK,
+    id: "10",
+    title: "A task being judged",
+    created_at: (CREATED - 200n * SECOND).toString(),
+    commit_deadline: (CREATED - 100n * SECOND).toString(),
+    reveal_deadline: (CREATED + 10n * SECOND).toString(),
+  };
+  fakeApi(json(page(TASK, judging, SETTLED)));
+  render(<Board />);
+  await screen.findAllByTestId("task-card");
+  expect(pressed()).toEqual(["All 3:true", "Open 0:false", "Judging 2:false", "Settled 1:false"]);
+
+  await userEvent.click(screen.getByRole("button", { name: /^Judging/ }));
+
+  const phases = screen
+    .getAllByTestId("task-card")
+    .map((card) => within(card).getByTestId("phase-chip").textContent);
+  expect(phases).toEqual(["Revealing", "Judging"]);
+  expect(nav.replaced).toEqual(["/tasks?phase=judging"]);
+});
+
+test("board_summary_says_how_many_are_open_and_what_they_lock", async () => {
+  fakeApi(
+    json(
+      page(
+        TASK,
+        { ...TASK, id: "8", reward: "2500000" },
+        // Settled: not open, and its reward is paid out.
+        SETTLED,
+        // A token the app has no decimals for: counted as open, its amount left out of the line.
+        { ...TASK, id: "11", reward: "42", token: "odd.testnet" },
+      ),
+    ),
+  );
+  render(<Board />);
+  await screen.findAllByTestId("task-card");
+  expect(screen.getByTestId("board-summary").textContent).toBe("3 open · 4.00 tUSDC locked");
+});
+
+test("board_summary_says_it_counts_only_what_it_loaded_when_there_is_more", async () => {
+  fakeApi(json({ tasks: [TASK], next_cursor: "7" }));
+  render(<Board />);
+  await screen.findByTestId("task-card");
+  expect(screen.getByTestId("board-summary").textContent).toBe(
+    "1 open · 1.50 tUSDC locked · of the 1 tasks loaded",
+  );
+});
+
+test("board_asks_the_api_for_the_tag_the_address_holds_and_clear_takes_it_off", async () => {
+  nav.go("?tag=json");
   const api = fakeApi(json(page(TASK)));
   render(<Board />);
   await screen.findByTestId("task-card");
-
-  // Case and the spaces around a tag do not matter, as a person types it.
-  await userEvent.type(screen.getByLabelText("Tag"), "  JSON {Enter}");
-
-  await waitFor(() => expect(api.urls).toHaveLength(2));
-  expect(query(api, 1).get("tag")).toBe("json");
+  expect(query(api, 0).get("tag")).toBe("json");
 
   await userEvent.click(screen.getByRole("button", { name: "Clear" }));
 
-  await waitFor(() => expect(api.urls).toHaveLength(3));
-  expect(query(api, 2).has("tag")).toBe(false);
-  expect((screen.getByLabelText("Tag") as HTMLInputElement).value).toBe("");
+  await waitFor(() => expect(api.urls).toHaveLength(2));
+  expect(query(api, 1).has("tag")).toBe(false);
   expect(screen.queryByRole("button", { name: "Clear" })).toBeNull();
+  expect(nav.replaced).toEqual(["/tasks"]);
 });
 
 test("board_keeps_the_phase_when_the_tag_changes_and_the_tag_when_the_phase_does", async () => {
+  nav.go("?phase=open&tag=json");
   const api = fakeApi(json(page(TASK)));
   render(<Board />);
   await screen.findByTestId("task-card");
 
-  await userEvent.click(screen.getByRole("button", { name: "Open" }));
+  await userEvent.click(screen.getByRole("button", { name: /^Settled/ }));
+  expect(nav.replaced.at(-1)).toBe("/tasks?phase=settled&tag=json");
+  // A segment asks for nothing: the tag is the board's one question to the API.
+  expect(api.urls).toHaveLength(1);
+
+  await userEvent.click(screen.getByRole("button", { name: "Clear" }));
+
   await waitFor(() => expect(api.urls).toHaveLength(2));
-  await userEvent.type(screen.getByLabelText("Tag"), "json{Enter}");
-  await waitFor(() => expect(api.urls).toHaveLength(3));
-  expect(query(api, 2).get("phase")).toBe("open");
-  expect(query(api, 2).get("tag")).toBe("json");
-
-  await userEvent.click(screen.getByRole("button", { name: "Settled" }));
-
-  await waitFor(() => expect(api.urls).toHaveLength(4));
-  expect(query(api, 3).get("phase")).toBe("settled");
-  expect(query(api, 3).get("tag")).toBe("json");
+  expect(query(api, 1).has("tag")).toBe(false);
+  expect(nav.replaced.at(-1)).toBe("/tasks?phase=settled");
 });
 
-test("board_does_not_ask_for_a_tag_the_api_would_refuse", async () => {
-  const api = fakeApi(json(page(TASK)));
+test("board_has_no_tag_field_and_no_filter_button", async () => {
+  // Tender asks for no category: the board narrows by phase only, and a tag only by its address.
+  fakeApi(json(page(TASK)));
   render(<Board />);
   await screen.findByTestId("task-card");
-
-  await userEvent.type(screen.getByLabelText("Tag"), "not a tag!{Enter}");
-
-  // The person is told what a tag looks like, next to the field, and nothing is sent.
-  expect(screen.getByTestId("tag-error").textContent).toBe(
-    "A tag is 1 to 24 characters: a to z, 0 to 9 and -.",
-  );
-  expect(api.urls).toHaveLength(1);
-  // The message is not an alert: the board has one alert at a time, for a request that failed.
-  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByRole("textbox")).toBeNull();
+  expect(screen.queryByLabelText("Tag")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Filter" })).toBeNull();
 });
 
 test("board_shows_the_tags_of_a_card_as_text_and_not_as_buttons", async () => {
-  fakeApi(json(page(TASK)));
+  fakeApi(json(page({ ...TASK, tags: ["extraction", "json", "invoices"] })));
   render(<Board />);
   const card = within(await screen.findByTestId("task-card"));
 
-  // The Tag field is the one way to filter by a tag.
   expect(card.getByText("json")).toBeTruthy();
   expect(card.queryByRole("button")).toBeNull();
+  // Two tags at most on a card: its page has them all.
+  expect(card.queryByText("invoices")).toBeNull();
 });
 
 test("board_says_when_no_task_matches_the_filters", async () => {
-  fakeApi(json(page(TASK)), json(page()));
+  fakeApi(json(page(TASK)));
   render(<Board />);
   await screen.findByTestId("task-card");
 
-  await userEvent.click(screen.getByRole("button", { name: "Settled" }));
+  await userEvent.click(screen.getByRole("button", { name: /^Settled/ }));
 
   expect(await screen.findByText(/no tasks match/i)).toBeTruthy();
   expect(screen.queryByText(/no tasks yet/i)).toBeNull();
+  expect(screen.getByRole("link", { name: "Show all tasks" }).getAttribute("href")).toBe("/tasks");
 });
 
 test("board_drops_the_answer_to_a_filter_that_is_no_longer_the_one_asked_for", async () => {
@@ -477,41 +528,34 @@ test("board_drops_the_answer_to_a_filter_that_is_no_longer_the_one_asked_for", a
   render(<Board />);
   await waitFor(() => expect(pending).toHaveLength(1));
 
-  await userEvent.click(screen.getByRole("button", { name: "Open" }));
+  // A tag in the address while the first read is still out: the board asks again.
+  act(() => nav.go("?tag=json"));
   await waitFor(() => expect(pending).toHaveLength(2));
-  pending[1]?.(json(page({ ...TASK, title: "Answer for Open" })));
-  await screen.findByText("Answer for Open");
+  pending[1]?.(json(page({ ...TASK, title: "Answer for json" })));
+  await screen.findByText("Answer for json");
   pending[0]?.(json(page({ ...TASK, title: "Answer for All" })));
   await new Promise((resolve) => setTimeout(resolve, 20));
 
   expect(screen.queryByText("Answer for All")).toBeNull();
-  expect(screen.getByText("Answer for Open")).toBeTruthy();
+  expect(screen.getByText("Answer for json")).toBeTruthy();
 });
 
 // ---- The filters are in the address ------------------------------------------------------------
 
 test("board_puts_each_filter_in_the_address_and_replaces_the_entry_it_is_on", async () => {
+  nav.go("?tag=json");
   const api = fakeApi(json(page(TASK)));
   render(<Board />);
   await screen.findByTestId("task-card");
 
-  await userEvent.click(screen.getByRole("button", { name: "Open" }));
-  await waitFor(() => expect(api.urls).toHaveLength(2));
-  await userEvent.type(screen.getByLabelText("Tag"), "  JSON {Enter}");
-  await waitFor(() => expect(api.urls).toHaveLength(3));
-  await userEvent.click(screen.getByRole("button", { name: "All" }));
-  await waitFor(() => expect(api.urls).toHaveLength(4));
+  await userEvent.click(screen.getByRole("button", { name: /^Open/ }));
+  await userEvent.click(screen.getByRole("button", { name: /^All/ }));
   await userEvent.click(screen.getByRole("button", { name: "Clear" }));
-  await waitFor(() => expect(api.urls).toHaveLength(5));
+  await waitFor(() => expect(api.urls).toHaveLength(2));
 
   // A filter changes the address of the board and adds nothing to the history, and the board is
   // addressed where it is (`/tasks` here), whatever that is.
-  expect(nav.replaced).toEqual([
-    "/tasks?phase=open",
-    "/tasks?phase=open&tag=json",
-    "/tasks?tag=json",
-    "/tasks",
-  ]);
+  expect(nav.replaced).toEqual(["/tasks?phase=open&tag=json", "/tasks?tag=json", "/tasks"]);
 });
 
 test("board_opens_on_the_filters_the_address_holds", async () => {
@@ -520,13 +564,24 @@ test("board_opens_on_the_filters_the_address_holds", async () => {
 
   render(<Board />);
 
-  await screen.findByTestId("task-card");
-  expect(query(api, 0).get("phase")).toBe("judging");
+  await screen.findByText(/no tasks match/i);
   expect(query(api, 0).get("tag")).toBe("json");
+  expect(query(api, 0).has("phase")).toBe(false);
   expect(api.urls).toHaveLength(1);
-  expect(screen.getByRole("button", { name: "Judging" }).getAttribute("aria-pressed")).toBe("true");
-  expect((screen.getByLabelText("Tag") as HTMLInputElement).value).toBe("json");
+  expect(screen.getByRole("button", { name: /^Judging/ }).getAttribute("aria-pressed")).toBe(
+    "true",
+  );
   expect(screen.getByRole("button", { name: "Clear" })).toBeTruthy();
+});
+
+test("board_opens_an_older_link_to_revealing_on_the_judging_segment", async () => {
+  nav.go("?phase=revealing");
+  fakeApi(json(page(TASK)));
+  render(<Board />);
+  await screen.findByText(/no tasks match/i);
+  expect(screen.getByRole("button", { name: /^Judging/ }).getAttribute("aria-pressed")).toBe(
+    "true",
+  );
 });
 
 test("board_follows_the_address_when_it_changes_under_it_as_on_back", async () => {
@@ -538,15 +593,18 @@ test("board_follows_the_address_when_it_changes_under_it_as_on_back", async () =
   // Back to an address with other filters, and then to one with none.
   act(() => nav.go("?phase=settled"));
   await waitFor(() => expect(api.urls).toHaveLength(2));
-  expect(query(api, 1).get("phase")).toBe("settled");
   expect(query(api, 1).has("tag")).toBe(false);
-  expect((screen.getByLabelText("Tag") as HTMLInputElement).value).toBe("");
+  expect(screen.getByRole("button", { name: /^Settled/ }).getAttribute("aria-pressed")).toBe(
+    "true",
+  );
   expect(screen.queryByRole("button", { name: "Clear" })).toBeNull();
 
   act(() => nav.go(""));
-  await waitFor(() => expect(api.urls).toHaveLength(3));
-  expect(query(api, 2).has("phase")).toBe(false);
-  expect(screen.getByRole("button", { name: "All" }).getAttribute("aria-pressed")).toBe("true");
+  // The same tag (none): the board has its tasks, and only the segment changes.
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: /^All/ }).getAttribute("aria-pressed")).toBe("true"),
+  );
+  expect(api.urls).toHaveLength(2);
 });
 
 test.each([
@@ -563,7 +621,7 @@ test.each([
   await screen.findByTestId("task-card");
   expect(query(api, 0).has("phase")).toBe(false);
   expect(query(api, 0).has("tag")).toBe(false);
-  expect(screen.getByRole("button", { name: "All" }).getAttribute("aria-pressed")).toBe("true");
+  expect(screen.getByRole("button", { name: /^All/ }).getAttribute("aria-pressed")).toBe("true");
 });
 
 test("board_reads_a_tag_of_the_address_as_a_person_would_type_it", async () => {
@@ -725,13 +783,14 @@ test("board_leaves_the_focus_where_the_person_went_while_the_last_page_loaded", 
   await screen.findByTestId("task-card");
   await userEvent.click(screen.getByRole("button", { name: "Load more" }));
   await waitFor(() => expect(pending).toHaveLength(1));
-  // While the page is on its way the person goes on to the tag field and starts to type.
-  await userEvent.click(screen.getByLabelText("Tag"));
+  // While the page is on its way the person goes on to a segment of the control.
+  const open = screen.getByRole("button", { name: /^Open/ });
+  await userEvent.click(open);
 
   pending[0]?.(json({ tasks: [{ ...TASK, id: "6", title: "An older task" }], next_cursor: null }));
 
   await screen.findByText("No more tasks");
-  expect(document.activeElement).toBe(screen.getByLabelText("Tag"));
+  expect(document.activeElement).toBe(open);
 });
 
 // ---- The featured card ------------------------------------------------------------------------
@@ -764,4 +823,12 @@ test("board_features_the_open_task_with_the_top_reward_and_keeps_the_api_order",
   ]);
   expect(within(cards[1] as HTMLElement).getByText("Top reward")).toBeTruthy();
   expect(within(cards[0] as HTMLElement).queryByText("Top reward")).toBeNull();
+});
+
+test("board_features_no_card_when_only_one_task_is_open", async () => {
+  fakeApi(json(page(TASK, SETTLED)));
+  render(<Board />);
+  const cards = await screen.findAllByTestId("task-card");
+  expect(cards.map((card) => card.getAttribute("data-featured"))).toEqual(["false", "false"]);
+  expect(screen.queryByText("Top reward")).toBeNull();
 });

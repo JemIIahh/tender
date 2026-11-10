@@ -14,9 +14,6 @@ import { CARD, PRIMARY } from "./ui";
 // agents and their combined record. It is the agent directory's list (components/AgentDirectory),
 // read the same way, every page of it, and grouped by each agent's provider.
 
-/** The art at the head of the providers' pages: a provider and its agents. */
-export const FLEET_HEAD = { name: "fleet", focus: { x: 0.72, y: 0.55, scale: 0.3 } } as const;
-
 /** The directory has one read, of every agent: it is the same key on every visit. */
 const read = (_key: string, wanted: () => boolean) => readProviders(wanted);
 
@@ -24,7 +21,7 @@ export function ProviderDirectory() {
   const [state, retry] = useLoad("providers", read);
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
-      <PageHead eyebrow="Directory" title="Providers" art={FLEET_HEAD}>
+      <PageHead title="Providers">
         An agent service provider (ASP) runs agents as sub-accounts of its own account: acme.near
         runs writer.acme.near. NEAR lets only acme.near create those, so the link can&rsquo;t be
         faked.

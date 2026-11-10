@@ -5,9 +5,10 @@ import { LiveStatus } from "../components/LiveStatus";
 import { liveOf } from "../lib/live";
 import { agent, summary } from "./tasks";
 
-// The top bar's Live pill (components/LiveStatus.tsx, lib/live.ts): whether the index is up to date
-// with the chain, and the platform's figures behind it, as the API gave them. It makes the three
-// reads the sidebar's figures used to make, and never shows a block height or a count of blocks.
+// The top bar's status (components/LiveStatus.tsx, lib/live.ts), the first part of its account
+// group: whether the index is up to date with the chain, the network's name, and the platform's
+// figures behind it, as the API gave them. It makes three reads, which the sidebar's Live block
+// shares, and never shows a block height or a count of blocks.
 
 // No jest-dom here (X-20): plain assertions on what the Testing Library finds.
 
@@ -72,8 +73,10 @@ test("live_pill_says_up_to_date_and_shows_the_api_s_figures_token_by_token", asy
   render(<LiveStatus />);
 
   const button = await pill();
+  // Its name says the state, as does its tooltip; it shows the dot and the network's name.
   expect(button.getAttribute("aria-label")).toBe("Status: Live");
-  expect(button.textContent).toBe("Live");
+  expect(button.getAttribute("title")).toBe("Live: Up to date");
+  expect(button.textContent).toBe("Testnet");
   expect(dot(button)).toBe("synced");
   expect(button.getAttribute("aria-expanded")).toBe("false");
   // The three reads, once each, and nothing else.
@@ -109,7 +112,8 @@ test("live_pill_says_catching_up_and_never_how_many_blocks", async () => {
 
   const button = await pill();
   expect(button.getAttribute("aria-label")).toBe("Status: Updating");
-  expect(button.textContent).toBe("Updating");
+  expect(button.getAttribute("title")).toBe("Updating: Some numbers may be a few minutes old.");
+  expect(button.textContent).toBe("Testnet");
   expect(dot(button)).toBe("behind");
   await userEvent.click(button);
   const panel = screen.getByTestId("live-panel");
@@ -155,7 +159,7 @@ test("live_pill_is_amber_when_the_health_check_says_the_chain_is_unavailable", a
   render(<LiveStatus />);
   const button = await pill();
   expect(button.getAttribute("aria-label")).toBe("Status: Updating");
-  expect(button.textContent).toBe("Updating");
+  expect(dot(button)).toBe("behind");
   await userEvent.click(button);
   expect(screen.getAllByTestId("live-figure").map((row) => row.textContent)).toEqual([
     "Open tasks3",
@@ -171,7 +175,7 @@ test("live_pill_says_offline_and_shows_no_figure_when_the_api_can_t_be_reached",
   const button = await pill();
   expect(urls).toHaveLength(3);
   expect(button.getAttribute("aria-label")).toBe("Status: Offline");
-  expect(button.textContent).toBe("Offline");
+  expect(button.getAttribute("title")).toBe("Offline: Can't reach Tender right now");
   expect(dot(button)).toBe("offline");
   await userEvent.click(button);
   expect(screen.getByTestId("live-line").textContent).toBe("Can't reach Tender right now");
@@ -295,10 +299,14 @@ test("live_pill_reads_again_each_minute_only_while_the_tab_is_in_view", async ()
 test("live_pill_is_the_dot_alone_on_a_phone_and_keeps_its_name", async () => {
   fakeApi({ [HEALTH_PATH]: () => json(HEALTH) });
   render(<LiveStatus />);
+  // Before the first read is back: the network's name, with no state and nothing to press.
+  expect(screen.getByTestId("live-waiting").textContent).toBe("Testnet");
+  expect(screen.queryByRole("button")).toBeNull();
   const button = await pill();
-  // The word is hidden on a phone by CSS (max-sm:sr-only), and stays in the button's name.
-  const word = within(button).getByText("Live");
-  expect(word.className).toContain("max-sm:sr-only");
+  // The network's name is hidden on a phone by CSS; the state stays in the button's name.
+  const word = within(button).getByText("Testnet");
+  expect(word.className).toContain("max-sm:hidden");
+  expect(button.getAttribute("aria-label")).toBe("Status: Live");
   expect(button.className).toContain("max-sm:w-10");
   // On a phone the panel spans the screen under the top bar.
   await userEvent.click(button);

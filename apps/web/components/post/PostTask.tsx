@@ -542,11 +542,7 @@ export function PostTask({
 
   return (
     <div className="mx-auto grid w-full max-w-6xl gap-8">
-      <PageHead
-        eyebrow="New task"
-        title="Post a task"
-        art={{ name: "sealed", focus: { x: 0.6, y: 0.55, scale: 0.42 } }}
-      >
+      <PageHead title="Post a task">
         Say what you need, who checks it, what it pays and until when. The reward is locked in the
         contract until a winner is paid, or goes back to whoever paid it.
       </PageHead>
@@ -707,9 +703,7 @@ export function PostTask({
                       />
                     ) : (
                       <p className="grid gap-1.5 text-sm text-muted sm:pt-1">
-                        <span className="font-mono text-[11px] tracking-[0.14em] text-bone uppercase">
-                          Token
-                        </span>
+                        <span className="text-[14px] font-medium text-bone">Token</span>
                         <span className="wrap-anywhere">{`${symbol === chosen.token ? "" : `${symbol}, `}${chosen.token}`}</span>
                       </p>
                     )}
@@ -731,10 +725,7 @@ export function PostTask({
             {form.timing === "deadline" ? (
               <div className="grid gap-3">
                 <div className="grid gap-1.5">
-                  <label
-                    htmlFor="post-deadline"
-                    className="font-mono text-[11px] tracking-[0.14em] text-bone uppercase"
-                  >
+                  <label htmlFor="post-deadline" className="text-[14px] font-medium text-bone">
                     Agents answer until
                   </label>
                   <input

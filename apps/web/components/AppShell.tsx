@@ -15,11 +15,11 @@ import {
 import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
 import { restoreSidebar, setRail, sidebarStore } from "../lib/sidebar";
 import { walletStore } from "../lib/wallet";
-import { AccountPill, BAR_PILL } from "./AccountPill";
-import { LiveStatus } from "./LiveStatus";
+import { AccountGroup, BAR_PILL } from "./AccountPill";
 import { Mark } from "./Mark";
 import { Nav, type TipHandlers } from "./Nav";
-import { PRIMARY, SECONDARY } from "./ui";
+import { SidebarLive } from "./SidebarLive";
+import { PRIMARY } from "./ui";
 
 /** Laptop width, from which the sidebar is a sidebar (and can be the rail) and not a menu. */
 const WIDE = "(min-width: 64rem)";
@@ -117,11 +117,12 @@ function PanelIcon() {
 const FADE = "transition-[opacity,visibility] duration-200 motion-reduce:transition-none";
 
 /**
- * The frame of every page after the landing: a sidebar with the pages, a top bar with the Live
- * pill (components/LiveStatus: whether the index is up to date, and a few figures behind it),
- * "Post task" and the way to the wallet (the connected account, once a page has connected one),
- * and the page itself. On a phone the sidebar is a menu that the top bar opens, over the page, and
- * that closes when a page is chosen.
+ * The frame of every page after the landing: a sidebar with the pages and, pinned under them, the
+ * Live block (components/SidebarLive: a few of the platform's figures and the way to Metrics); a
+ * top bar with "Post task" and the account group (components/AccountPill: whether the index is up
+ * to date, the network, and the way to the wallet, which is the connected account once a page has
+ * connected one); and the page itself. On a phone the sidebar is a menu that the top bar opens,
+ * over the page, and that closes when a page is chosen.
  *
  * From laptop width up, the button at the head of the sidebar, or ⌘B (Ctrl+B), makes the sidebar a
  * narrow rail of icons and back (lib/sidebar.ts keeps the choice). On the rail each icon has its
@@ -282,7 +283,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     <div className="app min-h-svh bg-ink text-bone lg:grid lg:grid-cols-[15rem_minmax(0,1fr)] lg:grid-rows-[auto_1fr] lg:transition-[grid-template-columns] lg:duration-200 lg:ease-[cubic-bezier(0.32,0.72,0,1)] lg:motion-reduce:transition-none lg:rail:grid-cols-[4rem_minmax(0,1fr)]">
       <a
         href="#main"
-        className="sr-only z-50 rounded-full bg-bone px-4 py-2 font-mono text-[11px] tracking-[0.12em] text-ink uppercase focus:not-sr-only focus:fixed focus:top-3 focus:left-3"
+        className="sr-only z-50 rounded-full bg-bone px-4 py-2 text-[13px] font-medium text-ink focus:not-sr-only focus:fixed focus:top-3 focus:left-3"
       >
         Skip to the page
       </a>
@@ -327,37 +328,18 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div ref={barMark} data-testid="bar-wordmark" className="lg:hidden lg:rail:block">
           <Wordmark />
         </div>
-        <div className="ml-auto flex items-center gap-2">
-          <LiveStatus />
+        <div className="ml-auto flex min-w-0 items-center gap-2">
           <Link href="/post" className={`${PRIMARY} ${BAR_PILL}`}>
             Post task
           </Link>
-          {/* While the store looks, a placeholder of the pill's size. On a phone the Live dot takes
-              some of the bar, so the pill says "Connect", and an account is cut a little shorter;
-              the names and the title are whole. */}
-          {!ready ? (
-            <span
-              role="status"
-              aria-label="Checking your wallet"
-              data-testid="wallet-pill-placeholder"
-              className={`${SECONDARY} ${BAR_PILL} w-24 animate-pulse motion-reduce:animate-none sm:w-36`}
-            >
-              <span className="sr-only">Checking your wallet</span>
-            </span>
-          ) : accountId === null ? (
-            <Link href="/wallet" aria-label="Connect wallet" className={`${SECONDARY} ${BAR_PILL}`}>
-              Connect<span className="max-sm:hidden">{"\u00a0"}wallet</span>
-            </Link>
-          ) : (
-            <AccountPill accountId={accountId} />
-          )}
+          <AccountGroup ready={ready} accountId={accountId} />
         </div>
       </header>
 
       <aside
         id={menuId}
         data-open={open}
-        className="fixed inset-x-0 top-16 bottom-0 z-20 hidden flex-col gap-8 overflow-x-hidden overflow-y-auto border-t border-line bg-ink px-4 pt-6 pb-8 data-[open=true]:flex sm:px-8 lg:sticky lg:top-0 lg:col-start-1 lg:row-span-2 lg:row-start-1 lg:flex lg:h-svh lg:border-t-0 lg:px-3 lg:pt-0 lg:pb-6"
+        className="fixed inset-x-0 top-16 bottom-0 z-20 hidden flex-col gap-4 overflow-hidden border-t border-line bg-ink px-4 pt-4 pb-5 data-[open=true]:flex sm:px-8 lg:sticky lg:top-0 lg:col-start-1 lg:row-span-2 lg:row-start-1 lg:flex lg:h-svh lg:border-t-0 lg:px-3 lg:pt-0 lg:pb-4"
       >
         <div className="hidden h-16 shrink-0 items-center gap-1.5 lg:flex">
           {/* Its name is what it controls, and stays the same as it is pressed; `aria-expanded` says
@@ -385,7 +367,12 @@ export function AppShell({ children }: { children: ReactNode }) {
             <Wordmark />
           </div>
         </div>
-        <Nav tip={linkTip} />
+        {/* The links scroll on their own when the window is short; the Live block stays in view. The
+            gutter leaves room for a link's focus ring, which the scrolling box would cut off. */}
+        <div className="-mx-1.5 min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-1.5 py-1">
+          <Nav tip={linkTip} />
+        </div>
+        <SidebarLive tip={linkTip} />
       </aside>
 
       {/* Under the open menu, the page is out of reach of the keyboard and the pointer alike. */}

@@ -11,7 +11,6 @@ import { Tokens } from "./account/parts";
 import { ErrorState } from "./ErrorState";
 import { Count, EarnedNothing, FigureLine } from "./Figures";
 import { PageHead } from "./PageHead";
-import { FLEET_HEAD } from "./ProviderDirectory";
 import { ProviderServices } from "./ProviderServices";
 import { CardsSkeleton } from "./Skeleton";
 import { StatsSkeleton } from "./SkeletonLists";
@@ -45,14 +44,12 @@ function Back() {
 function Head({ account, isTeam }: { account: string; isTeam: boolean }) {
   return (
     <PageHead
-      eyebrow="Agent service provider (ASP)"
       title={
         <span className="flex min-w-0 items-center gap-4">
           <Avatar account={account} size={56} />
           <span className="min-w-0">{account}</span>
         </span>
       }
-      art={FLEET_HEAD}
     >
       {isTeam ? (
         <p className="mb-3 text-bone">
@@ -60,8 +57,8 @@ function Head({ account, isTeam }: { account: string; isTeam: boolean }) {
         </p>
       ) : null}
       <p className="wrap-anywhere">
-        The agents this account runs, each a sub-account of it. NEAR lets only {account} create
-        them, so the link can&rsquo;t be faked.
+        Agent service provider (ASP). The agents this account runs, each a sub-account of it. NEAR
+        lets only {account} create them, so the link can&rsquo;t be faked.
       </p>
     </PageHead>
   );

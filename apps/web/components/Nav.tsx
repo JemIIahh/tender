@@ -5,8 +5,10 @@ import { usePathname } from "next/navigation";
 import type { FocusEvent, PointerEvent, ReactNode } from "react";
 
 // Every page of the app, in the groups of the sidebar (components/AppShell.tsx), so that a task
-// that adds a page does not have to touch the shell. How it works is in the top group, beside the
-// Marketplace, for anyone new to find first.
+// that adds a page does not have to touch the shell. The Marketplace is first and alone; then the
+// tasks, the agents, the account, and the docs. Providers is a tab of Browse agents, Telegram is a
+// row of Settings, and Metrics is behind the sidebar's Live block: each still has its page, which
+// marks the link it is under.
 //
 // From laptop width up the sidebar can be a narrow rail of icons (lib/sidebar.ts). The rail's look
 // is all CSS, on the `rail:` variant: each link keeps its icon where it was, its words fade out,
@@ -15,17 +17,14 @@ import type { FocusEvent, PointerEvent, ReactNode } from "react";
 type Icon =
   | "market"
   | "activity"
-  | "metrics"
   | "post"
   | "tasks"
   | "browse"
-  | "providers"
   | "services"
   | "add"
   | "mine"
   | "earnings"
   | "wallet"
-  | "telegram"
   | "settings"
   | "how";
 
@@ -38,12 +37,7 @@ interface Item {
 const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = [
   {
     title: null,
-    items: [
-      { href: "/tasks", label: "Marketplace", icon: "market" },
-      { href: "/how-it-works", label: "How it works", icon: "how" },
-      { href: "/activity", label: "Activity", icon: "activity" },
-      { href: "/metrics", label: "Metrics", icon: "metrics" },
-    ],
+    items: [{ href: "/tasks", label: "Marketplace", icon: "market" }],
   },
   {
     title: "Tasks",
@@ -56,7 +50,6 @@ const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = 
     title: "Agents",
     items: [
       { href: "/agents", label: "Browse agents", icon: "browse" },
-      { href: "/providers", label: "Providers", icon: "providers" },
       { href: "/services", label: "Services", icon: "services" },
       { href: "/my-agents/new", label: "Add an agent", icon: "add" },
       { href: "/my-agents", label: "My agents", icon: "mine" },
@@ -65,24 +58,39 @@ const GROUPS: ReadonlyArray<{ title: string | null; items: readonly Item[] }> = 
   {
     title: "Account",
     items: [
+      { href: "/activity", label: "Activity", icon: "activity" },
       { href: "/earnings", label: "Earnings", icon: "earnings" },
       { href: "/wallet", label: "Wallet", icon: "wallet" },
-      { href: "/telegram", label: "Telegram", icon: "telegram" },
       { href: "/settings", label: "Settings", icon: "settings" },
     ],
+  },
+  {
+    title: "Docs",
+    items: [{ href: "/how-it-works", label: "How it works", icon: "how" }],
   },
 ];
 
 const HREFS = GROUPS.flatMap((group) => group.items.map((item) => item.href));
 
+/** Pages with no link of their own, and the link they are under. */
+const UNDER: Readonly<Record<string, string>> = {
+  "/providers": "/agents",
+  "/telegram": "/settings",
+};
+
+/** Whether `pathname` is the page `href`, or under it. */
+const within = (pathname: string, href: string) =>
+  pathname === href || pathname.startsWith(`${href}/`);
+
 /**
  * The link of the page you are on: the one whose page `pathname` is, or is under, and of those the
- * longest, so that adding an agent (`/my-agents/new`) is "Add an agent" and not "My agents" too.
+ * longest, so that adding an agent (`/my-agents/new`) is "Add an agent" and not "My agents" too. A
+ * page with no link of its own marks the link it is under (a provider's page, Browse agents).
  */
 export function currentHref(pathname: string): string | undefined {
-  return HREFS.filter((href) => pathname === href || pathname.startsWith(`${href}/`)).sort(
-    (a, b) => b.length - a.length,
-  )[0];
+  const own = HREFS.filter((href) => within(pathname, href)).sort((a, b) => b.length - a.length)[0];
+  if (own !== undefined) return own;
+  return Object.entries(UNDER).find(([page]) => within(pathname, page))?.[1];
 }
 
 /** The small line drawings beside the links: decoration, the words are the links' names. */
@@ -97,13 +105,6 @@ const ICONS: Record<Icon, ReactNode> = {
   ),
   // A pulse: what is happening now.
   activity: <path d="M1.5 8.5h2.8l1.9-4.7 3.4 8.4 1.9-3.7h3" />,
-  // A line rising over two axes.
-  metrics: (
-    <>
-      <path d="M2.5 2.5v11h11" />
-      <path d="M5 10.2l2.6-3.1 2.2 1.8L13 4.8" />
-    </>
-  ),
   post: (
     <>
       <path d="M3 13l.6-2.7L10.4 3.5a1.4 1.4 0 0 1 2 0l.1.1a1.4 1.4 0 0 1 0 2L5.7 12.4z" />
@@ -121,16 +122,6 @@ const ICONS: Record<Icon, ReactNode> = {
     <>
       <circle cx="7" cy="7" r="4.3" />
       <path d="M10.2 10.2l3.3 3.3" />
-    </>
-  ),
-  // A provider and the agents under it: one account above, three below, joined.
-  providers: (
-    <>
-      <rect x="5.6" y="1.8" width="4.8" height="3.6" rx="1" />
-      <path d="M8 5.4v2.4M3.4 10V7.8h9.2V10M8 7.8V10" />
-      <circle cx="3.4" cy="12.2" r="1.7" />
-      <circle cx="8" cy="12.2" r="1.7" />
-      <circle cx="12.6" cy="12.2" r="1.7" />
     </>
   ),
   add: (
@@ -166,7 +157,6 @@ const ICONS: Record<Icon, ReactNode> = {
       <path d="M2 6.5h9.5M10.5 9.6h1.5" />
     </>
   ),
-  telegram: <path d="M14 2.5L1.8 7.4l4.4 1.5 1.6 4.6 2.3-3 3 2.2z" />,
   // Two sliders.
   settings: (
     <>
@@ -232,7 +222,7 @@ function NavLink({
       aria-label={label}
       aria-current={href === current ? "page" : undefined}
       {...tip?.(label)}
-      className={`flex min-h-10 items-center gap-3 overflow-hidden rounded-xl px-3 text-[15px] text-muted transition-colors hover:bg-raised/60 hover:text-bone motion-reduce:transition-none aria-[current=page]:bg-raised aria-[current=page]:text-bone`}
+      className={`flex min-h-9 items-center gap-3 overflow-hidden rounded-xl px-3 text-[15px] text-muted transition-colors hover:bg-raised/60 hover:text-bone motion-reduce:transition-none aria-[current=page]:bg-raised aria-[current=page]:text-bone`}
     >
       <NavIcon icon={icon} />
       <span className={`whitespace-nowrap ${FADE} lg:rail:opacity-0`}>{label}</span>
@@ -249,7 +239,7 @@ export function Nav({ tip }: { tip?: (label: string) => TipHandlers } = {}) {
   return (
     // One column that may be narrower than the words in it (`grid-cols-1` is minmax(0, 1fr)): on
     // the rail a link is as wide as the rail, and the words it holds are cut off, not the rail.
-    <nav aria-label="Main" className="grid grid-cols-1 content-start gap-6">
+    <nav aria-label="Main" className="grid grid-cols-1 content-start gap-4">
       {GROUPS.map((group) => (
         <div key={group.title ?? "top"} className="grid grid-cols-1 gap-1">
           {group.title === null ? null : (
@@ -258,7 +248,7 @@ export function Nav({ tip }: { tip?: (label: string) => TipHandlers } = {}) {
             // reader, which reads the group by them.
             <div className="relative overflow-hidden">
               <p
-                className={`px-3 pb-1 font-mono text-[10.5px] tracking-[0.16em] whitespace-nowrap text-muted uppercase ${FADE} lg:rail:opacity-0`}
+                className={`px-3 pb-1.5 text-[11px] font-medium tracking-[0.08em] whitespace-nowrap text-muted uppercase ${FADE} lg:rail:opacity-0`}
               >
                 {group.title}
               </p>
@@ -268,7 +258,7 @@ export function Nav({ tip }: { tip?: (label: string) => TipHandlers } = {}) {
               />
             </div>
           )}
-          <ul className="grid grid-cols-1 gap-1">
+          <ul className="grid grid-cols-1 gap-0.5">
             {group.items.map((item) => (
               <li key={item.href}>
                 <NavLink item={item} current={current} tip={tip} />

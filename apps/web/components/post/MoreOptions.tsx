@@ -51,7 +51,7 @@ const UNIT_LABEL: Record<DurationUnit, string> = {
 function Group({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="grid min-w-0 gap-4 border-t border-line pt-5 first:border-t-0 first:pt-0">
-      <h3 className="font-mono text-[11px] tracking-[0.16em] text-muted uppercase">{title}</h3>
+      <h3 className="text-[13px] font-medium text-muted">{title}</h3>
       {children}
     </section>
   );

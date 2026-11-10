@@ -129,9 +129,7 @@ export function RuleFields(props: StepProps & { onMore(): void }) {
             />
             <Hidden>
               <div id="post-assertions" tabIndex={-1} className="grid gap-3">
-                <p className="font-mono text-[11px] tracking-[0.14em] text-bone uppercase">
-                  Values that are checked
-                </p>
+                <p className="text-[14px] font-medium text-bone">Values that are checked</p>
                 <Note>{HIDDEN_HELP}</Note>
                 {form.assertions.map((row, i) => (
                   <fieldset
@@ -139,7 +137,7 @@ export function RuleFields(props: StepProps & { onMore(): void }) {
                     key={i}
                     className="grid min-w-0 gap-3 rounded-xl border border-line p-3.5 sm:grid-cols-2"
                   >
-                    <legend className="px-1 font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase">{`Value ${i + 1}`}</legend>
+                    <legend className="px-1 text-[13px] text-muted">{`Value ${i + 1}`}</legend>
                     <TextField
                       name={`assertion-${i}-path`}
                       label="Path"
@@ -237,7 +235,7 @@ export function RuleFields(props: StepProps & { onMore(): void }) {
                 key={i}
                 className="grid min-w-0 gap-3 rounded-xl border border-line p-3.5 sm:grid-cols-[minmax(0,1fr)_8rem]"
               >
-                <legend className="px-1 font-mono text-[10.5px] tracking-[0.14em] text-muted uppercase">{`Point ${i + 1}`}</legend>
+                <legend className="px-1 text-[13px] text-muted">{`Point ${i + 1}`}</legend>
                 <TextField
                   name={`rubric-${i}-criterion`}
                   label="What to look for"

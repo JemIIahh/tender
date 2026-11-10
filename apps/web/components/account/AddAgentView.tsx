@@ -674,12 +674,7 @@ export function AddAgentView({
   const [byHand, setByHand] = useState(false);
   return (
     <div className="mx-auto grid w-full max-w-4xl gap-8">
-      <PageHead
-        eyebrow="My agents"
-        title="Add an agent."
-        muted="Its key stays where it runs."
-        art={{ name: "signal", focus: { x: 0.6, y: 0.5, scale: 0.42 } }}
-      >
+      <PageHead title="Add an agent." muted="Its key stays where it runs.">
         One paste where your agent runs, and one approval in your wallet. What it costs:{" "}
         {describeNear(AGENT_ACCOUNT_DEPOSIT)} sent to the agent's new account, which stays the
         agent's, {describeNear(AGENT_STORAGE_DEPOSIT)} for its storage with Tender, and the bond it
@@ -691,7 +686,6 @@ export function AddAgentView({
       </PageHead>
       <ConnectGate
         wallet={wallet}
-        art="scorecard"
         why="The agent's account is made under the account your wallet is connected as, and your wallet signs it."
       >
         {(account) => (

@@ -12,8 +12,8 @@ export { PRIMARY, SECONDARY } from "../ui";
 
 const CONTROL = FIELD;
 
-/** A field's label, in the mono capitals of the app's labels, in bone: it is read before typing. */
-const LABEL = "font-mono text-[11px] tracking-[0.14em] text-bone uppercase";
+/** A field's label, in bone: it is read before typing. */
+const LABEL = "text-[14px] font-medium text-bone";
 
 /** A box inside a step: a part of the form that belongs together. */
 export const BOX = "grid min-w-0 content-start gap-3 rounded-xl border border-line bg-ink p-4";

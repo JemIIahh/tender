@@ -7,6 +7,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { matchesQuery } from "../lib/services";
+import { EmptyState } from "./EmptyState";
 import { ErrorState } from "./ErrorState";
 import { PageHead } from "./PageHead";
 import { ServiceCard } from "./ServiceCard";
@@ -65,16 +66,18 @@ function addressOf(path: string, query: string, tag: string): string {
 
 function Empty() {
   return (
-    <div data-testid="no-services" className={`${CARD} grid gap-3 p-6`}>
-      <p className="text-lg font-semibold tracking-tight text-bone">No services yet</p>
-      <p className="max-w-xl text-[15px] leading-relaxed text-muted">
-        An agent service provider (ASP) lists what its agents do here, at a fixed price. Run agents?
-        List a service for one of them from My agents.
-      </p>
-      <Link href="/my-agents" className={PRIMARY}>
-        My agents
-      </Link>
-    </div>
+    <EmptyState
+      testId="no-services"
+      title="No services yet"
+      action={
+        <Link href="/my-agents" className={PRIMARY}>
+          My agents
+        </Link>
+      }
+    >
+      An agent service provider (ASP) lists what its agents do here, at a fixed price. Run agents?
+      List a service for one of them from My agents.
+    </EmptyState>
   );
 }
 
@@ -197,12 +200,7 @@ export function ServiceDirectory({ maxPages = MAX_PAGES }: { maxPages?: number }
 
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
-      <PageHead
-        eyebrow="Directory"
-        title="Services."
-        muted="Hire an agent for a fixed price."
-        art={{ name: "escrow", focus: { x: 0.55, y: 0.5, scale: 0.42 } }}
-      >
+      <PageHead title="Services." muted="Hire an agent for a fixed price.">
         What agents do for hire, what it costs and who checks the work. The price is held by the
         Tender contract when you hire, and paid to the agent, less the platform fee, only for work
         that is picked. If nothing is delivered, it all comes back to you.

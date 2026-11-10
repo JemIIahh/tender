@@ -217,27 +217,23 @@ test("raw_units_cut_a_long_number_in_the_middle_visibly_and_keep_every_digit_in_
 
 // ---- Nav --------------------------------------------------------------------------------------
 
-// The sidebar calls the board "Marketplace", as the app restyle brief names it, and groups the
-// agents' pages under Agents, the provider (ASP) pages and the services for hire among them (the
-// ASP and the services briefs).
-// The parity brief adds Activity and Metrics beside it, My tasks, Settings, and How it works at the
-// foot.
+// The sidebar calls the board "Marketplace", alone at the top, and groups the rest: the tasks, the
+// agents (the services for hire among them), the account and the docs. Providers is a tab of Browse
+// agents, Telegram a row of Settings, and Metrics is behind the sidebar's Live block: their pages
+// stay, and mark the link they are under.
 const LINKS = [
   ["Marketplace", "/tasks"],
-  ["How it works", "/how-it-works"],
-  ["Activity", "/activity"],
-  ["Metrics", "/metrics"],
   ["Post a task", "/post"],
   ["My tasks", "/my-tasks"],
   ["Browse agents", "/agents"],
-  ["Providers", "/providers"],
   ["Services", "/services"],
   ["Add an agent", "/my-agents/new"],
   ["My agents", "/my-agents"],
+  ["Activity", "/activity"],
   ["Earnings", "/earnings"],
   ["Wallet", "/wallet"],
-  ["Telegram", "/telegram"],
   ["Settings", "/settings"],
+  ["How it works", "/how-it-works"],
 ] as const;
 
 test("nav_links_every_page_of_the_app", () => {
@@ -265,13 +261,11 @@ test("nav_groups_the_pages_under_their_titles", () => {
     links: [...group.querySelectorAll("a")].map((link) => link.getAttribute("aria-label")),
   }));
   expect(groups).toEqual([
-    { title: null, links: ["Marketplace", "How it works", "Activity", "Metrics"] },
+    { title: null, links: ["Marketplace"] },
     { title: "Tasks", links: ["Post a task", "My tasks"] },
-    {
-      title: "Agents",
-      links: ["Browse agents", "Providers", "Services", "Add an agent", "My agents"],
-    },
-    { title: "Account", links: ["Earnings", "Wallet", "Telegram", "Settings"] },
+    { title: "Agents", links: ["Browse agents", "Services", "Add an agent", "My agents"] },
+    { title: "Account", links: ["Activity", "Earnings", "Wallet", "Settings"] },
+    { title: "Docs", links: ["How it works"] },
   ]);
 });
 
@@ -288,7 +282,7 @@ test("nav_marks_the_page_you_are_on", () => {
   home.unmount();
 
   // A page under a link belongs to it: an agent's page to Browse agents, a task's page to Tasks, a
-  // provider's page to Providers.
+  // provider's page (Providers is a tab of Browse agents) to Browse agents.
   pathname.current = "/agents/alice.near";
   const agent = render(<Nav />);
   expect(current()).toEqual(["Browse agents"]);
@@ -296,8 +290,14 @@ test("nav_marks_the_page_you_are_on", () => {
 
   pathname.current = "/providers/acme.near";
   const provider = render(<Nav />);
-  expect(current()).toEqual(["Providers"]);
+  expect(current()).toEqual(["Browse agents"]);
   provider.unmount();
+
+  // Telegram is a row of Settings now: its page marks Settings.
+  pathname.current = "/telegram";
+  const telegram = render(<Nav />);
+  expect(current()).toEqual(["Settings"]);
+  telegram.unmount();
 
   pathname.current = "/tasks/7";
   const task = render(<Nav />);

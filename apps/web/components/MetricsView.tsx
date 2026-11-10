@@ -250,10 +250,8 @@ export function MetricsView() {
   return (
     <div className="mx-auto grid w-full max-w-[1400px] gap-8">
       <PageHead
-        eyebrow="Platform"
         title="Metrics."
         muted="What has happened on Tender, as Tender's index of the chain records it."
-        art={{ name: "coins", focus: { x: 0.6, y: 0.62, scale: 0.6 } }}
       />
       <Body data={data} onRetry={retry} />
     </div>

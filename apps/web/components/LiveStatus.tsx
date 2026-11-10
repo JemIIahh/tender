@@ -8,12 +8,23 @@ import { type Live, type LiveState, liveOf, liveReads } from "../lib/live";
 import { scrollCue } from "../lib/scrollCue";
 import { knownFirst, knowsToken } from "../lib/tokens";
 import { RawUnits } from "./Amount";
-import { SCROLL_CUE, SECONDARY, TEXT_LINK } from "./ui";
+import { SCROLL_CUE, TEXT_LINK } from "./ui";
 
-/** The pill's size in the top bar: the bar's other pills', and the dot alone on a phone. */
-const PILL = "min-h-10 whitespace-nowrap px-3.5 sm:px-4 max-sm:w-10 max-sm:px-0";
+/**
+ * The segment's size in the top bar's account group (components/AccountPill.tsx): the group's
+ * height, and the dot alone on a phone.
+ */
+const SEGMENT =
+  "inline-flex h-10 items-center justify-center gap-2 rounded-l-full pr-3.5 pl-4 text-[13px] whitespace-nowrap text-bone transition-colors hover:bg-raised/60 motion-reduce:transition-none max-sm:w-10 max-sm:px-0";
 
-const LOOKS: Record<LiveState, { word: string; line: string; dot: string }> = {
+/** The network this build is for, as the top bar names it. */
+export function networkName(): string {
+  return config.network === "sandbox"
+    ? "Local chain"
+    : `${config.network.charAt(0).toUpperCase()}${config.network.slice(1)}`;
+}
+
+export const LOOKS: Record<LiveState, { word: string; line: string; dot: string }> = {
   synced: { word: "Live", line: "Up to date", dot: "bg-ok" },
   behind: { word: "Updating", line: "Some numbers may be a few minutes old.", dot: "bg-wait" },
   // Hollow, so that it differs from the other two by its shape as well as its colour.
@@ -24,7 +35,7 @@ const LOOKS: Record<LiveState, { word: string; line: string; dot: string }> = {
   },
 };
 
-function Dot({ state }: { state: LiveState }) {
+export function Dot({ state }: { state: LiveState }) {
   return (
     <span
       aria-hidden="true"
@@ -113,25 +124,12 @@ function Figures({ live }: { live: Live }) {
 }
 
 /**
- * The top bar's Live pill: a dot and a word for whether the index is up to date with the chain
- * (green, Live: 30 blocks behind its final block or fewer, about 30 seconds), still catching up or
- * waiting for the chain (amber, Updating), or out of reach
- * (hollow, Offline). On a phone it is the dot alone; its name says the word either way.
- *
- * A press opens a small panel under it with the platform's figures, as the API gave them: open
- * tasks, agents, and what the open tasks hold in escrow, token by token, and a link to the Metrics
- * page. A figure the API did not give is left out. Escape, or a press anywhere else, closes it;
- * Escape gives the focus back to the pill. Until the first read is back there is no pill.
+ * The platform's figures and whether the index is up to date, from the tab's one shared read of
+ * them (`liveReads`), read again each minute while the tab is in view: null until the first read
+ * is back. The top bar's status and the sidebar's Live block both take it, and make one read.
  */
-export function LiveStatus() {
+export function useLive(): Live | null {
   const [live, setLive] = useState<Live | null>(null);
-  const [open, setOpen] = useState(false);
-  const button = useRef<HTMLButtonElement>(null);
-  const panel = useRef<HTMLDivElement>(null);
-  const panelId = useId();
-
-  // The tab's one read of the figures, which the landing's ticker shares: read again each minute
-  // while the tab is in view (`liveReads`).
   useEffect(
     () =>
       liveReads.subscribe((reads) => {
@@ -148,6 +146,28 @@ export function LiveStatus() {
       }),
     [],
   );
+  return live;
+}
+
+/**
+ * The top bar's status, the first part of its account group: a dot for whether the index is up to
+ * date with the chain
+ * (green, Live: 30 blocks behind its final block or fewer, about 30 seconds), still catching up or
+ * waiting for the chain (amber, Updating), or out of reach (hollow, Offline), and the network's
+ * name. Its accessible name and its tooltip say the state's word. On a phone it is the dot alone.
+ *
+ * A press opens a small panel under it with the platform's figures, as the API gave them: open
+ * tasks, agents, and what the open tasks hold in escrow, token by token, and a link to the Metrics
+ * page. A figure the API did not give is left out. Escape, or a press anywhere else, closes it;
+ * Escape gives the focus back to the pill. Until the first read is back it is the network's name
+ * alone, with no state and nothing to press.
+ */
+export function LiveStatus() {
+  const live = useLive();
+  const [open, setOpen] = useState(false);
+  const button = useRef<HTMLButtonElement>(null);
+  const panel = useRef<HTMLDivElement>(null);
+  const panelId = useId();
 
   useEffect(() => {
     if (!open) return;
@@ -169,7 +189,14 @@ export function LiveStatus() {
     };
   }, [open]);
 
-  if (live === null) return null;
+  if (live === null) {
+    return (
+      <span data-testid="live-waiting" className={`${SEGMENT} hover:bg-transparent`}>
+        <span aria-hidden="true" className="size-2 shrink-0 rounded-full bg-dim" />
+        <span className="max-sm:sr-only">{networkName()}</span>
+      </span>
+    );
+  }
   const look = LOOKS[live.state];
   return (
     <div className="relative">
@@ -178,6 +205,7 @@ export function LiveStatus() {
         type="button"
         // The name holds the word the pill shows (WCAG 2.5.3), and says what it is about.
         aria-label={`Status: ${look.word}`}
+        title={`${look.word}: ${look.line}`}
         aria-expanded={open}
         aria-controls={panelId}
         onClick={() => setOpen((was) => !was)}
@@ -186,10 +214,10 @@ export function LiveStatus() {
           const next = event.relatedTarget as Node | null;
           if (next !== null && !panel.current?.contains(next)) setOpen(false);
         }}
-        className={`${SECONDARY} ${PILL}`}
+        className={SEGMENT}
       >
         <Dot state={live.state} />
-        <span className="max-sm:sr-only">{look.word}</span>
+        <span className="max-sm:hidden">{networkName()}</span>
       </button>
       {/* Always in the page, so that `aria-controls` names an element; `hidden` while closed. On
           a phone it is fixed to the screen, under the top bar and across it with a gutter at each
