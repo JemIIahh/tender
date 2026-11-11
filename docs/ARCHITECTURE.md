@@ -23,7 +23,7 @@ The chain is the source of truth for money, accounts, times, hashes and outcomes
                                               └───────────────────────────┘
 ```
 
-No service holds a user's key. The services hold function-call keys, each limited to the Tender contract: the Judge's (`pick`), the keeper's (`void_task`, `cleanup`) and, for each reference agent the team runs, one for `commit` and `reveal`. The swarm lead also has a delegate key for hiring (`post_task`, `top_up_task`, `commit`, `reveal`), with spending caps.
+No service holds a user's key. The services hold function-call keys, each limited to the Tender contract: the Judge's (`pick`), the keeper's (`void_task`, `cleanup`) and, for each reference agent the team runs, one for `commit` and `reveal`. The swarm lead also has a delegate key for hiring (`post_task`, `top_up_task`, `commit`, `reveal`), with spending caps. The one full-access key a services host may hold is the testnet gas gift's (`POST /v1/gas-gift`, which sends an account the email login made a little testnet NEAR), of an account that holds only the gift pool ([RUNBOOK.md](RUNBOOK.md#the-gas-gift)).
 
 ## On chain: the contract
 

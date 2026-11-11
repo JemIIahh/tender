@@ -53,7 +53,7 @@ Back up `.env.deploy.testnet`. It holds the only copy of every full-access key t
 
 ## 2. Keys
 
-Principle: a service holds a function-call key limited to the Tender contract and to the methods it needs. It never holds a full-access key. A function-call key cannot call `withdraw`, `register_agent` or any method that needs 1 yoctoNEAR, so a leaked service key cannot move tokens out of any vault.
+Principle: a service holds a function-call key limited to the Tender contract and to the methods it needs. It never holds a full-access key, with one exception: the gas gift's, on testnet, of an account that holds only the gift pool ([The gas gift](#the-gas-gift)). A function-call key cannot call `withdraw`, `register_agent` or any method that needs 1 yoctoNEAR, so a leaked service key cannot move tokens out of any vault.
 
 | Role | Account env | Key env | Methods | Who adds it |
 |---|---|---|---|---|
@@ -142,6 +142,53 @@ Rules:
 - Behind a proxy with the default of 0, every viewer counts as one client (the proxy). The whole site then shares the four event streams, the sign-in limits and the `/mcp` limit.
 - Set it to the true number of proxies **only when the API's port can be reached through those proxies alone.** If clients can reach the API directly, a client can send its own `X-Forwarded-For` and choose the address it is counted under, which defeats every per-client limit. Too high a value does the same.
 
+### The gas gift
+
+On testnet, `POST /v1/gas-gift` sends an account that the web app's email login made a little testnet NEAR, so that it can pay its first fees. Such an account is an implicit one (64 hex characters, its public key): it is not on chain and can do nothing until NEAR reaches it, and the transfer creates it. Each login gets one gift and each account one, and all the gifts of a UTC day add up to a cap. The web app calls the route with the login's access token, which the API verifies with the login's verification key.
+
+It is on only when the first four variables below are all set, and never on mainnet: `pnpm serve` refuses to start with any `GAS_GIFT_*` set there. With some of the four set and not all, it logs a `WARN serve:` line that names the missing ones, and the gift stays off.
+
+| Variable | Value |
+|---|---|
+| `GAS_GIFT_ACCOUNT` | the gift account |
+| `GAS_GIFT_PRIVATE_KEY` | its full-access key, secret |
+| `PRIVY_APP_ID` | the login's app id, from the Privy dashboard |
+| `PRIVY_VERIFICATION_KEY` | the login's verification key, from the same dashboard: a PEM. On one line with `\n` for each line break works too |
+| `GAS_GIFT_AMOUNT` | optional, yoctoNEAR per gift: 0.1 NEAR unless set |
+| `GAS_GIFT_MIN_BALANCE` | optional: an account that holds this much already gets nothing. 0.05 NEAR unless set |
+| `GAS_GIFT_DAILY_CAP` | optional, yoctoNEAR for all gifts of a UTC day: 2 NEAR (20 gifts) unless set |
+
+**This is the one full-access key on the services host.** A function-call key cannot send NEAR. So the gift account must be an account of its own that holds only the gift pool: never the contract's account, the owner's, the keeper's or the Judge's. A leaked key can take what that account holds, and nothing else. `pnpm serve` refuses to start when the key is not a full-access key of `GAS_GIFT_ACCOUNT`, when the account is the contract's owner or its proposed owner, and when it is the contract's account, the keeper's, the Judge's or the account the contract is under.
+
+The owner's steps (each is the owner's call; the first spends testnet NEAR):
+
+1. Create a new testnet account for the gift, with a new full-access key, and send it a few testnet NEAR: 2 NEAR is a day of gifts at the defaults, plus a little for gas.
+2. In the host's settings, set `GAS_GIFT_ACCOUNT` to it and paste its private key into `GAS_GIFT_PRIVATE_KEY`. Never put the key in a file in the repository. Set `PRIVY_APP_ID` and `PRIVY_VERIFICATION_KEY` from the Privy dashboard.
+3. Restart the services. The log says `serve: gas gift on, from <account>: 0.1 NEAR to each new account, 2 NEAR a day at most`.
+
+To refill it, send more testnet NEAR to the gift account. Watch its balance (section 8): once it is too low, every gift answers 502 `transfer_failed`.
+
+What the route answers:
+
+| Answer | Meaning |
+|---|---|
+| 200 `sent` | The NEAR was sent and the transfer has executed; `tx_hash` is its hash |
+| 200 `not_needed` | The account holds `GAS_GIFT_MIN_BALANCE` or more already. Nothing is sent or counted |
+| 400 `not_implicit` | The account is not an implicit one (64 lowercase hex characters) |
+| 401 `unauthorized` | No login token, or one that does not verify: another app, expired, another key. The answer does not say which |
+| 409 `already_given` | This login, or this account, has had its gift, or it is on its way |
+| 429 `daily_limit` | The day's cap is used up. `Retry-After` gives the seconds to the next UTC day |
+| 429 `rate_limited` | One address asked more than 30 times in 10 minutes |
+| 502 `transfer_failed` | The transfer did not go through: the gift account is short of NEAR, or the node refused it. The claim is let go, so asking again works |
+| 503 `gift_off` | The gift is not set up on this API, or this is mainnet |
+| 503 `unavailable` | The node could not say what the account holds. `Retry-After: 5` |
+
+The table `gas_gifts` keeps one row per gift: the login's user id (`did:privy:...`, no email), the account, the amount, the transfer's hash and the times. A gift is claimed in that table before it is sent, so two calls at once cannot both send.
+
+What it does not check: which account the login's wallet is. The login's token says who logged in, not which account they hold, so a login can send its one gift to any implicit account. The daily cap bounds what many logins can take together.
+
+If the key leaks, move what the gift account holds to another account, or add a new full-access key to it and delete the old one, then set the new key on the host.
+
 ## 4. The Judge needs its model before any rubric task
 
 Start the Judge with `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` all set **before** you post any `rubric` seed. They are used only all three together; if some are set and not all, `pnpm serve` logs a `WARN serve:` line and the Judge runs without a model. A rubric task the Judge cannot score is refused at intake, which tells the poster early, but a task that was posted before the model was set up has reward in escrow until a verifier acts or the fallback and void windows run out. Check the Judge's log for the WARN, and post a rubric task only after it is gone.
@@ -217,7 +264,7 @@ Alert on:
 3. **A non-200 from `/v1/health`, or no answer.**
 4. **Exit code 1.** The services end with 1 when the database is another deploy's. Do not just restart: it needs a new database.
 5. **Other `WARN` lines.** `WARN indexer: cannot take the indexer lock` or `lost the indexer lock` mean another process holds the lock or the connection dropped (a transaction-mode pooler does this).
-6. **The balances** of the keeper, Judge and agent accounts. When one runs out of NEAR, the service stops signing.
+6. **The balances** of the keeper, Judge and agent accounts, and of the gift account when the gas gift is on. When one runs out of NEAR, the service stops signing; the gift answers 502 `transfer_failed`.
 
 A task whose verifier does nothing is refunded after the fallback deadline. Anyone can call `void_task`, and the keeper does so every 30 seconds. If tasks sit past their deadline and are not voided, look at the keeper: its key, its balance and `waiting_for_chain`.
 

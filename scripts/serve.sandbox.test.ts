@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { generateKeyPairSync, type KeyObject, sign } from "node:crypto";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { connect } from "node:net";
@@ -8,7 +9,7 @@ import { parseEnv } from "node:util";
 import { ApiClient, type LocalChain, startLocalChain, TenderClient } from "@tender/client";
 import { type Db, migrate, openDb, PgliteLockLostError, type SessionLock } from "@tender/db";
 import { IndexerError } from "@tender/indexer";
-import { sha256Hex } from "@tender/shared";
+import { GasGiftResponseSchema, implicitAccountOf, sha256Hex } from "@tender/shared";
 import { BOT_COMMANDS } from "@tender/telegram";
 import { KeyPair } from "near-api-js";
 import { afterAll, beforeAll, expect, test, vi } from "vitest";
@@ -1617,3 +1618,102 @@ test("off_the_sandbox_the_process_waits_for_a_node_behind_the_index_and_ends_onl
     far.child.kill("SIGKILL");
   }
 }, 240_000);
+
+/**
+ * A token as the email login signs one: a JWT with ES256, made here with node's crypto. The route
+ * verifies it as it does a real one.
+ */
+function loginToken(key: KeyObject, claims: Record<string, unknown>): string {
+  const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const signed = `${part({ alg: "ES256", typ: "JWT" })}.${part(claims)}`;
+  const signature = sign("sha256", Buffer.from(signed), { key, dsaEncoding: "ieee-p1363" });
+  return `${signed}.${signature.toString("base64url")}`;
+}
+
+test("the_gas_gift_creates_a_new_implicit_account_with_its_first_near_once", async () => {
+  const login = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const pem = login.publicKey.export({ type: "spki", format: "pem" }).toString().trim();
+  // Alice's key is a full-access key of a local account that is not the contract's owner.
+  const gift = chain.accounts.alice;
+  const lines: string[] = [];
+  const services = await serve(
+    envFor({
+      GAS_GIFT_ACCOUNT: gift.accountId,
+      GAS_GIFT_PRIVATE_KEY: gift.privateKey,
+      PRIVY_APP_ID: "tender-sandbox-app",
+      // On one line, as a host keeps it.
+      PRIVY_VERIFICATION_KEY: pem.replaceAll("\n", "\\n"),
+    }),
+    lines,
+  );
+  expect(lines).toContain(
+    `serve: gas gift on, from ${gift.accountId}: 0.1 NEAR to each new account, 2 NEAR a day at most`,
+  );
+
+  const key = KeyPair.fromRandom("ed25519");
+  const publicKey = key.getPublicKey().toString();
+  const implicit = implicitAccountOf(publicKey);
+  if (implicit === null) throw new Error("a fresh ed25519 key has no implicit account");
+  // Nobody has sent it NEAR: it is not on chain.
+  expect(await reader.nearBalanceOf(implicit)).toBe(0n);
+  expect(await reader.viewAccessKey(implicit, publicKey)).toBeNull();
+
+  const now = Math.floor(Date.now() / 1000);
+  const token = loginToken(login.privateKey, {
+    iss: "privy.io",
+    aud: "tender-sandbox-app",
+    sub: "did:privy:sandbox-user",
+    sid: "sandbox-session",
+    iat: now,
+    exp: now + 3600,
+  });
+  const askFor = (accountId: string) =>
+    fetch(`${services.url}/v1/gas-gift`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ account_id: accountId }),
+    });
+
+  const res = await askFor(implicit);
+  expect(res.status).toBe(200);
+  const sent = GasGiftResponseSchema.parse(await res.json());
+  expect(sent).toMatchObject({ status: "sent", amount: "100000000000000000000000" });
+  if (sent.status !== "sent") throw new Error("the gift was not sent");
+  expect((await reader.txStatus(sent.tx_hash, gift.accountId)).kind).toMatch(
+    /^(executed|pending)$/,
+  );
+
+  // The route answers once the transfer has executed; the final view catches up within blocks.
+  await until(
+    "the gift is in the final view",
+    async () => (await reader.nearBalanceOf(implicit)) > 0n,
+    15_000,
+  );
+  expect(await reader.nearBalanceOf(implicit)).toBe(100_000_000_000_000_000_000_000n);
+  // The transfer made the account, with the key its name is the hex of as its full-access key.
+  expect(await reader.viewAccessKey(implicit, publicKey)).toEqual({ permission: "FullAccess" });
+  // And it succeeded, once all of it is final (its refund receipt comes a block later).
+  await until(
+    "the gift's transaction is final",
+    async () => (await reader.txStatus(sent.tx_hash, gift.accountId)).kind !== "pending",
+    15_000,
+  );
+  expect((await reader.txStatus(sent.tx_hash, gift.accountId)).kind).toBe("executed");
+
+  // Once per login: the same login, for the same account and for another, gets nothing more.
+  const twice = await askFor(implicit);
+  expect(twice.status).toBe(409);
+  expect(await twice.json()).toMatchObject({ error: "already_given" });
+  const other = implicitAccountOf(KeyPair.fromRandom("ed25519").getPublicKey().toString());
+  if (other === null) throw new Error("a fresh ed25519 key has no implicit account");
+  const elsewhere = await askFor(other);
+  expect(elsewhere.status).toBe(409);
+  expect(await reader.nearBalanceOf(other)).toBe(0n);
+
+  await services.stop();
+  expect(lines.filter((line) => line.startsWith("ERROR"))).toEqual([]);
+  // Nothing the services wrote holds the key or the token.
+  expect(lines.filter((line) => line.includes(gift.privateKey) || line.includes(token))).toEqual(
+    [],
+  );
+});

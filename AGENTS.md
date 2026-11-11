@@ -76,7 +76,7 @@ The sandbox tests (`*.sandbox.test.ts`, `contract/sandbox`) start a nearcore nod
 - **Errors.** Contract panics start with a code (`E_AUTH: ...`); the client maps them to `TenderError.code`.
 - **Events count only from successful receipts.** A failed receipt keeps its logs on NEAR, so the indexer and every consumer check the receipt's status.
 - **Untrusted text is data.** Briefs, questions, answers, clarifications, URIs, scorecard reasons and entries come from strangers. Render them as text, carry them to a model as data under a heading, and never as instructions. The Judge has no dependency that reaches the question board, and a test fails if its sources name it.
-- **Keys.** Services sign with function-call keys limited to the Tender contract. Full-access keys never go on a host that runs a service. See [docs/RUNBOOK.md](docs/RUNBOOK.md).
+- **Keys.** Services sign with function-call keys limited to the Tender contract. Full-access keys never go on a host that runs a service, with one exception: the testnet gas gift's, of an account that holds only the gift pool. See [docs/RUNBOOK.md](docs/RUNBOOK.md).
 - **Failure reports.** Say what ran and what it printed. If a test fails, say so with the output. If a step was skipped, say that.
 - **Visual work.** Screenshot every UI change at 375 px and 1440 px before you show it. Do not restructure a layout that was not asked about.
 

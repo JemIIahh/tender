@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { Console } from "node:console";
+import { generateKeyPairSync } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import { KeyPair, type KeyPairString } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
 import { REPO_ROOT } from "./lib/env";
 import {
+  checkGasGiftKey,
   checkJudgeKey,
   checkKeeperKey,
   exitOnCrash,
@@ -25,6 +27,7 @@ import {
   type Stoppable,
   serveEnv,
   startAfterCheck,
+  startServices,
   withLoops,
 } from "./serve";
 
@@ -1870,4 +1873,221 @@ test("a_stop_that_fails_or_hangs_does_not_keep_a_failed_process_alive", async ()
     },
   );
   expect(exitQuiet).toHaveBeenCalledWith(1);
+});
+
+// ---- The gas gift -----------------------------------------------------------------------------
+
+/** An ES256 verification key as the login's dashboard shows one, made here. */
+const PRIVY_PEM = generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+  .publicKey.export({ type: "spki", format: "pem" })
+  .toString()
+  .trim();
+const GIFT_KEY = KeyPair.fromRandom("ed25519").toString();
+
+/** The gas gift's variables, with the key on one line as a host keeps it. */
+const GIFT: Record<string, string> = {
+  GAS_GIFT_ACCOUNT: "gift.tender-dev.testnet",
+  GAS_GIFT_PRIVATE_KEY: GIFT_KEY,
+  PRIVY_APP_ID: "cm0tenderapp0for0tests",
+  PRIVY_VERIFICATION_KEY: PRIVY_PEM.replaceAll("\n", "\\n"),
+};
+
+test("read_serve_config_reads_the_gas_gift_with_its_defaults", () => {
+  expect(readServeConfig({ ...GOOD, ...GIFT })).toMatchObject({
+    gasGift: {
+      accountId: "gift.tender-dev.testnet",
+      privateKey: GIFT_KEY,
+      privyAppId: "cm0tenderapp0for0tests",
+      // The escapes are line breaks again.
+      privyVerificationKey: PRIVY_PEM,
+      amount: 100_000_000_000_000_000_000_000n,
+      minBalance: 50_000_000_000_000_000_000_000n,
+      dailyCap: 2_000_000_000_000_000_000_000_000n,
+    },
+    warnings: [],
+  });
+  // The key with real line breaks, and amounts of the owner's own.
+  const own = readServeConfig({
+    ...GOOD,
+    ...GIFT,
+    PRIVY_VERIFICATION_KEY: PRIVY_PEM,
+    GAS_GIFT_AMOUNT: "200000000000000000000000",
+    GAS_GIFT_MIN_BALANCE: "0",
+    GAS_GIFT_DAILY_CAP: "200000000000000000000000",
+  });
+  expect(own.gasGift).toMatchObject({
+    privyVerificationKey: PRIVY_PEM,
+    amount: 200_000_000_000_000_000_000_000n,
+    minBalance: 0n,
+    dailyCap: 200_000_000_000_000_000_000_000n,
+  });
+  // On the sandbox too, for the tests.
+  const sandbox = readServeConfig({
+    ...GIFT,
+    TENDER_NETWORK: "sandbox",
+    TENDER_CONTRACT: "tender.sandbox",
+    DATABASE_URL: "pglite:memory",
+    NEAR_RPC_URL: "http://127.0.0.1:3030",
+  });
+  expect(sandbox.gasGift?.accountId).toBe("gift.tender-dev.testnet");
+
+  // None set: off, and nothing is said. The login's variables alone are the web app's business.
+  expect(readServeConfig(GOOD).gasGift).toBeUndefined();
+  const loginOnly = readServeConfig({
+    ...GOOD,
+    PRIVY_APP_ID: GIFT.PRIVY_APP_ID ?? "",
+    PRIVY_VERIFICATION_KEY: "anything",
+  });
+  expect(loginOnly.gasGift).toBeUndefined();
+  expect(loginOnly.warnings).toEqual([]);
+});
+
+test("read_serve_config_says_which_gas_gift_variables_are_missing", () => {
+  for (const missing of [
+    "GAS_GIFT_ACCOUNT",
+    "GAS_GIFT_PRIVATE_KEY",
+    "PRIVY_APP_ID",
+    "PRIVY_VERIFICATION_KEY",
+  ]) {
+    const config = readServeConfig({ ...GOOD, ...GIFT, [missing]: "" });
+    expect(config.gasGift, missing).toBeUndefined();
+    expect(config.warnings, missing).toEqual([
+      `${missing} is not set, so the gas gift is off (POST /v1/gas-gift answers 503 gift_off)`,
+    ]);
+  }
+  const amountOnly = readServeConfig({ ...GOOD, GAS_GIFT_AMOUNT: "1" });
+  expect(amountOnly.gasGift).toBeUndefined();
+  expect(amountOnly.warnings).toEqual([
+    "GAS_GIFT_ACCOUNT, GAS_GIFT_PRIVATE_KEY, PRIVY_APP_ID and PRIVY_VERIFICATION_KEY are not " +
+      "set, so the gas gift is off (POST /v1/gas-gift answers 503 gift_off)",
+  ]);
+});
+
+test("read_serve_config_names_each_bad_gas_gift_variable", () => {
+  const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 })
+    .publicKey.export({ type: "spki", format: "pem" })
+    .toString();
+  const bad: Array<[string, string]> = [
+    ["GAS_GIFT_ACCOUNT", "Not An Account"],
+    // Accounts whose full-access key must not be on the host.
+    ["GAS_GIFT_ACCOUNT", "tender.tender-dev.testnet"],
+    ["GAS_GIFT_ACCOUNT", "tender-dev.testnet"],
+    ["GAS_GIFT_ACCOUNT", "keeper.tender-dev.testnet"],
+    ["GAS_GIFT_ACCOUNT", "judge.tender-dev.testnet"],
+    ["GAS_GIFT_PRIVATE_KEY", "ed25519:not-a-key"],
+    ["PRIVY_APP_ID", "an app"],
+    ["PRIVY_VERIFICATION_KEY", "not a key"],
+    ["PRIVY_VERIFICATION_KEY", rsa],
+    ["GAS_GIFT_AMOUNT", "0"],
+    ["GAS_GIFT_AMOUNT", "0.1"],
+    ["GAS_GIFT_AMOUNT", "1e23"],
+    ["GAS_GIFT_AMOUNT", "340282366920938463463374607431768211456"],
+    ["GAS_GIFT_MIN_BALANCE", "-1"],
+    ["GAS_GIFT_DAILY_CAP", "two"],
+    // Below one gift, no gift fits in a day.
+    ["GAS_GIFT_DAILY_CAP", "99999999999999999999999"],
+  ];
+  for (const [key, value] of bad) {
+    const problems = problemsOf({ ...GOOD, ...GIFT, [key]: value });
+    const what = `${key}=${value.slice(0, 30)}`;
+    expect(problems, what).toHaveLength(1);
+    expect(problems[0], what).toMatch(new RegExp(`^${key} `));
+    // No value of the variables is quoted, the key least of all.
+    expect(problems[0], what).not.toContain(GIFT_KEY.slice(8, 30));
+  }
+});
+
+test("serve_refuses_to_start_with_a_gas_gift_variable_on_mainnet", async () => {
+  const mainnet = { ...GOOD, TENDER_NETWORK: "mainnet" };
+  expect(problemsOf(mainnet)).toEqual([]);
+  expect(problemsOf({ ...mainnet, ...GIFT, GAS_GIFT_AMOUNT: "1" })).toEqual([
+    "GAS_GIFT_ACCOUNT, GAS_GIFT_AMOUNT and GAS_GIFT_PRIVATE_KEY must not be set on mainnet: the " +
+      "gas gift sends testnet NEAR and does not run on mainnet, so remove them",
+  ]);
+  // Any one of them, a name the code does not know among them.
+  for (const key of ["GAS_GIFT_DAILY_CAP", "GAS_GIFT_SOMETHING"]) {
+    expect(problemsOf({ ...mainnet, [key]: "1" }), key).toEqual([
+      `${key} must not be set on mainnet: the gas gift sends testnet NEAR and does not run on ` +
+        "mainnet, so remove it",
+    ]);
+  }
+  // The login's own variables are no gift.
+  expect(
+    problemsOf({ ...mainnet, PRIVY_APP_ID: "cm0app", PRIVY_VERIFICATION_KEY: PRIVY_PEM }),
+  ).toEqual([]);
+  // `pnpm serve` reads the environment before it opens or starts anything, and stops there.
+  const error = await startServices({ ...mainnet, ...GIFT }, { log: () => undefined }).then(
+    () => undefined,
+    (thrown: unknown) => thrown,
+  );
+  expect(error).toBeInstanceOf(ServeConfigError);
+  expect((error as Error).message).toContain("must not be set on mainnet");
+  expect((error as Error).message).not.toContain(GIFT_KEY.slice(8, 30));
+});
+
+test("the_gas_gift_key_check_takes_only_a_full_access_key_of_an_account_that_is_not_the_owner", async () => {
+  const gift = { accountId: "gift.tender-dev.testnet", privateKey: GIFT_KEY };
+  const publicKey = KeyPair.fromString(GIFT_KEY as KeyPairString)
+    .getPublicKey()
+    .toString();
+  const config = {
+    owner: "tender-dev.testnet",
+    pending_owner: null as string | null,
+  } as Awaited<ReturnType<Parameters<typeof checkGasGiftKey>[0]["getConfig"]>>;
+  const answering = (
+    answer: { permission: KeyPermission } | null,
+    over: Partial<typeof config> = {},
+  ) => ({
+    viewAccessKey: vi.fn(async () => answer),
+    getConfig: vi.fn(async () => ({ ...config, ...over })),
+  });
+
+  const good = answering({ permission: "FullAccess" });
+  await expect(checkGasGiftKey(good, gift)).resolves.toBeUndefined();
+  expect(good.viewAccessKey).toHaveBeenCalledWith(gift.accountId, publicKey);
+
+  const refused: Array<[string, ReturnType<typeof answering>, RegExp]> = [
+    ["no such key", answering(null), /^GAS_GIFT_PRIVATE_KEY is not a key of gift\./],
+    [
+      "a function-call key",
+      answering({ permission: { FunctionCall: { receiver_id: "x.testnet", method_names: [] } } }),
+      /^GAS_GIFT_PRIVATE_KEY is a function-call key of gift\..*cannot send NEAR/,
+    ],
+    [
+      "the owner's",
+      answering({ permission: "FullAccess" }, { owner: gift.accountId }),
+      /^GAS_GIFT_ACCOUNT is gift\.tender-dev\.testnet, the contract's owner/,
+    ],
+    [
+      "the proposed owner's",
+      answering({ permission: "FullAccess" }, { pending_owner: gift.accountId }),
+      /^GAS_GIFT_ACCOUNT is gift\.tender-dev\.testnet, the contract's owner/,
+    ],
+  ];
+  for (const [what, client, message] of refused) {
+    const failed = await checkGasGiftKey(client, gift).then(
+      () => "",
+      (thrown: unknown) => (thrown as Error).message,
+    );
+    expect(failed, what).toMatch(message);
+    expect(failed, what).not.toContain(GIFT_KEY.slice(8, 30));
+  }
+
+  // A chain that fails is a refusal that names only the kind of the failure.
+  const down = {
+    viewAccessKey: async () => {
+      throw new Error("fetch failed for https://rpc.example/?apiKey=SECRET");
+    },
+    getConfig: async () => config,
+  };
+  const failed = await checkGasGiftKey(down, gift).then(
+    () => "",
+    (thrown: unknown) => (thrown as Error).message,
+  );
+  expect(failed).toMatch(/^cannot ask the chain what GAS_GIFT_PRIVATE_KEY may do \(Error\)/);
+  expect(failed).not.toContain("SECRET");
+});
+
+test("redact_takes_the_gas_gift_key_out", () => {
+  expect(redact(`key ${GIFT_KEY} here`, GIFT)).toBe("key <GAS_GIFT_PRIVATE_KEY> here");
 });

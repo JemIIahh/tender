@@ -6,8 +6,13 @@ import { format, type InspectOptions, inspect } from "node:util";
 import {
   type ApiServer,
   createApp,
+  DEFAULT_GAS_GIFT_AMOUNT,
+  DEFAULT_GAS_GIFT_DAILY_CAP,
+  DEFAULT_GAS_GIFT_MIN_BALANCE,
   type ErrorBody,
+  type GasGift,
   NoAnswerInTime,
+  readPrivyKey,
   resultUsable,
   startApiServer,
   startKeeper,
@@ -72,6 +77,11 @@ import { deploymentsDirOverride, envDir, loadEnv, readEnvFile } from "./lib/env"
  *   Telegram   the bot and the notifier, when TELEGRAM_BOT_TOKEN is set: the bot takes its updates
  *              by long polling (TELEGRAM_MODE=polling, the default), or at POST /telegram/webhook
  *              (webhook), and the notifier sends the alerts
+ *   gas gift   POST /v1/gas-gift sends a new email-login account a little testnet NEAR, when
+ *              GAS_GIFT_ACCOUNT, GAS_GIFT_PRIVATE_KEY, PRIVY_APP_ID and PRIVY_VERIFICATION_KEY are
+ *              all set, off mainnet only: any GAS_GIFT_* on mainnet is a refusal to start. Its key is
+ *              the gift account's full-access key, the one such key a services host holds, which the
+ *              chain is asked about first
  *
  * The environment is checked before anything starts (`readServeConfig`), and every problem with
  * it is named in one error. On the first SIGTERM or SIGINT the command line stops everything
@@ -176,9 +186,40 @@ export interface ServeConfig {
   judge: JudgeConfig | undefined;
   /** The Telegram bot and the notifier, when `TELEGRAM_BOT_TOKEN` is set. */
   telegram: TelegramConfig | undefined;
+  /** The gas gift, when its four variables are set, off mainnet. */
+  gasGift: GasGiftConfig | undefined;
   /** What the environment allows but is likely a mistake, one sentence each. */
   warnings: string[];
 }
+
+/** The gas gift's settings, as `GAS_GIFT_*` and `PRIVY_*` give them. */
+export interface GasGiftConfig {
+  /** `GAS_GIFT_ACCOUNT`: an account of its own that holds only the gift pool. */
+  accountId: string;
+  /** `GAS_GIFT_PRIVATE_KEY`: that account's full-access key, a secret, which nothing prints. */
+  privateKey: string;
+  /** `PRIVY_APP_ID`: the login's app, which its tokens must be for. */
+  privyAppId: string;
+  /** `PRIVY_VERIFICATION_KEY`, as a PEM with real line breaks (`readPrivyKey`). */
+  privyVerificationKey: string;
+  /** `GAS_GIFT_AMOUNT`, `GAS_GIFT_MIN_BALANCE` and `GAS_GIFT_DAILY_CAP`, in yoctoNEAR. */
+  amount: bigint;
+  minBalance: bigint;
+  dailyCap: bigint;
+}
+
+/** The variables the gas gift needs, all four, before it is on. */
+const GAS_GIFT_REQUIRED = [
+  "GAS_GIFT_ACCOUNT",
+  "GAS_GIFT_PRIVATE_KEY",
+  "PRIVY_APP_ID",
+  "PRIVY_VERIFICATION_KEY",
+] as const;
+
+/** A Privy app id, as its dashboard shows one: letters and digits, and maybe `-` and `_`. */
+const PRIVY_APP_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+const U128_MAX = 2n ** 128n - 1n;
 
 export interface KeeperConfig {
   accountId: string;
@@ -336,7 +377,8 @@ function databaseKind(url: string): "pglite" | "postgres" | undefined {
  * - `TELEGRAM_MODE`, polling or webhook, and `TELEGRAM_WEBHOOK_SECRET`, which must be what
  *   Telegram takes as a secret token, 16 characters or more. With `TELEGRAM_BOT_TOKEN` set, that
  *   it looks like a bot's token, that `PUBLIC_WEB_URL` names the web app the bot links to, and in
- *   webhook mode that the secret is set.
+ *   webhook mode that the secret is set;
+ * - the gas gift's `GAS_GIFT_*`, none of which may be set on mainnet, and `PRIVY_*` (`readGasGift`).
  *
  * An empty value is an unset one. Off the sandbox, an empty `PUBLIC_WEB_URL` is a warning: allowed,
  * but likely a mistake. So are no `FASTNEAR_API_KEY`, without which neardata rate limits the
@@ -623,6 +665,12 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
     }
   }
 
+  const gasGift = readGasGift(env, network, problems, warnings, {
+    contractId,
+    keeperAccount: get("KEEPER_ACCOUNT"),
+    judgeAccount,
+  });
+
   if (
     problems.length > 0 ||
     network === undefined ||
@@ -648,7 +696,142 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
     judgeAccount,
     judge,
     telegram,
+    gasGift,
     warnings,
+  };
+}
+
+/**
+ * The gas gift's part of `readServeConfig`: its settings, or undefined when it is off. It adds to
+ * `problems` and `warnings` as `readServeConfig` does, naming variables and quoting no value.
+ *
+ * - On mainnet, any `GAS_GIFT_*` that is set is a problem: the gift is for testnet NEAR only.
+ * - With no `GAS_GIFT_*` set, the gift is off and nothing is said: `PRIVY_*` alone may be there for
+ *   the web app's build.
+ * - With some set, the gift is on only when `GAS_GIFT_ACCOUNT`, `GAS_GIFT_PRIVATE_KEY`,
+ *   `PRIVY_APP_ID` and `PRIVY_VERIFICATION_KEY` all are; what is missing is a warning. What is set
+ *   is checked: an account id; a private key; an app id; an ES256 public key in PEM, with real line
+ *   breaks or `\n` escapes; and amounts in yoctoNEAR, the gift above 0 and the daily cap at least
+ *   one gift.
+ * - The gift account's full-access key is on the host, so it must be an account of its own: not
+ *   the contract's, the keeper's or the Judge's, and not one the contract is under (on testnet the
+ *   deploy parent, which owns the contract). The owner's, by the contract's config, is refused at
+ *   the start (`checkGasGiftKey`).
+ */
+function readGasGift(
+  env: Record<string, string | undefined>,
+  network: NetworkId | undefined,
+  problems: string[],
+  warnings: string[],
+  others: { contractId: string | undefined; keeperAccount?: string; judgeAccount?: string },
+): GasGiftConfig | undefined {
+  const get = (key: string) => setting(env, key);
+  const giftSet = Object.keys(env)
+    .filter((key) => key.startsWith("GAS_GIFT_") && get(key) !== undefined)
+    .sort();
+  if (giftSet.length === 0 || network === undefined) return undefined;
+  if (network === "mainnet") {
+    problems.push(
+      `${listed(giftSet)} must not be set on mainnet: the gas gift sends testnet NEAR and does ` +
+        `not run on mainnet, so remove ${giftSet.length === 1 ? "it" : "them"}`,
+    );
+    return undefined;
+  }
+
+  const before = problems.length;
+  const accountId = get("GAS_GIFT_ACCOUNT");
+  if (accountId !== undefined) {
+    const { contractId, keeperAccount, judgeAccount } = others;
+    if (!isAccountId(accountId)) {
+      problems.push("GAS_GIFT_ACCOUNT must be a NEAR account id (its value is not shown)");
+    } else if (
+      accountId === contractId ||
+      accountId === keeperAccount ||
+      accountId === judgeAccount ||
+      contractId?.endsWith(`.${accountId}`) === true
+    ) {
+      problems.push(
+        "GAS_GIFT_ACCOUNT must be an account of its own that holds only the gift pool, not the " +
+          "contract's, the keeper's, the Judge's or the account the contract is under: its " +
+          "full-access key is on this host",
+      );
+    }
+  }
+  const privateKey = get("GAS_GIFT_PRIVATE_KEY");
+  if (privateKey !== undefined) {
+    try {
+      parseKey(privateKey, "GAS_GIFT_PRIVATE_KEY");
+    } catch (error) {
+      problems.push((error as Error).message);
+    }
+  }
+  const privyAppId = get("PRIVY_APP_ID");
+  if (privyAppId !== undefined && !PRIVY_APP_ID.test(privyAppId)) {
+    problems.push(
+      "PRIVY_APP_ID must be the app id from the login's dashboard: letters, digits, - and _",
+    );
+  }
+  const pemText = get("PRIVY_VERIFICATION_KEY");
+  const pem = pemText === undefined ? undefined : readPrivyKey(pemText);
+  if (pem === null) {
+    problems.push(
+      "PRIVY_VERIFICATION_KEY must be the verification key from the login's dashboard: an ES256 " +
+        "public key in PEM (-----BEGIN PUBLIC KEY-----), with real line breaks or \\n (its value " +
+        "is not shown)",
+    );
+  }
+  /** A setting in yoctoNEAR: its value, its default when unset, or undefined when wrong. */
+  const yocto = (key: string, fallback: bigint, min: bigint): bigint | undefined => {
+    const value = get(key);
+    if (value === undefined) return fallback;
+    if (
+      /^(?:0|[1-9][0-9]{0,38})$/.test(value) &&
+      BigInt(value) >= min &&
+      BigInt(value) <= U128_MAX
+    ) {
+      return BigInt(value);
+    }
+    problems.push(`${key} must be a whole number of yoctoNEAR from ${min} (1 NEAR is 10^24)`);
+    return undefined;
+  };
+  const amount = yocto("GAS_GIFT_AMOUNT", DEFAULT_GAS_GIFT_AMOUNT, 1n);
+  const minBalance = yocto("GAS_GIFT_MIN_BALANCE", DEFAULT_GAS_GIFT_MIN_BALANCE, 0n);
+  const dailyCap = yocto("GAS_GIFT_DAILY_CAP", DEFAULT_GAS_GIFT_DAILY_CAP, 1n);
+  if (amount !== undefined && dailyCap !== undefined && dailyCap < amount) {
+    problems.push(
+      "GAS_GIFT_DAILY_CAP must be at least GAS_GIFT_AMOUNT: below it, not one gift a day fits",
+    );
+  }
+
+  const missing = GAS_GIFT_REQUIRED.filter((key) => get(key) === undefined);
+  if (missing.length > 0) {
+    warnings.push(
+      `${listed(missing)} ${missing.length === 1 ? "is" : "are"} not set, so the gas gift is off ` +
+        "(POST /v1/gas-gift answers 503 gift_off)",
+    );
+    return undefined;
+  }
+  if (
+    problems.length > before ||
+    accountId === undefined ||
+    privateKey === undefined ||
+    privyAppId === undefined ||
+    pem === undefined ||
+    pem === null ||
+    amount === undefined ||
+    minBalance === undefined ||
+    dailyCap === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    accountId,
+    privateKey,
+    privyAppId,
+    privyVerificationKey: pem,
+    amount,
+    minBalance,
+    dailyCap,
   };
 }
 
@@ -983,6 +1166,86 @@ export function checkJudgeKey(
     },
     contractId,
   );
+}
+
+// ---- The gas gift's key -----------------------------------------------------------------------
+
+/**
+ * The gas gift's key, which must be a full-access key of `GAS_GIFT_ACCOUNT`: a function-call key
+ * cannot attach NEAR, so every gift would fail. It is the one full-access key a services host
+ * holds, so the account must hold only the gift pool, and it is refused when it is the contract's
+ * owner or the owner it has proposed (`get_config`): that key can change the contract's settings.
+ * The chain is asked, with 15 seconds to answer, and anything else is a failure to start, whose
+ * message names the variables and shows no key.
+ */
+export async function checkGasGiftKey(
+  client: Pick<TenderClient, "viewAccessKey" | "getConfig">,
+  gift: Pick<GasGiftConfig, "accountId" | "privateKey">,
+): Promise<void> {
+  const { accountId } = gift;
+  const publicKey = parseKey(gift.privateKey, "GAS_GIFT_PRIVATE_KEY").getPublicKey().toString();
+  let found: Awaited<ReturnType<TenderClient["viewAccessKey"]>>;
+  let config: Awaited<ReturnType<TenderClient["getConfig"]>>;
+  try {
+    [found, config] = await withinDeadline(
+      KEY_CHECK_DEADLINE_MS,
+      Promise.all([client.viewAccessKey(accountId, publicKey), client.getConfig()]),
+    );
+  } catch (error) {
+    throw new Error(
+      `cannot ask the chain what GAS_GIFT_PRIVATE_KEY may do (${describe(error)}), and the gas ` +
+        "gift does not start with a key that was not checked",
+    );
+  }
+  if (found === null) {
+    throw new Error(
+      `GAS_GIFT_PRIVATE_KEY is not a key of ${accountId} (GAS_GIFT_ACCOUNT): set the full-access ` +
+        "key of the gift account, which holds only the gift pool",
+    );
+  }
+  if (found.permission !== "FullAccess") {
+    throw new Error(
+      `GAS_GIFT_PRIVATE_KEY is a function-call key of ${accountId} (GAS_GIFT_ACCOUNT), which ` +
+        "cannot send NEAR: the gas gift needs the gift account's full-access key",
+    );
+  }
+  if (accountId === config.owner || accountId === config.pending_owner) {
+    throw new Error(
+      `GAS_GIFT_ACCOUNT is ${accountId}, the contract's owner, whose full-access key must never ` +
+        "be on a services host: make an account of its own for the gift pool",
+    );
+  }
+}
+
+/** `yocto` yoctoNEAR as NEAR, as a line says it: `0.1`, `2`. */
+function nearOf(yocto: bigint): string {
+  const whole = yocto / 10n ** 24n;
+  const fraction = (yocto % 10n ** 24n).toString().padStart(24, "0").replace(/0+$/, "");
+  return fraction === "" ? `${whole}` : `${whole}.${fraction}`;
+}
+
+/**
+ * What the API is given of the gas gift (`ApiDeps.gasGift`): its settings, the services' client to
+ * read balances with, and a client that signs as the gift account to send with.
+ */
+function gasGiftOf(
+  config: GasGiftConfig,
+  reader: Pick<TenderClient, "nearBalanceOf">,
+  sender: Pick<TenderClient, "transfer">,
+): GasGift {
+  return {
+    account: config.accountId,
+    privyAppId: config.privyAppId,
+    privyVerificationKey: config.privyVerificationKey,
+    amount: config.amount,
+    minBalance: config.minBalance,
+    dailyCap: config.dailyCap,
+    balanceOf: (accountId) => reader.nearBalanceOf(accountId),
+    transfer: async (accountId, amount) => {
+      const { txHash } = await sender.transfer(accountId, amount);
+      return { txHash };
+    },
+  };
 }
 
 // ---- The services -----------------------------------------------------------------------------
@@ -1373,6 +1636,8 @@ export async function startServices(
     if (config.keeper !== undefined) await checkKeeperKey(client, config.keeper, contractId);
     if (config.judge !== undefined) await checkJudgeKey(client, config.judge, contractId);
   }
+  // On the sandbox too: a key that cannot send NEAR fails every gift there as well.
+  if (config.gasGift !== undefined) await checkGasGiftKey(client, config.gasGift);
   /** A client that signs as the account of `key`, with it. */
   const signingAs = (key: { accountId: string; privateKey: string }) =>
     new TenderClient({
@@ -1389,6 +1654,10 @@ export async function startServices(
     config.judge === undefined
       ? undefined
       : { config: config.judge, client: signingAs(config.judge) };
+  const gasGift =
+    config.gasGift === undefined
+      ? undefined
+      : gasGiftOf(config.gasGift, client, signingAs(config.gasGift));
 
   // What ends the services after they are up (`Services.failed`). Before that it is thrown.
   const ending: { error?: Error; up: boolean } = { up: false };
@@ -1488,6 +1757,7 @@ export async function startServices(
           judgeAccount: config.judgeAccount,
           webOrigins: config.webOrigins,
           telegramBotUsername: config.telegramBotUsername,
+          gasGift,
           trustedProxyHops: config.trustedProxyHops,
           // True while the indexer, the keeper and the Judge wait for a node that cannot be asked
           // or is behind the index: `lag_blocks` cannot show that, so health says it.
@@ -1534,6 +1804,15 @@ export async function startServices(
       { port: config.apiPort, closeGraceMs: options.closeGraceMs },
     );
     log(`serve: API at ${api.url}, called at ${publicUrl} (${network}, ${contractId})`);
+    if (config.gasGift === undefined) {
+      log("serve: gas gift off (GAS_GIFT_PRIVATE_KEY and the variables with it are not all set)");
+    } else {
+      const { accountId, amount, dailyCap } = config.gasGift;
+      log(
+        `serve: gas gift on, from ${accountId}: ${nearOf(amount)} NEAR to each new account, ` +
+          `${nearOf(dailyCap)} NEAR a day at most`,
+      );
+    }
 
     // The indexer, the keeper and the Judge start and stop together, so that the keeper and the
     // Judge run only where the index is written: two keepers would send the same calls, and pay
