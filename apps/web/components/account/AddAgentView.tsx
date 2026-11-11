@@ -1,13 +1,21 @@
 "use client";
 
-import { AGENT_ACCOUNT_DEPOSIT, AGENT_STORAGE_DEPOSIT } from "@tender/shared";
+import { AGENT_ACCOUNT_DEPOSIT, AGENT_STORAGE_DEPOSIT, implicitAccountOf } from "@tender/shared";
 import Link from "next/link";
 import { type ReactNode, useEffect, useId, useRef, useState } from "react";
 import { type BondTerms, readBondTerms } from "../../lib/account";
 import { readAgentName, readPublicKey, SECRET_WARNING } from "../../lib/agentKey";
 import { api } from "../../lib/api";
 import { config } from "../../lib/config";
-import { createAccountActions, createAccountCommand } from "../../lib/connect";
+import {
+  type AgentOnChain,
+  bondOfTerms,
+  createAccountActions,
+  createAccountCommand,
+  implicitAgentBatch,
+  isPaid,
+  readAgentOnChain,
+} from "../../lib/connect";
 import { formatSpan } from "../../lib/phase";
 import { accountExists, accountKeyState } from "../../lib/rpc";
 import { useLoad } from "../../lib/useLoad";
@@ -588,15 +596,17 @@ function Register({
   accountId,
   onListed,
   watchEveryMs,
+  command = REGISTER_COMMAND,
 }: {
   accountId: string;
   onListed: () => void;
   watchEveryMs: number;
+  command?: string;
 }) {
   const [terms, retry] = useLoad("config", () => readBondTerms());
   return (
     <div className="grid gap-4">
-      <Command command={REGISTER_COMMAND} label="Run where the agent runs" account={accountId} />
+      <Command command={command} label="Run where the agent runs" account={accountId} />
       <div className="grid gap-2 text-[15px] leading-relaxed text-muted">
         {terms.status === "ready" ? (
           <BondLine terms={terms.data} />
@@ -619,6 +629,315 @@ function Register({
         )}
       </div>
       <RegistrationWatch accountId={accountId} onListed={onListed} everyMs={watchEveryMs} />
+    </div>
+  );
+}
+
+// ---- An owner whose account is an implicit account ---------------------------------------------
+
+/**
+ * An implicit account: 64 hex characters, the account of an ed25519 key. Every account of the email
+ * and Google login is one. A NEAR account id is 64 characters at most, so it can have no account
+ * under it, and "Add an agent" can't make `<name>.<owner>`, nor can the API make a connect code for
+ * one (`readAgentName` refuses the owner).
+ */
+export function isImplicitAccount(accountId: string): boolean {
+  return /^[0-9a-f]{64}$/.test(accountId);
+}
+
+/** Why an implicit account's agent gets an account of its own key, in one plain line. */
+export const IMPLICIT_OWNER_LINE =
+  "Your account's name has no room for accounts under it, so your agent gets an account made from its own key.";
+
+/** The name of the agent's key file, which `init` makes and `register` reads. */
+const IMPLICIT_KEY_NAME = "agent";
+
+/** The command that registers the agent of an implicit account, which `init` could not name. */
+export const implicitRegisterCommand = (agentId: string) =>
+  `${REGISTER_COMMAND} --name ${IMPLICIT_KEY_NAME} --account ${agentId}`;
+
+/** What the chain says of the agent's account, for the key that was pasted. */
+type ImplicitLook =
+  | { state: "idle" }
+  | { state: "checking" | "error"; accountId: string }
+  | { state: "read"; accountId: string; chain: AgentOnChain };
+
+/**
+ * "Add an agent" for an implicit account: the agent makes its key, the person pastes the public
+ * half, and ONE approval sends NEAR to the implicit account of that key (which the chain creates
+ * with that key as its one full-access key), Tender's storage for it and the bond into its vault
+ * (`implicitAgentBatch`, as "Use a separate account instead" sends). Then the agent registers with
+ * its own key. Nothing is signed until the button is pressed.
+ */
+function ImplicitFlow({ watchEveryMs }: { watchEveryMs: number }) {
+  const id = useId();
+  const actions = useAccountActions();
+  const [terms, retryTerms] = useLoad("config", () => readBondTerms());
+  const [keyText, setKeyText] = useState("");
+  const [keyError, setKeyError] = useState<string | null>(null);
+  const [look, setLook] = useState<ImplicitLook>({ state: "idle" });
+  const [create, setCreate] = useState<Create>({ state: "idle" });
+  const [listed, setListed] = useState<string | null>(null);
+  const busy = useRef(false);
+  const latestLook = useRef(0);
+
+  const key = readPublicKey(keyText);
+  const publicKey = key.ok ? key.publicKey : null;
+  const agentId = publicKey === null ? null : implicitAccountOf(publicKey);
+  const bond = terms.status === "ready" ? bondOfTerms(terms.data) : null;
+  const termsRead = terms.status === "ready";
+  const sending = create.state === "waiting" || create.state === "settling";
+
+  /** Reads where the agent's account stands. Null when the read failed. */
+  const read = async (target: string, pk: string): Promise<AgentOnChain | null> => {
+    const request = ++latestLook.current;
+    setLook({ state: "checking", accountId: target });
+    try {
+      const chain = await readAgentOnChain(target, pk, bond);
+      if (request === latestLook.current) setLook({ state: "read", accountId: target, chain });
+      return chain;
+    } catch (error) {
+      console.error(error);
+      if (request === latestLook.current) setLook({ state: "error", accountId: target });
+      return null;
+    }
+  };
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `read` is this render's, and the read is keyed on what it reads
+  useEffect(() => {
+    if (agentId === null || publicKey === null || !termsRead) {
+      latestLook.current++;
+      setLook({ state: "idle" });
+      return;
+    }
+    if (busy.current) return;
+    void read(agentId, publicKey);
+  }, [agentId, publicKey, termsRead]);
+
+  const onKey = (text: string) => {
+    if (sending) return;
+    setCreate({ state: "idle" });
+    setListed(null);
+    const reading = readPublicKey(text);
+    if (!reading.ok && reading.secret) {
+      // Key material: out of the field at once, kept nowhere, and the person is told.
+      setKeyText("");
+      setKeyError(reading.message);
+      return;
+    }
+    setKeyText(text);
+    setKeyError(reading.ok || text.trim().length < 50 ? null : reading.message);
+  };
+
+  const shown = look.state !== "idle" && look.accountId === agentId ? look : null;
+  const chain = shown?.state === "read" ? shown.chain : null;
+  const made = chain !== null && chain.key === "has-key" && isPaid(chain, bond);
+  const taken = chain !== null && chain.key === "other-keys";
+  const ready = agentId !== null && chain !== null && !made && !taken;
+
+  const send = async () => {
+    if (busy.current || agentId === null || publicKey === null || !termsRead) return;
+    busy.current = true;
+    setCreate({ state: "waiting" });
+    try {
+      // Read again now: what Tender holds for the account may have changed since the page looked.
+      const fresh = await read(agentId, publicKey);
+      if (
+        fresh === null ||
+        fresh.key === "other-keys" ||
+        (fresh.key === "has-key" && isPaid(fresh, bond))
+      ) {
+        setCreate({ state: "idle" });
+        return;
+      }
+      await actions.sendBatch(implicitAgentBatch({ accountId: agentId, chain: fresh, bond }));
+      setCreate({ state: "settling" });
+      for (let tries = 0; tries < SETTLE_TRIES; tries++) {
+        const seen = await read(agentId, publicKey);
+        if (seen !== null && seen.key === "has-key" && isPaid(seen, bond)) {
+          setCreate({ state: "idle" });
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, SETTLE_EVERY_MS));
+      }
+      setCreate({ state: "unseen" });
+    } catch (error) {
+      console.error(error);
+      setCreate({
+        state: "failed",
+        message:
+          error instanceof TransactionFailed
+            ? "The transaction failed on the network. Check that your account holds the NEAR and the bond before you try again."
+            : error instanceof WalletError
+              ? "The wallet didn't send it. Try again."
+              : "Something went wrong before anything was sent. Try once more.",
+      });
+    } finally {
+      busy.current = false;
+    }
+  };
+
+  return (
+    <div className="grid gap-6">
+      <p data-testid="implicit-owner" className={NOTICE}>
+        {IMPLICIT_OWNER_LINE}
+      </p>
+      <ol className="grid gap-4">
+        <Step
+          n={1}
+          title="Make your agent's key where the agent runs."
+          why="The key signs everything the agent does, so it is made on the agent's machine and never leaves it. Tender only ever sees the public half."
+          done={publicKey !== null}
+          open
+        >
+          <Command command={initCommand(IMPLICIT_KEY_NAME)} label="Run where the agent runs" />
+          <div className="grid gap-1.5">
+            <label htmlFor={`${id}-key`} className={FACT_LABEL}>
+              The public key it printed
+            </label>
+            <input
+              id={`${id}-key`}
+              value={keyText}
+              onChange={(event) => onKey(event.currentTarget.value)}
+              onBlur={() => setKeyError(keyText === "" ? keyError : key.ok ? null : key.message)}
+              readOnly={sending}
+              placeholder="ed25519:…"
+              autoComplete="off"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              aria-invalid={keyError !== null}
+              aria-describedby={keyError === null ? undefined : `${id}-key-error`}
+              className={`${FIELD} font-mono text-sm`}
+            />
+            {keyError === null ? null : (
+              <p
+                id={`${id}-key-error`}
+                data-testid="key-error"
+                role={keyError === SECRET_WARNING ? "alert" : undefined}
+                className="text-sm text-seal"
+              >
+                {keyError}
+              </p>
+            )}
+          </div>
+        </Step>
+
+        <Step
+          n={2}
+          title="Create its account."
+          why="The account is made from the key: its name is the key's 64 characters, and the key is its only key. Tender's directory won't list it under you as its provider."
+          done={made}
+          open={publicKey !== null || made}
+        >
+          <dl className="grid gap-px overflow-hidden rounded-xl border border-line bg-line sm:grid-cols-2">
+            <div className="grid content-start gap-1 bg-ink p-4">
+              <dt className={FACT_LABEL}>Its account</dt>
+              <dd
+                data-testid="implicit-agent"
+                className="font-mono text-[13px] text-bone wrap-anywhere"
+              >
+                {agentId ?? "From step 1"}
+              </dd>
+            </div>
+            <div className="grid content-start gap-1 bg-ink p-4">
+              <dt className={FACT_LABEL}>You sign</dt>
+              <dd className="text-lg text-bone">1 approval</dd>
+              <dd className="text-[13px] text-muted">
+                {describeNear(AGENT_ACCOUNT_DEPOSIT)} to the account, which stays the agent's, its
+                storage with Tender and its bond.
+              </dd>
+            </div>
+          </dl>
+
+          {terms.status === "error" ? (
+            <div className="grid gap-2">
+              <p role="alert" className="text-sm text-seal">
+                Couldn't read the bond from the contract.
+              </p>
+              <button
+                type="button"
+                aria-disabled={terms.retrying}
+                onClick={terms.retrying ? undefined : retryTerms}
+                className={SECONDARY}
+              >
+                {terms.retrying ? "Retrying…" : "Retry"}
+              </button>
+            </div>
+          ) : null}
+
+          <p data-testid="implicit-state" className="text-sm" aria-live="polite">
+            {shown === null ? null : shown.state === "checking" ? (
+              <span className="text-muted">Checking the account…</span>
+            ) : shown.state === "error" ? (
+              <span className="text-seal">
+                Couldn't ask the network about the account. It is checked again before anything is
+                sent.
+              </span>
+            ) : made ? (
+              <span className="text-bone">The account is made and paid for. On to step 3.</span>
+            ) : taken ? (
+              <span className="text-seal">
+                That account exists with other keys, so it isn't this key's to use.
+              </span>
+            ) : null}
+          </p>
+
+          {made ? null : !actions.canSend() ? (
+            <p data-testid="cannot-create" className={NOTICE}>
+              This wallet can't send the approval from the page.
+            </p>
+          ) : (
+            <button
+              type="button"
+              aria-disabled={!ready || sending}
+              onClick={() => {
+                if (ready && !sending) void send();
+              }}
+              className={PRIMARY}
+            >
+              {create.state === "waiting"
+                ? "Waiting for your wallet…"
+                : create.state === "settling"
+                  ? "Looking for the account…"
+                  : "Create the agent's account"}
+            </button>
+          )}
+
+          {create.state === "failed" ? (
+            <p
+              role="alert"
+              data-testid="create-error"
+              className="rounded-xl border border-seal/45 bg-seal/[0.06] p-4 text-sm text-bone"
+            >
+              {create.message}
+            </p>
+          ) : create.state === "unseen" ? (
+            <p role="status" className={NOTICE}>
+              The wallet sent it, but the account isn't on the network yet. Check again in a moment.
+            </p>
+          ) : null}
+        </Step>
+
+        <Step
+          n={3}
+          title="Let the agent register itself and lock its bond."
+          why="Registering is signed with the agent's own key, so only the agent can do it. The bond makes each agent cost something while it is active, and comes back when it retires."
+          done={made && listed === agentId}
+          open={made}
+        >
+          {made && agentId !== null ? (
+            <Register
+              accountId={agentId}
+              command={implicitRegisterCommand(agentId)}
+              onListed={() => setListed(agentId)}
+              watchEveryMs={watchEveryMs}
+            />
+          ) : (
+            <p className="text-sm text-muted">Once its account exists.</p>
+          )}
+        </Step>
+      </ol>
     </div>
   );
 }
@@ -692,19 +1011,24 @@ export function AddAgentView({
         wallet={wallet}
         why="The agent's account is made under the account your wallet is connected as, and your wallet signs it."
       >
-        {(account) => (
-          <div className="grid gap-8">
-            <ConnectAgent
-              key={account}
-              account={account}
-              onByHand={() => setByHand(true)}
-              {...(pollMs === undefined ? {} : { pollMs })}
-            />
-            <ByHand open={byHand} onToggle={() => setByHand((was) => !was)}>
-              <Flow key={account} account={account} watchEveryMs={watchEveryMs} />
-            </ByHand>
-          </div>
-        )}
+        {(account) =>
+          isImplicitAccount(account) ? (
+            // No account can be made under it, and no connect code: the agent's own key's account.
+            <ImplicitFlow key={account} watchEveryMs={watchEveryMs} />
+          ) : (
+            <div className="grid gap-8">
+              <ConnectAgent
+                key={account}
+                account={account}
+                onByHand={() => setByHand(true)}
+                {...(pollMs === undefined ? {} : { pollMs })}
+              />
+              <ByHand open={byHand} onToggle={() => setByHand((was) => !was)}>
+                <Flow key={account} account={account} watchEveryMs={watchEveryMs} />
+              </ByHand>
+            </div>
+          )
+        }
       </ConnectGate>
     </div>
   );
