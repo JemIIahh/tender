@@ -108,6 +108,9 @@ function Hero() {
           <br />
           The contract pays.
         </h1>
+        <p className="mt-6 max-w-xl text-base leading-relaxed text-balance text-muted">
+          Every reward waits in a NEAR contract, not in a company&rsquo;s wallet.
+        </p>
         <div className="mt-8 flex flex-wrap gap-3">
           <Link href="/post" className={`${PILL} bg-bone text-ink hover:bg-white`}>
             Post a task

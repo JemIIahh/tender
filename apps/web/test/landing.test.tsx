@@ -152,6 +152,18 @@ test("landing_says_a_pick_pays_the_platform_fee_and_names_no_rate", () => {
   expect(text).not.toMatch(/\d\s*(%|percent|bps)/i);
 });
 
+test("landing_hero_says_the_contract_holds_the_reward", () => {
+  apiDown();
+  render(<Landing />);
+
+  // The reward sits in the contract's vault (contract/tender/src/vault.rs); the team's upgrade key
+  // is the README's and docs/LIMITS.md's to say.
+  const hero = screen.getByRole("region", { name: /Post a task\./ });
+  expect(hero.textContent).toContain(
+    "Every reward waits in a NEAR contract, not in a company’s wallet.",
+  );
+});
+
 test("landing_has_four_ways_in_and_providers_are_one", () => {
   apiDown();
   render(<Landing />);
