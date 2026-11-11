@@ -19,7 +19,9 @@ export interface ServiceFields {
   commitSecs: number;
   revealSecs: number;
   pickSecs: number;
-  verifier: "hirer" | "judge";
+  verifier: "hirer" | "judge" | "none";
+  paymentMode?: "escrow" | "x402";
+  x402?: string | null;
   criteria: string | null;
   status: "active" | "paused";
 }
@@ -49,8 +51,8 @@ export async function insertService(
     const [row] = await tx.query<{ id: string }>(
       `insert into services (provider, agent, title, description, tags, category, output_format,
                              token, price, commit_secs, reveal_secs, pick_secs, verifier, criteria,
-                             status)
-       values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::numeric, $10, $11, $12, $13, $14, $15)
+                             status, payment_mode, x402)
+       values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::numeric, $10, $11, $12, $13, $14, $15, $16, $17::jsonb)
        returning id::text as id`,
       [
         input.provider,
@@ -68,6 +70,8 @@ export async function insertService(
         input.verifier,
         input.criteria,
         input.status,
+        input.paymentMode ?? "escrow",
+        input.x402 ?? null,
       ],
     );
     if (!row) throw new Error("the service was not stored");
@@ -90,7 +94,7 @@ export async function updateService(
     `update services
         set title = $3, description = $4, tags = $5::jsonb, category = $6, output_format = $7,
             token = $8, price = $9::numeric, commit_secs = $10, reveal_secs = $11, pick_secs = $12,
-            verifier = $13, criteria = $14, status = coalesce($15, status), updated_at = now()
+            verifier = $13, criteria = $14, status = coalesce($15, status), payment_mode = $16, x402 = $17::jsonb, updated_at = now()
       where id = $1 and provider = $2
       returning id::text as id`,
     [
@@ -109,6 +113,8 @@ export async function updateService(
       fields.verifier,
       fields.criteria,
       fields.status,
+      fields.paymentMode ?? "escrow",
+      fields.x402 ?? null,
     ],
   );
   return rows.length === 1;

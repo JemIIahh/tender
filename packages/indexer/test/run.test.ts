@@ -19,7 +19,15 @@ import { blockOf, FIXTURE_CONTRACT, FIXTURE_OPTIONS, lifecycleBlocks } from "./f
 // The runner and its supervisor, on a PGlite database, with a scripted block source and a fake
 // chain: nothing here reaches a network. The sandbox file runs them on a real chain.
 
-const TABLES = ["chain_cursor", "events", "tasks", "funders", "entries", "agents"];
+const TABLES = [
+  "chain_cursor",
+  "events",
+  "tasks",
+  "funders",
+  "entries",
+  "agents",
+  "indexer_request_budget",
+];
 /** What an RPC error may quote: a URL, which can hold a key. No log line may show it (P03-R16). */
 const KEYED = "https://rpc.example.org/?apiKey=s3cret";
 const leaks = (lines: string[]) => lines.filter((line) => line.includes("s3cret"));
@@ -455,6 +463,47 @@ test("a_failed_reconcile_is_logged_and_indexing_goes_on", async () => {
     await indexer.stop();
   }
   expect(leaks(lines)).toEqual([]);
+});
+
+test("retired_lifetime_caps_cannot_stop_the_indexer_even_after_prior_usage", async () => {
+  await db.query("insert into indexer_request_budget(scope, requests) values ($1, 1000)", [
+    "legacy",
+  ]);
+  const fetchImpl = vi.fn(async (url: string) => {
+    const match = /\/block\/(\d+)/.exec(url);
+    const height = match ? Number(match[1]) : 13;
+    return new Response(
+      JSON.stringify({
+        block: {
+          header: {
+            height,
+            prev_height: height - 1,
+            timestamp_nanosec: String(height * 1000000000),
+          },
+        },
+        shards: [],
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
+  });
+  vi.stubGlobal("fetch", fetchImpl);
+  const lines: string[] = [];
+  const indexer = startIndexer(
+    testnetEnv({
+      INDEXER_START_HEIGHT: "10",
+      INDEXER_MAX_REQUESTS: "2",
+      FASTNEAR_API_KEY: "test-placeholder",
+    }),
+    { db, client: emptyChain(13n), log: (line) => lines.push(line) },
+  );
+  try {
+    await until("all blocks pass the old cap", async () => (await cursor(TESTNET_CURSOR)) === 13n);
+    expect(fetchImpl.mock.calls.length).toBeGreaterThan(2);
+    expect(lines.some((line) => line.includes("retired and ignored"))).toBe(true);
+  } finally {
+    await indexer.stop();
+    vi.unstubAllGlobals();
+  }
 });
 
 test("neardata's lines name NEARDATA_URL rather than quote it", async () => {

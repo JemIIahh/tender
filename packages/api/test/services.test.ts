@@ -118,7 +118,10 @@ async function send<T = unknown>(
   path: string,
   o: { account?: string; body?: unknown; raw?: string; app?: Requester; headers?: object } = {},
 ): Promise<Reply<T>> {
-  const headers: Record<string, string> = { ...(o.headers as Record<string, string>) };
+  const headers: Record<string, string> = {
+    "Tender-Service-Version": "2",
+    ...(o.headers as Record<string, string>),
+  };
   if (o.account !== undefined) headers["x-test-account"] = o.account;
   let body: string | undefined;
   if (o.raw !== undefined) body = o.raw;
@@ -788,3 +791,164 @@ async function tokenFor(account: string): Promise<string> {
   );
   return token;
 }
+
+test("x402 listings are explicit, have no escrow windows, and survive reads and updates", async () => {
+  const request = {
+    ...listing(WRITER),
+    output_format: "json",
+    payment_mode: "x402",
+    verification: { kind: "none" },
+    commit_secs: 0,
+    reveal_secs: 0,
+    pick_secs: 0,
+    x402: {
+      endpoint: "https://asp.example/inventory",
+      network: "near:testnet",
+      pay_to: ACME,
+      max_timeout_seconds: 60,
+    },
+  };
+  const made = await create(ACME, request);
+  expect(made.status).toBe(200);
+  expect(made.body.service).toMatchObject({
+    payment_mode: "x402",
+    x402: request.x402,
+    verification: { kind: "none" },
+    available: true,
+  });
+  const changed = await change(ServiceResponseSchema.parse(made.body).service.id, ACME, {
+    price: "3000",
+  });
+  expect(changed.status).toBe(200);
+  expect(changed.body.service).toMatchObject({
+    price: "3000",
+    payment_mode: "x402",
+    x402: request.x402,
+  });
+  expect(
+    (
+      await change(ServiceResponseSchema.parse(made.body).service.id, ACME, {
+        payment_mode: "escrow",
+      })
+    ).status,
+  ).toBe(400);
+  expect(
+    (await change(ServiceResponseSchema.parse(made.body).service.id, WRITER, { price: "1" }))
+      .status,
+  ).toBe(403);
+  expect(
+    (await change(ServiceResponseSchema.parse(made.body).service.id, ACME, { status: "paused" }))
+      .body.service.available,
+  ).toBe(false);
+});
+
+test("escrow is the legacy default and mixed payment terms are refused", async () => {
+  const legacy = await create(ACME, listing(WRITER));
+  expect(legacy.body.service.payment_mode).toBe("escrow");
+  expect(legacy.body.service.x402).toBeNull();
+  const config = {
+    endpoint: "https://asp.example/inventory",
+    network: "near:testnet",
+    pay_to: ACME,
+    max_timeout_seconds: 60,
+  };
+  expect((await create(ACME, { ...listing(WRITER), x402: config })).status).toBe(400);
+  expect(
+    (await create(ACME, { ...listing(WRITER), payment_mode: "x402", x402: config })).status,
+  ).toBe(400);
+  expect(
+    (
+      await create(ACME, {
+        ...listing(WRITER),
+        output_format: "json",
+        payment_mode: "x402",
+        verification: { kind: "none" },
+        commit_secs: 0,
+        reveal_secs: 0,
+        pick_secs: 0,
+      })
+    ).status,
+  ).toBe(400);
+});
+
+test("public x402 listings require HTTPS and refuse mainnet settlement", async () => {
+  const request = {
+    ...listing(WRITER),
+    output_format: "json",
+    payment_mode: "x402",
+    verification: { kind: "none" },
+    commit_secs: 0,
+    reveal_secs: 0,
+    pick_secs: 0,
+    x402: {
+      endpoint: "http://127.0.0.1:9000/inventory",
+      network: "near:testnet",
+      pay_to: ACME,
+      max_timeout_seconds: 60,
+    },
+  };
+  expect((await create(ACME, request, appWith({ network: "testnet" }))).status).toBe(400);
+  expect(
+    (await create(ACME, { ...request, x402: { ...request.x402, network: "near:mainnet" } })).status,
+  ).toBe(400);
+});
+
+test("legacy service pages remain escrow-only and opt-in clients see paid listings", async () => {
+  const escrow = await create(ACME, listing(WRITER));
+  const paid = await create(ACME, {
+    ...listing(WRITER),
+    output_format: "json",
+    payment_mode: "x402",
+    verification: { kind: "none" },
+    commit_secs: 0,
+    reveal_secs: 0,
+    pick_secs: 0,
+    x402: {
+      endpoint: "https://asp.example/inventory",
+      network: "near:testnet",
+      pay_to: ACME,
+      max_timeout_seconds: 60,
+    },
+  });
+  expect(paid.status).toBe(200);
+  const app = appWith();
+  const legacy = await app.request("/v1/services?limit=1");
+  const oldPage = (await legacy.json()) as {
+    services: Array<{ id: string; verification: { kind: string } }>;
+    next_cursor: string | null;
+  };
+  expect(oldPage.services.map((one) => one.id)).toEqual([idOf(escrow)]);
+  expect(
+    oldPage.services.every(
+      (one) => one.verification.kind === "hirer" || one.verification.kind === "judge",
+    ),
+  ).toBe(true);
+  expect(oldPage.next_cursor).toBeNull();
+  expect(legacy.headers.get("Vary")).toContain("Tender-Service-Version");
+  expect((await app.request(`/v1/services/${idOf(paid)}`)).status).toBe(404);
+  const modern = await send<ServiceBody>("GET", `/v1/services/${idOf(paid)}`);
+  expect(modern.status).toBe(200);
+  expect(modern.body.service.payment_mode).toBe("x402");
+});
+
+test("the service version header is named once in Vary, on the directory and on one service", async () => {
+  const escrow = await create(ACME, listing(WRITER));
+  const app = appWith();
+  for (const path of ["/v1/services", "/v1/services?limit=1", `/v1/services/${idOf(escrow)}`]) {
+    const versions: Record<string, string>[] = [{}, { "Tender-Service-Version": "2" }];
+    for (const headers of versions) {
+      const response = await app.request(path, { headers });
+      expect(response.status).toBe(200);
+      const named = (response.headers.get("Vary") ?? "")
+        .split(",")
+        .map((name) => name.trim().toLowerCase())
+        .filter((name) => name === "tender-service-version");
+      expect(named, `${path} ${JSON.stringify(headers)}`).toHaveLength(1);
+    }
+  }
+  // A version other than 2 is still refused, on both.
+  for (const path of ["/v1/services", `/v1/services/${idOf(escrow)}`]) {
+    const response = await app.request(path, { headers: { "Tender-Service-Version": "3" } });
+    expect(response.status).toBe(400);
+  }
+});

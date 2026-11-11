@@ -17,6 +17,7 @@ import {
   submitHire,
   teamOnlyNote,
 } from "../lib/hire";
+import { MCP_DOCS_URL, safeHref } from "../lib/links";
 import { spanText } from "../lib/post";
 import { liveToken } from "../lib/postSubmit";
 import { checkedSentence } from "../lib/services";
@@ -449,6 +450,45 @@ function HirePanel({
   );
 }
 
+/**
+ * An x402 service's panel, where an escrow service has its hire form. Agents buy the API through
+ * the MCP server's `purchase_service` tool; the page only says so, and what a call costs and pays.
+ */
+function ApiPanel({ service }: { service: Service }) {
+  const endpoint = safeHref(service.x402?.endpoint ?? "");
+  return (
+    <section id="hire" className={`${PANEL} scroll-mt-24`} aria-labelledby="x402-payment">
+      <h2 id="x402-payment" className={PANEL_TITLE}>
+        x402 paid API
+      </h2>
+      <p data-testid="api-price">
+        <Amount value={service.price} token={service.token} />{" "}
+        <span className="text-muted">/ call</span> ·{" "}
+        {config.network === "sandbox" ? "Local NEAR sandbox" : "NEAR testnet"}
+      </p>
+      <p data-testid="api-notice" className={NOTICE}>
+        Agents buy this API through Tender's MCP server, with the{" "}
+        <span className="font-mono">purchase_service</span> tool. Each call pays the price directly
+        to the account below. Tender doesn't hold the payment or judge the answer.
+      </p>
+      <dl className={FACTS}>
+        <dt className={FACT_LABEL}>API origin</dt>
+        <dd data-testid="api-origin" className="font-mono text-sm wrap-anywhere">
+          {endpoint === undefined ? "Unknown" : new URL(endpoint).origin}
+        </dd>
+        <dt className={FACT_LABEL}>Paid to</dt>
+        <dd className="font-mono text-sm wrap-anywhere">{service.x402?.pay_to}</dd>
+      </dl>
+      <a href={MCP_DOCS_URL} className={`${TEXT_LINK} justify-self-start text-sm`}>
+        Set up the MCP server
+      </a>
+      {!service.available ? (
+        <p className={NOTICE}>This service is not available for purchases.</p>
+      ) : null}
+    </section>
+  );
+}
+
 function ReadyView({
   service,
   onChanged,
@@ -510,10 +550,14 @@ function ReadyView({
           </section>
         </div>
         <div className="min-w-0 lg:sticky lg:top-24 lg:col-start-2 lg:row-span-2 lg:row-start-1">
-          <HirePanel service={service} onChanged={onChanged} />
+          {service.payment_mode === "x402" ? (
+            <ApiPanel service={service} />
+          ) : (
+            <HirePanel service={service} onChanged={onChanged} />
+          )}
         </div>
         <div className="grid min-w-0 gap-6 lg:col-start-1">
-          <Terms service={service} />
+          {service.payment_mode === "x402" ? null : <Terms service={service} />}
           <JudgeCriteria service={service} />
           <Facts service={service} />
         </div>

@@ -20,7 +20,12 @@ import { telegramRoutes } from "./routes/telegram";
 import { eventRoutes } from "./sse";
 
 /** The request headers a browser may send to the API: sign-in, JSON bodies, and SSE resumption. */
-const ALLOWED_HEADERS = ["Authorization", "Content-Type", "Last-Event-ID"];
+const ALLOWED_HEADERS = [
+  "Authorization",
+  "Content-Type",
+  "Last-Event-ID",
+  "Tender-Service-Version",
+];
 
 /**
  * The response headers browser code may read, beyond the few that any response allows: how long to

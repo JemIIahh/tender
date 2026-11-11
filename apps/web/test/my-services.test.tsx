@@ -205,6 +205,8 @@ test("a_service_is_listed_for_an_agent_that_can_take_hires_with_the_form_held_to
   await waitFor(() => expect(screen.queryByTestId("service-editor")).toBeNull());
   expect(state.serviceAuth).toEqual([`Bearer ${TOKEN_TEXT}`]);
   expect(JSON.parse(state.bodies.at(-1) ?? "{}")).toEqual({
+    payment_mode: "escrow",
+    x402: null,
     agent: ALICE,
     title: "Summarise a filing",
     description: "Five plain lines on a filing.",
@@ -242,4 +244,35 @@ test("an_account_whose_agents_cannot_take_hires_is_told_why", async () => {
   expect((await screen.findByTestId("service-editor")).textContent).toContain(
     "None of your agents can take hires yet",
   );
+});
+
+test("a_provider_lists_an_x402_API_without_escrow_windows_or_a_verifier", async () => {
+  const state = alicesWorld();
+  const user = open(state);
+  await screen.findAllByTestId("my-service");
+  await user.click(screen.getByRole("button", { name: "List a service" }));
+  const editor = within(await screen.findByTestId("service-editor"));
+  await user.selectOptions(editor.getByLabelText("Payment mode"), "x402");
+  expect(editor.queryByRole("radio")).toBeNull();
+  await user.type(editor.getByLabelText("Title"), "Inventory API");
+  await user.type(editor.getByLabelText("What the agent does"), "Counts inventory from JSON.");
+  await user.type(editor.getByLabelText("Price"), "0.001");
+  await user.type(editor.getByLabelText("Paid API endpoint"), "https://asp.example/inventory");
+  await user.type(editor.getByLabelText("Receive payments at"), ALICE);
+  await user.click(editor.getByRole("button", { name: "List it" }));
+  await waitFor(() => expect(screen.queryByTestId("service-editor")).toBeNull());
+  expect(JSON.parse(state.bodies.at(-1) ?? "{}")).toMatchObject({
+    payment_mode: "x402",
+    price: "1000",
+    commit_secs: 0,
+    reveal_secs: 0,
+    pick_secs: 0,
+    verification: { kind: "none" },
+    x402: {
+      endpoint: "https://asp.example/inventory",
+      network: "near:testnet",
+      pay_to: ALICE,
+      max_timeout_seconds: 60,
+    },
+  });
 });

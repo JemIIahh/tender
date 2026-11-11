@@ -40,6 +40,14 @@ export {
   type LlmErrorCode,
   type LlmSolverOptions,
 } from "./solvers/llm";
+export { createLlmServiceSolver, type LlmServiceOptions } from "./solvers/llm-service";
+export { createModelCallBudget, type ModelCallBudget } from "./solvers/model-budget";
 export { createOfflineSolver } from "./solvers/offline";
+export {
+  type CapabilityPlan,
+  type CapabilityPolicy,
+  createServiceAssistedSolver,
+  type ServiceAssistedSolverOptions,
+} from "./solvers/service";
 export { createWeakSolver } from "./solvers/weak";
 export type { Solver, TaskContext } from "./types";

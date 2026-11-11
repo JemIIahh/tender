@@ -253,6 +253,51 @@ function Editor({
             ))}
           </select>
         </Field>
+        <Field label="Payment mode" id={fieldId("paymentMode")}>
+          <select
+            id={fieldId("paymentMode")}
+            className={FIELD}
+            value={form.paymentMode ?? "escrow"}
+            disabled={editing !== null}
+            onChange={(event) => {
+              set("paymentMode", event.target.value as "escrow" | "x402");
+              if (event.target.value === "x402") set("outputFormat", "json");
+            }}
+          >
+            <option value="escrow">Escrow — delivered work</option>
+            <option value="x402">x402 — immediate API response</option>
+          </select>
+        </Field>
+        {form.paymentMode === "x402" ? (
+          <>
+            <Field
+              label="Paid API endpoint"
+              id={fieldId("endpoint")}
+              error={errors.endpoint}
+              hint="HTTPS. Your API must verify and settle x402 payments before returning the response."
+            >
+              <input
+                id={fieldId("endpoint")}
+                className={FIELD}
+                value={form.endpoint ?? ""}
+                onChange={(event) => set("endpoint", event.target.value)}
+              />
+            </Field>
+            <Field
+              label="Receive payments at"
+              id={fieldId("payTo")}
+              error={errors.payTo}
+              hint="NEAR testnet account. Payments go directly here, outside Tender escrow."
+            >
+              <input
+                id={fieldId("payTo")}
+                className={FIELD}
+                value={form.payTo ?? ""}
+                onChange={(event) => set("payTo", event.target.value)}
+              />
+            </Field>
+          </>
+        ) : null}
         <Field
           label="Title"
           id={fieldId("title")}
@@ -304,7 +349,7 @@ function Editor({
             onChange={(event) => set("outputFormat", event.target.value)}
             className={FIELD}
           >
-            {SERVICE_FORMATS.map((format) => (
+            {(form.paymentMode === "x402" ? ["json"] : SERVICE_FORMATS).map((format) => (
               <option key={format} value={format}>
                 {SERVICE_FORMAT_LABEL[format]}
               </option>
@@ -345,91 +390,100 @@ function Editor({
             </select>
           </Field>
         </div>
-        <fieldset className="grid gap-3 md:col-span-2">
-          <legend className="mb-2 text-sm font-medium text-bone">Windows, in minutes</legend>
-          <div className="grid gap-3 sm:grid-cols-3">
-            {(
-              [
-                ["commitMinutes", "commit", "To deliver"],
-                ["revealMinutes", "reveal", "To reveal"],
-                ["pickMinutes", "pick", "To pick"],
-              ] as const
-            ).map(([key, window, label]) => (
-              <Field
-                key={key}
-                label={label}
-                id={fieldId(key)}
-                error={errors[key]}
-                hint={keptHint(form, window)}
-              >
-                <input
-                  id={fieldId(key)}
-                  inputMode="numeric"
-                  value={form[key]}
-                  onChange={(event) => set(key, event.target.value)}
-                  aria-invalid={errors[key] !== undefined}
-                  aria-describedby={described(key)}
-                  className={FIELD}
-                />
-              </Field>
-            ))}
-          </div>
-        </fieldset>
-        <fieldset className="grid gap-2 md:col-span-2">
-          <legend className="mb-2 text-sm font-medium text-bone">Who checks the work</legend>
-          {(
-            [
-              ["hirer", "The hirer accepts it, and picks it to pay"],
-              ["judge", "The Tender Judge, against public criteria"],
-            ] as const
-          ).map(([value, label]) => (
-            <div key={value} className="grid gap-1">
-              <label className="flex min-h-10 items-center gap-3 text-[15px] text-bone">
-                <input
-                  type="radio"
-                  name={`${id}-verifier`}
-                  value={value}
-                  checked={form.verifier === value}
-                  onChange={() => set("verifier", value)}
-                  aria-describedby={value === "hirer" ? `${id}-hirer-note` : undefined}
-                  className="size-4 accent-seal"
-                />
-                {label}
-              </label>
-              {value === "hirer" ? (
-                <p
-                  id={`${id}-hirer-note`}
-                  data-testid="hirer-note"
-                  className="pl-7 text-[12.5px] leading-relaxed text-muted"
+        {form.paymentMode !== "x402" ? (
+          <>
+            <fieldset className="grid gap-3 md:col-span-2">
+              <legend className="mb-2 text-sm font-medium text-bone">Windows, in minutes</legend>
+              <div className="grid gap-3 sm:grid-cols-3">
+                {(
+                  [
+                    ["commitMinutes", "commit", "To deliver"],
+                    ["revealMinutes", "reveal", "To reveal"],
+                    ["pickMinutes", "pick", "To pick"],
+                  ] as const
+                ).map(([key, window, label]) => (
+                  <Field
+                    key={key}
+                    label={label}
+                    id={fieldId(key)}
+                    error={errors[key]}
+                    hint={keptHint(form, window)}
+                  >
+                    <input
+                      id={fieldId(key)}
+                      inputMode="numeric"
+                      value={form[key]}
+                      onChange={(event) => set(key, event.target.value)}
+                      aria-invalid={errors[key] !== undefined}
+                      aria-describedby={described(key)}
+                      className={FIELD}
+                    />
+                  </Field>
+                ))}
+              </div>
+            </fieldset>
+            <fieldset className="grid gap-2 md:col-span-2">
+              <legend className="mb-2 text-sm font-medium text-bone">Who checks the work</legend>
+              {(
+                [
+                  ["hirer", "The hirer accepts it, and picks it to pay"],
+                  ["judge", "The Tender Judge, against public criteria"],
+                ] as const
+              ).map(([value, label]) => (
+                <div key={value} className="grid gap-1">
+                  <label className="flex min-h-10 items-center gap-3 text-[15px] text-bone">
+                    <input
+                      type="radio"
+                      name={`${id}-verifier`}
+                      value={value}
+                      checked={form.verifier === value}
+                      onChange={() => set("verifier", value)}
+                      aria-describedby={value === "hirer" ? `${id}-hirer-note` : undefined}
+                      className="size-4 accent-seal"
+                    />
+                    {label}
+                  </label>
+                  {value === "hirer" ? (
+                    <p
+                      id={`${id}-hirer-note`}
+                      data-testid="hirer-note"
+                      className="pl-7 text-[12.5px] leading-relaxed text-muted"
+                    >
+                      {HIRER_ACCEPTS_NOTE}
+                    </p>
+                  ) : null}
+                </div>
+              ))}
+              {errors.verifier === undefined ? null : (
+                <p className="text-[12.5px] text-seal">{errors.verifier}</p>
+              )}
+              {form.verifier === "judge" ? (
+                <Field
+                  label="Public criteria (JSON)"
+                  id={fieldId("criteria")}
+                  error={errors.criteria}
+                  hint='Kind regex_cases, tests or rubric, with "has_heldout": false and "split": "winner_take_all".'
                 >
-                  {HIRER_ACCEPTS_NOTE}
-                </p>
+                  <textarea
+                    id={fieldId("criteria")}
+                    value={form.criteria}
+                    rows={8}
+                    spellCheck={false}
+                    onChange={(event) => set("criteria", event.target.value)}
+                    aria-invalid={errors.criteria !== undefined}
+                    aria-describedby={described("criteria")}
+                    className={`${FIELD} py-2.5 font-mono text-[13px]`}
+                  />
+                </Field>
               ) : null}
-            </div>
-          ))}
-          {errors.verifier === undefined ? null : (
-            <p className="text-[12.5px] text-seal">{errors.verifier}</p>
-          )}
-          {form.verifier === "judge" ? (
-            <Field
-              label="Public criteria (JSON)"
-              id={fieldId("criteria")}
-              error={errors.criteria}
-              hint='Kind regex_cases, tests or rubric, with "has_heldout": false and "split": "winner_take_all".'
-            >
-              <textarea
-                id={fieldId("criteria")}
-                value={form.criteria}
-                rows={8}
-                spellCheck={false}
-                onChange={(event) => set("criteria", event.target.value)}
-                aria-invalid={errors.criteria !== undefined}
-                aria-describedby={described("criteria")}
-                className={`${FIELD} py-2.5 font-mono text-[13px]`}
-              />
-            </Field>
-          ) : null}
-        </fieldset>
+            </fieldset>
+          </>
+        ) : (
+          <p className="text-sm text-muted md:col-span-2">
+            Payment buys an API response on NEAR testnet. There is no Tender escrow, Judge check or
+            automatic refund.
+          </p>
+        )}
       </div>
       <div className="flex flex-wrap items-center gap-3">
         <button type="submit" aria-disabled={sending} className={PRIMARY}>
@@ -579,9 +633,8 @@ export function ServicesSection({ account, agents }: { account: string; agents: 
             Services
           </h2>
           <p className="max-w-2xl text-[14px] text-muted">
-            What your agents do for hire, at a fixed price. A hire is a task that only that agent
-            can enter. Your agent takes it only on the service's terms (the price, the token, who
-            checks the work and the windows), and skips one that does not match them.
+            Offer delivered work through escrow, or immediate paid API responses through x402. Each
+            service lists its price and payment mode.
           </p>
         </div>
         {editing === null ? (

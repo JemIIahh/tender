@@ -89,7 +89,9 @@ interface StoredRow {
   commit_secs: number;
   reveal_secs: number;
   pick_secs: number;
-  verifier: "hirer" | "judge";
+  verifier: "hirer" | "judge" | "none";
+  payment_mode: "escrow" | "x402";
+  x402: ServiceTerms["x402"];
   criteria: string | null;
   status: "active" | "paused";
 }
@@ -109,6 +111,8 @@ function fieldsOf(terms: ServiceTerms, status: "active" | "paused"): ServiceFiel
     revealSecs: terms.reveal_secs,
     pickSecs: terms.pick_secs,
     verifier: verification.kind,
+    paymentMode: terms.payment_mode ?? "escrow",
+    x402: terms.x402 ? JSON.stringify(terms.x402) : null,
     criteria:
       verification.kind === "judge"
         ? new TextDecoder().decode(canonicalJson(verification.criteria))
@@ -130,10 +134,14 @@ function termsOf(row: StoredRow): ServiceTerms {
     commit_secs: row.commit_secs,
     reveal_secs: row.reveal_secs,
     pick_secs: row.pick_secs,
+    payment_mode: row.payment_mode,
+    x402: row.x402,
     verification:
       row.verifier === "judge" && row.criteria !== null
         ? { kind: "judge", criteria: JSON.parse(row.criteria) }
-        : { kind: "hirer" },
+        : row.verifier === "none"
+          ? { kind: "none" }
+          : { kind: "hirer" },
   };
 }
 
@@ -171,6 +179,13 @@ export function serviceRoutes(
   function checkTerms(terms: ServiceTerms, agent: string): void {
     const problem = serviceTermsProblem(terms);
     if (problem !== null) badRequest(problem);
+    if (terms.payment_mode === "x402") {
+      if (deps.network !== "testnet" && deps.network !== "sandbox")
+        badRequest("x402 listings currently require NEAR testnet");
+      if (deps.network !== "sandbox" && !terms.x402?.endpoint.startsWith("https://"))
+        badRequest("public x402 endpoints require HTTPS");
+      return;
+    }
     for (const name of ["commit_secs", "reveal_secs", "pick_secs"] as const) {
       if (terms[name] < minWindowSecs) {
         badRequest(
@@ -231,6 +246,17 @@ export function serviceRoutes(
     return { service };
   }
 
+  const supportsPaidApis = (c: Context) => c.req.header("Tender-Service-Version") === "2";
+  const version = async (c: Context, next: () => Promise<void>) => {
+    c.header("Vary", "Tender-Service-Version", { append: true });
+    const requested = c.req.header("Tender-Service-Version");
+    if (requested !== undefined && requested !== "2")
+      return badRequest("unsupported Tender-Service-Version");
+    await next();
+  };
+  // Once: Hono's `/services/*` matches `/services` itself as well, so a second registration for
+  // `/services` would run this twice and list the header twice in `Vary`.
+  app.use("/services/*", version);
   app.get("/services", async (c) => {
     const q = c.req.query();
     const text = param(q.q)?.trim();
@@ -252,6 +278,7 @@ export function serviceRoutes(
     const page = await listServices(
       deps.db,
       {
+        escrowOnly: !supportsPaidApis(c),
         q: text,
         tag: parseTag(q.tag),
         provider: parseAccount("provider", q.provider),
@@ -278,7 +305,8 @@ export function serviceRoutes(
 
   app.get("/services/:id", async (c) => {
     const service = await getService(deps.db, idOf(c.req.param("id")), readers);
-    if (service === null) return notFound("no such service");
+    if (service === null || (!supportsPaidApis(c) && service.payment_mode === "x402"))
+      return notFound("no such service");
     const body: ServiceResponse = { service };
     return c.json(body);
   });
@@ -286,6 +314,8 @@ export function serviceRoutes(
   app.post("/services", requireAuth, perAccount, tooLarge, async (c) => {
     const provider = c.var.account;
     const { agent, ...terms } = await bodyOf(c, CreateServiceRequestSchema);
+    if (terms.payment_mode === "x402" && !supportsPaidApis(c))
+      return badRequest("x402 services require Tender-Service-Version: 2");
     checkTerms(terms, agent);
     await requireAgentOf(provider, agent, true);
     const result = await insertService(
@@ -307,15 +337,19 @@ export function serviceRoutes(
     const id = idOf(c.req.param("id"));
     const [row] = await deps.db.query<StoredRow>(
       `select provider, agent, title, description, tags, category, output_format, token,
-              price::text as price, commit_secs, reveal_secs, pick_secs, verifier, criteria, status
+              price::text as price, commit_secs, reveal_secs, pick_secs, verifier, criteria, status, payment_mode, x402
          from services where id = $1::numeric`,
       [id],
     );
-    if (!row) return notFound("no such service");
+    if (!row || (!supportsPaidApis(c) && row.payment_mode === "x402"))
+      return notFound("no such service");
     if (row.provider !== c.var.account) {
       return fail(403, "not_provider", "only the provider that listed a service can change it");
     }
     const { status, ...changes } = await bodyOf(c, UpdateServiceRequestSchema);
+    if (changes.payment_mode !== undefined && changes.payment_mode !== row.payment_mode) {
+      return badRequest("payment mode is fixed: create another listing to change it");
+    }
     const terms: ServiceTerms = { ...termsOf(row), ...changes };
     const next = status ?? row.status;
     // A pause alone is never refused: a setting that changed since the terms were written (a Judge

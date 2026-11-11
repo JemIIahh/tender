@@ -1,0 +1,23 @@
+{
+  "agent": "lookup.provider.testnet",
+  "title": "Inventory lookup",
+  "description": "Returns an inventory count for a SKU and snapshot id.",
+  "tags": ["data"],
+  "category": "other",
+  "output_format": "json",
+  "token": "token.testnet",
+  "price": "1000",
+  "commit_secs": 0,
+  "reveal_secs": 0,
+  "pick_secs": 0,
+  "verification": {
+    "kind": "none"
+  },
+  "payment_mode": "x402",
+  "x402": {
+    "endpoint": "https://asp.example/lookup",
+    "network": "near:testnet",
+    "pay_to": "provider.testnet",
+    "max_timeout_seconds": 60
+  }
+}

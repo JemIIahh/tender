@@ -527,3 +527,86 @@ test("hire_agent_needs_max_price_and_the_judge_the_service_names", async () => {
   expect(k2.api.uploadBlob).not.toHaveBeenCalled();
   expect(k2.chain.postTask).not.toHaveBeenCalled();
 });
+
+test("escrow hiring refuses an x402 service before any upload or transaction", async () => {
+  const k = kit(service({ payment_mode: "x402" }));
+  const reply = await (await connect(k))("hire_agent", {
+    service_id: "7",
+    request: REQUEST,
+    max_price: PRICE,
+  });
+  expect(reply.isError).toBe(true);
+  expect(reply.text).toContain("X402_SERVICE");
+  expect(k.api.uploadBlob).not.toHaveBeenCalled();
+  expect(k.chain.postTask).not.toHaveBeenCalled();
+});
+
+test("purchase_service is disabled until the owner configures a payer and budget", async () => {
+  const k = kit(service({ payment_mode: "x402" }));
+  const reply = await (await connect(k))("purchase_service", {
+    service_id: "7",
+    request_id: "one",
+    input_json: "{}",
+    max_price: "1000",
+  });
+  expect(reply.isError).toBe(true);
+  expect(reply.text).toMatch(/not found|unknown tool/i);
+  expect(k.api.getService).not.toHaveBeenCalled();
+});
+
+test("purchase_service buys an API response within owner caps and never touches escrow", async () => {
+  const { createX402ServiceHandler } = await import("@tender/payments");
+  const listed = service({
+    payment_mode: "x402",
+    output_format: "json",
+    price: "1000",
+    verification: { kind: "none" },
+    commit_secs: 0,
+    reveal_secs: 0,
+    pick_secs: 0,
+    x402: {
+      endpoint: "https://asp.example/data",
+      network: "near:testnet",
+      pay_to: "acme.testnet",
+      max_timeout_seconds: 60,
+    },
+  });
+  const k = kit(listed);
+  const settle = vi.fn(async () => ({
+    success: true,
+    network: "near:testnet" as const,
+    payer: ACCOUNT,
+    transaction: "unit-test-receipt",
+  }));
+  const endpoint = createX402ServiceHandler({
+    service: listed,
+    stateFile: join(root, "seller-payments.json"),
+    facilitator: { verify: async () => ({ isValid: true, payer: ACCOUNT }), settle },
+    respond: async () => ({ result: "paid API data" }),
+  });
+  const call = await connect(k, {
+    x402Buyer: {
+      payer: ACCOUNT,
+      asset: USDC,
+      signer: { createSignedDelegateAction: async () => "unit-test-delegate" },
+      budgetFile: join(root, "buyer-budget.json"),
+      maxPerCall: "1000",
+      totalBudget: "1000",
+      allowedOrigins: ["https://asp.example"],
+      fetch: async (url, init) => endpoint(new Request(url, init)),
+    },
+  });
+  const args = { service_id: "7", request_id: "one", input_json: "{}", max_price: "1000" };
+  const reply = await call("purchase_service", args);
+  expect(reply.isError).toBe(false);
+  expect(JSON.parse(reply.text).response_data).toEqual({ result: "paid API data" });
+  expect((await call("purchase_service", args)).isError).toBe(false);
+  expect(settle).toHaveBeenCalledTimes(1);
+  expect((await call("purchase_service", { ...args, max_price: "1001" })).text).toContain(
+    "X402_BUDGET",
+  );
+  expect((await call("purchase_service", { ...args, request_id: "two" })).isError).toBe(true);
+  expect(k.api.uploadBlob).not.toHaveBeenCalled();
+  expect(k.chain.postTask).not.toHaveBeenCalled();
+  expect(k.chain.balanceOf).not.toHaveBeenCalled();
+});

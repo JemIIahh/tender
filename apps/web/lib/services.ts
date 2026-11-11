@@ -11,6 +11,7 @@ import {
   ServiceTitleSchema,
   serviceTermsProblem,
   tokenMeta,
+  X402ServiceConfigSchema,
 } from "@tender/shared";
 import { CATEGORIES, type Category, parseTags, spanText } from "./briefTerms";
 import { config } from "./config";
@@ -22,13 +23,16 @@ import { readAmount } from "./vault";
 // which the API holds too; this only puts it in words for the form.
 
 /** How a service is checked, in two or three words. */
-export function checkedBy(service: Pick<Service, "verification">): string {
+export function checkedBy(service: Pick<Service, "verification" | "payment_mode">): string {
+  if (service.payment_mode === "x402") return "x402 paid API";
   return service.verification.kind === "judge" ? "Tender Judge checks" : "You accept the work";
 }
 
 /** How a service is checked, in a sentence. */
-export function checkedSentence(service: Pick<Service, "verification">): string {
+export function checkedSentence(service: Pick<Service, "verification" | "payment_mode">): string {
   const { verification } = service;
+  if (verification.kind === "none")
+    return "Payment buys an immediate API response. Tender does not judge the response or hold the price in escrow.";
   if (verification.kind === "hirer") {
     return "You check the work yourself: once it is revealed, you pick it to pay the agent, or pick nobody.";
   }
@@ -37,12 +41,17 @@ export function checkedSentence(service: Pick<Service, "verification">): string 
 }
 
 /** How soon a hire's work is delivered: the end of its entry window, as a card says it. */
-export function deliveredLine(service: Pick<Service, "commit_secs">): string {
+export function deliveredLine(service: Pick<Service, "commit_secs" | "payment_mode">): string {
+  // An x402 API answers the call itself; the card's chip already says "x402 paid API".
+  if (service.payment_mode === "x402") return "Answers at once";
   return `Delivered within ${spanText(service.commit_secs)}`;
 }
 
 /** The windows of a hire in a line: `Delivered within 10m · Revealed 5m · Picked 10m`. */
-export function windowsLine(service: Pick<Service, "commit_secs" | "reveal_secs" | "pick_secs">) {
+export function windowsLine(
+  service: Pick<Service, "commit_secs" | "reveal_secs" | "pick_secs" | "payment_mode">,
+) {
+  if (service.payment_mode === "x402") return "Answers at once";
   return `Delivered within ${spanText(service.commit_secs)} · Revealed ${spanText(service.reveal_secs)} · Picked ${spanText(service.pick_secs)}`;
 }
 
@@ -74,6 +83,9 @@ export const SERVICE_FORMAT_LABEL: Record<string, string> = {
 
 /** The provider's form, as it is typed. Windows are whole minutes. */
 export interface ServiceForm {
+  paymentMode?: "escrow" | "x402";
+  endpoint?: string;
+  payTo?: string;
   agent: string;
   title: string;
   description: string;
@@ -131,6 +143,9 @@ export function formOfService(service: Service): ServiceForm {
   const unit = 10n ** BigInt(decimals);
   const fraction = (whole % unit).toString().padStart(decimals, "0").replace(/0+$/, "");
   return {
+    paymentMode: service.payment_mode ?? "escrow",
+    endpoint: service.x402?.endpoint ?? "",
+    payTo: service.x402?.pay_to ?? "",
     agent: service.agent,
     title: service.title,
     description: service.description,
@@ -147,7 +162,7 @@ export function formOfService(service: Service): ServiceForm {
       reveal: { minutes: String(Math.ceil(service.reveal_secs / 60)), secs: service.reveal_secs },
       pick: { minutes: String(Math.ceil(service.pick_secs / 60)), secs: service.pick_secs },
     },
-    verifier: service.verification.kind,
+    verifier: service.verification.kind === "judge" ? "judge" : "hirer",
     criteria:
       service.verification.kind === "judge"
         ? JSON.stringify(service.verification.criteria, null, 2)
@@ -210,6 +225,22 @@ export function checkServiceForm(form: ServiceForm, minWindowSecs: number): Serv
   }
   const price = readAmount(form.price, form.token, null, "vault");
   if (!price.ok) errors.price = price.message;
+  if (form.paymentMode === "x402") {
+    const parsed = X402ServiceConfigSchema.safeParse({
+      endpoint: form.endpoint,
+      network: "near:testnet",
+      pay_to: form.payTo,
+      max_timeout_seconds: 60,
+    });
+    if (!parsed.success) {
+      for (const issue of parsed.error.issues) {
+        if (issue.path[0] === "pay_to")
+          errors.payTo = "Enter the NEAR account that receives payment.";
+        else errors.endpoint = "Enter the HTTPS URL of your paid API.";
+      }
+    }
+    return errors;
+  }
   for (const [window, key, label] of [
     ["commit", "commitMinutes", "delivery"],
     ["reveal", "revealMinutes", "reveal"],
@@ -258,6 +289,16 @@ export function serviceRequestOf(form: ServiceForm): CreateServiceRequest {
   if (!price.ok) throw new RangeError(price.message);
   const criteria = form.verifier === "judge" ? criteriaOf(form.criteria) : null;
   const parsed = CreateServiceRequestSchema.safeParse({
+    payment_mode: form.paymentMode ?? "escrow",
+    x402:
+      form.paymentMode === "x402"
+        ? {
+            endpoint: form.endpoint,
+            network: "near:testnet",
+            pay_to: form.payTo,
+            max_timeout_seconds: 60,
+          }
+        : null,
     agent: form.agent,
     title: form.title,
     description: form.description,
@@ -266,10 +307,15 @@ export function serviceRequestOf(form: ServiceForm): CreateServiceRequest {
     output_format: form.outputFormat,
     token: form.token,
     price: price.amount.toString(),
-    commit_secs: windowSecsOf(form, "commit"),
-    reveal_secs: windowSecsOf(form, "reveal"),
-    pick_secs: windowSecsOf(form, "pick"),
-    verification: criteria === null ? { kind: "hirer" } : { kind: "judge", criteria },
+    commit_secs: form.paymentMode === "x402" ? 0 : windowSecsOf(form, "commit"),
+    reveal_secs: form.paymentMode === "x402" ? 0 : windowSecsOf(form, "reveal"),
+    pick_secs: form.paymentMode === "x402" ? 0 : windowSecsOf(form, "pick"),
+    verification:
+      form.paymentMode === "x402"
+        ? { kind: "none" }
+        : criteria === null
+          ? { kind: "hirer" }
+          : { kind: "judge", criteria },
   });
   if (!parsed.success) throw new RangeError(parsed.error.issues[0]?.message ?? "not a service");
   return parsed.data;

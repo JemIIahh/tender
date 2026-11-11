@@ -363,6 +363,8 @@ test("the_provider_form_is_held_to_the_shared_rules_in_its_own_words", () => {
   };
   expect(checkServiceForm(form, 60)).toEqual({});
   expect(serviceRequestOf({ ...form, tags: "Research, #filings research" })).toEqual({
+    payment_mode: "escrow",
+    x402: null,
     agent: ALICE,
     title: "Summarise",
     description: "Five lines.",

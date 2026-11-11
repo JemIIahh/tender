@@ -819,6 +819,163 @@ test("every_kind_of_failure_is_retried", async () => {
   }
 });
 
+test("access_errors_back_off_and_recover_automatically_without_skipping", async () => {
+  for (const status of [401, 402, 403]) {
+    fakeClock();
+    let failing = true;
+    const lines: string[] = [];
+    const server = fakeServer(({ path }) =>
+      path === FINAL
+        ? json(chainBlock(11))
+        : failing
+          ? failure(status)
+          : json(chainBlock(heightOf(path))),
+    );
+    const { ctrl, heights, finished } = run(
+      source(server, { concurrency: 1, log: (line) => lines.push(line) }),
+      10n,
+    );
+    await settle();
+    await tick(59999);
+    expect(server.count(blockPath(10))).toBe(1);
+    expect(heights).toEqual([]);
+    failing = false;
+    await tick(1);
+    await settle();
+    expect(heights).toEqual([10, 11]);
+    expect(server.count(blockPath(10))).toBe(2);
+    expect(lines.some((line) => line.includes(`WARN neardata: HTTP ${status}`))).toBe(true);
+    ctrl.abort();
+    await finished;
+    vi.useRealTimers();
+  }
+});
+
+test("one_burst_of_access_errors_is_one_backoff_step_at_the_default_concurrency", async () => {
+  // During catch-up 4 requests are in flight together. When they all get a 403, that is one burst:
+  // the first wait is 60 s, not one doubling per request (60, 120, 240, 480 s). The next burst
+  // doubles it, and a request that gets through ends the backoff.
+  fakeClock();
+  let failing = true;
+  const lines: string[] = [];
+  const server = fakeServer(({ path }) =>
+    path === FINAL
+      ? json(chainBlock(20))
+      : failing
+        ? failure(403)
+        : json(chainBlock(heightOf(path))),
+  );
+  const { ctrl, heights, finished } = run(source(server, { log: (line) => lines.push(line) }), 10n);
+  const warnings = () => lines.filter((line) => line.startsWith("WARN neardata: HTTP 403"));
+  const blocksAsked = () => server.calls.filter((call) => call.path !== FINAL).length;
+  await settle();
+  expect(blocksAsked()).toBe(4);
+  expect(warnings()).toHaveLength(4);
+  expect(warnings().every((line) => line.includes("retrying after 60000 ms"))).toBe(true);
+
+  await tick(59_999);
+  expect(blocksAsked()).toBe(4);
+  // The second burst, after the first wait: one step more, 120 s.
+  await tick(1);
+  expect(blocksAsked()).toBe(8);
+  expect(warnings()).toHaveLength(8);
+  expect(
+    warnings()
+      .slice(4)
+      .every((line) => line.includes("retrying after 120000 ms")),
+  ).toBe(true);
+
+  failing = false;
+  await tick(119_999);
+  expect(blocksAsked()).toBe(8);
+  expect(heights).toEqual([]);
+  await tick(1);
+  expect(heights.slice(0, 4)).toEqual([10, 11, 12, 13]);
+  ctrl.abort();
+  await finished;
+});
+
+test("request_spacing_applies_across_concurrent_block_fetches", async () => {
+  fakeClock();
+  const server = fakeServer(({ path }) =>
+    json(path === FINAL ? chainBlock(13) : chainBlock(heightOf(path))),
+  );
+  const { ctrl, finished } = run(source(server, { minRequestIntervalMs: 100 }), 10n);
+  await settle();
+  expect(server.calls).toHaveLength(1);
+  // The final height takes two slots (neardata redirects it to the block): block 10 at 200.
+  await tick(199);
+  expect(server.calls).toHaveLength(1);
+  await tick(1);
+  expect(server.calls).toHaveLength(2);
+  // Simulate a late event-loop turn. The overdue request starts at 500;
+  // the other queued requests must remain spaced instead of bursting together.
+  await tick(300);
+  expect(server.calls).toHaveLength(3);
+  await tick(99);
+  expect(server.calls).toHaveLength(3);
+  await tick(1);
+  await tick(100);
+  expect(server.calls.slice(0, 5).map((call) => call.at - (server.calls[0]?.at ?? 0))).toEqual([
+    0, 200, 500, 600, 700,
+  ]);
+  ctrl.abort();
+  await finished;
+});
+
+test("a_final_height_poll_takes_two_slots_and_a_followed_redirect_one_more", async () => {
+  // Neardata answers the final height with a redirect to the block, which fetch follows: two HTTP
+  // requests, so the next request waits two slots. A block that fetch reached by a redirect (a
+  // skipped height can redirect to the next block) makes the next request wait one slot more.
+  fakeClock();
+  const redirected = (body: unknown) => {
+    const response = json(body);
+    Object.defineProperty(response, "redirected", { value: true });
+    return response;
+  };
+  const server = fakeServer(({ path }) =>
+    path === FINAL
+      ? json(chainBlock(11))
+      : path === blockPath(10)
+        ? redirected(chainBlock(10))
+        : json(chainBlock(heightOf(path))),
+  );
+  const { ctrl, finished } = run(
+    source(server, { minRequestIntervalMs: 100, concurrency: 1, pollMs: 0 }),
+    10n,
+  );
+  for (let ms = 0; ms < 800; ms += 50) await tick(50);
+  const start = server.calls[0]?.at ?? 0;
+  expect(server.calls.slice(0, 5).map((call) => [call.path, call.at - start])).toEqual([
+    [FINAL, 0],
+    [blockPath(10), 200],
+    [blockPath(11), 400],
+    [FINAL, 500],
+    [FINAL, 700],
+  ]);
+  ctrl.abort();
+  await finished;
+});
+
+test("without_a_key_a_caught_up_source_stays_under_the_public_limit", async () => {
+  // The services' keyless spacing (400 ms) for a whole minute, caught up, polling as fast as it
+  // may: each poll is two HTTP requests at neardata, and the total is 150 a minute (151 counting
+  // the one that starts the minute), under the 180 a minute per IP that the public feed allows.
+  // Counted as one request each, the polls would come every 400 ms: 300 requests.
+  fakeClock();
+  const server = fakeServer(({ path }) =>
+    json(path === FINAL ? chainBlock(10) : chainBlock(heightOf(path))),
+  );
+  const { ctrl, finished } = run(source(server, { minRequestIntervalMs: 400, pollMs: 0 }), 10n);
+  for (let ms = 0; ms < 60_000; ms += 100) await tick(100);
+  const polls = server.calls.filter((call) => call.path === FINAL).length;
+  const requests = 2 * polls + (server.calls.length - polls);
+  expect(requests).toBeLessThanOrEqual(151);
+  expect(requests).toBeGreaterThanOrEqual(145);
+  ctrl.abort();
+  await finished;
+});
+
 test("reports_each_failed_attempt_to_log", async () => {
   fakeClock();
   const lines: string[] = [];

@@ -83,6 +83,8 @@ export function termsChanged(shown: Service, now: Service): boolean {
   const judgeOf = (service: Service) =>
     service.verification.kind === "judge" ? service.verification.judge : null;
   return (
+    shown.payment_mode !== now.payment_mode ||
+    JSON.stringify(shown.x402) !== JSON.stringify(now.x402) ||
     shown.price !== now.price ||
     shown.token !== now.token ||
     shown.commit_secs !== now.commit_secs ||
@@ -155,10 +157,12 @@ export function hirePlan(data: VaultData, service: Pick<Service, "token" | "pric
  * poster that invites itself, and the page can name the Judge only if it was built with its account.
  */
 export function hireBlocker(
-  service: Pick<Service, "available" | "status" | "agent" | "verification">,
+  service: Pick<Service, "available" | "status" | "agent" | "verification" | "payment_mode">,
   account: string | null,
   judgeAccount: string | null = config.judgeAccount,
 ): string | null {
+  if (service.payment_mode === "x402")
+    return "Agents buy this API through Tender's MCP server, with the purchase_service tool. It is not an escrow hire.";
   if (!service.available) {
     if (service.status === "paused") {
       return "The provider has paused this service. It can't be hired now.";

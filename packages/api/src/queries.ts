@@ -189,7 +189,7 @@ function hireSql(hirerAccepts: string): string {
       and (t.criteria_hash = ${hirerAccepts}
         or exists (select 1 from services s
                     where s.agent = t.invited ->> 0
-                      and s.verifier = 'judge'
+                      and s.payment_mode = 'escrow' and s.verifier = 'judge'
                       and s.criteria is not null
                       and encode(sha256(convert_to(s.criteria, 'UTF8')), 'hex') = t.criteria_hash)))`;
 }
@@ -593,7 +593,9 @@ interface ServiceRow {
   commit_secs: number;
   reveal_secs: number;
   pick_secs: number;
-  verifier: "hirer" | "judge";
+  verifier: "hirer" | "judge" | "none";
+  payment_mode: "escrow" | "x402";
+  x402: Service["x402"];
   criteria: string | null;
   status: Service["status"];
   created_at: Date;
@@ -617,6 +619,8 @@ function serviceColumns(team: string): string {
     s.reveal_secs,
     s.pick_secs,
     s.verifier,
+    s.payment_mode,
+    s.x402,
     s.criteria,
     s.status,
     s.created_at,
@@ -665,8 +669,10 @@ function serviceOf(
           criteria_hash: sha256Hex(row.criteria),
           judge: judgeAccount,
         }
-      : { kind: "hirer" };
-  const checkable = verification.kind === "hirer" || judgeAccount !== null;
+      : row.verifier === "none"
+        ? { kind: "none" }
+        : { kind: "hirer" };
+  const checkable = verification.kind !== "judge" || judgeAccount !== null;
   return {
     id: row.id,
     provider: row.provider,
@@ -682,6 +688,8 @@ function serviceOf(
     reveal_secs: row.reveal_secs,
     pick_secs: row.pick_secs,
     verification,
+    payment_mode: row.payment_mode,
+    x402: row.x402,
     status: row.status,
     available: row.status === "active" && canTakeHires(agent) && checkable,
     is_team: row.is_team,
@@ -707,6 +715,7 @@ async function servicesOf(db: Db, rows: ServiceRow[], r: ServiceReaders): Promis
 }
 
 export interface ServiceFilter {
+  escrowOnly?: boolean;
   /** Words the title or the description contains, case aside: 1 to 80 characters. */
   q?: string;
   tag?: string;
@@ -732,7 +741,7 @@ function availableSql(judgeAccount: string | null): string {
   return `(s.status = 'active'
       and exists (select 1 from agents a
                    where a.account = s.agent and a.status = 'active' and a.bond_amount is not null)
-      ${judgeAccount === null ? "and s.verifier = 'hirer'" : ""})`;
+      ${judgeAccount === null ? "and s.verifier in ('hirer', 'none')" : ""})`;
 }
 
 /** `text` for a `like` pattern that matches it as it is: `\`, `%` and `_` are escaped. */
@@ -754,6 +763,7 @@ export async function listServices(
   const p = new SqlParams();
   const teamP = p.add([...r.teamAccounts]);
   const where: string[] = [];
+  if (f.escrowOnly) where.push("s.payment_mode = 'escrow'");
   if (f.status === "available") where.push(availableSql(r.judgeAccount));
   if (f.q !== undefined) {
     const pattern = p.add(`%${likeEscaped(f.q)}%`);

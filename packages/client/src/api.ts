@@ -268,6 +268,12 @@ function post(signal: AbortSignal, token?: string, body?: unknown): RequestInit 
   };
 }
 
+function serviceRequest(init: RequestInit): RequestInit {
+  const headers = new Headers(init.headers);
+  headers.set("Tender-Service-Version", "2");
+  return { ...init, headers };
+}
+
 function isUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
 }
@@ -540,7 +546,7 @@ export class ApiClient implements TenderApi {
       fetchJson(
         this.url(`/services${query}`),
         ListServicesResponseSchema,
-        get(signal),
+        serviceRequest(get(signal)),
         this.fetchImpl,
       ),
     );
@@ -549,7 +555,12 @@ export class ApiClient implements TenderApi {
   getService(id: bigint): Promise<ServiceResponse | null> {
     return orNull(
       this.timed("getService", (signal) =>
-        fetchJson(this.url(`/services/${id}`), ServiceResponseSchema, get(signal), this.fetchImpl),
+        fetchJson(
+          this.url(`/services/${id}`),
+          ServiceResponseSchema,
+          serviceRequest(get(signal)),
+          this.fetchImpl,
+        ),
       ),
     );
   }
@@ -671,7 +682,7 @@ export class ApiClient implements TenderApi {
       fetchJson(
         this.url("/services"),
         ServiceResponseSchema,
-        post(signal, token, service),
+        serviceRequest(post(signal, token, service)),
         this.fetchImpl,
       ),
     );
@@ -682,7 +693,7 @@ export class ApiClient implements TenderApi {
       fetchJson(
         this.url(`/services/${id}`),
         ServiceResponseSchema,
-        post(signal, token, update),
+        serviceRequest(post(signal, token, update)),
         this.fetchImpl,
       ),
     );

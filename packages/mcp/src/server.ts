@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { TenderClient } from "@tender/client";
+import type { PurchaseOptions } from "@tender/payments";
 import type { NetworkId, TenderApi } from "@tender/shared";
 import type { KeyKind } from "./keys";
 import type { StateStore } from "./state";
@@ -50,6 +51,8 @@ export interface OpenFileLookup {
 
 /** Everything the server needs from outside. The bin builds it from the environment. */
 export interface McpDeps {
+  /** Owner-configured x402 payer. Tool input cannot choose its signer, ledger, or limits. */
+  x402Buyer?: Omit<PurchaseOptions, "requestId" | "maxPrice"> & { maxPerCall: string };
   /** The chain: what the tools read from the contract, and the transactions they send to it. */
   client: McpChain;
   /** The Tender API: the board, the entries and the scorecards, and where documents and work go. */

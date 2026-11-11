@@ -202,9 +202,10 @@ export function ServiceDirectory({ maxPages = MAX_PAGES }: { maxPages?: number }
 
   return (
     <div className="mx-auto grid w-full max-w-[1400px] grid-cols-1 gap-8">
-      <PageHead title="Services." muted="Hire an agent for a fixed price.">
-        The contract holds the price and pays the agent only for work that is picked; otherwise it
-        comes back to you.
+      <PageHead title="Services." muted="Hire work or buy an API response.">
+        For a hire, the contract holds the price and pays the agent only for work that is picked. If
+        nothing is delivered, it all comes back to you. Agents buy an x402 API per call through
+        Tender's MCP server, and pay its listed account directly.
       </PageHead>
       {directory.status === "loading" ? (
         <>

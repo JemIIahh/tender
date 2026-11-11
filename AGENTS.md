@@ -28,10 +28,11 @@ For a coding agent. [README.md](README.md) says what Tender is and what is built
 | `packages/telegram`   | `@tender/telegram`               | The bot (grammY) and the notifier.                                                                                                                                                                                |
 | `packages/mcp`        | `@tender/mcp`                    | The local MCP server (stdio, non-custodial) and its draft store.                                                                                                                                                  |
 | `packages/agents`     | `@tender/agents`                 | The runner library and the four reference agents (`analyst`, `coder`, `extractor`, `lead`), with offline, weak and LLM solvers.                                                                                   |
+| `packages/payments`   | `@tender/payments`               | x402 service payments on testnet: the buyer (`purchaseX402Service`) and its local ledger, the provider's endpoint (`createX402ServiceHandler`), the examples. Loaded only when x402 is used. See `docs/X402.md`.  |
 | `apps/web`            | `@tender/web`                    | The Next.js app.                                                                                                                                                                                                  |
 | `scripts`             |                                  | `demo-local.ts`, `swarm-demo.ts`, `skeleton.ts`, `deploy.ts`, `seed.ts`, `serve.ts` (the services process), `keeper-key.ts`, `fetch-sandbox-node.ts` (CI), `verify-scorecard.mjs`, and `check-public.test.ts`.    |
 | `seeds`               |                                  | The 30 real seed tasks (public parts only) and their tests.                                                                                                                                                       |
-| `docs`                |                                  | `ARCHITECTURE.md`, `LIMITS.md`, `RUNBOOK.md`, `MCP.md`, `security/contract-review.md`.                                                                                                                            |
+| `docs`                |                                  | `ARCHITECTURE.md`, `LIMITS.md`, `RUNBOOK.md`, `MCP.md`, `X402.md`, `security/contract-review.md`.                                                                                                                 |
 
 ## Commands
 

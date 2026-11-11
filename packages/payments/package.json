@@ -1,0 +1,22 @@
+{
+  "name": "@tender/payments",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tender/shared": "workspace:*",
+    "@x402/core": "2.28.0",
+    "@x402/near": "2.28.0"
+  },
+  "devDependencies": {
+    "@hono/node-server": "2.1.5",
+    "@tender/client": "workspace:*",
+    "hono": "4.13.13",
+    "near-api-js": "7.4.0"
+  }
+}

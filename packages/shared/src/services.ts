@@ -97,7 +97,30 @@ const PriceSchema = U128StringSchema.refine(
 );
 
 /** A window in seconds, within the contract's cap; the network's shortest is the API's to check. */
-const WindowSecsSchema = z.int().min(1).max(SERVICE_MAX_WINDOW_SECS);
+const WindowSecsSchema = z.int().min(0).max(SERVICE_MAX_WINDOW_SECS);
+
+/** Immediate paid APIs currently settle only on NEAR testnet. No Tender vault is used. */
+export const X402ServiceConfigSchema = z.strictObject({
+  endpoint: z
+    .url()
+    .max(2048)
+    .refine((value) => {
+      try {
+        const url = new URL(value);
+        const local =
+          url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
+        return (url.protocol === "https:" || local) && !url.username && !url.password && !url.hash;
+      } catch {
+        return false;
+      }
+    }, "expected HTTPS (or loopback HTTP for sandbox), without credentials or a fragment")
+    .transform((value) => new URL(value).href),
+  network: z.literal("near:testnet"),
+  pay_to: AccountIdSchema,
+  max_timeout_seconds: z.int().min(10).max(300),
+});
+export type X402ServiceConfig = z.infer<typeof X402ServiceConfigSchema>;
+export const ServicePaymentModeSchema = z.enum(["escrow", "x402"]);
 
 export const ServiceStatusSchema = z.enum(["active", "paused"]);
 export type ServiceStatus = z.infer<typeof ServiceStatusSchema>;
@@ -108,6 +131,7 @@ export type ServiceStatus = z.infer<typeof ServiceStatusSchema>;
  * a service can use is `verificationProblem`'s.
  */
 export const ServiceVerificationSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("none") }),
   z.strictObject({ kind: z.literal("hirer") }),
   z.strictObject({ kind: z.literal("judge"), criteria: PublicCriteriaSchema }),
 ]);
@@ -126,6 +150,8 @@ const termFields = {
   reveal_secs: WindowSecsSchema,
   pick_secs: WindowSecsSchema,
   verification: ServiceVerificationSchema,
+  payment_mode: ServicePaymentModeSchema.optional(),
+  x402: X402ServiceConfigSchema.nullable().optional(),
 };
 
 /** Everything a service's terms hold, once each field is checked. */
@@ -146,9 +172,27 @@ export type ServiceTerms = z.infer<z.ZodObject<typeof termFields>>;
  *   `tests`, and text or JSON for a `rubric`.
  */
 export function serviceTermsProblem(
-  terms: Pick<ServiceTerms, "verification" | "output_format">,
+  terms: Pick<ServiceTerms, "verification" | "output_format" | "payment_mode" | "x402"> &
+    Partial<Pick<ServiceTerms, "commit_secs" | "reveal_secs" | "pick_secs">>,
 ): string | null {
   const { verification, output_format } = terms;
+  if (terms.payment_mode === "x402") {
+    if (output_format !== "json")
+      return "x402 API services return JSON: output_format must be json";
+    if (!terms.x402) return "an x402 service needs its endpoint and settlement terms";
+    if (verification.kind !== "none") return "x402 responses have no Tender verifier";
+    if ([terms.commit_secs, terms.reveal_secs, terms.pick_secs].some((v) => v !== 0)) {
+      return "x402 services have no commit, reveal or pick windows";
+    }
+    return null;
+  }
+  if (terms.x402 != null) return "an escrow service cannot carry x402 settlement terms";
+  if (verification.kind === "none") return "an escrow service needs a hirer or Judge verifier";
+  if (
+    [terms.commit_secs, terms.reveal_secs, terms.pick_secs].some((v) => v !== undefined && v < 1)
+  ) {
+    return "escrow windows must be above zero";
+  }
   if (verification.kind === "hirer") return null;
   const criteria = verification.criteria;
   if (criteria.has_heldout) {
@@ -206,10 +250,12 @@ export const UpdateServiceRequestSchema = z
     output_format: termFields.output_format.optional(),
     token: termFields.token.optional(),
     price: termFields.price.optional(),
-    commit_secs: termFields.commit_secs.optional(),
-    reveal_secs: termFields.reveal_secs.optional(),
-    pick_secs: termFields.pick_secs.optional(),
-    verification: termFields.verification.optional(),
+    commit_secs: WindowSecsSchema.optional(),
+    reveal_secs: WindowSecsSchema.optional(),
+    pick_secs: WindowSecsSchema.optional(),
+    verification: ServiceVerificationSchema.optional(),
+    payment_mode: ServicePaymentModeSchema.optional(),
+    x402: X402ServiceConfigSchema.nullable().optional(),
     status: ServiceStatusSchema.optional(),
   })
   .refine((update) => Object.keys(update).length > 0, "expected at least one field to change");
@@ -224,6 +270,7 @@ export type UpdateServiceRequest = z.infer<typeof UpdateServiceRequestSchema>;
  * API has none, and then the service cannot be hired.
  */
 export const ServiceVerificationViewSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("none") }),
   z.object({ kind: z.literal("hirer") }),
   z.object({
     kind: z.literal("judge"),
@@ -241,29 +288,46 @@ export type ServiceVerificationView = z.infer<typeof ServiceVerificationViewSche
  * that account. `available` says whether it can be hired now: the service is active, and its agent
  * is an active agent that holds a bond. `is_team` says the team runs the agent, or its provider.
  */
-export const ServiceSchema = z.object({
-  id: U64StringSchema,
-  provider: AccountIdSchema,
-  agent: AccountIdSchema,
-  title: z.string(),
-  description: z.string(),
-  tags: z.array(z.string()),
-  category: BriefSchema.shape.category,
-  output_format: BriefSchema.shape.output.shape.format,
-  token: AccountIdSchema,
-  price: U128StringSchema,
-  commit_secs: z.int(),
-  reveal_secs: z.int(),
-  pick_secs: z.int(),
-  verification: ServiceVerificationViewSchema,
-  status: ServiceStatusSchema,
-  available: z.boolean(),
-  is_team: z.boolean(),
-  /** ISO 8601 in UTC to the millisecond. */
-  created_at: z.iso.datetime(),
-  updated_at: z.iso.datetime(),
-  agent_record: AgentSummarySchema.nullable(),
-});
+export const ServiceSchema = z
+  .object({
+    id: U64StringSchema,
+    provider: AccountIdSchema,
+    agent: AccountIdSchema,
+    title: z.string(),
+    description: z.string(),
+    tags: z.array(z.string()),
+    category: BriefSchema.shape.category,
+    output_format: BriefSchema.shape.output.shape.format,
+    token: AccountIdSchema,
+    price: U128StringSchema,
+    commit_secs: z.int(),
+    reveal_secs: z.int(),
+    pick_secs: z.int(),
+    verification: ServiceVerificationViewSchema,
+    /** Omitted only by older APIs; omission means escrow. New APIs always return it. */
+    payment_mode: ServicePaymentModeSchema.optional(),
+    x402: X402ServiceConfigSchema.nullable().optional(),
+    status: ServiceStatusSchema,
+    available: z.boolean(),
+    is_team: z.boolean(),
+    /** ISO 8601 in UTC to the millisecond. */
+    created_at: z.iso.datetime(),
+    updated_at: z.iso.datetime(),
+    agent_record: AgentSummarySchema.nullable(),
+  })
+  .superRefine((service, ctx) => {
+    const paid = service.payment_mode === "x402";
+    if (
+      paid
+        ? serviceTermsProblem(service) !== null
+        : service.verification.kind === "none" || service.x402 != null
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "payment mode does not match the service terms",
+        path: ["payment_mode"],
+      });
+  });
 export type Service = z.infer<typeof ServiceSchema>;
 
 /** `GET /v1/services`, newest first. `next_cursor` is the last id of the page, null at the end. */
@@ -403,6 +467,7 @@ const NS_PER_SEC = 1_000_000_000n;
  */
 export function hireMismatch(task: HireTaskTerms, service: Service): string | null {
   const name = `service ${service.id}`;
+  if (service.payment_mode === "x402") return `${name} uses x402, not task escrow`;
   if (service.status !== "active") return `${name} is paused`;
   if (task.criteria_hash !== hireCriteriaHash(service)) {
     return `its criteria are not ${name}'s`;
@@ -452,6 +517,8 @@ export type HiredService = Pick<
   | "reveal_secs"
   | "pick_secs"
   | "verification"
+  | "payment_mode"
+  | "x402"
 >;
 
 /** A hire's two public documents, as the canonical bytes that are uploaded and hashed on chain. */
@@ -472,6 +539,8 @@ export interface HireDocuments {
  * service's `criteria_hash`), or `HIRER_ACCEPTS_CRITERIA`.
  */
 export function hireDocuments(service: HiredService, request: string): HireDocuments {
+  if (service.payment_mode === "x402")
+    throw new RangeError("use the x402 paid-request client, not escrow hiring");
   const words = HireRequestSchema.parse(request);
   const brief = BriefSchema.parse({
     version: 1,
@@ -522,6 +591,8 @@ export interface HireTerms {
  * must be set then and be the Judge the service names; a `RangeError` otherwise).
  */
 export function hireTerms(service: HiredService, judgeAccount: string | null): HireTerms {
+  if (service.payment_mode === "x402")
+    throw new RangeError("x402 services do not create escrow tasks");
   let verifier: string | undefined;
   if (service.verification.kind === "judge") {
     if (judgeAccount === null)

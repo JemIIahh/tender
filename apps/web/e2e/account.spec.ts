@@ -11,6 +11,7 @@ import {
   SCOUT,
 } from "./accountApi";
 import { routeApi } from "./fixtures";
+import { routeServices } from "./servicesApi";
 import { STUB_WALLET_NAME } from "./walletStub";
 
 // The account pages against the fixture API, a fixture node and an injected wallet that can make
@@ -29,10 +30,15 @@ const chainOf = (): AccountChain => ({
   },
 });
 
-async function openConnected(page: Page, path: string, options: { bonds?: boolean } = {}) {
+async function openConnected(
+  page: Page,
+  path: string,
+  options: { bonds?: boolean; services?: boolean } = {},
+) {
   await page.clock.install({ time: OPEN_AT });
   await routeApi(page);
   const api = await routeAccount(page, options);
+  if (options.services) await routeServices(page, []);
   const chain = chainOf();
   await routeAccountNode(page, chain);
   const wallet = await installAccountWallet(page, { account: OWNER, chain });
@@ -152,3 +158,45 @@ test("earnings_shows_the_wins_fees_and_net_and_where_posted_rewards_went", async
   await page.getByRole("tab", { name: "Transactions" }).click();
   await expectToFit(page, "/earnings?tab=transactions (phone)");
 });
+
+for (const width of [375, 1440]) {
+  test(`x402_provider_form_at_${width}px`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const { chain } = await openConnected(page, "/my-agents", { bonds: true, services: true });
+    chain.config = {
+      owner: "owner.testnet",
+      pending_owner: null,
+      treasury: "treasury.testnet",
+      fee_bps: 500,
+      min_window_secs: 60,
+      max_window_secs: 1209600,
+      paused: false,
+      version: 1,
+      tokens: [
+        {
+          token: "tusdc.tender-team.testnet",
+          min_reward: "1",
+          max_reward: "1000000000000",
+          enabled: true,
+        },
+      ],
+      agent_bond_token: "tusdc.tender-team.testnet",
+      agent_bond_amount: "5000000",
+      agent_bond_cooldown_secs: "604800",
+    };
+    await page.getByRole("button", { name: "List a service", exact: true }).click();
+    const editor = page.getByTestId("service-editor");
+    await editor.getByLabel("Payment mode").selectOption("x402");
+    await expect(editor.getByLabel("Paid API endpoint")).toBeVisible();
+    await expect(editor.getByLabel("Receive payments at")).toBeVisible();
+    await expect(editor.getByRole("radio")).toHaveCount(0);
+    await editor.getByLabel("Paid API endpoint").fill("https://asp.example/inventory");
+    await editor.getByLabel("Receive payments at").fill(OWNER);
+    await expect(editor.getByText(/Couldn.t|returned something other/)).toHaveCount(0);
+    await expectToFit(page, "x402 provider form");
+    await page.screenshot({
+      path: testInfo.outputPath(`x402-provider-${width}.png`),
+      fullPage: true,
+    });
+  });
+}

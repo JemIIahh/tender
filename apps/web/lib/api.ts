@@ -127,8 +127,13 @@ function notAnId(call: string, what: string, value: unknown): never {
 function get<T>(path: string, schema: Schema<T>, query?: Query, token?: string): Promise<T> {
   const headers: Record<string, string> = {};
   if (token !== undefined) headers.Authorization = `Bearer ${token}`;
+  if (/^\/services(?:\/|$)/.test(path)) headers["Tender-Service-Version"] = "2";
   return withTimeout(READ_TIMEOUT_MS, (signal) =>
-    fetchJson(url(path, query), schema, token === undefined ? { signal } : { signal, headers }),
+    fetchJson(
+      url(path, query),
+      schema,
+      Object.keys(headers).length === 0 ? { signal } : { signal, headers },
+    ),
   );
 }
 
@@ -142,6 +147,7 @@ function post<T>(
 ): Promise<T> {
   const headers: Record<string, string> = {};
   if (token !== undefined) headers.Authorization = `Bearer ${token}`;
+  if (/^\/services(?:\/|$)/.test(path)) headers["Tender-Service-Version"] = "2";
   if (body !== undefined) headers["Content-Type"] = "application/json";
   return withTimeout(WRITE_TIMEOUT_MS, (signal) =>
     fetchJson(url(path), schema, {

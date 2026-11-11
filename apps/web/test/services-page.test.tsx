@@ -87,6 +87,25 @@ const JUDGED = service({
   agent_record: agent({ account: "scout.tender-team.testnet", wins: 31, earned: {} }),
 });
 
+/** An x402 listing: a paid API that agents buy through the MCP server, with no escrow. */
+const PAID = service({
+  id: "9",
+  title: "Inventory API",
+  payment_mode: "x402",
+  output_format: "json",
+  price: "1000",
+  verification: { kind: "none" },
+  commit_secs: 0,
+  reveal_secs: 0,
+  pick_secs: 0,
+  x402: {
+    endpoint: "https://provider.example/inventory",
+    network: "near:testnet",
+    pay_to: "acme.testnet",
+    max_timeout_seconds: 60,
+  },
+});
+
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
 function fakeApi(handler: (url: URL) => Response | Promise<Response>) {
@@ -124,7 +143,7 @@ test("the_directory_shows_each_service_with_its_price_check_and_the_agents_recor
   expect(cards).toHaveLength(2);
   expect(calls).toEqual(["/v1/services?limit=50"]);
   expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
-    "Services. Hire an agent for a fixed price.",
+    "Services. Hire work or buy an API response.",
   );
   const [judged, hired] = cards as [HTMLElement, HTMLElement];
   expect(
@@ -154,6 +173,20 @@ test("the_directory_shows_each_service_with_its_price_check_and_the_agents_recor
   // The provider's words are text: markup in them is not read as markup.
   expect(hired.querySelector("b")).toBeNull();
   expect(hired.textContent).toContain("<b>and</b>");
+});
+
+test("an_x402_card_says_view_api_and_what_a_call_costs", async () => {
+  fakeApi(() => json({ services: [PAID, service()], next_cursor: null }));
+  render(<ServiceDirectory />);
+  const [paid] = (await screen.findAllByTestId("service-card")) as [HTMLElement];
+  expect(within(paid).getByTestId("service-checked").textContent).toBe("x402 paid API");
+  expect(within(paid).getByTestId("service-price").textContent).toBe("Price: 0.001 tUSDC");
+  expect(paid.textContent).toContain("/ call");
+  expect(paid.textContent).toContain("Answers at once");
+  expect(
+    within(paid).getByRole("link", { name: "View API: Inventory API" }).getAttribute("href"),
+  ).toBe("/services/9#hire");
+  expect(within(paid).queryByRole("link", { name: /^Hire/ })).toBeNull();
 });
 
 test("the_tag_and_the_search_narrow_the_list_and_live_in_the_address", async () => {
@@ -318,6 +351,34 @@ test("a_paused_service_and_one_whose_agent_left_cannot_be_hired", async () => {
     "isn't an active agent with a bond",
   );
   expect(screen.getByTestId("service-status").textContent).toBe("Not taking work");
+});
+
+test("an_x402_service_page_says_agents_buy_it_through_the_mcp_server_and_has_no_hire_form", async () => {
+  const paid = PAID;
+  const { calls } = fakeApi(() => json({ service: paid }));
+  const { unmount } = render(<ServiceView id="9" />);
+  const panel = within(await screen.findByRole("region", { name: "x402 paid API" }));
+  expect(panel.getByTestId("api-price").textContent).toBe("0.001 tUSDC / call · NEAR testnet");
+  expect(panel.getByTestId("api-notice").textContent).toBe(
+    "Agents buy this API through Tender's MCP server, with the purchase_service tool. Each call pays the price directly to the account below. Tender doesn't hold the payment or judge the answer.",
+  );
+  expect(panel.getByTestId("api-origin").textContent).toBe("https://provider.example");
+  expect(panel.getByRole("link", { name: "Set up the MCP server" }).getAttribute("href")).toBe(
+    "https://github.com/JemIIahh/tender/blob/main/docs/MCP.md",
+  );
+  // No hire form, no wallet, no escrow terms: nothing on the page signs or pays.
+  expect(panel.queryAllByRole("button")).toEqual([]);
+  expect(screen.queryByTestId("hire-price")).toBeNull();
+  expect(screen.queryByTestId("money-note")).toBeNull();
+  expect(screen.queryByTestId("service-checked-sentence")).toBeNull();
+  // The agent and its record are there, as on any service.
+  expect(screen.getByTestId("record-wins").textContent).toBe("9");
+  expect(calls).toEqual(["/v1/services/9"]);
+  unmount();
+
+  fakeApi(() => json({ service: { ...paid, available: false } }));
+  render(<ServiceView id="9" />);
+  expect(await screen.findByText("This service is not available for purchases.")).toBeTruthy();
 });
 
 test("an_unknown_service_is_not_found_and_an_id_that_is_none_is_not_asked_for", async () => {

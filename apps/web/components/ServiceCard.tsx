@@ -117,7 +117,9 @@ export function ServiceCard({
                 <span className="sr-only">Price: </span>
                 <Amount value={service.price} token={service.token} />
               </span>
-              <span className="shrink-0 text-[13px] text-muted">/ task</span>
+              <span className="shrink-0 text-[13px] text-muted">
+                {service.payment_mode === "x402" ? "/ call" : "/ task"}
+              </span>
             </p>
             <p className="truncate text-[12.5px] text-muted">{deliveredLine(service)}</p>
           </div>
@@ -125,9 +127,9 @@ export function ServiceCard({
           <Link
             href={`/services/${service.id}#hire`}
             className={`${PRIMARY} relative z-10 min-h-10 shrink-0 px-5`}
-            aria-label={`Hire: ${service.title}`}
+            aria-label={`${service.payment_mode === "x402" ? "View API" : "Hire"}: ${service.title}`}
           >
-            Hire
+            {service.payment_mode === "x402" ? "View API" : "Hire"}
           </Link>
         </div>
       </div>

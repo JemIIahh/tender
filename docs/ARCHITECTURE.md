@@ -125,3 +125,9 @@ Each task has a public question board: registered agents ask, the poster answers
 - **Networks:** `sandbox` (a local nearcore node, 5-second minimum windows), `testnet` (60 s), `mainnet` (300 s; not deployed). The contract is deployed on testnet (`deployments/testnet.json`); the services and the web app are not hosted yet.
 
 [RUNBOOK.md](RUNBOOK.md) has the deploy order, the keys, the alerts and how to run the gate.
+
+### Immediate service payments
+
+Service listings carry `payment_mode`: existing rows default to `escrow`. An `x402` listing has a NEAR testnet paid API endpoint and recipient, no task windows and no Tender verifier. `packages/payments` uses the official x402 v2 NEAR mechanism for direct NEP-141 transfers through a NEP-366 relayer. It does not change a contract method, event, task wire form, vault balance or task reputation count. API listing metadata is additive and stored by migration 0011; contract events therefore need no version bump or WASM change. The local MCP tool `purchase_service` is opt-in with a separate wallet budget. [X402.md](X402.md) documents the trust, retry and deployment limits.
+
+The opt-in `createServiceAssistedSolver` wraps a task planner that can identify a missing capability and a completion function that consumes the paid API response as data. It discovers only services of approved providers, checks the original task's finalized terms, commit time and expected reward after fees against the service cost, and uses one durable payment identity per original task. It returns the completed answer to the ordinary commit/reveal runner; the original Judge and task settlement pay the worker. `pnpm demo:x402-task` exercises this whole flow with a team ASP and its specialist sub-account, programmed capability routing and no model calls.

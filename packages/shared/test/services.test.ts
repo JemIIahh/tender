@@ -22,6 +22,7 @@ import {
   sha256Hex,
   UpdateServiceRequestSchema,
 } from "../src/index";
+import paidFixture from "./fixtures/service_x402.json";
 
 // The rules of a service and of a hire, which the API, the MCP server and the web app all take
 // from here, so that each makes the same documents and refuses the same terms.
@@ -365,4 +366,46 @@ test("the_board_text_keeps_its_rules_after_the_factory", () => {
   expect(over.success).toBe(false);
   expect(over.error?.issues[0]?.message).toBe("expected at most 1000 characters");
   expect(BoardTextSchema.parse("  hi  ")).toBe("hi");
+});
+
+test("x402 service terms have explicit verification and zero windows only", () => {
+  const paid = CreateServiceRequestSchema.parse(paidFixture);
+  expect(paid.verification).toEqual({ kind: "none" });
+  for (const changed of [
+    { payment_mode: "escrow" },
+    { verification: { kind: "hirer" } },
+    { commit_secs: 1 },
+    { output_format: "text" },
+    { x402: null },
+  ]) {
+    expect(CreateServiceRequestSchema.safeParse({ ...paidFixture, ...changed }).success).toBe(
+      false,
+    );
+  }
+  const { verification: _verification, ...missing } = paidFixture;
+  expect(CreateServiceRequestSchema.safeParse(missing).success).toBe(false);
+  expect(
+    CreateServiceRequestSchema.safeParse({
+      ...missing,
+      payment_mode: "escrow",
+      verification: { kind: "none" },
+      x402: null,
+      commit_secs: 600,
+      reveal_secs: 300,
+      pick_secs: 900,
+    }).success,
+  ).toBe(false);
+});
+test("escrow cannot carry payment terms and neither hire builder accepts x402", () => {
+  const { id: _id, provider: _provider, ...escrow } = SERVICE;
+  expect(CreateServiceRequestSchema.safeParse({ ...escrow, x402: paidFixture.x402 }).success).toBe(
+    false,
+  );
+  const paid: HiredService = {
+    ...SERVICE,
+    ...CreateServiceRequestSchema.parse(paidFixture),
+    verification: { kind: "none" },
+  };
+  expect(() => hireTerms(paid, null)).toThrow(/x402/);
+  expect(() => hireDocuments(paid, "Look up this stock")).toThrow(/x402/);
 });

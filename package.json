@@ -22,7 +22,11 @@
     "agent:connect": "tsx scripts/agent.ts connect",
     "serve": "tsx scripts/serve.ts",
     "deploy:testnet": "tsx scripts/deploy.ts --network testnet",
-    "deploy:mainnet": "tsx scripts/deploy.ts --network mainnet"
+    "deploy:mainnet": "tsx scripts/deploy.ts --network mainnet",
+    "demo:x402": "tsx scripts/demo-x402.ts",
+    "demo:x402-task": "tsx scripts/demo-x402-task.ts",
+    "demo:x402-llm": "tsx scripts/demo-x402-llm.ts",
+    "check:x402-facilitator": "tsx scripts/check-x402-facilitator.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.6.4",
@@ -39,6 +43,7 @@
     "near-api-js": "7.4.0",
     "tsx": "4.23.15",
     "typescript": "7.0.2",
-    "vitest": "5.0.5"
+    "vitest": "5.0.5",
+    "@tender/payments": "workspace:*"
   }
 }

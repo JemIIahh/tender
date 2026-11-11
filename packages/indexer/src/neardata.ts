@@ -16,6 +16,12 @@ export interface NeardataOptions {
    */
   fetchImpl?: typeof fetch;
   /**
+   * Minimum spacing between HTTP requests, shared across concurrent fetches, retries included. A
+   * final-height poll counts as two (neardata redirects it), and so does any other GET that `fetch`
+   * followed a redirect for. Default 0.
+   */
+  minRequestIntervalMs?: number;
+  /**
    * Told about each failed request just before it is tried again, about each block fetched again
    * because the block after it names it as its parent, and, in a line that has `WARN` in it, about
    * a block that does not follow the one yielded before it.
@@ -30,6 +36,12 @@ const REQUEST_TIMEOUT_MS = 10_000;
 /** The wait after a first failure. It doubles with each failure in a row, up to `LONGEST_WAIT_MS`. */
 const FIRST_WAIT_MS = 500;
 const LONGEST_WAIT_MS = 8000;
+/**
+ * The wait after a burst of access errors (HTTP 401, 402, 403), which every request then waits out.
+ * It doubles with each burst in a row, up to `ACCESS_LONGEST_WAIT_MS`.
+ */
+const ACCESS_FIRST_WAIT_MS = 60_000;
+const ACCESS_LONGEST_WAIT_MS = 600_000;
 
 /** What a fetch gives when the source was stopped before it could finish. */
 const STOPPED = Symbol("stopped");
@@ -55,6 +67,7 @@ type Stopped = typeof STOPPED;
  * below the last block yielded is yielded all the same, with a `WARN` to `log`: only a fork, or a
  * server that disagrees with itself, can cause that.
  *
+ * HTTP 401, 402 and 403 retry with a shared backoff from 60 seconds to 10 minutes.
  * Every other failure is retried, after a wait of 0.5, 1, 2, 4, 8, 8... s, for as long as `signal`
  * has not aborted: an HTTP error of any status, a network error, no answer in 10 s, an answer that
  * is not a block or not the block asked for. Not getting a block shows as lag, never as a gap.
@@ -68,11 +81,20 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
   const pollMs = opts.pollMs ?? DEFAULT_POLL_MS;
   const fetchImpl = opts.fetchImpl ?? fetch;
   const log = opts.log;
+  const minRequestIntervalMs = opts.minRequestIntervalMs ?? 0;
+  let nextRequestAt = 0;
+  let requestTurn = Promise.resolve();
+  let accessRetryAt = 0;
+  let accessFailures = 0;
+  let accessEpoch = 0;
   if (!Number.isInteger(concurrency) || concurrency < 1) {
     throw new RangeError(`concurrency must be a whole number of at least 1, got ${concurrency}`);
   }
   if (!Number.isFinite(pollMs) || pollMs < 0) {
     throw new RangeError(`pollMs must be 0 or more, got ${pollMs}`);
+  }
+  if (!Number.isFinite(minRequestIntervalMs) || minRequestIntervalMs < 0) {
+    throw new RangeError("minRequestIntervalMs must be finite and nonnegative");
   }
   const headers: Record<string, string> = opts.apiKey
     ? { Authorization: `Bearer ${opts.apiKey}` }
@@ -81,21 +103,78 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
   /**
    * The JSON body of `GET url`. Throws on a status that is not 2xx, a body that is not JSON, and
    * no answer in time.
+   *
+   * `hops` is how many HTTP requests the GET is expected to take, as `fetch` follows a redirect on
+   * its own: 2 for the final height, which neardata answers with a redirect to the block. With
+   * `minRequestIntervalMs`, the GET takes that many slots of the gate, and a redirect it was not
+   * counted for (a skipped height can redirect to the next block) takes one more after it.
    */
-  async function getJson(url: string, stop: AbortSignal): Promise<unknown> {
+  async function getJson(url: string, stop: AbortSignal, hops = 1): Promise<unknown> {
     // This request's own signal: aborted when the source is stopped, or when the time is up.
     const request = new AbortController();
     const abort = () => request.abort();
     stop.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(abort, REQUEST_TIMEOUT_MS);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      // An access error (401, 402, 403) holds every request until its backoff is over.
+      if (accessRetryAt > Date.now()) await sleep(accessRetryAt - Date.now(), stop);
+      if (minRequestIntervalMs > 0) {
+        // Serialize admission, not the network reads: a late event-loop turn
+        // must not release all the scheduled requests as one burst.
+        const preceding = requestTurn;
+        let release = () => {};
+        requestTurn = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        await preceding;
+        try {
+          // Again after each wait: a redirect counted after its request can move the slot on.
+          while (nextRequestAt > Date.now() && !stop.aborted) {
+            await sleep(nextRequestAt - Date.now(), stop);
+          }
+          nextRequestAt = Date.now() + hops * minRequestIntervalMs;
+        } finally {
+          release();
+        }
+        if (accessRetryAt > Date.now()) await sleep(accessRetryAt - Date.now(), stop);
+      }
+      if (stop.aborted) throw new Error("source stopped");
+      // The burst this request belongs to: the access errors counted so far.
+      const attemptEpoch = accessEpoch;
+      timer = setTimeout(abort, REQUEST_TIMEOUT_MS);
       const res = await fetchImpl(url, { headers, signal: request.signal });
+      if (minRequestIntervalMs > 0 && hops === 1 && res.redirected) {
+        nextRequestAt = Math.max(nextRequestAt, Date.now()) + minRequestIntervalMs;
+      }
       if (!res.ok) {
         // Not reading the body would keep the connection busy until it is collected.
         await res.body?.cancel().catch(() => undefined);
+        if ([401, 402, 403].includes(res.status)) {
+          // One backoff step per burst, not per request: the requests in flight together with
+          // the first to fail (4 during catch-up) fail in the same epoch, and add nothing.
+          if (attemptEpoch === accessEpoch) {
+            const step = Math.min(
+              ACCESS_FIRST_WAIT_MS * 2 ** Math.min(accessFailures, 4),
+              ACCESS_LONGEST_WAIT_MS,
+            );
+            accessFailures += 1;
+            accessEpoch += 1;
+            accessRetryAt = Date.now() + step;
+          }
+          const wait = Math.max(accessRetryAt - Date.now(), 0);
+          log?.(
+            `WARN neardata: HTTP ${res.status}; provider access unavailable; retrying after ${wait} ms. No blocks skipped.`,
+          );
+        }
         throw new Error(`HTTP ${res.status}`);
       }
-      return await res.json();
+      const json = await res.json();
+      // A request that started after the last access error got through: access is back.
+      if (attemptEpoch === accessEpoch) {
+        accessFailures = 0;
+        accessRetryAt = 0;
+      }
+      return json;
     } catch (error) {
       if (request.signal.aborted && !stop.aborted) {
         throw new Error(`no answer in ${REQUEST_TIMEOUT_MS / 1000} s`, { cause: error });
@@ -115,10 +194,11 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
     url: string,
     stop: AbortSignal,
     read: (json: unknown) => T,
+    hops = 1,
   ): Promise<T | Stopped> {
     for (let failures = 0; !stop.aborted; failures++) {
       try {
-        return read(await getJson(url, stop));
+        return read(await getJson(url, stop, hops));
       } catch (error) {
         if (stop.aborted) break;
         const wait = Math.min(FIRST_WAIT_MS * 2 ** failures, LONGEST_WAIT_MS);
@@ -129,8 +209,9 @@ export function createNeardataSource(opts: NeardataOptions): BlockSource {
     return STOPPED;
   }
 
+  // Neardata answers the final height with a redirect to that block: two requests.
   const fetchFinalHeight = (stop: AbortSignal) =>
-    fetchUntilRead(`${baseUrl}/v0/last_block/final`, stop, finalHeightOf);
+    fetchUntilRead(`${baseUrl}/v0/last_block/final`, stop, finalHeightOf, 2);
 
   const blockUrl = (height: bigint) => `${baseUrl}/v0/block/${height}`;
 

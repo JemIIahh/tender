@@ -22,6 +22,7 @@ import { detectKeyAccess } from "../src/keys";
 import { urlCredentials } from "../src/secrets";
 import { createConnectServer, createMcpServer } from "../src/server";
 import { createStateStore } from "../src/state";
+import { x402BuyerOf, x402SecretsOf } from "../src/x402";
 
 // The Tender MCP server over stdio, for one agent account. An MCP client starts it with the
 // environment that `readConfig` lists. stdout belongs to the protocol, so only the transport writes
@@ -88,9 +89,12 @@ async function connectMode(): Promise<void> {
 
 async function main(): Promise<void> {
   if (process.argv.slice(2).includes("--connect")) return connectMode();
+  // The x402 payer's key first, so that no failure from here on, the configuration's included,
+  // can print it.
+  secrets = x402SecretsOf(process.env);
   const config = readConfig(process.env);
   const { accountId } = config.signer;
-  secrets = secretsOf(config);
+  secrets = [...secretsOf(config), ...x402SecretsOf(process.env)];
   // A files directory that nothing can be read from is no fault of the environment, but every
   // `file_path` would be refused without a word as to why: one line says it.
   const warning = filesDirWarning(config);
@@ -117,7 +121,9 @@ async function main(): Promise<void> {
   // place of a bare `fetch failed`.
   const key = await askNode(config, () => detectKeyAccess(client, accountId, config.publicKey));
   const defaultToken = await askNode(config, () => resolveDefaultToken(config, client));
+  const x402Buyer = await askNode(config, () => x402BuyerOf(process.env, config, client));
   const server = createMcpServer({
+    x402Buyer,
     client,
     api,
     state: createStateStore(config.stateDir),

@@ -137,6 +137,7 @@ const DEPLOYMENTS_DIR = fileURLToPath(new URL("../../../deployments/", import.me
  *   neardata otherwise, at `NEARDATA_URL` (default: the network's) with `FASTNEAR_API_KEY`. Neither
  *   ever stands in for the other. `INDEXER_POLL_MS` sets how often a source that has caught up
  *   looks again.
+ *   No lifetime HTTP request cap is imposed. Provider access errors retry with backoff.
  * - **Start**: `INDEXER_START_HEIGHT`; else the `deployHeight` in the deploy script's record,
  *   `<deploymentsDir>/<network>.json`, if it is this contract's; else, on the sandbox only, the
  *   chain's final height when nothing is indexed yet (it prunes its old blocks within minutes),
@@ -162,7 +163,6 @@ export function startIndexer(
   const log = opts.log ?? console.log;
   const config = readConfig(env);
   const start = startOf(env, config, opts.deploymentsDir);
-  const source = opts.source ?? sourceOf(env, config, log);
   const client = opts.client ?? clientOf(env, config);
   const { db } = opts;
   let openDatabase: () => Promise<Db>;
@@ -172,6 +172,11 @@ export function startIndexer(
   } else {
     openDatabase = async () => db;
   }
+  if (setting(env, "INDEXER_MAX_REQUESTS") !== undefined)
+    log(
+      "WARN indexer: INDEXER_MAX_REQUESTS is retired and ignored; monitor provider usage and lag. No lifetime request cap is applied.",
+    );
+  const source = opts.source ?? sourceOf(env, config, log);
 
   const stopping = new AbortController();
   const running = supervise({
@@ -806,9 +811,14 @@ function sourceOf(
   // The source's lines quote the URLs it asks for, which begin with NEARDATA_URL as it keeps it,
   // with no trailing slash. A URL can hold a key, so the lines name it instead (P03-R16).
   const base = httpUrl("NEARDATA_URL", baseUrl).replace(/\/+$/, "");
+  const apiKey = setting(env, "FASTNEAR_API_KEY");
   return createNeardataSource({
     baseUrl,
-    apiKey: setting(env, "FASTNEAR_API_KEY"),
+    apiKey,
+    // Public access is limited to 180 requests/minute per IP. Without a key, the source starts a
+    // request at most every 400 ms (150 a minute), retries included; a final-height poll, which
+    // neardata redirects to the block, takes two of those slots, and so does any other redirect.
+    minRequestIntervalMs: apiKey === undefined ? 400 : 0,
     pollMs: config.pollMs,
     log: (line) => log(line.replaceAll(base, "NEARDATA_URL")),
   });

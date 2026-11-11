@@ -17,5 +17,13 @@
     "@tender/shared": "workspace:*",
     "near-api-js": "7.4.0",
     "zod": "4.6.7"
+  },
+  "peerDependencies": {
+    "@tender/payments": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "@tender/payments": {
+      "optional": true
+    }
   }
 }

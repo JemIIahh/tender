@@ -142,6 +142,7 @@ async function insertRow(db: Db, table: string, row: Record<string, unknown>) {
 const SCHEMA: Record<string, string[]> = {
   schema_migrations: ["name text", "applied_at timestamp with time zone? = now()"],
   chain_cursor: ["source text", "height numeric(40,0)"],
+  indexer_request_budget: ["scope text", "requests bigint"],
   events: [
     "id bigint = serial",
     "height numeric(40,0)",
@@ -289,6 +290,8 @@ const SCHEMA: Record<string, string[]> = {
     "status text = 'active'::text",
     "created_at timestamp with time zone = now()",
     "updated_at timestamp with time zone = now()",
+    "payment_mode text = 'escrow'::text",
+    "x402 jsonb?",
   ],
   // Migration 0005.
   tg_board_digests: [
@@ -339,6 +342,7 @@ const KEYS = [
   "events: unique (receipt_id, log_index)",
   "funders: primary key (task_id, account)",
   "heldout_uploads: primary key (sha256, account)",
+  "indexer_request_budget: primary key (scope)",
   "result_uploads: primary key (sha256, task_id, account)",
   "schema_migrations: primary key (name)",
   "services: index (agent)",
@@ -367,7 +371,7 @@ const KEYS = [
 // Postgres 18 also lists NOT NULL in pg_constraint, 17 does not): no foreign key, and no CHECK but
 // the kind of a blob, the three of a board row (migration 0004), the status of an agent (0006), the
 // three of a service (0007), the key of a connect code with its time (0008) and the two of a connect
-// code's account (0009).
+// code's account (0009), and the positive provider request count (0010).
 const CONSTRAINTS = [
   "agents: CHECK ((status = ANY (ARRAY['active'::text, 'unregistering'::text, 'retired'::text])))",
   "blobs: CHECK ((kind = ANY (ARRAY['brief'::text, 'criteria'::text, 'heldout'::text, " +
@@ -376,13 +380,15 @@ const CONSTRAINTS = [
   "connect_codes: CHECK (((account_kind = 'sub_account'::text) OR (public_key IS NOT NULL)))",
   "connect_codes: CHECK (((public_key IS NULL) = (attached_at IS NULL)))",
   "connect_codes: CHECK ((account_kind = ANY (ARRAY['sub_account'::text, 'implicit'::text])))",
+  "indexer_request_budget: CHECK ((requests > 0))",
   "services: CHECK (((verifier = 'judge'::text) = (criteria IS NOT NULL)))",
   "services: CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text])))",
-  "services: CHECK ((verifier = ANY (ARRAY['hirer'::text, 'judge'::text])))",
+  "services: CHECK ((verifier = ANY (ARRAY['hirer'::text, 'judge'::text, 'none'::text])))",
+  "services: CHECK ((((payment_mode = 'escrow'::text) AND (x402 IS NULL) AND (verifier = ANY (ARRAY['hirer'::text, 'judge'::text])) AND (commit_secs > 0) AND (reveal_secs > 0) AND (pick_secs > 0)) OR ((payment_mode = 'x402'::text) AND (x402 IS NOT NULL) AND (verifier = 'none'::text) AND (commit_secs = 0) AND (reveal_secs = 0) AND (pick_secs = 0))))",
   "task_questions: CHECK (((answer IS NULL) = (answered_at IS NULL)))",
   "task_questions: CHECK (((kind = 'question'::text) = (asker IS NOT NULL)))",
   "task_questions: CHECK ((kind = ANY (ARRAY['question'::text, 'clarification'::text])))",
-];
+].sort();
 
 async function describeSchema(db: Db) {
   const columns = await db.query<{

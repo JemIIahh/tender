@@ -5,3 +5,4 @@ packages:
 # so its install script is not needed; listing it here keeps pnpm from asking about it on each install.
 ignoredBuiltDependencies:
   - esbuild
+  - secp256k1

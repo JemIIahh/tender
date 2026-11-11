@@ -4,7 +4,7 @@ import { FakeChain } from "../test/fakeChain";
 import { API_URL, routeApi } from "./fixtures";
 import { installInjectedWallet } from "./injectedWallet";
 import { routePostApi } from "./postApi";
-import { ALICE, routeServices, TEST_TOKEN, WRITER } from "./servicesApi";
+import { ALICE, routeServices, SERVICES, service, TEST_TOKEN, WRITER } from "./servicesApi";
 import { STUB_WALLET_NAME } from "./walletStub";
 
 // The Services page and a hire, in a browser: the directory from the fixture API
@@ -23,7 +23,7 @@ test("services_directory_filters_and_opens_a_service", async ({ page }) => {
   await page.goto("/services");
 
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(
-    "Services. Hire an agent for a fixed price.",
+    "Services. Hire work or buy an API response.",
   );
   // The sidebar's Services item is the page's.
   await expect(page.getByRole("link", { name: "Services", exact: true })).toHaveAttribute(
@@ -120,3 +120,93 @@ test("hire_end_to_end", async ({ page }) => {
     "Hire: Summarise a public filing",
   );
 });
+
+for (const width of [375, 1440]) {
+  // An x402 service is bought by agents through the MCP server, not in the browser: its card says
+  // View API, and its page says how agents buy it where an escrow service has its hire form. The
+  // escrow card and page next to it are as they were.
+  test(`x402_service_at_${width}px`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 1000 });
+    await routeApi(page);
+    const paid = service({
+      id: "9",
+      payment_mode: "x402",
+      title: "Tender team inventory API",
+      output_format: "json",
+      price: "1000",
+      verification: { kind: "none" },
+      commit_secs: 0,
+      reveal_secs: 0,
+      pick_secs: 0,
+      x402: {
+        endpoint: "https://asp.example/inventory",
+        network: "near:testnet",
+        pay_to: ALICE,
+        max_timeout_seconds: 60,
+      },
+    });
+    await routeServices(page, [paid, ...SERVICES]);
+    await page.goto("/services");
+    const card = page.getByTestId("service-card").filter({ hasText: "Tender team inventory API" });
+    await expect(card.getByTestId("service-checked")).toHaveText("x402 paid API");
+    await expect(card).toContainText("/ call");
+    await expect(card).toContainText("Answers at once");
+    await expect(
+      page.getByRole("link", { name: "View API: Tender team inventory API" }),
+    ).toHaveAttribute("href", "/services/9#hire");
+    await expect(
+      page.getByRole("link", { name: "Use API: Tender team inventory API" }),
+    ).toHaveCount(0);
+    // The escrow card beside it still hires.
+    await expect(
+      page.getByRole("link", { name: "Hire: Summarise a public filing" }),
+    ).toHaveAttribute("href", "/services/3#hire");
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(
+      true,
+    );
+    await page.screenshot({
+      path: testInfo.outputPath(`x402-directory-${width}.png`),
+      fullPage: true,
+    });
+
+    await page.goto("/services/9");
+    await expect(page.getByRole("heading", { name: "x402 paid API" })).toBeVisible({
+      timeout: 20_000,
+    });
+    const panel = page.locator("#hire");
+    await expect(panel.getByTestId("api-price")).toHaveText("0.001 tUSDC / call · NEAR testnet");
+    await expect(panel.getByTestId("api-notice")).toHaveText(
+      "Agents buy this API through Tender's MCP server, with the purchase_service tool. Each call pays the price directly to the account below. Tender doesn't hold the payment or judge the answer.",
+    );
+    await expect(panel.getByTestId("api-origin")).toHaveText("https://asp.example");
+    await expect(panel).toContainText(ALICE);
+    await expect(panel.getByRole("link", { name: "Set up the MCP server" })).toHaveAttribute(
+      "href",
+      "https://github.com/JemIIahh/tender/blob/main/docs/MCP.md",
+    );
+    // Nothing to sign or buy here: no hire form, no wallet, no request box.
+    await expect(panel.getByRole("button")).toHaveCount(0);
+    await expect(panel.getByRole("textbox")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /^Hire/ })).toHaveCount(0);
+    // The agent and its provider, as on any service.
+    await expect(page.getByTestId("service-agent")).toBeVisible();
+    await expect(page.getByText("Provider (ASP)")).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(
+      true,
+    );
+    await page.screenshot({
+      path: testInfo.outputPath(`x402-service-${width}.png`),
+      fullPage: true,
+    });
+
+    await page.goto("/services/3");
+    await expect(page.locator("#hire").getByRole("button", { name: "Connect wallet" })).toBeVisible(
+      { timeout: 20_000 },
+    );
+    await expect(page.getByTestId("hire-price")).toHaveText("2.50 tUSDC");
+    await page.screenshot({
+      path: testInfo.outputPath(`escrow-service-${width}.png`),
+      fullPage: true,
+    });
+  });
+}

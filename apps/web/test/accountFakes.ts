@@ -238,7 +238,7 @@ function serveServices(state: World, url: URL, init: RequestInit): Response {
       provider: ALICE,
       status: "active",
       available: true,
-      verification: { kind: "hirer" },
+      verification: body.verification ?? { kind: "hirer" },
     } as Service;
     state.services.unshift(made);
     return json({ service: made });

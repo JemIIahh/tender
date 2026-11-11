@@ -1,0 +1,47 @@
+# Exact historical false positives reviewed during terminal verification.
+# Public NEAR keys, public contract storage keys and account names, and synthetic test values.
+# Each fingerprint includes its commit, path, rule and line; new findings remain checked.
+56ddc8f0858f39705ffab1c47cd2203f2ff3668f:packages/judge/test/rubric.test.ts:generic-api-key:61
+6f675860be635da55d8c19e1a8678c3a2f249049:apps/web/test/faucet.test.ts:generic-api-key:26
+a581ff39e438063e610d1a6e670681b6b759aa82:README.md:generic-api-key:104
+ad3b75c34cfe971b0a3d21708c0ac3e599dd550d:packages/agents/test/cli.test.ts:generic-api-key:51
+ad3b75c34cfe971b0a3d21708c0ac3e599dd550d:packages/agents/test/llm.test.ts:generic-api-key:22
+ad3b75c34cfe971b0a3d21708c0ac3e599dd550d:packages/agents/test/llm.test.ts:generic-api-key:247
+ad3b75c34cfe971b0a3d21708c0ac3e599dd550d:packages/agents/test/llm.test.ts:generic-api-key:254
+b0b8e4f689f2d1487895772c06a5772354e04669:apps/web/test/auth.test.ts:generic-api-key:36
+ccf29bc6b30f287f87b44ab9b691bc086a3df6df:README.md:generic-api-key:106
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370832.json:generic-api-key:925
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370832.json:generic-api-key:936
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370832.json:generic-api-key:960
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370832.json:generic-api-key:984
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370832.json:generic-api-key:996
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:1353
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:914
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:949
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:960
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:984
+d69620e9cec0887be9d46ec20f856415aa5c4746:packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:996
+.env.example:generic-api-key:133
+packages/mcp/src/x402.ts:generic-api-key:17
+# The same false positives where a whole-tree scan (gitleaks dir) finds them today.
+.env.example:generic-api-key:131
+packages/mcp/src/x402.ts:generic-api-key:41
+README.md:generic-api-key:148
+apps/web/test/auth.test.ts:generic-api-key:36
+apps/web/test/faucet.test.ts:generic-api-key:26
+packages/agents/test/cli.test.ts:generic-api-key:69
+packages/agents/test/llm.test.ts:generic-api-key:26
+packages/agents/test/llm.test.ts:generic-api-key:271
+packages/agents/test/llm.test.ts:generic-api-key:278
+packages/indexer/test/fixtures/neardata/275370832.json:generic-api-key:925
+packages/indexer/test/fixtures/neardata/275370832.json:generic-api-key:936
+packages/indexer/test/fixtures/neardata/275370832.json:generic-api-key:960
+packages/indexer/test/fixtures/neardata/275370832.json:generic-api-key:984
+packages/indexer/test/fixtures/neardata/275370832.json:generic-api-key:996
+packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:914
+packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:949
+packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:960
+packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:984
+packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:996
+packages/indexer/test/fixtures/neardata/275370833.json:generic-api-key:1353
+packages/judge/test/rubric.test.ts:generic-api-key:72

@@ -539,7 +539,9 @@ async function ownServices(run: Run): Promise<Service[] | null> {
       status: "all",
       limit: SERVICES_PAGE,
     });
-    return page.services.filter((service) => service.agent === run.account);
+    return page.services.filter(
+      (service) => service.agent === run.account && service.payment_mode !== "x402",
+    );
   } catch (error) {
     run.log(`ERROR ${run.name}: reading its services failed (${describe(error)})`);
     return null;

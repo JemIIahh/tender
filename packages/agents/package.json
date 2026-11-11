@@ -12,7 +12,8 @@
     "@tender/client": "workspace:*",
     "@tender/mcp": "workspace:*",
     "@tender/shared": "workspace:*",
-    "openai": "7.34.0"
+    "openai": "7.34.0",
+    "@tender/payments": "workspace:*"
   },
   "devDependencies": {
     "@hono/node-server": "2.1.5",
