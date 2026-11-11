@@ -1,4 +1,6 @@
+import type { AddressInfo } from "node:net";
 import { connect } from "node:net";
+import { networkInterfaces } from "node:os";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { type ApiDeps, type ApiServer, createApp, startApiServer } from "../src/index";
 import { testDeps } from "./helpers";
@@ -72,6 +74,29 @@ test("start_api_server_serves_and_closes", async () => {
 
   await one.close();
   expect(await takesConnections(one.url)).toBe(false);
+});
+
+test("start_api_server_with_no_hostname_listens_on_every_address", async () => {
+  // In a container, the host's proxy reaches the port by the container's own address, not by the
+  // loopback address: a server bound to the loopback address alone would never be reached.
+  const every = await serve(createApp(deps), { port: 0 });
+  const bound = every.server.address() as AddressInfo;
+  expect(["::", "0.0.0.0"]).toContain(bound.address);
+
+  // So an address of this machine that is not the loopback one is answered. The machine of a run
+  // may have none (the check is then left to the address above), as one with no network does.
+  const outside = Object.values(networkInterfaces())
+    .flat()
+    .find((entry) => entry !== undefined && !entry.internal && entry.family === "IPv4");
+  if (outside === undefined) return;
+  const answer = await fetch(`http://${outside.address}:${bound.port}/v1/health`);
+  expect(answer.status).toBe(200);
+
+  // A server bound to the loopback address alone refuses the same address.
+  const loopback = await serve(createApp(deps), { port: 0, hostname: "127.0.0.1" });
+  await expect(
+    fetch(`http://${outside.address}:${new URL(loopback.url).port}/v1/health`),
+  ).rejects.toThrow();
 });
 
 test("start_api_server_rejects_a_port_that_is_taken", async () => {

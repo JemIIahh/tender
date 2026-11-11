@@ -212,6 +212,35 @@ test("read_serve_config_reads_the_judge_and_the_bot_as_they_are_set", () => {
   ]);
 });
 
+test("the_api_port_is_api_port_then_port_then_8787", () => {
+  // `PORT` is what a host such as Railway gives the container. `API_PORT` still wins, and an empty
+  // one is an unset one.
+  const { API_PORT: _, ...without } = GOOD;
+  expect(readServeConfig({ ...without, PORT: "3001" }).apiPort).toBe(3001);
+  expect(readServeConfig({ ...without, API_PORT: "", PORT: "3001" }).apiPort).toBe(3001);
+  expect(readServeConfig({ ...without, API_PORT: " ", PORT: " 3001 " }).apiPort).toBe(3001);
+  expect(readServeConfig({ ...without, PORT: "0" }).apiPort).toBe(0);
+  expect(readServeConfig({ ...GOOD, API_PORT: "8080", PORT: "3001" }).apiPort).toBe(8080);
+  expect(readServeConfig({ ...GOOD, API_PORT: "0", PORT: "3001" }).apiPort).toBe(0);
+  expect(readServeConfig({ ...without, PORT: "" }).apiPort).toBe(8787);
+  expect(readServeConfig(without).apiPort).toBe(8787);
+
+  // `PORT` is checked as `API_PORT` is, and the problem names the one that was read.
+  for (const bad of ["65536", "80a", "0x50", "-1", "3001.5", "http"]) {
+    expect(problemsOf({ ...without, PORT: bad }), bad).toEqual([
+      "PORT must be a whole number from 0 to 65535 (0 picks a free port)",
+    ]);
+    expect(problemsOf({ ...GOOD, API_PORT: bad, PORT: "3001" }), bad).toEqual([
+      "API_PORT must be a whole number from 0 to 65535 (0 picks a free port)",
+    ]);
+    // A `PORT` left over from another program changes nothing where `API_PORT` is set.
+    expect(problemsOf({ ...GOOD, API_PORT: "8080", PORT: bad }), bad).toEqual([]);
+  }
+
+  // The problem does not show the value.
+  expect(problemsOf({ ...without, PORT: "PLANTED-port" }).join("\n")).not.toContain("PLANTED");
+});
+
 test("read_serve_config_names_each_bad_variable", () => {
   // Each bad value alone is one problem, which names its variable.
   const bad: Array<[string, string | undefined]> = [

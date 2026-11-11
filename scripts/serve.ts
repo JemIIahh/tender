@@ -51,8 +51,9 @@ import { deploymentsDirOverride, envDir, loadEnv, readEnvFile } from "./lib/env"
  *   database   opened from DATABASE_URL and migrated, and checked: it serves one contract deploy,
  *              so one whose chain cursor is for another is refused at the start
  *              (`checkCursorSource`)
- *   API        on API_PORT (default 8787), for the web app, agents and MCP clients, at the base
- *              URL PUBLIC_API_URL, which sign-in is bound to (P03-R28)
+ *   API        on API_PORT (default 8787; PORT when API_PORT is unset, which is the one a host such
+ *              as Railway sets), on every address of the machine, for the web app, agents and MCP
+ *              clients, at the base URL PUBLIC_API_URL, which sign-in is bound to (P03-R28)
  *   indexer    follows the chain into the database; on Postgres only while this process holds
  *              the indexer lock, so that one process at a time writes to the index (P03-R25).
  *              The indexer, the keeper and the Judge start once the database has been checked
@@ -78,7 +79,7 @@ import { deploymentsDirOverride, envDir, loadEnv, readEnvFile } from "./lib/env"
  * prints its message, with no secret in it, and exits with 1.
  */
 
-/** The port the API listens on unless `API_PORT` says otherwise. */
+/** The port the API listens on unless `API_PORT`, or failing that `PORT`, says otherwise. */
 const DEFAULT_API_PORT = 8787;
 /** The longest wait `setTimeout` keeps, which bounds every interval in milliseconds. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
@@ -139,7 +140,10 @@ export interface ServeConfig {
   contractId: string;
   /** `DATABASE_URL`, and which kind of database it names. */
   database: { url: string; kind: "pglite" | "postgres" };
-  /** `API_PORT`: 8787 unless set; 0 picks a free port. */
+  /**
+   * `API_PORT`, or `PORT` when `API_PORT` is unset: 8787 when neither is set; 0 picks a free port.
+   * `PORT` is the one a host such as Railway gives the container.
+   */
   apiPort: number;
   /**
    * `PUBLIC_API_URL` as `canonicalBase` spells it, the one spelling that sign-in and the blob URIs
@@ -314,9 +318,9 @@ function databaseKind(url: string): "pglite" | "postgres" | undefined {
  *   `DATABASE_URL` (`pglite:memory`, `pglite:<dir>` or a Postgres URL, whose password, if it has
  *   one, has 8 characters or more, and off the sandbox is neither its user name nor `postgres`,
  *   `password` or `tender`), which must all be set;
- * - `API_PORT`, `INDEXER_POLL_MS`, `KEEPER_INTERVAL_MS`, `JUDGE_INTERVAL_MS`,
- *   `INDEXER_START_HEIGHT` and `TRUSTED_PROXY_HOPS`, which must be whole numbers in plain decimal
- *   digits, each in its range;
+ * - `API_PORT` (or `PORT`, which is read only when `API_PORT` is unset, and is checked the same
+ *   way), `INDEXER_POLL_MS`, `KEEPER_INTERVAL_MS`, `JUDGE_INTERVAL_MS`, `INDEXER_START_HEIGHT` and
+ *   `TRUSTED_PROXY_HOPS`, which must be whole numbers in plain decimal digits, each in its range;
  * - `PUBLIC_API_URL`, the exact base URL clients call, which sign-in is bound to: it must be set
  *   off the sandbox, be an http(s) URL with no query, fragment or credentials, and have the one
  *   spelling `canonicalBase` gives it (no empty path segment, no second `/v1`, no dot at the end
@@ -394,8 +398,12 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
     }
   }
 
+  // `API_PORT` wins. `PORT` is what a host such as Railway gives the container, and is read only
+  // when `API_PORT` is unset, so that a `PORT` left in a shell for another program changes nothing
+  // where `API_PORT` is set. Either is checked the same way, and the problem names the one read.
+  const portKey = get("API_PORT") === undefined ? "PORT" : "API_PORT";
   const apiPort =
-    whole("API_PORT", 0, 65_535, "a whole number from 0 to 65535 (0 picks a free port)") ??
+    whole(portKey, 0, 65_535, "a whole number from 0 to 65535 (0 picks a free port)") ??
     DEFAULT_API_PORT;
   whole("INDEXER_POLL_MS", 1, MAX_TIMER_MS, milliseconds);
   const keeperIntervalMs = whole("KEEPER_INTERVAL_MS", 1, MAX_TIMER_MS, milliseconds);
