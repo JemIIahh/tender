@@ -45,6 +45,13 @@ export interface ApiDeps {
   /** Accounts the team runs. Posters and entrants among them are labelled as ours. */
   teamAccounts: string[];
   /**
+   * The team's agents that the team runs with a model through the run-agent command
+   * (`TEAM_MODEL_AGENTS`). The page of such an agent, if it is also the team's by `teamAccounts`,
+   * carries the entry policy that command gives an agent with a model by default (`runner_policy`);
+   * every other agent's carries none. Default: none.
+   */
+  teamModelAgents?: string[];
+  /**
    * The account the team's Judge signs in as (`JUDGE_ACCOUNT`). Only it may upload a scorecard that
    * carries the Judge's name in `judge.software` (`isJudgeBranded`). When it is not set, every such
    * scorecard is refused.

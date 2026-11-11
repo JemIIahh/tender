@@ -31,7 +31,13 @@ export function agentRoutes(deps: ApiDeps): Hono {
     const account = c.req.param("account");
     // A string that is no account id names no agent.
     const detail = AccountIdSchema.safeParse(account).success
-      ? await getAgentDetail(deps.db, account, nowNs(deps), deps.teamAccounts)
+      ? await getAgentDetail(
+          deps.db,
+          account,
+          nowNs(deps),
+          deps.teamAccounts,
+          deps.teamModelAgents ?? [],
+        )
       : null;
     if (detail === null) return notFound("no such agent");
     return c.json(detail);

@@ -5,6 +5,7 @@ import { StrictMode } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { AgentDirectory } from "../components/AgentDirectory";
 import { AgentView } from "../components/AgentView";
+import { RPC_ORIGIN, type RpcCalls, rpcAnswer } from "./fakeRpc";
 import { agent, HASH_C, summary, TOKEN } from "./tasks";
 
 // The agent directory and an agent's page over a fake API. The directory's filter is in the
@@ -100,13 +101,16 @@ const listed = vi.hoisted(() => ({ current: [] as unknown[] }));
 /**
  * A `fetch` that hands each request, as a URL, to `handler`, and writes down path and query. The
  * services, which the directory and an agent's page read beside the agents, are answered from
- * `listed` and written down apart (`serviceCalls`), so that `calls` are the agents' reads.
+ * `listed` and written down apart (`serviceCalls`), so that `calls` are the agents' reads. So are
+ * the reads of the chain that an agent's Safety section makes (`rpcCalls`, from an empty chain).
  */
 function fakeApi(handler: (url: URL, call: number) => Response | Promise<Response>) {
   const calls: string[] = [];
   const serviceCalls: string[] = [];
-  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+  const rpcCalls: RpcCalls = [];
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
+    if (url.origin === RPC_ORIGIN) return rpcAnswer(String(init?.body ?? ""), {}, rpcCalls);
     if (url.pathname === "/v1/services") {
       serviceCalls.push(`${url.pathname}${url.search}`);
       const agent = url.searchParams.get("agent");
@@ -118,7 +122,7 @@ function fakeApi(handler: (url: URL, call: number) => Response | Promise<Respons
     calls.push(`${url.pathname}${url.search}`);
     return handler(url, calls.length);
   });
-  return { calls, serviceCalls };
+  return { calls, serviceCalls, rpcCalls };
 }
 
 /** A service of `agent`'s at `price` (tUSDC's smallest unit), as the API lists one. */
@@ -542,7 +546,7 @@ test("agent_page_shows_the_profile_the_recent_entries_and_the_lineage", async ()
   expect(record.getByTestId("picks-made").textContent).toBe("0");
   expect(record.getByTestId("voids-after-reveals").textContent).toBe("0");
   // The numbered sections.
-  for (const name of ["Services", "Recent tasks", "Record"]) {
+  for (const name of ["Services", "Recent tasks", "Record", "Safety"]) {
     expect(screen.getByRole("heading", { level: 2, name }), name).toBeTruthy();
   }
   expect(await screen.findByTestId("no-agent-services")).toBeTruthy();
@@ -623,6 +627,35 @@ test("agent_page_lists_its_services_and_says_what_the_cheapest_costs", async () 
   const pill = screen.getByRole("link", { name: /See services/ });
   expect(pill.getAttribute("href")).toBe("#agent-services");
   expect(within(pill).getByTestId("agent-from").textContent).toBe("From 2.00 tUSDC / task");
+});
+
+test("agent_page_tells_its_safety_section_of_the_x402_apis_it_lists", async () => {
+  // One escrow service and one x402 API, which is paid at once, outside the contract.
+  const api: Service = {
+    ...serviceOf(ALICE, "3", "1000"),
+    title: "Inventory API",
+    output_format: "json",
+    commit_secs: 0,
+    reveal_secs: 0,
+    pick_secs: 0,
+    verification: { kind: "none" },
+    payment_mode: "x402",
+    x402: {
+      endpoint: "https://provider.example/inventory",
+      network: "near:testnet",
+      pay_to: ALICE,
+      max_timeout_seconds: 60,
+    },
+  };
+  listed.current = [serviceOf(ALICE, "1", "3000000"), api];
+  fakeApi(routes());
+  render(<AgentView account={ALICE} />);
+  await loadedHeading();
+
+  expect(await screen.findAllByTestId("service-card")).toHaveLength(2);
+  await waitFor(() =>
+    expect(screen.getByTestId("safety-hiring").textContent).toContain("It lists an x402 API."),
+  );
 });
 
 test("agent_page_says_when_an_agent_runs_under_no_provider_and_has_earned_nothing", async () => {

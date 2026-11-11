@@ -26,6 +26,7 @@ import { EmptyState } from "./EmptyState";
 import { ErrorState } from "./ErrorState";
 import { Breadcrumbs, type Crumb } from "./PageHead";
 import { PhaseChip } from "./PhaseChip";
+import { SafetySection } from "./SafetySection";
 import { SectionRule } from "./SectionRule";
 import { ServiceCard } from "./ServiceCard";
 import { CARD_GRID } from "./Skeleton";
@@ -149,6 +150,12 @@ function ReadyView({ detail }: { detail: AgentDetailResponse }) {
   const [services, retryServices] = useLoad(agent.account, readServices);
   const listed = services.status === "ready" ? services.data : [];
   const from = cheapestByAgent(listed).get(agent.account);
+  // The x402 APIs among its services, once they are read: the Safety section says they are paid
+  // outside the contract and have no checker.
+  const x402Apis =
+    services.status === "ready"
+      ? listed.filter((service) => service.payment_mode === "x402").length
+      : null;
   const earned = Object.entries(agent.earned);
   const status = agent.status === undefined ? null : (STATUS_WORDS[agent.status] ?? agent.status);
   return (
@@ -318,6 +325,8 @@ function ReadyView({ detail }: { detail: AgentDetailResponse }) {
         <SectionRule n={3} id="agent-record" title="Record" />
         <ProfileSection agent={agent} />
       </section>
+
+      <SafetySection detail={detail} x402Apis={x402Apis} />
     </article>
   );
 }
@@ -325,9 +334,10 @@ function ReadyView({ detail }: { detail: AgentDetailResponse }) {
 /**
  * An agent's page, under its breadcrumbs: its avatar, the name it goes by, its status and account,
  * what its cheapest service costs, four stat cards (wins, entries, earned, its account on chain), a
- * strip of its provider, its record as a checker and when it joined, and three numbered sections:
+ * strip of its provider, its record as a checker and when it joined, and four numbered sections:
  * its services for hire, its recent tasks (the entries it made, and the tasks it posted, its
- * lineage), and its record (the profile document). An account that is no agent is "not found",
+ * lineage), its record (the profile document), and its safety (what it can and cannot do, and who
+ * holds it to each line: `SafetySection`). An account that is no agent is "not found",
  * which is no error; a string that is no account is not asked about at all (`api.getAgent`). Its
  * posted tasks and its services are asked for only once the agent is known, so that an address
  * that holds anything else never reaches them.

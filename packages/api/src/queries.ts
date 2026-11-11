@@ -4,6 +4,7 @@ import {
   HIRER_ACCEPTS_CRITERIA_HASH,
   type ListServicesResponse,
   type MetricsResponse,
+  MODEL_AGENT_POLICY,
   type Phase,
   type PosterRecordResponse,
   type PublicCriteria,
@@ -27,6 +28,7 @@ import {
   MAX_LIMIT,
   MAX_LISTED,
   RECENT_ENTRIES,
+  type RunnerPolicy,
   type TaskDetail,
   type TaskDetailResponse,
   type TaskEntry,
@@ -474,14 +476,32 @@ export async function listAgents(
 }
 
 /**
+ * The entry policy the team's runner (the run-agent command) gives an agent with a model by
+ * default, as the API sends it. It is read from `MODEL_AGENT_POLICY`, the values the runner itself
+ * applies, so that the two cannot differ. A flag can change them for a run, and the API cannot see
+ * the flags: the page says these are defaults.
+ */
+export const TEAM_RUNNER_POLICY: RunnerPolicy = Object.freeze({
+  verifiers: MODEL_AGENT_POLICY.verifiers,
+  daily_entries: MODEL_AGENT_POLICY.dailyEntries,
+  daily_judged_hires: MODEL_AGENT_POLICY.dailyJudgedHires,
+  max_poster_voids: MODEL_AGENT_POLICY.maxPosterVoids,
+});
+
+/**
  * A registered agent and the latest of its entries, with each task's phase at `now`, or null if
- * the account is no agent. It is labelled as `listAgents` labels it, by `teamAccounts`.
+ * the account is no agent. It is labelled as `listAgents` labels it, by `teamAccounts`. With them,
+ * for an agent of the team that `modelAgents` names (`TEAM_MODEL_AGENTS`: the ones the team runs
+ * with a model), the entry policy the team's runner gives such an agent by default
+ * (`TEAM_RUNNER_POLICY`); for any other agent, null. Being the team's is not enough: the swarm lead
+ * and the scripted agents run under other rules, which this does not describe.
  */
 export async function getAgentDetail(
   db: Db,
   account: string,
   now: bigint,
   teamAccounts: readonly string[],
+  modelAgents: readonly string[],
 ): Promise<AgentDetailResponse | null> {
   const [agent] = await db.query<AgentSummary>(
     `select ${agentColumns("$2")} from agents a where a.account = $1`,
@@ -489,6 +509,7 @@ export async function getAgentDetail(
   );
   if (!agent) return null;
   const latest = await accountEntries(db, account, now, RECENT_ENTRIES);
+  const runsWithModel = agent.is_team && modelAgents.includes(agent.account);
   return {
     agent,
     recent_entries: latest.map(({ task_id, title, phase, revealed, won }) => ({
@@ -498,6 +519,7 @@ export async function getAgentDetail(
       revealed,
       won,
     })),
+    runner_policy: runsWithModel ? { ...TEAM_RUNNER_POLICY } : null,
   };
 }
 

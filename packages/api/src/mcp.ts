@@ -244,7 +244,14 @@ function createServer(deps: ApiDeps): McpServer {
     ({ account }) =>
       answer(
         "get_agent",
-        () => getAgentDetail(deps.db, account, nowNs(deps), deps.teamAccounts),
+        () =>
+          getAgentDetail(
+            deps.db,
+            account,
+            nowNs(deps),
+            deps.teamAccounts,
+            deps.teamModelAgents ?? [],
+          ),
         "no such agent",
       ),
   );

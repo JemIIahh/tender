@@ -411,7 +411,9 @@ test("agent_and_entry_routes_match_their_schemas", async () => {
     taskLine(2, windowsFor("open")),
     eventLine("committed", { task_id: "2", account: alice, block_height: "120" }),
   );
-  const app = appWith({ teamAccounts: [judge] });
+  // The judge's account is named as a model agent here only so that one page carries a policy for
+  // the schema to hold.
+  const app = appWith({ teamAccounts: [judge], teamModelAgents: [judge] });
 
   const list = await get(app, "/v1/agents");
   expect(list.status).toBe(200);
@@ -437,7 +439,10 @@ test("agent_and_entry_routes_match_their_schemas", async () => {
     { task_id: "2", title: null, phase: "open", revealed: false, won: false },
     { task_id: "1", title: FIXTURE_BRIEF.title, phase: "settled", revealed: true, won: true },
   ]);
-  expect((await detail(judge)).recent_entries).toEqual([]);
+  expect(aliceDetail.runner_policy).toBeNull();
+  const judgeDetail = await detail(judge);
+  expect(judgeDetail.recent_entries).toEqual([]);
+  expect(judgeDetail.runner_policy).toMatchObject({ verifiers: "judge" });
 
   const entries = await get(app, `/v1/entries?account=${alice}`);
   expect(entries.status).toBe(200);
@@ -730,6 +735,7 @@ test("api_types_and_schema_types_are_the_same_type_both_ways", () => {
   expectTypeOf<Pair<Api.ListAgentsResponse, Shared.ListAgentsResponse>>().toEqualTypeOf<true>();
   expectTypeOf<Pair<Api.AgentRecentEntry, Shared.AgentRecentEntry>>().toEqualTypeOf<true>();
   expectTypeOf<Pair<Api.AgentDetailResponse, Shared.AgentDetailResponse>>().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.RunnerPolicy, Shared.RunnerPolicy>>().toEqualTypeOf<true>();
   expectTypeOf<Pair<Api.AccountEntry, Shared.AccountEntry>>().toEqualTypeOf<true>();
   expectTypeOf<
     Pair<Api.AccountEntriesResponse, Shared.AccountEntriesResponse>

@@ -1,9 +1,10 @@
 import { afterEach, expect, test, vi } from "vitest";
-import { accountExists, accountKeyState, RpcError } from "../lib/rpc";
+import { accessKeysOf, accountExists, accountKeyState, RpcError } from "../lib/rpc";
 import { rejection } from "./support";
 
-// `accountExists` and `accountKeyState` over a fake node: what a node answers for an account and a
-// key that are there, and for ones that are not, in the words of a current node and an older one.
+// `accountExists`, `accountKeyState` and `accessKeysOf` over a fake node: what a node answers for an
+// account and a key that are there, and for ones that are not, in the words of a current node and an
+// older one.
 
 interface Query {
   request_type: string;
@@ -139,4 +140,71 @@ test("the_key_state_tells_a_missing_account_from_one_without_the_key_and_one_wit
   expect(await accountKeyState("other.alice.testnet", KEY)).toBe("other-keys");
   // The key with a function-call permission only is not the full access the agent needs.
   expect(await accountKeyState("limited.alice.testnet", KEY)).toBe("other-keys");
+});
+
+test("the_keys_of_an_account_are_null_only_when_the_node_says_the_account_does_not_exist", async () => {
+  const list = json({
+    jsonrpc: "2.0",
+    id: "x",
+    result: {
+      keys: [
+        { public_key: KEY, access_key: { nonce: 1, permission: "FullAccess" } },
+        {
+          public_key: "ed25519:runner",
+          access_key: {
+            nonce: 1,
+            permission: {
+              FunctionCall: {
+                allowance: null,
+                receiver_id: "tender.testnet",
+                method_names: ["commit", "reveal"],
+              },
+            },
+          },
+        },
+      ],
+      block_height: 9,
+    },
+  });
+  const queries = fakeNode(() => list.clone());
+  expect(await accessKeysOf("alice.testnet")).toEqual([
+    { publicKey: KEY, kind: "full_access" },
+    {
+      publicKey: "ed25519:runner",
+      kind: "function_call",
+      receiver: "tender.testnet",
+      methods: ["commit", "reveal"],
+    },
+  ]);
+  expect(queries).toEqual([
+    { request_type: "view_access_key_list", account_id: "alice.testnet", finality: "final" },
+  ]);
+
+  // The account is not there: by name, and in an older node's words.
+  fakeNode(() => unknown("UNKNOWN_ACCOUNT", "account nobody.testnet does not exist while viewing"));
+  expect(await accessKeysOf("nobody.testnet")).toBeNull();
+  fakeNode(() =>
+    json({
+      jsonrpc: "2.0",
+      id: "x",
+      error: {
+        code: -32000,
+        message: "Server error",
+        data: "account x does not exist while viewing",
+      },
+    }),
+  );
+  expect(await accessKeysOf("x.testnet")).toBeNull();
+
+  // Any other "unknown" is a read that failed, not an account with no keys.
+  fakeNode(() => unknown("UNKNOWN_BLOCK", "DB Not Found Error: BLOCK HEIGHT: 12"));
+  const error = await rejection(accessKeysOf("alice.testnet"));
+  expect(error).toBeInstanceOf(RpcError);
+  expect(error.message).toContain("UNKNOWN_BLOCK");
+
+  // A list with an entry that is no key is not counted.
+  fakeNode(() =>
+    json({ jsonrpc: "2.0", id: "x", result: { keys: [{ public_key: KEY }], block_height: 9 } }),
+  );
+  expect(await rejection(accessKeysOf("alice.testnet"))).toBeInstanceOf(RpcError);
 });

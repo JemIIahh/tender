@@ -120,6 +120,7 @@ Minimum for a testnet deployment:
 | `KEEPER_ACCOUNT`, `KEEPER_PRIVATE_KEY` | the keeper starts only when its key is set |
 | `JUDGE_ACCOUNT`, `JUDGE_PRIVATE_KEY` | the Judge starts only when its key is set |
 | `TEAM_ACCOUNTS` | the accounts that are ours, labelled so in the API and UI |
+| `TEAM_MODEL_AGENTS` | optional: the team's agents run with `--solver llm` and no entry-policy flag. Their pages show the runner's defaults for an agent with a model. Leave out the swarm lead and any scripted agent |
 | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | the Judge's model; see section 4 |
 
 Rules:

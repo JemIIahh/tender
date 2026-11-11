@@ -15,6 +15,7 @@ export * from "./phase";
 export * from "./pick";
 export * from "./profile";
 export * from "./rubric";
+export * from "./runnerPolicy";
 export * from "./scorecard";
 export * from "./services";
 export * from "./signin";

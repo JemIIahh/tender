@@ -153,6 +153,11 @@ export interface ServeConfig {
   webOrigins: string[];
   /** `TEAM_ACCOUNTS`, split at its commas. */
   teamAccounts: string[];
+  /**
+   * `TEAM_MODEL_AGENTS`, split at its commas: the team's agents that the team runs with a model
+   * through the run-agent command, whose pages show that command's defaults (`runner_policy`).
+   */
+  teamModelAgents: string[];
   telegramBotUsername: string | undefined;
   /** `TRUSTED_PROXY_HOPS`: 0 unless set. */
   trustedProxyHops: number;
@@ -319,8 +324,8 @@ function databaseKind(url: string): "pglite" | "postgres" | undefined {
  * - `PUBLIC_WEB_URL`, whose entries must be http(s) origins, and `NEAR_RPC_URL` and
  *   `NEARDATA_URL`, which must be http(s) URLs. `NEAR_RPC_URL` must be set on the sandbox, whose
  *   node has no fixed address;
- * - `TEAM_ACCOUNTS`, whose entries must be account ids, and `TELEGRAM_BOT_USERNAME`, which must be
- *   a username as in t.me/<username>;
+ * - `TEAM_ACCOUNTS` and `TEAM_MODEL_AGENTS`, whose entries must be account ids, and
+ *   `TELEGRAM_BOT_USERNAME`, which must be a username as in t.me/<username>;
  * - with `KEEPER_PRIVATE_KEY` set, that it is a private key and `KEEPER_ACCOUNT` an account id;
  * - `JUDGE_ACCOUNT`, which must be an account id when it is set, and must be set with
  *   `JUDGE_PRIVATE_KEY`, which must be a private key;
@@ -483,6 +488,13 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
       `TEAM_ACCOUNTS must be NEAR account ids separated by commas; entry ${notAccount + 1} is not one`,
     );
   }
+  const teamModelAgents = entriesOf(get("TEAM_MODEL_AGENTS"));
+  const notAgent = teamModelAgents.findIndex((account) => !isAccountId(account));
+  if (notAgent !== -1) {
+    problems.push(
+      `TEAM_MODEL_AGENTS must be NEAR account ids separated by commas; entry ${notAgent + 1} is not one`,
+    );
+  }
 
   const telegramBotUsername = get("TELEGRAM_BOT_USERNAME");
   if (telegramBotUsername !== undefined && !TELEGRAM_USERNAME.test(telegramBotUsername)) {
@@ -621,6 +633,7 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
     rpcUrl,
     webOrigins,
     teamAccounts,
+    teamModelAgents,
     telegramBotUsername,
     trustedProxyHops,
     keeper,
@@ -1463,6 +1476,7 @@ export async function startServices(
           contractId,
           publicUrl,
           teamAccounts: config.teamAccounts,
+          teamModelAgents: config.teamModelAgents,
           judgeAccount: config.judgeAccount,
           webOrigins: config.webOrigins,
           telegramBotUsername: config.telegramBotUsername,

@@ -12,6 +12,7 @@ export type {
   HealthResponse,
   ListAgentsResponse,
   ListTasksResponse,
+  RunnerPolicy,
   TaskDetail,
   TaskDetailResponse,
   TaskEntry,

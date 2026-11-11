@@ -342,9 +342,10 @@ test("bad_input_is_a_tool_error", async () => {
 });
 
 test("tools_return_the_documents_of_the_rest_routes", async () => {
-  // The poster is the team's, so a tool that forgets the team accounts is caught. The clock is the
-  // one of the deps: at the wall clock's time every task is long past its deadlines.
-  const app = createApp({ ...deps, teamAccounts: [poster] });
+  // The poster is the team's, so a tool that forgets the team accounts is caught; so is alice, run
+  // with a model, so a tool that forgets those agents is caught too. The clock is the one of the
+  // deps: at the wall clock's time every task is long past its deadlines.
+  const app = createApp({ ...deps, teamAccounts: [poster, alice], teamModelAgents: [alice] });
   const client = await connect(app);
   const rest = async (path: string): Promise<string> => {
     const res = await app.request(path);
@@ -377,6 +378,11 @@ test("tools_return_the_documents_of_the_rest_routes", async () => {
     // The very text, so that no number went through a JS number on the way (R19).
     expect(reply.text, `${tool} ${path}`).toBe(await rest(path));
   }
+
+  const agent = documentOf<AgentDetailResponse>(
+    await call(client, "get_agent", { account: alice }),
+  );
+  expect(agent.runner_policy).toMatchObject({ verifiers: "judge" });
 
   const filtered = documentOf<ListTasksResponse>(await call(client, "list_tasks", { tag: "rust" }));
   expect(filtered.tasks.map((task) => task.id)).toEqual(["2"]);

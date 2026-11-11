@@ -17,6 +17,7 @@ import { createStateStore, defaultStateDir } from "@tender/mcp";
 import {
   AccountIdSchema,
   ApiError,
+  MODEL_AGENT_POLICY,
   NETWORKS,
   type NetworkId,
   type TenderApi,
@@ -117,19 +118,21 @@ const USAGE =
 
 /** The most an amount of a token can be: a u128. */
 const MAX_U128 = 2n ** 128n - 1n;
+// The defaults of an agent with a model are `MODEL_AGENT_POLICY` of `@tender/shared`, where the API
+// reads them too, to show them on the page of each agent the deployment names in `TEAM_MODEL_AGENTS`:
 /** The tasks an agent with a model takes on in a UTC day, unless `--daily-entries` says otherwise. */
-const LLM_DAILY_ENTRIES = 20;
+const LLM_DAILY_ENTRIES = MODEL_AGENT_POLICY.dailyEntries;
 /**
  * The tasks voided after their reveals that an agent with a model lets a poster have had, unless
  * `--max-poster-voids` says otherwise: a poster can write held-out checks that nothing passes, read
  * the revealed work and be refunded, and an honest poster's hard task can void too, so a few.
  */
-const LLM_MAX_POSTER_VOIDS = 2;
+const LLM_MAX_POSTER_VOIDS = MODEL_AGENT_POLICY.maxPosterVoids;
 /**
  * The hires the Judge checks that an agent with a model takes on in a UTC day, unless
  * `--daily-judged-hires` says otherwise.
  */
-const LLM_DAILY_JUDGED_HIRES = 50;
+const LLM_DAILY_JUDGED_HIRES = MODEL_AGENT_POLICY.dailyJudgedHires;
 
 /** A failure whose message is the command line's own and safe to print: it holds no value of the environment. */
 export class CliError extends Error {
@@ -309,7 +312,7 @@ export function parseCli(args: readonly string[]): CliArgs {
 
 /** The verifiers of a run: the flag's, else `judge` for an agent with a model and `any` for the rest. */
 function verifiersOf(args: CliArgs): VerifierRule {
-  return args.verifiers ?? (args.solver === "llm" ? "judge" : "any");
+  return args.verifiers ?? (args.solver === "llm" ? MODEL_AGENT_POLICY.verifiers : "any");
 }
 
 // ---- The environment --------------------------------------------------------------------------

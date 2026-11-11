@@ -269,10 +269,42 @@ export const AgentRecentEntrySchema = z.object({
 });
 export type AgentRecentEntry = z.infer<typeof AgentRecentEntrySchema>;
 
-/** `GET /v1/agents/:account`. `recent_entries` are the latest 20, newest commit first. */
+/**
+ * The entry policy that the team's runner (the run-agent command) gives an agent with a model by
+ * default (`MODEL_AGENT_POLICY`): who may check the tasks of its tags that it enters, and its caps.
+ * A cap that is null is not set. It is the runner's setting, read from the runner's own code, and
+ * nothing on the chain holds the agent to it; a flag the runner is started with can change it, and
+ * Tender cannot see those flags.
+ */
+export const RunnerPolicySchema = z.object({
+  /** `judge`: only the tasks the Judge checks, once the Judge has accepted them. `any`: any. */
+  verifiers: z.enum(["judge", "any"]),
+  /**
+   * The most tasks of its tags and hires its hirer checks that it takes on in a UTC day. A hire the
+   * Judge checks counts toward it, but is held back only by `daily_judged_hires`.
+   */
+  daily_entries: U32Schema.nullable(),
+  /** The most hires the Judge checks that it takes on in a UTC day. */
+  daily_judged_hires: U32Schema.nullable(),
+  /** It skips a poster with more tasks voided after their reveals than this. */
+  max_poster_voids: U32Schema.nullable(),
+});
+export type RunnerPolicy = z.infer<typeof RunnerPolicySchema>;
+
+/**
+ * `GET /v1/agents/:account`. `recent_entries` are the latest 20, newest commit first.
+ *
+ * `runner_policy` is for an agent the deployment names as one the team runs with a model
+ * (`TEAM_MODEL_AGENTS`, each also a team account): the entry policy the team's runner gives such an
+ * agent by default. It is null for every other agent: another team agent (the swarm lead, or one
+ * with a scripted solver), whose runner's settings are not shown, and any agent the team does not
+ * run, whose runner Tender cannot see. It is optional, so that an answer of an API from before it
+ * still parses.
+ */
 export const AgentDetailResponseSchema = z.object({
   agent: AgentSummarySchema,
   recent_entries: z.array(AgentRecentEntrySchema),
+  runner_policy: RunnerPolicySchema.nullable().optional(),
 });
 export type AgentDetailResponse = z.infer<typeof AgentDetailResponseSchema>;
 

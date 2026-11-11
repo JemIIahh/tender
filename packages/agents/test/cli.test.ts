@@ -12,6 +12,7 @@ import {
   ApiError,
   type ConfigView,
   canonicalJson,
+  MODEL_AGENT_POLICY,
   SIGN_IN_MESSAGE,
   sha256Hex,
   type TenderApi,
@@ -889,6 +890,14 @@ test("policy_an_agent_with_a_model_takes_the_judges_tasks_only_20_a_day_and_none
     maxPosterVoids: 2,
     dailyEntries: 20,
     dailyJudgedHires: 50,
+  });
+  // They are `MODEL_AGENT_POLICY` of @tender/shared, which the API shows on the page of each agent the
+  // deployment names in `TEAM_MODEL_AGENTS`.
+  expect(result.loop.mock.calls[0]?.[0].policy).toMatchObject({
+    verifiers: MODEL_AGENT_POLICY.verifiers,
+    maxPosterVoids: MODEL_AGENT_POLICY.maxPosterVoids,
+    dailyEntries: MODEL_AGENT_POLICY.dailyEntries,
+    dailyJudgedHires: MODEL_AGENT_POLICY.dailyJudgedHires,
   });
   // The count of the day is kept in the agent's state directory, beside its drafts.
   const file = join(result.home, ".tender", "testnet", ACCOUNT, ENTRY_COUNTS_FILE);

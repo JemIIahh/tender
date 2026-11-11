@@ -200,6 +200,52 @@ export async function accountKeyState(
 }
 
 /**
+ * A key on an account, as `view_access_key_list` has it: a full-access key, or a function-call key,
+ * which can call only `receiver`'s methods (`methods`; all of them when the list is empty) and can
+ * attach no deposit.
+ */
+export type AccessKey =
+  | { publicKey: string; kind: "full_access" }
+  | { publicKey: string; kind: "function_call"; receiver: string; methods: string[] };
+
+/** The key of one entry of `view_access_key_list`, or undefined if it is not one. */
+function accessKeyOf(entry: unknown): AccessKey | undefined {
+  const item = asRecord(entry);
+  const publicKey = item?.public_key;
+  if (typeof publicKey !== "string") return undefined;
+  const permission = asRecord(item?.access_key)?.permission;
+  if (permission === "FullAccess") return { publicKey, kind: "full_access" };
+  const call = asRecord(asRecord(permission)?.FunctionCall);
+  const receiver = call?.receiver_id;
+  const methods = call?.method_names;
+  if (typeof receiver !== "string" || !Array.isArray(methods)) return undefined;
+  if (!methods.every((method): method is string => typeof method === "string")) return undefined;
+  return { publicKey, kind: "function_call", receiver, methods };
+}
+
+/**
+ * Every key of `accountId` (`view_access_key_list`), or null when there is no such account. Only
+ * the node's own word that the account does not exist is null: `UNKNOWN_ACCOUNT`, or an older
+ * node's "does not exist" in words. Any other "unknown" (`UNKNOWN_BLOCK`, when the node lacks the
+ * block it was asked at) is a read that failed, and throws an `RpcError`, as does a list that holds
+ * anything but keys: a count, or a "none", made of a list it could not read would be a guess.
+ */
+export async function accessKeysOf(accountId: string): Promise<AccessKey[] | null> {
+  const answer = await query({ request_type: "view_access_key_list", account_id: accountId });
+  if ("missing" in answer) {
+    if (answer.missing === "UNKNOWN_ACCOUNT" || answer.missing === "") return null;
+    throw new RpcError(`view_access_key_list failed: the RPC node answered ${answer.missing}`);
+  }
+  const keys = answer.result.keys;
+  if (!Array.isArray(keys)) throw new RpcError("view_access_key_list returned no list of keys");
+  return keys.map((entry) => {
+    const key = accessKeyOf(entry);
+    if (key === undefined) throw new RpcError("view_access_key_list returned a key it can't read");
+    return key;
+  });
+}
+
+/**
  * The full-access keys of `accountId` (`view_access_key_list`), as `ed25519:<base58>`, or null when
  * there is no such account. A function-call key is left out.
  */

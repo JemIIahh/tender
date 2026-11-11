@@ -232,10 +232,27 @@ export interface AgentRecentEntry {
   won: boolean;
 }
 
-/** `GET /v1/agents/:account`. `recent_entries` are the latest `RECENT_ENTRIES`, newest commit first. */
+/**
+ * The entry policy the team's runner gives an agent with a model, from `MODEL_AGENT_POLICY`: the
+ * runner's setting, not the contract's.
+ */
+export interface RunnerPolicy {
+  verifiers: "judge" | "any";
+  daily_entries: number | null;
+  daily_judged_hires: number | null;
+  max_poster_voids: number | null;
+}
+
+/**
+ * `GET /v1/agents/:account`. `recent_entries` are the latest `RECENT_ENTRIES`, newest commit first.
+ * `runner_policy` is for an agent of the team that the deployment names as run with a model
+ * (`ApiDeps.teamModelAgents`), and null for any other. The API always sends it; it is optional in
+ * the type because the shared schema leaves it so, that a client reads an API from before it.
+ */
 export interface AgentDetailResponse {
   agent: AgentSummary;
   recent_entries: AgentRecentEntry[];
+  runner_policy?: RunnerPolicy | null;
 }
 
 /** One entry of an account, with the task it is in. */

@@ -17,10 +17,12 @@ import {
   putFixtureBlobs,
 } from "@tender/indexer/testing";
 import {
+  AgentDetailResponseSchema,
   type AgentSummary,
   AgentSummarySchema,
   type Brief,
   canonicalJson,
+  MODEL_AGENT_POLICY,
   type Phase,
   type PosterRecordResponse,
   PosterRecordResponseSchema,
@@ -38,6 +40,7 @@ import {
   type ApiDeps,
   type ChainReader,
   createApp,
+  getAgentDetail,
   type HealthResponse,
   type ListAgentsResponse,
   type ListTasksResponse,
@@ -1062,6 +1065,58 @@ test("agent_detail_marks_only_listed_winners_as_winners", async () => {
     );
   expect(await wonBy(alice)).toEqual(["2:true", "1:true"]);
   expect(await wonBy(bob)).toEqual(["2:false", "1:true"]);
+});
+
+test("agent_detail_carries_the_team_runners_policy_only_for_a_team_agent_run_with_a_model", async () => {
+  await seedLifecycle(deps.db);
+  // alice and bob are the team's; only alice is named as run with a model. carol is named, but is
+  // not the team's. The judge is neither.
+  const app = appWith({ teamAccounts: [alice, bob], teamModelAgents: [alice, carol] });
+  await apply(eventLine("agent_registered", { account: carol, asp: null }));
+  const of = async (account: string) =>
+    (await get<AgentDetailResponse>(`/v1/agents/${account}`, app)).body;
+
+  // alice: the runner's defaults for an agent with a model, the very values the runner reads
+  // (`MODEL_AGENT_POLICY`), field for field.
+  const model = await of(alice);
+  expect(model.agent.is_team).toBe(true);
+  expect(model.runner_policy).toEqual({
+    verifiers: MODEL_AGENT_POLICY.verifiers,
+    daily_entries: MODEL_AGENT_POLICY.dailyEntries,
+    daily_judged_hires: MODEL_AGENT_POLICY.dailyJudgedHires,
+    max_poster_voids: MODEL_AGENT_POLICY.maxPosterVoids,
+  });
+  // And they are the figures the runner's own test holds it to (packages/agents, cli.test.ts).
+  expect(model.runner_policy).toEqual({
+    verifiers: "judge",
+    daily_entries: 20,
+    daily_judged_hires: 50,
+    max_poster_voids: 2,
+  });
+  expect(AgentDetailResponseSchema.parse(model).runner_policy).toEqual(model.runner_policy);
+
+  // bob is the team's but not on the list (the swarm lead, say, or a scripted agent): those
+  // defaults do not govern him, so none are sent.
+  const team = await of(bob);
+  expect(team.agent.is_team).toBe(true);
+  expect(team.runner_policy).toBeNull();
+  // carol is on the list but not the team's, and the judge is on neither: Tender cannot see their
+  // runners.
+  for (const account of [carol, judge]) {
+    const other = await of(account);
+    expect(other.agent.is_team, account).toBe(false);
+    expect(other.runner_policy, account).toBeNull();
+    expect(AgentDetailResponseSchema.safeParse(other).success, account).toBe(true);
+  }
+
+  // With no list, no team agent has one.
+  const unset = (
+    await get<AgentDetailResponse>(`/v1/agents/${alice}`, appWith({ teamAccounts: [alice] }))
+  ).body;
+  expect(unset.runner_policy).toBeNull();
+
+  // The MCP tool reads the same document, through the same query.
+  expect(model).toEqual(await getAgentDetail(deps.db, alice, nowNs, [alice, bob], [alice, carol]));
 });
 
 // ---- Entries ----------------------------------------------------------------------------------

@@ -602,6 +602,12 @@ const RECENT_ENTRY = {
   revealed: false,
   won: false,
 };
+const RUNNER_POLICY = {
+  verifiers: "judge",
+  daily_entries: 20,
+  daily_judged_hires: 50,
+  max_poster_voids: 2,
+};
 const ISSUE = { path: ["title"], message: "Required", code: "invalid_type" };
 const PICKED = {
   kind: "picked",
@@ -670,7 +676,29 @@ const SAMPLES: { [name in SchemaName]: Sample[] } = {
   AgentSummarySchema: [{ body: AGENT }],
   ListAgentsResponseSchema: [{ body: { agents: [AGENT], next_cursor: ALICE } }],
   AgentRecentEntrySchema: [{ body: RECENT_ENTRY }],
-  AgentDetailResponseSchema: [{ body: { agent: AGENT, recent_entries: [RECENT_ENTRY] } }],
+  RunnerPolicySchema: [
+    { body: RUNNER_POLICY },
+    {
+      body: {
+        verifiers: "any",
+        daily_entries: null,
+        daily_judged_hires: null,
+        max_poster_voids: 0,
+      },
+    },
+  ],
+  AgentDetailResponseSchema: [
+    // An API from before the runner's policy sends none.
+    { body: { agent: AGENT, recent_entries: [RECENT_ENTRY] } },
+    {
+      body: { agent: AGENT, recent_entries: [RECENT_ENTRY], runner_policy: RUNNER_POLICY },
+      optional: ["runner_policy"],
+    },
+    {
+      body: { agent: AGENT, recent_entries: [], runner_policy: null },
+      optional: ["runner_policy"],
+    },
+  ],
   PosterRecordResponseSchema: [
     { body: { account: POSTER, tasks_posted: 4, voided_after_reveals: 1, is_team: false } },
   ],
