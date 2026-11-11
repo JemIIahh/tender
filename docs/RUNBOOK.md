@@ -238,8 +238,26 @@ The bot and the notifier start only when `TELEGRAM_BOT_TOKEN` is set, and they n
 | `NEXT_PUBLIC_CONTRACT` | the contract account |
 | `NEXT_PUBLIC_RPC_URL` | optional; a key in it is public, so use one issued for browsers |
 | `NEXT_PUBLIC_JUDGE_ACCOUNT` | the Judge's account, so the post wizard can offer it |
+| `NEXT_PUBLIC_PRIVY_APP_ID` | optional; Privy's app id, which turns on the email and Google login (below) |
+| `NEXT_PUBLIC_PRIVY_CLIENT_ID` | optional; the id of a Privy app client, with the app id only |
 
 Leave `NEXT_PUBLIC_DEV_WALLET*` unset. It works on the sandbox only.
+
+### The email and Google login (Privy)
+
+With `NEXT_PUBLIC_PRIVY_APP_ID` set, Connect opens a chooser: "Continue with email or Google" first, and "Use a NEAR wallet" (the NEAR wallets, as before) second. A login makes the person a NEAR implicit account (64 hex characters, its public key). Privy keeps that account's key and signs with it once the person has logged in; the web app builds and sends each transaction itself. Right after a login, the page reads the account's balance and, under 0.05 NEAR, asks `POST /v1/gas-gift` for testnet NEAR for its fees (the API's gas gift must be set up: `PRIVY_APP_ID` and `PRIVY_VERIFICATION_KEY` on the API host). If the gift is off or refused, the page says so in one line and links the testnet faucet. Without the app id, the app has no login and Connect opens the NEAR wallets directly. The sandbox ignores the app id: it has the dev wallet.
+
+The owner sets it up in Privy's dashboard (dashboard.privy.io); nothing here does it:
+
+1. Create an app.
+2. Under the login methods, turn on **Email** and **Google**, and turn the others off. The app's button names these two.
+3. Under **Configuration > App settings > Clients**, add the origins the app is served from to **Allowed origins**: the local preview (`http://localhost:3000`, or the port you use), the phone preview `http://jemiiah-macbook-pro.local:3050`, and the domain once it is bought.
+4. Copy the **app id** into `NEXT_PUBLIC_PRIVY_APP_ID` (web) and `PRIVY_APP_ID` (API), and the client's id, if you made one, into `NEXT_PUBLIC_PRIVY_CLIENT_ID`.
+5. Copy the **verification key** (**Configuration > App settings**) into `PRIVY_VERIFICATION_KEY` on the API host, for the gas gift.
+
+Both ids are public: they ship in the page. The verification key is a public key too, but it belongs to the API. The web app sets no Content-Security-Policy; if one is added, it must allow what Privy lists (`auth.privy.io` in `frame-src`, `child-src` and `connect-src`, `*.rpc.privy.systems` in `connect-src`, and Cloudflare's `challenges.cloudflare.com` for its CAPTCHA): https://docs.privy.io/security/implementation-guide/content-security-policy.
+
+"Export key" on the wallet page opens Privy's own window, on Privy's domain, from which the person copies the account's private key; the web app never sees it.
 
 ### Deploy order: the API first, then the client
 
