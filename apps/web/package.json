@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@hot-labs/near-connect": "0.12.0",
+    "@privy-io/react-auth": "3.51.0",
     "@tender/client": "workspace:*",
     "@tender/shared": "workspace:*",
     "near-api-js": "7.4.0",
