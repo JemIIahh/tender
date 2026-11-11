@@ -1,6 +1,6 @@
 # Runbook
 
-For the person who deploys and runs Tender. It covers a deployment to testnet. Section 1, the contract deploy, was run on testnet on 2026-11-04 and wrote `deployments/testnet.json`; the rest is written from the scripts and the code, and the services and the web app are not hosted yet. Where a step is the owner's to take (anything that spends, posts, publishes or uses a secret), it says so.
+For the person who deploys and runs Tender. It covers a deployment to testnet. Section 1, the contract deploy, was run on testnet on 2026-11-04 and wrote `deployments/testnet.json`; the rest is written from the scripts and the code, and the services and the web app are not hosted yet. Sections 11 and 12 say how to host them on Railway and Vercel: they are written from those hosts' docs and from local runs of the web build and of `pnpm serve` on `PORT`, and nothing was deployed. Where a step is the owner's to take (anything that spends, posts, publishes or uses a secret), it says so.
 
 Mainnet is not covered. The scripts refuse it, and a mainnet deploy needs decisions that are not made ([LIMITS.md](LIMITS.md)).
 
@@ -104,7 +104,7 @@ The lead keeps a journal directory so that it never pays for a part twice. One l
 pnpm serve
 ```
 
-or build and run the image (`docker build .`; the `Dockerfile` runs `pnpm serve` as a non-root user and exposes 8787). The image has not been built yet. Both read the same environment.
+or build and run the image (`docker build .`; the `Dockerfile` runs `pnpm serve` as a non-root user and exposes 8787). The image has not been built yet. Both read the same environment. Section 11 hosts it on Railway.
 
 Minimum for a testnet deployment:
 
@@ -117,6 +117,7 @@ Minimum for a testnet deployment:
 | `DATABASE_URL` | the Postgres URL (or `pglite:<dir>` on one machine) |
 | `PUBLIC_API_URL` | the exact `https` URL clients call. Sign-in and the blob URIs that go on chain are bound to it, so changing it later breaks both |
 | `PUBLIC_WEB_URL` | the web app's URL: used for links in Telegram messages and as the CORS origin |
+| `API_PORT`, or `PORT` | the port the API listens on, on every address of the machine. `API_PORT` wins; `PORT` is read only when it is unset, and is the one a host such as Railway sets. 8787 when neither is set |
 | `KEEPER_ACCOUNT`, `KEEPER_PRIVATE_KEY` | the keeper starts only when its key is set |
 | `JUDGE_ACCOUNT`, `JUDGE_PRIVATE_KEY` | the Judge starts only when its key is set |
 | `TEAM_ACCOUNTS` | the accounts that are ours, labelled so in the API and UI |
@@ -254,3 +255,79 @@ Notes:
 - The `@tender/db` tests always run on PGlite, and also on a Postgres server when `TEST_DATABASE_URL` is set. CI sets it on every push, to a Postgres 17 service, so the Postgres paths run there. To run them on your machine, set it to a Postgres 17 database.
 - `pnpm demo:local` runs the whole loop on a local chain in about 80 seconds once the local node is downloaded, and prints `DEMO OK`. The first run of an install also downloads the node (about 30 MB; it prints a line before it starts), which takes a few minutes on a slow link; `NEAR_SANDBOX_BIN_PATH` skips that. `pnpm demo:local --keep` then keeps the chain and the services up until Ctrl-C, for the MCP server. The swarm demo is `pnpm exec tsx scripts/swarm-demo.ts`, four to five minutes.
 - The same checks guard what is public: `pnpm exec vitest run --project scripts scripts/check-public.test.ts` fails if a tracked or not-yet-tracked file is an `.env*` file other than the example, is under `.submission/` or `seeds-private/`, or holds the owner's email address, a NEAR `ed25519:` private key, a PEM private key, a Telegram bot token, an `sk-`, GitHub, AWS, Slack or Google key, a JWT, or a `NAME=value` line (at the start of a line, with or without `export`) for a capitalised name that is, or ends in, `API_KEY`, `APIKEY`, `SECRET`, `TOKEN`, `PASSWORD`, `JWT` or `PRIVATE_KEY`, with a value of 16 or more characters that is no placeholder. It finds nothing of any other shape (a short password, a lower-case name, a key in a TypeScript object), and it is not in the pre-commit hook, so run it before you commit.
+
+## 11. Hosting on Railway (the services)
+
+`railway.json` in the repository root is Railway's config as code. It builds the `Dockerfile`, runs its command (`pnpm serve`), runs one replica (one services process per database), restarts a crash up to 3 times, and after each start waits up to 300 seconds for `GET /v1/health` to answer 200. Each step below is the owner's: it makes a bill, uses secrets, or both.
+
+1. **Project.** In Railway: New project, Deploy from GitHub repo, and choose this repository. While it is not public, Railway asks for access to it. The first deploy fails until step 3 is done. That is expected.
+2. **Database.** In the project: New, Database, PostgreSQL. Its `DATABASE_URL` is a direct connection, as the indexer's lock needs (section 3): Railway puts no pooler in front of it, so do not add one. Use `DATABASE_URL` and not `DATABASE_PUBLIC_URL`, which exists only if you turn on public access. Do not use `pglite:` here: the container's disk is not kept between deploys.
+3. **Variables.** On the service, Variables. The values come from `.env.example`, `deployments/testnet.json` and `.env.deploy.testnet`; section 3 says what each does.
+
+   | Variable | Value | Secret |
+   |---|---|---|
+   | `TENDER_NETWORK` | `testnet` | |
+   | `TENDER_CONTRACT` | `contract` in `deployments/testnet.json` | |
+   | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}`: Railway's reference to the database's own variable (use the service's name if it is not `Postgres`) | holds the database password; Railway keeps it |
+   | `NEAR_RPC_URL` | a testnet RPC URL | if it holds a key |
+   | `FASTNEAR_API_KEY` | optional | yes |
+   | `PUBLIC_API_URL` | the final `https` address of the API (step 4) | |
+   | `PUBLIC_WEB_URL` | the final `https` address of the web app | |
+   | `TRUSTED_PROXY_HOPS` | `1` (see below) | |
+   | `KEEPER_ACCOUNT`, `KEEPER_PRIVATE_KEY` | the two lines of `.env.deploy.testnet` | the key |
+   | `JUDGE_ACCOUNT`, `JUDGE_PRIVATE_KEY` | the two lines of `.env.deploy.testnet` | the key |
+   | `TEAM_ACCOUNTS`, `TEAM_MODEL_AGENTS` | as in section 3 | |
+   | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | the Judge's model (section 4) | the key |
+   | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, `TELEGRAM_MODE`, `TELEGRAM_WEBHOOK_SECRET` | optional; `webhook` mode here (section 6) | the token and the secret |
+
+   Leave `PORT` alone: Railway sets it for the container, and the API listens on it. Do not set `API_PORT`, `TENDER_ENV_DIR`, `DEBUG`, any `NEXT_PUBLIC_*`, `DEPLOY_*` or `*_FULL_ACCESS_KEY` variable.
+
+   **Keys.** The only key lines that go to Railway are `KEEPER_PRIVATE_KEY` and `JUDGE_PRIVATE_KEY`, the function-call keys of section 2. Never a `*_FULL_ACCESS_KEY`, `DEPLOY_PARENT_PRIVATE_KEY` or an agent's key. The owner pastes them into Railway's Variables page in the browser and nowhere else: not into a file in the repository, a commit, a chat or a log. Railway can seal a variable, which hides its value in the dashboard from then on and cannot be undone: seal the keys once the services run.
+4. **Public address.** On the service: Settings, Networking, Generate Domain. Railway finds the port the API listens on. `PUBLIC_API_URL` and `PUBLIC_WEB_URL` must be the final `https` addresses, because sign-in and the blob URIs that go on chain are bound to the API's (section 3). With the domain bought, add `api.<domain>` as a custom domain now (section 12) and use that. Without it, use the generated `https://<name>.up.railway.app` address, and do not change it later. Settle both before section 5 posts a task.
+5. **Deploy and check.** Press Deploy. Then `GET https://<address>/v1/health` answers 200 with `"ok": true`, and the deploy log shows `serve: API at ... called at https://...`, `keeper on` and `Judge on`.
+
+Notes:
+
+- **The check runs only when a deploy starts.** Railway never asks again, so section 8 still applies. `/v1/health` answers 200 while the indexer catches up (`lag_blocks` shows how far behind). It answers 503 `chain_unavailable` only when the API cannot read the chain's final height at all: then the deploy fails after 300 seconds, and `NEAR_RPC_URL` is the first thing to check.
+- **A redeploy starts the new container beside the old one.** On Postgres the new one serves the API at once and takes the indexer lock when the old one lets go, a few seconds after it, so the keeper and the Judge never run twice. The old one gets SIGTERM and 30 seconds to stop (`drainingSeconds`). Run locally, `pnpm serve` stops within a second of SIGTERM.
+- **A crash restarts up to 3 times, then stays down.** Read the log. The services end with 1 when the database is another deploy's, and no restart fixes that (section 8).
+- **`TRUSTED_PROXY_HOPS=1`.** Railway's edge is one proxy in front of the API, and Railway says it replaces `X-Forwarded-For` with the client's address. At 0, every visitor counts as one client and the whole site shares the four event streams (section 3). Railway's staff say the hop count is not a promise: if visitors at different addresses get `429 rate_limited` together, look here first. Keep other services out of this project: section 3's rule holds only while the API is reached through the edge alone.
+- **Section 3's backup rule applies.** Railway's database is the only copy of the uploads until you set up a backup.
+
+## 12. Hosting the web app on Vercel
+
+Import the same repository in Vercel (Add New, Project; while it is not public, Vercel asks for access). The settings that matter:
+
+| Setting | Value |
+|---|---|
+| Root Directory | `apps/web` |
+| Include source files outside of the Root Directory | on (the default): the app imports `packages/shared` and `packages/client` |
+| Framework Preset | Next.js |
+| Install Command | the default, `pnpm install`. Run from `apps/web`, pnpm finds the workspace at the repository root and installs all of it from the lockfile. No `vercel.json` is needed |
+| Build Command | the default, `pnpm run build`, which is `next build` |
+| Node.js Version | 24.x (Settings, Build and Deployment) |
+| `ENABLE_EXPERIMENTAL_COREPACK` | `1`, as an environment variable: Vercel then uses the pnpm that the root `package.json` pins (10.26.0), and not 9 or 10 as it picks from the lockfile |
+
+Environment variables, for Production (section 7 has the meaning of each). All are sent to the browser, so none holds a secret, and the build bakes them in: changing one needs a redeploy.
+
+| Variable | Value |
+|---|---|
+| `NEXT_PUBLIC_NETWORK` | `testnet` |
+| `NEXT_PUBLIC_API_URL` | the same address as `PUBLIC_API_URL` |
+| `NEXT_PUBLIC_CONTRACT` | the same account as `TENDER_CONTRACT` |
+| `NEXT_PUBLIC_JUDGE_ACCOUNT` | the same account as `JUDGE_ACCOUNT` |
+| `NEXT_PUBLIC_RPC_URL` | optional (section 7) |
+
+A build without `NEXT_PUBLIC_NETWORK`, `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_CONTRACT` fails and names the variable, so a missing one stops the deploy and ships no broken site. A preview deployment has its own address, which is not in `PUBLIC_WEB_URL`, so the API refuses its calls from a browser (CORS): use Production.
+
+If the install stops with `ERR_PNPM_UNSUPPORTED_ENGINE`, the 24.x that Vercel runs is older than the 24.21 that `package.json` asks for (and `.npmrc` enforces). Pick 26.x for the project: `engines` allows it.
+
+**Order.** Services first, then the web app (section 7's rule). Check `/v1/health` on the API, then deploy the web app, then open it and look for tasks on the home page.
+
+**The domain.** The owner adds it, and both hosts say which DNS records to create:
+
+1. Vercel: Settings, Domains, add `<domain>` for the web app.
+2. Railway: the service, Settings, Networking, Custom Domain, add `api.<domain>`. Railway shows a CNAME and a TXT record: create both at the DNS provider, and wait for the green check.
+3. Set `PUBLIC_API_URL=https://api.<domain>` and `PUBLIC_WEB_URL=https://<domain>` on Railway, and `NEXT_PUBLIC_API_URL=https://api.<domain>` on Vercel. Redeploy the services first, then the web app.
+
+Do this before section 5: a task posted under the old API address keeps a blob URI that points at it.
