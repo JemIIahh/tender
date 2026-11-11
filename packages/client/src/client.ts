@@ -269,7 +269,8 @@ export function toTxResult(resp: FinalTxOutcome, contractId: string): TxResult {
  * amount or count return a bigint.
  *
  * Sending needs a `signer`. `send` waits until the transaction and all of its receipts are final,
- * so a view made after it sees what it did. A failure on chain throws a `TenderError`; an error
+ * so a view made after it sees what it did; `transfer`, which sends NEAR, waits only until its
+ * receipt has run (see there). A failure on chain throws a `TenderError`; an error
  * before the transaction ran, from the RPC or from near-api-js, is thrown as near-api-js throws
  * it.
  *
@@ -419,6 +420,41 @@ export class TenderClient {
             waitUntil: "FINAL",
             throwOnFailure: false,
             signer,
+          }),
+        SEND_MAY_STILL_LAND,
+      );
+      return toTxResult(resp, this.contractId);
+    });
+  }
+
+  /**
+   * Sends `amount` yoctoNEAR from the signer to `receiverId`, as one `Transfer` action. A transfer to
+   * an implicit account that is not on chain yet creates it, with the key its name is the hex of.
+   * Only a full-access key can sign it: a function-call key cannot attach NEAR.
+   *
+   * It waits until the transfer has executed (`EXECUTED`: the transaction is in a final block and
+   * its receipt has run), and not until that receipt's block is final too, as `send` does: a view
+   * of the last final block made at once may not see it yet. It goes through `defaultQueue` like
+   * `send`, with `sendTimeoutMs`. A transfer that failed on chain throws a `TenderError` with the
+   * hash; one the node refused before it ran (not enough NEAR, a bad nonce) throws as near-api-js
+   * throws it, and one that ran out of time throws `E_TIMEOUT`, and may still land.
+   */
+  async transfer(receiverId: string, amount: bigint): Promise<TxResult> {
+    const account = this.account;
+    if (account === undefined) {
+      throw new Error("this TenderClient has no signer, so it cannot send transactions");
+    }
+    if (amount <= 0n) throw new RangeError("TenderClient.transfer: amount must be above 0");
+    return defaultQueue.run(account.accountId, async () => {
+      const resp = await withDeadline(
+        "TenderClient.transfer",
+        this.sendTimeoutMs,
+        () =>
+          account.signAndSendTransaction({
+            receiverId,
+            actions: [actions.transfer(amount)],
+            waitUntil: "EXECUTED",
+            throwOnFailure: false,
           }),
         SEND_MAY_STILL_LAND,
       );
@@ -605,6 +641,26 @@ export class TenderClient {
       this.provider.viewBlock({ finality: FINALITY }),
     );
     return BigInt(header.timestamp_nanosec);
+  }
+
+  /**
+   * The NEAR `accountId` holds, in yoctoNEAR, at the last final block: its `amount`, which is what
+   * it can spend on fees and transfers (staked NEAR is not in it). An account that does not exist
+   * holds 0, as an implicit account that nobody has sent NEAR to yet. Any other RPC error is thrown,
+   * never read as 0; a node that does not answer in `rpcTimeoutMs` throws `E_TIMEOUT`.
+   */
+  async nearBalanceOf(accountId: string): Promise<bigint> {
+    try {
+      const view = await withDeadline("TenderClient.nearBalanceOf", this.rpcTimeoutMs, () =>
+        this.provider.viewAccount({ accountId, blockQuery: { finality: FINALITY } }),
+      );
+      // near-api-js 7.4.0 hands `amount` back as a bigint, though its type says a string: either
+      // way it is read as the decimal it is.
+      return BigInt(U128StringSchema.parse(String(view.amount)));
+    } catch (error) {
+      if (error instanceof AccountDoesNotExistError) return 0n;
+      throw error;
+    }
   }
 
   /**

@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { type extractEvents, NETWORKS, type PostTaskInput, type TenderCall } from "@tender/shared";
-import { KeyPair } from "near-api-js";
+import { Account, actions, KeyPair } from "near-api-js";
 import { afterEach, describe, expect, expectTypeOf, test, vi } from "vitest";
 import { TenderClient, TenderError, type TxResult, toTxResult } from "../src/index";
 
@@ -651,4 +651,114 @@ describe("toTxResult", () => {
       );
     },
   );
+});
+
+describe("NEAR transfers and balances", () => {
+  /** What `view_account` answers for an account that holds `amount` yoctoNEAR. */
+  const accountView = (amount: string) => ({
+    result: {
+      ...BLOCK,
+      amount,
+      locked: "0",
+      code_hash: "11111111111111111111111111111111",
+      storage_usage: 182,
+      storage_paid_at: 0,
+    },
+  });
+
+  test("the_balance_is_the_accounts_amount_at_the_last_final_block", async () => {
+    const amount = "340282366920938463463374607431768211455";
+    const { client, requests } = await fakeRpc(() => accountView(amount));
+    expect(await client.nearBalanceOf("alice.test.near")).toBe(BigInt(amount));
+    expect(requests[0]).toMatchObject({
+      method: "query",
+      params: { request_type: "view_account", account_id: "alice.test.near", finality: "final" },
+    });
+  });
+
+  test("an_account_that_does_not_exist_holds_nothing", async () => {
+    // An implicit account that nobody has sent NEAR to is not on chain yet.
+    const { client } = await fakeRpc(() => ({
+      error: {
+        name: "HANDLER_ERROR",
+        cause: {
+          name: "UNKNOWN_ACCOUNT",
+          info: { requested_account_id: "ab".repeat(32), ...BLOCK },
+        },
+        code: -32000,
+        message: "Server error",
+      },
+    }));
+    expect(await client.nearBalanceOf("ab".repeat(32))).toBe(0n);
+  });
+
+  test.each([
+    [{ name: "HANDLER_ERROR", cause: { name: "UNKNOWN_BLOCK", info: {} } }],
+    [{ name: "INTERNAL_ERROR", cause: { name: "INTERNAL_ERROR", info: { error_message: "x" } } }],
+  ])("any_other_rpc_error_is_thrown_and_never_read_as_nothing %j", async (error) => {
+    const { client } = await fakeRpc(() => ({ error: { ...error, code: -32000, message: "x" } }));
+    await expect(client.nearBalanceOf("alice.test.near")).rejects.toThrow();
+  });
+
+  /** A signing client whose sends do not reach a node: `answer` is what each send returns. */
+  function signing(answer: () => unknown) {
+    const key = KeyPair.fromRandom("ed25519");
+    const client = new TenderClient({
+      network: "testnet",
+      contractId: CONTRACT,
+      signer: { accountId: "gift.test.near", privateKey: key.toString() },
+    });
+    const sent = vi
+      .spyOn(Account.prototype, "signAndSendTransaction")
+      .mockImplementation(async () => answer() as never);
+    return { client, sent };
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("a_transfer_is_one_transfer_action_and_waits_until_it_has_executed", async () => {
+    const { client, sent } = signing(() => ({
+      status: { SuccessValue: "" },
+      transaction: { hash: "TX" },
+      receipts_outcome: [
+        {
+          id: "R1",
+          outcome: { executor_id: "ab".repeat(32), status: { SuccessValue: "" }, logs: [] },
+        },
+      ],
+    }));
+    const result = await client.transfer("ab".repeat(32), 100n);
+    expect(result).toMatchObject({ txHash: "TX", events: [], returnValue: undefined });
+    expect(sent).toHaveBeenCalledTimes(1);
+    const [args] = sent.mock.calls[0] ?? [];
+    expect(args).toMatchObject({
+      receiverId: "ab".repeat(32),
+      waitUntil: "EXECUTED",
+      throwOnFailure: false,
+    });
+    expect(args?.actions).toEqual([actions.transfer(100n)]);
+  });
+
+  test("a_transfer_that_failed_on_chain_throws_with_its_hash", async () => {
+    const failure = { ActionError: { index: 0, kind: { LackBalanceForState: {} } } };
+    const { client } = signing(() => ({
+      status: { Failure: failure },
+      transaction: { hash: "TX" },
+      receipts_outcome: [],
+    }));
+    await expect(client.transfer("ab".repeat(32), 100n)).rejects.toMatchObject({
+      code: "E_UNKNOWN",
+      txHash: "TX",
+    });
+  });
+
+  test("a_transfer_needs_a_signer_and_an_amount", async () => {
+    const reader = new TenderClient({ network: "testnet", contractId: CONTRACT });
+    await expect(reader.transfer("ab".repeat(32), 100n)).rejects.toThrow(/no signer/);
+    const { client, sent } = signing(() => ({}));
+    await expect(client.transfer("ab".repeat(32), 0n)).rejects.toThrow(RangeError);
+    expect(sent).not.toHaveBeenCalled();
+  });
 });

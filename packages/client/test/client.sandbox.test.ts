@@ -1,6 +1,7 @@
 import {
   commitCall,
   computeCommitment,
+  implicitAccountOf,
   type PostTaskInput,
   parseEventLog,
   postTaskCall,
@@ -430,4 +431,31 @@ test("view_access_key_passes_the_permission_through", async () => {
       },
     },
   });
+});
+
+test("a_transfer_creates_an_implicit_account_with_the_amount", async () => {
+  const NEAR = 10n ** 24n;
+  const sender = clients.treasury;
+  const implicit = implicitAccountOf(KeyPair.fromRandom("ed25519").getPublicKey().toString());
+  if (implicit === null) throw new Error("a fresh ed25519 key has no implicit account");
+  // Nobody has sent it NEAR, so it is not on chain, and holds nothing.
+  expect(await sender.nearBalanceOf(implicit)).toBe(0n);
+  const before = await sender.nearBalanceOf(id("treasury"));
+
+  const result = await sender.transfer(implicit, NEAR / 10n);
+  expect(result.txHash).toMatch(/^[1-9A-HJ-NP-Za-km-z]{43,44}$/);
+  expect(result.events).toEqual([]);
+  // `transfer` waits until it has executed, not until that block is final: the final view catches
+  // up within a few blocks.
+  const giveUpAt = Date.now() + 15_000;
+  while ((await sender.nearBalanceOf(implicit)) === 0n && Date.now() < giveUpAt) await sleep(200);
+  expect(await sender.nearBalanceOf(implicit)).toBe(NEAR / 10n);
+  // The sender paid the amount and a little gas.
+  const after = await sender.nearBalanceOf(id("treasury"));
+  expect(before - after).toBeGreaterThan(NEAR / 10n);
+  expect(before - after).toBeLessThan(NEAR / 10n + NEAR / 100n);
+
+  // More than the sender holds is refused by the node: nothing runs.
+  await expect(sender.transfer(implicit, after + NEAR)).rejects.toThrow();
+  expect(await sender.nearBalanceOf(implicit)).toBe(NEAR / 10n);
 });
