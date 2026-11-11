@@ -2,7 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { connect } from "node:net";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseEnv } from "node:util";
 import { ApiClient, type LocalChain, startLocalChain, TenderClient } from "@tender/client";
@@ -478,6 +478,16 @@ test("serve_boots_with_pglite_and_reports_health", async () => {
   expect((await fetch(`${services.url}${TELEGRAM_WEBHOOK_PATH}`, { method: "POST" })).status).toBe(
     404,
   );
+
+  // The API is on every address of the machine, not on the loopback one alone: a host's proxy
+  // reaches a container by its own address. A machine with no such address (no network) skips this.
+  const outside = Object.values(networkInterfaces())
+    .flat()
+    .find((entry) => entry !== undefined && !entry.internal && entry.family === "IPv4");
+  if (outside !== undefined) {
+    const answer = await health(`http://${outside.address}:${new URL(services.url).port}`);
+    expect(answer.status).toBe(200);
+  }
 
   await services.stop();
 });

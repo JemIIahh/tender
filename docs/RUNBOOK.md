@@ -258,11 +258,12 @@ Notes:
 
 ## 11. Hosting on Railway (the services)
 
-`railway.json` in the repository root is Railway's config as code. It builds the `Dockerfile`, runs its command (`pnpm serve`), runs one replica (one services process per database), restarts a crash up to 3 times, and after each start waits up to 300 seconds for `GET /v1/health` to answer 200. Each step below is the owner's: it makes a bill, uses secrets, or both.
+`railway.json` in the repository root is Railway's config as code. It builds the `Dockerfile`, runs its command (`pnpm serve`), runs one replica (one services process per database), restarts a crash up to 3 times, and when a deploy starts waits up to 300 seconds for `GET /v1/health` to answer 200. Each step below is the owner's: it costs money, uses secrets, or both.
 
-1. **Project.** In Railway: New project, Deploy from GitHub repo, and choose this repository. While it is not public, Railway asks for access to it. The first deploy fails until step 3 is done. That is expected.
+1. **Project.** In Railway: New project, Deploy from GitHub repo, and choose this repository. While it is not public, Railway asks for access to it. The first deploy fails until the variables (step 4) are set. That is expected. Railway then deploys again on every push to the branch, and a docs-only push restarts the services (safe, see the redeploy note below). In the last days before the deadline, hold that back: the service's Settings, Source, has "Wait for CI", or disconnect the branch and deploy by hand.
 2. **Database.** In the project: New, Database, PostgreSQL. Its `DATABASE_URL` is a direct connection, as the indexer's lock needs (section 3): Railway puts no pooler in front of it, so do not add one. Use `DATABASE_URL` and not `DATABASE_PUBLIC_URL`, which exists only if you turn on public access. Do not use `pglite:` here: the container's disk is not kept between deploys.
-3. **Variables.** On the service, Variables. The values come from `.env.example`, `deployments/testnet.json` and `.env.deploy.testnet`; section 3 says what each does.
+3. **Public address.** On the service: Settings, Networking, Generate Domain. `PUBLIC_API_URL` and `PUBLIC_WEB_URL` must be the final `https` addresses, because sign-in and the blob URIs that go on chain are bound to the API's (section 3). With the domain bought, add `api.<domain>` as a custom domain now (section 12) and use that. Without it, use the generated `https://<name>.up.railway.app` address, and do not change it later. Settle both before section 5 posts a task. If Railway asks for the port, use the `PORT` it set: the log line `serve: API at http://127.0.0.1:<port>` shows it. If the health check says "service unavailable" while the log shows 8787, Railway did not pass `PORT`: add a variable `PORT` with a value of your choice (Railway's healthcheck page describes this), and deploy again.
+4. **Variables.** On the service, Variables. Add each one by hand from this table; do not accept the variables Railway suggests from `.env.example` wholesale, and do not paste `.env.deploy.testnet` into the Raw Editor (it holds `*_FULL_ACCESS_KEY`). The values come from `.env.example`, `deployments/testnet.json` and `.env.deploy.testnet`; section 3 says what each does.
 
    | Variable | Value | Secret |
    |---|---|---|
@@ -271,27 +272,32 @@ Notes:
    | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}`: Railway's reference to the database's own variable (use the service's name if it is not `Postgres`) | holds the database password; Railway keeps it |
    | `NEAR_RPC_URL` | a testnet RPC URL | if it holds a key |
    | `FASTNEAR_API_KEY` | optional | yes |
-   | `PUBLIC_API_URL` | the final `https` address of the API (step 4) | |
-   | `PUBLIC_WEB_URL` | the final `https` address of the web app | |
-   | `TRUSTED_PROXY_HOPS` | `1` (see below) | |
-   | `KEEPER_ACCOUNT`, `KEEPER_PRIVATE_KEY` | the two lines of `.env.deploy.testnet` | the key |
-   | `JUDGE_ACCOUNT`, `JUDGE_PRIVATE_KEY` | the two lines of `.env.deploy.testnet` | the key |
+   | `PUBLIC_API_URL` | the final `https` address of the API (step 3) | |
+   | `PUBLIC_WEB_URL` | the final `https` address of the web app, as an origin with no path. If the web app's address is not known yet, leave it empty for the first deploy: serve warns once and goes on, a browser's calls to the API are refused until it is set, and a Telegram bot needs it. Section 12 sets it | |
+   | `TRUSTED_PROXY_HOPS` | `1`, then check it after the first deploy (see below) | |
+   | `KEEPER_ACCOUNT`, `KEEPER_PRIVATE_KEY` | the two lines of `.env.deploy.testnet` (section 2 makes the key line) | the key |
+   | `JUDGE_ACCOUNT`, `JUDGE_PRIVATE_KEY` | the two lines of `.env.deploy.testnet` (section 2 makes the key line) | the key |
    | `TEAM_ACCOUNTS`, `TEAM_MODEL_AGENTS` | as in section 3 | |
    | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | the Judge's model (section 4) | the key |
    | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, `TELEGRAM_MODE`, `TELEGRAM_WEBHOOK_SECRET` | optional; `webhook` mode here (section 6) | the token and the secret |
 
-   Leave `PORT` alone: Railway sets it for the container, and the API listens on it. Do not set `API_PORT`, `TENDER_ENV_DIR`, `DEBUG`, any `NEXT_PUBLIC_*`, `DEPLOY_*` or `*_FULL_ACCESS_KEY` variable.
+   Leave `PORT` alone: Railway sets it for the container, and the API listens on it (step 3 says what to do if it does not). Do not set `API_PORT`, `TENDER_ENV_DIR`, `DEBUG`, any `NEXT_PUBLIC_*`, `DEPLOY_*` or `*_FULL_ACCESS_KEY` variable.
 
-   **Keys.** The only key lines that go to Railway are `KEEPER_PRIVATE_KEY` and `JUDGE_PRIVATE_KEY`, the function-call keys of section 2. Never a `*_FULL_ACCESS_KEY`, `DEPLOY_PARENT_PRIVATE_KEY` or an agent's key. The owner pastes them into Railway's Variables page in the browser and nowhere else: not into a file in the repository, a commit, a chat or a log. Railway can seal a variable, which hides its value in the dashboard from then on and cannot be undone: seal the keys once the services run.
-4. **Public address.** On the service: Settings, Networking, Generate Domain. Railway finds the port the API listens on. `PUBLIC_API_URL` and `PUBLIC_WEB_URL` must be the final `https` addresses, because sign-in and the blob URIs that go on chain are bound to the API's (section 3). With the domain bought, add `api.<domain>` as a custom domain now (section 12) and use that. Without it, use the generated `https://<name>.up.railway.app` address, and do not change it later. Settle both before section 5 posts a task.
-5. **Deploy and check.** Press Deploy. Then `GET https://<address>/v1/health` answers 200 with `"ok": true`, and the deploy log shows `serve: API at ... called at https://...`, `keeper on` and `Judge on`.
+   **Keys.** The only key lines that go to Railway are `KEEPER_PRIVATE_KEY` and `JUDGE_PRIVATE_KEY`, the function-call keys of section 2, which `scripts/keeper-key.ts` appends to `.env.deploy.testnet`: until it has run, there are no such lines, and the keeper and the Judge stay off. Never a `*_FULL_ACCESS_KEY`, `DEPLOY_PARENT_PRIVATE_KEY` or an agent's key. The owner pastes them into Railway's Variables page in the browser and nowhere else: not into a file in the repository, a commit, a chat or a log. Railway can seal a variable, which hides its value in the dashboard from then on and cannot be undone: seal the keys once the services run.
+5. **Deploy and check.** Press Deploy. Then `GET https://<address>/v1/health` answers 200 with `"ok": true`. The deploy log shows `serve: API at ... called at https://...`, and `keeper on` and `Judge on` once the chain check has passed and this process holds the indexer lock: seconds on a first deploy, and in a redeploy until the old container lets go. A missing line is not a fault until then.
 
 Notes:
 
 - **The check runs only when a deploy starts.** Railway never asks again, so section 8 still applies. `/v1/health` answers 200 while the indexer catches up (`lag_blocks` shows how far behind). It answers 503 `chain_unavailable` only when the API cannot read the chain's final height at all: then the deploy fails after 300 seconds, and `NEAR_RPC_URL` is the first thing to check.
 - **A redeploy starts the new container beside the old one.** On Postgres the new one serves the API at once and takes the indexer lock when the old one lets go, a few seconds after it, so the keeper and the Judge never run twice. The old one gets SIGTERM and 30 seconds to stop (`drainingSeconds`). Run locally, `pnpm serve` stops within a second of SIGTERM.
 - **A crash restarts up to 3 times, then stays down.** Read the log. The services end with 1 when the database is another deploy's, and no restart fixes that (section 8).
-- **`TRUSTED_PROXY_HOPS=1`.** Railway's edge is one proxy in front of the API, and Railway says it replaces `X-Forwarded-For` with the client's address. At 0, every visitor counts as one client and the whole site shares the four event streams (section 3). Railway's staff say the hop count is not a promise: if visitors at different addresses get `429 rate_limited` together, look here first. Keep other services out of this project: section 3's rule holds only while the API is reached through the edge alone.
+- **`TRUSTED_PROXY_HOPS=1` is not verified, so check it after the first deploy.** Railway's docs list the headers its edge sets (`X-Real-IP`, `X-Forwarded-Proto`, `X-Forwarded-Host` and others), and `X-Forwarded-For` is not among them. That the edge replaces `X-Forwarded-For` with the client's address is what Railway staff say on its forum, and they add that the hop count is not a promise. The API reads only `X-Forwarded-For` (section 3), and a wrong count lets a client choose the address it is counted under. The check: send 310 requests to `/v1/health` within a minute, each with a different `X-Forwarded-For`:
+
+  ```
+  seq 1 310 | xargs -P 20 -I{} sh -c 'curl -s -o /dev/null -w "%{http_code}\n" -H "X-Forwarded-For: 198.18.$(({} / 250)).$(({} % 250 + 1))" https://<address>/v1/health' | sort | uniq -c
+  ```
+
+  If about 10 of them answer 429 (the limit is 300 a minute per client), `1` is right: the edge's own value decided, and the header you sent did not. If none does, Railway passes the client's header through: `1` is wrong, because a client can then dodge every per-client limit. Set `0`, and accept that every visitor counts as one client and the whole site shares the four event streams (section 3), or change the API to read `X-Real-IP`, which is a code change. Run on a local `pnpm serve` with no proxy, the same command printed `310 200` at `TRUSTED_PROXY_HOPS=1` (the header is believed) and `299 200`, `11 429` at 0. Keep other services out of this project: section 3's rule holds only while the API is reached through the edge alone.
 - **Section 3's backup rule applies.** Railway's database is the only copy of the uploads until you set up a backup.
 
 ## 12. Hosting the web app on Vercel
@@ -320,9 +326,9 @@ Environment variables, for Production (section 7 has the meaning of each). All a
 
 A build without `NEXT_PUBLIC_NETWORK`, `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_CONTRACT` fails and names the variable, so a missing one stops the deploy and ships no broken site. A preview deployment has its own address, which is not in `PUBLIC_WEB_URL`, so the API refuses its calls from a browser (CORS): use Production.
 
-If the install stops with `ERR_PNPM_UNSUPPORTED_ENGINE`, the 24.x that Vercel runs is older than the 24.21 that `package.json` asks for (and `.npmrc` enforces). Pick 26.x for the project: `engines` allows it.
+If the install stops with `ERR_PNPM_UNSUPPORTED_ENGINE`, the 24.x that Vercel runs is older than the 24.21 that `package.json` asks for (and `.npmrc` enforces). Pick 26.x for the project (not tried: the web build was run on Node 24.21 only, and how Vercel supplies Corepack on 26.x is not shown). If the install then fails on the package manager, remove `ENABLE_EXPERIMENTAL_COREPACK`: the lockfile then picks pnpm 9 or 10. `engines` allows 26.
 
-**Order.** Services first, then the web app (section 7's rule). Check `/v1/health` on the API, then deploy the web app, then open it and look for tasks on the home page.
+**Order.** Services first, then the web app (section 7's rule). Check `/v1/health` on the API, then deploy the web app. Then copy the Production address of the web app into `PUBLIC_WEB_URL` on Railway (a comma-separated list takes more than one, each an origin with no path) and deploy the services again: until it is set the API refuses the browser's calls (CORS) and the site shows no data. Then open the web app and look for tasks on its home page. Do the same with the custom domain when it is attached.
 
 **The domain.** The owner adds it, and both hosts say which DNS records to create:
 
