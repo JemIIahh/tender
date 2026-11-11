@@ -780,6 +780,17 @@ const SAMPLES: { [name in SchemaName]: Sample[] } = {
   TelegramLinkResponseSchema: [
     { body: { url: "https://t.me/tender_test_bot?start=abc", expires_at: SOON } },
   ],
+  GasGiftRequestSchema: [{ body: { account_id: "ab".repeat(32) } }],
+  GasGiftResponseSchema: [
+    {
+      body: {
+        status: "sent",
+        amount: "100000000000000000000000",
+        tx_hash: "3xEZYiuTvu9qfvHEzKGo7DAj9XJDq7SKFb3nWGyj4xp2",
+      },
+    },
+    { body: { status: "not_needed", balance: "250000000000000000000000" } },
+  ],
   // `data` is any object on purpose, so the sample leaves it empty.
   EventMessageSchema: [{ body: { event: "task_created", data: {}, height: "90", task_id: "7" } }],
   TokenTotalSchema: [{ body: { token: TOKEN, amount: "950000" } }],

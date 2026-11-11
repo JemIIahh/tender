@@ -493,6 +493,29 @@ export const TelegramLinkResponseSchema = z.object({
 });
 export type TelegramLinkResponse = z.infer<typeof TelegramLinkResponseSchema>;
 
+// ---- Gas gift ---------------------------------------------------------------------------------
+
+/**
+ * `POST /v1/gas-gift`, on testnet only: an account that the email login made gets a little testnet
+ * NEAR from the team's gift account, so it can pay its first fees. The bearer is the login's own
+ * token (not a Tender sign-in, which the account can't do before it holds NEAR); the body names the
+ * account, an implicit one (64 lowercase hex characters). Refusals are an `ErrorBody`: `gift_off`
+ * (503, the API has no gift account), `unauthorized` (401), `not_implicit` (400), `already_given`
+ * (409, once per login and once per account), `daily_limit` (429).
+ */
+export const GasGiftRequestSchema = z.object({ account_id: AccountIdSchema });
+export type GasGiftRequest = z.infer<typeof GasGiftRequestSchema>;
+
+/**
+ * The answer of `POST /v1/gas-gift`: `sent`, with the amount in yoctoNEAR and the transfer's hash,
+ * or `not_needed`, with the account's balance, when it already holds enough to pay its fees.
+ */
+export const GasGiftResponseSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("sent"), amount: U128StringSchema, tx_hash: z.string().min(1) }),
+  z.object({ status: z.literal("not_needed"), balance: U128StringSchema }),
+]);
+export type GasGiftResponse = z.infer<typeof GasGiftResponseSchema>;
+
 // ---- Events -----------------------------------------------------------------------------------
 
 /**
