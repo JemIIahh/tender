@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { loginLabel } from "../lib/copy";
 import { CopyButton } from "./CopyButton";
 import { LiveStatus } from "./LiveStatus";
 
@@ -8,15 +9,32 @@ export const BAR_PILL = "min-h-10 px-4 whitespace-nowrap";
 /** The part of the account group after the status, divided from it by a hairline. */
 const PART = "flex h-10 min-w-0 items-center border-l border-line";
 
+/** An implicit account (64 hex characters) with its middle left out; any other id as it is. */
+export function shortAccount(accountId: string): string {
+  return /^[0-9a-f]{64}$/.test(accountId)
+    ? `${accountId.slice(0, 6)}…${accountId.slice(-4)}`
+    : accountId;
+}
+
 /**
  * The top bar's account group, one joined pill: the status of the index and the network's name
  * (components/LiveStatus), then the connected account, cut short to fit and whole in its title,
  * with a button that copies it; or "Connect wallet" when no account is connected. Both lead to the
  * Wallet page. While the wallet store looks (`ready` false), the account's place is a placeholder
  * of its size, so that a page that is about to show the account never shows Connect first. On a
- * phone it is the dot and a short account.
+ * phone it is the dot and a short account. An account from the email or Google login (`login` set,
+ * null when it does not say which) says so before the account, from a tablet's width up.
  */
-export function AccountGroup({ ready, accountId }: { ready: boolean; accountId: string | null }) {
+export function AccountGroup({
+  ready,
+  accountId,
+  login,
+}: {
+  ready: boolean;
+  accountId: string | null;
+  login?: "email" | "google" | null;
+}) {
+  const label = login === undefined ? null : loginLabel(login);
   return (
     <div className="flex h-10 min-w-0 items-center rounded-full border border-line bg-panel">
       <LiveStatus />
@@ -45,10 +63,18 @@ export function AccountGroup({ ready, accountId }: { ready: boolean; accountId: 
         <span className={`${PART} gap-1 pr-1`}>
           <Link
             href="/wallet"
-            title={accountId}
-            className="flex h-10 min-w-0 items-center rounded-full pr-2.5 pl-3.5 font-mono text-[13px] text-bone decoration-bone/40 underline-offset-4 hover:underline sm:pr-0"
+            title={label === null ? accountId : `${label}: ${accountId}`}
+            className="flex h-10 min-w-0 items-center gap-2 rounded-full pr-2.5 pl-3.5 font-mono text-[13px] text-bone decoration-bone/40 underline-offset-4 hover:underline sm:pr-0"
           >
-            <span className="max-w-[6.5rem] truncate sm:max-w-44">{accountId}</span>
+            {label === null ? null : (
+              <span
+                data-testid="pill-login"
+                className="font-sans text-[12px] whitespace-nowrap text-muted max-sm:sr-only"
+              >
+                {label}
+              </span>
+            )}
+            <span className="max-w-[6.5rem] truncate sm:max-w-44">{shortAccount(accountId)}</span>
           </Link>
           <CopyButton value={accountId} label="Copy account" className="max-sm:hidden" />
         </span>

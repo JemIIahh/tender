@@ -16,6 +16,7 @@ import { MCP_DOCS_URL, REPO_URL, SKILL_URL } from "../lib/links";
 import { restoreSidebar, setRail, sidebarStore } from "../lib/sidebar";
 import { walletStore } from "../lib/wallet";
 import { AccountGroup, BAR_PILL } from "./AccountPill";
+import { ConnectChooser } from "./ConnectChooser";
 import { Mark } from "./Mark";
 import { Nav, type TipHandlers } from "./Nav";
 import { SidebarLive } from "./SidebarLive";
@@ -149,7 +150,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   // every page takes up the wallet of an earlier visit (silently: a restore opens no window); the
   // wallet library loads then, after the page. Until the store knows (`ready`), the pill is a
   // placeholder, so that a page that is about to show the account never shows Connect first.
-  const { ready, accountId } = useSyncExternalStore(
+  const { ready, accountId, keyHolder } = useSyncExternalStore(
     walletStore.subscribe,
     walletStore.getSnapshot,
     walletStore.getServerSnapshot,
@@ -332,7 +333,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Link href="/post" className={`${PRIMARY} ${BAR_PILL}`}>
             Post task
           </Link>
-          <AccountGroup ready={ready} accountId={accountId} />
+          <AccountGroup ready={ready} accountId={accountId} login={keyHolder?.login} />
         </div>
       </header>
 
@@ -417,6 +418,9 @@ export function AppShell({ children }: { children: ReactNode }) {
           ) : null}
         </div>
       )}
+
+      {/* Connect's chooser, in a build with the email and Google login (lib/chooser.ts). */}
+      <ConnectChooser />
     </div>
   );
 }

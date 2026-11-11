@@ -23,6 +23,7 @@ test("config_reads_the_public_values", () => {
     contractId: "tender.testnet",
     devWallet: false,
     judgeAccount: null,
+    privy: null,
   });
 });
 
@@ -214,5 +215,42 @@ test("config_of_this_module_comes_from_the_environment", () => {
     contractId: "tender.testnet",
     devWallet: false,
     judgeAccount: null,
+    privy: null,
   });
+});
+
+test("config_has_the_email_login_only_with_a_privy_app_id_and_off_the_sandbox", () => {
+  // No app id: Connect opens the NEAR wallets, as it did before there was a login.
+  expect(readConfig(BASE).privy).toBeNull();
+  expect(readConfig({ ...BASE, NEXT_PUBLIC_PRIVY_APP_ID: "" }).privy).toBeNull();
+  expect(readConfig({ ...BASE, NEXT_PUBLIC_PRIVY_APP_ID: " cm0app1d " }).privy).toEqual({
+    appId: "cm0app1d",
+    clientId: null,
+  });
+  expect(
+    readConfig({
+      ...BASE,
+      NEXT_PUBLIC_NETWORK: "mainnet",
+      NEXT_PUBLIC_PRIVY_APP_ID: "cm0app1d",
+      NEXT_PUBLIC_PRIVY_CLIENT_ID: "client-WY2abc_9",
+    }).privy,
+  ).toEqual({ appId: "cm0app1d", clientId: "client-WY2abc_9" });
+  // The sandbox has its dev wallet, and Tender sends no NEAR for fees there.
+  expect(readConfig({ ...SANDBOX, NEXT_PUBLIC_PRIVY_APP_ID: "cm0app1d" }).privy).toBeNull();
+});
+
+test("config_refuses_a_privy_id_that_is_not_one_and_a_client_id_alone", () => {
+  expect(() => readConfig({ ...BASE, NEXT_PUBLIC_PRIVY_APP_ID: "app id" })).toThrow(
+    /NEXT_PUBLIC_PRIVY_APP_ID/,
+  );
+  expect(() =>
+    readConfig({
+      ...BASE,
+      NEXT_PUBLIC_PRIVY_APP_ID: "cm0app1d",
+      NEXT_PUBLIC_PRIVY_CLIENT_ID: "a/b",
+    }),
+  ).toThrow(/NEXT_PUBLIC_PRIVY_CLIENT_ID/);
+  expect(() => readConfig({ ...BASE, NEXT_PUBLIC_PRIVY_CLIENT_ID: "client-1" })).toThrow(
+    /NEXT_PUBLIC_PRIVY_CLIENT_ID is set without NEXT_PUBLIC_PRIVY_APP_ID/,
+  );
 });

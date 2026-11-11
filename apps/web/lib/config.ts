@@ -20,6 +20,13 @@ export interface WebConfig {
    * it, "Tender Judge" is the default verifier, and without it that choice is not offered.
    */
   judgeAccount: string | null;
+  /**
+   * The email and Google login (Privy), or null when this build has none: no app id, or the sandbox,
+   * which has its dev wallet. With it, Connect offers that login first and the NEAR wallets second;
+   * without it, Connect opens the NEAR wallets, as it always did. Both ids are public: Privy's
+   * dashboard says they are meant for the browser.
+   */
+  privy: { appId: string; clientId: string | null } | null;
 }
 
 /** The variables `readConfig` reads, as `process.env` holds them. */
@@ -30,6 +37,21 @@ export interface PublicEnv {
   NEXT_PUBLIC_RPC_URL?: string;
   NEXT_PUBLIC_DEV_WALLET?: string;
   NEXT_PUBLIC_JUDGE_ACCOUNT?: string;
+  NEXT_PUBLIC_PRIVY_APP_ID?: string;
+  NEXT_PUBLIC_PRIVY_CLIENT_ID?: string;
+}
+
+/** What a Privy app id or client id is made of: letters, digits, `-` and `_`. */
+const PRIVY_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** The id in `value`, or null for none (an empty value is none), or an error that names `name`. */
+function privyId(name: string, value: string | undefined): string | null {
+  const id = value?.trim() ?? "";
+  if (id === "") return null;
+  if (!PRIVY_ID.test(id)) {
+    throw new Error(`${name} must be the id from Privy's dashboard: letters, digits, - and _`);
+  }
+  return id;
 }
 
 function isNetworkId(value: string): value is NetworkId {
@@ -104,6 +126,13 @@ export function readConfig(env: PublicEnv): WebConfig {
     );
   }
 
+  // Optional, both. A client id without an app id is no login, and is refused rather than dropped.
+  const privyAppId = privyId("NEXT_PUBLIC_PRIVY_APP_ID", env.NEXT_PUBLIC_PRIVY_APP_ID);
+  const privyClientId = privyId("NEXT_PUBLIC_PRIVY_CLIENT_ID", env.NEXT_PUBLIC_PRIVY_CLIENT_ID);
+  if (privyAppId === null && privyClientId !== null) {
+    throw new Error("NEXT_PUBLIC_PRIVY_CLIENT_ID is set without NEXT_PUBLIC_PRIVY_APP_ID");
+  }
+
   return {
     network,
     apiUrl,
@@ -111,6 +140,11 @@ export function readConfig(env: PublicEnv): WebConfig {
     contractId,
     devWallet: network === "sandbox" && env.NEXT_PUBLIC_DEV_WALLET?.trim() === "1",
     judgeAccount: judge === "" ? null : judge,
+    // The sandbox has the dev wallet and no gas gift: the login is for testnet and mainnet.
+    privy:
+      privyAppId === null || network === "sandbox"
+        ? null
+        : { appId: privyAppId, clientId: privyClientId },
   };
 }
 
@@ -123,4 +157,6 @@ export const config: WebConfig = readConfig({
   NEXT_PUBLIC_RPC_URL: process.env.NEXT_PUBLIC_RPC_URL,
   NEXT_PUBLIC_DEV_WALLET: process.env.NEXT_PUBLIC_DEV_WALLET,
   NEXT_PUBLIC_JUDGE_ACCOUNT: process.env.NEXT_PUBLIC_JUDGE_ACCOUNT,
+  NEXT_PUBLIC_PRIVY_APP_ID: process.env.NEXT_PUBLIC_PRIVY_APP_ID,
+  NEXT_PUBLIC_PRIVY_CLIENT_ID: process.env.NEXT_PUBLIC_PRIVY_CLIENT_ID,
 });

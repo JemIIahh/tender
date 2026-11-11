@@ -17,9 +17,10 @@ import {
   useState,
 } from "react";
 import { config } from "../lib/config";
-import { READING_BALANCES } from "../lib/copy";
+import { LOGIN_HOLDS_KEY, loginLabel, READING_BALANCES } from "../lib/copy";
 import { errorMessage } from "../lib/errors";
 import { FAUCET_AMOUNT, faucetOffered, faucetToken, planFaucet } from "../lib/faucet";
+import { shortId } from "../lib/tokens";
 import {
   describeAmount,
   describeNear,
@@ -35,6 +36,7 @@ import { useWallet } from "../lib/wallet";
 import { WALLET_CANNOT_SIGN_MESSAGE, walletErrorMessage } from "../lib/walletErrors";
 import { Amount } from "./Amount";
 import { Avatar } from "./Avatar";
+import { CopyButton } from "./CopyButton";
 import { ErrorState } from "./ErrorState";
 import { FaucetSection } from "./FaucetSection";
 import { PageHead } from "./PageHead";
@@ -62,7 +64,15 @@ type Panel =
   | { status: "error"; message: string; retrying: boolean }
   | { status: "ready"; data: VaultData; stale: Stale | null };
 
-type ActionId = "connect" | "disconnect" | "setup" | "deposit" | "withdraw" | "storage" | "faucet";
+type ActionId =
+  | "connect"
+  | "disconnect"
+  | "export"
+  | "setup"
+  | "deposit"
+  | "withdraw"
+  | "storage"
+  | "faucet";
 
 /** What the last action came to, shown next to the control that started it. */
 interface Notice {
@@ -378,7 +388,8 @@ export function WalletView({
 }: {
   laterRefreshMs?: number;
 } = {}) {
-  const { ready, accountId, canSignMessage, connect, disconnect, signAndSend } = useWallet();
+  const { ready, accountId, canSignMessage, keyHolder, connect, disconnect, signAndSend } =
+    useWallet();
   const [panel, setPanel] = useState<Panel>({ status: "loading" });
   const [running, setRunning] = useState<ActionId | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -621,36 +632,93 @@ export function WalletView({
           </>
         ) : (
           <>
-            <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
-              <Avatar account={accountId} size={34} />
-              <span className="text-sm text-muted">Connected as</span>
-              <span data-testid="account-id" className="font-mono text-sm text-bone wrap-anywhere">
-                {accountId}
-              </span>
-            </p>
+            {keyHolder === undefined ? (
+              <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+                <Avatar account={accountId} size={34} />
+                <span className="text-sm text-muted">Connected as</span>
+                <span
+                  data-testid="account-id"
+                  className="font-mono text-sm text-bone wrap-anywhere"
+                >
+                  {accountId}
+                </span>
+              </p>
+            ) : (
+              // An account from the email or Google login: how the person logs in, the account
+              // (its 64 characters cut in the middle, whole in the title and in what is copied),
+              // and who holds its key.
+              <div className="grid gap-2">
+                <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+                  <Avatar account={accountId} size={34} />
+                  <span data-testid="login-label" className="text-sm text-muted">
+                    {loginLabel(keyHolder.login)}
+                  </span>
+                  <span className="flex min-w-0 items-center gap-1">
+                    <span
+                      data-testid="account-id"
+                      title={accountId}
+                      className="font-mono text-sm text-bone wrap-anywhere"
+                    >
+                      {shortId(accountId)}
+                    </span>
+                    <CopyButton value={accountId} label="Copy account" />
+                  </span>
+                </p>
+                <p data-testid="key-holder" className="text-sm text-muted">
+                  {LOGIN_HOLDS_KEY}
+                </p>
+              </div>
+            )}
             {canSignMessage ? null : (
               <p role="status" data-testid="cannot-sign" className={NOTICE}>
                 {WALLET_CANNOT_SIGN_MESSAGE}
               </p>
             )}
-            <button
-              key="disconnect"
-              type="button"
-              aria-disabled={running !== null}
-              onClick={() =>
-                run("disconnect", async () => {
-                  await disconnect();
-                  return null;
-                })
-              }
-              className={SECONDARY}
-            >
-              {running === "disconnect" ? "Disconnecting…" : "Disconnect"}
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                key="disconnect"
+                type="button"
+                aria-disabled={running !== null}
+                onClick={() =>
+                  run("disconnect", async () => {
+                    await disconnect();
+                    return null;
+                  })
+                }
+                className={SECONDARY}
+              >
+                {keyHolder === undefined
+                  ? running === "disconnect"
+                    ? "Disconnecting…"
+                    : "Disconnect"
+                  : running === "disconnect"
+                    ? "Logging out…"
+                    : "Log out"}
+              </button>
+              {keyHolder === undefined ? null : (
+                // The key is shown in the login's own window, on its own domain: this page never
+                // sees it.
+                <button
+                  key="export"
+                  type="button"
+                  aria-disabled={running !== null}
+                  onClick={() =>
+                    run("export", async () => {
+                      await keyHolder.exportKey();
+                      return null;
+                    })
+                  }
+                  className={SECONDARY}
+                >
+                  Export key
+                </button>
+              )}
+            </div>
           </>
         )}
         {noticeFor("connect")}
         {noticeFor("disconnect")}
+        {noticeFor("export")}
       </section>
 
       {accountId === null ? null : panel.status === "loading" ? (

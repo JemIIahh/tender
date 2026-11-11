@@ -182,6 +182,27 @@ export async function accountExists(
 }
 
 /**
+ * The NEAR that `accountId` holds now, in yoctoNEAR (`view_account`'s `amount`), or 0 when there is
+ * no such account: an implicit account that no one has sent NEAR to yet is not on the chain. Only
+ * the node's own word that the account does not exist is 0; any other failure throws.
+ */
+export async function nearBalanceOf(
+  accountId: string,
+  finality: Finality = "final",
+): Promise<bigint> {
+  const answer = await query({ request_type: "view_account", account_id: accountId }, finality);
+  if ("missing" in answer) {
+    if (answer.missing === "UNKNOWN_ACCOUNT" || answer.missing === "") return 0n;
+    throw new RpcError(`view_account failed: the RPC node answered ${answer.missing}`);
+  }
+  const amount = answer.result.amount;
+  if (typeof amount !== "string" || !/^\d{1,40}$/.test(amount)) {
+    throw new RpcError("view_account returned no amount");
+  }
+  return BigInt(amount);
+}
+
+/**
  * What the chain says of `accountId` and `publicKey`: no such account, an account without that key,
  * or an account that has it as a full-access key, which is what "Add an agent" gives it.
  */

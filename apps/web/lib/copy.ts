@@ -18,6 +18,18 @@ export const CRITERIA_UNAVAILABLE = "The criteria aren't available yet.";
 /** A page that reads the account's balances says so in these words. */
 export const READING_BALANCES = "Reading your balances…";
 
+/** What an account from the email or Google login is called, by how the person logs in. */
+export function loginLabel(login: "email" | "google" | null): string {
+  return login === "google"
+    ? "Google login"
+    : login === "email"
+      ? "Email login"
+      : "Email or Google login";
+}
+
+/** Who holds the key of an account from the login, in one line. */
+export const LOGIN_HOLDS_KEY = "Privy keeps this account's key; you unlock it by logging in.";
+
 /** What a check kind is called, as the wizard calls it; a kind the wizard does not offer, as it is. */
 export function kindLabel(kind: string): string {
   return KINDS.find((candidate) => candidate.kind === kind)?.label ?? kind;

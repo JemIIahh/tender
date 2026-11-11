@@ -24,6 +24,10 @@ import {
   ConnectImplicitAgentsSchema,
   type CreateServiceRequest,
   fetchJson,
+  type GasGiftRequest,
+  GasGiftRequestSchema,
+  type GasGiftResponse,
+  GasGiftResponseSchema,
   type HealthResponse,
   HealthResponseSchema,
   HeldoutUploadResponseSchema,
@@ -487,6 +491,20 @@ export const api = {
   /** `POST /v1/telegram/link`: a one-time link from this account to the bot. Needs a token. */
   telegramLink(token: string): Promise<TelegramLinkResponse> {
     return post("/telegram/link", TelegramLinkResponseSchema, { token });
+  },
+
+  /**
+   * `POST /v1/gas-gift`: a little testnet NEAR for the fees of a new email-login account. The
+   * bearer is the login's own access token (Privy's), not a Tender sign-in: the account can't sign
+   * in to Tender before it exists on the chain, and this is what makes it exist. It throws for an
+   * account that is no account id, without asking; a refusal is an `ApiError` whose body's `error`
+   * says which (`gift_off`, `daily_limit`, `already_given`).
+   */
+  async gasGift(loginToken: string, accountId: string): Promise<GasGiftResponse> {
+    const body: GasGiftRequest = GasGiftRequestSchema.parse({
+      account_id: accountIdText(accountId) ?? notAnId("gasGift", "an account id", accountId),
+    });
+    return post("/gas-gift", GasGiftResponseSchema, { token: loginToken, body });
   },
 
   // ---- The question board (spec 7.2.1). Each needs a token, and throws for an id that is no

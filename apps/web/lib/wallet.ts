@@ -11,7 +11,9 @@ import {
 } from "@tender/shared";
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { clearApiToken, sessionBegan, sessionEnded } from "./apiToken";
+import { chooser } from "./chooser";
 import { config } from "./config";
+import { choiceProvider, createPrivyBridge, type MakePrivyWallet, privyProvider } from "./privy";
 import {
   TransactionFailed,
   WalletCannotSign,
@@ -24,10 +26,11 @@ import { linkTabs, noTabs, type OpenTabLink, type TabLink } from "./walletTabs";
 
 // The wallet, as the pages use it. One store holds the connected account for the whole page: every
 // component that calls `useWallet` sees the same one, and a wallet connects once. What sits behind
-// the store is a `WalletProvider`: near-connect for the real wallets, and in a sandbox build, if
-// it is switched on, the dev wallet (lib/devWallet.ts). Both give the store a `SigningWallet`,
-// which is the part of near-connect's wallet interface this app calls, so a transaction is grouped,
-// sent and read back by the same code whoever signs it.
+// the store is a `WalletProvider`: near-connect for the real wallets; in a build with a Privy app
+// id, the email and Google login too (lib/privy.ts), offered first, with near-connect second
+// (lib/chooser.ts); and in a sandbox build, if it is switched on, the dev wallet (lib/devWallet.ts).
+// Each gives the store a `SigningWallet`, which is the part of near-connect's wallet interface this
+// app calls, so a transaction is grouped, sent and read back by the same code whoever signs it.
 //
 // The wallet's answers are not trusted. A transaction result is checked for the fields this file
 // reads before it is used, and what a page does next does not rest on it: the pages read their
@@ -73,10 +76,25 @@ export interface MixedTransaction {
   actions: AccountAction[] | ConnectorFunctionCallAction[];
 }
 
+/**
+ * Who holds the key of an account that is not in the person's own wallet: an email or Google login
+ * (lib/privy.ts), which keeps the key and signs with it once the person has logged in.
+ */
+export interface KeyHolder {
+  /** How the person logs in, when the login says. */
+  login: "email" | "google" | null;
+  /** Opens the login's own window, from which the person can copy the key. */
+  exportKey(): Promise<void>;
+  /** The login's access token, which `POST /v1/gas-gift` takes; null when the login has ended. */
+  loginToken(): Promise<string | null>;
+}
+
 /** A wallet and the account it is connected as. */
 export interface Session {
   wallet: SigningWallet;
   accountId: string;
+  /** Set when a login holds the account's key, and not the person's own wallet. */
+  keyHolder?: KeyHolder;
 }
 
 /** Where a store gets its wallet. */
@@ -98,6 +116,11 @@ export interface WalletState {
   accountId: string | null;
   /** Whether the connected wallet can sign a message (NEP-413). Signing in to the API needs it. */
   canSignMessage: boolean;
+  /**
+   * Who holds the key when a login does (the email and Google login). Absent for a wallet's own
+   * account, and while nothing is connected.
+   */
+  keyHolder?: KeyHolder;
 }
 
 export interface SendResult {
@@ -326,7 +349,8 @@ export function createWalletStore(
     if (
       merged.ready === state.ready &&
       merged.accountId === state.accountId &&
-      merged.canSignMessage === state.canSignMessage
+      merged.canSignMessage === state.canSignMessage &&
+      merged.keyHolder === state.keyHolder
     ) {
       return;
     }
@@ -350,7 +374,11 @@ export function createWalletStore(
   function beginSession(next: Session, restored: boolean): void {
     session = next;
     sessionBegan(next.accountId, restored);
-    publish({ accountId: next.accountId, canSignMessage: canSign(next.wallet) });
+    publish({
+      accountId: next.accountId,
+      canSignMessage: canSign(next.wallet),
+      keyHolder: next.keyHolder,
+    });
     if (!restored) link().tell();
   }
 
@@ -363,7 +391,7 @@ export function createWalletStore(
   function endSession(tell: boolean): void {
     session = null;
     sessionEnded();
-    publish({ accountId: null, canSignMessage: false });
+    publish({ accountId: null, canSignMessage: false, keyHolder: undefined });
     if (tell) link().tell();
   }
 
@@ -654,11 +682,60 @@ export function loadDevWallet(): Promise<typeof import("./devWallet") | null> {
       : Promise.resolve(null);
 }
 
+// ---- The email and Google login ----------------------------------------------------------------
+
+/**
+ * The login's wallet for one account, whose code (near-api-js and the signer, lib/privyWallet.ts)
+ * loads at its first signature: a page that only takes up the session of an earlier visit, and
+ * signs nothing, loads none of it.
+ */
+function loginWallet(plan: Parameters<MakePrivyWallet>[0]): SigningWallet {
+  let made: Promise<import("./privyWallet").PrivyWallet> | null = null;
+  const wallet = () => {
+    made ??= import("./privyWallet")
+      .then(({ createPrivyWallet }) => createPrivyWallet({ ...plan, rpcUrl: config.rpcUrl }))
+      .catch((error: unknown) => {
+        made = null;
+        throw error;
+      });
+    return made;
+  };
+  return {
+    manifest: { features: { signMessage: true, signAndSendTransactions: true } },
+    signAndSendTransactions: async (params) => (await wallet()).signAndSendTransactions(params),
+    signMessage: async (params) => (await wallet()).signMessage(params),
+  };
+}
+
+/**
+ * The login as a provider: Privy's kit (lib/privyKit.tsx), imported here and nowhere else, and
+ * mounted when it loads. Only a build with a Privy app id gets here (`config.privy`).
+ */
+async function loginProvider(privy: NonNullable<typeof config.privy>): Promise<WalletProvider> {
+  let kit: typeof import("./privyKit");
+  try {
+    kit = await import("./privyKit");
+  } catch (cause) {
+    throw new WalletError("connect", cause);
+  }
+  const bridge = createPrivyBridge();
+  kit.mountPrivyKit(bridge, privy);
+  return privyProvider({ bridge, makeWallet: loginWallet });
+}
+
 async function createProvider(): Promise<WalletProvider> {
   const dev = await loadDevWallet();
   if (dev !== null) return dev.createDevProvider();
   if (config.network === "sandbox") throw new WalletUnavailable();
-  return connectorProvider(config.network);
+  const { network, privy } = config;
+  // No Privy app id: Connect opens the NEAR wallets, as it did before there was a login.
+  if (privy === null) return connectorProvider(network);
+  return choiceProvider({
+    login: () => loginProvider(privy),
+    wallet: () => connectorProvider(network),
+    ask: chooser.ask,
+    prepare: chooser.prepare,
+  });
 }
 
 /** The wallet of this page. */
