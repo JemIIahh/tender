@@ -9,6 +9,7 @@ import { authRoutes } from "./routes/auth";
 import { blobRoutes } from "./routes/blobs";
 import { connectRoutes } from "./routes/connect";
 import { entryRoutes } from "./routes/entries";
+import { gasGiftRoutes } from "./routes/gas-gift";
 import { healthRoutes } from "./routes/health";
 import { metricsRoutes } from "./routes/metrics";
 import { questionRoutes } from "./routes/questions";
@@ -59,6 +60,9 @@ export function createApp(deps: ApiDeps): Hono {
   app.route("/v1", entryRoutes(deps));
   app.route("/v1", metricsRoutes(deps));
   app.route("/v1", authRoutes(deps));
+  // Its bearer is the email login's own token, not a Tender sign-in: an account the login made
+  // holds no NEAR yet, and so cannot sign in.
+  app.route("/v1", gasGiftRoutes(deps));
   // One sign-in middleware for every route that needs an account, so that its record of which
   // keys it has checked lately is shared.
   const signedIn = requireAuth(deps);

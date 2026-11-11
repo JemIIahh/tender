@@ -318,6 +318,16 @@ const SCHEMA: Record<string, string[]> = {
     // Migration 0009.
     "account_kind text = 'sub_account'::text",
   ],
+  // Migration 0012.
+  gas_gifts: [
+    "privy_user text",
+    "account_id text",
+    "amount numeric(40,0)",
+    "status text",
+    "tx_hash text?",
+    "created_at timestamp with time zone",
+    "sent_at timestamp with time zone?",
+  ],
 };
 
 // Primary keys, uniqueness and every index, as "table: kind (columns)". An index on an expression
@@ -341,6 +351,10 @@ const KEYS = [
   "events: primary key (id)",
   "events: unique (receipt_id, log_index)",
   "funders: primary key (task_id, account)",
+  // Migration 0012.
+  "gas_gifts: index (created_at)",
+  "gas_gifts: primary key (privy_user)",
+  "gas_gifts: unique (account_id)",
   "heldout_uploads: primary key (sha256, account)",
   "indexer_request_budget: primary key (scope)",
   "result_uploads: primary key (sha256, task_id, account)",
@@ -371,7 +385,8 @@ const KEYS = [
 // Postgres 18 also lists NOT NULL in pg_constraint, 17 does not): no foreign key, and no CHECK but
 // the kind of a blob, the three of a board row (migration 0004), the status of an agent (0006), the
 // three of a service (0007), the key of a connect code with its time (0008) and the two of a connect
-// code's account (0009), and the positive provider request count (0010).
+// code's account (0009), the positive provider request count (0010), and the three of a gas gift
+// (0012).
 const CONSTRAINTS = [
   "agents: CHECK ((status = ANY (ARRAY['active'::text, 'unregistering'::text, 'retired'::text])))",
   "blobs: CHECK ((kind = ANY (ARRAY['brief'::text, 'criteria'::text, 'heldout'::text, " +
@@ -380,6 +395,10 @@ const CONSTRAINTS = [
   "connect_codes: CHECK (((account_kind = 'sub_account'::text) OR (public_key IS NOT NULL)))",
   "connect_codes: CHECK (((public_key IS NULL) = (attached_at IS NULL)))",
   "connect_codes: CHECK ((account_kind = ANY (ARRAY['sub_account'::text, 'implicit'::text])))",
+  // Migration 0012: a gift is sent with its hash and time, and claimed without either.
+  "gas_gifts: CHECK (((status = 'sent'::text) = (tx_hash IS NOT NULL)))",
+  "gas_gifts: CHECK (((tx_hash IS NULL) = (sent_at IS NULL)))",
+  "gas_gifts: CHECK ((status = ANY (ARRAY['claimed'::text, 'sent'::text])))",
   "indexer_request_budget: CHECK ((requests > 0))",
   "services: CHECK (((verifier = 'judge'::text) = (criteria IS NOT NULL)))",
   "services: CHECK ((status = ANY (ARRAY['active'::text, 'paused'::text])))",

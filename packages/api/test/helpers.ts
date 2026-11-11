@@ -156,6 +156,7 @@ const TABLES = [
   "tg_sent",
   "worker_cursor",
   "connect_codes",
+  "gas_gifts",
 ];
 
 /** Empties every table, so one database can serve a whole test file. */

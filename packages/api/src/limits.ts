@@ -97,6 +97,12 @@ export interface RateLimits {
   connectClient: RateLimit;
   /** Every listing and every change of a service (`POST /v1/services`, `POST /v1/services/:id`), per signed-in account. */
   services: RateLimit;
+  /**
+   * `POST /v1/gas-gift`, per client address. A gift is once per login and per account, and the
+   * day's total has a cap of its own; this only keeps one address from making the API verify
+   * tokens and ask the chain over and over.
+   */
+  gasGift: RateLimit;
 }
 
 const HOUR_MS = 60 * 60_000;
@@ -130,6 +136,9 @@ export const DEFAULT_RATE_LIMITS: Readonly<RateLimits> = Object.freeze({
   connectClient: { limit: 60, windowMs: 10 * 60_000 },
   // A provider that lists its agents' services, or pauses all of them, makes a few writes a minute.
   services: { limit: 30, windowMs: 60_000 },
+  // A person asks once, as their first login finishes, and maybe again after a failure. 30 in ten
+  // minutes leaves room for the people behind one address.
+  gasGift: { limit: 30, windowMs: 10 * 60_000 },
 });
 
 /** The limits in `over` where it has them, and the defaults for the rest. */
@@ -150,6 +159,7 @@ export function rateLimitsOf(over: Partial<RateLimits> | undefined): RateLimits 
     connectRead: over?.connectRead ?? DEFAULT_RATE_LIMITS.connectRead,
     connectClient: over?.connectClient ?? DEFAULT_RATE_LIMITS.connectClient,
     services: over?.services ?? DEFAULT_RATE_LIMITS.services,
+    gasGift: over?.gasGift ?? DEFAULT_RATE_LIMITS.gasGift,
   };
 }
 

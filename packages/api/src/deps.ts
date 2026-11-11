@@ -26,6 +26,38 @@ export interface ChainReader {
   balanceOf(accountId: string, token: string): Promise<bigint>;
 }
 
+/**
+ * The gas gift (`POST /v1/gas-gift`, `routes/gas-gift.ts`): a little testnet NEAR from the team's
+ * gift account to an implicit account that an email login made, so that it can pay its first fees.
+ * The caller makes it from `GAS_GIFT_*` and `PRIVY_*`, and leaves it out when they are not all set;
+ * the route then answers every call with 503 `gift_off`, as it does on mainnet whatever this holds.
+ * The chain parts are functions, so that a test passes fakes.
+ */
+export interface GasGift {
+  /** The account the NEAR comes from (`GAS_GIFT_ACCOUNT`), which holds only the gift pool. */
+  account: string;
+  /** The login's app id (`PRIVY_APP_ID`): a token is good only with it as its audience. */
+  privyAppId: string;
+  /**
+   * The key the login's tokens are verified with (`PRIVY_VERIFICATION_KEY`): an ES256 public key
+   * as an SPKI PEM, with real line breaks or with `\n` escapes (`readPrivyKey`).
+   */
+  privyVerificationKey: string;
+  /** What each gift is, in yoctoNEAR (`GAS_GIFT_AMOUNT`). */
+  amount: bigint;
+  /** An account that holds this much already gets nothing (`GAS_GIFT_MIN_BALANCE`). */
+  minBalance: bigint;
+  /** The most all gifts of one UTC day may add up to, in yoctoNEAR (`GAS_GIFT_DAILY_CAP`). */
+  dailyCap: bigint;
+  /** The NEAR `accountId` holds, and 0 for one not on chain (`TenderClient.nearBalanceOf`). */
+  balanceOf(accountId: string): Promise<bigint>;
+  /**
+   * Sends `amount` from the gift account to `accountId` and resolves once it has executed, with its
+   * hash (`TenderClient.transfer`). It rejects when the transfer was not made.
+   */
+  transfer(accountId: string, amount: bigint): Promise<{ txHash: string }>;
+}
+
 /** Everything `createApp` needs. No route reads the environment: the caller resolves it into this. */
 export interface ApiDeps {
   db: Db;
@@ -65,6 +97,8 @@ export interface ApiDeps {
   webOrigins: string[];
   /** The Telegram bot's username as in `t.me/<username>`. Without it, linking answers 503. */
   telegramBotUsername?: string;
+  /** The gas gift, on testnet only (see `GasGift`). Without it, `POST /v1/gas-gift` answers 503. */
+  gasGift?: GasGift;
   /** The current time in nanoseconds since the epoch. Default: the wall clock. */
   now?: () => bigint;
   /**

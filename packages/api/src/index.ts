@@ -1,7 +1,7 @@
 export { createApp } from "./app";
 export type { AuthVariables, RequireAuth } from "./auth";
 export { NoAnswerInTime, withinDeadline } from "./deadline";
-export type { ApiDeps, ChainReader } from "./deps";
+export type { ApiDeps, ChainReader, GasGift } from "./deps";
 export type {
   AccountEntriesResponse,
   AccountEntry,
@@ -39,5 +39,12 @@ export {
   listTasks,
 } from "./queries";
 export { resultUsable } from "./routes/blobs";
+export {
+  DEFAULT_GAS_GIFT_AMOUNT,
+  DEFAULT_GAS_GIFT_DAILY_CAP,
+  DEFAULT_GAS_GIFT_MIN_BALANCE,
+  PRIVY_ISSUER,
+  readPrivyKey,
+} from "./routes/gas-gift";
 export type { ApiServer, ApiServerOptions, FetchHandler } from "./server";
 export { startApiServer } from "./server";
