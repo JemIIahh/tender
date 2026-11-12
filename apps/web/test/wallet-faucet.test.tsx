@@ -168,9 +168,76 @@ test.each(["mainnet", "sandbox"] as NetworkId[])(
     expect(screen.queryByTestId("faucet")).toBeNull();
     expect(screen.queryByRole("button", { name: /test tUSDC/ })).toBeNull();
     expect(screen.queryByText("Test tokens")).toBeNull();
+    expect(screen.queryByRole("link", { name: "Get testnet NEAR" })).toBeNull();
     expect(wallet.sent).toEqual([]);
   },
 );
+
+test("testnet_near_comes_first_and_one_press_copies_the_account_and_opens_the_faucet", async () => {
+  const { user, wallet } = setup();
+  const copied: string[] = [];
+  const writeText = vi.fn(async (text: string) => {
+    copied.push(text);
+  });
+  Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+  render(<WalletView />);
+
+  const link = await screen.findByRole("link", { name: "Get testnet NEAR" });
+  const panel = screen.getByTestId("faucet");
+  // NEAR first, then the test token.
+  const rows = [...panel.querySelectorAll("[data-testid^='faucet-']")].map((row) =>
+    row.getAttribute("data-testid"),
+  );
+  expect(rows.slice(0, 2)).toEqual(["faucet-near", "faucet-tusdc"]);
+  expect(
+    within(screen.getByTestId("faucet-near")).getByText(
+      "Paste your account there and pick NEAR. It's free test money.",
+    ),
+  ).toBeDefined();
+  // The public faucet, in a new tab that gets no hold on this one.
+  expect(link.getAttribute("href")).toBe("https://near-faucet.io/");
+  expect(link.getAttribute("target")).toBe("_blank");
+  expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+
+  // jsdom opens no tab for a link; the press is what is tested: it copies the account.
+  link.addEventListener("click", (event) => event.preventDefault());
+  await user.click(link);
+  expect(copied).toEqual([ALICE]);
+  expect((await screen.findByTestId("faucet-near-copied")).textContent).toBe(
+    "Your account is copied.",
+  );
+  // Nothing is signed for it.
+  expect(wallet.sent).toEqual([]);
+});
+
+test("a_browser_that_will_not_copy_shows_the_account_to_copy_by_hand", async () => {
+  // user-event puts a clipboard of its own on the page when it is set up, so the broken one goes
+  // on after it.
+  const { user } = setup();
+  Object.defineProperty(navigator, "clipboard", {
+    value: {
+      writeText: async () => {
+        throw new DOMException("Write permission denied.", "NotAllowedError");
+      },
+    },
+    configurable: true,
+  });
+  render(<WalletView />);
+
+  const link = await screen.findByRole("link", { name: "Get testnet NEAR" });
+  link.addEventListener("click", (event) => event.preventDefault());
+  await user.click(link);
+  const fallback = await screen.findByTestId("faucet-near-copy");
+  expect(fallback.textContent).toBe(
+    `The browser didn't let the page copy it. Your account:${ALICE}`,
+  );
+  expect(screen.queryByTestId("faucet-near-copied")).toBeNull();
+
+  // And a browser with no clipboard at all.
+  Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
+  await user.click(link);
+  expect(screen.getByTestId("faucet-near-copy").textContent).toContain(ALICE);
+});
 
 test("the_faucet_waits_for_the_wallet_like_the_page", async () => {
   // Signed out, there is no account to mint to, and the page reads nothing.

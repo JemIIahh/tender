@@ -764,6 +764,7 @@ export function WalletView({
 
               {faucetOffered(config.network) ? (
                 <FaucetSection
+                  accountId={accountId}
                   token={faucetToken(panel.data.rows, config.network)}
                   running={running === "faucet"}
                   anyRunning={running !== null}

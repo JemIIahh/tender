@@ -1,3 +1,5 @@
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { expect, type Page, test } from "@playwright/test";
 import { FakeChain } from "../test/fakeChain";
 import { installWallet, pickStubWallet } from "./walletStub";
@@ -182,6 +184,60 @@ test("get_test_tusdc_registers_the_account_and_mints_in_one_approval", async ({ 
   expect(wallet.sent[1]?.transactions[0]?.actions.map((a) => a.params.methodName)).toEqual([
     "mint",
   ]);
+});
+
+/** With WALLET_SHOTS set to a directory, the faucet area is saved there at 375 and 1440 px wide. */
+const SHOTS = process.env.WALLET_SHOTS;
+
+test("get_testnet_near_copies_the_account_and_opens_the_public_faucet_in_a_new_tab", async ({
+  page,
+  context,
+}) => {
+  const chain = new FakeChain(CONTRACT, [{ token: TOKEN }]);
+  const wallet = await installWallet(page, chain, { account: ALICE });
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  // The faucet is a page of its own on the internet: a stand-in answers for it here.
+  await context.route("https://near-faucet.io/**", (route) =>
+    route.fulfill({ status: 200, contentType: "text/html", body: "<title>faucet</title>" }),
+  );
+
+  await connect(page);
+  const faucet = page.getByTestId("faucet");
+  const near = faucet.getByTestId("faucet-near");
+  await expect(near).toContainText("Paste your account there and pick NEAR. It's free test money.");
+  // NEAR first, then the test token.
+  const rows = await faucet
+    .locator("[data-testid='faucet-near'], [data-testid='faucet-tusdc']")
+    .evaluateAll((found) => found.map((row) => row.getAttribute("data-testid")));
+  expect(rows).toEqual(["faucet-near", "faucet-tusdc"]);
+
+  if (SHOTS !== undefined && SHOTS !== "") {
+    mkdirSync(SHOTS, { recursive: true });
+    // The dev server's badge would sit over the section in the picture.
+    await page.addStyleTag({ content: "nextjs-portal { display: none }" });
+    for (const width of [375, 1440]) {
+      await page.setViewportSize({ width, height: width === 375 ? 812 : 900 });
+      // In the middle of the screen, clear of the bar at the top.
+      await faucet.evaluate((element) => element.scrollIntoView({ block: "center" }));
+      await faucet.screenshot({
+        path: join(SHOTS, `${width}-wallet-faucet.png`),
+        animations: "disabled",
+      });
+    }
+    await page.setViewportSize({ width: 1280, height: 720 });
+  }
+
+  const popup = page.waitForEvent("popup");
+  await near.getByRole("link", { name: "Get testnet NEAR" }).click();
+  const tab = await popup;
+  await tab.waitForLoadState();
+  expect(tab.url()).toBe("https://near-faucet.io/");
+  // A tab opened with noopener has no hold on this one.
+  expect(await tab.evaluate(() => window.opener)).toBeNull();
+  await expect(near.getByTestId("faucet-near-copied")).toHaveText("Your account is copied.");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(ALICE);
+  // Nothing is signed for it.
+  expect(wallet.sent).toEqual([]);
 });
 
 test("wallet_that_cannot_sign_messages_says_so_and_still_moves_funds", async ({ page }) => {
