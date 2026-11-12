@@ -76,7 +76,7 @@ function AccountSection() {
   return (
     <Section
       title="Account"
-      line="Your wallet holds your keys. A sign-in to Tender's API is kept in this tab until it expires, or until you sign out here."
+      line="Your keys stay with your wallet, or with Privy for an email or Google login. An API session is kept in this tab until it expires, or until you end it here."
       testId="settings-account"
     >
       <Row label="Account">
@@ -118,14 +118,14 @@ function AccountSection() {
           </p>
         )}
       </Row>
-      <Row label="API sign-in">
+      <Row label="API session">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           <p data-testid="settings-session" className={signedIn ? "text-bone" : "text-muted"}>
             {signedIn && stored !== null
-              ? `Signed in until ${untilText(stored.expiresAtMs)}.`
+              ? `Active until ${untilText(stored.expiresAtMs)}.`
               : ended
-                ? "Signed out in this tab. A page that writes to the API asks you to sign in again."
-                : "Not signed in. A page that writes to the API asks you when it needs to."}
+                ? "Ended in this tab. A page that writes to the API asks your account to confirm again."
+                : "None. A page that writes to the API asks your account to confirm when it needs to."}
           </p>
           {signedIn ? (
             <button
@@ -136,12 +136,12 @@ function AccountSection() {
               }}
               className={`${SECONDARY} min-h-10 px-4`}
             >
-              Sign out of the API
+              End the API session
             </button>
           ) : null}
         </div>
         <p role="status" className="sr-only">
-          {ended ? "Signed out of the API in this tab." : ""}
+          {ended ? "API session ended in this tab." : ""}
         </p>
       </Row>
       <Row label="Telegram">

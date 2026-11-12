@@ -260,7 +260,7 @@ test("a_sign_in_that_finishes_after_the_disconnect_stores_nothing", async () => 
 
   expect(failure).toBeInstanceOf(WalletSessionEnded);
   expect(walletErrorMessage(failure)).toBe(
-    "The wallet was disconnected or changed during sign-in, so you are not signed in. Try again with the wallet you want to use.",
+    "The wallet was disconnected or changed while confirming with Tender's API, so nothing was confirmed. Try again with the account you want to use.",
   );
   // The API did give a token; it was not kept, in memory or in the tab.
   expect(api.tokens).toEqual(["tok-alice.testnet-1"]);

@@ -8,7 +8,7 @@ import { createWalletStore, type WalletStore } from "../lib/wallet";
 import { ALICE, accountWallet, world } from "./accountFakes";
 import { fakeProvider } from "./walletDoubles";
 
-// Settings (components/SettingsView.tsx): the account and its API sign-in, Telegram, the sidebar's
+// Settings (components/SettingsView.tsx): the account and its API session, Telegram, the sidebar's
 // state (the one key lib/sidebar.ts keeps), motion, and the network to copy. Nothing on chain.
 
 const holder = vi.hoisted(() => ({ store: undefined as unknown as WalletStore }));
@@ -53,8 +53,8 @@ test("settings_without_an_account_offer_sign_in_here_and_say_there_is_no_api_sig
   await user.click(signIn);
   await within(account).findByTestId("settings-wallet");
   expect(screen.getByTestId("settings-wallet").textContent).toBe(ALICE);
-  expect(screen.getByTestId("settings-session").textContent).toContain("Not signed in.");
-  expect(screen.queryByRole("button", { name: "Sign out of the API" })).toBeNull();
+  expect(screen.getByTestId("settings-session").textContent).toContain("None.");
+  expect(screen.queryByRole("button", { name: "End the API session" })).toBeNull();
   // Telegram is linked on its own page.
   expect(
     within(account).getByRole("link", { name: "Telegram settings" }).getAttribute("href"),
@@ -69,17 +69,17 @@ test("settings_show_the_account_and_end_the_api_sign_in_without_showing_the_toke
   const user = open(true);
   expect((await screen.findByTestId("settings-wallet")).textContent).toBe(ALICE);
   await waitFor(() =>
-    expect(screen.getByTestId("settings-session").textContent).toMatch(/^Signed in until /),
+    expect(screen.getByTestId("settings-session").textContent).toMatch(/^Active until /),
   );
   // The token is a secret: it is nowhere on the page.
   expect(document.body.textContent).not.toContain(TOKEN_TEXT);
 
-  await user.click(screen.getByRole("button", { name: "Sign out of the API" }));
+  await user.click(screen.getByRole("button", { name: "End the API session" }));
   expect(heldToken()).toBeNull();
   expect(window.sessionStorage.getItem("tender.apiToken")).toBeNull();
   // Only this tab forgets it: the API has no way to end a token before it expires.
-  expect(screen.getByTestId("settings-session").textContent).toContain("Signed out in this tab.");
-  expect(screen.queryByRole("button", { name: "Sign out of the API" })).toBeNull();
+  expect(screen.getByTestId("settings-session").textContent).toContain("Ended in this tab.");
+  expect(screen.queryByRole("button", { name: "End the API session" })).toBeNull();
 });
 
 test("settings_choose_the_sidebar_in_its_one_key_and_follow_a_change_made_elsewhere", async () => {

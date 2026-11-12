@@ -300,7 +300,7 @@ test("the_sign_in_line_shows_only_where_it_can_find_something", async () => {
   sessionStorage.setItem(`tender.connect.implicit.${ALICE}`, "1");
   open(world());
   expect((await screen.findByTestId("implicit-agents-signin")).textContent).toContain(
-    "Sign in to Tender to list them",
+    "Confirm with your account to list them",
   );
 
   // Signed in with nothing set up that way: nothing more is shown.
@@ -322,7 +322,7 @@ test("a_sign_in_that_ended_offers_a_new_one_and_a_failed_read_says_so_with_retry
   signedIn();
   open(state);
   expect((await screen.findByTestId("implicit-agents-signin")).textContent).toContain(
-    "Your sign-in to Tender has ended",
+    "Your API session has ended",
   );
 
   // The API is away: one line, with Retry, which reads again.

@@ -785,7 +785,7 @@ test("a_wallet_that_cannot_sign_in_is_sent_to_the_steps_by_hand", async () => {
   const state = world();
   const { user } = open(state, { signMessage: false });
   const notice = await screen.findByTestId("connect-cannot-sign");
-  expect(notice.textContent).toContain("This wallet can't sign in to Tender");
+  expect(notice.textContent).toContain("This wallet can't sign the message that confirms it to Tender's API");
   expect(within(step(1)).queryByRole("button", { name: "Get a connect code" })).toBeNull();
   await user.click(within(notice).getByRole("button", { name: "Set up by hand" }));
   await screen.findByLabelText("The public key it printed");
@@ -798,10 +798,10 @@ test("a_sign_in_that_ended_is_said_and_signing_in_again_goes_on", async () => {
   await getCode(user);
   state.readStatus = 401;
   const notice = await screen.findByTestId("connect-signed-out");
-  expect(notice.textContent).toContain("Your sign-in to Tender has ended");
+  expect(notice.textContent).toContain("Your API session has ended");
   state.readStatus = null;
   agentAttaches(state);
-  await user.click(within(notice).getByRole("button", { name: "Sign in again" }));
+  await user.click(within(notice).getByRole("button", { name: "Confirm again" }));
   await waitFor(() => expect(step(3).dataset.open).toBe("true"));
   expect(signed).toHaveLength(2);
 });

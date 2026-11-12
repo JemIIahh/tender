@@ -28,7 +28,7 @@ export type VaultState =
 
 const PROGRESS: Record<Stage, string> = {
   check: "Looking for your earlier post on the chain.",
-  signin: "Signing in to Tender. Approve the message in your wallet.",
+  signin: "Confirming with Tender. Approve the message in your wallet.",
   upload: "Saving your task's documents with Tender.",
   vault: READING_BALANCES,
   wallet: "Waiting for your wallet. Approve the transactions there.",
@@ -340,8 +340,8 @@ export function PostSummary(props: {
         </button>
       )}
       <p className="text-[13px] text-muted">
-        Your wallet may ask you to sign in to Tender first. The deposit and the post are then one
-        approval. Once posted, the terms can&rsquo;t change.
+        Your wallet may first ask you to confirm with Tender (a message, no fee). The deposit and
+        the post are then one approval. Once posted, the terms can&rsquo;t change.
       </p>
     </section>
   );

@@ -147,13 +147,13 @@ export function walletErrorMessage(error: unknown): string {
       : "The wallet signed, but its answer can't be used.";
   }
   if (error instanceof SignInRefused) {
-    return `Tender's sign-in request has the wrong ${error.field}, so nothing was signed.`;
+    return `Tender's request to confirm your account has the wrong ${error.field}, so nothing was signed.`;
   }
   if (error instanceof WalletSessionEnded) {
-    return "The wallet was disconnected or changed during sign-in, so you are not signed in. Try again with the wallet you want to use.";
+    return "The wallet was disconnected or changed while confirming with Tender's API, so nothing was confirmed. Try again with the account you want to use.";
   }
   if (error instanceof WalletAccountMismatch) {
-    return "The wallet signed in as a different account than the one connected, so nothing was sent to Tender.";
+    return "The wallet signed as a different account than the one you're signed in as, so nothing was sent to Tender.";
   }
   return errorMessage(error);
 }

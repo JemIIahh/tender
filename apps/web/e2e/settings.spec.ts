@@ -18,7 +18,8 @@ test("settings_show_the_account_keep_the_sidebar_and_copy_the_network", async ({
     .click();
   await expect(page).toHaveURL("/settings", { timeout: 20_000 });
   await expect(page.getByTestId("settings-wallet")).toHaveText(OWNER);
-  await expect(page.getByTestId("settings-session")).toContainText("Not signed in.");
+  // Signed in, with no API session yet: the two are told apart.
+  await expect(page.getByTestId("settings-session")).toContainText("None.");
 
   await page.getByRole("radio", { name: /Icons only/ }).check();
   await expect(page.locator("html")).toHaveAttribute("data-sidebar", "rail");

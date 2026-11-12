@@ -60,7 +60,7 @@ type State =
 const STAGE_WORDS: Record<HireStage, string> = {
   documents: "Writing the task…",
   check: "Checking the service's terms…",
-  signin: "Signing in with your wallet…",
+  signin: "Confirming with your account…",
   upload: "Uploading the request…",
   vault: "Reading your vault…",
   wallet: "Waiting for your wallet to approve…",

@@ -22,7 +22,7 @@ import { PickPayout } from "./PickPayout";
 
 const STAGE_WORDS: Record<PickStage, string> = {
   check: "Checking the task…",
-  signin: "Signing in with your wallet…",
+  signin: "Confirming with your account…",
   upload: "Publishing the scorecard…",
   wallet: "Waiting for your wallet to approve…",
 };
@@ -221,7 +221,7 @@ export function PickPanel({
       <div className="grid gap-3">
         {windowLine}
         <p data-testid="pick-blocked" className={NOTICE}>
-          This wallet can't sign messages, and the scorecard is published under a sign-in to Tender.
+          This wallet can't sign messages, and the scorecard is published under an API session.
           Switch to a wallet that signs messages to pick.
         </p>
       </div>

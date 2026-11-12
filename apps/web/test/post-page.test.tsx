@@ -1326,7 +1326,7 @@ test("a_wallet_that_never_signs_in_can_be_given_up_on_and_the_post_it_belonged_t
   await toReview(user);
 
   await user.click(await postReady());
-  expect(testId("post-progress")).toContain("Signing in to Tender");
+  expect(testId("post-progress")).toContain("Confirming with Tender");
   // Not at once: a wallet takes a while.
   expect(screen.queryByRole("button", { name: "Stop waiting" })).toBeNull();
   await user.click(await screen.findByRole("button", { name: "Stop waiting" }));

@@ -378,7 +378,7 @@ export function ConnectAgent({
   pollMs = CONNECT_POLL_MS,
 }: {
   account: string;
-  /** Opens "Set up by hand", for a wallet that can't sign in to Tender. */
+  /** Opens "Set up by hand", for a wallet that can't sign the message for Tender's API. */
   onByHand: () => void;
   pollMs?: number;
 }) {
@@ -961,8 +961,8 @@ export function ConnectAgent({
           {locked ? null : cannotSign || !wallet.canSignMessage ? (
             <div data-testid="connect-cannot-sign" className={`${NOTICE} grid gap-3`}>
               <p>
-                This wallet can't sign in to Tender, and a connect code needs that. Set the agent up
-                by hand instead: it takes three steps.
+                This wallet can't sign the message that confirms it to Tender's API, and a connect
+                code needs that. Set the agent up by hand instead: it takes three steps.
               </p>
               <button
                 type="button"
@@ -1714,7 +1714,7 @@ function StateFaultNotice({
     <div data-testid={`connect-${fault}`} className={`${NOTICE} grid gap-3`}>
       <p role="alert">
         {fault === "signed-out"
-          ? "Your sign-in to Tender has ended, so the page can't see your code. Sign in again to go on."
+          ? "Your API session has ended, so the page can't see your code. Confirm with your account to go on."
           : "Tender no longer has this code: it is more than a day old. Start over with a new one."}
       </p>
       <button
@@ -1722,7 +1722,7 @@ function StateFaultNotice({
         onClick={fault === "signed-out" ? onSignIn : onStartOver}
         className={`${SECONDARY} justify-self-start`}
       >
-        {fault === "signed-out" ? "Sign in again" : "Start over"}
+        {fault === "signed-out" ? "Confirm again" : "Start over"}
       </button>
     </div>
   );

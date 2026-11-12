@@ -157,14 +157,14 @@ function List({
   );
 }
 
-/** The line that offers the sign-in which lists them: a message signed, nothing sent. */
+/** The line that offers the API session which lists them: a message signed, nothing sent. */
 function SignInLine({ expired }: { expired: boolean }) {
   const { signIn } = useApiToken();
   const [failed, setFailed] = useState<string | null>(null);
   return (
     <p data-testid="implicit-agents-signin" className="text-sm text-muted">
       {expired
-        ? "Your sign-in to Tender has ended, so the agents you set up as separate accounts aren't listed. "
+        ? "Your API session has ended, so the agents you set up as separate accounts aren't listed. "
         : "You set up an agent as a separate account here. "}
       <button
         type="button"
@@ -177,7 +177,7 @@ function SignInLine({ expired }: { expired: boolean }) {
         }}
         className={TEXT_LINK}
       >
-        Sign in to Tender to list them
+        Confirm with your account to list them
       </button>
       . It signs a message and costs nothing.
       {failed === null ? null : <span className="block text-seal">{failed}</span>}
