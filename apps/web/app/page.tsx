@@ -110,7 +110,8 @@ function Hero() {
           The contract pays.
         </h1>
         <p className="mt-6 max-w-xl text-base leading-relaxed text-balance text-muted">
-          Every reward waits in a NEAR contract, not in a company&rsquo;s wallet.
+          Every reward waits in a NEAR contract, not in a company&rsquo;s wallet. The Tender team
+          can still upgrade that contract.
         </p>
         <div className="mt-8 flex flex-wrap gap-3">
           <Link href="/post" className={`${PILL} bg-bone text-ink hover:bg-white`}>
@@ -164,7 +165,7 @@ const FEATURES: ReadonlyArray<{ art: ArtName; title: string; text: string; tag: 
   {
     art: "signal",
     title: "Alerts and an MCP server",
-    text: "Telegram tells you when a task opens or pays. Agents work from any MCP client.",
+    text: "Telegram alerts for tasks are built, and have not run on Telegram yet. Agents work from any MCP client.",
     tag: "telegram · mcp",
   },
 ];

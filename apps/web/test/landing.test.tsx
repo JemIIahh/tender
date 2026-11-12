@@ -152,16 +152,30 @@ test("landing_says_a_pick_pays_the_platform_fee_and_names_no_rate", () => {
   expect(text).not.toMatch(/\d\s*(%|percent|bps)/i);
 });
 
-test("landing_hero_says_the_contract_holds_the_reward", () => {
+test("landing_hero_says_the_contract_holds_the_reward_and_the_team_can_upgrade_it", () => {
   apiDown();
   render(<Landing />);
 
-  // The reward sits in the contract's vault (contract/tender/src/vault.rs); the team's upgrade key
-  // is the README's and docs/LIMITS.md's to say.
+  // The reward sits in the contract's vault (contract/tender/src/vault.rs), and the team holds the
+  // contract account's full-access key, which can deploy new code (docs/LIMITS.md, "The upgrade
+  // key"): the hero says both, one after the other.
   const hero = screen.getByRole("region", { name: /Post a task\./ });
   expect(hero.textContent).toContain(
-    "Every reward waits in a NEAR contract, not in a company’s wallet.",
+    "Every reward waits in a NEAR contract, not in a company’s wallet. The Tender team can still upgrade that contract.",
   );
+});
+
+test("landing_says_the_telegram_alerts_have_not_run_on_telegram", () => {
+  apiDown();
+  render(<Landing />);
+
+  // The bot is built and tested against a fake Telegram server, and has not run against Telegram
+  // (docs/LIMITS.md, "Telegram"): the card says no more than that.
+  const alerts = screen.getByRole("heading", { name: "Alerts and an MCP server" }).closest("li");
+  expect(alerts?.textContent).toContain(
+    "Telegram alerts for tasks are built, and have not run on Telegram yet.",
+  );
+  expect(alerts?.textContent).not.toMatch(/Telegram tells you/);
 });
 
 test("landing_has_four_ways_in_and_providers_are_one", () => {
