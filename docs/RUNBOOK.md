@@ -245,18 +245,21 @@ Leave `NEXT_PUBLIC_DEV_WALLET*` unset. It works on the sandbox only.
 
 ### The email and Google login (Privy)
 
-With `NEXT_PUBLIC_PRIVY_APP_ID` set, Connect opens a chooser: "Continue with email or Google" first, and "Use a NEAR wallet" (the NEAR wallets, as before) second. A login makes the person a NEAR implicit account (64 hex characters, its public key). Privy keeps that account's key and signs with it once the person has logged in; the web app builds and sends each transaction itself. Right after a login, the page reads the account's balance and, under 0.05 NEAR, asks `POST /v1/gas-gift` for testnet NEAR for its fees (the API's gas gift must be set up, with `PRIVY_APP_ID` on the API host: the API checks the login's token against Privy's published keys for that app). If the gift is off or refused, the page says so in one line and links the testnet faucet. Without the app id, the app has no login and Connect opens the NEAR wallets directly. The sandbox ignores the app id: it has the dev wallet.
+With `NEXT_PUBLIC_PRIVY_APP_ID` set, Connect opens one window, "Log in or sign up": an email field (Submit sends a one-time code, which the person types in the same window), "Continue with Google" (the page goes to Google and comes back to the page it left, where the login ends), and under them a row for each NEAR wallet near-connect lists, which connects that wallet with no second window. If near-connect's list can't be had, one row, "NEAR wallets", opens near-connect's own window. The window marks the way this browser connected last ("Last used", kept in the browser's local storage as `email`, `google` or a wallet's id). The login uses Privy's headless hooks (`useLoginWithEmail`, `useLoginWithOAuth`); no window of Privy's logs anyone in. A login makes the person a NEAR implicit account (64 hex characters, its public key). Privy keeps that account's key and signs with it once the person has logged in; the web app builds and sends each transaction itself. Right after a login, the page reads the account's balance and, under 0.05 NEAR, asks `POST /v1/gas-gift` for testnet NEAR for its fees (the API's gas gift must be set up, with `PRIVY_APP_ID` on the API host: the API checks the login's token against Privy's published keys for that app). If the gift is off or refused, the page says so in one line and links the testnet faucet. Without the app id, the app has no login, and the same window lists the NEAR wallets alone. The sandbox ignores the app id: it has the dev wallet.
 
 The owner sets it up in Privy's dashboard (dashboard.privy.io); nothing here does it:
 
 1. Create an app.
-2. Under the login methods, turn on **Email** and **Google**, and turn the others off. The app's button names these two.
+2. Under the login methods, turn on **Email** and **Google**, and turn the others off. The Connect window offers these two.
 3. Under **Configuration > App settings > Clients**, add the origins the app is served from to **Allowed origins**: the local preview (`http://localhost:3000`, or the port you use), the phone preview `http://jemiiah-macbook-pro.local:3050`, and the domain once it is bought.
-4. Copy the **app id** into `NEXT_PUBLIC_PRIVY_APP_ID` (web) and `PRIVY_APP_ID` (API), and, optionally, the client's id, if you made one, into `NEXT_PUBLIC_PRIVY_CLIENT_ID`.
+4. Leave **Configuration > App settings > Advanced > Allowed OAuth redirect URLs** empty. The Google login comes back to the page it started on, with that page's own path and query, and Privy's docs say a URL listed there must match exactly (no query string, no trailing slash, `https` only): with the list empty, Privy allows any page of the allowed origins of step 3 (https://docs.privy.io/recipes/react/allowed-oauth-redirects).
+5. Copy the **app id** into `NEXT_PUBLIC_PRIVY_APP_ID` (web) and `PRIVY_APP_ID` (API), and, optionally, the client's id, if you made one, into `NEXT_PUBLIC_PRIVY_CLIENT_ID`.
 
 Nothing else is copied: the app secret is not used anywhere.
 
 Both ids are public: they ship in the page. The web app sets no Content-Security-Policy; if one is added, it must allow what Privy lists (`auth.privy.io` in `frame-src`, `child-src` and `connect-src`, `*.rpc.privy.systems` in `connect-src`, and `challenges.cloudflare.com` for its CAPTCHA): https://docs.privy.io/security/implementation-guide/content-security-policy.
+
+Privy's docs note that a Google login may not work inside an app's built-in browser (a link opened from a chat app), where Google refuses embedded views. The email login does not leave the page. Neither has been tried in such a browser.
 
 "Export key" on the wallet page opens Privy's own window, on Privy's domain, from which the person copies the account's private key; the web app never sees it.
 
