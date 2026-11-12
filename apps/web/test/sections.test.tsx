@@ -285,7 +285,22 @@ test("scorecard_of_a_rubric_is_labelled_subjective_and_names_the_model", () => {
   );
 });
 
-test("scorecard_of_another_verifiers_rubric_is_subjective_under_its_own_name", () => {
+test("scorecard_of_another_verifiers_rubric_is_subjective_under_its_own_name_and_its_model", () => {
+  render(
+    <Scorecard
+      scorecard={scorecard({
+        kind: "rubric",
+        judge: { software: "acme-grader/3", model: "grader-model-1" },
+      })}
+    />,
+  );
+
+  expect(screen.getByTestId("scored-by").textContent).toBe(
+    "Scored by acme-grader/3 with grader-model-1. Subjective: a model's judgement.",
+  );
+});
+
+test("scorecard_of_a_rubric_that_names_no_model_is_subjective_and_not_called_a_models", () => {
   render(
     <Scorecard
       scorecard={scorecard({
@@ -296,8 +311,31 @@ test("scorecard_of_another_verifiers_rubric_is_subjective_under_its_own_name", (
   );
 
   expect(screen.getByTestId("scored-by").textContent).toBe(
-    "Scored by acme-grader/3. Subjective: a model's judgement.",
+    "Scored by acme-grader/3. Subjective: a judgement, and the scorecard names no model.",
   );
+});
+
+test("scorecard_of_a_hire_its_hirer_accepted_by_hand_says_no_model_scored_it", () => {
+  // As testnet task 3: a hire of a listed service, whose hirer (its verifier) accepted the delivery
+  // and wrote a rubric scorecard with no model in it. Nothing on the card may say a model scored it.
+  render(
+    <Scorecard
+      scorecard={scorecard({
+        kind: "rubric",
+        verifier: "poster.testnet",
+        heldout: null,
+        heldout_commitment: null,
+        judge: { software: "tender-utility-hirer/1", model: null },
+      })}
+      commitment={null}
+    />,
+  );
+
+  const line = screen.getByTestId("scored-by").textContent ?? "";
+  expect(line).toBe(
+    "Scored by tender-utility-hirer/1. Subjective: a judgement, and the scorecard names no model.",
+  );
+  expect(line).not.toMatch(/model's judgement/);
 });
 
 test("scorecard_of_a_check_is_not_called_subjective", () => {

@@ -44,9 +44,11 @@ function unsalted(heldout: unknown): boolean {
  * Who scored it, in a line. A scorecard whose `judge.software` carries the Judge's name is the
  * Tender Judge's: the API takes such a card from the Judge's account only (P03-R29), and a build
  * that knows the Judge's account holds the card to that too. Any other is named by what it says it
- * is. A rubric is scored by a model, which is a judgement and not a check, so it is said to be
- * subjective (spec 7.3) and the model is named. A scorecard that names `HAND_PICK_SOFTWARE` is said
- * to say that its verifier picked by hand: no one holds that name to an account.
+ * is. A rubric is scored by judgement and not by a check, so it is said to be subjective (spec 7.3).
+ * The Judge scores one with a model, which the card names, and then it is a model's judgement. A
+ * card that names no model is not called a model's: a hire whose hirer accepted it by hand is a
+ * rubric with `model: null`. A scorecard that names `HAND_PICK_SOFTWARE` is said to say that its
+ * verifier picked by hand: no one holds that name to an account.
  */
 export function ScoredBy({
   scorecard,
@@ -73,7 +75,11 @@ export function ScoredBy({
     <p data-testid="scored-by" className="text-sm text-muted wrap-anywhere">
       {`Scored by ${who}`}
       {rubric && model !== null ? ` with ${model}` : ""}
-      {rubric ? ". Subjective: a model's judgement." : "."}
+      {!rubric
+        ? "."
+        : model !== null
+          ? ". Subjective: a model's judgement."
+          : ". Subjective: a judgement, and the scorecard names no model."}
     </p>
   );
 }
