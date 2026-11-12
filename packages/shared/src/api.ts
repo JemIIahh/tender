@@ -496,8 +496,9 @@ export type TelegramLinkResponse = z.infer<typeof TelegramLinkResponseSchema>;
 // ---- Gas gift ---------------------------------------------------------------------------------
 
 /**
- * `POST /v1/gas-gift`, on testnet only: an account that the email login made gets a little testnet
- * NEAR from the team's gift account, so it can pay its first fees. The bearer is the login's own
+ * `POST /v1/gas-gift`, on testnet only: an account that the email login made gets testnet NEAR
+ * from the team's gift account (0.25 NEAR unless the API sets another), so it can pay its fees and
+ * add an agent with nothing of its own. The bearer is the login's own
  * token (not a Tender sign-in, which the account can't do before it holds NEAR); the body names the
  * account, an implicit one (64 lowercase hex characters). Refusals are an `ErrorBody`, by status:
  *

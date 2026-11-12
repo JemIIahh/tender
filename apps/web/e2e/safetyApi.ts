@@ -63,7 +63,7 @@ const KEYS: Record<string, unknown[]> = {
   [DORA]: [fullAccess(OWNER_KEY), limited(RUNNER_KEY, ["commit", "reveal"])],
 };
 
-/** The bond terms in force: 1 tUSDC, 14 days from leaving to claiming, as on testnet. */
+/** The bond terms in force: 1 tUSDC (an amount of the fixture), and 14 days from leaving to claiming, as on testnet. */
 const CONFIG = {
   agent_bond_token: TEST_TOKEN,
   agent_bond_amount: "1000000",

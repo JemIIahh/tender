@@ -13,8 +13,8 @@ import {
 
 /**
  * What one press mints: 20 tUSDC, in the token's smallest unit (tUSDC has 6 decimals). Enough for
- * the agent bond (1 tUSDC unless the owner set another) and for a small task, with room to try
- * again. The same figure is in the wallet page's words and in docs/MCP.md.
+ * the agent bond (0.01 tUSDC on testnet since 2026-11-12, unless the owner sets another) and for a
+ * small task, with room to try again. The same figure is in the wallet page's words and in docs/MCP.md.
  */
 export const FAUCET_AMOUNT = 20_000_000n;
 
