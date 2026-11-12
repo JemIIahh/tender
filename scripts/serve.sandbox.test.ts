@@ -6,12 +6,29 @@ import { connect } from "node:net";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseEnv } from "node:util";
-import { ApiClient, type LocalChain, startLocalChain, TenderClient } from "@tender/client";
+import {
+  ApiClient,
+  type LocalChain,
+  registerWithBond,
+  scriptedProfile,
+  startLocalChain,
+  TenderClient,
+} from "@tender/client";
 import { type Db, migrate, openDb, PgliteLockLostError, type SessionLock } from "@tender/db";
 import { IndexerError } from "@tender/indexer";
-import { GasGiftResponseSchema, implicitAccountOf, sha256Hex } from "@tender/shared";
+import {
+  AGENT_ACCOUNT_DEPOSIT,
+  fundAgentCalls,
+  GasGiftResponseSchema,
+  implicitAccountActions,
+  implicitAccountOf,
+  mintCall,
+  sha256Hex,
+  type TenderCall,
+  tokenStorageDepositCall,
+} from "@tender/shared";
 import { BOT_COMMANDS } from "@tender/telegram";
-import { KeyPair } from "near-api-js";
+import { Account, actions, JsonRpcProvider, KeyPair, type KeyPairString } from "near-api-js";
 import { afterAll, beforeAll, expect, test, vi } from "vitest";
 import { addRoleKey } from "./keeper-key";
 import { REPO_ROOT } from "./lib/env";
@@ -1619,6 +1636,150 @@ test("off_the_sandbox_the_process_waits_for_a_node_behind_the_index_and_ends_onl
   }
 }, 240_000);
 
+/** What the gas gift sends by default: 0.25 NEAR (`DEFAULT_GAS_GIFT_AMOUNT`). */
+const GIFT = 250_000_000_000_000_000_000_000n;
+
+/** `yocto` as NEAR with five decimals, for the lines the test prints. */
+const nearText = (yocto: bigint) => `${(Number(yocto / 10n ** 19n) / 100_000).toFixed(5)} NEAR`;
+
+/**
+ * The NEAR `account` holds once it has stopped moving: a transaction's refund comes a block or two
+ * after it, and the final view a block or two after that.
+ */
+async function settledNear(account: string): Promise<bigint> {
+  let last = await reader.nearBalanceOf(account);
+  for (let tries = 0; tries < 30; tries++) {
+    await sleep(1_000);
+    const now = await reader.nearBalanceOf(account);
+    if (now === last) return now;
+    last = now;
+  }
+  return last;
+}
+
+/** What a transaction burnt in fees, its receipts included, from its outcome. */
+function burntBy(outcome: {
+  transaction_outcome: { outcome: { tokens_burnt: string | bigint } };
+  receipts_outcome: Array<{ outcome: { tokens_burnt: string | bigint } }>;
+}): bigint {
+  return [outcome.transaction_outcome, ...outcome.receipts_outcome].reduce(
+    (sum, part) => sum + BigInt(part.outcome.tokens_burnt),
+    0n,
+  );
+}
+
+/**
+ * One transaction of `calls`, all to one receiver, as the web app's wallet sends a group of them
+ * (`groupCalls`), signed by `signer`. Gives what it burnt in fees.
+ */
+async function sendAs(signer: Account, receiverId: string, calls: TenderCall[]): Promise<bigint> {
+  const outcome = await signer.signAndSendTransaction({
+    receiverId,
+    actions: calls.map((call) =>
+      actions.functionCall(call.methodName, call.args, call.gas, call.deposit),
+    ),
+    waitUntil: "FINAL",
+    throwOnFailure: true,
+  });
+  return burntBy(outcome);
+}
+
+/**
+ * A login account adds an agent, as the web app does it, on the NEAR the gas gift sent it and
+ * nothing else, and the agent registers. Each step through the real calls, and what each cost
+ * (what left the account, and of it what was burnt in fees):
+ *
+ * 1. The wallet page's faucet: the test token registers the account (0.00125 NEAR) and mints it
+ *    20 tUSDC, in one transaction (`planFaucet`).
+ * 2. Add an agent for an implicit owner (`implicitAgentBatch`): `AGENT_ACCOUNT_DEPOSIT` to the
+ *    implicit account of the agent's key, which creates it; the agent's storage with Tender; the
+ *    bond into the agent's vault. Three transactions, one approval.
+ * 3. The agent registers with its own key, on the NEAR it was sent (`pnpm agent:register`).
+ *
+ * Gives what the login and the agent hold at the end.
+ */
+async function addAnAgentAsALogin(
+  ownerId: string,
+  ownerKey: KeyPairString,
+): Promise<{ left: bigint; agentLeft: bigint }> {
+  const provider = new JsonRpcProvider({ url: chain.rpcUrl });
+  const owner = new Account(ownerId, provider, ownerKey);
+  const token = chain.tokenId;
+  const start = await settledNear(ownerId);
+  const lines = [`a login account with ${nearText(start)}, from the gas gift:`];
+  const step = (what: string, before: bigint, after: bigint, fees: bigint) =>
+    lines.push(`  ${what}: ${nearText(before - after)}, of it fees ${nearText(fees)}`);
+
+  const faucetFees = await sendAs(owner, token, [
+    tokenStorageDepositCall(token, ownerId),
+    mintCall(token, ownerId, 20_000_000n),
+  ]);
+  const afterFaucet = await settledNear(ownerId);
+  expect(await reader.ftBalanceOf(token, ownerId)).toBe(20_000_000n);
+  step("the faucet, 20 tUSDC (registration with the token, mint)", start, afterFaucet, faucetFees);
+
+  const agentKey = KeyPair.fromRandom("ed25519");
+  const agentId = implicitAccountOf(agentKey.getPublicKey().toString());
+  if (agentId === null) throw new Error("a fresh ed25519 key has no implicit account");
+  const bondAmount = BigInt((await reader.getConfig()).agent_bond_amount ?? "0");
+  expect(bondAmount).toBeGreaterThan(0n);
+  const [storage, bond] = fundAgentCalls({
+    contractId: chain.contractId,
+    accountId: agentId,
+    storage: true,
+    bond: { token, amount: bondAmount },
+  });
+  if (storage === undefined || bond === undefined) throw new Error("no storage or bond call");
+
+  const created = await owner.signAndSendTransaction({
+    receiverId: agentId,
+    actions: implicitAccountActions().map((action) => {
+      if (action.type !== "Transfer") throw new Error(`not a transfer: ${action.type}`);
+      return actions.transfer(BigInt(action.params.deposit));
+    }),
+    waitUntil: "FINAL",
+    throwOnFailure: true,
+  });
+  const afterNear = await settledNear(ownerId);
+  step(
+    `the agent's ${nearText(AGENT_ACCOUNT_DEPOSIT)}, which creates its account`,
+    afterFaucet,
+    afterNear,
+    burntBy(created),
+  );
+
+  const storageFees = await sendAs(owner, chain.contractId, [storage]);
+  const afterStorage = await settledNear(ownerId);
+  step("the agent's storage with Tender", afterNear, afterStorage, storageFees);
+
+  const bondFees = await sendAs(owner, token, [bond]);
+  const left = await settledNear(ownerId);
+  step("the bond into the agent's vault", afterStorage, left, bondFees);
+  lines.push(`  left: ${nearText(left)}`);
+  expect(await reader.balanceOf(agentId, token)).toBe(bondAmount);
+  expect(await reader.storageBalanceOf(agentId)).not.toBeNull();
+
+  const agent = new TenderClient({
+    network: chain.network,
+    contractId: chain.contractId,
+    rpcUrl: chain.rpcUrl,
+    signer: { accountId: agentId, privateKey: agentKey.toString() },
+  });
+  const agentStart = await settledNear(agentId);
+  expect(agentStart).toBe(AGENT_ACCOUNT_DEPOSIT);
+  const registered = await registerWithBond(agent, scriptedProfile("writer"), {
+    approve: () => true,
+  });
+  expect(await reader.getAgent(agentId)).toMatchObject({ status: "active" });
+  const agentLeft = await settledNear(agentId);
+  lines.push(
+    `the agent, with ${nearText(agentStart)}: registering cost it ${nearText(agentStart - agentLeft)} ` +
+      `(storage it added: ${nearText(registered.storageAdded)}); left: ${nearText(agentLeft)}`,
+  );
+  console.log(lines.join("\n"));
+  return { left, agentLeft };
+}
+
 /**
  * A token as the email login signs one: a JWT with ES256, made here with node's crypto. The route
  * verifies it as it does a real one.
@@ -1654,7 +1815,7 @@ test("the_gas_gift_creates_a_new_implicit_account_with_its_first_near_once", asy
     },
   );
   expect(lines).toContain(
-    `serve: gas gift on, from ${gift.accountId}: 0.1 NEAR to each new account, 2 NEAR a day ` +
+    `serve: gas gift on, from ${gift.accountId}: 0.25 NEAR to each new account, 2 NEAR a day ` +
       "at most; login tokens checked with the app's published keys",
   );
 
@@ -1686,7 +1847,7 @@ test("the_gas_gift_creates_a_new_implicit_account_with_its_first_near_once", asy
   expect(res.status).toBe(200);
   expect(asked).toEqual(["sandbox-key"]);
   const sent = GasGiftResponseSchema.parse(await res.json());
-  expect(sent).toMatchObject({ status: "sent", amount: "100000000000000000000000" });
+  expect(sent).toMatchObject({ status: "sent", amount: "250000000000000000000000" });
   if (sent.status !== "sent") throw new Error("the gift was not sent");
   expect((await reader.txStatus(sent.tx_hash, gift.accountId)).kind).toMatch(
     /^(executed|pending)$/,
@@ -1698,7 +1859,7 @@ test("the_gas_gift_creates_a_new_implicit_account_with_its_first_near_once", asy
     async () => (await reader.nearBalanceOf(implicit)) > 0n,
     15_000,
   );
-  expect(await reader.nearBalanceOf(implicit)).toBe(100_000_000_000_000_000_000_000n);
+  expect(await reader.nearBalanceOf(implicit)).toBe(GIFT);
   // The transfer made the account, with the key its name is the hex of as its full-access key.
   expect(await reader.viewAccessKey(implicit, publicKey)).toEqual({ permission: "FullAccess" });
   // And it succeeded, once all of it is final (its refund receipt comes a block later).
@@ -1708,6 +1869,12 @@ test("the_gas_gift_creates_a_new_implicit_account_with_its_first_near_once", asy
     15_000,
   );
   expect((await reader.txStatus(sent.tx_hash, gift.accountId)).kind).toBe("executed");
+
+  // The gift is enough for the login to add an agent with nothing of its own, the way the web app
+  // does it, and to have NEAR left (`addAnAgentAsALogin` prints what each step cost).
+  const { left, agentLeft } = await addAnAgentAsALogin(implicit, key.toString() as KeyPairString);
+  expect(left).toBeGreaterThan(10n ** 23n);
+  expect(agentLeft).toBeGreaterThan(9n * 10n ** 22n);
 
   // Once per login: the same login, for the same account and for another, gets nothing more.
   const twice = await askFor(implicit);

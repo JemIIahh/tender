@@ -92,11 +92,19 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 // not which account they hold, so a login can name any implicit account, once. The daily cap bounds
 // what many logins can take together.
 
-/** What the gift is unless `GAS_GIFT_AMOUNT` says otherwise: 0.1 NEAR. */
-export const DEFAULT_GAS_GIFT_AMOUNT = 100_000_000_000_000_000_000_000n;
+/**
+ * What the gift is unless `GAS_GIFT_AMOUNT` says otherwise: 0.25 NEAR. Enough for a login to add an
+ * agent at no cost of its own: the test token's registration and mint (the wallet page's faucet),
+ * then the agent's 0.1 NEAR (`AGENT_ACCOUNT_DEPOSIT`), its storage with Tender and its bond, with
+ * NEAR left for fees (scripts/serve.sandbox.test.ts runs it).
+ */
+export const DEFAULT_GAS_GIFT_AMOUNT = 250_000_000_000_000_000_000_000n;
 /** Below this the account gets a gift, unless `GAS_GIFT_MIN_BALANCE` says otherwise: 0.05 NEAR. */
 export const DEFAULT_GAS_GIFT_MIN_BALANCE = 50_000_000_000_000_000_000_000n;
-/** What all gifts of one UTC day may add up to, unless `GAS_GIFT_DAILY_CAP` says otherwise: 2 NEAR. */
+/**
+ * What all gifts of one UTC day may add up to, unless `GAS_GIFT_DAILY_CAP` says otherwise: 2 NEAR,
+ * 8 gifts of the default amount.
+ */
 export const DEFAULT_GAS_GIFT_DAILY_CAP = 2_000_000_000_000_000_000_000_000n;
 
 /** The issuer of every token of the login, as Privy's documentation gives it. */

@@ -1948,7 +1948,7 @@ test("read_serve_config_reads_the_gas_gift_with_its_defaults", () => {
         privyAppId: "cm0tenderapp0for0tests",
         // None: the keys Privy publishes for the app.
         privyVerificationKey: undefined,
-        amount: 100_000_000_000_000_000_000_000n,
+        amount: 250_000_000_000_000_000_000_000n,
         minBalance: 50_000_000_000_000_000_000_000n,
         dailyCap: 2_000_000_000_000_000_000_000_000n,
       },
@@ -2044,7 +2044,7 @@ test("serve_reads_the_gas_gift_from_an_env_file_as_the_owner_writes_it", async (
   expect(PRIVY_PEM.split("\n").length).toBeGreaterThan(2);
   expect(quoted.gasGift).toMatchObject({
     privyVerificationKey: PRIVY_PEM,
-    amount: 100_000_000_000_000_000_000_000n,
+    amount: 250_000_000_000_000_000_000_000n,
     dailyCap: 2_000_000_000_000_000_000_000_000n,
   });
   expect(quoted.warnings).toEqual([]);
