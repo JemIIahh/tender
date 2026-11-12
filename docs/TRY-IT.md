@@ -218,7 +218,7 @@ curl -s https://rpc.testnet.fastnear.com -H 'content-type: application/json' \
 
 It printed `5ec43a10812fb9b92f47ac09c3e3a7ab619104491aa00dcec05c9e6f51b62b36` on 2026-11-12, the `tender.wasm` line of [`contract/res/SHA256SUMS`](../contract/res/SHA256SUMS) (`grep tender.wasm contract/res/SHA256SUMS`).
 
-How many tasks the contract holds, the same way (`task_count`; it printed `"3"` on 2026-11-12 at 14:37 UTC):
+How many tasks the contract holds, the same way (`task_count`; it printed `"13"` at 15:18 UTC on 2026-11-12, and the number only grows):
 
 ```
 curl -s https://rpc.testnet.fastnear.com -H 'content-type: application/json' \

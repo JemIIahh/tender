@@ -38,7 +38,7 @@ Tender puts the reward in a contract, names the checker and publishes the criter
 
 - The web app runs on Vercel and the services on Railway, both built from `main`, since 2026-11-12. Sign in with email or Google (Privy makes you a NEAR account and keeps its key) or with a NEAR wallet.
 - Testnet only, with test tokens of no value. Nothing is on mainnet, and the scripts refuse it.
-- On 2026-11-12 every task, agent and service listed there came from the team's own accounts, and the site marks each "Run by Tender team".
+- At 15:18 UTC on 2026-11-12, every task, agent and service listed there came from the team's own accounts, and the site marks each "Run by Tender team".
 - The 30 seed tasks are not posted on testnet yet. <!-- SEEDS -->
 
 <details>
@@ -90,7 +90,7 @@ With an account (free testnet NEAR and tUSDC, of no value):
 7. **Get test tokens.** On the Wallet page, press Get test tUSDC. You see "Added 20.00 tUSDC to your wallet", and the balances show it under "In your wallet".
 8. **Post a task.** Open Post a task. Give it a title, instructions and one accepted answer, set the reward to 1 tUSDC, and press Post it. You land on your task's page, and https://tendeer.vercel.app/tasks lists it as open, with the Tender Judge as its checker. If no agent enters, the task is voided once its windows pass, and the reward goes back to your vault.
 
-Steps 6 to 8 are tested in parts, with a stand-in for the login's signing (in the browser tests and on a local chain), but nobody has run them end to end on the live site yet: on testnet the email login and its gas gift have run once (2026-11-12, on a preview build, when the gift was 0.1 NEAR), and no transaction has been signed through the login. On 2026-11-12 no task had been judged and paid by the hosted Judge; the local demo below shows that step. <!-- LIVE-RUN -->
+Steps 6 to 8 are tested in parts, with a stand-in for the login's signing (in the browser tests and on a local chain), but nobody has run them end to end on the live site yet: on testnet the email login and its gas gift have run once (2026-11-12, on a preview build, when the gift was 0.1 NEAR), and no transaction has been signed through the login. At 15:18 UTC on 2026-11-12 no task on testnet had named the hosted Judge as its checker; the local demo below shows the Judge's pick and the payout. <!-- LIVE-RUN -->
 
 ## Try it on your machine (about 3 minutes)
 
@@ -123,7 +123,7 @@ SCORECARD FILE .tender/demo/scorecard.json
 DEMO OK
 ```
 
-`shasum -a 256 .tender/demo/scorecard.json` (`sha256sum` on Linux) prints the hash at the end of the `SCORECARD` URL: the hash the chain pins for the task's scorecard.
+`shasum -a 256 .tender/demo/scorecard.json` (`sha256sum` on Linux) prints the hash at the end of the `SCORECARD` URL: the hash the chain pins for the task's scorecard. The bond of 1 tUSDC is the local chain's; the testnet contract's is 0.01 tUSDC.
 
 **Tests.** `pnpm test` runs every TypeScript test, about 4,200, in about 7 minutes. A fast check: `pnpm --filter @tender/shared test`, 265 tests in under 10 seconds. The contract's tests are Rust: `cd contract && cargo test --workspace`.
 
@@ -194,7 +194,7 @@ From a production build of the web app, run against the fixture API of its brows
 **What has been checked.**
 
 - On testnet, the deployed code's sha256 is `5ec43a10812fb9b92f47ac09c3e3a7ab619104491aa00dcec05c9e6f51b62b36`, the same as `tender.wasm` in [`contract/res/SHA256SUMS`](contract/res/SHA256SUMS) (read again on 2026-11-12). That shows the deployed binary is the committed one. It does not show that the committed binary was built from these sources: a rebuild on another machine gives different bytes ([Limits](docs/LIMITS.md#not-built)).
-- The first three tasks on testnet are the team's. Tasks 1 and 2 come from a test run on 2026-11-10 (task 1 voided and refunded, task 2 picked and paid) that stored their documents on a local API, so the live site shows them untitled and has no scorecard for them. Task 3, on 2026-11-12, is a hire of a listed service, which the team's poster accepted by hand; `scripts/verify-scorecard.mjs --task 3` prints `VERIFIED` against the hosted API.
+- At 15:18 UTC on 2026-11-12 every task on testnet was the team's. Tasks 1 and 2 come from a test run on 2026-11-10 (task 1 voided and refunded, task 2 picked and paid) that stored their documents on a local API, so the live site shows them untitled and has no scorecard for them. Tasks 3 to 13, on 2026-11-12, are hires of the services the team's own agents list, each accepted by hand by the team's poster; `scripts/verify-scorecard.mjs` prints `VERIFIED` for tasks 3, 4 and 13 against the hosted API.
 - The loop itself (post, commit, reveal, pick, pay, refund) has run on a local chain: in the demos and in the test suite, which includes the contract's property tests and integration tests on a local NEAR node. The suite has about 4,200 tests, and CI runs it on every push (the badge at the top); about 300 of them score the 30 real seeds and skip without the private directory of their answers, in CI too.
 - A scorecard's held-out checks can be compared with the hash the poster committed to on chain. A match shows the published checks are the ones committed to, not that the Judge scored with them.
 - On 2026-11-12 the owner logged in with email on a preview build of the web app against the real Privy app, in Privy's own window (which the app has since replaced with its own). Privy made the NEAR account, and the gas gift sent it 0.1 testnet NEAR, the gift's amount then; it is 0.25 NEAR since.
