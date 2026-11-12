@@ -3,10 +3,20 @@ import type { AddressInfo } from "node:net";
 import { type extractEvents, NETWORKS, type PostTaskInput, type TenderCall } from "@tender/shared";
 import { Account, actions, KeyPair } from "near-api-js";
 import {
+  CostOverflowError,
+  InvalidChainError,
   InvalidNonceError,
+  InvalidReceiverIdError,
+  InvalidSignatureError,
+  InvalidSignerIdError,
+  InvalidTransactionVersionError,
+  NonceTooLargeError,
   NotEnoughBalanceError,
   ShardCongestedError,
   ShardStuckError,
+  SignerDoesNotExistError,
+  TransactionExpiredError,
+  TransactionSizeExceededError,
   TransactionTimeoutError,
 } from "near-api-js/rpc-errors";
 import { afterEach, describe, expect, expectTypeOf, test, vi } from "vitest";
@@ -770,7 +780,7 @@ describe("NEAR transfers and balances", () => {
   });
 
   test("a_transfer_the_node_refused_or_that_failed_on_chain_is_refused_for_certain", async () => {
-    const refusedByTheNode = new NotEnoughBalanceError(1n, 2n, "gift.test.near", "TX", "BLOCK");
+    const refusedByTheNode = new InvalidSignatureError("TX", "BLOCK");
     const { client } = signing(() => {
       throw refusedByTheNode;
     });
@@ -780,7 +790,18 @@ describe("NEAR transfers and balances", () => {
     );
     expect(error).toBe(refusedByTheNode);
     expect(sendRefused(error)).toBe(true);
-    expect(sendRefused(new InvalidNonceError(1, 1, "TX", "BLOCK"))).toBe(true);
+    // The other refusals that are properties of the signed bytes alone.
+    for (const [what, refused] of [
+      ["a signer id that is no account id", new InvalidSignerIdError("Not An Id", "TX", "BLOCK")],
+      [
+        "a receiver id that is no account id",
+        new InvalidReceiverIdError("Not An Id", "TX", "BLOCK"),
+      ],
+      ["bytes over the size limit", new TransactionSizeExceededError(1, 2, "TX", "BLOCK")],
+      ["a version the protocol does not take", new InvalidTransactionVersionError("TX", "BLOCK")],
+    ] as const) {
+      expect(sendRefused(refused), what).toBe(true);
+    }
 
     // A final outcome that is a failure: the transaction ran and kept nothing.
     const failed = (() => {
@@ -820,6 +841,22 @@ describe("NEAR transfers and balances", () => {
       // refused for its receiver's shard while the first is already taken.
       ["a congested shard", new ShardCongestedError(1, 0, "TX", "BLOCK")],
       ["a stuck shard", new ShardStuckError(5, 0, "TX", "BLOCK")],
+      // The same, for a second copy of bytes whose first copy already ran: it used the nonce,
+      // spent what was there, or landed before its block expired.
+      ["a nonce that is used", new InvalidNonceError(7, 7, "TX", "BLOCK")],
+      [
+        "a signer short of NEAR",
+        new NotEnoughBalanceError(1n, 2n, "gift.test.near", "TX", "BLOCK"),
+      ],
+      ["an expired block", new TransactionExpiredError("TX", "BLOCK")],
+      // What the node sees at that moment, which another node behind the same address may not.
+      ["a block the node does not know", new InvalidChainError("TX", "BLOCK")],
+      ["a nonce too large for the node's height", new NonceTooLargeError(9, 8, "TX", "BLOCK")],
+      [
+        "a signer the node does not see",
+        new SignerDoesNotExistError("gift.test.near", "TX", "BLOCK"),
+      ],
+      ["a cost that overflows at that gas price", new CostOverflowError("TX", "BLOCK")],
       ["a network error", new TypeError("fetch failed")],
       ["a contract's code, made by hand", new TenderError("E_AUTH", "E_AUTH: no")],
       ["nothing that is an error", "boom"],

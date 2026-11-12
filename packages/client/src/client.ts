@@ -50,17 +50,10 @@ import {
 import {
   AccessKeyDoesNotExistError,
   AccountDoesNotExistError,
-  CostOverflowError,
-  InvalidChainError,
-  InvalidNonceError,
   InvalidReceiverIdError,
   InvalidSignatureError,
   InvalidSignerIdError,
   InvalidTransactionVersionError,
-  NonceTooLargeError,
-  NotEnoughBalanceError,
-  SignerDoesNotExistError,
-  TransactionExpiredError,
   TransactionSizeExceededError,
   TransactionTimeoutError,
   UnknownTransactionError,
@@ -236,43 +229,46 @@ function failedWith(txHash: string, failure: unknown): TenderError {
 
 /**
  * The errors near-api-js 7.4.0 throws for a transaction the node refused as invalid (the RPC's
- * `InvalidTxError`), for a reason that no other copy of the same signed bytes escapes. near-api-js
- * sends those bytes again after an HTTP 408, 500 or 503, so the error can answer a second copy;
- * each of these holds for the first copy too:
+ * `InvalidTxError`) that are properties of the signed bytes alone, so that every copy of them gets
+ * the same answer. near-api-js sends those bytes again after an HTTP 408, 500 or 503, and the
+ * error can answer a second copy while the first was already taken; for each of these, the first
+ * copy was refused too:
  *
- * - a reason in the bytes themselves, or in what does not change between the copies: a bad
- *   signature, a chain, receiver or signer that does not fit, a nonce too large, a size or a cost
- *   over the limit, a version the node does not take, a reference block too old (a resend comes
- *   within the send's 120 s, and a transaction is good for 86,400 blocks);
- * - a signer short of the NEAR: the node checks the nonce first, so a copy that already ran would
- *   be answered `InvalidNonce`, not this;
- * - `InvalidNonce`: near-api-js signs the transaction again with a new nonce for it, and so does
- *   `defaultQueue` once more, so the one thrown is of the last transaction, which was refused.
+ * - `InvalidSignature`: the signature does not verify against the transaction and the public key
+ *   it names, both in the bytes;
+ * - `InvalidSignerId` and `InvalidReceiverId`: an account id in the bytes is not a valid one, which
+ *   is its spelling alone;
+ * - `TransactionSizeExceeded`: the bytes are longer than the protocol takes;
+ * - `InvalidTransactionVersion`: the bytes are of a version the protocol does not take.
  *
- * Not `ShardCongested` or `ShardStuck`: they depend on the receiver's shard at that moment, and a
- * second copy can get one while the first is already taken and will run once the shard recovers.
+ * The last two compare the bytes with the protocol, which changes only at an upgrade, not within
+ * the 120 s of a send. Every other refusal depends on the chain or the node at the moment it is
+ * asked, and can answer a copy whose first was taken; they leave the outcome unknown:
+ *
+ * - `InvalidNonce`: the first copy used the nonce;
+ * - `NotEnoughBalance`: the first copy spent what was there;
+ * - `TransactionExpired`: the first copy landed in time, and the copy came after the reference
+ *   block had expired;
+ * - `ShardCongested` and `ShardStuck`: the receiver's shard at that moment;
+ * - `InvalidChain` and `NonceTooLarge`: the node's own view of the chain, its blocks and its
+ *   height, which a node that lags behind another one of the same RPC address does not share;
+ * - `SignerDoesNotExist`: the signer's account as the node sees it then;
+ * - `CostOverflow`: the cost at the gas price of that block.
  */
 const REFUSED_BY_THE_NODE = [
-  CostOverflowError,
-  InvalidChainError,
-  InvalidNonceError,
   InvalidReceiverIdError,
   InvalidSignatureError,
   InvalidSignerIdError,
   InvalidTransactionVersionError,
-  NonceTooLargeError,
-  NotEnoughBalanceError,
-  SignerDoesNotExistError,
-  TransactionExpiredError,
   TransactionSizeExceededError,
 ] as const;
 
 /**
  * Whether the error of a send (`send`, `transfer`) says for certain that its transaction will not
- * run from here on: its final outcome is a failure, or the node refused it as invalid before taking
- * it (`REFUSED_BY_THE_NODE`). Anything else leaves the outcome unknown: above all an `E_TIMEOUT`, a
- * congested or stuck shard, and an RPC or network error, after which the transaction may still
- * land. A caller that would send the same thing again does so only when this is true, or once the
+ * run from here on: its final outcome is a failure, or the node refused it as invalid for a reason
+ * in its bytes alone (`REFUSED_BY_THE_NODE`). Anything else leaves the outcome unknown: above all an
+ * `E_TIMEOUT`, a wrong nonce, a signer short of NEAR, an expired block, a congested or stuck shard,
+ * and an RPC or network error, after which the transaction may still land. A caller that would send the same thing again does so only when this is true, or once the
  * chain shows the first did not land.
  *
  * What a failure undid depends on the transaction. One with a single receipt, such as `transfer`'s
@@ -507,9 +503,10 @@ export class TenderClient {
    * its receipt has run), and not until that receipt's block is final too, as `send` does: a view
    * of the last final block made at once may not see it yet. It goes through `defaultQueue` like
    * `send`, with `sendTimeoutMs`. A transfer that failed on chain throws a `TenderError` with the
-   * hash; one the node refused before it ran (not enough NEAR, a bad nonce) throws as near-api-js
+   * hash; one the node answered with an error (not enough NEAR, a bad nonce) throws as near-api-js
    * throws it, and one that ran out of time throws `E_TIMEOUT`, and may still land. `sendRefused`
-   * says which errors mean, for certain, that it will not run.
+   * says which errors mean, for certain, that it will not run: a wrong nonce or a lack of NEAR can
+   * answer a second copy of a transfer whose first already ran.
    */
   async transfer(receiverId: string, amount: bigint): Promise<TxResult> {
     const account = this.account;

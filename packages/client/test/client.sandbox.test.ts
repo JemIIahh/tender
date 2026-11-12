@@ -11,6 +11,7 @@ import {
   withdrawCall,
 } from "@tender/shared";
 import { Account, actions, KeyPair, type KeyPairString } from "near-api-js";
+import { NotEnoughBalanceError } from "near-api-js/rpc-errors";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import {
   LOCAL_AGENT_BOND,
@@ -456,13 +457,14 @@ test("a_transfer_creates_an_implicit_account_with_the_amount", async () => {
   expect(before - after).toBeGreaterThan(NEAR / 10n);
   expect(before - after).toBeLessThan(NEAR / 10n + NEAR / 100n);
 
-  // More than the sender holds is refused by the node: nothing runs, and the error says so for
-  // certain (`sendRefused`), as near-api-js reports it from a real node.
+  // More than the sender holds is refused by the node, and nothing runs. near-api-js reports it as
+  // a `NotEnoughBalanceError`, which is not a refusal for certain (`sendRefused`): the same answer
+  // can come to a second copy of a transfer whose first copy spent what was there.
   const refused = await sender.transfer(implicit, after + NEAR).then(
     () => undefined,
     (thrown: unknown) => thrown,
   );
-  expect(refused).toBeInstanceOf(Error);
-  expect(sendRefused(refused)).toBe(true);
+  expect(refused).toBeInstanceOf(NotEnoughBalanceError);
+  expect(sendRefused(refused)).toBe(false);
   expect(await sender.nearBalanceOf(implicit)).toBe(NEAR / 10n);
 });
