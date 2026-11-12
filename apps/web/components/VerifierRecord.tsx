@@ -52,8 +52,9 @@ export function VerifierRecord({
   account: string;
   /**
    * The account is the Tender Judge, as this build knows it. The Judge is not a registered agent,
-   * so the contract keeps no record for it, and the page names it and labels it as the team's
-   * instead of showing an anonymous account with "no record".
+   * so the contract keeps no count of its picks, and the page names it and labels it as the team's
+   * instead of showing an anonymous account with "no record". The line says that the count is what
+   * is missing, not a pick: on a task the Judge picked it sits above "Picked by" the Judge.
    */
   isJudge?: boolean;
   isTeam: boolean;
@@ -85,7 +86,7 @@ export function VerifierRecord({
       ) : picks_made === null || voids_after_reveals === null ? (
         <p data-testid="verifier-no-record" className="text-sm text-muted">
           {isJudge
-            ? "No pick record on chain yet."
+            ? "No on-chain count of past picks: the contract keeps one only for checkers registered as agents."
             : "No record: this account is not a registered agent."}
         </p>
       ) : (

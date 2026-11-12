@@ -700,8 +700,13 @@ test("the_judge_is_named_and_labelled_as_the_teams_though_it_is_no_registered_ag
   expect(record.getByTestId("verifier-name").textContent).toBe("Tender Judge");
   expect(record.getByText(VERIFIER)).toBeTruthy();
   expect(record.getByText("Run by Tender team")).toBeTruthy();
-  // It does not read as an anonymous account that nobody knows.
-  expect(record.getByTestId("verifier-no-record").textContent).toBe("No pick record on chain yet.");
+  // It does not read as an anonymous account that nobody knows, and it says what is missing: the
+  // contract's count of its past picks, not a pick (a task the Judge picked says "Picked by" below).
+  const line = record.getByTestId("verifier-no-record").textContent ?? "";
+  expect(line).toBe(
+    "No on-chain count of past picks: the contract keeps one only for checkers registered as agents.",
+  );
+  expect(line).not.toMatch(/No pick record/);
   expect(record.queryByText(/not a registered agent/)).toBeNull();
 });
 
