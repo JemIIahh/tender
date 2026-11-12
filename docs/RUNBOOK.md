@@ -224,6 +224,19 @@ pnpm seed --network testnet
 - If the variable is not set, the script looks for `seeds-private/` in the repository, which git ignores. Never put the directory inside `seeds/`, which is tracked. `scripts/check-public.test.ts` and `seeds/no-answers-in-tree.test.ts` fail if an answer-like value or a secret turns up in a tracked file.
 - The thirty seeds, their rewards and the poster are the team's. They are labelled as ours.
 
+Each seed's `task.json` gives it short windows: 10 minutes to commit, 5 to reveal, 10 for the pick and 10 more before anyone can void it. To keep tasks open for longer, give the run a commit deadline and, if you like, other windows:
+
+```
+pnpm seed --network testnet --only <slug>,<slug> --commit-until 2026-11-18T16:00:00Z \
+  --reveal-secs 21600 --pick-secs 86400 --fallback-secs 86400
+```
+
+- `--commit-until` is a UTC time written as `YYYY-MM-DDTHH:MM:SSZ`. Each seed's commit window is the time from just before its `post_task` to then, rounded up to the second. The chain counts from the block that runs the post, so the deadline on chain is that time or a few seconds after it, as long as the clock of the machine that runs the script is right.
+- `--reveal-secs`, `--pick-secs` and `--fallback-secs` set those windows, in seconds, for every seed of the run. Each is optional; a window no flag sets is the seed's own.
+- Each window a flag sets must be one the contract takes: from its `min_window_secs` (60 seconds on testnet; the script reads it from `get_config`) to `MAX_WINDOW_SECS`, 1,209,600 seconds (14 days). So the commit deadline is at most 14 days away. The script stops before anything is paid or uploaded on a time it cannot read, a commit deadline that has passed, and a window outside those limits.
+- The reward stays in escrow until the task is picked or voided. With the windows above, a task with nothing revealed can be voided 6 hours after the commit deadline, and any task still unsettled 2 days and 6 hours after it. The keeper sends those voids.
+- Without the flags, the windows are the seeds' own.
+
 `pnpm demo:local`, the CI demo job and the end-to-end tests do not need the private directory: they post the demo-only tasks in `scripts/demo-seeds/`, which are public in full. Never post those to a public network.
 
 ## 6. Telegram

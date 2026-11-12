@@ -21,7 +21,15 @@ import { KeyPair } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
 import { writeSyntheticHeldouts } from "../seeds/synthetic-heldout";
 import { missingHeldouts, PRIVATE_DIR_VARIABLE, privateDirOf } from "./lib/private-dir";
-import { loadTarget, main, type SeedChain, type SeedOptions, seed } from "./seed";
+import {
+  commitSecsUntil,
+  loadTarget,
+  main,
+  parseUtcTime,
+  type SeedChain,
+  type SeedOptions,
+  seed,
+} from "./seed";
 
 // Everything here runs without a chain, an API or the network. The API and the chain are fakes the
 // test steers; the seeds are real files in a temporary directory (or, in one test, the repository's
@@ -421,7 +429,12 @@ interface ChainOptions {
   /** The network and the contract the client is set for, in place of the testnet and the tests'. */
   network?: NetworkId;
   contractId?: string;
+  /** The contract's least window, in seconds: testnet's 60 unless given. */
+  minWindowSecs?: number;
 }
+
+/** The longest window the contract takes, which `get_config` reports: `MAX_WINDOW_SECS`, 14 days. */
+const MAX_WINDOW_SECS = 1_209_600;
 
 /** A chain with a vault, a wallet and a storage balance for the poster, which `trace` hears. */
 function fakeChain(trace: string[], options: ChainOptions = {}) {
@@ -484,6 +497,23 @@ function fakeChain(trace: string[], options: ChainOptions = {}) {
     lastId += 1n;
     return { ...tx(), taskId: lastId };
   });
+  const getConfig = vi.fn<SeedChain["getConfig"]>(async () => {
+    trace.push("getConfig");
+    return {
+      owner: PARENT,
+      pending_owner: null,
+      treasury: `treasury.${PARENT}`,
+      fee_bps: 500,
+      min_window_secs: options.minWindowSecs ?? 60,
+      max_window_secs: MAX_WINDOW_SECS,
+      paused: false,
+      version: 1,
+      tokens: [],
+      agent_bond_token: TOKEN,
+      agent_bond_amount: "10000",
+      agent_bond_cooldown_secs: "1209600",
+    };
+  });
 
   const client: SeedChain = {
     network: options.network ?? "testnet",
@@ -495,6 +525,7 @@ function fakeChain(trace: string[], options: ChainOptions = {}) {
     deposit,
     storageBalanceOf,
     storageDeposit,
+    getConfig,
   };
   return {
     client,
@@ -507,6 +538,7 @@ function fakeChain(trace: string[], options: ChainOptions = {}) {
     storageBalanceOf,
     storageDeposit,
     postTask,
+    getConfig,
   };
 }
 
@@ -967,6 +999,200 @@ test("the_windows_option_replaces_the_windows_of_every_seed", async () => {
   }
   // Only the windows: the winners are the seed's own.
   expect(chain.posts.map((post) => post.maxWinners)).toEqual([1, 2]);
+});
+
+// ---- Windows the run sets: a commit deadline, and the other windows in seconds -----------------
+
+/** The moment the tests of the run's windows start at: 2026-11-12, 16:00 UTC. */
+const START = Date.UTC(2026, 10, 12, 16, 0, 0);
+/** Six days later, as a run for a Wednesday would set it. */
+const WEDNESDAY = Date.UTC(2026, 10, 18, 16, 0, 0);
+
+test("without_the_window_flags_the_chain_is_not_asked_for_its_config", async () => {
+  const { chain, trace } = await run({ alpha: {} });
+
+  expect(chain.getConfig).not.toHaveBeenCalled();
+  expect(trace).not.toContain("getConfig");
+  expect(chain.posts[0]).toMatchObject({
+    commitSecs: 600,
+    revealSecs: 300,
+    pickSecs: 600,
+    fallbackSecs: 600,
+  });
+});
+
+test("commit_secs_until_is_the_whole_seconds_to_the_deadline_rounded_up", () => {
+  expect(commitSecsUntil(WEDNESDAY, START)).toBe(518_400);
+  expect(commitSecsUntil(WEDNESDAY, WEDNESDAY - 600_000)).toBe(600);
+  // A part of a second counts as a whole one, so the deadline on chain is never before the one asked.
+  expect(commitSecsUntil(WEDNESDAY, WEDNESDAY - 599_001)).toBe(600);
+  expect(commitSecsUntil(WEDNESDAY, WEDNESDAY - 600_001)).toBe(601);
+});
+
+test("commit_until_sets_each_seeds_commit_secs_from_the_moment_just_before_its_post_task", async () => {
+  const dir = await seedsDir({ alpha: {}, beta: {} });
+  const world = worldOf();
+  // A clock that moves on 1.5 s each time it is read, and says in the trace when it was read.
+  let clock = START;
+  const now = () => {
+    world.trace.push(`now ${clock}`);
+    const at = clock;
+    clock += 1_500;
+    return at;
+  };
+
+  const { result, lines, trace } = await play(world, dir, { commitUntil: WEDNESDAY, now });
+
+  expect(result).toEqual([seeded("alpha", 1n), seeded("beta", 2n)]);
+  expect(lines).toEqual(["DEPOSITED 0.50 tUSDC", "SEEDED alpha task=1", "SEEDED beta task=2"]);
+  // The clock is read for each post after its seed's uploads, as the last thing before the post.
+  const posting = trace.filter((call) => call.startsWith("now ") || call === "postTask");
+  const readAt = trace.flatMap((call, i) => (call === "postTask" ? [trace[i - 1] ?? ""] : []));
+  expect(readAt).toHaveLength(2);
+  expect(readAt.every((call) => call.startsWith("now "))).toBe(true);
+  expect(posting.slice(-4)).toEqual([readAt[0], "postTask", readAt[1], "postTask"]);
+  // Each window runs from that moment to the deadline, so the later post has the shorter one.
+  const moments = readAt.map((call) => Number(call.slice("now ".length)));
+  const commits = world.chain.posts.map((post) => post.commitSecs);
+  expect(commits).toEqual(moments.map((at) => commitSecsUntil(WEDNESDAY, at)));
+  expect(commits[0]).toBeGreaterThan(commits[1] ?? Number.POSITIVE_INFINITY);
+  // About six days: 518,400 seconds less the few the clock moved on.
+  for (const secs of commits) expect(518_400 - secs).toBeLessThan(10);
+  // The other windows are the seeds' own.
+  for (const post of world.chain.posts) {
+    expect([post.revealSecs, post.pickSecs, post.fallbackSecs]).toEqual([300, 600, 600]);
+  }
+  // The limits were read once, from the chain, before anything was paid.
+  expect(world.chain.getConfig).toHaveBeenCalledTimes(1);
+  expect(trace.indexOf("getConfig")).toBeLessThan(trace.indexOf("deposit"));
+});
+
+test("window_secs_replace_those_windows_of_every_seed_over_its_own_and_over_the_windows_option", async () => {
+  const seeds = { alpha: {}, beta: { task: taskWith({ commit_secs: 61, reveal_secs: 62 }) } };
+
+  const { chain } = await run(seeds, { windowSecs: { pick_secs: 86_400 } });
+  expect(
+    chain.posts.map((post) => [post.commitSecs, post.revealSecs, post.pickSecs, post.fallbackSecs]),
+  ).toEqual([
+    [600, 300, 86_400, 600],
+    [61, 62, 86_400, 600],
+  ]);
+
+  const windows = { commit_secs: 70, reveal_secs: 71, pick_secs: 72, fallback_secs: 73 };
+  const over = await run(seeds, {
+    windows,
+    windowSecs: { reveal_secs: 21_600, pick_secs: 86_400, fallback_secs: 86_400 },
+  });
+  for (const post of over.chain.posts) {
+    expect([post.commitSecs, post.revealSecs, post.pickSecs, post.fallbackSecs]).toEqual([
+      70, 21_600, 86_400, 86_400,
+    ]);
+  }
+});
+
+test("the_run_takes_windows_at_the_contracts_limits_inclusive", async () => {
+  const { result, chain } = await run(
+    { alpha: {} },
+    {
+      now: () => START,
+      commitUntil: START + 60_000,
+      windowSecs: { reveal_secs: 60, pick_secs: MAX_WINDOW_SECS, fallback_secs: 60 },
+    },
+  );
+  expect(result).toEqual([seeded("alpha", 1n)]);
+  expect(chain.posts[0]).toMatchObject({
+    commitSecs: 60,
+    revealSecs: 60,
+    pickSecs: MAX_WINDOW_SECS,
+    fallbackSecs: 60,
+  });
+
+  // A commit deadline 14 days away, to the second, is the longest window.
+  const longest = await run(
+    { alpha: {} },
+    { now: () => START, commitUntil: START + MAX_WINDOW_SECS * 1000 },
+  );
+  expect(longest.chain.posts[0]?.commitSecs).toBe(MAX_WINDOW_SECS);
+});
+
+test("a_commit_deadline_that_has_passed_or_a_window_the_contract_refuses_stops_the_run_before_anything_is_paid_or_uploaded", async () => {
+  const now = () => START;
+  const takes =
+    ": the contract takes a window of 60 to 1209600 seconds (its min_window_secs and max_window_secs)";
+  const cases: Array<[RunOptions, string, string[]]> = [
+    // A deadline that has passed, or is now, is refused before the chain is asked anything.
+    [
+      { commitUntil: START - 1_000 },
+      "the commit deadline 2026-11-12T15:59:59Z has passed",
+      UNTOUCHED,
+    ],
+    [{ commitUntil: START }, "the commit deadline 2026-11-12T16:00:00Z has passed", UNTOUCHED],
+    // Closer than the contract's least window, or further than its longest.
+    [
+      { commitUntil: START + 59_000 },
+      `the commit deadline 2026-11-12T16:00:59Z is 59 seconds away${takes}`,
+      ["getConfig"],
+    ],
+    [
+      { commitUntil: START + (MAX_WINDOW_SECS + 1) * 1000 },
+      `the commit deadline 2026-11-26T16:00:01Z is 1209601 seconds away${takes}`,
+      ["getConfig"],
+    ],
+    [{ windowSecs: { reveal_secs: 59 } }, `reveal_secs is 59${takes}`, ["getConfig"]],
+    [
+      { windowSecs: { pick_secs: MAX_WINDOW_SECS + 1 } },
+      `pick_secs is 1209601${takes}`,
+      ["getConfig"],
+    ],
+    [{ windowSecs: { fallback_secs: 0 } }, `fallback_secs is 0${takes}`, ["getConfig"]],
+    // The least window is the contract's, as get_config gives it.
+    [
+      { chain: { minWindowSecs: 120 }, windowSecs: { reveal_secs: 100 } },
+      "reveal_secs is 100: the contract takes a window of 120 to 1209600 seconds",
+      ["getConfig"],
+    ],
+    // Every window that is wrong is named, in one message.
+    [
+      { commitUntil: START + 30_000, windowSecs: { reveal_secs: 10, fallback_secs: 20 } },
+      `the commit deadline 2026-11-12T16:00:30Z is 30 seconds away; reveal_secs is 10; fallback_secs is 20${takes}`,
+      ["getConfig"],
+    ],
+    // A window that is no whole number of seconds, which only a caller of the function can give.
+    [{ windowSecs: { pick_secs: 90.5 } }, "pick_secs is not a whole number of seconds", UNTOUCHED],
+  ];
+  for (const [options, message, trace] of cases) {
+    const refused = await run({ alpha: {} }, { now, ...options });
+
+    expect((refused.failure as Error)?.message, message).toContain(message);
+    // Nothing was paid, uploaded or posted, and the API was not asked anything.
+    expect(refused.trace, message).toEqual(trace);
+    expect(refused.lines, message).toEqual([]);
+  }
+});
+
+test("a_seed_whose_commit_deadline_has_come_too_close_by_its_turn_is_not_posted", async () => {
+  const dir = await seedsDir({ alpha: {}, beta: {} });
+  const world = worldOf();
+  let clock = START;
+  // Each post takes 9.5 minutes, so that the second comes 30 seconds before a deadline 10 minutes off.
+  const posted = world.chain.postTask.getMockImplementation();
+  world.chain.postTask.mockImplementation(async (...args) => {
+    clock += 570_000;
+    if (posted === undefined) throw new Error("the fake chain has no postTask");
+    return posted(...args);
+  });
+
+  const { result, failure, lines } = await play(world, dir, {
+    commitUntil: START + 600_000,
+    now: () => clock,
+  });
+
+  expect(result).toBeUndefined();
+  expect((failure as Error).message).toBe(
+    "beta: the commit deadline 2026-11-12T16:10:00Z is 30 seconds away now, less than the contract's min_window_secs of 60",
+  );
+  expect(lines).toEqual(["DEPOSITED 0.50 tUSDC", "SEEDED alpha task=1", "FAILED beta"]);
+  expect(world.chain.posts.map((post) => post.commitSecs)).toEqual([600]);
 });
 
 // ---- Choosing seeds -----------------------------------------------------------------------------
@@ -2059,6 +2285,108 @@ test("cli_takes_the_seeds_from_only_whether_it_is_given_once_or_often", async ()
     expect(refused.code).toBe(1);
     expect(refused.err).toMatch(/--only needs at least one seed slug/);
     expect(refused.seed).not.toHaveBeenCalled();
+  }
+});
+
+test("cli_gives_seed_the_commit_deadline_and_the_windows_of_its_flags", async () => {
+  const {
+    code,
+    err,
+    seed: fake,
+  } = await runCli(deployed(), [
+    "--network",
+    "testnet",
+    "--commit-until",
+    "2026-11-18T16:00:00Z",
+    "--reveal-secs",
+    "21600",
+    "--pick-secs",
+    "86400",
+    "--fallback-secs=86400",
+  ]);
+
+  expect(code).toBe(0);
+  expect(err).toBe("");
+  expect(fake.mock.calls[0]?.[0]).toMatchObject({
+    commitUntil: WEDNESDAY,
+    windowSecs: { reveal_secs: 21_600, pick_secs: 86_400, fallback_secs: 86_400 },
+  });
+
+  // A flag alone sets its window and no other.
+  const one = await runCli(deployed(), ["--network", "testnet", "--pick-secs", "3600"]);
+  expect(one.code).toBe(0);
+  expect(one.seed.mock.calls[0]?.[0].windowSecs).toEqual({ pick_secs: 3_600 });
+  expect(one.seed.mock.calls[0]?.[0]).not.toHaveProperty("commitUntil");
+  const deadline = await runCli(deployed(), [
+    "--network",
+    "testnet",
+    "--commit-until",
+    "2026-11-20T16:00:00Z",
+  ]);
+  expect(deadline.seed.mock.calls[0]?.[0].commitUntil).toBe(Date.UTC(2026, 10, 20, 16, 0, 0));
+  expect(deadline.seed.mock.calls[0]?.[0]).not.toHaveProperty("windowSecs");
+
+  // Without the flags, seed is given neither, as before.
+  const none = await runCli(deployed(), ["--network", "testnet"]);
+  expect(none.seed.mock.calls[0]?.[0]).not.toHaveProperty("commitUntil");
+  expect(none.seed.mock.calls[0]?.[0]).not.toHaveProperty("windowSecs");
+});
+
+test("parse_utc_time_reads_a_utc_time_to_the_second_that_exists_and_nothing_else", () => {
+  expect(parseUtcTime("2026-11-18T16:00:00Z")).toBe(WEDNESDAY);
+  expect(parseUtcTime("2028-02-29T23:59:59Z")).toBe(Date.UTC(2028, 1, 29, 23, 59, 59));
+  expect(parseUtcTime("2026-12-31T00:00:00Z")).toBe(Date.UTC(2026, 11, 31, 0, 0, 0));
+  for (const text of [
+    // No zone (Date.parse would read it as local time), another zone, or not to the second.
+    "2026-11-18T16:00:00",
+    "2026-11-18T16:00:00+00:00",
+    "2026-11-18T16:00Z",
+    "2026-11-18T16:00:00.000Z",
+    "2026-11-18",
+    "2026-11-18 16:00:00Z",
+    "+002026-11-18T16:00:00Z",
+    // Times Date.parse would roll over into another day, or refuse.
+    "2026-02-29T00:00:00Z",
+    "2026-02-30T16:00:00Z",
+    "2026-11-31T16:00:00Z",
+    "2026-11-18T24:00:00Z",
+    "2026-11-18T16:60:00Z",
+    "2026-11-18T16:00:60Z",
+    // Not a time at all.
+    "tomorrow",
+    "1795017600000",
+    "",
+  ]) {
+    expect(parseUtcTime(text), text).toBeUndefined();
+  }
+});
+
+test("cli_refuses_a_commit_deadline_or_a_window_it_cannot_read_and_never_shows_the_value", async () => {
+  const cases: Array<[string, RegExp]> = [
+    ...["2026-11-18T16:00:00", "2026-02-30T16:00:00Z", "tomorrow", "", LEAKY].map(
+      (value): [string, RegExp] => [
+        `--commit-until=${value}`,
+        /--commit-until must be a UTC time written as YYYY-MM-DDTHH:MM:SSZ, such as 2026-11-18T16:00:00Z/,
+      ],
+    ),
+    ...["reveal-secs", "pick-secs", "fallback-secs"].flatMap((flag) =>
+      ["0", "-1", "1.5", "1e3", " 60", "0x3c", "99999999999999999999", "", LEAKY].map(
+        (value): [string, RegExp] => [
+          `--${flag}=${value}`,
+          new RegExp(`--${flag} must be a whole number of seconds above 0`),
+        ],
+      ),
+    ),
+  ];
+  for (const [arg, message] of cases) {
+    const { code, err, out, seed: fake } = await runCli(deployed(), ["--network", "testnet", arg]);
+
+    expect(code, arg).toBe(1);
+    expect(err, arg).toMatch(message);
+    expect(err, arg).toMatch(/usage: pnpm seed --network testnet/);
+    expect(err, arg).not.toContain("LEAKY");
+    expect(out, arg).toEqual([]);
+    expect(fake, arg).not.toHaveBeenCalled();
   }
 });
 

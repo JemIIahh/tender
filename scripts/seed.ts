@@ -96,7 +96,28 @@ import { PRIVATE_DIR_VARIABLE, privateDirOf } from "./lib/private-dir";
  * anything: a seed that does not read, does not fit its schemas, or shares its held-out checks
  * with another stops the run with nothing posted.
  *
- *   pnpm seed --network testnet [--only <slug>[,<slug>...]]
+ * The windows. A seed's `task.json` gives its four windows. The flags can set them for a run,
+ * over every seed's own:
+ *
+ *   --commit-until <time>     the commit deadline, a UTC time written as 2026-11-18T16:00:00Z. Each
+ *                             seed's commit_secs is the time from just before its post_task to then,
+ *                             rounded up to the second. The chain counts the window from the block
+ *                             that runs the post, so the deadline on chain is that time or a few
+ *                             seconds after it, as long as this machine's clock agrees with the chain's
+ *   --reveal-secs <n>         the reveal window of every seed, in seconds
+ *   --pick-secs <n>           the pick window
+ *   --fallback-secs <n>       the fallback window
+ *
+ * Each window a flag sets has to be one the contract takes: from its min_window_secs (read from
+ * get_config) to its max_window_secs, which is MAX_WINDOW_SECS, 1,209,600 seconds (14 days). So a
+ * commit deadline is at most 14 days away. A time or a number of seconds that does not read stops
+ * the command line before it reads anything. A commit deadline that has passed, and a window the
+ * contract would refuse, stop the run once the files are read, before anything is paid or
+ * uploaded. Without the flags the windows are the seeds' own, and the chain is not asked for its
+ * config.
+ *
+ *   pnpm seed --network testnet [--only <slug>[,<slug>...]] [--commit-until <time>]
+ *     [--reveal-secs <n>] [--pick-secs <n>] [--fallback-secs <n>]
  */
 
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -109,11 +130,15 @@ export interface SeedWindows {
   fallback_secs: number;
 }
 
+/** The windows the flags `--reveal-secs`, `--pick-secs` and `--fallback-secs` set, in seconds. */
+export type WindowSecs = Partial<Pick<SeedWindows, "reveal_secs" | "pick_secs" | "fallback_secs">>;
+
 /**
  * What `seed` needs of a `TenderClient` (X-12): the network and contract it is for, the account it
  * signs as, the post, the poster's balance in the vault and in its wallet, the deposit that tops
- * the vault up, and the storage balance and deposit that pay for the tasks' records. Tests pass a
- * fake with these members.
+ * the vault up, the storage balance and deposit that pay for the tasks' records, and the config,
+ * whose window limits are read when the run sets windows of its own. Tests pass a fake with these
+ * members.
  */
 export type SeedChain = Pick<
   TenderClient,
@@ -126,6 +151,7 @@ export type SeedChain = Pick<
   | "deposit"
   | "storageBalanceOf"
   | "storageDeposit"
+  | "getConfig"
 >;
 
 export interface SeedOptions {
@@ -162,6 +188,17 @@ export interface SeedOptions {
   only?: readonly string[];
   /** Replaces the windows of every seed, for a demo or a test that cannot wait a whole phase. */
   windows?: SeedWindows;
+  /**
+   * The commit deadline of every seed the run posts, in milliseconds since the epoch
+   * (`--commit-until`). Each seed's `commit_secs` is worked out just before its `post_task`: the
+   * time from then to this, rounded up to the second (`commitSecsUntil`). It wins over the
+   * `commit_secs` of `windows` and of the seed's `task.json`.
+   */
+  commitUntil?: number;
+  /** Replaces these windows of every seed (`--reveal-secs` and the rest), over `windows`. */
+  windowSecs?: WindowSecs;
+  /** The clock `commitUntil` is counted from, in milliseconds since the epoch. `Date.now` by default. */
+  now?: () => number;
   /** Receives each line the script prints. Defaults to `console.log`. */
   log?: (line: string) => void;
   /** Where `deployments/` is. The repository root by default, or what `TENDER_ENV_DIR` names. */
@@ -474,9 +511,128 @@ async function prepare(
     token,
     reward: rewardOf(terms.reward, token, o.network, slug),
     verifier: terms.verifier === "judge" ? o.judgeAccount : o.poster,
-    windows: o.windows ?? terms.windows,
+    windows: withWindowSecs(o.windows ?? terms.windows, o.windowSecs),
     maxWinners: terms.maxWinners,
   };
+}
+
+// ---- Windows ------------------------------------------------------------------------------------
+
+/** `windows` with the windows that `secs` sets in place of its own. A window `secs` leaves out stays. */
+function withWindowSecs(windows: SeedWindows, secs: WindowSecs = {}): SeedWindows {
+  return {
+    commit_secs: windows.commit_secs,
+    reveal_secs: secs.reveal_secs ?? windows.reveal_secs,
+    pick_secs: secs.pick_secs ?? windows.pick_secs,
+    fallback_secs: secs.fallback_secs ?? windows.fallback_secs,
+  };
+}
+
+/**
+ * The commit window, in whole seconds, from `at` to the deadline `until` (both in milliseconds
+ * since the epoch), rounded up. The chain counts the window from the block that runs the post,
+ * which comes after `at`, so the deadline it records is `until` or a few seconds after it, and not
+ * before it as long as the clock that gave `at` agrees with the chain's.
+ */
+export function commitSecsUntil(until: number, at: number): number {
+  return Math.ceil((until - at) / 1000);
+}
+
+/** A time in milliseconds since the epoch as `--commit-until` writes it: `2026-11-18T16:00:00Z`. */
+function utcOf(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.000Z$/, "Z");
+}
+
+/** A UTC time to the second, as `--commit-until` takes it. */
+const UTC_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+/**
+ * The time `text` names, in milliseconds since the epoch, or undefined unless it is a UTC time
+ * written as `YYYY-MM-DDTHH:MM:SSZ` that exists. `Date.parse` takes many forms, reads one with no
+ * zone as local time, and rolls over a day or an hour that does not exist (the 30th of February
+ * is the 2nd of March, the 24th hour the next day), so only that one form is let through, and only
+ * when it reads back the same.
+ */
+export function parseUtcTime(text: string): number | undefined {
+  if (!UTC_TIME.test(text)) return undefined;
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) && utcOf(ms) === text ? ms : undefined;
+}
+
+/** What the contract takes of a window, in seconds (`get_config`): from `min` to `max`. */
+interface WindowLimits {
+  min: number;
+  max: number;
+}
+
+/**
+ * Checks the windows that the run sets, `commitUntil` and `windowSecs`, and gives what the contract
+ * takes of a window. The commit deadline has to be a time that has not passed. Every window the run
+ * sets, the commit window counted from now among them, has to be from the contract's
+ * `min_window_secs` to its `max_window_secs` (`MAX_WINDOW_SECS` of the contract, 14 days), or the
+ * post would fail with `E_WINDOW`. It throws, naming each window that is wrong, before anything is
+ * paid or uploaded. It gives undefined, and asks the chain nothing, when the run sets no window: the
+ * windows are then the seeds' own, as they always were.
+ */
+async function windowLimits(o: SeedOptions, now: () => number): Promise<WindowLimits | undefined> {
+  const secs = Object.entries(o.windowSecs ?? {}).filter(
+    (set): set is [string, number] => set[1] !== undefined,
+  );
+  if (o.commitUntil === undefined && secs.length === 0) return undefined;
+  const { commitUntil } = o;
+  if (commitUntil !== undefined) {
+    if (!Number.isFinite(commitUntil)) {
+      throw new Error("the commit deadline is not a time: give milliseconds since the epoch");
+    }
+    if (commitUntil <= now())
+      throw new Error(`the commit deadline ${utcOf(commitUntil)} has passed`);
+  }
+  const wrong = secs.filter(([, value]) => !Number.isSafeInteger(value));
+  if (wrong.length > 0) {
+    throw new Error(wrong.map(([name]) => `${name} is not a whole number of seconds`).join("; "));
+  }
+
+  const config = await o.client.getConfig();
+  const limits = { min: config.min_window_secs, max: config.max_window_secs };
+  const taken = (value: number) => value >= limits.min && value <= limits.max;
+  const faults: string[] = [];
+  if (commitUntil !== undefined) {
+    const commit = commitSecsUntil(commitUntil, now());
+    if (!taken(commit)) {
+      faults.push(`the commit deadline ${utcOf(commitUntil)} is ${commit} seconds away`);
+    }
+  }
+  for (const [name, value] of secs) if (!taken(value)) faults.push(`${name} is ${value}`);
+  if (faults.length > 0) {
+    throw new Error(
+      `${faults.join("; ")}: the contract takes a window of ${limits.min} to ${limits.max} ` +
+        "seconds (its min_window_secs and max_window_secs)",
+    );
+  }
+  return limits;
+}
+
+/**
+ * The commit window of a seed that is about to be posted: its own, or, when the run has a commit
+ * deadline, the time from now to it, read off `now` at this moment. Throws if that time has fallen
+ * below the contract's least window since the run began: the post would fail with `E_WINDOW`, and
+ * the seed is not posted.
+ */
+function commitSecsOf(
+  o: SeedOptions,
+  seed: Prepared,
+  now: () => number,
+  limits: WindowLimits | undefined,
+): number {
+  if (o.commitUntil === undefined) return seed.windows.commit_secs;
+  const secs = commitSecsUntil(o.commitUntil, now());
+  if (limits !== undefined && secs < limits.min) {
+    throw new Error(
+      `${seed.slug}: the commit deadline ${utcOf(o.commitUntil)} is ${secs} seconds away now, ` +
+        `less than the contract's min_window_secs of ${limits.min}`,
+    );
+  }
+  return secs;
 }
 
 // ---- Posting ------------------------------------------------------------------------------------
@@ -587,11 +743,20 @@ async function upload(
   return stored.uri;
 }
 
-/** Uploads a seed's documents and posts its task. Gives the task's id. */
-async function post(o: SeedOptions, seed: Prepared): Promise<bigint> {
+/**
+ * Uploads a seed's documents and posts its task. Gives the task's id. A run with a commit deadline
+ * works out the seed's commit window last, after the uploads and just before the post.
+ */
+async function post(
+  o: SeedOptions,
+  seed: Prepared,
+  now: () => number,
+  limits: WindowLimits | undefined,
+): Promise<bigint> {
   const briefUri = await upload(o.api, "brief", seed.slug, seed.brief);
   await upload(o.api, "criteria", seed.slug, seed.criteria);
   if (seed.heldout !== undefined) await o.api.uploadHeldout(seed.heldout.hash, seed.heldout.bytes);
+  const commitSecs = commitSecsOf(o, seed, now, limits);
   const { taskId } = await o.client.postTask({
     token: seed.token,
     reward: seed.reward,
@@ -600,7 +765,7 @@ async function post(o: SeedOptions, seed: Prepared): Promise<bigint> {
     criteriaHash: seed.criteria.hash,
     heldoutCommitment: seed.heldout?.hash,
     verifier: seed.verifier,
-    commitSecs: seed.windows.commit_secs,
+    commitSecs,
     revealSecs: seed.windows.reveal_secs,
     pickSecs: seed.windows.pick_secs,
     fallbackSecs: seed.windows.fallback_secs,
@@ -792,14 +957,17 @@ const MAINNET_REFUSED =
  * Throws for mainnet, whether `network` or the client says it; if `network` and the client's network
  * differ; if the client does not sign as the poster; naming the seed, if its files are wrong, its
  * held-out file is not in the private directory, two seeds share their held-out checks, or a seed
- * to post carries a salt that a scorecard of the poster has published; if the
- * API is not the client's deployment, or its index is more than 10 blocks behind the chain; if the
- * poster's wallet cannot cover the rewards the vault lacks; if the API's list of the poster's tasks
- * cannot be read in full; and with the API's or the chain's own error if either refuses a step. The
- * seeds posted before a failure stay posted, and running the script again finishes the rest.
+ * to post carries a salt that a scorecard of the poster has published; if `commitUntil` has
+ * passed, or a window that `commitUntil` or `windowSecs` sets is one the contract would refuse; if
+ * the API is not the client's deployment, or its index is more than 10 blocks behind the chain; if
+ * the poster's wallet cannot cover the rewards the vault lacks; if the API's list of the poster's
+ * tasks cannot be read in full; and with the API's or the chain's own error if either refuses a
+ * step. The seeds posted before a failure stay posted, and running the script again finishes the
+ * rest.
  */
 export async function seed(o: SeedOptions): Promise<SeededTask[]> {
   const log = o.log ?? console.log;
+  const now = o.now ?? Date.now;
   if (o.network === "mainnet" || o.client.network === "mainnet") throw new Error(MAINNET_REFUSED);
   // The token is chosen by `network` and the API is checked against the client's: one network.
   if (o.network !== o.client.network) {
@@ -827,6 +995,9 @@ export async function seed(o: SeedOptions): Promise<SeededTask[]> {
   // Nothing is asked when there is nothing to post.
   if (seeds.length === 0) return [];
 
+  // The windows the run sets are checked against the contract's limits before the API is asked
+  // anything, and so before anything is paid or uploaded.
+  const limits = await windowLimits(o, now);
   await checkApi(o);
 
   // P05-P12: a task's held-out checks are single-use. Once the API serves them the task was
@@ -862,7 +1033,7 @@ export async function seed(o: SeedOptions): Promise<SeededTask[]> {
     }
     let taskId: bigint;
     try {
-      taskId = await post(o, prepared);
+      taskId = await post(o, prepared, now, limits);
     } catch (error) {
       log(`FAILED ${slug}`);
       throw error;
@@ -875,7 +1046,52 @@ export async function seed(o: SeedOptions): Promise<SeededTask[]> {
 
 // ---- The command line ---------------------------------------------------------------------------
 
-const USAGE = "usage: pnpm seed --network testnet [--only <slug>[,<slug>...]]";
+const USAGE =
+  "usage: pnpm seed --network testnet [--only <slug>[,<slug>...]] [--commit-until <time>] " +
+  "[--reveal-secs <n>] [--pick-secs <n>] [--fallback-secs <n>]";
+
+/** The flags that set a window in seconds, and the window each sets. */
+const SECS_FLAGS = {
+  "reveal-secs": "reveal_secs",
+  "pick-secs": "pick_secs",
+  "fallback-secs": "fallback_secs",
+} as const;
+
+/**
+ * The windows `--reveal-secs`, `--pick-secs` and `--fallback-secs` set, or undefined when none is
+ * given. Each is a whole number of seconds above 0, written in digits. Whether the contract takes
+ * it is for `seed` to find out, from the chain. Throws a `UsageError` naming the flag, without its
+ * value, which can be anything that was pasted.
+ */
+function windowSecsOf(
+  values: Partial<Record<keyof typeof SECS_FLAGS, string>>,
+): WindowSecs | undefined {
+  const secs: WindowSecs = {};
+  for (const [flag, window] of Object.entries(SECS_FLAGS) as [
+    keyof typeof SECS_FLAGS,
+    keyof WindowSecs,
+  ][]) {
+    const text = values[flag];
+    if (text === undefined) continue;
+    const value = /^[0-9]+$/.test(text) ? Number(text) : Number.NaN;
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new UsageError(`--${flag} must be a whole number of seconds above 0\n${USAGE}`);
+    }
+    secs[window] = value;
+  }
+  return Object.keys(secs).length === 0 ? undefined : secs;
+}
+
+/** The time of `--commit-until`, in milliseconds since the epoch. Throws a `UsageError` without the value. */
+function commitUntilOf(text: string): number {
+  const ms = parseUtcTime(text);
+  if (ms === undefined) {
+    throw new UsageError(
+      `--commit-until must be a UTC time written as YYYY-MM-DDTHH:MM:SSZ, such as 2026-11-18T16:00:00Z\n${USAGE}`,
+    );
+  }
+  return ms;
+}
 
 /**
  * What is said when a variable does not hold an account id. The value is never in it: it may be a
@@ -992,17 +1208,31 @@ export async function main(args: readonly string[], options: CliOptions = {}): P
   const out = options.out ?? console.log;
   const err = options.err ?? console.error;
   try {
-    let values: { network?: string; only?: string[] };
+    let values: {
+      network?: string;
+      only?: string[];
+      "commit-until"?: string;
+    } & Partial<Record<keyof typeof SECS_FLAGS, string>>;
     try {
       values = parseArgs({
         args: [...args],
-        options: { network: { type: "string" }, only: { type: "string", multiple: true } },
+        options: {
+          network: { type: "string" },
+          only: { type: "string", multiple: true },
+          "commit-until": { type: "string" },
+          "reveal-secs": { type: "string" },
+          "pick-secs": { type: "string" },
+          "fallback-secs": { type: "string" },
+        },
       }).values;
     } catch (error) {
       throw new UsageError(`${messageOf(error)}\n${USAGE}`);
     }
     const only = values.only === undefined ? undefined : slugsOf(values.only);
     if (only?.length === 0) throw new UsageError(`--only needs at least one seed slug\n${USAGE}`);
+    const until = values["commit-until"];
+    const commitUntil = until === undefined ? undefined : commitUntilOf(until);
+    const windowSecs = windowSecsOf(values);
     const target = loadTarget(values.network, options);
 
     const client = new TenderClient({
@@ -1024,6 +1254,9 @@ export async function main(args: readonly string[], options: CliOptions = {}): P
       poster: target.poster.accountId,
       judgeAccount: target.judgeAccount,
       only,
+      // Only when a flag is given: without the flags, `seed` is called as it always was.
+      ...(commitUntil !== undefined && { commitUntil }),
+      ...(windowSecs !== undefined && { windowSecs }),
       log: out,
       dir: options.dir,
       heldoutDir: privateDirOfCli(options.dir),
