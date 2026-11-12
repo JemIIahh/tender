@@ -512,9 +512,10 @@ export type TelegramLinkResponse = z.infer<typeof TelegramLinkResponseSchema>;
  * - 502 `transfer_failed`: the transfer was refused, and asking again works; or its outcome is not
  *   known, and the NEAR may still arrive (the message says which). Look at the account's balance
  *   before asking again.
- * - 503 `gift_off`, with no `Retry-After`: the API has no gift account, or this is mainnet; asking
- *   again changes nothing. 503 `unavailable`, with `Retry-After`: try again after it, because the
- *   login's keys or the account's balance cannot be read right now (5 s), or a gift for this login
+ * - 503 `gift_off`, with no `Retry-After`: the API has no gift account, this is mainnet, or the
+ *   gift account's pool is empty (until it is refilled); asking again soon changes nothing.
+ *   503 `unavailable`, with `Retry-After`: try again after it, because the login's keys, the
+ *   account's balance or the gift pool's cannot be read right now (5 s), or a gift for this login
  *   or this account is on its way or may still arrive (30 s).
  */
 export const GasGiftRequestSchema = z.object({ account_id: AccountIdSchema });

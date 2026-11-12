@@ -52,6 +52,8 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 //        its transfer is on its way, or its outcome is not known yet (see THE CLAIM);
 //   503  `unavailable`: the chain cannot say what the account holds right now (`Retry-After: 5`);
 //   200  `not_needed`: the account holds `minBalance` or more already;
+//   503  `gift_off`: the gift account holds less than one gift and `GAS_GIFT_POOL_MARGIN` (its pool
+//        is empty), so nothing is claimed; a `WARN api:` line says so, once in `POOL_WARN_MS`;
 //   429  `daily_limit`: the gifts of this UTC day would go past the cap (`Retry-After`: the seconds
 //        to the next UTC day);
 //   502  `transfer_failed`: the transfer was refused for certain (`sendRefused`: it failed on chain,
@@ -60,8 +62,10 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 //        claim is kept, as THE CLAIM says, and a `WARN api:` line says `may still land`. Unknown
 //        is a timeout, no answer within `TRANSFER_WAIT_MS`, and every error that can answer a
 //        resent copy of a transfer that was taken: a used nonce, a gift account short of NEAR,
-//        an expired block, a congested or stuck shard. So an empty gift pool keeps the claims of
-//        its calls until they go stale, counted against the day meanwhile;
+//        an expired block, a congested or stuck shard. The pool is read before each claim, so a
+//        call meets an empty pool here only when calls at once empty it between that read and the
+//        transfer: the read is a check before sending, not a guarantee. Such a call keeps its
+//        claim until it goes stale, counted against the day meanwhile;
 //   200  `sent`, with the amount and the transfer's hash, once the transfer has executed.
 //
 // THE CLAIM. A gift's row is written before the transfer is sent, in a transaction that locks the
@@ -133,6 +137,18 @@ const IMPLICIT = /^[0-9a-f]{64}$/;
 
 /** How long the chain has to say what an account holds. */
 const BALANCE_DEADLINE_MS = 5_000;
+
+/**
+ * What the gift account must hold beyond one gift before a gift is claimed: 0.01 NEAR. The account
+ * keeps its own storage staked, about 0.002 NEAR for a plain account with one key (10^19
+ * yoctoNEAR a byte), and pays the transfer's gas, well under 0.001 NEAR on testnet even at the
+ * higher price the node takes up front; short of either, the node refuses the transfer. 0.01 NEAR
+ * covers both several times over, and is a tenth of one gift at the default.
+ */
+export const GAS_GIFT_POOL_MARGIN = 10_000_000_000_000_000_000_000n;
+
+/** How often, at most, the WARN that the gift's pool is empty is written: 5 minutes. */
+const POOL_WARN_MS = 5 * 60_000;
 
 /**
  * How old a claim must be before the next claim lets it go, if its transfer is no longer in flight
@@ -560,6 +576,45 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
     );
   }
 
+  /** When the WARN that the pool is empty was last written, by the API's clock (ms). */
+  let poolWarnedAt: number | undefined;
+
+  /**
+   * Whether the gift account can pay one more gift and `GAS_GIFT_POOL_MARGIN` for its storage and
+   * fees, by its balance now. A check before the claim, not a guarantee: calls at once can still
+   * empty the pool between this read and their transfers. An empty pool is said in a WARN, with the
+   * account and its balance, once in `POOL_WARN_MS` at most (a clock gone back says it again).
+   */
+  async function poolCovers(on: GasGift): Promise<boolean> {
+    let pool: bigint;
+    try {
+      pool = await withinDeadline(BALANCE_DEADLINE_MS, on.balanceOf(on.account));
+    } catch (error) {
+      console.error(`api: cannot read the NEAR balance of ${on.account} (${kindOf(error)})`);
+      return unavailableForNow("cannot read the gift pool's balance right now");
+    }
+    if (pool >= on.amount + GAS_GIFT_POOL_MARGIN) return true;
+    const now = nowMs();
+    if (poolWarnedAt === undefined || now < poolWarnedAt || now - poolWarnedAt >= POOL_WARN_MS) {
+      poolWarnedAt = now;
+      console.warn(
+        `WARN api: the gas gift's pool is empty: ${on.account} holds ${pool} yoctoNEAR, less ` +
+          `than one gift of ${on.amount} and ${GAS_GIFT_POOL_MARGIN} for its storage and fees; ` +
+          "calls answer 503 gift_off until it is refilled",
+      );
+    }
+    return false;
+  }
+
+  /** The answer when the gift's pool is empty: nothing is claimed, and the web app links elsewhere. */
+  function poolEmpty(c: Context): Response {
+    const body: ErrorBody = {
+      error: "gift_off",
+      message: "the testnet NEAR for new accounts has run out for now: the gift pool is empty",
+    };
+    return c.json(body, 503);
+  }
+
   /** The answer when the day's gifts are used up: come back at the next UTC day. */
   function dailyLimit(): never {
     const now = nowMs();
@@ -621,6 +676,7 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
         const body: GasGiftResponse = { status: "not_needed", balance: `${balance}` };
         return c.json(body, 200, NOT_CACHED);
       }
+      if (!(await poolCovers(on))) return poolEmpty(c);
 
       const claimed = await claim(on, login, account);
       if (claimed === "sent") return alreadyGiven();

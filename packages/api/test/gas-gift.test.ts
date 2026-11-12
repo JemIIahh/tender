@@ -26,6 +26,7 @@ import {
   type ApiDeps,
   createApp,
   type ErrorBody,
+  GAS_GIFT_POOL_MARGIN,
   PRIVY_ISSUER,
   privyJwksUrl,
   readPrivyKey,
@@ -50,6 +51,8 @@ const OTHER_ACCOUNT = "cd".repeat(32);
 const NEAR = 10n ** 24n;
 const AMOUNT = NEAR / 10n;
 const MIN_BALANCE = NEAR / 20n;
+/** The gift account of the tests' gift: what it holds is its entry in `balances`. */
+const GIFT_ACCOUNT = "gift.testnet";
 
 let deps: ApiDeps;
 let nowNs = TEST_NOW;
@@ -78,6 +81,8 @@ beforeEach(async () => {
   await resetDb(deps.db);
   nowNs = TEST_NOW;
   balances.clear();
+  // The gift account's pool: enough for every gift of a day, unless a test says otherwise.
+  balances.set(GIFT_ACCOUNT, 10n * NEAR);
   transfers = [];
 });
 
@@ -88,7 +93,7 @@ afterEach(() => {
 /** The gift as `serve` would make it, with the fake chain, and `over` on top. */
 function giftWith(over: Partial<GasGift> = {}): GasGift {
   return {
-    account: "gift.testnet",
+    account: GIFT_ACCOUNT,
     privyAppId: APP_ID,
     privyKeys: createLocalJWKSet({ keys: [publicJwk] }),
     amount: AMOUNT,
@@ -946,4 +951,87 @@ test("after_a_failed_fetch_the_key_set_rests_5_s_and_the_failure_is_logged_once"
   expect((await post(app, token)).status).toBe(200);
   expect(fetches).toBe(3);
   expect(said()).toBe(2);
+});
+
+// ---- The gift's pool ----------------------------------------------------------------------------
+
+test("an_empty_pool_answers_gift_off_and_claims_nothing", async () => {
+  const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  balances.set(GIFT_ACCOUNT, 0n);
+  const app = appWith();
+  const reply = await ask(app);
+  expect(reply.status).toBe(503);
+  expect((reply.body as ErrorBody).error).toBe("gift_off");
+  expect((reply.body as ErrorBody).message).toContain("the gift pool is empty");
+  // Refilling changes it, not waiting: no Retry-After, as for any gift_off.
+  expect(reply.headers.get("retry-after")).toBeNull();
+  expect(await rows()).toEqual([]);
+  expect(transfers).toEqual([]);
+  const logged = warnings.mock.calls.map((call) => call.join(" ")).join("\n");
+  expect(logged).toContain(
+    `WARN api: the gas gift's pool is empty: ${GIFT_ACCOUNT} holds 0 yoctoNEAR`,
+  );
+  expect(logged).not.toMatch(/ed25519:|PRIVATE/);
+
+  // What does not need the pool is answered as before: an account that holds enough.
+  balances.set(OTHER_ACCOUNT, NEAR);
+  expect((await ask(app, OTHER_USER, OTHER_ACCOUNT)).body).toMatchObject({ status: "not_needed" });
+
+  // A gift account that is not on chain holds nothing either.
+  balances.delete(GIFT_ACCOUNT);
+  expect((await ask(app)).status).toBe(503);
+  expect(await rows()).toEqual([]);
+});
+
+test("a_pool_of_one_gift_and_its_margin_sends_and_one_yocto_less_does_not", async () => {
+  vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const app = appWith();
+  balances.set(GIFT_ACCOUNT, AMOUNT + GAS_GIFT_POOL_MARGIN - 1n);
+  expect((await ask(app)).status).toBe(503);
+  expect(await rows()).toEqual([]);
+
+  balances.set(GIFT_ACCOUNT, AMOUNT + GAS_GIFT_POOL_MARGIN);
+  const sent = await ask(app);
+  expect(sent.status).toBe(200);
+  expect(sent.body).toMatchObject({ status: "sent" });
+  expect(transfers).toEqual([{ to: ACCOUNT, amount: AMOUNT }]);
+});
+
+test("the_warn_that_the_pool_is_empty_is_written_once_in_5_minutes", async () => {
+  const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const said = () =>
+    warnings.mock.calls.filter((call) => call.join(" ").includes("pool is empty")).length;
+  balances.set(GIFT_ACCOUNT, NEAR / 1000n);
+  const app = appWith();
+  for (const [sub, accountId] of [
+    [USER, ACCOUNT],
+    [OTHER_USER, OTHER_ACCOUNT],
+    ["did:privy:c", "a3".repeat(32)],
+  ] as const) {
+    expect((await ask(app, sub, accountId)).status).toBe(503);
+  }
+  expect(said()).toBe(1);
+  nowNs += 4n * 60n * SECOND_NS;
+  expect((await ask(app)).status).toBe(503);
+  expect(said()).toBe(1);
+  nowNs += 1n * 60n * SECOND_NS;
+  expect((await ask(app)).status).toBe(503);
+  expect(said()).toBe(2);
+});
+
+test("a_pool_the_chain_cannot_read_is_a_503_to_try_again", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const app = appWith(
+    giftWith({
+      balanceOf: async (accountId) => {
+        if (accountId === GIFT_ACCOUNT) throw new Error("node down");
+        return 0n;
+      },
+    }),
+  );
+  const reply = await ask(app);
+  expect(reply.status).toBe(503);
+  expect((reply.body as ErrorBody).error).toBe("unavailable");
+  expect(reply.headers.get("retry-after")).toBe("5");
+  expect(await rows()).toEqual([]);
 });
