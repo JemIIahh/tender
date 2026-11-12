@@ -93,6 +93,10 @@ test("the_top_bar_names_the_login_and_cuts_an_implicit_account_short", () => {
   expect(within(container).getByTestId("pill-login").textContent).toBe("Google login");
   expect(link.textContent).toContain(shortAccount(ACCOUNT));
 
+  // A login whose method the user's accounts don't name: a neutral word.
+  rerender(<AccountGroup ready accountId={ACCOUNT} login={null} />);
+  expect(within(container).getByTestId("pill-login").textContent).toBe("Login");
+
   // A wallet's own account: no login named.
   rerender(<AccountGroup ready accountId="alice.testnet" />);
   expect(within(container).queryByTestId("pill-login")).toBeNull();

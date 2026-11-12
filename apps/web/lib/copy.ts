@@ -18,13 +18,13 @@ export const CRITERIA_UNAVAILABLE = "The criteria aren't available yet.";
 /** A page that reads the account's balances says so in these words. */
 export const READING_BALANCES = "Reading your balances…";
 
-/** What an account from the email or Google login is called, by how the person logs in. */
+/**
+ * What an account from the email or Google login is called, by how the person logs in. A login the
+ * user's linked accounts don't name (the owner can turn on other methods in Privy's dashboard) is
+ * just "Login".
+ */
 export function loginLabel(login: "email" | "google" | null): string {
-  return login === "google"
-    ? "Google login"
-    : login === "email"
-      ? "Email login"
-      : "Email or Google login";
+  return login === "google" ? "Google login" : login === "email" ? "Email login" : "Login";
 }
 
 /** Who holds the key of an account from the login, in one line. */
