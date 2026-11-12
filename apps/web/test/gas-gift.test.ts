@@ -3,8 +3,8 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { api } from "../lib/api";
 import {
   GAS_GIFT_BELOW,
-  GIFT_PROBLEM_WAYS,
   GIFT_PROBLEM_WORDS,
+  GIFT_RETRY_HELPS,
   type GiftDeps,
   getAccountReady,
   giftProblemOf,
@@ -121,18 +121,24 @@ test("the_problem_comes_from_the_code_in_the_body_and_not_the_status_alone", asy
   expect(giftProblemOf(new ApiError(429, "not json"))).toBe("failed");
 });
 
-test("each_problem_offers_try_again_where_it_can_help_and_the_faucet_where_tender_won_t_send", () => {
-  expect(GIFT_PROBLEM_WAYS).toEqual({
-    gift_off: { retry: false, faucet: true },
-    daily_limit: { retry: false, faucet: true },
-    already_given: { retry: false, faucet: true },
-    rate_limited: { retry: true, faucet: false },
-    unavailable: { retry: true, faucet: false },
-    transfer_failed: { retry: true, faucet: false },
-    timeout: { retry: true, faucet: false },
-    failed: { retry: true, faucet: true },
+test("try_again_is_offered_where_it_can_help", () => {
+  // The faucet is offered for every problem; Try again only where trying again can help.
+  expect(GIFT_RETRY_HELPS).toEqual({
+    gift_off: false,
+    daily_limit: false,
+    already_given: false,
+    rate_limited: true,
+    unavailable: true,
+    transfer_failed: true,
+    timeout: true,
+    failed: true,
   });
   expect(GIFT_PROBLEM_WORDS.transfer_failed).toMatch(/^Couldn't send yet\./);
+  // `unavailable` has three causes on the route (the login check, a gift on its way, the chain
+  // can't say): the words name none of them.
+  expect(GIFT_PROBLEM_WORDS.unavailable).toBe(
+    "Tender can't send NEAR for fees right now. Try again in a moment.",
+  );
 });
 
 test("try_again_after_a_failed_transfer_reads_the_balance_first_and_takes_near_that_arrived", async () => {

@@ -184,11 +184,12 @@ test("a_transfer_that_failed_says_couldn_t_send_yet_and_try_again_takes_near_tha
   expect(screen.getByTestId("account-stuck").textContent).toBe(
     "Couldn't send yet. Try again in a moment.",
   );
-  // Only Try again, as the one action: no faucet and no account to copy.
+  // Try again first, with the focus; the faucet and the account to copy as the other way.
   const again = screen.getByRole("button", { name: "Try again" });
   expect(document.activeElement).toBe(again);
-  expect(screen.queryByRole("link", { name: "Open the faucet" })).toBeNull();
-  expect(screen.queryByTestId("stuck-account")).toBeNull();
+  const faucet = screen.getByRole("link", { name: "Open the faucet" });
+  expect(again.compareDocumentPosition(faucet) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(screen.getByTestId("stuck-account").getAttribute("title")).toBe(ACCOUNT);
   expect(world.asked).toHaveLength(1);
 
   // The transfer had timed out at the API and landed after all: Try again reads the balance first
@@ -201,7 +202,7 @@ test("a_transfer_that_failed_says_couldn_t_send_yet_and_try_again_takes_near_tha
 
 test("the_login_check_down_for_a_moment_and_too_many_tries_ask_to_try_again", async () => {
   for (const [status, code, line] of [
-    [503, "unavailable", "Tender can't check your login right now. Try again in a moment."],
+    [503, "unavailable", "Tender can't send NEAR for fees right now. Try again in a moment."],
     [429, "rate_limited", "Too many tries from here. Try again in a few minutes."],
   ] as const) {
     let down = true;
@@ -214,7 +215,8 @@ test("the_login_check_down_for_a_moment_and_too_many_tries_ask_to_try_again", as
     const { unmount } = render(<ConnectChooser store={store} />);
     await act(() => store.prepare(loginSession()));
     expect(screen.getByTestId("account-stuck").textContent, code).toBe(line);
-    expect(screen.queryByRole("link", { name: "Open the faucet" }), code).toBeNull();
+    // The faucet is the other way, after Try again.
+    expect(screen.getByRole("link", { name: "Open the faucet" }), code).toBeTruthy();
     down = false;
     await userEvent.click(screen.getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(screen.queryByRole("dialog"), code).toBeNull());
@@ -316,6 +318,9 @@ const privy = vi.hoisted(() => ({
   bridge: null as PrivyBridge | null,
   mounted: [] as Array<{ appId: string; clientId: string | null }>,
   kit: null as PrivyKit | null,
+  /** Calls of Privy's logout, and whether Privy holds a login now. */
+  logouts: 0,
+  authenticated: false,
 }));
 vi.mock("../lib/privyKit", () => ({
   mountPrivyKit: (bridge: PrivyBridge, ids: { appId: string; clientId: string | null }) => {
@@ -331,10 +336,15 @@ vi.mock("../lib/privyKit", () => ({
       user: null,
       // The person logs in: Privy says so to the hooks, and to the login's callback.
       login: () => {
+        privy.authenticated = true;
         bridge.publish({ ...kit, authenticated: true, user });
         bridge.loginEnded({ user });
       },
-      logout: async () => bridge.publish({ ...kit, authenticated: false, user: null }),
+      logout: async () => {
+        privy.logouts++;
+        privy.authenticated = false;
+        bridge.publish({ ...kit, authenticated: false, user: null });
+      },
       createWallet: async () => ({ wallet: { address: ACCOUNT } }),
       signRawHash: async () => ({ signature: `0x${"00".repeat(64)}` }),
       exportWallet: async () => {},
@@ -350,6 +360,8 @@ async function pageModules(env: Record<string, string>) {
   vi.resetModules();
   near.made.length = 0;
   privy.mounted.length = 0;
+  privy.logouts = 0;
+  privy.authenticated = false;
   for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
   const [{ walletStore }, { chooser }] = await Promise.all([
     import("../lib/wallet"),
@@ -438,8 +450,10 @@ test("with_a_privy_app_id_the_login_connects_gets_the_account_ready_and_logs_out
     "RPC view_account",
   ]);
 
-  // Log out: the store's session and Privy's both end.
+  // Log out: the store's session and Privy's both end, Privy's by one call of its logout.
+  expect(privy.authenticated).toBe(true);
   await walletStore.disconnect();
   expect(walletStore.getSnapshot().accountId).toBeNull();
-  expect(privy.kit).not.toBeNull();
+  expect(privy.logouts).toBe(1);
+  expect(privy.authenticated).toBe(false);
 });

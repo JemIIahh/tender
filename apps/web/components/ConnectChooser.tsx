@@ -4,8 +4,8 @@ import { type KeyboardEvent, useEffect, useId, useRef } from "react";
 import { type Chooser, chooser as pageChooser, useChooserState } from "../lib/chooser";
 import { config } from "../lib/config";
 import {
-  GIFT_PROBLEM_WAYS,
   GIFT_PROBLEM_WORDS,
+  GIFT_RETRY_HELPS,
   type GiftProblem,
   TESTNET_FAUCET_URL,
 } from "../lib/gasGift";
@@ -16,8 +16,8 @@ import { CARD, PANEL_TITLE, PRIMARY, SECONDARY } from "./ui";
 // The Connect chooser, in a build with the email and Google login (lib/chooser.ts has the steps).
 // One big action, the login, and under it the NEAR wallets. After a login it shows the one line
 // "Getting your account ready…" while Tender sends the new account NEAR for its fees, and, if that
-// is refused or doesn't arrive, one line that says so, with Try again where trying again can help
-// and the faucet, with the account to copy, where Tender won't send.
+// is refused or doesn't arrive, one line that says so, with Try again first where trying again can
+// help, and the faucet with the account to copy as the other way.
 //
 // It is a modal of the page's own: the focus goes into it and stays there, Escape and the backdrop
 // close it, and the focus goes back to where it was when it closes.
@@ -40,7 +40,11 @@ function trapTab(event: KeyboardEvent<HTMLDivElement>, panel: HTMLElement | null
   }
 }
 
-/** What is in the way of the account's NEAR for fees, and the ways on. */
+/**
+ * What is in the way of the account's NEAR for fees, and the ways on: Try again first where it can
+ * help, and always the faucet with the account to copy (on testnet; elsewhere, the account to send
+ * NEAR to).
+ */
 function Stuck({
   accountId,
   problem,
@@ -52,55 +56,47 @@ function Stuck({
   firstRef: (element: HTMLElement | null) => void;
   onRetry: () => void;
 }) {
-  const ways = GIFT_PROBLEM_WAYS[problem];
-  // The faucet is testnet's; elsewhere the person is told to send the account some NEAR.
-  const faucetLink = ways.faucet && config.network === "testnet";
+  const retry = GIFT_RETRY_HELPS[problem];
+  const faucet = config.network === "testnet";
   return (
     <div className="grid gap-4">
       <p role="status" data-testid="account-stuck" className="text-[15px] text-bone">
         {GIFT_PROBLEM_WORDS[problem]}
       </p>
-      {ways.faucet ? (
-        <div className="grid gap-2">
-          <p className="text-sm text-muted">
-            {faucetLink
-              ? "Get free testnet NEAR for this account at the faucet:"
-              : "Send this account a little NEAR to pay its fees:"}
-          </p>
-          <p className="flex min-w-0 items-center justify-between gap-2 rounded-xl border border-line bg-ink py-1 pr-1 pl-3">
-            <span
-              title={accountId}
-              data-testid="stuck-account"
-              className="min-w-0 truncate font-mono text-[13px] text-bone"
-            >
-              {shortId(accountId)}
-            </span>
-            <CopyButton value={accountId} label="Copy account" />
-          </p>
-        </div>
-      ) : null}
-      {faucetLink || ways.retry ? (
+      <div className="grid gap-2">
+        <p className="text-sm text-muted">
+          {faucet
+            ? `${retry ? "Or get" : "Get"} free testnet NEAR for this account at the faucet:`
+            : `${retry ? "Or send" : "Send"} this account a little NEAR to pay its fees:`}
+        </p>
+        <p className="flex min-w-0 items-center justify-between gap-2 rounded-xl border border-line bg-ink py-1 pr-1 pl-3">
+          <span
+            title={accountId}
+            data-testid="stuck-account"
+            className="min-w-0 truncate font-mono text-[13px] text-bone"
+          >
+            {shortId(accountId)}
+          </span>
+          <CopyButton value={accountId} label="Copy account" />
+        </p>
+      </div>
+      {retry || faucet ? (
         <div className="flex flex-wrap gap-2">
-          {faucetLink ? (
+          {retry ? (
+            <button ref={firstRef} type="button" onClick={onRetry} className={PRIMARY}>
+              Try again
+            </button>
+          ) : null}
+          {faucet ? (
             <a
-              ref={firstRef}
+              ref={retry ? undefined : firstRef}
               href={TESTNET_FAUCET_URL}
               target="_blank"
               rel="noreferrer"
-              className={PRIMARY}
+              className={retry ? SECONDARY : PRIMARY}
             >
               Open the faucet
             </a>
-          ) : null}
-          {ways.retry ? (
-            <button
-              ref={faucetLink ? undefined : firstRef}
-              type="button"
-              onClick={onRetry}
-              className={faucetLink ? SECONDARY : PRIMARY}
-            >
-              Try again
-            </button>
           ) : null}
         </div>
       ) : null}

@@ -5,8 +5,8 @@ import { ApiError, ErrorBodySchema, type GasGiftResponse } from "@tender/shared"
 // and so can pay no fee. Right after the login the page reads its balance from the node; below
 // `GAS_GIFT_BELOW` it asks Tender's API for a little testnet NEAR (`POST /v1/gas-gift`, with the
 // login's access token), and reads the node again until the NEAR has arrived. Anything in the way
-// is told in one plain line, with Try again where trying again can help, and the testnet faucet
-// where Tender will not send.
+// is told in one plain line, with Try again where trying again can help, and always the testnet
+// faucet, with the account to copy, as another way.
 
 /** Under this much NEAR, in yoctoNEAR, an account is given NEAR for its fees: 0.05 NEAR. */
 export const GAS_GIFT_BELOW = 50_000_000_000_000_000_000_000n;
@@ -25,7 +25,8 @@ export const GIFT_POLL_MS = 2_000;
  * - `gift_off` (503): the gift is switched off. `daily_limit` (429): the day's cap is spent.
  *   `already_given` (409): this login or account had its gift. Tender won't send: the faucet.
  * - `rate_limited` (429): too many tries from this address. `unavailable` (503, with
- *   Retry-After): the login check is down for a moment. Try again later, or shortly.
+ *   Retry-After): the route can't send for a moment (the login check, a gift for this login on
+ *   its way, or the chain can't say what the account holds). Try again later, or shortly.
  * - `transfer_failed` (502): the send didn't go through, or timed out and may still arrive.
  * - `timeout`: a gift was sent and hasn't reached this page's node in `GIFT_WAIT_MS`.
  * - `failed`: anything else: `bad_request` and `payload_too_large` (a fault of ours), a refused
@@ -65,22 +66,26 @@ export const GIFT_PROBLEM_WORDS: Record<GiftProblem, string> = {
   daily_limit: "Tender has sent all the NEAR for fees it sends today.",
   already_given: "Tender has already sent this account NEAR for fees once.",
   rate_limited: "Too many tries from here. Try again in a few minutes.",
-  unavailable: "Tender can't check your login right now. Try again in a moment.",
+  unavailable: "Tender can't send NEAR for fees right now. Try again in a moment.",
   transfer_failed: "Couldn't send yet. Try again in a moment.",
   timeout: "The NEAR for fees hasn't arrived yet.",
   failed: "Tender couldn't send NEAR for fees just now.",
 };
 
-/** What the chooser offers for each problem: Try again, the faucet, or both. */
-export const GIFT_PROBLEM_WAYS: Record<GiftProblem, { retry: boolean; faucet: boolean }> = {
-  gift_off: { retry: false, faucet: true },
-  daily_limit: { retry: false, faucet: true },
-  already_given: { retry: false, faucet: true },
-  rate_limited: { retry: true, faucet: false },
-  unavailable: { retry: true, faucet: false },
-  transfer_failed: { retry: true, faucet: false },
-  timeout: { retry: true, faucet: false },
-  failed: { retry: true, faucet: true },
+/**
+ * Whether Try again can help with each problem. Where it can, it is the chooser's first way and the
+ * faucet (with the account to copy) the second; where it can't, the faucet is the only way. The
+ * faucet is harmless if Tender's NEAR lands later as well.
+ */
+export const GIFT_RETRY_HELPS: Record<GiftProblem, boolean> = {
+  gift_off: false,
+  daily_limit: false,
+  already_given: false,
+  rate_limited: true,
+  unavailable: true,
+  transfer_failed: true,
+  timeout: true,
+  failed: true,
 };
 
 /** What the readiness check needs: the node, the login's token and the API, and a clock. */
