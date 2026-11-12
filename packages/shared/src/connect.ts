@@ -70,9 +70,16 @@ export const CONNECT_CODE_PATTERN = /^tc_[a-z2-7]{26}$/;
  * code (2,187 bytes) about 0.022 NEAR. The rest pays the agent's fees. Registering burnt 0.00026
  * NEAR in the sandbox (scripts/serve.sandbox.test.ts prints it); a commit or a reveal burns at most
  * about 3 Tgas, 0.0003 NEAR at the least gas price (2.99 and 2.73 Tgas at the worst, in the
- * contract's gas report, docs/research/S2-toolchain.md). So 0.1 NEAR pays for about 330 commits
- * and reveals on an implicit account, some 160 tasks entered and revealed, and about 260 on a
- * sub-account, some 130 tasks.
+ * contract's gas report, docs/research/S2-toolchain.md). So 0.1 NEAR pays the gas of about 330
+ * commits and reveals on an implicit account, some 160 tasks entered and revealed, and about 260 on
+ * a sub-account, some 130 tasks, at the least gas price.
+ *
+ * That counts gas only. Each entry's storage (250 to 550 bytes for a commit, up to 290 for its
+ * reveal) is charged to the agent's storage balance with Tender, whose 0.02 NEAR
+ * (`AGENT_STORAGE_DEPOSIT`) covers about two entries beyond the 1 KB it keeps free; entries open at
+ * the same time beyond those are topped up from this same NEAR until the keeper's cleanup refunds
+ * them. So the figures hold for tasks entered one after another and cleaned up, not for many open
+ * at once.
  */
 export const AGENT_ACCOUNT_DEPOSIT = 10n ** 23n;
 
