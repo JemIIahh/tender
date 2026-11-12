@@ -20,14 +20,42 @@ const CORS = {
 
 /**
  * Answers near-connect's request for the list of wallets it can open (it asks GitHub, then a CDN)
- * with an empty one, so that a page that uses the wallet reaches no server outside the spec. The
- * list a page needs, it is given in the browser (`installWallet`).
+ * with an empty one, or with `wallets`, so that a page that uses the wallet reaches no server
+ * outside the spec. The list a page needs, it is given in the browser (`installWallet`).
  */
-export async function routeWalletManifest(page: Page): Promise<void> {
+export async function routeWalletManifest(page: Page, wallets: unknown[] = []): Promise<void> {
   await page.route("**/repository/manifest.json", (route) =>
-    route.fulfill({ status: 200, headers: CORS, json: { wallets: [], version: "1.0.0" } }),
+    route.fulfill({ status: 200, headers: CORS, json: { wallets, version: "1.0.0" } }),
   );
 }
+
+/** A square icon of one colour, as a wallet's manifest gives an icon. */
+const square = (colour: string) =>
+  `data:image/svg+xml,${encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="${colour}"/><circle cx="16" cy="16" r="7" fill="#0a0a0b" opacity=".55"/></svg>`,
+  )}`;
+
+/**
+ * Two made-up wallets in the shape of near-connect's list (sandboxed wallets, for testnet, that
+ * send a batch): what the Connect window lists as rows. Their code is never loaded: no spec picks
+ * them.
+ */
+export const LISTED_WALLETS = [
+  ["ash-wallet", "Ash Wallet", "https://wallet.ash.test", "#d9c6a5"],
+  ["birch-wallet", "Birch Wallet", "https://birch.test", "#9fb8a0"],
+].map(([id, name, website, colour]) => ({
+  id,
+  name,
+  icon: square(colour as string),
+  description: "A made-up wallet for the specs.",
+  website,
+  version: "1.0.0",
+  executor: `${website}/executor.js`,
+  type: "sandbox",
+  platform: {},
+  permissions: {},
+  features: { signMessage: true, signAndSendTransactions: true, testnet: true, mainnet: true },
+}));
 
 /** One batch the page sent to the wallet, as the wallet got it. */
 export interface SentBatch {
@@ -42,6 +70,15 @@ export interface StubWallet {
 
 /** The name of the wallet in near-connect's list, and so on the button that picks it. */
 export const STUB_WALLET_NAME = "E2E Wallet";
+
+/**
+ * Picks the specs' wallet in the Connect window (components/ConnectChooser.tsx): its row, which
+ * connects it with no window of near-connect's. Before the one window, the specs picked it in
+ * near-connect's own list.
+ */
+export async function pickStubWallet(page: Page): Promise<void> {
+  await page.getByRole("dialog").getByRole("button", { name: STUB_WALLET_NAME }).click();
+}
 
 /**
  * Puts the wallet and the node in front of `page`: it will find a wallet for `account`, which runs

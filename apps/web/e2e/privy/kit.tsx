@@ -1,19 +1,38 @@
 "use client";
 
-import { type ReactNode, useSyncExternalStore } from "react";
+import { type ReactNode, useEffect, useRef, useSyncExternalStore } from "react";
 
 // A stand-in for Privy's React kit (`@privy-io/react-auth` and its `extended-chains` entry), for
 // the login's e2e suite (playwright.privy.config.ts) only. The real kit talks to Privy's servers,
 // which a spec must not reach, so that suite builds the app with these two module names pointing
 // here (next.config.ts, under TENDER_E2E_PRIVY_KIT=1, which no other build sets). It has the hooks
-// lib/privyKit.tsx uses, with Privy's shapes: a login that succeeds at once as the person the spec
-// set (`window.__tenderPrivyStub`), a NEAR wallet at the address the spec set, and a login that
-// lasts for the tab (sessionStorage), as Privy's lasts across a reload. It signs nothing: the
-// specs that use it send no transaction.
+// lib/privyKit.tsx uses, with Privy's shapes: an email login whose code is the one the spec set
+// (`window.__tenderPrivyStub`; any other is Privy's "invalid_credentials"), a Google login that
+// leaves the page and comes back to it with Privy's `privy_oauth_*` parameters (no Google is
+// reached), a NEAR wallet at the address the spec set, and a login that lasts for the tab
+// (sessionStorage), as Privy's lasts across a reload. It signs nothing: the specs that use it send
+// no transaction.
 
 interface StubSettings {
   address: string;
   login: "email" | "google";
+  /** The code the email login takes. */
+  code?: string;
+  /** Privy's error code for every code sent, when the spec wants sending to fail. */
+  sendFails?: string;
+}
+
+/** The code the email login takes when the spec sets none. */
+const CODE = "123456";
+
+/** An error as Privy's hooks throw one: with its code. */
+function privyError(code: string): Error {
+  return Object.assign(new Error(code), { privyErrorCode: code });
+}
+
+interface LoginCallbacks {
+  onComplete?: (params: { user: ReturnType<typeof userOf> }) => void;
+  onError?: (error: string) => void;
 }
 
 const AUTHED = "tender.e2e.privy.authed";
@@ -66,15 +85,56 @@ export function usePrivy() {
   return { ready: true, authenticated, user: authenticated ? userOf(settings()) : null };
 }
 
-export function useLogin(callbacks: {
-  onComplete?: (params: { user: ReturnType<typeof userOf> }) => void;
-  onError?: (error: string) => void;
-}) {
+export function useLoginWithEmail(callbacks: LoginCallbacks) {
   return {
-    login: () => {
+    sendCode: async ({ email }: { email: string }) => {
+      const fails = settings().sendFails;
+      if (fails !== undefined) throw privyError(fails);
+      if (!email.includes("@")) throw privyError("invalid_data");
+    },
+    loginWithCode: async ({ code }: { code: string }) => {
+      if (code !== (settings().code ?? CODE)) {
+        callbacks.onError?.("invalid_credentials");
+        throw privyError("invalid_credentials");
+      }
       setAuthed(true);
       callbacks.onComplete?.({ user: userOf(settings()) });
     },
+    state: { status: "initial" },
+  };
+}
+
+const OAUTH_PARAMS = ["privy_oauth_code", "privy_oauth_state", "privy_oauth_provider"];
+
+export function useLoginWithOAuth(callbacks: LoginCallbacks) {
+  const latest = useRef(callbacks);
+  latest.current = callbacks;
+  // Back from "Google": the parameters are read, taken off the address, and the login ends, as
+  // Privy's hook does on the page the provider sends the person back to.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const code = url.searchParams.get("privy_oauth_code");
+    if (code === null || url.searchParams.get("privy_oauth_state") === null) return;
+    for (const name of OAUTH_PARAMS) url.searchParams.delete(name);
+    window.history.replaceState({}, "", url);
+    if (code === "denied") {
+      latest.current.onError?.("oauth_user_denied");
+      return;
+    }
+    setAuthed(true);
+    latest.current.onComplete?.({ user: userOf(settings()) });
+  }, []);
+  return {
+    // Leaves the page and comes back to it, as a Google login does, with no Google in between.
+    initOAuth: async ({ provider }: { provider: string }) => {
+      const url = new URL(window.location.href);
+      url.searchParams.set("privy_oauth_code", "e2e-code");
+      url.searchParams.set("privy_oauth_state", "e2e-state");
+      url.searchParams.set("privy_oauth_provider", provider);
+      window.location.assign(url);
+    },
+    loading: false,
+    state: { status: "initial" },
   };
 }
 

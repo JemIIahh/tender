@@ -16,7 +16,7 @@ import {
   routeAccountNode,
 } from "./accountApi";
 import { API_URL, type FixtureApi, routeApi } from "./fixtures";
-import { STUB_WALLET_NAME } from "./walletStub";
+import { pickStubWallet } from "./walletStub";
 
 // The fixture API of the pages the parity brief adds: My tasks (what alice picks and what she hired,
 // beside what she posted, which `routeAccount` answers), Activity's backlog, and Metrics. Register
@@ -301,7 +301,7 @@ export async function openParity(
   await page.goto(path);
   if (options.connect) {
     await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-    await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+    await pickStubWallet(page);
   }
   return { fixture, parity };
 }

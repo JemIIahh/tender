@@ -4,7 +4,7 @@ import { FakeChain } from "../test/fakeChain";
 import { API_URL, routeApi } from "./fixtures";
 import { installInjectedWallet } from "./injectedWallet";
 import { routePostApi } from "./postApi";
-import { STUB_WALLET_NAME } from "./walletStub";
+import { pickStubWallet } from "./walletStub";
 
 // The post form in a browser: a person writes a task on one page, the page uploads its documents to
 // a fixture API (e2e/postApi.ts), asks a wallet (e2e/injectedWallet.ts) to sign in and to send one
@@ -78,7 +78,7 @@ async function writeTask(page: Page, amount = "5"): Promise<void> {
 
 async function connect(page: Page): Promise<void> {
   await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
   await expect(page.getByTestId("review-account")).toHaveText(ALICE);
 }
 

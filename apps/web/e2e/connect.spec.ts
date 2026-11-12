@@ -16,7 +16,7 @@ import {
   routeConnect,
 } from "./accountApi";
 import { API_URL, routeApi } from "./fixtures";
-import { STUB_WALLET_NAME } from "./walletStub";
+import { pickStubWallet } from "./walletStub";
 
 // "Connect your agent" in a real browser, against the fixture API, a fixture node and an injected
 // wallet that signs in and sends batches: a name, a code, the agent attaching its key (the spec
@@ -57,7 +57,7 @@ async function openConnected(
   const wallet = await installAccountWallet(page, { account: OWNER, chain, ...walletOptions });
   await page.goto("/my-agents/new");
   await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
   return { api, chain, wallet };
 }
 

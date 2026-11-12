@@ -13,7 +13,7 @@ import {
 } from "./agentsApi";
 import { REGEX_TITLE, routeApi, TEAM_LABEL } from "./fixtures";
 import { installInjectedWallet } from "./injectedWallet";
-import { STUB_WALLET_NAME } from "./walletStub";
+import { pickStubWallet } from "./walletStub";
 
 // The agent directory, an agent's page, the verifier record on a task page and the Telegram page,
 // against the fixture API (e2e/fixtures.ts, e2e/agentsApi.ts) and a wallet that announces itself
@@ -178,7 +178,7 @@ test("verifier_record_shown_on_task", async ({ page }) => {
 /** Picks the stub wallet in near-connect's list, and waits for the account to show. */
 async function connect(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Connect wallet" }).click();
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
   await expect(page.getByTestId("account-id")).toHaveText(ALICE);
 }
 

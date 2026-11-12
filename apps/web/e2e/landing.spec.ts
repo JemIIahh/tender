@@ -2,7 +2,7 @@ import { expect, type Page, test } from "@playwright/test";
 import { OWNER } from "./accountApi";
 import { routeApi, TASKS } from "./fixtures";
 import { openParity, pageFits } from "./parityApi";
-import { STUB_WALLET_NAME } from "./walletStub";
+import { pickStubWallet } from "./walletStub";
 
 // The landing (app/page.tsx) in a browser: its way to the board, its keyboard focus, the ticker's
 // figures from the API, and art that moves, except when reduced motion is asked for.
@@ -127,7 +127,7 @@ test("landing_top_bar_launches_the_market_and_shows_no_account_even_when_connect
   await expect(page).toHaveURL(/\/tasks$/, { timeout: 20_000 });
   await page.goto("/my-tasks");
   await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
   await expect(page.getByRole("banner").getByRole("link", { name: OWNER })).toBeVisible();
   for (const reach of ["load", "wordmark"] as const) {
     if (reach === "load") await page.goto("/");

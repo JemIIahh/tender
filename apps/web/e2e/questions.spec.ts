@@ -4,7 +4,7 @@ import { AT, agent, SECOND } from "../test/tasks";
 import { emptyBoard, routeApi } from "./fixtures";
 import { installInjectedWallet } from "./injectedWallet";
 import { routeBoardWrites } from "./questionsApi";
-import { STUB_WALLET_NAME } from "./walletStub";
+import { pickStubWallet } from "./walletStub";
 
 // The question board on the task page (spec 7.2.1), against the fixture API and its stream: what a
 // reader sees and hears live, what an entrant and the poster can do through the real wallet picker
@@ -34,7 +34,7 @@ const board = (page: Page) => page.getByTestId("questions");
 /** Picks the spec's wallet in near-connect's list from the board's own Connect button. */
 async function connect(page: Page): Promise<void> {
   await board(page).getByRole("button", { name: "Connect wallet" }).click();
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
 }
 
 test("question_board_shows_answers_hidden_items_and_updates_live", async ({ page }) => {

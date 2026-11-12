@@ -1,6 +1,6 @@
 import { expect, type Page, test } from "@playwright/test";
 import { FakeChain } from "../test/fakeChain";
-import { installWallet, STUB_WALLET_NAME } from "./walletStub";
+import { installWallet, pickStubWallet } from "./walletStub";
 
 // The wallet page in a browser, against a model of the contract and its token (test/fakeChain.ts)
 // and a wallet that announces itself the way an extension does (e2e/walletStub.ts). The page
@@ -24,7 +24,7 @@ const row = (page: Page) => page.getByTestId("token-row").filter({ hasText: TOKE
 async function connect(page: Page): Promise<void> {
   await page.goto("/wallet");
   await page.getByRole("button", { name: "Connect wallet" }).click();
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
   await expect(page.getByTestId("account-id")).toHaveText(ALICE);
 }
 
@@ -51,7 +51,7 @@ test("register_deposit_withdraw_round_trip", async ({ page }) => {
   await expect(page.getByTestId("account-id")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Connect wallet" }).click();
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
   await expect(page.getByTestId("account-id")).toHaveText(ALICE);
   await expect(page.getByRole("button", { name: "Disconnect" })).toBeVisible();
 

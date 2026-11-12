@@ -3,17 +3,26 @@ import { join } from "node:path";
 import { expect, type Page, type Route, test } from "@playwright/test";
 import { FakeChain, FakeNode } from "../../test/fakeChain";
 import { API_URL, RPC_URL, routeApi } from "../fixtures";
-import { installWallet, routeWalletManifest, STUB_WALLET_NAME } from "../walletStub";
+import {
+  installWallet,
+  LISTED_WALLETS,
+  pickStubWallet,
+  routeWalletManifest,
+  STUB_WALLET_NAME,
+} from "../walletStub";
 
 // The email and Google login in a browser, in a build with a Privy app id (playwright.privy.config.ts),
-// with Privy's kit replaced by the stand-in in e2e/privy/kit.tsx: Connect's chooser at a phone's
-// width and a laptop's, the NEAR wallets as the second choice (near-connect, as the first suite
-// drives it), and a login that gets its new account ready: its balance read from the node, the gas
-// gift asked of the API (`POST /v1/gas-gift`, answered here: the route is another lane's), the node
-// read again until the NEAR is there, and the wallet page saying who holds the key.
+// with Privy's kit replaced by the stand-in in e2e/privy/kit.tsx: Connect's one window at a phone's
+// width and a laptop's (the email field, Google, and the NEAR wallets near-connect lists, as rows),
+// a wallet's row that connects it with no second window, the email login's code step, the Google
+// login's trip away from the page and back, and a login that gets its new account ready: its
+// balance read from the node, the gas gift asked of the API (`POST /v1/gas-gift`, answered here:
+// the route is another lane's), the node read again until the NEAR is there, and the wallet page
+// saying who holds the key.
 //
-// With PRIVY_SHOTS set to a directory, the chooser, "Getting your account ready…", a refused gift,
-// a gift whose send failed, and the wallet page of a login are saved there at 375 and 1440 px wide.
+// With PRIVY_SHOTS set to a directory, the window, the code step, "Getting your account ready…", a
+// refused gift, a gift whose send failed, and the wallet page of a login are saved there at 375 and
+// 1440 px wide.
 
 const CONTRACT = "tender.tender-team.testnet";
 const TOKEN = "tusdc.tender-team.testnet";
@@ -70,7 +79,7 @@ async function loginWorld(
   options: { login?: "email" | "google"; refuse?: string; refuseStatus?: number } = {},
 ): Promise<Login> {
   await routeApi(page);
-  await routeWalletManifest(page);
+  await routeWalletManifest(page, LISTED_WALLETS);
   const node = new FakeNode(new FakeChain(CONTRACT, [{ token: TOKEN }]));
   let landed = false;
   let release: () => void = () => {};
@@ -135,33 +144,56 @@ async function loginWorld(
   return { gifts, land: () => release() };
 }
 
-const chooser = (page: Page) => page.getByRole("dialog");
+const connectWindow = (page: Page) => page.getByRole("dialog");
 
-test("the_chooser_offers_the_login_first_and_a_near_wallet_second_at_both_widths", async ({
-  page,
-}) => {
+/** Presses Connect wallet on the wallet page, and waits for the window's wallets. */
+async function openWindow(page: Page): Promise<void> {
+  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+  await expect(connectWindow(page).getByRole("button", { name: /Birch Wallet/ })).toBeVisible();
+}
+
+/** Logs in by email in the window: the address, Submit, then the code. */
+async function emailLogin(page: Page, code = "123456"): Promise<void> {
+  await connectWindow(page).getByLabel("Email address").fill("ada@example.com");
+  await connectWindow(page).getByRole("button", { name: "Submit" }).click();
+  await expect(connectWindow(page).getByLabel("Code")).toBeFocused();
+  await connectWindow(page).getByLabel("Code").fill(code);
+}
+
+test("the_window_offers_email_google_and_the_near_wallets_at_both_widths", async ({ page }) => {
   await loginWorld(page);
   for (const size of [PHONE, LAPTOP]) {
     await page.setViewportSize(size);
     await page.goto("/wallet");
-    await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-    await expect(chooser(page).getByRole("heading")).toHaveText("Connect to Tender");
+    await openWindow(page);
+    const panel = connectWindow(page);
+    await expect(panel.getByRole("heading")).toHaveText("Log in or sign up");
+    await expect(panel.getByLabel("Email address")).toBeFocused();
+    await expect(panel.getByRole("button", { name: "Submit" })).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Continue with Google" })).toBeVisible();
+    await expect(panel.getByText("or use a NEAR wallet")).toBeVisible();
+    // One row for each wallet near-connect lists, with its site.
+    await expect(panel.getByTestId("wallet-row")).toHaveText([
+      "Ash Walletwallet.ash.test",
+      "Birch Walletbirch.test",
+    ]);
     await expect(
-      chooser(page).getByRole("button", { name: "Continue with email or Google" }),
-    ).toBeFocused();
-    await expect(chooser(page).getByRole("button", { name: "Use a NEAR wallet" })).toBeVisible();
-    // The whole chooser is on the screen, inside the page's gutters.
-    const box = await chooser(page).boundingBox();
+      panel.getByText("Email and Google login by Privy.", { exact: false }),
+    ).toBeVisible();
+    // The whole window is on the screen: on a phone, the width less a 16px gutter each side.
+    const box = await panel.boundingBox();
     expect(box?.x).toBeGreaterThanOrEqual(16);
     expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(size.width - 16);
+    if (size === PHONE) expect(box?.width).toBe(size.width - 32);
+    else expect(box?.width).toBe(360);
     await page.keyboard.press("Escape");
-    await expect(chooser(page)).toHaveCount(0);
+    await expect(connectWindow(page)).toHaveCount(0);
   }
-  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-  await shoot(page, "chooser");
+  await openWindow(page);
+  await shoot(page, "window");
 });
 
-test("use_a_near_wallet_opens_near_connect_as_connect_did_before", async ({ page }) => {
+test("a_wallet_row_connects_that_wallet_with_no_second_window", async ({ page }) => {
   await routeApi(page);
   await installWallet(page, new FakeChain(CONTRACT, [{ token: TOKEN }]), { account: ALICE });
   await page.addInitScript(() => {
@@ -172,32 +204,64 @@ test("use_a_near_wallet_opens_near_connect_as_connect_did_before", async ({ page
   });
   await page.goto("/wallet");
   await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-  await chooser(page).getByRole("button", { name: "Use a NEAR wallet" }).click();
-  await expect(chooser(page)).toHaveCount(0);
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
+  await expect(connectWindow(page)).toHaveCount(0);
   await expect(page.getByTestId("account-id")).toHaveText(ALICE);
+  // near-connect's own list never opened.
+  await expect(page.locator(".hot-connector-popup")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Disconnect" })).toBeVisible();
   await expect(page.getByTestId("key-holder")).toHaveCount(0);
+
+  // Next time, the window marks the wallet used last.
+  await page.getByRole("button", { name: "Disconnect" }).click();
+  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+  await expect(
+    connectWindow(page).getByRole("button", { name: STUB_WALLET_NAME }).getByTestId("last-used"),
+  ).toHaveText("Last used");
 });
 
-test("a_login_gets_its_account_ready_and_the_wallet_page_says_who_holds_the_key", async ({
+test("the_code_step_says_a_wrong_code_and_back_keeps_the_address", async ({ page }) => {
+  await loginWorld(page);
+  await page.setViewportSize(LAPTOP);
+  await page.goto("/wallet");
+  await openWindow(page);
+
+  // A wrong code: one plain line, and the field is ready for the next.
+  await emailLogin(page, "000000");
+  await expect(connectWindow(page).getByRole("alert")).toHaveText(
+    "That code is wrong or has expired.",
+  );
+  await expect(connectWindow(page).getByLabel("Code")).toHaveValue("");
+  await expect(connectWindow(page).getByRole("heading")).toHaveText("Check your email");
+  await expect(connectWindow(page).getByText("Enter the code sent to")).toHaveText(
+    "Enter the code sent to ada@example.com",
+  );
+  await shoot(page, "code-wrong");
+  await connectWindow(page).getByRole("button", { name: "Back" }).click();
+  await expect(connectWindow(page).getByLabel("Email address")).toHaveValue("ada@example.com");
+  await connectWindow(page).getByRole("button", { name: "Submit" }).click();
+  await expect(connectWindow(page).getByLabel("Code")).toBeFocused();
+  await shoot(page, "code");
+});
+
+test("an_email_login_takes_its_code_gets_its_account_ready_and_the_wallet_page_says_who_holds_the_key", async ({
   page,
 }) => {
   const world = await loginWorld(page);
   await page.setViewportSize(LAPTOP);
   await page.goto("/wallet");
-  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-  await chooser(page).getByRole("button", { name: "Continue with email or Google" }).click();
+  await openWindow(page);
+  await emailLogin(page);
 
   // The new account has no NEAR: Tender is asked for some, with the login's token.
-  await expect(chooser(page).getByTestId("account-preparing")).toHaveText(
+  await expect(connectWindow(page).getByTestId("account-preparing")).toHaveText(
     "Getting your account ready…",
   );
   await expect.poll(() => world.gifts).toEqual([`Bearer e2e-login-token ${ACCOUNT}`]);
   await shoot(page, "preparing");
 
   world.land();
-  await expect(chooser(page)).toHaveCount(0);
+  await expect(connectWindow(page)).toHaveCount(0);
   await expect(page.getByTestId("login-label")).toHaveText("Email login");
   await expect(page.getByTestId("account-id")).toHaveText(
     `${ACCOUNT.slice(0, 8)}…${ACCOUNT.slice(-8)}`,
@@ -220,37 +284,47 @@ test("a_login_gets_its_account_ready_and_the_wallet_page_says_who_holds_the_key"
   await shoot(page, "add-agent-login");
   await page.goto("/wallet");
 
-  // A reload takes the login up again, with no chooser and no second gift.
+  // A reload takes the login up again, with no window and no second gift.
   await page.reload();
   await expect(page.getByTestId("login-label")).toHaveText("Email login");
-  await expect(chooser(page)).toHaveCount(0);
+  await expect(connectWindow(page)).toHaveCount(0);
   expect(world.gifts).toHaveLength(1);
 
-  // Log out ends both: the page offers Connect again, and a reload finds no login.
+  // Log out ends both: the page offers Connect again, a reload finds no login, and the window
+  // marks the email row as the way used last.
   await page.getByRole("button", { name: "Log out" }).click();
   await expect(page.locator("main").getByRole("button", { name: "Connect wallet" })).toBeVisible();
   await page.reload();
-  await expect(page.locator("main").getByRole("button", { name: "Connect wallet" })).toBeVisible();
+  await openWindow(page);
+  await expect(connectWindow(page).locator("form").getByTestId("last-used")).toHaveText(
+    "Last used",
+  );
 });
 
-test("a_refused_gift_says_so_with_the_faucet_and_the_account_to_copy", async ({ page }) => {
-  await loginWorld(page, { login: "google", refuse: "gift_off" });
+test("a_google_login_leaves_and_comes_back_and_a_refused_gift_says_so_with_the_faucet", async ({
+  page,
+}) => {
+  const world = await loginWorld(page, { login: "google", refuse: "gift_off" });
   await page.setViewportSize(PHONE);
   await page.goto("/wallet");
-  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-  await chooser(page).getByRole("button", { name: "Continue with email or Google" }).click();
+  await openWindow(page);
+  await connectWindow(page).getByRole("button", { name: "Continue with Google" }).click();
 
-  await expect(chooser(page).getByTestId("account-stuck")).toHaveText(
+  // Back on the page it left, with Privy's parameters taken off the address, the login ends and
+  // the account is got ready: here, Tender won't send.
+  await expect(connectWindow(page).getByTestId("account-stuck")).toHaveText(
     "Tender isn't sending NEAR for fees right now.",
   );
-  const faucet = chooser(page).getByRole("link", { name: "Open the faucet" });
+  await expect(page).toHaveURL(/\/wallet$/);
+  expect(world.gifts).toEqual([`Bearer e2e-login-token ${ACCOUNT}`]);
+  const faucet = connectWindow(page).getByRole("link", { name: "Open the faucet" });
   await expect(faucet).toHaveAttribute("href", "https://near-faucet.io/");
-  await expect(chooser(page).getByTestId("stuck-account")).toHaveAttribute("title", ACCOUNT);
-  await expect(chooser(page).getByRole("button", { name: "Copy account" })).toBeVisible();
+  await expect(connectWindow(page).getByTestId("stuck-account")).toHaveAttribute("title", ACCOUNT);
+  await expect(connectWindow(page).getByRole("button", { name: "Copy account" })).toBeVisible();
   await shoot(page, "stuck");
 
   // The person is logged in all the same, as a Google login; the account waits for its NEAR.
-  await chooser(page).getByRole("button", { name: "Close" }).click();
+  await connectWindow(page).getByRole("button", { name: "Close" }).click();
   await expect(page.getByTestId("login-label")).toHaveText("Google login");
 });
 
@@ -258,14 +332,14 @@ test("a_gift_whose_send_failed_offers_try_again_first_and_the_faucet_second", as
   await loginWorld(page, { refuse: "transfer_failed", refuseStatus: 502 });
   await page.setViewportSize(PHONE);
   await page.goto("/wallet");
-  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-  await chooser(page).getByRole("button", { name: "Continue with email or Google" }).click();
+  await openWindow(page);
+  await emailLogin(page);
 
-  await expect(chooser(page).getByTestId("account-stuck")).toHaveText(
+  await expect(connectWindow(page).getByTestId("account-stuck")).toHaveText(
     "Couldn't send yet. Try again in a moment.",
   );
-  await expect(chooser(page).getByRole("button", { name: "Try again" })).toBeFocused();
-  await expect(chooser(page).getByRole("link", { name: "Open the faucet" })).toBeVisible();
-  await expect(chooser(page).getByTestId("stuck-account")).toHaveAttribute("title", ACCOUNT);
+  await expect(connectWindow(page).getByRole("button", { name: "Try again" })).toBeFocused();
+  await expect(connectWindow(page).getByRole("link", { name: "Open the faucet" })).toBeVisible();
+  await expect(connectWindow(page).getByTestId("stuck-account")).toHaveAttribute("title", ACCOUNT);
   await shoot(page, "stuck-retry");
 });

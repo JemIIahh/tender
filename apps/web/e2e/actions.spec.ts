@@ -6,7 +6,7 @@ import { FakeChain, type FakeTask } from "../test/fakeChain";
 import { AT, agent, detail, entry, POSTER, SECOND, TOKEN } from "../test/tasks";
 import { API_URL, routeApi } from "./fixtures";
 import { installInjectedWallet } from "./injectedWallet";
-import { STUB_WALLET_NAME } from "./walletStub";
+import { pickStubWallet } from "./walletStub";
 
 // The actions of the task page (`#pick`, `#refund`, `#top-up`) against the fixture API, a wallet in
 // the page through the real wallet picker, and the model of the chain (test/fakeChain.ts). Each
@@ -145,7 +145,7 @@ async function open(
 /** Connects the page's wallet from the Connect button in `scope`. */
 async function connect(page: Page, scope = page.getByTestId("task-actions")): Promise<void> {
   await scope.getByRole("button", { name: "Connect wallet" }).click();
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
 }
 
 const IN_JUDGING = AT.reveal + 120n * SECOND;

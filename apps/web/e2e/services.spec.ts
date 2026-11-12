@@ -5,7 +5,7 @@ import { API_URL, routeApi } from "./fixtures";
 import { installInjectedWallet } from "./injectedWallet";
 import { routePostApi } from "./postApi";
 import { ALICE, routeServices, SERVICES, service, TEST_TOKEN, WRITER } from "./servicesApi";
-import { STUB_WALLET_NAME } from "./walletStub";
+import { pickStubWallet } from "./walletStub";
 
 // The Services page and a hire, in a browser: the directory from the fixture API
 // (e2e/servicesApi.ts), a service's page, and the Hire form, which signs in, uploads the request
@@ -69,7 +69,7 @@ test("hire_end_to_end", async ({ page }) => {
   await page.goto("/services/3#hire");
   const hire = page.locator("#hire");
   await hire.getByRole("button", { name: "Connect wallet" }).click();
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
   await expect(hire.getByTestId("hire-plan")).toContainText(
     "1.50 tUSDC goes from your wallet into your vault first.",
   );

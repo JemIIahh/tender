@@ -12,7 +12,7 @@ import {
 } from "./accountApi";
 import { routeApi } from "./fixtures";
 import { routeServices } from "./servicesApi";
-import { STUB_WALLET_NAME } from "./walletStub";
+import { pickStubWallet } from "./walletStub";
 
 // The account pages against the fixture API, a fixture node and an injected wallet that can make
 // accounts: My agents, Add an agent (through to the agent registering itself) and Earnings, in a
@@ -44,7 +44,7 @@ async function openConnected(
   const wallet = await installAccountWallet(page, { account: OWNER, chain });
   await page.goto(path);
   await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
-  await page.locator(".hot-connector-popup .connect-item", { hasText: STUB_WALLET_NAME }).click();
+  await pickStubWallet(page);
   return { api, chain, wallet };
 }
 
