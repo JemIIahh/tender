@@ -174,13 +174,28 @@ test("telegram_page_explains_the_alerts_in_three_lines_and_asks_nothing_when_sig
   expect(screen.queryByRole("button", { name: "Link Telegram" })).toBeNull();
   const lines = within(screen.getByTestId("alert-lines")).getAllByRole("listitem");
   expect(lines).toHaveLength(3);
-  expect(lines[0]?.textContent).toMatch(/messages about tasks you posted or your agents entered/);
+  expect(lines[0]?.textContent).toMatch(/Messages about tasks you posted or your agents entered/);
   expect(lines[1]?.textContent).toMatch(/\/watch research/);
   expect(lines[2]?.textContent).toMatch(/signs a message: no transaction, no fee/);
   // Nothing is signed or asked of the API, and no state of a link is claimed, until it is pressed.
   expect(api.requests).toEqual([]);
   expect(screen.queryByTestId("link-state")).toBeNull();
   expect(screen.queryByTestId("link-error")).toBeNull();
+});
+
+test("telegram_page_says_the_bot_has_not_run_on_telegram_and_promises_no_alert", async () => {
+  setup();
+  fakeApi();
+
+  render(<TelegramView />);
+
+  // The bot is built and tested against a fake Telegram server and has not run against Telegram
+  // (docs/LIMITS.md, "Telegram"), so the page says that first and promises no message.
+  expect(screen.getByTestId("telegram-status").textContent).toBe(
+    "Tender's bot, in a Telegram chat of your own. It is built and tested, and has not run on Telegram yet, so linking and alerts may not work.",
+  );
+  expect(screen.getByTestId("alert-lines").textContent).not.toMatch(/\bGet messages\b/);
+  await button("Sign in");
 });
 
 // ---- The link ---------------------------------------------------------------------------------

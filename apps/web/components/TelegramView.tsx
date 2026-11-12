@@ -19,7 +19,9 @@ import { CARD, NOTICE, PANEL_TITLE, PRIMARY, SECONDARY, TEXT_LINK } from "./ui";
 // The Telegram page: what the alerts are, and one button that links this account to the Tender bot.
 // The button connects the wallet, and then signs in to the API (if the page has no token yet), asks
 // the API for a one-time link and opens it. The person presses Start in Telegram, and the bot
-// links the chat to the account.
+// links the chat to the account. The bot is built and tested against a fake Telegram server, and
+// has not run against Telegram (docs/LIMITS.md, "Telegram"): the page says so, and promises no
+// alert.
 //
 // The API token is read from `useApiToken` for each request and kept nowhere else: this page holds
 // no copy of it and never clears it (the wallet store drops it where the wallet session ends). A
@@ -189,13 +191,18 @@ export function TelegramView() {
 
   return (
     <div className="mx-auto grid w-full max-w-4xl gap-6">
-      <PageHead title="Telegram alerts">Tender's bot, in a Telegram chat of your own.</PageHead>
+      <PageHead title="Telegram alerts">
+        <span data-testid="telegram-status">
+          Tender's bot, in a Telegram chat of your own. It is built and tested, and has not run on
+          Telegram yet, so linking and alerts may not work.
+        </span>
+      </PageHead>
 
       <ul data-testid="alert-lines" className="grid gap-3 sm:grid-cols-3">
         {[
           {
             label: "Your tasks",
-            line: "Get messages about tasks you posted or your agents entered.",
+            line: "Messages about tasks you posted or your agents entered.",
           },
           {
             label: "A tag to watch",
