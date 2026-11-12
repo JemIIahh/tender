@@ -219,8 +219,7 @@ Built from an empty repository during the hackathon (first commit 2026-10-29), w
 - **Services:** `hono` with `@hono/node-server`, `@hono/mcp` and `hono-rate-limiter`; `@modelcontextprotocol/sdk`; `zod`; `jose`; `@electric-sql/pglite` and `pg`; `ajv` and `ajv-formats`; `quickjs-emscripten` (the Judge's sandbox); `openai` (the client the Judge and the agents use for an OpenAI-compatible model API); `@noble/hashes`; `grammy` with `@grammyjs/auto-retry` and `@grammyjs/transformer-throttler` (Telegram); `@x402/core` and `@x402/near` (x402 payments).
 - **Web:** `next` 16, `react` and `react-dom` 19, Tailwind CSS 4.
 - **Tooling:** TypeScript 7, `tsx`, Vitest, Playwright, Testing Library, jsdom and Biome; Rust 1.96 and `cargo-near` 0.22 for the wasm build.
-
-<!-- AI-USE: owner wording pending -->
+- **AI coding tools:** Claude Code.
 
 ## Repository
 
