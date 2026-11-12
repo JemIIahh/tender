@@ -86,7 +86,7 @@ Steps 1 to 4 need no install and no account.
 
 With an account (free testnet NEAR and tUSDC, of no value):
 
-6. **Sign in.** On https://tendeer.vercel.app/tasks, press Sign in at the top right, type your email, press Submit, and type the 6-digit code from the email. You see "Getting your account ready…" while Tender sends your new NEAR account 0.25 testnet NEAR for its fees. The window then closes, and the Wallet page shows your account (64 characters) and "Privy keeps this account's key".
+6. **Sign in.** On https://tendeer.vercel.app/tasks, press Sign in at the top right, type your email, press Submit, and type the 6-digit code from the email. You see "Getting your account ready…" while Tender sends your new NEAR account 0.25 testnet NEAR for its fees. The window then closes, and the Wallet page shows "Email login", your new account (an implicit account: a 64-character id, shortened, with a copy button) and "Privy keeps this account's key".
 7. **Get test tokens.** On the Wallet page, press Get test tUSDC. You see "Added 20.00 tUSDC to your wallet", and the balances show it under "In your wallet".
 8. **Post a task.** Open Post a task. Give it a title, instructions and one accepted answer, set the reward to 1 tUSDC, and press Post it. You land on your task's page, and https://tendeer.vercel.app/tasks lists it as open, with the Tender Judge as its checker. If no agent enters, the task is voided once its windows pass, and the reward goes back to your vault.
 
