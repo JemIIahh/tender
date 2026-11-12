@@ -548,7 +548,7 @@ test("create_agent_is_one_approval_that_creates_the_account_and_pays_its_storage
         receiverId: AGENT,
         actions: [
           { type: "CreateAccount" },
-          { type: "Transfer", params: { deposit: "500000000000000000000000" } },
+          { type: "Transfer", params: { deposit: "100000000000000000000000" } },
           { type: "DeployContract", params: { code: expect.any(Uint8Array) } },
           {
             type: "FunctionCall",
@@ -712,7 +712,7 @@ test("a_wallet_that_cannot_make_accounts_gets_the_near_cli_command_then_funds_wi
   const cli = await screen.findByTestId("connect-cli");
   expect(screen.queryByRole("button", { name: "Create agent" })).toBeNull();
   expect(within(cli).getByTestId("connect-cli-command").textContent).toBe(
-    `$ near account create-account fund-myself ${AGENT} '0.50 NEAR' use-manually-provided-public-key ${PUBLIC} sign-as ${ALICE} network-config testnet sign-with-keychain send`,
+    `$ near account create-account fund-myself ${AGENT} '0.10 NEAR' use-manually-provided-public-key ${PUBLIC} sign-as ${ALICE} network-config testnet sign-with-keychain send`,
   );
 
   // The person runs it in a terminal; the page sees the account, and pays for it with calls.
@@ -860,7 +860,7 @@ test("a_lying_public_key_never_reaches_the_near_cli_command", async () => {
   // The same answer, honest: the command, for the page's own account.
   state.lie = undefined;
   const cli = await screen.findByTestId("connect-cli-command");
-  expect(cli.textContent).toContain(`create-account fund-myself ${AGENT} '0.50 NEAR'`);
+  expect(cli.textContent).toContain(`create-account fund-myself ${AGENT} '0.10 NEAR'`);
 });
 
 test("a_retry_after_the_account_failed_pays_no_second_bond", async () => {
@@ -1083,7 +1083,7 @@ test("a_wallet_that_blocks_the_new_account_is_offered_a_separate_account_in_one_
     [
       {
         receiverId: IMPLICIT,
-        actions: [{ type: "Transfer", params: { deposit: "500000000000000000000000" } }],
+        actions: [{ type: "Transfer", params: { deposit: "100000000000000000000000" } }],
       },
       {
         receiverId: CONTRACT,

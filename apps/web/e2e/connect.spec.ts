@@ -268,7 +268,7 @@ test("a_wallet_that_blocks_the_new_account_gets_one_button_for_a_separate_accoun
   expect(api.requests).toContain("POST /v1/connect/codes/Q0RFRkdISUpLTE1OT1BRUg/implicit");
   expect(wallet.sent.map((tx) => tx.receiverId)).toEqual([implicit, CONTRACT, TOKEN]);
   expect(wallet.sent[0]?.actions).toEqual([
-    { type: "Transfer", params: { deposit: "500000000000000000000000" } },
+    { type: "Transfer", params: { deposit: "100000000000000000000000" } },
   ]);
   expect(chain.accounts.get(implicit)).toEqual([AGENT_PUBLIC_KEY]);
   expect(chain.vault?.get(implicit)).toBe(5_000_000n);

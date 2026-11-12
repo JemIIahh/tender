@@ -15,7 +15,9 @@ import {
   implicitAgentBatch,
   isPaid,
   readAgentOnChain,
+  readWalletBalance,
 } from "../../lib/connect";
+import { faucetOffered } from "../../lib/faucet";
 import { formatSpan } from "../../lib/phase";
 import { accountExists, accountKeyState } from "../../lib/rpc";
 import { useLoad } from "../../lib/useLoad";
@@ -667,14 +669,21 @@ type ImplicitLook =
   | { state: "checking" | "error"; accountId: string }
   | { state: "read"; accountId: string; chain: AgentOnChain };
 
+/** What the owner's own wallet holds of the bond's token, as the page last read it. */
+type Held = { state: "unknown" } | { state: "read"; amount: bigint } | { state: "error" };
+
 /**
  * "Add an agent" for an implicit account: the agent makes its key, the person pastes the public
  * half, and ONE approval sends NEAR to the implicit account of that key (which the chain creates
  * with that key as its one full-access key), Tender's storage for it and the bond into its vault
  * (`implicitAgentBatch`, as "Use a separate account instead" sends). Then the agent registers with
  * its own key. Nothing is signed until the button is pressed.
+ *
+ * Every email or Google login is such an account, and holds none of the bond's token until the
+ * Wallet page's faucet: the page reads what the owner's wallet holds of it, and says so (with the
+ * way to the faucet) before the approval, whose bond would otherwise fail on the network.
  */
-function ImplicitFlow({ watchEveryMs }: { watchEveryMs: number }) {
+function ImplicitFlow({ owner, watchEveryMs }: { owner: string; watchEveryMs: number }) {
   const id = useId();
   const actions = useAccountActions();
   const [terms, retryTerms] = useLoad("config", () => readBondTerms());
@@ -738,7 +747,31 @@ function ImplicitFlow({ watchEveryMs }: { watchEveryMs: number }) {
   const chain = shown?.state === "read" ? shown.chain : null;
   const made = chain !== null && chain.key === "has-key" && isPaid(chain, bond);
   const taken = chain !== null && chain.key === "other-keys";
-  const ready = agentId !== null && chain !== null && !made && !taken;
+  // What the owner's wallet holds of the bond's token, read again on Check again.
+  const [held, setHeld] = useState<Held>({ state: "unknown" });
+  const [lookAgain, setLookAgain] = useState(0);
+  const bondToken = bond?.token ?? null;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `lookAgain` reads it again on purpose
+  useEffect(() => {
+    if (bondToken === null || made) return;
+    let gone = false;
+    readWalletBalance(owner, bondToken).then(
+      (amount) => {
+        if (!gone) setHeld({ state: "read", amount });
+      },
+      (error) => {
+        console.error(error);
+        if (!gone) setHeld({ state: "error" });
+      },
+    );
+    return () => {
+      gone = true;
+    };
+  }, [owner, bondToken, made, lookAgain]);
+  // The bond the approval would pay: what the agent's vault doesn't hold of it yet.
+  const bondDue = bond === null ? 0n : bond.amount - (chain?.vault ?? 0n);
+  const short = held.state === "read" && bondDue > 0n && held.amount < bondDue ? held.amount : null;
+  const ready = agentId !== null && chain !== null && !made && !taken && short === null;
 
   const send = async () => {
     if (busy.current || agentId === null || publicKey === null || !termsRead) return;
@@ -890,6 +923,30 @@ function ImplicitFlow({ watchEveryMs }: { watchEveryMs: number }) {
             ) : null}
           </p>
 
+          {short !== null && bond !== null && !made ? (
+            <div data-testid="implicit-short" className={`${NOTICE} grid gap-2`}>
+              <p>
+                Your wallet holds {describeAmount(short, bond.token)}, and the bond is{" "}
+                {describeAmount(bondDue, bond.token)}. Add{" "}
+                {describeAmount(bondDue - short, bond.token)} to your wallet first.
+              </p>
+              <div className="flex flex-wrap items-center gap-3">
+                {faucetOffered(config.network) ? (
+                  <Link href="/wallet" className={TEXT_LINK}>
+                    Get test tUSDC on the Wallet page
+                  </Link>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() => setLookAgain((n) => n + 1)}
+                  className={SECONDARY}
+                >
+                  Check again
+                </button>
+              </div>
+            </div>
+          ) : null}
+
           {made ? null : !actions.canSend() ? (
             <p data-testid="cannot-create" className={NOTICE}>
               This wallet can't send the approval from the page.
@@ -1021,7 +1078,7 @@ export function AddAgentView({
         {(account) =>
           isImplicitAccount(account) ? (
             // No account can be made under it, and no connect code: the agent's own key's account.
-            <ImplicitFlow key={account} watchEveryMs={watchEveryMs} />
+            <ImplicitFlow key={account} owner={account} watchEveryMs={watchEveryMs} />
           ) : (
             <div className="grid gap-8">
               <ConnectAgent

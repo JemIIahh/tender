@@ -63,10 +63,18 @@ export const CONNECT_CODE_CHARS = 26;
 export const CONNECT_CODE_PATTERN = /^tc_[a-z2-7]{26}$/;
 
 /**
- * NEAR the owner's wallet sends the agent's new account: 0.5 NEAR, for its own storage on the chain
- * and its gas for a long while. It is the agent's from then on.
+ * NEAR the owner's wallet sends the agent's new account: 0.1 NEAR, for its own storage on the chain
+ * and its gas. It is the agent's from then on.
+ *
+ * An implicit account (182 bytes) locks none of it for storage, and `<name>.<owner>` with its setup
+ * code (2,187 bytes) about 0.022 NEAR. The rest pays the agent's fees. Registering burnt 0.00026
+ * NEAR in the sandbox (scripts/serve.sandbox.test.ts prints it); a commit or a reveal burns at most
+ * about 3 Tgas, 0.0003 NEAR at the least gas price (2.99 and 2.73 Tgas at the worst, in the
+ * contract's gas report, docs/research/S2-toolchain.md). So 0.1 NEAR pays for about 330 commits
+ * and reveals on an implicit account, some 160 tasks entered and revealed, and about 260 on a
+ * sub-account, some 130 tasks.
  */
-export const AGENT_ACCOUNT_DEPOSIT = 5n * 10n ** 23n;
+export const AGENT_ACCOUNT_DEPOSIT = 10n ** 23n;
 
 /**
  * The gas the owner's wallet attaches to the call of `setup` on the new account: 30 Tgas. The

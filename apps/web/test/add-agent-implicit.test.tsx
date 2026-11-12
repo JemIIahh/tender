@@ -160,7 +160,7 @@ test("the_agent_s_account_is_made_funded_and_bonded_in_one_approval_and_it_regis
   const [batch] = sent;
   expect(batch?.map((tx) => tx.receiverId)).toEqual([AGENT, CONTRACT, TOKEN]);
   expect(batch?.[0]?.actions).toEqual([
-    { type: "Transfer", params: { deposit: "500000000000000000000000" } },
+    { type: "Transfer", params: { deposit: "100000000000000000000000" } },
   ]);
   expect(batch?.[1]?.actions[0]?.params).toMatchObject({
     methodName: "storage_deposit",
@@ -183,6 +183,40 @@ test("the_agent_s_account_is_made_funded_and_bonded_in_one_approval_and_it_regis
   expect((await within(step3).findByTestId("registered")).textContent).toContain(
     `Registered. ${AGENT} is in the directory.`,
   );
+});
+
+test("a_login_with_none_of_the_bond_token_is_sent_to_the_faucet_before_anything_is_signed", async () => {
+  // A login account as the gas gift leaves it: NEAR, and none of the test token yet.
+  const state = world();
+  state.accounts.set(OWNER, []);
+  state.config = { ...state.config, agent_bond: { token: TOKEN, amount: BOND.toString() } };
+  state.wallet.set(OWNER, 0n);
+  const { sent, user } = open(state);
+
+  await user.click(await screen.findByLabelText("The public key it printed"));
+  await user.paste(AGENT_KEY);
+  const short = await screen.findByTestId("implicit-short");
+  expect(short.textContent).toContain(
+    "Your wallet holds 0.00 tUSDC, and the bond is 5.00 tUSDC. Add 5.00 tUSDC to your wallet first.",
+  );
+  expect(
+    within(short)
+      .getByRole("link", { name: "Get test tUSDC on the Wallet page" })
+      .getAttribute("href"),
+  ).toBe("/wallet");
+  const create = screen.getByRole("button", { name: "Create the agent's account" });
+  expect(create.getAttribute("aria-disabled")).toBe("true");
+  await user.click(create);
+  expect(sent).toEqual([]);
+
+  // The faucet's 20 tUSDC, then Check again: the approval is on.
+  state.wallet.set(OWNER, 20_000_000n);
+  await user.click(within(short).getByRole("button", { name: "Check again" }));
+  await waitFor(() => expect(screen.queryByTestId("implicit-short")).toBeNull());
+  await waitFor(() => expect(create.getAttribute("aria-disabled")).toBe("false"));
+  await user.click(create);
+  await waitFor(() => expect(screen.getByTestId("step-2").dataset.done).toBe("true"));
+  expect(sent[0]?.map((tx) => tx.receiverId)).toEqual([AGENT, CONTRACT, TOKEN]);
 });
 
 test("an_agent_account_already_made_and_paid_for_is_step_two_done_with_nothing_to_send", async () => {

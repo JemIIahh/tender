@@ -111,7 +111,7 @@ test("add_agent_makes_the_account_in_one_transaction_and_watches_the_agent_regis
     "DeployContract",
     "FunctionCall",
   ]);
-  expect(wallet.sent[0]?.actions[1]?.params).toEqual({ deposit: "500000000000000000000000" });
+  expect(wallet.sent[0]?.actions[1]?.params).toEqual({ deposit: "100000000000000000000000" });
   expect(wallet.sent[0]?.actions[3]?.params).toEqual({
     methodName: "setup",
     args: { public_key: AGENT_PUBLIC_KEY },

@@ -188,7 +188,7 @@ describe("what the owner's wallet pays", () => {
   test("the_storage_holds_the_record_the_slot_and_what_registering_asks_free", () => {
     // 133 bytes of record at most, a 200-byte vault slot, and 1,024 bytes free (`storageShortfall`).
     expect(AGENT_STORAGE_DEPOSIT).toBeGreaterThanOrEqual((133n + 200n + 1024n) * STORAGE_BYTE_COST);
-    expect(AGENT_ACCOUNT_DEPOSIT).toBe(5n * 10n ** 23n);
+    expect(AGENT_ACCOUNT_DEPOSIT).toBe(10n ** 23n);
   });
 
   test("the_sub_account_gets_the_setup_code_and_its_call_and_no_add_key", () => {
@@ -201,7 +201,7 @@ describe("what the owner's wallet pays", () => {
     ]);
     expect(actions[1]).toEqual({
       type: "Transfer",
-      params: { deposit: "500000000000000000000000" },
+      params: { deposit: "100000000000000000000000" },
     });
     const deploy = actions[2];
     if (deploy?.type !== "DeployContract") throw new Error("no DeployContract");
@@ -219,7 +219,7 @@ describe("what the owner's wallet pays", () => {
 
   test("the_implicit_account_gets_its_near_and_nothing_else", () => {
     expect(implicitAccountActions()).toEqual([
-      { type: "Transfer", params: { deposit: "500000000000000000000000" } },
+      { type: "Transfer", params: { deposit: "100000000000000000000000" } },
     ]);
   });
 

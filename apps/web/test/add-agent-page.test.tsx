@@ -84,7 +84,7 @@ test("add_agent_asks_to_connect_first", async () => {
   );
   // What it costs is said before anything else.
   expect(screen.getByRole("banner").textContent).toMatch(
-    /0\.50 NEAR sent to the agent's new account.*0\.02 NEAR for its storage with Tender.*the bond it locks when it registers, paid from your wallet into the agent's own vault and refunded in full to that vault/,
+    /0\.10 NEAR sent to the agent's new account.*0\.02 NEAR for its storage with Tender.*the bond it locks when it registers, paid from your wallet into the agent's own vault and refunded in full to that vault/,
   );
   await screen.findByRole("heading", { name: "You're not signed in" });
   expect(screen.queryByLabelText("The public key it printed")).toBeNull();
@@ -159,7 +159,7 @@ test("the_wallet_creates_funds_and_keys_the_account_in_one_transaction_only_when
     expect(screen.getByTestId("name-state").textContent).toBe(`${AGENT} is free.`),
   );
   expect(screen.getByTestId("step-1").dataset.done).toBe("true");
-  expect(screen.getByTestId("deposit").textContent).toBe("0.50 NEAR");
+  expect(screen.getByTestId("deposit").textContent).toBe("0.10 NEAR");
   // Nothing is signed until the button is pressed.
   expect(sent).toEqual([]);
 
@@ -171,7 +171,7 @@ test("the_wallet_creates_funds_and_keys_the_account_in_one_transaction_only_when
       receiverId: AGENT,
       actions: [
         { type: "CreateAccount" },
-        { type: "Transfer", params: { deposit: "500000000000000000000000" } },
+        { type: "Transfer", params: { deposit: "100000000000000000000000" } },
         // The setup code, and its call that adds the key: no AddKey, which some wallets refuse.
         { type: "DeployContract", params: { code: expect.any(Uint8Array) } },
         {
@@ -230,7 +230,7 @@ test("a_wallet_that_cannot_make_accounts_gets_the_near_cli_command_and_check_aga
     network: "testnet",
   });
   expect(cli).toBe(
-    `near account create-account fund-myself ${AGENT} '0.50 NEAR' use-manually-provided-public-key ${PUBLIC} sign-as ${ALICE} network-config testnet sign-with-keychain send`,
+    `near account create-account fund-myself ${AGENT} '0.10 NEAR' use-manually-provided-public-key ${PUBLIC} sign-as ${ALICE} network-config testnet sign-with-keychain send`,
   );
   expect(commands()).toContain(cli);
 

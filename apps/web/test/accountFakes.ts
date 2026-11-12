@@ -103,6 +103,8 @@ export interface World {
   /** Accounts with a storage balance with Tender, and vault balances, for the dismissal's checks. */
   storage: Set<string>;
   vault: Map<string, bigint>;
+  /** What an account holds of the bond's token in its own wallet (`ft_balance_of`), if set. */
+  wallet: Map<string, bigint>;
 }
 
 export function world(): World {
@@ -123,6 +125,7 @@ export function world(): World {
     implicitStatus: null,
     storage: new Set(),
     vault: new Map(),
+    wallet: new Map(),
   };
 }
 
@@ -160,7 +163,9 @@ export function serve(state: World): void {
             : null
           : params.method_name === "balance_of"
             ? (state.vault.get(who) ?? 0n).toString()
-            : state.config;
+            : params.method_name === "ft_balance_of" && state.wallet.has(who)
+              ? (state.wallet.get(who) ?? 0n).toString()
+              : state.config;
       const bytes = [...new TextEncoder().encode(JSON.stringify(value))];
       return json({ jsonrpc: "2.0", id: "x", result: { result: bytes, logs: [] } });
     }
