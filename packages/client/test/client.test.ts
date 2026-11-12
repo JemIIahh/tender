@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { type extractEvents, NETWORKS, type PostTaskInput, type TenderCall } from "@tender/shared";
-import { Account, actions, KeyPair } from "near-api-js";
+import { Account, actions, JsonRpcProvider, KeyPair } from "near-api-js";
 import {
   CostOverflowError,
   InvalidChainError,
@@ -754,6 +754,7 @@ describe("NEAR transfers and balances", () => {
       receiverId: "ab".repeat(32),
       waitUntil: "EXECUTED",
       throwOnFailure: false,
+      retries: 0,
     });
     expect(args?.actions).toEqual([actions.transfer(100n)]);
   });
@@ -821,6 +822,46 @@ describe("NEAR transfers and balances", () => {
     expect(sendRefused(failed)).toBe(true);
   });
 
+  test("a_transfer_is_signed_once_even_when_its_nonce_is_refused", async () => {
+    // The node is stubbed at the provider: every transaction signed is counted, and every one sent
+    // is answered `InvalidNonce`, which can be the answer to a resent copy of one that was taken.
+    const key = KeyPair.fromRandom("ed25519");
+    const client = new TenderClient({
+      network: "testnet",
+      contractId: CONTRACT,
+      signer: { accountId: "gift.test.near", privateKey: key.toString() },
+    });
+    const signed = vi
+      .spyOn(Account.prototype, "createSignedTransaction")
+      .mockImplementation(
+        async () =>
+          ({ transaction: { publicKey: key.getPublicKey(), nonceIndex: undefined } }) as never,
+      );
+    const sent = vi
+      .spyOn(JsonRpcProvider.prototype, "sendTransactionUntil")
+      .mockImplementation(async () => {
+        throw new InvalidNonceError(7, 7, "TX", "BLOCK");
+      });
+
+    const error = await client.transfer("ab".repeat(32), 100n).then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(InvalidNonceError);
+    expect(sendRefused(error)).toBe(false);
+    // Neither near-api-js nor the queue signed a second transfer.
+    expect(signed).toHaveBeenCalledTimes(1);
+    expect(sent).toHaveBeenCalledTimes(1);
+
+    // Every other send is as it was: near-api-js signs anew up to 10 times, then the queue once more
+    // after 500 ms, and near-api-js 10 times again.
+    signed.mockClear();
+    sent.mockClear();
+    await expect(client.voidTask(1n)).rejects.toBeInstanceOf(InvalidNonceError);
+    expect(signed).toHaveBeenCalledTimes(22);
+    expect(sent).toHaveBeenCalledTimes(22);
+  });
+
   test("a_send_whose_outcome_is_not_known_is_never_refused_for_certain", () => {
     // Each of these may be followed by the transaction landing all the same.
     const unfinished = (() => {
@@ -841,8 +882,9 @@ describe("NEAR transfers and balances", () => {
       // refused for its receiver's shard while the first is already taken.
       ["a congested shard", new ShardCongestedError(1, 0, "TX", "BLOCK")],
       ["a stuck shard", new ShardStuckError(5, 0, "TX", "BLOCK")],
-      // The same, for a second copy of bytes whose first copy already ran: it used the nonce,
-      // spent what was there, or landed before its block expired.
+      // The same, for a second copy of bytes whose first copy already ran: it used the nonce, or
+      // landed before its block expired; and a signer's balance is the chain's state at that
+      // moment, not part of the signed bytes.
       ["a nonce that is used", new InvalidNonceError(7, 7, "TX", "BLOCK")],
       [
         "a signer short of NEAR",

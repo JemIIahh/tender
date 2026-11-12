@@ -246,7 +246,8 @@ function failedWith(txHash: string, failure: unknown): TenderError {
  * asked, and can answer a copy whose first was taken; they leave the outcome unknown:
  *
  * - `InvalidNonce`: the first copy used the nonce;
- * - `NotEnoughBalance`: the first copy spent what was there;
+ * - `NotEnoughBalance`: the signer's balance is the chain's state at that moment, not part of the
+ *   signed bytes: another spend, or the gas price, can change it between two copies;
  * - `TransactionExpired`: the first copy landed in time, and the copy came after the reference
  *   block had expired;
  * - `ShardCongested` and `ShardStuck`: the receiver's shard at that moment;
@@ -364,6 +365,7 @@ export function toTxResult(resp: FinalTxOutcome, contractId: string): TxResult {
  * nonce, up to 10 times, and then once more by the queue after 500 ms. That happens when another
  * process signs with the same key, which nothing coordinates, and when another client of the
  * account has sent since this one last did, since each client keeps its own count of the nonce.
+ * `transfer` is the one exception: it is never signed twice (see there).
  */
 export class TenderClient {
   readonly network: NetworkId;
@@ -505,8 +507,18 @@ export class TenderClient {
    * `send`, with `sendTimeoutMs`. A transfer that failed on chain throws a `TenderError` with the
    * hash; one the node answered with an error (not enough NEAR, a bad nonce) throws as near-api-js
    * throws it, and one that ran out of time throws `E_TIMEOUT`, and may still land. `sendRefused`
-   * says which errors mean, for certain, that it will not run: a wrong nonce or a lack of NEAR can
-   * answer a second copy of a transfer whose first already ran.
+   * says which errors mean, for certain, that it will not run: a wrong nonce can answer a second
+   * copy of a transfer whose first already ran, and a lack of NEAR is the chain's state at that
+   * moment, not part of the signed bytes.
+   *
+   * It is signed once. near-api-js 7.4.0's `signAndSendTransaction` answers an `InvalidNonce` by
+   * signing a new transaction with a new nonce, up to `retries` times (10 unless set), and
+   * `defaultQueue` does it once more; both are turned off here (`retries: 0`, `retryOnNonce:
+   * false`). An `InvalidNonce` can answer a resent copy of a transfer that was taken, and a new
+   * signature would then be a second transfer of the same NEAR. So an `InvalidNonce` is thrown,
+   * as an outcome not known (`sendRefused` is false for it), and the caller decides. Only the
+   * resends of the same signed bytes that near-api-js makes after an HTTP 408, 500 or 503 are
+   * left, and those can run at most once.
    */
   async transfer(receiverId: string, amount: bigint): Promise<TxResult> {
     const account = this.account;
@@ -514,21 +526,28 @@ export class TenderClient {
       throw new Error("this TenderClient has no signer, so it cannot send transactions");
     }
     if (amount <= 0n) throw new RangeError("TenderClient.transfer: amount must be above 0");
-    return defaultQueue.run(account.accountId, async () => {
-      const resp = await withDeadline(
-        "TenderClient.transfer",
-        this.sendTimeoutMs,
-        () =>
-          account.signAndSendTransaction({
-            receiverId,
-            actions: [actions.transfer(amount)],
-            waitUntil: "EXECUTED",
-            throwOnFailure: false,
-          }),
-        SEND_MAY_STILL_LAND,
-      );
-      return toTxResult(resp, this.contractId);
-    });
+    return defaultQueue.run(
+      account.accountId,
+      async () => {
+        const resp = await withDeadline(
+          "TenderClient.transfer",
+          this.sendTimeoutMs,
+          () =>
+            account.signAndSendTransaction({
+              receiverId,
+              actions: [actions.transfer(amount)],
+              waitUntil: "EXECUTED",
+              throwOnFailure: false,
+              // Signed once: near-api-js would sign a new transfer for each `InvalidNonce`.
+              retries: 0,
+            }),
+          SEND_MAY_STILL_LAND,
+        );
+        return toTxResult(resp, this.contractId);
+      },
+      // Nor does the queue sign it again on a nonce collision.
+      { retryOnNonce: false },
+    );
   }
 
   /** A signed transaction as `SignedTx`: its reference block's height is asked of the node. */

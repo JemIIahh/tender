@@ -49,10 +49,12 @@ export class KeyQueue {
    * Calls `fn` once every call queued under `key` before it has settled, and returns what `fn`
    * returns or throws. A failure does not hold up the calls after it. If `fn` fails with a nonce
    * collision, it is called once more after 500 ms, before the next call of the key starts; a
-   * second collision is thrown.
+   * second collision is thrown. With `retryOnNonce: false` it is called once whatever it throws,
+   * for a send that must never be signed twice (`TenderClient.transfer`).
    */
-  run<T>(key: string, fn: () => Promise<T>): Promise<T> {
-    const result = (this.tails.get(key) ?? Promise.resolve()).then(() => withOneRetry(fn));
+  run<T>(key: string, fn: () => Promise<T>, options: { retryOnNonce?: boolean } = {}): Promise<T> {
+    const call = options.retryOnNonce === false ? fn : () => withOneRetry(fn);
+    const result = (this.tails.get(key) ?? Promise.resolve()).then(call);
     const tail = result.then(
       () => undefined,
       () => undefined,

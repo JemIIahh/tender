@@ -171,6 +171,23 @@ describe("KeyQueue", () => {
       expect(order).toEqual(["first", "first again", "second"]);
     });
 
+    test("with_retry_on_nonce_off_a_collision_is_thrown_at_once_and_the_key_goes_on", async () => {
+      // For a send that must never be signed twice: `TenderClient.transfer`.
+      const queue = new KeyQueue();
+      const collision = nearApiCollision();
+      const fn = vi
+        .fn<() => Promise<string>>()
+        .mockRejectedValueOnce(collision)
+        .mockResolvedValue("a second transfer");
+      const result = queue.run("alice", fn, { retryOnNonce: false });
+      const thrown = expect(result).rejects.toBe(collision);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await thrown;
+      expect(fn).toHaveBeenCalledTimes(1);
+      // The key is free for the next call, which keeps the default.
+      await expect(queue.run("alice", fn)).resolves.toBe("a second transfer");
+    });
+
     test.each([
       ["InvalidNonceError of another near-api-js copy", otherCopyCollision],
       ["final outcome whose failure is InvalidNonce", outcomeCollision],
