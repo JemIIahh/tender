@@ -1,6 +1,8 @@
 import { bytesToHex, hexToBytes } from "@tender/shared";
 import { Account, actions, JsonRpcProvider, KeyType, PublicKey, Signer } from "near-api-js";
+import { InvalidNonceError, TransactionExecutionError } from "near-api-js/rpc-errors";
 import { toBase64 } from "./base64";
+import { SendOutcomeUnknown } from "./sendOutcome";
 
 // The wallet of an email or Google login (lib/privy.ts): near-api-js builds each transaction and
 // each NEP-413 message, hashes it, and hands the hash to Privy to sign (`signRawHash`, chain type
@@ -16,6 +18,14 @@ import { toBase64 } from "./base64";
 // The account is an implicit account: its id is the 64 hex characters of its ed25519 public key,
 // so the key is read from the id and not asked of the chain, which has no such account until NEAR
 // is sent to it.
+//
+// A transaction is signed once and never again by itself. Privy signs a raw hash with no window to
+// approve it, so a second signature is a second transaction the person never saw: near-api-js's
+// own retry (on InvalidNonce it takes a new nonce and signs again) is turned off (`retries: 0`),
+// and a send that fails after the signature, in a way that leaves open whether the network took
+// it, is `SendOutcomeUnknown`: the page says it may still go through, and to look before trying
+// again. (The node client still resends the same signed bytes when a request fails; the network
+// runs a transaction at most once, so that can't spend twice.)
 
 /** Privy's signing of a raw hash, as its hook `useSignRawHash` gives it. */
 export type SignRawHash = (input: {
@@ -30,6 +40,8 @@ const SIGNATURE = /^0x[0-9a-fA-F]{128}$/;
 /** A near-api-js signer whose signatures are Privy's. */
 export class PrivySigner extends Signer {
   private readonly key: PublicKey;
+  /** How many signatures this signer has made: a send that fails after one may have gone out. */
+  signatures = 0;
 
   constructor(
     private readonly signRawHash: SignRawHash,
@@ -63,6 +75,7 @@ export class PrivySigner extends Signer {
     if (!this.key.verify(bytes, signed)) {
       throw new Error("the login signed with a key that is not this account's");
     }
+    this.signatures++;
     return signed;
   }
 }
@@ -92,6 +105,18 @@ function toNearAction(action: ConnectorAction) {
     default:
       throw new Error(`this wallet does not send ${String((action as { type?: unknown }).type)}`);
   }
+}
+
+/**
+ * Whether a send that threw after the transaction was signed may have been taken by the network.
+ * Only the node's refusal of the transaction itself says it was not (an invalid transaction, which
+ * is never run), with one exception: InvalidNonce, which a node also answers to a copy of a
+ * transaction that already got in. Anything else, a dropped or timed-out request among it, leaves
+ * it open.
+ */
+function mayHaveLanded(error: unknown): boolean {
+  if (error instanceof InvalidNonceError) return true;
+  return !(error instanceof TransactionExecutionError);
 }
 
 /** Whether a final outcome says the transaction failed. */
@@ -137,14 +162,25 @@ export function createPrivyWallet(plan: {
     async signAndSendTransactions({ transactions }) {
       const outcomes: unknown[] = [];
       for (const { receiverId, actions: wanted } of transactions) {
-        const outcome = await account.signAndSendTransaction({
-          receiverId,
-          actions: (wanted as ConnectorAction[]).map(toNearAction),
-          waitUntil: "FINAL",
-          // A failed transaction is an outcome with a `Failure`, which the store words by its
-          // error code, and not an exception.
-          throwOnFailure: false,
-        });
+        const signedBefore = signer.signatures;
+        let outcome: Awaited<ReturnType<typeof account.signAndSendTransaction>>;
+        try {
+          outcome = await account.signAndSendTransaction({
+            receiverId,
+            actions: (wanted as ConnectorAction[]).map(toNearAction),
+            waitUntil: "FINAL",
+            // A failed transaction is an outcome with a `Failure`, which the store words by its
+            // error code, and not an exception.
+            throwOnFailure: false,
+            // Never sign again by itself: see the head of this file.
+            retries: 0,
+          });
+        } catch (error) {
+          if (signer.signatures > signedBefore && mayHaveLanded(error)) {
+            throw new SendOutcomeUnknown(error);
+          }
+          throw error;
+        }
         outcomes.push(outcome);
         if (failed(outcome)) break;
       }

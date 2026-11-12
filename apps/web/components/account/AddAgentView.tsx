@@ -21,7 +21,12 @@ import { accountExists, accountKeyState } from "../../lib/rpc";
 import { useLoad } from "../../lib/useLoad";
 import { describeAmount, describeNear } from "../../lib/vault";
 import { useAccountActions, useWallet } from "../../lib/wallet";
-import { TransactionFailed, WalletError } from "../../lib/walletErrors";
+import {
+  SEND_MAY_STILL_GO_THROUGH,
+  sendOutcomeUnknown,
+  TransactionFailed,
+  WalletError,
+} from "../../lib/walletErrors";
 import { PageHead } from "../PageHead";
 import { FACT_LABEL, FIELD, NOTICE, PRIMARY, SECONDARY, TEXT_LINK } from "../ui";
 import { ConnectAgent } from "./ConnectAgent";
@@ -768,9 +773,11 @@ function ImplicitFlow({ watchEveryMs }: { watchEveryMs: number }) {
         message:
           error instanceof TransactionFailed
             ? "The transaction failed on the network. Check that your account holds the NEAR and the bond before you try again."
-            : error instanceof WalletError
-              ? "The wallet didn't send it. Try again."
-              : "Something went wrong before anything was sent. Try once more.",
+            : sendOutcomeUnknown(error)
+              ? SEND_MAY_STILL_GO_THROUGH
+              : error instanceof WalletError
+                ? "The wallet didn't send it. Try again."
+                : "Something went wrong before anything was sent. Try once more.",
       });
     } finally {
       busy.current = false;

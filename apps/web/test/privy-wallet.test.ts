@@ -11,7 +11,13 @@ import { KeyPair, KeyType, PublicKey } from "near-api-js";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createPrivyWallet, type SignRawHash } from "../lib/privyWallet";
 import { createWalletStore } from "../lib/wallet";
-import { TransactionFailed } from "../lib/walletErrors";
+import {
+  SEND_MAY_STILL_GO_THROUGH,
+  SendOutcomeUnknown,
+  TransactionFailed,
+  WalletError,
+  walletErrorMessage,
+} from "../lib/walletErrors";
 import { FakeChain, FakeNode, fakeFetch } from "./fakeChain";
 import { rejection } from "./support";
 import { fakeProvider } from "./walletDoubles";
@@ -165,4 +171,81 @@ test("a_signer_is_for_an_implicit_account_only", () => {
       rpcUrl: "http://rpc.test",
     }),
   ).toThrow(/implicit account/);
+});
+
+/**
+ * The node, but its first `send_tx` is answered with `answer`'s error (as a node answers InvalidNonce
+ * to a copy of a transaction that already got in), and every request after that as usual.
+ */
+function nodeRefusingFirstSend(answer: object) {
+  const sends: number[] = [];
+  const base = fakeFetch("http://rpc.test", node);
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body)) as { id: unknown; method: string };
+    if (request.method === "send_tx") {
+      sends.push(sends.length);
+      if (sends.length === 1) {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: answer }));
+      }
+    }
+    return base(input as string, init);
+  });
+  return sends;
+}
+
+const INVALID_NONCE = {
+  name: "HANDLER_ERROR",
+  cause: { name: "INVALID_TRANSACTION", info: {} },
+  data: { TxExecutionError: { InvalidTxError: { InvalidNonce: { ak_nonce: 5, tx_nonce: 5 } } } },
+};
+
+test("a_send_answered_invalid_nonce_is_signed_once_and_may_still_go_through", async () => {
+  chain.fundVault(ACCOUNT, TOKEN, 100n);
+  const sends = nodeRefusingFirstSend(INVALID_NONCE);
+  const { sign, hashes } = localSigner();
+  const store = createWalletStore(async () =>
+    fakeProvider({ wallet: walletOf(sign), accountId: ACCOUNT }, { connect: "session" }),
+  );
+  await store.connect();
+
+  const failure = await rejection(store.signAndSend([withdrawCall(CONTRACT, TOKEN, 5n)]));
+
+  // Signed once and sent once: near-api-js did not take a new nonce and sign again by itself.
+  expect(hashes).toHaveLength(1);
+  expect(sends).toHaveLength(1);
+  expect(failure).toBeInstanceOf(WalletError);
+  expect((failure as WalletError).cause).toBeInstanceOf(SendOutcomeUnknown);
+  // The person is told it may have gone through, and to look before sending it again.
+  expect(walletErrorMessage(failure)).toBe(SEND_MAY_STILL_GO_THROUGH);
+  expect(SEND_MAY_STILL_GO_THROUGH).toBe(
+    "The transaction may still go through. Check your account's activity before you try again.",
+  );
+});
+
+test("a_transaction_the_node_refuses_outright_is_not_an_unknown_outcome", async () => {
+  // Too little NEAR for the fees: the node never runs such a transaction.
+  nodeRefusingFirstSend({
+    name: "HANDLER_ERROR",
+    cause: { name: "INVALID_TRANSACTION", info: {} },
+    data: {
+      TxExecutionError: {
+        InvalidTxError: {
+          NotEnoughBalance: { signer_id: ACCOUNT, balance: "0", cost: "1" },
+        },
+      },
+    },
+  });
+  const { sign, hashes } = localSigner();
+  const failure = await rejection(
+    walletOf(sign).signAndSendTransactions({
+      transactions: [
+        {
+          receiverId: CONTRACT,
+          actions: [{ type: "Transfer", params: { deposit: "1" } }],
+        },
+      ],
+    }),
+  );
+  expect(hashes).toHaveLength(1);
+  expect(failure).not.toBeInstanceOf(SendOutcomeUnknown);
 });

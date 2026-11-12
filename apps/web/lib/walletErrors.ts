@@ -1,4 +1,5 @@
 import { errorMessage } from "./errors";
+import { SendOutcomeUnknown } from "./sendOutcome";
 
 // What can go wrong between this app and a wallet, as errors a page can tell apart. Each one's
 // `message` is for a developer's console and quotes nothing a wallet or the API chose; the words
@@ -108,6 +109,23 @@ export class WalletAccountMismatch extends Error {
   }
 }
 
+export { SendOutcomeUnknown };
+
+/**
+ * What a person is told when a transaction was signed and sent and its end is not known
+ * (`SendOutcomeUnknown`): it may still go through, so they look before they send it again.
+ */
+export const SEND_MAY_STILL_GO_THROUGH =
+  "The transaction may still go through. Check your account's activity before you try again.";
+
+/** Whether `error` is a send whose end is not known, as the wallet threw it or the store wrapped it. */
+export function sendOutcomeUnknown(error: unknown): boolean {
+  return (
+    error instanceof SendOutcomeUnknown ||
+    (error instanceof WalletError && error.cause instanceof SendOutcomeUnknown)
+  );
+}
+
 const WALLET_ACTION_WORDS: Record<WalletError["action"], string> = {
   connect: "Couldn't connect the wallet. Try again.",
   disconnect: "Couldn't disconnect the wallet. Try again.",
@@ -120,6 +138,7 @@ export function walletErrorMessage(error: unknown): string {
   if (error instanceof WalletCannotSign) return WALLET_CANNOT_SIGN_MESSAGE;
   if (error instanceof WalletNotConnected) return "Connect a wallet first.";
   if (error instanceof WalletUnavailable) return "This build has no wallet to connect.";
+  if (sendOutcomeUnknown(error)) return SEND_MAY_STILL_GO_THROUGH;
   if (error instanceof WalletError) return WALLET_ACTION_WORDS[error.action];
   if (error instanceof TransactionFailed) return "The transaction failed on the network.";
   if (error instanceof WalletResultUnreadable) {
