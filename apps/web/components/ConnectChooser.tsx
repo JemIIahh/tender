@@ -3,7 +3,12 @@
 import { type KeyboardEvent, useEffect, useId, useRef } from "react";
 import { type Chooser, chooser as pageChooser, useChooserState } from "../lib/chooser";
 import { config } from "../lib/config";
-import { GIFT_PROBLEM_WORDS, TESTNET_FAUCET_URL } from "../lib/gasGift";
+import {
+  GIFT_PROBLEM_WAYS,
+  GIFT_PROBLEM_WORDS,
+  type GiftProblem,
+  TESTNET_FAUCET_URL,
+} from "../lib/gasGift";
 import { shortId } from "../lib/tokens";
 import { CopyButton } from "./CopyButton";
 import { CARD, PANEL_TITLE, PRIMARY, SECONDARY } from "./ui";
@@ -11,7 +16,8 @@ import { CARD, PANEL_TITLE, PRIMARY, SECONDARY } from "./ui";
 // The Connect chooser, in a build with the email and Google login (lib/chooser.ts has the steps).
 // One big action, the login, and under it the NEAR wallets. After a login it shows the one line
 // "Getting your account ready…" while Tender sends the new account NEAR for its fees, and, if that
-// is refused or doesn't arrive, one line that says so, the faucet and a Try again.
+// is refused or doesn't arrive, one line that says so, with Try again where trying again can help
+// and the faucet, with the account to copy, where Tender won't send.
 //
 // It is a modal of the page's own: the focus goes into it and stays there, Escape and the backdrop
 // close it, and the focus goes back to where it was when it closes.
@@ -32,6 +38,74 @@ function trapTab(event: KeyboardEvent<HTMLDivElement>, panel: HTMLElement | null
     event.preventDefault();
     first.focus();
   }
+}
+
+/** What is in the way of the account's NEAR for fees, and the ways on. */
+function Stuck({
+  accountId,
+  problem,
+  firstRef,
+  onRetry,
+}: {
+  accountId: string;
+  problem: GiftProblem;
+  firstRef: (element: HTMLElement | null) => void;
+  onRetry: () => void;
+}) {
+  const ways = GIFT_PROBLEM_WAYS[problem];
+  // The faucet is testnet's; elsewhere the person is told to send the account some NEAR.
+  const faucetLink = ways.faucet && config.network === "testnet";
+  return (
+    <div className="grid gap-4">
+      <p role="status" data-testid="account-stuck" className="text-[15px] text-bone">
+        {GIFT_PROBLEM_WORDS[problem]}
+      </p>
+      {ways.faucet ? (
+        <div className="grid gap-2">
+          <p className="text-sm text-muted">
+            {faucetLink
+              ? "Get free testnet NEAR for this account at the faucet:"
+              : "Send this account a little NEAR to pay its fees:"}
+          </p>
+          <p className="flex min-w-0 items-center justify-between gap-2 rounded-xl border border-line bg-ink py-1 pr-1 pl-3">
+            <span
+              title={accountId}
+              data-testid="stuck-account"
+              className="min-w-0 truncate font-mono text-[13px] text-bone"
+            >
+              {shortId(accountId)}
+            </span>
+            <CopyButton value={accountId} label="Copy account" />
+          </p>
+        </div>
+      ) : null}
+      {faucetLink || ways.retry ? (
+        <div className="flex flex-wrap gap-2">
+          {faucetLink ? (
+            <a
+              ref={firstRef}
+              href={TESTNET_FAUCET_URL}
+              target="_blank"
+              rel="noreferrer"
+              className={PRIMARY}
+            >
+              Open the faucet
+            </a>
+          ) : null}
+          {ways.retry ? (
+            <button
+              ref={faucetLink ? undefined : firstRef}
+              type="button"
+              onClick={onRetry}
+              className={faucetLink ? SECONDARY : PRIMARY}
+            >
+              Try again
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 export function ConnectChooser({ store = pageChooser }: { store?: Chooser } = {}) {
@@ -150,49 +224,12 @@ export function ConnectChooser({ store = pageChooser }: { store?: Chooser } = {}
             Getting your account ready…
           </p>
         ) : (
-          <div className="grid gap-4">
-            <p role="status" data-testid="account-stuck" className="text-[15px] text-bone">
-              {GIFT_PROBLEM_WORDS[state.problem]}
-            </p>
-            <div className="grid gap-2">
-              <p className="text-sm text-muted">
-                {config.network === "testnet"
-                  ? "Get free testnet NEAR for this account at the faucet:"
-                  : "Send this account a little NEAR to pay its fees:"}
-              </p>
-              <p className="flex min-w-0 items-center justify-between gap-2 rounded-xl border border-line bg-ink py-1 pr-1 pl-3">
-                <span
-                  title={state.accountId}
-                  data-testid="stuck-account"
-                  className="min-w-0 truncate font-mono text-[13px] text-bone"
-                >
-                  {shortId(state.accountId)}
-                </span>
-                <CopyButton value={state.accountId} label="Copy account" />
-              </p>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {config.network === "testnet" ? (
-                <a
-                  ref={firstRef}
-                  href={TESTNET_FAUCET_URL}
-                  target="_blank"
-                  rel="noreferrer"
-                  className={PRIMARY}
-                >
-                  Open the faucet
-                </a>
-              ) : null}
-              <button
-                ref={config.network === "testnet" ? undefined : firstRef}
-                type="button"
-                onClick={() => void store.retry()}
-                className={SECONDARY}
-              >
-                Try again
-              </button>
-            </div>
-          </div>
+          <Stuck
+            accountId={state.accountId}
+            problem={state.problem}
+            firstRef={firstRef}
+            onRetry={() => void store.retry()}
+          />
         )}
       </div>
     </div>

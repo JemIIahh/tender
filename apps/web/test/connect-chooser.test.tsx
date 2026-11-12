@@ -131,11 +131,9 @@ test("after_a_login_it_says_getting_your_account_ready_until_the_near_arrives", 
   expect(world.asked).toEqual([`login-token ${ACCOUNT}`]);
 });
 
-test("a_refused_gift_says_so_in_one_line_with_the_faucet_and_the_account_to_copy", async () => {
-  let refuse = true;
+test("a_gift_switched_off_says_so_in_one_line_with_the_faucet_and_the_account_to_copy", async () => {
   const world = giftWorld([0n], async () => {
-    if (refuse) throw new ApiError(503, { error: "gift_off", message: "off" });
-    return { status: "not_needed", balance: GIFT.toString() };
+    throw new ApiError(503, { error: "gift_off", message: "off" });
   });
   const store = createChooser(() => world.deps);
   render(<ConnectChooser store={store} />);
@@ -152,11 +150,77 @@ test("a_refused_gift_says_so_in_one_line_with_the_faucet_and_the_account_to_copy
   expect(within(panel).getByTestId("stuck-account").getAttribute("title")).toBe(ACCOUNT);
   expect(within(panel).getByRole("button", { name: "Copy account" })).toBeTruthy();
   expect(document.activeElement).toBe(faucet);
+  // Trying again would get the same answer: there is no Try again.
+  expect(within(panel).queryByRole("button", { name: "Try again" })).toBeNull();
+});
 
-  // Try again, once the gift is on: ready, and the chooser closes.
-  refuse = false;
-  await userEvent.click(within(panel).getByRole("button", { name: "Try again" }));
+test("a_failure_of_ours_offers_the_faucet_and_try_again", async () => {
+  let fail = true;
+  const world = giftWorld([0n], async () => {
+    if (fail) throw new ApiError(400, { error: "bad_request", message: "x" });
+    return { status: "not_needed", balance: GIFT.toString() };
+  });
+  const store = createChooser(() => world.deps);
+  render(<ConnectChooser store={store} />);
+  await act(() => store.prepare(loginSession()));
+  expect(screen.getByTestId("account-stuck").textContent).toBe(
+    "Tender couldn't send NEAR for fees just now.",
+  );
+  expect(screen.getByRole("link", { name: "Open the faucet" })).toBeTruthy();
+  fail = false;
+  await userEvent.click(screen.getByRole("button", { name: "Try again" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+test("a_transfer_that_failed_says_couldn_t_send_yet_and_try_again_takes_near_that_arrived", async () => {
+  const balances = [0n];
+  const world = giftWorld(balances, async () => {
+    throw new ApiError(502, { error: "transfer_failed", message: "x" });
+  });
+  const store = createChooser(() => world.deps);
+  render(<ConnectChooser store={store} />);
+  await act(() => store.prepare(loginSession()));
+
+  expect(screen.getByTestId("account-stuck").textContent).toBe(
+    "Couldn't send yet. Try again in a moment.",
+  );
+  // Only Try again, as the one action: no faucet and no account to copy.
+  const again = screen.getByRole("button", { name: "Try again" });
+  expect(document.activeElement).toBe(again);
+  expect(screen.queryByRole("link", { name: "Open the faucet" })).toBeNull();
+  expect(screen.queryByTestId("stuck-account")).toBeNull();
+  expect(world.asked).toHaveLength(1);
+
+  // The transfer had timed out at the API and landed after all: Try again reads the balance first
+  // and the account is ready, without a second ask.
+  balances[0] = GIFT / 4n;
+  await userEvent.click(again);
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(world.asked).toHaveLength(1);
+});
+
+test("the_login_check_down_for_a_moment_and_too_many_tries_ask_to_try_again", async () => {
+  for (const [status, code, line] of [
+    [503, "unavailable", "Tender can't check your login right now. Try again in a moment."],
+    [429, "rate_limited", "Too many tries from here. Try again in a few minutes."],
+  ] as const) {
+    let down = true;
+    // Nothing at the first read and at Try again's; then the gift arrives.
+    const world = giftWorld([0n, 0n, GIFT], async () => {
+      if (down) throw new ApiError(status, { error: code, message: "x" });
+      return { status: "sent", amount: GIFT.toString(), tx_hash: "h" };
+    });
+    const store = createChooser(() => world.deps);
+    const { unmount } = render(<ConnectChooser store={store} />);
+    await act(() => store.prepare(loginSession()));
+    expect(screen.getByTestId("account-stuck").textContent, code).toBe(line);
+    expect(screen.queryByRole("link", { name: "Open the faucet" }), code).toBeNull();
+    down = false;
+    await userEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(screen.queryByRole("dialog"), code).toBeNull());
+    expect(world.asked, code).toHaveLength(2);
+    unmount();
+  }
 });
 
 test("each_problem_has_its_own_line_and_try_again_after_a_timeout_only_waits", async () => {
@@ -172,6 +236,9 @@ test("each_problem_has_its_own_line_and_try_again_after_a_timeout_only_waits", a
     const { unmount } = render(<ConnectChooser store={store} />);
     await act(() => store.prepare(loginSession()));
     expect(screen.getByTestId("account-stuck").textContent).toBe(line);
+    // Tender won't send today, or again: the faucet, and no Try again.
+    expect(screen.getByRole("link", { name: "Open the faucet" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
     unmount();
   }
 

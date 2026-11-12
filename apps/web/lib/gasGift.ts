@@ -4,8 +4,9 @@ import { ApiError, ErrorBodySchema, type GasGiftResponse } from "@tender/shared"
 // implicit NEAR account, which holds no NEAR and is not on the chain until someone sends it some,
 // and so can pay no fee. Right after the login the page reads its balance from the node; below
 // `GAS_GIFT_BELOW` it asks Tender's API for a little testnet NEAR (`POST /v1/gas-gift`, with the
-// login's access token), and reads the node again until the NEAR has arrived. A refusal, or a gift
-// that doesn't arrive in time, is told in one plain line, with the testnet faucet as the way on.
+// login's access token), and reads the node again until the NEAR has arrived. Anything in the way
+// is told in one plain line, with Try again where trying again can help, and the testnet faucet
+// where Tender will not send.
 
 /** Under this much NEAR, in yoctoNEAR, an account is given NEAR for its fees: 0.05 NEAR. */
 export const GAS_GIFT_BELOW = 50_000_000_000_000_000_000_000n;
@@ -18,22 +19,68 @@ export const GIFT_WAIT_MS = 60_000;
 export const GIFT_POLL_MS = 2_000;
 
 /**
- * Why an account is not ready: the API's three refusals, a gift that was sent and has not arrived
- * in time, and anything else that failed (the API or the node did not answer, or answered wrong).
+ * Why an account is not ready. From the route's error code (the `error` of its body, not the
+ * status alone, since 429 and 503 each carry two meanings):
+ *
+ * - `gift_off` (503): the gift is switched off. `daily_limit` (429): the day's cap is spent.
+ *   `already_given` (409): this login or account had its gift. Tender won't send: the faucet.
+ * - `rate_limited` (429): too many tries from this address. `unavailable` (503, with
+ *   Retry-After): the login check is down for a moment. Try again later, or shortly.
+ * - `transfer_failed` (502): the send didn't go through, or timed out and may still arrive.
+ * - `timeout`: a gift was sent and hasn't reached this page's node in `GIFT_WAIT_MS`.
+ * - `failed`: anything else: `bad_request` and `payload_too_large` (a fault of ours), a refused
+ *   token, no answer, a node that can't be read, a login with no token.
  */
-export type GiftProblem = "gift_off" | "daily_limit" | "already_given" | "timeout" | "failed";
+export type GiftProblem =
+  | "gift_off"
+  | "daily_limit"
+  | "already_given"
+  | "rate_limited"
+  | "unavailable"
+  | "transfer_failed"
+  | "timeout"
+  | "failed";
 
-export type Readiness = { status: "ready" } | { status: "stuck"; problem: GiftProblem };
+/**
+ * Not ready: the problem, and the balance the account had when the gift was asked for (null when
+ * it could not be read), so that a Try again knows whether NEAR arrived since.
+ */
+export type Readiness =
+  | { status: "ready" }
+  | { status: "stuck"; problem: GiftProblem; before: bigint | null };
 
-const REFUSALS: readonly GiftProblem[] = ["gift_off", "daily_limit", "already_given"];
+/** The codes of the route that are a problem of their own; any other is `failed`. */
+const CODED: readonly GiftProblem[] = [
+  "gift_off",
+  "daily_limit",
+  "already_given",
+  "rate_limited",
+  "unavailable",
+  "transfer_failed",
+];
 
 /** The one line for each problem. */
 export const GIFT_PROBLEM_WORDS: Record<GiftProblem, string> = {
   gift_off: "Tender isn't sending NEAR for fees right now.",
   daily_limit: "Tender has sent all the NEAR for fees it sends today.",
   already_given: "Tender has already sent this account NEAR for fees once.",
+  rate_limited: "Too many tries from here. Try again in a few minutes.",
+  unavailable: "Tender can't check your login right now. Try again in a moment.",
+  transfer_failed: "Couldn't send yet. Try again in a moment.",
   timeout: "The NEAR for fees hasn't arrived yet.",
   failed: "Tender couldn't send NEAR for fees just now.",
+};
+
+/** What the chooser offers for each problem: Try again, the faucet, or both. */
+export const GIFT_PROBLEM_WAYS: Record<GiftProblem, { retry: boolean; faucet: boolean }> = {
+  gift_off: { retry: false, faucet: true },
+  daily_limit: { retry: false, faucet: true },
+  already_given: { retry: false, faucet: true },
+  rate_limited: { retry: true, faucet: false },
+  unavailable: { retry: true, faucet: false },
+  transfer_failed: { retry: true, faucet: false },
+  timeout: { retry: true, faucet: false },
+  failed: { retry: true, faucet: true },
 };
 
 /** What the readiness check needs: the node, the login's token and the API, and a clock. */
@@ -46,13 +93,19 @@ export interface GiftDeps {
   now(): number;
 }
 
-/** The refusal in an API error's body, or `failed` for any other failure. */
+/** The problem an API error's body names, or `failed` for any other failure. */
 export function giftProblemOf(error: unknown): GiftProblem {
   if (!(error instanceof ApiError)) return "failed";
   const body = ErrorBodySchema.safeParse(error.body);
   const code = body.success ? body.data.error : null;
-  return REFUSALS.find((refusal) => refusal === code) ?? "failed";
+  return CODED.find((problem) => problem === code) ?? "failed";
 }
+
+const stuck = (problem: GiftProblem, before: bigint | null): Readiness => ({
+  status: "stuck",
+  problem,
+  before,
+});
 
 /**
  * Reads the node until `accountId` holds more than `before`, for at most `waitMs`. A read that
@@ -72,47 +125,61 @@ async function waitForArrival(
     } catch (error) {
       console.error(error);
     }
-    if (deps.now() + everyMs > until) return { status: "stuck", problem: "timeout" };
+    if (deps.now() + everyMs > until) return stuck("timeout", before);
     await deps.sleep(everyMs);
   }
 }
 
 /**
  * Makes `accountId` ready to pay fees, if it is not: reads its balance, asks for the gift when it is
- * under `GAS_GIFT_BELOW`, and waits for it to arrive. `waitOnly`: a gift was sent before and has
- * not arrived, so only the wait is done again (asking again would be `already_given`). Never
- * throws: what went wrong is the answer.
+ * under `GAS_GIFT_BELOW`, and waits for it to arrive. Never throws: what went wrong is the answer.
+ *
+ * `retrying`: what the last try came to, for Try again. Its balance is read first in every case;
+ * after a gift that was sent (`timeout`) or may have been (`transfer_failed`), NEAR that arrived
+ * since is the gift, and the account is ready. After a `timeout` it only waits again (asking again
+ * would be `already_given`); after anything else it asks again.
  */
 export async function getAccountReady(
   accountId: string,
   deps: GiftDeps,
-  options: { waitOnly?: boolean; waitMs?: number; everyMs?: number } = {},
+  options: {
+    retrying?: { problem: GiftProblem; before: bigint | null };
+    waitMs?: number;
+    everyMs?: number;
+  } = {},
 ): Promise<Readiness> {
   const waitMs = options.waitMs ?? GIFT_WAIT_MS;
   const everyMs = options.everyMs ?? GIFT_POLL_MS;
-  let before: bigint;
+  const last = options.retrying;
+  let now: bigint;
   try {
-    before = await deps.balanceOf(accountId);
+    now = await deps.balanceOf(accountId);
   } catch (error) {
     console.error(error);
-    return { status: "stuck", problem: "failed" };
+    return stuck("failed", last?.before ?? null);
   }
-  if (before >= GAS_GIFT_BELOW) return { status: "ready" };
-  if (options.waitOnly === true) return waitForArrival(accountId, before, deps, waitMs, everyMs);
+  if (now >= GAS_GIFT_BELOW) return { status: "ready" };
+  if (last !== undefined && last.before !== null) {
+    const mayHaveSent = last.problem === "timeout" || last.problem === "transfer_failed";
+    if (mayHaveSent && now > last.before) return { status: "ready" };
+    if (last.problem === "timeout") {
+      return waitForArrival(accountId, last.before, deps, waitMs, everyMs);
+    }
+  }
 
   let answer: GasGiftResponse;
   try {
     const token = await deps.loginToken();
-    if (token === null) return { status: "stuck", problem: "failed" };
+    if (token === null) return stuck("failed", now);
     answer = await deps.requestGift(token, accountId);
   } catch (error) {
-    // The words come from the refusal's code; the error itself is for a developer. It names no
-    // token: an `ApiError` keeps the body out of its message and its enumerable fields.
+    // The words come from the code; the error itself is for a developer. It names no token: an
+    // `ApiError` keeps the body out of its message and its enumerable fields.
     const problem = giftProblemOf(error);
     if (problem === "failed") console.error(error);
-    return { status: "stuck", problem };
+    return stuck(problem, now);
   }
   // The API read the account as holding enough: this page's node is a block or two behind it.
   if (answer.status === "not_needed") return { status: "ready" };
-  return waitForArrival(accountId, before, deps, waitMs, everyMs);
+  return waitForArrival(accountId, now, deps, waitMs, everyMs);
 }

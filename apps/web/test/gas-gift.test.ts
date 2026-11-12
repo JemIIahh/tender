@@ -1,7 +1,14 @@
 import { ApiError, type GasGiftResponse } from "@tender/shared";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { api } from "../lib/api";
-import { GAS_GIFT_BELOW, type GiftDeps, getAccountReady, giftProblemOf } from "../lib/gasGift";
+import {
+  GAS_GIFT_BELOW,
+  GIFT_PROBLEM_WAYS,
+  GIFT_PROBLEM_WORDS,
+  type GiftDeps,
+  getAccountReady,
+  giftProblemOf,
+} from "../lib/gasGift";
 import { nearBalanceOf } from "../lib/rpc";
 
 // Getting a new email-login account ready: its balance read from the node, the gift asked of the
@@ -74,11 +81,15 @@ test("not_needed_from_the_api_is_ready", async () => {
   expect(await getAccountReady(ACCOUNT, world)).toEqual({ status: "ready" });
 });
 
-test("each_refusal_of_the_api_is_its_own_problem", async () => {
+test("the_problem_comes_from_the_code_in_the_body_and_not_the_status_alone", async () => {
+  // 429 and 503 each carry two meanings; the code tells them apart.
   for (const [status, code] of [
     [503, "gift_off"],
+    [503, "unavailable"],
     [429, "daily_limit"],
+    [429, "rate_limited"],
     [409, "already_given"],
+    [502, "transfer_failed"],
   ] as const) {
     const { world } = deps([0n], async () => {
       throw refusal(status, code);
@@ -86,20 +97,73 @@ test("each_refusal_of_the_api_is_its_own_problem", async () => {
     expect(await getAccountReady(ACCOUNT, world), code).toEqual({
       status: "stuck",
       problem: code,
+      before: 0n,
     });
   }
-  // Anything else is a failure, said as one: a 502 from a transfer that failed, a 401, no answer.
+  // Anything else is a failure, said as one: our own bad request or body, a refused token, a
+  // status with no code, no answer at all.
   for (const thrown of [
-    refusal(502, "transfer_failed"),
+    refusal(400, "bad_request"),
+    refusal(413, "payload_too_large"),
     refusal(401, "unauthorized"),
+    new ApiError(503, "Service Unavailable"),
     new TypeError("Failed to fetch"),
   ]) {
     const { world } = deps([0n], async () => {
       throw thrown;
     });
-    expect(await getAccountReady(ACCOUNT, world)).toEqual({ status: "stuck", problem: "failed" });
+    expect(await getAccountReady(ACCOUNT, world)).toEqual({
+      status: "stuck",
+      problem: "failed",
+      before: 0n,
+    });
   }
   expect(giftProblemOf(new ApiError(429, "not json"))).toBe("failed");
+});
+
+test("each_problem_offers_try_again_where_it_can_help_and_the_faucet_where_tender_won_t_send", () => {
+  expect(GIFT_PROBLEM_WAYS).toEqual({
+    gift_off: { retry: false, faucet: true },
+    daily_limit: { retry: false, faucet: true },
+    already_given: { retry: false, faucet: true },
+    rate_limited: { retry: true, faucet: false },
+    unavailable: { retry: true, faucet: false },
+    transfer_failed: { retry: true, faucet: false },
+    timeout: { retry: true, faucet: false },
+    failed: { retry: true, faucet: true },
+  });
+  expect(GIFT_PROBLEM_WORDS.transfer_failed).toMatch(/^Couldn't send yet\./);
+});
+
+test("try_again_after_a_failed_transfer_reads_the_balance_first_and_takes_near_that_arrived", async () => {
+  // The transfer timed out at the API and landed after all: no second gift is asked for.
+  const landed = deps([GIFT / 4n], null);
+  expect(
+    await getAccountReady(ACCOUNT, landed.world, {
+      retrying: { problem: "transfer_failed", before: 0n },
+    }),
+  ).toEqual({ status: "ready" });
+  expect(landed.asked).toEqual([]);
+
+  // Nothing came: the gift is asked for again, and this time it is sent and arrives.
+  const again = deps([0n, 0n, GIFT]);
+  expect(
+    await getAccountReady(ACCOUNT, again.world, {
+      retrying: { problem: "transfer_failed", before: 0n },
+    }),
+  ).toEqual({ status: "ready" });
+  expect(again.asked).toEqual([{ token: TOKEN, account: ACCOUNT }]);
+});
+
+test("try_again_after_unavailable_or_rate_limited_asks_again", async () => {
+  for (const problem of ["unavailable", "rate_limited"] as const) {
+    const world = deps([0n, GIFT]);
+    expect(
+      await getAccountReady(ACCOUNT, world.world, { retrying: { problem, before: 0n } }),
+      problem,
+    ).toEqual({ status: "ready" });
+    expect(world.asked, problem).toHaveLength(1);
+  }
 });
 
 test("a_gift_that_does_not_arrive_in_time_is_a_timeout_and_try_again_only_waits", async () => {
@@ -107,16 +171,22 @@ test("a_gift_that_does_not_arrive_in_time_is_a_timeout_and_try_again_only_waits"
   expect(await getAccountReady(ACCOUNT, world, { waitMs: 10_000, everyMs: 2000 })).toEqual({
     status: "stuck",
     problem: "timeout",
+    before: 0n,
   });
   expect(elapsed()).toBeLessThanOrEqual(10_000);
   expect(asked).toHaveLength(1);
 
-  // Try again after a timeout reads the node again and does not ask for a second gift.
-  const later = deps([0n, GIFT], null);
-  expect(await getAccountReady(ACCOUNT, later.world, { waitOnly: true })).toEqual({
-    status: "ready",
-  });
+  // Try again after a timeout reads the node again and does not ask for a second gift: it waits.
+  const later = deps([0n, 0n, GIFT], null);
+  expect(
+    await getAccountReady(ACCOUNT, later.world, { retrying: { problem: "timeout", before: 0n } }),
+  ).toEqual({ status: "ready" });
   expect(later.asked).toEqual([]);
+  // A gift smaller than the line still counts once it has arrived.
+  const small = deps([GIFT / 4n], null);
+  expect(
+    await getAccountReady(ACCOUNT, small.world, { retrying: { problem: "timeout", before: 0n } }),
+  ).toEqual({ status: "ready" });
 });
 
 test("a_node_that_cannot_be_read_or_a_login_with_no_token_is_a_failure", async () => {
@@ -127,6 +197,7 @@ test("a_node_that_cannot_be_read_or_a_login_with_no_token_is_a_failure", async (
   expect(await getAccountReady(ACCOUNT, broken.world)).toEqual({
     status: "stuck",
     problem: "failed",
+    before: null,
   });
 
   const loggedOut = deps([0n], null);
@@ -134,6 +205,7 @@ test("a_node_that_cannot_be_read_or_a_login_with_no_token_is_a_failure", async (
   expect(await getAccountReady(ACCOUNT, loggedOut.world)).toEqual({
     status: "stuck",
     problem: "failed",
+    before: 0n,
   });
   expect(loggedOut.asked).toEqual([]);
 });

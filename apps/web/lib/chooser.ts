@@ -10,13 +10,13 @@ import type { Session } from "./wallet";
 // store opens the chooser, and closes it once a way is picked, so that the login's window or the
 // wallet's list is what shows next and nothing of ours is in front of it. After a login, it opens
 // again to get the account ready (lib/gasGift.ts): "Getting your account ready…", then nothing
-// (it closes), or one line that says what is in the way, with the faucet and a Try again.
+// (it closes), or one line that says what is in the way, with a Try again or the faucet or both.
 
 export type ChooserState =
   | { step: "closed" }
   | { step: "choose" }
   | { step: "preparing"; accountId: string }
-  | { step: "stuck"; accountId: string; problem: GiftProblem };
+  | { step: "stuck"; accountId: string; problem: GiftProblem; before: bigint | null };
 
 const CLOSED: ChooserState = { step: "closed" };
 
@@ -49,25 +49,35 @@ export function createChooser(makeDeps: (session: Readied) => GiftDeps) {
   let release: (() => void) | null = null;
 
   /** Runs the check and shows it. Resolves when it is done, or when the person closes it. */
-  function check(session: Readied, waitOnly: boolean): Promise<void> {
+  function check(
+    session: Readied,
+    retrying?: { problem: GiftProblem; before: bigint | null },
+  ): Promise<void> {
     const mine = ++run;
     readying = session;
     set({ step: "preparing", accountId: session.accountId });
     return new Promise((resolve) => {
       release = resolve;
-      void getAccountReady(session.accountId, makeDeps(session), { waitOnly }).then(
-        (readiness: Readiness) => {
-          if (mine === run) {
-            if (readiness.status === "ready") {
-              readying = null;
-              set(CLOSED);
-            } else {
-              set({ step: "stuck", accountId: session.accountId, problem: readiness.problem });
-            }
+      void getAccountReady(
+        session.accountId,
+        makeDeps(session),
+        retrying === undefined ? {} : { retrying },
+      ).then((readiness: Readiness) => {
+        if (mine === run) {
+          if (readiness.status === "ready") {
+            readying = null;
+            set(CLOSED);
+          } else {
+            set({
+              step: "stuck",
+              accountId: session.accountId,
+              problem: readiness.problem,
+              before: readiness.before,
+            });
           }
-          resolve();
-        },
-      );
+        }
+        resolve();
+      });
     });
   }
 
@@ -106,13 +116,17 @@ export function createChooser(makeDeps: (session: Readied) => GiftDeps) {
      * closes) or stuck (it stays open, saying why); never rejects.
      */
     prepare(session: Readied): Promise<void> {
-      return check(session, false);
+      return check(session);
     },
 
-    /** Try again, from a stuck chooser: a gift that was sent is waited for, and not asked again. */
+    /**
+     * Try again, from a stuck chooser that offers it: the balance first (NEAR that arrived after a
+     * gift that was sent, or may have been, is that gift), then a wait or a new ask, as
+     * `getAccountReady` says.
+     */
     retry(): Promise<void> {
       if (state.step !== "stuck" || readying === null) return Promise.resolve();
-      return check(readying, state.problem === "timeout");
+      return check(readying, { problem: state.problem, before: state.before });
     },
 
     /** The person closed the chooser. A question is answered with null. */
