@@ -1,6 +1,7 @@
 import type { KeyPermission } from "@tender/client";
 import type { Db } from "@tender/db";
 import type { ConfigView, NetworkId, StorageView } from "@tender/shared";
+import type { JWTVerifyGetKey } from "jose";
 import type { RateLimits } from "./limits";
 
 /**
@@ -29,20 +30,32 @@ export interface ChainReader {
 /**
  * The gas gift (`POST /v1/gas-gift`, `routes/gas-gift.ts`): a little testnet NEAR from the team's
  * gift account to an implicit account that an email login made, so that it can pay its first fees.
- * The caller makes it from `GAS_GIFT_*` and `PRIVY_*`, and leaves it out when they are not all set;
- * the route then answers every call with 503 `gift_off`, as it does on mainnet whatever this holds.
+ * The caller makes it from `GAS_GIFT_*` and `PRIVY_*`, and leaves it out when those it needs are not
+ * all set; the route then answers every call with 503 `gift_off`, as it does on mainnet whatever this
+ * holds.
  * The chain parts are functions, so that a test passes fakes.
  */
 export interface GasGift {
   /** The account the NEAR comes from (`GAS_GIFT_ACCOUNT`), which holds only the gift pool. */
   account: string;
-  /** The login's app id (`PRIVY_APP_ID`): a token is good only with it as its audience. */
+  /**
+   * The login's app id (`PRIVY_APP_ID`): a token is good only with it as its audience, and it is
+   * checked with the keys Privy publishes for this app, at `privyJwksUrl` of it, unless one of the
+   * two below is given.
+   */
   privyAppId: string;
   /**
-   * The key the login's tokens are verified with (`PRIVY_VERIFICATION_KEY`): an ES256 public key
-   * as an SPKI PEM, with real line breaks or with `\n` escapes (`readPrivyKey`).
+   * Optional (`PRIVY_VERIFICATION_KEY`): the one key to check tokens with, in place of the
+   * published ones. An ES256 public key as an SPKI PEM, with real line breaks or with `\n` escapes
+   * (`readPrivyKey`). Empty counts as unset.
    */
-  privyVerificationKey: string;
+  privyVerificationKey?: string;
+  /**
+   * Optional, for tests: how the key of a token is found, in place of the app's published key set
+   * (as `jose`'s `createLocalJWKSet` or `createRemoteJWKSet` make one). `privyVerificationKey` wins
+   * over it.
+   */
+  privyKeys?: JWTVerifyGetKey;
   /** What each gift is, in yoctoNEAR (`GAS_GIFT_AMOUNT`). */
   amount: bigint;
   /** An account that holds this much already gets nothing (`GAS_GIFT_MIN_BALANCE`). */

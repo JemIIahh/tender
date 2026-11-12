@@ -1884,28 +1884,39 @@ const PRIVY_PEM = generateKeyPairSync("ec", { namedCurve: "prime256v1" })
   .trim();
 const GIFT_KEY = KeyPair.fromRandom("ed25519").toString();
 
-/** The gas gift's variables, with the key on one line as a host keeps it. */
+/** The gas gift's three variables: the login's tokens are then checked against its published keys. */
 const GIFT: Record<string, string> = {
   GAS_GIFT_ACCOUNT: "gift.tender-dev.testnet",
   GAS_GIFT_PRIVATE_KEY: GIFT_KEY,
   PRIVY_APP_ID: "cm0tenderapp0for0tests",
-  PRIVY_VERIFICATION_KEY: PRIVY_PEM.replaceAll("\n", "\\n"),
 };
 
 test("read_serve_config_reads_the_gas_gift_with_its_defaults", () => {
-  expect(readServeConfig({ ...GOOD, ...GIFT })).toMatchObject({
-    gasGift: {
-      accountId: "gift.tender-dev.testnet",
-      privateKey: GIFT_KEY,
-      privyAppId: "cm0tenderapp0for0tests",
-      // The escapes are line breaks again.
-      privyVerificationKey: PRIVY_PEM,
-      amount: 100_000_000_000_000_000_000_000n,
-      minBalance: 50_000_000_000_000_000_000_000n,
-      dailyCap: 2_000_000_000_000_000_000_000_000n,
-    },
-    warnings: [],
+  expect(readServeConfig({ ...GOOD, ...GIFT })).toEqual(
+    expect.objectContaining({
+      gasGift: {
+        accountId: "gift.tender-dev.testnet",
+        privateKey: GIFT_KEY,
+        privyAppId: "cm0tenderapp0for0tests",
+        // None: the keys Privy publishes for the app.
+        privyVerificationKey: undefined,
+        amount: 100_000_000_000_000_000_000_000n,
+        minBalance: 50_000_000_000_000_000_000_000n,
+        dailyCap: 2_000_000_000_000_000_000_000_000n,
+      },
+      warnings: [],
+    }),
+  );
+  // A verification key, on one line as a host keeps it: the escapes are line breaks again.
+  const escaped = readServeConfig({
+    ...GOOD,
+    ...GIFT,
+    PRIVY_VERIFICATION_KEY: PRIVY_PEM.replaceAll("\n", "\\n"),
   });
+  expect(escaped.gasGift?.privyVerificationKey).toBe(PRIVY_PEM);
+  // Set to nothing, it is unset: the published keys.
+  const empty = readServeConfig({ ...GOOD, ...GIFT, PRIVY_VERIFICATION_KEY: "" });
+  expect(empty.gasGift).toMatchObject({ privyVerificationKey: undefined });
   // The key with real line breaks, and amounts of the owner's own.
   const own = readServeConfig({
     ...GOOD,
@@ -1943,12 +1954,7 @@ test("read_serve_config_reads_the_gas_gift_with_its_defaults", () => {
 });
 
 test("read_serve_config_says_which_gas_gift_variables_are_missing", () => {
-  for (const missing of [
-    "GAS_GIFT_ACCOUNT",
-    "GAS_GIFT_PRIVATE_KEY",
-    "PRIVY_APP_ID",
-    "PRIVY_VERIFICATION_KEY",
-  ]) {
+  for (const missing of ["GAS_GIFT_ACCOUNT", "GAS_GIFT_PRIVATE_KEY", "PRIVY_APP_ID"]) {
     const config = readServeConfig({ ...GOOD, ...GIFT, [missing]: "" });
     expect(config.gasGift, missing).toBeUndefined();
     expect(config.warnings, missing).toEqual([
@@ -1958,8 +1964,92 @@ test("read_serve_config_says_which_gas_gift_variables_are_missing", () => {
   const amountOnly = readServeConfig({ ...GOOD, GAS_GIFT_AMOUNT: "1" });
   expect(amountOnly.gasGift).toBeUndefined();
   expect(amountOnly.warnings).toEqual([
-    "GAS_GIFT_ACCOUNT, GAS_GIFT_PRIVATE_KEY, PRIVY_APP_ID and PRIVY_VERIFICATION_KEY are not " +
-      "set, so the gas gift is off (POST /v1/gas-gift answers 503 gift_off)",
+    "GAS_GIFT_ACCOUNT, GAS_GIFT_PRIVATE_KEY and PRIVY_APP_ID are not set, so the gas gift is " +
+      "off (POST /v1/gas-gift answers 503 gift_off)",
+  ]);
+});
+
+test("serve_reads_the_gas_gift_from_an_env_file_as_the_owner_writes_it", async () => {
+  // The env file of the services, read by the loader `pnpm serve` uses (`serveEnv`, from the
+  // directory TENDER_ENV_DIR names): the verification key as the login's dashboard shows it, a PEM
+  // with real line breaks inside double quotes, and variables that are there with nothing after
+  // them, which are unset.
+  const dir = await mkdtemp(join(tmpdir(), "tender-serve-gift-env-"));
+  dirs.push(dir);
+  const read = async (lines: string[]) => {
+    await writeFile(join(dir, ".env"), `${lines.join("\n")}\n`);
+    return readServeConfig(serveEnv({ TENDER_NETWORK: "testnet" }, dir));
+  };
+  const base = Object.entries(GOOD)
+    .filter(([key]) => key !== "TENDER_NETWORK")
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`);
+
+  const quoted = await read([
+    ...base,
+    `GAS_GIFT_ACCOUNT=${GIFT.GAS_GIFT_ACCOUNT}`,
+    `GAS_GIFT_PRIVATE_KEY=${GIFT_KEY}`,
+    `PRIVY_APP_ID=${GIFT.PRIVY_APP_ID}`,
+    `PRIVY_VERIFICATION_KEY="${PRIVY_PEM}"`,
+    "GAS_GIFT_AMOUNT=",
+    "GAS_GIFT_DAILY_CAP=",
+  ]);
+  expect(PRIVY_PEM.split("\n").length).toBeGreaterThan(2);
+  expect(quoted.gasGift).toMatchObject({
+    privyVerificationKey: PRIVY_PEM,
+    amount: 100_000_000_000_000_000_000_000n,
+    dailyCap: 2_000_000_000_000_000_000_000_000n,
+  });
+  expect(quoted.warnings).toEqual([]);
+
+  // On one line with \n, quoted or not, and with Windows line ends.
+  for (const line of [
+    `PRIVY_VERIFICATION_KEY="${PRIVY_PEM.replaceAll("\n", "\\n")}"`,
+    `PRIVY_VERIFICATION_KEY=${PRIVY_PEM.replaceAll("\n", "\\n")}`,
+  ]) {
+    const oneLine = await read([
+      ...base,
+      ...Object.entries(GIFT).map(([k, v]) => `${k}=${v}`),
+      line,
+    ]);
+    expect(oneLine.gasGift?.privyVerificationKey, line.slice(0, 30)).toBe(PRIVY_PEM);
+  }
+  await writeFile(
+    join(dir, ".env"),
+    [
+      ...base,
+      ...Object.entries(GIFT).map(([k, v]) => `${k}=${v}`),
+      `PRIVY_VERIFICATION_KEY="${PRIVY_PEM}"`,
+    ]
+      .join("\r\n")
+      .replaceAll("\n", "\r\n")
+      .replaceAll("\r\r", "\r"),
+  );
+  expect(readServeConfig(serveEnv({ TENDER_NETWORK: "testnet" }, dir)).gasGift).toMatchObject({
+    privyVerificationKey: PRIVY_PEM,
+  });
+
+  // The owner's file as it is today: every gift variable there, with nothing after it. The gift is
+  // off, nothing is said, and the services start.
+  const blank = await read([
+    ...base,
+    "GAS_GIFT_ACCOUNT=",
+    "GAS_GIFT_PRIVATE_KEY=",
+    "PRIVY_APP_ID=",
+    "PRIVY_VERIFICATION_KEY=",
+  ]);
+  expect(blank.gasGift).toBeUndefined();
+  expect(blank.warnings).toEqual([]);
+  // Some filled in and the app id not yet: off, with a warning that names it, and no refusal.
+  const partial = await read([
+    ...base,
+    `GAS_GIFT_ACCOUNT=${GIFT.GAS_GIFT_ACCOUNT}`,
+    `GAS_GIFT_PRIVATE_KEY=${GIFT_KEY}`,
+    "PRIVY_APP_ID=",
+    "PRIVY_VERIFICATION_KEY=",
+  ]);
+  expect(partial.gasGift).toBeUndefined();
+  expect(partial.warnings).toEqual([
+    "PRIVY_APP_ID is not set, so the gas gift is off (POST /v1/gas-gift answers 503 gift_off)",
   ]);
 });
 

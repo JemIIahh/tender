@@ -1,16 +1,36 @@
 import { generateKeyPairSync } from "node:crypto";
+import { createServer, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { GasGiftResponseSchema } from "@tender/shared";
-import { type CryptoKey, exportSPKI, generateKeyPair, SignJWT } from "jose";
+import {
+  type CryptoKey,
+  createLocalJWKSet,
+  createRemoteJWKSet,
+  exportJWK,
+  exportSPKI,
+  generateKeyPair,
+  type JWK,
+  SignJWT,
+} from "jose";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import type { GasGift } from "../src/deps";
-import { type ApiDeps, createApp, type ErrorBody, PRIVY_ISSUER, readPrivyKey } from "../src/index";
+import {
+  type ApiDeps,
+  createApp,
+  type ErrorBody,
+  PRIVY_ISSUER,
+  privyJwksUrl,
+  readPrivyKey,
+} from "../src/index";
 import { resetDb, TEST_NOW, testDeps } from "./helpers";
 
 // `POST /v1/gas-gift`: the login's token, the account, the once-per-login-and-per-account rule, the
 // daily cap, the claim that two calls at once cannot both win, and a failed transfer letting its
-// claim go. The key pair the login signs with is made here, as `jose` makes one, and the chain is
-// a fake: what an account holds is a map, and a transfer is a function the test controls.
-// `scripts/serve.sandbox.test.ts` sends a real gift on a local chain.
+// claim go. The key pair the login signs with is made here, as `jose` makes one, and the key set
+// the route checks tokens against is a local one of it (`privyKeys`), or one served by a small HTTP
+// server of the test's own: Privy is never called. The chain is a fake: what an account holds is a
+// map, and a transfer is a function the test controls. `scripts/serve.sandbox.test.ts` sends a real
+// gift on a local chain.
 
 const SECOND_NS = 1_000_000_000n;
 const DAY_NS = 24n * 60n * 60n * SECOND_NS;
@@ -27,6 +47,10 @@ let deps: ApiDeps;
 let nowNs = TEST_NOW;
 let signingKey: CryptoKey;
 let pem: string;
+/** The public half of `signingKey`, as the app's key set lists it. */
+let publicJwk: JWK;
+/** The `kid` of `signingKey` in the key set. */
+const KID = "key-one";
 /** What each account holds, for the fake chain; an account not in it holds nothing. */
 const balances = new Map<string, bigint>();
 /** Every transfer the fake chain was asked for, in order. */
@@ -37,6 +61,7 @@ beforeAll(async () => {
   const pair = await generateKeyPair("ES256", { extractable: true });
   signingKey = pair.privateKey;
   pem = await exportSPKI(pair.publicKey);
+  publicJwk = { ...(await exportJWK(pair.publicKey)), kid: KID, alg: "ES256", use: "sig" };
 });
 
 afterAll(() => deps.db.close());
@@ -57,7 +82,7 @@ function giftWith(over: Partial<GasGift> = {}): GasGift {
   return {
     account: "gift.testnet",
     privyAppId: APP_ID,
-    privyVerificationKey: pem,
+    privyKeys: createLocalJWKSet({ keys: [publicJwk] }),
     amount: AMOUNT,
     minBalance: MIN_BALANCE,
     dailyCap: 2n * NEAR,
@@ -86,10 +111,15 @@ async function tokenFor(
     iat?: number;
     exp?: number | null;
     key?: CryptoKey;
+    /** The `kid` in its header: `KID` unless given, and none for null. */
+    kid?: string | null;
   } = {},
 ): Promise<string> {
+  const kid = o.kid === undefined ? KID : o.kid;
   const jwt = new SignJWT({ sid: "session-for-tests" })
-    .setProtectedHeader({ alg: "ES256", typ: "JWT" })
+    .setProtectedHeader(
+      kid === null ? { alg: "ES256", typ: "JWT" } : { alg: "ES256", typ: "JWT", kid },
+    )
     .setIssuer(o.iss ?? PRIVY_ISSUER)
     .setAudience(o.aud ?? APP_ID)
     .setIssuedAt(o.iat ?? nowSeconds() - 60);
@@ -162,6 +192,7 @@ test("every_fault_of_the_token_is_the_same_401_and_sends_nothing", async () => {
     ["another scheme", `Basic ${Buffer.from("a:b").toString("base64")}`],
     ["not a JWT", "Bearer not-a-token"],
     ["a bad signature", `Bearer ${await tokenFor({ key: other.privateKey })}`],
+    ["a kid the key set does not have", `Bearer ${await tokenFor({ kid: "key-unknown" })}`],
     ["a wrong audience", `Bearer ${await tokenFor({ aud: "another-app" })}`],
     ["a wrong issuer", `Bearer ${await tokenFor({ iss: "auth.example" })}`],
     // Past the 30 s that the clocks may be apart.
@@ -352,7 +383,8 @@ test("the_gift_is_off_without_its_settings_and_on_mainnet", async () => {
     ["no gift", createApp({ ...deps, gasGift: undefined })],
     ["no account", appWith(giftWith({ account: "" }))],
     ["no app id", appWith(giftWith({ privyAppId: "" }))],
-    ["no key", appWith(giftWith({ privyVerificationKey: "" }))],
+    ["an app id of spaces", appWith(giftWith({ privyAppId: "  " }))],
+    // A verification key is not needed, but one that is set must be one.
     ["a key that is no PEM", appWith(giftWith({ privyVerificationKey: "not a key" }))],
     [
       "an RSA key",
@@ -493,4 +525,140 @@ test("the_route_takes_a_browser_call_from_the_web_app", async () => {
   expect(res.status).toBe(204);
   expect(res.headers.get("access-control-allow-origin")).toBe("https://tender.example");
   expect(res.headers.get("access-control-allow-headers")?.toLowerCase()).toContain("authorization");
+});
+
+// ---- The login's keys ---------------------------------------------------------------------------
+
+test("the_default_key_set_is_the_one_privy_publishes_for_the_app_fetched_once", async () => {
+  expect(privyJwksUrl(APP_ID)).toBe(
+    "https://auth.privy.io/api/v1/apps/tender-app-for-tests/jwks.json",
+  );
+  // No key set given and no key set: the route fetches the app's published one. The fetch is the
+  // test's, so nothing leaves the machine.
+  const fetched: string[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    fetched.push(input instanceof Request ? input.url : String(input));
+    return Response.json({ keys: [publicJwk] });
+  });
+  const app = appWith(giftWith({ privyKeys: undefined }));
+  expect((await ask(app, USER, ACCOUNT)).status).toBe(200);
+  expect((await ask(app, OTHER_USER, OTHER_ACCOUNT)).status).toBe(200);
+  // Kept for the next token: one fetch for both.
+  expect(fetched).toEqual([privyJwksUrl(APP_ID)]);
+});
+
+test("a_set_verification_key_is_used_in_place_of_the_key_set", async () => {
+  const keySet = vi.fn(async () => {
+    throw new Error("the key set must not be asked");
+  });
+  // On one line with escapes, as a host keeps it; a token with no kid is fine with one key.
+  const app = appWith(
+    giftWith({ privyVerificationKey: pem.trim().replaceAll("\n", "\\n"), privyKeys: keySet }),
+  );
+  expect((await post(app, `Bearer ${await tokenFor({ kid: null })}`)).status).toBe(200);
+  const other = await generateKeyPair("ES256");
+  expect((await post(app, `Bearer ${await tokenFor({ key: other.privateKey })}`)).status).toBe(401);
+  expect(keySet).not.toHaveBeenCalled();
+});
+
+test("an_empty_verification_key_is_unset_and_the_key_set_is_used", async () => {
+  for (const [what, key] of [
+    ["empty", ""],
+    ["spaces", "  "],
+  ]) {
+    await resetDb(deps.db);
+    const reply = await ask(appWith(giftWith({ privyVerificationKey: key })));
+    expect(reply.status, what).toBe(200);
+  }
+});
+
+test("a_token_without_a_kid_is_checked_against_each_key_that_fits", async () => {
+  // Privy publishes more than one key; a token that names none of them is tried with each.
+  const second = await generateKeyPair("ES256", { extractable: true });
+  const keys = [
+    { ...publicJwk, kid: undefined },
+    { ...(await exportJWK(second.publicKey)), alg: "ES256", use: "sig" },
+  ];
+  const app = appWith(giftWith({ privyKeys: createLocalJWKSet({ keys }) }));
+  const bySecond = await tokenFor({ kid: null, key: second.privateKey });
+  expect((await post(app, `Bearer ${bySecond}`)).status).toBe(200);
+  const other = await generateKeyPair("ES256");
+  const byNeither = await tokenFor({ kid: null, key: other.privateKey, sub: OTHER_USER });
+  expect((await post(app, `Bearer ${byNeither}`, { account_id: OTHER_ACCOUNT })).status).toBe(401);
+});
+
+/** HTTP servers of the tests' own, on ports the system picks, closed after each test. */
+const servers: Server[] = [];
+afterEach(async () => {
+  for (const server of servers.splice(0)) {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+/** A key set served at `/jwks.json` of a local server, as `answer` says, and the URL to it. */
+async function servedKeySet(answer: (res: ServerResponse) => void) {
+  const server = createServer((_req, res) => answer(res));
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return new URL(`http://127.0.0.1:${port}/jwks.json`);
+}
+
+test("a_key_set_that_cannot_be_fetched_is_a_503_and_not_a_401", async () => {
+  const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const token = await tokenFor();
+  const json = (status: number, body: string) => (res: ServerResponse) => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(body);
+  };
+  const closed = await servedKeySet(json(200, "{}"));
+  const gone = servers.pop();
+  gone?.closeAllConnections();
+  await new Promise((resolve) => gone?.close(resolve));
+  const cases: Array<[string, URL]> = [
+    ["an answer that is not 200", await servedKeySet(json(500, "{}"))],
+    ["an answer that is not JSON", await servedKeySet(json(200, "<html>"))],
+    ["JSON that is no key set", await servedKeySet(json(200, '{"keys": "none"}'))],
+    ["a server that is not there", closed],
+    ["a server that does not answer", await servedKeySet(() => undefined)],
+  ];
+  for (const [what, url] of cases) {
+    const keys = createRemoteJWKSet(url, { timeoutDuration: 300 });
+    const reply = await post<ErrorBody>(appWith(giftWith({ privyKeys: keys })), `Bearer ${token}`);
+    expect(reply.status, what).toBe(503);
+    expect(reply.body.error, what).toBe("unavailable");
+    expect(reply.headers.get("retry-after"), what).toBe("5");
+  }
+  expect(transfers).toEqual([]);
+  expect(await rows()).toEqual([]);
+  // Said by the kind of failure alone: never the token, and never the key set's address.
+  const logged = errors.mock.calls.map((call) => call.join(" ")).join("\n");
+  expect(logged).toContain("cannot fetch the login's key set");
+  expect(logged).not.toContain(token);
+  expect(logged).not.toContain("127.0.0.1");
+
+  // What is wrong with a token before any key is looked for is a 401 all the same.
+  const nowhere = createRemoteJWKSet(closed, { timeoutDuration: 300 });
+  const hmac = await new SignJWT({})
+    .setProtectedHeader({ alg: "HS256" })
+    .sign(new TextEncoder().encode("a shared secret of thirty-two bytes!"));
+  const app = appWith(giftWith({ privyKeys: nowhere }));
+  expect((await post(app, `Bearer ${hmac}`)).status).toBe(401);
+  expect((await post(app, "Bearer not-a-token")).status).toBe(401);
+});
+
+test("a_key_set_served_over_http_verifies_and_knows_no_other_kid", async () => {
+  let fetches = 0;
+  const url = await servedKeySet((res) => {
+    fetches += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ keys: [publicJwk] }));
+  });
+  const app = appWith(giftWith({ privyKeys: createRemoteJWKSet(url) }));
+  expect((await ask(app)).status).toBe(200);
+  // A kid the set does not have, just after a fetch: a token's fault, a 401, and no new fetch.
+  const unknown = await tokenFor({ kid: "key-unknown", sub: OTHER_USER });
+  expect((await post(app, `Bearer ${unknown}`, { account_id: OTHER_ACCOUNT })).status).toBe(401);
+  expect(fetches).toBe(1);
 });

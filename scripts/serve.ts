@@ -78,10 +78,11 @@ import { deploymentsDirOverride, envDir, loadEnv, readEnvFile } from "./lib/env"
  *              by long polling (TELEGRAM_MODE=polling, the default), or at POST /telegram/webhook
  *              (webhook), and the notifier sends the alerts
  *   gas gift   POST /v1/gas-gift sends a new email-login account a little testnet NEAR, when
- *              GAS_GIFT_ACCOUNT, GAS_GIFT_PRIVATE_KEY, PRIVY_APP_ID and PRIVY_VERIFICATION_KEY are
- *              all set, off mainnet only: any GAS_GIFT_* on mainnet is a refusal to start. Its key is
- *              the gift account's full-access key, the one such key a services host holds, which the
- *              chain is asked about first
+ *              GAS_GIFT_ACCOUNT, GAS_GIFT_PRIVATE_KEY and PRIVY_APP_ID are all set, off mainnet
+ *              only: any GAS_GIFT_* on mainnet is a refusal to start. The login's tokens are checked
+ *              against the keys Privy publishes for the app, or PRIVY_VERIFICATION_KEY when it is
+ *              set. Its key is the gift account's full-access key, the one such key a services host
+ *              holds, which the chain is asked about first
  *
  * The environment is checked before anything starts (`readServeConfig`), and every problem with
  * it is named in one error. On the first SIGTERM or SIGINT the command line stops everything
@@ -186,7 +187,7 @@ export interface ServeConfig {
   judge: JudgeConfig | undefined;
   /** The Telegram bot and the notifier, when `TELEGRAM_BOT_TOKEN` is set. */
   telegram: TelegramConfig | undefined;
-  /** The gas gift, when its four variables are set, off mainnet. */
+  /** The gas gift, when its three variables are set, off mainnet. */
   gasGift: GasGiftConfig | undefined;
   /** What the environment allows but is likely a mistake, one sentence each. */
   warnings: string[];
@@ -200,21 +201,20 @@ export interface GasGiftConfig {
   privateKey: string;
   /** `PRIVY_APP_ID`: the login's app, which its tokens must be for. */
   privyAppId: string;
-  /** `PRIVY_VERIFICATION_KEY`, as a PEM with real line breaks (`readPrivyKey`). */
-  privyVerificationKey: string;
+  /**
+   * `PRIVY_VERIFICATION_KEY`, as a PEM with real line breaks (`readPrivyKey`), when it is set: the
+   * one key the login's tokens are checked with. Unset, they are checked against the keys Privy
+   * publishes for the app.
+   */
+  privyVerificationKey: string | undefined;
   /** `GAS_GIFT_AMOUNT`, `GAS_GIFT_MIN_BALANCE` and `GAS_GIFT_DAILY_CAP`, in yoctoNEAR. */
   amount: bigint;
   minBalance: bigint;
   dailyCap: bigint;
 }
 
-/** The variables the gas gift needs, all four, before it is on. */
-const GAS_GIFT_REQUIRED = [
-  "GAS_GIFT_ACCOUNT",
-  "GAS_GIFT_PRIVATE_KEY",
-  "PRIVY_APP_ID",
-  "PRIVY_VERIFICATION_KEY",
-] as const;
+/** The variables the gas gift needs, all three, before it is on. */
+const GAS_GIFT_REQUIRED = ["GAS_GIFT_ACCOUNT", "GAS_GIFT_PRIVATE_KEY", "PRIVY_APP_ID"] as const;
 
 /** A Privy app id, as its dashboard shows one: letters and digits, and maybe `-` and `_`. */
 const PRIVY_APP_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -706,12 +706,15 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
  * `problems` and `warnings` as `readServeConfig` does, naming variables and quoting no value.
  *
  * - On mainnet, any `GAS_GIFT_*` that is set is a problem: the gift is for testnet NEAR only.
+ * - A variable that is set to nothing (`PRIVY_APP_ID=`) is unset, as everywhere in `serve`.
  * - With no `GAS_GIFT_*` set, the gift is off and nothing is said: `PRIVY_*` alone may be there for
  *   the web app's build.
- * - With some set, the gift is on only when `GAS_GIFT_ACCOUNT`, `GAS_GIFT_PRIVATE_KEY`,
- *   `PRIVY_APP_ID` and `PRIVY_VERIFICATION_KEY` all are; what is missing is a warning. What is set
- *   is checked: an account id; a private key; an app id; an ES256 public key in PEM, with real line
- *   breaks or `\n` escapes; and amounts in yoctoNEAR, the gift above 0 and the daily cap at least
+ * - With some set, the gift is on only when `GAS_GIFT_ACCOUNT`, `GAS_GIFT_PRIVATE_KEY` and
+ *   `PRIVY_APP_ID` all are; what is missing is a warning, and the services start without the gift.
+ *   `PRIVY_VERIFICATION_KEY` is optional: without it, the login's tokens are checked against the
+ *   keys Privy publishes for the app. What is set is checked: an account id; a private key; an app
+ *   id; an ES256 public key in PEM, with real line breaks (as a quoted value of an env file holds
+ *   them) or `\n` escapes; and amounts in yoctoNEAR, the gift above 0 and the daily cap at least
  *   one gift.
  * - The gift account's full-access key is on the host, so it must be an account of its own: not
  *   the contract's, the keeper's or the Judge's, and not one the contract is under (on testnet the
@@ -771,6 +774,7 @@ function readGasGift(
       "PRIVY_APP_ID must be the app id from the login's dashboard: letters, digits, - and _",
     );
   }
+  // Optional: unset, the route checks tokens against the keys Privy publishes for the app.
   const pemText = get("PRIVY_VERIFICATION_KEY");
   const pem = pemText === undefined ? undefined : readPrivyKey(pemText);
   if (pem === null) {
@@ -816,7 +820,6 @@ function readGasGift(
     accountId === undefined ||
     privateKey === undefined ||
     privyAppId === undefined ||
-    pem === undefined ||
     pem === null ||
     amount === undefined ||
     minBalance === undefined ||
@@ -1232,11 +1235,13 @@ function gasGiftOf(
   config: GasGiftConfig,
   reader: Pick<TenderClient, "nearBalanceOf">,
   sender: Pick<TenderClient, "transfer">,
+  privyKeys: GasGift["privyKeys"],
 ): GasGift {
   return {
     account: config.accountId,
     privyAppId: config.privyAppId,
     privyVerificationKey: config.privyVerificationKey,
+    privyKeys,
     amount: config.amount,
     minBalance: config.minBalance,
     dailyCap: config.dailyCap,
@@ -1279,6 +1284,11 @@ export interface ServeOptions {
    * trailing slash (grammY's `client.apiRoot`).
    */
   telegramApiRoot?: string;
+  /**
+   * For tests: how the gas gift finds the key of a login's token (`GasGift.privyKeys`), in place of
+   * fetching the keys Privy publishes for the app. `PRIVY_VERIFICATION_KEY` wins over it.
+   */
+  gasGiftKeys?: GasGift["privyKeys"];
 }
 
 export interface Services {
@@ -1657,7 +1667,7 @@ export async function startServices(
   const gasGift =
     config.gasGift === undefined
       ? undefined
-      : gasGiftOf(config.gasGift, client, signingAs(config.gasGift));
+      : gasGiftOf(config.gasGift, client, signingAs(config.gasGift), options.gasGiftKeys);
 
   // What ends the services after they are up (`Services.failed`). Before that it is thrown.
   const ending: { error?: Error; up: boolean } = { up: false };
@@ -1807,10 +1817,12 @@ export async function startServices(
     if (config.gasGift === undefined) {
       log("serve: gas gift off (GAS_GIFT_PRIVATE_KEY and the variables with it are not all set)");
     } else {
-      const { accountId, amount, dailyCap } = config.gasGift;
+      const { accountId, amount, dailyCap, privyVerificationKey } = config.gasGift;
+      const keys =
+        privyVerificationKey === undefined ? "the app's published keys" : "PRIVY_VERIFICATION_KEY";
       log(
         `serve: gas gift on, from ${accountId}: ${nearOf(amount)} NEAR to each new account, ` +
-          `${nearOf(dailyCap)} NEAR a day at most`,
+          `${nearOf(dailyCap)} NEAR a day at most; login tokens checked with ${keys}`,
       );
     }
 

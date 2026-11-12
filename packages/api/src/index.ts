@@ -44,6 +44,7 @@ export {
   DEFAULT_GAS_GIFT_DAILY_CAP,
   DEFAULT_GAS_GIFT_MIN_BALANCE,
   PRIVY_ISSUER,
+  privyJwksUrl,
   readPrivyKey,
 } from "./routes/gas-gift";
 export type { ApiServer, ApiServerOptions, FetchHandler } from "./server";

@@ -144,16 +144,16 @@ Rules:
 
 ### The gas gift
 
-On testnet, `POST /v1/gas-gift` sends an account that the web app's email login made a little testnet NEAR, so that it can pay its first fees. Such an account is an implicit one (64 hex characters, its public key): it is not on chain and can do nothing until NEAR reaches it, and the transfer creates it. Each login gets one gift and each account one, and all the gifts of a UTC day add up to a cap. The web app calls the route with the login's access token, which the API verifies with the login's verification key.
+On testnet, `POST /v1/gas-gift` sends an account that the web app's email login made a little testnet NEAR, so that it can pay its first fees. Such an account is an implicit one (64 hex characters, its public key): it is not on chain and can do nothing until NEAR reaches it, and the transfer creates it. Each login gets one gift and each account one, and all the gifts of a UTC day add up to a cap. The web app calls the route with the login's access token. The API checks it against the keys Privy publishes for the app (`https://auth.privy.io/api/v1/apps/<PRIVY_APP_ID>/jwks.json`), which it fetches when the first token comes and keeps for 10 minutes, and fetches again for a key it does not know, so a key Privy rotates in is found. The services host must be able to reach `auth.privy.io` over HTTPS.
 
-It is on only when the first four variables below are all set, and never on mainnet: `pnpm serve` refuses to start with any `GAS_GIFT_*` set there. With some of the four set and not all, it logs a `WARN serve:` line that names the missing ones, and the gift stays off.
+It is on only when the first three variables below are all set, and never on mainnet: `pnpm serve` refuses to start with any `GAS_GIFT_*` set there. A variable with nothing after its `=` counts as unset. With some of the three set and not all, `pnpm serve` logs a `WARN serve:` line that names the missing ones, starts, and leaves the gift off.
 
 | Variable | Value |
 |---|---|
 | `GAS_GIFT_ACCOUNT` | the gift account |
 | `GAS_GIFT_PRIVATE_KEY` | its full-access key, secret |
-| `PRIVY_APP_ID` | the login's app id, from the Privy dashboard |
-| `PRIVY_VERIFICATION_KEY` | the login's verification key, from the same dashboard: a PEM. On one line with `\n` for each line break works too |
+| `PRIVY_APP_ID` | the login's app id, from the Privy dashboard. Tokens are checked against the keys Privy publishes for it |
+| `PRIVY_VERIFICATION_KEY` | optional: the login's verification key, from the same dashboard, used in place of the published keys (nothing is fetched then, and a key Privy rotates in is not known until you change this). A PEM: in an env file, in double quotes with its line breaks as the dashboard shows it, or on one line with `\n` for each line break |
 | `GAS_GIFT_AMOUNT` | optional, yoctoNEAR per gift: 0.1 NEAR unless set |
 | `GAS_GIFT_MIN_BALANCE` | optional: an account that holds this much already gets nothing. 0.05 NEAR unless set |
 | `GAS_GIFT_DAILY_CAP` | optional, yoctoNEAR for all gifts of a UTC day: 2 NEAR (20 gifts) unless set |
@@ -163,8 +163,8 @@ It is on only when the first four variables below are all set, and never on main
 The owner's steps (each is the owner's call; the first spends testnet NEAR):
 
 1. Create a new testnet account for the gift, with a new full-access key, and send it a few testnet NEAR: 2 NEAR is a day of gifts at the defaults, plus a little for gas.
-2. In the host's settings, set `GAS_GIFT_ACCOUNT` to it and paste its private key into `GAS_GIFT_PRIVATE_KEY`. Never put the key in a file in the repository. Set `PRIVY_APP_ID` and `PRIVY_VERIFICATION_KEY` from the Privy dashboard.
-3. Restart the services. The log says `serve: gas gift on, from <account>: 0.1 NEAR to each new account, 2 NEAR a day at most`.
+2. In the host's settings, set `GAS_GIFT_ACCOUNT` to it and paste its private key into `GAS_GIFT_PRIVATE_KEY`. Never put the key in a file in the repository. Set `PRIVY_APP_ID` from the Privy dashboard.
+3. Restart the services. The log says `serve: gas gift on, from <account>: 0.1 NEAR to each new account, 2 NEAR a day at most; login tokens checked with the app's published keys` (or `with PRIVY_VERIFICATION_KEY` when that is set).
 
 To refill it, send more testnet NEAR to the gift account. Watch its balance (section 8): once it is too low, every gift answers 502 `transfer_failed`.
 
@@ -181,7 +181,7 @@ What the route answers:
 | 429 `rate_limited` | One address asked more than 30 times in 10 minutes |
 | 502 `transfer_failed` | The transfer did not go through: the gift account is short of NEAR, or the node refused it. The claim is let go, so asking again works |
 | 503 `gift_off` | The gift is not set up on this API, or this is mainnet |
-| 503 `unavailable` | The node could not say what the account holds. `Retry-After: 5` |
+| 503 `unavailable` | The login's published keys could not be fetched, or the node could not say what the account holds. `Retry-After: 5`. The log says which: `cannot fetch the login's key set` or `cannot read the NEAR balance` |
 
 The table `gas_gifts` keeps one row per gift: the login's user id (`did:privy:...`, no email), the account, the amount, the transfer's hash and the times. A gift is claimed in that table before it is sent, so two calls at once cannot both send.
 

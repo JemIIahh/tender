@@ -3,7 +3,15 @@ import { GasGiftRequestSchema, type GasGiftResponse } from "@tender/shared";
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
-import { type CryptoKey, importSPKI, jwtVerify } from "jose";
+import {
+  type CryptoKey,
+  createRemoteJWKSet,
+  errors,
+  importSPKI,
+  type JWTVerifyGetKey,
+  type JWTVerifyOptions,
+  jwtVerify,
+} from "jose";
 import { withinDeadline } from "../deadline";
 import { type ApiDeps, type GasGift, nowNs } from "../deps";
 import { badRequest, type ErrorBody, fail, issuesOf, readJson } from "../format";
@@ -20,10 +28,14 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 // testnet (and on the sandbox, for tests) only, and only with the gift set up (`ApiDeps.gasGift`).
 //
 // THE TOKEN. The bearer is the login's own access token, a JWT that Privy signs with ES256 for the
-// app: it is verified with the app's verification key, for the issuer `privy.io` and the audience
-// of the app's id, and its `sub` is the login's user id (`did:privy:...`). It is not a Tender
-// sign-in, which an account that holds no NEAR cannot do yet. Every fault of a token gets the same
-// 401, which names none of them, and no token is ever logged.
+// app: it is verified for the issuer `privy.io` and the audience of the app's id, and its `sub` is
+// the login's user id (`did:privy:...`). The key is the one of the token's `kid` among the keys
+// Privy publishes for the app (`privyJwksUrl`), which `jose` fetches and keeps for 10 minutes, and
+// fetches again for a `kid` it does not know (at most once in 30 seconds), so a key Privy rotates
+// in is found. `PRIVY_VERIFICATION_KEY`, when it is set, is the one key used instead, and nothing
+// is fetched. It is not a Tender sign-in, which an account that holds no NEAR cannot do yet. Every
+// fault of a token gets the same 401, which names none of them; a key set that cannot be fetched
+// is a 503, since the token may be good. No token is ever logged.
 //
 // The order of the checks, and the first fault is the answer:
 //
@@ -31,6 +43,7 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 //   429  `rate_limited`: over the client address's limit;
 //   413  `payload_too_large`: a body over 4 KiB;
 //   401  `unauthorized`: no token, or one that does not verify;
+//   503  `unavailable`: the app's key set cannot be fetched right now (`Retry-After: 5`);
 //   400  `bad_request` for a body that is not `{ account_id }`, and `not_implicit` for an account
 //        that is not 64 lowercase hex characters;
 //   409  `already_given`: this login, or this account, has had its gift (or it is on its way);
@@ -60,6 +73,17 @@ export const DEFAULT_GAS_GIFT_DAILY_CAP = 2_000_000_000_000_000_000_000_000n;
 
 /** The issuer of every token of the login, as Privy's documentation gives it. */
 export const PRIVY_ISSUER = "privy.io";
+
+/**
+ * Where Privy publishes the keys that sign the access tokens of the app `appId`: a JSON Web Key
+ * Set of ES256 keys, each with its `kid`.
+ */
+export function privyJwksUrl(appId: string): string {
+  return `https://auth.privy.io/api/v1/apps/${encodeURIComponent(appId)}/jwks.json`;
+}
+
+/** How long a fetch of the key set may take before the call is a 503. */
+const JWKS_TIMEOUT_MS = 5_000;
 
 /** How far the clocks of Privy and of this API may be apart, in seconds. */
 const CLOCK_TOLERANCE_S = 30;
@@ -112,18 +136,65 @@ export function readPrivyKey(text: string): string | null {
   }
 }
 
-/** Whether `gift` has all a gift needs: the first that is missing turns the route off. */
+/** `gift.privyVerificationKey` when it is set: empty, or only spaces, is unset. */
+function setKeyOf(gift: GasGift): string | undefined {
+  const text = gift.privyVerificationKey;
+  return text === undefined || text.trim() === "" ? undefined : text;
+}
+
+/**
+ * Whether `gift` has all a gift needs: the first that is missing turns the route off. A
+ * verification key is not needed, but one that is set must be an ES256 public key.
+ */
 function usable(gift: GasGift | undefined): gift is GasGift {
+  if (gift === undefined) return false;
+  const key = setKeyOf(gift);
   return (
-    gift !== undefined &&
     gift.account !== "" &&
-    gift.privyAppId !== "" &&
-    readPrivyKey(gift.privyVerificationKey) !== null &&
+    gift.privyAppId.trim() !== "" &&
+    (key === undefined || readPrivyKey(key) !== null) &&
     gift.amount > 0n &&
     gift.minBalance >= 0n &&
     gift.dailyCap >= gift.amount
   );
 }
+
+/**
+ * Whether a key set's error is about the token, which no fetch can mend: no key of its `kid` and
+ * algorithm (after a fetch, if one was due), more than one that the token does not tell apart, or
+ * an algorithm that a key set has no keys for. Anything else, such as a failed or timed-out fetch,
+ * an answer that is not 200 or not a key set, means the key set could not be read.
+ */
+function aboutTheToken(error: unknown): boolean {
+  return (
+    error instanceof errors.JWKSNoMatchingKey ||
+    error instanceof errors.JWKSMultipleMatchingKeys ||
+    error instanceof errors.JOSENotSupported
+  );
+}
+
+/** `token` verified with the first of the keys `several` yields that verifies it, or `several`. */
+async function verifiedByOneOf(
+  token: string,
+  several: InstanceType<typeof errors.JWKSMultipleMatchingKeys>,
+  options: JWTVerifyOptions,
+): Promise<Awaited<ReturnType<typeof jwtVerify>>> {
+  for await (const candidate of several) {
+    try {
+      return await jwtVerify(token, candidate, options);
+    } catch {
+      // the next one
+    }
+  }
+  throw several;
+}
+
+/** What `loginOf` makes of a bearer token. */
+type Login =
+  | { kind: "user"; user: string }
+  | { kind: "refused" }
+  // The app's key set could not be fetched: the token may be good.
+  | { kind: "unavailable" };
 
 /** The name of what went wrong, and its code when it has one: never its text, which can hold a URL. */
 function kindOf(error: unknown): string {
@@ -154,8 +225,20 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
   const gift = deps.network !== "mainnet" && usable(deps.gasGift) ? deps.gasGift : undefined;
   const nowMs = () => Number(nowNs(deps) / 1_000_000n);
 
-  /** The verification key as a PEM, read once: `usable` has found it good when the gift is on. */
-  const pem = gift === undefined ? null : readPrivyKey(gift.privyVerificationKey);
+  /** The verification key as a PEM, read once when it is set: `usable` has found it good. */
+  const setKey = gift === undefined ? undefined : setKeyOf(gift);
+  const pem = setKey === undefined ? null : readPrivyKey(setKey);
+  /**
+   * The key set tokens are checked against when no verification key is set: the one a test gives,
+   * or the app's published one, fetched when the first token comes, and kept as `jose` keeps it.
+   */
+  const keySet: JWTVerifyGetKey | undefined =
+    gift === undefined || pem !== null
+      ? undefined
+      : (gift.privyKeys ??
+        createRemoteJWKSet(new URL(privyJwksUrl(gift.privyAppId.trim())), {
+          timeoutDuration: JWKS_TIMEOUT_MS,
+        }));
   /** The verification key, imported once. A failed import is tried again by the next request. */
   let imported: Promise<CryptoKey> | undefined;
   const verificationKey = (pem: string): Promise<CryptoKey> => {
@@ -167,28 +250,62 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
   };
 
   /**
-   * The login's user id from `Authorization: Bearer <token>`, or null for anything that is not a
-   * good token: none, malformed, signed by another key or with another algorithm, for another app
-   * or issuer, expired or not yet valid, or without a user. Which of them it was is not said.
+   * The login's user from `Authorization: Bearer <token>`. `refused` is anything that is not a good
+   * token: none, malformed, signed by another key or with another algorithm, for another app or
+   * issuer, expired or not yet valid, or without a user; which of them it was is not said.
+   * `unavailable` is a key set that could not be fetched, which says nothing of the token: its
+   * failure is logged by name, and the token never.
    */
-  async function loginOf(on: GasGift, header: string | undefined): Promise<string | null> {
+  async function loginOf(on: GasGift, header: string | undefined): Promise<Login> {
     const token = BEARER.exec(header ?? "")?.[1];
-    if (token === undefined || token.length > MAX_TOKEN_CHARS) return null;
-    if (pem === null) return null;
-    // Outside the `try`: a key that cannot be imported is a fault of ours, not of the token.
-    const key = await verificationKey(pem);
+    if (token === undefined || token.length > MAX_TOKEN_CHARS) return { kind: "refused" };
+    const options: JWTVerifyOptions = {
+      algorithms: ["ES256"],
+      issuer: PRIVY_ISSUER,
+      audience: on.privyAppId.trim(),
+      clockTolerance: CLOCK_TOLERANCE_S,
+      currentDate: new Date(nowMs()),
+      requiredClaims: ["sub", "exp"],
+    };
+    /** What the key set threw that was not about the token, if it threw such a thing. */
+    let unreadable: { error: unknown } | undefined;
+    // Outside the `try`: a set key that cannot be imported is a fault of ours, not of the token.
+    const key = pem === null ? undefined : await verificationKey(pem);
     try {
-      const { payload } = await jwtVerify(token, key, {
-        algorithms: ["ES256"],
-        issuer: PRIVY_ISSUER,
-        audience: on.privyAppId,
-        clockTolerance: CLOCK_TOLERANCE_S,
-        currentDate: new Date(nowMs()),
-        requiredClaims: ["sub", "exp"],
-      });
-      return typeof payload.sub === "string" && PRIVY_USER.test(payload.sub) ? payload.sub : null;
+      let verified: Awaited<ReturnType<typeof jwtVerify>>;
+      if (key !== undefined) {
+        verified = await jwtVerify(token, key, options);
+      } else if (keySet !== undefined) {
+        try {
+          verified = await jwtVerify(
+            token,
+            async (protectedHeader, jws) => {
+              try {
+                return await keySet(protectedHeader, jws);
+              } catch (error) {
+                if (!aboutTheToken(error)) unreadable = { error };
+                throw error;
+              }
+            },
+            options,
+          );
+        } catch (error) {
+          // A token with no `kid` that more than one key of the set fits: `jose` leaves trying
+          // each of them to the caller. One that none of them verifies is refused.
+          if (!(error instanceof errors.JWKSMultipleMatchingKeys)) throw error;
+          verified = await verifiedByOneOf(token, error, options);
+        }
+      } else {
+        return { kind: "refused" };
+      }
+      const { sub } = verified.payload;
+      return typeof sub === "string" && PRIVY_USER.test(sub)
+        ? { kind: "user", user: sub }
+        : { kind: "refused" };
     } catch {
-      return null;
+      if (unreadable === undefined) return { kind: "refused" };
+      console.error(`api: cannot fetch the login's key set (${kindOf(unreadable.error)})`);
+      return { kind: "unavailable" };
     }
   }
 
@@ -310,8 +427,12 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
     async (c) => {
       // Set: the first middleware answers when it is not.
       const on = gift as GasGift;
-      const login = await loginOf(on, c.req.header("Authorization"));
-      if (login === null) return unauthorized(c);
+      const checked = await loginOf(on, c.req.header("Authorization"));
+      if (checked.kind === "unavailable") {
+        return unavailableForNow("cannot check your login right now: try again in a few seconds");
+      }
+      if (checked.kind === "refused") return unauthorized(c);
+      const login = checked.user;
       const account = accountOf(await readJson(c));
 
       if (await given(login, account)) return alreadyGiven();

@@ -1625,29 +1625,37 @@ test("off_the_sandbox_the_process_waits_for_a_node_behind_the_index_and_ends_onl
  */
 function loginToken(key: KeyObject, claims: Record<string, unknown>): string {
   const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
-  const signed = `${part({ alg: "ES256", typ: "JWT" })}.${part(claims)}`;
+  const signed = `${part({ alg: "ES256", typ: "JWT", kid: "sandbox-key" })}.${part(claims)}`;
   const signature = sign("sha256", Buffer.from(signed), { key, dsaEncoding: "ieee-p1363" });
   return `${signed}.${signature.toString("base64url")}`;
 }
 
 test("the_gas_gift_creates_a_new_implicit_account_with_its_first_near_once", async () => {
   const login = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
-  const pem = login.publicKey.export({ type: "spki", format: "pem" }).toString().trim();
   // Alice's key is a full-access key of a local account that is not the contract's owner.
   const gift = chain.accounts.alice;
   const lines: string[] = [];
+  // The three variables the gift needs, as the owner sets them. The login's tokens are checked
+  // against a key set: here the test's own, in place of the one Privy publishes, which is never
+  // called. It is asked for the key of each token, as a published one is.
+  const asked: unknown[] = [];
   const services = await serve(
     envFor({
       GAS_GIFT_ACCOUNT: gift.accountId,
       GAS_GIFT_PRIVATE_KEY: gift.privateKey,
       PRIVY_APP_ID: "tender-sandbox-app",
-      // On one line, as a host keeps it.
-      PRIVY_VERIFICATION_KEY: pem.replaceAll("\n", "\\n"),
     }),
     lines,
+    {
+      gasGiftKeys: async (header) => {
+        asked.push(header.kid);
+        return login.publicKey;
+      },
+    },
   );
   expect(lines).toContain(
-    `serve: gas gift on, from ${gift.accountId}: 0.1 NEAR to each new account, 2 NEAR a day at most`,
+    `serve: gas gift on, from ${gift.accountId}: 0.1 NEAR to each new account, 2 NEAR a day ` +
+      "at most; login tokens checked with the app's published keys",
   );
 
   const key = KeyPair.fromRandom("ed25519");
@@ -1676,6 +1684,7 @@ test("the_gas_gift_creates_a_new_implicit_account_with_its_first_near_once", asy
 
   const res = await askFor(implicit);
   expect(res.status).toBe(200);
+  expect(asked).toEqual(["sandbox-key"]);
   const sent = GasGiftResponseSchema.parse(await res.json());
   expect(sent).toMatchObject({ status: "sent", amount: "100000000000000000000000" });
   if (sent.status !== "sent") throw new Error("the gift was not sent");
