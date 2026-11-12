@@ -59,8 +59,6 @@ import {
   InvalidTransactionVersionError,
   NonceTooLargeError,
   NotEnoughBalanceError,
-  ShardCongestedError,
-  ShardStuckError,
   SignerDoesNotExistError,
   TransactionExpiredError,
   TransactionSizeExceededError,
@@ -237,9 +235,22 @@ function failedWith(txHash: string, failure: unknown): TenderError {
 }
 
 /**
- * The errors near-api-js 7.4.0 throws for a transaction the node refused as invalid when it was
- * sent (the RPC's `InvalidTxError`): it was not taken, and no copy of it can run. A wrong nonce, a
- * signer without the NEAR, a bad signature, an expired block, a shard that takes no more.
+ * The errors near-api-js 7.4.0 throws for a transaction the node refused as invalid (the RPC's
+ * `InvalidTxError`), for a reason that no other copy of the same signed bytes escapes. near-api-js
+ * sends those bytes again after an HTTP 408, 500 or 503, so the error can answer a second copy;
+ * each of these holds for the first copy too:
+ *
+ * - a reason in the bytes themselves, or in what does not change between the copies: a bad
+ *   signature, a chain, receiver or signer that does not fit, a nonce too large, a size or a cost
+ *   over the limit, a version the node does not take, a reference block too old (a resend comes
+ *   within the send's 120 s, and a transaction is good for 86,400 blocks);
+ * - a signer short of the NEAR: the node checks the nonce first, so a copy that already ran would
+ *   be answered `InvalidNonce`, not this;
+ * - `InvalidNonce`: near-api-js signs the transaction again with a new nonce for it, and so does
+ *   `defaultQueue` once more, so the one thrown is of the last transaction, which was refused.
+ *
+ * Not `ShardCongested` or `ShardStuck`: they depend on the receiver's shard at that moment, and a
+ * second copy can get one while the first is already taken and will run once the shard recovers.
  */
 const REFUSED_BY_THE_NODE = [
   CostOverflowError,
@@ -251,20 +262,26 @@ const REFUSED_BY_THE_NODE = [
   InvalidTransactionVersionError,
   NonceTooLargeError,
   NotEnoughBalanceError,
-  ShardCongestedError,
-  ShardStuckError,
   SignerDoesNotExistError,
   TransactionExpiredError,
   TransactionSizeExceededError,
 ] as const;
 
 /**
- * Whether the error of a send (`send`, `transfer`) says for certain that its transaction moved
- * nothing and never will: it ran and its final outcome is a failure (a failed transaction keeps
- * nothing it did, but its gas), or the node refused it as invalid before taking it
- * (`REFUSED_BY_THE_NODE`). Anything else leaves the outcome unknown: above all an `E_TIMEOUT`, and
- * an RPC or network error, after which the transaction may still land. A caller that would send the
- * same thing again does so only when this is true, or once the chain shows the first did not land.
+ * Whether the error of a send (`send`, `transfer`) says for certain that its transaction will not
+ * run from here on: its final outcome is a failure, or the node refused it as invalid before taking
+ * it (`REFUSED_BY_THE_NODE`). Anything else leaves the outcome unknown: above all an `E_TIMEOUT`, a
+ * congested or stuck shard, and an RPC or network error, after which the transaction may still
+ * land. A caller that would send the same thing again does so only when this is true, or once the
+ * chain shows the first did not land.
+ *
+ * What a failure undid depends on the transaction. One with a single receipt, such as `transfer`'s
+ * one `Transfer` action, moved nothing for good: a receipt that fails keeps none of its actions'
+ * effects, and its NEAR goes back to the signer in a refund, so only the gas is spent. A call whose
+ * receipts go on to other contracts takes its final status from the last receipt, and the earlier
+ * ones can have taken effect: `withdraw` debits the vault, then calls the token, then
+ * `on_withdraw`, and a failed `on_withdraw` comes after the debit and maybe the payment. For such a
+ * call this says only that it will not run again, not that it did nothing.
  */
 export function sendRefused(error: unknown): boolean {
   if (error instanceof TenderError) return failedOnChain.has(error);
@@ -491,7 +508,8 @@ export class TenderClient {
    * of the last final block made at once may not see it yet. It goes through `defaultQueue` like
    * `send`, with `sendTimeoutMs`. A transfer that failed on chain throws a `TenderError` with the
    * hash; one the node refused before it ran (not enough NEAR, a bad nonce) throws as near-api-js
-   * throws it, and one that ran out of time throws `E_TIMEOUT`, and may still land.
+   * throws it, and one that ran out of time throws `E_TIMEOUT`, and may still land. `sendRefused`
+   * says which errors mean, for certain, that it will not run.
    */
   async transfer(receiverId: string, amount: bigint): Promise<TxResult> {
     const account = this.account;

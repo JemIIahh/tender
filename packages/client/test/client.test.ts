@@ -5,6 +5,8 @@ import { Account, actions, KeyPair } from "near-api-js";
 import {
   InvalidNonceError,
   NotEnoughBalanceError,
+  ShardCongestedError,
+  ShardStuckError,
   TransactionTimeoutError,
 } from "near-api-js/rpc-errors";
 import { afterEach, describe, expect, expectTypeOf, test, vi } from "vitest";
@@ -814,6 +816,10 @@ describe("NEAR transfers and balances", () => {
       ["a timeout of the client", new TenderError("E_TIMEOUT", "TenderClient.transfer timed out")],
       ["an outcome that is not final", unfinished],
       ["a timeout of the node's own wait", new TransactionTimeoutError()],
+      // near-api-js sends the same bytes again after a 408, 500 or 503, and a second copy can be
+      // refused for its receiver's shard while the first is already taken.
+      ["a congested shard", new ShardCongestedError(1, 0, "TX", "BLOCK")],
+      ["a stuck shard", new ShardStuckError(5, 0, "TX", "BLOCK")],
       ["a network error", new TypeError("fetch failed")],
       ["a contract's code, made by hand", new TenderError("E_AUTH", "E_AUTH: no")],
       ["nothing that is an error", "boom"],
