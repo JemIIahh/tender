@@ -144,7 +144,7 @@ async function open(
 
 /** Connects the page's wallet from the Connect button in `scope`. */
 async function connect(page: Page, scope = page.getByTestId("task-actions")): Promise<void> {
-  await scope.getByRole("button", { name: "Connect wallet" }).click();
+  await scope.getByRole("button", { name: "Sign in" }).click();
   await pickStubWallet(page);
 }
 

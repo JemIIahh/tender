@@ -23,7 +23,7 @@ const row = (page: Page) => page.getByTestId("token-row").filter({ hasText: TOKE
 /** Opens the page, picks the wallet in near-connect's list, and waits for the account to show. */
 async function connect(page: Page): Promise<void> {
   await page.goto("/wallet");
-  await page.getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await pickStubWallet(page);
   await expect(page.getByTestId("account-id")).toHaveText(ALICE);
 }
@@ -47,10 +47,10 @@ test("register_deposit_withdraw_round_trip", async ({ page }) => {
   // Signed out, the page offers the one thing there is to do.
   await page.goto("/wallet");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Wallet");
-  await expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible();
+  await expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible();
   await expect(page.getByTestId("account-id")).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await pickStubWallet(page);
   await expect(page.getByTestId("account-id")).toHaveText(ALICE);
   await expect(page.getByRole("button", { name: "Disconnect" })).toBeVisible();
@@ -111,7 +111,7 @@ test("register_deposit_withdraw_round_trip", async ({ page }) => {
 
   // Disconnecting leaves the connect button, with nothing of the account on the page.
   await page.getByRole("button", { name: "Disconnect" }).click();
-  await expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible();
+  await expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible();
   await expect(page.getByTestId("token-row")).toHaveCount(0);
 });
 
@@ -264,8 +264,8 @@ test("a_disconnect_in_one_tab_signs_the_other_tab_out", async ({ context, page }
 
   await page.getByRole("button", { name: "Disconnect" }).click();
 
-  await expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible();
-  await expect(other.getByRole("button", { name: "Connect wallet" })).toBeVisible();
+  await expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible();
+  await expect(other.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible();
   await expect(other.getByTestId("account-id")).toHaveCount(0);
   await expect(other.getByTestId("token-row")).toHaveCount(0);
 });

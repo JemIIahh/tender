@@ -43,7 +43,7 @@ test("register_deposit_withdraw_round_trip", async ({ page }) => {
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Wallet");
   await expect(page.getByTestId("account-id")).toHaveCount(0);
   // The dev wallet has no picker: it connects at once.
-  await page.getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByTestId("account-id")).toHaveText(run.dev);
   await expect(page.getByRole("button", { name: "Disconnect" })).toBeVisible();
 
@@ -95,7 +95,7 @@ test("register_deposit_withdraw_round_trip", async ({ page }) => {
 
   // Disconnecting leaves the connect button, with nothing of the account on the page.
   await page.getByRole("button", { name: "Disconnect" }).click();
-  await expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible();
+  await expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible();
   await expect(page.getByTestId("token-row")).toHaveCount(0);
 });
 
@@ -150,12 +150,12 @@ async function setWindows(page: Page): Promise<void> {
 async function ensureAccountIsSetUp(page: Page, run: RunInfo): Promise<void> {
   if ((await readerOf(run).storageBalanceOf(run.dev)) !== null) return;
   await page.goto("/wallet");
-  await page.getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByTestId("account-id")).toHaveText(run.dev);
   await page.getByRole("button", { name: "Set up account" }).click();
   await expect(page.getByTestId("storage-total")).toHaveText("0.05 NEAR");
   await page.getByRole("button", { name: "Disconnect" }).click();
-  await expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible();
+  await expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible();
 }
 
 test("post_task_end_to_end", async ({ page }) => {
@@ -196,12 +196,12 @@ test("post_task_end_to_end", async ({ page }) => {
   // The page says what is about to happen. Without a wallet its one button connects one.
   await expect(page.getByTestId("review-reward")).toContainText(show(reward));
   await expect(page.getByTestId("review-verifier")).toContainText("Tender Judge");
-  await expect(page.getByTestId("review-account")).toHaveText("Not connected");
+  await expect(page.getByTestId("review-account")).toHaveText("Not signed in");
   const post = page.getByRole("button", { name: "Post task" });
   await expect(post).toHaveCount(0);
 
   // The dev wallet connects at once, and the page reads the vault from the chain.
-  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByTestId("review-account")).toHaveText(run.dev);
   await expect(page.getByTestId("review-funding")).toHaveText(
     toAdd === 0n

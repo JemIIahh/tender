@@ -41,9 +41,15 @@ test("phone_width_has_no_horizontal_scroll", async ({ page }) => {
     ],
     ["/agents", () => expect(page.getByTestId("agent-card")).toHaveCount(1)],
     // Signed out, as a visitor first sees them.
-    ["/wallet", () => expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible()],
+    [
+      "/wallet",
+      () => expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible(),
+    ],
     ["/post", () => expect(page.getByRole("heading", { level: 1 })).toHaveText("Post a task")],
-    ["/telegram", () => expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible()],
+    [
+      "/telegram",
+      () => expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible(),
+    ],
     [`/tasks/${first.taskId}`, () => expect(page.getByTestId("phase-timeline")).toBeVisible()],
     [
       `/agents/${run.agent}`,

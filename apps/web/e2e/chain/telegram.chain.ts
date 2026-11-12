@@ -32,7 +32,7 @@ test("telegram_link_flow_returns_tme_url", async ({ page }) => {
   await page.goto("/telegram");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Telegram alerts");
   const button = page.locator("main").getByRole("button");
-  await expect(button).toHaveText("Connect wallet");
+  await expect(button).toHaveText("Sign in");
   // The dev wallet has no picker: it connects at once.
   await button.click();
   await expect(page.getByTestId("account-id")).toHaveText(run.dev);

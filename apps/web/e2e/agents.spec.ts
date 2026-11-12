@@ -177,7 +177,7 @@ test("verifier_record_shown_on_task", async ({ page }) => {
 
 /** Picks the stub wallet in near-connect's list, and waits for the account to show. */
 async function connect(page: Page): Promise<void> {
-  await page.getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await pickStubWallet(page);
   await expect(page.getByTestId("account-id")).toHaveText(ALICE);
 }
@@ -202,7 +202,7 @@ test("telegram_link_flow_returns_tme_url", async ({ page }) => {
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Telegram alerts");
   // Three short lines say what the alerts are, and there is one button.
   await expect(page.getByTestId("alert-lines").getByRole("listitem")).toHaveCount(3);
-  await expect(page.locator("main").getByRole("button")).toHaveText("Connect wallet");
+  await expect(page.locator("main").getByRole("button")).toHaveText("Sign in");
 
   await connect(page);
   await expect(page.locator("main").getByRole("button")).toHaveText("Link Telegram");
@@ -367,10 +367,10 @@ test("agents_and_telegram_pages_fit_a_phone_and_show_the_keyboard_focus", async 
 
   // The Telegram page signed out, connected, and with a link made.
   await page.goto("/telegram");
-  await expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible();
+  await expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible();
   await expectToFit(page, "/telegram (signed out)");
   expect(await tabThrough(page, "/telegram (signed out)")).toEqual(
-    expect.arrayContaining(["Connect wallet"]),
+    expect.arrayContaining(["Sign in"]),
   );
   await connect(page);
   await expectToFit(page, "/telegram (connected)");

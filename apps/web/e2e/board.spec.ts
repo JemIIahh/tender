@@ -46,7 +46,8 @@ const ROUTES: Record<string, (page: Page) => Promise<void>> = {
   // A settled one with every part of the page, each as wide as the data can be (fixtures.ts).
   "/tasks/3": (page) => expect(page.getByTestId("recompute")).toBeVisible(),
   // Signed out: the connected page is looked at on a phone in wallet.spec.ts.
-  "/wallet": (page) => expect(page.getByRole("button", { name: "Connect wallet" })).toBeVisible(),
+  "/wallet": (page) =>
+    expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible(),
 };
 
 test("phone_width_has_no_horizontal_scroll", async ({ page }) => {

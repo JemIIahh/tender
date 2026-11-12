@@ -49,6 +49,6 @@ test("my_tasks_lists_what_to_pick_what_was_posted_and_the_hires_with_their_next_
 
 test("my_tasks_asks_a_visitor_to_connect", async ({ page }) => {
   await openParity(page, "/my-tasks");
-  await expect(page.getByRole("heading", { name: "Connect your wallet" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "You're not signed in" })).toBeVisible();
   await expect(page.getByRole("tab")).toHaveCount(0);
 });

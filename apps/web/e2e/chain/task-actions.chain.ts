@@ -113,7 +113,7 @@ async function postTask(
 
 /** Connects the dev wallet from the Connect button in `scope`: it has no picker. */
 async function connect(scope: ReturnType<Page["getByTestId"]>): Promise<void> {
-  await scope.getByRole("button", { name: "Connect wallet" }).click();
+  await scope.getByRole("button", { name: "Sign in" }).click();
 }
 
 test("web_verifier_picks_and_the_winner_is_paid_the_reward_less_the_fee", async ({ page }) => {

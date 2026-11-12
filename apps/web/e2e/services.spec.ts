@@ -68,7 +68,7 @@ test("hire_end_to_end", async ({ page }) => {
 
   await page.goto("/services/3#hire");
   const hire = page.locator("#hire");
-  await hire.getByRole("button", { name: "Connect wallet" }).click();
+  await hire.getByRole("button", { name: "Sign in" }).click();
   await pickStubWallet(page);
   await expect(hire.getByTestId("hire-plan")).toContainText(
     "1.50 tUSDC goes from your wallet into your vault first.",
@@ -200,9 +200,9 @@ for (const width of [375, 1440]) {
     });
 
     await page.goto("/services/3");
-    await expect(page.locator("#hire").getByRole("button", { name: "Connect wallet" })).toBeVisible(
-      { timeout: 20_000 },
-    );
+    await expect(page.locator("#hire").getByRole("button", { name: "Sign in" })).toBeVisible({
+      timeout: 20_000,
+    });
     await expect(page.getByTestId("hire-price")).toHaveText("2.50 tUSDC");
     await page.screenshot({
       path: testInfo.outputPath(`escrow-service-${width}.png`),

@@ -300,7 +300,7 @@ export async function openParity(
   await options.beforeOpen?.(fixture);
   await page.goto(path);
   if (options.connect) {
-    await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+    await page.locator("main").getByRole("button", { name: "Sign in" }).click();
     await pickStubWallet(page);
   }
   return { fixture, parity };

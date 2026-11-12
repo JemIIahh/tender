@@ -146,9 +146,9 @@ async function loginWorld(
 
 const connectWindow = (page: Page) => page.getByRole("dialog");
 
-/** Presses Connect wallet on the wallet page, and waits for the window's wallets. */
+/** Presses Sign in on the wallet page, and waits for the window's wallets. */
 async function openWindow(page: Page): Promise<void> {
-  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await expect(connectWindow(page).getByRole("button", { name: /Birch Wallet/ })).toBeVisible();
 }
 
@@ -193,6 +193,49 @@ test("the_window_offers_email_google_and_the_near_wallets_at_both_widths", async
   await shoot(page, "window");
 });
 
+test("the_bar_s_sign_in_opens_the_window_where_you_are_and_you_stay_there", async ({ page }) => {
+  await routeApi(page);
+  await installWallet(page, new FakeChain(CONTRACT, [{ token: TOKEN }]), { account: ALICE });
+  await page.addInitScript(() => {
+    (window as unknown as { __tenderPrivyStub: unknown }).__tenderPrivyStub = {
+      address: "0".repeat(64),
+      login: "email",
+    };
+  });
+  const bar = page.getByRole("banner");
+  for (const size of [PHONE, LAPTOP]) {
+    await page.setViewportSize(size);
+    await page.goto("/tasks");
+    // A button, not a link: no page of its own.
+    await expect(bar.getByRole("link", { name: "Sign in" })).toHaveCount(0);
+    await bar.getByRole("button", { name: "Sign in" }).click();
+    await expect(connectWindow(page).getByRole("heading")).toHaveText("Log in or sign up");
+    await expect(connectWindow(page).getByLabel("Email address")).toBeFocused();
+    expect(new URL(page.url()).pathname).toBe("/tasks");
+    // The bar keeps Post task and the network's pill (its name is for screen readers on a phone).
+    await expect(bar.getByRole("link", { name: "Post task" })).toBeVisible();
+    await expect(bar.getByText("Testnet")).toHaveCount(1);
+    await page.keyboard.press("Escape");
+    await expect(connectWindow(page)).toHaveCount(0);
+    // The focus goes back to the bar's button.
+    await expect(bar.getByRole("button", { name: "Sign in" })).toBeFocused();
+  }
+
+  // The bar as it is: Post task, the network's pill, and Sign in.
+  await shoot(page, "bar");
+
+  // Signed in from the bar: still on the same page, and the bar names the account.
+  await bar.getByRole("button", { name: "Sign in" }).click();
+  await expect(connectWindow(page).getByTestId("wallet-row")).toHaveCount(1);
+  await shoot(page, "bar-sign-in");
+  await pickStubWallet(page);
+  await expect(connectWindow(page)).toHaveCount(0);
+  await expect(bar.getByRole("link", { name: ALICE })).toBeVisible();
+  await expect(bar.getByRole("button", { name: "Sign in" })).toHaveCount(0);
+  expect(new URL(page.url()).pathname).toBe("/tasks");
+  await shoot(page, "bar-signed-in");
+});
+
 test("a_wallet_row_connects_that_wallet_with_no_second_window", async ({ page }) => {
   await routeApi(page);
   await installWallet(page, new FakeChain(CONTRACT, [{ token: TOKEN }]), { account: ALICE });
@@ -203,7 +246,7 @@ test("a_wallet_row_connects_that_wallet_with_no_second_window", async ({ page })
     };
   });
   await page.goto("/wallet");
-  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await pickStubWallet(page);
   await expect(connectWindow(page)).toHaveCount(0);
   await expect(page.getByTestId("account-id")).toHaveText(ALICE);
@@ -214,7 +257,7 @@ test("a_wallet_row_connects_that_wallet_with_no_second_window", async ({ page })
 
   // Next time, the window marks the wallet used last.
   await page.getByRole("button", { name: "Disconnect" }).click();
-  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await expect(
     connectWindow(page).getByRole("button", { name: STUB_WALLET_NAME }).getByTestId("last-used"),
   ).toHaveText("Last used");
@@ -293,7 +336,7 @@ test("an_email_login_takes_its_code_gets_its_account_ready_and_the_wallet_page_s
   // Log out ends both: the page offers Connect again, a reload finds no login, and the window
   // marks the email row as the way used last.
   await page.getByRole("button", { name: "Log out" }).click();
-  await expect(page.locator("main").getByRole("button", { name: "Connect wallet" })).toBeVisible();
+  await expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible();
   await page.reload();
   await openWindow(page);
   await expect(connectWindow(page).locator("form").getByTestId("last-used")).toHaveText(

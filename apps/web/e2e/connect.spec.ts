@@ -56,7 +56,7 @@ async function openConnected(
   await routeAccountNode(page, chain);
   const wallet = await installAccountWallet(page, { account: OWNER, chain, ...walletOptions });
   await page.goto("/my-agents/new");
-  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await pickStubWallet(page);
   return { api, chain, wallet };
 }

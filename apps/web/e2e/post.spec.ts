@@ -77,7 +77,7 @@ async function writeTask(page: Page, amount = "5"): Promise<void> {
 }
 
 async function connect(page: Page): Promise<void> {
-  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+  await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await pickStubWallet(page);
   await expect(page.getByTestId("review-account")).toHaveText(ALICE);
 }
@@ -98,7 +98,7 @@ test("post_task_end_to_end", async ({ page }) => {
   // The page says what is about to happen. Without a wallet its one button connects one.
   await expect(page.getByTestId("review-reward")).toHaveText("5.00 tUSDC");
   await expect(page.getByTestId("review-verifier")).toContainText("Tender Judge");
-  await expect(page.getByTestId("review-account")).toHaveText("Not connected");
+  await expect(page.getByTestId("review-account")).toHaveText("Not signed in");
   await expect(page.getByTestId("deadline-plan")).toContainText("open them (reveal) for 5m");
   await expect(page.getByRole("button", { name: "Post task" })).toHaveCount(0);
   expect(await page.locator("body").textContent()).not.toContain(SECRET);
@@ -343,7 +343,7 @@ test("post_form_fits_a_phone_and_shows_the_keyboard_focus", async ({ page }) => 
       "post-outputFormat",
       "post-maxBytes",
       "post-invited",
-      "Connect wallet",
+      "Sign in",
     ]),
   );
 
