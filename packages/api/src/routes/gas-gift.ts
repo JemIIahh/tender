@@ -56,13 +56,16 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 //        to the next UTC day);
 //   502  `transfer_failed`: the transfer was refused for certain (`sendRefused`: it failed on chain,
 //        or the node refused it before taking it), and its claim is let go, so asking again works;
-//        or its outcome is not known (a timeout, or no answer within `TRANSFER_WAIT_MS`), and the
-//        NEAR may still arrive: its claim is kept, as THE CLAIM says;
+//        or its outcome is not known (a timeout, a congested or stuck shard, any other error that
+//        may follow the node taking it, or no answer within `TRANSFER_WAIT_MS`), and the NEAR may
+//        still arrive: its claim is kept, as THE CLAIM says, and a `WARN api:` line says
+//        `may still land`;
 //   200  `sent`, with the amount and the transfer's hash, once the transfer has executed.
 //
 // THE CLAIM. A gift's row is written before the transfer is sent, in a transaction that locks the
-// table, checks the login, the account and the day's total, and inserts it: of two calls at once,
-// one claims, and the other is told the gift is on its way (503 `unavailable`). The day's total
+// table, checks the login, the account and the day's total, and inserts it: of two calls at once
+// for the same login or the same account, one claims, and the other is told the gift is on its way
+// (503 `unavailable`). The day's total
 // counts every claim as well as every gift sent, so the claims and the sent gifts of a day never
 // pass the cap. The row is this request's own (its login, account and time), and only it is
 // changed: to `sent` once the transfer has executed, or deleted when the transfer was refused for
@@ -70,9 +73,11 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 // while the first may land; the outcome is recorded whenever it comes, even after the answer.
 // A claim is let go by the next claim once it is older than `STALE_CLAIM_MS` and its transfer is
 // not in flight in this process: one left by a process that died mid-gift, or one whose transfer
-// ended with its outcome unknown. That is the one way a transfer can go uncounted: one whose
-// outcome was unknown and that lands after its claim is let go. Its account then holds the NEAR,
-// so it gets `not_needed` if asked for again; its login could still ask for another account.
+// ended with its outcome unknown. A transfer can go uncounted in two ways: one whose outcome was
+// unknown and that lands after its claim is let go, and one that was sent but whose `sent` could
+// not be written (the database failed: the answer is a 500, and the claim is let go in time). Its
+// account then holds the NEAR, so it gets `not_needed` if asked for again; its login could still
+// ask for another account.
 //
 // What the route does not know: which account the login's wallet is. The token says who logged in,
 // not which account they hold, so a login can name any implicit account, once. The daily cap bounds
@@ -627,6 +632,12 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
         // A database that failed as the outcome was recorded is a fault: a 500.
         if (!(error instanceof NoAnswerInTime)) throw error;
         outcome = { kind: "unknown" };
+        console.warn(
+          `WARN api: the gas gift to ${account} gave no answer within ` +
+            `${(on.transferWaitMs ?? TRANSFER_WAIT_MS) / 1000} s and may still land; its claim is ` +
+            `kept while its transfer is in flight, and until it is ${STALE_CLAIM_MS / 60_000} ` +
+            "minutes old",
+        );
         // The outcome is recorded when it comes; only a failure to record it is said then.
         sending.catch((late: unknown) =>
           console.error(

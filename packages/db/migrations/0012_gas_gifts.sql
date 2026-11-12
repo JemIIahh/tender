@@ -9,8 +9,10 @@
 --     or other detail of the person is stored.
 --   - `account_id`: the implicit account the NEAR went to (64 lowercase hex characters).
 --   - `amount`: what was sent, in yoctoNEAR.
---   - `status`: `claimed` while the transfer is on its way, `sent` once it executed. A transfer that
---     fails deletes its row, so that the login can try again. The day's total counts both.
+--   - `status`: `claimed` while the transfer is on its way or its outcome is not known, `sent` once
+--     it executed. A transfer refused for certain deletes its row, so that the login can try again;
+--     any other claim is let go once it is 10 minutes old and its transfer has ended (the API's
+--     `routes/gas-gift.ts`). The day's total counts both.
 --   - `tx_hash` (nullable): the transfer's hash, set with `sent`.
 --   - `created_at`: when the gift was claimed; the daily cap counts by its UTC day.
 --   - `sent_at` (nullable): when the transfer executed, set with `sent`.

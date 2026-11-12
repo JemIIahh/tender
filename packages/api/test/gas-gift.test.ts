@@ -13,7 +13,7 @@ import {
   type JWK,
   SignJWT,
 } from "jose";
-import { NotEnoughBalanceError } from "near-api-js/rpc-errors";
+import { NotEnoughBalanceError, ShardCongestedError } from "near-api-js/rpc-errors";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import type { GasGift } from "../src/deps";
 import {
@@ -539,8 +539,40 @@ test("a_transfer_that_timed_out_keeps_its_claim_since_the_near_may_still_arrive"
   expect(transfers).toHaveLength(2);
 });
 
+test("a_transfer_refused_for_a_congested_shard_keeps_its_claim", async () => {
+  // near-api-js sends the same signed bytes again after an HTTP 408, 500 or 503, so a congested
+  // shard can answer a second copy while the first was taken: the NEAR may still arrive.
+  const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const app = appWith(
+    giftWith({
+      transfer: async (to, amount) => {
+        transfers.push({ to, amount });
+        throw new ShardCongestedError(1, 0, "TX", "BLOCK");
+      },
+    }),
+  );
+  const reply = await ask(app);
+  expect(reply.status).toBe(502);
+  expect((reply.body as ErrorBody).error).toBe("transfer_failed");
+  expect((reply.body as ErrorBody).message).toContain("may still arrive");
+  expect(await rows()).toEqual([
+    {
+      privy_user: USER,
+      account_id: ACCOUNT,
+      amount: `${AMOUNT}`,
+      status: "claimed",
+      tx_hash: null,
+    },
+  ]);
+  const logged = warnings.mock.calls.map((call) => call.join(" ")).join("\n");
+  expect(logged).toContain("may still land (ShardCongestedError");
+  // Asked for again meanwhile: on its way, or may be; never a second transfer.
+  expect((await ask(app, USER, OTHER_ACCOUNT)).status).toBe(503);
+  expect(transfers).toHaveLength(1);
+});
+
 test("a_transfer_with_no_answer_in_time_is_recorded_when_its_outcome_comes", async () => {
-  vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
   const outcomes: Array<{ settle: () => void; fail: (error: unknown) => void }> = [];
   const app = appWith(
     giftWith({
@@ -556,9 +588,17 @@ test("a_transfer_with_no_answer_in_time_is_recorded_when_its_outcome_comes", asy
       },
     }),
   );
-  const first = await ask(app);
+  const token = `Bearer ${await tokenFor()}`;
+  const first = await post(app, token);
   expect(first.status).toBe(502);
   expect((first.body as ErrorBody).message).toContain("may still arrive");
+  // The operator is told as the answer goes out, by the account alone: never the token or a key.
+  const warned = warnings.mock.calls.map((call) => call.join(" ")).join("\n");
+  expect(warned).toContain(
+    `WARN api: the gas gift to ${ACCOUNT} gave no answer within 0.05 s and may still land`,
+  );
+  expect(warned).not.toContain(token.slice(7));
+  expect(warned).not.toMatch(/ed25519:|PRIVATE/);
   // However long the transfer stays in flight, its claim is never let go, so no second goes out.
   nowNs += 30n * 60n * SECOND_NS;
   expect((await ask(app, USER, OTHER_ACCOUNT)).status).toBe(503);
