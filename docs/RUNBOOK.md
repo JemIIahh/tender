@@ -256,7 +256,7 @@ The owner sets it up in Privy's dashboard (dashboard.privy.io); nothing here doe
 
 Nothing else is copied: the app secret is not used anywhere.
 
-Both ids are public: they ship in the page. The web app sets no Content-Security-Policy; if one is added, it must allow what Privy lists (`auth.privy.io` in `frame-src`, `child-src` and `connect-src`, `*.rpc.privy.systems` in `connect-src`, and Cloudflare's `challenges.cloudflare.com` for its CAPTCHA): https://docs.privy.io/security/implementation-guide/content-security-policy.
+Both ids are public: they ship in the page. The web app sets no Content-Security-Policy; if one is added, it must allow what Privy lists (`auth.privy.io` in `frame-src`, `child-src` and `connect-src`, `*.rpc.privy.systems` in `connect-src`, and `challenges.cloudflare.com` for its CAPTCHA): https://docs.privy.io/security/implementation-guide/content-security-policy.
 
 "Export key" on the wallet page opens Privy's own window, on Privy's domain, from which the person copies the account's private key; the web app never sees it.
 

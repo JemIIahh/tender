@@ -21,6 +21,9 @@ const config: NextConfig = {
       // Two Solana program clients that Privy's kit imports for its Solana funding screens, which
       // this app never shows: the installed versions need a newer @solana/kit than the one Privy
       // resolves to, and fail the build. lib/noSolana.ts stands in for both, in every build.
+      // The alias applies to the whole app, not only to Privy's kit: anything here that imports
+      // either name gets stubs that throw. Adding a real Solana dependency to the web app means
+      // removing these two lines (and giving apps/web a @solana/kit 8 that Privy resolves to).
       "@solana-program/system": "./lib/noSolana.ts",
       "@solana-program/token": "./lib/noSolana.ts",
       // Privy's kit, the module lib/privyKit.tsx imports, as the build is for:
