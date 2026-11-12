@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { LAST_WAY_KEY, lastWay } from "../lib/lastWay";
 import {
   type ConnectChoice,
   choiceProvider,
@@ -10,7 +11,12 @@ import {
   type PrivyUser,
   privyProvider,
 } from "../lib/privy";
-import { createWalletStore, type Session, type SigningWallet } from "../lib/wallet";
+import {
+  createWalletStore,
+  type Session,
+  type SigningWallet,
+  type WalletProvider,
+} from "../lib/wallet";
 import { WalletError } from "../lib/walletErrors";
 import { fakeProvider } from "./walletDoubles";
 
@@ -245,11 +251,14 @@ function choices(
     answer?: ConnectChoice | null;
     loginRestored?: boolean;
     walletRestored?: boolean;
+    remembered?: ConnectChoice | null;
+    loginRestoreMs?: number;
   } = {},
 ) {
   const login = fakeProvider(loginSession, { restored: options.loginRestored });
   const near = fakeProvider(walletSession, { restored: options.walletRestored });
   const prepared: Session[] = [];
+  const remembered: { way: ConnectChoice | null } = { way: options.remembered ?? null };
   let asked = 0;
   const provider = choiceProvider({
     login: async () => login,
@@ -261,8 +270,15 @@ function choices(
     prepare: async (session) => {
       prepared.push(session);
     },
+    memory: {
+      get: () => remembered.way,
+      set: (way) => {
+        remembered.way = way;
+      },
+    },
+    ...(options.loginRestoreMs === undefined ? {} : { loginRestoreMs: options.loginRestoreMs }),
   });
-  return { provider, login, near, prepared, asked: () => asked };
+  return { provider, login, near, prepared, remembered, asked: () => asked };
 }
 
 test("connect_asks_which_way_and_only_a_login_is_got_ready", async () => {
@@ -329,4 +345,110 @@ test("only_the_way_of_the_session_is_heard_signing_out", async () => {
   expect(heard).toEqual([]);
   near.signOut();
   expect(heard).toEqual([null]);
+});
+
+test("restore_prefers_the_way_this_browser_last_connected", async () => {
+  // Both ways hold a session: the remembered way's is the one, whichever answers first.
+  for (const way of ["login", "wallet"] as const) {
+    const both = choices({ loginRestored: true, walletRestored: true, remembered: way });
+    const session = await both.provider.restore();
+    expect(session?.accountId, way).toBe(way === "login" ? ACCOUNT : ALICE);
+  }
+  // The remembered way has none: the other's session is taken.
+  const other = choices({ walletRestored: true, remembered: "login" });
+  expect((await other.provider.restore())?.accountId).toBe(ALICE);
+});
+
+test("connect_remembers_its_way_and_ends_the_other_way_s_session", async () => {
+  const { provider, login, near, remembered } = choices({
+    answer: "wallet",
+    loginRestored: true,
+    remembered: "login",
+  });
+  const heard: Array<Session | null> = [];
+  provider.subscribe((next) => heard.push(next));
+  expect((await provider.restore())?.accountId).toBe(ACCOUNT);
+
+  expect((await provider.connect())?.accountId).toBe(ALICE);
+  expect(near.connects).toBe(1);
+  expect(remembered.way).toBe("wallet");
+  // One session at a time: the login's ended, quietly.
+  expect(login.disconnects).toBe(1);
+  expect(heard).toEqual([]);
+});
+
+test("a_slow_login_does_not_hold_the_restore_and_a_late_session_is_still_taken", async () => {
+  vi.useFakeTimers();
+  let answer: (session: Session | null) => void = () => {};
+  const slowLogin: WalletProvider = {
+    restore: () =>
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    connect: async () => null,
+    disconnect: async () => {},
+    subscribe: () => () => {},
+  };
+  const store = createWalletStore(async () =>
+    choiceProvider({
+      login: async () => slowLogin,
+      wallet: async () => fakeProvider(walletSession),
+      ask: async () => null,
+      prepare: async () => {},
+      loginRestoreMs: 2500,
+    }),
+  );
+
+  const starting = store.start();
+  await vi.advanceTimersByTimeAsync(2500);
+  await starting;
+  // near-connect said none and the login had not answered: the page shows Connect.
+  expect(store.getSnapshot()).toMatchObject({ ready: true, accountId: null });
+
+  // The login answers late, with a session: the store takes it up as a restore.
+  answer(loginSession);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(store.getSnapshot().accountId).toBe(ACCOUNT);
+  expect(store.getSnapshot().keyHolder?.login).toBe("email");
+});
+
+test("a_disconnect_that_fails_keeps_the_way_heard_and_one_that_works_is_not_told_back", async () => {
+  // The way's own sign-out, caused by the disconnect, is not told back to the store.
+  const quiet = choices({ loginRestored: true });
+  quiet.login.disconnect = async () => {
+    quiet.login.signOut();
+  };
+  const heard: Array<Session | null> = [];
+  quiet.provider.subscribe((next) => heard.push(next));
+  await quiet.provider.restore();
+  await quiet.provider.disconnect(loginSession);
+  expect(heard).toEqual([]);
+
+  // A disconnect that throws leaves the session the way's: a sign-out from elsewhere later is heard.
+  const stuck = choices({ loginRestored: true });
+  stuck.login.disconnect = async () => {
+    throw new Error("logout failed");
+  };
+  const later: Array<Session | null> = [];
+  stuck.provider.subscribe((next) => later.push(next));
+  await stuck.provider.restore();
+  await expect(stuck.provider.disconnect(loginSession)).rejects.toThrow("logout failed");
+  stuck.login.signOut();
+  expect(later).toEqual([null]);
+});
+
+test("the_last_way_is_kept_as_one_of_two_words_and_anything_else_is_none", () => {
+  localStorage.clear();
+  expect(lastWay.get()).toBeNull();
+  lastWay.set("wallet");
+  expect(localStorage.getItem(LAST_WAY_KEY)).toBe("wallet");
+  expect(lastWay.get()).toBe("wallet");
+  localStorage.setItem(LAST_WAY_KEY, "something else");
+  expect(lastWay.get()).toBeNull();
+  // A browser that won't keep it loses only the preference.
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  expect(() => lastWay.set("login")).not.toThrow();
+  localStorage.clear();
 });

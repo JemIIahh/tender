@@ -273,6 +273,19 @@ export function privyProvider({
 /** The two ways to connect: the email or Google login, or a NEAR wallet (near-connect). */
 export type ConnectChoice = "login" | "wallet";
 
+/** Where the way of the last connect is kept, so that a restore prefers it (lib/lastWay.ts). */
+export interface WayMemory {
+  get(): ConnectChoice | null;
+  set(choice: ConnectChoice): void;
+}
+
+/**
+ * How long a restore waits for the login's answer before the store goes on without it. The login
+ * loads Privy's kit, which talks to Privy's servers and can be slow or blocked; a session it finds
+ * after this is still taken (it comes to the store through `subscribe`).
+ */
+export const LOGIN_RESTORE_MS = 2500;
+
 export interface ChoiceOptions {
   /** The email and Google login. Made the first time it is wanted. */
   login: () => Promise<WalletProvider>;
@@ -282,26 +295,55 @@ export interface ChoiceOptions {
   ask: () => Promise<ConnectChoice | null>;
   /** Gets a session of the login ready to pay fees (lib/gasGift.ts), as the chooser shows it. */
   prepare: (session: Session) => Promise<void>;
+  /** The way of the last connect. None by default: nothing is kept. */
+  memory?: WayMemory;
+  loginRestoreMs?: number;
 }
 
+const NO_MEMORY: WayMemory = { get: () => null, set: () => {} };
+
+const otherWay = (choice: ConnectChoice): ConnectChoice =>
+  choice === "login" ? "wallet" : "login";
+
 /**
- * One provider over both ways. Connect asks which; a restore takes either one's session from the
- * earlier visit; a disconnect and a sign-out are the way's that gave the session. Each way is made
- * once, and made again after it failed to load.
+ * One provider over both ways. Connect asks which, remembers it, and ends the other way's session,
+ * so that there is one session at a time. A restore looks at both ways at once and prefers the
+ * remembered one: another way's session is taken only once the preferred way has said it has none
+ * (with no way remembered, the first session found is taken). The login is waited for at most
+ * `loginRestoreMs`; a session it finds later is handed to the store through `subscribe`. A
+ * disconnect and a sign-out are the way's that gave the session. Each way is made once, and made
+ * again after it failed to load.
  */
-export function choiceProvider({ login, wallet, ask, prepare }: ChoiceOptions): WalletProvider {
+export function choiceProvider({
+  login,
+  wallet,
+  ask,
+  prepare,
+  memory = NO_MEMORY,
+  loginRestoreMs = LOGIN_RESTORE_MS,
+}: ChoiceOptions): WalletProvider {
   const made: Partial<Record<ConnectChoice, Promise<WalletProvider>>> = {};
   // The way of the session the store holds, as far as this provider gave it.
   let active: ConnectChoice | null = null;
+  // The session each way is known to hold, from its restore or its connect.
+  const known: Partial<Record<ConnectChoice, Session>> = {};
+  // A way being disconnected by this provider: the sign-out that causes is not news.
+  let muted: ConnectChoice | null = null;
   const listeners = new Set<(session: Session | null) => void>();
+
+  const tell = (session: Session | null) => {
+    for (const listener of [...listeners]) listener(session);
+  };
 
   function way(choice: ConnectChoice): Promise<WalletProvider> {
     made[choice] ??= (choice === "login" ? login() : wallet())
       .then((provider) => {
         provider.subscribe((next) => {
-          if (next === null && active === choice) {
+          if (next !== null) return;
+          delete known[choice];
+          if (active === choice && muted !== choice) {
             active = null;
-            for (const listener of [...listeners]) listener(null);
+            tell(null);
           }
         });
         return provider;
@@ -316,33 +358,80 @@ export function choiceProvider({ login, wallet, ask, prepare }: ChoiceOptions): 
   /** The session `choice` restores, or null when it has none or could not look. */
   async function restoreOf(choice: ConnectChoice): Promise<Session | null> {
     try {
-      return await (await way(choice)).restore();
+      const session = await (await way(choice)).restore();
+      if (session !== null) known[choice] = session;
+      return session;
     } catch (error) {
       console.error(error);
       return null;
     }
   }
 
+  /** Ends `choice`'s session, if it is known to have one, quietly: a failure is only logged. */
+  async function endOther(choice: ConnectChoice): Promise<void> {
+    const session = known[choice];
+    if (session === undefined) return;
+    delete known[choice];
+    muted = choice;
+    try {
+      await (await way(choice)).disconnect(session);
+    } catch (error) {
+      console.error(error);
+    } finally {
+      muted = null;
+    }
+  }
+
   return {
-    // Both ways look at once, and the first session found is the one: a login whose kit is slow to
-    // load (or blocked) does not keep a wallet's session from coming back.
     restore() {
+      const preferred = memory.get();
       return new Promise((resolve) => {
-        let left = 2;
-        let found = false;
-        for (const choice of ["login", "wallet"] as const) {
-          void restoreOf(choice).then((session) => {
-            if (found) return;
-            if (session !== null) {
-              found = true;
-              active = choice;
-              resolve(session);
-            } else if (--left === 0) {
-              active = null;
-              resolve(null);
+        const answers: Partial<Record<ConnectChoice, Session | null>> = {};
+        let loginGivenUp = false;
+        let done = false;
+        const answered = (choice: ConnectChoice) =>
+          choice in answers || (choice === "login" && loginGivenUp);
+        const take = (session: Session | null, choice: ConnectChoice | null) => {
+          done = true;
+          active = choice;
+          resolve(session);
+        };
+        const decide = () => {
+          if (done) return;
+          if (preferred === null) {
+            // No way remembered: the first session found.
+            for (const choice of ["login", "wallet"] as const) {
+              const session = answers[choice];
+              if (session) return take(session, choice);
             }
-          });
-        }
+          } else {
+            // The remembered way first; the other's session only once it has none.
+            for (const choice of [preferred, otherWay(preferred)]) {
+              if (!answered(choice)) return;
+              const session = answers[choice];
+              if (session) return take(session, choice);
+            }
+          }
+          if (answered("login") && answered("wallet")) take(null, null);
+        };
+        const giveUp = setTimeout(() => {
+          loginGivenUp = true;
+          decide();
+        }, loginRestoreMs);
+        void restoreOf("login").then((session) => {
+          clearTimeout(giveUp);
+          answers.login = session;
+          if (!done) return decide();
+          // Too late for the restore. A login found while the store has no session is still taken.
+          if (session !== null && active === null) {
+            active = "login";
+            tell(session);
+          }
+        });
+        void restoreOf("wallet").then((session) => {
+          answers.wallet = session;
+          decide();
+        });
       });
     },
 
@@ -357,14 +446,26 @@ export function choiceProvider({ login, wallet, ask, prepare }: ChoiceOptions): 
       }
       if (session === null) return null;
       active = choice;
+      known[choice] = session;
+      memory.set(choice);
+      // One session at a time: the other way's, if it has one, ends.
+      await endOther(otherWay(choice));
       if (choice === "login") await prepare(session);
       return session;
     },
 
     async disconnect(session) {
       const choice = active ?? (session.keyHolder === undefined ? "wallet" : "login");
-      active = null;
-      await (await way(choice)).disconnect(session);
+      // The sign-out this causes is the store's own doing: it is not told back. `active` stays
+      // until the way has disconnected, so that a way that failed to is still heard later.
+      muted = choice;
+      try {
+        await (await way(choice)).disconnect(session);
+      } finally {
+        muted = null;
+      }
+      if (active === choice) active = null;
+      delete known[choice];
     },
 
     subscribe(listener) {

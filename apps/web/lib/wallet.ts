@@ -13,6 +13,7 @@ import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { clearApiToken, sessionBegan, sessionEnded } from "./apiToken";
 import { chooser } from "./chooser";
 import { config } from "./config";
+import { lastWay } from "./lastWay";
 import { choiceProvider, createPrivyBridge, type MakePrivyWallet, privyProvider } from "./privy";
 import {
   TransactionFailed,
@@ -104,7 +105,11 @@ export interface WalletProvider {
   /** Has the person pick a wallet and sign in: null if they closed the dialog without one. */
   connect(): Promise<Session | null>;
   disconnect(session: Session): Promise<void>;
-  /** `listener(null)` when the wallet signs out by itself. Returns what stops the listening. */
+  /**
+   * `listener(null)` when the wallet signs out by itself, and `listener(session)` for a session of
+   * an earlier visit that turned up after `restore` had answered (the login, whose kit is slow to
+   * load). Returns what stops the listening.
+   */
   subscribe(listener: (session: Session | null) => void): () => void;
 }
 
@@ -410,6 +415,8 @@ export function createWalletStore(
         // first and loads on a later try has to be heard for a sign-out just the same.
         made.subscribe((next) => {
           if (next === null) endSession(true);
+          // A session of an earlier visit that came late: taken as a restore, if there is none.
+          else if (session === null) beginSession(next, true);
         });
         return made;
       })
@@ -735,6 +742,7 @@ async function createProvider(): Promise<WalletProvider> {
     wallet: () => connectorProvider(network),
     ask: chooser.ask,
     prepare: chooser.prepare,
+    memory: lastWay,
   });
 }
 

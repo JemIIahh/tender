@@ -170,13 +170,23 @@ test("the_dev_wallet_key_and_account_are_read_in_one_module_and_only_under_the_s
 });
 
 test("the_app_never_writes_to_local_storage_and_the_token_module_never_logs", () => {
-  // Local storage is read by every later visit to the page, and the API token is a secret. The one
-  // thing kept there is the viewer's choice of sidebar (the ASP brief), in one module, under one
-  // key, as one of two words: no token, no account, nothing from a request.
+  // Local storage is read by every later visit to the page, and the API token is a secret. Two
+  // things are kept there, each in one module, under one key, as one of two words: the viewer's
+  // choice of sidebar (the ASP brief), and the way this browser last connected ("login" or
+  // "wallet", lib/lastWay.ts). No token, no account, nothing from a request.
   const holders = appSources()
     .filter((file) => /\blocalStorage\s*[.[]/.test(readFileSync(file, "utf8")))
-    .map((file) => relative(WEB, file));
-  expect(holders).toEqual(["lib/sidebar.ts"]);
+    .map((file) => relative(WEB, file))
+    .sort();
+  expect(holders).toEqual(["lib/lastWay.ts", "lib/sidebar.ts"]);
+  const way = read("lib/lastWay.ts");
+  expect(way).toContain('export const LAST_WAY_KEY = "tender.connect.way";');
+  expect(way).toContain('const WAYS: readonly ConnectChoice[] = ["login", "wallet"];');
+  expect(way.match(/localStorage\.\w+\([^)]*\)/g)).toEqual([
+    "localStorage.getItem(LAST_WAY_KEY)",
+    "localStorage.setItem(LAST_WAY_KEY, choice)",
+  ]);
+  expect(way).not.toMatch(/localStorage\.(?:removeItem|clear|key)\b|localStorage\s*\[/);
   const sidebar = read("lib/sidebar.ts");
   expect(sidebar).toContain('export const SIDEBAR_KEY = "tender.sidebar";');
   const uses = sidebar.match(/localStorage\.\w+\([^)]*\)/g) ?? [];
