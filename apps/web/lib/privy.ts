@@ -280,9 +280,11 @@ export interface WayMemory {
 }
 
 /**
- * How long a restore waits for the login's answer before the store goes on without it. The login
- * loads Privy's kit, which talks to Privy's servers and can be slow or blocked; a session it finds
- * after this is still taken (it comes to the store through `subscribe`).
+ * How long a restore waits for the remembered login before it takes the other way's session. The
+ * login loads Privy's kit, which talks to Privy's servers and can be slow or blocked. With no
+ * session elsewhere the restore waits for the login's own answer, however long: the store shows
+ * Connect after its own patience (`START_PATIENCE_MS`) meanwhile, and takes up the login, with the
+ * token the tab kept, when it comes.
  */
 export const LOGIN_RESTORE_MS = 2500;
 
@@ -306,13 +308,14 @@ const otherWay = (choice: ConnectChoice): ConnectChoice =>
   choice === "login" ? "wallet" : "login";
 
 /**
- * One provider over both ways. Connect asks which, remembers it, and ends the other way's session,
- * so that there is one session at a time. A restore looks at both ways at once and prefers the
- * remembered one: another way's session is taken only once the preferred way has said it has none
- * (with no way remembered, the first session found is taken). The login is waited for at most
- * `loginRestoreMs`; a session it finds later is handed to the store through `subscribe`. A
- * disconnect and a sign-out are the way's that gave the session. Each way is made once, and made
- * again after it failed to load.
+ * One provider over both ways, with one session at a time. Connect asks which, remembers it, and
+ * ends the other way's session. A restore looks at both ways at once and prefers the remembered
+ * one: another way's session is taken only once the preferred way has said it has none, or, for
+ * the login, after `loginRestoreMs` (with no way remembered, the first session found is taken).
+ * "None" is said only once both ways have answered. A session that turns up beside the one taken
+ * is ended. Log out ends every session this provider knows of, so that a reload brings back none.
+ * A sign-out is the way's that gave the session. Each way is made once, and made again after it
+ * failed to load.
  */
 export function choiceProvider({
   login,
@@ -393,7 +396,9 @@ export function choiceProvider({
           choice in answers || (choice === "login" && loginGivenUp);
         const take = (session: Session | null, choice: ConnectChoice | null) => {
           done = true;
-          active = choice;
+          if (active === null) active = choice;
+          // A connect came first: the store keeps that one, and this way's session ends.
+          else if (session !== null && choice !== null && choice !== active) void endOther(choice);
           resolve(session);
         };
         const decide = () => {
@@ -412,7 +417,9 @@ export function choiceProvider({
               if (session) return take(session, choice);
             }
           }
-          if (answered("login") && answered("wallet")) take(null, null);
+          // "None" only once both ways have really answered: a login that is slow to say is not a
+          // login that isn't there, and the token the tab kept for it must not be dropped.
+          if ("login" in answers && "wallet" in answers) take(null, null);
         };
         const giveUp = setTimeout(() => {
           loginGivenUp = true;
@@ -422,11 +429,9 @@ export function choiceProvider({
           clearTimeout(giveUp);
           answers.login = session;
           if (!done) return decide();
-          // Too late for the restore. A login found while the store has no session is still taken.
-          if (session !== null && active === null) {
-            active = "login";
-            tell(session);
-          }
+          // Too late: the other way's session was taken. One session at a time, so this one ends,
+          // unless the person has connected by the login since.
+          if (session !== null && active !== "login") void endOther("login");
         });
         void restoreOf("wallet").then((session) => {
           answers.wallet = session;
@@ -466,6 +471,9 @@ export function choiceProvider({
       }
       if (active === choice) active = null;
       delete known[choice];
+      // Log out is no session at all: any other this provider knows of ends too, quietly, so that
+      // a reload can't bring it back.
+      await endOther(otherWay(choice));
     },
 
     subscribe(listener) {

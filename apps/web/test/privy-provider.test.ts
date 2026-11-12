@@ -377,21 +377,45 @@ test("connect_remembers_its_way_and_ends_the_other_way_s_session", async () => {
   expect(heard).toEqual([]);
 });
 
-test("a_slow_login_does_not_hold_the_restore_and_a_late_session_is_still_taken", async () => {
-  vi.useFakeTimers();
+/** A login whose restore answers only when the test says, and which counts its log outs. */
+function slowLogin() {
   let answer: (session: Session | null) => void = () => {};
-  const slowLogin: WalletProvider = {
+  const provider: WalletProvider & { logouts: number } = {
+    logouts: 0,
     restore: () =>
       new Promise((resolve) => {
         answer = resolve;
       }),
     connect: async () => null,
-    disconnect: async () => {},
+    disconnect: async () => {
+      provider.logouts++;
+    },
     subscribe: () => () => {},
   };
-  const store = createWalletStore(async () =>
-    choiceProvider({
-      login: async () => slowLogin,
+  return { provider, answer: (session: Session | null) => answer(session) };
+}
+
+test("a_login_slow_to_answer_is_not_taken_for_none_and_keeps_the_token_the_tab_kept", async () => {
+  // A reload: the tab kept a Tender token for the login's account (lib/apiToken.ts).
+  vi.resetModules();
+  sessionStorage.setItem(
+    "tender.apiToken",
+    JSON.stringify({
+      accountId: ACCOUNT,
+      token: "kept-token",
+      expiresAtMs: Date.now() + 3_600_000,
+    }),
+  );
+  const [wallet, privy, tokens] = await Promise.all([
+    import("../lib/wallet"),
+    import("../lib/privy"),
+    import("../lib/apiToken"),
+  ]);
+  vi.useFakeTimers();
+  const login = slowLogin();
+  const store = wallet.createWalletStore(async () =>
+    privy.choiceProvider({
+      login: async () => login.provider,
       wallet: async () => fakeProvider(walletSession),
       ask: async () => null,
       prepare: async () => {},
@@ -399,17 +423,56 @@ test("a_slow_login_does_not_hold_the_restore_and_a_late_session_is_still_taken",
     }),
   );
 
+  // Past the login's 2.5 s and the store's own patience: the page shows Connect...
   const starting = store.start();
-  await vi.advanceTimersByTimeAsync(2500);
+  await vi.advanceTimersByTimeAsync(wallet.START_PATIENCE_MS);
   await starting;
-  // near-connect said none and the login had not answered: the page shows Connect.
   expect(store.getSnapshot()).toMatchObject({ ready: true, accountId: null });
+  // ...but nothing has said there is no login, so the tab's token stays.
+  expect(tokens.heldToken()?.token).toBe("kept-token");
 
-  // The login answers late, with a session: the store takes it up as a restore.
-  answer(loginSession);
+  // The login answers: it is taken up as the earlier visit's, with its token.
+  login.answer(loginSession);
   await vi.advanceTimersByTimeAsync(0);
   expect(store.getSnapshot().accountId).toBe(ACCOUNT);
-  expect(store.getSnapshot().keyHolder?.login).toBe("email");
+  expect(tokens.heldToken()?.token).toBe("kept-token");
+  sessionStorage.clear();
+});
+
+test("a_login_that_answers_after_the_wallet_was_taken_is_ended", async () => {
+  vi.useFakeTimers();
+  const login = slowLogin();
+  const provider = choiceProvider({
+    login: async () => login.provider,
+    wallet: async () => fakeProvider(walletSession, { restored: true }),
+    ask: async () => null,
+    prepare: async () => {},
+    memory: { get: () => "login", set: () => {} },
+    loginRestoreMs: 2500,
+  });
+  const restoring = provider.restore();
+  await vi.advanceTimersByTimeAsync(2500);
+  // The remembered login didn't answer in time and the wallet has a session: it is taken.
+  expect((await restoring)?.accountId).toBe(ALICE);
+
+  // The login comes back late: one session at a time, so it ends.
+  login.answer(loginSession);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(login.provider.logouts).toBe(1);
+});
+
+test("log_out_ends_every_session_the_provider_knows_of", async () => {
+  // Both ways hold a session (from before the way was remembered); the login's is taken.
+  const both = choices({ loginRestored: true, walletRestored: true, remembered: "login" });
+  const heard: Array<Session | null> = [];
+  both.provider.subscribe((next) => heard.push(next));
+  expect((await both.provider.restore())?.accountId).toBe(ACCOUNT);
+
+  await both.provider.disconnect(loginSession);
+  // Both end, so that a reload can't bring back the wallet's account; quietly.
+  expect(both.login.disconnects).toBe(1);
+  expect(both.near.disconnects).toBe(1);
+  expect(heard).toEqual([]);
 });
 
 test("a_disconnect_that_fails_keeps_the_way_heard_and_one_that_works_is_not_told_back", async () => {
