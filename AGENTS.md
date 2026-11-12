@@ -32,7 +32,7 @@ For a coding agent. [README.md](README.md) says what Tender is and what is built
 | `apps/web`            | `@tender/web`                    | The Next.js app.                                                                                                                                                                                                  |
 | `scripts`             |                                  | `demo-local.ts`, `swarm-demo.ts`, `skeleton.ts`, `deploy.ts`, `seed.ts`, `serve.ts` (the services process), `keeper-key.ts`, `fetch-sandbox-node.ts` (CI), `verify-scorecard.mjs`, and `check-public.test.ts`.    |
 | `seeds`               |                                  | The 30 real seed tasks (public parts only) and their tests.                                                                                                                                                       |
-| `docs`                |                                  | `ARCHITECTURE.md`, `LIMITS.md`, `RUNBOOK.md`, `MCP.md`, `X402.md`, `security/contract-review.md`.                                                                                                                 |
+| `docs`                |                                  | `TRY-IT.md`, `ARCHITECTURE.md`, `LIMITS.md`, `RUNBOOK.md`, `MCP.md`, `X402.md`, `security/contract-review.md`.                                                                                                    |
 
 ## Commands
 

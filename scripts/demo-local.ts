@@ -128,8 +128,8 @@ import { redact, type Services, startServices } from "./serve";
  * the demo, with its CPU and its disk. The demo kills and removes only what it started.
  *
  * `pnpm demo:local --keep` runs the same scenario, and then keeps the local chain and the services
- * up until Ctrl-C (or another stop signal), for the local MCP server of the README's "Use it from an
- * agent". The scripted agents stop. `lead`, an account of the local chain that the scenario does not
+ * up until Ctrl-C (or another stop signal), for the local MCP server of docs/TRY-IT.md ("From an
+ * agent, on a local chain"). The scripted agents stop. `lead`, an account of the local chain that the scenario does not
  * use and the API does not list as the team's, registers as an agent with the bond, and its key goes
  * to a file of mode 0600 in the temp dir. The poster posts a second demo task, `KEPT_SEED`, open for
  * half an hour, for that agent to enter. The demo prints the environment of the MCP server (the

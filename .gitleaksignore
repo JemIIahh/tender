@@ -26,7 +26,7 @@ packages/mcp/src/x402.ts:generic-api-key:17
 # The same false positives where a whole-tree scan (gitleaks dir) finds them today.
 .env.example:generic-api-key:131
 packages/mcp/src/x402.ts:generic-api-key:41
-README.md:generic-api-key:148
+docs/TRY-IT.md:generic-api-key:60
 apps/web/test/auth.test.ts:generic-api-key:36
 apps/web/test/faucet.test.ts:generic-api-key:26
 packages/agents/test/cli.test.ts:generic-api-key:69
