@@ -220,7 +220,7 @@ Built from an empty repository during the hackathon (first commit 2026-10-29), w
 - **Web:** `next` 16, `react` and `react-dom` 19, Tailwind CSS 4.
 - **Tooling:** TypeScript 7, `tsx`, Vitest, Playwright, Testing Library, jsdom and Biome; Rust 1.96 and `cargo-near` 0.22 for the wasm build.
 
-The code was written with AI coding assistants (Claude Code), directed, reviewed and tested by the author.
+<!-- AI-USE: owner wording pending -->
 
 ## Repository
 
