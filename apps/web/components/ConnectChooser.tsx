@@ -290,7 +290,8 @@ function Choose({
   store: Chooser;
   firstRef: (element: HTMLElement | null) => void;
 }) {
-  const problemId = useId();
+  const emailProblemId = useId();
+  const googleProblemId = useId();
   const busy = state.busy !== null;
   return (
     <>
@@ -316,8 +317,8 @@ function Choose({
                 spellCheck={false}
                 placeholder="your@email.com"
                 aria-label="Email address"
-                aria-invalid={state.problem !== null && state.busy === null ? true : undefined}
-                aria-describedby={state.problem === null ? undefined : problemId}
+                aria-invalid={state.emailProblem !== null && state.busy === null ? true : undefined}
+                aria-describedby={state.emailProblem === null ? undefined : emailProblemId}
                 defaultValue={state.email}
                 readOnly={busy}
                 className="h-12 min-w-0 flex-1 bg-transparent text-[14px] font-medium text-bone placeholder:text-muted focus-visible:outline-none!"
@@ -331,9 +332,16 @@ function Choose({
                 {state.busy === "email" ? "Sending…" : "Submit"}
               </button>
             </form>
+            {/* Each row's line under its own row: the email row's, then Google's. */}
+            {state.emailProblem === null ? null : (
+              <p id={emailProblemId} role="alert" className={PROBLEM}>
+                {state.emailProblem}
+              </p>
+            )}
             <button
               type="button"
               aria-disabled={busy ? true : undefined}
+              aria-describedby={state.googleProblem === null ? undefined : googleProblemId}
               onClick={() => void store.google()}
               className={ROW_BUTTON}
             >
@@ -343,9 +351,9 @@ function Choose({
               </span>
               {state.lastUsed === "google" ? <LastUsedBadge /> : null}
             </button>
-            {state.problem === null ? null : (
-              <p id={problemId} role="alert" className={PROBLEM}>
-                {state.problem}
+            {state.googleProblem === null ? null : (
+              <p id={googleProblemId} role="alert" className={PROBLEM}>
+                {state.googleProblem}
               </p>
             )}
             <p className="flex items-center gap-3 py-2 text-[12px] text-muted">
@@ -406,7 +414,6 @@ function Code({
         }}
         inputMode="numeric"
         autoComplete="one-time-code"
-        maxLength={6}
         placeholder="······"
         aria-label="Code"
         aria-invalid={state.problem === null ? undefined : true}

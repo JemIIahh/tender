@@ -37,7 +37,10 @@ export type ChooserState =
       /** The address typed last, kept for Back. */
       email: string;
       busy: "email" | "google" | null;
-      problem: string | null;
+      /** What went wrong with the email row (a bad address, a code that couldn't be sent). */
+      emailProblem: string | null;
+      /** What went wrong with Google (`GOOGLE_DIDNT_FINISH`). */
+      googleProblem: string | null;
     } & Offer)
   | ({
       step: "code";
@@ -241,7 +244,8 @@ export function createChooser(
         lastUsed: offered.lastUsed,
         email: "",
         busy: null,
-        problem: offered.problem ?? null,
+        emailProblem: null,
+        googleProblem: offered.problem ?? null,
       });
       listWallets(mine, offered);
       return asked;
@@ -256,18 +260,19 @@ export function createChooser(
         set({
           ...state,
           email,
-          problem: email === "" ? "Enter your email address." : "Check the email address.",
+          emailProblem: email === "" ? "Enter your email address." : "Check the email address.",
+          googleProblem: null,
         });
         return;
       }
-      set({ ...state, email, busy: "email", problem: null });
+      set({ ...state, email, busy: "email", emailProblem: null, googleProblem: null });
       try {
         await (await steps()).sendCode(email);
       } catch (error) {
         update(mine, "choose", (current) => ({
           ...current,
           busy: null,
-          problem: sendCodeProblem(error),
+          emailProblem: sendCodeProblem(error),
         }));
         return;
       }
@@ -329,14 +334,21 @@ export function createChooser(
     /** From the code back to the window's first step, with the address kept. */
     back(): void {
       if (state.step !== "code") return;
-      set({ ...offerOf(state), step: "choose", email: state.email, busy: null, problem: null });
+      set({
+        ...offerOf(state),
+        step: "choose",
+        email: state.email,
+        busy: null,
+        emailProblem: null,
+        googleProblem: null,
+      });
     },
 
     /** Sends the page to Google. The login ends when the page comes back (lib/privy.ts). */
     async google(): Promise<void> {
       if (state.step !== "choose" || state.busy !== null || !state.login) return;
       const mine = run;
-      set({ ...state, busy: "google", problem: null });
+      set({ ...state, busy: "google", emailProblem: null, googleProblem: null });
       try {
         await (await steps()).google();
       } catch (error) {
@@ -344,7 +356,7 @@ export function createChooser(
         update(mine, "choose", (current) => ({
           ...current,
           busy: null,
-          problem: GOOGLE_DIDNT_FINISH,
+          googleProblem: GOOGLE_DIDNT_FINISH,
         }));
       }
       // Otherwise the page is on its way to Google, and the window stays as it is until it goes.

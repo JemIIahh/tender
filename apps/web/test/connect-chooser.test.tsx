@@ -186,8 +186,10 @@ test("an_email_gets_a_code_and_the_code_logs_in_with_the_window_kept_open", asyn
   expect(code.getAttribute("autocomplete")).toBe("one-time-code");
   expect(code.getAttribute("inputmode")).toBe("numeric");
 
-  // Six digits are the whole code: it goes at once.
-  await userEvent.type(code, "123456");
+  // A code pasted as the email shows it, with a space: all six digits, and it goes at once.
+  expect(code.getAttribute("maxlength")).toBeNull();
+  await userEvent.click(code);
+  await userEvent.paste("123 456");
   expect(asked).toEqual(["sendCode ada@example.com", "loginWithCode 123456"]);
   expect(await answer).toEqual({ way: "login" });
   // The window stays, getting the account ready, until the session is made and checked.
@@ -238,7 +240,12 @@ test("each_email_problem_is_one_plain_line", async () => {
   await userEvent.type(screen.getByLabelText("Email address"), "ada@");
   await submit();
   expect(screen.getByRole("alert").textContent).toBe("Check the email address.");
-  expect(screen.getByLabelText("Email address").getAttribute("aria-invalid")).toBe("true");
+  const field = screen.getByLabelText("Email address");
+  expect(field.getAttribute("aria-invalid")).toBe("true");
+  // The email row's line is under the email row, before Google's, and describes the field.
+  const line = screen.getByRole("alert");
+  expect(field.closest("form")?.nextElementSibling).toBe(line);
+  expect(field.getAttribute("aria-describedby")).toBe(line.id);
   expect(asked).toEqual([]);
   await userEvent.type(screen.getByLabelText("Email address"), "example.com");
   await submit();
@@ -318,12 +325,16 @@ test("google_sends_the_page_to_google_and_says_so_if_it_can_t", async () => {
     }).ways,
   );
   await userEvent.click(screen.getByRole("button", { name: "Continue with Google" }));
-  expect(screen.getByRole("alert").textContent).toBe(
-    "Google sign-in didn't finish. Try again or use email.",
-  );
-  expect(
-    screen.getByRole("button", { name: "Continue with Google" }).getAttribute("aria-disabled"),
-  ).toBeNull();
+  const line = screen.getByRole("alert");
+  expect(line.textContent).toBe("Google sign-in didn't finish. Try again or use email.");
+  const google = screen.getByRole("button", { name: "Continue with Google" });
+  expect(google.getAttribute("aria-disabled")).toBeNull();
+  // Google's line is under the Google row and describes it; the email field is not marked.
+  expect(google.nextElementSibling).toBe(line);
+  expect(google.getAttribute("aria-describedby")).toBe(line.id);
+  const field = screen.getByLabelText("Email address");
+  expect(field.getAttribute("aria-invalid")).toBeNull();
+  expect(field.getAttribute("aria-describedby")).toBeNull();
 });
 
 test("back_from_google_the_window_says_it_is_finishing_and_then_gets_the_account_ready", async () => {
