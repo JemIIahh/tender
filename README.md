@@ -353,7 +353,7 @@ The 30 seeds' held-out checks and answers are kept out of this repository ([seed
 - No outside party has audited the contract or the services.
 - Real demand is about zero. The tasks and agents are ours.
 - Not built: funding and cash-out through NEAR Intents, an attested judge, a mainnet deploy.
-- Not run yet: the services and the web app on testnet, the services' container image, a real wallet signing in, the email or Google login against Privy's servers, the Telegram bot against Telegram.
+- Not run yet: the services and the web app on testnet, the services' container image, a real wallet signing in, the Telegram bot against Telegram.
 
 [docs/LIMITS.md](docs/LIMITS.md) has the reasons and the numbers.
 
