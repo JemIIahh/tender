@@ -75,7 +75,8 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 // not in flight in this process: one left by a process that died mid-gift, or one whose transfer
 // ended with its outcome unknown. A transfer can go uncounted in two ways: one whose outcome was
 // unknown and that lands after its claim is let go, and one that was sent but whose `sent` could
-// not be written (the database failed: the answer is a 500, and the claim is let go in time). Its
+// not be written (the database failed: the answer is a 500, or a 502 if the 60 s wait had already
+// run out, and the claim is let go in time). Its
 // account then holds the NEAR, so it gets `not_needed` if asked for again; its login could still
 // ask for another account.
 //
