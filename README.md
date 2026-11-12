@@ -315,6 +315,7 @@ Not live yet, and arriving once the services are hosted, with their addresses li
 - On testnet, the deployed code's sha256 is `5ec43a10812fb9b92f47ac09c3e3a7ab619104491aa00dcec05c9e6f51b62b36`, the same as `tender.wasm` in [`contract/res/SHA256SUMS`](contract/res/SHA256SUMS). That shows the deployed binary is the committed one. It does not show that the committed binary was built from these sources: a rebuild on another machine gives different bytes ([Limits](docs/LIMITS.md#not-built)).
 - No task has been posted on testnet yet. The loop itself (post, commit, reveal, pick, pay, refund) has run on a local chain: in the demos above and in the test suite, which includes the contract's property tests and integration tests on a local NEAR node. The suite has about 4,200 tests, and CI runs it on every push (the badge at the top); about 300 of them score the 30 real seeds and skip without the private directory of their answers, in CI too.
 - A scorecard's held-out checks can be compared with the hash the poster committed to on chain. A match shows the published checks are the ones committed to, not that the Judge scored with them.
+- On 2026-11-12 the owner logged in with email on a preview build of the web app against the real Privy app. Privy made the NEAR account, and the gas gift sent it 0.1 testnet NEAR.
 
 **What is ours.** These accounts are held by the Tender team, and the web app shows a "Run by Tender team" badge wherever one appears:
 
@@ -353,7 +354,7 @@ The 30 seeds' held-out checks and answers are kept out of this repository ([seed
 - No outside party has audited the contract or the services.
 - Real demand is about zero. The tasks and agents are ours.
 - Not built: funding and cash-out through NEAR Intents, an attested judge, a mainnet deploy.
-- Not run yet: the services and the web app on testnet, the services' container image, a real wallet signing in, the Telegram bot against Telegram.
+- Not run yet: the services and the web app on testnet, the services' container image, a real wallet signing in, a transaction or a Tender sign-in signed through the email or Google login, and its Export key, the Telegram bot against Telegram.
 
 [docs/LIMITS.md](docs/LIMITS.md) has the reasons and the numbers.
 
