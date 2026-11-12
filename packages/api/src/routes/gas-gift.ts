@@ -60,12 +60,14 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 //        or the node refused it for a reason in its signed bytes alone), and its claim is let go,
 //        so asking again works; or its outcome is not known, and the NEAR may still arrive: its
 //        claim is kept, as THE CLAIM says, and a `WARN api:` line says `may still land`. Unknown
-//        is a timeout, no answer within `TRANSFER_WAIT_MS`, and every error that can answer a
-//        resent copy of a transfer that was taken: a used nonce, a gift account short of NEAR,
-//        an expired block, a congested or stuck shard. The pool is read before each claim, so a
-//        call meets an empty pool here only when calls at once empty it between that read and the
-//        transfer: the read is a check before sending, not a guarantee. Such a call keeps its
-//        claim until it goes stale, counted against the day meanwhile;
+//        is a timeout, no answer within `TRANSFER_WAIT_MS`, and every refusal that is not a
+//        property of the signed bytes alone: a used nonce, a gift account short of NEAR (its
+//        balance is the chain's state at that moment), an expired block, a congested or stuck
+//        shard, and any other error. The pool is read before each claim, but that read is a check
+//        before sending, not a guarantee: it is of the last final block, which can lag a gift
+//        that has just executed, so calls close together can still meet an empty pool here, and
+//        so can a call after another spend from the gift account. Such a call keeps its claim
+//        until it goes stale, counted against the day meanwhile;
 //   200  `sent`, with the amount and the transfer's hash, once the transfer has executed.
 //
 // THE CLAIM. A gift's row is written before the transfer is sent, in a transaction that locks the
@@ -581,8 +583,9 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
 
   /**
    * Whether the gift account can pay one more gift and `GAS_GIFT_POOL_MARGIN` for its storage and
-   * fees, by its balance now. A check before the claim, not a guarantee: calls at once can still
-   * empty the pool between this read and their transfers. An empty pool is said in a WARN, with the
+   * fees, by its balance at the last final block. A check before the claim, not a guarantee: that
+   * block can lag a gift that has just executed, and calls close together, or another spend from
+   * the gift account, can still empty the pool before a transfer. An empty pool is said in a WARN, with the
    * account and its balance, once in `POOL_WARN_MS` at most (a clock gone back says it again).
    */
   async function poolCovers(on: GasGift): Promise<boolean> {

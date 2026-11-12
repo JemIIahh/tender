@@ -550,11 +550,12 @@ test("a_transfer_that_timed_out_keeps_its_claim_since_the_near_may_still_arrive"
   expect(transfers).toHaveLength(2);
 });
 
-test("a_transfer_answered_with_an_error_that_a_resent_copy_can_get_keeps_its_claim", async () => {
-  // near-api-js sends the same signed bytes again after an HTTP 408, 500 or 503, and each of these
-  // can answer that second copy while the first was taken: it used the nonce, spent what was there
-  // (so an empty gift pool looks the same), landed before its block expired, or met a congested
-  // shard. The NEAR may still arrive, so the claim is kept.
+test("a_transfer_answered_with_a_refusal_not_in_its_signed_bytes_keeps_its_claim", async () => {
+  // None of these is a property of the signed bytes alone, so none says for certain that no copy
+  // of the transfer ran: near-api-js sends the same bytes again after an HTTP 408, 500 or 503, and a
+  // used nonce or an expired block can answer that second copy while the first was taken; a lack of
+  // NEAR (as an emptied gift pool gives) and a congested shard are the chain's state at that moment.
+  // The NEAR may still arrive, so the claim is kept.
   const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
   for (const [what, error] of [
     ["a used nonce", new InvalidNonceError(7, 7, "TX", "BLOCK")],
