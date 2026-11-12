@@ -76,7 +76,13 @@ interface Login {
  */
 async function loginWorld(
   page: Page,
-  options: { login?: "email" | "google"; refuse?: string; refuseStatus?: number } = {},
+  options: {
+    login?: "email" | "google";
+    refuse?: string;
+    refuseStatus?: number;
+    oauth?: "deny";
+    oauthDelayMs?: number;
+  } = {},
 ): Promise<Login> {
   await routeApi(page);
   await routeWalletManifest(page, LISTED_WALLETS);
@@ -139,7 +145,12 @@ async function loginWorld(
     (stub) => {
       (window as unknown as { __tenderPrivyStub: unknown }).__tenderPrivyStub = stub;
     },
-    { address: ACCOUNT, login: options.login ?? "email" },
+    {
+      address: ACCOUNT,
+      login: options.login ?? "email",
+      ...(options.oauth === undefined ? {} : { oauth: options.oauth }),
+      ...(options.oauthDelayMs === undefined ? {} : { oauthDelayMs: options.oauthDelayMs }),
+    },
   );
   return { gifts, land: () => release() };
 }
@@ -347,14 +358,24 @@ test("an_email_login_takes_its_code_gets_its_account_ready_and_the_wallet_page_s
 test("a_google_login_leaves_and_comes_back_and_a_refused_gift_says_so_with_the_faucet", async ({
   page,
 }) => {
-  const world = await loginWorld(page, { login: "google", refuse: "gift_off" });
+  const world = await loginWorld(page, {
+    login: "google",
+    refuse: "gift_off",
+    oauthDelayMs: 2500,
+  });
   await page.setViewportSize(PHONE);
   await page.goto("/wallet");
   await openWindow(page);
   await connectWindow(page).getByRole("button", { name: "Continue with Google" }).click();
 
-  // Back on the page it left, with Privy's parameters taken off the address, the login ends and
-  // the account is got ready: here, Tender won't send.
+  // Back on the page it left, the window says the Google sign-in is being finished...
+  await expect(connectWindow(page).getByTestId("google-finishing")).toHaveText(
+    "Finishing your Google sign-in…",
+  );
+  await shoot(page, "google-finishing");
+
+  // ...and, with Privy's parameters taken off the address, the login ends and the account is got
+  // ready: here, Tender won't send.
   await expect(connectWindow(page).getByTestId("account-stuck")).toHaveText(
     "Tender isn't sending NEAR for fees right now.",
   );
@@ -369,6 +390,33 @@ test("a_google_login_leaves_and_comes_back_and_a_refused_gift_says_so_with_the_f
   // The person is logged in all the same, as a Google login; the account waits for its NEAR.
   await connectWindow(page).getByRole("button", { name: "Close" }).click();
   await expect(page.getByTestId("login-label")).toHaveText("Google login");
+});
+
+test("a_google_sign_in_turned_down_says_so_in_the_window_with_every_way_still_there", async ({
+  page,
+}) => {
+  const world = await loginWorld(page, { login: "google", oauth: "deny" });
+  await page.setViewportSize(LAPTOP);
+  await page.goto("/wallet");
+  await openWindow(page);
+  await connectWindow(page).getByRole("button", { name: "Continue with Google" }).click();
+
+  // Back from "Google" with no login: the window opens again, says so, and offers every way.
+  await expect(connectWindow(page).getByRole("alert")).toHaveText(
+    "Google sign-in didn't finish. Try again or use email.",
+  );
+  await expect(page).toHaveURL(/\/wallet$/);
+  await expect(connectWindow(page).getByLabel("Email address")).toBeVisible();
+  await expect(
+    connectWindow(page).getByRole("button", { name: "Continue with Google" }),
+  ).toBeVisible();
+  await expect(connectWindow(page).getByTestId("wallet-row")).toHaveCount(2);
+  expect(world.gifts).toEqual([]);
+  await shoot(page, "google-didnt-finish");
+
+  // Closed, the page offers Sign in, signed in as nobody.
+  await page.keyboard.press("Escape");
+  await expect(page.locator("main").getByRole("button", { name: "Sign in" })).toBeVisible();
 });
 
 test("a_gift_whose_send_failed_offers_try_again_first_and_the_faucet_second", async ({ page }) => {

@@ -20,6 +20,10 @@ interface StubSettings {
   code?: string;
   /** Privy's error code for every code sent, when the spec wants sending to fail. */
   sendFails?: string;
+  /** "deny": the person turns the Google login down at "Google". */
+  oauth?: "deny";
+  /** How long the login takes to end once the page is back from "Google". */
+  oauthDelayMs?: number;
 }
 
 /** The code the email login takes when the spec sets none. */
@@ -117,18 +121,23 @@ export function useLoginWithOAuth(callbacks: LoginCallbacks) {
     if (code === null || url.searchParams.get("privy_oauth_state") === null) return;
     for (const name of OAUTH_PARAMS) url.searchParams.delete(name);
     window.history.replaceState({}, "", url);
-    if (code === "denied") {
-      latest.current.onError?.("oauth_user_denied");
-      return;
-    }
-    setAuthed(true);
-    latest.current.onComplete?.({ user: userOf(settings()) });
+    const end = () => {
+      if (code === "denied") {
+        latest.current.onError?.("oauth_user_denied");
+        return;
+      }
+      setAuthed(true);
+      latest.current.onComplete?.({ user: userOf(settings()) });
+    };
+    const delay = settings().oauthDelayMs ?? 0;
+    if (delay > 0) setTimeout(end, delay);
+    else end();
   }, []);
   return {
     // Leaves the page and comes back to it, as a Google login does, with no Google in between.
     initOAuth: async ({ provider }: { provider: string }) => {
       const url = new URL(window.location.href);
-      url.searchParams.set("privy_oauth_code", "e2e-code");
+      url.searchParams.set("privy_oauth_code", settings().oauth === "deny" ? "denied" : "e2e-code");
       url.searchParams.set("privy_oauth_state", "e2e-state");
       url.searchParams.set("privy_oauth_provider", provider);
       window.location.assign(url);

@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { api } from "./api";
+import { GOOGLE_DIDNT_FINISH } from "./copy";
 import { type GiftDeps, type GiftProblem, getAccountReady, type Readiness } from "./gasGift";
 import type { LastUsed } from "./lastWay";
 import type { ConnectPick, ConnectWays, LoginSteps } from "./privy";
@@ -48,6 +49,7 @@ export type ChooserState =
       /** A new code was sent (Resend). */
       resent: boolean;
     } & Offer)
+  | { step: "finishing" }
   | { step: "preparing"; accountId: string | null }
   | { step: "stuck"; accountId: string; problem: GiftProblem; before: bigint | null };
 
@@ -239,7 +241,7 @@ export function createChooser(
         lastUsed: offered.lastUsed,
         email: "",
         busy: null,
-        problem: null,
+        problem: offered.problem ?? null,
       });
       listWallets(mine, offered);
       return asked;
@@ -342,7 +344,7 @@ export function createChooser(
         update(mine, "choose", (current) => ({
           ...current,
           busy: null,
-          problem: "Couldn't open the Google login. Try again.",
+          problem: GOOGLE_DIDNT_FINISH,
         }));
       }
       // Otherwise the page is on its way to Google, and the window stays as it is until it goes.
@@ -357,6 +359,16 @@ export function createChooser(
       run++;
       set(CLOSED);
       settle({ way: "wallet", walletId });
+    },
+
+    /**
+     * Says the page is finishing a login that came back from Google, until the account is got ready
+     * (`prepare`) or the window asks again (`ask`, saying it didn't finish).
+     */
+    finishing(): void {
+      run++;
+      readying = null;
+      set({ step: "finishing" });
     },
 
     /**

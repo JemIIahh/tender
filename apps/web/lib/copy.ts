@@ -30,6 +30,12 @@ export const SIGNED_IN_AS = "Signed in as";
 /** While the page looks for the sign-in of an earlier visit. */
 export const CHECKING_SIGN_IN = "Checking if you're signed in…";
 
+/** While the page, back from Google, waits for the login to end. */
+export const FINISHING_GOOGLE = "Finishing your Google sign-in…";
+
+/** A Google sign-in that was cancelled at Google, failed there, or couldn't start. */
+export const GOOGLE_DIDNT_FINISH = "Google sign-in didn't finish. Try again or use email.";
+
 /** A page that reads the account's balances says so in these words. */
 export const READING_BALANCES = "Reading your balances…";
 

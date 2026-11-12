@@ -318,10 +318,62 @@ test("google_sends_the_page_to_google_and_says_so_if_it_can_t", async () => {
     }).ways,
   );
   await userEvent.click(screen.getByRole("button", { name: "Continue with Google" }));
-  expect(screen.getByRole("alert").textContent).toBe("Couldn't open the Google login. Try again.");
+  expect(screen.getByRole("alert").textContent).toBe(
+    "Google sign-in didn't finish. Try again or use email.",
+  );
   expect(
     screen.getByRole("button", { name: "Continue with Google" }).getAttribute("aria-disabled"),
   ).toBeNull();
+});
+
+test("back_from_google_the_window_says_it_is_finishing_and_then_gets_the_account_ready", async () => {
+  let land: (answer: GasGiftResponse) => void = () => {};
+  const world = giftWorld(
+    [0n, GIFT],
+    () =>
+      new Promise((resolve) => {
+        land = resolve;
+      }),
+  );
+  const store = createChooser(() => world.deps);
+  render(<ConnectChooser store={store} />);
+  act(() => store.finishing());
+  expect(within(dialog()).getByRole("heading").textContent).toBe("Your account");
+  expect(screen.getByTestId("google-finishing").textContent).toBe("Finishing your Google sign-in…");
+  // Nothing to press but Close, which has the focus.
+  expect(document.activeElement?.getAttribute("aria-label")).toBe("Close");
+
+  // The login ended: the account step opens in its place.
+  let prepared: Promise<void> = Promise.resolve();
+  act(() => {
+    prepared = store.prepare(loginSession());
+  });
+  expect((await screen.findByTestId("account-preparing")).textContent).toBe(
+    "Getting your account ready…",
+  );
+  expect(screen.queryByTestId("google-finishing")).toBeNull();
+  await act(async () => land({ status: "sent", amount: GIFT.toString(), tx_hash: "h" }));
+  await act(() => prepared);
+  expect(screen.queryByRole("dialog")).toBeNull();
+});
+
+test("a_google_sign_in_that_didn_t_finish_opens_the_window_with_one_line", async () => {
+  const store = windowStore();
+  render(<ConnectChooser store={store} />);
+  act(() => store.finishing());
+  // The window asks again, with the line the provider gives it, and every way.
+  await open(store, {
+    ...fakeWays().ways,
+    problem: "Google sign-in didn't finish. Try again or use email.",
+  });
+  expect(screen.getByRole("alert").textContent).toBe(
+    "Google sign-in didn't finish. Try again or use email.",
+  );
+  expect(screen.getByLabelText("Email address")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Continue with Google" })).toBeTruthy();
+  // The line goes once the person does something else.
+  await userEvent.type(screen.getByLabelText("Email address"), "ada@example.com{Enter}");
+  expect(screen.queryByRole("alert")).toBeNull();
 });
 
 test("a_wallet_row_picks_that_wallet_and_the_window_closes", async () => {

@@ -801,6 +801,7 @@ async function createProvider(): Promise<WalletProvider> {
     ask: chooser.ask,
     prepare: chooser.prepare,
     close: chooser.close,
+    finishing: chooser.finishing,
     returning,
     memory: lastWay,
   });

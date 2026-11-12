@@ -1,3 +1,4 @@
+import { GOOGLE_DIDNT_FINISH } from "./copy";
 import { type LastUsed, walletUsed, wayOf } from "./lastWay";
 import type {
   KeyHolder,
@@ -315,7 +316,16 @@ export function privyProvider({
       const kit = await ready();
       if (kit.authenticated && kit.user !== null) return sessionOf(kit.user);
       if (ending === null) return null;
-      return sessionOf(await ending);
+      let user: PrivyUser;
+      try {
+        user = await ending;
+      } catch (error) {
+        // Turned down or failed at Google: no login, and no fault of the page's. The Connect window
+        // says so (`choiceProvider`); anything else is thrown, and logged.
+        if (error instanceof LoginEnded) return null;
+        throw error;
+      }
+      return sessionOf(user);
     },
 
     // The Connect window has logged the person in by now (`steps`): this takes the user it logged
@@ -367,6 +377,8 @@ export interface ConnectWays {
   wallets: () => Promise<WalletRow[]>;
   /** How this browser signed in last, for the window's "Last used". */
   lastUsed: LastUsed | null;
+  /** A line the window opens with: what went wrong just before (`GOOGLE_DIDNT_FINISH`). */
+  problem?: string | null;
 }
 
 /**
@@ -398,6 +410,8 @@ export interface ChoiceOptions {
   prepare: (session: Session) => Promise<void>;
   /** Closes the window: a login it ended gave no session. */
   close: () => void;
+  /** Shows, in the window, that a login coming back from Google is being finished. */
+  finishing?: () => void;
   /** The provider of a login coming back to the page from its OAuth sign-in (`oauthReturn`). */
   returning?: string | null;
   /** How the last sign-in went. None by default: nothing is kept. */
@@ -428,9 +442,10 @@ function once<T>(load: () => Promise<T>): () => Promise<T> {
  * taken only once the preferred way has said it has none, or, for the login, after
  * `loginRestoreMs` (with no way remembered, the first session found is taken). "None" is said only
  * once both ways have answered. A session that turns up beside the one taken is ended. A login
- * coming back from Google is the preferred way, is waited for in full, and is got ready as a
- * connect's is. Log out ends every session this provider knows of, so that a reload brings back
- * none. A sign-out is the way's that gave the session. Each way is made once,
+ * coming back from Google is the preferred way and is waited for in full, while the window says
+ * it is being finished; it is got ready as a connect's is, or, if it came back without a login,
+ * the window opens again and says so. Log out ends every session this provider knows of, so that a
+ * reload brings back none. A sign-out is the way's that gave the session. Each way is made once,
  * and made again after it failed to load.
  */
 export function choiceProvider({
@@ -439,6 +454,7 @@ export function choiceProvider({
   ask,
   prepare,
   close,
+  finishing,
   returning = null,
   memory = NO_MEMORY,
   loginRestoreMs = LOGIN_RESTORE_MS,
@@ -508,12 +524,13 @@ export function choiceProvider({
     }
   }
 
-  /** Opens the window and connects what the person picks. */
-  async function connectBy(): Promise<Session | null> {
+  /** Opens the window (with `problem`, a line it opens with) and connects what the person picks. */
+  async function connectBy(problem: string | null): Promise<Session | null> {
     const pick = await ask({
       login: loginWay === null ? null : async () => (await loginWay()).steps,
       wallets: async () => (await walletWay()).wallets(),
       lastUsed: memory.get(),
+      problem,
     });
     if (pick === null) return null;
     let session: Session | null;
@@ -539,7 +556,11 @@ export function choiceProvider({
     return session;
   }
 
-  /** What a restore that came back from Google gives: the login, remembered and got ready. */
+  /**
+   * What a restore that came back from Google gives: the login, remembered and got ready; another
+   * way's session, as it is (the window closes); or, with neither, the window again, which says
+   * the Google sign-in didn't finish and offers every way.
+   */
   async function finishReturn(
     session: Session | null,
     choice: ConnectWay | null,
@@ -547,14 +568,25 @@ export function choiceProvider({
     if (session !== null && choice === "login") {
       memory.set(returning === "google" ? "google" : "login");
       await prepare(session);
+      return session;
     }
-    return session;
+    if (session !== null) {
+      close();
+      return session;
+    }
+    try {
+      return await connectBy(GOOGLE_DIDNT_FINISH);
+    } catch (error) {
+      console.error(error);
+      return null;
+    }
   }
 
   return {
     restore() {
       // Back from Google: the login is the way the person just took, waited for in full.
       const back = returning !== null && loginWay !== null;
+      if (back) finishing?.();
       const preferred = back ? "login" : wayOf(memory.get());
       return new Promise((resolve) => {
         const answers: Partial<Record<ConnectWay, Session | null>> = {};
@@ -612,7 +644,7 @@ export function choiceProvider({
     },
 
     connect() {
-      return connectBy();
+      return connectBy(null);
     },
 
     async disconnect(session) {

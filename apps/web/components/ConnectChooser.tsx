@@ -9,6 +9,7 @@ import {
   type WalletList,
 } from "../lib/chooser";
 import { config } from "../lib/config";
+import { FINISHING_GOOGLE } from "../lib/copy";
 import {
   GIFT_PROBLEM_WORDS,
   GIFT_RETRY_HELPS,
@@ -22,7 +23,9 @@ import { PRIMARY, SECONDARY } from "./ui";
 // The Connect window (lib/chooser.ts has the steps): "Log in or sign up", with the email field
 // (Submit sends a code, and the window asks for it), Google, and under them a row for each NEAR
 // wallet near-connect lists, which connects that wallet at once. A build with no login shows the
-// wallets alone. After a login it shows the one line "Getting your account ready…" while Tender
+// wallets alone. Back from Google, it says "Finishing your Google sign-in…" until the account step
+// opens, or, if the Google sign-in didn't finish, opens again with one line that says so. After a
+// login it shows the one line "Getting your account ready…" while Tender
 // sends the new account NEAR for its fees, and, if that is refused or doesn't arrive, one line that
 // says so, with Try again first where trying again can help, and the faucet with the account to
 // copy as the other way.
@@ -442,6 +445,7 @@ function Code({
 const TITLE: Record<Exclude<ChooserState["step"], "closed">, string> = {
   choose: "Log in or sign up",
   code: "Check your email",
+  finishing: "Your account",
   preparing: "Your account",
   stuck: "Your account",
 };
@@ -568,6 +572,18 @@ export function ConnectChooser({ store = pageChooser }: { store?: Chooser } = {}
           <Choose state={state} store={store} firstRef={firstRef} />
         ) : state.step === "code" ? (
           <Code key={state.tries} state={state} store={store} firstRef={firstRef} />
+        ) : state.step === "finishing" ? (
+          <p
+            role="status"
+            data-testid="google-finishing"
+            className="mt-6 flex items-center justify-center gap-2.5 text-[15px] text-bone"
+          >
+            <span
+              aria-hidden="true"
+              className="size-2 shrink-0 animate-pulse rounded-full bg-seal motion-reduce:animate-none"
+            />
+            {FINISHING_GOOGLE}
+          </p>
         ) : state.step === "preparing" ? (
           <p
             role="status"

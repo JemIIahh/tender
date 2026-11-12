@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { GOOGLE_DIDNT_FINISH } from "../lib/copy";
 import { LAST_WAY_KEY, type LastUsed, lastUsedOf, lastWay, wayOf } from "../lib/lastWay";
 import {
   type ConnectPick,
@@ -199,14 +200,12 @@ test("back_from_google_restore_waits_for_the_kit_to_end_the_login", async () => 
   expect(session?.accountId).toBe(ACCOUNT);
   expect(session?.keyHolder?.login).toBe("google");
 
-  // Turned down at Google: the restore fails, and the page offers Connect.
+  // Turned down at Google: no login, which the window then says, and nothing thrown or logged.
   const denied = createPrivyBridge();
   denied.publish(fakeKit(denied));
-  const refused = privyProvider({ bridge: denied, makeWallet, returning: true })
-    .restore()
-    .catch((thrown: unknown) => thrown);
+  const refused = privyProvider({ bridge: denied, makeWallet, returning: true }).restore();
   denied.loginEnded({ error: "oauth_user_denied" });
-  expect(await refused).toBeInstanceOf(LoginEnded);
+  expect(await refused).toBeNull();
 
   // Not coming back from anywhere: a signed-out kit is no session, at once.
   const plain = createPrivyBridge();
@@ -359,6 +358,7 @@ function choices(
     sets: [],
   };
   let closes = 0;
+  let finishes = 0;
   const provider = choiceProvider({
     login: options.login === false ? null : async () => login,
     wallet: async () => near,
@@ -371,6 +371,9 @@ function choices(
     },
     close: () => {
       closes++;
+    },
+    finishing: () => {
+      finishes++;
     },
     returning: options.returning ?? null,
     memory: {
@@ -393,6 +396,7 @@ function choices(
     remembered,
     asked: () => offered.length,
     closes: () => closes,
+    finishes: () => finishes,
   };
 }
 
@@ -443,12 +447,50 @@ test("a_login_the_window_ended_that_gives_no_session_closes_the_window", async (
   expect(closes()).toBe(1);
 });
 
-test("back_from_google_the_restored_login_is_got_ready_and_remembered", async () => {
-  const back = choices({ loginRestored: true, returning: "google" });
-  expect((await back.provider.restore())?.accountId).toBe(ACCOUNT);
+test("back_from_google_the_window_says_it_is_finishing_and_the_login_is_got_ready", async () => {
+  // A wallet was the way last time; back from Google, the login is the one, and is waited for.
+  const back = choices({
+    loginRestored: true,
+    returning: "google",
+    remembered: "wallet:ash-wallet",
+  });
+  const restoring = back.provider.restore();
+  expect(back.finishes()).toBe(1);
+  expect((await restoring)?.accountId).toBe(ACCOUNT);
   expect(back.prepared.map((session) => session.accountId)).toEqual([ACCOUNT]);
   expect(back.remembered.sets).toEqual(["google"]);
   expect(back.asked()).toBe(0);
+
+  // No Google return: nothing is said to be finishing.
+  const plain = choices({ loginRestored: true });
+  await plain.provider.restore();
+  expect(plain.finishes()).toBe(0);
+  expect(plain.prepared).toEqual([]);
+});
+
+test("back_from_google_with_no_login_the_window_opens_again_and_says_it_didn_t_finish", async () => {
+  // Turned down at Google (the login has none): the window opens with the line, and what the
+  // person picks there is the session.
+  const denied = choices({
+    returning: "google",
+    answer: { way: "wallet", walletId: "ash-wallet" },
+  });
+  const session = await denied.provider.restore();
+  expect(denied.offered.map((ways) => ways.problem)).toEqual([GOOGLE_DIDNT_FINISH]);
+  expect(session?.accountId).toBe(ALICE);
+  expect(denied.remembered.sets).toEqual(["wallet:ash-wallet"]);
+  expect(GOOGLE_DIDNT_FINISH).toBe("Google sign-in didn't finish. Try again or use email.");
+
+  // Closed again: no session, and nothing remembered.
+  const closed = choices({ returning: "google", answer: null });
+  expect(await closed.provider.restore()).toBeNull();
+  expect(closed.remembered.sets).toEqual([]);
+
+  // A wallet's session from before is taken as it is, and the window closes.
+  const wallet = choices({ returning: "google", walletRestored: true });
+  expect((await wallet.provider.restore())?.accountId).toBe(ALICE);
+  expect(wallet.asked()).toBe(0);
+  expect(wallet.closes()).toBe(1);
 });
 
 test("restore_takes_whichever_way_has_a_session_and_disconnect_goes_to_that_way", async () => {
