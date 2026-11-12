@@ -191,6 +191,10 @@ export function createChooser(
   ): Promise<void> {
     const mine = ++run;
     readying = session;
+    // A question the window still has open (Sign in, pressed while a login back from Google was
+    // finishing) is answered now: the person is signed in, so it has nothing more to ask, and a
+    // later Sign in opens the window again.
+    if (answer !== null) settle(null);
     set({ step: "preparing", accountId: session.accountId });
     return new Promise((resolve) => {
       release = resolve;

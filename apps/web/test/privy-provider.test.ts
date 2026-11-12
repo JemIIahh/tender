@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { createChooser } from "../lib/chooser";
 import { GOOGLE_DIDNT_FINISH } from "../lib/copy";
 import {
   keepReturnPage,
@@ -605,6 +606,49 @@ test("a_google_return_that_ends_after_a_wallet_sign_in_is_ended_and_not_got_read
   expect(sets).toEqual(["wallet:ash-wallet"]);
 });
 
+test("a_google_login_that_ends_while_sign_in_has_the_window_open_answers_its_question", async () => {
+  // The window's own store, over an account that already holds NEAR for its fees.
+  const store = createChooser(() => ({
+    balanceOf: async () => 10n ** 24n,
+    loginToken: async () => "t",
+    requestGift: async () => {
+      throw new Error("no gift is asked for");
+    },
+    sleep: async () => {},
+    now: () => 0,
+  }));
+  const login = slowLogin();
+  const near = Object.assign(fakeProvider(walletSession), { wallets: async () => ROWS });
+  const provider = choiceProvider({
+    login: async () => login.provider,
+    wallet: async () => near,
+    ask: store.ask,
+    prepare: store.prepare,
+    close: store.close,
+    finishing: store.finishing,
+    returning: "google",
+  });
+  const restoring = provider.restore();
+  expect(store.getSnapshot().step).toBe("finishing");
+  // The person closes "Finishing…" and presses Sign in: the window asks.
+  store.close();
+  const signingIn = provider.connect();
+  await vi.waitFor(() => expect(store.getSnapshot().step).toBe("choose"));
+  await vi.waitFor(() => expect(login.asked()).toBe(true));
+
+  // Google ends now: the account step answers the window's question, and the window closes.
+  login.answer(loginSession);
+  expect((await restoring)?.accountId).toBe(ACCOUNT);
+  expect(await signingIn).toBeNull();
+  expect(store.getSnapshot().step).toBe("closed");
+
+  // A later Sign in opens the window again, with no reload.
+  const again = provider.connect();
+  await vi.waitFor(() => expect(store.getSnapshot().step).toBe("choose"));
+  store.close();
+  expect(await again).toBeNull();
+});
+
 test("a_login_back_from_google_is_a_new_sign_in_the_other_tabs_hear_of_and_ends_a_wallet_s", async () => {
   // Both ways hold a session; back from Google, the login is the one, and the wallet's ends.
   const both = choices({ loginRestored: true, walletRestored: true, returning: "google" });
@@ -743,7 +787,7 @@ test("connect_remembers_its_way_and_ends_the_other_way_s_session", async () => {
 
 /** A login whose restore answers only when the test says, and which counts its log outs. */
 function slowLogin() {
-  let answer: (session: Session | null) => void = () => {};
+  let answer: ((session: Session | null) => void) | null = null;
   const provider: WalletProvider & { logouts: number; steps: LoginSteps } = {
     logouts: 0,
     steps: { sendCode: async () => {}, loginWithCode: async () => {}, google: async () => {} },
@@ -757,7 +801,15 @@ function slowLogin() {
     },
     subscribe: () => () => {},
   };
-  return { provider, answer: (session: Session | null) => answer(session) };
+  return {
+    provider,
+    /** Whether the restore has been asked, so that an answer reaches it. */
+    asked: () => answer !== null,
+    answer: (session: Session | null) => {
+      if (answer === null) throw new Error("the login's restore has not been asked yet");
+      answer(session);
+    },
+  };
 }
 
 test("a_login_slow_to_answer_is_not_taken_for_none_and_keeps_the_token_the_tab_kept", async () => {
