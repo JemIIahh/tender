@@ -882,42 +882,90 @@ test("a_crash_line_arrives_whole_when_stderr_is_full_and_its_reader_is_slow", as
   // A line written through a stream, with the process ending right after it, is cut short when the
   // pipe is full: the stream holds it behind what it has queued already. The crash waits for the
   // pipe instead.
+  //
+  // The pipe is full when the crash comes, whatever the system: the child fills it once its reader
+  // has stopped taking from it, and only then crashes. A fixed amount of filler is not enough: on
+  // Linux, a socket takes a short write while it is still too full to wake the stream's own
+  // queue, so the crash line can go straight in with nothing waited for.
   const script = `
+    import { writeSync } from "node:fs";
     import { exitOnCrash, redactConsole } from ${JSON.stringify(join(REPO_ROOT, "scripts", "serve.ts"))};
     const env = { TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN };
     redactConsole(env);
     exitOnCrash(env);
-    // More than a pipe holds, queued behind each other, and then the crash.
-    for (let i = 0; i < 64; i++) console.error("filler " + "x".repeat(8192));
+    // Node makes a stderr pipe non-blocking, and the crash is written for that. The esbuild that
+    // tsx starts shares the pipe, and leaves it blocking once it has run (when tsx's cache is
+    // cold): the filler below would then wait for a reader that waits for "ready". Node's mode
+    // again.
+    if (process.stderr._handle.setBlocking(false) !== 0) throw new Error("stderr stays blocking");
+    const filler = "filler " + "x".repeat(8192);
+    // More than the reader takes before it stops, queued behind each other.
+    for (let i = 0; i < 64; i++) console.error(filler);
     console.log("ready");
-    setTimeout(() => {
+    // Once the reader holds all it takes: the pipe is filled until it takes nothing more, the
+    // stream holds lines back behind it, and then the crash.
+    process.stdin.once("data", () => {
+      try {
+        for (;;) writeSync(2, filler + "\\n");
+      } catch (error) {
+        if (error.code !== "EAGAIN") throw error;
+      }
+      while (process.stderr.writableLength === 0) console.error(filler);
+      writeSync(1, "crashing\\n");
       throw new Error("failed: https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/getMe");
-    }, 50);
+    });
     setTimeout(() => process.exit(0), 30_000);
   `;
   const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
     cwd: REPO_ROOT,
     env: { ...process.env, TELEGRAM_BOT_TOKEN: BOT_TOKEN },
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
-  // Noted from the start: a child that ends at once, as one does that cuts its line short, must
-  // not be waited for after it has gone.
-  const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
+  // The reader is slow: paused, it takes from the pipe only what it holds below its high water
+  // mark, and then nothing until it is resumed. It listens from the start all the same: once a
+  // child has exited, Node drains the output nothing listens to (`flushStdio` resumes it), so a
+  // listener added after the exit would find nothing, however whole the line was.
+  const chunks: Buffer[] = [];
+  child.stderr.pause();
+  child.stderr.on("data", (chunk: Buffer) => chunks.push(chunk));
+  let awake = false;
+  const exited = new Promise<{ code: number | null; awake: boolean }>((resolve) =>
+    child.once("exit", (code) => resolve({ code, awake })),
+  );
   const closed = new Promise<void>((resolve) => child.stderr.once("close", () => resolve()));
+  let stdout = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  let spawnError: unknown;
+  child.once("error", (error) => {
+    spawnError = error;
+  });
+  const until = async (what: string, done: () => boolean) => {
+    while (!done()) {
+      if (spawnError !== undefined) throw spawnError;
+      if (child.exitCode !== null || child.signalCode !== null) {
+        throw new Error(`the child ended before ${what}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
   try {
-    // Nothing reads stderr until the child is ready, and then for a little longer still.
-    await new Promise<void>((resolve, reject) => {
-      child.once("error", reject);
-      child.stdout.on("data", (chunk: Buffer) => {
-        if (chunk.toString().includes("ready")) resolve();
-      });
-      void exited.then(() => reject(new Error("the child ended before it was ready")));
-    });
+    await until("it was ready", () => stdout.includes("ready\n"));
+    await until(
+      "its reader was full",
+      () => child.stderr.readableLength >= child.stderr.readableHighWaterMark,
+    );
+    child.stdin.write("crash\n");
+    await until("it crashed", () => stdout.includes("crashing\n") || child.exitCode !== null);
+    // The pipe stays full a little longer, and then the reader wakes.
     await new Promise((resolve) => setTimeout(resolve, 400));
-    const chunks: Buffer[] = [];
-    child.stderr.on("data", (chunk: Buffer) => chunks.push(chunk));
-    const [code] = await Promise.all([exited, closed]);
+    awake = true;
+    child.stderr.resume();
+    const [{ code, awake: wokenFirst }] = await Promise.all([exited, closed]);
     const text = Buffer.concat(chunks).toString();
+    // The crash waited for the pipe: the child was still there when its reader woke.
+    expect(wokenFirst, `the child ended before its reader woke: ${text.slice(-500)}`).toBe(true);
     expect(code, text.slice(-500)).toBe(1);
     expect(text).toContain(
       "serve: uncaught exception: Error: failed: https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getMe",
