@@ -31,7 +31,7 @@ const question = (id: string, overrides: Partial<Question> = {}): Question => ({
 
 const board = (page: Page) => page.getByTestId("questions");
 
-/** Picks the spec's wallet in near-connect's list from the board's own Connect button. */
+/** Picks the spec's wallet's row in the Connect window, from the board's own Sign in button. */
 async function connect(page: Page): Promise<void> {
   await board(page).getByRole("button", { name: "Sign in" }).click();
   await pickStubWallet(page);

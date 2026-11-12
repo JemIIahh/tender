@@ -68,7 +68,7 @@ export interface StubWallet {
   sent: SentBatch[];
 }
 
-/** The name of the wallet in near-connect's list, and so on the button that picks it. */
+/** The name of the wallet in near-connect's list, and so on its row in the Connect window. */
 export const STUB_WALLET_NAME = "E2E Wallet";
 
 /**

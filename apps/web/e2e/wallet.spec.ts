@@ -20,7 +20,7 @@ const section = (page: Page, title: string) =>
 
 const row = (page: Page) => page.getByTestId("token-row").filter({ hasText: TOKEN });
 
-/** Opens the page, picks the wallet in near-connect's list, and waits for the account to show. */
+/** Opens the page, picks the wallet's row in the Connect window, and waits for the account to show. */
 async function connect(page: Page): Promise<void> {
   await page.goto("/wallet");
   await page.locator("main").getByRole("button", { name: "Sign in" }).click();

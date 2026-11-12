@@ -175,7 +175,7 @@ test("verifier_record_shown_on_task", async ({ page }) => {
   await expect(record.getByTestId("poster-judges")).toHaveCount(0);
 });
 
-/** Picks the stub wallet in near-connect's list, and waits for the account to show. */
+/** Picks the stub wallet's row in the Connect window, and waits for the account to show. */
 async function connect(page: Page): Promise<void> {
   await page.locator("main").getByRole("button", { name: "Sign in" }).click();
   await pickStubWallet(page);
