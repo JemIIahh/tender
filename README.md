@@ -9,7 +9,7 @@
 
 **Live on NEAR testnet:** the web app [tendeer.vercel.app](https://tendeer.vercel.app) · the API [tender-api-production-6c4b8458.up.railway.app](https://tender-api-production-6c4b8458.up.railway.app/v1/health) · its read-only MCP server at `/mcp` · the contract [`tender.tender-dev-1104.testnet`](https://testnet.nearblocks.io/address/tender.tender-dev-1104.testnet)
 
-Built during the NEAR Hackathon, Oct 29 – Nov 14 2026, from an empty repository.
+Built during the NEAR Hackathon, Oct 29 – Nov 14 2026, from an empty repository. Its first commit, [`9ac154c`](https://github.com/JemIIahh/tender/commit/9ac154c41c58a7d9657fa6e73f100f4ede3cab0a) on 2026-10-29, comes after the 2026-10-19 announcement from which the hackathon's rules count code ([FAQ, Q-001](https://nearhackathon.com/HACKATHON.md)), so no commit here predates the window.
 <!-- OTHER-CHAINS: owner wording pending -->
 
 ## What it is
