@@ -55,11 +55,13 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 //   429  `daily_limit`: the gifts of this UTC day would go past the cap (`Retry-After`: the seconds
 //        to the next UTC day);
 //   502  `transfer_failed`: the transfer was refused for certain (`sendRefused`: it failed on chain,
-//        or the node refused it before taking it), and its claim is let go, so asking again works;
-//        or its outcome is not known (a timeout, a congested or stuck shard, any other error that
-//        may follow the node taking it, or no answer within `TRANSFER_WAIT_MS`), and the NEAR may
-//        still arrive: its claim is kept, as THE CLAIM says, and a `WARN api:` line says
-//        `may still land`;
+//        or the node refused it for a reason in its signed bytes alone), and its claim is let go,
+//        so asking again works; or its outcome is not known, and the NEAR may still arrive: its
+//        claim is kept, as THE CLAIM says, and a `WARN api:` line says `may still land`. Unknown
+//        is a timeout, no answer within `TRANSFER_WAIT_MS`, and every error that can answer a
+//        resent copy of a transfer that was taken: a used nonce, a gift account short of NEAR,
+//        an expired block, a congested or stuck shard. So an empty gift pool keeps the claims of
+//        its calls until they go stale, counted against the day meanwhile;
 //   200  `sent`, with the amount and the transfer's hash, once the transfer has executed.
 //
 // THE CLAIM. A gift's row is written before the transfer is sent, in a transaction that locks the

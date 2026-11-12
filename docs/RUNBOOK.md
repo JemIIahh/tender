@@ -166,7 +166,7 @@ The owner's steps (each is the owner's call; the first spends testnet NEAR):
 2. In the host's settings, set `GAS_GIFT_ACCOUNT` to it and paste its private key into `GAS_GIFT_PRIVATE_KEY`. Never put the key in a file in the repository. Set `PRIVY_APP_ID` from the Privy dashboard.
 3. Restart the services. The log says `serve: gas gift on, from <account>: 0.1 NEAR to each new account, 2 NEAR a day at most; login tokens checked with the app's published keys` (or `with PRIVY_VERIFICATION_KEY` when that is set).
 
-To refill it, send more testnet NEAR to the gift account. Watch its balance (section 8): once it is too low, every gift answers 502 `transfer_failed`.
+To refill it, send more testnet NEAR to the gift account. Watch its balance (section 8): once it is too low, every gift answers 502 `transfer_failed`, and a `WARN api:` line names `NotEnoughBalanceError`. The node's "not enough balance" cannot be told from its answer to a resent copy of a transfer that already ran, so each such call keeps its claim until it is 10 minutes old, counted against the day's cap meanwhile: that login and that account get 503 `unavailable` until then. After a refill, new calls go through, and those claims are let go as they go stale.
 
 What the route answers:
 
@@ -179,7 +179,7 @@ What the route answers:
 | 409 `already_given` | This login, or this account, has had its gift: it was sent. One that is claimed and on its way, or may still arrive, is a 503 `unavailable` (below) |
 | 429 `daily_limit` | The day's cap is used up. `Retry-After` gives the seconds to the next UTC day |
 | 429 `rate_limited` | One address asked more than 30 times in 10 minutes |
-| 502 `transfer_failed` | The transfer was refused (the node turned it down, for instance because the gift account is short of NEAR, or it failed on chain): the claim is let go, so asking again works. Or its outcome is not known (it timed out, the receiver's shard was congested or stuck, or it gave no answer within 60 s), and the NEAR may still arrive: the claim is kept, the answer's message says so, and a `WARN api:` line says `may still land` |
+| 502 `transfer_failed` | The transfer was refused for certain (it failed on chain, or the node turned it down for a reason in its signed bytes alone, such as a bad signature): the claim is let go, so asking again works. Or its outcome is not known, and the NEAR may still arrive: the claim is kept, the answer's message says so, and a `WARN api:` line says `may still land`. Not known is a timeout, no answer within 60 s, and every refusal that can answer a resent copy of a transfer that was taken: a used nonce, a gift account short of NEAR (an empty pool), an expired block, a congested or stuck shard |
 | 503 `gift_off` | The gift is not set up on this API, or this is mainnet |
 | 503 `unavailable` | The login's published keys could not be fetched, or the node could not say what the account holds: `Retry-After: 5`, and the log says which, `cannot fetch the login's key set` or `cannot read the NEAR balance`. After a failed fetch of the keys, the calls of the next 5 s get this at once, with no fetch and no line. Or a gift for this login or this account is claimed and on its way, or may still arrive: `Retry-After: 30` |
 

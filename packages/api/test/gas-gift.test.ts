@@ -13,7 +13,13 @@ import {
   type JWK,
   SignJWT,
 } from "jose";
-import { NotEnoughBalanceError, ShardCongestedError } from "near-api-js/rpc-errors";
+import {
+  InvalidNonceError,
+  InvalidSignatureError,
+  NotEnoughBalanceError,
+  ShardCongestedError,
+  TransactionExpiredError,
+} from "near-api-js/rpc-errors";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import type { GasGift } from "../src/deps";
 import {
@@ -455,8 +461,8 @@ test("a_transfer_refused_for_certain_lets_its_claim_go_so_that_a_retry_works", a
     giftWith({
       transfer: async (to, amount) => {
         transfers.push({ to, amount });
-        // The node refused it before taking it: the gift account is short of NEAR.
-        if (fail) throw new NotEnoughBalanceError(1n, AMOUNT, "gift.testnet", "TX", "BLOCK");
+        // The node refused it for a reason in its signed bytes alone: no copy of them can run.
+        if (fail) throw new InvalidSignatureError("TX", "BLOCK");
         return { txHash: "tx-after-retry" };
       },
     }),
@@ -539,36 +545,51 @@ test("a_transfer_that_timed_out_keeps_its_claim_since_the_near_may_still_arrive"
   expect(transfers).toHaveLength(2);
 });
 
-test("a_transfer_refused_for_a_congested_shard_keeps_its_claim", async () => {
-  // near-api-js sends the same signed bytes again after an HTTP 408, 500 or 503, so a congested
-  // shard can answer a second copy while the first was taken: the NEAR may still arrive.
+test("a_transfer_answered_with_an_error_that_a_resent_copy_can_get_keeps_its_claim", async () => {
+  // near-api-js sends the same signed bytes again after an HTTP 408, 500 or 503, and each of these
+  // can answer that second copy while the first was taken: it used the nonce, spent what was there
+  // (so an empty gift pool looks the same), landed before its block expired, or met a congested
+  // shard. The NEAR may still arrive, so the claim is kept.
   const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-  const app = appWith(
-    giftWith({
-      transfer: async (to, amount) => {
-        transfers.push({ to, amount });
-        throw new ShardCongestedError(1, 0, "TX", "BLOCK");
+  for (const [what, error] of [
+    ["a used nonce", new InvalidNonceError(7, 7, "TX", "BLOCK")],
+    [
+      "a signer short of NEAR",
+      new NotEnoughBalanceError(1n, AMOUNT, "gift.testnet", "TX", "BLOCK"),
+    ],
+    ["an expired block", new TransactionExpiredError("TX", "BLOCK")],
+    ["a congested shard", new ShardCongestedError(1, 0, "TX", "BLOCK")],
+  ] as const) {
+    await resetDb(deps.db);
+    transfers = [];
+    warnings.mockClear();
+    const app = appWith(
+      giftWith({
+        transfer: async (to, amount) => {
+          transfers.push({ to, amount });
+          throw error;
+        },
+      }),
+    );
+    const reply = await ask(app);
+    expect(reply.status, what).toBe(502);
+    expect((reply.body as ErrorBody).error, what).toBe("transfer_failed");
+    expect((reply.body as ErrorBody).message, what).toContain("may still arrive");
+    expect(await rows(), what).toEqual([
+      {
+        privy_user: USER,
+        account_id: ACCOUNT,
+        amount: `${AMOUNT}`,
+        status: "claimed",
+        tx_hash: null,
       },
-    }),
-  );
-  const reply = await ask(app);
-  expect(reply.status).toBe(502);
-  expect((reply.body as ErrorBody).error).toBe("transfer_failed");
-  expect((reply.body as ErrorBody).message).toContain("may still arrive");
-  expect(await rows()).toEqual([
-    {
-      privy_user: USER,
-      account_id: ACCOUNT,
-      amount: `${AMOUNT}`,
-      status: "claimed",
-      tx_hash: null,
-    },
-  ]);
-  const logged = warnings.mock.calls.map((call) => call.join(" ")).join("\n");
-  expect(logged).toContain("may still land (ShardCongestedError");
-  // Asked for again meanwhile: on its way, or may be; never a second transfer.
-  expect((await ask(app, USER, OTHER_ACCOUNT)).status).toBe(503);
-  expect(transfers).toHaveLength(1);
+    ]);
+    const logged = warnings.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(logged, what).toContain(`may still land (${error.name}`);
+    // Asked for again meanwhile: on its way, or may be; never a second transfer.
+    expect((await ask(app, USER, OTHER_ACCOUNT)).status, what).toBe(503);
+    expect(transfers, what).toHaveLength(1);
+  }
 });
 
 test("a_transfer_with_no_answer_in_time_is_recorded_when_its_outcome_comes", async () => {
@@ -616,7 +637,7 @@ test("a_transfer_with_no_answer_in_time_is_recorded_when_its_outcome_comes", asy
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   const second = await ask(app, OTHER_USER, OTHER_ACCOUNT);
   expect(second.status).toBe(502);
-  outcomes[1]?.fail(new NotEnoughBalanceError(1n, AMOUNT, "gift.testnet", "TX", "BLOCK"));
+  outcomes[1]?.fail(new InvalidSignatureError("TX", "BLOCK"));
   await vi.waitFor(async () => expect(await rows()).toHaveLength(1));
 });
 
@@ -638,7 +659,7 @@ test("a_transfer_changes_only_its_own_row", async () => {
           [USER, OTHER_ACCOUNT, `${AMOUNT}`, later(1)],
         );
         if (transfers.length === 1) {
-          throw new NotEnoughBalanceError(1n, AMOUNT, "gift.testnet", "TX", "BLOCK");
+          throw new InvalidSignatureError("TX", "BLOCK");
         }
         return { txHash: "tx-unrecorded" };
       },
