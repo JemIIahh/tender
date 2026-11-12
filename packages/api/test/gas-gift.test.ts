@@ -1,6 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { TenderError } from "@tender/client";
 import { GasGiftResponseSchema } from "@tender/shared";
 import {
   type CryptoKey,
@@ -12,6 +13,7 @@ import {
   type JWK,
   SignJWT,
 } from "jose";
+import { NotEnoughBalanceError } from "near-api-js/rpc-errors";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import type { GasGift } from "../src/deps";
 import {
@@ -297,33 +299,29 @@ test("a_gift_is_once_per_login_and_once_per_account", async () => {
   expect(transfers).toHaveLength(1);
 });
 
-test("of_calls_at_once_for_one_login_or_one_account_only_one_sends", async () => {
+/**
+ * A transfer that waits until the test lets it go (`release`), so that calls are in flight at once,
+ * and `atOnce`, which sends calls together and lets the transfers go only once every call has been
+ * answered or reached its transfer: so each one was decided while the others were in flight.
+ */
+function heldTransfers(app: () => App) {
   let release: () => void = () => undefined;
-  const app = appWith(
-    giftWith({
-      transfer: async (to, amount) => {
-        transfers.push({ to, amount });
-        // Each transfer waits until the test lets it go, so that every call is in flight at once.
-        await new Promise<void>((resolve) => {
-          const before = release;
-          release = () => {
-            before();
-            resolve();
-          };
-        });
-        return { txHash: `tx-${transfers.length}` };
-      },
-    }),
-  );
-  /**
-   * Sends all of `calls` at once, and lets the transfers go only once every call has either been
-   * answered or reached its transfer: so each one was decided while the others were in flight.
-   */
+  const transfer: GasGift["transfer"] = async (to, amount) => {
+    transfers.push({ to, amount });
+    await new Promise<void>((resolve) => {
+      const before = release;
+      release = () => {
+        before();
+        resolve();
+      };
+    });
+    return { txHash: `tx-${transfers.length}` };
+  };
   async function atOnce(calls: Array<[string, string]>) {
     const before = transfers.length;
     let answered = 0;
     const replies = calls.map(([sub, accountId]) =>
-      ask(app, sub, accountId).then((reply) => {
+      ask(app(), sub, accountId).then((reply) => {
         answered += 1;
         return reply;
       }),
@@ -332,25 +330,57 @@ test("of_calls_at_once_for_one_login_or_one_account_only_one_sends", async () =>
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     release();
-    return (await Promise.all(replies)).map((reply) => reply.status).sort();
+    return await Promise.all(replies);
   }
-  // One login, three accounts: one gift.
-  expect(
-    await atOnce([
-      [USER, "a1".repeat(32)],
-      [USER, "a2".repeat(32)],
-      [USER, "a3".repeat(32)],
-    ]),
-  ).toEqual([200, 409, 409]);
+  return { transfer, atOnce };
+}
+
+const statusesOf = (replies: ReadonlyArray<{ status: number }>) =>
+  replies.map((reply) => reply.status).sort();
+
+test("of_calls_at_once_for_one_login_or_one_account_only_one_sends", async () => {
+  const held = heldTransfers(() => app);
+  const app = appWith(giftWith({ transfer: held.transfer }));
+  // One login, three accounts: one gift. The others are told it is on its way: a 503 to try again
+  // in 30 s, and never `already_given`, which would say the login has had its gift.
+  const one = await held.atOnce([
+    [USER, "a1".repeat(32)],
+    [USER, "a2".repeat(32)],
+    [USER, "a3".repeat(32)],
+  ]);
+  expect(statusesOf(one)).toEqual([200, 503, 503]);
+  for (const reply of one.filter((r) => r.status === 503)) {
+    expect((reply.body as ErrorBody).error).toBe("unavailable");
+    expect(reply.headers.get("retry-after")).toBe("30");
+  }
   expect(transfers).toHaveLength(1);
+  // Once it is sent, asking again is `already_given`.
+  expect((await ask(app, USER, "a2".repeat(32))).status).toBe(409);
   // One account, three logins: one gift.
-  expect(
-    await atOnce([
-      ["did:privy:b1", ACCOUNT],
-      ["did:privy:b2", ACCOUNT],
-      ["did:privy:b3", ACCOUNT],
-    ]),
-  ).toEqual([200, 409, 409]);
+  const other = await held.atOnce([
+    ["did:privy:b1", ACCOUNT],
+    ["did:privy:b2", ACCOUNT],
+    ["did:privy:b3", ACCOUNT],
+  ]);
+  expect(statusesOf(other)).toEqual([200, 503, 503]);
+  expect(transfers).toHaveLength(2);
+  expect(await rows()).toHaveLength(2);
+});
+
+test("of_two_logins_at_once_for_the_last_gift_under_the_cap_one_gets_it", async () => {
+  const held = heldTransfers(() => app);
+  const app = appWith(giftWith({ dailyCap: 2n * AMOUNT, transfer: held.transfer }));
+  // One gift of the day's two is out.
+  const first = held.atOnce([["did:privy:a", "a1".repeat(32)]]);
+  expect(statusesOf(await first)).toEqual([200]);
+  // Two other logins, for two other accounts, at once: the table's lock decides, and the claim of
+  // the one counts against the other.
+  const race = await held.atOnce([
+    ["did:privy:b", "a2".repeat(32)],
+    ["did:privy:c", "a3".repeat(32)],
+  ]);
+  expect(statusesOf(race)).toEqual([200, 429]);
+  expect(race.map((r) => (r.body as Partial<ErrorBody>).error)).toContain("daily_limit");
   expect(transfers).toHaveLength(2);
   expect(await rows()).toHaveLength(2);
 });
@@ -418,14 +448,15 @@ test("the_gift_is_off_without_its_settings_and_on_mainnet", async () => {
   expect(transfers).toEqual([]);
 });
 
-test("a_failed_transfer_lets_its_claim_go_so_that_a_retry_works", async () => {
+test("a_transfer_refused_for_certain_lets_its_claim_go_so_that_a_retry_works", async () => {
   const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
   let fail = true;
   const app = appWith(
     giftWith({
       transfer: async (to, amount) => {
         transfers.push({ to, amount });
-        if (fail) throw new Error("rpc https://rpc.example/?apikey=s3cret-rpc-key refused it");
+        // The node refused it before taking it: the gift account is short of NEAR.
+        if (fail) throw new NotEnoughBalanceError(1n, AMOUNT, "gift.testnet", "TX", "BLOCK");
         return { txHash: "tx-after-retry" };
       },
     }),
@@ -434,11 +465,11 @@ test("a_failed_transfer_lets_its_claim_go_so_that_a_retry_works", async () => {
   const failed = await post<ErrorBody>(app, token);
   expect(failed.status).toBe(502);
   expect(failed.body.error).toBe("transfer_failed");
+  expect(failed.body.message).toContain("could not be sent");
   expect(await rows()).toEqual([]);
   // Logged by name, never with the error's text, nor the token.
   const logged = errors.mock.calls.map((call) => call.join(" ")).join("\n");
-  expect(logged).toContain("was not sent (Error)");
-  expect(logged).not.toContain("s3cret");
+  expect(logged).toContain("was refused (");
   expect(logged).not.toContain(token.slice(7));
 
   fail = false;
@@ -446,6 +477,153 @@ test("a_failed_transfer_lets_its_claim_go_so_that_a_retry_works", async () => {
   expect(retry.status).toBe(200);
   expect(retry.body).toMatchObject({ status: "sent", tx_hash: "tx-after-retry" });
   expect(transfers).toHaveLength(2);
+});
+
+test("a_transfer_that_timed_out_keeps_its_claim_since_the_near_may_still_arrive", async () => {
+  const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  let timeOut = true;
+  const app = appWith(
+    giftWith({
+      transfer: async (to, amount) => {
+        transfers.push({ to, amount });
+        if (timeOut) {
+          throw new TenderError(
+            "E_TIMEOUT",
+            "TenderClient.transfer timed out at https://rpc.example/?apikey=s3cret-rpc-key",
+          );
+        }
+        return { txHash: `tx-${transfers.length}` };
+      },
+    }),
+  );
+  const token = `Bearer ${await tokenFor()}`;
+  const timedOut = await post<ErrorBody>(app, token);
+  expect(timedOut.status).toBe(502);
+  expect(timedOut.body.error).toBe("transfer_failed");
+  expect(timedOut.body.message).toContain("may still arrive");
+  // The claim is kept: it counts against the day, and no second gift goes out meanwhile.
+  expect(await rows()).toEqual([
+    {
+      privy_user: USER,
+      account_id: ACCOUNT,
+      amount: `${AMOUNT}`,
+      status: "claimed",
+      tx_hash: null,
+    },
+  ]);
+  const logged = warnings.mock.calls.map((call) => call.join(" ")).join("\n");
+  expect(logged).toContain("WARN api: the gas gift to");
+  expect(logged).toContain("may still land (TenderError E_TIMEOUT)");
+  expect(logged).not.toContain("s3cret");
+
+  // Asked for again, by the login for another account or by another login for the account: it
+  // may be on its way, which is a 503 to try again, and not `already_given`.
+  for (const [sub, accountId] of [
+    [USER, OTHER_ACCOUNT],
+    [OTHER_USER, ACCOUNT],
+    [USER, ACCOUNT],
+  ] as const) {
+    const again = await ask(app, sub, accountId);
+    expect(again.status, `${sub} ${accountId}`).toBe(503);
+    expect((again.body as ErrorBody).error).toBe("unavailable");
+    expect(again.headers.get("retry-after")).toBe("30");
+  }
+  expect(transfers).toHaveLength(1);
+
+  // Ten minutes on, with nothing in flight, the claim is let go: had the NEAR landed, the account
+  // would hold it and get `not_needed`; it did not, so the gift is sent.
+  timeOut = false;
+  nowNs += 11n * 60n * SECOND_NS;
+  const later = await ask(app);
+  expect(later.status).toBe(200);
+  expect(transfers).toHaveLength(2);
+});
+
+test("a_transfer_with_no_answer_in_time_is_recorded_when_its_outcome_comes", async () => {
+  vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  const outcomes: Array<{ settle: () => void; fail: (error: unknown) => void }> = [];
+  const app = appWith(
+    giftWith({
+      transferWaitMs: 50,
+      transfer: (to, amount) => {
+        transfers.push({ to, amount });
+        return new Promise((resolve, reject) => {
+          outcomes.push({
+            settle: () => resolve({ txHash: `tx-${transfers.length}` }),
+            fail: reject,
+          });
+        });
+      },
+    }),
+  );
+  const first = await ask(app);
+  expect(first.status).toBe(502);
+  expect((first.body as ErrorBody).message).toContain("may still arrive");
+  // However long the transfer stays in flight, its claim is never let go, so no second goes out.
+  nowNs += 30n * 60n * SECOND_NS;
+  expect((await ask(app, USER, OTHER_ACCOUNT)).status).toBe(503);
+  expect(transfers).toHaveLength(1);
+
+  // It lands: the row says so, and the login has had its gift.
+  outcomes[0]?.settle();
+  await vi.waitFor(async () => expect((await rows())[0]?.status).toBe("sent"));
+  expect(await rows()).toEqual([
+    { privy_user: USER, account_id: ACCOUNT, amount: `${AMOUNT}`, status: "sent", tx_hash: "tx-1" },
+  ]);
+  expect((await ask(app, USER, OTHER_ACCOUNT)).status).toBe(409);
+
+  // Another that is refused for certain after its answer: its claim is let go when that comes.
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const second = await ask(app, OTHER_USER, OTHER_ACCOUNT);
+  expect(second.status).toBe(502);
+  outcomes[1]?.fail(new NotEnoughBalanceError(1n, AMOUNT, "gift.testnet", "TX", "BLOCK"));
+  await vi.waitFor(async () => expect(await rows()).toHaveLength(1));
+});
+
+test("a_transfer_changes_only_its_own_row", async () => {
+  const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const later = (minutes: number) =>
+    new Date(Number(nowNs / 1_000_000n) + minutes * 60_000).toISOString();
+  // While the first transfer is in flight, its row is replaced by another claim of the same login
+  // (as if it had been let go and claimed again): the outcome must not touch the newer row.
+  const app = appWith(
+    giftWith({
+      transfer: async (to, amount) => {
+        transfers.push({ to, amount });
+        await deps.db.query("delete from gas_gifts");
+        await deps.db.query(
+          `insert into gas_gifts (privy_user, account_id, amount, status, created_at)
+           values ($1, $2, $3, 'claimed', $4::timestamptz)`,
+          [USER, OTHER_ACCOUNT, `${AMOUNT}`, later(1)],
+        );
+        if (transfers.length === 1) {
+          throw new NotEnoughBalanceError(1n, AMOUNT, "gift.testnet", "TX", "BLOCK");
+        }
+        return { txHash: "tx-unrecorded" };
+      },
+    }),
+  );
+  const newer = {
+    privy_user: USER,
+    account_id: OTHER_ACCOUNT,
+    amount: `${AMOUNT}`,
+    status: "claimed",
+    tx_hash: null,
+  };
+  // Refused: the delete is of its own row, which is gone; the newer claim stays.
+  expect((await ask(app)).status).toBe(502);
+  expect(await rows()).toEqual([newer]);
+
+  // Sent: the update finds no row of its own, and says so. The NEAR went, so the answer is `sent`.
+  await deps.db.query("delete from gas_gifts");
+  const sent = await ask(app);
+  expect(sent.status).toBe(200);
+  expect(await rows()).toEqual([newer]);
+  const logged = warnings.mock.calls.map((call) => call.join(" ")).join("\n");
+  expect(logged).toContain(
+    "was sent (tx-unrecorded), but its claim was gone, so it is not recorded",
+  );
 });
 
 test("a_balance_the_chain_cannot_give_is_a_503_to_try_again", async () => {
@@ -474,10 +652,12 @@ test("a_claim_left_by_a_process_that_died_goes_after_ten_minutes", async () => {
      values ($1, $2, $3, 'claimed', $4::timestamptz)`,
     [USER, ACCOUNT, `${AMOUNT}`, claimedAt(9)],
   );
-  // Nine minutes on, it may still be on its way.
-  expect((await ask(app)).status).toBe(409);
+  // Nine minutes on, it may still be on its way: try again later.
+  const early = await ask(app);
+  expect(early.status).toBe(503);
+  expect((early.body as ErrorBody).error).toBe("unavailable");
   nowNs += 2n * 60n * SECOND_NS;
-  // Eleven: no transfer takes that long, so the claim is let go.
+  // Eleven, and no transfer of it in flight here: the claim is let go.
   const reply = await ask(app);
   expect(reply.status).toBe(200);
   expect(await rows()).toEqual([
@@ -661,4 +841,48 @@ test("a_key_set_served_over_http_verifies_and_knows_no_other_kid", async () => {
   const unknown = await tokenFor({ kid: "key-unknown", sub: OTHER_USER });
   expect((await post(app, `Bearer ${unknown}`, { account_id: OTHER_ACCOUNT })).status).toBe(401);
   expect(fetches).toBe(1);
+});
+
+test("after_a_failed_fetch_the_key_set_rests_5_s_and_the_failure_is_logged_once", async () => {
+  const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const said = () =>
+    errors.mock.calls.filter((call) => call.join(" ").includes("cannot fetch the login's key set"))
+      .length;
+  let fetches = 0;
+  let good = false;
+  const url = await servedKeySet((res) => {
+    fetches += 1;
+    // Slow enough that calls made together share the one fetch.
+    setTimeout(() => {
+      res.writeHead(good ? 200 : 500, { "content-type": "application/json" });
+      res.end(good ? JSON.stringify({ keys: [publicJwk] }) : "{}");
+    }, 100);
+  });
+  const app = appWith(giftWith({ privyKeys: createRemoteJWKSet(url) }));
+  const token = `Bearer ${await tokenFor()}`;
+
+  // A burst while the key set's server fails: one fetch, one line, and a 503 for each.
+  const burst = await Promise.all([post(app, token), post(app, token), post(app, token)]);
+  expect(statusesOf(burst)).toEqual([503, 503, 503]);
+  expect(fetches).toBe(1);
+  expect(said()).toBe(1);
+
+  // Within 5 s of the failure: a 503 at once, with no fetch and no line.
+  nowNs += 4n * SECOND_NS;
+  expect((await post(app, token)).status).toBe(503);
+  expect(fetches).toBe(1);
+  expect(said()).toBe(1);
+
+  // Past it: fetched again, and a new failure is said again.
+  nowNs += 2n * SECOND_NS;
+  expect((await post(app, token)).status).toBe(503);
+  expect(fetches).toBe(2);
+  expect(said()).toBe(2);
+
+  // Once the server answers again, the next call past the rest gets its gift.
+  good = true;
+  nowNs += 6n * SECOND_NS;
+  expect((await post(app, token)).status).toBe(200);
+  expect(fetches).toBe(3);
+  expect(said()).toBe(2);
 });

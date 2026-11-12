@@ -66,9 +66,16 @@ export interface GasGift {
   balanceOf(accountId: string): Promise<bigint>;
   /**
    * Sends `amount` from the gift account to `accountId` and resolves once it has executed, with its
-   * hash (`TenderClient.transfer`). It rejects when the transfer was not made.
+   * hash (`TenderClient.transfer`). It rejects as `TenderClient.transfer` does: `sendRefused` of
+   * `@tender/client` says whether its error means the transfer was refused for certain. Any other
+   * means its outcome is not known, and the NEAR may still arrive.
    */
   transfer(accountId: string, amount: bigint): Promise<{ txHash: string }>;
+  /**
+   * Optional, for tests: how long a request waits for its transfer before it answers that the NEAR
+   * may still arrive, in milliseconds. Default 60 s.
+   */
+  transferWaitMs?: number;
 }
 
 /** Everything `createApp` needs. No route reads the environment: the caller resolves it into this. */

@@ -1,4 +1,5 @@
 import { createPublicKey } from "node:crypto";
+import { sendRefused } from "@tender/client";
 import { GasGiftRequestSchema, type GasGiftResponse } from "@tender/shared";
 import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -12,7 +13,7 @@ import {
   type JWTVerifyOptions,
   jwtVerify,
 } from "jose";
-import { withinDeadline } from "../deadline";
+import { NoAnswerInTime, withinDeadline } from "../deadline";
 import { type ApiDeps, type GasGift, nowNs } from "../deps";
 import { badRequest, type ErrorBody, fail, issuesOf, readJson } from "../format";
 import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits";
@@ -46,19 +47,32 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 //   503  `unavailable`: the app's key set cannot be fetched right now (`Retry-After: 5`);
 //   400  `bad_request` for a body that is not `{ account_id }`, and `not_implicit` for an account
 //        that is not 64 lowercase hex characters;
-//   409  `already_given`: this login, or this account, has had its gift (or it is on its way);
+//   409  `already_given`: this login, or this account, has had its gift;
+//   503  `unavailable` with `Retry-After: 30`: a gift for this login or this account is claimed and
+//        its transfer is on its way, or its outcome is not known yet (see THE CLAIM);
 //   503  `unavailable`: the chain cannot say what the account holds right now (`Retry-After: 5`);
 //   200  `not_needed`: the account holds `minBalance` or more already;
 //   429  `daily_limit`: the gifts of this UTC day would go past the cap (`Retry-After`: the seconds
 //        to the next UTC day);
-//   502  `transfer_failed`: the transfer was not made. Its claim is let go, so asking again works.
+//   502  `transfer_failed`: the transfer was refused for certain (`sendRefused`: it failed on chain,
+//        or the node refused it before taking it), and its claim is let go, so asking again works;
+//        or its outcome is not known (a timeout, or no answer within `TRANSFER_WAIT_MS`), and the
+//        NEAR may still arrive: its claim is kept, as THE CLAIM says;
 //   200  `sent`, with the amount and the transfer's hash, once the transfer has executed.
 //
 // THE CLAIM. A gift's row is written before the transfer is sent, in a transaction that locks the
 // table, checks the login, the account and the day's total, and inserts it: of two calls at once,
-// one claims and the other is `already_given`, and the day's total can never pass the cap. A
-// transfer that fails deletes the row. A row still `claimed` after `STALE_CLAIM_MS` belongs to a
-// process that died mid-gift: the next claim deletes it, so that the login is not shut out.
+// one claims, and the other is told the gift is on its way (503 `unavailable`). The day's total
+// counts every claim as well as every gift sent, so the claims and the sent gifts of a day never
+// pass the cap. The row is this request's own (its login, account and time), and only it is
+// changed: to `sent` once the transfer has executed, or deleted when the transfer was refused for
+// certain. A transfer whose outcome is unknown keeps its claim, so that no second gift goes out
+// while the first may land; the outcome is recorded whenever it comes, even after the answer.
+// A claim is let go by the next claim once it is older than `STALE_CLAIM_MS` and its transfer is
+// not in flight in this process: one left by a process that died mid-gift, or one whose transfer
+// ended with its outcome unknown. That is the one way a transfer can go uncounted: one whose
+// outcome was unknown and that lands after its claim is let go. Its account then holds the NEAR,
+// so it gets `not_needed` if asked for again; its login could still ask for another account.
 //
 // What the route does not know: which account the login's wallet is. The token says who logged in,
 // not which account they hold, so a login can name any implicit account, once. The daily cap bounds
@@ -85,6 +99,12 @@ export function privyJwksUrl(appId: string): string {
 /** How long a fetch of the key set may take before the call is a 503. */
 const JWKS_TIMEOUT_MS = 5_000;
 
+/**
+ * After a fetch of the key set fails, how long the calls get a 503 at once, with no new fetch:
+ * while the login's server is down, a burst of calls makes one fetch, and one log line.
+ */
+const KEYS_RETRY_MS = 5_000;
+
 /** How far the clocks of Privy and of this API may be apart, in seconds. */
 const CLOCK_TOLERANCE_S = 30;
 
@@ -106,8 +126,21 @@ const IMPLICIT = /^[0-9a-f]{64}$/;
 /** How long the chain has to say what an account holds. */
 const BALANCE_DEADLINE_MS = 5_000;
 
-/** How long a claim may wait for its transfer before it counts as left by a process that died. */
+/**
+ * How old a claim must be before the next claim lets it go, if its transfer is no longer in flight
+ * in this process: well past `TRANSFER_WAIT_MS` and the client's own 120 s for a send.
+ */
 const STALE_CLAIM_MS = 10 * 60_000;
+
+/**
+ * How long a request waits for its transfer, the wait for the gift account's turn in the client's
+ * queue included, before it answers that the NEAR may still arrive. Its outcome is recorded when
+ * it comes. `GasGift.transferWaitMs` changes it for tests.
+ */
+const TRANSFER_WAIT_MS = 60_000;
+
+/** When a claimed gift is asked for again, how many seconds to wait before asking once more. */
+const HELD_RETRY_S = 30;
 
 const DAY_MS = 24 * 60 * 60_000;
 
@@ -189,6 +222,17 @@ async function verifiedByOneOf(
   throw several;
 }
 
+/** This request's own row of `gas_gifts`: the only one it changes. */
+interface Claim {
+  login: string;
+  account: string;
+  /** `created_at` as it was written, ISO 8601. */
+  createdAt: string;
+}
+
+/** What became of a transfer: sent, refused for certain, or not known. */
+type Outcome = { kind: "sent"; txHash: string } | { kind: "refused" } | { kind: "unknown" };
+
 /** What `loginOf` makes of a bearer token. */
 type Login =
   | { kind: "user"; user: string }
@@ -239,6 +283,39 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
         createRemoteJWKSet(new URL(privyJwksUrl(gift.privyAppId.trim())), {
           timeoutDuration: JWKS_TIMEOUT_MS,
         }));
+  /** When a fetch of the key set last failed, by the API's clock (ms), within `KEYS_RETRY_MS`. */
+  let keysFailedAt: number | undefined;
+  /** Whether a failure at `at` is within `KEYS_RETRY_MS` of the last one (a clock gone back: no). */
+  const keysResting = (at: number) =>
+    keysFailedAt !== undefined && at >= keysFailedAt && at - keysFailedAt < KEYS_RETRY_MS;
+  /**
+   * `keySet`, with a rest after a failure: for `KEYS_RETRY_MS` after a fetch fails, every call is
+   * refused at once as one the key set could not answer, with no new fetch. The failure is logged
+   * once, by the kind of error alone: a burst of calls, which share one fetch, writes one line.
+   */
+  const keys: JWTVerifyGetKey | undefined =
+    keySet === undefined
+      ? undefined
+      : async (protectedHeader, jws) => {
+          if (keysResting(nowMs())) {
+            throw new Error("the key set could not be fetched a moment ago");
+          }
+          try {
+            return await keySet(protectedHeader, jws);
+          } catch (error) {
+            if (!aboutTheToken(error)) {
+              const at = nowMs();
+              if (!keysResting(at)) {
+                console.error(
+                  `api: cannot fetch the login's key set (${kindOf(error)}); not trying again ` +
+                    `for ${KEYS_RETRY_MS / 1000} s`,
+                );
+              }
+              keysFailedAt = at;
+            }
+            throw error;
+          }
+        };
   /** The verification key, imported once. A failed import is tried again by the next request. */
   let imported: Promise<CryptoKey> | undefined;
   const verificationKey = (pem: string): Promise<CryptoKey> => {
@@ -253,8 +330,8 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
    * The login's user from `Authorization: Bearer <token>`. `refused` is anything that is not a good
    * token: none, malformed, signed by another key or with another algorithm, for another app or
    * issuer, expired or not yet valid, or without a user; which of them it was is not said.
-   * `unavailable` is a key set that could not be fetched, which says nothing of the token: its
-   * failure is logged by name, and the token never.
+   * `unavailable` is a key set that could not be fetched, which says nothing of the token: `keys`
+   * logs its failure by name, and the token is never logged.
    */
   async function loginOf(on: GasGift, header: string | undefined): Promise<Login> {
     const token = BEARER.exec(header ?? "")?.[1];
@@ -275,13 +352,13 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
       let verified: Awaited<ReturnType<typeof jwtVerify>>;
       if (key !== undefined) {
         verified = await jwtVerify(token, key, options);
-      } else if (keySet !== undefined) {
+      } else if (keys !== undefined) {
         try {
           verified = await jwtVerify(
             token,
             async (protectedHeader, jws) => {
               try {
-                return await keySet(protectedHeader, jws);
+                return await keys(protectedHeader, jws);
               } catch (error) {
                 if (!aboutTheToken(error)) unreadable = { error };
                 throw error;
@@ -303,9 +380,7 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
         ? { kind: "user", user: sub }
         : { kind: "refused" };
     } catch {
-      if (unreadable === undefined) return { kind: "refused" };
-      console.error(`api: cannot fetch the login's key set (${kindOf(unreadable.error)})`);
-      return { kind: "unavailable" };
+      return unreadable === undefined ? { kind: "refused" } : { kind: "unavailable" };
     }
   }
 
@@ -329,54 +404,142 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
     return parsed.data.account_id;
   }
 
+  /** The logins whose transfer is in flight in this process: their claims are never let go. */
+  const inFlight = new Set<string>();
+
+  /** A row of `gas_gifts`, as far as a claim reads it. */
+  type GiftRow = { privy_user: string; status: string; created_at: Date };
+
+  /** Whether `row` is a claim that the next claim lets go (see THE CLAIM). */
+  const letGo = (row: GiftRow, now: number) =>
+    row.status === "claimed" &&
+    row.created_at.getTime() < now - STALE_CLAIM_MS &&
+    !inFlight.has(row.privy_user);
+
   /**
-   * Whether the login or the account has a gift, sent or on its way. A claim older than
-   * `STALE_CLAIM_MS` is not on its way: `claim` deletes it.
+   * What the rows of the login or the account say: `sent`, when one of them had its gift;
+   * `held`, when one is claimed and not to be let go; or `none`.
    */
-  async function given(login: string, account: string): Promise<boolean> {
-    const rows = await deps.db.query(
-      `select 1 from gas_gifts
-        where (privy_user = $1 or account_id = $2)
-          and (status = 'sent' or created_at >= $3::timestamptz)
-        limit 1`,
-      [login, account, isoAt(nowMs() - STALE_CLAIM_MS)],
+  function standing(rows: readonly GiftRow[], now: number): "sent" | "held" | "none" {
+    if (rows.some((row) => row.status === "sent")) return "sent";
+    return rows.some((row) => !letGo(row, now)) ? "held" : "none";
+  }
+
+  /** The rows of the login or the account, if any. */
+  async function rowsOf(
+    db: Pick<ApiDeps["db"], "query">,
+    login: string,
+    account: string,
+  ): Promise<GiftRow[]> {
+    return await db.query<GiftRow>(
+      "select privy_user, status, created_at from gas_gifts where privy_user = $1 or account_id = $2",
+      [login, account],
     );
-    return rows.length > 0;
   }
 
   /**
    * Claims the gift for the login and the account, in one transaction that locks the table, so
-   * that no two claims are decided at once: `claimed`, or why not.
+   * that no two claims are decided at once: the claim, or why not. It first lets go of the claims
+   * that are due (`letGo`), each by its own login and time.
    */
   async function claim(
     on: GasGift,
     login: string,
     account: string,
-  ): Promise<"claimed" | "already_given" | "daily_limit"> {
+  ): Promise<Claim | "sent" | "held" | "daily_limit"> {
     const now = nowMs();
     const dayStart = Math.floor(now / DAY_MS) * DAY_MS;
     return await deps.db.tx(async (tx) => {
       await tx.query("lock table gas_gifts in share row exclusive mode");
-      await tx.query(
-        "delete from gas_gifts where status = 'claimed' and created_at < $1::timestamptz",
+      const stale = await tx.query<GiftRow>(
+        `select privy_user, status, created_at from gas_gifts
+          where status = 'claimed' and created_at < $1::timestamptz`,
         [isoAt(now - STALE_CLAIM_MS)],
       );
-      const taken = await tx.query(
-        "select 1 from gas_gifts where privy_user = $1 or account_id = $2 limit 1",
-        [login, account],
-      );
-      if (taken.length > 0) return "already_given";
+      for (const row of stale) {
+        if (!letGo(row, now)) continue;
+        await tx.query(
+          `delete from gas_gifts
+            where privy_user = $1 and created_at = $2::timestamptz and status = 'claimed'`,
+          [row.privy_user, row.created_at.toISOString()],
+        );
+      }
+      const said = standing(await rowsOf(tx, login, account), now);
+      if (said !== "none") return said;
       const [day] = await tx.query<{ total: string }>(
         "select coalesce(sum(amount), 0)::text as total from gas_gifts where created_at >= $1::timestamptz",
         [isoAt(dayStart)],
       );
       if (BigInt(day?.total ?? "0") + on.amount > on.dailyCap) return "daily_limit";
+      const createdAt = isoAt(now);
       await tx.query(
         `insert into gas_gifts (privy_user, account_id, amount, status, created_at)
          values ($1, $2, $3, 'claimed', $4::timestamptz)`,
-        [login, account, `${on.amount}`, isoAt(now)],
+        [login, account, `${on.amount}`, createdAt],
       );
-      return "claimed";
+      return { login, account, createdAt };
+    });
+  }
+
+  /**
+   * Sends the gift of `own` and records what became of it in its own row: `sent` with the hash, or
+   * the row deleted when the transfer was refused for certain (`sendRefused`). An outcome that is
+   * not known leaves the claim as it is. The login is in `inFlight` until the outcome is recorded,
+   * however long that takes: a request that stops waiting leaves this running. It rejects only when
+   * the database fails as it records.
+   */
+  function send(on: GasGift, own: Claim): Promise<Outcome> {
+    const where =
+      "privy_user = $1 and account_id = $2 and created_at = $3::timestamptz and status = 'claimed'";
+    const mine = [own.login, own.account, own.createdAt];
+    inFlight.add(own.login);
+    // Called inside a promise, so that one that throws at once is an outcome like any other.
+    return Promise.resolve()
+      .then(() => on.transfer(own.account, on.amount))
+      .then(
+        async ({ txHash }): Promise<Outcome> => {
+          const updated = await deps.db.query(
+            `update gas_gifts set status = 'sent', tx_hash = $4, sent_at = $5::timestamptz
+              where ${where} returning privy_user`,
+            [...mine, txHash, isoAt(nowMs())],
+          );
+          if (updated.length === 0) {
+            console.warn(
+              `WARN api: the gas gift to ${own.account} was sent (${txHash}), but its claim was ` +
+                "gone, so it is not recorded",
+            );
+          }
+          return { kind: "sent", txHash };
+        },
+        async (error: unknown): Promise<Outcome> => {
+          if (sendRefused(error)) {
+            console.error(
+              `api: the gas gift to ${own.account} was refused (${kindOf(error)}); its claim is let go`,
+            );
+            await deps.db.query(`delete from gas_gifts where ${where}`, mine);
+            return { kind: "refused" };
+          }
+          console.warn(
+            `WARN api: the gas gift to ${own.account} may still land (${kindOf(error)}); its ` +
+              `claim is kept until it is ${STALE_CLAIM_MS / 60_000} minutes old`,
+          );
+          return { kind: "unknown" };
+        },
+      )
+      .finally(() => inFlight.delete(own.login));
+  }
+
+  /** The answer to a gift asked for again while it is claimed: it is on its way, or may be. */
+  function held(): never {
+    const body: ErrorBody = {
+      error: "unavailable",
+      message:
+        "the testnet NEAR for this login or this account is on its way, or may still arrive: " +
+        "try again in a minute",
+    };
+    throw new HTTPException(503, {
+      res: Response.json(body, { status: 503, headers: { "Retry-After": String(HELD_RETRY_S) } }),
+      message: body.message,
     });
   }
 
@@ -435,7 +598,9 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
       const login = checked.user;
       const account = accountOf(await readJson(c));
 
-      if (await given(login, account)) return alreadyGiven();
+      const before = standing(await rowsOf(deps.db, login, account), nowMs());
+      if (before === "sent") return alreadyGiven();
+      if (before === "held") return held();
 
       let balance: bigint;
       try {
@@ -450,29 +615,45 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
       }
 
       const claimed = await claim(on, login, account);
-      if (claimed === "already_given") return alreadyGiven();
+      if (claimed === "sent") return alreadyGiven();
+      if (claimed === "held") return held();
       if (claimed === "daily_limit") return dailyLimit();
 
-      let txHash: string;
+      const sending = send(on, claimed);
+      let outcome: Outcome;
       try {
-        ({ txHash } = await on.transfer(account, on.amount));
+        outcome = await withinDeadline(on.transferWaitMs ?? TRANSFER_WAIT_MS, sending);
       } catch (error) {
-        console.error(`api: the gas gift to ${account} was not sent (${kindOf(error)})`);
-        await deps.db.query("delete from gas_gifts where privy_user = $1 and status = 'claimed'", [
-          login,
-        ]);
+        // A database that failed as the outcome was recorded is a fault: a 500.
+        if (!(error instanceof NoAnswerInTime)) throw error;
+        outcome = { kind: "unknown" };
+        // The outcome is recorded when it comes; only a failure to record it is said then.
+        sending.catch((late: unknown) =>
+          console.error(
+            `api: cannot record the outcome of the gas gift to ${account} (${kindOf(late)})`,
+          ),
+        );
+      }
+      if (outcome.kind === "refused") {
         return fail(
           502,
           "transfer_failed",
-          "the testnet NEAR could not be sent just now: try again in a minute",
+          "the testnet NEAR could not be sent: the transfer was refused. Try again in a minute",
         );
       }
-      await deps.db.query(
-        `update gas_gifts set status = 'sent', tx_hash = $2, sent_at = $3::timestamptz
-          where privy_user = $1`,
-        [login, txHash, isoAt(nowMs())],
-      );
-      const body: GasGiftResponse = { status: "sent", amount: `${on.amount}`, tx_hash: txHash };
+      if (outcome.kind === "unknown") {
+        return fail(
+          502,
+          "transfer_failed",
+          "the testnet NEAR may still arrive: the transfer's outcome is not known yet. Look at the " +
+            "account's balance in a few minutes before you ask again",
+        );
+      }
+      const body: GasGiftResponse = {
+        status: "sent",
+        amount: `${on.amount}`,
+        tx_hash: outcome.txHash,
+      };
       return c.json(body, 200, NOT_CACHED);
     },
   );
