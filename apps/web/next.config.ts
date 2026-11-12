@@ -23,17 +23,27 @@ const config: NextConfig = {
       // resolves to, and fail the build. lib/noSolana.ts stands in for both, in every build.
       "@solana-program/system": "./lib/noSolana.ts",
       "@solana-program/token": "./lib/noSolana.ts",
-      // The login's e2e suite (playwright.privy.config.ts) builds the app with Privy's kit replaced
-      // by a stand-in (e2e/privy/kit.tsx): the real kit talks to Privy's servers, which a spec must
-      // not reach. Only that suite sets TENDER_E2E_PRIVY_KIT, and only for its own dev server.
-      ...(process.env.TENDER_E2E_PRIVY_KIT === "1"
-        ? {
-            "@privy-io/react-auth/extended-chains": "./e2e/privy/kit.tsx",
-            "@privy-io/react-auth": "./e2e/privy/kit.tsx",
-          }
-        : {}),
+      // Privy's kit, the module lib/privyKit.tsx imports, as the build is for:
+      ...privyKit(),
     },
   },
 };
+
+/**
+ * Where Privy's kit comes from. The login's e2e suite (playwright.privy.config.ts) builds the app
+ * with a stand-in (e2e/privy/kit.tsx), since the real kit talks to Privy's servers, which a spec
+ * must not reach; only that suite sets TENDER_E2E_PRIVY_KIT. A build with no Privy app id has no
+ * login, and gets lib/noPrivy.ts, so that it does not compile the kit for nothing. Next has read
+ * the .env files by the time it reads this file. Any other build gets the kit itself.
+ */
+function privyKit(): Record<string, string> {
+  const to = (file: string) => ({
+    "@privy-io/react-auth/extended-chains": file,
+    "@privy-io/react-auth": file,
+  });
+  if (process.env.TENDER_E2E_PRIVY_KIT === "1") return to("./e2e/privy/kit.tsx");
+  if ((process.env.NEXT_PUBLIC_PRIVY_APP_ID ?? "").trim() === "") return to("./lib/noPrivy.ts");
+  return {};
+}
 
 export default config;
