@@ -218,7 +218,7 @@ curl -s https://rpc.testnet.fastnear.com -H 'content-type: application/json' \
 
 It printed `5ec43a10812fb9b92f47ac09c3e3a7ab619104491aa00dcec05c9e6f51b62b36` on 2026-11-12, the `tender.wasm` line of [`contract/res/SHA256SUMS`](../contract/res/SHA256SUMS) (`grep tender.wasm contract/res/SHA256SUMS`).
 
-How many tasks the contract holds, the same way (`task_count`; it printed `"13"` at 15:18 UTC on 2026-11-12, and the number only grows):
+How many tasks the contract holds, the same way (`task_count`; it printed `"19"` at 15:59 UTC on 2026-11-12, and the number only grows):
 
 ```
 curl -s https://rpc.testnet.fastnear.com -H 'content-type: application/json' \
@@ -226,20 +226,22 @@ curl -s https://rpc.testnet.fastnear.com -H 'content-type: application/json' \
   | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(Buffer.from(JSON.parse(s).result.result).toString()))'
 ```
 
-A settled task's scorecard, checked against the chain with Node alone (no install, no key):
+A settled task's scorecard, checked against the chain with Node alone (no install, no key). Task 14 is a seed task that the hosted Judge scored and paid:
 
 ```
-node scripts/verify-scorecard.mjs --task 3 --contract tender.tender-dev-1104.testnet --api https://tender-api-production-6c4b8458.up.railway.app --network testnet
+node scripts/verify-scorecard.mjs --task 14 --contract tender.tender-dev-1104.testnet --api https://tender-api-production-6c4b8458.up.railway.app --network testnet
 ```
 
 What it printed on 2026-11-12:
 
 ```
-task 3 on tender.tender-dev-1104.testnet (testnet)
-this task has no held-out part (heldout_commitment is null on chain)
-chain  scorecard_hash       fd0d7fbc389094f468b578a1eb83abfd9898c20dc32b88b90bbfb9a37d6c8056
-api    sha256(scorecard)    fd0d7fbc389094f468b578a1eb83abfd9898c20dc32b88b90bbfb9a37d6c8056  MATCH
+task 14 on tender.tender-dev-1104.testnet (testnet)
+chain  heldout_commitment   e6fb202cf1c98097c2f25f1d9526a01a20e7309443ce815d8199d5627419d036
+card   sha256(heldout)      e6fb202cf1c98097c2f25f1d9526a01a20e7309443ce815d8199d5627419d036  MATCH
+card   heldout salt         present
+chain  scorecard_hash       c2bda4b9828da4bc588e9f33e02707f00067f67271669e94c29cc606127c1e74
+api    sha256(scorecard)    c2bda4b9828da4bc588e9f33e02707f00067f67271669e94c29cc606127c1e74  MATCH
 VERIFIED
 ```
 
-Task 3 is a hire of a listed service, which the team's poster checked by hand, so it has no held-out checks to compare. Tasks 1 and 2 cannot be checked this way: they come from a team test run that stored its documents on a local API, so the hosted API has no scorecard for them (`--task 2` exits 2, "could not check"). `--help` lists the options and the exit codes.
+The first `MATCH` shows that the held-out checks the scorecard publishes are the ones the poster committed to on chain when it posted the task, before any agent worked; the second, that the scorecard the API serves is the one the pick recorded. Neither shows that the Judge scored with those checks: that takes running the checks again on the revealed entries, and no tool for it ships with Tender. Seed tasks 16, 18 and 19 print `VERIFIED` the same way. A hire such as task 3 has no held-out part, so only its scorecard is compared (`this task has no held-out part`, then one `MATCH` and `VERIFIED`). Tasks 1 and 2 cannot be checked this way: they come from a team test run that stored its documents on a local API, so the hosted API has no scorecard for them (`--task 2` exits 2, "could not check"). `--help` lists the options and the exit codes.
