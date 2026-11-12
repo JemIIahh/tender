@@ -327,7 +327,9 @@ export function privyProvider({
       google: async () => {
         const kit = await ready();
         // Google comes back to the site's root; the landing sends the person on to this page.
-        keepReturnPage(`${window.location.pathname}${window.location.search}`);
+        keepReturnPage(
+          `${window.location.pathname}${window.location.search}${window.location.hash}`,
+        );
         await kit.initOAuth({ provider: "google" });
       },
     },

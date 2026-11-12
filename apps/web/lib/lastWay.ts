@@ -93,19 +93,30 @@ export const OAUTH_PARAMS = [
 /** Where a page on this site is not: another origin, a protocol-relative address, or a backslash. */
 const ELSEWHERE = /^(?:[a-z][a-z0-9+.-]*:|\/\/|\/\\|\\)/i;
 
-/** `page` if it is a path on this site ("/wallet?x=1"), with no Privy parameters, or null. */
+/** The made-up origin a kept page is read against: what resolves elsewhere is not this site. */
+const HERE = "https://tender.invalid";
+
+/**
+ * `page` if it is a path on this site ("/tasks/2?x=1#pick"), with no Privy parameters, or null.
+ * It is checked as given and as the browser would read it: a path that only becomes another origin
+ * once its dot segments are resolved ("/a/..//evil.com") is not one.
+ */
 function pageOf(page: string | null): string | null {
   if (page === null || !page.startsWith("/") || ELSEWHERE.test(page) || page.length > 2048) {
     return null;
   }
   if ([...page].some((char) => char.charCodeAt(0) <= 0x20 || char === "\u007f")) return null;
-  const url = new URL(page, "https://tender.invalid");
-  if (url.origin !== "https://tender.invalid") return null;
+  const url = new URL(page, HERE);
+  if (url.origin !== HERE) return null;
   for (const name of OAUTH_PARAMS) url.searchParams.delete(name);
-  return `${url.pathname}${url.search}`;
+  const kept = `${url.pathname}${url.search}${url.hash}`;
+  if (!kept.startsWith("/") || ELSEWHERE.test(kept) || new URL(kept, HERE).origin !== HERE) {
+    return null;
+  }
+  return kept;
 }
 
-/** Keeps `page` (its path and query) as the one a Google sign-in started on, in this tab. */
+/** Keeps `page` (its path, query and anchor) as the one a Google sign-in started on, in this tab. */
 export function keepReturnPage(page: string): void {
   const checked = pageOf(page);
   if (checked === null) return;
@@ -132,13 +143,14 @@ export const RETURN_FALLBACK = "/wallet";
 
 /**
  * Where a Google sign-in that came back to `search` (the root's `location.search`) goes on to: the
- * page `kept`, or the wallet page, with Privy's three parameters, so that the login ends there; or
- * null when `search` holds none of them.
+ * page `kept`, or the wallet page, with Privy's three parameters and the page's own anchor, so that
+ * the login ends there; or null when `search` holds none of them.
  */
 export function returnAddress(search: string, kept: string | null): string | null {
   const params = new URLSearchParams(search);
   if (OAUTH_PARAMS.some((name) => params.get(name) === null)) return null;
-  const url = new URL(pageOf(kept) ?? RETURN_FALLBACK, "https://tender.invalid");
+  const url = new URL(pageOf(kept) ?? RETURN_FALLBACK, HERE);
   for (const name of OAUTH_PARAMS) url.searchParams.set(name, params.get(name) as string);
-  return `${url.pathname}${url.search}`;
+  // The page's own anchor comes back with it, after the query ("/tasks/2?…#pick").
+  return `${url.pathname}${url.search}${url.hash}`;
 }

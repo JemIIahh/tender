@@ -133,21 +133,22 @@ test("google_keeps_the_page_it_starts_on_and_the_root_sends_the_person_back_to_i
   const bridge = createPrivyBridge();
   const kit = fakeKit(bridge);
   bridge.publish(kit);
-  window.history.replaceState({}, "", "/tasks?tag=research");
+  window.history.replaceState({}, "", "/tasks/2?tag=research#pick");
   try {
     await privyProvider({ bridge, makeWallet }).steps.google();
   } finally {
     window.history.replaceState({}, "", "/");
   }
   expect(kit.asked).toEqual(["initOAuth google"]);
-  expect(sessionStorage.getItem(RETURN_PAGE_KEY)).toBe("/tasks?tag=research");
+  expect(sessionStorage.getItem(RETURN_PAGE_KEY)).toBe("/tasks/2?tag=research#pick");
 
   // Google comes back to the root, the one address given to Privy...
   expect(oauthRedirectUrl("https://tendeer.vercel.app")).toBe("https://tendeer.vercel.app");
   const back = "?privy_oauth_code=c1&privy_oauth_state=s1&privy_oauth_provider=google";
-  // ...which sends the person on to the page kept, with Privy's three parameters, once.
+  // ...which sends the person on to the page kept, with Privy's three parameters and the page's
+  // own anchor after them, once.
   expect(returnAddress(back, takeReturnPage())).toBe(
-    "/tasks?tag=research&privy_oauth_code=c1&privy_oauth_state=s1&privy_oauth_provider=google",
+    "/tasks/2?tag=research&privy_oauth_code=c1&privy_oauth_state=s1&privy_oauth_provider=google#pick",
   );
   expect(takeReturnPage()).toBeNull();
   // With nothing kept, to the wallet page; with no parameters, nowhere.
@@ -164,7 +165,12 @@ test("a_kept_page_is_only_ever_a_path_on_this_site", () => {
   for (const page of [
     "https://evil.test/x",
     "//evil.test/x",
+    "//evil.com",
+    "/\\evil.com",
     "/\\evil.test",
+    // Paths that become another origin only once their dot segments are resolved.
+    "/a/..//evil.com",
+    "/./\\evil.com",
     "javascript:alert(1)",
     "tasks",
     "/tasks with space",
