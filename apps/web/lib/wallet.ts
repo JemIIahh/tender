@@ -104,6 +104,12 @@ export interface Session {
   accountId: string;
   /** Set when a login holds the account's key, and not the person's own wallet. */
   keyHolder?: KeyHolder;
+  /**
+   * Set on a session a restore gives that the person signed in to on this page load: a login back
+   * from Google, or a sign-in in the window that return opened. The store takes it as a connect's
+   * (the other tabs are told, and a token kept for another sign-in is dropped), not as a restore's.
+   */
+  justSignedIn?: boolean;
 }
 
 /** Where a store gets its wallet. */
@@ -444,7 +450,7 @@ export function createWalletStore(
           (restored) => {
             // A wallet connected in the meantime stays.
             if (session !== null) return;
-            if (restored !== null) beginSession(restored, true);
+            if (restored !== null) beginSession(restored, restored.justSignedIn !== true);
             // No wallet: this tab has no session to go on with. The other tabs are not told.
             // near-connect also says "no wallet" when its wallet list did not download, and a
             // guess is no reason to sign them out. A session ends for them when it is

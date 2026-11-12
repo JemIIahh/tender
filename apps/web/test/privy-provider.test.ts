@@ -36,7 +36,7 @@ import {
   walletRowOf,
 } from "../lib/wallet";
 import { WalletError } from "../lib/walletErrors";
-import { fakeProvider } from "./walletDoubles";
+import { fakeProvider, fakeTabs } from "./walletDoubles";
 
 // The email and Google login as a wallet provider (lib/privy.ts), with Privy's hooks stood in for
 // by a kit the tests drive: what `usePrivy`, `useLoginWithEmail`, `useLoginWithOAuth`,
@@ -539,6 +539,99 @@ test("back_from_google_the_window_says_it_is_finishing_and_the_login_is_got_read
   await plain.provider.restore();
   expect(plain.finishes()).toBe(0);
   expect(plain.prepared).toEqual([]);
+});
+
+test("a_google_return_has_its_own_time_counted_from_when_the_kit_is_ready", async () => {
+  vi.useFakeTimers();
+  const google: PrivyUser = { linkedAccounts: [nearWallet()], google: { email: "x" } };
+  const bridge = createPrivyBridge();
+  const kit = fakeKit(bridge, { ready: false });
+  bridge.publish(kit);
+  const restoring = privyProvider({
+    bridge,
+    makeWallet,
+    returning: true,
+    readyWithinMs: 15_000,
+    returnWithinMs: 30_000,
+  }).restore();
+  // The kit takes 10 s to load; Privy ends the login 25 s after that, 35 s in all.
+  await vi.advanceTimersByTimeAsync(10_000);
+  bridge.publish({ ...kit, ready: true });
+  await vi.advanceTimersByTimeAsync(25_000);
+  bridge.loginEnded({ user: google });
+  expect((await restoring)?.accountId).toBe(ACCOUNT);
+
+  // No end within 30 s of the kit being ready: the return gave nothing.
+  const quiet = createPrivyBridge();
+  quiet.publish(fakeKit(quiet));
+  const late = privyProvider({ bridge: quiet, makeWallet, returning: true, returnWithinMs: 30_000 })
+    .restore()
+    .catch((thrown: unknown) => thrown);
+  await vi.advanceTimersByTimeAsync(29_000);
+  quiet.publish(fakeKit(quiet));
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(String(await late)).toContain("did not end in time");
+});
+
+test("a_google_return_that_ends_after_a_wallet_sign_in_is_ended_and_not_got_ready", async () => {
+  const login = slowLogin();
+  const prepared: Session[] = [];
+  const sets: LastUsed[] = [];
+  let finishes = 0;
+  const near = Object.assign(fakeProvider(walletSession), { wallets: async () => ROWS });
+  const provider = choiceProvider({
+    login: async () => login.provider,
+    wallet: async () => near,
+    ask: async () => ({ way: "wallet", walletId: "ash-wallet" }),
+    prepare: async (session) => {
+      prepared.push(session);
+    },
+    close: () => {},
+    finishing: () => {
+      finishes++;
+    },
+    returning: "google",
+    memory: { get: () => null, set: (used) => sets.push(used) },
+  });
+  // Back from Google, the window says it is finishing; the person signs in with a wallet meanwhile.
+  const restoring = provider.restore();
+  expect(finishes).toBe(1);
+  expect((await provider.connect())?.accountId).toBe(ALICE);
+  // The login ends after: one session at a time, so it ends too, and nothing else is done with it.
+  login.answer(loginSession);
+  expect(await restoring).toBeNull();
+  await vi.waitFor(() => expect(login.provider.logouts).toBe(1));
+  expect(prepared).toEqual([]);
+  expect(sets).toEqual(["wallet:ash-wallet"]);
+});
+
+test("a_login_back_from_google_is_a_new_sign_in_the_other_tabs_hear_of_and_ends_a_wallet_s", async () => {
+  // Both ways hold a session; back from Google, the login is the one, and the wallet's ends.
+  const both = choices({ loginRestored: true, walletRestored: true, returning: "google" });
+  const session = await both.provider.restore();
+  expect(session?.accountId).toBe(ACCOUNT);
+  expect(session?.justSignedIn).toBe(true);
+  expect(both.near.disconnects).toBe(1);
+
+  // The store takes it as a connect: the other tabs are told.
+  const tabs = fakeTabs();
+  const store = createWalletStore(
+    async () => choices({ loginRestored: true, returning: "google" }).provider,
+    tabs.open,
+  );
+  await store.start();
+  expect(store.getSnapshot().accountId).toBe(ACCOUNT);
+  expect(tabs.told).toBe(1);
+
+  // A plain restore of an earlier visit's login is no news to them.
+  const quiet = fakeTabs();
+  const again = createWalletStore(
+    async () => choices({ loginRestored: true }).provider,
+    quiet.open,
+  );
+  await again.start();
+  expect(again.getSnapshot().accountId).toBe(ACCOUNT);
+  expect(quiet.told).toBe(0);
 });
 
 test("back_from_google_with_no_login_the_window_opens_again_and_says_it_didn_t_finish", async () => {

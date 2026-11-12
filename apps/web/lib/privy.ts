@@ -73,6 +73,13 @@ export interface PrivyKit {
 /** How long a connect waits for Privy's kit to be ready before it says it couldn't connect. */
 export const PRIVY_READY_MS = 15_000;
 
+/**
+ * How long a login back from Google has to end once the kit is ready: Privy then trades the code
+ * for a session with its servers, which a slow connection makes slow. Only then does the window
+ * say the Google sign-in didn't finish.
+ */
+export const GOOGLE_RETURN_MS = 30_000;
+
 /** A login that ended without a user, with Privy's error code (`oauth_user_denied`, ...). */
 export class LoginEnded extends Error {
   constructor(readonly code: string) {
@@ -96,9 +103,9 @@ export interface PrivyBridge {
   /**
    * The user, once a kit says the person is logged in (at once if the latest does), or a login
    * ends with one. Rejects with `LoginEnded` for a login that ends without one, and after
-   * `withinMs` with neither.
+   * `withinMs` with neither: counted from now, or from when `from` settles.
    */
-  loggedIn(withinMs?: number): Promise<PrivyUser>;
+  loggedIn(withinMs?: number, from?: Promise<unknown>): Promise<PrivyUser>;
   /** `listener` hears a login that was on end without this page asking (it ran out, another tab). */
   onLoggedOut(listener: () => void): () => void;
 }
@@ -155,26 +162,36 @@ export function createPrivyBridge(): PrivyBridge {
       return latest;
     },
 
-    loggedIn(withinMs = PRIVY_READY_MS) {
+    loggedIn(withinMs = PRIVY_READY_MS, from) {
       if (latest?.ready === true && latest.authenticated && latest.user !== null) {
         return Promise.resolve(latest.user);
       }
       return new Promise((resolve, reject) => {
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const stop = () => {
+          if (timer !== null) clearTimeout(timer);
+        };
         const waiter = {
           yes: (user: PrivyUser) => {
-            clearTimeout(timer);
+            stop();
             resolve(user);
           },
           no: (error: unknown) => {
-            clearTimeout(timer);
+            stop();
             reject(error);
           },
         };
-        const timer = setTimeout(() => {
-          ending.delete(waiter);
-          reject(new Error("the login did not end in time"));
-        }, withinMs);
+        // The waiter is there from now, so that no login's end is missed; its time from `from`.
         ending.add(waiter);
+        const start = () => {
+          if (!ending.has(waiter)) return;
+          timer = setTimeout(() => {
+            ending.delete(waiter);
+            reject(new Error("the login did not end in time"));
+          }, withinMs);
+        };
+        if (from === undefined) start();
+        else from.then(start, start);
       });
     },
 
@@ -248,6 +265,8 @@ export interface PrivyProviderOptions {
   readyWithinMs?: number;
   /** Whether the page is coming back from a login's OAuth sign-in (`oauthReturn`). */
   returning?: boolean;
+  /** How long that return has to end once the kit is ready. */
+  returnWithinMs?: number;
 }
 
 /**
@@ -259,6 +278,7 @@ export function privyProvider({
   makeWallet,
   readyWithinMs = PRIVY_READY_MS,
   returning = false,
+  returnWithinMs = GOOGLE_RETURN_MS,
 }: PrivyProviderOptions): LoginProvider {
   // One wallet made at a time: a restore and a connect at once must not make two.
   let making: Promise<string> | null = null;
@@ -314,11 +334,12 @@ export function privyProvider({
 
     async restore() {
       // Back from Google: the kit's hook ends that login on this page once the kit is ready, so
-      // the wait for it starts first.
-      const ending = returning ? bridge.loggedIn(readyWithinMs) : null;
+      // the wait for it starts first, and its own time once the kit is ready.
+      const readying = ready();
+      const ending = returning ? bridge.loggedIn(returnWithinMs, readying) : null;
       // Read below, or not at all (a login of an earlier visit came back instead).
       ending?.catch(() => {});
-      const kit = await ready();
+      const kit = await readying;
       if (kit.authenticated && kit.user !== null) return sessionOf(kit.user);
       if (ending === null) return null;
       let user: PrivyUser;
@@ -562,25 +583,34 @@ export function choiceProvider({
   }
 
   /**
-   * What a restore that came back from Google gives: the login, remembered and got ready; another
-   * way's session, as it is (the window closes); or, with neither, the window again, which says
-   * the Google sign-in didn't finish and offers every way.
+   * What a restore that came back from Google gives, when it was the first to give a session
+   * (`first`; a sign-in made meanwhile has the window and the session, and this gives none):
+   * the login, remembered, the other way's session ended, and got ready; another way's session
+   * from before, as it is (the window closes); or, with neither, the window again, which says the
+   * Google sign-in didn't finish and offers every way. A session the person signed in to here is
+   * new (`justSignedIn`), as a connect's is.
    */
   async function finishReturn(
     session: Session | null,
     choice: ConnectWay | null,
+    first: boolean,
   ): Promise<Session | null> {
-    if (session !== null && choice === "login") {
+    if (!first) return null;
+    if (session !== null && choice === "login" && active === "login") {
       memory.set(returning === "google" ? "google" : "login");
+      // One session at a time, as for a connect.
+      await endOther("wallet");
       await prepare(session);
-      return session;
+      return { ...session, justSignedIn: true };
     }
     if (session !== null) {
       close();
       return session;
     }
+    if (active !== null) return null;
     try {
-      return await connectBy(GOOGLE_DIDNT_FINISH);
+      const picked = await connectBy(GOOGLE_DIDNT_FINISH);
+      return picked === null ? null : { ...picked, justSignedIn: true };
     } catch (error) {
       console.error(error);
       return null;
@@ -601,10 +631,11 @@ export function choiceProvider({
           choice in answers || (choice === "login" && loginGivenUp);
         const take = (session: Session | null, choice: ConnectWay | null) => {
           done = true;
-          if (active === null) active = choice;
+          const first = active === null;
+          if (first) active = choice;
           // A connect came first: the store keeps that one, and this way's session ends.
           else if (session !== null && choice !== null && choice !== active) void endOther(choice);
-          if (back) void finishReturn(session, choice).then(resolve);
+          if (back) void finishReturn(session, choice, first).then(resolve);
           else resolve(session);
         };
         const decide = () => {
