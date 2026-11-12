@@ -2,29 +2,32 @@ import { ApiError, type GasGiftResponse } from "@tender/shared";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { ConnectChooser } from "../components/ConnectChooser";
-import { createChooser } from "../lib/chooser";
+import { ConnectChooser, FOOTER_LOGIN, FOOTER_WALLETS } from "../components/ConnectChooser";
+import { CODE_TRIES, codeProblem, createChooser, sendCodeProblem } from "../lib/chooser";
 import type { GiftDeps } from "../lib/gasGift";
-import type { PrivyBridge, PrivyKit } from "../lib/privy";
-import type { Session } from "../lib/wallet";
+import { LAST_WAY_KEY } from "../lib/lastWay";
+import type { ConnectPick, ConnectWays, LoginSteps, PrivyBridge, PrivyKit } from "../lib/privy";
+import type { Session, WalletRow } from "../lib/wallet";
 
-// Connect's chooser: in a build with a Privy app id, Connect asks which way, the email or Google
-// login first and a NEAR wallet second; after a login it gets the account ready to pay fees. In a
-// build without one, Connect opens near-connect at once, as it did before. Privy's kit and
-// near-connect are both replaced here: the kit by a module that hands the bridge a kit the test
-// drives (what Privy's hooks would give), near-connect by a connector that records its calls.
+// Connect's one window: "Log in or sign up", with the email field, Google, and a row for each NEAR
+// wallet near-connect lists, in a build with a Privy app id; the wallets alone in a build without
+// one. After a login it gets the account ready to pay fees. Privy's kit and near-connect are both
+// replaced here: the kit by a module that hands the bridge a kit the test drives (what Privy's
+// hooks would give), near-connect by a connector that records its calls.
 
 const ACCOUNT = "5e".repeat(32);
 const GIFT = 100_000_000_000_000_000_000_000n;
 
 beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
+  localStorage.clear();
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 const loginSession = (): Pick<Session, "accountId" | "keyHolder"> => ({
@@ -51,55 +54,388 @@ function giftWorld(balances: bigint[], gift: () => Promise<GasGiftResponse>) {
 
 const dialog = () => screen.getByRole("dialog");
 
-test("the_chooser_offers_the_login_first_and_a_near_wallet_second", async () => {
-  const store = createChooser(
+/** A store whose readiness check is never run. */
+const windowStore = (options?: { walletsWithinMs?: number }) =>
+  createChooser(
     () => giftWorld([0n], async () => ({ status: "not_needed", balance: "1" })).deps,
+    options,
   );
+
+const ROWS: WalletRow[] = [
+  {
+    id: "ash-wallet",
+    name: "Ash Wallet",
+    icon: "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%2F%3E",
+    site: "wallet.ash.test",
+  },
+  { id: "birch-wallet", name: "Birch Wallet", icon: null, site: "birch.test" },
+];
+
+/** What a privy error looks like to the window: an error with Privy's code. */
+const privyError = (code: string) => Object.assign(new Error(code), { privyErrorCode: code });
+
+/** The window's ways, over steps that record what they were asked. */
+function fakeWays(
+  over: { steps?: Partial<LoginSteps>; login?: null } & Partial<
+    Pick<ConnectWays, "wallets" | "lastUsed">
+  > = {},
+) {
+  const asked: string[] = [];
+  const steps: LoginSteps = {
+    sendCode: async (email) => {
+      asked.push(`sendCode ${email}`);
+    },
+    loginWithCode: async (code) => {
+      asked.push(`loginWithCode ${code}`);
+    },
+    google: async () => {
+      asked.push("google");
+    },
+    ...over.steps,
+  };
+  const ways: ConnectWays = {
+    login: over.login === null ? null : async () => steps,
+    wallets: over.wallets ?? (async () => ROWS),
+    lastUsed: over.lastUsed ?? null,
+  };
+  return { ways, asked };
+}
+
+/** Opens the window of `store` over `ways`, and waits for its wallets. Gives the answer. */
+async function open(
+  store: ReturnType<typeof windowStore>,
+  ways: ConnectWays,
+): Promise<{ answer: Promise<ConnectPick | null> }> {
+  let answer: Promise<ConnectPick | null> = Promise.resolve(null);
+  act(() => {
+    answer = store.ask(ways);
+  });
+  await waitFor(() => expect(within(dialog()).queryByRole("status")).toBeNull());
+  return { answer };
+}
+
+/** The names of the window's buttons, in order: a label, or the words on it. */
+const buttonNames = () =>
+  within(dialog())
+    .getAllByRole("button")
+    .map((button) => button.getAttribute("aria-label") ?? button.textContent);
+
+test("the_window_offers_email_google_and_each_near_wallet_in_privy_s_order", async () => {
+  const store = windowStore();
   render(<ConnectChooser store={store} />);
   expect(screen.queryByRole("dialog")).toBeNull();
+  await open(store, fakeWays().ways);
 
-  let answer: Promise<string | null> = Promise.resolve(null);
-  act(() => {
-    answer = store.ask();
-  });
-  expect(within(dialog()).getByRole("heading").textContent).toBe("Connect to Tender");
-  const buttons = within(dialog())
-    .getAllByRole("button")
-    .map((button) => button.textContent);
-  expect(buttons).toEqual(["", "Continue with email or Google", "Use a NEAR wallet"]);
-  // The one big action has the focus.
-  expect(document.activeElement?.textContent).toBe("Continue with email or Google");
-
-  await userEvent.click(screen.getByRole("button", { name: "Continue with email or Google" }));
-  expect(await answer).toBe("login");
-  // Closed at once, so that the login's own window is what shows.
-  expect(screen.queryByRole("dialog")).toBeNull();
-
-  act(() => {
-    answer = store.ask();
-  });
-  await userEvent.click(screen.getByRole("button", { name: "Use a NEAR wallet" }));
-  expect(await answer).toBe("wallet");
+  const panel = dialog();
+  expect(panel.getAttribute("aria-modal")).toBe("true");
+  const heading = within(panel).getByRole("heading");
+  expect(heading.textContent).toBe("Log in or sign up");
+  expect(panel.getAttribute("aria-labelledby")).toBe(heading.id);
+  // The email field and its Submit, Google, then one row for each wallet, with its site.
+  expect(buttonNames()).toEqual([
+    "Close",
+    "Submit",
+    "Continue with Google",
+    "Ash Walletwallet.ash.test",
+    "Birch Walletbirch.test",
+  ]);
+  const email = within(panel).getByLabelText("Email address");
+  expect(email.getAttribute("placeholder")).toBe("your@email.com");
+  expect(document.activeElement).toBe(email);
+  expect(within(panel).getByText("or use a NEAR wallet")).toBeTruthy();
+  expect(within(panel).getByText(FOOTER_LOGIN)).toBeTruthy();
+  expect(FOOTER_LOGIN).toBe("Email and Google login by Privy. NEAR wallets connect directly.");
+  // The wallet's own icon, and none for a wallet whose list gave none.
+  const rows = within(panel).getAllByTestId("wallet-row");
+  expect(rows[0]?.querySelector("img")?.getAttribute("src")).toBe(ROWS[0]?.icon);
+  expect(rows[1]?.querySelector("img")).toBeNull();
+  expect(within(panel).queryByTestId("last-used")).toBeNull();
 });
 
-test("escape_the_close_button_and_the_backdrop_close_it_with_no_choice", async () => {
-  const store = createChooser(
-    () => giftWorld([0n], async () => ({ status: "not_needed", balance: "1" })).deps,
-  );
+test("without_a_login_the_window_shows_the_wallets_alone_with_the_same_look", async () => {
+  const store = windowStore();
   render(<ConnectChooser store={store} />);
+  await open(store, fakeWays({ login: null }).ways);
+
+  const panel = dialog();
+  expect(within(panel).getByRole("heading").textContent).toBe("Connect a NEAR wallet");
+  expect(within(panel).queryByLabelText("Email address")).toBeNull();
+  expect(within(panel).queryByText("or use a NEAR wallet")).toBeNull();
+  expect(buttonNames()).toEqual(["Close", "Ash Walletwallet.ash.test", "Birch Walletbirch.test"]);
+  expect(within(panel).getByText(FOOTER_WALLETS)).toBeTruthy();
+  // The first wallet takes the focus once the list is there.
+  await waitFor(() =>
+    expect(document.activeElement).toBe(within(panel).getAllByTestId("wallet-row")[0]),
+  );
+});
+
+test("an_email_gets_a_code_and_the_code_logs_in_with_the_window_kept_open", async () => {
+  const store = windowStore();
+  render(<ConnectChooser store={store} />);
+  const { ways, asked } = fakeWays();
+  const { answer } = await open(store, ways);
+
+  await userEvent.type(screen.getByLabelText("Email address"), " ada@example.com {Enter}");
+  expect(asked).toEqual(["sendCode ada@example.com"]);
+  expect(within(dialog()).getByRole("heading").textContent).toBe("Check your email");
+  expect(within(dialog()).getByText(/Enter the code sent to/).textContent).toBe(
+    "Enter the code sent to ada@example.com",
+  );
+  const code = screen.getByLabelText("Code");
+  await waitFor(() => expect(document.activeElement).toBe(code));
+  expect(code.getAttribute("autocomplete")).toBe("one-time-code");
+  expect(code.getAttribute("inputmode")).toBe("numeric");
+
+  // Six digits are the whole code: it goes at once.
+  await userEvent.type(code, "123456");
+  expect(asked).toEqual(["sendCode ada@example.com", "loginWithCode 123456"]);
+  expect(await answer).toEqual({ way: "login" });
+  // The window stays, getting the account ready, until the session is made and checked.
+  expect(screen.getByTestId("account-preparing").textContent).toBe("Getting your account ready…");
+});
+
+test("each_email_problem_is_one_plain_line", async () => {
+  // The words, by Privy's code.
+  expect(sendCodeProblem(privyError("invalid_data"))).toBe("Check the email address.");
+  expect(sendCodeProblem(privyError("too_many_requests"))).toBe(
+    "Too many tries. Wait a few minutes, then try again.",
+  );
+  expect(sendCodeProblem(privyError("disallowed_login_method"))).toBe(
+    "This email address can't log in here.",
+  );
+  expect(sendCodeProblem(new Error("offline"))).toBe("Couldn't send the code. Try again.");
+  expect(codeProblem(privyError("invalid_credentials"), 1)).toBe(
+    "That code is wrong or has expired.",
+  );
+  expect(codeProblem(privyError("invalid_credentials"), CODE_TRIES)).toBe(
+    "Too many wrong codes. Send a new code.",
+  );
+  expect(codeProblem(privyError("too_many_requests"), 1)).toBe(
+    "Too many tries. Wait a few minutes, then send a new code.",
+  );
+  expect(codeProblem(new Error("offline"), 1)).toBe("Couldn't log in. Try again.");
+
+  // In the window: an empty field and an address that is not one are caught before Privy is asked.
+  let refuse: string | null = "too_many_requests";
+  const { ways, asked } = fakeWays({
+    steps: {
+      sendCode: async (email) => {
+        asked.push(`sendCode ${email}`);
+        if (refuse !== null) throw privyError(refuse);
+      },
+      loginWithCode: async (code) => {
+        asked.push(`loginWithCode ${code}`);
+        if (code !== "123456") throw privyError("invalid_credentials");
+      },
+    },
+  });
+  const store = windowStore();
+  render(<ConnectChooser store={store} />);
+  await open(store, ways);
+  const submit = () => userEvent.click(screen.getByRole("button", { name: "Submit" }));
+  await submit();
+  expect(screen.getByRole("alert").textContent).toBe("Enter your email address.");
+  await userEvent.type(screen.getByLabelText("Email address"), "ada@");
+  await submit();
+  expect(screen.getByRole("alert").textContent).toBe("Check the email address.");
+  expect(screen.getByLabelText("Email address").getAttribute("aria-invalid")).toBe("true");
+  expect(asked).toEqual([]);
+  await userEvent.type(screen.getByLabelText("Email address"), "example.com");
+  await submit();
+  expect(screen.getByRole("alert").textContent).toBe(
+    "Too many tries. Wait a few minutes, then try again.",
+  );
+
+  // Sent; then a wrong code, which empties the field for the next.
+  refuse = null;
+  await submit();
+  const code = () => screen.getByLabelText("Code") as HTMLInputElement;
+  await userEvent.type(code(), "000000");
+  expect(screen.getByRole("alert").textContent).toBe("That code is wrong or has expired.");
+  expect(code().value).toBe("");
+  await waitFor(() => expect(document.activeElement).toBe(code()));
+  // Fewer than six digits, with Log in.
+  await userEvent.type(code(), "12");
+  await userEvent.click(screen.getByRole("button", { name: "Log in" }));
+  expect(screen.getByRole("alert").textContent).toBe("Enter the 6-digit code.");
+  // Wrong until Privy takes no more for this code.
+  for (let tries = 2; tries <= CODE_TRIES; tries++) {
+    await userEvent.clear(code());
+    await userEvent.type(code(), "000000");
+  }
+  expect(screen.getByRole("alert").textContent).toBe("Too many wrong codes. Send a new code.");
+
+  // Resend: a new code to the same address, and the count starts again.
+  await userEvent.click(screen.getByRole("button", { name: "Resend code" }));
+  expect(asked.filter((line) => line === "sendCode ada@example.com")).toHaveLength(3);
+  expect(screen.getByRole("status").textContent).toBe("A new code is on its way.");
+  expect(screen.queryByRole("alert")).toBeNull();
+
+  // Back: the first step again, with the address still in its field.
+  await userEvent.click(screen.getByRole("button", { name: "Back" }));
+  expect(within(dialog()).getByRole("heading").textContent).toBe("Log in or sign up");
+  expect((screen.getByLabelText("Email address") as HTMLInputElement).value).toBe(
+    "ada@example.com",
+  );
+});
+
+test("google_sends_the_page_to_google_and_says_so_if_it_can_t", async () => {
+  const store = windowStore();
+  render(<ConnectChooser store={store} />);
+  let go: () => void = () => {};
+  const { ways, asked } = fakeWays({
+    steps: {
+      google: () => {
+        asked.push("google");
+        return new Promise((resolve) => {
+          go = resolve;
+        });
+      },
+    },
+  });
+  await open(store, ways);
+  await userEvent.click(screen.getByRole("button", { name: "Continue with Google" }));
+  expect(asked).toEqual(["google"]);
+  // On its way: the row says so, and a second press does nothing.
+  const row = screen.getByRole("button", { name: "Opening Google…" });
+  expect(row.getAttribute("aria-disabled")).toBe("true");
+  await userEvent.click(row);
+  expect(asked).toEqual(["google"]);
+  go();
+  act(() => store.close());
+
+  // Privy refuses to start it: the window says so, and Google can be pressed again.
+  const failing = windowStore();
+  render(<ConnectChooser store={failing} />);
+  await open(
+    failing,
+    fakeWays({
+      steps: {
+        google: async () => {
+          throw privyError("disallowed_login_method");
+        },
+      },
+    }).ways,
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Continue with Google" }));
+  expect(screen.getByRole("alert").textContent).toBe("Couldn't open the Google login. Try again.");
+  expect(
+    screen.getByRole("button", { name: "Continue with Google" }).getAttribute("aria-disabled"),
+  ).toBeNull();
+});
+
+test("a_wallet_row_picks_that_wallet_and_the_window_closes", async () => {
+  const store = windowStore();
+  render(<ConnectChooser store={store} />);
+  const { answer } = await open(store, fakeWays().ways);
+  await userEvent.click(screen.getByRole("button", { name: /Birch Wallet/ }));
+  expect(await answer).toEqual({ way: "wallet", walletId: "birch-wallet" });
+  // Closed at once, so that the wallet's own approval is what shows.
+  expect(screen.queryByRole("dialog")).toBeNull();
+});
+
+test("last_used_marks_the_way_this_browser_connected_with_last", async () => {
+  for (const [used, row] of [
+    ["email", "Email address"],
+    ["google", "Continue with Google"],
+    ["wallet:birch-wallet", "Birch Wallet"],
+  ] as const) {
+    const store = windowStore();
+    const { unmount } = render(<ConnectChooser store={store} />);
+    await open(store, fakeWays({ lastUsed: used }).ways);
+    const badges = screen.getAllByTestId("last-used");
+    expect(badges, used).toHaveLength(1);
+    expect(badges[0]?.textContent).toBe("Last used");
+    // In the row of that way.
+    const holder = badges[0]?.closest("form, button");
+    expect(holder?.textContent, used).toContain(row === "Email address" ? "Submit" : row);
+    act(() => store.close());
+    unmount();
+  }
+
+  // A way kept with no method ("login" or "wallet", as an earlier build kept it) marks no row.
+  for (const used of ["login", "wallet"] as const) {
+    const store = windowStore();
+    const { unmount } = render(<ConnectChooser store={store} />);
+    await open(store, fakeWays({ lastUsed: used }).ways);
+    expect(screen.queryAllByTestId("last-used"), used).toEqual([]);
+    act(() => store.close());
+    unmount();
+  }
+});
+
+test("a_list_that_can_t_be_had_is_one_row_that_opens_near_connect_s_own_window", async () => {
+  for (const wallets of [
+    async () => {
+      throw new Error("the library did not load");
+    },
+    async () => [],
+  ]) {
+    const store = windowStore();
+    const { unmount } = render(<ConnectChooser store={store} />);
+    const { answer } = await open(store, fakeWays({ wallets }).ways);
+    const fallback = screen.getByRole("button", { name: "NEAR wallets" });
+    expect(screen.queryAllByTestId("wallet-row")).toEqual([]);
+    await userEvent.click(fallback);
+    expect(await answer).toEqual({ way: "wallet", walletId: null });
+    unmount();
+  }
+
+  // A list that doesn't come in time: the same row, while it still may.
+  vi.useFakeTimers();
+  const store = windowStore({ walletsWithinMs: 1000 });
+  render(<ConnectChooser store={store} />);
+  act(() => {
+    void store.ask(fakeWays({ wallets: () => new Promise(() => {}) }).ways);
+  });
+  expect(within(dialog()).getByRole("status").textContent).toBe("Loading NEAR wallets…");
+  await act(() => vi.advanceTimersByTimeAsync(1000));
+  expect(screen.getByRole("button", { name: "NEAR wallets" })).toBeTruthy();
+});
+
+test("escape_the_close_button_and_the_backdrop_close_it_and_the_focus_goes_back", async () => {
+  const store = windowStore();
+  render(
+    <>
+      <button type="button">Connect wallet</button>
+      <ConnectChooser store={store} />
+    </>,
+  );
+  const opener = screen.getByRole("button", { name: "Connect wallet" });
 
   for (const close of [
     () => fireEvent.keyDown(dialog(), { key: "Escape" }),
     () => fireEvent.click(screen.getByRole("button", { name: "Close" })),
     () => fireEvent.click(screen.getByTestId("connect-chooser")),
   ]) {
-    let answer: Promise<string | null> = Promise.resolve("login");
-    act(() => {
-      answer = store.ask();
-    });
+    opener.focus();
+    const { answer } = await open(store, fakeWays().ways);
+    expect(document.activeElement).toBe(screen.getByLabelText("Email address"));
     act(close);
     expect(await answer).toBeNull();
     expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+  }
+});
+
+test("the_focus_stays_in_the_window_and_every_row_is_a_button", async () => {
+  const store = windowStore();
+  render(<ConnectChooser store={store} />);
+  await open(store, fakeWays().ways);
+  const close = screen.getByRole("button", { name: "Close" });
+  const last = screen.getByRole("button", { name: /Birch Wallet/ });
+  // Tab from the last row goes round to the first control, and Shift+Tab from it back to the last.
+  last.focus();
+  fireEvent.keyDown(dialog(), { key: "Tab" });
+  expect(document.activeElement).toBe(close);
+  fireEvent.keyDown(dialog(), { key: "Tab", shiftKey: true });
+  expect(document.activeElement).toBe(last);
+  // Google and every wallet are buttons; the email row is its field and its button.
+  for (const row of [
+    screen.getByRole("button", { name: "Continue with Google" }),
+    ...screen.getAllByTestId("wallet-row"),
+  ]) {
+    expect(row.tagName).toBe("BUTTON");
   }
 });
 
@@ -289,7 +625,19 @@ test("closing_while_it_gets_ready_lets_the_connect_go_on_at_once", async () => {
 const near = vi.hoisted(() => {
   class FakeConnector {
     picked = false;
-    connect = vi.fn(async () => {
+    whenManifestLoaded = Promise.resolve();
+    // What near-connect lists for this app: one wallet that can send a batch.
+    availableWallets = [
+      {
+        manifest: {
+          id: "ash-wallet",
+          name: "Ash Wallet",
+          icon: "https://example.test/ash.png",
+          website: "https://wallet.ash.test",
+        },
+      },
+    ];
+    connect = vi.fn(async (_input?: { walletId?: string }) => {
       this.picked = true;
       return {};
     });
@@ -321,6 +669,7 @@ const privy = vi.hoisted(() => ({
   /** Calls of Privy's logout, and whether Privy holds a login now. */
   logouts: 0,
   authenticated: false,
+  asked: [] as string[],
 }));
 vi.mock("../lib/privyKit", () => ({
   mountPrivyKit: (bridge: PrivyBridge, ids: { appId: string; clientId: string | null }) => {
@@ -334,11 +683,18 @@ vi.mock("../lib/privyKit", () => ({
       ready: true,
       authenticated: false,
       user: null,
-      // The person logs in: Privy says so to the hooks, and to the login's callback.
-      login: () => {
+      sendCode: async ({ email }) => {
+        privy.asked.push(`sendCode ${email}`);
+      },
+      // The right code logs the person in: Privy says so to the login's callback, then the hooks.
+      loginWithCode: async ({ code }) => {
+        privy.asked.push(`loginWithCode ${code}`);
         privy.authenticated = true;
-        bridge.publish({ ...kit, authenticated: true, user });
         bridge.loginEnded({ user });
+        setTimeout(() => bridge.publish({ ...kit, authenticated: true, user }), 0);
+      },
+      initOAuth: async ({ provider }) => {
+        privy.asked.push(`initOAuth ${provider}`);
       },
       logout: async () => {
         privy.logouts++;
@@ -362,6 +718,7 @@ async function pageModules(env: Record<string, string>) {
   privy.mounted.length = 0;
   privy.logouts = 0;
   privy.authenticated = false;
+  privy.asked.length = 0;
   for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
   const [{ walletStore }, { chooser }] = await Promise.all([
     import("../lib/wallet"),
@@ -370,37 +727,80 @@ async function pageModules(env: Record<string, string>) {
   return { walletStore, chooser };
 }
 
-test("without_a_privy_app_id_connect_opens_near_connect_at_once", async () => {
+/** Waits for the page's window to list its wallets. */
+async function listed(chooser: Awaited<ReturnType<typeof pageModules>>["chooser"]) {
+  await vi.waitFor(() => {
+    const state = chooser.getSnapshot();
+    expect(state.step === "choose" && state.wallets.status).toBe("listed");
+  });
+  return chooser.getSnapshot();
+}
+
+test("without_a_privy_app_id_connect_opens_the_window_with_the_wallets_alone", async () => {
   const { walletStore, chooser } = await pageModules({});
-  const opened: string[] = [];
-  chooser.subscribe(() => opened.push(chooser.getSnapshot().step));
+  const connecting = walletStore.connect();
+  const state = await listed(chooser);
+  expect(state).toMatchObject({
+    step: "choose",
+    login: false,
+    wallets: {
+      status: "listed",
+      wallets: [
+        {
+          id: "ash-wallet",
+          name: "Ash Wallet",
+          icon: "https://example.test/ash.png",
+          site: "wallet.ash.test",
+        },
+      ],
+    },
+  });
 
-  await walletStore.connect();
-
+  // A wallet's row connects that wallet, with no window of near-connect's.
+  chooser.pickWallet("ash-wallet");
+  await connecting;
   expect(near.made).toHaveLength(1);
-  expect(near.made[0]?.connect).toHaveBeenCalledTimes(1);
-  expect(opened).toEqual([]);
-  // The kit is never loaded.
+  expect(near.made[0]?.connect.mock.calls).toEqual([[{ walletId: "ash-wallet" }]]);
+  expect(walletStore.getSnapshot().accountId).toBe("alice.testnet");
+  // Remembered for the window's "Last used"; and the kit is never loaded.
+  expect(localStorage.getItem(LAST_WAY_KEY)).toBe("wallet:ash-wallet");
   expect(privy.mounted).toEqual([]);
+
+  await walletStore.disconnect();
+  const again = walletStore.connect();
+  expect(await listed(chooser)).toMatchObject({ lastUsed: "wallet:ash-wallet" });
+  // The row that opens near-connect's own list.
+  chooser.pickWallet(null);
+  await again;
+  expect(near.made[0]?.connect.mock.calls.at(-1)).toEqual([]);
 });
 
-test("with_a_privy_app_id_connect_asks_and_a_near_wallet_is_near_connect", async () => {
+test("with_a_privy_app_id_the_window_offers_the_login_and_a_wallet_row_connects_that_wallet", async () => {
   const { walletStore, chooser } = await pageModules({
     NEXT_PUBLIC_PRIVY_APP_ID: "cm0app1d",
     NEXT_PUBLIC_PRIVY_CLIENT_ID: "client-1",
   });
   await walletStore.start();
   const connecting = walletStore.connect();
-  await vi.waitFor(() => expect(chooser.getSnapshot().step).toBe("choose"));
+  expect(await listed(chooser)).toMatchObject({ step: "choose", login: true });
   // The kit was loaded with the build's ids to look for a login of an earlier visit.
   expect(privy.mounted).toEqual([{ appId: "cm0app1d", clientId: "client-1" }]);
 
-  chooser.choose("wallet");
+  chooser.pickWallet("ash-wallet");
   await connecting;
-  expect(near.made.at(-1)?.connect).toHaveBeenCalledTimes(1);
+  expect(near.made.at(-1)?.connect.mock.calls).toEqual([[{ walletId: "ash-wallet" }]]);
 });
 
-test("with_a_privy_app_id_the_login_connects_gets_the_account_ready_and_logs_out", async () => {
+test("with_a_privy_app_id_google_calls_privy_s_init_oauth", async () => {
+  const { walletStore, chooser } = await pageModules({ NEXT_PUBLIC_PRIVY_APP_ID: "cm0app1d" });
+  await walletStore.start();
+  void walletStore.connect();
+  await listed(chooser);
+  await chooser.google();
+  expect(privy.asked).toEqual(["initOAuth google"]);
+});
+
+test("with_a_privy_app_id_the_email_login_connects_gets_the_account_ready_and_logs_out", async () => {
   const requests: string[] = [];
   let funded = false;
   vi.stubGlobal("fetch", async (input: string, init: RequestInit = {}) => {
@@ -432,10 +832,13 @@ test("with_a_privy_app_id_the_login_connects_gets_the_account_ready_and_logs_out
   expect(walletStore.getSnapshot().accountId).toBeNull();
 
   const connecting = walletStore.connect();
-  await vi.waitFor(() => expect(chooser.getSnapshot().step).toBe("choose"));
-  chooser.choose("login");
+  await listed(chooser);
+  await chooser.sendCode("ada@example.com");
+  expect(chooser.getSnapshot().step).toBe("code");
+  await chooser.submitCode("123456");
   await connecting;
 
+  expect(privy.asked).toEqual(["sendCode ada@example.com", "loginWithCode 123456"]);
   expect(walletStore.getSnapshot()).toMatchObject({
     ready: true,
     accountId: ACCOUNT,
@@ -443,6 +846,7 @@ test("with_a_privy_app_id_the_login_connects_gets_the_account_ready_and_logs_out
   });
   expect(walletStore.getSnapshot().keyHolder?.login).toBe("email");
   expect(chooser.getSnapshot().step).toBe("closed");
+  expect(localStorage.getItem(LAST_WAY_KEY)).toBe("email");
   // The balance, the gift with the login's token, and the balance again until it arrived.
   expect(requests).toEqual([
     "RPC view_account",

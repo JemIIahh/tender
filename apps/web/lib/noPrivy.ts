@@ -14,7 +14,8 @@ function noLogin(): never {
 // @privy-io/react-auth
 export const PrivyProvider = noLogin;
 export const usePrivy = noLogin;
-export const useLogin = noLogin;
+export const useLoginWithEmail = noLogin;
+export const useLoginWithOAuth = noLogin;
 export const useLogout = noLogin;
 export const getAccessToken = noLogin;
 

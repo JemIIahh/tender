@@ -1,4 +1,12 @@
-import type { KeyHolder, Session, SigningWallet, WalletProvider } from "./wallet";
+import { type LastUsed, walletUsed, wayOf } from "./lastWay";
+import type {
+  KeyHolder,
+  NearProvider,
+  Session,
+  SigningWallet,
+  WalletProvider,
+  WalletRow,
+} from "./wallet";
 import { WalletError } from "./walletErrors";
 
 // The email and Google login, through Privy, as a wallet provider of the store (lib/wallet.ts).
@@ -15,6 +23,11 @@ import { WalletError } from "./walletErrors";
 // provider in a root of its own and hands what the hooks give to a `PrivyBridge` on every render;
 // this file reads the bridge, and has no import of the kit, so that the kit (and near-api-js) load
 // only when a page needs them, in a build that has a Privy app id.
+//
+// No window of Privy's logs anyone in: Tender's Connect window (components/ConnectChooser.tsx)
+// does, with Privy's headless hooks (`useLoginWithEmail`, `useLoginWithOAuth`), which the provider
+// hands it as `steps`. The Google login leaves the page for Google and comes back to it; the hook,
+// mounted on every page, ends the login there, and `restore` takes it up.
 
 /** One of the accounts a Privy user has linked, as far as this app reads them. */
 export interface PrivyLinkedAccount {
@@ -35,8 +48,15 @@ export interface PrivyKit {
   ready: boolean;
   authenticated: boolean;
   user: PrivyUser | null;
-  /** Opens Privy's login window. What came of it is told to the bridge (`loginEnded`). */
-  login(): void;
+  /** Sends a one-time code to `email` (`useLoginWithEmail().sendCode`). Rejects with Privy's error. */
+  sendCode(input: { email: string }): Promise<void>;
+  /** Logs in with the code that was sent (`loginWithCode`). Rejects with Privy's error. */
+  loginWithCode(input: { code: string }): Promise<void>;
+  /**
+   * Sends the page to Google (`useLoginWithOAuth().initOAuth`). The login ends when the page comes
+   * back, and Privy says so to the bridge (`loginEnded`).
+   */
+  initOAuth(input: { provider: "google" }): Promise<void>;
   logout(): Promise<void>;
   createWallet(input: { chainType: "near" }): Promise<{ wallet: { address: string } }>;
   signRawHash(input: {
@@ -49,11 +69,16 @@ export interface PrivyKit {
   getAccessToken(): Promise<string | null>;
 }
 
-/** What Privy calls a login window closed by the person. Not a failure. */
-const LOGIN_CLOSED = "exited_auth_flow";
-
 /** How long a connect waits for Privy's kit to be ready before it says it couldn't connect. */
 export const PRIVY_READY_MS = 15_000;
+
+/** A login that ended without a user, with Privy's error code (`oauth_user_denied`, ...). */
+export class LoginEnded extends Error {
+  constructor(readonly code: string) {
+    super(`the login ended without a user: ${code}`);
+    this.name = "LoginEnded";
+  }
+}
 
 /**
  * Where the kit's hooks meet the provider. The kit's component calls `publish` with every render,
@@ -61,14 +86,18 @@ export const PRIVY_READY_MS = 15_000;
  */
 export interface PrivyBridge {
   publish(kit: PrivyKit): void;
-  /** The login window ended: with a user, or with Privy's error code (`exited_auth_flow`: closed). */
+  /** A login ended: with a user, or with Privy's error code. */
   loginEnded(outcome: { user: PrivyUser } | { error: string }): void;
   /** The kit, once it is ready. Rejects after `withinMs` without it. */
   whenReady(withinMs?: number): Promise<PrivyKit>;
   /** The latest kit. Throws before the first. */
   kit(): PrivyKit;
-  /** Opens the login window: the user it logs in, or null when the person closes it. */
-  login(): Promise<PrivyUser | null>;
+  /**
+   * The user, once a kit says the person is logged in (at once if the latest does), or a login
+   * ends with one. Rejects with `LoginEnded` for a login that ends without one, and after
+   * `withinMs` with neither.
+   */
+  loggedIn(withinMs?: number): Promise<PrivyUser>;
   /** `listener` hears a login that was on end without this page asking (it ran out, another tab). */
   onLoggedOut(listener: () => void): () => void;
 }
@@ -77,11 +106,16 @@ export function createPrivyBridge(): PrivyBridge {
   let latest: PrivyKit | null = null;
   const waiting = new Set<(kit: PrivyKit) => void>();
   const loggedOut = new Set<() => void>();
-  let pending: {
-    resolve: (user: PrivyUser | null) => void;
-    reject: (error: unknown) => void;
-    promise: Promise<PrivyUser | null>;
-  } | null = null;
+  // Those waiting for a login to end (`loggedIn`).
+  const ending = new Set<{ yes: (user: PrivyUser) => void; no: (error: unknown) => void }>();
+
+  function ended(outcome: { user: PrivyUser } | { error: unknown }): void {
+    for (const waiter of [...ending]) {
+      if ("user" in outcome) waiter.yes(outcome.user);
+      else waiter.no(outcome.error);
+    }
+    ending.clear();
+  }
 
   return {
     publish(kit) {
@@ -90,18 +124,14 @@ export function createPrivyBridge(): PrivyBridge {
       if (!kit.ready) return;
       for (const resolve of [...waiting]) resolve(kit);
       waiting.clear();
+      if (kit.authenticated && kit.user !== null) ended({ user: kit.user });
       if (was?.ready === true && was.authenticated && !kit.authenticated) {
         for (const listener of [...loggedOut]) listener();
       }
     },
 
     loginEnded(outcome) {
-      const current = pending;
-      if (current === null) return;
-      pending = null;
-      if ("user" in outcome) current.resolve(outcome.user);
-      else if (outcome.error === LOGIN_CLOSED) current.resolve(null);
-      else current.reject(new Error(`the login failed: ${outcome.error}`));
+      ended("user" in outcome ? outcome : { error: new LoginEnded(outcome.error) });
     },
 
     whenReady(withinMs = PRIVY_READY_MS) {
@@ -124,23 +154,27 @@ export function createPrivyBridge(): PrivyBridge {
       return latest;
     },
 
-    login() {
-      if (pending !== null) return pending.promise;
-      let resolve!: (user: PrivyUser | null) => void;
-      let reject!: (error: unknown) => void;
-      const promise = new Promise<PrivyUser | null>((yes, no) => {
-        resolve = yes;
-        reject = no;
-      });
-      pending = { resolve, reject, promise };
-      try {
-        if (latest === null) throw new Error("Privy's kit has not started");
-        latest.login();
-      } catch (error) {
-        pending = null;
-        reject(error);
+    loggedIn(withinMs = PRIVY_READY_MS) {
+      if (latest?.ready === true && latest.authenticated && latest.user !== null) {
+        return Promise.resolve(latest.user);
       }
-      return promise;
+      return new Promise((resolve, reject) => {
+        const waiter = {
+          yes: (user: PrivyUser) => {
+            clearTimeout(timer);
+            resolve(user);
+          },
+          no: (error: unknown) => {
+            clearTimeout(timer);
+            reject(error);
+          },
+        };
+        const timer = setTimeout(() => {
+          ending.delete(waiter);
+          reject(new Error("the login did not end in time"));
+        }, withinMs);
+        ending.add(waiter);
+      });
     },
 
     onLoggedOut(listener) {
@@ -178,10 +212,41 @@ export type MakePrivyWallet = (plan: {
   signRawHash: PrivyKit["signRawHash"];
 }) => SigningWallet;
 
+/**
+ * The provider of a login coming back to the page from its OAuth sign-in, read from the address
+ * (`search`: `location.search`), or null. Privy sends the person back to the page they started on
+ * with `privy_oauth_code`, `privy_oauth_state` and `privy_oauth_provider`, and takes them off the
+ * address once it has read them, so this is read before the kit starts.
+ */
+export function oauthReturn(search: string): string | null {
+  const params = new URLSearchParams(search);
+  if (params.get("privy_oauth_code") === null || params.get("privy_oauth_state") === null) {
+    return null;
+  }
+  return params.get("privy_oauth_provider");
+}
+
+/** The login's steps, as the Connect window takes the person through them. */
+export interface LoginSteps {
+  /** Sends a one-time code to `email`. Rejects with Privy's error (`privyErrorCode`). */
+  sendCode(email: string): Promise<void>;
+  /** Logs in with the code. Resolves once the person is logged in; rejects with Privy's error. */
+  loginWithCode(code: string): Promise<void>;
+  /** Sends the page to Google; the login ends when the page comes back (`restore`). */
+  google(): Promise<void>;
+}
+
+/** The login as a provider: a connect takes the login the Connect window ended (`steps`). */
+export interface LoginProvider extends WalletProvider {
+  steps: LoginSteps;
+}
+
 export interface PrivyProviderOptions {
   bridge: PrivyBridge;
   makeWallet: MakePrivyWallet;
   readyWithinMs?: number;
+  /** Whether the page is coming back from a login's OAuth sign-in (`oauthReturn`). */
+  returning?: boolean;
 }
 
 /**
@@ -192,7 +257,8 @@ export function privyProvider({
   bridge,
   makeWallet,
   readyWithinMs = PRIVY_READY_MS,
-}: PrivyProviderOptions): WalletProvider {
+  returning = false,
+}: PrivyProviderOptions): LoginProvider {
   // One wallet made at a time: a restore and a connect at once must not make two.
   let making: Promise<string> | null = null;
 
@@ -231,22 +297,36 @@ export function privyProvider({
     };
   }
 
+  const ready = () => bridge.whenReady(readyWithinMs);
+
   return {
-    async restore() {
-      const kit = await bridge.whenReady(readyWithinMs);
-      if (!kit.authenticated || kit.user === null) return null;
-      return sessionOf(kit.user);
+    steps: {
+      sendCode: async (email) => (await ready()).sendCode({ email }),
+      loginWithCode: async (code) => (await ready()).loginWithCode({ code }),
+      google: async () => (await ready()).initOAuth({ provider: "google" }),
     },
 
+    async restore() {
+      // Back from Google: the kit's hook ends that login on this page once the kit is ready, so
+      // the wait for it starts first.
+      const ending = returning ? bridge.loggedIn(readyWithinMs) : null;
+      // Read below, or not at all (a login of an earlier visit came back instead).
+      ending?.catch(() => {});
+      const kit = await ready();
+      if (kit.authenticated && kit.user !== null) return sessionOf(kit.user);
+      if (ending === null) return null;
+      return sessionOf(await ending);
+    },
+
+    // The Connect window has logged the person in by now (`steps`): this takes the user it logged
+    // in, as soon as the kit says so.
     async connect() {
-      let user: PrivyUser | null;
+      let user: PrivyUser;
       try {
-        const kit = await bridge.whenReady(readyWithinMs);
-        user = kit.authenticated ? kit.user : await bridge.login();
+        [, user] = await Promise.all([ready(), bridge.loggedIn(readyWithinMs)]);
       } catch (cause) {
         throw new WalletError("connect", cause);
       }
-      if (user === null) return null;
       try {
         return await sessionOf(user);
       } catch (cause) {
@@ -268,98 +348,141 @@ export function privyProvider({
   };
 }
 
-// ---- Two ways to connect ------------------------------------------------------------------------
+// ---- One window for both ways ------------------------------------------------------------------
 
 /** The two ways to connect: the email or Google login, or a NEAR wallet (near-connect). */
-export type ConnectChoice = "login" | "wallet";
+export type ConnectWay = "login" | "wallet";
 
-/** Where the way of the last connect is kept, so that a restore prefers it (lib/lastWay.ts). */
+/**
+ * What the person did in the Connect window: logged in by email (the login has ended), or picked a
+ * NEAR wallet (`walletId` null: near-connect's own list, when the window could not list them).
+ */
+export type ConnectPick = { way: "login" } | { way: "wallet"; walletId: string | null };
+
+/** What the Connect window offers, and reaches through. */
+export interface ConnectWays {
+  /** The login's steps, loaded the first time they are wanted; null in a build with no login. */
+  login: (() => Promise<LoginSteps>) | null;
+  /** The NEAR wallets near-connect lists. Rejects when they can't be listed. */
+  wallets: () => Promise<WalletRow[]>;
+  /** How this browser signed in last, for the window's "Last used". */
+  lastUsed: LastUsed | null;
+}
+
+/**
+ * Where the method of the last sign-in is kept (lib/lastWay.ts): a restore prefers its way, and the
+ * window marks its row.
+ */
 export interface WayMemory {
-  get(): ConnectChoice | null;
-  set(choice: ConnectChoice): void;
+  get(): LastUsed | null;
+  set(used: LastUsed): void;
 }
 
 /**
  * How long a restore waits for the remembered login before it takes the other way's session. The
  * login loads Privy's kit, which talks to Privy's servers and can be slow or blocked. With no
  * session elsewhere the restore waits for the login's own answer, however long: the store shows
- * Connect after its own patience (`START_PATIENCE_MS`) meanwhile, and takes up the login, with the
- * token the tab kept, when it comes.
+ * Sign in after its own patience (`START_PATIENCE_MS`) meanwhile, and takes up the login, with the
+ * token the tab kept, when it comes. A login coming back from Google is waited for in full.
  */
 export const LOGIN_RESTORE_MS = 2500;
 
 export interface ChoiceOptions {
-  /** The email and Google login. Made the first time it is wanted. */
-  login: () => Promise<WalletProvider>;
+  /** The email and Google login, made the first time it is wanted; null in a build with none. */
+  login: (() => Promise<LoginProvider>) | null;
   /** near-connect. Made the first time it is wanted. */
-  wallet: () => Promise<WalletProvider>;
-  /** Asks the person which way: null when they close the chooser. */
-  ask: () => Promise<ConnectChoice | null>;
-  /** Gets a session of the login ready to pay fees (lib/gasGift.ts), as the chooser shows it. */
+  wallet: () => Promise<NearProvider>;
+  /** Opens the Connect window: what the person did, or null when they close it. */
+  ask: (ways: ConnectWays) => Promise<ConnectPick | null>;
+  /** Gets a session of the login ready to pay fees (lib/gasGift.ts), as the window shows it. */
   prepare: (session: Session) => Promise<void>;
-  /** The way of the last connect. None by default: nothing is kept. */
+  /** Closes the window: a login it ended gave no session. */
+  close: () => void;
+  /** The provider of a login coming back to the page from its OAuth sign-in (`oauthReturn`). */
+  returning?: string | null;
+  /** How the last sign-in went. None by default: nothing is kept. */
   memory?: WayMemory;
   loginRestoreMs?: number;
 }
 
 const NO_MEMORY: WayMemory = { get: () => null, set: () => {} };
 
-const otherWay = (choice: ConnectChoice): ConnectChoice =>
-  choice === "login" ? "wallet" : "login";
+const otherWay = (choice: ConnectWay): ConnectWay => (choice === "login" ? "wallet" : "login");
+
+/** Memoizes `load`: made once, and made again after it failed. */
+function once<T>(load: () => Promise<T>): () => Promise<T> {
+  let made: Promise<T> | null = null;
+  return () => {
+    made ??= load().catch((error: unknown) => {
+      made = null;
+      throw error;
+    });
+    return made;
+  };
+}
 
 /**
- * One provider over both ways, with one session at a time. Connect asks which, remembers it, and
- * ends the other way's session. A restore looks at both ways at once and prefers the remembered
- * one: another way's session is taken only once the preferred way has said it has none, or, for
- * the login, after `loginRestoreMs` (with no way remembered, the first session found is taken).
- * "None" is said only once both ways have answered. A session that turns up beside the one taken
- * is ended. Log out ends every session this provider knows of, so that a reload brings back none.
- * A sign-out is the way's that gave the session. Each way is made once, and made again after it
- * failed to load.
+ * One provider over both ways, with one session at a time. Connect opens the window, which logs
+ * the person in or picks a wallet; the method is remembered, and the other way's session ends. A
+ * restore looks at both ways at once and prefers the remembered way: another way's session is
+ * taken only once the preferred way has said it has none, or, for the login, after
+ * `loginRestoreMs` (with no way remembered, the first session found is taken). "None" is said only
+ * once both ways have answered. A session that turns up beside the one taken is ended. A login
+ * coming back from Google is the preferred way, is waited for in full, and is got ready as a
+ * connect's is. Log out ends every session this provider knows of, so that a reload brings back
+ * none. A sign-out is the way's that gave the session. Each way is made once,
+ * and made again after it failed to load.
  */
 export function choiceProvider({
   login,
   wallet,
   ask,
   prepare,
+  close,
+  returning = null,
   memory = NO_MEMORY,
   loginRestoreMs = LOGIN_RESTORE_MS,
 }: ChoiceOptions): WalletProvider {
-  const made: Partial<Record<ConnectChoice, Promise<WalletProvider>>> = {};
   // The way of the session the store holds, as far as this provider gave it.
-  let active: ConnectChoice | null = null;
+  let active: ConnectWay | null = null;
   // The session each way is known to hold, from its restore or its connect.
-  const known: Partial<Record<ConnectChoice, Session>> = {};
+  const known: Partial<Record<ConnectWay, Session>> = {};
   // A way being disconnected by this provider: the sign-out that causes is not news.
-  let muted: ConnectChoice | null = null;
+  let muted: ConnectWay | null = null;
   const listeners = new Set<(session: Session | null) => void>();
 
   const tell = (session: Session | null) => {
     for (const listener of [...listeners]) listener(session);
   };
 
-  function way(choice: ConnectChoice): Promise<WalletProvider> {
-    made[choice] ??= (choice === "login" ? login() : wallet())
-      .then((provider) => {
-        provider.subscribe((next) => {
-          if (next !== null) return;
-          delete known[choice];
-          if (active === choice && muted !== choice) {
-            active = null;
-            tell(null);
-          }
-        });
-        return provider;
-      })
-      .catch((error: unknown) => {
-        delete made[choice];
-        throw error;
+  /** `load`, heard for a sign-out of the session it gave. */
+  function heard<P extends WalletProvider>(choice: ConnectWay, load: () => Promise<P>) {
+    return once(async () => {
+      const provider = await load();
+      provider.subscribe((next) => {
+        if (next !== null) return;
+        delete known[choice];
+        if (active === choice && muted !== choice) {
+          active = null;
+          tell(null);
+        }
       });
-    return made[choice];
+      return provider;
+    });
   }
 
+  const loginWay = login === null ? null : heard("login", login);
+  const walletWay = heard("wallet", wallet);
+  const way = (choice: ConnectWay): Promise<WalletProvider> => {
+    if (choice === "wallet") return walletWay();
+    if (loginWay === null) return Promise.reject(new Error("this build has no login"));
+    return loginWay();
+  };
+
   /** The session `choice` restores, or null when it has none or could not look. */
-  async function restoreOf(choice: ConnectChoice): Promise<Session | null> {
+  async function restoreOf(choice: ConnectWay): Promise<Session | null> {
+    // A build with no login has no login's session, and nothing to say about it.
+    if (choice === "login" && loginWay === null) return null;
     try {
       const session = await (await way(choice)).restore();
       if (session !== null) known[choice] = session;
@@ -371,7 +494,7 @@ export function choiceProvider({
   }
 
   /** Ends `choice`'s session, if it is known to have one, quietly: a failure is only logged. */
-  async function endOther(choice: ConnectChoice): Promise<void> {
+  async function endOther(choice: ConnectWay): Promise<void> {
     const session = known[choice];
     if (session === undefined) return;
     delete known[choice];
@@ -385,21 +508,67 @@ export function choiceProvider({
     }
   }
 
+  /** Opens the window and connects what the person picks. */
+  async function connectBy(): Promise<Session | null> {
+    const pick = await ask({
+      login: loginWay === null ? null : async () => (await loginWay()).steps,
+      wallets: async () => (await walletWay()).wallets(),
+      lastUsed: memory.get(),
+    });
+    if (pick === null) return null;
+    let session: Session | null;
+    try {
+      session =
+        pick.way === "login"
+          ? await (await way("login")).connect()
+          : await (await walletWay()).connect(pick.walletId);
+    } catch (error) {
+      if (pick.way === "login") close();
+      throw error instanceof WalletError ? error : new WalletError("connect", error);
+    }
+    if (session === null) {
+      if (pick.way === "login") close();
+      return null;
+    }
+    active = pick.way;
+    known[pick.way] = session;
+    memory.set(pick.way === "login" ? "email" : walletUsed(pick.walletId));
+    // One session at a time: the other way's, if it has one, ends.
+    await endOther(otherWay(pick.way));
+    if (pick.way === "login") await prepare(session);
+    return session;
+  }
+
+  /** What a restore that came back from Google gives: the login, remembered and got ready. */
+  async function finishReturn(
+    session: Session | null,
+    choice: ConnectWay | null,
+  ): Promise<Session | null> {
+    if (session !== null && choice === "login") {
+      memory.set(returning === "google" ? "google" : "login");
+      await prepare(session);
+    }
+    return session;
+  }
+
   return {
     restore() {
-      const preferred = memory.get();
+      // Back from Google: the login is the way the person just took, waited for in full.
+      const back = returning !== null && loginWay !== null;
+      const preferred = back ? "login" : wayOf(memory.get());
       return new Promise((resolve) => {
-        const answers: Partial<Record<ConnectChoice, Session | null>> = {};
+        const answers: Partial<Record<ConnectWay, Session | null>> = {};
         let loginGivenUp = false;
         let done = false;
-        const answered = (choice: ConnectChoice) =>
+        const answered = (choice: ConnectWay) =>
           choice in answers || (choice === "login" && loginGivenUp);
-        const take = (session: Session | null, choice: ConnectChoice | null) => {
+        const take = (session: Session | null, choice: ConnectWay | null) => {
           done = true;
           if (active === null) active = choice;
           // A connect came first: the store keeps that one, and this way's session ends.
           else if (session !== null && choice !== null && choice !== active) void endOther(choice);
-          resolve(session);
+          if (back) void finishReturn(session, choice).then(resolve);
+          else resolve(session);
         };
         const decide = () => {
           if (done) return;
@@ -421,12 +590,14 @@ export function choiceProvider({
           // login that isn't there, and the token the tab kept for it must not be dropped.
           if ("login" in answers && "wallet" in answers) take(null, null);
         };
-        const giveUp = setTimeout(() => {
-          loginGivenUp = true;
-          decide();
-        }, loginRestoreMs);
+        const giveUp = back
+          ? null
+          : setTimeout(() => {
+              loginGivenUp = true;
+              decide();
+            }, loginRestoreMs);
         void restoreOf("login").then((session) => {
-          clearTimeout(giveUp);
+          if (giveUp !== null) clearTimeout(giveUp);
           answers.login = session;
           if (!done) return decide();
           // Too late: the other way's session was taken. One session at a time, so this one ends,
@@ -440,23 +611,8 @@ export function choiceProvider({
       });
     },
 
-    async connect() {
-      const choice = await ask();
-      if (choice === null) return null;
-      let session: Session | null;
-      try {
-        session = await (await way(choice)).connect();
-      } catch (error) {
-        throw error instanceof WalletError ? error : new WalletError("connect", error);
-      }
-      if (session === null) return null;
-      active = choice;
-      known[choice] = session;
-      memory.set(choice);
-      // One session at a time: the other way's, if it has one, ends.
-      await endOther(otherWay(choice));
-      if (choice === "login") await prepare(session);
-      return session;
+    connect() {
+      return connectBy();
     },
 
     async disconnect(session) {

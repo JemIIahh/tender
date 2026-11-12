@@ -14,7 +14,14 @@ import { clearApiToken, sessionBegan, sessionEnded } from "./apiToken";
 import { chooser } from "./chooser";
 import { config } from "./config";
 import { lastWay } from "./lastWay";
-import { choiceProvider, createPrivyBridge, type MakePrivyWallet, privyProvider } from "./privy";
+import {
+  choiceProvider,
+  createPrivyBridge,
+  type LoginProvider,
+  type MakePrivyWallet,
+  oauthReturn,
+  privyProvider,
+} from "./privy";
 import {
   TransactionFailed,
   WalletCannotSign,
@@ -28,8 +35,9 @@ import { linkTabs, noTabs, type OpenTabLink, type TabLink } from "./walletTabs";
 // The wallet, as the pages use it. One store holds the connected account for the whole page: every
 // component that calls `useWallet` sees the same one, and a wallet connects once. What sits behind
 // the store is a `WalletProvider`: near-connect for the real wallets; in a build with a Privy app
-// id, the email and Google login too (lib/privy.ts), offered first, with near-connect second
-// (lib/chooser.ts); and in a sandbox build, if it is switched on, the dev wallet (lib/devWallet.ts).
+// id, the email and Google login too (lib/privy.ts), both in the one Connect window, the login
+// first and the NEAR wallets under it (lib/chooser.ts); and in a sandbox build, if it is switched
+// on, the dev wallet (lib/devWallet.ts).
 // Each gives the store a `SigningWallet`, which is the part of near-connect's wallet interface this
 // app calls, so a transaction is grouped, sent and read back by the same code whoever signs it.
 //
@@ -584,6 +592,47 @@ const NO_SESSION = ["No wallet selected", "No accounts found"];
 /** What near-connect rejects with when the person closes its wallet dialog. */
 const DIALOG_CLOSED = "User rejected";
 
+/** A NEAR wallet near-connect lists, as the Connect window shows it. */
+export interface WalletRow {
+  id: string;
+  name: string;
+  /** The wallet's icon: an `https:` or `data:image/` address from its manifest, or null. */
+  icon: string | null;
+  /** The host name of the wallet's site, or null when its manifest has none. */
+  site: string | null;
+}
+
+/** near-connect as a provider, with its list of wallets and a connect straight to one of them. */
+export interface NearProvider extends WalletProvider {
+  /** The wallets near-connect lists, once its list has loaded. */
+  wallets(): Promise<WalletRow[]>;
+  /** Connects the wallet `walletId` with no window of near-connect's; with none, opens its list. */
+  connect(walletId?: string | null): Promise<Session | null>;
+}
+
+/**
+ * A wallet of near-connect's list as a row. The manifest comes from the network, so its icon is
+ * taken only as an `https:` or `data:image/` address, and its site as a host name.
+ */
+export function walletRowOf(manifest: {
+  id: string;
+  name: string;
+  icon?: string;
+  website?: string;
+}): WalletRow {
+  const icon =
+    typeof manifest.icon === "string" && /^(?:https:\/\/|data:image\/)/i.test(manifest.icon)
+      ? manifest.icon
+      : null;
+  let site: string | null = null;
+  try {
+    site = new URL(manifest.website ?? "").hostname || null;
+  } catch {
+    site = null;
+  }
+  return { id: manifest.id, name: manifest.name, icon, site };
+}
+
 /** The session of `connected` (near-connect's `getConnectedWallet`), if its account is one. */
 function sessionOf(connected: {
   wallet: SigningWallet;
@@ -613,9 +662,11 @@ export function connectorOptions(network: "mainnet" | "testnet"): {
 
 /**
  * near-connect as a provider. The library touches `window` as it loads, so it is imported when the
- * first page needs a wallet and not before.
+ * first page needs a wallet and not before. Its list is shown in the Connect window, and a wallet
+ * picked there is connected by its id; near-connect's own list opens only when the window could not
+ * show one.
  */
-export async function connectorProvider(network: "mainnet" | "testnet"): Promise<WalletProvider> {
+export async function connectorProvider(network: "mainnet" | "testnet"): Promise<NearProvider> {
   let library: typeof import("@hot-labs/near-connect");
   try {
     library = await import("@hot-labs/near-connect");
@@ -635,9 +686,17 @@ export async function connectorProvider(network: "mainnet" | "testnet"): Promise
       }
     },
 
-    async connect() {
+    async wallets() {
+      // It never rejects: a list that did not download is an empty one, and the window says so.
+      await connector.whenManifestLoaded;
+      return connector.availableWallets.map(({ manifest }) => walletRowOf(manifest));
+    },
+
+    async connect(walletId) {
       try {
-        await connector.connect();
+        await (walletId === undefined || walletId === null
+          ? connector.connect()
+          : connector.connect({ walletId }));
       } catch (error) {
         if (error instanceof Error && error.message === DIALOG_CLOSED) return null;
         throw new WalletError("connect", error);
@@ -712,7 +771,10 @@ function loginWallet(plan: Parameters<MakePrivyWallet>[0]): SigningWallet {
  * The login as a provider: Privy's kit (lib/privyKit.tsx), imported here and nowhere else, and
  * mounted when it loads. Only a build with a Privy app id gets here (`config.privy`).
  */
-async function loginProvider(privy: NonNullable<typeof config.privy>): Promise<WalletProvider> {
+async function loginProvider(
+  privy: NonNullable<typeof config.privy>,
+  returning: boolean,
+): Promise<LoginProvider> {
   let kit: typeof import("./privyKit");
   try {
     kit = await import("./privyKit");
@@ -721,7 +783,7 @@ async function loginProvider(privy: NonNullable<typeof config.privy>): Promise<W
   }
   const bridge = createPrivyBridge();
   kit.mountPrivyKit(bridge, privy);
-  return privyProvider({ bridge, makeWallet: loginWallet });
+  return privyProvider({ bridge, makeWallet: loginWallet, returning });
 }
 
 async function createProvider(): Promise<WalletProvider> {
@@ -729,13 +791,17 @@ async function createProvider(): Promise<WalletProvider> {
   if (dev !== null) return dev.createDevProvider();
   if (config.network === "sandbox") throw new WalletUnavailable();
   const { network, privy } = config;
-  // No Privy app id: Connect opens the NEAR wallets, as it did before there was a login.
-  if (privy === null) return connectorProvider(network);
+  // A Google login coming back to this page, read before Privy's kit takes it off the address.
+  const returning = privy === null ? null : oauthReturn(window.location.search);
+  // Connect opens one window (lib/chooser.ts): the email and Google login, in a build with a
+  // Privy app id, and the NEAR wallets near-connect lists, in every build.
   return choiceProvider({
-    login: () => loginProvider(privy),
+    login: privy === null ? null : () => loginProvider(privy, returning !== null),
     wallet: () => connectorProvider(network),
     ask: chooser.ask,
     prepare: chooser.prepare,
+    close: chooser.close,
+    returning,
     memory: lastWay,
   });
 }

@@ -22,8 +22,8 @@ export interface WebConfig {
   judgeAccount: string | null;
   /**
    * The email and Google login (Privy), or null when this build has none: no app id, or the sandbox,
-   * which has its dev wallet. With it, Connect offers that login first and the NEAR wallets second;
-   * without it, Connect opens the NEAR wallets, as it always did. Both ids are public: Privy's
+   * which has its dev wallet. With it, Connect's window offers that login, with the NEAR wallets
+   * under it; without it, the window lists the NEAR wallets alone. Both ids are public: Privy's
    * dashboard says they are meant for the browser.
    */
   privy: { appId: string; clientId: string | null } | null;

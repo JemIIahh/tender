@@ -171,9 +171,11 @@ test("the_dev_wallet_key_and_account_are_read_in_one_module_and_only_under_the_s
 
 test("the_app_never_writes_to_local_storage_and_the_token_module_never_logs", () => {
   // Local storage is read by every later visit to the page, and the API token is a secret. Two
-  // things are kept there, each in one module, under one key, as one of two words: the viewer's
-  // choice of sidebar (the ASP brief), and the way this browser last connected ("login" or
-  // "wallet", lib/lastWay.ts). No token, no account, nothing from a request.
+  // things are kept there, each in one module under one key: the viewer's choice of sidebar (the
+  // ASP brief), as one of two words; and how this browser last signed in (lib/lastWay.ts), as
+  // "email", "google" or a wallet's id from near-connect's list (or, as an earlier build kept it,
+  // "login" or "wallet"), checked on the way in and out, from which the way is read. No token, no
+  // account, no address.
   const holders = appSources()
     .filter((file) => /\blocalStorage\s*[.[]/.test(readFileSync(file, "utf8")))
     .map((file) => relative(WEB, file))
@@ -181,11 +183,12 @@ test("the_app_never_writes_to_local_storage_and_the_token_module_never_logs", ()
   expect(holders).toEqual(["lib/lastWay.ts", "lib/sidebar.ts"]);
   const way = read("lib/lastWay.ts");
   expect(way).toContain('export const LAST_WAY_KEY = "tender.connect.way";');
-  expect(way).toContain('const WAYS: readonly ConnectChoice[] = ["login", "wallet"];');
   expect(way.match(/localStorage\.\w+\([^)]*\)/g)).toEqual([
     "localStorage.getItem(LAST_WAY_KEY)",
-    "localStorage.setItem(LAST_WAY_KEY, choice)",
+    "localStorage.setItem(LAST_WAY_KEY, checked)",
   ]);
+  // What is written is checked first: one of the kept forms, or nothing.
+  expect(way).toMatch(/const checked = lastUsedOf\(used\);\s*if \(checked === null\) return;/);
   expect(way).not.toMatch(/localStorage\.(?:removeItem|clear|key)\b|localStorage\s*\[/);
   const sidebar = read("lib/sidebar.ts");
   expect(sidebar).toContain('export const SIDEBAR_KEY = "tender.sidebar";');

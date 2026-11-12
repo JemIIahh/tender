@@ -649,7 +649,11 @@ const library = vi.hoisted(() => {
     accounts: Array<{ accountId: string }>;
   }
   class FakeConnector {
-    connect = vi.fn<() => Promise<unknown>>(async () => ({}));
+    connect = vi.fn<(input?: { walletId?: string }) => Promise<unknown>>(async () => ({}));
+    whenManifestLoaded = Promise.resolve();
+    availableWallets: Array<{
+      manifest: { id: string; name: string; icon?: string; website?: string };
+    }> = [];
     getConnectedWallet = vi.fn<() => Promise<Connected>>(async () => {
       throw new Error("No wallet selected");
     });
@@ -758,6 +762,36 @@ test("near_connect_connect_has_the_person_pick_a_wallet_and_reads_the_account_it
   const store = createWalletStore(async () => provider);
   await store.connect();
   expect(store.getSnapshot()).toEqual({ ready: true, accountId: ALICE, canSignMessage: false });
+});
+
+test("near_connect_lists_its_wallets_for_the_window_and_connects_one_by_its_id", async () => {
+  const { provider, connector } = await connectorFor();
+  // What `availableWallets` holds: the wallets for this network that can send a batch.
+  connector.availableWallets = [
+    {
+      manifest: {
+        id: "ash-wallet",
+        name: "Ash Wallet",
+        icon: "https://example.test/ash.png",
+        website: "https://wallet.ash.test",
+      },
+    },
+  ];
+  expect(await provider.wallets()).toEqual([
+    {
+      id: "ash-wallet",
+      name: "Ash Wallet",
+      icon: "https://example.test/ash.png",
+      site: "wallet.ash.test",
+    },
+  ]);
+
+  // A row connects its wallet with no window of near-connect's; no id opens near-connect's list.
+  connector.getConnectedWallet.mockResolvedValue(connected(true));
+  expect((await provider.connect("ash-wallet"))?.accountId).toBe(ALICE);
+  expect(connector.connect).toHaveBeenLastCalledWith({ walletId: "ash-wallet" });
+  await provider.connect(null);
+  expect(connector.connect).toHaveBeenLastCalledWith();
 });
 
 test("near_connect_connect_closed_by_the_person_is_not_an_error_and_any_other_is", async () => {

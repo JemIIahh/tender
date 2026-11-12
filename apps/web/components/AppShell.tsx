@@ -419,7 +419,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
       )}
 
-      {/* Connect's chooser, in a build with the email and Google login (lib/chooser.ts). */}
+      {/* Connect's window: the email and Google login and the NEAR wallets (lib/chooser.ts). */}
       <ConnectChooser />
     </div>
   );
