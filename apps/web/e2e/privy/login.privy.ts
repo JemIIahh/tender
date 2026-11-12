@@ -12,8 +12,8 @@ import { installWallet, routeWalletManifest, STUB_WALLET_NAME } from "../walletS
 // gift asked of the API (`POST /v1/gas-gift`, answered here: the route is another lane's), the node
 // read again until the NEAR is there, and the wallet page saying who holds the key.
 //
-// With PRIVY_SHOTS set to a directory, the chooser, "Getting your account ready…", a refused gift
-// and the wallet page of a login are saved there at 375 and 1440 px wide.
+// With PRIVY_SHOTS set to a directory, the chooser, "Getting your account ready…", a refused gift,
+// a gift whose send failed, and the wallet page of a login are saved there at 375 and 1440 px wide.
 
 const CONTRACT = "tender.tender-team.testnet";
 const TOKEN = "tusdc.tender-team.testnet";
@@ -67,7 +67,7 @@ interface Login {
  */
 async function loginWorld(
   page: Page,
-  options: { login?: "email" | "google"; refuse?: string } = {},
+  options: { login?: "email" | "google"; refuse?: string; refuseStatus?: number } = {},
 ): Promise<Login> {
   await routeApi(page);
   await routeWalletManifest(page);
@@ -112,9 +112,9 @@ async function loginWorld(
     gifts.push(`${request.headers().authorization} ${account}`);
     if (options.refuse !== undefined) {
       return route.fulfill({
-        status: 503,
+        status: options.refuseStatus ?? 503,
         headers: CORS,
-        json: { error: options.refuse, message: "the gas gift is off" },
+        json: { error: options.refuse, message: "the gas gift can't be sent" },
       });
     }
     await arrived;
@@ -252,4 +252,20 @@ test("a_refused_gift_says_so_with_the_faucet_and_the_account_to_copy", async ({ 
   // The person is logged in all the same, as a Google login; the account waits for its NEAR.
   await chooser(page).getByRole("button", { name: "Close" }).click();
   await expect(page.getByTestId("login-label")).toHaveText("Google login");
+});
+
+test("a_gift_whose_send_failed_offers_try_again_first_and_the_faucet_second", async ({ page }) => {
+  await loginWorld(page, { refuse: "transfer_failed", refuseStatus: 502 });
+  await page.setViewportSize(PHONE);
+  await page.goto("/wallet");
+  await page.locator("main").getByRole("button", { name: "Connect wallet" }).click();
+  await chooser(page).getByRole("button", { name: "Continue with email or Google" }).click();
+
+  await expect(chooser(page).getByTestId("account-stuck")).toHaveText(
+    "Couldn't send yet. Try again in a moment.",
+  );
+  await expect(chooser(page).getByRole("button", { name: "Try again" })).toBeFocused();
+  await expect(chooser(page).getByRole("link", { name: "Open the faucet" })).toBeVisible();
+  await expect(chooser(page).getByTestId("stuck-account")).toHaveAttribute("title", ACCOUNT);
+  await shoot(page, "stuck-retry");
 });
