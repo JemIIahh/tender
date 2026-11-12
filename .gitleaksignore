@@ -1,6 +1,7 @@
 # Exact historical false positives reviewed during terminal verification.
 # Public NEAR keys, public contract storage keys and account names, and synthetic test values.
 # Each fingerprint includes its commit, path, rule and line; new findings remain checked.
+0210a187ed21e1b377098cab91b6d245666aaf8f:docs/TRY-IT.md:generic-api-key:60
 56ddc8f0858f39705ffab1c47cd2203f2ff3668f:packages/judge/test/rubric.test.ts:generic-api-key:61
 6f675860be635da55d8c19e1a8678c3a2f249049:apps/web/test/faucet.test.ts:generic-api-key:26
 a581ff39e438063e610d1a6e670681b6b759aa82:README.md:generic-api-key:104
