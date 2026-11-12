@@ -378,7 +378,7 @@ export function ConnectAgent({
   pollMs = CONNECT_POLL_MS,
 }: {
   account: string;
-  /** Opens "Set up by hand", for a wallet that can't sign the message for Tender's API. */
+  /** Opens "Set up by hand", for a wallet that can't sign the message to confirm with its account. */
   onByHand: () => void;
   pollMs?: number;
 }) {
@@ -961,8 +961,8 @@ export function ConnectAgent({
           {locked ? null : cannotSign || !wallet.canSignMessage ? (
             <div data-testid="connect-cannot-sign" className={`${NOTICE} grid gap-3`}>
               <p>
-                This wallet can't sign the message that confirms it to Tender's API, and a connect
-                code needs that. Set the agent up by hand instead: it takes three steps.
+                This wallet can't sign the message to confirm with your account, and a connect code
+                needs that. Set the agent up by hand instead: it takes three steps.
               </p>
               <button
                 type="button"
@@ -1722,7 +1722,7 @@ function StateFaultNotice({
         onClick={fault === "signed-out" ? onSignIn : onStartOver}
         className={`${SECONDARY} justify-self-start`}
       >
-        {fault === "signed-out" ? "Confirm again" : "Start over"}
+        {fault === "signed-out" ? "Confirm with your account" : "Start over"}
       </button>
     </div>
   );

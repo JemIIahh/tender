@@ -31,7 +31,7 @@ import {
   windowsLine,
 } from "../../lib/services";
 import { knowsToken } from "../../lib/tokens";
-import { walletErrorMessage } from "../../lib/walletErrors";
+import { NoApiSession, walletErrorMessage } from "../../lib/walletErrors";
 import { Amount } from "../Amount";
 import { ErrorState } from "../ErrorState";
 import { CARD, EYEBROW, FIELD, PANEL_TITLE, PRIMARY, SECONDARY } from "../ui";
@@ -73,7 +73,7 @@ function canTakeHires(agent: AgentRecord): boolean {
   return bond !== null && bond.status === "active" && bond.amount !== null;
 }
 
-/** One request with the token held for `account`, signing in first if there is none, or again on a 401. */
+/** One request with the API session held for `account`, confirming first if there is none, or again on a 401. */
 async function withToken<T>(
   account: string,
   signIn: () => Promise<unknown>,
@@ -89,7 +89,7 @@ async function withToken<T>(
   }
   await signIn();
   const fresh = liveToken(account);
-  if (fresh === null) throw new Error("not signed in");
+  if (fresh === null) throw new NoApiSession();
   return request(fresh);
 }
 

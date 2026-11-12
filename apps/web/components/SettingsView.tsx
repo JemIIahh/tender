@@ -124,8 +124,8 @@ function AccountSection() {
             {signedIn && stored !== null
               ? `Active until ${untilText(stored.expiresAtMs)}.`
               : ended
-                ? "Ended in this tab. A page that writes to the API asks your account to confirm again."
-                : "None. A page that writes to the API asks your account to confirm when it needs to."}
+                ? "Ended in this tab. A page that writes to the API asks you to confirm with your account again."
+                : "None. A page that writes to the API asks you to confirm with your account when it needs to."}
           </p>
           {signedIn ? (
             <button

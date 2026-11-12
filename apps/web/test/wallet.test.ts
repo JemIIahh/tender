@@ -15,6 +15,7 @@ import {
   type WalletProvider,
 } from "../lib/wallet";
 import {
+  NoApiSession,
   TransactionFailed,
   WALLET_CANNOT_SIGN_MESSAGE,
   WalletCannotSign,
@@ -232,6 +233,14 @@ test("send_by_a_wallet_that_throws_is_a_wallet_error_with_the_cause", async () =
   // What the person reads says nothing a wallet chose.
   expect(failure.message).not.toContain("closed the window");
   expect(walletErrorMessage(failure)).toContain("Check the balances");
+});
+
+test("no_api_session_is_said_as_such_and_not_as_a_network_fault", () => {
+  // An account that is signed in but has no API session after confirming: plain words, which say
+  // nothing about the network or about signing in.
+  expect(walletErrorMessage(new NoApiSession())).toBe(
+    "No API session for this account, so nothing was sent. Confirm with your account and try again.",
+  );
 });
 
 test("send_without_a_wallet_or_without_calls_sends_nothing", async () => {

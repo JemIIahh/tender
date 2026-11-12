@@ -101,6 +101,17 @@ export class WalletSessionEnded extends Error {
   }
 }
 
+/**
+ * A page needed an API session for an account and has none, even after confirming with the
+ * account (the session it got is another account's, or ended at once): nothing was sent.
+ */
+export class NoApiSession extends Error {
+  constructor() {
+    super("there is no API session for this account");
+    this.name = "NoApiSession";
+  }
+}
+
 /** The wallet signed a sign-in as another account than the one that is connected. */
 export class WalletAccountMismatch extends Error {
   constructor() {
@@ -147,10 +158,13 @@ export function walletErrorMessage(error: unknown): string {
       : "The wallet signed, but its answer can't be used.";
   }
   if (error instanceof SignInRefused) {
-    return `Tender's request to confirm your account has the wrong ${error.field}, so nothing was signed.`;
+    return `Tender's request to confirm with your account has the wrong ${error.field}, so nothing was signed.`;
+  }
+  if (error instanceof NoApiSession) {
+    return "No API session for this account, so nothing was sent. Confirm with your account and try again.";
   }
   if (error instanceof WalletSessionEnded) {
-    return "The wallet was disconnected or changed while confirming with Tender's API, so nothing was confirmed. Try again with the account you want to use.";
+    return "The wallet was disconnected or changed while confirming with your account, so nothing was confirmed. Try again with the account you want to use.";
   }
   if (error instanceof WalletAccountMismatch) {
     return "The wallet signed as a different account than the one you're signed in as, so nothing was sent to Tender.";

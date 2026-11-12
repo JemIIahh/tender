@@ -534,7 +534,7 @@ test("a_sign_in_that_leaves_no_token_is_a_session_that_ended", async () => {
   const failure = (await rejection(submitPost(input(form), w.deps))) as SubmitFailure;
 
   expect(failure.stage).toBe("signin");
-  expect(failure.message).toContain("disconnected or changed while confirming with Tender's API");
+  expect(failure.message).toContain("disconnected or changed while confirming with your account");
   expect(w.blobs).toEqual([]);
 });
 
