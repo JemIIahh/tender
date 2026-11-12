@@ -210,13 +210,15 @@ test("board_empty_shows_the_fixed_note_and_asks_a_reader_to_connect", async () =
   // The board itself looks for no wallet (this tab never signed in): until the tab's store knows,
   // it offers no Connect, which would flash for someone about to be taken up again.
   expect(restore).not.toHaveBeenCalled();
-  expect(screen.getByTestId("board-wallet-checking").textContent).toBe("Checking for your wallet…");
-  expect(screen.queryByRole("button", { name: "Connect wallet" })).toBeNull();
+  expect(screen.getByTestId("board-wallet-checking").textContent).toBe(
+    "Checking if you're signed in…",
+  );
+  expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
 
   // The app shell starts the store; it finds no wallet. A reader is offered the way in, and no
   // form; nothing else announces itself.
   await act(() => holder.store.start());
-  expect(screen.getByRole("button", { name: "Connect wallet" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Sign in" })).toBeTruthy();
   expect(screen.queryByTestId("board-wallet-checking")).toBeNull();
   expect(screen.queryByTestId("ask-form")).toBeNull();
   expect(screen.queryByRole("status")).toBeNull();
@@ -360,7 +362,7 @@ test("board_is_read_only_by_the_clock_even_when_the_api_said_open_a_moment_ago",
   await loaded();
 
   expect(screen.getByTestId("board-read-only")).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "Connect wallet" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
 });
 
 // ---- An entrant -------------------------------------------------------------------------------
@@ -788,7 +790,7 @@ test("connect_is_offered_once_the_tab_knows_and_then_offers_the_form", async () 
   expect(restore).not.toHaveBeenCalled();
   await act(() => holder.store.start());
 
-  await user.click(screen.getByRole("button", { name: "Connect wallet" }));
+  await user.click(screen.getByRole("button", { name: "Sign in" }));
 
   expect(await screen.findByTestId("ask-form")).toBeTruthy();
   expect((provider as FakeProvider).connects).toBe(1);

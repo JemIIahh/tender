@@ -965,7 +965,7 @@ test("a_rubric_that_is_dropped_while_the_page_is_open_stops_the_post", async () 
   expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe(
     "Regex for NEAR account ids",
   );
-  await user.click(screen.getByRole("button", { name: "Connect wallet" }));
+  await user.click(screen.getByRole("button", { name: "Sign in" }));
   await waitFor(() => expect(testId("review-account")).toBe(ALICE), LONG);
   expect(off(postButton())).toBe(true);
   await user.click(postButton());
@@ -999,14 +999,14 @@ test("without_a_wallet_the_form_works_and_the_button_connects_one", async () => 
 
   await toReview(user);
 
-  expect(testId("review-account")).toBe("Not connected");
+  expect(testId("review-account")).toBe("Not signed in");
   // Nothing is being read without a wallet, so the row does not say it is reading.
   expect(testId("review-funding")).toBe("—");
   // The one button connects a wallet; Post is not there until one is.
   expect(screen.queryByRole("button", { name: "Post task" })).toBeNull();
-  await user.click(screen.getByRole("button", { name: "Connect wallet" }));
+  await user.click(screen.getByRole("button", { name: "Sign in" }));
   await waitFor(() => expect(testId("review-account")).toBe(ALICE), LONG);
-  expect(screen.queryByRole("button", { name: "Connect wallet" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
   // The button the person pressed is gone; the focus is where they read on.
   expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Post it" }));
   await postReady();
@@ -1259,7 +1259,7 @@ function switching(world: World) {
         await holder.store.disconnect();
       });
       provider.connect = async () => session;
-      await world.user.click(await screen.findByRole("button", { name: "Connect wallet" }));
+      await world.user.click(await screen.findByRole("button", { name: "Sign in" }));
       await screen.findByText(session.accountId, { selector: "[data-testid=review-account]" });
     },
     alice,

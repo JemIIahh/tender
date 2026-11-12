@@ -10,8 +10,10 @@ import {
   tokenForAccount,
 } from "../lib/apiToken";
 import { config } from "../lib/config";
+import { CHECKING_SIGN_IN, SIGN_IN } from "../lib/copy";
 import { setRail, sidebarStore } from "../lib/sidebar";
 import { useWallet } from "../lib/wallet";
+import { walletErrorMessage } from "../lib/walletErrors";
 import { PageHead } from "./PageHead";
 import { CARD, EYEBROW, FACT_LABEL, PANEL_TITLE, SECONDARY } from "./ui";
 
@@ -69,6 +71,7 @@ function AccountSection() {
   const stored = useSyncExternalStore(subscribeToken, heldToken, noToken);
   const signedIn = tokenForAccount(stored, wallet.accountId) !== null;
   const [ended, setEnded] = useState(false);
+  const [signInFailure, setSignInFailure] = useState<string | null>(null);
 
   return (
     <Section
@@ -76,18 +79,36 @@ function AccountSection() {
       line="Your wallet holds your keys. A sign-in to Tender's API is kept in this tab until it expires, or until you sign out here."
       testId="settings-account"
     >
-      <Row label="Wallet">
+      <Row label="Account">
         {!wallet.ready ? (
           <p role="status" className="text-muted">
-            Checking for your wallet…
+            {CHECKING_SIGN_IN}
           </p>
         ) : wallet.accountId === null ? (
-          <p className="flex flex-wrap items-center gap-x-4 gap-y-2 text-muted">
-            No wallet connected.
-            <Link href="/wallet" className={`${SECONDARY} min-h-10 px-4`}>
-              Open Wallet to connect
-            </Link>
-          </p>
+          <div className="grid gap-2">
+            <p className="flex flex-wrap items-center gap-x-4 gap-y-2 text-muted">
+              You're not signed in.
+              {/* The Connect window, over this page: the person stays here once signed in. */}
+              <button
+                type="button"
+                onClick={() => {
+                  setSignInFailure(null);
+                  wallet.connect().catch((error: unknown) => {
+                    console.error(error);
+                    setSignInFailure(walletErrorMessage(error));
+                  });
+                }}
+                className={`${SECONDARY} min-h-10 px-4`}
+              >
+                {SIGN_IN}
+              </button>
+            </p>
+            {signInFailure === null ? null : (
+              <p role="alert" className="text-sm text-seal">
+                {signInFailure}
+              </p>
+            )}
+          </div>
         ) : (
           <p
             data-testid="settings-wallet"

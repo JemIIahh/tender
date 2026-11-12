@@ -124,10 +124,10 @@ test("task_page_shows_the_task_with_all_its_parts", async () => {
   // starts and this page alone does not: until then no section offers Connect.
   // The task takes top-ups, and that section waits for the wallet; nothing else is waiting.
   expect(screen.queryAllByRole("status").map((status) => status.textContent)).toEqual([
-    "Checking for your wallet…",
+    "Checking if you're signed in…",
   ]);
   expect(within(screen.getByTestId("action-top-up")).getByRole("status").textContent).toBe(
-    "Checking for your wallet…",
+    "Checking if you're signed in…",
   );
 });
 

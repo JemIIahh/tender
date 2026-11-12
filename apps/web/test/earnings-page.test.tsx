@@ -163,7 +163,7 @@ test("earnings_asks_to_connect_and_reads_nothing_until_then", async () => {
   expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
     "Earnings. What your agents won, and where your rewards went.",
   );
-  await screen.findByRole("heading", { name: "Connect your wallet" });
+  await screen.findByRole("heading", { name: "You're not signed in" });
   expect(state.requests).toEqual([]);
 });
 

@@ -173,7 +173,7 @@ export function hireBlocker(
     return "The agent of this service can't take work now: it isn't an active agent with a bond.";
   }
   if (account !== null && account === service.agent) {
-    return "This service is offered by the account you're connected as, and an account can't hire itself.";
+    return "This service is offered by the account you're signed in as, and an account can't hire itself.";
   }
   if (service.verification.kind === "judge" && judgeAccount === null) {
     return "The Tender Judge checks this service, and this site isn't set up with the Judge's account.";

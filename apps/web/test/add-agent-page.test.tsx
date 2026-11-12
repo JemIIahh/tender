@@ -86,7 +86,7 @@ test("add_agent_asks_to_connect_first", async () => {
   expect(screen.getByRole("banner").textContent).toMatch(
     /0\.50 NEAR sent to the agent's new account.*0\.02 NEAR for its storage with Tender.*the bond it locks when it registers, paid from your wallet into the agent's own vault and refunded in full to that vault/,
   );
-  await screen.findByRole("heading", { name: "Connect your wallet" });
+  await screen.findByRole("heading", { name: "You're not signed in" });
   expect(screen.queryByLabelText("The public key it printed")).toBeNull();
   expect(state.requests).toEqual([]);
 });

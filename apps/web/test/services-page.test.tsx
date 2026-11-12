@@ -283,7 +283,7 @@ test("a_service_page_says_what_it_does_how_it_is_checked_and_what_the_agent_has_
   expect(note).toContain("all of it comes back to you");
   // Not connected: the form asks for a wallet, and has nothing to send.
   const hire = within(document.getElementById("hire") as HTMLElement);
-  expect(await hire.findByRole("button", { name: "Connect wallet" })).toBeTruthy();
+  expect(await hire.findByRole("button", { name: "Sign in" })).toBeTruthy();
   expect(hire.queryByLabelText("Your request")).toBeNull();
 });
 

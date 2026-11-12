@@ -788,7 +788,7 @@ test("a_wallet_that_is_not_connected_is_a_failure_with_nothing_sent", async () =
   const failure = (await rejection(submitPost(input(form), w.deps))) as SubmitFailure;
 
   expect(failure.stage).toBe("wallet");
-  expect(failure.message).toBe("Connect a wallet first.");
+  expect(failure.message).toBe("Sign in first.");
 });
 
 test("a_wallet_connected_as_another_account_is_sent_nothing", async () => {

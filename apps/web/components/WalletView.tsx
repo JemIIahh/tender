@@ -17,7 +17,15 @@ import {
   useState,
 } from "react";
 import { config } from "../lib/config";
-import { LOGIN_HOLDS_KEY, loginLabel, READING_BALANCES } from "../lib/copy";
+import {
+  CHECKING_SIGN_IN,
+  LOGIN_HOLDS_KEY,
+  loginLabel,
+  READING_BALANCES,
+  SIGN_IN,
+  SIGNED_IN_AS,
+  SIGNING_IN,
+} from "../lib/copy";
 import { errorMessage } from "../lib/errors";
 import { FAUCET_AMOUNT, faucetOffered, faucetToken, planFaucet } from "../lib/faucet";
 import { shortId } from "../lib/tokens";
@@ -608,13 +616,11 @@ export function WalletView({
         </h2>
         {!ready ? (
           <p role="status" className="text-sm text-muted">
-            Checking for your wallet…
+            {CHECKING_SIGN_IN}
           </p>
         ) : accountId === null ? (
           <>
-            <p className="text-sm text-muted">
-              Connect a wallet to see your balances and move funds.
-            </p>
+            <p className="text-sm text-muted">Sign in to see your balances and move funds.</p>
             <button
               key="connect"
               type="button"
@@ -627,7 +633,7 @@ export function WalletView({
               }
               className={PRIMARY}
             >
-              {running === "connect" ? "Waiting for your wallet…" : "Connect wallet"}
+              {running === "connect" ? SIGNING_IN : SIGN_IN}
             </button>
           </>
         ) : (
@@ -635,7 +641,7 @@ export function WalletView({
             {keyHolder === undefined ? (
               <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
                 <Avatar account={accountId} size={34} />
-                <span className="text-sm text-muted">Connected as</span>
+                <span className="text-sm text-muted">{SIGNED_IN_AS}</span>
                 <span
                   data-testid="account-id"
                   className="font-mono text-sm text-bone wrap-anywhere"

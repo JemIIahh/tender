@@ -1,11 +1,12 @@
 "use client";
 
 import { useState } from "react";
+import { SIGN_IN } from "../../lib/copy";
 import type { UseWallet } from "../../lib/wallet";
 import { walletErrorMessage } from "../../lib/walletErrors";
 import { PRIMARY } from "../ui";
 
-/** The way in for someone with no wallet connected: a Connect button and its failure. */
+/** The way in for someone not signed in: Sign in, which opens the Connect window, and its failure. */
 export function Connect({ wallet, why }: { wallet: UseWallet; why?: string }) {
   const [failure, setFailure] = useState<string | null>(null);
   return (
@@ -22,7 +23,7 @@ export function Connect({ wallet, why }: { wallet: UseWallet; why?: string }) {
           });
         }}
       >
-        Connect wallet
+        {SIGN_IN}
       </button>
       {failure === null ? null : (
         <p role="alert" className="text-sm text-seal">

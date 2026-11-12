@@ -15,6 +15,21 @@ export const BRIEF_UNAVAILABLE = "The brief isn't available yet.";
 /** The criteria the index holds none of. */
 export const CRITERIA_UNAVAILABLE = "The criteria aren't available yet.";
 
+/**
+ * The button that signs a visitor in, wherever a page asks for an account: it opens the Connect
+ * window (components/ConnectChooser.tsx), with the email and Google login and the NEAR wallets.
+ */
+export const SIGN_IN = "Sign in";
+
+/** That button while the window is open and the sign-in is under way. */
+export const SIGNING_IN = "Signing in…";
+
+/** Before the account a person is signed in as. */
+export const SIGNED_IN_AS = "Signed in as";
+
+/** While the page looks for the sign-in of an earlier visit. */
+export const CHECKING_SIGN_IN = "Checking if you're signed in…";
+
 /** A page that reads the account's balances says so in these words. */
 export const READING_BALANCES = "Reading your balances…";
 

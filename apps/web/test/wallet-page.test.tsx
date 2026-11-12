@@ -76,8 +76,8 @@ test("wallet_page_signed_out_offers_connect_and_reads_nothing", async () => {
   render(<WalletView />);
 
   // Until the wallet from an earlier visit is looked for, nothing is claimed either way.
-  expect(screen.getByRole("status").textContent).toBe("Checking for your wallet…");
-  await button("Connect wallet");
+  expect(screen.getByRole("status").textContent).toBe("Checking if you're signed in…");
+  await button("Sign in");
   expect(screen.queryByText("Balances")).toBeNull();
   expect(screen.queryByText("Storage with Tender")).toBeNull();
   expect(fetchCalls).toEqual([]);
@@ -88,7 +88,7 @@ test("register_deposit_withdraw_round_trip_on_the_page", async () => {
   render(<WalletView />);
 
   // Connect.
-  await user.click(await button("Connect wallet"));
+  await user.click(await button("Sign in"));
   expect((await screen.findByTestId("account-id")).textContent).toBe(ALICE);
   const row = await screen.findByTestId("token-row");
   expect(textOf(row, "vault-balance")).toBe("0.00 tUSDC");
@@ -281,7 +281,7 @@ test("wallet_without_sign_message_degrades_on_the_page", async () => {
   const { user, wallet } = setup({ signMessage: false });
   render(<WalletView />);
 
-  await user.click(await button("Connect wallet"));
+  await user.click(await button("Sign in"));
 
   expect((await screen.findByTestId("cannot-sign")).textContent).toBe(
     "This wallet can't sign messages. Switch wallet to post tasks or link Telegram.",
@@ -459,7 +459,7 @@ test("disconnect_takes_the_balances_away_and_leaves_the_focus_on_the_page", asyn
 
   await user.click(await button("Disconnect"));
 
-  await button("Connect wallet");
+  await button("Sign in");
   expect(screen.queryByTestId("token-row")).toBeNull();
   expect(screen.queryByText("Storage with Tender")).toBeNull();
   expect(document.activeElement?.textContent).toBe("Connection");

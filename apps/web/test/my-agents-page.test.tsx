@@ -104,13 +104,13 @@ test("my_agents_asks_to_connect_and_reads_nothing_until_then", async () => {
   expect(screen.getByRole("banner").textContent).toContain(
     "Your agent service provider (ASP) dashboard: your agents, as their provider.",
   );
-  expect(screen.getByRole("status").textContent).toBe("Checking for your wallet…");
-  await screen.findByRole("heading", { name: "Connect your wallet" });
+  expect(screen.getByRole("status").textContent).toBe("Checking if you're signed in…");
+  await screen.findByRole("heading", { name: "You're not signed in" });
   expect(state.requests).toEqual([]);
   // The way to add an agent is offered once there is an account to add it under.
   expect(screen.queryByRole("link", { name: "Add an agent" })).toBeNull();
 
-  await user.click(screen.getByRole("button", { name: "Connect wallet" }));
+  await user.click(screen.getByRole("button", { name: "Sign in" }));
 
   expect(provider.connects).toBe(1);
   // The account's own row and the rows under it come from two reads: wait for all three.

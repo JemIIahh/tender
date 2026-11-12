@@ -169,8 +169,8 @@ test("telegram_page_explains_the_alerts_in_three_lines_and_asks_nothing_when_sig
 
   expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Telegram alerts");
   // Until the wallet from an earlier visit is looked for, nothing is claimed either way.
-  expect(screen.getByRole("status").textContent).toBe("Checking for your wallet…");
-  await button("Connect wallet");
+  expect(screen.getByRole("status").textContent).toBe("Checking if you're signed in…");
+  await button("Sign in");
   expect(screen.queryByRole("button", { name: "Link Telegram" })).toBeNull();
   const lines = within(screen.getByTestId("alert-lines")).getAllByRole("listitem");
   expect(lines).toHaveLength(3);
@@ -190,7 +190,7 @@ test("the_button_connects_signs_in_asks_for_the_link_and_opens_it", async () => 
   const api = fakeApi();
   render(<TelegramView />);
 
-  await user.click(await button("Connect wallet"));
+  await user.click(await button("Sign in"));
 
   // The same button, now for the next step, and it still has the keyboard focus.
   const link = await button("Link Telegram");
@@ -312,11 +312,11 @@ test("a_wallet_that_never_connects_can_be_given_up_on", async () => {
   fakeApi();
   render(<TelegramView />);
 
-  await user.click(await button("Connect wallet"));
-  await button("Waiting for your wallet…");
+  await user.click(await button("Sign in"));
+  await button("Signing in…");
   await user.click(await button("Stop waiting"));
 
-  expect((await button("Connect wallet")).getAttribute("aria-disabled")).toBe("false");
+  expect((await button("Sign in")).getAttribute("aria-disabled")).toBe("false");
   expect(screen.getByTestId("link-error").textContent).toContain("You stopped waiting");
   wait.open();
 });
@@ -479,12 +479,12 @@ test("a_wallet_that_will_not_connect_is_told_in_words", async () => {
   };
   render(<TelegramView />);
 
-  await user.click(await button("Connect wallet"));
+  await user.click(await button("Sign in"));
 
   expect((await screen.findByTestId("link-error")).textContent).toBe(
-    "Couldn't connect the wallet. Try again.",
+    "Couldn't sign in. Try again.",
   );
-  expect((await button("Connect wallet")).getAttribute("aria-disabled")).toBe("false");
+  expect((await button("Sign in")).getAttribute("aria-disabled")).toBe("false");
   expect(console.error).toHaveBeenCalledTimes(1);
 });
 
@@ -559,9 +559,9 @@ test("a_wallet_that_is_disconnected_while_the_api_answers_gets_no_link", async (
 
   // The page waits for the request to end before it takes the button back.
   await waitFor(() =>
-    expect(
-      screen.getByRole("button", { name: "Connect wallet" }).getAttribute("aria-disabled"),
-    ).toBe("false"),
+    expect(screen.getByRole("button", { name: "Sign in" }).getAttribute("aria-disabled")).toBe(
+      "false",
+    ),
   );
   expect(open).not.toHaveBeenCalled();
   expect(screen.queryByTestId("link-state")).toBeNull();
@@ -604,7 +604,7 @@ test("a_link_made_for_one_account_is_not_shown_for_another", async () => {
     await holder.store.disconnect();
   });
   expect(screen.queryByTestId("link-state")).toBeNull();
-  await user.click(await button("Connect wallet"));
+  await user.click(await button("Sign in"));
 
   expect((await screen.findByTestId("account-id")).textContent).toBe(BOB);
   expect(screen.queryByTestId("link-state")).toBeNull();

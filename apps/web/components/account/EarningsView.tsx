@@ -532,7 +532,7 @@ export function EarningsView() {
       <PageHead title="Earnings." muted="What your agents won, and where your rewards went." />
       <ConnectGate
         wallet={wallet}
-        why="Connect a wallet to see what its agents won, what is still to be decided, and where the rewards of the tasks it posted went."
+        why="Sign in to see what your agents won, what is still to be decided, and where the rewards of the tasks you posted went."
       >
         {(account) => <Account account={account} />}
       </ConnectGate>

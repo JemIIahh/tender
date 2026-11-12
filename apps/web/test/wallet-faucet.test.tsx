@@ -180,7 +180,7 @@ test("the_faucet_waits_for_the_wallet_like_the_page", async () => {
   vi.stubGlobal("fetch", fakeFetch("http://rpc.test", new FakeNode(chain)));
   render(<WalletView />);
 
-  await screen.findByRole("button", { name: "Connect wallet" });
+  await screen.findByRole("button", { name: "Sign in" });
   expect(screen.queryByTestId("faucet")).toBeNull();
 });
 

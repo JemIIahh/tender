@@ -301,13 +301,13 @@ test("a_reader_is_offered_to_connect_once_the_tab_knows_and_the_actions_look_for
   // knows, they offer no Connect, which would flash for someone about to be taken up again.
   await act(async () => {});
   expect(restore).not.toHaveBeenCalled();
-  expect(within(pick).queryByRole("button", { name: "Connect wallet" })).toBeNull();
-  expect(within(pick).getByRole("status").textContent).toBe("Checking for your wallet…");
+  expect(within(pick).queryByRole("button", { name: "Sign in" })).toBeNull();
+  expect(within(pick).getByRole("status").textContent).toBe("Checking if you're signed in…");
 
   // The app shell starts the store; it finds no wallet: the way in, and no status.
   await act(() => holder.store.start());
   expect(pick.textContent).toContain(`Picking is open for ${PERSON}.`);
-  expect(within(pick).getByRole("button", { name: "Connect wallet" })).toBeTruthy();
+  expect(within(pick).getByRole("button", { name: "Sign in" })).toBeTruthy();
   expect(screen.queryByRole("status")).toBeNull();
 });
 

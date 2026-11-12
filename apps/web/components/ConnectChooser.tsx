@@ -488,7 +488,7 @@ export function ConnectChooser({ store = pageChooser }: { store?: Chooser } = {}
     first.current = element;
   };
   const title =
-    state.step === "choose" && !state.login ? "Connect a NEAR wallet" : TITLE[state.step];
+    state.step === "choose" && !state.login ? "Sign in with a NEAR wallet" : TITLE[state.step];
 
   return (
     // The backdrop closes it with a pointer; Escape does from the keyboard (below).

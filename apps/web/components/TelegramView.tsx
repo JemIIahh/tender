@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { useApiToken } from "../lib/auth";
 import { useNowNs } from "../lib/clock";
+import { CHECKING_SIGN_IN, SIGN_IN, SIGNED_IN_AS, SIGNING_IN } from "../lib/copy";
 import { TelegramLinkRefused, telegramLinkMessage, telegramStartUrl } from "../lib/telegram";
 import { type Told, toldFor } from "../lib/told";
 import { useWaitedLong } from "../lib/waiting";
@@ -218,16 +219,16 @@ export function TelegramView() {
         <h2 className={PANEL_TITLE}>Link your chat</h2>
         {!ready ? (
           <p role="status" className="text-sm text-muted">
-            Checking for your wallet…
+            {CHECKING_SIGN_IN}
           </p>
         ) : (
           <>
             {accountId === null ? (
-              <p className="text-sm text-muted">Connect a wallet to link Telegram.</p>
+              <p className="text-sm text-muted">Sign in to link Telegram.</p>
             ) : (
               <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
                 <Avatar account={accountId} size={34} />
-                <span className="text-sm text-muted">Connected as</span>
+                <span className="text-sm text-muted">{SIGNED_IN_AS}</span>
                 <span
                   data-testid="account-id"
                   className="font-mono text-sm text-bone wrap-anywhere"
@@ -250,7 +251,7 @@ export function TelegramView() {
               </div>
             ) : null}
             {/* One button, whose words follow the step. It is the same element from one step to
-                the next, so the keyboard focus stays on it when the wallet connects. `aria-disabled`
+                the next, so the keyboard focus stays on it when the person signs in. `aria-disabled`
                 and not `disabled`: a disabled button cannot hold the focus. */}
             <button
               type="button"
@@ -260,8 +261,8 @@ export function TelegramView() {
             >
               {accountId === null
                 ? running === "connect"
-                  ? "Waiting for your wallet…"
-                  : "Connect wallet"
+                  ? SIGNING_IN
+                  : SIGN_IN
                 : running === "link"
                   ? "Linking…"
                   : "Link Telegram"}

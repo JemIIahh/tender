@@ -12,6 +12,7 @@ import {
   topUpOpen,
 } from "../../lib/actions";
 import { heldToken, noToken, subscribeToken } from "../../lib/apiToken";
+import { CHECKING_SIGN_IN } from "../../lib/copy";
 import type { PickResult } from "../../lib/pick";
 import type { RefundResult } from "../../lib/refund";
 import type { TopUpResult } from "../../lib/topUp";
@@ -188,14 +189,14 @@ export function TaskActions({
     } else if (looking) {
       body = (
         <p role="status" className={EYEBROW}>
-          Checking for your wallet…
+          {CHECKING_SIGN_IN}
         </p>
       );
     } else if (pick?.kind === "connect") {
       body = (
         <Connect
           wallet={wallet}
-          why={`Picking is open for ${pick.account}. If that's you, connect your wallet to pick.`}
+          why={`Picking is open for ${pick.account}. If that's you, sign in to pick.`}
         />
       );
     } else if (pick?.kind === "pick") {
@@ -249,14 +250,14 @@ export function TaskActions({
     if (looking) {
       body = (
         <p role="status" className={EYEBROW}>
-          Checking for your wallet…
+          {CHECKING_SIGN_IN}
         </p>
       );
     } else if (account === null) {
       body = (
         <Connect
           wallet={wallet}
-          why="Anyone can add to this reward until answers close. Connect a wallet to top up from your vault."
+          why="Anyone can add to this reward until answers close. Sign in to top up from your vault."
         />
       );
     } else {

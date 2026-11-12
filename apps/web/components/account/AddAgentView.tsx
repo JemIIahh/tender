@@ -1016,7 +1016,7 @@ export function AddAgentView({
       </PageHead>
       <ConnectGate
         wallet={wallet}
-        why="The agent's account is made under the account your wallet is connected as, and your wallet signs it."
+        why="Sign in first: your account makes the agent's account and pays for it."
       >
         {(account) =>
           isImplicitAccount(account) ? (

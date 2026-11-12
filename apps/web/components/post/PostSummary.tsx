@@ -1,7 +1,7 @@
 "use client";
 
 import { type ReactNode, useMemo } from "react";
-import { READING_BALANCES } from "../../lib/copy";
+import { CHECKING_SIGN_IN, READING_BALANCES, SIGN_IN, SIGNING_IN } from "../../lib/copy";
 import {
   fundingOf,
   heldoutFile,
@@ -190,7 +190,7 @@ export function PostSummary(props: {
           {verifierText}
         </Row>
         <Row id="review-account" label="Posting as">
-          {accountId ?? "Not connected"}
+          {accountId ?? "Not signed in"}
         </Row>
       </dl>
 
@@ -203,7 +203,7 @@ export function PostSummary(props: {
 
       {!ready ? (
         <p role="status" className="text-sm text-muted">
-          Checking for your wallet…
+          {CHECKING_SIGN_IN}
         </p>
       ) : accountId === null ? null : !canSignMessage ? (
         <p role="status" data-testid="cannot-sign" className={NOTICE}>
@@ -322,9 +322,9 @@ export function PostSummary(props: {
             onClick={props.onConnect}
             className={`${PRIMARY} w-full`}
           >
-            {props.connecting ? "Waiting for your wallet…" : "Connect wallet"}
+            {props.connecting ? SIGNING_IN : SIGN_IN}
           </button>
-          <p className="text-[13px] text-muted">Connect your wallet to see what posting costs.</p>
+          <p className="text-[13px] text-muted">Sign in to see what posting costs.</p>
         </div>
       ) : (
         // `aria-disabled` does not stop a press: with a problem in the form, a press shows each one

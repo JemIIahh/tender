@@ -121,8 +121,8 @@ const FADE = "transition-[opacity,visibility] duration-200 motion-reduce:transit
  * The frame of every page after the landing: a sidebar with the pages and, pinned under them, the
  * Live block (components/SidebarLive: a few of the platform's figures and the way to Metrics); a
  * top bar with "Post task" and the account group (components/AccountPill: whether the index is up
- * to date, the network, and the way to the wallet, which is the connected account once a page has
- * connected one); and the page itself. On a phone the sidebar is a menu that the top bar opens,
+ * to date, the network, and Sign in, which opens the Connect window over the page, or the account
+ * once the person is signed in); and the page itself. On a phone the sidebar is a menu that the top bar opens,
  * over the page, and that closes when a page is chosen.
  *
  * From laptop width up, the button at the head of the sidebar, or ⌘B (Ctrl+B), makes the sidebar a
@@ -149,7 +149,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   // The wallet as this tab knows it. The shell starts the store once it is in the browser, so that
   // every page takes up the wallet of an earlier visit (silently: a restore opens no window); the
   // wallet library loads then, after the page. Until the store knows (`ready`), the pill is a
-  // placeholder, so that a page that is about to show the account never shows Connect first.
+  // placeholder, so that a page that is about to show the account never shows Sign in first.
   const { ready, accountId, keyHolder } = useSyncExternalStore(
     walletStore.subscribe,
     walletStore.getSnapshot,
@@ -333,7 +333,12 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Link href="/post" className={`${PRIMARY} ${BAR_PILL}`}>
             Post task
           </Link>
-          <AccountGroup ready={ready} accountId={accountId} login={keyHolder?.login} />
+          <AccountGroup
+            ready={ready}
+            accountId={accountId}
+            login={keyHolder?.login}
+            onSignIn={walletStore.connect}
+          />
         </div>
       </header>
 

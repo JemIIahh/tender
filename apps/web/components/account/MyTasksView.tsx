@@ -341,7 +341,7 @@ export function MyTasksView() {
       <PageHead title="My tasks." muted="What you posted, and what is yours to do next." />
       <ConnectGate
         wallet={wallet}
-        why="Connect a wallet to see the tasks it posted, the ones it has to pick, and the hires it made."
+        why="Sign in to see the tasks you posted, the ones you have to pick, and the hires you made."
       >
         {(account) => <Account account={account} />}
       </ConnectGate>

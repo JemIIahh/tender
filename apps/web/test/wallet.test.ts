@@ -905,7 +905,7 @@ test("dev_wallet_only_stands_in_where_the_sandbox_has_no_other_wallet", async ()
   const failure = await rejection(built.walletStore.connect());
 
   expect(failure).toBeInstanceOf(errors.WalletUnavailable);
-  expect(errors.walletErrorMessage(failure)).toBe("This build has no wallet to connect.");
+  expect(errors.walletErrorMessage(failure)).toBe("This build has no way to sign in.");
 });
 
 test("the_wallet_hook_is_the_store", async () => {

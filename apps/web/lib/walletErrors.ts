@@ -127,7 +127,7 @@ export function sendOutcomeUnknown(error: unknown): boolean {
 }
 
 const WALLET_ACTION_WORDS: Record<WalletError["action"], string> = {
-  connect: "Couldn't connect the wallet. Try again.",
+  connect: "Couldn't sign in. Try again.",
   disconnect: "Couldn't disconnect the wallet. Try again.",
   send: "The wallet reported a problem. Check the balances below before you try again.",
   sign: "The wallet didn't sign the message.",
@@ -136,8 +136,8 @@ const WALLET_ACTION_WORDS: Record<WalletError["action"], string> = {
 /** Plain words for why a wallet or a sign-in step failed. Any other failure is `errorMessage`'s. */
 export function walletErrorMessage(error: unknown): string {
   if (error instanceof WalletCannotSign) return WALLET_CANNOT_SIGN_MESSAGE;
-  if (error instanceof WalletNotConnected) return "Connect a wallet first.";
-  if (error instanceof WalletUnavailable) return "This build has no wallet to connect.";
+  if (error instanceof WalletNotConnected) return "Sign in first.";
+  if (error instanceof WalletUnavailable) return "This build has no way to sign in.";
   if (sendOutcomeUnknown(error)) return SEND_MAY_STILL_GO_THROUGH;
   if (error instanceof WalletError) return WALLET_ACTION_WORDS[error.action];
   if (error instanceof TransactionFailed) return "The transaction failed on the network.";

@@ -6,6 +6,7 @@ import { type ReactNode, useCallback, useEffect, useId, useRef, useState } from 
 import { api } from "../lib/api";
 import { useApiToken } from "../lib/auth";
 import { config } from "../lib/config";
+import { CHECKING_SIGN_IN, SIGN_IN } from "../lib/copy";
 import { errorMessage } from "../lib/errors";
 import {
   HireFailure,
@@ -307,13 +308,13 @@ function HirePanel({
   } else if (!ready) {
     body = (
       <p role="status" className={EYEBROW}>
-        Checking for your wallet…
+        {CHECKING_SIGN_IN}
       </p>
     );
   } else if (accountId === null) {
     body = (
       <div className="grid gap-3">
-        <p className="text-[14px] text-muted">Connect a wallet to hire. It pays the price.</p>
+        <p className="text-[14px] text-muted">Sign in to hire. Your account pays the price.</p>
         <button
           type="button"
           className={PRIMARY}
@@ -325,7 +326,7 @@ function HirePanel({
             });
           }}
         >
-          Connect wallet
+          {SIGN_IN}
         </button>
         {connecting === null ? null : (
           <p role="alert" className="text-sm text-seal">

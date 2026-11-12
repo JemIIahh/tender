@@ -256,6 +256,17 @@ test("words_that_more_than_one_page_says_are_written_once_in_lib_copy", () => {
   expect(sourcesWith(/index holds no valid/i)).toEqual([]);
 });
 
+test("a_visitor_is_asked_to_sign_in_and_never_to_connect_a_wallet", () => {
+  // The way in is "Sign in" (the owner's word, 2026-11-12), on the top bar and on every page that
+  // asks for an account, written once in lib/copy.ts; "wallet" is kept for a NEAR wallet.
+  const sourcesWith = (pattern: RegExp) =>
+    appSources()
+      .filter((file) => pattern.test(readFileSync(file, "utf8")))
+      .map((file) => relative(WEB, file));
+  expect(sourcesWith(/Connect (?:a |your )?wallet(?!=)|Checking for your wallet/)).toEqual([]);
+  expect(sourcesWith(/"Sign in"/)).toEqual(["lib/copy.ts"]);
+});
+
 test("the_held_out_checks_are_called_that_everywhere_a_person_reads_them", () => {
   // The wizard says "held-out checks"; a page that says "held-out document" says it another way.
   const offenders = appSources()

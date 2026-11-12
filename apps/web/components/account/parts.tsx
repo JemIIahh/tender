@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { ByToken } from "../../lib/account";
-import { UNTITLED_TASK } from "../../lib/copy";
+import { CHECKING_SIGN_IN, SIGN_IN, SIGNING_IN, UNTITLED_TASK } from "../../lib/copy";
 import { knownFirst, knowsToken } from "../../lib/tokens";
 import type { UseWallet } from "../../lib/wallet";
 import { walletErrorMessage } from "../../lib/walletErrors";
@@ -16,10 +16,10 @@ import { EYEBROW, FACT_LABEL, PRIMARY, SECONDARY, TEXT_LINK } from "../ui";
 // a command to copy, and amounts listed token by token.
 
 /**
- * The page before it knows the account: "Checking for your wallet…" while the wallet from an
- * earlier visit is looked for, a card that asks to connect one when there is none, and the page
- * (`children`) once there is. The Connect button stays the same button while it waits, so that
- * the person who pressed it keeps their place.
+ * The page before it knows the account: "Checking if you're signed in…" while the sign-in of an
+ * earlier visit is looked for, a card that asks the person to sign in when there is none, and the
+ * page (`children`) once there is. The Sign in button stays the same button while it waits, so
+ * that the person who pressed it keeps their place.
  */
 export function ConnectGate({
   wallet,
@@ -27,7 +27,7 @@ export function ConnectGate({
   children,
 }: {
   wallet: Pick<UseWallet, "ready" | "accountId" | "connect">;
-  /** What connecting shows, in a sentence. */
+  /** What signing in shows, in a sentence. */
   why: string;
   children: (accountId: string) => ReactNode;
 }) {
@@ -36,7 +36,7 @@ export function ConnectGate({
   if (!wallet.ready) {
     return (
       <p role="status" className={EYEBROW}>
-        Checking for your wallet…
+        {CHECKING_SIGN_IN}
       </p>
     );
   }
@@ -58,10 +58,10 @@ export function ConnectGate({
     <EmptyState
       testId="connect-gate"
       heading="h2"
-      title="Connect your wallet"
+      title="You're not signed in"
       action={
         <button type="button" aria-disabled={waiting} onClick={connect} className={PRIMARY}>
-          {waiting ? "Waiting for your wallet…" : "Connect wallet"}
+          {waiting ? SIGNING_IN : SIGN_IN}
         </button>
       }
     >

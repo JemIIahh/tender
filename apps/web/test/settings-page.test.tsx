@@ -44,13 +44,15 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-test("settings_without_a_wallet_point_to_the_wallet_and_say_there_is_no_sign_in", async () => {
-  open(false);
+test("settings_without_an_account_offer_sign_in_here_and_say_there_is_no_api_sign_in", async () => {
+  const user = open(false);
   const account = screen.getByTestId("settings-account");
-  await within(account).findByText("No wallet connected.");
-  expect(
-    within(account).getByRole("link", { name: "Open Wallet to connect" }).getAttribute("href"),
-  ).toBe("/wallet");
+  await within(account).findByText("You're not signed in.");
+  // Sign in opens the Connect window over this page (the store's connect), and leads nowhere.
+  const signIn = within(account).getByRole("button", { name: "Sign in" });
+  await user.click(signIn);
+  await within(account).findByTestId("settings-wallet");
+  expect(screen.getByTestId("settings-wallet").textContent).toBe(ALICE);
   expect(screen.getByTestId("settings-session").textContent).toContain("Not signed in.");
   expect(screen.queryByRole("button", { name: "Sign out of the API" })).toBeNull();
   // Telegram is linked on its own page.

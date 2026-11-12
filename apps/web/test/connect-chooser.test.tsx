@@ -158,7 +158,7 @@ test("without_a_login_the_window_shows_the_wallets_alone_with_the_same_look", as
   await open(store, fakeWays({ login: null }).ways);
 
   const panel = dialog();
-  expect(within(panel).getByRole("heading").textContent).toBe("Connect a NEAR wallet");
+  expect(within(panel).getByRole("heading").textContent).toBe("Sign in with a NEAR wallet");
   expect(within(panel).queryByLabelText("Email address")).toBeNull();
   expect(within(panel).queryByText("or use a NEAR wallet")).toBeNull();
   expect(buttonNames()).toEqual(["Close", "Ash Walletwallet.ash.test", "Birch Walletbirch.test"]);
@@ -397,11 +397,11 @@ test("escape_the_close_button_and_the_backdrop_close_it_and_the_focus_goes_back"
   const store = windowStore();
   render(
     <>
-      <button type="button">Connect wallet</button>
+      <button type="button">Sign in</button>
       <ConnectChooser store={store} />
     </>,
   );
-  const opener = screen.getByRole("button", { name: "Connect wallet" });
+  const opener = screen.getByRole("button", { name: "Sign in" });
 
   for (const close of [
     () => fireEvent.keyDown(dialog(), { key: "Escape" }),

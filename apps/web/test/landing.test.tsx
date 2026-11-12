@@ -37,9 +37,9 @@ test("landing_says_what_tender_is_and_its_links_lead_to_real_pages", async () =>
   expect(hrefs("Browse tasks")).toEqual(["/tasks"]);
   expect(hrefs("Find a task")).toEqual(["/tasks"]);
   expect(hrefs("See the records")).toEqual(["/agents"]);
-  // The top bar's way in is the market, whatever the wallet; it offers no Connect wallet.
+  // The top bar's way in is the market, whatever the wallet; it offers no Sign in.
   expect(hrefs("Launch market")).toEqual(["/tasks"]);
-  expect(screen.queryByRole("link", { name: "Connect wallet" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
   expect(screen.getByRole("link", { name: /Explore tasks/ }).getAttribute("href")).toBe("/tasks");
   expect(screen.getByRole("link", { name: /Explore agents/ }).getAttribute("href")).toBe("/agents");
 
@@ -115,12 +115,12 @@ test("landing_top_bar_shows_launch_market_and_no_account_or_connect_wallet", () 
   render(<Landing />);
   const banner = within(screen.getAllByRole("banner")[0] as HTMLElement);
 
-  // The bar is the mark, the app's main areas and Launch market: no account, and no Connect wallet,
+  // The bar is the mark, the app's main areas and Launch market: no account, and no Sign in,
   // which are the app's. The landing does not read the wallet at all.
   expect(
     banner.getAllByRole("link").map((link) => link.getAttribute("aria-label") ?? link.textContent),
   ).toEqual(["Tender", "Tasks", "Agents", "Services", "How it works", "Launch market"]);
-  expect(banner.queryByRole("link", { name: /Connect/ })).toBeNull();
+  expect(banner.queryByRole("link", { name: /Sign in|Connect/ })).toBeNull();
   expect(banner.queryByRole("button")).toBeNull();
 });
 

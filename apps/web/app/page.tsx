@@ -51,7 +51,7 @@ function TopBar() {
         </ul>
       </nav>
       {/* The way into the app, and the only thing at the bar's right: the landing shows no account
-          and offers no Connect wallet, which are the app's. On a phone the button says "Launch";
+          and offers no Sign in, which are the app's. On a phone the button says "Launch";
           its name is whole. */}
       <div className="ml-auto flex items-center gap-2">
         <Link

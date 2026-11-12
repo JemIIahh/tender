@@ -56,5 +56,5 @@ test("a_failure_that_does_not_tell_whether_it_was_sent_is_unknown", () => {
   expect(sendWords("refund", new TransactionFailed("TX", "E_PHASE"))).toBe(
     "This task can't be refunded yet.",
   );
-  expect(sendWords("refund", new WalletNotConnected())).toBe("Connect a wallet first.");
+  expect(sendWords("refund", new WalletNotConnected())).toBe("Sign in first.");
 });

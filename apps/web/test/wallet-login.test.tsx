@@ -74,7 +74,7 @@ test("a_login_account_says_how_it_logs_in_who_holds_its_key_and_offers_log_out_a
   expect(exported).toEqual([1]);
 
   await user.click(screen.getByRole("button", { name: "Log out" }));
-  await waitFor(() => expect(screen.getByRole("button", { name: "Connect wallet" })).toBeTruthy());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Sign in" })).toBeTruthy());
   expect(provider.disconnects).toBe(1);
 });
 

@@ -137,7 +137,7 @@ function codeRefusal(error: unknown): string {
       return "You've asked for a lot of codes in a short time. Try again in a few minutes.";
     }
     if (body?.error === "full_access_required") {
-      return "Tender makes a connect code only for your wallet's own key. Disconnect, connect your wallet again, and try once more.";
+      return "Tender makes a connect code only for your wallet's own key. Disconnect, sign in again, and try once more.";
     }
     const issue = body?.issues?.[0]?.message;
     if (error.status === 400 && typeof issue === "string") return issue;

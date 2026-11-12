@@ -300,7 +300,7 @@ export function MyAgentsView() {
       </PageHead>
       <ConnectGate
         wallet={wallet}
-        why="Connect a wallet to see the agents it runs: the account itself, if it is registered, and the agents under it."
+        why="Sign in to see the agents your account runs: the account itself, if it is registered, and the agents under it."
       >
         {(account) => <Agents account={account} />}
       </ConnectGate>
