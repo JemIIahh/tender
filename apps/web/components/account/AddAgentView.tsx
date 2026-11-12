@@ -14,12 +14,13 @@ import {
   createAccountCommand,
   implicitAgentBatch,
   isPaid,
+  nearNeeded,
   readAgentOnChain,
   readWalletBalance,
 } from "../../lib/connect";
 import { faucetOffered } from "../../lib/faucet";
 import { formatSpan } from "../../lib/phase";
-import { accountExists, accountKeyState } from "../../lib/rpc";
+import { accountExists, accountKeyState, nearBalanceOf } from "../../lib/rpc";
 import { useLoad } from "../../lib/useLoad";
 import { describeAmount, describeNear } from "../../lib/vault";
 import { useAccountActions, useWallet } from "../../lib/wallet";
@@ -32,7 +33,7 @@ import {
 import { PageHead } from "../PageHead";
 import { FACT_LABEL, FIELD, NOTICE, PRIMARY, SECONDARY, TEXT_LINK } from "../ui";
 import { ConnectAgent } from "./ConnectAgent";
-import { Command, ConnectGate } from "./parts";
+import { Command, ConnectGate, NearShortNotice } from "./parts";
 import { STEP_LOOK, Step } from "./Step";
 
 export { AGENT_ACCOUNT_DEPOSIT, createAccountActions, createAccountCommand, STEP_LOOK };
@@ -680,8 +681,9 @@ type Held = { state: "unknown" } | { state: "read"; amount: bigint } | { state: 
  * its own key. Nothing is signed until the button is pressed.
  *
  * Every email or Google login is such an account, and holds none of the bond's token until the
- * Wallet page's faucet: the page reads what the owner's wallet holds of it, and says so (with the
- * way to the faucet) before the approval, whose bond would otherwise fail on the network.
+ * Wallet page's faucet, and only the NEAR the gas gift sent it: the page reads what the owner holds
+ * of both, and says what is missing (with the way to the faucet) before the approval, which would
+ * otherwise fail part-way on the network. Both are read again when the button is pressed.
  */
 function ImplicitFlow({ owner, watchEveryMs }: { owner: string; watchEveryMs: number }) {
   const id = useId();
@@ -749,21 +751,39 @@ function ImplicitFlow({ owner, watchEveryMs }: { owner: string; watchEveryMs: nu
   const taken = chain !== null && chain.key === "other-keys";
   // What the owner's wallet holds of the bond's token, read again on Check again.
   const [held, setHeld] = useState<Held>({ state: "unknown" });
+  // What the owner's account holds of NEAR, which the approval sends and burns.
+  const [nearHeld, setNearHeld] = useState<Held>({ state: "unknown" });
   const [lookAgain, setLookAgain] = useState(0);
   const bondToken = bond?.token ?? null;
-  // biome-ignore lint/correctness/useExhaustiveDependencies: `lookAgain` reads it again on purpose
+
+  /** Reads what the owner holds of the bond's token and of NEAR. A read that fails blocks nothing. */
+  const readOwner = async (): Promise<{ token: Held; near: Held }> => {
+    const asHeld = (read: Promise<bigint>): Promise<Held> =>
+      read.then(
+        (amount): Held => ({ state: "read", amount }),
+        (error): Held => {
+          console.error(error);
+          return { state: "error" };
+        },
+      );
+    const [token, near] = await Promise.all([
+      bondToken === null
+        ? Promise.resolve<Held>({ state: "unknown" })
+        : asHeld(readWalletBalance(owner, bondToken)),
+      asHeld(nearBalanceOf(owner)),
+    ]);
+    return { token, near };
+  };
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `lookAgain` reads it again on purpose; `readOwner` is this render's
   useEffect(() => {
-    if (bondToken === null || made) return;
+    if (made) return;
     let gone = false;
-    readWalletBalance(owner, bondToken).then(
-      (amount) => {
-        if (!gone) setHeld({ state: "read", amount });
-      },
-      (error) => {
-        console.error(error);
-        if (!gone) setHeld({ state: "error" });
-      },
-    );
+    void readOwner().then(({ token, near }) => {
+      if (gone) return;
+      setHeld(token);
+      setNearHeld(near);
+    });
     return () => {
       gone = true;
     };
@@ -771,7 +791,14 @@ function ImplicitFlow({ owner, watchEveryMs }: { owner: string; watchEveryMs: nu
   // The bond the approval would pay: what the agent's vault doesn't hold of it yet.
   const bondDue = bond === null ? 0n : bond.amount - (chain?.vault ?? 0n);
   const short = held.state === "read" && bondDue > 0n && held.amount < bondDue ? held.amount : null;
-  const ready = agentId !== null && chain !== null && !made && !taken && short === null;
+  // The NEAR the approval needs, by what the chain holds of the agent's account.
+  const nearDue = agentId === null || chain === null ? null : nearNeeded(agentId, chain, bond);
+  const nearShort =
+    nearDue !== null && nearHeld.state === "read" && nearHeld.amount < nearDue
+      ? nearHeld.amount
+      : null;
+  const ready =
+    agentId !== null && chain !== null && !made && !taken && short === null && nearShort === null;
 
   const send = async () => {
     if (busy.current || agentId === null || publicKey === null || !termsRead) return;
@@ -784,6 +811,18 @@ function ImplicitFlow({ owner, watchEveryMs }: { owner: string; watchEveryMs: nu
         fresh === null ||
         fresh.key === "other-keys" ||
         (fresh.key === "has-key" && isPaid(fresh, bond))
+      ) {
+        setCreate({ state: "idle" });
+        return;
+      }
+      // And what the owner holds now: the page may not have read it yet, or it changed since.
+      const now = await readOwner();
+      setHeld(now.token);
+      setNearHeld(now.near);
+      const due = bond === null ? 0n : bond.amount - fresh.vault;
+      if (
+        (now.token.state === "read" && due > 0n && now.token.amount < due) ||
+        (now.near.state === "read" && now.near.amount < nearNeeded(agentId, fresh, bond))
       ) {
         setCreate({ state: "idle" });
         return;
@@ -945,6 +984,15 @@ function ImplicitFlow({ owner, watchEveryMs }: { owner: string; watchEveryMs: nu
                 </button>
               </div>
             </div>
+          ) : null}
+
+          {nearShort !== null && nearDue !== null && !made ? (
+            <NearShortNotice
+              testId="implicit-near-short"
+              held={nearShort}
+              needed={nearDue}
+              onCheckAgain={() => setLookAgain((n) => n + 1)}
+            />
           ) : null}
 
           {made ? null : !actions.canSend() ? (

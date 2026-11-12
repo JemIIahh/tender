@@ -105,6 +105,8 @@ export interface World {
   vault: Map<string, bigint>;
   /** What an account holds of the bond's token in its own wallet (`ft_balance_of`), if set. */
   wallet: Map<string, bigint>;
+  /** What `view_account` says an account holds, in yoctoNEAR; 1 for one not here. */
+  balances: Map<string, bigint>;
 }
 
 export function world(): World {
@@ -126,6 +128,7 @@ export function world(): World {
     storage: new Set(),
     vault: new Map(),
     wallet: new Map(),
+    balances: new Map(),
   };
 }
 
@@ -145,8 +148,9 @@ export function serve(state: World): void {
       const { params } = JSON.parse(String(init.body)) as { params: Record<string, string> };
       state.requests.push(`RPC ${params.request_type} ${params.account_id}`);
       if (params.request_type === "view_account") {
+        const amount = state.balances.get(params.account_id ?? "") ?? 1n;
         return state.accounts.has(params.account_id ?? "")
-          ? json({ jsonrpc: "2.0", id: "x", result: { amount: "1" } })
+          ? json({ jsonrpc: "2.0", id: "x", result: { amount: `${amount}` } })
           : rpcError("UNKNOWN_ACCOUNT", "does not exist while viewing");
       }
       if (params.request_type === "view_access_key") {

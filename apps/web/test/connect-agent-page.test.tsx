@@ -112,6 +112,8 @@ interface World {
   bodies: string[];
   /** The Authorization of each request to the connect routes. */
   authorizations: (string | null)[];
+  /** What `view_account` says an account holds, in yoctoNEAR; 10 NEAR for one not here. */
+  near: Map<string, bigint>;
 }
 
 function world(): World {
@@ -136,6 +138,7 @@ function world(): World {
     requests: [],
     bodies: [],
     authorizations: [],
+    near: new Map(),
   };
 }
 
@@ -163,7 +166,11 @@ function serve(state: World): void {
       if (params.request_type === "view_account") {
         state.requests.push(`RPC view_account ${account}`);
         return state.accounts.has(account)
-          ? json({ jsonrpc: "2.0", id: "x", result: { amount: "1" } })
+          ? json({
+              jsonrpc: "2.0",
+              id: "x",
+              result: { amount: (state.near.get(account) ?? 10n ** 25n).toString() },
+            })
           : rpcMissing("UNKNOWN_ACCOUNT");
       }
       if (params.request_type === "view_access_key_list") {
@@ -531,6 +538,38 @@ test("the_attached_key_is_shown_with_its_fingerprint_and_a_warning_before_anythi
   expect(batches).toEqual([]);
 });
 
+test("a_near_wallet_owner_short_of_near_is_told_how_much_more_and_one_with_enough_is_not", async () => {
+  // Alice's wallet holds 0.05 NEAR: Create agent sends 0.10 to the account and 0.02 of storage,
+  // and its fees.
+  const state = world();
+  state.near.set(ALICE, 5n * 10n ** 22n);
+  const { user, batches } = open(state);
+  await getCode(user);
+  agentAttaches(state);
+  const notice = await screen.findByTestId("connect-near-short");
+  expect(notice.textContent).toContain(
+    "Your account holds 0.05 NEAR, and adding this agent takes 0.13 NEAR with its fees. Add 0.08 NEAR to your account first.",
+  );
+  expect(
+    within(notice)
+      .getByRole("link", { name: "Get testnet NEAR on the Wallet page" })
+      .getAttribute("href"),
+  ).toBe("/wallet");
+  const create = screen.getByRole("button", { name: "Create agent" });
+  expect(create.getAttribute("aria-disabled")).toBe("true");
+  await user.click(create);
+  expect(batches).toEqual([]);
+
+  // With enough (the wallet's own NEAR, after the faucet): no notice, and Create agent goes.
+  state.near.set(ALICE, 10n ** 25n);
+  await user.click(within(notice).getByRole("button", { name: "Check again" }));
+  await waitFor(() => expect(screen.queryByTestId("connect-near-short")).toBeNull());
+  await waitFor(() => expect(create.getAttribute("aria-disabled")).toBe("false"));
+  await user.click(create);
+  await waitFor(() => expect(step(4).dataset.open).toBe("true"));
+  expect(batches).toHaveLength(1);
+});
+
 test("create_agent_is_one_approval_that_creates_the_account_and_pays_its_storage_and_bond", async () => {
   const state = world();
   const { user, batches } = open(state);
@@ -539,6 +578,8 @@ test("create_agent_is_one_approval_that_creates_the_account_and_pays_its_storage
   const create = await screen.findByRole("button", { name: "Create agent" });
   await waitFor(() => expect(state.requests).toContain(`RPC ft_balance_of ${ALICE}`));
 
+  // A NEAR wallet with enough: no word about NEAR.
+  expect(screen.queryByTestId("connect-near-short")).toBeNull();
   await user.click(create);
 
   await waitFor(() => expect(step(4).dataset.open).toBe("true"));

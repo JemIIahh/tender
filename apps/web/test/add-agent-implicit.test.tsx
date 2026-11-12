@@ -107,7 +107,11 @@ function ownerWallet(state: World): { wallet: SigningWallet; sent: Sent[][] } {
   return { wallet, sent };
 }
 
+/** A login as the gas gift leaves it: 0.25 NEAR, unless the test says otherwise. */
+const GIFT = 25n * 10n ** 22n;
+
 function open(state: World) {
+  if (!state.balances.has(OWNER)) state.balances.set(OWNER, GIFT);
   serve(state);
   const { wallet, sent } = ownerWallet(state);
   holder.store = createWalletStore(async () =>
@@ -218,6 +222,49 @@ test("a_login_with_none_of_the_bond_token_is_sent_to_the_faucet_before_anything_
   await waitFor(() => expect(screen.getByTestId("step-2").dataset.done).toBe("true"));
   expect(sent[0]?.map((tx) => tx.receiverId)).toEqual([AGENT, CONTRACT, TOKEN]);
 });
+
+test.each([
+  // Its second agent: the first left it 0.12045 NEAR (scripts/serve.sandbox.test.ts).
+  ["a_login_after_its_first_agent", 120_450_000_000_000_000_000_000n, "0.12 NEAR", "0.01 NEAR"],
+  // A login whose gift was 0.1 NEAR, before the gift was 0.25.
+  ["a_login_with_0_1_near", 10n ** 23n, "0.10 NEAR", "0.03 NEAR"],
+])(
+  "%s_is_told_how_much_near_is_missing_before_anything_is_signed",
+  async (_name, near, holds, add) => {
+    const state = world();
+    state.accounts.set(OWNER, []);
+    state.config = { ...state.config, agent_bond: { token: TOKEN, amount: BOND.toString() } };
+    state.wallet.set(OWNER, 20_000_000n);
+    state.balances.set(OWNER, near);
+    const { sent, user } = open(state);
+
+    await user.click(await screen.findByLabelText("The public key it printed"));
+    await user.paste(AGENT_KEY);
+    const notice = await screen.findByTestId("implicit-near-short");
+    // 0.10 NEAR to the agent, 0.02 of its storage and 0.01 for the fees.
+    expect(notice.textContent).toContain(
+      `Your account holds ${holds}, and adding this agent takes 0.13 NEAR with its fees. Add ${add} to your account first.`,
+    );
+    expect(
+      within(notice)
+        .getByRole("link", { name: "Get testnet NEAR on the Wallet page" })
+        .getAttribute("href"),
+    ).toBe("/wallet");
+    const create = screen.getByRole("button", { name: "Create the agent's account" });
+    expect(create.getAttribute("aria-disabled")).toBe("true");
+    await user.click(create);
+    expect(sent).toEqual([]);
+
+    // NEAR from the faucet, then Check again: the approval is on.
+    state.balances.set(OWNER, near + 10n ** 24n);
+    await user.click(within(notice).getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(screen.queryByTestId("implicit-near-short")).toBeNull());
+    await waitFor(() => expect(create.getAttribute("aria-disabled")).toBe("false"));
+    await user.click(create);
+    await waitFor(() => expect(screen.getByTestId("step-2").dataset.done).toBe("true"));
+    expect(sent[0]?.map((tx) => tx.receiverId)).toEqual([AGENT, CONTRACT, TOKEN]);
+  },
+);
 
 test("an_agent_account_already_made_and_paid_for_is_step_two_done_with_nothing_to_send", async () => {
   const state = world();

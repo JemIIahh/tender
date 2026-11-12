@@ -33,6 +33,8 @@ import {
   isPaid,
   type KeptCode,
   keepCode,
+  nearNeeded,
+  nearShortfall,
   readAgentFunding,
   readAgentOnChain,
   readKeptCode,
@@ -43,7 +45,7 @@ import {
 } from "../../lib/connect";
 import { errorMessage } from "../../lib/errors";
 import { faucetOffered } from "../../lib/faucet";
-import { accountExists, fullAccessKeysOf } from "../../lib/rpc";
+import { accountExists, fullAccessKeysOf, nearBalanceOf } from "../../lib/rpc";
 import type { Loaded } from "../../lib/useLoad";
 import { useLoad } from "../../lib/useLoad";
 import { describeAmount, describeNear } from "../../lib/vault";
@@ -55,7 +57,7 @@ import {
   walletErrorMessage,
 } from "../../lib/walletErrors";
 import { FACT_LABEL, FIELD, NOTICE, PRIMARY, SECONDARY, TEXT_LINK } from "../ui";
-import { Command } from "./parts";
+import { Command, NearShortNotice } from "./parts";
 import { Step } from "./Step";
 
 // "Connect your agent": the agent provider's way to add an agent, in one paste and one approval
@@ -412,6 +414,8 @@ export function ConnectAgent({
   // there is never paid again for this way.
   const [other, setOther] = useState<{ account: string; chain: AgentOnChain } | null>(null);
   const [held, setHeld] = useState<Held>({ state: "unknown" });
+  // What the person's account holds of NEAR, which Create agent sends and burns.
+  const [nearHeld, setNearHeld] = useState<Held>({ state: "unknown" });
   const [send, setSend] = useState<Send>({ state: "idle" });
   const [nowMs, setNowMs] = useState(() => Date.now());
   // Bumped to look again: after a sign-in that the page asked for, or a press of Check again.
@@ -553,19 +557,31 @@ export function ConnectAgent({
   }, [codeId, pollMs, lookAgain, account]);
 
   // A key is attached and the account is not made yet: how much of the bond's token the person's
-  // wallet holds, so that the page says before the wallet does whether the bond can be paid.
+  // wallet holds, and of NEAR, so that the page says before the wallet does whether the approval can
+  // be paid.
   const bondToken = bond?.token ?? null;
   // biome-ignore lint/correctness/useExhaustiveDependencies: `lookAgain` reads it again on purpose
   useEffect(() => {
-    if (attached === null || bondToken === null || created) return;
+    if (attached === null || created) return;
     let gone = false;
-    readWalletBalance(account, bondToken).then(
+    if (bondToken !== null) {
+      readWalletBalance(account, bondToken).then(
+        (amount) => {
+          if (!gone) setHeld({ state: "read", amount });
+        },
+        (error) => {
+          console.error(error);
+          if (!gone) setHeld({ state: "error" });
+        },
+      );
+    }
+    nearBalanceOf(account).then(
       (amount) => {
-        if (!gone) setHeld({ state: "read", amount });
+        if (!gone) setNearHeld({ state: "read", amount });
       },
       (error) => {
         console.error(error);
-        if (!gone) setHeld({ state: "error" });
+        if (!gone) setNearHeld({ state: "error" });
       },
     );
     return () => {
@@ -741,6 +757,26 @@ export function ConnectAgent({
         });
         return;
       }
+      // What the person's account holds of NEAR now, against what this approval sends and burns.
+      const nearNow = await nearBalanceOf(account).catch((error: unknown) => {
+        console.error(error);
+        return null;
+      });
+      if (nearNow !== null) setNearHeld({ state: "read", amount: nearNow });
+      const nearFor = nearNeeded(target, fresh, bond);
+      if (nearNow !== null && nearNow < nearFor && (fresh.key === "has-key" || !fundOnly)) {
+        // Step 3 says so before Create agent; Fund agent, in step 4, says it here.
+        const { holds, takes, add } = nearShortfall(nearNow, nearFor);
+        setSend(
+          fresh.key === "has-key"
+            ? {
+                state: "failed",
+                message: `Your account holds ${describeNear(holds)}, and paying the agent's storage and bond takes ${describeNear(takes)} with its fees. Add ${describeNear(add)} to your account first, then press Fund agent again.`,
+              }
+            : { state: "idle" },
+        );
+        return;
+      }
       if (fresh.key === "has-key") {
         const calls = fundCallsFor(target, fresh, bond);
         if (calls.length > 0) await wallet.signAndSend(calls);
@@ -833,8 +869,22 @@ export function ConnectAgent({
       : kind === "implicit"
         ? heldOnSubAccount(accountId, other.chain, bond)
         : heldOnImplicit(other.account, accountId, other.chain, bond);
+  // The NEAR Create agent needs, by what the chain holds of the code's account.
+  const nearDue =
+    target === null
+      ? null
+      : nearNeeded(target, chain ?? { key: "missing", storage: false, vault: 0n }, bond);
+  const nearShort =
+    nearDue !== null && nearHeld.state === "read" && nearHeld.amount < nearDue
+      ? nearHeld.amount
+      : null;
   const blocked =
-    short !== null || terms.status !== "ready" || !answerFits || contested || otherWords !== null;
+    short !== null ||
+    nearShort !== null ||
+    terms.status !== "ready" ||
+    !answerFits ||
+    contested ||
+    otherWords !== null;
   const showFinishOffer =
     !locked && name.ok && check.state === "taken" && check.accountId === accountId;
   // What of the first way is on the chain for `<name>.<you>`, in words, or null when nothing is.
@@ -1203,6 +1253,15 @@ export function ConnectAgent({
                         </button>
                       </div>
                     </div>
+                  ) : null}
+
+                  {nearShort !== null && nearDue !== null && !created ? (
+                    <NearShortNotice
+                      testId="connect-near-short"
+                      held={nearShort}
+                      needed={nearDue}
+                      onCheckAgain={() => setLookAgain((n) => n + 1)}
+                    />
                   ) : null}
 
                   {created ? null : canSend ? (

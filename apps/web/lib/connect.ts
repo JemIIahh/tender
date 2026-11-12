@@ -302,6 +302,50 @@ export async function readWalletBalance(account: string, token: string): Promise
   return BigInt(parsed.data);
 }
 
+/**
+ * NEAR the owner keeps over what Add an agent's approval sends, for its fees: 0.01 NEAR. A local
+ * chain burnt 0.0071 NEAR for the transfer that creates an implicit account, 0.0002 for the
+ * storage deposit and 0.0006 for the bond's deposit (scripts/serve.sandbox.test.ts prints them);
+ * a sub-account's transaction burns about 0.001.
+ */
+export const AGENT_FEE_MARGIN = 10n ** 22n;
+
+/**
+ * The NEAR the owner's one approval for `accountId` needs, by what the chain holds of it: the
+ * account's own NEAR (`AGENT_ACCOUNT_DEPOSIT`) while it doesn't exist, what the calls that pay the
+ * rest attach (its storage with Tender, the bond's 1 yoctoNEAR), and `AGENT_FEE_MARGIN`.
+ */
+export function nearNeeded(
+  accountId: string,
+  chain: Pick<AgentOnChain, "key" | "storage" | "vault">,
+  bond: AgentBondTerms | null,
+): bigint {
+  const account = chain.key === "has-key" ? 0n : AGENT_ACCOUNT_DEPOSIT;
+  const calls = fundCallsFor(accountId, chain, bond).reduce((sum, call) => sum + call.deposit, 0n);
+  return account + calls + AGENT_FEE_MARGIN;
+}
+
+/** A hundredth of a NEAR, the step the pre-check's words round to. */
+const CENT = 10n ** 22n;
+
+/**
+ * The pre-check's figures, in hundredths of a NEAR: what the account holds (rounded down, never
+ * overstated), what the approval takes (to the nearest hundredth: the bond's 1 yoctoNEAR is not a
+ * hundredth more), and what to add (rounded up, at least 0.01, so that adding it is enough).
+ */
+export function nearShortfall(
+  held: bigint,
+  needed: bigint,
+): { holds: bigint; takes: bigint; add: bigint } {
+  const takes = ((needed + CENT / 2n) / CENT) * CENT;
+  const missing = takes > held ? takes - held : 1n;
+  return {
+    holds: (held / CENT) * CENT,
+    takes,
+    add: ((missing + CENT - 1n) / CENT) * CENT,
+  };
+}
+
 /** The calls of "Fund agent": what the account still lacks, for a wallet that sends only calls. */
 export function fundCallsFor(
   accountId: string,

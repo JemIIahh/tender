@@ -3,13 +3,17 @@
 import Link from "next/link";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { ByToken } from "../../lib/account";
+import { config } from "../../lib/config";
+import { nearShortfall } from "../../lib/connect";
 import { CHECKING_SIGN_IN, SIGN_IN, SIGNING_IN, UNTITLED_TASK } from "../../lib/copy";
+import { faucetOffered } from "../../lib/faucet";
 import { knownFirst, knowsToken } from "../../lib/tokens";
+import { describeNear } from "../../lib/vault";
 import type { UseWallet } from "../../lib/wallet";
 import { walletErrorMessage } from "../../lib/walletErrors";
 import { Amount, RawUnits } from "../Amount";
 import { EmptyState } from "../EmptyState";
-import { EYEBROW, FACT_LABEL, PRIMARY, SECONDARY, TEXT_LINK } from "../ui";
+import { EYEBROW, FACT_LABEL, NOTICE, PRIMARY, SECONDARY, TEXT_LINK } from "../ui";
 
 // The pieces the account pages (My agents, Add an agent, Earnings) are built from, in the app's
 // look: the state a page has before a wallet is connected, the stat blocks, the boxed empty state,
@@ -339,5 +343,43 @@ export function Chip({ children, dot = "bg-current" }: { children: ReactNode; do
       <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${dot}`} />
       {children}
     </span>
+  );
+}
+
+/**
+ * Add an agent's NEAR pre-check, before anything is signed: the owner's account holds `held`, less
+ * than the `needed` its approval sends and burns (`nearNeeded`). Says how much more, in hundredths
+ * of a NEAR (`nearShortfall`), points to the Wallet page's "Get testnet NEAR" on testnet, and has Check
+ * again. The page keeps its button off meanwhile.
+ */
+export function NearShortNotice({
+  held,
+  needed,
+  onCheckAgain,
+  testId,
+}: {
+  held: bigint;
+  needed: bigint;
+  onCheckAgain: () => void;
+  testId: string;
+}) {
+  const { holds, takes, add } = nearShortfall(held, needed);
+  return (
+    <div data-testid={testId} className={`${NOTICE} grid gap-2`}>
+      <p>
+        Your account holds {describeNear(holds)}, and adding this agent takes {describeNear(takes)}{" "}
+        with its fees. Add {describeNear(add)} to your account first.
+      </p>
+      <div className="flex flex-wrap items-center gap-3">
+        {faucetOffered(config.network) ? (
+          <Link href="/wallet" className={TEXT_LINK}>
+            Get testnet NEAR on the Wallet page
+          </Link>
+        ) : null}
+        <button type="button" onClick={onCheckAgain} className={SECONDARY}>
+          Check again
+        </button>
+      </div>
+    </div>
   );
 }
