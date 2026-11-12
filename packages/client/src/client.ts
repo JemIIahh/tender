@@ -50,6 +50,20 @@ import {
 import {
   AccessKeyDoesNotExistError,
   AccountDoesNotExistError,
+  CostOverflowError,
+  InvalidChainError,
+  InvalidNonceError,
+  InvalidReceiverIdError,
+  InvalidSignatureError,
+  InvalidSignerIdError,
+  InvalidTransactionVersionError,
+  NonceTooLargeError,
+  NotEnoughBalanceError,
+  ShardCongestedError,
+  ShardStuckError,
+  SignerDoesNotExistError,
+  TransactionExpiredError,
+  TransactionSizeExceededError,
   TransactionTimeoutError,
   UnknownTransactionError,
 } from "near-api-js/rpc-errors";
@@ -211,10 +225,50 @@ function failureMessage(failure: unknown): string {
   return typeof panic === "string" ? panic : (JSON.stringify(failure) ?? String(failure));
 }
 
+/** The errors `failedWith` made: each is of a transaction whose final outcome is a failure. */
+const failedOnChain = new WeakSet<TenderError>();
+
 /** The error of a transaction that failed on chain: the contract's code, if it gave one. */
 function failedWith(txHash: string, failure: unknown): TenderError {
   const message = failureMessage(failure);
-  return new TenderError(errorCodeOf(message), message, { txHash, cause: failure });
+  const error = new TenderError(errorCodeOf(message), message, { txHash, cause: failure });
+  failedOnChain.add(error);
+  return error;
+}
+
+/**
+ * The errors near-api-js 7.4.0 throws for a transaction the node refused as invalid when it was
+ * sent (the RPC's `InvalidTxError`): it was not taken, and no copy of it can run. A wrong nonce, a
+ * signer without the NEAR, a bad signature, an expired block, a shard that takes no more.
+ */
+const REFUSED_BY_THE_NODE = [
+  CostOverflowError,
+  InvalidChainError,
+  InvalidNonceError,
+  InvalidReceiverIdError,
+  InvalidSignatureError,
+  InvalidSignerIdError,
+  InvalidTransactionVersionError,
+  NonceTooLargeError,
+  NotEnoughBalanceError,
+  ShardCongestedError,
+  ShardStuckError,
+  SignerDoesNotExistError,
+  TransactionExpiredError,
+  TransactionSizeExceededError,
+] as const;
+
+/**
+ * Whether the error of a send (`send`, `transfer`) says for certain that its transaction moved
+ * nothing and never will: it ran and its final outcome is a failure (a failed transaction keeps
+ * nothing it did, but its gas), or the node refused it as invalid before taking it
+ * (`REFUSED_BY_THE_NODE`). Anything else leaves the outcome unknown: above all an `E_TIMEOUT`, and
+ * an RPC or network error, after which the transaction may still land. A caller that would send the
+ * same thing again does so only when this is true, or once the chain shows the first did not land.
+ */
+export function sendRefused(error: unknown): boolean {
+  if (error instanceof TenderError) return failedOnChain.has(error);
+  return REFUSED_BY_THE_NODE.some((refused) => error instanceof refused);
 }
 
 /** A `SuccessValue`: base64 of what the call returned, JSON for this contract and NEP-141. */

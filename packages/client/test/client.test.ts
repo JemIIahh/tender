@@ -2,8 +2,13 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { type extractEvents, NETWORKS, type PostTaskInput, type TenderCall } from "@tender/shared";
 import { Account, actions, KeyPair } from "near-api-js";
+import {
+  InvalidNonceError,
+  NotEnoughBalanceError,
+  TransactionTimeoutError,
+} from "near-api-js/rpc-errors";
 import { afterEach, describe, expect, expectTypeOf, test, vi } from "vitest";
-import { TenderClient, TenderError, type TxResult, toTxResult } from "../src/index";
+import { sendRefused, TenderClient, TenderError, type TxResult, toTxResult } from "../src/index";
 
 const CONTRACT = "tender.test.near";
 const BLOCK = { block_hash: "6kSpdaiEGudXLa4p43ALXFHCu96ozdEJ3c8KsCuajXyj", block_height: 34 };
@@ -760,5 +765,60 @@ describe("NEAR transfers and balances", () => {
     const { client, sent } = signing(() => ({}));
     await expect(client.transfer("ab".repeat(32), 0n)).rejects.toThrow(RangeError);
     expect(sent).not.toHaveBeenCalled();
+  });
+
+  test("a_transfer_the_node_refused_or_that_failed_on_chain_is_refused_for_certain", async () => {
+    const refusedByTheNode = new NotEnoughBalanceError(1n, 2n, "gift.test.near", "TX", "BLOCK");
+    const { client } = signing(() => {
+      throw refusedByTheNode;
+    });
+    const error = await client.transfer("ab".repeat(32), 100n).then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBe(refusedByTheNode);
+    expect(sendRefused(error)).toBe(true);
+    expect(sendRefused(new InvalidNonceError(1, 1, "TX", "BLOCK"))).toBe(true);
+
+    // A final outcome that is a failure: the transaction ran and kept nothing.
+    const failed = (() => {
+      try {
+        toTxResult(
+          {
+            status: { Failure: { ActionError: { index: 0, kind: { LackBalanceForState: {} } } } },
+            transaction: { hash: "TX" },
+            receipts_outcome: [],
+          },
+          CONTRACT,
+        );
+      } catch (thrown) {
+        return thrown;
+      }
+    })();
+    expect(sendRefused(failed)).toBe(true);
+  });
+
+  test("a_send_whose_outcome_is_not_known_is_never_refused_for_certain", () => {
+    // Each of these may be followed by the transaction landing all the same.
+    const unfinished = (() => {
+      try {
+        toTxResult(
+          { status: "Started", transaction: { hash: "TX" }, receipts_outcome: [] },
+          CONTRACT,
+        );
+      } catch (thrown) {
+        return thrown;
+      }
+    })();
+    for (const [what, error] of [
+      ["a timeout of the client", new TenderError("E_TIMEOUT", "TenderClient.transfer timed out")],
+      ["an outcome that is not final", unfinished],
+      ["a timeout of the node's own wait", new TransactionTimeoutError()],
+      ["a network error", new TypeError("fetch failed")],
+      ["a contract's code, made by hand", new TenderError("E_AUTH", "E_AUTH: no")],
+      ["nothing that is an error", "boom"],
+    ] as const) {
+      expect(sendRefused(error), what).toBe(false);
+    }
   });
 });

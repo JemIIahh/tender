@@ -17,6 +17,7 @@ import {
   type LocalChain,
   registerLocalAgent,
   registerWithBond,
+  sendRefused,
   startLocalChain,
   TenderClient,
   TenderError,
@@ -455,7 +456,13 @@ test("a_transfer_creates_an_implicit_account_with_the_amount", async () => {
   expect(before - after).toBeGreaterThan(NEAR / 10n);
   expect(before - after).toBeLessThan(NEAR / 10n + NEAR / 100n);
 
-  // More than the sender holds is refused by the node: nothing runs.
-  await expect(sender.transfer(implicit, after + NEAR)).rejects.toThrow();
+  // More than the sender holds is refused by the node: nothing runs, and the error says so for
+  // certain (`sendRefused`), as near-api-js reports it from a real node.
+  const refused = await sender.transfer(implicit, after + NEAR).then(
+    () => undefined,
+    (thrown: unknown) => thrown,
+  );
+  expect(refused).toBeInstanceOf(Error);
+  expect(sendRefused(refused)).toBe(true);
   expect(await sender.nearBalanceOf(implicit)).toBe(NEAR / 10n);
 });
