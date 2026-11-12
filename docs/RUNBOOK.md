@@ -392,6 +392,7 @@ Environment variables, for Production (section 7 has the meaning of each). All a
 | `NEXT_PUBLIC_CONTRACT` | the same account as `TENDER_CONTRACT` |
 | `NEXT_PUBLIC_JUDGE_ACCOUNT` | the same account as `JUDGE_ACCOUNT` |
 | `NEXT_PUBLIC_RPC_URL` | optional (section 7) |
+| `NEXT_PUBLIC_PRIVY_APP_ID` | optional; turns on the email and Google login (section 7). The build reads it, so set it before the deploy, and add the web app's Production address to the Privy app's allowed origins |
 
 A build without `NEXT_PUBLIC_NETWORK`, `NEXT_PUBLIC_API_URL` or `NEXT_PUBLIC_CONTRACT` fails and names the variable, so a missing one stops the deploy and ships no broken site. A preview deployment has its own address, which is not in `PUBLIC_WEB_URL`, so the API refuses its calls from a browser (CORS): use Production.
 
