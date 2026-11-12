@@ -139,14 +139,14 @@ Rules:
 
 `TRUSTED_PROXY_HOPS` (0 to 10, default 0) is the number of proxies in front of the API that each add the address they saw to `X-Forwarded-For`.
 
-- Behind a proxy with the default of 0, every viewer counts as one client (the proxy). The whole site then shares the four event streams, the sign-in limits and the `/mcp` limit.
+- Behind a proxy with the default of 0, every viewer counts as one client (the proxy). The whole site then shares the four event streams, the sign-in limits, the `/mcp` limit and the gas gift's (30 calls in 10 minutes).
 - Set it to the true number of proxies **only when the API's port can be reached through those proxies alone.** If clients can reach the API directly, a client can send its own `X-Forwarded-For` and choose the address it is counted under, which defeats every per-client limit. Too high a value does the same.
 
 ### The gas gift
 
 On testnet, `POST /v1/gas-gift` sends an account that the web app's email login made a little testnet NEAR, so that it can pay its first fees. Such an account is an implicit one (64 hex characters, its public key): it is not on chain and can do nothing until NEAR reaches it, and the transfer creates it. Each login gets one gift and each account one, and all the gifts of a UTC day add up to a cap. The web app calls the route with the login's access token. The API checks it against the keys Privy publishes for the app (`https://auth.privy.io/api/v1/apps/<PRIVY_APP_ID>/jwks.json`), which it fetches when the first token comes and keeps for 10 minutes, and fetches again for a key it does not know, so a key Privy rotates in is found. The services host must be able to reach `auth.privy.io` over HTTPS.
 
-It is on only when the first three variables below are all set, and never on mainnet: `pnpm serve` refuses to start with any `GAS_GIFT_*` set there. A variable with nothing after its `=` counts as unset. With some of the three set and not all, `pnpm serve` logs a `WARN serve:` line that names the missing ones, starts, and leaves the gift off.
+It is on only when the first three variables below are all set, and never on mainnet: `pnpm serve` refuses to start with any `GAS_GIFT_*` set there. A variable with nothing after its `=` counts as unset. With a `GAS_GIFT_*` variable set but not all three, `pnpm serve` logs a `WARN serve:` line that names the missing ones, starts, and leaves the gift off. `PRIVY_APP_ID` alone says nothing: the web app's build may need it.
 
 | Variable | Value |
 |---|---|
@@ -179,13 +179,13 @@ What the route answers:
 | 409 `already_given` | This login, or this account, has had its gift, or it is on its way |
 | 429 `daily_limit` | The day's cap is used up. `Retry-After` gives the seconds to the next UTC day |
 | 429 `rate_limited` | One address asked more than 30 times in 10 minutes |
-| 502 `transfer_failed` | The transfer did not go through: the gift account is short of NEAR, or the node refused it. The claim is let go, so asking again works |
+| 502 `transfer_failed` | The transfer was refused (the node turned it down, for instance because the gift account is short of NEAR, or it failed on chain): the claim is let go, so asking again works. Or its outcome is not known (it timed out, or gave no answer within 60 s), and the NEAR may still arrive: the claim is kept, the answer's message says so, and a `WARN api:` line says `may still land` |
 | 503 `gift_off` | The gift is not set up on this API, or this is mainnet |
-| 503 `unavailable` | The login's published keys could not be fetched, or the node could not say what the account holds. `Retry-After: 5`. The log says which: `cannot fetch the login's key set` or `cannot read the NEAR balance` |
+| 503 `unavailable` | The login's published keys could not be fetched, or the node could not say what the account holds: `Retry-After: 5`, and the log says which, `cannot fetch the login's key set` or `cannot read the NEAR balance`. After a failed fetch of the keys, the calls of the next 5 s get this at once, with no fetch and no line. Or a gift for this login or this account is claimed and on its way, or may still arrive: `Retry-After: 30` |
 
-The table `gas_gifts` keeps one row per gift: the login's user id (`did:privy:...`, no email), the account, the amount, the transfer's hash and the times. A gift is claimed in that table before it is sent, so two calls at once cannot both send.
+The table `gas_gifts` keeps one row per gift: the login's user id (`did:privy:...`, no email), the account, the amount, the transfer's hash and the times. A gift is claimed in that table before it is sent, so two calls at once cannot both send, and the day's total counts claims as well as gifts sent. A claim whose transfer's outcome is not known is kept until it is 10 minutes old and its transfer is no longer in flight, and then let go; so is a claim of a process that died. Only then can the login or the account ask again: an account the NEAR did reach answers `not_needed`, and only a transfer that landed after its claim was let go goes uncounted.
 
-What it does not check: which account the login's wallet is. The login's token says who logged in, not which account they hold, so a login can send its one gift to any implicit account. The daily cap bounds what many logins can take together.
+What it does not check: which account the login's wallet is. The login's token says who logged in, not which account they hold, so a login can send its one gift to any implicit account. The daily cap bounds what many logins can take together. Once the day's cap is used, new accounts get nothing until the next UTC day, and logins made by a script can use it up early in the day.
 
 If the key leaks, move what the gift account holds to another account, or add a new full-access key to it and delete the old one, then set the new key on the host.
 

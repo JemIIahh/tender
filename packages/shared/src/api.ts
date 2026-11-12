@@ -499,9 +499,23 @@ export type TelegramLinkResponse = z.infer<typeof TelegramLinkResponseSchema>;
  * `POST /v1/gas-gift`, on testnet only: an account that the email login made gets a little testnet
  * NEAR from the team's gift account, so it can pay its first fees. The bearer is the login's own
  * token (not a Tender sign-in, which the account can't do before it holds NEAR); the body names the
- * account, an implicit one (64 lowercase hex characters). Refusals are an `ErrorBody`: `gift_off`
- * (503, the API has no gift account), `unauthorized` (401), `not_implicit` (400), `already_given`
- * (409, once per login and once per account), `daily_limit` (429).
+ * account, an implicit one (64 lowercase hex characters). Refusals are an `ErrorBody`, by status:
+ *
+ * - 400 `bad_request`: the body is not `{ account_id }`; `not_implicit`: the account is not 64
+ *   lowercase hex characters.
+ * - 401 `unauthorized`: no login token, or one that does not verify (which check failed is not said).
+ * - 409 `already_given`: this login or this account has had its gift (once per login, once per
+ *   account).
+ * - 413 `payload_too_large`: a body over 4 KiB.
+ * - 429 `rate_limited`: too many calls from one address, with `Retry-After`; `daily_limit`: the
+ *   day's gifts are given out, with `Retry-After` up to the next UTC day.
+ * - 502 `transfer_failed`: the transfer was refused, and asking again works; or its outcome is not
+ *   known, and the NEAR may still arrive (the message says which). Look at the account's balance
+ *   before asking again.
+ * - 503 `gift_off`, with no `Retry-After`: the API has no gift account, or this is mainnet; asking
+ *   again changes nothing. 503 `unavailable`, with `Retry-After`: try again after it, because the
+ *   login's keys or the account's balance cannot be read right now (5 s), or a gift for this login
+ *   or this account is on its way or may still arrive (30 s).
  */
 export const GasGiftRequestSchema = z.object({ account_id: AccountIdSchema });
 export type GasGiftRequest = z.infer<typeof GasGiftRequestSchema>;
