@@ -2,7 +2,7 @@
 
 What Tender does not do, what it asks you to trust, and what has not been run. Each entry says what is true now, who is affected and what would fix it. Finding numbers (A1, A2, A4, A8, A9, L1, L4, L5, M1, R1) are those of [security/contract-review.md](security/contract-review.md).
 
-The contract is deployed on testnet (2026-11-04, `deployments/testnet.json`) and nothing is on mainnet. No task has run on testnet yet, so every statement about behaviour is about the contract and services as run on a local chain.
+The contract is deployed on testnet (2026-11-04, `deployments/testnet.json`), the services and the web app are hosted for it (2026-11-12), and nothing is on mainnet. On 2026-11-12 every task on testnet was one of the team's own test runs, so most statements about behaviour are about the contract and services as run on a local chain.
 
 ## Trust points
 
@@ -123,7 +123,7 @@ The chain holds hashes, amounts, accounts, times and URIs. It does not hold the 
 | Amounts, accounts, windows, outcomes, counters | The question board, sign-ins, Telegram links |
 
 - A hash lets anyone check a document they hold. It does not make the document available. If the database is lost, the hashes still stand and point at nothing, and a held-out check that was only there cannot be recovered. A copy that someone made while the document was public can be checked against the hash and put back.
-- The URIs point at our API host by default. If the host goes away or changes, they break, even though the chain is fine.
+- The URIs point at our API host by default. If the host goes away or changes, they break, even though the chain is fine. Testnet tasks 1 and 2 show it: a team test run posted them through a local API, so their URIs name that API, and the hosted site shows them untitled, with no brief and no scorecard.
 - The index (tasks, entries, counters) can be rebuilt from the chain. The documents cannot. [RUNBOOK.md](RUNBOOK.md) says to back up the database.
 
 ## Weak points in the services
@@ -183,15 +183,17 @@ The state of the repository when this was written. Update this list when any of 
 
 | What | Status |
 |---|---|
-| Local chain: `pnpm demo:local` and the swarm demo | Run; the output is pasted in the README. The full gate is in [RUNBOOK.md](RUNBOOK.md#10-running-the-gate) |
+| Local chain: `pnpm demo:local` and the swarm demo | Run; the output is pasted in [TRY-IT.md](TRY-IT.md) (the demo's in the README too). The full gate is in [RUNBOOK.md](RUNBOOK.md#10-running-the-gate) |
 | Testnet: the contract deploy | Done on 2026-11-04 (`deployments/testnet.json`). The deployed code's sha256 equals `tender.wasm` in `contract/res/SHA256SUMS` |
-| Testnet: seeding, the hosted services and web app, any task posted there | Not done. They come with hosting |
+| Testnet: the hosted services and web app | Up since 2026-11-12: the services on Railway, built from the `Dockerfile`, with Postgres; the web app on Vercel. The README has the addresses |
+| Testnet: tasks | The first three are the team's: tasks 1 and 2 from a test run on 2026-11-10 that stored its documents on a local API (task 1 voided and refunded, task 2 picked and paid), and task 3, a hire of a listed service on 2026-11-12, picked by hand, whose scorecard `scripts/verify-scorecard.mjs` checks against the chain ([TRY-IT.md](TRY-IT.md#check-the-testnet-deployment)). On 2026-11-12 no task on testnet had named the hosted Judge as its checker |
+| Testnet: the 30 seed tasks | Not posted yet <!-- SEEDS --> |
 | Continuous integration | `.github/workflows/ci.yml` runs on every push and pull request: a secret scan, the contract build and tests, the type-check and lint, the TypeScript tests in four shards, and `pnpm demo:local`. The run for `428708a` on `main` (run 41984122331) passed all seven of its jobs. The badge in the README shows the latest run |
 | Postgres code paths (the Postgres adapter, the advisory lock, the migration on Postgres) | On every push, CI runs the database tests on a Postgres 17 service as well as on PGlite (Postgres 18), and the run named above passed. They share the test suite with PGlite where the suite is written against the adapter interface |
-| `docker build` of the services image | Not run |
+| `docker build` of the services image | Railway builds the image from the `Dockerfile` and runs it, since 2026-11-12 |
 | A real wallet signing in with NEP-413 | Not done. The tests use a local key |
 | The Telegram bot against Telegram | Not done. The tests use a fake server |
-| The indexer reading the NEAR Data API for 24 hours | Not done. It has run against a local chain only |
+| The indexer reading the NEAR Data API for 24 hours | Not recorded. It follows testnet in the hosted services (on 2026-11-12 `/v1/health` showed it 1 block behind the chain), and how it holds up over days is not recorded here |
 | Real model calls for the rubric step and for the LLM solvers | Not exercised by the demo, which uses offline solvers. Whether any run used a real key is not recorded here |
 | The 30 real seed tasks scored by the Judge | The tests that do it run only when `TENDER_SEEDS_PRIVATE_DIR` names the private directory, and skip with one note elsewhere |
 
