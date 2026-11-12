@@ -785,7 +785,9 @@ test("a_wallet_that_cannot_sign_in_is_sent_to_the_steps_by_hand", async () => {
   const state = world();
   const { user } = open(state, { signMessage: false });
   const notice = await screen.findByTestId("connect-cannot-sign");
-  expect(notice.textContent).toContain("This wallet can't sign the message that confirms it to Tender's API");
+  expect(notice.textContent).toContain(
+    "This wallet can't sign the message that confirms it to Tender's API",
+  );
   expect(within(step(1)).queryByRole("button", { name: "Get a connect code" })).toBeNull();
   await user.click(within(notice).getByRole("button", { name: "Set up by hand" }));
   await screen.findByLabelText("The public key it printed");
