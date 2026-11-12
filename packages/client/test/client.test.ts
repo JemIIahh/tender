@@ -766,10 +766,29 @@ describe("NEAR transfers and balances", () => {
       transaction: { hash: "TX" },
       receipts_outcome: [],
     }));
-    await expect(client.transfer("ab".repeat(32), 100n)).rejects.toMatchObject({
-      code: "E_UNKNOWN",
-      txHash: "TX",
-    });
+    const error = await client.transfer("ab".repeat(32), 100n).then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toMatchObject({ code: "E_UNKNOWN", txHash: "TX" });
+    // It ran, and its receipt failed: refused for certain.
+    expect(sendRefused(error)).toBe(true);
+  });
+
+  test("a_transfer_whose_outcome_is_an_invalid_tx_error_is_not_refused_for_certain", async () => {
+    // That copy was included and found invalid when applied: another copy of the same bytes may
+    // have run, so the outcome is unknown.
+    const { client } = signing(() => ({
+      status: { Failure: { InvalidTxError: { InvalidNonce: { tx_nonce: 7, ak_nonce: 7 } } } },
+      transaction: { hash: "TX" },
+      receipts_outcome: [],
+    }));
+    const error = await client.transfer("ab".repeat(32), 100n).then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toMatchObject({ txHash: "TX" });
+    expect(sendRefused(error)).toBe(false);
   });
 
   test("a_transfer_needs_a_signer_and_an_amount", async () => {
@@ -874,7 +893,22 @@ describe("NEAR transfers and balances", () => {
         return thrown;
       }
     })();
+    const invalidWhenApplied = (() => {
+      try {
+        toTxResult(
+          {
+            status: { Failure: { InvalidTxError: { InvalidNonce: { tx_nonce: 7, ak_nonce: 7 } } } },
+            transaction: { hash: "TX" },
+            receipts_outcome: [],
+          },
+          CONTRACT,
+        );
+      } catch (thrown) {
+        return thrown;
+      }
+    })();
     for (const [what, error] of [
+      ["a final outcome that is an InvalidTxError", invalidWhenApplied],
       ["a timeout of the client", new TenderError("E_TIMEOUT", "TenderClient.transfer timed out")],
       ["an outcome that is not final", unfinished],
       ["a timeout of the node's own wait", new TransactionTimeoutError()],

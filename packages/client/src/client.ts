@@ -216,14 +216,19 @@ function failureMessage(failure: unknown): string {
   return typeof panic === "string" ? panic : (JSON.stringify(failure) ?? String(failure));
 }
 
-/** The errors `failedWith` made: each is of a transaction whose final outcome is a failure. */
+/**
+ * The errors `failedWith` made for a final outcome whose failure is an `ActionError`: the
+ * transaction ran, and a receipt of it failed. Not one whose failure is an `InvalidTxError`, such
+ * as `{"InvalidTxError":{"InvalidNonce":…}}`: that copy was included and found invalid when it was
+ * applied, which says nothing of another copy of the same signed bytes (see `sendRefused`).
+ */
 const failedOnChain = new WeakSet<TenderError>();
 
 /** The error of a transaction that failed on chain: the contract's code, if it gave one. */
 function failedWith(txHash: string, failure: unknown): TenderError {
   const message = failureMessage(failure);
   const error = new TenderError(errorCodeOf(message), message, { txHash, cause: failure });
-  failedOnChain.add(error);
+  if (variantOf(failure)?.[0] === "ActionError") failedOnChain.add(error);
   return error;
 }
 
@@ -266,11 +271,14 @@ const REFUSED_BY_THE_NODE = [
 
 /**
  * Whether the error of a send (`send`, `transfer`) says for certain that its transaction will not
- * run from here on: its final outcome is a failure, or the node refused it as invalid for a reason
- * in its bytes alone (`REFUSED_BY_THE_NODE`). Anything else leaves the outcome unknown: above all an
- * `E_TIMEOUT`, a wrong nonce, a signer short of NEAR, an expired block, a congested or stuck shard,
- * and an RPC or network error, after which the transaction may still land. A caller that would send the same thing again does so only when this is true, or once the
- * chain shows the first did not land.
+ * run from here on: it ran and its final outcome is a failure of one of its receipts (an
+ * `ActionError`), or the node refused it as invalid for a reason in its bytes alone
+ * (`REFUSED_BY_THE_NODE`). Anything else leaves the outcome unknown: above all an `E_TIMEOUT`, a
+ * wrong nonce, a signer short of NEAR, an expired block, a congested or stuck shard, a final
+ * outcome whose failure is an `InvalidTxError` (that copy was included and found invalid, as with
+ * `{"InvalidTxError":{"InvalidNonce":…}}`, which says nothing of another copy), and an RPC or
+ * network error, after which the transaction may still land. A caller that would send the same
+ * thing again does so only when this is true, or once the chain shows the first did not land.
  *
  * What a failure undid depends on the transaction. One with a single receipt, such as `transfer`'s
  * one `Transfer` action, moved nothing for good: a receipt that fails keeps none of its actions'
@@ -516,7 +524,9 @@ export class TenderClient {
    * `defaultQueue` does it once more; both are turned off here (`retries: 0`, `retryOnNonce:
    * false`). An `InvalidNonce` can answer a resent copy of a transfer that was taken, and a new
    * signature would then be a second transfer of the same NEAR. So an `InvalidNonce` is thrown,
-   * as an outcome not known (`sendRefused` is false for it), and the caller decides. Only the
+   * as an outcome not known, and the caller decides: the node's refusal (`InvalidNonceError`) and
+   * a final outcome whose failure is `{"InvalidTxError":{"InvalidNonce":…}}` alike, for neither of
+   * which `sendRefused` is true. Only the
    * resends of the same signed bytes that near-api-js makes after an HTTP 408, 500 or 503 are
    * left, and those can run at most once.
    */

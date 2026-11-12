@@ -56,37 +56,37 @@ import { clientKey, rateLimit, rateLimitsOf, unavailableForNow } from "../limits
 //        is empty), so nothing is claimed; a `WARN api:` line says so, once in `POOL_WARN_MS`;
 //   429  `daily_limit`: the gifts of this UTC day would go past the cap (`Retry-After`: the seconds
 //        to the next UTC day);
-//   502  `transfer_failed`: the transfer was refused for certain (`sendRefused`: it failed on chain,
-//        or the node refused it for a reason in its signed bytes alone), and its claim is let go,
-//        so asking again works; or its outcome is not known, and the NEAR may still arrive: its
-//        claim is kept, as THE CLAIM says, and a `WARN api:` line says `may still land`. Unknown
-//        is a timeout, no answer within `TRANSFER_WAIT_MS`, and every refusal that is not a
-//        property of the signed bytes alone: a used nonce, a gift account short of NEAR (its
-//        balance is the chain's state at that moment), an expired block, a congested or stuck
-//        shard, and any other error. The pool is read before each claim, but that read is a check
-//        before sending, not a guarantee: it is of the last final block, which can lag a gift
-//        that has just executed, so calls close together can still meet an empty pool here, and
-//        so can a call after another spend from the gift account. Such a call keeps its claim
-//        until it goes stale, counted against the day meanwhile;
+//   502  `transfer_failed`: the transfer was refused for certain (`sendRefused`: it ran and a
+//        receipt of it failed on chain, an `ActionError`, or the node refused it for a reason in
+//        its signed bytes alone), and its claim is let go, so asking again works; or its outcome is
+//        not known, and the NEAR may still arrive: its claim is kept, as THE CLAIM says, and a
+//        `WARN api:` line says `may still land`. Unknown is a timeout, no answer within
+//        `TRANSFER_WAIT_MS`, and every refusal that is not a property of the signed bytes alone: a
+//        used nonce, a gift account short of NEAR (its balance is the chain's state at that
+//        moment), an expired block, a congested or stuck shard, a final outcome whose failure is an
+//        `InvalidTxError` (that copy was included and found invalid, which says nothing of another
+//        copy), and any other error. The pool is read before each claim, but that read is a check
+//        before sending, not a guarantee: it is of the last final block, which can lag a gift that
+//        has just executed, so calls close together can still meet an empty pool here, and so can a
+//        call after another spend from the gift account. Such a call keeps its claim until it goes
+//        stale, counted against the day meanwhile;
 //   200  `sent`, with the amount and the transfer's hash, once the transfer has executed.
 //
 // THE CLAIM. A gift's row is written before the transfer is sent, in a transaction that locks the
 // table, checks the login, the account and the day's total, and inserts it: of two calls at once
 // for the same login or the same account, one claims, and the other is told the gift is on its way
-// (503 `unavailable`). The day's total
-// counts every claim as well as every gift sent, so the claims and the sent gifts of a day never
-// pass the cap. The row is this request's own (its login, account and time), and only it is
-// changed: to `sent` once the transfer has executed, or deleted when the transfer was refused for
-// certain. A transfer whose outcome is unknown keeps its claim, so that no second gift goes out
-// while the first may land; the outcome is recorded whenever it comes, even after the answer.
-// A claim is let go by the next claim once it is older than `STALE_CLAIM_MS` and its transfer is
-// not in flight in this process: one left by a process that died mid-gift, or one whose transfer
-// ended with its outcome unknown. A transfer can go uncounted in two ways: one whose outcome was
-// unknown and that lands after its claim is let go, and one that was sent but whose `sent` could
-// not be written (the database failed: the answer is a 500, or a 502 if the 60 s wait had already
-// run out, and the claim is let go in time). Its
-// account then holds the NEAR, so it gets `not_needed` if asked for again; its login could still
-// ask for another account.
+// (503 `unavailable`). The day's total counts every claim as well as every gift sent, so the claims
+// and the sent gifts of a day never pass the cap. The row is this request's own (its login, account
+// and time), and only it is changed: to `sent` once the transfer has executed, or deleted when the
+// transfer was refused for certain. A transfer whose outcome is unknown keeps its claim, so that no
+// second gift goes out while the first may land; the outcome is recorded whenever it comes, even
+// after the answer. A claim is let go by the next claim once it is older than `STALE_CLAIM_MS` and
+// its transfer is not in flight in this process: one left by a process that died mid-gift, or one
+// whose transfer ended with its outcome unknown. A transfer can go uncounted in two ways: one whose
+// outcome was unknown and that lands after its claim is let go, and one that was sent but whose
+// `sent` could not be written (the database failed: the answer is a 500, or a 502 if the 60 s wait
+// had already run out, and the claim is let go in time). Its account then holds the NEAR, so it
+// gets `not_needed` if asked for again; its login could still ask for another account.
 //
 // What the route does not know: which account the login's wallet is. The token says who logged in,
 // not which account they hold, so a login can name any implicit account, once. The daily cap bounds
@@ -585,8 +585,9 @@ export function gasGiftRoutes(deps: ApiDeps): Hono {
    * Whether the gift account can pay one more gift and `GAS_GIFT_POOL_MARGIN` for its storage and
    * fees, by its balance at the last final block. A check before the claim, not a guarantee: that
    * block can lag a gift that has just executed, and calls close together, or another spend from
-   * the gift account, can still empty the pool before a transfer. An empty pool is said in a WARN, with the
-   * account and its balance, once in `POOL_WARN_MS` at most (a clock gone back says it again).
+   * the gift account, can still empty the pool before a transfer. An empty pool is said in a WARN,
+   * with the account and its balance, once in `POOL_WARN_MS` at most (a clock gone back says it
+   * again).
    */
   async function poolCovers(on: GasGift): Promise<boolean> {
     let pool: bigint;

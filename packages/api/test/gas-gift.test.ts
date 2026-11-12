@@ -1,7 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { TenderError } from "@tender/client";
+import { TenderError, toTxResult } from "@tender/client";
 import { GasGiftResponseSchema } from "@tender/shared";
 import {
   type CryptoKey,
@@ -51,6 +51,19 @@ const OTHER_ACCOUNT = "cd".repeat(32);
 const NEAR = 10n ** 24n;
 const AMOUNT = NEAR / 10n;
 const MIN_BALANCE = NEAR / 20n;
+/** The error the client throws for a final outcome whose failure is `failure`. */
+function outcomeFailure(failure: object): Error {
+  try {
+    toTxResult(
+      { status: { Failure: failure }, transaction: { hash: "TX" }, receipts_outcome: [] },
+      "tender.test.near",
+    );
+  } catch (thrown) {
+    return thrown as Error;
+  }
+  throw new Error("toTxResult took a failure as a success");
+}
+
 /** The gift account of the tests' gift: what it holds is its entry in `balances`. */
 const GIFT_ACCOUNT = "gift.testnet";
 
@@ -565,6 +578,11 @@ test("a_transfer_answered_with_a_refusal_not_in_its_signed_bytes_keeps_its_claim
     ],
     ["an expired block", new TransactionExpiredError("TX", "BLOCK")],
     ["a congested shard", new ShardCongestedError(1, 0, "TX", "BLOCK")],
+    // A copy included and found invalid when applied, which says nothing of another copy.
+    [
+      "an outcome that is an InvalidTxError InvalidNonce",
+      outcomeFailure({ InvalidTxError: { InvalidNonce: { tx_nonce: 7, ak_nonce: 7 } } }),
+    ],
   ] as const) {
     await resetDb(deps.db);
     transfers = [];
@@ -596,6 +614,30 @@ test("a_transfer_answered_with_a_refusal_not_in_its_signed_bytes_keeps_its_claim
     expect((await ask(app, USER, OTHER_ACCOUNT)).status, what).toBe(503);
     expect(transfers, what).toHaveLength(1);
   }
+});
+
+test("a_transfer_that_ran_and_failed_on_chain_lets_its_claim_go", async () => {
+  // An `ActionError`: the transaction ran, its receipt failed, and its NEAR comes back.
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let fail = true;
+  const app = appWith(
+    giftWith({
+      transfer: async (to, amount) => {
+        transfers.push({ to, amount });
+        if (fail) {
+          throw outcomeFailure({ ActionError: { index: 0, kind: { LackBalanceForState: {} } } });
+        }
+        return { txHash: "tx-after-retry" };
+      },
+    }),
+  );
+  const failed = await ask(app);
+  expect(failed.status).toBe(502);
+  expect((failed.body as ErrorBody).message).toContain("could not be sent");
+  expect(await rows()).toEqual([]);
+  fail = false;
+  expect((await ask(app)).status).toBe(200);
+  expect(transfers).toHaveLength(2);
 });
 
 test("a_transfer_with_no_answer_in_time_is_recorded_when_its_outcome_comes", async () => {
