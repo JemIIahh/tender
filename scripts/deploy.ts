@@ -72,7 +72,8 @@ import { envDir, loadEnv, parseEnvText, REPO_ROOT } from "./lib/env";
  * THE AGENT BOND (contract Task 16b). Registering as an agent takes a refundable bond, and only a
  * registered agent may enter an open task, so the bond is set here, by the last two steps of the
  * owner's lane, before any agent registers. It is in the test token
- * the deploy made: 1 tUSDC (1_000_000 of its smallest unit, at 6 decimals) on every network, and a
+ * the deploy made: 0.01 tUSDC (10_000 of its smallest unit, at 6 decimals) on every network, as the
+ * owner set it on testnet on 2026-11-12 (tx 7iuZDg1WnqAzyhjCFcPfVes8rpxqWm241DyKoR4YcoyA), and a
  * cooldown (the wait from `unregister_agent` to `claim_agent_bond`) of 14 days on testnet, the
  * contract's own default and the longest a task's window can be, so that a bond cannot be passed
  * from account to account within one task. On a local chain the cooldown is the shortest window,
@@ -108,7 +109,7 @@ export interface DeployTarget {
   usdc?: string;
   /**
    * The agent bond to set, if the defaults do not suit: `amount` in the smallest unit of the test
-   * token (default 1 tUSDC, `AGENT_BOND`), `cooldownSecs` from the shortest window to 56 days
+   * token (default 0.01 tUSDC, `AGENT_BOND`), `cooldownSecs` from the shortest window to 56 days
    * (default: 14 days on testnet, the shortest window elsewhere). See the top of the file.
    */
   agentBond?: { amount?: bigint; cooldownSecs?: number };
@@ -157,8 +158,8 @@ const TOKEN_SUPPLY = 10n ** 12n;
 /** The rewards Tender accepts in each token, in its smallest unit. */
 const TUSDC_LIMITS = { min: 1n, max: 10n ** 12n };
 const USDC_LIMITS = { min: 100_000n, max: 50_000_000n };
-/** The bond that registering takes by default: 1 tUSDC, in the test token's smallest unit. */
-export const AGENT_BOND = 10n ** 6n;
+/** The bond that registering takes by default: 0.01 tUSDC, in the test token's smallest unit. */
+export const AGENT_BOND = 10_000n;
 /** The amount and cooldown the owner's lane sets for `target`: its own, else the defaults. */
 export function bondTermsFor(
   target: Pick<DeployTarget, "network" | "minWindowSecs" | "agentBond">,

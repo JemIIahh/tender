@@ -257,13 +257,13 @@ test("deploy_inits_tender_by_its_own_account_and_the_token_for_the_poster", asyn
 test("deploy_sets_the_agent_bond_in_the_test_token_before_any_agent_registers", async () => {
   // The owner's lane ends with the cooldown and then the bond, both in the first run's output.
   expect(first.lines).toContain("OK set_agent_bond_cooldown 5");
-  expect(first.lines).toContain("OK set_agent_bond tusdc.sandbox 1000000");
+  expect(first.lines).toContain("OK set_agent_bond tusdc.sandbox 10000");
   const lines = first.lines;
   expect(lines.indexOf("OK set_agent_bond_cooldown 5")).toBeLessThan(
-    lines.indexOf("OK set_agent_bond tusdc.sandbox 1000000"),
+    lines.indexOf("OK set_agent_bond tusdc.sandbox 10000"),
   );
   expect(lines.indexOf("OK set_token tusdc.sandbox")).toBeLessThan(
-    lines.indexOf("OK set_agent_bond tusdc.sandbox 1000000"),
+    lines.indexOf("OK set_agent_bond tusdc.sandbox 10000"),
   );
 
   // On a local chain the cooldown is the shortest window, the least the contract takes.
@@ -273,10 +273,10 @@ test("deploy_sets_the_agent_bond_in_the_test_token_before_any_agent_registers", 
     agent_bond_amount: String(AGENT_BOND),
     agent_bond_cooldown_secs: "5",
   });
-  expect(config.agent_bond_amount).toBe("1000000");
+  expect(config.agent_bond_amount).toBe("10000");
 
   // Every agent registers after the bond is set, and none before it.
-  const bondAt = lines.indexOf("OK set_agent_bond tusdc.sandbox 1000000");
+  const bondAt = lines.indexOf("OK set_agent_bond tusdc.sandbox 10000");
   for (const name of Object.keys(REFERENCE_AGENTS)) {
     const at = lines.indexOf(`OK register_agent ${name}.sandbox`);
     expect(at, name).toBeGreaterThan(bondAt);
@@ -310,7 +310,7 @@ test("deploy_registers_the_four_reference_agents_with_their_bonds", async () => 
       account: id,
       status: "active",
       bond_token: "tusdc.sandbox",
-      bond_amount: "1000000",
+      bond_amount: "10000",
       claimable_at: null,
       profile_uri: profile.uri,
       profile_hash: profile.hash,
@@ -641,7 +641,7 @@ test("deploy_run_again_leaves_a_bond_the_owner_changed", async () => {
   });
   await deploy(targetFor(parent, "usdc.sandbox"), { dir, log: () => undefined });
   expect(await tender.getConfig()).toMatchObject({
-    agent_bond_amount: "1000000",
+    agent_bond_amount: "10000",
     agent_bond_cooldown_secs: "5",
   });
 
@@ -653,7 +653,7 @@ test("deploy_run_again_leaves_a_bond_the_owner_changed", async () => {
   const again: string[] = [];
   await deploy(targetFor(parent, "usdc.sandbox"), { dir, log: (l) => again.push(l) });
   expect(again).toContain("SKIP set_agent_bond_cooldown 5 (exists)");
-  expect(again).toContain("SKIP set_agent_bond tusdc.bondown.sandbox 1000000 (exists)");
+  expect(again).toContain("SKIP set_agent_bond tusdc.bondown.sandbox 10000 (exists)");
   expect(await tender.getConfig()).toMatchObject({
     agent_bond_token: "tusdc.bondown.sandbox",
     agent_bond_amount: "2500000",
@@ -700,7 +700,7 @@ test("deploy_with_a_cooldown_below_the_shortest_window_fails_at_that_step_and_se
   });
   // The contract's rule held, and the bond was not set after a failed cooldown.
   expect((await tender.getConfig()).agent_bond_token).toBeNull();
-  expect(lines).not.toContain("OK set_agent_bond tusdc.bondlow.sandbox 1000000");
+  expect(lines).not.toContain("OK set_agent_bond tusdc.bondlow.sandbox 10000");
 });
 
 test("deploy_finishes_a_reference_agent_that_stopped_with_its_bond_in_the_vault", async () => {
