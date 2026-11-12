@@ -138,11 +138,15 @@ function Stuck({
   );
 }
 
-function LastUsedBadge() {
+/**
+ * "Last used", in the row of the way this browser signed in last. On the email row it sits on the
+ * row's top edge (`onEdge`), so that the field keeps its width on a phone.
+ */
+function LastUsedBadge({ onEdge = false }: { onEdge?: boolean }) {
   return (
     <span
       data-testid="last-used"
-      className="shrink-0 rounded-full border border-line bg-raised px-2 py-0.5 text-[11px] font-medium text-muted"
+      className={`rounded-full border border-line px-2 py-0.5 text-[11px] font-medium text-muted ${onEdge ? "absolute -top-[9px] right-3 bg-panel leading-none" : "shrink-0 bg-raised"}`}
     >
       Last used
     </span>
@@ -305,7 +309,7 @@ function Choose({
                 const typed = new FormData(event.currentTarget).get("email");
                 void store.sendCode(typeof typed === "string" ? typed : "");
               }}
-              className={`${ROW} pr-1.5 focus-within:border-bone/50`}
+              className={`${ROW} relative pr-1.5 focus-within:border-bone/50`}
             >
               <span className={TILE}>{MAIL}</span>
               <input
@@ -323,7 +327,7 @@ function Choose({
                 readOnly={busy}
                 className="h-12 min-w-0 flex-1 bg-transparent text-[14px] font-medium text-bone placeholder:text-muted focus-visible:outline-none!"
               />
-              {state.lastUsed === "email" ? <LastUsedBadge /> : null}
+              {state.lastUsed === "email" ? <LastUsedBadge onEdge /> : null}
               <button
                 type="submit"
                 aria-disabled={busy ? true : undefined}

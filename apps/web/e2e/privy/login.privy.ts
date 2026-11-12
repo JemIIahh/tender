@@ -157,6 +157,9 @@ async function loginWorld(
 
 const connectWindow = (page: Page) => page.getByRole("dialog");
 
+/** How long a return from "Google" may take: the root, then the page, each a page load in dev. */
+const RETURN_MS = 20_000;
+
 /** Presses Sign in on the wallet page, and waits for the window's wallets. */
 async function openWindow(page: Page): Promise<void> {
   await page.locator("main").getByRole("button", { name: "Sign in" }).click();
@@ -353,6 +356,11 @@ test("an_email_login_takes_its_code_gets_its_account_ready_and_the_wallet_page_s
   await expect(connectWindow(page).locator("form").getByTestId("last-used")).toHaveText(
     "Last used",
   );
+  // The badge leaves the field room for an address at a phone's width.
+  await page.setViewportSize(PHONE);
+  const field = await connectWindow(page).getByLabel("Email address").boundingBox();
+  expect(field?.width ?? 0).toBeGreaterThanOrEqual(110);
+  await shoot(page, "last-used-email");
 });
 
 test("a_google_login_leaves_and_comes_back_and_a_refused_gift_says_so_with_the_faucet", async ({
@@ -368,9 +376,11 @@ test("a_google_login_leaves_and_comes_back_and_a_refused_gift_says_so_with_the_f
   await openWindow(page);
   await connectWindow(page).getByRole("button", { name: "Continue with Google" }).click();
 
-  // Back on the page it left, the window says the Google sign-in is being finished...
+  // Back on the page it left (by the root, two page loads), the window says the Google sign-in
+  // is being finished...
   await expect(connectWindow(page).getByTestId("google-finishing")).toHaveText(
     "Finishing your Google sign-in…",
+    { timeout: RETURN_MS },
   );
   await shoot(page, "google-finishing");
 
@@ -412,6 +422,7 @@ test("a_google_sign_in_turned_down_says_so_in_the_window_with_every_way_still_th
   // started on, says so, and offers every way.
   await expect(connectWindow(page).getByRole("alert")).toHaveText(
     "Google sign-in didn't finish. Try again or use email.",
+    { timeout: RETURN_MS },
   );
   await expect(page).toHaveURL(/\/wallet\?from=e2e$/);
   await expect(connectWindow(page).getByLabel("Email address")).toBeVisible();
