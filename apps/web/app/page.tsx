@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import type { CSSProperties, ReactNode } from "react";
 import { DitherArt } from "../components/landing/DitherArt";
+import { OAuthReturn } from "../components/landing/OAuthReturn";
 import { Stepper } from "../components/landing/Stepper";
 import { Ticker } from "../components/landing/Ticker";
 import { TypedCode } from "../components/landing/TypedCode";
@@ -593,6 +594,8 @@ function Footer() {
 export default function Landing() {
   return (
     <div className="landing relative min-h-svh bg-ink text-bone">
+      {/* Back from Google: on to the page the sign-in started on (lib/lastWay.ts). */}
+      <OAuthReturn />
       <div className="absolute inset-x-0 top-0 z-30">
         <TopBar />
       </div>

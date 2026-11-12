@@ -1,5 +1,5 @@
 import { GOOGLE_DIDNT_FINISH } from "./copy";
-import { type LastUsed, walletUsed, wayOf } from "./lastWay";
+import { keepReturnPage, type LastUsed, walletUsed, wayOf } from "./lastWay";
 import type {
   KeyHolder,
   NearProvider,
@@ -304,7 +304,12 @@ export function privyProvider({
     steps: {
       sendCode: async (email) => (await ready()).sendCode({ email }),
       loginWithCode: async (code) => (await ready()).loginWithCode({ code }),
-      google: async () => (await ready()).initOAuth({ provider: "google" }),
+      google: async () => {
+        const kit = await ready();
+        // Google comes back to the site's root; the landing sends the person on to this page.
+        keepReturnPage(`${window.location.pathname}${window.location.search}`);
+        await kit.initOAuth({ provider: "google" });
+      },
     },
 
     async restore() {

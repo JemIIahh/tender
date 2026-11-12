@@ -1,6 +1,17 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { GOOGLE_DIDNT_FINISH } from "../lib/copy";
-import { LAST_WAY_KEY, type LastUsed, lastUsedOf, lastWay, wayOf } from "../lib/lastWay";
+import {
+  keepReturnPage,
+  LAST_WAY_KEY,
+  type LastUsed,
+  lastUsedOf,
+  lastWay,
+  oauthRedirectUrl,
+  RETURN_PAGE_KEY,
+  returnAddress,
+  takeReturnPage,
+  wayOf,
+} from "../lib/lastWay";
 import {
   type ConnectPick,
   type ConnectWays,
@@ -115,6 +126,68 @@ test("the_near_wallet_is_picked_from_the_linked_accounts_and_the_login_is_named"
   expect(loginOf(EMAIL_USER)).toBe("email");
   expect(loginOf({ linkedAccounts: [], google: { email: "x" } })).toBe("google");
   expect(loginOf({ linkedAccounts: [] })).toBeNull();
+});
+
+test("google_keeps_the_page_it_starts_on_and_the_root_sends_the_person_back_to_it", async () => {
+  const bridge = createPrivyBridge();
+  const kit = fakeKit(bridge);
+  bridge.publish(kit);
+  window.history.replaceState({}, "", "/tasks?tag=research");
+  try {
+    await privyProvider({ bridge, makeWallet }).steps.google();
+  } finally {
+    window.history.replaceState({}, "", "/");
+  }
+  expect(kit.asked).toEqual(["initOAuth google"]);
+  expect(sessionStorage.getItem(RETURN_PAGE_KEY)).toBe("/tasks?tag=research");
+
+  // Google comes back to the root, the one address given to Privy...
+  expect(oauthRedirectUrl("https://tendeer.vercel.app")).toBe("https://tendeer.vercel.app");
+  const back = "?privy_oauth_code=c1&privy_oauth_state=s1&privy_oauth_provider=google";
+  // ...which sends the person on to the page kept, with Privy's three parameters, once.
+  expect(returnAddress(back, takeReturnPage())).toBe(
+    "/tasks?tag=research&privy_oauth_code=c1&privy_oauth_state=s1&privy_oauth_provider=google",
+  );
+  expect(takeReturnPage()).toBeNull();
+  // With nothing kept, to the wallet page; with no parameters, nowhere.
+  expect(returnAddress(back, null)).toBe(
+    "/wallet?privy_oauth_code=c1&privy_oauth_state=s1&privy_oauth_provider=google",
+  );
+  expect(returnAddress("", "/tasks")).toBeNull();
+  expect(returnAddress("?privy_oauth_code=c1&privy_oauth_state=s1", "/tasks")).toBeNull();
+});
+
+test("a_kept_page_is_only_ever_a_path_on_this_site", () => {
+  const back = "?privy_oauth_code=c&privy_oauth_state=s&privy_oauth_provider=google";
+  // Another site, a protocol-relative address, a backslash, a script, or spaces: the wallet page.
+  for (const page of [
+    "https://evil.test/x",
+    "//evil.test/x",
+    "/\\evil.test",
+    "javascript:alert(1)",
+    "tasks",
+    "/tasks with space",
+    `/${"x".repeat(3000)}`,
+  ]) {
+    keepReturnPage(page);
+    expect(sessionStorage.getItem(RETURN_PAGE_KEY), page).toBeNull();
+    sessionStorage.setItem(RETURN_PAGE_KEY, page);
+    expect(returnAddress(back, takeReturnPage()), page).toMatch(/^\/wallet\?privy_oauth_code=c&/);
+  }
+  // Privy's own parameters are not kept with the page.
+  keepReturnPage("/tasks?privy_oauth_code=old&x=1");
+  expect(sessionStorage.getItem(RETURN_PAGE_KEY)).toBe("/tasks?x=1");
+  sessionStorage.clear();
+  // A tab that won't keep it: nothing kept, nothing thrown.
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new Error("quota");
+  });
+  expect(() => keepReturnPage("/tasks")).not.toThrow();
+  vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+    throw new Error("denied");
+  });
+  expect(takeReturnPage()).toBeNull();
+  vi.restoreAllMocks();
 });
 
 test("the_steps_are_privy_s_headless_hooks", async () => {

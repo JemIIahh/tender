@@ -379,7 +379,13 @@ test("a_google_login_leaves_and_comes_back_and_a_refused_gift_says_so_with_the_f
   await expect(connectWindow(page).getByTestId("account-stuck")).toHaveText(
     "Tender isn't sending NEAR for fees right now.",
   );
+  // Google was sent back to the site's origin (the root), the one listed address, and the landing
+  // sent the person on to the page they started on, which is where they are.
   await expect(page).toHaveURL(/\/wallet$/);
+  expect(await page.evaluate(() => sessionStorage.getItem("tender.e2e.privy.redirect"))).toBe(
+    new URL(page.url()).origin,
+  );
+  expect(await page.evaluate(() => sessionStorage.getItem("tender.connect.return"))).toBeNull();
   expect(world.gifts).toEqual([`Bearer e2e-login-token ${ACCOUNT}`]);
   const faucet = connectWindow(page).getByRole("link", { name: "Open the faucet" });
   await expect(faucet).toHaveAttribute("href", "https://near-faucet.io/");
@@ -397,15 +403,17 @@ test("a_google_sign_in_turned_down_says_so_in_the_window_with_every_way_still_th
 }) => {
   const world = await loginWorld(page, { login: "google", oauth: "deny" });
   await page.setViewportSize(LAPTOP);
-  await page.goto("/wallet");
+  // A page with a query of its own: the person comes back to it whole.
+  await page.goto("/wallet?from=e2e");
   await openWindow(page);
   await connectWindow(page).getByRole("button", { name: "Continue with Google" }).click();
 
-  // Back from "Google" with no login: the window opens again, says so, and offers every way.
+  // Back from "Google" (by the root) with no login: the window opens again on the page the person
+  // started on, says so, and offers every way.
   await expect(connectWindow(page).getByRole("alert")).toHaveText(
     "Google sign-in didn't finish. Try again or use email.",
   );
-  await expect(page).toHaveURL(/\/wallet$/);
+  await expect(page).toHaveURL(/\/wallet\?from=e2e$/);
   await expect(connectWindow(page).getByLabel("Email address")).toBeVisible();
   await expect(
     connectWindow(page).getByRole("button", { name: "Continue with Google" }),

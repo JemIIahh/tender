@@ -8,8 +8,8 @@ import { type ReactNode, useEffect, useRef, useSyncExternalStore } from "react";
 // here (next.config.ts, under TENDER_E2E_PRIVY_KIT=1, which no other build sets). It has the hooks
 // lib/privyKit.tsx uses, with Privy's shapes: an email login whose code is the one the spec set
 // (`window.__tenderPrivyStub`; any other is Privy's "invalid_credentials"), a Google login that
-// leaves the page and comes back to it with Privy's `privy_oauth_*` parameters (no Google is
-// reached), a NEAR wallet at the address the spec set, and a login that lasts for the tab
+// leaves the page and comes back to the app's `customOAuthRedirectUrl` with Privy's `privy_oauth_*`
+// parameters (no Google is reached), a NEAR wallet at the address the spec set, and a login that lasts for the tab
 // (sessionStorage), as Privy's lasts across a reload. It signs nothing: the specs that use it send
 // no transaction.
 
@@ -80,7 +80,21 @@ const subscribe = (listener: () => void) => {
   };
 };
 
-export function PrivyProvider({ children }: { appId: string; children: ReactNode }) {
+/** The address the app gave for Google's return (`customOAuthRedirectUrl`), as Privy keeps it. */
+let customRedirect: string | undefined;
+
+/** The address the stand-in last sent the person back to, as the app gave it, for the spec. */
+export const REDIRECT_RECORD = "tender.e2e.privy.redirect";
+
+export function PrivyProvider({
+  children,
+  config,
+}: {
+  appId: string;
+  children: ReactNode;
+  config?: { customOAuthRedirectUrl?: string };
+}) {
+  customRedirect = config?.customOAuthRedirectUrl;
   return <>{children}</>;
 }
 
@@ -134,9 +148,11 @@ export function useLoginWithOAuth(callbacks: LoginCallbacks) {
     else end();
   }, []);
   return {
-    // Leaves the page and comes back to it, as a Google login does, with no Google in between.
+    // Leaves the page and comes back, as a Google login does, with no Google in between: to
+    // `customOAuthRedirectUrl`, as Privy does, or to the page itself without one.
     initOAuth: async ({ provider }: { provider: string }) => {
-      const url = new URL(window.location.href);
+      const url = new URL(customRedirect ?? window.location.href);
+      sessionStorage.setItem(REDIRECT_RECORD, customRedirect ?? "(the page itself)");
       url.searchParams.set("privy_oauth_code", settings().oauth === "deny" ? "denied" : "e2e-code");
       url.searchParams.set("privy_oauth_state", "e2e-state");
       url.searchParams.set("privy_oauth_provider", provider);

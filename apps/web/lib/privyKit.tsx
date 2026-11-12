@@ -15,6 +15,7 @@ import {
 } from "@privy-io/react-auth/extended-chains";
 import { useEffect } from "react";
 import { createRoot } from "react-dom/client";
+import { oauthRedirectUrl } from "./lastWay";
 import type { PrivyBridge, PrivyKit, PrivyUser } from "./privy";
 
 // Privy's React kit, mounted in a React root of its own at the end of the page, with one component
@@ -73,6 +74,9 @@ export function mountPrivyKit(
       appId={appId}
       {...(clientId === null ? {} : { clientId })}
       config={{
+        // Google sends the person back to the site's root, the one address Privy's dashboard
+        // lists for this origin; the landing sends them on to the page they started on.
+        customOAuthRedirectUrl: oauthRedirectUrl(window.location.origin),
         // No `loginMethods` here: a value here would override the dashboard's, and the owner
         // chooses them there (email and Google, which the app's Connect window offers;
         // docs/RUNBOOK.md).
