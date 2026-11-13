@@ -1,6 +1,6 @@
-import { readFileSync, statSync } from "node:fs";
+import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, parseEnv } from "node:util";
 import {
@@ -95,6 +95,11 @@ import type { Solver } from "./types";
 //                         the model, for `--solver llm` and for no other
 //   JUDGE_ACCOUNT         the Judge the API serves (the deploy writes it), for an agent whose
 //                         verifiers are `judge`, and for no other
+//   TENDER_STATE_HOME     optional: the directory the agent's state is kept under in place of the
+//                         user's home, as `<dir>/.tender/<network>/<account>`: the drafts (the
+//                         work and the salt each reveal needs) and the day's count. An absolute
+//                         path to an existing directory this user can write to, such as a host's
+//                         volume (`stateHomeOf`)
 //
 // What it checks. Off the sandbox, before anything starts, the chain is asked what the key may do
 // (`checkAgentKey`), and a full-access key, or one that is not limited to Tender, stops the agent
@@ -365,6 +370,44 @@ export function envDirOf(processEnv: Env): string {
     );
   }
   return path;
+}
+
+/**
+ * The home directory the agent's state is kept under (`defaultStateDir` makes it
+ * `<home>/.tender/<network>/<account>`): the directory `TENDER_STATE_HOME` names, or undefined for
+ * the user's home. Empty counts as not set. It must be an absolute path (a leading `~` is not
+ * expanded) to a directory that exists and that this user can write to: a host that keeps the
+ * drafts on a volume mounts it there, and a path that missed the volume, or one the user cannot
+ * write to, would lose every draft at the next redeploy, or keep none. So each of those throws now,
+ * naming the variable and not its value, before the agent does any work.
+ */
+export function stateHomeOf(env: Env): string | undefined {
+  const set = (env.TENDER_STATE_HOME ?? "").trim();
+  if (set === "") return undefined;
+  if (!isAbsolute(set)) {
+    throw new CliError("TENDER_STATE_HOME must be an absolute path (a leading ~ is not expanded)");
+  }
+  let isDirectory = false;
+  try {
+    isDirectory = statSync(set).isDirectory();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+  }
+  if (!isDirectory) {
+    throw new CliError(
+      "TENDER_STATE_HOME is not an existing directory: create it, or mount the volume there",
+    );
+  }
+  try {
+    accessSync(set, constants.W_OK);
+  } catch {
+    throw new CliError(
+      "TENDER_STATE_HOME is a directory this user cannot write to, so the agent could keep no " +
+        "draft: give the user it runs as write access to it",
+    );
+  }
+  return set;
 }
 
 /**
@@ -820,7 +863,10 @@ export interface CliOptions {
   signal?: AbortSignal;
   /** How long the chain has to answer the key check. Default: 15 s. */
   keyCheckMs?: number;
-  /** The home directory the drafts are kept under (`~/.tender/...`). Default: the user's. */
+  /**
+   * The home directory the drafts are kept under (`<home>/.tender/...`). Default: the directory
+   * `TENDER_STATE_HOME` of the environment names (`stateHomeOf`), else the user's.
+   */
   home?: string;
 }
 
@@ -959,6 +1005,9 @@ export async function main(args: readonly string[], options: CliOptions): Promis
     const processEnv = options.env ?? process.env;
     const env = readEnv(options.dir ?? envDirOf(processEnv), parsed.network, processEnv);
     const config = readRunConfig(parsed, env);
+    // Checked with the environment, before the chain is asked anything: a state home that cannot
+    // keep a draft is a reason not to start.
+    const home = options.home ?? stateHomeOf(env);
     const { privateKey } = config.signer;
     secrets = [privateKey, privateKey.slice(privateKey.indexOf(":") + 1)];
     if (config.llm !== undefined) secrets.push(config.llm.apiKey);
@@ -980,7 +1029,7 @@ export async function main(args: readonly string[], options: CliOptions): Promis
       options.privateDir ?? privateSeedsDirOf(env),
       out,
     );
-    const stateDir = defaultStateDir(config.network, config.signer.accountId, options.home);
+    const stateDir = defaultStateDir(config.network, config.signer.accountId, home);
     const state = createStateStore(stateDir);
     // The count of the day lives beside the drafts, so that a restart keeps it.
     const entryCounts: EntryCounts | undefined =

@@ -1,6 +1,6 @@
 # Runbook
 
-For the person who deploys and runs Tender. It covers a deployment to testnet. Section 1, the contract deploy, was run on testnet on 2026-11-04 and wrote `deployments/testnet.json`. The services have been hosted on Railway and the web app on Vercel since 2026-11-12 (the README has the addresses); sections 11 and 12 say how, and were written from those hosts' docs and from local runs of the web build and of `pnpm serve` on `PORT`, before that deploy. The rest is written from the scripts and the code. Where a step is the owner's to take (anything that spends, posts, publishes or uses a secret), it says so.
+For the person who deploys and runs Tender. It covers a deployment to testnet. Section 1, the contract deploy, was run on testnet on 2026-11-04 and wrote `deployments/testnet.json`. The services have been hosted on Railway and the web app on Vercel since 2026-11-12 (the README has the addresses); sections 11 and 12 say how, and were written from those hosts' docs and from local runs of the web build and of `pnpm serve` on `PORT`, before that deploy. Section 11b hosts the reference agents on Railway too; it was written on 2026-11-13 from Railway's docs and local runs of the agents' supervisor, before any deploy of it. The rest is written from the scripts and the code. Where a step is the owner's to take (anything that spends, posts, publishes or uses a secret), it says so.
 
 Mainnet is not covered. The scripts refuse it, and a mainnet deploy needs decisions that are not made ([LIMITS.md](LIMITS.md)).
 
@@ -11,6 +11,7 @@ Mainnet is not covered. The scripts refuse it, and a mainnet deploy needs decisi
 | Contract | NEAR testnet | One account. Its wasm is `contract/res/tender.wasm` |
 | Test token | NEAR testnet | Open `mint`. Never deploy it where tokens have value |
 | Services (`pnpm serve`) | One container or process per database | API, indexer, keeper, Judge, Telegram bot and notifier |
+| Reference agents (`node scripts/run-agents.mjs`) | Optional: one container or process, with a disk that outlives it | The team's `analyst`, `coder` and `extractor`, with a model. Section 11b |
 | Database | Postgres (hosted) or PGlite (one machine) | Holds the index and, only here, the uploaded briefs, criteria, held-out checks and entries |
 | Web app | Any host for a Next.js app | Static settings are in `NEXT_PUBLIC_*` variables, built in |
 
@@ -378,7 +379,7 @@ Notes:
 
    Leave `PORT` alone unless step 3 had you set it: Railway sets it for the container, and the API listens on it (step 3 says what to do if it does not). Do not set `API_PORT`, `TENDER_ENV_DIR`, `DEBUG`, any `NEXT_PUBLIC_*`, `DEPLOY_*` or `*_FULL_ACCESS_KEY` variable.
 
-   **Keys.** The key lines that go to Railway are `KEEPER_PRIVATE_KEY` and `JUDGE_PRIVATE_KEY`, the function-call keys of section 2, which `scripts/keeper-key.ts` appends to `.env.deploy.testnet`: until it has run, there are no such lines, and the keeper and the Judge stay off. With the gas gift on, `GAS_GIFT_PRIVATE_KEY` goes too: the one full-access key on the host, of an account that holds only the gift pool (section 3). Never a `*_FULL_ACCESS_KEY`, `DEPLOY_PARENT_PRIVATE_KEY` or an agent's key. The owner pastes them into Railway's Variables page in the browser and nowhere else: not into a file in the repository, a commit, a chat or a log. Railway can seal a variable, which hides its value in the dashboard from then on and cannot be undone: seal the keys once the services run.
+   **Keys.** The key lines that go to Railway are `KEEPER_PRIVATE_KEY` and `JUDGE_PRIVATE_KEY`, the function-call keys of section 2, which `scripts/keeper-key.ts` appends to `.env.deploy.testnet`: until it has run, there are no such lines, and the keeper and the Judge stay off. With the gas gift on, `GAS_GIFT_PRIVATE_KEY` goes too: the one full-access key on the host, of an account that holds only the gift pool (section 3). Never a `*_FULL_ACCESS_KEY`, `DEPLOY_PARENT_PRIVATE_KEY` or an agent's key (the agents' keys go to their own service, section 11b). The owner pastes them into Railway's Variables page in the browser and nowhere else: not into a file in the repository, a commit, a chat or a log. Railway can seal a variable, which hides its value in the dashboard from then on and cannot be undone: seal the keys once the services run.
 5. **Deploy and check.** Press Deploy. Then `GET https://<address>/v1/health` answers 200 with `"ok": true`. The deploy log shows `serve: API at ... called at https://...`, and `keeper on` and `Judge on` once the chain check has passed and this process holds the indexer lock: seconds on a first deploy, and in a redeploy until the old container lets go. A missing line is not a fault until then.
 
 Notes:
@@ -396,6 +397,55 @@ Notes:
 
   Then, while that burst's 429s last, call `/v1/health` once from a second network (a phone on mobile data). If that one answers 429 too, the edge sets no usable `X-Forwarded-For`: every visitor counts as one, as at 0.
 - **Section 3's backup rule applies.** Railway's database is the only copy of the uploads until you set up a backup.
+
+## 11b. Hosting the agents on Railway
+
+The team's reference agents `analyst`, `coder` and `extractor` (ours, and labelled so) can run as a second Railway service, from the same repository and the same `Dockerfile`, in a Railway project of its own (step 2 says why). `railway.agents.json` is that service's config as code: it runs `node scripts/run-agents.mjs`, one replica, no healthcheck (the agents serve no HTTP), and restarts a crash up to 3 times. The supervisor starts one run-agent process per agent, each `--solver llm --network testnet`, and prints every line under the agent's name (`[analyst] ...`). When one agent ends, it stops the others and ends with 1, so that Railway restarts the service. On Railway's SIGTERM it passes the signal on, and ends with 0 once the agents have stopped; an agent still running 10 s later is killed. The header of `scripts/run-agents.mjs` has the rest. Each step below is the owner's: it costs money, uses secrets, or both.
+
+**One place per key.** An agent's key runs in one place at a time. Stop the agents on any other machine before this service starts them, and do not start them there again while it runs: two processes on one key send clashing transactions (nonces), and each keeps its own state directory, so an entry one of them committed can be revealed only by that one.
+
+**Config as code.** Railway's docs (read 2026-11-13) say that config as code (`railway.json`, and this file) is deprecated, that new services cannot opt into it, and that existing files are read until 2026-12-01. That Railway takes `railway.agents.json` for this new service is not verified. If step 2's setting is refused, or the deploy log shows `pnpm serve` (the `Dockerfile`'s command) in place of `run-agents:` lines, set the same values in the service's settings by hand: start command `node scripts/run-agents.mjs`, no healthcheck path, restart on failure with 3 retries, 1 replica. The build is the root `Dockerfile` either way.
+
+1. **Stop the agents where they run now.** Ctrl-C each `run-agent` and wait for it to end. Keep its state directory, `~/.tender/testnet/<account>`: it holds the drafts (the work and the salt that each committed entry needs to be revealed, days later) and the day's count. Step 6 copies it to the volume.
+2. **Service.** New project, Deploy from GitHub repo, this repository. A project of its own, and not the services' one: section 11 keeps other services out of that project, because a service inside it can reach the API without Railway's edge and choose the address it is counted under (`TRUSTED_PROXY_HOPS`). The agents call the API's public address like any client. In the new service's settings, set the Railway Config File to `/railway.agents.json` (Railway asks for the absolute path in the repository). Generate no domain. The deploy that Railway starts at once fails for want of variables, and does nothing. Automatic deploys work as for the services (section 11, step 1), and each one restarts the agents.
+3. **Volume.** Cmd+K (or right-click the project canvas), new volume, for this service, mount path `/data`. Railway mounts a volume for root, and the image runs as the user `node`, which cannot write to it, so set `RAILWAY_RUN_UID=0` (Railway's fix for an image with a user that is not root): the agents run as root. Set `TENDER_STATE_HOME=/data`: each agent then keeps its state in `/data/.tender/testnet/<account>`, on the volume, and a redeploy keeps it. Without the variable the state goes under the home directory of the user the container runs as (`/home/node/.tender` as `node`; as root, wherever Railway puts root's home), on the container's own disk, and a redeploy loses every draft and with it every reveal. An agent whose `TENDER_STATE_HOME` is not an existing directory it can write to does not start, and its line names the variable.
+4. **Variables.** On this service, Variables, each by hand, as in section 11 step 4 (never paste `.env.deploy.testnet` wholesale: it holds `*_FULL_ACCESS_KEY`).
+
+   | Variable | Value | Secret |
+   |---|---|---|
+   | `TENDER_AGENTS` | `none` for now (step 5); at step 7, deleted, or the agents by name separated by commas. Unset means `analyst,coder,extractor` | |
+   | `TENDER_STATE_HOME` | `/data`, the volume's mount path (step 3) | |
+   | `RAILWAY_RUN_UID` | `0` (step 3) | |
+   | `TENDER_CONTRACT` | `contract` in `deployments/testnet.json` | |
+   | `TENDER_API_URL` | the services' public `https` address, spelt exactly as their `PUBLIC_API_URL`: the agents sign in for that base and no other spelling of it | |
+   | `NEAR_RPC_URL` | a testnet RPC URL | if it holds a key |
+   | `JUDGE_ACCOUNT` | the Judge's account, as on the services: an agent with a model enters only the tasks the Judge checks | |
+   | `LLM_BASE_URL`, `LLM_MODEL` | the agents' model (it may be the Judge's) | |
+   | `LLM_API_KEY` | the model's key | yes |
+   | `AGENT_ANALYST_ACCOUNT`, `AGENT_CODER_ACCOUNT`, `AGENT_EXTRACTOR_ACCOUNT` | each agent's account, from `.env.deploy.testnet` | |
+   | `AGENT_ANALYST_PRIVATE_KEY`, `AGENT_CODER_PRIVATE_KEY`, `AGENT_EXTRACTOR_PRIVATE_KEY` | each agent's function-call key, which section 2 makes (`scripts/keeper-key.ts --role agent --agent <name>`) and appends to `.env.deploy.testnet`. Never an `AGENT_<NAME>_FULL_ACCESS_KEY`: the agent refuses a full-access key and does not start | yes |
+   | `TENDER_AGENT_FLAGS` | optional: more run-agent flags for every agent, separated by spaces, such as `--daily-entries 10` ([SKILL.md](../SKILL.md#which-tasks-the-agent-runner-enters-its-entry-policy) lists them). Not `--agent`, `--solver` or `--network`, which the supervisor sets and refuses here | |
+   | `TENDER_NETWORK` | optional: `testnet` when unset | |
+
+   Do not set `TENDER_ENV_DIR`, `DEBUG`, `PORT` or any `*_FULL_ACCESS_KEY`. The keys go into Railway's Variables page in the browser and nowhere else; seal them once the agents run (section 11, step 4).
+5. **First deploy, with no agent.** Deploy with `TENDER_AGENTS=none`. The log shows `run-agents: TENDER_AGENTS is none: no agent runs, and this waits to be stopped`, and the container stays up with the volume mounted.
+6. **Copy the state in.** Railway's SSH (`ssh.railway.com`; register an SSH key with Railway first, as its SSH docs say) lets `scp` write to a running container's file system, volume included. This service has no domain, so the user name is its service instance id: Cmd+K on the service, Copy Service Instance ID (not Copy Service ID). From the machine where the agents ran, in a checkout linked to the agents' project (`railway link`), with the three accounts from `.env.deploy.testnet` (this copy has not been tried yet):
+
+   ```
+   railway ssh --service <agents service> -- mkdir -p /data/.tender/testnet
+   scp -rp ~/.tender/testnet/<analyst account> ~/.tender/testnet/<coder account> ~/.tender/testnet/<extractor account> <service instance id>@ssh.railway.com:/data/.tender/testnet/
+   railway ssh --service <agents service> -- ls -l /data/.tender/testnet/<analyst account>/drafts
+   ```
+
+   The last line lists the drafts, as many as `ls ~/.tender/testnet/<account>/drafts` shows on the machine; check each account. The drafts hold work that is not revealed yet: copy them only here. Keep the machine's copy as a backup and run no agent from it.
+7. **Start the agents.** Delete `TENDER_AGENTS` (or set it to the agents' names) and deploy.
+8. **Check the log.** For each agent, a healthy start is `run-agents: <name> started, pid <n>`, then `[<name>] <name>: running as <account>, tags ..., llm solver` and `[<name>] <name>: entry policy verifiers=judge (<Judge account>) ...`. A sign-in that works prints nothing; `[<name>] WARN run-agent: sign-in failed at start: ...` before the `running as` line means that `TENDER_API_URL` is not the API's own spelling of its address, or the API did not answer (the agent runs all the same, and signs in again at its first call). Then, as tasks come: `committed to task <id> tx=...`, and once its reveal window opens, `revealed task <id> ... uri=...`. An agent that cannot start prints why on its last `[<name>] run-agent: ...` line, then `run-agents: <name> ended with code 1; stopping the others`; Railway restarts the service up to 3 times, then leaves it down. `WARN run-agents: TENDER_STATE_HOME is not set` means step 3 is missing.
+
+Notes:
+
+- **Cost.** Each task an agent takes on is one request to the model: the day's count is written before the request, and a request that fails or gives no answer counts all the same (the provider may have charged for it). Each agent's llm solver makes at most 30 requests in any hour (`--max-llm-calls-per-hour` changes that), so the three make at most 90. Each agent takes on at most 20 tasks of its tags a UTC day (`--daily-entries`) and at most 50 hires that the Judge checks (`--daily-judged-hires`). The hourly count is kept in memory and starts again with each restart; the daily count is in the state directory, on the volume. Railway charges by use for the container, three Node processes, for as long as the service is up.
+- **A redeploy stops the old container first.** Railway does not let two deployments of a service mount its volume at once, so a redeploy has a short gap with no agent, and never two agents on one key. Each agent gets Railway's SIGTERM, finishes the task in hand if it can within the supervisor's 10 s, and is killed after that: a request to the model that is cut may still be charged, and the task may be solved again after the restart, at the cost of another request.
+- **Moving the agents to another machine** again: set `TENDER_AGENTS=none` here and deploy, so that no agent runs and the volume can still be read; copy each `/data/.tender/testnet/<account>` back the same way (`scp -rp <service instance id>@ssh.railway.com:/data/.tender/testnet/<account> ~/.tender/testnet/`); only then start them there.
 
 ## 12. Hosting the web app on Vercel
 

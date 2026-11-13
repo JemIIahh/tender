@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -35,6 +35,7 @@ import {
   readEnv,
   readRunConfig,
   registrationWarning,
+  stateHomeOf,
 } from "../src/cli";
 import { ENTRY_COUNTS_FILE } from "../src/policy";
 import type { RunAgentOptions } from "../src/runner";
@@ -107,6 +108,7 @@ const dirs: string[] = [];
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -213,12 +215,20 @@ interface Setup {
   seedsDir?: string;
   /** Where they find the real seeds' solutions. Default: what the environment says. */
   privateDir?: string;
+  /**
+   * Gives `main` no home directory, so that the environment (`TENDER_STATE_HOME`) decides where
+   * the drafts go; the process's `HOME` is then the test's directory for the run. Default: a new
+   * directory of the test's, given as `home`.
+   */
+  noHome?: boolean;
 }
 
 /** Runs the command line with `args` against the setup, and reports what happened. */
 async function start(args: string[], setup: Setup = {}) {
   const dir = await dirWith(setup.files);
   const home = await dirWith();
+  // With no home given, the user's is the fallback, and that must be a directory of the test's too.
+  if (setup.noHome === true) vi.stubEnv("HOME", home);
   const out: string[] = [];
   const err: string[] = [];
   const calls: string[] = [];
@@ -269,7 +279,7 @@ async function start(args: string[], setup: Setup = {}) {
   const options: CliOptions = {
     createApi,
     ...(setup.dirFromEnv !== true && { dir }),
-    home,
+    ...(setup.noHome !== true && { home }),
     env: {
       ...(setup.env ?? ENV),
       ...(setup.dirFromEnv === true && { TENDER_ENV_DIR: dir }),
@@ -639,6 +649,84 @@ test("the_drafts_are_kept_under_the_agents_account_in_the_home_directory", async
   expect(result.code).toBe(0);
   const file = join(result.home, ".tender", "testnet", ACCOUNT, "drafts", "7.json");
   expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ taskId: "7" });
+});
+
+/** The loop of a run that saves one draft, for task 7. */
+const saveDraftSeven = async (options: RunAgentOptions) => {
+  await options.state.saveDraft({
+    taskId: "7",
+    contentBase64: "",
+    contentHash: "0".repeat(64),
+    salt: "1".repeat(64),
+    commitment: "2".repeat(64),
+  });
+};
+
+test("the_drafts_are_kept_under_TENDER_STATE_HOME_when_it_names_a_directory", async () => {
+  // A host keeps the drafts on a volume, mounted where the variable points, and not in the home of
+  // whatever user the container runs as.
+  const volume = await dirWith();
+  const result = await start(ARGS, {
+    env: { ...ENV, TENDER_STATE_HOME: volume },
+    noHome: true,
+    loop: saveDraftSeven,
+  });
+
+  expect(result.code).toBe(0);
+  const file = join(volume, ".tender", "testnet", ACCOUNT, "drafts", "7.json");
+  expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ taskId: "7" });
+  // And nothing under the home directory.
+  await expect(
+    readFile(join(result.home, ".tender", "testnet", ACCOUNT, "drafts", "7.json")),
+  ).rejects.toMatchObject({ code: "ENOENT" });
+
+  // A home that the caller gives wins over the variable, as the tests give theirs.
+  const given = await start(ARGS, {
+    env: { ...ENV, TENDER_STATE_HOME: volume },
+    loop: saveDraftSeven,
+  });
+  expect(given.code).toBe(0);
+  const there = join(given.home, ".tender", "testnet", ACCOUNT, "drafts", "7.json");
+  expect(JSON.parse(await readFile(there, "utf8"))).toMatchObject({ taskId: "7" });
+
+  // Set to nothing, it is not set: the user's home is used, which this test does not write to.
+  expect(stateHomeOf({ TENDER_STATE_HOME: "  " })).toBeUndefined();
+  expect(stateHomeOf({})).toBeUndefined();
+  expect(stateHomeOf({ TENDER_STATE_HOME: volume })).toBe(volume);
+});
+
+test("a_TENDER_STATE_HOME_that_cannot_keep_a_draft_stops_the_agent_before_the_chain_is_asked", async () => {
+  const volume = await dirWith({ "a-file": "" });
+  const unwritable = await dirWith();
+  await chmod(unwritable, 0o500);
+  const cases: Array<[string, string]> = [
+    ["relative/state", "TENDER_STATE_HOME must be an absolute path"],
+    ["~/state", "TENDER_STATE_HOME must be an absolute path"],
+    [join(volume, "missing"), "TENDER_STATE_HOME is not an existing directory"],
+    [join(volume, "a-file"), "TENDER_STATE_HOME is not an existing directory"],
+  ];
+  // Root may write anywhere, so the mode tells nothing when the tests run as root.
+  if (process.getuid?.() !== 0) {
+    cases.push([unwritable, "TENDER_STATE_HOME is a directory this user cannot write to"]);
+  }
+
+  try {
+    for (const [value, sentence] of cases) {
+      const result = await start(ARGS, {
+        env: { ...ENV, TENDER_STATE_HOME: value },
+        noHome: true,
+        loop: saveDraftSeven,
+      });
+      expect(result.code).toBe(1);
+      expect(said(result)).toContain(`run-agent: ${sentence}`);
+      // The message names the variable and never its value.
+      expect(said(result)).not.toContain(value);
+      // Nothing was asked of the chain, and the agent did not run.
+      expect(result.calls).toEqual([]);
+    }
+  } finally {
+    await chmod(unwritable, 0o700);
+  }
 });
 
 // ---- The environment --------------------------------------------------------------------------
