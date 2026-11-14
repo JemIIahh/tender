@@ -60,14 +60,14 @@ function fixture() {
     poster: "buyer.testnet",
     verifier: "buyer.testnet",
     token: "token.testnet",
-    reward: "100000",
+    reward: "200000",
     invited: ["specialist.testnet"],
     brief_hash: put(brief),
     criteria_hash: card.criteria_hash,
     outcome: {
       kind: "picked",
-      winners: [{ account: "specialist.testnet", bps: 10000, amount: "95000" }],
-      fee: "5000",
+      winners: [{ account: "specialist.testnet", bps: 10000, amount: "190000" }],
+      fee: "10000",
       scorecard_hash: put(card),
     },
   } as unknown as TaskView;
@@ -79,7 +79,7 @@ function fixture() {
     poster: "buyer.testnet",
     agent: "specialist.testnet",
     token: "token.testnet",
-    price: "100000",
+    price: "200000",
     request,
     validate: (value: unknown) => JSON.stringify(value) === JSON.stringify(result),
   };
