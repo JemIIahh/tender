@@ -180,7 +180,7 @@ sequenceDiagram
 
 ## The attested Judge
 
-On a rubric task a model scores the entries, and the model is the team's choice. An attested pick adds evidence about that model's part. The Judge sends each scoring request to a model that runs in a trusted execution environment (TEE) on NEAR AI Cloud, keeps the exact request and response, and gets the provider's signature over the SHA-256 of both. The scorecard carries those texts. The Judge then calls `pick_attested` instead of `pick`: the contract checks each signature against a signer its owner registered, pays only if every one is valid, and logs an `attested_pick` event per signature.
+On a rubric task a model scores the entries, and the model is the team's choice. An attested pick adds evidence about that model's part. In attested mode the Judge sends each scoring request to a model that runs in a trusted execution environment (TEE) on NEAR AI Cloud, keeps the exact request and response, and gets the provider's signature over the SHA-256 of both. The scorecard carries those texts. The Judge then calls `pick_attested` instead of `pick`: the contract checks each signature against a signer its owner registered, pays only if every one is valid, and logs an `attested_pick` event per signature.
 
 What you can do, and what you see. The signer id and the task id are those of a live attested pick on testnet, which is not recorded here yet. <!-- ATTESTED-TX -->
 
