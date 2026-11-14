@@ -73,6 +73,11 @@ export {
 //   take 60 s and its retry as long, an entry is cut to 16 000 characters, and a rubric has at most
 //   20 criteria of at most 200 characters, so that a reply fits. The key's credits are the team's
 //   money.
+// - An attested Judge (`JudgeDeps.attested`) sends the same requests to NEAR AI Cloud's TEE model as
+//   exact bytes through `attestedComplete` instead of the client, and checks each completion's
+//   signature before it reads the reply; one that cannot be had or does not hold fails the task
+//   closed (no entry can make a TEE signature fail). It grades at most `ATTESTED_MAX_ENTRIES` (6)
+//   entries, so that a task's at most 12 signatures fit one `pick_attested`.
 // - What a failure says names the failure and nothing it came from. The client's own messages
 //   quote the server's words, and a server that rejects a key can repeat part of it, so no reason,
 //   log line or error here is built from one.

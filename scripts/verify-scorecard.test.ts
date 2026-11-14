@@ -267,7 +267,16 @@ test("a_network_named_beside_a_node_is_named_with_it", async () => {
 
 const FIXTURE = JSON.parse(
   readFileSync(new URL("../docs/research/S1-fixture.json", import.meta.url), "utf8"),
-) as Record<string, string>;
+) as {
+  model: string;
+  text: string;
+  signature: string;
+  signing_address: string;
+  request_sha256: string;
+  response_sha256: string;
+  request: string;
+  response: string;
+};
 const ATTESTATION = {
   signer_id: "nearai-qwen3.8",
   model: FIXTURE.model,

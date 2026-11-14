@@ -13,6 +13,7 @@ import { KeyPair, type KeyPairString } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
 import { REPO_ROOT } from "./lib/env";
 import {
+  checkAttestedSigner,
   checkGasGiftKey,
   checkJudgeKey,
   checkKeeperKey,
@@ -2288,4 +2289,47 @@ test("judge_attested_needs_the_near_ai_cloud_model_and_a_signer", () => {
     "JUDGE_ATTESTED_SIGNER_ID and JUDGE_ATTESTED_EXTRA_BODY are used only with JUDGE_ATTESTED=1, " +
       "which is not set, so the Judge is not attested",
   ]);
+});
+
+test("an_attested_judge_starts_only_with_its_signer_registered_for_its_model", async () => {
+  const judge = {
+    llm: { baseUrl: "https://cloud-api.near.ai/v1", apiKey: "k", model: "Qwen/Qwen3.8-27B" },
+    attested: { signerId: "nearai-qwen3.8" },
+  };
+  const signer = {
+    signer_id: "nearai-qwen3.8",
+    algo: "ecdsa",
+    address: "0x835ab53d20294ef795906dff21ae4c045336aa26",
+    model: "Qwen/Qwen3.8-27B",
+    enabled: true,
+  };
+  const answering = (answer: typeof signer | null) => ({
+    getAttestedSigner: vi.fn(async () => answer),
+  });
+  const ok = answering(signer);
+  await expect(checkAttestedSigner(ok, judge)).resolves.toBeUndefined();
+  expect(ok.getAttestedSigner).toHaveBeenCalledWith("nearai-qwen3.8");
+
+  // Not attested: the chain is not asked.
+  const unasked = answering(null);
+  await expect(checkAttestedSigner(unasked, { ...judge, attested: undefined })).resolves.toBe(
+    undefined,
+  );
+  expect(unasked.getAttestedSigner).not.toHaveBeenCalled();
+
+  await expect(checkAttestedSigner(answering(null), judge)).rejects.toThrow(
+    "the contract has no attested signer nearai-qwen3.8. Register it with " +
+      "scripts/register-signer.ts --signer-id nearai-qwen3.8 --model Qwen/Qwen3.8-27B",
+  );
+  for (const wrong of [{ enabled: false }, { model: "z-ai/glm-5.3-flash" }, { algo: "ed25519" }]) {
+    await expect(checkAttestedSigner(answering({ ...signer, ...wrong }), judge)).rejects.toThrow(
+      "is not an enabled ecdsa signer for LLM_MODEL",
+    );
+  }
+  const down = {
+    getAttestedSigner: vi.fn(async () => Promise.reject(new Error("no such method"))),
+  };
+  await expect(checkAttestedSigner(down, judge)).rejects.toThrow(
+    "cannot ask the chain for the attested signer nearai-qwen3.8",
+  );
 });

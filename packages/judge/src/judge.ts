@@ -183,6 +183,16 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  * `judgeEntries`'s; a task with no entries is picked as before, and one with some scored is
  * picked from those. Then the entries are ranked, the winners chosen, and the scorecard built
  * from exactly the winners `pick` is sent.
+ * An attested Judge (`deps.attested`) grades a `rubric` task the same way, but every request goes
+ * to NEAR AI Cloud's TEE model through `attestedComplete`, whose signature is checked as it comes:
+ * one that cannot be had or does not hold fails the task closed. It grades the first 6 entries in
+ * commit order (`ATTESTED_MAX_ENTRIES`, so that the at most 12 signatures fit one `pick_attested`)
+ * and the rest are on the scorecard as not scored. The attestations of the completions the results
+ * rest on are kept with what judging found out, go on the scorecard (`attestations`, with the
+ * signer id), and the task is settled with `pickAttested`, which the contract checks against the
+ * registered signer before it pays. A task whose grading asked the model nothing is settled with
+ * `pick`, as `pick_attested` takes at least one signature. Other kinds are as without it.
+ *
  * The scorecard is stored as a public blob, the held-out checks are made public, and `pick` is
  * called with the scorecard's hash and URI, in that order, so that the pick never points at
  * something that cannot be read. A retry stores the same scorecard again unless the clock moved:

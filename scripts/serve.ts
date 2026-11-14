@@ -1263,6 +1263,45 @@ export function checkJudgeKey(
   );
 }
 
+/**
+ * For an attested Judge: the contract must hold `JUDGE_ATTESTED_SIGNER_ID` as an enabled ecdsa
+ * signer for `LLM_MODEL` (`get_attested_signer`), as `scripts/register-signer.ts` registers it, or
+ * every `pick_attested` would be refused and the tasks left to their fallback windows. It throws,
+ * so the Judge does not start, when the signer is missing, disabled, for another model, or the
+ * chain cannot be asked (a contract without `pick_attested` cannot answer). Nothing to check for a
+ * Judge that is not attested.
+ */
+export async function checkAttestedSigner(
+  client: Pick<TenderClient, "getAttestedSigner">,
+  judge: Pick<JudgeConfig, "attested" | "llm">,
+): Promise<void> {
+  const { attested, llm } = judge;
+  if (attested === undefined || llm === undefined) return;
+  const register =
+    `Register it with scripts/register-signer.ts --signer-id ${attested.signerId} ` +
+    `--model ${llm.model}, or unset JUDGE_ATTESTED.`;
+  let signer: Awaited<ReturnType<TenderClient["getAttestedSigner"]>>;
+  try {
+    signer = await withinDeadline(
+      KEY_CHECK_DEADLINE_MS,
+      client.getAttestedSigner(attested.signerId),
+    );
+  } catch (error) {
+    throw new Error(
+      `cannot ask the chain for the attested signer ${attested.signerId} (${describe(error)}), ` +
+        "and an attested Judge does not start with a signer that was not checked",
+    );
+  }
+  if (signer === null) {
+    throw new Error(`the contract has no attested signer ${attested.signerId}. ${register}`);
+  }
+  if (!signer.enabled || signer.algo !== "ecdsa" || signer.model !== llm.model) {
+    throw new Error(
+      `the attested signer ${attested.signerId} is not an enabled ecdsa signer for LLM_MODEL. ${register}`,
+    );
+  }
+}
+
 // ---- The gas gift's key -----------------------------------------------------------------------
 
 /**
@@ -1738,6 +1777,7 @@ export async function startServices(
     if (config.keeper !== undefined) await checkKeeperKey(client, config.keeper, contractId);
     if (config.judge !== undefined) await checkJudgeKey(client, config.judge, contractId);
   }
+  if (config.judge !== undefined) await checkAttestedSigner(client, config.judge);
   // On the sandbox too: a key that cannot send NEAR fails every gift there as well.
   if (config.gasGift !== undefined) await checkGasGiftKey(client, config.gasGift);
   /** A client that signs as the account of `key`, with it. */
