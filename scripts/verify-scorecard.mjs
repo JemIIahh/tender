@@ -25,7 +25,7 @@
 // It prints one verdict, and exits with its code:
 //   0  VERIFIED       everything that exists matches;
 //   1  MISMATCH       a hash does not: the scorecard served, or the held-out checks it publishes,
-//                     are not what the chain committed to;
+//                     are not what the chain committed to, or an attestation does not hold;
 //   2                 it could not look (a usage error, a node or an API that did not answer);
 //   3  NOT PUBLISHED  the scorecard is the one the chain pinned, but it publishes no held-out
 //                     checks for a task that committed to some.
@@ -219,7 +219,9 @@ const usage = (problem) => {
 const HELP = `${USAGE}
 
 Checks a settled task's scorecard against the chain: the held-out checks it publishes against the
-task's heldout_commitment, and the scorecard's bytes against the outcome's scorecard_hash.
+task's heldout_commitment, and the scorecard's bytes against the outcome's scorecard_hash. A
+scorecard from the attested Judge has each TEE attestation checked too (the bodies re-hashed, the
+signature recovered, the signer read from the contract): ATTESTED, or NOT ATTESTED and MISMATCH.
 --contract, --api, --network and --rpc default to TENDER_CONTRACT, TENDER_API_URL, TENDER_NETWORK
 (else testnet, unless --rpc names a node) and NEAR_RPC_URL. No key is needed or read.
 
