@@ -92,6 +92,9 @@ impl Tender {
     /// send them, as long as it is not a delegate key. A verifier with no delegate key may also
     /// pick through a relayer, or be a contract, such as a DAO, that picks in a cross-contract
     /// call.
+    ///
+    /// `pick_attested` is this method with TEE attestations attached. The two share
+    /// `settle_pick`, so every rule above holds for both, in the same order.
     #[deny_unknown_arguments]
     pub fn pick(
         &mut self,
@@ -3121,6 +3124,20 @@ mod tests {
                 vec![unknown],
                 "no signer is registered as nobody",
             );
+            // An id longer than any signer id, or longer than a storage key may be, is refused
+            // without a lookup.
+            for bad in [
+                "x".repeat(65),
+                "x".repeat(5_000),
+                "Upper".to_string(),
+                String::new(),
+            ] {
+                let invalid = AttestationArg {
+                    signer_id: bad,
+                    ..real()
+                };
+                assert_refused(&mut t, id, vec![invalid], "is not a registrable signer id");
+            }
             let (address, model) = (fixture("signing_address"), fixture("model"));
             try_set_signer(&mut t, OWNER, SIGNER, "ecdsa", &address, &model, false).unwrap();
             assert_refused(&mut t, id, vec![real()], "signer nearai-qwen is disabled");

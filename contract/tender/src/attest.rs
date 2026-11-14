@@ -247,6 +247,13 @@ pub(crate) fn check_attestations(
                 ));
             }
             let signer_id = a.signer_id.as_str();
+            // An id that could never be registered is not looked up, nor repeated in the message:
+            // it may be longer than a storage key can be.
+            if !valid_signer_id(signer_id) {
+                bad_attestation(format!(
+                    "attestation {i}: signer_id is not a registrable signer id"
+                ));
+            }
             let signer = read_signer(signer_id).unwrap_or_else(|| {
                 bad_attestation(format!(
                     "attestation {i}: no signer is registered as {signer_id}"
