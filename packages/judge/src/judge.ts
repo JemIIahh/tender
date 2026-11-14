@@ -1,10 +1,20 @@
 import { type Db, putBlob, setBlobPublic } from "@tender/db";
-import { type EntryView, phaseOfTaskView, sha256Hex, type TaskView } from "@tender/shared";
+import {
+  type EntryView,
+  MAX_ATTESTATIONS,
+  phaseOfTaskView,
+  type ScorecardAttestation,
+  sha256Hex,
+  type TaskView,
+} from "@tender/shared";
+import type { Attestation } from "./attest";
 import { FETCH_TIMEOUT_MS, fetchEntryContent, ownBlobHash } from "./fetch";
 import { loadDocuments, type TaskDocuments } from "./intake";
 import { COMPILE_BUDGET_MS, openTaskScorer, type TaskScorer, TaskWorkers } from "./isolate";
 import { zero } from "./kinds/common";
 import {
+  ATTESTED_LEFT_OUT,
+  ATTESTED_MAX_ENTRIES,
   LEFT_OUT,
   NO_USABLE_REPLY,
   prepareRubric,
@@ -77,6 +87,13 @@ const NOT_ALL_GRADED = "not judged: not every entry could be graded before the p
  * the first ones were never graded, so it is not picked.
  */
 const NONE_OF_THE_FIRST_PASSED = `not judged: none of the first ${RUBRIC_MAX_ENTRIES} entries passed, and the others were not scored`;
+/** `NONE_OF_THE_FIRST_PASSED` for an attested Judge, which grades fewer (`ATTESTED_MAX_ENTRIES`). */
+const NONE_OF_THE_ATTESTED_PASSED = `not judged: none of the first ${ATTESTED_MAX_ENTRIES} entries passed, and the others were not scored`;
+/**
+ * The `judge_reason` of a task an attested Judge graded with more completions than `pick_attested`
+ * takes. Its entry cap keeps that from happening; this is the guard if it ever does.
+ */
+const TOO_MANY_ATTESTATIONS = `the task took more than ${MAX_ATTESTATIONS} model requests, more than pick_attested takes`;
 
 /** An entry that has revealed its content's hash and where the content is. */
 type RevealedEntry = EntryView & { content_hash: string; uri: string };
@@ -166,6 +183,16 @@ type RevealedEntry = EntryView & { content_hash: string; uri: string };
  * `judgeEntries`'s; a task with no entries is picked as before, and one with some scored is
  * picked from those. Then the entries are ranked, the winners chosen, and the scorecard built
  * from exactly the winners `pick` is sent.
+ * An attested Judge (`deps.attested`) grades a `rubric` task the same way, but every request goes
+ * to NEAR AI Cloud's TEE model through `attestedComplete`, whose signature is checked as it comes:
+ * one that cannot be had or does not hold fails the task closed. It grades the first 6 entries in
+ * commit order (`ATTESTED_MAX_ENTRIES`, so that the at most 12 signatures fit one `pick_attested`)
+ * and the rest are on the scorecard as not scored. The attestations of the completions the results
+ * rest on are kept with what judging found out, go on the scorecard (`attestations`, with the
+ * signer id), and the task is settled with `pickAttested`, which the contract checks against the
+ * registered signer before it pays. A task whose grading asked the model nothing is settled with
+ * `pick`, as `pick_attested` takes at least one signature. Other kinds are as without it.
+ *
  * The scorecard is stored as a public blob, the held-out checks are made public, and `pick` is
  * called with the scorecard's hash and URI, in that order, so that the pick never points at
  * something that cannot be read. A retry stores the same scorecard again unless the clock moved:
@@ -209,6 +236,13 @@ export async function judgeTask(
   let model: string | null = null;
   // The entries of a rubric task after the first 50 in commit order, which are not scored.
   let leftOut: RevealedEntry[] = [];
+  // For a rubric task an attested Judge grades: the attestations its results rest on, kept with
+  // what judging found out, so that a turn or a pick tried again keeps them. `undefined` otherwise.
+  let attestations: Attestation[] | undefined;
+  // How many entries of a rubric task are graded, and the reason the rest have.
+  const attested = deps.attested !== undefined;
+  const maxEntries = attested ? ATTESTED_MAX_ENTRIES : RUBRIC_MAX_ENTRIES;
+  const leftOutReason = attested ? ATTESTED_LEFT_OUT : LEFT_OUT;
   try {
     const loaded = await loadDocuments(deps.db, task, {
       teamAccounts: deps.teamAccounts,
@@ -238,12 +272,21 @@ export async function judgeTask(
     if (kindCriteria.kind === "rubric") {
       // P05-R21: the first 50 revealed entries in commit order are graded, chosen before anything
       // else orders them (`judgeEntries` takes ours first), and the rest are not scored.
+      // An attested Judge grades the first 6 (`ATTESTED_MAX_ENTRIES`), so that the signatures fit
+      // one `pick_attested`.
       const ordered = revealed.toSorted(inCommitOrder);
-      revealed = ordered.slice(0, RUBRIC_MAX_ENTRIES);
-      leftOut = ordered.slice(RUBRIC_MAX_ENTRIES);
+      revealed = ordered.slice(0, maxEntries);
+      leftOut = ordered.slice(maxEntries);
+      if (attested) {
+        progress.attestations ??= [];
+        attestations = progress.attestations;
+      }
+      const kept = attestations;
       // A rubric needs the network, so it is graded on this thread and not in a worker. It fails
       // closed before any request when it cannot be graded at all.
-      const rubric = await prepareRubric(deps, task, kindCriteria);
+      const rubric = await prepareRubric(deps, task, kindCriteria, (graded) => {
+        kept?.push(...graded);
+      });
       if ("failedClosed" in rubric) {
         return forget(deps, taskId, await failClosed(deps, taskId, rubric.failedClosed));
       }
@@ -323,8 +366,13 @@ export async function judgeTask(
   // P05-R21: an empty pick refunds the task at once, and the entries after the first 50 were never
   // graded. When none of the first passed, the task is left to its fallback window instead.
   if (leftOut.length > 0 && !judged.entries.some((entry) => entry.passed)) {
-    const why = `none of the first ${RUBRIC_MAX_ENTRIES} entries passed, and the others were not scored`;
-    return notJudged(deps, taskId, NONE_OF_THE_FIRST_PASSED, why);
+    const why = `none of the first ${maxEntries} entries passed, and the others were not scored`;
+    const reason = attested ? NONE_OF_THE_ATTESTED_PASSED : NONE_OF_THE_FIRST_PASSED;
+    return notJudged(deps, taskId, reason, why);
+  }
+  // An attested Judge's signatures must fit one `pick_attested`. Its entry cap sees to that.
+  if (attestations !== undefined && attestations.length > MAX_ATTESTATIONS) {
+    return forget(deps, taskId, await failClosed(deps, taskId, TOO_MANY_ATTESTATIONS));
   }
   // A worker could not compile the criteria again, in the task's last stretch: the machine's load,
   // not the criteria's fault. The entries left have no score, and the task is picked from those
@@ -340,7 +388,7 @@ export async function judgeTask(
   // The entries after a rubric task's first 50 are on the scorecard too, with the rule for reason.
   const ranked = rankEntries([
     ...judged.entries,
-    ...leftOut.map((entry) => scoredEntry(entry, zero(LEFT_OUT))),
+    ...leftOut.map((entry) => scoredEntry(entry, zero(leftOutReason))),
   ]);
   // The one list of winners: the scorecard states it and `pick` pays it.
   const winners = chooseWinners(ranked, criteria, task.max_winners);
@@ -356,6 +404,7 @@ export async function judgeTask(
       winners,
       model,
       now: clock(),
+      attestations: scorecardAttestations(deps, attestations),
     });
   } catch (error) {
     return retryLater(taskId, `the scorecard could not be built (${describeError(error)})`);
@@ -384,7 +433,23 @@ export async function judgeTask(
   if (task.heldout_commitment !== null) await setBlobPublic(deps.db, task.heldout_commitment, true);
   const uri = `${deps.publicUrl.replace(/\/+$/, "")}/v1/blobs/${sha256}`;
   try {
-    await deps.client.pick(taskId, winners, sha256, uri);
+    // Scores that rest on attested completions are settled with their signatures, which the
+    // contract checks before it pays; the rest with `pick`, as always.
+    if (attestations !== undefined && attestations.length > 0) {
+      if (deps.client.pickAttested === undefined || deps.attested === undefined) {
+        return retryLater(taskId, "this Judge's chain client cannot call pick_attested");
+      }
+      const { signerId } = deps.attested;
+      await deps.client.pickAttested(
+        taskId,
+        winners,
+        sha256,
+        uri,
+        attestations.map(({ text, signature }) => ({ signer_id: signerId, text, signature })),
+      );
+    } else {
+      await deps.client.pick(taskId, winners, sha256, uri);
+    }
   } catch (error) {
     if (codeOf(error) === "E_SETTLED") return forget(deps, taskId, "skipped");
     // What was found out stays, and the next try picks with it.
@@ -393,6 +458,16 @@ export async function judgeTask(
   // A reason an earlier tick left, `not judged: …` say, would say otherwise of a picked task.
   await deps.db.query("update tasks set judge_reason = null where id = $1", [taskId]);
   return forget(deps, taskId, winners.length === 0 ? "no_award" : "picked");
+}
+
+/** The scorecard's `attestations`: each with the signer it is registered as. */
+function scorecardAttestations(
+  deps: JudgeDeps,
+  attestations: readonly Attestation[] | undefined,
+): ScorecardAttestation[] | undefined {
+  if (deps.attested === undefined || attestations === undefined) return undefined;
+  const signerId = deps.attested.signerId;
+  return attestations.map((attestation) => ({ signer_id: signerId, ...attestation }));
 }
 
 /** What judging a task's entries came to. */

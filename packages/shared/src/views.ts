@@ -232,3 +232,18 @@ export const DelegateViewSchema = z.object({
   spent: U128StringSchema,
 });
 export type DelegateView = z.infer<typeof DelegateViewSchema>;
+
+/**
+ * A TEE signer `pick_attested` accepts, as `get_attested_signer` returns it: the key's address
+ * (`0x` and 40 lowercase hex, for `algo` `ecdsa`), the model whose completions it signs, and
+ * whether it is on. The owner registers it with `set_attested_signer` after checking the model's
+ * attestation report off chain.
+ */
+export const AttestedSignerViewSchema = z.object({
+  signer_id: z.string(),
+  algo: z.string(),
+  address: z.string(),
+  model: z.string(),
+  enabled: z.boolean(),
+});
+export type AttestedSignerView = z.infer<typeof AttestedSignerViewSchema>;

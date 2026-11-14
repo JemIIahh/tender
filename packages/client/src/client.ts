@@ -1,6 +1,8 @@
 import {
   type AgentView,
   AgentViewSchema,
+  type AttestedSignerView,
+  AttestedSignerViewSchema,
   addDelegateCall,
   type ConfigView,
   ConfigViewSchema,
@@ -15,6 +17,7 @@ import {
   NETWORKS,
   type NetworkId,
   type PostTaskInput,
+  pickAttestedCall,
   pickCall,
   postTaskCall,
   type ReceiptOutcome,
@@ -26,6 +29,7 @@ import {
   StorageViewSchema,
   setAgentBondCall,
   setAgentBondCooldownCall,
+  setAttestedSignerCall,
   storageDepositCall,
   type TaskView,
   TaskViewSchema,
@@ -193,6 +197,7 @@ const Tasks = TaskViewSchema.array();
 const EntryOrNull = EntryViewSchema.nullable();
 const Entries = EntryViewSchema.array();
 const AgentOrNull = AgentViewSchema.nullable();
+const AttestedSignerOrNull = AttestedSignerViewSchema.nullable();
 const StorageOrNull = StorageViewSchema.nullable();
 const FtStorageOrNull = StorageViewSchema.pick({ total: true, available: true }).nullable();
 
@@ -706,6 +711,13 @@ export class TenderClient {
     );
   }
 
+  /** The TEE signer `pick_attested` accepts as `signerId`, or null when none is registered. */
+  async getAttestedSigner(signerId: string): Promise<AttestedSignerView | null> {
+    return AttestedSignerOrNull.parse(
+      await this.view(this.contractId, "get_attested_signer", { signer_id: signerId }),
+    );
+  }
+
   // Views of a token (NEP-141 and NEP-145).
 
   /** What `account` holds of `token` itself, outside Tender. */
@@ -837,6 +849,22 @@ export class TenderClient {
     return this.send(pickCall(this.contractId, taskId, winners, scorecardHash, scorecardUri));
   }
 
+  /**
+   * `pick` with TEE attestations: the contract checks each one against its registered signer
+   * before it settles exactly as `pick` does (see `pickAttestedCall`).
+   */
+  pickAttested(
+    taskId: bigint,
+    winners: readonly { account: string; bps: number }[],
+    scorecardHash: string,
+    scorecardUri: string,
+    attestations: readonly { signer_id: string; text: string; signature: string }[],
+  ): Promise<TxResult> {
+    return this.send(
+      pickAttestedCall(this.contractId, taskId, winners, scorecardHash, scorecardUri, attestations),
+    );
+  }
+
   voidTask(taskId: bigint): Promise<TxResult> {
     return this.send(voidTaskCall(this.contractId, taskId));
   }
@@ -903,6 +931,16 @@ export class TenderClient {
   /** The owner's `set_agent_bond_cooldown`: seconds from `unregister_agent` to the claim. */
   setAgentBondCooldown(secs: number): Promise<TxResult> {
     return this.send(setAgentBondCooldownCall(this.contractId, secs));
+  }
+
+  /** Owner only: registers, changes or turns off a TEE signer for `pick_attested`. 1 yoctoNEAR. */
+  setAttestedSigner(input: {
+    signerId: string;
+    address: string;
+    model: string;
+    enabled: boolean;
+  }): Promise<TxResult> {
+    return this.send(setAttestedSignerCall(this.contractId, input));
   }
 
   addDelegate(

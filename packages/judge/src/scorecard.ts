@@ -2,6 +2,7 @@ import {
   type CriteriaKind,
   canonicalJson,
   type Scorecard,
+  type ScorecardAttestation,
   ScorecardSchema,
   sha256Hex,
   type TaskView,
@@ -50,6 +51,11 @@ export function buildScorecard(input: {
   winners: { account: string; bps: number }[];
   model: string | null;
   now: Date;
+  /**
+   * The TEE attestations of the model completions the scores rest on, from an attested Judge. None
+   * or an empty list leaves the key out, so the bytes are what they were before attestations.
+   */
+  attestations?: readonly ScorecardAttestation[];
 }): Uint8Array {
   const scorecard: Scorecard = {
     version: 1,
@@ -73,6 +79,9 @@ export function buildScorecard(input: {
     generated_at: input.now.toISOString(),
     judge: { software: "tender-judge/1", model: input.model },
   };
+  if (input.attestations !== undefined && input.attestations.length > 0) {
+    scorecard.attestations = input.attestations.map((attestation) => ({ ...attestation }));
+  }
   // The schema and the hash checks look at the scorecard built here, and the bytes are written
   // from that same object, not from the copy the schema returns, so that what is published is what
   // was checked.

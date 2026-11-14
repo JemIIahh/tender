@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
@@ -38,6 +39,8 @@ interface Case {
 
 /** The tasks the stand-ins hold, by id. */
 const cases = new Map<string, Case>();
+/** The attested signers the stand-in contract holds, by id. */
+const signers = new Map<string, unknown>();
 let node: Server;
 let api: Server;
 
@@ -59,10 +62,21 @@ beforeAll(async () => {
       text += chunk;
     });
     request.on("end", () => {
-      const body = JSON.parse(text) as { params: { args_base64: string } };
-      const { task_id: id } = JSON.parse(
-        Buffer.from(body.params.args_base64, "base64").toString("utf8"),
-      ) as { task_id: string };
+      const body = JSON.parse(text) as { params: { args_base64: string; method_name: string } };
+      const args = JSON.parse(Buffer.from(body.params.args_base64, "base64").toString("utf8"));
+      if (body.params.method_name === "get_attested_signer") {
+        const signer = signers.get((args as { signer_id: string }).signer_id) ?? null;
+        response.setHeader("content-type", "application/json");
+        response.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            result: { result: [...Buffer.from(JSON.stringify(signer))] },
+          }),
+        );
+        return;
+      }
+      const { task_id: id } = args as { task_id: string };
       const found = cases.get(id);
       const task =
         found === undefined
@@ -247,4 +261,84 @@ test("a_network_named_beside_a_node_is_named_with_it", async () => {
   const { code, out } = await verify("8", ["--network", "sandbox"]);
   expect(out.split("\n")[0]).toBe(`task 8 on tender.test (sandbox, node ${new URL(nodeUrl).host})`);
   expect(code).toBe(0);
+});
+
+// The attested Judge's signatures: the real S1 fixture, a NEAR AI Cloud TEE signature.
+
+const FIXTURE = JSON.parse(
+  readFileSync(new URL("../docs/research/S1-fixture.json", import.meta.url), "utf8"),
+) as {
+  model: string;
+  text: string;
+  signature: string;
+  signing_address: string;
+  request_sha256: string;
+  response_sha256: string;
+  request: string;
+  response: string;
+};
+const ATTESTATION = {
+  signer_id: "nearai-qwen3.8",
+  model: FIXTURE.model,
+  text: FIXTURE.text,
+  signature: FIXTURE.signature,
+  signing_address: FIXTURE.signing_address,
+  request_sha256: FIXTURE.request_sha256,
+  response_sha256: FIXTURE.response_sha256,
+  request: FIXTURE.request,
+  response: FIXTURE.response,
+};
+const SIGNER = {
+  signer_id: "nearai-qwen3.8",
+  algo: "ecdsa",
+  address: FIXTURE.signing_address,
+  model: FIXTURE.model,
+  enabled: true,
+};
+
+/** A scorecard with no held-out part and these attestations. */
+function attestedCard(attestations: unknown[]): Uint8Array {
+  return canonicalJson({
+    version: 1,
+    task_id: "1",
+    verifier: "judge.test",
+    heldout: null,
+    heldout_commitment: null,
+    winners: [{ account: "alice.test", bps: 10_000 }],
+    attestations,
+  });
+}
+
+test("each_attestation_is_rehashed_recovered_and_found_registered_on_chain", async () => {
+  signers.set("nearai-qwen3.8", SIGNER);
+  pinned("40", null, attestedCard([ATTESTATION, ATTESTATION]));
+  const { code, out } = await verify("40");
+  const line = `ATTESTED  ${FIXTURE.model} by nearai-qwen3.8 (${FIXTURE.signing_address})`;
+  expect(out).toContain(`attestation 1               ${line}`);
+  expect(out).toContain(`attestation 2               ${line}`);
+  expect(out.trimEnd().split("\n").at(-1)).toBe("VERIFIED");
+  expect(code).toBe(0);
+});
+
+test("an_attestation_that_does_not_hold_is_a_mismatch", async () => {
+  signers.set("nearai-qwen3.8", SIGNER);
+  signers.set("off", { ...SIGNER, signer_id: "off", enabled: false });
+  signers.set("other-model", { ...SIGNER, signer_id: "other-model", model: "z-ai/glm-5.3-flash" });
+  const flipped = `${FIXTURE.signature.slice(0, 10)}${FIXTURE.signature[10] === "0" ? "1" : "0"}${FIXTURE.signature.slice(11)}`;
+  const bad: [unknown, string][] = [
+    [{ ...ATTESTATION, response: `${FIXTURE.response} ` }, "response_sha256 is not of response"],
+    [{ ...ATTESTATION, signature: flipped }, "the signature does not recover to signing_address"],
+    [{ ...ATTESTATION, signer_id: "nobody" }, "no signer nobody is registered on chain"],
+    [{ ...ATTESTATION, signer_id: "off" }, "signer off is disabled on chain"],
+    [{ ...ATTESTATION, signer_id: "other-model" }, "the signer on chain is for another model"],
+  ];
+  for (const [i, [attestation, problem]] of bad.entries()) {
+    const id = String(41 + i);
+    pinned(id, null, attestedCard([attestation]));
+    const { code, out } = await verify(id);
+    expect(out, problem).toContain(`NOT ATTESTED: `);
+    expect(out, problem).toContain(problem);
+    expect(out.trimEnd().split("\n").at(-1), problem).toBe("MISMATCH");
+    expect(code, problem).toBe(1);
+  }
 });

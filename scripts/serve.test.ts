@@ -13,6 +13,7 @@ import { KeyPair, type KeyPairString } from "near-api-js";
 import { afterEach, expect, test, vi } from "vitest";
 import { REPO_ROOT } from "./lib/env";
 import {
+  checkAttestedSigner,
   checkGasGiftKey,
   checkJudgeKey,
   checkKeeperKey,
@@ -183,6 +184,8 @@ test("read_serve_config_reads_the_judge_and_the_bot_as_they_are_set", () => {
   const none = readServeConfig({ ...GOOD, LLM_BASE_URL: "", LLM_API_KEY: "", LLM_MODEL: "" });
   expect(none.judge?.llm).toBeUndefined();
   expect(none.warnings).toEqual([]);
+  // Without JUDGE_ATTESTED the Judge is not attested.
+  expect(readServeConfig(GOOD).judge?.attested).toBeUndefined();
 
   // Polling is the default, and takes no secret: one that is set is still checked, and kept out.
   for (const mode of ["", "polling"]) {
@@ -2228,4 +2231,105 @@ test("the_gas_gift_key_check_takes_only_a_full_access_key_of_an_account_that_is_
 
 test("redact_takes_the_gas_gift_key_out", () => {
   expect(redact(`key ${GIFT_KEY} here`, GIFT)).toBe("key <GAS_GIFT_PRIVATE_KEY> here");
+});
+
+test("judge_attested_needs_the_near_ai_cloud_model_and_a_signer", () => {
+  const attested = {
+    ...GOOD,
+    JUDGE_ATTESTED: "1",
+    LLM_BASE_URL: "https://cloud-api.near.ai/v1",
+    LLM_MODEL: "Qwen/Qwen3.8-27B",
+    JUDGE_ATTESTED_SIGNER_ID: "nearai-qwen3.8",
+  };
+  expect(readServeConfig(attested).judge).toMatchObject({
+    llm: { baseUrl: "https://cloud-api.near.ai/v1", model: "Qwen/Qwen3.8-27B" },
+    attested: { signerId: "nearai-qwen3.8" },
+  });
+  expect(readServeConfig(attested).judge?.attested).toStrictEqual({ signerId: "nearai-qwen3.8" });
+  expect(readServeConfig({ ...attested, JUDGE_ATTESTED: "0" }).judge?.attested).toBeUndefined();
+
+  // Fields for the request body, a JSON object.
+  const extra = readServeConfig({
+    ...attested,
+    JUDGE_ATTESTED_EXTRA_BODY: '{"chat_template_kwargs":{"enable_thinking":false}}',
+  });
+  expect(extra.judge?.attested).toStrictEqual({
+    signerId: "nearai-qwen3.8",
+    extraBody: { chat_template_kwargs: { enable_thinking: false } },
+  });
+
+  // Each thing it needs is a problem when it is missing or wrong, and no value is quoted.
+  expect(problemsOf({ ...attested, JUDGE_ATTESTED: "yes" })).toEqual([
+    "JUDGE_ATTESTED must be 1 (attested) or 0 (not)",
+  ]);
+  expect(problemsOf({ ...attested, LLM_BASE_URL: "https://llm.example/v1" })).toEqual([
+    "JUDGE_ATTESTED=1 needs LLM_BASE_URL on https://cloud-api.near.ai, whose TEE models sign " +
+      "their completions",
+  ]);
+  expect(problemsOf({ ...attested, LLM_BASE_URL: "http://cloud-api.near.ai/v1" })).toHaveLength(1);
+  expect(problemsOf({ ...attested, LLM_MODEL: "" })).toEqual([
+    "JUDGE_ATTESTED=1 needs LLM_BASE_URL, LLM_API_KEY and LLM_MODEL: the TEE model on NEAR AI Cloud",
+  ]);
+  for (const signer of ["", "Upper", "a".repeat(65), "has space"]) {
+    expect(problemsOf({ ...attested, JUDGE_ATTESTED_SIGNER_ID: signer }), signer).toEqual([
+      "JUDGE_ATTESTED=1 needs JUDGE_ATTESTED_SIGNER_ID, 1 to 64 of a-z, 0-9, '.', '_' and '-': " +
+        "the signer the owner registered on chain for LLM_MODEL (scripts/register-signer.ts)",
+    ]);
+  }
+  for (const body of ["[1]", "not json", "3", "null"]) {
+    expect(problemsOf({ ...attested, JUDGE_ATTESTED_EXTRA_BODY: body }), body).toEqual([
+      "JUDGE_ATTESTED_EXTRA_BODY must be a JSON object (its value is not shown)",
+    ]);
+  }
+
+  // Its variables without the flag are a warning: the Judge is not attested.
+  const off = readServeConfig({ ...GOOD, JUDGE_ATTESTED_SIGNER_ID: "nearai-qwen3.8" });
+  expect(off.judge?.attested).toBeUndefined();
+  expect(off.warnings).toEqual([
+    "JUDGE_ATTESTED_SIGNER_ID and JUDGE_ATTESTED_EXTRA_BODY are used only with JUDGE_ATTESTED=1, " +
+      "which is not set, so the Judge is not attested",
+  ]);
+});
+
+test("an_attested_judge_starts_only_with_its_signer_registered_for_its_model", async () => {
+  const judge = {
+    llm: { baseUrl: "https://cloud-api.near.ai/v1", apiKey: "k", model: "Qwen/Qwen3.8-27B" },
+    attested: { signerId: "nearai-qwen3.8" },
+  };
+  const signer = {
+    signer_id: "nearai-qwen3.8",
+    algo: "ecdsa",
+    address: "0x835ab53d20294ef795906dff21ae4c045336aa26",
+    model: "Qwen/Qwen3.8-27B",
+    enabled: true,
+  };
+  const answering = (answer: typeof signer | null) => ({
+    getAttestedSigner: vi.fn(async () => answer),
+  });
+  const ok = answering(signer);
+  await expect(checkAttestedSigner(ok, judge)).resolves.toBeUndefined();
+  expect(ok.getAttestedSigner).toHaveBeenCalledWith("nearai-qwen3.8");
+
+  // Not attested: the chain is not asked.
+  const unasked = answering(null);
+  await expect(checkAttestedSigner(unasked, { ...judge, attested: undefined })).resolves.toBe(
+    undefined,
+  );
+  expect(unasked.getAttestedSigner).not.toHaveBeenCalled();
+
+  await expect(checkAttestedSigner(answering(null), judge)).rejects.toThrow(
+    "the contract has no attested signer nearai-qwen3.8. Register it with " +
+      "scripts/register-signer.ts --signer-id nearai-qwen3.8 --model Qwen/Qwen3.8-27B",
+  );
+  for (const wrong of [{ enabled: false }, { model: "z-ai/glm-5.3-flash" }, { algo: "ed25519" }]) {
+    await expect(checkAttestedSigner(answering({ ...signer, ...wrong }), judge)).rejects.toThrow(
+      "is not an enabled ecdsa signer for LLM_MODEL",
+    );
+  }
+  const down = {
+    getAttestedSigner: vi.fn(async () => Promise.reject(new Error("no such method"))),
+  };
+  await expect(checkAttestedSigner(down, judge)).rejects.toThrow(
+    "cannot ask the chain for the attested signer nearai-qwen3.8",
+  );
 });

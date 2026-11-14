@@ -235,7 +235,20 @@ export interface JudgeConfig {
   intervalMs: number | undefined;
   /** `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL`, when all three are set (rubric is P1). */
   llm: { baseUrl: string; apiKey: string; model: string } | undefined;
+  /**
+   * With `JUDGE_ATTESTED=1`: the attested Judge, whose rubric requests go to NEAR AI Cloud's TEE
+   * model (`LLM_*`) and whose picks are `pick_attested` with the completions' signatures.
+   * `JUDGE_ATTESTED_SIGNER_ID` is the signer the owner registered for `LLM_MODEL`
+   * (`scripts/register-signer.ts`), and `JUDGE_ATTESTED_EXTRA_BODY` a JSON object of fields added to
+   * each request. Undefined when the flag is off.
+   */
+  attested: { signerId: string; extraBody?: Record<string, unknown> } | undefined;
 }
+
+/** Where an attested Judge's model must be: NEAR AI Cloud, whose TEE models sign completions. */
+const ATTESTED_HOST = "cloud-api.near.ai";
+/** A signer id as `set_attested_signer` takes it. */
+const SIGNER_ID = /^[a-z0-9._-]{1,64}$/;
 
 /** The bot's token and where its links go, and how it takes its updates (`TELEGRAM_MODE`). */
 export type TelegramConfig = {
@@ -251,6 +264,83 @@ export type TelegramConfig = {
       webhookSecret: string;
     }
 );
+
+/**
+ * The attested Judge's settings, or undefined when `JUDGE_ATTESTED` is unset or `0`. With `1` the
+ * Judge must have a model on NEAR AI Cloud (`LLM_BASE_URL` an https URL on cloud-api.near.ai, with
+ * `LLM_MODEL` and `LLM_API_KEY`) and `JUDGE_ATTESTED_SIGNER_ID` (1 to 64 of a-z, 0-9, `.`, `_`,
+ * `-`), and `JUDGE_ATTESTED_EXTRA_BODY`, when set, must be a JSON object; anything else is a
+ * problem, so that a Judge meant to be attested never runs without it. The other variables set
+ * while the flag is off are a warning. No value is quoted.
+ */
+function readAttested(
+  get: (key: string) => string | undefined,
+  llm: JudgeConfig["llm"],
+  problems: string[],
+  warnings: string[],
+): JudgeConfig["attested"] {
+  const flag = get("JUDGE_ATTESTED");
+  const signerId = get("JUDGE_ATTESTED_SIGNER_ID");
+  const extra = get("JUDGE_ATTESTED_EXTRA_BODY");
+  if (flag === undefined || flag === "0") {
+    if (signerId !== undefined || extra !== undefined) {
+      warnings.push(
+        "JUDGE_ATTESTED_SIGNER_ID and JUDGE_ATTESTED_EXTRA_BODY are used only with JUDGE_ATTESTED=1, " +
+          "which is not set, so the Judge is not attested",
+      );
+    }
+    return undefined;
+  }
+  if (flag !== "1") {
+    problems.push("JUDGE_ATTESTED must be 1 (attested) or 0 (not)");
+    return undefined;
+  }
+  let ok = true;
+  if (llm === undefined) {
+    problems.push(
+      "JUDGE_ATTESTED=1 needs LLM_BASE_URL, LLM_API_KEY and LLM_MODEL: the TEE model on NEAR AI Cloud",
+    );
+    ok = false;
+  } else {
+    let url: URL | undefined;
+    try {
+      url = new URL(llm.baseUrl);
+    } catch {
+      url = undefined;
+    }
+    if (url?.protocol !== "https:" || url.hostname !== ATTESTED_HOST) {
+      problems.push(
+        `JUDGE_ATTESTED=1 needs LLM_BASE_URL on https://${ATTESTED_HOST}, whose TEE models sign ` +
+          "their completions",
+      );
+      ok = false;
+    }
+  }
+  if (signerId === undefined || !SIGNER_ID.test(signerId)) {
+    problems.push(
+      "JUDGE_ATTESTED=1 needs JUDGE_ATTESTED_SIGNER_ID, 1 to 64 of a-z, 0-9, '.', '_' and '-': the " +
+        "signer the owner registered on chain for LLM_MODEL (scripts/register-signer.ts)",
+    );
+    ok = false;
+  }
+  let extraBody: Record<string, unknown> | undefined;
+  if (extra !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(extra);
+    } catch {
+      parsed = undefined;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      problems.push("JUDGE_ATTESTED_EXTRA_BODY must be a JSON object (its value is not shown)");
+      ok = false;
+    } else {
+      extraBody = parsed as Record<string, unknown>;
+    }
+  }
+  if (!ok || signerId === undefined) return undefined;
+  return extraBody === undefined ? { signerId } : { signerId, extraBody };
+}
 
 /**
  * What `readServeConfig` throws: every problem with the environment, one sentence each, naming
@@ -373,7 +463,8 @@ function databaseKind(url: string): "pglite" | "postgres" | undefined {
  *   `TELEGRAM_BOT_USERNAME`, which must be a username as in t.me/<username>;
  * - with `KEEPER_PRIVATE_KEY` set, that it is a private key and `KEEPER_ACCOUNT` an account id;
  * - `JUDGE_ACCOUNT`, which must be an account id when it is set, and must be set with
- *   `JUDGE_PRIVATE_KEY`, which must be a private key;
+ *   `JUDGE_PRIVATE_KEY`, which must be a private key; with `JUDGE_ATTESTED=1`, the attested Judge's
+ *   model on NEAR AI Cloud and `JUDGE_ATTESTED_SIGNER_ID` (`readAttested`);
  * - `TELEGRAM_MODE`, polling or webhook, and `TELEGRAM_WEBHOOK_SECRET`, which must be what
  *   Telegram takes as a secret token, 16 characters or more. With `TELEGRAM_BOT_TOKEN` set, that
  *   it looks like a bot's token, that `PUBLIC_WEB_URL` names the web app the bot links to, and in
@@ -612,6 +703,7 @@ export function readServeConfig(env: Record<string, string | undefined>): ServeC
       privateKey: judgeKey,
       intervalMs: judgeIntervalMs,
       llm,
+      attested: readAttested(get, llm, problems, warnings),
     };
   }
 
@@ -1172,6 +1264,45 @@ export function checkJudgeKey(
   );
 }
 
+/**
+ * For an attested Judge: the contract must hold `JUDGE_ATTESTED_SIGNER_ID` as an enabled ecdsa
+ * signer for `LLM_MODEL` (`get_attested_signer`), as `scripts/register-signer.ts` registers it, or
+ * every `pick_attested` would be refused and the tasks left to their fallback windows. It throws,
+ * so the Judge does not start, when the signer is missing, disabled, for another model, or the
+ * chain cannot be asked (a contract without `pick_attested` cannot answer). Nothing to check for a
+ * Judge that is not attested.
+ */
+export async function checkAttestedSigner(
+  client: Pick<TenderClient, "getAttestedSigner">,
+  judge: Pick<JudgeConfig, "attested" | "llm">,
+): Promise<void> {
+  const { attested, llm } = judge;
+  if (attested === undefined || llm === undefined) return;
+  const register =
+    `Register it with scripts/register-signer.ts --signer-id ${attested.signerId} ` +
+    `--model ${llm.model}, or unset JUDGE_ATTESTED.`;
+  let signer: Awaited<ReturnType<TenderClient["getAttestedSigner"]>>;
+  try {
+    signer = await withinDeadline(
+      KEY_CHECK_DEADLINE_MS,
+      client.getAttestedSigner(attested.signerId),
+    );
+  } catch (error) {
+    throw new Error(
+      `cannot ask the chain for the attested signer ${attested.signerId} (${describe(error)}), ` +
+        "and an attested Judge does not start with a signer that was not checked",
+    );
+  }
+  if (signer === null) {
+    throw new Error(`the contract has no attested signer ${attested.signerId}. ${register}`);
+  }
+  if (!signer.enabled || signer.algo !== "ecdsa" || signer.model !== llm.model) {
+    throw new Error(
+      `the attested signer ${attested.signerId} is not an enabled ecdsa signer for LLM_MODEL. ${register}`,
+    );
+  }
+}
+
 // ---- The gas gift's key -----------------------------------------------------------------------
 
 /**
@@ -1647,6 +1778,7 @@ export async function startServices(
     if (config.keeper !== undefined) await checkKeeperKey(client, config.keeper, contractId);
     if (config.judge !== undefined) await checkJudgeKey(client, config.judge, contractId);
   }
+  if (config.judge !== undefined) await checkAttestedSigner(client, config.judge);
   // On the sandbox too: a key that cannot send NEAR fails every gift there as well.
   if (config.gasGift !== undefined) await checkGasGiftKey(client, config.gasGift);
   /** A client that signs as the account of `key`, with it. */
@@ -1855,11 +1987,18 @@ export async function startServices(
               resultUploaded: (sha256, taskId, account, nowNs) =>
                 resultUsable(db, sha256, taskId, account, nowNs),
               llm: judge.config.llm,
+              attested: judge.config.attested,
               intervalMs: judge.config.intervalMs,
               signal: stopLoops.signal,
             }),
           );
-          log(`serve: Judge on, as ${judge.config.accountId}`);
+          const attested = judge.config.attested;
+          log(
+            `serve: Judge on, as ${judge.config.accountId}` +
+              (attested === undefined
+                ? ""
+                : `, attested (signer ${attested.signerId}, model ${judge.config.llm?.model})`),
+          );
         }
         if (keeper !== undefined) {
           loops.push(

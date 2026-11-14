@@ -224,6 +224,72 @@ describe("delegate sends", () => {
   });
 });
 
+describe("the attested Judge calls", () => {
+  test("pick_attested_and_set_attested_signer_send_their_builders_calls", async () => {
+    const client = new TenderClient({ network: "testnet", contractId: CONTRACT });
+    const calls: TenderCall[] = [];
+    vi.spyOn(client, "send").mockImplementation(async (call) => {
+      calls.push(call);
+      return { returnValue: undefined } as TxResult;
+    });
+    const attestation = { signer_id: "nearai-qwen", text: "m:a:b", signature: "0x00" };
+    await client.pickAttested(
+      7n,
+      [{ account: "alice.test.near", bps: 10_000 }],
+      "c".repeat(64),
+      "u",
+      [{ ...attestation, model: "extra field, not sent" } as typeof attestation],
+    );
+    await client.setAttestedSigner({
+      signerId: "nearai-qwen",
+      address: "0x835ab53d20294ef795906dff21ae4c045336aa26",
+      model: "Qwen/Qwen3.8-27B",
+      enabled: true,
+    });
+    expect(calls.map((call) => [call.methodName, call.args, call.deposit])).toEqual([
+      [
+        "pick_attested",
+        {
+          task_id: "7",
+          winners: [{ account: "alice.test.near", bps: 10_000 }],
+          scorecard_hash: "c".repeat(64),
+          scorecard_uri: "u",
+          attestations: [attestation],
+        },
+        0n,
+      ],
+      [
+        "set_attested_signer",
+        {
+          signer_id: "nearai-qwen",
+          algo: "ecdsa",
+          public_key_or_address: "0x835ab53d20294ef795906dff21ae4c045336aa26",
+          model: "Qwen/Qwen3.8-27B",
+          enabled: true,
+        },
+        1n,
+      ],
+    ]);
+  });
+
+  test("get_attested_signer_reads_the_view_or_null", async () => {
+    const signer = {
+      signer_id: "nearai-qwen",
+      algo: "ecdsa",
+      address: "0x835ab53d20294ef795906dff21ae4c045336aa26",
+      model: "Qwen/Qwen3.8-27B",
+      enabled: true,
+    };
+    const { client, requests } = await fakeRpc(() => viewResult(signer));
+    expect(await client.getAttestedSigner("nearai-qwen")).toEqual(signer);
+    expect(requests.map(viewCall)).toEqual([
+      { method: "get_attested_signer", args: { signer_id: "nearai-qwen" } },
+    ]);
+    const { client: none } = await fakeRpc(() => viewResult(null));
+    expect(await none.getAttestedSigner("nobody")).toBeNull();
+  });
+});
+
 describe("the agent bond calls", () => {
   /** A client whose `send` records the calls it is given. */
   function recording() {

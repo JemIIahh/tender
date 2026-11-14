@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 import type { ZodType } from "zod";
-import { isJudgeBranded, ScorecardSchema } from "../src/index";
+import { isJudgeBranded, MAX_ATTESTATIONS, ScorecardSchema } from "../src/index";
 
 // Any account that a task names as its verifier may publish a scorecard (the poster, a script, a
 // person), not only the team's Judge. The Judge writes `tender-judge/1`; another verifier names its
@@ -141,4 +141,39 @@ test("is_judge_branded_is_the_judges_name_in_any_case_and_punctuation", () => {
   ]) {
     expect(isJudgeBranded(software), software).toBe(true);
   }
+});
+
+test("scorecard_attestations_are_optional_and_checked_when_present", () => {
+  const attestation = {
+    signer_id: "nearai-qwen3.8",
+    model: "Qwen/Qwen3.8-27B",
+    text: `Qwen/Qwen3.8-27B:${HASH}:${HASH}`,
+    signature: `0x${"ab".repeat(64)}1c`,
+    signing_address: "0x835ab53d20294ef795906dff21ae4c045336aa26",
+    request_sha256: HASH,
+    response_sha256: HASH,
+    request: "{}",
+    response: "{}",
+  };
+  const card = { ...scorecard("tender-judge/1", "Qwen/Qwen3.8-27B"), attestations: [attestation] };
+  expect(ScorecardSchema.parse(card)).toEqual(card);
+  // A scorecard without them parses with no `attestations` key, so its bytes are unchanged.
+  expect("attestations" in ScorecardSchema.parse(scorecard("tender-judge/1"))).toBe(false);
+  // Present, there is at least one and at most what `pick_attested` takes.
+  expect(failures(ScorecardSchema, { ...card, attestations: [] })).toEqual(["attestations"]);
+  const many = Array.from({ length: MAX_ATTESTATIONS + 1 }, () => attestation);
+  expect(failures(ScorecardSchema, { ...card, attestations: many })).toEqual(["attestations"]);
+  // Each field is held to its form, and no other key is taken.
+  for (const [key, value] of Object.entries({
+    signer_id: "Upper",
+    signature: "0x12",
+    signing_address: "0x835AB53D20294EF795906DFF21AE4C045336AA26",
+    request_sha256: "x",
+  })) {
+    const bad = { ...card, attestations: [{ ...attestation, [key]: value }] };
+    expect(failures(ScorecardSchema, bad), key).toEqual([`attestations.0.${key}`]);
+  }
+  expect(
+    failures(ScorecardSchema, { ...card, attestations: [{ ...attestation, extra: 1 }] }),
+  ).toEqual(["attestations.0"]);
 });

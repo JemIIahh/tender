@@ -1,5 +1,6 @@
 import type { Db } from "@tender/db";
 import type { EntryView, TaskView } from "@tender/shared";
+import type { Attestation } from "./attest";
 import type { WorkerSource } from "./isolate";
 
 /** How one revealed entry scored against a task's criteria. */
@@ -31,6 +32,36 @@ export interface JudgeChain {
     scorecardHash: string,
     scorecardUri: string,
   ): Promise<unknown>;
+  /**
+   * `pick` with the TEE attestations of the model completions the scores rest on: the contract
+   * checks each against its registered signer before it settles as `pick` does. An attested Judge
+   * (`JudgeDeps.attested`) needs it; `TenderClient` has it.
+   */
+  pickAttested?(
+    taskId: bigint,
+    winners: readonly { account: string; bps: number }[],
+    scorecardHash: string,
+    scorecardUri: string,
+    attestations: readonly { signer_id: string; text: string; signature: string }[],
+  ): Promise<unknown>;
+}
+
+/**
+ * The attested Judge (`JUDGE_ATTESTED=1`): every model request of a `rubric` task goes to NEAR AI
+ * Cloud's TEE through `attestedComplete`, each completion's signature is checked as it comes, the
+ * scorecard carries them all, and the task is settled with `pick_attested`. `llm` must name the
+ * TEE model.
+ */
+export interface AttestedJudge {
+  /** The signer the owner registered on chain for `llm.model` (`set_attested_signer`). */
+  signerId: string;
+  /**
+   * Fields added to each request body, `chat_template_kwargs` or `max_tokens` say
+   * (`JUDGE_ATTESTED_EXTRA_BODY`). They cannot replace `model`, `messages` or `stream`.
+   */
+  extraBody?: Record<string, unknown>;
+  /** The `fetch` the requests go through: tests pass a fake TEE. The global one by default. */
+  fetchImpl?: typeof fetch;
 }
 
 /**
@@ -140,6 +171,11 @@ export interface TaskProgress {
   usable: number;
   disqualified: number;
   /**
+   * For a `rubric` task an attested Judge grades: the attestation of each model completion behind
+   * the results so far, in the order they came. A request the stop line cut leaves none.
+   */
+  attestations?: Attestation[];
+  /**
    * Whether a worker has compiled the task's criteria to score with. From then on a compile that
    * fails is the machine's load, not the criteria's fault, and does not reject them.
    */
@@ -168,6 +204,8 @@ export interface JudgeDeps {
   resultUploaded(sha256: string, taskId: bigint, account: string, nowNs: bigint): Promise<boolean>;
   /** The model that scores `rubric` tasks, from P1 on. */
   llm?: { baseUrl: string; apiKey: string; model: string; headers?: Record<string, string> };
+  /** When set, the Judge is attested (see `AttestedJudge`). Unset, nothing of it runs. */
+  attested?: AttestedJudge;
   /** The clock. Defaults to the wall clock. */
   now?: () => Date;
   /**

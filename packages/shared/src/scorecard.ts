@@ -23,6 +23,31 @@ const ScorecardEntrySchema = z.strictObject({
   reasons: z.array(z.string()),
 });
 
+/** The most attestations a scorecard carries: what `pick_attested` takes at once. */
+export const MAX_ATTESTATIONS = 12;
+
+/**
+ * One model completion behind the scores, signed in a TEE (NEAR AI Cloud's `provider_tee`
+ * signature). `request` and `response` are the exact bodies sent and received, so anyone can hash
+ * them again: `request_sha256` and `response_sha256` are their SHA-256, `text` is
+ * `"{model}:{request_sha256}:{response_sha256}"`, and `signature` is an EIP-191 personal_sign over
+ * `text` that recovers to `signing_address`, the key the model's attestation report names. The
+ * contract's `pick_attested` checks the signature against the signer registered as `signer_id`
+ * before it pays. It proves which key signed these bytes, not that the score is right.
+ */
+export const ScorecardAttestationSchema = z.strictObject({
+  signer_id: z.string().regex(/^[a-z0-9._-]{1,64}$/),
+  model: z.string().min(1).max(128),
+  text: z.string().min(1),
+  signature: z.string().regex(/^0x[0-9a-f]{130}$/),
+  signing_address: z.string().regex(/^0x[0-9a-f]{40}$/),
+  request_sha256: HashHexSchema,
+  response_sha256: HashHexSchema,
+  request: z.string(),
+  response: z.string(),
+});
+export type ScorecardAttestation = z.infer<typeof ScorecardAttestationSchema>;
+
 /**
  * The scorecard a verifier publishes with `pick`: how every revealed entry scored, who won, and
  * what the scores rest on. It is stored as `canonicalJson` bytes, and the `scorecard_hash` that
@@ -77,6 +102,11 @@ export const ScorecardSchema = z.strictObject({
     /** The model that scored a `rubric` task, `null` when none did. */
     model: z.string().nullable(),
   }),
+  /**
+   * The TEE attestations of every model completion the scores rest on, when an attested Judge
+   * scored the task (`pick_attested`). Left out otherwise, so other scorecards keep their bytes.
+   */
+  attestations: z.array(ScorecardAttestationSchema).min(1).max(MAX_ATTESTATIONS).optional(),
 });
 export type Scorecard = z.infer<typeof ScorecardSchema>;
 

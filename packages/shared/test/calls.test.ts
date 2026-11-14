@@ -12,6 +12,7 @@ import {
   mintCall,
   ONE_YOCTO,
   type PostTaskInput,
+  pickAttestedCall,
   pickCall,
   postTaskCall,
   registerAgentCall,
@@ -19,6 +20,7 @@ import {
   revealCall,
   setAgentBondCall,
   setAgentBondCooldownCall,
+  setAttestedSignerCall,
   sha256Hex,
   storageDepositCall,
   storageWithdrawCall,
@@ -38,6 +40,9 @@ const BOB = "bob.near";
 const PUBLIC_KEY = "ed25519:6E8sCci9badyRkXb3JoRpBj5p8C6Tw41ELDZoiihKEtp";
 const TERA = 10n ** 12n;
 const U64_MAX = 2n ** 64n - 1n;
+const ATTESTED_TEXT = `Qwen/Qwen3.8-27B:${"a".repeat(64)}:${"b".repeat(64)}`;
+const ATTESTED_SIGNATURE = `0x${"c".repeat(128)}1c`;
+const ATTESTED_ADDRESS = "0x835ab53d20294ef795906dff21ae4c045336aa26";
 const U128_MAX = 2n ** 128n - 1n;
 
 const BRIEF_HASH = sha256Hex("brief");
@@ -440,6 +445,54 @@ function wire(): { name: string; call: TenderCall; expected: TenderCall }[] {
         deposit: 1n,
       },
     },
+    {
+      name: "pickAttestedCall",
+      call: pickAttestedCall(
+        TENDER,
+        42n,
+        [{ account: ALICE, bps: 10_000 }],
+        SCORECARD_HASH,
+        "ipfs://scorecard",
+        [{ signer_id: "nearai-qwen", text: ATTESTED_TEXT, signature: ATTESTED_SIGNATURE }],
+      ),
+      expected: {
+        receiverId: TENDER,
+        methodName: "pick_attested",
+        args: {
+          task_id: "42",
+          winners: [{ account: ALICE, bps: 10_000 }],
+          scorecard_hash: SCORECARD_HASH,
+          scorecard_uri: "ipfs://scorecard",
+          attestations: [
+            { signer_id: "nearai-qwen", text: ATTESTED_TEXT, signature: ATTESTED_SIGNATURE },
+          ],
+        },
+        gas: 150n * TERA,
+        deposit: 0n,
+      },
+    },
+    {
+      name: "setAttestedSignerCall",
+      call: setAttestedSignerCall(TENDER, {
+        signerId: "nearai-qwen",
+        address: ATTESTED_ADDRESS,
+        model: "Qwen/Qwen3.8-27B",
+        enabled: true,
+      }),
+      expected: {
+        receiverId: TENDER,
+        methodName: "set_attested_signer",
+        args: {
+          signer_id: "nearai-qwen",
+          algo: "ecdsa",
+          public_key_or_address: ATTESTED_ADDRESS,
+          model: "Qwen/Qwen3.8-27B",
+          enabled: true,
+        },
+        gas: 15n * TERA,
+        deposit: 1n,
+      },
+    },
   ];
 }
 
@@ -634,11 +687,11 @@ test("bond_calls_have_no_delegate_form", () => {
 // What the builders send.
 
 test("every_builder_sends_the_expected_call", () => {
-  // The table has all twenty builders: Tender's seventeen and the three token calls (the NEP-145
+  // The table has all twenty-two builders: Tender's nineteen and the three token calls (the NEP-145
   // registration, and the test token's `mint`). One of those has Tender's method name
   // `storage_deposit`, so the receiver is part of the key.
   const covered = new Set(wire().map(({ call }) => `${call.receiverId} ${call.methodName}`));
-  expect(covered.size).toBe(20);
+  expect(covered.size).toBe(22);
   for (const { name, call, expected } of wire()) {
     expect(call, name).toStrictEqual(expected);
   }
@@ -652,6 +705,7 @@ test("gas_is_in_gas_units", () => {
     commit: 15n * TERA,
     reveal: 15n * TERA,
     pick: 60n * TERA,
+    pickAttested: 150n * TERA,
     voidTask: 60n * TERA,
     cleanup: 150n * TERA,
     withdraw: 50n * TERA,
@@ -667,6 +721,7 @@ test("gas_is_in_gas_units", () => {
     mint: 15n * TERA,
     addDelegate: 15n * TERA,
     removeDelegate: 15n * TERA,
+    setAttestedSigner: 15n * TERA,
   });
   // `withdraw` fails with E_GAS below 35 Tgas prepaid (MIN_WITHDRAW_GAS in the contract).
   expect(GAS.withdraw).toBeGreaterThanOrEqual(35n * TERA);
@@ -762,6 +817,29 @@ const PLANNED: Record<string, RustMethod> = {
     ],
   },
   remove_delegate: { payable: true, params: [{ name: "public_key", optional: false }] },
+};
+
+// `pick_attested` and `set_attested_signer`, as the attested-Judge spec gives them, until the
+// contract defines them.
+PLANNED.pick_attested = {
+  payable: false,
+  params: [
+    { name: "task_id", optional: false },
+    { name: "winners", optional: false },
+    { name: "scorecard_hash", optional: false },
+    { name: "scorecard_uri", optional: false },
+    { name: "attestations", optional: false },
+  ],
+};
+PLANNED.set_attested_signer = {
+  payable: true,
+  params: [
+    { name: "signer_id", optional: false },
+    { name: "algo", optional: false },
+    { name: "public_key_or_address", optional: false },
+    { name: "model", optional: false },
+    { name: "enabled", optional: false },
+  ],
 };
 
 const sources = new Map<string, string>();
