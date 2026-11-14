@@ -195,7 +195,7 @@ function createServer(deps: ApiDeps): McpServer {
   server.registerTool(
     "get_task",
     {
-      description: `Get one task with its brief, criteria, entries, funders, child tasks and scorecard${strangers("its brief, criteria, entry URIs and scorecard reasons")}`,
+      description: `Get one task with its brief, criteria, entries, funders, child tasks, scorecard and the signatures its contract checked before it paid (attestations)${strangers("its brief, criteria, entry URIs and scorecard reasons")}`,
       inputSchema: { task_id: TaskIdInput },
       annotations: READ_ONLY,
     },

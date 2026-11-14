@@ -188,6 +188,21 @@ export const TaskFunderSchema = z.object({ account: AccountIdSchema, amount: U12
 export type TaskFunder = z.infer<typeof TaskFunderSchema>;
 
 /**
+ * One signature the contract checked before it paid a task: an `attested_pick` event of the task's
+ * settling call (`pick_attested`). `signer_id` names a signer the contract owner registered, and
+ * `model` is the model that signer was registered for. The two hashes are the SHA-256 of the exact
+ * bytes of the request that was sent to the model and of its response, as the signed text holds
+ * them. The signature itself is not stored on chain: the scorecard has the bodies to hash again.
+ */
+export const TaskAttestationSchema = z.object({
+  signer_id: z.string(),
+  model: z.string(),
+  request_hash: HashHexSchema,
+  response_hash: HashHexSchema,
+});
+export type TaskAttestation = z.infer<typeof TaskAttestationSchema>;
+
+/**
  * `GET /v1/tasks/:id`. `brief`, `criteria` and `scorecard` are the documents the task points at by
  * hash, and only if the index holds a public blob of that kind that fits the schema: otherwise
  * null. A held-out document is never among them. The schemas of the three documents are strict, so
@@ -205,6 +220,13 @@ export const TaskDetailResponseSchema = z.object({
   /** Ids of the tasks that name this one as their parent, oldest first: the first 500. */
   children: z.array(U64StringSchema),
   scorecard: ScorecardSchema.nullable(),
+  /**
+   * The signatures the contract checked when it settled the task with `pick_attested`, from the
+   * task's `attested_pick` events in the order they were logged. Empty when the task was settled
+   * any other way or is not settled. Optional, so that an answer of an API from before it still
+   * parses; this API always sends it.
+   */
+  attestations: z.array(TaskAttestationSchema).optional(),
 });
 export type TaskDetailResponse = z.infer<typeof TaskDetailResponseSchema>;
 

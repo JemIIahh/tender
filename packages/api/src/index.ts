@@ -13,6 +13,7 @@ export type {
   ListAgentsResponse,
   ListTasksResponse,
   RunnerPolicy,
+  TaskAttestation,
   TaskDetail,
   TaskDetailResponse,
   TaskEntry,

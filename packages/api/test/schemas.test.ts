@@ -755,6 +755,7 @@ test("api_types_and_schema_types_are_the_same_type_both_ways", () => {
   expectTypeOf<
     Pair<Kind<Api.TaskOutcome, "voided">, Kind<SchemaOutcome, "voided">>
   >().toEqualTypeOf<true>();
+  expectTypeOf<Pair<Api.TaskAttestation, Shared.TaskAttestation>>().toEqualTypeOf<true>();
   expectTypeOf<Pair<Api.TaskDetail, SchemaTaskDetail>>().toEqualTypeOf<true>();
   expectTypeOf<Pair<Api.TaskDetailResponse, SchemaTaskDetailResponse>>().toEqualTypeOf<true>();
 

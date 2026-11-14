@@ -29,6 +29,7 @@ import {
   MAX_LISTED,
   RECENT_ENTRIES,
   type RunnerPolicy,
+  type TaskAttestation,
   type TaskDetail,
   type TaskDetailResponse,
   type TaskEntry,
@@ -260,7 +261,7 @@ export async function getTaskDetail(
   );
   if (!task) return null;
 
-  const [entries, funders, children, brief, criteria, scorecard] = await Promise.all([
+  const [entries, funders, children, brief, criteria, scorecard, attestations] = await Promise.all([
     db.query<TaskEntry>(
       `select e.account,
               e.entry_index,
@@ -298,6 +299,20 @@ export async function getTaskDetail(
     publicDocument(db, task.brief_hash, "brief", BriefSchema),
     publicDocument(db, task.criteria_hash, "criteria", PublicCriteriaSchema),
     scorecardOf(db, task),
+    // The signatures the contract checked before it paid, in the order of the log. The contract
+    // keeps nothing of them, so the events are the record. `id` is the order the indexer stored
+    // them in, which is the chain's.
+    db.query<TaskAttestation>(
+      `select ev.data ->> 'signer_id' as signer_id,
+              ev.data ->> 'model' as model,
+              ev.data ->> 'request_hash' as request_hash,
+              ev.data ->> 'response_hash' as response_hash
+         from events ev
+        where ev.task_id = $1::numeric
+          and ev.event = 'attested_pick'
+        order by ev.id`,
+      [taskId],
+    ),
   ]);
 
   return {
@@ -308,6 +323,7 @@ export async function getTaskDetail(
     funders,
     children: children.map((child) => child.id),
     scorecard,
+    attestations,
   };
 }
 

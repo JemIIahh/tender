@@ -15,6 +15,7 @@ import {
   fixtureData,
   lifecycleBlocks,
   putFixtureBlobs,
+  receipt,
 } from "@tender/indexer/testing";
 import {
   AgentDetailResponseSchema,
@@ -30,6 +31,7 @@ import {
   phaseAt,
   type Scorecard,
   sha256Hex,
+  TaskDetailResponseSchema,
   type TenderEvent,
 } from "@tender/shared";
 import type { Hono } from "hono";
@@ -709,6 +711,72 @@ test("task_detail_reads_only_public_blobs_of_the_matching_kind", async () => {
   expect((await get<TaskDetailResponse>("/v1/tasks/4")).body.scorecard?.task_id).toBe("4");
   // Public now, but it is the scorecard of task 9.
   expect((await get<TaskDetailResponse>("/v1/tasks/3")).body.scorecard).toBeNull();
+});
+
+test("task_detail_lists_the_signatures_the_contract_checked_before_it_paid", async () => {
+  await apply(taskLine(3, windowsFor("judging")), taskLine(4, windowsFor("judging")));
+  // `pick_attested` is one call: the pick and one `attested_pick` event per signature, all logged
+  // by one receipt, in this order. Task 4 has a signature of its own, in another call.
+  const signedBy = (signer: string, model: string, request: string, response: string) =>
+    eventLine("attested_pick", {
+      task_id: "3",
+      signer_id: signer,
+      model,
+      request_hash: sha256Hex(request),
+      response_hash: sha256Hex(response),
+    });
+  const block = blockOf(nextHeight++, []);
+  block.receipts = [
+    receipt("receipt-attested-3", [
+      eventLine("picked", { task_id: "3" }),
+      signedBy("nearai-tee-1", "Qwen/Qwen3.8-27B", "request one", "response one"),
+      signedBy("nearai-tee-2", "z-ai/glm-5.3-flash", "request two", "response two"),
+    ]),
+    receipt("receipt-attested-4", [
+      eventLine("attested_pick", { task_id: "4", signer_id: "nearai-tee-1" }),
+    ]),
+  ];
+  await applyBlock(deps.db, block, FIXTURE_OPTIONS);
+
+  const { body } = await get<TaskDetailResponse>("/v1/tasks/3");
+  expect(body.attestations).toEqual([
+    {
+      signer_id: "nearai-tee-1",
+      model: "Qwen/Qwen3.8-27B",
+      request_hash: sha256Hex("request one"),
+      response_hash: sha256Hex("response one"),
+    },
+    {
+      signer_id: "nearai-tee-2",
+      model: "z-ai/glm-5.3-flash",
+      request_hash: sha256Hex("request two"),
+      response_hash: sha256Hex("response two"),
+    },
+  ]);
+  // Task 4's own signature is not task 3's.
+  const captured = fixtureData("attested_pick");
+  const other = await get<TaskDetailResponse>("/v1/tasks/4");
+  expect(other.body.attestations).toEqual([
+    {
+      signer_id: "nearai-tee-1",
+      model: captured.model,
+      request_hash: captured.request_hash,
+      response_hash: captured.response_hash,
+    },
+  ]);
+  // The answer is what the shared schema, and so the client and the web app, read.
+  expect(TaskDetailResponseSchema.parse(body).attestations).toHaveLength(2);
+});
+
+test("task_detail_has_no_signatures_for_a_task_settled_with_pick", async () => {
+  await seedLifecycle(deps.db);
+  await apply(taskLine(2, windowsFor("open")));
+  // The lifecycle's task 1 was picked by `pick`, and task 2 is still open: both have none, and the
+  // field is an empty list, not missing.
+  for (const id of ["1", "2"]) {
+    const { body } = await get<TaskDetailResponse>(`/v1/tasks/${id}`);
+    expect(body.attestations, `task ${id}`).toEqual([]);
+  }
 });
 
 test("task_detail_keeps_who_voided_a_task", async () => {

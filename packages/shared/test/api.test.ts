@@ -578,6 +578,12 @@ const ENTRY = {
   is_team: false,
 };
 const FUNDER = { account: POSTER, amount: "1000000" };
+const ATTESTATION = {
+  signer_id: "nearai-tee-1",
+  model: "Qwen/Qwen3.8-27B",
+  request_hash: HASH,
+  response_hash: HASH,
+};
 const AGENT = {
   account: ALICE,
   asp: null,
@@ -659,7 +665,9 @@ const SAMPLES: { [name in SchemaName]: Sample[] } = {
   TaskDetailSchema: [{ body: TASK_DETAIL }],
   TaskEntrySchema: [{ body: ENTRY }],
   TaskFunderSchema: [{ body: FUNDER }],
+  TaskAttestationSchema: [{ body: ATTESTATION }],
   TaskDetailResponseSchema: [
+    // An API from before `attestations` sends none.
     {
       body: {
         task: TASK_DETAIL,
@@ -670,6 +678,19 @@ const SAMPLES: { [name in SchemaName]: Sample[] } = {
         children: ["8"],
         scorecard: null,
       },
+    },
+    {
+      body: {
+        task: TASK_DETAIL,
+        brief: null,
+        criteria: null,
+        entries: [ENTRY],
+        funders: [FUNDER],
+        children: ["8"],
+        scorecard: null,
+        attestations: [ATTESTATION],
+      },
+      optional: ["attestations"],
     },
   ],
   ListTasksResponseSchema: [{ body: PAGE }],
