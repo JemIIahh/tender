@@ -1,3 +1,11 @@
+export {
+  type Attestation,
+  AttestedCompletionError,
+  addressOfPublicKey,
+  attestationProblem,
+  attestedComplete,
+  recoverAddress,
+} from "./attest";
 export { fetchEntryContent } from "./fetch";
 export { intakeTask } from "./intake";
 export { WarmWorker, type WorkerSource } from "./isolate";

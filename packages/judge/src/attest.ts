@@ -295,6 +295,17 @@ export function recoverAddress(text: string, signature: string): string | null {
   }
 }
 
+/**
+ * The address (`0x` and 40 lowercase hex) of a secp256k1 public key given as 64 bytes of hex (`x`
+ * then `y`, with `0x` or a leading `04` allowed): the last 20 bytes of its keccak256. `null` when
+ * it is not such a key.
+ */
+export function addressOfPublicKey(publicKey: string): string | null {
+  const key = publicKey.replace(/^0x/, "").replace(/^04(?=[0-9a-fA-F]{128}$)/, "");
+  if (!/^[0-9a-fA-F]{128}$/.test(key)) return null;
+  return `0x${bytesToHex(keccak_256(hexToBytes(key)).slice(12))}`;
+}
+
 /** `signature` as `0x` and lowercase hex. */
 function normaliseSignature(signature: string): string {
   return `0x${signature.replace(/^0x/, "").toLowerCase()}`;
